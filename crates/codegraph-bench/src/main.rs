@@ -1,8 +1,13 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::ExitCode;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use clap::{Parser, ValueEnum};
-use codegraph_bench::corpus::{fetch_all, list_statuses};
+use codegraph_bench::ab::{
+    AbConfig, AbCorpus, DEFAULT_RUN_TIMEOUT, run_ab, write_ab_markdown, write_ab_report,
+};
+use codegraph_bench::corpus::{corpora_root, fetch_all_in, list_statuses, list_statuses_in};
+use codegraph_bench::graph_diff::run_graph_diff;
 use codegraph_bench::markdown::{render_from_json, write_markdown};
 use codegraph_bench::oracle::golden::write_golden;
 use codegraph_bench::pipeline::{PipelineConfig, run_pipeline, select_corpora};
@@ -20,7 +25,10 @@ struct Args {
     )]
     list_corpora: bool,
 
-    #[arg(long, help = "Fetch pinned corpora into bench/corpora/<name>")]
+    #[arg(
+        long,
+        help = "Fetch pinned corpora into bench/corpora/<name> (or <--corpora-root>/<name>)"
+    )]
     fetch_corpora: bool,
 
     #[arg(
@@ -32,9 +40,39 @@ struct Args {
     #[arg(
         long,
         value_name = "NAME",
-        help = "Corpus to benchmark (repeatable). Omit or pass 'all' for every pinned corpus."
+        value_delimiter = ',',
+        help = "Corpus to benchmark: repeat the flag or pass a comma-separated list. \
+                For --run, omit it or pass 'all' for every pinned corpus; --ab needs a list or 'all'."
     )]
     corpora: Vec<String>,
+
+    #[arg(
+        long,
+        value_name = "DIR",
+        help = "Directory holding the corpus checkouts for --ab, --list-corpora and \
+                --fetch-corpora (default: bench/corpora in the workspace)"
+    )]
+    corpora_root: Option<PathBuf>,
+
+    #[arg(
+        long,
+        help = "A/B-time a cold `init` of --baseline against --candidate on --corpora"
+    )]
+    ab: bool,
+
+    #[arg(long, value_name = "BIN", help = "Baseline codegraph binary for --ab")]
+    baseline: Option<PathBuf>,
+
+    #[arg(long, value_name = "BIN", help = "Candidate codegraph binary for --ab")]
+    candidate: Option<PathBuf>,
+
+    #[arg(
+        long,
+        value_name = "N",
+        value_delimiter = ',',
+        help = "RAYON_NUM_THREADS values for --ab, comma-separated; each is its own cell"
+    )]
+    threads: Vec<usize>,
 
     #[arg(
         long,
@@ -46,7 +84,7 @@ struct Args {
     #[arg(
         long,
         default_value_t = 12,
-        help = "Number of process runs for --smoke"
+        help = "Number of process runs per cell for --smoke, --run and --ab; the first is discarded"
     )]
     runs: usize,
 
@@ -56,14 +94,14 @@ struct Args {
     #[arg(
         long,
         value_name = "PATH",
-        help = "Write a results.json report for --smoke or --run"
+        help = "Write the JSON report for --smoke, --run or --ab (default: stdout)"
     )]
     out: Option<PathBuf>,
 
     #[arg(
         long,
         value_name = "PATH",
-        help = "Write the rendered markdown report (docs/benchmark-results.md) for --run"
+        help = "Write the rendered Markdown report for --run (docs/benchmark-results.md) or --ab"
     )]
     report_md: Option<PathBuf>,
 
@@ -82,6 +120,15 @@ struct Args {
         help = "Generate canonical golden files from an upstream SQLite database"
     )]
     gen_golden: Option<Vec<PathBuf>>,
+
+    #[arg(
+        long,
+        value_names = ["LEFT", "RIGHT"],
+        num_args = 2,
+        help = "Compare two canonical graphs, each a SQLite database or a golden directory; \
+                exit 0 when identical, 1 when different, 2 when an input cannot be loaded"
+    )]
+    graph_diff: Option<Vec<PathBuf>>,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -90,17 +137,42 @@ enum CliCacheMode {
     Cold,
 }
 
-fn main() -> Result<()> {
+fn main() -> ExitCode {
     let args = Args::parse();
-    let workspace_root = workspace_root()?;
+    if let Some(paths) = &args.graph_diff {
+        return graph_diff_exit(&paths[0], &paths[1]);
+    }
+    match run(&args) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("Error: {error:?}");
+            ExitCode::FAILURE
+        }
+    }
+}
 
+/// `--graph-diff` follows the `cmp`/`diff` convention: 0 identical, 1
+/// different, 2 when an input cannot be loaded or the report cannot be written.
+fn graph_diff_exit(left: &Path, right: &Path) -> ExitCode {
+    let mut stdout = std::io::stdout().lock();
+    match run_graph_diff(left, right, &mut stdout) {
+        Ok(true) => ExitCode::SUCCESS,
+        Ok(false) => ExitCode::from(1),
+        Err(error) => {
+            eprintln!("Error: {error:?}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+fn run(args: &Args) -> Result<()> {
     if args.fetch_corpora {
-        let statuses = fetch_all(&workspace_root)?;
+        let statuses = fetch_all_in(&selected_corpora_root(args)?)?;
         print_statuses(&statuses);
     }
 
     if args.list_corpora {
-        let statuses = list_statuses(&workspace_root);
+        let statuses = list_statuses_in(&selected_corpora_root(args)?);
         print_statuses(&statuses);
     }
 
@@ -110,7 +182,12 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    if args.ab {
+        return run_ab_command(args);
+    }
+
     if args.run {
+        let workspace_root = workspace_root()?;
         let names: Vec<String> = args
             .corpora
             .iter()
@@ -139,14 +216,15 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    if let Some(paths) = args.gen_golden {
+    if let Some(paths) = &args.gen_golden {
         write_golden(&paths[0], &paths[1])?;
     }
 
-    if let Some(command) = args.smoke {
+    if let Some(command) = &args.smoke {
+        let workspace_root = workspace_root()?;
         let summary = run_command(
             &RunConfig {
-                command,
+                command: command.clone(),
                 runs: args.runs,
                 discard_first: true,
                 mode: args.mode.into(),
@@ -155,13 +233,73 @@ fn main() -> Result<()> {
         )?;
         let report =
             BenchmarkReport::smoke(&workspace_root, summary, list_statuses(&workspace_root));
-        match args.out {
-            Some(path) => write_report(&path, &report)?,
+        match &args.out {
+            Some(path) => write_report(path, &report)?,
             None => println!("{}", serde_json::to_string_pretty(&report)?),
         }
     }
 
     Ok(())
+}
+
+fn run_ab_command(args: &Args) -> Result<()> {
+    let baseline = args
+        .baseline
+        .clone()
+        .context("--ab needs --baseline <BIN>")?;
+    let candidate = args
+        .candidate
+        .clone()
+        .context("--ab needs --candidate <BIN>")?;
+    if args.corpora.is_empty() {
+        bail!("--ab needs --corpora <NAME[,NAME...]> (or 'all')");
+    }
+    if args.threads.is_empty() {
+        bail!("--ab needs --threads <N[,M...]>");
+    }
+    let names: Vec<String> = args
+        .corpora
+        .iter()
+        .filter(|name| name.as_str() != "all")
+        .cloned()
+        .collect();
+    let root = selected_corpora_root(args)?;
+    let corpora = select_corpora(&names)?
+        .into_iter()
+        .map(|corpus| AbCorpus::from_registry(corpus, &root))
+        .collect::<Result<Vec<_>>>()?;
+    let config = AbConfig {
+        baseline,
+        candidate,
+        corpora,
+        threads: args.threads.clone(),
+        runs: args.runs,
+        run_timeout: DEFAULT_RUN_TIMEOUT,
+        workspace_root: workspace_root().ok(),
+        argv: std::env::args_os()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect(),
+    };
+    let report = run_ab(&config)?;
+    match &args.out {
+        Some(path) => {
+            write_ab_report(path, &report)?;
+            eprintln!("wrote {}", path.display());
+        }
+        None => println!("{}", serde_json::to_string_pretty(&report)?),
+    }
+    if let Some(path) = &args.report_md {
+        write_ab_markdown(path, &report)?;
+        eprintln!("wrote {}", path.display());
+    }
+    Ok(())
+}
+
+fn selected_corpora_root(args: &Args) -> Result<PathBuf> {
+    match &args.corpora_root {
+        Some(root) => Ok(root.clone()),
+        None => Ok(corpora_root(&workspace_root()?)),
+    }
 }
 
 impl From<CliCacheMode> for CacheMode {
@@ -174,10 +312,12 @@ impl From<CliCacheMode> for CacheMode {
 }
 
 fn print_statuses(statuses: &[codegraph_bench::corpus::CorpusStatus]) {
-    println!("name\tcommit\texpected_loc\texpected_files\tactual_loc\tactual_files\tfetched\tpath");
+    println!(
+        "name\tcommit\texpected_loc\texpected_files\tactual_loc\tactual_files\tfetched\tpath\ttag"
+    );
     for status in statuses {
         println!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             status.name,
             status.commit,
             status.expected_loc,
@@ -191,7 +331,8 @@ fn print_statuses(statuses: &[codegraph_bench::corpus::CorpusStatus]) {
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "-".to_string()),
             status.fetched,
-            status.path
+            status.path,
+            status.tag.as_deref().unwrap_or("-")
         );
     }
 }
