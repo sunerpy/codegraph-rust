@@ -105,6 +105,7 @@ pub struct Case {
     edges_before: Vec<EdgeSpec>,
     edges_after: Vec<EdgeSpec>,
     absent_after: Vec<EdgeSpec>,
+    languages_after: Vec<(&'static str, &'static str)>,
 }
 
 impl Case {
@@ -119,6 +120,7 @@ impl Case {
             edges_before: Vec::new(),
             edges_after: Vec::new(),
             absent_after: Vec::new(),
+            languages_after: Vec::new(),
         }
     }
 
@@ -177,6 +179,12 @@ impl Case {
         target: &'static str,
     ) -> Self {
         self.absent_after.push((source, kind, target));
+        self
+    }
+
+    /// The language a fresh index of the final tree records for file `path`.
+    pub fn file_language_after(mut self, path: &'static str, language: &'static str) -> Self {
+        self.languages_after.push((path, language));
         self
     }
 
@@ -286,6 +294,19 @@ fn run_case(name: &str, case: &Case) {
         .index();
     expect_edges(name, "fresh", fresh.graph(), &case.edges_after);
     expect_no_edges(name, "fresh", fresh.graph(), &case.absent_after);
+    for &(path, language) in &case.languages_after {
+        let recorded = fresh
+            .graph()
+            .files
+            .iter()
+            .find(|file| file.path == path)
+            .map(|file| file.language.as_str());
+        assert_eq!(
+            recorded,
+            Some(language),
+            "[{name}] the fresh index records {path} as {recorded:?}"
+        );
+    }
     languages.extend(indexed_languages(fresh.graph()));
     for language in &case.languages {
         assert!(

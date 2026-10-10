@@ -202,6 +202,56 @@ pub fn detect_language_with(
     Language::Unknown
 }
 
+/// The language `file_path` is indexed as, given its `source`: the language
+/// of its extension, except that a `.h` header holding C++ or Objective-C is
+/// that language. Extraction parses a file with it and every path that records
+/// a file row stores it, so the row agrees with the file's nodes.
+pub fn detect_language_for_source(
+    file_path: &str,
+    source: &str,
+    overrides: &ExtensionOverrides,
+) -> Language {
+    sniff_header_language(
+        file_path,
+        detect_language_with(file_path, overrides),
+        source,
+    )
+}
+
+/// [`detect_language_for_source`] for a file as the bounded reader returned
+/// it. A file over the size limit was never read, so only its extension
+/// decides; it has no nodes to disagree with.
+pub fn detect_language_of(
+    file_path: &str,
+    source: &SourceText,
+    overrides: &ExtensionOverrides,
+) -> Language {
+    match source {
+        SourceText::Text(text) => detect_language_for_source(file_path, text, overrides),
+        SourceText::Oversize(_) | SourceText::MpegTransportStream => {
+            detect_language_with(file_path, overrides)
+        }
+    }
+}
+
+/// `language` refined by `source` when `file_path` is a `.h` header of it:
+/// C++ or Objective-C content makes the header that language.
+fn sniff_header_language(file_path: &str, language: Language, source: &str) -> Language {
+    let header = Path::new(file_path)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("h"));
+    if language != Language::C || !header {
+        language
+    } else if looks_like_cpp(source) {
+        Language::Cpp
+    } else if looks_like_objc(source) {
+        Language::ObjC
+    } else {
+        language
+    }
+}
+
 /// A `.h` file maps to `Language::C` by extension, but may hold C++ or
 /// Objective-C. The ordinary unique-C++ probes retain their bounded 8 KiB pass;
 /// a second full-source pass recognizes a plain class/struct base clause, whose
@@ -287,20 +337,9 @@ pub fn extract_source_with_observer(
 ) -> ExtractionResult {
     let start = Instant::now();
     observer(ExtractionStage::DetectLanguage);
-    let mut language = language.unwrap_or_else(|| detect_language_with(file_path, overrides));
+    let language = language.unwrap_or_else(|| detect_language_with(file_path, overrides));
     observer(ExtractionStage::Prepare);
-    if language == Language::C
-        && Path::new(file_path)
-            .extension()
-            .and_then(|ext| ext.to_str())
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("h"))
-    {
-        if looks_like_cpp(source) {
-            language = Language::Cpp;
-        } else if looks_like_objc(source) {
-            language = Language::ObjC;
-        }
-    }
+    let language = sniff_header_language(file_path, language, source);
     observer(ExtractionStage::Embedded);
     if let Some(result) = crate::embedded::extract_embedded(file_path, source, language) {
         return result;

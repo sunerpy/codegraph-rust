@@ -22,7 +22,7 @@ use codegraph_core::generated_header::detect_generated_file;
 use codegraph_core::logger::{LoggerConfig, init_logger};
 use codegraph_core::node_id::hash_content;
 use codegraph_core::types::{Edge, ExtractionResult, FileRecord, Language, Node, NodeKind};
-use codegraph_extract::{ExtractOptions, detect_language_with};
+use codegraph_extract::{ExtractOptions, detect_language_of};
 use codegraph_graph::graph::{GodotReach, GraphTraverser, group_definitions};
 use codegraph_graph::query::{SearchOptions, search_nodes};
 use codegraph_graph::{segment_match, segments};
@@ -5708,7 +5708,7 @@ fn index_project_inner(
                 return Ok(None);
             };
             parse_tracker.stage(index, "prepare");
-            let language = detect_language_with(relative, &options.extensions);
+            let language = detect_language_of(relative, &source, &options.extensions);
             parse_tracker.file_info(index, metadata.len(), language);
 
             let result =

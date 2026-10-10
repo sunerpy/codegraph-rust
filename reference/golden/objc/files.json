@@ -3,7 +3,7 @@
     "content_hash": "95cce029910e4811b902e941ef00328254a4c489bc854d84e38e1a8e3645ac28",
     "errors": null,
     "generated": 0,
-    "language": "c",
+    "language": "objc",
     "node_count": 4,
     "path": "Sources/Base.h",
     "size": 116

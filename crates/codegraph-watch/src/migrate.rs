@@ -37,7 +37,7 @@ use codegraph_core::IndexPaths;
 use codegraph_core::generated_header::detect_generated_file;
 use codegraph_core::node_id::hash_content;
 use codegraph_core::types::{Edge, FileRecord, Node, UnresolvedRef};
-use codegraph_extract::detect_language_with;
+use codegraph_extract::detect_language_of;
 use codegraph_resolve::ReferenceResolver;
 use codegraph_store::StoreWriteAuthorization;
 
@@ -111,7 +111,7 @@ pub(crate) fn migrate_project(
         let file = FileRecord {
             path: relative.clone(),
             content_hash: hash_content(&hash_input),
-            language: detect_language_with(relative, &options.extensions),
+            language: detect_language_of(relative, &source, &options.extensions),
             size: metadata.len() as i64,
             modified_at: modified_millis(&metadata),
             indexed_at: now_millis(),

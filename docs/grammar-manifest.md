@@ -105,7 +105,8 @@ emit SQL-related mapper symbols from XML without adding `.sql` source support.
 classifications:
 
 - `.h` begins as C, then masked source heuristics may promote it to C++ or
-  Objective-C;
+  Objective-C; the file's row records the promoted language, the same one its
+  nodes carry;
 - `.metal`, `.cu`, and `.cuh` use the C++ grammar with dialect-specific preparse;
 - `.xsjs` and `.xsjslib` use JavaScript;
 - `.dfm` and `.fmx` use the Pascal language ID but custom extraction;

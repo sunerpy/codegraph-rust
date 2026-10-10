@@ -253,3 +253,32 @@ fn single_argument_function_macros_are_never_guessed() {
         Some("old_style")
     );
 }
+
+/// A `.h` header is C by its extension but is extracted as C++ or Objective-C
+/// when its content says so. The file row records that same sniffed language,
+/// so it agrees with the header's nodes (G15).
+#[test]
+fn a_sniffed_header_records_the_language_of_its_nodes() {
+    use codegraph_extract::engine::detect_language_for_source;
+    use codegraph_extract::ext_config::ExtensionOverrides;
+
+    let overrides = ExtensionOverrides::default();
+    let cpp = "class Shape {\npublic:\n    int sides() const { return 4; }\n};\n";
+    let objc = "@interface Shape : NSObject\n- (int)sides;\n@end\n";
+    let c = "struct shape {\n    int sides;\n};\n\nint shape_sides(const struct shape *s);\n";
+    for (path, source, want) in [
+        ("include/shape.h", cpp, Language::Cpp),
+        ("include/Shape.H", cpp, Language::Cpp),
+        ("include/shape.h", objc, Language::ObjC),
+        ("include/shape.h", c, Language::C),
+        // Only a header is sniffed: a `.c` file is C whatever it holds.
+        ("src/shape.c", cpp, Language::C),
+        ("src/shape.cpp", c, Language::Cpp),
+    ] {
+        let language = detect_language_for_source(path, source, &overrides);
+        assert_eq!(language, want, "{path} holding {source:?}");
+        for node in extract_source(path, source, None).nodes {
+            assert_eq!(node.language, language, "{path}: node {} agrees", node.name);
+        }
+    }
+}

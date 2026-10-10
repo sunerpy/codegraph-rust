@@ -1064,4 +1064,5 @@ pub fn c_header_flips_to_cpp() -> Case {
         .edge_throughout("file:main.c", "imports", "file:shape.h")
         .edge_throughout("function main", "calls", "function shape_sides @shape.c")
         .edge_after("file:shape.h", "contains", "class Shape")
+        .file_language_after("shape.h", "cpp")
 }
