@@ -152,6 +152,20 @@ pub fn java_parameter_type_of_an_added_class() -> Case {
         .edge_after("method zoo::Keeper::feed", "references", "class zoo::Animal")
 }
 
+/// G3: a C# parameter type is a reference to a class that appears later.
+pub fn csharp_parameter_type_of_an_added_class() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::CSharp])
+        .file(
+            "src/Keeper.cs",
+            "namespace Zoo\n{\n    public class Keeper\n    {\n        public int Feed(Animal animal) { return 1; }\n    }\n}\n",
+        )
+        .write(
+            "src/Animal.cs",
+            "namespace Zoo\n{\n    public class Animal { }\n}\n",
+        )
+        .edge_after("method Zoo::Keeper::Feed", "references", "class Zoo::Animal")
+}
+
 /// Upstream #2392 notes that C includes already converge.
 pub fn c_include_of_an_added_header() -> Case {
     Case::new(Change::AddImportTarget, &[Language::C])

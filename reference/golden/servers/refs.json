@@ -622,6 +622,16 @@
   {
     "candidates": null,
     "col": 15,
+    "file_path": "aspnet/Controllers/UsersController.cs",
+    "from_node_id": "method:5305c5e90802aeb697042a8f5a945c5c",
+    "language": "csharp",
+    "line": 10,
+    "reference_kind": "references",
+    "reference_name": "IActionResult"
+  },
+  {
+    "candidates": null,
+    "col": 15,
     "file_path": "express/routes/users.js",
     "from_node_id": "constant:d1b69054221431f51b587e24cd94be13",
     "language": "javascript",
@@ -731,6 +741,16 @@
   },
   {
     "candidates": null,
+    "col": 19,
+    "file_path": "vapor/Sources/App/routes.swift",
+    "from_node_id": "function:8dd3364a31120bc5e71dc9a707df0dcc",
+    "language": "swift",
+    "line": 3,
+    "reference_kind": "references",
+    "reference_name": "Application"
+  },
+  {
+    "candidates": null,
     "col": 2,
     "file_path": "express/app.js",
     "from_node_id": "function:16279817ad2a6e3ecd9cda244219b9cb",
@@ -831,6 +851,16 @@
   },
   {
     "candidates": null,
+    "col": 20,
+    "file_path": "vapor/Sources/App/Controllers/TodoController.swift",
+    "from_node_id": "method:e26506678f57fd0e05462e7399ce0be8",
+    "language": "swift",
+    "line": 9,
+    "reference_kind": "references",
+    "reference_name": "Request"
+  },
+  {
+    "candidates": null,
     "col": 21,
     "file_path": "actix/src/main.rs",
     "from_node_id": "file:actix/src/main.rs",
@@ -878,6 +908,16 @@
     "line": 10,
     "reference_kind": "references",
     "reference_name": "Action"
+  },
+  {
+    "candidates": null,
+    "col": 22,
+    "file_path": "vapor/Sources/App/Controllers/TodoController.swift",
+    "from_node_id": "method:0b06fe724556d9527319b8c22a64ab43",
+    "language": "swift",
+    "line": 4,
+    "reference_kind": "references",
+    "reference_name": "RoutesBuilder"
   },
   {
     "candidates": null,

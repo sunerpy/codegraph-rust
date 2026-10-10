@@ -121,3 +121,76 @@ fn scala_parameter_lists_return_type_and_bounds_are_references() {
         ])
     );
 }
+
+/// C#: only type positions are walked (a parameter's or tuple element's name
+/// never surfaces), a qualified name by its last segment, and a built-in
+/// (`predefined_type`) is skipped.
+#[test]
+fn csharp_type_positions_are_references() {
+    let source = "namespace App {\n  class Svc {\n    private readonly ILogger _log;\n    public Widget Size { get; set; }\n    public Result<Out> Build(Widget w, List<Item> items, int n, (int Code, Foo Payload) t, App.Models.Order o) { return null; }\n  }\n}\n";
+    assert_eq!(
+        type_refs("src/Svc.cs", source, Language::CSharp),
+        pairs(&[
+            ("Build", "Foo"),
+            ("Build", "Item"),
+            ("Build", "List"),
+            ("Build", "Order"),
+            ("Build", "Out"),
+            ("Build", "Result"),
+            ("Build", "Widget"),
+            ("Size", "Widget"),
+            ("_log", "ILogger"),
+        ])
+    );
+}
+
+/// PHP: parameter and return type hints; a qualified name by its last
+/// segment; primitives and pseudo-types (`self`, `null`) are skipped.
+#[test]
+fn php_type_hints_are_references() {
+    let source = "<?php\nclass Svc {\n  public function build(?Widget $w, \\App\\Item|null $i, int $n, self $s): Result { return $x; }\n}\n";
+    assert_eq!(
+        type_refs("src/Svc.php", source, Language::Php),
+        pairs(&[("build", "Item"), ("build", "Result"), ("build", "Widget"),])
+    );
+}
+
+/// Dart: a method's signature, walked whole, since its names are
+/// `identifier` and only types are `type_identifier`.
+#[test]
+fn dart_signature_types_are_references() {
+    let source =
+        "class Svc {\n  Result<Out> build(Widget w, List<Item> items, int n) { return x; }\n}\n";
+    assert_eq!(
+        type_refs("lib/svc.dart", source, Language::Dart),
+        pairs(&[
+            ("build", "Item"),
+            ("build", "List"),
+            ("build", "Out"),
+            ("build", "Result"),
+            ("build", "Widget"),
+        ])
+    );
+}
+
+/// Swift: parameter and return types; and a protocol composition continued
+/// on an `&` line inside a type's body keeps the continuation's types
+/// (upstream #2108), which the grammar otherwise parses as an error.
+#[test]
+fn swift_signature_and_composition_types_are_references() {
+    let source = "final class EditorStore {\n    typealias EditorClient = AutocompleteService.Client\n        & MediaUploadService.Client\n    func build(w: Widget, items: [Item]) -> Result<Out, Error> { fatalError() }\n}\n";
+    assert_eq!(
+        type_refs("Sources/EditorStore.swift", source, Language::Swift),
+        pairs(&[
+            ("EditorClient", "AutocompleteService"),
+            ("EditorClient", "Client"),
+            ("EditorClient", "Client"),
+            ("EditorClient", "MediaUploadService"),
+            ("build", "Error"),
+            ("build", "Item"),
+            ("build", "Out"),
+            ("build", "Result"),
+            ("build", "Widget"),
+        ])
+    );
+}

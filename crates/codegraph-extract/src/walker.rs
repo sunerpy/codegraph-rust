@@ -4712,9 +4712,35 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
         if !has_type_annotation_refs(language) {
             return;
         }
-        if language == Language::Kotlin {
-            self.extract_kotlin_type_annotations(node, node_id);
-            return;
+        match language {
+            Language::Kotlin => {
+                self.extract_kotlin_type_annotations(node, node_id);
+                return;
+            }
+            Language::CSharp => {
+                self.extract_csharp_type_annotations(node, node_id);
+                return;
+            }
+            Language::Php => {
+                self.extract_php_type_annotations(node, node_id);
+                return;
+            }
+            Language::Dart => {
+                self.extract_dart_type_annotations(node, node_id);
+                return;
+            }
+            Language::Swift => {
+                // A Swift parameter is not under a field of its function; its
+                // type is the parameter's own `type` field.
+                for child in node.named_children(&mut node.walk()) {
+                    if child.kind() == "parameter"
+                        && let Some(ty) = child_by_field(child, "type")
+                    {
+                        self.extract_type_refs_from_subtree(ty, node_id);
+                    }
+                }
+            }
+            _ => {}
         }
         // Scala curries (`def f(a)(implicit m: M)`), and the typeclass usually
         // sits in a later list, so every parameter list is read; the bounds of
@@ -4750,6 +4776,152 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
                 self.extract_type_refs_from_subtree(child, node_id);
             }
         }
+    }
+
+    /// C# writes no `type_identifier` leaves, so only its type positions are
+    /// walked (upstream `extractCsharpTypeRefs`): a property's `type`, a
+    /// method's `returns`, a field's `variable_declaration` type, and each
+    /// parameter's `type`. A parameter's name is never one of them.
+    fn extract_csharp_type_annotations(&mut self, node: SyntaxNode<'tree>, node_id: &str) {
+        if let Some(ty) = child_by_field(node, "type").or_else(|| child_by_field(node, "returns")) {
+            self.csharp_type_refs(ty, node_id);
+        }
+        for child in node.named_children(&mut node.walk()) {
+            if child.kind() == "variable_declaration"
+                && let Some(ty) = child_by_field(child, "type")
+            {
+                self.csharp_type_refs(ty, node_id);
+            }
+        }
+        if let Some(params) = child_by_field(node, "parameters") {
+            for param in params.named_children(&mut params.walk()) {
+                if param.kind() == "parameter"
+                    && let Some(ty) = child_by_field(param, "type")
+                {
+                    self.csharp_type_refs(ty, node_id);
+                }
+            }
+        }
+    }
+
+    /// A C# subtree known to be in a type position (upstream
+    /// `walkCsharpTypePosition`): an identifier names a type, a qualified name
+    /// by its last segment, a tuple element by its type alone; a built-in is
+    /// skipped. A `global::` alias contributes only its name.
+    fn csharp_type_refs(&mut self, node: SyntaxNode<'tree>, from_node_id: &str) {
+        match node.kind() {
+            "predefined_type" => {}
+            "identifier" => {
+                let name = node_text(node, self.source);
+                if !name.is_empty() && !is_builtin_type(&name) {
+                    self.push_ref(from_node_id, &name, EdgeKind::References, node);
+                }
+            }
+            "qualified_name" => {
+                let text = node_text(node, self.source);
+                let last = text.rsplit('.').next().unwrap_or(&text).trim();
+                if !last.is_empty() && !is_builtin_type(last) {
+                    let last = last.to_string();
+                    self.push_ref(from_node_id, &last, EdgeKind::References, node);
+                }
+            }
+            "tuple_element" | "alias_qualified_name" => {
+                let field = if node.kind() == "tuple_element" {
+                    "type"
+                } else {
+                    "name"
+                };
+                if let Some(inner) = child_by_field(node, field) {
+                    self.csharp_type_refs(inner, from_node_id);
+                }
+            }
+            _ => {
+                for child in node.named_children(&mut node.walk()) {
+                    self.csharp_type_refs(child, from_node_id);
+                }
+            }
+        }
+    }
+
+    /// PHP type hints (upstream `extractPhpTypeRefs`): each parameter's type,
+    /// and the return or property type written directly under the
+    /// declaration. A `$name` is never a type node.
+    fn extract_php_type_annotations(&mut self, node: SyntaxNode<'tree>, node_id: &str) {
+        for child in node.named_children(&mut node.walk()) {
+            if child.kind() == "formal_parameters" {
+                for param in child.named_children(&mut child.walk()) {
+                    for part in param.named_children(&mut param.walk()) {
+                        if is_php_type_kind(part.kind()) {
+                            self.php_type_refs(part, node_id);
+                        }
+                    }
+                }
+            } else if is_php_type_kind(child.kind()) {
+                self.php_type_refs(child, node_id);
+            }
+        }
+    }
+
+    /// A PHP subtree known to be a type: a `name` names a class unless it is a
+    /// pseudo-type, a qualified name by its last `\` segment, a primitive is
+    /// skipped.
+    fn php_type_refs(&mut self, node: SyntaxNode<'tree>, from_node_id: &str) {
+        match node.kind() {
+            "primitive_type" => {}
+            "name" | "qualified_name" => {
+                let text = node_text(node, self.source);
+                let last = text.rsplit('\\').next().unwrap_or(&text).trim();
+                if !last.is_empty() && !is_php_pseudo_type(last) {
+                    let last = last.to_string();
+                    self.push_ref(from_node_id, &last, EdgeKind::References, node);
+                }
+            }
+            _ => {
+                for child in node.named_children(&mut node.walk()) {
+                    self.php_type_refs(child, from_node_id);
+                }
+            }
+        }
+    }
+
+    /// Dart (upstream's Dart path): a method's inner signature, or a field's
+    /// declaration, is walked whole, since names are `identifier` and only
+    /// types are `type_identifier`. A redirecting factory's target is a
+    /// constructed class and perhaps its constructor (`= _Impl.create`); only
+    /// an UpperCamel name there is a type.
+    fn extract_dart_type_annotations(&mut self, node: SyntaxNode<'tree>, node_id: &str) {
+        let node = match node.kind() {
+            "method_declaration" => child_by_field(node, "signature").unwrap_or(node),
+            _ => node,
+        };
+        let signature = if node.kind() == "method_signature" {
+            node.named_children(&mut node.walk())
+                .find(|child| {
+                    matches!(
+                        child.kind(),
+                        "function_signature"
+                            | "getter_signature"
+                            | "setter_signature"
+                            | "constructor_signature"
+                            | "factory_constructor_signature"
+                            | "redirecting_factory_constructor_signature"
+                    )
+                })
+                .unwrap_or(node)
+        } else {
+            node
+        };
+        if signature.kind() == "redirecting_factory_constructor_signature" {
+            for child in signature.named_children(&mut signature.walk()) {
+                if child.kind() != "type_identifier"
+                    || dart_names_a_type(&node_text(child, self.source))
+                {
+                    self.extract_type_refs_from_subtree(child, node_id);
+                }
+            }
+            return;
+        }
+        self.extract_type_refs_from_subtree(signature, node_id);
     }
 
     /// kotlin-ng writes a function's types as unnamed children: each
@@ -5870,7 +6042,58 @@ fn has_type_annotation_refs(language: Language) -> bool {
             | Language::Java
             | Language::Kotlin
             | Language::Scala
+            | Language::CSharp
+            | Language::Swift
+            | Language::Dart
+            | Language::Php
     )
+}
+
+/// The PHP node kinds a type hint is written as (upstream `PHP_TYPE_NODES`).
+fn is_php_type_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "named_type"
+            | "optional_type"
+            | "nullable_type"
+            | "union_type"
+            | "intersection_type"
+            | "disjunctive_normal_form_type"
+            | "primitive_type"
+    )
+}
+
+/// PHP pseudo-types and relative class names that name no project class
+/// (upstream `PHP_PSEUDO_TYPES`).
+fn is_php_pseudo_type(name: &str) -> bool {
+    matches!(
+        name,
+        "self"
+            | "static"
+            | "parent"
+            | "mixed"
+            | "object"
+            | "iterable"
+            | "callable"
+            | "void"
+            | "null"
+            | "false"
+            | "true"
+            | "never"
+            | "array"
+            | "int"
+            | "float"
+            | "string"
+            | "bool"
+    )
+}
+
+/// Dart writes type names UpperCamel, after any leading `_` or `$`.
+fn dart_names_a_type(name: &str) -> bool {
+    name.trim_start_matches(['_', '$'])
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_uppercase())
 }
 
 /// The kotlin-ng node kinds a type is written as.

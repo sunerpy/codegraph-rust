@@ -121,6 +121,16 @@
   },
   {
     "candidates": null,
+    "col": 15,
+    "file_path": "flutter/lib/main.dart",
+    "from_node_id": "method:06cc27db07d4944f8a4f2dccba77e661",
+    "language": "dart",
+    "line": 9,
+    "reference_kind": "references",
+    "reference_name": "BuildContext"
+  },
+  {
+    "candidates": null,
     "col": 16,
     "file_path": "rn/src/Camera.tsx",
     "from_node_id": "constant:1e0d4a36cc226cb0db4993c763f554e4",
@@ -138,6 +148,16 @@
     "line": 8,
     "reference_kind": "decorates",
     "reference_name": "override"
+  },
+  {
+    "candidates": null,
+    "col": 2,
+    "file_path": "flutter/lib/main.dart",
+    "from_node_id": "method:06cc27db07d4944f8a4f2dccba77e661",
+    "language": "dart",
+    "line": 9,
+    "reference_kind": "references",
+    "reference_name": "Widget"
   },
   {
     "candidates": null,
@@ -247,6 +267,16 @@
     "language": "kotlin",
     "line": 7,
     "reference_kind": "calls",
+    "reference_name": "ModuleDefinition"
+  },
+  {
+    "candidates": null,
+    "col": 30,
+    "file_path": "expo-modules/ios/HelloModule.swift",
+    "from_node_id": "method:8094fb8a03ad4f4399b1d43017c67450",
+    "language": "swift",
+    "line": 4,
+    "reference_kind": "references",
     "reference_name": "ModuleDefinition"
   },
   {
