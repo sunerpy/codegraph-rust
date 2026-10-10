@@ -91,3 +91,19 @@ fn objc_interfaces_name_their_superclass_and_protocols() {
         ]
     );
 }
+
+/// G6 (upstream v1.0.1): a Python class's bases are `extends` refs, a dotted
+/// base by its full path; a `metaclass=` keyword or a subscripted generic
+/// (`Generic[T]`) is no base the resolver can bind.
+#[test]
+fn python_class_bases_are_supertypes() {
+    let source = "class Flask(Scaffold, mixins.Mixin, metaclass=Meta):\n    pass\n\n\nclass Box(Generic[T], Base):\n    pass\n\n\nclass Plain:\n    pass\n";
+    assert_eq!(
+        supertypes("app.py", source, Language::Python),
+        vec![
+            extends("Box", "Base"),
+            extends("Flask", "Scaffold"),
+            extends("Flask", "mixins.Mixin"),
+        ]
+    );
+}

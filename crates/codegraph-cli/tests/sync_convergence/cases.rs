@@ -837,6 +837,25 @@ pub fn objc_change_a_superclass() -> Case {
         .edge_after("class Sub", "extends", "class Other")
 }
 
+/// G6: a Python class's bases are its supertypes.
+pub fn python_change_a_base_class() -> Case {
+    Case::new(Change::EditHeritage, &[Language::Python])
+        .file(
+            "zoo/base.py",
+            "class Animal:\n    def speak(self):\n        return '...'\n\n\nclass Robot:\n    def speak(self):\n        return 'beep'\n",
+        )
+        .file(
+            "zoo/dog.py",
+            "from zoo.base import Animal, Robot\n\n\nclass Dog(Animal):\n    pass\n",
+        )
+        .write(
+            "zoo/dog.py",
+            "from zoo.base import Animal, Robot\n\n\nclass Dog(Robot):\n    pass\n",
+        )
+        .edge_before("class Dog", "extends", "class Animal")
+        .edge_after("class Dog", "extends", "class Robot")
+}
+
 pub fn scala_change_a_parent_trait() -> Case {
     Case::new(Change::EditHeritage, &[Language::Scala])
         .file(

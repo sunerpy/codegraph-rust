@@ -109,6 +109,18 @@
   },
   {
     "col": 11,
+    "kind": "extends",
+    "line": 4,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "class:a14afda3fa296e6da71c03fc0b7d2601",
+    "target": "class:24d57926799611befdff3330f284b2a7"
+  },
+  {
+    "col": 11,
     "kind": "instantiates",
     "line": 8,
     "metadata": {
@@ -118,6 +130,18 @@
     "provenance": null,
     "source": "function:ea5748bfd28172ce0b0766d2e0b58106",
     "target": "class:3eac5c229dffda670a81ffbca4147c63"
+  },
+  {
+    "col": 12,
+    "kind": "extends",
+    "line": 10,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "class:3eac5c229dffda670a81ffbca4147c63",
+    "target": "class:a14afda3fa296e6da71c03fc0b7d2601"
   },
   {
     "col": 15,
@@ -142,6 +166,18 @@
     "provenance": null,
     "source": "file:pkg/service.py",
     "target": "file:pkg/models/__init__.py"
+  },
+  {
+    "col": 17,
+    "kind": "extends",
+    "line": 4,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "class:a14afda3fa296e6da71c03fc0b7d2601",
+    "target": "class:87c409b2abd116818b83ffeb16248828"
   },
   {
     "col": 18,

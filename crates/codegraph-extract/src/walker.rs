@@ -4756,6 +4756,18 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             if child.kind() == "class_heritage" {
                 self.extract_inheritance(child, class_id);
             }
+            // G6 (upstream v1.0.1) — Python `class Flask(Scaffold, mixins.Mixin)`:
+            // each identifier or dotted base in the argument list is a
+            // supertype; `metaclass=M` (a keyword argument) and `Generic[T]`
+            // (a subscript) are not.
+            if child.kind() == "argument_list" && node.kind() == "class_definition" {
+                for base in child.named_children(&mut child.walk()) {
+                    if matches!(base.kind(), "identifier" | "attribute") {
+                        let name = node_text(base, self.source);
+                        self.push_ref(class_id, &name, EdgeKind::Extends, base);
+                    }
+                }
+            }
             // G1 (upstream `b712e4de`) — C# `class Store : BaseStore, IStore`:
             // one `base_list` holds the base class and the interfaces alike, so
             // every entry is an `extends` ref and the resolver promotes the

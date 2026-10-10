@@ -12,6 +12,16 @@
   {
     "candidates": null,
     "col": 11,
+    "file_path": "pkg/models/base.py",
+    "from_node_id": "class:6fddf6cd7e5fa996fc4fd7330a6b0d6a",
+    "language": "python",
+    "line": 15,
+    "reference_kind": "extends",
+    "reference_name": "type"
+  },
+  {
+    "candidates": null,
+    "col": 11,
     "file_path": "pkg/service.py",
     "from_node_id": "function:7a3344a7ac17b30aaa3f83a44206faa5",
     "language": "python",
