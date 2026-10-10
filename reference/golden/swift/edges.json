@@ -24,6 +24,18 @@
     "target": "method:bcfcd79fcf00e45b1c54b8bf6e234a3a"
   },
   {
+    "col": 15,
+    "kind": "references",
+    "line": 12,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "method:f7c6eb334dea73aa3b78c0e47f419235",
+    "target": "enum:98d69fdb34096484f0ca06bb4208d684"
+  },
+  {
     "col": 16,
     "kind": "instantiates",
     "line": 4,

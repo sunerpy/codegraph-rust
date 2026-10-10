@@ -341,6 +341,37 @@ pub fn swift_method_body_edit() -> Case {
         .edge_throughout("function tick", "instantiates", "class Counter")
 }
 
+/// G4: a static field read references the class it reads through.
+pub fn java_static_field_read_body_edit() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Java])
+        .file(
+            "src/app/Limits.java",
+            "package app;\n\nclass Limits {\n  static final int MAX = 10;\n}\n",
+        )
+        .file(
+            "src/app/Bounds.java",
+            "package app;\n\nclass Bounds {\n  static final int MAX = 20;\n}\n",
+        )
+        .file(
+            "src/app/Reader.java",
+            "package app;\n\nclass Reader {\n  int peek() {\n    return Limits.MAX;\n  }\n}\n",
+        )
+        .write(
+            "src/app/Reader.java",
+            "package app;\n\nclass Reader {\n  int peek() {\n    return Bounds.MAX;\n  }\n}\n",
+        )
+        .edge_before(
+            "method app::Reader::peek",
+            "references",
+            "class app::Limits",
+        )
+        .edge_after(
+            "method app::Reader::peek",
+            "references",
+            "class app::Bounds",
+        )
+}
+
 /// #895: a function's value reference follows the constant its body reads.
 pub fn typescript_value_reader_body_edit() -> Case {
     Case::new(Change::BodyEdit, &[Language::TypeScript])

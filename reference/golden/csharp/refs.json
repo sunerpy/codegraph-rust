@@ -78,5 +78,15 @@
     "line": 14,
     "reference_kind": "calls",
     "reference_name": "new Inner.Deep().Dive"
+  },
+  {
+    "candidates": null,
+    "col": 34,
+    "file_path": "src/App/Store.cs",
+    "from_node_id": "method:360b9af06af1e876cce7cf4bcfe932b0",
+    "language": "csharp",
+    "line": 50,
+    "reference_kind": "references",
+    "reference_name": "Console"
   }
 ]

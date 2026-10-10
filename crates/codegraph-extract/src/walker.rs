@@ -95,6 +95,58 @@ fn is_literal_receiver(node: SyntaxNode<'_>) -> bool {
     LITERAL_RECEIVER_KINDS.contains(&node.kind())
 }
 
+/// G4 (upstream `STATIC_MEMBER_LANGS`) — the languages whose static-member
+/// and enum-value reads (`Enum.value`, `Type.CONST`, `Foo::BAR`) reference the
+/// type they read through. VB.NET's reads are its own (W8).
+fn has_static_member_reads(language: Language) -> bool {
+    matches!(
+        language,
+        Language::Java
+            | Language::CSharp
+            | Language::Kotlin
+            | Language::Swift
+            | Language::Scala
+            | Language::Dart
+            | Language::Php
+            | Language::Cpp
+            | Language::Rust
+    )
+}
+
+/// The member-access kinds a static-member read is written as (upstream
+/// `MEMBER_ACCESS_TYPES`): Java `field_access`, C# `member_access_expression`,
+/// Kotlin/Swift `navigation_expression`, Scala `field_expression`, PHP
+/// `class_constant_access_expression` / `scoped_property_access_expression`,
+/// C++ `qualified_identifier`. Dart and Rust have paths of their own.
+const MEMBER_ACCESS_KINDS: [&str; 7] = [
+    "field_access",
+    "member_access_expression",
+    "navigation_expression",
+    "field_expression",
+    "class_constant_access_expression",
+    "scoped_property_access_expression",
+    "qualified_identifier",
+];
+
+/// Parents of a Rust `scoped_identifier` that is not a member written as a
+/// value or a pattern: the prefix of a longer path, or a `use` tree.
+const RUST_NON_MEMBER_PATH_PARENTS: [&str; 7] = [
+    "scoped_identifier",
+    "scoped_type_identifier",
+    "use_declaration",
+    "use_list",
+    "scoped_use_list",
+    "use_as_clause",
+    "use_wildcard",
+];
+
+/// A single capitalized name: what a type is written as.
+fn is_capitalized_name(text: &str) -> bool {
+    let mut chars = text.chars();
+    chars.next().is_some_and(|c| c.is_ascii_uppercase())
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
 /// Call-node kinds whose `function` child names a member on a receiver — the
 /// `obj.method` family across the grammars (`member_expression` for TS/JS/ArkTS,
 /// `attribute` for Python, `field_expression` for Go/Rust/C/C++,
@@ -552,6 +604,7 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             && node_type == "property_declaration"
             && self.is_inside_class_like_node()
         {
+            self.walk_swift_attribute_arguments(node);
             if let Some(computed) = swift_computed_property_body(node) {
                 // A computed property is its own node; its getter is consumed by
                 // the function-body walk, so skip the generic child descent that
@@ -4616,6 +4669,10 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             }
         }
 
+        // G4 — a static-member or enum-value read: `Enum.value`,
+        // `Type.CONST`, `Foo::BAR`.
+        self.extract_static_member_ref(node);
+
         if node_type == "variable_declarator" {
             if let Some(owner_id) = self.node_stack.last().cloned() {
                 self.extract_variable_type_annotation(node, &owner_id);
@@ -4668,6 +4725,170 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             if let Some(child) = node.named_child(i as u32) {
                 self.visit_body_node(child);
             }
+        }
+    }
+
+    /// G4 (upstream `extractStaticMemberRef`) — a read through a type, which
+    /// is a dependency on it even when nothing constructs or calls it: a
+    /// `references` ref named by the receiver, at the receiver. The receiver
+    /// is a single capitalized name; an access that is a call's callee
+    /// (`Type.method()`) is the call's. The node kind is checked before its
+    /// parent is looked up.
+    fn extract_static_member_ref(&mut self, node: SyntaxNode<'tree>) {
+        let language = self.spec.language();
+        if !has_static_member_reads(language) {
+            return;
+        }
+        let Some(owner_id) = self.node_stack.last().cloned() else {
+            return;
+        };
+        match language {
+            Language::Dart => self.extract_dart_static_member_ref(node, &owner_id),
+            Language::Rust => self.extract_rust_variant_ref(node, &owner_id),
+            _ => {
+                if !MEMBER_ACCESS_KINDS.contains(&node.kind()) || self.is_callee_of_call(node) {
+                    return;
+                }
+                let receiver = child_by_field(node, "object")
+                    .or_else(|| child_by_field(node, "expression"))
+                    .or_else(|| child_by_field(node, "scope"))
+                    .or_else(|| node.named_child(0));
+                let Some(receiver) = receiver else { return };
+                if !matches!(
+                    receiver.kind(),
+                    "identifier"
+                        | "type_identifier"
+                        | "simple_identifier"
+                        | "name"
+                        | "scoped_type_identifier"
+                ) {
+                    return;
+                }
+                let text = node_text(receiver, self.source);
+                if is_capitalized_name(&text) {
+                    self.push_ref(&owner_id, &text, EdgeKind::References, receiver);
+                }
+            }
+        }
+    }
+
+    /// G4 — Fluent / SwiftUI property-wrapper attributes name a type by
+    /// metatype in their arguments (`@Siblings(through: Pivot.self, …)`); a read
+    /// through it is the enclosing type's dependency, as the wrapper is. A
+    /// model reached only through a relationship is not left orphaned.
+    fn walk_swift_attribute_arguments(&mut self, node: SyntaxNode<'tree>) {
+        let modifiers = node
+            .named_children(&mut node.walk())
+            .find(|child| child.kind() == "modifiers");
+        if let Some(modifiers) = modifiers {
+            self.static_member_refs_in(modifiers);
+        }
+    }
+
+    fn static_member_refs_in(&mut self, node: SyntaxNode<'tree>) {
+        self.extract_static_member_ref(node);
+        for child in node.named_children(&mut node.walk()) {
+            self.static_member_refs_in(child);
+        }
+    }
+
+    /// Whether `node` is the callee of the call it sits in (upstream: the
+    /// call's `function`, else its `method`, else its first named child).
+    fn is_callee_of_call(&self, node: SyntaxNode<'tree>) -> bool {
+        let Some(parent) = node.parent() else {
+            return false;
+        };
+        if !has_type(self.spec.call_types(), parent.kind()) {
+            return false;
+        }
+        child_by_field(parent, "function")
+            .or_else(|| child_by_field(parent, "method"))
+            .or_else(|| parent.named_child(0))
+            .is_some_and(|callee| callee.start_byte() == node.start_byte())
+    }
+
+    /// Dart writes a member access as a `member_expression`: a read through a
+    /// capitalized name that is not a call's callee, generic (`Foo.of<T>()`)
+    /// or not.
+    fn extract_dart_static_member_ref(&mut self, node: SyntaxNode<'tree>, owner_id: &str) {
+        if node.kind() != "member_expression" {
+            return;
+        }
+        let callee = match node.parent() {
+            Some(parent) if parent.kind() == "instantiation_expression" => parent,
+            _ => node,
+        };
+        if self.is_callee_of_call(callee) {
+            return;
+        }
+        let Some(receiver) = child_by_field(node, "object") else {
+            return;
+        };
+        if receiver.kind() != "identifier" {
+            return;
+        }
+        let text = node_text(receiver, self.source);
+        if is_capitalized_name(&text) {
+            self.push_ref(owner_id, &text, EdgeKind::References, receiver);
+        }
+    }
+
+    /// Rust writes an enum variant as a path: read (`Mode::A`,
+    /// `mode::Mode::B`, `xs.map(Mode::C)`), matched (`Mode::C(x) =>`,
+    /// `Mode::D { .. } =>`), or `Self::A` in an impl (upstream #2328). The
+    /// receiver, the segment before the member, is referenced where it is
+    /// written. A lowercase receiver is a module and a lowercase member a
+    /// function (`util::take`, `Foo::new`); a call's callee (`Mode::C(1)`) and
+    /// a struct literal's name are linked to their member already; the prefix
+    /// of a longer path and a `use` tree name no member.
+    fn extract_rust_variant_ref(&mut self, node: SyntaxNode<'tree>, owner_id: &str) {
+        let kind = node.kind();
+        if kind != "scoped_identifier" && kind != "scoped_type_identifier" {
+            return;
+        }
+        let Some(parent) = node.parent() else { return };
+        let excluded = if kind == "scoped_type_identifier" {
+            parent.kind() != "struct_pattern"
+        } else {
+            RUST_NON_MEMBER_PATH_PARENTS.contains(&parent.kind())
+        };
+        if excluded {
+            return;
+        }
+        if parent.kind() == "call_expression"
+            && child_by_field(parent, "function")
+                .is_some_and(|callee| callee.start_byte() == node.start_byte())
+        {
+            return;
+        }
+        let Some(member) = child_by_field(node, "name") else {
+            return;
+        };
+        let mut receiver = child_by_field(node, "path");
+        if let Some(path) = receiver
+            && path.kind() == "scoped_identifier"
+        {
+            receiver = child_by_field(path, "name");
+        }
+        let Some(receiver) = receiver.filter(|receiver| receiver.kind() == "identifier") else {
+            return;
+        };
+        if !node_text(member, self.source)
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_uppercase())
+        {
+            return;
+        }
+        let mut text = node_text(receiver, self.source);
+        if text == "Self" {
+            text = self
+                .spec
+                .get_receiver_type(node, self.source)
+                .unwrap_or_default();
+        }
+        if is_capitalized_name(&text) {
+            self.push_ref(owner_id, &text, EdgeKind::References, receiver);
         }
     }
 
