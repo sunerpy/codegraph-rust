@@ -7,7 +7,7 @@
     "language": "ruby",
     "line": 9,
     "reference_kind": "calls",
-    "reference_name": "upcase"
+    "reference_name": "message.upcase"
   },
   {
     "candidates": null,
@@ -18,5 +18,15 @@
     "line": 3,
     "reference_kind": "calls",
     "reference_name": "puts"
+  },
+  {
+    "candidates": null,
+    "col": 4,
+    "file_path": "service.rb",
+    "from_node_id": "method:ac1efceb37c260d79e9bbe3f76828698",
+    "language": "ruby",
+    "line": 14,
+    "reference_kind": "calls",
+    "reference_name": "@logger.log"
   }
 ]

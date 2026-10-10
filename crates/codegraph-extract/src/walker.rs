@@ -1627,7 +1627,22 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             }
             return;
         }
-        self.push_ref(&parent_id, &method_name, EdgeKind::Calls, node);
+        // G11 (upstream #2147's extraction half): the receiver stays with the
+        // method, `message.upcase`, so resolution can read what it is; `self`
+        // and `super` leave the bare name, which resolves in the class.
+        let receiver_name = node_text(receiver, self.source);
+        let skip = matches!(receiver_name.as_str(), "self" | "super");
+        let callee = if skip {
+            method_name
+        } else {
+            format!("{receiver_name}.{method_name}")
+        };
+        self.push_ref(&parent_id, &callee, EdgeKind::Calls, node);
+        // A constant receiver (`Formatter.shout`, a class or module method) is
+        // itself a dependency on that constant.
+        if !skip && receiver.kind() == "constant" {
+            self.push_ref(&parent_id, &receiver_name, EdgeKind::References, receiver);
+        }
     }
 
     fn visit_ruby_call_arguments(&mut self, node: SyntaxNode<'tree>) {
@@ -7679,9 +7694,9 @@ end
 
     #[test]
     fn ruby_instance_method_call_records_calls_to_method() {
-        // `logger.log(msg)` → a Calls edge to the METHOD name (`log`), not the
-        // receiver (`logger`). Regression: the pre-#1110 fall-through emitted the
-        // receiver text as the callee.
+        // `logger.log(msg)` → a Calls edge to the method with its receiver
+        // (`logger.log`, G11), never to the receiver alone. Regression: the
+        // pre-#1110 fall-through emitted the receiver text as the callee.
         let src = r#"
 def run(logger, msg)
   logger.log(msg)
@@ -7689,8 +7704,8 @@ end
 "#;
         let (_, refs) = run("i.rb", src, Language::Ruby);
         assert!(
-            has_ref(&refs, EdgeKind::Calls, "log"),
-            "expected Calls edge to method `log`, got: {refs:?}"
+            has_ref(&refs, EdgeKind::Calls, "logger.log"),
+            "expected Calls edge to method `logger.log`, got: {refs:?}"
         );
         assert!(
             !has_ref(&refs, EdgeKind::Calls, "logger"),
@@ -7700,7 +7715,8 @@ end
 
     #[test]
     fn ruby_class_method_call_records_calls_to_method() {
-        // `Foo.bar` (constant receiver = class-method call) → Calls edge to `bar`.
+        // `Foo.bar` (constant receiver = class-method call) → Calls `Foo.bar`,
+        // and a reference to the constant `Foo` (G11).
         let src = r#"
 def run
   Foo.bar(1)
@@ -7708,8 +7724,12 @@ end
 "#;
         let (_, refs) = run("cm.rb", src, Language::Ruby);
         assert!(
-            has_ref(&refs, EdgeKind::Calls, "bar"),
-            "expected Calls edge to class method `bar`, got: {refs:?}"
+            has_ref(&refs, EdgeKind::Calls, "Foo.bar"),
+            "expected Calls edge to class method `Foo.bar`, got: {refs:?}"
+        );
+        assert!(
+            has_ref(&refs, EdgeKind::References, "Foo"),
+            "a constant receiver is a reference: {refs:?}"
         );
     }
 
@@ -7758,7 +7778,7 @@ end
     #[test]
     fn ruby_instance_new_is_calls_not_instantiates() {
         // A NON-constant receiver `.new` (`factory.new`) is an ordinary method
-        // call, not a construction — Calls `new`, never Instantiates.
+        // call, not a construction — Calls `factory.new`, never Instantiates.
         let src = r#"
 def build(factory)
   factory.new
@@ -7766,8 +7786,8 @@ end
 "#;
         let (_, refs) = run("in.rb", src, Language::Ruby);
         assert!(
-            has_ref(&refs, EdgeKind::Calls, "new"),
-            "expected Calls edge to `new`, got: {refs:?}"
+            has_ref(&refs, EdgeKind::Calls, "factory.new"),
+            "expected Calls edge to `factory.new`, got: {refs:?}"
         );
         assert!(
             !has_ref(&refs, EdgeKind::Instantiates, "factory"),
@@ -7777,8 +7797,8 @@ end
 
     #[test]
     fn ruby_chained_call_records_last_method() {
-        // `a.b.c(x)`: receiver is itself a `call` (`a.b`); the OUTER method `c`
-        // is recorded as a Calls edge.
+        // `a.b.c(x)`: receiver is itself a `call` (`a.b`); the OUTER method is
+        // recorded with that receiver, `a.b.c`.
         let src = r#"
 def run(a, x)
   a.b.c(x)
@@ -7786,8 +7806,8 @@ end
 "#;
         let (_, refs) = run("ch.rb", src, Language::Ruby);
         assert!(
-            has_ref(&refs, EdgeKind::Calls, "c"),
-            "expected Calls edge to `c`, got: {refs:?}"
+            has_ref(&refs, EdgeKind::Calls, "a.b.c"),
+            "expected Calls edge to `a.b.c`, got: {refs:?}"
         );
     }
 
@@ -7842,8 +7862,8 @@ Registry.register(Widget.new)
 "#;
         let (_, refs) = run("top.rb", src, Language::Ruby);
         assert!(
-            has_ref(&refs, EdgeKind::Calls, "register"),
-            "expected Calls edge to `register`, got: {refs:?}"
+            has_ref(&refs, EdgeKind::Calls, "Registry.register"),
+            "expected Calls edge to `Registry.register`, got: {refs:?}"
         );
         assert!(
             has_ref(&refs, EdgeKind::Instantiates, "Widget"),
@@ -7854,35 +7874,41 @@ Registry.register(Widget.new)
     #[test]
     fn ruby_nested_call_in_arguments_is_walked() {
         // `logger.log(other.format(x))` inside a method body: the outer call
-        // records `log`, and the nested argument call `format` is still walked
-        // via visit_ruby_call_arguments.
+        // records `logger.log`, and the nested argument call `other.format` is
+        // still walked via visit_ruby_call_arguments.
         let src = r#"
 def run(logger, other, x)
   logger.log(other.format(x))
 end
 "#;
         let (_, refs) = run("na.rb", src, Language::Ruby);
-        assert!(has_ref(&refs, EdgeKind::Calls, "log"), "outer: {refs:?}");
         assert!(
-            has_ref(&refs, EdgeKind::Calls, "format"),
-            "nested argument call `format` must be walked: {refs:?}"
+            has_ref(&refs, EdgeKind::Calls, "logger.log"),
+            "outer: {refs:?}"
+        );
+        assert!(
+            has_ref(&refs, EdgeKind::Calls, "other.format"),
+            "nested argument call `other.format` must be walked: {refs:?}"
         );
     }
 
     #[test]
     fn ruby_nested_call_in_receiver_is_walked() {
         // `factory.build.run`: the receiver of the outer `.run` is itself the
-        // call `factory.build`; walking the receiver records `build` too.
+        // call `factory.build`; walking the receiver records it too.
         let src = r#"
 def go(factory)
   factory.build.run
 end
 "#;
         let (_, refs) = run("nr.rb", src, Language::Ruby);
-        assert!(has_ref(&refs, EdgeKind::Calls, "run"), "outer: {refs:?}");
         assert!(
-            has_ref(&refs, EdgeKind::Calls, "build"),
-            "nested receiver call `build` must be walked: {refs:?}"
+            has_ref(&refs, EdgeKind::Calls, "factory.build.run"),
+            "outer: {refs:?}"
+        );
+        assert!(
+            has_ref(&refs, EdgeKind::Calls, "factory.build"),
+            "nested receiver call `factory.build` must be walked: {refs:?}"
         );
     }
 

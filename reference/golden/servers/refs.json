@@ -337,7 +337,7 @@
     "language": "ruby",
     "line": 1,
     "reference_kind": "calls",
-    "reference_name": "application"
+    "reference_name": "Rails.application"
   },
   {
     "candidates": null,
@@ -347,7 +347,7 @@
     "language": "ruby",
     "line": 1,
     "reference_kind": "calls",
-    "reference_name": "draw"
+    "reference_name": "Rails.application.routes"
   },
   {
     "candidates": null,
@@ -357,7 +357,17 @@
     "language": "ruby",
     "line": 1,
     "reference_kind": "calls",
-    "reference_name": "routes"
+    "reference_name": "Rails.application.routes.draw"
+  },
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "rails/config/routes.rb",
+    "from_node_id": "file:rails/config/routes.rb",
+    "language": "ruby",
+    "line": 1,
+    "reference_kind": "references",
+    "reference_name": "Rails"
   },
   {
     "candidates": null,

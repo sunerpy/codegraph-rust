@@ -38,18 +38,18 @@
   {
     "col": 4,
     "kind": "calls",
-    "line": 14,
+    "line": 15,
     "metadata": {
-      "confidence": 0.9,
-      "resolvedBy": "exact-match"
+      "confidence": 0.85,
+      "resolvedBy": "qualified-name"
     },
     "provenance": null,
     "source": "method:ac1efceb37c260d79e9bbe3f76828698",
-    "target": "method:fb94e9aad5122a4f49414ebab9facc1e"
+    "target": "method:802cce700d42a7eb7209b354d3dddec7"
   },
   {
     "col": 4,
-    "kind": "calls",
+    "kind": "references",
     "line": 15,
     "metadata": {
       "confidence": 0.9,
@@ -57,7 +57,7 @@
     },
     "provenance": null,
     "source": "method:ac1efceb37c260d79e9bbe3f76828698",
-    "target": "method:802cce700d42a7eb7209b354d3dddec7"
+    "target": "class:df596ba5f1f91ca7319d035e74179ec1"
   },
   {
     "col": null,

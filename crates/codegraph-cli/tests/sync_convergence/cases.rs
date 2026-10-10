@@ -442,6 +442,31 @@ pub fn svelte_instance_script_call_edit() -> Case {
         .edge_after("component src/Widget.svelte::Widget", "calls", "function doTeardown")
 }
 
+/// G11: a Ruby call keeps its receiver, so a local built by `Logger.new`
+/// types it (ahead of `Audit`'s same-named methods), and an edit moves the
+/// edge to the other method.
+pub fn ruby_receiver_call_body_edit() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Ruby])
+        .file(
+            "audit.rb",
+            "class Audit\n  def log(m)\n    m\n  end\n\n  def warn(m)\n    m\n  end\nend\n",
+        )
+        .file(
+            "logger.rb",
+            "class Logger\n  def log(m)\n    m\n  end\n\n  def warn(m)\n    m\n  end\nend\n",
+        )
+        .file(
+            "service.rb",
+            "require_relative \"logger\"\n\nclass Service\n  def run\n    lg = Logger.new\n    lg.log(1)\n  end\nend\n",
+        )
+        .write(
+            "service.rb",
+            "require_relative \"logger\"\n\nclass Service\n  def run\n    lg = Logger.new\n    lg.warn(1)\n  end\nend\n",
+        )
+        .edge_before("method Service::run", "calls", "method Logger::log")
+        .edge_after("method Service::run", "calls", "method Logger::warn")
+}
+
 pub fn objc_implementation_body_edit() -> Case {
     Case::new(Change::BodyEdit, &[Language::ObjC])
         .file(
