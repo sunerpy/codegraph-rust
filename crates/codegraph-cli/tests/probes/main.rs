@@ -129,8 +129,10 @@ fn pr0965_vue_import_never_binds_a_svelte_import_node() {
         "component src/App.vue::App" => imports => "import vue @src/Widget.svelte"
     );
     assert_no_edge!(project, "component src/App.vue::App" => imports => "import vue");
-    // The package is not in the project, so the import stays unresolved.
-    assert_unresolved!(project, "component src/App.vue::App" => imports => "vue");
+    assert_no_edge!(project, "file:src/App.vue" => imports => "import vue");
+    // The package is not in the project, so the import stays unresolved, on
+    // the file that holds the component (an SFC's imports are its file's).
+    assert_unresolved!(project, "file:src/App.vue" => imports => "vue");
 }
 
 /// Upstream #2437: a catch-all `"*"` path alias has an empty prefix, which

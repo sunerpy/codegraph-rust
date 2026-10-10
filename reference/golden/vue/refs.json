@@ -31,6 +31,16 @@
   },
   {
     "candidates": null,
+    "col": 4,
+    "file_path": "src/components/Counter.vue",
+    "from_node_id": "file:src/components/Counter.vue",
+    "language": "vue",
+    "line": 24,
+    "reference_kind": "calls",
+    "reference_name": "bump"
+  },
+  {
+    "candidates": null,
     "col": 9,
     "file_path": "src/composables/useCounter.ts",
     "from_node_id": "file:src/composables/useCounter.ts",

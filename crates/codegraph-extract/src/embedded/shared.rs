@@ -208,51 +208,106 @@ pub fn line_start_for(line_starts: &[usize], line_number: i64) -> usize {
         .unwrap_or(0)
 }
 
-pub fn merge_delegated_result(
+/// A single-file component's own file node (upstream `sfcFileNode`): the
+/// whole file, holding the component, with the id every file node has.
+pub fn sfc_file_node(file_path: &str, source: &str, language: Language) -> Node {
+    let mut node = file_like_node(file_path, source, language);
+    node.id = format!("file:{file_path}");
+    node.end_column = 0;
+    node
+}
+
+/// How a component's script block joins it (upstream `ScriptFold`).
+pub struct ScriptFold<'a> {
+    pub file_path: &'a str,
+    pub component_id: &'a str,
+    /// Lines before the block: the block's line 1 is `line_offset + 1`.
+    pub line_offset: i64,
+    pub language: Language,
+    /// The block runs once per component instance: Vue `<script setup>`, a
+    /// Svelte instance script.
+    pub per_instance: bool,
+}
+
+/// Fold a script block's extraction into its component (upstream
+/// `foldScriptResult`, #2268). The SFC has one file node, holding the
+/// component; what the block holds at its top level the component holds,
+/// and a nested symbol keeps its own parent. A per-instance block's
+/// top-level calls and references, a top-level constant's or variable's
+/// initializer's included, are the component's doing; its imports, and
+/// everything a module-level block does, stay with the file.
+pub fn fold_script_result(
     target: &mut ExtractionResult,
     mut delegated: ExtractionResult,
-    parent_id: &str,
-    file_path: &str,
-    language: Language,
-    line_offset: i64,
+    fold: &ScriptFold<'_>,
 ) {
-    let file_ids = delegated
-        .nodes
+    let block_file = format!("file:{}", fold.file_path);
+    let parented: std::collections::HashSet<String> = delegated
+        .edges
         .iter()
-        .filter(|node| node.kind == NodeKind::File)
-        .map(|node| node.id.clone())
-        .collect::<Vec<_>>();
+        .filter(|edge| edge.kind == EdgeKind::Contains && edge.source != block_file)
+        .map(|edge| edge.target.clone())
+        .collect();
+    let instance_values: std::collections::HashSet<String> = if fold.per_instance {
+        delegated
+            .nodes
+            .iter()
+            .filter(|node| matches!(node.kind, NodeKind::Constant | NodeKind::Variable))
+            .filter(|node| !parented.contains(&node.id))
+            .map(|node| node.id.clone())
+            .collect()
+    } else {
+        std::collections::HashSet::new()
+    };
+    let runs_as_component = |id: &str| id == block_file || instance_values.contains(id);
 
     for mut node in delegated.nodes.drain(..) {
         if node.kind == NodeKind::File {
             continue;
         }
-        node.start_line += line_offset;
-        node.end_line += line_offset;
-        node.file_path = file_path.to_string();
-        node.language = language;
-        let node_id = node.id.clone();
+        node.start_line += fold.line_offset;
+        node.end_line += fold.line_offset;
+        node.file_path = fold.file_path.to_string();
+        node.language = fold.language;
+        if !parented.contains(&node.id) {
+            target
+                .edges
+                .push(contains_edge(fold.component_id, &node.id));
+        }
         target.nodes.push(node);
-        target.edges.push(contains_edge(parent_id, &node_id));
     }
 
     for mut edge in delegated.edges.drain(..) {
-        if file_ids.iter().any(|id| id == &edge.target) {
+        if edge.kind == EdgeKind::Contains && edge.source == block_file {
             continue;
         }
-        if file_ids.iter().any(|id| id == &edge.source) {
-            edge.source = parent_id.to_string();
-        }
         if let Some(line) = edge.line.as_mut() {
-            *line += line_offset;
+            *line += fold.line_offset;
+        }
+        // What a top-level value does is the component's; what it holds stays
+        // its own (`const api = { load() {} }` keeps `api::load`).
+        if fold.per_instance
+            && runs_as_component(&edge.source)
+            && !matches!(edge.kind, EdgeKind::Imports | EdgeKind::Contains)
+        {
+            edge.source = fold.component_id.to_string();
         }
         target.edges.push(edge);
     }
 
     for mut reference in delegated.unresolved_references.drain(..) {
-        reference.line += line_offset;
-        reference.file_path = file_path.to_string();
-        reference.language = language;
+        reference.line += fold.line_offset;
+        reference.file_path = fold.file_path.to_string();
+        reference.language = fold.language;
+        if fold.per_instance
+            && runs_as_component(&reference.from_node_id)
+            && matches!(
+                reference.reference_kind,
+                EdgeKind::Calls | EdgeKind::References | EdgeKind::Instantiates
+            )
+        {
+            reference.from_node_id = fold.component_id.to_string();
+        }
         target.unresolved_references.push(reference);
     }
 

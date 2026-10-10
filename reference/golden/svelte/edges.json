@@ -12,6 +12,18 @@
     "target": "function:83965346d145121562cb4ee22ea2660e"
   },
   {
+    "col": 11,
+    "kind": "imports",
+    "line": 8,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "file:src/lib/Widget.svelte",
+    "target": "function:83965346d145121562cb4ee22ea2660e"
+  },
+  {
     "col": 14,
     "kind": "calls",
     "line": 11,
@@ -20,7 +32,43 @@
       "resolvedBy": "import"
     },
     "provenance": null,
-    "source": "variable:e2be970a07d215fc883f52bcbdcfee80",
+    "source": "component:63f1b0690fb7ace4182d2609024aadf5",
+    "target": "function:0b98d06016a836832feba77c5ee38067"
+  },
+  {
+    "col": 2,
+    "kind": "calls",
+    "line": 10,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "component:63f1b0690fb7ace4182d2609024aadf5",
+    "target": "function:83965346d145121562cb4ee22ea2660e"
+  },
+  {
+    "col": 2,
+    "kind": "imports",
+    "line": 8,
+    "metadata": {
+      "confidence": 0.95,
+      "resolvedBy": "qualified-name"
+    },
+    "provenance": null,
+    "source": "file:src/lib/Widget.svelte",
+    "target": "import:2a58e1a83637c28e86d5f72c721328c9"
+  },
+  {
+    "col": 20,
+    "kind": "imports",
+    "line": 8,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "file:src/lib/Widget.svelte",
     "target": "function:0b98d06016a836832feba77c5ee38067"
   },
   {
@@ -58,6 +106,15 @@
     "provenance": null,
     "source": "component:63f1b0690fb7ace4182d2609024aadf5",
     "target": "variable:e2be970a07d215fc883f52bcbdcfee80"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:src/lib/Widget.svelte",
+    "target": "component:63f1b0690fb7ace4182d2609024aadf5"
   },
   {
     "col": null,

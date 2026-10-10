@@ -16,6 +16,18 @@
     "kind": "imports",
     "line": 2,
     "metadata": {
+      "confidence": 0.7,
+      "resolvedBy": "file-path"
+    },
+    "provenance": null,
+    "source": "file:apps/vue/src/router/index.ts",
+    "target": "file:apps/vue/src/views/Home.vue"
+  },
+  {
+    "col": 0,
+    "kind": "imports",
+    "line": 2,
+    "metadata": {
       "confidence": 0.95,
       "resolvedBy": "qualified-name"
     },
@@ -34,18 +46,6 @@
     "provenance": null,
     "source": "file:apps/react-router/src/main.tsx",
     "target": "import:9f815cbc702f9f06380da6de52028444"
-  },
-  {
-    "col": 0,
-    "kind": "imports",
-    "line": 2,
-    "metadata": {
-      "confidence": 0.95,
-      "resolvedBy": "qualified-name"
-    },
-    "provenance": null,
-    "source": "file:apps/vue/src/router/index.ts",
-    "target": "import:45f048c480897bc38ad5a11334228eee"
   },
   {
     "col": 0,
@@ -195,7 +195,7 @@
     },
     "provenance": null,
     "source": "file:apps/vue/src/router/index.ts",
-    "target": "component:1a7b7031523fe7654fa37131da535be3"
+    "target": "file:apps/vue/src/views/Home.vue"
   },
   {
     "col": 9,
@@ -518,6 +518,24 @@
     "line": null,
     "metadata": null,
     "provenance": null,
+    "source": "file:apps/nuxt/pages/index.vue",
+    "target": "component:ba1b120ba0c0a0e3733130855a8a1c17"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:apps/nuxt/pages/users/[id].vue",
+    "target": "component:eacd25434ecfb1c883a35441dd7dd4a0"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
     "source": "file:apps/react-router/src/main.tsx",
     "target": "constant:12853c40af592d62e70d60d7fc689444"
   },
@@ -592,6 +610,24 @@
     "provenance": null,
     "source": "file:apps/react-router/src/pages/Team.tsx",
     "target": "function:5dd4a1bf99112612e8c2797164f02fcc"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:apps/sveltekit/src/routes/(marketing)/about/+page.svelte",
+    "target": "component:1a0676b95db66966c593cf6c182747c4"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:apps/sveltekit/src/routes/+page.svelte",
+    "target": "component:5f34c45ff72fb84793e041a2fb224d56"
   },
   {
     "col": null,
@@ -700,5 +736,23 @@
     "provenance": null,
     "source": "file:apps/vue/src/router/index.ts",
     "target": "import:45f048c480897bc38ad5a11334228eee"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:apps/vue/src/views/About.vue",
+    "target": "component:f03c817073321d2ca5841191b01278d1"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:apps/vue/src/views/Home.vue",
+    "target": "component:1a7b7031523fe7654fa37131da535be3"
   }
 ]

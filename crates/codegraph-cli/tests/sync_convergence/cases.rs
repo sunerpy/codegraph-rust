@@ -422,6 +422,26 @@ pub fn vue_script_function_body_edit() -> Case {
         .edge_after("function go", "calls", "function stop")
 }
 
+/// G9 / upstream #2268: a Svelte instance script's top-level call is the
+/// component's.
+pub fn svelte_instance_script_call_edit() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Svelte, Language::TypeScript])
+        .file(
+            "src/setup.ts",
+            "export function doSetup(): void {}\n\nexport function doTeardown(): void {}\n",
+        )
+        .file(
+            "src/Widget.svelte",
+            "<script lang=\"ts\">\n  import { doSetup, doTeardown } from './setup';\n  doSetup();\n</script>\n\n<p>hi</p>\n",
+        )
+        .write(
+            "src/Widget.svelte",
+            "<script lang=\"ts\">\n  import { doSetup, doTeardown } from './setup';\n  doTeardown();\n</script>\n\n<p>hi</p>\n",
+        )
+        .edge_before("component src/Widget.svelte::Widget", "calls", "function doSetup")
+        .edge_after("component src/Widget.svelte::Widget", "calls", "function doTeardown")
+}
+
 pub fn objc_implementation_body_edit() -> Case {
     Case::new(Change::BodyEdit, &[Language::ObjC])
         .file(
@@ -575,7 +595,9 @@ pub fn svelte_rename_an_imported_function() -> Case {
             "src/format.ts",
             "export function tidyName(name: string): string {\n  return name.trim();\n}\n",
         )
-        .edge_before("constant shown", "calls", "function formatName")
+        // An instance script's top-level constant's initializer is the
+        // component's call (upstream #2268).
+        .edge_before("component src/Hello.svelte::Hello", "calls", "function formatName")
 }
 
 pub fn pascal_rename_a_unit_function() -> Case {

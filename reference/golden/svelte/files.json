@@ -4,7 +4,7 @@
     "errors": null,
     "generated": 0,
     "language": "svelte",
-    "node_count": 5,
+    "node_count": 6,
     "path": "src/lib/Widget.svelte",
     "size": 303
   },

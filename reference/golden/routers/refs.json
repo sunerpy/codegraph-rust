@@ -151,6 +151,16 @@
   },
   {
     "candidates": null,
+    "col": 0,
+    "file_path": "apps/vue/src/views/Home.vue",
+    "from_node_id": "file:apps/vue/src/views/Home.vue",
+    "language": "vue",
+    "line": 3,
+    "reference_kind": "imports",
+    "reference_name": "vue-router"
+  },
+  {
+    "candidates": null,
     "col": 10,
     "file_path": "apps/expo/app/_layout.tsx",
     "from_node_id": "function:d16a883860241c55bdc8506906d752d9",
@@ -212,6 +222,16 @@
   {
     "candidates": null,
     "col": 11,
+    "file_path": "apps/sveltekit/src/routes/+page.svelte",
+    "from_node_id": "file:apps/sveltekit/src/routes/+page.svelte",
+    "language": "svelte",
+    "line": 2,
+    "reference_kind": "imports",
+    "reference_name": "goto"
+  },
+  {
+    "candidates": null,
+    "col": 11,
     "file_path": "apps/vue/src/router/index.ts",
     "from_node_id": "constant:aae634828e679bd138fccffb08050d6b",
     "language": "typescript",
@@ -233,7 +253,7 @@
     "candidates": null,
     "col": 14,
     "file_path": "apps/nuxt/pages/users/[id].vue",
-    "from_node_id": "constant:d7a8d34fa1fce6ecb20fd36b87bc7726",
+    "from_node_id": "component:eacd25434ecfb1c883a35441dd7dd4a0",
     "language": "vue",
     "line": 3,
     "reference_kind": "calls",
@@ -258,6 +278,16 @@
     "line": 17,
     "reference_kind": "calls",
     "reference_name": "useNavigate"
+  },
+  {
+    "candidates": null,
+    "col": 2,
+    "file_path": "apps/sveltekit/src/routes/+page.svelte",
+    "from_node_id": "file:apps/sveltekit/src/routes/+page.svelte",
+    "language": "svelte",
+    "line": 2,
+    "reference_kind": "imports",
+    "reference_name": "$app/navigation"
   },
   {
     "candidates": null,
@@ -348,6 +378,16 @@
     "line": 1,
     "reference_kind": "imports",
     "reference_name": "createWebHistory"
+  },
+  {
+    "candidates": null,
+    "col": 24,
+    "file_path": "apps/nuxt/pages/users/[id].vue",
+    "from_node_id": "component:eacd25434ecfb1c883a35441dd7dd4a0",
+    "language": "vue",
+    "line": 4,
+    "reference_kind": "function_ref",
+    "reference_name": "params.id"
   },
   {
     "candidates": null,
@@ -728,5 +768,15 @@
     "line": 17,
     "reference_kind": "calls",
     "reference_name": "router.push"
+  },
+  {
+    "candidates": null,
+    "col": 9,
+    "file_path": "apps/vue/src/views/Home.vue",
+    "from_node_id": "file:apps/vue/src/views/Home.vue",
+    "language": "vue",
+    "line": 3,
+    "reference_kind": "imports",
+    "reference_name": "RouterLink"
   }
 ]

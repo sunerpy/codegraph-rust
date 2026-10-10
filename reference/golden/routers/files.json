@@ -112,7 +112,7 @@
     "errors": null,
     "generated": 0,
     "language": "vue",
-    "node_count": 2,
+    "node_count": 3,
     "path": "apps/nuxt/pages/index.vue",
     "size": 149
   },
@@ -121,7 +121,7 @@
     "errors": null,
     "generated": 0,
     "language": "vue",
-    "node_count": 3,
+    "node_count": 4,
     "path": "apps/nuxt/pages/users/[id].vue",
     "size": 126
   },
@@ -166,7 +166,7 @@
     "errors": null,
     "generated": 0,
     "language": "svelte",
-    "node_count": 1,
+    "node_count": 2,
     "path": "apps/sveltekit/src/routes/(marketing)/about/+page.svelte",
     "size": 15
   },
@@ -175,7 +175,7 @@
     "errors": null,
     "generated": 0,
     "language": "svelte",
-    "node_count": 3,
+    "node_count": 4,
     "path": "apps/sveltekit/src/routes/+page.svelte",
     "size": 146
   },
@@ -220,7 +220,7 @@
     "errors": null,
     "generated": 0,
     "language": "vue",
-    "node_count": 1,
+    "node_count": 2,
     "path": "apps/vue/src/views/About.vue",
     "size": 69
   },
@@ -229,7 +229,7 @@
     "errors": null,
     "generated": 0,
     "language": "vue",
-    "node_count": 2,
+    "node_count": 3,
     "path": "apps/vue/src/views/Home.vue",
     "size": 140
   }

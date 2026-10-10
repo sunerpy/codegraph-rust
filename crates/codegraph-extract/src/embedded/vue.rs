@@ -5,7 +5,9 @@ use codegraph_core::types::{
 use regex::Regex;
 use std::path::Path;
 
-use crate::embedded::shared::{empty_result, merge_delegated_result};
+use crate::embedded::shared::{
+    ScriptFold, contains_edge, empty_result, fold_script_result, sfc_file_node,
+};
 
 // Vue built-in components to skip
 fn is_vue_builtin(name: &str) -> bool {
@@ -40,7 +42,7 @@ fn kebab_to_pascal(name: &str) -> String {
 struct ScriptBlock {
     content: String,
     line_offset: i64, // 0-indexed original .vue line containing content byte 0
-    _is_setup: bool,
+    is_setup: bool,
     is_typescript: bool,
 }
 
@@ -68,8 +70,12 @@ impl<'a> VueExtractor<'a> {
     pub fn extract(mut self) -> ExtractionResult {
         let start_time = std::time::Instant::now();
 
+        // The SFC's one file node holds the component (upstream #2268).
+        let file_node = sfc_file_node(self.file_path, self.source, Language::Vue);
         let component_node = self.create_component_node();
         let component_id = component_node.id.clone();
+        self.edges.push(contains_edge(&file_node.id, &component_id));
+        self.nodes.push(file_node);
         self.nodes.push(component_node);
 
         let script_blocks = self.extract_script_blocks();
@@ -152,7 +158,7 @@ impl<'a> VueExtractor<'a> {
             blocks.push(ScriptBlock {
                 content: content.to_string(),
                 line_offset: content_line_offset as i64,
-                _is_setup: is_setup,
+                is_setup,
                 is_typescript,
             });
         }
@@ -161,8 +167,9 @@ impl<'a> VueExtractor<'a> {
     }
 
     /// A script block is extracted by the TypeScript (or JavaScript)
-    /// extractor, as upstream's Vue extractor delegates it (G8), and its
-    /// result joins the component at the block's file lines.
+    /// extractor, as upstream's Vue extractor delegates it (G8), and folded
+    /// into the component at the block's file lines; `<script setup>` runs
+    /// per component instance.
     fn process_script_block(&mut self, block: &ScriptBlock, component_id: &str) {
         let language = if block.is_typescript {
             Language::TypeScript
@@ -172,13 +179,16 @@ impl<'a> VueExtractor<'a> {
         let delegated =
             crate::engine::extract_source(self.file_path, &block.content, Some(language));
         let mut merged = empty_result(0);
-        merge_delegated_result(
+        fold_script_result(
             &mut merged,
             delegated,
-            component_id,
-            self.file_path,
-            Language::Vue,
-            block.line_offset,
+            &ScriptFold {
+                file_path: self.file_path,
+                component_id,
+                line_offset: block.line_offset,
+                language: Language::Vue,
+                per_instance: block.is_setup,
+            },
         );
         self.nodes.append(&mut merged.nodes);
         self.edges.append(&mut merged.edges);
