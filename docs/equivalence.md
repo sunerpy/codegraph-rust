@@ -184,11 +184,12 @@ Every intentional golden change is recorded here with the commit, the corpora
 and artifacts it changed, why the graph change is intended, and the command
 that regenerated it. Older regenerations are described in each corpus section.
 
-| Commit                                                                                        | Corpus                                                              | Artifacts                | Intent                                                                                                                               | Command                                                                                                           |
-| --------------------------------------------------------------------------------------------- | ------------------------------------------------------------------- | ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------- |
-| `test(bench): add C#, Java, Swift, ObjC, PHP, Vue, Svelte, Python-bases and CommonJS corpora` | csharp, java, swift, objc, php, vue, svelte, python_bases, commonjs | all (new corpora)        | baseline capture of the current extraction and resolution, including the misses later commits correct                                | `scripts/regen-goldens.sh --write csharp java swift objc php vue svelte python_bases commonjs`                    |
-| `test(bench): add router, server, mobile and synthesis corpora`                               | routers, servers, mobile, synthesis                                 | all (new corpora)        | baseline capture of today's framework and synthesis output ahead of the framework resolvers and synthesis passes                     | `scripts/regen-goldens.sh --write routers servers mobile synthesis`                                               |
-| `feat(store): add schema 9 for synthesis inputs and move the extraction version to 22`        | every corpus, plus `reference/golden/colby.schema.sql`              | `schema.sql`, `colby.db` | schema 9 adds the `synthesis_inputs` table and the `idx_edges_synthesis_site` index; the canonical JSON of every corpus is unchanged | `scripts/regen-goldens.sh --write <every re-indexable corpus>`, then `scripts/regen-goldens.sh --mini-transplant` |
+| Commit                                                                                        | Corpus                                                              | Artifacts                | Intent                                                                                                                                   | Command                                                                                                           |
+| --------------------------------------------------------------------------------------------- | ------------------------------------------------------------------- | ------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
+| `test(bench): add C#, Java, Swift, ObjC, PHP, Vue, Svelte, Python-bases and CommonJS corpora` | csharp, java, swift, objc, php, vue, svelte, python_bases, commonjs | all (new corpora)        | baseline capture of the current extraction and resolution, including the misses later commits correct                                    | `scripts/regen-goldens.sh --write csharp java swift objc php vue svelte python_bases commonjs`                    |
+| `test(bench): add router, server, mobile and synthesis corpora`                               | routers, servers, mobile, synthesis                                 | all (new corpora)        | baseline capture of today's framework and synthesis output ahead of the framework resolvers and synthesis passes                         | `scripts/regen-goldens.sh --write routers servers mobile synthesis`                                               |
+| `test(bench): seed the PHP, CommonJS and mobile corpora with the shapes W0-06 requires`       | php, commonjs, mobile                                               | all                      | baseline capture of a `static::` call, `require().member` and a Flutter `pubspec.yaml` app; each adds rows only, no existing row changes | `scripts/regen-goldens.sh --write php commonjs mobile`                                                            |
+| `feat(store): add schema 9 for synthesis inputs and move the extraction version to 22`        | every corpus, plus `reference/golden/colby.schema.sql`              | `schema.sql`, `colby.db` | schema 9 adds the `synthesis_inputs` table and the `idx_edges_synthesis_site` index; the canonical JSON of every corpus is unchanged     | `scripts/regen-goldens.sh --write <every re-indexable corpus>`, then `scripts/regen-goldens.sh --mini-transplant` |
 
 The canonicalizer strips inherently unstable timestamp columns
 (`nodes.updated_at`, `files.modified_at`, `files.indexed_at`), parses JSON text
@@ -1118,7 +1119,7 @@ correction shows up as a diff attributable to one change:
 - **`objc`**: `@interface Sub : Base <Doer>`, message sends to `self`, `super`
   and a class, and a plain C call inside a method.
 - **`php`**: namespaces with `use` imports, `extends`/`implements`,
-  `$this`/`self`/`parent` calls, calls written after `=>` in an array literal, a
+  `$this`/`self`/`static`/`parent` calls, calls written after `=>` in an array literal, a
   case-variant call to a global function, and a namespace-qualified class name
   (`Field\FirstName::make()`).
 - **`vue`**: a `<script setup>` component calling an imported composable and a
@@ -1143,8 +1144,9 @@ corpus.
 
 Four multi-project corpora give the framework resolvers and the synthesis passes
 a baseline before they land. Each project directory carries the manifest that
-framework detection reads (`package.json`, `pom.xml`, `composer.json`,
-`Gemfile`, `*.csproj`, `Package.swift`, `Cargo.toml`, `go.mod`, `build.sbt`),
+framework detection reads (`package.json`, `pom.xml`, `pubspec.yaml`,
+`composer.json`, `Gemfile`, `*.csproj`, `Package.swift`, `Cargo.toml`, `go.mod`,
+`build.sbt`),
 and the projects deliberately share symbol names, so name matching that crosses
 project boundaries is visible in the golden:
 
@@ -1161,7 +1163,8 @@ project boundaries is visible in the golden:
 - **`mobile`**: React Native native modules (Java and Objective-C halves, an
   event name held in a constant, a `requireNativeComponent` view), an Expo
   module (Swift and Kotlin definitions called through `requireNativeModule`),
-  and a Swift class called from Objective-C.
+  a Swift class called from Objective-C, and a Flutter app whose
+  `pubspec.yaml` names the Flutter SDK.
 - **`synthesis`**: an event emitter and a handler table, a React component that
   re-renders a child, Redux Toolkit and Pinia stores, Go interface embedding with
   implicit implementations, a type alias and a defined type, a C function-pointer

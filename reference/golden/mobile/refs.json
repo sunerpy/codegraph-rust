@@ -11,6 +11,26 @@
   },
   {
     "candidates": null,
+    "col": 11,
+    "file_path": "flutter/lib/main.dart",
+    "from_node_id": "method:06cc27db07d4944f8a4f2dccba77e661",
+    "language": "dart",
+    "line": 10,
+    "reference_kind": "calls",
+    "reference_name": "MaterialApp"
+  },
+  {
+    "candidates": null,
+    "col": 15,
+    "file_path": "flutter/lib/main.dart",
+    "from_node_id": "function:50a37489458bbc7176f70d6d71b158e3",
+    "language": "dart",
+    "line": 3,
+    "reference_kind": "calls",
+    "reference_name": "runApp"
+  },
+  {
+    "candidates": null,
     "col": 16,
     "file_path": "rn/src/Camera.tsx",
     "from_node_id": "constant:1e0d4a36cc226cb0db4993c763f554e4",
@@ -18,6 +38,16 @@
     "line": 5,
     "reference_kind": "instantiates",
     "reference_name": "NativeEventEmitter"
+  },
+  {
+    "candidates": null,
+    "col": 2,
+    "file_path": "flutter/lib/main.dart",
+    "from_node_id": "method:06cc27db07d4944f8a4f2dccba77e661",
+    "language": "dart",
+    "line": 8,
+    "reference_kind": "decorates",
+    "reference_name": "override"
   },
   {
     "candidates": null,
@@ -61,6 +91,16 @@
   },
   {
     "candidates": null,
+    "col": 23,
+    "file_path": "flutter/lib/main.dart",
+    "from_node_id": "class:18d5cdc4c3c6e9e4170973689ae3ed4e",
+    "language": "dart",
+    "line": 5,
+    "reference_kind": "extends",
+    "reference_name": "StatelessWidget"
+  },
+  {
+    "candidates": null,
     "col": 26,
     "file_path": "expo-modules/ios/HelloModule.swift",
     "from_node_id": "class:6f54d95ed9c790af0ac11c4f615b0b98",
@@ -78,6 +118,16 @@
     "line": 7,
     "reference_kind": "calls",
     "reference_name": "requireNativeComponent"
+  },
+  {
+    "candidates": null,
+    "col": 29,
+    "file_path": "flutter/lib/main.dart",
+    "from_node_id": "method:06cc27db07d4944f8a4f2dccba77e661",
+    "language": "dart",
+    "line": 10,
+    "reference_kind": "calls",
+    "reference_name": "Scaffold"
   },
   {
     "candidates": null,
@@ -218,6 +268,16 @@
     "line": 13,
     "reference_kind": "decorates",
     "reference_name": "ReactMethod"
+  },
+  {
+    "candidates": null,
+    "col": 44,
+    "file_path": "flutter/lib/main.dart",
+    "from_node_id": "method:06cc27db07d4944f8a4f2dccba77e661",
+    "language": "dart",
+    "line": 10,
+    "reference_kind": "calls",
+    "reference_name": "Text"
   },
   {
     "candidates": null,

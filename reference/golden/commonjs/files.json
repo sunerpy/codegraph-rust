@@ -18,6 +18,15 @@
     "size": 358
   },
   {
+    "content_hash": "62ed0e8252cccf9a16a43e7be30b934159e03fd6bdfb3332c12b8908dc7be217",
+    "errors": null,
+    "generated": 0,
+    "language": "javascript",
+    "node_count": 3,
+    "path": "lib/chain.js",
+    "size": 146
+  },
+  {
     "content_hash": "97553bcf137c9ed3b6f14e8803b80e20825c11954150346751c380cf458f3905",
     "errors": null,
     "generated": 0,

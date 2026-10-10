@@ -41,6 +41,16 @@
   },
   {
     "candidates": null,
+    "col": 13,
+    "file_path": "lib/chain.js",
+    "from_node_id": "constant:d1e8e25413dba4bd9610a6cec8d1f667",
+    "language": "javascript",
+    "line": 3,
+    "reference_kind": "calls",
+    "reference_name": "require"
+  },
+  {
+    "candidates": null,
     "col": 16,
     "file_path": "test/app.test.js",
     "from_node_id": "constant:a207c2fcdb3b1eb8b6d19351164ebb49",
@@ -98,6 +108,26 @@
     "line": 9,
     "reference_kind": "calls",
     "reference_name": "util.wrap"
+  },
+  {
+    "candidates": null,
+    "col": 9,
+    "file_path": "lib/chain.js",
+    "from_node_id": "function:cfde938b4e2a0395239b945699803212",
+    "language": "javascript",
+    "line": 6,
+    "reference_kind": "calls",
+    "reference_name": "require"
+  },
+  {
+    "candidates": null,
+    "col": 9,
+    "file_path": "lib/chain.js",
+    "from_node_id": "function:cfde938b4e2a0395239b945699803212",
+    "language": "javascript",
+    "line": 6,
+    "reference_kind": "calls",
+    "reference_name": "require().title"
   },
   {
     "candidates": null,

@@ -45,6 +45,24 @@
     "size": 191
   },
   {
+    "content_hash": "da5d96c2180cbc1d6a4e010b807d498f5d222a01da6eeef478ed7a34c2e0441a",
+    "errors": null,
+    "generated": 0,
+    "language": "dart",
+    "node_count": 6,
+    "path": "flutter/lib/main.dart",
+    "size": 321
+  },
+  {
+    "content_hash": "e3ecfb1187c2edfd49ecd5f715a901ef95876c39e8e83ecfc8c0b775ac5def2f",
+    "errors": null,
+    "generated": 0,
+    "language": "yaml",
+    "node_count": 0,
+    "path": "flutter/pubspec.yaml",
+    "size": 213
+  },
+  {
     "content_hash": "47e43d86482970653ed8a5c8ab3a0c7cbfaadcb94cad1a63a9c40032a26db136",
     "errors": null,
     "generated": 0,

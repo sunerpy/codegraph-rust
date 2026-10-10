@@ -62,6 +62,18 @@
     "target": "method:7581b0f9f2147fb086aa7bdc323a353c"
   },
   {
+    "col": 35,
+    "kind": "calls",
+    "line": 6,
+    "metadata": {
+      "confidence": 0.4,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "function:cfde938b4e2a0395239b945699803212",
+    "target": "constant:d1e8e25413dba4bd9610a6cec8d1f667"
+  },
+  {
     "col": 4,
     "kind": "calls",
     "line": 10,
@@ -138,6 +150,24 @@
     "provenance": null,
     "source": "file:lib/app.js",
     "target": "function:feb3ac5a0a28894758fdc7dbbd267c67"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:lib/chain.js",
+    "target": "constant:d1e8e25413dba4bd9610a6cec8d1f667"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:lib/chain.js",
+    "target": "function:cfde938b4e2a0395239b945699803212"
   },
   {
     "col": null,

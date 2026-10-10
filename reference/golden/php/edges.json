@@ -38,6 +38,30 @@
   {
     "col": 15,
     "kind": "calls",
+    "line": 14,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "method:7f84e20518eed0e977aca22917c042b4",
+    "target": "method:e6bddc97c9c9c187daba700a47a2189c"
+  },
+  {
+    "col": 15,
+    "kind": "calls",
+    "line": 19,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "method:0f46df92e935bc6ec0755a35aa0a0744",
+    "target": "method:54a244e9b2983af5ed03edcd91f27ab9"
+  },
+  {
+    "col": 15,
+    "kind": "calls",
     "line": 19,
     "metadata": {
       "confidence": 0.9,
@@ -143,6 +167,33 @@
     "line": null,
     "metadata": null,
     "provenance": null,
+    "source": "class:4a5a584db1e132f1566e3f2166285884",
+    "target": "method:0f46df92e935bc6ec0755a35aa0a0744"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "class:4a5a584db1e132f1566e3f2166285884",
+    "target": "method:7f84e20518eed0e977aca22917c042b4"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "class:4a5a584db1e132f1566e3f2166285884",
+    "target": "method:e6bddc97c9c9c187daba700a47a2189c"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
     "source": "class:82ee0565e7bb3f0efd92d1ef50aa4660",
     "target": "method:eb71c0f01dd64f14e6a9c61109c8dd41"
   },
@@ -233,6 +284,15 @@
     "line": null,
     "metadata": null,
     "provenance": null,
+    "source": "file:src/Field/Registry.php",
+    "target": "namespace:4995736d6bee7202362469b09a462331"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
     "source": "file:src/Util/helpers.php",
     "target": "function:2c3e0ea1a203fedfce0fee1a81132f72"
   },
@@ -271,6 +331,15 @@
     "provenance": null,
     "source": "namespace:087cd3f8e35861feacdc40e7dc9d886f",
     "target": "class:158122603a9ae3fc9141a03774beaf92"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "namespace:4995736d6bee7202362469b09a462331",
+    "target": "class:4a5a584db1e132f1566e3f2166285884"
   },
   {
     "col": null,

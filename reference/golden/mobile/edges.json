@@ -68,6 +68,18 @@
       "resolvedBy": "qualified-name"
     },
     "provenance": null,
+    "source": "file:flutter/lib/main.dart",
+    "target": "import:cd03561180ffc6f283258db1260f4b63"
+  },
+  {
+    "col": 0,
+    "kind": "imports",
+    "line": 1,
+    "metadata": {
+      "confidence": 0.95,
+      "resolvedBy": "qualified-name"
+    },
+    "provenance": null,
     "source": "file:rn/ios/CameraModule.m",
     "target": "import:a05843af9cf5d99d3eac34baf66f7bf7"
   },
@@ -180,6 +192,18 @@
     "target": "class:3a57e87d807eb4d2915da3f5943b6ea0"
   },
   {
+    "col": 49,
+    "kind": "calls",
+    "line": 10,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "method:06cc27db07d4944f8a4f2dccba77e661",
+    "target": "function:116f45884b2ffee2c7ac312e837c6a6e"
+  },
+  {
     "col": 6,
     "kind": "calls",
     "line": 11,
@@ -190,6 +214,15 @@
     "provenance": null,
     "source": "method:7213bf39d4184600fdceed846162834b",
     "target": "function:1d9953b5c1201319ca07a6f3ef6e3c80"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "class:18d5cdc4c3c6e9e4170973689ae3ed4e",
+    "target": "method:06cc27db07d4944f8a4f2dccba77e661"
   },
   {
     "col": null,
@@ -361,6 +394,42 @@
     "provenance": null,
     "source": "file:expo-modules/src/index.ts",
     "target": "import:3d0084b775fca6e0e2d625a6f1eccd38"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:flutter/lib/main.dart",
+    "target": "class:18d5cdc4c3c6e9e4170973689ae3ed4e"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:flutter/lib/main.dart",
+    "target": "function:116f45884b2ffee2c7ac312e837c6a6e"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:flutter/lib/main.dart",
+    "target": "function:50a37489458bbc7176f70d6d71b158e3"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:flutter/lib/main.dart",
+    "target": "import:cd03561180ffc6f283258db1260f4b63"
   },
   {
     "col": null,

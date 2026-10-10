@@ -27,6 +27,15 @@
     "size": 397
   },
   {
+    "content_hash": "6681b278205a802958bfc3fec1f2ec391cc83b607c4d0e38a7aa3824ed8e4c93",
+    "errors": null,
+    "generated": 0,
+    "language": "php",
+    "node_count": 6,
+    "path": "src/Field/Registry.php",
+    "size": 320
+  },
+  {
     "content_hash": "4d47dfae3beafc8a685ce19fd495a298397cdc896e61255e14fc851049a30e6f",
     "errors": null,
     "generated": 0,

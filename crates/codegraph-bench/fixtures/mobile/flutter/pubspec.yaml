@@ -1,0 +1,11 @@
+name: hello_flutter
+description: A Flutter app the mobile corpus uses to trigger Flutter detection.
+publish_to: none
+version: 1.0.0
+
+environment:
+  sdk: ">=3.0.0 <4.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
