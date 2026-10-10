@@ -132,3 +132,72 @@ fn pr0965_vue_import_never_binds_a_svelte_import_node() {
     // The package is not in the project, so the import stays unresolved.
     assert_unresolved!(project, "component src/App.vue::App" => imports => "vue");
 }
+
+/// Upstream #2437: a catch-all `"*"` path alias has an empty prefix, which
+/// every package specifier starts with. Matching it no longer makes
+/// `@mui/material` or `react` look local, so neither the import nor the
+/// supertype binds the project's same-named symbol. (A `calls` or
+/// `references` ref through an out-of-repo import is the wider #2134 gate.)
+#[test]
+fn pr2437_catch_all_alias_keeps_package_imports_external() {
+    let project = Project::new()
+        .file(
+            "tsconfig.json",
+            "{\n  \"compilerOptions\": {\n    \"baseUrl\": \".\",\n    \"paths\": { \"*\": [\"./typings/*\"] }\n  }\n}\n",
+        )
+        .file(
+            "src/Typography.tsx",
+            "export function Typography(props: { text: string }) {\n  return <span>{props.text}</span>;\n}\n",
+        )
+        .file("src/Component.ts", "export class Component {}\n")
+        .file(
+            "src/App.tsx",
+            "import { Typography } from '@mui/material';\n\nexport function App() {\n  return <Typography variant=\"h1\" />;\n}\n",
+        )
+        .file(
+            "src/Widget.ts",
+            "import { Component } from 'react';\n\nexport class Widget extends Component {}\n",
+        )
+        .file(
+            "src/Page.tsx",
+            "import { Typography } from './Typography';\n\nexport function Page() {\n  return <Typography text=\"hi\" />;\n}\n",
+        )
+        .index();
+
+    assert_no_edge!(project, "file:src/App.tsx" => imports => "function Typography");
+    assert_no_edge!(project, "class Widget" => extends => "class Component");
+    assert_unresolved!(project, "class Widget" => extends => "Component");
+    // The project's own import still resolves.
+    assert_edge!(
+        project,
+        "file:src/Page.tsx" => imports => "function Typography @src/Typography.tsx",
+        resolved_by = "import",
+    );
+}
+
+/// Upstream #2437: an alias that lands on disk outside the index (here in
+/// `node_modules`) does not make the import the project's either.
+#[test]
+fn pr2437_alias_into_node_modules_keeps_the_import_external() {
+    let project = Project::new()
+        .file(
+            "tsconfig.json",
+            "{\n  \"compilerOptions\": {\n    \"baseUrl\": \".\",\n    \"paths\": { \"lit/format\": [\"./node_modules/lit/format.js\"] }\n  }\n}\n",
+        )
+        .file(
+            "node_modules/lit/format.js",
+            "export function format(value) { return String(value); }\n",
+        )
+        .file(
+            "src/util.ts",
+            "export function format(value: number): string {\n  return value.toFixed(2);\n}\n",
+        )
+        .file(
+            "src/card.ts",
+            "import { format } from 'lit/format';\n\nexport function render(): string {\n  return format(1);\n}\n",
+        )
+        .index();
+
+    assert_no_edge!(project, "file:src/card.ts" => imports => "function format");
+    assert_unresolved!(project, "file:src/card.ts" => imports => "format");
+}

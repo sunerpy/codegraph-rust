@@ -510,6 +510,12 @@ impl ResolutionContext for SnapshotResolutionContext {
         })
     }
 
+    fn is_indexed_file(&self, file_path: &str) -> bool {
+        self.snapshot
+            .known_file_paths
+            .contains(&file_path.replace('\\', "/"))
+    }
+
     fn read_file(&self, file_path: &str) -> Option<String> {
         self.read_file_cached(file_path)
             .as_deref()
@@ -834,6 +840,9 @@ mod tests {
         assert!(ctx.file_exists("a.ts"));
         assert!(ctx.file_exists("ondisk.ts"));
         assert!(!ctx.file_exists("nowhere.ts"));
+        // Only the index's own files are indexed; the disk fallback is not.
+        assert!(ctx.is_indexed_file("a.ts"));
+        assert!(!ctx.is_indexed_file("ondisk.ts"));
         assert!(
             !ctx.file_exists(&format!(
                 "../{}/secret.ts",

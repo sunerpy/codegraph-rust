@@ -900,6 +900,35 @@ pub fn php_use_of_a_namespace_gains_a_same_named_import_elsewhere() -> Case {
         )
 }
 
+/// Upstream #2437: a catch-all `"*"` path alias does not make a package
+/// import local, so a project component that appears with the package's name
+/// is no target for it, while the project's own import of it resolves.
+pub fn tsx_catch_all_alias_ignores_a_same_named_project_component() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Tsx])
+        .file(
+            "tsconfig.json",
+            "{\n  \"compilerOptions\": {\n    \"baseUrl\": \".\",\n    \"paths\": { \"*\": [\"./typings/*\"] }\n  }\n}\n",
+        )
+        .file(
+            "src/App.tsx",
+            "import { Typography } from '@mui/material';\n\nexport function App() {\n  return <Typography variant=\"h1\" />;\n}\n",
+        )
+        .file(
+            "src/Page.tsx",
+            "import { Typography } from './Typography';\n\nexport function Page() {\n  return <Typography text=\"hi\" />;\n}\n",
+        )
+        .write(
+            "src/Typography.tsx",
+            "export function Typography(props: { text: string }) {\n  return <span>{props.text}</span>;\n}\n",
+        )
+        .edge_after(
+            "file:src/Page.tsx",
+            "imports",
+            "function Typography @src/Typography.tsx",
+        )
+        .no_edge_after("file:src/App.tsx", "imports", "function Typography")
+}
+
 /// The index root's `config.toml` is a watcher control file: the watcher
 /// reloads its scope and reconciles the whole project.
 pub fn typescript_config_toml_excludes_a_competitor() -> Case {

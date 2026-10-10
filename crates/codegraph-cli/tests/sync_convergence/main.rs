@@ -104,6 +104,7 @@ pub struct Case {
     edit: Vec<Op>,
     edges_before: Vec<EdgeSpec>,
     edges_after: Vec<EdgeSpec>,
+    absent_after: Vec<EdgeSpec>,
 }
 
 impl Case {
@@ -117,6 +118,7 @@ impl Case {
             edit: Vec::new(),
             edges_before: Vec::new(),
             edges_after: Vec::new(),
+            absent_after: Vec::new(),
         }
     }
 
@@ -163,6 +165,18 @@ impl Case {
         target: &'static str,
     ) -> Self {
         self.edges_after.push((source, kind, target));
+        self
+    }
+
+    /// An edge a fresh index of the final tree must NOT hold, between nodes it
+    /// does hold.
+    pub fn no_edge_after(
+        mut self,
+        source: &'static str,
+        kind: &'static str,
+        target: &'static str,
+    ) -> Self {
+        self.absent_after.push((source, kind, target));
         self
     }
 
@@ -271,6 +285,7 @@ fn run_case(name: &str, case: &Case) {
         })
         .index();
     expect_edges(name, "fresh", fresh.graph(), &case.edges_after);
+    expect_no_edges(name, "fresh", fresh.graph(), &case.absent_after);
     languages.extend(indexed_languages(fresh.graph()));
     for language in &case.languages {
         assert!(
@@ -350,6 +365,26 @@ fn expect_edges(name: &str, label: &str, graph: &Graph, edges: &[EdgeSpec]) {
             !graph.edges_matching(source, kind, target).is_empty(),
             "[{name}] the {label} index lacks {source} -[{kind}]-> {target}, which this case \
              exists to exercise\n{}",
+            graph.report()
+        );
+    }
+}
+
+#[track_caller]
+fn expect_no_edges(name: &str, label: &str, graph: &Graph, edges: &[EdgeSpec]) {
+    for &(source, kind, target) in edges {
+        for selector in [source, target] {
+            assert!(
+                !graph.nodes_matching(selector).is_empty(),
+                "[{name}] the {label} index has no `{selector}`, so the absence of \
+                 {source} -[{kind}]-> {target} would hold vacuously\n{}",
+                graph.report()
+            );
+        }
+        assert!(
+            graph.edges_matching(source, kind, target).is_empty(),
+            "[{name}] the {label} index holds {source} -[{kind}]-> {target}, which this case \
+             exists to rule out\n{}",
             graph.report()
         );
     }
@@ -573,6 +608,7 @@ matrix! {
     ruby_add_a_same_named_competitor,
     php_add_a_same_named_competitor,
     php_use_of_a_namespace_gains_a_same_named_import_elsewhere,
+    tsx_catch_all_alias_ignores_a_same_named_project_component,
     typescript_config_toml_excludes_a_competitor,
     python_root_gitignore_hides_a_competitor,
     python_repository_exclude_hides_a_competitor,
