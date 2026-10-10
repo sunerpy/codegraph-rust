@@ -1,0 +1,562 @@
+[
+  {
+    "candidates": null,
+    "col": 10,
+    "file_path": "apps/expo/app/_layout.tsx",
+    "from_node_id": "function:d16a883860241c55bdc8506906d752d9",
+    "language": "tsx",
+    "line": 4,
+    "reference_kind": "references",
+    "reference_name": "Stack"
+  },
+  {
+    "candidates": null,
+    "col": 10,
+    "file_path": "apps/expo/app/index.tsx",
+    "from_node_id": "function:f635ab08203e0ff853aa7eaa5276ccc9",
+    "language": "tsx",
+    "line": 5,
+    "reference_kind": "references",
+    "reference_name": "Button"
+  },
+  {
+    "candidates": null,
+    "col": 10,
+    "file_path": "apps/expo/app/settings.tsx",
+    "from_node_id": "function:1f24522fd6944eca56c6841beba30994",
+    "language": "tsx",
+    "line": 4,
+    "reference_kind": "references",
+    "reference_name": "Text"
+  },
+  {
+    "candidates": null,
+    "col": 10,
+    "file_path": "apps/next/app/page.tsx",
+    "from_node_id": "function:8694a47e777f8aafc5c96fe460badf43",
+    "language": "tsx",
+    "line": 4,
+    "reference_kind": "references",
+    "reference_name": "Link"
+  },
+  {
+    "candidates": null,
+    "col": 10,
+    "file_path": "apps/tanstack/src/routes/index.tsx",
+    "from_node_id": "function:9137efed7a4eda576ab983339ee0aebb",
+    "language": "tsx",
+    "line": 8,
+    "reference_kind": "references",
+    "reference_name": "Link"
+  },
+  {
+    "candidates": null,
+    "col": 11,
+    "file_path": "apps/nuxt/pages/index.vue",
+    "from_node_id": "component:ba1b120ba0c0a0e3733130855a8a1c17",
+    "language": "vue",
+    "line": 1,
+    "reference_kind": "references",
+    "reference_name": "NuxtLink"
+  },
+  {
+    "candidates": null,
+    "col": 11,
+    "file_path": "apps/vue/src/router/index.ts",
+    "from_node_id": "constant:aae634828e679bd138fccffb08050d6b",
+    "language": "typescript",
+    "line": 5,
+    "reference_kind": "calls",
+    "reference_name": "createWebHistory"
+  },
+  {
+    "candidates": null,
+    "col": 11,
+    "file_path": "apps/vue/src/views/Home.vue",
+    "from_node_id": "component:1a7b7031523fe7654fa37131da535be3",
+    "language": "vue",
+    "line": 1,
+    "reference_kind": "references",
+    "reference_name": "RouterLink"
+  },
+  {
+    "candidates": null,
+    "col": 16,
+    "file_path": "apps/react-router/src/pages/Layout.tsx",
+    "from_node_id": "function:c863eb857f02e69680c9e47dace356b9",
+    "language": "tsx",
+    "line": 4,
+    "reference_kind": "references",
+    "reference_name": "Outlet"
+  },
+  {
+    "candidates": null,
+    "col": 19,
+    "file_path": "apps/react-router/src/main.tsx",
+    "from_node_id": "function:bd2443bcbe09694a55210a349147c068",
+    "language": "tsx",
+    "line": 17,
+    "reference_kind": "calls",
+    "reference_name": "useNavigate"
+  },
+  {
+    "candidates": null,
+    "col": 21,
+    "file_path": "apps/angular/src/app/app.routes.ts",
+    "from_node_id": "constant:06ea8b9bbf6fb3d63e00be0a1c9eb74e",
+    "language": "typescript",
+    "line": 4,
+    "reference_kind": "references",
+    "reference_name": "Routes"
+  },
+  {
+    "candidates": null,
+    "col": 21,
+    "file_path": "apps/tanstack/src/routes/index.tsx",
+    "from_node_id": "constant:dd5bc75347a5d9c5036bf26cb698787e",
+    "language": "tsx",
+    "line": 3,
+    "reference_kind": "calls",
+    "reference_name": "createFileRoute"
+  },
+  {
+    "candidates": null,
+    "col": 21,
+    "file_path": "apps/tanstack/src/routes/index.tsx",
+    "from_node_id": "constant:dd5bc75347a5d9c5036bf26cb698787e",
+    "language": "tsx",
+    "line": 3,
+    "reference_kind": "calls",
+    "reference_name": "createFileRoute('/')"
+  },
+  {
+    "candidates": null,
+    "col": 21,
+    "file_path": "apps/tanstack/src/routes/posts.tsx",
+    "from_node_id": "constant:8e49a75df94c7f91f21ce627b5793167",
+    "language": "tsx",
+    "line": 3,
+    "reference_kind": "calls",
+    "reference_name": "createFileRoute"
+  },
+  {
+    "candidates": null,
+    "col": 21,
+    "file_path": "apps/tanstack/src/routes/posts.tsx",
+    "from_node_id": "constant:8e49a75df94c7f91f21ce627b5793167",
+    "language": "tsx",
+    "line": 3,
+    "reference_kind": "calls",
+    "reference_name": "createFileRoute('/posts')"
+  },
+  {
+    "candidates": null,
+    "col": 22,
+    "file_path": "apps/react-router/src/main.tsx",
+    "from_node_id": "constant:12853c40af592d62e70d60d7fc689444",
+    "language": "tsx",
+    "line": 5,
+    "reference_kind": "calls",
+    "reference_name": "createBrowserRouter"
+  },
+  {
+    "candidates": null,
+    "col": 22,
+    "file_path": "apps/vue/src/router/index.ts",
+    "from_node_id": "constant:aae634828e679bd138fccffb08050d6b",
+    "language": "typescript",
+    "line": 4,
+    "reference_kind": "calls",
+    "reference_name": "createRouter"
+  },
+  {
+    "candidates": null,
+    "col": 23,
+    "file_path": "apps/vue/src/router/index.ts",
+    "from_node_id": "constant:aae634828e679bd138fccffb08050d6b",
+    "language": "typescript",
+    "line": 10,
+    "reference_kind": "calls",
+    "reference_name": "import"
+  },
+  {
+    "candidates": null,
+    "col": 23,
+    "file_path": "apps/vue/src/router/index.ts",
+    "from_node_id": "file:apps/vue/src/router/index.ts",
+    "language": "typescript",
+    "line": 1,
+    "reference_kind": "imports",
+    "reference_name": "createWebHistory"
+  },
+  {
+    "candidates": null,
+    "col": 24,
+    "file_path": "apps/sveltekit/src/routes/blog/[slug=slug]/+page.ts",
+    "from_node_id": "function:5b78e25224f937e219793d3c6a611284",
+    "language": "typescript",
+    "line": 7,
+    "reference_kind": "function_ref",
+    "reference_name": "params.slug"
+  },
+  {
+    "candidates": null,
+    "col": 25,
+    "file_path": "apps/angular/src/app/app.routes.ts",
+    "from_node_id": "constant:06ea8b9bbf6fb3d63e00be0a1c9eb74e",
+    "language": "typescript",
+    "line": 5,
+    "reference_kind": "function_ref",
+    "reference_name": "HomeComponent"
+  },
+  {
+    "candidates": null,
+    "col": 25,
+    "file_path": "apps/angular/src/app/app.routes.ts",
+    "from_node_id": "file:apps/angular/src/app/app.routes.ts",
+    "language": "typescript",
+    "line": 5,
+    "reference_kind": "function_ref",
+    "reference_name": "HomeComponent"
+  },
+  {
+    "candidates": null,
+    "col": 26,
+    "file_path": "apps/tanstack/src/routes/index.tsx",
+    "from_node_id": "file:apps/tanstack/src/routes/index.tsx",
+    "language": "tsx",
+    "line": 1,
+    "reference_kind": "imports",
+    "reference_name": "Link"
+  },
+  {
+    "candidates": null,
+    "col": 29,
+    "file_path": "apps/react-router/src/main.tsx",
+    "from_node_id": "function:bd2443bcbe09694a55210a349147c068",
+    "language": "tsx",
+    "line": 21,
+    "reference_kind": "calls",
+    "reference_name": "navigate"
+  },
+  {
+    "candidates": null,
+    "col": 30,
+    "file_path": "apps/angular/src/app/home/home.component.ts",
+    "from_node_id": "method:d4726b2e34926c3875a341be13f597b0",
+    "language": "typescript",
+    "line": 9,
+    "reference_kind": "references",
+    "reference_name": "Router"
+  },
+  {
+    "candidates": null,
+    "col": 30,
+    "file_path": "apps/react-router/src/main.tsx",
+    "from_node_id": "file:apps/react-router/src/main.tsx",
+    "language": "tsx",
+    "line": 1,
+    "reference_kind": "imports",
+    "reference_name": "Link"
+  },
+  {
+    "candidates": null,
+    "col": 32,
+    "file_path": "apps/next/app/dashboard/page.tsx",
+    "from_node_id": "function:6dccb0ce095800be34bbf630bb5e1b0b",
+    "language": "tsx",
+    "line": 6,
+    "reference_kind": "calls",
+    "reference_name": "router.push"
+  },
+  {
+    "candidates": null,
+    "col": 34,
+    "file_path": "apps/react-router/src/main.tsx",
+    "from_node_id": "constant:12853c40af592d62e70d60d7fc689444",
+    "language": "tsx",
+    "line": 11,
+    "reference_kind": "calls",
+    "reference_name": "import"
+  },
+  {
+    "candidates": null,
+    "col": 36,
+    "file_path": "apps/react-router/src/main.tsx",
+    "from_node_id": "file:apps/react-router/src/main.tsx",
+    "language": "tsx",
+    "line": 1,
+    "reference_kind": "imports",
+    "reference_name": "useNavigate"
+  },
+  {
+    "candidates": null,
+    "col": 39,
+    "file_path": "apps/angular/src/app/app.routes.ts",
+    "from_node_id": "constant:06ea8b9bbf6fb3d63e00be0a1c9eb74e",
+    "language": "typescript",
+    "line": 6,
+    "reference_kind": "calls",
+    "reference_name": "import"
+  },
+  {
+    "candidates": null,
+    "col": 39,
+    "file_path": "apps/angular/src/app/app.routes.ts",
+    "from_node_id": "constant:06ea8b9bbf6fb3d63e00be0a1c9eb74e",
+    "language": "typescript",
+    "line": 6,
+    "reference_kind": "calls",
+    "reference_name": "import().then"
+  },
+  {
+    "candidates": null,
+    "col": 4,
+    "file_path": "apps/angular/src/app/home/home.component.ts",
+    "from_node_id": "method:bbc2c93e3330c7a866ecaf686ba2f83b",
+    "language": "typescript",
+    "line": 16,
+    "reference_kind": "calls",
+    "reference_name": "this.router.navigate"
+  },
+  {
+    "candidates": null,
+    "col": 4,
+    "file_path": "apps/sveltekit/src/routes/+page.svelte",
+    "from_node_id": "function:bb9fd543df3b3f09c016b7b41c8c8799",
+    "language": "svelte",
+    "line": 4,
+    "reference_kind": "calls",
+    "reference_name": "goto"
+  },
+  {
+    "candidates": null,
+    "col": 4,
+    "file_path": "apps/sveltekit/src/routes/blog/[slug=slug]/+page.ts",
+    "from_node_id": "function:5b78e25224f937e219793d3c6a611284",
+    "language": "typescript",
+    "line": 5,
+    "reference_kind": "calls",
+    "reference_name": "redirect"
+  },
+  {
+    "candidates": null,
+    "col": 49,
+    "file_path": "apps/expo/app/index.tsx",
+    "from_node_id": "function:f635ab08203e0ff853aa7eaa5276ccc9",
+    "language": "tsx",
+    "line": 5,
+    "reference_kind": "calls",
+    "reference_name": "router.push"
+  },
+  {
+    "candidates": null,
+    "col": 50,
+    "file_path": "apps/vue/src/router/index.ts",
+    "from_node_id": "constant:aae634828e679bd138fccffb08050d6b",
+    "language": "typescript",
+    "line": 11,
+    "reference_kind": "calls",
+    "reference_name": "import"
+  },
+  {
+    "candidates": null,
+    "col": 67,
+    "file_path": "apps/next/app/layout.tsx",
+    "from_node_id": "function:cc5fd243ace832cbaa7135efc0ee6ce6",
+    "language": "tsx",
+    "line": 1,
+    "reference_kind": "references",
+    "reference_name": "ReactNode"
+  },
+  {
+    "candidates": null,
+    "col": 7,
+    "file_path": "apps/next/app/page.tsx",
+    "from_node_id": "file:apps/next/app/page.tsx",
+    "language": "tsx",
+    "line": 1,
+    "reference_kind": "imports",
+    "reference_name": "Link"
+  },
+  {
+    "candidates": null,
+    "col": 7,
+    "file_path": "apps/react-router/src/main.tsx",
+    "from_node_id": "function:bd2443bcbe09694a55210a349147c068",
+    "language": "tsx",
+    "line": 20,
+    "reference_kind": "references",
+    "reference_name": "Link"
+  },
+  {
+    "candidates": null,
+    "col": 9,
+    "file_path": "apps/angular/src/app/app.routes.ts",
+    "from_node_id": "file:apps/angular/src/app/app.routes.ts",
+    "language": "typescript",
+    "line": 1,
+    "reference_kind": "imports",
+    "reference_name": "Routes"
+  },
+  {
+    "candidates": null,
+    "col": 9,
+    "file_path": "apps/angular/src/app/home/home.component.ts",
+    "from_node_id": "file:apps/angular/src/app/home/home.component.ts",
+    "language": "typescript",
+    "line": 1,
+    "reference_kind": "imports",
+    "reference_name": "Component"
+  },
+  {
+    "candidates": null,
+    "col": 9,
+    "file_path": "apps/angular/src/app/home/home.component.ts",
+    "from_node_id": "file:apps/angular/src/app/home/home.component.ts",
+    "language": "typescript",
+    "line": 2,
+    "reference_kind": "imports",
+    "reference_name": "Router"
+  },
+  {
+    "candidates": null,
+    "col": 9,
+    "file_path": "apps/expo/app/_layout.tsx",
+    "from_node_id": "file:apps/expo/app/_layout.tsx",
+    "language": "tsx",
+    "line": 1,
+    "reference_kind": "imports",
+    "reference_name": "Stack"
+  },
+  {
+    "candidates": null,
+    "col": 9,
+    "file_path": "apps/expo/app/api/hello+api.ts",
+    "from_node_id": "function:4657a5913a769bdf2504b0a266d22d45",
+    "language": "typescript",
+    "line": 2,
+    "reference_kind": "calls",
+    "reference_name": "Response.json"
+  },
+  {
+    "candidates": null,
+    "col": 9,
+    "file_path": "apps/expo/app/index.tsx",
+    "from_node_id": "file:apps/expo/app/index.tsx",
+    "language": "tsx",
+    "line": 1,
+    "reference_kind": "imports",
+    "reference_name": "router"
+  },
+  {
+    "candidates": null,
+    "col": 9,
+    "file_path": "apps/expo/app/index.tsx",
+    "from_node_id": "file:apps/expo/app/index.tsx",
+    "language": "tsx",
+    "line": 2,
+    "reference_kind": "imports",
+    "reference_name": "Button"
+  },
+  {
+    "candidates": null,
+    "col": 9,
+    "file_path": "apps/expo/app/settings.tsx",
+    "from_node_id": "file:apps/expo/app/settings.tsx",
+    "language": "tsx",
+    "line": 1,
+    "reference_kind": "imports",
+    "reference_name": "Text"
+  },
+  {
+    "candidates": null,
+    "col": 9,
+    "file_path": "apps/next/app/api/auth/route.ts",
+    "from_node_id": "function:29920e4f02f68e40aa606dfca0356aae",
+    "language": "typescript",
+    "line": 2,
+    "reference_kind": "calls",
+    "reference_name": "Response.json"
+  },
+  {
+    "candidates": null,
+    "col": 9,
+    "file_path": "apps/next/app/dashboard/page.tsx",
+    "from_node_id": "file:apps/next/app/dashboard/page.tsx",
+    "language": "tsx",
+    "line": 2,
+    "reference_kind": "imports",
+    "reference_name": "useRouter"
+  },
+  {
+    "candidates": null,
+    "col": 9,
+    "file_path": "apps/react-router/src/main.tsx",
+    "from_node_id": "file:apps/react-router/src/main.tsx",
+    "language": "tsx",
+    "line": 1,
+    "reference_kind": "imports",
+    "reference_name": "createBrowserRouter"
+  },
+  {
+    "candidates": null,
+    "col": 9,
+    "file_path": "apps/react-router/src/pages/Layout.tsx",
+    "from_node_id": "file:apps/react-router/src/pages/Layout.tsx",
+    "language": "tsx",
+    "line": 1,
+    "reference_kind": "imports",
+    "reference_name": "Outlet"
+  },
+  {
+    "candidates": null,
+    "col": 9,
+    "file_path": "apps/sveltekit/src/routes/blog/[slug=slug]/+page.ts",
+    "from_node_id": "file:apps/sveltekit/src/routes/blog/[slug=slug]/+page.ts",
+    "language": "typescript",
+    "line": 1,
+    "reference_kind": "imports",
+    "reference_name": "redirect"
+  },
+  {
+    "candidates": null,
+    "col": 9,
+    "file_path": "apps/tanstack/src/routes/index.tsx",
+    "from_node_id": "file:apps/tanstack/src/routes/index.tsx",
+    "language": "tsx",
+    "line": 1,
+    "reference_kind": "imports",
+    "reference_name": "createFileRoute"
+  },
+  {
+    "candidates": null,
+    "col": 9,
+    "file_path": "apps/tanstack/src/routes/posts.tsx",
+    "from_node_id": "file:apps/tanstack/src/routes/posts.tsx",
+    "language": "tsx",
+    "line": 1,
+    "reference_kind": "imports",
+    "reference_name": "createFileRoute"
+  },
+  {
+    "candidates": null,
+    "col": 9,
+    "file_path": "apps/vue/src/router/index.ts",
+    "from_node_id": "file:apps/vue/src/router/index.ts",
+    "language": "typescript",
+    "line": 1,
+    "reference_kind": "imports",
+    "reference_name": "createRouter"
+  },
+  {
+    "candidates": null,
+    "col": 9,
+    "file_path": "apps/vue/src/router/index.ts",
+    "from_node_id": "function:66ba7a3a4954c0c8fda1292c5d336133",
+    "language": "typescript",
+    "line": 17,
+    "reference_kind": "calls",
+    "reference_name": "router.push"
+  }
+]

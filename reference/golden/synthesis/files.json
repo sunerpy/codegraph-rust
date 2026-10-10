@@ -1,0 +1,101 @@
+[
+  {
+    "content_hash": "f054fd34d46d866d45aa963a0ee4c60ad255b44917cf21bfda2c320a920640fc",
+    "errors": null,
+    "generated": 0,
+    "language": "c",
+    "node_count": 5,
+    "path": "c/src/ops.c",
+    "size": 356
+  },
+  {
+    "content_hash": "7c59ba2837e635bc674c2fea732925ccdce6ef3b35dd0a56ab7b4367611d29fe",
+    "errors": null,
+    "generated": 0,
+    "language": "java",
+    "node_count": 13,
+    "path": "dispatch/src/Events.java",
+    "size": 719
+  },
+  {
+    "content_hash": "65acc0aa30be3ed776601d151d4c8def2842810c9f434c8b1d218c5cd3079b53",
+    "errors": null,
+    "generated": 0,
+    "language": "go",
+    "node_count": 11,
+    "path": "go/store/store.go",
+    "size": 429
+  },
+  {
+    "content_hash": "897c54c90596cfad23707ddd5c2515c56b227e0ce5d4d1b16bc37f1d7e159352",
+    "errors": null,
+    "generated": 0,
+    "language": "tsx",
+    "node_count": 4,
+    "path": "js/src/Counter.tsx",
+    "size": 296
+  },
+  {
+    "content_hash": "77603a7146b36ed50ba8da6e5d7f505ecf8672794f32a7320c176a064cda5385",
+    "errors": null,
+    "generated": 0,
+    "language": "javascript",
+    "node_count": 8,
+    "path": "js/src/events.js",
+    "size": 410
+  },
+  {
+    "content_hash": "5f341c3ab4e59f73a5c36eff633465194a7d09b39659bfe81b8a58d5dc152a27",
+    "errors": null,
+    "generated": 0,
+    "language": "typescript",
+    "node_count": 7,
+    "path": "js/src/store.ts",
+    "size": 600
+  },
+  {
+    "content_hash": "7de1ffd65c22a65d5053245a2372f52d21f1a234719bc8ae4bc2678f6bf8f94a",
+    "errors": null,
+    "generated": 0,
+    "language": "kotlin",
+    "node_count": 4,
+    "path": "kotlin/common/src/Platform.kt",
+    "size": 99
+  },
+  {
+    "content_hash": "2ebf00913af8a0cd6da62518e9020b762e050292d73bcf8a8177311eb60ff69a",
+    "errors": null,
+    "generated": 0,
+    "language": "kotlin",
+    "node_count": 3,
+    "path": "kotlin/jvm/src/Platform.kt",
+    "size": 55
+  },
+  {
+    "content_hash": "df00c323c075eab3be0a5f0518b48d1177e6097a6c71e0af233e60fb32917518",
+    "errors": null,
+    "generated": 0,
+    "language": "java",
+    "node_count": 4,
+    "path": "mybatis/src/main/java/com/example/mapper/UserMapper.java",
+    "size": 91
+  },
+  {
+    "content_hash": "58ccf487c4f085ec4b8fbc78550e84c2b4d9bec8a98b78ccfd5f690316cc6ab4",
+    "errors": null,
+    "generated": 0,
+    "language": "xml",
+    "node_count": 2,
+    "path": "mybatis/src/main/resources/mapper/UserMapper.xml",
+    "size": 309
+  },
+  {
+    "content_hash": "84106e6c6479c5c90ffcaf379ce5d05575c74222521e31aa859559b6067a8c95",
+    "errors": null,
+    "generated": 0,
+    "language": "python",
+    "node_count": 6,
+    "path": "python/tasks.py",
+    "size": 208
+  }
+]

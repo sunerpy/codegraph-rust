@@ -1,0 +1,292 @@
+[
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "bridge/ios/Greeter.swift",
+    "from_node_id": "class:3a57e87d807eb4d2915da3f5943b6ea0",
+    "language": "swift",
+    "line": 3,
+    "reference_kind": "decorates",
+    "reference_name": "objc"
+  },
+  {
+    "candidates": null,
+    "col": 16,
+    "file_path": "rn/src/Camera.tsx",
+    "from_node_id": "constant:1e0d4a36cc226cb0db4993c763f554e4",
+    "language": "tsx",
+    "line": 5,
+    "reference_kind": "instantiates",
+    "reference_name": "NativeEventEmitter"
+  },
+  {
+    "candidates": null,
+    "col": 20,
+    "file_path": "expo-modules/android/src/main/java/expo/modules/hello/HelloModule.kt",
+    "from_node_id": "class:946daa8afc56bfaede35c949303f1b8c",
+    "language": "kotlin",
+    "line": 6,
+    "reference_kind": "extends",
+    "reference_name": "Module"
+  },
+  {
+    "candidates": null,
+    "col": 20,
+    "file_path": "expo-modules/src/index.ts",
+    "from_node_id": "constant:d0c0862768da1c6cbf178fa108eec57a",
+    "language": "typescript",
+    "line": 3,
+    "reference_kind": "calls",
+    "reference_name": "requireNativeModule"
+  },
+  {
+    "candidates": null,
+    "col": 21,
+    "file_path": "bridge/ios/Greeter.swift",
+    "from_node_id": "class:3a57e87d807eb4d2915da3f5943b6ea0",
+    "language": "swift",
+    "line": 3,
+    "reference_kind": "extends",
+    "reference_name": "NSObject"
+  },
+  {
+    "candidates": null,
+    "col": 23,
+    "file_path": "bridge/ios/Caller.m",
+    "from_node_id": "method:b9e09b3b72138d018e6e7c4f6f7a7b73",
+    "language": "objc",
+    "line": 5,
+    "reference_kind": "calls",
+    "reference_name": "[Greeter alloc]"
+  },
+  {
+    "candidates": null,
+    "col": 26,
+    "file_path": "expo-modules/ios/HelloModule.swift",
+    "from_node_id": "class:6f54d95ed9c790af0ac11c4f615b0b98",
+    "language": "swift",
+    "line": 3,
+    "reference_kind": "extends",
+    "reference_name": "Module"
+  },
+  {
+    "candidates": null,
+    "col": 26,
+    "file_path": "rn/src/Camera.tsx",
+    "from_node_id": "constant:f20d5a9b40e98b33cf1117278cd07cd6",
+    "language": "tsx",
+    "line": 7,
+    "reference_kind": "calls",
+    "reference_name": "requireNativeComponent"
+  },
+  {
+    "candidates": null,
+    "col": 29,
+    "file_path": "rn/src/Camera.tsx",
+    "from_node_id": "file:rn/src/Camera.tsx",
+    "language": "tsx",
+    "line": 1,
+    "reference_kind": "imports",
+    "reference_name": "NativeModules"
+  },
+  {
+    "candidates": null,
+    "col": 30,
+    "file_path": "expo-modules/android/src/main/java/expo/modules/hello/HelloModule.kt",
+    "from_node_id": "method:7213bf39d4184600fdceed846162834b",
+    "language": "kotlin",
+    "line": 7,
+    "reference_kind": "calls",
+    "reference_name": "ModuleDefinition"
+  },
+  {
+    "candidates": null,
+    "col": 31,
+    "file_path": "rn/src/Camera.tsx",
+    "from_node_id": "function:8046a67d37fbd343813de38ad289060d",
+    "language": "tsx",
+    "line": 9,
+    "reference_kind": "references",
+    "reference_name": "Promise"
+  },
+  {
+    "candidates": null,
+    "col": 31,
+    "file_path": "rn/src/Camera.tsx",
+    "from_node_id": "function:8046a67d37fbd343813de38ad289060d",
+    "language": "tsx",
+    "line": 9,
+    "reference_kind": "references",
+    "reference_name": "Promise"
+  },
+  {
+    "candidates": null,
+    "col": 34,
+    "file_path": "rn/android/app/src/main/java/com/example/CameraModule.java",
+    "from_node_id": "class:35e048f8ee123153ba3469f8b25e0f8e",
+    "language": "java",
+    "line": 7,
+    "reference_kind": "extends",
+    "reference_name": "ReactContextBaseJavaModule"
+  },
+  {
+    "candidates": null,
+    "col": 4,
+    "file_path": "bridge/ios/Caller.m",
+    "from_node_id": "method:b9e09b3b72138d018e6e7c4f6f7a7b73",
+    "language": "objc",
+    "line": 6,
+    "reference_kind": "calls",
+    "reference_name": "greeter"
+  },
+  {
+    "candidates": null,
+    "col": 4,
+    "file_path": "bridge/ios/Greeter.swift",
+    "from_node_id": "method:5c5cbcd2b0e6fe7235dc3ae8e281c076",
+    "language": "swift",
+    "line": 4,
+    "reference_kind": "decorates",
+    "reference_name": "objc"
+  },
+  {
+    "candidates": null,
+    "col": 4,
+    "file_path": "expo-modules/android/src/main/java/expo/modules/hello/HelloModule.kt",
+    "from_node_id": "method:7213bf39d4184600fdceed846162834b",
+    "language": "kotlin",
+    "line": 10,
+    "reference_kind": "calls",
+    "reference_name": "Function"
+  },
+  {
+    "candidates": null,
+    "col": 4,
+    "file_path": "expo-modules/android/src/main/java/expo/modules/hello/HelloModule.kt",
+    "from_node_id": "method:7213bf39d4184600fdceed846162834b",
+    "language": "kotlin",
+    "line": 10,
+    "reference_kind": "calls",
+    "reference_name": "Function(\"hello\")"
+  },
+  {
+    "candidates": null,
+    "col": 4,
+    "file_path": "expo-modules/android/src/main/java/expo/modules/hello/HelloModule.kt",
+    "from_node_id": "method:7213bf39d4184600fdceed846162834b",
+    "language": "kotlin",
+    "line": 8,
+    "reference_kind": "calls",
+    "reference_name": "Name"
+  },
+  {
+    "candidates": null,
+    "col": 4,
+    "file_path": "expo-modules/ios/HelloModule.swift",
+    "from_node_id": "method:8094fb8a03ad4f4399b1d43017c67450",
+    "language": "swift",
+    "line": 5,
+    "reference_kind": "calls",
+    "reference_name": "Name"
+  },
+  {
+    "candidates": null,
+    "col": 4,
+    "file_path": "expo-modules/ios/HelloModule.swift",
+    "from_node_id": "method:8094fb8a03ad4f4399b1d43017c67450",
+    "language": "swift",
+    "line": 7,
+    "reference_kind": "calls",
+    "reference_name": "Function"
+  },
+  {
+    "candidates": null,
+    "col": 4,
+    "file_path": "rn/android/app/src/main/java/com/example/CameraModule.java",
+    "from_node_id": "method:3227c7eb835a7d55f57b433f567cb3a9",
+    "language": "java",
+    "line": 8,
+    "reference_kind": "decorates",
+    "reference_name": "Override"
+  },
+  {
+    "candidates": null,
+    "col": 4,
+    "file_path": "rn/android/app/src/main/java/com/example/CameraModule.java",
+    "from_node_id": "method:ab6793be7ebd07b31be9173944264c20",
+    "language": "java",
+    "line": 13,
+    "reference_kind": "decorates",
+    "reference_name": "ReactMethod"
+  },
+  {
+    "candidates": null,
+    "col": 44,
+    "file_path": "rn/src/Camera.tsx",
+    "from_node_id": "file:rn/src/Camera.tsx",
+    "language": "tsx",
+    "line": 1,
+    "reference_kind": "imports",
+    "reference_name": "requireNativeComponent"
+  },
+  {
+    "candidates": null,
+    "col": 8,
+    "file_path": "rn/android/app/src/main/java/com/example/CameraModule.java",
+    "from_node_id": "method:ab6793be7ebd07b31be9173944264c20",
+    "language": "java",
+    "line": 15,
+    "reference_kind": "calls",
+    "reference_name": "promise.resolve"
+  },
+  {
+    "candidates": null,
+    "col": 9,
+    "file_path": "expo-modules/src/index.ts",
+    "from_node_id": "file:expo-modules/src/index.ts",
+    "language": "typescript",
+    "line": 1,
+    "reference_kind": "imports",
+    "reference_name": "requireNativeModule"
+  },
+  {
+    "candidates": null,
+    "col": 9,
+    "file_path": "expo-modules/src/index.ts",
+    "from_node_id": "function:ed409b0ec63920ada922d872991c7d64",
+    "language": "typescript",
+    "line": 6,
+    "reference_kind": "calls",
+    "reference_name": "HelloModule.hello"
+  },
+  {
+    "candidates": null,
+    "col": 9,
+    "file_path": "rn/src/Camera.tsx",
+    "from_node_id": "file:rn/src/Camera.tsx",
+    "language": "tsx",
+    "line": 1,
+    "reference_kind": "imports",
+    "reference_name": "NativeEventEmitter"
+  },
+  {
+    "candidates": null,
+    "col": 9,
+    "file_path": "rn/src/Camera.tsx",
+    "from_node_id": "function:470c3a2bd39959fd3e0009563f7511a5",
+    "language": "tsx",
+    "line": 14,
+    "reference_kind": "calls",
+    "reference_name": "emitter.addListener"
+  },
+  {
+    "candidates": null,
+    "col": 9,
+    "file_path": "rn/src/Camera.tsx",
+    "from_node_id": "function:8046a67d37fbd343813de38ad289060d",
+    "language": "tsx",
+    "line": 10,
+    "reference_kind": "calls",
+    "reference_name": "CameraModule.takePicture"
+  }
+]

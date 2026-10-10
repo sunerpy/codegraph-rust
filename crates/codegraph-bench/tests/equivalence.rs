@@ -96,6 +96,10 @@ golden_corpora! {
     "svelte" => generated_golden_matches_committed_svelte_fixture, svelte_db_is_self_equivalent_to_svelte_golden;
     "python_bases" => generated_golden_matches_committed_python_bases_fixture, python_bases_db_is_self_equivalent_to_python_bases_golden;
     "commonjs" => generated_golden_matches_committed_commonjs_fixture, commonjs_db_is_self_equivalent_to_commonjs_golden;
+    "routers" => generated_golden_matches_committed_routers_fixture, routers_db_is_self_equivalent_to_routers_golden;
+    "servers" => generated_golden_matches_committed_servers_fixture, servers_db_is_self_equivalent_to_servers_golden;
+    "mobile" => generated_golden_matches_committed_mobile_fixture, mobile_db_is_self_equivalent_to_mobile_golden;
+    "synthesis" => generated_golden_matches_committed_synthesis_fixture, synthesis_db_is_self_equivalent_to_synthesis_golden;
 }
 
 #[test]

@@ -1,0 +1,5 @@
+{
+  "name": "routers-fixture",
+  "private": true,
+  "workspaces": ["apps/*"]
+}

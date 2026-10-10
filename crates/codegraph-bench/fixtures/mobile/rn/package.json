@@ -1,0 +1,1 @@
+{ "name": "rn-app", "private": true, "dependencies": { "react": "18.2.0", "react-native": "0.73.0" } }

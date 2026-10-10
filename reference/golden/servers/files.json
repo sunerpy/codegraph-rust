@@ -1,0 +1,272 @@
+[
+  {
+    "content_hash": "33117c6f3ccbc821c6c137f5c67036bcc9ecf3aa6852c14c03ee1429e6a61eed",
+    "errors": null,
+    "generated": 0,
+    "language": "rust",
+    "node_count": 5,
+    "path": "actix/src/main.rs",
+    "size": 341
+  },
+  {
+    "content_hash": "0ed0768c9351989e3a551378303f5ca74f2d68b5dc5346fdf4082a508c72c661",
+    "errors": null,
+    "generated": 0,
+    "language": "csharp",
+    "node_count": 6,
+    "path": "aspnet/Controllers/UsersController.cs",
+    "size": 352
+  },
+  {
+    "content_hash": "f44688e482b429d0f7a58387087f937154d5962efb0d2a8551918a04d585efc6",
+    "errors": null,
+    "generated": 0,
+    "language": "csharp",
+    "node_count": 3,
+    "path": "aspnet/Program.cs",
+    "size": 226
+  },
+  {
+    "content_hash": "6fba1e49ad901baeec4c92c90c195d39a72170b543b16e3cab12556ac2ebb930",
+    "errors": null,
+    "generated": 0,
+    "language": "rust",
+    "node_count": 7,
+    "path": "axum/src/main.rs",
+    "size": 321
+  },
+  {
+    "content_hash": "ab8d8874726643a2660d85c7d9a16d61e4cdcab2cec2979cf509bbf955c371a5",
+    "errors": null,
+    "generated": 0,
+    "language": "python",
+    "node_count": 4,
+    "path": "django/shop/urls.py",
+    "size": 133
+  },
+  {
+    "content_hash": "c1b8dbb0d7b4dea54dd6249b6feb3b36f6d354b52f177685344b23883a6b9cf8",
+    "errors": null,
+    "generated": 0,
+    "language": "python",
+    "node_count": 4,
+    "path": "django/shop/views.py",
+    "size": 149
+  },
+  {
+    "content_hash": "311f723ef7849faeda1acdd84a1a8e0106110bdf1404a38be385b7a7355e8c3a",
+    "errors": null,
+    "generated": 0,
+    "language": "yaml",
+    "node_count": 0,
+    "path": "drupal/modules/custom/greeting/greeting.routing.yml",
+    "size": 168
+  },
+  {
+    "content_hash": "347a366c18c03b313eaafbc4fc33c9c768a53e0941b989649fa86ae9347065b2",
+    "errors": null,
+    "generated": 0,
+    "language": "php",
+    "node_count": 6,
+    "path": "drupal/modules/custom/greeting/src/Controller/GreetingController.php",
+    "size": 313
+  },
+  {
+    "content_hash": "9c0df6fddb934bb1ba0f3f5d6d165298a0c3853e6a85e9ae3ed5ab330d4215e7",
+    "errors": null,
+    "generated": 0,
+    "language": "javascript",
+    "node_count": 7,
+    "path": "express/app.js",
+    "size": 346
+  },
+  {
+    "content_hash": "a655d8a8c80f43460115b07f9fed48d1b65f559ec7988c00cc154f4552b32e3f",
+    "errors": null,
+    "generated": 0,
+    "language": "javascript",
+    "node_count": 4,
+    "path": "express/routes/users.js",
+    "size": 223
+  },
+  {
+    "content_hash": "5e89acfc2b7f79723c92ed29b1fffca465e6e26e5bca4e9041b254eb6ed0832c",
+    "errors": null,
+    "generated": 0,
+    "language": "python",
+    "node_count": 6,
+    "path": "fastapi/main.py",
+    "size": 260
+  },
+  {
+    "content_hash": "152f534059254657e764f2fa75dc5855ef68f19fb50d2c92d6c47392fe25282f",
+    "errors": null,
+    "generated": 0,
+    "language": "python",
+    "node_count": 6,
+    "path": "flask/app.py",
+    "size": 218
+  },
+  {
+    "content_hash": "edd9f4fe39f31d38d037bf67ce4b8304add8074f4a88e76e0685561e3ecde1d4",
+    "errors": null,
+    "generated": 0,
+    "language": "go",
+    "node_count": 5,
+    "path": "gin/main.go",
+    "size": 229
+  },
+  {
+    "content_hash": "cc034d603c5133d17fc3f250996d9fe263cf7068630e9a6c8b5deb65d2697980",
+    "errors": null,
+    "generated": 0,
+    "language": "php",
+    "node_count": 6,
+    "path": "laravel/app/Http/Controllers/UserController.php",
+    "size": 331
+  },
+  {
+    "content_hash": "1ca1620d22da97650c902b9fe1f8f80c2e874b6b680c85ee373feda9a25b2141",
+    "errors": null,
+    "generated": 0,
+    "language": "php",
+    "node_count": 2,
+    "path": "laravel/routes/api.php",
+    "size": 129
+  },
+  {
+    "content_hash": "54612402900cb5f3d7684ad4946e9af56c4ac92489a6f5bfc2a578ea287bd4d6",
+    "errors": null,
+    "generated": 0,
+    "language": "php",
+    "node_count": 3,
+    "path": "laravel/routes/web.php",
+    "size": 241
+  },
+  {
+    "content_hash": "91ab9ea896315ff8b92eb2c4363a80b5731ce1a31439cd4ec2512999004a7d40",
+    "errors": null,
+    "generated": 0,
+    "language": "typescript",
+    "node_count": 5,
+    "path": "nest/src/app.module.ts",
+    "size": 253
+  },
+  {
+    "content_hash": "eba3d5bed119b9535a8278e9e4705d74da667130f1a4e7c51a88b546e349ec76",
+    "errors": null,
+    "generated": 0,
+    "language": "typescript",
+    "node_count": 5,
+    "path": "nest/src/main.ts",
+    "size": 362
+  },
+  {
+    "content_hash": "8437beac9decae8e7bd796e3e57ac086646f294697a813ed42424a98254e8214",
+    "errors": null,
+    "generated": 0,
+    "language": "typescript",
+    "node_count": 6,
+    "path": "nest/src/users/users.controller.ts",
+    "size": 320
+  },
+  {
+    "content_hash": "04d7db81570e9b29c82b96a550694ac932ebe8854dc9c9ddbdebac7841eafa12",
+    "errors": null,
+    "generated": 0,
+    "language": "typescript",
+    "node_count": 4,
+    "path": "nest/src/users/users.service.ts",
+    "size": 137
+  },
+  {
+    "content_hash": "5b7a9bca785bb089db5dafb57e3b662b290fa63bba87bb549736a9debab550da",
+    "errors": null,
+    "generated": 0,
+    "language": "scala",
+    "node_count": 7,
+    "path": "play/app/controllers/HomeController.scala",
+    "size": 355
+  },
+  {
+    "content_hash": "183b5b639eaea162a49ec812cf0140d070525826d5ee1d065abbd1358d4a5973",
+    "errors": null,
+    "generated": 0,
+    "language": "ruby",
+    "node_count": 4,
+    "path": "rails/app/controllers/admin/reports_controller.rb",
+    "size": 117
+  },
+  {
+    "content_hash": "7df7272e5ddc09f89a3ea564ac9615eac5084d9bdb1fe003c48ef479b95cc762",
+    "errors": null,
+    "generated": 0,
+    "language": "ruby",
+    "node_count": 5,
+    "path": "rails/app/controllers/users_controller.rb",
+    "size": 193
+  },
+  {
+    "content_hash": "7d00716afa098fa560e1835399fd12babf4a2978e7ddd119afb2901700a1f8c1",
+    "errors": null,
+    "generated": 0,
+    "language": "ruby",
+    "node_count": 1,
+    "path": "rails/config/routes.rb",
+    "size": 183
+  },
+  {
+    "content_hash": "71f326f05b3c1c11aa891643551b63674a0884e3e35799731b50b3127153b18b",
+    "errors": null,
+    "generated": 0,
+    "language": "xml",
+    "node_count": 1,
+    "path": "spring/pom.xml",
+    "size": 326
+  },
+  {
+    "content_hash": "b42621fd67a6064ee8eab81d875a206cb965ef07cdc866eedf8686cb415c5eba",
+    "errors": null,
+    "generated": 0,
+    "language": "java",
+    "node_count": 10,
+    "path": "spring/src/main/java/com/example/users/UserController.java",
+    "size": 583
+  },
+  {
+    "content_hash": "ef8a1070bb1130f5f7e6b7fc9736f963b87979aba2d1b404df8587ae383fc86c",
+    "errors": null,
+    "generated": 0,
+    "language": "java",
+    "node_count": 5,
+    "path": "spring/src/main/java/com/example/users/UserService.java",
+    "size": 175
+  },
+  {
+    "content_hash": "401d22c52274e860e7af1ba9360ab7f517f38da9f4c4060b116c313cd3aef186",
+    "errors": null,
+    "generated": 0,
+    "language": "swift",
+    "node_count": 2,
+    "path": "vapor/Package.swift",
+    "size": 320
+  },
+  {
+    "content_hash": "bed884fe7f4b024eaaad5c77f7b72f2a108a01dfa632ebe79aca03cef67e5bbe",
+    "errors": null,
+    "generated": 0,
+    "language": "swift",
+    "node_count": 5,
+    "path": "vapor/Sources/App/Controllers/TodoController.swift",
+    "size": 264
+  },
+  {
+    "content_hash": "b79e79c72851fb61ebe7e094785a3fd078a94bcf91e7ad4c967cef6a5b67c4a6",
+    "errors": null,
+    "generated": 0,
+    "language": "swift",
+    "node_count": 4,
+    "path": "vapor/Sources/App/routes.swift",
+    "size": 230
+  }
+]

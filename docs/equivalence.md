@@ -184,9 +184,10 @@ Every intentional golden change is recorded here with the commit, the corpora
 and artifacts it changed, why the graph change is intended, and the command
 that regenerated it. Older regenerations are described in each corpus section.
 
-| Commit                                                                                        | Corpus                                                              | Artifacts         | Intent                                                                                                | Command                                                                                        |
-| --------------------------------------------------------------------------------------------- | ------------------------------------------------------------------- | ----------------- | ----------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
-| `test(bench): add C#, Java, Swift, ObjC, PHP, Vue, Svelte, Python-bases and CommonJS corpora` | csharp, java, swift, objc, php, vue, svelte, python_bases, commonjs | all (new corpora) | baseline capture of the current extraction and resolution, including the misses later commits correct | `scripts/regen-goldens.sh --write csharp java swift objc php vue svelte python_bases commonjs` |
+| Commit                                                                                        | Corpus                                                              | Artifacts         | Intent                                                                                                           | Command                                                                                        |
+| --------------------------------------------------------------------------------------------- | ------------------------------------------------------------------- | ----------------- | ---------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
+| `test(bench): add C#, Java, Swift, ObjC, PHP, Vue, Svelte, Python-bases and CommonJS corpora` | csharp, java, swift, objc, php, vue, svelte, python_bases, commonjs | all (new corpora) | baseline capture of the current extraction and resolution, including the misses later commits correct            | `scripts/regen-goldens.sh --write csharp java swift objc php vue svelte python_bases commonjs` |
+| `test(bench): add router, server, mobile and synthesis corpora`                               | routers, servers, mobile, synthesis                                 | all (new corpora) | baseline capture of today's framework and synthesis output ahead of the framework resolvers and synthesis passes | `scripts/regen-goldens.sh --write routers servers mobile synthesis`                            |
 
 The canonicalizer strips inherently unstable timestamp columns
 (`nodes.updated_at`, `files.modified_at`, `files.indexed_at`), parses JSON text
@@ -1136,6 +1137,40 @@ Regenerate any of them with `scripts/regen-goldens.sh --write <corpus>` (the
 shared recipe in [Regenerating goldens](#regenerating-goldens)); `golden_reextract`
 and the `golden_corpora!` pairs in `equivalence.rs` pin them like every other
 corpus.
+
+### Framework and synthesis corpora
+
+Four multi-project corpora give the framework resolvers and the synthesis passes
+a baseline before they land. Each project directory carries the manifest that
+framework detection reads (`package.json`, `pom.xml`, `composer.json`,
+`Gemfile`, `*.csproj`, `Package.swift`, `Cargo.toml`, `go.mod`, `build.sbt`),
+and the projects deliberately share symbol names, so name matching that crosses
+project boundaries is visible in the golden:
+
+- **`routers`**: React Router, Next.js (`app/` and `pages/`), Expo Router
+  (including a `+api` file), Vue Router, Nuxt, SvelteKit (a `(group)` folder
+  and a parameter matcher), Angular and TanStack Router apps side by side,
+  each with links and programmatic navigation.
+- **`servers`**: Express (a mounted router, inline and function-expression
+  handlers, middleware), NestJS (global prefix and URI versioning), Flask
+  (`route` and `add_url_rule`), Django, FastAPI (router prefix), Spring,
+  Laravel (array and string controllers, a prefix group), Rails (`resources`
+  with `only`/`except`, a namespace), ASP.NET (a controller and a minimal API),
+  Vapor, axum, actix-web, Gin, Play and a Drupal `routing.yml`.
+- **`mobile`**: React Native native modules (Java and Objective-C halves, an
+  event name held in a constant, a `requireNativeComponent` view), an Expo
+  module (Swift and Kotlin definitions called through `requireNativeModule`),
+  and a Swift class called from Objective-C.
+- **`synthesis`**: an event emitter and a handler table, a React component that
+  re-renders a child, Redux Toolkit and Pinia stores, Go interface embedding with
+  implicit implementations, a type alias and a defined type, a C function-pointer
+  table, Kotlin `expect`/`actual`, a MyBatis mapper, a Celery task, and Spring
+  application events.
+
+At capture time the golden still contains cross-project misses (for example an
+Angular `@Component` decorator bound to a React file's `Component`); the commits
+that scope resolution to its own project remove them, and the diff records it.
+Regenerate any of them with `scripts/regen-goldens.sh --write <corpus>`.
 
 ### Retrieval and ranking wave (golden-neutral)
 

@@ -1,0 +1,1072 @@
+[
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "aspnet/Program.cs",
+    "from_node_id": "file:aspnet/Program.cs",
+    "language": "csharp",
+    "line": 4,
+    "reference_kind": "calls",
+    "reference_name": "app.MapGet"
+  },
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "aspnet/Program.cs",
+    "from_node_id": "file:aspnet/Program.cs",
+    "language": "csharp",
+    "line": 5,
+    "reference_kind": "calls",
+    "reference_name": "app.MapControllers"
+  },
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "aspnet/Program.cs",
+    "from_node_id": "file:aspnet/Program.cs",
+    "language": "csharp",
+    "line": 6,
+    "reference_kind": "calls",
+    "reference_name": "app.Run"
+  },
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "express/app.js",
+    "from_node_id": "file:express/app.js",
+    "language": "javascript",
+    "line": 10,
+    "reference_kind": "calls",
+    "reference_name": "app.use"
+  },
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "express/app.js",
+    "from_node_id": "file:express/app.js",
+    "language": "javascript",
+    "line": 11,
+    "reference_kind": "calls",
+    "reference_name": "app.use"
+  },
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "express/app.js",
+    "from_node_id": "file:express/app.js",
+    "language": "javascript",
+    "line": 12,
+    "reference_kind": "calls",
+    "reference_name": "app.get"
+  },
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "express/routes/users.js",
+    "from_node_id": "file:express/routes/users.js",
+    "language": "javascript",
+    "line": 9,
+    "reference_kind": "calls",
+    "reference_name": "router.get"
+  },
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "fastapi/main.py",
+    "from_node_id": "file:fastapi/main.py",
+    "language": "python",
+    "line": 16,
+    "reference_kind": "calls",
+    "reference_name": "app.include_router"
+  },
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "flask/app.py",
+    "from_node_id": "file:flask/app.py",
+    "language": "python",
+    "line": 19,
+    "reference_kind": "calls",
+    "reference_name": "app.add_url_rule"
+  },
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "laravel/routes/api.php",
+    "from_node_id": "file:laravel/routes/api.php",
+    "language": "php",
+    "line": 5,
+    "reference_kind": "calls",
+    "reference_name": "Route.get"
+  },
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "laravel/routes/web.php",
+    "from_node_id": "file:laravel/routes/web.php",
+    "language": "php",
+    "line": 6,
+    "reference_kind": "calls",
+    "reference_name": "Route.get"
+  },
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "laravel/routes/web.php",
+    "from_node_id": "file:laravel/routes/web.php",
+    "language": "php",
+    "line": 7,
+    "reference_kind": "calls",
+    "reference_name": "Route.prefix"
+  },
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "laravel/routes/web.php",
+    "from_node_id": "file:laravel/routes/web.php",
+    "language": "php",
+    "line": 7,
+    "reference_kind": "calls",
+    "reference_name": "Route::prefix().group"
+  },
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "nest/src/app.module.ts",
+    "from_node_id": "class:b85f92e25e17a53ca474c50e773fbbce",
+    "language": "typescript",
+    "line": 5,
+    "reference_kind": "decorates",
+    "reference_name": "Module"
+  },
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "nest/src/users/users.controller.ts",
+    "from_node_id": "class:36b4b6e1e98c86a0b4c46c4efad52e9c",
+    "language": "typescript",
+    "line": 4,
+    "reference_kind": "decorates",
+    "reference_name": "Controller"
+  },
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "nest/src/users/users.service.ts",
+    "from_node_id": "class:dd7a559e38199bbfc9aad6cc66584786",
+    "language": "typescript",
+    "line": 3,
+    "reference_kind": "decorates",
+    "reference_name": "Injectable"
+  },
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "play/app/controllers/HomeController.scala",
+    "from_node_id": "class:908c4169dedf1fe5157efb633b5125a9",
+    "language": "scala",
+    "line": 6,
+    "reference_kind": "decorates",
+    "reference_name": "Singleton"
+  },
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "rails/config/routes.rb",
+    "from_node_id": "file:rails/config/routes.rb",
+    "language": "ruby",
+    "line": 1,
+    "reference_kind": "calls",
+    "reference_name": "application"
+  },
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "rails/config/routes.rb",
+    "from_node_id": "file:rails/config/routes.rb",
+    "language": "ruby",
+    "line": 1,
+    "reference_kind": "calls",
+    "reference_name": "draw"
+  },
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "rails/config/routes.rb",
+    "from_node_id": "file:rails/config/routes.rb",
+    "language": "ruby",
+    "line": 1,
+    "reference_kind": "calls",
+    "reference_name": "routes"
+  },
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "spring/src/main/java/com/example/users/UserController.java",
+    "from_node_id": "class:6ec3aacfa8e83a050de08024bb99c1f7",
+    "language": "java",
+    "line": 10,
+    "reference_kind": "decorates",
+    "reference_name": "RequestMapping"
+  },
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "spring/src/main/java/com/example/users/UserController.java",
+    "from_node_id": "class:6ec3aacfa8e83a050de08024bb99c1f7",
+    "language": "java",
+    "line": 9,
+    "reference_kind": "decorates",
+    "reference_name": "RestController"
+  },
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "spring/src/main/java/com/example/users/UserService.java",
+    "from_node_id": "class:19fed4f1deb67fb9289f70ef980e2c67",
+    "language": "java",
+    "line": 5,
+    "reference_kind": "decorates",
+    "reference_name": "Service"
+  },
+  {
+    "candidates": null,
+    "col": 1,
+    "file_path": "fastapi/main.py",
+    "from_node_id": "file:fastapi/main.py",
+    "language": "python",
+    "line": 7,
+    "reference_kind": "calls",
+    "reference_name": "router.get"
+  },
+  {
+    "candidates": null,
+    "col": 1,
+    "file_path": "flask/app.py",
+    "from_node_id": "file:flask/app.py",
+    "language": "python",
+    "line": 6,
+    "reference_kind": "calls",
+    "reference_name": "app.route"
+  },
+  {
+    "candidates": null,
+    "col": 1,
+    "file_path": "gin/main.go",
+    "from_node_id": "function:5e1d20097df150dd2a09a3e1b7cb041e",
+    "language": "go",
+    "line": 15,
+    "reference_kind": "calls",
+    "reference_name": "r.GET"
+  },
+  {
+    "candidates": null,
+    "col": 1,
+    "file_path": "gin/main.go",
+    "from_node_id": "function:822994b41b49c7ca4069da738515f400",
+    "language": "go",
+    "line": 6,
+    "reference_kind": "calls",
+    "reference_name": "c.JSON"
+  },
+  {
+    "candidates": null,
+    "col": 1,
+    "file_path": "nest/src/app.module.ts",
+    "from_node_id": "file:nest/src/app.module.ts",
+    "language": "typescript",
+    "line": 5,
+    "reference_kind": "calls",
+    "reference_name": "Module"
+  },
+  {
+    "candidates": null,
+    "col": 1,
+    "file_path": "nest/src/users/users.controller.ts",
+    "from_node_id": "file:nest/src/users/users.controller.ts",
+    "language": "typescript",
+    "line": 4,
+    "reference_kind": "calls",
+    "reference_name": "Controller"
+  },
+  {
+    "candidates": null,
+    "col": 1,
+    "file_path": "nest/src/users/users.service.ts",
+    "from_node_id": "file:nest/src/users/users.service.ts",
+    "language": "typescript",
+    "line": 3,
+    "reference_kind": "calls",
+    "reference_name": "Injectable"
+  },
+  {
+    "candidates": null,
+    "col": 11,
+    "file_path": "axum/src/main.rs",
+    "from_node_id": "file:axum/src/main.rs",
+    "language": "rust",
+    "line": 1,
+    "reference_kind": "imports",
+    "reference_name": "axum::routing::get"
+  },
+  {
+    "candidates": null,
+    "col": 11,
+    "file_path": "django/shop/views.py",
+    "from_node_id": "function:c7f3c01d15e858886375c57ef6bd694e",
+    "language": "python",
+    "line": 5,
+    "reference_kind": "calls",
+    "reference_name": "JsonResponse"
+  },
+  {
+    "candidates": null,
+    "col": 11,
+    "file_path": "laravel/routes/api.php",
+    "from_node_id": "file:laravel/routes/api.php",
+    "language": "php",
+    "line": 6,
+    "reference_kind": "calls",
+    "reference_name": "response"
+  },
+  {
+    "candidates": null,
+    "col": 11,
+    "file_path": "laravel/routes/api.php",
+    "from_node_id": "file:laravel/routes/api.php",
+    "language": "php",
+    "line": 6,
+    "reference_kind": "calls",
+    "reference_name": "response().json"
+  },
+  {
+    "candidates": null,
+    "col": 14,
+    "file_path": "express/app.js",
+    "from_node_id": "constant:77ae0a0e3a39fd3e312956380f52f71d",
+    "language": "javascript",
+    "line": 2,
+    "reference_kind": "calls",
+    "reference_name": "require"
+  },
+  {
+    "candidates": null,
+    "col": 15,
+    "file_path": "express/routes/users.js",
+    "from_node_id": "constant:d1b69054221431f51b587e24cd94be13",
+    "language": "javascript",
+    "line": 3,
+    "reference_kind": "calls",
+    "reference_name": "express.Router"
+  },
+  {
+    "candidates": null,
+    "col": 15,
+    "file_path": "laravel/app/Http/Controllers/UserController.php",
+    "from_node_id": "method:89630d061e1ba36c3a3eee13e796d89a",
+    "language": "php",
+    "line": 9,
+    "reference_kind": "calls",
+    "reference_name": "view"
+  },
+  {
+    "candidates": null,
+    "col": 15,
+    "file_path": "laravel/app/Http/Controllers/UserController.php",
+    "from_node_id": "method:9c266f666867e6f29cf57cec22ddddc0",
+    "language": "php",
+    "line": 14,
+    "reference_kind": "calls",
+    "reference_name": "redirect"
+  },
+  {
+    "candidates": null,
+    "col": 16,
+    "file_path": "actix/src/main.rs",
+    "from_node_id": "file:actix/src/main.rs",
+    "language": "rust",
+    "line": 1,
+    "reference_kind": "imports",
+    "reference_name": "actix_web::get"
+  },
+  {
+    "candidates": null,
+    "col": 16,
+    "file_path": "express/app.js",
+    "from_node_id": "constant:534df51fd59b1266fc6c127cda3e2ee7",
+    "language": "javascript",
+    "line": 1,
+    "reference_kind": "calls",
+    "reference_name": "require"
+  },
+  {
+    "candidates": null,
+    "col": 16,
+    "file_path": "express/routes/users.js",
+    "from_node_id": "constant:d732f584521946d9fe931b0cb1834c06",
+    "language": "javascript",
+    "line": 1,
+    "reference_kind": "calls",
+    "reference_name": "require"
+  },
+  {
+    "candidates": null,
+    "col": 18,
+    "file_path": "flask/app.py",
+    "from_node_id": "file:flask/app.py",
+    "language": "python",
+    "line": 1,
+    "reference_kind": "imports",
+    "reference_name": "Flask"
+  },
+  {
+    "candidates": null,
+    "col": 19,
+    "file_path": "aspnet/Controllers/UsersController.cs",
+    "from_node_id": "method:5305c5e90802aeb697042a8f5a945c5c",
+    "language": "csharp",
+    "line": 12,
+    "reference_kind": "calls",
+    "reference_name": "Ok"
+  },
+  {
+    "candidates": null,
+    "col": 2,
+    "file_path": "express/app.js",
+    "from_node_id": "function:16279817ad2a6e3ecd9cda244219b9cb",
+    "language": "javascript",
+    "line": 7,
+    "reference_kind": "calls",
+    "reference_name": "next"
+  },
+  {
+    "candidates": null,
+    "col": 2,
+    "file_path": "express/app.js",
+    "from_node_id": "function:a5a6ecc0fc3fdcb6fc5249ca49a5dbea",
+    "language": "javascript",
+    "line": 13,
+    "reference_kind": "calls",
+    "reference_name": "res.json"
+  },
+  {
+    "candidates": null,
+    "col": 2,
+    "file_path": "express/routes/users.js",
+    "from_node_id": "file:express/routes/users.js",
+    "language": "javascript",
+    "line": 10,
+    "reference_kind": "calls",
+    "reference_name": "res.json"
+  },
+  {
+    "candidates": null,
+    "col": 2,
+    "file_path": "nest/src/main.ts",
+    "from_node_id": "function:9ebdff4ce3daa221b8c910d8634dc3e2",
+    "language": "typescript",
+    "line": 7,
+    "reference_kind": "calls",
+    "reference_name": "app.setGlobalPrefix"
+  },
+  {
+    "candidates": null,
+    "col": 2,
+    "file_path": "nest/src/main.ts",
+    "from_node_id": "function:9ebdff4ce3daa221b8c910d8634dc3e2",
+    "language": "typescript",
+    "line": 8,
+    "reference_kind": "calls",
+    "reference_name": "app.enableVersioning"
+  },
+  {
+    "candidates": null,
+    "col": 2,
+    "file_path": "nest/src/users/users.controller.ts",
+    "from_node_id": "method:49949645145820e984b029acad16139c",
+    "language": "typescript",
+    "line": 8,
+    "reference_kind": "decorates",
+    "reference_name": "Get"
+  },
+  {
+    "candidates": null,
+    "col": 2,
+    "file_path": "rails/app/controllers/users_controller.rb",
+    "from_node_id": "class:5ea1790a8fc9afffc23c1ef543e0efae",
+    "language": "ruby",
+    "line": 10,
+    "reference_kind": "calls",
+    "reference_name": "private"
+  },
+  {
+    "candidates": null,
+    "col": 20,
+    "file_path": "fastapi/main.py",
+    "from_node_id": "file:fastapi/main.py",
+    "language": "python",
+    "line": 1,
+    "reference_kind": "imports",
+    "reference_name": "APIRouter"
+  },
+  {
+    "candidates": null,
+    "col": 20,
+    "file_path": "nest/src/main.ts",
+    "from_node_id": "function:9ebdff4ce3daa221b8c910d8634dc3e2",
+    "language": "typescript",
+    "line": 6,
+    "reference_kind": "calls",
+    "reference_name": "NestFactory.create"
+  },
+  {
+    "candidates": null,
+    "col": 20,
+    "file_path": "vapor/Sources/App/Controllers/TodoController.swift",
+    "from_node_id": "method:0b06fe724556d9527319b8c22a64ab43",
+    "language": "swift",
+    "line": 5,
+    "reference_kind": "calls",
+    "reference_name": "routes.grouped"
+  },
+  {
+    "candidates": null,
+    "col": 21,
+    "file_path": "actix/src/main.rs",
+    "from_node_id": "file:actix/src/main.rs",
+    "language": "rust",
+    "line": 1,
+    "reference_kind": "imports",
+    "reference_name": "actix_web::App"
+  },
+  {
+    "candidates": null,
+    "col": 21,
+    "file_path": "nest/src/users/users.controller.ts",
+    "from_node_id": "file:nest/src/users/users.controller.ts",
+    "language": "typescript",
+    "line": 1,
+    "reference_kind": "imports",
+    "reference_name": "Get"
+  },
+  {
+    "candidates": null,
+    "col": 21,
+    "file_path": "play/app/controllers/HomeController.scala",
+    "from_node_id": "class:908c4169dedf1fe5157efb633b5125a9",
+    "language": "scala",
+    "line": 7,
+    "reference_kind": "decorates",
+    "reference_name": "Inject"
+  },
+  {
+    "candidates": null,
+    "col": 23,
+    "file_path": "actix/src/main.rs",
+    "from_node_id": "function:a2a6735587193c6e84d31f91e10cdff3",
+    "language": "rust",
+    "line": 14,
+    "reference_kind": "calls",
+    "reference_name": "App::new"
+  },
+  {
+    "candidates": null,
+    "col": 23,
+    "file_path": "actix/src/main.rs",
+    "from_node_id": "function:a2a6735587193c6e84d31f91e10cdff3",
+    "language": "rust",
+    "line": 14,
+    "reference_kind": "calls",
+    "reference_name": "App::new().service"
+  },
+  {
+    "candidates": null,
+    "col": 23,
+    "file_path": "vapor/Sources/App/Controllers/TodoController.swift",
+    "from_node_id": "struct:b8ebc07fa3053803566be74ed25a96e3",
+    "language": "swift",
+    "line": 3,
+    "reference_kind": "extends",
+    "reference_name": "RouteCollection"
+  },
+  {
+    "candidates": null,
+    "col": 24,
+    "file_path": "django/shop/urls.py",
+    "from_node_id": "file:django/shop/urls.py",
+    "language": "python",
+    "line": 1,
+    "reference_kind": "imports",
+    "reference_name": "path"
+  },
+  {
+    "candidates": null,
+    "col": 24,
+    "file_path": "django/shop/views.py",
+    "from_node_id": "file:django/shop/views.py",
+    "language": "python",
+    "line": 1,
+    "reference_kind": "imports",
+    "reference_name": "JsonResponse"
+  },
+  {
+    "candidates": null,
+    "col": 24,
+    "file_path": "nest/src/app.module.ts",
+    "from_node_id": "file:nest/src/app.module.ts",
+    "language": "typescript",
+    "line": 5,
+    "reference_kind": "function_ref",
+    "reference_name": "UsersController"
+  },
+  {
+    "candidates": null,
+    "col": 24,
+    "file_path": "rails/app/controllers/users_controller.rb",
+    "from_node_id": "class:5ea1790a8fc9afffc23c1ef543e0efae",
+    "language": "ruby",
+    "line": 1,
+    "reference_kind": "extends",
+    "reference_name": "ApplicationController"
+  },
+  {
+    "candidates": null,
+    "col": 25,
+    "file_path": "axum/src/main.rs",
+    "from_node_id": "file:axum/src/main.rs",
+    "language": "rust",
+    "line": 1,
+    "reference_kind": "imports",
+    "reference_name": "axum::Router"
+  },
+  {
+    "candidates": null,
+    "col": 26,
+    "file_path": "actix/src/main.rs",
+    "from_node_id": "file:actix/src/main.rs",
+    "language": "rust",
+    "line": 1,
+    "reference_kind": "imports",
+    "reference_name": "actix_web::HttpResponse"
+  },
+  {
+    "candidates": null,
+    "col": 26,
+    "file_path": "nest/src/users/users.controller.ts",
+    "from_node_id": "file:nest/src/users/users.controller.ts",
+    "language": "typescript",
+    "line": 1,
+    "reference_kind": "imports",
+    "reference_name": "Param"
+  },
+  {
+    "candidates": null,
+    "col": 28,
+    "file_path": "rails/app/controllers/admin/reports_controller.rb",
+    "from_node_id": "class:d5d6042d06254c952127e6e835674a66",
+    "language": "ruby",
+    "line": 2,
+    "reference_kind": "extends",
+    "reference_name": "ApplicationController"
+  },
+  {
+    "candidates": null,
+    "col": 29,
+    "file_path": "axum/src/main.rs",
+    "from_node_id": "function:b473a4158e0b81f730b947fb06a41b50",
+    "language": "rust",
+    "line": 4,
+    "reference_kind": "calls",
+    "reference_name": "get"
+  },
+  {
+    "candidates": null,
+    "col": 3,
+    "file_path": "nest/src/users/users.controller.ts",
+    "from_node_id": "class:36b4b6e1e98c86a0b4c46c4efad52e9c",
+    "language": "typescript",
+    "line": 8,
+    "reference_kind": "calls",
+    "reference_name": "Get"
+  },
+  {
+    "candidates": null,
+    "col": 31,
+    "file_path": "express/routes/users.js",
+    "from_node_id": "file:express/routes/users.js",
+    "language": "javascript",
+    "line": 10,
+    "reference_kind": "function_ref",
+    "reference_name": "params.id"
+  },
+  {
+    "candidates": null,
+    "col": 31,
+    "file_path": "fastapi/main.py",
+    "from_node_id": "file:fastapi/main.py",
+    "language": "python",
+    "line": 1,
+    "reference_kind": "imports",
+    "reference_name": "FastAPI"
+  },
+  {
+    "candidates": null,
+    "col": 36,
+    "file_path": "play/app/controllers/HomeController.scala",
+    "from_node_id": "method:0952d7c19228f96d12bb769ece592391",
+    "language": "scala",
+    "line": 8,
+    "reference_kind": "calls",
+    "reference_name": "Action"
+  },
+  {
+    "candidates": null,
+    "col": 39,
+    "file_path": "aspnet/Controllers/UsersController.cs",
+    "from_node_id": "method:689677c2c9f3e992fb81ebee8995a7e7",
+    "language": "csharp",
+    "line": 15,
+    "reference_kind": "calls",
+    "reference_name": "id.ToString"
+  },
+  {
+    "candidates": null,
+    "col": 39,
+    "file_path": "nest/src/main.ts",
+    "from_node_id": "function:9ebdff4ce3daa221b8c910d8634dc3e2",
+    "language": "typescript",
+    "line": 6,
+    "reference_kind": "function_ref",
+    "reference_name": "AppModule"
+  },
+  {
+    "candidates": null,
+    "col": 4,
+    "file_path": "actix/src/main.rs",
+    "from_node_id": "function:a2a6735587193c6e84d31f91e10cdff3",
+    "language": "rust",
+    "line": 14,
+    "reference_kind": "calls",
+    "reference_name": "HttpServer::new"
+  },
+  {
+    "candidates": null,
+    "col": 4,
+    "file_path": "actix/src/main.rs",
+    "from_node_id": "function:a2a6735587193c6e84d31f91e10cdff3",
+    "language": "rust",
+    "line": 14,
+    "reference_kind": "calls",
+    "reference_name": "HttpServer::new().bind"
+  },
+  {
+    "candidates": null,
+    "col": 4,
+    "file_path": "actix/src/main.rs",
+    "from_node_id": "function:a2a6735587193c6e84d31f91e10cdff3",
+    "language": "rust",
+    "line": 14,
+    "reference_kind": "calls",
+    "reference_name": "run"
+  },
+  {
+    "candidates": null,
+    "col": 4,
+    "file_path": "actix/src/main.rs",
+    "from_node_id": "function:c00a6838622a713addd079533520e04b",
+    "language": "rust",
+    "line": 5,
+    "reference_kind": "calls",
+    "reference_name": "HttpResponse::Ok"
+  },
+  {
+    "candidates": null,
+    "col": 4,
+    "file_path": "actix/src/main.rs",
+    "from_node_id": "function:c00a6838622a713addd079533520e04b",
+    "language": "rust",
+    "line": 5,
+    "reference_kind": "calls",
+    "reference_name": "HttpResponse::Ok().body"
+  },
+  {
+    "candidates": null,
+    "col": 4,
+    "file_path": "axum/src/main.rs",
+    "from_node_id": "function:689f8194913d54e89a243187a447d3dc",
+    "language": "rust",
+    "line": 16,
+    "reference_kind": "calls",
+    "reference_name": "String::new"
+  },
+  {
+    "candidates": null,
+    "col": 4,
+    "file_path": "axum/src/main.rs",
+    "from_node_id": "function:b473a4158e0b81f730b947fb06a41b50",
+    "language": "rust",
+    "line": 4,
+    "reference_kind": "calls",
+    "reference_name": "Router::new"
+  },
+  {
+    "candidates": null,
+    "col": 4,
+    "file_path": "axum/src/main.rs",
+    "from_node_id": "function:b473a4158e0b81f730b947fb06a41b50",
+    "language": "rust",
+    "line": 4,
+    "reference_kind": "calls",
+    "reference_name": "Router::new().route"
+  },
+  {
+    "candidates": null,
+    "col": 4,
+    "file_path": "axum/src/main.rs",
+    "from_node_id": "function:b473a4158e0b81f730b947fb06a41b50",
+    "language": "rust",
+    "line": 4,
+    "reference_kind": "calls",
+    "reference_name": "route"
+  },
+  {
+    "candidates": null,
+    "col": 4,
+    "file_path": "laravel/routes/web.php",
+    "from_node_id": "file:laravel/routes/web.php",
+    "language": "php",
+    "line": 8,
+    "reference_kind": "calls",
+    "reference_name": "Route.get"
+  },
+  {
+    "candidates": null,
+    "col": 4,
+    "file_path": "rails/app/controllers/users_controller.rb",
+    "from_node_id": "method:519356e5fcc6de599e3961ad1a49bead",
+    "language": "ruby",
+    "line": 7,
+    "reference_kind": "calls",
+    "reference_name": "render"
+  },
+  {
+    "candidates": null,
+    "col": 4,
+    "file_path": "rails/app/controllers/users_controller.rb",
+    "from_node_id": "method:ec5576bfff4fde71d094b1c11bbf0808",
+    "language": "ruby",
+    "line": 3,
+    "reference_kind": "calls",
+    "reference_name": "render"
+  },
+  {
+    "candidates": null,
+    "col": 4,
+    "file_path": "spring/src/main/java/com/example/users/UserController.java",
+    "from_node_id": "method:203dfa9524733a2e4ceac374305fad0b",
+    "language": "java",
+    "line": 15,
+    "reference_kind": "decorates",
+    "reference_name": "GetMapping"
+  },
+  {
+    "candidates": null,
+    "col": 4,
+    "file_path": "vapor/Sources/App/routes.swift",
+    "from_node_id": "function:8dd3364a31120bc5e71dc9a707df0dcc",
+    "language": "swift",
+    "line": 4,
+    "reference_kind": "calls",
+    "reference_name": "app.get"
+  },
+  {
+    "candidates": null,
+    "col": 40,
+    "file_path": "actix/src/main.rs",
+    "from_node_id": "file:actix/src/main.rs",
+    "language": "rust",
+    "line": 1,
+    "reference_kind": "imports",
+    "reference_name": "actix_web::HttpServer"
+  },
+  {
+    "candidates": null,
+    "col": 43,
+    "file_path": "play/app/controllers/HomeController.scala",
+    "from_node_id": "method:dffa1d90061d3bb5d52e05bf5da1951d",
+    "language": "scala",
+    "line": 10,
+    "reference_kind": "calls",
+    "reference_name": "Action"
+  },
+  {
+    "candidates": null,
+    "col": 45,
+    "file_path": "play/app/controllers/HomeController.scala",
+    "from_node_id": "method:0952d7c19228f96d12bb769ece592391",
+    "language": "scala",
+    "line": 8,
+    "reference_kind": "calls",
+    "reference_name": "Ok"
+  },
+  {
+    "candidates": null,
+    "col": 46,
+    "file_path": "nest/src/main.ts",
+    "from_node_id": "function:9ebdff4ce3daa221b8c910d8634dc3e2",
+    "language": "typescript",
+    "line": 8,
+    "reference_kind": "function_ref",
+    "reference_name": "VersioningType.URI"
+  },
+  {
+    "candidates": null,
+    "col": 5,
+    "file_path": "gin/main.go",
+    "from_node_id": "function:5e1d20097df150dd2a09a3e1b7cb041e",
+    "language": "go",
+    "line": 16,
+    "reference_kind": "calls",
+    "reference_name": "r.Run"
+  },
+  {
+    "candidates": null,
+    "col": 52,
+    "file_path": "play/app/controllers/HomeController.scala",
+    "from_node_id": "method:dffa1d90061d3bb5d52e05bf5da1951d",
+    "language": "scala",
+    "line": 10,
+    "reference_kind": "calls",
+    "reference_name": "Ok"
+  },
+  {
+    "candidates": null,
+    "col": 54,
+    "file_path": "nest/src/app.module.ts",
+    "from_node_id": "file:nest/src/app.module.ts",
+    "language": "typescript",
+    "line": 5,
+    "reference_kind": "function_ref",
+    "reference_name": "UsersService"
+  },
+  {
+    "candidates": null,
+    "col": 56,
+    "file_path": "axum/src/main.rs",
+    "from_node_id": "function:b473a4158e0b81f730b947fb06a41b50",
+    "language": "rust",
+    "line": 4,
+    "reference_kind": "calls",
+    "reference_name": "get"
+  },
+  {
+    "candidates": null,
+    "col": 6,
+    "file_path": "gin/main.go",
+    "from_node_id": "function:5e1d20097df150dd2a09a3e1b7cb041e",
+    "language": "go",
+    "line": 14,
+    "reference_kind": "calls",
+    "reference_name": "gin.Default"
+  },
+  {
+    "candidates": null,
+    "col": 6,
+    "file_path": "rails/app/controllers/admin/reports_controller.rb",
+    "from_node_id": "method:fd9132c439cfae25243586341304dc2d",
+    "language": "ruby",
+    "line": 4,
+    "reference_kind": "calls",
+    "reference_name": "render"
+  },
+  {
+    "candidates": null,
+    "col": 8,
+    "file_path": "nest/src/main.ts",
+    "from_node_id": "function:9ebdff4ce3daa221b8c910d8634dc3e2",
+    "language": "typescript",
+    "line": 9,
+    "reference_kind": "calls",
+    "reference_name": "app.listen"
+  },
+  {
+    "candidates": null,
+    "col": 8,
+    "file_path": "vapor/Sources/App/Controllers/TodoController.swift",
+    "from_node_id": "method:0b06fe724556d9527319b8c22a64ab43",
+    "language": "swift",
+    "line": 6,
+    "reference_kind": "calls",
+    "reference_name": "todos.get"
+  },
+  {
+    "candidates": null,
+    "col": 8,
+    "file_path": "vapor/Sources/App/routes.swift",
+    "from_node_id": "function:8dd3364a31120bc5e71dc9a707df0dcc",
+    "language": "swift",
+    "line": 7,
+    "reference_kind": "calls",
+    "reference_name": "app.register"
+  },
+  {
+    "candidates": null,
+    "col": 87,
+    "file_path": "play/app/controllers/HomeController.scala",
+    "from_node_id": "class:908c4169dedf1fe5157efb633b5125a9",
+    "language": "scala",
+    "line": 7,
+    "reference_kind": "extends",
+    "reference_name": "BaseController"
+  },
+  {
+    "candidates": null,
+    "col": 9,
+    "file_path": "nest/src/app.module.ts",
+    "from_node_id": "file:nest/src/app.module.ts",
+    "language": "typescript",
+    "line": 1,
+    "reference_kind": "imports",
+    "reference_name": "Module"
+  },
+  {
+    "candidates": null,
+    "col": 9,
+    "file_path": "nest/src/main.ts",
+    "from_node_id": "file:nest/src/main.ts",
+    "language": "typescript",
+    "line": 1,
+    "reference_kind": "imports",
+    "reference_name": "NestFactory"
+  },
+  {
+    "candidates": null,
+    "col": 9,
+    "file_path": "nest/src/main.ts",
+    "from_node_id": "file:nest/src/main.ts",
+    "language": "typescript",
+    "line": 2,
+    "reference_kind": "imports",
+    "reference_name": "VersioningType"
+  },
+  {
+    "candidates": null,
+    "col": 9,
+    "file_path": "nest/src/users/users.controller.ts",
+    "from_node_id": "file:nest/src/users/users.controller.ts",
+    "language": "typescript",
+    "line": 1,
+    "reference_kind": "imports",
+    "reference_name": "Controller"
+  },
+  {
+    "candidates": null,
+    "col": 9,
+    "file_path": "nest/src/users/users.service.ts",
+    "from_node_id": "file:nest/src/users/users.service.ts",
+    "language": "typescript",
+    "line": 1,
+    "reference_kind": "imports",
+    "reference_name": "Injectable"
+  }
+]

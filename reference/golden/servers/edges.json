@@ -1,0 +1,1820 @@
+[
+  {
+    "col": 0,
+    "kind": "calls",
+    "line": 11,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "file:nest/src/main.ts",
+    "target": "function:9ebdff4ce3daa221b8c910d8634dc3e2"
+  },
+  {
+    "col": 0,
+    "kind": "imports",
+    "line": 1,
+    "metadata": {
+      "confidence": 0.7,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "file:nest/src/app.module.ts",
+    "target": "import:3a3fab8eb20d35503306087b37b09488"
+  },
+  {
+    "col": 0,
+    "kind": "imports",
+    "line": 1,
+    "metadata": {
+      "confidence": 0.7,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "file:nest/src/users/users.controller.ts",
+    "target": "import:07416e71404457bf455563a9611a38f1"
+  },
+  {
+    "col": 0,
+    "kind": "imports",
+    "line": 1,
+    "metadata": {
+      "confidence": 0.7,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "file:nest/src/users/users.service.ts",
+    "target": "import:69415bb0f0a3c11654186d6fe545ccae"
+  },
+  {
+    "col": 0,
+    "kind": "imports",
+    "line": 1,
+    "metadata": {
+      "confidence": 0.7,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "file:vapor/Sources/App/Controllers/TodoController.swift",
+    "target": "import:0b314ddda750c707f008af9955dbf0ec"
+  },
+  {
+    "col": 0,
+    "kind": "imports",
+    "line": 1,
+    "metadata": {
+      "confidence": 0.7,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "file:vapor/Sources/App/routes.swift",
+    "target": "import:002f43122150d0c53e978f8e4bb56929"
+  },
+  {
+    "col": 0,
+    "kind": "imports",
+    "line": 1,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "file:actix/src/main.rs",
+    "target": "import:9337bb2a22681755cb761b05e70c247a"
+  },
+  {
+    "col": 0,
+    "kind": "imports",
+    "line": 1,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "file:axum/src/main.rs",
+    "target": "import:f3b6e97307a80a2aaa93e1f2088f5e22"
+  },
+  {
+    "col": 0,
+    "kind": "imports",
+    "line": 1,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "file:fastapi/main.py",
+    "target": "import:5672b7da4a6b3a19981302e740f373a9"
+  },
+  {
+    "col": 0,
+    "kind": "imports",
+    "line": 1,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "file:flask/app.py",
+    "target": "import:c4a72fb95b5af43d4e256442eb742939"
+  },
+  {
+    "col": 0,
+    "kind": "imports",
+    "line": 1,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "file:nest/src/main.ts",
+    "target": "import:ef2e7df02e7f61d48ea9d678f96f3347"
+  },
+  {
+    "col": 0,
+    "kind": "imports",
+    "line": 1,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "namespace:5621b770c48eb2fb78dfb3599ac32818",
+    "target": "import:09b6a779483d2799c7ded7048a3412dd"
+  },
+  {
+    "col": 0,
+    "kind": "imports",
+    "line": 1,
+    "metadata": {
+      "confidence": 0.95,
+      "resolvedBy": "qualified-name"
+    },
+    "provenance": null,
+    "source": "file:django/shop/urls.py",
+    "target": "import:3f6d7481feae27c4df4c52c2ac06e9f5"
+  },
+  {
+    "col": 0,
+    "kind": "imports",
+    "line": 1,
+    "metadata": {
+      "confidence": 0.95,
+      "resolvedBy": "qualified-name"
+    },
+    "provenance": null,
+    "source": "file:django/shop/views.py",
+    "target": "import:d8a52ef5786cfeacebdb8d96d2d0fe75"
+  },
+  {
+    "col": 0,
+    "kind": "imports",
+    "line": 2,
+    "metadata": {
+      "confidence": 0.7,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "file:nest/src/main.ts",
+    "target": "import:b8864d22bd7848e8f78863883f989317"
+  },
+  {
+    "col": 0,
+    "kind": "imports",
+    "line": 2,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "file:vapor/Package.swift",
+    "target": "import:f12e7545a4638c45f23b4a61175e8758"
+  },
+  {
+    "col": 0,
+    "kind": "imports",
+    "line": 2,
+    "metadata": {
+      "confidence": 0.95,
+      "resolvedBy": "qualified-name"
+    },
+    "provenance": null,
+    "source": "file:nest/src/app.module.ts",
+    "target": "import:cc6e06b72f217d0405235e9936915b2d"
+  },
+  {
+    "col": 0,
+    "kind": "imports",
+    "line": 2,
+    "metadata": {
+      "confidence": 0.95,
+      "resolvedBy": "qualified-name"
+    },
+    "provenance": null,
+    "source": "file:nest/src/users/users.controller.ts",
+    "target": "import:bd04287f7581a4729261425fba53948e"
+  },
+  {
+    "col": 0,
+    "kind": "imports",
+    "line": 3,
+    "metadata": {
+      "confidence": 0.7,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "file:laravel/routes/api.php",
+    "target": "import:9a8a569665d599cc0c29bd27f0f07798"
+  },
+  {
+    "col": 0,
+    "kind": "imports",
+    "line": 3,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "file:laravel/routes/web.php",
+    "target": "import:8034c4ef1a81805dc8fedb0311b8a4d6"
+  },
+  {
+    "col": 0,
+    "kind": "imports",
+    "line": 3,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "file:play/app/controllers/HomeController.scala",
+    "target": "import:93ed606ca17de2e32cd75943dd536ea0"
+  },
+  {
+    "col": 0,
+    "kind": "imports",
+    "line": 3,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "namespace:02ebee76e8a3ddd520f7ada1f2a9b996",
+    "target": "import:dffe4ae6765851ae40db28f96b438646"
+  },
+  {
+    "col": 0,
+    "kind": "imports",
+    "line": 3,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "namespace:89420a54d6cc3ed24b9523bf98d7ed5d",
+    "target": "import:adfa49ca55ce1812bb73c18965b28abb"
+  },
+  {
+    "col": 0,
+    "kind": "imports",
+    "line": 3,
+    "metadata": {
+      "confidence": 0.95,
+      "resolvedBy": "qualified-name"
+    },
+    "provenance": null,
+    "source": "file:django/shop/urls.py",
+    "target": "import:509c72514d8aa5f96fcfb30da2d5a39e"
+  },
+  {
+    "col": 0,
+    "kind": "imports",
+    "line": 3,
+    "metadata": {
+      "confidence": 0.95,
+      "resolvedBy": "qualified-name"
+    },
+    "provenance": null,
+    "source": "file:nest/src/app.module.ts",
+    "target": "import:bc14cae2fcfc4c0cbeaac23e3ddfe457"
+  },
+  {
+    "col": 0,
+    "kind": "imports",
+    "line": 3,
+    "metadata": {
+      "confidence": 0.95,
+      "resolvedBy": "qualified-name"
+    },
+    "provenance": null,
+    "source": "file:nest/src/main.ts",
+    "target": "import:5f057ee3069c78d863f7b664c52752b5"
+  },
+  {
+    "col": 0,
+    "kind": "imports",
+    "line": 4,
+    "metadata": {
+      "confidence": 0.7,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "file:laravel/routes/web.php",
+    "target": "import:10b8728bfdf38c1d1d3167fd24458937"
+  },
+  {
+    "col": 0,
+    "kind": "imports",
+    "line": 4,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "file:play/app/controllers/HomeController.scala",
+    "target": "import:2ef9f9a21636395709f249c3fa33bf68"
+  },
+  {
+    "col": 0,
+    "kind": "imports",
+    "line": 4,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "namespace:89420a54d6cc3ed24b9523bf98d7ed5d",
+    "target": "import:db3db8de213cb2c9c40253eb56d7c480"
+  },
+  {
+    "col": 0,
+    "kind": "imports",
+    "line": 5,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "namespace:89420a54d6cc3ed24b9523bf98d7ed5d",
+    "target": "import:1f72115a751b0d80f63d3648dffb898c"
+  },
+  {
+    "col": 0,
+    "kind": "imports",
+    "line": 5,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "namespace:9cc6f3fa64a53fb24596b3a255875059",
+    "target": "import:86f66b5ebf09175d62b9cbb65d0598aa"
+  },
+  {
+    "col": 0,
+    "kind": "imports",
+    "line": 6,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "namespace:89420a54d6cc3ed24b9523bf98d7ed5d",
+    "target": "import:f60a90da3b21845a035a351f659d1191"
+  },
+  {
+    "col": 0,
+    "kind": "imports",
+    "line": 7,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "namespace:89420a54d6cc3ed24b9523bf98d7ed5d",
+    "target": "import:cc765525266ad9c9147e0bfd4cb8ddcc"
+  },
+  {
+    "col": 0,
+    "kind": "references",
+    "line": 8,
+    "metadata": {
+      "confidence": 0.7,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "route:nest/src/users/users.controller.ts:8:GET:/users/:id",
+    "target": "method:49949645145820e984b029acad16139c"
+  },
+  {
+    "col": 11,
+    "kind": "calls",
+    "line": 10,
+    "metadata": {
+      "confidence": 0.85,
+      "resolvedBy": "instance-method"
+    },
+    "provenance": null,
+    "source": "method:49949645145820e984b029acad16139c",
+    "target": "method:e8744cde22f336827f79236f7ec3c0ae"
+  },
+  {
+    "col": 11,
+    "kind": "calls",
+    "line": 10,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "file:express/routes/users.js",
+    "target": "function:203842290365d50993a2f45495b18a72"
+  },
+  {
+    "col": 11,
+    "kind": "calls",
+    "line": 13,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "function:a5a6ecc0fc3fdcb6fc5249ca49a5dbea",
+    "target": "function:9387feb17c7a091449c44cd100568815"
+  },
+  {
+    "col": 11,
+    "kind": "calls",
+    "line": 8,
+    "metadata": {
+      "confidence": 0.4,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "function:c49b36ba9866aa9075c5e726b4f3fd4b",
+    "target": "function:233af15af580db19c828f5ee8f78a483"
+  },
+  {
+    "col": 11,
+    "kind": "calls",
+    "line": 9,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "function:91f55ff4968a290758de7bbd2a2aabfd",
+    "target": "function:3fa49d2ea27ead1cb13afc6f86e1ff3f"
+  },
+  {
+    "col": 12,
+    "kind": "calls",
+    "line": 20,
+    "metadata": {
+      "confidence": 0.7,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "function:3fe56047b3be3b25f130a37afbbab635",
+    "target": "function:b473a4158e0b81f730b947fb06a41b50"
+  },
+  {
+    "col": 12,
+    "kind": "calls",
+    "line": 4,
+    "metadata": {
+      "confidence": 0.4,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "constant:7ebbb89b6f7b9e19fabb92c0ad65118c",
+    "target": "constant:534df51fd59b1266fc6c127cda3e2ee7"
+  },
+  {
+    "col": 14,
+    "kind": "imports",
+    "line": 3,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "file:django/shop/urls.py",
+    "target": "file:django/shop/views.py"
+  },
+  {
+    "col": 15,
+    "kind": "calls",
+    "line": 17,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "instance-method"
+    },
+    "provenance": null,
+    "source": "method:203dfa9524733a2e4ceac374305fad0b",
+    "target": "method:4c73f840b24020322f82b69cff754959"
+  },
+  {
+    "col": 15,
+    "kind": "calls",
+    "line": 5,
+    "metadata": {
+      "confidence": 0.7,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "function:8dd3364a31120bc5e71dc9a707df0dcc",
+    "target": "function:94b39098bab610cdaf0bdebd6ef1b20f"
+  },
+  {
+    "col": 16,
+    "kind": "references",
+    "line": 15,
+    "metadata": {
+      "confidence": 0.95,
+      "fnRef": true,
+      "resolvedBy": "function-ref"
+    },
+    "provenance": null,
+    "source": "function:5e1d20097df150dd2a09a3e1b7cb041e",
+    "target": "function:822994b41b49c7ca4069da738515f400"
+  },
+  {
+    "col": 22,
+    "kind": "calls",
+    "line": 12,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "method:5305c5e90802aeb697042a8f5a945c5c",
+    "target": "method:689677c2c9f3e992fb81ebee8995a7e7"
+  },
+  {
+    "col": 23,
+    "kind": "references",
+    "line": 6,
+    "metadata": {
+      "confidence": 0.95,
+      "fnRef": true,
+      "resolvedBy": "function-ref"
+    },
+    "provenance": null,
+    "source": "method:0b06fe724556d9527319b8c22a64ab43",
+    "target": "method:e26506678f57fd0e05462e7399ce0be8"
+  },
+  {
+    "col": 26,
+    "kind": "calls",
+    "line": 4,
+    "metadata": {
+      "confidence": 0.85,
+      "resolvedBy": "qualified-name"
+    },
+    "provenance": null,
+    "source": "file:aspnet/Program.cs",
+    "target": "method:399ebceadaa4db26ab518551c4b2c6e6"
+  },
+  {
+    "col": 28,
+    "kind": "calls",
+    "line": 5,
+    "metadata": {
+      "confidence": 0.7,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "function:c00a6838622a713addd079533520e04b",
+    "target": "function:82a0f0afc49fcd39285accff4fdbde41"
+  },
+  {
+    "col": 28,
+    "kind": "references",
+    "line": 6,
+    "metadata": {
+      "confidence": 0.9,
+      "fnRef": true,
+      "resolvedBy": "function-ref"
+    },
+    "provenance": null,
+    "source": "file:django/shop/urls.py",
+    "target": "function:c7f3c01d15e858886375c57ef6bd694e"
+  },
+  {
+    "col": 29,
+    "kind": "calls",
+    "line": 11,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "method:dbc237abab96f8f768a79e8d91dc5d8f",
+    "target": "method:2e0a23a952ecacb2aaf0e8858091b5ff"
+  },
+  {
+    "col": 30,
+    "kind": "calls",
+    "line": 6,
+    "metadata": {
+      "confidence": 0.4,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "function:822994b41b49c7ca4069da738515f400",
+    "target": "function:694e25b347b7b84af61922f9058caac3"
+  },
+  {
+    "col": 33,
+    "kind": "instantiates",
+    "line": 7,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "function:8dd3364a31120bc5e71dc9a707df0dcc",
+    "target": "struct:b8ebc07fa3053803566be74ed25a96e3"
+  },
+  {
+    "col": 33,
+    "kind": "references",
+    "line": 4,
+    "metadata": {
+      "confidence": 0.95,
+      "fnRef": true,
+      "resolvedBy": "function-ref"
+    },
+    "provenance": null,
+    "source": "function:b473a4158e0b81f730b947fb06a41b50",
+    "target": "function:906746217bd0eb7b32b0e0f273152ec6"
+  },
+  {
+    "col": 34,
+    "kind": "calls",
+    "line": 5,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "function:c7f3c01d15e858886375c57ef6bd694e",
+    "target": "function:8a3a97883fdb46dd38ad9262a2dc8489"
+  },
+  {
+    "col": 36,
+    "kind": "references",
+    "line": 19,
+    "metadata": {
+      "confidence": 0.95,
+      "fnRef": true,
+      "resolvedBy": "function-ref"
+    },
+    "provenance": null,
+    "source": "file:flask/app.py",
+    "target": "function:359d25aadac7c78f4c23663b4a877017"
+  },
+  {
+    "col": 4,
+    "kind": "calls",
+    "line": 12,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "function:b1496fb151be50dd31a292a7bf05f2eb",
+    "target": "function:689f8194913d54e89a243187a447d3dc"
+  },
+  {
+    "col": 42,
+    "kind": "references",
+    "line": 14,
+    "metadata": {
+      "confidence": 0.95,
+      "fnRef": true,
+      "resolvedBy": "function-ref"
+    },
+    "provenance": null,
+    "source": "function:a2a6735587193c6e84d31f91e10cdff3",
+    "target": "function:c00a6838622a713addd079533520e04b"
+  },
+  {
+    "col": 45,
+    "kind": "references",
+    "line": 6,
+    "metadata": {
+      "confidence": 0.9,
+      "fnRef": true,
+      "resolvedBy": "function-ref"
+    },
+    "provenance": null,
+    "source": "file:laravel/routes/web.php",
+    "target": "method:89630d061e1ba36c3a3eee13e796d89a"
+  },
+  {
+    "col": 45,
+    "kind": "references",
+    "line": 6,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "method:f74d3a0d68aefdfbd126ee98f8974fe9",
+    "target": "class:dd7a559e38199bbfc9aad6cc66584786"
+  },
+  {
+    "col": 47,
+    "kind": "calls",
+    "line": 9,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "method:89630d061e1ba36c3a3eee13e796d89a",
+    "target": "method:b1b5ab1509b18a2033bb2d3cb8c52c1f"
+  },
+  {
+    "col": 48,
+    "kind": "calls",
+    "line": 8,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "method:0952d7c19228f96d12bb769ece592391",
+    "target": "method:4ad7168daf4280198373fcd712ff0a0b"
+  },
+  {
+    "col": 60,
+    "kind": "references",
+    "line": 4,
+    "metadata": {
+      "confidence": 0.95,
+      "fnRef": true,
+      "resolvedBy": "function-ref"
+    },
+    "provenance": null,
+    "source": "function:b473a4158e0b81f730b947fb06a41b50",
+    "target": "function:b1496fb151be50dd31a292a7bf05f2eb"
+  },
+  {
+    "col": 7,
+    "kind": "imports",
+    "line": 3,
+    "metadata": {
+      "confidence": 0.95,
+      "resolvedBy": "qualified-name"
+    },
+    "provenance": null,
+    "source": "file:gin/main.go",
+    "target": "import:cee7c74f3ff3a708db06d9fda210ade7"
+  },
+  {
+    "col": 8,
+    "kind": "references",
+    "line": 10,
+    "metadata": {
+      "confidence": 0.95,
+      "fnRef": true,
+      "resolvedBy": "function-ref"
+    },
+    "provenance": null,
+    "source": "file:express/app.js",
+    "target": "function:16279817ad2a6e3ecd9cda244219b9cb"
+  },
+  {
+    "col": 9,
+    "kind": "imports",
+    "line": 2,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "file:nest/src/app.module.ts",
+    "target": "class:36b4b6e1e98c86a0b4c46c4efad52e9c"
+  },
+  {
+    "col": 9,
+    "kind": "imports",
+    "line": 2,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "file:nest/src/users/users.controller.ts",
+    "target": "class:dd7a559e38199bbfc9aad6cc66584786"
+  },
+  {
+    "col": 9,
+    "kind": "imports",
+    "line": 3,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "file:nest/src/app.module.ts",
+    "target": "class:dd7a559e38199bbfc9aad6cc66584786"
+  },
+  {
+    "col": 9,
+    "kind": "imports",
+    "line": 3,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "file:nest/src/main.ts",
+    "target": "class:b85f92e25e17a53ca474c50e773fbbce"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "class:14ec2f0f328423f71434027b160d7e18",
+    "target": "method:399ebceadaa4db26ab518551c4b2c6e6"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "class:19fed4f1deb67fb9289f70ef980e2c67",
+    "target": "method:4c73f840b24020322f82b69cff754959"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "class:36b4b6e1e98c86a0b4c46c4efad52e9c",
+    "target": "method:49949645145820e984b029acad16139c"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "class:36b4b6e1e98c86a0b4c46c4efad52e9c",
+    "target": "method:f74d3a0d68aefdfbd126ee98f8974fe9"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "class:4427637d355b7933cc98e64c30388b30",
+    "target": "method:2e0a23a952ecacb2aaf0e8858091b5ff"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "class:4427637d355b7933cc98e64c30388b30",
+    "target": "method:dbc237abab96f8f768a79e8d91dc5d8f"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "class:4f18c6a55fbdb96432d525ab7e14c64e",
+    "target": "method:89630d061e1ba36c3a3eee13e796d89a"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "class:4f18c6a55fbdb96432d525ab7e14c64e",
+    "target": "method:9c266f666867e6f29cf57cec22ddddc0"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "class:4f18c6a55fbdb96432d525ab7e14c64e",
+    "target": "method:b1b5ab1509b18a2033bb2d3cb8c52c1f"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "class:5ea1790a8fc9afffc23c1ef543e0efae",
+    "target": "method:14c1347bd7aee3a928b0b3e6ce0e6e6e"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "class:5ea1790a8fc9afffc23c1ef543e0efae",
+    "target": "method:519356e5fcc6de599e3961ad1a49bead"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "class:5ea1790a8fc9afffc23c1ef543e0efae",
+    "target": "method:ec5576bfff4fde71d094b1c11bbf0808"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "class:6ec3aacfa8e83a050de08024bb99c1f7",
+    "target": "field:6330d8451ba170c8488baa2b07967cbf"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "class:6ec3aacfa8e83a050de08024bb99c1f7",
+    "target": "method:203dfa9524733a2e4ceac374305fad0b"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "class:908c4169dedf1fe5157efb633b5125a9",
+    "target": "method:0952d7c19228f96d12bb769ece592391"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "class:908c4169dedf1fe5157efb633b5125a9",
+    "target": "method:4ad7168daf4280198373fcd712ff0a0b"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "class:908c4169dedf1fe5157efb633b5125a9",
+    "target": "method:dffa1d90061d3bb5d52e05bf5da1951d"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "class:d5d6042d06254c952127e6e835674a66",
+    "target": "method:fd9132c439cfae25243586341304dc2d"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "class:dd7a559e38199bbfc9aad6cc66584786",
+    "target": "method:e8744cde22f336827f79236f7ec3c0ae"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "class:e1ff6b0b9c2d0dbf97ddf5bc62282550",
+    "target": "method:5305c5e90802aeb697042a8f5a945c5c"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "class:e1ff6b0b9c2d0dbf97ddf5bc62282550",
+    "target": "method:689677c2c9f3e992fb81ebee8995a7e7"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:actix/src/main.rs",
+    "target": "function:82a0f0afc49fcd39285accff4fdbde41"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:actix/src/main.rs",
+    "target": "function:a2a6735587193c6e84d31f91e10cdff3"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:actix/src/main.rs",
+    "target": "function:c00a6838622a713addd079533520e04b"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:actix/src/main.rs",
+    "target": "import:9337bb2a22681755cb761b05e70c247a"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:aspnet/Controllers/UsersController.cs",
+    "target": "namespace:5621b770c48eb2fb78dfb3599ac32818"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:aspnet/Program.cs",
+    "target": "class:14ec2f0f328423f71434027b160d7e18"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:axum/src/main.rs",
+    "target": "function:3fe56047b3be3b25f130a37afbbab635"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:axum/src/main.rs",
+    "target": "function:689f8194913d54e89a243187a447d3dc"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:axum/src/main.rs",
+    "target": "function:906746217bd0eb7b32b0e0f273152ec6"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:axum/src/main.rs",
+    "target": "function:b1496fb151be50dd31a292a7bf05f2eb"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:axum/src/main.rs",
+    "target": "function:b473a4158e0b81f730b947fb06a41b50"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:axum/src/main.rs",
+    "target": "import:f3b6e97307a80a2aaa93e1f2088f5e22"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:django/shop/urls.py",
+    "target": "import:3f6d7481feae27c4df4c52c2ac06e9f5"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:django/shop/urls.py",
+    "target": "import:509c72514d8aa5f96fcfb30da2d5a39e"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:django/shop/urls.py",
+    "target": "variable:9df1d4a53d2df042760d2c8d1024bee5"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:django/shop/views.py",
+    "target": "function:8a3a97883fdb46dd38ad9262a2dc8489"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:django/shop/views.py",
+    "target": "function:c7f3c01d15e858886375c57ef6bd694e"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:django/shop/views.py",
+    "target": "import:d8a52ef5786cfeacebdb8d96d2d0fe75"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:drupal/modules/custom/greeting/src/Controller/GreetingController.php",
+    "target": "namespace:9cc6f3fa64a53fb24596b3a255875059"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:express/app.js",
+    "target": "constant:534df51fd59b1266fc6c127cda3e2ee7"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:express/app.js",
+    "target": "constant:77ae0a0e3a39fd3e312956380f52f71d"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:express/app.js",
+    "target": "constant:7ebbb89b6f7b9e19fabb92c0ad65118c"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:express/app.js",
+    "target": "function:16279817ad2a6e3ecd9cda244219b9cb"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:express/app.js",
+    "target": "function:9387feb17c7a091449c44cd100568815"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:express/app.js",
+    "target": "function:a5a6ecc0fc3fdcb6fc5249ca49a5dbea"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:express/routes/users.js",
+    "target": "constant:d1b69054221431f51b587e24cd94be13"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:express/routes/users.js",
+    "target": "constant:d732f584521946d9fe931b0cb1834c06"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:express/routes/users.js",
+    "target": "function:203842290365d50993a2f45495b18a72"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:fastapi/main.py",
+    "target": "function:3fa49d2ea27ead1cb13afc6f86e1ff3f"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:fastapi/main.py",
+    "target": "function:91f55ff4968a290758de7bbd2a2aabfd"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:fastapi/main.py",
+    "target": "import:5672b7da4a6b3a19981302e740f373a9"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:fastapi/main.py",
+    "target": "variable:54db3a22883c2057acccd3d2ddce692d"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:fastapi/main.py",
+    "target": "variable:e77eb1f042facd495c2f739639ffe1e4"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:flask/app.py",
+    "target": "function:233af15af580db19c828f5ee8f78a483"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:flask/app.py",
+    "target": "function:359d25aadac7c78f4c23663b4a877017"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:flask/app.py",
+    "target": "function:c49b36ba9866aa9075c5e726b4f3fd4b"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:flask/app.py",
+    "target": "import:c4a72fb95b5af43d4e256442eb742939"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:flask/app.py",
+    "target": "variable:bcdf45f6e77c6ede088e6c3689502bee"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:gin/main.go",
+    "target": "function:5e1d20097df150dd2a09a3e1b7cb041e"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:gin/main.go",
+    "target": "function:694e25b347b7b84af61922f9058caac3"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:gin/main.go",
+    "target": "function:822994b41b49c7ca4069da738515f400"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:gin/main.go",
+    "target": "import:cee7c74f3ff3a708db06d9fda210ade7"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:laravel/app/Http/Controllers/UserController.php",
+    "target": "namespace:6d9c45b30b344db42024c582839e7680"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:laravel/routes/api.php",
+    "target": "import:9a8a569665d599cc0c29bd27f0f07798"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:laravel/routes/web.php",
+    "target": "import:10b8728bfdf38c1d1d3167fd24458937"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:laravel/routes/web.php",
+    "target": "import:8034c4ef1a81805dc8fedb0311b8a4d6"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:nest/src/app.module.ts",
+    "target": "class:b85f92e25e17a53ca474c50e773fbbce"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:nest/src/app.module.ts",
+    "target": "import:3a3fab8eb20d35503306087b37b09488"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:nest/src/app.module.ts",
+    "target": "import:bc14cae2fcfc4c0cbeaac23e3ddfe457"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:nest/src/app.module.ts",
+    "target": "import:cc6e06b72f217d0405235e9936915b2d"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:nest/src/main.ts",
+    "target": "function:9ebdff4ce3daa221b8c910d8634dc3e2"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:nest/src/main.ts",
+    "target": "import:5f057ee3069c78d863f7b664c52752b5"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:nest/src/main.ts",
+    "target": "import:b8864d22bd7848e8f78863883f989317"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:nest/src/main.ts",
+    "target": "import:ef2e7df02e7f61d48ea9d678f96f3347"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:nest/src/users/users.controller.ts",
+    "target": "class:36b4b6e1e98c86a0b4c46c4efad52e9c"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:nest/src/users/users.controller.ts",
+    "target": "import:07416e71404457bf455563a9611a38f1"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:nest/src/users/users.controller.ts",
+    "target": "import:bd04287f7581a4729261425fba53948e"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:nest/src/users/users.service.ts",
+    "target": "class:dd7a559e38199bbfc9aad6cc66584786"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:nest/src/users/users.service.ts",
+    "target": "import:69415bb0f0a3c11654186d6fe545ccae"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:play/app/controllers/HomeController.scala",
+    "target": "class:908c4169dedf1fe5157efb633b5125a9"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:play/app/controllers/HomeController.scala",
+    "target": "import:2ef9f9a21636395709f249c3fa33bf68"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:play/app/controllers/HomeController.scala",
+    "target": "import:93ed606ca17de2e32cd75943dd536ea0"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:rails/app/controllers/admin/reports_controller.rb",
+    "target": "module:83d9820a44a51190cb8723354b6b5180"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:rails/app/controllers/users_controller.rb",
+    "target": "class:5ea1790a8fc9afffc23c1ef543e0efae"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:spring/src/main/java/com/example/users/UserController.java",
+    "target": "namespace:89420a54d6cc3ed24b9523bf98d7ed5d"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:spring/src/main/java/com/example/users/UserService.java",
+    "target": "namespace:02ebee76e8a3ddd520f7ada1f2a9b996"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:vapor/Package.swift",
+    "target": "import:f12e7545a4638c45f23b4a61175e8758"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:vapor/Sources/App/Controllers/TodoController.swift",
+    "target": "import:0b314ddda750c707f008af9955dbf0ec"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:vapor/Sources/App/Controllers/TodoController.swift",
+    "target": "struct:b8ebc07fa3053803566be74ed25a96e3"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:vapor/Sources/App/routes.swift",
+    "target": "function:8dd3364a31120bc5e71dc9a707df0dcc"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:vapor/Sources/App/routes.swift",
+    "target": "function:94b39098bab610cdaf0bdebd6ef1b20f"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:vapor/Sources/App/routes.swift",
+    "target": "import:002f43122150d0c53e978f8e4bb56929"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "module:83d9820a44a51190cb8723354b6b5180",
+    "target": "class:d5d6042d06254c952127e6e835674a66"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "namespace:02ebee76e8a3ddd520f7ada1f2a9b996",
+    "target": "class:19fed4f1deb67fb9289f70ef980e2c67"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "namespace:02ebee76e8a3ddd520f7ada1f2a9b996",
+    "target": "import:dffe4ae6765851ae40db28f96b438646"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "namespace:5621b770c48eb2fb78dfb3599ac32818",
+    "target": "class:e1ff6b0b9c2d0dbf97ddf5bc62282550"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "namespace:5621b770c48eb2fb78dfb3599ac32818",
+    "target": "import:09b6a779483d2799c7ded7048a3412dd"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "namespace:6d9c45b30b344db42024c582839e7680",
+    "target": "class:4f18c6a55fbdb96432d525ab7e14c64e"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "namespace:89420a54d6cc3ed24b9523bf98d7ed5d",
+    "target": "class:6ec3aacfa8e83a050de08024bb99c1f7"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "namespace:89420a54d6cc3ed24b9523bf98d7ed5d",
+    "target": "import:1f72115a751b0d80f63d3648dffb898c"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "namespace:89420a54d6cc3ed24b9523bf98d7ed5d",
+    "target": "import:adfa49ca55ce1812bb73c18965b28abb"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "namespace:89420a54d6cc3ed24b9523bf98d7ed5d",
+    "target": "import:cc765525266ad9c9147e0bfd4cb8ddcc"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "namespace:89420a54d6cc3ed24b9523bf98d7ed5d",
+    "target": "import:db3db8de213cb2c9c40253eb56d7c480"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "namespace:89420a54d6cc3ed24b9523bf98d7ed5d",
+    "target": "import:f60a90da3b21845a035a351f659d1191"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "namespace:9cc6f3fa64a53fb24596b3a255875059",
+    "target": "class:4427637d355b7933cc98e64c30388b30"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "namespace:9cc6f3fa64a53fb24596b3a255875059",
+    "target": "import:86f66b5ebf09175d62b9cbb65d0598aa"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "struct:b8ebc07fa3053803566be74ed25a96e3",
+    "target": "method:0b06fe724556d9527319b8c22a64ab43"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "struct:b8ebc07fa3053803566be74ed25a96e3",
+    "target": "method:e26506678f57fd0e05462e7399ce0be8"
+  }
+]

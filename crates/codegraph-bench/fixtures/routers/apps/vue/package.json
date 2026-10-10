@@ -1,0 +1,1 @@
+{ "name": "vue-router-app", "private": true, "dependencies": { "vue": "3.4.0", "vue-router": "4.2.0" } }

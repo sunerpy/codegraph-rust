@@ -1,0 +1,236 @@
+[
+  {
+    "content_hash": "9d902e82fc6a8dd632bd64d8a098d3bc7f4a54292026530cfac2a876ba6ebbbb",
+    "errors": null,
+    "generated": 0,
+    "language": "typescript",
+    "node_count": 4,
+    "path": "apps/angular/src/app/app.routes.ts",
+    "size": 278
+  },
+  {
+    "content_hash": "23f4b16e595115e0c9545f8aa39906584f31a2d3965eb3fe19b3cc3707699b35",
+    "errors": null,
+    "generated": 0,
+    "language": "typescript",
+    "node_count": 7,
+    "path": "apps/angular/src/app/home/home.component.ts",
+    "size": 364
+  },
+  {
+    "content_hash": "1d8e616d293b91fb3824755a4d8f198e8c61f2cf00ce38aeb6d189fce1156e04",
+    "errors": null,
+    "generated": 0,
+    "language": "tsx",
+    "node_count": 3,
+    "path": "apps/expo/app/_layout.tsx",
+    "size": 95
+  },
+  {
+    "content_hash": "f1c1b215b623945ca9e52960206a5ded4ec98c0fb9991f795d3c8258d609a3e6",
+    "errors": null,
+    "generated": 0,
+    "language": "typescript",
+    "node_count": 2,
+    "path": "apps/expo/app/api/hello+api.ts",
+    "size": 70
+  },
+  {
+    "content_hash": "fe555b712b7ecee6b2abbd9b1cf4e00139031effb36bf0eeefdbba32bda873f8",
+    "errors": null,
+    "generated": 0,
+    "language": "tsx",
+    "node_count": 4,
+    "path": "apps/expo/app/index.tsx",
+    "size": 193
+  },
+  {
+    "content_hash": "f9aa792f791d536a75780f6315d9644648d837d3bfa3a5723faf38b28ee31f4f",
+    "errors": null,
+    "generated": 0,
+    "language": "tsx",
+    "node_count": 3,
+    "path": "apps/expo/app/settings.tsx",
+    "size": 109
+  },
+  {
+    "content_hash": "181deeef974b598e5647e25d12a88fd0d50522c09dec67127cc3c1d5b2e4a6d4",
+    "errors": null,
+    "generated": 0,
+    "language": "typescript",
+    "node_count": 2,
+    "path": "apps/next/app/api/auth/route.ts",
+    "size": 70
+  },
+  {
+    "content_hash": "dfd8684f0e73fc5b793028a865647ef5386c52c05e9cec7eac60ce3f06f13533",
+    "errors": null,
+    "generated": 0,
+    "language": "tsx",
+    "node_count": 3,
+    "path": "apps/next/app/dashboard/page.tsx",
+    "size": 195
+  },
+  {
+    "content_hash": "c77b68cfec4bf09ca5d1c7c8bb14fcfdd7dbb5a1c91b3a982e3d022c9da0260c",
+    "errors": null,
+    "generated": 0,
+    "language": "tsx",
+    "node_count": 2,
+    "path": "apps/next/app/layout.tsx",
+    "size": 131
+  },
+  {
+    "content_hash": "c0b28c7efefba9b5cb6cf1c20a4bfec8566744031b99f21a4a81bd9aa841dc9f",
+    "errors": null,
+    "generated": 0,
+    "language": "tsx",
+    "node_count": 3,
+    "path": "apps/next/app/page.tsx",
+    "size": 117
+  },
+  {
+    "content_hash": "81914920c008151b3021164b604a2974a2a6f2189fd502b01aba42a3a0603617",
+    "errors": null,
+    "generated": 0,
+    "language": "tsx",
+    "node_count": 2,
+    "path": "apps/next/components/posts.tsx",
+    "size": 45
+  },
+  {
+    "content_hash": "45a51f47e4227104d82de6aca10d4d110f81f6d50becae06f8891a8b2b23e666",
+    "errors": null,
+    "generated": 0,
+    "language": "tsx",
+    "node_count": 2,
+    "path": "apps/next/pages/legacy.tsx",
+    "size": 61
+  },
+  {
+    "content_hash": "0948e61c42cd7fc14364193d34eea30443f0bbb8d06958287c0ffe56fd852f36",
+    "errors": null,
+    "generated": 0,
+    "language": "vue",
+    "node_count": 2,
+    "path": "apps/nuxt/pages/index.vue",
+    "size": 149
+  },
+  {
+    "content_hash": "9766e3a7d6c37f351205ac3cb8cef1cad83f5712476ce767a99e38b3863486a0",
+    "errors": null,
+    "generated": 0,
+    "language": "vue",
+    "node_count": 1,
+    "path": "apps/nuxt/pages/users/[id].vue",
+    "size": 126
+  },
+  {
+    "content_hash": "520411bbab0111168126595385f77b665a330621366194f9d927e6b33dd9f083",
+    "errors": null,
+    "generated": 0,
+    "language": "tsx",
+    "node_count": 6,
+    "path": "apps/react-router/src/main.tsx",
+    "size": 567
+  },
+  {
+    "content_hash": "0dbc05f176ab5d6c8e78477853a4303e7f22ceffe39503687e6859bca109dce7",
+    "errors": null,
+    "generated": 0,
+    "language": "tsx",
+    "node_count": 2,
+    "path": "apps/react-router/src/pages/Home.tsx",
+    "size": 51
+  },
+  {
+    "content_hash": "14d97d09abd8a59def3ca549f1cd03b09d51f5ddfe2d27a2ea21ca65bdd095e9",
+    "errors": null,
+    "generated": 0,
+    "language": "tsx",
+    "node_count": 3,
+    "path": "apps/react-router/src/pages/Layout.tsx",
+    "size": 107
+  },
+  {
+    "content_hash": "df55ae4732c9d5c7ae073b110b91ba60a81f84ce7181d735df0da7fa8623a35a",
+    "errors": null,
+    "generated": 0,
+    "language": "tsx",
+    "node_count": 2,
+    "path": "apps/react-router/src/pages/Team.tsx",
+    "size": 56
+  },
+  {
+    "content_hash": "3fc557d15e2108a348b353585d23b0f11c965ddc6c4e3019dc7b9cfa5dc5f6d1",
+    "errors": null,
+    "generated": 0,
+    "language": "svelte",
+    "node_count": 1,
+    "path": "apps/sveltekit/src/routes/(marketing)/about/+page.svelte",
+    "size": 15
+  },
+  {
+    "content_hash": "24cfc15d9d8c3815e95ea11a855a95ec3e4c5ea15c77de783c5ce5b8777bb840",
+    "errors": null,
+    "generated": 0,
+    "language": "svelte",
+    "node_count": 3,
+    "path": "apps/sveltekit/src/routes/+page.svelte",
+    "size": 146
+  },
+  {
+    "content_hash": "df821fff7acd2fb224adf6acc85b4217419500239b3d7fd97d44a45a776e9297",
+    "errors": null,
+    "generated": 0,
+    "language": "typescript",
+    "node_count": 3,
+    "path": "apps/sveltekit/src/routes/blog/[slug=slug]/+page.ts",
+    "size": 162
+  },
+  {
+    "content_hash": "a12bf61f450c6962a0adeb521de2f28df02154406408cf4e4e363973cf20a7aa",
+    "errors": null,
+    "generated": 0,
+    "language": "tsx",
+    "node_count": 4,
+    "path": "apps/tanstack/src/routes/index.tsx",
+    "size": 196
+  },
+  {
+    "content_hash": "8127be03e259d1279ef683ce89d977f8348dbdc1969a269a1358b7ffdb9b63a2",
+    "errors": null,
+    "generated": 0,
+    "language": "tsx",
+    "node_count": 4,
+    "path": "apps/tanstack/src/routes/posts.tsx",
+    "size": 171
+  },
+  {
+    "content_hash": "521858b56b6ab8f3ca6d6add69e7582281057e997011c0f80ce3c6623ab2ea7c",
+    "errors": null,
+    "generated": 0,
+    "language": "typescript",
+    "node_count": 5,
+    "path": "apps/vue/src/router/index.ts",
+    "size": 473
+  },
+  {
+    "content_hash": "fb8c2fc08871ea2a7c3c0d7f92671ccc5bf97d20f09ed1fedfc3304f303eb498",
+    "errors": null,
+    "generated": 0,
+    "language": "vue",
+    "node_count": 1,
+    "path": "apps/vue/src/views/About.vue",
+    "size": 69
+  },
+  {
+    "content_hash": "2266f97fd19d0c1c45356fd6967962d890d2335ebeea16704ab6ae3b852e9e08",
+    "errors": null,
+    "generated": 0,
+    "language": "vue",
+    "node_count": 1,
+    "path": "apps/vue/src/views/Home.vue",
+    "size": 140
+  }
+]
