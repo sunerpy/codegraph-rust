@@ -31,6 +31,26 @@
   },
   {
     "candidates": null,
+    "col": 15,
+    "file_path": "src/Field/FirstName.php",
+    "from_node_id": "method:4e32dd7e5c8e93e94ca89040929d64b5",
+    "language": "php",
+    "line": 14,
+    "reference_kind": "instantiates",
+    "reference_name": "self"
+  },
+  {
+    "candidates": null,
+    "col": 15,
+    "file_path": "src/Field/Registry.php",
+    "from_node_id": "method:e6bddc97c9c9c187daba700a47a2189c",
+    "language": "php",
+    "line": 9,
+    "reference_kind": "instantiates",
+    "reference_name": "static"
+  },
+  {
+    "candidates": null,
     "col": 16,
     "file_path": "src/Controller.php",
     "from_node_id": "method:d7e53b91aba4c60a50c0023d3ae0b6fa",

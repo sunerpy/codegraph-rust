@@ -584,6 +584,7 @@ matrix! {
     python_from_import_of_an_added_module,
     go_call_into_an_added_file_of_the_same_package,
     typescript_collapsed_parse_is_fixed,
+    go_composite_literal_of_an_added_struct,
     c_include_of_an_added_header,
     #[ignore = "W5-02 #2403: a Liquid `render` does not link a snippet that appears later"]
     liquid_render_of_an_added_snippet,

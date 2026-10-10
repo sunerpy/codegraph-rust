@@ -1,5 +1,29 @@
 [
   {
+    "col": 6,
+    "kind": "instantiates",
+    "line": 9,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "method:96ccb238e207922617dad91a1a3bd096",
+    "target": "struct:69ce2dc78af1c72c5e705b2eff7d50b3"
+  },
+  {
+    "col": 9,
+    "kind": "instantiates",
+    "line": 11,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "function:9ca48aa8a0359c83c2de731082d72870",
+    "target": "struct:6e0211f4791dd90203584f4897508e01"
+  },
+  {
     "col": null,
     "kind": "contains",
     "line": null,

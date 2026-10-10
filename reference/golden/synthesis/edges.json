@@ -89,6 +89,18 @@
     "target": "function:994db1e9cc732ccb7ea9e3a57730e984"
   },
   {
+    "col": 31,
+    "kind": "instantiates",
+    "line": 14,
+    "metadata": {
+      "confidence": 0.7,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "method:4fa1cc0f5c6e16964aa519b8ffa473d9",
+    "target": "class:c684061b11657d620087d825c55d4e41"
+  },
+  {
     "col": 36,
     "kind": "calls",
     "line": 5,

@@ -591,6 +591,16 @@
   },
   {
     "candidates": null,
+    "col": 13,
+    "file_path": "gin/main.go",
+    "from_node_id": "function:822994b41b49c7ca4069da738515f400",
+    "language": "go",
+    "line": 6,
+    "reference_kind": "instantiates",
+    "reference_name": "gin.H"
+  },
+  {
+    "candidates": null,
     "col": 14,
     "file_path": "express/app.js",
     "from_node_id": "constant:77ae0a0e3a39fd3e312956380f52f71d",

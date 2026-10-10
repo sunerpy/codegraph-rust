@@ -107,6 +107,21 @@ pub fn typescript_collapsed_parse_is_fixed() -> Case {
         .edge_after("function main", "calls", "function helper @src/util.ts")
 }
 
+/// G2: a Go composite literal instantiates its struct, which appears later.
+pub fn go_composite_literal_of_an_added_struct() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Go])
+        .file("go.mod", "module example.com/shop\n\ngo 1.22\n")
+        .file(
+            "main.go",
+            "package main\n\nfunc main() {\n\tw := Widget{N: 1}\n\tprintln(w.N)\n}\n",
+        )
+        .write(
+            "widget.go",
+            "package main\n\ntype Widget struct {\n\tN int\n}\n",
+        )
+        .edge_after("function main", "instantiates", "struct Widget @widget.go")
+}
+
 /// Upstream #2392 notes that C includes already converge.
 pub fn c_include_of_an_added_header() -> Case {
     Case::new(Change::AddImportTarget, &[Language::C])

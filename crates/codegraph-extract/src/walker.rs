@@ -230,6 +230,17 @@ fn ts_js_chain_root(node: SyntaxNode<'_>) -> Option<SyntaxNode<'_>> {
     current
 }
 
+/// Node kinds that construct an object, each yielding an `instantiates`
+/// reference to the constructed type (upstream `INSTANTIATION_KINDS`).
+const INSTANTIATION_KINDS: [&str; 6] = [
+    "new_expression",               // TypeScript, JavaScript
+    "object_creation_expression",   // Java, C#, PHP
+    "instance_creation_expression", // some grammars
+    "composite_literal",            // Go `Widget{...}`, `pkga.Widget{...}`
+    "struct_expression",            // Rust `Widget { n: 1 }`, `m::Widget { .. }`
+    "instance_expression",          // Scala `new Monoid[Int] { ... }`
+];
+
 /// Whether a TS/JS receiver still collapses to the bare method name: `this` /
 /// `super` (resolution reads the owner off the enclosing class), a member
 /// chain rooted at either or at `window` (the project-global escape of
@@ -563,8 +574,8 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             if let Some(caller_id) = self.node_stack.last().cloned() {
                 self.push_ref(&caller_id, &callee_name, EdgeKind::Calls, node);
             }
-        } else if node_type == "new_expression" {
-            self.extract_instantiation(node);
+        } else if INSTANTIATION_KINDS.contains(&node_type) {
+            skip_children = self.extract_construction(node);
         } else if (node_type == "property_signature" || node_type == "method_signature")
             && self.is_inside_class_like_node()
         {
@@ -4182,28 +4193,112 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
         self.push_ref(caller_id, &callee, EdgeKind::Calls, node);
     }
 
+    /// An object construction: its `instantiates` reference and, for a Java
+    /// `new T(...) { ... }`, the anonymous class. Returns whether the node's
+    /// children were walked here, which an anonymous class requires.
+    fn extract_construction(&mut self, node: SyntaxNode<'tree>) -> bool {
+        self.extract_instantiation(node);
+        let Some(body) = self.anonymous_class_body(node) else {
+            return false;
+        };
+        // The arguments belong to the enclosing scope, the body to the class.
+        for child in node.named_children(&mut node.walk()) {
+            if child.id() != body.id() {
+                self.visit_node(child);
+            }
+        }
+        self.extract_anonymous_class(node, body);
+        true
+    }
+
+    /// The node naming the type an object construction builds, in the field
+    /// or position each grammar puts it.
+    fn constructed_type(node: SyntaxNode<'tree>) -> Option<SyntaxNode<'tree>> {
+        child_by_field(node, "constructor")
+            .or_else(|| child_by_field(node, "type"))
+            .or_else(|| child_by_field(node, "name"))
+            .or_else(|| node.named_child(0))
+    }
+
+    /// The name an object construction's type is bound by, or `None` when it
+    /// names no type: generic arguments go, and of a qualified name only the
+    /// last segment stays, except that Go keeps its package qualifier for the
+    /// cross-package resolver and constructs a named type only (never a slice,
+    /// map or array literal).
+    fn constructed_type_name(&self, node: SyntaxNode<'tree>) -> Option<String> {
+        let ctor = Self::constructed_type(node)?;
+        let name = match node.kind() {
+            "composite_literal" => {
+                let ctor = if ctor.kind() == "generic_type" {
+                    child_by_field(ctor, "type")?
+                } else {
+                    ctor
+                };
+                if !matches!(ctor.kind(), "type_identifier" | "qualified_type") {
+                    return None;
+                }
+                node_text(ctor, self.source)
+            }
+            "instance_expression" => crate::lang::scala_base_type_name(ctor, self.source)?,
+            _ => {
+                let mut name = node_text(ctor, self.source);
+                if let Some(idx) = name.find('<') {
+                    name.truncate(idx);
+                }
+                // PHP writes a qualified class name with `\`.
+                let separators: &[char] = if self.spec.language() == Language::Php {
+                    &['.', ':', '\\']
+                } else {
+                    &['.', ':']
+                };
+                if let Some(idx) = name.rfind(separators) {
+                    name = name[idx + 1..].trim_start_matches(separators).to_string();
+                }
+                name
+            }
+        };
+        let name = name.trim();
+        (!name.is_empty()).then(|| name.to_string())
+    }
+
     fn extract_instantiation(&mut self, node: SyntaxNode<'tree>) {
         let Some(from_id) = self.node_stack.last().cloned() else {
             return;
         };
-        let ctor = child_by_field(node, "constructor")
-            .or_else(|| child_by_field(node, "type"))
-            .or_else(|| child_by_field(node, "name"))
-            .or_else(|| node.named_child(0));
-        let Some(ctor) = ctor else { return };
-        let mut class_name = node_text(ctor, self.source);
-        if let Some(idx) = class_name.find('<') {
-            class_name.truncate(idx);
-        }
-        if let Some(idx) = class_name.rfind(['.', ':']) {
-            class_name = class_name[idx + 1..]
-                .trim_start_matches([':', '.'])
-                .to_string();
-        }
-        class_name = class_name.trim().to_string();
-        if !class_name.is_empty() {
+        if let Some(class_name) = self.constructed_type_name(node) {
             self.push_ref(&from_id, &class_name, EdgeKind::Instantiates, node);
         }
+    }
+
+    /// The body of a Java anonymous class, `new T(...) { ... }`.
+    fn anonymous_class_body(&self, node: SyntaxNode<'tree>) -> Option<SyntaxNode<'tree>> {
+        if self.spec.language() != Language::Java || node.kind() != "object_creation_expression" {
+            return None;
+        }
+        node.named_children(&mut node.walk())
+            .find(|child| child.kind() == "class_body")
+    }
+
+    /// A Java anonymous class (upstream `34240eb2`) is a class named for its
+    /// type and line, `<T$anon@12>`, that extends T, so the interface-impl
+    /// pass can bridge T's methods to the overrides it declares, and that owns
+    /// the members of its body.
+    fn extract_anonymous_class(&mut self, node: SyntaxNode<'tree>, body: SyntaxNode<'tree>) {
+        let type_name = self
+            .constructed_type_name(node)
+            .unwrap_or_else(|| "Object".to_string());
+        let name = format!("<{type_name}$anon@{}>", node.start_position().row + 1);
+        let Some(class_node) = self.create_node(NodeKind::Class, &name, node, NodeExtra::default())
+        else {
+            return;
+        };
+        let type_node = Self::constructed_type(node).unwrap_or(node);
+        self.push_ref(&class_node.id, &type_name, EdgeKind::Extends, type_node);
+        self.node_stack.push(class_node.id.clone());
+        for child in body.named_children(&mut body.walk()) {
+            self.visit_node(child);
+        }
+        self.node_stack.pop();
     }
 
     /// A C/C++ function-like macro (`#define TRACE(x) ...`) becomes a `constant`
@@ -4394,8 +4489,10 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             self.extract_jsx_component_ref(node);
         } else if has_type(self.spec.call_types(), node_type) {
             self.extract_call(node);
-        } else if node_type == "new_expression" {
-            self.extract_instantiation(node);
+        } else if INSTANTIATION_KINDS.contains(&node_type) {
+            if self.extract_construction(node) {
+                return;
+            }
         } else if let Some(callee_name) = self.spec.extract_bare_call(node, self.source) {
             if let Some(caller_id) = self.node_stack.last().cloned() {
                 self.push_ref(&caller_id, &callee_name, EdgeKind::Calls, node);

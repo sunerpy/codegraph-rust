@@ -61,6 +61,16 @@
   },
   {
     "candidates": null,
+    "col": 12,
+    "file_path": "src/main/java/app/shapes/Main.java",
+    "from_node_id": "method:6286f4575b75b858d15373165a633a08",
+    "language": "java",
+    "line": 25,
+    "reference_kind": "decorates",
+    "reference_name": "Override"
+  },
+  {
+    "candidates": null,
     "col": 19,
     "file_path": "src/test/java/app/MainTest.java",
     "from_node_id": "method:c5f83603bb58827e828bd921b11695b4",
@@ -71,6 +81,26 @@
   },
   {
     "candidates": null,
+    "col": 21,
+    "file_path": "src/main/java/app/shapes/Main.java",
+    "from_node_id": "method:c8883fca5b9ab3e5b9f4c67c82365397",
+    "language": "java",
+    "line": 24,
+    "reference_kind": "instantiates",
+    "reference_name": "Runnable"
+  },
+  {
+    "candidates": null,
+    "col": 25,
+    "file_path": "src/main/java/app/shapes/Main.java",
+    "from_node_id": "class:5f71b18693d8b0a3187abcb460d0433c",
+    "language": "java",
+    "line": 24,
+    "reference_kind": "extends",
+    "reference_name": "Runnable"
+  },
+  {
+    "candidates": null,
     "col": 25,
     "file_path": "src/test/java/app/MainTest.java",
     "from_node_id": "method:c5f83603bb58827e828bd921b11695b4",
@@ -78,6 +108,16 @@
     "line": 15,
     "reference_kind": "calls",
     "reference_name": "mock"
+  },
+  {
+    "candidates": null,
+    "col": 27,
+    "file_path": "src/main/java/app/shapes/Main.java",
+    "from_node_id": "method:c8883fca5b9ab3e5b9f4c67c82365397",
+    "language": "java",
+    "line": 22,
+    "reference_kind": "instantiates",
+    "reference_name": "ArrayList"
   },
   {
     "candidates": null,

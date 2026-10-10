@@ -36,6 +36,18 @@
     "target": "method:332692d36b049f0071041145d30d687c"
   },
   {
+    "col": 4,
+    "kind": "instantiates",
+    "line": 53,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "function:190b8fbf32e627648ed53f2ce8cc285c",
+    "target": "union:466d8ec81e4f465f813cbcac35562ca9"
+  },
+  {
     "col": 5,
     "kind": "implements",
     "line": 13,
@@ -202,6 +214,18 @@
     "provenance": null,
     "source": "struct:7f825a66bc76a8e6e836625a54175140",
     "target": "trait:d8605a7e20ab75ad54290c9e4502ad66"
+  },
+  {
+    "col": 8,
+    "kind": "instantiates",
+    "line": 65,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "method:6ddb55846e243b76871de524e0099384",
+    "target": "struct:37445fd25f0ca6329d4d7075ab077d8c"
   },
   {
     "col": null,
