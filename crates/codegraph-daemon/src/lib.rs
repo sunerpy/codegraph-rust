@@ -383,6 +383,22 @@ pub fn run_foreground_gated(
     }
 }
 
+/// Whether a daemon could be listening at the recorded rendezvous
+/// `socket_path` now. On Unix that is its socket file existing. On Windows the
+/// record holds a bare pipe name with no file behind it, so only connecting
+/// can tell; the probe's connection is dropped at once and its session ends.
+pub fn rendezvous_accepts(socket_path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        socket_path.exists()
+    }
+    #[cfg(windows)]
+    {
+        !socket_path.as_os_str().is_empty()
+            && connect(&Rendezvous::from_socket_path(socket_path)).is_ok()
+    }
+}
+
 pub fn attach_to_daemon(socket_path: &Path) -> Result<DaemonClient> {
     let rendezvous = Rendezvous::from_socket_path(socket_path);
     let mut stream = connect(&rendezvous)
@@ -1305,6 +1321,31 @@ mod tests {
         let (_listener, bound) =
             bind_with_fallback(&root, preferred.clone()).expect("preferred socket must bind");
         assert_eq!(bound, preferred, "the preferred candidate binds first");
+        #[cfg(unix)]
+        if let Some(stale) = Rendezvous::from_socket_path(&bound).cleanup_path() {
+            let _ = fs::remove_file(stale);
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_rendezvous_nobody_binds_accepts_nothing() {
+        let root = temp_root("accepts-dead");
+        assert!(!rendezvous_accepts(&socket_path_of(&root)));
+        assert!(!rendezvous_accepts(Path::new("")));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn a_bound_rendezvous_accepts() {
+        let root = temp_root("accepts-bound");
+        create_rendezvous_dir(&root);
+        let (_listener, bound) =
+            bind_with_fallback(&root, socket_path_of(&root)).expect("the preferred socket binds");
+        assert!(
+            rendezvous_accepts(&bound),
+            "a bound rendezvous is found, by file on Unix and by connecting on Windows"
+        );
         #[cfg(unix)]
         if let Some(stale) = Rendezvous::from_socket_path(&bound).cleanup_path() {
             let _ = fs::remove_file(stale);

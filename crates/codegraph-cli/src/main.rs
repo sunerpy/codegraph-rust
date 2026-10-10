@@ -3847,7 +3847,7 @@ fn start_daemon_for_adopted_root(project_root: &Path, no_watch: bool) -> Option<
                 socket_path = %socket_path.display(),
                 "adopted-root: spawned new daemon"
             );
-            socket_path.exists().then_some(socket_path)
+            codegraph_daemon::rendezvous_accepts(&socket_path).then_some(socket_path)
         }
         Err(err) => {
             tracing::warn!(error = %err, "adopted project daemon start failed");
@@ -4116,7 +4116,7 @@ fn proxy_to_running_daemon(project_root: &Path) -> WarmAttach {
     let Ok(socket_path) = codegraph_daemon::recorded_socket_path(project_root) else {
         return WarmAttach::Unavailable;
     };
-    if !socket_path.exists() {
+    if !codegraph_daemon::rendezvous_accepts(&socket_path) {
         tracing::debug!("proxy_to_running_daemon: daemon socket missing; falling back to direct");
         heal_stale_daemon_if_dead(project_root);
         return WarmAttach::Unavailable;
@@ -4274,7 +4274,8 @@ fn poll_for_daemon_socket(project_root: &Path) {
         // Re-read the lock each tick: the daemon rewrites the recorded socket to
         // its bind-fallback choice during startup, so the path can change while
         // we poll (D-Daemon-b).
-        if codegraph_daemon::recorded_socket_path(project_root).is_ok_and(|socket| socket.exists())
+        if codegraph_daemon::recorded_socket_path(project_root)
+            .is_ok_and(|socket| codegraph_daemon::rendezvous_accepts(&socket))
         {
             return;
         }
