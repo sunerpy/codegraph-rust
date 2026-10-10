@@ -86,8 +86,8 @@ index_corpus() {
     new_scratch "$name"
     work="$scratch_dir"
     cp -a "$repo/crates/codegraph-bench/fixtures/$name/." "$work/"
-    log="$work.init.log"
-    scratch+=("$log")
+    new_scratch "$name-init-log"
+    log="$scratch_dir/init.log"
     if ! env -u CODEGRAPH_DIR CODEGRAPH_NO_DAEMON=1 CODEGRAPH_NO_WATCH=1 \
         "$codegraph_bin" init "$work" >"$log" 2>&1; then
         cat "$log" >&2
@@ -96,12 +96,14 @@ index_corpus() {
     indexed_db="$work/.codegraph/codegraph.db"
 }
 
-# Dump canonical artifacts of a database into a directory.
+# Dump canonical artifacts of a database into a directory. The log goes to a
+# scratch directory of its own, so a write never touches anything beside the
+# named corpus.
 dump_golden() {
     local db="$1" out="$2" log
     mkdir -p "$out"
-    log="$out.gen.log"
-    scratch+=("$log")
+    new_scratch "gen-log"
+    log="$scratch_dir/gen.log"
     if ! "$bench_bin" --gen-golden "$db" "$out" >"$log" 2>&1; then
         cat "$log" >&2
         die "bench --gen-golden failed for $db"
