@@ -601,6 +601,7 @@ matrix! {
     java_overloads_keep_their_callers,
     jsx_component_body_edit,
     swift_method_body_edit,
+    typescript_value_reader_body_edit,
     cpp_qualified_call_body_edit,
     vue_component_template_edit,
     liquid_snippet_body_edit,

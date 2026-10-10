@@ -335,6 +335,9 @@ pub struct TreeSitterWalker<'a, 'tree> {
     /// Same-line, same-name declarations keep distinct identities (#1349).
     node_ids: NodeIdAllocator,
     fn_ref_candidates: Vec<(crate::function_ref::FnRefCandidate, String)>,
+    /// Same-file value references (#895, #897): targets and readers recorded
+    /// as nodes are created, turned into edges once the walk is done.
+    value_refs: crate::value_refs::ValueRefs<'tree>,
     /// C++ enclosing `namespace ns { … }` names, prefixed onto contained
     /// symbols' `qualified_name`. Prefix-only (no namespace node) to avoid the
     /// #1093 crowd-out; empty outside C++.
@@ -390,6 +393,7 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             node_stack: Vec::new(),
             node_ids: NodeIdAllocator::default(),
             fn_ref_candidates: Vec::new(),
+            value_refs: crate::value_refs::ValueRefs::default(),
             namespace_prefix: Vec::new(),
             erlang_last_fn_name: None,
             erlang_last_fn_arity: None,
@@ -425,6 +429,13 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
         }
 
         self.flush_fn_ref_candidates();
+        let value_refs = std::mem::take(&mut self.value_refs);
+        self.edges.extend(value_refs.into_edges(
+            self.spec.language(),
+            self.file_path,
+            self.root,
+            self.source,
+        ));
 
         ExtractionResult {
             nodes: self.nodes,
@@ -2396,6 +2407,15 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
         }
 
         self.nodes.push(new_node.clone());
+        if crate::value_refs::has_value_refs(self.spec.language()) {
+            self.value_refs.capture(
+                kind,
+                name,
+                &id,
+                node,
+                self.node_stack.last().map(String::as_str),
+            );
+        }
 
         if let Some(parent_id) = self.node_stack.last() {
             self.edges.push(Edge {

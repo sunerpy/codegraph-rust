@@ -341,6 +341,21 @@ pub fn swift_method_body_edit() -> Case {
         .edge_throughout("function tick", "instantiates", "class Counter")
 }
 
+/// #895: a function's value reference follows the constant its body reads.
+pub fn typescript_value_reader_body_edit() -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript])
+        .file(
+            "src/paging.ts",
+            "export const PAGE_SIZE = 20;\nexport const PAGE_LIMIT = 50;\n\nexport function pages(total: number): number {\n  return Math.ceil(total / PAGE_SIZE);\n}\n",
+        )
+        .write(
+            "src/paging.ts",
+            "export const PAGE_SIZE = 20;\nexport const PAGE_LIMIT = 50;\n\nexport function pages(total: number): number {\n  return Math.ceil(total / PAGE_LIMIT);\n}\n",
+        )
+        .edge_before("function pages", "references", "constant PAGE_SIZE")
+        .edge_after("function pages", "references", "constant PAGE_LIMIT")
+}
+
 /// G13: a C++ call keeps its scope, so `ns::compute()` and `alt::compute()`
 /// reach different functions of one name.
 pub fn cpp_qualified_call_body_edit() -> Case {

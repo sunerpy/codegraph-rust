@@ -109,8 +109,9 @@ parallel file parsing. A file then follows one of these paths:
 2. a grammar-backed `LanguageSpec` and generic tree-sitter walker; or
 3. file-level handling for formats that intentionally expose no language symbols.
 
-The walker emits file/symbol nodes and structural ownership edges immediately.
-Calls, imports, type relationships, decorators, and framework evidence that need
+The walker emits file/symbol nodes and structural ownership edges immediately,
+and so the value references of a file, which need nothing outside it (see
+[`data-model.md`](data-model.md#edges)). Calls, imports, type relationships, decorators, and framework evidence that need
 global knowledge are stored as unresolved references. Per-file extraction is
 fail-closed: an unsafe tree depth or fatal parse condition cannot leave a partial
 replacement graph for that file.

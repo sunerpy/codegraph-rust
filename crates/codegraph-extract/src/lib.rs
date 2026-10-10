@@ -16,6 +16,7 @@ pub mod lang;
 mod links;
 pub mod spec;
 pub mod syntax_tokens;
+mod value_refs;
 pub mod walker;
 
 pub use codegraph_core::source_file::{

@@ -92,6 +92,16 @@ that made it) and, when the wiring happens elsewhere, `registeredAt`
 (`path:line` of the registration). Consumers such as the type hierarchy and the
 named-symbol flow recognize synthesized edges by that provenance value.
 
+A value reference is a `references` edge the extractor emits from a symbol to a
+constant or variable of the same file that the symbol reads (upstream #895,
+#897), so `impact` on a shared value reaches its readers. It carries `metadata`
+`{"valueRef": true}` and no location. Only a constant or variable declared at
+file, class, module, struct or enum scope with a distinctive name (three or more
+characters, one of them an uppercase letter or `_`) is a target, and none whose
+name the file binds again in an inner scope. Generated files have none. The
+languages are TypeScript, JavaScript, TSX, ArkTS, Go and Python, and the scripts
+of Vue, Svelte and Astro components through the extractor they delegate to.
+
 An edge's semantic identity is:
 
 ```text
