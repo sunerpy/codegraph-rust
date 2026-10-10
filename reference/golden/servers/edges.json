@@ -192,6 +192,18 @@
     "target": "constant:534df51fd59b1266fc6c127cda3e2ee7"
   },
   {
+    "col": 12,
+    "kind": "references",
+    "line": 13,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "field:6330d8451ba170c8488baa2b07967cbf",
+    "target": "class:19fed4f1deb67fb9289f70ef980e2c67"
+  },
+  {
     "col": 14,
     "kind": "imports",
     "line": 3,

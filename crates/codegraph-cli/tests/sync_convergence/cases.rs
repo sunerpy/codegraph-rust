@@ -137,6 +137,21 @@ pub fn go_parameter_type_of_an_added_struct() -> Case {
         .edge_after("function Ship", "references", "struct Order @order.go")
 }
 
+/// G3: a Java parameter type is a reference to a class that appears later in
+/// the same package.
+pub fn java_parameter_type_of_an_added_class() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Java])
+        .file(
+            "src/zoo/Keeper.java",
+            "package zoo;\n\npublic class Keeper {\n    public int feed(Animal animal) {\n        return 1;\n    }\n}\n",
+        )
+        .write(
+            "src/zoo/Animal.java",
+            "package zoo;\n\npublic class Animal {\n}\n",
+        )
+        .edge_after("method zoo::Keeper::feed", "references", "class zoo::Animal")
+}
+
 /// Upstream #2392 notes that C includes already converge.
 pub fn c_include_of_an_added_header() -> Case {
     Case::new(Change::AddImportTarget, &[Language::C])

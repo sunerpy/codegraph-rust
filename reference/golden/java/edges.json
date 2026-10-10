@@ -12,6 +12,18 @@
     "target": "class:94e832e0c31a7087908a6e3a64f46c91"
   },
   {
+    "col": 17,
+    "kind": "references",
+    "line": 20,
+    "metadata": {
+      "confidence": 0.7,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "method:c8883fca5b9ab3e5b9f4c67c82365397",
+    "target": "class:22afc7b49093ccfbb79006770c212771"
+  },
+  {
     "col": 19,
     "kind": "instantiates",
     "line": 21,
@@ -82,6 +94,18 @@
     "provenance": null,
     "source": "method:6286f4575b75b858d15373165a633a08",
     "target": "method:3cc03d430f5a0977506f878c1b611938"
+  },
+  {
+    "col": 4,
+    "kind": "references",
+    "line": 20,
+    "metadata": {
+      "confidence": 0.7,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "method:c8883fca5b9ab3e5b9f4c67c82365397",
+    "target": "class:22afc7b49093ccfbb79006770c212771"
   },
   {
     "col": 42,

@@ -586,6 +586,7 @@ matrix! {
     typescript_collapsed_parse_is_fixed,
     go_composite_literal_of_an_added_struct,
     go_parameter_type_of_an_added_struct,
+    java_parameter_type_of_an_added_class,
     c_include_of_an_added_header,
     #[ignore = "W5-02 #2403: a Liquid `render` does not link a snippet that appears later"]
     liquid_render_of_an_added_snippet,

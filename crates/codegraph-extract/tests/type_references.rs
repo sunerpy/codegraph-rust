@@ -67,3 +67,57 @@ fn go_parameter_and_result_types_are_references() {
         ])
     );
 }
+
+/// Java: parameter, return and field types; a qualified type names only its
+/// last segment, and primitives are their own grammar kinds.
+#[test]
+fn java_parameter_return_and_field_types_are_references() {
+    let source = "package app;\n\nclass Shop {\n    private Repo repo;\n    public Result<Out> build(Widget w, java.util.List<Item> items, int n, String s) {\n        return null;\n    }\n}\n";
+    assert_eq!(
+        type_refs("src/app/Shop.java", source, Language::Java),
+        pairs(&[
+            ("build", "Item"),
+            ("build", "List"),
+            ("build", "Out"),
+            ("build", "Result"),
+            ("build", "Widget"),
+            ("repo", "Repo"),
+        ])
+    );
+}
+
+/// Kotlin (kotlin-ng writes a type as `user_type` over identifiers):
+/// parameter and return types; an extension receiver is not a parameter type.
+#[test]
+fn kotlin_parameter_and_return_types_are_references() {
+    let source = "class Svc {\n    fun build(w: Widget, items: List<Item>, n: Int): Result<Out>? { return x }\n    fun Widget.ext(n: Int): Unit {}\n}\n";
+    assert_eq!(
+        type_refs("src/Svc.kt", source, Language::Kotlin),
+        pairs(&[
+            ("build", "Item"),
+            ("build", "List"),
+            ("build", "Out"),
+            ("build", "Result"),
+            ("build", "Widget"),
+        ])
+    );
+}
+
+/// Scala: every parameter list of a curried definition, the return type, and
+/// the bounds of its type parameters.
+#[test]
+fn scala_parameter_lists_return_type_and_bounds_are_references() {
+    let source = "object Shop {\n  def build[A: Monoid, F <: Base](w: Widget)(implicit ord: Ordering[Item]): Result[Out] = ???\n}\n";
+    assert_eq!(
+        type_refs("src/Shop.scala", source, Language::Scala),
+        pairs(&[
+            ("build", "Base"),
+            ("build", "Item"),
+            ("build", "Monoid"),
+            ("build", "Ordering"),
+            ("build", "Out"),
+            ("build", "Result"),
+            ("build", "Widget"),
+        ])
+    );
+}

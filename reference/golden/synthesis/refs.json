@@ -101,6 +101,26 @@
   },
   {
     "candidates": null,
+    "col": 18,
+    "file_path": "dispatch/src/Events.java",
+    "from_node_id": "field:b4afa2847b5e18c9e5084ec2c917ca28",
+    "language": "java",
+    "line": 7,
+    "reference_kind": "references",
+    "reference_name": "ApplicationEventPublisher"
+  },
+  {
+    "candidates": null,
+    "col": 18,
+    "file_path": "dispatch/src/Events.java",
+    "from_node_id": "method:7067346642bc248a1eae7fe70349eb4c",
+    "language": "java",
+    "line": 9,
+    "reference_kind": "references",
+    "reference_name": "ApplicationEventPublisher"
+  },
+  {
+    "candidates": null,
     "col": 19,
     "file_path": "python/tasks.py",
     "from_node_id": "file:python/tasks.py",

@@ -101,6 +101,18 @@
     "target": "function:994db1e9cc732ccb7ea9e3a57730e984"
   },
   {
+    "col": 29,
+    "kind": "references",
+    "line": 18,
+    "metadata": {
+      "confidence": 0.7,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "method:d5658cf785502385e0d2dc65e6908262",
+    "target": "class:c684061b11657d620087d825c55d4e41"
+  },
+  {
     "col": 31,
     "kind": "instantiates",
     "line": 14,

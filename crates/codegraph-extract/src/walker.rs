@@ -4708,7 +4708,27 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
     }
 
     fn extract_type_annotations(&mut self, node: SyntaxNode<'tree>, node_id: &str) {
-        if !has_type_annotation_refs(self.spec.language()) {
+        let language = self.spec.language();
+        if !has_type_annotation_refs(language) {
+            return;
+        }
+        if language == Language::Kotlin {
+            self.extract_kotlin_type_annotations(node, node_id);
+            return;
+        }
+        // Scala curries (`def f(a)(implicit m: M)`), and the typeclass usually
+        // sits in a later list, so every parameter list is read; the bounds of
+        // its type parameters (`[A: Monoid]`, `[F <: Base]`) are the other way
+        // Scala requires a type.
+        if language == Language::Scala {
+            for child in node.named_children(&mut node.walk()) {
+                if matches!(child.kind(), "parameters" | "type_parameters") {
+                    self.extract_type_refs_from_subtree(child, node_id);
+                }
+            }
+            if let Some(return_type) = child_by_field(node, "return_type") {
+                self.extract_type_refs_from_subtree(return_type, node_id);
+            }
             return;
         }
         if let Some(params) = child_by_field(node, self.spec.params_field()) {
@@ -4732,7 +4752,80 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
         }
     }
 
+    /// kotlin-ng writes a function's types as unnamed children: each
+    /// parameter's after its name, the return type after the parameter list.
+    /// An extension receiver, before the name, is not a parameter type.
+    fn extract_kotlin_type_annotations(&mut self, node: SyntaxNode<'tree>, node_id: &str) {
+        if node.kind() != "function_declaration" {
+            return;
+        }
+        let mut after_parameters = false;
+        for child in node.named_children(&mut node.walk()) {
+            match child.kind() {
+                "function_value_parameters" => {
+                    for param in child.named_children(&mut child.walk()) {
+                        if param.kind() == "parameter" {
+                            self.kotlin_types_among_children(param, node_id);
+                        }
+                    }
+                    after_parameters = true;
+                }
+                "function_body" => break,
+                kind if after_parameters && is_kotlin_type_kind(kind) => {
+                    self.kotlin_type_refs(child, node_id);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn kotlin_types_among_children(&mut self, node: SyntaxNode<'tree>, from_node_id: &str) {
+        for child in node.named_children(&mut node.walk()) {
+            if is_kotlin_type_kind(child.kind()) {
+                self.kotlin_type_refs(child, from_node_id);
+            }
+        }
+    }
+
+    /// A kotlin-ng `user_type` is named by its last identifier (`a.b.C` is
+    /// `C`); its type arguments are types of their own.
+    fn kotlin_type_refs(&mut self, node: SyntaxNode<'tree>, from_node_id: &str) {
+        if node.kind() == "user_type" {
+            let last = node
+                .named_children(&mut node.walk())
+                .filter(|child| child.kind() == "identifier")
+                .last();
+            if let Some(name) = last {
+                let type_name = node_text(name, self.source);
+                if !is_builtin_type(&type_name) {
+                    self.push_ref(from_node_id, &type_name, EdgeKind::References, name);
+                }
+            }
+            for child in node.named_children(&mut node.walk()) {
+                if child.kind() == "type_arguments" {
+                    self.kotlin_type_refs(child, from_node_id);
+                }
+            }
+            return;
+        }
+        for child in node.named_children(&mut node.walk()) {
+            self.kotlin_type_refs(child, from_node_id);
+        }
+    }
+
     fn extract_type_refs_from_subtree(&mut self, node: SyntaxNode<'tree>, from_node_id: &str) {
+        // Java writes `java.util.List` as nested `scoped_type_identifier`s over
+        // `type_identifier`s; only the last segment names the type.
+        if node.kind() == "scoped_type_identifier" && self.spec.language() == Language::Java {
+            let last = node
+                .named_children(&mut node.walk())
+                .filter(|child| child.kind() == "type_identifier")
+                .last();
+            if let Some(name) = last {
+                self.extract_type_refs_from_subtree(name, from_node_id);
+            }
+            return;
+        }
         if node.kind() == "type_identifier" {
             let type_name = node_text(node, self.source);
             if !is_builtin_type(&type_name) {
@@ -5770,7 +5863,25 @@ fn property_or_field_signature(node: SyntaxNode<'_>, name: &str, source: &str) -
 fn has_type_annotation_refs(language: Language) -> bool {
     matches!(
         language,
-        Language::TypeScript | Language::Tsx | Language::Rust | Language::Go
+        Language::TypeScript
+            | Language::Tsx
+            | Language::Rust
+            | Language::Go
+            | Language::Java
+            | Language::Kotlin
+            | Language::Scala
+    )
+}
+
+/// The kotlin-ng node kinds a type is written as.
+fn is_kotlin_type_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "user_type"
+            | "nullable_type"
+            | "function_type"
+            | "parenthesized_type"
+            | "non_nullable_type"
     )
 }
 

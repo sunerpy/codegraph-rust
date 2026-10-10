@@ -211,6 +211,16 @@
   },
   {
     "candidates": null,
+    "col": 28,
+    "file_path": "rn/android/app/src/main/java/com/example/CameraModule.java",
+    "from_node_id": "method:ab6793be7ebd07b31be9173944264c20",
+    "language": "java",
+    "line": 14,
+    "reference_kind": "references",
+    "reference_name": "Promise"
+  },
+  {
+    "candidates": null,
     "col": 29,
     "file_path": "flutter/lib/main.dart",
     "from_node_id": "method:06cc27db07d4944f8a4f2dccba77e661",

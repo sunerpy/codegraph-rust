@@ -651,6 +651,16 @@
   },
   {
     "candidates": null,
+    "col": 15,
+    "file_path": "play/app/controllers/HomeController.scala",
+    "from_node_id": "method:0952d7c19228f96d12bb769ece592391",
+    "language": "scala",
+    "line": 8,
+    "reference_kind": "references",
+    "reference_name": "Action"
+  },
+  {
+    "candidates": null,
     "col": 16,
     "file_path": "actix/src/main.rs",
     "from_node_id": "file:actix/src/main.rs",
@@ -851,6 +861,26 @@
   },
   {
     "candidates": null,
+    "col": 22,
+    "file_path": "play/app/controllers/HomeController.scala",
+    "from_node_id": "method:0952d7c19228f96d12bb769ece592391",
+    "language": "scala",
+    "line": 8,
+    "reference_kind": "references",
+    "reference_name": "AnyContent"
+  },
+  {
+    "candidates": null,
+    "col": 22,
+    "file_path": "play/app/controllers/HomeController.scala",
+    "from_node_id": "method:dffa1d90061d3bb5d52e05bf5da1951d",
+    "language": "scala",
+    "line": 10,
+    "reference_kind": "references",
+    "reference_name": "Action"
+  },
+  {
+    "candidates": null,
     "col": 23,
     "file_path": "actix/src/main.rs",
     "from_node_id": "function:a2a6735587193c6e84d31f91e10cdff3",
@@ -978,6 +1008,16 @@
     "line": 4,
     "reference_kind": "calls",
     "reference_name": "get"
+  },
+  {
+    "candidates": null,
+    "col": 29,
+    "file_path": "play/app/controllers/HomeController.scala",
+    "from_node_id": "method:dffa1d90061d3bb5d52e05bf5da1951d",
+    "language": "scala",
+    "line": 10,
+    "reference_kind": "references",
+    "reference_name": "AnyContent"
   },
   {
     "candidates": null,
