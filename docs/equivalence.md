@@ -142,12 +142,50 @@ Canonical fixture files are committed under `reference/golden/<corpus>/`:
 - `files.json`
 - `schema.sql`
 
-Regenerate from a reference SQLite database with:
+Every corpus except `mini` is re-indexable and is regenerated with one recipe:
+copy its source corpus from `crates/codegraph-bench/fixtures/<corpus>/` into a
+clean directory, index it with the current binary
+(`CODEGRAPH_NO_DAEMON=1 CODEGRAPH_NO_WATCH=1 codegraph init`), commit the produced
+database as `reference/golden/<corpus>/colby.db`, and dump the canonical
+artifacts from that same database with `bench --gen-golden`. Never hand-write a
+golden. `scripts/regen-goldens.sh` runs exactly that recipe:
+
+```bash
+cargo build --locked --release -p codegraph-rs -p codegraph-bench
+scripts/regen-goldens.sh --check                 # every corpus; exit 1 on any difference
+scripts/regen-goldens.sh --check cpp go          # only the named corpora
+scripts/regen-goldens.sh --write cpp             # rewrite colby.db + artifacts of cpp only
+scripts/regen-goldens.sh --mini-transplant       # mini; see "Mini schema rebuild" below
+```
+
+`--check` writes nothing into the repository; `--write` writes only under
+`reference/golden/<named corpus>/`. Both use `target/release/codegraph` and
+`target/release/bench` unless `CODEGRAPH_BIN` / `BENCH_BIN` say otherwise, and
+work in `mktemp` scratch directories that are removed on exit.
+
+The same comparison runs in the test suite:
+`cargo test -p codegraph-rs --locked --test golden_reextract` indexes every
+re-indexable corpus with the test build of the binary and fails, naming the
+changed artifacts and the canonical row diff, when extraction or resolution
+output moved without its golden being regenerated. `equivalence.rs` (below)
+only proves that each committed `colby.db` agrees with its own JSON; it never
+runs the extractor.
+
+To dump a single database by hand (for example while investigating a diff):
 
 ```bash
 cargo run -p codegraph-bench --bin bench -- \
   --gen-golden reference/golden/mini/colby.db reference/golden/mini
 ```
+
+#### Regeneration log
+
+Every intentional golden change is recorded here with the commit, the corpora
+and artifacts it changed, why the graph change is intended, and the command
+that regenerated it. Older regenerations are described in each corpus section.
+
+| Commit | Corpus | Artifacts | Intent | Command |
+| ------ | ------ | --------- | ------ | ------- |
 
 The canonicalizer strips inherently unstable timestamp columns
 (`nodes.updated_at`, `files.modified_at`, `files.indexed_at`), parses JSON text
@@ -182,25 +220,7 @@ The minimal source corpus lives at `crates/codegraph-bench/fixtures/godot/`
 (`project.godot`, `game_flow.gd`, `stage_manager.gd`, `main.tscn`,
 `effect_manager.gd`, `effect_manager.gd.uid`, `combo_ui.tscn`).
 
-Regenerate the committed database + canonical JSON reproducibly from the corpus:
-
-```bash
-# 1. Copy the corpus to a clean directory (keeps the workspace index out of it).
-rm -rf /tmp/cg-fixture-godot
-cp -r crates/codegraph-bench/fixtures/godot /tmp/cg-fixture-godot
-
-# 2. Index it with OUR binary (never hand-write the golden).
-cargo build --release -p codegraph-rs
-CODEGRAPH_NO_DAEMON=1 CODEGRAPH_NO_WATCH=1 \
-  ./target/release/codegraph init /tmp/cg-fixture-godot
-
-# 3. Commit the produced database as the fixture's colby.db.
-cp /tmp/cg-fixture-godot/.codegraph/codegraph.db reference/golden/godot/colby.db
-
-# 4. Dump the canonical golden JSON + schema from that database.
-cargo run -p codegraph-bench --bin bench -- \
-  --gen-golden reference/golden/godot/colby.db reference/golden/godot
-```
+Regenerate it with `scripts/regen-goldens.sh --write godot` (the shared recipe in [Regenerating goldens](#regenerating-goldens)).
 
 The extraction and `--gen-golden` steps are both byte-stable: re-running the
 index or the dump reproduces identical `nodes.json`/`edges.json`/`refs.json`/
@@ -248,25 +268,7 @@ shapes:
 The minimal source corpus lives at `crates/codegraph-bench/fixtures/ruby/`
 (`service.rb`, `logger.rb`).
 
-Regenerate the committed database + canonical JSON reproducibly from the corpus:
-
-```bash
-# 1. Copy the corpus to a clean directory (keeps the workspace index out of it).
-rm -rf /tmp/cg-fixture-ruby
-cp -r crates/codegraph-bench/fixtures/ruby /tmp/cg-fixture-ruby
-
-# 2. Index it with OUR binary (never hand-write the golden).
-cargo build --release -p codegraph-rs
-CODEGRAPH_NO_DAEMON=1 CODEGRAPH_NO_WATCH=1 \
-  ./target/release/codegraph init /tmp/cg-fixture-ruby
-
-# 3. Commit the produced database as the fixture's colby.db.
-cp /tmp/cg-fixture-ruby/.codegraph/codegraph.db reference/golden/ruby/colby.db
-
-# 4. Dump the canonical golden JSON + schema from that database.
-cargo run -p codegraph-bench --bin bench -- \
-  --gen-golden reference/golden/ruby/colby.db reference/golden/ruby
-```
+Regenerate it with `scripts/regen-goldens.sh --write ruby` (the shared recipe in [Regenerating goldens](#regenerating-goldens)).
 
 Like the Godot fixture, both the index and the dump are byte-stable, and the
 `generated_golden_matches_committed_ruby_fixture` and
@@ -314,26 +316,7 @@ Since extraction version 14 the `pkg/__init__.py` file node carries its module
 docstring (upstream #1905): a bare string literal first in a module, class or
 function body is that node's docstring, joined after any preceding comment.
 
-Regenerate the committed database and canonical artifacts from a clean corpus:
-
-```bash
-# 1. Copy the corpus to a clean directory (keeps the workspace index out of it).
-rm -rf /tmp/cg-fixture-python
-cp -r crates/codegraph-bench/fixtures/python /tmp/cg-fixture-python
-
-# 2. Index it with OUR release binary (never hand-write the golden).
-cargo build --release -p codegraph-rs
-CODEGRAPH_NO_DAEMON=1 CODEGRAPH_NO_WATCH=1 \
-  ./target/release/codegraph init /tmp/cg-fixture-python
-
-# 3. Commit the produced database as the fixture's colby.db.
-mkdir -p reference/golden/python
-cp /tmp/cg-fixture-python/.codegraph/codegraph.db reference/golden/python/colby.db
-
-# 4. Dump canonical JSON + schema from that exact database.
-cargo run -p codegraph-bench --bin bench -- \
-  --gen-golden reference/golden/python/colby.db reference/golden/python
-```
+Regenerate it with `scripts/regen-goldens.sh --write python` (the shared recipe in [Regenerating goldens](#regenerating-goldens)).
 
 As with every fixture, compare only `nodes.json`, `edges.json`, `refs.json`,
 `files.json`, and `schema.sql` byte-for-byte. `colby.db` itself is not a
@@ -354,19 +337,7 @@ class method with a nullable generic return, and an extension function. The
 `Processor` primary constructor is the negative boundary: the class signature
 stays null and no constructor method is synthesized.
 
-Regenerate the committed database and canonical artifacts from a clean corpus:
-
-```bash
-rm -rf /tmp/cg-fixture-kotlin
-cp -r crates/codegraph-bench/fixtures/kotlin /tmp/cg-fixture-kotlin
-cargo build --release -p codegraph-rs
-CODEGRAPH_NO_DAEMON=1 CODEGRAPH_NO_WATCH=1 \
-  ./target/release/codegraph init /tmp/cg-fixture-kotlin
-mkdir -p reference/golden/kotlin
-cp /tmp/cg-fixture-kotlin/.codegraph/codegraph.db reference/golden/kotlin/colby.db
-cargo run -p codegraph-bench --bin bench -- \
-  --gen-golden reference/golden/kotlin/colby.db reference/golden/kotlin
-```
+Regenerate it with `scripts/regen-goldens.sh --write kotlin` (the shared recipe in [Regenerating goldens](#regenerating-goldens)).
 
 As with every fixture, only the five text artifacts are byte-compared;
 `colby.db` is not byte-reproducible. Compare `schema.sql` by normalized statement
@@ -389,19 +360,7 @@ fixes from upstream #1823 and #1824. Its two-file corpus under
   `trait`; the inheritance edge resolves to the trait even when the object
   appears first in the file.
 
-Regenerate it from the committed source corpus:
-
-```bash
-rm -rf /tmp/cg-fixture-scala
-cp -r crates/codegraph-bench/fixtures/scala /tmp/cg-fixture-scala
-cargo build --release -p codegraph-rs
-CODEGRAPH_NO_DAEMON=1 CODEGRAPH_NO_WATCH=1 \
-  ./target/release/codegraph init /tmp/cg-fixture-scala
-mkdir -p reference/golden/scala
-cp /tmp/cg-fixture-scala/.codegraph/codegraph.db reference/golden/scala/colby.db
-cargo run -p codegraph-bench --bin bench -- \
-  --gen-golden reference/golden/scala/colby.db reference/golden/scala
-```
+Regenerate it with `scripts/regen-goldens.sh --write scala` (the shared recipe in [Regenerating goldens](#regenerating-goldens)).
 
 `generated_golden_matches_committed_scala_fixture` and
 `scala_db_is_self_equivalent_to_scala_golden` pin the canonical artifacts and
@@ -416,19 +375,7 @@ corpus at `crates/codegraph-bench/fixtures/dart/extension_type.dart` proves an
 ordinary-class control. This prevents either the old top-level-function shape
 or the later complete member drop from returning unnoticed.
 
-Regenerate it from the committed source corpus:
-
-```bash
-rm -rf /tmp/cg-fixture-dart
-cp -r crates/codegraph-bench/fixtures/dart /tmp/cg-fixture-dart
-cargo build --release -p codegraph-rs
-CODEGRAPH_NO_DAEMON=1 CODEGRAPH_NO_WATCH=1 \
-  ./target/release/codegraph init /tmp/cg-fixture-dart
-mkdir -p reference/golden/dart
-cp /tmp/cg-fixture-dart/.codegraph/codegraph.db reference/golden/dart/colby.db
-cargo run -p codegraph-bench --bin bench -- \
-  --gen-golden reference/golden/dart/colby.db reference/golden/dart
-```
+Regenerate it with `scripts/regen-goldens.sh --write dart` (the shared recipe in [Regenerating goldens](#regenerating-goldens)).
 
 `generated_golden_matches_committed_dart_fixture` and
 `dart_db_is_self_equivalent_to_dart_golden` enforce the same two-layer
@@ -615,25 +562,7 @@ which maps to `Language::C` by extension); `ue_actor.h` deliberately uses `.h` t
 guard the content-based C++ reclassification, and `attr_macro.c` uses `.c` so the
 C walker (not the C++ one) is the thing under test.
 
-Regenerate the committed database + canonical JSON reproducibly from the corpus:
-
-```bash
-# 1. Copy the corpus to a clean directory (keeps the workspace index out of it).
-rm -rf /tmp/cg-fixture-cpp
-cp -r crates/codegraph-bench/fixtures/cpp /tmp/cg-fixture-cpp
-
-# 2. Index it with OUR binary (never hand-write the golden).
-cargo build --release -p codegraph-rs
-CODEGRAPH_NO_DAEMON=1 CODEGRAPH_NO_WATCH=1 \
-  ./target/release/codegraph init /tmp/cg-fixture-cpp
-
-# 3. Commit the produced database as the fixture's colby.db.
-cp /tmp/cg-fixture-cpp/.codegraph/codegraph.db reference/golden/cpp/colby.db
-
-# 4. Dump the canonical golden JSON + schema from that database.
-cargo run -p codegraph-bench --bin bench -- \
-  --gen-golden reference/golden/cpp/colby.db reference/golden/cpp
-```
+Regenerate it with `scripts/regen-goldens.sh --write cpp` (the shared recipe in [Regenerating goldens](#regenerating-goldens)).
 
 Like the Ruby fixture, both the index and the dump are byte-stable, and the
 `generated_golden_matches_committed_cpp_fixture` and
@@ -688,19 +617,7 @@ manifest inside the workspace tree could confuse `cargo`.
 The four source files are `lib.rs`, `consumer.rs`, `impl_ownership.rs`, and
 `self_field.rs`.
 
-Regenerate reproducibly (identical recipe to the C++ fixture, substituting `rust`):
-
-```bash
-mkdir -p reference/golden/rust
-rm -rf /tmp/cg-fixture-rust
-cp -r crates/codegraph-bench/fixtures/rust /tmp/cg-fixture-rust
-cargo build --release -p codegraph-rs
-CODEGRAPH_NO_DAEMON=1 CODEGRAPH_NO_WATCH=1 \
-  ./target/release/codegraph init /tmp/cg-fixture-rust
-cp /tmp/cg-fixture-rust/.codegraph/codegraph.db reference/golden/rust/colby.db
-cargo run -p codegraph-bench --bin bench -- \
-  --gen-golden reference/golden/rust/colby.db reference/golden/rust
-```
+Regenerate it with `scripts/regen-goldens.sh --write rust` (the shared recipe in [Regenerating goldens](#regenerating-goldens)).
 
 `generated_golden_matches_committed_rust_fixture` and
 `rust_db_is_self_equivalent_to_rust_golden` enforce byte-stability.
@@ -721,19 +638,7 @@ table fields. Its single `handlers.lua` source pins:
 - `localFn()`, `M.assignedFn()`, and `M:assignedFn()` resolving to the intended
   target, with dot and colon calls sharing `M::assignedFn`.
 
-Regenerate reproducibly:
-
-```bash
-mkdir -p reference/golden/lua
-rm -rf /tmp/cg-fixture-lua
-cp -r crates/codegraph-bench/fixtures/lua /tmp/cg-fixture-lua
-cargo build --release -p codegraph-rs
-CODEGRAPH_NO_DAEMON=1 CODEGRAPH_NO_WATCH=1 \
-  ./target/release/codegraph init /tmp/cg-fixture-lua
-cp /tmp/cg-fixture-lua/.codegraph/codegraph.db reference/golden/lua/colby.db
-cargo run -p codegraph-bench --bin bench -- \
-  --gen-golden reference/golden/lua/colby.db reference/golden/lua
-```
+Regenerate it with `scripts/regen-goldens.sh --write lua` (the shared recipe in [Regenerating goldens](#regenerating-goldens)).
 
 `generated_golden_matches_committed_lua_fixture` and
 `lua_db_is_self_equivalent_to_lua_golden` enforce byte-stability.
@@ -766,19 +671,7 @@ Six files pin BOTH values of the flag, three each way:
 the ranking effect observable: without the content signal the generated definition
 wins on name overlap alone.
 
-Regenerate reproducibly (identical recipe to the Rust fixture, substituting `go`):
-
-```bash
-mkdir -p reference/golden/go
-rm -rf /tmp/cg-fixture-go
-cp -r crates/codegraph-bench/fixtures/go /tmp/cg-fixture-go
-cargo build --release -p codegraph-rs
-CODEGRAPH_NO_DAEMON=1 CODEGRAPH_NO_WATCH=1 \
-  ./target/release/codegraph init /tmp/cg-fixture-go
-cp /tmp/cg-fixture-go/.codegraph/codegraph.db reference/golden/go/colby.db
-cargo run -p codegraph-bench --bin bench -- \
-  --gen-golden reference/golden/go/colby.db reference/golden/go
-```
+Regenerate it with `scripts/regen-goldens.sh --write go` (the shared recipe in [Regenerating goldens](#regenerating-goldens)).
 
 `generated_golden_matches_committed_go_fixture` and
 `go_db_is_self_equivalent_to_go_golden` enforce byte-stability.
@@ -799,41 +692,18 @@ migration order while a freshly-created one carries them in `BASE_SCHEMA` order.
 That is why `mini` and `godot` used to carry `idx_edges_identity` LAST while the
 other corpora carried it alphabetically.
 
-For a schema migration, rebuild `mini` on the fresh schema and transplant its rows:
+For a schema migration, rebuild `mini` on the fresh schema and transplant its rows.
+`scripts/regen-goldens.sh --mini-transplant` does exactly this: a fresh `init` over
+`crates/codegraph-bench/fixtures/mini/` creates a database from the current
+`BASE_SCHEMA`, its freshly-extracted rows are replaced with mini's committed rows
+(an `ATTACH` of `reference/golden/mini/colby.db`), the result is committed as
+`colby.db`, and the JSON + schema goldens are re-derived from it:
 
 ```bash
-# 1. A fresh index over mini's own fixture → a database created from the CURRENT
-#    BASE_SCHEMA, so every index lands in declaration order.
-rm -rf /tmp/mini-rebuild && mkdir -p /tmp/mini-rebuild
-cp -a crates/codegraph-bench/fixtures/mini/. /tmp/mini-rebuild/
-CODEGRAPH_NO_DAEMON=1 CODEGRAPH_NO_WATCH=1 \
-  ./target/release/codegraph init /tmp/mini-rebuild
-DB=/tmp/mini-rebuild/.codegraph/codegraph.db
-
-# 2. Replace its freshly-extracted rows with mini's COMMITTED rows, preserving
-#    the upstream-derived values instead of re-extracting them. Run from the repo
-#    root — the ATTACH path is relative.
-sqlite3 "$DB" "
-  ATTACH DATABASE 'reference/golden/mini/colby.db' AS src;
-  BEGIN;
-  DELETE FROM unresolved_refs; DELETE FROM edges; DELETE FROM files;
-  DELETE FROM nodes; DELETE FROM project_metadata;
-  INSERT INTO nodes            SELECT * FROM src.nodes;
-  INSERT INTO edges            SELECT * FROM src.edges;
-  INSERT INTO unresolved_refs  SELECT * FROM src.unresolved_refs;
-  INSERT INTO project_metadata SELECT * FROM src.project_metadata;
-  INSERT INTO files (path, content_hash, language, size, modified_at, indexed_at, node_count, errors)
-    SELECT path, content_hash, language, size, modified_at, indexed_at, node_count, errors FROM src.files;
-  COMMIT;
-  DETACH src;"
-
-# 3. Commit as the fixture's colby.db, then re-derive the JSON + schema goldens.
-cp "$DB" reference/golden/mini/colby.db
-cargo run -p codegraph-bench --bin bench -- \
-  --gen-golden reference/golden/mini/colby.db reference/golden/mini
+scripts/regen-goldens.sh --mini-transplant
 ```
 
-Two constraints in that transplant are load-bearing:
+Two constraints in that transplant are load-bearing, and the script keeps both:
 
 - **The `files` insert MUST use an explicit column list.** `SELECT *` fails with
   `table files has N columns but 8 values were supplied` once a column is added,
@@ -905,17 +775,7 @@ The CUDA blank fires for `.cu`/`.cuh` files OR any C/C++-family file whose conte
 carries a strong CUDA marker (`__global__`/`__device__`/`__constant__`/
 `cudaStream_t`), so CUDA living in `.h`/`.hpp` headers is recognized.
 
-Regenerate both new fixtures reproducibly (identical recipe to the C++ fixture,
-substituting `metal`/`cuda`):
-
-```bash
-rm -rf /tmp/cg-fixture-metal && cp -r crates/codegraph-bench/fixtures/metal /tmp/cg-fixture-metal
-cargo build --release -p codegraph-rs
-CODEGRAPH_NO_DAEMON=1 CODEGRAPH_NO_WATCH=1 ./target/release/codegraph init /tmp/cg-fixture-metal
-cp /tmp/cg-fixture-metal/.codegraph/codegraph.db reference/golden/metal/colby.db
-cargo run -p codegraph-bench --bin bench -- --gen-golden reference/golden/metal/colby.db reference/golden/metal
-# …and the same for cuda.
-```
+Regenerate both fixtures with `scripts/regen-goldens.sh --write metal cuda` (the shared recipe in [Regenerating goldens](#regenerating-goldens)).
 
 The `generated_golden_matches_committed_{metal,cuda}_fixture` and
 `{metal,cuda}_db_is_self_equivalent_to_{metal,cuda}_golden` tests in
@@ -951,16 +811,7 @@ edges) and does NOT override `extract_modifiers` (the decorator hook). Adding th
 variant is byte-neutral for `colby.schema.sql` (language is a stored TEXT value,
 not DDL) and for the six existing goldens (none holds a `.ets` file).
 
-Regenerate reproducibly (identical recipe to the C++ fixture, substituting
-`arkts`):
-
-```bash
-rm -rf /tmp/cg-fixture-arkts && cp -r crates/codegraph-bench/fixtures/arkts /tmp/cg-fixture-arkts
-cargo build --release -p codegraph-rs
-CODEGRAPH_NO_DAEMON=1 CODEGRAPH_NO_WATCH=1 ./target/release/codegraph init /tmp/cg-fixture-arkts
-cp /tmp/cg-fixture-arkts/.codegraph/codegraph.db reference/golden/arkts/colby.db
-cargo run -p codegraph-bench --bin bench -- --gen-golden reference/golden/arkts/colby.db reference/golden/arkts
-```
+Regenerate it with `scripts/regen-goldens.sh --write arkts` (the shared recipe in [Regenerating goldens](#regenerating-goldens)).
 
 The `generated_golden_matches_committed_arkts_fixture` and
 `arkts_db_is_self_equivalent_to_arkts_golden` tests in
@@ -1001,16 +852,7 @@ post-resolution state. No `FrameworkResolver` impl is involved; the
 `colby.schema.sql` (language is a stored TEXT value, not DDL) and for the seven
 existing goldens (none holds a `.sol` file).
 
-Regenerate reproducibly (identical recipe to the ArkTS fixture, substituting
-`solidity`):
-
-```bash
-rm -rf /tmp/cg-fixture-solidity && cp -r crates/codegraph-bench/fixtures/solidity /tmp/cg-fixture-solidity
-cargo build --release -p codegraph-rs
-CODEGRAPH_NO_DAEMON=1 CODEGRAPH_NO_WATCH=1 ./target/release/codegraph init /tmp/cg-fixture-solidity
-cp /tmp/cg-fixture-solidity/.codegraph/codegraph.db reference/golden/solidity/colby.db
-cargo run -p codegraph-bench --bin bench -- --gen-golden reference/golden/solidity/colby.db reference/golden/solidity
-```
+Regenerate it with `scripts/regen-goldens.sh --write solidity` (the shared recipe in [Regenerating goldens](#regenerating-goldens)).
 
 The `generated_golden_matches_committed_solidity_fixture` and
 `solidity_db_is_self_equivalent_to_solidity_golden` tests in
@@ -1049,16 +891,7 @@ resolve code binds anything. Adding the variant is byte-neutral for
 `colby.schema.sql` (language is a stored TEXT value, not DDL) and for the eight
 existing goldens (none holds a `.nix` file).
 
-Regenerate reproducibly (identical recipe to the Solidity fixture, substituting
-`nix`):
-
-```bash
-rm -rf /tmp/cg-fixture-nix && cp -r crates/codegraph-bench/fixtures/nix /tmp/cg-fixture-nix
-cargo build --release -p codegraph-rs
-CODEGRAPH_NO_DAEMON=1 CODEGRAPH_NO_WATCH=1 ./target/release/codegraph init /tmp/cg-fixture-nix
-cp /tmp/cg-fixture-nix/.codegraph/codegraph.db reference/golden/nix/colby.db
-cargo run -p codegraph-bench --bin bench -- --gen-golden reference/golden/nix/colby.db reference/golden/nix
-```
+Regenerate it with `scripts/regen-goldens.sh --write nix` (the shared recipe in [Regenerating goldens](#regenerating-goldens)).
 
 The `generated_golden_matches_committed_nix_fixture` and
 `nix_db_is_self_equivalent_to_nix_golden` tests in
@@ -1102,16 +935,7 @@ top-level-assignment `var.X` ref, and the `module.M:output.<out>` scoped half of
 byte-neutral for `colby.schema.sql` (language is a stored TEXT value, not DDL)
 and for the nine existing goldens (none holds a `.tf`/`.tfvars`/`.tofu` file).
 
-Regenerate reproducibly (identical recipe to the Nix fixture, substituting
-`terraform`):
-
-```bash
-rm -rf /tmp/cg-fixture-terraform && cp -r crates/codegraph-bench/fixtures/terraform /tmp/cg-fixture-terraform
-cargo build --release -p codegraph-rs
-CODEGRAPH_NO_DAEMON=1 CODEGRAPH_NO_WATCH=1 ./target/release/codegraph init /tmp/cg-fixture-terraform
-cp /tmp/cg-fixture-terraform/.codegraph/codegraph.db reference/golden/terraform/colby.db
-cargo run -p codegraph-bench --bin bench -- --gen-golden reference/golden/terraform/colby.db reference/golden/terraform
-```
+Regenerate it with `scripts/regen-goldens.sh --write terraform` (the shared recipe in [Regenerating goldens](#regenerating-goldens)).
 
 The `generated_golden_matches_committed_terraform_fixture` and
 `terraform_db_is_self_equivalent_to_terraform_golden` tests in
@@ -1153,16 +977,7 @@ dispatch, dynamic MFA targets, behaviour callback contracts, and
 node lookup normalize Erlang's source spelling `mod:fn/3` to the stored
 `mod::fn/3` form.
 
-Regenerate reproducibly (identical recipe to the Terraform fixture, substituting
-`erlang`):
-
-```bash
-rm -rf /tmp/cg-fixture-erlang && cp -r crates/codegraph-bench/fixtures/erlang /tmp/cg-fixture-erlang
-cargo build --release -p codegraph-rs
-CODEGRAPH_NO_DAEMON=1 CODEGRAPH_NO_WATCH=1 ./target/release/codegraph init /tmp/cg-fixture-erlang
-cp /tmp/cg-fixture-erlang/.codegraph/codegraph.db reference/golden/erlang/colby.db
-cargo run -p codegraph-bench --bin bench -- --gen-golden reference/golden/erlang/colby.db reference/golden/erlang
-```
+Regenerate it with `scripts/regen-goldens.sh --write erlang` (the shared recipe in [Regenerating goldens](#regenerating-goldens)).
 
 The `generated_golden_matches_committed_erlang_fixture` and
 `erlang_db_is_self_equivalent_to_erlang_golden` tests in
@@ -1201,15 +1016,7 @@ are all **DEFERRED**. Adding the variant is byte-neutral for `colby.schema.sql`
 (language is a stored TEXT value, not DDL) and for the eleven existing goldens
 (none holds a `.cfc`/`.cfm`/`.cfs` file).
 
-Regenerate reproducibly (identical recipe, substituting `cfml`):
-
-```bash
-rm -rf /tmp/cg-fixture-cfml && cp -r crates/codegraph-bench/fixtures/cfml /tmp/cg-fixture-cfml
-cargo build --release -p codegraph-rs
-CODEGRAPH_NO_DAEMON=1 CODEGRAPH_NO_WATCH=1 ./target/release/codegraph init /tmp/cg-fixture-cfml
-cp /tmp/cg-fixture-cfml/.codegraph/codegraph.db reference/golden/cfml/colby.db
-cargo run -p codegraph-bench --bin bench -- --gen-golden reference/golden/cfml/colby.db reference/golden/cfml
-```
+Regenerate it with `scripts/regen-goldens.sh --write cfml` (the shared recipe in [Regenerating goldens](#regenerating-goldens)).
 
 The `generated_golden_matches_committed_cfml_fixture` and
 `cfml_db_is_self_equivalent_to_cfml_golden` tests in
@@ -1276,19 +1083,7 @@ all four canonical JSON artifacts and proving the original 14-file rows
 byte-for-byte unchanged. This is the required review shape for future corpus
 growth: an additive fixture must not silently perturb old resolution confidence.
 
-Regenerate the committed database and canonical artifacts from a clean corpus:
-
-```bash
-rm -rf /tmp/cg-fixture-typescript
-cp -r crates/codegraph-bench/fixtures/typescript /tmp/cg-fixture-typescript
-cargo build --release -p codegraph-rs
-CODEGRAPH_NO_DAEMON=1 CODEGRAPH_NO_WATCH=1 \
-  ./target/release/codegraph init /tmp/cg-fixture-typescript
-mkdir -p reference/golden/typescript
-cp /tmp/cg-fixture-typescript/.codegraph/codegraph.db reference/golden/typescript/colby.db
-cargo run -p codegraph-bench --bin bench -- \
-  --gen-golden reference/golden/typescript/colby.db reference/golden/typescript
-```
+Regenerate it with `scripts/regen-goldens.sh --write typescript` (the shared recipe in [Regenerating goldens](#regenerating-goldens)).
 
 The `generated_golden_matches_committed_typescript_fixture` and
 `typescript_db_is_self_equivalent_to_typescript_golden` tests in
