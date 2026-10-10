@@ -230,7 +230,12 @@ the kernel lock is authority and is released automatically on process exit.
 
 Default daemon mode multiplexes every MCP client onto that one writer. On a cold
 start the foreground stdio session answers immediately without its own background
-services while the detached daemon takes ownership. Explicit direct mode
+services while the detached daemon takes ownership. Once the daemon's socket is
+up, the session retains a passive lease on it, the same client connection an
+explicit `projectPath` service holds, so the daemon does not idle-exit while the
+session lives. If that lease stops being live (the daemon died, was replaced, or
+the index was re-created), the session starts or re-attaches a daemon with
+exponential backoff, and never creates an index that is gone. Explicit direct mode
 (`CODEGRAPH_NO_DAEMON=1`) may own the writer instead; a second direct process fails
 fast rather than alternating sync mutations. An unindexed explicit path remains
 state-free: only `codegraph init` creates an index namespace.

@@ -3879,9 +3879,10 @@ pub enum ColdStartAction {
     /// A daemon is ALREADY running: attach to it via the real proxy (the proxy
     /// answers `initialize`/`tools/list` locally and forwards tool calls). Fast.
     ProxyToRunningDaemon,
-    /// COLD start (no live daemon): spawn the shared daemon FIRE-AND-FORGET for
-    /// the NEXT session's warm attach, but serve THIS session DIRECT immediately
-    /// so the MCP handshake is answered without waiting on daemon readiness.
+    /// COLD start (no live daemon): spawn the shared daemon FIRE-AND-FORGET, serve
+    /// THIS session DIRECT immediately so the MCP handshake is answered without
+    /// waiting on daemon readiness, and retain a passive lease on the daemon in
+    /// the background so it stays alive for this session.
     SpawnDaemonAndServeDirect,
 }
 
@@ -3903,6 +3904,8 @@ pub fn cold_start_action(daemon_running: bool) -> ColdStartAction {
 /// handshake without blocking on daemon socket readiness. This is the fix for
 /// the cold-start handshake race (opencode marking codegraph `failed` when the
 /// spawn→poll→proxy→heal prelude exceeded its MCP init timeout under load).
+/// A background keeper then retains a passive lease on that daemon, so it does
+/// not idle-exit while this session lives (upstream #2293).
 fn serve_spawn_or_proxy(
     project: Option<PathBuf>,
     project_root: &Path,
@@ -3937,6 +3940,15 @@ fn serve_spawn_or_proxy(
                 // exists only to answer the first MCP handshake without waiting for
                 // socket readiness; starting another watcher/catch-up here recreated
                 // the exact dual-writer race #1740 guards against.
+                //
+                // The daemon is also what keeps this session's index live, and a
+                // daemon with no client idle-exits. Once its socket is up, the
+                // keeper retains a passive lease for the life of the session and,
+                // if that lease is lost, starts or re-attaches a daemon with
+                // backoff (upstream #2293). It runs on its own thread, so the
+                // handshake below still never waits on the daemon.
+                let _lease_keeper =
+                    codegraph_daemon::keep_session_attached(project_root.to_path_buf(), no_watch);
                 serve_direct_stdio(project, explicit_project_services(no_watch))
             } else {
                 // If the child could not even be spawned, preserve the established

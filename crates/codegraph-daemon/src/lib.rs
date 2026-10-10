@@ -7,6 +7,7 @@
 
 pub mod control;
 pub mod http_registry;
+mod lease_keeper;
 mod lock;
 pub mod mcp_registry;
 mod paths;
@@ -30,6 +31,10 @@ pub use control::{
     CONTROL_PROTOCOL, ControlAck, ControlFrame, ShutdownOutcome, parse_control_frame,
     request_daemon_shutdown,
 };
+pub use lease_keeper::{
+    CODEGRAPH_DAEMON_RETRY_MAX_MS, CODEGRAPH_DAEMON_RETRY_MS, DaemonRetryPolicy,
+    SessionLeaseKeeper, keep_session_attached,
+};
 pub use lock::{
     AcquireResult, DaemonLockInfo, clear_stale_daemon_lock, clear_stale_daemon_socket,
     decode_lock_info, encode_lock_info, recorded_socket_path, try_acquire_daemon_lock,
@@ -40,7 +45,10 @@ pub use process::{
     SupervisionState, current_ppid, is_process_alive, is_session_leader, supervision_lost_reason,
     terminate_pid,
 };
-pub use project_service::{ProjectDaemonLease, project_service_broker, retain_project_daemon};
+pub use project_service::{
+    ProjectDaemonLease, attach_project_daemon_passive, project_service_broker,
+    retain_project_daemon, retain_project_daemon_passive,
+};
 pub use proxy::{ProxyOutcome, run_proxy, verify_daemon_hello};
 pub use session::{SessionRegistry, read_daemon_hello, run_session_recv};
 pub use spawn::{

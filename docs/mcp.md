@@ -500,7 +500,11 @@ OS kernel exclusive lock on `.codegraph/writer.pid` for its whole watcher/catch-
 lifetime. The file's JSON is diagnostic; process death releases the kernel lock
 without trusting PID reuse or deleting/recreating the authority path. On a cold
 daemon start, the foreground stdio process answers the first handshake directly
-but starts no second watcher. When `CODEGRAPH_NO_DAEMON=1` is used, the foreground
+but starts no second watcher. It then retains a passive connection to the daemon
+it started, so the daemon keeps live sync running for as long as the session is
+open instead of idle-exiting under it; if that connection is lost, the session
+starts or re-attaches a daemon with backoff (`CODEGRAPH_DAEMON_RETRY_MS`, see
+[`cli.md`](cli.md#detached-daemon-lifecycle)). When `CODEGRAPH_NO_DAEMON=1` is used, the foreground
 process owns this writer lock; a second direct server for the same project exits
 with actionable guidance. Read-only/no-default sessions take no writer lock.
 When the resolved root is exactly `$HOME` or the filesystem root (`/`), the
