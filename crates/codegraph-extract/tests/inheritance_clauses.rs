@@ -155,3 +155,48 @@ fn go_embedded_types_are_supertypes() {
         ]
     );
 }
+
+/// G12 (upstream #2145, `0ff11b36`): a Dart class extends its base and
+/// implements every `with` mixin and `implements` interface, whether or not
+/// it names a base; an enum mixes in and implements the same way, and a
+/// mixin implements its interfaces (its `on` constraint is no supertype). A
+/// mixin application `class A = B with M implements I;` is named `A` and has
+/// the same supertypes. Type arguments and an import prefix are dropped.
+#[test]
+fn dart_supertypes_name_the_base_mixins_and_interfaces() {
+    let source = "import 'package:base/base.dart' as p;\n\nclass Child extends Base with M1, M2 implements I1, I2 {}\nclass OnlyMixins with M3 {}\nclass Applied = Base with Mixer implements Face;\nclass Wrapped<T> = Shell<T> with Wm<T>;\nclass Generic<T> extends Box<Map<K, V>> with Mx<T>, My implements Ix<int>, Iy {}\nclass Prefixed extends p.Root with p.Pm implements p.Pi {}\nenum Mode with Em implements Ei { a }\nmixin Logging on Base implements Li {}\n";
+    let implements = |declaration: &str, supertype: &str| {
+        (
+            declaration.to_string(),
+            EdgeKind::Implements,
+            supertype.to_string(),
+        )
+    };
+    assert_eq!(
+        supertypes("lib/child.dart", source, Language::Dart),
+        vec![
+            extends("Applied", "Base"),
+            implements("Applied", "Face"),
+            implements("Applied", "Mixer"),
+            extends("Child", "Base"),
+            implements("Child", "I1"),
+            implements("Child", "I2"),
+            implements("Child", "M1"),
+            implements("Child", "M2"),
+            extends("Generic", "Box"),
+            implements("Generic", "Ix"),
+            implements("Generic", "Iy"),
+            implements("Generic", "Mx"),
+            implements("Generic", "My"),
+            implements("Logging", "Li"),
+            implements("Mode", "Ei"),
+            implements("Mode", "Em"),
+            implements("OnlyMixins", "M3"),
+            implements("Prefixed", "Pi"),
+            implements("Prefixed", "Pm"),
+            extends("Prefixed", "Root"),
+            extends("Wrapped", "Shell"),
+            implements("Wrapped", "Wm"),
+        ]
+    );
+}

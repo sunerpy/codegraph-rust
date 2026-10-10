@@ -956,6 +956,26 @@ pub fn go_change_an_embedded_struct() -> Case {
         .edge_after("struct DB", "extends", "struct Tail")
 }
 
+/// G12: a Dart class implements each `with` mixin; its base stays `extends`.
+pub fn dart_change_a_mixin() -> Case {
+    Case::new(Change::EditHeritage, &[Language::Dart])
+        .file(
+            "lib/parts.dart",
+            "class Bird {}\n\nmixin Walker {}\n\nmixin Swimmer {}\n",
+        )
+        .file(
+            "lib/duck.dart",
+            "import 'parts.dart';\n\nclass Duck extends Bird with Walker {}\n",
+        )
+        .write(
+            "lib/duck.dart",
+            "import 'parts.dart';\n\nclass Duck extends Bird with Swimmer {}\n",
+        )
+        .edge_before("class Duck", "implements", "class Walker")
+        .edge_after("class Duck", "implements", "class Swimmer")
+        .edge_throughout("class Duck", "extends", "class Bird")
+}
+
 pub fn scala_change_a_parent_trait() -> Case {
     Case::new(Change::EditHeritage, &[Language::Scala])
         .file(

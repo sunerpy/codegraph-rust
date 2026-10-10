@@ -3873,6 +3873,16 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
         }
         let mut callee_name = String::new();
         let func = child_by_field(node, "function").or_else(|| node.named_child(0));
+        // #2375 — a Dart generic call `ref.read<Repo>(p)` wraps its callee in
+        // an `instantiation_expression`; the type arguments are no part of
+        // the name it calls.
+        let func = func.map(|func| {
+            if self.spec.language() == Language::Dart && func.kind() == "instantiation_expression" {
+                child_by_field(func, "function").unwrap_or(func)
+            } else {
+                func
+            }
+        });
         if let Some(func) = func {
             if is_member_shaped_callee(func) {
                 if let Some(property) = member_name_of(func) {
@@ -4658,6 +4668,10 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             }
             return;
         }
+        if self.spec.language() == Language::Dart {
+            self.extract_dart_supertypes(node, class_id);
+            return;
+        }
         for child in node.named_children(&mut node.walk()) {
             if matches!(
                 child.kind(),
@@ -4879,6 +4893,42 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
                         self.push_ref(class_id, &name, EdgeKind::Extends, base);
                     }
                 }
+            }
+        }
+    }
+
+    /// G12 (upstream #2145, `0ff11b36`) — Dart `class C extends B with M1, M2
+    /// implements I`. tree-sitter-dart keeps the base and the `with` mixins in
+    /// `superclass`, the interfaces in `interfaces`, an enum's mixins in a
+    /// `mixins` of its own, and `class A = B with M implements I;` in a
+    /// `mixin_application`. The base is `extends`; every mixin and interface
+    /// is `implements`. A mixin's `on` constraint is no supertype.
+    fn extract_dart_supertypes(&mut self, node: SyntaxNode<'tree>, class_id: &str) {
+        for child in node.named_children(&mut node.walk()) {
+            match child.kind() {
+                "superclass" | "mixin_application" => {
+                    // The base is the first `type`; the `type`s after it carry
+                    // its type arguments.
+                    let base = child
+                        .named_children(&mut child.walk())
+                        .find(|c| c.kind() == "type")
+                        .and_then(crate::lang::dart_supertype_name);
+                    if let Some(base) = base {
+                        let name = node_text(base, self.source);
+                        self.push_ref(class_id, &name, EdgeKind::Extends, base);
+                    }
+                    self.extract_dart_supertypes(child, class_id);
+                }
+                "mixin_application_class" => self.extract_dart_supertypes(child, class_id),
+                "mixins" | "interfaces" => {
+                    for entry in child.named_children(&mut child.walk()) {
+                        if let Some(name_node) = crate::lang::dart_supertype_name(entry) {
+                            let name = node_text(name_node, self.source);
+                            self.push_ref(class_id, &name, EdgeKind::Implements, name_node);
+                        }
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -5213,6 +5263,22 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
                 for inner in child.named_children(&mut child.walk()) {
                     self.consider_decorator(inner, decorated_id);
                 }
+            }
+        }
+        // #2382 — a Dart member's annotations are written inside the wrappers
+        // around it (its `class_member`, a bodiless member's `declaration`),
+        // before it.
+        if self.spec.language() == Language::Dart {
+            let wrappers = crate::lang::dart_member_wrappers(decl_node);
+            if !wrappers.is_empty() {
+                let mut inner = decl_node;
+                for wrapper in wrappers {
+                    for prefix in crate::lang::dart_prefix(wrapper, inner) {
+                        self.consider_decorator(prefix, decorated_id);
+                    }
+                    inner = wrapper;
+                }
+                return;
             }
         }
         let Some(parent) = decl_node.parent() else {
@@ -5594,14 +5660,56 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
     /// two things the author wrote about the same symbol (upstream
     /// `docstringFor`, #1905).
     fn docstring_for(&self, node: SyntaxNode<'tree>) -> Option<String> {
-        let preceding = self
-            .preceding_docstring(node)
-            .filter(|text| !text.is_empty());
+        let preceding = if self.spec.language() == Language::Dart {
+            self.dart_preceding_docstring(node)
+        } else {
+            self.preceding_docstring(node)
+        }
+        .filter(|text| !text.is_empty());
         let body = self.spec.body_docstring(node, self.source);
         match (preceding, body) {
             (Some(preceding), Some(body)) => Some(format!("{preceding}\n\n{body}")),
             (preceding, body) => body.or(preceding),
         }
+    }
+
+    /// #2382 / #2387 — a Dart member's dartdoc is written before the outermost
+    /// wrapper tree-sitter-dart puts around it (`dart_member_wrappers`), above
+    /// the annotations inside it. A comment written among those annotations,
+    /// or between the annotations that open a function or method and its
+    /// signature, joins it, as adjacent comments do. A class-like
+    /// declaration's annotations open its own node, and the dartdoc above them
+    /// is its previous sibling already.
+    fn dart_preceding_docstring(&self, node: SyntaxNode<'tree>) -> Option<String> {
+        let wrappers = crate::lang::dart_member_wrappers(node);
+        let outer = wrappers.last().copied().unwrap_or(node);
+        let mut parts: Vec<String> = self.preceding_docstring(outer).into_iter().collect();
+        let mut prefixes = Vec::new();
+        let mut inner = node;
+        for wrapper in &wrappers {
+            prefixes.push(crate::lang::dart_prefix(*wrapper, inner));
+            inner = *wrapper;
+        }
+        for prefix in prefixes.iter().rev() {
+            for child in prefix {
+                if is_comment_kind(child.kind()) {
+                    parts.push(clean_comment(&node_text(*child, self.source)));
+                }
+            }
+        }
+        if matches!(node.kind(), "method_declaration" | "function_declaration") {
+            for child in node.named_children(&mut node.walk()) {
+                if is_comment_kind(child.kind()) {
+                    parts.push(clean_comment(&node_text(child, self.source)));
+                } else if child.kind() != "annotation" {
+                    break;
+                }
+            }
+        }
+        if parts.is_empty() {
+            return None;
+        }
+        Some(parts.join("\n").trim().to_string())
     }
 
     fn preceding_docstring(&self, node: SyntaxNode<'tree>) -> Option<String> {
@@ -5621,10 +5729,7 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
         let mut sibling = anchor.prev_named_sibling();
         let mut comments = Vec::new();
         while let Some(current) = sibling {
-            if matches!(
-                current.kind(),
-                "comment" | "line_comment" | "block_comment" | "documentation_comment"
-            ) {
+            if is_comment_kind(current.kind()) {
                 comments.push(clean_comment(&node_text(current, self.source)));
                 sibling = current.prev_named_sibling();
             } else {
@@ -6021,6 +6126,13 @@ fn is_r_constant_name(name: &str) -> bool {
         && name
             .chars()
             .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '.' || c == '_')
+}
+
+fn is_comment_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "comment" | "line_comment" | "block_comment" | "documentation_comment"
+    )
 }
 
 fn is_docstring_wrapper_type(kind: &str) -> bool {

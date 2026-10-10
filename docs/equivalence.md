@@ -395,6 +395,15 @@ corpus at `crates/codegraph-bench/fixtures/dart/extension_type.dart` proves an
 ordinary-class control. This prevents either the old top-level-function shape
 or the later complete member drop from returning unnoticed.
 
+Since `feat(extract): Dart mixins, implements, mixin applications and member
+docs`, a mixin application `class A = B with M;` is named `A` rather than
+`<anonymous>`, so its node id changes; the formula does not, the name is one of
+its inputs (OD-5). No committed corpus holds a mixin application, a `with` or
+`implements` list, a member dartdoc or a generic call, so no golden changed
+(`scripts/regen-goldens.sh --check`: every corpus identical); the extractor
+tests `inheritance_clauses`, `dart_member_docs` and `dart_generic_calls` pin
+the behavior.
+
 Regenerate it with `scripts/regen-goldens.sh --write dart` (the shared recipe in [Regenerating goldens](#regenerating-goldens)).
 
 `generated_golden_matches_committed_dart_fixture` and

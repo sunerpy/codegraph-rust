@@ -55,6 +55,7 @@ pub(crate) use cpp::{
 pub use csharp::CSHARP_SPEC;
 pub(crate) use csharp::csharp_base_type_name;
 pub use dart::DART_SPEC;
+pub(crate) use dart::{dart_member_wrappers, dart_prefix, dart_supertype_name};
 pub use erlang::ERLANG_SPEC;
 pub(crate) use erlang::{
     erlang_atom_text, erlang_call_ref_name, erlang_clause_header, erlang_clause_name,
