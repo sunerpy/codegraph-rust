@@ -36,6 +36,18 @@
     "target": "method:fb6e3b0761da57101db4a4ffde0342a4"
   },
   {
+    "col": 25,
+    "kind": "extends",
+    "line": 19,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "class:cac67137c3d2c62db6f57e129ef207e9",
+    "target": "class:0aadaac60542db4c7e0a4c05e819e2b5"
+  },
+  {
     "col": 31,
     "kind": "calls",
     "line": 5,
@@ -58,6 +70,18 @@
     "provenance": null,
     "source": "method:4fc33d78b0a343e2d1667a33b1ce8f33",
     "target": "method:dd80af2d494eec7f7e4d7eb45689e497"
+  },
+  {
+    "col": 36,
+    "kind": "implements",
+    "line": 19,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "class:cac67137c3d2c62db6f57e129ef207e9",
+    "target": "interface:26f33931f5c1df4f0f8c3a5d94640af1"
   },
   {
     "col": 43,

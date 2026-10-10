@@ -53,6 +53,7 @@ pub(crate) use cpp::{
     recover_explicit_operator_call,
 };
 pub use csharp::CSHARP_SPEC;
+pub(crate) use csharp::csharp_base_type_name;
 pub use dart::DART_SPEC;
 pub use erlang::ERLANG_SPEC;
 pub(crate) use erlang::{

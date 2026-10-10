@@ -621,6 +621,7 @@ matrix! {
     python_move_an_imported_module_away,
     typescript_change_a_superclass,
     java_change_a_superclass_and_interface,
+    csharp_base_list_gains_an_interface,
     scala_change_a_parent_trait,
     solidity_change_a_base_contract,
     cfml_change_a_base_component,

@@ -738,6 +738,25 @@ pub fn java_change_a_superclass_and_interface() -> Case {
         .edge_after("class zoo::Dog", "implements", "interface zoo::Named")
 }
 
+/// G1: a C# `base_list` names the base class and the interfaces in one list.
+pub fn csharp_base_list_gains_an_interface() -> Case {
+    Case::new(Change::EditHeritage, &[Language::CSharp])
+        .file(
+            "src/Shapes.cs",
+            "namespace Shapes\n{\n    public class Shape { }\n\n    public interface IDrawable { }\n}\n",
+        )
+        .file(
+            "src/Square.cs",
+            "namespace Shapes\n{\n    public class Square : Shape { }\n}\n",
+        )
+        .write(
+            "src/Square.cs",
+            "namespace Shapes\n{\n    public class Square : Shape, IDrawable { }\n}\n",
+        )
+        .edge_throughout("class Shapes::Square", "extends", "class Shapes::Shape")
+        .edge_after("class Shapes::Square", "implements", "interface Shapes::IDrawable")
+}
+
 pub fn scala_change_a_parent_trait() -> Case {
     Case::new(Change::EditHeritage, &[Language::Scala])
         .file(

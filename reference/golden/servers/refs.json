@@ -961,6 +961,16 @@
   },
   {
     "candidates": null,
+    "col": 35,
+    "file_path": "aspnet/Controllers/UsersController.cs",
+    "from_node_id": "class:e1ff6b0b9c2d0dbf97ddf5bc62282550",
+    "language": "csharp",
+    "line": 7,
+    "reference_kind": "extends",
+    "reference_name": "ControllerBase"
+  },
+  {
+    "candidates": null,
     "col": 36,
     "file_path": "play/app/controllers/HomeController.scala",
     "from_node_id": "method:0952d7c19228f96d12bb769ece592391",

@@ -4571,6 +4571,26 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             if child.kind() == "class_heritage" {
                 self.extract_inheritance(child, class_id);
             }
+            // G1 (upstream `b712e4de`) — C# `class Store : BaseStore, IStore`:
+            // one `base_list` holds the base class and the interfaces alike, so
+            // every entry is an `extends` ref and the resolver promotes the
+            // ones that bind an interface. An enum's `: byte` is a
+            // `predefined_type`, never a supertype.
+            if child.kind() == "base_list" && self.spec.language() == Language::CSharp {
+                for base in child.named_children(&mut child.walk()) {
+                    let base = if base.kind() == "primary_constructor_base_type" {
+                        match child_by_field(base, "type") {
+                            Some(ty) => ty,
+                            None => continue,
+                        }
+                    } else {
+                        base
+                    };
+                    if let Some(name) = crate::lang::csharp_base_type_name(base, self.source) {
+                        self.push_ref(class_id, &name, EdgeKind::Extends, base);
+                    }
+                }
+            }
             // #1043 — C++ `class D : public Base<int>, ns::Tpl<T>`: base_class_clause
             // (a C++-grammar-only node kind) holds base refs as type_identifier /
             // qualified_identifier / template_type. access_specifier (public/…),

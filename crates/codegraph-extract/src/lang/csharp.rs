@@ -142,6 +142,35 @@ fn blank_csharp_preprocessor_directives(source: &str) -> String {
         .join("\n")
 }
 
+/// The name a C# `base_list` entry binds by: an identifier, a generic name
+/// without its type arguments, or a qualified name built from those, with the
+/// `global::` alias (the root namespace) dropped. A built-in or composite type
+/// (`byte`, a tuple, an array) names no supertype.
+pub(crate) fn csharp_base_type_name(node: Node<'_>, source: &str) -> Option<String> {
+    match node.kind() {
+        "identifier" => Some(node_text(node, source)),
+        "generic_name" => node
+            .named_children(&mut node.walk())
+            .find(|child| child.kind() == "identifier")
+            .map(|id| node_text(id, source)),
+        "qualified_name" => {
+            let qualifier = csharp_base_type_name(child_by_field(node, "qualifier")?, source)?;
+            let name = csharp_base_type_name(child_by_field(node, "name")?, source)?;
+            Some(format!("{qualifier}.{name}"))
+        }
+        "alias_qualified_name" => {
+            let alias = node_text(child_by_field(node, "alias")?, source);
+            let name = csharp_base_type_name(child_by_field(node, "name")?, source)?;
+            Some(if alias == "global" {
+                name
+            } else {
+                format!("{alias}::{name}")
+            })
+        }
+        _ => None,
+    }
+}
+
 fn has_modifier(node: Node<'_>, modifier: &str) -> bool {
     node.children(&mut node.walk()).any(|child| {
         child.kind() == "modifier" && child.child(0).is_some_and(|inner| inner.kind() == modifier)
