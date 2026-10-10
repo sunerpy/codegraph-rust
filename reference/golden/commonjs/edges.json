@@ -1,0 +1,187 @@
+[
+  {
+    "col": 12,
+    "kind": "calls",
+    "line": 9,
+    "metadata": {
+      "confidence": 0.4,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "file:test/app.test.js",
+    "target": "constant:85a5dcf259eaae3906faacccec6b7071"
+  },
+  {
+    "col": 17,
+    "kind": "references",
+    "line": 12,
+    "metadata": {
+      "confidence": 0.95,
+      "fnRef": true,
+      "resolvedBy": "function-ref"
+    },
+    "provenance": null,
+    "source": "file:lib/app.js",
+    "target": "function:feb3ac5a0a28894758fdc7dbbd267c67"
+  },
+  {
+    "col": 18,
+    "kind": "instantiates",
+    "line": 8,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "function:feb3ac5a0a28894758fdc7dbbd267c67",
+    "target": "class:6421dd6a0fb750004ef4863b05213d9e"
+  },
+  {
+    "col": 19,
+    "kind": "references",
+    "line": 7,
+    "metadata": {
+      "confidence": 0.95,
+      "fnRef": true,
+      "resolvedBy": "function-ref"
+    },
+    "provenance": null,
+    "source": "file:lib/format.js",
+    "target": "function:98496f9dc78403b03abbe6c7b80d5984"
+  },
+  {
+    "col": 32,
+    "kind": "calls",
+    "line": 9,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "instance-method"
+    },
+    "provenance": null,
+    "source": "function:feb3ac5a0a28894758fdc7dbbd267c67",
+    "target": "method:7581b0f9f2147fb086aa7bdc323a353c"
+  },
+  {
+    "col": 4,
+    "kind": "calls",
+    "line": 10,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "file:test/app.test.js",
+    "target": "function:614ebe045ff7b9e4ae1fbcf86f0ec074"
+  },
+  {
+    "col": 4,
+    "kind": "calls",
+    "line": 9,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "file:test/app.test.js",
+    "target": "constant:a207c2fcdb3b1eb8b6d19351164ebb49"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "class:6421dd6a0fb750004ef4863b05213d9e",
+    "target": "method:7581b0f9f2147fb086aa7bdc323a353c"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:index.js",
+    "target": "constant:9f62233a1a2b3a3959cbbf99bdef9231"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:lib/app.js",
+    "target": "constant:188e17c107498c0214cba002327df0c8"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:lib/app.js",
+    "target": "constant:1cd2674cf311c6f8fb58d97bae848d6a"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:lib/app.js",
+    "target": "function:614ebe045ff7b9e4ae1fbcf86f0ec074"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:lib/app.js",
+    "target": "function:feb3ac5a0a28894758fdc7dbbd267c67"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:lib/format.js",
+    "target": "function:98496f9dc78403b03abbe6c7b80d5984"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:lib/service.js",
+    "target": "class:6421dd6a0fb750004ef4863b05213d9e"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:lib/util.js",
+    "target": "function:30231724b71586cd7faef27bc665c8d7"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:test/app.test.js",
+    "target": "constant:85a5dcf259eaae3906faacccec6b7071"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:test/app.test.js",
+    "target": "constant:a207c2fcdb3b1eb8b6d19351164ebb49"
+  }
+]

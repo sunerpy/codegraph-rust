@@ -184,8 +184,9 @@ Every intentional golden change is recorded here with the commit, the corpora
 and artifacts it changed, why the graph change is intended, and the command
 that regenerated it. Older regenerations are described in each corpus section.
 
-| Commit | Corpus | Artifacts | Intent | Command |
-| ------ | ------ | --------- | ------ | ------- |
+| Commit                                                                                        | Corpus                                                              | Artifacts         | Intent                                                                                                | Command                                                                                        |
+| --------------------------------------------------------------------------------------------- | ------------------------------------------------------------------- | ----------------- | ----------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
+| `test(bench): add C#, Java, Swift, ObjC, PHP, Vue, Svelte, Python-bases and CommonJS corpora` | csharp, java, swift, objc, php, vue, svelte, python_bases, commonjs | all (new corpora) | baseline capture of the current extraction and resolution, including the misses later commits correct | `scripts/regen-goldens.sh --write csharp java swift objc php vue svelte python_bases commonjs` |
 
 The canonicalizer strips inherently unstable timestamp columns
 (`nodes.updated_at`, `files.modified_at`, `files.indexed_at`), parses JSON text
@@ -1091,6 +1092,50 @@ The `generated_golden_matches_committed_typescript_fixture` and
 self-equivalence. As for every fixture below the Godot caveats, do not compare
 `colby.db` bytes; compare the four JSON artifacts byte-for-byte and compare
 `schema.sql` as a normalized statement set when statement order differs.
+
+### Baseline corpora for C#, Java, Swift, Objective-C, PHP, Vue, Svelte, Python bases and CommonJS
+
+These nine corpora pin languages and shapes the older corpora never exercised.
+Each was captured with the extraction and resolution as they stood when the
+corpus was added, deliberately including what that code got wrong, so every later
+correction shows up as a diff attributable to one change:
+
+- **`csharp`**: a `base_list` with a class base and an interface, target-typed
+  `new()`, property accessor bodies and expression-bodied members, field
+  initializers, nested and sibling block namespaces, `using static`, a partial
+  class split across declarations, and an overload that delegates to its
+  sibling.
+- **`java`**: `extends`/`implements`, object creation and an anonymous class,
+  enum constants with their own bodies, a static import, two same-named `Field`
+  classes in different packages, test-only imports of Mockito helpers, and the
+  `pick(int)`/`pick(String)` overload pair.
+- **`swift`**: a protocol and its conformance, an extension of a struct, nested
+  types reached through a type path (`API.DependencyController.GetRoute.query()`)
+  beside a same-named path elsewhere, an overload family distinguished by
+  argument labels, and a `#Preview` block.
+- **`objc`**: `@interface Sub : Base <Doer>`, message sends to `self`, `super`
+  and a class, and a plain C call inside a method.
+- **`php`**: namespaces with `use` imports, `extends`/`implements`,
+  `$this`/`self`/`parent` calls, calls written after `=>` in an array literal, a
+  case-variant call to a global function, and a namespace-qualified class name
+  (`Field\FirstName::make()`).
+- **`vue`**: a `<script setup>` component calling an imported composable and a
+  local function from the template, and an Options API component with `data`,
+  `computed`, `methods` and a lifecycle hook.
+- **`svelte`**: a component with a module script and an instance script whose
+  top-level statement calls an imported function.
+- **`python_bases`**: a class with two bases and a metaclass keyword, a
+  classmethod reached through a subclass, `super()` calls, a pytest fixture
+  feeding a test parameter, and a package that re-exports a class through `*`.
+- **`commonjs`**: `require('../')`, `module.exports = X`,
+  `exports.default`, a destructured `{ default: X }` require, `require().member`,
+  a `var` list declaring two requires, and a test that requires an out-of-repo
+  package.
+
+Regenerate any of them with `scripts/regen-goldens.sh --write <corpus>` (the
+shared recipe in [Regenerating goldens](#regenerating-goldens)); `golden_reextract`
+and the `golden_corpora!` pairs in `equivalence.rs` pin them like every other
+corpus.
 
 ### Retrieval and ranking wave (golden-neutral)
 

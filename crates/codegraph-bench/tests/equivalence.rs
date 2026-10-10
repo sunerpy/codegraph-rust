@@ -87,6 +87,15 @@ golden_corpora! {
     "terraform" => generated_golden_matches_committed_terraform_fixture, terraform_db_is_self_equivalent_to_terraform_golden;
     "erlang" => generated_golden_matches_committed_erlang_fixture, erlang_db_is_self_equivalent_to_erlang_golden;
     "cfml" => generated_golden_matches_committed_cfml_fixture, cfml_db_is_self_equivalent_to_cfml_golden;
+    "csharp" => generated_golden_matches_committed_csharp_fixture, csharp_db_is_self_equivalent_to_csharp_golden;
+    "java" => generated_golden_matches_committed_java_fixture, java_db_is_self_equivalent_to_java_golden;
+    "swift" => generated_golden_matches_committed_swift_fixture, swift_db_is_self_equivalent_to_swift_golden;
+    "objc" => generated_golden_matches_committed_objc_fixture, objc_db_is_self_equivalent_to_objc_golden;
+    "php" => generated_golden_matches_committed_php_fixture, php_db_is_self_equivalent_to_php_golden;
+    "vue" => generated_golden_matches_committed_vue_fixture, vue_db_is_self_equivalent_to_vue_golden;
+    "svelte" => generated_golden_matches_committed_svelte_fixture, svelte_db_is_self_equivalent_to_svelte_golden;
+    "python_bases" => generated_golden_matches_committed_python_bases_fixture, python_bases_db_is_self_equivalent_to_python_bases_golden;
+    "commonjs" => generated_golden_matches_committed_commonjs_fixture, commonjs_db_is_self_equivalent_to_commonjs_golden;
 }
 
 #[test]

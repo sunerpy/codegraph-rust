@@ -1,0 +1,20 @@
+[
+  {
+    "content_hash": "d086167a33e6907109315906fcea08d0677d5c0a5e02233dd60df080d5fad524",
+    "errors": null,
+    "generated": 0,
+    "language": "svelte",
+    "node_count": 5,
+    "path": "src/lib/Widget.svelte",
+    "size": 303
+  },
+  {
+    "content_hash": "a27aad0b0b97f138bd095453e5e72bd1131ef83353dd015a755467daed4956c8",
+    "errors": null,
+    "generated": 0,
+    "language": "typescript",
+    "node_count": 3,
+    "path": "src/lib/util.ts",
+    "size": 129
+  }
+]

@@ -1,0 +1,32 @@
+[
+  {
+    "candidates": null,
+    "col": 12,
+    "file_path": "src/App/Store.cs",
+    "from_node_id": "method:fb6e3b0761da57101db4a4ffde0342a4",
+    "language": "csharp",
+    "line": 33,
+    "reference_kind": "calls",
+    "reference_name": "_innerWriter.WriteLine"
+  },
+  {
+    "candidates": null,
+    "col": 26,
+    "file_path": "src/App/Store.cs",
+    "from_node_id": "method:fb6e3b0761da57101db4a4ffde0342a4",
+    "language": "csharp",
+    "line": 35,
+    "reference_kind": "calls",
+    "reference_name": "Pow"
+  },
+  {
+    "candidates": null,
+    "col": 29,
+    "file_path": "src/App/Nested.cs",
+    "from_node_id": "method:c4141344da99409ec7ad03e1ea5f6205",
+    "language": "csharp",
+    "line": 14,
+    "reference_kind": "calls",
+    "reference_name": "new Inner.Deep().Dive"
+  }
+]

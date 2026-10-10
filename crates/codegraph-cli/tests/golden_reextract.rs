@@ -44,8 +44,34 @@ macro_rules! reextract_corpora {
 }
 
 reextract_corpora!(
-    arkts, cfml, cpp, cuda, dart, erlang, go, godot, kotlin, lua, metal, nix, python, ruby, rust,
-    scala, solidity, terraform, typescript,
+    arkts,
+    cfml,
+    commonjs,
+    cpp,
+    csharp,
+    cuda,
+    dart,
+    erlang,
+    go,
+    godot,
+    java,
+    kotlin,
+    lua,
+    metal,
+    nix,
+    objc,
+    php,
+    python,
+    python_bases,
+    ruby,
+    rust,
+    scala,
+    solidity,
+    svelte,
+    swift,
+    terraform,
+    typescript,
+    vue,
 );
 
 #[test]

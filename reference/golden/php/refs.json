@@ -1,0 +1,62 @@
+[
+  {
+    "candidates": null,
+    "col": 11,
+    "file_path": "src/Util/helpers.php",
+    "from_node_id": "function:2c3e0ea1a203fedfce0fee1a81132f72",
+    "language": "php",
+    "line": 10,
+    "reference_kind": "calls",
+    "reference_name": "number_format"
+  },
+  {
+    "candidates": null,
+    "col": 16,
+    "file_path": "src/Controller.php",
+    "from_node_id": "method:d7e53b91aba4c60a50c0023d3ae0b6fa",
+    "language": "php",
+    "line": 20,
+    "reference_kind": "calls",
+    "reference_name": "Field\\FirstName.make"
+  },
+  {
+    "candidates": null,
+    "col": 23,
+    "file_path": "src/Controller.php",
+    "from_node_id": "method:d7e53b91aba4c60a50c0023d3ae0b6fa",
+    "language": "php",
+    "line": 24,
+    "reference_kind": "calls",
+    "reference_name": "formatprice"
+  },
+  {
+    "candidates": null,
+    "col": 31,
+    "file_path": "tests/ControllerTest.php",
+    "from_node_id": "method:eb71c0f01dd64f14e6a9c61109c8dd41",
+    "language": "php",
+    "line": 12,
+    "reference_kind": "calls",
+    "reference_name": "count"
+  },
+  {
+    "candidates": null,
+    "col": 40,
+    "file_path": "src/Controller.php",
+    "from_node_id": "method:d7e53b91aba4c60a50c0023d3ae0b6fa",
+    "language": "php",
+    "line": 25,
+    "reference_kind": "calls",
+    "reference_name": "other.render"
+  },
+  {
+    "candidates": null,
+    "col": 8,
+    "file_path": "tests/ControllerTest.php",
+    "from_node_id": "method:eb71c0f01dd64f14e6a9c61109c8dd41",
+    "language": "php",
+    "line": 12,
+    "reference_kind": "calls",
+    "reference_name": "assertEquals"
+  }
+]

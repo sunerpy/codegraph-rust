@@ -1,0 +1,461 @@
+[
+  {
+    "col": 0,
+    "kind": "imports",
+    "line": 1,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "file:pkg/service.py",
+    "target": "import:77de8c1e0efc6cfc112d20a7df6b5519"
+  },
+  {
+    "col": 0,
+    "kind": "imports",
+    "line": 1,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "file:tests/test_service.py",
+    "target": "file:pkg/service.py"
+  },
+  {
+    "col": 0,
+    "kind": "imports",
+    "line": 1,
+    "metadata": {
+      "confidence": 0.95,
+      "resolvedBy": "qualified-name"
+    },
+    "provenance": null,
+    "source": "file:pkg/__init__.py",
+    "target": "import:5a84e0599dab909bda5f5fc39543a608"
+  },
+  {
+    "col": 0,
+    "kind": "imports",
+    "line": 1,
+    "metadata": {
+      "confidence": 0.95,
+      "resolvedBy": "qualified-name"
+    },
+    "provenance": null,
+    "source": "file:pkg/models/__init__.py",
+    "target": "import:253e6de715bb1372e596991a3cb5d0a7"
+  },
+  {
+    "col": 0,
+    "kind": "imports",
+    "line": 1,
+    "metadata": {
+      "confidence": 0.95,
+      "resolvedBy": "qualified-name"
+    },
+    "provenance": null,
+    "source": "file:pkg/models/user.py",
+    "target": "import:b02bc8ebc91ef54ae28245f84b42fb13"
+  },
+  {
+    "col": 0,
+    "kind": "imports",
+    "line": 2,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "file:pkg/service.py",
+    "target": "file:pkg/models/__init__.py"
+  },
+  {
+    "col": 0,
+    "kind": "imports",
+    "line": 3,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "file:tests/conftest.py",
+    "target": "file:pkg/models/user.py"
+  },
+  {
+    "col": 11,
+    "kind": "calls",
+    "line": 5,
+    "metadata": {
+      "confidence": 0.8,
+      "resolvedBy": "instance-method"
+    },
+    "provenance": null,
+    "source": "function:34950f400ecef51d8f3ab74d8cc496ef",
+    "target": "method:96bb5b7c0ce9d04be7cb37384f7a4d15"
+  },
+  {
+    "col": 11,
+    "kind": "calls",
+    "line": 8,
+    "metadata": {
+      "confidence": 0.8,
+      "resolvedBy": "instance-method"
+    },
+    "provenance": null,
+    "source": "function:7a3344a7ac17b30aaa3f83a44206faa5",
+    "target": "method:2226bffb7188c9ea4ee6a95a2b386626"
+  },
+  {
+    "col": 11,
+    "kind": "calls",
+    "line": 9,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "function:2f41a674a292ed6cf2160da3ffacd664",
+    "target": "function:7a3344a7ac17b30aaa3f83a44206faa5"
+  },
+  {
+    "col": 11,
+    "kind": "instantiates",
+    "line": 8,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "function:ea5748bfd28172ce0b0766d2e0b58106",
+    "target": "class:3eac5c229dffda670a81ffbca4147c63"
+  },
+  {
+    "col": 15,
+    "kind": "calls",
+    "line": 7,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "method:2226bffb7188c9ea4ee6a95a2b386626",
+    "target": "method:6840adae2cb87b312fe0260a4227ef90"
+  },
+  {
+    "col": 16,
+    "kind": "imports",
+    "line": 1,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "file:pkg/service.py",
+    "target": "file:pkg/models/__init__.py"
+  },
+  {
+    "col": 18,
+    "kind": "imports",
+    "line": 1,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "file:pkg/models/user.py",
+    "target": "class:24d57926799611befdff3330f284b2a7"
+  },
+  {
+    "col": 20,
+    "kind": "imports",
+    "line": 1,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "file:pkg/__init__.py",
+    "target": "class:a14afda3fa296e6da71c03fc0b7d2601"
+  },
+  {
+    "col": 23,
+    "kind": "imports",
+    "line": 2,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "file:pkg/service.py",
+    "target": "class:a14afda3fa296e6da71c03fc0b7d2601"
+  },
+  {
+    "col": 24,
+    "kind": "imports",
+    "line": 1,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "file:pkg/models/user.py",
+    "target": "class:6fddf6cd7e5fa996fc4fd7330a6b0d6a"
+  },
+  {
+    "col": 24,
+    "kind": "imports",
+    "line": 1,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "file:tests/test_service.py",
+    "target": "function:7a3344a7ac17b30aaa3f83a44206faa5"
+  },
+  {
+    "col": 28,
+    "kind": "imports",
+    "line": 3,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "file:tests/conftest.py",
+    "target": "class:3eac5c229dffda670a81ffbca4147c63"
+  },
+  {
+    "col": 30,
+    "kind": "imports",
+    "line": 1,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "file:pkg/models/user.py",
+    "target": "class:87c409b2abd116818b83ffeb16248828"
+  },
+  {
+    "col": 7,
+    "kind": "imports",
+    "line": 1,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "file:tests/conftest.py",
+    "target": "import:717376c5975a7ba05a7eef52516e31d2"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "class:24d57926799611befdff3330f284b2a7",
+    "target": "method:02d9ab9d379b2325283a261067a9141e"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "class:24d57926799611befdff3330f284b2a7",
+    "target": "method:9d9b5b00778c2267ae8859aa05672b8d"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "class:3eac5c229dffda670a81ffbca4147c63",
+    "target": "method:96bb5b7c0ce9d04be7cb37384f7a4d15"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "class:87c409b2abd116818b83ffeb16248828",
+    "target": "method:6840adae2cb87b312fe0260a4227ef90"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "class:a14afda3fa296e6da71c03fc0b7d2601",
+    "target": "method:2226bffb7188c9ea4ee6a95a2b386626"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:pkg/__init__.py",
+    "target": "import:5a84e0599dab909bda5f5fc39543a608"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:pkg/__init__.py",
+    "target": "variable:7d68af011c2fecb4c488f97142d94833"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:pkg/models/__init__.py",
+    "target": "import:253e6de715bb1372e596991a3cb5d0a7"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:pkg/models/base.py",
+    "target": "class:24d57926799611befdff3330f284b2a7"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:pkg/models/base.py",
+    "target": "class:6fddf6cd7e5fa996fc4fd7330a6b0d6a"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:pkg/models/base.py",
+    "target": "class:87c409b2abd116818b83ffeb16248828"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:pkg/models/user.py",
+    "target": "class:3eac5c229dffda670a81ffbca4147c63"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:pkg/models/user.py",
+    "target": "class:a14afda3fa296e6da71c03fc0b7d2601"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:pkg/models/user.py",
+    "target": "import:b02bc8ebc91ef54ae28245f84b42fb13"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:pkg/service.py",
+    "target": "function:7a3344a7ac17b30aaa3f83a44206faa5"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:pkg/service.py",
+    "target": "import:77de8c1e0efc6cfc112d20a7df6b5519"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:pkg/service.py",
+    "target": "import:916673563fe5dc3d1ffc15cc2400b9de"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:tests/conftest.py",
+    "target": "function:ea5748bfd28172ce0b0766d2e0b58106"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:tests/conftest.py",
+    "target": "import:011616a76d86b1acf58dd73b9422af56"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:tests/conftest.py",
+    "target": "import:717376c5975a7ba05a7eef52516e31d2"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:tests/test_service.py",
+    "target": "function:2f41a674a292ed6cf2160da3ffacd664"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:tests/test_service.py",
+    "target": "function:34950f400ecef51d8f3ab74d8cc496ef"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:tests/test_service.py",
+    "target": "import:1012a36ac888279e45afc0e740f909df"
+  }
+]

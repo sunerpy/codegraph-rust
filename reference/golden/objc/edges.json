@@ -1,0 +1,152 @@
+[
+  {
+    "col": 0,
+    "kind": "imports",
+    "line": 1,
+    "metadata": {
+      "confidence": 0.85,
+      "resolvedBy": "file-path"
+    },
+    "provenance": null,
+    "source": "file:Sources/Base.m",
+    "target": "file:Sources/Base.h"
+  },
+  {
+    "col": 0,
+    "kind": "imports",
+    "line": 1,
+    "metadata": {
+      "confidence": 0.85,
+      "resolvedBy": "file-path"
+    },
+    "provenance": null,
+    "source": "file:Sources/Sub.m",
+    "target": "file:Sources/Base.h"
+  },
+  {
+    "col": 0,
+    "kind": "imports",
+    "line": 1,
+    "metadata": {
+      "confidence": 0.95,
+      "resolvedBy": "qualified-name"
+    },
+    "provenance": null,
+    "source": "file:Sources/Base.h",
+    "target": "import:1ce470e34d12b1d96f2893c77175d57f"
+  },
+  {
+    "col": 4,
+    "kind": "calls",
+    "line": 14,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "method:49ca705b64b6a4720b4f148fb99b72a9",
+    "target": "function:472cf6a0fb6f2d37874ed780d46c849b"
+  },
+  {
+    "col": 4,
+    "kind": "instantiates",
+    "line": 13,
+    "metadata": {
+      "confidence": 0.4,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "method:49ca705b64b6a4720b4f148fb99b72a9",
+    "target": "class:af64ae616fc3bb7b883e8a45029b29f8"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "class:52ec7d59ce3d67fe354230d7f239464e",
+    "target": "method:170d8afffc0f57cedd01f0804accb327"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "class:8cede3a6d1ba882388e3e2a33c6444f3",
+    "target": "method:49ca705b64b6a4720b4f148fb99b72a9"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:Sources/Base.h",
+    "target": "class:af64ae616fc3bb7b883e8a45029b29f8"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:Sources/Base.h",
+    "target": "import:1ce470e34d12b1d96f2893c77175d57f"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:Sources/Base.h",
+    "target": "protocol:9120395f2fb9f2545511f7bb9556d8c6"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:Sources/Base.m",
+    "target": "class:52ec7d59ce3d67fe354230d7f239464e"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:Sources/Base.m",
+    "target": "import:9383ab375183c736bfe8540c60c7174a"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:Sources/Sub.m",
+    "target": "class:8cede3a6d1ba882388e3e2a33c6444f3"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:Sources/Sub.m",
+    "target": "function:472cf6a0fb6f2d37874ed780d46c849b"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:Sources/Sub.m",
+    "target": "import:ad671eb565001cca4c620276daf6e309"
+  }
+]

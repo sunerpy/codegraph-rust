@@ -1,0 +1,32 @@
+[
+  {
+    "candidates": null,
+    "col": 4,
+    "file_path": "Sources/Base.m",
+    "from_node_id": "method:170d8afffc0f57cedd01f0804accb327",
+    "language": "objc",
+    "line": 5,
+    "reference_kind": "calls",
+    "reference_name": "NSLog"
+  },
+  {
+    "candidates": null,
+    "col": 4,
+    "file_path": "Sources/Sub.m",
+    "from_node_id": "method:49ca705b64b6a4720b4f148fb99b72a9",
+    "language": "objc",
+    "line": 11,
+    "reference_kind": "calls",
+    "reference_name": "self"
+  },
+  {
+    "candidates": null,
+    "col": 4,
+    "file_path": "Sources/Sub.m",
+    "from_node_id": "method:49ca705b64b6a4720b4f148fb99b72a9",
+    "language": "objc",
+    "line": 12,
+    "reference_kind": "calls",
+    "reference_name": "super"
+  }
+]
