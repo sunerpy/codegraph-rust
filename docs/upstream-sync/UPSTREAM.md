@@ -178,6 +178,32 @@ below remain immutable historical evidence.
 
 ## Sync log
 
+### 2026-10-10 — CORRECTED: four ledger and doc statements that disagreed with the code
+
+Found by the 2026-10-10 audit (§1.6 of
+[`V1_6_2_AUDIT_2026-10-10.md`](V1_6_2_AUDIT_2026-10-10.md)); the entries they
+correct stay as written.
+
+- **`ns::compute` resolution.** The 2026-07-14 Release D entry says `ns::fn()`
+  calls "resolve for free via the existing qualified-name matcher". They do
+  not: the extractor records `ns::compute()` as the bare `compute`, and the
+  cpp golden shows the edge `resolvedBy: exact-match`.
+  [`equivalence.md`](../equivalence.md) now says so.
+- **#226 (`1c180a4`) is KEEP-RUST.** Its S3 unique-candidate receiver-word gate
+  compares the whole qualified name and refuses Lua untyped receivers that
+  upstream #2153 keeps, so it is stricter than upstream. It is now recorded as
+  a deliberate divergence.
+- **#1728 (`9a324874`) was never recorded.** Upstream reads
+  `.git/info/exclude` and the global `core.excludesFile`. The repository's own
+  `.git/info/exclude` is planned for v0.55.0; the global file is KEEP-RUST,
+  because reading per-user configuration from outside the project breaks
+  project containment (AGENTS.md invariant 5).
+- **KNOWN_DIFFS listed ported behavior as deferred.** C++ receiver-type
+  inference, Java/Kotlin field-receiver inference, the batched and conformance
+  resolution passes, and the per-language import refinements all exist in
+  `crates/codegraph-resolve`. They are removed from
+  [`KNOWN_DIFFS.md`](KNOWN_DIFFS.md).
+
 ### 2026-10-10 — `f4ddf508..b635dd46` AUDITED; the codegraph-rs `v0.55.0` program PLANNED
 
 - **Range:** colby `v1.6.1` (`f4ddf508`) to colby `main` of 2026-10-07

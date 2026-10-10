@@ -416,8 +416,9 @@ Three further files exercise the Release D C++ extraction gains:
 
 - **namespace prefix + `ns::fn()` resolution** — `namespaced.cpp` defines
   `namespace ns { void compute() {} }` (qualified name `ns::compute`) and calls
-  `ns::compute()` from `run_namespaced`; the call resolves to a `Calls` edge via
-  the existing qualified-name matcher (no resolver change).
+  `ns::compute()` from `run_namespaced`. The extractor records the call as the
+  bare name `compute`, so it resolves to a `Calls` edge by exact name match
+  (`resolvedBy: exact-match`), not through the qualified-name matcher.
 - **template-argument call stripping** — `templated_call.cpp` defines
   `template <typename T> void process(T)` and calls `process<int>(0)`; the
   `<int>` template args are stripped at extraction so the call links to `process`.
@@ -613,9 +614,9 @@ fires only for the CALL-EXPRESSION construction form: `TupleStruct(2)` yes, a ba
 path `UnitStruct` no, a struct literal `Bits { i: 0 }` no. A Rust union is
 constructible only as `Bits { … }`, so no Rust union can ever emit that edge —
 `make_unit` / `make_bits` are return-type references, not instantiation assertions,
-and the golden carries zero `instantiates` edges. Instantiation is pinned in C++
-instead (`instantiate_agg.cpp` / `instantiate_rank.cpp`), which is upstream's own
-shape. The corpus carries **no `Cargo.toml`**: it is indexed, not compiled, and a
+and the golden carries zero `instantiates` edges. Upstream also records a struct
+literal as an instantiation; this extractor does not, so instantiation is pinned
+in C++ instead (`instantiate_agg.cpp` / `instantiate_rank.cpp`). The corpus carries **no `Cargo.toml`**: it is indexed, not compiled, and a
 manifest inside the workspace tree could confuse `cargo`.
 
 The four source files are `lib.rs`, `consumer.rs`, `impl_ownership.rs`, and
