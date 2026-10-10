@@ -341,6 +341,21 @@ pub fn swift_method_body_edit() -> Case {
         .edge_throughout("function tick", "instantiates", "class Counter")
 }
 
+/// #897: a Ruby method's value reference follows the class constant it reads.
+pub fn ruby_class_constant_reader_body_edit() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Ruby])
+        .file(
+            "lib/config.rb",
+            "class Config\n  MAX_RETRIES = 3\n  MAX_WAIT = 30\n\n  def limit\n    MAX_RETRIES\n  end\nend\n",
+        )
+        .write(
+            "lib/config.rb",
+            "class Config\n  MAX_RETRIES = 3\n  MAX_WAIT = 30\n\n  def limit\n    MAX_WAIT\n  end\nend\n",
+        )
+        .edge_before("method Config::limit", "references", "variable Config::MAX_RETRIES")
+        .edge_after("method Config::limit", "references", "variable Config::MAX_WAIT")
+}
+
 /// G4: a static field read references the class it reads through.
 pub fn java_static_field_read_body_edit() -> Case {
     Case::new(Change::BodyEdit, &[Language::Java])

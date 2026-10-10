@@ -589,7 +589,7 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             self.extract_type_alias(node);
             skip_children = true;
         } else if has_type(self.spec.variable_types(), node_type)
-            && !self.is_inside_class_like_node()
+            && (!self.is_inside_class_like_node() || self.is_type_scope_constant(node))
         {
             self.maybe_cpp_construction(node);
             self.extract_variable(node);
@@ -1737,7 +1737,9 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             }
             return true;
         }
-        if node.kind() == "const_declaration" && self.is_inside_class_like_node() {
+        // A `const` at file scope or in a class is a constant (upstream
+        // php.ts visitNode).
+        if node.kind() == "const_declaration" {
             for elem in node
                 .named_children(&mut node.walk())
                 .filter(|child| child.kind() == "const_element")
@@ -2219,8 +2221,12 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
                     return false;
                 };
                 let name = node_text(name_node, self.source);
-                let in_class = self.is_inside_class_like_node();
-                let kind = if in_class {
+                // #897 — an `object` is a singleton: its `val`s are shared
+                // constants, like a top-level `val`. A `class`, `trait`, `enum`
+                // or `given` value is per-instance state, a field. Both an
+                // object and a class are class-kind nodes, so the enclosing
+                // definition's syntax decides.
+                let kind = if scala_instance_scope(node) {
                     NodeKind::Field
                 } else if node.kind() == "val_definition" {
                     NodeKind::Constant
@@ -2462,6 +2468,7 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
         self.nodes.push(new_node.clone());
         if crate::value_refs::has_value_refs(self.spec.language()) {
             self.value_refs.capture(
+                self.spec.language(),
                 kind,
                 name,
                 &id,
@@ -3150,6 +3157,25 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             }
             return;
         }
+        match self.spec.language() {
+            Language::Rust => {
+                self.extract_rust_value_item(node);
+                return;
+            }
+            Language::Ruby => {
+                self.extract_ruby_constant(node);
+                return;
+            }
+            Language::C => {
+                self.extract_c_globals(node);
+                return;
+            }
+            Language::Pascal => {
+                self.extract_pascal_constant(node);
+                return;
+            }
+            _ => {}
+        }
         if !matches!(
             self.spec.language(),
             Language::TypeScript | Language::Tsx | Language::JavaScript | Language::Jsx
@@ -3337,6 +3363,140 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
         }
         self.node_stack.pop();
         extracted
+    }
+
+    /// A constant written in a type's scope that is a value of its own
+    /// (#897): a Ruby `CONST = …` in a class or module body, and a Pascal
+    /// class `const`.
+    fn is_type_scope_constant(&self, node: SyntaxNode<'tree>) -> bool {
+        match self.spec.language() {
+            Language::Ruby => is_ruby_constant_assignment(node),
+            Language::Pascal => node.kind() == "declConst",
+            _ => false,
+        }
+    }
+
+    /// Rust `const X: T = …` and `static X: T = …` (upstream's generic
+    /// variable path, which names them `variable`).
+    fn extract_rust_value_item(&mut self, node: SyntaxNode<'tree>) {
+        if !matches!(node.kind(), "const_item" | "static_item") {
+            return;
+        }
+        let Some(name_node) = child_by_field(node, "name") else {
+            return;
+        };
+        self.create_node(
+            NodeKind::Variable,
+            &node_text(name_node, self.source),
+            node,
+            NodeExtra {
+                docstring: self.docstring_for(node),
+                signature: value_signature(child_by_field(node, "value"), self.source),
+                is_exported: self.spec.is_exported(node, self.source),
+                ..NodeExtra::default()
+            },
+        );
+    }
+
+    /// #897 — a Ruby constant assignment (`MAX = 3`), at the top level or in a
+    /// class or module; its left side is a `constant`.
+    fn extract_ruby_constant(&mut self, node: SyntaxNode<'tree>) {
+        if !is_ruby_constant_assignment(node) {
+            return;
+        }
+        let Some(left) = child_by_field(node, "left").or_else(|| node.named_child(0)) else {
+            return;
+        };
+        self.create_node(
+            NodeKind::Variable,
+            &node_text(left, self.source),
+            node,
+            NodeExtra {
+                docstring: self.docstring_for(node),
+                signature: value_signature(
+                    child_by_field(node, "right").or_else(|| node.named_child(1)),
+                    self.source,
+                ),
+                ..NodeExtra::default()
+            },
+        );
+    }
+
+    /// #897 — C file-scope values: each declarator of a `declaration` that is
+    /// initialized, a pointer or an array; `const` makes it a constant. A bare
+    /// identifier declarator is skipped: a prototype led by an unknown macro
+    /// (`CURL_EXTERN CURLcode f(int);`) misparses as one named by its return
+    /// type. A function declarator is a prototype.
+    fn extract_c_globals(&mut self, node: SyntaxNode<'tree>) {
+        if node.kind() != "declaration" || has_c_function_ancestor(node) {
+            return;
+        }
+        let is_const = node.named_children(&mut node.walk()).any(|child| {
+            child.kind() == "type_qualifier" && node_text(child, self.source) == "const"
+        });
+        let kind = if is_const {
+            NodeKind::Constant
+        } else {
+            NodeKind::Variable
+        };
+        let docstring = self.docstring_for(node);
+        let is_exported = self.spec.is_exported(node, self.source);
+        for child in node.named_children(&mut node.walk()) {
+            if !matches!(
+                child.kind(),
+                "init_declarator" | "pointer_declarator" | "array_declarator"
+            ) {
+                continue;
+            }
+            let Some(name_node) = crate::lang::c_declarator_identifier(Some(child)) else {
+                continue;
+            };
+            let value = (child.kind() == "init_declarator")
+                .then(|| child_by_field(child, "value"))
+                .flatten();
+            self.create_node(
+                kind,
+                &node_text(name_node, self.source),
+                child,
+                NodeExtra {
+                    docstring: docstring.clone(),
+                    signature: value_signature(value, self.source),
+                    is_exported,
+                    ..NodeExtra::default()
+                },
+            );
+        }
+    }
+
+    /// A Pascal unit or class `const` (upstream `extractPascalConst`). A
+    /// routine's own `const` section is local to it.
+    fn extract_pascal_constant(&mut self, node: SyntaxNode<'tree>) {
+        if node.kind() != "declConst" {
+            return;
+        }
+        let mut ancestor = node.parent();
+        while let Some(current) = ancestor {
+            if current.kind() == "defProc" {
+                return;
+            }
+            ancestor = current.parent();
+        }
+        let Some(name_node) = child_by_field(node, "name") else {
+            return;
+        };
+        let signature = node
+            .named_children(&mut node.walk())
+            .find(|child| child.kind() == "defaultValue")
+            .map(|value| node_text(value, self.source));
+        self.create_node(
+            NodeKind::Constant,
+            &node_text(name_node, self.source),
+            node,
+            NodeExtra {
+                signature,
+                ..NodeExtra::default()
+            },
+        );
     }
 
     fn extract_python_assignment(&mut self, node: SyntaxNode<'tree>) {
@@ -6376,6 +6536,55 @@ fn is_r_constant_name(name: &str) -> bool {
             .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '.' || c == '_')
 }
 
+/// `= <initializer>`, cut at 100 characters, as a value's signature.
+fn value_signature(value: Option<SyntaxNode<'_>>, source: &str) -> Option<String> {
+    value.map(|value| {
+        let init = node_text(value, source)
+            .chars()
+            .take(100)
+            .collect::<String>();
+        format!("= {}{}", init, if init.len() >= 100 { "..." } else { "" })
+    })
+}
+
+/// A Ruby assignment whose left side is a `constant` (`MAX = 3`).
+fn is_ruby_constant_assignment(node: SyntaxNode<'_>) -> bool {
+    node.kind() == "assignment"
+        && child_by_field(node, "left")
+            .or_else(|| node.named_child(0))
+            .is_some_and(|left| left.kind() == "constant")
+}
+
+/// Whether a C node sits inside a function definition.
+fn has_c_function_ancestor(node: SyntaxNode<'_>) -> bool {
+    let mut parent = node.parent();
+    while let Some(current) = parent {
+        if current.kind() == "function_definition" {
+            return true;
+        }
+        parent = current.parent();
+    }
+    false
+}
+
+/// Whether a Scala value is declared in a `class`, `trait`, `enum` or
+/// `given`, the nearest enclosing definition; an `object`'s or a top-level
+/// value is shared.
+fn scala_instance_scope(node: SyntaxNode<'_>) -> bool {
+    let mut parent = node.parent();
+    while let Some(current) = parent {
+        match current.kind() {
+            "class_definition" | "trait_definition" | "enum_definition" | "given_definition" => {
+                return true;
+            }
+            "object_definition" => return false,
+            _ => {}
+        }
+        parent = current.parent();
+    }
+    false
+}
+
 fn is_comment_kind(kind: &str) -> bool {
     matches!(
         kind,
@@ -7066,8 +7275,9 @@ class Holder {
 enum Color { case Red, Green, Blue }
 "#;
         let (nodes, _) = run("src/S.scala", src, Language::Scala);
-        assert!(has_node(&nodes, NodeKind::Field, "topConst"));
-        assert!(has_node(&nodes, NodeKind::Field, "topVar"));
+        // #897: an object's `val`/`var` is a shared value, a class's a field.
+        assert!(has_node(&nodes, NodeKind::Constant, "topConst"));
+        assert!(has_node(&nodes, NodeKind::Variable, "topVar"));
         assert!(has_node(&nodes, NodeKind::Field, "field"));
         assert!(has_node(&nodes, NodeKind::EnumMember, "Red"));
         assert!(has_node(&nodes, NodeKind::EnumMember, "Blue"));

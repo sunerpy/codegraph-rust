@@ -31,6 +31,12 @@ pub(crate) fn has_value_refs(language: Language) -> bool {
             | Language::ArkTs
             | Language::Go
             | Language::Python
+            | Language::Php
+            | Language::Scala
+            | Language::Rust
+            | Language::Ruby
+            | Language::C
+            | Language::Pascal
     )
 }
 
@@ -57,16 +63,21 @@ impl<'tree> ValueRefs<'tree> {
     /// is a target; a function, method, constant or variable is a reader.
     pub(crate) fn capture(
         &mut self,
+        language: Language,
         kind: NodeKind,
         name: &str,
         id: &str,
         node: SyntaxNode<'tree>,
         parent_id: Option<&str>,
     ) {
-        if matches!(kind, NodeKind::Constant | NodeKind::Variable)
-            && is_distinctive(name)
-            && parent_id.is_some_and(is_target_scope)
-        {
+        // Pascal's shared values are its `const`s: a Pascal `variable` is a
+        // routine's parameter or a class field, which would be noise.
+        let target_kind = if language == Language::Pascal {
+            kind == NodeKind::Constant
+        } else {
+            matches!(kind, NodeKind::Constant | NodeKind::Variable)
+        };
+        if target_kind && is_distinctive(name) && parent_id.is_some_and(is_target_scope) {
             self.targets.insert(name.to_string(), id.to_string());
             *self.target_counts.entry(name.to_string()).or_default() += 1;
         }
@@ -105,6 +116,14 @@ impl<'tree> ValueRefs<'tree> {
         for reader in &self.readers {
             let mut seen = HashSet::new();
             let mut stack = vec![reader.node];
+            // A Pascal routine's body is a sibling of its header, the reader's
+            // node (`defProc` holds `declProc` and `block`).
+            if language == Language::Pascal
+                && let Some(body) = reader.node.next_named_sibling()
+                && body.kind() == "block"
+            {
+                stack.push(body);
+            }
             let mut visited = 0;
             while let Some(node) = stack.pop() {
                 if visited >= MAX_VALUE_REF_NODES {
@@ -157,9 +176,22 @@ impl<'tree> ValueRefs<'tree> {
             match node.kind() {
                 // TS/JS `const X = …`; Go `const X = …` / `var X = …`.
                 "variable_declarator" | "const_spec" | "var_spec" => bump(node.named_child(0)),
-                // Go `x, Y := …`; Python `X = …`, `A, B = …`.
-                "short_var_declaration" | "assignment" => {
-                    let left = child_by_field(node, "left").or_else(|| node.named_child(0));
+                // Rust `const X: T = …` / `static X: T = …`; Pascal `const X =
+                // …` (the target and a routine's own) and `var X: T`.
+                "const_item" | "static_item" | "declConst" | "declVar" => {
+                    bump(child_by_field(node, "name"));
+                }
+                // C `T X = …`: the file-scope value and a local that shadows it.
+                "init_declarator" => bump(crate::lang::c_declarator_identifier(Some(node))),
+                // Scala `val X = …` / `var X = …`.
+                "val_definition" | "var_definition" => {
+                    bump(child_by_field(node, "pattern").filter(|p| p.kind() == "identifier"));
+                }
+                // Rust `let x = …`; Go `x, Y := …`; Python `X = …`, `A, B = …`.
+                "let_declaration" | "short_var_declaration" | "assignment" => {
+                    let left = child_by_field(node, "left")
+                        .or_else(|| child_by_field(node, "pattern"))
+                        .or_else(|| node.named_child(0));
                     match left {
                         Some(left) if left.kind() == "identifier" => bump(Some(left)),
                         Some(left) => {

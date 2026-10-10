@@ -603,6 +603,7 @@ matrix! {
     swift_method_body_edit,
     typescript_value_reader_body_edit,
     java_static_field_read_body_edit,
+    ruby_class_constant_reader_body_edit,
     cpp_qualified_call_body_edit,
     vue_component_template_edit,
     liquid_snippet_body_edit,

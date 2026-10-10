@@ -39,6 +39,7 @@ use crate::spec::LanguageSpec;
 
 pub use arkts::ARKTS_SPEC;
 pub use c::C_SPEC;
+pub(crate) use c::c_declarator_identifier;
 pub use cfml::CFML_SPEC;
 pub(crate) use cfml::{
     cfml_component_name_from_path, cfml_string_attr_value, cfml_tag_attr, is_bare_script_cfml,

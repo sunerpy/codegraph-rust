@@ -133,3 +133,205 @@ fn svelte_and_astro_scripts_inherit_value_references() {
         ["pages"]
     );
 }
+
+/// `(kind, qualified name)` of every constant, variable and field in `source`.
+fn values(path: &str, source: &str, language: Language) -> Vec<(String, String)> {
+    let result = extract_source(path, source, Some(language));
+    let mut values: Vec<_> = result
+        .nodes
+        .iter()
+        .filter(|node| {
+            matches!(
+                node.kind,
+                codegraph_core::types::NodeKind::Constant
+                    | codegraph_core::types::NodeKind::Variable
+                    | codegraph_core::types::NodeKind::Field
+            )
+        })
+        .map(|node| (format!("{:?}", node.kind), node.qualified_name.clone()))
+        .collect();
+    values.sort();
+    values
+}
+
+/// PHP: a file-scope `const` and a class `const` are constants, read bare or
+/// through `self::` / `Config::`; a static property is mutable class state
+/// and no target.
+#[test]
+fn php_readers_of_file_and_class_constants() {
+    let source = "<?php\nconst APP_VERSION = \"1.0\";\nclass Config {\n  const MAX_ITEMS = 100;\n  const STATUS_NAMES = [\"ok\", \"fail\"];\n  public static $counter = 0;\n  function capped($n) { return $n > self::MAX_ITEMS ? self::MAX_ITEMS : $n; }\n  function label($i) { return Config::STATUS_NAMES[$i]; }\n  function version() { return APP_VERSION; }\n}";
+    assert_eq!(
+        values("Config.php", source, Language::Php),
+        [
+            ("Constant".to_string(), "APP_VERSION".to_string()),
+            ("Constant".to_string(), "Config::MAX_ITEMS".to_string()),
+            ("Constant".to_string(), "Config::STATUS_NAMES".to_string()),
+        ]
+    );
+    assert_eq!(
+        readers("Config.php", source, Language::Php, "MAX_ITEMS"),
+        ["capped"]
+    );
+    assert_eq!(
+        readers("Config.php", source, Language::Php, "STATUS_NAMES"),
+        ["label"]
+    );
+    assert_eq!(
+        readers("Config.php", source, Language::Php, "APP_VERSION"),
+        ["version"]
+    );
+    assert!(readers("Config.php", source, Language::Php, "counter").is_empty());
+}
+
+/// Scala: an `object` is a singleton, so its `val`s are shared constants, as
+/// a top-level `val` is; a `class` `val` is a per-instance field.
+#[test]
+fn scala_readers_of_top_level_and_object_values() {
+    let source = "val AppVersion = \"1.0\"\nobject Config {\n  val TIMEOUT_MS = 30\n  val STATUS_NAMES = List(\"ok\", \"fail\")\n  def capped(n: Int): Int = if (n > TIMEOUT_MS) TIMEOUT_MS else n\n  def label(i: Int): String = STATUS_NAMES(i)\n}\nclass Widget {\n  val MaxItems = 100\n  def within(n: Int): Int = if (n < MaxItems) n else MaxItems\n}";
+    assert_eq!(
+        values("Demo.scala", source, Language::Scala),
+        [
+            ("Constant".to_string(), "AppVersion".to_string()),
+            ("Constant".to_string(), "Config::STATUS_NAMES".to_string()),
+            ("Constant".to_string(), "Config::TIMEOUT_MS".to_string()),
+            ("Field".to_string(), "Widget::MaxItems".to_string()),
+        ]
+    );
+    assert_eq!(
+        readers("Demo.scala", source, Language::Scala, "TIMEOUT_MS"),
+        ["capped"]
+    );
+    assert_eq!(
+        readers("Demo.scala", source, Language::Scala, "STATUS_NAMES"),
+        ["label"]
+    );
+    assert!(readers("Demo.scala", source, Language::Scala, "MaxItems").is_empty());
+}
+
+#[test]
+fn a_scala_object_value_shadowed_by_a_local_has_no_readers() {
+    let source = "object Config {\n  val TIMEOUT = 30\n  def usesConst(): Int = TIMEOUT\n  def shadows(): Int = { val TIMEOUT = 5; TIMEOUT }\n}";
+    assert!(readers("Shadow.scala", source, Language::Scala, "TIMEOUT").is_empty());
+}
+
+/// Rust: a module-level `const` and `static` are values (upstream's generic
+/// path names them `variable`).
+#[test]
+fn rust_readers_of_a_module_const_and_static() {
+    let source = "const MAX_RETRIES: u32 = 3;\nstatic DEFAULT_LABEL: &str = \"prod\";\n\nfn retry() -> u32 { MAX_RETRIES }\nfn label() -> &'static str { DEFAULT_LABEL }";
+    assert_eq!(
+        values("lib.rs", source, Language::Rust),
+        [
+            ("Variable".to_string(), "DEFAULT_LABEL".to_string()),
+            ("Variable".to_string(), "MAX_RETRIES".to_string()),
+        ]
+    );
+    assert_eq!(
+        readers("lib.rs", source, Language::Rust, "MAX_RETRIES"),
+        ["retry"]
+    );
+    assert_eq!(
+        readers("lib.rs", source, Language::Rust, "DEFAULT_LABEL"),
+        ["label"]
+    );
+}
+
+#[test]
+fn a_rust_const_shadowed_by_a_let_has_no_readers() {
+    let source = "const TIMEOUT: u32 = 30;\n\nfn uses_const() -> u32 { TIMEOUT }\nfn shadows() -> u32 {\n    let TIMEOUT = 5;\n    TIMEOUT\n}";
+    assert!(readers("shadow.rs", source, Language::Rust, "TIMEOUT").is_empty());
+}
+
+/// Ruby keeps most constants inside a class or module; both a top-level and
+/// a class constant are values, read by the methods around them.
+#[test]
+fn ruby_readers_of_top_level_and_class_constants() {
+    let source = "MAX_RETRIES = 3\n\ndef retry_count\n  MAX_RETRIES\nend\n\nclass Config\n  TIMEOUT = 30\n  def self.get_timeout\n    TIMEOUT\n  end\n  def describe\n    \"timeout=#{TIMEOUT}\"\n  end\nend";
+    assert_eq!(
+        values("app.rb", source, Language::Ruby),
+        [
+            ("Variable".to_string(), "Config::TIMEOUT".to_string()),
+            ("Variable".to_string(), "MAX_RETRIES".to_string()),
+        ]
+    );
+    assert_eq!(
+        readers("app.rb", source, Language::Ruby, "MAX_RETRIES"),
+        ["retry_count"]
+    );
+    assert_eq!(
+        readers("app.rb", source, Language::Ruby, "TIMEOUT"),
+        ["describe", "get_timeout"]
+    );
+}
+
+/// C: a file-scope `static const` scalar and lookup table are constants,
+/// plain globals are variables; a prototype is none.
+#[test]
+fn c_readers_of_file_scope_constants() {
+    let source = "static const int MAX_ITEMS = 100;\nstatic const char *const STATUS_NAMES[] = { \"ok\", \"fail\", \"pending\" };\nint counter_total = 0;\nint capped(int n);\n\nint capped(int n) { return n > MAX_ITEMS ? MAX_ITEMS : n; }\nconst char *label(int i) { return STATUS_NAMES[i]; }";
+    assert_eq!(
+        values("config.c", source, Language::C),
+        [
+            ("Constant".to_string(), "MAX_ITEMS".to_string()),
+            ("Constant".to_string(), "STATUS_NAMES".to_string()),
+            ("Variable".to_string(), "counter_total".to_string()),
+        ]
+    );
+    assert_eq!(
+        readers("config.c", source, Language::C, "MAX_ITEMS"),
+        ["capped"]
+    );
+    assert_eq!(
+        readers("config.c", source, Language::C, "STATUS_NAMES"),
+        ["label"]
+    );
+}
+
+#[test]
+fn a_c_constant_shadowed_by_a_local_has_no_readers() {
+    let source = "static const int TIMEOUT = 30;\n\nint uses_const(void) { return TIMEOUT; }\nint shadows(void) {\n    int TIMEOUT = 5;\n    return TIMEOUT;\n}";
+    assert!(readers("shadow.c", source, Language::C, "TIMEOUT").is_empty());
+}
+
+/// A prototype led by an unknown macro (`CURL_EXTERN CURLcode fn(int);`)
+/// never mints a value named by its return type.
+#[test]
+fn a_macro_prefixed_c_prototype_mints_no_value() {
+    let source = "typedef enum { CURLE_OK, CURLE_FAIL } CURLcode;\nCURL_EXTERN CURLcode curl_easy_init(int x);\nCURL_EXTERN CURLcode curl_easy_setopt(int y);\n\nstatic const int REAL_LIMIT = 42;\nint use_real(void) { return REAL_LIMIT; }";
+    assert_eq!(
+        values("api.c", source, Language::C),
+        [("Constant".to_string(), "REAL_LIMIT".to_string())]
+    );
+    assert_eq!(
+        readers("api.c", source, Language::C, "REAL_LIMIT"),
+        ["use_real"]
+    );
+}
+
+/// Pascal: a unit `const` is a constant; a routine's body is its header's
+/// sibling, and a routine's own `const` section binds the name again.
+#[test]
+fn pascal_readers_of_unit_constants() {
+    let source = "unit Demo;\ninterface\nconst\n  MAX_ITEMS = 100;\n  APP_NAME = 'MyApp';\nimplementation\nfunction Capped(n: Integer): Integer;\nbegin\n  if n > MAX_ITEMS then Capped := MAX_ITEMS else Capped := n;\nend;\nfunction AppLabel: string;\nbegin\n  AppLabel := APP_NAME;\nend;\nend.";
+    assert_eq!(
+        values("demo.pas", source, Language::Pascal),
+        [
+            ("Constant".to_string(), "APP_NAME".to_string()),
+            ("Constant".to_string(), "MAX_ITEMS".to_string()),
+        ]
+    );
+    assert_eq!(
+        readers("demo.pas", source, Language::Pascal, "MAX_ITEMS"),
+        ["Capped"]
+    );
+    assert_eq!(
+        readers("demo.pas", source, Language::Pascal, "APP_NAME"),
+        ["AppLabel"]
+    );
+    let shadow = "unit Shadow;\ninterface\nconst\n  TIMEOUT = 30;\nimplementation\nfunction UsesConst: Integer;\nbegin\n  UsesConst := TIMEOUT;\nend;\nfunction Shadows: Integer;\nconst TIMEOUT = 5;\nbegin\n  Shadows := TIMEOUT;\nend;\nend.";
+    assert_eq!(
+        values("shadow.pas", shadow, Language::Pascal),
+        [("Constant".to_string(), "TIMEOUT".to_string())]
+    );
+    assert!(readers("shadow.pas", shadow, Language::Pascal, "TIMEOUT").is_empty());
+}
