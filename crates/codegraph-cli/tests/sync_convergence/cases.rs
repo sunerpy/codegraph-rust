@@ -90,6 +90,23 @@ pub fn go_call_into_an_added_file_of_the_same_package() -> Case {
         .edge_after("function main", "calls", "function Total @total.go")
 }
 
+/// A file whose parse collapsed records the error on its row (the status
+/// report's `filesWithParseErrors`); once fixed, the synced row and symbols
+/// equal a fresh index's, error cleared.
+pub fn typescript_collapsed_parse_is_fixed() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::TypeScript])
+        .file("src/util.ts", "@@@ ### ((( === }}} <<<\n")
+        .file(
+            "src/main.ts",
+            "import { helper } from './util';\n\nexport function main(): number {\n  return helper();\n}\n",
+        )
+        .write(
+            "src/util.ts",
+            "export function helper(): number {\n  return 1;\n}\n",
+        )
+        .edge_after("function main", "calls", "function helper @src/util.ts")
+}
+
 /// Upstream #2392 notes that C includes already converge.
 pub fn c_include_of_an_added_header() -> Case {
     Case::new(Change::AddImportTarget, &[Language::C])
