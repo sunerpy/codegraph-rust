@@ -2,6 +2,36 @@
   {
     "candidates": null,
     "col": 0,
+    "file_path": "src/components/App.vue",
+    "from_node_id": "file:src/components/App.vue",
+    "language": "vue",
+    "line": 7,
+    "reference_kind": "imports",
+    "reference_name": "../composables/useCounter"
+  },
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "src/components/App.vue",
+    "from_node_id": "file:src/components/App.vue",
+    "language": "vue",
+    "line": 8,
+    "reference_kind": "imports",
+    "reference_name": "../composables/useCounter"
+  },
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "src/components/Counter.vue",
+    "from_node_id": "file:src/components/Counter.vue",
+    "language": "vue",
+    "line": 6,
+    "reference_kind": "imports",
+    "reference_name": "../composables/useCounter"
+  },
+  {
+    "candidates": null,
+    "col": 0,
     "file_path": "src/composables/useCounter.ts",
     "from_node_id": "file:src/composables/useCounter.ts",
     "language": "typescript",

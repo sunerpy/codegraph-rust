@@ -2,42 +2,6 @@
   {
     "col": 0,
     "kind": "imports",
-    "line": 6,
-    "metadata": {
-      "confidence": 0.95,
-      "resolvedBy": "qualified-name"
-    },
-    "provenance": null,
-    "source": "file:src/components/Counter.vue",
-    "target": "import:53ac2b441303553cd61bae19cf2ca7f6"
-  },
-  {
-    "col": 0,
-    "kind": "imports",
-    "line": 7,
-    "metadata": {
-      "confidence": 0.95,
-      "resolvedBy": "qualified-name"
-    },
-    "provenance": null,
-    "source": "file:src/components/App.vue",
-    "target": "import:5c379979046e84279087fa18b4701e92"
-  },
-  {
-    "col": 0,
-    "kind": "imports",
-    "line": 8,
-    "metadata": {
-      "confidence": 0.95,
-      "resolvedBy": "qualified-name"
-    },
-    "provenance": null,
-    "source": "file:src/components/App.vue",
-    "target": "import:5c379979046e84279087fa18b4701e92"
-  },
-  {
-    "col": 0,
-    "kind": "imports",
     "line": 9,
     "metadata": {
       "confidence": 0.7,

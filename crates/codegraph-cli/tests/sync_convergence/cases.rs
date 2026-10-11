@@ -136,6 +136,35 @@ pub fn java_import_of_an_added_class() -> Case {
         )
 }
 
+/// Upstream #2392 (2): a Lua `require` reaches a module file or nothing, so a
+/// require of a module that appears later parks and links it (it used to bind
+/// the local it is assigned to, which no sync retries).
+pub fn lua_require_of_an_added_module() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Lua])
+        .file(
+            "main.lua",
+            "local util = require('util')\n\nlocal function run()\n  return util.clamp(5, 0, 3)\nend\n\nreturn run\n",
+        )
+        .write(
+            "util.lua",
+            "local M = {}\n\nfunction M.clamp(value, low, high)\n  return math.max(low, math.min(high, value))\nend\n\nreturn M\n",
+        )
+        .edge_after("file:main.lua", "imports", "file:util.lua")
+}
+
+/// Upstream #2263 and #2392 (1): a side-effect import names a file, so one
+/// that names no file yet parks and links it when it appears (it used to bind
+/// its own import statement).
+pub fn typescript_side_effect_import_of_an_added_file() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::TypeScript])
+        .file(
+            "src/main.ts",
+            "import './polyfill';\n\nexport function start() {\n  return 1;\n}\n",
+        )
+        .write("src/polyfill.ts", "export const ready = true;\n")
+        .edge_after("file:src/main.ts", "imports", "file:src/polyfill.ts")
+}
+
 /// Upstream #2392 (3): a Go call through an imported package links once the
 /// package appears.
 pub fn go_import_of_an_added_package() -> Case {

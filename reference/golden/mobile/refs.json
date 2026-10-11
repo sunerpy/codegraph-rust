@@ -2,6 +2,16 @@
   {
     "candidates": null,
     "col": 0,
+    "file_path": "bridge/ios/Caller.m",
+    "from_node_id": "file:bridge/ios/Caller.m",
+    "language": "objc",
+    "line": 1,
+    "reference_kind": "imports",
+    "reference_name": "App-Swift.h"
+  },
+  {
+    "candidates": null,
+    "col": 0,
     "file_path": "bridge/ios/Greeter.swift",
     "from_node_id": "class:3a57e87d807eb4d2915da3f5943b6ea0",
     "language": "swift",
@@ -62,6 +72,16 @@
   {
     "candidates": null,
     "col": 0,
+    "file_path": "flutter/lib/main.dart",
+    "from_node_id": "file:flutter/lib/main.dart",
+    "language": "dart",
+    "line": 1,
+    "reference_kind": "imports",
+    "reference_name": "package:flutter/material.dart"
+  },
+  {
+    "candidates": null,
+    "col": 0,
     "file_path": "rn/android/app/src/main/java/com/example/CameraModule.java",
     "from_node_id": "namespace:6c3a9356c606e3f675e0dab3fba13d1d",
     "language": "java",
@@ -88,6 +108,26 @@
     "line": 5,
     "reference_kind": "imports",
     "reference_name": "com.facebook.react.bridge.ReactMethod"
+  },
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "rn/ios/CameraModule.m",
+    "from_node_id": "file:rn/ios/CameraModule.m",
+    "language": "objc",
+    "line": 1,
+    "reference_kind": "imports",
+    "reference_name": "React/RCTBridgeModule.h"
+  },
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "rn/ios/CameraModule.m",
+    "from_node_id": "file:rn/ios/CameraModule.m",
+    "language": "objc",
+    "line": 2,
+    "reference_kind": "imports",
+    "reference_name": "React/RCTEventEmitter.h"
   },
   {
     "candidates": null,

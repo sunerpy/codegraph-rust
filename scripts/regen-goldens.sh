@@ -11,11 +11,15 @@
 #                                                  artifacts of the named corpora only
 #   scripts/regen-goldens.sh --mini-transplant     rebuild mini on the current schema,
 #                                                  keeping its committed (upstream) rows
+#   scripts/regen-goldens.sh --mini-resolve        rebuild mini keeping its committed
+#                                                  (upstream) nodes and files, with the
+#                                                  edges and unresolved references this
+#                                                  build resolves (OD-4)
 #
 # With no corpus named, --check covers every directory under reference/golden/
 # that has a source corpus under crates/codegraph-bench/fixtures/. mini is never
 # re-indexed: it has no re-indexable provenance (see docs/equivalence.md, "Mini
-# schema rebuild"), so only --mini-transplant touches it.
+# schema rebuild"), so only --mini-transplant and --mini-resolve touch it.
 #
 # Binaries default to target/release/codegraph and target/release/bench; build
 # them with `cargo build --locked --release -p codegraph-rs -p codegraph-bench`
@@ -75,7 +79,7 @@ validate_corpus() {
     local name="$1"
     case "$name" in
         "" | *[!A-Za-z0-9_-]*) die "invalid corpus name: '$name'" ;;
-        mini) die "mini is not re-indexable; use --mini-transplant" ;;
+        mini) die "mini is not re-indexable; use --mini-transplant or --mini-resolve" ;;
     esac
     [ -d "$repo/crates/codegraph-bench/fixtures/$name" ] || die "no source corpus at crates/codegraph-bench/fixtures/$name"
 }
@@ -139,8 +143,12 @@ write_corpus() {
     printf '%-12s written\n' "$name"
 }
 
-mini_transplant() {
-    command -v sqlite3 >/dev/null 2>&1 || die "--mini-transplant needs the sqlite3 CLI"
+# $1 = transplant: keep every committed row; resolve: keep the committed nodes,
+# files and project metadata, and take the edges and unresolved references from
+# the fresh index of the fixture, which extracts the same nodes.
+mini_rebuild() {
+    local keep="$1"
+    command -v sqlite3 >/dev/null 2>&1 || die "--mini-$keep needs the sqlite3 CLI"
     local committed="$repo/reference/golden/mini/colby.db" fresh work log
     [ -f "$committed" ] || die "missing $committed"
     new_scratch mini
@@ -156,14 +164,27 @@ mini_transplant() {
     fresh="$work/.codegraph/codegraph.db"
     # Keep the fresh schema_versions rows: copying mini's would leave
     # MAX(version) behind the schema the fresh database already has.
+    local relations=""
+    if [ "$keep" = transplant ]; then
+        relations="
+        DELETE FROM unresolved_refs; DELETE FROM edges;
+        INSERT INTO edges            SELECT * FROM src.edges;
+        INSERT INTO unresolved_refs  SELECT * FROM src.unresolved_refs;"
+    else
+        # The fresh nodes must be the committed ones, so the fresh edges and
+        # references point at nodes the golden keeps.
+        local differ
+        differ="$(sqlite3 "$fresh" "
+            ATTACH DATABASE '$committed' AS src;
+            SELECT (SELECT COUNT(*) FROM (SELECT id FROM nodes EXCEPT SELECT id FROM src.nodes))
+                 + (SELECT COUNT(*) FROM (SELECT id FROM src.nodes EXCEPT SELECT id FROM nodes));")"
+        [ "$differ" = 0 ] || die "mini's fresh node ids differ from the committed ones; --mini-resolve keeps upstream nodes only when they match"
+    fi
     sqlite3 "$fresh" "
         ATTACH DATABASE '$committed' AS src;
         BEGIN;
-        DELETE FROM unresolved_refs; DELETE FROM edges; DELETE FROM files;
-        DELETE FROM nodes; DELETE FROM project_metadata;
-        INSERT INTO nodes            SELECT * FROM src.nodes;
-        INSERT INTO edges            SELECT * FROM src.edges;
-        INSERT INTO unresolved_refs  SELECT * FROM src.unresolved_refs;
+        DELETE FROM files; DELETE FROM nodes; DELETE FROM project_metadata;
+        INSERT INTO nodes            SELECT * FROM src.nodes;$relations
         INSERT INTO project_metadata SELECT * FROM src.project_metadata;
         INSERT INTO files (path, content_hash, language, size, modified_at, indexed_at, node_count, errors)
           SELECT path, content_hash, language, size, modified_at, indexed_at, node_count, errors FROM src.files;
@@ -171,7 +192,11 @@ mini_transplant() {
         DETACH src;"
     cp "$fresh" "$committed"
     dump_golden "$committed" "$repo/reference/golden/mini"
-    printf '%-12s transplanted\n' mini
+    if [ "$keep" = transplant ]; then
+        printf '%-12s transplanted\n' mini
+    else
+        printf '%-12s resolved\n' mini
+    fi
 }
 
 [ "$#" -ge 1 ] || usage
@@ -205,12 +230,17 @@ case "$mode" in
     --mini-transplant)
         [ "$#" -eq 0 ] || die "--mini-transplant takes no corpus names"
         require_binaries
-        mini_transplant
+        mini_rebuild transplant
+        ;;
+    --mini-resolve)
+        [ "$#" -eq 0 ] || die "--mini-resolve takes no corpus names"
+        require_binaries
+        mini_rebuild resolve
         ;;
     -h | --help)
         usage
         ;;
     *)
-        die "unknown mode '$mode' (use --check, --write or --mini-transplant)"
+        die "unknown mode '$mode' (use --check, --write, --mini-transplant or --mini-resolve)"
         ;;
 esac

@@ -14,86 +14,50 @@
   {
     "col": 0,
     "kind": "imports",
-    "line": 1,
-    "metadata": {
-      "confidence": 0.95,
-      "resolvedBy": "qualified-name"
-    },
-    "provenance": null,
-    "source": "file:django/shop/urls.py",
-    "target": "import:3f6d7481feae27c4df4c52c2ac06e9f5"
-  },
-  {
-    "col": 0,
-    "kind": "imports",
-    "line": 1,
-    "metadata": {
-      "confidence": 0.95,
-      "resolvedBy": "qualified-name"
-    },
-    "provenance": null,
-    "source": "file:django/shop/views.py",
-    "target": "import:d8a52ef5786cfeacebdb8d96d2d0fe75"
-  },
-  {
-    "col": 0,
-    "kind": "imports",
     "line": 2,
     "metadata": {
-      "confidence": 0.95,
-      "resolvedBy": "qualified-name"
+      "confidence": 0.9,
+      "resolvedBy": "import"
     },
     "provenance": null,
     "source": "file:nest/src/app.module.ts",
-    "target": "import:cc6e06b72f217d0405235e9936915b2d"
+    "target": "file:nest/src/users/users.controller.ts"
   },
   {
     "col": 0,
     "kind": "imports",
     "line": 2,
     "metadata": {
-      "confidence": 0.95,
-      "resolvedBy": "qualified-name"
+      "confidence": 0.9,
+      "resolvedBy": "import"
     },
     "provenance": null,
     "source": "file:nest/src/users/users.controller.ts",
-    "target": "import:bd04287f7581a4729261425fba53948e"
+    "target": "file:nest/src/users/users.service.ts"
   },
   {
     "col": 0,
     "kind": "imports",
     "line": 3,
     "metadata": {
-      "confidence": 0.95,
-      "resolvedBy": "qualified-name"
-    },
-    "provenance": null,
-    "source": "file:django/shop/urls.py",
-    "target": "import:509c72514d8aa5f96fcfb30da2d5a39e"
-  },
-  {
-    "col": 0,
-    "kind": "imports",
-    "line": 3,
-    "metadata": {
-      "confidence": 0.95,
-      "resolvedBy": "qualified-name"
+      "confidence": 0.9,
+      "resolvedBy": "import"
     },
     "provenance": null,
     "source": "file:nest/src/app.module.ts",
-    "target": "import:bc14cae2fcfc4c0cbeaac23e3ddfe457"
+    "target": "file:nest/src/users/users.service.ts"
   },
   {
     "col": 0,
     "kind": "imports",
     "line": 3,
     "metadata": {
-      "confidence": 0.95,
-      "resolvedBy": "qualified-name"
+      "confidence": 0.9,
+      "resolvedBy": "import"
     },
     "provenance": null,
     "source": "file:nest/src/main.ts",
-    "target": "import:5f057ee3069c78d863f7b664c52752b5"
+    "target": "file:nest/src/app.module.ts"
   },
   {
     "col": 0,
@@ -474,18 +438,6 @@
     "provenance": null,
     "source": "function:b473a4158e0b81f730b947fb06a41b50",
     "target": "function:b1496fb151be50dd31a292a7bf05f2eb"
-  },
-  {
-    "col": 7,
-    "kind": "imports",
-    "line": 3,
-    "metadata": {
-      "confidence": 0.95,
-      "resolvedBy": "qualified-name"
-    },
-    "provenance": null,
-    "source": "file:gin/main.go",
-    "target": "import:cee7c74f3ff3a708db06d9fda210ade7"
   },
   {
     "col": 8,

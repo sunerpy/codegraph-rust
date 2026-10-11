@@ -1,53 +1,5 @@
 [
   {
-    "col": 0,
-    "kind": "imports",
-    "line": 1,
-    "metadata": {
-      "confidence": 0.95,
-      "resolvedBy": "qualified-name"
-    },
-    "provenance": null,
-    "source": "file:bridge/ios/Caller.m",
-    "target": "import:66486258f08e781aa40e9185c1dbff66"
-  },
-  {
-    "col": 0,
-    "kind": "imports",
-    "line": 1,
-    "metadata": {
-      "confidence": 0.95,
-      "resolvedBy": "qualified-name"
-    },
-    "provenance": null,
-    "source": "file:flutter/lib/main.dart",
-    "target": "import:cd03561180ffc6f283258db1260f4b63"
-  },
-  {
-    "col": 0,
-    "kind": "imports",
-    "line": 1,
-    "metadata": {
-      "confidence": 0.95,
-      "resolvedBy": "qualified-name"
-    },
-    "provenance": null,
-    "source": "file:rn/ios/CameraModule.m",
-    "target": "import:a05843af9cf5d99d3eac34baf66f7bf7"
-  },
-  {
-    "col": 0,
-    "kind": "imports",
-    "line": 2,
-    "metadata": {
-      "confidence": 0.95,
-      "resolvedBy": "qualified-name"
-    },
-    "provenance": null,
-    "source": "file:rn/ios/CameraModule.m",
-    "target": "import:94066fb7d31758f52a193ea4ed1f986b"
-  },
-  {
     "col": 13,
     "kind": "calls",
     "line": 8,

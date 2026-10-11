@@ -203,3 +203,73 @@ fn pr2437_alias_into_node_modules_keeps_the_import_external() {
     assert_no_edge!(project, "file:src/card.ts" => imports => "function format");
     assert_unresolved!(project, "file:src/card.ts" => imports => "format");
 }
+
+/// W3: the cross-language resolution seams (plan section 3 "W3"). Every probe
+/// of this wave sits here, so `cargo test --test probes -- seams` runs them.
+mod seams {
+    use super::support::{Project, assert_edge, assert_no_edge, assert_unresolved};
+
+    /// Upstream #2392 (`3f5a9e2e`) and #2263 (`c4babfce`): an `imports`
+    /// reference never binds the import statement it was written in. A module
+    /// path names a file: `import './side'` links `src/side.ts`, while a path
+    /// no file answers (`./missing`, `<stdio.h>`, a Lua module) parks as
+    /// unresolved instead of an edge to its own statement, which a sync never
+    /// retries. A Lua `require` reaches a module file or nothing.
+    #[test]
+    fn pr2392_an_import_never_binds_its_own_statement() {
+        let project = Project::new()
+            .file(
+                "src/a.ts",
+                "import { X } from './x';\nimport './side';\nimport './missing';\nexport function run() { return X; }\n",
+            )
+            .file("src/side.ts", "console.log(1);\n")
+            .file(
+                "src/main.c",
+                "#include \"a/b.h\"\n#include <stdio.h>\nint main(void) { return 0; }\n",
+            )
+            .file(
+                "main.lua",
+                "local m = require(\"missing.mod\")\nlocal p = require(\"pkg\")\nreturn { m, p }\n",
+            )
+            .file("pkg/init.lua", "local P = {}\nreturn P\n")
+            .index();
+
+        assert_edge!(project, "file:src/a.ts" => imports => "file:src/side.ts", resolved_by = "import");
+        assert_no_edge!(project, "file:src/a.ts" => imports => "import ./side");
+        assert_no_edge!(project, "file:src/a.ts" => imports => "import ./missing");
+        assert_no_edge!(project, "file:src/a.ts" => imports => "import ./x");
+        assert_unresolved!(project, "file:src/a.ts" => imports => "./missing");
+        assert_unresolved!(project, "file:src/a.ts" => imports => "./x");
+
+        assert_no_edge!(project, "file:src/main.c" => imports => "import a/b.h");
+        assert_no_edge!(project, "file:src/main.c" => imports => "import stdio.h");
+        assert_unresolved!(project, "file:src/main.c" => imports => "a/b.h");
+        assert_unresolved!(project, "file:src/main.c" => imports => "stdio.h");
+
+        assert_edge!(project, "file:main.lua" => imports => "file:pkg/init.lua");
+        assert_no_edge!(project, "file:main.lua" => imports => "import missing.mod");
+        assert_unresolved!(project, "file:main.lua" => imports => "missing.mod");
+    }
+
+    /// A C# `using` of a namespace the project does not declare stays
+    /// unresolved, in each file that writes it (a C# `using` mints no import
+    /// node, so there is no statement to bind).
+    #[test]
+    fn pr2392_an_outside_csharp_namespace_stays_unresolved() {
+        let project = Project::new()
+            .file(
+                "src/Svc.cs",
+                "using System;\nusing System.Text;\nnamespace App { class Svc {} }\n",
+            )
+            .file(
+                "src/Other.cs",
+                "using System.Text;\nnamespace App { class Other {} }\n",
+            )
+            .index();
+
+        // A C# file's usings are its namespace's references.
+        assert_unresolved!(project, "namespace App @src/Svc.cs" => imports => "System");
+        assert_unresolved!(project, "namespace App @src/Svc.cs" => imports => "System.Text");
+        assert_unresolved!(project, "namespace App @src/Other.cs" => imports => "System.Text");
+    }
+}

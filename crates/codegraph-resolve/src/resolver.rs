@@ -10,9 +10,9 @@
 use crate::alias_binding::resolve_alias_binding;
 use crate::framework::FrameworkResolver;
 use crate::import_resolver::{
-    PhpImportedStaticCallResolution, is_bound_to_out_of_repo_module, is_php_include_path_ref,
-    python_module_member_is_claimed, resolve_jvm_import, resolve_php_imported_static_call,
-    resolve_via_import,
+    PhpImportedStaticCallResolution, is_bound_to_out_of_repo_module, is_js_path_import_ref,
+    is_lua_require_ref, is_php_include_path_ref, python_module_member_is_claimed,
+    resolve_jvm_import, resolve_php_imported_static_call, resolve_via_import,
 };
 use crate::name_matcher::{
     crosses_code_boundary, gate_language_match, is_js_name_target_visible,
@@ -1679,6 +1679,17 @@ impl ReferenceResolver {
         let Some(target) = context.get_node_by_id_shared(&result.target_node_id) else {
             return Some(result);
         };
+        // #2392 — an `imports` reference never names the import statement it
+        // was written in. A module path no file answers (`./missing`,
+        // `stdio.h`, `pkg.mod`) reaches that statement by its qualified name;
+        // as an edge to itself it is never retried, while a failed reference is
+        // retried by the sync that adds the file it names.
+        if reference.reference_kind == EdgeKind::Imports
+            && target.kind == NodeKind::Import
+            && target.file_path == reference.file_path
+        {
+            return None;
+        }
         if crate::types::node_is_eligible_target(reference.reference_kind, &target) {
             return Some(result);
         }
@@ -1722,7 +1733,10 @@ impl ReferenceResolver {
             &reference.reference_name
         };
         let call_result_chain = is_call_result_chain(reference);
-        if !self.has_any_possible_match_for(existence_name, reference.language)
+        // A JS/TS module path names a file, not a symbol (#2263); a CommonJS
+        // `require('./x')` has no node of that name to pass the check.
+        if !is_js_path_import_ref(reference)
+            && !self.has_any_possible_match_for(existence_name, reference.language)
             && !self.matches_any_import(reference, context)
             && !self
                 .framework_resolver_extensions
@@ -1862,7 +1876,9 @@ impl ReferenceResolver {
         }
 
         // PHP include path: never fall through to name-matcher (index.ts:714-720).
-        if is_php_include_path_ref(reference) {
+        // A Lua / Luau `require` reaches a module file or nothing: its leaf
+        // name-matched the local it is assigned to (#2392).
+        if is_php_include_path_ref(reference) || is_lua_require_ref(reference) {
             return (candidates.into_iter().reduce(highest_confidence), None);
         }
 

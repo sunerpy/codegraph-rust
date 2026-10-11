@@ -16,8 +16,32 @@
     "kind": "imports",
     "line": 2,
     "metadata": {
-      "confidence": 0.7,
-      "resolvedBy": "file-path"
+      "confidence": 0.9,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "file:apps/angular/src/app/app.routes.ts",
+    "target": "file:apps/angular/src/app/home/home.component.ts"
+  },
+  {
+    "col": 0,
+    "kind": "imports",
+    "line": 2,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "file:apps/react-router/src/main.tsx",
+    "target": "file:apps/react-router/src/pages/Home.tsx"
+  },
+  {
+    "col": 0,
+    "kind": "imports",
+    "line": 2,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "import"
     },
     "provenance": null,
     "source": "file:apps/vue/src/router/index.ts",
@@ -26,38 +50,14 @@
   {
     "col": 0,
     "kind": "imports",
-    "line": 2,
-    "metadata": {
-      "confidence": 0.95,
-      "resolvedBy": "qualified-name"
-    },
-    "provenance": null,
-    "source": "file:apps/angular/src/app/app.routes.ts",
-    "target": "import:ca0c63f22874b4fbd285cff2a21cd687"
-  },
-  {
-    "col": 0,
-    "kind": "imports",
-    "line": 2,
-    "metadata": {
-      "confidence": 0.95,
-      "resolvedBy": "qualified-name"
-    },
-    "provenance": null,
-    "source": "file:apps/react-router/src/main.tsx",
-    "target": "import:9f815cbc702f9f06380da6de52028444"
-  },
-  {
-    "col": 0,
-    "kind": "imports",
     "line": 3,
     "metadata": {
-      "confidence": 0.95,
-      "resolvedBy": "qualified-name"
+      "confidence": 0.9,
+      "resolvedBy": "import"
     },
     "provenance": null,
     "source": "file:apps/react-router/src/main.tsx",
-    "target": "import:3b5acd64e0bf640fe89555c411d88342"
+    "target": "file:apps/react-router/src/pages/Layout.tsx"
   },
   {
     "col": 1,

@@ -594,6 +594,57 @@ fn resolve_cpp_include_path(
     None
 }
 
+/// A JS/TS module specifier written as a path (upstream `isJsPathSpecifier`,
+/// #2263): relative (`./x`, `../x`, `.`, `..`), rooted, or an alias with a
+/// folder in it (`@/lib/x`, `~/x`, `$lib/x`), rather than an imported
+/// binding's name or a bare or scoped package (`react`, `@scope/pkg`).
+fn is_js_path_specifier(name: &str) -> bool {
+    if name.starts_with("./") || name.starts_with("../") || name == "." || name == ".." {
+        return true;
+    }
+    if !name.contains('/') || name.chars().any(char::is_whitespace) {
+        return false;
+    }
+    // `@scope/pkg`: exactly one `/`, after an `@`-prefixed segment.
+    let scoped_package = name.strip_prefix('@').is_some_and(|rest| {
+        let mut parts = rest.split('/');
+        let (Some(scope), Some(pkg), None) = (parts.next(), parts.next(), parts.next()) else {
+            return false;
+        };
+        let word = |part: &str| {
+            !part.is_empty()
+                && part
+                    .chars()
+                    .all(|c| c.is_alphanumeric() || matches!(c, '_' | '.' | '-'))
+        };
+        word(scope) && word(pkg)
+    });
+    !scoped_package
+}
+
+/// A JS/TS `imports` reference that names a module by path (upstream
+/// `isJsPathImportRef`, #2263). It names a FILE, not a symbol, so it skips the
+/// name-exists pre-filter.
+pub fn is_js_path_import_ref(reference: &RefView) -> bool {
+    reference.reference_kind == codegraph_core::types::EdgeKind::Imports
+        && matches!(
+            reference.language,
+            Language::JavaScript
+                | Language::Jsx
+                | Language::TypeScript
+                | Language::Tsx
+                | Language::ArkTs
+        )
+        && is_js_path_specifier(&reference.reference_name)
+}
+
+/// A Lua / Luau `require` (upstream `isLuaRequireRef`, #2392): it names a
+/// module file or a module from outside the project, never a symbol.
+pub fn is_lua_require_ref(reference: &RefView) -> bool {
+    matches!(reference.language, Language::Lua | Language::Luau)
+        && reference.reference_kind == codegraph_core::types::EdgeKind::Imports
+}
+
 /// Is this reference a PHP include/require PATH (vs a namespace `use` symbol)?
 /// (`isPhpIncludePathRef`, `import-resolver.ts:541-547`).
 pub fn is_php_include_path_ref(reference: &RefView) -> bool {
@@ -1510,6 +1561,29 @@ pub fn resolve_via_import(
     reference: &RefView,
     context: &dyn ResolutionContext,
 ) -> Option<ResolvedRef> {
+    // #2263 — a JS/TS module path (`import './polyfills'`, the module of
+    // `import x from '../lib/a'`) names a FILE, found the way the runtime finds
+    // it: extensions, `index` files, path aliases.
+    if is_js_path_import_ref(reference)
+        && let Some(file) = resolve_import_path(
+            &reference.reference_name,
+            &reference.file_path,
+            reference.language,
+            context,
+        )
+        && file != reference.file_path
+        && let Some(file_node) = context
+            .get_nodes_by_name_shared(pathutil::basename(&file))
+            .into_iter()
+            .find(|n| n.kind == NodeKind::File && n.file_path == file)
+    {
+        return Some(ResolvedRef {
+            original: reference.clone(),
+            target_node_id: file_node.id.clone(),
+            confidence: 0.9,
+            resolved_by: ResolvedBy::Import,
+        });
+    }
     // C/C++ #include → file→file edge (import-resolver.ts:1132-1164).
     if matches!(reference.language, Language::C | Language::Cpp)
         && reference.reference_kind == codegraph_core::types::EdgeKind::Imports

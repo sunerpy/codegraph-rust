@@ -14,42 +14,6 @@
   {
     "col": 0,
     "kind": "imports",
-    "line": 1,
-    "metadata": {
-      "confidence": 0.95,
-      "resolvedBy": "qualified-name"
-    },
-    "provenance": null,
-    "source": "file:pkg/__init__.py",
-    "target": "import:5a84e0599dab909bda5f5fc39543a608"
-  },
-  {
-    "col": 0,
-    "kind": "imports",
-    "line": 1,
-    "metadata": {
-      "confidence": 0.95,
-      "resolvedBy": "qualified-name"
-    },
-    "provenance": null,
-    "source": "file:pkg/models/__init__.py",
-    "target": "import:253e6de715bb1372e596991a3cb5d0a7"
-  },
-  {
-    "col": 0,
-    "kind": "imports",
-    "line": 1,
-    "metadata": {
-      "confidence": 0.95,
-      "resolvedBy": "qualified-name"
-    },
-    "provenance": null,
-    "source": "file:pkg/models/user.py",
-    "target": "import:b02bc8ebc91ef54ae28245f84b42fb13"
-  },
-  {
-    "col": 0,
-    "kind": "imports",
     "line": 2,
     "metadata": {
       "confidence": 0.9,

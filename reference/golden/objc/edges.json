@@ -24,18 +24,6 @@
     "target": "file:Sources/Base.h"
   },
   {
-    "col": 0,
-    "kind": "imports",
-    "line": 1,
-    "metadata": {
-      "confidence": 0.95,
-      "resolvedBy": "qualified-name"
-    },
-    "provenance": null,
-    "source": "file:Sources/Base.h",
-    "target": "import:1ce470e34d12b1d96f2893c77175d57f"
-  },
-  {
     "col": 17,
     "kind": "extends",
     "line": 5,

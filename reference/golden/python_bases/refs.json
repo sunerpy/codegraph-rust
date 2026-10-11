@@ -2,6 +2,36 @@
   {
     "candidates": null,
     "col": 0,
+    "file_path": "pkg/__init__.py",
+    "from_node_id": "file:pkg/__init__.py",
+    "language": "python",
+    "line": 1,
+    "reference_kind": "imports",
+    "reference_name": ".models"
+  },
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "pkg/models/__init__.py",
+    "from_node_id": "file:pkg/models/__init__.py",
+    "language": "python",
+    "line": 1,
+    "reference_kind": "imports",
+    "reference_name": ".user"
+  },
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "pkg/models/user.py",
+    "from_node_id": "file:pkg/models/user.py",
+    "language": "python",
+    "line": 1,
+    "reference_kind": "imports",
+    "reference_name": ".base"
+  },
+  {
+    "candidates": null,
+    "col": 0,
     "file_path": "pkg/service.py",
     "from_node_id": "file:pkg/service.py",
     "language": "python",

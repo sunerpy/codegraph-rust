@@ -48,18 +48,6 @@
     "target": "function:83965346d145121562cb4ee22ea2660e"
   },
   {
-    "col": 2,
-    "kind": "imports",
-    "line": 8,
-    "metadata": {
-      "confidence": 0.95,
-      "resolvedBy": "qualified-name"
-    },
-    "provenance": null,
-    "source": "file:src/lib/Widget.svelte",
-    "target": "import:2a58e1a83637c28e86d5f72c721328c9"
-  },
-  {
     "col": 20,
     "kind": "imports",
     "line": 8,

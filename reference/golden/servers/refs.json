@@ -62,6 +62,36 @@
   {
     "candidates": null,
     "col": 0,
+    "file_path": "django/shop/urls.py",
+    "from_node_id": "file:django/shop/urls.py",
+    "language": "python",
+    "line": 1,
+    "reference_kind": "imports",
+    "reference_name": "django.urls"
+  },
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "django/shop/urls.py",
+    "from_node_id": "file:django/shop/urls.py",
+    "language": "python",
+    "line": 3,
+    "reference_kind": "imports",
+    "reference_name": "."
+  },
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "django/shop/views.py",
+    "from_node_id": "file:django/shop/views.py",
+    "language": "python",
+    "line": 1,
+    "reference_kind": "imports",
+    "reference_name": "django.http"
+  },
+  {
+    "candidates": null,
+    "col": 0,
     "file_path": "drupal/modules/custom/greeting/src/Controller/GreetingController.php",
     "from_node_id": "namespace:9cc6f3fa64a53fb24596b3a255875059",
     "language": "php",
@@ -1398,6 +1428,16 @@
     "line": 4,
     "reference_kind": "calls",
     "reference_name": "render"
+  },
+  {
+    "candidates": null,
+    "col": 7,
+    "file_path": "gin/main.go",
+    "from_node_id": "file:gin/main.go",
+    "language": "go",
+    "line": 3,
+    "reference_kind": "imports",
+    "reference_name": "github.com/gin-gonic/gin"
   },
   {
     "candidates": null,
