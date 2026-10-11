@@ -337,6 +337,42 @@ pub fn csharp_method_becomes_an_extension_method() -> Case {
         )
 }
 
+/// W3-05c (KEEP-RUST): of a C# extension method's overloads, only those
+/// extending the receiver's type compete, type parameters renamed or not: an
+/// added `Open<U>(this Box<U>, U)` takes `box.Open(1)` from the `params`
+/// overload, while the plain `Open(object)` and `Open(this Exception, …)`
+/// never do, as a fresh index of the edit finds.
+pub fn csharp_extension_overload_of_a_renamed_type_parameter_appears() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::CSharp])
+        .file(
+            "src/Utilities/Boxes.cs",
+            "using System;\n\nnamespace App.Utilities\n{\n    public class Box<T>\n    {\n        public T Value;\n    }\n\n    public static class BoxExtensions\n    {\n        public static object Open<T>(this Box<T> box, params T[] values)\n        {\n            return box;\n        }\n\n        public static object Open(object value)\n        {\n            return value;\n        }\n\n        public static object Open(this Exception error, object value)\n        {\n            return error;\n        }\n    }\n}\n",
+        )
+        .file(
+            "src/Reader.cs",
+            "using App.Utilities;\n\nnamespace App\n{\n    public class Reader\n    {\n        public object Unbox(Box<int> box)\n        {\n            return box.Open(1);\n        }\n    }\n}\n",
+        )
+        .write(
+            "src/Utilities/Boxes.cs",
+            "using System;\n\nnamespace App.Utilities\n{\n    public class Box<T>\n    {\n        public T Value;\n    }\n\n    public static class BoxExtensions\n    {\n        public static object Open<T>(this Box<T> box, params T[] values)\n        {\n            return box;\n        }\n\n        public static object Open<U>(this Box<U> box, U value)\n        {\n            return box;\n        }\n\n        public static object Open(object value)\n        {\n            return value;\n        }\n\n        public static object Open(this Exception error, object value)\n        {\n            return error;\n        }\n    }\n}\n",
+        )
+        .edge_before(
+            "method App::Reader::Unbox",
+            "calls",
+            "method App.Utilities::BoxExtensions::Open @src/Utilities/Boxes.cs:12",
+        )
+        .edge_after(
+            "method App::Reader::Unbox",
+            "calls",
+            "method App.Utilities::BoxExtensions::Open @src/Utilities/Boxes.cs:17",
+        )
+        .no_edge_after(
+            "method App::Reader::Unbox",
+            "calls",
+            "method App.Utilities::BoxExtensions::Open @src/Utilities/Boxes.cs:12",
+        )
+}
+
 /// Upstream #2180: a call through a class name reaches the class method the
 /// class inherits, before and after the calling body changes.
 pub fn python_inherited_classmethod_body_edit() -> Case {

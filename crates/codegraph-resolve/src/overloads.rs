@@ -10,6 +10,7 @@
 //! argument list is read from the source at the reference's position.
 
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use codegraph_core::types::{EdgeKind, Language, Node, NodeKind};
@@ -56,12 +57,14 @@ impl Arity {
 }
 
 /// One overload's declared parameters: its arity, whether it is a C#
-/// extension method (a `this` first parameter), and the parameters' text.
+/// extension method (a `this` first parameter), the parameters' text, and
+/// the type parameters a C# extension method declares (`Open<T>`).
 #[derive(Debug, Clone)]
 struct Overload {
     arity: Arity,
     extension: bool,
     params: Vec<String>,
+    type_params: Vec<String>,
 }
 
 /// A method's same-owner overloads in its file.
@@ -213,25 +216,21 @@ enum Form {
 /// The overload of `set` an instance-style call of a C# extension method
 /// takes, by C#'s rules with no `this` argument (W3-05c). Only the extension
 /// overloads whose `this` parameter is declared as the current target's is
-/// take the receiver it was chosen for: a static method that is no
-/// extension, or one extending another type, is never a candidate. Of those,
-/// an overload that takes the arguments in its normal form beats one that
-/// takes them only expanded; an array creation passed at a `params` position
-/// goes to the `params` overload over one whose parameter there is not an
-/// array. `None` when the current target is no extension method, or no
-/// overload fits; the current target when several still do.
+/// ([`receiver_key`]: the method's own type parameters numbered, so `Box<T>`
+/// and `Box<U>` agree) take the receiver it was chosen for: a static method
+/// that is no extension, or one extending another type, is never a
+/// candidate. Of those, an overload that takes the arguments in its normal
+/// form beats one that takes them only expanded; an array creation passed at
+/// a `params` position goes to the `params` overload over one whose
+/// parameter there is not an array. `None` when the current target is no
+/// extension method, or no overload fits; the current target when several
+/// still do.
 fn csharp_extension_choice(
     set: &OverloadSet,
     current: &str,
     arguments: &[String],
 ) -> Option<String> {
-    let this_text = |entry: &Overload| {
-        entry
-            .params
-            .first()
-            .and_then(|first| crate::csharp_extensions::this_parameter_text(first))
-    };
-    let receiver = set.own.as_ref().and_then(this_text)?;
+    let receiver = set.own.as_ref().and_then(receiver_key)?;
     let count = arguments.len();
     let array_last = arguments.last().is_some_and(|arg| is_array_creation(arg));
     let form = |entry: &Overload| -> Option<Form> {
@@ -258,7 +257,7 @@ fn csharp_extension_choice(
         .chain(set.siblings.iter().filter_map(|(id, entry)| {
             entry
                 .as_ref()
-                .filter(|entry| this_text(entry).as_ref() == Some(&receiver))
+                .filter(|entry| receiver_key(entry).as_ref() == Some(&receiver))
                 .map(|entry| (id.as_str(), entry))
         }))
         .collect();
@@ -302,6 +301,84 @@ fn csharp_extension_choice(
             .any(|(id, _)| *id == current)
             .then(|| current.to_string()),
     }
+}
+
+/// A C# extension overload's `this` type as written, with the method's own
+/// type parameters numbered by first appearance: `Box<T>` over `Open<T>` and
+/// `Box<U>` over `Open<U>` are both `Box<#0>`, while `IList<int>` stays
+/// apart from `IList<T>`. `None` for an overload that is no extension method.
+fn receiver_key(entry: &Overload) -> Option<String> {
+    let text = crate::csharp_extensions::this_parameter_text(entry.params.first()?)?;
+    let is_word = |c: char| c.is_alphanumeric() || c == '_';
+    let mut seen: Vec<&str> = Vec::new();
+    let mut key = String::with_capacity(text.len());
+    let mut rest = text.as_str();
+    while let Some(first) = rest.chars().next() {
+        let len = if is_word(first) {
+            rest.find(|c: char| !is_word(c)).unwrap_or(rest.len())
+        } else {
+            first.len_utf8()
+        };
+        let token = &rest[..len];
+        if entry.type_params.iter().any(|param| param == token) {
+            let ordinal = seen.iter().position(|s| *s == token).unwrap_or_else(|| {
+                seen.push(token);
+                seen.len() - 1
+            });
+            let _ = write!(key, "#{ordinal}");
+        } else {
+            key.push_str(token);
+        }
+        rest = &rest[len..];
+    }
+    Some(key)
+}
+
+/// The type parameters a method declares (`Open<T, U>(…)`: `T`, `U`), read
+/// from its declaration; empty when it declares none.
+fn method_type_parameters(
+    file: &str,
+    line: i64,
+    name: &str,
+    context: &dyn ResolutionContext,
+) -> Vec<String> {
+    let Some(facts) = context.source_facts(file) else {
+        return Vec::new();
+    };
+    let Some(start) = usize::try_from(line).ok().and_then(|l| l.checked_sub(1)) else {
+        return Vec::new();
+    };
+    let end = (start + 12).min(facts.line_count());
+    if start >= end {
+        return Vec::new();
+    }
+    let text = facts.join_lines(start, end, "\n");
+    // The first `name(` or `name<…>(` is the declaration's own head, as in
+    // [`paren_list_after`]; a later overload's type parameters are not its.
+    let Ok(pattern) = Regex::new(&format!(
+        r"(?-u:\b){}\s*(?:<([^<>()]*)>)?\s*\(",
+        regex::escape(name)
+    )) else {
+        return Vec::new();
+    };
+    pattern
+        .captures(&text)
+        .and_then(|captures| captures.get(1))
+        .map(|list| {
+            list.as_str()
+                .split(',')
+                .filter_map(|param| {
+                    // `[Attr] T`: the name is the last word.
+                    param
+                        .trim()
+                        .rsplit(|c: char| !(c.is_alphanumeric() || c == '_'))
+                        .next()
+                        .filter(|name| !name.is_empty())
+                        .map(str::to_string)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// `new T[] { … }`, `new T[n]` or `new[] { … }`.
@@ -368,10 +445,16 @@ fn overload_set_of(id: &str, context: &dyn ResolutionContext) -> Option<Overload
             && params
                 .first()
                 .is_some_and(|first| crate::csharp_extensions::is_this_parameter(first));
+        let type_params = if extension {
+            method_type_parameters(&node.file_path, node.start_line, &own.name, context)
+        } else {
+            Vec::new()
+        };
         Some(Overload {
             arity: Arity { min, max },
             extension,
             params,
+            type_params,
         })
     };
     Some(OverloadSet {
@@ -538,6 +621,11 @@ mod tests {
     };
 
     fn overload(params: &[&str]) -> Overload {
+        generic(&[], params)
+    }
+
+    /// An overload declaring the type parameters `type_params`.
+    fn generic(type_params: &[&str], params: &[&str]) -> Overload {
         let params: Vec<String> = params.iter().map(|p| (*p).to_string()).collect();
         let min = params
             .iter()
@@ -550,6 +638,7 @@ mod tests {
                 .first()
                 .is_some_and(|p| crate::csharp_extensions::is_this_parameter(p)),
             params,
+            type_params: type_params.iter().map(|p| (*p).to_string()).collect(),
         }
     }
 
@@ -652,13 +741,21 @@ mod tests {
         );
         // The `this` types are compared as written, spacing aside:
         // `IList<int>` is not the `IList<T>` the current target extends.
-        let lists = set(
-            &["this IList<T> list", "params T[] items"],
-            &[
-                ("ints", &["this IList<int> list", "int item"]),
-                ("same", &["this  IList<T>  list", "T item"]),
+        let lists = OverloadSet {
+            name: "M".to_string(),
+            owner: "Ext".to_string(),
+            own: Some(generic(&["T"], &["this IList<T> list", "params T[] items"])),
+            siblings: vec![
+                (
+                    "ints".to_string(),
+                    Some(overload(&["this IList<int> list", "int item"])),
+                ),
+                (
+                    "same".to_string(),
+                    Some(generic(&["T"], &["this  IList<T>  list", "T item"])),
+                ),
             ],
-        );
+        };
         assert_eq!(
             csharp_extension_choice(&lists, "own", &args("1")).as_deref(),
             Some("same")
@@ -681,6 +778,45 @@ mod tests {
             &[("ext", &["this Type type", "object? arg"])],
         );
         assert_eq!(csharp_extension_choice(&plain, "own", &args("arg")), None);
+    }
+
+    #[test]
+    fn renamed_type_parameters_extend_the_same_type() {
+        let pair = |own: Overload, sibling: Overload| OverloadSet {
+            name: "Open".to_string(),
+            owner: "BoxExtensions".to_string(),
+            own: Some(own),
+            siblings: vec![("sibling".to_string(), Some(sibling))],
+        };
+        // `box.Open(1)`: `Open<U>(this Box<U>, U)` takes it in its normal
+        // form, though its type parameter is not named `T`.
+        let boxes = pair(
+            generic(&["T"], &["this Box<T> box", "params T[] values"]),
+            generic(&["U"], &["this Box<U> box", "U value"]),
+        );
+        assert_eq!(
+            csharp_extension_choice(&boxes, "own", &args("1")).as_deref(),
+            Some("sibling")
+        );
+        // Numbered by first appearance in the `this` type: `Map<B, A>` over
+        // `<A, B>` is `Map<T, U>` over `<T, U>`.
+        let maps = pair(
+            generic(&["T", "U"], &["this Map<T, U> map", "params T[] keys"]),
+            generic(&["A", "B"], &["this Map<B, A> map", "B key"]),
+        );
+        assert_eq!(
+            csharp_extension_choice(&maps, "own", &args("k")).as_deref(),
+            Some("sibling")
+        );
+        // A constructed `Box<int>` is not the open `Box<T>`.
+        let constructed = pair(
+            generic(&["T"], &["this Box<T> box", "params T[] values"]),
+            overload(&["this Box<int> box", "int value"]),
+        );
+        assert_eq!(
+            csharp_extension_choice(&constructed, "own", &args("1")).as_deref(),
+            Some("own")
+        );
     }
 
     #[test]
