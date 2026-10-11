@@ -333,14 +333,101 @@ fn find_standalone_at_generated(lower: &str) -> Option<bool> {
     None
 }
 
-/// The union signal — path convention OR content banner — and the value the
-/// indexer persists to `files.generated`.
+/// The union signal — path convention, content banner, or a minified script —
+/// and the value the indexer persists to `files.generated`.
 ///
 /// The content half only ever ADDS: a file the path check already flags stays
 /// flagged whatever its header says, so this can never REMOVE a demotion an
 /// existing index applied.
 pub fn detect_generated_file(path: &str, content: &str) -> bool {
-    is_generated_file(path) || has_generated_header(content)
+    is_generated_file(path) || has_generated_header(content) || is_minified_content(path, content)
+}
+
+/// A line this long is not written by hand (upstream `MINIFIED_LINE_CHARS`).
+const MINIFIED_LINE_CHARS: usize = 1000;
+
+/// A script a bundler or minifier can write, `/\.(?:m?js|cjs)$/i` (upstream
+/// `MINIFIABLE_SCRIPT`).
+pub fn is_minifiable_script(path: &str) -> bool {
+    path.rsplit_once('.').is_some_and(|(_, extension)| {
+        ["js", "mjs", "cjs"]
+            .iter()
+            .any(|known| extension.eq_ignore_ascii_case(known))
+    })
+}
+
+/// A minified or bundled script that is not NAMED so — a docs site's
+/// `bundle.js`, a sample's vendored `app.js` (upstream #2122
+/// `isMinifiedContent`): most of its text sits on lines of a thousand
+/// characters or more, and that text is code, dense with `;{}(),`, not one
+/// long string literal (a base64 fixture) in an ordinary file. A webpack build
+/// counts by its module loader, however readable its lines. Lengths are
+/// counted in UTF-16 code units, as upstream's JavaScript strings are.
+pub fn is_minified_content(path: &str, content: &str) -> bool {
+    if !is_minifiable_script(path) {
+        return false;
+    }
+    let total = utf16_len(content);
+    if total < 4 * MINIFIED_LINE_CHARS {
+        return false;
+    }
+    if has_webpack_runtime(content) {
+        return true;
+    }
+    let mut long = 0usize;
+    let mut punctuation = 0usize;
+    for line in content.split('\n') {
+        let length = utf16_len(line);
+        if length >= MINIFIED_LINE_CHARS {
+            long += length;
+            punctuation += line
+                .bytes()
+                .filter(|byte| matches!(byte, b';' | b'{' | b'}' | b'(' | b')' | b','))
+                .count();
+        }
+    }
+    // The JavaScript original compares doubles; every operand is an integer
+    // well below 2^53, so the f64 arithmetic is the same.
+    long as f64 >= total as f64 * 0.5 && punctuation as f64 >= long as f64 * 0.03
+}
+
+fn utf16_len(text: &str) -> usize {
+    if text.is_ascii() {
+        text.len()
+    } else {
+        text.encode_utf16().count()
+    }
+}
+
+/// `/\bfunction __webpack_require__\s*\(/`: the loader every webpack bundle
+/// defines for its modules.
+fn has_webpack_runtime(content: &str) -> bool {
+    const LOADER: &str = "function __webpack_require__";
+    content.match_indices(LOADER).any(|(at, _)| {
+        let bounded = content[..at]
+            .bytes()
+            .next_back()
+            .is_none_or(|byte| !(byte.is_ascii_alphanumeric() || byte == b'_'));
+        bounded
+            && content[at + LOADER.len()..]
+                .trim_start_matches(is_js_whitespace)
+                .starts_with('(')
+    })
+}
+
+/// JavaScript's `\s`: whitespace and line terminators, `U+FEFF` included.
+fn is_js_whitespace(c: char) -> bool {
+    matches!(
+        c,
+        '\t' | '\n' | '\u{b}' | '\u{c}' | '\r' | ' ' | '\u{a0}' | '\u{1680}' | '\u{2000}'
+            ..='\u{200a}'
+                | '\u{2028}'
+                | '\u{2029}'
+                | '\u{202f}'
+                | '\u{205f}'
+                | '\u{3000}'
+                | '\u{feff}'
+    )
 }
 
 #[cfg(test)]
@@ -636,6 +723,76 @@ mod tests {
     }
 
     // ---- the union written to files.generated -----------------------------
+
+    // ---- a bundle not named .min.js (upstream #2122) ------------------------
+
+    fn bundle(count: usize) -> String {
+        (0..count)
+            .map(|i| format!("function f{i}(e){{return n(e,{i})+t(e)}}"))
+            .collect::<Vec<_>>()
+            .join(";")
+    }
+
+    #[test]
+    fn a_minified_script_is_recognized_by_its_enormous_code_lines() {
+        let bundle = bundle(300);
+        assert!(is_minified_content("docs/assets/bundle.js", &bundle));
+        assert!(is_minified_content("site/app.mjs", &bundle));
+        assert!(is_minified_content("site/app.CJS", &bundle));
+        assert!(detect_generated_file("docs/assets/bundle.js", &bundle));
+    }
+
+    #[test]
+    fn a_bundle_of_two_nine_kilobyte_lines_is_generated() {
+        let line = bundle(260);
+        assert!(line.len() > 9_000 && line.len() < 10_000, "{}", line.len());
+        let two_lines = format!("{line}\n{line}\n");
+        assert!(is_minified_content("public/app.js", &two_lines));
+        assert!(detect_generated_file("public/app.js", &two_lines));
+        assert!(!detect_generated_file("public/app.ts", &two_lines));
+    }
+
+    #[test]
+    fn a_readable_webpack_build_is_recognized_by_its_module_loader() {
+        let webpack = format!(
+            "/*! lib */\n(function(modules) {{\n  function __webpack_require__(moduleId) {{\n    return modules[moduleId];\n  }}\n{}}})([]);\n",
+            "  var x = 1;\n".repeat(400)
+        );
+        assert!(is_minified_content(
+            "assets/js/syntaxhighlighter.js",
+            &webpack
+        ));
+        assert!(!has_webpack_runtime("my_function __webpack_require__("));
+        assert!(has_webpack_runtime("(function __webpack_require__ \u{a0}("));
+        assert!(is_generated_file("vendor/underscore/underscore-min.js"));
+    }
+
+    #[test]
+    fn an_ordinary_file_with_one_long_string_literal_is_not_minified() {
+        let fixture = [
+            "export function decode(input) {".to_string(),
+            "  return atob(input);".to_string(),
+            "}".to_string(),
+            format!("export const LOGO = \"{}\";", "QUJD".repeat(4000)),
+            "export function size() { return LOGO.length; }".to_string(),
+        ]
+        .join("\n");
+        assert!(!is_minified_content("src/logo.js", &fixture));
+    }
+
+    #[test]
+    fn hand_written_code_typescript_and_short_files_are_not_minified() {
+        let code = (0..400)
+            .map(|i| format!("export function f{i}(e) {{\n  return e + {i};\n}}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!is_minified_content("src/code.js", &code));
+        assert!(!is_minified_content("src/bundle.ts", &bundle(300)));
+        assert!(!is_minified_content(
+            "src/tiny.js",
+            "function n(e){return e};function t(e){return n(e)}"
+        ));
+    }
 
     #[test]
     fn detect_generated_file_unions_path_and_content() {

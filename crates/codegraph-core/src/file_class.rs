@@ -266,9 +266,12 @@ const GENERATED_SUFFIXES: &[&str] = &[
     "_grpc_pb.ts",
     "_grpc_pb.js",
     // Minified bundles vendored into a repo: single-letter symbols make
-    // name-based edges pure noise.
+    // name-based edges pure noise. Upstream's `[.-]min` also takes
+    // `underscore-min.js` (#2122).
     ".min.js",
     ".min.mjs",
+    "-min.js",
+    "-min.mjs",
     // Python — protobuf / gRPC
     "_pb2.py",
     "_pb2_grpc.py",
@@ -450,6 +453,8 @@ mod tests {
             "svc_grpc_pb.js",
             "vendor/chart.min.js",
             "vendor/chart.min.mjs",
+            "vendor/underscore/underscore-min.js",
+            "vendor/underscore/underscore-min.mjs",
             "svc_pb2.py",
             "svc_pb2_grpc.py",
             "svc_pb2.pyi",
@@ -480,6 +485,7 @@ mod tests {
             "src/genesis.go",
             "src/pb.go",
             "src/table.js",
+            "src/admin.js",
             "docs/min.css",
             "src/grpc.cs",
             "src/outerclass.java",

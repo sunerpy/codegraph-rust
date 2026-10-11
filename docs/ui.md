@@ -120,6 +120,10 @@ All answers are JSON; failures are `{error, code, hint?}` with `bad-request`
 | `GET /api/events`                                             | the live channel above                                                                        |
 | `GET/POST /api/trails`, `DELETE /api/trails/<id>`             | saved trails, re-resolved; the one write                                                      |
 
+The entry points' hubs leave out symbols in test files and in generated files
+(the indexed flag or the path convention), so a vendored bundle's one-letter
+functions, depended on by the bundle alone, never top the list.
+
 ## Differences from upstream
 
 The wire shapes, limits, error codes and refusals follow upstream `v1.6.1`. Where

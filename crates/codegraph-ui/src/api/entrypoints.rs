@@ -10,6 +10,7 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
+use codegraph_core::file_class::is_generated_file;
 use codegraph_core::types::{Node, NodeKind};
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -240,13 +241,22 @@ fn hubs(ctx: &Ctx<'_>, limit: usize) -> ApiResult<WireList<WireEntryHub>> {
     let ranked = ctx.store.top_depended_on(SCAN_ROWS)?;
     let ids: Vec<String> = ranked.iter().map(|(id, _)| id.clone()).collect();
     let nodes = ctx.store.nodes_by_ids(&ids)?;
+    // A vendored bundle's one-letter functions are depended on by the bundle
+    // alone (upstream #2122): generated files are skipped like tests, by the
+    // indexed flag or the path convention.
+    let mut paths: Vec<String> = nodes.values().map(|node| node.file_path.clone()).collect();
+    paths.sort_unstable();
+    paths.dedup();
+    let flagged = ctx.store.generated_paths_among(&paths)?;
+    let generated = |path: &str| flagged.contains(path) || is_generated_file(path);
     let mut items: Vec<WireEntryHub> = Vec::new();
     let mut eligible = 0;
     for (node_id, dependents) in &ranked {
         let Some(node) = nodes.get(node_id) else {
             continue;
         };
-        if is_non_hub_kind(node.kind) || is_test_file(&node.file_path) {
+        if is_non_hub_kind(node.kind) || is_test_file(&node.file_path) || generated(&node.file_path)
+        {
             continue;
         }
         eligible += 1;

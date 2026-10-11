@@ -1146,6 +1146,27 @@ fn rust_method_is_in_trait_impl(facts: &SourceFacts, start_line: i64) -> bool {
     }
 }
 
+/// A minified or bundled script, by name (`jquery.min.js`, `underscore-min.js`)
+/// or by its text (upstream #2204 `isMinifiedScript`, judged once per file and
+/// pass).
+fn is_minified_script(file_path: &str, context: &dyn ResolutionContext) -> bool {
+    if !codegraph_core::generated_header::is_minifiable_script(file_path) {
+        return false;
+    }
+    let lower = file_path.to_ascii_lowercase();
+    if [".min.js", "-min.js", ".min.mjs", "-min.mjs"]
+        .iter()
+        .any(|suffix| lower.ends_with(suffix))
+    {
+        return true;
+    }
+    context.source_facts(file_path).is_some_and(|facts| {
+        facts.minified_script(|source| {
+            codegraph_core::generated_header::is_minified_content(file_path, source)
+        })
+    })
+}
+
 fn target_is_visible_across_files(
     target: &Node,
     reference: &RefView,
@@ -1729,6 +1750,17 @@ impl ReferenceResolver {
         let Some(target) = context.get_node_by_id_shared(&result.target_node_id) else {
             return Some(result);
         };
+        // A vendored minified bundle keeps mangled one-letter names, so a name
+        // written in another file never means one of them (upstream #2204):
+        // healthchecks' `$(…)`, jQuery loaded as a global, went to a helper
+        // inside bootstrap-native.min.js. An import names its module, so what
+        // it binds stays; calls inside a bundle still resolve.
+        if result.resolved_by != ResolvedBy::Import
+            && target.file_path != reference.file_path
+            && is_minified_script(&target.file_path, context)
+        {
+            return None;
+        }
         target_is_visible_across_files(&target, reference, context).then_some(result)
     }
 

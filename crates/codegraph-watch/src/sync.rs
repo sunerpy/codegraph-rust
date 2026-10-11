@@ -9,7 +9,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use codegraph_core::IndexPaths;
 use codegraph_core::config::Config;
-use codegraph_core::generated_header::detect_generated_file;
+use codegraph_core::generated_header::{detect_generated_file, is_minifiable_script};
 use codegraph_core::node_id::hash_content;
 use codegraph_core::types::{FileRecord, Node, NodeKind};
 use codegraph_extract::{
@@ -1021,6 +1021,21 @@ fn reextract_into_store(
         changed_names.any.insert((*name).to_string());
     }
     changed_names.note_candidates(&old_nodes, &result.nodes);
+    // No name in another file resolves into a minified script (upstream
+    // #2204), and that verdict is read from the script's text: a script that
+    // was or is generated can flip it with every node where it was, so all of
+    // its names are touched and the refs naming them resolve afresh.
+    let was_generated = store
+        .file_by_path(relative)?
+        .is_some_and(|stored| stored.generated);
+    if is_minifiable_script(relative) && (was_generated || file.generated) {
+        changed_names.note_all(
+            old_nodes
+                .iter()
+                .chain(&result.nodes)
+                .map(|node| node.name.clone()),
+        );
+    }
     for node in &result.nodes {
         if matches!(node.kind, NodeKind::Namespace | NodeKind::Module) {
             changed_names
@@ -1077,6 +1092,12 @@ impl ChangedNames {
 
     /// Every node of a file left the index: all its names are touched.
     fn note_removed(&mut self, names: HashSet<String>) {
+        self.note_all(names);
+    }
+
+    /// Touch every one of `names`, as a ref outside their file may now see
+    /// them differently.
+    fn note_all(&mut self, names: impl IntoIterator<Item = String>) {
         for name in names {
             self.candidates.insert(name.clone());
             self.any.insert(name);

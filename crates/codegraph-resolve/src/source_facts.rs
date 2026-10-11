@@ -137,6 +137,7 @@ pub struct SourceFacts {
     awaited_index: OnceLock<Arc<AwaitedIndex>>,
     rust_use_scopes: OnceLock<crate::rust_lexical::RustUseScopes>,
     python_from_imports: OnceLock<HashMap<String, String>>,
+    minified_script: OnceLock<bool>,
 }
 
 impl SourceFacts {
@@ -161,6 +162,7 @@ impl SourceFacts {
             awaited_index: OnceLock::new(),
             rust_use_scopes: OnceLock::new(),
             python_from_imports: OnceLock::new(),
+            minified_script: OnceLock::new(),
         }
     }
 
@@ -349,6 +351,12 @@ impl SourceFacts {
         scan: impl FnOnce(&str) -> HashMap<String, String>,
     ) -> &HashMap<String, String> {
         self.python_from_imports.get_or_init(|| scan(&self.source))
+    }
+
+    /// Whether the raw source is a minified or bundled script; `detect` runs
+    /// once.
+    pub(crate) fn minified_script(&self, detect: impl FnOnce(&str) -> bool) -> bool {
+        *self.minified_script.get_or_init(|| detect(&self.source))
     }
 
     /// The awaited-binding index over [`Self::ts_blanked`]; `build` runs once.

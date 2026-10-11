@@ -329,6 +329,7 @@ pub struct FileRow {
     pub language: String,
     pub node_count: i64,
     pub errors: Value,
+    pub generated: bool,
 }
 
 /// Every row of one published index, read once.
@@ -401,13 +402,14 @@ impl Graph {
         );
         let files = rows(
             &conn,
-            "SELECT path, language, node_count, errors FROM files ORDER BY path",
+            "SELECT path, language, node_count, errors, generated FROM files ORDER BY path",
             |row| {
                 Ok(FileRow {
                     path: row.get(0)?,
                     language: row.get(1)?,
                     node_count: row.get(2)?,
                     errors: json_column(row, 3)?,
+                    generated: row.get::<_, i64>(4)? != 0,
                 })
             },
         );

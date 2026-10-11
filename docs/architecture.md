@@ -170,7 +170,12 @@ type's member only from inside it, a subtype, or a file importing its members
 declared inside a function is reached only from inside it, and a Python name
 passed as a value that its function binds (a parameter, an assignment, a
 `for` / `as` target) is that local, unless a pytest fixture of its name is in
-reach (its own module, or a `conftest.py` above it). Pure JS-family alias
+reach (its own module, or a `conftest.py` above it). No name written in another
+file resolves into a minified script (`*.min.js`, `*-min.js`, or a script whose
+text is mostly code on lines of a thousand characters, or a webpack build),
+though what an import names still binds and calls inside the script still
+resolve; a sync that changes such a script re-resolves the references naming
+its symbols, since its verdict can flip with no symbol moving. Pure JS-family alias
 bindings may forward to a unique callable; wrappers and ambiguity stop at the
 binding. A framework-resolved edge carries its own reachability proof and is not
 erased by ordinary source-language visibility (for example Tauri IPC to a

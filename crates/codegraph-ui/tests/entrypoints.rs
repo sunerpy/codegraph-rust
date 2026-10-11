@@ -249,3 +249,43 @@ async fn counts_the_tests_exactly_and_the_derived_lists_as_a_floor() {
         );
     }
 }
+
+/// Upstream #2122: a docs site's bundle, not named `.min.js` (one-letter
+/// functions calling each other on one enormous line), is generated, and its
+/// functions are not the project's hubs.
+#[tokio::test]
+async fn lists_the_projects_own_hubs_not_a_vendored_bundles() {
+    let body: Vec<String> = (0..400)
+        .map(|i| format!("function f{i}(e){{return n(e,{i})+t(e)}}"))
+        .collect();
+    let bundle = format!(
+        "function n(e,r){{return e+r}};function t(e){{return n(e,1)}};{};\n",
+        body.join(";")
+    );
+    let project = Project::indexed(&[
+        (
+            "src/store.ts",
+            "export function insertNode(name: string): string {
+  return name.trim();
+}
+export function readNode(name: string): string {
+  return insertNode(name);
+}
+export function warm(): string {
+  return insertNode('a') + readNode('b');
+}
+",
+        ),
+        ("docs/assets/bundle.js", &bundle),
+    ]);
+    let payload = project.viewer().json("/api/entrypoints").await;
+    let names: Vec<&str> = payload["hubs"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|hub| hub["name"].as_str())
+        .collect();
+    assert!(names.contains(&"insertNode"), "{names:?}");
+    assert!(!names.contains(&"n"), "{names:?}");
+    assert!(!names.contains(&"t"), "{names:?}");
+}

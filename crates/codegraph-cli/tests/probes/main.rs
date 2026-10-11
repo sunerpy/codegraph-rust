@@ -956,4 +956,68 @@ mod seams {
         assert_no_edge!(project, "method Auth::sync_auth_flow" => references => "function request");
         assert_edge!(project, "function test_recipe" => references => "function recipe @tests/test_coverage.py");
     }
+    /// Upstream #2122 (`068c422e`) and #2204 (`e7be363f`): a script a bundler
+    /// or minifier wrote (named `*.min.js` / `*-min.js`, or a few enormous
+    /// lines of code) is generated, and no name written in another file
+    /// resolves into it: jQuery's global `$(…)` never reaches a vendored
+    /// bundle's one-letter helper. Calls inside a bundle still resolve, and
+    /// an import still binds what it names.
+    #[test]
+    fn pr2204_no_name_from_another_file_resolves_into_a_minified_script() {
+        let functions: Vec<String> = (0..120)
+            .map(|i| format!("function f{i}(e,t){{return e+t+{i}}}"))
+            .collect();
+        let bundle = format!(
+            "!function(){{{};function u(e){{return f1(e,2)}}}}();\n",
+            functions.join(";")
+        )
+        .repeat(4);
+        let project = Project::new()
+            .file(
+                "static/js/vendor.min.js",
+                "function $(e){return document.querySelector(e)}function q(e){return $(e)}\n",
+            )
+            .file("static/js/bundle.js", &bundle)
+            .file("static/js/lib-min.js", "export function debounce(e){return e}\n")
+            .file(
+                "static/js/app.js",
+                "function init() {\n  $(\"#edit-name\").click(function () {});\n  $('#app');\n  u(\"x\");\n}\n",
+            )
+            .file(
+                "src/main.js",
+                "import { debounce } from '../static/js/lib-min.js';\n\nexport function run() {\n  return debounce(1);\n}\n",
+            )
+            .index();
+
+        assert_no_edge!(project, "function init" => calls => "function $ @static/js/vendor.min.js");
+        assert_no_edge!(project, "function init" => calls => "function u @static/js/bundle.js");
+        assert_unresolved!(project, "function init" => calls => "$");
+        assert_unresolved!(project, "function init" => calls => "u");
+        assert_edge!(project, "function q" => calls => "function $ @static/js/vendor.min.js");
+        assert_edge!(
+            project,
+            "function u @static/js/bundle.js:1" => calls => "function f1 @static/js/bundle.js:1"
+        );
+        assert_edge!(
+            project,
+            "function run" => calls => "function debounce @static/js/lib-min.js",
+            resolved_by = "import"
+        );
+        let generated: Vec<(&str, bool)> = project
+            .graph()
+            .files
+            .iter()
+            .map(|file| (file.path.as_str(), file.generated))
+            .collect();
+        assert_eq!(
+            generated,
+            [
+                ("src/main.js", false),
+                ("static/js/app.js", false),
+                ("static/js/bundle.js", true),
+                ("static/js/lib-min.js", true),
+                ("static/js/vendor.min.js", true),
+            ]
+        );
+    }
 }

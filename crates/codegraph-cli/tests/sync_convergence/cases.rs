@@ -6,6 +6,8 @@
 //! `edge_before`/`edge_after` expectation proves that the `before` index or a
 //! fresh index of the final tree holds the relationship the case is about.
 
+use std::sync::LazyLock;
+
 use codegraph_core::types::Language;
 
 use crate::{Case, Change};
@@ -375,6 +377,44 @@ pub fn typescript_type_parameter_added_body_edit() -> Case {
         )
         .edge_before("function wrap", "references", "class T @src/model.ts")
         .no_edge_after("function wrap", "references", "class T @src/model.ts")
+}
+
+/// `util.js` with `u` on its first line and, below it, a data array: on one
+/// line of 5,000 characters of code (a minified script), or split over many.
+fn util_script(minified: bool) -> String {
+    let separator = if minified { "" } else { "\n" };
+    let data = format!("1,{separator}").repeat(2500);
+    format!("function u(e){{return e}}\nvar data=[{separator}{data}0];\n")
+}
+
+static MINIFIED_UTIL: LazyLock<String> = LazyLock::new(|| util_script(true));
+static READABLE_UTIL: LazyLock<String> = LazyLock::new(|| util_script(false));
+
+/// Upstream #2204: a script that stops being minified, every declaration
+/// where it was, is reachable by name again, as a fresh index of it is.
+pub fn javascript_minified_script_becomes_readable() -> Case {
+    Case::new(Change::BodyEdit, &[Language::JavaScript])
+        .file(
+            "static/js/app.js",
+            "function init() {\n  return u(\"x\");\n}\n",
+        )
+        .file("static/js/util.js", MINIFIED_UTIL.as_str())
+        .write("static/js/util.js", READABLE_UTIL.as_str())
+        .edge_after("function init", "calls", "function u @static/js/util.js")
+}
+
+/// Upstream #2204: a script that becomes minified, every declaration where
+/// it was, is no longer reachable by name from another file.
+pub fn javascript_readable_script_becomes_minified() -> Case {
+    Case::new(Change::BodyEdit, &[Language::JavaScript])
+        .file(
+            "static/js/app.js",
+            "function init() {\n  return u(\"x\");\n}\n",
+        )
+        .file("static/js/util.js", READABLE_UTIL.as_str())
+        .write("static/js/util.js", MINIFIED_UTIL.as_str())
+        .edge_before("function init", "calls", "function u @static/js/util.js")
+        .no_edge_after("function init", "calls", "function u @static/js/util.js")
 }
 
 /// Upstream #2219: a Python name an edit makes the function's own parameter
