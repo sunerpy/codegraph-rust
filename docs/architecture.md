@@ -169,7 +169,9 @@ private Rust command).
 
 The registered framework candidates are NestJS, React/Next.js, Vue/Nuxt, Godot,
 and Tauri, in a deliberate order. Each activates only when its detection guard
-matches. Godot also extracts project/scene/resource relationships; Tauri bridges
+matches, and resolves only references written in its own languages (React
+and Vue their scripts', NestJS TypeScript and JavaScript, Tauri the JS-family
+`invoke` sites and Rust; Godot stays universal). Godot also extracts project/scene/resource relationships; Tauri bridges
 literal JS-family `invoke` calls to uniquely registered Rust commands. Ambiguous
 or dynamic targets remain unresolved rather than falling through to a global
 same-name guess.

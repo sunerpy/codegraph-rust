@@ -1945,9 +1945,16 @@ impl ReferenceResolver {
 
         let mut candidates: Vec<ResolvedRef> = Vec::new();
 
-        // Strategy 1: `FrameworkResolver` extension point (index.ts:695-701).
-        // Empty in v1 → no candidates contributed.
-        for resolver in &self.framework_resolver_extensions {
+        // Strategy 1: `FrameworkResolver` extension point (index.ts:695-701),
+        // by the resolvers that read this reference's language (upstream
+        // #2415): Express's `logger` rule took a Go result type for the
+        // method itself. Bridges list the language their references are
+        // written in.
+        for resolver in self
+            .framework_resolver_extensions
+            .iter()
+            .filter(|resolver| resolves_language(resolver.as_ref(), reference.language))
+        {
             if let Some(result) = self.gate_framework_resolver_extension_language(
                 resolver.resolve(reference, context),
                 reference,
@@ -3125,6 +3132,15 @@ fn build_edge_metadata(reference: &ResolvedRef) -> serde_json::Value {
         map.insert("subkind".to_string(), serde_json::json!(subkind.as_str()));
     }
     serde_json::Value::Object(map)
+}
+
+/// Does a `FrameworkResolver`'s `resolve()` read a reference written in
+/// `language`? (`getResolvingFrameworks`, upstream #2415): its
+/// `resolve_languages`, which default to its `languages`; none = universal.
+fn resolves_language(resolver: &dyn FrameworkResolver, language: Language) -> bool {
+    resolver
+        .resolve_languages()
+        .is_none_or(|langs| langs.contains(&language))
 }
 
 /// Does a `FrameworkResolver` apply to `language`? (`getApplicableFrameworks`,

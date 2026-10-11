@@ -331,6 +331,35 @@ pub fn java_overload_delegation_body_edit() -> Case {
         )
 }
 
+/// Upstream #2415: in a React app, a Python call never reaches a React hook
+/// by the React resolver's rules, before or after its body changes; the
+/// app's own call still does.
+pub fn python_call_ignores_a_react_hook_body_edit() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Python, Language::Tsx])
+        .file(
+            "package.json",
+            "{\"name\":\"web\",\"dependencies\":{\"react\":\"^19.0.0\"}}\n",
+        )
+        .file(
+            "src/hooks/useSession.tsx",
+            "export function useSession() {\n  return null;\n}\n",
+        )
+        .file(
+            "src/App.tsx",
+            "import { useSession } from './hooks/useSession';\n\nexport function App() {\n  const session = useSession();\n  return <div>{String(session)}</div>;\n}\n",
+        )
+        .file(
+            "backend/session.py",
+            "def handle():\n    return useSession()\n",
+        )
+        .write(
+            "backend/session.py",
+            "def handle():\n    value = useSession()\n    return value\n",
+        )
+        .edge_throughout("function App", "calls", "function useSession")
+        .no_edge_after("function handle", "calls", "function useSession")
+}
+
 /// Upstream #2392 (3): a Go call through an imported package links once the
 /// package appears.
 pub fn go_import_of_an_added_package() -> Case {

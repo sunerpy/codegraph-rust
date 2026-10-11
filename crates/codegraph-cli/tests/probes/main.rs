@@ -789,4 +789,49 @@ mod seams {
         let sol = "contracts/access/AccessControl.sol";
         assert_edge!(project, &format!("method AccessControl::_checkRole @{sol}:4") => calls => &format!("method AccessControl::_checkRole @{sol}:8"));
     }
+
+    /// Upstream #2415 (`19f91e27`), #2211 (`5c01f017`) and #2210 (`d7cdb0c0`):
+    /// a framework resolver answers only references written in its own
+    /// languages. A React app's hook and context rules never take a Python
+    /// or Java `useSession()` / `SecurityContext`, and the Vue resolver never
+    /// takes a Python call for a `.vue` component; the app's own TSX hook call
+    /// still resolves.
+    #[test]
+    fn pr2415_a_framework_resolves_only_its_own_languages() {
+        let project = Project::new()
+            .file(
+                "package.json",
+                "{\"name\":\"web\",\"dependencies\":{\"react\":\"^19.0.0\",\"vue\":\"^3.0.0\"}}\n",
+            )
+            .file(
+                "src/hooks/useSession.tsx",
+                "export function useSession() {\n  return null;\n}\n\nexport const SecurityContext = { user: null };\n",
+            )
+            .file(
+                "src/App.tsx",
+                "import { useSession } from './hooks/useSession';\n\nexport function App() {\n  const session = useSession();\n  return <div>{String(session)}</div>;\n}\n",
+            )
+            .file(
+                "src/components/QueryFilterBuilder.vue",
+                "<template><div /></template>\n<script setup lang=\"ts\">\nconst x = 1;\n</script>\n",
+            )
+            .file(
+                "backend/session.py",
+                "def handle():\n    useSession()\n    return SecurityContext()\n\n\ndef build():\n    return QueryFilterBuilder()\n",
+            )
+            .file(
+                "server/src/main/java/app/Auth.java",
+                "package app;\n\npublic class Auth {\n  public void check() {\n    useSession();\n  }\n}\n",
+            )
+            .index();
+
+        assert_edge!(project, "function App" => calls => "function useSession");
+        assert_no_edge!(project, "function handle" => calls => "function useSession");
+        assert_no_edge!(project, "function handle" => calls => "constant SecurityContext");
+        assert_no_edge!(project, "method app::Auth::check" => calls => "function useSession");
+        assert_no_edge!(
+            project,
+            "function build" => calls => "component src/components/QueryFilterBuilder.vue::QueryFilterBuilder"
+        );
+    }
 }

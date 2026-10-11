@@ -120,6 +120,20 @@ impl FrameworkResolver for TauriResolver {
         None
     }
 
+    /// Its `invoke` references are written in the JS-family files `extract()`
+    /// reads, and its commands in Rust (upstream #2415: a resolver lists the
+    /// languages its references are written in).
+    fn resolve_languages(&self) -> Option<&[Language]> {
+        const LANGS: [Language; 5] = [
+            Language::TypeScript,
+            Language::Tsx,
+            Language::JavaScript,
+            Language::Jsx,
+            Language::Rust,
+        ];
+        Some(&LANGS)
+    }
+
     /// Ordered cheapest-first, returning `true` on the first hit.
     ///
     /// Probes 1-2 use `file_exists` rather than a `get_all_files` basename scan

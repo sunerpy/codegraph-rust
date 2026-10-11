@@ -93,6 +93,15 @@ pub trait FrameworkResolver: Sync {
         None
     }
 
+    /// The languages whose references `resolve()` sees, when they are not
+    /// [`Self::languages`] (upstream #2415 `resolveLanguages`): a framework's
+    /// conventions are its languages', so Strategy 1 asks only the resolvers
+    /// that read a reference's language. Defaults to [`Self::languages`]; a
+    /// resolver that declares neither stays universal.
+    fn resolve_languages(&self) -> Option<&[Language]> {
+        self.languages()
+    }
+
     /// Detect whether the project uses this `FrameworkResolver`'s target — called
     /// once at startup (`detect`, `types.ts:163`).
     fn detect(&self, context: &dyn ResolutionContext) -> bool;

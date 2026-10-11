@@ -593,6 +593,7 @@ matrix! {
     python_inherited_classmethod_body_edit,
     typescript_test_suite_namesake_appears,
     java_overload_delegation_body_edit,
+    python_call_ignores_a_react_hook_body_edit,
     typescript_side_effect_import_of_an_added_file,
     go_import_of_an_added_package,
     solidity_import_of_an_added_file,

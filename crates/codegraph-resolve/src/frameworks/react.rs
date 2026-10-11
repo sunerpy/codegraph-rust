@@ -26,6 +26,18 @@ impl FrameworkResolver for ReactResolver {
         Some(&LANGS)
     }
 
+    /// Components, hooks and contexts are a script's (upstream #2211): halo's
+    /// Java `import org.springframework…SecurityContext` is no React context.
+    fn resolve_languages(&self) -> Option<&[Language]> {
+        const LANGS: [Language; 4] = [
+            Language::TypeScript,
+            Language::JavaScript,
+            Language::Tsx,
+            Language::Jsx,
+        ];
+        Some(&LANGS)
+    }
+
     // Ports reactResolver.detect (react.ts:14-32).
     fn detect(&self, context: &dyn ResolutionContext) -> bool {
         if let Some(package_json) = context.read_file("package.json") {

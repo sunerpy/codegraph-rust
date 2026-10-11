@@ -84,6 +84,20 @@ impl FrameworkResolver for VueResolver {
     }
 
     // Ports vueResolver.resolve (vue.ts:103-188).
+    /// A Vue app's macros, auto-imports and components are its scripts'
+    /// (upstream #2210): mealie's Python `QueryFilterBuilder(...)` is not the
+    /// `QueryFilterBuilder.vue` component.
+    fn resolve_languages(&self) -> Option<&[Language]> {
+        const LANGS: [Language; 5] = [
+            Language::Vue,
+            Language::JavaScript,
+            Language::TypeScript,
+            Language::Tsx,
+            Language::Jsx,
+        ];
+        Some(&LANGS)
+    }
+
     fn resolve(&self, reference: &RefView, context: &dyn ResolutionContext) -> Option<ResolvedRef> {
         let name = &reference.reference_name;
 
