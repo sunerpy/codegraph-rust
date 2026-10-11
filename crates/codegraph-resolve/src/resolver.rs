@@ -2079,6 +2079,38 @@ impl ReferenceResolver {
             return (candidates.into_iter().reduce(highest_confidence), None);
         }
         if is_unresolved_js_member_call(reference) {
+            // A path through module namespaces is not untyped:
+            // `z.coerce.number()` after `import * as z`, where the barrel has
+            // `export * as coerce` (upstream #2192). Only the import resolver
+            // answers it, and only with a callable or a value; any framework
+            // result is preserved beside it.
+            let root = reference
+                .reference_name
+                .split('.')
+                .next()
+                .unwrap_or_default();
+            let namespace = context
+                .get_import_mappings(&reference.file_path, reference.language)
+                .iter()
+                .any(|mapping| mapping.is_namespace && mapping.local_name == root);
+            if namespace
+                && let Some(through) =
+                    self.gate_language(resolve_via_import(reference, context), reference, context)
+                && context
+                    .get_node_by_id_shared(&through.target_node_id)
+                    .is_some_and(|target| {
+                        matches!(
+                            target.kind,
+                            NodeKind::Function
+                                | NodeKind::Method
+                                | NodeKind::Class
+                                | NodeKind::Constant
+                                | NodeKind::Variable
+                        )
+                    })
+            {
+                candidates.push(through);
+            }
             return (candidates.into_iter().reduce(highest_confidence), None);
         }
 

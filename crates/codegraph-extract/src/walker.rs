@@ -3324,8 +3324,13 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             return false;
         }
         let name = regex::escape(name);
+        // Inside `{ … }` the name is bounded by a character that cannot
+        // continue an identifier, not by `\b`, which takes a `$` for a
+        // separator: it cannot bound `items$` and finds `items` inside it
+        // (upstream #2384). The bounds consume, as the regex crate has no
+        // look-around, and are spelled in ASCII.
         Regex::new(&format!(
-            r"(?m)^[ \t]*export\s+(?:default\s+{name}\s*;?[ \t\r]*$|\{{[^}}]*\b{name}\b[^}}]*\}})"
+            r"(?m)^[ \t]*export\s+(?:default\s+{name}\s*;?[ \t\r]*$|\{{(?:[^}}]*[^0-9A-Za-z_$}}])?{name}(?:[^0-9A-Za-z_$}}][^}}]*)?\}})"
         ))
         .is_ok_and(|pattern| pattern.is_match(self.source))
     }

@@ -692,8 +692,10 @@ fn js_import_regex() -> &'static Regex {
         // form, not a default import named `type` (upstream #2134); the
         // optional `type` group takes it, and `import type from './x'`, which
         // leaves nothing else, still binds `type` (see `extract_js_imports`).
+        // A binding is any JS identifier, `$` included (upstream #2378): `\w`
+        // stops at the `$` of `import $store from './store'`.
         Regex::new(
-            r#"import\s+(?:(type)\s+)?(?:(\w+)\s*,?\s*)?(?:\{([^}]+)\})?\s*(?:(\*)\s+as\s+(\w+))?\s*from\s*['"]([^'"]+)['"]"#,
+            r#"import\s+(?:(type)\s+)?(?:([A-Za-z_$][0-9A-Za-z_$]*)\s*,?\s*)?(?:\{([^}]+)\})?\s*(?:(\*)\s+as\s+([A-Za-z_$][0-9A-Za-z_$]*))?\s*from\s*['"]([^'"]+)['"]"#,
         )
         .expect("valid JS import regex")
     })
@@ -736,6 +738,15 @@ fn extract_js_imports(content: &str) -> Vec<ImportMapping> {
     let mut mappings = Vec::new();
 
     for caps in js_import_regex().captures_iter(content) {
+        // A default binding is never followed by `{`: the `${` of a code
+        // generator's `` `import ${name} from '${src}'` `` is no binding
+        // (upstream #2378's `(?![\w${])`).
+        if caps
+            .get(2)
+            .is_some_and(|binding| content[binding.end()..].starts_with('{'))
+        {
+            continue;
+        }
         let type_only = caps.get(1).is_some();
         let named_imports = caps.get(3).map(|m| m.as_str());
         let star = caps.get(4).is_some();
@@ -761,11 +772,14 @@ fn extract_js_imports(content: &str) -> Vec<ImportMapping> {
             for raw in named.split(',') {
                 let name = strip_inline_type_modifier(raw.trim());
                 if let Some((orig, alias)) = parse_as_alias(name) {
+                    // `{ default as X }` is the default import spelled as a
+                    // named one (upstream #2412).
+                    let is_default = orig == "default";
                     mappings.push(ImportMapping {
                         local_name: alias,
                         exported_name: orig,
                         source: source.to_string(),
-                        is_default: false,
+                        is_default,
                         is_namespace: false,
                     });
                 } else if !name.is_empty() {
@@ -1040,7 +1054,7 @@ fn strip_inline_type_modifier(name: &str) -> &str {
     if rest
         .bytes()
         .next()
-        .is_some_and(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_' || byte == b'$')
     {
         rest
     } else {
@@ -1050,7 +1064,10 @@ fn strip_inline_type_modifier(name: &str) -> &str {
 
 fn parse_as_alias(name: &str) -> Option<(String, String)> {
     static RE: OnceLock<Regex> = OnceLock::new();
-    let re = RE.get_or_init(|| Regex::new(r"(\w+)\s+as\s+(\w+)").expect("as-alias"));
+    let re = RE.get_or_init(|| {
+        Regex::new(r"([A-Za-z_$][0-9A-Za-z_$]*)\s+as\s+([A-Za-z_$][0-9A-Za-z_$]*)")
+            .expect("as-alias")
+    });
     re.captures(name)
         .map(|c| (c[1].to_string(), c[2].to_string()))
 }
@@ -1363,9 +1380,13 @@ pub fn extract_re_exports(content: &str, language: Language) -> Vec<ReExport> {
     static LOCAL_CONST_RE: OnceLock<Regex> = OnceLock::new();
     static LOCAL_NAMED_RE: OnceLock<Regex> = OnceLock::new();
     static LOCAL_DEFAULT_RE: OnceLock<Regex> = OnceLock::new();
+    // `export * from '…'`; `export * as ns from '…'` exports `ns` alone
+    // (upstream #2192).
     let wildcard_re = WILDCARD_RE.get_or_init(|| {
-        Regex::new(r#"export\s*\*(?:\s+as\s+\w+)?\s*from\s*['"]([^'"]+)['"]"#)
-            .expect("reexport wildcard")
+        Regex::new(
+            r#"export\s*\*(?:\s+as\s+([A-Za-z_$][0-9A-Za-z_$]*))?\s*from\s*['"]([^'"]+)['"]"#,
+        )
+        .expect("reexport wildcard")
     });
     let named_re = NAMED_RE.get_or_init(|| {
         Regex::new(r#"export\s*\{([^}]+)\}\s*from\s*['"]([^'"]+)['"]"#).expect("reexport named")
@@ -1384,8 +1405,13 @@ pub fn extract_re_exports(content: &str, language: Language) -> Vec<ReExport> {
     });
 
     for caps in wildcard_re.captures_iter(&cleaned) {
-        out.push(ReExport::Wildcard {
-            source: caps[1].to_string(),
+        let source = caps[2].to_string();
+        out.push(match caps.get(1) {
+            Some(namespace) => ReExport::Namespace {
+                exported_name: namespace.as_str().to_string(),
+                source,
+            },
+            None => ReExport::Wildcard { source },
         });
     }
 
@@ -1491,8 +1517,13 @@ pub fn extract_re_exports(content: &str, language: Language) -> Vec<ReExport> {
     out
 }
 
+/// A JS identifier: `[A-Za-z_$][0-9A-Za-z_$]*` (upstream #2378).
 fn is_word(s: &str) -> bool {
-    !s.is_empty() && s.chars().all(|c| c.is_alphanumeric() || c == '_')
+    let mut chars = s.chars();
+    chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_' || c == '$')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
 }
 
 /// Resolve a JVM (Java/Kotlin) FQN import via the qualifiedName index
@@ -2497,8 +2528,14 @@ fn find_exported_symbol(
         return None;
     }
 
+    // For `ns.member` through `import * as ns`, the member is the name wanted
+    // (upstream #2192).
     let target_name = if want.is_default {
         "default"
+    } else if want.is_namespace
+        && let Some(member) = want.member_name.as_deref()
+    {
+        member
     } else {
         &want.exported_name
     };
@@ -2531,9 +2568,39 @@ fn find_exported_symbol(
                 }
             }
             ReExport::Wildcard { .. }
+            | ReExport::Namespace { .. }
             | ReExport::LocalAlias { .. }
             | ReExport::CommonJsAlias { .. } => {}
         }
+    }
+
+    // `z.core.util.fn` through `export * as core from './core'`: the member
+    // continues in that module (upstream #2192).
+    if want.is_namespace
+        && let Some(member) = want.member_name.as_deref()
+        && let Some((head, rest)) = member.split_once('.')
+        && let Some(source) = re_exports.iter().find_map(|rex| match rex {
+            ReExport::Namespace {
+                exported_name,
+                source,
+            } if exported_name == head => Some(source),
+            _ => None,
+        })
+    {
+        let next = resolve_import_path(source, file_path, language, context)?;
+        return find_exported_symbol(
+            &next,
+            &Want {
+                is_default: want.is_default,
+                is_namespace: want.is_namespace,
+                exported_name: rest.split('.').next().unwrap_or(rest).to_string(),
+                member_name: Some(rest.to_string()),
+            },
+            language,
+            context,
+            visited,
+            depth + 1,
+        );
     }
 
     for rex in &re_exports {
@@ -2548,6 +2615,7 @@ fn find_exported_symbol(
                 }
             }
             ReExport::Named { .. }
+            | ReExport::Namespace { .. }
             | ReExport::LocalAlias { .. }
             | ReExport::CommonJsAlias { .. } => {}
         }
@@ -3855,6 +3923,120 @@ import * as ns from './baz';
         );
     }
 
+    fn mapping_strings(content: &str) -> Vec<String> {
+        extract_js_imports(content)
+            .into_iter()
+            .map(|m| {
+                format!(
+                    "{}<{}{}{}",
+                    m.local_name,
+                    m.exported_name,
+                    if m.is_default { " default" } else { "" },
+                    if m.is_namespace { " ns" } else { "" }
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn import_default_as_is_the_default_import() {
+        assert_eq!(
+            mapping_strings(
+                "import {\n  default as AppRoot,\n  ErrorBoundary as AppRootErrorBoundary,\n} from './routes/app/root';\n"
+            ),
+            [
+                "AppRoot<default default",
+                "AppRootErrorBoundary<ErrorBoundary"
+            ]
+        );
+        assert_eq!(
+            mapping_strings("import { default as Settings } from './settings';\n"),
+            ["Settings<default default"]
+        );
+        assert_eq!(
+            mapping_strings("import type { default as Config } from './config';\n"),
+            ["Config<default default"]
+        );
+        assert_eq!(
+            mapping_strings("import { type default as Config } from './config';\n"),
+            ["Config<default default"]
+        );
+        assert_eq!(
+            mapping_strings("import Main, { default as Again, helper } from './main';\n"),
+            [
+                "Main<default default",
+                "Again<default default",
+                "helper<helper"
+            ]
+        );
+        assert_eq!(
+            mapping_strings("import { defaults as d, defaultTheme as theme } from './theme';\n"),
+            ["d<defaults", "theme<defaultTheme"]
+        );
+    }
+
+    #[test]
+    fn dollar_identifiers_are_import_bindings() {
+        assert_eq!(
+            mapping_strings("import items$ from './store';\n"),
+            ["items$<default default"]
+        );
+        assert_eq!(
+            mapping_strings("import $ from './dom';\n"),
+            ["$<default default"]
+        );
+        assert_eq!(
+            mapping_strings("import * as ns$ from './ns';\n"),
+            ["ns$<* ns"]
+        );
+        assert_eq!(
+            mapping_strings("import { a as b$, default as items$ } from './x';\n"),
+            ["b$<a", "items$<default default"]
+        );
+        assert_eq!(
+            mapping_strings("import type $T from './t';\n"),
+            ["$T<default default"]
+        );
+        // A code generator's template literal is no import.
+        assert!(mapping_strings("const code = `import ${name} from '${src}'`;\n").is_empty());
+        assert_eq!(
+            extract_re_exports(
+                "export { a$ } from './a';\nexport { b as c$ } from './b';\n",
+                Language::TypeScript
+            )
+            .into_iter()
+            .filter_map(|rex| match rex {
+                ReExport::Named {
+                    exported_name,
+                    original_name,
+                    ..
+                } => {
+                    Some(format!("{exported_name}<{original_name}"))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>(),
+            ["a$<a$", "c$<b"]
+        );
+    }
+
+    #[test]
+    fn a_namespace_reexport_is_its_own_kind() {
+        let reexports = extract_re_exports(
+            "export * as core from './core';\nexport * from './schemas';\n",
+            Language::TypeScript,
+        );
+        assert!(reexports.iter().any(|rex| matches!(
+            rex,
+            ReExport::Namespace { exported_name, source } if exported_name == "core" && source == "./core"
+        )));
+        assert!(reexports.iter().any(|rex| matches!(
+            rex,
+            ReExport::Wildcard { source } if source == "./schemas"
+        )));
+        assert_eq!(reexports.len(), 2);
+    }
+
     #[test]
     fn extract_js_imports_reads_require_lists_and_members() {
         let content = "var express = require('../')\n  , request = require('supertest');\nvar setCharset = require('./utils').setCharset;\nconst { default: Service, $el: el } = require('./service');\n";
@@ -4049,8 +4231,13 @@ export { } from './empty';
             out.iter()
                 .any(|r| matches!(r, ReExport::Wildcard { source } if source == "./all"))
         );
+        // `export * as ns` exports the namespace alone (upstream #2192).
+        assert!(out.iter().any(|r| matches!(
+            r,
+            ReExport::Namespace { exported_name, source } if exported_name == "ns" && source == "./ns"
+        )));
         assert!(
-            out.iter()
+            !out.iter()
                 .any(|r| matches!(r, ReExport::Wildcard { source } if source == "./ns"))
         );
         assert!(out.iter().any(|r| matches!(

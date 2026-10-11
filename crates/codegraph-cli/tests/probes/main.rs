@@ -1903,4 +1903,122 @@ mod js {
         );
         assert!(into(graph, "py/mod.py", "first", &["calls"]).is_empty());
     }
+
+    /// Upstream #2192 (`7c1c9a36`): `export * as ns from './x'` exports the
+    /// namespace, not every member: a later `export *` supplies `z.number()`,
+    /// `z.core.safeParse()` continues in the namespaced module, and a member a
+    /// barrel forwards by name is found for a namespace import.
+    #[test]
+    fn pr2192_a_namespace_reexport_exports_the_namespace_only() {
+        let project = Project::new()
+            .file("package.json", "{\"name\":\"schema\",\"private\":true}")
+            .file("src/core/regexes.ts", "export const number = /^-?\\d+$/;\n")
+            .file("src/core/parse.ts", "export function safeParse(value: unknown) {\n  return { success: true, data: value };\n}\n")
+            .file("src/core/api.ts", "export function _lt(limit: number) {\n  return limit;\n}\n")
+            .file("src/core/index.ts", "export * as regexes from \"./regexes.js\";\nexport * from \"./parse.js\";\nexport * from \"./api.js\";\n")
+            .file("src/classic/schemas.ts", "export function number() {\n  return { kind: \"number\" };\n}\n")
+            .file("src/classic/external.ts", "export * as core from \"../core/index.js\";\nexport * from \"./schemas.js\";\nexport { _lt as lt } from \"../core/index.js\";\n")
+            .file("src/mini/parse.ts", "export { safeParse } from \"../core/index.js\";\n")
+            .file("src/mini/external.ts", "export * as core from \"../core/index.js\";\nexport * from \"./parse.js\";\n")
+            .file("src/tests/classic.test.ts", "import * as z from \"../classic/external.js\";\n\nexport function classic() {\n  z.number();\n  z.lt(10);\n  z.core.safeParse(1);\n}\n")
+            .file("src/tests/mini.test.ts", "import * as m from \"../mini/external.js\";\n\nexport function mini() {\n  m.safeParse(1);\n}\n")
+            .index();
+        let graph = project.graph();
+        let calls_out = |file: &str| -> Vec<String> {
+            let mut calls: Vec<String> = graph
+                .edges
+                .iter()
+                .filter(|edge| {
+                    edge.kind == "calls"
+                        && graph
+                            .node(&edge.source)
+                            .is_some_and(|node| node.file_path == file)
+                })
+                .filter_map(|edge| graph.node(&edge.target))
+                .map(|node| format!("{}: {}", node.file_path, node.qualified_name))
+                .collect();
+            calls.sort();
+            calls
+        };
+        assert_eq!(
+            calls_out("src/tests/classic.test.ts"),
+            [
+                "src/classic/schemas.ts: number",
+                "src/core/api.ts: _lt",
+                "src/core/parse.ts: safeParse",
+            ]
+        );
+        assert_eq!(
+            calls_out("src/tests/mini.test.ts"),
+            ["src/core/parse.ts: safeParse"]
+        );
+    }
+
+    /// Upstream #2412 (`f261fda5`): `import { default as X }` is the module's
+    /// default import, so `AppRoot()` reaches the module's default export,
+    /// not another file's `AppRoot`, and the binding's import links the module
+    /// file when its default has no symbol.
+    #[test]
+    fn pr2412_import_default_as_is_the_default_import() {
+        let project = Project::new()
+            .file("package.json", "{\"name\":\"web\",\"dependencies\":{\"react\":\"^18\"}}")
+            .file("src/app/routes/app/root.tsx", "export const ErrorBoundary = () => {\n  return <div>Something went wrong!</div>;\n};\n\nconst AppRoot = () => {\n  return <main />;\n};\n\nexport default AppRoot;\n")
+            .file("src/config.ts", "export default { theme: 'dark' };\n")
+            .file(
+                "src/app.ts",
+                "import { default as config } from './config';\n\nexport const theme = config.theme;\n",
+            )
+            .file("src/legacy/shell.tsx", "export function AppRoot() {\n  return <section />;\n}\n")
+            .file("src/app/router.tsx", "import { default as AppRoot, ErrorBoundary as AppRootErrorBoundary } from './routes/app/root';\n\nexport function render() {\n  AppRootErrorBoundary();\n  return AppRoot();\n}\n")
+            .index();
+        assert_edge!(project, "function render" => calls => "function AppRoot @src/app/routes/app/root.tsx", resolved_by = "import");
+        assert_no_edge!(project, "function render" => calls => "function AppRoot @src/legacy/shell.tsx");
+        assert_edge!(project, "function render" => calls => "function ErrorBoundary @src/app/routes/app/root.tsx");
+        // A default export with no symbol of its own still links the module
+        // file through the binding's import, as `import config from` does.
+        let graph = project.graph();
+        let parked: Vec<&str> = graph
+            .unresolved
+            .iter()
+            .filter(|reference| {
+                reference.file_path == "src/app.ts" && reference.reference_kind == "imports"
+            })
+            .map(|reference| reference.reference_name.as_str())
+            .collect();
+        assert!(!parked.contains(&"config"), "{parked:?}");
+    }
+
+    /// Upstream #2378 (`05712869`): an import binding whose name contains `$`
+    /// maps like any other (a default `$fmt`, a renamed `$alias`).
+    #[test]
+    fn pr2378_a_dollar_import_binding_is_an_import() {
+        let project = Project::new()
+            .file("package.json", "{\"name\":\"web\",\"private\":true}")
+            .file("src/fmt.ts", "export default function $fmt(value: string) {\n  return value;\n}\n")
+            .file("src/other.ts", "export function $fmt(value: string) {\n  return value + '!';\n}\n")
+            .file("src/use.ts", "import $fmt from './fmt';\nimport { $fmt as $alias } from './other';\n\nexport function show(value: string) {\n  return $fmt(value) + $alias(value);\n}\n\nexport function shadow($fmt: (v: string) => string) {\n  return $fmt('x');\n}\n")
+            .index();
+        assert_edge!(project, "function show" => calls => "function $fmt @src/fmt.ts", resolved_by = "import");
+        assert_edge!(project, "function show" => calls => "function $fmt @src/other.ts", resolved_by = "import");
+    }
+
+    /// Upstream #2384 (`5f5b8db6`): a store exported by an `export { … }` list
+    /// owns its actions when its name ends with `$`; `export { useStore$ }`
+    /// does not export a store named `useStore`.
+    #[test]
+    fn pr2384_an_export_list_exports_a_dollar_named_store() {
+        let project = Project::new()
+            .file("package.json", "{\"name\":\"web\",\"dependencies\":{\"zustand\":\"^4\"}}")
+            .file("src/items.ts", "import { create } from 'zustand';\n\nconst items$ = create((set) => ({\n  inc: () => set({}),\n}));\n\nconst useStore = create((set) => ({\n  reset: () => set({}),\n}));\n\nexport { items$ };\nexport { useStore$ };\n")
+            .index();
+        let graph = project.graph();
+        let names: Vec<&str> = graph
+            .nodes
+            .iter()
+            .filter(|node| node.file_path == "src/items.ts")
+            .map(|node| node.qualified_name.as_str())
+            .collect();
+        assert!(names.contains(&"items$::inc"), "{names:?}");
+        assert!(!names.contains(&"useStore::reset"), "{names:?}");
+    }
 }

@@ -941,6 +941,46 @@ pub fn typescript_require_default_of_an_added_es_module() -> Case {
         .edge_after("function mount", "instantiates", "class Widget")
 }
 
+/// Upstream #2192: through `export * as core`, a namespace import's
+/// `z.core.safeParse()` reaches the namespaced module's function once that
+/// module appears, as a fresh index of the edit finds.
+pub fn typescript_namespace_reexport_member_reaches_an_added_module() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::TypeScript])
+        .file(
+            "src/external.ts",
+            "export * as core from './core';\n",
+        )
+        .file(
+            "src/use.ts",
+            "import * as z from './external';\n\nexport function check() {\n  return z.core.safeParse(1);\n}\n",
+        )
+        .write(
+            "src/core.ts",
+            "export function safeParse(value: unknown) {\n  return value;\n}\n",
+        )
+        .edge_after("function check", "calls", "function safeParse")
+}
+
+/// Upstream #2378: a `$`-named default import binds its module's default
+/// export once the module appears, ahead of another file's namesake.
+pub fn typescript_dollar_import_reaches_an_added_module() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::TypeScript])
+        .file(
+            "src/a/other.ts",
+            "export function $fmt(value: string) {\n  return value + '!';\n}\n",
+        )
+        .file(
+            "src/use.ts",
+            "import $fmt from './fmt';\n\nexport function show(value: string) {\n  return $fmt(value);\n}\n",
+        )
+        .write(
+            "src/fmt.ts",
+            "export default function $fmt(value: string) {\n  return value;\n}\n",
+        )
+        .edge_after("function show", "calls", "function $fmt @src/fmt.ts")
+        .no_edge_after("function show", "calls", "function $fmt @src/a/other.ts")
+}
+
 /// Upstream #2392 (3): a Svelte import links the component file once it appears.
 pub fn svelte_import_of_an_added_component() -> Case {
     Case::new(Change::AddImportTarget, &[Language::Svelte])

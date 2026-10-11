@@ -280,6 +280,14 @@ pub enum ReExport {
         /// Module specifier of the upstream module.
         source: String,
     },
+    /// `export * as ns from 'source'`: only `ns` is exported, the module's
+    /// members through it (upstream #2192).
+    Namespace {
+        /// The namespace's name as exported by THIS file.
+        exported_name: String,
+        /// Module specifier of the upstream module.
+        source: String,
+    },
     /// An explicit local export alias such as `export { original as alias }`.
     LocalAlias {
         /// Name as exported by THIS file.
