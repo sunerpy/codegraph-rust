@@ -33,11 +33,13 @@ mod object_literal;
 mod overloads;
 pub mod path_aliases;
 pub mod pathutil;
+mod python_values;
 pub mod resolver;
 mod rust_lexical;
 pub mod snapshot_context;
 pub mod source_facts;
 pub mod strip_comments;
+mod type_parameters;
 pub mod types;
 pub mod workspace_packages;
 

@@ -360,6 +360,41 @@ pub fn python_call_ignores_a_react_hook_body_edit() -> Case {
         .no_edge_after("function handle", "calls", "function useSession")
 }
 
+/// Upstream #2123: a type parameter the function declares in an edit is
+/// that parameter, never the project class it shares a name with.
+pub fn typescript_type_parameter_added_body_edit() -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript])
+        .file("src/model.ts", "export class T {\n  id = 0;\n}\n")
+        .file(
+            "src/wrap.ts",
+            "import { T } from './model';\n\nexport function wrap(x: T): T {\n  return x;\n}\n",
+        )
+        .write(
+            "src/wrap.ts",
+            "import { T } from './model';\n\nexport function wrap<T>(x: T): T {\n  return x;\n}\n",
+        )
+        .edge_before("function wrap", "references", "class T @src/model.ts")
+        .no_edge_after("function wrap", "references", "class T @src/model.ts")
+}
+
+/// Upstream #2219: a Python name an edit makes the function's own parameter
+/// is that local's value, not the package's function of that name (the
+/// same-file `Recorder.request` makes `request` a value candidate).
+pub fn python_function_value_bound_by_an_added_parameter() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Python])
+        .file("app/api.py", "def request(method, url):\n    return method, url\n")
+        .file(
+            "app/views.py",
+            "class Recorder:\n    def request(self):\n        return None\n\n\ndef view():\n    return handle(request)\n",
+        )
+        .write(
+            "app/views.py",
+            "class Recorder:\n    def request(self):\n        return None\n\n\ndef view(request):\n    return handle(request)\n",
+        )
+        .edge_before("function view", "references", "function request @app/api.py")
+        .no_edge_after("function view", "references", "function request @app/api.py")
+}
+
 /// Upstream #2392 (3): a Go call through an imported package links once the
 /// package appears.
 pub fn go_import_of_an_added_package() -> Case {

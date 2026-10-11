@@ -357,7 +357,7 @@ fn is_scala_type(node: &Node) -> bool {
 
 /// The simple names a Scala type's declarations extend or mix in (upstream
 /// `scalaSupertypesOf`).
-fn scala_supertypes_of(type_name: &str, context: &dyn ResolutionContext) -> Vec<String> {
+pub(crate) fn scala_supertypes_of(type_name: &str, context: &dyn ResolutionContext) -> Vec<String> {
     static CLAUSE: OnceLock<Regex> = OnceLock::new();
     static NAME: OnceLock<Regex> = OnceLock::new();
     let clause_re =

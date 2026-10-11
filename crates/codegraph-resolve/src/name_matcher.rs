@@ -360,7 +360,19 @@ pub(crate) fn is_lexically_reachable(
     reference: &RefView,
     context: &dyn ResolutionContext,
 ) -> bool {
-    if candidate.kind != NodeKind::Function {
+    // A function, or a type (`case class B()` in a test method), declared
+    // inside a function is only in scope in there (upstream #2123).
+    if candidate.kind != NodeKind::Function
+        && !matches!(
+            candidate.kind,
+            NodeKind::Class
+                | NodeKind::Struct
+                | NodeKind::Enum
+                | NodeKind::Interface
+                | NodeKind::Trait
+                | NodeKind::TypeAlias
+        )
+    {
         return true;
     }
     // C and C++ have no nested named functions: a function the graph shows
@@ -1738,6 +1750,17 @@ pub fn match_by_exact_name(
     let candidates: Vec<Arc<Node>> = reachable
         .iter()
         .filter(|n| node_is_eligible_target(reference.reference_kind, n))
+        // A Scala type position (`Arbitrary[B]`) never names a method: an
+        // `implicit def A: Order[A]` shares its name with half of cats' type
+        // parameters (upstream #2123).
+        .filter(|n| {
+            !(reference.language == Language::Scala
+                && reference.reference_kind == EdgeKind::References
+                && reference
+                    .reference_name
+                    .starts_with(|c: char| c.is_ascii_uppercase())
+                && matches!(n.kind, NodeKind::Method | NodeKind::Function))
+        })
         // A receiver-less JS/TS or Go call cannot reach a member of a type: a
         // method (#1714, #1857), nor a property, field or enum case (upstream
         // #2120: mocha's global `it(…)` bound an interface's `it` property). A
@@ -5128,7 +5151,7 @@ pub fn match_function_ref(
         });
     }
 
-    let mut candidates: Vec<Arc<Node>> = context
+    let named: Vec<Arc<Node>> = context
         .get_nodes_by_name_shared(&reference.reference_name)
         .into_iter()
         .filter(|n| {
@@ -5139,7 +5162,33 @@ pub fn match_function_ref(
                 && n.id != reference.from_node_id
         })
         .collect();
+    // A function declared inside another is in scope only in there: httpx's
+    // `self._build_auth(auth)` passes its own parameter, not the `auth` a test
+    // defines inside `test_custom_auth`. Those still count against a lone
+    // cross-file guess below: a name several functions use for themselves is
+    // as likely a local's (upstream #2219).
+    let mut candidates: Vec<Arc<Node>> = named
+        .iter()
+        .filter(|n| is_lexically_reachable(n, reference, context))
+        .cloned()
+        .collect();
     if candidates.is_empty() {
+        return None;
+    }
+    // A Python name the function around it binds (a parameter, an
+    // assignment) is that local's value: httpx's `auth_flow(self, request)`
+    // handing `request` on is not the package's `request()` function. A
+    // pytest fixture is what a test's parameter of its name receives.
+    if reference.language == Language::Python
+        && !candidates
+            .iter()
+            .any(|n| crate::python_values::is_fixture_in_reach(n, &reference.file_path, context))
+        && crate::python_values::is_python_locally_bound(
+            &reference.reference_name,
+            reference,
+            context,
+        )
+    {
         return None;
     }
 
@@ -5209,7 +5258,18 @@ pub fn match_function_ref(
         });
     }
 
-    if candidates.len() == 1 {
+    // Cross-file: only an unambiguous match resolves, or, in Python, the one
+    // in reach of a name the file imports (netbox's `sender=CustomField`
+    // beside a test's own nested `CustomField`).
+    if candidates.len() == 1
+        && (named.len() == 1
+            || (reference.language == Language::Python
+                && crate::python_values::python_imports_name(
+                    &reference.file_path,
+                    &reference.reference_name,
+                    context,
+                )))
+    {
         return Some(ResolvedRef {
             original: reference.clone(),
             target_node_id: candidates[0].id.clone(),

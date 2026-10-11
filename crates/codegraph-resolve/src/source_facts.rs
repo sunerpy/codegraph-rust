@@ -136,6 +136,7 @@ pub struct SourceFacts {
     awaited_raw_names: OnceLock<HashSet<String>>,
     awaited_index: OnceLock<Arc<AwaitedIndex>>,
     rust_use_scopes: OnceLock<crate::rust_lexical::RustUseScopes>,
+    python_from_imports: OnceLock<HashMap<String, String>>,
 }
 
 impl SourceFacts {
@@ -159,6 +160,7 @@ impl SourceFacts {
             awaited_raw_names: OnceLock::new(),
             awaited_index: OnceLock::new(),
             rust_use_scopes: OnceLock::new(),
+            python_from_imports: OnceLock::new(),
         }
     }
 
@@ -338,6 +340,15 @@ impl SourceFacts {
         scan: impl FnOnce(&str) -> HashSet<String>,
     ) -> &HashSet<String> {
         self.awaited_raw_names.get_or_init(|| scan(&self.source))
+    }
+
+    /// What the raw source's `from <module> import <name>` lines bind, name
+    /// to module; `scan` runs once.
+    pub(crate) fn python_from_imports(
+        &self,
+        scan: impl FnOnce(&str) -> HashMap<String, String>,
+    ) -> &HashMap<String, String> {
+        self.python_from_imports.get_or_init(|| scan(&self.source))
     }
 
     /// The awaited-binding index over [`Self::ts_blanked`]; `build` runs once.

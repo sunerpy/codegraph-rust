@@ -834,4 +834,126 @@ mod seams {
             "function build" => calls => "component src/components/QueryFilterBuilder.vue::QueryFilterBuilder"
         );
     }
+    /// Upstream #2123 (`c5ba6807`): a name an enclosing declaration declares
+    /// as a type parameter is that parameter (Scala `def zipWith[A, B, C]`,
+    /// Java `<T extends …> T max(`, TS `wrap<T>`, Dart `first<T>`), a Scala
+    /// def's value parameter is that parameter (`f(fa.head)`), and a type
+    /// declared inside a function is only in scope in there. A bare Scala
+    /// type name reaches another type's member only from inside it, a
+    /// subtype, or a file importing its members; otherwise the type of that
+    /// name in scope is taken (`trait FlatMap`, not `Eval.FlatMap`).
+    #[test]
+    fn pr2123_type_parameters_and_function_local_types_stay_in_scope() {
+        let project = Project::new()
+            .file("src/Inst.scala", "package app\nobject Inst {\n  implicit def A: Int = 1\n}\n")
+            .file(
+                "src/Seqs.scala",
+                "package app\nobject Seqs {\n  def zipWith[A, B, C](fa: List[A], fb: List[B])(f: (A, B) => C): List[C] = ???\n}\n",
+            )
+            .file(
+                "src/Ops.scala",
+                "package app\nobject Ops {\n  def |+|[A](x: A, y: A): A = x\n  def *[B](b: B): B = b\n}\ntrait Heyting[@sp(Int, Long) A] {\n  def and(a: A, b: A): A\n}\nfinal case class FlatMapped(f: Int => Int) {\n  type A = Int\n}\ntrait Laws {\n  type L = Int\n}\nclass MyLaws extends Laws {\n  def check(x: L): Boolean = true\n}\nobject UsesImport {\n  import FlatMapped._\n  def viaImport(x: A): Int = 1\n}\nobject Folds {\n  def foldMap[A](fa: List[A])(f: A => Int)(implicit G: Ordering[Int]): Int = { f(fa.head); G.max(1, 2) }\n}\nobject TraverseLaws {\n  def updatedRef[A, B >: A](fa: List[A], b: B): Option[B] = None\n}\ntrait UnorderedTraverseTests {\n  def unorderedTraverse[\n    A,\n    B,\n    C,\n    X,\n    Y\n  ](implicit\n    ArbXB: Option[X],\n    ArbYB: List[B]\n  ): Unit = ()\n}\n",
+            )
+            .file(
+                "src/Elsewhere.scala",
+                "package app\nobject Elsewhere {\n  def combineAll(xs: List[A]): Int = 1\n  def lift(implicit F: FlatMap): Int = 1\n}\n",
+            )
+            .file("src/FlatMap.scala", "package app\ntrait FlatMap\n")
+            .file("src/Eval.scala", "package app\nobject Eval {\n  final case class FlatMap(x: Int)\n}\n")
+            .file("src/Fns.scala", "package app\nobject Fns {\n  def f(x: Int): Int = x\n}\n")
+            .file(
+                "src/SyntaxSuite.scala",
+                "package app\nclass SyntaxSuite {\n  def testOptionEmpty(): Unit = {\n    case class B()\n    val b: B = B()\n  }\n}\n",
+            )
+            .file("src/T.java", "package app;\npublic class T {}\n")
+            .file("src/Foo.java", "package app;\npublic class Foo {}\n")
+            .file(
+                "src/Util.java",
+                "package app;\nimport java.util.List;\nimport java.util.Map;\npublic class Util {\n  public static <T extends Comparable<T>> T max(List<T> xs) { return null; }\n  public static Map<String, Foo> index(List<Foo> xs) { return null; }\n}\n",
+            )
+            .file("src/wrap.ts", "export class T {}\nexport function wrap<T>(x: T): T { return x; }\n")
+            .file(
+                "src/local.ts",
+                "export function build() {\n  class Local {}\n  return new Local();\n}\n\nexport function other(): Local {\n  return null as any;\n}\n",
+            )
+            .file("lib/first.dart", "const T = 1;\nT first<T>(List<T> xs) => xs.first;\n")
+            .index();
+
+        let local_b = "class SyntaxSuite::testOptionEmpty::B";
+        for owner in [
+            "method Seqs::zipWith",
+            "method Ops::*",
+            "method TraverseLaws::updatedRef",
+            "method UnorderedTraverseTests::unorderedTraverse",
+        ] {
+            assert_no_edge!(project, owner => references => local_b);
+        }
+        assert_no_edge!(project, "method Seqs::zipWith" => references => "method Inst::A");
+        assert_no_edge!(project, "method Elsewhere::combineAll" => references => "method Inst::A");
+        for owner in [
+            "method Ops::|+|",
+            "method Heyting::and",
+            "method Folds::foldMap",
+            "method TraverseLaws::updatedRef",
+        ] {
+            assert_no_edge!(project, owner => references => "type_alias FlatMapped::A");
+        }
+        assert_no_edge!(project, "method Folds::foldMap" => calls => "method Fns::f");
+        assert_edge!(project, "method Elsewhere::lift" => references => "trait FlatMap");
+        assert_no_edge!(project, "method Elsewhere::lift" => references => "class Eval::FlatMap");
+        assert_edge!(project, "method MyLaws::check" => references => "type_alias Laws::L");
+        assert_edge!(project, "method UsesImport::viaImport" => references => "type_alias FlatMapped::A");
+        assert_edge!(project, "method SyntaxSuite::testOptionEmpty" => instantiates => local_b);
+
+        assert_no_edge!(project, "method app::Util::max" => references => "class app::T");
+        assert_edge!(project, "method app::Util::index" => references => "class app::Foo");
+        assert_no_edge!(project, "function wrap" => references => "class T");
+        assert_no_edge!(project, "function first" => references => "constant T");
+        assert_edge!(project, "function build" => instantiates => "class build::Local");
+        assert_no_edge!(project, "function other" => references => "class build::Local");
+    }
+
+    /// Upstream #2219 (`03123335`): a name passed as a value is what is in
+    /// scope where it is written. A function nested in another function is
+    /// reached only from inside it (httpx's `self._build_auth(auth)` passes
+    /// its parameter, not a test's nested `auth`); a Python name the function
+    /// around it binds is that local's (`auth_flow(self, request)` handing
+    /// `request` on is not the package's `request()`); a pytest fixture is a
+    /// test's parameter of its name in its own module or under its
+    /// `conftest.py`. The `_run_both(func)` call half of the upstream test is
+    /// a call, not a value: it lands with Python's bare-call rule (W4-PY-01).
+    #[test]
+    fn pr2219_a_name_passed_as_a_value_is_what_is_in_scope_where_it_is_written() {
+        let project = Project::new()
+            .file(
+                "httpx/_client.py",
+                "class Client:\n    @property\n    def auth(self):\n        return self._auth\n\n    def _build_auth(self, auth):\n        return auth\n\n    def set_auth(self, auth):\n        self._auth = self._build_auth(auth)\n",
+            )
+            .file("httpx/_api.py", "def request(method, url):\n    return method, url\n")
+            .file(
+                "httpx/_auth.py",
+                "class Auth:\n    def auth_flow(self, request):\n        yield request\n\n    def sync_auth_flow(self, request):\n        flow = self.auth_flow(request)\n        return flow\n\n\nclass Recorder:\n    def request(self):\n        return None\n",
+            )
+            .file(
+                "tests/test_auth.py",
+                "def test_custom_auth():\n    def auth(request):\n        return request\n\n    return register(auth)\n\n\ndef test_basic_auth():\n    auth = (\"user\", \"pass\")\n    return register(auth)\n",
+            )
+            .file(
+                "docs/example/test_order.py",
+                "import pytest\n\n\n@pytest.fixture\ndef func():\n    return 1\n",
+            )
+            .file(
+                "tests/test_coverage.py",
+                "import pytest\n\n\ndef _run_both(func):\n    return func()\n\n\n@pytest.fixture(\n    scope=\"module\",\n)\ndef recipe():\n    return {}\n\n\ndef test_recipe(recipe):\n    return use(recipe)\n",
+            )
+            .index();
+
+        let nested = "function test_custom_auth::auth";
+        assert_no_edge!(project, "method Client::_build_auth" => references => nested);
+        assert_no_edge!(project, "method Client::set_auth" => references => nested);
+        assert_no_edge!(project, "function test_basic_auth" => references => nested);
+        assert_edge!(project, "function test_custom_auth" => references => nested);
+        assert_no_edge!(project, "method Auth::sync_auth_flow" => references => "function request");
+        assert_edge!(project, "function test_recipe" => references => "function recipe @tests/test_coverage.py");
+    }
 }

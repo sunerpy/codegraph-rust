@@ -161,7 +161,16 @@ in a test suite (a test source set, a `tests/` / `spec/` / `e2e/` tree, a
 `FooTest.kt` / `test_foo.py` / `foo.test.ts` / `foo_unittest.cc` file): test
 support a project ships (`testing/`, `fakes/`, a `*-test` module) stays in
 reach, and so does a C or C++ file the reference's translation unit
-includes. Pure JS-family alias
+includes. A type name a declaration around the reference declares as a type
+parameter (`class Foo<T>`, `def f[A]`, `<T> T max(`, `template <typename T>`) is
+that parameter, never a project type of its name; a Scala def's value
+parameter is that parameter, and a bare Scala type name reaches another
+type's member only from inside it, a subtype, or a file importing its members
+(otherwise the type of that name in scope is taken). A function or type
+declared inside a function is reached only from inside it, and a Python name
+passed as a value that its function binds (a parameter, an assignment, a
+`for` / `as` target) is that local, unless a pytest fixture of its name is in
+reach (its own module, or a `conftest.py` above it). Pure JS-family alias
 bindings may forward to a unique callable; wrappers and ambiguity stop at the
 binding. A framework-resolved edge carries its own reachability proof and is not
 erased by ordinary source-language visibility (for example Tauri IPC to a

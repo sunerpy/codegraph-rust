@@ -1221,6 +1221,9 @@ pub struct ReferenceResolver {
     /// Same-owner overload sets by method id (upstream #2212), filled on
     /// demand and cleared with the other resolution caches.
     overload_sets: crate::overloads::OverloadSets,
+    /// Declared type and Scala value parameters by declaration id (upstream
+    /// #2123), filled on demand and cleared with the other resolution caches.
+    type_parameters: std::sync::Mutex<crate::type_parameters::TypeParameterMemos>,
     /// `this.<member>` fn-refs whose member wasn't on the enclosing class
     /// itself — retried in the supertype pass once implements/extends edges
     /// exist (`deferredThisMemberRefs`, index.ts:214 / #808). A `Mutex` (not
@@ -1248,6 +1251,7 @@ impl ReferenceResolver {
             macro_visibility: std::sync::Mutex::default(),
             cpp_includers: std::sync::Mutex::default(),
             overload_sets: std::sync::Mutex::default(),
+            type_parameters: std::sync::Mutex::default(),
             deferred_this_member_refs: std::sync::Mutex::new(Vec::new()),
             deferred_chain_refs: std::sync::Mutex::new(Vec::new()),
         }
@@ -1439,6 +1443,10 @@ impl ReferenceResolver {
             .get_mut()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clear();
+        *self
+            .type_parameters
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Default::default();
     }
 
     /// Resolve all unresolved references (`resolveAll`, `index.ts:511-572`).
@@ -1534,6 +1542,15 @@ impl ReferenceResolver {
     ) -> (Option<ResolvedRef>, Option<DeferredIntent>) {
         let (resolved, deferred) = self.resolve_one_pure_inner(reference, context);
         let resolved = self.gate_target_kind(resolved, reference, context);
+        // A name a declaration around the reference declares as a type
+        // parameter (`def f[A]`, `class Foo<T>`) is that parameter, whichever
+        // strategy chose a namesake (upstream #2123).
+        let resolved = crate::type_parameters::gate_type_parameter(
+            resolved,
+            reference,
+            context,
+            &self.type_parameters,
+        );
         let resolved = self.gate_import_locality(resolved, reference, context);
         let resolved = self.gate_c_macro_calls(resolved, reference, context);
         let resolved = self.forward_alias_binding(resolved, reference, context);
