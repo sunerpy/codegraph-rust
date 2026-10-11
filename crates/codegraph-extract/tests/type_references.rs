@@ -3,7 +3,7 @@
 //! methods, and the other type positions each language's own path reads.
 //! Built-in and primitive types name no project symbol and are skipped.
 
-use codegraph_core::types::{EdgeKind, Language};
+use codegraph_core::types::{EdgeKind, Language, NodeKind};
 use codegraph_extract::extract_source;
 
 /// `(from, type)` for every `references` ref in `source`, sorted.
@@ -191,6 +191,79 @@ fn swift_signature_and_composition_types_are_references() {
             ("build", "Out"),
             ("build", "Result"),
             ("build", "Widget"),
+        ])
+    );
+}
+
+/// W2-03d (KEEP-RUST: upstream mints these nodes without reading their
+/// types): a Kotlin property's declared type is a reference from the property.
+/// An extension property's receiver is not its type; a primary-constructor
+/// parameter and a local mint no node, so they reference nothing.
+#[test]
+fn kotlin_property_types_are_references() {
+    let source = "package app\n\nval shared: Repo = Repo()\n\nobject Config {\n    val clock: Clock = Clock()\n    var cache: Cache<Repo>? = null\n}\n\nclass Svc(private val ctor: Ctor) {\n    private val clock: Clock = Clock()\n    val count: Int = 0\n    val Widget.label: String get() = \"x\"\n    fun run() { val local: Local = Local() }\n}\n";
+    assert_eq!(
+        type_refs("src/Svc.kt", source, Language::Kotlin),
+        pairs(&[
+            ("cache", "Cache"),
+            ("cache", "Repo"),
+            ("clock", "Clock"),
+            ("clock", "Clock"),
+            ("shared", "Repo"),
+        ])
+    );
+}
+
+/// W2-03d: a PHP class property is a `field` node, one per
+/// `property_element`, whose name nests as `variable_name → name` (upstream
+/// `extractField`). Its signature is the declared type and `$name`, and its
+/// visibility defaults to `public` as PHP's does.
+#[test]
+fn php_class_properties_are_field_nodes() {
+    let source = "<?php\nnamespace App;\n\nclass Svc {\n    private Logger $logger;\n    public static ?Mailer $mailer = null;\n    var $untyped;\n    public $a, $b;\n}\n";
+    let result = extract_source("src/Svc.php", source, Some(Language::Php));
+    let mut fields: Vec<_> = result
+        .nodes
+        .iter()
+        .filter(|node| node.kind == NodeKind::Field)
+        .map(|node| {
+            (
+                node.name.as_str(),
+                node.start_line,
+                node.signature.as_deref(),
+                node.visibility.as_deref(),
+                node.is_static,
+            )
+        })
+        .collect();
+    fields.sort();
+    assert_eq!(
+        fields,
+        [
+            ("a", 8, Some("$a"), Some("public"), false),
+            ("b", 8, Some("$b"), Some("public"), false),
+            ("logger", 5, Some("Logger $logger"), Some("private"), false),
+            ("mailer", 6, Some("?Mailer $mailer"), Some("public"), true),
+            ("untyped", 7, Some("$untyped"), Some("public"), false),
+        ]
+    );
+}
+
+/// W2-03d (KEEP-RUST: upstream's PHP field branch returns before it reads a
+/// type): a PHP property's declared type is a reference from its field node,
+/// a qualified name by its last segment; a primitive is skipped and an untyped
+/// property references nothing.
+#[test]
+fn php_property_types_are_references() {
+    let source = "<?php\nnamespace App;\n\nclass Svc {\n    private Logger $logger;\n    public static ?Mailer $mailer = null;\n    protected int $count = 0;\n    public Logger|Mailer $either;\n    public readonly \\App\\Models\\Order $order;\n    var $untyped;\n}\n";
+    assert_eq!(
+        type_refs("src/Svc.php", source, Language::Php),
+        pairs(&[
+            ("either", "Logger"),
+            ("either", "Mailer"),
+            ("logger", "Logger"),
+            ("mailer", "Mailer"),
+            ("order", "Order"),
         ])
     );
 }

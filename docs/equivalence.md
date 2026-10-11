@@ -363,6 +363,13 @@ class method with a nullable generic return, and an extension function. The
 `Processor` primary constructor is the negative boundary: the class signature
 stays null and no constructor method is synthesized.
 
+A Kotlin property's declared type is a `References` from the property node
+(W2-03d), which upstream does not read: a deliberate difference (KEEP-RUST,
+OD-8, owner decision 2026-10-11). `Processor`'s `val id: Int` is a constructor
+parameter, which mints no property node, so the fixture is unchanged;
+`kotlin_property_types_are_references` in `type_references.rs` and the sync
+case `kotlin_property_type_of_an_added_class` pin the behavior.
+
 Regenerate it with `scripts/regen-goldens.sh --write kotlin` (the shared recipe in [Regenerating goldens](#regenerating-goldens)).
 
 As with every fixture, only the five text artifacts are byte-compared;
@@ -1150,7 +1157,12 @@ correction shows up as a diff attributable to one change:
 - **`php`**: namespaces with `use` imports, `extends`/`implements`,
   `$this`/`self`/`static`/`parent` calls, calls written after `=>` in an array literal, a
   case-variant call to a global function, and a namespace-qualified class name
-  (`Field\FirstName::make()`).
+  (`Field\FirstName::make()`). It declares no class property, so W2-03d's
+  property `field` nodes (as upstream's `extractField`) and their type
+  references (KEEP-RUST, OD-8: upstream reads no property type) move nothing
+  here; `php_class_properties_are_field_nodes`,
+  `php_property_types_are_references` and the sync case
+  `php_property_type_of_an_added_class` pin them.
 - **`vue`**: a `<script setup>` component calling an imported composable and a
   local function from the template, and an Options API component with `data`,
   `computed`, `methods` and a lifecycle hook.

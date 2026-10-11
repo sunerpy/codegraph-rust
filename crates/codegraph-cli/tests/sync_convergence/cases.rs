@@ -166,6 +166,41 @@ pub fn csharp_parameter_type_of_an_added_class() -> Case {
         .edge_after("method Zoo::Keeper::Feed", "references", "class Zoo::Animal")
 }
 
+/// W2-03d: a Kotlin property's declared type is a reference from the property
+/// to a class that appears later in the same package.
+pub fn kotlin_property_type_of_an_added_class() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Kotlin])
+        .file(
+            "src/zoo/Keeper.kt",
+            "package zoo\n\nclass Keeper {\n    private val animal: Animal? = null\n}\n",
+        )
+        .write("src/zoo/Animal.kt", "package zoo\n\nclass Animal\n")
+        .edge_after(
+            "field zoo::Keeper::animal",
+            "references",
+            "class zoo::Animal",
+        )
+}
+
+/// W2-03d: a PHP property's declared type is a reference from its field to a
+/// class that appears later in the same namespace.
+pub fn php_property_type_of_an_added_class() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Php])
+        .file(
+            "src/Keeper.php",
+            "<?php\nnamespace Zoo;\n\nclass Keeper\n{\n    private ?Animal $animal = null;\n}\n",
+        )
+        .write(
+            "src/Animal.php",
+            "<?php\nnamespace Zoo;\n\nclass Animal\n{\n}\n",
+        )
+        .edge_after(
+            "field Zoo::Keeper::animal",
+            "references",
+            "class Zoo::Animal",
+        )
+}
+
 /// Upstream #2392 notes that C includes already converge.
 pub fn c_include_of_an_added_header() -> Case {
     Case::new(Change::AddImportTarget, &[Language::C])

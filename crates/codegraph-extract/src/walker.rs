@@ -3523,19 +3523,21 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
     /// level or in an `object` / companion object a shared value (`val` a
     /// constant, `var` a variable), in a class a field. A local is none and
     /// stays the default path's. The property's subtree is not walked, as
-    /// before.
+    /// before; its declared type is a reference from it (W2-03d, KEEP-RUST:
+    /// upstream reads no property type).
     fn visit_kotlin_node(&mut self, node: SyntaxNode<'tree>) -> bool {
         if node.kind() != "property_declaration" {
             return false;
         }
-        let Some(name_node) = node
+        let Some(declaration) = node
             .named_children(&mut node.walk())
             .find(|child| child.kind() == "variable_declaration")
-            .and_then(|declaration| {
-                declaration
-                    .named_children(&mut declaration.walk())
-                    .find(|child| child.kind() == "identifier")
-            })
+        else {
+            return false;
+        };
+        let Some(name_node) = declaration
+            .named_children(&mut declaration.walk())
+            .find(|child| child.kind() == "identifier")
         else {
             return false;
         };
@@ -3550,7 +3552,7 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             (KotlinPropertyScope::Shared, true) => NodeKind::Constant,
             (KotlinPropertyScope::Shared, false) => NodeKind::Variable,
         };
-        self.create_node(
+        if let Some(property) = self.create_node(
             kind,
             &node_text(name_node, self.source),
             node,
@@ -3559,7 +3561,11 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
                 visibility: self.spec.get_visibility(node),
                 ..NodeExtra::default()
             },
-        );
+        ) {
+            // The type is written inside the declaration; an extension
+            // property's receiver comes before it and is not its type.
+            self.kotlin_types_among_children(declaration, &property.id);
+        }
         true
     }
 
@@ -3944,18 +3950,29 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             return;
         }
         if declarators.is_empty() && self.spec.language() == Language::Php {
+            // A property's name nests as `property_element → variable_name →
+            // name` (upstream `extractField`). Its declared type is a
+            // reference from the field (W2-03d, KEEP-RUST: upstream's branch
+            // returns before it reads a type).
             for elem in node
                 .named_children(&mut node.walk())
                 .filter(|child| child.kind() == "property_element")
             {
                 let Some(name_node) = elem
                     .named_children(&mut elem.walk())
-                    .find(|child| child.kind() == "name")
+                    .find(|child| child.kind() == "variable_name")
+                    .and_then(|variable| {
+                        variable
+                            .named_children(&mut variable.walk())
+                            .find(|child| child.kind() == "name")
+                    })
                 else {
                     continue;
                 };
                 let name = node_text(name_node, self.source);
-                let signature = property_or_field_signature(node, &format!("${name}"), self.source);
+                let variable = format!("${name}");
+                let signature =
+                    property_or_field_signature(node, &variable, self.source).or(Some(variable));
                 if let Some(field_node) = self.create_node(
                     NodeKind::Field,
                     &name,

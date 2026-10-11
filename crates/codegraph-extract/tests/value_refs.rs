@@ -174,8 +174,8 @@ fn values(path: &str, source: &str, language: Language) -> Vec<(String, String)>
 }
 
 /// PHP: a file-scope `const` and a class `const` are constants, read bare or
-/// through `self::` / `Config::`; a static property is mutable class state
-/// and no target.
+/// through `self::` / `Config::`; a static property is mutable class state, a
+/// field (W2-03d, as upstream's `extractField`) and no target.
 #[test]
 fn php_readers_of_file_and_class_constants() {
     let source = "<?php\nconst APP_VERSION = \"1.0\";\nclass Config {\n  const MAX_ITEMS = 100;\n  const STATUS_NAMES = [\"ok\", \"fail\"];\n  public static $counter = 0;\n  function capped($n) { return $n > self::MAX_ITEMS ? self::MAX_ITEMS : $n; }\n  function label($i) { return Config::STATUS_NAMES[$i]; }\n  function version() { return APP_VERSION; }\n}";
@@ -185,6 +185,7 @@ fn php_readers_of_file_and_class_constants() {
             ("Constant".to_string(), "APP_VERSION".to_string()),
             ("Constant".to_string(), "Config::MAX_ITEMS".to_string()),
             ("Constant".to_string(), "Config::STATUS_NAMES".to_string()),
+            ("Field".to_string(), "Config::counter".to_string()),
         ]
     );
     assert_eq!(
