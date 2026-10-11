@@ -5,15 +5,18 @@
 //! JSX-like template, and optional client `<script>` blocks. Like Vue/Svelte
 //! it has no grammar of its own — frontmatter + scripts delegate to the TS
 //! extractor (offsets remapped), and the template contributes `{fn(...)}` call
-//! refs plus `<Component>` usage refs. The `.astro` file itself is one
-//! `component` node. Astro's framework resolution (`astro:*` imports, the
+//! refs plus `<Component>` usage refs. The `.astro` file has one file node
+//! holding its `component` node (upstream #2268). Astro's framework resolution (`astro:*` imports, the
 //! `Astro` global, `src/pages` routing) is part of the deferred
 //! `FrameworkResolver` layer (see KNOWN_DIFFS) and is NOT ported here.
 
 use codegraph_core::types::{EdgeKind, ExtractionResult, Language};
 use regex::Regex;
 
-use crate::embedded::shared::{component_node, contains_edge, empty_result, unresolved_ref};
+use crate::embedded::shared::{
+    ScriptFold, component_node, contains_edge, empty_result, fold_script_result, sfc_file_node,
+    unresolved_ref,
+};
 
 /// Compiler-provided (`<Fragment>`) or `astro:components`-shipped components,
 /// not user code (astro-extractor.ts:10).
@@ -32,27 +35,44 @@ impl<'a> AstroExtractor<'a> {
     pub fn extract(self) -> ExtractionResult {
         let start = std::time::Instant::now();
         let mut result = empty_result(0);
+        // The file, holding the component the .astro file is (upstream #2268).
+        let file_node = sfc_file_node(self.file_path, self.source, Language::Astro);
         let component = component_node(self.file_path, self.source, Language::Astro, ".astro");
         let component_id = component.id.clone();
+        result
+            .edges
+            .push(contains_edge(&file_node.id, &component_id));
+        result.nodes.push(file_node);
         result.nodes.push(component);
 
         let frontmatter = self.extract_frontmatter();
-        if let Some(fm) = &frontmatter {
-            let delegated = crate::engine::extract_source(
-                self.file_path,
-                &fm.content,
-                Some(Language::TypeScript),
+        let scripts = self.extract_script_blocks();
+        let blocks = frontmatter
+            .iter()
+            .map(|fm| (fm.content.as_str(), fm.start_line))
+            .chain(
+                scripts
+                    .iter()
+                    .map(|block| (block.content.as_str(), block.start_line)),
+            )
+            .collect::<Vec<_>>();
+        for (content, line_offset) in blocks {
+            let delegated =
+                crate::engine::extract_source(self.file_path, content, Some(Language::TypeScript));
+            // Frontmatter runs on every render of the component, and a
+            // `<script>` is the page's own client code: both are the
+            // component's doing.
+            fold_script_result(
+                &mut result,
+                delegated,
+                &ScriptFold {
+                    file_path: self.file_path,
+                    component_id: &component_id,
+                    line_offset,
+                    language: Language::Astro,
+                    per_instance: true,
+                },
             );
-            self.merge_astro_block(&mut result, delegated, &component_id, fm.start_line);
-        }
-
-        for block in self.extract_script_blocks() {
-            let delegated = crate::engine::extract_source(
-                self.file_path,
-                &block.content,
-                Some(Language::TypeScript),
-            );
-            self.merge_astro_block(&mut result, delegated, &component_id, block.start_line);
         }
 
         let covered = self.covered_ranges(frontmatter.as_ref());
@@ -61,44 +81,6 @@ impl<'a> AstroExtractor<'a> {
 
         result.duration_ms += start.elapsed().as_millis() as i64;
         result
-    }
-
-    /// Merge a delegated TS block (frontmatter or `<script>`) into the result.
-    /// Ports `processScriptContent` (astro-extractor.ts:185-235): EVERY
-    /// delegated node is kept (including its `file:` node) with lines offset and
-    /// language set to astro, and each gets an added `component -> node`
-    /// contains edge; delegated edges and refs are kept as-is (only line
-    /// offset), so the TS extraction's own `file -> symbol` / `file -> import`
-    /// edges survive — yielding the upstream double containment.
-    fn merge_astro_block(
-        &self,
-        result: &mut ExtractionResult,
-        mut delegated: ExtractionResult,
-        component_id: &str,
-        line_offset: i64,
-    ) {
-        for mut node in delegated.nodes.drain(..) {
-            node.start_line += line_offset;
-            node.end_line += line_offset;
-            node.language = Language::Astro;
-            let node_id = node.id.clone();
-            result.nodes.push(node);
-            result.edges.push(contains_edge(component_id, &node_id));
-        }
-        for mut edge in delegated.edges.drain(..) {
-            if let Some(line) = edge.line.as_mut() {
-                *line += line_offset;
-            }
-            result.edges.push(edge);
-        }
-        for mut reference in delegated.unresolved_references.drain(..) {
-            reference.line += line_offset;
-            reference.file_path = self.file_path.to_string();
-            reference.language = Language::Astro;
-            result.unresolved_references.push(reference);
-        }
-        result.errors.append(&mut delegated.errors);
-        result.duration_ms += delegated.duration_ms;
     }
 
     /// Frontmatter is the content between the opening `---` fence (the first

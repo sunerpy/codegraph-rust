@@ -403,6 +403,33 @@ pub fn java_static_field_read_body_edit() -> Case {
         )
 }
 
+/// #2268: an Astro frontmatter's top-level call is the component's.
+pub fn astro_frontmatter_call_body_edit() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Astro])
+        .file(
+            "src/lib/posts.ts",
+            "export function getPosts(): string[] {\n  return [];\n}\n\nexport function getDrafts(): string[] {\n  return [];\n}\n",
+        )
+        .file(
+            "src/pages/index.astro",
+            "---\nimport { getPosts, getDrafts } from '../lib/posts';\nconst posts = getPosts();\n---\n<ul>{posts.length}</ul>\n",
+        )
+        .write(
+            "src/pages/index.astro",
+            "---\nimport { getPosts, getDrafts } from '../lib/posts';\nconst posts = getDrafts();\n---\n<ul>{posts.length}</ul>\n",
+        )
+        .edge_before(
+            "component src/pages/index.astro::index",
+            "calls",
+            "function getPosts",
+        )
+        .edge_after(
+            "component src/pages/index.astro::index",
+            "calls",
+            "function getDrafts",
+        )
+}
+
 /// #895: a function's value reference follows the constant its body reads.
 pub fn typescript_value_reader_body_edit() -> Case {
     Case::new(Change::BodyEdit, &[Language::TypeScript])
@@ -876,7 +903,13 @@ pub fn astro_delete_an_imported_module() -> Case {
             "---\nimport { formatDate } from '../lib/date';\nconst today = formatDate(new Date());\n---\n<p>{today}</p>\n",
         )
         .remove("src/lib/date.ts")
-        .edge_before("constant today", "calls", "function formatDate")
+        // The frontmatter runs per render: its top-level constant's
+        // initializer call is the component's (#2268).
+        .edge_before(
+            "component src/pages/index.astro::index",
+            "calls",
+            "function formatDate",
+        )
 }
 
 pub fn lua_delete_a_required_module() -> Case {

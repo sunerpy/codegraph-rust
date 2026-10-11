@@ -126,3 +126,44 @@ fn a_svelte_instance_script_call_is_the_components() {
         ["./setup", "doSetup"]
     );
 }
+
+/// Upstream #2268 applies to Astro too: one file node holds the component,
+/// the component holds what the frontmatter holds at its top level, and the
+/// frontmatter and a client `<script>` run per render, so their top-level
+/// calls are the component's while their imports stay the file's.
+#[test]
+fn an_astro_frontmatter_folds_into_its_component() {
+    let source = "---\nimport Layout from './Layout.astro';\nimport { getPosts } from '../lib/posts';\nconst posts = await getPosts();\nfunction title() {\n  return format(posts);\n}\n---\n<Layout>{title()}</Layout>\n<script>\n  track();\n</script>\n";
+    let result = extract_source("src/pages/index.astro", source, None);
+    let files: Vec<_> = result
+        .nodes
+        .iter()
+        .filter(|n| n.kind == NodeKind::File)
+        .map(|n| (n.id.as_str(), n.start_line))
+        .collect();
+    assert_eq!(files, [("file:src/pages/index.astro", 1)], "one file node");
+    let file = node_id(&result, NodeKind::File, "index.astro");
+    let component = node_id(&result, NodeKind::Component, "index");
+    assert_eq!(parents_of(&result, &component), std::slice::from_ref(&file));
+    let title = node_id(&result, NodeKind::Function, "title");
+    assert_eq!(
+        parents_of(&result, &title),
+        std::slice::from_ref(&component),
+        "one parent each"
+    );
+    assert_eq!(
+        refs_from(&result, &component, EdgeKind::Calls),
+        ["getPosts", "title", "track"]
+    );
+    assert_eq!(refs_from(&result, &title, EdgeKind::Calls), ["format"]);
+    let imports = refs_from(&result, &file, EdgeKind::Imports);
+    for module in ["../lib/posts", "./Layout.astro"] {
+        assert!(imports.iter().any(|name| name == module), "{imports:?}");
+    }
+    for reference in &result.unresolved_references {
+        assert!(
+            result.nodes.iter().any(|n| n.id == reference.from_node_id),
+            "{reference:?} comes from a node of the file"
+        );
+    }
+}

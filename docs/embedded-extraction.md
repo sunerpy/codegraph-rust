@@ -63,6 +63,12 @@ Tree-sitter 0.26 note: `QueryCursor::matches()` returns a `StreamingIterator`, n
 - Svelte 5 runes (`$props`, `$state`, `$derived`, `$effect`, etc.) are compiler built-ins and must be filtered.
 - PascalCase tags become component references; lowercase native tags are skipped.
 
+### Astro
+
+- The `---`-fenced frontmatter and each `<script>` block are TypeScript, delegated to the TypeScript extractor at their file lines.
+- Both fold into the component exactly as Vue's do, with language `astro`: the `.astro` file node holds the component, and since the frontmatter runs on every render and a `<script>` is the page's own client code, both are per-instance, so their top-level calls are the component's while their imports stay with the file node.
+- The template contributes `{fn(...)}` calls and PascalCase component references outside the frontmatter and script ranges; `Fragment`, `Code` and `Debug` are built-ins.
+
 ### Razor / Blazor
 
 - Always creates one component node for `.razor` / `.cshtml`.
@@ -98,7 +104,7 @@ Tree-sitter 0.26 note: `QueryCursor::matches()` returns a `StreamingIterator`, n
 - Keep Vue, Svelte, Razor, Liquid, and MyBatis as custom extractors. Do not wait for full outer-language grammars before shipping useful graph coverage.
 - Reuse one embedded-region abstraction with: `content`, `language`, `content_byte_start`, `line_offset`, and optional `synthetic_wrapper_line_delta`.
 - Prefer byte-offset-to-line remap when the captured content can include leading delimiters/newlines. It avoids the off-by-one ambiguity in line-only formulas.
-- Preserve the merge semantics: embedded symbols keep the parent file path, parent embedded language (`vue`, `svelte`, `razor`, etc.), and receive parent-component/file containment edges; Vue and Svelte fold their scripts as described above.
+- Preserve the merge semantics: embedded symbols keep the parent file path, parent embedded language (`vue`, `svelte`, `razor`, etc.), and receive parent-component/file containment edges; Vue, Svelte and Astro fold their scripts as described above.
 - Template-only references should remain unresolved refs unless the extractor creates explicit nodes for them (Liquid snippets/sections are the notable exception).
 - Rust `regex` has no backreferences; translate regexes such as `</\1>` into explicit alternation or a small scanner.
 - Add fixtures that assert original-file line numbers, not region-local lines, for every delegated extractor.
