@@ -1683,23 +1683,37 @@ impl ReferenceResolver {
         let Some(target) = context.get_node_by_id_shared(&result.target_node_id) else {
             return Some(result);
         };
+        if target.file_path == reference.file_path {
+            return Some(result);
+        }
         // A vendored minified bundle keeps mangled one-letter names, so a name
         // written in another file never means one of them (upstream #2204,
         // in `isVisibleAcrossFiles` beside this rule): healthchecks' `$(…)`,
         // jQuery loaded as a global, went to a helper inside
         // bootstrap-native.min.js. Calls inside a bundle still resolve.
-        if target.file_path != reference.file_path && is_minified_script(&target.file_path, context)
+        if is_minified_script(&target.file_path, context) {
+            return None;
+        }
+        if codegraph_core::file_class::is_test_suite_path(&target.file_path)
+            && !codegraph_core::file_class::is_test_path(&reference.file_path)
+            && !self.is_included_cpp_test_suite(&target, reference, context)
         {
             return None;
         }
-        if target.file_path == reference.file_path
-            || !codegraph_core::file_class::is_test_suite_path(&target.file_path)
-            || codegraph_core::file_class::is_test_path(&reference.file_path)
-            || self.is_included_cpp_test_suite(&target, reference, context)
-        {
-            return Some(result);
+        // A top-level binding an ES module does not export (upstream #2162):
+        // sveltekit's `generate_manifest.js` keeps an unexported `resolve`
+        // that twenty other files' `resolve(…)` calls went to.
+        if !crate::name_matcher::is_name_match_reachable(&target, reference, context) {
+            return None;
         }
-        None
+        // A Svelte component's instance script, or a Vue SFC's `<script
+        // setup>`, is private to the component (upstream #2227):
+        // shadcn-svelte's `<Item.Root>` (a namespace import) went to a
+        // `type Item` one example component declares for itself.
+        if crate::sfc_scripts::is_sfc_private(&target, context) {
+            return None;
+        }
+        Some(result)
     }
 
     /// Whether a C or C++ file named like a test suite is part of `reference`'s
@@ -2121,11 +2135,16 @@ impl ReferenceResolver {
         }
 
         // Strategy 3: name matching (index.ts:723-726), with the name
-        // matcher's self vetoes (upstream #2221, #2223, #2229).
+        // matcher's self vetoes (upstream #2221, #2223, #2229) and the JS/TS
+        // function-local shadow (#2226).
         // A call reaches the overload its arguments fit (upstream #2212,
         // #2213, #2238, #2241), before the test-suite rule judges the target.
-        let name_result = crate::name_matcher::veto_self_target(
-            self.gate_language(match_reference(reference, context), reference, context),
+        let name_result = crate::name_matcher::veto_js_local_shadow(
+            crate::name_matcher::veto_self_target(
+                self.gate_language(match_reference(reference, context), reference, context),
+                reference,
+                context,
+            ),
             reference,
             context,
         )

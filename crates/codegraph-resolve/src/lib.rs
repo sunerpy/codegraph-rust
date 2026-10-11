@@ -39,6 +39,7 @@ pub mod pathutil;
 mod python_values;
 pub mod resolver;
 mod rust_lexical;
+pub mod sfc_scripts;
 pub mod snapshot_context;
 pub mod source_facts;
 pub mod strip_comments;

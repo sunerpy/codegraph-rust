@@ -1380,4 +1380,202 @@ mod js {
         assert_edge!(project, "file:docs/src/routes/+page.svelte" => imports => "file:docs/src/lib/Map.svelte");
         assert_no_edge!(project, "file:docs/src/routes/+page.svelte" => imports => "file:docs/src/lib/router.ts");
     }
+
+    /// The `file:name` of every non-`contains` edge target from the nodes
+    /// `select` picks (upstream's `targetsFrom`).
+    fn targets_from(
+        graph: &Graph,
+        select: impl Fn(&super::support::NodeRow) -> bool,
+    ) -> Vec<String> {
+        let mut targets: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.kind != "contains" && graph.node(&edge.source).is_some_and(&select))
+            .filter_map(|edge| graph.node(&edge.target))
+            .map(|node| format!("{}:{}", node.file_path, node.name))
+            .collect();
+        targets.sort();
+        targets
+    }
+
+    /// Upstream #2162 (`d03e4dbf`): a top-level binding an ES module does not
+    /// export is not reached from another file; every export form still is
+    /// (`export { a as b }`, `export default x`, `export default { a, b }`),
+    /// and so are a function assigned onto a prototype and classic scripts.
+    #[test]
+    fn pr2162_an_unexported_module_binding_is_not_reached_from_another_file() {
+        let project = Project::new()
+            .file("package.json", r#"{"name":"app","type":"module"}"#)
+            .file(
+                "src/manifest.js",
+                "import { join } from 'node:path';\nfunction resolve(event) { return join(event); }\nexport function manifest() { return resolve('x'); }\n",
+            )
+            .file(
+                "src/adapters.js",
+                "import { a } from './a.js';\nfunction getAdapter(name) { return name; }\nexport default { getAdapter };\n",
+            )
+            .file(
+                "src/listed.js",
+                "import { a } from './a.js';\nfunction helper() { return 1; }\nexport { helper };\n",
+            )
+            .file(
+                "src/proto.js",
+                "import { a } from './a.js';\nfunction Params() {}\nconst prototype = Params.prototype;\nprototype.render = function render() { return ''; };\nexport default Params;\n",
+            )
+            .file("src/a.js", "export const a = 1;\n")
+            .file(
+                "src/use.js",
+                "import { helper } from './listed.js';\nimport Params from './proto.js';\nexport async function handle(event) {\n  await resolve(event);\n  getAdapter('xhr');\n  helper();\n  new Params().render();\n}\n",
+            )
+            .file(
+                "src/classic.js",
+                "function legacy() { return 1; }\n",
+            )
+            .file(
+                "src/old.js",
+                "export function old() { return legacy(); }\n",
+            )
+            .index();
+        let graph = project.graph();
+        let from_handle = targets_from(graph, |node| {
+            node.name == "handle" && node.file_path == "src/use.js"
+        });
+        assert!(
+            !from_handle.iter().any(|t| t == "src/manifest.js:resolve"),
+            "{from_handle:?}"
+        );
+        assert!(
+            from_handle
+                .iter()
+                .any(|t| t == "src/adapters.js:getAdapter"),
+            "{from_handle:?}"
+        );
+        assert!(
+            from_handle.iter().any(|t| t == "src/listed.js:helper"),
+            "{from_handle:?}"
+        );
+        assert!(
+            from_handle.iter().any(|t| t == "src/proto.js:render"),
+            "{from_handle:?}"
+        );
+        // A classic script (no import, no export) keeps its globals.
+        let from_old = targets_from(graph, |node| node.name == "old");
+        assert!(
+            from_old.iter().any(|t| t == "src/classic.js:legacy"),
+            "{from_old:?}"
+        );
+        // The module's own call still reaches it.
+        assert_edge!(project, "function manifest" => calls => "function resolve @src/manifest.js");
+    }
+
+    /// Upstream #2227 (`3e6252f3`): what a Svelte instance `<script>` or a Vue
+    /// `<script setup>` declares is the component's own; a type a
+    /// `<script setup>` exports stays importable.
+    #[test]
+    fn pr2227_a_components_instance_script_declarations_are_its_own() {
+        let project = Project::new()
+            .file("package.json", r#"{"name":"docs","private":true}"#)
+            .file(
+                "src/lib/examples/attachment-group.svelte",
+                "<script lang=\"ts\">\n\ttype Item = {\n\t\tname: string;\n\t};\n\tconst items: Item[] = [];\n</script>\n\n<div>{items.length}</div>\n",
+            )
+            .file(
+                "src/lib/examples/item-demo.svelte",
+                "<script lang=\"ts\">\n\timport * as Item from \"$lib/ui/item/index.js\";\n\tlet label: Item = null;\n</script>\n\n<Item.Root>{label}</Item.Root>\n",
+            )
+            .file(
+                "src/components/TabItem.vue",
+                "<script lang=\"ts\" setup>\nimport { computed } from \"vue\";\nconst isActive = computed(() => true);\n</script>\n\n<template><div v-if=\"isActive\" /></template>\n",
+            )
+            .file(
+                "src/extensions/code-block.ts",
+                "import { isActive } from \"@/tiptap/core\";\n\nexport function active(state: unknown) {\n  return isActive(state);\n}\n",
+            )
+            .file(
+                "src/components/CrudTable.vue",
+                "<script setup lang=\"ts\">\nexport interface TableConfig {\n  hideColumns: boolean;\n}\ndefineProps<{ config: TableConfig }>();\n</script>\n\n<template><table /></template>\n",
+            )
+            .file(
+                "src/pages/GroupDataPage.vue",
+                "<script setup lang=\"ts\">\nimport type { TableConfig } from \"~/components/CrudTable.vue\";\nconst config: TableConfig = { hideColumns: false };\n</script>\n\n<template><div>{{ config }}</div></template>\n",
+            )
+            .index();
+        let graph = project.graph();
+        let in_file =
+            |file: &'static str| move |node: &super::support::NodeRow| node.file_path == file;
+        let from_demo = targets_from(graph, in_file("src/lib/examples/item-demo.svelte"));
+        assert!(
+            !from_demo
+                .iter()
+                .any(|t| t == "src/lib/examples/attachment-group.svelte:Item"),
+            "{from_demo:?}"
+        );
+        let from_block = targets_from(graph, in_file("src/extensions/code-block.ts"));
+        assert!(
+            !from_block
+                .iter()
+                .any(|t| t == "src/components/TabItem.vue:isActive"),
+            "{from_block:?}"
+        );
+        let from_page = targets_from(graph, in_file("src/pages/GroupDataPage.vue"));
+        assert!(
+            from_page
+                .iter()
+                .any(|t| t == "src/components/CrudTable.vue:TableConfig"),
+            "{from_page:?}"
+        );
+    }
+
+    /// Upstream #2226 (`83dac15c`): a JS/TS name the calling function binds
+    /// itself (a parameter, or a `var` / `let` / `const` above the reference)
+    /// is that local, never a same-named function declared elsewhere in the
+    /// file; an unbound name and a `const`'s own recursion are left alone, and
+    /// `if (handler) handler()` is no parameter list.
+    #[test]
+    fn pr2226_a_name_the_calling_function_binds_is_its_local() {
+        let project = Project::new()
+            .file(
+                "lodash.js",
+                "function runInContext(context) {\n  var baseCreate = (function() {\n    function object() {}\n    return function(proto) {\n      object.prototype = proto;\n      return new object;\n    };\n  }());\n\n  function baseHas(object, key) {\n    return object != null && hasOwnProperty.call(object, key);\n  }\n\n  function mixin(object, source) {\n    var result = object(this.__wrapped__);\n    return result;\n  }\n\n  function handler() {}\n\n  function run() {\n    if (handler) {\n      handler();\n    }\n    const walk = (node) => (node ? walk(node.next) : null);\n    return walk(context);\n  }\n\n  return { baseCreate, baseHas, mixin, run };\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        let named = |qualified: &'static str| {
+            move |node: &super::support::NodeRow| node.qualified_name == qualified
+        };
+        let qualified_targets = |qualified: &'static str| -> Vec<String> {
+            let mut targets: Vec<String> = graph
+                .edges
+                .iter()
+                .filter(|edge| {
+                    edge.kind != "contains"
+                        && graph.node(&edge.source).is_some_and(named(qualified))
+                })
+                .filter_map(|edge| graph.node(&edge.target))
+                .map(|node| node.qualified_name.clone())
+                .collect();
+            targets.sort();
+            targets
+        };
+        let from_base_has = qualified_targets("runInContext::baseHas");
+        assert!(
+            !from_base_has.iter().any(|t| t == "runInContext::object"),
+            "{from_base_has:?}"
+        );
+        let from_mixin = qualified_targets("runInContext::mixin");
+        assert!(
+            !from_mixin.iter().any(|t| t == "runInContext::object"),
+            "{from_mixin:?}"
+        );
+        let from_run = qualified_targets("runInContext::run");
+        assert!(
+            from_run.iter().any(|t| t == "runInContext::handler"),
+            "{from_run:?}"
+        );
+        let from_walk = qualified_targets("runInContext::run::walk");
+        assert!(
+            from_walk.iter().any(|t| t == "runInContext::run::walk"),
+            "{from_walk:?}"
+        );
+    }
 }

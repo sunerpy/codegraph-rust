@@ -125,6 +125,7 @@ pub struct SourceFacts {
     python_comment_free: OnceLock<(String, LineIndex)>,
     ts_blanked: OnceLock<String>,
     js_sealed_module: OnceLock<bool>,
+    js_module_exports: OnceLock<Option<HashSet<String>>>,
     js_binding_sites: OnceLock<LocalBindingSites>,
     js_local_bindings: Mutex<HashMap<String, bool>>,
     node_decisions: Mutex<HashMap<(&'static str, String), bool>>,
@@ -139,6 +140,7 @@ pub struct SourceFacts {
     python_from_imports: OnceLock<HashMap<String, String>>,
     minified_script: OnceLock<bool>,
     csharp_scopes: OnceLock<Arc<crate::csharp_scopes::CsharpScopes>>,
+    sfc_script_blocks: OnceLock<Vec<crate::sfc_scripts::ScriptBlock>>,
 }
 
 impl SourceFacts {
@@ -151,6 +153,7 @@ impl SourceFacts {
             python_comment_free: OnceLock::new(),
             ts_blanked: OnceLock::new(),
             js_sealed_module: OnceLock::new(),
+            js_module_exports: OnceLock::new(),
             js_binding_sites: OnceLock::new(),
             js_local_bindings: Mutex::new(HashMap::new()),
             node_decisions: Mutex::new(HashMap::new()),
@@ -165,6 +168,7 @@ impl SourceFacts {
             python_from_imports: OnceLock::new(),
             minified_script: OnceLock::new(),
             csharp_scopes: OnceLock::new(),
+            sfc_script_blocks: OnceLock::new(),
         }
     }
 
@@ -253,6 +257,24 @@ impl SourceFacts {
     /// Memoised sealed-module decision for this file; `compute` runs once.
     pub fn js_sealed_module(&self, compute: impl FnOnce(&Self) -> bool) -> bool {
         *self.js_sealed_module.get_or_init(|| compute(self))
+    }
+
+    /// The names this ES module's export lists name, or `None` when it is no
+    /// ES module (upstream #2162); `read` runs once.
+    pub fn js_module_exports(
+        &self,
+        read: impl FnOnce(&Self) -> Option<HashSet<String>>,
+    ) -> Option<&HashSet<String>> {
+        self.js_module_exports.get_or_init(|| read(self)).as_ref()
+    }
+
+    /// A Svelte or Vue component's `<script>` blocks (upstream #2227); `read`
+    /// runs once.
+    pub fn sfc_script_blocks(
+        &self,
+        read: impl FnOnce(&Self) -> Vec<crate::sfc_scripts::ScriptBlock>,
+    ) -> &[crate::sfc_scripts::ScriptBlock] {
+        self.sfc_script_blocks.get_or_init(|| read(self))
     }
 
     /// Memoised "is `name` bound locally in this file" decision; `compute`

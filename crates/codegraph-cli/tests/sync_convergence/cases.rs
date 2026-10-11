@@ -762,6 +762,61 @@ pub fn vue_bare_call_ignores_an_added_interface_property() -> Case {
         .no_edge_after("component src/Labels.vue::Labels", "calls", "ProvidersContext::t")
 }
 
+/// Upstream #2162: an added ES module's unexported top-level function is
+/// reached by its own module's call, never by another file's bare call of
+/// its name, as a fresh index of the edit finds.
+pub fn javascript_unexported_namesake_appears() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::JavaScript])
+        .file("package.json", "{\"name\":\"app\",\"type\":\"module\"}\n")
+        .file(
+            "src/use.js",
+            "export async function handle(event) {\n  await resolve(event);\n}\n",
+        )
+        .write(
+            "src/manifest.js",
+            "import { join } from 'node:path';\nfunction resolve(event) {\n  return join(event);\n}\nexport function manifest() {\n  return resolve('x');\n}\n",
+        )
+        .edge_after("function manifest", "calls", "function resolve")
+        .no_edge_after("function handle", "calls", "function resolve")
+}
+
+/// Upstream #2227: what an added Svelte component's instance script declares
+/// is its own: another file's bare call of the name never reaches it, as a
+/// fresh index of the edit finds.
+pub fn svelte_instance_script_namesake_appears() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Svelte, Language::TypeScript])
+        .file(
+            "src/extensions/code-block.ts",
+            "export function active(state: unknown) {\n  return formatLabel(state);\n}\n",
+        )
+        .write(
+            "src/components/Widget.svelte",
+            "<script lang=\"ts\">\n  function formatLabel(value: unknown) {\n    return String(value);\n  }\n  const label = formatLabel(1);\n</script>\n\n<p>{label}</p>\n",
+        )
+        .edge_after(
+            "component src/components/Widget.svelte::Widget",
+            "calls",
+            "function formatLabel",
+        )
+        .no_edge_after("function active", "calls", "function formatLabel")
+}
+
+/// Upstream #2226: a JS function's parameter shadows a same-named function
+/// added elsewhere in its file: `mixin(object, source)` calling `object(…)`
+/// calls its parameter, as a fresh index of the edit finds.
+pub fn javascript_parameter_shadows_an_added_function() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::JavaScript])
+        .file(
+            "lodash.js",
+            "function runInContext(context) {\n  function mixin(object, source) {\n    var result = object(source);\n    return result;\n  }\n  return { mixin };\n}\n",
+        )
+        .write(
+            "lodash.js",
+            "function runInContext(context) {\n  var baseCreate = (function() {\n    function object() {}\n    return object;\n  }());\n\n  function mixin(object, source) {\n    var result = object(source);\n    return result;\n  }\n  return { baseCreate, mixin };\n}\n",
+        )
+        .no_edge_after("runInContext::mixin", "calls", "runInContext::object")
+}
+
 /// Upstream #2392 (3): a Svelte import links the component file once it appears.
 pub fn svelte_import_of_an_added_component() -> Case {
     Case::new(Change::AddImportTarget, &[Language::Svelte])

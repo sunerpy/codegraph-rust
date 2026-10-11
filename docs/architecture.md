@@ -181,8 +181,16 @@ type's member only from inside it, a subtype, or a file importing its members
 declared inside a function is reached only from inside it, and a Python name
 passed as a value that its function binds (a parameter, an assignment, a
 `for` / `as` target) is that local, unless a pytest fixture of its name is in
-reach (its own module, or a `conftest.py` above it). A name match from another
-file never reaches into a minified script (`*.min.js`, `*-min.js`, a script
+reach (its own module, or a `conftest.py` above it); a JS/TS name the calling
+function binds itself (a parameter, or a `var` / `let` / `const` above the
+reference) is that local, never a same-named function elsewhere in its file.
+A name match from another file never reaches an ES module's top-level binding
+the module does not export (the `export` keyword, an `export { … }` list,
+`export default x` and `export default { … }` export it; classic scripts,
+CommonJS and `.d.ts` files keep their globals), nor a declaration in a Svelte
+instance `<script>` or a Vue `<script setup>` (a `<script module>`, a plain
+Vue `<script>` and a type a `<script setup>` exports stay importable). A name
+match from another file never reaches into a minified script (`*.min.js`, `*-min.js`, a script
 whose text is mostly code on lines of a thousand characters, or a webpack
 build), though what an import names still binds and calls inside the script
 still resolve; a sync that changes such a script re-resolves the references

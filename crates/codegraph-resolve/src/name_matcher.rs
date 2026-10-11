@@ -17,7 +17,7 @@ use crate::types::{
 use codegraph_core::types::{EdgeKind, Language, Node, NodeKind};
 use regex::Regex;
 use std::borrow::Borrow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
 
 /// Ceiling on same-name candidates a proximity-SCORED strategy will rank
@@ -558,9 +558,6 @@ pub(crate) fn is_esm_module_family(language: Language) -> bool {
 /// template literal spelling `import fake from "fake"` is data, not an import.
 /// The decision is memoised per file for the resolution pass.
 fn is_sealed_js_module(file_path: &str, context: &dyn ResolutionContext) -> bool {
-    static HAS_IMPORT: OnceLock<Regex> = OnceLock::new();
-    static HAS_EXPORT: OnceLock<Regex> = OnceLock::new();
-    static HAS_CJS_EXPORT: OnceLock<Regex> = OnceLock::new();
     if context.file_has_exported_node(file_path) {
         return false;
     }
@@ -574,26 +571,167 @@ fn is_sealed_js_module(file_path: &str, context: &dyn ResolutionContext) -> bool
         }
         // CommonJS assignments can execute inside template interpolations,
         // which the blanked view hides, so this exemption reads raw source.
-        let has_cjs_export = HAS_CJS_EXPORT
-            .get_or_init(|| {
-                Regex::new(r"(?-u:\b)module\.exports(?-u:\b)|(?-u:\b)exports\s*[.\[]")
-                    .expect("CommonJS export marker")
-            })
-            .is_match(source);
-        if has_cjs_export {
+        if cjs_export_marker().is_match(source) {
             return false;
         }
         let code = facts.ts_blanked();
-        HAS_IMPORT
-            .get_or_init(|| Regex::new(r#"(?m)^[ \t]*import[\s{*'"]"#).expect("js import marker"))
-            .is_match(code)
-            && !HAS_EXPORT
-                .get_or_init(|| {
-                    Regex::new(r"(?m)^[ \t]*export[\s{*]|^[ \t]*declare\s+global(?-u:\b)")
-                        .expect("js export marker")
-                })
-                .is_match(code)
+        js_import_marker().is_match(code) && !js_export_marker().is_match(code)
     })
+}
+
+/// A line-initial `import` statement (`HAS_IMPORT_STATEMENT`).
+fn js_import_marker() -> &'static Regex {
+    static HAS_IMPORT: OnceLock<Regex> = OnceLock::new();
+    HAS_IMPORT.get_or_init(|| Regex::new(r#"(?m)^[ \t]*import[\s{*'"]"#).expect("js import marker"))
+}
+
+/// A line-initial `export` or `declare global` (`HAS_ESM_EXPORT`).
+fn js_export_marker() -> &'static Regex {
+    static HAS_EXPORT: OnceLock<Regex> = OnceLock::new();
+    HAS_EXPORT.get_or_init(|| {
+        Regex::new(r"(?m)^[ \t]*export[\s{*]|^[ \t]*declare\s+global(?-u:\b)")
+            .expect("js export marker")
+    })
+}
+
+/// `module.exports` or `exports.x` / `exports[…]` (`HAS_CJS_EXPORT`).
+fn cjs_export_marker() -> &'static Regex {
+    static HAS_CJS_EXPORT: OnceLock<Regex> = OnceLock::new();
+    HAS_CJS_EXPORT.get_or_init(|| {
+        Regex::new(r"(?-u:\b)module\.exports(?-u:\b)|(?-u:\b)exports\s*[.\[]")
+            .expect("CommonJS export marker")
+    })
+}
+
+/// Whether `candidate` is a top-level binding of an ES module that the module
+/// does not export (upstream #2162 `isUnexportedModuleBinding`): declared
+/// without `export` and absent from its `export { … }`, `export default x`
+/// and `export default { … }` lists, so no other file can name it. The
+/// sealed-module rule covers files that export nothing; this is the same
+/// boundary per symbol. Classic scripts, CommonJS, `declare global` and
+/// `.d.ts` files, members of a class or namespace (qualified names), and
+/// anything not declared by a statement of its own (an object literal's
+/// member, `proto.x = function x() {}`) are exempt.
+fn is_unexported_module_binding(candidate: &Node, context: &dyn ResolutionContext) -> bool {
+    if candidate.is_exported
+        || !matches!(
+            candidate.kind,
+            NodeKind::Function
+                | NodeKind::Variable
+                | NodeKind::Constant
+                | NodeKind::Class
+                | NodeKind::Interface
+                | NodeKind::TypeAlias
+                | NodeKind::Enum
+                | NodeKind::Component
+        )
+        || candidate.qualified_name.contains("::")
+        || [".d.ts", ".d.cts", ".d.mts"]
+            .iter()
+            .any(|suffix| candidate.file_path.ends_with(suffix))
+    {
+        return false;
+    }
+    let Some(facts) = context.source_facts(&candidate.file_path) else {
+        return false;
+    };
+    let Some(exported) = facts.js_module_exports(read_module_exports) else {
+        return false;
+    };
+    if exported.contains(&candidate.name) {
+        return false;
+    }
+    let Some(line) = usize::try_from(candidate.start_line)
+        .ok()
+        .and_then(|line| line.checked_sub(1))
+        .and_then(|index| facts.raw_line(index))
+    else {
+        return false;
+    };
+    static OWN_EXPORT: OnceLock<Regex> = OnceLock::new();
+    static DECLARATION: OnceLock<Regex> = OnceLock::new();
+    // Its own line says `export` (a node's flag can miss a form).
+    if OWN_EXPORT
+        .get_or_init(|| Regex::new(r"^\s*export(?-u:\b)").expect("export line"))
+        .is_match(line)
+    {
+        return false;
+    }
+    // Only a declaration statement is a module binding: an object literal's
+    // member (a zustand store action `setZipUri: (v) => set(…)`) is reached
+    // through the object, and so is `proto.x = function x() {}`.
+    DECLARATION
+        .get_or_init(|| {
+            Regex::new(
+                r"^\s*(?:declare\s+)?(?:async\s+)?(?:function\*?|const|let|var|(?:abstract\s+)?class|interface|type|enum)\s",
+            )
+            .expect("declaration line")
+        })
+        .is_match(line)
+}
+
+/// The names an ES module's export lists name, or `None` for a file that is
+/// no ES module (no `import` / `export`, CommonJS, or `declare global`).
+fn read_module_exports(facts: &crate::source_facts::SourceFacts) -> Option<HashSet<String>> {
+    static EXPORT_LIST: OnceLock<Regex> = OnceLock::new();
+    static EXPORT_DEFAULT_NAME: OnceLock<Regex> = OnceLock::new();
+    static EXPORT_DEFAULT_OBJECT: OnceLock<Regex> = OnceLock::new();
+    static DECLARE_GLOBAL: OnceLock<Regex> = OnceLock::new();
+    static AS: OnceLock<Regex> = OnceLock::new();
+    static IDENTIFIER: OnceLock<Regex> = OnceLock::new();
+    let source = facts.source();
+    let code = facts.ts_blanked();
+    let module = (js_import_marker().is_match(code) || js_export_marker().is_match(code))
+        && !cjs_export_marker().is_match(source)
+        && !DECLARE_GLOBAL
+            .get_or_init(|| {
+                Regex::new(r"(?-u:\b)declare\s+global(?-u:\b)").expect("declare global")
+            })
+            .is_match(code);
+    if !module {
+        return None;
+    }
+    let mut names = HashSet::new();
+    let export_list = EXPORT_LIST.get_or_init(|| {
+        Regex::new(r"(?m)^[ \t]*export\s+(?:type\s+)?\{([^}]*)\}").expect("export list")
+    });
+    let alias = AS.get_or_init(|| Regex::new(r"\s+as\s+").expect("export alias"));
+    for captures in export_list.captures_iter(source) {
+        for item in captures[1].split(',') {
+            let item = item.trim();
+            let item = item
+                .strip_prefix("type")
+                .filter(|rest| rest.starts_with(char::is_whitespace))
+                .map_or(item, str::trim_start);
+            let local = alias.split(item).next().unwrap_or(item).trim();
+            if !local.is_empty() {
+                names.insert(local.to_string());
+            }
+        }
+    }
+    let export_default_name = EXPORT_DEFAULT_NAME.get_or_init(|| {
+        Regex::new(r"(?m)^[ \t]*export\s+(?:default|=)\s+([A-Za-z_$][0-9A-Za-z_$]*)\s*;?\s*$")
+            .expect("export default name")
+    });
+    for captures in export_default_name.captures_iter(source) {
+        names.insert(captures[1].to_string());
+    }
+    // `export default { getAdapter, adapters: known }` exposes its shorthand
+    // and value names.
+    let export_default_object = EXPORT_DEFAULT_OBJECT.get_or_init(|| {
+        Regex::new(r"(?m)^[ \t]*export\s+default\s+\{([^}]*)\}").expect("export default object")
+    });
+    let identifier = IDENTIFIER
+        .get_or_init(|| Regex::new(r"^\s*([A-Za-z_$][0-9A-Za-z_$]*)\s*$").expect("identifier"));
+    for captures in export_default_object.captures_iter(code) {
+        for item in captures[1].split(',') {
+            let value = item.rsplit(':').next().unwrap_or(item);
+            if let Some(id) = identifier.captures(value) {
+                names.insert(id[1].to_string());
+            }
+        }
+    }
+    Some(names)
 }
 
 /// Post-pipeline visibility gate for JS/TS name targets (`isCrossFileReachable`,
@@ -616,6 +754,20 @@ pub(crate) fn is_js_name_target_visible(
     candidate.file_path == reference.file_path
         || !is_esm_module_family(candidate.language)
         || !is_sealed_js_module(&candidate.file_path, context)
+}
+
+/// The name-match half of upstream's `isCrossFileReachable` (#2162): an ES
+/// module's top-level binding it does not export is no other file's to
+/// name. Import resolution still reaches it through what the module does
+/// export (`UploadApi.localHelper()` through a default-exported object).
+pub(crate) fn is_name_match_reachable(
+    candidate: &Node,
+    reference: &RefView,
+    context: &dyn ResolutionContext,
+) -> bool {
+    candidate.file_path == reference.file_path
+        || !is_esm_module_family(candidate.language)
+        || !is_unexported_module_binding(candidate, context)
 }
 
 /// `^=\s*require\s*\(\s*(['"])[^'"]+\.json\1\s*\)\s*;?\s*$` (upstream), with
@@ -4992,6 +5144,203 @@ fn other_supertype_named(
     })
 }
 
+/// Reference kinds a bare JS/TS local can be: a call, a value (function refs
+/// included), a construction (upstream `JS_LOCAL_REF_KINDS`).
+fn is_js_local_ref_kind(kind: EdgeKind) -> bool {
+    matches!(
+        kind,
+        EdgeKind::Calls | EdgeKind::References | EdgeKind::Instantiates
+    )
+}
+
+/// A name the calling JS/TS function binds itself shadows the file's own
+/// (upstream #2226, in `matchReference`): lodash's `mixin(object, …)` calling
+/// `object(this.__wrapped__)` is its parameter, whichever strategy (fuzzy
+/// included) found a `function object`. A target of another name is what the
+/// local was followed to (`const selected = useStore(s => s.reset);
+/// selected()` is the store's `reset`) and stays.
+pub fn veto_js_local_shadow(
+    result: Option<ResolvedRef>,
+    reference: &RefView,
+    context: &dyn ResolutionContext,
+) -> Option<ResolvedRef> {
+    let result = result?;
+    if !is_js_local_ref_kind(reference.reference_kind) {
+        return Some(result);
+    }
+    let Some(target) = context.get_node_by_id_shared(&result.target_node_id) else {
+        return Some(result);
+    };
+    if target.name == reference.reference_name && is_outside_js_local(&target, reference, context) {
+        return None;
+    }
+    Some(result)
+}
+
+/// Whether `node` lies outside the function that binds the reference's name
+/// itself ([`js_function_local_scope`]; upstream `isOutsideJsLocal`).
+fn is_outside_js_local(node: &Node, reference: &RefView, context: &dyn ResolutionContext) -> bool {
+    // `const indexName = this.dataSource.namingStrategy.indexName(…)`: a
+    // member, whatever the local's name.
+    if reference.reference_kind == EdgeKind::Calls
+        && bare_call_receiver(reference, context).is_some()
+    {
+        return false;
+    }
+    js_function_local_scope(&reference.reference_name, reference, context).is_some_and(
+        |(start, end)| {
+            !(node.file_path == reference.file_path
+                && start <= node.start_line
+                && node.start_line <= end)
+        },
+    )
+}
+
+/// The lines of the JS/TS function a reference sits in when that function
+/// binds the name itself, a parameter or a `var` / `let` / `const` above the
+/// reference (upstream #2226 `jsFunctionLocalScope`). Such a name is the
+/// local, never a same-named function declared elsewhere: every lodash
+/// helper lives inside `runInContext`, so `baseHas(object, key)`'s `object`
+/// reached a `function object() {}` an IIFE declares there. `None` when the
+/// function does not bind it.
+pub(crate) fn js_function_local_scope(
+    name: &str,
+    reference: &RefView,
+    context: &dyn ResolutionContext,
+) -> Option<(i64, i64)> {
+    if !is_js_family(reference.language) || !is_simple_js_identifier(name) {
+        return None;
+    }
+    let function = context.get_node_by_id_shared(&reference.from_node_id)?;
+    if !matches!(function.kind, NodeKind::Function | NodeKind::Method)
+        || function.start_line > reference.line
+        || function.end_line < reference.line
+    {
+        return None;
+    }
+    let facts = context.source_facts(&reference.file_path)?;
+    // Every function that starts on the same line has the same code through
+    // the reference's line, so they share the answer (upstream #2334).
+    let key = format!("{}\0{}\0{name}", function.start_line, reference.line);
+    facts
+        .node_decision("js_code_binds", &key, |facts| {
+            js_code_binds_name(name, &function, reference.line, facts)
+        })
+        .then_some((function.start_line, function.end_line))
+}
+
+/// Whether `function`'s code from its first line through `line` declares
+/// `name` with `var` / `let` / `const` or names it in a parameter list
+/// (upstream `jsCodeBindsName`), comments and strings blanked.
+fn js_code_binds_name(name: &str, function: &Node, line: i64, facts: &SourceFacts) -> bool {
+    let Some(start) = usize::try_from(function.start_line)
+        .ok()
+        .and_then(|line| line.checked_sub(1))
+    else {
+        return false;
+    };
+    let through = usize::try_from(line.min(function.end_line))
+        .unwrap_or(0)
+        .min(facts.line_count());
+    if start >= through {
+        return false;
+    }
+    let code = crate::strip_comments::strip_comments_for_regex(
+        &facts.join_lines(start, through, "\n"),
+        crate::strip_comments::CommentLang::JavaScript,
+    );
+    let Some(patterns) = js_local_patterns(name) else {
+        return false;
+    };
+    // A plain declaration. Destructuring re-binds what a call returns under
+    // the same name (`const { t } = useI18n()`), which is the same-named
+    // function more often than not, so `const a, …` / `[a]` / `{ a }` forms
+    // (`(?!\s*[,\]}])` upstream) do not count.
+    let declared = patterns.declared.find_iter(&code).any(|found| {
+        !code[found.end()..]
+            .trim_start()
+            .starts_with([',', ']', '}'])
+    });
+    // A parameter list, never a control-flow head (`if (openMarkerClose) {`):
+    // tried at each `(` not preceded by `if` / `while` / `for` / `switch` /
+    // `with` (upstream's `(?=\()(?<!…)` lookbehind).
+    declared
+        || code.match_indices('(').any(|(at, _)| {
+            !follows_control_keyword(&code[..at]) && patterns.parameter.is_match(&code[at..])
+        })
+}
+
+/// Whether `before` ends, past trailing whitespace, with `if`, `while`,
+/// `for`, `switch` or `with` as a whole word.
+fn follows_control_keyword(before: &str) -> bool {
+    let before = before.trim_end();
+    ["if", "while", "for", "switch", "with"]
+        .iter()
+        .any(|keyword| {
+            before.strip_suffix(keyword).is_some_and(|head| {
+                !head
+                    .bytes()
+                    .next_back()
+                    .is_some_and(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+            })
+        })
+}
+
+/// [`js_code_binds_name`]'s patterns for one plain identifier.
+struct JsLocalPatterns {
+    declared: Regex,
+    /// [`LocalBindingPatterns`]' parameter form, its return type kept to one
+    /// line (`(?::[^=;{}()\n]*)?`), so a ternary's `: data.slice()` below
+    /// `filter(canRowExpand)` is no return type.
+    parameter: Regex,
+}
+
+/// Patterns by name, cached like [`local_binding_patterns`].
+fn js_local_patterns(name: &str) -> Option<Arc<JsLocalPatterns>> {
+    const CAP: usize = 1024;
+    type PatternCache = (
+        HashMap<String, Option<Arc<JsLocalPatterns>>>,
+        std::collections::VecDeque<String>,
+    );
+    static CACHE: OnceLock<Mutex<PatternCache>> = OnceLock::new();
+    let cache =
+        CACHE.get_or_init(|| Mutex::new((HashMap::new(), std::collections::VecDeque::new())));
+    if let Some(patterns) = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .0
+        .get(name)
+    {
+        return patterns.clone();
+    }
+    let n = regex::escape(name);
+    let declared = Regex::new(&format!(r"(?-u:\b)(?:const|let|var)\s+{n}(?-u:\b)")).ok();
+    let parameter = Regex::new(&format!(
+        r"^\(\s*(?:(?:\.\.\.)?[0-9A-Za-z_$]+(?:\s*(?:\?\s*)?:[^,()]+|\s*=[^,()]+|\s*),\s*)*{n}(?-u:\b)(?:\s*\??\s*:[^,()]*)?(?:\s*=[^,()]*)?(?:\s*,\s*[^()]*)?\)\s*(?::[^=;{{}}()\n]*)?(?:=>|\{{)"
+    ))
+    .ok();
+    let patterns = declared.zip(parameter).map(|(declared, parameter)| {
+        Arc::new(JsLocalPatterns {
+            declared,
+            parameter,
+        })
+    });
+    let mut guard = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (map, order) = &mut *guard;
+    if !map.contains_key(name) {
+        if map.len() >= CAP
+            && let Some(oldest) = order.pop_front()
+        {
+            map.remove(&oldest);
+        }
+        map.insert(name.to_string(), patterns.clone());
+        order.push_back(name.to_string());
+    }
+    patterns
+}
+
 /// The name matcher's self vetoes (upstream `matchReference`): a result that
 /// lands on the reference's own node is the caller only when nothing rules it
 /// out. A call written on another object is not (#2221, #2223); a type never
@@ -5299,6 +5648,18 @@ pub fn match_function_ref(
     {
         return None;
     }
+    // Likewise a JS/TS parameter or local: lodash's `baseHas(object, key)`
+    // passes its own `object` (upstream #2226).
+    if let Some((start, end)) =
+        js_function_local_scope(&reference.reference_name, reference, context)
+    {
+        candidates.retain(|n| {
+            n.file_path == reference.file_path && start <= n.start_line && n.start_line <= end
+        });
+        if candidates.is_empty() {
+            return None;
+        }
+    }
 
     // Swift implicit-self: a bare identifier names a METHOD only of the
     // ENCLOSING type; a same-named method on another class is a parameter
@@ -5386,6 +5747,55 @@ pub fn match_function_ref(
         });
     }
     None
+}
+
+#[cfg(test)]
+mod js_module_tests {
+    use std::sync::Arc;
+
+    use super::{follows_control_keyword, read_module_exports};
+    use crate::source_facts::SourceFacts;
+
+    fn exports(source: &str) -> Option<Vec<String>> {
+        read_module_exports(&SourceFacts::new(Arc::from(source))).map(|names| {
+            let mut names: Vec<String> = names.into_iter().collect();
+            names.sort();
+            names
+        })
+    }
+
+    #[test]
+    fn an_es_modules_export_lists_name_its_exported_bindings() {
+        let source = "import { a } from './a.js';\nfunction one() {}\nfunction two() {}\nexport { one, two as second, type Shape };\nexport default three;\nexport default { four, five: six, 'seven': eight };\n";
+        assert_eq!(
+            exports(source).unwrap(),
+            ["Shape", "eight", "four", "one", "six", "three", "two"]
+        );
+    }
+
+    #[test]
+    fn classic_scripts_commonjs_and_ambient_globals_are_no_es_modules() {
+        assert_eq!(exports("function legacy() {}\n"), None);
+        assert_eq!(
+            exports("import x from 'x';\nmodule.exports = { x };\n"),
+            None
+        );
+        assert_eq!(
+            exports("export {};\ndeclare global { interface Window { a: 1 } }\n"),
+            None
+        );
+        assert_eq!(exports("export const a = 1;\n"), Some(Vec::new()));
+    }
+
+    #[test]
+    fn control_flow_heads_are_no_parameter_lists() {
+        assert!(follows_control_keyword("    if "));
+        assert!(follows_control_keyword("x = 1; while"));
+        assert!(follows_control_keyword("for"));
+        assert!(!follows_control_keyword("elif"));
+        assert!(!follows_control_keyword("function handler"));
+        assert!(!follows_control_keyword(""));
+    }
 }
 
 #[cfg(test)]
