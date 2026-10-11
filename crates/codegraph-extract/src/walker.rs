@@ -3226,6 +3226,13 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
                 continue;
             };
             if name_node.kind() == "object_pattern" || name_node.kind() == "array_pattern" {
+                // A pattern declares no symbol of its own, but its initializer
+                // (and any default value in the pattern) still runs: walk the
+                // declarator the way a function body walks it, with the
+                // enclosing scope on the stack, the file for module code, which
+                // a `<script setup>` block hands to its component (upstream
+                // #2357: `const { data } = useFetch()` recorded no call).
+                self.visit_function_body(child);
                 continue;
             }
             let value_node = child_by_field(child, "value");

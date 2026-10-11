@@ -37,6 +37,18 @@
     "target": "function:ebed3eb94b336abcd372c60a4dd346ad"
   },
   {
+    "col": 2,
+    "kind": "calls",
+    "line": 15,
+    "metadata": {
+      "confidence": 0.85,
+      "resolvedBy": "instance-method"
+    },
+    "provenance": null,
+    "source": "function:9bdc9cd1f3fedac8bed880a1d4210b7a",
+    "target": "function:ebed3eb94b336abcd372c60a4dd346ad"
+  },
+  {
     "col": 20,
     "kind": "calls",
     "line": 20,
@@ -47,6 +59,18 @@
     "provenance": null,
     "source": "file:src/components/Counter.vue",
     "target": "function:4969a1ad19a6bf73e764e687c6323329"
+  },
+  {
+    "col": 29,
+    "kind": "calls",
+    "line": 12,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "component:bf4932bbbd9ae2d8b66cf6b90d96d83a",
+    "target": "function:c44eb90155d41a4c58621579fa89e878"
   },
   {
     "col": 3,

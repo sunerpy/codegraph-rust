@@ -1578,4 +1578,89 @@ mod js {
             "{from_walk:?}"
         );
     }
+
+    /// Upstream #2163 (`cf449fda`): a bare call through a name destructured
+    /// from a call's result reaches the function the callee returns under
+    /// that key: one declared in the callee's body, else a module-level one
+    /// it returns. A later declaration of the name at the call's scope
+    /// shadows the binding.
+    #[test]
+    fn pr2163_a_name_destructured_from_a_call_reaches_what_the_callee_returns() {
+        let project = Project::new()
+            .file("package.json", r#"{"name":"app","dependencies":{"vue":"^3"}}"#)
+            .file(
+                "src/composables/use-default-activity.ts",
+                "function getDefaultActivityRoute(key?: string): string {\n  return key ?? '/';\n}\nexport default function useDefaultActivity() {\n  return { getDefaultActivityRoute };\n}\n",
+            )
+            .file(
+                "src/hooks/useAuth.ts",
+                "export function useAuth() {\n  function login(user: string) {\n    return user;\n  }\n  const logout = () => null;\n  return { login, signOut: logout };\n}\n",
+            )
+            .file(
+                "src/pages/index.ts",
+                "import useDefaultActivity from '../composables/use-default-activity';\nimport { useAuth } from '../hooks/useAuth';\nexport function go() {\n  const { getDefaultActivityRoute } = useDefaultActivity();\n  const { login, signOut: leave } = useAuth();\n  login('ada');\n  leave();\n  return getDefaultActivityRoute('x');\n}\nexport function shadowed() {\n  const { login } = useAuth();\n  {\n    const login = (name: string) => name;\n    return login('bob');\n  }\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        let from_go = targets_from(graph, |node| node.name == "go");
+        assert!(
+            from_go
+                .iter()
+                .any(|t| t == "src/composables/use-default-activity.ts:getDefaultActivityRoute"),
+            "{from_go:?}"
+        );
+        assert!(
+            from_go.iter().any(|t| t == "src/hooks/useAuth.ts:login"),
+            "{from_go:?}"
+        );
+        let from_shadowed = targets_from(graph, |node| node.name == "shadowed");
+        assert!(
+            !from_shadowed
+                .iter()
+                .any(|t| t == "src/hooks/useAuth.ts:login"),
+            "{from_shadowed:?}"
+        );
+    }
+
+    /// Upstream #2357 (`8998697f`) (a): a destructuring declaration at module
+    /// or `<script setup>` scope mints no symbol, yet its initializer runs:
+    /// `const { a } = useFoo(1)` calls `useFoo` from the file, or from the
+    /// component a `<script setup>` folds into.
+    #[test]
+    fn pr2357_module_scope_destructuring_calls_its_initializer() {
+        let project = Project::new()
+            .file("package.json", r#"{"name":"app","dependencies":{"vue":"^3"}}"#)
+            .file(
+                "src/composables/useFoo.ts",
+                "export function useFoo(n: number) {\n  return { a: n };\n}\n",
+            )
+            .file(
+                "src/app.ts",
+                "import { useFoo } from './composables/useFoo';\nconst { a } = useFoo(1);\nexport const value = a;\n",
+            )
+            .file(
+                "src/components/Panel.vue",
+                "<script setup lang=\"ts\">\nimport { useFoo } from '../composables/useFoo';\nconst { a } = useFoo(2);\n</script>\n<template><p>{{ a }}</p></template>\n",
+            )
+            .index();
+        assert_edge!(project, "file:src/app.ts" => calls => "function useFoo");
+        assert_edge!(project, "component src/components/Panel.vue::Panel" => calls => "function useFoo");
+    }
+
+    /// Upstream #2357 (d): a file's own function shadows a Nuxt auto-import
+    /// of its name: elk's lists page calls its own `clearError(true)`, not
+    /// Nuxt's, and the call is no edge from the caller to itself.
+    #[test]
+    fn pr2357_a_files_own_function_shadows_a_nuxt_auto_import() {
+        let project = Project::new()
+            .file("package.json", r#"{"name":"app","dependencies":{"nuxt":"^3","vue":"^3"}}"#)
+            .file("nuxt.config.ts", "export default defineNuxtConfig({});\n")
+            .file(
+                "pages/lists.vue",
+                "<script setup lang=\"ts\">\nfunction clearError(reset: boolean) {\n  return reset;\n}\nfunction retry() {\n  return clearError(true);\n}\n</script>\n<template><button @click=\"retry\">retry</button></template>\n",
+            )
+            .index();
+        assert_edge!(project, "function retry" => calls => "function clearError @pages/lists.vue");
+        assert_no_edge!(project, "function retry" => calls => "function retry");
+    }
 }

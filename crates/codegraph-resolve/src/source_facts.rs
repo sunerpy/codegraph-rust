@@ -141,6 +141,7 @@ pub struct SourceFacts {
     minified_script: OnceLock<bool>,
     csharp_scopes: OnceLock<Arc<crate::csharp_scopes::CsharpScopes>>,
     sfc_script_blocks: OnceLock<Vec<crate::sfc_scripts::ScriptBlock>>,
+    js_destructured_calls: OnceLock<Option<crate::destructured_calls::DestructuredFile>>,
 }
 
 impl SourceFacts {
@@ -169,6 +170,7 @@ impl SourceFacts {
             minified_script: OnceLock::new(),
             csharp_scopes: OnceLock::new(),
             sfc_script_blocks: OnceLock::new(),
+            js_destructured_calls: OnceLock::new(),
         }
     }
 
@@ -266,6 +268,17 @@ impl SourceFacts {
         read: impl FnOnce(&Self) -> Option<HashSet<String>>,
     ) -> Option<&HashSet<String>> {
         self.js_module_exports.get_or_init(|| read(self)).as_ref()
+    }
+
+    /// This file's `const { … } = f(…)` statements, or `None` when it has none
+    /// (upstream #2163); `read` runs once.
+    pub fn js_destructured_calls(
+        &self,
+        read: impl FnOnce(&Self) -> Option<crate::destructured_calls::DestructuredFile>,
+    ) -> Option<&crate::destructured_calls::DestructuredFile> {
+        self.js_destructured_calls
+            .get_or_init(|| read(self))
+            .as_ref()
     }
 
     /// A Svelte or Vue component's `<script>` blocks (upstream #2227); `read`

@@ -183,7 +183,9 @@ passed as a value that its function binds (a parameter, an assignment, a
 `for` / `as` target) is that local, unless a pytest fixture of its name is in
 reach (its own module, or a `conftest.py` above it); a JS/TS name the calling
 function binds itself (a parameter, or a `var` / `let` / `const` above the
-reference) is that local, never a same-named function elsewhere in its file.
+reference) is that local, never a same-named function elsewhere in its file,
+and a name destructured from a call's result (`const { login } = useAuth()`)
+is the function the callee returns under that key.
 A name match from another file never reaches an ES module's top-level binding
 the module does not export (the `export` keyword, an `export { … }` list,
 `export default x` and `export default { … }` export it; classic scripts,

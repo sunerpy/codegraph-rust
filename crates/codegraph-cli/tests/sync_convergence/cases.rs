@@ -817,6 +817,70 @@ pub fn javascript_parameter_shadows_an_added_function() -> Case {
         .no_edge_after("runInContext::mixin", "calls", "runInContext::object")
 }
 
+/// Upstream #2163: a call through a name destructured from a composable's
+/// result reaches the function the composable returns once its module
+/// appears, as a fresh index of the edit finds.
+pub fn typescript_destructured_composable_call_reaches_an_added_module() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::TypeScript])
+        .file(
+            "src/pages/index.ts",
+            "import { useAuth } from '../hooks/useAuth';\nexport function go() {\n  const { login } = useAuth();\n  return login('ada');\n}\n",
+        )
+        .write(
+            "src/hooks/useAuth.ts",
+            "export function useAuth() {\n  function login(user: string) {\n    return user;\n  }\n  return { login };\n}\n",
+        )
+        .edge_after("function go", "calls", "function useAuth::login")
+}
+
+/// Upstream #2357 (a): a module-scope destructuring declaration's initializer
+/// call is the file's, and an edit to it moves the edge.
+pub fn typescript_module_destructuring_call_body_edit() -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript])
+        .file(
+            "src/composables.ts",
+            "export function useFoo(n: number) {\n  return { a: n };\n}\n\nexport function useBar(n: number) {\n  return { a: n };\n}\n",
+        )
+        .file(
+            "src/app.ts",
+            "import { useFoo, useBar } from './composables';\nconst { a } = useFoo(1);\nexport const value = a;\n",
+        )
+        .write(
+            "src/app.ts",
+            "import { useFoo, useBar } from './composables';\nconst { a } = useBar(1);\nexport const value = a;\n",
+        )
+        .edge_before("file:src/app.ts", "calls", "function useFoo")
+        .edge_after("file:src/app.ts", "calls", "function useBar")
+}
+
+/// Upstream #2357 (d): a Vue page's own function, once added, shadows the
+/// Nuxt auto-import of its name: the call that was the auto-import's (an
+/// edge from the caller to itself) reaches the page's function, as a fresh
+/// index of the edit finds.
+pub fn vue_own_function_shadows_a_nuxt_auto_import() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Vue, Language::TypeScript])
+        .file(
+            "package.json",
+            "{\"name\":\"app\",\"dependencies\":{\"nuxt\":\"^3\",\"vue\":\"^3\"}}\n",
+        )
+        .file("nuxt.config.ts", "export default defineNuxtConfig({});\n")
+        .file(
+            "utils/errors.ts",
+            "export function clearError(reset: boolean) {\n  return reset;\n}\n",
+        )
+        .file(
+            "pages/lists.vue",
+            "<script setup lang=\"ts\">\nfunction retry() {\n  return clearError(true);\n}\n</script>\n<template><button @click=\"retry\">retry</button></template>\n",
+        )
+        .write(
+            "pages/lists.vue",
+            "<script setup lang=\"ts\">\nfunction retry() {\n  return clearError(true);\n}\nfunction clearError(reset: boolean) {\n  return reset;\n}\n</script>\n<template><button @click=\"retry\">retry</button></template>\n",
+        )
+        .edge_before("function retry", "calls", "function retry")
+        .edge_after("function retry", "calls", "function clearError @pages/lists.vue")
+        .no_edge_after("function retry", "calls", "function retry")
+}
+
 /// Upstream #2392 (3): a Svelte import links the component file once it appears.
 pub fn svelte_import_of_an_added_component() -> Case {
     Case::new(Change::AddImportTarget, &[Language::Svelte])

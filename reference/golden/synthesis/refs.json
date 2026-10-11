@@ -142,6 +142,16 @@
   {
     "candidates": null,
     "col": 25,
+    "file_path": "js/src/events.js",
+    "from_node_id": "file:js/src/events.js",
+    "language": "javascript",
+    "line": 1,
+    "reference_kind": "calls",
+    "reference_name": "require"
+  },
+  {
+    "candidates": null,
+    "col": 25,
     "file_path": "js/src/store.ts",
     "from_node_id": "constant:4b684f1aedba2724eae145b1dea95daa",
     "language": "typescript",

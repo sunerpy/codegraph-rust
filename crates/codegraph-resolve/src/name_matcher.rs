@@ -717,14 +717,19 @@ fn read_module_exports(facts: &crate::source_facts::SourceFacts) -> Option<HashS
         names.insert(captures[1].to_string());
     }
     // `export default { getAdapter, adapters: known }` exposes its shorthand
-    // and value names.
+    // and value names; so does a `return { getDefaultActivityRoute, … }` (a
+    // composable hands the function out through its result, upstream #2163).
     let export_default_object = EXPORT_DEFAULT_OBJECT.get_or_init(|| {
-        Regex::new(r"(?m)^[ \t]*export\s+default\s+\{([^}]*)\}").expect("export default object")
+        Regex::new(r"(?m)^[ \t]*export\s+default\s+\{([^}]*)\}|(?-u:\b)return\s*\{([^{}]*)\}")
+            .expect("export default object")
     });
     let identifier = IDENTIFIER
         .get_or_init(|| Regex::new(r"^\s*([A-Za-z_$][0-9A-Za-z_$]*)\s*$").expect("identifier"));
     for captures in export_default_object.captures_iter(code) {
-        for item in captures[1].split(',') {
+        let Some(items) = captures.get(1).or_else(|| captures.get(2)) else {
+            continue;
+        };
+        for item in items.as_str().split(',') {
             let value = item.rsplit(':').next().unwrap_or(item);
             if let Some(id) = identifier.captures(value) {
                 names.insert(id[1].to_string());
@@ -1944,6 +1949,14 @@ pub fn match_by_exact_name(
     {
         return Some(action);
     }
+    // A name destructured from a call's result is what the callee returns
+    // under that key (upstream #2163).
+    if bare_js
+        && let Some(returned) =
+            crate::destructured_calls::match_destructured_call_result(reference, context)
+    {
+        return Some(returned);
+    }
     // `import { useQuery } from '@tanstack/react-query'`, a CommonJS
     // `require('supertest')`: the bare call means the package's, and no
     // same-named project symbol (upstream #2120).
@@ -2223,7 +2236,7 @@ pub(crate) fn range_within(inner: &Node, outer: &Node) -> bool {
     true
 }
 
-fn same_range(left: &Node, right: &Node) -> bool {
+pub(crate) fn same_range(left: &Node, right: &Node) -> bool {
     left.start_line == right.start_line
         && left.start_column == right.start_column
         && left.end_line == right.end_line

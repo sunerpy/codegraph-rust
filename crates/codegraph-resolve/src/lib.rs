@@ -24,6 +24,7 @@ pub mod context;
 mod cpp_includers;
 mod csharp_extensions;
 mod csharp_scopes;
+pub mod destructured_calls;
 pub mod framework; // the FrameworkResolver extension point
 pub mod frameworks; // concrete react/vue/nestjs FrameworkResolvers
 pub mod import_resolver;

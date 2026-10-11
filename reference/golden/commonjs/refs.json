@@ -91,6 +91,26 @@
   },
   {
     "candidates": null,
+    "col": 23,
+    "file_path": "test/app.test.js",
+    "from_node_id": "file:test/app.test.js",
+    "language": "javascript",
+    "line": 5,
+    "reference_kind": "calls",
+    "reference_name": "require"
+  },
+  {
+    "candidates": null,
+    "col": 29,
+    "file_path": "lib/app.js",
+    "from_node_id": "file:lib/app.js",
+    "language": "javascript",
+    "line": 3,
+    "reference_kind": "calls",
+    "reference_name": "require"
+  },
+  {
+    "candidates": null,
     "col": 4,
     "file_path": "test/app.test.js",
     "from_node_id": "file:test/app.test.js",

@@ -341,3 +341,77 @@ function helper() {}
     values.sort_unstable();
     assert_eq!(values, vec!["handleApprove", "handleRetake", "helper"]);
 }
+
+/// Upstream #2357 (#2340): a destructuring declaration at module scope mints
+/// no symbol, yet its initializer and the defaults in its pattern run, so
+/// their calls are the file's; inside a function they stay the function's.
+#[test]
+fn module_scope_destructuring_records_its_initializer_calls() {
+    let code = [
+        "const { a } = useFoo(1)",
+        "let [b, c] = pair()",
+        "var { d: { e } } = nested()",
+        "const { f = fallback() } = withDefault()",
+        "const [g = other(), ...rest] = list()",
+        "export const { h } = exported()",
+        "const { i } = await load(() => inArrow())",
+        "export function probe() { const { j } = inner(); return j }",
+        "",
+    ]
+    .join("\n");
+    for (file, language) in [
+        ("app.ts", Language::TypeScript),
+        ("app.tsx", Language::Tsx),
+        ("app.js", Language::JavaScript),
+        ("app.jsx", Language::Jsx),
+    ] {
+        let result = extract(file, &code, language);
+        let kind_of = |id: &str| {
+            result
+                .nodes
+                .iter()
+                .find(|node| node.id == id)
+                .map_or("?", |node| node.kind.as_str())
+        };
+        let mut calls: Vec<String> = result
+            .unresolved_references
+            .iter()
+            .filter(|reference| reference.reference_kind == EdgeKind::Calls)
+            .map(|reference| {
+                format!(
+                    "{}:{}@{}",
+                    kind_of(&reference.from_node_id),
+                    reference.reference_name,
+                    reference.line
+                )
+            })
+            .collect();
+        calls.sort();
+        assert_eq!(
+            calls,
+            [
+                "file:exported@6",
+                "file:fallback@4",
+                "file:inArrow@7",
+                "file:list@5",
+                "file:load@7",
+                "file:nested@3",
+                "file:other@5",
+                "file:pair@2",
+                "file:useFoo@1",
+                "file:withDefault@4",
+                "function:inner@8",
+            ],
+            "{file}"
+        );
+        // Still no symbol for a destructured binding.
+        assert!(
+            !result
+                .nodes
+                .iter()
+                .any(|node| matches!(node.kind, NodeKind::Constant | NodeKind::Variable)),
+            "{file}: {:?}",
+            result.nodes
+        );
+    }
+}
