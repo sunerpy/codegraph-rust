@@ -58,13 +58,15 @@ impl Arity {
 
 /// One overload's declared parameters: its arity, whether it is a C#
 /// extension method (a `this` first parameter), the parameters' text, and
-/// the type parameters a C# extension method declares (`Open<T>`).
+/// the type parameters and `where` clauses a C# extension method declares
+/// (`Open<T>(…) where T : struct`).
 #[derive(Debug, Clone)]
 struct Overload {
     arity: Arity,
     extension: bool,
     params: Vec<String>,
     type_params: Vec<String>,
+    constraints: String,
 }
 
 /// A method's same-owner overloads in its file.
@@ -303,16 +305,33 @@ fn csharp_extension_choice(
     }
 }
 
-/// A C# extension overload's `this` type as written, with the method's own
-/// type parameters numbered by first appearance: `Box<T>` over `Open<T>` and
-/// `Box<U>` over `Open<U>` are both `Box<#0>`, while `IList<int>` stays
-/// apart from `IList<T>`. `None` for an overload that is no extension method.
+/// A C# extension overload's `this` type as written, then its `where`
+/// clauses, with the method's own type parameters numbered by first
+/// appearance: `Box<T>` over `Open<T>` and `Box<U>` over `Open<U>` are both
+/// `Box<#0>`, while `IList<int>` stays apart from `IList<T>` and
+/// `where T : struct` from `where U : class`. `None` for an overload that is
+/// no extension method.
 fn receiver_key(entry: &Overload) -> Option<String> {
     let text = crate::csharp_extensions::this_parameter_text(entry.params.first()?)?;
+    let mut seen: Vec<String> = Vec::new();
+    let mut key = number_type_parameters(&text, &entry.type_params, &mut seen);
+    if !entry.constraints.is_empty() {
+        key.push(' ');
+        key.push_str(&number_type_parameters(
+            &entry.constraints,
+            &entry.type_params,
+            &mut seen,
+        ));
+    }
+    Some(key)
+}
+
+/// `text` with each of `type_params` replaced by `#` and its ordinal in
+/// `seen`, which a type parameter joins when it first appears.
+fn number_type_parameters(text: &str, type_params: &[String], seen: &mut Vec<String>) -> String {
     let is_word = |c: char| c.is_alphanumeric() || c == '_';
-    let mut seen: Vec<&str> = Vec::new();
-    let mut key = String::with_capacity(text.len());
-    let mut rest = text.as_str();
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
     while let Some(first) = rest.chars().next() {
         let len = if is_word(first) {
             rest.find(|c: char| !is_word(c)).unwrap_or(rest.len())
@@ -320,37 +339,39 @@ fn receiver_key(entry: &Overload) -> Option<String> {
             first.len_utf8()
         };
         let token = &rest[..len];
-        if entry.type_params.iter().any(|param| param == token) {
-            let ordinal = seen.iter().position(|s| *s == token).unwrap_or_else(|| {
-                seen.push(token);
+        if type_params.iter().any(|param| param == token) {
+            let ordinal = seen.iter().position(|s| s == token).unwrap_or_else(|| {
+                seen.push(token.to_string());
                 seen.len() - 1
             });
-            let _ = write!(key, "#{ordinal}");
+            let _ = write!(out, "#{ordinal}");
         } else {
-            key.push_str(token);
+            out.push_str(token);
         }
         rest = &rest[len..];
     }
-    Some(key)
+    out
 }
 
-/// The type parameters a method declares (`Open<T, U>(…)`: `T`, `U`), read
-/// from its declaration; empty when it declares none.
-fn method_type_parameters(
+/// The type parameters a C# method declares (`Open<T, U>(…)`: `T`, `U`) and
+/// the `where` clauses between its parameter list and its body, whitespace
+/// runs collapsed, read from the declaration; empty when it declares none.
+fn generic_head(
     file: &str,
     line: i64,
     name: &str,
     context: &dyn ResolutionContext,
-) -> Vec<String> {
+) -> (Vec<String>, String) {
+    let none = (Vec::new(), String::new());
     let Some(facts) = context.source_facts(file) else {
-        return Vec::new();
+        return none;
     };
     let Some(start) = usize::try_from(line).ok().and_then(|l| l.checked_sub(1)) else {
-        return Vec::new();
+        return none;
     };
     let end = (start + 12).min(facts.line_count());
     if start >= end {
-        return Vec::new();
+        return none;
     }
     let text = facts.join_lines(start, end, "\n");
     // The first `name(` or `name<…>(` is the declaration's own head, as in
@@ -359,11 +380,13 @@ fn method_type_parameters(
         r"(?-u:\b){}\s*(?:<([^<>()]*)>)?\s*\(",
         regex::escape(name)
     )) else {
-        return Vec::new();
+        return none;
     };
-    pattern
-        .captures(&text)
-        .and_then(|captures| captures.get(1))
+    let Some(head) = pattern.captures(&text) else {
+        return none;
+    };
+    let type_params: Vec<String> = head
+        .get(1)
         .map(|list| {
             list.as_str()
                 .split(',')
@@ -378,7 +401,38 @@ fn method_type_parameters(
                 })
                 .collect()
         })
-        .unwrap_or_default()
+        .unwrap_or_default();
+    let open = head.get(0).map_or(0, |all| all.end() - 1);
+    let mut depth = 0usize;
+    let mut close = None;
+    for (offset, ch) in text[open..].char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    close = Some(open + offset + 1);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let constraints = close
+        .map(|close| {
+            let tail = &text[close..];
+            let body = [tail.find(['{', ';']), tail.find("=>")]
+                .into_iter()
+                .flatten()
+                .min()
+                .unwrap_or(tail.len());
+            tail[..body]
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .unwrap_or_default();
+    (type_params, constraints)
 }
 
 /// `new T[] { … }`, `new T[n]` or `new[] { … }`.
@@ -445,16 +499,17 @@ fn overload_set_of(id: &str, context: &dyn ResolutionContext) -> Option<Overload
             && params
                 .first()
                 .is_some_and(|first| crate::csharp_extensions::is_this_parameter(first));
-        let type_params = if extension {
-            method_type_parameters(&node.file_path, node.start_line, &own.name, context)
+        let (type_params, constraints) = if extension {
+            generic_head(&node.file_path, node.start_line, &own.name, context)
         } else {
-            Vec::new()
+            (Vec::new(), String::new())
         };
         Some(Overload {
             arity: Arity { min, max },
             extension,
             params,
             type_params,
+            constraints,
         })
     };
     Some(OverloadSet {
@@ -626,6 +681,12 @@ mod tests {
 
     /// An overload declaring the type parameters `type_params`.
     fn generic(type_params: &[&str], params: &[&str]) -> Overload {
+        constrained(type_params, params, "")
+    }
+
+    /// An overload declaring `type_params` under the `where` clauses
+    /// `constraints`.
+    fn constrained(type_params: &[&str], params: &[&str], constraints: &str) -> Overload {
         let params: Vec<String> = params.iter().map(|p| (*p).to_string()).collect();
         let min = params
             .iter()
@@ -639,6 +700,7 @@ mod tests {
                 .is_some_and(|p| crate::csharp_extensions::is_this_parameter(p)),
             params,
             type_params: type_params.iter().map(|p| (*p).to_string()).collect(),
+            constraints: constraints.to_string(),
         }
     }
 
@@ -816,6 +878,31 @@ mod tests {
         assert_eq!(
             csharp_extension_choice(&constructed, "own", &args("1")).as_deref(),
             Some("own")
+        );
+        // `where` clauses are part of the receiver: `U : class` takes no
+        // receiver `T : struct` does, `U : struct` takes the same ones.
+        let own = || {
+            constrained(
+                &["T"],
+                &["this Box<T> box", "params T[] values"],
+                "where T : struct",
+            )
+        };
+        let classes = pair(
+            own(),
+            constrained(&["U"], &["this Box<U> box", "U value"], "where U : class"),
+        );
+        assert_eq!(
+            csharp_extension_choice(&classes, "own", &args("1")).as_deref(),
+            Some("own")
+        );
+        let structs = pair(
+            own(),
+            constrained(&["U"], &["this Box<U> box", "U value"], "where U : struct"),
+        );
+        assert_eq!(
+            csharp_extension_choice(&structs, "own", &args("1")).as_deref(),
+            Some("sibling")
         );
     }
 

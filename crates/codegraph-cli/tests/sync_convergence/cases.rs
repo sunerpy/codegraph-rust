@@ -373,6 +373,37 @@ pub fn csharp_extension_overload_of_a_renamed_type_parameter_appears() -> Case {
         )
 }
 
+/// W3-05c (KEEP-RUST): an added C# extension overload whose `where` clause
+/// takes no receiver the current one takes (`Seal<U>(this Box<U>, U) where
+/// U : class` beside `Seal<T>(this Box<T>, params T[]) where T : struct`)
+/// never takes `box.Seal(1)` on a `Box<int>`, as a fresh index of the edit
+/// finds.
+pub fn csharp_extension_overload_under_another_constraint_appears() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::CSharp])
+        .file(
+            "src/Utilities/Boxes.cs",
+            "namespace App.Utilities\n{\n    public class Box<T>\n    {\n        public T Value;\n    }\n\n    public static class BoxExtensions\n    {\n        public static object Seal<T>(this Box<T> box, params T[] values) where T : struct\n        {\n            return box;\n        }\n    }\n}\n",
+        )
+        .file(
+            "src/Reader.cs",
+            "using App.Utilities;\n\nnamespace App\n{\n    public class Reader\n    {\n        public object Close(Box<int> box)\n        {\n            return box.Seal(1);\n        }\n    }\n}\n",
+        )
+        .write(
+            "src/Utilities/Boxes.cs",
+            "namespace App.Utilities\n{\n    public class Box<T>\n    {\n        public T Value;\n    }\n\n    public static class BoxExtensions\n    {\n        public static object Seal<T>(this Box<T> box, params T[] values) where T : struct\n        {\n            return box;\n        }\n\n        public static object Seal<U>(this Box<U> box, U value) where U : class\n        {\n            return box;\n        }\n    }\n}\n",
+        )
+        .edge_throughout(
+            "method App::Reader::Close",
+            "calls",
+            "method App.Utilities::BoxExtensions::Seal @src/Utilities/Boxes.cs:10",
+        )
+        .no_edge_after(
+            "method App::Reader::Close",
+            "calls",
+            "method App.Utilities::BoxExtensions::Seal @src/Utilities/Boxes.cs:15",
+        )
+}
+
 /// Upstream #2180: a call through a class name reaches the class method the
 /// class inherits, before and after the calling body changes.
 pub fn python_inherited_classmethod_body_edit() -> Case {
