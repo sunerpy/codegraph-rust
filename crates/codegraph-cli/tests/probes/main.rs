@@ -1233,3 +1233,151 @@ mod seams {
         );
     }
 }
+
+/// W4a: the JavaScript/TypeScript resolution family (plan section 3 "W4a").
+/// `cargo test --test probes -- js::` runs them.
+mod js {
+    use super::support::{Graph, Project, assert_edge, assert_no_edge};
+
+    /// The qualified names `calls` edges from any node of `file` reach,
+    /// sorted (upstream's `callsFrom`).
+    fn calls_from(graph: &Graph, file: &str) -> Vec<String> {
+        let mut targets: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|edge| {
+                edge.kind == "calls"
+                    && graph
+                        .node(&edge.source)
+                        .is_some_and(|node| node.file_path == file)
+            })
+            .filter_map(|edge| graph.node(&edge.target))
+            .map(|node| node.qualified_name.clone())
+            .collect();
+        targets.sort();
+        targets
+    }
+
+    /// Upstream #2128 (`1ef1eb88`): calls in Vue, Svelte and Astro files
+    /// follow the JS/TS rules, and "outside the repository" is a package the
+    /// importing file's package.json chain (or a Deno import map) declares, a
+    /// Node built-in, `@std/…` or a framework's virtual module. An alias the
+    /// resolver cannot follow (`~/…`, SvelteKit's `$lib/…`) stays the
+    /// project's, a `workspace:` dependency is in the repository, SFC files
+    /// get the JS built-ins, and a file's own import of a built-in's name is
+    /// the import.
+    #[test]
+    fn pr2128_sfc_calls_follow_the_js_rules_and_an_unknown_alias_stays_the_projects() {
+        let project = Project::new()
+            .file(
+                "frontend/package.json",
+                r#"{"name":"frontend","dependencies":{"vue-i18n":"*","dayjs":"*","@app/shared":"workspace:*"}}"#,
+            )
+            .file(
+                "shared/index.ts",
+                "export function formatUrl(u: string) { return u; }\n",
+            )
+            .file(
+                "frontend/types/context.ts",
+                "export interface ProvidersContext {\n  t: (key: string) => string;\n}\n",
+            )
+            .file(
+                "frontend/test/mocks.ts",
+                "export function dayjs() { return 0; }\n",
+            )
+            .file(
+                "frontend/composables/store.ts",
+                "export function useLabelStore() { return {}; }\n",
+            )
+            .file(
+                "frontend/composables/use-labels.ts",
+                "import { useLabelStore } from '~/composables/store';\nexport function useLabels() { return useLabelStore(); }\n",
+            )
+            .file(
+                "frontend/pages/labels.vue",
+                "<script setup lang=\"ts\">\nimport { useI18n } from 'vue-i18n';\nimport dayjs from 'dayjs';\nimport { useLabelStore } from '~/composables/store';\nimport { formatUrl } from '@app/shared';\nconst { t } = useI18n();\nconst url = formatUrl('/labels');\nconst title = t('labels.title');\nconst today = dayjs();\nconst store = useLabelStore();\n</script>\n<template><h1>{{ title }}</h1></template>\n",
+            )
+            .file(
+                "docs/package.json",
+                r#"{"name":"docs","devDependencies":{"@sveltejs/kit":"*"}}"#,
+            )
+            .file(
+                "docs/src/lib/design.ts",
+                "export function useDesignSystem() { return 1; }\n",
+            )
+            .file(
+                "docs/src/lib/router.ts",
+                "export function goto(path: string) { return path; }\n",
+            )
+            .file(
+                "docs/src/lib/use.ts",
+                "import { useDesignSystem } from '$lib/design';\nexport const current = () => useDesignSystem();\n",
+            )
+            .file(
+                "docs/src/lib/instance.js",
+                "export const DEV = true;\nif (DEV) {\n  const fetch = globalThis.fetch;\n  globalThis.fetch = async (info) => fetch(info);\n}\n",
+            )
+            .file("docs/src/lib/Map.svelte", "<div>map</div>\n")
+            .file(
+                "docs/src/routes/+page.svelte",
+                "<script lang=\"ts\">\n  import Map from '../lib/Map.svelte';\n  import { useDesignSystem } from '$lib/design';\n  import { goto } from '$app/navigation';\n  const ds = useDesignSystem();\n  function go() { goto('/'); fetch('/api'); }\n</script>\n<button on:click={go}>{ds}</button>\n",
+            )
+            .file(
+                "deno/deno.json",
+                r#"{"imports":{"@std/assert":"jsr:@std/assert@^1","app/":"../src/"}}"#,
+            )
+            .file(
+                "deno/test/assert.ts",
+                "export function assertEquals(a: unknown, b: unknown) { return a === b; }\n",
+            )
+            .file(
+                "deno/app.test.ts",
+                "import { assertEquals } from '@std/assert';\nassertEquals(1, 1);\n",
+            )
+            .index();
+        let graph = project.graph();
+
+        let from_vue = calls_from(graph, "frontend/pages/labels.vue");
+        assert!(
+            !from_vue.iter().any(|q| q == "ProvidersContext::t"),
+            "{from_vue:?}"
+        );
+        assert!(!from_vue.iter().any(|q| q == "dayjs"), "{from_vue:?}");
+        assert!(
+            from_vue.iter().any(|q| q == "useLabelStore"),
+            "{from_vue:?}"
+        );
+        // A `workspace:*` dependency is in the repository.
+        assert!(from_vue.iter().any(|q| q == "formatUrl"), "{from_vue:?}");
+        let from_labels = calls_from(graph, "frontend/composables/use-labels.ts");
+        assert!(
+            from_labels.iter().any(|q| q == "useLabelStore"),
+            "{from_labels:?}"
+        );
+
+        let from_svelte = calls_from(graph, "docs/src/routes/+page.svelte");
+        assert!(
+            from_svelte.iter().any(|q| q == "useDesignSystem"),
+            "{from_svelte:?}"
+        );
+        // SvelteKit's `$app/…` is the framework's; `fetch` is a JS built-in.
+        assert!(!from_svelte.iter().any(|q| q == "goto"), "{from_svelte:?}");
+        assert!(!from_svelte.iter().any(|q| q == "fetch"), "{from_svelte:?}");
+        let from_use = calls_from(graph, "docs/src/lib/use.ts");
+        assert!(
+            from_use.iter().any(|q| q == "useDesignSystem"),
+            "{from_use:?}"
+        );
+
+        // Deno's import map says `@std/assert` comes from JSR.
+        let from_deno = calls_from(graph, "deno/app.test.ts");
+        assert!(
+            !from_deno.iter().any(|q| q == "assertEquals"),
+            "{from_deno:?}"
+        );
+
+        // A built-in's name imported from the project is the import.
+        assert_edge!(project, "file:docs/src/routes/+page.svelte" => imports => "file:docs/src/lib/Map.svelte");
+        assert_no_edge!(project, "file:docs/src/routes/+page.svelte" => imports => "file:docs/src/lib/router.ts");
+    }
+}

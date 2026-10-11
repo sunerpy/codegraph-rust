@@ -56,7 +56,7 @@ const MAX_EXTENDS_DEPTH: usize = 32;
 ///
 /// Walks the source as a tiny state machine tracking string context so that a
 /// `//` inside a string value (e.g. a URL) is never truncated.
-fn strip_jsonc(src: &str) -> String {
+pub(crate) fn strip_jsonc(src: &str) -> String {
     let chars: Vec<char> = src.chars().collect();
     let n = chars.len();
     let mut out = String::with_capacity(src.len());

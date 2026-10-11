@@ -33,6 +33,7 @@ mod member_value;
 pub mod name_matcher;
 mod object_literal;
 mod overloads;
+pub mod package_manifests;
 pub mod path_aliases;
 pub mod pathutil;
 mod python_values;

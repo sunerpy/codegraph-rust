@@ -408,7 +408,18 @@ pub(crate) fn is_lexically_reachable(
             .any(|p| reference.line >= p.start_line && reference.line <= p.end_line)
 }
 
+/// Languages whose calls are JS/TS calls (upstream `JS_FAMILY`): Vue, Svelte
+/// and Astro components' scripts and template expressions included, so a
+/// bare `t('key')` in a `.vue` file resolves lexically exactly as in a `.ts`
+/// one (upstream #2128).
 pub(crate) fn is_js_family(language: Language) -> bool {
+    is_js_ts(language) || matches!(language, Language::Vue | Language::Svelte | Language::Astro)
+}
+
+/// The four script languages themselves (upstream `JS_TS`), for the rules
+/// upstream keeps to them: `this.<field>` and `this.#field` calls and
+/// call-result receivers.
+pub(crate) fn is_js_ts(language: Language) -> bool {
     matches!(
         language,
         Language::TypeScript | Language::Tsx | Language::JavaScript | Language::Jsx
@@ -533,7 +544,7 @@ fn is_js_builtin_method(name: &str) -> bool {
 /// ArkTS participates in module visibility even though the narrower JS call
 /// inference gates deliberately exclude it (upstream #1719).
 pub(crate) fn is_esm_module_family(language: Language) -> bool {
-    is_js_family(language) || language == Language::ArkTs
+    is_js_ts(language) || language == Language::ArkTs
 }
 
 /// A JS/TS/ArkTS file containing an import statement but no export is a sealed
@@ -3355,7 +3366,7 @@ pub fn match_method_call(
     // `this.#items.add()`, emitted as `this.#items.add` (#1987) — resolves
     // exactly like `this.<field>` below (#1496). `#` is outside the dotted
     // receiver grammar, so the shape is matched here.
-    if is_js_family(reference.language)
+    if is_js_ts(reference.language)
         && let Some((field, method)) = split_private_this_field_call(&reference.reference_name)
     {
         return match_ts_this_field_call(field, method, reference, context);
@@ -3377,7 +3388,7 @@ pub fn match_method_call(
         }
     }
 
-    if is_js_family(reference.language) {
+    if is_js_ts(reference.language) {
         if let Some(field) = object_or_class.strip_prefix("this.") {
             return match_ts_this_field_call(field, &method_name, reference, context);
         }
@@ -5116,7 +5127,7 @@ pub fn match_reference(
     // `run` (#1683). The one exception is a store accessor, whose store is
     // identified (`useStore.getState().reset`, #1862).
     if reference.reference_kind == EdgeKind::Calls
-        && (is_js_family(reference.language) || reference.language == Language::Python)
+        && (is_js_ts(reference.language) || reference.language == Language::Python)
         && reference.reference_name.contains("().")
     {
         return crate::js_store::match_store_accessor_chain(reference, context);

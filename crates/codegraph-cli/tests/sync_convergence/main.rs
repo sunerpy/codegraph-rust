@@ -587,6 +587,8 @@ matrix! {
     java_import_of_an_added_class,
     lua_require_of_an_added_module,
     typescript_out_of_repo_call_ignores_an_added_namesake,
+    svelte_lib_alias_call_reaches_an_added_module,
+    vue_bare_call_ignores_an_added_interface_property,
     java_super_call_in_an_override_body_edit,
     java_annotation_ignores_a_case_variant_method_body_edit,
     typescript_outside_type_call_ignores_an_added_method,

@@ -708,6 +708,60 @@ pub fn solidity_import_of_an_added_file() -> Case {
         )
 }
 
+/// Upstream #2128: a Svelte call imported through SvelteKit's `$lib` alias,
+/// which no package.json declares, stays the project's and reaches the
+/// module once it appears, while one from the framework's `$app/…` never
+/// reaches a project namesake, as a fresh index of the edit finds.
+pub fn svelte_lib_alias_call_reaches_an_added_module() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Svelte, Language::TypeScript])
+        .file(
+            "docs/package.json",
+            "{\"name\":\"docs\",\"devDependencies\":{\"@sveltejs/kit\":\"*\"}}\n",
+        )
+        .file(
+            "docs/src/routes/Design.svelte",
+            "<script lang=\"ts\">\n  import { useDesignSystem } from '$lib/design';\n  import { goto } from '$app/navigation';\n  const ds = useDesignSystem();\n  goto('/');\n</script>\n\n<p>{ds}</p>\n",
+        )
+        .file(
+            "docs/src/lib/router.ts",
+            "export function goto(path: string) {\n  return path;\n}\n",
+        )
+        .write(
+            "docs/src/lib/design.ts",
+            "export function useDesignSystem() {\n  return 1;\n}\n",
+        )
+        .edge_after(
+            "component docs/src/routes/Design.svelte::Design",
+            "calls",
+            "function useDesignSystem",
+        )
+        .no_edge_after(
+            "component docs/src/routes/Design.svelte::Design",
+            "calls",
+            "function goto",
+        )
+}
+
+/// Upstream #2128: a bare call in a Vue component follows the JS/TS rules: a
+/// `t` destructured from a package's composable never reaches an interface's
+/// `t` property that appears later, as a fresh index of the edit finds.
+pub fn vue_bare_call_ignores_an_added_interface_property() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Vue, Language::TypeScript])
+        .file(
+            "package.json",
+            "{\"name\":\"app\",\"dependencies\":{\"vue-i18n\":\"*\"}}\n",
+        )
+        .file(
+            "src/Labels.vue",
+            "<script setup lang=\"ts\">\nimport { useI18n } from 'vue-i18n';\nconst { t } = useI18n();\nconst title = t('labels.title');\n</script>\n<template><h1>{{ title }}</h1></template>\n",
+        )
+        .write(
+            "src/types/context.ts",
+            "export interface ProvidersContext {\n  t: (key: string) => string;\n}\n",
+        )
+        .no_edge_after("component src/Labels.vue::Labels", "calls", "ProvidersContext::t")
+}
+
 /// Upstream #2392 (3): a Svelte import links the component file once it appears.
 pub fn svelte_import_of_an_added_component() -> Case {
     Case::new(Change::AddImportTarget, &[Language::Svelte])

@@ -153,7 +153,16 @@ streaming path for very large graphs), then applies deterministic strategies:
 
 The selected target then passes fail-closed correctness gates: language/module
 visibility, C-family macro and translation-unit scope, Go local bindings,
-external-import locality, and target-kind eligibility. A result that lands on
+external-import locality, and target-kind eligibility. A JS-family import is
+from outside the repository only when the importing file's package.json, or
+an enclosing one, declares the package (a `workspace:`, `file:` or `link:`
+dependency is the repository's own, and a Deno import map counts), or it is a
+Node built-in, `@std/…`, a runtime scheme (`node:`, `npm:`, `jsr:`) or a
+framework's virtual module (`$app/…`, `astro:…`); an alias the resolver does
+not follow (`$lib/…`, `~/…`) stays the project's. Calls in Vue, Svelte and
+Astro components follow the JS/TS rules and, like ArkTS, see the JS
+built-ins, unless the file imports its own binding of the built-in's name.
+A result that lands on
 the referencing node itself is kept only when nothing rules it out: a call
 written through `super` / `base` / `parent::`, on another object's value, or
 from a value's initializer is not a self-call, and a type never inherits from

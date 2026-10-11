@@ -437,6 +437,35 @@ fn js_built_ins() -> &'static BTreeSet<&'static str> {
     })
 }
 
+/// Languages that see the JS built-ins (upstream `isBuiltInOrExternal`'s
+/// `isJsTs`): the script languages, ArkTS and, since #2128, Vue, Svelte and
+/// Astro components.
+fn has_js_built_ins(language: Language) -> bool {
+    matches!(
+        language,
+        Language::TypeScript
+            | Language::JavaScript
+            | Language::Tsx
+            | Language::Jsx
+            | Language::ArkTs
+            | Language::Vue
+            | Language::Svelte
+            | Language::Astro
+    )
+}
+
+/// Does the file import its own binding of a JS built-in's name
+/// (`import Map from './Map.svelte'`)? Then the reference is that import,
+/// not the built-in (upstream #2128).
+fn imports_its_own_built_in(reference: &RefView, context: &dyn ResolutionContext) -> bool {
+    has_js_built_ins(reference.language)
+        && js_built_ins().contains(reference.reference_name.as_str())
+        && context
+            .get_import_mappings(&reference.file_path, reference.language)
+            .iter()
+            .any(|mapping| mapping.local_name == reference.reference_name)
+}
+
 /// React hooks from React itself (`REACT_HOOKS`, `index.ts:75-78`).
 fn react_hooks() -> &'static BTreeSet<&'static str> {
     static SET: OnceLock<BTreeSet<&'static str>> = OnceLock::new();
@@ -1904,7 +1933,8 @@ impl ReferenceResolver {
         if parse_cpp_constructor_reference_name(&reference.reference_name).is_some() {
             return (self.resolve_cpp_constructor(reference, context), None);
         }
-        if self.is_built_in_or_external(reference) {
+        if self.is_built_in_or_external(reference) && !imports_its_own_built_in(reference, context)
+        {
             return (None, None);
         }
 
@@ -2893,10 +2923,7 @@ impl ReferenceResolver {
     /// (`isBuiltInOrExternal`, `index.ts:982-1081`).
     fn is_built_in_or_external(&self, reference: &RefView) -> bool {
         let name = &reference.reference_name;
-        let is_js_ts = matches!(
-            reference.language,
-            Language::TypeScript | Language::JavaScript | Language::Tsx | Language::Jsx
-        );
+        let is_js_ts = has_js_built_ins(reference.language);
 
         if is_js_ts && js_built_ins().contains(name.as_str()) {
             return true;
@@ -3621,6 +3648,61 @@ mod tests {
             EdgeKind::Calls,
             Language::TypeScript
         )));
+        // Vue, Svelte and Astro components and ArkTS see the same built-ins
+        // (upstream #2128).
+        assert!(r.is_built_in_or_external(&mk_ref("fetch", EdgeKind::Calls, Language::Svelte)));
+        assert!(r.is_built_in_or_external(&mk_ref("console.log", EdgeKind::Calls, Language::Vue)));
+        assert!(r.is_built_in_or_external(&mk_ref("Map", EdgeKind::Calls, Language::Astro)));
+        assert!(r.is_built_in_or_external(&mk_ref("JSON.parse", EdgeKind::Calls, Language::ArkTs)));
+        assert!(!r.is_built_in_or_external(&mk_ref("t", EdgeKind::Calls, Language::Vue)));
+    }
+
+    #[test]
+    fn a_package_is_outside_only_when_a_manifest_declares_it() {
+        use crate::package_manifests::is_declared_outside_package;
+        let files = [
+            (
+                "package.json",
+                r#"{"name":"root","dependencies":{"lodash":"^4"}}"#,
+            ),
+            (
+                "frontend/package.json",
+                r#"{"name":"frontend","dependencies":{"dayjs":"*","@app/shared":"workspace:*"},"devDependencies":{"@sveltejs/kit":"*"}}"#,
+            ),
+            (
+                "deno/deno.jsonc",
+                "{\n  // JSR packages\n  \"imports\": {\"@oak/oak\": \"jsr:@oak/oak@^17\", \"app/\": \"../src/\",},\n}\n",
+            ),
+            ("kit/package.json", r#"{"name":"@sveltejs/kit"}"#),
+        ];
+        let ctx = MinimalCtx {
+            files: files
+                .iter()
+                .map(|(path, text)| ((*path).to_string(), (*text).to_string()))
+                .collect(),
+        };
+        let outside = |source: &str, from: &str| is_declared_outside_package(source, from, &ctx);
+        // Declared by the file's package.json or an enclosing one.
+        assert!(outside("dayjs/plugin/utc", "frontend/pages/a.vue"));
+        assert!(outside("lodash", "frontend/pages/a.vue"));
+        assert!(outside("lodash", "src/a.ts"));
+        assert!(!outside("dayjs", "src/a.ts"));
+        // A `workspace:` dependency and the package itself are the project's.
+        assert!(!outside("@app/shared", "frontend/pages/a.vue"));
+        assert!(!outside("frontend/utils", "frontend/pages/a.vue"));
+        // An alias nothing declares stays the project's.
+        assert!(!outside("$lib/design", "frontend/pages/a.vue"));
+        assert!(!outside("~/composables/store", "frontend/pages/a.vue"));
+        // Node built-ins, runtime schemes, `@std/…`, Deno import maps.
+        assert!(outside("fs/promises", "src/a.ts"));
+        assert!(outside("node:sqlite", "src/a.ts"));
+        assert!(outside("@std/assert", "src/a.ts"));
+        assert!(outside("@oak/oak", "deno/main.ts"));
+        assert!(!outside("app/handlers", "deno/main.ts"));
+        // A framework's virtual module, unless the repository is that framework.
+        assert!(outside("$app/navigation", "frontend/routes/+page.svelte"));
+        assert!(outside("astro:content", "src/pages/a.astro"));
+        assert!(!outside("$app/navigation", "kit/src/runtime/a.js"));
     }
 
     #[test]

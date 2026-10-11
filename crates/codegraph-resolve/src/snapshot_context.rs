@@ -29,13 +29,12 @@
 
 use crate::context::{DEFAULT_CACHE_LIMIT, order_candidates};
 use crate::import_resolver;
+use crate::package_manifests::{ManifestScope, read_manifest_scope};
 use crate::path_aliases::{AliasMap, load_project_aliases};
 use crate::pathutil;
 use crate::source_facts::SourceFacts;
 use crate::types::{GoModule, ImportMapping, ReExport, ResolutionContext};
-use crate::workspace_packages::{
-    WorkspacePackages, load_own_package_name, load_workspace_packages,
-};
+use crate::workspace_packages::{WorkspacePackages, load_workspace_packages};
 use codegraph_core::types::{EdgeKind, Language, Node, NodeKind};
 use codegraph_store::Store;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -180,6 +179,9 @@ struct SnapshotCaches {
     /// same candidates are probed from every importing file, and the tree does
     /// not change within a pass (upstream `fileExistsMemo`).
     fs_exists: BoundedFileMemo<bool>,
+    /// Each directory's package.json / Deno import-map scope (upstream
+    /// #2128 `manifestScopes`).
+    manifest_scopes: BoundedFileMemo<Arc<ManifestScope>>,
     #[cfg(test)]
     counters: SnapshotCacheCounters,
 }
@@ -195,6 +197,7 @@ impl SnapshotCaches {
             import_mappings: BoundedFileMemo::new(DEFAULT_CACHE_LIMIT),
             re_exports: BoundedFileMemo::new(DEFAULT_CACHE_LIMIT),
             fs_exists: BoundedFileMemo::new(crate::context::FILE_EXISTS_MEMO_LIMIT),
+            manifest_scopes: BoundedFileMemo::new(DEFAULT_CACHE_LIMIT),
             #[cfg(test)]
             counters: SnapshotCacheCounters::default(),
         }
@@ -222,7 +225,6 @@ struct NodeSnapshot {
     files_by_basename: HashMap<String, Arc<Vec<String>>>,
     project_aliases: Option<AliasMap>,
     workspace_packages: Option<WorkspacePackages>,
-    own_package_name: Option<String>,
     go_module: Option<GoModule>,
     go_modules: Vec<GoModule>,
 }
@@ -354,7 +356,6 @@ impl SnapshotResolutionContext {
 
         let project_aliases = load_project_aliases(&project_root);
         let workspace_packages = load_workspace_packages(&project_root);
-        let own_package_name = load_own_package_name(&project_root);
         let go_module = crate::context::load_go_module_pub(&project_root);
         let go_modules = crate::context::load_go_modules_pub(&project_root, &all_file_paths);
 
@@ -374,7 +375,6 @@ impl SnapshotResolutionContext {
                 files_by_basename,
                 project_aliases,
                 workspace_packages,
-                own_package_name,
                 go_module,
                 go_modules,
             }),
@@ -666,8 +666,12 @@ impl ResolutionContext for SnapshotResolutionContext {
         self.snapshot.workspace_packages.clone()
     }
 
-    fn own_package_name(&self) -> Option<String> {
-        self.snapshot.own_package_name.clone()
+    fn manifest_scope(&self, dir: &str) -> Arc<ManifestScope> {
+        // A directory's parent is another key, so the memo never re-enters
+        // the entry it is filling.
+        self.caches
+            .manifest_scopes
+            .get_or_init(dir, || Arc::new(read_manifest_scope(dir, self)))
     }
 
     fn get_go_module(&self) -> Option<GoModule> {

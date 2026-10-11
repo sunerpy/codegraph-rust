@@ -46,14 +46,6 @@ pub fn load_workspace_packages(project_root: &str) -> Option<WorkspacePackages> 
     Some(WorkspacePackages { by_name })
 }
 
-/// The repository's own package name, from its root package.json (upstream
-/// #2120 `isOwnPackage`): `axios` inside the axios repository names the
-/// repository itself, not a package from outside it. `None` without a root
-/// package.json or a non-empty `name`.
-pub fn load_own_package_name(project_root: &str) -> Option<String> {
-    read_package_name(Path::new(project_root))
-}
-
 /// Rewrite a bare workspace import to a project-relative path WITHOUT extension
 /// (`resolveWorkspaceImport`, `workspace-packages.ts:70-86`).
 ///

@@ -477,10 +477,13 @@ pub trait ResolutionContext {
         None
     }
 
-    /// The repository's own package name, from its root package.json (upstream
-    /// #2120 `isOwnPackage`). `None` without one.
-    fn own_package_name(&self) -> Option<String> {
-        None
+    /// The package names `dir`'s package.json chain and Deno import maps own
+    /// and depend on (upstream #2128 `manifestScope`). `dir` is the
+    /// project-relative directory of an indexed file (`""` for the root). The
+    /// default reads it uncached; the store and snapshot contexts keep each
+    /// directory's for the pass.
+    fn manifest_scope(&self, dir: &str) -> Arc<crate::package_manifests::ManifestScope> {
+        Arc::new(crate::package_manifests::read_manifest_scope(dir, self))
     }
 
     /// Go module info from `go.mod` (`getGoModule?`). `None` for non-Go /

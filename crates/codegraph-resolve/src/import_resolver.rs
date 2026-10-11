@@ -1280,10 +1280,13 @@ fn is_out_of_repo_js_import(
 }
 
 /// Does a JS-family import of `source`, written in `from_file`, name a module
-/// outside the repository (upstream #2120 `isOutOfRepoImport`)? A package that
-/// is not a relative path, a path alias onto an indexed file, a workspace
-/// member, or the repository's own package (`axios` inside axios). Every other
-/// language answers `false`.
+/// outside the repository (upstream #2120 `isOutOfRepoImport`, #2128)? A
+/// package that is not a relative path, a path alias onto an indexed file or
+/// a workspace member, and that the file's package.json chain or Deno import
+/// map declares, or a Node built-in, a runtime scheme or a framework's
+/// virtual module ([`crate::package_manifests`]): an alias the resolver does
+/// not follow (`$lib/…`, `~/…`) and the repository's own package stay the
+/// project's. Every other language answers `false`.
 pub fn is_out_of_repo_import(
     source: &str,
     from_file: &str,
@@ -1292,9 +1295,7 @@ pub fn is_out_of_repo_import(
 ) -> bool {
     is_js_specifier_language(language)
         && is_out_of_repo_js_import(source, from_file, language, context)
-        && !context
-            .own_package_name()
-            .is_some_and(|own| source == own || source.starts_with(&format!("{own}/")))
+        && crate::package_manifests::is_declared_outside_package(source, from_file, context)
 }
 
 /// Does a Rust `use` path name a crate outside the repository?
