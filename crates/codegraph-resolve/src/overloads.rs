@@ -211,24 +211,31 @@ enum Form {
 }
 
 /// The overload of `set` an instance-style call of a C# extension method
-/// takes, by C#'s rules with no `this` argument (W3-05c): an overload that
-/// takes the arguments in its normal form beats one that takes them only
-/// expanded; an array creation passed at a `params` position goes to the
-/// `params` overload over one whose parameter there is not an array. `None`
-/// when no overload fits; the current target when several still do.
+/// takes, by C#'s rules with no `this` argument (W3-05c). Only the extension
+/// overloads whose `this` parameter is declared as the current target's is
+/// take the receiver it was chosen for: a static method that is no
+/// extension, or one extending another type, is never a candidate. Of those,
+/// an overload that takes the arguments in its normal form beats one that
+/// takes them only expanded; an array creation passed at a `params` position
+/// goes to the `params` overload over one whose parameter there is not an
+/// array. `None` when the current target is no extension method, or no
+/// overload fits; the current target when several still do.
 fn csharp_extension_choice(
     set: &OverloadSet,
     current: &str,
     arguments: &[String],
 ) -> Option<String> {
+    let this_text = |entry: &Overload| {
+        entry
+            .params
+            .first()
+            .and_then(|first| crate::csharp_extensions::this_parameter_text(first))
+    };
+    let receiver = set.own.as_ref().and_then(this_text)?;
     let count = arguments.len();
     let array_last = arguments.last().is_some_and(|arg| is_array_creation(arg));
     let form = |entry: &Overload| -> Option<Form> {
-        let params = if entry.extension {
-            entry.params.get(1..).unwrap_or_default()
-        } else {
-            &entry.params[..]
-        };
+        let params = entry.params.get(1..).unwrap_or_default();
         let variadic = params.last().is_some_and(|p| is_pack(p));
         let fixed = if variadic {
             &params[..params.len() - 1]
@@ -248,11 +255,12 @@ fn csharp_extension_choice(
         .own
         .iter()
         .map(|entry| (current, entry))
-        .chain(
-            set.siblings
-                .iter()
-                .filter_map(|(id, entry)| entry.as_ref().map(|entry| (id.as_str(), entry))),
-        )
+        .chain(set.siblings.iter().filter_map(|(id, entry)| {
+            entry
+                .as_ref()
+                .filter(|entry| this_text(entry).as_ref() == Some(&receiver))
+                .map(|entry| (id.as_str(), entry))
+        }))
         .collect();
     let fitting: Vec<(&str, &Overload, Form)> = entries
         .iter()
@@ -272,14 +280,7 @@ fn csharp_extension_choice(
         // `new object?[] { … }` at a `params object?[]` position is an
         // identity conversion; to an `object?` parameter it is not.
         let at = count - 1;
-        let declared = |entry: &Overload| {
-            let params = if entry.extension {
-                entry.params.get(1..).unwrap_or_default()
-            } else {
-                &entry.params[..]
-            };
-            params.get(at).cloned().unwrap_or_default()
-        };
+        let declared = |entry: &Overload| entry.params.get(1 + at).cloned().unwrap_or_default();
         let packs: Vec<(&str, &Overload)> = chosen
             .iter()
             .copied()
@@ -631,6 +632,55 @@ mod tests {
             csharp_extension_choice(&methods, "own", &args("null, parameterTypes")).as_deref(),
             Some("own")
         );
+    }
+
+    #[test]
+    fn only_overloads_extending_the_receivers_type_compete() {
+        // `type.Pick(arg)`: the plain static `Pick(object?)` and
+        // `Pick(this Exception, object?)` fit one argument in their normal
+        // form, but neither takes a `Type` receiver.
+        let picks = set(
+            &["this Type type", "params object?[] args"],
+            &[
+                ("plain", &["object? arg"]),
+                ("other", &["this Exception error", "object? arg"]),
+            ],
+        );
+        assert_eq!(
+            csharp_extension_choice(&picks, "own", &args("arg")).as_deref(),
+            Some("own")
+        );
+        // The `this` types are compared as written, spacing aside:
+        // `IList<int>` is not the `IList<T>` the current target extends.
+        let lists = set(
+            &["this IList<T> list", "params T[] items"],
+            &[
+                ("ints", &["this IList<int> list", "int item"]),
+                ("same", &["this  IList<T>  list", "T item"]),
+            ],
+        );
+        assert_eq!(
+            csharp_extension_choice(&lists, "own", &args("1")).as_deref(),
+            Some("same")
+        );
+        let timers = set(
+            &["this System.Timers.Timer timer", "params object?[] args"],
+            &[(
+                "threading",
+                &["this System.Threading.Timer timer", "object? arg"],
+            )],
+        );
+        assert_eq!(
+            csharp_extension_choice(&timers, "own", &args("arg")).as_deref(),
+            Some("own")
+        );
+        // A current target that is no extension method names no receiver
+        // type to compare with.
+        let plain = set(
+            &["object? arg"],
+            &[("ext", &["this Type type", "object? arg"])],
+        );
+        assert_eq!(csharp_extension_choice(&plain, "own", &args("arg")), None);
     }
 
     #[test]

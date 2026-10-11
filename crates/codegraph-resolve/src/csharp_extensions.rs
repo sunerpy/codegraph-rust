@@ -129,6 +129,15 @@ pub(crate) fn this_parameter_type(param: &str) -> Option<String> {
 
 /// Whether a declared parameter is a C# extension method's `this` one,
 /// attributes before it allowed (`[NotNull] this PropertyInfo p`).
+/// A `this` parameter's declaration without its name, whitespace runs
+/// collapsed (`IList<T>`, `ref Span<byte>`), or `None` when `param` is no
+/// `this` parameter. Two overloads in one class whose texts are equal extend
+/// the same type.
+pub(crate) fn this_parameter_text(param: &str) -> Option<String> {
+    let (written, _name) = after_this(param)?.rsplit_once(char::is_whitespace)?;
+    Some(written.split_whitespace().collect::<Vec<_>>().join(" "))
+}
+
 pub(crate) fn is_this_parameter(param: &str) -> bool {
     after_this(param).is_some()
 }
