@@ -1550,22 +1550,25 @@ impl Store {
     }
 
     /// Delete every resolution-produced edge whose SOURCE node lives in
-    /// `file_path`. Every non-`contains` edge is produced by reference resolution
-    /// (it carries `metadata.resolvedBy`); `contains` edges come only from
-    /// extraction. Used only by incremental sync's correctness-first whole-file
-    /// fallback; normal unchanged dependents use
-    /// [`Self::delete_resolved_edges_at_sites`]. `contains` edges are left intact
-    /// because the file's nodes are not re-extracted.
+    /// `file_path`. Extraction produces only `contains` edges and same-file
+    /// value references (`references` with `{"valueRef": true}` and no
+    /// coordinates); every other edge comes from reference resolution. Used
+    /// only by incremental sync's correctness-first whole-file fallback;
+    /// normal unchanged dependents use [`Self::delete_resolved_edges_at_sites`].
+    /// Extraction edges are left intact because the file's nodes are not
+    /// re-extracted.
     pub fn delete_resolved_edges_from_file(&self, file_path: &str) -> rusqlite::Result<usize> {
         self.conn.execute(
-            r#"DELETE FROM edges
+            &format!(
+                r#"DELETE FROM edges
             WHERE id IN (
               SELECT e.id
               FROM edges e
               JOIN nodes src ON src.id = e.source
               WHERE src.file_path = ?1
-                AND e.kind != 'contains'
-            )"#,
+                AND {RESOLUTION_EDGE}
+            )"#
+            ),
             [file_path],
         )
     }
@@ -1615,14 +1618,16 @@ impl Store {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let removed = tx.execute(
-            r#"DELETE FROM edges
+            &format!(
+                r#"DELETE FROM edges
             WHERE id IN (
               SELECT e.id
               FROM edges e
               JOIN nodes src ON src.id = e.source
               WHERE src.file_path = ?1
-                AND e.kind != 'contains'
-            )"#,
+                AND {RESOLUTION_EDGE}
+            )"#
+            ),
             [file_path],
         )?;
         tx.execute(
@@ -1788,6 +1793,12 @@ impl Store {
         Ok(out.into_iter().collect())
     }
 }
+
+/// SQL predicate over edge alias `e`: an edge reference resolution produced.
+/// Extraction produces `contains` edges and same-file value references (a
+/// `references` edge with `{"valueRef": true}` and no coordinates), which a
+/// re-resolution of an unchanged file must keep.
+const RESOLUTION_EDGE: &str = "e.kind != 'contains' AND NOT (e.kind = 'references' AND e.line IS NULL AND CASE WHEN json_valid(e.metadata) THEN json_extract(e.metadata, '$.valueRef') END = 1)";
 
 fn row_to_file_reference_site(row: &Row<'_>) -> rusqlite::Result<FileReferenceSite> {
     let file_path = row.get(0)?;
@@ -3700,6 +3711,50 @@ mod tests {
         assert_eq!(removed, 1);
         assert_eq!(store.all_edges().unwrap().len(), 1);
         assert_eq!(store.all_edges().unwrap()[0].kind, EdgeKind::Contains);
+    }
+
+    #[test]
+    fn whole_file_fallbacks_keep_same_file_value_references() {
+        let mut store = store("value-refs-survive");
+        store
+            .upsert_nodes(&[
+                node("function:run", "run", "a.ts"),
+                node("constant:limit", "LIMIT_MAX", "a.ts"),
+                node("function:callee", "callee", "b.ts"),
+            ])
+            .unwrap();
+        let mut value_ref = edge("function:run", "constant:limit", EdgeKind::References);
+        value_ref.metadata = Some(serde_json::json!({ "valueRef": true }));
+        value_ref.line = None;
+        value_ref.col = None;
+        // A resolved `references` edge without the marker still goes.
+        let mut resolved_ref = edge("function:run", "function:callee", EdgeKind::References);
+        resolved_ref.line = Some(3);
+        resolved_ref.col = Some(4);
+        store
+            .insert_edges(&[
+                value_ref.clone(),
+                resolved_ref,
+                edge("function:run", "function:callee", EdgeKind::Calls),
+            ])
+            .unwrap();
+        assert_eq!(store.delete_resolved_edges_from_file("a.ts").unwrap(), 2);
+        let left = store.all_edges().unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].target, "constant:limit");
+
+        store
+            .insert_edges(&[edge("function:run", "function:callee", EdgeKind::Calls)])
+            .unwrap();
+        assert_eq!(
+            store
+                .replace_resolution_state_from_file("a.ts", &[])
+                .unwrap(),
+            1
+        );
+        let left = store.all_edges().unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].kind, EdgeKind::References);
     }
 
     #[test]

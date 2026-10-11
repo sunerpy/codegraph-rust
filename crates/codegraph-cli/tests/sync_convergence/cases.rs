@@ -881,6 +881,20 @@ pub fn vue_own_function_shadows_a_nuxt_auto_import() -> Case {
         .no_edge_after("function retry", "calls", "function retry")
 }
 
+/// Same-file value references (upstream #895) are extraction edges: a
+/// namesake appearing in another file sends the unchanged reader file through
+/// the whole-file re-resolution, which must keep `run`'s value reference to
+/// its own `LIMIT_MAX`, as a fresh index of the edit has it.
+pub fn typescript_value_reference_survives_an_added_namesake() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::TypeScript])
+        .file(
+            "src/a.ts",
+            "const LIMIT_MAX = 3;\nexport function run() {\n  return LIMIT_MAX + 1;\n}\n",
+        )
+        .write("src/b.ts", "export const LIMIT_MAX = 5;\n")
+        .edge_throughout("function run", "references", "constant LIMIT_MAX @src/a.ts")
+}
+
 /// Upstream #2392 (3): a Svelte import links the component file once it appears.
 pub fn svelte_import_of_an_added_component() -> Case {
     Case::new(Change::AddImportTarget, &[Language::Svelte])

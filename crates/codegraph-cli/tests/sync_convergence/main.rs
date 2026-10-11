@@ -595,6 +595,7 @@ matrix! {
     typescript_destructured_composable_call_reaches_an_added_module,
     typescript_module_destructuring_call_body_edit,
     vue_own_function_shadows_a_nuxt_auto_import,
+    typescript_value_reference_survives_an_added_namesake,
     java_super_call_in_an_override_body_edit,
     java_annotation_ignores_a_case_variant_method_body_edit,
     typescript_outside_type_call_ignores_an_added_method,
