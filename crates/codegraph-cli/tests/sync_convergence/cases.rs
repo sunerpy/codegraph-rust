@@ -76,6 +76,119 @@ pub fn python_from_import_of_an_added_module() -> Case {
         .edge_after("function main", "calls", "function helper @pkg/mod.py")
 }
 
+/// Upstream #2392 (3): a failed PHP include is retried when the file it names
+/// appears.
+pub fn php_include_of_an_added_file() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Php])
+        .file(
+            "index.php",
+            "<?php\nrequire 'inc/db.php';\n\nfunction boot() {\n    return connect();\n}\n",
+        )
+        .write(
+            "inc/db.php",
+            "<?php\nfunction connect() {\n    return 1;\n}\n",
+        )
+        .edge_after("file:index.php", "imports", "file:inc/db.php")
+}
+
+/// Upstream #2392 (3): a Dart import links the library it names once it appears.
+pub fn dart_import_of_an_added_library() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Dart])
+        .file("pubspec.yaml", "name: app\n")
+        .file("lib/a.dart", "import 'b.dart';\n\nvoid main() {}\n")
+        .write("lib/b.dart", "class B {}\n")
+        .edge_after("file:lib/a.dart", "imports", "file:lib/b.dart")
+}
+
+/// Upstream #2392 (3): a C# `using` links the namespace a later file declares.
+pub fn csharp_using_of_an_added_namespace() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::CSharp])
+        .file(
+            "src/Svc.cs",
+            "using App.Models;\nnamespace App { class Svc {} }\n",
+        )
+        .write(
+            "src/Models.cs",
+            "namespace App.Models { public class User {} }\n",
+        )
+        .edge_after(
+            "namespace App @src/Svc.cs",
+            "imports",
+            "namespace App.Models",
+        )
+}
+
+/// Upstream #2392 (3): a Java import links the class a later file declares.
+pub fn java_import_of_an_added_class() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Java])
+        .file(
+            "src/app/Main.java",
+            "package app;\nimport app.util.Util;\nclass Main { void run() { Util.go(); } }\n",
+        )
+        .write(
+            "src/app/util/Util.java",
+            "package app.util;\npublic class Util { public static void go() {} }\n",
+        )
+        .edge_after(
+            "namespace app @src/app/Main.java",
+            "imports",
+            "class app.util::Util",
+        )
+}
+
+/// Upstream #2392 (3): a Go call through an imported package links once the
+/// package appears.
+pub fn go_import_of_an_added_package() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Go])
+        .file("go.mod", "module example.com/shop\n\ngo 1.22\n")
+        .file(
+            "main.go",
+            "package main\n\nimport \"example.com/shop/util\"\n\nfunc main() { util.Go() }\n",
+        )
+        .write("util/util.go", "package util\n\nfunc Go() {}\n")
+        .edge_after("function main", "calls", "function Go @util/util.go")
+}
+
+/// Upstream #2392 (3): a Solidity import links the file it names once it appears.
+pub fn solidity_import_of_an_added_file() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Solidity])
+        .file(
+            "contracts/Token.sol",
+            "pragma solidity ^0.8.0;\nimport \"./Lib.sol\";\ncontract Token {}\n",
+        )
+        .write(
+            "contracts/Lib.sol",
+            "pragma solidity ^0.8.0;\nlibrary Lib {}\n",
+        )
+        .edge_after(
+            "file:contracts/Token.sol",
+            "imports",
+            "file:contracts/Lib.sol",
+        )
+}
+
+/// Upstream #2392 (3): a Svelte import links the component file once it appears.
+pub fn svelte_import_of_an_added_component() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Svelte])
+        .file(
+            "src/App.svelte",
+            "<script>\n  import Child from './Child.svelte';\n</script>\n<Child />\n",
+        )
+        .write("src/Child.svelte", "<p>child</p>\n")
+        .edge_after("file:src/App.svelte", "imports", "file:src/Child.svelte")
+}
+
+/// Upstream #2392 (3): a Vue import links the component file once it appears.
+pub fn vue_import_of_an_added_component() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Vue])
+        .file(
+            "src/App.vue",
+            "<script setup>\nimport Foo from './Foo.vue';\n</script>\n<template><Foo /></template>\n",
+        )
+        .write("src/Foo.vue", "<template><p>foo</p></template>\n")
+        .edge_after("file:src/App.vue", "imports", "file:src/Foo.vue")
+}
+
 pub fn go_call_into_an_added_file_of_the_same_package() -> Case {
     Case::new(Change::AddImportTarget, &[Language::Go])
         .file("go.mod", "module example.com/shop\n\ngo 1.22\n")

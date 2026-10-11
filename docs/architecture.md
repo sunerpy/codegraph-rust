@@ -225,7 +225,11 @@ bursts, reloads project control files, and reconciles additions, modifications,
 deletions, and scope changes through `codegraph-watch`. A burst past 500 paths,
 a backend's sign of dropped events, or (on Windows) drift found by an idle
 sentinel escalates to one full reconcile, reported as RECOVERING until it
-commits. Each mutation acquires the
+commits. A sync re-resolves the references that name what it changed; an import
+names a file, a folder or a namespace rather than a symbol, so the parked
+imports an added file or a changed file's namespace can satisfy (by the file's
+name and stem, its folder's, or the namespace's whole name) send their files
+down the whole-file re-resolution lane. Each mutation acquires the
 store's short-lived `index.lock` writer authority; readers use corroborated state
 and shared leases. A separate persistent `writer.pid` file carries an OS kernel
 exclusive lock for the lifetime of the ONE process allowed to run watcher/catch-up

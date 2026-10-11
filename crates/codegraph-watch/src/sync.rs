@@ -11,7 +11,7 @@ use codegraph_core::IndexPaths;
 use codegraph_core::config::Config;
 use codegraph_core::generated_header::detect_generated_file;
 use codegraph_core::node_id::hash_content;
-use codegraph_core::types::{FileRecord, Node};
+use codegraph_core::types::{FileRecord, Node, NodeKind};
 use codegraph_extract::{
     ExtensionOverrides, ExtractOptions, SourceText, detect_language_of, extract_file_with_options,
     is_source_file, read_source_file,
@@ -611,6 +611,18 @@ fn sync_paths_with_store(
                 merge_dependent_site(&mut dependent_sites, &mut dependent_fallbacks, affected);
             }
         }
+        // #2392 — an import names a file, a folder or a namespace, which the
+        // name lookup never matches: the parked imports an added file or a
+        // changed file's namespace can satisfy send their files down the
+        // whole-file lane, so they resolve as a fresh index resolves them.
+        let (path_keys, module_names) = changed_names.import_retry_keys();
+        for parked in
+            store.retryable_failed_imports(&path_keys, &module_names, IMPORT_RETRY_CEILING)?
+        {
+            if !reindexed.contains(&parked.file_path) {
+                dependent_fallbacks.insert(parked.file_path);
+            }
+        }
         let mut resolver = ReferenceResolver::new(project_root.to_string_lossy())
             .with_max_file_size(scope.options.max_file_size);
         {
@@ -901,6 +913,7 @@ fn sync_one(
         );
     };
     let content_hash = hash_content(&hash_input);
+    let added = stored.is_none();
     // Authoritative content gate, port of the upstream hash gate in
     // `upstream extraction/index.ts:1326-1337,1465-1483`.
     if stored.is_some_and(|file| file.content_hash == content_hash) {
@@ -918,6 +931,9 @@ fn sync_one(
         changed_names,
         (&metadata, &source, content_hash),
     )?;
+    if added {
+        changed_names.added_files.insert(relative.to_string());
+    }
     outcome.files_reindexed += 1;
     Ok(true)
 }
@@ -1005,6 +1021,14 @@ fn reextract_into_store(
         changed_names.any.insert((*name).to_string());
     }
     changed_names.note_candidates(&old_nodes, &result.nodes);
+    for node in &result.nodes {
+        if matches!(node.kind, NodeKind::Namespace | NodeKind::Module) {
+            changed_names
+                .module_names
+                .insert(node.qualified_name.clone());
+            changed_names.module_names.insert(node.name.clone());
+        }
+    }
 
     delete_unresolved_refs_by_file(store, relative)?;
     store.delete_file_record(relative)?;
@@ -1028,9 +1052,29 @@ struct ChangedNames {
     /// Only these can move an edge whose source and target share an unchanged
     /// file, so only these re-resolve such edges; a line shift elsewhere does not.
     candidates: HashSet<String>,
+    /// The files this sync added: a parked import may name one (#2392).
+    added_files: BTreeSet<String>,
+    /// The namespaces and modules the changed files declare, which a parked
+    /// import may name whole (`using Foo.Bar`, `import com.z.*`).
+    module_names: HashSet<String>,
 }
 
+/// How many parked imports one retry key may wake (upstream's per-name ceiling).
+const IMPORT_RETRY_CEILING: usize = 500;
+
 impl ChangedNames {
+    /// What an import of an added file can be written as, and the namespaces
+    /// and modules the changed files declare (upstream #2392).
+    fn import_retry_keys(&self) -> (Vec<String>, Vec<String>) {
+        let mut path_keys = BTreeSet::new();
+        for file in &self.added_files {
+            path_keys.extend(codegraph_store::import_path_keys(file));
+        }
+        let mut names: Vec<String> = self.module_names.iter().cloned().collect();
+        names.sort_unstable();
+        (path_keys.into_iter().collect(), names)
+    }
+
     /// Every node of a file left the index: all its names are touched.
     fn note_removed(&mut self, names: HashSet<String>) {
         for name in names {

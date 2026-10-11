@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use codegraph_core::types::{
     Edge, EdgeKind, FileRecord, Language, Node, NodeKind, ReferenceSubkind, UnresolvedRef,
@@ -1049,6 +1049,66 @@ impl Store {
         Ok(out)
     }
 
+    /// The parked imports a sync that adds files should retry (upstream
+    /// `getRetryableFailedImports`, #2392). An import names a file, a folder or
+    /// a namespace, which the symbol-name lookup cannot match, so it is found by
+    /// `path_keys` (each added file's [`import_path_keys`]) as its tail or its
+    /// whole name, and by `names` (the namespaces and modules the changed files
+    /// declare) as its whole name when its tail is something else. A
+    /// reference written as a path is looked up as an import is. A key more
+    /// than `per_key_ceiling` rows share is skipped, as the symbol lookup's
+    /// keys are.
+    pub fn retryable_failed_imports(
+        &self,
+        path_keys: &[String],
+        names: &[String],
+        per_key_ceiling: usize,
+    ) -> rusqlite::Result<Vec<UnresolvedRef>> {
+        if path_keys.is_empty() && names.is_empty() {
+            return Ok(Vec::new());
+        }
+        let path_keys: HashSet<&str> = path_keys.iter().map(String::as_str).collect();
+        let names: HashSet<&str> = names.iter().map(String::as_str).collect();
+        let mut stmt = self.conn.prepare(
+            "SELECT * FROM unresolved_refs WHERE reference_kind = 'imports' \
+             OR (reference_kind = 'references' AND instr(reference_name, '/') > 0) ORDER BY id",
+        )?;
+        let rows = stmt
+            .query_map([], row_to_unresolved_ref)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        // One bucket per (lookup, key), counted against the ceiling apiece.
+        let mut buckets: BTreeMap<(u8, String), Vec<usize>> = BTreeMap::new();
+        for (index, reference) in rows.iter().enumerate() {
+            let name = reference.reference_name.as_str();
+            let tail = reference_name_tail(name, reference.reference_kind);
+            if path_keys.contains(tail.as_str()) {
+                buckets.entry((0, tail.clone())).or_default().push(index);
+            }
+            if path_keys.contains(name) {
+                buckets
+                    .entry((1, name.to_string()))
+                    .or_default()
+                    .push(index);
+            }
+            if names.contains(name) && tail != name {
+                buckets
+                    .entry((2, name.to_string()))
+                    .or_default()
+                    .push(index);
+            }
+        }
+        let mut chosen = BTreeSet::new();
+        for indexes in buckets.values() {
+            if indexes.len() <= per_key_ceiling {
+                chosen.extend(indexes.iter().copied());
+            }
+        }
+        Ok(chosen
+            .into_iter()
+            .map(|index| rows[index].clone())
+            .collect())
+    }
+
     /// Ports `getStats` count SQL from `upstream db/queries.ts:1746-1756`.
     pub fn counts(&self) -> rusqlite::Result<StoreCounts> {
         self.conn.query_row(
@@ -1792,6 +1852,76 @@ fn millis_column(row: &Row<'_>, name: &str) -> rusqlite::Result<i64> {
             other.data_type(),
         )),
     }
+}
+
+/// The tail a parked reference waits under (upstream `referenceNameTail`,
+/// #1240, #2392): the part a new symbol's plain name could match, after the
+/// last `.` or `:` (`util.greet` -> `greet`, `mod::fn/2` -> `fn`, an Erlang
+/// arity dropped). An import, or a reference written as a path, names a FILE,
+/// so its tail is the path's last segment cut at its first dot
+/// (`package:app/b.dart` -> `b`, `./foo` -> `foo`, `inc/db.php` -> `db`): the
+/// stem [`import_path_keys`] takes from a file that could satisfy it.
+pub fn reference_name_tail(reference_name: &str, reference_kind: EdgeKind) -> String {
+    // A reference written as a path, but not an Erlang `fun mod:f/2` value.
+    let path_reference = reference_kind == EdgeKind::References
+        && reference_name.contains('/')
+        && strip_erlang_arity(reference_name) == reference_name;
+    if reference_kind == EdgeKind::Imports || path_reference {
+        let path = reference_name.trim_end_matches('/');
+        if let Some(slash) = path.rfind('/') {
+            let stem = file_name_stem(&path[slash + 1..]);
+            // `..` and `.` name a folder only through the importing file.
+            if !stem.chars().all(|c| c == '.') {
+                return stem.to_string();
+            }
+        }
+    }
+    let base = strip_erlang_arity(reference_name);
+    match base.rfind(['.', ':']) {
+        Some(idx) => base[idx + 1..].to_string(),
+        None => base.to_string(),
+    }
+}
+
+/// `name` without a trailing `/<1-3 digits>` arity (`f/1` -> `f`).
+fn strip_erlang_arity(name: &str) -> &str {
+    match name.rsplit_once('/') {
+        Some((base, arity))
+            if !base.is_empty()
+                && (1..=3).contains(&arity.len())
+                && arity.chars().all(|c| c.is_ascii_digit()) =>
+        {
+            base
+        }
+        _ => name,
+    }
+}
+
+/// A file or folder name up to its first dot past the first character:
+/// `b.dart` -> `b`, `types.d.ts` -> `types`, `.eslintrc.js` -> `.eslintrc`.
+fn file_name_stem(name: &str) -> &str {
+    match name.get(1..).and_then(|rest| rest.find('.')) {
+        Some(dot) => &name[..dot + 1],
+        None => name,
+    }
+}
+
+/// What an import of the file at `file_path` can be written as (upstream
+/// `importPathKeys`, #2392): its name (`b.h`, a bare include) and stem (`b`,
+/// the tail of `a/b.h`, `./b`, `pkg.b`), and the same two for its folder,
+/// which an import names for its index file (`./ui` -> `ui/index.ts`, `pkg`
+/// -> `pkg/__init__.py`) or as a Go package.
+pub fn import_path_keys(file_path: &str) -> Vec<String> {
+    let parts: Vec<&str> = file_path.split('/').collect();
+    let mut keys: Vec<String> = Vec::new();
+    for name in &parts[parts.len().saturating_sub(2)..] {
+        for key in [*name, file_name_stem(name)] {
+            if !key.is_empty() && !keys.iter().any(|existing| existing == key) {
+                keys.push(key.to_string());
+            }
+        }
+    }
+    keys
 }
 
 pub(crate) fn row_to_unresolved_ref(row: &Row<'_>) -> rusqlite::Result<UnresolvedRef> {

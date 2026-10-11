@@ -580,8 +580,18 @@ matrix! {
     #[ignore = "W5-03 #2450: a reference through an aliased import binding does not link a module that appears later"]
     typescript_aliased_named_import_of_an_added_file,
     tsx_component_import_of_an_added_file,
-    #[ignore = "W5-01 #2392: a failed `from pkg.mod import` is not retried when pkg/mod.py appears"]
+    #[ignore = "W3-01 #2392(1): the from-import binds its own statement until W3-01's gate parks it for the W5-01 retry"]
     python_from_import_of_an_added_module,
+    php_include_of_an_added_file,
+    dart_import_of_an_added_library,
+    csharp_using_of_an_added_namespace,
+    java_import_of_an_added_class,
+    #[ignore = "W3-01 #2392(1): the Go package import binds its own statement until W3-01's gate parks it for the retry"]
+    go_import_of_an_added_package,
+    #[ignore = "W3-01 #2392(1): the Solidity import binds its own statement until W3-01's gate parks it for the retry"]
+    solidity_import_of_an_added_file,
+    svelte_import_of_an_added_component,
+    vue_import_of_an_added_component,
     go_call_into_an_added_file_of_the_same_package,
     typescript_collapsed_parse_is_fixed,
     go_composite_literal_of_an_added_struct,
