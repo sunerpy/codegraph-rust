@@ -1640,7 +1640,10 @@ impl ReferenceResolver {
     /// `Record<K, V>` is not a test entity `Record`. Test-support code a
     /// project ships (`testing/`, `fakes/`, a `*-test` module) stays in reach,
     /// and so does a C or C++ file the reference's translation unit includes,
-    /// whatever its name (#2421).
+    /// whatever its name (#2421). No name match from another file reaches
+    /// into a minified script either (#2204). Upstream checks both in
+    /// `isVisibleAcrossFiles`, which it applies to the name match and fuzzy's
+    /// survivor only, so an import still binds what it names.
     fn gate_test_suite(
         &self,
         result: Option<ResolvedRef>,
@@ -1651,6 +1654,15 @@ impl ReferenceResolver {
         let Some(target) = context.get_node_by_id_shared(&result.target_node_id) else {
             return Some(result);
         };
+        // A vendored minified bundle keeps mangled one-letter names, so a name
+        // written in another file never means one of them (upstream #2204,
+        // in `isVisibleAcrossFiles` beside this rule): healthchecks' `$(…)`,
+        // jQuery loaded as a global, went to a helper inside
+        // bootstrap-native.min.js. Calls inside a bundle still resolve.
+        if target.file_path != reference.file_path && is_minified_script(&target.file_path, context)
+        {
+            return None;
+        }
         if target.file_path == reference.file_path
             || !codegraph_core::file_class::is_test_suite_path(&target.file_path)
             || codegraph_core::file_class::is_test_path(&reference.file_path)
@@ -1750,17 +1762,6 @@ impl ReferenceResolver {
         let Some(target) = context.get_node_by_id_shared(&result.target_node_id) else {
             return Some(result);
         };
-        // A vendored minified bundle keeps mangled one-letter names, so a name
-        // written in another file never means one of them (upstream #2204):
-        // healthchecks' `$(…)`, jQuery loaded as a global, went to a helper
-        // inside bootstrap-native.min.js. An import names its module, so what
-        // it binds stays; calls inside a bundle still resolve.
-        if result.resolved_by != ResolvedBy::Import
-            && target.file_path != reference.file_path
-            && is_minified_script(&target.file_path, context)
-        {
-            return None;
-        }
         target_is_visible_across_files(&target, reference, context).then_some(result)
     }
 
