@@ -2,7 +2,10 @@
 //!
 //! Direct port of `upstream extraction/languages/typescript.ts:4-118`.
 
+use std::sync::OnceLock;
+
 use codegraph_core::types::Language;
+use regex::Regex;
 use tree_sitter::{Language as TsLanguage, Node};
 
 use crate::spec::{ImportInfo, LanguageSpec};
@@ -97,6 +100,10 @@ impl LanguageSpec for TypeScriptSpec {
 
     fn return_field(&self) -> &'static str {
         "return_type"
+    }
+
+    fn pre_parse(&self, source: &str, file_path: &str) -> String {
+        blank_flow_syntax(source, file_path)
     }
 
     fn resolve_body<'tree>(&self, node: Node<'tree>, body_field: &str) -> Option<Node<'tree>> {
@@ -199,6 +206,74 @@ impl LanguageSpec for TypeScriptSpec {
     }
 }
 
+/// JavaScript's `\s` as a regex class: whitespace and line terminators,
+/// `U+FEFF` included.
+const JS_SPACE: &str = r"[\t\n\x0B\x0C\r \x{A0}\x{1680}\x{2000}-\x{200A}\x{2028}\x{2029}\x{202F}\x{205F}\x{3000}\x{FEFF}]";
+
+/// Flow's own syntax blanked to spaces, so a Flow-typed file reads as TSX
+/// (upstream #2161 `blankFlowSyntax`): exact object types `{| a: T |}`, a
+/// maybe type's `?` (`x: ?string`, `Array<?T>`), an inexact object's bare
+/// `...`, `import typeof` and `opaque type`. Only a `.js`, `.jsx`, `.mjs` or
+/// `.cjs` file with the `@flow` pragma changes, the files detection reads as
+/// TSX for it. Every byte offset survives, and so does every line: a line
+/// break inside `import typeof` stays, where upstream's blanks it too.
+pub(crate) fn blank_flow_syntax(source: &str, file_path: &str) -> String {
+    static IMPORT_TYPEOF: OnceLock<Regex> = OnceLock::new();
+    static OPAQUE: OnceLock<Regex> = OnceLock::new();
+    static INEXACT: OnceLock<Regex> = OnceLock::new();
+    let script = [".js", ".jsx", ".mjs", ".cjs"]
+        .iter()
+        .any(|extension| file_path.ends_with(extension));
+    if !script || !crate::engine::has_flow_pragma(source) {
+        return source.to_string();
+    }
+    let code = source.replace("{|", "{ ").replace("|}", " }");
+    // A maybe type's `?` after `:`, `<` or `,`, before what it qualifies.
+    let mut bytes = code.clone().into_bytes();
+    for (at, punctuation) in code.char_indices() {
+        if !matches!(punctuation, ':' | '<' | ',') {
+            continue;
+        }
+        let rest = &code[at + 1..];
+        let mark = rest.trim_start_matches(codegraph_core::generated_header::is_js_whitespace);
+        let qualifies = mark
+            .strip_prefix('?')
+            .and_then(|after| after.chars().next());
+        if qualifies.is_some_and(|c| c.is_ascii_alphanumeric() || "_$({[".contains(c)) {
+            bytes[at + 1 + rest.len() - mark.len()] = b' ';
+        }
+    }
+    let code = String::from_utf8(bytes).expect("a `?` blanked to a space keeps UTF-8");
+    let code = IMPORT_TYPEOF
+        .get_or_init(|| {
+            Regex::new(&format!(r"(?-u:\b)import{JS_SPACE}+typeof(?-u:\b)")).expect("import typeof")
+        })
+        .replace_all(&code, |found: &regex::Captures<'_>| {
+            let typeof_clause = &found[0]["import".len()..];
+            let blank: String = typeof_clause
+                .bytes()
+                .map(|byte| {
+                    if matches!(byte, b'\n' | b'\r') {
+                        byte as char
+                    } else {
+                        ' '
+                    }
+                })
+                .collect();
+            format!("import{blank}")
+        });
+    let code = OPAQUE
+        .get_or_init(|| {
+            Regex::new(&format!(r"(?-u:\b)opaque({JS_SPACE}+type(?-u:\b))")).expect("opaque type")
+        })
+        .replace_all(&code, "      ${1}");
+    // An inexact object type's bare `...` (`{a: T, ...}`), never a spread.
+    INEXACT
+        .get_or_init(|| Regex::new(&format!(r"\.\.\.({JS_SPACE}*[}},])")).expect("inexact object"))
+        .replace_all(&code, "   ${1}")
+        .into_owned()
+}
+
 fn has_direct_child_kind(node: Node<'_>, kind: &str) -> bool {
     (0..node.child_count()).any(|i| node.child(i).is_some_and(|child| child.kind() == kind))
 }
@@ -233,4 +308,81 @@ pub(crate) fn class_field_is_callable(node: Node<'_>, field_kind: &str) -> bool 
         }
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::blank_flow_syntax;
+
+    fn blank(code: &str) -> String {
+        let source = format!("// @flow\n{code}");
+        let out = blank_flow_syntax(&source, "a.js");
+        assert_eq!(out.len(), source.len(), "{code:?}");
+        out.strip_prefix("// @flow\n")
+            .expect("pragma line")
+            .to_string()
+    }
+
+    #[test]
+    fn flow_only_syntax_becomes_spaces() {
+        assert_eq!(blank("type A = {| a: T |};"), "type A = {  a: T  };");
+        assert_eq!(
+            blank("let x: ?string = f(y, ?z);"),
+            "let x:  string = f(y,  z);"
+        );
+        assert_eq!(blank("type L = Array<?T>;"), "type L = Array< T>;");
+        assert_eq!(blank("f: ?(e: E) => void"), "f:  (e: E) => void");
+        assert_eq!(blank("type O = {a: T, ...};"), "type O = {a: T,    };");
+        assert_eq!(
+            blank("import typeof * as R from 'r';"),
+            "import        * as R from 'r';"
+        );
+        assert_eq!(
+            blank("export opaque type T = string;"),
+            "export        type T = string;"
+        );
+    }
+
+    #[test]
+    fn javascript_that_only_looks_like_flow_stays() {
+        for code in [
+            "const b = a ? c : d;",
+            "const v = a?.b ?? c;",
+            "const o = {...rest};",
+            "f(...args, [...xs]);",
+            "const opaque = 1;",
+            "opaque.type = 2;",
+            "importtypeof(x);",
+            "import typeofx from 'y';",
+        ] {
+            assert_eq!(blank(code), code);
+        }
+    }
+
+    #[test]
+    fn blanking_keeps_every_byte_offset_and_line() {
+        // A no-break space is two bytes; it becomes two spaces.
+        assert_eq!(
+            blank("import\u{a0}typeof R from 'r';"),
+            "import         R from 'r';"
+        );
+        assert_eq!(
+            blank("import\ntypeof R from 'r';"),
+            "import\n       R from 'r';"
+        );
+        assert_eq!(blank("x:\n  ?T"), "x:\n   T");
+    }
+
+    #[test]
+    fn only_flow_typed_javascript_paths_are_blanked() {
+        let flow = "// @flow\ntype A = {| a: ?T |};";
+        for path in ["a.js", "a.jsx", "a.mjs", "a.cjs"] {
+            assert_ne!(blank_flow_syntax(flow, path), flow, "{path}");
+        }
+        for path in ["a.ts", "a.tsx", "a.JS", "a.vue"] {
+            assert_eq!(blank_flow_syntax(flow, path), flow, "{path}");
+        }
+        let plain = "type A = {| a: ?T |};";
+        assert_eq!(blank_flow_syntax(plain, "a.js"), plain);
+    }
 }

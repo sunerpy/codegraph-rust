@@ -2021,4 +2021,38 @@ mod js {
         assert!(names.contains(&"items$::inc"), "{names:?}");
         assert!(!names.contains(&"useStore::reset"), "{names:?}");
     }
+
+    /// Upstream #2161 (`2d1b6441`): a `.js` whose leading comments carry
+    /// Flow's `@flow` pragma is read as TSX once Flow's own syntax is blanked,
+    /// so `render(): React.Node` no longer cuts its class short, and its file
+    /// row records `tsx`; a `.js` without the pragma, or with `@noflow`,
+    /// stays JavaScript.
+    #[test]
+    fn pr2161_a_flow_typed_javascript_file_is_read_as_tsx() {
+        let project = Project::new()
+            .file("js/SegmentedControl.js", "/**\n * @flow strict-local\n * @format\n */\nimport typeof * as React from 'react';\nimport * as React from 'react';\n\ntype Props = $ReadOnly<{|\n  values: ?Array<string>,\n  onChange?: ?(event: {nativeEvent: {value: string}, ...}) => mixed,\n|}>;\n\nopaque type Token = string;\n\nclass SegmentedControl extends React.Component<Props> {\n  render(): React.Node {\n    return this._renderItems();\n  }\n\n  _renderItems(): React.Node {\n    return null;\n  }\n}\n\nmodule.exports = SegmentedControl;\n")
+            .file("js/plain.js", "function plain() { return 1; }\nmodule.exports = plain;\n")
+            .file("js/noflow.js", "// @noflow\nfunction off() { return 1; }\nmodule.exports = off;\n")
+            .index();
+        let graph = project.graph();
+        let language = |path: &str| {
+            graph
+                .files
+                .iter()
+                .find(|file| file.path == path)
+                .map(|file| file.language.as_str())
+        };
+        assert_eq!(language("js/SegmentedControl.js"), Some("tsx"));
+        assert_eq!(language("js/plain.js"), Some("javascript"));
+        assert_eq!(language("js/noflow.js"), Some("javascript"));
+        let mut methods: Vec<&str> = graph
+            .nodes
+            .iter()
+            .filter(|node| node.file_path == "js/SegmentedControl.js" && node.kind == "method")
+            .map(|node| node.name.as_str())
+            .collect();
+        methods.sort_unstable();
+        assert_eq!(methods, ["_renderItems", "render"], "{}", graph.report());
+        assert_edge!(project, "method SegmentedControl::render" => calls => "method SegmentedControl::_renderItems");
+    }
 }

@@ -204,16 +204,20 @@ pub fn detect_language_with(
 
 /// The language `file_path` is indexed as, given its `source`: the language
 /// of its extension, except that a `.h` header holding C++ or Objective-C is
-/// that language. Extraction parses a file with it and every path that records
-/// a file row stores it, so the row agrees with the file's nodes.
+/// that language, and a JavaScript file carrying Flow's `@flow` pragma is TSX.
+/// Extraction parses a file with it and every path that records a file row
+/// stores it, so the row agrees with the file's nodes.
 pub fn detect_language_for_source(
     file_path: &str,
     source: &str,
     overrides: &ExtensionOverrides,
 ) -> Language {
-    sniff_header_language(
-        file_path,
-        detect_language_with(file_path, overrides),
+    sniff_flow_language(
+        sniff_header_language(
+            file_path,
+            detect_language_with(file_path, overrides),
+            source,
+        ),
         source,
     )
 }
@@ -250,6 +254,61 @@ fn sniff_header_language(file_path: &str, language: Language, source: &str) -> L
     } else {
         language
     }
+}
+
+/// `language` refined by `source` when it is JavaScript: a Flow-typed file
+/// (upstream #2161) is read as TSX. The JavaScript grammar cannot parse Flow's
+/// annotations (`render(): React.Node` cut a class short), TypeScript's syntax
+/// covers most of Flow's, and the TypeScript spec's `pre_parse` blanks the
+/// rest.
+fn sniff_flow_language(language: Language, source: &str) -> Language {
+    if matches!(language, Language::JavaScript | Language::Jsx) && has_flow_pragma(source) {
+        Language::Tsx
+    } else {
+        language
+    }
+}
+
+/// Whether a JavaScript file's leading comments carry Flow's `@flow` pragma
+/// and not `@noflow` (upstream `hasFlowPragma`): the comments, after an
+/// optional shebang line, before any code in the first 4096 UTF-16 code units.
+pub(crate) fn has_flow_pragma(source: &str) -> bool {
+    static FLOW: OnceLock<Regex> = OnceLock::new();
+    static NOFLOW: OnceLock<Regex> = OnceLock::new();
+    let mut units = 0;
+    let head = source
+        .char_indices()
+        .find(|(_, ch)| {
+            units += ch.len_utf16();
+            units > 4096
+        })
+        .map_or(source, |(at, _)| &source[..at]);
+    let head = head
+        .strip_prefix("#!")
+        .and_then(|rest| rest.split_once('\n'))
+        .map_or(head, |(_, rest)| rest);
+    let mut lead = 0;
+    loop {
+        let rest = &head[lead..];
+        let code = rest.trim_start_matches(codegraph_core::generated_header::is_js_whitespace);
+        let comment = if let Some(line) = code.strip_prefix("//") {
+            2 + line.find('\n').unwrap_or(line.len())
+        } else if let Some(block) = code.strip_prefix("/*") {
+            match block.find("*/") {
+                Some(close) => 2 + close + 2,
+                None => break,
+            }
+        } else {
+            break;
+        };
+        lead += rest.len() - code.len() + comment;
+    }
+    let lead = &head[..lead];
+    FLOW.get_or_init(|| Regex::new(r"@flow(?-u:\b)").expect("flow pragma"))
+        .is_match(lead)
+        && !NOFLOW
+            .get_or_init(|| Regex::new(r"@noflow(?-u:\b)").expect("noflow pragma"))
+            .is_match(lead)
 }
 
 /// A `.h` file maps to `Language::C` by extension, but may hold C++ or
@@ -337,9 +396,17 @@ pub fn extract_source_with_observer(
 ) -> ExtractionResult {
     let start = Instant::now();
     observer(ExtractionStage::DetectLanguage);
+    let named = language;
     let language = language.unwrap_or_else(|| detect_language_with(file_path, overrides));
     observer(ExtractionStage::Prepare);
     let language = sniff_header_language(file_path, language, source);
+    // A caller that names the language (an embedded block's delegation) keeps
+    // it, as upstream's `language || detectLanguage(filePath, source)` does.
+    let language = if named.is_none() {
+        sniff_flow_language(language, source)
+    } else {
+        language
+    };
     observer(ExtractionStage::Embedded);
     if let Some(result) = crate::embedded::extract_embedded(file_path, source, language) {
         return result;
@@ -2164,6 +2231,121 @@ mod tests {
     fn dot_h_plain_c_stays_c() {
         let result = extract_source("plain.h", "int add(int a, int b);\n", None);
         assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+    }
+
+    /// Upstream #2161's Flow-typed component (`__tests__/flow-js.test.ts`).
+    const FLOW_COMPONENT: &str = "/**\n * @flow strict-local\n * @format\n */\nimport typeof * as React from 'react';\nimport * as React from 'react';\n\ntype Props = $ReadOnly<{|\n  values: ?Array<string>,\n  onChange?: ?(event: {nativeEvent: {value: string}, ...}) => mixed,\n|}>;\n\nopaque type Token = string;\n\nclass SegmentedControl extends React.Component<Props> {\n  render(): React.Node {\n    return this._renderItems();\n  }\n\n  _renderItems(): React.Node {\n    return null;\n  }\n}\n\nmodule.exports = SegmentedControl;\n";
+
+    #[test]
+    fn a_flow_pragma_reads_a_javascript_file_as_tsx() {
+        let none = ExtensionOverrides::default();
+        let detect = |path: &str, source: &str| detect_language_for_source(path, source, &none);
+        assert_eq!(
+            detect("js/SegmentedControl.js", FLOW_COMPONENT),
+            Language::Tsx
+        );
+        assert_eq!(
+            detect("js/plain.js", "function plain() {}"),
+            Language::JavaScript
+        );
+        assert_eq!(
+            detect("js/x.js", "// @noflow\nconst a = 1;"),
+            Language::JavaScript
+        );
+        assert_eq!(
+            detect("js/x.jsx", "// @flow\nconst a = <b />;"),
+            Language::Tsx
+        );
+        assert_eq!(
+            detect("js/x.mjs", "/* @flow */\nexport const a = 1;"),
+            Language::Tsx
+        );
+        // Only JavaScript reads the pragma.
+        assert_eq!(
+            detect("src/x.ts", "// @flow\nconst a = 1;"),
+            Language::TypeScript
+        );
+        // A shebang line comes first; a byte-order mark is whitespace.
+        assert_eq!(
+            detect("bin/cli.js", "#!/usr/bin/env node\n// @flow\nmain();"),
+            Language::Tsx
+        );
+        assert_eq!(
+            detect("js/bom.js", "\u{feff}// @flow\nconst a = 1;"),
+            Language::Tsx
+        );
+    }
+
+    #[test]
+    fn the_flow_pragma_is_read_from_the_leading_comments_only() {
+        for source in [
+            "const a = 1; // @flow\n",
+            "'use strict';\n// @flow\n",
+            "/* @flowtype */\nconst a = 1;\n",
+            "// @flow\n// @noflow\nconst a = 1;\n",
+            "/* @flow\nconst a = 1;\n",
+            "#!/usr/bin/env node // @flow",
+        ] {
+            assert!(!has_flow_pragma(source), "{source:?}");
+        }
+        assert!(has_flow_pragma("// a\n\n/* b */ /** @flow */\n"));
+        // The leading comments are read in the first 4096 UTF-16 code units
+        // (`é` is one unit and two bytes).
+        assert!(has_flow_pragma(&format!(
+            "// {}\n// @flow\n",
+            "é".repeat(4000)
+        )));
+        assert!(!has_flow_pragma(&format!(
+            "// {}\n// @flow\n",
+            "é".repeat(4096)
+        )));
+    }
+
+    #[test]
+    fn the_typescript_specs_blank_flow_syntax_keeping_every_offset() {
+        let flow_only = Regex::new(r"\{\||\|\}|import\s+typeof|opaque\s+type|:\s*\?Array")
+            .expect("Flow-only syntax");
+        for language in [Language::TypeScript, Language::Tsx] {
+            let spec = crate::lang::spec_for_language(language).expect("TypeScript spec");
+            let out = spec.pre_parse(FLOW_COMPONENT, "js/SegmentedControl.js");
+            assert_eq!(out.len(), FLOW_COMPONENT.len());
+            assert_eq!(out.lines().count(), FLOW_COMPONENT.lines().count());
+            assert!(!flow_only.is_match(&out), "{out}");
+            // Not a Flow file, or not a JavaScript path: unchanged.
+            assert_eq!(
+                spec.pre_parse("const a = {| b |};", "plain.js"),
+                "const a = {| b |};"
+            );
+            assert_eq!(spec.pre_parse(FLOW_COMPONENT, "src/x.tsx"), FLOW_COMPONENT);
+        }
+    }
+
+    #[test]
+    fn a_flow_typed_javascript_file_keeps_its_class_and_methods() {
+        let flow = extract_source("js/SegmentedControl.js", FLOW_COMPONENT, None);
+        let mut methods: Vec<(&str, Language)> = flow
+            .nodes
+            .iter()
+            .filter(|node| node.kind == codegraph_core::types::NodeKind::Method)
+            .map(|node| (node.name.as_str(), node.language))
+            .collect();
+        methods.sort_by_key(|(name, _)| *name);
+        assert_eq!(
+            methods,
+            [("_renderItems", Language::Tsx), ("render", Language::Tsx)]
+        );
+        // A caller that names the language keeps it.
+        let named = extract_source(
+            "js/SegmentedControl.js",
+            FLOW_COMPONENT,
+            Some(Language::JavaScript),
+        );
+        assert!(
+            named
+                .nodes
+                .iter()
+                .all(|node| node.language == Language::JavaScript)
+        );
     }
 
     fn cpp_raw_string(delimiter: &str) -> String {

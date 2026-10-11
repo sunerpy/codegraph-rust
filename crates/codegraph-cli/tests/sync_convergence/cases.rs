@@ -2452,3 +2452,32 @@ pub fn c_header_flips_to_cpp() -> Case {
         .edge_after("file:shape.h", "contains", "class Shape")
         .file_language_after("shape.h", "cpp")
 }
+
+// ----- a `.js` file gains Flow's `@flow` pragma ------------------------------
+
+/// Upstream #2161: a `.js` file that gains Flow's `@flow` pragma is read as
+/// TSX, so the class its annotations cut short (the JavaScript grammar ends
+/// it at `React.Component<Props>`) has its methods, as a fresh index of the
+/// edit finds.
+pub fn javascript_file_gains_the_flow_pragma() -> Case {
+    Case::new(Change::PragmaFlip, &[Language::JavaScript, Language::Tsx])
+        .file(
+            "js/SegmentedControl.js",
+            "class SegmentedControl extends React.Component<Props> {\n  render(): React.Node {\n    return this._renderItems();\n  }\n\n  _renderItems(): React.Node {\n    return null;\n  }\n}\n\nmodule.exports = SegmentedControl;\n",
+        )
+        .file(
+            "js/index.js",
+            "const SegmentedControl = require('./SegmentedControl');\nmodule.exports = SegmentedControl;\n",
+        )
+        .write(
+            "js/SegmentedControl.js",
+            "// @flow\nclass SegmentedControl extends React.Component<Props> {\n  render(): React.Node {\n    return this._renderItems();\n  }\n\n  _renderItems(): React.Node {\n    return null;\n  }\n}\n\nmodule.exports = SegmentedControl;\n",
+        )
+        .edge_throughout("file:js/index.js", "imports", "file:js/SegmentedControl.js")
+        .edge_after(
+            "method SegmentedControl::render",
+            "calls",
+            "method SegmentedControl::_renderItems",
+        )
+        .file_language_after("js/SegmentedControl.js", "tsx")
+}

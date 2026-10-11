@@ -62,10 +62,12 @@ pub enum Change {
     ControlFile,
     /// A `.h` header changes from C to C++ content.
     HeaderFlip,
+    /// A `.js` file gains Flow's `@flow` pragma, so it is read as TSX.
+    PragmaFlip,
 }
 
 impl Change {
-    const ALL: [Self; 8] = [
+    const ALL: [Self; 9] = [
         Self::AddImportTarget,
         Self::BodyEdit,
         Self::RenameSymbol,
@@ -74,6 +76,7 @@ impl Change {
         Self::AddCompetitor,
         Self::ControlFile,
         Self::HeaderFlip,
+        Self::PragmaFlip,
     ];
 }
 
@@ -707,6 +710,7 @@ matrix! {
     #[ignore = "unscheduled, found by W0-04: a package.json framework dependency change does not re-run framework detection"]
     typescript_react_dependency_appears_in_package_json,
     c_header_flips_to_cpp,
+    javascript_file_gains_the_flow_pragma,
 }
 
 #[test]

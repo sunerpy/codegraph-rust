@@ -416,7 +416,7 @@ fn has_webpack_runtime(content: &str) -> bool {
 }
 
 /// JavaScript's `\s`: whitespace and line terminators, `U+FEFF` included.
-fn is_js_whitespace(c: char) -> bool {
+pub fn is_js_whitespace(c: char) -> bool {
     matches!(
         c,
         '\t' | '\n' | '\u{b}' | '\u{c}' | '\r' | ' ' | '\u{a0}' | '\u{1680}' | '\u{2000}'
