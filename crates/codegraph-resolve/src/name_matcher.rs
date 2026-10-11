@@ -762,11 +762,56 @@ fn is_undeclared_type_name(
             .any(|n| is_method_owner(n) && same_language_family(n.language, reference.language))
 }
 
+/// Words that end a C++ declarator scan without naming a type (upstream
+/// `CPP_NON_TYPE_TOKENS`).
+const CPP_NON_TYPE_TOKENS: &[&str] = &[
+    "return",
+    "if",
+    "else",
+    "for",
+    "while",
+    "do",
+    "switch",
+    "case",
+    "default",
+    "break",
+    "continue",
+    "goto",
+    "throw",
+    "new",
+    "delete",
+    "co_await",
+    "co_yield",
+    "co_return",
+    "static_cast",
+    "const_cast",
+    "dynamic_cast",
+    "reinterpret_cast",
+    "sizeof",
+    "alignof",
+    "typeid",
+    "and",
+    "or",
+    "not",
+    "xor",
+];
+
 /// The type a C++ declared type names, as upstream's `normalizeCppTypeName`
-/// reads it: cv-qualifiers, `typename` / `class` / `struct`, `&` / `*` and
-/// template arguments (nested ones with them) dropped, the last `::` segment
-/// kept (`const SkipList<Key, Comparator>&` → `SkipList`).
-fn cpp_declared_type_name(declared: &str) -> String {
+/// reads it: `None` when a `>` closes no `<` (the type began on an earlier
+/// line, `std::unique_ptr<Blob>>>& reqs`, or the text is an expression) or
+/// when what is left names no type (`return`, `sizeof`); otherwise
+/// cv-qualifiers, `typename` / `class` / `struct`, `&` / `*` and template
+/// arguments (nested ones with them) dropped and the last `::` segment kept
+/// (`const SkipList<Key, Comparator>&` → `SkipList`).
+fn cpp_declared_type_name(declared: &str) -> Option<String> {
+    let mut open = 0usize;
+    for c in declared.chars() {
+        match c {
+            '<' => open += 1,
+            '>' => open = open.checked_sub(1)?,
+            _ => {}
+        }
+    }
     let mut depth = 0usize;
     let mut bare = String::with_capacity(declared.len());
     for c in declared.chars() {
@@ -787,12 +832,13 @@ fn cpp_declared_type_name(declared: &str) -> String {
             )
         })
         .collect();
-    words
-        .join(" ")
-        .rsplit("::")
-        .find(|segment| !segment.trim().is_empty())
-        .map(|segment| segment.trim().to_string())
-        .unwrap_or_default()
+    let normalized = words.join(" ");
+    let last = normalized
+        .split("::")
+        .filter(|segment| !segment.is_empty())
+        .last()?
+        .trim();
+    (!last.is_empty() && !CPP_NON_TYPE_TOKENS.contains(&last)).then(|| last.to_string())
 }
 
 /// The simple name of the type a member belongs to: the last `::` / `.`
@@ -3428,9 +3474,11 @@ pub fn match_method_call(
             let type_name = if reference.language == Language::Cpp {
                 cpp_declared_type_name(&inferred)
             } else {
-                inferred.rsplit('.').next().unwrap_or(&inferred).to_string()
+                Some(inferred.rsplit('.').next().unwrap_or(&inferred).to_string())
             };
-            if is_undeclared_type_name(&type_name, reference, context) {
+            if let Some(type_name) = type_name
+                && is_undeclared_type_name(&type_name, reference, context)
+            {
                 // KEEP-RUST (owner 2026-10-11, W3-05c): a C# call on an
                 // outside type still reaches the one project extension method
                 // in scope that takes it as `this` (`objectType.IsEnum()` on a
@@ -5335,22 +5383,29 @@ mod cpp_declared_type_tests {
 
     #[test]
     fn a_declared_cpp_type_is_read_as_upstream_reads_it() {
+        let read = |declared: &str| cpp_declared_type_name(declared);
         assert_eq!(
-            cpp_declared_type_name("SkipList<Key, Comparator>"),
-            "SkipList"
+            read("SkipList<Key, Comparator>").as_deref(),
+            Some("SkipList")
         );
-        assert_eq!(cpp_declared_type_name("const ScopedHandle"), "ScopedHandle");
-        assert_eq!(cpp_declared_type_name("Table<int, Box<int>>&"), "Table");
+        assert_eq!(read("const ScopedHandle").as_deref(), Some("ScopedHandle"));
+        assert_eq!(read("Table<int, Box<int>>&").as_deref(), Some("Table"));
         assert_eq!(
-            cpp_declared_type_name("leveldb::Table::Iterator*"),
-            "Iterator"
+            read("leveldb::Table::Iterator*").as_deref(),
+            Some("Iterator")
         );
-        assert_eq!(cpp_declared_type_name("std::vector<std::string>"), "vector");
+        assert_eq!(read("std::vector<std::string>").as_deref(), Some("vector"));
         assert_eq!(
-            cpp_declared_type_name("typename T::value_type"),
-            "value_type"
+            read("typename T::value_type").as_deref(),
+            Some("value_type")
         );
-        assert_eq!(cpp_declared_type_name(""), "");
+        // A type begun on an earlier line, an expression, or no type at all.
+        assert_eq!(read("Foo<Bar>>>&"), None);
+        assert_eq!(read("BlobContents>>>&"), None);
+        assert_eq!(read("return"), None);
+        assert_eq!(read("sizeof"), None);
+        assert_eq!(read(""), None);
+        assert_eq!(read("&"), None);
     }
 }
 
