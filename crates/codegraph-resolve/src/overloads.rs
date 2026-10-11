@@ -306,11 +306,11 @@ fn csharp_extension_choice(
 }
 
 /// A C# extension overload's `this` type as written, then its `where`
-/// clauses, with the method's own type parameters numbered by first
-/// appearance: `Box<T>` over `Open<T>` and `Box<U>` over `Open<U>` are both
-/// `Box<#0>`, while `IList<int>` stays apart from `IList<T>` and
-/// `where T : struct` from `where U : class`. `None` for an overload that is
-/// no extension method.
+/// clauses, token by token with the method's own type parameters numbered by
+/// first appearance: `Box<T>` over `Open<T>` and `Box< U >` over `Open<U>`
+/// are both `Box<#0>`, `where T: struct` and `where T : struct` agree, while
+/// `IList<int>` stays apart from `IList<T>` and `where T : struct` from
+/// `where U : class`. `None` for an overload that is no extension method.
 fn receiver_key(entry: &Overload) -> Option<String> {
     let text = crate::csharp_extensions::this_parameter_text(entry.params.first()?)?;
     let mut seen: Vec<String> = Vec::new();
@@ -326,19 +326,30 @@ fn receiver_key(entry: &Overload) -> Option<String> {
     Some(key)
 }
 
-/// `text` with each of `type_params` replaced by `#` and its ordinal in
-/// `seen`, which a type parameter joins when it first appears.
+/// `text`'s tokens with each of `type_params` replaced by `#` and its
+/// ordinal in `seen`, which a type parameter joins when it first appears.
+/// Spacing is dropped, except one space between two words (`ref int`).
 fn number_type_parameters(text: &str, type_params: &[String], seen: &mut Vec<String>) -> String {
     let is_word = |c: char| c.is_alphanumeric() || c == '_';
     let mut out = String::with_capacity(text.len());
+    let mut after_word = false;
     let mut rest = text;
     while let Some(first) = rest.chars().next() {
-        let len = if is_word(first) {
+        if first.is_whitespace() {
+            rest = &rest[first.len_utf8()..];
+            continue;
+        }
+        let word = is_word(first);
+        let len = if word {
             rest.find(|c: char| !is_word(c)).unwrap_or(rest.len())
         } else {
             first.len_utf8()
         };
         let token = &rest[..len];
+        if word && after_word {
+            out.push(' ');
+        }
+        after_word = word;
         if type_params.iter().any(|param| param == token) {
             let ordinal = seen.iter().position(|s| s == token).unwrap_or_else(|| {
                 seen.push(token.to_string());
@@ -354,8 +365,8 @@ fn number_type_parameters(text: &str, type_params: &[String], seen: &mut Vec<Str
 }
 
 /// The type parameters a C# method declares (`Open<T, U>(…)`: `T`, `U`) and
-/// the `where` clauses between its parameter list and its body, whitespace
-/// runs collapsed, read from the declaration; empty when it declares none.
+/// the `where` clauses between its parameter list and its body, read from
+/// the declaration with its comments blanked; empty when it declares none.
 fn generic_head(
     file: &str,
     line: i64,
@@ -373,7 +384,10 @@ fn generic_head(
     if start >= end {
         return none;
     }
-    let text = facts.join_lines(start, end, "\n");
+    let text = crate::strip_comments::strip_comments_for_regex(
+        &facts.join_lines(start, end, "\n"),
+        crate::strip_comments::CommentLang::CSharp,
+    );
     // The first `name(` or `name<…>(` is the declaration's own head, as in
     // [`paren_list_after`]; a later overload's type parameters are not its.
     let Ok(pattern) = Regex::new(&format!(
@@ -426,10 +440,7 @@ fn generic_head(
                 .flatten()
                 .min()
                 .unwrap_or(tail.len());
-            tail[..body]
-                .split_whitespace()
-                .collect::<Vec<_>>()
-                .join(" ")
+            tail[..body].trim().to_string()
         })
         .unwrap_or_default();
     (type_params, constraints)
@@ -903,6 +914,38 @@ mod tests {
         assert_eq!(
             csharp_extension_choice(&structs, "own", &args("1")).as_deref(),
             Some("sibling")
+        );
+        // Spacing is no part of either: `Box< T >` with `where T: struct` is
+        // the `Box<T>` with `where T : struct` the current target extends.
+        let spaced = pair(
+            own(),
+            constrained(&["T"], &["this Box< T > box", "T value"], "where T: struct"),
+        );
+        assert_eq!(
+            csharp_extension_choice(&spaced, "own", &args("1")).as_deref(),
+            Some("sibling")
+        );
+        // Nor are comments in the `this` parameter.
+        let commented = pair(
+            own(),
+            constrained(
+                &["T"],
+                &["this Box<T> /* boxed */ box", "T value"],
+                "where T : struct",
+            ),
+        );
+        assert_eq!(
+            csharp_extension_choice(&commented, "own", &args("1")).as_deref(),
+            Some("sibling")
+        );
+        // Words stay apart: `ref int` is not `refint`.
+        let words = pair(
+            overload(&["this ref int x", "params int[] xs"]),
+            overload(&["this refint x", "int y"]),
+        );
+        assert_eq!(
+            csharp_extension_choice(&words, "own", &args("1")).as_deref(),
+            Some("own")
         );
     }
 

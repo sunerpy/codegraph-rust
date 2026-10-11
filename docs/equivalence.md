@@ -1191,7 +1191,12 @@ correction shows up as a diff attributable to one change:
   and the sync case `csharp_extension_method_call_body_edit` pin it. What it
   cannot tell apart: two outside types with one simple name from different
   namespaces (`System.Threading.Timer` and `System.Timers.Timer`), imported by
-  different files, as every typed resolution by simple name.
+  different files, as every typed resolution by simple name. An extension
+  call's overloads compete only when their `this` types and `where` clauses
+  agree token by token (spacing and comments aside, the method's own type
+  parameters numbered by first use); two spellings of one type (`int` and
+  `System.Int32`, an alias) keep the target the name match chose, as does an
+  overload choice that needs argument types.
 - **`java`**: `extends`/`implements`, object creation and an anonymous class,
   enum constants with their own bodies, a static import, two same-named `Field`
   classes in different packages, test-only imports of Mockito helpers, and the

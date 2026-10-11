@@ -595,6 +595,7 @@ matrix! {
     csharp_method_becomes_an_extension_method,
     csharp_extension_overload_of_a_renamed_type_parameter_appears,
     csharp_extension_overload_under_another_constraint_appears,
+    csharp_extension_overload_spelled_with_other_spacing_appears,
     python_inherited_classmethod_body_edit,
     python_class_method_of_an_added_class,
     python_inherited_classmethod_of_an_added_base,

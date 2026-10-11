@@ -404,6 +404,42 @@ pub fn csharp_extension_overload_under_another_constraint_appears() -> Case {
         )
 }
 
+/// W3-05c (KEEP-RUST): spacing and comments are no part of a C# extension
+/// overload's receiver or constraints: an added `Wrap<T>(this Box< T > /* … */
+/// box, T) where T : struct // …` takes `box.Wrap(1)` from
+/// `Wrap<T>(this Box<T>, params T[]) where T: struct`, as a fresh index of
+/// the edit finds.
+pub fn csharp_extension_overload_spelled_with_other_spacing_appears() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::CSharp])
+        .file(
+            "src/Utilities/Boxes.cs",
+            "namespace App.Utilities\n{\n    public class Box<T>\n    {\n        public T Value;\n    }\n\n    public static class BoxExtensions\n    {\n        public static object Wrap<T>(this Box<T> box, params T[] values) where T: struct\n        {\n            return box;\n        }\n    }\n}\n",
+        )
+        .file(
+            "src/Reader.cs",
+            "using App.Utilities;\n\nnamespace App\n{\n    public class Reader\n    {\n        public object Fold(Box<int> box)\n        {\n            return box.Wrap(1);\n        }\n    }\n}\n",
+        )
+        .write(
+            "src/Utilities/Boxes.cs",
+            "namespace App.Utilities\n{\n    public class Box<T>\n    {\n        public T Value;\n    }\n\n    public static class BoxExtensions\n    {\n        public static object Wrap<T>(this Box<T> box, params T[] values) where T: struct\n        {\n            return box;\n        }\n\n        public static object Wrap<T>(this Box< T > /* boxed */ box, T value) where T : struct // value types\n        {\n            return box;\n        }\n    }\n}\n",
+        )
+        .edge_before(
+            "method App::Reader::Fold",
+            "calls",
+            "method App.Utilities::BoxExtensions::Wrap @src/Utilities/Boxes.cs:10",
+        )
+        .edge_after(
+            "method App::Reader::Fold",
+            "calls",
+            "method App.Utilities::BoxExtensions::Wrap @src/Utilities/Boxes.cs:15",
+        )
+        .no_edge_after(
+            "method App::Reader::Fold",
+            "calls",
+            "method App.Utilities::BoxExtensions::Wrap @src/Utilities/Boxes.cs:10",
+        )
+}
+
 /// Upstream #2180: a call through a class name reaches the class method the
 /// class inherits, before and after the calling body changes.
 pub fn python_inherited_classmethod_body_edit() -> Case {
