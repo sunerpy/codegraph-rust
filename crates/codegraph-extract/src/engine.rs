@@ -403,6 +403,22 @@ pub fn extract_source_with_observer(
     let parse_has_error = tree.root_node().has_error();
     let mut result = TreeSitterWalker::new(file_path, &parsed_source, spec, tree.root_node())
         .extract(start.elapsed().as_millis() as i64);
+    // A CommonJS `require('./x')` is a file import, as ESM's `import` is
+    // (upstream #2263).
+    if result
+        .nodes
+        .iter()
+        .any(|node| node.kind == codegraph_core::types::NodeKind::File)
+    {
+        result
+            .unresolved_references
+            .extend(crate::commonjs_requires::require_refs(
+                file_path,
+                &parsed_source,
+                tree.root_node(),
+                language,
+            ));
+    }
     if parse_has_error
         && result
             .nodes

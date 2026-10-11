@@ -1,15 +1,63 @@
 [
   {
+    "col": 11,
+    "kind": "imports",
+    "line": 5,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "file:lib/app.js",
+    "target": "file:lib/format.js"
+  },
+  {
     "col": 12,
     "kind": "calls",
     "line": 9,
     "metadata": {
-      "confidence": 0.4,
-      "resolvedBy": "exact-match"
+      "confidence": 0.9,
+      "resolvedBy": "import"
     },
     "provenance": null,
     "source": "file:test/app.test.js",
-    "target": "constant:85a5dcf259eaae3906faacccec6b7071"
+    "target": "constant:9f62233a1a2b3a3959cbbf99bdef9231"
+  },
+  {
+    "col": 12,
+    "kind": "imports",
+    "line": 3,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "file:index.js",
+    "target": "file:lib/app.js"
+  },
+  {
+    "col": 13,
+    "kind": "imports",
+    "line": 3,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "file:lib/chain.js",
+    "target": "file:lib/util.js"
+  },
+  {
+    "col": 13,
+    "kind": "imports",
+    "line": 4,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "file:lib/app.js",
+    "target": "file:lib/util.js"
   },
   {
     "col": 17,
@@ -26,11 +74,23 @@
   },
   {
     "col": 18,
+    "kind": "imports",
+    "line": 4,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "file:test/app.test.js",
+    "target": "file:index.js"
+  },
+  {
+    "col": 18,
     "kind": "instantiates",
     "line": 8,
     "metadata": {
       "confidence": 0.9,
-      "resolvedBy": "exact-match"
+      "resolvedBy": "import"
     },
     "provenance": null,
     "source": "function:feb3ac5a0a28894758fdc7dbbd267c67",
@@ -50,6 +110,30 @@
     "target": "function:98496f9dc78403b03abbe6c7b80d5984"
   },
   {
+    "col": 23,
+    "kind": "imports",
+    "line": 5,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "file:test/app.test.js",
+    "target": "file:lib/app.js"
+  },
+  {
+    "col": 29,
+    "kind": "imports",
+    "line": 3,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "file:lib/app.js",
+    "target": "file:lib/service.js"
+  },
+  {
     "col": 32,
     "kind": "calls",
     "line": 9,
@@ -66,12 +150,12 @@
     "kind": "calls",
     "line": 6,
     "metadata": {
-      "confidence": 0.4,
-      "resolvedBy": "exact-match"
+      "confidence": 0.9,
+      "resolvedBy": "import"
     },
     "provenance": null,
     "source": "function:cfde938b4e2a0395239b945699803212",
-    "target": "constant:d1e8e25413dba4bd9610a6cec8d1f667"
+    "target": "function:30231724b71586cd7faef27bc665c8d7"
   },
   {
     "col": 4,
@@ -79,11 +163,23 @@
     "line": 10,
     "metadata": {
       "confidence": 0.9,
-      "resolvedBy": "exact-match"
+      "resolvedBy": "import"
     },
     "provenance": null,
     "source": "file:test/app.test.js",
     "target": "function:614ebe045ff7b9e4ae1fbcf86f0ec074"
+  },
+  {
+    "col": 9,
+    "kind": "imports",
+    "line": 6,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "file:lib/chain.js",
+    "target": "file:lib/format.js"
   },
   {
     "col": null,

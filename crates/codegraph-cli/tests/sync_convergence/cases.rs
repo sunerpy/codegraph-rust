@@ -895,6 +895,52 @@ pub fn typescript_value_reference_survives_an_added_namesake() -> Case {
         .edge_throughout("function run", "references", "constant LIMIT_MAX @src/a.ts")
 }
 
+/// Upstream #2263: a CommonJS `require('./application')` imports that file once
+/// it appears, though the binding is only ever used as a value.
+pub fn javascript_require_imports_an_added_module() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::JavaScript])
+        .file(
+            "lib/express.js",
+            "var proto = require('./application');\n\nfunction createApplication() {\n  return Object.create(proto);\n}\n\nmodule.exports = createApplication;\n",
+        )
+        .write(
+            "lib/application.js",
+            "var app = exports = module.exports = {};\napp.init = function init() {};\n",
+        )
+        .edge_after("file:lib/express.js", "imports", "file:lib/application.js")
+}
+
+/// Upstream #2189: `require('./utils').setCharset` is the module's
+/// `setCharset` once the module appears, never its first export.
+pub fn javascript_require_member_reaches_an_added_module() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::JavaScript])
+        .file(
+            "lib/response.js",
+            "'use strict';\n\nvar setCharset = require('./utils').setCharset;\n\nfunction send(body) {\n  return setCharset(body, 'utf-8');\n}\n\nmodule.exports = { send };\n",
+        )
+        .write(
+            "lib/utils.js",
+            "'use strict';\n\nexports.normalizeType = function (type) {\n  return type;\n};\n\nexports.setCharset = function setCharset(type, charset) {\n  return type + charset;\n};\n",
+        )
+        .edge_after("function send", "calls", "function setCharset")
+        .no_edge_after("function send", "calls", "function normalizeType")
+}
+
+/// Upstream #2433: `require('./widget').default` of an ES module is its
+/// default export once the module appears, under whatever local name.
+pub fn typescript_require_default_of_an_added_es_module() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::TypeScript])
+        .file(
+            "src/main.ts",
+            "export function mount(): unknown {\n  const Ctor = require('./widget').default;\n  return new Ctor();\n}\n",
+        )
+        .write(
+            "src/widget.ts",
+            "function helper(): number {\n  return 1;\n}\n\nexport default class Widget {\n  size = helper();\n}\n",
+        )
+        .edge_after("function mount", "instantiates", "class Widget")
+}
+
 /// Upstream #2392 (3): a Svelte import links the component file once it appears.
 pub fn svelte_import_of_an_added_component() -> Case {
     Case::new(Change::AddImportTarget, &[Language::Svelte])

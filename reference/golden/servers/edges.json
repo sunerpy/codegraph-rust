@@ -158,6 +158,18 @@
   {
     "col": 14,
     "kind": "imports",
+    "line": 2,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "file:express/app.js",
+    "target": "file:express/routes/users.js"
+  },
+  {
+    "col": 14,
+    "kind": "imports",
     "line": 3,
     "metadata": {
       "confidence": 0.9,

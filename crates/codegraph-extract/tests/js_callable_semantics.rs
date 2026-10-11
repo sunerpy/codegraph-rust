@@ -415,3 +415,63 @@ fn module_scope_destructuring_records_its_initializer_calls() {
         );
     }
 }
+
+/// Upstream #2263: a local `require('…')` specifier is an `imports` ref from
+/// the file, once per specifier; a package, `require.resolve`, a member's
+/// `require`, a template with a hole, comments, strings and TypeScript's
+/// `import x = require(…)` are not.
+#[test]
+fn commonjs_requires_import_the_local_files_they_name() {
+    let code = [
+        "var proto = require('./application');",
+        "var again = require('./application');",
+        "var pkg = require('express');",
+        "var root = require('..');",
+        "var alias = require(\"@/lib/x\");",
+        "var raw = require(`./tpl`);",
+        "var hole = require(`./${name}`);",
+        "var path = require.resolve('./resolved');",
+        "var other = loader.require('./member');",
+        "// require('./commented')",
+        "var text = \"require('./quoted')\";",
+        "",
+    ]
+    .join("\n");
+    let result = extract("lib/express.js", &code, Language::JavaScript);
+    let imports: Vec<(&str, i64, &str)> = result
+        .unresolved_references
+        .iter()
+        .filter(|reference| reference.reference_kind == EdgeKind::Imports)
+        .map(|reference| {
+            (
+                reference.reference_name.as_str(),
+                reference.line,
+                reference.from_node_id.as_str(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        imports,
+        [
+            ("./application", 1, "file:lib/express.js"),
+            ("..", 4, "file:lib/express.js"),
+            ("@/lib/x", 5, "file:lib/express.js"),
+            ("./tpl", 6, "file:lib/express.js"),
+        ]
+    );
+    // TypeScript's `import x = require(…)` is an import statement already:
+    // the require reader adds no second import of it.
+    let ts = extract(
+        "src/main.ts",
+        "import helper = require('./helper');\nexport const value = helper.run();\n",
+        Language::TypeScript,
+    );
+    let helper_imports = ts
+        .unresolved_references
+        .iter()
+        .filter(|reference| {
+            reference.reference_kind == EdgeKind::Imports && reference.reference_name == "./helper"
+        })
+        .count();
+    assert!(helper_imports <= 1, "{:?}", ts.unresolved_references);
+}

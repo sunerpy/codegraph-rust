@@ -516,6 +516,15 @@ fn resolve_relative_import(
 
     let base_path = pathutil::resolve(from_dir, import_path);
     let relative_path = pathutil::relative(project_root, &base_path);
+    // `require('..')` up to the project root is its `index.js` (upstream
+    // #2189): only the `/index…` candidates name a file there.
+    if relative_path.is_empty() || relative_path == "." {
+        return extension_resolution(language)
+            .iter()
+            .filter_map(|extension| extension.strip_prefix('/'))
+            .find(|candidate| context.file_exists(candidate))
+            .map(str::to_string);
+    }
     resolve_source_candidate(&relative_path, language, context)
 }
 
@@ -690,11 +699,16 @@ fn js_import_regex() -> &'static Regex {
     })
 }
 
+/// A `require` binding: each declarator of a list too (`var express =
+/// require('../'), request = require('supertest')`), and a member of the
+/// module (`require('./utils').methods`, upstream #2189).
 fn js_require_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
-        Regex::new(r#"(?:const|let|var)\s+(?:(\w+)|\{([^}]+)\})\s*=\s*require\(['"]([^'"]+)['"]\)"#)
-            .expect("valid JS require regex")
+        Regex::new(
+            r#"(?:(?-u:\b)(?:const|let|var)\s+|,\s*)(?:([A-Za-z_$][0-9A-Za-z_$]*)|\{([^}]+)\})\s*=\s*require\(\s*['"]([^'"]+)['"]\s*\)(?:\s*\.\s*([A-Za-z_$][0-9A-Za-z_$]*))?"#,
+        )
+        .expect("valid JS require regex")
     })
 }
 
@@ -783,13 +797,16 @@ fn extract_js_imports(content: &str) -> Vec<ImportMapping> {
         let default_name = caps.get(1).map(|m| m.as_str());
         let destructured = caps.get(2).map(|m| m.as_str());
         let source = caps.get(3).map(|m| m.as_str()).unwrap_or_default();
+        let member = caps.get(4).map(|m| m.as_str());
 
         if let Some(default_name) = default_name {
+            // `require('./utils').setCharset` is the module's `setCharset`,
+            // not its default (upstream #2189).
             mappings.push(ImportMapping {
                 local_name: default_name.to_string(),
-                exported_name: "default".to_string(),
+                exported_name: member.unwrap_or("default").to_string(),
                 source: source.to_string(),
-                is_default: true,
+                is_default: member.is_none(),
                 is_namespace: false,
             });
         }
@@ -797,7 +814,7 @@ fn extract_js_imports(content: &str) -> Vec<ImportMapping> {
         if let Some(destructured) = destructured {
             for raw in destructured.split(',') {
                 let name = raw.trim();
-                if let Some((orig, alias)) = parse_colon_alias(name) {
+                if let Some((orig, alias)) = parse_js_colon_alias(name) {
                     mappings.push(ImportMapping {
                         local_name: alias,
                         exported_name: orig,
@@ -1038,9 +1055,14 @@ fn parse_as_alias(name: &str) -> Option<(String, String)> {
         .map(|c| (c[1].to_string(), c[2].to_string()))
 }
 
-fn parse_colon_alias(name: &str) -> Option<(String, String)> {
+/// `key: local` in a destructured `require` pattern, with JS identifiers
+/// (`$` included, upstream's `[A-Za-z_$][\w$]*`).
+fn parse_js_colon_alias(name: &str) -> Option<(String, String)> {
     static RE: OnceLock<Regex> = OnceLock::new();
-    let re = RE.get_or_init(|| Regex::new(r"(\w+)\s*:\s*(\w+)").expect("colon-alias"));
+    let re = RE.get_or_init(|| {
+        Regex::new(r"([A-Za-z_$][0-9A-Za-z_$]*)\s*:\s*([A-Za-z_$][0-9A-Za-z_$]*)")
+            .expect("js colon alias")
+    });
     re.captures(name)
         .map(|c| (c[1].to_string(), c[2].to_string()))
 }
@@ -1420,6 +1442,50 @@ pub fn extract_re_exports(content: &str, language: Language) -> Vec<ReExport> {
             exported_name: "default".to_string(),
             original_name: caps[1].to_string(),
         });
+    }
+
+    // CommonJS (upstream #2189): `exports.setCharset = function setCharset(…)`,
+    // `module.exports.x = impl`, and `module.exports = { parse, format:
+    // formatDate }`.
+    static CJS_MEMBER_RE: OnceLock<Regex> = OnceLock::new();
+    static CJS_OBJECT_RE: OnceLock<Regex> = OnceLock::new();
+    static CJS_ENTRY_RE: OnceLock<Regex> = OnceLock::new();
+    let cjs_member_re = CJS_MEMBER_RE.get_or_init(|| {
+        Regex::new(
+            r"(?m)^[ \t]*(?:module\.)?exports\.([A-Za-z_$][0-9A-Za-z_$]*)\s*=\s*(?:(?:async\s+)?function\s*\*?\s*([A-Za-z_$][0-9A-Za-z_$]*)\s*\(|([A-Za-z_$][0-9A-Za-z_$]*)\s*;?[ \t]*$)",
+        )
+        .expect("commonjs member export")
+    });
+    let cjs_object_re = CJS_OBJECT_RE.get_or_init(|| {
+        Regex::new(r"(?m)^[ \t]*module\.exports\s*=\s*\{([^{}]*)\}")
+            .expect("commonjs object export")
+    });
+    let cjs_entry_re = CJS_ENTRY_RE.get_or_init(|| {
+        Regex::new(r"^\s*([A-Za-z_$][0-9A-Za-z_$]*)\s*(?::\s*([A-Za-z_$][0-9A-Za-z_$]*)\s*)?$")
+            .expect("commonjs object entry")
+    });
+    for caps in cjs_member_re.captures_iter(content) {
+        let local = caps.get(2).or_else(|| caps.get(3));
+        if let Some(local) = local {
+            out.push(ReExport::CommonJsAlias {
+                exported_name: caps[1].to_string(),
+                original_name: local.as_str().to_string(),
+            });
+        }
+    }
+    for caps in cjs_object_re.captures_iter(content) {
+        for raw in caps[1].split(',') {
+            if let Some(entry) = cjs_entry_re.captures(raw) {
+                let exported = entry[1].to_string();
+                let local = entry
+                    .get(2)
+                    .map_or_else(|| exported.clone(), |m| m.as_str().to_string());
+                out.push(ReExport::CommonJsAlias {
+                    exported_name: exported,
+                    original_name: local,
+                });
+            }
+        }
     }
 
     out
@@ -2098,6 +2164,153 @@ fn resolve_java_imported_reference(
     None
 }
 
+/// What `module.exports = …` (also `exports = module.exports = …`) default
+/// exports (upstream #2189 `commonJsDefaultExport`).
+enum CommonJsDefault {
+    /// The module it forwards: `module.exports = require('./lib/express')`.
+    Forward(String),
+    /// The name it binds: `createApplication`, `function name(`, `class Name`.
+    Binding(String),
+}
+
+fn commonjs_default_export(
+    file_path: &str,
+    context: &dyn ResolutionContext,
+) -> Option<CommonJsDefault> {
+    static COMMONJS_DEFAULT_EXPORT: OnceLock<Regex> = OnceLock::new();
+    if !is_js_family_file(file_path) {
+        return None;
+    }
+    let source = context.read_file_shared(file_path)?;
+    if !source.contains("module.exports") {
+        return None;
+    }
+    let pattern = COMMONJS_DEFAULT_EXPORT.get_or_init(|| {
+        Regex::new(
+            r#"(?m)^[ \t]*(?:exports\s*=\s*)?module\.exports\s*=\s*(?:exports\s*=\s*)?(?:require\(\s*['"]([^'"]+)['"]\s*\)\s*;?[ \t]*$|(?:async\s+)?function\s*\*?\s*([A-Za-z_$][0-9A-Za-z_$]*)\s*\(|class\s+([A-Za-z_$][0-9A-Za-z_$]*)|([A-Za-z_$][0-9A-Za-z_$]*)\s*;?[ \t]*$)"#,
+        )
+        .expect("commonjs default export")
+    });
+    let captures = pattern.captures(&source)?;
+    if let Some(forward) = captures.get(1) {
+        return Some(CommonJsDefault::Forward(forward.as_str().to_string()));
+    }
+    captures
+        .get(2)
+        .or_else(|| captures.get(3))
+        .or_else(|| captures.get(4))
+        .map(|name| CommonJsDefault::Binding(name.as_str().to_string()))
+}
+
+/// `[cm]?[jt]sx?`: a JS-family file (upstream `JS_FAMILY_FILE`).
+fn is_js_family_file(file_path: &str) -> bool {
+    let Some((_, extension)) = file_path.rsplit_once('.') else {
+        return false;
+    };
+    let extension = extension.strip_prefix(['c', 'm']).unwrap_or(extension);
+    matches!(extension, "js" | "jsx" | "ts" | "tsx")
+}
+
+/// Languages with ES import semantics (upstream `ESM_IMPORT_LANGUAGES`).
+fn is_esm_import_language(language: Language) -> bool {
+    matches!(
+        language,
+        Language::TypeScript
+            | Language::Tsx
+            | Language::JavaScript
+            | Language::Jsx
+            | Language::ArkTs
+            | Language::Svelte
+            | Language::Vue
+            | Language::Astro
+    )
+}
+
+/// The node a CommonJS export alias (`exports.x = impl`) names for
+/// `exported_name`: the file's first node of that local name (upstream
+/// `exportedByName`'s clause aliases).
+fn commonjs_alias_target(
+    exported_name: &str,
+    re_exports: &[ReExport],
+    nodes_in_file: &[Arc<Node>],
+) -> Option<Node> {
+    let local = re_exports.iter().find_map(|rex| match rex {
+        ReExport::CommonJsAlias {
+            exported_name: exported,
+            original_name,
+        } if exported == exported_name => Some(original_name.as_str()),
+        _ => None,
+    })?;
+    nodes_in_file
+        .iter()
+        .find(|n| n.name == local && n.kind != NodeKind::File)
+        .map(|n| n.as_ref().clone())
+}
+
+/// The declaration an ES module default-exports, when it has an ESM default
+/// export at all (upstream #2433 `hasEsmDefaultExport` / `esmDefaultExport`):
+/// the component a single-file component file is, else what an `export
+/// default NAME` statement names, else the first exported function or class
+/// of a file with an `export default` statement. A CommonJS module has none,
+/// though its `exports.x = function` declarations are exported.
+fn esm_default_export(
+    file_path: &str,
+    nodes_in_file: &[Arc<Node>],
+    re_exports: &[ReExport],
+    context: &dyn ResolutionContext,
+) -> Option<Node> {
+    static ESM_DEFAULT_EXPORT: OnceLock<Regex> = OnceLock::new();
+    if let Some(component) = nodes_in_file
+        .iter()
+        .find(|n| n.is_exported && n.kind == NodeKind::Component)
+    {
+        return Some(component.as_ref().clone());
+    }
+    if !is_js_family_file(file_path) {
+        return None;
+    }
+    let source = context.read_file_shared(file_path)?;
+    if !source.contains("default")
+        || !ESM_DEFAULT_EXPORT
+            .get_or_init(|| {
+                Regex::new(r"(?m)^[ \t]*export\s+default(?-u:\b)").expect("export default")
+            })
+            .is_match(&source)
+    {
+        return None;
+    }
+    let bound = re_exports.iter().find_map(|rex| match rex {
+        ReExport::LocalAlias {
+            exported_name,
+            original_name,
+        } if exported_name == "default" => Some(original_name.as_str()),
+        _ => None,
+    });
+    bound
+        .and_then(|name| {
+            nodes_in_file
+                .iter()
+                .filter(|n| {
+                    n.name == name
+                        && matches!(
+                            n.kind,
+                            NodeKind::Function
+                                | NodeKind::Class
+                                | NodeKind::Component
+                                | NodeKind::Constant
+                                | NodeKind::Variable
+                        )
+                })
+                .min_by_key(|n| (n.start_line, n.start_column))
+        })
+        .or_else(|| {
+            nodes_in_file
+                .iter()
+                .find(|n| n.is_exported && matches!(n.kind, NodeKind::Function | NodeKind::Class))
+        })
+        .map(|n| n.as_ref().clone())
+}
+
 /// Recursive depth cap for re-export chains (`REEXPORT_MAX_DEPTH`,
 /// `import-resolver.ts:1798`).
 const REEXPORT_MAX_DEPTH: u32 = 8;
@@ -2207,6 +2420,42 @@ fn find_exported_symbol(
         {
             return Some(direct.as_ref().clone());
         }
+        // CommonJS: `module.exports = createApplication`, or `=
+        // require('./lib/express')` (upstream #2189).
+        match commonjs_default_export(file_path, context) {
+            Some(CommonJsDefault::Forward(source)) => {
+                if let Some(next) = resolve_import_path(&source, file_path, language, context) {
+                    return find_exported_symbol(
+                        &next,
+                        want,
+                        language,
+                        context,
+                        visited,
+                        depth + 1,
+                    );
+                }
+            }
+            Some(CommonJsDefault::Binding(name)) => {
+                if let Some(bound) = nodes_in_file
+                    .iter()
+                    .filter(|n| {
+                        n.name == name
+                            && matches!(
+                                n.kind,
+                                NodeKind::Function
+                                    | NodeKind::Class
+                                    | NodeKind::Component
+                                    | NodeKind::Constant
+                                    | NodeKind::Variable
+                            )
+                    })
+                    .min_by_key(|n| (n.start_line, n.start_column))
+                {
+                    return Some(bound.as_ref().clone());
+                }
+            }
+            None => {}
+        }
     } else if want.is_namespace {
         if let Some(member) = &want.member_name {
             if let Some(direct) = nodes_in_file
@@ -2215,12 +2464,32 @@ fn find_exported_symbol(
             {
                 return Some(direct.as_ref().clone());
             }
+            if let Some(aliased) = commonjs_alias_target(member, &re_exports, &nodes_in_file) {
+                return Some(aliased);
+            }
         }
     } else if let Some(direct) = nodes_in_file
         .iter()
         .find(|n| n.name == want.exported_name && n.is_exported)
     {
         return Some(direct.as_ref().clone());
+    } else if let Some(aliased) =
+        commonjs_alias_target(&want.exported_name, &re_exports, &nodes_in_file)
+    {
+        return Some(aliased);
+    } else if depth == 0
+        && want.exported_name == "default"
+        && is_esm_import_language(language)
+        && let Some(esm_default) =
+            esm_default_export(file_path, &nodes_in_file, &re_exports, context)
+    {
+        // `require('./x').default` and `const { default: X } = require('./x')`
+        // read the `default` property of module.exports. A CommonJS module
+        // sets it by name (`exports.default = fn`, found just above); a module
+        // written as an ES module sets it to its default export, which is no
+        // named export (upstream #2433). Only in the module asked for:
+        // `export * from` never forwards a default.
+        return Some(esm_default);
     }
 
     // Cross-file re-export hits (import-resolver.ts:1855-1893).
@@ -2261,7 +2530,9 @@ fn find_exported_symbol(
                     }
                 }
             }
-            ReExport::Wildcard { .. } | ReExport::LocalAlias { .. } => {}
+            ReExport::Wildcard { .. }
+            | ReExport::LocalAlias { .. }
+            | ReExport::CommonJsAlias { .. } => {}
         }
     }
 
@@ -2276,7 +2547,9 @@ fn find_exported_symbol(
                     }
                 }
             }
-            ReExport::Named { .. } | ReExport::LocalAlias { .. } => {}
+            ReExport::Named { .. }
+            | ReExport::LocalAlias { .. }
+            | ReExport::CommonJsAlias { .. } => {}
         }
     }
 
@@ -3493,10 +3766,14 @@ mod tests {
     #[test]
     fn parse_colon_alias_extracts_orig_and_alias() {
         assert_eq!(
-            parse_colon_alias("foo: bar"),
+            parse_js_colon_alias("foo: bar"),
             Some(("foo".to_string(), "bar".to_string()))
         );
-        assert_eq!(parse_colon_alias("foo"), None);
+        assert_eq!(parse_js_colon_alias("foo"), None);
+        assert_eq!(
+            parse_js_colon_alias("$el: $root"),
+            Some(("$el".to_string(), "$root".to_string()))
+        );
     }
 
     #[test]
@@ -3576,6 +3853,62 @@ import * as ns from './baz';
             js_bindings("import type from './type';\n"),
             ["type<default"]
         );
+    }
+
+    #[test]
+    fn extract_js_imports_reads_require_lists_and_members() {
+        let content = "var express = require('../')\n  , request = require('supertest');\nvar setCharset = require('./utils').setCharset;\nconst { default: Service, $el: el } = require('./service');\n";
+        let mappings = extract_js_imports(content);
+        let find = |local: &str| {
+            mappings
+                .iter()
+                .find(|m| m.local_name == local)
+                .unwrap_or_else(|| panic!("{local}: {mappings:?}"))
+        };
+        assert!(find("express").is_default && find("express").source == "../");
+        assert!(find("request").is_default && find("request").source == "supertest");
+        let member = find("setCharset");
+        assert!(!member.is_default);
+        assert_eq!(member.exported_name, "setCharset");
+        assert_eq!(find("Service").exported_name, "default");
+        assert_eq!(find("el").exported_name, "$el");
+    }
+
+    #[test]
+    fn extract_re_exports_reads_commonjs_export_aliases() {
+        let content = "exports.setCharset = function setCharset(type) { return type; };\nmodule.exports.alias = impl;\nexports.default = formatDate;\nmodule.exports = { parse, format: formatDate };\n";
+        let aliases: Vec<(String, String)> = extract_re_exports(content, Language::JavaScript)
+            .into_iter()
+            .filter_map(|rex| match rex {
+                ReExport::CommonJsAlias {
+                    exported_name,
+                    original_name,
+                } => Some((exported_name, original_name)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            aliases,
+            [
+                ("setCharset".to_string(), "setCharset".to_string()),
+                ("alias".to_string(), "impl".to_string()),
+                ("default".to_string(), "formatDate".to_string()),
+                ("parse".to_string(), "parse".to_string()),
+                ("format".to_string(), "formatDate".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn js_family_files_carry_js_or_ts_extensions() {
+        for file in [
+            "a.js", "a.cjs", "a.mjs", "a.jsx", "a.ts", "a.mts", "a.cts", "a.tsx",
+        ] {
+            assert!(is_js_family_file(file), "{file}");
+        }
+        for file in ["a.vue", "a.svelte", "a.json", "a", "a.py"] {
+            assert!(!is_js_family_file(file), "{file}");
+        }
     }
 
     #[test]

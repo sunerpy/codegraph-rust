@@ -135,7 +135,10 @@ indexes, and migration history.
 `ReferenceResolver` reads the complete extracted snapshot (or the bounded
 streaming path for very large graphs), then applies deterministic strategies:
 
-1. language-aware imports, re-exports, packages, and paths;
+1. language-aware imports, re-exports, packages, and paths (a CommonJS
+   `require('./x')` imports its file, and a call through a `require` binding
+   follows `module.exports`, `exports.name = …`, a `require(…).member` and a
+   `.default` the way the module exports them);
 2. qualified, scoped, receiver/type, lexical, and exact-name matching (a
    receiver written as, or inferred to be, a type the project does not declare
    stops the name guesses, except that a C# call still reaches the one

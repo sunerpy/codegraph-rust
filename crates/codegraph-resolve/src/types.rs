@@ -287,6 +287,15 @@ pub enum ReExport {
         /// Name of the local declaration.
         original_name: String,
     },
+    /// A CommonJS export of a local binding by name (upstream #2189):
+    /// `exports.setCharset = function setCharset(…)`, `module.exports.x =
+    /// impl`, `module.exports = { parse, format: formatDate }`.
+    CommonJsAlias {
+        /// Name as exported by THIS file.
+        exported_name: String,
+        /// Name of the local declaration.
+        original_name: String,
+    },
 }
 
 /// Result of a [`FrameworkResolver`] extension's file extraction.

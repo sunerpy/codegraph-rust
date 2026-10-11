@@ -1663,4 +1663,244 @@ mod js {
         assert_edge!(project, "function retry" => calls => "function clearError @pages/lists.vue");
         assert_no_edge!(project, "function retry" => calls => "function retry");
     }
+
+    /// The distinct files an `imports` edge from any node of `file` reaches,
+    /// other than `file` itself.
+    fn imported_files(graph: &Graph, file: &str) -> Vec<String> {
+        let mut files: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|edge| {
+                edge.kind == "imports"
+                    && graph
+                        .node(&edge.source)
+                        .is_some_and(|node| node.file_path == file)
+            })
+            .filter_map(|edge| graph.node(&edge.target))
+            .map(|node| node.file_path.clone())
+            .filter(|path| path != file)
+            .collect();
+        files.sort();
+        files.dedup();
+        files
+    }
+
+    /// `kind file:name` of the calls and instantiations out of `file`'s nodes.
+    fn out_of(graph: &Graph, file: &str) -> Vec<String> {
+        let mut edges: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|edge| {
+                (edge.kind == "calls" || edge.kind == "instantiates")
+                    && graph
+                        .node(&edge.source)
+                        .is_some_and(|node| node.file_path == file)
+            })
+            .filter_map(|edge| {
+                graph
+                    .node(&edge.target)
+                    .map(|target| format!("{} {}:{}", edge.kind, target.file_path, target.name))
+            })
+            .collect();
+        edges.sort();
+        edges
+    }
+
+    /// `kind source-file resolvedBy` of the edges of `kinds` into the node of
+    /// `file` named `name` (an import node aside).
+    fn into(graph: &Graph, file: &str, name: &str, kinds: &[&str]) -> Vec<String> {
+        let target = graph
+            .nodes
+            .iter()
+            .find(|node| node.file_path == file && node.name == name && node.kind != "import")
+            .unwrap_or_else(|| panic!("{file}: {name}"));
+        let mut edges: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.target == target.id && kinds.contains(&edge.kind.as_str()))
+            .map(|edge| {
+                format!(
+                    "{} {} {}",
+                    edge.kind,
+                    graph
+                        .node(&edge.source)
+                        .map_or("?", |node| node.file_path.as_str()),
+                    edge.resolved_by().unwrap_or("?")
+                )
+            })
+            .collect();
+        edges.sort();
+        edges
+    }
+
+    /// Upstream #2263 (`c4babfce`), its extraction half: a CommonJS
+    /// `require('./x')` imports the file it names, as ESM's `import` does,
+    /// used as a value or not; a package stays outside the index, and a
+    /// directory require reaches its package entry (with #2189's root
+    /// `index.js`).
+    #[test]
+    fn pr2263_a_commonjs_require_imports_the_file_it_names() {
+        let project = Project::new()
+            .file("package.json", "{\"name\":\"web\",\"main\":\"index.js\"}")
+            .file("index.js", "module.exports = require('./lib/express');\n")
+            .file("lib/express.js", "var EventEmitter = require('events').EventEmitter;\nvar mixin = require('merge-descriptors');\nvar proto = require('./application');\nvar req = require('./request');\n\nfunction createApplication() {\n  var app = function () {};\n  mixin(app, EventEmitter.prototype, false);\n  mixin(app, proto, false);\n  app.request = Object.create(req);\n  return app;\n}\n\nmodule.exports = createApplication;\n")
+            .file("lib/application.js", "var app = exports = module.exports = {};\napp.init = function init() {};\n")
+            .file("lib/request.js", "var req = Object.create({});\nmodule.exports = req;\n")
+            .file("test/app.js", "var express = require('..');\nvar assert = require(\"assert\");\n")
+            .file("src/main.ts", "import './polyfills';\nimport helper = require('./helper');\nexport const value = helper.run();\n")
+            .file("src/polyfills.ts", "export {};\n")
+            .file("src/helper.ts", "export function run(): number {\n  return 1;\n}\n")
+            .index();
+        let graph = project.graph();
+        assert_eq!(
+            imported_files(graph, "lib/express.js"),
+            ["lib/application.js", "lib/request.js"]
+        );
+        assert_eq!(imported_files(graph, "index.js"), ["lib/express.js"]);
+        assert_eq!(imported_files(graph, "test/app.js"), ["index.js"]);
+        assert!(
+            imported_files(graph, "src/main.ts")
+                .iter()
+                .any(|f| f == "src/polyfills.ts")
+        );
+        let to_helper = graph
+            .edges
+            .iter()
+            .filter(|edge| {
+                edge.kind == "imports"
+                    && graph
+                        .node(&edge.source)
+                        .is_some_and(|node| node.file_path == "src/main.ts")
+                    && graph.node(&edge.target).is_some_and(|node| {
+                        node.file_path == "src/helper.ts" && node.kind == "file"
+                    })
+            })
+            .count();
+        assert!(to_helper <= 1, "{to_helper}");
+    }
+
+    /// Upstream #2189 (`e77ca836`): calls through CommonJS `require` bindings
+    /// follow `module.exports` through the root `index.js` to the exported
+    /// function, read every declarator of a list, take `require(…).member` as
+    /// that member, and leave a package's call without an edge.
+    #[test]
+    fn pr2189_calls_through_commonjs_require_bindings_reach_the_right_function() {
+        let project = Project::new()
+            .file("package.json", "{\"name\":\"web\",\"main\":\"index.js\",\"devDependencies\":{\"supertest\":\"^6\"}}")
+            .file("index.js", "'use strict';\n\nmodule.exports = require('./lib/express');\n")
+            .file("lib/express.js", "'use strict';\n\nexports = module.exports = createApplication;\n\nfunction createApplication() {\n  return {};\n}\n")
+            .file("lib/utils.js", "'use strict';\n\nexports.normalizeType = function (type) {\n  return type;\n};\n\nexports.setCharset = function setCharset(type, charset) {\n  return type + charset;\n};\n")
+            .file("lib/response.js", "'use strict';\n\nvar normalizeType = require('./utils').normalizeType;\nvar setCharset = require('./utils').setCharset;\n\nfunction send(body) {\n  return setCharset(normalizeType(body), 'utf-8');\n}\n\nmodule.exports = { send };\n")
+            .file("test/app.js", "'use strict';\n\nvar express = require('../')\n  , request = require('supertest');\n\ndescribe('app', function () {\n  it('responds', function () {\n    var app = express();\n    request(app);\n  });\n});\n")
+            .index();
+        let graph = project.graph();
+        let calls_out = |file: &str| -> Vec<String> {
+            let mut calls: Vec<String> = graph
+                .edges
+                .iter()
+                .filter(|edge| {
+                    edge.kind == "calls"
+                        && graph
+                            .node(&edge.source)
+                            .is_some_and(|node| node.file_path == file)
+                })
+                .filter_map(|edge| graph.node(&edge.target))
+                .map(|node| format!("{}: {}", node.file_path, node.qualified_name))
+                .collect();
+            calls.sort();
+            calls
+        };
+        assert_eq!(
+            calls_out("test/app.js"),
+            ["lib/express.js: createApplication"]
+        );
+        assert_eq!(
+            calls_out("lib/response.js"),
+            ["lib/utils.js: normalizeType", "lib/utils.js: setCharset"]
+        );
+    }
+
+    /// Upstream #2433 (`9a1d4bd9`): `require('./x').default` and
+    /// `const { default: X } = require('./x')` read the module's `default`
+    /// property: what `exports.default` names in a CommonJS module, else an
+    /// ES module's default export (in the module asked for only), and nothing
+    /// for a CommonJS module that sets no `default`.
+    #[test]
+    fn pr2433_require_default_reaches_the_modules_default_export() {
+        let project = Project::new()
+            .file("package.json", "{\"name\":\"desktop\",\"devDependencies\":{\"svelte\":\"^4\"}}")
+            .file("src/biometrics/os-biometrics.service.ts", "export interface OsBiometricService {\n  enrollPersistent(userId: string): Promise<string>;\n}\n")
+            .file("src/biometrics/os-biometrics-mac.service.ts", "import { OsBiometricService } from './os-biometrics.service';\n\nfunction getLookupKeyForUser(userId: string): string {\n  return `${userId}_user_biometric`;\n}\n\nexport default class OsBiometricsServiceMac implements OsBiometricService {\n  async enrollPersistent(userId: string): Promise<string> {\n    return getLookupKeyForUser(userId);\n  }\n}\n")
+            .file("src/biometrics/main-biometrics.service.ts", "import { OsBiometricService } from './os-biometrics.service';\n\nexport class MainBiometricsService {\n  private osBiometricsService: OsBiometricService | undefined;\n\n  constructor(platform: string) {\n    if (platform === 'darwin') {\n      // eslint-disable-next-line\n      const OsBiometricsServiceMac = require('./os-biometrics-mac.service').default;\n      this.osBiometricsService = new OsBiometricsServiceMac();\n    }\n  }\n}\n")
+            .file("src/biometrics/os-biometrics-mac.service.spec.ts", "describe('OsBiometricsServiceMac', () => {\n  it('enrolls in an isolated module registry', async () => {\n    const { default: ServiceCtor } = require('./os-biometrics-mac.service');\n    const isolated = new ServiceCtor();\n    await isolated.enrollPersistent('user');\n  });\n});\n")
+            .file("src/App.svelte", "<script>\n  export let name = 'world';\n</script>\n\n<h1>Hello {name}!</h1>\n")
+            .file("src/main.js", "const App = require('./App.svelte').default;\n\nconst app = new App({ target: document.body });\n\nmodule.exports = app;\n")
+            .file("lib/format.js", "'use strict';\n\nexports.pad = function (value) {\n  return String(value).padStart(2, '0');\n};\n\nfunction formatDate(date) {\n  return exports.pad(date.getDate());\n}\n\nexports.default = formatDate;\n")
+            .file("lib/server.js", "'use strict';\n\nfunction createServer(options) {\n  return { options };\n}\n\nmodule.exports = createServer;\nmodule.exports.default = createServer;\nmodule.exports.createServer = createServer;\n")
+            .file("lib/plain.js", "'use strict';\n\nexports.first = function () {\n  return 1;\n};\n\nexports.second = () => 2;\n")
+            .file("src/widgets/Dial.ts", "export const DIAL_SIZE = 3;\n\nexport default class Dial {\n  size = DIAL_SIZE;\n}\n")
+            .file("src/widgets/index.ts", "export * from './Dial';\n")
+            .file("src/dashboard.ts", "export function mountDashboard(): unknown {\n  const Widget = require('./widgets').default;\n  return new Widget();\n}\n")
+            .file("lib/app.js", "'use strict';\n\nconst format = require('./format').default;\nconst build = require('./server').default;\nconst { default: fastify } = require('./server');\nconst plain = require('./plain').default;\n\nfunction start() {\n  const server = build({ port: 3000 });\n  fastify({ logger: true });\n  plain();\n  return format(new Date()) + server.options.port;\n}\n\nmodule.exports = start;\n")
+            .file("py/__init__.py", "")
+            .file("py/mod.py", "def first():\n    return 1\n")
+            .file("py/use.py", "from .mod import default\n\n\ndef run():\n    return default()\n")
+            .index();
+        let graph = project.graph();
+        assert_eq!(
+            into(
+                graph,
+                "src/biometrics/os-biometrics-mac.service.ts",
+                "OsBiometricsServiceMac",
+                &["instantiates"]
+            ),
+            [
+                "instantiates src/biometrics/main-biometrics.service.ts import",
+                "instantiates src/biometrics/os-biometrics-mac.service.spec.ts import",
+            ]
+        );
+        assert_eq!(
+            into(graph, "src/App.svelte", "App", &["instantiates"]),
+            ["instantiates src/main.js import"]
+        );
+        assert!(
+            out_of(graph, "lib/app.js")
+                .iter()
+                .any(|e| e == "calls lib/format.js:formatDate")
+        );
+        assert!(into(graph, "lib/format.js", "pad", &["calls"]).is_empty());
+        assert_eq!(
+            into(graph, "lib/server.js", "createServer", &["calls"]),
+            ["calls lib/app.js import", "calls lib/app.js import"]
+        );
+        assert!(into(graph, "lib/plain.js", "first", &["calls"]).is_empty());
+        assert!(into(graph, "lib/plain.js", "second", &["calls"]).is_empty());
+        assert!(
+            into(
+                graph,
+                "src/widgets/Dial.ts",
+                "Dial",
+                &["instantiates", "calls"]
+            )
+            .is_empty()
+        );
+        assert!(
+            out_of(graph, "src/dashboard.ts").is_empty(),
+            "{:?}",
+            out_of(graph, "src/dashboard.ts")
+        );
+        let foreign: Vec<String> = out_of(graph, "lib/app.js")
+            .into_iter()
+            .filter(|edge| !edge.contains(" lib/app.js:"))
+            .collect();
+        assert_eq!(
+            foreign,
+            [
+                "calls lib/format.js:formatDate",
+                "calls lib/server.js:createServer",
+                "calls lib/server.js:createServer",
+            ]
+        );
+        assert!(into(graph, "py/mod.py", "first", &["calls"]).is_empty());
+    }
 }

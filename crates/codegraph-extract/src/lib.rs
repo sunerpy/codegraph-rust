@@ -8,6 +8,7 @@
     clippy::manual_contains
 )]
 
+mod commonjs_requires;
 pub mod embedded;
 pub mod engine;
 pub mod ext_config;
