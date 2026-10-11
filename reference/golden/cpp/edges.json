@@ -228,6 +228,18 @@
     "target": "struct:860b4dfc2d8e87f389dbeb7e3370cac2"
   },
   {
+    "col": 22,
+    "kind": "references",
+    "line": 10,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "function:87a31607b9531ae0a01b03caf6c870aa",
+    "target": "class:2e7e24e7488b3868c5b2924a018549c9"
+  },
+  {
     "col": 25,
     "kind": "calls",
     "line": 38,

@@ -403,6 +403,25 @@ pub fn java_static_field_read_body_edit() -> Case {
         )
 }
 
+/// G4: a C++ read through a capitalized scope references the type it names.
+pub fn cpp_scoped_read_body_edit() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Cpp])
+        .file(
+            "src/colors.hpp",
+            "enum Color { RED, GREEN };\nenum Shade { DARK, LIGHT };\n",
+        )
+        .file(
+            "src/paint.cpp",
+            "#include \"colors.hpp\"\n\nint paint() {\n  return Color::RED;\n}\n",
+        )
+        .write(
+            "src/paint.cpp",
+            "#include \"colors.hpp\"\n\nint paint() {\n  return Shade::DARK;\n}\n",
+        )
+        .edge_before("function paint", "references", "enum Color")
+        .edge_after("function paint", "references", "enum Shade")
+}
+
 /// #895: a Go package value reads what its initializer names.
 pub fn go_value_initializer_body_edit() -> Case {
     Case::new(Change::BodyEdit, &[Language::Go])

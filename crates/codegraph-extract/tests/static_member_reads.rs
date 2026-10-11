@@ -125,12 +125,18 @@ fn rust_variant_paths_reference_their_receiver() {
     );
 }
 
-/// tree-sitter-cpp writes the scope of `Color::RED` as a `namespace_identifier`,
-/// which names no type, so a C++ scoped read gives none (as upstream).
+/// C++: `Color::RED` and `Limits::kMax` reference the scope they read
+/// through. tree-sitter-cpp writes every scope as a `namespace_identifier`, so
+/// the scope is read only when it is capitalized; a lowercase namespace
+/// (`std::`, `ns::`) and a global-scope read (`::g`) name no type, and a call
+/// (`Factory::make()`) is the call's.
 #[test]
-fn a_cpp_scoped_read_names_no_type() {
-    let source = "enum Color { RED };\nint f() { return Color::RED; }\n";
-    assert!(member_reads("src/f.cpp", source, Language::Cpp).is_empty());
+fn cpp_scoped_reads_reference_their_scope() {
+    let source = "enum Color { RED };\nstruct Limits { static const int kMax = 3; };\nint g = 0;\nint f() {\n  int a = Color::RED + Limits::kMax + ns::k + ::g;\n  return a + Factory::make();\n}\n";
+    assert_eq!(
+        member_reads("src/f.cpp", source, Language::Cpp),
+        pairs(&[("f", "Color"), ("f", "Limits")])
+    );
 }
 
 /// A Swift property wrapper names a type by metatype in its arguments

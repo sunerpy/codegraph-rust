@@ -28,8 +28,9 @@ presented as a clean parse.
 A read through a type, a static member or an enum value (`JsonScope.EMPTY_DOCUMENT`,
 `Color::RED`, Rust `Mode::A` and `Self::A`), references the type it reads through in Java,
 C#, Kotlin, Swift, Scala, Dart, PHP, C++ and Rust: the receiver must be one capitalized name,
-and an access that a call is made through stays the call's. tree-sitter-cpp writes the scope
-of `Color::RED` as a namespace name, so C++ scoped reads reference nothing. A symbol also
+and an access that a call is made through stays the call's. tree-sitter-cpp writes every C++
+scope as a namespace name, so a capitalized scope (`Color::RED`, `Limits::kMax`) is read as the
+type it names; a lowercase namespace (`std::`) and a global-scope read (`::g`) name none. A symbol also
 references the constants and variables of its own file that it reads (value references, see
 [`data-model.md`](data-model.md#edges)).
 

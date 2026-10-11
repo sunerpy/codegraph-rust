@@ -5035,6 +5035,9 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
         match language {
             Language::Dart => self.extract_dart_static_member_ref(node, &owner_id),
             Language::Rust => self.extract_rust_variant_ref(node, &owner_id),
+            Language::Cpp if node.kind() == "qualified_identifier" => {
+                self.extract_cpp_scoped_read(node, &owner_id);
+            }
             _ => {
                 if !MEMBER_ACCESS_KINDS.contains(&node.kind()) || self.is_callee_of_call(node) {
                     return;
@@ -5079,6 +5082,28 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
         self.extract_static_member_ref(node);
         for child in node.named_children(&mut node.walk()) {
             self.static_member_refs_in(child);
+        }
+    }
+
+    /// C++ `Color::RED`, `Limits::kMax`: the scope a qualified read is written
+    /// through. tree-sitter-cpp writes every scope as a `namespace_identifier`,
+    /// which upstream's receiver kinds never accept, so its C++ reads link
+    /// nothing; here a capitalized scope is read as the type it names (a
+    /// namespace of that name parks unresolved). A global-scope read (`::g`)
+    /// has no scope, and a call through the path is the call's.
+    fn extract_cpp_scoped_read(&mut self, node: SyntaxNode<'tree>, owner_id: &str) {
+        if self.is_callee_of_call(node) {
+            return;
+        }
+        let Some(scope) = child_by_field(node, "scope") else {
+            return;
+        };
+        if !matches!(scope.kind(), "namespace_identifier" | "type_identifier") {
+            return;
+        }
+        let text = node_text(scope, self.source);
+        if is_capitalized_name(&text) {
+            self.push_ref(owner_id, &text, EdgeKind::References, scope);
         }
     }
 
