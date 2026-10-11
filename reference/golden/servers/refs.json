@@ -641,6 +641,16 @@
   },
   {
     "candidates": null,
+    "col": 12,
+    "file_path": "express/app.js",
+    "from_node_id": "constant:7ebbb89b6f7b9e19fabb92c0ad65118c",
+    "language": "javascript",
+    "line": 4,
+    "reference_kind": "calls",
+    "reference_name": "express"
+  },
+  {
+    "candidates": null,
     "col": 13,
     "file_path": "gin/main.go",
     "from_node_id": "function:822994b41b49c7ca4069da738515f400",

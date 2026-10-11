@@ -679,8 +679,12 @@ fn resolve_php_include_path(
 fn js_import_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
+        // `import type { X }` / `import type * as ns` is TypeScript's type-only
+        // form, not a default import named `type` (upstream #2134); the
+        // optional `type` group takes it, and `import type from './x'`, which
+        // leaves nothing else, still binds `type` (see `extract_js_imports`).
         Regex::new(
-            r#"import\s+(?:(\w+)\s*,?\s*)?(?:\{([^}]+)\})?\s*(?:(\*)\s+as\s+(\w+))?\s*from\s*['"]([^'"]+)['"]"#,
+            r#"import\s+(?:(type)\s+)?(?:(\w+)\s*,?\s*)?(?:\{([^}]+)\})?\s*(?:(\*)\s+as\s+(\w+))?\s*from\s*['"]([^'"]+)['"]"#,
         )
         .expect("valid JS import regex")
     })
@@ -718,11 +722,16 @@ fn extract_js_imports(content: &str) -> Vec<ImportMapping> {
     let mut mappings = Vec::new();
 
     for caps in js_import_regex().captures_iter(content) {
-        let default_import = caps.get(1).map(|m| m.as_str());
-        let named_imports = caps.get(2).map(|m| m.as_str());
-        let star = caps.get(3).is_some();
-        let namespace_alias = caps.get(4).map(|m| m.as_str());
-        let source = caps.get(5).map(|m| m.as_str()).unwrap_or_default();
+        let type_only = caps.get(1).is_some();
+        let named_imports = caps.get(3).map(|m| m.as_str());
+        let star = caps.get(4).is_some();
+        let namespace_alias = caps.get(5).map(|m| m.as_str());
+        let source = caps.get(6).map(|m| m.as_str()).unwrap_or_default();
+        // `import type from './x'`: the `type` group took the binding's name.
+        let default_import = caps
+            .get(2)
+            .map(|m| m.as_str())
+            .or((type_only && named_imports.is_none() && !star).then_some("type"));
 
         if let Some(default_import) = default_import {
             mappings.push(ImportMapping {
@@ -736,7 +745,7 @@ fn extract_js_imports(content: &str) -> Vec<ImportMapping> {
 
         if let Some(named) = named_imports {
             for raw in named.split(',') {
-                let name = raw.trim();
+                let name = strip_inline_type_modifier(raw.trim());
                 if let Some((orig, alias)) = parse_as_alias(name) {
                     mappings.push(ImportMapping {
                         local_name: alias,
@@ -1001,6 +1010,27 @@ fn extract_cpp_imports(content: &str) -> Vec<ImportMapping> {
     mappings
 }
 
+/// `{ util, type objectUtil }`: an inline `type` modifier is not part of the
+/// binding's name (upstream #2134, `^type\s+(?=\w)`).
+fn strip_inline_type_modifier(name: &str) -> &str {
+    let Some(rest) = name.strip_prefix("type") else {
+        return name;
+    };
+    if !rest.starts_with(char::is_whitespace) {
+        return name;
+    }
+    let rest = rest.trim_start();
+    if rest
+        .bytes()
+        .next()
+        .is_some_and(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    {
+        rest
+    } else {
+        name
+    }
+}
+
 fn parse_as_alias(name: &str) -> Option<(String, String)> {
     static RE: OnceLock<Regex> = OnceLock::new();
     let re = RE.get_or_init(|| Regex::new(r"(\w+)\s+as\s+(\w+)").expect("as-alias"));
@@ -1247,6 +1277,24 @@ fn is_out_of_repo_js_import(
     is_external_import_with(source, language, context, false)
         && !resolve_import_path(source, from_file, language, context)
             .is_some_and(|resolved| context.is_indexed_file(&resolved))
+}
+
+/// Does a JS-family import of `source`, written in `from_file`, name a module
+/// outside the repository (upstream #2120 `isOutOfRepoImport`)? A package that
+/// is not a relative path, a path alias onto an indexed file, a workspace
+/// member, or the repository's own package (`axios` inside axios). Every other
+/// language answers `false`.
+pub fn is_out_of_repo_import(
+    source: &str,
+    from_file: &str,
+    language: Language,
+    context: &dyn ResolutionContext,
+) -> bool {
+    is_js_specifier_language(language)
+        && is_out_of_repo_js_import(source, from_file, language, context)
+        && !context
+            .own_package_name()
+            .is_some_and(|own| source == own || source.starts_with(&format!("{own}/")))
 }
 
 /// Does a Rust `use` path name a crate outside the repository?
@@ -3478,6 +3526,54 @@ import * as ns from './baz';
         assert!(
             m.iter()
                 .any(|x| x.local_name == "ns" && x.exported_name == "*" && x.is_namespace)
+        );
+    }
+
+    /// `local<exported` (` ns` for a namespace), the shape of upstream
+    /// #2134's `import-type-modifier.test.ts`.
+    fn js_bindings(source: &str) -> Vec<String> {
+        extract_import_mappings(source, Language::TypeScript)
+            .into_iter()
+            .map(|m| {
+                format!(
+                    "{}<{}{}",
+                    m.local_name,
+                    m.exported_name,
+                    if m.is_namespace { " ns" } else { "" }
+                )
+            })
+            .collect()
+    }
+
+    /// Upstream #2134: a type-only import binds its names, never `type`.
+    #[test]
+    fn a_type_only_import_binds_its_names_never_type() {
+        assert_eq!(
+            js_bindings("import type { enumUtil } from './helpers/enumUtil.js';\n"),
+            ["enumUtil<enumUtil"]
+        );
+        assert_eq!(js_bindings("import type * as z from './z';\n"), ["z<* ns"]);
+        assert_eq!(
+            js_bindings("import type Foo from './foo';\n"),
+            ["Foo<default"]
+        );
+    }
+
+    /// Upstream #2134: an inline `type` modifier is not part of the name, and
+    /// a default import that is named `type` is still one.
+    #[test]
+    fn an_inline_type_modifier_is_not_part_of_the_name() {
+        assert_eq!(
+            js_bindings("import { util, type objectUtil } from './helpers/util.js';\n"),
+            ["util<util", "objectUtil<objectUtil"]
+        );
+        assert_eq!(
+            js_bindings("import { type A as B } from './ab';\n"),
+            ["B<A"]
+        );
+        assert_eq!(
+            js_bindings("import type from './type';\n"),
+            ["type<default"]
         );
     }
 

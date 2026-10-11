@@ -701,6 +701,81 @@ fn is_bare_go_call(reference: &RefView, context: &dyn ResolutionContext) -> bool
     reference.language == Language::Go && is_receiver_less_call(reference, context)
 }
 
+/// What only exists inside a type, reachable through a receiver alone
+/// (upstream #2120 `TYPE_MEMBER_KINDS`).
+fn is_type_member_kind(kind: NodeKind) -> bool {
+    matches!(
+        kind,
+        NodeKind::Method | NodeKind::Property | NodeKind::Field | NodeKind::EnumMember
+    )
+}
+
+/// The first import binding the file declares under `name`.
+fn import_binding_named(
+    name: &str,
+    reference: &RefView,
+    context: &dyn ResolutionContext,
+) -> Option<crate::types::ImportMapping> {
+    context
+        .get_import_mappings(&reference.file_path, reference.language)
+        .into_iter()
+        .find(|mapping| mapping.local_name == name)
+}
+
+/// Does the file bind `name` by importing it from outside the repository
+/// (upstream #2120 `isOutOfRepoBinding`)?
+fn is_out_of_repo_binding(
+    name: &str,
+    reference: &RefView,
+    context: &dyn ResolutionContext,
+) -> bool {
+    import_binding_named(name, reference, context).is_some_and(|mapping| {
+        crate::import_resolver::is_out_of_repo_import(
+            &mapping.source,
+            &reference.file_path,
+            reference.language,
+            context,
+        )
+    })
+}
+
+/// Is the root of a member call's receiver (`z` in `z.string`, `ns` in
+/// `ns.util.fn`) an import binding that is a module namespace, or one from
+/// outside the repository (upstream #2120 `isImportedModuleReceiver`)?
+fn is_imported_module_receiver(
+    receiver: &str,
+    reference: &RefView,
+    context: &dyn ResolutionContext,
+) -> bool {
+    let root = receiver.split('.').next().unwrap_or(receiver);
+    import_binding_named(root, reference, context).is_some_and(|mapping| {
+        mapping.is_namespace
+            || crate::import_resolver::is_out_of_repo_import(
+                &mapping.source,
+                &reference.file_path,
+                reference.language,
+                context,
+            )
+    })
+}
+
+/// Is the root of a member call's receiver (`CameraManager` in
+/// `CameraManager.x`) one of the file's imports (upstream #2134
+/// `isImportBinding`)?
+fn is_import_binding(receiver: &str, reference: &RefView, context: &dyn ResolutionContext) -> bool {
+    let root = receiver.split('.').next().unwrap_or(receiver);
+    import_binding_named(root, reference, context).is_some()
+}
+
+/// A plain JS identifier, `/^[A-Za-z_$][\w$]*$/`.
+fn is_simple_js_identifier(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    bytes
+        .next()
+        .is_some_and(|first| first.is_ascii_alphabetic() || matches!(first, b'_' | b'$'))
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'$'))
+}
+
 /// How a Rust `calls` ref recorded under a bare name was written (KEEP-RUST,
 /// P15). The extractor keeps a receiver only for an identifier, `self`, one
 /// `self.<field>` hop and a `path::call()` receiver; any other receiver —
@@ -1393,12 +1468,29 @@ pub fn match_by_exact_name(
     context: &dyn ResolutionContext,
 ) -> Option<ResolvedRef> {
     let bare_js = is_bare_js_call(reference, context);
+    // A type, a value or an import the file binds from a package outside the
+    // repository names nothing in it, whatever kind of reference it is
+    // (upstream #2134).
+    if !bare_js
+        && is_js_family(reference.language)
+        && reference.reference_kind != EdgeKind::Calls
+        && is_simple_js_identifier(&reference.reference_name)
+        && is_out_of_repo_binding(&reference.reference_name, reference, context)
+    {
+        return None;
+    }
     // A bare call bound to a store action (#1862) resolves inside that store,
     // ahead of any same-named function.
     if bare_js
         && let Some(action) = crate::js_store::match_js_store_binding_call(reference, context)
     {
         return Some(action);
+    }
+    // `import { useQuery } from '@tanstack/react-query'`, a CommonJS
+    // `require('supertest')`: the bare call means the package's, and no
+    // same-named project symbol (upstream #2120).
+    if bare_js && is_out_of_repo_binding(&reference.reference_name, reference, context) {
+        return None;
     }
     // KEEP-RUST (P15): a bare-named Rust call's shape, read from its source. A
     // method call whose receiver the extractor dropped never binds a std
@@ -1442,9 +1534,12 @@ pub fn match_by_exact_name(
     let candidates: Vec<Arc<Node>> = reachable
         .iter()
         .filter(|n| node_is_eligible_target(reference.reference_kind, n))
-        // A receiver-less JS/TS, Go or Rust call cannot reach a method (#1714,
-        // #1857; P15 R1).
-        .filter(|n| !((bare_js || bare_go || rust_bare) && n.kind == NodeKind::Method))
+        // A receiver-less JS/TS or Go call cannot reach a member of a type: a
+        // method (#1714, #1857), nor a property, field or enum case (upstream
+        // #2120: mocha's global `it(…)` bound an interface's `it` property). A
+        // bare Rust call cannot reach a method (P15 R1).
+        .filter(|n| !((bare_js || bare_go) && is_type_member_kind(n.kind)))
+        .filter(|n| !(rust_bare && n.kind == NodeKind::Method))
         // A Rust method call whose receiver was dropped reaches only a method:
         // never a function, type, enum member or import (P15 R2).
         .filter(|n| !rust_method || n.kind == NodeKind::Method)
@@ -3189,6 +3284,19 @@ pub fn match_method_call(
         return None;
     }
 
+    // A receiver the file imports is past guessing. A namespace import is the
+    // module object, whose members are its exports, never some class's method;
+    // a binding from a package outside the repository names nothing in it. The
+    // import resolver placed what it could, and a method picked by name alone
+    // is wrong (upstream #2120: zod's `z.string()` bound a test helper's
+    // `string` getter).
+    if reference.reference_kind == EdgeKind::Calls
+        && is_js_family(reference.language)
+        && is_imported_module_receiver(&object_or_class, reference, context)
+    {
+        return None;
+    }
+
     // Strategy 2: instance-variable receiver → capitalized class
     // (name-matcher.ts:852-880), call-site file first (#1079).
     let capitalized = capitalize(&object_or_class);
@@ -3235,11 +3343,23 @@ pub fn match_method_call(
         .filter(|m| m.language == reference.language)
         .cloned()
         .collect();
-    let target_methods = if !same_language.is_empty() {
+    let mut target_methods = if !same_language.is_empty() {
         same_language
     } else {
         methods
     };
+    // A receiver the file imports is another module's value: never a method
+    // declared in the calling file (upstream #2134: expo-camera's
+    // `CameraManager.isAvailableAsync()` reached `CameraView`'s own static
+    // method, the one making the call). Ruling the caller's file out may
+    // reject a guess; it must never manufacture one, so the one method left
+    // is then no likelier than before.
+    let mut narrowed = false;
+    if is_js_family(reference.language) && is_import_binding(&object_or_class, reference, context) {
+        let before = target_methods.len();
+        target_methods.retain(|method| method.file_path != reference.file_path);
+        narrowed = target_methods.len() != before;
+    }
 
     // A SINGLE same-named candidate is not on its own evidence that the receiver
     // is that candidate's type. Without the overlap check this branch bound every
@@ -3255,6 +3375,7 @@ pub fn match_method_call(
     // *bonuses* same language, it does not require it, and `Calls` edges get no
     // cross-family protection from `gate_language`.
     if target_methods.len() == 1
+        && !narrowed
         && target_methods[0].language == reference.language
         && receiver_shares_word(&object_or_class, &target_methods[0].qualified_name)
     {
@@ -3989,14 +4110,19 @@ pub fn match_fuzzy(reference: &RefView, context: &dyn ResolutionContext) -> Opti
         return None;
     };
     let bare_js_rejects = is_bare_js_call(reference, context)
-        && (candidate.kind == NodeKind::Method
+        && (is_type_member_kind(candidate.kind)
             || (candidate.file_path != reference.file_path
                 && is_locally_bound_js_name(
                     &reference.reference_name,
                     &reference.file_path,
                     context,
                 )));
+    // A name the file binds from outside the repository names nothing in it,
+    // for every reference kind (upstream #2120, #2134).
+    let out_of_repo = is_js_family(reference.language)
+        && is_out_of_repo_binding(&reference.reference_name, reference, context);
     if bare_js_rejects
+        || out_of_repo
         || (candidate.kind == NodeKind::Method
             && (is_bare_go_call(reference, context) || rust_shape == Some(RustCallShape::Bare)))
         // A builtin method call (`res.text()`) whose only same-named project

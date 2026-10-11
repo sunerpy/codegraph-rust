@@ -10,7 +10,9 @@ use crate::lru_cache::LruCache;
 use crate::path_aliases::{AliasMap, load_project_aliases};
 use crate::source_facts::SourceFacts;
 use crate::types::{GoModule, ImportMapping, ReExport, ResolutionContext};
-use crate::workspace_packages::{WorkspacePackages, load_workspace_packages};
+use crate::workspace_packages::{
+    WorkspacePackages, load_own_package_name, load_workspace_packages,
+};
 use crate::{import_resolver, pathutil};
 use codegraph_core::types::{EdgeKind, Language, Node, NodeKind};
 use codegraph_store::Store;
@@ -49,6 +51,7 @@ struct Caches {
     go_module: Option<Option<GoModule>>,
     go_modules: Option<Vec<GoModule>>,
     workspace_packages: Option<Option<WorkspacePackages>>,
+    own_package_name: Option<Option<String>>,
     all_files: Option<Arc<Vec<String>>>,
     files_by_basename: Option<HashMap<String, Arc<Vec<String>>>>,
     /// Existence answers for the pass: import resolution probes every extension
@@ -78,6 +81,7 @@ impl Caches {
             go_module: None,
             go_modules: None,
             workspace_packages: None,
+            own_package_name: None,
             all_files: None,
             files_by_basename: None,
             file_exists: HashMap::new(),
@@ -436,6 +440,14 @@ impl ResolutionContext for StoreResolutionContext<'_> {
             c.workspace_packages = Some(loaded);
         }
         c.workspace_packages.clone().flatten()
+    }
+
+    fn own_package_name(&self) -> Option<String> {
+        let mut c = self.caches.borrow_mut();
+        if c.own_package_name.is_none() {
+            c.own_package_name = Some(load_own_package_name(&self.project_root));
+        }
+        c.own_package_name.clone().flatten()
     }
 
     fn get_go_module(&self) -> Option<GoModule> {

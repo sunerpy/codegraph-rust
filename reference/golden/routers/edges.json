@@ -1,18 +1,6 @@
 [
   {
     "col": 0,
-    "kind": "decorates",
-    "line": 4,
-    "metadata": {
-      "confidence": 0.5,
-      "resolvedBy": "exact-match"
-    },
-    "provenance": null,
-    "source": "class:49a64bdaf5b8db2e9dbf283b51dba375",
-    "target": "function:5dd4a1bf99112612e8c2797164f02fcc"
-  },
-  {
-    "col": 0,
     "kind": "imports",
     "line": 2,
     "metadata": {
@@ -58,18 +46,6 @@
     "provenance": null,
     "source": "file:apps/react-router/src/main.tsx",
     "target": "file:apps/react-router/src/pages/Layout.tsx"
-  },
-  {
-    "col": 1,
-    "kind": "calls",
-    "line": 4,
-    "metadata": {
-      "confidence": 0.5,
-      "resolvedBy": "exact-match"
-    },
-    "provenance": null,
-    "source": "file:apps/angular/src/app/home/home.component.ts",
-    "target": "function:5dd4a1bf99112612e8c2797164f02fcc"
   },
   {
     "col": 13,

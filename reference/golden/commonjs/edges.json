@@ -86,18 +86,6 @@
     "target": "function:614ebe045ff7b9e4ae1fbcf86f0ec074"
   },
   {
-    "col": 4,
-    "kind": "calls",
-    "line": 9,
-    "metadata": {
-      "confidence": 0.9,
-      "resolvedBy": "exact-match"
-    },
-    "provenance": null,
-    "source": "file:test/app.test.js",
-    "target": "constant:a207c2fcdb3b1eb8b6d19351164ebb49"
-  },
-  {
     "col": null,
     "kind": "contains",
     "line": null,

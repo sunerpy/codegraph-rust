@@ -272,4 +272,97 @@ mod seams {
         assert_unresolved!(project, "namespace App @src/Svc.cs" => imports => "System.Text");
         assert_unresolved!(project, "namespace App @src/Other.cs" => imports => "System.Text");
     }
+
+    /// Upstream #2120 (`7a51969f`), its general half: a receiver-less JS/TS
+    /// call never reaches a property or a field (mocha's `it`, `describe`); a
+    /// member call on a namespace import, or on a binding from a package
+    /// outside the repository, never takes a method picked by name; and a bare
+    /// call to a name imported from outside the repository has no project
+    /// candidate. A package importing itself is not outside.
+    #[test]
+    fn pr2120_bare_and_imported_receivers_never_guess_a_member() {
+        let project = Project::new()
+            .file(
+                "package.json",
+                "{\"name\":\"app\",\"dependencies\":{\"zod\":\"*\",\"supertest\":\"*\",\"vitest\":\"*\"}}\n",
+            )
+            .file(
+                "src/test/xfail.ts",
+                "export interface XFailFunction {\n  it: (title: string) => void;\n}\n",
+            )
+            .file(
+                "src/commands/CacheClear.ts",
+                "export class CacheClearCommand {\n  describe = \"Clears the cache.\";\n  run() { return 1; }\n}\n",
+            )
+            .file(
+                "src/test/Mocker.ts",
+                "export class Mocker {\n  string(): string { return 'x'; }\n  record(): number { return 1; }\n}\n",
+            )
+            .file(
+                "src/helpers.ts",
+                "export function test(name: string) { return name; }\nexport function request(url: string) { return url; }\n",
+            )
+            .file(
+                "src/schemas.ts",
+                "import * as mocker from 'zod';\nimport { Mocker as mockerLib } from 'zod';\n\nexport function schemas() {\n  const a = mocker.string();\n  const b = mockerLib.record();\n  return [a, b];\n}\n",
+            )
+            .file(
+                "src/schemas.test.ts",
+                "import { test } from 'vitest';\nconst request = require('supertest');\n\ndescribe('schemas', () => {\n  it('works', () => { test('x'); request('app'); });\n});\n",
+            )
+            .file("src/lib/adapters.ts", "export function getAdapter() { return 1; }\n")
+            .file(
+                "src/own.ts",
+                "import { getAdapter } from 'app';\n\nexport function own() {\n  return getAdapter();\n}\n",
+            )
+            .index();
+
+        let test_file = "file:src/schemas.test.ts";
+        assert_no_edge!(project, test_file => calls => "property XFailFunction::it");
+        assert_no_edge!(project, test_file => calls => "property CacheClearCommand::describe");
+        assert_no_edge!(project, test_file => calls => "function test");
+        assert_no_edge!(project, test_file => calls => "function request");
+        // The CommonJS binding is the package's value, not a project symbol.
+        assert_no_edge!(project, test_file => calls => "constant request");
+        assert_no_edge!(project, "function schemas" => calls => "method Mocker::string");
+        assert_no_edge!(project, "function schemas" => calls => "method Mocker::record");
+        assert_edge!(project, "function own" => calls => "function getAdapter");
+    }
+
+    /// Upstream #2134 (`67744468`), its resolution half: a JS/TS member call
+    /// on an import binding never picks a method declared in the calling file
+    /// (expo-camera's `CameraManager.isAvailableAsync()` inside `CameraView`'s
+    /// own `isAvailableAsync`), and a name the file binds from a package
+    /// outside the repository names nothing in it, for every reference kind
+    /// (`type Command` from `@tiptap/core` is not a local `command`).
+    #[test]
+    fn pr2134_imported_names_never_bind_the_caller_or_a_namesake() {
+        let project = Project::new()
+            .file(
+                "package.json",
+                "{\"name\":\"app\",\"dependencies\":{\"@tiptap/core\":\"*\",\"@rsbuild/core\":\"*\"}}\n",
+            )
+            .file("src/ExpoCameraManager.ts", "export default {};\n")
+            .file(
+                "src/CameraView.ts",
+                "import CameraManager from './ExpoCameraManager';\n\nexport class CameraView {\n  static isAvailableAsync() {\n    return CameraManager.isAvailableAsync();\n  }\n}\n",
+            )
+            .file("src/menu.ts", "export function command() { return 1; }\n")
+            .file(
+                "src/gap.ts",
+                "import type { Command } from '@tiptap/core';\n\nexport function gapCursor(): Command {\n  return () => true;\n}\n",
+            )
+            .file(
+                "src/rsbuild.ts",
+                "import { defineConfig, type RsbuildConfig } from '@rsbuild/core';\n\nexport function rsbuildConfig(): RsbuildConfig {\n  return defineConfig({});\n}\n",
+            )
+            .index();
+
+        assert_no_edge!(
+            project,
+            "method CameraView::isAvailableAsync" => calls => "method CameraView::isAvailableAsync"
+        );
+        assert_no_edge!(project, "function gapCursor" => references => "function command");
+        assert_no_edge!(project, "function rsbuildConfig" => references => "function rsbuildConfig");
+    }
 }

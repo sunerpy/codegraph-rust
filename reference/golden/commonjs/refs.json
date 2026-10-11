@@ -91,6 +91,16 @@
   },
   {
     "candidates": null,
+    "col": 4,
+    "file_path": "test/app.test.js",
+    "from_node_id": "file:test/app.test.js",
+    "language": "javascript",
+    "line": 9,
+    "reference_kind": "calls",
+    "reference_name": "request"
+  },
+  {
+    "candidates": null,
     "col": 9,
     "file_path": "lib/app.js",
     "from_node_id": "function:614ebe045ff7b9e4ae1fbcf86f0ec074",

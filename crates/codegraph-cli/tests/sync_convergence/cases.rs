@@ -165,6 +165,31 @@ pub fn typescript_side_effect_import_of_an_added_file() -> Case {
         .edge_after("file:src/main.ts", "imports", "file:src/polyfill.ts")
 }
 
+/// Upstream #2120: a bare call to a name imported from a package outside the
+/// repository never binds the project function of that name that appears
+/// later, while a file that imports the project's own does.
+pub fn typescript_out_of_repo_call_ignores_an_added_namesake() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::TypeScript])
+        .file(
+            "package.json",
+            "{\"name\":\"app\",\"dependencies\":{\"vitest\":\"*\"}}\n",
+        )
+        .file(
+            "src/use.ts",
+            "import { test } from './helpers';\n\nexport function run() {\n  return test('a');\n}\n",
+        )
+        .file(
+            "src/a.test.ts",
+            "import { test } from 'vitest';\n\ntest('works');\n",
+        )
+        .write(
+            "src/helpers.ts",
+            "export function test(name: string) {\n  return name;\n}\n",
+        )
+        .edge_after("function run", "calls", "function test @src/helpers.ts")
+        .no_edge_after("file:src/a.test.ts", "calls", "function test")
+}
+
 /// Upstream #2392 (3): a Go call through an imported package links once the
 /// package appears.
 pub fn go_import_of_an_added_package() -> Case {

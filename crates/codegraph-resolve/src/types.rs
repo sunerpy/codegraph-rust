@@ -477,6 +477,12 @@ pub trait ResolutionContext {
         None
     }
 
+    /// The repository's own package name, from its root package.json (upstream
+    /// #2120 `isOwnPackage`). `None` without one.
+    fn own_package_name(&self) -> Option<String> {
+        None
+    }
+
     /// Go module info from `go.mod` (`getGoModule?`). `None` for non-Go /
     /// module-less projects (`types.ts:104-111`).
     fn get_go_module(&self) -> Option<GoModule> {
