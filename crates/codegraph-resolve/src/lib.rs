@@ -30,6 +30,7 @@ pub mod lru_cache;
 mod member_value;
 pub mod name_matcher;
 mod object_literal;
+mod overloads;
 pub mod path_aliases;
 pub mod pathutil;
 pub mod resolver;

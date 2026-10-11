@@ -592,6 +592,7 @@ matrix! {
     typescript_outside_type_call_ignores_an_added_method,
     python_inherited_classmethod_body_edit,
     typescript_test_suite_namesake_appears,
+    java_overload_delegation_body_edit,
     typescript_side_effect_import_of_an_added_file,
     go_import_of_an_added_package,
     solidity_import_of_an_added_file,

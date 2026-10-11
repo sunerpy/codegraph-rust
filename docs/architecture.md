@@ -141,7 +141,9 @@ streaming path for very large graphs), then applies deterministic strategies:
    stops the name guesses; a class-name receiver also reaches the class
    methods its declared supertypes provide; a receiver-word guess never takes
    a framework-dispatched handler, an unnamed test double or the caller
-   itself), then a
+   itself; in a language that overloads by arity, a call then moves to the
+   same-owner overload its argument count fits, or in Swift its argument
+   labels), then a
    last-resort fuzzy match that ignores case only in PHP, Pascal and CFML,
    whose identifiers do;
 3. detected `FrameworkResolver` implementations; and

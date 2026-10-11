@@ -1218,6 +1218,9 @@ pub struct ReferenceResolver {
     /// The C/C++ include graph the test-suite rule reads (upstream #2421),
     /// filled on demand and cleared with the other resolution caches.
     cpp_includers: std::sync::Mutex<crate::cpp_includers::CppIncluders>,
+    /// Same-owner overload sets by method id (upstream #2212), filled on
+    /// demand and cleared with the other resolution caches.
+    overload_sets: crate::overloads::OverloadSets,
     /// `this.<member>` fn-refs whose member wasn't on the enclosing class
     /// itself — retried in the supertype pass once implements/extends edges
     /// exist (`deferredThisMemberRefs`, index.ts:214 / #808). A `Mutex` (not
@@ -1244,6 +1247,7 @@ impl ReferenceResolver {
             known_names: None,
             macro_visibility: std::sync::Mutex::default(),
             cpp_includers: std::sync::Mutex::default(),
+            overload_sets: std::sync::Mutex::default(),
             deferred_this_member_refs: std::sync::Mutex::new(Vec::new()),
             deferred_chain_refs: std::sync::Mutex::new(Vec::new()),
         }
@@ -1431,6 +1435,10 @@ impl ReferenceResolver {
             .cpp_includers
             .get_mut()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Default::default();
+        self.overload_sets
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
     }
 
     /// Resolve all unresolved references (`resolveAll`, `index.ts:511-572`).
@@ -2027,15 +2035,17 @@ impl ReferenceResolver {
 
         // Strategy 3: name matching (index.ts:723-726), with the name
         // matcher's self vetoes (upstream #2221, #2223, #2229).
-        if let Some(name_result) = self.gate_test_suite(
-            crate::name_matcher::veto_self_target(
-                self.gate_language(match_reference(reference, context), reference, context),
-                reference,
-                context,
-            ),
+        // A call reaches the overload its arguments fit (upstream #2212,
+        // #2213, #2238, #2241), before the test-suite rule judges the target.
+        let name_result = crate::name_matcher::veto_self_target(
+            self.gate_language(match_reference(reference, context), reference, context),
             reference,
             context,
-        ) {
+        )
+        .map(|result| {
+            crate::overloads::retarget_overload(result, reference, context, &self.overload_sets)
+        });
+        if let Some(name_result) = self.gate_test_suite(name_result, reference, context) {
             candidates.push(name_result);
         }
 

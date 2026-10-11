@@ -307,6 +307,30 @@ pub fn typescript_test_suite_namesake_appears() -> Case {
         .no_edge_after("function toJson", "references", "class Record")
 }
 
+/// Upstream #2212: a method delegating to another overload of itself
+/// reaches that overload, before and after its body changes.
+pub fn java_overload_delegation_body_edit() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Java])
+        .file(
+            "src/app/Instants.java",
+            "package app;\n\npublic class Instants {\n    public static Object toInstant(Object instant) {\n        return toInstant(instant, null);\n    }\n\n    public static Object toInstant(Object instant, Object fallback) {\n        return instant;\n    }\n}\n",
+        )
+        .write(
+            "src/app/Instants.java",
+            "package app;\n\npublic class Instants {\n    public static Object toInstant(Object instant) {\n        return toInstant(instant, instant);\n    }\n\n    public static Object toInstant(Object instant, Object fallback) {\n        return fallback;\n    }\n}\n",
+        )
+        .edge_after(
+            "method app::Instants::toInstant @src/app/Instants.java:4",
+            "calls",
+            "method app::Instants::toInstant @src/app/Instants.java:8",
+        )
+        .no_edge_after(
+            "method app::Instants::toInstant @src/app/Instants.java:4",
+            "calls",
+            "method app::Instants::toInstant @src/app/Instants.java:4",
+        )
+}
+
 /// Upstream #2392 (3): a Go call through an imported package links once the
 /// package appears.
 pub fn go_import_of_an_added_package() -> Case {
