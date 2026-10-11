@@ -1215,6 +1215,9 @@ pub struct ReferenceResolver {
     /// entry is a pure function of the files, so evaluation order cannot reach
     /// the output.
     macro_visibility: std::sync::Mutex<crate::c_macro_visibility::MacroVisibility>,
+    /// The C/C++ include graph the test-suite rule reads (upstream #2421),
+    /// filled on demand and cleared with the other resolution caches.
+    cpp_includers: std::sync::Mutex<crate::cpp_includers::CppIncluders>,
     /// `this.<member>` fn-refs whose member wasn't on the enclosing class
     /// itself — retried in the supertype pass once implements/extends edges
     /// exist (`deferredThisMemberRefs`, index.ts:214 / #808). A `Mutex` (not
@@ -1240,6 +1243,7 @@ impl ReferenceResolver {
             framework_resolver_extensions: Vec::new(),
             known_names: None,
             macro_visibility: std::sync::Mutex::default(),
+            cpp_includers: std::sync::Mutex::default(),
             deferred_this_member_refs: std::sync::Mutex::new(Vec::new()),
             deferred_chain_refs: std::sync::Mutex::new(Vec::new()),
         }
@@ -1423,6 +1427,10 @@ impl ReferenceResolver {
             .macro_visibility
             .get_mut()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Default::default();
+        *self
+            .cpp_includers
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Default::default();
     }
 
     /// Resolve all unresolved references (`resolveAll`, `index.ts:511-572`).
@@ -1579,6 +1587,78 @@ impl ReferenceResolver {
             Ok(via_super) if via_super.is_match(&line) => None,
             _ => Some(result),
         }
+    }
+
+    /// A test suite is not linked into the program, so no name match from a
+    /// non-test file reaches a symbol in one (upstream #2209): typeorm's
+    /// `Record<K, V>` is not a test entity `Record`. Test-support code a
+    /// project ships (`testing/`, `fakes/`, a `*-test` module) stays in reach,
+    /// and so does a C or C++ file the reference's translation unit includes,
+    /// whatever its name (#2421).
+    fn gate_test_suite(
+        &self,
+        result: Option<ResolvedRef>,
+        reference: &RefView,
+        context: &dyn ResolutionContext,
+    ) -> Option<ResolvedRef> {
+        let result = result?;
+        let Some(target) = context.get_node_by_id_shared(&result.target_node_id) else {
+            return Some(result);
+        };
+        if target.file_path == reference.file_path
+            || !codegraph_core::file_class::is_test_suite_path(&target.file_path)
+            || codegraph_core::file_class::is_test_path(&reference.file_path)
+            || self.is_included_cpp_test_suite(&target, reference, context)
+        {
+            return Some(result);
+        }
+        None
+    }
+
+    /// Whether a C or C++ file named like a test suite is part of `reference`'s
+    /// translation unit (upstream #2421 `isIncludedCppTestSuite`): the
+    /// reference's file includes it, or, for a definition in a source file,
+    /// the same-named test-suite header it includes (`conformance_test.cc` →
+    /// `conformance_test.h`).
+    fn is_included_cpp_test_suite(
+        &self,
+        candidate: &Node,
+        reference: &RefView,
+        context: &dyn ResolutionContext,
+    ) -> bool {
+        let c_family = |language| matches!(language, Language::C | Language::Cpp);
+        if !c_family(candidate.language) || !c_family(reference.language) {
+            return false;
+        }
+        let mut includers = self
+            .cpp_includers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if includers
+            .includers(&candidate.file_path, context)
+            .contains(&reference.file_path)
+        {
+            return true;
+        }
+        let stem = crate::cpp_includers::file_stem(&candidate.file_path);
+        for include in context.get_nodes_in_file_shared(&candidate.file_path) {
+            if include.kind != NodeKind::Import
+                || crate::cpp_includers::file_stem(&include.name) != stem
+            {
+                continue;
+            }
+            if let Some(header) = includers.included_file_of(&include, context)
+                && header != candidate.file_path
+                && crate::cpp_includers::file_stem(&header) == stem
+                && codegraph_core::file_class::is_test_suite_path(&header)
+                && includers
+                    .includers(&header, context)
+                    .contains(&reference.file_path)
+            {
+                return true;
+            }
+        }
+        false
     }
 
     /// C/C++ preprocessor binding gate (upstream #1838). A call spelled like
@@ -1903,9 +1983,13 @@ impl ReferenceResolver {
         {
             // A name match like Strategy 3's, so its self vetoes apply
             // (upstream #2223: `self.0.into_route(state)` inside `into_route`).
-            if let Some(result) = crate::name_matcher::veto_self_target(
-                self.gate_language(
-                    crate::name_matcher::match_rust_lost_receiver_call(reference, context),
+            if let Some(result) = self.gate_test_suite(
+                crate::name_matcher::veto_self_target(
+                    self.gate_language(
+                        crate::name_matcher::match_rust_lost_receiver_call(reference, context),
+                        reference,
+                        context,
+                    ),
                     reference,
                     context,
                 ),
@@ -1943,8 +2027,12 @@ impl ReferenceResolver {
 
         // Strategy 3: name matching (index.ts:723-726), with the name
         // matcher's self vetoes (upstream #2221, #2223, #2229).
-        if let Some(name_result) = crate::name_matcher::veto_self_target(
-            self.gate_language(match_reference(reference, context), reference, context),
+        if let Some(name_result) = self.gate_test_suite(
+            crate::name_matcher::veto_self_target(
+                self.gate_language(match_reference(reference, context), reference, context),
+                reference,
+                context,
+            ),
             reference,
             context,
         ) {

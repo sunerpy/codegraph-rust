@@ -664,4 +664,80 @@ mod seams {
         assert_edge!(project, "function test_mocked" => calls => "method MockedResponse::json");
         assert_no_edge!(project, "method FileStorage::delete" => calls => "method FileStorage::delete");
     }
+
+    /// Upstream #2209 (`de9f346c`): a test suite is not linked into the
+    /// program, so production code never names one of its symbols, while
+    /// test-support code a project ships (`testing/`) stays in reach and a
+    /// test reaches another test's helpers.
+    #[test]
+    fn pr2209_production_code_never_names_a_test_suite_symbol() {
+        let project = Project::new()
+            .file("package.json", "{\"name\":\"orm\",\"private\":true}\n")
+            .file("test/functional/entity/Record.ts", "export class Record {\n  id = 0;\n}\n")
+            .file(
+                "test/functional/helpers.ts",
+                "export function makeFixture(): number {\n  return 1;\n}\n",
+            )
+            .file(
+                "test/functional/record.test.ts",
+                "export function uses(): number {\n  return makeFixture();\n}\n",
+            )
+            .file(
+                "src/testing/stub.ts",
+                "export function stubConnection(): number {\n  return 2;\n}\n",
+            )
+            .file(
+                "src/columns.ts",
+                "export function toJson(values: Record<string, number>): string {\n  return JSON.stringify(values);\n}\n\nexport function connect(): number {\n  return stubConnection();\n}\n",
+            )
+            .file(
+                "src/main/java/app/Service.java",
+                "package app;\n\npublic class Service implements Runnable {\n  @Override\n  public void run() { }\n}\n",
+            )
+            .file(
+                "src/test/java/app/InterceptorTest.java",
+                "package app;\n\npublic class InterceptorTest {\n  @interface Override { }\n}\n",
+            )
+            .index();
+
+        assert_no_edge!(project, "function toJson" => references => "class Record");
+        assert_no_edge!(project, "method app::Service::run" => decorates => "interface app::InterceptorTest::Override");
+        assert_edge!(project, "function connect" => calls => "function stubConnection");
+        assert_edge!(project, "function uses" => calls => "function makeFixture");
+    }
+
+    /// Upstream #2421 (`22a7ba85`) and #2434 (`1fb8691d`): a C or C++ file
+    /// named like a test is visible to the code that includes it, a source
+    /// file's definition through the same-named header it includes
+    /// (`conformance_test.cc` through `conformance_test.h`); and Google's
+    /// `foo_unittest.cc` is a test suite production code never reaches.
+    #[test]
+    fn pr2421_an_included_test_named_file_is_part_of_the_translation_unit() {
+        let project = Project::new()
+            .file(
+                "conformance/conformance_test.h",
+                "class ConformanceTestSuite {\n public:\n  void ReportFailure(int code);\n};\n",
+            )
+            .file(
+                "conformance/conformance_test.cc",
+                "#include \"conformance_test.h\"\n\nvoid ConformanceTestSuite::ReportFailure(int code) {}\n",
+            )
+            .file(
+                "conformance/binary_suite.cc",
+                "#include \"conformance_test.h\"\n\nvoid RunSuite(ConformanceTestSuite& suite_) {\n  suite_.ReportFailure(1);\n}\n",
+            )
+            .file(
+                "src/cpp/stack_unittest.cc",
+                "struct StackHelper {\n  int size() { return 0; }\n};\n",
+            )
+            .file(
+                "src/cpp/walk.cc",
+                "int Walk() {\n  return StackHelper().size();\n}\n",
+            )
+            .index();
+
+        assert_edge!(project, "function RunSuite" => calls => "method ConformanceTestSuite::ReportFailure");
+        assert_no_edge!(project, "function Walk" => calls => "method StackHelper::size");
+        assert_no_edge!(project, "function Walk" => instantiates => "struct StackHelper");
+    }
 }

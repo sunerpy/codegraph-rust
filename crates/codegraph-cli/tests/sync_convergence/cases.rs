@@ -287,6 +287,26 @@ pub fn python_inherited_classmethod_body_edit() -> Case {
         .edge_after("function make", "calls", "method Base::create")
 }
 
+/// Upstream #2209: a test suite's `Record` that appears later is never what
+/// production code's `Record<…>` names; shipped test support stays in reach.
+pub fn typescript_test_suite_namesake_appears() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::TypeScript])
+        .file(
+            "src/testing/stub.ts",
+            "export function stubConnection(): number {\n  return 2;\n}\n",
+        )
+        .file(
+            "src/columns.ts",
+            "export function toJson(values: Record<string, number>): string {\n  return JSON.stringify(values);\n}\n\nexport function connect(): number {\n  return stubConnection();\n}\n",
+        )
+        .write(
+            "test/functional/entity/Record.ts",
+            "export class Record {\n  id = 0;\n}\n",
+        )
+        .edge_throughout("function connect", "calls", "function stubConnection")
+        .no_edge_after("function toJson", "references", "class Record")
+}
+
 /// Upstream #2392 (3): a Go call through an imported package links once the
 /// package appears.
 pub fn go_import_of_an_added_package() -> Case {

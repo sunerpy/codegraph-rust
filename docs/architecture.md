@@ -154,7 +154,12 @@ the referencing node itself is kept only when nothing rules it out: a call
 written through `super` / `base` / `parent::`, on another object's value, or
 from a value's initializer is not a self-call, and a type never inherits from
 itself (the other type of its name its written qualifier leads to is taken
-instead, or none). Pure JS-family alias
+instead, or none). A name match from non-test code never reaches a symbol
+in a test suite (a test source set, a `tests/` / `spec/` / `e2e/` tree, a
+`FooTest.kt` / `test_foo.py` / `foo.test.ts` / `foo_unittest.cc` file): test
+support a project ships (`testing/`, `fakes/`, a `*-test` module) stays in
+reach, and so does a C or C++ file the reference's translation unit
+includes. Pure JS-family alias
 bindings may forward to a unique callable; wrappers and ambiguity stop at the
 binding. A framework-resolved edge carries its own reachability proof and is not
 erased by ordinary source-language visibility (for example Tauri IPC to a

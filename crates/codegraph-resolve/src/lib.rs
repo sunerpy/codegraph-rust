@@ -21,6 +21,7 @@ mod awaited;
 mod c_macro_visibility;
 mod class_heads;
 pub mod context;
+mod cpp_includers;
 pub mod framework; // the FrameworkResolver extension point
 pub mod frameworks; // concrete react/vue/nestjs FrameworkResolvers
 pub mod import_resolver;
