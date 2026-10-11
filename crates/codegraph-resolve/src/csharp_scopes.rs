@@ -204,10 +204,11 @@ fn qualified_name(tokens: &[Token<'_>], mut i: usize) -> (String, usize) {
     (name, i)
 }
 
-/// `source` with every comment, string and character literal, preprocessor
-/// line and inactive `#elif` / `#else` branch replaced by spaces (newlines
-/// kept), so only code is left at the same offsets.
-fn blank_non_code(source: &str) -> String {
+/// `source` with every comment, string and character literal (verbatim,
+/// interpolated and raw ones included), preprocessor line and inactive
+/// `#elif` / `#else` branch replaced by spaces (newlines kept), so only code
+/// is left at the same offsets.
+pub(crate) fn blank_non_code(source: &str) -> String {
     let bytes = source.as_bytes();
     let mut out = bytes.to_vec();
     let blank = |out: &mut Vec<u8>, from: usize, to: usize| {
@@ -425,6 +426,18 @@ mod tests {
         assert!(!scopes.imports_at(inside, "static"));
         assert!(scopes.imports_at(inside, "System.Linq"));
         assert_eq!(scopes.namespace_at(inside), "App");
+    }
+
+    #[test]
+    fn a_comment_marker_inside_a_raw_string_is_text() {
+        let declaration = "Note<U>(this Box<U> box, U value, string note = \"\"\"x\" // literal text\"\"\") where U : struct { return box; }";
+        let blanked = super::blank_non_code(declaration);
+        assert!(
+            blanked.contains(") where U : struct { return box; }"),
+            "{blanked}"
+        );
+        assert!(!blanked.contains("literal"), "{blanked}");
+        assert_eq!(blanked.len(), declaration.len());
     }
 
     #[test]

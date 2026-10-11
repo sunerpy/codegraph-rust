@@ -133,10 +133,7 @@ pub(crate) fn this_parameter_type(param: &str) -> Option<String> {
 /// whitespace runs collapsed (`IList<T>`, `ref Span<byte>`), or `None` when
 /// `param` is no `this` parameter.
 pub(crate) fn this_parameter_text(param: &str) -> Option<String> {
-    let declared = crate::strip_comments::strip_comments_for_regex(
-        after_this(param)?,
-        crate::strip_comments::CommentLang::CSharp,
-    );
+    let declared = crate::csharp_scopes::blank_non_code(after_this(param)?);
     let (written, _name) = declared.trim_end().rsplit_once(char::is_whitespace)?;
     Some(written.split_whitespace().collect::<Vec<_>>().join(" "))
 }

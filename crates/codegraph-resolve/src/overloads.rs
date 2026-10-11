@@ -366,7 +366,8 @@ fn number_type_parameters(text: &str, type_params: &[String], seen: &mut Vec<Str
 
 /// The type parameters a C# method declares (`Open<T, U>(…)`: `T`, `U`) and
 /// the `where` clauses between its parameter list and its body, read from
-/// the declaration with its comments blanked; empty when it declares none.
+/// the declaration with its comments and literals blanked by the C# lexer
+/// (raw strings included); empty when it declares none.
 fn generic_head(
     file: &str,
     line: i64,
@@ -384,10 +385,7 @@ fn generic_head(
     if start >= end {
         return none;
     }
-    let text = crate::strip_comments::strip_comments_for_regex(
-        &facts.join_lines(start, end, "\n"),
-        crate::strip_comments::CommentLang::CSharp,
-    );
+    let text = crate::csharp_scopes::blank_non_code(&facts.join_lines(start, end, "\n"));
     // The first `name(` or `name<…>(` is the declaration's own head, as in
     // [`paren_list_after`]; a later overload's type parameters are not its.
     let Ok(pattern) = Regex::new(&format!(

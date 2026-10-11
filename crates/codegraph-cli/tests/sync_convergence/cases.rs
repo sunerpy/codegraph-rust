@@ -440,6 +440,41 @@ pub fn csharp_extension_overload_spelled_with_other_spacing_appears() -> Case {
         )
 }
 
+/// W3-05c (KEEP-RUST): a comment marker inside a raw string default value is
+/// text: an added `Note<U>(this Box<U>, U, string note = """x" // …""") where
+/// U : struct` keeps its `where` clause and takes `box.Note(1)` from the
+/// `params` overload, as a fresh index of the edit finds.
+pub fn csharp_extension_overload_with_a_raw_string_default_appears() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::CSharp])
+        .file(
+            "src/Utilities/Boxes.cs",
+            "namespace App.Utilities\n{\n    public class Box<T>\n    {\n        public T Value;\n    }\n\n    public static class BoxExtensions\n    {\n        public static object Note<T>(this Box<T> box, params T[] values) where T : struct { return box; }\n    }\n}\n",
+        )
+        .file(
+            "src/Reader.cs",
+            "using App.Utilities;\n\nnamespace App\n{\n    public class Reader\n    {\n        public object Jot(Box<int> box)\n        {\n            return box.Note(1);\n        }\n    }\n}\n",
+        )
+        .write(
+            "src/Utilities/Boxes.cs",
+            "namespace App.Utilities\n{\n    public class Box<T>\n    {\n        public T Value;\n    }\n\n    public static class BoxExtensions\n    {\n        public static object Note<T>(this Box<T> box, params T[] values) where T : struct { return box; }\n\n        public static object Note<U>(this Box<U> box, U value, string note = \"\"\"x\" // literal text\"\"\") where U : struct { return box; }\n    }\n}\n",
+        )
+        .edge_before(
+            "method App::Reader::Jot",
+            "calls",
+            "method App.Utilities::BoxExtensions::Note @src/Utilities/Boxes.cs:10",
+        )
+        .edge_after(
+            "method App::Reader::Jot",
+            "calls",
+            "method App.Utilities::BoxExtensions::Note @src/Utilities/Boxes.cs:12",
+        )
+        .no_edge_after(
+            "method App::Reader::Jot",
+            "calls",
+            "method App.Utilities::BoxExtensions::Note @src/Utilities/Boxes.cs:10",
+        )
+}
+
 /// Upstream #2180: a call through a class name reaches the class method the
 /// class inherits, before and after the calling body changes.
 pub fn python_inherited_classmethod_body_edit() -> Case {
