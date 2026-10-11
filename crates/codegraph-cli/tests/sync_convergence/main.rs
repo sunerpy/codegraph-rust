@@ -603,6 +603,7 @@ matrix! {
     swift_method_body_edit,
     typescript_value_reader_body_edit,
     astro_frontmatter_call_body_edit,
+    go_value_initializer_body_edit,
     java_static_field_read_body_edit,
     ruby_class_constant_reader_body_edit,
     kotlin_object_constant_reader_body_edit,

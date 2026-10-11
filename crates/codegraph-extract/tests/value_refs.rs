@@ -90,6 +90,25 @@ fn go_readers_of_a_package_constant_and_variable() {
     );
 }
 
+/// A Go constant or variable reads what its initializer names, as upstream's
+/// reader (the whole `const_spec` / `var_spec`) does.
+#[test]
+fn a_go_value_reads_the_values_its_initializer_names() {
+    let source = "package main\n\nconst BaseValue = 1\nconst DerivedValue = BaseValue + 1\nvar ScaledValue = DerivedValue * 2\n\nfunc total() int { return ScaledValue }";
+    assert_eq!(
+        readers("values.go", source, Language::Go, "BaseValue"),
+        ["DerivedValue"]
+    );
+    assert_eq!(
+        readers("values.go", source, Language::Go, "DerivedValue"),
+        ["ScaledValue"]
+    );
+    assert_eq!(
+        readers("values.go", source, Language::Go, "ScaledValue"),
+        ["total"]
+    );
+}
+
 #[test]
 fn a_go_constant_shadowed_by_a_short_variable_has_no_readers() {
     let source = "package main\n\nconst Timeout = 30\n\nfunc usesConst() int { return Timeout }\nfunc shadows() int {\n\tTimeout := 5\n\treturn Timeout\n}";

@@ -3656,12 +3656,18 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             ) {
                 continue;
             }
-            self.create_node(
+            let created = self.create_node(
                 kind,
                 &node_text(ident, self.source),
                 ident,
                 NodeExtra::default(),
             );
+            // The value reads what its whole spec (its initializer) names.
+            if let Some(created) = created
+                && crate::value_refs::has_value_refs(self.spec.language())
+            {
+                self.value_refs.scan_reader_from(&created.id, parent);
+            }
             break;
         }
     }

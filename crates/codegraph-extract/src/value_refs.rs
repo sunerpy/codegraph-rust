@@ -98,6 +98,15 @@ impl<'tree> ValueRefs<'tree> {
         }
     }
 
+    /// Scan `node` for the reads of the reader `id` instead of the syntax its
+    /// node was created from: a Go value's node is its name, while what it
+    /// reads is in its whole `const_spec` / `var_spec`, upstream's reader.
+    pub(crate) fn scan_reader_from(&mut self, id: &str, node: SyntaxNode<'tree>) {
+        if let Some(reader) = self.readers.iter_mut().rev().find(|reader| reader.id == id) {
+            reader.node = node;
+        }
+    }
+
     /// The value-reference edges of the file whose tree is `root`.
     pub(crate) fn into_edges(
         mut self,

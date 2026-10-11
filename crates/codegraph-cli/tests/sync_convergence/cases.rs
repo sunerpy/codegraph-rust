@@ -403,6 +403,22 @@ pub fn java_static_field_read_body_edit() -> Case {
         )
 }
 
+/// #895: a Go package value reads what its initializer names.
+pub fn go_value_initializer_body_edit() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Go])
+        .file("go.mod", "module example.com/limits\n\ngo 1.22\n")
+        .file(
+            "limits.go",
+            "package limits\n\nconst BaseLimit = 10\nconst WideLimit = 50\n\nvar ScaledLimit = BaseLimit * 2\n",
+        )
+        .write(
+            "limits.go",
+            "package limits\n\nconst BaseLimit = 10\nconst WideLimit = 50\n\nvar ScaledLimit = WideLimit * 2\n",
+        )
+        .edge_before("variable ScaledLimit", "references", "constant BaseLimit")
+        .edge_after("variable ScaledLimit", "references", "constant WideLimit")
+}
+
 /// #2268: an Astro frontmatter's top-level call is the component's.
 pub fn astro_frontmatter_call_body_edit() -> Case {
     Case::new(Change::BodyEdit, &[Language::Astro])
