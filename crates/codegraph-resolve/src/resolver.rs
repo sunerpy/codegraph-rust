@@ -1530,9 +1530,55 @@ impl ReferenceResolver {
             }
             _ => self.gate_language(resolved, reference, context),
         };
+        let resolved = self.gate_super_self_call(resolved, reference, context);
         let resolved = self.gate_language_visibility(resolved, reference, context);
         let resolved = self.gate_js_visibility(resolved, reference, context);
         (resolved, deferred)
+    }
+
+    /// `super.didMoveToWindow()` inside an override of `didMoveToWindow` calls
+    /// the parent's implementation, never the method making the call
+    /// (upstream #2136 `gateSuperSelfCall`). Extraction keeps a `super` call
+    /// under the bare method name, so every strategy found the enclosing
+    /// method itself. Only a call written through `super` / `base` (C#) /
+    /// `[super …]` (Objective-C) / `parent::` (PHP) / `super().` /
+    /// `super(C, self).` (Python) is declined; real recursion keeps its edge.
+    fn gate_super_self_call(
+        &self,
+        result: Option<ResolvedRef>,
+        reference: &RefView,
+        context: &dyn ResolutionContext,
+    ) -> Option<ResolvedRef> {
+        let result = result?;
+        if reference.reference_kind != EdgeKind::Calls
+            || result.target_node_id != reference.from_node_id
+        {
+            return Some(result);
+        }
+        let name = &reference.reference_name;
+        let name = &name[name.rfind(['.', ':']).map_or(0, |cut| cut + 1)..];
+        if !crate::name_matcher::is_simple_js_identifier(name) {
+            return Some(result);
+        }
+        let Some(line) = usize::try_from(reference.line)
+            .ok()
+            .and_then(|line| line.checked_sub(1))
+            .and_then(|index| {
+                context
+                    .source_facts(&reference.file_path)
+                    .and_then(|facts| facts.raw_line(index).map(str::to_string))
+            })
+        else {
+            return Some(result);
+        };
+        let via_super = Regex::new(&format!(
+            r"(?:(?-u:\b)(?:super|base)\s*(?:\(\s*(?:[A-Za-z0-9_.]+\s*,\s*[A-Za-z0-9_]+)?\s*\))?\s*\??\.\s*|\[\s*super\s+|(?-u:\b)parent\s*::\s*){}(?-u:\b)",
+            regex::escape(name)
+        ));
+        match via_super {
+            Ok(via_super) if via_super.is_match(&line) => None,
+            _ => Some(result),
+        }
     }
 
     /// C/C++ preprocessor binding gate (upstream #1838). A call spelled like
@@ -1855,8 +1901,14 @@ impl ReferenceResolver {
         if crate::name_matcher::rust_call_shape(reference, context)
             == Some(crate::name_matcher::RustCallShape::Method)
         {
-            if let Some(result) = self.gate_language(
-                crate::name_matcher::match_rust_lost_receiver_call(reference, context),
+            // A name match like Strategy 3's, so its self vetoes apply
+            // (upstream #2223: `self.0.into_route(state)` inside `into_route`).
+            if let Some(result) = crate::name_matcher::veto_self_target(
+                self.gate_language(
+                    crate::name_matcher::match_rust_lost_receiver_call(reference, context),
+                    reference,
+                    context,
+                ),
                 reference,
                 context,
             ) {
@@ -1889,10 +1941,13 @@ impl ReferenceResolver {
             return (candidates.into_iter().reduce(highest_confidence), None);
         }
 
-        // Strategy 3: name matching (index.ts:723-726).
-        if let Some(name_result) =
-            self.gate_language(match_reference(reference, context), reference, context)
-        {
+        // Strategy 3: name matching (index.ts:723-726), with the name
+        // matcher's self vetoes (upstream #2221, #2223, #2229).
+        if let Some(name_result) = crate::name_matcher::veto_self_target(
+            self.gate_language(match_reference(reference, context), reference, context),
+            reference,
+            context,
+        ) {
             candidates.push(name_result);
         }
 

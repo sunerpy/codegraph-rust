@@ -190,6 +190,30 @@ pub fn typescript_out_of_repo_call_ignores_an_added_namesake() -> Case {
         .no_edge_after("file:src/a.test.ts", "calls", "function test")
 }
 
+/// Upstream #2136: a `super` call inside an override is the parent's, never a
+/// self-call, before and after the override's body changes.
+pub fn java_super_call_in_an_override_body_edit() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Java])
+        .file(
+            "src/app/Base.java",
+            "package app;\n\npublic class Base {\n    public void start() {\n    }\n}\n",
+        )
+        .file(
+            "src/app/Service.java",
+            "package app;\n\npublic class Service extends Base {\n    @Override\n    public void start() {\n        super.start();\n    }\n\n    void log() {\n    }\n}\n",
+        )
+        .write(
+            "src/app/Service.java",
+            "package app;\n\npublic class Service extends Base {\n    @Override\n    public void start() {\n        super.start();\n        log();\n    }\n\n    void log() {\n    }\n}\n",
+        )
+        .edge_after("method app::Service::start", "calls", "method app::Service::log")
+        .no_edge_after(
+            "method app::Service::start",
+            "calls",
+            "method app::Service::start",
+        )
+}
+
 /// Upstream #2392 (3): a Go call through an imported package links once the
 /// package appears.
 pub fn go_import_of_an_added_package() -> Case {

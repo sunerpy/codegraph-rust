@@ -768,7 +768,7 @@ fn is_import_binding(receiver: &str, reference: &RefView, context: &dyn Resoluti
 }
 
 /// A plain JS identifier, `/^[A-Za-z_$][\w$]*$/`.
-fn is_simple_js_identifier(name: &str) -> bool {
+pub(crate) fn is_simple_js_identifier(name: &str) -> bool {
     let mut bytes = name.bytes();
     bytes
         .next()
@@ -4326,6 +4326,296 @@ fn lookup_callee_return_type(
         .and_then(|n| n.return_type.clone())
 }
 
+/// How a call the extractor recorded by its bare name is written in the
+/// source (upstream #2223 `bareCallReceiver`).
+#[derive(Debug, PartialEq, Eq)]
+enum BareCallReceiver {
+    /// `this.m()`, `self.m()`, `super.m()`, `super().m()`.
+    OwnObject,
+    /// Any other receiver: `window.$events.m()`, `make().m()`, `self.0.m()`.
+    /// `links` are the member names between `this` and the method, for a
+    /// `this.a.b.m()` chain.
+    Other { links: Vec<String> },
+}
+
+/// An ASCII word character or `$` (JS `[\w$]`).
+fn is_js_word_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'$'
+}
+
+/// Where the receiver of a bare-recorded call is written, read from up to
+/// eight source lines from the reference's column: the first `name` not
+/// preceded by a word character and followed (past `<…>` or Scala `[…]` type
+/// arguments) by `(` or `{`, whose preceding text ends in `.` or `?.`.
+/// `None` for a call written bare, or not found.
+fn bare_call_receiver(
+    reference: &RefView,
+    context: &dyn ResolutionContext,
+) -> Option<BareCallReceiver> {
+    let name = reference.reference_name.as_str();
+    if reference.reference_kind != EdgeKind::Calls || !is_simple_js_identifier(name) {
+        return None;
+    }
+    let facts = context.source_facts(&reference.file_path)?;
+    let start = usize::try_from(reference.line).ok()?.checked_sub(1)?;
+    let end = (start + 8).min(facts.line_count());
+    if start >= end {
+        return None;
+    }
+    let window = facts.join_lines(start, end, "\n");
+    let column = usize::try_from(reference.column).unwrap_or(0);
+    let text = window.get(column..)?;
+    let tail = Regex::new(&format!(
+        r"^{}\s*(?:<[^<>()]*>|\[(?:[^\[\]]|\[[^\[\]]*\])*\])?\s*[({{]",
+        regex::escape(name)
+    ))
+    .ok()?;
+    let at = text.match_indices(name).map(|(at, _)| at).find(|&at| {
+        !text[..at].bytes().next_back().is_some_and(is_js_word_byte) && tail.is_match(&text[at..])
+    })?;
+    let before = text[..at].trim_end();
+    let head = before.strip_suffix('.')?;
+    let head = head.strip_suffix('?').unwrap_or(head).trim_end();
+    static OWN_OBJECT: OnceLock<Regex> = OnceLock::new();
+    static SUPER_CALL: OnceLock<Regex> = OnceLock::new();
+    static THIS_CHAIN: OnceLock<Regex> = OnceLock::new();
+    let own_object = OWN_OBJECT.get_or_init(|| {
+        Regex::new(r"(?:^|[^A-Za-z0-9_$.])(?:this|self|super|Self)$").expect("own object")
+    });
+    let super_call = SUPER_CALL
+        .get_or_init(|| Regex::new(r"(?:^|[^A-Za-z0-9_$.])super\s*\([^()]*\)$").expect("super()"));
+    if own_object.is_match(head) || super_call.is_match(head) {
+        return Some(BareCallReceiver::OwnObject);
+    }
+    let this_chain = THIS_CHAIN.get_or_init(|| {
+        Regex::new(r"(?:^|[^A-Za-z0-9_$.#])((?:this|super)(?:\s*\??\.\s*#?[A-Za-z0-9_$]+)+)$")
+            .expect("this chain")
+    });
+    let links = this_chain
+        .captures(head)
+        .map(|chain| {
+            chain[1]
+                .split('.')
+                .skip(1)
+                .map(|link| {
+                    link.chars()
+                        .filter(|c| !c.is_whitespace() && *c != '?')
+                        .collect()
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(BareCallReceiver::Other { links })
+}
+
+/// Whether a call recorded by its bare name is written on something other
+/// than the caller's own object (upstream #2221, #2223
+/// `isCollapsedNonRecursion`).
+fn is_collapsed_non_recursion(reference: &RefView, context: &dyn ResolutionContext) -> bool {
+    match bare_call_receiver(reference, context) {
+        None | Some(BareCallReceiver::OwnObject) => false,
+        Some(BareCallReceiver::Other { links }) => {
+            !(is_js_family(reference.language)
+                && is_collapsed_self_recursion(&links, reference, context))
+        }
+    }
+}
+
+/// Whether a collapsed `this.<field>.m()` inside `m` can be `m` itself: only
+/// when the class declares the field as its own type, a tree node's
+/// `this.left.insert(v)` (upstream #2221 `isCollapsedSelfRecursion`).
+fn is_collapsed_self_recursion(
+    links: &[String],
+    reference: &RefView,
+    context: &dyn ResolutionContext,
+) -> bool {
+    let [link] = links else {
+        return false;
+    };
+    if link.contains('(') {
+        return false;
+    }
+    let field = link.strip_prefix('#').unwrap_or(link);
+    let Some(caller) = context.get_node_by_id_shared(&reference.from_node_id) else {
+        return false;
+    };
+    let Some(cut) = caller.qualified_name.rfind("::").filter(|&cut| cut > 0) else {
+        return false;
+    };
+    let owner = caller.qualified_name[..cut]
+        .rsplit("::")
+        .next()
+        .unwrap_or_default();
+    let Some(class) = context
+        .get_nodes_in_file_shared(&reference.file_path)
+        .into_iter()
+        .find(|node| {
+            node.kind == NodeKind::Class
+                && node.name == owner
+                && node.start_line <= reference.line
+                && node.end_line >= reference.line
+        })
+    else {
+        return false;
+    };
+    let Some(facts) = context.source_facts(&reference.file_path) else {
+        return false;
+    };
+    let first = usize::try_from(class.start_line)
+        .unwrap_or(1)
+        .saturating_sub(1);
+    let last = usize::try_from(class.end_line)
+        .unwrap_or(0)
+        .min(facts.line_count());
+    if first >= last {
+        return false;
+    }
+    let body = facts.join_lines(first, last, "\n");
+    let field = regex::escape(field);
+    let annotated = Regex::new(&format!(
+        r"(?m)(?:^|[\s(,])#?{field}\s*[?!]?\s*:\s*([A-Za-z_$][A-Za-z0-9_$]*)"
+    ));
+    let constructed = Regex::new(&format!(
+        r"(?-u:\b)this\.{field}\s*=\s*new\s+([A-Za-z_$][A-Za-z0-9_$]*)"
+    ));
+    let declared = annotated
+        .ok()
+        .and_then(|re| re.captures(&body).map(|c| c[1].to_string()))
+        .or_else(|| {
+            constructed
+                .ok()
+                .and_then(|re| re.captures(&body).map(|c| c[1].to_string()))
+        });
+    declared.as_deref() == Some(owner)
+}
+
+/// A declaration's dotted owner path: its file's `package` clauses, then its
+/// enclosing types (`cats.kernel.instances`, `cats.Functor`; upstream #2229
+/// `ownerPathOf`).
+fn owner_path_of(node: &Node, context: &dyn ResolutionContext) -> String {
+    static PACKAGE: OnceLock<Regex> = OnceLock::new();
+    let package = PACKAGE.get_or_init(|| {
+        Regex::new(r"(?m)^\s*package\s+([A-Za-z0-9_.]+)\s*;?\s*$").expect("package clause")
+    });
+    let text = context.read_file(&node.file_path).unwrap_or_default();
+    let pkg = package
+        .captures_iter(&text)
+        .map(|c| c[1].to_string())
+        .collect::<Vec<_>>()
+        .join(".");
+    let owners = node
+        .qualified_name
+        .rfind("::")
+        .filter(|&cut| cut > 0)
+        .map(|cut| node.qualified_name[..cut].replace("::", "."))
+        .unwrap_or_default();
+    [pkg.as_str(), owners.as_str()]
+        .into_iter()
+        .filter(|part| {
+            !part.is_empty() && !(!pkg.is_empty() && *part == owners && owners.starts_with(&pkg))
+        })
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+/// The supertype an inheritance ref names when the name is the declaring
+/// type's own: the other type of that name the written qualifier
+/// (`cats.kernel.instances.`, `Functor.`) leads to by its owner path, or
+/// `None` unless exactly one fits (upstream #2229 `otherSupertypeNamed`).
+fn other_supertype_named(
+    reference: &RefView,
+    context: &dyn ResolutionContext,
+) -> Option<ResolvedRef> {
+    let name = reference
+        .reference_name
+        .rsplit("::")
+        .next()
+        .and_then(|tail| tail.rsplit('.').next())
+        .unwrap_or_default();
+    if name.is_empty() {
+        return None;
+    }
+    let line = usize::try_from(reference.line)
+        .ok()
+        .and_then(|line| line.checked_sub(1))
+        .and_then(|index| {
+            context
+                .source_facts(&reference.file_path)
+                .and_then(|facts| facts.raw_line(index).map(str::to_string))
+        })
+        .unwrap_or_default();
+    let column = usize::try_from(reference.column).unwrap_or(0);
+    let rest = line.get(column..).unwrap_or_default();
+    let qualifier = Regex::new(&format!(
+        r"^\s*((?:[A-Za-z0-9_$]+\.)+){}(?-u:\b)",
+        regex::escape(name)
+    ))
+    .ok()
+    .and_then(|re| {
+        re.captures(rest)
+            .map(|c| c[1].trim_end_matches('.').to_string())
+    })
+    .unwrap_or_default();
+    let candidates: Vec<Arc<Node>> = context
+        .get_nodes_by_name_shared(name)
+        .into_iter()
+        .filter(|node| {
+            node.id != reference.from_node_id
+                && node_is_eligible_target(reference.reference_kind, node)
+                && same_language_family(node.language, reference.language)
+                && (qualifier.is_empty() || {
+                    let path = owner_path_of(node, context);
+                    path == qualifier || path.ends_with(&format!(".{qualifier}"))
+                })
+        })
+        .collect();
+    let [candidate] = candidates.as_slice() else {
+        return None;
+    };
+    Some(ResolvedRef {
+        original: reference.clone(),
+        target_node_id: candidate.id.clone(),
+        confidence: 0.8,
+        resolved_by: ResolvedBy::QualifiedName,
+    })
+}
+
+/// The name matcher's self vetoes (upstream `matchReference`): a result that
+/// lands on the reference's own node is the caller only when nothing rules it
+/// out. A call written on another object is not (#2221, #2223); a type never
+/// inherits from itself, so the other type of its name the qualifier leads to
+/// is chosen instead (#2229); and a value's initializer never calls the value
+/// (#2223).
+pub fn veto_self_target(
+    result: Option<ResolvedRef>,
+    reference: &RefView,
+    context: &dyn ResolutionContext,
+) -> Option<ResolvedRef> {
+    let result = result?;
+    if result.target_node_id != reference.from_node_id {
+        return Some(result);
+    }
+    if is_collapsed_non_recursion(reference, context) {
+        return None;
+    }
+    if crate::types::is_inheritance_ref(reference.reference_kind) {
+        return other_supertype_named(reference, context);
+    }
+    if reference.reference_kind == EdgeKind::Calls
+        && context
+            .get_node_by_id_shared(&reference.from_node_id)
+            .is_some_and(|from| {
+                matches!(
+                    from.kind,
+                    NodeKind::Variable | NodeKind::Constant | NodeKind::Field | NodeKind::Property
+                )
+            })
+    {
+        return None;
+    }
+    Some(result)
+}
+
 /// Match all strategies in order of confidence (`matchReference`,
 /// `name-matcher.ts:1093-1157`).
 pub fn match_reference(
@@ -4647,6 +4937,123 @@ pub fn match_function_ref(
         });
     }
     None
+}
+
+#[cfg(test)]
+mod self_veto_tests {
+    use super::*;
+    use crate::types::ImportMapping;
+
+    /// A context whose only node is the reference's own.
+    struct OneNode(Node);
+
+    impl ResolutionContext for OneNode {
+        fn get_nodes_in_file(&self, _file_path: &str) -> Vec<Node> {
+            vec![self.0.clone()]
+        }
+        fn get_nodes_by_name(&self, _name: &str) -> Vec<Node> {
+            vec![self.0.clone()]
+        }
+        fn get_nodes_by_qualified_name(&self, _qualified_name: &str) -> Vec<Node> {
+            Vec::new()
+        }
+        fn get_nodes_by_kind(&self, _kind: NodeKind) -> Vec<Node> {
+            Vec::new()
+        }
+        fn file_exists(&self, _file_path: &str) -> bool {
+            false
+        }
+        fn read_file(&self, _file_path: &str) -> Option<String> {
+            None
+        }
+        fn get_project_root(&self) -> &str {
+            ""
+        }
+        fn get_all_files(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn get_nodes_by_lower_name(&self, _lower_name: &str) -> Vec<Node> {
+            Vec::new()
+        }
+        fn get_node_by_id(&self, id: &str) -> Option<Node> {
+            (id == self.0.id).then(|| self.0.clone())
+        }
+        fn get_import_mappings(&self, _file_path: &str, _language: Language) -> Vec<ImportMapping> {
+            Vec::new()
+        }
+    }
+
+    fn own_node(kind: NodeKind) -> Node {
+        Node {
+            id: format!("{}:00000000000000000000000000000001", kind.as_str()),
+            kind,
+            name: "response".to_string(),
+            qualified_name: "CurlTest::response".to_string(),
+            file_path: "src/Curl.scala".to_string(),
+            language: Language::Scala,
+            start_line: 2,
+            end_line: 4,
+            start_column: 0,
+            end_column: 0,
+            docstring: None,
+            signature: None,
+            visibility: None,
+            is_exported: false,
+            is_async: false,
+            is_static: false,
+            is_abstract: false,
+            decorators: Vec::new(),
+            type_parameters: Vec::new(),
+            return_type: None,
+            updated_at: 0,
+        }
+    }
+
+    fn self_result(node: &Node) -> (RefView, Option<ResolvedRef>) {
+        let reference = RefView {
+            row_id: None,
+            from_node_id: node.id.clone(),
+            reference_name: "response".to_string(),
+            reference_kind: EdgeKind::Calls,
+            line: 4,
+            column: 4,
+            file_path: node.file_path.clone(),
+            language: Language::Scala,
+            is_function_ref: false,
+            reference_subkind: None,
+        };
+        let result = ResolvedRef {
+            original: reference.clone(),
+            target_node_id: node.id.clone(),
+            confidence: 0.9,
+            resolved_by: ResolvedBy::ExactMatch,
+        };
+        (reference, Some(result))
+    }
+
+    /// Upstream #2223: sttp's `val response = basicRequest.get(…).response(…)`
+    /// is a request's `response`, never the value calling itself; a method's
+    /// call of its own name (recursion) keeps its edge.
+    #[test]
+    fn a_value_initializer_never_calls_the_value() {
+        for kind in [
+            NodeKind::Variable,
+            NodeKind::Constant,
+            NodeKind::Field,
+            NodeKind::Property,
+        ] {
+            let node = own_node(kind);
+            let (reference, result) = self_result(&node);
+            assert_eq!(
+                veto_self_target(result, &reference, &OneNode(node.clone())),
+                None,
+                "{kind:?}"
+            );
+        }
+        let method = own_node(NodeKind::Method);
+        let (reference, result) = self_result(&method);
+        assert!(veto_self_target(result, &reference, &OneNode(method.clone())).is_some());
+    }
 }
 
 #[cfg(test)]

@@ -587,6 +587,7 @@ matrix! {
     java_import_of_an_added_class,
     lua_require_of_an_added_module,
     typescript_out_of_repo_call_ignores_an_added_namesake,
+    java_super_call_in_an_override_body_edit,
     typescript_side_effect_import_of_an_added_file,
     go_import_of_an_added_package,
     solidity_import_of_an_added_file,

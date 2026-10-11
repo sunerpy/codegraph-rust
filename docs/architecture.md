@@ -142,7 +142,12 @@ streaming path for very large graphs), then applies deterministic strategies:
 
 The selected target then passes fail-closed correctness gates: language/module
 visibility, C-family macro and translation-unit scope, Go local bindings,
-external-import locality, and target-kind eligibility. Pure JS-family alias
+external-import locality, and target-kind eligibility. A result that lands on
+the referencing node itself is kept only when nothing rules it out: a call
+written through `super` / `base` / `parent::`, on another object's value, or
+from a value's initializer is not a self-call, and a type never inherits from
+itself (the other type of its name its written qualifier leads to is taken
+instead, or none). Pure JS-family alias
 bindings may forward to a unique callable; wrappers and ambiguity stop at the
 binding. A framework-resolved edge carries its own reachability proof and is not
 erased by ordinary source-language visibility (for example Tauri IPC to a

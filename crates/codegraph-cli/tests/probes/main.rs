@@ -365,4 +365,116 @@ mod seams {
         assert_no_edge!(project, "function gapCursor" => references => "function command");
         assert_no_edge!(project, "function rsbuildConfig" => references => "function rsbuildConfig");
     }
+
+    /// Upstream #2136 (`a4f98202`): a call written through `super` / `base`
+    /// (C#) / `super()` (Python) inside an override calls the parent's
+    /// implementation, never the method making it. Real recursion keeps its
+    /// edge.
+    #[test]
+    fn pr2136_a_super_call_is_not_a_self_call() {
+        let project = Project::new()
+            .file(
+                "ios/CameraView.swift",
+                "import UIKit\nclass CameraView: UIView {\n  override func didMoveToWindow() {\n    super.didMoveToWindow()\n    setup()\n  }\n  func setup() {}\n  func countdown(_ n: Int) {\n    if n > 0 { countdown(n - 1) }\n  }\n}\n",
+            )
+            .file(
+                "android/CameraView.kt",
+                "package app\nclass CameraView(context: Context) : FrameLayout(context) {\n  override fun onAttachedToWindow() {\n    super.onAttachedToWindow()\n  }\n}\n",
+            )
+            .file(
+                "java/Service.java",
+                "package app;\npublic class Service extends Base {\n  @Override\n  public void start() {\n    super.start();\n  }\n}\n",
+            )
+            .file(
+                "py/views.py",
+                "class ProfileView(BaseView):\n    def dispatch(self, request):\n        return super().dispatch(request)\n",
+            )
+            .file(
+                "ts/list.ts",
+                "export class List extends Base {\n  render(): string {\n    return super.render() + '!';\n  }\n}\n",
+            )
+            .file(
+                "cs/Handler.cs",
+                "public class Handler : BaseHandler {\n  public override void Handle() {\n    base.Handle();\n  }\n}\n",
+            )
+            .index();
+
+        for method in [
+            "method CameraView::didMoveToWindow",
+            "method app::CameraView::onAttachedToWindow",
+            "method app::Service::start",
+            "method ProfileView::dispatch",
+            "method List::render",
+            "method Handler::Handle",
+        ] {
+            assert_no_edge!(project, method => calls => method);
+        }
+        assert_edge!(project, "method CameraView::countdown" => calls => "method CameraView::countdown");
+    }
+
+    /// Upstream #2221 (`ff190b30`, its `window` half) and #2223
+    /// (`ca1eba98`): a call the extractor recorded by its bare name but the
+    /// source writes on another object (`window.$events.listen()`, Scala
+    /// `requestToArmeria(request).execute()`, Rust `self.0.into_route(state)`)
+    /// is not the calling method. A call on the method's own object, and one
+    /// through a field of the class's own type, are.
+    #[test]
+    fn pr2223_a_call_handed_on_to_another_object_is_not_the_caller() {
+        let project = Project::new()
+            .file(
+                "resources/js/editor-toolbox.ts",
+                "export class EditorToolbox {\n  container: HTMLElement;\n\n  toggle(): void {\n    this.container.classList.toggle('open');\n    this.toggle();\n  }\n}\n",
+            )
+            .file(
+                "resources/js/tree.ts",
+                "export class TreeNode {\n  left: TreeNode | null = null;\n\n  insert(v: number): void {\n    this.left.insert(v);\n  }\n}\n",
+            )
+            .file(
+                "resources/js/common-events.js",
+                "export function listen(editor) {\n  window.$events.listen('editor::replace', () => editor.reset());\n}\n",
+            )
+            .file(
+                "core/src/main/scala/sttp/ArmeriaBackend.scala",
+                "package sttp\n\nclass ArmeriaBackend {\n  def requestToArmeria(request: String): Client = new Client\n\n  def execute(request: String): Unit = {\n    val armeriaRes = requestToArmeria(request).execute()\n  }\n}\n",
+            )
+            .file(
+                "src/routing/route.rs",
+                "pub struct BoxedIntoRoute(Box<dyn ErasedIntoRoute>);\n\nimpl BoxedIntoRoute {\n    pub fn into_route(self, state: u32) -> u32 {\n        self.0.into_route(state)\n    }\n}\n",
+            )
+            .index();
+
+        assert_no_edge!(project, "function listen" => calls => "function listen");
+        assert_no_edge!(project, "method ArmeriaBackend::execute" => calls => "method ArmeriaBackend::execute");
+        assert_no_edge!(project, "method BoxedIntoRoute::into_route" => calls => "method BoxedIntoRoute::into_route");
+        assert_edge!(project, "method EditorToolbox::toggle" => calls => "method EditorToolbox::toggle");
+        assert_edge!(project, "method TreeNode::insert" => calls => "method TreeNode::insert");
+    }
+
+    /// Upstream #2229 (`b2818198`): a type never inherits from itself. cats'
+    /// `trait BigDecimalInstances extends cats.kernel.instances.BigDecimalInstances`
+    /// names the other type of its name the written qualifier leads to.
+    #[test]
+    fn pr2229_a_type_never_inherits_itself() {
+        let project = Project::new()
+            .file(
+                "kernel/src/main/scala/cats/kernel/instances/BigDecimalInstances.scala",
+                "package cats.kernel\npackage instances\n\ntrait BigDecimalInstances {\n  def order: Int = 0\n}\n",
+            )
+            .file(
+                "core/src/main/scala/cats/instances/bigDecimal.scala",
+                "package cats\npackage instances\n\ntrait BigDecimalInstances extends cats.kernel.instances.BigDecimalInstances {\n  def show: String = \"\"\n}\n",
+            )
+            .file(
+                "core/src/main/scala/cats/Functor.scala",
+                "package cats\n\nobject Functor {\n  trait AllOps[F[_], A]\n}\n\nobject Apply {\n  trait AllOps[F[_], A] extends Functor.AllOps[F, A]\n}\n\nobject Foldable {\n  trait AllOps[F[_], A]\n}\n",
+            )
+            .index();
+
+        let core = "trait BigDecimalInstances @core/src/main/scala/cats/instances/bigDecimal.scala";
+        let kernel = "trait BigDecimalInstances @kernel/src/main/scala/cats/kernel/instances/BigDecimalInstances.scala";
+        assert_no_edge!(project, core => extends => core);
+        assert_edge!(project, core => extends => kernel);
+        assert_no_edge!(project, "trait Apply::AllOps" => extends => "trait Apply::AllOps");
+        assert_edge!(project, "trait Apply::AllOps" => extends => "trait Functor::AllOps");
+    }
 }
