@@ -55,14 +55,22 @@ impl Arity {
     }
 }
 
-/// A method's same-owner overloads in its file and every one's arity, with
-/// whether each is a C# extension method (a `this` first parameter).
+/// One overload's declared parameters: its arity, whether it is a C#
+/// extension method (a `this` first parameter), and the parameters' text.
+#[derive(Debug, Clone)]
+struct Overload {
+    arity: Arity,
+    extension: bool,
+    params: Vec<String>,
+}
+
+/// A method's same-owner overloads in its file.
 #[derive(Debug)]
 pub(crate) struct OverloadSet {
     name: String,
     owner: String,
-    own: Option<(Arity, bool)>,
-    siblings: Vec<(String, Option<(Arity, bool)>)>,
+    own: Option<Overload>,
+    siblings: Vec<(String, Option<Overload>)>,
 }
 
 /// Overload sets by method id, per resolution pass.
@@ -104,15 +112,14 @@ pub(crate) fn retarget_overload(
             .is_some_and(|(receiver, _)| {
                 receiver.rsplit('.').next().unwrap_or(receiver) != set.owner
             });
-    let arity_of = |entry: (Arity, bool)| {
-        let (arity, extension) = entry;
-        if extension && instance_style {
-            arity.without_this()
+    let arity_of = |entry: &Overload| {
+        if entry.extension && instance_style {
+            entry.arity.without_this()
         } else {
-            arity
+            entry.arity
         }
     };
-    let Some(own) = set.own.map(arity_of) else {
+    let Some(own) = set.own.as_ref().map(arity_of) else {
         return result;
     };
     let Some(args) = paren_list_after(
@@ -157,24 +164,164 @@ pub(crate) fn retarget_overload(
             _ => result,
         };
     }
-    let count = if args.trim().is_empty() {
-        0
+    let arguments = if args.trim().is_empty() {
+        Vec::new()
     } else {
-        split_top_level(&args).len()
+        split_top_level(&args)
     };
+    let count = arguments.len();
+    let extension_call = instance_style
+        && set
+            .own
+            .iter()
+            .chain(set.siblings.iter().filter_map(|(_, entry)| entry.as_ref()))
+            .any(|entry| entry.extension);
+    if extension_call {
+        return match csharp_extension_choice(&set, &result.target_node_id, &arguments) {
+            Some(id) if id != result.target_node_id => retarget(&id),
+            _ => result,
+        };
+    }
     if own.takes(count) {
         return result;
     }
     let fits: Vec<&String> = set
         .siblings
         .iter()
-        .filter(|(_, arity)| arity.is_some_and(|arity| arity_of(arity).takes(count)))
+        .filter(|(_, entry)| {
+            entry
+                .as_ref()
+                .is_some_and(|entry| arity_of(entry).takes(count))
+        })
         .map(|(id, _)| id)
         .collect();
     match fits.as_slice() {
         [only] => retarget(only),
         _ => result,
     }
+}
+
+/// How a C# overload takes a call's arguments.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Form {
+    /// As declared: no `params`, or an array passed at the `params` position.
+    Normal,
+    /// The `params` array built from the trailing arguments.
+    Expanded,
+}
+
+/// The overload of `set` an instance-style call of a C# extension method
+/// takes, by C#'s rules with no `this` argument (W3-05c): an overload that
+/// takes the arguments in its normal form beats one that takes them only
+/// expanded; an array creation passed at a `params` position goes to the
+/// `params` overload over one whose parameter there is not an array. `None`
+/// when no overload fits; the current target when several still do.
+fn csharp_extension_choice(
+    set: &OverloadSet,
+    current: &str,
+    arguments: &[String],
+) -> Option<String> {
+    let count = arguments.len();
+    let array_last = arguments.last().is_some_and(|arg| is_array_creation(arg));
+    let form = |entry: &Overload| -> Option<Form> {
+        let params = if entry.extension {
+            entry.params.get(1..).unwrap_or_default()
+        } else {
+            &entry.params[..]
+        };
+        let variadic = params.last().is_some_and(|p| is_pack(p));
+        let fixed = if variadic {
+            &params[..params.len() - 1]
+        } else {
+            params
+        };
+        let required = fixed.iter().filter(|p| !p.contains('=')).count();
+        if !variadic {
+            return (required <= count && count <= fixed.len()).then_some(Form::Normal);
+        }
+        if count == params.len() && array_last {
+            return Some(Form::Normal);
+        }
+        (count >= required).then_some(Form::Expanded)
+    };
+    let entries: Vec<(&str, &Overload)> = set
+        .own
+        .iter()
+        .map(|entry| (current, entry))
+        .chain(
+            set.siblings
+                .iter()
+                .filter_map(|(id, entry)| entry.as_ref().map(|entry| (id.as_str(), entry))),
+        )
+        .collect();
+    let fitting: Vec<(&str, &Overload, Form)> = entries
+        .iter()
+        .filter_map(|&(id, entry)| form(entry).map(|form| (id, entry, form)))
+        .collect();
+    let best = if fitting.iter().any(|(_, _, form)| *form == Form::Normal) {
+        Form::Normal
+    } else {
+        Form::Expanded
+    };
+    let mut chosen: Vec<(&str, &Overload)> = fitting
+        .iter()
+        .filter(|(_, _, form)| *form == best)
+        .map(|&(id, entry, _)| (id, entry))
+        .collect();
+    if chosen.len() > 1 && array_last {
+        // `new object?[] { … }` at a `params object?[]` position is an
+        // identity conversion; to an `object?` parameter it is not.
+        let at = count - 1;
+        let declared = |entry: &Overload| {
+            let params = if entry.extension {
+                entry.params.get(1..).unwrap_or_default()
+            } else {
+                &entry.params[..]
+            };
+            params.get(at).cloned().unwrap_or_default()
+        };
+        let packs: Vec<(&str, &Overload)> = chosen
+            .iter()
+            .copied()
+            .filter(|(_, entry)| is_pack(&declared(entry)))
+            .collect();
+        let others_take_no_array = chosen
+            .iter()
+            .filter(|(_, entry)| !is_pack(&declared(entry)))
+            .all(|(_, entry)| !declares_array(&declared(entry)));
+        if packs.len() == 1 && others_take_no_array {
+            chosen = packs;
+        }
+    }
+    match chosen.as_slice() {
+        [] => None,
+        [(id, _)] => Some((*id).to_string()),
+        _ => chosen
+            .iter()
+            .any(|(id, _)| *id == current)
+            .then(|| current.to_string()),
+    }
+}
+
+/// `new T[] { … }`, `new T[n]` or `new[] { … }`.
+fn is_array_creation(argument: &str) -> bool {
+    let Some(rest) = argument.trim().strip_prefix("new") else {
+        return false;
+    };
+    if !rest.starts_with(|c: char| c.is_whitespace() || c == '[') {
+        return false;
+    }
+    let head = rest.split(['{', '(']).next().unwrap_or_default();
+    head.contains('[')
+}
+
+/// Whether a declared parameter's type is an array (`object?[] args`).
+fn declares_array(param: &str) -> bool {
+    let without_default = param.split('=').next().unwrap_or(param);
+    without_default
+        .trim()
+        .rsplit_once(char::is_whitespace)
+        .is_some_and(|(declared, _)| declared.trim_end().ends_with(']'))
 }
 
 /// The owner prefix of a qualified name: everything before its last `::`.
@@ -205,7 +352,7 @@ fn overload_set_of(id: &str, context: &dyn ResolutionContext) -> Option<Overload
     if siblings.is_empty() {
         return None;
     }
-    let arity = |node: &Node| -> Option<(Arity, bool)> {
+    let arity = |node: &Node| -> Option<Overload> {
         let list = paren_list_after(&node.file_path, node.start_line, 0, &own.name, context)?;
         let params: Vec<String> = split_top_level(&list)
             .into_iter()
@@ -219,8 +366,12 @@ fn overload_set_of(id: &str, context: &dyn ResolutionContext) -> Option<Overload
         let extension = node.language == Language::CSharp
             && params
                 .first()
-                .is_some_and(|first| first.trim_start().starts_with("this "));
-        Some((Arity { min, max }, extension))
+                .is_some_and(|first| crate::csharp_extensions::is_this_parameter(first));
+        Some(Overload {
+            arity: Arity { min, max },
+            extension,
+            params,
+        })
     };
     Some(OverloadSet {
         name: own.name.clone(),
@@ -380,7 +531,119 @@ pub(crate) fn paren_list_after(
 
 #[cfg(test)]
 mod tests {
-    use super::{split_top_level, swift_labels_fit};
+    use super::{
+        Arity, Overload, OverloadSet, csharp_extension_choice, declares_array, is_array_creation,
+        split_top_level, swift_labels_fit,
+    };
+
+    fn overload(params: &[&str]) -> Overload {
+        let params: Vec<String> = params.iter().map(|p| (*p).to_string()).collect();
+        let min = params
+            .iter()
+            .filter(|p| !p.contains('=') && !super::is_pack(p))
+            .count();
+        let max = (!params.iter().any(|p| super::is_pack(p))).then_some(params.len());
+        Overload {
+            arity: Arity { min, max },
+            extension: params
+                .first()
+                .is_some_and(|p| crate::csharp_extensions::is_this_parameter(p)),
+            params,
+        }
+    }
+
+    fn set(own: &[&str], siblings: &[(&str, &[&str])]) -> OverloadSet {
+        OverloadSet {
+            name: "M".to_string(),
+            owner: "Ext".to_string(),
+            own: Some(overload(own)),
+            siblings: siblings
+                .iter()
+                .map(|(id, params)| ((*id).to_string(), Some(overload(params))))
+                .collect(),
+        }
+    }
+
+    fn args(text: &str) -> Vec<String> {
+        split_top_level(text)
+    }
+
+    #[test]
+    fn an_array_at_a_params_position_takes_the_params_overload() {
+        let formats = set(
+            &[
+                "this string format",
+                "IFormatProvider provider",
+                "object? arg0",
+            ],
+            &[(
+                "params",
+                &[
+                    "this string format",
+                    "IFormatProvider provider",
+                    "params object?[] args",
+                ],
+            )],
+        );
+        assert_eq!(
+            csharp_extension_choice(&formats, "own", &args("provider, new object?[] { a, b }"))
+                .as_deref(),
+            Some("params")
+        );
+        // A plain argument: the normal form of the fixed overload beats the
+        // expanded `params` one.
+        assert_eq!(
+            csharp_extension_choice(&formats, "own", &args("provider, a")).as_deref(),
+            Some("own")
+        );
+        assert_eq!(
+            csharp_extension_choice(&formats, "params", &args("provider, a, b")).as_deref(),
+            Some("params")
+        );
+    }
+
+    #[test]
+    fn an_attributed_this_parameter_is_not_an_argument() {
+        let getters = set(
+            &["[NotNull] this PropertyInfo propertyInfo", "bool nonPublic"],
+            &[("one", &["[NotNull] this PropertyInfo propertyInfo"])],
+        );
+        assert_eq!(
+            csharp_extension_choice(&getters, "own", &args("true")).as_deref(),
+            Some("own")
+        );
+        assert_eq!(
+            csharp_extension_choice(&getters, "own", &args("")).as_deref(),
+            Some("one")
+        );
+    }
+
+    #[test]
+    fn same_arity_overloads_keep_the_current_target() {
+        let methods = set(
+            &["this Type type", "string name", "BindingFlags flags"],
+            &[(
+                "other",
+                &["this Type type", "string name", "IList<Type> types"],
+            )],
+        );
+        assert_eq!(
+            csharp_extension_choice(&methods, "own", &args("null, parameterTypes")).as_deref(),
+            Some("own")
+        );
+    }
+
+    #[test]
+    fn array_creations_and_array_parameters_are_recognized() {
+        assert!(is_array_creation("new object?[] { a, b }"));
+        assert!(is_array_creation("new[] { 1, 2 }"));
+        assert!(is_array_creation("new int[3]"));
+        assert!(!is_array_creation("new Widget(1)"));
+        assert!(!is_array_creation("newer"));
+        assert!(declares_array("object?[] args"));
+        assert!(declares_array("params object?[] args"));
+        assert!(!declares_array("object? arg0"));
+    }
 
     #[test]
     fn top_level_commas_skip_nested_groups_and_strings() {

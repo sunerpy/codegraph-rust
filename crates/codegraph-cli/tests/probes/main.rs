@@ -629,6 +629,10 @@ mod seams {
                 "using System;\n\nnamespace App.Hidden\n{\n    internal static class HiddenExtensions\n    {\n        public static bool IsHidden(this Type type)\n        {\n            return false;\n        }\n    }\n}\n",
             )
             .file(
+                "src/Utilities/StringUtils.cs",
+                "using System;\n\nnamespace App.Utilities\n{\n    internal static class StringUtils\n    {\n        public static string FormatWith(this string format, IFormatProvider provider, object? arg0)\n        {\n            return format;\n        }\n\n        public static string FormatWith(this string format, IFormatProvider provider, object? arg0, object? arg1)\n        {\n            return format.FormatWith(provider, new object?[] { arg0, arg1 });\n        }\n\n        private static string FormatWith(this string format, IFormatProvider provider, params object?[] args)\n        {\n            return format;\n        }\n    }\n}\n",
+            )
+            .file(
                 "src/Model/Money.cs",
                 "namespace App.Model\n{\n    public class Money\n    {\n        public override string ToString()\n        {\n            return \"0\";\n        }\n    }\n}\n",
             )
@@ -667,6 +671,15 @@ mod seams {
             project,
             &format!("method App.Utilities::TypeExtensions::GetGetMethod @{extensions}:14") => calls => &format!("method App.Utilities::TypeExtensions::GetGetMethod @{extensions}:19")
         );
+        let strings = "src/Utilities/StringUtils.cs";
+        assert_edge!(
+            project,
+            &format!("method App.Utilities::StringUtils::FormatWith @{strings}:12") => calls => &format!("method App.Utilities::StringUtils::FormatWith @{strings}:17")
+        );
+        assert_no_edge!(
+            project,
+            &format!("method App.Utilities::StringUtils::FormatWith @{strings}:12") => calls => &format!("method App.Utilities::StringUtils::FormatWith @{strings}:7")
+        );
         assert_no_edge!(project, "method App.Serialization::Reader::Find" => calls => "method App.Utilities::TypeExtensions::GetMethod");
         assert_no_edge!(project, "method App.Serialization::Reader::Hidden" => calls => "method App.Hidden::HiddenExtensions::IsHidden");
         assert_no_edge!(project, "method App.Serialization::Reader::Tick" => calls => "method App.Utilities::TypeExtensions::Scale");
@@ -683,6 +696,27 @@ mod seams {
         assert_edge!(project, "method Outer::Deep::Down" => calls => "method Outer::OuterExtensions::IsOuter");
         assert_no_edge!(project, "method Outer::Top::Up" => calls => "method Outer::InnerExtensions::IsInner");
         assert_unresolved!(project, "method Outer::Top::Up" => calls => "type.IsInner");
+
+        // The same overload pair with an attributed `this` parameter.
+        let attributed = Project::new()
+            .file(
+                "src/Utilities/TypeExtensions.cs",
+                "using System.Diagnostics.CodeAnalysis;\nusing System.Reflection;\n\nnamespace App.Utilities\n{\n    internal static class TypeExtensions\n    {\n        public static MethodInfo GetGetMethod([NotNull] this PropertyInfo propertyInfo)\n        {\n            return propertyInfo.GetGetMethod(false);\n        }\n\n        public static MethodInfo GetGetMethod([NotNull] this PropertyInfo propertyInfo, bool nonPublic)\n        {\n            return null;\n        }\n    }\n}\n",
+            )
+            .file(
+                "src/Reader.cs",
+                "using System.Reflection;\nusing App.Utilities;\n\nnamespace App\n{\n    public class Reader\n    {\n        public MethodInfo Getter(PropertyInfo propertyInfo)\n        {\n            return propertyInfo.GetGetMethod(true);\n        }\n    }\n}\n",
+            )
+            .index();
+        let extensions = "src/Utilities/TypeExtensions.cs";
+        assert_edge!(
+            attributed,
+            "method App::Reader::Getter" => calls => &format!("method App.Utilities::TypeExtensions::GetGetMethod @{extensions}:13")
+        );
+        assert_no_edge!(
+            attributed,
+            "method App::Reader::Getter" => calls => &format!("method App.Utilities::TypeExtensions::GetGetMethod @{extensions}:8")
+        );
     }
 
     /// Upstream #2180 (`aa0c73c4`): a call through a class name reaches the

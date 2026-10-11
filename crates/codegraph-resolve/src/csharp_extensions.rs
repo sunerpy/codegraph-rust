@@ -109,15 +109,7 @@ fn extension_fits(
 /// IList<T>? list`, `this in Span s`) as a simple name, or `None` for a
 /// parameter without `this` or a type written with a namespace qualifier.
 pub(crate) fn this_parameter_type(param: &str) -> Option<String> {
-    let mut rest = param.trim();
-    while let Some(after) = rest.strip_prefix('[') {
-        rest = after.split_once(']')?.1.trim_start();
-    }
-    rest = rest.strip_prefix("this")?;
-    if !rest.starts_with(char::is_whitespace) {
-        return None;
-    }
-    let mut rest = rest.trim_start();
+    let mut rest = after_this(param)?;
     for modifier in ["scoped", "ref", "in", "readonly"] {
         if let Some(after) = rest.strip_prefix(modifier)
             && after.starts_with(char::is_whitespace)
@@ -133,6 +125,23 @@ pub(crate) fn this_parameter_type(param: &str) -> Option<String> {
         return None;
     }
     simple_type_name(written)
+}
+
+/// Whether a declared parameter is a C# extension method's `this` one,
+/// attributes before it allowed (`[NotNull] this PropertyInfo p`).
+pub(crate) fn is_this_parameter(param: &str) -> bool {
+    after_this(param).is_some()
+}
+
+/// What follows the `this` modifier of a parameter, past its attributes.
+fn after_this(param: &str) -> Option<&str> {
+    let mut rest = param.trim();
+    while let Some(after) = rest.strip_prefix('[') {
+        rest = after.split_once(']')?.1.trim_start();
+    }
+    let rest = rest.strip_prefix("this")?;
+    rest.starts_with(char::is_whitespace)
+        .then(|| rest.trim_start())
 }
 
 /// A type's simple name: type arguments, `?` and a trailing `[]` kept out
