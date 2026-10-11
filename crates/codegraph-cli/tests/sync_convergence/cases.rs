@@ -214,6 +214,35 @@ pub fn java_super_call_in_an_override_body_edit() -> Case {
         )
 }
 
+/// Upstream #2139: a Java `@Test` never decorates a `test()` method, whose
+/// name differs only in case, before or after the annotated method's body
+/// changes; an annotation the project declares keeps its edge.
+pub fn java_annotation_ignores_a_case_variant_method_body_edit() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Java])
+        .file(
+            "src/app/CharPredicate.java",
+            "package app;\n\npublic interface CharPredicate {\n    boolean test(char c);\n}\n",
+        )
+        .file(
+            "src/app/Marker.java",
+            "package app;\n\npublic @interface Marker {\n}\n",
+        )
+        .file(
+            "src/app/ParserTest.java",
+            "package app;\n\nimport org.junit.jupiter.api.Test;\n\npublic class ParserTest {\n    @Test\n    @Marker\n    void parses() {\n    }\n}\n",
+        )
+        .write(
+            "src/app/ParserTest.java",
+            "package app;\n\nimport org.junit.jupiter.api.Test;\n\npublic class ParserTest {\n    @Test\n    @Marker\n    void parses() {\n        int checked = 1;\n    }\n}\n",
+        )
+        .edge_throughout("method app::ParserTest::parses", "decorates", "interface app::Marker")
+        .no_edge_after(
+            "method app::ParserTest::parses",
+            "decorates",
+            "method app::CharPredicate::test",
+        )
+}
+
 /// Upstream #2392 (3): a Go call through an imported package links once the
 /// package appears.
 pub fn go_import_of_an_added_package() -> Case {

@@ -1,17 +1,5 @@
 [
   {
-    "col": 0,
-    "kind": "imports",
-    "line": 1,
-    "metadata": {
-      "confidence": 0.5,
-      "resolvedBy": "fuzzy"
-    },
-    "provenance": null,
-    "source": "file:service.rb",
-    "target": "class:5f20f7c9609d23d12f8de3f9bb665c29"
-  },
-  {
     "col": 14,
     "kind": "instantiates",
     "line": 10,

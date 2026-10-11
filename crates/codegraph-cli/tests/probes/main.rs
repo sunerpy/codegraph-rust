@@ -477,4 +477,49 @@ mod seams {
         assert_no_edge!(project, "trait Apply::AllOps" => extends => "trait Apply::AllOps");
         assert_edge!(project, "trait Apply::AllOps" => extends => "trait Functor::AllOps");
     }
+
+    /// Upstream #2139 (`66d5dc36`) and #2141 (c) (`ca3bb444`): the last-resort
+    /// fuzzy match ignores case only in a language whose identifiers do (PHP,
+    /// Pascal, CFML), and a fuzzy `instantiates` never names a method. (A PHP
+    /// call written in another case first needs the case-insensitive
+    /// prefilter of #2141 (a); `match_fuzzy`'s unit tests cover its fuzzy
+    /// half.)
+    #[test]
+    fn pr2139_fuzzy_matching_ignores_case_only_where_the_language_does() {
+        let project = Project::new()
+            .file(
+                "src/main/java/app/CharPredicate.java",
+                "package app;\npublic interface CharPredicate {\n  boolean test(char c);\n}\n",
+            )
+            .file(
+                "src/main/java/app/Request.java",
+                "package app;\npublic class Request {\n  public Object cookieManager() { return null; }\n}\n",
+            )
+            .file(
+                "src/test/java/app/ParserTest.java",
+                "package app;\nimport org.junit.jupiter.api.Test;\nimport java.net.CookieManager;\npublic class ParserTest {\n  @Test void parses() {\n    Object manager = new CookieManager();\n  }\n}\n",
+            )
+            .file("src/mocks.ts", "export function mock() { return 1; }\n")
+            .file(
+                "src/fixtures.ts",
+                "export class Store {\n  mockData() { return 1; }\n}\n",
+            )
+            .file(
+                "src/use.test.ts",
+                "export function check() {\n  const m = Mock();\n  return new MockData(m);\n}\n",
+            )
+            .file("tools/paths.py", "def path():\n    return 1\n")
+            .file("tools/main.py", "def main():\n    return Path(\".\")\n")
+            .file("pkg/builder.go", "package pkg\n\nfunc builder() int { return 1 }\n")
+            .file("pkg/main.go", "package pkg\n\nfunc Run() int { return Builder() }\n")
+            .index();
+
+        assert_no_edge!(project, "method app::ParserTest::parses" => decorates => "method app::CharPredicate::test");
+        assert_no_edge!(project, "class app::ParserTest" => decorates => "method app::CharPredicate::test");
+        assert_no_edge!(project, "method app::ParserTest::parses" => instantiates => "method app::Request::cookieManager");
+        assert_no_edge!(project, "function check" => calls => "function mock");
+        assert_no_edge!(project, "function check" => instantiates => "method Store::mockData");
+        assert_no_edge!(project, "function main" => calls => "function path");
+        assert_no_edge!(project, "function Run" => calls => "function builder");
+    }
 }

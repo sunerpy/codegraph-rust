@@ -701,6 +701,13 @@ fn is_bare_go_call(reference: &RefView, context: &dyn ResolutionContext) -> bool
     reference.language == Language::Go && is_receiver_less_call(reference, context)
 }
 
+/// Languages whose identifiers resolve regardless of case (upstream
+/// `CASE_INSENSITIVE_LANGUAGES`: PHP, Pascal/Delphi, CFML; COBOL is not
+/// extracted, and VB.NET joins with its extractor).
+pub(crate) fn is_case_insensitive_language(language: Language) -> bool {
+    matches!(language, Language::Php | Language::Pascal | Language::Cfml)
+}
+
 /// What only exists inside a type, reachable through a receiver alone
 /// (upstream #2120 `TYPE_MEMBER_KINDS`).
 fn is_type_member_kind(kind: NodeKind) -> bool {
@@ -4081,10 +4088,22 @@ pub fn match_fuzzy(reference: &RefView, context: &dyn ResolutionContext) -> Opti
     }
 
     let callable_kinds = [NodeKind::Function, NodeKind::Method, NodeKind::Class];
+    let case_insensitive = is_case_insensitive_language(reference.language);
     let callable_candidates = apply_language_gate(
         candidates
             .into_iter()
             .filter(|n| callable_kinds.contains(&n.kind))
+            // `new …MockData()` makes an instance of a type; a method is never
+            // what it names (upstream #2141).
+            .filter(|n| {
+                !(reference.reference_kind == EdgeKind::Instantiates && n.kind == NodeKind::Method)
+            })
+            // Names are case-sensitive in every language but a handful: a
+            // Java `@Test` is not a `test()` method, TS `Mock()` not `mock`,
+            // Python `Path(…)` not `path`. Only those whose identifiers
+            // resolve regardless of case use this fallback's lowercase index
+            // as such (upstream #2139).
+            .filter(|n| case_insensitive || n.name == reference.reference_name)
             .collect(),
         reference,
     );
@@ -5146,6 +5165,58 @@ mod ceiling_tests {
 
     fn nodes(count: usize) -> Vec<Node> {
         (0..count).map(node).collect()
+    }
+
+    /// Upstream #2139: the fuzzy fallback's lowercase index matches across
+    /// case only in a case-insensitive language (PHP `formatprice` reaches
+    /// `FormatPrice`); a TypeScript `Mock()` never reaches `mock`.
+    #[test]
+    fn fuzzy_ignores_case_only_in_a_case_insensitive_language() {
+        let mut php = node(1);
+        php.name = "FormatPrice".to_string();
+        php.qualified_name = "FormatPrice".to_string();
+        php.language = Language::Php;
+        php.file_path = "src/helpers.php".to_string();
+        let ctx = FakeContext {
+            by_name: Vec::new(),
+            by_lower: vec![php.clone()],
+        };
+        let mut call = reference();
+        call.reference_name = "formatprice".to_string();
+        call.language = Language::Php;
+        call.file_path = "src/view.php".to_string();
+        assert_eq!(
+            match_fuzzy(&call, &ctx).map(|m| m.target_node_id),
+            Some(php.id.clone())
+        );
+
+        let mut ts = node(2);
+        ts.name = "mock".to_string();
+        ts.qualified_name = "mock".to_string();
+        let ctx = FakeContext {
+            by_name: Vec::new(),
+            by_lower: vec![ts],
+        };
+        let mut call = reference();
+        call.reference_name = "Mock".to_string();
+        assert_eq!(match_fuzzy(&call, &ctx), None);
+    }
+
+    /// Upstream #2141 (c): `new MockData()` never instantiates a method.
+    #[test]
+    fn a_fuzzy_instantiation_never_names_a_method() {
+        let mut method = node(3);
+        method.kind = NodeKind::Method;
+        method.name = "MockData".to_string();
+        method.qualified_name = "Store::MockData".to_string();
+        let ctx = FakeContext {
+            by_name: Vec::new(),
+            by_lower: vec![method],
+        };
+        let mut new_call = reference();
+        new_call.reference_name = "MockData".to_string();
+        new_call.reference_kind = EdgeKind::Instantiates;
+        assert_eq!(match_fuzzy(&new_call, &ctx), None);
     }
 
     #[test]
@@ -6842,8 +6913,8 @@ mod tests {
         let n = mk(
             "function:x",
             NodeKind::Function,
-            "Run",
-            "Run",
+            "run",
+            "run",
             "src/a.ts",
             Language::TypeScript,
         );
@@ -6860,8 +6931,8 @@ mod tests {
         let n = mk(
             "function:x",
             NodeKind::Function,
-            "Run",
-            "Run",
+            "run",
+            "run",
             "src/a.jsx",
             Language::Jsx,
         );
@@ -7665,8 +7736,8 @@ mod tests {
         let n = mk(
             "function:x",
             NodeKind::Function,
-            "Run",
-            "Run",
+            "run",
+            "run",
             "src/a.ts",
             Language::TypeScript,
         );
@@ -11238,8 +11309,9 @@ mod tests {
 
     #[test]
     fn rust_receiver_gates_close_the_fuzzy_fallback() {
-        // Fuzzy matching is case-insensitive, so `Join` / `Helper` are its only
-        // candidates for `join` / `helper`; the shapes still gate them.
+        // Only the lowercase index holds `join` / `helper`, so the fuzzy
+        // fallback is the one strategy that finds them; the shapes still gate
+        // them. (Fuzzy matching is exact-case in Rust, upstream #2139.)
         let source = "fn f() {\n    root().join(x);\n    helper(x);\n}\n";
         let lone = |name: &str, kind: NodeKind| {
             vec![mk(
@@ -11259,21 +11331,21 @@ mod tests {
         };
         let ctx = Ctx::default()
             .file("src/a.rs", source)
-            .lower("join", lone("Join", NodeKind::Method));
+            .lower("join", lone("join", NodeKind::Method));
         assert!(
             fuzzy("join", 2, &ctx).is_none(),
             "a dropped receiver takes no fuzzy guess"
         );
         let ctx = Ctx::default()
             .file("src/a.rs", source)
-            .lower("helper", lone("Helper", NodeKind::Method));
+            .lower("helper", lone("helper", NodeKind::Method));
         assert!(
             fuzzy("helper", 3, &ctx).is_none(),
             "a bare call never reaches a method"
         );
         let ctx = Ctx::default()
             .file("src/a.rs", source)
-            .lower("helper", lone("Helper", NodeKind::Function));
+            .lower("helper", lone("helper", NodeKind::Function));
         assert!(
             fuzzy("helper", 3, &ctx).is_some(),
             "a bare call may still reach a function"
