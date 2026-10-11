@@ -136,7 +136,9 @@ indexes, and migration history.
 streaming path for very large graphs), then applies deterministic strategies:
 
 1. language-aware imports, re-exports, packages, and paths;
-2. qualified, scoped, receiver/type, lexical, and exact-name matching, then a
+2. qualified, scoped, receiver/type, lexical, and exact-name matching (a
+   receiver written as, or inferred to be, a type the project does not declare
+   stops the name guesses), then a
    last-resort fuzzy match that ignores case only in PHP, Pascal and CFML,
    whose identifiers do;
 3. detected `FrameworkResolver` implementations; and

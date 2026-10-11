@@ -522,4 +522,60 @@ mod seams {
         assert_no_edge!(project, "function main" => calls => "function path");
         assert_no_edge!(project, "function Run" => calls => "function builder");
     }
+
+    /// Upstream #2166 (`05740b55`) and #2169 (`791ae397`), its general half: a
+    /// call on a receiver written as a type the project does not declare
+    /// (`Object.assign`, Java `String.valueOf`), or on one whose inferred
+    /// type the project does not declare (`List<String> list`, Python
+    /// `path = Path("x")`), is that outside type's, never a project method's
+    /// guessed by name. Go's exported package variables are not type names,
+    /// and the project's own type still resolves.
+    #[test]
+    fn pr2166_a_call_on_an_outside_type_is_not_a_project_method() {
+        let project = Project::new()
+            .file(
+                "src/main/java/app/StringUtils.java",
+                "package app;\npublic class StringUtils {\n  public static String valueOf(Object o) { return String.valueOf(o); }\n}\n",
+            )
+            .file(
+                "src/main/java/app/Use.java",
+                "package app;\npublic class Use {\n  public int run() {\n    Integer.valueOf(1);\n    return StringUtils.valueOf(2).length();\n  }\n}\n",
+            )
+            .file(
+                "src/main/java/app/NonNullElementWrapperList.java",
+                "package app;\npublic class NonNullElementWrapperList {\n  public boolean add(Object o) { return true; }\n}\n",
+            )
+            .file(
+                "src/main/java/app/UseList.java",
+                "package app;\nimport java.util.ArrayList;\nimport java.util.List;\npublic class UseList {\n  public void run() {\n    List<String> list = new ArrayList<>();\n    list.add(\"x\");\n  }\n}\n",
+            )
+            .file(
+                "src/ts/ObjectUtils.ts",
+                "export class ObjectUtils {\n  static assign(a: unknown) { return a; }\n}\n",
+            )
+            .file(
+                "src/ts/merge.ts",
+                "export function merge(a: unknown) {\n  return Object.assign(a);\n}\n",
+            )
+            .file(
+                "tools/helper.py",
+                "class PathHelper:\n    def exists(self):\n        return True\n",
+            )
+            .file(
+                "tools/check.py",
+                "from pathlib import Path\n\ndef check():\n    path = Path(\"x\")\n    return path.exists()\n",
+            )
+            .file(
+                "pkg/form.go",
+                "package pkg\n\ntype form struct{}\n\nfunc (f form) Bind() int { return 1 }\n\nvar FormPost = form{}\n\nfunc Run() int { return FormPost.Bind() }\n",
+            )
+            .index();
+
+        assert_no_edge!(project, "method app::StringUtils::valueOf" => calls => "method app::StringUtils::valueOf");
+        assert_edge!(project, "method app::Use::run" => calls => "method app::StringUtils::valueOf");
+        assert_no_edge!(project, "method app::UseList::run" => calls => "method app::NonNullElementWrapperList::add");
+        assert_no_edge!(project, "function merge" => calls => "method ObjectUtils::assign");
+        assert_no_edge!(project, "function check" => calls => "method PathHelper::exists");
+        assert_edge!(project, "function Run" => calls => "method form::Bind");
+    }
 }

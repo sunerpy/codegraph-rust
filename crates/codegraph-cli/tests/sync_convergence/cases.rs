@@ -243,6 +243,27 @@ pub fn java_annotation_ignores_a_case_variant_method_body_edit() -> Case {
         )
 }
 
+/// Upstream #2166: `Object.assign(…)` stays the platform's when a project
+/// class with an `assign` method appears; a call written on that class is the
+/// project's.
+pub fn typescript_outside_type_call_ignores_an_added_method() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::TypeScript])
+        .file(
+            "src/merge.ts",
+            "export function merge(a: unknown) {\n  return Object.assign(a);\n}\n",
+        )
+        .file(
+            "src/use.ts",
+            "import { ObjectUtils } from './ObjectUtils';\n\nexport function use(a: unknown) {\n  return ObjectUtils.assign(a);\n}\n",
+        )
+        .write(
+            "src/ObjectUtils.ts",
+            "export class ObjectUtils {\n  static assign(a: unknown) {\n    return a;\n  }\n}\n",
+        )
+        .edge_after("function use", "calls", "method ObjectUtils::assign")
+        .no_edge_after("function merge", "calls", "method ObjectUtils::assign")
+}
+
 /// Upstream #2392 (3): a Go call through an imported package links once the
 /// package appears.
 pub fn go_import_of_an_added_package() -> Case {

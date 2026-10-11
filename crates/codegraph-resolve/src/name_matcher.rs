@@ -701,6 +701,55 @@ fn is_bare_go_call(reference: &RefView, context: &dyn ResolutionContext) -> bool
     reference.language == Language::Go && is_receiver_less_call(reference, context)
 }
 
+/// Whether a receiver written as `Name` is a type in `language`'s conventions
+/// (upstream #2166 `namesExternalType`). Not in Go (an exported package
+/// variable is `FormPost`), nor C, C++ (CUDA and Metal included) or Rust
+/// (their type paths use `::`); in Pascal every identifier is capitalized, so only Delphi's type
+/// prefixes (`TFoo`, `EFoo`, `IFoo`) and `Exception` count.
+fn names_external_type(receiver: &str, language: Language) -> bool {
+    let mut bytes = receiver.bytes();
+    if !bytes.next().is_some_and(|first| first.is_ascii_uppercase())
+        || !bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    {
+        return false;
+    }
+    if language == Language::Pascal {
+        let prefixed = receiver.len() >= 2
+            && matches!(receiver.as_bytes()[0], b'T' | b'E' | b'I')
+            && receiver.as_bytes()[1].is_ascii_uppercase();
+        return prefixed || receiver == "Exception";
+    }
+    // CUDA and Metal sources are extracted as C++.
+    !matches!(
+        language,
+        Language::Go | Language::C | Language::Cpp | Language::Rust
+    )
+}
+
+/// A class, struct, union or interface, or a Scala `object` (upstream
+/// `isMethodOwnerKind`).
+fn is_method_owner(node: &Node) -> bool {
+    matches!(
+        node.kind,
+        NodeKind::Class | NodeKind::Struct | NodeKind::Union | NodeKind::Interface
+    ) || crate::types::is_scala_singleton(node)
+}
+
+/// A type name that reads as a type (capitalized) yet names no class,
+/// struct or interface of the reference's language family the project
+/// declares: one from outside the project (upstream #2169).
+fn is_undeclared_type_name(
+    type_name: &str,
+    reference: &RefView,
+    context: &dyn ResolutionContext,
+) -> bool {
+    type_name.starts_with(|c: char| c.is_ascii_uppercase())
+        && !context
+            .get_nodes_by_name_shared(type_name)
+            .iter()
+            .any(|n| is_method_owner(n) && same_language_family(n.language, reference.language))
+}
+
 /// Languages whose identifiers resolve regardless of case (upstream
 /// `CASE_INSENSITIVE_LANGUAGES`: PHP, Pascal/Delphi, CFML; COBOL is not
 /// extracted, and VB.NET joins with its extractor).
@@ -3164,6 +3213,15 @@ pub fn match_method_call(
             ) {
                 return Some(typed);
             }
+            // The receiver's declared type is one the project doesn't declare
+            // (`List<String> list`, `String s`, `path = Path("x")`), so the
+            // method is that outside type's, never a project method guessed
+            // by name (upstream #2169). Only a type name: the last segment of
+            // `java.util.List`, not of a call chain.
+            let type_name = inferred.rsplit('.').next().unwrap_or(&inferred);
+            if is_undeclared_type_name(type_name, reference, context) {
+                return None;
+            }
         } else {
             match crate::awaited::infer_awaited_receiver(&object_or_class, reference, context) {
                 crate::awaited::AwaitedInference::NotApplicable => {}
@@ -3300,6 +3358,19 @@ pub fn match_method_call(
     if reference.reference_kind == EdgeKind::Calls
         && is_js_family(reference.language)
         && is_imported_module_receiver(&object_or_class, reference, context)
+    {
+        return None;
+    }
+
+    // A receiver written as a type name the project doesn't declare
+    // (`Exception.Create(…)` in Delphi, `Collections.sort(…)`,
+    // `Object.assign(…)`) is a type from outside it: a same-named method of
+    // some project type is a guess (upstream #2166).
+    if names_external_type(&object_or_class, reference.language)
+        && !context
+            .get_nodes_by_name_shared(&object_or_class)
+            .iter()
+            .any(|n| same_language_family(n.language, reference.language))
     {
         return None;
     }
