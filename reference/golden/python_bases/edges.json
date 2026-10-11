@@ -50,6 +50,18 @@
   {
     "col": 11,
     "kind": "calls",
+    "line": 6,
+    "metadata": {
+      "confidence": 0.8,
+      "resolvedBy": "qualified-name"
+    },
+    "provenance": null,
+    "source": "function:7a3344a7ac17b30aaa3f83a44206faa5",
+    "target": "method:9d9b5b00778c2267ae8859aa05672b8d"
+  },
+  {
+    "col": 11,
+    "kind": "calls",
     "line": 8,
     "metadata": {
       "confidence": 0.8,

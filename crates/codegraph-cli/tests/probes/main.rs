@@ -578,4 +578,90 @@ mod seams {
         assert_no_edge!(project, "function check" => calls => "method PathHelper::exists");
         assert_edge!(project, "function Run" => calls => "method form::Bind");
     }
+
+    /// Upstream #2180 (`aa0c73c4`): a call through a class name reaches the
+    /// class method it inherits, by the supertypes its declaration heads name
+    /// (Pascal `class(…)`, Python bases), before any guess by name.
+    #[test]
+    fn pr2180_a_call_through_a_class_name_reaches_the_method_it_inherits() {
+        let project = Project::new()
+            .file(
+                "src/Horse.Core.pas",
+                "unit Horse.Core;\n\ninterface\n\ntype\n  THorseCore = class\n  public\n    class function Get(const APath: string): THorseCore;\n  end;\n\nimplementation\n\nclass function THorseCore.Get(const APath: string): THorseCore;\nbegin\n  Result := nil;\nend;\n\nend.\n",
+            )
+            .file(
+                "src/Horse.Core.Group.pas",
+                "unit Horse.Core.Group;\n\ninterface\n\ntype\n  IHorseCoreGroup = interface\n    function Get(const APath: string): IHorseCoreGroup;\n  end;\n\nimplementation\n\nend.\n",
+            )
+            .file(
+                "src/Horse.pas",
+                "unit Horse;\n\ninterface\n\nuses Horse.Core;\n\ntype\n  THorseProvider = class(THorseCore)\n  end;\n\n  THorse = class(THorseProvider)\n  end;\n\nimplementation\n\nend.\n",
+            )
+            .file(
+                "samples/Console.dpr",
+                "program Console;\n\nuses Horse;\n\nbegin\n  THorse.Get('/ping');\nend.\n",
+            )
+            .file(
+                "app/views.py",
+                "class APIView:\n    @classmethod\n    def as_view(cls):\n        return cls\n\n\nclass GenericAPIView(APIView):\n    pass\n\n\nclass UserList(GenericAPIView):\n    pass\n\n\nclass Router:\n    def as_view(self):\n        return None\n",
+            )
+            .file(
+                "app/urls.py",
+                "from app.views import UserList\n\n\ndef routes():\n    return [UserList.as_view()]\n",
+            )
+            .index();
+
+        assert_edge!(project, "file:samples/Console.dpr" => calls => "method THorseCore::Get @src/Horse.Core.pas:8");
+        assert_no_edge!(project, "file:samples/Console.dpr" => calls => "method IHorseCoreGroup::Get");
+        // (In a function: a module-level assignment's initializer is not
+        // walked for calls, as before.)
+        assert_edge!(project, "function routes" => calls => "method APIView::as_view");
+        assert_no_edge!(project, "function routes" => calls => "method Router::as_view");
+    }
+
+    /// Upstream #2175 (`c0a38a87`), #2197 (`85aad42f`) and #2221 (`ff190b30`,
+    /// its Strategy 3 half): a receiver-word guess is never a handler the web
+    /// framework dispatches to, never a test double the receiver and the
+    /// calling file do not name, and never the calling method itself. A test
+    /// that names its double still calls it.
+    #[test]
+    fn pr2175_a_receiver_guess_is_never_a_handler_a_double_or_the_caller() {
+        let project = Project::new()
+            .file(
+                "app/handlers.py",
+                "from django.views import View\n\n\nclass ClientRegistrationView(View):\n    def post(self, request):\n        return None\n\n\nclass SessionView(View):\n    def post(self, request):\n        return None\n",
+            )
+            .file(
+                "tests/fakes.py",
+                "class _FakeHTTPResponse:\n    def json(self):\n        return {}\n\n\nclass Payload:\n    def json(self):\n        return {}\n",
+            )
+            .file(
+                "tests/test_views.py",
+                "def test_login(client):\n    resp = client.post(\"/login\")\n    assert resp.status_code == 200\n\n\ndef test_api(api_client):\n    response = api_client.get(\"/recipes\")\n    data = response.json()\n    assert data\n",
+            )
+            .file(
+                "tests/mocking.py",
+                "class MockedResponse:\n    def __init__(self, data):\n        self.data = data\n\n    def json(self):\n        return self.data\n",
+            )
+            .file(
+                "tests/test_mocking.py",
+                "from tests.mocking import MockedResponse\n\n\ndef test_mocked():\n    resp = MockedResponse({\"ok\": True})\n    assert resp.json()[\"ok\"]\n",
+            )
+            .file(
+                "app/Uploads/FileStorage.php",
+                "<?php\n\nclass FileStorage\n{\n    public function delete(string $path): void\n    {\n        $storage = $this->getStorageDisk();\n        $storage->delete($path);\n    }\n\n    protected function getStorageDisk()\n    {\n        return null;\n    }\n}\n",
+            )
+            .file(
+                "app/Uploads/ImageStorage.php",
+                "<?php\n\nclass ImageStorage\n{\n    public function delete(string $path): void\n    {\n    }\n}\n",
+            )
+            .index();
+
+        assert_no_edge!(project, "function test_login" => calls => "method ClientRegistrationView::post");
+        assert_no_edge!(project, "function test_login" => calls => "method SessionView::post");
+        assert_no_edge!(project, "function test_api" => calls => "method _FakeHTTPResponse::json");
+        assert_no_edge!(project, "function test_api" => calls => "method MockedResponse::json");
+        assert_edge!(project, "function test_mocked" => calls => "method MockedResponse::json");
+        assert_no_edge!(project, "method FileStorage::delete" => calls => "method FileStorage::delete");
+    }
 }

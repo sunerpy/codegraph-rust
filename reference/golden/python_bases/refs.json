@@ -51,16 +51,6 @@
   },
   {
     "candidates": null,
-    "col": 11,
-    "file_path": "pkg/service.py",
-    "from_node_id": "function:7a3344a7ac17b30aaa3f83a44206faa5",
-    "language": "python",
-    "line": 6,
-    "reference_kind": "calls",
-    "reference_name": "User.create"
-  },
-  {
-    "candidates": null,
     "col": 12,
     "file_path": "pkg/service.py",
     "from_node_id": "function:7a3344a7ac17b30aaa3f83a44206faa5",

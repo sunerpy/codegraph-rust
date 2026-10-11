@@ -750,6 +750,154 @@ fn is_undeclared_type_name(
             .any(|n| is_method_owner(n) && same_language_family(n.language, reference.language))
 }
 
+/// The simple name of the type a member belongs to: the last `::` / `.`
+/// segment before the member's own (`THorseCore` of `THorseCore::Get`).
+fn member_owner_name(qualified_name: &str) -> &str {
+    let Some(cut) = qualified_name.rfind("::").filter(|&cut| cut > 0) else {
+        return "";
+    };
+    qualified_name[..cut]
+        .rsplit("::")
+        .next()
+        .and_then(|segment| segment.rsplit('.').next())
+        .unwrap_or_default()
+}
+
+/// A method named `name` on a supertype of `classes`, nearest first, at most
+/// five levels up (upstream #2180 `inheritedClassMethod`).
+fn inherited_class_method(
+    classes: &[Arc<Node>],
+    name: &str,
+    context: &dyn ResolutionContext,
+) -> Option<Arc<Node>> {
+    let mut seen: std::collections::HashSet<String> =
+        classes.iter().map(|class| class.id.clone()).collect();
+    let mut frontier: Vec<Arc<Node>> = classes.to_vec();
+    for _ in 0..5 {
+        if frontier.is_empty() {
+            break;
+        }
+        let mut next = Vec::new();
+        for class in &frontier {
+            for supertype in crate::class_heads::declared_supertypes(class, context) {
+                for decl in context.get_nodes_by_name_shared(&supertype) {
+                    if decl.language != class.language
+                        || !is_method_owner(&decl)
+                        || !seen.insert(decl.id.clone())
+                    {
+                        continue;
+                    }
+                    if let Some(method) = context
+                        .get_nodes_in_file_shared(&decl.file_path)
+                        .into_iter()
+                        .find(|n| {
+                            n.kind == NodeKind::Method
+                                && n.name == name
+                                && member_owner_name(&n.qualified_name) == decl.name
+                        })
+                    {
+                        return Some(method);
+                    }
+                    next.push(decl);
+                }
+            }
+        }
+        frontier = next;
+    }
+    None
+}
+
+/// A request handler the web framework dispatches to: a Django / DRF /
+/// Flask view's `get` / `post` / …, a controller's `index` / `store` /
+/// `update` / `destroy` (upstream #2175 `DISPATCHED_OWNER` /
+/// `DISPATCHED_ACTIONS`). Nothing calls one through an instance by name.
+fn is_dispatched_handler(method: &Node) -> bool {
+    const ACTIONS: [&str; 17] = [
+        "get",
+        "post",
+        "put",
+        "patch",
+        "delete",
+        "head",
+        "options",
+        "index",
+        "show",
+        "store",
+        "update",
+        "destroy",
+        "create",
+        "edit",
+        "list",
+        "retrieve",
+        "partial_update",
+    ];
+    const OWNERS: [&str; 6] = [
+        "View",
+        "ViewSet",
+        "APIView",
+        "Controller",
+        "Endpoint",
+        "ViewMixin",
+    ];
+    ACTIONS.contains(&method.name.as_str()) && {
+        let owner = member_owner_name(&method.qualified_name);
+        OWNERS.iter().any(|suffix| owner.ends_with(suffix))
+    }
+}
+
+/// A test double's word: Fake…, Mock…, Mocked…, Stub…, Dummy…, Spy… (upstream
+/// `TEST_DOUBLE_OWNER`, matched per split word).
+fn is_test_double_word(word: &str) -> bool {
+    ["fake", "mock", "mocked", "stub", "dummy", "spy"]
+        .iter()
+        .any(|double| word.eq_ignore_ascii_case(double))
+}
+
+/// The link of a dotted receiver its value is named after: the last, or for a
+/// constant (`InitializationPhase.CONTROLLERS`) the type it belongs to
+/// (upstream `receiverLink`).
+fn receiver_link(receiver: &str) -> &str {
+    let mut links = receiver.rsplit('.');
+    let last = links.next().unwrap_or(receiver);
+    let constant = last.len() >= 2
+        && last.starts_with(|c: char| c.is_ascii_uppercase())
+        && last
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_');
+    match links.next() {
+        Some(owner) if constant => owner,
+        _ => last,
+    }
+}
+
+/// A method of a test double (`MockedResponse`, `_FakeHTTPResponse`) the
+/// receiver and the calling file never name (upstream #2197
+/// `isUnnamedTestDouble`).
+fn is_unnamed_test_double(
+    method: &Node,
+    receiver: &str,
+    reference: &RefView,
+    context: &dyn ResolutionContext,
+) -> bool {
+    let owner = member_owner_name(&method.qualified_name);
+    if owner.is_empty()
+        || !split_camel_case(owner)
+            .iter()
+            .any(|w| is_test_double_word(w))
+    {
+        return false;
+    }
+    if split_camel_case(receiver_link(receiver))
+        .iter()
+        .any(|w| is_test_double_word(w))
+    {
+        return false;
+    }
+    !context
+        .read_file_shared(&reference.file_path)
+        .is_some_and(|text| text.contains(owner))
+}
+
 /// Languages whose identifiers resolve regardless of case (upstream
 /// `CASE_INSENSITIVE_LANGUAGES`: PHP, Pascal/Delphi, CFML; COBOL is not
 /// extracted, and VB.NET joins with its extractor).
@@ -3336,6 +3484,28 @@ pub fn match_method_call(
             }
         }
     }
+    // A class method the named class inherits (Horse's `THorse.Get(…)` is
+    // THorseCore's, three `class(…)` heads up) before any guess by name
+    // (upstream #2180).
+    let named_classes: Vec<Arc<Node>> = context
+        .get_nodes_by_name_shared(&object_or_class)
+        .into_iter()
+        .filter(|class_node| {
+            class_node.language == reference.language
+                && (matches!(
+                    class_node.kind,
+                    NodeKind::Class | NodeKind::Struct | NodeKind::Union | NodeKind::Interface
+                ) || crate::types::is_scala_singleton(class_node))
+        })
+        .collect();
+    if let Some(inherited) = inherited_class_method(&named_classes, &method_name, context) {
+        return Some(ResolvedRef {
+            original: reference.clone(),
+            target_node_id: inherited.id.clone(),
+            confidence: 0.8,
+            resolved_by: ResolvedBy::QualifiedName,
+        });
+    }
 
     // Built-in method names need a validated receiver (#1987). Typed, imported,
     // object-literal and direct class receivers have had their chance above;
@@ -3438,6 +3608,15 @@ pub fn match_method_call(
         target_methods.retain(|method| method.file_path != reference.file_path);
         narrowed = target_methods.len() != before;
     }
+    // A handler the web framework dispatches to (a view's `post`, a
+    // controller's `update`) is never called through an instance by name, and
+    // ruling those out must not leave a lone other one to guess at (upstream
+    // #2175).
+    {
+        let before = target_methods.len();
+        target_methods.retain(|method| !is_dispatched_handler(method));
+        narrowed |= target_methods.len() != before;
+    }
 
     // A SINGLE same-named candidate is not on its own evidence that the receiver
     // is that candidate's type. Without the overlap check this branch bound every
@@ -3456,6 +3635,8 @@ pub fn match_method_call(
         && !narrowed
         && target_methods[0].language == reference.language
         && receiver_shares_word(&object_or_class, &target_methods[0].qualified_name)
+        // A test double is only what a test names (upstream #2197).
+        && !is_unnamed_test_double(&target_methods[0], &object_or_class, reference, context)
     {
         return Some(ResolvedRef {
             original: reference.clone(),
@@ -3472,6 +3653,12 @@ pub fn match_method_call(
         let mut best_match: Option<&Node> = None;
         let mut best_score = 0i64;
         for method in &ordered {
+            // A test double is only what a test constructs or names, never a
+            // guess from `response.json()` in a file that never mentions it
+            // (upstream #2175).
+            if is_unnamed_test_double(method, &object_or_class, reference, context) {
+                continue;
+            }
             let mut score = receiver_word_overlap(&object_or_class, &method.qualified_name) as i64;
             if method.language == reference.language {
                 score += 1;
@@ -3481,8 +3668,12 @@ pub fn match_method_call(
                 best_match = Some(method);
             }
         }
+        // A wrapper handing its call on (`FileStorage::delete` doing
+        // `$storage->delete($path)`) names the caller's own class only by a
+        // shared word: a guess that is the caller itself is no guess
+        // (upstream #2221).
         if let Some(best) = best_match {
-            if best_score >= 2 {
+            if best_score >= 2 && best.id != reference.from_node_id {
                 return Some(ResolvedRef {
                     original: reference.clone(),
                     target_node_id: best.id.clone(),

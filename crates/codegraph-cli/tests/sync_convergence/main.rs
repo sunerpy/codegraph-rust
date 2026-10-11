@@ -590,6 +590,7 @@ matrix! {
     java_super_call_in_an_override_body_edit,
     java_annotation_ignores_a_case_variant_method_body_edit,
     typescript_outside_type_call_ignores_an_added_method,
+    python_inherited_classmethod_body_edit,
     typescript_side_effect_import_of_an_added_file,
     go_import_of_an_added_package,
     solidity_import_of_an_added_file,

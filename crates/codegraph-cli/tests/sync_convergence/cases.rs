@@ -264,6 +264,29 @@ pub fn typescript_outside_type_call_ignores_an_added_method() -> Case {
         .no_edge_after("function merge", "calls", "method ObjectUtils::assign")
 }
 
+/// Upstream #2180: a call through a class name reaches the class method the
+/// class inherits, before and after the calling body changes.
+pub fn python_inherited_classmethod_body_edit() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Python])
+        .file(
+            "pkg/base.py",
+            "class Base:\n    @classmethod\n    def create(cls):\n        return cls()\n",
+        )
+        .file(
+            "pkg/user.py",
+            "from pkg.base import Base\n\n\nclass User(Base):\n    pass\n",
+        )
+        .file(
+            "pkg/service.py",
+            "from pkg.user import User\n\n\ndef make():\n    return None\n",
+        )
+        .write(
+            "pkg/service.py",
+            "from pkg.user import User\n\n\ndef make():\n    return User.create()\n",
+        )
+        .edge_after("function make", "calls", "method Base::create")
+}
+
 /// Upstream #2392 (3): a Go call through an imported package links once the
 /// package appears.
 pub fn go_import_of_an_added_package() -> Case {
