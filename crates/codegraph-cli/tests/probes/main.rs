@@ -579,6 +579,32 @@ mod seams {
         assert_edge!(project, "function Run" => calls => "method form::Bind");
     }
 
+    /// Upstream #2169 reads a C++ receiver's declared type through
+    /// `normalizeCppTypeName`: `SkipList<Key, Comparator> list_` is the
+    /// project's `SkipList`, so its call keeps the method (leveldb's
+    /// `list_.Insert(key)`), while a receiver of a type the project does not
+    /// declare stops the guess (`QString s; s.size()`).
+    #[test]
+    fn pr2169_a_cpp_receiver_of_a_project_class_template_keeps_its_method() {
+        let project = Project::new()
+            .file(
+                "db/skiplist.h",
+                "namespace leveldb {\ntemplate <typename Key, class Comparator>\nclass SkipList {\n public:\n  void Insert(const Key& key) {}\n  bool Contains(const Key& key) const { return false; }\n};\nclass Sizer {\n public:\n  int size() const { return 0; }\n};\n}  // namespace leveldb\n",
+            )
+            .file(
+                "db/skiplist_test.cc",
+                "#include \"db/skiplist.h\"\n#include <QString>\nnamespace leveldb {\nclass ConcurrentTest {\n  SkipList<int, int> list_;\n\n public:\n  void WriteStep() { list_.Insert(1); }\n};\nbool Probe() {\n  SkipList<int, int> list;\n  return list.Contains(2);\n}\nint Length() {\n  QString s;\n  return s.size();\n}\n}  // namespace leveldb\n",
+            )
+            .index();
+
+        assert_edge!(
+            project,
+            "method leveldb::ConcurrentTest::WriteStep" => calls => "method leveldb::SkipList::Insert"
+        );
+        assert_edge!(project, "function leveldb::Probe" => calls => "method leveldb::SkipList::Contains");
+        assert_no_edge!(project, "function leveldb::Length" => calls => "method leveldb::Sizer::size");
+    }
+
     /// Upstream #2180 (`aa0c73c4`): a call through a class name reaches the
     /// class method it inherits, by the supertypes its declaration heads name
     /// (Pascal `class(…)`, Python bases), before any guess by name.

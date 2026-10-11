@@ -590,6 +590,7 @@ matrix! {
     java_super_call_in_an_override_body_edit,
     java_annotation_ignores_a_case_variant_method_body_edit,
     typescript_outside_type_call_ignores_an_added_method,
+    cpp_class_template_receiver_body_edit,
     python_inherited_classmethod_body_edit,
     typescript_test_suite_namesake_appears,
     java_overload_delegation_body_edit,

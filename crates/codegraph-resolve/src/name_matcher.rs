@@ -762,6 +762,39 @@ fn is_undeclared_type_name(
             .any(|n| is_method_owner(n) && same_language_family(n.language, reference.language))
 }
 
+/// The type a C++ declared type names, as upstream's `normalizeCppTypeName`
+/// reads it: cv-qualifiers, `typename` / `class` / `struct`, `&` / `*` and
+/// template arguments (nested ones with them) dropped, the last `::` segment
+/// kept (`const SkipList<Key, Comparator>&` → `SkipList`).
+fn cpp_declared_type_name(declared: &str) -> String {
+    let mut depth = 0usize;
+    let mut bare = String::with_capacity(declared.len());
+    for c in declared.chars() {
+        match c {
+            '<' => depth += 1,
+            '>' => depth = depth.saturating_sub(1),
+            '&' | '*' if depth == 0 => bare.push(' '),
+            _ if depth == 0 => bare.push(c),
+            _ => {}
+        }
+    }
+    let words: Vec<&str> = bare
+        .split_whitespace()
+        .filter(|word| {
+            !matches!(
+                *word,
+                "const" | "volatile" | "mutable" | "typename" | "class" | "struct"
+            )
+        })
+        .collect();
+    words
+        .join(" ")
+        .rsplit("::")
+        .find(|segment| !segment.trim().is_empty())
+        .map(|segment| segment.trim().to_string())
+        .unwrap_or_default()
+}
+
 /// The simple name of the type a member belongs to: the last `::` / `.`
 /// segment before the member's own (`THorseCore` of `THorseCore::Get`).
 fn member_owner_name(qualified_name: &str) -> &str {
@@ -3388,9 +3421,16 @@ pub fn match_method_call(
             // (`List<String> list`, `String s`, `path = Path("x")`), so the
             // method is that outside type's, never a project method guessed
             // by name (upstream #2169). Only a type name: the last segment of
-            // `java.util.List`, not of a call chain.
-            let type_name = inferred.rsplit('.').next().unwrap_or(&inferred);
-            if is_undeclared_type_name(type_name, reference, context) {
+            // `java.util.List`, not of a call chain. A C++ declared type is
+            // read the way upstream's `normalizeCppTypeName` reads it, which
+            // the C++ inferrer here does not: `SkipList<Key, Comparator>` is
+            // the project's `SkipList`.
+            let type_name = if reference.language == Language::Cpp {
+                cpp_declared_type_name(&inferred)
+            } else {
+                inferred.rsplit('.').next().unwrap_or(&inferred).to_string()
+            };
+            if is_undeclared_type_name(&type_name, reference, context) {
                 return None;
             }
         } else {
@@ -5278,6 +5318,31 @@ pub fn match_function_ref(
         });
     }
     None
+}
+
+#[cfg(test)]
+mod cpp_declared_type_tests {
+    use super::cpp_declared_type_name;
+
+    #[test]
+    fn a_declared_cpp_type_is_read_as_upstream_reads_it() {
+        assert_eq!(
+            cpp_declared_type_name("SkipList<Key, Comparator>"),
+            "SkipList"
+        );
+        assert_eq!(cpp_declared_type_name("const ScopedHandle"), "ScopedHandle");
+        assert_eq!(cpp_declared_type_name("Table<int, Box<int>>&"), "Table");
+        assert_eq!(
+            cpp_declared_type_name("leveldb::Table::Iterator*"),
+            "Iterator"
+        );
+        assert_eq!(cpp_declared_type_name("std::vector<std::string>"), "vector");
+        assert_eq!(
+            cpp_declared_type_name("typename T::value_type"),
+            "value_type"
+        );
+        assert_eq!(cpp_declared_type_name(""), "");
+    }
 }
 
 #[cfg(test)]

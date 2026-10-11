@@ -266,6 +266,30 @@ pub fn typescript_outside_type_call_ignores_an_added_method() -> Case {
         .no_edge_after("function merge", "calls", "method ObjectUtils::assign")
 }
 
+/// Upstream #2169: a C++ receiver declared as one of the project's class
+/// templates (`SkipList<int, int> list_`) keeps its method, before and after
+/// the body changes.
+pub fn cpp_class_template_receiver_body_edit() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Cpp])
+        .file(
+            "db/skiplist.h",
+            "namespace leveldb {\ntemplate <typename Key, class Comparator>\nclass SkipList {\n public:\n  void Insert(const Key& key) {}\n};\n}  // namespace leveldb\n",
+        )
+        .file(
+            "db/writer.cc",
+            "#include \"db/skiplist.h\"\nnamespace leveldb {\nclass Writer {\n  SkipList<int, int> list_;\n\n public:\n  void WriteStep() { list_.Insert(1); }\n};\n}  // namespace leveldb\n",
+        )
+        .write(
+            "db/writer.cc",
+            "#include \"db/skiplist.h\"\nnamespace leveldb {\nclass Writer {\n  SkipList<int, int> list_;\n\n public:\n  void WriteStep() { list_.Insert(2); }\n};\n}  // namespace leveldb\n",
+        )
+        .edge_throughout(
+            "method leveldb::Writer::WriteStep",
+            "calls",
+            "method leveldb::SkipList::Insert",
+        )
+}
+
 /// Upstream #2180: a call through a class name reaches the class method the
 /// class inherits, before and after the calling body changes.
 pub fn python_inherited_classmethod_body_edit() -> Case {
