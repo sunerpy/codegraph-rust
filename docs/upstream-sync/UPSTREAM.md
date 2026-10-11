@@ -12,16 +12,21 @@
   deferred by the owner, as the 2026-10-01 CLOSEOUT entry below lists. The
   official codegraph-rs `v0.51.0` binaries passed the release smoke recorded
   there.
-- **Last discovery audit:** the `v1.6.1` tag
-  `f4ddf508516332419ea3c95702810765936cf679`, audited on 2026-09-30 in
-  [`V1_6_1_AUDIT_2026-09-30.md`](V1_6_1_AUDIT_2026-09-30.md): 113 commits from
-  the previous boundary, 111 of them non-merge.
-- **Previous discovery boundary:**
-  `3ed73bc127323e63153bf6ec8354afa82ce36aaf` (the 2026-09-15 main audit,
-  [`POST_V1_6_MAIN_2026-09-15.md`](POST_V1_6_MAIN_2026-09-15.md)).
+- **Last discovery audit:** colby `main` at
+  `b635dd467f0578926a9c01a37b9d28d2b26689f1` (2026-10-07), audited on
+  2026-10-10 in [`V1_6_2_AUDIT_2026-10-10.md`](V1_6_2_AUDIT_2026-10-10.md): 268
+  commits from the previous boundary, none of them merges, the first 180 of
+  them the `v1.6.2` release (`6560052a6f856855d3f71eee838fd66ccfa4285d`).
+- **Previous discovery boundary:** the `v1.6.1` tag
+  `f4ddf508516332419ea3c95702810765936cf679` (the 2026-09-30 audit,
+  [`V1_6_1_AUDIT_2026-09-30.md`](V1_6_1_AUDIT_2026-09-30.md)).
 - **Next discovery starts here:**
-  `f4ddf508516332419ea3c95702810765936cf679..origin/main`. Do not re-triage the
-  audited `v1.6.1` range.
+  `b635dd467f0578926a9c01a37b9d28d2b26689f1..origin/main`. Do not re-triage the
+  audited range.
+- **Planned for codegraph-rs `v0.55.0`:** every row of the 2026-10-10 audit
+  except its `ALREADY-HAVE`, `N/A` and `OWNER-EXCLUDED` rows, in one pull
+  request; see the 2026-10-10 entry below. The tracked release stays `v1.6.1`
+  until that release ships and its downloaded binaries are verified.
 - **Upstream repository:** <https://github.com/colbymchenry/codegraph>.
 - **Shipped in codegraph-rs `v0.52.0`, 2026-10-01:**
   - #286, which makes a full `sync` keep what `index` keeps;
@@ -72,7 +77,8 @@
   edges and routers, the synthesis layer and its schema, cross-tier channels,
   server route naming, the explore Flow, the React Native bridge) remain
   deferred, scheduled as phases 2–4: F10/F11 first, then F1–F6 with Screens and
-  Steps, then F7–F9 and F12.
+  Steps, then F7–F9 and F12. The 2026-10-10 program plans all of them for
+  `v0.55.0`.
 
 The Rust product and upstream release versions are independent. This Current
 alignment block is the only place that states release parity; dated log entries
@@ -171,6 +177,57 @@ below remain immutable historical evidence.
 > that records colby parity — do not infer it from `Cargo.toml`.
 
 ## Sync log
+
+### 2026-10-10 — CORRECTED: four ledger and doc statements that disagreed with the code
+
+Found by the 2026-10-10 audit (§1.6 of
+[`V1_6_2_AUDIT_2026-10-10.md`](V1_6_2_AUDIT_2026-10-10.md)); the entries they
+correct stay as written.
+
+- **`ns::compute` resolution.** The 2026-07-14 Release D entry says `ns::fn()`
+  calls "resolve for free via the existing qualified-name matcher". They do
+  not: the extractor records `ns::compute()` as the bare `compute`, and the
+  cpp golden shows the edge `resolvedBy: exact-match`.
+  [`equivalence.md`](../equivalence.md) now says so.
+- **#226 (`1c180a4`) is KEEP-RUST.** Its S3 unique-candidate receiver-word gate
+  compares the whole qualified name and refuses Lua untyped receivers that
+  upstream #2153 keeps, so it is stricter than upstream. It is now recorded as
+  a deliberate divergence.
+- **#1728 (`9a324874`) was never recorded.** Upstream reads
+  `.git/info/exclude` and the global `core.excludesFile`. The repository's own
+  `.git/info/exclude` is planned for v0.55.0; the global file is KEEP-RUST,
+  because reading per-user configuration from outside the project breaks
+  project containment (AGENTS.md invariant 5).
+- **KNOWN_DIFFS listed ported behavior as deferred.** C++ receiver-type
+  inference, Java/Kotlin field-receiver inference, the batched and conformance
+  resolution passes, and the per-language import refinements all exist in
+  `crates/codegraph-resolve`. They are removed from
+  [`KNOWN_DIFFS.md`](KNOWN_DIFFS.md).
+
+### 2026-10-10 — `f4ddf508..b635dd46` AUDITED; the codegraph-rs `v0.55.0` program PLANNED
+
+- **Range:** colby `v1.6.1` (`f4ddf508`) to colby `main` of 2026-10-07
+  (`b635dd46`): 268 commits, none of them merges; the first 180 are the
+  `v1.6.2` release (`6560052a`). Classified on 2026-10-09 against codegraph-rs
+  `v0.54.0` (`14c4f93`, extraction version 21, schema 8), with every probe run
+  on the released `0.54.0` binary. The row-by-row ledger is
+  [`V1_6_2_AUDIT_2026-10-10.md`](V1_6_2_AUDIT_2026-10-10.md).
+- **Findings:** most of the range is upstream's per-language precision sweep of
+  its name matcher. The audit also found nine Rust-only defects (§1 of the
+  audit file), among them a cold-start MCP session that never attaches to the
+  daemon it spawns, and the watcher event loss promised on
+  sunerpy/codegraph-rust#269. Fifteen pre-existing extraction gaps (G1–G15) had
+  gone unnoticed because the goldens had no C#, Java, Swift, Objective-C, PHP,
+  Vue or Svelte corpus.
+- **Owner decisions:** everything except the `ALREADY-HAVE` and `N/A` rows
+  lands in one pull request, squashed and released by release-please as
+  `v0.55.0`. COBOL is `OWNER-EXCLUDED` for this release. VB.NET goes through a
+  revertible trial of `tree-sitter-vb-dotnet =0.1.0`, and becomes
+  `OWNER-EXCLUDED` if any acceptance criterion fails. Refusing a schema newer
+  than the binary, found while planning, is split into its own follow-up pull
+  request. The full list is in the audit file.
+- **Not changed:** the tracked release stays `v1.6.1`; the discovery boundary
+  moves to `b635dd46`.
 
 ### 2026-10-03 — `v0.53.3` RELEASED: #314 shipped
 

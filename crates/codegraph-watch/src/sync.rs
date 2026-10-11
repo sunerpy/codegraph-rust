@@ -13,8 +13,8 @@ use codegraph_core::generated_header::detect_generated_file;
 use codegraph_core::node_id::hash_content;
 use codegraph_core::types::{FileRecord, Node};
 use codegraph_extract::{
-    ExtensionOverrides, ExtractOptions, SourceText, detect_language_with,
-    extract_file_with_options, is_source_file, read_source_file,
+    ExtensionOverrides, ExtractOptions, SourceText, detect_language_of, extract_file_with_options,
+    is_source_file, read_source_file,
 };
 use codegraph_resolve::ReferenceResolver;
 use codegraph_resolve::framework::FrameworkExtractionContext;
@@ -971,7 +971,7 @@ fn reextract_into_store(
     let file = FileRecord {
         path: relative.to_string(),
         content_hash,
-        language: detect_language_with(relative, &scope.options.extensions),
+        language: detect_language_of(relative, source, &scope.options.extensions),
         size: metadata.len() as i64,
         modified_at: modified_millis(metadata),
         indexed_at: now_millis(),

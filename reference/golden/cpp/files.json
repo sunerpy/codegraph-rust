@@ -120,7 +120,7 @@
     "content_hash": "21fbcda14c0c45acbdabcd19f24c8e00bdb7b05c0bf35bc28d5225794138f6c0",
     "errors": null,
     "generated": 0,
-    "language": "c",
+    "language": "cpp",
     "node_count": 5,
     "path": "plain_derived.h",
     "size": 201
@@ -130,7 +130,7 @@
     "errors": null,
     "generated": 0,
     "language": "c",
-    "node_count": 3,
+    "node_count": 4,
     "path": "plain_header_negatives.h",
     "size": 260
   },
@@ -174,7 +174,7 @@
     "content_hash": "5afecb82e36830d924845a28b9069f2fb7cc3d9b15d74f6bf6623fd737b3d265",
     "errors": null,
     "generated": 0,
-    "language": "c",
+    "language": "cpp",
     "node_count": 2,
     "path": "ue_actor.h",
     "size": 191

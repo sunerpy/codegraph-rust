@@ -809,6 +809,18 @@ impl Store {
         rows.collect()
     }
 
+    /// Files stored with no nodes or with recorded extraction errors: the only
+    /// rows that can be missing their symbols (upstream #2336's
+    /// `getFilesWithoutNodesOrWithErrors`). A healthy index has few, so this
+    /// stays cheap on a large one.
+    pub fn files_without_nodes_or_with_errors(&self) -> rusqlite::Result<Vec<FileRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT * FROM files WHERE node_count = 0 OR errors IS NOT NULL ORDER BY path",
+        )?;
+        let rows = stmt.query_map([], row_to_file)?;
+        rows.collect()
+    }
+
     /// Every node in the graph, ordered by id for a deterministic export.
     pub fn all_nodes(&self) -> rusqlite::Result<Vec<Node>> {
         query_nodes(&self.conn, "SELECT * FROM nodes ORDER BY id", [])

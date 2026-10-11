@@ -1,0 +1,12 @@
+[
+  {
+    "candidates": null,
+    "col": 9,
+    "file_path": "src/lib/util.ts",
+    "from_node_id": "function:0b98d06016a836832feba77c5ee38067",
+    "language": "typescript",
+    "line": 6,
+    "reference_kind": "calls",
+    "reference_name": "value.trim"
+  }
+]

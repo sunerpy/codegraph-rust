@@ -285,6 +285,14 @@ fn assert_preheal_precedes_writer(project: &Path, subcommand: &str, extra_args: 
         .args(extra_args)
         .arg(project)
         .env("CODEGRAPH_NO_DAEMON", "1")
+        // An empty registry of its own: `index --force` lists every registered
+        // stdio MCP server on stderr, and with the developer's real registry that
+        // list can outgrow the pipe this test drains only after the barriers,
+        // parking the command before its second lease.
+        .env(
+            "CODEGRAPH_MCP_REGISTRY_DIR",
+            project.with_file_name("mcp-registry"),
+        )
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     barrier.configure(&mut command);

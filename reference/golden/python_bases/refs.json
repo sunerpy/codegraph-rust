@@ -1,0 +1,132 @@
+[
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "pkg/service.py",
+    "from_node_id": "file:pkg/service.py",
+    "language": "python",
+    "line": 1,
+    "reference_kind": "imports",
+    "reference_name": "pkg"
+  },
+  {
+    "candidates": null,
+    "col": 11,
+    "file_path": "pkg/models/base.py",
+    "from_node_id": "class:6fddf6cd7e5fa996fc4fd7330a6b0d6a",
+    "language": "python",
+    "line": 15,
+    "reference_kind": "extends",
+    "reference_name": "type"
+  },
+  {
+    "candidates": null,
+    "col": 11,
+    "file_path": "pkg/service.py",
+    "from_node_id": "function:7a3344a7ac17b30aaa3f83a44206faa5",
+    "language": "python",
+    "line": 6,
+    "reference_kind": "calls",
+    "reference_name": "User.create"
+  },
+  {
+    "candidates": null,
+    "col": 12,
+    "file_path": "pkg/service.py",
+    "from_node_id": "function:7a3344a7ac17b30aaa3f83a44206faa5",
+    "language": "python",
+    "line": 7,
+    "reference_kind": "calls",
+    "reference_name": "models.User"
+  },
+  {
+    "candidates": null,
+    "col": 15,
+    "file_path": "pkg/models/base.py",
+    "from_node_id": "method:6840adae2cb87b312fe0260a4227ef90",
+    "language": "python",
+    "line": 3,
+    "reference_kind": "calls",
+    "reference_name": "type"
+  },
+  {
+    "candidates": null,
+    "col": 15,
+    "file_path": "pkg/models/base.py",
+    "from_node_id": "method:9d9b5b00778c2267ae8859aa05672b8d",
+    "language": "python",
+    "line": 9,
+    "reference_kind": "calls",
+    "reference_name": "cls"
+  },
+  {
+    "candidates": null,
+    "col": 15,
+    "file_path": "pkg/models/user.py",
+    "from_node_id": "method:96bb5b7c0ce9d04be7cb37384f7a4d15",
+    "language": "python",
+    "line": 12,
+    "reference_kind": "calls",
+    "reference_name": "super"
+  },
+  {
+    "candidates": null,
+    "col": 15,
+    "file_path": "pkg/models/user.py",
+    "from_node_id": "method:96bb5b7c0ce9d04be7cb37384f7a4d15",
+    "language": "python",
+    "line": 12,
+    "reference_kind": "calls",
+    "reference_name": "super().run"
+  },
+  {
+    "candidates": null,
+    "col": 23,
+    "file_path": "pkg/service.py",
+    "from_node_id": "function:7a3344a7ac17b30aaa3f83a44206faa5",
+    "language": "python",
+    "line": 8,
+    "reference_kind": "calls",
+    "reference_name": "other.run"
+  },
+  {
+    "candidates": null,
+    "col": 4,
+    "file_path": "pkg/models/base.py",
+    "from_node_id": "method:9d9b5b00778c2267ae8859aa05672b8d",
+    "language": "python",
+    "line": 7,
+    "reference_kind": "decorates",
+    "reference_name": "classmethod"
+  },
+  {
+    "candidates": null,
+    "col": 7,
+    "file_path": "tests/conftest.py",
+    "from_node_id": "file:tests/conftest.py",
+    "language": "python",
+    "line": 1,
+    "reference_kind": "imports",
+    "reference_name": "pytest"
+  },
+  {
+    "candidates": null,
+    "col": 8,
+    "file_path": "pkg/models/user.py",
+    "from_node_id": "method:2226bffb7188c9ea4ee6a95a2b386626",
+    "language": "python",
+    "line": 6,
+    "reference_kind": "calls",
+    "reference_name": "super"
+  },
+  {
+    "candidates": null,
+    "col": 8,
+    "file_path": "pkg/models/user.py",
+    "from_node_id": "method:2226bffb7188c9ea4ee6a95a2b386626",
+    "language": "python",
+    "line": 6,
+    "reference_kind": "calls",
+    "reference_name": "super().ping"
+  }
+]

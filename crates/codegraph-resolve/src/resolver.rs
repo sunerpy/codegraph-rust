@@ -1369,17 +1369,28 @@ impl ReferenceResolver {
     ) -> FrameworkExtractionCollection {
         let mut collection = FrameworkExtractionCollection::default();
         for relative in relative_files {
-            let language = codegraph_extract::detect_language_with(relative, extensions);
-            let has_applicable = self
-                .framework_resolver_extensions
-                .iter()
-                .any(|resolver| applies_to_language(resolver.as_ref(), language));
+            let detected = codegraph_extract::detect_language_with(relative, extensions);
+            // A `.h` header may turn out C++ or Objective-C once read, so it
+            // is read whenever a resolver applies to any language it can be.
+            let candidates: &[Language] = if detected == Language::C {
+                &[Language::C, Language::Cpp, Language::ObjC]
+            } else {
+                std::slice::from_ref(&detected)
+            };
+            let has_applicable = self.framework_resolver_extensions.iter().any(|resolver| {
+                candidates
+                    .iter()
+                    .any(|&language| applies_to_language(resolver.as_ref(), language))
+            });
             if !has_applicable {
                 continue;
             }
             let Some(content) = read_file(relative) else {
                 continue;
             };
+            // The file's language as extraction and its file row see it.
+            let language =
+                codegraph_extract::detect_language_for_source(relative, &content, extensions);
             for resolver in &self.framework_resolver_extensions {
                 if !applies_to_language(resolver.as_ref(), language) {
                     continue;

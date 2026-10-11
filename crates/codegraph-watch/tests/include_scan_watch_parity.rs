@@ -593,3 +593,73 @@ fn scan_and_watch_agree_on_root_gitignore_rules() {
         fs::remove_dir_all(&project).ok();
     }
 }
+
+/// `.git/info/exclude` joins the same matcher, ranked below the root
+/// `.gitignore` as git ranks it (upstream #1728): the watcher handles exactly
+/// the files the scan indexes, a `.gitignore` negation re-includes what the
+/// exclude file dropped, and every directory above an indexed file is watched.
+#[test]
+fn scan_and_watch_agree_on_repository_exclude_rules() {
+    let files = [
+        "src/app.ts",
+        "scratch/try.ts",
+        "src/debug.local.ts",
+        "kept/again.ts",
+        "notes/draft.ts",
+    ];
+    let everything_but_notes: &[&str] = &[
+        "kept/again.ts",
+        "scratch/try.ts",
+        "src/app.ts",
+        "src/debug.local.ts",
+    ];
+    for (exclude, gitignore, expected) in [
+        (
+            "scratch/\n*.local.ts\n",
+            "",
+            &["kept/again.ts", "notes/draft.ts", "src/app.ts"][..],
+        ),
+        ("kept/\nnotes/\n", "!kept/\n", everything_but_notes),
+        ("# comment only\n", "notes/\n", everything_but_notes),
+    ] {
+        let project = unique_project("exclude_rules");
+        touch(&project, ".git/info/exclude", exclude);
+        touch(&project, ".gitignore", gitignore);
+        for file in files {
+            touch(&project, file, "x");
+        }
+        let options = ExtractOptions::default();
+        let scanned = scan_project(&project, &options).expect("scan");
+        let policy = WatchPolicy::with_config(
+            &project,
+            &options.ignore_dirs,
+            &options.ignore_paths,
+            &[],
+            &[],
+        );
+        for file in files {
+            let in_scan = scanned.iter().any(|f| f == file);
+            assert_eq!(
+                in_scan,
+                policy.should_handle_file(file),
+                "scan⇔watch parity broken for exclude={exclude:?} .gitignore={gitignore:?} \
+                 file={file}"
+            );
+            if in_scan {
+                let segments = file.split('/').collect::<Vec<_>>();
+                for depth in 1..segments.len() {
+                    let dir = segments[..depth].join("/");
+                    assert!(
+                        policy.should_watch_dir(&dir),
+                        "exclude={exclude:?}: {dir} holds indexed {file} but is not watched"
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            scanned, expected,
+            "exclude={exclude:?} .gitignore={gitignore:?}"
+        );
+        fs::remove_dir_all(&project).ok();
+    }
+}

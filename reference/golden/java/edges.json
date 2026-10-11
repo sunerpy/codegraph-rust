@@ -1,0 +1,599 @@
+[
+  {
+    "col": 0,
+    "kind": "imports",
+    "line": 6,
+    "metadata": {
+      "confidence": 0.95,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "namespace:0241892b231b76f262f1d6f12c9a13bc",
+    "target": "class:94e832e0c31a7087908a6e3a64f46c91"
+  },
+  {
+    "col": 17,
+    "kind": "references",
+    "line": 20,
+    "metadata": {
+      "confidence": 0.7,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "method:c8883fca5b9ab3e5b9f4c67c82365397",
+    "target": "class:22afc7b49093ccfbb79006770c212771"
+  },
+  {
+    "col": 19,
+    "kind": "instantiates",
+    "line": 21,
+    "metadata": {
+      "confidence": 0.7,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "method:c8883fca5b9ab3e5b9f4c67c82365397",
+    "target": "class:22afc7b49093ccfbb79006770c212771"
+  },
+  {
+    "col": 25,
+    "kind": "calls",
+    "line": 32,
+    "metadata": {
+      "confidence": 0.85,
+      "resolvedBy": "qualified-name"
+    },
+    "provenance": null,
+    "source": "method:1b4003a7ca954fad2b793f108c48d32b",
+    "target": "method:1e4a24a85a4da3fedc2d8995dacbba16"
+  },
+  {
+    "col": 27,
+    "kind": "instantiates",
+    "line": 17,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "method:c5f83603bb58827e828bd921b11695b4",
+    "target": "class:94e832e0c31a7087908a6e3a64f46c91"
+  },
+  {
+    "col": 28,
+    "kind": "extends",
+    "line": 5,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "class:22afc7b49093ccfbb79006770c212771",
+    "target": "class:dab3e63e72adfc253c33d766f7ed9944"
+  },
+  {
+    "col": 31,
+    "kind": "calls",
+    "line": 11,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "method:cd87bdc9721fd2109c50bdd8ed3d5896",
+    "target": "method:1bb37813fd2158f3d88b0df50616bee9"
+  },
+  {
+    "col": 32,
+    "kind": "calls",
+    "line": 26,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "method:6286f4575b75b858d15373165a633a08",
+    "target": "method:3cc03d430f5a0977506f878c1b611938"
+  },
+  {
+    "col": 4,
+    "kind": "references",
+    "line": 20,
+    "metadata": {
+      "confidence": 0.7,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "method:c8883fca5b9ab3e5b9f4c67c82365397",
+    "target": "class:22afc7b49093ccfbb79006770c212771"
+  },
+  {
+    "col": 42,
+    "kind": "calls",
+    "line": 32,
+    "metadata": {
+      "confidence": 0.85,
+      "resolvedBy": "qualified-name"
+    },
+    "provenance": null,
+    "source": "method:1b4003a7ca954fad2b793f108c48d32b",
+    "target": "method:1e4a24a85a4da3fedc2d8995dacbba16"
+  },
+  {
+    "col": 44,
+    "kind": "implements",
+    "line": 5,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "class:22afc7b49093ccfbb79006770c212771",
+    "target": "interface:3fffd09acd8cea1790098cf4e09778e7"
+  },
+  {
+    "col": 8,
+    "kind": "calls",
+    "line": 16,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "method:c5f83603bb58827e828bd921b11695b4",
+    "target": "method:3d35716f895aa3c9f4647b6f246b841f"
+  },
+  {
+    "col": 8,
+    "kind": "calls",
+    "line": 18,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "instance-method"
+    },
+    "provenance": null,
+    "source": "method:c5f83603bb58827e828bd921b11695b4",
+    "target": "method:5e986b7b7013c7ef5d591c03116d2599"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "class:1fb698fc0eda40ad650bf0cf826b7dce",
+    "target": "method:0746db3de10b2999776f739e19828e8c"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "class:20fae71b4c5dd6363c9c148e65149b13",
+    "target": "method:3d35716f895aa3c9f4647b6f246b841f"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "class:22afc7b49093ccfbb79006770c212771",
+    "target": "field:741248955feb08dd1931083449bf6399"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "class:22afc7b49093ccfbb79006770c212771",
+    "target": "method:1e4a24a85a4da3fedc2d8995dacbba16"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "class:22afc7b49093ccfbb79006770c212771",
+    "target": "method:214c81420bea1e6726e940c6d1a9caa4"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "class:22afc7b49093ccfbb79006770c212771",
+    "target": "method:cd87bdc9721fd2109c50bdd8ed3d5896"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "class:22afc7b49093ccfbb79006770c212771",
+    "target": "method:d850d600a819269a5d2d3262600c673d"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "class:396464c511a39dc6873aecb201b67c66",
+    "target": "method:1bb37813fd2158f3d88b0df50616bee9"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "class:396464c511a39dc6873aecb201b67c66",
+    "target": "method:286a9ad4aa02347e3187c9f5fbd2c814"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "class:5f71b18693d8b0a3187abcb460d0433c",
+    "target": "method:6286f4575b75b858d15373165a633a08"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "class:6f5d867577fd050444b10879571da4b7",
+    "target": "method:975cc35bce465a0c4507365acea31519"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "class:8253d5b74471e5dc87fb3eafff05ee3d",
+    "target": "enum:48209de6df4e4498790922b62147f7bf"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "class:8253d5b74471e5dc87fb3eafff05ee3d",
+    "target": "method:1b4003a7ca954fad2b793f108c48d32b"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "class:8253d5b74471e5dc87fb3eafff05ee3d",
+    "target": "method:3cc03d430f5a0977506f878c1b611938"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "class:8253d5b74471e5dc87fb3eafff05ee3d",
+    "target": "method:c8883fca5b9ab3e5b9f4c67c82365397"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "class:94e832e0c31a7087908a6e3a64f46c91",
+    "target": "method:5e986b7b7013c7ef5d591c03116d2599"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "class:dab3e63e72adfc253c33d766f7ed9944",
+    "target": "method:c42808aed64852587a58906e65f4f315"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "class:fd4761ad7980274dcc1f7f8f9484b851",
+    "target": "class:6f5d867577fd050444b10879571da4b7"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "class:fd4761ad7980274dcc1f7f8f9484b851",
+    "target": "method:c5f83603bb58827e828bd921b11695b4"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "enum:48209de6df4e4498790922b62147f7bf",
+    "target": "enum_member:ab2675854aa6bc4c26a303ec445526ff"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "enum:48209de6df4e4498790922b62147f7bf",
+    "target": "enum_member:c1dd51431f0bdeb5cf502142989e324c"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "enum:48209de6df4e4498790922b62147f7bf",
+    "target": "method:926bfc7267583c9aa86a695cdc2a1303"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "enum:48209de6df4e4498790922b62147f7bf",
+    "target": "method:eb0a192bbb02f158d9599e3f97438b45"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:src/main/java/app/a/Field.java",
+    "target": "namespace:649ee977b4864333b2faf447ab5b94af"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:src/main/java/app/b/EmailVerificationService.java",
+    "target": "namespace:d04fed0c321b99bf84be423c949715e3"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:src/main/java/app/b/Field.java",
+    "target": "namespace:8d5ff0c6a292543bd0ab68429daf08c7"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:src/main/java/app/shapes/Main.java",
+    "target": "namespace:d2b9cc03ff2a1861e03fdab9098fdcf9"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:src/main/java/app/shapes/Shape.java",
+    "target": "namespace:8055d6038ae70c290514d0cec49e2dc0"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:src/main/java/app/shapes/Square.java",
+    "target": "namespace:81eb58e808c579f6c7e095f79a3ac1d6"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:src/main/java/app/util/MathUtil.java",
+    "target": "namespace:b1975f2a149a4af6fcac8012eda0acbf"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:src/test/java/app/MainTest.java",
+    "target": "namespace:0241892b231b76f262f1d6f12c9a13bc"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "interface:3fffd09acd8cea1790098cf4e09778e7",
+    "target": "method:3d88b8f054e0e481bc153e9c822c4ac4"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "method:c8883fca5b9ab3e5b9f4c67c82365397",
+    "target": "class:5f71b18693d8b0a3187abcb460d0433c"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "namespace:0241892b231b76f262f1d6f12c9a13bc",
+    "target": "class:fd4761ad7980274dcc1f7f8f9484b851"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "namespace:0241892b231b76f262f1d6f12c9a13bc",
+    "target": "import:0330d1c5d8d1ef121cbc5c38ebd70859"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "namespace:0241892b231b76f262f1d6f12c9a13bc",
+    "target": "import:5f89d0c4c4c8996fe486c4851e4d0fc8"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "namespace:0241892b231b76f262f1d6f12c9a13bc",
+    "target": "import:bce3cc394ea048be4411a12a60fc4ac1"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "namespace:0241892b231b76f262f1d6f12c9a13bc",
+    "target": "import:d64c32048b7aaf29a26a0877141dbf2b"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "namespace:649ee977b4864333b2faf447ab5b94af",
+    "target": "class:94e832e0c31a7087908a6e3a64f46c91"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "namespace:8055d6038ae70c290514d0cec49e2dc0",
+    "target": "interface:3fffd09acd8cea1790098cf4e09778e7"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "namespace:81eb58e808c579f6c7e095f79a3ac1d6",
+    "target": "class:22afc7b49093ccfbb79006770c212771"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "namespace:81eb58e808c579f6c7e095f79a3ac1d6",
+    "target": "class:dab3e63e72adfc253c33d766f7ed9944"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "namespace:81eb58e808c579f6c7e095f79a3ac1d6",
+    "target": "import:420d7b11635cb33bb564a64529310d7a"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "namespace:8d5ff0c6a292543bd0ab68429daf08c7",
+    "target": "class:1fb698fc0eda40ad650bf0cf826b7dce"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "namespace:b1975f2a149a4af6fcac8012eda0acbf",
+    "target": "class:396464c511a39dc6873aecb201b67c66"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "namespace:d04fed0c321b99bf84be423c949715e3",
+    "target": "class:20fae71b4c5dd6363c9c148e65149b13"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "namespace:d2b9cc03ff2a1861e03fdab9098fdcf9",
+    "target": "class:8253d5b74471e5dc87fb3eafff05ee3d"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "namespace:d2b9cc03ff2a1861e03fdab9098fdcf9",
+    "target": "import:2b244b8fe1be9e8812a109e14e5ab457"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "namespace:d2b9cc03ff2a1861e03fdab9098fdcf9",
+    "target": "import:f294f4c864dc4a1188a97c9726415161"
+  }
+]

@@ -1,0 +1,38 @@
+[
+  {
+    "content_hash": "5c58a5cc9afef3b0c1b02470bc9702dc3469519b1328da1bff7c35a7571e2962",
+    "errors": null,
+    "generated": 0,
+    "language": "csharp",
+    "node_count": 9,
+    "path": "src/App/Nested.cs",
+    "size": 387
+  },
+  {
+    "content_hash": "7e52d4aee1606fdc54dfaedf6e154f591d163faf9847f8836c092add4ec09a28",
+    "errors": null,
+    "generated": 0,
+    "language": "csharp",
+    "node_count": 6,
+    "path": "src/App/Partial.cs",
+    "size": 184
+  },
+  {
+    "content_hash": "195c2eced468c1530f8c9ac6db6f601471ad360b0815ec56b290070d4a977e20",
+    "errors": null,
+    "generated": 0,
+    "language": "csharp",
+    "node_count": 25,
+    "path": "src/App/Store.cs",
+    "size": 1278
+  },
+  {
+    "content_hash": "4fa9b7a2f03aa9adb9e7552402ece1c99552b14513906d73138e27bd3f5091a5",
+    "errors": null,
+    "generated": 0,
+    "language": "csharp",
+    "node_count": 7,
+    "path": "src/Support/TypeMap.cs",
+    "size": 228
+  }
+]

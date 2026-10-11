@@ -1,0 +1,267 @@
+[
+  {
+    "col": 0,
+    "kind": "imports",
+    "line": 6,
+    "metadata": {
+      "confidence": 0.95,
+      "resolvedBy": "qualified-name"
+    },
+    "provenance": null,
+    "source": "file:src/components/Counter.vue",
+    "target": "import:53ac2b441303553cd61bae19cf2ca7f6"
+  },
+  {
+    "col": 0,
+    "kind": "imports",
+    "line": 7,
+    "metadata": {
+      "confidence": 0.95,
+      "resolvedBy": "qualified-name"
+    },
+    "provenance": null,
+    "source": "file:src/components/App.vue",
+    "target": "import:5c379979046e84279087fa18b4701e92"
+  },
+  {
+    "col": 0,
+    "kind": "imports",
+    "line": 8,
+    "metadata": {
+      "confidence": 0.95,
+      "resolvedBy": "qualified-name"
+    },
+    "provenance": null,
+    "source": "file:src/components/App.vue",
+    "target": "import:5c379979046e84279087fa18b4701e92"
+  },
+  {
+    "col": 0,
+    "kind": "imports",
+    "line": 9,
+    "metadata": {
+      "confidence": 0.7,
+      "resolvedBy": "file-path"
+    },
+    "provenance": null,
+    "source": "file:src/components/App.vue",
+    "target": "file:src/components/Counter.vue"
+  },
+  {
+    "col": 12,
+    "kind": "calls",
+    "line": 11,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "component:bf4932bbbd9ae2d8b66cf6b90d96d83a",
+    "target": "function:4969a1ad19a6bf73e764e687c6323329"
+  },
+  {
+    "col": 18,
+    "kind": "references",
+    "line": 8,
+    "metadata": {
+      "confidence": 0.95,
+      "fnRef": true,
+      "resolvedBy": "function-ref"
+    },
+    "provenance": null,
+    "source": "function:c44eb90155d41a4c58621579fa89e878",
+    "target": "function:ebed3eb94b336abcd372c60a4dd346ad"
+  },
+  {
+    "col": 20,
+    "kind": "calls",
+    "line": 20,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "file:src/components/Counter.vue",
+    "target": "function:4969a1ad19a6bf73e764e687c6323329"
+  },
+  {
+    "col": 3,
+    "kind": "references",
+    "line": 3,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "component:bf4932bbbd9ae2d8b66cf6b90d96d83a",
+    "target": "component:f4f2c5bd83c7e2d2bd25b6aeca79a228"
+  },
+  {
+    "col": 7,
+    "kind": "imports",
+    "line": 9,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "file:src/components/App.vue",
+    "target": "component:f4f2c5bd83c7e2d2bd25b6aeca79a228"
+  },
+  {
+    "col": 9,
+    "kind": "calls",
+    "line": 16,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "function:9bdc9cd1f3fedac8bed880a1d4210b7a",
+    "target": "function:4969a1ad19a6bf73e764e687c6323329"
+  },
+  {
+    "col": 9,
+    "kind": "imports",
+    "line": 6,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "file:src/components/Counter.vue",
+    "target": "function:4969a1ad19a6bf73e764e687c6323329"
+  },
+  {
+    "col": 9,
+    "kind": "imports",
+    "line": 7,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "file:src/components/App.vue",
+    "target": "function:4969a1ad19a6bf73e764e687c6323329"
+  },
+  {
+    "col": 9,
+    "kind": "imports",
+    "line": 8,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "file:src/components/App.vue",
+    "target": "function:c44eb90155d41a4c58621579fa89e878"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "component:bf4932bbbd9ae2d8b66cf6b90d96d83a",
+    "target": "constant:3361d9de96f9b8296ef5f6715a372f3a"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "component:bf4932bbbd9ae2d8b66cf6b90d96d83a",
+    "target": "function:9bdc9cd1f3fedac8bed880a1d4210b7a"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "component:bf4932bbbd9ae2d8b66cf6b90d96d83a",
+    "target": "import:11238120f7290722088b7100c5606d28"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "component:bf4932bbbd9ae2d8b66cf6b90d96d83a",
+    "target": "import:5c379979046e84279087fa18b4701e92"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "component:bf4932bbbd9ae2d8b66cf6b90d96d83a",
+    "target": "import:7e507bd267b19b4aa026b0befba077d6"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "component:f4f2c5bd83c7e2d2bd25b6aeca79a228",
+    "target": "import:53ac2b441303553cd61bae19cf2ca7f6"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:src/components/App.vue",
+    "target": "component:bf4932bbbd9ae2d8b66cf6b90d96d83a"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:src/components/Counter.vue",
+    "target": "component:f4f2c5bd83c7e2d2bd25b6aeca79a228"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:src/composables/useCounter.ts",
+    "target": "function:4969a1ad19a6bf73e764e687c6323329"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:src/composables/useCounter.ts",
+    "target": "function:c44eb90155d41a4c58621579fa89e878"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:src/composables/useCounter.ts",
+    "target": "import:ddcf75e7656d4346509f14857778a4f4"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "function:c44eb90155d41a4c58621579fa89e878",
+    "target": "function:ebed3eb94b336abcd372c60a4dd346ad"
+  }
+]

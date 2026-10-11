@@ -1,0 +1,1 @@
+{ "name": "tanstack-app", "private": true, "dependencies": { "@tanstack/react-router": "1.15.0", "react": "18.2.0" } }

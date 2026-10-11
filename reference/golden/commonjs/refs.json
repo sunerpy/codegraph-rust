@@ -1,0 +1,152 @@
+[
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "test/app.test.js",
+    "from_node_id": "file:test/app.test.js",
+    "language": "javascript",
+    "line": 7,
+    "reference_kind": "calls",
+    "reference_name": "describe"
+  },
+  {
+    "candidates": null,
+    "col": 11,
+    "file_path": "lib/app.js",
+    "from_node_id": "constant:188e17c107498c0214cba002327df0c8",
+    "language": "javascript",
+    "line": 5,
+    "reference_kind": "calls",
+    "reference_name": "require"
+  },
+  {
+    "candidates": null,
+    "col": 12,
+    "file_path": "index.js",
+    "from_node_id": "constant:9f62233a1a2b3a3959cbbf99bdef9231",
+    "language": "javascript",
+    "line": 3,
+    "reference_kind": "calls",
+    "reference_name": "require"
+  },
+  {
+    "candidates": null,
+    "col": 13,
+    "file_path": "lib/app.js",
+    "from_node_id": "constant:1cd2674cf311c6f8fb58d97bae848d6a",
+    "language": "javascript",
+    "line": 4,
+    "reference_kind": "calls",
+    "reference_name": "require"
+  },
+  {
+    "candidates": null,
+    "col": 13,
+    "file_path": "lib/chain.js",
+    "from_node_id": "constant:d1e8e25413dba4bd9610a6cec8d1f667",
+    "language": "javascript",
+    "line": 3,
+    "reference_kind": "calls",
+    "reference_name": "require"
+  },
+  {
+    "candidates": null,
+    "col": 16,
+    "file_path": "test/app.test.js",
+    "from_node_id": "constant:a207c2fcdb3b1eb8b6d19351164ebb49",
+    "language": "javascript",
+    "line": 3,
+    "reference_kind": "calls",
+    "reference_name": "require"
+  },
+  {
+    "candidates": null,
+    "col": 18,
+    "file_path": "test/app.test.js",
+    "from_node_id": "constant:85a5dcf259eaae3906faacccec6b7071",
+    "language": "javascript",
+    "line": 4,
+    "reference_kind": "calls",
+    "reference_name": "require"
+  },
+  {
+    "candidates": null,
+    "col": 19,
+    "file_path": "lib/app.js",
+    "from_node_id": "function:feb3ac5a0a28894758fdc7dbbd267c67",
+    "language": "javascript",
+    "line": 9,
+    "reference_kind": "calls",
+    "reference_name": "format.title"
+  },
+  {
+    "candidates": null,
+    "col": 2,
+    "file_path": "test/app.test.js",
+    "from_node_id": "file:test/app.test.js",
+    "language": "javascript",
+    "line": 8,
+    "reference_kind": "calls",
+    "reference_name": "it"
+  },
+  {
+    "candidates": null,
+    "col": 9,
+    "file_path": "lib/app.js",
+    "from_node_id": "function:614ebe045ff7b9e4ae1fbcf86f0ec074",
+    "language": "javascript",
+    "line": 14,
+    "reference_kind": "calls",
+    "reference_name": "format.title"
+  },
+  {
+    "candidates": null,
+    "col": 9,
+    "file_path": "lib/app.js",
+    "from_node_id": "function:feb3ac5a0a28894758fdc7dbbd267c67",
+    "language": "javascript",
+    "line": 9,
+    "reference_kind": "calls",
+    "reference_name": "util.wrap"
+  },
+  {
+    "candidates": null,
+    "col": 9,
+    "file_path": "lib/chain.js",
+    "from_node_id": "function:cfde938b4e2a0395239b945699803212",
+    "language": "javascript",
+    "line": 6,
+    "reference_kind": "calls",
+    "reference_name": "require"
+  },
+  {
+    "candidates": null,
+    "col": 9,
+    "file_path": "lib/chain.js",
+    "from_node_id": "function:cfde938b4e2a0395239b945699803212",
+    "language": "javascript",
+    "line": 6,
+    "reference_kind": "calls",
+    "reference_name": "require().title"
+  },
+  {
+    "candidates": null,
+    "col": 9,
+    "file_path": "lib/format.js",
+    "from_node_id": "function:98496f9dc78403b03abbe6c7b80d5984",
+    "language": "javascript",
+    "line": 4,
+    "reference_kind": "calls",
+    "reference_name": "String"
+  },
+  {
+    "candidates": null,
+    "col": 9,
+    "file_path": "lib/format.js",
+    "from_node_id": "function:98496f9dc78403b03abbe6c7b80d5984",
+    "language": "javascript",
+    "line": 4,
+    "reference_kind": "calls",
+    "reference_name": "String().toUpperCase"
+  }
+]

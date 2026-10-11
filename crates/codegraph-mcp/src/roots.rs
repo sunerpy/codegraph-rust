@@ -10,6 +10,13 @@ pub const ROOTS_LIST_REQUEST_ID: &str = "codegraph-roots-list-1";
 
 const SUBPROJECT_SCAN_MAX_DEPTH: usize = 4;
 const SUBPROJECT_SCAN_MAX_CANDIDATES: usize = 64;
+/// Directory entries one downward scan may examine. Counted rather than timed,
+/// so where a scan stops is deterministic; a launch directory like `/tmp`, with
+/// tens of thousands of entries, used to keep `initialize` waiting.
+const SUBPROJECT_SCAN_MAX_VISITS: usize = 10_000;
+/// Wall-clock backstop for a filesystem slow enough (a network mount) that
+/// even the counted budget takes too long.
+const SUBPROJECT_SCAN_DEADLINE: Duration = Duration::from_millis(500);
 const SUBPROJECT_RESCAN_TTL: Duration = Duration::from_secs(5);
 
 const SUBPROJECT_SCAN_SKIP: &[&str] = &[
@@ -153,6 +160,9 @@ pub struct ServerRootResolution {
     pub root: Option<PathBuf>,
     pub via_subproject_scan: bool,
     pub candidates: Vec<PathBuf>,
+    /// The downward scan stopped at its visit budget or deadline, so the
+    /// candidates are incomplete and none was adopted.
+    pub scan_truncated: bool,
 }
 
 /// Resolve the default project for a stdio MCP server.
@@ -172,6 +182,7 @@ pub fn resolve_server_root(
             root: Some(root),
             via_subproject_scan: false,
             candidates: Vec::new(),
+            scan_truncated: false,
         };
     }
     if !scan_subprojects || !eligible_for_subproject_scan(&search_from) {
@@ -180,31 +191,44 @@ pub fn resolve_server_root(
             root: None,
             via_subproject_scan: false,
             candidates: Vec::new(),
+            scan_truncated: false,
         };
     }
 
-    let candidates = find_indexed_subproject_roots(
+    let scan = scan_indexed_subprojects(
         &search_from,
-        SUBPROJECT_SCAN_MAX_DEPTH,
-        SUBPROJECT_SCAN_MAX_CANDIDATES,
+        SubprojectScanLimits {
+            max_depth: SUBPROJECT_SCAN_MAX_DEPTH,
+            max_candidates: SUBPROJECT_SCAN_MAX_CANDIDATES,
+            max_visits: SUBPROJECT_SCAN_MAX_VISITS,
+            deadline: Instant::now() + SUBPROJECT_SCAN_DEADLINE,
+        },
     );
-    let root = (candidates.len() == 1).then(|| candidates[0].clone());
+    // Only a complete scan can prove a candidate is the only one.
+    let adopt = !scan.truncated && scan.candidates.len() == 1;
+    let root = adopt.then(|| scan.candidates[0].clone());
     ServerRootResolution {
         search_from,
         root,
-        via_subproject_scan: candidates.len() == 1,
-        candidates,
+        via_subproject_scan: adopt,
+        candidates: scan.candidates,
+        scan_truncated: scan.truncated,
     }
 }
 
-/// Stateful wrapper shared by both stdio front-ends. Initial construction scans
-/// immediately; retries always perform the cheap upward walk and run the
-/// downward scan no more than once per five seconds.
+/// Stateful wrapper shared by both stdio front-ends. Construction walks upward
+/// only; retries always perform the cheap upward walk and run the bounded
+/// downward scan no more than once per five seconds, the first one at once.
 #[derive(Debug)]
 pub(crate) struct ServerRootDiscovery {
     search_from: Option<PathBuf>,
     known_candidates: Vec<PathBuf>,
     last_subproject_scan: Option<Instant>,
+    /// The last downward scan stopped at its budget or deadline.
+    scan_truncated: bool,
+    /// The scan outcome last reported on stderr, so a retry reports a new
+    /// outcome once instead of every few seconds.
+    reported_scan: Option<(Vec<PathBuf>, bool)>,
 }
 
 impl ServerRootDiscovery {
@@ -213,11 +237,18 @@ impl ServerRootDiscovery {
             search_from,
             known_candidates: Vec::new(),
             last_subproject_scan: None,
+            scan_truncated: false,
+            reported_scan: None,
         }
     }
 
-    pub(crate) fn initial_resolution(&mut self) -> Option<ServerRootResolution> {
-        self.resolve_at(Instant::now(), true)
+    /// The resolution a server makes while it is being constructed, before it
+    /// can answer `initialize`: the cheap upward walk only. The bounded
+    /// downward scan is left to the first retry, so a large launch directory
+    /// never delays the handshake.
+    pub(crate) fn startup_resolution(&mut self) -> Option<ServerRootResolution> {
+        let search_from = self.search_from.as_ref()?;
+        Some(resolve_server_root(search_from, false))
     }
 
     pub(crate) fn retry_resolution(&mut self) -> Option<ServerRootResolution> {
@@ -238,6 +269,7 @@ impl ServerRootDiscovery {
         let resolution = resolve_server_root(search_from, scan_due);
         if scan_due {
             self.last_subproject_scan = Some(now);
+            self.scan_truncated = resolution.scan_truncated;
         }
         if resolution.root.is_some() {
             self.known_candidates.clear();
@@ -253,6 +285,43 @@ impl ServerRootDiscovery {
 
     pub(crate) fn known_candidates(&self) -> &[PathBuf] {
         &self.known_candidates
+    }
+
+    pub(crate) fn scan_truncated(&self) -> bool {
+        self.scan_truncated
+    }
+
+    /// The stderr notice a retry owes when its scan resolved no default: the
+    /// candidates it found and whether it stopped early, once per distinct
+    /// outcome. `None` when there is nothing new to say.
+    pub(crate) fn scan_notice(&mut self, resolution: &ServerRootResolution) -> Option<String> {
+        if resolution.root.is_some()
+            || (resolution.candidates.is_empty() && !resolution.scan_truncated)
+        {
+            return None;
+        }
+        let outcome = (resolution.candidates.clone(), resolution.scan_truncated);
+        if self.reported_scan.as_ref() == Some(&outcome) {
+            return None;
+        }
+        self.reported_scan = Some(outcome);
+        let mut notice = if resolution.candidates.is_empty() {
+            format!(
+                "[CodeGraph MCP] No indexed sub-project found below {}.",
+                resolution.search_from.display()
+            )
+        } else {
+            format!(
+                "[CodeGraph MCP] Indexed sub-projects found: {}. Pass `projectPath` per call, or launch with --path.",
+                format_subproject_candidates(Some(&resolution.search_from), &resolution.candidates)
+            )
+        };
+        if resolution.scan_truncated {
+            notice.push_str(&format!(
+                " The search stopped after {SUBPROJECT_SCAN_MAX_VISITS} entries, so it may have missed some and adopted none."
+            ));
+        }
+        Some(notice)
     }
 
     pub(crate) fn clear_candidates(&mut self) {
@@ -297,55 +366,105 @@ fn eligible_for_subproject_scan(base: &Path) -> bool {
         || base.join(".git").exists()
 }
 
+#[cfg(test)]
 fn find_indexed_subproject_roots(
     root: &Path,
     max_depth: usize,
     max_candidates: usize,
 ) -> Vec<PathBuf> {
-    fn walk(
-        dir: &Path,
-        depth: usize,
-        max_depth: usize,
-        max_candidates: usize,
-        out: &mut Vec<PathBuf>,
-    ) {
-        if out.len() >= max_candidates || depth > max_depth {
-            return;
+    scan_indexed_subprojects(
+        root,
+        SubprojectScanLimits {
+            max_depth,
+            max_candidates,
+            max_visits: usize::MAX,
+            deadline: Instant::now() + Duration::from_secs(3_600),
+        },
+    )
+    .candidates
+}
+
+/// The bounds of one downward sub-project scan.
+#[derive(Debug, Clone, Copy)]
+struct SubprojectScanLimits {
+    max_depth: usize,
+    max_candidates: usize,
+    /// Directory entries the scan may examine in all.
+    max_visits: usize,
+    deadline: Instant,
+}
+
+/// What a downward scan found, and whether it stopped before it was done.
+#[derive(Debug, Default)]
+struct SubprojectScan {
+    candidates: Vec<PathBuf>,
+    truncated: bool,
+}
+
+fn scan_indexed_subprojects(root: &Path, limits: SubprojectScanLimits) -> SubprojectScan {
+    struct Walk {
+        limits: SubprojectScanLimits,
+        visits: usize,
+        scan: SubprojectScan,
+    }
+
+    impl Walk {
+        /// Whether the walk must stop: enough candidates, or a budget spent.
+        fn done(&mut self) -> bool {
+            if self.scan.candidates.len() >= self.limits.max_candidates || self.scan.truncated {
+                return true;
+            }
+            if self.visits >= self.limits.max_visits || Instant::now() >= self.limits.deadline {
+                self.scan.truncated = true;
+                return true;
+            }
+            false
         }
-        let Ok(read_dir) = fs::read_dir(dir) else {
-            return;
-        };
-        let mut entries = read_dir.filter_map(Result::ok).collect::<Vec<_>>();
-        entries.sort_by_key(fs::DirEntry::file_name);
-        for entry in entries {
-            if out.len() >= max_candidates {
+
+        fn dir(&mut self, dir: &Path, depth: usize) {
+            if depth > self.limits.max_depth || self.done() {
                 return;
             }
-            let Ok(file_type) = entry.file_type() else {
-                continue;
+            let Ok(read_dir) = fs::read_dir(dir) else {
+                return;
             };
-            if !file_type.is_dir() {
-                continue;
+            let mut entries = read_dir.filter_map(Result::ok).collect::<Vec<_>>();
+            entries.sort_by_key(fs::DirEntry::file_name);
+            for entry in entries {
+                if self.done() {
+                    return;
+                }
+                self.visits += 1;
+                let Ok(file_type) = entry.file_type() else {
+                    continue;
+                };
+                if !file_type.is_dir() {
+                    continue;
+                }
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if name.starts_with('.') || SUBPROJECT_SCAN_SKIP.contains(&name.as_ref()) {
+                    continue;
+                }
+                let child = entry.path();
+                if db_exists_for(&child) {
+                    self.scan.candidates.push(child);
+                    continue;
+                }
+                self.dir(&child, depth + 1);
             }
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if name.starts_with('.') || SUBPROJECT_SCAN_SKIP.contains(&name.as_ref()) {
-                continue;
-            }
-            let child = entry.path();
-            if db_exists_for(&child) {
-                out.push(child);
-                continue;
-            }
-            walk(&child, depth + 1, max_depth, max_candidates, out);
         }
     }
 
-    let mut out = Vec::new();
-    walk(root, 1, max_depth, max_candidates, &mut out);
-    out.sort();
-    out.dedup();
-    out
+    let mut walk = Walk {
+        limits,
+        visits: 0,
+        scan: SubprojectScan::default(),
+    };
+    walk.dir(root, 1);
+    walk.scan.candidates.sort();
+    walk.scan.candidates.dedup();
+    walk.scan
 }
 
 pub(crate) fn format_subproject_candidates(base: Option<&Path>, roots: &[PathBuf]) -> String {
@@ -368,19 +487,27 @@ pub(crate) fn not_indexed_message(
     raw_project: Option<&str>,
     search_from: Option<&Path>,
     candidates: &[PathBuf],
+    scan_truncated: bool,
 ) -> String {
     if let Some(raw) = raw_project {
         return format!(
             "No indexed project found for projectPath {raw:?}. Pass an absolute path to an indexed project, or run `codegraph init` there."
         );
     }
-    if candidates.is_empty() {
-        return "No indexed project resolved. Pass a `projectPath` argument, run `codegraph init` in the project, or start the server with `--path <project>`.".to_string();
+    let mut message = if candidates.is_empty() {
+        "No indexed project resolved. Pass a `projectPath` argument, run `codegraph init` in the project, or start the server with `--path <project>`.".to_string()
+    } else {
+        let listed = format_subproject_candidates(search_from, candidates);
+        format!(
+            "No indexed project resolved. Indexed sub-projects were found below the server root: {listed}. Pass one as `projectPath`, or launch the server with `--path <project>`."
+        )
+    };
+    if scan_truncated {
+        message.push_str(&format!(
+            " The search below the server root stopped after {SUBPROJECT_SCAN_MAX_VISITS} entries, so it may have missed indexed sub-projects and adopted none."
+        ));
     }
-    let listed = format_subproject_candidates(search_from, candidates);
-    format!(
-        "No indexed project resolved. Indexed sub-projects were found below the server root: {listed}. Pass one as `projectPath`, or launch the server with `--path <project>`."
-    )
+    message
 }
 
 /// Pure classifier for an [`codegraph_core::IndexPaths::resolve`] outcome, split
@@ -1452,6 +1579,73 @@ mod tests {
     }
 
     #[test]
+    fn truncated_scan_never_adopts() {
+        // A workspace whose only indexed child sorts after more directories
+        // than the scan may visit: a scan that stops early cannot know the
+        // child is the only one, so it must not adopt it.
+        let workspace = unindexed_dir("subscan-truncated");
+        std::fs::create_dir(workspace.path().join(".git")).unwrap();
+        for index in 0..10_050 {
+            std::fs::create_dir(workspace.path().join(format!("a{index:05}"))).unwrap();
+        }
+        let only = workspace.path().join("zz-service");
+        mark_indexed(&only);
+
+        let resolved = resolve_server_root(workspace.path(), true);
+        assert_eq!(resolved.root, None, "a truncated scan adopts nothing");
+        assert!(!resolved.via_subproject_scan);
+    }
+
+    #[test]
+    fn subproject_scan_stops_at_visit_budget() {
+        let workspace = unindexed_dir("subscan-budget");
+        std::fs::create_dir(workspace.path().join(".git")).unwrap();
+        for index in 0..12 {
+            std::fs::create_dir(workspace.path().join(format!("dir-{index:02}"))).unwrap();
+        }
+        mark_indexed(&workspace.path().join("dir-02"));
+        mark_indexed(&workspace.path().join("dir-10"));
+        let limits = |max_visits| SubprojectScanLimits {
+            max_depth: 4,
+            max_candidates: 64,
+            max_visits,
+            deadline: Instant::now() + Duration::from_secs(60),
+        };
+
+        // `.git` and dir-00 .. dir-04 are the first six entries: the budget
+        // stops the walk before dir-10, and says so.
+        let cut = scan_indexed_subprojects(workspace.path(), limits(6));
+        assert!(cut.truncated);
+        assert_eq!(cut.candidates, [workspace.path().join("dir-02")]);
+        // The same budget on the same tree stops at the same entry.
+        let again = scan_indexed_subprojects(workspace.path(), limits(6));
+        assert_eq!(again.candidates, cut.candidates);
+
+        let whole = scan_indexed_subprojects(workspace.path(), limits(10_000));
+        assert!(!whole.truncated);
+        assert_eq!(whole.candidates.len(), 2);
+
+        let late = scan_indexed_subprojects(
+            workspace.path(),
+            SubprojectScanLimits {
+                deadline: Instant::now(),
+                ..limits(10_000)
+            },
+        );
+        assert!(late.truncated, "the deadline stops the walk too");
+    }
+
+    #[test]
+    fn a_truncated_scan_says_so_when_nothing_resolved() {
+        let message = not_indexed_message(None, None, &[], true);
+        assert!(message.contains("stopped after"), "{message}");
+        assert!(
+            !not_indexed_message(None, None, &[], false).contains("stopped after"),
+            "a complete scan says nothing about stopping"
+        );
+    }
+
+    #[test]
     fn subproject_scan_caps_candidates_at_sixty_four() {
         let workspace = unindexed_dir("subscan-cap");
         std::fs::create_dir(workspace.path().join(".git")).unwrap();
@@ -1499,6 +1693,7 @@ mod tests {
             None,
             Some(base),
             &[base.join("service-b"), base.join("service-a")],
+            false,
         );
         assert!(message.starts_with("No indexed project resolved."));
         assert!(message.contains("service-a, service-b"));

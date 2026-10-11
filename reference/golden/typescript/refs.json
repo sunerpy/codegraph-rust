@@ -1,6 +1,16 @@
 [
   {
     "candidates": null,
+    "col": 0,
+    "file_path": "alias_consumer.ts",
+    "from_node_id": "file:alias_consumer.ts",
+    "language": "typescript",
+    "line": 1,
+    "reference_kind": "imports",
+    "reference_name": "@fixture/aliased"
+  },
+  {
+    "candidates": null,
     "col": 2,
     "file_path": "consumer.ts",
     "from_node_id": "function:f457dd2d5f87f1af2a87ff0989542423",

@@ -1,6 +1,36 @@
 [
   {
     "candidates": null,
+    "col": 0,
+    "file_path": "aliases.py",
+    "from_node_id": "file:aliases.py",
+    "language": "python",
+    "line": 1,
+    "reference_kind": "imports",
+    "reference_name": "pkg"
+  },
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "aliases.py",
+    "from_node_id": "file:aliases.py",
+    "language": "python",
+    "line": 3,
+    "reference_kind": "imports",
+    "reference_name": "imported_types"
+  },
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "consumers.py",
+    "from_node_id": "file:consumers.py",
+    "language": "python",
+    "line": 1,
+    "reference_kind": "imports",
+    "reference_name": "imported_types"
+  },
+  {
+    "candidates": null,
     "col": 13,
     "file_path": "same_file.py",
     "from_node_id": "function:9b5e951f339c7fb15ae8717e06f1178e",
@@ -38,5 +68,15 @@
     "line": 59,
     "reference_kind": "calls",
     "reference_name": "register"
+  },
+  {
+    "candidates": null,
+    "col": 7,
+    "file_path": "aliases.py",
+    "from_node_id": "file:aliases.py",
+    "language": "python",
+    "line": 2,
+    "reference_kind": "imports",
+    "reference_name": "top_level"
   }
 ]

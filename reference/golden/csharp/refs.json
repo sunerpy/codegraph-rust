@@ -1,0 +1,92 @@
+[
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "src/App/Store.cs",
+    "from_node_id": "namespace:8f15a54d8f657c2e21df81a2391cb68a",
+    "language": "csharp",
+    "line": 1,
+    "reference_kind": "imports",
+    "reference_name": "System"
+  },
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "src/App/Store.cs",
+    "from_node_id": "namespace:8f15a54d8f657c2e21df81a2391cb68a",
+    "language": "csharp",
+    "line": 2,
+    "reference_kind": "imports",
+    "reference_name": "System.IO"
+  },
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "src/App/Store.cs",
+    "from_node_id": "namespace:8f15a54d8f657c2e21df81a2391cb68a",
+    "language": "csharp",
+    "line": 3,
+    "reference_kind": "imports",
+    "reference_name": "System.Math"
+  },
+  {
+    "candidates": null,
+    "col": 12,
+    "file_path": "src/App/Store.cs",
+    "from_node_id": "method:fb6e3b0761da57101db4a4ffde0342a4",
+    "language": "csharp",
+    "line": 33,
+    "reference_kind": "calls",
+    "reference_name": "_innerWriter.WriteLine"
+  },
+  {
+    "candidates": null,
+    "col": 21,
+    "file_path": "src/App/Store.cs",
+    "from_node_id": "method:3c79942d42476aa1e0551872721f401d",
+    "language": "csharp",
+    "line": 25,
+    "reference_kind": "references",
+    "reference_name": "TextWriter"
+  },
+  {
+    "candidates": null,
+    "col": 25,
+    "file_path": "src/App/Store.cs",
+    "from_node_id": "field:02def596987f1ff58283eb965c1c0b49",
+    "language": "csharp",
+    "line": 21,
+    "reference_kind": "references",
+    "reference_name": "TextWriter"
+  },
+  {
+    "candidates": null,
+    "col": 26,
+    "file_path": "src/App/Store.cs",
+    "from_node_id": "method:fb6e3b0761da57101db4a4ffde0342a4",
+    "language": "csharp",
+    "line": 35,
+    "reference_kind": "calls",
+    "reference_name": "Pow"
+  },
+  {
+    "candidates": null,
+    "col": 29,
+    "file_path": "src/App/Nested.cs",
+    "from_node_id": "method:c4141344da99409ec7ad03e1ea5f6205",
+    "language": "csharp",
+    "line": 14,
+    "reference_kind": "calls",
+    "reference_name": "new Inner.Deep().Dive"
+  },
+  {
+    "candidates": null,
+    "col": 34,
+    "file_path": "src/App/Store.cs",
+    "from_node_id": "method:360b9af06af1e876cce7cf4bcfe932b0",
+    "language": "csharp",
+    "line": 50,
+    "reference_kind": "references",
+    "reference_name": "Console"
+  }
+]

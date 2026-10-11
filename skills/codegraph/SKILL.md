@@ -92,7 +92,7 @@ one usable index, normally created with `codegraph init`.
 
 A bare stdio launch first walks upward for an index. If that misses and the
 launch directory is a workspace root (manifest or `.git`), CodeGraph performs a
-bounded scan (depth 4, at most 64 candidates). It adopts exactly one indexed
+bounded scan (depth 4, at most 64 candidates and 10,000 entries). It adopts exactly one indexed
 child and starts that child's normal daemon/watcher/catch-up path. Zero or
 multiple children are never guessed: the tool response and stderr name the
 sorted candidates, and the caller must pass `projectPath` or restart with
@@ -275,6 +275,13 @@ be trusted from the index without re-reading.
 before starting a large research session. If the watcher is expected, wait for
 its debounce and re-check status. If no watcher is running, use `codegraph sync`;
 do not default to a full `codegraph index` for ordinary source changes.
+
+A burst of many changes — a branch switch, a mass rename or move — or any sign
+that the operating system dropped file events makes the watcher re-scan the
+whole project on its own. Until that catch-up commits, responses can start with
+`⚠️ CodeGraph auto-sync is RECOVERING …`; read the files you rely on directly
+in the meantime. Large renames never need `codegraph index`: `codegraph sync`
+reconciles the whole project against the index.
 
 ---
 

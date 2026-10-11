@@ -8,8 +8,8 @@ mod watcher;
 mod worktree;
 
 pub use git::{
-    DEFAULT_SYNC_HOOKS, GitHookName, GitHookResult, install_git_sync_hooks, is_git_repo,
-    is_sync_hook_installed, remove_git_sync_hooks,
+    DEFAULT_SYNC_HOOKS, GitHookName, GitHookResult, hide_console_window, install_git_sync_hooks,
+    is_git_repo, is_sync_hook_installed, remove_git_sync_hooks,
 };
 #[cfg(feature = "test-hooks")]
 pub use git_pending::test_hooks as git_pending_hooks;
@@ -24,8 +24,8 @@ pub use sync::{
     sync_project_once_cancellable, sync_project_once_with_progress,
 };
 pub use watcher::{
-    LOCK_RECOVERY_INTERVAL, PendingFile, ProjectWatcher, WatchHealth, WatchOptions,
-    start_serve_watcher, watch_health, watch_options_for_project,
+    CODEGRAPH_WATCH_SENTINEL_MS, LOCK_RECOVERY_INTERVAL, PendingFile, ProjectWatcher, WatchHealth,
+    WatchOptions, start_serve_watcher, watch_health, watch_options_for_project,
 };
 #[cfg(feature = "test-hooks")]
 pub use watcher::{WatchHealthGuard, register_watch_health_for_tests};

@@ -1,0 +1,758 @@
+[
+  {
+    "col": 0,
+    "kind": "decorates",
+    "line": 4,
+    "metadata": {
+      "confidence": 0.5,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "class:49a64bdaf5b8db2e9dbf283b51dba375",
+    "target": "function:5dd4a1bf99112612e8c2797164f02fcc"
+  },
+  {
+    "col": 0,
+    "kind": "imports",
+    "line": 2,
+    "metadata": {
+      "confidence": 0.7,
+      "resolvedBy": "file-path"
+    },
+    "provenance": null,
+    "source": "file:apps/vue/src/router/index.ts",
+    "target": "file:apps/vue/src/views/Home.vue"
+  },
+  {
+    "col": 0,
+    "kind": "imports",
+    "line": 2,
+    "metadata": {
+      "confidence": 0.95,
+      "resolvedBy": "qualified-name"
+    },
+    "provenance": null,
+    "source": "file:apps/angular/src/app/app.routes.ts",
+    "target": "import:ca0c63f22874b4fbd285cff2a21cd687"
+  },
+  {
+    "col": 0,
+    "kind": "imports",
+    "line": 2,
+    "metadata": {
+      "confidence": 0.95,
+      "resolvedBy": "qualified-name"
+    },
+    "provenance": null,
+    "source": "file:apps/react-router/src/main.tsx",
+    "target": "import:9f815cbc702f9f06380da6de52028444"
+  },
+  {
+    "col": 0,
+    "kind": "imports",
+    "line": 3,
+    "metadata": {
+      "confidence": 0.95,
+      "resolvedBy": "qualified-name"
+    },
+    "provenance": null,
+    "source": "file:apps/react-router/src/main.tsx",
+    "target": "import:3b5acd64e0bf640fe89555c411d88342"
+  },
+  {
+    "col": 1,
+    "kind": "calls",
+    "line": 4,
+    "metadata": {
+      "confidence": 0.5,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "file:apps/angular/src/app/home/home.component.ts",
+    "target": "function:5dd4a1bf99112612e8c2797164f02fcc"
+  },
+  {
+    "col": 13,
+    "kind": "references",
+    "line": 4,
+    "metadata": {
+      "confidence": 0.95,
+      "fnRef": true,
+      "resolvedBy": "function-ref"
+    },
+    "provenance": null,
+    "source": "constant:8e49a75df94c7f91f21ce627b5793167",
+    "target": "function:5aeeebbe29a1bbdc7599b6af1126dab2"
+  },
+  {
+    "col": 13,
+    "kind": "references",
+    "line": 4,
+    "metadata": {
+      "confidence": 0.95,
+      "fnRef": true,
+      "resolvedBy": "function-ref"
+    },
+    "provenance": null,
+    "source": "constant:dd5bc75347a5d9c5036bf26cb698787e",
+    "target": "function:9137efed7a4eda576ab983339ee0aebb"
+  },
+  {
+    "col": 13,
+    "kind": "references",
+    "line": 4,
+    "metadata": {
+      "confidence": 0.95,
+      "fnRef": true,
+      "resolvedBy": "function-ref"
+    },
+    "provenance": null,
+    "source": "file:apps/tanstack/src/routes/index.tsx",
+    "target": "function:9137efed7a4eda576ab983339ee0aebb"
+  },
+  {
+    "col": 13,
+    "kind": "references",
+    "line": 4,
+    "metadata": {
+      "confidence": 0.95,
+      "fnRef": true,
+      "resolvedBy": "function-ref"
+    },
+    "provenance": null,
+    "source": "file:apps/tanstack/src/routes/posts.tsx",
+    "target": "function:5aeeebbe29a1bbdc7599b6af1126dab2"
+  },
+  {
+    "col": 14,
+    "kind": "references",
+    "line": 8,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "constant:12853c40af592d62e70d60d7fc689444",
+    "target": "function:c863eb857f02e69680c9e47dace356b9"
+  },
+  {
+    "col": 17,
+    "kind": "calls",
+    "line": 5,
+    "metadata": {
+      "confidence": 1.0,
+      "resolvedBy": "framework"
+    },
+    "provenance": null,
+    "source": "function:6dccb0ce095800be34bbf630bb5e1b0b",
+    "target": "function:6dccb0ce095800be34bbf630bb5e1b0b"
+  },
+  {
+    "col": 31,
+    "kind": "references",
+    "line": 10,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "constant:12853c40af592d62e70d60d7fc689444",
+    "target": "function:39add68cb5c4bab5e7011e7970b8700b"
+  },
+  {
+    "col": 42,
+    "kind": "references",
+    "line": 7,
+    "metadata": {
+      "confidence": 0.8,
+      "fnRef": true,
+      "resolvedBy": "function-ref"
+    },
+    "provenance": null,
+    "source": "constant:aae634828e679bd138fccffb08050d6b",
+    "target": "function:39add68cb5c4bab5e7011e7970b8700b"
+  },
+  {
+    "col": 42,
+    "kind": "references",
+    "line": 7,
+    "metadata": {
+      "confidence": 0.8,
+      "fnRef": true,
+      "resolvedBy": "function-ref"
+    },
+    "provenance": null,
+    "source": "file:apps/vue/src/router/index.ts",
+    "target": "function:39add68cb5c4bab5e7011e7970b8700b"
+  },
+  {
+    "col": 7,
+    "kind": "imports",
+    "line": 2,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "file:apps/vue/src/router/index.ts",
+    "target": "file:apps/vue/src/views/Home.vue"
+  },
+  {
+    "col": 9,
+    "kind": "imports",
+    "line": 2,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "file:apps/angular/src/app/app.routes.ts",
+    "target": "class:49a64bdaf5b8db2e9dbf283b51dba375"
+  },
+  {
+    "col": 9,
+    "kind": "imports",
+    "line": 2,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "file:apps/react-router/src/main.tsx",
+    "target": "function:39add68cb5c4bab5e7011e7970b8700b"
+  },
+  {
+    "col": 9,
+    "kind": "imports",
+    "line": 3,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "file:apps/react-router/src/main.tsx",
+    "target": "function:c863eb857f02e69680c9e47dace356b9"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "class:49a64bdaf5b8db2e9dbf283b51dba375",
+    "target": "method:bbc2c93e3330c7a866ecaf686ba2f83b"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "class:49a64bdaf5b8db2e9dbf283b51dba375",
+    "target": "method:c5210b38e25411979ea6f1cdf5a07a43"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "class:49a64bdaf5b8db2e9dbf283b51dba375",
+    "target": "method:d4726b2e34926c3875a341be13f597b0"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "component:1a7b7031523fe7654fa37131da535be3",
+    "target": "import:2cde58dcbdaee8cddbc3a543c3af3caa"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "component:5f34c45ff72fb84793e041a2fb224d56",
+    "target": "function:bb9fd543df3b3f09c016b7b41c8c8799"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "component:5f34c45ff72fb84793e041a2fb224d56",
+    "target": "import:d191558a3c5f26fc65ff665d8ced745e"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "component:ba1b120ba0c0a0e3733130855a8a1c17",
+    "target": "function:13bf526514dd2ebd32bee115b7bd0144"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "component:eacd25434ecfb1c883a35441dd7dd4a0",
+    "target": "constant:a11c2eddefaa17ff07974b80028bbcb9"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "component:eacd25434ecfb1c883a35441dd7dd4a0",
+    "target": "constant:d7a8d34fa1fce6ecb20fd36b87bc7726"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:apps/angular/src/app/app.routes.ts",
+    "target": "constant:06ea8b9bbf6fb3d63e00be0a1c9eb74e"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:apps/angular/src/app/app.routes.ts",
+    "target": "import:ca0c63f22874b4fbd285cff2a21cd687"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:apps/angular/src/app/app.routes.ts",
+    "target": "import:f0c49076b5e1d047a9385283a7d13637"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:apps/angular/src/app/home/home.component.ts",
+    "target": "class:49a64bdaf5b8db2e9dbf283b51dba375"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:apps/angular/src/app/home/home.component.ts",
+    "target": "import:15b6c96d5d3c601238dd62812f27ea50"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:apps/angular/src/app/home/home.component.ts",
+    "target": "import:ea5e3f383516c8cd17f6336d4b6dc87c"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:apps/expo/app/_layout.tsx",
+    "target": "function:d16a883860241c55bdc8506906d752d9"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:apps/expo/app/_layout.tsx",
+    "target": "import:db8a619627ebc64f5dc145c65530bab0"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:apps/expo/app/api/hello+api.ts",
+    "target": "function:4657a5913a769bdf2504b0a266d22d45"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:apps/expo/app/index.tsx",
+    "target": "function:f635ab08203e0ff853aa7eaa5276ccc9"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:apps/expo/app/index.tsx",
+    "target": "import:0fa81b80c019fe5dd52981aecefebeca"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:apps/expo/app/index.tsx",
+    "target": "import:4005a4a8785147bb3b39fe9c14d8225c"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:apps/expo/app/settings.tsx",
+    "target": "function:1f24522fd6944eca56c6841beba30994"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:apps/expo/app/settings.tsx",
+    "target": "import:522bb6c04ac826572760c65b6fe50c79"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:apps/next/app/api/auth/route.ts",
+    "target": "function:29920e4f02f68e40aa606dfca0356aae"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:apps/next/app/dashboard/page.tsx",
+    "target": "function:6dccb0ce095800be34bbf630bb5e1b0b"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:apps/next/app/dashboard/page.tsx",
+    "target": "import:5b340836a7622d1cbc413c072b2ea4ac"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:apps/next/app/layout.tsx",
+    "target": "function:cc5fd243ace832cbaa7135efc0ee6ce6"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:apps/next/app/page.tsx",
+    "target": "function:8694a47e777f8aafc5c96fe460badf43"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:apps/next/app/page.tsx",
+    "target": "import:0f60afe973ad0f52df209c1820360785"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:apps/next/components/posts.tsx",
+    "target": "function:6c0a2beb7331db5392f9cebbe180016b"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:apps/next/pages/legacy.tsx",
+    "target": "function:108c180fe7d14a4d6804c2eeaa836a20"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:apps/nuxt/pages/index.vue",
+    "target": "component:ba1b120ba0c0a0e3733130855a8a1c17"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:apps/nuxt/pages/users/[id].vue",
+    "target": "component:eacd25434ecfb1c883a35441dd7dd4a0"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:apps/react-router/src/main.tsx",
+    "target": "constant:12853c40af592d62e70d60d7fc689444"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:apps/react-router/src/main.tsx",
+    "target": "function:bd2443bcbe09694a55210a349147c068"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:apps/react-router/src/main.tsx",
+    "target": "import:3b5acd64e0bf640fe89555c411d88342"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:apps/react-router/src/main.tsx",
+    "target": "import:9f815cbc702f9f06380da6de52028444"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:apps/react-router/src/main.tsx",
+    "target": "import:b3237890d77394e7ef8cbacc25c64a62"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:apps/react-router/src/pages/Home.tsx",
+    "target": "function:39add68cb5c4bab5e7011e7970b8700b"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:apps/react-router/src/pages/Layout.tsx",
+    "target": "function:c863eb857f02e69680c9e47dace356b9"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:apps/react-router/src/pages/Layout.tsx",
+    "target": "import:7a74d8e2c225c0ab0c30a9d08d352e81"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:apps/react-router/src/pages/Team.tsx",
+    "target": "function:5dd4a1bf99112612e8c2797164f02fcc"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:apps/sveltekit/src/routes/(marketing)/about/+page.svelte",
+    "target": "component:1a0676b95db66966c593cf6c182747c4"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:apps/sveltekit/src/routes/+page.svelte",
+    "target": "component:5f34c45ff72fb84793e041a2fb224d56"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:apps/sveltekit/src/routes/blog/[slug=slug]/+page.ts",
+    "target": "function:5b78e25224f937e219793d3c6a611284"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:apps/sveltekit/src/routes/blog/[slug=slug]/+page.ts",
+    "target": "import:408eb74bb2652a7078578f2df26cd62f"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:apps/tanstack/src/routes/index.tsx",
+    "target": "constant:dd5bc75347a5d9c5036bf26cb698787e"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:apps/tanstack/src/routes/index.tsx",
+    "target": "function:9137efed7a4eda576ab983339ee0aebb"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:apps/tanstack/src/routes/index.tsx",
+    "target": "import:16329c463fd991dd7550999f0f8985e5"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:apps/tanstack/src/routes/posts.tsx",
+    "target": "constant:8e49a75df94c7f91f21ce627b5793167"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:apps/tanstack/src/routes/posts.tsx",
+    "target": "function:5aeeebbe29a1bbdc7599b6af1126dab2"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:apps/tanstack/src/routes/posts.tsx",
+    "target": "import:065d3a312844957f730cc199f2f67dac"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:apps/vue/src/router/index.ts",
+    "target": "constant:aae634828e679bd138fccffb08050d6b"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:apps/vue/src/router/index.ts",
+    "target": "function:66ba7a3a4954c0c8fda1292c5d336133"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:apps/vue/src/router/index.ts",
+    "target": "import:1661f396310fc3b3b3743f3b4b267a42"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:apps/vue/src/router/index.ts",
+    "target": "import:45f048c480897bc38ad5a11334228eee"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:apps/vue/src/views/About.vue",
+    "target": "component:f03c817073321d2ca5841191b01278d1"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:apps/vue/src/views/Home.vue",
+    "target": "component:1a7b7031523fe7654fa37131da535be3"
+  }
+]

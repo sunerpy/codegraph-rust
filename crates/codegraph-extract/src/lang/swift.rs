@@ -5,7 +5,10 @@
 //! the upstream WASM build; docs/grammar-manifest.md tier-a PASS against core 0.26,
 //! so no vendored `cc` build is required).
 
+use std::sync::OnceLock;
+
 use codegraph_core::types::{Language, NodeKind};
+use regex::Regex;
 use tree_sitter::{Language as TsLanguage, Node};
 
 use crate::spec::{ImportInfo, LanguageSpec};
@@ -18,6 +21,10 @@ pub static SWIFT_SPEC: SwiftSpec = SwiftSpec;
 impl LanguageSpec for SwiftSpec {
     fn language(&self) -> Language {
         Language::Swift
+    }
+
+    fn pre_parse(&self, source: &str, _file_path: &str) -> String {
+        join_swift_composition_continuations(source)
     }
 
     fn tree_sitter_language(&self) -> TsLanguage {
@@ -364,5 +371,118 @@ mod tests {
         let tree = parse(src);
         let func = first_of_kind(tree.root_node(), "function_declaration").unwrap();
         assert!(SWIFT_SPEC.get_return_type(func, src).is_none());
+    }
+}
+
+/// Move a protocol composition's line-leading `&` onto the line before it
+/// (upstream #2108):
+///
+/// ```swift
+/// typealias EditorClient = AutocompleteService.Client
+///     & MediaUploadService.Client
+/// ```
+///
+/// is valid Swift, but inside a type's body tree-sitter-swift ends the
+/// declaration at the newline and parses the `&` line as an error, which loses
+/// the types it names. With the `&` trailing the previous line it parses. Same
+/// length and line count; only the continuation line's tokens sit one column
+/// left. Applied to an indented `typealias`/`let`/`var` statement's `&` lines
+/// only, never to `&&`, `&+` or an inout `&x`.
+pub(crate) fn join_swift_composition_continuations(source: &str) -> String {
+    static HEAD: OnceLock<Regex> = OnceLock::new();
+    let head_re = HEAD.get_or_init(|| {
+        Regex::new(
+            r"^[ \t]+(?:@[\w.]+(?:\([^)]*\))?\s*)*(?:[a-z]+(?:\([a-z]+\))?\s+)*(?:typealias|let|var)\s",
+        )
+        .expect("Swift composition head regex")
+    });
+    if !source.contains('&') || !source.lines().any(|line| continuation(line).is_some()) {
+        return source.to_string();
+    }
+    let original: Vec<&str> = source.split('\n').collect();
+    let mut lines: Vec<String> = original.iter().map(|line| (*line).to_string()).collect();
+    let mut changed = false;
+    for i in 1..lines.len() {
+        let Some((indent, gap)) = continuation(&lines[i]) else {
+            continue;
+        };
+        let mut head = i - 1;
+        while head > 0 && continuation(original[head]).is_some() {
+            head -= 1;
+        }
+        if !head_re.is_match(original[head]) {
+            continue;
+        }
+        let prev = lines[i - 1].clone();
+        let (body, cr) = match prev.strip_suffix('\r') {
+            Some(body) => (body, "\r"),
+            None => (prev.as_str(), ""),
+        };
+        // The previous line must end on a type; a trailing comment would
+        // swallow the `&`.
+        let ends_on_type = body.chars().next_back().is_some_and(|c| {
+            c.is_ascii_alphanumeric() || matches!(c, '_' | '>' | ')' | ']' | '?' | '!')
+        });
+        if !ends_on_type || body.contains("//") {
+            continue;
+        }
+        let rest = lines[i][indent + 1 + gap..].to_string();
+        lines[i - 1] = format!("{body}&{cr}");
+        lines[i] = format!(
+            "{}{}{rest}",
+            &lines[i][..indent],
+            &lines[i][indent + 1..indent + 1 + gap]
+        );
+        changed = true;
+    }
+    if changed {
+        lines.join("\n")
+    } else {
+        source.to_string()
+    }
+}
+
+/// `(indent, gap)` of a composition continuation line: indentation, an `&`,
+/// then `gap` spaces or tabs before the next token.
+fn continuation(line: &str) -> Option<(usize, usize)> {
+    let indent = line.len() - line.trim_start_matches([' ', '\t']).len();
+    let after = line[indent..].strip_prefix('&')?;
+    let gap = after.len() - after.trim_start_matches([' ', '\t']).len();
+    let next = after[gap..].chars().next()?;
+    (gap > 0 && !next.is_whitespace()).then_some((indent, gap))
+}
+
+#[cfg(test)]
+mod composition_tests {
+    use super::join_swift_composition_continuations as join;
+
+    #[test]
+    fn a_body_composition_moves_its_ampersand_up() {
+        let source = "class S {\n    typealias C = A.Client\n        & B.Client\n        & D\n}\n";
+        let joined = join(source);
+        assert_eq!(
+            joined,
+            "class S {\n    typealias C = A.Client&\n         B.Client&\n         D\n}\n"
+        );
+        assert_eq!(joined.len(), source.len());
+        assert_eq!(joined.lines().count(), source.lines().count());
+    }
+
+    #[test]
+    fn other_ampersand_lines_are_left_alone() {
+        for source in [
+            // A top-level declaration parses as written.
+            "typealias C = A\n    & B\n",
+            // Not a typealias/let/var statement.
+            "    if ready\n        && done {}\n",
+            // `&&`, `&+` and an inout argument are other operators.
+            "    let x = a\n        &&b\n",
+            "    let x = a\n        &+ b\n",
+            "    let x = f(\n        &y)\n",
+            // A trailing comment would swallow the moved `&`.
+            "    let c: any A // client\n        & B\n",
+        ] {
+            assert_eq!(join(source), source, "{source:?}");
+        }
     }
 }

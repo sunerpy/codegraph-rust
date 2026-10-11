@@ -1,0 +1,162 @@
+[
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "src/main/java/app/shapes/Main.java",
+    "from_node_id": "namespace:d2b9cc03ff2a1861e03fdab9098fdcf9",
+    "language": "java",
+    "line": 3,
+    "reference_kind": "imports",
+    "reference_name": "java.util.ArrayList"
+  },
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "src/main/java/app/shapes/Main.java",
+    "from_node_id": "namespace:d2b9cc03ff2a1861e03fdab9098fdcf9",
+    "language": "java",
+    "line": 4,
+    "reference_kind": "imports",
+    "reference_name": "java.util.List"
+  },
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "src/main/java/app/shapes/Square.java",
+    "from_node_id": "namespace:81eb58e808c579f6c7e095f79a3ac1d6",
+    "language": "java",
+    "line": 3,
+    "reference_kind": "imports",
+    "reference_name": "app.util.MathUtil.square"
+  },
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "src/test/java/app/MainTest.java",
+    "from_node_id": "namespace:0241892b231b76f262f1d6f12c9a13bc",
+    "language": "java",
+    "line": 3,
+    "reference_kind": "imports",
+    "reference_name": "org.mockito.Mockito.mock"
+  },
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "src/test/java/app/MainTest.java",
+    "from_node_id": "namespace:0241892b231b76f262f1d6f12c9a13bc",
+    "language": "java",
+    "line": 4,
+    "reference_kind": "imports",
+    "reference_name": "org.mockito.Mockito.verify"
+  },
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "src/test/java/app/MainTest.java",
+    "from_node_id": "namespace:0241892b231b76f262f1d6f12c9a13bc",
+    "language": "java",
+    "line": 7,
+    "reference_kind": "imports",
+    "reference_name": "java.lang.reflect.Method"
+  },
+  {
+    "candidates": null,
+    "col": 12,
+    "file_path": "src/main/java/app/shapes/Main.java",
+    "from_node_id": "method:6286f4575b75b858d15373165a633a08",
+    "language": "java",
+    "line": 25,
+    "reference_kind": "decorates",
+    "reference_name": "Override"
+  },
+  {
+    "candidates": null,
+    "col": 19,
+    "file_path": "src/test/java/app/MainTest.java",
+    "from_node_id": "method:c5f83603bb58827e828bd921b11695b4",
+    "language": "java",
+    "line": 19,
+    "reference_kind": "calls",
+    "reference_name": "Object.class.getMethod"
+  },
+  {
+    "candidates": null,
+    "col": 21,
+    "file_path": "src/main/java/app/shapes/Main.java",
+    "from_node_id": "method:c8883fca5b9ab3e5b9f4c67c82365397",
+    "language": "java",
+    "line": 24,
+    "reference_kind": "instantiates",
+    "reference_name": "Runnable"
+  },
+  {
+    "candidates": null,
+    "col": 25,
+    "file_path": "src/main/java/app/shapes/Main.java",
+    "from_node_id": "class:5f71b18693d8b0a3187abcb460d0433c",
+    "language": "java",
+    "line": 24,
+    "reference_kind": "extends",
+    "reference_name": "Runnable"
+  },
+  {
+    "candidates": null,
+    "col": 25,
+    "file_path": "src/test/java/app/MainTest.java",
+    "from_node_id": "method:c5f83603bb58827e828bd921b11695b4",
+    "language": "java",
+    "line": 15,
+    "reference_kind": "calls",
+    "reference_name": "mock"
+  },
+  {
+    "candidates": null,
+    "col": 27,
+    "file_path": "src/main/java/app/shapes/Main.java",
+    "from_node_id": "method:c8883fca5b9ab3e5b9f4c67c82365397",
+    "language": "java",
+    "line": 22,
+    "reference_kind": "instantiates",
+    "reference_name": "ArrayList"
+  },
+  {
+    "candidates": null,
+    "col": 4,
+    "file_path": "src/main/java/app/shapes/Square.java",
+    "from_node_id": "method:cd87bdc9721fd2109c50bdd8ed3d5896",
+    "language": "java",
+    "line": 10,
+    "reference_kind": "decorates",
+    "reference_name": "Override"
+  },
+  {
+    "candidates": null,
+    "col": 46,
+    "file_path": "src/main/java/app/shapes/Square.java",
+    "from_node_id": "method:214c81420bea1e6726e940c6d1a9caa4",
+    "language": "java",
+    "line": 14,
+    "reference_kind": "calls",
+    "reference_name": "s.length"
+  },
+  {
+    "candidates": null,
+    "col": 8,
+    "file_path": "src/main/java/app/shapes/Main.java",
+    "from_node_id": "method:c8883fca5b9ab3e5b9f4c67c82365397",
+    "language": "java",
+    "line": 23,
+    "reference_kind": "calls",
+    "reference_name": "all.add"
+  },
+  {
+    "candidates": null,
+    "col": 8,
+    "file_path": "src/main/java/app/shapes/Main.java",
+    "from_node_id": "method:c8883fca5b9ab3e5b9f4c67c82365397",
+    "language": "java",
+    "line": 28,
+    "reference_kind": "calls",
+    "reference_name": "r.run"
+  }
+]

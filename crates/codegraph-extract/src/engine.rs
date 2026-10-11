@@ -202,6 +202,56 @@ pub fn detect_language_with(
     Language::Unknown
 }
 
+/// The language `file_path` is indexed as, given its `source`: the language
+/// of its extension, except that a `.h` header holding C++ or Objective-C is
+/// that language. Extraction parses a file with it and every path that records
+/// a file row stores it, so the row agrees with the file's nodes.
+pub fn detect_language_for_source(
+    file_path: &str,
+    source: &str,
+    overrides: &ExtensionOverrides,
+) -> Language {
+    sniff_header_language(
+        file_path,
+        detect_language_with(file_path, overrides),
+        source,
+    )
+}
+
+/// [`detect_language_for_source`] for a file as the bounded reader returned
+/// it. A file over the size limit was never read, so only its extension
+/// decides; it has no nodes to disagree with.
+pub fn detect_language_of(
+    file_path: &str,
+    source: &SourceText,
+    overrides: &ExtensionOverrides,
+) -> Language {
+    match source {
+        SourceText::Text(text) => detect_language_for_source(file_path, text, overrides),
+        SourceText::Oversize(_) | SourceText::MpegTransportStream => {
+            detect_language_with(file_path, overrides)
+        }
+    }
+}
+
+/// `language` refined by `source` when `file_path` is a `.h` header of it:
+/// C++ or Objective-C content makes the header that language.
+fn sniff_header_language(file_path: &str, language: Language, source: &str) -> Language {
+    let header = Path::new(file_path)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("h"));
+    if language != Language::C || !header {
+        language
+    } else if looks_like_cpp(source) {
+        Language::Cpp
+    } else if looks_like_objc(source) {
+        Language::ObjC
+    } else {
+        language
+    }
+}
+
 /// A `.h` file maps to `Language::C` by extension, but may hold C++ or
 /// Objective-C. The ordinary unique-C++ probes retain their bounded 8 KiB pass;
 /// a second full-source pass recognizes a plain class/struct base clause, whose
@@ -287,20 +337,9 @@ pub fn extract_source_with_observer(
 ) -> ExtractionResult {
     let start = Instant::now();
     observer(ExtractionStage::DetectLanguage);
-    let mut language = language.unwrap_or_else(|| detect_language_with(file_path, overrides));
+    let language = language.unwrap_or_else(|| detect_language_with(file_path, overrides));
     observer(ExtractionStage::Prepare);
-    if language == Language::C
-        && Path::new(file_path)
-            .extension()
-            .and_then(|ext| ext.to_str())
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("h"))
-    {
-        if looks_like_cpp(source) {
-            language = Language::Cpp;
-        } else if looks_like_objc(source) {
-            language = Language::ObjC;
-        }
-    }
+    let language = sniff_header_language(file_path, language, source);
     observer(ExtractionStage::Embedded);
     if let Some(result) = crate::embedded::extract_embedded(file_path, source, language) {
         return result;
@@ -893,20 +932,61 @@ pub fn size_skip_result(file_path: &str, size: u64, max: u64) -> ExtractionResul
         nodes: Vec::new(),
         edges: Vec::new(),
         unresolved_references: Vec::new(),
-        errors: vec![format!(
-            "File exceeds max size ({size} > {max}): {file_path}"
-        )],
+        errors: vec![format!("{SIZE_SKIP_PREFIX} ({size} > {max}): {file_path}")],
         duration_ms: 0,
     }
 }
 
-/// The project-root `.gitignore`, read with git's own rules through the
-/// `ignore` crate, as upstream reads it with the `ignore` package: a leading or
-/// inner `/` anchors a rule to the root, a slash-less rule applies at any
-/// depth, `*` and `**` glob, a trailing `/` matches directories only, and `!`
-/// re-includes. Shared with `codegraph-watch`, so the watcher's `.gitignore`
-/// verdict is the scan's by construction. An unreadable, non-UTF-8 or NUL-laden
-/// file is treated as absent and an unparseable line is skipped, never fatal.
+/// The repository's own exclude file, relative to the project root. git reads
+/// it beside every `.gitignore` for files nobody wants committed (upstream
+/// #1728).
+pub const REPOSITORY_EXCLUDE: &str = ".git/info/exclude";
+
+/// The largest exclude file read; a bigger one is treated as absent.
+const REPOSITORY_EXCLUDE_MAX_BYTES: u64 = 1024 * 1024;
+
+/// The directory holding [`REPOSITORY_EXCLUDE`], when both it and `.git` are
+/// real directories of the project root. A `.git` file (a linked worktree or a
+/// submodule) names a git directory outside the project, and a symlinked
+/// `.git` or `info` can lead there too, so none of them is followed.
+pub fn repository_exclude_dir(root: &Path) -> Option<PathBuf> {
+    let real_dir = |path: &Path| {
+        fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_dir())
+    };
+    let git = root.join(".git");
+    let info = git.join("info");
+    (real_dir(&git) && real_dir(&info)).then_some(info)
+}
+
+/// The text of [`REPOSITORY_EXCLUDE`]: a regular file (not a link) in
+/// [`repository_exclude_dir`], read through the bounded source reader, so it
+/// is stat-ed before it is opened and a FIFO there is never opened. `None`
+/// when there is no such file, or it is unreadable, over the size limit or
+/// NUL-laden.
+pub fn read_repository_exclude(root: &Path) -> Option<String> {
+    let path = repository_exclude_dir(root)?.join("exclude");
+    if !fs::symlink_metadata(&path).ok()?.file_type().is_file() {
+        return None;
+    }
+    match read_source_file(&path, REPOSITORY_EXCLUDE, REPOSITORY_EXCLUDE_MAX_BYTES)
+        .ok()?
+        .1
+    {
+        SourceText::Text(text) if !text.contains('\0') => Some(text),
+        _ => None,
+    }
+}
+
+/// The project-root `.gitignore`, together with the repository's own
+/// [`REPOSITORY_EXCLUDE`], read with git's own rules through the `ignore`
+/// crate, as upstream reads them with the `ignore` package: a leading or inner
+/// `/` anchors a rule to the root, a slash-less rule applies at any depth, `*`
+/// and `**` glob, a trailing `/` matches directories only, and `!` re-includes.
+/// git ranks a `.gitignore` above the exclude file, so the exclude rules are
+/// read first and a `.gitignore` line wins a conflict with them. Shared with
+/// `codegraph-watch`, so the watcher's verdict is the scan's by construction.
+/// An unreadable, non-UTF-8 or NUL-laden `.gitignore` is treated as absent and
+/// an unparseable line is skipped, never fatal.
 #[derive(Debug, Clone, Default)]
 pub struct RootGitignore {
     matcher: Option<ignore::gitignore::Gitignore>,
@@ -914,17 +994,19 @@ pub struct RootGitignore {
 
 impl RootGitignore {
     pub fn load(root: &Path) -> Self {
-        let Ok(text) = fs::read_to_string(root.join(".gitignore")) else {
-            return Self::default();
-        };
-        if text.contains('\0') {
-            return Self::default();
-        }
+        let gitignore = fs::read_to_string(root.join(".gitignore"))
+            .ok()
+            .filter(|text| !text.contains('\0'));
         // Rooted at `.` so a root-relative candidate is never prefix-stripped.
         let mut builder = ignore::gitignore::GitignoreBuilder::new(".");
-        for line in text.lines() {
-            // An invalid glob drops only its own line; the rest still apply.
-            let _ = builder.add_line(None, line);
+        for text in [read_repository_exclude(root), gitignore]
+            .into_iter()
+            .flatten()
+        {
+            for line in text.lines() {
+                // An invalid glob drops only its own line; the rest still apply.
+                let _ = builder.add_line(None, line);
+            }
         }
         let matcher = builder.build().ok().filter(|matcher| !matcher.is_empty());
         Self { matcher }
@@ -1134,6 +1216,46 @@ fn is_extractable_source_path(relative: &str, overrides: &ExtensionOverrides) ->
             || is_file_level_only_language(language))
 }
 
+/// Why an indexed file whose content is current has none of the symbols it
+/// should have (upstream #2336). A content-hash comparison calls such a file
+/// up to date, so only its stored row can tell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MissingSymbols {
+    /// Stored with no nodes and no recorded reason; every parse stores at least
+    /// the file node, so the row was wiped and a rebuild restores it.
+    NeedsReindex,
+    /// A recorded parse failure left it without symbols; it stays this way
+    /// until the file or the parser changes.
+    ParseError,
+}
+
+/// Classify one stored file row; `None` when it has its symbols or is empty on
+/// purpose (a file over the size limit, a file-level-only language).
+#[must_use]
+pub fn missing_symbols(file: &codegraph_core::types::FileRecord) -> Option<MissingSymbols> {
+    let collapsed = file
+        .errors
+        .iter()
+        .any(|error| error.contains(PARSE_COLLAPSE_WARNING));
+    if file.node_count > 0 {
+        return collapsed.then_some(MissingSymbols::ParseError);
+    }
+    if is_file_level_only_language(file.language) {
+        return None;
+    }
+    if file.errors.is_empty() {
+        return Some(MissingSymbols::NeedsReindex);
+    }
+    let skipped_for_size = file
+        .errors
+        .iter()
+        .all(|error| error.starts_with(SIZE_SKIP_PREFIX));
+    (!skipped_for_size).then_some(MissingSymbols::ParseError)
+}
+
+/// The start of the error [`size_skip_result`] records.
+const SIZE_SKIP_PREFIX: &str = "File exceeds max size";
+
 fn is_file_level_only_language(language: Language) -> bool {
     matches!(
         language,
@@ -1156,6 +1278,46 @@ fn normalize_path(path: impl AsRef<Path>) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn missing_symbols_classifies_stored_rows_like_upstream() {
+        use codegraph_core::types::FileRecord;
+        let row = |language: Language, node_count: i64, errors: &[&str]| FileRecord {
+            path: "src/a.ts".to_string(),
+            content_hash: String::new(),
+            language,
+            size: 1,
+            modified_at: 0,
+            indexed_at: 0,
+            node_count,
+            errors: errors.iter().map(|error| (*error).to_string()).collect(),
+            generated: false,
+        };
+        let collapsed = format!(
+            "src/a.ts: {PARSE_COLLAPSE_WARNING} - the file is indexed but contributes nothing to the graph"
+        );
+        assert_eq!(missing_symbols(&row(Language::TypeScript, 3, &[])), None);
+        assert_eq!(
+            missing_symbols(&row(Language::TypeScript, 1, &[&collapsed])),
+            Some(MissingSymbols::ParseError)
+        );
+        assert_eq!(
+            missing_symbols(&row(Language::TypeScript, 0, &[])),
+            Some(MissingSymbols::NeedsReindex)
+        );
+        assert_eq!(missing_symbols(&row(Language::Yaml, 0, &[])), None);
+        assert_eq!(missing_symbols(&row(Language::GodotScene, 0, &[])), None);
+        let oversized = size_skip_result("src/a.ts", 9, 4).errors;
+        let oversized = oversized.iter().map(String::as_str).collect::<Vec<_>>();
+        assert_eq!(
+            missing_symbols(&row(Language::TypeScript, 0, &oversized)),
+            None
+        );
+        assert_eq!(
+            missing_symbols(&row(Language::TypeScript, 0, &["could not read the file"])),
+            Some(MissingSymbols::ParseError)
+        );
+    }
+
     use super::*;
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::SystemTime;

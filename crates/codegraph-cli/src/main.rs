@@ -22,7 +22,7 @@ use codegraph_core::generated_header::detect_generated_file;
 use codegraph_core::logger::{LoggerConfig, init_logger};
 use codegraph_core::node_id::hash_content;
 use codegraph_core::types::{Edge, ExtractionResult, FileRecord, Language, Node, NodeKind};
-use codegraph_extract::{ExtractOptions, detect_language_with};
+use codegraph_extract::{ExtractOptions, detect_language_of};
 use codegraph_graph::graph::{GodotReach, GraphTraverser, group_definitions};
 use codegraph_graph::query::{SearchOptions, search_nodes};
 use codegraph_graph::{segment_match, segments};
@@ -1668,6 +1668,9 @@ fn drain_project_daemon(project: &Path, project_identity: &str) -> Result<(), St
         Ok(codegraph_daemon::ShutdownOutcome::Unresponsive { pid, detail }) => Err(format!(
             "daemon {pid} did not acknowledge the shutdown control frame ({detail})"
         )),
+        Ok(codegraph_daemon::ShutdownOutcome::Declined { pid, detail }) => Err(format!(
+            "daemon {pid} was not asked to shut down ({detail})"
+        )),
         Err(error) => Err(format!("could not reach this project's daemon: {error:#}")),
     }
 }
@@ -2128,6 +2131,9 @@ fn cmd_status(path: Option<PathBuf>, json_output: bool) -> Result<()> {
             .is_none_or(|v| v < codegraph_store::CURRENT_EXTRACTION_VERSION);
     let resolution_incomplete = store.is_resolution_incomplete()?;
     let pending = codegraph_watch::pending_project_changes(&project, &store)?;
+    // Files whose content is current but whose symbols are missing: the content
+    // hash behind "up to date" cannot see them (upstream #2336).
+    let health = FilesMissingSymbols::of(&store)?;
 
     if json_output {
         let mut index_obj = json!({
@@ -2135,6 +2141,8 @@ fn cmd_status(path: Option<PathBuf>, json_output: bool) -> Result<()> {
             "builtWithExtractionVersion": built_with_extraction_version,
             "currentExtractionVersion": codegraph_store::CURRENT_EXTRACTION_VERSION,
             "reindexRecommended": reindex_recommended,
+            "filesNeedingReindex": health.needs_reindex.len(),
+            "filesWithParseErrors": health.parse_errors.len(),
         });
         // #1187: surface the interrupted-index state ONLY when the marker is set,
         // so a healthy index's status JSON is byte-identical to a pre-#1187 build.
@@ -2223,6 +2231,13 @@ fn cmd_status(path: Option<PathBuf>, json_output: bool) -> Result<()> {
             }
         }
     }
+    let missing_symbols = health.warnings();
+    if !missing_symbols.is_empty() {
+        println!();
+        for line in &missing_symbols {
+            println!("⚠ {line}");
+        }
+    }
     if resolution_incomplete {
         println!(
             "\n⚠ Index is PARTIAL: a resolution pass was interrupted, so some call\n  edges are missing. Run `codegraph sync` to heal it.\n"
@@ -2232,10 +2247,85 @@ fn cmd_status(path: Option<PathBuf>, json_output: bool) -> Result<()> {
             "\nIndex has {} pending source change(s). Run `codegraph sync`.\n",
             pending.total()
         );
-    } else {
+    } else if missing_symbols.is_empty() {
         println!("\nIndex is up to date\n");
+    } else {
+        println!();
     }
     Ok(())
+}
+
+/// Indexed files whose content is current but whose symbols are missing,
+/// grouped by what to do about them (upstream #2336). Paths are sorted.
+struct FilesMissingSymbols {
+    needs_reindex: Vec<String>,
+    parse_errors: Vec<String>,
+}
+
+impl FilesMissingSymbols {
+    fn of(store: &Store) -> Result<Self> {
+        let mut health = Self {
+            needs_reindex: Vec::new(),
+            parse_errors: Vec::new(),
+        };
+        for file in store.files_without_nodes_or_with_errors()? {
+            match codegraph_extract::engine::missing_symbols(&file) {
+                Some(codegraph_extract::engine::MissingSymbols::NeedsReindex) => {
+                    health.needs_reindex.push(file.path);
+                }
+                Some(codegraph_extract::engine::MissingSymbols::ParseError) => {
+                    health.parse_errors.push(file.path);
+                }
+                None => {}
+            }
+        }
+        Ok(health)
+    }
+
+    /// One line per non-empty group: what is wrong, what to do, and up to
+    /// three of the files. A hash-based `sync` does not revisit a row whose
+    /// content is current, so a wiped row needs `codegraph index`.
+    fn warnings(&self) -> Vec<String> {
+        let sample = |paths: &[String]| {
+            let mut text = paths.iter().take(3).cloned().collect::<Vec<_>>().join(", ");
+            if paths.len() > 3 {
+                text.push_str(&format!(
+                    " (+{} more)",
+                    format_number(paths.len() as i64 - 3)
+                ));
+            }
+            text
+        };
+        let mut lines = Vec::new();
+        let reindex = self.needs_reindex.len();
+        if reindex > 0 {
+            lines.push(format!(
+                "{} {} symbols — run `codegraph index` to rebuild {}: {}",
+                format_number(reindex as i64),
+                if reindex == 1 {
+                    "file is missing its"
+                } else {
+                    "files are missing their"
+                },
+                if reindex == 1 { "it" } else { "them" },
+                sample(&self.needs_reindex)
+            ));
+        }
+        let unparsed = self.parse_errors.len();
+        if unparsed > 0 {
+            lines.push(format!(
+                "{} {} missing: {} — `codegraph files --json` shows the errors",
+                format_number(unparsed as i64),
+                if unparsed == 1 {
+                    "file could not be parsed, so its symbols are"
+                } else {
+                    "files could not be parsed, so their symbols are"
+                },
+                sample(&self.parse_errors)
+            ));
+        }
+        lines
+    }
 }
 
 fn print_wal_status(wal_size: u64, db_size: u64) {
@@ -3760,7 +3850,7 @@ fn start_daemon_for_adopted_root(project_root: &Path, no_watch: bool) -> Option<
                 socket_path = %socket_path.display(),
                 "adopted-root: spawned new daemon"
             );
-            socket_path.exists().then_some(socket_path)
+            codegraph_daemon::rendezvous_accepts(&socket_path).then_some(socket_path)
         }
         Err(err) => {
             tracing::warn!(error = %err, "adopted project daemon start failed");
@@ -3879,9 +3969,10 @@ pub enum ColdStartAction {
     /// A daemon is ALREADY running: attach to it via the real proxy (the proxy
     /// answers `initialize`/`tools/list` locally and forwards tool calls). Fast.
     ProxyToRunningDaemon,
-    /// COLD start (no live daemon): spawn the shared daemon FIRE-AND-FORGET for
-    /// the NEXT session's warm attach, but serve THIS session DIRECT immediately
-    /// so the MCP handshake is answered without waiting on daemon readiness.
+    /// COLD start (no live daemon): spawn the shared daemon FIRE-AND-FORGET, serve
+    /// THIS session DIRECT immediately so the MCP handshake is answered without
+    /// waiting on daemon readiness, and retain a passive lease on the daemon in
+    /// the background so it stays alive for this session.
     SpawnDaemonAndServeDirect,
 }
 
@@ -3903,6 +3994,8 @@ pub fn cold_start_action(daemon_running: bool) -> ColdStartAction {
 /// handshake without blocking on daemon socket readiness. This is the fix for
 /// the cold-start handshake race (opencode marking codegraph `failed` when the
 /// spawn→poll→proxy→heal prelude exceeded its MCP init timeout under load).
+/// A background keeper then retains a passive lease on that daemon, so it does
+/// not idle-exit while this session lives (upstream #2293).
 fn serve_spawn_or_proxy(
     project: Option<PathBuf>,
     project_root: &Path,
@@ -3916,8 +4009,24 @@ fn serve_spawn_or_proxy(
     match cold_start_action(daemon_already_running(project_root)) {
         ColdStartAction::ProxyToRunningDaemon => {
             tracing::debug!("serve_spawn_or_proxy: attaching to existing daemon (warm)");
-            if let Some(result) = proxy_to_running_daemon(project_root) {
-                return result;
+            match proxy_to_running_daemon(project_root) {
+                WarmAttach::Proxied(result) => return result,
+                WarmAttach::VersionMismatch => match replace_older_daemon(project_root) {
+                    DaemonReplacement::Drained => {
+                        return serve_after_replacement(
+                            project,
+                            project_root,
+                            no_watch,
+                            explicit_path,
+                        );
+                    }
+                    DaemonReplacement::Kept(reason) => {
+                        // stdout carries JSON-RPC only; MCP hosts log stderr, so a
+                        // session that quietly stopped syncing is visible there.
+                        eprintln!("[CodeGraph MCP] {READ_ONLY_SESSION_NOTICE}: {reason}.");
+                    }
+                },
+                WarmAttach::Unavailable => {}
             }
             // A failed transport attach does not grant a second watcher. Keep the
             // request path available as a read-only direct session while the live
@@ -3925,41 +4034,95 @@ fn serve_spawn_or_proxy(
             serve_direct_stdio(project, explicit_project_services(no_watch))
         }
         ColdStartAction::SpawnDaemonAndServeDirect => {
-            // Cold: kick off the shared daemon for FUTURE sessions, then serve
-            // this session direct immediately. The spawn is best-effort and
-            // idempotent — `start_or_attach` (via the daemon's pid lock) makes N
-            // concurrent cold sessions converge on at most one daemon, and a
-            // failed/lost race just means this session serves direct (which it
-            // does anyway). We deliberately do NOT poll or proxy here: that
-            // prelude is exactly what blew past opencode's handshake timeout.
-            if spawn_shared_daemon_best_effort(project_root, no_watch) {
-                // The detached daemon is the sole writer. This foreground process
-                // exists only to answer the first MCP handshake without waiting for
-                // socket readiness; starting another watcher/catch-up here recreated
-                // the exact dual-writer race #1740 guards against.
-                serve_direct_stdio(project, explicit_project_services(no_watch))
-            } else {
-                // If the child could not even be spawned, preserve the established
-                // in-process fallback. It takes writer.pid itself, so two fallback
-                // processes still cannot run competing watchers.
-                serve_direct(project, project_root, no_watch, explicit_path)
-            }
+            serve_cold_start(project, project_root, no_watch, explicit_path)
         }
     }
 }
 
-/// Attach to an ALREADY-running shared daemon via the real proxy. Returns
-/// `Some(Ok(()))` when the proxy bridged the session (caller must NOT also serve
-/// direct), or `None` when it could not attach (socket gone, version mismatch,
-/// or connect error) — the caller then falls back to direct serving. Unchanged
-/// proxy semantics: `run_proxy` answers `initialize`/`tools/list` locally and
+/// The stderr notice of a session that serves reads while another process owns
+/// the project's writer slot (upstream's `readOnlyFallback`).
+const READ_ONLY_SESSION_NOTICE: &str = "Serving reads in-process without auto-sync";
+
+/// Cold: kick off the shared daemon, then serve this session direct immediately.
+/// The spawn is best-effort and idempotent — `start_or_attach` (via the daemon's
+/// pid lock) makes N concurrent cold sessions converge on at most one daemon,
+/// and a failed/lost race just means this session serves direct (which it does
+/// anyway). We deliberately do NOT poll or proxy here: that prelude is exactly
+/// what blew past opencode's handshake timeout.
+fn serve_cold_start(
+    project: Option<PathBuf>,
+    project_root: &Path,
+    no_watch: bool,
+    explicit_path: bool,
+) -> Result<()> {
+    if spawn_shared_daemon_best_effort(project_root, no_watch) {
+        // The detached daemon is the sole writer. This foreground process exists
+        // only to answer the first MCP handshake without waiting for socket
+        // readiness; starting another watcher/catch-up here recreated the exact
+        // dual-writer race #1740 guards against.
+        //
+        // The daemon is also what keeps this session's index live, and a daemon
+        // with no client idle-exits. Once its socket is up, the keeper retains a
+        // passive lease for the life of the session and, if that lease is lost,
+        // starts or re-attaches a daemon with backoff (upstream #2293). It runs
+        // on its own thread, so the handshake below still never waits on the
+        // daemon.
+        let _lease_keeper =
+            codegraph_daemon::keep_session_attached(project_root.to_path_buf(), no_watch);
+        serve_direct_stdio(project, explicit_project_services(no_watch))
+    } else {
+        // If the child could not even be spawned, preserve the established
+        // in-process fallback. It takes writer.pid itself, so two fallback
+        // processes still cannot run competing watchers.
+        serve_direct(project, project_root, no_watch, explicit_path)
+    }
+}
+
+/// After an older install's daemon drained: start this install's daemon and
+/// proxy to it once its socket is up within the usual poll window; a slower
+/// start is served like a cold start, which attaches as soon as it can.
+fn serve_after_replacement(
+    project: Option<PathBuf>,
+    project_root: &Path,
+    no_watch: bool,
+    explicit_path: bool,
+) -> Result<()> {
+    if !spawn_shared_daemon_best_effort(project_root, no_watch) {
+        return serve_direct(project, project_root, no_watch, explicit_path);
+    }
+    poll_for_daemon_socket(project_root);
+    if let WarmAttach::Proxied(result) = proxy_to_running_daemon(project_root) {
+        return result;
+    }
+    let _lease_keeper =
+        codegraph_daemon::keep_session_attached(project_root.to_path_buf(), no_watch);
+    serve_direct_stdio(project, explicit_project_services(no_watch))
+}
+
+/// What attaching to a running daemon came to.
+enum WarmAttach {
+    /// The proxy bridged the session until one side closed.
+    Proxied(Result<()>),
+    /// The daemon is another build: its hello did not match this one.
+    VersionMismatch,
+    /// No usable socket, or the attach failed.
+    Unavailable,
+}
+
+/// Attach to an ALREADY-running shared daemon via the real proxy. On
+/// [`WarmAttach::Proxied`] the caller must NOT also serve direct; otherwise it
+/// may replace an older daemon or fall back to direct serving. Unchanged proxy
+/// semantics: `run_proxy` answers `initialize`/`tools/list` locally and
 /// forwards tool calls; its fd half-close / ppid-watchdog teardown is untouched.
-fn proxy_to_running_daemon(project_root: &Path) -> Option<Result<()>> {
-    let socket_path = codegraph_daemon::recorded_socket_path(project_root).ok()?;
-    if !socket_path.exists() {
+/// A mismatch is reported before `run_proxy` reads any client input.
+fn proxy_to_running_daemon(project_root: &Path) -> WarmAttach {
+    let Ok(socket_path) = codegraph_daemon::recorded_socket_path(project_root) else {
+        return WarmAttach::Unavailable;
+    };
+    if !codegraph_daemon::rendezvous_accepts(&socket_path) {
         tracing::debug!("proxy_to_running_daemon: daemon socket missing; falling back to direct");
         heal_stale_daemon_if_dead(project_root);
-        return None;
+        return WarmAttach::Unavailable;
     }
 
     let host_ppid = Some(codegraph_daemon::current_ppid());
@@ -3970,18 +4133,106 @@ fn proxy_to_running_daemon(project_root: &Path) -> Option<Result<()>> {
         BufReader::new(stdin.lock()),
         io::stdout(),
     ) {
-        Ok(codegraph_daemon::ProxyOutcome::Proxied) => Some(Ok(())),
+        Ok(codegraph_daemon::ProxyOutcome::Proxied) => WarmAttach::Proxied(Ok(())),
         Ok(codegraph_daemon::ProxyOutcome::VersionMismatch) => {
-            tracing::debug!(
-                "proxy_to_running_daemon: daemon version mismatch; falling back to direct"
-            );
-            None
+            tracing::debug!("proxy_to_running_daemon: daemon version mismatch");
+            WarmAttach::VersionMismatch
         }
         Err(err) => {
             tracing::debug!(error = %err, "proxy_to_running_daemon: proxy attach failed; falling back to direct");
             heal_stale_daemon_if_dead(project_root);
-            None
+            WarmAttach::Unavailable
         }
+    }
+}
+
+/// What a session did about a running daemon of another build.
+enum DaemonReplacement {
+    /// The daemon of an older release drained on request; the project's
+    /// rendezvous and writer slot are free for this install's daemon.
+    Drained,
+    /// The daemon keeps the project, for the reason given.
+    Kept(String),
+}
+
+/// Replace a running daemon only when it is an OLDER plain `X.Y.Z` release
+/// (upstream #2343): ask it to drain over its control channel, which is bound
+/// to this project's identity, so nothing is ever signalled by pid. A daemon of
+/// a newer release, a prerelease or an unknown version is never stopped, so two
+/// installs cannot take turns replacing each other's daemon, and one that does
+/// not acknowledge the drain keeps the project and its writer slot.
+fn replace_older_daemon(project_root: &Path) -> DaemonReplacement {
+    use codegraph_daemon::{DaemonPeer, ShutdownOutcome};
+
+    let hello = match codegraph_daemon::recorded_socket_path(project_root)
+        .and_then(|socket| codegraph_daemon::attach_to_daemon(&socket))
+    {
+        Ok(client) => client.hello,
+        Err(error) => {
+            return DaemonReplacement::Kept(format!(
+                "the project's daemon could not be reached ({error:#})"
+            ));
+        }
+    };
+    let version = match codegraph_daemon::classify_daemon_hello(&hello) {
+        DaemonPeer::OlderRelease { version } => version,
+        DaemonPeer::Same => {
+            return DaemonReplacement::Kept(
+                "the project's daemon is this build but did not accept the session".to_string(),
+            );
+        }
+        DaemonPeer::Foreign {
+            version: Some(version),
+        } => {
+            return DaemonReplacement::Kept(format!(
+                "the project's daemon runs codegraph {version}, which codegraph {VERSION} never \
+                 replaces"
+            ));
+        }
+        DaemonPeer::Foreign { version: None } => {
+            return DaemonReplacement::Kept(
+                "the project's daemon runs an unknown codegraph version, which is never replaced"
+                    .to_string(),
+            );
+        }
+    };
+    let identity = match index_paths(project_root) {
+        Ok(paths) => paths.project_identity().to_string(),
+        Err(error) => {
+            return DaemonReplacement::Kept(format!(
+                "the codegraph {version} daemon was left running: {error:#}"
+            ));
+        }
+    };
+    // The frame goes only to a daemon whose hello, on the shutdown connection
+    // itself, is the older release classified above: a daemon that took the
+    // project in between is never asked.
+    let classified = version.clone();
+    let is_classified = move |hello: &serde_json::Value| {
+        matches!(
+            codegraph_daemon::classify_daemon_hello(hello),
+            DaemonPeer::OlderRelease { version } if version == classified
+        )
+    };
+    match codegraph_daemon::request_daemon_shutdown_of(project_root, &identity, is_classified) {
+        Ok(ShutdownOutcome::Drained { pid }) => {
+            tracing::info!(
+                pid,
+                %version,
+                "replaced the daemon an older codegraph install left running"
+            );
+            DaemonReplacement::Drained
+        }
+        Ok(ShutdownOutcome::NoDaemon) => DaemonReplacement::Drained,
+        Ok(ShutdownOutcome::Unresponsive { pid, detail }) => DaemonReplacement::Kept(format!(
+            "the codegraph {version} daemon (pid {pid}) did not drain when asked ({detail})"
+        )),
+        Ok(ShutdownOutcome::Declined { pid, detail }) => DaemonReplacement::Kept(format!(
+            "the project's daemon (pid {pid}) is no longer the codegraph {version} one ({detail})"
+        )),
+        Err(error) => DaemonReplacement::Kept(format!(
+            "the codegraph {version} daemon could not be asked to drain ({error:#})"
+        )),
     }
 }
 
@@ -4039,7 +4290,8 @@ fn poll_for_daemon_socket(project_root: &Path) {
         // Re-read the lock each tick: the daemon rewrites the recorded socket to
         // its bind-fallback choice during startup, so the path can change while
         // we poll (D-Daemon-b).
-        if codegraph_daemon::recorded_socket_path(project_root).is_ok_and(|socket| socket.exists())
+        if codegraph_daemon::recorded_socket_path(project_root)
+            .is_ok_and(|socket| codegraph_daemon::rendezvous_accepts(&socket))
         {
             return;
         }
@@ -5473,7 +5725,7 @@ fn index_project_inner(
                 return Ok(None);
             };
             parse_tracker.stage(index, "prepare");
-            let language = detect_language_with(relative, &options.extensions);
+            let language = detect_language_of(relative, &source, &options.extensions);
             parse_tracker.file_info(index, metadata.len(), language);
 
             let result =
@@ -7222,6 +7474,9 @@ struct FileOutput<'a> {
     language: Language,
     node_count: i64,
     size: i64,
+    /// The errors extraction recorded for the file (upstream #2336); empty when
+    /// it parsed cleanly.
+    errors: &'a [String],
 }
 
 impl<'a> From<&'a FileRecord> for FileOutput<'a> {
@@ -7231,6 +7486,7 @@ impl<'a> From<&'a FileRecord> for FileOutput<'a> {
             language: file.language,
             node_count: file.node_count,
             size: file.size,
+            errors: &file.errors,
         }
     }
 }

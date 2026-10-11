@@ -1,6 +1,16 @@
 [
   {
     "candidates": null,
+    "col": 0,
+    "file_path": "m.erl",
+    "from_node_id": "namespace:998d8cbb5759a2fdb05d10d3a9fc6bd9",
+    "language": "erlang",
+    "line": 4,
+    "reference_kind": "imports",
+    "reference_name": "foo.hrl"
+  },
+  {
+    "candidates": null,
     "col": 10,
     "file_path": "client.erl",
     "from_node_id": "function:786a4e513d0c6396a2bc2eecaf516820",

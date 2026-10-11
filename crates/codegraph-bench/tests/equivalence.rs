@@ -36,398 +36,92 @@ fn an_unparseable_known_diffs_file_fails_the_equivalence_assertion() {
     assert!(message.contains("may not be allowlisted"), "got: {message}");
 }
 
-#[test]
-fn generated_golden_matches_committed_mini_fixture() {
-    let tempdir = TestDir::new("generated-golden");
-    write_golden(&mini_db(), tempdir.path()).unwrap();
+/// One pair of byte-drift tests per committed golden corpus. Each corpus's
+/// docs/equivalence.md section says what it guards; the regeneration recipe is
+/// shared (`scripts/regen-goldens.sh`). The first test regenerates the canonical
+/// artifacts from the committed `colby.db` and compares them with the committed
+/// JSON; the second runs the full oracle over the same pair.
+macro_rules! golden_corpora {
+    ($($corpus:literal => $generated:ident, $equivalent:ident;)+) => {
+        /// Every corpus with a committed `colby.db`, in declaration order.
+        const GOLDEN_CORPORA: &[&str] = &[$($corpus),+];
 
-    let expected = load_golden(&mini_golden_dir()).unwrap();
-    let actual = load_golden(tempdir.path()).unwrap();
+        $(
+            #[test]
+            fn $generated() {
+                let tempdir = TestDir::new(concat!("generated-golden-", $corpus));
+                write_golden(&corpus_db($corpus), tempdir.path()).unwrap();
 
-    diff_canonical(&expected, &actual, None).unwrap();
+                let expected = load_golden(&corpus_golden_dir($corpus)).unwrap();
+                let actual = load_golden(tempdir.path()).unwrap();
+
+                diff_canonical(&expected, &actual, None).unwrap();
+            }
+
+            #[test]
+            fn $equivalent() {
+                assert_equivalent(&corpus_db($corpus), &corpus_golden_dir($corpus)).unwrap();
+            }
+        )+
+    };
+}
+
+golden_corpora! {
+    "mini" => generated_golden_matches_committed_mini_fixture, upstream_db_is_self_equivalent_to_mini_golden;
+    "godot" => generated_golden_matches_committed_godot_fixture, upstream_db_is_self_equivalent_to_godot_golden;
+    "ruby" => generated_golden_matches_committed_ruby_fixture, upstream_db_is_self_equivalent_to_ruby_golden;
+    "cpp" => generated_golden_matches_committed_cpp_fixture, cpp_db_is_self_equivalent_to_cpp_golden;
+    "rust" => generated_golden_matches_committed_rust_fixture, rust_db_is_self_equivalent_to_rust_golden;
+    "lua" => generated_golden_matches_committed_lua_fixture, lua_db_is_self_equivalent_to_lua_golden;
+    "go" => generated_golden_matches_committed_go_fixture, go_db_is_self_equivalent_to_go_golden;
+    "python" => generated_golden_matches_committed_python_fixture, python_db_is_self_equivalent_to_python_golden;
+    "kotlin" => generated_golden_matches_committed_kotlin_fixture, kotlin_db_is_self_equivalent_to_kotlin_golden;
+    "scala" => generated_golden_matches_committed_scala_fixture, scala_db_is_self_equivalent_to_scala_golden;
+    "dart" => generated_golden_matches_committed_dart_fixture, dart_db_is_self_equivalent_to_dart_golden;
+    "typescript" => generated_golden_matches_committed_typescript_fixture, typescript_db_is_self_equivalent_to_typescript_golden;
+    "metal" => generated_golden_matches_committed_metal_fixture, metal_db_is_self_equivalent_to_metal_golden;
+    "cuda" => generated_golden_matches_committed_cuda_fixture, cuda_db_is_self_equivalent_to_cuda_golden;
+    "arkts" => generated_golden_matches_committed_arkts_fixture, arkts_db_is_self_equivalent_to_arkts_golden;
+    "solidity" => generated_golden_matches_committed_solidity_fixture, solidity_db_is_self_equivalent_to_solidity_golden;
+    "nix" => generated_golden_matches_committed_nix_fixture, nix_db_is_self_equivalent_to_nix_golden;
+    "terraform" => generated_golden_matches_committed_terraform_fixture, terraform_db_is_self_equivalent_to_terraform_golden;
+    "erlang" => generated_golden_matches_committed_erlang_fixture, erlang_db_is_self_equivalent_to_erlang_golden;
+    "cfml" => generated_golden_matches_committed_cfml_fixture, cfml_db_is_self_equivalent_to_cfml_golden;
+    "csharp" => generated_golden_matches_committed_csharp_fixture, csharp_db_is_self_equivalent_to_csharp_golden;
+    "java" => generated_golden_matches_committed_java_fixture, java_db_is_self_equivalent_to_java_golden;
+    "swift" => generated_golden_matches_committed_swift_fixture, swift_db_is_self_equivalent_to_swift_golden;
+    "objc" => generated_golden_matches_committed_objc_fixture, objc_db_is_self_equivalent_to_objc_golden;
+    "php" => generated_golden_matches_committed_php_fixture, php_db_is_self_equivalent_to_php_golden;
+    "vue" => generated_golden_matches_committed_vue_fixture, vue_db_is_self_equivalent_to_vue_golden;
+    "svelte" => generated_golden_matches_committed_svelte_fixture, svelte_db_is_self_equivalent_to_svelte_golden;
+    "python_bases" => generated_golden_matches_committed_python_bases_fixture, python_bases_db_is_self_equivalent_to_python_bases_golden;
+    "commonjs" => generated_golden_matches_committed_commonjs_fixture, commonjs_db_is_self_equivalent_to_commonjs_golden;
+    "routers" => generated_golden_matches_committed_routers_fixture, routers_db_is_self_equivalent_to_routers_golden;
+    "servers" => generated_golden_matches_committed_servers_fixture, servers_db_is_self_equivalent_to_servers_golden;
+    "mobile" => generated_golden_matches_committed_mobile_fixture, mobile_db_is_self_equivalent_to_mobile_golden;
+    "synthesis" => generated_golden_matches_committed_synthesis_fixture, synthesis_db_is_self_equivalent_to_synthesis_golden;
 }
 
 #[test]
-fn upstream_db_is_self_equivalent_to_mini_golden() {
-    assert_equivalent(&mini_db(), &mini_golden_dir()).unwrap();
-}
-
-#[test]
-fn generated_golden_matches_committed_godot_fixture() {
-    // Guards Godot extraction (F1 autoload-call→func + F2 signal-handler edges)
-    // against byte-drift: regenerating the canonical golden from the committed
-    // godot db must reproduce the committed JSON exactly.
-    let tempdir = TestDir::new("generated-golden-godot");
-    write_golden(&godot_db(), tempdir.path()).unwrap();
-
-    let expected = load_golden(&godot_golden_dir()).unwrap();
-    let actual = load_golden(tempdir.path()).unwrap();
-
-    diff_canonical(&expected, &actual, None).unwrap();
-}
-
-#[test]
-fn upstream_db_is_self_equivalent_to_godot_golden() {
-    assert_equivalent(&godot_db(), &godot_golden_dir()).unwrap();
-}
-
-#[test]
-fn generated_golden_matches_committed_ruby_fixture() {
-    // Guards Ruby #1110 receiver.method extraction (instance-call → Calls,
-    // class-method call → Calls, `Const.new` → Instantiates, bare include →
-    // Implements) against byte-drift: regenerating the canonical golden from the
-    // committed ruby db must reproduce the committed JSON exactly.
-    let tempdir = TestDir::new("generated-golden-ruby");
-    write_golden(&ruby_db(), tempdir.path()).unwrap();
-
-    let expected = load_golden(&ruby_golden_dir()).unwrap();
-    let actual = load_golden(tempdir.path()).unwrap();
-
-    diff_canonical(&expected, &actual, None).unwrap();
-}
-
-#[test]
-fn upstream_db_is_self_equivalent_to_ruby_golden() {
-    assert_equivalent(&ruby_db(), &ruby_golden_dir()).unwrap();
-}
-
-#[test]
-fn generated_golden_matches_committed_cpp_fixture() {
-    // Guards C++ #1043 base_class_clause inheritance (general Extends extraction
-    // + templated-base stripping) against byte-drift: regenerating the canonical
-    // golden from the committed cpp db must reproduce the committed JSON exactly.
-    let tempdir = TestDir::new("generated-golden-cpp");
-    write_golden(&cpp_db(), tempdir.path()).unwrap();
-
-    let expected = load_golden(&cpp_golden_dir()).unwrap();
-    let actual = load_golden(tempdir.path()).unwrap();
-
-    diff_canonical(&expected, &actual, None).unwrap();
-}
-
-#[test]
-fn cpp_db_is_self_equivalent_to_cpp_golden() {
-    assert_equivalent(&cpp_db(), &cpp_golden_dir()).unwrap();
-}
-
-#[test]
-fn generated_golden_matches_committed_rust_fixture() {
-    // Guards item 7 (Rust unit structs are indexed, so `impl Trait for Unit`
-    // forms) and item 9-Rust (`union` is a first-class kind) against byte-drift.
-    let tempdir = TestDir::new("generated-golden-rust");
-    write_golden(&rust_db(), tempdir.path()).unwrap();
-
-    let expected = load_golden(&rust_golden_dir()).unwrap();
-    let actual = load_golden(tempdir.path()).unwrap();
-
-    diff_canonical(&expected, &actual, None).unwrap();
-}
-
-#[test]
-fn rust_db_is_self_equivalent_to_rust_golden() {
-    assert_equivalent(&rust_db(), &rust_golden_dir()).unwrap();
-}
-
-#[test]
-fn generated_golden_matches_committed_lua_fixture() {
-    // Guards #1616 Lua function expressions: local assignment functions become
-    // Function nodes without duplicate Variables, table members become Methods
-    // with full qualified names, nested table members retain their namespace,
-    // body calls belong to the synthesized callable, and both dot/colon calls
-    // resolve to the same static table member.
-    let tempdir = TestDir::new("generated-golden-lua");
-    write_golden(&lua_db(), tempdir.path()).unwrap();
-
-    let expected = load_golden(&lua_golden_dir()).unwrap();
-    let actual = load_golden(tempdir.path()).unwrap();
-
-    diff_canonical(&expected, &actual, None).unwrap();
-}
-
-#[test]
-fn lua_db_is_self_equivalent_to_lua_golden() {
-    assert_equivalent(&lua_db(), &lua_golden_dir()).unwrap();
-}
-
-#[test]
-fn generated_golden_matches_committed_go_fixture() {
-    // Guards #1500 content-header detection: `files.generated` is byte-pinned at
-    // BOTH values — 1 for the Go banner, the Wrangler double-`by` banner, and the
-    // path-only `.pb.go`; 0 for the hand-written sibling, the single-`by` prose
-    // negative, and the generator whose banner is a `const` in its body.
-    let tempdir = TestDir::new("generated-golden-go");
-    write_golden(&go_db(), tempdir.path()).unwrap();
-
-    let expected = load_golden(&go_golden_dir()).unwrap();
-    let actual = load_golden(tempdir.path()).unwrap();
-
-    diff_canonical(&expected, &actual, None).unwrap();
-}
-
-#[test]
-fn go_db_is_self_equivalent_to_go_golden() {
-    assert_equivalent(&go_db(), &go_golden_dir()).unwrap();
-}
-
-#[test]
-fn generated_golden_matches_committed_python_fixture() {
-    let tempdir = TestDir::new("generated-golden-python");
-    write_golden(&python_db(), tempdir.path()).unwrap();
-
-    let expected = load_golden(&python_golden_dir()).unwrap();
-    let actual = load_golden(tempdir.path()).unwrap();
-
-    diff_canonical(&expected, &actual, None).unwrap();
-}
-
-#[test]
-fn python_db_is_self_equivalent_to_python_golden() {
-    assert_equivalent(&python_db(), &python_golden_dir()).unwrap();
-}
-
-#[test]
-fn generated_golden_matches_committed_kotlin_fixture() {
-    let tempdir = TestDir::new("generated-golden-kotlin");
-    write_golden(&kotlin_db(), tempdir.path()).unwrap();
-
-    let expected = load_golden(&kotlin_golden_dir()).unwrap();
-    let actual = load_golden(tempdir.path()).unwrap();
-
-    diff_canonical(&expected, &actual, None).unwrap();
-}
-
-#[test]
-fn kotlin_db_is_self_equivalent_to_kotlin_golden() {
-    assert_equivalent(&kotlin_db(), &kotlin_golden_dir()).unwrap();
-}
-
-#[test]
-fn generated_golden_matches_committed_scala_fixture() {
-    // Guards Scala grammar 0.26.2's multi-parameter-list inheritance shape,
-    // every `extends`/`with` parent, companion object -> Module classification,
-    // inheritance preference for the real type, and eta-expansion method values.
-    let tempdir = TestDir::new("generated-golden-scala");
-    write_golden(&scala_db(), tempdir.path()).unwrap();
-
-    let expected = load_golden(&scala_golden_dir()).unwrap();
-    let actual = load_golden(tempdir.path()).unwrap();
-
-    diff_canonical(&expected, &actual, None).unwrap();
-}
-
-#[test]
-fn scala_db_is_self_equivalent_to_scala_golden() {
-    assert_equivalent(&scala_db(), &scala_golden_dir()).unwrap();
-}
-
-#[test]
-fn generated_golden_matches_committed_dart_fixture() {
-    // Guards Dart 3 `extension type`: the type is class-like and owns getter /
-    // method nodes rather than leaving top-level functions or dropping members.
-    let tempdir = TestDir::new("generated-golden-dart");
-    write_golden(&dart_db(), tempdir.path()).unwrap();
-
-    let expected = load_golden(&dart_golden_dir()).unwrap();
-    let actual = load_golden(tempdir.path()).unwrap();
-
-    diff_canonical(&expected, &actual, None).unwrap();
-}
-
-#[test]
-fn dart_db_is_self_equivalent_to_dart_golden() {
-    assert_equivalent(&dart_db(), &dart_golden_dir()).unwrap();
-}
-
-#[test]
-fn generated_golden_matches_committed_typescript_fixture() {
-    let tempdir = TestDir::new("generated-golden-typescript");
-    write_golden(&typescript_db(), tempdir.path()).unwrap();
-
-    let expected = load_golden(&typescript_golden_dir()).unwrap();
-    let actual = load_golden(tempdir.path()).unwrap();
-
-    diff_canonical(&expected, &actual, None).unwrap();
-}
-
-#[test]
-fn typescript_db_is_self_equivalent_to_typescript_golden() {
-    assert_equivalent(&typescript_db(), &typescript_golden_dir()).unwrap();
-}
-
-#[test]
-fn generated_golden_matches_committed_metal_fixture() {
-    // Guards Metal (#1121): `.metal`→cpp mapping + the `[[attribute]]` blank that
-    // prevents the spurious `VertexIn extends float4` inheritance edge.
-    let tempdir = TestDir::new("generated-golden-metal");
-    write_golden(&metal_db(), tempdir.path()).unwrap();
-
-    let expected = load_golden(&metal_golden_dir()).unwrap();
-    let actual = load_golden(tempdir.path()).unwrap();
-
-    diff_canonical(&expected, &actual, None).unwrap();
-}
-
-#[test]
-fn metal_db_is_self_equivalent_to_metal_golden() {
-    assert_equivalent(&metal_db(), &metal_golden_dir()).unwrap();
-}
-
-#[test]
-fn generated_golden_matches_committed_cuda_fixture() {
-    // Guards CUDA (#1172 CUDA-lang parts): `.cu`→cpp mapping, the `<<<…>>>`
-    // launch-config blank that preserves the host→kernel Calls edge (plain +
-    // templated), and macro-defined-kernel name recovery (`my_kernel`).
-    let tempdir = TestDir::new("generated-golden-cuda");
-    write_golden(&cuda_db(), tempdir.path()).unwrap();
-
-    let expected = load_golden(&cuda_golden_dir()).unwrap();
-    let actual = load_golden(tempdir.path()).unwrap();
-
-    diff_canonical(&expected, &actual, None).unwrap();
-}
-
-#[test]
-fn cuda_db_is_self_equivalent_to_cuda_golden() {
-    assert_equivalent(&cuda_db(), &cuda_golden_dir()).unwrap();
-}
-
-#[test]
-fn generated_golden_matches_committed_arkts_fixture() {
-    // Guards ArkTS extraction (upstream #1186, extraction slice only): the
-    // `.ets`->ArkTs mapping, `@Component struct`->NodeKind::Struct via the
-    // dedicated tree-sitter-arkts grammar, function/class/import/call extraction.
-    let tempdir = TestDir::new("generated-golden-arkts");
-    write_golden(&arkts_db(), tempdir.path()).unwrap();
-
-    let expected = load_golden(&arkts_golden_dir()).unwrap();
-    let actual = load_golden(tempdir.path()).unwrap();
-
-    diff_canonical(&expected, &actual, None).unwrap();
-}
-
-#[test]
-fn arkts_db_is_self_equivalent_to_arkts_golden() {
-    assert_equivalent(&arkts_db(), &arkts_golden_dir()).unwrap();
-}
-
-#[test]
-fn generated_golden_matches_committed_solidity_fixture() {
-    // Guards Solidity extraction (upstream #1170): the `.sol`->Solidity mapping,
-    // contract/library->Class + interface->Interface + struct->Struct +
-    // enum->Enum, synthetic constructor/fallback/receive method names,
-    // state-var/struct-member/event/error->Field, `is`-inheritance->Extends
-    // (resolver promotes to Implements), and emit/modifier-guard call edges.
-    let tempdir = TestDir::new("generated-golden-solidity");
-    write_golden(&solidity_db(), tempdir.path()).unwrap();
-
-    let expected = load_golden(&solidity_golden_dir()).unwrap();
-    let actual = load_golden(tempdir.path()).unwrap();
-
-    diff_canonical(&expected, &actual, None).unwrap();
-}
-
-#[test]
-fn solidity_db_is_self_equivalent_to_solidity_golden() {
-    assert_equivalent(&solidity_db(), &solidity_golden_dir()).unwrap();
-}
-
-#[test]
-fn generated_golden_matches_committed_nix_fixture() {
-    // Guards Nix extraction (upstream #1190, extraction slice only): the
-    // `.nix`->Nix mapping, `binding`->Function|Variable, curried lambda->Function
-    // with a formatted signature, `inherit`->Variable names, `import`/
-    // `callPackage`/`imports`-list literal paths->Import node + Imports ref, and
-    // `apply_expression`->Calls ref with curried-chain dedup. The module-system
-    // synthesizer / lexical-scope gates / callback synthesizer / import-resolver
-    // wiring are DEFERRED, so path refs stay unresolved.
-    let tempdir = TestDir::new("generated-golden-nix");
-    write_golden(&nix_db(), tempdir.path()).unwrap();
-
-    let expected = load_golden(&nix_golden_dir()).unwrap();
-    let actual = load_golden(tempdir.path()).unwrap();
-
-    diff_canonical(&expected, &actual, None).unwrap();
-}
-
-#[test]
-fn nix_db_is_self_equivalent_to_nix_golden() {
-    assert_equivalent(&nix_db(), &nix_golden_dir()).unwrap();
-}
-
-#[test]
-fn generated_golden_matches_committed_terraform_fixture() {
-    // Guards Terraform/HCL extraction (upstream #1173, extraction slice only):
-    // the `.tf`/`.tfvars`/`.tofu`->Terraform mapping, block-type dispatch
-    // (resource/data->Class, module->Module, variable/output->Variable,
-    // provider->Namespace, locals->Constant per attr) with qualified names, and
-    // plain attribute-expression traversal refs
-    // (var.X/local.X/module.M/data.T.N/<type>.<name>)->References with built-ins
-    // skipped. The module-boundary TerraformResolver, emitModuleWiring's
-    // :-scoped refs, and the .tfvars var ref are DEFERRED, so no :-scoped ref is
-    // emitted; the undeclared aws_kms_key.logs stays unresolved.
-    let tempdir = TestDir::new("generated-golden-terraform");
-    write_golden(&terraform_db(), tempdir.path()).unwrap();
-
-    let expected = load_golden(&terraform_golden_dir()).unwrap();
-    let actual = load_golden(tempdir.path()).unwrap();
-
-    diff_canonical(&expected, &actual, None).unwrap();
-}
-
-#[test]
-fn terraform_db_is_self_equivalent_to_terraform_golden() {
-    assert_equivalent(&terraform_db(), &terraform_golden_dir()).unwrap();
-}
-
-#[test]
-fn generated_golden_matches_committed_erlang_fixture() {
-    // Guards Erlang extraction (upstream #1165, extraction slice only): the
-    // `.erl`/`.hrl`->Erlang mapping, `-module`->Namespace (so functions qualify
-    // as `m::f`), clause-merge dedup (a 2-clause `f/1`->one Function),
-    // `record_decl`->Struct + Field children, `-define`->Constant,
-    // `type_alias`/`opaque`->TypeAlias, `-include`->Import + file edge, local
-    // `call`->Calls and remote `mod:f()`->Calls `mod::f`, `fun f/1` value and
-    // `#state{}` usage->References (not calls). The `-spec`/`-callback` and
-    // record-field type-position `call` nodes mint NO bogus type call refs. The
-    // `-behaviour`, gen_server, spawn/apply MFA, and `.app` resource-tuple
-    // bridges are DEFERRED, so `other::h` (other module absent) stays unresolved.
-    let tempdir = TestDir::new("generated-golden-erlang");
-    write_golden(&erlang_db(), tempdir.path()).unwrap();
-
-    let expected = load_golden(&erlang_golden_dir()).unwrap();
-    let actual = load_golden(tempdir.path()).unwrap();
-
-    diff_canonical(&expected, &actual, None).unwrap();
-}
-
-#[test]
-fn erlang_db_is_self_equivalent_to_erlang_golden() {
-    assert_equivalent(&erlang_db(), &erlang_golden_dir()).unwrap();
-}
-
-#[test]
-fn generated_golden_matches_committed_cfml_fixture() {
-    // Guards CFML extraction (upstream #1153, scope-B extraction slice): the
-    // `.cfc`/`.cfm`/`.cfs`->Cfml mapping, the dual-grammar dialect switch
-    // (`is_bare_script_cfml`: cfscript for bare-script, cfml tag grammar for
-    // tag files), a bare-script `component`->Class named from the FILE (unnamed
-    // in the grammar) + script-style `extends`->Extends, a tag
-    // `<cfcomponent>`->Class from `name` attr + `<cffunction>`->Method with
-    // access/returntype + tag `extends`->Extends. Both extends resolve to
-    // `Base.cfc`; `helper()` stays unresolved. The `<cfscript>`-in-tag delegation
-    // + cfquery SQL-body extraction + framework resolvers are DEFERRED.
-    let tempdir = TestDir::new("generated-golden-cfml");
-    write_golden(&cfml_db(), tempdir.path()).unwrap();
-
-    let expected = load_golden(&cfml_golden_dir()).unwrap();
-    let actual = load_golden(tempdir.path()).unwrap();
-
-    diff_canonical(&expected, &actual, None).unwrap();
-}
-
-#[test]
-fn cfml_db_is_self_equivalent_to_cfml_golden() {
-    assert_equivalent(&cfml_db(), &cfml_golden_dir()).unwrap();
+fn every_committed_golden_corpus_has_its_test_pair() {
+    let mut found: Vec<String> = std::fs::read_dir(workspace_root().join("reference/golden"))
+        .unwrap()
+        .filter_map(|entry| {
+            let entry = entry.unwrap();
+            entry
+                .path()
+                .join("colby.db")
+                .is_file()
+                .then(|| entry.file_name().into_string().unwrap())
+        })
+        .collect();
+    found.sort();
+    let mut listed: Vec<String> = GOLDEN_CORPORA.iter().map(|c| (*c).to_string()).collect();
+    listed.sort();
+    assert_eq!(
+        found, listed,
+        "every reference/golden/<corpus>/colby.db must be listed in golden_corpora!"
+    );
 }
 
 #[test]
@@ -467,7 +161,6 @@ fn tier2_edges_are_order_independent_but_counted() {
             .any(|entry| entry.tier == Tier::Tier2 && entry.surface == "edges")
     );
 }
-
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -476,164 +169,23 @@ fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
+fn corpus_db(corpus: &str) -> PathBuf {
+    workspace_root()
+        .join("reference/golden")
+        .join(corpus)
+        .join("colby.db")
+}
+
+fn corpus_golden_dir(corpus: &str) -> PathBuf {
+    workspace_root().join("reference/golden").join(corpus)
+}
+
 fn mini_db() -> PathBuf {
-    workspace_root().join("reference/golden/mini/colby.db")
+    corpus_db("mini")
 }
 
 fn mini_golden_dir() -> PathBuf {
-    workspace_root().join("reference/golden/mini")
-}
-
-fn godot_db() -> PathBuf {
-    workspace_root().join("reference/golden/godot/colby.db")
-}
-
-fn godot_golden_dir() -> PathBuf {
-    workspace_root().join("reference/golden/godot")
-}
-
-fn ruby_db() -> PathBuf {
-    workspace_root().join("reference/golden/ruby/colby.db")
-}
-
-fn ruby_golden_dir() -> PathBuf {
-    workspace_root().join("reference/golden/ruby")
-}
-
-fn cpp_db() -> PathBuf {
-    workspace_root().join("reference/golden/cpp/colby.db")
-}
-
-fn cpp_golden_dir() -> PathBuf {
-    workspace_root().join("reference/golden/cpp")
-}
-
-fn rust_db() -> PathBuf {
-    workspace_root().join("reference/golden/rust/colby.db")
-}
-
-fn rust_golden_dir() -> PathBuf {
-    workspace_root().join("reference/golden/rust")
-}
-
-fn lua_db() -> PathBuf {
-    workspace_root().join("reference/golden/lua/colby.db")
-}
-
-fn lua_golden_dir() -> PathBuf {
-    workspace_root().join("reference/golden/lua")
-}
-
-fn go_db() -> PathBuf {
-    workspace_root().join("reference/golden/go/colby.db")
-}
-
-fn go_golden_dir() -> PathBuf {
-    workspace_root().join("reference/golden/go")
-}
-
-fn python_db() -> PathBuf {
-    workspace_root().join("reference/golden/python/colby.db")
-}
-
-fn python_golden_dir() -> PathBuf {
-    workspace_root().join("reference/golden/python")
-}
-
-fn kotlin_db() -> PathBuf {
-    workspace_root().join("reference/golden/kotlin/colby.db")
-}
-
-fn kotlin_golden_dir() -> PathBuf {
-    workspace_root().join("reference/golden/kotlin")
-}
-
-fn scala_db() -> PathBuf {
-    workspace_root().join("reference/golden/scala/colby.db")
-}
-
-fn scala_golden_dir() -> PathBuf {
-    workspace_root().join("reference/golden/scala")
-}
-
-fn dart_db() -> PathBuf {
-    workspace_root().join("reference/golden/dart/colby.db")
-}
-
-fn dart_golden_dir() -> PathBuf {
-    workspace_root().join("reference/golden/dart")
-}
-
-fn typescript_db() -> PathBuf {
-    workspace_root().join("reference/golden/typescript/colby.db")
-}
-
-fn typescript_golden_dir() -> PathBuf {
-    workspace_root().join("reference/golden/typescript")
-}
-
-fn metal_db() -> PathBuf {
-    workspace_root().join("reference/golden/metal/colby.db")
-}
-
-fn metal_golden_dir() -> PathBuf {
-    workspace_root().join("reference/golden/metal")
-}
-
-fn cuda_db() -> PathBuf {
-    workspace_root().join("reference/golden/cuda/colby.db")
-}
-
-fn cuda_golden_dir() -> PathBuf {
-    workspace_root().join("reference/golden/cuda")
-}
-
-fn arkts_db() -> PathBuf {
-    workspace_root().join("reference/golden/arkts/colby.db")
-}
-
-fn arkts_golden_dir() -> PathBuf {
-    workspace_root().join("reference/golden/arkts")
-}
-
-fn solidity_db() -> PathBuf {
-    workspace_root().join("reference/golden/solidity/colby.db")
-}
-
-fn solidity_golden_dir() -> PathBuf {
-    workspace_root().join("reference/golden/solidity")
-}
-
-fn nix_db() -> PathBuf {
-    workspace_root().join("reference/golden/nix/colby.db")
-}
-
-fn nix_golden_dir() -> PathBuf {
-    workspace_root().join("reference/golden/nix")
-}
-
-fn terraform_db() -> PathBuf {
-    workspace_root().join("reference/golden/terraform/colby.db")
-}
-
-fn terraform_golden_dir() -> PathBuf {
-    workspace_root().join("reference/golden/terraform")
-}
-
-fn erlang_db() -> PathBuf {
-    workspace_root().join("reference/golden/erlang/colby.db")
-}
-
-fn erlang_golden_dir() -> PathBuf {
-    workspace_root().join("reference/golden/erlang")
-}
-
-fn cfml_db() -> PathBuf {
-    workspace_root().join("reference/golden/cfml/colby.db")
-}
-
-fn cfml_golden_dir() -> PathBuf {
-    workspace_root().join("reference/golden/cfml")
+    corpus_golden_dir("mini")
 }
 
 struct TestDir {

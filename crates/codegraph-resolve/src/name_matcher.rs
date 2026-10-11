@@ -1423,6 +1423,12 @@ pub fn match_by_exact_name(
             .any(|n| crate::c_macro_visibility::is_define_constant(n));
     let reachable: Vec<Arc<Node>> = apply_language_gate(same_name, reference)
         .into_iter()
+        // An `import` node is a statement, not a definition: a reference never
+        // binds one by name, its own or another file's, and an import named
+        // like a definition never makes that definition look ambiguous
+        // (upstream #965, `0a91d0f5`). Linking an import to what it names is
+        // the import resolver's job.
+        .filter(|n| n.kind != NodeKind::Import)
         .filter(|n| !macro_call || matches!(n.kind, NodeKind::Function | NodeKind::Method))
         // Nested locals are only reachable from inside their container (#1230).
         .filter(|n| is_lexically_reachable(n, reference, context))
@@ -11029,5 +11035,78 @@ mod tests {
             .file("main.go", "\trun()\n")
             .name("run", vec![method]);
         assert!(match_by_exact_name(&bare, &only_method).is_none());
+    }
+
+    // ================= import statements are never name-match targets ========
+
+    /// Upstream #965 (`0a91d0f5`): an `import` node is a statement, not a
+    /// definition. Neither another file's import of the same module nor the
+    /// file's own is a candidate, so the reference stays unresolved.
+    #[test]
+    fn exact_match_never_offers_an_import_statement() {
+        let theirs = mk(
+            "import:widget-vue",
+            NodeKind::Import,
+            "vue",
+            "vue",
+            "src/Widget.svelte",
+            Language::Svelte,
+        );
+        let ours = mk(
+            "import:app-vue",
+            NodeKind::Import,
+            "vue",
+            "vue",
+            "src/App.vue",
+            Language::Vue,
+        );
+        let ctx = Ctx::default().name("vue", vec![theirs, ours]);
+        let reference = refv("vue", EdgeKind::Imports, "src/App.vue", Language::Vue, 6);
+        assert_eq!(match_by_exact_name(&reference, &ctx), None);
+    }
+
+    /// An import statement named like a definition does not make the
+    /// definition look ambiguous: the lone definition takes the single-match
+    /// confidence, not a proximity-ranked one.
+    #[test]
+    fn an_import_statement_never_makes_a_definition_ambiguous() {
+        let definition = mk(
+            "method:json",
+            NodeKind::Method,
+            "json",
+            "Response::json",
+            "lib/response.rb",
+            Language::Ruby,
+        );
+        let statement = mk(
+            "import:json",
+            NodeKind::Import,
+            "json",
+            "json",
+            "app/main.rb",
+            Language::Ruby,
+        );
+        let ctx = Ctx::default().name("json", vec![statement, definition]);
+        let reference = refv("json", EdgeKind::Calls, "app/main.rb", Language::Ruby, 4);
+        let resolved = match_by_exact_name(&reference, &ctx).expect("the definition resolves");
+        assert_eq!(resolved.target_node_id, "method:json");
+        assert_eq!(resolved.confidence, 0.9);
+    }
+
+    /// The fuzzy fallback considers callables only, so an import statement is
+    /// never its guess either.
+    #[test]
+    fn fuzzy_match_never_offers_an_import_statement() {
+        let statement = mk(
+            "import:vue",
+            NodeKind::Import,
+            "Vue",
+            "Vue",
+            "src/Widget.svelte",
+            Language::Svelte,
+        );
+        let ctx = Ctx::default().lower("vue", vec![statement]);
+        let reference = refv("vue", EdgeKind::Calls, "src/App.vue", Language::Vue, 6);
+        assert_eq!(match_fuzzy(&reference, &ctx), None);
     }
 }

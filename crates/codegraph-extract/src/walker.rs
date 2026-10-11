@@ -95,10 +95,63 @@ fn is_literal_receiver(node: SyntaxNode<'_>) -> bool {
     LITERAL_RECEIVER_KINDS.contains(&node.kind())
 }
 
+/// G4 (upstream `STATIC_MEMBER_LANGS`) — the languages whose static-member
+/// and enum-value reads (`Enum.value`, `Type.CONST`, `Foo::BAR`) reference the
+/// type they read through. VB.NET's reads are its own (W8).
+fn has_static_member_reads(language: Language) -> bool {
+    matches!(
+        language,
+        Language::Java
+            | Language::CSharp
+            | Language::Kotlin
+            | Language::Swift
+            | Language::Scala
+            | Language::Dart
+            | Language::Php
+            | Language::Cpp
+            | Language::Rust
+    )
+}
+
+/// The member-access kinds a static-member read is written as (upstream
+/// `MEMBER_ACCESS_TYPES`): Java `field_access`, C# `member_access_expression`,
+/// Kotlin/Swift `navigation_expression`, Scala `field_expression`, PHP
+/// `class_constant_access_expression` / `scoped_property_access_expression`,
+/// C++ `qualified_identifier`. Dart and Rust have paths of their own.
+const MEMBER_ACCESS_KINDS: [&str; 7] = [
+    "field_access",
+    "member_access_expression",
+    "navigation_expression",
+    "field_expression",
+    "class_constant_access_expression",
+    "scoped_property_access_expression",
+    "qualified_identifier",
+];
+
+/// Parents of a Rust `scoped_identifier` that is not a member written as a
+/// value or a pattern: the prefix of a longer path, or a `use` tree.
+const RUST_NON_MEMBER_PATH_PARENTS: [&str; 7] = [
+    "scoped_identifier",
+    "scoped_type_identifier",
+    "use_declaration",
+    "use_list",
+    "scoped_use_list",
+    "use_as_clause",
+    "use_wildcard",
+];
+
+/// A single capitalized name: what a type is written as.
+fn is_capitalized_name(text: &str) -> bool {
+    let mut chars = text.chars();
+    chars.next().is_some_and(|c| c.is_ascii_uppercase())
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
 /// Call-node kinds whose `function` child names a member on a receiver — the
 /// `obj.method` family across the grammars (`member_expression` for TS/JS/ArkTS,
 /// `attribute` for Python, `field_expression` for Go/Rust/C/C++,
-/// `navigation_expression` for Swift/Kotlin, plus C++ `qualified_identifier`).
+/// `navigation_expression` for Swift/Kotlin, plus C++ `qualified_identifier`
+/// as a receiver, `ns::obj.m()`; a qualified C++ callee keeps its scope, G13).
 const MEMBER_SHAPED_CALLEE_KINDS: [&str; 6] = [
     "member_expression",
     "attribute",
@@ -230,6 +283,17 @@ fn ts_js_chain_root(node: SyntaxNode<'_>) -> Option<SyntaxNode<'_>> {
     current
 }
 
+/// Node kinds that construct an object, each yielding an `instantiates`
+/// reference to the constructed type (upstream `INSTANTIATION_KINDS`).
+const INSTANTIATION_KINDS: [&str; 6] = [
+    "new_expression",               // TypeScript, JavaScript
+    "object_creation_expression",   // Java, C#, PHP
+    "instance_creation_expression", // some grammars
+    "composite_literal",            // Go `Widget{...}`, `pkga.Widget{...}`
+    "struct_expression",            // Rust `Widget { n: 1 }`, `m::Widget { .. }`
+    "instance_expression",          // Scala `new Monoid[Int] { ... }`
+];
+
 /// Whether a TS/JS receiver still collapses to the bare method name: `this` /
 /// `super` (resolution reads the owner off the enclosing class), a member
 /// chain rooted at either or at `window` (the project-global escape of
@@ -323,6 +387,9 @@ pub struct TreeSitterWalker<'a, 'tree> {
     /// Same-line, same-name declarations keep distinct identities (#1349).
     node_ids: NodeIdAllocator,
     fn_ref_candidates: Vec<(crate::function_ref::FnRefCandidate, String)>,
+    /// Same-file value references (#895, #897): targets and readers recorded
+    /// as nodes are created, turned into edges once the walk is done.
+    value_refs: crate::value_refs::ValueRefs<'tree>,
     /// C++ enclosing `namespace ns { … }` names, prefixed onto contained
     /// symbols' `qualified_name`. Prefix-only (no namespace node) to avoid the
     /// #1093 crowd-out; empty outside C++.
@@ -378,6 +445,7 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             node_stack: Vec::new(),
             node_ids: NodeIdAllocator::default(),
             fn_ref_candidates: Vec::new(),
+            value_refs: crate::value_refs::ValueRefs::default(),
             namespace_prefix: Vec::new(),
             erlang_last_fn_name: None,
             erlang_last_fn_arity: None,
@@ -413,6 +481,13 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
         }
 
         self.flush_fn_ref_candidates();
+        let value_refs = std::mem::take(&mut self.value_refs);
+        self.edges.extend(value_refs.into_edges(
+            self.spec.language(),
+            self.file_path,
+            self.root,
+            self.source,
+        ));
 
         ExtractionResult {
             nodes: self.nodes,
@@ -514,7 +589,7 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             self.extract_type_alias(node);
             skip_children = true;
         } else if has_type(self.spec.variable_types(), node_type)
-            && !self.is_inside_class_like_node()
+            && (!self.is_inside_class_like_node() || self.is_type_scope_constant(node))
         {
             self.maybe_cpp_construction(node);
             self.extract_variable(node);
@@ -529,6 +604,7 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             && node_type == "property_declaration"
             && self.is_inside_class_like_node()
         {
+            self.walk_swift_attribute_arguments(node);
             if let Some(computed) = swift_computed_property_body(node) {
                 // A computed property is its own node; its getter is consumed by
                 // the function-body walk, so skip the generic child descent that
@@ -536,10 +612,29 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
                 self.extract_swift_computed_property(node, computed);
                 skip_children = true;
             } else if let Some(owner_id) = self.node_stack.last().cloned() {
-                // tree-sitter.ts:453-487 — Swift stored properties inside a type
-                // are not their own nodes; their property-wrapper attributes and
-                // declared type attach to the enclosing type. Children stay
-                // visited so initializer calls are captured.
+                // #897 — a stored property inside a type is a node: a `static
+                // let`/`static var` a shared constant/variable, an instance one
+                // a field. Its property-wrapper attributes and declared type
+                // attach to the enclosing type (tree-sitter.ts:453-487), and
+                // children stay visited so initializer calls are captured.
+                if let Some((name, is_let)) = swift_stored_property(node, self.source) {
+                    let is_static = self.spec.is_static(node, self.source);
+                    let kind = match (is_static, is_let) {
+                        (true, true) => NodeKind::Constant,
+                        (true, false) => NodeKind::Variable,
+                        (false, _) => NodeKind::Field,
+                    };
+                    self.create_node(
+                        kind,
+                        &name,
+                        node,
+                        NodeExtra {
+                            visibility: self.spec.get_visibility(node),
+                            is_static,
+                            ..NodeExtra::default()
+                        },
+                    );
+                }
                 self.extract_decorators_for(node, &owner_id);
                 self.extract_variable_type_annotation(node, &owner_id);
             }
@@ -563,8 +658,8 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             if let Some(caller_id) = self.node_stack.last().cloned() {
                 self.push_ref(&caller_id, &callee_name, EdgeKind::Calls, node);
             }
-        } else if node_type == "new_expression" {
-            self.extract_instantiation(node);
+        } else if INSTANTIATION_KINDS.contains(&node_type) {
+            skip_children = self.extract_construction(node);
         } else if (node_type == "property_signature" || node_type == "method_signature")
             && self.is_inside_class_like_node()
         {
@@ -589,6 +684,8 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
     fn visit_language_specific(&mut self, node: SyntaxNode<'tree>) -> bool {
         match self.spec.language() {
             Language::Scala => self.visit_scala_node(node),
+            Language::Kotlin => self.visit_kotlin_node(node),
+            Language::Dart => self.visit_dart_node(node),
             Language::Lua | Language::Luau => self.visit_lua_node(node),
             Language::ObjC => self.visit_objc_node(node),
             Language::Ruby => self.visit_ruby_node(node),
@@ -1616,7 +1713,22 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             }
             return;
         }
-        self.push_ref(&parent_id, &method_name, EdgeKind::Calls, node);
+        // G11 (upstream #2147's extraction half): the receiver stays with the
+        // method, `message.upcase`, so resolution can read what it is; `self`
+        // and `super` leave the bare name, which resolves in the class.
+        let receiver_name = node_text(receiver, self.source);
+        let skip = matches!(receiver_name.as_str(), "self" | "super");
+        let callee = if skip {
+            method_name
+        } else {
+            format!("{receiver_name}.{method_name}")
+        };
+        self.push_ref(&parent_id, &callee, EdgeKind::Calls, node);
+        // A constant receiver (`Formatter.shout`, a class or module method) is
+        // itself a dependency on that constant.
+        if !skip && receiver.kind() == "constant" {
+            self.push_ref(&parent_id, &receiver_name, EdgeKind::References, receiver);
+        }
     }
 
     fn visit_ruby_call_arguments(&mut self, node: SyntaxNode<'tree>) {
@@ -1646,7 +1758,9 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             }
             return true;
         }
-        if node.kind() == "const_declaration" && self.is_inside_class_like_node() {
+        // A `const` at file scope or in a class is a constant (upstream
+        // php.ts visitNode).
+        if node.kind() == "const_declaration" {
             for elem in node
                 .named_children(&mut node.walk())
                 .filter(|child| child.kind() == "const_element")
@@ -2128,8 +2242,12 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
                     return false;
                 };
                 let name = node_text(name_node, self.source);
-                let in_class = self.is_inside_class_like_node();
-                let kind = if in_class {
+                // #897 — an `object` is a singleton: its `val`s are shared
+                // constants, like a top-level `val`. A `class`, `trait`, `enum`
+                // or `given` value is per-instance state, a field. Both an
+                // object and a class are class-kind nodes, so the enclosing
+                // definition's syntax decides.
+                let kind = if scala_instance_scope(node) {
                     NodeKind::Field
                 } else if node.kind() == "val_definition" {
                     NodeKind::Constant
@@ -2369,6 +2487,16 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
         }
 
         self.nodes.push(new_node.clone());
+        if crate::value_refs::has_value_refs(self.spec.language()) {
+            self.value_refs.capture(
+                self.spec.language(),
+                kind,
+                name,
+                &id,
+                node,
+                self.node_stack.last().map(String::as_str),
+            );
+        }
 
         if let Some(parent_id) = self.node_stack.last() {
             self.edges.push(Edge {
@@ -3050,6 +3178,29 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             }
             return;
         }
+        match self.spec.language() {
+            Language::Rust => {
+                self.extract_rust_value_item(node);
+                return;
+            }
+            Language::Ruby => {
+                self.extract_ruby_constant(node);
+                return;
+            }
+            Language::C => {
+                self.extract_c_globals(node);
+                return;
+            }
+            Language::Pascal => {
+                self.extract_pascal_constant(node);
+                return;
+            }
+            Language::Swift => {
+                self.extract_swift_global(node);
+                return;
+            }
+            _ => {}
+        }
         if !matches!(
             self.spec.language(),
             Language::TypeScript | Language::Tsx | Language::JavaScript | Language::Jsx
@@ -3237,6 +3388,230 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
         }
         self.node_stack.pop();
         extracted
+    }
+
+    /// A constant written in a type's scope that is a value of its own
+    /// (#897): a Ruby `CONST = …` in a class or module body, and a Pascal
+    /// class `const`.
+    fn is_type_scope_constant(&self, node: SyntaxNode<'tree>) -> bool {
+        match self.spec.language() {
+            Language::Ruby => is_ruby_constant_assignment(node),
+            Language::Pascal => node.kind() == "declConst",
+            _ => false,
+        }
+    }
+
+    /// Rust `const X: T = …` and `static X: T = …` (upstream's generic
+    /// variable path, which names them `variable`).
+    fn extract_rust_value_item(&mut self, node: SyntaxNode<'tree>) {
+        if !matches!(node.kind(), "const_item" | "static_item") {
+            return;
+        }
+        let Some(name_node) = child_by_field(node, "name") else {
+            return;
+        };
+        self.create_node(
+            NodeKind::Variable,
+            &node_text(name_node, self.source),
+            node,
+            NodeExtra {
+                docstring: self.docstring_for(node),
+                signature: value_signature(child_by_field(node, "value"), self.source),
+                is_exported: self.spec.is_exported(node, self.source),
+                ..NodeExtra::default()
+            },
+        );
+    }
+
+    /// #897 — a Ruby constant assignment (`MAX = 3`), at the top level or in a
+    /// class or module; its left side is a `constant`.
+    fn extract_ruby_constant(&mut self, node: SyntaxNode<'tree>) {
+        if !is_ruby_constant_assignment(node) {
+            return;
+        }
+        let Some(left) = child_by_field(node, "left").or_else(|| node.named_child(0)) else {
+            return;
+        };
+        self.create_node(
+            NodeKind::Variable,
+            &node_text(left, self.source),
+            node,
+            NodeExtra {
+                docstring: self.docstring_for(node),
+                signature: value_signature(
+                    child_by_field(node, "right").or_else(|| node.named_child(1)),
+                    self.source,
+                ),
+                ..NodeExtra::default()
+            },
+        );
+    }
+
+    /// #897 — C file-scope values: each declarator of a `declaration` that is
+    /// initialized, a pointer or an array; `const` makes it a constant. A bare
+    /// identifier declarator is skipped: a prototype led by an unknown macro
+    /// (`CURL_EXTERN CURLcode f(int);`) misparses as one named by its return
+    /// type. A function declarator is a prototype.
+    fn extract_c_globals(&mut self, node: SyntaxNode<'tree>) {
+        if node.kind() != "declaration" || has_c_function_ancestor(node) {
+            return;
+        }
+        let is_const = node.named_children(&mut node.walk()).any(|child| {
+            child.kind() == "type_qualifier" && node_text(child, self.source) == "const"
+        });
+        let kind = if is_const {
+            NodeKind::Constant
+        } else {
+            NodeKind::Variable
+        };
+        let docstring = self.docstring_for(node);
+        let is_exported = self.spec.is_exported(node, self.source);
+        for child in node.named_children(&mut node.walk()) {
+            if !matches!(
+                child.kind(),
+                "init_declarator" | "pointer_declarator" | "array_declarator"
+            ) {
+                continue;
+            }
+            let Some(name_node) = crate::lang::c_declarator_identifier(Some(child)) else {
+                continue;
+            };
+            let value = (child.kind() == "init_declarator")
+                .then(|| child_by_field(child, "value"))
+                .flatten();
+            self.create_node(
+                kind,
+                &node_text(name_node, self.source),
+                child,
+                NodeExtra {
+                    docstring: docstring.clone(),
+                    signature: value_signature(value, self.source),
+                    is_exported,
+                    ..NodeExtra::default()
+                },
+            );
+        }
+    }
+
+    /// #897 — a Swift top-level stored property: `let` a constant, `var` a
+    /// variable. A computed one is none.
+    fn extract_swift_global(&mut self, node: SyntaxNode<'tree>) {
+        if node.kind() != "property_declaration" {
+            return;
+        }
+        let Some((name, is_let)) = swift_stored_property(node, self.source) else {
+            return;
+        };
+        let kind = if is_let {
+            NodeKind::Constant
+        } else {
+            NodeKind::Variable
+        };
+        self.create_node(
+            kind,
+            &name,
+            node,
+            NodeExtra {
+                docstring: self.docstring_for(node),
+                is_exported: self.spec.is_exported(node, self.source),
+                ..NodeExtra::default()
+            },
+        );
+    }
+
+    /// #897 — a Kotlin property is a node by where it is declared: at the top
+    /// level or in an `object` / companion object a shared value (`val` a
+    /// constant, `var` a variable), in a class a field. A local is none and
+    /// stays the default path's. The property's subtree is not walked, as
+    /// before.
+    fn visit_kotlin_node(&mut self, node: SyntaxNode<'tree>) -> bool {
+        if node.kind() != "property_declaration" {
+            return false;
+        }
+        let Some(name_node) = node
+            .named_children(&mut node.walk())
+            .find(|child| child.kind() == "variable_declaration")
+            .and_then(|declaration| {
+                declaration
+                    .named_children(&mut declaration.walk())
+                    .find(|child| child.kind() == "identifier")
+            })
+        else {
+            return false;
+        };
+        let Some(scope) = kotlin_property_scope(node) else {
+            return false;
+        };
+        let is_val = node
+            .children(&mut node.walk())
+            .any(|child| child.kind() == "val");
+        let kind = match (scope, is_val) {
+            (KotlinPropertyScope::Instance, _) => NodeKind::Field,
+            (KotlinPropertyScope::Shared, true) => NodeKind::Constant,
+            (KotlinPropertyScope::Shared, false) => NodeKind::Variable,
+        };
+        self.create_node(
+            kind,
+            &node_text(name_node, self.source),
+            node,
+            NodeExtra {
+                docstring: self.docstring_for(node),
+                visibility: self.spec.get_visibility(node),
+                ..NodeExtra::default()
+            },
+        );
+        true
+    }
+
+    /// #897 — a Dart `static_final_declaration` is exactly a top-level or class
+    /// `static` `const`/`final`, the shared constant; an instance field or a
+    /// local is another node kind. Its children stay visited, as before.
+    fn visit_dart_node(&mut self, node: SyntaxNode<'tree>) -> bool {
+        if node.kind() == "static_final_declaration"
+            && let Some(name_node) = child_by_field(node, "name")
+        {
+            self.create_node(
+                NodeKind::Constant,
+                &node_text(name_node, self.source),
+                node,
+                NodeExtra {
+                    signature: value_signature(child_by_field(node, "value"), self.source),
+                    ..NodeExtra::default()
+                },
+            );
+        }
+        false
+    }
+
+    /// A Pascal unit or class `const` (upstream `extractPascalConst`). A
+    /// routine's own `const` section is local to it.
+    fn extract_pascal_constant(&mut self, node: SyntaxNode<'tree>) {
+        if node.kind() != "declConst" {
+            return;
+        }
+        let mut ancestor = node.parent();
+        while let Some(current) = ancestor {
+            if current.kind() == "defProc" {
+                return;
+            }
+            ancestor = current.parent();
+        }
+        let Some(name_node) = child_by_field(node, "name") else {
+            return;
+        };
+        let signature = node
+            .named_children(&mut node.walk())
+            .find(|child| child.kind() == "defaultValue")
+            .map(|value| node_text(value, self.source));
+        self.create_node(
+            NodeKind::Constant,
+            &node_text(name_node, self.source),
+            node,
+            NodeExtra {
+                signature,
+                ..NodeExtra::default()
+            },
+        );
     }
 
     fn extract_python_assignment(&mut self, node: SyntaxNode<'tree>) {
@@ -3592,6 +3967,15 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             return;
         }
 
+        // #897 — a Java `static final` or C# `const` / `static readonly` field
+        // is a constant (OD-5: it was a field).
+        let kind = if matches!(self.spec.language(), Language::Java | Language::CSharp)
+            && self.spec.is_const(node)
+        {
+            NodeKind::Constant
+        } else {
+            NodeKind::Field
+        };
         for declarator in declarators {
             let Some(name_node) = child_by_field(declarator, "name").or_else(|| {
                 declarator
@@ -3603,7 +3987,7 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             let name = node_text(name_node, self.source);
             let signature = property_or_field_signature(node, &name, self.source);
             if let Some(field_node) = self.create_node(
-                NodeKind::Field,
+                kind,
                 &name,
                 declarator,
                 NodeExtra {
@@ -3831,6 +4215,10 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
                 }
             }
         }
+        if node.kind() == "message_expression" {
+            self.extract_objc_message(node, &caller_id);
+            return;
+        }
         if self.spec.language() == Language::Cpp {
             match crate::lang::recover_explicit_operator_call(node, self.source) {
                 Some(crate::lang::ExplicitOperatorCall::Callee(callee)) => {
@@ -3843,8 +4231,24 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
         }
         let mut callee_name = String::new();
         let func = child_by_field(node, "function").or_else(|| node.named_child(0));
+        // #2375 — a Dart generic call `ref.read<Repo>(p)` wraps its callee in
+        // an `instantiation_expression`; the type arguments are no part of
+        // the name it calls.
+        let func = func.map(|func| {
+            if self.spec.language() == Language::Dart && func.kind() == "instantiation_expression" {
+                child_by_field(func, "function").unwrap_or(func)
+            } else {
+                func
+            }
+        });
         if let Some(func) = func {
-            if is_member_shaped_callee(func) {
+            // G13 — a C++ call keeps the scope it is written with: `ns::f()`
+            // calls `ns::f`, `Base::m()` calls `Base::m`, and `::f()`, from
+            // the global scope, `::f`. The qualified-name matcher binds it;
+            // template arguments are stripped below.
+            let cpp_scoped =
+                self.spec.language() == Language::Cpp && func.kind() == "qualified_identifier";
+            if is_member_shaped_callee(func) && !cpp_scoped {
                 if let Some(property) = member_name_of(func) {
                     let method_name = node_text(property, self.source);
                     let ts_js = is_ts_js_chain_language(self.spec.language());
@@ -4182,28 +4586,173 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
         self.push_ref(caller_id, &callee, EdgeKind::Calls, node);
     }
 
+    /// An Objective-C message send (upstream's `message_expression` arm): a
+    /// call named by its full selector, each keyword taking a `:` when the
+    /// message has arguments (`[c storeImage:k forKey:key]` is
+    /// `storeImage:forKey:`). A `self`/`super` receiver leaves the bare
+    /// selector; any other receiver is written before it (`cache.reset`), and
+    /// a class receiver is also a reference to the class. A unary message to a
+    /// class factory's result keeps the chain, `Factory.create().doIt`, so
+    /// resolution can read the factory's return type.
+    fn extract_objc_message(&mut self, node: SyntaxNode<'tree>, caller_id: &str) {
+        let Some(selector) = self.objc_selector(node) else {
+            return;
+        };
+        let receiver = child_by_field(node, "receiver");
+        let callee = match receiver {
+            Some(receiver) if receiver.kind() != "message_expression" => {
+                let receiver_name = node_text(receiver, self.source);
+                if receiver_name.is_empty() || matches!(receiver_name.as_str(), "self" | "super") {
+                    selector
+                } else {
+                    if is_objc_class_name(&receiver_name) {
+                        self.push_ref(caller_id, &receiver_name, EdgeKind::References, receiver);
+                    }
+                    format!("{receiver_name}.{selector}")
+                }
+            }
+            Some(receiver) if is_word(&selector) => {
+                let inner_receiver = child_by_field(receiver, "receiver");
+                let inner_name = inner_receiver.map(|r| node_text(r, self.source));
+                match (inner_receiver, inner_name, self.objc_selector(receiver)) {
+                    (Some(inner), Some(name), Some(inner_selector))
+                        if inner.kind() == "identifier"
+                            && name.starts_with(|c: char| c.is_ascii_uppercase()) =>
+                    {
+                        format!("{name}.{inner_selector}().{selector}")
+                    }
+                    _ => selector,
+                }
+            }
+            _ => selector,
+        };
+        self.push_ref(caller_id, &callee, EdgeKind::Calls, node);
+    }
+
+    /// The selector a message sends: its `method` keywords, each followed by
+    /// `:` when the message carries arguments.
+    fn objc_selector(&self, node: SyntaxNode<'tree>) -> Option<String> {
+        let keywords: Vec<String> = node
+            .children_by_field_name("method", &mut node.walk())
+            .map(|keyword| node_text(keyword, self.source))
+            .collect();
+        let first = keywords.first()?.clone();
+        let has_colon = node
+            .children(&mut node.walk())
+            .any(|child| child.kind() == ":");
+        Some(if has_colon {
+            keywords.iter().map(|k| format!("{k}:")).collect()
+        } else {
+            first
+        })
+    }
+
+    /// An object construction: its `instantiates` reference and, for a Java
+    /// `new T(...) { ... }`, the anonymous class. Returns whether the node's
+    /// children were walked here, which an anonymous class requires.
+    fn extract_construction(&mut self, node: SyntaxNode<'tree>) -> bool {
+        self.extract_instantiation(node);
+        let Some(body) = self.anonymous_class_body(node) else {
+            return false;
+        };
+        // The arguments belong to the enclosing scope, the body to the class.
+        for child in node.named_children(&mut node.walk()) {
+            if child.id() != body.id() {
+                self.visit_node(child);
+            }
+        }
+        self.extract_anonymous_class(node, body);
+        true
+    }
+
+    /// The node naming the type an object construction builds, in the field
+    /// or position each grammar puts it.
+    fn constructed_type(node: SyntaxNode<'tree>) -> Option<SyntaxNode<'tree>> {
+        child_by_field(node, "constructor")
+            .or_else(|| child_by_field(node, "type"))
+            .or_else(|| child_by_field(node, "name"))
+            .or_else(|| node.named_child(0))
+    }
+
+    /// The name an object construction's type is bound by, or `None` when it
+    /// names no type: generic arguments go, and of a qualified name only the
+    /// last segment stays, except that Go keeps its package qualifier for the
+    /// cross-package resolver and constructs a named type only (never a slice,
+    /// map or array literal).
+    fn constructed_type_name(&self, node: SyntaxNode<'tree>) -> Option<String> {
+        let ctor = Self::constructed_type(node)?;
+        let name = match node.kind() {
+            "composite_literal" => {
+                let ctor = if ctor.kind() == "generic_type" {
+                    child_by_field(ctor, "type")?
+                } else {
+                    ctor
+                };
+                if !matches!(ctor.kind(), "type_identifier" | "qualified_type") {
+                    return None;
+                }
+                node_text(ctor, self.source)
+            }
+            "instance_expression" => crate::lang::scala_base_type_name(ctor, self.source)?,
+            _ => {
+                let mut name = node_text(ctor, self.source);
+                if let Some(idx) = name.find('<') {
+                    name.truncate(idx);
+                }
+                // PHP writes a qualified class name with `\`.
+                let separators: &[char] = if self.spec.language() == Language::Php {
+                    &['.', ':', '\\']
+                } else {
+                    &['.', ':']
+                };
+                if let Some(idx) = name.rfind(separators) {
+                    name = name[idx + 1..].trim_start_matches(separators).to_string();
+                }
+                name
+            }
+        };
+        let name = name.trim();
+        (!name.is_empty()).then(|| name.to_string())
+    }
+
     fn extract_instantiation(&mut self, node: SyntaxNode<'tree>) {
         let Some(from_id) = self.node_stack.last().cloned() else {
             return;
         };
-        let ctor = child_by_field(node, "constructor")
-            .or_else(|| child_by_field(node, "type"))
-            .or_else(|| child_by_field(node, "name"))
-            .or_else(|| node.named_child(0));
-        let Some(ctor) = ctor else { return };
-        let mut class_name = node_text(ctor, self.source);
-        if let Some(idx) = class_name.find('<') {
-            class_name.truncate(idx);
-        }
-        if let Some(idx) = class_name.rfind(['.', ':']) {
-            class_name = class_name[idx + 1..]
-                .trim_start_matches([':', '.'])
-                .to_string();
-        }
-        class_name = class_name.trim().to_string();
-        if !class_name.is_empty() {
+        if let Some(class_name) = self.constructed_type_name(node) {
             self.push_ref(&from_id, &class_name, EdgeKind::Instantiates, node);
         }
+    }
+
+    /// The body of a Java anonymous class, `new T(...) { ... }`.
+    fn anonymous_class_body(&self, node: SyntaxNode<'tree>) -> Option<SyntaxNode<'tree>> {
+        if self.spec.language() != Language::Java || node.kind() != "object_creation_expression" {
+            return None;
+        }
+        node.named_children(&mut node.walk())
+            .find(|child| child.kind() == "class_body")
+    }
+
+    /// A Java anonymous class (upstream `34240eb2`) is a class named for its
+    /// type and line, `<T$anon@12>`, that extends T, so the interface-impl
+    /// pass can bridge T's methods to the overrides it declares, and that owns
+    /// the members of its body.
+    fn extract_anonymous_class(&mut self, node: SyntaxNode<'tree>, body: SyntaxNode<'tree>) {
+        let type_name = self
+            .constructed_type_name(node)
+            .unwrap_or_else(|| "Object".to_string());
+        let name = format!("<{type_name}$anon@{}>", node.start_position().row + 1);
+        let Some(class_node) = self.create_node(NodeKind::Class, &name, node, NodeExtra::default())
+        else {
+            return;
+        };
+        let type_node = Self::constructed_type(node).unwrap_or(node);
+        self.push_ref(&class_node.id, &type_name, EdgeKind::Extends, type_node);
+        self.node_stack.push(class_node.id.clone());
+        for child in body.named_children(&mut body.walk()) {
+            self.visit_node(child);
+        }
+        self.node_stack.pop();
     }
 
     /// A C/C++ function-like macro (`#define TRACE(x) ...`) becomes a `constant`
@@ -4394,13 +4943,19 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             self.extract_jsx_component_ref(node);
         } else if has_type(self.spec.call_types(), node_type) {
             self.extract_call(node);
-        } else if node_type == "new_expression" {
-            self.extract_instantiation(node);
+        } else if INSTANTIATION_KINDS.contains(&node_type) {
+            if self.extract_construction(node) {
+                return;
+            }
         } else if let Some(callee_name) = self.spec.extract_bare_call(node, self.source) {
             if let Some(caller_id) = self.node_stack.last().cloned() {
                 self.push_ref(&caller_id, &callee_name, EdgeKind::Calls, node);
             }
         }
+
+        // G4 — a static-member or enum-value read: `Enum.value`,
+        // `Type.CONST`, `Foo::BAR`.
+        self.extract_static_member_ref(node);
 
         if node_type == "variable_declarator" {
             if let Some(owner_id) = self.node_stack.last().cloned() {
@@ -4457,7 +5012,198 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
         }
     }
 
+    /// G4 (upstream `extractStaticMemberRef`) — a read through a type, which
+    /// is a dependency on it even when nothing constructs or calls it: a
+    /// `references` ref named by the receiver, at the receiver. The receiver
+    /// is a single capitalized name; an access that is a call's callee
+    /// (`Type.method()`) is the call's. The node kind is checked before its
+    /// parent is looked up.
+    fn extract_static_member_ref(&mut self, node: SyntaxNode<'tree>) {
+        let language = self.spec.language();
+        if !has_static_member_reads(language) {
+            return;
+        }
+        let Some(owner_id) = self.node_stack.last().cloned() else {
+            return;
+        };
+        match language {
+            Language::Dart => self.extract_dart_static_member_ref(node, &owner_id),
+            Language::Rust => self.extract_rust_variant_ref(node, &owner_id),
+            _ => {
+                if !MEMBER_ACCESS_KINDS.contains(&node.kind()) || self.is_callee_of_call(node) {
+                    return;
+                }
+                let receiver = child_by_field(node, "object")
+                    .or_else(|| child_by_field(node, "expression"))
+                    .or_else(|| child_by_field(node, "scope"))
+                    .or_else(|| node.named_child(0));
+                let Some(receiver) = receiver else { return };
+                if !matches!(
+                    receiver.kind(),
+                    "identifier"
+                        | "type_identifier"
+                        | "simple_identifier"
+                        | "name"
+                        | "scoped_type_identifier"
+                ) {
+                    return;
+                }
+                let text = node_text(receiver, self.source);
+                if is_capitalized_name(&text) {
+                    self.push_ref(&owner_id, &text, EdgeKind::References, receiver);
+                }
+            }
+        }
+    }
+
+    /// G4 — Fluent / SwiftUI property-wrapper attributes name a type by
+    /// metatype in their arguments (`@Siblings(through: Pivot.self, …)`); a read
+    /// through it is the enclosing type's dependency, as the wrapper is. A
+    /// model reached only through a relationship is not left orphaned.
+    fn walk_swift_attribute_arguments(&mut self, node: SyntaxNode<'tree>) {
+        let modifiers = node
+            .named_children(&mut node.walk())
+            .find(|child| child.kind() == "modifiers");
+        if let Some(modifiers) = modifiers {
+            self.static_member_refs_in(modifiers);
+        }
+    }
+
+    fn static_member_refs_in(&mut self, node: SyntaxNode<'tree>) {
+        self.extract_static_member_ref(node);
+        for child in node.named_children(&mut node.walk()) {
+            self.static_member_refs_in(child);
+        }
+    }
+
+    /// Whether `node` is the callee of the call it sits in (upstream: the
+    /// call's `function`, else its `method`, else its first named child).
+    fn is_callee_of_call(&self, node: SyntaxNode<'tree>) -> bool {
+        let Some(parent) = node.parent() else {
+            return false;
+        };
+        if !has_type(self.spec.call_types(), parent.kind()) {
+            return false;
+        }
+        child_by_field(parent, "function")
+            .or_else(|| child_by_field(parent, "method"))
+            .or_else(|| parent.named_child(0))
+            .is_some_and(|callee| callee.start_byte() == node.start_byte())
+    }
+
+    /// Dart writes a member access as a `member_expression`: a read through a
+    /// capitalized name that is not a call's callee, generic (`Foo.of<T>()`)
+    /// or not.
+    fn extract_dart_static_member_ref(&mut self, node: SyntaxNode<'tree>, owner_id: &str) {
+        if node.kind() != "member_expression" {
+            return;
+        }
+        let callee = match node.parent() {
+            Some(parent) if parent.kind() == "instantiation_expression" => parent,
+            _ => node,
+        };
+        if self.is_callee_of_call(callee) {
+            return;
+        }
+        let Some(receiver) = child_by_field(node, "object") else {
+            return;
+        };
+        if receiver.kind() != "identifier" {
+            return;
+        }
+        let text = node_text(receiver, self.source);
+        if is_capitalized_name(&text) {
+            self.push_ref(owner_id, &text, EdgeKind::References, receiver);
+        }
+    }
+
+    /// Rust writes an enum variant as a path: read (`Mode::A`,
+    /// `mode::Mode::B`, `xs.map(Mode::C)`), matched (`Mode::C(x) =>`,
+    /// `Mode::D { .. } =>`), or `Self::A` in an impl (upstream #2328). The
+    /// receiver, the segment before the member, is referenced where it is
+    /// written. A lowercase receiver is a module and a lowercase member a
+    /// function (`util::take`, `Foo::new`); a call's callee (`Mode::C(1)`) and
+    /// a struct literal's name are linked to their member already; the prefix
+    /// of a longer path and a `use` tree name no member.
+    fn extract_rust_variant_ref(&mut self, node: SyntaxNode<'tree>, owner_id: &str) {
+        let kind = node.kind();
+        if kind != "scoped_identifier" && kind != "scoped_type_identifier" {
+            return;
+        }
+        let Some(parent) = node.parent() else { return };
+        let excluded = if kind == "scoped_type_identifier" {
+            parent.kind() != "struct_pattern"
+        } else {
+            RUST_NON_MEMBER_PATH_PARENTS.contains(&parent.kind())
+        };
+        if excluded {
+            return;
+        }
+        if parent.kind() == "call_expression"
+            && child_by_field(parent, "function")
+                .is_some_and(|callee| callee.start_byte() == node.start_byte())
+        {
+            return;
+        }
+        let Some(member) = child_by_field(node, "name") else {
+            return;
+        };
+        let mut receiver = child_by_field(node, "path");
+        if let Some(path) = receiver
+            && path.kind() == "scoped_identifier"
+        {
+            receiver = child_by_field(path, "name");
+        }
+        let Some(receiver) = receiver.filter(|receiver| receiver.kind() == "identifier") else {
+            return;
+        };
+        if !node_text(member, self.source)
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_uppercase())
+        {
+            return;
+        }
+        let mut text = node_text(receiver, self.source);
+        if text == "Self" {
+            text = self
+                .spec
+                .get_receiver_type(node, self.source)
+                .unwrap_or_default();
+        }
+        if is_capitalized_name(&text) {
+            self.push_ref(owner_id, &text, EdgeKind::References, receiver);
+        }
+    }
+
     fn extract_inheritance(&mut self, node: SyntaxNode<'tree>, class_id: &str) {
+        // G5 (upstream `61153f96`) — Objective-C `@interface Sub : Base <P, Q>`
+        // extends its superclass and implements each adopted protocol.
+        if node.kind() == "class_interface" && self.spec.language() == Language::ObjC {
+            if let Some(superclass) = child_by_field(node, "superclass") {
+                let name = node_text(superclass, self.source);
+                self.push_ref(class_id, &name, EdgeKind::Extends, superclass);
+            }
+            for arguments in node.named_children(&mut node.walk()) {
+                if arguments.kind() != "parameterized_arguments" {
+                    continue;
+                }
+                for type_name in arguments.named_children(&mut arguments.walk()) {
+                    let protocol = type_name
+                        .named_children(&mut type_name.walk())
+                        .find(|c| matches!(c.kind(), "type_identifier" | "identifier"));
+                    if let Some(protocol) = protocol {
+                        let name = node_text(protocol, self.source);
+                        self.push_ref(class_id, &name, EdgeKind::Implements, protocol);
+                    }
+                }
+            }
+            return;
+        }
+        if self.spec.language() == Language::Dart {
+            self.extract_dart_supertypes(node, class_id);
+            return;
+        }
         for child in node.named_children(&mut node.walk()) {
             if matches!(
                 child.kind(),
@@ -4571,6 +5317,99 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             if child.kind() == "class_heritage" {
                 self.extract_inheritance(child, class_id);
             }
+            // G10 (upstream `1244c621`, #2397) — Go embedding: a struct's
+            // field without a name (`*Head`, `pkg.Base`, `Box[T]`) and an
+            // interface's lone named type are supertypes.
+            if self.spec.language() == Language::Go {
+                match child.kind() {
+                    "field_declaration_list" => self.extract_inheritance(child, class_id),
+                    "field_declaration" => {
+                        let named = child
+                            .named_children(&mut child.walk())
+                            .any(|c| c.kind() == "field_identifier");
+                        let embedded = (!named)
+                            .then(|| {
+                                go_embedded_type_name(child_by_field(child, "type"), self.source)
+                            })
+                            .flatten();
+                        if let Some(type_id) = embedded {
+                            let name = node_text(type_id, self.source);
+                            self.push_ref(class_id, &name, EdgeKind::Extends, type_id);
+                        }
+                    }
+                    "type_elem" => {
+                        let terms: Vec<_> = child
+                            .named_children(&mut child.walk())
+                            .filter(|c| c.kind() != "comment")
+                            .collect();
+                        let embedded = match terms.as_slice() {
+                            [term] => go_embedded_type_name(Some(*term), self.source),
+                            _ => None,
+                        };
+                        if let Some(type_id) = embedded {
+                            let name = node_text(type_id, self.source);
+                            self.push_ref(class_id, &name, EdgeKind::Extends, type_id);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            // G7 — PHP `class S extends Base implements A, B` and
+            // `interface I extends J, K`: every listed name, by its last `\`
+            // segment (the name a class is stored under and a `use` brings
+            // into scope).
+            if self.spec.language() == Language::Php
+                && matches!(child.kind(), "base_clause" | "class_interface_clause")
+            {
+                let kind = if child.kind() == "base_clause" {
+                    EdgeKind::Extends
+                } else {
+                    EdgeKind::Implements
+                };
+                for parent in child.named_children(&mut child.walk()) {
+                    if !matches!(parent.kind(), "name" | "qualified_name") {
+                        continue;
+                    }
+                    let text = node_text(parent, self.source);
+                    let name = text.rsplit('\\').next().unwrap_or(&text).trim();
+                    if !name.is_empty() {
+                        let name = name.to_string();
+                        self.push_ref(class_id, &name, kind, parent);
+                    }
+                }
+            }
+            // G6 (upstream v1.0.1) — Python `class Flask(Scaffold, mixins.Mixin)`:
+            // each identifier or dotted base in the argument list is a
+            // supertype; `metaclass=M` (a keyword argument) and `Generic[T]`
+            // (a subscript) are not.
+            if child.kind() == "argument_list" && node.kind() == "class_definition" {
+                for base in child.named_children(&mut child.walk()) {
+                    if matches!(base.kind(), "identifier" | "attribute") {
+                        let name = node_text(base, self.source);
+                        self.push_ref(class_id, &name, EdgeKind::Extends, base);
+                    }
+                }
+            }
+            // G1 (upstream `b712e4de`) — C# `class Store : BaseStore, IStore`:
+            // one `base_list` holds the base class and the interfaces alike, so
+            // every entry is an `extends` ref and the resolver promotes the
+            // ones that bind an interface. An enum's `: byte` is a
+            // `predefined_type`, never a supertype.
+            if child.kind() == "base_list" && self.spec.language() == Language::CSharp {
+                for base in child.named_children(&mut child.walk()) {
+                    let base = if base.kind() == "primary_constructor_base_type" {
+                        match child_by_field(base, "type") {
+                            Some(ty) => ty,
+                            None => continue,
+                        }
+                    } else {
+                        base
+                    };
+                    if let Some(name) = crate::lang::csharp_base_type_name(base, self.source) {
+                        self.push_ref(class_id, &name, EdgeKind::Extends, base);
+                    }
+                }
+            }
             // #1043 — C++ `class D : public Base<int>, ns::Tpl<T>`: base_class_clause
             // (a C++-grammar-only node kind) holds base refs as type_identifier /
             // qualified_identifier / template_type. access_specifier (public/…),
@@ -4590,8 +5429,90 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
         }
     }
 
+    /// G12 (upstream #2145, `0ff11b36`) — Dart `class C extends B with M1, M2
+    /// implements I`. tree-sitter-dart keeps the base and the `with` mixins in
+    /// `superclass`, the interfaces in `interfaces`, an enum's mixins in a
+    /// `mixins` of its own, and `class A = B with M implements I;` in a
+    /// `mixin_application`. The base is `extends`; every mixin and interface
+    /// is `implements`. A mixin's `on` constraint is no supertype.
+    fn extract_dart_supertypes(&mut self, node: SyntaxNode<'tree>, class_id: &str) {
+        for child in node.named_children(&mut node.walk()) {
+            match child.kind() {
+                "superclass" | "mixin_application" => {
+                    // The base is the first `type`; the `type`s after it carry
+                    // its type arguments.
+                    let base = child
+                        .named_children(&mut child.walk())
+                        .find(|c| c.kind() == "type")
+                        .and_then(crate::lang::dart_supertype_name);
+                    if let Some(base) = base {
+                        let name = node_text(base, self.source);
+                        self.push_ref(class_id, &name, EdgeKind::Extends, base);
+                    }
+                    self.extract_dart_supertypes(child, class_id);
+                }
+                "mixin_application_class" => self.extract_dart_supertypes(child, class_id),
+                "mixins" | "interfaces" => {
+                    for entry in child.named_children(&mut child.walk()) {
+                        if let Some(name_node) = crate::lang::dart_supertype_name(entry) {
+                            let name = node_text(name_node, self.source);
+                            self.push_ref(class_id, &name, EdgeKind::Implements, name_node);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
     fn extract_type_annotations(&mut self, node: SyntaxNode<'tree>, node_id: &str) {
-        if !matches!(self.spec.language(), Language::TypeScript | Language::Tsx) {
+        let language = self.spec.language();
+        if !has_type_annotation_refs(language) {
+            return;
+        }
+        match language {
+            Language::Kotlin => {
+                self.extract_kotlin_type_annotations(node, node_id);
+                return;
+            }
+            Language::CSharp => {
+                self.extract_csharp_type_annotations(node, node_id);
+                return;
+            }
+            Language::Php => {
+                self.extract_php_type_annotations(node, node_id);
+                return;
+            }
+            Language::Dart => {
+                self.extract_dart_type_annotations(node, node_id);
+                return;
+            }
+            Language::Swift => {
+                // A Swift parameter is not under a field of its function; its
+                // type is the parameter's own `type` field.
+                for child in node.named_children(&mut node.walk()) {
+                    if child.kind() == "parameter"
+                        && let Some(ty) = child_by_field(child, "type")
+                    {
+                        self.extract_type_refs_from_subtree(ty, node_id);
+                    }
+                }
+            }
+            _ => {}
+        }
+        // Scala curries (`def f(a)(implicit m: M)`), and the typeclass usually
+        // sits in a later list, so every parameter list is read; the bounds of
+        // its type parameters (`[A: Monoid]`, `[F <: Base]`) are the other way
+        // Scala requires a type.
+        if language == Language::Scala {
+            for child in node.named_children(&mut node.walk()) {
+                if matches!(child.kind(), "parameters" | "type_parameters") {
+                    self.extract_type_refs_from_subtree(child, node_id);
+                }
+            }
+            if let Some(return_type) = child_by_field(node, "return_type") {
+                self.extract_type_refs_from_subtree(return_type, node_id);
+            }
             return;
         }
         if let Some(params) = child_by_field(node, self.spec.params_field()) {
@@ -4615,7 +5536,226 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
         }
     }
 
+    /// C# writes no `type_identifier` leaves, so only its type positions are
+    /// walked (upstream `extractCsharpTypeRefs`): a property's `type`, a
+    /// method's `returns`, a field's `variable_declaration` type, and each
+    /// parameter's `type`. A parameter's name is never one of them.
+    fn extract_csharp_type_annotations(&mut self, node: SyntaxNode<'tree>, node_id: &str) {
+        if let Some(ty) = child_by_field(node, "type").or_else(|| child_by_field(node, "returns")) {
+            self.csharp_type_refs(ty, node_id);
+        }
+        for child in node.named_children(&mut node.walk()) {
+            if child.kind() == "variable_declaration"
+                && let Some(ty) = child_by_field(child, "type")
+            {
+                self.csharp_type_refs(ty, node_id);
+            }
+        }
+        if let Some(params) = child_by_field(node, "parameters") {
+            for param in params.named_children(&mut params.walk()) {
+                if param.kind() == "parameter"
+                    && let Some(ty) = child_by_field(param, "type")
+                {
+                    self.csharp_type_refs(ty, node_id);
+                }
+            }
+        }
+    }
+
+    /// A C# subtree known to be in a type position (upstream
+    /// `walkCsharpTypePosition`): an identifier names a type, a qualified name
+    /// by its last segment, a tuple element by its type alone; a built-in is
+    /// skipped. A `global::` alias contributes only its name.
+    fn csharp_type_refs(&mut self, node: SyntaxNode<'tree>, from_node_id: &str) {
+        match node.kind() {
+            "predefined_type" => {}
+            "identifier" => {
+                let name = node_text(node, self.source);
+                if !name.is_empty() && !is_builtin_type(&name) {
+                    self.push_ref(from_node_id, &name, EdgeKind::References, node);
+                }
+            }
+            "qualified_name" => {
+                let text = node_text(node, self.source);
+                let last = text.rsplit('.').next().unwrap_or(&text).trim();
+                if !last.is_empty() && !is_builtin_type(last) {
+                    let last = last.to_string();
+                    self.push_ref(from_node_id, &last, EdgeKind::References, node);
+                }
+            }
+            "tuple_element" | "alias_qualified_name" => {
+                let field = if node.kind() == "tuple_element" {
+                    "type"
+                } else {
+                    "name"
+                };
+                if let Some(inner) = child_by_field(node, field) {
+                    self.csharp_type_refs(inner, from_node_id);
+                }
+            }
+            _ => {
+                for child in node.named_children(&mut node.walk()) {
+                    self.csharp_type_refs(child, from_node_id);
+                }
+            }
+        }
+    }
+
+    /// PHP type hints (upstream `extractPhpTypeRefs`): each parameter's type,
+    /// and the return or property type written directly under the
+    /// declaration. A `$name` is never a type node.
+    fn extract_php_type_annotations(&mut self, node: SyntaxNode<'tree>, node_id: &str) {
+        for child in node.named_children(&mut node.walk()) {
+            if child.kind() == "formal_parameters" {
+                for param in child.named_children(&mut child.walk()) {
+                    for part in param.named_children(&mut param.walk()) {
+                        if is_php_type_kind(part.kind()) {
+                            self.php_type_refs(part, node_id);
+                        }
+                    }
+                }
+            } else if is_php_type_kind(child.kind()) {
+                self.php_type_refs(child, node_id);
+            }
+        }
+    }
+
+    /// A PHP subtree known to be a type: a `name` names a class unless it is a
+    /// pseudo-type, a qualified name by its last `\` segment, a primitive is
+    /// skipped.
+    fn php_type_refs(&mut self, node: SyntaxNode<'tree>, from_node_id: &str) {
+        match node.kind() {
+            "primitive_type" => {}
+            "name" | "qualified_name" => {
+                let text = node_text(node, self.source);
+                let last = text.rsplit('\\').next().unwrap_or(&text).trim();
+                if !last.is_empty() && !is_php_pseudo_type(last) {
+                    let last = last.to_string();
+                    self.push_ref(from_node_id, &last, EdgeKind::References, node);
+                }
+            }
+            _ => {
+                for child in node.named_children(&mut node.walk()) {
+                    self.php_type_refs(child, from_node_id);
+                }
+            }
+        }
+    }
+
+    /// Dart (upstream's Dart path): a method's inner signature, or a field's
+    /// declaration, is walked whole, since names are `identifier` and only
+    /// types are `type_identifier`. A redirecting factory's target is a
+    /// constructed class and perhaps its constructor (`= _Impl.create`); only
+    /// an UpperCamel name there is a type.
+    fn extract_dart_type_annotations(&mut self, node: SyntaxNode<'tree>, node_id: &str) {
+        let node = match node.kind() {
+            "method_declaration" => child_by_field(node, "signature").unwrap_or(node),
+            _ => node,
+        };
+        let signature = if node.kind() == "method_signature" {
+            node.named_children(&mut node.walk())
+                .find(|child| {
+                    matches!(
+                        child.kind(),
+                        "function_signature"
+                            | "getter_signature"
+                            | "setter_signature"
+                            | "constructor_signature"
+                            | "factory_constructor_signature"
+                            | "redirecting_factory_constructor_signature"
+                    )
+                })
+                .unwrap_or(node)
+        } else {
+            node
+        };
+        if signature.kind() == "redirecting_factory_constructor_signature" {
+            for child in signature.named_children(&mut signature.walk()) {
+                if child.kind() != "type_identifier"
+                    || dart_names_a_type(&node_text(child, self.source))
+                {
+                    self.extract_type_refs_from_subtree(child, node_id);
+                }
+            }
+            return;
+        }
+        self.extract_type_refs_from_subtree(signature, node_id);
+    }
+
+    /// kotlin-ng writes a function's types as unnamed children: each
+    /// parameter's after its name, the return type after the parameter list.
+    /// An extension receiver, before the name, is not a parameter type.
+    fn extract_kotlin_type_annotations(&mut self, node: SyntaxNode<'tree>, node_id: &str) {
+        if node.kind() != "function_declaration" {
+            return;
+        }
+        let mut after_parameters = false;
+        for child in node.named_children(&mut node.walk()) {
+            match child.kind() {
+                "function_value_parameters" => {
+                    for param in child.named_children(&mut child.walk()) {
+                        if param.kind() == "parameter" {
+                            self.kotlin_types_among_children(param, node_id);
+                        }
+                    }
+                    after_parameters = true;
+                }
+                "function_body" => break,
+                kind if after_parameters && is_kotlin_type_kind(kind) => {
+                    self.kotlin_type_refs(child, node_id);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn kotlin_types_among_children(&mut self, node: SyntaxNode<'tree>, from_node_id: &str) {
+        for child in node.named_children(&mut node.walk()) {
+            if is_kotlin_type_kind(child.kind()) {
+                self.kotlin_type_refs(child, from_node_id);
+            }
+        }
+    }
+
+    /// A kotlin-ng `user_type` is named by its last identifier (`a.b.C` is
+    /// `C`); its type arguments are types of their own.
+    fn kotlin_type_refs(&mut self, node: SyntaxNode<'tree>, from_node_id: &str) {
+        if node.kind() == "user_type" {
+            let last = node
+                .named_children(&mut node.walk())
+                .filter(|child| child.kind() == "identifier")
+                .last();
+            if let Some(name) = last {
+                let type_name = node_text(name, self.source);
+                if !is_builtin_type(&type_name) {
+                    self.push_ref(from_node_id, &type_name, EdgeKind::References, name);
+                }
+            }
+            for child in node.named_children(&mut node.walk()) {
+                if child.kind() == "type_arguments" {
+                    self.kotlin_type_refs(child, from_node_id);
+                }
+            }
+            return;
+        }
+        for child in node.named_children(&mut node.walk()) {
+            self.kotlin_type_refs(child, from_node_id);
+        }
+    }
+
     fn extract_type_refs_from_subtree(&mut self, node: SyntaxNode<'tree>, from_node_id: &str) {
+        // Java writes `java.util.List` as nested `scoped_type_identifier`s over
+        // `type_identifier`s; only the last segment names the type.
+        if node.kind() == "scoped_type_identifier" && self.spec.language() == Language::Java {
+            let last = node
+                .named_children(&mut node.walk())
+                .filter(|child| child.kind() == "type_identifier")
+                .last();
+            if let Some(name) = last {
+                self.extract_type_refs_from_subtree(name, from_node_id);
+            }
+            return;
+        }
         if node.kind() == "type_identifier" {
             let type_name = node_text(node, self.source);
             if !is_builtin_type(&type_name) {
@@ -4655,6 +5795,22 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
                 for inner in child.named_children(&mut child.walk()) {
                     self.consider_decorator(inner, decorated_id);
                 }
+            }
+        }
+        // #2382 — a Dart member's annotations are written inside the wrappers
+        // around it (its `class_member`, a bodiless member's `declaration`),
+        // before it.
+        if self.spec.language() == Language::Dart {
+            let wrappers = crate::lang::dart_member_wrappers(decl_node);
+            if !wrappers.is_empty() {
+                let mut inner = decl_node;
+                for wrapper in wrappers {
+                    for prefix in crate::lang::dart_prefix(wrapper, inner) {
+                        self.consider_decorator(prefix, decorated_id);
+                    }
+                    inner = wrapper;
+                }
+                return;
             }
         }
         let Some(parent) = decl_node.parent() else {
@@ -5036,14 +6192,56 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
     /// two things the author wrote about the same symbol (upstream
     /// `docstringFor`, #1905).
     fn docstring_for(&self, node: SyntaxNode<'tree>) -> Option<String> {
-        let preceding = self
-            .preceding_docstring(node)
-            .filter(|text| !text.is_empty());
+        let preceding = if self.spec.language() == Language::Dart {
+            self.dart_preceding_docstring(node)
+        } else {
+            self.preceding_docstring(node)
+        }
+        .filter(|text| !text.is_empty());
         let body = self.spec.body_docstring(node, self.source);
         match (preceding, body) {
             (Some(preceding), Some(body)) => Some(format!("{preceding}\n\n{body}")),
             (preceding, body) => body.or(preceding),
         }
+    }
+
+    /// #2382 / #2387 — a Dart member's dartdoc is written before the outermost
+    /// wrapper tree-sitter-dart puts around it (`dart_member_wrappers`), above
+    /// the annotations inside it. A comment written among those annotations,
+    /// or between the annotations that open a function or method and its
+    /// signature, joins it, as adjacent comments do. A class-like
+    /// declaration's annotations open its own node, and the dartdoc above them
+    /// is its previous sibling already.
+    fn dart_preceding_docstring(&self, node: SyntaxNode<'tree>) -> Option<String> {
+        let wrappers = crate::lang::dart_member_wrappers(node);
+        let outer = wrappers.last().copied().unwrap_or(node);
+        let mut parts: Vec<String> = self.preceding_docstring(outer).into_iter().collect();
+        let mut prefixes = Vec::new();
+        let mut inner = node;
+        for wrapper in &wrappers {
+            prefixes.push(crate::lang::dart_prefix(*wrapper, inner));
+            inner = *wrapper;
+        }
+        for prefix in prefixes.iter().rev() {
+            for child in prefix {
+                if is_comment_kind(child.kind()) {
+                    parts.push(clean_comment(&node_text(*child, self.source)));
+                }
+            }
+        }
+        if matches!(node.kind(), "method_declaration" | "function_declaration") {
+            for child in node.named_children(&mut node.walk()) {
+                if is_comment_kind(child.kind()) {
+                    parts.push(clean_comment(&node_text(child, self.source)));
+                } else if child.kind() != "annotation" {
+                    break;
+                }
+            }
+        }
+        if parts.is_empty() {
+            return None;
+        }
+        Some(parts.join("\n").trim().to_string())
     }
 
     fn preceding_docstring(&self, node: SyntaxNode<'tree>) -> Option<String> {
@@ -5063,10 +6261,7 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
         let mut sibling = anchor.prev_named_sibling();
         let mut comments = Vec::new();
         while let Some(current) = sibling {
-            if matches!(
-                current.kind(),
-                "comment" | "line_comment" | "block_comment" | "documentation_comment"
-            ) {
+            if is_comment_kind(current.kind()) {
                 comments.push(clean_comment(&node_text(current, self.source)));
                 sibling = current.prev_named_sibling();
             } else {
@@ -5465,6 +6660,116 @@ fn is_r_constant_name(name: &str) -> bool {
             .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '.' || c == '_')
 }
 
+/// `= <initializer>`, cut at 100 characters, as a value's signature.
+fn value_signature(value: Option<SyntaxNode<'_>>, source: &str) -> Option<String> {
+    value.map(|value| {
+        let init = node_text(value, source)
+            .chars()
+            .take(100)
+            .collect::<String>();
+        format!("= {}{}", init, if init.len() >= 100 { "..." } else { "" })
+    })
+}
+
+/// A Ruby assignment whose left side is a `constant` (`MAX = 3`).
+fn is_ruby_constant_assignment(node: SyntaxNode<'_>) -> bool {
+    node.kind() == "assignment"
+        && child_by_field(node, "left")
+            .or_else(|| node.named_child(0))
+            .is_some_and(|left| left.kind() == "constant")
+}
+
+/// Whether a C node sits inside a function definition.
+fn has_c_function_ancestor(node: SyntaxNode<'_>) -> bool {
+    let mut parent = node.parent();
+    while let Some(current) = parent {
+        if current.kind() == "function_definition" {
+            return true;
+        }
+        parent = current.parent();
+    }
+    false
+}
+
+/// A Swift stored property's name and whether it is a `let` (upstream
+/// `swiftPropertyInfo`); none for a computed property.
+fn swift_stored_property(node: SyntaxNode<'_>, source: &str) -> Option<(String, bool)> {
+    if node.named_children(&mut node.walk()).any(|child| {
+        matches!(
+            child.kind(),
+            "computed_property" | "protocol_property_requirements"
+        )
+    }) {
+        return None;
+    }
+    let pattern = child_by_field(node, "name").or_else(|| {
+        node.named_children(&mut node.walk())
+            .find(|child| matches!(child.kind(), "value_binding_pattern" | "pattern"))
+    })?;
+    let name = first_descendant_kind(pattern, "simple_identifier")
+        .or_else(|| (pattern.kind() == "simple_identifier").then_some(pattern))?;
+    let is_let = node
+        .named_children(&mut node.walk())
+        .find(|child| child.kind() == "value_binding_pattern")
+        .is_some_and(|binding| node_text(binding, source).trim_start().starts_with("let"));
+    Some((node_text(name, source), is_let))
+}
+
+#[derive(Clone, Copy)]
+enum KotlinPropertyScope {
+    Shared,
+    Instance,
+}
+
+/// Where a Kotlin property is declared (upstream `kotlinPropertyKind`): none
+/// for a local (a function, lambda, initializer block, control body or
+/// accessor), shared at the top level or in an `object` / companion object,
+/// instance in a class.
+fn kotlin_property_scope(node: SyntaxNode<'_>) -> Option<KotlinPropertyScope> {
+    let mut parent = node.parent();
+    while let Some(current) = parent {
+        match current.kind() {
+            "function_body"
+            | "function_declaration"
+            | "lambda_literal"
+            | "anonymous_initializer"
+            | "control_structure_body"
+            | "getter"
+            | "setter" => return None,
+            "companion_object" | "object_declaration" => return Some(KotlinPropertyScope::Shared),
+            "class_declaration" => return Some(KotlinPropertyScope::Instance),
+            _ => {}
+        }
+        parent = current.parent();
+    }
+    Some(KotlinPropertyScope::Shared)
+}
+
+/// Whether a Scala value is declared in a `class`, `trait`, `enum` or
+/// `given`, the nearest enclosing definition; an `object`'s or a top-level
+/// value is shared.
+fn scala_instance_scope(node: SyntaxNode<'_>) -> bool {
+    let mut parent = node.parent();
+    while let Some(current) = parent {
+        match current.kind() {
+            "class_definition" | "trait_definition" | "enum_definition" | "given_definition" => {
+                return true;
+            }
+            "object_definition" => return false,
+            _ => {}
+        }
+        parent = current.parent();
+    }
+    false
+}
+
+fn is_comment_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "comment" | "line_comment" | "block_comment" | "documentation_comment"
+    )
+}
+
 fn is_docstring_wrapper_type(kind: &str) -> bool {
     matches!(
         kind,
@@ -5648,6 +6953,147 @@ fn property_or_field_signature(node: SyntaxNode<'_>, name: &str, source: &str) -
     type_node.map(|node| format!("{} {name}", node_text(node, source)))
 }
 
+/// Languages whose declarations' annotated types are `references` from them
+/// (upstream `TYPE_ANNOTATION_LANGUAGES`, G3).
+fn has_type_annotation_refs(language: Language) -> bool {
+    matches!(
+        language,
+        Language::TypeScript
+            | Language::Tsx
+            | Language::Rust
+            | Language::Go
+            | Language::Java
+            | Language::Kotlin
+            | Language::Scala
+            | Language::CSharp
+            | Language::Swift
+            | Language::Dart
+            | Language::Php
+    )
+}
+
+/// The name node of the type a Go embedding names (upstream
+/// `goEmbeddedTypeName`): `Base`, `pkg.Base` by `Base`, `Base[T]` by `Base`;
+/// a predeclared type is none.
+fn go_embedded_type_name<'tree>(
+    ty: Option<SyntaxNode<'tree>>,
+    source: &str,
+) -> Option<SyntaxNode<'tree>> {
+    let ty = ty?;
+    let ty = if ty.kind() == "generic_type" {
+        child_by_field(ty, "type")?
+    } else {
+        ty
+    };
+    if ty.kind() == "qualified_type" {
+        return child_by_field(ty, "name");
+    }
+    (ty.kind() == "type_identifier" && !is_go_predeclared_type(&node_text(ty, source)))
+        .then_some(ty)
+}
+
+/// Go's predeclared types (upstream `GO_PREDECLARED_TYPES`).
+fn is_go_predeclared_type(name: &str) -> bool {
+    matches!(
+        name,
+        "any"
+            | "bool"
+            | "byte"
+            | "comparable"
+            | "complex64"
+            | "complex128"
+            | "error"
+            | "float32"
+            | "float64"
+            | "int"
+            | "int8"
+            | "int16"
+            | "int32"
+            | "int64"
+            | "rune"
+            | "string"
+            | "uint"
+            | "uint8"
+            | "uint16"
+            | "uint32"
+            | "uint64"
+            | "uintptr"
+    )
+}
+
+/// A capitalized Objective-C identifier names a class.
+fn is_objc_class_name(name: &str) -> bool {
+    name.starts_with(|c: char| c.is_ascii_uppercase())
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// A selector of one bare keyword (no `:`), the only kind a chain resolver
+/// reads.
+fn is_word(name: &str) -> bool {
+    !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// The PHP node kinds a type hint is written as (upstream `PHP_TYPE_NODES`).
+fn is_php_type_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "named_type"
+            | "optional_type"
+            | "nullable_type"
+            | "union_type"
+            | "intersection_type"
+            | "disjunctive_normal_form_type"
+            | "primitive_type"
+    )
+}
+
+/// PHP pseudo-types and relative class names that name no project class
+/// (upstream `PHP_PSEUDO_TYPES`).
+fn is_php_pseudo_type(name: &str) -> bool {
+    matches!(
+        name,
+        "self"
+            | "static"
+            | "parent"
+            | "mixed"
+            | "object"
+            | "iterable"
+            | "callable"
+            | "void"
+            | "null"
+            | "false"
+            | "true"
+            | "never"
+            | "array"
+            | "int"
+            | "float"
+            | "string"
+            | "bool"
+    )
+}
+
+/// Dart writes type names UpperCamel, after any leading `_` or `$`.
+fn dart_names_a_type(name: &str) -> bool {
+    name.trim_start_matches(['_', '$'])
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_uppercase())
+}
+
+/// The kotlin-ng node kinds a type is written as.
+fn is_kotlin_type_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "user_type"
+            | "nullable_type"
+            | "function_type"
+            | "parenthesized_type"
+            | "non_nullable_type"
+    )
+}
+
+/// Built-in and primitive type names, which name no project symbol (upstream
+/// `BUILTIN_TYPE_NAMES`, one set for every language).
 fn is_builtin_type(name: &str) -> bool {
     matches!(
         name,
@@ -5663,6 +7109,47 @@ fn is_builtin_type(name: &str) -> bool {
             | "object"
             | "symbol"
             | "bigint"
+            // Rust
+            | "str"
+            | "bool"
+            | "i8"
+            | "i16"
+            | "i32"
+            | "i64"
+            | "i128"
+            | "isize"
+            | "u8"
+            | "u16"
+            | "u32"
+            | "u64"
+            | "u128"
+            | "usize"
+            | "f32"
+            | "f64"
+            | "char"
+            // Java, C#
+            | "int"
+            | "long"
+            | "short"
+            | "byte"
+            | "float"
+            | "double"
+            // Go
+            | "int8"
+            | "int16"
+            | "int32"
+            | "int64"
+            | "uint8"
+            | "uint16"
+            | "uint32"
+            | "uint64"
+            | "float32"
+            | "float64"
+            | "complex64"
+            | "complex128"
+            | "rune"
+            | "error"
+            // Scala primitives and ubiquitous standard aliases
             | "Int"
             | "Long"
             | "Short"
@@ -5966,8 +7453,9 @@ class Holder {
 enum Color { case Red, Green, Blue }
 "#;
         let (nodes, _) = run("src/S.scala", src, Language::Scala);
-        assert!(has_node(&nodes, NodeKind::Field, "topConst"));
-        assert!(has_node(&nodes, NodeKind::Field, "topVar"));
+        // #897: an object's `val`/`var` is a shared value, a class's a field.
+        assert!(has_node(&nodes, NodeKind::Constant, "topConst"));
+        assert!(has_node(&nodes, NodeKind::Variable, "topVar"));
         assert!(has_node(&nodes, NodeKind::Field, "field"));
         assert!(has_node(&nodes, NodeKind::EnumMember, "Red"));
         assert!(has_node(&nodes, NodeKind::EnumMember, "Blue"));
@@ -6954,9 +8442,9 @@ end
 
     #[test]
     fn ruby_instance_method_call_records_calls_to_method() {
-        // `logger.log(msg)` → a Calls edge to the METHOD name (`log`), not the
-        // receiver (`logger`). Regression: the pre-#1110 fall-through emitted the
-        // receiver text as the callee.
+        // `logger.log(msg)` → a Calls edge to the method with its receiver
+        // (`logger.log`, G11), never to the receiver alone. Regression: the
+        // pre-#1110 fall-through emitted the receiver text as the callee.
         let src = r#"
 def run(logger, msg)
   logger.log(msg)
@@ -6964,8 +8452,8 @@ end
 "#;
         let (_, refs) = run("i.rb", src, Language::Ruby);
         assert!(
-            has_ref(&refs, EdgeKind::Calls, "log"),
-            "expected Calls edge to method `log`, got: {refs:?}"
+            has_ref(&refs, EdgeKind::Calls, "logger.log"),
+            "expected Calls edge to method `logger.log`, got: {refs:?}"
         );
         assert!(
             !has_ref(&refs, EdgeKind::Calls, "logger"),
@@ -6975,7 +8463,8 @@ end
 
     #[test]
     fn ruby_class_method_call_records_calls_to_method() {
-        // `Foo.bar` (constant receiver = class-method call) → Calls edge to `bar`.
+        // `Foo.bar` (constant receiver = class-method call) → Calls `Foo.bar`,
+        // and a reference to the constant `Foo` (G11).
         let src = r#"
 def run
   Foo.bar(1)
@@ -6983,8 +8472,12 @@ end
 "#;
         let (_, refs) = run("cm.rb", src, Language::Ruby);
         assert!(
-            has_ref(&refs, EdgeKind::Calls, "bar"),
-            "expected Calls edge to class method `bar`, got: {refs:?}"
+            has_ref(&refs, EdgeKind::Calls, "Foo.bar"),
+            "expected Calls edge to class method `Foo.bar`, got: {refs:?}"
+        );
+        assert!(
+            has_ref(&refs, EdgeKind::References, "Foo"),
+            "a constant receiver is a reference: {refs:?}"
         );
     }
 
@@ -7033,7 +8526,7 @@ end
     #[test]
     fn ruby_instance_new_is_calls_not_instantiates() {
         // A NON-constant receiver `.new` (`factory.new`) is an ordinary method
-        // call, not a construction — Calls `new`, never Instantiates.
+        // call, not a construction — Calls `factory.new`, never Instantiates.
         let src = r#"
 def build(factory)
   factory.new
@@ -7041,8 +8534,8 @@ end
 "#;
         let (_, refs) = run("in.rb", src, Language::Ruby);
         assert!(
-            has_ref(&refs, EdgeKind::Calls, "new"),
-            "expected Calls edge to `new`, got: {refs:?}"
+            has_ref(&refs, EdgeKind::Calls, "factory.new"),
+            "expected Calls edge to `factory.new`, got: {refs:?}"
         );
         assert!(
             !has_ref(&refs, EdgeKind::Instantiates, "factory"),
@@ -7052,8 +8545,8 @@ end
 
     #[test]
     fn ruby_chained_call_records_last_method() {
-        // `a.b.c(x)`: receiver is itself a `call` (`a.b`); the OUTER method `c`
-        // is recorded as a Calls edge.
+        // `a.b.c(x)`: receiver is itself a `call` (`a.b`); the OUTER method is
+        // recorded with that receiver, `a.b.c`.
         let src = r#"
 def run(a, x)
   a.b.c(x)
@@ -7061,8 +8554,8 @@ end
 "#;
         let (_, refs) = run("ch.rb", src, Language::Ruby);
         assert!(
-            has_ref(&refs, EdgeKind::Calls, "c"),
-            "expected Calls edge to `c`, got: {refs:?}"
+            has_ref(&refs, EdgeKind::Calls, "a.b.c"),
+            "expected Calls edge to `a.b.c`, got: {refs:?}"
         );
     }
 
@@ -7117,8 +8610,8 @@ Registry.register(Widget.new)
 "#;
         let (_, refs) = run("top.rb", src, Language::Ruby);
         assert!(
-            has_ref(&refs, EdgeKind::Calls, "register"),
-            "expected Calls edge to `register`, got: {refs:?}"
+            has_ref(&refs, EdgeKind::Calls, "Registry.register"),
+            "expected Calls edge to `Registry.register`, got: {refs:?}"
         );
         assert!(
             has_ref(&refs, EdgeKind::Instantiates, "Widget"),
@@ -7129,35 +8622,41 @@ Registry.register(Widget.new)
     #[test]
     fn ruby_nested_call_in_arguments_is_walked() {
         // `logger.log(other.format(x))` inside a method body: the outer call
-        // records `log`, and the nested argument call `format` is still walked
-        // via visit_ruby_call_arguments.
+        // records `logger.log`, and the nested argument call `other.format` is
+        // still walked via visit_ruby_call_arguments.
         let src = r#"
 def run(logger, other, x)
   logger.log(other.format(x))
 end
 "#;
         let (_, refs) = run("na.rb", src, Language::Ruby);
-        assert!(has_ref(&refs, EdgeKind::Calls, "log"), "outer: {refs:?}");
         assert!(
-            has_ref(&refs, EdgeKind::Calls, "format"),
-            "nested argument call `format` must be walked: {refs:?}"
+            has_ref(&refs, EdgeKind::Calls, "logger.log"),
+            "outer: {refs:?}"
+        );
+        assert!(
+            has_ref(&refs, EdgeKind::Calls, "other.format"),
+            "nested argument call `other.format` must be walked: {refs:?}"
         );
     }
 
     #[test]
     fn ruby_nested_call_in_receiver_is_walked() {
         // `factory.build.run`: the receiver of the outer `.run` is itself the
-        // call `factory.build`; walking the receiver records `build` too.
+        // call `factory.build`; walking the receiver records it too.
         let src = r#"
 def go(factory)
   factory.build.run
 end
 "#;
         let (_, refs) = run("nr.rb", src, Language::Ruby);
-        assert!(has_ref(&refs, EdgeKind::Calls, "run"), "outer: {refs:?}");
         assert!(
-            has_ref(&refs, EdgeKind::Calls, "build"),
-            "nested receiver call `build` must be walked: {refs:?}"
+            has_ref(&refs, EdgeKind::Calls, "factory.build.run"),
+            "outer: {refs:?}"
+        );
+        assert!(
+            has_ref(&refs, EdgeKind::Calls, "factory.build"),
+            "nested receiver call `factory.build` must be walked: {refs:?}"
         );
     }
 
@@ -8637,11 +10136,11 @@ public:
         );
     }
 
-    // NEGATIVE: a non-C++ language that has a `:`-bearing construct must be
-    // unaffected by the base_class_clause arm (Go struct embedding is NOT a
-    // base_class_clause and does not emit Extends via this path).
+    // Go struct embedding is no C++ base_class_clause, but it is a supertype
+    // (G10, upstream `1244c621`): the embedded `Base` is one `Extends` ref,
+    // emitted once, by the Go arm.
     #[test]
-    fn go_struct_unaffected_by_cpp_base_arm() {
+    fn go_struct_embedding_is_one_extends_ref() {
         let src = r#"
 package main
 type Base struct{}
@@ -8650,11 +10149,11 @@ type D struct {
 }
 "#;
         let (_, refs) = run("d.go", src, Language::Go);
-        // No C++ base_class_clause exists in Go; the arm must not fire.
-        assert!(
-            !has_ref(&refs, EdgeKind::Extends, "Base"),
-            "Go struct embedding must not go through the C++ base arm"
-        );
+        let extends = refs
+            .iter()
+            .filter(|r| r.reference_kind == EdgeKind::Extends && r.reference_name == "Base")
+            .count();
+        assert_eq!(extends, 1, "Go struct embedding is one Extends ref");
     }
 
     // The #1061 export-macro path and the general base arm must NOT double-emit:

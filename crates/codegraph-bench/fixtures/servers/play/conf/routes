@@ -1,0 +1,2 @@
+GET     /                           controllers.HomeController.index()
+GET     /items/:id                  controllers.HomeController.show(id: Long)

@@ -1,0 +1,74 @@
+[
+  {
+    "content_hash": "ce11d73ab0dd1aa3a853268e1bd10501bc46f51901991438d501a99ff517d837",
+    "errors": null,
+    "generated": 0,
+    "language": "java",
+    "node_count": 4,
+    "path": "src/main/java/app/a/Field.java",
+    "size": 80
+  },
+  {
+    "content_hash": "98e03a2a39d97f1595a1ed6c62009469f2c5e5bdfa7f29b4ce15eadcc6421954",
+    "errors": null,
+    "generated": 0,
+    "language": "java",
+    "node_count": 4,
+    "path": "src/main/java/app/b/EmailVerificationService.java",
+    "size": 124
+  },
+  {
+    "content_hash": "de43678ff5adffb0ee88d70773497b34560d477b85b3ae7e69c5fdd63dd34964",
+    "errors": null,
+    "generated": 0,
+    "language": "java",
+    "node_count": 4,
+    "path": "src/main/java/app/b/Field.java",
+    "size": 80
+  },
+  {
+    "content_hash": "2993d4fe0f79205b4a136b34cfc8910732527284e2ffc37cf5346133e1afbf0a",
+    "errors": null,
+    "generated": 0,
+    "language": "java",
+    "node_count": 15,
+    "path": "src/main/java/app/shapes/Main.java",
+    "size": 756
+  },
+  {
+    "content_hash": "39b1bb54b978be3730eb85e6de40b2b44d42b4b0741246412ade0cd61ffd49ec",
+    "errors": null,
+    "generated": 0,
+    "language": "java",
+    "node_count": 4,
+    "path": "src/main/java/app/shapes/Shape.java",
+    "size": 64
+  },
+  {
+    "content_hash": "7c3a7ac4a41475be2dc156f56ed19d4862b750d3f867ceb64edf6620e03f8d25",
+    "errors": null,
+    "generated": 0,
+    "language": "java",
+    "node_count": 11,
+    "path": "src/main/java/app/shapes/Square.java",
+    "size": 403
+  },
+  {
+    "content_hash": "0faa0b279c9b7619f745823a0def3888f19c8475a358835fc52484eab7d2edd5",
+    "errors": null,
+    "generated": 0,
+    "language": "java",
+    "node_count": 5,
+    "path": "src/main/java/app/util/MathUtil.java",
+    "size": 133
+  },
+  {
+    "content_hash": "ed681ae56c2e4803772efb7f53f6a0bf6828209d991983df273dac0c1bef2cdf",
+    "errors": null,
+    "generated": 0,
+    "language": "java",
+    "node_count": 10,
+    "path": "src/test/java/app/MainTest.java",
+    "size": 485
+  }
+]

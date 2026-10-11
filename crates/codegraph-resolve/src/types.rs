@@ -366,6 +366,16 @@ pub trait ResolutionContext {
     }
     /// Check if a file exists (`fileExists`).
     fn file_exists(&self, file_path: &str) -> bool;
+    /// Whether `file_path` (project-relative) is one of the files the index
+    /// holds. Unlike [`Self::file_exists`], which also answers from the
+    /// filesystem, a directory or a `node_modules` file is never one.
+    fn is_indexed_file(&self, file_path: &str) -> bool {
+        let normalized = file_path.replace('\\', "/");
+        let basename = normalized.rsplit('/').next().unwrap_or(&normalized);
+        self.get_files_by_basename_shared(basename)
+            .iter()
+            .any(|file| file.replace('\\', "/") == normalized)
+    }
     /// Read file content (`readFile`); `None` when unreadable.
     fn read_file(&self, file_path: &str) -> Option<String>;
     /// Whether [`Self::read_file`] can produce source text.

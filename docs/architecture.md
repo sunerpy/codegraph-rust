@@ -109,8 +109,9 @@ parallel file parsing. A file then follows one of these paths:
 2. a grammar-backed `LanguageSpec` and generic tree-sitter walker; or
 3. file-level handling for formats that intentionally expose no language symbols.
 
-The walker emits file/symbol nodes and structural ownership edges immediately.
-Calls, imports, type relationships, decorators, and framework evidence that need
+The walker emits file/symbol nodes and structural ownership edges immediately,
+and so the value references of a file, which need nothing outside it (see
+[`data-model.md`](data-model.md#edges)). Calls, imports, type relationships, decorators, and framework evidence that need
 global knowledge are stored as unresolved references. Per-file extraction is
 fail-closed: an unsafe tree depth or fatal parse condition cannot leave a partial
 replacement graph for that file.
@@ -221,7 +222,10 @@ socket location recorded in the rendezvous metadata.
 
 The watcher maintains per-directory watches outside ignored trees, debounces
 bursts, reloads project control files, and reconciles additions, modifications,
-deletions, and scope changes through `codegraph-watch`. Each mutation acquires the
+deletions, and scope changes through `codegraph-watch`. A burst past 500 paths,
+a backend's sign of dropped events, or (on Windows) drift found by an idle
+sentinel escalates to one full reconcile, reported as RECOVERING until it
+commits. Each mutation acquires the
 store's short-lived `index.lock` writer authority; readers use corroborated state
 and shared leases. A separate persistent `writer.pid` file carries an OS kernel
 exclusive lock for the lifetime of the ONE process allowed to run watcher/catch-up
@@ -230,7 +234,16 @@ the kernel lock is authority and is released automatically on process exit.
 
 Default daemon mode multiplexes every MCP client onto that one writer. On a cold
 start the foreground stdio session answers immediately without its own background
-services while the detached daemon takes ownership. Explicit direct mode
+services while the detached daemon takes ownership. Once the daemon's socket is
+up, the session retains a passive lease on it, the same client connection an
+explicit `projectPath` service holds, so the daemon does not idle-exit while the
+session lives. If that lease stops being live (the daemon died, was replaced, or
+the index was re-created), the session starts or re-attaches a daemon with
+exponential backoff, and never creates an index that is gone. A session that
+meets a daemon of an older plain `X.Y.Z` release asks it to drain over the
+project-bound control channel and starts one from its own install; a daemon of
+any other version keeps the project. Each daemon also exits once its own
+executable is replaced or removed. Explicit direct mode
 (`CODEGRAPH_NO_DAEMON=1`) may own the writer instead; a second direct process fails
 fast rather than alternating sync mutations. An unindexed explicit path remains
 state-free: only `codegraph init` creates an index namespace.

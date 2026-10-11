@@ -1,0 +1,292 @@
+[
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "dispatch/src/Events.java",
+    "from_node_id": "namespace:559ecd17038af11c9b6ef54ae38f2d50",
+    "language": "java",
+    "line": 3,
+    "reference_kind": "imports",
+    "reference_name": "org.springframework.context.ApplicationEventPublisher"
+  },
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "dispatch/src/Events.java",
+    "from_node_id": "namespace:559ecd17038af11c9b6ef54ae38f2d50",
+    "language": "java",
+    "line": 4,
+    "reference_kind": "imports",
+    "reference_name": "org.springframework.context.event.EventListener"
+  },
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "js/src/Counter.tsx",
+    "from_node_id": "file:js/src/Counter.tsx",
+    "language": "tsx",
+    "line": 1,
+    "reference_kind": "imports",
+    "reference_name": "react"
+  },
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "js/src/events.js",
+    "from_node_id": "file:js/src/events.js",
+    "language": "javascript",
+    "line": 9,
+    "reference_kind": "calls",
+    "reference_name": "bus.on"
+  },
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "js/src/store.ts",
+    "from_node_id": "file:js/src/store.ts",
+    "language": "typescript",
+    "line": 1,
+    "reference_kind": "imports",
+    "reference_name": "@reduxjs/toolkit"
+  },
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "js/src/store.ts",
+    "from_node_id": "file:js/src/store.ts",
+    "language": "typescript",
+    "line": 2,
+    "reference_kind": "imports",
+    "reference_name": "pinia"
+  },
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "python/tasks.py",
+    "from_node_id": "file:python/tasks.py",
+    "language": "python",
+    "line": 1,
+    "reference_kind": "imports",
+    "reference_name": "celery"
+  },
+  {
+    "candidates": null,
+    "col": 11,
+    "file_path": "c/src/ops.c",
+    "from_node_id": "function:0114da5ed06cbe96441f72b8ce3bd9cc",
+    "language": "c",
+    "line": 16,
+    "reference_kind": "calls",
+    "reference_name": "ops.close"
+  },
+  {
+    "candidates": null,
+    "col": 12,
+    "file_path": "js/src/events.js",
+    "from_node_id": "constant:f1553fed82b8f496223f2d2115aa5853",
+    "language": "javascript",
+    "line": 3,
+    "reference_kind": "instantiates",
+    "reference_name": "EventEmitter"
+  },
+  {
+    "candidates": null,
+    "col": 13,
+    "file_path": "c/src/ops.c",
+    "from_node_id": "function:0114da5ed06cbe96441f72b8ce3bd9cc",
+    "language": "c",
+    "line": 15,
+    "reference_kind": "calls",
+    "reference_name": "ops.open"
+  },
+  {
+    "candidates": null,
+    "col": 18,
+    "file_path": "dispatch/src/Events.java",
+    "from_node_id": "field:b4afa2847b5e18c9e5084ec2c917ca28",
+    "language": "java",
+    "line": 7,
+    "reference_kind": "references",
+    "reference_name": "ApplicationEventPublisher"
+  },
+  {
+    "candidates": null,
+    "col": 18,
+    "file_path": "dispatch/src/Events.java",
+    "from_node_id": "method:7067346642bc248a1eae7fe70349eb4c",
+    "language": "java",
+    "line": 9,
+    "reference_kind": "references",
+    "reference_name": "ApplicationEventPublisher"
+  },
+  {
+    "candidates": null,
+    "col": 19,
+    "file_path": "python/tasks.py",
+    "from_node_id": "file:python/tasks.py",
+    "language": "python",
+    "line": 1,
+    "reference_kind": "imports",
+    "reference_name": "Celery"
+  },
+  {
+    "candidates": null,
+    "col": 2,
+    "file_path": "js/src/events.js",
+    "from_node_id": "function:4c075e5c6998bde068ac64c5129298c1",
+    "language": "javascript",
+    "line": 12,
+    "reference_kind": "calls",
+    "reference_name": "bus.emit"
+  },
+  {
+    "candidates": null,
+    "col": 25,
+    "file_path": "js/src/store.ts",
+    "from_node_id": "constant:4b684f1aedba2724eae145b1dea95daa",
+    "language": "typescript",
+    "line": 4,
+    "reference_kind": "calls",
+    "reference_name": "createAsyncThunk"
+  },
+  {
+    "candidates": null,
+    "col": 25,
+    "file_path": "js/src/store.ts",
+    "from_node_id": "constant:ca889f0e21c710abec3a16bf7a22f369",
+    "language": "typescript",
+    "line": 12,
+    "reference_kind": "calls",
+    "reference_name": "createSlice"
+  },
+  {
+    "candidates": null,
+    "col": 27,
+    "file_path": "js/src/Counter.tsx",
+    "from_node_id": "function:33d9d8364fb2a1c7aabe3039389f7a9c",
+    "language": "tsx",
+    "line": 10,
+    "reference_kind": "calls",
+    "reference_name": "setCount"
+  },
+  {
+    "candidates": null,
+    "col": 27,
+    "file_path": "js/src/store.ts",
+    "from_node_id": "file:js/src/store.ts",
+    "language": "typescript",
+    "line": 1,
+    "reference_kind": "imports",
+    "reference_name": "createSlice"
+  },
+  {
+    "candidates": null,
+    "col": 28,
+    "file_path": "js/src/Counter.tsx",
+    "from_node_id": "function:33d9d8364fb2a1c7aabe3039389f7a9c",
+    "language": "tsx",
+    "line": 8,
+    "reference_kind": "calls",
+    "reference_name": "useState"
+  },
+  {
+    "candidates": null,
+    "col": 28,
+    "file_path": "js/src/store.ts",
+    "from_node_id": "constant:9eff9be391067cb6961cb0e9edd413b4",
+    "language": "typescript",
+    "line": 22,
+    "reference_kind": "calls",
+    "reference_name": "defineStore"
+  },
+  {
+    "candidates": null,
+    "col": 4,
+    "file_path": "dispatch/src/Events.java",
+    "from_node_id": "method:d5658cf785502385e0d2dc65e6908262",
+    "language": "java",
+    "line": 17,
+    "reference_kind": "decorates",
+    "reference_name": "EventListener"
+  },
+  {
+    "candidates": null,
+    "col": 4,
+    "file_path": "python/tasks.py",
+    "from_node_id": "function:fa4a2925d6f31cdb05806f4225d4fc3b",
+    "language": "python",
+    "line": 16,
+    "reference_kind": "calls",
+    "reference_name": "send_email.delay"
+  },
+  {
+    "candidates": null,
+    "col": 6,
+    "file_path": "js/src/store.ts",
+    "from_node_id": "constant:9eff9be391067cb6961cb0e9edd413b4",
+    "language": "typescript",
+    "line": 26,
+    "reference_kind": "calls",
+    "reference_name": "this.items.push"
+  },
+  {
+    "candidates": null,
+    "col": 8,
+    "file_path": "dispatch/src/Events.java",
+    "from_node_id": "method:4fa1cc0f5c6e16964aa519b8ffa473d9",
+    "language": "java",
+    "line": 14,
+    "reference_kind": "calls",
+    "reference_name": "publisher.publishEvent"
+  },
+  {
+    "candidates": null,
+    "col": 8,
+    "file_path": "go/store/store.go",
+    "from_node_id": "function:31958cc8a7c1c6134f84b5da2195fa02",
+    "language": "go",
+    "line": 29,
+    "reference_kind": "calls",
+    "reference_name": "s.Get"
+  },
+  {
+    "candidates": null,
+    "col": 9,
+    "file_path": "js/src/Counter.tsx",
+    "from_node_id": "file:js/src/Counter.tsx",
+    "language": "tsx",
+    "line": 1,
+    "reference_kind": "imports",
+    "reference_name": "useState"
+  },
+  {
+    "candidates": null,
+    "col": 9,
+    "file_path": "js/src/events.js",
+    "from_node_id": "function:994db1e9cc732ccb7ea9e3a57730e984",
+    "language": "javascript",
+    "line": 21,
+    "reference_kind": "calls",
+    "reference_name": "handlers[kind]"
+  },
+  {
+    "candidates": null,
+    "col": 9,
+    "file_path": "js/src/store.ts",
+    "from_node_id": "file:js/src/store.ts",
+    "language": "typescript",
+    "line": 1,
+    "reference_kind": "imports",
+    "reference_name": "createAsyncThunk"
+  },
+  {
+    "candidates": null,
+    "col": 9,
+    "file_path": "js/src/store.ts",
+    "from_node_id": "file:js/src/store.ts",
+    "language": "typescript",
+    "line": 2,
+    "reference_kind": "imports",
+    "reference_name": "defineStore"
+  }
+]

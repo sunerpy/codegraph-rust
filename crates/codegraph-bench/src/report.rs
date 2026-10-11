@@ -135,14 +135,14 @@ pub fn write_report(path: &Path, report: &BenchmarkReport) -> Result<()> {
     fs::write(path, json).with_context(|| format!("writing {}", path.display()))
 }
 
-fn read_cpu_model() -> Option<String> {
+pub(crate) fn read_cpu_model() -> Option<String> {
     fs::read_to_string("/proc/cpuinfo")
         .ok()?
         .lines()
         .find_map(|line| line.strip_prefix("model name\t: ").map(str::to_string))
 }
 
-fn read_mem_total_kb() -> Option<u64> {
+pub(crate) fn read_mem_total_kb() -> Option<u64> {
     fs::read_to_string("/proc/meminfo")
         .ok()?
         .lines()
@@ -152,7 +152,7 @@ fn read_mem_total_kb() -> Option<u64> {
         })
 }
 
-fn read_os_pretty_name() -> Option<String> {
+pub(crate) fn read_os_pretty_name() -> Option<String> {
     fs::read_to_string("/etc/os-release")
         .ok()?
         .lines()
@@ -177,7 +177,7 @@ fn read_reference_pin(workspace_root: &Path, heading: &str) -> Option<String> {
     None
 }
 
-fn command_stdout(program: &str, args: &[&str]) -> Option<String> {
+pub(crate) fn command_stdout(program: &str, args: &[&str]) -> Option<String> {
     command_stdout_in(Path::new("."), program, args)
 }
 

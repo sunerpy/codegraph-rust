@@ -370,6 +370,20 @@ fn is_external_import(
     language: Language,
     context: &dyn ResolutionContext,
 ) -> bool {
+    is_external_import_with(import_path, language, context, true)
+}
+
+/// [`is_external_import`], where `alias_prefixes: false` skips the test that
+/// a JS specifier starting with a project path alias's prefix is local. Only a
+/// caller that asks [`resolve_import_path`] whether the alias maps the import
+/// to a file may skip it: a catch-all `"*"` alias has an empty prefix, which
+/// every package starts with (upstream #2437).
+fn is_external_import_with(
+    import_path: &str,
+    language: Language,
+    context: &dyn ResolutionContext,
+    alias_prefixes: bool,
+) -> bool {
     if import_path.starts_with('.') {
         return false;
     }
@@ -407,7 +421,7 @@ fn is_external_import(
             return true;
         }
         // Project-defined alias prefix → local (import-resolver.ts:149-154).
-        if let Some(aliases) = context.get_project_aliases() {
+        if let Some(aliases) = context.get_project_aliases().filter(|_| alias_prefixes) {
             for pat in &aliases.patterns {
                 if import_path.starts_with(&pat.prefix) {
                     return false;
@@ -1118,8 +1132,8 @@ fn split_top_level_commas(inner: &str) -> Vec<String> {
 /// ref, a `type_alias` for a supertype).
 ///
 /// Two oracles only, each one its language cannot be wrong about:
-/// - the JS specifier family, via the existing [`is_external_import`], which
-///   already understands tsconfig path aliases and workspace packages; and
+/// - the JS specifier family, via [`is_out_of_repo_js_import`], which
+///   understands tsconfig path aliases and workspace packages; and
 /// - Rust `use`, restricted to [`RUST_OUT_OF_REPO_ROOTS`], with the escape that a
 ///   path walking to a real file is local.
 ///
@@ -1144,7 +1158,14 @@ pub fn is_bound_to_out_of_repo_module(
             .get_import_mappings(&reference.file_path, reference.language)
             .into_iter()
             .filter(|m| m.local_name == head)
-            .any(|m| is_external_import(&m.source, reference.language, context));
+            .any(|m| {
+                is_out_of_repo_js_import(
+                    &m.source,
+                    &reference.file_path,
+                    reference.language,
+                    context,
+                )
+            });
     }
 
     if reference.language == Language::Rust {
@@ -1158,6 +1179,23 @@ pub fn is_bound_to_out_of_repo_module(
     }
 
     false
+}
+
+/// Does a JS-family import of `source` from `from_file` name a module outside
+/// the repository? A path alias makes it the project's only when it maps the
+/// import to a file the index holds (upstream #2437). Matching the alias's
+/// prefix is not enough: a catch-all `"*": ["./typings/*"]` matches every
+/// package. Nor is a path that exists on disk: an alias can land in
+/// `node_modules`, or on a directory.
+fn is_out_of_repo_js_import(
+    source: &str,
+    from_file: &str,
+    language: Language,
+    context: &dyn ResolutionContext,
+) -> bool {
+    is_external_import_with(source, language, context, false)
+        && !resolve_import_path(source, from_file, language, context)
+            .is_some_and(|resolved| context.is_indexed_file(&resolved))
 }
 
 /// Does a Rust `use` path name a crate outside the repository?
@@ -2848,6 +2886,8 @@ mod tests {
         workspace_packages: Option<WorkspacePackages>,
         go_module: Option<GoModule>,
         cpp_include_dirs: Vec<String>,
+        /// Files on disk that the index does not hold (a `node_modules` file).
+        disk_only_files: BTreeSet<String>,
     }
 
     impl ResolutionContext for TestContext {
@@ -2880,7 +2920,7 @@ mod tests {
                 .collect()
         }
         fn file_exists(&self, file_path: &str) -> bool {
-            self.existing_files.contains(file_path)
+            self.existing_files.contains(file_path) || self.disk_only_files.contains(file_path)
         }
         fn read_file(&self, file_path: &str) -> Option<String> {
             self.file_contents.get(file_path).cloned()
@@ -3195,6 +3235,95 @@ mod tests {
                 "{language:?} has no trustworthy oracle and must abstain"
             );
         }
+    }
+
+    fn alias(prefix: &str, has_wildcard: bool, replacement: &str) -> AliasPattern {
+        AliasPattern {
+            prefix: prefix.to_string(),
+            suffix: String::new(),
+            has_wildcard,
+            replacements: vec![replacement.to_string()],
+        }
+    }
+
+    /// Upstream #2437: a catch-all `"*"` alias has an empty prefix, which every
+    /// package specifier starts with, so matching it proves nothing. A binding
+    /// is local only when an alias maps it to an indexed file.
+    #[test]
+    fn catch_all_alias_never_makes_a_package_binding_local() {
+        let mut ctx = TestContext {
+            project_root: "/proj".to_string(),
+            project_aliases: Some(AliasMap {
+                base_url: "/proj".to_string(),
+                // In the loader's specificity order: longest prefix first.
+                patterns: vec![
+                    alias("@lib/", true, "lib/*"),
+                    alias("", true, "./typings/*"),
+                ],
+            }),
+            ..Default::default()
+        };
+        ctx.existing_files.insert("lib/thing.ts".to_string());
+        ctx.import_mappings.insert(
+            "src/App.tsx".to_string(),
+            vec![
+                mapping("Typography", "Typography", "@mui/material"),
+                mapping("Thing", "Thing", "@lib/thing"),
+            ],
+        );
+        let package = reference(
+            "Typography",
+            EdgeKind::Imports,
+            "src/App.tsx",
+            Language::Tsx,
+        );
+        assert!(
+            is_bound_to_out_of_repo_module(&package, &ctx),
+            "a catch-all alias must not make `@mui/material` local"
+        );
+        let aliased = reference("Thing", EdgeKind::Imports, "src/App.tsx", Language::Tsx);
+        assert!(
+            !is_bound_to_out_of_repo_module(&aliased, &ctx),
+            "an alias that maps the import to an indexed file keeps it local"
+        );
+        // Resolving an import still honors the catch-all's empty prefix.
+        assert!(!is_external_import("@mui/material", Language::Tsx, &ctx));
+    }
+
+    /// Upstream #2437: an alias that lands on a file outside the index, such as
+    /// one under `node_modules`, does not make the binding the project's.
+    #[test]
+    fn alias_onto_a_file_outside_the_index_is_out_of_repo() {
+        let mut ctx = TestContext {
+            project_root: "/proj".to_string(),
+            project_aliases: Some(AliasMap {
+                base_url: "/proj".to_string(),
+                patterns: vec![alias("lit/format", false, "./node_modules/lit/format.js")],
+            }),
+            ..Default::default()
+        };
+        ctx.disk_only_files
+            .insert("node_modules/lit/format.js".to_string());
+        ctx.import_mappings.insert(
+            "src/card.ts".to_string(),
+            vec![mapping("format", "format", "lit/format")],
+        );
+        let r = reference(
+            "format",
+            EdgeKind::Imports,
+            "src/card.ts",
+            Language::TypeScript,
+        );
+        assert!(
+            is_bound_to_out_of_repo_module(&r, &ctx),
+            "an alias into node_modules is out of the repository"
+        );
+
+        // The same alias onto a file the index holds is the project's.
+        ctx.disk_only_files.clear();
+        ctx.existing_files
+            .insert("node_modules/lit/format.js".to_string());
+        assert!(!is_bound_to_out_of_repo_module(&r, &ctx));
     }
 
     #[test]

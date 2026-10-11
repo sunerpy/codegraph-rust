@@ -480,10 +480,12 @@ maintained once.
 The daemon runs a file watcher (`codegraph-watch`) that live-reindexes changed
 files. Events are debounced (default ~2 s; tunable via
 `CODEGRAPH_WATCH_DEBOUNCE_MS`) so a burst of saves triggers one incremental
-rebuild rather than many. The watcher is auto-disabled on WSL2 `/mnt/` drives
+rebuild rather than many. A burst of more than 500 paths, or any sign that the
+OS dropped events, runs one full project reconcile instead (see
+[`cli.md`](cli.md#live-file-watch)). The watcher is auto-disabled on WSL2 `/mnt/` drives
 where recursive watch is too slow; set `CODEGRAPH_FORCE_WATCH=1` to override.
-The selected index root's `config.toml` and `codegraph.json`, plus the project
-root `.gitignore`, are live control files: their events bypass ordinary
+The selected index root's `config.toml` and `codegraph.json`, the project root
+`.gitignore`, and `.git/info/exclude` are live control files: their events bypass ordinary
 include/exclude filtering, reload the running scope, reconcile OS watch targets,
 and trigger one full scan that supersedes queued path deltas. Invalid TOML keeps
 the last valid scope and is reported; malformed JSON keeps the existing tolerant
@@ -500,7 +502,14 @@ OS kernel exclusive lock on `.codegraph/writer.pid` for its whole watcher/catch-
 lifetime. The file's JSON is diagnostic; process death releases the kernel lock
 without trusting PID reuse or deleting/recreating the authority path. On a cold
 daemon start, the foreground stdio process answers the first handshake directly
-but starts no second watcher. When `CODEGRAPH_NO_DAEMON=1` is used, the foreground
+but starts no second watcher. It then retains a passive connection to the daemon
+it started, so the daemon keeps live sync running for as long as the session is
+open instead of idle-exiting under it; if that connection is lost, the session
+starts or re-attaches a daemon with backoff (`CODEGRAPH_DAEMON_RETRY_MS`, see
+[`cli.md`](cli.md#detached-daemon-lifecycle)). A daemon left running by an older
+release is drained and replaced by one from the session's own install; a newer or
+unresponsive one is left alone, and the session then serves reads without
+auto-sync and says so on stderr. When `CODEGRAPH_NO_DAEMON=1` is used, the foreground
 process owns this writer lock; a second direct server for the same project exits
 with actionable guidance. Read-only/no-default sessions take no writer lock.
 When the resolved root is exactly `$HOME` or the filesystem root (`/`), the
@@ -525,10 +534,16 @@ project folder as the working directory.
 For a normal unindexed workspace container, stdio startup has one additional
 safe path before entering no-default mode: if the launch directory has a
 workspace manifest or `.git`, CodeGraph scans downward to depth 4, inspects at
-most 64 indexed candidates, skips dot/heavy/build/vendor/venv/cache/temp
+most 64 indexed candidates and 10,000 directory entries in all (with a 500 ms
+backstop for slow filesystems), skips dot/heavy/build/vendor/venv/cache/temp
 directories, and stops below an indexed child. Exactly one candidate is adopted
 and gets the full daemon/watcher/catch-up lifecycle. Zero or multiple candidates
-are never guessed. This scan is forbidden at `$HOME` and filesystem roots.
+are never guessed, and a scan that stops at its entry budget or backstop adopts
+nothing, because it cannot know the candidate it found is the only one. This
+scan is forbidden at `$HOME` and filesystem roots. `serve --mcp` runs it once
+before it chooses direct or daemon mode, and the MCP server runs its own on the
+first `tools/list` or tool call rather than before answering `initialize`, so a
+large launch directory delays the handshake by at most the backstop.
 
 Multiple indexed children do not need duplicate MCP registrations. On the first
 tool call that supplies an explicit `projectPath`, CodeGraph starts or attaches
@@ -571,9 +586,10 @@ The stdio server resolves a default project from these sources:
    `.codegraph/` index root. A cwd at or inside an indexed project resolves it
    here, and `projectPath` is optional.
 3. **bounded workspace child scan** — if find-up yields nothing and the launch
-   directory contains `.git` or a workspace manifest, scan at most four levels
-   and 64 candidates. Exactly one indexed child is adopted; multiple candidates
-   are sorted and reported, never selected. HOME and filesystem roots are not
+   directory contains `.git` or a workspace manifest, scan at most four levels,
+   64 candidates and 10,000 entries. Exactly one indexed child of a complete
+   scan is adopted; multiple candidates are sorted and reported, never selected,
+   and a scan cut short adopts nothing. HOME and filesystem roots are not
    scanned.
 4. **MCP `initialize` handshake** — if startup resolution yields nothing, the server reads
    the `initialize` message sent by the client and adopts the workspace it
@@ -741,9 +757,14 @@ When the server runs the project's live watcher in-process, every answer also
 reports its health, since edits the index never heard about cannot reach the
 per-file banner above:
 
-- **RECOVERING** — another process held the index past the sync's contention
-  budget (a long foreground `index`). Watching continues and changes are still
-  collected; a full reconcile is retried every 30 s, and until one commits each
+- **RECOVERING** — a full reconcile is owed and has not committed yet, and the
+  banner names why. Either another process held the index past the sync's
+  contention budget (a long foreground `index`), in which case the reconcile is
+  retried every 30 s, or the watcher saw a sign that file events were lost (an
+  overflowed or dropped event stream, an event without a path, a burst of more
+  than 500 paths, or, on Windows, drift its sentinel found), in which case it
+  runs right away. Watching
+  continues and changes are still collected; until the reconcile commits each
   response starts with `⚠️ CodeGraph auto-sync is RECOVERING …`.
 - **DISABLED** — watching stopped (watch resources exhausted, or syncs failing
   persistently). Responses start with `⚠️ CodeGraph auto-sync is DISABLED …` and

@@ -1,0 +1,112 @@
+[
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "src/Controller.php",
+    "from_node_id": "namespace:af2b1f4b9beef2072a30dae246e21427",
+    "language": "php",
+    "line": 6,
+    "reference_kind": "imports",
+    "reference_name": "App\\Field\\FirstName"
+  },
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "tests/ControllerTest.php",
+    "from_node_id": "namespace:ecdfc0eb0d3003d191ba5713cb2e8831",
+    "language": "php",
+    "line": 5,
+    "reference_kind": "imports",
+    "reference_name": "App\\Controller"
+  },
+  {
+    "candidates": null,
+    "col": 11,
+    "file_path": "src/Util/helpers.php",
+    "from_node_id": "function:2c3e0ea1a203fedfce0fee1a81132f72",
+    "language": "php",
+    "line": 10,
+    "reference_kind": "calls",
+    "reference_name": "number_format"
+  },
+  {
+    "candidates": null,
+    "col": 15,
+    "file_path": "src/Field/FirstName.php",
+    "from_node_id": "method:4e32dd7e5c8e93e94ca89040929d64b5",
+    "language": "php",
+    "line": 14,
+    "reference_kind": "instantiates",
+    "reference_name": "self"
+  },
+  {
+    "candidates": null,
+    "col": 15,
+    "file_path": "src/Field/Registry.php",
+    "from_node_id": "method:e6bddc97c9c9c187daba700a47a2189c",
+    "language": "php",
+    "line": 9,
+    "reference_kind": "instantiates",
+    "reference_name": "static"
+  },
+  {
+    "candidates": null,
+    "col": 16,
+    "file_path": "src/Controller.php",
+    "from_node_id": "method:d7e53b91aba4c60a50c0023d3ae0b6fa",
+    "language": "php",
+    "line": 20,
+    "reference_kind": "calls",
+    "reference_name": "Field\\FirstName.make"
+  },
+  {
+    "candidates": null,
+    "col": 23,
+    "file_path": "src/Controller.php",
+    "from_node_id": "method:d7e53b91aba4c60a50c0023d3ae0b6fa",
+    "language": "php",
+    "line": 24,
+    "reference_kind": "calls",
+    "reference_name": "formatprice"
+  },
+  {
+    "candidates": null,
+    "col": 29,
+    "file_path": "tests/ControllerTest.php",
+    "from_node_id": "class:82ee0565e7bb3f0efd92d1ef50aa4660",
+    "language": "php",
+    "line": 7,
+    "reference_kind": "extends",
+    "reference_name": "TestCase"
+  },
+  {
+    "candidates": null,
+    "col": 31,
+    "file_path": "tests/ControllerTest.php",
+    "from_node_id": "method:eb71c0f01dd64f14e6a9c61109c8dd41",
+    "language": "php",
+    "line": 12,
+    "reference_kind": "calls",
+    "reference_name": "count"
+  },
+  {
+    "candidates": null,
+    "col": 40,
+    "file_path": "src/Controller.php",
+    "from_node_id": "method:d7e53b91aba4c60a50c0023d3ae0b6fa",
+    "language": "php",
+    "line": 25,
+    "reference_kind": "calls",
+    "reference_name": "other.render"
+  },
+  {
+    "candidates": null,
+    "col": 8,
+    "file_path": "tests/ControllerTest.php",
+    "from_node_id": "method:eb71c0f01dd64f14e6a9c61109c8dd41",
+    "language": "php",
+    "line": 12,
+    "reference_kind": "calls",
+    "reference_name": "assertEquals"
+  }
+]

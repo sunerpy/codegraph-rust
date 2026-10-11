@@ -1,0 +1,52 @@
+[
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "src/composables/useCounter.ts",
+    "from_node_id": "file:src/composables/useCounter.ts",
+    "language": "typescript",
+    "line": 1,
+    "reference_kind": "imports",
+    "reference_name": "vue"
+  },
+  {
+    "candidates": null,
+    "col": 16,
+    "file_path": "src/composables/useCounter.ts",
+    "from_node_id": "function:c44eb90155d41a4c58621579fa89e878",
+    "language": "typescript",
+    "line": 4,
+    "reference_kind": "calls",
+    "reference_name": "ref"
+  },
+  {
+    "candidates": null,
+    "col": 2,
+    "file_path": "src/components/App.vue",
+    "from_node_id": "function:9bdc9cd1f3fedac8bed880a1d4210b7a",
+    "language": "vue",
+    "line": 15,
+    "reference_kind": "calls",
+    "reference_name": "increment"
+  },
+  {
+    "candidates": null,
+    "col": 4,
+    "file_path": "src/components/Counter.vue",
+    "from_node_id": "file:src/components/Counter.vue",
+    "language": "vue",
+    "line": 24,
+    "reference_kind": "calls",
+    "reference_name": "bump"
+  },
+  {
+    "candidates": null,
+    "col": 9,
+    "file_path": "src/composables/useCounter.ts",
+    "from_node_id": "file:src/composables/useCounter.ts",
+    "language": "typescript",
+    "line": 1,
+    "reference_kind": "imports",
+    "reference_name": "ref"
+  }
+]

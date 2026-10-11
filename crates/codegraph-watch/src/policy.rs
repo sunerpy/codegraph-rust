@@ -34,11 +34,12 @@ pub struct WatchPolicy {
     /// uses, never [`rule_matches`] — whose `*` form compares BASENAMES, so it
     /// could never match a `res/values*` prefix against `res/values/strings.xml`.
     ignore_paths: Vec<String>,
-    /// The root `.gitignore` — the NEGOTIABLE tail of the last-match-wins stream
-    /// (`ignore_paths` and `exclude` first, it last, mirroring the scan), so a
-    /// `!pattern` line here re-includes what an `ignore_paths`, `exclude`, or
-    /// earlier `.gitignore` line dropped. It is the scan's own git-rules
-    /// matcher, so the two read every `.gitignore` line identically.
+    /// The root `.gitignore`, with `.git/info/exclude` read ahead of it — the
+    /// NEGOTIABLE tail of the last-match-wins stream (`ignore_paths` and
+    /// `exclude` first, it last, mirroring the scan), so a `!pattern` line here
+    /// re-includes what an `ignore_paths`, `exclude`, or earlier line dropped.
+    /// It is the scan's own git-rules matcher, so the two read every line
+    /// identically.
     gitignore: RootGitignore,
     include: Vec<String>,
     exclude: Vec<String>,

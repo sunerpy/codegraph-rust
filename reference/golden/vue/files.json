@@ -1,0 +1,29 @@
+[
+  {
+    "content_hash": "6f0de59460e82f6412d864aa534058b33ecc695a7236aa50290efc8d18d9e95a",
+    "errors": null,
+    "generated": 0,
+    "language": "vue",
+    "node_count": 7,
+    "path": "src/components/App.vue",
+    "size": 396
+  },
+  {
+    "content_hash": "65fcc4a9df480a9de45ee54f2468596783403dab4156d8f05d0ae5d2e3862a0f",
+    "errors": null,
+    "generated": 0,
+    "language": "vue",
+    "node_count": 3,
+    "path": "src/components/Counter.vue",
+    "size": 415
+  },
+  {
+    "content_hash": "d6db69f8e443edab5b3f65625d6bff9fbaec5fa3183f903424ee5f50ecca321b",
+    "errors": null,
+    "generated": 0,
+    "language": "typescript",
+    "node_count": 5,
+    "path": "src/composables/useCounter.ts",
+    "size": 234
+  }
+]

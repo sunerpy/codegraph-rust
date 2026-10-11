@@ -69,9 +69,12 @@ struct Record {
 
 /// A stable identity of everything that decides scan membership. A record
 /// made under another scope (config, extension overrides, root `.gitignore`,
-/// index root, extraction rules, binary) proves nothing about this one.
+/// `.git/info/exclude`, index root, extraction rules, binary) proves nothing
+/// about this one.
 pub fn scope_fingerprint(root: &Path, options: &ExtractOptions) -> String {
     let gitignore = fs::read(root.join(".gitignore")).unwrap_or_default();
+    let repository_exclude =
+        codegraph_extract::engine::read_repository_exclude(root).unwrap_or_default();
     let reserved =
         IndexPaths::reserved_index_roots(root, std::env::var("CODEGRAPH_DIR").ok().as_deref());
     let identity = serde_json::json!({
@@ -86,6 +89,7 @@ pub fn scope_fingerprint(root: &Path, options: &ExtractOptions) -> String {
             .map(|(extension, language)| (extension.to_string(), format!("{language:?}")))
             .collect::<Vec<_>>(),
         "gitignore": hash_content(&String::from_utf8_lossy(&gitignore)),
+        "repository_exclude": hash_content(&repository_exclude),
         "reserved": reserved
             .iter()
             .map(|path| path.to_string_lossy().into_owned())
@@ -111,12 +115,7 @@ fn git(root: &Path, args: &[&str]) -> Option<Vec<u8>> {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt as _;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        command.creation_flags(CREATE_NO_WINDOW);
-    }
+    crate::git::hide_console_window(&mut command);
     let mut child = command.spawn().ok()?;
     let stdout = child.stdout.take()?;
     let reader = std::thread::spawn(move || {
@@ -768,6 +767,7 @@ mod tests {
     fn wait_until_executable(script: &Path) {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
+            // console-window-guard: test-only, runs a test's own stand-in script.
             match std::process::Command::new(script)
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())

@@ -165,6 +165,19 @@ impl LanguageSpec for DartSpec {
     }
 
     fn resolve_name(&self, node: Node<'_>, _source: &str) -> Option<String> {
+        // #2145 — `class A = B with C;`, a mixin application, names its class
+        // inside the `mixin_application_class`, not in a `name` field.
+        if node.kind() == "class_declaration" {
+            let application = node
+                .named_children(&mut node.walk())
+                .find(|child| child.kind() == "mixin_application_class");
+            if let Some(application) = application {
+                return application
+                    .named_children(&mut application.walk())
+                    .find(|child| child.kind() == "identifier")
+                    .map(|id| node_text(id, _source));
+            }
+        }
         if let Some((class_name, ctor_name)) = dart_ctor_info(node, _source) {
             if ctor_name != class_name {
                 return Some(ctor_name);
@@ -205,39 +218,6 @@ impl LanguageSpec for DartSpec {
     }
 
     fn extract_bare_call(&self, node: Node<'_>, source: &str) -> Option<String> {
-        if node.kind() == "selector" {
-            let has_arg_part = node
-                .named_children(&mut node.walk())
-                .any(|child| child.kind() == "argument_part");
-            if !has_arg_part {
-                return None;
-            }
-            let prev = node.prev_named_sibling()?;
-            if prev.kind() == "identifier" {
-                return Some(node_text(prev, source));
-            }
-            if prev.kind() == "selector" {
-                let accessor = prev.named_children(&mut prev.walk()).find(|child| {
-                    matches!(
-                        child.kind(),
-                        "unconditional_assignable_selector" | "conditional_assignable_selector"
-                    )
-                })?;
-                let method_id = accessor
-                    .named_children(&mut accessor.walk())
-                    .find(|child| child.kind() == "identifier")?;
-                return Some(node_text(method_id, source));
-            }
-            if matches!(
-                prev.kind(),
-                "unconditional_assignable_selector" | "conditional_assignable_selector"
-            ) {
-                let method_id = prev
-                    .named_children(&mut prev.walk())
-                    .find(|child| child.kind() == "identifier")?;
-                return Some(node_text(method_id, source));
-            }
-        }
         if matches!(node.kind(), "new_expression" | "const_object_expression") {
             if let Some(type_id) = node
                 .named_children(&mut node.walk())
@@ -259,6 +239,70 @@ impl LanguageSpec for DartSpec {
             }
         }
         None
+    }
+}
+
+/// The wrappers tree-sitter-dart puts around a member, innermost first: the
+/// `declaration` a member with no body opens (`Foo._();`, `void m();`,
+/// `external int f();`), the `external_function_declaration` of a top-level
+/// `external` function, and the `class_member` every class, mixin and
+/// extension member sits in. The member's annotations are written inside
+/// them, before it, and its dartdoc before the outermost one (#2382). A
+/// wrapper counts only while nothing but annotations, comments and
+/// `external` comes before the node inside it.
+pub(crate) fn dart_member_wrappers(node: Node<'_>) -> Vec<Node<'_>> {
+    let mut wrappers = Vec::new();
+    let mut inner = node;
+    while let Some(parent) = inner.parent() {
+        let wraps = match parent.kind() {
+            "declaration" | "external_function_declaration" => wrappers.is_empty(),
+            "class_member" => true,
+            _ => false,
+        };
+        if !wraps
+            || !dart_prefix(parent, inner)
+                .iter()
+                .all(|prefix| dart_is_member_prefix(prefix.kind()))
+        {
+            break;
+        }
+        wrappers.push(parent);
+        if parent.kind() == "class_member" {
+            break;
+        }
+        inner = parent;
+    }
+    wrappers
+}
+
+/// The named children of `wrapper` written before `inner`.
+pub(crate) fn dart_prefix<'tree>(wrapper: Node<'tree>, inner: Node<'tree>) -> Vec<Node<'tree>> {
+    wrapper
+        .named_children(&mut wrapper.walk())
+        .take_while(|child| child.start_byte() < inner.start_byte())
+        .collect()
+}
+
+/// What may stand before a member inside its wrapper.
+fn dart_is_member_prefix(kind: &str) -> bool {
+    matches!(
+        kind,
+        "annotation" | "comment" | "documentation_comment" | "external"
+    )
+}
+
+/// The name of a supertype written in a Dart heritage list (G12): a `type`
+/// holding the `type_identifier` it names, the last one past an import
+/// prefix (`p.Base`). Its type arguments are `type` siblings that open with
+/// `<` and hold no `type_identifier` of their own, so they name nothing.
+pub(crate) fn dart_supertype_name(node: Node<'_>) -> Option<Node<'_>> {
+    match node.kind() {
+        "type_identifier" => Some(node),
+        "type" => node
+            .named_children(&mut node.walk())
+            .filter(|child| child.kind() == "type_identifier")
+            .last(),
+        _ => None,
     }
 }
 

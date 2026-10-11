@@ -1,0 +1,92 @@
+[
+  {
+    "content_hash": "ffd485f0d38149d5e5615df5efc0092035f7c8955adb30375e464f53a09e4d92",
+    "errors": null,
+    "generated": 0,
+    "language": "objc",
+    "node_count": 4,
+    "path": "bridge/ios/Caller.m",
+    "size": 144
+  },
+  {
+    "content_hash": "1aa7628ded662d1a72b699a27fe1c5b4fe2400381ddc099537ab3cc8db48de53",
+    "errors": null,
+    "generated": 0,
+    "language": "swift",
+    "node_count": 4,
+    "path": "bridge/ios/Greeter.swift",
+    "size": 139
+  },
+  {
+    "content_hash": "1639c45a7d7f36ee67bc0e76ecd6ac972e6df7d920d48f8a91db010500ed868c",
+    "errors": null,
+    "generated": 0,
+    "language": "kotlin",
+    "node_count": 7,
+    "path": "expo-modules/android/src/main/java/expo/modules/hello/HelloModule.kt",
+    "size": 341
+  },
+  {
+    "content_hash": "c8b2906d2c93c857ef66743e89997188cfdeee8238b249c56e94a0006fed2f9b",
+    "errors": null,
+    "generated": 0,
+    "language": "swift",
+    "node_count": 5,
+    "path": "expo-modules/ios/HelloModule.swift",
+    "size": 283
+  },
+  {
+    "content_hash": "59b454ef62faa0a2be50de14f2c445b0948a75dc9f2de966e327a77dbe08bbb2",
+    "errors": null,
+    "generated": 0,
+    "language": "typescript",
+    "node_count": 4,
+    "path": "expo-modules/src/index.ts",
+    "size": 191
+  },
+  {
+    "content_hash": "da5d96c2180cbc1d6a4e010b807d498f5d222a01da6eeef478ed7a34c2e0441a",
+    "errors": null,
+    "generated": 0,
+    "language": "dart",
+    "node_count": 6,
+    "path": "flutter/lib/main.dart",
+    "size": 321
+  },
+  {
+    "content_hash": "e3ecfb1187c2edfd49ecd5f715a901ef95876c39e8e83ecfc8c0b775ac5def2f",
+    "errors": null,
+    "generated": 0,
+    "language": "yaml",
+    "node_count": 0,
+    "path": "flutter/pubspec.yaml",
+    "size": 213
+  },
+  {
+    "content_hash": "47e43d86482970653ed8a5c8ab3a0c7cbfaadcb94cad1a63a9c40032a26db136",
+    "errors": null,
+    "generated": 0,
+    "language": "java",
+    "node_count": 9,
+    "path": "rn/android/app/src/main/java/com/example/CameraModule.java",
+    "size": 498
+  },
+  {
+    "content_hash": "64a4ff2b776e218e076c6626f18e1bf08f564f0745a5473a25dc1bbf68efc60d",
+    "errors": null,
+    "generated": 0,
+    "language": "objc",
+    "node_count": 5,
+    "path": "rn/ios/CameraModule.m",
+    "size": 438
+  },
+  {
+    "content_hash": "6fea6281774f118ed7aca5eb0105095052af77097b6dda26362b46e4412b7957",
+    "errors": null,
+    "generated": 0,
+    "language": "tsx",
+    "node_count": 7,
+    "path": "rn/src/Camera.tsx",
+    "size": 505
+  }
+]

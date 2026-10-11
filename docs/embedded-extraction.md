@@ -9,7 +9,7 @@ The Vue prototype validates the embedded extractor pattern. The important archit
 
 ## Vue prototype
 
-The Vue extractor creates one `component` node for the `.vue` file, then extracts `<script>` / `<script setup>` regions:
+The Vue extractor creates the `.vue` file's `file` node (`file:<path>`) holding one `component` node, then extracts `<script>` / `<script setup>` regions:
 
 ```text
 /<script(\s[^>]*)?>(?<content>[\s\S]*?)<\/script>/g
@@ -19,9 +19,9 @@ The attribute string drives language selection:
 
 - `lang="ts"` or `lang="typescript"` → TypeScript grammar.
 - otherwise → JavaScript grammar.
-- `setup` is recorded as a script-block property, but both normal and setup blocks are delegated through the same JS/TS extraction path.
+- both normal and setup blocks are delegated to the TypeScript or JavaScript extractor; `setup` marks a block that runs once per component instance.
 
-The delegated result is merged by changing embedded nodes and refs back to the parent language (`vue`) and adding a `contains` edge from the component node to each extracted symbol. Template component usages are scanned outside `<script>` / `<style>` ranges with:
+The delegated result is folded into the component (upstream `foldScriptResult`, #2268): nodes and refs take the parent language (`vue`) and their file lines; the component contains each symbol the block holds at its top level, while a nested symbol keeps its own parent; the block's own file node is dropped, since the `.vue` file node is the file. A per-instance block's top-level calls and references, a top-level constant's or variable's initializer's included, are the component's; its imports, and everything a non-setup block does at its top level, stay with the file node. Template component usages are scanned outside `<script>` / `<style>` ranges with:
 
 ```text
 /<([A-Za-z][A-Za-z0-9_-]*)\b/g
@@ -57,8 +57,8 @@ Tree-sitter 0.26 note: `QueryCursor::matches()` returns a `StreamingIterator`, n
 
 - Region regex is the same script-block shape as Vue: `/<script(\s[^>]*)?>(?<content>[\s\S]*?)<\/script>/g`.
 - `lang="ts"` / `lang="typescript"` selects TypeScript; otherwise JavaScript.
-- `context="module"` is recorded for module scripts.
-- Script result merge uses the same line-offset pattern as Vue and rewrites language to `svelte`.
+- `context="module"` (Svelte 4) or a bare `module` attribute (Svelte 5) marks a module script; any other script is an instance script.
+- Script results fold into the component exactly as Vue's do, with language `svelte`: an instance script runs per component instance, so its top-level calls are the component's; a module script's stay with the `.svelte` file node.
 - Template scan additionally finds calls inside `{...}` expressions with `/\{([^}#/:@][^}]*)\}/g` and call names with `/\b([a-zA-Z_$][\w$.]*)\s*\(/g`.
 - Svelte 5 runes (`$props`, `$state`, `$derived`, `$effect`, etc.) are compiler built-ins and must be filtered.
 - PascalCase tags become component references; lowercase native tags are skipped.
@@ -98,7 +98,7 @@ Tree-sitter 0.26 note: `QueryCursor::matches()` returns a `StreamingIterator`, n
 - Keep Vue, Svelte, Razor, Liquid, and MyBatis as custom extractors. Do not wait for full outer-language grammars before shipping useful graph coverage.
 - Reuse one embedded-region abstraction with: `content`, `language`, `content_byte_start`, `line_offset`, and optional `synthetic_wrapper_line_delta`.
 - Prefer byte-offset-to-line remap when the captured content can include leading delimiters/newlines. It avoids the off-by-one ambiguity in line-only formulas.
-- Preserve the merge semantics: embedded symbols keep the parent file path, parent embedded language (`vue`, `svelte`, `razor`, etc.), and receive parent-component/file containment edges.
+- Preserve the merge semantics: embedded symbols keep the parent file path, parent embedded language (`vue`, `svelte`, `razor`, etc.), and receive parent-component/file containment edges; Vue and Svelte fold their scripts as described above.
 - Template-only references should remain unresolved refs unless the extractor creates explicit nodes for them (Liquid snippets/sections are the notable exception).
 - Rust `regex` has no backreferences; translate regexes such as `</\1>` into explicit alternation or a small scanner.
 - Add fixtures that assert original-file line numbers, not region-local lines, for every delegated extractor.

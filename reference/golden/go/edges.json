@@ -1,5 +1,65 @@
 [
   {
+    "col": 19,
+    "kind": "references",
+    "line": 10,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "function:0244d391763c9267d93aa0f3daec14c3",
+    "target": "struct:beab0d96e183bbfa38be5a5dae58f885"
+  },
+  {
+    "col": 19,
+    "kind": "references",
+    "line": 4,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "function:8182c7b348a8f99ca98471df85b680d0",
+    "target": "struct:beab0d96e183bbfa38be5a5dae58f885"
+  },
+  {
+    "col": 44,
+    "kind": "references",
+    "line": 10,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "function:9ca48aa8a0359c83c2de731082d72870",
+    "target": "struct:6e0211f4791dd90203584f4897508e01"
+  },
+  {
+    "col": 6,
+    "kind": "instantiates",
+    "line": 9,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "method:96ccb238e207922617dad91a1a3bd096",
+    "target": "struct:69ce2dc78af1c72c5e705b2eff7d50b3"
+  },
+  {
+    "col": 9,
+    "kind": "instantiates",
+    "line": 11,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "function:9ca48aa8a0359c83c2de731082d72870",
+    "target": "struct:6e0211f4791dd90203584f4897508e01"
+  },
+  {
     "col": null,
     "kind": "contains",
     "line": null,

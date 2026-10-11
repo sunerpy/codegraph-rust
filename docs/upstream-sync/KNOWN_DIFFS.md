@@ -60,26 +60,8 @@ stay deferred. The following colby behaviors are intentionally NOT ported in v1:
   (`reference/colby/src/resolution/callback-synthesizer.ts`, invoked at
   `index.ts:959-963`). Heuristic dynamic-dispatch edge synthesis; deferred behind
   the same extension point.
-- **C++ receiver-type inference for method calls** — `inferCppReceiverType` /
-  `matchCppCallChain` / `resolveCppCallResultType` (`name-matcher.ts:333-570`).
-  Reads source text + return types to type bare `recv.method()` receivers.
-- **Java/Kotlin field-receiver inference** — `inferJavaFieldReceiverType`
-  (`name-matcher.ts:705-752`), the Spring `@Autowired` field-injection receiver
-  path.
-- **Per-language import refinements in `resolveViaImport`** — Go cross-package
-  (`resolveGoCrossPackageReference`), Python module-member / absolute-module
-  (`resolvePythonModuleMember` / `resolvePythonAbsoluteModule` /
-  `findPythonModuleFile`), Rust qualified-path (`resolveRustPathReference` and
-  the `crate::`/`self::`/`super::` module-file walk), and Lua/Luau `require`
-  (`resolveLuaRequire`) — `import-resolver.ts:1202-1253,1311-1658`. The generic
-  import-mapping + re-export-chase core ships; these language-specific
-  refinements are follow-ups.
 - **Razor `@using` cascade resolution** — `resolveRazorUsing` / `getRazorUsings`
   (`index.ts:1116-1158`), tied to the Razor framework layer.
-- **Batched/conformance passes** — `resolveAndPersistBatched` +
-  `resolveChainedCallsViaConformance` (`index.ts:836-970`). The v1 port resolves
-  the full `unresolved_refs` set in one pass (`resolveAndPersist`); the bounded
-  batched loop and the deferred-chain conformance second pass are deferred.
 
 None of the above are Tier-3 allowlist rules: they do not introduce a different
 value for a surface colby produces on the validated mini golden — they are

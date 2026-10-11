@@ -273,6 +273,15 @@ impl ResolutionContext for StoreResolutionContext<'_> {
         exists
     }
 
+    fn is_indexed_file(&self, file_path: &str) -> bool {
+        let normalized = file_path.replace('\\', "/");
+        self.store
+            .file_by_path(&normalized)
+            .ok()
+            .flatten()
+            .is_some()
+    }
+
     fn read_file(&self, file_path: &str) -> Option<String> {
         self.read_file_shared(file_path)
             .map(|content| content.to_string())
@@ -848,6 +857,10 @@ mod tests {
         assert!(ctx.file_exists("known.ts"));
         assert!(ctx.file_exists("ondisk.ts"));
         assert!(!ctx.file_exists("nowhere.ts"));
+        // Only the index's own files are indexed; the disk fallback is not.
+        assert!(ctx.is_indexed_file("known.ts"));
+        assert!(!ctx.is_indexed_file("ondisk.ts"));
+        assert!(!ctx.is_indexed_file("nowhere.ts"));
         assert!(
             !ctx.file_exists(&format!(
                 "../{}/secret.ts",
