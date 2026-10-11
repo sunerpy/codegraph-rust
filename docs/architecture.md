@@ -262,7 +262,9 @@ bursts, reloads project control files, and reconciles additions, modifications,
 deletions, and scope changes through `codegraph-watch`. A burst past 500 paths,
 a backend's sign of dropped events, or (on Windows) drift found by an idle
 sentinel escalates to one full reconcile, reported as RECOVERING until it
-commits. A sync re-resolves the references that name what it changed; an import
+commits. A sync re-resolves the references that name what it changed, a
+qualified one (`User.create`) by its last segment as well (at most 500 per
+segment); an import
 names a file, a folder or a namespace rather than a symbol, so the parked
 imports an added file or a changed file's namespace can satisfy (by the file's
 name and stem, its folder's, or the namespace's whole name) send their files

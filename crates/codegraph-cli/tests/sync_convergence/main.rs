@@ -592,9 +592,10 @@ matrix! {
     typescript_outside_type_call_ignores_an_added_method,
     cpp_class_template_receiver_body_edit,
     csharp_extension_method_call_body_edit,
-    #[ignore = "W5-05 (tail retry): a sync never retries a dotted unresolved ref (`objectType.IsEnum`) by its tail, so the touched name `IsEnum` does not reach it"]
     csharp_method_becomes_an_extension_method,
     python_inherited_classmethod_body_edit,
+    python_class_method_of_an_added_class,
+    python_inherited_classmethod_of_an_added_base,
     typescript_test_suite_namesake_appears,
     java_overload_delegation_body_edit,
     python_call_ignores_a_react_hook_body_edit,

@@ -360,6 +360,39 @@ pub fn python_inherited_classmethod_body_edit() -> Case {
         .edge_after("function make", "calls", "method Base::create")
 }
 
+/// W5-05a (upstream #1240's tail retry): a qualified call `User.create()`
+/// parked before its class exists links once a new file declares the class,
+/// as a fresh index links it; the whole-name retry never matches it.
+pub fn python_class_method_of_an_added_class() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Python])
+        .file("pkg/service.py", "def make():\n    return User.create()\n")
+        .write(
+            "pkg/user.py",
+            "class User:\n    @classmethod\n    def create(cls):\n        return cls()\n",
+        )
+        .edge_after("function make", "calls", "method User::create")
+}
+
+/// W5-05a: a call through a subclass (`User.create()`) reaches the
+/// classmethod of a base that a new file declares later, as a fresh index
+/// reaches it; the caller's file is unchanged and its import already resolved.
+pub fn python_inherited_classmethod_of_an_added_base() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Python])
+        .file(
+            "pkg/user.py",
+            "from pkg.base import Base\n\n\nclass User(Base):\n    pass\n",
+        )
+        .file(
+            "pkg/service.py",
+            "from pkg.user import User\n\n\ndef make():\n    return User.create()\n",
+        )
+        .write(
+            "pkg/base.py",
+            "class Base:\n    @classmethod\n    def create(cls):\n        return cls()\n",
+        )
+        .edge_after("function make", "calls", "method Base::create")
+}
+
 /// Upstream #2209: a test suite's `Record` that appears later is never what
 /// production code's `Record<…>` names; shipped test support stays in reach.
 pub fn typescript_test_suite_namesake_appears() -> Case {

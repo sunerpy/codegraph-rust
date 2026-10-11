@@ -194,3 +194,48 @@ fn a_key_more_parked_imports_share_than_the_ceiling_is_skipped() {
         3
     );
 }
+
+#[test]
+fn a_qualified_reference_is_found_by_its_tail_never_by_its_whole_name() {
+    let store = store("tails");
+    // `x.b` (a call) and the path imports wait under the tail `b`, as
+    // upstream's `name_tail` does; `b.dart` waits under `dart`, the bare
+    // `useState` under the whole-name lane only.
+    assert_eq!(
+        names(
+            store
+                .unresolved_refs_by_name_tails(&keys(&["b"]), 500)
+                .unwrap()
+        ),
+        ["../b.dart", "package:app/b.dart", "src/b.dart", "x.b"]
+    );
+    assert_eq!(
+        names(
+            store
+                .unresolved_refs_by_name_tails(&keys(&["Bar"]), 500)
+                .unwrap()
+        ),
+        ["Foo.Bar"]
+    );
+    assert!(
+        store
+            .unresolved_refs_by_name_tails(&keys(&["useState", "x.b"]), 500)
+            .unwrap()
+            .is_empty()
+    );
+    // A tail more references share than the ceiling wakes none of them.
+    assert!(
+        store
+            .unresolved_refs_by_name_tails(&keys(&["b"]), 3)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        names(
+            store
+                .unresolved_refs_by_name_tails(&keys(&["b", "Bar"]), 3)
+                .unwrap()
+        ),
+        ["Foo.Bar"]
+    );
+}

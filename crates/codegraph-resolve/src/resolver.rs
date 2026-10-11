@@ -2861,7 +2861,10 @@ impl ReferenceResolver {
         let by_files = store.unresolved_refs_by_files(&files)?;
         let by_sites = store.unresolved_refs_by_sites(&sites)?;
         let by_names = store.unresolved_refs_by_names(&names)?;
-        let scoped = union_persisted_refs([by_files, by_sites, by_names])?;
+        // A qualified reference (`User.create`) waits for its tail's name:
+        // the whole-name lookup above never matches it (upstream #1240).
+        let by_tails = store.unresolved_refs_by_name_tails(&names, NAME_TAIL_RETRY_CEILING)?;
+        let scoped = union_persisted_refs([by_files, by_sites, by_names, by_tails])?;
 
         let result = {
             let context = self.store_context(store);
@@ -3324,6 +3327,11 @@ fn delete_internal_constructor_rows(
     }
     Ok(())
 }
+
+/// How many qualified references one tail may wake in a sync (upstream's
+/// per-name retry ceiling): a tail more share is a name too common for one
+/// new definition to settle.
+const NAME_TAIL_RETRY_CEILING: usize = 500;
 
 fn union_persisted_refs(
     lanes: impl IntoIterator<Item = Vec<UnresolvedRef>>,

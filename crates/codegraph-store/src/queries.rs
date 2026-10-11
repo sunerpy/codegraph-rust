@@ -1049,6 +1049,48 @@ impl Store {
         Ok(out)
     }
 
+    /// The unresolved references written with a qualifier (`User.create`,
+    /// `objectType.IsEnum`) whose [`reference_name_tail`] is one of `names`,
+    /// the symbol names a sync's changed files touched (upstream #1240's
+    /// `name_tail` retry). The whole-name lookup,
+    /// [`Self::unresolved_refs_by_names`], never matches them. A tail more
+    /// than `per_key_ceiling` such references share is skipped, as
+    /// upstream's per-name ceiling skips names that common.
+    pub fn unresolved_refs_by_name_tails(
+        &self,
+        names: &[String],
+        per_key_ceiling: usize,
+    ) -> rusqlite::Result<Vec<UnresolvedRef>> {
+        if names.is_empty() {
+            return Ok(Vec::new());
+        }
+        let names: HashSet<&str> = names.iter().map(String::as_str).collect();
+        let mut stmt = self.conn.prepare(
+            "SELECT * FROM unresolved_refs \
+             WHERE instr(reference_name, '.') > 0 OR instr(reference_name, ':') > 0 ORDER BY id",
+        )?;
+        let rows = stmt
+            .query_map([], row_to_unresolved_ref)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut buckets: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+        for (index, reference) in rows.iter().enumerate() {
+            let tail = reference_name_tail(&reference.reference_name, reference.reference_kind);
+            if tail != reference.reference_name && names.contains(tail.as_str()) {
+                buckets.entry(tail).or_default().push(index);
+            }
+        }
+        let mut chosen = BTreeSet::new();
+        for indexes in buckets.values() {
+            if indexes.len() <= per_key_ceiling {
+                chosen.extend(indexes.iter().copied());
+            }
+        }
+        Ok(chosen
+            .into_iter()
+            .map(|index| rows[index].clone())
+            .collect())
+    }
+
     /// The parked imports a sync that adds files should retry (upstream
     /// `getRetryableFailedImports`, #2392). An import names a file, a folder or
     /// a namespace, which the symbol-name lookup cannot match, so it is found by
