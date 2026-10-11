@@ -3431,7 +3431,16 @@ pub fn match_method_call(
                 inferred.rsplit('.').next().unwrap_or(&inferred).to_string()
             };
             if is_undeclared_type_name(&type_name, reference, context) {
-                return None;
+                // KEEP-RUST (owner 2026-10-11, W3-05c): a C# call on an
+                // outside type still reaches the one project extension method
+                // in scope that takes it as `this` (`objectType.IsEnum()` on a
+                // `System.Type`); anything else stops here.
+                return crate::csharp_extensions::extension_method_target(
+                    &type_name,
+                    &method_name,
+                    reference,
+                    context,
+                );
             }
         } else {
             match crate::awaited::infer_awaited_receiver(&object_or_class, reference, context) {

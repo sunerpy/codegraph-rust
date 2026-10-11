@@ -605,6 +605,86 @@ mod seams {
         assert_no_edge!(project, "function leveldb::Length" => calls => "method leveldb::Sizer::size");
     }
 
+    /// W3-05c (KEEP-RUST, owner 2026-10-11): a C# call on a type the project
+    /// does not declare reaches the one project extension method in scope
+    /// that takes it as `this` and fits the call's arguments (Newtonsoft's
+    /// `objectType.IsEnum()` on a `System.Type`), and the overload pass keeps
+    /// it (`propertyInfo.GetGetMethod(true)` stays the `bool` overload). Two
+    /// fitting overloads, an extension whose namespace is not in scope (also a
+    /// sibling block's local `using`), a qualified `this` type, and an outside
+    /// type with no extension all stay unresolved.
+    #[test]
+    fn pr2169_a_csharp_call_on_an_outside_type_reaches_the_projects_extension_method() {
+        let project = Project::new()
+            .file(
+                "src/Utilities/TypeExtensions.cs",
+                "using System;\nusing System.Collections.Generic;\nusing System.Reflection;\n\nnamespace App.Utilities\n{\n    internal static class TypeExtensions\n    {\n        public static bool IsEnum(this Type type)\n        {\n            return false;\n        }\n\n        public static MethodInfo GetGetMethod(this PropertyInfo propertyInfo)\n        {\n            return propertyInfo.GetGetMethod(false);\n        }\n\n        public static MethodInfo GetGetMethod(this PropertyInfo propertyInfo, bool nonPublic)\n        {\n            return null;\n        }\n\n        public static MethodInfo GetMethod(this Type type, string name, BindingFlags bindingFlags)\n        {\n            return null;\n        }\n\n        public static MethodInfo GetMethod(this Type type, string name, IList<Type> parameterTypes)\n        {\n            return null;\n        }\n\n        public static int Scale(this System.Timers.Timer timer)\n        {\n            return 0;\n        }\n    }\n}\n",
+            )
+            .file(
+                "src/Utilities/ILGeneratorExtensions.cs",
+                "using System.Reflection;\nusing System.Reflection.Emit;\n\nnamespace App.Utilities\n{\n    internal static class ILGeneratorExtensions\n    {\n        public static void CallMethod(this ILGenerator generator, MethodInfo methodInfo)\n        {\n        }\n    }\n}\n",
+            )
+            .file(
+                "src/Hidden/HiddenExtensions.cs",
+                "using System;\n\nnamespace App.Hidden\n{\n    internal static class HiddenExtensions\n    {\n        public static bool IsHidden(this Type type)\n        {\n            return false;\n        }\n    }\n}\n",
+            )
+            .file(
+                "src/Model/Money.cs",
+                "namespace App.Model\n{\n    public class Money\n    {\n        public override string ToString()\n        {\n            return \"0\";\n        }\n    }\n}\n",
+            )
+            .file(
+                "src/Serialization/Reader.cs",
+                "using System;\nusing System.Collections.Generic;\nusing System.IO;\nusing System.Reflection;\nusing System.Reflection.Emit;\nusing App.Utilities;\n\nnamespace App.Serialization\n{\n    public class Reader\n    {\n        public bool Check(Type objectType)\n        {\n            return objectType.IsEnum();\n        }\n\n        public void Emit(ILGenerator generator, MethodInfo m)\n        {\n            generator.CallMethod(m);\n        }\n\n        public MethodInfo Getter(PropertyInfo propertyInfo)\n        {\n            return propertyInfo.GetGetMethod(true);\n        }\n\n        public MethodInfo Find(Type type, IList<Type> parameterTypes)\n        {\n            return type.GetMethod(null, parameterTypes);\n        }\n\n        public bool Hidden(Type type)\n        {\n            return type.IsHidden();\n        }\n\n        public int Tick(System.Timers.Timer timer)\n        {\n            return timer.Scale();\n        }\n\n        public string Text(StringWriter writer)\n        {\n            return writer.ToString();\n        }\n    }\n}\n",
+            )
+            .file(
+                "src/Nest.cs",
+                "using System;\n\nnamespace Outer\n{\n    internal static class OuterExtensions\n    {\n        public static bool IsOuter(this Type type)\n        {\n            return false;\n        }\n    }\n\n    namespace Inner\n    {\n        internal static class InnerExtensions\n        {\n            public static bool IsInner(this Type type)\n            {\n                return false;\n            }\n        }\n\n        public class Deep\n        {\n            public bool Down(Type type)\n            {\n                return type.IsOuter();\n            }\n        }\n    }\n\n    public class Top\n    {\n        public bool Up(Type type)\n        {\n            return type.IsInner();\n        }\n    }\n}\n",
+            )
+            .file(
+                "src/Two.cs",
+                "using System;\n\nnamespace App.First\n{\n    using App.Hidden;\n\n    public class A\n    {\n        public bool Seen(Type type)\n        {\n            return type.IsHidden();\n        }\n    }\n}\n\nnamespace App.Second\n{\n    public class B\n    {\n        public bool Unseen(Type type)\n        {\n            return type.IsHidden();\n        }\n    }\n}\n",
+            )
+            .index();
+
+        let extensions = "src/Utilities/TypeExtensions.cs";
+        assert_edge!(
+            project,
+            "method App.Serialization::Reader::Check" => calls => "method App.Utilities::TypeExtensions::IsEnum"
+        );
+        assert_edge!(
+            project,
+            "method App.Serialization::Reader::Emit" => calls => "method App.Utilities::ILGeneratorExtensions::CallMethod"
+        );
+        assert_edge!(
+            project,
+            "method App.Serialization::Reader::Getter" => calls => &format!("method App.Utilities::TypeExtensions::GetGetMethod @{extensions}:19")
+        );
+        assert_no_edge!(
+            project,
+            "method App.Serialization::Reader::Getter" => calls => &format!("method App.Utilities::TypeExtensions::GetGetMethod @{extensions}:14")
+        );
+        assert_edge!(
+            project,
+            &format!("method App.Utilities::TypeExtensions::GetGetMethod @{extensions}:14") => calls => &format!("method App.Utilities::TypeExtensions::GetGetMethod @{extensions}:19")
+        );
+        assert_no_edge!(project, "method App.Serialization::Reader::Find" => calls => "method App.Utilities::TypeExtensions::GetMethod");
+        assert_no_edge!(project, "method App.Serialization::Reader::Hidden" => calls => "method App.Hidden::HiddenExtensions::IsHidden");
+        assert_no_edge!(project, "method App.Serialization::Reader::Tick" => calls => "method App.Utilities::TypeExtensions::Scale");
+        assert_no_edge!(project, "method App.Serialization::Reader::Text" => calls => "method App.Model::Money::ToString");
+        assert_edge!(project, "method App.First::A::Seen" => calls => "method App.Hidden::HiddenExtensions::IsHidden");
+        // `B` is in `App.Second`; the extraction still files it under the
+        // file's first namespace until W4-CS-01 (#2220), the scope reader
+        // does not.
+        assert_no_edge!(project, "method App.First::B::Unseen" => calls => "method App.Hidden::HiddenExtensions::IsHidden");
+        assert_unresolved!(project, "method App.First::B::Unseen" => calls => "type.IsHidden");
+        // An enclosing namespace's extension is in scope in a nested one; a
+        // nested one's is not in scope outside it (both files under `Outer`
+        // by the extraction, see above).
+        assert_edge!(project, "method Outer::Deep::Down" => calls => "method Outer::OuterExtensions::IsOuter");
+        assert_no_edge!(project, "method Outer::Top::Up" => calls => "method Outer::InnerExtensions::IsInner");
+        assert_unresolved!(project, "method Outer::Top::Up" => calls => "type.IsInner");
+    }
+
     /// Upstream #2180 (`aa0c73c4`): a call through a class name reaches the
     /// class method it inherits, by the supertypes its declaration heads name
     /// (Pascal `class(…)`, Python bases), before any guess by name.

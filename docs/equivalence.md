@@ -1183,7 +1183,15 @@ correction shows up as a diff attributable to one change:
   `new()`, property accessor bodies and expression-bodied members, field
   initializers, nested and sibling block namespaces, `using static`, a partial
   class split across declarations, and an overload that delegates to its
-  sibling.
+  sibling. It declares no extension method, so the rule that a call on an
+  outside type reaches the project's one in-scope extension method for it
+  (W3-05c; KEEP-RUST, OD-8: upstream resolves no extension method) moves
+  nothing here; the probe
+  `pr2169_a_csharp_call_on_an_outside_type_reaches_the_projects_extension_method`
+  and the sync case `csharp_extension_method_call_body_edit` pin it. What it
+  cannot tell apart: two outside types with one simple name from different
+  namespaces (`System.Threading.Timer` and `System.Timers.Timer`), imported by
+  different files, as every typed resolution by simple name.
 - **`java`**: `extends`/`implements`, object creation and an anonymous class,
   enum constants with their own bodies, a static import, two same-named `Field`
   classes in different packages, test-only imports of Mockito helpers, and the

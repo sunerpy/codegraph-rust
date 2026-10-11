@@ -290,6 +290,53 @@ pub fn cpp_class_template_receiver_body_edit() -> Case {
         )
 }
 
+/// W3-05c (KEEP-RUST): a C# call on an outside type keeps reaching the
+/// project's extension method for it, before and after the body changes.
+pub fn csharp_extension_method_call_body_edit() -> Case {
+    Case::new(Change::BodyEdit, &[Language::CSharp])
+        .file(
+            "src/Utilities/TypeExtensions.cs",
+            "using System;\n\nnamespace App.Utilities\n{\n    internal static class TypeExtensions\n    {\n        public static bool IsEnum(this Type type)\n        {\n            return false;\n        }\n    }\n}\n",
+        )
+        .file(
+            "src/Reader.cs",
+            "using System;\nusing App.Utilities;\n\nnamespace App\n{\n    public class Reader\n    {\n        public bool Check(Type objectType)\n        {\n            return objectType.IsEnum();\n        }\n    }\n}\n",
+        )
+        .write(
+            "src/Reader.cs",
+            "using System;\nusing App.Utilities;\n\nnamespace App\n{\n    public class Reader\n    {\n        public bool Check(Type objectType)\n        {\n            bool result = objectType.IsEnum();\n            return result;\n        }\n    }\n}\n",
+        )
+        .edge_throughout(
+            "method App::Reader::Check",
+            "calls",
+            "method App.Utilities::TypeExtensions::IsEnum",
+        )
+}
+
+/// W3-05c (KEEP-RUST): a static method that gains its `this` parameter, on
+/// the same line, becomes the extension method an unchanged file's call on an
+/// outside type reaches, as a fresh index of the edit finds.
+pub fn csharp_method_becomes_an_extension_method() -> Case {
+    Case::new(Change::BodyEdit, &[Language::CSharp])
+        .file(
+            "src/Utilities/TypeExtensions.cs",
+            "using System;\n\nnamespace App.Utilities\n{\n    internal static class TypeExtensions\n    {\n        public static bool IsEnum(Type type)\n        {\n            return false;\n        }\n    }\n}\n",
+        )
+        .file(
+            "src/Reader.cs",
+            "using System;\nusing App.Utilities;\n\nnamespace App\n{\n    public class Reader\n    {\n        public bool Check(Type objectType)\n        {\n            return objectType.IsEnum();\n        }\n    }\n}\n",
+        )
+        .write(
+            "src/Utilities/TypeExtensions.cs",
+            "using System;\n\nnamespace App.Utilities\n{\n    internal static class TypeExtensions\n    {\n        public static bool IsEnum(this Type type)\n        {\n            return false;\n        }\n    }\n}\n",
+        )
+        .edge_after(
+            "method App::Reader::Check",
+            "calls",
+            "method App.Utilities::TypeExtensions::IsEnum",
+        )
+}
+
 /// Upstream #2180: a call through a class name reaches the class method the
 /// class inherits, before and after the calling body changes.
 pub fn python_inherited_classmethod_body_edit() -> Case {

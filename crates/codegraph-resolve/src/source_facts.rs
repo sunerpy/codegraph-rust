@@ -138,6 +138,7 @@ pub struct SourceFacts {
     rust_use_scopes: OnceLock<crate::rust_lexical::RustUseScopes>,
     python_from_imports: OnceLock<HashMap<String, String>>,
     minified_script: OnceLock<bool>,
+    csharp_scopes: OnceLock<Arc<crate::csharp_scopes::CsharpScopes>>,
 }
 
 impl SourceFacts {
@@ -163,6 +164,7 @@ impl SourceFacts {
             rust_use_scopes: OnceLock::new(),
             python_from_imports: OnceLock::new(),
             minified_script: OnceLock::new(),
+            csharp_scopes: OnceLock::new(),
         }
     }
 
@@ -351,6 +353,15 @@ impl SourceFacts {
         scan: impl FnOnce(&str) -> HashMap<String, String>,
     ) -> &HashMap<String, String> {
         self.python_from_imports.get_or_init(|| scan(&self.source))
+    }
+
+    /// The C# namespace blocks and `using` directives of the raw source,
+    /// read once.
+    pub(crate) fn csharp_scopes(&self) -> Arc<crate::csharp_scopes::CsharpScopes> {
+        Arc::clone(
+            self.csharp_scopes
+                .get_or_init(|| Arc::new(crate::csharp_scopes::CsharpScopes::read(&self.source))),
+        )
     }
 
     /// Whether the raw source is a minified or bundled script; `detect` runs

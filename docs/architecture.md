@@ -138,7 +138,9 @@ streaming path for very large graphs), then applies deterministic strategies:
 1. language-aware imports, re-exports, packages, and paths;
 2. qualified, scoped, receiver/type, lexical, and exact-name matching (a
    receiver written as, or inferred to be, a type the project does not declare
-   stops the name guesses; a class-name receiver also reaches the class
+   stops the name guesses, except that a C# call still reaches the one
+   project extension method in scope that takes that type as `this` and fits
+   its arguments; a class-name receiver also reaches the class
    methods its declared supertypes provide; a receiver-word guess never takes
    a framework-dispatched handler, an unnamed test double or the caller
    itself; in a language that overloads by arity, a call then moves to the

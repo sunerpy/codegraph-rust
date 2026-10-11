@@ -44,14 +44,25 @@ impl Arity {
     fn takes(self, count: usize) -> bool {
         count >= self.min && self.max.is_none_or(|max| count <= max)
     }
+
+    /// The arity once a C# extension method's `this` parameter, which an
+    /// instance-style call does not pass, is set aside.
+    fn without_this(self) -> Self {
+        Self {
+            min: self.min.saturating_sub(1),
+            max: self.max.map(|max| max.saturating_sub(1)),
+        }
+    }
 }
 
-/// A method's same-owner overloads in its file and every one's arity.
+/// A method's same-owner overloads in its file and every one's arity, with
+/// whether each is a C# extension method (a `this` first parameter).
 #[derive(Debug)]
 pub(crate) struct OverloadSet {
     name: String,
-    own: Option<Arity>,
-    siblings: Vec<(String, Option<Arity>)>,
+    owner: String,
+    own: Option<(Arity, bool)>,
+    siblings: Vec<(String, Option<(Arity, bool)>)>,
 }
 
 /// Overload sets by method id, per resolution pass.
@@ -83,7 +94,25 @@ pub(crate) fn retarget_overload(
     let Some(set) = set else {
         return result;
     };
-    let Some(own) = set.own else {
+    // A C# extension method called on a receiver other than its own class
+    // (`propertyInfo.GetGetMethod(true)`, not `TypeExtensions.GetGetMethod(p,
+    // true)`) is not passed its `this` parameter (W3-05c).
+    let instance_style = reference.language == Language::CSharp
+        && reference
+            .reference_name
+            .rsplit_once('.')
+            .is_some_and(|(receiver, _)| {
+                receiver.rsplit('.').next().unwrap_or(receiver) != set.owner
+            });
+    let arity_of = |entry: (Arity, bool)| {
+        let (arity, extension) = entry;
+        if extension && instance_style {
+            arity.without_this()
+        } else {
+            arity
+        }
+    };
+    let Some(own) = set.own.map(arity_of) else {
         return result;
     };
     let Some(args) = paren_list_after(
@@ -139,7 +168,7 @@ pub(crate) fn retarget_overload(
     let fits: Vec<&String> = set
         .siblings
         .iter()
-        .filter(|(_, arity)| arity.is_some_and(|arity| arity.takes(count)))
+        .filter(|(_, arity)| arity.is_some_and(|arity| arity_of(arity).takes(count)))
         .map(|(id, _)| id)
         .collect();
     match fits.as_slice() {
@@ -176,7 +205,7 @@ fn overload_set_of(id: &str, context: &dyn ResolutionContext) -> Option<Overload
     if siblings.is_empty() {
         return None;
     }
-    let arity = |node: &Node| -> Option<Arity> {
+    let arity = |node: &Node| -> Option<(Arity, bool)> {
         let list = paren_list_after(&node.file_path, node.start_line, 0, &own.name, context)?;
         let params: Vec<String> = split_top_level(&list)
             .into_iter()
@@ -187,10 +216,15 @@ fn overload_set_of(id: &str, context: &dyn ResolutionContext) -> Option<Overload
             .filter(|p| !p.contains('=') && !is_pack(p))
             .count();
         let max = (!params.iter().any(|p| is_pack(p))).then_some(params.len());
-        Some(Arity { min, max })
+        let extension = node.language == Language::CSharp
+            && params
+                .first()
+                .is_some_and(|first| first.trim_start().starts_with("this "));
+        Some((Arity { min, max }, extension))
     };
     Some(OverloadSet {
         name: own.name.clone(),
+        owner: owner.rsplit("::").next().unwrap_or(owner).to_string(),
         own: arity(&own),
         siblings: siblings
             .iter()
@@ -201,7 +235,7 @@ fn overload_set_of(id: &str, context: &dyn ResolutionContext) -> Option<Overload
 
 /// A variadic parameter: `...` (outside one level of `<…>`), C#'s `params`,
 /// Kotlin's `vararg`.
-fn is_pack(param: &str) -> bool {
+pub(crate) fn is_pack(param: &str) -> bool {
     static ANGLES: OnceLock<Regex> = OnceLock::new();
     static KEYWORD: OnceLock<Regex> = OnceLock::new();
     let flat = ANGLES
@@ -266,7 +300,7 @@ fn swift_labels_fit(labels: &[String], param_list: &str) -> bool {
 /// Split `a, f(b, c), d<e, f>` at its top-level commas (upstream
 /// `splitCppTopLevel`): a quoted string is one unit, `(`, `[`, `{` and `<`
 /// nest, and `->` closes nothing.
-fn split_top_level(text: &str) -> Vec<String> {
+pub(crate) fn split_top_level(text: &str) -> Vec<String> {
     let chars: Vec<char> = text.chars().collect();
     let mut out = Vec::new();
     let mut depth = 0usize;
@@ -306,7 +340,7 @@ fn split_top_level(text: &str) -> Vec<String> {
 
 /// The balanced `( … )` after `name`, from `line` / `column` of `file`
 /// (twelve lines at most), or `None` (upstream `cppParenListAfter`).
-fn paren_list_after(
+pub(crate) fn paren_list_after(
     file: &str,
     line: i64,
     column: usize,

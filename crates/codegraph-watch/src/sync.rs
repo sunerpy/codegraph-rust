@@ -11,7 +11,7 @@ use codegraph_core::IndexPaths;
 use codegraph_core::config::Config;
 use codegraph_core::generated_header::{detect_generated_file, is_minifiable_script};
 use codegraph_core::node_id::hash_content;
-use codegraph_core::types::{FileRecord, Node, NodeKind};
+use codegraph_core::types::{FileRecord, Language, Node, NodeKind};
 use codegraph_extract::{
     ExtensionOverrides, ExtractOptions, SourceText, detect_language_of, extract_file_with_options,
     is_source_file, read_source_file,
@@ -1036,6 +1036,19 @@ fn reextract_into_store(
                 .map(|node| node.name.clone()),
         );
     }
+    // A C# extension method is reached through the `this` type and the
+    // namespace its declaration reads (W3-05c), which no node records: a file
+    // that declares one touches its method names, so the calls naming them
+    // resolve afresh.
+    if file.language == Language::CSharp && declares_csharp_extension_method(&hash_input) {
+        changed_names.note_all(
+            old_nodes
+                .iter()
+                .chain(&result.nodes)
+                .filter(|node| node.kind == NodeKind::Method)
+                .map(|node| node.name.clone()),
+        );
+    }
     for node in &result.nodes {
         if matches!(node.kind, NodeKind::Namespace | NodeKind::Module) {
             changed_names
@@ -1130,6 +1143,26 @@ impl ChangedNames {
             }
         }
     }
+}
+
+/// Whether C# `source` may declare an extension method: a parameter list
+/// that opens with a `this` parameter, attributes allowed before it
+/// (`IsEnum(this Type type)`). Over-approximates (`if (this is X)`), which
+/// only re-resolves more references.
+fn declares_csharp_extension_method(source: &str) -> bool {
+    source.match_indices("this").any(|(at, _)| {
+        if !source[at + 4..].starts_with(char::is_whitespace) {
+            return false;
+        }
+        let mut before = source[..at].trim_end();
+        while let Some(rest) = before.strip_suffix(']') {
+            let Some(open) = rest.rfind('[') else {
+                return false;
+            };
+            before = rest[..open].trim_end();
+        }
+        before.ends_with('(')
+    })
 }
 
 /// A node as a ref in ANOTHER file sees it during resolution: every field but
