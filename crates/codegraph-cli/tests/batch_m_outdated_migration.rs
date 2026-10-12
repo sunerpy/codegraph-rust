@@ -470,6 +470,78 @@ fn incremental_sync_on_outdated_v2_forces_all_files() {
     );
 }
 
+/// W4-JVM-01: a migration writes the Java head rows and their marker a
+/// fresh `index --force` writes, so the next sync compares a changed Java
+/// file's heads with what it held.
+#[test]
+fn outdated_migration_writes_the_java_head_rows_of_index_force() {
+    let dir = TestDir::new("outdated-java-heads");
+    let project = dir.path().join("mini");
+    for (path, contents) in [
+        (
+            "src/app/Root.java",
+            "package app;\n\npublic class Root {\n    protected void assist() { }\n}\n",
+        ),
+        (
+            "src/app/Base.java",
+            "package app;\n\npublic class Base extends Root implements Runnable {\n    public void run() { }\n}\n",
+        ),
+        (
+            "src/app/Child.java",
+            "package app;\n\npublic class Child extends Base {\n    void go() {\n        assist();\n    }\n}\n",
+        ),
+    ] {
+        let full = project.join(path);
+        fs::create_dir_all(full.parent().unwrap()).expect("create the source directory");
+        fs::write(full, contents).expect("write a source file");
+    }
+    let run = cli(&["init", project.to_str().unwrap()]);
+    assert!(
+        run.ok,
+        "setup: `codegraph init` must succeed (stdout={}, stderr={})",
+        run.stdout, run.stderr
+    );
+    let paths = IndexPaths::resolve(&project, None).expect("resolve v2 paths");
+    stage_state_slot(
+        &paths,
+        100,
+        CURRENT_STORAGE_PROTOCOL,
+        CURRENT_EXTRACTION_VERSION - 1,
+        "current",
+    );
+    let run = cli(&["sync", project.to_str().unwrap()]);
+    assert!(
+        run.ok,
+        "sync must migrate an Outdated namespace: stdout={}, stderr={}",
+        run.stdout, run.stderr
+    );
+    let (_scratch, peer) = fresh_force_peer("outdated-java-heads", &project);
+    let head_rows = |paths: &IndexPaths| {
+        Store::open_for_read(paths, deadline(), || false)
+            .expect("readable namespace")
+            .project_metadata_with_prefix("java_type_heads")
+            .expect("Java head rows")
+    };
+    let migrated = head_rows(&paths);
+    assert_eq!(
+        migrated
+            .iter()
+            .map(|(key, _)| key.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "java_type_heads:src/app/Base.java",
+            "java_type_heads:src/app/Child.java",
+            "java_type_heads_version",
+        ],
+        "a migration writes the head rows and their marker: {migrated:?}"
+    );
+    assert_eq!(
+        migrated,
+        head_rows(&IndexPaths::resolve(&peer, None).expect("resolve peer v2 paths")),
+        "a forced migration must write the Java head rows of `index --force`"
+    );
+}
+
 /// Migration is a from-source rebuild, so a tracked file that no longer exists
 /// on disk disappears from the migrated index and the result still equals a
 /// fresh `index --force` over the surviving tree.

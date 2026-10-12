@@ -153,6 +153,8 @@ pub struct SourceFacts {
     cpp_template_parameters: Mutex<HashMap<String, Arc<BTreeSet<String>>>>,
     cpp_class_bases: Mutex<HashMap<String, Arc<Vec<String>>>>,
     cpp_usings: OnceLock<Arc<Vec<crate::cpp_supertypes::CppUsing>>>,
+    java_file_scope: OnceLock<Arc<crate::java_scope::JavaFileScope>>,
+    java_heads: Mutex<HashMap<String, Arc<crate::java_scope::JavaHead>>>,
 }
 
 impl SourceFacts {
@@ -193,6 +195,8 @@ impl SourceFacts {
             cpp_template_parameters: Mutex::new(HashMap::new()),
             cpp_class_bases: Mutex::new(HashMap::new()),
             cpp_usings: OnceLock::new(),
+            java_file_scope: OnceLock::new(),
+            java_heads: Mutex::new(HashMap::new()),
         }
     }
 
@@ -553,6 +557,26 @@ impl SourceFacts {
         read: impl FnOnce(&str) -> Vec<crate::cpp_supertypes::CppUsing>,
     ) -> Arc<Vec<crate::cpp_supertypes::CppUsing>> {
         Arc::clone(self.cpp_usings.get_or_init(|| Arc::new(read(&self.source))))
+    }
+
+    /// The package and imports of a Java file (upstream #2126, #2236), read
+    /// once.
+    pub(crate) fn java_file_scope(&self) -> Arc<crate::java_scope::JavaFileScope> {
+        Arc::clone(
+            self.java_file_scope
+                .get_or_init(|| Arc::new(crate::java_scope::JavaFileScope::read(&self.source))),
+        )
+    }
+
+    /// Memoised supertype names the head of the Java type declaration
+    /// `declaration_id` (defined in this file) writes (upstream #2126,
+    /// #2236); `read` runs at most once per declaration.
+    pub(crate) fn java_head(
+        &self,
+        declaration_id: &str,
+        read: impl FnOnce(&Self) -> crate::java_scope::JavaHead,
+    ) -> Arc<crate::java_scope::JavaHead> {
+        keyed_memo(&self.java_heads, declaration_id, || Arc::new(read(self)))
     }
 
     /// The C# namespace blocks and `using` directives of the raw source,

@@ -339,7 +339,20 @@ and restored with the surface marker, and an index without it, or with an
 older version, re-resolves every C and C++ file once and rebuilds the namespace
 rows (a base that becomes a namesake in another namespace, and a class gaining
 or losing its `template <…>` head while no alias's text changes, are not
-detected); an import
+detected); a Java file whose head row moved (a class, interface or enum whose
+head names other types, by the two readers resolution uses and in file order,
+came, went or now names others; the rows are kept per file in
+`project_metadata`) sends every unchanged file declaring a Java type of a
+touched name, or an anonymous class instantiating one, down the whole-file lane,
+the names closed over every head that names one, since a bare call's scope walk
+and a type name's ancestor walk read those heads by name across the project; a
+package the sync makes the project declare, or stop declaring (only Java and
+Kotlin files declare one), sends every unchanged Java file with an import from
+under it down the same lane, since an import from outside the project owns its
+name; the `java_type_heads_version` marker is withdrawn and restored with the
+others, and an index without it re-resolves every Java file once and rebuilds
+the head rows (a call through a receiver typed as a subtype of a changed head,
+in a file declaring no type of a touched name, is not detected); an import
 names a file, a folder or a namespace rather than a symbol, so the parked
 imports an added file or a changed file's namespace can satisfy (by the file's
 name and stem, its folder's, or the namespace's whole name) send their files

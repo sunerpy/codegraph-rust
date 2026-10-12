@@ -205,6 +205,22 @@ resolution is persisted, and a sync that finds it missing or at another version
 re-resolves every C and C++ file and rebuilds the namespace rows before writing
 it. Neither is a canonical surface.
 
+Head rows record what Java resolution reads of a Java file's type declarations:
+for each class, interface and enum, the names the scope walk of a bare call
+reads from the lines of its head and the names its ancestor walk reads, by the
+same readers. `java_type_heads:<path>` holds the JSON `{"entries": [{"name",
+"qualified_name", "supertypes", "ancestors"}]}`, the entries in the order of the
+declarations in the file (the walk reads same-named declarations in that order,
+across files by path); a declaration whose head names nothing has no entry, and
+a file with no entry has no row. A full index and a migration write them with
+the namespace rows; a sync writes the rows it changed last, with the other rows.
+`java_type_heads_version` (1) records that no sync left a Java reference
+unrefreshed whose resolution reads another file's heads or the project's
+packages, and that the head rows are current; it is written, withdrawn and
+checked as `cpp_type_surface_version` is, and a sync that finds it missing or at
+another version re-resolves every Java file and rebuilds the head rows. Neither
+is a canonical surface.
+
 ## FTS5
 
 `nodes_fts` is an external-content FTS5 table over `nodes`:

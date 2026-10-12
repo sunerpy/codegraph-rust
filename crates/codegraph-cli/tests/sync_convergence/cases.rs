@@ -2569,6 +2569,278 @@ pub fn java_subclass_gains_a_base_its_caller_reaches() -> Case {
         .edge_after("method app::Use::go", "calls", "method app::Base::run")
 }
 
+/// Upstream #2126: a bare call reaches a method of a supertype the classes
+/// around it name in their heads, so a base changed in another file moves the
+/// call of an unchanged subclass, as on a fresh index.
+pub fn java_bare_call_follows_a_base_change_in_another_file() -> Case {
+    Case::new(Change::EditHeritage, &[Language::Java])
+        .file(
+            "src/app/Root.java",
+            "package app;\n\npublic class Root {\n    protected void assist() { }\n}\n",
+        )
+        .file(
+            "src/app/Other.java",
+            "package app;\n\npublic class Other {\n    protected void assist() { }\n}\n",
+        )
+        .file(
+            "src/app/Base.java",
+            "package app;\n\npublic class Base extends Root {\n}\n",
+        )
+        .file(
+            "src/app/Child.java",
+            "package app;\n\npublic class Child extends Base {\n    void go() {\n        assist();\n    }\n}\n",
+        )
+        .write(
+            "src/app/Base.java",
+            "package app;\n\npublic class Base extends Other {\n}\n",
+        )
+        .edge_before("method app::Child::go", "calls", "method app::Root::assist")
+        .edge_after("method app::Child::go", "calls", "method app::Other::assist")
+}
+
+/// Upstream #2126: the scope walk reads every declaration of a type's name,
+/// so a head changed in another package's same-named class moves the bare
+/// call of an unchanged class of that name, as on a fresh index.
+pub fn java_bare_call_follows_a_same_named_head_in_another_file() -> Case {
+    Case::new(Change::EditHeritage, &[Language::Java])
+        .file(
+            "src/lib/Root.java",
+            "package lib;\n\npublic class Root {\n    public void assist() { }\n}\n",
+        )
+        .file(
+            "src/lib/Other.java",
+            "package lib;\n\npublic class Other {\n    public void assist() { }\n}\n",
+        )
+        .file(
+            "src/lib/Node.java",
+            "package lib;\n\npublic class Node extends Root {\n}\n",
+        )
+        .file(
+            "src/app/Node.java",
+            "package app;\n\npublic class Node {\n    void go() {\n        assist();\n    }\n}\n",
+        )
+        .write(
+            "src/lib/Node.java",
+            "package lib;\n\npublic class Node extends Other {\n}\n",
+        )
+        .edge_before("method app::Node::go", "calls", "method lib::Root::assist")
+        .edge_after("method app::Node::go", "calls", "method lib::Other::assist")
+}
+
+/// #2126 with an anonymous class (KEEP-RUST): it derives from what it
+/// instantiates, so that interface changing its base in another file moves
+/// a bare call in the unchanged anonymous class, as on a fresh index.
+pub fn java_anonymous_class_follows_an_interface_head_change() -> Case {
+    Case::new(Change::EditHeritage, &[Language::Java])
+        .file(
+            "src/lib/Left.java",
+            "package lib;\n\npublic interface Left {\n    default void step() { }\n}\n",
+        )
+        .file(
+            "src/lib/Right.java",
+            "package lib;\n\npublic interface Right {\n    default void step() { }\n}\n",
+        )
+        .file(
+            "src/lib/Walker.java",
+            "package lib;\n\npublic interface Walker extends Left {\n}\n",
+        )
+        .file(
+            "src/app/Tree.java",
+            "package app;\n\nimport lib.Walker;\n\npublic class Tree {\n    Object walk() {\n        return new Walker() {\n            void next() {\n                step();\n            }\n        };\n    }\n}\n",
+        )
+        .write(
+            "src/lib/Walker.java",
+            "package lib;\n\npublic interface Walker extends Right {\n}\n",
+        )
+        .edge_before(
+            "method app::Tree::walk::<Walker$anon@7>::next",
+            "calls",
+            "method lib::Left::step",
+        )
+        .edge_after(
+            "method app::Tree::walk::<Walker$anon@7>::next",
+            "calls",
+            "method lib::Right::step",
+        )
+}
+
+/// Upstream #2126 reads a head's six lines as written, a `? extends X` in
+/// the class body's first lines included: editing that body text moves the
+/// bare call of an unchanged subclass, though no declaration's `extends`
+/// changed, as on a fresh index.
+pub fn java_head_window_text_moves_a_subclass_bare_call() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Java])
+        .file(
+            "src/app/Root.java",
+            "package app;\n\npublic class Root {\n    protected void assist() { }\n}\n",
+        )
+        .file(
+            "src/app/Other.java",
+            "package app;\n\npublic class Other {\n    protected void assist() { }\n}\n",
+        )
+        .file(
+            "src/app/Base.java",
+            "package app;\n\npublic class Base {\n    java.util.List<? extends Root> items;\n    void touch() {\n    }\n}\n",
+        )
+        .file(
+            "src/app/Child.java",
+            "package app;\n\npublic class Child extends Base {\n    void go() {\n        assist();\n    }\n}\n",
+        )
+        .write(
+            "src/app/Base.java",
+            "package app;\n\npublic class Base {\n    java.util.List<? extends Other> items;\n    void touch() {\n    }\n}\n",
+        )
+        .edge_before("method app::Child::go", "calls", "method app::Root::assist")
+        .edge_after("method app::Child::go", "calls", "method app::Other::assist")
+}
+
+/// Upstream #2126 in a batch: the base and the type between it and an
+/// unchanged subclass both change in one sync; the subclass's bare call
+/// reaches what the new middle type names, as on a fresh index.
+pub fn java_batch_rewrites_a_base_and_a_middle_type() -> Case {
+    Case::new(Change::EditHeritage, &[Language::Java])
+        .file(
+            "src/app/Root.java",
+            "package app;\n\npublic class Root {\n    protected void assist() { }\n}\n",
+        )
+        .file(
+            "src/app/Other.java",
+            "package app;\n\npublic class Other {\n    protected void assist() { }\n}\n",
+        )
+        .file(
+            "src/app/Spare.java",
+            "package app;\n\npublic class Spare {\n    protected void assist() { }\n}\n",
+        )
+        .file(
+            "src/app/Base.java",
+            "package app;\n\npublic class Base extends Root {\n}\n",
+        )
+        .file(
+            "src/app/Mid.java",
+            "package app;\n\npublic class Mid extends Base {\n}\n",
+        )
+        .file(
+            "src/app/Child.java",
+            "package app;\n\npublic class Child extends Mid {\n    void go() {\n        assist();\n    }\n}\n",
+        )
+        .write(
+            "src/app/Base.java",
+            "package app;\n\npublic class Base extends Other {\n}\n",
+        )
+        .write(
+            "src/app/Mid.java",
+            "package app;\n\npublic class Mid extends Spare {\n}\n",
+        )
+        .edge_before("method app::Child::go", "calls", "method app::Root::assist")
+        .edge_after("method app::Child::go", "calls", "method app::Spare::assist")
+}
+
+/// A file with two same-named interfaces, each extending thirty names: the
+/// scope walk of a bare call reads them in file order and stops at forty
+/// names, so whichever comes first is the one whose names it reaches.
+fn heads_at_the_limit(b_first: bool) -> String {
+    let names = |prefix: char| {
+        (1..=30)
+            .map(|n| format!("{prefix}{n}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let a = format!(
+        "class Front {{\n    interface Node extends {} {{ }}\n}}\n",
+        names('A')
+    );
+    let b = format!(
+        "class Back {{\n    interface Node extends {} {{ }}\n}}\n",
+        names('B')
+    );
+    let (first, second) = if b_first { (b, a) } else { (a, b) };
+    format!("package app;\n\n{first}\n{second}")
+}
+
+static HEADS_B_FIRST: LazyLock<String> = LazyLock::new(|| heads_at_the_limit(true));
+static HEADS_A_FIRST: LazyLock<String> = LazyLock::new(|| heads_at_the_limit(false));
+
+/// Upstream #2126's walk stops at forty names: two same-named interfaces in
+/// one file trading places, nothing else changing, decide which of their
+/// supertypes an unchanged caller's bare call can reach, as on a fresh
+/// index.
+pub fn java_same_named_heads_trade_places_at_the_walk_limit() -> Case {
+    Case::new(Change::EditHeritage, &[Language::Java])
+        .file(
+            "src/app/B20.java",
+            "package app;\n\npublic interface B20 {\n    default void reachB() { }\n}\n",
+        )
+        .file(
+            "src/app/Caller.java",
+            "package app;\n\npublic class Caller implements Node {\n    void go() {\n        reachB();\n    }\n}\n",
+        )
+        .file("src/app/Heads.java", HEADS_B_FIRST.as_str())
+        .write("src/app/Heads.java", HEADS_A_FIRST.as_str())
+        .edge_before("method app::Caller::go", "calls", "method app::B20::reachB")
+        .no_edge_after("method app::Caller::go", "calls", "method app::B20::reachB")
+}
+
+/// Upstream #2236: a nested type is in reach from a subclass of its owner,
+/// the heads read from source, so a base changed in another file moves the
+/// type reference of an unchanged subclass, as on a fresh index.
+pub fn java_nested_type_follows_a_base_change_in_another_file() -> Case {
+    Case::new(Change::EditHeritage, &[Language::Java])
+        .file(
+            "src/lib/Widget.java",
+            "package lib;\n\npublic class Widget {\n    public static class Part { }\n}\n",
+        )
+        .file(
+            "src/other/Holder.java",
+            "package other;\n\npublic class Holder {\n    public static class Part { }\n}\n",
+        )
+        .file(
+            "src/app/Mid.java",
+            "package app;\n\npublic class Mid extends lib.Widget {\n}\n",
+        )
+        .file(
+            "src/app/Sub.java",
+            "package app;\n\npublic class Sub extends Mid {\n    Part part;\n}\n",
+        )
+        .write(
+            "src/app/Mid.java",
+            "package app;\n\npublic class Mid extends other.Holder {\n}\n",
+        )
+        .edge_before(
+            "field app::Sub::part",
+            "references",
+            "class lib::Widget::Part",
+        )
+        .edge_after(
+            "field app::Sub::part",
+            "references",
+            "class other::Holder::Part",
+        )
+}
+
+/// Upstream #2236: a nested type of an unrelated class is no candidate, so a
+/// namesake appearing in another package leaves the subclass's reference
+/// where it was.
+pub fn java_nested_type_ignores_an_added_namesake() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Java])
+        .file(
+            "src/lib/Widget.java",
+            "package lib;\n\npublic class Widget {\n    public static class Part { }\n}\n",
+        )
+        .file(
+            "src/app/Sub.java",
+            "package app;\n\npublic class Sub extends lib.Widget {\n    Part part;\n}\n",
+        )
+        .write(
+            "src/app/Holder.java",
+            "package app;\n\npublic class Holder {\n    public static class Part { }\n}\n",
+        )
+        .edge_throughout(
+            "field app::Sub::part",
+            "references",
+            "class lib::Widget::Part",
+        )
+}
+
 /// Upstream #2446: a base class defined in a variable declaration (`class
 /// Base { … } base_instance;`) is a node, so a heritage edit in another file
 /// moves the `extends` edge from one such class to another, as on a fresh
@@ -3616,6 +3888,74 @@ pub fn typescript_change_a_superclass() -> Case {
         )
         .edge_before("class Dog", "extends", "class Animal")
         .edge_after("class Dog", "extends", "class Robot")
+}
+
+/// Upstream #2195: an import is the project's when a project file declares
+/// its package. A file appearing in that package makes an unchanged file's
+/// `Tools.make()` under `import com.lib.Tools;` a project name again, as on a
+/// fresh index.
+pub fn java_import_package_appears_in_the_project() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Java])
+        .file(
+            "src/app/Tools.java",
+            "package app;\n\npublic class Tools {\n    public static void make() { }\n}\n",
+        )
+        .file(
+            "src/app/Use.java",
+            "package app;\n\nimport com.lib.Tools;\n\npublic class Use {\n    void go() {\n        Tools.make();\n    }\n}\n",
+        )
+        .write(
+            "src/com/lib/Other.java",
+            "package com.lib;\n\npublic class Other { }\n",
+        )
+        .edge_after("method app::Use::go", "calls", "method app::Tools::make")
+}
+
+/// Upstream #2195: the only file of a package moving to another package
+/// makes an import from the first an outside one, which owns its name in an
+/// unchanged file, as on a fresh index.
+pub fn java_import_package_is_renamed_away() -> Case {
+    Case::new(Change::RenameSymbol, &[Language::Java])
+        .file(
+            "src/app/Tools.java",
+            "package app;\n\npublic class Tools {\n    public static void make() { }\n}\n",
+        )
+        .file(
+            "src/app/Use.java",
+            "package app;\n\nimport com.lib.Tools;\n\npublic class Use {\n    void go() {\n        Tools.make();\n    }\n}\n",
+        )
+        .file(
+            "src/com/lib/Other.java",
+            "package com.lib;\n\npublic class Other { }\n",
+        )
+        .write(
+            "src/com/lib/Other.java",
+            "package com.misc;\n\npublic class Other { }\n",
+        )
+        .edge_before("method app::Use::go", "calls", "method app::Tools::make")
+        .no_edge_after("method app::Use::go", "calls", "method app::Tools::make")
+}
+
+/// Upstream #2195: the last file of a package leaving makes an import from it
+/// an outside one, which owns its name in an unchanged file, as on a fresh
+/// index.
+pub fn java_import_package_leaves_the_project() -> Case {
+    Case::new(Change::DeleteImportedModule, &[Language::Java])
+        .file(
+            "src/app/Tools.java",
+            "package app;\n\npublic class Tools {\n    public static void make() { }\n}\n",
+        )
+        .file(
+            "src/app/Use.java",
+            "package app;\n\nimport com.lib.Tools;\n\npublic class Use {\n    void go() {\n        Tools.make();\n    }\n}\n",
+        )
+        .file(
+            "src/com/lib/Other.java",
+            "package com.lib;\n\npublic class Other { }\n",
+        )
+        .remove("src/com/lib/Other.java")
+        .edge_before("method app::Use::go", "calls", "method app::Tools::make")
+        .no_edge_after("method app::Use::go", "calls", "method app::Tools::make")
 }
 
 pub fn java_change_a_superclass_and_interface() -> Case {

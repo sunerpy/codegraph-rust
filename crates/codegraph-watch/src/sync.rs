@@ -557,6 +557,9 @@ fn sync_paths_with_store(
     // The same for the C/C++ dependents of changed type declarations: every
     // C/C++ file is re-resolved once (W4-CPP-04).
     let cpp_bootstrap = crate::cpp_dependents::needs_bootstrap(store)?;
+    // And for the Java files whose resolution reads other files' heads and
+    // packages: every Java file is re-resolved once (W4-JVM-01).
+    let java_bootstrap = crate::java_heads::needs_bootstrap(store)?;
 
     let paths = paths.into_iter().collect::<Vec<_>>();
     let total = paths.len();
@@ -603,7 +606,7 @@ fn sync_paths_with_store(
         on_progress(done + 1, total);
     }
 
-    if changed || surface_bootstrap || cpp_bootstrap {
+    if changed || surface_bootstrap || cpp_bootstrap || java_bootstrap {
         note_python_global_readers(
             project_root,
             store,
@@ -660,6 +663,22 @@ fn sync_paths_with_store(
         )? {
             dependent_sites.remove(&file);
             dependent_fallbacks.insert(file);
+        }
+        // What Java resolution in an unchanged file read from a changed
+        // file: the heads its scope walks pass through, the packages its
+        // imports are from (W4-JVM-01).
+        let java = crate::java_heads::java_refresh(
+            store,
+            project_root,
+            scope.options.max_file_size,
+            &changed_names.java,
+            &reindexed,
+            &changed_names.removed_files,
+            java_bootstrap,
+        )?;
+        for file in &java.files {
+            dependent_sites.remove(file);
+            dependent_fallbacks.insert(file.clone());
         }
         // What a changed Python import statement re-exports moves for its
         // module's importers without any node of those names changing.
@@ -747,8 +766,10 @@ fn sync_paths_with_store(
         // mutation withdrew.
         surfaces.write_rows(store)?;
         namespaces.write_rows(store)?;
+        java.write_rows(store)?;
         crate::module_surfaces::finish_bootstrap(store)?;
         crate::cpp_dependents::write_marker(store)?;
+        crate::java_heads::write_marker(store)?;
     }
 
     // Orphan sweep (#1187, upstream index.ts:645-682): a full-index resolution
@@ -1128,6 +1149,7 @@ fn remove_tracked_file(
         change.importers.extend(importers);
         note_python_fixture_holders(change, &old_nodes);
     }
+    changed_names.java.note(store, relative, &old_nodes, None)?;
     delete_unresolved_refs_by_file(store, relative)?;
     store.delete_file_record(relative)?;
     changed_names
@@ -1484,6 +1506,14 @@ fn reextract_into_store(
         changed_names.any.insert((*name).to_string());
     }
     changed_names.note_candidates(&old_nodes, &result.nodes);
+    // What other files' Java resolution reads of this one's text and
+    // packages, before and after (W4-JVM-01).
+    changed_names.java.note(
+        store,
+        relative,
+        &old_nodes,
+        Some((file.language, source, &result.nodes)),
+    )?;
     // No name in another file resolves into a minified script (upstream
     // #2204), and that verdict is read from the script's text: a script that
     // was or is generated can flip it with every node where it was, so all of
@@ -1602,6 +1632,9 @@ struct ChangedNames {
     /// What the changed C/C++ files held that resolution in other files reads
     /// (W4-CPP-04).
     cpp: crate::cpp_dependents::CppChanges,
+    /// What the changed Java, Kotlin and Scala files held that Java
+    /// resolution in other files reads: heads and packages (W4-JVM-01).
+    java: crate::java_heads::JavaChanges,
 }
 
 /// What a changed Python file held before the change. A module global's
@@ -1636,6 +1669,7 @@ impl ChangedNames {
         if !self.surface_dirty {
             store.delete_project_metadata(codegraph_resolve::module_surface::VERSION_KEY)?;
             crate::cpp_dependents::withdraw_marker(store)?;
+            crate::java_heads::withdraw_marker(store)?;
             self.surface_dirty = true;
         }
         Ok(())
@@ -2016,6 +2050,179 @@ pub(crate) mod tests {
                 &[CPP_LISTS, CPP_TO_SKIP, CPP_USE, CPP_OTHER_EDITED]
             )
         );
+    }
+
+    fn java_marker(db: &Path) -> Option<String> {
+        Store::open(db)
+            .unwrap()
+            .get_project_metadata(crate::java_heads::VERSION_KEY)
+            .unwrap()
+    }
+
+    fn head_rows(db: &Path) -> Vec<(String, String)> {
+        Store::open(db)
+            .unwrap()
+            .project_metadata_with_prefix(codegraph_resolve::java_scope::HEAD_ROW_KEY_PREFIX)
+            .unwrap()
+    }
+
+    const JAVA_ROOT: (&str, &str) = (
+        "src/app/Root.java",
+        "package app;\n\npublic class Root {\n    protected void assist() { }\n}\n",
+    );
+    const JAVA_OTHER: (&str, &str) = (
+        "src/app/Other.java",
+        "package app;\n\npublic class Other {\n    protected void assist() { }\n}\n",
+    );
+    const JAVA_BASE_ROOT: (&str, &str) = (
+        "src/app/Base.java",
+        "package app;\n\npublic class Base extends Root {\n}\n",
+    );
+    const JAVA_BASE_OTHER: (&str, &str) = (
+        "src/app/Base.java",
+        "package app;\n\npublic class Base extends Other {\n}\n",
+    );
+    const JAVA_CHILD: (&str, &str) = (
+        "src/app/Child.java",
+        "package app;\n\npublic class Child extends Base {\n    void go() {\n        assist();\n    }\n}\n",
+    );
+    const JAVA_SPARE: (&str, &str) = (
+        "src/app/Spare.java",
+        "package app;\n\npublic class Spare { }\n",
+    );
+    const JAVA_SPARE_EDITED: (&str, &str) = (
+        "src/app/Spare.java",
+        "package app;\n\npublic class Spare {\n    int count;\n}\n",
+    );
+
+    /// W4-JVM-01: a sync failing after its mutations leaves the Java marker
+    /// away, so the next sync, with nothing changed or with an unrelated
+    /// change, re-resolves every Java file and rebuilds the head rows:
+    /// `Child`'s bare call, which the changed base moves, ends where a fresh
+    /// index puts it.
+    #[test]
+    fn a_java_sync_failing_after_its_mutations_leaves_the_next_one_to_reconcile() {
+        let version = Some(crate::java_heads::VERSION.to_string());
+        let dir = TestDir::new("java-heads-fail");
+        let db = default_db_path(dir.path()).unwrap();
+        let initial = [
+            JAVA_ROOT,
+            JAVA_OTHER,
+            JAVA_BASE_ROOT,
+            JAVA_CHILD,
+            JAVA_SPARE,
+        ];
+        write_files(dir.path(), &initial);
+        sync_changed_paths(dir.path(), &db, initial.iter().map(|(path, _)| *path)).unwrap();
+        assert_eq!(java_marker(&db), version);
+
+        let fail_once = |paths: &[&str]| {
+            FAIL_BEFORE_RESOLUTION.with(|fail| fail.set(true));
+            let failed = sync_changed_paths(dir.path(), &db, paths.iter().copied());
+            FAIL_BEFORE_RESOLUTION.with(|fail| fail.set(false));
+            assert!(failed.is_err(), "the injected failure must stop the sync");
+            assert_eq!(
+                java_marker(&db),
+                None,
+                "a failed sync leaves the marker away"
+            );
+        };
+
+        write_files(dir.path(), &[JAVA_BASE_OTHER]);
+        fail_once(&["src/app/Base.java"]);
+        sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
+        assert_eq!(java_marker(&db), version);
+        let fresh = [
+            JAVA_ROOT,
+            JAVA_OTHER,
+            JAVA_BASE_OTHER,
+            JAVA_CHILD,
+            JAVA_SPARE,
+        ];
+        assert_eq!(
+            edge_projection(&db),
+            fresh_edges("java-heads-fail-other", &fresh)
+        );
+        assert!(
+            edge_projection(&db)
+                .iter()
+                .any(|edge| edge.contains("Child::go -[calls]-> src/app/Other.java")),
+            "{:#?}",
+            edge_projection(&db)
+        );
+
+        write_files(dir.path(), &[JAVA_BASE_ROOT]);
+        fail_once(&["src/app/Base.java"]);
+        write_files(dir.path(), &[JAVA_SPARE_EDITED]);
+        sync_changed_paths(dir.path(), &db, ["src/app/Spare.java"]).unwrap();
+        assert_eq!(java_marker(&db), version);
+        let fresh = [
+            JAVA_ROOT,
+            JAVA_OTHER,
+            JAVA_BASE_ROOT,
+            JAVA_CHILD,
+            JAVA_SPARE_EDITED,
+        ];
+        assert_eq!(
+            edge_projection(&db),
+            fresh_edges("java-heads-fail-root", &fresh)
+        );
+    }
+
+    /// W4-JVM-01: an index without the Java marker or its head rows (built
+    /// before them) has every Java file re-resolved and every row rebuilt by
+    /// its next sync: the bare call an older sync left without its edge comes
+    /// back.
+    #[test]
+    fn an_index_without_the_java_marker_rebuilds_the_head_rows() {
+        let version = Some(crate::java_heads::VERSION.to_string());
+        let dir = TestDir::new("java-heads-bootstrap");
+        let db = default_db_path(dir.path()).unwrap();
+        let initial = [
+            JAVA_ROOT,
+            JAVA_OTHER,
+            JAVA_BASE_ROOT,
+            JAVA_CHILD,
+            JAVA_SPARE,
+        ];
+        write_files(dir.path(), &initial);
+        sync_changed_paths(dir.path(), &db, initial.iter().map(|(path, _)| *path)).unwrap();
+        assert_eq!(java_marker(&db), version);
+        let rows = head_rows(&db);
+        assert_eq!(
+            rows.iter().map(|(key, _)| key.as_str()).collect::<Vec<_>>(),
+            [
+                "java_type_heads:src/app/Base.java",
+                "java_type_heads:src/app/Child.java"
+            ]
+        );
+        let expected = edge_projection(&db);
+        {
+            let store = Store::open(&db).unwrap();
+            let dropped = store
+                .connection()
+                .execute(
+                    "DELETE FROM edges WHERE kind = 'calls' AND target = (SELECT id FROM nodes \
+                     WHERE name = 'assist' AND qualified_name = 'app::Root::assist')",
+                    [],
+                )
+                .unwrap();
+            assert_eq!(dropped, 1, "the call edge an older sync lost");
+            store
+                .delete_project_metadata_with_prefix(
+                    codegraph_resolve::java_scope::HEAD_ROW_KEY_PREFIX,
+                )
+                .unwrap();
+            store
+                .delete_project_metadata(crate::java_heads::VERSION_KEY)
+                .unwrap();
+        }
+        assert_ne!(edge_projection(&db), expected);
+        write_files(dir.path(), &[JAVA_SPARE_EDITED]);
+        sync_changed_paths(dir.path(), &db, ["src/app/Spare.java"]).unwrap();
+        assert_eq!(java_marker(&db), version);
+        assert_eq!(head_rows(&db), rows);
+        assert_eq!(edge_projection(&db), expected);
     }
 
     /// W4-CPP-04: an index without the C/C++ marker (built before it, or

@@ -5696,18 +5696,21 @@ fn index_project_inner(
 
     // `None` for an MPEG transport stream named `.ts`: video, not source (#1910).
     // A JavaScript-family module's surface rides along for the consumer to
-    // record once every file row is stored (W4a-F3), and so does what a C/C++
-    // file holds for its namespace row (W4-CPP-07).
+    // record once every file row is stored (W4a-F3), and so do what a C/C++
+    // file holds for its namespace row (W4-CPP-07) and a Java file's head row
+    // (W4-JVM-01).
     type ParsePayload = Option<(
         String,
         FileRecord,
         ExtractionResult,
         Option<ModuleSurface>,
         Option<codegraph_watch::cpp_namespace_rows::NamespaceScan>,
+        Option<codegraph_resolve::java_scope::HeadRow>,
     )>;
     let mut surfaces: Vec<(String, ModuleSurface)> = Vec::new();
     let mut namespace_scans: Vec<(String, codegraph_watch::cpp_namespace_rows::NamespaceScan)> =
         Vec::new();
+    let mut head_rows: Vec<(String, codegraph_resolve::java_scope::HeadRow)> = Vec::new();
     let schedule_tracker = tracker.clone();
     let parse_tracker = tracker.clone();
     let buffer_tracker = tracker.clone();
@@ -5764,17 +5767,20 @@ fn index_project_inner(
             let surface = codegraph_watch::module_surfaces::surface_of(relative, language, &source);
             let namespace_scan =
                 codegraph_watch::cpp_namespace_rows::scan_of(relative, language, &source);
+            let head_row = codegraph_watch::java_heads::row_of(language, &source, &result.nodes);
             Ok(Some((
                 relative.clone(),
                 file,
                 result,
                 surface,
                 namespace_scan,
+                head_row,
             )))
         },
         |buffered| buffer_tracker.buffered(buffered),
         |index, payload| {
-            let Some((relative, file, mut result, surface, namespace_scan)) = payload else {
+            let Some((relative, file, mut result, surface, namespace_scan, head_row)) = payload
+            else {
                 files_not_source += 1;
                 persist_tracker.persisted(index);
                 return Ok(());
@@ -5815,6 +5821,9 @@ fn index_project_inner(
             }
             if let Some(scan) = namespace_scan {
                 namespace_scans.push((relative.clone(), scan));
+            }
+            if let Some(row) = head_row {
+                head_rows.push((relative.clone(), row));
             }
             if let Some(surface) = surface {
                 surfaces.push((relative, surface));
@@ -5860,8 +5869,12 @@ fn index_project_inner(
     drop(surfaces);
     codegraph_watch::cpp_namespace_rows::write_index_rows(&store, &mut namespace_scans)?;
     drop(namespace_scans);
-    // A fresh index leaves no C/C++ dependent unrefreshed (W4-CPP-04).
+    codegraph_watch::java_heads::write_index_rows(&store, &mut head_rows)?;
+    drop(head_rows);
+    // A fresh index leaves no C/C++ (W4-CPP-04) or Java (W4-JVM-01)
+    // dependent unrefreshed.
     codegraph_watch::cpp_dependents::write_marker(&store)?;
+    codegraph_watch::java_heads::write_marker(&store)?;
     finish_phase(&pb, "Persisted nodes");
     diagnostic_run.phase_end("node_write", node_write_started.elapsed(), json!({}));
 

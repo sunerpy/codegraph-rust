@@ -31,6 +31,7 @@ pub mod destructured_calls;
 pub mod framework; // the FrameworkResolver extension point
 pub mod frameworks; // concrete react/vue/nestjs FrameworkResolvers
 pub mod import_resolver;
+pub mod java_scope;
 mod js_store;
 mod jsx_tags;
 pub mod lru_cache;

@@ -158,5 +158,15 @@
     "line": 28,
     "reference_kind": "calls",
     "reference_name": "r.run"
+  },
+  {
+    "candidates": null,
+    "col": 8,
+    "file_path": "src/test/java/app/MainTest.java",
+    "from_node_id": "method:c5f83603bb58827e828bd921b11695b4",
+    "language": "java",
+    "line": 16,
+    "reference_kind": "calls",
+    "reference_name": "verify"
   }
 ]

@@ -15,6 +15,7 @@ use crate::types::{
 use codegraph_core::types::{EdgeKind, Language, Node, NodeKind};
 use regex::Regex;
 use std::borrow::Borrow;
+use std::cell::OnceCell;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -2054,6 +2055,11 @@ pub fn match_by_exact_name(
     // An Objective-C name in C call syntax calls a function, a block or a
     // function pointer, never a method or property (upstream #2150).
     let objc_c_call = objc_call_shape(reference, context) == Some(ObjcCallShape::CCall);
+    // A bare Java call reaches a method in scope (upstream #2126), and a bare
+    // Java type name a type in reach (upstream #2236), both read once.
+    let java_bare = crate::java_scope::is_java_bare_call(reference);
+    let java_call_scope = OnceCell::new();
+    let java_type_site = crate::java_scope::JavaTypeSite::new(reference);
     let candidates: Vec<Arc<Node>> = reachable
         .iter()
         .filter(|n| {
@@ -2111,6 +2117,19 @@ pub fn match_by_exact_name(
                     context,
                 ))
         })
+        // halo's tests' Mockito `verify(…)` is no `EmailVerificationService`
+        // method (upstream #2126).
+        .filter(|n| {
+            !(java_bare
+                && n.kind == NodeKind::Method
+                && !java_call_scope
+                    .get_or_init(|| crate::java_scope::JavaCallScope::of(reference, context))
+                    .reaches(n, reference))
+        })
+        // Ahead of the ranking, so a visible namesake wins: retrofit's tests'
+        // `new Builder()` is not a wire converter test's nested
+        // `CrashingPhone.Builder` (upstream #2236).
+        .filter(|n| java_type_site.visible(n, context))
         .cloned()
         .collect();
 
@@ -5284,12 +5303,22 @@ pub fn match_fuzzy(reference: &RefView, context: &dyn ResolutionContext) -> Opti
     let case_insensitive = is_case_insensitive_language(reference.language);
     let python_shape = crate::python_values::python_call_shape(reference, context);
     let objc_c_call = objc_call_shape(reference, context) == Some(ObjcCallShape::CCall);
+    let java_bare = crate::java_scope::is_java_bare_call(reference);
+    let java_call_scope = OnceCell::new();
     let callable_candidates = apply_language_gate(
         candidates
             .into_iter()
             .filter(|n| callable_kinds.contains(&n.kind))
             // C call syntax in Objective-C is no message (upstream #2150).
             .filter(|n| !(objc_c_call && is_objc_member_kind(n.kind)))
+            // A bare Java call reaches a method in scope (upstream #2126).
+            .filter(|n| {
+                !(java_bare
+                    && n.kind == NodeKind::Method
+                    && !java_call_scope
+                        .get_or_init(|| crate::java_scope::JavaCallScope::of(reference, context))
+                        .reaches(n, reference))
+            })
             .filter(|n| {
                 python_shape.as_ref().is_none_or(|shape| {
                     crate::python_values::fits_python_call_shape(n, shape, reference, context)
@@ -6146,6 +6175,14 @@ pub fn match_reference(
     reference: &RefView,
     context: &dyn ResolutionContext,
 ) -> Option<ResolvedRef> {
+    // `import java.lang.reflect.Field;`: the file's `Field` is the JDK's,
+    // never a project class of that name, by any strategy (upstream #2195:
+    // gson's production code bound it to a test's nested
+    // `ParameterizedTypesTest.Field`).
+    if crate::java_scope::binds_an_outside_import(reference, context) {
+        return None;
+    }
+
     // `window.App.init()` / a sibling's `this.init()`, recorded by the bare
     // name: the object they are written on comes first (upstream #2363).
     if let Some(result) = crate::object_owners::match_collapsed_object_call(reference, context) {

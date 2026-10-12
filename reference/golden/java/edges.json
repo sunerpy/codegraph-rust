@@ -134,18 +134,6 @@
   {
     "col": 8,
     "kind": "calls",
-    "line": 16,
-    "metadata": {
-      "confidence": 0.9,
-      "resolvedBy": "exact-match"
-    },
-    "provenance": null,
-    "source": "method:c5f83603bb58827e828bd921b11695b4",
-    "target": "method:3d35716f895aa3c9f4647b6f246b841f"
-  },
-  {
-    "col": 8,
-    "kind": "calls",
     "line": 18,
     "metadata": {
       "confidence": 0.9,

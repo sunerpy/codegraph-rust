@@ -6840,3 +6840,434 @@ class basic_json
         assert_eq!(targets, Vec::<String>::new(), "{}", graph.report());
     }
 }
+
+mod java {
+    use super::support::{Graph, Project};
+
+    /// `kind qualified-name` of every edge but `contains` and `imports` out
+    /// of `file`'s nodes, sorted.
+    fn edges_from(graph: &Graph, file: &str) -> Vec<String> {
+        let mut out: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.kind != "contains" && edge.kind != "imports")
+            .filter(|edge| {
+                graph
+                    .node(&edge.source)
+                    .is_some_and(|node| node.file_path == file)
+            })
+            .filter_map(|edge| {
+                graph
+                    .node(&edge.target)
+                    .map(|target| format!("{} {}", edge.kind, target.qualified_name))
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// The names of what the method `qualified` calls, sorted.
+    fn calls_of(graph: &Graph, qualified: &str) -> Vec<String> {
+        let ids: Vec<&str> = graph
+            .nodes
+            .iter()
+            .filter(|node| node.kind == "method" && node.qualified_name == qualified)
+            .map(|node| node.id.as_str())
+            .collect();
+        assert!(!ids.is_empty(), "no method {qualified}");
+        let mut out: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.kind == "calls" && ids.contains(&edge.source.as_str()))
+            .filter_map(|edge| graph.node(&edge.target))
+            .map(|node| node.qualified_name.clone())
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// Upstream #2126 (`8987be42`): a bare Java call reaches a method of a
+    /// class around it, of one of that class's supertypes (read from the
+    /// declarations' heads), or one the file imports statically; not another
+    /// class's method of that name (halo's Mockito `verify(…)` bound 1,038
+    /// calls to an `EmailVerificationService.verify`).
+    #[test]
+    fn pr2126_a_bare_java_call_reaches_its_class_supertypes_or_static_imports() {
+        let project = Project::new()
+            .file(
+                "src/main/java/app/EmailVerificationService.java",
+                "package app;\npublic class EmailVerificationService {\n  public boolean verify(String token) { return true; }\n}\n",
+            )
+            .file(
+                "src/main/java/app/Util.java",
+                "package app;\npublic class Util {\n  public static String format(String s) { return s; }\n}\n",
+            )
+            .file(
+                "src/main/java/app/Base.java",
+                "package app;\npublic class Base {\n  protected void helper() {}\n}\n",
+            )
+            .file(
+                "src/main/java/app/Child.java",
+                "package app;\nimport static app.Util.format;\npublic class Child extends Base {\n  public void run() {\n    helper();\n    format(\"x\");\n    own();\n  }\n  private void own() {}\n}\n",
+            )
+            .file(
+                "src/test/java/app/ChildTest.java",
+                "package app;\nimport static org.mockito.Mockito.verify;\npublic class ChildTest {\n  public void sends(Object mock) {\n    verify(mock);\n  }\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        assert_eq!(
+            calls_of(graph, "app::ChildTest::sends"),
+            Vec::<String>::new(),
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            calls_of(graph, "app::Child::run"),
+            ["app::Base::helper", "app::Child::own", "app::Util::format"],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// #2126 beyond upstream's fixture: the walk follows supertypes through
+    /// a type that only names another (two levels up, an interface in an
+    /// `implements` clause, a qualified and generic base), and an on-demand
+    /// static import opens its owner's methods; a same-named method of a
+    /// class nothing reaches stays out, and so does a lone one (the edge
+    /// would be the only candidate's).
+    #[test]
+    fn pr2126_the_scope_walk_follows_heads_and_on_demand_static_imports() {
+        let project = Project::new()
+            .file(
+                "src/app/Root.java",
+                "package app;\npublic class Root {\n  protected void rootHelper() {}\n}\n",
+            )
+            .file(
+                "src/app/Mid.java",
+                "package app;\npublic class Mid<T> extends app.Root {\n}\n",
+            )
+            .file(
+                "src/app/Greeter.java",
+                "package app;\npublic interface Greeter {\n  default void greet() {}\n}\n",
+            )
+            .file(
+                "src/app/Asserts.java",
+                "package app;\npublic class Asserts {\n  public static void check(boolean b) {}\n}\n",
+            )
+            .file(
+                "src/app/Other.java",
+                "package app;\npublic class Other {\n  public void greet() {}\n  public void rootHelper() {}\n  public void lonely() {}\n}\n",
+            )
+            .file(
+                "src/app/Leaf.java",
+                "package app;\nimport static app.Asserts.*;\npublic class Leaf extends Mid<String>\n    implements Greeter {\n  void go() {\n    rootHelper();\n    greet();\n    check(true);\n    lonely();\n  }\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        assert_eq!(
+            calls_of(graph, "app::Leaf::go"),
+            [
+                "app::Asserts::check",
+                "app::Greeter::greet",
+                "app::Root::rootHelper"
+            ],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// #2126 with an anonymous class (KEEP-RUST): its bare calls reach the
+    /// methods of what it instantiates and of that type's supertypes, as in
+    /// gson's `new LinkedTreeMapIterator<…>() { … nextNode() … }`; upstream
+    /// reads only the anonymous class's own head, which names nothing.
+    #[test]
+    fn pr2126_an_anonymous_class_reaches_what_it_instantiates() {
+        let project = Project::new()
+            .file(
+                "src/app/Root.java",
+                "package app;\npublic class Root {\n  protected Object nextNode() { return null; }\n}\n",
+            )
+            .file(
+                "src/app/Walker.java",
+                "package app;\npublic abstract class Walker<T> extends Root {\n  public abstract T next();\n}\n",
+            )
+            .file(
+                "src/app/Other.java",
+                "package app;\npublic class Other {\n  public Object nextNode() { return null; }\n}\n",
+            )
+            .file(
+                "src/app/Tree.java",
+                "package app;\npublic class Tree {\n  Walker<String> walk() {\n    return new Walker<String>() {\n      public String next() {\n        return (String) nextNode();\n      }\n    };\n  }\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        assert_eq!(
+            calls_of(graph, "app::Tree::walk::<Walker$anon@4>::next"),
+            ["app::Root::nextNode"],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream #2195 (`81ce7e56`): a single-type or static import whose
+    /// package prefix is none of the project's packages makes the name mean
+    /// the outside class: gson's production code bound
+    /// `java.lang.reflect.Field` to a test's nested
+    /// `ParameterizedTypesTest.Field`. The project's own imports, nested
+    /// classes included, resolve as before.
+    #[test]
+    fn pr2195_an_import_from_outside_the_project_owns_its_name() {
+        let project = Project::new()
+            .file(
+                "src/test/java/app/functional/TypesTest.java",
+                "package app.functional;\n\npublic class TypesTest {\n  static class Field {\n    String name;\n  }\n\n  static void assertEquals(Object a, Object b) { }\n}\n",
+            )
+            .file(
+                "src/main/java/app/model/Outer.java",
+                "package app.model;\n\npublic class Outer {\n  public static class Inner {\n    public static Inner create() { return new Inner(); }\n  }\n}\n",
+            )
+            .file(
+                "src/main/java/app/Reflect.java",
+                "package app;\n\nimport java.lang.reflect.Field;\nimport app.model.Outer;\nimport app.model.Outer.Inner;\n\npublic class Reflect {\n  String nameOf(Field field) {\n    return field.getName();\n  }\n\n  Outer.Inner make() {\n    return Inner.create();\n  }\n}\n",
+            )
+            .file(
+                "src/test/java/app/ReflectTest.java",
+                "package app;\n\nimport static org.junit.Assert.assertEquals;\n\npublic class ReflectTest {\n  void names() {\n    assertEquals(\"a\", \"a\");\n  }\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        let reflect = edges_from(graph, "src/main/java/app/Reflect.java");
+        assert!(
+            !reflect.contains(&"references app.functional::TypesTest::Field".to_string()),
+            "{}",
+            graph.report()
+        );
+        assert!(
+            reflect.contains(&"calls app.model::Outer::Inner::create".to_string()),
+            "{}",
+            graph.report()
+        );
+        assert!(
+            !edges_from(graph, "src/test/java/app/ReflectTest.java")
+                .contains(&"calls app.functional::TypesTest::assertEquals".to_string()),
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// #2195 beyond upstream's fixture: a package a Kotlin file declares is
+    /// the project's, so a Java import from it still resolves; a class
+    /// imported from outside owns its name through a qualified call too
+    /// (`Mockito.verify(…)`).
+    #[test]
+    fn pr2195_a_kotlin_package_is_the_projects_and_a_qualified_use_is_owned() {
+        let project = Project::new()
+            .file(
+                "src/kt/Shapes.kt",
+                "package app.shapes\n\nclass Circle {\n  fun area(): Double = 1.0\n}\n",
+            )
+            .file(
+                "src/app/Mockito.java",
+                "package app;\n\npublic class Mockito {\n  public static void verify(Object o) {}\n}\n",
+            )
+            .file(
+                "src/app/Area.java",
+                "package app;\n\nimport app.shapes.Circle;\nimport org.mockito.Mockito;\n\npublic class Area {\n  double of(Circle c) {\n    Mockito.verify(c);\n    return c.area();\n  }\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        let area = edges_from(graph, "src/app/Area.java");
+        assert!(
+            area.contains(&"references app.shapes::Circle".to_string()),
+            "{}",
+            graph.report()
+        );
+        assert!(
+            !area.contains(&"calls app::Mockito::verify".to_string()),
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// #2195 with a package only Scala files declare: Scala files index no
+    /// namespace node (neither upstream nor here), so the package is no
+    /// project package and the import owns its name, as upstream decides it.
+    #[test]
+    fn pr2195_a_package_only_scala_declares_is_outside() {
+        let project = Project::new()
+            .file(
+                "src/scala/Geometry.scala",
+                "package app.geometry\n\nclass Circle {\n  def area(): Double = 1.0\n}\n",
+            )
+            .file(
+                "src/app/shapes/Circle.java",
+                "package app.shapes;\n\npublic class Circle { }\n",
+            )
+            .file(
+                "src/app/Area.java",
+                "package app;\n\nimport app.geometry.Circle;\n\npublic class Area {\n  double of(Circle c) {\n    return 0;\n  }\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        assert!(
+            !graph.nodes.iter().any(
+                |node| node.kind == "namespace" && node.file_path == "src/scala/Geometry.scala"
+            ),
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            edges_from(graph, "src/app/Area.java"),
+            Vec::<String>::new(),
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream #2236 (`ef62f023`): a bare Java type name is a type in reach
+    /// by package, import or nesting. retrofit's `new Retrofit.Builder()`
+    /// went to `RequestFactory.Builder`, halo's micrometer `Counter` to its
+    /// own `core.extension.Counter`; a constructor never stands in for its
+    /// type, and a nested type of what an anonymous class implements is in
+    /// reach inside it.
+    #[test]
+    fn pr2236_a_bare_java_type_name_is_a_type_in_reach() {
+        let project = Project::new()
+            .file(
+                "src/main/java/retrofit2/RequestFactory.java",
+                "package retrofit2;\n\nfinal class RequestFactory {\n  static final class Builder {\n    Builder() { }\n  }\n}\n",
+            )
+            .file(
+                "src/main/java/retrofit2/Retrofit.java",
+                "package retrofit2;\n\npublic final class Retrofit {\n  public static final class Builder {\n    public Builder() { }\n  }\n}\n",
+            )
+            .file(
+                "src/test/java/retrofit2/CallTest.java",
+                "package retrofit2;\n\nclass CallTest {\n  Object make() {\n    return new Retrofit.Builder();\n  }\n}\n",
+            )
+            .file(
+                "src/main/java/run/halo/core/extension/Counter.java",
+                "package run.halo.core.extension;\n\npublic class Counter { }\n",
+            )
+            .file(
+                "src/main/java/run/halo/core/counter/MeterUtils.java",
+                "package run.halo.core.counter;\n\nimport io.micrometer.core.instrument.Counter;\n\nclass MeterUtils {\n  static Counter counter() { return null; }\n}\n",
+            )
+            .file(
+                "src/main/java/org/jsoup/select/NodeFilter.java",
+                "package org.jsoup.select;\n\npublic interface NodeFilter {\n  enum FilterResult { CONTINUE }\n  FilterResult head(Object node);\n}\n",
+            )
+            .file(
+                "src/test/java/org/jsoup/select/TraversorTest.java",
+                "package org.jsoup.select;\n\nclass TraversorTest {\n  void filter() {\n    run(new NodeFilter() {\n      public FilterResult head(Object node) { return null; }\n    });\n  }\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        let call_test = edges_from(graph, "src/test/java/retrofit2/CallTest.java");
+        assert!(
+            call_test.contains(&"instantiates retrofit2::Retrofit::Builder".to_string()),
+            "{}",
+            graph.report()
+        );
+        assert!(
+            !call_test
+                .iter()
+                .any(|edge| edge.contains("retrofit2::RequestFactory")
+                    || edge.ends_with("::Builder::Builder")),
+            "{}",
+            graph.report()
+        );
+        assert!(
+            !edges_from(graph, "src/main/java/run/halo/core/counter/MeterUtils.java")
+                .iter()
+                .any(|edge| edge.ends_with(" run.halo.core.extension::Counter")),
+            "{}",
+            graph.report()
+        );
+        assert!(
+            edges_from(graph, "src/test/java/org/jsoup/select/TraversorTest.java")
+                .contains(&"references org.jsoup.select::NodeFilter::FilterResult".to_string()),
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// #2236 beyond upstream's fixture: a top-level type of another package
+    /// is in reach through a single-type or on-demand import and not
+    /// without one; a nested type from a subclass of its owner (two levels
+    /// down, the heads read from source) and through its owner's import; a
+    /// nested type of an unrelated class is not, whichever ranks first.
+    #[test]
+    fn pr2236_packages_imports_and_subtypes_put_a_type_in_reach() {
+        let project = Project::new()
+            .file(
+                "src/lib/Widget.java",
+                "package lib;\n\npublic class Widget {\n  public static class Part { }\n}\n",
+            )
+            .file(
+                "src/lib/Gadget.java",
+                "package lib;\n\npublic class Gadget { }\n",
+            )
+            .file(
+                "src/other/Holder.java",
+                "package other;\n\npublic class Holder {\n  public static class Part { }\n}\n",
+            )
+            .file(
+                "src/app/Base.java",
+                "package app;\n\npublic class Base extends lib.Widget { }\n",
+            )
+            .file(
+                "src/app/Sub.java",
+                "package app;\n\npublic class Sub extends Base {\n  Part part;\n}\n",
+            )
+            .file(
+                "src/app/Single.java",
+                "package app;\n\nimport lib.Gadget;\n\npublic class Single {\n  Gadget gadget;\n}\n",
+            )
+            .file(
+                "src/app/Demand.java",
+                "package app;\n\nimport lib.*;\n\npublic class Demand {\n  Gadget gadget;\n}\n",
+            )
+            .file(
+                "src/app/Nothing.java",
+                "package app;\n\npublic class Nothing {\n  Gadget gadget;\n  Part part;\n}\n",
+            )
+            .file(
+                "src/app/Members.java",
+                "package app;\n\nimport lib.Widget.*;\n\npublic class Members {\n  Part part;\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        assert_eq!(
+            edges_from(graph, "src/app/Sub.java"),
+            ["extends app::Base", "references lib::Widget::Part"],
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            edges_from(graph, "src/app/Single.java"),
+            ["references lib::Gadget"],
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            edges_from(graph, "src/app/Demand.java"),
+            ["references lib::Gadget"],
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            edges_from(graph, "src/app/Nothing.java"),
+            Vec::<String>::new(),
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            edges_from(graph, "src/app/Members.java"),
+            ["references lib::Widget::Part"],
+            "{}",
+            graph.report()
+        );
+    }
+}

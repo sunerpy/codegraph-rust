@@ -349,6 +349,8 @@ fn run_case(name: &str, case: &Case) {
     let cpp_marker = support::project_metadata_with_prefix(&fresh.db(), "cpp_type_surface");
     let namespace_rows =
         support::project_metadata_with_prefix(&fresh.db(), "cpp_namespace_surface");
+    // The Java head rows and their marker (W4-JVM-01), one prefix for both.
+    let head_rows = support::project_metadata_with_prefix(&fresh.db(), "java_type_heads");
     for (driver, project) in [("cli", &cli), ("watch", &watch)] {
         let rows = support::project_metadata_with_prefix(&project.db(), "js_module_surface");
         if rows != surface_rows {
@@ -369,6 +371,13 @@ fn run_case(name: &str, case: &Case) {
             divergent.push(format!(
                 "=== {driver} driver: the C/C++ namespace rows differ from a fresh index\n\
                  synced: {rows:#?}\nfresh: {namespace_rows:#?}"
+            ));
+        }
+        let rows = support::project_metadata_with_prefix(&project.db(), "java_type_heads");
+        if rows != head_rows {
+            divergent.push(format!(
+                "=== {driver} driver: the Java head rows differ from a fresh index\n\
+                 synced: {rows:#?}\nfresh: {head_rows:#?}"
             ));
         }
     }
@@ -794,6 +803,17 @@ matrix! {
     python_move_an_imported_module_away,
     typescript_change_a_superclass,
     java_change_a_superclass_and_interface,
+    java_bare_call_follows_a_base_change_in_another_file,
+    java_nested_type_follows_a_base_change_in_another_file,
+    java_nested_type_ignores_an_added_namesake,
+    java_import_package_appears_in_the_project,
+    java_import_package_leaves_the_project,
+    java_import_package_is_renamed_away,
+    java_bare_call_follows_a_same_named_head_in_another_file,
+    java_anonymous_class_follows_an_interface_head_change,
+    java_head_window_text_moves_a_subclass_bare_call,
+    java_batch_rewrites_a_base_and_a_middle_type,
+    java_same_named_heads_trade_places_at_the_walk_limit,
     csharp_base_list_gains_an_interface,
     objc_change_a_superclass,
     python_change_a_base_class,

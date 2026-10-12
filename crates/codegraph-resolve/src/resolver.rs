@@ -1766,6 +1766,11 @@ impl ReferenceResolver {
         if crate::sfc_scripts::is_sfc_private(&target, context) {
             return None;
         }
+        // A bare Java type name is its package's, an import's, or a nested
+        // type in reach (upstream #2236).
+        if !crate::java_scope::is_java_type_visible(&target, reference, context) {
+            return None;
+        }
         Some(result)
     }
 
