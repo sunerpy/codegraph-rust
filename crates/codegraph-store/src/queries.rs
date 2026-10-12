@@ -1419,6 +1419,40 @@ impl Store {
         Ok(out.into_iter().collect())
     }
 
+    /// The source sites of the function-value `references` edges
+    /// (`{"fnRef": true}`) whose source lies in one of `file_paths`, sorted
+    /// and deduplicated. Sync refreshes the ones that read through a Python
+    /// module global whose writes changed.
+    pub fn function_ref_sites_in_files(
+        &self,
+        file_paths: &[String],
+    ) -> rusqlite::Result<Vec<FileReferenceSite>> {
+        let mut unique = file_paths.to_vec();
+        unique.sort_unstable();
+        unique.dedup();
+        let mut out = BTreeSet::new();
+        for chunk in unique.chunks(SQLITE_PARAM_CHUNK_SIZE) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                r#"SELECT src.file_path, e.source, e.line, e.col
+                FROM edges e
+                JOIN nodes src ON src.id = e.source
+                WHERE e.kind = 'references'
+                  AND json_extract(e.metadata, '$.fnRef') = 1
+                  AND src.file_path IN ({placeholders})"#
+            );
+            let params = chunk.iter().map(|p| p as &dyn ToSql).collect::<Vec<_>>();
+            let mut stmt = self.conn.prepare(&sql)?;
+            let rows = stmt.query_map(params.as_slice(), row_to_file_reference_site)?;
+            for row in rows {
+                out.insert(row?);
+            }
+        }
+        Ok(out.into_iter().collect())
+    }
+
     /// Ports `getDependencyFilePaths` from
     /// `upstream db/queries.ts:1410-1420`: the OUTGOING twin of
     /// `dependent_file_paths` — every file containing a symbol that a symbol of

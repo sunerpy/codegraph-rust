@@ -597,6 +597,15 @@ fn sync_paths_with_store(
     }
 
     if changed {
+        note_python_global_readers(
+            project_root,
+            store,
+            scope,
+            &reindexed,
+            &mut changed_names,
+            &mut dependent_sites,
+            &mut dependent_fallbacks,
+        )?;
         // What a changed Python import statement re-exports moves for its
         // module's importers without any node of those names changing.
         if !changed_names.python_imports.is_empty() {
@@ -937,7 +946,9 @@ fn sync_one(
         return Ok(false);
     }
 
+    let mut importers = BTreeSet::new();
     for dependent in store.reference_sites_dependent_on_file(relative)? {
+        importers.insert(dependent.file_path.clone());
         merge_dependent_site(dependent_sites, dependent_fallbacks, dependent);
     }
     reextract_into_store(
@@ -947,6 +958,9 @@ fn sync_one(
         changed_names,
         (&metadata, &source, content_hash),
     )?;
+    if let Some(change) = changed_names.python_files.get_mut(relative) {
+        change.importers.extend(importers);
+    }
     if added {
         changed_names.added_files.insert(relative.to_string());
     }
@@ -969,15 +983,31 @@ fn remove_tracked_file(
         outcome.files_ignored += 1;
         return Ok(false);
     }
+    let mut importers = BTreeSet::new();
     for dependent in store.reference_sites_dependent_on_file(relative)? {
+        importers.insert(dependent.file_path.clone());
         merge_dependent_site(dependent_sites, dependent_fallbacks, dependent);
     }
     changed_names.note_removed(node_names_in_file(store, relative)?);
+    let old_nodes = store.nodes_by_file_path(relative)?;
+    let statements = python_import_statements(&old_nodes);
     changed_names.python_imports.extend(
-        python_import_statements(&store.nodes_by_file_path(relative)?)
-            .into_iter()
-            .map(|statement| (relative.to_string(), statement)),
+        statements
+            .iter()
+            .map(|statement| (relative.to_string(), statement.clone())),
     );
+    if old_nodes
+        .iter()
+        .any(|node| node.language == Language::Python)
+    {
+        let change = changed_names
+            .python_files
+            .entry(relative.to_string())
+            .or_default();
+        change.old_globals.extend(python_module_globals(&old_nodes));
+        change.statements.extend(statements);
+        change.importers.extend(importers);
+    }
     delete_unresolved_refs_by_file(store, relative)?;
     store.delete_file_record(relative)?;
     outcome.files_removed += 1;
@@ -991,6 +1021,125 @@ fn python_import_statements(nodes: &[Node]) -> BTreeSet<String> {
         .filter(|node| node.kind == NodeKind::Import && node.language == Language::Python)
         .filter_map(|node| node.signature.clone())
         .collect()
+}
+
+/// The names of the Python module globals among `nodes`: variables and
+/// constants no class or function of the file holds.
+fn python_module_globals(nodes: &[Node]) -> BTreeSet<String> {
+    nodes
+        .iter()
+        .filter(|node| {
+            node.language == Language::Python
+                && matches!(node.kind, NodeKind::Variable | NodeKind::Constant)
+                && !nodes.iter().any(|scope| {
+                    matches!(
+                        scope.kind,
+                        NodeKind::Class | NodeKind::Function | NodeKind::Method
+                    ) && scope.start_line <= node.start_line
+                        && scope.end_line >= node.start_line
+                })
+        })
+        .map(|node| node.name.clone())
+        .collect()
+}
+
+/// Method values that read through a Python module global (upstream #2291
+/// a): its type is read from its module's assignments and from other
+/// modules' writes, which no node records. For every changed Python file,
+/// the modules it declares or can write a global of are read: the
+/// unresolved method values through a global the type can now come from are
+/// retried by name, and the resolved ones through any global it had are
+/// refreshed by site, in the module and in its importers.
+fn note_python_global_readers(
+    project_root: &Path,
+    store: &Store,
+    scope: &ProjectScope,
+    reindexed: &HashSet<String>,
+    changed_names: &mut ChangedNames,
+    dependent_sites: &mut BTreeMap<String, BTreeSet<ReferenceSite>>,
+    dependent_fallbacks: &mut BTreeSet<String>,
+) -> Result<()> {
+    use codegraph_resolve::python_globals::{
+        imported_module_files, module_globals, names_through_global, reads_through_global,
+        typable_module_globals,
+    };
+    if changed_names.python_files.is_empty() {
+        return Ok(());
+    }
+    let context =
+        codegraph_resolve::StoreResolutionContext::new(store, project_root.to_string_lossy())
+            .with_max_file_size(scope.options.max_file_size);
+    let mut names = BTreeSet::new();
+    let mut sites = Vec::new();
+    let mut sources: BTreeMap<String, Option<String>> = BTreeMap::new();
+    for (file, change) in &changed_names.python_files {
+        let mut modules =
+            imported_module_files(file, change.statements.iter().map(String::as_str), &context);
+        modules.insert(file.clone());
+        for module in modules {
+            let typable = typable_module_globals(&module, &context);
+            let mut globals = typable.clone();
+            let mut readers = BTreeSet::new();
+            if module == *file {
+                globals.extend(module_globals(&module, &context));
+                globals.extend(change.old_globals.iter().cloned());
+                readers.extend(change.importers.iter().cloned());
+            } else {
+                readers.extend(
+                    store
+                        .reference_sites_dependent_on_file(&module)?
+                        .into_iter()
+                        .map(|site| site.file_path),
+                );
+            }
+            if globals.is_empty() {
+                continue;
+            }
+            readers.insert(module.clone());
+            let readers: Vec<String> = readers
+                .into_iter()
+                .filter(|reader| !reindexed.contains(reader))
+                .collect();
+            if readers.is_empty() {
+                continue;
+            }
+            if !typable.is_empty() {
+                for reference in store.unresolved_refs_by_files(&readers)? {
+                    if reference.is_function_ref
+                        && reference.language == Language::Python
+                        && names_through_global(&reference.reference_name, &typable)
+                    {
+                        names.insert(reference.reference_name);
+                    }
+                }
+            }
+            for found in store.function_ref_sites_in_files(&readers)? {
+                let Some(site) = &found.site else {
+                    sites.push(found);
+                    continue;
+                };
+                let source = sources.entry(found.file_path.clone()).or_insert_with(|| {
+                    fs::read_to_string(project_root.join(&found.file_path)).ok()
+                });
+                let before = source.as_deref().and_then(|source| {
+                    let line = source
+                        .lines()
+                        .nth(usize::try_from(site.line).ok()?.checked_sub(1)?)?;
+                    line.get(..usize::try_from(site.col).ok()?)
+                });
+                if before.is_none_or(|before| reads_through_global(before, &globals)) {
+                    sites.push(found);
+                }
+            }
+        }
+    }
+    changed_names.any.extend(names);
+    for found in sites {
+        if !reindexed.contains(&found.file_path) {
+            merge_dependent_site(dependent_sites, dependent_fallbacks, found);
+        }
+    }
+    Ok(())
 }
 
 /// Re-extract `relative` from the bytes `sync_one` already read and hashed, so
@@ -1096,6 +1245,18 @@ fn reextract_into_store(
             .symmetric_difference(&after)
             .map(|statement| (relative.to_string(), statement.clone())),
     );
+    if file.language == Language::Python
+        || old_nodes
+            .iter()
+            .any(|node| node.language == Language::Python)
+    {
+        let change = changed_names
+            .python_files
+            .entry(relative.to_string())
+            .or_default();
+        change.old_globals.extend(python_module_globals(&old_nodes));
+        change.statements.extend(before.union(&after).cloned());
+    }
 
     delete_unresolved_refs_by_file(store, relative)?;
     store.delete_file_record(relative)?;
@@ -1128,6 +1289,25 @@ struct ChangedNames {
     /// re-exports what they bind (upstream #2247), so the names they can
     /// carry are touched once the store holds the new files.
     python_imports: BTreeSet<(String, String)>,
+    /// What each changed Python file held before the change, for the module
+    /// globals it declares or can write (upstream #2291 a).
+    python_files: BTreeMap<String, PythonFileChange>,
+}
+
+/// What a changed Python file held before the change. A module global's
+/// type is read from its module's assignments and other modules' writes,
+/// which no node records, so the method values reading through it are
+/// re-resolved from here.
+#[derive(Debug, Default)]
+struct PythonFileChange {
+    /// Its module globals before the change.
+    old_globals: BTreeSet<String>,
+    /// Its import statements before and after: the modules whose globals it
+    /// can write.
+    statements: BTreeSet<String>,
+    /// The files whose resolved references reached into it before the
+    /// change (they are gone with its nodes by the time sync reads them).
+    importers: BTreeSet<String>,
 }
 
 /// How many parked imports one retry key may wake (upstream's per-name ceiling).

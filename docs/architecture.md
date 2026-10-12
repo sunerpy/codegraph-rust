@@ -293,7 +293,10 @@ qualified one (`User.create`) by its last segment as well (at most 500 per
 segment); a Python import statement that comes or goes counts the names it
 can re-export as changed (what it binds, and for a star import every name the
 module offers, as deep as the re-export walk looks), since an importer's name
-then moves with no node of it changing; an import
+then moves with no node of it changing; and a changed Python file refreshes the
+method values that read through a module global it declares or can write, in
+that module and its importers, since the global's type is read from statements
+no node records; an import
 names a file, a folder or a namespace rather than a symbol, so the parked
 imports an added file or a changed file's namespace can satisfy (by the file's
 name and stem, its folder's, or the namespace's whole name) send their files

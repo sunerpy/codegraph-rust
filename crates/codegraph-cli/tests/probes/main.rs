@@ -3056,4 +3056,1006 @@ mod python {
             graph.report()
         );
     }
+
+    /// `source name -> target qualified name` of every function-value
+    /// `references` edge into a node named `member`, sorted.
+    fn fn_refs_into(graph: &Graph, member: &str) -> Vec<String> {
+        let mut out: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.kind == "references" && edge.metadata["fnRef"] == true)
+            .filter_map(|edge| {
+                let target = graph.node(&edge.target)?;
+                let source = graph.node(&edge.source)?;
+                (target.name == member)
+                    .then(|| format!("{} -> {}", source.name, target.qualified_name))
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// Upstream #2290 (`a4bd890e`): `self.get_ip(request)` is a method call
+    /// on the instance even when the file imports a function named `get_ip`;
+    /// a plain `get_ip(request)` is still the import's.
+    #[test]
+    fn pr2290_a_self_call_never_resolves_through_a_same_named_import() {
+        let httpkit = "def get_ip(request):\n    return \"1.2.3.4\"\n";
+        let own = Project::new()
+            .file("pkg/__init__.py", "")
+            .file("pkg/httpkit.py", httpkit)
+            .file(
+                "pkg/adapter.py",
+                "from pkg.httpkit import get_ip\n\n\nclass Adapter:\n    def get_ip(self, request):\n        return get_ip(request)\n\n    def notify(self, request):\n        return self.get_ip(request)\n",
+            )
+            .index();
+        let graph = own.graph();
+        assert_eq!(
+            calls_of(graph, "get_ip"),
+            ["pkg/httpkit.py: get_ip"],
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            calls_of(graph, "notify"),
+            ["pkg/adapter.py: Adapter::get_ip"],
+            "{}",
+            graph.report()
+        );
+        let inherited = Project::new()
+            .file("pkg/__init__.py", "")
+            .file("pkg/httpkit.py", httpkit)
+            .file(
+                "pkg/base.py",
+                "class Base:\n    def get_ip(self, request):\n        return \"base\"\n",
+            )
+            .file(
+                "pkg/adapter.py",
+                "from pkg.base import Base\nfrom pkg.httpkit import get_ip\n\n\nclass Adapter(Base):\n    def notify(self, request):\n        return self.get_ip(request)\n\n    def raw(self, request):\n        return get_ip(request)\n",
+            )
+            .index();
+        let graph = inherited.graph();
+        assert_eq!(
+            calls_of(graph, "notify"),
+            ["pkg/base.py: Base::get_ip"],
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            calls_of(graph, "raw"),
+            ["pkg/httpkit.py: get_ip"],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream #2291 (a): a method value on a module global with no static
+    /// type (`conn = None`, rebound by `global conn; conn = Store()`) is a
+    /// method of the class its module assigns; a parameter, a loop variable
+    /// or an import shadowing the module is not the global.
+    #[test]
+    fn pr2291_a_module_global_bound_by_its_assignments_resolves_as_a_receiver() {
+        let project = Project::new()
+            .file("store.py", "class Store:\n    def fetch(self, ids):\n        return ids\n")
+            .file("decoy.py", "class Decoy:\n    def fetch(self, ids):\n        return []\n")
+            .file(
+                "settings.py",
+                "from decoy import Decoy\nconn = None\n\ndef init():\n    global conn\n    from store import Store\n    conn = Store()\n\ndef shadow():\n    conn = Decoy()\n    return conn\n\ndef same_file(pool):\n    pool.submit(conn.fetch, [])\n\ndef param_shadow(pool, conn):\n    pool.submit(conn.fetch, [])\n\ndef loop_shadow(pool, items):\n    for conn in items:\n        pool.submit(conn.fetch, [])\n",
+            )
+            .file(
+                "consumer.py",
+                "import settings\nfrom settings import conn\n\ndef via_module(pool):\n    pool.submit(settings.conn.fetch, [])\n\ndef via_name(pool):\n    pool.submit(conn.fetch, [])\n\ndef import_shadow(pool, settings):\n    pool.submit(settings.conn.fetch, [])\n\ndef local_import(pool):\n    from settings import conn\n    pool.submit(conn.fetch, [])\n",
+            )
+            .index();
+        let graph = project.graph();
+        assert_eq!(
+            fn_refs_into(graph, "fetch"),
+            [
+                "local_import -> Store::fetch",
+                "same_file -> Store::fetch",
+                "via_module -> Store::fetch",
+                "via_name -> Store::fetch"
+            ],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream #2291 (a): a module global several backends can hold binds
+    /// to the nearest declaration they all inherit; an opaque initializer
+    /// (`make_conn()`, a conditional) leaves its type unknown.
+    #[test]
+    fn pr2291_a_module_global_with_several_backends_binds_their_shared_declaration() {
+        let project = Project::new()
+            .file("backends/__init__.py", "")
+            .file(
+                "backends/base.py",
+                "class Base:\n    def fetch(self, ids):\n        raise NotImplementedError(\"backend\")\n    def search(self):\n        raise NotImplementedError(\"backend\")\n",
+            )
+            .file(
+                "backends/es.py",
+                "from backends.base import Base\nclass ES(Base):\n    def search(self):\n        return []\n",
+            )
+            .file(
+                "backends/vec.py",
+                "from backends.base import (\n    Base,\n)\nclass Vec(Base):\n    def fetch(self, ids):\n        return ids\n    def search(self):\n        return []\n",
+            )
+            .file("other.py", "class Other:\n    def fetch(self, ids):\n        return ids\n")
+            .file(
+                "settings.py",
+                "import backends.es\nconn = None\n\ndef init(engine):\n    global conn\n    if engine == \"es\":\n        conn = backends.es.ES()\n    else:\n        from backends import vec as vec_module\n        conn = vec_module.Vec()\n",
+            )
+            .file(
+                "unknown.py",
+                "from other import Other\nconn = None\nmixed = None\n\ndef init(flag):\n    global conn, mixed\n    conn = make_conn()\n    mixed = Other() if flag else None\n",
+            )
+            .file(
+                "consumer.py",
+                "import settings\nimport unknown\n\ndef gc(pool):\n    pool.submit(settings.conn.fetch, [])\n\ndef find(pool):\n    pool.submit(settings.conn.search)\n\ndef opaque(pool):\n    pool.submit(unknown.conn.fetch, [])\n    pool.submit(unknown.mixed.fetch, [])\n",
+            )
+            .index();
+        let graph = project.graph();
+        assert_eq!(
+            fn_refs_into(graph, "fetch"),
+            ["gc -> Base::fetch"],
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            fn_refs_into(graph, "search"),
+            ["find -> Base::search"],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream #2291 (a): the module-global rule never binds through a
+    /// shadow, an unknown value, a deeper chain, a write it cannot place, or
+    /// a test double: upstream's adversarial table, one project per case.
+    #[test]
+    fn pr2291_a_module_global_never_binds_through_a_shadow_or_an_unknown_value() {
+        #[allow(clippy::type_complexity)]
+        let cases: &[(&str, &[(&str, &str)], &[&str])] = &[
+            (
+                "control",
+                &[(
+                    "m.py",
+                    "from store import Store\nfrom decoy import Decoy\nconn = None\n\ndef init():\n    global conn\n    conn = Store()\ndef cb(pool):\n    pool.submit(conn.fetch)\n",
+                )],
+                &["cb -> Store::fetch"],
+            ),
+            (
+                "tuple_first",
+                &[(
+                    "m.py",
+                    "from store import Store\nfrom decoy import Decoy\nconn = None\n\ndef init():\n    global conn\n    conn = Store()\ndef cb(pool):\n    conn, _ = (Decoy(), None)\n    pool.submit(conn.fetch)\n",
+                )],
+                &[],
+            ),
+            (
+                "loop_and_nested_global",
+                &[(
+                    "m.py",
+                    "from store import Store\nfrom decoy import Decoy\nconn = None\n\ndef init():\n    global conn\n    conn = Store()\ndef cb(pool, items):\n    for conn in items:\n        pass\n    def nested():\n        global conn\n    pool.submit(conn.fetch)\n",
+                )],
+                &[],
+            ),
+            (
+                "multiline_conditional",
+                &[(
+                    "m.py",
+                    "from store import Store\nfrom decoy import Decoy\nconn = None\n\ndef init():\n    global conn\n    conn = Store(\n        x=1,\n    ) if flag else Decoy()\ndef cb(pool):\n    pool.submit(conn.fetch)\n",
+                )],
+                &[],
+            ),
+            (
+                "multiline_constructor",
+                &[(
+                    "m.py",
+                    "from store import Store\nfrom decoy import Decoy\nconn = None\n\ndef init():\n    global conn\n    conn = Store(\n        x=1,\n    )\ndef cb(pool):\n    pool.submit(conn.fetch)\n",
+                )],
+                &["cb -> Store::fetch"],
+            ),
+            (
+                "closure_param",
+                &[(
+                    "m.py",
+                    "from store import Store\nfrom decoy import Decoy\nconn = None\n\ndef init():\n    global conn\n    conn = Store()\ndef outer(conn):\n    def cb(pool):\n        pool.submit(conn.fetch)\n    return cb\n",
+                )],
+                &[],
+            ),
+            (
+                "closure_local",
+                &[(
+                    "m.py",
+                    "from store import Store\nfrom decoy import Decoy\nconn = None\n\ndef init():\n    global conn\n    conn = Store()\ndef outer(pool):\n    conn = Decoy()\n    def cb():\n        pool.submit(conn.fetch)\n    return cb\n",
+                )],
+                &[],
+            ),
+            (
+                "lambda_param",
+                &[(
+                    "m.py",
+                    "from store import Store\nfrom decoy import Decoy\nconn = None\n\ndef init():\n    global conn\n    conn = Store()\ndef cb(pool):\n    pool.submit(lambda conn: pool.map(conn.fetch))\n",
+                )],
+                &[],
+            ),
+            (
+                "comprehension",
+                &[(
+                    "m.py",
+                    "from store import Store\nfrom decoy import Decoy\nconn = None\n\ndef init():\n    global conn\n    conn = Store()\ndef cb(pool, xs):\n    [pool.submit(conn.fetch) for conn in xs]\n",
+                )],
+                &[],
+            ),
+            (
+                "except_as",
+                &[(
+                    "m.py",
+                    "from store import Store\nfrom decoy import Decoy\nconn = None\n\ndef init():\n    global conn\n    conn = Store()\ndef cb(pool):\n    try:\n        pass\n    except Exception as conn:\n        pool.submit(conn.fetch)\n",
+                )],
+                &[],
+            ),
+            (
+                "match_as",
+                &[(
+                    "m.py",
+                    "from store import Store\nfrom decoy import Decoy\nconn = None\n\ndef init():\n    global conn\n    conn = Store()\ndef cb(pool, x):\n    match x:\n        case Decoy() as conn:\n            pool.submit(conn.fetch)\n",
+                )],
+                &[],
+            ),
+            (
+                "global_in_nested_def",
+                &[(
+                    "m.py",
+                    "from decoy import Decoy\nconn = None\n\ndef init():\n    def helper():\n        global conn\n    conn = Decoy()\n\ndef cb(pool):\n    pool.submit(conn.fetch)\n",
+                )],
+                &[],
+            ),
+            (
+                "keyword_in_multiline_call",
+                &[(
+                    "m.py",
+                    "from decoy import Decoy\nconn = None\napp = dict(\n    conn=Decoy()\n)\n\ndef cb(pool):\n    pool.submit(conn.fetch)\n",
+                )],
+                &[],
+            ),
+            (
+                "tuple_rebind",
+                &[(
+                    "m.py",
+                    "from store import Store\nfrom decoy import Decoy\nconn = None\n\ndef init():\n    global conn\n    conn = Store()\ndef reset():\n    global conn\n    conn, other = Decoy(), 1\n\ndef cb(pool):\n    pool.submit(conn.fetch)\n",
+                )],
+                &[],
+            ),
+            (
+                "with_rebind",
+                &[(
+                    "m.py",
+                    "from store import Store\nfrom decoy import Decoy\nconn = None\n\ndef init():\n    global conn\n    conn = Store()\ndef reset():\n    global conn\n    with open_decoy() as conn:\n        pass\n\ndef cb(pool):\n    pool.submit(conn.fetch)\n",
+                )],
+                &[],
+            ),
+            (
+                "docstring",
+                &[(
+                    "m.py",
+                    "from store import Store\nconn = None\n\"\"\"\nconn = Store()\n\"\"\"\n\ndef cb(pool):\n    pool.submit(conn.fetch)\n",
+                )],
+                &[],
+            ),
+            (
+                "deeper_chain",
+                &[
+                    (
+                        "settings.py",
+                        "from store import Store\nfrom decoy import Decoy\nconn = None\n\ndef init():\n    global conn\n    conn = Store()\n",
+                    ),
+                    (
+                        "c.py",
+                        "import settings\n\ndef cb(pool):\n    pool.submit(settings.conn.pool.fetch)\n",
+                    ),
+                ],
+                &[],
+            ),
+            (
+                "importer_rebinds",
+                &[
+                    (
+                        "settings.py",
+                        "from store import Store\nfrom decoy import Decoy\nconn = None\n\ndef init():\n    global conn\n    conn = Store()\n",
+                    ),
+                    (
+                        "c.py",
+                        "from settings import conn\nfrom decoy import Decoy\n\ndef reset():\n    global conn\n    conn = Decoy()\n\ndef cb(pool):\n    pool.submit(conn.fetch)\n",
+                    ),
+                ],
+                &[],
+            ),
+            (
+                "local_import_of_other_module",
+                &[
+                    (
+                        "settings.py",
+                        "from store import Store\nfrom decoy import Decoy\nconn = None\n\ndef init():\n    global conn\n    conn = Store()\n",
+                    ),
+                    (
+                        "other_settings.py",
+                        "from decoy import Decoy\nconn = Decoy()\n",
+                    ),
+                    (
+                        "c.py",
+                        "import settings\n\ndef cb(pool):\n    import other_settings as settings\n    pool.submit(settings.conn.fetch)\n",
+                    ),
+                ],
+                &[],
+            ),
+            (
+                "local_from_import_of_other_module",
+                &[
+                    (
+                        "settings.py",
+                        "from store import Store\nfrom decoy import Decoy\nconn = None\n\ndef init():\n    global conn\n    conn = Store()\n",
+                    ),
+                    (
+                        "other_settings.py",
+                        "from decoy import Decoy\nconn = Decoy()\n",
+                    ),
+                    (
+                        "c.py",
+                        "from settings import conn\n\ndef cb(pool):\n    from other_settings import conn\n    pool.submit(conn.fetch)\n",
+                    ),
+                ],
+                &[],
+            ),
+            (
+                "comment_in_parenthesized_import",
+                &[
+                    (
+                        "settings.py",
+                        "from store import Store\nfrom decoy import Decoy\nconn = None\n\ndef init():\n    global conn\n    conn = Store()\nother = 1\n",
+                    ),
+                    (
+                        "c.py",
+                        "from settings import (\n    other,  # see fetch()\n    conn,\n)\n\ndef cb(pool):\n    pool.submit(conn.fetch)\n",
+                    ),
+                ],
+                &["cb -> Store::fetch"],
+            ),
+            (
+                "star_import_override",
+                &[
+                    ("local.py", "from decoy import Decoy\nconn = Decoy()\n"),
+                    (
+                        "settings.py",
+                        "from store import Store\nfrom decoy import Decoy\nconn = None\n\ndef init():\n    global conn\n    conn = Store()\nfrom local import *\n",
+                    ),
+                    (
+                        "c.py",
+                        "import settings\n\ndef cb(pool):\n    pool.submit(settings.conn.fetch)\n",
+                    ),
+                ],
+                &[],
+            ),
+            (
+                "match_sequence_capture",
+                &[(
+                    "m.py",
+                    "from store import Store\nfrom decoy import Decoy\nconn = None\n\ndef init():\n    global conn\n    conn = Store()\ndef cb(pool, x):\n    match x:\n        case [conn]:\n            pool.submit(conn.fetch)\n",
+                )],
+                &[],
+            ),
+            (
+                "match_keyword_capture",
+                &[(
+                    "m.py",
+                    "from store import Store\nfrom decoy import Decoy\nconn = None\n\ndef init():\n    global conn\n    conn = Store()\ndef cb(pool, x):\n    match x:\n        case Decoy(inner=conn):\n            pool.submit(conn.fetch)\n",
+                )],
+                &[],
+            ),
+            (
+                "match_bare_capture",
+                &[(
+                    "m.py",
+                    "from store import Store\nfrom decoy import Decoy\nconn = None\n\ndef init():\n    global conn\n    conn = Store()\ndef cb(pool, x):\n    match x:\n        case conn:\n            pool.submit(conn.fetch)\n",
+                )],
+                &[],
+            ),
+            (
+                "multiline_loop_target",
+                &[(
+                    "m.py",
+                    "from store import Store\nfrom decoy import Decoy\nconn = None\n\ndef init():\n    global conn\n    conn = Store()\ndef cb(pool, xs):\n    for (a,\n         conn) in xs:\n        pool.submit(conn.fetch)\n",
+                )],
+                &[],
+            ),
+            (
+                "multiline_tuple_local",
+                &[(
+                    "m.py",
+                    "from store import Store\nfrom decoy import Decoy\nconn = None\n\ndef init():\n    global conn\n    conn = Store()\ndef cb(pool):\n    (a,\n     conn) = 1, Decoy()\n    pool.submit(conn.fetch)\n",
+                )],
+                &[],
+            ),
+            (
+                "multiline_tuple_rebind",
+                &[(
+                    "m.py",
+                    "from store import Store\nfrom decoy import Decoy\nconn = None\n\ndef init():\n    global conn\n    conn = Store()\ndef reset():\n    global conn\n    (a,\n     conn) = 1, Decoy()\n\ndef cb(pool):\n    pool.submit(conn.fetch)\n",
+                )],
+                &[],
+            ),
+            (
+                "annotation_contradicts_value",
+                &[(
+                    "m.py",
+                    "from store import Store\nfrom decoy import Decoy\nconn: Store = Decoy()\n\ndef cb(pool):\n    pool.submit(conn.fetch)\n",
+                )],
+                &[],
+            ),
+            (
+                "annotation_over_factory",
+                &[(
+                    "m.py",
+                    "from store import Store\nconn: Store = make_store()\n\ndef cb(pool):\n    pool.submit(conn.fetch)\n",
+                )],
+                &["cb -> Store::fetch"],
+            ),
+            (
+                "external_production_write",
+                &[
+                    (
+                        "settings.py",
+                        "from store import Store\nfrom decoy import Decoy\nconn = None\n\ndef init():\n    global conn\n    conn = Store()\n",
+                    ),
+                    (
+                        "reset.py",
+                        "import settings\nfrom decoy import Decoy\n\ndef reset():\n    settings.conn = Decoy()\n",
+                    ),
+                    (
+                        "c.py",
+                        "import settings\n\ndef cb(pool):\n    pool.submit(settings.conn.fetch)\n",
+                    ),
+                ],
+                &[],
+            ),
+            (
+                "external_aliased_write",
+                &[
+                    ("pkg/__init__.py", ""),
+                    (
+                        "pkg/settings.py",
+                        "from store import Store\nfrom decoy import Decoy\nconn = None\n\ndef init():\n    global conn\n    conn = Store()\n",
+                    ),
+                    (
+                        "reset.py",
+                        "import pkg.settings as cfg\n\ndef reset():\n    cfg.conn = make_conn()\n",
+                    ),
+                    (
+                        "c.py",
+                        "from pkg import settings\n\ndef cb(pool):\n    pool.submit(settings.conn.fetch)\n",
+                    ),
+                ],
+                &[],
+            ),
+            (
+                "external_relative_write",
+                &[
+                    ("pkg/__init__.py", ""),
+                    (
+                        "pkg/settings.py",
+                        "from store import Store\nfrom decoy import Decoy\nconn = None\n\ndef init():\n    global conn\n    conn = Store()\n",
+                    ),
+                    (
+                        "pkg/reset.py",
+                        "from . import settings\nfrom decoy import Decoy\n\ndef reset():\n    settings.conn = Decoy()\n",
+                    ),
+                    (
+                        "c.py",
+                        "from pkg import settings\n\ndef cb(pool):\n    pool.submit(settings.conn.fetch)\n",
+                    ),
+                ],
+                &[],
+            ),
+            (
+                "external_setattr",
+                &[
+                    (
+                        "settings.py",
+                        "from store import Store\nfrom decoy import Decoy\nconn = None\n\ndef init():\n    global conn\n    conn = Store()\n",
+                    ),
+                    (
+                        "reset.py",
+                        "import settings\nfrom decoy import Decoy\n\ndef reset():\n    setattr(settings, \"conn\", Decoy())\n",
+                    ),
+                    (
+                        "c.py",
+                        "import settings\n\ndef cb(pool):\n    pool.submit(settings.conn.fetch)\n",
+                    ),
+                ],
+                &[],
+            ),
+            (
+                "external_subclass_write",
+                &[
+                    (
+                        "settings.py",
+                        "from store import Store\nfrom decoy import Decoy\nconn = None\n\ndef init():\n    global conn\n    conn = Store()\n",
+                    ),
+                    (
+                        "sub.py",
+                        "from store import Store\nclass SubStore(Store):\n    def fetch(self, ids):\n        return ids\n",
+                    ),
+                    (
+                        "reset.py",
+                        "import settings\nfrom sub import SubStore\n\ndef reset():\n    settings.conn = SubStore()\n",
+                    ),
+                    (
+                        "c.py",
+                        "import settings\n\ndef cb(pool):\n    pool.submit(settings.conn.fetch)\n",
+                    ),
+                ],
+                &["cb -> Store::fetch"],
+            ),
+            (
+                "test_double_write",
+                &[
+                    (
+                        "settings.py",
+                        "from store import Store\nfrom decoy import Decoy\nconn = None\n\ndef init():\n    global conn\n    conn = Store()\n",
+                    ),
+                    (
+                        "tests/test_c.py",
+                        "import settings\nfrom unittest.mock import MagicMock\n\ndef test_cb(pool):\n    settings.conn = MagicMock()\n    pool.submit(settings.conn.fetch)\n",
+                    ),
+                    (
+                        "c.py",
+                        "import settings\n\ndef cb(pool):\n    pool.submit(settings.conn.fetch)\n",
+                    ),
+                ],
+                &["cb -> Store::fetch"],
+            ),
+            (
+                "test_monkeypatch",
+                &[
+                    (
+                        "settings.py",
+                        "from store import Store\nfrom decoy import Decoy\nconn = None\n\ndef init():\n    global conn\n    conn = Store()\n",
+                    ),
+                    (
+                        "tests/test_c.py",
+                        "import settings\n\ndef test_cb(monkeypatch, pool):\n    monkeypatch.setattr(settings, \"conn\", object())\n    pool.submit(settings.conn.fetch)\n",
+                    ),
+                ],
+                &[],
+            ),
+            (
+                "globals_literal_write",
+                &[(
+                    "m.py",
+                    "from store import Store\nfrom decoy import Decoy\nconn = None\n\ndef init():\n    global conn\n    conn = Store()\ndef reset():\n    globals()[\"conn\"] = Decoy()\n\ndef cb(pool):\n    pool.submit(conn.fetch)\n",
+                )],
+                &[],
+            ),
+            (
+                "globals_dynamic_write",
+                &[(
+                    "m.py",
+                    "from store import Store\nfrom decoy import Decoy\nconn = None\n\ndef init():\n    global conn\n    conn = Store()\nfor name, obj in [(\"conn\", Decoy())]:\n    globals()[name] = obj\n\ndef cb(pool):\n    pool.submit(conn.fetch)\n",
+                )],
+                &[],
+            ),
+            (
+                "unrelated_attribute_write",
+                &[
+                    (
+                        "settings.py",
+                        "from store import Store\nfrom decoy import Decoy\nconn = None\n\ndef init():\n    global conn\n    conn = Store()\n",
+                    ),
+                    (
+                        "other.py",
+                        "from decoy import Decoy\n\nclass Holder:\n    def __init__(self):\n        self.conn = Decoy()\n",
+                    ),
+                    (
+                        "c.py",
+                        "import settings\n\ndef cb(pool):\n    pool.submit(settings.conn.fetch)\n",
+                    ),
+                ],
+                &["cb -> Store::fetch"],
+            ),
+            (
+                "write_path_is_exact",
+                &[
+                    ("x/__init__.py", ""),
+                    ("y/__init__.py", ""),
+                    (
+                        "x/settings.py",
+                        "from store import Store\nfrom decoy import Decoy\nconn = None\n\ndef init():\n    global conn\n    conn = Store()\n",
+                    ),
+                    (
+                        "y/settings.py",
+                        "from store import Store\nfrom decoy import Decoy\nconn = None\n\ndef init():\n    global conn\n    conn = Store()\n",
+                    ),
+                    (
+                        "reset.py",
+                        "from x import settings\nfrom decoy import Decoy\n\ndef reset():\n    settings.conn = Decoy()\n",
+                    ),
+                    (
+                        "cx.py",
+                        "from x import settings\n\ndef cb_x(pool):\n    pool.submit(settings.conn.fetch)\n",
+                    ),
+                    (
+                        "cy.py",
+                        "from y import settings\n\ndef cb_y(pool):\n    pool.submit(settings.conn.fetch)\n",
+                    ),
+                ],
+                &["cb_y -> Store::fetch"],
+            ),
+            (
+                "ambiguous_write_target",
+                &[
+                    ("x/__init__.py", ""),
+                    ("y/__init__.py", ""),
+                    (
+                        "x/settings.py",
+                        "from store import Store\nfrom decoy import Decoy\nconn = None\n\ndef init():\n    global conn\n    conn = Store()\n",
+                    ),
+                    (
+                        "y/settings.py",
+                        "from store import Store\nfrom decoy import Decoy\nconn = None\n\ndef init():\n    global conn\n    conn = Store()\n",
+                    ),
+                    (
+                        "reset.py",
+                        "import settings\nfrom decoy import Decoy\n\ndef reset():\n    settings.conn = Decoy()\n",
+                    ),
+                    (
+                        "cx.py",
+                        "from x import settings\n\ndef cb_x(pool):\n    pool.submit(settings.conn.fetch)\n",
+                    ),
+                    (
+                        "cy.py",
+                        "from y import settings\n\ndef cb_y(pool):\n    pool.submit(settings.conn.fetch)\n",
+                    ),
+                ],
+                &[],
+            ),
+            (
+                "relative_write_is_exact",
+                &[
+                    ("pkg/__init__.py", ""),
+                    ("pkg/sub/__init__.py", ""),
+                    (
+                        "pkg/settings.py",
+                        "from store import Store\nfrom decoy import Decoy\nconn = None\n\ndef init():\n    global conn\n    conn = Store()\n",
+                    ),
+                    ("other/__init__.py", ""),
+                    ("other/pkg/__init__.py", ""),
+                    (
+                        "other/pkg/settings.py",
+                        "from store import Store\nfrom decoy import Decoy\nconn = None\n\ndef init():\n    global conn\n    conn = Store()\n",
+                    ),
+                    (
+                        "pkg/sub/reset.py",
+                        "from .. import settings\n\ndef reset():\n    settings.conn = make_conn()\n",
+                    ),
+                    (
+                        "c2.py",
+                        "from other.pkg import settings\n\ndef cb2(pool):\n    pool.submit(settings.conn.fetch)\n",
+                    ),
+                ],
+                &["cb2 -> Store::fetch"],
+            ),
+            (
+                "namespace_import_binds_root",
+                &[
+                    ("pkg/__init__.py", ""),
+                    (
+                        "pkg/settings.py",
+                        "from store import Store\nfrom decoy import Decoy\nconn = None\n\ndef init():\n    global conn\n    conn = Store()\n",
+                    ),
+                    (
+                        "c.py",
+                        "import pkg.settings\nfrom decoy import Decoy\n\nsettings = Bag()\nsettings.conn = Decoy()\n",
+                    ),
+                    (
+                        "d.py",
+                        "from pkg import settings\n\ndef cb(pool):\n    pool.submit(settings.conn.fetch)\n",
+                    ),
+                ],
+                &["cb -> Store::fetch"],
+            ),
+            (
+                "alias_of_longer_module_is_not_explicit",
+                &[
+                    ("pkg/__init__.py", ""),
+                    (
+                        "pkg/settings.py",
+                        "from store import Store\nfrom decoy import Decoy\nconn = None\n\ndef init():\n    global conn\n    conn = Store()\n",
+                    ),
+                    ("other/__init__.py", ""),
+                    ("other/pkg/__init__.py", ""),
+                    ("other/pkg/settings.py", "conn = None\n"),
+                    (
+                        "reset.py",
+                        "import pkg.settings\nimport other.pkg.settings as settings\nfrom decoy import Decoy\n\ndef reset():\n    settings.conn = Decoy()\n",
+                    ),
+                    (
+                        "pkg/d.py",
+                        "from . import settings\n\ndef cb(pool):\n    pool.submit(settings.conn.fetch)\n",
+                    ),
+                ],
+                &["cb -> Store::fetch"],
+            ),
+            (
+                "alias_in_string_is_not_explicit",
+                &[
+                    ("pkg/__init__.py", ""),
+                    ("pkg/settings.py", "conn = None\n"),
+                    (
+                        "reset.py",
+                        "import pkg.settings\nfrom decoy import Decoy\nnote = \"import pkg.settings as settings\"\n\ndef reset():\n    settings.conn = Decoy()\n",
+                    ),
+                    (
+                        "d.py",
+                        "from pkg import settings\n\ndef cb(pool):\n    pool.submit(settings.conn.fetch)\n",
+                    ),
+                ],
+                &[],
+            ),
+            (
+                "explicit_alias_equal_to_leaf",
+                &[
+                    ("pkg/__init__.py", ""),
+                    (
+                        "pkg/settings.py",
+                        "from store import Store\nfrom decoy import Decoy\nconn = None\n\ndef init():\n    global conn\n    conn = Store()\n",
+                    ),
+                    (
+                        "reset.py",
+                        "import pkg.settings as settings\nfrom decoy import Decoy\n\ndef reset():\n    settings.conn = Decoy()\n",
+                    ),
+                    (
+                        "d.py",
+                        "from pkg import settings\n\ndef cb(pool):\n    pool.submit(settings.conn.fetch)\n",
+                    ),
+                ],
+                &[],
+            ),
+            (
+                "one_line_main_write",
+                &[
+                    (
+                        "settings.py",
+                        "from store import Store\nfrom decoy import Decoy\nconn = None\n\ndef init():\n    global conn\n    conn = Store()\n",
+                    ),
+                    (
+                        "run.py",
+                        "import settings\nfrom decoy import Decoy\n\nif __name__ == \"__main__\": settings.conn = Decoy()\n",
+                    ),
+                    (
+                        "c.py",
+                        "import settings\n\ndef cb(pool):\n    pool.submit(settings.conn.fetch)\n",
+                    ),
+                ],
+                &["cb -> Store::fetch"],
+            ),
+            (
+                "globals_in_main_block",
+                &[(
+                    "m.py",
+                    "from store import Store\nfrom decoy import Decoy\nconn = None\n\ndef init():\n    global conn\n    conn = Store()\nif __name__ == \"__main__\":\n    globals()[\"conn\"] = Decoy()\n\ndef cb(pool):\n    pool.submit(conn.fetch)\n",
+                )],
+                &["cb -> Store::fetch"],
+            ),
+            (
+                "vars_in_function_is_locals",
+                &[(
+                    "m.py",
+                    "from store import Store\nfrom decoy import Decoy\nconn = None\n\ndef init():\n    global conn\n    conn = Store()\ndef dump():\n    return vars()\n\ndef cb(pool):\n    pool.submit(conn.fetch)\n",
+                )],
+                &["cb -> Store::fetch"],
+            ),
+            (
+                "example_write_is_production",
+                &[
+                    (
+                        "settings.py",
+                        "from store import Store\nfrom decoy import Decoy\nconn = None\n\ndef init():\n    global conn\n    conn = Store()\n",
+                    ),
+                    (
+                        "examples/wire.py",
+                        "import settings\nfrom decoy import Decoy\n\ndef wire():\n    settings.conn = Decoy()\n",
+                    ),
+                    (
+                        "c.py",
+                        "import settings\n\ndef cb(pool):\n    pool.submit(settings.conn.fetch)\n",
+                    ),
+                ],
+                &[],
+            ),
+            (
+                "conftest_write_is_test",
+                &[
+                    (
+                        "settings.py",
+                        "from store import Store\nfrom decoy import Decoy\nconn = None\n\ndef init():\n    global conn\n    conn = Store()\n",
+                    ),
+                    (
+                        "pkg/conftest.py",
+                        "import settings\nfrom decoy import Decoy\n\ndef fixture():\n    settings.conn = Decoy()\n",
+                    ),
+                    (
+                        "c.py",
+                        "import settings\n\ndef cb(pool):\n    pool.submit(settings.conn.fetch)\n",
+                    ),
+                ],
+                &["cb -> Store::fetch"],
+            ),
+            (
+                "main_block_write",
+                &[
+                    (
+                        "settings.py",
+                        "from store import Store\nfrom decoy import Decoy\nconn = None\n\ndef init():\n    global conn\n    conn = Store()\n",
+                    ),
+                    (
+                        "run.py",
+                        "import settings\nfrom decoy import Decoy\n\nif __name__ == \"__main__\":\n    settings.conn = Decoy()\n",
+                    ),
+                    (
+                        "c.py",
+                        "import settings\n\ndef cb(pool):\n    pool.submit(settings.conn.fetch)\n",
+                    ),
+                ],
+                &["cb -> Store::fetch"],
+            ),
+            (
+                "own_main_block_write",
+                &[(
+                    "m.py",
+                    "from store import Store\nfrom decoy import Decoy\nconn = None\n\ndef init():\n    global conn\n    conn = Store()\nif __name__ == \"__main__\":\n    conn = Decoy()\n\ndef cb(pool):\n    pool.submit(conn.fetch)\n",
+                )],
+                &["cb -> Store::fetch"],
+            ),
+            (
+                "globals_continued_key",
+                &[(
+                    "m.py",
+                    "from store import Store\nfrom decoy import Decoy\nconn = None\n\ndef init():\n    global conn\n    conn = Store()\ndef reset():\n    globals()[\n        \"conn\"] = Decoy()\n\ndef cb(pool):\n    pool.submit(conn.fetch)\n",
+                )],
+                &[],
+            ),
+            (
+                "globals_alias",
+                &[(
+                    "m.py",
+                    "from store import Store\nfrom decoy import Decoy\nconn = None\n\ndef init():\n    global conn\n    conn = Store()\ndef reset():\n    g = globals()\n    g[\"conn\"] = Decoy()\n\ndef cb(pool):\n    pool.submit(conn.fetch)\n",
+                )],
+                &[],
+            ),
+            (
+                "globals_in_string",
+                &[(
+                    "m.py",
+                    "from store import Store\nfrom decoy import Decoy\nconn = None\n\ndef init():\n    global conn\n    conn = Store()\nNOTE = \"globals().update(mapping)\"\n\ndef cb(pool):\n    pool.submit(conn.fetch)\n",
+                )],
+                &["cb -> Store::fetch"],
+            ),
+            (
+                "external_dict_write",
+                &[
+                    (
+                        "settings.py",
+                        "from store import Store\nfrom decoy import Decoy\nconn = None\n\ndef init():\n    global conn\n    conn = Store()\n",
+                    ),
+                    (
+                        "reset.py",
+                        "import settings\nfrom decoy import Decoy\n\ndef reset():\n    settings.__dict__[\"conn\"] = Decoy()\n",
+                    ),
+                    (
+                        "c.py",
+                        "import settings\n\ndef cb(pool):\n    pool.submit(settings.conn.fetch)\n",
+                    ),
+                ],
+                &[],
+            ),
+            (
+                "external_annotated_write",
+                &[
+                    (
+                        "settings.py",
+                        "from store import Store\nfrom decoy import Decoy\nconn = None\n\ndef init():\n    global conn\n    conn = Store()\n",
+                    ),
+                    (
+                        "reset.py",
+                        "import settings\nfrom store import Store\n\ndef reset():\n    settings.conn: Store = Store()\n",
+                    ),
+                    (
+                        "c.py",
+                        "import settings\n\ndef cb(pool):\n    pool.submit(settings.conn.fetch)\n",
+                    ),
+                ],
+                &["cb -> Store::fetch"],
+            ),
+            (
+                "external_parenthesized_write",
+                &[
+                    (
+                        "settings.py",
+                        "from store import Store\nfrom decoy import Decoy\nconn = None\n\ndef init():\n    global conn\n    conn = Store()\n",
+                    ),
+                    (
+                        "reset.py",
+                        "import settings\nfrom store import Store\n\ndef reset():\n    settings.conn = (Store())\n",
+                    ),
+                    (
+                        "c.py",
+                        "import settings\n\ndef cb(pool):\n    pool.submit(settings.conn.fetch)\n",
+                    ),
+                ],
+                &["cb -> Store::fetch"],
+            ),
+            (
+                "dotted_import_collision",
+                &[
+                    ("alpha/__init__.py", ""),
+                    ("beta/__init__.py", ""),
+                    (
+                        "alpha/foo.py",
+                        "class Client:\n    def fetch(self):\n        return 1\n",
+                    ),
+                    (
+                        "beta/foo.py",
+                        "class Client:\n    def fetch(self):\n        return 2\n",
+                    ),
+                    (
+                        "m.py",
+                        "import beta.foo\nimport alpha.foo\nconn = None\n\ndef init():\n    global conn\n    conn = alpha.foo.Client()\n\ndef cb(pool):\n    pool.submit(conn.fetch)\n",
+                    ),
+                ],
+                &[],
+            ),
+            (
+                "dotted_base_collision",
+                &[
+                    ("alpha/__init__.py", ""),
+                    ("beta/__init__.py", ""),
+                    (
+                        "alpha/foo.py",
+                        "class Client:\n    def fetch(self):\n        return 1\n",
+                    ),
+                    (
+                        "beta/foo.py",
+                        "class Client:\n    def fetch(self):\n        return 2\n",
+                    ),
+                    (
+                        "m.py",
+                        "import beta.foo\nimport alpha.foo\n\nclass Sub(alpha.foo.Client):\n    pass\n\ndef go(pool, s: Sub):\n    pool.submit(s.fetch)\n",
+                    ),
+                ],
+                &[],
+            ),
+        ];
+        let mut mismatches = Vec::new();
+        for (name, files, want) in cases {
+            let mut project = Project::named(name)
+                .file(
+                    "store.py",
+                    "class Store:\n    def fetch(self, ids):\n        return ids\n",
+                )
+                .file(
+                    "decoy.py",
+                    "class Decoy:\n    def fetch(self, ids):\n        return []\n",
+                );
+            for (path, contents) in *files {
+                project = project.file(path, contents);
+            }
+            let indexed = project.index();
+            let got = fn_refs_into(indexed.graph(), "fetch");
+            if got != *want {
+                mismatches.push(format!("{name}: got {got:?}, want {want:?}"));
+            }
+        }
+        assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+    }
 }

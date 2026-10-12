@@ -182,6 +182,8 @@ struct SnapshotCaches {
     /// Each directory's package.json / Deno import-map scope (upstream
     /// #2128 `manifestScopes`).
     manifest_scopes: BoundedFileMemo<Arc<ManifestScope>>,
+    /// The Python write index for the run (upstream #2332).
+    python_write_index: OnceLock<Arc<crate::python_globals::PythonWriteIndex>>,
     #[cfg(test)]
     counters: SnapshotCacheCounters,
 }
@@ -198,6 +200,7 @@ impl SnapshotCaches {
             re_exports: BoundedFileMemo::new(DEFAULT_CACHE_LIMIT),
             fs_exists: BoundedFileMemo::new(crate::context::FILE_EXISTS_MEMO_LIMIT),
             manifest_scopes: BoundedFileMemo::new(DEFAULT_CACHE_LIMIT),
+            python_write_index: OnceLock::new(),
             #[cfg(test)]
             counters: SnapshotCacheCounters::default(),
         }
@@ -664,6 +667,14 @@ impl ResolutionContext for SnapshotResolutionContext {
 
     fn get_workspace_packages(&self) -> Option<WorkspacePackages> {
         self.snapshot.workspace_packages.clone()
+    }
+
+    fn python_write_index(&self) -> Arc<crate::python_globals::PythonWriteIndex> {
+        Arc::clone(
+            self.caches
+                .python_write_index
+                .get_or_init(|| Arc::new(crate::python_globals::PythonWriteIndex::build(self))),
+        )
     }
 
     fn manifest_scope(&self, dir: &str) -> Arc<ManifestScope> {

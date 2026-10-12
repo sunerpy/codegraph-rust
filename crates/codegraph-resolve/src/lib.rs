@@ -39,6 +39,7 @@ mod overloads;
 pub mod package_manifests;
 pub mod path_aliases;
 pub mod pathutil;
+pub mod python_globals;
 mod python_values;
 pub mod resolver;
 mod rust_lexical;

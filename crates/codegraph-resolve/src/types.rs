@@ -529,6 +529,14 @@ pub trait ResolutionContext {
     fn get_cpp_include_dirs(&self) -> Vec<String> {
         Vec::new()
     }
+
+    /// Python files by the words they spell after `.`, `'` or `"`, which a
+    /// module global's write scan reads (upstream #2332). Contexts that live
+    /// for one resolution pass build it once; the default builds it on each
+    /// call.
+    fn python_write_index(&self) -> Arc<crate::python_globals::PythonWriteIndex> {
+        Arc::new(crate::python_globals::PythonWriteIndex::build(self))
+    }
 }
 
 /// Go module info parsed from `go.mod`.

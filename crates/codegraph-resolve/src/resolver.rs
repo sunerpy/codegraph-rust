@@ -2155,8 +2155,19 @@ impl ReferenceResolver {
         }
 
         // Strategy 2: import-based resolution (index.ts:704-708).
-        if let Some(import_result) =
-            self.gate_language(resolve_via_import(reference, context), reference, context)
+        // `self.get_ip()` is a method call on the instance even when the file
+        // also imports a function named `get_ip`: the import never names it
+        // (upstream #2290).
+        let python_self_call = reference.language == Language::Python
+            && reference.reference_kind == EdgeKind::Calls
+            && context
+                .get_import_mappings(&reference.file_path, reference.language)
+                .iter()
+                .any(|mapping| mapping.local_name == reference.reference_name)
+            && crate::python_values::is_python_self_call(reference, context);
+        if !python_self_call
+            && let Some(import_result) =
+                self.gate_language(resolve_via_import(reference, context), reference, context)
         {
             if import_result.confidence >= 0.9 {
                 return (Some(import_result), None);

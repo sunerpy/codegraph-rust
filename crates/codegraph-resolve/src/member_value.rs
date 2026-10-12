@@ -62,15 +62,26 @@ pub(crate) fn match_member_function_ref(
     let root = receiver.split('.').next().unwrap_or(receiver);
     // An import is authoritative even when it points outside the project.
     if imports.iter().any(|import| import.local_name == root) {
-        if reference.language == Language::Python
-            && let Some(class) = python_ref_class(receiver, reference, context)
-        {
-            return unique_callable(
-                python_members(&class, member, reference, context, &mut HashSet::new()),
-                reference,
-                context,
-                0.9,
-            );
+        if reference.language == Language::Python {
+            if let Some(class) = python_ref_class(receiver, reference, context) {
+                return unique_callable(
+                    python_members(&class, member, reference, context, &mut HashSet::new()),
+                    reference,
+                    context,
+                    0.9,
+                );
+            }
+            // `mod.global` / an imported `global` itself (upstream #2291).
+            if let Some(global) =
+                crate::python_globals::imported_global(receiver, reference, context)
+            {
+                return unique_callable(
+                    crate::python_globals::global_members(&global, member, reference, context),
+                    reference,
+                    context,
+                    0.9,
+                );
+            }
         }
         let imported = resolve_via_import(reference, context)?;
         let node = context.get_node_by_id_shared(&imported.target_node_id)?;
@@ -128,7 +139,20 @@ pub(crate) fn match_member_function_ref(
         {
             python_field_type(field, owner.as_deref()?, reference, context)
         } else {
-            python_local_type(receiver, reference, context)
+            let local = python_local_type(receiver, reference, context);
+            // An untyped module global of this file (upstream #2291).
+            if local.is_none()
+                && let Some(global) =
+                    crate::python_globals::own_file_global(receiver, reference, context)
+            {
+                return unique_callable(
+                    crate::python_globals::global_members(&global, member, reference, context),
+                    reference,
+                    context,
+                    0.9,
+                );
+            }
+            local
         };
         // A type name used directly (`Store.fetch`) is scoped like an annotation.
         if type_name.is_none()
@@ -336,7 +360,7 @@ fn strip_go_line_comments(line: &str) -> String {
 
 /// The project class a Python name refers to: an import binding when the
 /// name's root is imported, else the one same-file class of that name.
-fn python_ref_class(
+pub(crate) fn python_ref_class(
     name: &str,
     reference: &RefView,
     context: &dyn ResolutionContext,
@@ -398,7 +422,11 @@ fn python_ref_class(
 }
 
 /// The classes named in a Python class's base list, resolved from its file.
-fn python_bases(class: &Node, reference: &RefView, context: &dyn ResolutionContext) -> Vec<Node> {
+pub(crate) fn python_bases(
+    class: &Node,
+    reference: &RefView,
+    context: &dyn ResolutionContext,
+) -> Vec<Node> {
     let Some(facts) = context.source_facts(&class.file_path) else {
         return Vec::new();
     };
@@ -428,7 +456,7 @@ fn python_bases(class: &Node, reference: &RefView, context: &dyn ResolutionConte
         .collect()
 }
 
-fn python_derives_from(
+pub(crate) fn python_derives_from(
     class: &Node,
     base: &Node,
     reference: &RefView,
@@ -448,7 +476,7 @@ fn python_derives_from(
 /// What `class.member` names: an instance or class assignment shadows any
 /// method (the class itself is returned, which is not callable), else the
 /// class's own method, else what its bases provide.
-fn python_members(
+pub(crate) fn python_members(
     class: &Node,
     member: &str,
     reference: &RefView,

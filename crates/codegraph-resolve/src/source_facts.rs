@@ -139,6 +139,9 @@ pub struct SourceFacts {
     rust_use_scopes: OnceLock<crate::rust_lexical::RustUseScopes>,
     python_from_imports: OnceLock<HashMap<String, String>>,
     python_module_symbols: Mutex<HashMap<(String, usize), Option<String>>>,
+    python_file_scan: OnceLock<Arc<crate::python_globals::PythonFileScan>>,
+    python_name_scans: Mutex<HashMap<String, Arc<crate::python_globals::NameScan>>>,
+    python_globals: Mutex<HashMap<String, Arc<crate::python_globals::GlobalMemo>>>,
     minified_script: OnceLock<bool>,
     csharp_scopes: OnceLock<Arc<crate::csharp_scopes::CsharpScopes>>,
     sfc_script_blocks: OnceLock<Vec<crate::sfc_scripts::ScriptBlock>>,
@@ -170,6 +173,9 @@ impl SourceFacts {
             rust_use_scopes: OnceLock::new(),
             python_from_imports: OnceLock::new(),
             python_module_symbols: Mutex::new(HashMap::new()),
+            python_file_scan: OnceLock::new(),
+            python_name_scans: Mutex::new(HashMap::new()),
+            python_globals: Mutex::new(HashMap::new()),
             minified_script: OnceLock::new(),
             csharp_scopes: OnceLock::new(),
             sfc_script_blocks: OnceLock::new(),
@@ -428,6 +434,37 @@ impl SourceFacts {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(key, found.clone());
         found
+    }
+
+    /// The statement starts and `__main__` blocks of the Python code, read
+    /// once.
+    pub(crate) fn python_file_scan(
+        &self,
+        build: impl FnOnce(&Self) -> crate::python_globals::PythonFileScan,
+    ) -> Arc<crate::python_globals::PythonFileScan> {
+        Arc::clone(self.python_file_scan.get_or_init(|| Arc::new(build(self))))
+    }
+
+    /// The memoised answers this Python file gives about `name`.
+    pub(crate) fn python_name_scan(&self, name: &str) -> Arc<crate::python_globals::NameScan> {
+        Arc::clone(
+            self.python_name_scans
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .entry(name.to_string())
+                .or_default(),
+        )
+    }
+
+    /// The memoised answers about the module global `id` this file declares.
+    pub(crate) fn python_global_memo(&self, id: &str) -> Arc<crate::python_globals::GlobalMemo> {
+        Arc::clone(
+            self.python_globals
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .entry(id.to_string())
+                .or_default(),
+        )
     }
 
     /// The C# namespace blocks and `using` directives of the raw source,

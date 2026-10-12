@@ -1251,6 +1251,118 @@ pub fn python_dotted_module_class_of_an_added_module() -> Case {
         .edge_after("function go", "references", "method Client::fetch")
 }
 
+/// Upstream #2290: `self.get_ip()` stays the class's own method when the
+/// module the file imports a `get_ip` from appears, as a fresh index of the
+/// edit finds.
+pub fn python_self_call_ignores_an_added_import_target() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Python])
+        .file("pkg/__init__.py", "")
+        .file(
+            "pkg/adapter.py",
+            "from pkg.httpkit import get_ip\n\n\nclass Adapter:\n    def get_ip(self, request):\n        return request\n\n    def notify(self, request):\n        return self.get_ip(request)\n",
+        )
+        .write(
+            "pkg/httpkit.py",
+            "def get_ip(request):\n    return \"1.2.3.4\"\n",
+        )
+        .edge_after("method Adapter::notify", "calls", "method Adapter::get_ip")
+        .no_edge_after("method Adapter::notify", "calls", "function get_ip")
+}
+
+/// The files every module-global case starts from: two classes with a
+/// `fetch`, a module whose `conn` its `init()` assigns, and two importers
+/// reading `fetch` through it, by the module and by the name.
+fn python_global_files(case: Case, init: &'static str) -> Case {
+    case.file(
+        "store.py",
+        "class Store:\n    def fetch(self, ids):\n        return ids\n",
+    )
+    .file(
+        "decoy.py",
+        "class Decoy:\n    def fetch(self, ids):\n        return []\n",
+    )
+    .file("settings.py", init)
+    .file(
+        "consumer.py",
+        "import settings\n\n\ndef cb(pool):\n    pool.submit(settings.conn.fetch)\n",
+    )
+    .file(
+        "direct.py",
+        "from settings import conn\n\n\ndef direct(pool):\n    pool.submit(conn.fetch)\n",
+    )
+}
+
+/// Upstream #2291 (a): a module global its module comes to assign another
+/// class takes that class's method for an unchanged importer's method value,
+/// as a fresh index of the edit finds.
+pub fn python_module_global_retyped_in_its_module() -> Case {
+    python_global_files(
+        Case::new(Change::BodyEdit, &[Language::Python]),
+        "from store import Store\nfrom decoy import Decoy\nconn = None\n\n\ndef init():\n    global conn\n    conn = Store()\n",
+    )
+    .write(
+        "settings.py",
+        "from store import Store\nfrom decoy import Decoy\nconn = None\n\n\ndef init():\n    global conn\n    conn = Decoy()\n",
+    )
+    .edge_before("function cb", "references", "method Store::fetch")
+    .edge_before("function direct", "references", "method Store::fetch")
+    .edge_after("function cb", "references", "method Decoy::fetch")
+    .edge_after("function direct", "references", "method Decoy::fetch")
+    .no_edge_after("function cb", "references", "method Store::fetch")
+}
+
+/// Upstream #2291 (a): another module that comes to write a second class
+/// into the global leaves its type with no shared declaration, so the
+/// method values through it go, in its module and in an importer.
+pub fn python_module_global_gains_an_external_write() -> Case {
+    python_global_files(
+        Case::new(Change::BodyEdit, &[Language::Python]),
+        "from store import Store\nconn = None\n\n\ndef init():\n    global conn\n    conn = Store()\n\n\ndef same_file(pool):\n    pool.submit(conn.fetch)\n",
+    )
+    .file(
+        "reset.py",
+        "import settings\nfrom decoy import Decoy\n\n\ndef reset():\n    return Decoy\n",
+    )
+    .write(
+        "reset.py",
+        "import settings\nfrom decoy import Decoy\n\n\ndef reset():\n    settings.conn = Decoy()\n",
+    )
+    .edge_before("function cb", "references", "method Store::fetch")
+    .edge_before("function same_file", "references", "method Store::fetch")
+    .no_edge_after("function cb", "references", "method Store::fetch")
+    .no_edge_after("function same_file", "references", "method Store::fetch")
+}
+
+/// Upstream #2291 (a): a write the type could not use goes, so the global's
+/// type is its module's again and an importer's method value binds it.
+pub fn python_module_global_loses_an_unknown_write() -> Case {
+    python_global_files(
+        Case::new(Change::BodyEdit, &[Language::Python]),
+        "from store import Store\nconn = None\n\n\ndef init():\n    global conn\n    conn = Store()\n",
+    )
+    .file(
+        "reset.py",
+        "import settings\n\n\ndef reset():\n    settings.conn = make_conn()\n",
+    )
+    .write("reset.py", "import settings\n\n\ndef reset():\n    return None\n")
+    .edge_after("function cb", "references", "method Store::fetch")
+}
+
+/// Upstream #2291 (a): deleting the module that wrote an unknown value into
+/// the global restores its type for an importer's method value.
+pub fn python_module_global_writer_is_deleted() -> Case {
+    python_global_files(
+        Case::new(Change::DeleteImportedModule, &[Language::Python]),
+        "from store import Store\nimport reset\nconn = None\n\n\ndef init():\n    global conn\n    conn = Store()\n",
+    )
+    .file(
+        "reset.py",
+        "import settings\n\n\ndef reset():\n    settings.conn = make_conn()\n",
+    )
+    .remove("reset.py")
+    .edge_after("function cb", "references", "method Store::fetch")
+}
+
 /// Upstream #2263: a CommonJS `require('./application')` imports that file once
 /// it appears, though the binding is only ever used as a value.
 pub fn javascript_require_imports_an_added_module() -> Case {

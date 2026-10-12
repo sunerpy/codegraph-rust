@@ -58,6 +58,8 @@ struct Caches {
     /// of a specifier from every importing file, and neither the borrowed store
     /// nor the tree changes within a pass (upstream `fileExistsMemo`).
     file_exists: HashMap<String, bool>,
+    /// The Python write index for the pass (upstream #2332).
+    python_write_index: Option<Arc<crate::python_globals::PythonWriteIndex>>,
 }
 
 /// Bound on memoized existence answers; the memo restarts past it, as upstream.
@@ -85,6 +87,7 @@ impl Caches {
             all_files: None,
             files_by_basename: None,
             file_exists: HashMap::new(),
+            python_write_index: None,
         }
     }
 }
@@ -123,6 +126,7 @@ impl<'a> StoreResolutionContext<'a> {
         c.all_files = None;
         c.files_by_basename = None;
         c.file_exists.clear();
+        c.python_write_index = None;
     }
 
     fn cached_all_files(&self) -> Arc<Vec<String>> {
@@ -440,6 +444,15 @@ impl ResolutionContext for StoreResolutionContext<'_> {
             c.workspace_packages = Some(loaded);
         }
         c.workspace_packages.clone().flatten()
+    }
+
+    fn python_write_index(&self) -> Arc<crate::python_globals::PythonWriteIndex> {
+        if let Some(index) = self.caches.borrow().python_write_index.clone() {
+            return index;
+        }
+        let index = Arc::new(crate::python_globals::PythonWriteIndex::build(self));
+        self.caches.borrow_mut().python_write_index = Some(Arc::clone(&index));
+        index
     }
 
     fn manifest_scope(&self, dir: &str) -> Arc<ManifestScope> {

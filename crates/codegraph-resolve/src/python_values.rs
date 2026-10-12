@@ -87,6 +87,38 @@ pub(crate) fn python_call_shape(
     shape_of_call(&line[column..], name)
 }
 
+/// Whether a Python call that reaches the resolver as a bare name was
+/// written on the instance, `self.get_ip(request)` (upstream #2290
+/// `isPythonSelfCall`): the extractor drops the `self.`, so a name the file
+/// imports would otherwise claim the method call.
+pub(crate) fn is_python_self_call(reference: &RefView, context: &dyn ResolutionContext) -> bool {
+    use crate::name_matcher::{BareCallReceiver, bare_call_receiver};
+    if reference.language != Language::Python
+        || !matches!(
+            bare_call_receiver(reference, context),
+            Some(BareCallReceiver::OwnObject)
+        )
+    {
+        return false;
+    }
+    // `OwnObject` is `super()` and `this` too: the receiver is `self` alone.
+    let Some(facts) = context.source_facts(&reference.file_path) else {
+        return false;
+    };
+    let Some(line) = usize::try_from(reference.line)
+        .ok()
+        .and_then(|line| line.checked_sub(1))
+        .and_then(|index| facts.raw_line(index))
+    else {
+        return false;
+    };
+    usize::try_from(reference.column)
+        .ok()
+        .and_then(|column| line.get(column..))
+        .and_then(|text| text.strip_prefix("self"))
+        .is_some_and(|rest| rest.trim_start().starts_with('.'))
+}
+
 /// The shape of the call of `name` that `text` (its line from the call's
 /// column on) starts with.
 fn shape_of_call(text: &str, name: &str) -> Option<PythonCallShape> {
