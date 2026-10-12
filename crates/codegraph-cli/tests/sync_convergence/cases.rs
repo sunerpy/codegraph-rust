@@ -2227,6 +2227,104 @@ pub fn cpp_using_declaration_names_the_base() -> Case {
         )
 }
 
+/// Upstream #2413: once the header retypes a member from the project's
+/// `Slice` to `std::string`, the unchanged source's `saved_slice_.clear()`
+/// is the string's own member, not `Slice::clear`, which the receiver's
+/// shared word would otherwise guess.
+pub fn cpp_header_member_becomes_a_library_type() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Cpp])
+        .file(
+            "include/leveldb/slice.h",
+            "namespace leveldb {\nclass Slice {\n public:\n  void clear() { size_ = 0; }\n private:\n  unsigned size_;\n};\n}  // namespace leveldb\n",
+        )
+        .file(
+            "db/db_iter.h",
+            "#include <string>\n#include \"include/leveldb/slice.h\"\nnamespace leveldb {\nclass DBIter {\n public:\n  void Next();\n private:\n  Slice saved_slice_;\n};\n}  // namespace leveldb\n",
+        )
+        .file(
+            "db/db_iter.cc",
+            "#include \"db/db_iter.h\"\nnamespace leveldb {\nvoid DBIter::Next() {\n  saved_slice_.clear();\n}\n}  // namespace leveldb\n",
+        )
+        .write(
+            "db/db_iter.h",
+            "#include <string>\n#include \"include/leveldb/slice.h\"\nnamespace leveldb {\nclass DBIter {\n public:\n  void Next();\n private:\n  std::string saved_slice_;\n};\n}  // namespace leveldb\n",
+        )
+        .edge_before(
+            "method leveldb::DBIter::Next @db/db_iter.cc",
+            "calls",
+            "method leveldb::Slice::clear",
+        )
+        .no_edge_after(
+            "method leveldb::DBIter::Next @db/db_iter.cc",
+            "calls",
+            "method leveldb::Slice::clear",
+        )
+}
+
+/// Upstream #2413: a lowercase type is from outside the project only while
+/// the project declares no type of that name. Once a vendored
+/// `absl::flat_hash_set` appears, the unchanged caller's `arena.insert(1)`
+/// is that class's method, never the decoy `Arena::insert`.
+pub fn cpp_project_declares_a_lowercase_outside_type() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Cpp])
+        .file(
+            "util/arena.h",
+            "namespace leveldb {\nclass Arena {\n public:\n  void insert(int block) {}\n};\n}  // namespace leveldb\n",
+        )
+        .file(
+            "util/use.cc",
+            "#include \"absl/container/flat_hash_set.h\"\n#include \"util/arena.h\"\nnamespace leveldb {\nvoid Use() {\n  absl::flat_hash_set<int> arena;\n  arena.insert(1);\n}\n}  // namespace leveldb\n",
+        )
+        .write(
+            "absl/container/flat_hash_set.h",
+            "namespace absl {\ntemplate <class T>\nclass flat_hash_set {\n public:\n  void insert(const T& value) {}\n};\n}  // namespace absl\n",
+        )
+        .edge_after(
+            "function leveldb::Use",
+            "calls",
+            "method absl::flat_hash_set::insert",
+        )
+        .no_edge_after("function leveldb::Use", "calls", "method leveldb::Arena::insert")
+}
+
+/// Upstream #2443: a member declared with nested template arguments is its
+/// class template's, so retyping it in the header moves the unchanged
+/// source's call from `autovector::clear` to `smallvector::clear`.
+pub fn cpp_nested_template_member_type_moves_an_unchanged_receiver() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Cpp])
+        .file(
+            "util/vectors.h",
+            "namespace rocksdb {\ntemplate <class T>\nclass autovector {\n public:\n  void clear() {}\n};\ntemplate <class T>\nclass smallvector {\n public:\n  void clear() {}\n};\nstruct FileMetaData {};\n}  // namespace rocksdb\n",
+        )
+        .file(
+            "db/version_set.h",
+            "#include \"util/vectors.h\"\nnamespace rocksdb {\nclass VersionStorageInfo {\n public:\n  void Reset();\n private:\n  autovector<std::pair<int, FileMetaData*>> files_;\n};\n}  // namespace rocksdb\n",
+        )
+        .file(
+            "db/version_set.cc",
+            "#include \"db/version_set.h\"\nnamespace rocksdb {\nvoid VersionStorageInfo::Reset() {\n  files_.clear();\n}\n}  // namespace rocksdb\n",
+        )
+        .write(
+            "db/version_set.h",
+            "#include \"util/vectors.h\"\nnamespace rocksdb {\nclass VersionStorageInfo {\n public:\n  void Reset();\n private:\n  smallvector<std::pair<int, FileMetaData*>> files_;\n};\n}  // namespace rocksdb\n",
+        )
+        .edge_before(
+            "method rocksdb::VersionStorageInfo::Reset @db/version_set.cc",
+            "calls",
+            "method rocksdb::autovector::clear",
+        )
+        .edge_after(
+            "method rocksdb::VersionStorageInfo::Reset @db/version_set.cc",
+            "calls",
+            "method rocksdb::smallvector::clear",
+        )
+        .no_edge_after(
+            "method rocksdb::VersionStorageInfo::Reset @db/version_set.cc",
+            "calls",
+            "method rocksdb::autovector::clear",
+        )
+}
+
 /// Upstream #1789's prerequisite phase: once `Child` gains `extends Base`
 /// in the file that also calls `c.run()` on a `Child`, the call reaches
 /// `Base::run`, the extends edge resolved before the call, as on a fresh

@@ -1002,48 +1002,11 @@ const CPP_NON_TYPE_TOKENS: &[&str] = &[
 ];
 
 /// The type a C++ declared type names, as upstream's `normalizeCppTypeName`
-/// reads it: `None` when a `>` closes no `<` (the type began on an earlier
-/// line, `std::unique_ptr<Blob>>>& reqs`, or the text is an expression) or
-/// when what is left names no type (`return`, `sizeof`); otherwise
-/// cv-qualifiers, `typename` / `class` / `struct`, `&` / `*` and template
-/// arguments (nested ones with them) dropped and the last `::` segment kept
-/// (`const SkipList<Key, Comparator>&` → `SkipList`).
+/// reads it: [`normalize_cpp_type_name`]'s reading, its last `::` segment
+/// kept (`const SkipList<Key, Comparator>&` → `SkipList`).
 fn cpp_declared_type_name(declared: &str) -> Option<String> {
-    let mut open = 0usize;
-    for c in declared.chars() {
-        match c {
-            '<' => open += 1,
-            '>' => open = open.checked_sub(1)?,
-            _ => {}
-        }
-    }
-    let mut depth = 0usize;
-    let mut bare = String::with_capacity(declared.len());
-    for c in declared.chars() {
-        match c {
-            '<' => depth += 1,
-            '>' => depth = depth.saturating_sub(1),
-            '&' | '*' if depth == 0 => bare.push(' '),
-            _ if depth == 0 => bare.push(c),
-            _ => {}
-        }
-    }
-    let words: Vec<&str> = bare
-        .split_whitespace()
-        .filter(|word| {
-            !matches!(
-                *word,
-                "const" | "volatile" | "mutable" | "typename" | "class" | "struct"
-            )
-        })
-        .collect();
-    let normalized = words.join(" ");
-    let last = normalized
-        .split("::")
-        .filter(|segment| !segment.is_empty())
-        .last()?
-        .trim();
-    (!last.is_empty() && !CPP_NON_TYPE_TOKENS.contains(&last)).then(|| last.to_string())
+    normalize_cpp_type_name(declared)
+        .map(|normalized| cpp_last_segment(&normalized).trim().to_string())
 }
 
 /// The simple name of the type a member belongs to: the last `::` / `.`
@@ -2572,28 +2535,121 @@ fn build_declarator_regex(escaped_receiver: &str) -> Regex {
     .expect("declarator regex")
 }
 
-/// `normalizeCppTypeName` (`name-matcher.ts:480-498` family): strip pointer/ref
-/// markers + surrounding whitespace, keep the last `::` segment's namespace tail
-/// as the upstream does (the upstream keeps the full `ns::Type`; we mirror by trimming markers
-/// only). Returns `""` for an empty/garbage match.
-fn normalize_cpp_type_name(raw: &str) -> String {
-    raw.trim()
-        .trim_end_matches(['*', '&', ' ', '\t'])
-        .trim()
-        .to_string()
+/// Does a `>` in a declared C++ type close no `<` (upstream #2443
+/// `cppTypeBeganAbove`)? Then the type began on an earlier line (rocksdb's
+/// `std::unique_ptr<BlobContents>>>& blob_reqs` under
+/// `autovector<std::pair<BlobRangeReadRequest*,`), or the text is an
+/// expression (`i < a->b->c`).
+fn cpp_type_began_above(type_name: &str) -> bool {
+    let mut depth = 0usize;
+    for c in type_name.chars() {
+        match c {
+            '<' => depth += 1,
+            '>' => match depth.checked_sub(1) {
+                Some(open) => depth = open,
+                None => return true,
+            },
+            _ => {}
+        }
+    }
+    false
 }
 
-/// A declarator scan's capture that names no type (`return x`, `throw x`,
-/// `delete x`): upstream's `normalizeCppTypeName` reads none in it, and the
-/// scan goes on to earlier lines rather than taking `return` as `x`'s type.
-fn is_cpp_non_type_capture(raw: &str) -> bool {
-    let bare = raw.replace(['*', '&'], " ");
-    let last = bare
+/// A C++ declarator scan's captured type (`std::vector<Slice>*`,
+/// `autovector<std::pair<int, FileMetaData*>>&`) as receiver inference reads
+/// it (upstream `normalizeCppTypeName`, the shape after #2443): `&` / `*`,
+/// cv-qualifiers, `typename` / `class` / `struct` and the template
+/// arguments, nested ones with them, dropped (`Table<int, Box<int>>` →
+/// `Table`, never `Table >`, which names no class). `None` when the text
+/// names no type: what is left of a type begun on an earlier line names a
+/// template argument's type, not the declared one, and `return x` /
+/// `delete x` declare nothing. Upstream keeps only the last `::` segment; the
+/// namespaces a declaration writes stay here (`port::Mutex`), as they always
+/// have, and [`resolve_method_on_type`] matches the qualified tail. A capture
+/// ending in `::` is the receiver's own qualifier, not a type: leveldb's
+/// `leveldb::g_env = leveldb::Env::Default();` declares nothing, and the scan
+/// goes on to `leveldb::Env* g_env` (upstream reads the type `leveldb` there;
+/// this scan never has).
+fn normalize_cpp_type_name(raw: &str) -> Option<String> {
+    if cpp_type_began_above(raw) {
+        return None;
+    }
+    let bare = crate::cpp_type_aliases::strip_template_arguments(&raw.replace(['&', '*'], " "));
+    let normalized = bare
         .split_whitespace()
-        .last()
-        .and_then(|word| word.rsplit("::").next())
-        .unwrap_or_default();
-    last.is_empty() || CPP_NON_TYPE_TOKENS.contains(&last)
+        .filter(|word| {
+            !matches!(
+                *word,
+                "const" | "volatile" | "mutable" | "typename" | "class" | "struct"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let last = normalized.rsplit("::").next()?.trim();
+    (!last.is_empty() && !CPP_NON_TYPE_TOKENS.contains(&last)).then_some(normalized)
+}
+
+/// A C++ source line as code, for reading declarations (upstream #2413
+/// `cppCodeOf`): `None` for a line of a comment (`// …`, ` * …`), else the
+/// line with its comments blanked, columns kept. Receiver inference read
+/// leveldb's `// … non-null imm_` as a declaration of `imm_` with the type
+/// `null`.
+fn cpp_code_of(line: &str) -> Option<String> {
+    static COMMENT_LINE: OnceLock<Regex> = OnceLock::new();
+    static BLOCK: OnceLock<Regex> = OnceLock::new();
+    let comment_line =
+        COMMENT_LINE.get_or_init(|| Regex::new(r"^\s*(?://|\*)").expect("comment line"));
+    if comment_line.is_match(line) {
+        return None;
+    }
+    let block = BLOCK.get_or_init(|| Regex::new(r"/\*.*?\*/").expect("block comment"));
+    let mut code = block
+        .replace_all(line, |found: &regex::Captures<'_>| {
+            " ".repeat(found[0].len())
+        })
+        .into_owned();
+    // A block comment opening here runs past the line.
+    if let Some(open) = code.find("/*") {
+        code.truncate(open);
+    }
+    if let Some(comment) = code.find("//") {
+        code.truncate(comment);
+    }
+    Some(code)
+}
+
+/// Patterns for a line that declares a C++ receiver in a form the
+/// declarator pattern doesn't read (upstream #2413 `cppRebindsReceiver`): a
+/// range-`for` variable (`for (const Foo& x : xs)`) or a structured binding
+/// (`auto [x, y] = …`).
+struct CppRebinding {
+    range_variable: Regex,
+    binding: Regex,
+}
+
+impl CppRebinding {
+    fn new(escaped_receiver: &str) -> Option<Self> {
+        Some(Self {
+            range_variable: Regex::new(&format!(r"\b{escaped_receiver}\s*:")).ok()?,
+            binding: Regex::new(&format!(
+                r"\bauto\s*&{{0,2}}\s*\[[^\]]*\b{escaped_receiver}\b[^\]]*\]"
+            ))
+            .ok()?,
+        })
+    }
+
+    fn rebinds(&self, line: &str) -> bool {
+        static FOR: OnceLock<Regex> = OnceLock::new();
+        let range_for = FOR.get_or_init(|| Regex::new(r"\bfor\s*\(").expect("range for"));
+        // `x :` after a `for (`, not `x::`.
+        let in_range_for = range_for.find(line).is_some_and(|open| {
+            let rest = &line[open.end()..];
+            self.range_variable
+                .find_iter(rest)
+                .any(|variable| !rest[variable.end()..].starts_with(':'))
+        });
+        in_range_for || self.binding.is_match(line)
+    }
 }
 
 /// The char following the receiver word must be a declarator terminator
@@ -2703,6 +2759,17 @@ struct CppReceiverDeclaration {
     /// The type is one of the project's class templates, whose
     /// specializations may add members.
     class_template: bool,
+    /// The declared type as written (`std::vector<Slice>*`).
+    raw: String,
+    /// The declaration is the calling function's own, or a member of its
+    /// class ([`is_cpp_callers_declaration`]).
+    callers: bool,
+    /// On its way back to the declaration the scan passed one of the
+    /// receiver it could not read a type from (`auto x = Make();`, `for
+    /// (Foo& x : xs)`, `auto [x, y] = …`, the end of a declaration begun on an
+    /// earlier line), so the declaration it found may be an earlier
+    /// variable's.
+    shadowed: bool,
 }
 
 /// A declared C++ type as receiver inference reads it: as the declaration
@@ -2744,26 +2811,20 @@ fn cpp_declared_type(
     followed.map(crate::cpp_type_aliases::cpp_aliased_type_name)
 }
 
-/// Is line `line` of `file`, where `text` declares a C++ receiver at byte
-/// `at`, the calling function's own code, or a member declaration of the
-/// caller's class (upstream #2399 `isCppCallersDeclaration`)? Receiver
+/// Is line `line` of `file`, which declares a C++ receiver, the calling
+/// function's own code, or a member declaration of the caller's class
+/// (upstream #2399 `isCppCallersDeclaration`, #2413's shape)? Receiver
 /// inference reads back to the top of the file and through the header, so a
 /// declaration it finds elsewhere (an earlier function, another class in the
-/// header, a comment) may be another variable of the same name.
+/// header, a class nested in the caller's: rocksdb's
+/// `MultiScan::MultiScanIterator` has a `scan_opts_` of its own) may be
+/// another variable of the same name. The scan has blanked comments.
 fn is_cpp_callers_declaration(
     file: &str,
     line: i64,
-    text: &str,
-    at: usize,
     reference: &RefView,
     context: &dyn ResolutionContext,
 ) -> bool {
-    static COMMENT_LINE: OnceLock<Regex> = OnceLock::new();
-    let comment_line =
-        COMMENT_LINE.get_or_init(|| Regex::new(r"^\s*(?://|/\*|\*)").expect("comment line"));
-    if comment_line.is_match(text) || text.find("//").is_some_and(|comment| comment < at) {
-        return false;
-    }
     let Some(caller) = context.get_node_by_id_shared(&reference.from_node_id) else {
         return false;
     };
@@ -2776,64 +2837,164 @@ fn is_cpp_callers_declaration(
     let Some((owner, _)) = caller.qualified_name.rsplit_once("::") else {
         return false;
     };
-    context
-        .get_nodes_by_qualified_name_shared(owner)
-        .iter()
-        .any(|class| {
-            matches!(
-                class.kind,
-                NodeKind::Class | NodeKind::Struct | NodeKind::Union
-            ) && class.file_path == file
-                && line >= class.start_line
-                && line
-                    <= if class.end_line != 0 {
-                        class.end_line
-                    } else {
-                        class.start_line
-                    }
-        })
+    let mut innermost: Option<Arc<Node>> = None;
+    for class in context.get_nodes_in_file_shared(file) {
+        if !matches!(
+            class.kind,
+            NodeKind::Class | NodeKind::Struct | NodeKind::Union
+        ) {
+            continue;
+        }
+        let end = if class.end_line != 0 {
+            class.end_line
+        } else {
+            class.start_line
+        };
+        if line < class.start_line || line > end {
+            continue;
+        }
+        if innermost
+            .as_ref()
+            .is_none_or(|inner| class.start_line >= inner.start_line)
+        {
+            innermost = Some(class);
+        }
+    }
+    innermost.is_some_and(|class| class.qualified_name == owner)
 }
 
-/// Is the C++ member call `reference` written `receiver.method(…)`, not
-/// through `->` (upstream #2399 `isCppDotCall`)?
-fn is_cpp_dot_call(receiver: &str, reference: &RefView, context: &dyn ResolutionContext) -> bool {
-    let Some(facts) = context.source_facts(&reference.file_path) else {
-        return false;
-    };
-    let Some(index) = usize::try_from(reference.line - 1)
+/// The operator the C++ member call `reference` is written with (upstream
+/// #2413 `cppMemberOperator`): `.` for `receiver.method(…)`, `->` through a
+/// pointer, iterator or smart pointer, `None` when the source doesn't show
+/// it.
+fn cpp_member_operator(
+    receiver: &str,
+    reference: &RefView,
+    context: &dyn ResolutionContext,
+) -> Option<&'static str> {
+    let facts = context.source_facts(&reference.file_path)?;
+    let index = usize::try_from(reference.line - 1)
         .ok()
-        .filter(|&index| index < facts.line_count())
-    else {
-        return false;
-    };
-    let Some(mut rest) = facts
+        .filter(|&index| index < facts.line_count())?;
+    let mut rest = facts
         .line(index)
         .get(usize::try_from(reference.column).unwrap_or(0)..)
-        .and_then(|at| at.strip_prefix(receiver))
-    else {
-        return false;
-    };
+        .and_then(|at| at.strip_prefix(receiver))?;
     // `symbols_by_parent_` ending its line, `.insert(…)` starting the next.
     let mut next = index + 1;
     while rest.trim().is_empty() && next < facts.line_count().min(index + 1 + 3) {
         rest = facts.line(next);
         next += 1;
     }
-    rest.trim_start().starts_with('.')
+    let rest = rest.trim_start();
+    if rest.starts_with('.') {
+        Some(".")
+    } else if rest.starts_with("->") {
+        Some("->")
+    } else {
+        None
+    }
+}
+
+/// Is the C++ member call `reference` written `receiver.method(…)`, not
+/// through `->` (upstream #2399 `isCppDotCall`)?
+fn is_cpp_dot_call(receiver: &str, reference: &RefView, context: &dyn ResolutionContext) -> bool {
+    cpp_member_operator(receiver, reference, context) == Some(".")
+}
+
+/// The C and C++ types the project declares under `name` (upstream #2413
+/// `cppTypesNamed`).
+fn cpp_types_named(name: &str, context: &dyn ResolutionContext) -> Vec<Arc<Node>> {
+    context
+        .get_nodes_by_name_shared(name)
+        .into_iter()
+        .filter(|node| {
+            matches!(node.language, Language::C | Language::Cpp)
+                && matches!(
+                    node.kind,
+                    NodeKind::Class
+                        | NodeKind::Struct
+                        | NodeKind::Union
+                        | NodeKind::Enum
+                        | NodeKind::Interface
+                        | NodeKind::TypeAlias
+                )
+        })
+        .collect()
+}
+
+/// Is a C++ declared type, as written (`std::vector<Slice>*`, `const
+/// absl::flat_hash_set<int>&`), one from outside the project with a
+/// lowercase name, as the standard library's and abseil's are (upstream
+/// #2413 `isCppLibraryType`)? [`is_undeclared_type_name`] takes the
+/// capitalized ones. The name is qualified, by namespaces that are no
+/// project type's (`Foo::kMask & key` reads like a declaration of `key`),
+/// and the project declares no type of that name: in `std` itself for a
+/// `std::` name (googletest's `testing::internal::string` is no
+/// `std::string`), anywhere for any other, since a namespace a macro opens
+/// (fmt's `FMT_BEGIN_NAMESPACE`) is in no qualified name. An unqualified
+/// name is not known to be std's: fmt's `using namespace std;` is inside
+/// `namespace adl { … }`, and its `basic_string_view` is fmt's own. Nor is a
+/// type whose `>`s outnumber its `<`s, the end of a declaration begun on an
+/// earlier line. A `_t` name has no members of its own: a scalar
+/// (`std::size_t`, so the declaration is another variable's), a tag, or a
+/// trait naming another type (rocksdb's `std::conditional_t<kIsDigested,
+/// void*, Slice> dict`).
+fn is_cpp_library_type(raw: &str, context: &dyn ResolutionContext) -> bool {
+    if raw.matches('<').count() != raw.matches('>').count() {
+        return false;
+    }
+    let Some(segments) = crate::cpp_type_aliases::cpp_type_segments(raw) else {
+        return false;
+    };
+    let Some((name, qualifiers)) = segments.split_last().filter(|(_, rest)| !rest.is_empty())
+    else {
+        return false;
+    };
+    if !name.starts_with(|c: char| c.is_ascii_lowercase()) || name.ends_with("_t") {
+        return false;
+    }
+    if qualifiers
+        .iter()
+        .any(|qualifier| !cpp_types_named(qualifier, context).is_empty())
+    {
+        return false;
+    }
+    let declared = cpp_types_named(name, context);
+    if qualifiers[0] != "std" {
+        return declared.is_empty();
+    }
+    let spelled = segments.join("::");
+    let tail = format!("::{spelled}");
+    !declared
+        .iter()
+        .any(|node| node.qualified_name == spelled || node.qualified_name.ends_with(&tail))
+}
+
+/// Record the C++ declaration receiver inference settles on (upstream #2413
+/// `noteCppDeclaration`).
+fn note_cpp_declaration(found: Option<&mut CppReceiverDeclaration>, raw: &str, callers: bool) {
+    if let Some(found) = found {
+        found.raw = raw.to_string();
+        found.callers = callers;
+        found.pointer = crate::cpp_type_aliases::is_cpp_pointer_type(raw);
+    }
 }
 
 /// Infer a C++ receiver's declared type by scanning the source backwards from
 /// the call line for its declarator (`inferCppReceiverType`,
 /// `name-matcher.ts:512-567`). Handles `Foo x;`, `auto x = Foo::make();`, and a
-/// `.h/.hpp/.hxx` header fallback. A declared type the caller's own code
-/// spells through an alias is the type the alias names (upstream #2399), and
-/// `found` records what the declaration said.
+/// `.h/.hpp/.hxx` header fallback. Comments are no declarations (upstream
+/// #2413). A declared type the caller's own code spells through an alias is
+/// the type the alias names (upstream #2399), and `found` records what the
+/// declaration said and whether a re-declaration the scan could not read
+/// passed on the way.
 fn infer_cpp_receiver_type(
     receiver_name: &str,
     reference: &RefView,
     context: &dyn ResolutionContext,
     depth: u32,
-    found: Option<&mut CppReceiverDeclaration>,
+    mut found: Option<&mut CppReceiverDeclaration>,
 ) -> Option<String> {
     let source = context.read_file(&reference.file_path)?;
     let lines: Vec<&str> = source
@@ -2847,48 +3008,79 @@ fn infer_cpp_receiver_type(
     let escaped = regex_escape(receiver_name);
     let receiver_pattern = Regex::new(&format!(r"\b{escaped}\b")).ok()?;
     let declarator_regex = build_declarator_regex(&escaped);
+    let mut rebinding: Option<Option<CppRebinding>> = None;
 
     for i in (0..=call_line_index).rev() {
-        let line = lines[i];
-        if line.is_empty() || !receiver_pattern.is_match(line) {
+        let text = lines[i];
+        if text.is_empty() || !receiver_pattern.is_match(text) {
             continue;
         }
-        if let Some(caps) = declarator_regex.captures(line) {
-            let whole = caps.get(0)?;
-            if !declarator_terminator_ok(line, whole.end()) {
-                continue;
-            }
+        let Some(line) = cpp_code_of(text) else {
+            continue;
+        };
+        if !receiver_pattern.is_match(&line) {
+            continue;
+        }
+        let declarator = declarator_regex.captures(&line).filter(|caps| {
+            caps.get(0)
+                .is_some_and(|whole| declarator_terminator_ok(&line, whole.end()))
+        });
+        if let Some(caps) = declarator {
             let raw = caps.get(1).map_or("", |m| m.as_str());
-            if is_cpp_non_type_capture(raw) {
-                continue;
-            }
-            let normalized = normalize_cpp_type_name(raw);
-            if normalized == "auto" {
-                // `auto x = Foo::instance();` — recover the type from the
-                // initializer (call return type / construction).
-                if let Some(init_type) =
-                    infer_cpp_auto_initializer_type(line, receiver_name, reference, context, depth)
-                {
-                    return Some(init_type);
+            match normalize_cpp_type_name(raw) {
+                Some(normalized) if normalized == "auto" => {
+                    // `auto x = Foo::instance();` — recover the type from the
+                    // initializer (call return type / construction).
+                    if let Some(init_type) = infer_cpp_auto_initializer_type(
+                        &line,
+                        receiver_name,
+                        reference,
+                        context,
+                        depth,
+                    ) {
+                        return Some(init_type);
+                    }
+                    // No usable initializer on this line: keep scanning
+                    // earlier ones, where what is declared is an earlier
+                    // variable.
+                    if let Some(found) = found.as_deref_mut() {
+                        found.shadowed = true;
+                    }
                 }
-            } else if !normalized.is_empty() {
-                let in_caller_scope = is_cpp_callers_declaration(
-                    &reference.file_path,
-                    i as i64 + 1,
-                    line,
-                    whole.start(),
-                    reference,
-                    context,
-                );
-                return cpp_declared_type(
-                    raw,
-                    normalized,
-                    in_caller_scope,
-                    reference,
-                    context,
-                    found,
-                );
+                Some(normalized) => {
+                    let in_caller_scope = is_cpp_callers_declaration(
+                        &reference.file_path,
+                        i as i64 + 1,
+                        reference,
+                        context,
+                    );
+                    note_cpp_declaration(found.as_deref_mut(), raw, in_caller_scope);
+                    return cpp_declared_type(
+                        raw,
+                        normalized,
+                        in_caller_scope,
+                        reference,
+                        context,
+                        found,
+                    );
+                }
+                // The end of a declaration begun on an earlier line, maybe the
+                // receiver's: one found further up may be another variable
+                // (upstream #2443).
+                None if cpp_type_began_above(raw) => {
+                    if let Some(found) = found.as_deref_mut() {
+                        found.shadowed = true;
+                    }
+                }
+                None => {}
             }
+        } else if let Some(found) = found.as_deref_mut()
+            && rebinding
+                .get_or_insert_with(|| CppRebinding::new(&escaped))
+                .as_ref()
+                .is_some_and(|rebinding| rebinding.rebinds(&line))
+        {
+            found.shadowed = true;
         }
     }
 
@@ -2909,42 +3101,37 @@ fn infer_cpp_receiver_type(
         let Some(header_source) = context.read_file(&header_path) else {
             continue;
         };
-        for (i, line) in header_source
+        for (i, text) in header_source
             .split('\n')
             .map(|l| l.trim_end_matches('\r'))
             .enumerate()
         {
-            if !receiver_pattern.is_match(line) {
+            if !receiver_pattern.is_match(text) {
                 continue;
             }
-            if let Some(caps) = declarator_regex.captures(line) {
-                let Some(whole) = caps.get(0) else { continue };
-                if !declarator_terminator_ok(line, whole.end()) {
-                    continue;
-                }
-                let raw = caps.get(1).map_or("", |m| m.as_str());
-                if is_cpp_non_type_capture(raw) {
-                    continue;
-                }
-                let normalized = normalize_cpp_type_name(raw);
-                if !normalized.is_empty() && normalized != "auto" {
-                    let in_caller_scope = is_cpp_callers_declaration(
-                        &header_path,
-                        i as i64 + 1,
-                        line,
-                        whole.start(),
-                        reference,
-                        context,
-                    );
-                    return cpp_declared_type(
-                        raw,
-                        normalized,
-                        in_caller_scope,
-                        reference,
-                        context,
-                        found,
-                    );
-                }
+            let Some(line) = cpp_code_of(text) else {
+                continue;
+            };
+            let Some(caps) = declarator_regex.captures(&line) else {
+                continue;
+            };
+            let Some(whole) = caps.get(0) else { continue };
+            if !declarator_terminator_ok(&line, whole.end()) {
+                continue;
+            }
+            let raw = caps.get(1).map_or("", |m| m.as_str());
+            if let Some(normalized) = normalize_cpp_type_name(raw).filter(|n| n != "auto") {
+                let in_caller_scope =
+                    is_cpp_callers_declaration(&header_path, i as i64 + 1, reference, context);
+                note_cpp_declaration(found.as_deref_mut(), raw, in_caller_scope);
+                return cpp_declared_type(
+                    raw,
+                    normalized,
+                    in_caller_scope,
+                    reference,
+                    context,
+                    found,
+                );
             }
         }
     }
@@ -4109,6 +4296,25 @@ pub fn match_method_call(
             if is_undeclared_type_name(&cpp_declaration.written, reference, context) {
                 return None;
             }
+        }
+        // A C++ receiver the calling function or its class declares as a
+        // type from outside the project with a lowercase name calls that
+        // type's own member, through `.` or a raw pointer's `->` (upstream
+        // #2413): leveldb's `std::string data_; data_.data()` went to
+        // `Slice::data`, protobuf's `std::string proto; proto.append(…)` to
+        // `LeftoverBuffer::append`. Not so for `->` on such a value (an
+        // iterator, smart pointer or optional hands the call to its element
+        // type), nor for a call that doesn't fit the declaration (`.` on a
+        // pointer), which then is another variable's.
+        if reference.language == Language::Cpp
+            && cpp_declaration.callers
+            && !cpp_declaration.aliased
+            && !cpp_declaration.shadowed
+            && cpp_member_operator(&object_or_class, reference, context)
+                == Some(if cpp_declaration.pointer { "->" } else { "." })
+            && is_cpp_library_type(&cpp_declaration.raw, context)
+        {
+            return None;
         }
     }
 
@@ -6249,11 +6455,21 @@ mod js_module_tests {
 
 #[cfg(test)]
 mod cpp_declared_type_tests {
-    use super::{cpp_declared_type_name, is_cpp_non_type_capture};
+    use super::{cpp_declared_type_name, normalize_cpp_type_name};
 
     #[test]
     fn a_capture_naming_no_type_lets_the_declarator_scan_go_on() {
-        for capture in ["return", "return *", "throw", "delete", "sizeof", "", "&"] {
+        let is_cpp_non_type_capture = |capture: &str| normalize_cpp_type_name(capture).is_none();
+        for capture in [
+            "return",
+            "return *",
+            "throw",
+            "delete",
+            "sizeof",
+            "",
+            "&",
+            "leveldb::",
+        ] {
             assert!(is_cpp_non_type_capture(capture), "{capture:?}");
         }
         for capture in [
@@ -6293,6 +6509,60 @@ mod cpp_declared_type_tests {
         assert_eq!(read("sizeof"), None);
         assert_eq!(read(""), None);
         assert_eq!(read("&"), None);
+    }
+
+    /// Upstream #2443: a receiver's declared type keeps no debris of nested
+    /// template arguments, and the end of a declaration begun on an earlier
+    /// line names no type; the namespaces it writes stay.
+    #[test]
+    fn a_receiver_type_drops_nested_template_arguments() {
+        let read = |raw: &str| super::normalize_cpp_type_name(raw);
+        assert_eq!(
+            read("autovector<std::pair<int, FileMetaData*>>").as_deref(),
+            Some("autovector")
+        );
+        assert_eq!(
+            read("Striped<CacheAlignedWrapper<port::Mutex>>").as_deref(),
+            Some("Striped")
+        );
+        assert_eq!(read("std::vector<Slice>*").as_deref(), Some("std::vector"));
+        assert_eq!(read("port::Mutex&").as_deref(), Some("port::Mutex"));
+        assert_eq!(read("auto&").as_deref(), Some("auto"));
+        assert_eq!(read("std::unique_ptr<BlobContents>>>&"), None);
+        assert_eq!(read("CachableEntry<BlobContents>>>&"), None);
+        assert!(super::cpp_type_began_above("Blob>>>&"));
+        assert!(!super::cpp_type_began_above("a<b<c>>"));
+    }
+
+    /// Upstream #2413: the declaration scan reads code, not comments.
+    #[test]
+    fn a_line_as_code_blanks_its_comments_and_keeps_columns() {
+        let code = |line: &str| super::cpp_code_of(line);
+        assert_eq!(code("  // a non-null imm_"), None);
+        assert_eq!(code("   * imm_ is never null"), None);
+        assert_eq!(
+            code("/* static */ bool Status::Check(const std::string& msg) {").as_deref(),
+            Some("             bool Status::Check(const std::string& msg) {")
+        );
+        assert_eq!(
+            code("  MemTable* imm_;  // the one being compacted").as_deref(),
+            Some("  MemTable* imm_;  ")
+        );
+        assert_eq!(code("  int x; /* runs on").as_deref(), Some("  int x; "));
+    }
+
+    /// Upstream #2413: a range-`for` variable or a structured binding
+    /// re-declares the receiver in a form the declarator pattern doesn't read.
+    #[test]
+    fn a_range_for_variable_or_a_structured_binding_rebinds_the_receiver() {
+        let rebinding = super::CppRebinding::new("key").expect("patterns");
+        assert!(rebinding.rebinds("  for (const Slice& key : slices) {"));
+        assert!(rebinding.rebinds("  for (auto& [key, value] : map) {"));
+        assert!(rebinding.rebinds("  auto [key, value] = Split(line);"));
+        assert!(rebinding.rebinds("  const auto& [first, key] = pair;"));
+        assert!(!rebinding.rebinds("  for (int i = 0; i < key::kMax; ++i) {"));
+        assert!(!rebinding.rebinds("  std::string key;"));
+        assert!(!rebinding.rebinds("  key.clear();"));
     }
 }
 

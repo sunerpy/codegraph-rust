@@ -1120,6 +1120,27 @@ mod tests {
         assert_eq!(segments("void (*)(int)"), None);
     }
 
+    /// Upstream #2443's `stripCppTemplateArguments` cases.
+    #[test]
+    fn template_arguments_go_with_the_ones_nested_in_them() {
+        assert_eq!(
+            strip_template_arguments("autovector<std::pair<int, FileMetaData*>>"),
+            "autovector"
+        );
+        assert_eq!(
+            strip_template_arguments("Striped<CacheAlignedWrapper<port::Mutex>>"),
+            "Striped"
+        );
+        assert_eq!(
+            strip_template_arguments("const std::map<int, std::vector<int> >&"),
+            "const std::map&"
+        );
+        assert_eq!(
+            strip_template_arguments("SkipList<const char*, Cmp<int>>::Iterator"),
+            "SkipList::Iterator"
+        );
+    }
+
     #[test]
     fn templated_segments_are_marked() {
         let name = cpp_type_name("ns::Table<int>::Iterator").expect("type name");

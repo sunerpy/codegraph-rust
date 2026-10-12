@@ -5531,4 +5531,987 @@ class basic_json
             graph.report()
         );
     }
+
+    /// Source lines joined as a file, with its last newline (upstream's
+    /// `lines(…)`).
+    fn lines(text: &[&str]) -> String {
+        let mut out = text.join("\n");
+        out.push('\n');
+        out
+    }
+
+    /// The qualified names of the `calls` callees of `caller`, sorted.
+    fn callee_names(graph: &Graph, caller: &str) -> Vec<String> {
+        callees(graph, caller)
+            .into_iter()
+            .map(|callee| {
+                callee
+                    .rsplit_once(" (")
+                    .map_or(callee.clone(), |(name, _)| name.to_string())
+            })
+            .collect()
+    }
+
+    /// The `calls` callees of `caller` with how each was resolved, as
+    /// `qualified resolvedBy@confidence`, sorted.
+    fn resolved_callees(graph: &Graph, caller: &str) -> Vec<String> {
+        let ids: Vec<&str> = graph
+            .nodes
+            .iter()
+            .filter(|node| {
+                node.qualified_name == caller && (node.kind == "method" || node.kind == "function")
+            })
+            .map(|node| node.id.as_str())
+            .collect();
+        assert!(!ids.is_empty(), "no function or method {caller}");
+        let mut out: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.kind == "calls" && ids.contains(&edge.source.as_str()))
+            .filter_map(|edge| {
+                graph.node(&edge.target).map(|node| {
+                    format!(
+                        "{} {}@{}",
+                        node.qualified_name,
+                        edge.resolved_by().unwrap_or("?"),
+                        edge.confidence()
+                            .map_or_else(|| "?".to_string(), |c| c.to_string())
+                    )
+                })
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// leveldb's Slice and its namesakes elsewhere (upstream #2413's
+    /// `PROJECT`): every method a library type's call could be mistaken for.
+    fn library_type_project(extra: &[(&str, String)]) -> super::support::Indexed {
+        let project = Project::new()
+            .file(
+                "include/leveldb/slice.h",
+                &lines(&[
+                    "namespace leveldb {",
+                    "class Slice {",
+                    " public:",
+                    "  const char* data() const { return data_; }",
+                    "  unsigned size() const { return size_; }",
+                    "  void clear() { size_ = 0; }",
+                    "  const char* begin() const { return data_; }",
+                    "  void remove_prefix(unsigned n) { size_ -= n; }",
+                    " private:",
+                    "  const char* data_;",
+                    "  unsigned size_;",
+                    "};",
+                    "}  // namespace leveldb",
+                ]),
+            )
+            .file(
+                "util/buffers.h",
+                &lines(&[
+                    "namespace leveldb {",
+                    "class LeftoverBuffer {",
+                    " public:",
+                    "  void append(const char* s, unsigned n) {}",
+                    "};",
+                    "class Arena {",
+                    " public:",
+                    "  void insert(int block) {}",
+                    "};",
+                    "class Cache {",
+                    " public:",
+                    "  void reset() {}",
+                    "};",
+                    "class Iterator {",
+                    " public:",
+                    "  void SeekToFirst() {}",
+                    "};",
+                    "}  // namespace leveldb",
+                ]),
+            );
+        extra
+            .iter()
+            .fold(project, |project, (path, text)| project.file(path, text))
+            .index()
+    }
+
+    /// Upstream #2413 (`61f8b09c`): a C++ receiver the calling function or
+    /// its class declares as a type from outside the project with a
+    /// lowercase name calls that type's own member. leveldb's `std::string
+    /// saved_key_; saved_key_.clear()` reached `Slice::clear`, the one
+    /// project `clear`. The receiver here is `saved_slice_`: Rust's guess of a
+    /// lone candidate needs a word the receiver shares with it (#226,
+    /// KEEP-RUST), and this one would reach `Slice::clear` without the stop.
+    #[test]
+    fn pr2413_a_std_string_member_calls_its_own_member() {
+        let project = library_type_project(&[(
+            "db/db_iter.cc",
+            lines(&[
+                "#include <string>",
+                "#include \"include/leveldb/slice.h\"",
+                "namespace leveldb {",
+                "class DBIter {",
+                " public:",
+                "  void Next();",
+                " private:",
+                "  std::string saved_slice_;    // == current key when direction_==kReverse",
+                "};",
+                "void DBIter::Next() {",
+                "  saved_slice_.clear();",
+                "}",
+                "}  // namespace leveldb",
+            ]),
+        )]);
+        let graph = project.graph();
+        assert_eq!(
+            callee_names(graph, "leveldb::DBIter::Next"),
+            Vec::<String>::new(),
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            callers(graph, "leveldb::Slice::clear"),
+            Vec::<String>::new()
+        );
+    }
+
+    /// Upstream #2413: a local, a parameter, a raw pointer, nested template
+    /// arguments and an abseil container; `value` is a `Slice`, the others
+    /// are not. The receivers are `buffer`, `proto_buffer`, `arena` and
+    /// `slice_files` (upstream's `dst`, `proto`, `seen`, `files`), sharing a
+    /// word with a decoy Rust's lone-candidate guess (#226, KEEP-RUST) would
+    /// take without the stop.
+    #[test]
+    fn pr2413_locals_parameters_and_raw_pointers_of_library_types() {
+        let project = library_type_project(&[(
+            "db/encode.cc",
+            lines(&[
+                "#include <string>",
+                "#include <vector>",
+                "#include \"absl/container/flat_hash_set.h\"",
+                "#include \"include/leveldb/slice.h\"",
+                "#include \"util/buffers.h\"",
+                "namespace leveldb {",
+                "void Encode(std::string* buffer, const Slice& value) {",
+                "  buffer->clear();",
+                "  buffer->append(value.data(), value.size());",
+                "}",
+                "std::string Render(const std::vector<std::pair<int, Slice>>& slice_files) {",
+                "  std::string proto_buffer;",
+                "  proto_buffer.append(\"x\", 1);",
+                "  absl::flat_hash_set<int> arena;",
+                "  arena.insert(1);",
+                "  const char* first = proto_buffer.data();",
+                "  return slice_files.begin() == slice_files.end() ? proto_buffer : std::string(first);",
+                "}",
+                "}  // namespace leveldb",
+            ]),
+        )]);
+        let graph = project.graph();
+        assert_eq!(
+            callee_names(graph, "leveldb::Encode"),
+            ["leveldb::Slice::data", "leveldb::Slice::size"],
+            "{}",
+            graph.report()
+        );
+        assert_eq!(callee_names(graph, "leveldb::Render"), Vec::<String>::new());
+    }
+
+    /// Upstream #2413: a `std::` name beside a project type of that name in
+    /// another namespace (rocksdb vendors googletest, whose `typedef
+    /// ::std::string string;` in `testing::internal` is a project `string`).
+    /// The receiver is `slice` (upstream's `text`), which Rust's lone-candidate
+    /// guess (#226, KEEP-RUST) would take to `Slice::clear` without the stop.
+    #[test]
+    fn pr2413_a_std_name_beside_a_project_namesake_elsewhere() {
+        let project = library_type_project(&[
+            (
+                "third_party/gtest.h",
+                lines(&[
+                    "#include <string>",
+                    "namespace testing {",
+                    "namespace internal {",
+                    "typedef ::std::string string;",
+                    "}  // namespace internal",
+                    "}  // namespace testing",
+                ]),
+            ),
+            (
+                "tools/trim.cc",
+                lines(&[
+                    "#include <string>",
+                    "#include \"include/leveldb/slice.h\"",
+                    "void Trim(std::string& slice) {",
+                    "  slice.clear();",
+                    "}",
+                ]),
+            ),
+        ]);
+        let graph = project.graph();
+        assert_eq!(
+            callee_names(graph, "Trim"),
+            Vec::<String>::new(),
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream #2413: on a smart pointer, `.` is its own member and `->`
+    /// reaches the element type: `reset()` is `unique_ptr`'s, not
+    /// `Cache::reset`. The receiver is `cache_iterator` (upstream's `iter`),
+    /// which shares a word with both `Iterator` and the decoy `Cache` for
+    /// Rust's lone-candidate guess (#226, KEEP-RUST).
+    #[test]
+    fn pr2413_a_smart_pointer_dot_call_is_its_own_member() {
+        let project = library_type_project(&[(
+            "db/scan.cc",
+            lines(&[
+                "#include <memory>",
+                "#include \"util/buffers.h\"",
+                "namespace leveldb {",
+                "void Scan(Iterator* raw) {",
+                "  std::unique_ptr<Iterator> cache_iterator(raw);",
+                "  cache_iterator->SeekToFirst();",
+                "  cache_iterator.reset();",
+                "}",
+                "}  // namespace leveldb",
+            ]),
+        )]);
+        let graph = project.graph();
+        assert_eq!(
+            callee_names(graph, "leveldb::Scan"),
+            ["leveldb::Iterator::SeekToFirst"],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream #2413: a std trait or member type names another type, maybe
+    /// the project's (rocksdb's `std::conditional_t<kIsDigestedDict, void*,
+    /// Slice> dict` is a `Slice` when the flag is off). The receivers are
+    /// `dict_slice` and `first_slice` (upstream's `dict`, `first`), which
+    /// Rust's lone-candidate guess (#226, KEEP-RUST) takes to `Slice`.
+    #[test]
+    fn pr2413_a_std_trait_or_member_type_may_name_a_project_type() {
+        let project = library_type_project(&[(
+            "util/compression.cc",
+            lines(&[
+                "#include <type_traits>",
+                "#include <vector>",
+                "#include \"include/leveldb/slice.h\"",
+                "namespace leveldb {",
+                "template <bool kIsDigestedDict>",
+                "unsigned DictSize(std::conditional_t<kIsDigestedDict, void*, Slice> dict_slice) {",
+                "  return dict_slice.size();",
+                "}",
+                "void Drop(const std::vector<Slice>& slices) {",
+                "  std::vector<Slice>::value_type first_slice = slices[0];",
+                "  first_slice.remove_prefix(1);",
+                "}",
+                "}  // namespace leveldb",
+            ]),
+        )]);
+        let graph = project.graph();
+        assert_eq!(
+            callee_names(graph, "leveldb::DictSize"),
+            ["leveldb::Slice::size"],
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            callee_names(graph, "leveldb::Drop"),
+            ["leveldb::Slice::remove_prefix"]
+        );
+    }
+
+    /// Upstream #2413: a project type with a lowercase name is still the
+    /// project's.
+    #[test]
+    fn pr2413_a_lowercase_project_type_keeps_its_method() {
+        let project = library_type_project(&[
+            (
+                "util/arena.h",
+                lines(&[
+                    "namespace util {",
+                    "class arena {",
+                    " public:",
+                    "  void* allocate(unsigned n) { return 0; }",
+                    "};",
+                    "}  // namespace util",
+                ]),
+            ),
+            (
+                "util/use.cc",
+                lines(&[
+                    "#include \"util/arena.h\"",
+                    "void Use(util::arena& a) {",
+                    "  a.allocate(8);",
+                    "}",
+                ]),
+            ),
+        ]);
+        let graph = project.graph();
+        assert_eq!(
+            callee_names(graph, "Use"),
+            ["util::arena::allocate"],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream #2413: a range-for variable, or an `auto` one, hides an
+    /// earlier library-typed one of the same name, so that declaration says
+    /// nothing about the call; the block's `clear()` is the string's. The
+    /// receivers are `slice` and `cache` (upstream's `key`, `buf`), which
+    /// Rust's lone-candidate guess (#226, KEEP-RUST) takes to `Slice` and
+    /// `Cache`.
+    #[test]
+    fn pr2413_a_range_for_or_auto_variable_hides_a_library_typed_one() {
+        let project = library_type_project(&[(
+            "db/shadow.cc",
+            lines(&[
+                "#include <string>",
+                "#include <vector>",
+                "#include \"include/leveldb/slice.h\"",
+                "#include \"util/buffers.h\"",
+                "namespace leveldb {",
+                "void Trim(const std::vector<Slice>& slices) {",
+                "  std::string slice;",
+                "  for (const Slice& slice : slices) {",
+                "    slice.remove_prefix(1);",
+                "  }",
+                "}",
+                "void Flush(Cache* caches) {",
+                "  { std::string cache; cache.clear(); }",
+                "  auto cache = caches[0];",
+                "  cache.reset();",
+                "}",
+                "}  // namespace leveldb",
+            ]),
+        )]);
+        let graph = project.graph();
+        assert_eq!(
+            callee_names(graph, "leveldb::Trim"),
+            ["leveldb::Slice::remove_prefix"],
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            callee_names(graph, "leveldb::Flush"),
+            ["leveldb::Cache::reset"]
+        );
+    }
+
+    /// Upstream #2413: a call that contradicts the declaration the scan
+    /// found (`.` on what reads as a pointer, `absl::kWeightScale * key[0]`)
+    /// keeps its guess: that declaration is another variable's. The receiver
+    /// is `slice_key` (upstream's `key`), which Rust's lone-candidate guess
+    /// (#226, KEEP-RUST) takes to `Slice::size`.
+    #[test]
+    fn pr2413_a_call_contradicting_its_declaration_keeps_its_guess() {
+        let project = library_type_project(&[(
+            "util/weight.cc",
+            lines(&[
+                "#include \"include/leveldb/slice.h\"",
+                "namespace leveldb {",
+                "unsigned Weight(const Slice& slice_key) {",
+                "  unsigned w = absl::kWeightScale * slice_key[0];",
+                "  return w + slice_key.size();",
+                "}",
+                "}  // namespace leveldb",
+            ]),
+        )]);
+        let graph = project.graph();
+        assert_eq!(
+            callee_names(graph, "leveldb::Weight"),
+            ["leveldb::Slice::size"],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream #2413: a constant of a project class read as a type
+    /// (`Slice::kMask & key[0]`), and a `_t` scalar, are no library types.
+    /// The receiver is `slice_key` (upstream's `key`), which Rust's
+    /// lone-candidate guess (#226, KEEP-RUST) takes to `Slice`.
+    #[test]
+    fn pr2413_a_project_class_constant_and_a_scalar_are_no_library_types() {
+        let project = library_type_project(&[(
+            "util/mask.cc",
+            lines(&[
+                "#include <cstddef>",
+                "#include \"include/leveldb/slice.h\"",
+                "#define SLICE_AT(var, list, i) const Slice& var = list[i]",
+                "namespace leveldb {",
+                "unsigned Mask(const Slice& slice_key) {",
+                "  unsigned m = Slice::kMask & slice_key[0];",
+                "  return m + slice_key.size();",
+                "}",
+                "void Visit(const Slice* slices) {",
+                "  std::size_t slice_key = 0;",
+                "  {",
+                "    SLICE_AT(slice_key, slices, 0);",
+                "    slice_key.remove_prefix(1);",
+                "  }",
+                "}",
+                "}  // namespace leveldb",
+            ]),
+        )]);
+        let graph = project.graph();
+        assert_eq!(
+            callee_names(graph, "leveldb::Mask"),
+            ["leveldb::Slice::size"],
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            callee_names(graph, "leveldb::Visit"),
+            ["leveldb::Slice::remove_prefix"]
+        );
+    }
+
+    /// Upstream #2413: a member of another class in the file (leveldb's
+    /// `db/log_test.cc`: `StringDest`'s `std::string contents_` sits above
+    /// `StringSource`, whose own `Slice contents_` follows its methods). The
+    /// members are `slice_` here (upstream's `contents_`), which Rust's
+    /// lone-candidate guess (#226, KEEP-RUST) takes to `Slice`.
+    #[test]
+    fn pr2413_a_member_of_another_class_in_the_file() {
+        let project = library_type_project(&[(
+            "db/log_test.cc",
+            lines(&[
+                "#include <string>",
+                "#include \"include/leveldb/slice.h\"",
+                "namespace leveldb {",
+                "class StringDest {",
+                " public:",
+                "  std::string slice_;",
+                "};",
+                "class StringSource {",
+                " public:",
+                "  void Skip(unsigned n) { slice_.remove_prefix(n); }",
+                " private:",
+                "  Slice slice_;",
+                "};",
+                "}  // namespace leveldb",
+            ]),
+        )]);
+        let graph = project.graph();
+        assert_eq!(
+            callee_names(graph, "leveldb::StringSource::Skip"),
+            ["leveldb::Slice::remove_prefix"],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream #2413: the last line of a declaration that starts on an
+    /// earlier one (rocksdb's `BlobFileReader`: `autovector<std::pair<…,`
+    /// ends one line and `std::unique_ptr<…>>>& blob_reqs` starts the next).
+    /// The parameter is `autovector_reqs` (upstream's `blob_reqs`), which
+    /// Rust's lone-candidate guess (#226, KEEP-RUST) takes to `autovector`.
+    #[test]
+    fn pr2413_the_last_line_of_a_declaration_begun_above() {
+        let project = Project::new()
+            .file(
+                "util/autovector.h",
+                &lines(&[
+                    "namespace rocksdb {",
+                    "template <class T>",
+                    "class autovector {",
+                    " public:",
+                    "  unsigned size() const { return 0; }",
+                    "};",
+                    "}  // namespace rocksdb",
+                ]),
+            )
+            .file(
+                "db/blob/blob_file_reader.cc",
+                &lines(&[
+                    "#include <memory>",
+                    "#include \"util/autovector.h\"",
+                    "namespace rocksdb {",
+                    "class BlobFileReader {",
+                    " public:",
+                    "  unsigned MultiGetBlob(autovector<std::pair<int*,",
+                    "                                 std::unique_ptr<int>>>& autovector_reqs);",
+                    "};",
+                    "unsigned BlobFileReader::MultiGetBlob(autovector<std::pair<int*,",
+                    "                                      std::unique_ptr<int>>>& autovector_reqs) {",
+                    "  return autovector_reqs.size();",
+                    "}",
+                    "}  // namespace rocksdb",
+                ]),
+            )
+            .index();
+        let graph = project.graph();
+        assert_eq!(
+            callee_names(graph, "rocksdb::BlobFileReader::MultiGetBlob"),
+            ["rocksdb::autovector::size"],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream #2413: a member of a class nested in the caller's (rocksdb's
+    /// `MultiScan::MultiScanIterator` declares a `scan_opts_` of its own,
+    /// above `MultiScan`'s).
+    #[test]
+    fn pr2413_a_member_of_a_class_nested_in_the_callers() {
+        let project = Project::new()
+            .file(
+                "include/rocksdb/multi_scan.h",
+                &lines(&[
+                    "#include <vector>",
+                    "namespace rocksdb {",
+                    "struct ScanOptions {};",
+                    "class MultiScanArgs {",
+                    " public:",
+                    "  int GetScanRanges() const { return 0; }",
+                    "};",
+                    "class MultiScan {",
+                    " public:",
+                    "  class MultiScanIterator {",
+                    "   private:",
+                    "    const std::vector<ScanOptions>& scan_opts_;",
+                    "  };",
+                    "  int begin() { return scan_opts_.GetScanRanges(); }",
+                    " private:",
+                    "  const MultiScanArgs scan_opts_;",
+                    "};",
+                    "}  // namespace rocksdb",
+                ]),
+            )
+            .index();
+        let graph = project.graph();
+        assert_eq!(
+            callee_names(graph, "rocksdb::MultiScan::begin"),
+            ["rocksdb::MultiScanArgs::GetScanRanges"],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream #2413: a comment that mentions the receiver is not its
+    /// declaration (leveldb's `// … since there is a non-null imm_` above
+    /// `imm_->…` read as `imm_`'s declaration, with the type `null`).
+    #[test]
+    fn pr2413_a_comment_mentioning_the_receiver_is_no_declaration() {
+        let project = Project::new()
+            .file(
+                "db/memtable.h",
+                &lines(&[
+                    "namespace leveldb {",
+                    "class MemTable {",
+                    " public:",
+                    "  unsigned ApproximateMemoryUsage() { return 0; }",
+                    "};",
+                    "class Arena {",
+                    " public:",
+                    "  unsigned ApproximateMemoryUsage() { return 0; }",
+                    "};",
+                    "}  // namespace leveldb",
+                ]),
+            )
+            .file(
+                "db/db_impl.h",
+                &lines(&[
+                    "#include \"db/memtable.h\"",
+                    "namespace leveldb {",
+                    "class DBImpl {",
+                    " public:",
+                    "  unsigned MemoryUsage();",
+                    " private:",
+                    "  MemTable* imm_;",
+                    "};",
+                    "}  // namespace leveldb",
+                ]),
+            )
+            .file(
+                "db/db_impl.cc",
+                &lines(&[
+                    "#include \"db/db_impl.h\"",
+                    "namespace leveldb {",
+                    "unsigned DBImpl::MemoryUsage() {",
+                    "  // Count the memtable being compacted, since there is a non-null imm_",
+                    "  return imm_->ApproximateMemoryUsage();",
+                    "}",
+                    "}  // namespace leveldb",
+                ]),
+            )
+            .index();
+        let graph = project.graph();
+        assert_eq!(
+            callee_names(graph, "leveldb::DBImpl::MemoryUsage"),
+            ["leveldb::MemTable::ApproximateMemoryUsage"],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream #2413: a parameter after a leading `/* static */` is the
+    /// caller's own. The parameter is `slice_msg` (upstream's `msg`), which
+    /// Rust's lone-candidate guess (#226, KEEP-RUST) would take to
+    /// `Slice::begin` without the stop.
+    #[test]
+    fn pr2413_a_parameter_after_a_leading_block_comment_is_the_callers() {
+        let project = library_type_project(&[(
+            "util/status.cc",
+            lines(&[
+                "#include <string>",
+                "#include \"include/leveldb/slice.h\"",
+                "namespace leveldb {",
+                "class Status {",
+                " public:",
+                "  static bool Check(const std::string& slice_msg);",
+                "};",
+                "/* static */ bool Status::Check(const std::string& slice_msg) {",
+                "  return slice_msg.begin() != nullptr;",
+                "}",
+                "}  // namespace leveldb",
+            ]),
+        )]);
+        let graph = project.graph();
+        assert_eq!(
+            callee_names(graph, "leveldb::Status::Check"),
+            Vec::<String>::new(),
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// The declaration scan reads a receiver's own namespace qualifier as no
+    /// type (kept from before upstream #2413's port; upstream reads `leveldb`
+    /// as the type): leveldb's `db_bench.cc` assigns `leveldb::g_env =
+    /// leveldb::Env::Default();` above `leveldb::g_env->GetTestDirectory(…)`,
+    /// and the call is `Env`'s, the type `leveldb::Env* g_env` declares, not
+    /// `InMemoryEnv::GetTestDirectory` guessed by name.
+    #[test]
+    fn pr2413_a_qualified_receivers_namespace_is_no_declaration() {
+        let project = Project::new()
+            .file(
+                "include/leveldb/env.h",
+                &lines(&[
+                    "namespace leveldb {",
+                    "class Env {",
+                    " public:",
+                    "  static Env* Default();",
+                    "  virtual int GetTestDirectory(int* path) = 0;",
+                    "};",
+                    "class EnvWrapper : public Env {",
+                    " public:",
+                    "  int GetTestDirectory(int* path) override { return 0; }",
+                    "};",
+                    "}  // namespace leveldb",
+                ]),
+            )
+            .file(
+                "helpers/memenv/memenv.cc",
+                &lines(&[
+                    "#include \"include/leveldb/env.h\"",
+                    "namespace leveldb {",
+                    "class InMemoryEnv : public EnvWrapper {",
+                    " public:",
+                    "  int GetTestDirectory(int* path) override { return 1; }",
+                    "};",
+                    "}  // namespace leveldb",
+                ]),
+            )
+            .file(
+                "benchmarks/db_bench.cc",
+                &lines(&[
+                    "#include \"include/leveldb/env.h\"",
+                    "static const char* FLAGS_db = nullptr;",
+                    "namespace leveldb {",
+                    "namespace {",
+                    "leveldb::Env* g_env = nullptr;",
+                    "}  // namespace",
+                    "}  // namespace leveldb",
+                    "int main(int argc, char** argv) {",
+                    "  int default_db_path = 0;",
+                    "  leveldb::g_env = leveldb::Env::Default();",
+                    "  // Choose a location for the test database if none given with --db=<path>",
+                    "  if (FLAGS_db == nullptr) {",
+                    "    leveldb::g_env->GetTestDirectory(&default_db_path);",
+                    "  }",
+                    "  return 0;",
+                    "}",
+                ]),
+            )
+            .index();
+        let graph = project.graph();
+        assert_eq!(
+            callees(graph, "main"),
+            ["leveldb::Env::GetTestDirectory (include/leveldb/env.h)"],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// facebook/rocksdb's shapes, trimmed (upstream #2443's `ROCKSDB`): the
+    /// small vector, and the class whose words the receivers share.
+    fn nested_template_files() -> Vec<(&'static str, String)> {
+        vec![
+            (
+                "util/autovector.h",
+                lines(&[
+                    "namespace rocksdb {",
+                    "template <class T, size_t kSize = 8>",
+                    "class autovector {",
+                    " public:",
+                    "  size_t size() const { return 0; }",
+                    "  void clear() {}",
+                    "  void push_back(const T& item) {}",
+                    "};",
+                    "}  // namespace rocksdb",
+                ]),
+            ),
+            (
+                "db/compaction/compaction.h",
+                lines(&[
+                    "namespace rocksdb {",
+                    "struct FileMetaData {};",
+                    "struct CompactionInputFiles {",
+                    "  size_t size() const { return 0; }",
+                    "  void clear() {}",
+                    "};",
+                    "}  // namespace rocksdb",
+                ]),
+            ),
+            (
+                "db/version_set.h",
+                lines(&[
+                    "#include \"util/autovector.h\"",
+                    "#include \"db/compaction/compaction.h\"",
+                    "namespace rocksdb {",
+                    "class VersionEdit {};",
+                    "class VersionStorageInfo {",
+                    " public:",
+                    "  void ComputeFilesMarkedForCompaction();",
+                    "  size_t CountEditLists(VersionEdit* edit);",
+                    " private:",
+                    "  autovector<std::pair<int, FileMetaData*>> files_marked_for_compaction_;",
+                    "};",
+                    "}  // namespace rocksdb",
+                ]),
+            ),
+            (
+                "db/version_set.cc",
+                lines(&[
+                    "#include \"db/version_set.h\"",
+                    "namespace rocksdb {",
+                    "void VersionStorageInfo::ComputeFilesMarkedForCompaction() {",
+                    "  files_marked_for_compaction_.clear();",
+                    "}",
+                    "size_t VersionStorageInfo::CountEditLists(VersionEdit* edit) {",
+                    "  autovector<autovector<VersionEdit*>> edit_lists;",
+                    "  edit_lists.push_back(autovector<VersionEdit*>());",
+                    "  return edit_lists.size();",
+                    "}",
+                    "}  // namespace rocksdb",
+                ]),
+            ),
+        ]
+    }
+
+    fn nested_template_project(extra: &[(&'static str, String)]) -> super::support::Indexed {
+        nested_template_files()
+            .iter()
+            .chain(extra)
+            .fold(Project::new(), |project, (path, text)| {
+                project.file(path, text)
+            })
+            .index()
+    }
+
+    /// Upstream #2443 (`cdf06812`): a C++ receiver declared with template
+    /// arguments nested in its template arguments calls its own class's
+    /// method. rocksdb's `files_marked_for_compaction_.clear()` on an
+    /// `autovector<std::pair<int, FileMetaData*>>` was guessed by the
+    /// receiver's words to be `CompactionInputFiles::clear`.
+    #[test]
+    fn pr2443_a_member_with_nested_template_arguments_calls_its_class() {
+        let project = nested_template_project(&[]);
+        let graph = project.graph();
+        assert_eq!(
+            callees(
+                graph,
+                "rocksdb::VersionStorageInfo::ComputeFilesMarkedForCompaction"
+            ),
+            ["rocksdb::autovector::clear (util/autovector.h)"],
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            callers(graph, "rocksdb::CompactionInputFiles::clear"),
+            Vec::<String>::new()
+        );
+    }
+
+    /// Upstream #2443: a local of a class template nested in its own
+    /// template arguments; both calls are the declared type's.
+    #[test]
+    fn pr2443_a_local_nested_in_its_own_template_arguments_is_typed() {
+        let project = nested_template_project(&[]);
+        let graph = project.graph();
+        assert_eq!(
+            resolved_callees(graph, "rocksdb::VersionStorageInfo::CountEditLists"),
+            [
+                "rocksdb::autovector::push_back instance-method@0.9",
+                "rocksdb::autovector::size instance-method@0.9",
+            ],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream #2443: a capitalized class template is the project's own,
+    /// not a type from outside it (`Striped<CacheAlignedWrapper<port::Mutex>>
+    /// mutex_; mutex_.Get(key)` got no edge).
+    #[test]
+    fn pr2443_a_capitalized_class_template_is_the_projects() {
+        let project = Project::new()
+            .file(
+                "util/mutexlock.h",
+                &lines(&[
+                    "namespace rocksdb {",
+                    "namespace port {",
+                    "class Mutex {",
+                    " public:",
+                    "  void Lock() {}",
+                    "};",
+                    "}  // namespace port",
+                    "template <class T>",
+                    "struct CacheAlignedWrapper {",
+                    "  T obj_;",
+                    "};",
+                    "template <class T, class Key = int>",
+                    "class Striped {",
+                    " public:",
+                    "  T& Get(const Key& key) { return *data_; }",
+                    " private:",
+                    "  T* data_;",
+                    "};",
+                    "}  // namespace rocksdb",
+                ]),
+            )
+            .file(
+                "db/blob/blob_file_cache.h",
+                &lines(&[
+                    "#include \"util/mutexlock.h\"",
+                    "namespace rocksdb {",
+                    "class BlobFileCache {",
+                    " public:",
+                    "  void Evict(int key);",
+                    " private:",
+                    "  Striped<CacheAlignedWrapper<port::Mutex>> mutex_;",
+                    "};",
+                    "}  // namespace rocksdb",
+                ]),
+            )
+            .file(
+                "db/blob/blob_file_cache.cc",
+                &lines(&[
+                    "#include \"db/blob/blob_file_cache.h\"",
+                    "namespace rocksdb {",
+                    "void BlobFileCache::Evict(int key) {",
+                    "  mutex_.Get(key);",
+                    "}",
+                    "}  // namespace rocksdb",
+                ]),
+            )
+            .index();
+        let graph = project.graph();
+        assert_eq!(
+            callees(graph, "rocksdb::BlobFileCache::Evict"),
+            ["rocksdb::Striped::Get (util/mutexlock.h)"],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream #2443: the end of a declaration begun on the line above
+    /// names no type, not even its template argument's
+    /// (`CachableEntry<BlobContents>>>& blob_reqs` under
+    /// `autovector<std::pair<…,`).
+    #[test]
+    fn pr2443_a_declaration_tail_from_the_line_above_names_no_type() {
+        let project = nested_template_project(&[
+            (
+                "table/block_based/cachable_entry.h",
+                lines(&[
+                    "namespace rocksdb {",
+                    "template <class T>",
+                    "class CachableEntry {",
+                    " public:",
+                    "  size_t size() const { return 0; }",
+                    "};",
+                    "}  // namespace rocksdb",
+                ]),
+            ),
+            (
+                "db/blob/blob_file_reader.cc",
+                lines(&[
+                    "#include \"util/autovector.h\"",
+                    "#include \"table/block_based/cachable_entry.h\"",
+                    "namespace rocksdb {",
+                    "struct BlobContents {};",
+                    "struct BlobReadRequest {};",
+                    "size_t MultiGetBlob(",
+                    "    autovector<std::pair<BlobReadRequest*,",
+                    "                         CachableEntry<BlobContents>>>& blob_reqs) {",
+                    "  return blob_reqs.size();",
+                    "}",
+                    "}  // namespace rocksdb",
+                ]),
+            ),
+        ]);
+        let graph = project.graph();
+        assert_eq!(
+            callees(graph, "rocksdb::MultiGetBlob"),
+            Vec::<String>::new(),
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream #2443: a declaration begun on the line above still hides a
+    /// member of the same name: the class's `std::string` member says nothing
+    /// about the call on the parameter. Both are `autovector_reqs` (upstream's
+    /// `blob_reqs`), which Rust's lone-candidate guess (#226, KEEP-RUST)
+    /// takes to `autovector`.
+    #[test]
+    fn pr2443_a_declaration_begun_above_still_hides_a_member() {
+        let project = Project::new()
+            .file("util/autovector.h", &nested_template_files()[0].1)
+            .file(
+                "db/blob/blob_file_reader.cc",
+                &lines(&[
+                    "#include <string>",
+                    "#include \"util/autovector.h\"",
+                    "namespace rocksdb {",
+                    "struct BlobContents {};",
+                    "class BlobFileReader {",
+                    " public:",
+                    "  size_t MultiGetBlob(autovector<std::pair<int*,",
+                    "                                           std::unique_ptr<BlobContents>>>& autovector_reqs) const;",
+                    " private:",
+                    "  std::string autovector_reqs;",
+                    "};",
+                    "size_t BlobFileReader::MultiGetBlob(autovector<std::pair<int*,",
+                    "                                           std::unique_ptr<BlobContents>>>& autovector_reqs) const {",
+                    "  return autovector_reqs.size();",
+                    "}",
+                    "}  // namespace rocksdb",
+                ]),
+            )
+            .index();
+        let graph = project.graph();
+        assert_eq!(
+            callees(graph, "rocksdb::BlobFileReader::MultiGetBlob"),
+            ["rocksdb::autovector::size (util/autovector.h)"],
+            "{}",
+            graph.report()
+        );
+    }
 }
