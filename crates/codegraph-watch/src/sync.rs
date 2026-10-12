@@ -606,6 +606,14 @@ fn sync_paths_with_store(
             &mut dependent_sites,
             &mut dependent_fallbacks,
         )?;
+        note_python_fixture_readers(
+            project_root,
+            store,
+            &reindexed,
+            &changed_names,
+            &mut dependent_sites,
+            &mut dependent_fallbacks,
+        )?;
         // What a changed Python import statement re-exports moves for its
         // module's importers without any node of those names changing.
         if !changed_names.python_imports.is_empty() {
@@ -1007,6 +1015,7 @@ fn remove_tracked_file(
         change.old_globals.extend(python_module_globals(&old_nodes));
         change.statements.extend(statements);
         change.importers.extend(importers);
+        note_python_fixture_holders(change, &old_nodes);
     }
     delete_unresolved_refs_by_file(store, relative)?;
     store.delete_file_record(relative)?;
@@ -1041,6 +1050,169 @@ fn python_module_globals(nodes: &[Node]) -> BTreeSet<String> {
         })
         .map(|node| node.name.clone())
         .collect()
+}
+
+/// What `nodes` held of a file's pytest fixtures before a change: its
+/// top-level functions and its `pytest_plugins` value.
+fn note_python_fixture_holders(change: &mut PythonFileChange, nodes: &[Node]) {
+    for node in nodes {
+        if node.language != Language::Python || node.qualified_name.contains("::") {
+            continue;
+        }
+        if node.kind == NodeKind::Function {
+            change.old_functions.insert(node.name.clone());
+        }
+        if matches!(node.kind, NodeKind::Variable | NodeKind::Constant)
+            && node.name == "pytest_plugins"
+        {
+            change.old_plugins.extend(node.signature.clone());
+        }
+    }
+}
+
+/// The top-level functions of the Python file `file` in the store.
+fn python_top_level_functions(store: &Store, file: &str) -> Result<BTreeSet<String>> {
+    Ok(store
+        .nodes_by_file_path(file)?
+        .into_iter()
+        .filter(|node| {
+            node.language == Language::Python
+                && node.kind == NodeKind::Function
+                && !node.qualified_name.contains("::")
+        })
+        .map(|node| node.name)
+        .collect())
+}
+
+/// Pytest fixture parameters (upstream #2228): a test's parameter is the
+/// class its in-reach fixture returns, read from the fixture's body and from
+/// the conftests' plugin lists, which no node records. A changed
+/// `conftest.py` reaches the tests under its directory with its own
+/// functions and those of the modules it pulls in, before or after the
+/// change; a changed module a conftest pulls in reaches the tests under that
+/// conftest. Every function there with a parameter named like one of those
+/// functions has all its reference sites refreshed.
+fn note_python_fixture_readers(
+    project_root: &Path,
+    store: &Store,
+    reindexed: &HashSet<String>,
+    changed_names: &ChangedNames,
+    dependent_sites: &mut BTreeMap<String, BTreeSet<ReferenceSite>>,
+    dependent_fallbacks: &mut BTreeSet<String>,
+) -> Result<()> {
+    use codegraph_resolve::python_globals::{
+        conftest_plugged_modules, parameter_names, quoted_module_files,
+    };
+    let is_conftest = |file: &str| file == "conftest.py" || file.ends_with("/conftest.py");
+    let dir_of = |file: &str| {
+        file.rsplit_once('/')
+            .map_or(String::new(), |(dir, _)| dir.to_string())
+    };
+    let names_module =
+        |file: &str, module: &str| file == module || file.ends_with(&format!("/{module}"));
+    // (directory the fixtures reach, the fixture names).
+    let mut reaches: Vec<(String, BTreeSet<String>)> = Vec::new();
+    let mut files: Option<Vec<String>> = None;
+    let mut conftests: Option<Vec<(String, Vec<String>)>> = None;
+    for (file, change) in &changed_names.python_files {
+        let mut names: BTreeSet<String> = change.old_functions.clone();
+        names.extend(python_top_level_functions(store, file)?);
+        if is_conftest(file) {
+            let mut plugged = BTreeSet::new();
+            for statement in &change.statements {
+                plugged.extend(conftest_plugged_modules(statement));
+            }
+            for value in &change.old_plugins {
+                plugged.extend(quoted_module_files(value));
+            }
+            if let Ok(text) = fs::read_to_string(project_root.join(file)) {
+                plugged.extend(conftest_plugged_modules(&text));
+            }
+            if !plugged.is_empty() {
+                let all = match &files {
+                    Some(all) => all,
+                    None => files.insert(
+                        store
+                            .all_files()?
+                            .into_iter()
+                            .map(|record| record.path)
+                            .collect(),
+                    ),
+                };
+                for path in all {
+                    if plugged.iter().any(|module| names_module(path, module)) {
+                        names.extend(python_top_level_functions(store, path)?);
+                    }
+                }
+            }
+            if !names.is_empty() {
+                reaches.push((dir_of(file), names));
+            }
+            continue;
+        }
+        // Only a module that imports pytest can define a fixture.
+        if names.is_empty()
+            || !change
+                .statements
+                .iter()
+                .any(|statement| statement.contains("pytest"))
+        {
+            continue;
+        }
+        let pluggers = match &conftests {
+            Some(pluggers) => pluggers,
+            None => {
+                let all = match &files {
+                    Some(all) => all,
+                    None => files.insert(
+                        store
+                            .all_files()?
+                            .into_iter()
+                            .map(|record| record.path)
+                            .collect(),
+                    ),
+                };
+                let found = all
+                    .iter()
+                    .filter(|path| is_conftest(path))
+                    .map(|path| {
+                        let plugged = fs::read_to_string(project_root.join(path))
+                            .map(|text| conftest_plugged_modules(&text))
+                            .unwrap_or_default();
+                        (path.clone(), plugged)
+                    })
+                    .collect();
+                conftests.insert(found)
+            }
+        };
+        for (conftest, plugged) in pluggers {
+            if plugged.iter().any(|module| names_module(file, module)) {
+                reaches.push((dir_of(conftest), names.clone()));
+            }
+        }
+    }
+    if reaches.is_empty() {
+        return Ok(());
+    }
+    let readers: Vec<String> = store
+        .python_callable_signatures()?
+        .into_iter()
+        .filter(|(_, file, signature)| {
+            if reindexed.contains(file) {
+                return false;
+            }
+            let parameters = parameter_names(signature);
+            reaches.iter().any(|(dir, names)| {
+                (dir.is_empty() || file.starts_with(&format!("{dir}/")))
+                    && parameters.iter().any(|name| names.contains(name))
+            })
+        })
+        .map(|(id, _, _)| id)
+        .collect();
+    for found in store.reference_sites_from_nodes(&readers)? {
+        merge_dependent_site(dependent_sites, dependent_fallbacks, found);
+    }
+    Ok(())
 }
 
 /// Method values that read through a Python module global (upstream #2291
@@ -1256,6 +1428,7 @@ fn reextract_into_store(
             .or_default();
         change.old_globals.extend(python_module_globals(&old_nodes));
         change.statements.extend(before.union(&after).cloned());
+        note_python_fixture_holders(change, &old_nodes);
     }
 
     delete_unresolved_refs_by_file(store, relative)?;
@@ -1308,6 +1481,11 @@ struct PythonFileChange {
     /// The files whose resolved references reached into it before the
     /// change (they are gone with its nodes by the time sync reads them).
     importers: BTreeSet<String>,
+    /// Its top-level functions before the change: the pytest fixtures it
+    /// could define.
+    old_functions: BTreeSet<String>,
+    /// What its `pytest_plugins` held before the change.
+    old_plugins: Vec<String>,
 }
 
 /// How many parked imports one retry key may wake (upstream's per-name ceiling).

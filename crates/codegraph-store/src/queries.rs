@@ -1419,6 +1419,58 @@ impl Store {
         Ok(out.into_iter().collect())
     }
 
+    /// `(id, file_path, signature)` of every Python function and method, in
+    /// id order. Sync reads the parameters a pytest fixture can feed.
+    pub fn python_callable_signatures(&self) -> rusqlite::Result<Vec<(String, String, String)>> {
+        let mut stmt = self.conn.prepare(
+            r#"SELECT id, file_path, COALESCE(signature, '')
+            FROM nodes
+            WHERE language = 'python' AND kind IN ('function', 'method')
+            ORDER BY id"#,
+        )?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+        rows.collect()
+    }
+
+    /// The reference sites of everything `node_ids` reference: their
+    /// non-`contains` edges and their unresolved rows, sorted and
+    /// deduplicated.
+    pub fn reference_sites_from_nodes(
+        &self,
+        node_ids: &[String],
+    ) -> rusqlite::Result<Vec<FileReferenceSite>> {
+        let mut unique = node_ids.to_vec();
+        unique.sort_unstable();
+        unique.dedup();
+        let mut out = BTreeSet::new();
+        for chunk in unique.chunks(SQLITE_PARAM_CHUNK_SIZE) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let params = chunk.iter().map(|p| p as &dyn ToSql).collect::<Vec<_>>();
+            for sql in [
+                format!(
+                    r#"SELECT src.file_path, e.source, e.line, e.col
+                    FROM edges e
+                    JOIN nodes src ON src.id = e.source
+                    WHERE e.kind != 'contains' AND e.source IN ({placeholders})"#
+                ),
+                format!(
+                    r#"SELECT file_path, from_node_id, line, col
+                    FROM unresolved_refs
+                    WHERE from_node_id IN ({placeholders})"#
+                ),
+            ] {
+                let mut stmt = self.conn.prepare(&sql)?;
+                let rows = stmt.query_map(params.as_slice(), row_to_file_reference_site)?;
+                for row in rows {
+                    out.insert(row?);
+                }
+            }
+        }
+        Ok(out.into_iter().collect())
+    }
+
     /// The source sites of the function-value `references` edges
     /// (`{"fnRef": true}`) whose source lies in one of `file_paths`, sorted
     /// and deduplicated. Sync refreshes the ones that read through a Python

@@ -11,7 +11,7 @@
 
 use std::cell::OnceCell;
 use std::collections::HashMap;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use codegraph_core::types::{EdgeKind, Language, Node, NodeKind};
 use regex::Regex;
@@ -406,7 +406,9 @@ fn is_decorated_fixture(node: &Node, context: &dyn ResolutionContext) -> bool {
 }
 
 /// A fixture a test at `file_path` can take by name: one its own module
-/// defines, or one a `conftest.py` of its directory or a parent does. A test
+/// defines, one a `conftest.py` of its directory or a parent does, or one a
+/// module such a conftest pulls in defines (`from tests.fixtures.cli import
+/// *`, `pytest_plugins = ["tests.fixtures.cli"]`, upstream #2228). A test
 /// module's fixture is that module's alone (upstream `isFixtureInReach`).
 pub(crate) fn is_fixture_in_reach(
     node: &Node,
@@ -419,13 +421,183 @@ pub(crate) fn is_fixture_in_reach(
     if node.file_path == "conftest.py" {
         return true;
     }
-    node.file_path
-        .strip_suffix("/conftest.py")
-        .is_some_and(|dir| {
-            file_path
-                .strip_prefix(dir)
-                .is_some_and(|rest| rest.starts_with('/'))
-        })
+    if let Some(dir) = node.file_path.strip_suffix("/conftest.py") {
+        return file_path
+            .strip_prefix(dir)
+            .is_some_and(|rest| rest.starts_with('/'));
+    }
+    is_pytest_fixture(node, context)
+        && plugged_fixture_modules(file_path, context)
+            .iter()
+            .any(|module| {
+                node.file_path == *module || node.file_path.ends_with(&format!("/{module}"))
+            })
+}
+
+/// The module files (`tests/fixtures/cli.py`) the `conftest.py` files above
+/// `file_path` star-import or list in `pytest_plugins` (upstream
+/// `pluggedFixtureModules`).
+fn plugged_fixture_modules(file_path: &str, context: &dyn ResolutionContext) -> Vec<String> {
+    let scan = || {
+        let mut modules = Vec::new();
+        let mut dir = file_path.rsplit_once('/').map_or("", |(dir, _)| dir);
+        loop {
+            let conftest = if dir.is_empty() {
+                "conftest.py".to_string()
+            } else {
+                format!("{dir}/conftest.py")
+            };
+            if let Some(text) = context.read_file_shared(&conftest) {
+                modules.extend(plugged_modules_in(&text));
+            }
+            if dir.is_empty() {
+                break;
+            }
+            dir = dir.rsplit_once('/').map_or("", |(parent, _)| parent);
+        }
+        modules
+    };
+    match context.source_facts(file_path) {
+        Some(facts) => facts.python_plugged_modules(scan).to_vec(),
+        None => scan(),
+    }
+}
+
+/// The module files a `conftest.py`'s text pulls fixtures in from: what it
+/// star-imports, and what its `pytest_plugins` lists.
+pub(crate) fn plugged_modules_in(text: &str) -> Vec<String> {
+    static STAR: OnceLock<Regex> = OnceLock::new();
+    static PLUGINS: OnceLock<Regex> = OnceLock::new();
+    let star = STAR.get_or_init(|| {
+        Regex::new(r"(?m)^\s*from\s+([0-9A-Za-z_.]+)\s+import\s+\*").expect("star import")
+    });
+    let plugins = PLUGINS.get_or_init(|| {
+        Regex::new(r"(?m)^\s*pytest_plugins\s*=\s*[\[(]([^\])]*)[\])]").expect("pytest_plugins")
+    });
+    let mut modules: Vec<String> = star
+        .captures_iter(text)
+        .map(|found| format!("{}.py", found[1].replace('.', "/")))
+        .collect();
+    if let Some(list) = plugins.captures(text).and_then(|found| found.get(1)) {
+        modules.extend(quoted_module_files(list.as_str()));
+    }
+    modules
+}
+
+/// The module files the quoted dotted names in `text` spell
+/// (`"tests.fixtures.cli"` is `tests/fixtures/cli.py`).
+pub(crate) fn quoted_module_files(text: &str) -> Vec<String> {
+    static QUOTED: OnceLock<Regex> = OnceLock::new();
+    QUOTED
+        .get_or_init(|| Regex::new(r#"["']([0-9A-Za-z_.]+)["']"#).expect("quoted module"))
+        .captures_iter(text)
+        .map(|found| format!("{}.py", found[1].replace('.', "/")))
+        .collect()
+}
+
+/// The class a pytest fixture returns, for a test's parameter of its name
+/// (upstream #2228 `pythonFixtureReturnType`): the fixture in reach (the
+/// test's module first, then the nearest `conftest.py` above it) whose body
+/// returns or yields `Cls(…)`, directly or through a local assigned
+/// `Cls(…)`. `None` for anything else: a receiver that is no parameter, a
+/// fixture returning a call of a function.
+pub(crate) fn python_fixture_return_type(
+    receiver: &str,
+    reference: &RefView,
+    context: &dyn ResolutionContext,
+) -> Option<String> {
+    static SIGNATURE_END: OnceLock<Regex> = OnceLock::new();
+    static RETURNED: OnceLock<Regex> = OnceLock::new();
+    let lower_word = receiver
+        .bytes()
+        .next()
+        .is_some_and(|b| b.is_ascii_lowercase() || b == b'_')
+        && receiver
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_');
+    if !lower_word || receiver == "self" || receiver == "cls" {
+        return None;
+    }
+    let compute = || {
+        let caller = context.get_node_by_id_shared(&reference.from_node_id)?;
+        if !matches!(caller.kind, NodeKind::Function | NodeKind::Method) {
+            return None;
+        }
+        let caller_facts = context.source_facts(&caller.file_path)?;
+        // The receiver must be the test's own parameter.
+        let start = usize::try_from(caller.start_line).ok()?.checked_sub(1)?;
+        let header = (start..start + 5)
+            .filter_map(|index| caller_facts.raw_line(index))
+            .map(|line| line.trim_end_matches('\r'))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let signature_end =
+            SIGNATURE_END.get_or_init(|| Regex::new(r"\)\s*(?:->[^:]*)?:").expect("signature end"));
+        let signature = signature_end
+            .find(&header)
+            .map_or(header.as_str(), |end| &header[..end.start()]);
+        let param = Regex::new(&format!(
+            r"[(,]\s*{}\s*(?:[:=,)]|$)",
+            regex::escape(receiver)
+        ))
+        .ok()?;
+        if !param.is_match(signature) {
+            return None;
+        }
+        let mut fixtures: Vec<Arc<Node>> = context
+            .get_nodes_by_name_shared(receiver)
+            .into_iter()
+            .filter(|node| {
+                node.kind == NodeKind::Function
+                    && node.language == Language::Python
+                    && is_fixture_in_reach(node, &reference.file_path, context)
+            })
+            .collect();
+        // The test's own module first, then the deepest conftest.
+        fixtures.sort_by(|a, b| {
+            (b.file_path == reference.file_path)
+                .cmp(&(a.file_path == reference.file_path))
+                .then_with(|| b.file_path.len().cmp(&a.file_path.len()))
+                .then_with(|| a.file_path.cmp(&b.file_path))
+                .then_with(|| a.start_line.cmp(&b.start_line))
+        });
+        let fixture = fixtures.first()?;
+        let facts = context.source_facts(&fixture.file_path)?;
+        let from = usize::try_from(fixture.start_line).ok()?;
+        let to = usize::try_from(fixture.end_line).ok()?;
+        let body = (from..to)
+            .filter_map(|index| facts.raw_line(index))
+            .map(|line| line.trim_end_matches('\r'))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let returned = RETURNED.get_or_init(|| {
+            Regex::new(r"(?m)^\s*(?:return|yield)\s+([A-Za-z_][0-9A-Za-z_.]*)\s*(\()?")
+                .expect("fixture return")
+        });
+        let found = returned.captures(&body)?;
+        let value = found.get(1)?.as_str();
+        let direct = if found.get(2).is_some() {
+            Some(value.to_string())
+        } else {
+            Regex::new(&format!(
+                r"(?m)^\s*{}\s*=\s*([A-Za-z_][0-9A-Za-z_.]*)\s*\(",
+                regex::escape(value)
+            ))
+            .ok()?
+            .captures(&body)
+            .and_then(|assigned| assigned.get(1))
+            .map(|callee| callee.as_str().to_string())
+        }?;
+        let class = direct.rsplit('.').next()?;
+        class
+            .starts_with(|c: char| c.is_ascii_uppercase())
+            .then(|| class.to_string())
+    };
+    let key = format!("{}\0{receiver}", reference.from_node_id);
+    match context.source_facts(&reference.file_path) {
+        Some(facts) => facts.python_fixture_type(&key, compute),
+        None => compute(),
+    }
 }
 
 #[cfg(test)]

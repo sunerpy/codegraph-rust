@@ -2664,10 +2664,16 @@ fn resolve_imported_instance_member(
     let decl_slice = lines[start..end].join("\n");
 
     let escaped = regex_escape(&value.name);
-    for pattern in local_receiver_type_patterns(value.language, &escaped) {
-        let Some(captured) = pattern.captures(&decl_slice).and_then(|c| c.get(1)) else {
+    for (pattern, check) in local_receiver_type_patterns(value.language, &escaped) {
+        let Some(captures) = pattern.captures(&decl_slice) else {
             continue;
         };
+        let (Some(whole), Some(captured)) = (captures.get(0), captures.get(1)) else {
+            continue;
+        };
+        if !check.passes(&decl_slice, whole, captured) {
+            continue;
+        }
         let Some(type_name) = normalize_inferred_type_name(captured.as_str()) else {
             continue;
         };

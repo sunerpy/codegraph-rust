@@ -296,7 +296,9 @@ module offers, as deep as the re-export walk looks), since an importer's name
 then moves with no node of it changing; and a changed Python file refreshes the
 method values that read through a module global it declares or can write, in
 that module and its importers, since the global's type is read from statements
-no node records; an import
+no node records; a changed `conftest.py`, or a module one pulls in, refreshes
+the functions under its reach that take a parameter named like one of its
+fixtures, since a fixture's return type types that parameter; an import
 names a file, a folder or a namespace rather than a symbol, so the parked
 imports an added file or a changed file's namespace can satisfy (by the file's
 name and stem, its folder's, or the namespace's whole name) send their files

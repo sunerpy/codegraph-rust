@@ -2874,34 +2874,95 @@ pub(crate) fn normalize_inferred_type_name(raw: &str) -> Option<String> {
 /// most-specific first. The type-annotation / typed-parameter forms (#1125) are
 /// baked into the second pattern per language. Languages without a pattern set
 /// (the C++ path uses its own dedicated inferrer) return an empty vector.
-pub(crate) fn local_receiver_type_patterns(language: Language, r: &str) -> Vec<Regex> {
+pub(crate) fn local_receiver_type_patterns(
+    language: Language,
+    r: &str,
+) -> Vec<(Regex, PatternCheck)> {
     local_receiver_type_patterns_tagged(language, r)
-        .into_iter()
-        .map(|(re, _)| re)
-        .collect()
 }
 
-/// The bool tags the Lua/Luau `receiver: Type` ANNOTATION pattern, which needs a
-/// code-side self-match gate (#1124): `lg:Log()` is byte-identical to the Luau
-/// annotation `lg: Logger`, and the `regex` crate has no look-ahead to reject the
-/// call form, so `infer_local_receiver_type` post-checks the tagged capture.
-fn local_receiver_type_patterns_tagged(language: Language, r: &str) -> Vec<(Regex, bool)> {
-    let build = |src: String| Regex::new(&src).ok().map(|re| (re, false));
+/// What a receiver-type pattern needs checked beyond its regex, which the
+/// `regex` crate cannot say: it has no look-around.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PatternCheck {
+    /// Nothing beyond the match.
+    None,
+    /// The Lua/Luau `receiver: Type` ANNOTATION: `lg:Log()` is byte-identical
+    /// to the Luau annotation `lg: Logger`, so the call form is rejected here
+    /// (#1124).
+    LuaAnnotation,
+    /// A Python `name = Cls(…)` is a statement of its own: one whose line goes
+    /// on to end in a comma is a keyword argument inside a call
+    /// (`prefix=IPNetwork(…),`, upstream #2169 `(?![^\n]*,\s*$)`).
+    PythonStatement,
+}
+
+impl PatternCheck {
+    /// Whether a match of the pattern in `text` (`whole`, with its type
+    /// `capture`) passes.
+    pub(crate) fn passes(
+        self,
+        text: &str,
+        whole: regex::Match<'_>,
+        capture: regex::Match<'_>,
+    ) -> bool {
+        match self {
+            Self::None => true,
+            Self::LuaAnnotation => !lua_annotation_is_method_call(text, capture.end()),
+            Self::PythonStatement => {
+                let rest = &text[whole.end()..];
+                let line_end = rest.find('\n').unwrap_or(rest.len());
+                !rest[..line_end]
+                    .rfind(',')
+                    .is_some_and(|comma| rest[comma + 1..].trim().is_empty())
+            }
+        }
+    }
+}
+
+/// The receiver-type patterns of `language`, each with the check its match
+/// needs.
+fn local_receiver_type_patterns_tagged(language: Language, r: &str) -> Vec<(Regex, PatternCheck)> {
+    let build = |src: String| Regex::new(&src).ok().map(|re| (re, PatternCheck::None));
     let pats: Vec<String> = match language {
         Language::TypeScript | Language::Tsx | Language::JavaScript | Language::Jsx => vec![
             format!(r"\b{r}\b\s*=\s*new\s+([A-Za-z_$][\w.$]*)"),
             format!(r"\b{r}\b\s*:\s*([A-Z][\w.$]*)"),
         ],
-        Language::Python => vec![
-            format!(r"\b{r}\b\s*=\s*([A-Z][\w.]*)\s*\("),
-            // Quoted forward references are ordinary Python annotations (and
-            // the form produced by `from __future__ import annotations`). Keep
-            // this stricter shape before the unquoted annotation pattern so
-            // `obj: "pkg.Type"` recovers the same receiver type as
-            // `obj: pkg.Type` (#1684).
-            format!(r#"\b{r}\b\s*:\s*["']([A-Z][\w.]*)["']"#),
-            format!(r"\b{r}\b\s*:\s*([A-Z][\w.]*)"),
-        ],
+        Language::Python => {
+            let mut out = Vec::new();
+            for (src, check) in [
+                // group = VLANGroup.objects.create(…): a Django manager call
+                // that returns one instance of the model, not `filter` / `all`
+                // (a QuerySet; upstream #2175).
+                (
+                    format!(
+                        r"(?:^|;)\s*{r}\s*=\s*([A-Z]\w*)\.objects\.(?:create|get|first|last|latest|earliest|get_by_natural_key)\s*\("
+                    ),
+                    PatternCheck::None,
+                ),
+                // lg = Logger(...), a statement of its own (upstream #2169).
+                (
+                    format!(r"(?:^|;)\s*{r}\s*=\s*([A-Z][\w.]*)\s*\("),
+                    PatternCheck::PythonStatement,
+                ),
+                // Quoted forward references are ordinary Python annotations
+                // (and the form produced by `from __future__ import
+                // annotations`). Keep this stricter shape before the unquoted
+                // annotation pattern so `obj: "pkg.Type"` recovers the same
+                // receiver type as `obj: pkg.Type` (#1684).
+                (
+                    format!(r#"\b{r}\b\s*:\s*["']([A-Z][\w.]*)["']"#),
+                    PatternCheck::None,
+                ),
+                (format!(r"\b{r}\b\s*:\s*([A-Z][\w.]*)"), PatternCheck::None),
+            ] {
+                if let Ok(re) = Regex::new(&src) {
+                    out.push((re, check));
+                }
+            }
+            return out;
+        }
         Language::Java => vec![
             format!(r"\b{r}\b\s*=\s*new\s+([A-Za-z_][\w.]*)"),
             format!(r"\b([A-Z][\w.]*)\s+{r}\b\s*[=;,)]"),
@@ -2941,17 +3002,17 @@ fn local_receiver_type_patterns_tagged(language: Language, r: &str) -> Vec<(Rege
             format!(r"\b([A-Za-z_\\][\w\\]*)\s+&?\${r}\b"),
         ],
         Language::Lua | Language::Luau => {
-            let mut out: Vec<(Regex, bool)> = Vec::new();
+            let mut out: Vec<(Regex, PatternCheck)> = Vec::new();
             for src in [
                 format!(r"\b{r}\b\s*=\s*([A-Z]\w*)\.new\b"),
                 format!(r"\b{r}\b\s*=\s*([A-Z]\w*)\s*\("),
             ] {
-                if let Some((re, _)) = build(src) {
-                    out.push((re, false));
+                if let Some(pattern) = build(src) {
+                    out.push(pattern);
                 }
             }
             if let Ok(re) = Regex::new(&format!(r"\b{r}\b\s*:\s*([A-Z][\w.]*)")) {
-                out.push((re, true));
+                out.push((re, PatternCheck::LuaAnnotation));
             }
             return out;
         }
@@ -3025,10 +3086,10 @@ pub(crate) fn infer_local_receiver_type(
         if line.len() > 10_000 {
             continue;
         }
-        for (re, is_lua_annotation) in &patterns {
+        for (re, check) in &patterns {
             if let Some(caps) = re.captures(line) {
-                if let Some(m) = caps.get(1) {
-                    if *is_lua_annotation && lua_annotation_is_method_call(line, m.end()) {
+                if let (Some(whole), Some(m)) = (caps.get(0), caps.get(1)) {
+                    if !check.passes(line, whole, m) {
                         continue;
                     }
                     if let Some(ty) = normalize_inferred_type_name(m.as_str()) {
@@ -3115,10 +3176,10 @@ fn infer_class_field_receiver_type(
     if line.len() > 10_000 {
         return None;
     }
-    for (re, is_lua_annotation) in &patterns {
+    for (re, check) in &patterns {
         if let Some(caps) = re.captures(line) {
-            if let Some(m) = caps.get(1) {
-                if *is_lua_annotation && lua_annotation_is_method_call(line, m.end()) {
+            if let (Some(whole), Some(m)) = (caps.get(0), caps.get(1)) {
+                if !check.passes(line, whole, m) {
                     continue;
                 }
                 if let Some(ty) = normalize_inferred_type_name(m.as_str()) {
@@ -3525,7 +3586,7 @@ fn infer_php_assigned_property_type(
     for i in (0..=assign_idx).rev() {
         let line = lines[i];
         if line.len() <= 10_000 {
-            for re in &var_patterns {
+            for (re, _) in &var_patterns {
                 if let Some(caps) = re.captures(line) {
                     if let Some(m) = caps.get(1) {
                         if let Some(ty) = normalize_inferred_type_name(m.as_str()) {
@@ -3712,6 +3773,20 @@ pub fn match_method_call(
             // so it can add an inference but never change one (#1566, ESM only).
             infer_local_receiver_type(&object_or_class, reference, context)
                 .or_else(|| infer_class_field_receiver_type(&object_or_class, reference, context))
+                // A pytest test's parameter is what its fixture returns:
+                // flaskbb's `cli_runner.invoke(…)` is click's `CliRunner`, not
+                // the project's one `invoke` (upstream #2228).
+                .or_else(|| {
+                    (reference.language == Language::Python)
+                        .then(|| {
+                            crate::python_values::python_fixture_return_type(
+                                &object_or_class,
+                                reference,
+                                context,
+                            )
+                        })
+                        .flatten()
+                })
         };
         if let Some(inferred) = inferred {
             // #1566 — an inferred type the call site cannot SEE is not this

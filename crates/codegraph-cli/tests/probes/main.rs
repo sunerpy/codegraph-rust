@@ -4058,4 +4058,145 @@ mod python {
         }
         assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
     }
+
+    /// Upstream #2228 (`92f141f0`): a pytest test's parameter is the class
+    /// its in-reach fixture returns (`return Cls(…)`, or a local assigned
+    /// `Cls(…)`), so a call on it is that class's method, and none of the
+    /// project's when the class comes from outside. A fixture is in reach
+    /// from its own module, a `conftest.py` above the test, or a module such
+    /// a conftest star-imports or lists in `pytest_plugins`.
+    #[test]
+    fn pr2228_a_pytest_parameter_is_the_class_its_fixture_returns() {
+        let project = Project::new()
+            .file(
+                "app/cli.py",
+                "class AlembicGroup:\n    def invoke(self, ctx):\n        return ctx\n",
+            )
+            .file(
+                "app/models.py",
+                "class Forum:\n    def save(self):\n        return self\n\n\nclass Topic:\n    def save(self):\n        return self\n\n\nclass Board:\n    def pin(self):\n        return self\n\n\nclass Stray:\n    def pin(self):\n        return self\n",
+            )
+            .file(
+                "tests/conftest.py",
+                "from tests.fixtures.cli import *  # noqa\nfrom tests.fixtures.forum import *  # noqa\n\npytest_plugins = [\"tests.fixtures.plugged\"]\n",
+            )
+            .file(
+                "tests/fixtures/cli.py",
+                "import pytest\nfrom click.testing import CliRunner\n\n\n@pytest.fixture\ndef runner():\n    return CliRunner()\n",
+            )
+            .file(
+                "tests/fixtures/forum.py",
+                "import pytest\nfrom app.models import Forum\n\n\n@pytest.fixture\ndef account():\n    forum = Forum()\n    return forum\n",
+            )
+            .file(
+                "tests/fixtures/plugged.py",
+                "import pytest\nfrom app.models import Board\n\n\n@pytest.fixture\ndef board():\n    return Board()\n",
+            )
+            .file(
+                "tests/fixtures/stray.py",
+                "import pytest\nfrom app.models import Stray\n\n\n@pytest.fixture\ndef loose():\n    return Stray()\n",
+            )
+            .file(
+                "tests/test_cli.py",
+                "def test_routes(runner):\n    result = runner.invoke(cli, [\"routes\"])\n    return result\n\n\ndef test_forum(account):\n    account.save()\n\n\ndef test_board(board):\n    board.pin()\n\n\ndef test_loose(loose):\n    loose.pin()\n",
+            )
+            .file(
+                "tests/test_local.py",
+                "import pytest\nfrom app.models import Topic\n\n\n@pytest.fixture\ndef thread():\n    return Topic()\n\n\ndef test_thread(thread):\n    thread.save()\n",
+            )
+            .index();
+        let graph = project.graph();
+        assert_eq!(
+            calls_of(graph, "test_routes"),
+            Vec::<String>::new(),
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            calls_of(graph, "test_forum"),
+            ["app/models.py: Forum::save"],
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            calls_of(graph, "test_board"),
+            ["app/models.py: Board::pin"],
+            "{}",
+            graph.report()
+        );
+        // A module no conftest pulls in is out of reach.
+        assert_eq!(
+            calls_of(graph, "test_loose"),
+            Vec::<String>::new(),
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            calls_of(graph, "test_thread"),
+            ["app/models.py: Topic::save"],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream #2175 (`c0a38a87`), its Python part: `x =
+    /// Model.objects.create|get|first|last|latest|earliest(…)` makes `x` a
+    /// `Model`, a Django manager call returning one instance; `filter` and
+    /// `all` return a QuerySet and type nothing.
+    #[test]
+    fn pr2175_a_django_manager_call_types_its_result() {
+        let project = Project::new()
+            .file(
+                "app/models.py",
+                "from django.db import models\n\n\nclass Site(models.Model):\n    def save(self, *args, **kwargs):\n        super().save(*args, **kwargs)\n\n\nclass Rack(models.Model):\n    def save(self, *args, **kwargs):\n        super().save(*args, **kwargs)\n",
+            )
+            .file(
+                "tests/test_sites.py",
+                "from app.models import Site\n\n\ndef test_site():\n    site = Site.objects.create(name=\"a\")\n    site.save()\n\n\ndef test_record():\n    record = Site.objects.get(pk=1)\n    record.save()\n\n\ndef test_many():\n    rows = Site.objects.filter(name=\"a\")\n    rows.save()\n",
+            )
+            .index();
+        let graph = project.graph();
+        assert_eq!(
+            calls_of(graph, "test_site"),
+            ["app/models.py: Site::save"],
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            calls_of(graph, "test_record"),
+            ["app/models.py: Site::save"],
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            calls_of(graph, "test_many"),
+            Vec::<String>::new(),
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream #2169 (`791ae397`), its Python part: a keyword argument
+    /// inside a call (`prefix=IPNetwork(…),`) is not a binding of `prefix`;
+    /// the statement above it is.
+    #[test]
+    fn pr2169_a_python_keyword_argument_is_no_binding() {
+        let project = Project::new()
+            .file(
+                "app/models.py",
+                "class Prefix:\n    def get_available_ip_count(self):\n        return 0\n",
+            )
+            .file(
+                "app/tests.py",
+                "from app.models import Prefix\nfrom netaddr import IPNetwork\n\n\ndef test_count():\n    prefix = Prefix(\n        prefix=IPNetwork('192.0.2.0/24'),\n    )\n    return prefix.get_available_ip_count()\n",
+            )
+            .index();
+        let graph = project.graph();
+        assert_eq!(
+            calls_of(graph, "test_count"),
+            ["app/models.py: Prefix::get_available_ip_count"],
+            "{}",
+            graph.report()
+        );
+    }
 }

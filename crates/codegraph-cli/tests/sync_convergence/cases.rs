@@ -1269,6 +1269,109 @@ pub fn python_self_call_ignores_an_added_import_target() -> Case {
         .no_edge_after("method Adapter::notify", "calls", "function get_ip")
 }
 
+/// The models the pytest fixture cases type parameters with.
+const PYTHON_FIXTURE_MODELS: &str = "class Forum:\n    def save(self):\n        return self\n\n\nclass Topic:\n    def save(self):\n        return self\n\n\nclass Board:\n    def pin(self):\n        return self\n\n\nclass Stray:\n    def pin(self):\n        return self\n";
+
+/// Upstream #2228: a conftest fixture that comes to return another class
+/// retypes an unchanged test's parameter, as a fresh index of the edit finds.
+pub fn python_fixture_returns_another_class() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Python])
+        .file("app/models.py", PYTHON_FIXTURE_MODELS)
+        .file(
+            "tests/conftest.py",
+            "import pytest\nfrom app.models import Forum, Topic\n\n\n@pytest.fixture\ndef account():\n    return Forum()\n",
+        )
+        .file(
+            "tests/test_forum.py",
+            "def test_forum(account):\n    account.save()\n",
+        )
+        .write(
+            "tests/conftest.py",
+            "import pytest\nfrom app.models import Forum, Topic\n\n\n@pytest.fixture\ndef account():\n    return Topic()\n",
+        )
+        .edge_before("function test_forum", "calls", "method Forum::save")
+        .edge_after("function test_forum", "calls", "method Topic::save")
+        .no_edge_after("function test_forum", "calls", "method Forum::save")
+}
+
+/// Upstream #2228: a conftest that comes to list a fixture module in
+/// `pytest_plugins` puts its fixtures in reach of an unchanged test.
+pub fn python_conftest_plugs_a_fixture_module() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Python])
+        .file("app/models.py", PYTHON_FIXTURE_MODELS)
+        .file("tests/conftest.py", "import pytest\n")
+        .file(
+            "tests/fixtures/plugged.py",
+            "import pytest\nfrom app.models import Board\n\n\n@pytest.fixture\ndef pinned():\n    return Board()\n",
+        )
+        .file("tests/test_board.py", "def test_board(pinned):\n    pinned.pin()\n")
+        .write(
+            "tests/conftest.py",
+            "import pytest\n\npytest_plugins = [\"tests.fixtures.plugged\"]\n",
+        )
+        .edge_after("function test_board", "calls", "method Board::pin")
+}
+
+/// Upstream #2228: a fixture module a conftest pulls in that comes to
+/// return another class retypes an unchanged test's parameter.
+pub fn python_plugged_fixture_returns_another_class() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Python])
+        .file("app/models.py", PYTHON_FIXTURE_MODELS)
+        .file("tests/conftest.py", "from tests.fixtures.plugged import *  # noqa\n")
+        .file(
+            "tests/fixtures/plugged.py",
+            "import pytest\nfrom app.models import Board, Stray\n\n\n@pytest.fixture\ndef board():\n    return Board()\n",
+        )
+        .file("tests/test_board.py", "def test_board(board):\n    board.pin()\n")
+        .write(
+            "tests/fixtures/plugged.py",
+            "import pytest\nfrom app.models import Board, Stray\n\n\n@pytest.fixture\ndef board():\n    return Stray()\n",
+        )
+        .edge_before("function test_board", "calls", "method Board::pin")
+        .edge_after("function test_board", "calls", "method Stray::pin")
+}
+
+/// Upstream #2228: a closer conftest's fixture of the same name, added
+/// later, is what an unchanged test below it takes.
+pub fn python_closer_conftest_overrides_a_fixture() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Python])
+        .file("app/models.py", PYTHON_FIXTURE_MODELS)
+        .file(
+            "tests/conftest.py",
+            "import pytest\nfrom app.models import Forum\n\n\n@pytest.fixture\ndef account():\n    return Forum()\n",
+        )
+        .file(
+            "tests/sub/test_sub.py",
+            "def test_sub(account):\n    account.save()\n",
+        )
+        .write(
+            "tests/sub/conftest.py",
+            "import pytest\nfrom app.models import Topic\n\n\n@pytest.fixture\ndef account():\n    return Topic()\n",
+        )
+        .edge_before("function test_sub", "calls", "method Forum::save")
+        .edge_after("function test_sub", "calls", "method Topic::save")
+}
+
+/// Upstream #2175: a Django manager call that comes to build another model
+/// types the local it binds.
+pub fn python_django_manager_result_body_edit() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Python])
+        .file(
+            "app/models.py",
+            "class Site:\n    def save(self):\n        return self\n\n\nclass Rack:\n    def save(self):\n        return self\n",
+        )
+        .file(
+            "tests/test_sites.py",
+            "from app.models import Rack, Site\n\n\ndef test_record():\n    record = Site.objects.get(pk=1)\n    record.save()\n",
+        )
+        .write(
+            "tests/test_sites.py",
+            "from app.models import Rack, Site\n\n\ndef test_record():\n    record = Rack.objects.get(pk=1)\n    record.save()\n",
+        )
+        .edge_before("function test_record", "calls", "method Site::save")
+        .edge_after("function test_record", "calls", "method Rack::save")
+}
+
 /// The files every module-global case starts from: two classes with a
 /// `fetch`, a module whose `conn` its `init()` assigns, and two importers
 /// reading `fetch` through it, by the module and by the name.

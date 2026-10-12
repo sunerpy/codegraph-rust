@@ -40,7 +40,7 @@
     "kind": "calls",
     "line": 5,
     "metadata": {
-      "confidence": 0.8,
+      "confidence": 0.9,
       "resolvedBy": "instance-method"
     },
     "provenance": null,

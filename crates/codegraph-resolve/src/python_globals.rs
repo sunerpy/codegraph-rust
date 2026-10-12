@@ -1548,9 +1548,74 @@ pub fn names_through_global(reference_name: &str, globals: &BTreeSet<String>) ->
         && segments.iter().all(|segment| is_ascii_word(segment))
 }
 
+/// The module files a `conftest.py`'s text pulls pytest fixtures in from
+/// (`from tests.fixtures.cli import *`, `pytest_plugins = [...]`).
+pub fn conftest_plugged_modules(text: &str) -> Vec<String> {
+    crate::python_values::plugged_modules_in(text)
+}
+
+/// The module files the quoted dotted names in `text` spell, as a
+/// `pytest_plugins` value lists them.
+pub fn quoted_module_files(text: &str) -> Vec<String> {
+    crate::python_values::quoted_module_files(text)
+}
+
+/// The parameter names of a Python signature (`(self, request, *args,
+/// user: User = None)`).
+pub fn parameter_names(signature: &str) -> Vec<String> {
+    let inner = signature
+        .find('(')
+        .map_or(signature, |open| &signature[open + 1..]);
+    let mut names = Vec::new();
+    let mut depth = 0i64;
+    let mut part = String::new();
+    let mut flush = |part: &mut String| {
+        let name: String = part
+            .trim()
+            .trim_start_matches('*')
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect();
+        if !name.is_empty() {
+            names.push(name);
+        }
+        part.clear();
+    };
+    for c in inner.chars() {
+        match c {
+            '(' | '[' | '{' => {
+                depth += 1;
+                part.push(c);
+            }
+            ')' | ']' | '}' if depth == 0 => break,
+            ')' | ']' | '}' => {
+                depth -= 1;
+                part.push(c);
+            }
+            ',' if depth == 0 => flush(&mut part),
+            _ => part.push(c),
+        }
+    }
+    flush(&mut part);
+    names
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{assignment, blank_strings, constructor_call, has_word, imports_explicitly_as};
+    use super::{
+        assignment, blank_strings, constructor_call, has_word, imports_explicitly_as,
+        parameter_names,
+    };
+
+    #[test]
+    fn parameter_names_read_a_signature() {
+        assert_eq!(
+            parameter_names("(self, request, *args, user: Dict[str, int] = None, **kwargs)"),
+            ["self", "request", "args", "user", "kwargs"]
+        );
+        assert_eq!(parameter_names("(account)"), ["account"]);
+        assert!(parameter_names("()").is_empty());
+    }
 
     #[test]
     fn assignment_splits_targets_and_marks_augmented_operators() {

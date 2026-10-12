@@ -142,6 +142,8 @@ pub struct SourceFacts {
     python_file_scan: OnceLock<Arc<crate::python_globals::PythonFileScan>>,
     python_name_scans: Mutex<HashMap<String, Arc<crate::python_globals::NameScan>>>,
     python_globals: Mutex<HashMap<String, Arc<crate::python_globals::GlobalMemo>>>,
+    python_plugged_modules: OnceLock<Vec<String>>,
+    python_fixture_types: Mutex<HashMap<String, Option<String>>>,
     minified_script: OnceLock<bool>,
     csharp_scopes: OnceLock<Arc<crate::csharp_scopes::CsharpScopes>>,
     sfc_script_blocks: OnceLock<Vec<crate::sfc_scripts::ScriptBlock>>,
@@ -176,6 +178,8 @@ impl SourceFacts {
             python_file_scan: OnceLock::new(),
             python_name_scans: Mutex::new(HashMap::new()),
             python_globals: Mutex::new(HashMap::new()),
+            python_plugged_modules: OnceLock::new(),
+            python_fixture_types: Mutex::new(HashMap::new()),
             minified_script: OnceLock::new(),
             csharp_scopes: OnceLock::new(),
             sfc_script_blocks: OnceLock::new(),
@@ -465,6 +469,36 @@ impl SourceFacts {
                 .entry(id.to_string())
                 .or_default(),
         )
+    }
+
+    /// The fixture modules the `conftest.py` files above this Python file
+    /// pull in; `scan` runs once.
+    pub(crate) fn python_plugged_modules(&self, scan: impl FnOnce() -> Vec<String>) -> &[String] {
+        self.python_plugged_modules.get_or_init(scan)
+    }
+
+    /// Memoised class a pytest fixture parameter of this file is (`key`
+    /// names the test and the parameter); `compute` runs at most once per
+    /// key, without the lock held.
+    pub(crate) fn python_fixture_type(
+        &self,
+        key: &str,
+        compute: impl FnOnce() -> Option<String>,
+    ) -> Option<String> {
+        if let Some(known) = self
+            .python_fixture_types
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(key)
+        {
+            return known.clone();
+        }
+        let found = compute();
+        self.python_fixture_types
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(key.to_string(), found.clone());
+        found
     }
 
     /// The C# namespace blocks and `using` directives of the raw source,
