@@ -29,8 +29,9 @@ pub const ROW_KEY_PREFIX: &str = "js_module_surface:";
 /// written in. An index without it (built before the rows existed) holds no
 /// rows to trust.
 pub const VERSION_KEY: &str = "js_module_surface_version";
-/// The row format this build writes.
-pub const VERSION: &str = "1";
+/// The row format this build writes. 2: `targets` is the union over the
+/// JavaScript-family resolution languages (W4a-F4).
+pub const VERSION: &str = "2";
 
 /// The canonical encoding of the default surface: an ES module none of whose
 /// text another file's resolution reads. No row records it.
@@ -52,15 +53,15 @@ pub struct ModuleSurface {
     pub sources: Vec<String>,
 }
 
-/// A surface as its row stores it: with what each source resolved to when
-/// the row was written, so a barrel that forwarded a file still names it once
-/// the file is gone.
+/// A surface as its row stores it: with every project file its sources
+/// resolved to when the row was written, so a barrel that forwarded a file
+/// still names it once the file is gone.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SurfaceRow {
     pub digest: String,
     pub sources: Vec<String>,
-    /// `targets[i]` is the project file `sources[i]` resolved to, or `None`.
-    pub targets: Vec<Option<String>>,
+    /// [`resolve_targets`] of `sources`: sorted, each file once.
+    pub targets: Vec<String>,
 }
 
 impl SurfaceRow {
@@ -84,9 +85,7 @@ impl SurfaceRow {
 
     /// A row read back; `None` for a value this build does not understand.
     pub fn decode(value: &str) -> Option<Self> {
-        serde_json::from_str::<Self>(value)
-            .ok()
-            .filter(|row| row.sources.len() == row.targets.len())
+        serde_json::from_str::<Self>(value).ok()
     }
 }
 
@@ -131,19 +130,38 @@ pub fn module_surface(
     })
 }
 
-/// What each of `sources`, forwarded by `file_path`, resolves to in the
-/// project `context` sees, as a barrel's re-exports are followed.
+/// The languages a barrel's sources can be resolved in: `find_exported_symbol`
+/// follows a re-export with the language of the import it resolves, and each
+/// orders extensions its own way (`./inner` is `inner.ts` from TypeScript,
+/// `inner.js` from JavaScript).
+const RESOLUTION_LANGUAGES: [Language; 8] = [
+    Language::TypeScript,
+    Language::Tsx,
+    Language::JavaScript,
+    Language::Jsx,
+    Language::Vue,
+    Language::Svelte,
+    Language::Astro,
+    Language::ArkTs,
+];
+
+/// Every project file one of `sources`, forwarded by `file_path`, resolves to
+/// in the project `context` sees, in any language an import following it can
+/// be written in: sorted, each file once.
 pub fn resolve_targets(
     file_path: &str,
     sources: &[String],
     context: &dyn ResolutionContext,
-) -> Vec<Option<String>> {
-    sources
-        .iter()
-        .map(|source| {
-            import_resolver::resolve_import_path(source, file_path, Language::TypeScript, context)
-        })
-        .collect()
+) -> Vec<String> {
+    let mut targets = std::collections::BTreeSet::new();
+    for source in sources {
+        for language in RESOLUTION_LANGUAGES {
+            targets.extend(import_resolver::resolve_import_path(
+                source, file_path, language, context,
+            ));
+        }
+    }
+    targets.into_iter().collect()
 }
 
 /// The canonical encoding of every fact and the forwarded specifiers. Each
@@ -332,15 +350,16 @@ mod tests {
     }
 
     #[test]
-    fn a_row_round_trips_and_rejects_a_mismatched_value() {
+    fn a_row_round_trips_and_rejects_another_format() {
         let row = SurfaceRow {
             digest: "d".into(),
             sources: vec!["./a".into(), "pkg".into()],
-            targets: vec![Some("src/a.ts".into()), None],
+            targets: vec!["src/a.js".into(), "src/a.ts".into()],
         };
         assert_eq!(SurfaceRow::decode(&row.encode()), Some(row));
+        // Format 1 aligned a nullable target with each source.
         assert_eq!(
-            SurfaceRow::decode(r#"{"digest":"d","sources":["./a"],"targets":[]}"#),
+            SurfaceRow::decode(r#"{"digest":"d","sources":["./a"],"targets":[null]}"#),
             None
         );
         assert_eq!(SurfaceRow::decode("not json"), None);

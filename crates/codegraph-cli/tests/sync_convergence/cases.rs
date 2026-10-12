@@ -1781,6 +1781,27 @@ pub fn typescript_workspace_entry_barrel_is_renamed() -> Case {
         .edge_before("function check", "calls", "function safeParse @packages/mid/a.ts")
 }
 
+/// A barrel's source resolves by the language of the import it is followed
+/// for: `./inner` from a JavaScript caller is `inner.js` first, from a
+/// TypeScript one `inner.ts`. The node-less `inner.js` that a JavaScript
+/// caller reaches through `outer.js` comes to forward another module, so the
+/// caller moves although `inner.ts` is what a TypeScript import would see.
+pub fn javascript_barrel_chain_follows_the_importer_language() -> Case {
+    Case::new(Change::ReexportEdit, &[Language::JavaScript, Language::TypeScript])
+        .file("src/a.js", "export function safeParse(value) {\n  return value;\n}\n")
+        .file("src/b.js", "export function safeParse(value) {\n  return [value];\n}\n")
+        .file("src/inner.js", "export * from './a';\n")
+        .file("src/inner.ts", "export function other(): number {\n  return 1;\n}\n")
+        .file("src/outer.js", "export * from './inner';\n")
+        .file(
+            "src/use.js",
+            "import { safeParse } from './outer';\n\nexport function check() {\n  return safeParse(1);\n}\n",
+        )
+        .write("src/inner.js", "export * from './b';\n")
+        .edge_before("function check", "calls", "function safeParse @src/a.js")
+        .edge_after("function check", "calls", "function safeParse @src/b.js")
+}
+
 /// Upstream #2378's identifier grammar: `export default $fmt;` that comes
 /// to name `$other` moves an unchanged default importer, as on a fresh
 /// index, rather than both falling back to the first exported function.

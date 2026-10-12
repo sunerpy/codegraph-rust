@@ -662,6 +662,7 @@ matrix! {
     svelte_instance_script_becomes_a_module_script,
     typescript_alias_forwarded_barrel_is_deleted,
     typescript_workspace_entry_barrel_is_renamed,
+    javascript_barrel_chain_follows_the_importer_language,
     typescript_dollar_import_reaches_an_added_module,
     typescript_dollar_default_export_names_another_declaration,
     java_super_call_in_an_override_body_edit,

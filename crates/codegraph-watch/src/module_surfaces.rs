@@ -95,7 +95,7 @@ impl OldRow {
         }
     }
 
-    fn targets(&self) -> &[Option<String>] {
+    fn targets(&self) -> &[String] {
         match self {
             Self::Row(row) => &row.targets,
             Self::Default | Self::Unreadable => &[],
@@ -184,9 +184,9 @@ impl SurfaceRefresh {
 struct Barrel {
     path: String,
     /// What its sources resolved to when its row was written.
-    recorded: Vec<Option<String>>,
+    recorded: Vec<String>,
     /// What they resolve to now.
-    now: Vec<Option<String>>,
+    now: Vec<String>,
 }
 
 /// Read what the surfaces of a sync's changed files call for, after every
@@ -329,7 +329,6 @@ pub(crate) fn note_surface_changes(
                     .recorded
                     .iter()
                     .chain(&barrel.now)
-                    .flatten()
                     .any(|target| closure.contains(target))
             {
                 closure.insert(barrel.path.clone());
