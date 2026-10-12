@@ -1616,6 +1616,9 @@ impl ReferenceResolver {
         let resolved = self.gate_super_self_call(resolved, reference, context);
         let resolved = self.gate_language_visibility(resolved, reference, context);
         let resolved = self.gate_js_visibility(resolved, reference, context);
+        // A JSX tag naming a local of its component renders that local
+        // (upstream #2442).
+        let resolved = crate::jsx_tags::gate_jsx_local_tag(resolved, reference, context);
         (resolved, deferred)
     }
 

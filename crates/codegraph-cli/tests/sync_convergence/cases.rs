@@ -940,6 +940,28 @@ pub fn javascript_object_literal_this_call_body_edit() -> Case {
         .no_edge_after("function window.App::init", "calls", "function window.App::render")
 }
 
+/// Upstream #2442: a JSX tag whose name the component comes to bind as a
+/// parameter renders that local, so the edge to another file's component of
+/// the name goes, as a fresh index of the edit finds.
+pub fn tsx_tag_becomes_a_parameter_body_edit() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Tsx])
+        .file("package.json", "{\"dependencies\":{\"react\":\"^18.0.0\"}}\n")
+        .file(
+            "src/Widget.tsx",
+            "export function Widget() {\n  return <div />;\n}\n",
+        )
+        .file(
+            "src/Widgets.tsx",
+            "export function Widgets({ widgets }) {\n  return <div>{widgets.map((item, index) => <Widget key={index} />)}</div>;\n}\n",
+        )
+        .write(
+            "src/Widgets.tsx",
+            "export function Widgets({ widgets }) {\n  return <div>{widgets.map((Widget, index) => <Widget key={index} />)}</div>;\n}\n",
+        )
+        .edge_before("function Widgets", "references", "function Widget @src/Widget.tsx")
+        .no_edge_after("function Widgets", "references", "function Widget @src/Widget.tsx")
+}
+
 /// Upstream #2263: a CommonJS `require('./application')` imports that file once
 /// it appears, though the binding is only ever used as a value.
 pub fn javascript_require_imports_an_added_module() -> Case {

@@ -602,6 +602,7 @@ matrix! {
     javascript_global_namespace_member_appears,
     javascript_global_namespace_member_renamed,
     javascript_object_literal_this_call_body_edit,
+    tsx_tag_becomes_a_parameter_body_edit,
     javascript_require_imports_an_added_module,
     javascript_require_member_reaches_an_added_module,
     typescript_require_default_of_an_added_es_module,

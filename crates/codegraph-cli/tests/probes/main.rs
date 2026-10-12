@@ -2490,4 +2490,81 @@ mod js {
         assert_eq!(go_files("missing"), Vec::<String>::new());
         assert_eq!(go_files("viaImport"), Vec::<String>::new());
     }
+
+    /// `name file:line` of each node a JSX tag in the node named `parent`
+    /// reaches (a `references` edge written right after `<`), sorted: the
+    /// components the parent renders.
+    fn renders(project: &super::support::Indexed, parent: &str) -> Vec<String> {
+        let graph = project.graph();
+        let parents: Vec<&super::support::NodeRow> = graph
+            .nodes
+            .iter()
+            .filter(|node| node.name == parent && node.kind != "import")
+            .collect();
+        let at_tag = |file: &str, line: Option<i64>, col: Option<i64>| -> bool {
+            let (Some(line), Some(col)) = (line, col) else {
+                return false;
+            };
+            let text = std::fs::read_to_string(project.root().join(file)).unwrap_or_default();
+            let Some(row) = text
+                .lines()
+                .nth(usize::try_from(line - 1).unwrap_or(usize::MAX))
+            else {
+                return false;
+            };
+            usize::try_from(col)
+                .ok()
+                .and_then(|col| col.checked_sub(1))
+                .is_some_and(|before| row.as_bytes().get(before) == Some(&b'<'))
+        };
+        let mut out: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|edge| {
+                edge.kind == "references"
+                    && parents.iter().any(|parent| {
+                        parent.id == edge.source && at_tag(&parent.file_path, edge.line, edge.col)
+                    })
+            })
+            .filter_map(|edge| graph.node(&edge.target))
+            .filter(|node| matches!(node.kind.as_str(), "component" | "function" | "class"))
+            .map(|node| format!("{} {}:{}", node.name, node.file_path, node.start_line))
+            .collect();
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// Upstream #2442 (`47311494`): a JSX tag whose name its component binds
+    /// itself, a `const` or a parameter by the tag's line, renders that local:
+    /// a component the parent declares inside itself, else nothing; a tag
+    /// above the local still renders the outer one. A name written only in a
+    /// type argument or parameter list is no tag of the syntax tree, so it
+    /// renders nothing either.
+    #[test]
+    fn pr2442_a_jsx_tag_bound_to_a_local_renders_no_other_component() {
+        let project = Project::new()
+            .file("package.json", "{\"dependencies\":{\"react\":\"^18.0.0\"}}")
+            .file("app/components/CommandBarItem.tsx", "export function Content() {\n  return <div />;\n}\n\nexport function Icon() {\n  return <svg />;\n}\n")
+            .file("shared/editor/Widget.tsx", "export function Widget() {\n  return <div />;\n}\n")
+            .file("app/components/Portal.tsx", "export function Portal({ children }) {\n  return <div>{children}</div>;\n}\n")
+            .file("app/components/Menu.tsx", "import * as DropdownMenu from '@radix-ui/react-dropdown-menu';\nimport * as ContextMenu from '@radix-ui/react-context-menu';\n\nconst Portal = DropdownMenu.Portal;\n\nexport function SubMenuContent({ variant, children }) {\n  const Portal =\n    variant === 'dropdown' ? DropdownMenu.Portal : ContextMenu.Portal;\n  const Content =\n    variant === 'dropdown'\n      ? DropdownMenu.SubContent\n      : ContextMenu.SubContent;\n  return (\n    <Portal>\n      <Content collisionPadding={6}>{children}</Content>\n    </Portal>\n  );\n}\n\nexport function SettingsLinks({ config }) {\n  return (\n    <ul>\n      {config.map((item) => {\n        const Icon = item.icon;\n        return <li key={item.path}><Icon /></li>;\n      })}\n    </ul>\n  );\n}\n\nexport function Widgets({ widgets }) {\n  return <div>{Object.values(widgets).map((Widget, index) => <Widget key={index} />)}</div>;\n}\n")
+            .file("a-decoy/row.tsx", "export function Row() {\n  return <tr />;\n}\n")
+            .file("app/icon.tsx", "export function Icon() {\n  return <svg />;\n}\n")
+            .file("app/table.tsx", "import { Icon } from './icon';\n\nfunction Row() {\n  return <tr className=\"outer\" />;\n}\n\nexport function Table({ rows }) {\n  const Row = ({ row }) => <tr>{row.name}</tr>;\n  return <table>{rows.map((row) => <Row key={row.id} row={row} />)}</table>;\n}\n\nexport function Toolbar({ actions }) {\n  return (\n    <div>\n      <Icon />\n      {actions.map((action) => {\n        const Icon = action.icon;\n        return <Icon key={action.id} />;\n      })}\n    </div>\n  );\n}\n")
+            .file("app/profile/entry.tsx", "export function Entry() {\n  return <div />;\n}\n")
+            .file("app/components/GenericTable.tsx", "type BaseEntity = { id: string };\n\nexport const GenericTable = <Entry extends BaseEntity>({ data }: { data: Entry[] }) => {\n  return <table>{data.length}</table>;\n};\n")
+            .index();
+        assert_eq!(
+            renders(&project, "SubMenuContent"),
+            Vec::<String>::new(),
+            "{}",
+            project.graph().report()
+        );
+        assert_eq!(renders(&project, "SettingsLinks"), Vec::<String>::new());
+        assert_eq!(renders(&project, "Widgets"), Vec::<String>::new());
+        assert_eq!(renders(&project, "Table"), ["Row app/table.tsx:8"]);
+        assert_eq!(renders(&project, "Toolbar"), ["Icon app/icon.tsx:1"]);
+        assert_eq!(renders(&project, "GenericTable"), Vec::<String>::new());
+    }
 }
