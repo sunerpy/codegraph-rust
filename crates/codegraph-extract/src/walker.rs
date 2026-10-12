@@ -10,7 +10,7 @@ use codegraph_core::types::{
     Edge, EdgeKind, ExtractionResult, Language, Node, NodeKind, ReferenceSubkind, UnresolvedRef,
 };
 use regex::Regex;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use tree_sitter::Node as SyntaxNode;
 
@@ -423,6 +423,13 @@ pub struct TreeSitterWalker<'a, 'tree> {
     /// Whether this file's named object literals own their function members;
     /// see [`Self::owns_object_literals`].
     owns_objects: Option<bool>,
+    /// A C++ file whose tree has errors is walked in the scopes its braces
+    /// open (see [`Self::visit_in_cpp_brace_scope`], upstream #2426): the
+    /// scan of them, `None` for every other file, and the class-like nodes
+    /// extracted so far by the braces of their bodies.
+    cpp_brace_scopes: Option<crate::lang::cpp_brace_scopes::CppBraceScopes>,
+    cpp_class_scopes: crate::lang::cpp_brace_scopes::NestedIntervals<String>,
+    cpp_class_scope_ids: HashSet<String>,
 }
 
 /// The parts of a store initializer that its walk must not treat as the
@@ -465,6 +472,9 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             store_walk: None,
             object_path_owners: HashMap::new(),
             owns_objects: None,
+            cpp_brace_scopes: None,
+            cpp_class_scopes: crate::lang::cpp_brace_scopes::NestedIntervals::default(),
+            cpp_class_scope_ids: HashSet::new(),
         }
     }
 
@@ -473,6 +483,10 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             return self.depth_error_result(duration_ms);
         }
 
+        if self.spec.language() == Language::Cpp && self.root.has_error() {
+            self.cpp_brace_scopes =
+                crate::lang::cpp_brace_scopes::scan_cpp_brace_scopes(self.source);
+        }
         let file_node = self.create_file_node();
         let file_id = file_node.id.clone();
         self.nodes.push(file_node);
@@ -533,8 +547,84 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
         }
 
         self.walk_depth += 1;
-        self.visit_node_inner(node);
+        if self.cpp_brace_scopes.is_some() {
+            self.visit_in_cpp_brace_scope(node);
+        } else {
+            self.visit_node_inner(node);
+        }
         self.walk_depth -= 1;
+    }
+
+    /// Walk a node of a C++ file whose tree has errors in the namespaces and
+    /// classes its source braces put it in (upstream #2426
+    /// `visitInCppBraceScope`). That is where the tree put it unless error
+    /// recovery closed a scope at the wrong `}` or ran one past its own: the
+    /// rest of a class then parses as declarations of the namespace around
+    /// it (rocksdb's `struct Opts`), and the rest of each namespace one level
+    /// out (protobuf's `FieldDescriptor` at the top level).
+    ///
+    /// The namespaces apply everywhere. The enclosing classes are set only at
+    /// declaration level, where the stack above the file node holds nothing
+    /// but class scopes; inside a function (a local class's members) the
+    /// walk's own stack stands.
+    fn visit_in_cpp_brace_scope(&mut self, node: SyntaxNode<'tree>) {
+        let at = node.start_byte();
+        let Some(scopes) = self.cpp_brace_scopes.as_ref() else {
+            self.visit_node_inner(node);
+            return;
+        };
+        let namespaces = std::mem::replace(&mut self.namespace_prefix, scopes.namespaces_at(at));
+        let mut base = self.node_stack.len();
+        while base > 1
+            && self
+                .cpp_class_scope_ids
+                .contains(&self.node_stack[base - 1])
+        {
+            base -= 1;
+        }
+        let mut walked: Option<Vec<String>> = None;
+        if base == 1 {
+            let classes: Vec<String> = self.cpp_class_scopes.at(at).into_iter().cloned().collect();
+            if self.node_stack[base..] != classes[..] {
+                walked = Some(self.node_stack.split_off(base));
+                self.node_stack.extend(classes);
+            }
+        }
+        self.visit_node_inner(node);
+        if let Some(walked) = walked {
+            self.node_stack.truncate(base);
+            self.node_stack.extend(walked);
+        }
+        self.namespace_prefix = namespaces;
+    }
+
+    /// Where a C++ class-like node ends while the file is walked in brace
+    /// scopes: the `}` that closes its body, or `None` to keep the tree's.
+    fn cpp_body_end(&self, body: Option<SyntaxNode<'tree>>) -> Option<(i64, i64)> {
+        let scopes = self.cpp_brace_scopes.as_ref()?;
+        let close = scopes.close_of(body?.start_byte())?;
+        Some(scopes.position_of(close + 1))
+    }
+
+    /// Open a class-like node's body as a scope for
+    /// [`Self::visit_in_cpp_brace_scope`].
+    fn open_cpp_class_scope(&mut self, id: &str, body: Option<SyntaxNode<'tree>>) {
+        let Some(body) = body else {
+            return;
+        };
+        let Some(close) = self
+            .cpp_brace_scopes
+            .as_ref()
+            .and_then(|scopes| scopes.close_of(body.start_byte()))
+        else {
+            return;
+        };
+        if self
+            .cpp_class_scopes
+            .add(body.start_byte(), close, id.to_string())
+        {
+            self.cpp_class_scope_ids.insert(id.to_string());
+        }
     }
 
     fn visit_node_inner(&mut self, node: SyntaxNode<'tree>) {
@@ -609,6 +699,21 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
         } else if has_type(self.spec.variable_types(), node_type)
             && (!self.is_inside_class_like_node() || self.is_type_scope_constant(node))
         {
+            // In a file walked in brace scopes, a class the tree reads as the
+            // type of a declaration (`class X {…}` glued to the tokens after
+            // it by error recovery) is still a class (upstream #2426). In a
+            // class body the children walk reached it; out of one, this
+            // branch skips that walk.
+            if self.cpp_brace_scopes.is_some()
+                && let Some(declared) = child_by_field(node, "type")
+                && matches!(
+                    declared.kind(),
+                    "class_specifier" | "struct_specifier" | "union_specifier" | "enum_specifier"
+                )
+                && child_by_field(declared, "body").is_some()
+            {
+                self.visit_node(declared);
+            }
             self.maybe_cpp_construction(node);
             self.extract_variable(node);
             self.scan_fn_ref_subtree(node, 0);
@@ -2498,6 +2603,10 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
         if let Some(qualified_name) = extra.qualified_name {
             new_node.qualified_name = qualified_name;
         }
+        if let Some((end_line, end_column)) = extra.end {
+            new_node.end_line = end_line;
+            new_node.end_column = end_column;
+        }
         // Upstream tree-sitter.ts:626-634: extractModifiers output (Kotlin
         // expect/actual) merges into decorators.
         let mods = self.spec.extract_modifiers(node);
@@ -2825,6 +2934,7 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             return;
         }
         let name = self.extract_name(node);
+        let resolved_body = self.resolve_body(node);
         let class_node = self.create_node(
             kind,
             &name,
@@ -2833,10 +2943,12 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
                 docstring: self.docstring_for(node),
                 visibility: self.spec.get_visibility(node),
                 is_exported: self.spec.is_exported(node, self.source),
+                end: self.cpp_body_end(resolved_body),
                 ..NodeExtra::default()
             },
         );
         let Some(class_node) = class_node else { return };
+        self.open_cpp_class_scope(&class_node.id, resolved_body);
         self.extract_inheritance(node, &class_node.id);
         self.extract_decorators_for(node, &class_node.id);
         self.node_stack.push(class_node.id);
@@ -2877,12 +2989,14 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
                 docstring: self.docstring_for(node),
                 visibility: self.spec.get_visibility(node),
                 is_exported: self.spec.is_exported(node, self.source),
+                end: self.cpp_body_end(body),
                 ..NodeExtra::default()
             },
         );
         let Some(aggregate_node) = aggregate_node else {
             return;
         };
+        self.open_cpp_class_scope(&aggregate_node.id, body);
         self.extract_inheritance(node, &aggregate_node.id);
         if let Some(body) = body {
             self.node_stack.push(aggregate_node.id);
@@ -6795,6 +6909,10 @@ struct NodeExtra {
     /// on a dotted path: it reads values, but no value read reaches it
     /// (upstream #2363 `valueTarget = false`).
     local_value: bool,
+    /// Where the node ends instead of where its tree node ends: a C++
+    /// class-like node of a file walked in brace scopes ends at its body's
+    /// `}` (upstream #2426 `cppBodyEnd`).
+    end: Option<(i64, i64)>,
 }
 
 /// An object key's name as written, a string key's quotes dropped (upstream

@@ -436,7 +436,7 @@ fn find_descendant_of_kind<'tree>(node: Node<'tree>, kind: &str) -> Option<Node<
 /// with ASCII spaces on char boundaries, so byte length (and thus every
 /// line/column) is preserved. Each pass is gated, so macro-free C++ is
 /// returned byte-identical.
-fn pre_parse_cpp_source(source: &str, file_path: &str) -> String {
+pub(crate) fn pre_parse_cpp_source(source: &str, file_path: &str) -> String {
     // Every pass replaces whole ASCII spans, so the text stays UTF-8; were it
     // ever not to, the source goes to the parser unchanged.
     try_pre_parse_cpp_source(source, file_path).unwrap_or_else(|| source.to_string())

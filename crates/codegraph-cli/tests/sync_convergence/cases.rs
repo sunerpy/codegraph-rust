@@ -1823,6 +1823,27 @@ pub fn cpp_attribute_macro_class_body_edit() -> Case {
         .edge_after("function run", "calls", "method db::Counter::IncrementBy")
 }
 
+/// Upstream #2426: in a C++ file whose tree has errors (rocksdb's macro call
+/// in a nested struct's head), the class after it keeps its namespaces
+/// through a body edit, and an unchanged caller keeps its call into it.
+pub fn cpp_broken_tree_class_body_edit() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Cpp])
+        .file(
+            "cache/clock_cache.h",
+            "namespace rocksdb {\nnamespace clock_cache {\n\nclass FixedTable : public BaseTable {\n public:\n  struct cacheline_aligned(64U) HandleImpl : public ClockHandle {\n    RelaxedAtomic<uint32_t> displacements{};\n    bool standalone = false;\n  };\n\n  struct Opts : public BaseOpts {\n    explicit Opts(size_t size) : BaseOpts(0), size(size) {}\n    size_t size;\n  };\n\n  void Insert(const Opts& opts);\n};\n\nclass AutoTable : public BaseTable {\n public:\n  void Erase() {\n    count_ = 0;\n  }\n\n private:\n  int count_;\n};\n\n}  // namespace clock_cache\n}  // namespace rocksdb\n",
+        )
+        .file(
+            "src/use.cc",
+            "#include \"clock_cache.h\"\n\nvoid run(rocksdb::clock_cache::AutoTable& table) {\n  table.Erase();\n}\n",
+        )
+        .write(
+            "cache/clock_cache.h",
+            "namespace rocksdb {\nnamespace clock_cache {\n\nclass FixedTable : public BaseTable {\n public:\n  struct cacheline_aligned(64U) HandleImpl : public ClockHandle {\n    RelaxedAtomic<uint32_t> displacements{};\n    bool standalone = false;\n  };\n\n  struct Opts : public BaseOpts {\n    explicit Opts(size_t size) : BaseOpts(0), size(size) {}\n    size_t size;\n  };\n\n  void Insert(const Opts& opts);\n};\n\nclass AutoTable : public BaseTable {\n public:\n  void Erase() {\n    count_ = 1;\n  }\n\n private:\n  int count_;\n};\n\n}  // namespace clock_cache\n}  // namespace rocksdb\n",
+        )
+        .edge_before("function run", "calls", "method rocksdb::clock_cache::AutoTable::Erase")
+        .edge_after("function run", "calls", "method rocksdb::clock_cache::AutoTable::Erase")
+}
+
 /// Upstream #2378's identifier grammar: `export default $fmt;` that comes
 /// to name `$other` moves an unchanged default importer, as on a fresh
 /// index, rather than both falling back to the first exported function.
