@@ -3,6 +3,7 @@ pub mod cpp_namespace_rows;
 mod git;
 pub mod git_pending;
 pub mod java_heads;
+pub mod kotlin_surfaces;
 mod link_state;
 mod migrate;
 pub mod module_surfaces;

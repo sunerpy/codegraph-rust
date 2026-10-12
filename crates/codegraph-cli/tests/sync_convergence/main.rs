@@ -351,6 +351,8 @@ fn run_case(name: &str, case: &Case) {
         support::project_metadata_with_prefix(&fresh.db(), "cpp_namespace_surface");
     // The Java head rows and their marker (W4-JVM-01), one prefix for both.
     let head_rows = support::project_metadata_with_prefix(&fresh.db(), "java_type_heads");
+    // And the Kotlin surface rows and their marker (W4-JVM-03).
+    let kotlin_rows = support::project_metadata_with_prefix(&fresh.db(), "kotlin_surface");
     for (driver, project) in [("cli", &cli), ("watch", &watch)] {
         let rows = support::project_metadata_with_prefix(&project.db(), "js_module_surface");
         if rows != surface_rows {
@@ -378,6 +380,13 @@ fn run_case(name: &str, case: &Case) {
             divergent.push(format!(
                 "=== {driver} driver: the Java head rows differ from a fresh index\n\
                  synced: {rows:#?}\nfresh: {head_rows:#?}"
+            ));
+        }
+        let rows = support::project_metadata_with_prefix(&project.db(), "kotlin_surface");
+        if rows != kotlin_rows {
+            divergent.push(format!(
+                "=== {driver} driver: the Kotlin surface rows differ from a fresh index\n\
+                 synced: {rows:#?}\nfresh: {kotlin_rows:#?}"
             ));
         }
     }
@@ -806,6 +815,16 @@ matrix! {
     java_bare_call_follows_a_base_change_in_another_file,
     java_enum_constant_body_edit,
     kotlin_enum_entry_body_edit,
+    kotlin_bare_call_follows_a_base_change_in_another_file,
+    kotlin_receiver_type_appears_in_another_file,
+    kotlin_lambda_receiver_changes_in_another_file,
+    kotlin_import_package_appears_in_the_project,
+    kotlin_gradle_script_owner_becomes_a_project_class,
+    kotlin_platform_ancestry_chain_follows_a_project_head_change,
+    kotlin_base_body_edit_keeps_a_bare_call,
+    kotlin_batch_rewrites_a_base_and_a_middle_type,
+    kotlin_lambda_receiver_changes_through_a_typealias,
+    kotlin_gradle_script_follows_a_project_head_change,
     java_nested_type_follows_a_base_change_in_another_file,
     java_nested_type_ignores_an_added_namesake,
     java_import_package_appears_in_the_project,

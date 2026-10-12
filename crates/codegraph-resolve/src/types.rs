@@ -545,6 +545,14 @@ pub trait ResolutionContext {
     fn cpp_namespace_tables(&self) -> Arc<crate::cpp_namespaces::CppNamespaceTables> {
         Arc::new(crate::cpp_namespaces::CppNamespaceTables::new())
     }
+
+    /// The project-wide Kotlin facts a bare Kotlin call reads (upstream
+    /// #2172's receiver types). Contexts that live for one resolution pass
+    /// keep one set; the default makes a new one, which reads the files
+    /// again, on each call.
+    fn kotlin_tables(&self) -> Arc<crate::kotlin_scope::KotlinTables> {
+        Arc::new(crate::kotlin_scope::KotlinTables::new())
+    }
 }
 
 /// Go module info parsed from `go.mod`.

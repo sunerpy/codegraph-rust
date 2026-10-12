@@ -560,6 +560,7 @@ fn sync_paths_with_store(
     // And for the Java files whose resolution reads other files' heads and
     // packages: every Java file is re-resolved once (W4-JVM-01).
     let java_bootstrap = crate::java_heads::needs_bootstrap(store)?;
+    let kotlin_bootstrap = crate::kotlin_surfaces::needs_bootstrap(store)?;
 
     let paths = paths.into_iter().collect::<Vec<_>>();
     let total = paths.len();
@@ -606,7 +607,7 @@ fn sync_paths_with_store(
         on_progress(done + 1, total);
     }
 
-    if changed || surface_bootstrap || cpp_bootstrap || java_bootstrap {
+    if changed || surface_bootstrap || cpp_bootstrap || java_bootstrap || kotlin_bootstrap {
         note_python_global_readers(
             project_root,
             store,
@@ -680,6 +681,23 @@ fn sync_paths_with_store(
             dependent_sites.remove(file);
             dependent_fallbacks.insert(file.clone());
         }
+        // And Kotlin's: the heads its walks pass through, the receivers its
+        // lambdas run on, the project-wide receiver types and a Gradle
+        // script's owners (W4-JVM-03).
+        let kotlin = crate::kotlin_surfaces::kotlin_refresh(
+            store,
+            project_root,
+            scope.options.max_file_size,
+            &changed_names.kotlin,
+            &reindexed,
+            &changed_names.removed_files,
+            kotlin_bootstrap,
+        )?;
+        for file in &kotlin.files {
+            dependent_sites.remove(file);
+            dependent_fallbacks.insert(file.clone());
+        }
+        changed_names.note_all(kotlin.names.iter().cloned());
         // What a changed Python import statement re-exports moves for its
         // module's importers without any node of those names changing.
         if !changed_names.python_imports.is_empty() {
@@ -767,9 +785,11 @@ fn sync_paths_with_store(
         surfaces.write_rows(store)?;
         namespaces.write_rows(store)?;
         java.write_rows(store)?;
+        kotlin.write_rows(store)?;
         crate::module_surfaces::finish_bootstrap(store)?;
         crate::cpp_dependents::write_marker(store)?;
         crate::java_heads::write_marker(store)?;
+        crate::kotlin_surfaces::write_marker(store)?;
     }
 
     // Orphan sweep (#1187, upstream index.ts:645-682): a full-index resolution
@@ -1150,6 +1170,9 @@ fn remove_tracked_file(
         note_python_fixture_holders(change, &old_nodes);
     }
     changed_names.java.note(store, relative, &old_nodes, None)?;
+    changed_names
+        .kotlin
+        .note(store, relative, &old_nodes, None)?;
     delete_unresolved_refs_by_file(store, relative)?;
     store.delete_file_record(relative)?;
     changed_names
@@ -1514,6 +1537,12 @@ fn reextract_into_store(
         &old_nodes,
         Some((file.language, source, &result.nodes)),
     )?;
+    changed_names.kotlin.note(
+        store,
+        relative,
+        &old_nodes,
+        Some((file.language, source, &result.nodes)),
+    )?;
     // No name in another file resolves into a minified script (upstream
     // #2204), and that verdict is read from the script's text: a script that
     // was or is generated can flip it with every node where it was, so all of
@@ -1635,6 +1664,9 @@ struct ChangedNames {
     /// What the changed Java, Kotlin and Scala files held that Java
     /// resolution in other files reads: heads and packages (W4-JVM-01).
     java: crate::java_heads::JavaChanges,
+    /// What the changed files held that Kotlin resolution in other files
+    /// reads: surfaces and class names (W4-JVM-03).
+    kotlin: crate::kotlin_surfaces::KotlinChanges,
 }
 
 /// What a changed Python file held before the change. A module global's
@@ -1670,6 +1702,7 @@ impl ChangedNames {
             store.delete_project_metadata(codegraph_resolve::module_surface::VERSION_KEY)?;
             crate::cpp_dependents::withdraw_marker(store)?;
             crate::java_heads::withdraw_marker(store)?;
+            crate::kotlin_surfaces::withdraw_marker(store)?;
             self.surface_dirty = true;
         }
         Ok(())
@@ -2222,6 +2255,179 @@ pub(crate) mod tests {
         sync_changed_paths(dir.path(), &db, ["src/app/Spare.java"]).unwrap();
         assert_eq!(java_marker(&db), version);
         assert_eq!(head_rows(&db), rows);
+        assert_eq!(edge_projection(&db), expected);
+    }
+
+    fn kotlin_marker(db: &Path) -> Option<String> {
+        Store::open(db)
+            .unwrap()
+            .get_project_metadata(crate::kotlin_surfaces::VERSION_KEY)
+            .unwrap()
+    }
+
+    fn kotlin_rows(db: &Path) -> Vec<(String, String)> {
+        Store::open(db)
+            .unwrap()
+            .project_metadata_with_prefix(codegraph_resolve::kotlin_scope::SURFACE_ROW_KEY_PREFIX)
+            .unwrap()
+    }
+
+    const KOTLIN_ROOT: (&str, &str) = (
+        "src/app/Root.kt",
+        "package app\n\nopen class Root {\n    fun assist() { }\n}\n",
+    );
+    const KOTLIN_OTHER: (&str, &str) = (
+        "src/app/Other.kt",
+        "package app\n\nopen class Other {\n    fun assist() { }\n}\n",
+    );
+    const KOTLIN_BASE_ROOT: (&str, &str) = (
+        "src/app/Base.kt",
+        "package app\n\nopen class Base : Root()\n",
+    );
+    const KOTLIN_BASE_OTHER: (&str, &str) = (
+        "src/app/Base.kt",
+        "package app\n\nopen class Base : Other()\n",
+    );
+    const KOTLIN_CHILD: (&str, &str) = (
+        "src/app/Child.kt",
+        "package app\n\nclass Child : Base() {\n    fun go() {\n        assist()\n    }\n}\n",
+    );
+    const KOTLIN_SPARE: (&str, &str) = ("src/app/Spare.kt", "package app\n\nclass Spare\n");
+    const KOTLIN_SPARE_EDITED: (&str, &str) = (
+        "src/app/Spare.kt",
+        "package app\n\nclass Spare {\n    val count = 1\n}\n",
+    );
+
+    /// W4-JVM-03: a sync failing after its mutations leaves the Kotlin
+    /// marker away, so the next sync, with nothing changed or with an
+    /// unrelated change, re-resolves every Kotlin file and rebuilds the
+    /// surface rows: `Child`'s bare call, which the changed base moves, ends
+    /// where a fresh index puts it.
+    #[test]
+    fn a_kotlin_sync_failing_after_its_mutations_leaves_the_next_one_to_reconcile() {
+        let version = Some(crate::kotlin_surfaces::VERSION.to_string());
+        let dir = TestDir::new("kotlin-surface-fail");
+        let db = default_db_path(dir.path()).unwrap();
+        let initial = [
+            KOTLIN_ROOT,
+            KOTLIN_OTHER,
+            KOTLIN_BASE_ROOT,
+            KOTLIN_CHILD,
+            KOTLIN_SPARE,
+        ];
+        write_files(dir.path(), &initial);
+        sync_changed_paths(dir.path(), &db, initial.iter().map(|(path, _)| *path)).unwrap();
+        assert_eq!(kotlin_marker(&db), version);
+
+        let fail_once = |paths: &[&str]| {
+            FAIL_BEFORE_RESOLUTION.with(|fail| fail.set(true));
+            let failed = sync_changed_paths(dir.path(), &db, paths.iter().copied());
+            FAIL_BEFORE_RESOLUTION.with(|fail| fail.set(false));
+            assert!(failed.is_err(), "the injected failure must stop the sync");
+            assert_eq!(
+                kotlin_marker(&db),
+                None,
+                "a failed sync leaves the marker away"
+            );
+        };
+
+        write_files(dir.path(), &[KOTLIN_BASE_OTHER]);
+        fail_once(&["src/app/Base.kt"]);
+        sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
+        assert_eq!(kotlin_marker(&db), version);
+        let fresh = [
+            KOTLIN_ROOT,
+            KOTLIN_OTHER,
+            KOTLIN_BASE_OTHER,
+            KOTLIN_CHILD,
+            KOTLIN_SPARE,
+        ];
+        assert_eq!(
+            edge_projection(&db),
+            fresh_edges("kotlin-surface-fail-other", &fresh)
+        );
+        assert!(
+            edge_projection(&db)
+                .iter()
+                .any(|edge| edge.contains("Child::go -[calls]-> src/app/Other.kt")),
+            "{:#?}",
+            edge_projection(&db)
+        );
+
+        write_files(dir.path(), &[KOTLIN_BASE_ROOT]);
+        fail_once(&["src/app/Base.kt"]);
+        write_files(dir.path(), &[KOTLIN_SPARE_EDITED]);
+        sync_changed_paths(dir.path(), &db, ["src/app/Spare.kt"]).unwrap();
+        assert_eq!(kotlin_marker(&db), version);
+        let fresh = [
+            KOTLIN_ROOT,
+            KOTLIN_OTHER,
+            KOTLIN_BASE_ROOT,
+            KOTLIN_CHILD,
+            KOTLIN_SPARE_EDITED,
+        ];
+        assert_eq!(
+            edge_projection(&db),
+            fresh_edges("kotlin-surface-fail-root", &fresh)
+        );
+    }
+
+    /// W4-JVM-03: an index without the Kotlin marker or its surface rows
+    /// (built before them) has every Kotlin file re-resolved and every row
+    /// rebuilt by its next sync: the bare call an older sync left without
+    /// its edge comes back.
+    #[test]
+    fn an_index_without_the_kotlin_marker_rebuilds_the_surface_rows() {
+        let version = Some(crate::kotlin_surfaces::VERSION.to_string());
+        let dir = TestDir::new("kotlin-surface-bootstrap");
+        let db = default_db_path(dir.path()).unwrap();
+        let initial = [
+            KOTLIN_ROOT,
+            KOTLIN_OTHER,
+            KOTLIN_BASE_ROOT,
+            KOTLIN_CHILD,
+            KOTLIN_SPARE,
+        ];
+        write_files(dir.path(), &initial);
+        sync_changed_paths(dir.path(), &db, initial.iter().map(|(path, _)| *path)).unwrap();
+        assert_eq!(kotlin_marker(&db), version);
+        let rows = kotlin_rows(&db);
+        assert!(
+            rows.iter()
+                .any(|(key, _)| key == "kotlin_surface:src/app/Base.kt"),
+            "{rows:#?}"
+        );
+        let expected = edge_projection(&db);
+        {
+            let store = Store::open(&db).unwrap();
+            let dropped = store
+                .connection()
+                .execute(
+                    "DELETE FROM edges WHERE kind = 'calls' AND target = (SELECT id FROM nodes \
+                     WHERE qualified_name = 'app::Root::assist')",
+                    [],
+                )
+                .unwrap();
+            assert_eq!(dropped, 1, "the call edge an older sync lost");
+            store
+                .delete_project_metadata_with_prefix(
+                    codegraph_resolve::kotlin_scope::SURFACE_ROW_KEY_PREFIX,
+                )
+                .unwrap();
+            store
+                .delete_project_metadata(crate::kotlin_surfaces::VERSION_KEY)
+                .unwrap();
+        }
+        assert_ne!(edge_projection(&db), expected);
+        write_files(dir.path(), &[KOTLIN_SPARE_EDITED]);
+        sync_changed_paths(dir.path(), &db, ["src/app/Spare.kt"]).unwrap();
+        assert_eq!(kotlin_marker(&db), version);
+        let mut rebuilt = kotlin_rows(&db);
+        let mut wanted = rows;
+        // The edited file's row is its new one.
+        rebuilt.retain(|(key, _)| key != "kotlin_surface:src/app/Spare.kt");
+        wanted.retain(|(key, _)| key != "kotlin_surface:src/app/Spare.kt");
+        assert_eq!(rebuilt, wanted);
         assert_eq!(edge_projection(&db), expected);
     }
 

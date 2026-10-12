@@ -2060,6 +2060,15 @@ pub fn match_by_exact_name(
     let java_bare = crate::java_scope::is_java_bare_call(reference);
     let java_call_scope = OnceCell::new();
     let java_type_site = crate::java_scope::JavaTypeSite::new(reference);
+    // A Kotlin call reaches a top-level declaration only where it is visible
+    // (upstream #2146), a bare one only a member in reach (#2172, #2206,
+    // #2232), and a standard-library name on an untyped chain link only a
+    // member its receiver names (#2168).
+    let kotlin_call = crate::kotlin_scope::is_kotlin_call(reference);
+    let kotlin_bare =
+        kotlin_call && crate::kotlin_scope::is_receiver_less_kotlin_call(reference, context);
+    let kotlin_site = crate::kotlin_scope::KotlinSite::new(reference);
+    let kotlin_std_chain = crate::kotlin_scope::std_chain_receiver(reference, context);
     let candidates: Vec<Arc<Node>> = reachable
         .iter()
         .filter(|n| {
@@ -2130,8 +2139,22 @@ pub fn match_by_exact_name(
         // `new Builder()` is not a wire converter test's nested
         // `CrashingPhone.Builder` (upstream #2236).
         .filter(|n| java_type_site.visible(n, context))
+        .filter(|n| {
+            kotlin_std_chain
+                .as_deref()
+                .is_none_or(|receiver| crate::kotlin_scope::is_std_chain_target(n, receiver))
+        })
+        .filter(|n| {
+            !kotlin_call || crate::kotlin_scope::is_kotlin_top_level_visible(n, reference, context)
+        })
+        .filter(|n| !kotlin_bare || kotlin_site.reaches(n, context))
         .cloned()
         .collect();
+    let candidates = if kotlin_bare {
+        kotlin_site.lexical(candidates, context)
+    } else {
+        candidates
+    };
 
     if candidates.is_empty() {
         return None;
@@ -5143,7 +5166,7 @@ fn receiver_shares_word(receiver: &str, qualified_name: &str) -> bool {
 
 /// Split a camelCase/PascalCase string into words (`splitCamelCase`,
 /// `name-matcher.ts:941-946`).
-fn split_camel_case(s: &str) -> Vec<String> {
+pub(crate) fn split_camel_case(s: &str) -> Vec<String> {
     // Insert spaces at lower→upper and ACRONYM→Word boundaries, then split on
     // separators, then drop single-char words.
     let spaced = insert_camel_spaces(s);
@@ -5305,6 +5328,11 @@ pub fn match_fuzzy(reference: &RefView, context: &dyn ResolutionContext) -> Opti
     let objc_c_call = objc_call_shape(reference, context) == Some(ObjcCallShape::CCall);
     let java_bare = crate::java_scope::is_java_bare_call(reference);
     let java_call_scope = OnceCell::new();
+    let kotlin_call = crate::kotlin_scope::is_kotlin_call(reference);
+    let kotlin_bare =
+        kotlin_call && crate::kotlin_scope::is_receiver_less_kotlin_call(reference, context);
+    let kotlin_site = crate::kotlin_scope::KotlinSite::new(reference);
+    let kotlin_std_chain = crate::kotlin_scope::std_chain_receiver(reference, context);
     let callable_candidates = apply_language_gate(
         candidates
             .into_iter()
@@ -5318,6 +5346,18 @@ pub fn match_fuzzy(reference: &RefView, context: &dyn ResolutionContext) -> Opti
                     && !java_call_scope
                         .get_or_init(|| crate::java_scope::JavaCallScope::of(reference, context))
                         .reaches(n, reference))
+            })
+            // Kotlin's visibility, member reach and standard chain names, as
+            // in exact matching (upstream #2146, #2172, #2168).
+            .filter(|n| {
+                !kotlin_call
+                    || crate::kotlin_scope::is_kotlin_top_level_visible(n, reference, context)
+            })
+            .filter(|n| !kotlin_bare || kotlin_site.reaches(n, context))
+            .filter(|n| {
+                kotlin_std_chain
+                    .as_deref()
+                    .is_none_or(|receiver| crate::kotlin_scope::is_std_chain_target(n, receiver))
             })
             .filter(|n| {
                 python_shape.as_ref().is_none_or(|shape| {

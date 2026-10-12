@@ -352,7 +352,15 @@ under it down the same lane, since an import from outside the project owns its
 name; the `java_type_heads_version` marker is withdrawn and restored with the
 others, and an index without it re-resolves every Java file once and rebuilds
 the head rows (a call through a receiver typed as a subtype of a changed head,
-in a file declaring no type of a touched name, is not detected); an import
+in a file declaring no type of a touched name, is not detected); a Kotlin file
+whose surface row moved re-resolves, whole, the unchanged Kotlin files whose
+walks can start from a name the changed heads reach (closing over the heads
+naming a reached name and Android's platform ancestry in one queue) or whose
+lambdas are passed to a function whose receiver moved, and touches, for the name
+lane, the members of every type that joined or left the project-wide receiver
+types and of every owner a Gradle script reads that came or left as a project
+class name, since none of those facts is a node; the `kotlin_surface_version`
+marker is withdrawn and restored with the others; an import
 names a file, a folder or a namespace rather than a symbol, so the parked
 imports an added file or a changed file's namespace can satisfy (by the file's
 name and stem, its folder's, or the namespace's whole name) send their files

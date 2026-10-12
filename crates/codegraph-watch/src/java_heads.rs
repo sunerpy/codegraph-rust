@@ -332,8 +332,9 @@ fn flipped_packages(
     Ok(flipped)
 }
 
-/// The unchanged Java files with an import binding from under a `flipped`
-/// package, read from their text as resolution reads them.
+/// The unchanged Java and Kotlin files with an import binding from under a
+/// `flipped` package, read from their text as resolution reads them (Kotlin
+/// since W4-JVM-03, upstream #2196).
 fn import_dependents(
     store: &Store,
     project_root: &Path,
@@ -347,13 +348,13 @@ fn import_dependents(
         .collect();
     let mut files = BTreeSet::new();
     for file in store.all_files()? {
-        if file.language != Language::Java || !unchanged(&file.path) {
+        if !matches!(file.language, Language::Java | Language::Kotlin) || !unchanged(&file.path) {
             continue;
         }
         let Some(text) = read_text(project_root, &file.path, max_file_size) else {
             continue;
         };
-        if codegraph_resolve::import_resolver::extract_import_mappings(&text, Language::Java)
+        if codegraph_resolve::import_resolver::extract_import_mappings(&text, file.language)
             .iter()
             .any(|mapping| {
                 prefixes

@@ -694,7 +694,7 @@ pub(crate) fn match_cpp_global_name(
 }
 
 /// Split `a, f(b, c), d<e, f>` at its top-level commas.
-fn split_cpp_top_level(text: &str) -> Vec<String> {
+pub(crate) fn split_cpp_top_level(text: &str) -> Vec<String> {
     let chars: Vec<char> = text.chars().collect();
     let mut out = Vec::new();
     let mut depth = 0usize;

@@ -964,7 +964,9 @@ fn extract_go_imports(content: &str) -> Vec<ImportMapping> {
     mappings
 }
 
-/// `extractJavaImports` (`import-resolver.ts:826-853`).
+/// `extractJavaImports` (`import-resolver.ts:826-853`): Java's `import
+/// [static] <fqn>[.*];`, and Kotlin's `import <fqn> [as Alias]` with no `;`
+/// (upstream #2196). A renaming import binds its alias to the imported name.
 fn extract_java_imports(content: &str) -> Vec<ImportMapping> {
     static BLOCK_RE: OnceLock<Regex> = OnceLock::new();
     static LINE_RE: OnceLock<Regex> = OnceLock::new();
@@ -972,7 +974,8 @@ fn extract_java_imports(content: &str) -> Vec<ImportMapping> {
     let block_re = BLOCK_RE.get_or_init(|| Regex::new(r"(?s)/\*.*?\*/").expect("java block"));
     let line_re = LINE_RE.get_or_init(|| Regex::new(r"//[^\n]*").expect("java line"));
     let import_re = IMPORT_RE.get_or_init(|| {
-        Regex::new(r"(?m)^\s*import\s+(static\s+)?([\w.]+(?:\.\*)?)\s*;").expect("java import")
+        Regex::new(r"(?m)^\s*import\s+(static\s+)?([\w.]+(?:\.\*)?)(?:\s+as\s+(\w+))?\s*(?:;|$)")
+            .expect("java import")
     });
 
     let no_block = block_re.replace_all(content, "");
@@ -983,13 +986,14 @@ fn extract_java_imports(content: &str) -> Vec<ImportMapping> {
         if fqn.ends_with(".*") {
             continue;
         }
-        let local_name = fqn.rsplit('.').next().unwrap_or(fqn);
+        let exported_name = fqn.rsplit('.').next().unwrap_or(fqn);
+        let local_name = caps.get(3).map_or(exported_name, |alias| alias.as_str());
         if local_name.is_empty() {
             continue;
         }
         mappings.push(ImportMapping {
             local_name: local_name.to_string(),
-            exported_name: local_name.to_string(),
+            exported_name: exported_name.to_string(),
             source: fqn.to_string(),
             is_default: false,
             is_namespace: false,
@@ -1891,6 +1895,17 @@ pub fn resolve_via_import(
         }
     }
 
+    // Kotlin's `import app.model.Outer.Inner as Made`: `Made.create()` is the
+    // aliased class's member, found by its FQN; nothing else binds the alias
+    // (upstream #2196).
+    if reference.language == Language::Kotlin
+        && reference.reference_kind != codegraph_core::types::EdgeKind::Imports
+    {
+        if let Some(aliased) = resolve_jvm_alias(reference, &imports, context) {
+            return Some(aliased);
+        }
+    }
+
     // Generic: reference name matches an import (import-resolver.ts:1272-1306).
     for imp in &imports {
         if imp.local_name == reference.reference_name
@@ -2132,6 +2147,49 @@ fn resolve_module_import_to_file(
 
 /// Resolve a Java/Kotlin reference whose receiver is an imported FQN's simple
 /// name (`resolveJavaImportedReference`, `import-resolver.ts:1671-1735`).
+/// `Alias` or `Alias.member` through a renaming Kotlin import, by the imported
+/// FQN (upstream #2196 `resolveJvmAlias`): the package is some prefix of the
+/// FQN, the rest the type path (`app.model::Outer::Inner`).
+fn resolve_jvm_alias(
+    reference: &RefView,
+    imports: &[ImportMapping],
+    context: &dyn ResolutionContext,
+) -> Option<ResolvedRef> {
+    let (root, member) = match reference.reference_name.split_once('.') {
+        Some((root, member)) => (root, Some(member)),
+        None => (reference.reference_name.as_str(), None),
+    };
+    let imp = imports.iter().find(|mapping| {
+        mapping.local_name == root && mapping.local_name != mapping.exported_name
+    })?;
+    let parts: Vec<&str> = imp.source.split('.').collect();
+    for cut in (1..parts.len()).rev() {
+        let qualified = format!("{}::{}", parts[..cut].join("."), parts[cut..].join("::"));
+        let Some(target) = context
+            .get_nodes_by_qualified_name_shared(&qualified)
+            .into_iter()
+            .next()
+        else {
+            continue;
+        };
+        let target_node = match member {
+            None => target,
+            Some(member) if member.contains('.') => return None,
+            Some(member) => context
+                .get_nodes_by_qualified_name_shared(&format!("{}::{member}", target.qualified_name))
+                .into_iter()
+                .next()?,
+        };
+        return Some(ResolvedRef {
+            original: reference.clone(),
+            target_node_id: target_node.id.clone(),
+            confidence: 0.9,
+            resolved_by: ResolvedBy::Import,
+        });
+    }
+    None
+}
+
 fn resolve_java_imported_reference(
     reference: &RefView,
     imports: &[ImportMapping],
@@ -4427,6 +4485,21 @@ const { x, y: z } = require('./other');
             !m.iter()
                 .any(|x| x.local_name == "Bad" || x.local_name == "AlsoBad")
         );
+    }
+
+    /// Upstream #2196: Kotlin imports carry no `;`, and `as` renames one.
+    #[test]
+    fn extract_kotlin_imports_without_semicolons_and_with_aliases() {
+        let content = "package app\n\nimport java.lang.reflect.Field\nimport app.model.Outer.Inner as Made // the builder\nimport okio.*\n/* import gone.Thing */\n";
+        let m = extract_import_mappings(content, Language::Kotlin);
+        assert!(m.iter().any(|x| x.local_name == "Field"
+            && x.exported_name == "Field"
+            && x.source == "java.lang.reflect.Field"));
+        assert!(m.iter().any(|x| x.local_name == "Made"
+            && x.exported_name == "Inner"
+            && x.source == "app.model.Outer.Inner"));
+        assert!(!m.iter().any(|x| x.source.ends_with(".*")));
+        assert!(!m.iter().any(|x| x.local_name == "Thing"));
     }
 
     #[test]

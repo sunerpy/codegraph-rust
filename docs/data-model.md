@@ -221,6 +221,20 @@ checked as `cpp_type_surface_version` is, and a sync that finds it missing or at
 another version re-resolves every Java file and rebuilds the head rows. Neither
 is a canonical surface.
 
+Kotlin surface rows record what Kotlin resolution reads of a Kotlin file (`.kt`,
+`.kts`) by the readers it uses: `kotlin_surface:<path>` holds the JSON
+`{"heads", "function_types", "extensions", "lambdas", "aliases", "starts",
+"lambda_calls"}`: each class, struct, interface and enum head's name, qualified
+name and supertypes, the receivers its function types and extension functions
+name, each function's name and last parameter type as written, each typealias's
+name and right side (each list in file order), and, sorted, the names a
+hierarchy walk in the file can start from (type names, member owners, brace
+heads, a Gradle script's `Project` or `Settings`) and the calls its lambdas are
+passed to. A file with none of these has no row. They are written, withdrawn and
+checked like the head rows under `kotlin_surface_version` (1); a sync that finds
+it missing or at another version re-resolves every Kotlin file and rebuilds the
+rows. Neither is a canonical surface.
+
 ## FTS5
 
 `nodes_fts` is an external-content FTS5 table over `nodes`:

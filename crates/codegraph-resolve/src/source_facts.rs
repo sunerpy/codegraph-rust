@@ -155,6 +155,8 @@ pub struct SourceFacts {
     cpp_usings: OnceLock<Arc<Vec<crate::cpp_supertypes::CppUsing>>>,
     java_file_scope: OnceLock<Arc<crate::java_scope::JavaFileScope>>,
     java_heads: Mutex<HashMap<String, Arc<crate::java_scope::JavaHead>>>,
+    kotlin_file_scope: OnceLock<Arc<crate::kotlin_scope::KotlinFileScope>>,
+    kotlin_brace_frames: OnceLock<Arc<Vec<crate::kotlin_scope::BraceFrame>>>,
 }
 
 impl SourceFacts {
@@ -197,6 +199,8 @@ impl SourceFacts {
             cpp_usings: OnceLock::new(),
             java_file_scope: OnceLock::new(),
             java_heads: Mutex::new(HashMap::new()),
+            kotlin_file_scope: OnceLock::new(),
+            kotlin_brace_frames: OnceLock::new(),
         }
     }
 
@@ -577,6 +581,28 @@ impl SourceFacts {
         read: impl FnOnce(&Self) -> crate::java_scope::JavaHead,
     ) -> Arc<crate::java_scope::JavaHead> {
         keyed_memo(&self.java_heads, declaration_id, || Arc::new(read(self)))
+    }
+
+    /// The package and imports of a Kotlin file (upstream #2146), read once.
+    pub(crate) fn kotlin_file_scope(&self) -> Arc<crate::kotlin_scope::KotlinFileScope> {
+        Arc::clone(
+            self.kotlin_file_scope
+                .get_or_init(|| Arc::new(crate::kotlin_scope::KotlinFileScope::read(&self.source))),
+        )
+    }
+
+    /// The type bodies of a Kotlin file read from its braces (upstream
+    /// #2172 `kotlinBraceFrames`); `read` runs once. A lambda's frame reads
+    /// the receiver its function's declaration names in another file, which
+    /// a pass does not change either.
+    pub(crate) fn kotlin_brace_frames(
+        &self,
+        read: impl FnOnce(&str) -> Vec<crate::kotlin_scope::BraceFrame>,
+    ) -> Arc<Vec<crate::kotlin_scope::BraceFrame>> {
+        Arc::clone(
+            self.kotlin_brace_frames
+                .get_or_init(|| Arc::new(read(&self.source))),
+        )
     }
 
     /// The C# namespace blocks and `using` directives of the raw source,

@@ -446,18 +446,22 @@ fn is_project_jvm_package(name: &str, context: &dyn ResolutionContext) -> bool {
         })
 }
 
-/// Whether a Java reference's first segment is bound by a single-type or
-/// static import from a package the project does not declare (upstream
-/// #2195 `isJavaOutsideImport`): after `import java.lang.reflect.Field;` the
-/// file's `Field` is the JDK's, and after `import static
-/// org.junit.Assert.assertEquals;` its `assertEquals` is JUnit's. An import
-/// of the project's own class, a nested one included, is under a project
-/// package. An `imports` reference is the import resolver's.
+/// Whether a Java or Kotlin reference's first segment is bound by a
+/// single-type or static import from a package the project does not declare
+/// (upstream #2195 `isJavaOutsideImport`, Kotlin since #2196): after `import
+/// java.lang.reflect.Field;` the file's `Field` is the JDK's, and after
+/// `import static org.junit.Assert.assertEquals;` its `assertEquals` is
+/// JUnit's. An import of the project's own class, a nested one included, is
+/// under a project package. A declaration the file makes itself comes first,
+/// in its own namespace: a callable for a call, a type otherwise (#2196).
+/// An `imports` reference is the import resolver's.
 pub(crate) fn binds_an_outside_import(
     reference: &RefView,
     context: &dyn ResolutionContext,
 ) -> bool {
-    if reference.language != Language::Java || reference.reference_kind == EdgeKind::Imports {
+    if !matches!(reference.language, Language::Java | Language::Kotlin)
+        || reference.reference_kind == EdgeKind::Imports
+    {
         return false;
     }
     let head = reference
@@ -465,10 +469,36 @@ pub(crate) fn binds_an_outside_import(
         .split('.')
         .next()
         .unwrap_or_default();
-    let mappings = context.get_import_mappings(&reference.file_path, Language::Java);
+    let mappings = context.get_import_mappings(&reference.file_path, reference.language);
     let Some(binding) = mappings.iter().find(|mapping| mapping.local_name == head) else {
         return false;
     };
+    // Exposed's `toLocalDateTime(value)` inside the column type that defines
+    // it, beside `import kotlinx.datetime.toLocalDateTime`; but gson's `new
+    // URI(…)` is `java.net.URI` beside `TypeAdapters`' field `URI`.
+    let call = reference.reference_kind == EdgeKind::Calls && head == reference.reference_name;
+    if context
+        .get_nodes_in_file_shared(&reference.file_path)
+        .iter()
+        .any(|node| {
+            node.name == head
+                && if call {
+                    matches!(node.kind, NodeKind::Method | NodeKind::Function)
+                } else {
+                    matches!(
+                        node.kind,
+                        NodeKind::Class
+                            | NodeKind::Interface
+                            | NodeKind::Enum
+                            | NodeKind::Struct
+                            | NodeKind::Trait
+                            | NodeKind::TypeAlias
+                    )
+                }
+        })
+    {
+        return false;
+    }
     let parts: Vec<&str> = binding.source.split('.').collect();
     !(1..parts.len()).any(|end| is_project_jvm_package(&parts[..end].join("."), context))
 }

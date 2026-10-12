@@ -2569,6 +2569,277 @@ pub fn java_subclass_gains_a_base_its_caller_reaches() -> Case {
         .edge_after("method app::Use::go", "calls", "method app::Base::run")
 }
 
+/// Upstream #2172: a bare Kotlin call reaches a member of what the class
+/// around it inherits, read from the declarations' heads by name, so a base
+/// changed in another file moves the call of an unchanged subclass, as on a
+/// fresh index.
+pub fn kotlin_bare_call_follows_a_base_change_in_another_file() -> Case {
+    Case::new(Change::EditHeritage, &[Language::Kotlin])
+        .file(
+            "src/app/Root.kt",
+            "package app\n\nopen class Root {\n    fun assist() { }\n}\n",
+        )
+        .file(
+            "src/app/Other.kt",
+            "package app\n\nopen class Other {\n    fun assist() { }\n}\n",
+        )
+        .file(
+            "src/app/Base.kt",
+            "package app\n\nopen class Base : Root()\n",
+        )
+        .file(
+            "src/app/Child.kt",
+            "package app\n\nclass Child : Base() {\n    fun go() {\n        assist()\n    }\n}\n",
+        )
+        .write(
+            "src/app/Base.kt",
+            "package app\n\nopen class Base : Other()\n",
+        )
+        .edge_before("method app::Child::go", "calls", "method app::Root::assist")
+        .edge_after(
+            "method app::Child::go",
+            "calls",
+            "method app::Other::assist",
+        )
+}
+
+/// Upstream #2172: the members of a type some project function type takes
+/// as a receiver are in reach of every bare call, so a file appearing with
+/// `Helper.() -> Unit` makes an unchanged file's bare `ping()` reach
+/// `Helper::ping`, as on a fresh index.
+pub fn kotlin_receiver_type_appears_in_another_file() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Kotlin])
+        .file(
+            "src/app/Helper.kt",
+            "package app\n\nclass Helper {\n    fun ping() { }\n}\n",
+        )
+        .file(
+            "src/app/Use.kt",
+            "package app\n\nclass Use {\n    fun go() {\n        ping()\n    }\n}\n",
+        )
+        .write(
+            "src/app/Dsl.kt",
+            "package app\n\nfun helping(block: Helper.() -> Unit) { }\n",
+        )
+        .edge_after("method app::Use::go", "calls", "method app::Helper::ping")
+}
+
+/// Upstream #2206: a lambda runs on the receiver its function's last
+/// parameter type names, so that function's declaration changing in another
+/// file moves the bare call inside an unchanged lambda, as on a fresh index.
+pub fn kotlin_lambda_receiver_changes_in_another_file() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Kotlin])
+        .file(
+            "src/app/Scopes.kt",
+            "package app\n\nclass Scope {\n    fun get(): Int = 1\n}\n\nclass Koin {\n    fun get(): Int = 2\n}\n",
+        )
+        .file(
+            "src/app/Module.kt",
+            "package app\n\nclass Module {\n    fun single(definition: Scope.() -> Int) { }\n}\n",
+        )
+        .file(
+            "src/app/Perfs.kt",
+            "package app\n\nfun perfModule(m: Module) {\n    m.single { get() }\n}\n",
+        )
+        .write(
+            "src/app/Module.kt",
+            "package app\n\nclass Module {\n    fun single(definition: Koin.() -> Int) { }\n}\n",
+        )
+        .edge_before("function app::perfModule", "calls", "method app::Scope::get")
+        .edge_after("function app::perfModule", "calls", "method app::Koin::get")
+}
+
+/// Upstream #2196: the outside-import rule reads the project's packages for
+/// Kotlin too: a Kotlin file appearing in `com.lib` makes an unchanged
+/// Kotlin file's `Tools.make()` under `import com.lib.Tools` a project name,
+/// as on a fresh index.
+pub fn kotlin_import_package_appears_in_the_project() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Kotlin])
+        .file(
+            "src/app/Tools.kt",
+            "package app\n\nobject Tools {\n    fun make() { }\n}\n",
+        )
+        .file(
+            "src/app/Use.kt",
+            "package app\n\nimport com.lib.Tools\n\nclass Use {\n    fun go() {\n        Tools.make()\n    }\n}\n",
+        )
+        .write(
+            "src/com/lib/Other.kt",
+            "package com.lib\n\nclass Other\n",
+        )
+        .edge_after("method app::Use::go", "calls", "method app::Tools::make")
+}
+
+/// Upstream #2232: a Gradle script's bare call reaches a member only of an
+/// owner the project declares no class for, so a class of that name
+/// appearing makes an unchanged script's call to an extension on it stop,
+/// as on a fresh index.
+pub fn kotlin_gradle_script_owner_becomes_a_project_class() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Kotlin])
+        .file(
+            "build-support/src/main/kotlin/SourceSets.kt",
+            "fun NamedThings.createSourceSet(name: String) {\n}\n",
+        )
+        .file(
+            "app/build.gradle.kts",
+            "kotlin {\n    createSourceSet(\"nonJvm\")\n}\n",
+        )
+        .write(
+            "build-support/src/main/kotlin/NamedThings.kt",
+            "class NamedThings\n",
+        )
+        .edge_before(
+            "file:app/build.gradle.kts",
+            "calls",
+            "method NamedThings::createSourceSet",
+        )
+        .no_edge_after(
+            "file:app/build.gradle.kts",
+            "calls",
+            "method NamedThings::createSourceSet",
+        )
+}
+
+/// Upstream #2172: the hierarchy walk takes Android's platform ancestry
+/// between project types, so a project `Context` changing its base moves the
+/// bare call of an unchanged `Screen : MyActivity`, `MyActivity :
+/// AppCompatActivity`, as on a fresh index.
+pub fn kotlin_platform_ancestry_chain_follows_a_project_head_change() -> Case {
+    Case::new(Change::EditHeritage, &[Language::Kotlin])
+        .file(
+            "src/app/Root.kt",
+            "package app\n\nopen class Root {\n    fun assist() { }\n}\n",
+        )
+        .file(
+            "src/app/Other.kt",
+            "package app\n\nopen class Other {\n    fun assist() { }\n}\n",
+        )
+        .file("src/app/Context.kt", "package app\n\nopen class Context : Root()\n")
+        .file(
+            "src/app/MyActivity.kt",
+            "package app\n\nopen class MyActivity : AppCompatActivity()\n",
+        )
+        .file(
+            "src/app/Screen.kt",
+            "package app\n\nclass Screen : MyActivity() {\n    fun go() {\n        assist()\n    }\n}\n",
+        )
+        .write("src/app/Context.kt", "package app\n\nopen class Context : Other()\n")
+        .edge_before("method app::Screen::go", "calls", "method app::Root::assist")
+        .edge_after("method app::Screen::go", "calls", "method app::Other::assist")
+}
+
+/// A Kotlin function body edit moves no head, receiver or lambda type: an
+/// unchanged subclass's bare call stays where it was, as on a fresh index.
+pub fn kotlin_base_body_edit_keeps_a_bare_call() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Kotlin])
+        .file(
+            "src/app/Base.kt",
+            "package app\n\nopen class Base {\n    fun assist() { }\n}\n",
+        )
+        .file(
+            "src/app/Child.kt",
+            "package app\n\nclass Child : Base() {\n    fun go() {\n        assist()\n    }\n}\n",
+        )
+        .write(
+            "src/app/Base.kt",
+            "package app\n\nopen class Base {\n    fun assist() {\n        println(1)\n    }\n}\n",
+        )
+        .edge_throughout("method app::Child::go", "calls", "method app::Base::assist")
+}
+
+/// Upstream #2172 in a batch: the base and the type between it and an
+/// unchanged subclass both change in one sync; the subclass's bare call
+/// reaches what the new middle type names, as on a fresh index.
+pub fn kotlin_batch_rewrites_a_base_and_a_middle_type() -> Case {
+    Case::new(Change::EditHeritage, &[Language::Kotlin])
+        .file(
+            "src/app/Root.kt",
+            "package app\n\nopen class Root {\n    fun assist() { }\n}\n",
+        )
+        .file(
+            "src/app/Other.kt",
+            "package app\n\nopen class Other {\n    fun assist() { }\n}\n",
+        )
+        .file(
+            "src/app/Spare.kt",
+            "package app\n\nopen class Spare {\n    fun assist() { }\n}\n",
+        )
+        .file(
+            "src/app/Base.kt",
+            "package app\n\nopen class Base : Root()\n",
+        )
+        .file("src/app/Mid.kt", "package app\n\nopen class Mid : Base()\n")
+        .file(
+            "src/app/Child.kt",
+            "package app\n\nclass Child : Mid() {\n    fun go() {\n        assist()\n    }\n}\n",
+        )
+        .write(
+            "src/app/Base.kt",
+            "package app\n\nopen class Base : Other()\n",
+        )
+        .write(
+            "src/app/Mid.kt",
+            "package app\n\nopen class Mid : Spare()\n",
+        )
+        .edge_before("method app::Child::go", "calls", "method app::Root::assist")
+        .edge_after(
+            "method app::Child::go",
+            "calls",
+            "method app::Spare::assist",
+        )
+}
+
+/// Upstream #2206 through a typealias: the alias changing the receiver it
+/// names moves the bare call inside an unchanged lambda, as on a fresh index.
+pub fn kotlin_lambda_receiver_changes_through_a_typealias() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Kotlin])
+        .file(
+            "src/app/Scopes.kt",
+            "package app\n\nclass Scope {\n    fun get(): Int = 1\n}\n\nclass Koin {\n    fun get(): Int = 2\n}\n",
+        )
+        .file(
+            "src/app/Definition.kt",
+            "package app\n\ntypealias Definition = Scope.() -> Int\n",
+        )
+        .file(
+            "src/app/Module.kt",
+            "package app\n\nclass Module {\n    fun single(definition: Definition) { }\n}\n",
+        )
+        .file(
+            "src/app/Perfs.kt",
+            "package app\n\nfun perfModule(m: Module) {\n    m.single { get() }\n}\n",
+        )
+        .write(
+            "src/app/Definition.kt",
+            "package app\n\ntypealias Definition = Koin.() -> Int\n",
+        )
+        .edge_before("function app::perfModule", "calls", "method app::Scope::get")
+        .edge_after("function app::perfModule", "calls", "method app::Koin::get")
+}
+
+/// Upstream #2172 and #2232: a Gradle build script's walk starts from
+/// `Project`, so a project class of that name changing its base moves which
+/// outside type's extension an unchanged script's bare call takes, as on a
+/// fresh index.
+pub fn kotlin_gradle_script_follows_a_project_head_change() -> Case {
+    Case::new(Change::EditHeritage, &[Language::Kotlin])
+        .file(
+            "build-logic/src/main/kotlin/Ext.kt",
+            "fun Base.foo() { }\n\nfun Other.foo() { }\n",
+        )
+        .file(
+            "build-logic/src/main/kotlin/Project.kt",
+            "abstract class Project : Base()\n",
+        )
+        .file("app/build.gradle.kts", "foo()\n")
+        .write(
+            "build-logic/src/main/kotlin/Project.kt",
+            "abstract class Project : Other()\n",
+        )
+        .edge_before("file:app/build.gradle.kts", "calls", "method Base::foo")
+        .edge_after("file:app/build.gradle.kts", "calls", "method Other::foo")
+}
+
 /// Upstream #2194: a Java enum constant's body declares methods, so an edit
 /// to that body gains the call it adds, as on a fresh index.
 pub fn java_enum_constant_body_edit() -> Case {

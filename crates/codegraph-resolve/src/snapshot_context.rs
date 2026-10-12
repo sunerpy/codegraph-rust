@@ -186,6 +186,8 @@ struct SnapshotCaches {
     python_write_index: OnceLock<Arc<crate::python_globals::PythonWriteIndex>>,
     /// The C/C++ namespace tables for the run (upstream #2176).
     cpp_namespace_tables: OnceLock<Arc<crate::cpp_namespaces::CppNamespaceTables>>,
+    /// The Kotlin tables for the run (upstream #2172).
+    kotlin_tables: OnceLock<Arc<crate::kotlin_scope::KotlinTables>>,
     #[cfg(test)]
     counters: SnapshotCacheCounters,
 }
@@ -204,6 +206,7 @@ impl SnapshotCaches {
             manifest_scopes: BoundedFileMemo::new(DEFAULT_CACHE_LIMIT),
             python_write_index: OnceLock::new(),
             cpp_namespace_tables: OnceLock::new(),
+            kotlin_tables: OnceLock::new(),
             #[cfg(test)]
             counters: SnapshotCacheCounters::default(),
         }
@@ -685,6 +688,14 @@ impl ResolutionContext for SnapshotResolutionContext {
             self.caches
                 .cpp_namespace_tables
                 .get_or_init(|| Arc::new(crate::cpp_namespaces::CppNamespaceTables::new())),
+        )
+    }
+
+    fn kotlin_tables(&self) -> Arc<crate::kotlin_scope::KotlinTables> {
+        Arc::clone(
+            self.caches
+                .kotlin_tables
+                .get_or_init(|| Arc::new(crate::kotlin_scope::KotlinTables::new())),
         )
     }
 

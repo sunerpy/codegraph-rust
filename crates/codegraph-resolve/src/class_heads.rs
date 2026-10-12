@@ -114,15 +114,36 @@ fn head_names(text: &str) -> Vec<String> {
 /// implements (upstream `classHeadSupertypes`): the head up to its body at
 /// type-argument and parenthesis depth 0, then the `extends` / `implements`
 /// clause or the part after a `:`, without a C# `where` constraint.
-fn class_head_supertypes(class: &Node, context: &dyn ResolutionContext) -> Vec<String> {
+pub(crate) fn class_head_supertypes(class: &Node, context: &dyn ResolutionContext) -> Vec<String> {
+    head_supertypes(&head_lines(class, 9, " ", context))
+}
+
+/// [`class_head_supertypes`] of the declaration starting on `class`'s line of
+/// a file whose facts are `facts` (for the sync's Kotlin surface rows, which
+/// read the same heads).
+pub(crate) fn class_head_supertypes_in(
+    facts: &crate::source_facts::SourceFacts,
+    class: &Node,
+) -> Vec<String> {
+    let start = usize::try_from(class.start_line)
+        .unwrap_or(1)
+        .saturating_sub(1);
+    let end = start.saturating_add(9).min(facts.line_count());
+    if start >= end {
+        return head_supertypes("");
+    }
+    head_supertypes(&facts.join_lines(start, end, " "))
+}
+
+/// The supertypes the joined head lines `joined` name.
+fn head_supertypes(joined: &str) -> Vec<String> {
     static COMMENTS: OnceLock<Regex> = OnceLock::new();
     static KEYWORD_CLAUSE: OnceLock<Regex> = OnceLock::new();
     static COLON_CLAUSE: OnceLock<Regex> = OnceLock::new();
     static WHERE: OnceLock<Regex> = OnceLock::new();
-    let joined = head_lines(class, 9, " ", context);
     let joined = COMMENTS
         .get_or_init(|| Regex::new(r"//[^\n]*|/\*.*?\*/").expect("head comments"))
-        .replace_all(&joined, " ");
+        .replace_all(joined, " ");
     let mut depth = 0usize;
     let mut head = String::new();
     for ch in joined.chars() {

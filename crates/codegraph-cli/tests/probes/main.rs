@@ -7354,3 +7354,427 @@ mod java {
         );
     }
 }
+
+mod kotlin {
+    use super::support::{Graph, Project};
+
+    /// `target qualified-name` of every `calls` edge out of `file`'s nodes,
+    /// sorted.
+    fn calls_from(graph: &Graph, file: &str) -> Vec<String> {
+        let mut out: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.kind == "calls")
+            .filter(|edge| {
+                graph
+                    .node(&edge.source)
+                    .is_some_and(|node| node.file_path == file)
+            })
+            .filter_map(|edge| graph.node(&edge.target))
+            .map(|node| node.qualified_name.clone())
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// The files the `calls` edges out of `file` named `name` land in.
+    fn call_targets_named(graph: &Graph, file: &str, name: &str) -> Vec<String> {
+        let mut out: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.kind == "calls")
+            .filter(|edge| {
+                graph
+                    .node(&edge.source)
+                    .is_some_and(|node| node.file_path == file)
+            })
+            .filter_map(|edge| graph.node(&edge.target))
+            .filter(|node| node.name == name)
+            .map(|node| node.file_path.clone())
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// Upstream #2146 (`75976f99`): a top-level Kotlin function, an extension
+    /// function included, is visible from its own package and from a file
+    /// that imports it by name or imports its package with `*`; a file
+    /// importing kotlin.test's `assertEquals` reaches neither project helper
+    /// (Exposed's 3,075 calls). A function type with a qualified receiver
+    /// keeps the class around it: tree-sitter-kotlin-ng parses it, so
+    /// upstream's pre-parse is not needed (N/A).
+    #[test]
+    fn pr2146_kotlin_top_level_functions_are_visible_where_imported() {
+        let project = Project::new()
+            .file(
+                "jdbc/src/main/kotlin/app/jdbc/tests/Assert.kt",
+                "package app.jdbc.tests\n\nclass JdbcTransaction\n\nfun withTables(statement: JdbcTransaction.() -> Unit) {}\n\nfun <T> JdbcTransaction.assertEquals(exp: T, act: T) {}\n",
+            )
+            .file(
+                "r2dbc/src/main/kotlin/app/r2dbc/tests/Assert.kt",
+                "package app.r2dbc.tests\n\nclass R2dbcTransaction\n\nfun withTables(statement: R2dbcTransaction.() -> Unit) {}\n\nfun <T> R2dbcTransaction.assertEquals(exp: T, act: T) {}\n",
+            )
+            .file(
+                "jdbc/src/test/kotlin/app/jdbc/JdbcTest.kt",
+                "package app.jdbc\n\nimport app.jdbc.tests.assertEquals\nimport app.jdbc.tests.withTables\n\nclass JdbcTest {\n  fun works() {\n    withTables { assertEquals(1, 1) }\n  }\n}\n",
+            )
+            .file(
+                "r2dbc/src/test/kotlin/app/r2dbc/R2dbcTest.kt",
+                "package app.r2dbc\n\nimport app.r2dbc.tests.*\n\nclass R2dbcTest {\n  fun works() {\n    withTables { assertEquals(1, 1) }\n  }\n}\n",
+            )
+            .file(
+                "core/src/test/kotlin/app/core/PlainTest.kt",
+                "package app.core\n\nimport kotlin.test.assertEquals\n\nclass PlainTest {\n  fun works() {\n    assertEquals(1, 1)\n  }\n}\n",
+            )
+            .file(
+                "jdbc/src/main/kotlin/app/jdbc/tests/Local.kt",
+                "package app.jdbc.tests\n\nfun check() {\n  withTables { assertEquals(1, 1) }\n}\n",
+            )
+            .file(
+                "jdbc/src/main/kotlin/app/jdbc/tests/DatabaseTestsBase.kt",
+                "package app.jdbc.tests\n\nclass DatabaseConfig {\n  class Builder\n}\n\n@MethodSource(\"data\")\nabstract class DatabaseTestsBase {\n  fun withTables(configure: (DatabaseConfig.Builder.() -> Unit)? = null, statement: () -> Unit) {\n    statement()\n  }\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        assert_eq!(
+            call_targets_named(
+                graph,
+                "jdbc/src/test/kotlin/app/jdbc/JdbcTest.kt",
+                "assertEquals"
+            ),
+            ["jdbc/src/main/kotlin/app/jdbc/tests/Assert.kt"],
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            call_targets_named(
+                graph,
+                "r2dbc/src/test/kotlin/app/r2dbc/R2dbcTest.kt",
+                "assertEquals"
+            ),
+            ["r2dbc/src/main/kotlin/app/r2dbc/tests/Assert.kt"],
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            call_targets_named(
+                graph,
+                "core/src/test/kotlin/app/core/PlainTest.kt",
+                "assertEquals"
+            ),
+            Vec::<String>::new(),
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            call_targets_named(
+                graph,
+                "jdbc/src/main/kotlin/app/jdbc/tests/Local.kt",
+                "assertEquals"
+            ),
+            ["jdbc/src/main/kotlin/app/jdbc/tests/Assert.kt"],
+            "{}",
+            graph.report()
+        );
+        let with_tables: Vec<_> = graph
+            .nodes
+            .iter()
+            .filter(|node| {
+                node.file_path == "jdbc/src/main/kotlin/app/jdbc/tests/DatabaseTestsBase.kt"
+                    && node.name == "withTables"
+            })
+            .map(|node| (node.kind.as_str(), node.qualified_name.as_str()))
+            .collect();
+        assert_eq!(
+            with_tables,
+            [("method", "app.jdbc.tests::DatabaseTestsBase::withTables")],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream #2196 (`da1312e8`): Kotlin imports (no `;`, an optional
+    /// `as`) are read, an outside import owns its name, a member the file
+    /// declares itself comes first, and a renaming import binds its alias by
+    /// the imported FQN.
+    #[test]
+    fn pr2196_kotlin_imports_outside_names_and_aliases() {
+        let project = Project::new()
+            .file(
+                "src/test/java/app/functional/TypesTest.java",
+                "package app.functional;\n\npublic class TypesTest {\n  static class Field {\n    String name;\n  }\n\n  static void assertEquals(Object a, Object b) { }\n}\n",
+            )
+            .file(
+                "src/main/java/app/model/Outer.java",
+                "package app.model;\n\npublic class Outer {\n  public static class Inner {\n    public static Inner create() { return new Inner(); }\n  }\n}\n",
+            )
+            .file(
+                "src/main/kotlin/app/Dates.kt",
+                "package app\n\nimport java.lang.reflect.Field\nimport kotlinx.datetime.toLocalDateTime\nimport app.model.Outer.Inner as Made\n\nclass Dates {\n    private fun toLocalDateTime(value: Long): Long = value\n\n    fun parse(value: Long, field: Field): Long {\n        field.getName()\n        Made.create()\n        return toLocalDateTime(value)\n    }\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        let out: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.kind != "contains" && edge.kind != "imports")
+            .filter(|edge| {
+                graph
+                    .node(&edge.source)
+                    .is_some_and(|node| node.file_path == "src/main/kotlin/app/Dates.kt")
+            })
+            .filter_map(|edge| {
+                graph
+                    .node(&edge.target)
+                    .map(|target| format!("{} {}", edge.kind, target.qualified_name))
+            })
+            .collect();
+        assert!(
+            !out.contains(&"references app.functional::TypesTest::Field".to_string()),
+            "{}",
+            graph.report()
+        );
+        assert!(
+            out.contains(&"calls app::Dates::toLocalDateTime".to_string()),
+            "{}",
+            graph.report()
+        );
+        assert!(
+            out.contains(&"calls app.model::Outer::Inner::create".to_string()),
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream #2172 (`2e2b98c9`): a bare Kotlin call reaches a member of a
+    /// type around it (an anonymous `object : Table()` included), of a type
+    /// the project's function types take as a lambda receiver, or of an
+    /// object member the file imports; never another class's member by name
+    /// (koin's `error("…")` went to a Logger's `error`). `require(n >= 0) {
+    /// … }` is Kotlin's precondition, not a member `require`.
+    #[test]
+    fn pr2172_bare_kotlin_calls_reach_only_members_in_reach() {
+        let project = Project::new()
+            .file(
+                "src/main/kotlin/app/dsl/Module.kt",
+                "package app.dsl\n\nclass Scope {\n    fun get(): Any = 1\n}\n\nclass Koin {\n    fun get(): Any = 2\n}\n\nclass Module {\n    fun single(definition: Scope.() -> Any) { }\n}\n\nfun module(declaration: Module.() -> Unit): Module = Module().apply(declaration)\n",
+            )
+            .file(
+                "src/main/kotlin/app/log/Logger.kt",
+                "package app.log\n\nclass Logger {\n    fun error(message: String) { }\n}\n",
+            )
+            .file(
+                "src/main/kotlin/app/db/Table.kt",
+                "package app.db\n\nabstract class Table {\n    fun integer(name: String): Int = 0\n}\n",
+            )
+            .file(
+                "src/main/kotlin/app/io/Source.kt",
+                "package app.io\n\ninterface Source {\n    fun require(byteCount: Long)\n}\n\nclass RealSource : Source {\n    override fun require(byteCount: Long) { }\n\n    fun read(byteCount: Long) {\n        require(byteCount >= 0L) { \"byteCount < 0: $byteCount\" }\n        require(byteCount)\n    }\n}\n",
+            )
+            .file(
+                "src/test/kotlin/app/TestUtil.kt",
+                "package app\n\nobject TestUtil {\n    fun deepCopy(value: Int): Int = value\n}\n",
+            )
+            .file(
+                "src/test/kotlin/app/AppTest.kt",
+                "package app\n\nimport app.TestUtil.deepCopy\nimport app.db.Table\nimport app.dsl.module\n\nclass AppTest {\n    fun wires() {\n        val m = module {\n            single { get() }\n        }\n        val table = object : Table() {\n            val id = integer(\"id\")\n        }\n        val copy = deepCopy(1)\n        if (copy < 0) error(\"negative\")\n    }\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        let calls = calls_from(graph, "src/test/kotlin/app/AppTest.kt");
+        for wanted in [
+            "app.dsl::Module::single",
+            "app.dsl::Scope::get",
+            "app.db::Table::integer",
+            "app::TestUtil::deepCopy",
+        ] {
+            assert!(
+                calls.contains(&wanted.to_string()),
+                "missing {wanted}: {calls:?}\n{}",
+                graph.report()
+            );
+        }
+        for unwanted in ["app.dsl::Koin::get", "app.log::Logger::error"] {
+            assert!(
+                !calls.contains(&unwanted.to_string()),
+                "unexpected {unwanted}: {calls:?}\n{}",
+                graph.report()
+            );
+        }
+        let read: Vec<&str> = graph
+            .nodes
+            .iter()
+            .filter(|node| {
+                node.file_path == "src/main/kotlin/app/io/Source.kt" && node.name == "read"
+            })
+            .map(|node| node.id.as_str())
+            .collect();
+        let mut lines: Vec<i64> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.kind == "calls" && read.contains(&edge.source.as_str()))
+            .filter_map(|edge| edge.line)
+            .collect();
+        lines.sort();
+        assert_eq!(lines, [12], "{}", graph.report());
+    }
+
+    /// Upstream #2168 (`b7b2a44c`): a primary constructor on the line after
+    /// its class name keeps the class (tree-sitter-kotlin-ng parses it, so
+    /// the pre-parse is N/A), and a standard-library name on an untyped chain
+    /// link needs a receiver named after the owner: `.apply { }` never goes to
+    /// `ConnectionSpec.apply`.
+    #[test]
+    fn pr2168_split_constructors_keep_their_class_and_std_chain_names_stay_std() {
+        let project = Project::new()
+            .file(
+                "src/commonMain/kotlin/okio/ByteString.kt",
+                "package okio\n\nexpect open class ByteString\n// Trusted internal constructor doesn't clone data.\ninternal constructor(data: ByteArray) : Comparable<ByteString> {\n  fun hex(): String\n  fun toByteArray(): ByteArray\n}\n",
+            )
+            .file(
+                "src/main/kotlin/app/ConnectionSpec.kt",
+                "package app\n\nclass ConnectionSpec {\n  fun apply(sslSocket: Any, isFallback: Boolean) {}\n}\n",
+            )
+            .file(
+                "src/main/kotlin/app/Builder.kt",
+                "package app\n\nclass Builder {\n  var name = \"\"\n  fun build(): String = StringBuilder().apply { append(name) }.toString()\n}\n",
+            )
+            .file(
+                "src/main/kotlin/app/Chains.kt",
+                "package app\n\nclass Chains {\n  fun names(items: List<String>): List<String> =\n    items.filter { it.isNotEmpty() }.map { it.trim() }\n}\n",
+            )
+            .file(
+                "src/main/kotlin/app/Mapper.kt",
+                "package app\n\nclass Mapper {\n  fun map(value: String): String = value\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        assert!(
+            graph
+                .nodes
+                .iter()
+                .any(|node| node.name == "hex" && node.qualified_name == "okio::ByteString::hex"),
+            "{}",
+            graph.report()
+        );
+        assert!(
+            !calls_from(graph, "src/main/kotlin/app/Builder.kt")
+                .iter()
+                .any(|target| target.ends_with("ConnectionSpec::apply")),
+            "{}",
+            graph.report()
+        );
+        assert!(
+            !calls_from(graph, "src/main/kotlin/app/Chains.kt")
+                .contains(&"app::Mapper::map".to_string()),
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream #2206 (`fc73204f`): a lambda runs on the receiver its
+    /// function's parameter type names, directly or through a typealias, and
+    /// the members the code around a bare call reaches come before those
+    /// only another lambda type in the project could: koin's `single {
+    /// C51(get(), get()) }` and `Scope.new(…)`'s `get()` are Scope's.
+    #[test]
+    fn pr2206_a_kotlin_lambda_runs_on_its_own_receiver() {
+        let project = Project::new()
+            .file(
+                "src/main/kotlin/org/koin/core/Koin.kt",
+                "package org.koin.core\n\nclass Koin {\n    fun <T> get(): T = TODO()\n}\n\nfun koinTest(block: Koin.() -> Unit) { }\n",
+            )
+            .file(
+                "src/main/kotlin/org/koin/core/scope/Scope.kt",
+                "package org.koin.core.scope\n\nclass Scope {\n    fun <T> get(): T = TODO()\n}\n",
+            )
+            .file(
+                "src/main/kotlin/org/koin/core/definition/Definition.kt",
+                "package org.koin.core.definition\n\nimport org.koin.core.scope.Scope\n\ntypealias Definition<T> = Scope.(Int) -> T\n",
+            )
+            .file(
+                "src/main/kotlin/org/koin/core/module/Module.kt",
+                "package org.koin.core.module\n\nimport org.koin.core.definition.Definition\n\nclass Module {\n    fun <T> single(definition: Definition<T>) { }\n}\n",
+            )
+            .file(
+                "src/main/kotlin/org/koin/dsl/New.kt",
+                "package org.koin.dsl\n\nimport org.koin.core.scope.Scope\n\ninline fun <reified R, reified T1, reified T2> Scope.new(\n    constructor: (T1, T2) -> R,\n): R = constructor(get(), get())\n",
+            )
+            .file(
+                "src/test/kotlin/app/Perfs.kt",
+                "package app\n\nimport org.koin.core.module.Module\n\nclass C51(a: Int, b: Int)\n\nfun perfModule(m: Module) {\n    m.single { C51(get(), get()) }\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        let gets = |file: &str| {
+            let mut out: Vec<String> = calls_from(graph, file)
+                .into_iter()
+                .filter(|target| target.ends_with("::get"))
+                .collect();
+            out.dedup();
+            out
+        };
+        assert_eq!(
+            gets("src/test/kotlin/app/Perfs.kt"),
+            ["org.koin.core.scope::Scope::get"],
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            gets("src/main/kotlin/org/koin/dsl/New.kt"),
+            ["org.koin.core.scope::Scope::get"],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream #2232 (`27da2563`): a Gradle script's bare calls run on the
+    /// build tool's own types, never on a class the project declares
+    /// (nowinandroid's `Graph.plugins()`); build logic's extension functions
+    /// on Gradle's types stay.
+    #[test]
+    fn pr2232_a_gradle_script_bare_call_is_never_a_project_class_member() {
+        let project = Project::new()
+            .file(
+                "build-logic/src/main/kotlin/com/example/Graph.kt",
+                "package com.example\n\nclass Graph {\n    fun plugins(): List<String> = emptyList()\n    fun dependencies(): List<String> = emptyList()\n}\n",
+            )
+            .file(
+                "build-support/src/main/kotlin/SourceSets.kt",
+                "import org.gradle.api.NamedDomainObjectContainer\n\nfun NamedDomainObjectContainer<String>.createSourceSet(name: String) {\n}\n",
+            )
+            .file(
+                "app/build.gradle.kts",
+                "plugins {\n    id(\"com.android.application\")\n}\n\ndependencies {\n    implementation(libs.core)\n}\n\nkotlin {\n    sourceSets {\n        createSourceSet(\"nonJvm\")\n    }\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        let names: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.kind == "calls")
+            .filter(|edge| {
+                graph
+                    .node(&edge.source)
+                    .is_some_and(|node| node.file_path == "app/build.gradle.kts")
+            })
+            .filter_map(|edge| graph.node(&edge.target))
+            .map(|node| node.name.clone())
+            .collect();
+        assert!(
+            !names.contains(&"plugins".to_string()),
+            "{}",
+            graph.report()
+        );
+        assert!(
+            !names.contains(&"dependencies".to_string()),
+            "{}",
+            graph.report()
+        );
+        assert!(
+            names.contains(&"createSourceSet".to_string()),
+            "{}",
+            graph.report()
+        );
+    }
+}

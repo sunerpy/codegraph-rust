@@ -62,6 +62,8 @@ struct Caches {
     python_write_index: Option<Arc<crate::python_globals::PythonWriteIndex>>,
     /// The C/C++ namespace tables for the pass (upstream #2176).
     cpp_namespace_tables: Option<Arc<crate::cpp_namespaces::CppNamespaceTables>>,
+    /// The Kotlin tables for the pass (upstream #2172).
+    kotlin_tables: Option<Arc<crate::kotlin_scope::KotlinTables>>,
 }
 
 /// Bound on memoized existence answers; the memo restarts past it, as upstream.
@@ -91,6 +93,7 @@ impl Caches {
             file_exists: HashMap::new(),
             python_write_index: None,
             cpp_namespace_tables: None,
+            kotlin_tables: None,
         }
     }
 }
@@ -131,6 +134,7 @@ impl<'a> StoreResolutionContext<'a> {
         c.file_exists.clear();
         c.python_write_index = None;
         c.cpp_namespace_tables = None;
+        c.kotlin_tables = None;
     }
 
     fn cached_all_files(&self) -> Arc<Vec<String>> {
@@ -465,6 +469,15 @@ impl ResolutionContext for StoreResolutionContext<'_> {
                 .borrow_mut()
                 .cpp_namespace_tables
                 .get_or_insert_with(|| Arc::new(crate::cpp_namespaces::CppNamespaceTables::new())),
+        )
+    }
+
+    fn kotlin_tables(&self) -> Arc<crate::kotlin_scope::KotlinTables> {
+        Arc::clone(
+            self.caches
+                .borrow_mut()
+                .kotlin_tables
+                .get_or_insert_with(|| Arc::new(crate::kotlin_scope::KotlinTables::new())),
         )
     }
 
