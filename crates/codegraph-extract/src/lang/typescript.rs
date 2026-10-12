@@ -177,7 +177,7 @@ impl LanguageSpec for TypeScriptSpec {
             }
             current = parent.parent();
         }
-        false
+        is_ambient_export(node)
     }
 
     fn is_async(&self, node: Node<'_>) -> bool {
@@ -204,6 +204,57 @@ impl LanguageSpec for TypeScriptSpec {
             handled_refs: false,
         })
     }
+}
+
+/// Whether `node` is declared in a `declare module 'x' { … }` or `declare
+/// global { … }` body, which exports it without an `export` keyword (upstream
+/// #2418 `isAmbientExport`).
+///
+/// This is TypeScript's own rule: the binder makes an ambient module body an
+/// export context unless the body holds an export declaration (`export {…}`,
+/// `export * from`, `export =`, `export default x`), and a namespace nested in
+/// one is ambient too. What such a body declares belongs to that module or to
+/// the global scope, not to this file (`interface Window`, chart.js's
+/// `PluginOptionsByType`): other files reach it through them, and so does the
+/// library whose type it extends. `declare namespace X` is not one: in a
+/// module file, X belongs to that file.
+pub(crate) fn is_ambient_export(node: Node<'_>) -> bool {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if parent.kind() == "statement_block" && has_export_declaration(parent) {
+            return false;
+        }
+        if parent.kind() == "ambient_declaration" {
+            // `declare global` is the keyword and a bare block, with no field
+            // names.
+            if (0..parent.child_count()).any(|i| {
+                parent
+                    .child(i)
+                    .is_some_and(|child| child.kind() == "global")
+            }) {
+                return true;
+            }
+            if parent.named_child(0).is_some_and(|declared| {
+                declared.kind() == "module"
+                    && child_by_field(declared, "name").is_some_and(|name| name.kind() == "string")
+            }) {
+                return true;
+            }
+        }
+        current = parent.parent();
+    }
+    false
+}
+
+/// A statement in `block` that exports by name or by assignment, not by
+/// declaring.
+fn has_export_declaration(block: Node<'_>) -> bool {
+    (0..block.named_child_count()).any(|i| {
+        block.named_child(i as u32).is_some_and(|statement| {
+            statement.kind() == "export_statement"
+                && child_by_field(statement, "declaration").is_none()
+        })
+    })
 }
 
 /// JavaScript's `\s` as a regex class: whitespace and line terminators,
@@ -312,6 +363,8 @@ pub(crate) fn class_field_is_callable(node: Node<'_>, field_kind: &str) -> bool 
 
 #[cfg(test)]
 mod tests {
+    use codegraph_core::types::{Language, NodeKind};
+
     use super::blank_flow_syntax;
 
     fn blank(code: &str) -> String {
@@ -384,5 +437,104 @@ mod tests {
         }
         let plain = "type A = {| a: ?T |};";
         assert_eq!(blank_flow_syntax(plain, "a.js"), plain);
+    }
+
+    /// Upstream #2418's module file: augmentations, a global block, and the
+    /// namespaces that are neither (`__tests__/ts-ambient-exports.test.ts`).
+    const MODULE_SOURCE: &str = "import type { ChartType } from 'chart.js';\n\ndeclare module 'chart.js' {\n  interface PluginOptionsByType<TType extends ChartType> {\n    verticalHoverLine: TType;\n  }\n  export interface WrittenOut {}\n  namespace Plugins {\n    interface Nested {}\n  }\n  type Alias = string;\n  enum Position { Top }\n  class Positioner {}\n  const defaults: Alias;\n}\n\ndeclare global {\n  interface Window {\n    __conduit_debug__?: unknown;\n  }\n  namespace NodeJS {\n    interface ProcessEnv {\n      API_URL?: string;\n    }\n  }\n  var bitwardenContainerService: unknown;\n}\n\ndeclare namespace Settings {\n  interface OwnNamespace {}\n}\n\nnamespace Plain {\n  interface Hidden {}\n  export interface Shown {}\n}\n\ninterface FileLocal {}\n\nexport const appConfig = {};\n";
+
+    /// A script declaring modules whole, as an untyped library's typings do.
+    const SCRIPT_SOURCE: &str = "declare module 'legacy-lib' {\n  interface Options {}\n  const main: (options: Options) => void;\n  export = main;\n}\n\ndeclare module 'listed-lib' {\n  interface Unlisted {}\n  export interface Listed {}\n  export { Unlisted as Renamed };\n}\n\ndeclare module 'open-lib' {\n  interface Open {}\n}\n";
+
+    /// `name exported` for every declaration a statement declares, sorted.
+    fn export_flags(path: &str, source: &str, language: Language) -> Vec<(String, bool)> {
+        let result = crate::extract_source(path, source, Some(language));
+        let mut flags: Vec<(String, bool)> = result
+            .nodes
+            .iter()
+            .filter(|node| {
+                matches!(
+                    node.kind,
+                    NodeKind::Interface
+                        | NodeKind::Class
+                        | NodeKind::Enum
+                        | NodeKind::TypeAlias
+                        | NodeKind::Function
+                        | NodeKind::Variable
+                        | NodeKind::Constant
+                        | NodeKind::Component
+                )
+            })
+            .map(|node| (node.name.clone(), node.is_exported))
+            .collect();
+        flags.sort();
+        flags
+    }
+
+    fn flags(pairs: &[(&str, bool)]) -> Vec<(String, bool)> {
+        let mut out: Vec<(String, bool)> = pairs
+            .iter()
+            .map(|(name, exported)| (name.to_string(), *exported))
+            .collect();
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn declare_module_and_declare_global_bodies_export_their_declarations() {
+        for crlf in [false, true] {
+            let eol = |source: &str| {
+                if crlf {
+                    source.replace('\n', "\r\n")
+                } else {
+                    source.to_string()
+                }
+            };
+            assert_eq!(
+                export_flags(
+                    "src/chart.registry.ts",
+                    &eol(MODULE_SOURCE),
+                    Language::TypeScript
+                ),
+                flags(&[
+                    ("PluginOptionsByType", true),
+                    ("WrittenOut", true),
+                    ("Nested", true),
+                    ("Alias", true),
+                    ("Position", true),
+                    ("Positioner", true),
+                    ("defaults", true),
+                    ("Window", true),
+                    ("ProcessEnv", true),
+                    ("bitwardenContainerService", true),
+                    ("OwnNamespace", false),
+                    ("Hidden", false),
+                    ("Shown", true),
+                    ("FileLocal", false),
+                    ("appConfig", true),
+                ]),
+                "crlf {crlf}"
+            );
+            // A body with an export declaration exports only what it names.
+            assert_eq!(
+                export_flags("types/legacy.ts", &eol(SCRIPT_SOURCE), Language::TypeScript),
+                flags(&[
+                    ("Options", false),
+                    ("main", false),
+                    ("Unlisted", false),
+                    ("Listed", true),
+                    ("Open", true),
+                ]),
+                "crlf {crlf}"
+            );
+            let tsx = eol(
+                "declare module '@tanstack/react-router' {\n  interface Register {\n    router: unknown;\n  }\n}\nexport const App = () => <main />;\n",
+            );
+            assert!(
+                export_flags("src/main.tsx", &tsx, Language::Tsx)
+                    .contains(&("Register".to_string(), true)),
+                "crlf {crlf}"
+            );
+        }
     }
 }

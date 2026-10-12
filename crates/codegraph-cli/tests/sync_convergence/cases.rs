@@ -962,6 +962,26 @@ pub fn tsx_tag_becomes_a_parameter_body_edit() -> Case {
         .no_edge_after("function Widgets", "references", "function Widget @src/Widget.tsx")
 }
 
+/// Upstream #2418: an interface moved into a `declare module 'x'` body is
+/// exported, so another file's type reference reaches it by name, as a fresh
+/// index of the edit finds.
+pub fn typescript_interface_moves_into_a_declare_module_body() -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript])
+        .file(
+            "src/chart.registry.ts",
+            "export {};\ninterface PluginOptions {\n  color?: string;\n}\n",
+        )
+        .file(
+            "src/use.ts",
+            "export function pick(options: PluginOptions) {\n  return options;\n}\n",
+        )
+        .write(
+            "src/chart.registry.ts",
+            "export {};\ndeclare module 'chart.js' {\n  interface PluginOptions {\n    color?: string;\n  }\n}\n",
+        )
+        .edge_after("function pick", "references", "interface PluginOptions")
+}
+
 /// Upstream #2263: a CommonJS `require('./application')` imports that file once
 /// it appears, though the binding is only ever used as a value.
 pub fn javascript_require_imports_an_added_module() -> Case {
