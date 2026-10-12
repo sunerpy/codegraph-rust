@@ -2051,6 +2051,9 @@ pub fn match_by_exact_name(
     // A Python call's shape at its column decides what it can mean (upstream
     // #2125): a bare call no method, a chained one a member of its last link.
     let python_shape = crate::python_values::python_call_shape(reference, context);
+    // An Objective-C name in C call syntax calls a function, a block or a
+    // function pointer, never a method or property (upstream #2150).
+    let objc_c_call = objc_call_shape(reference, context) == Some(ObjcCallShape::CCall);
     let candidates: Vec<Arc<Node>> = reachable
         .iter()
         .filter(|n| {
@@ -2058,6 +2061,7 @@ pub fn match_by_exact_name(
                 crate::python_values::fits_python_call_shape(n, shape, reference, context)
             })
         })
+        .filter(|n| !(objc_c_call && is_objc_member_kind(n.kind)))
         .filter(|n| node_is_eligible_target(reference.reference_kind, n))
         // A Scala type position (`Arbitrary[B]`) never names a method: an
         // `implicit def A: Order[A]` shares its name with half of cats' type
@@ -5279,10 +5283,13 @@ pub fn match_fuzzy(reference: &RefView, context: &dyn ResolutionContext) -> Opti
     let callable_kinds = [NodeKind::Function, NodeKind::Method, NodeKind::Class];
     let case_insensitive = is_case_insensitive_language(reference.language);
     let python_shape = crate::python_values::python_call_shape(reference, context);
+    let objc_c_call = objc_call_shape(reference, context) == Some(ObjcCallShape::CCall);
     let callable_candidates = apply_language_gate(
         candidates
             .into_iter()
             .filter(|n| callable_kinds.contains(&n.kind))
+            // C call syntax in Objective-C is no message (upstream #2150).
+            .filter(|n| !(objc_c_call && is_objc_member_kind(n.kind)))
             .filter(|n| {
                 python_shape.as_ref().is_none_or(|shape| {
                     crate::python_values::fits_python_call_shape(n, shape, reference, context)
@@ -5997,6 +6004,104 @@ fn js_local_patterns(name: &str) -> Option<Arc<JsLocalPatterns>> {
         order.push_back(name.to_string());
     }
     patterns
+}
+
+/// C has no methods, and C code cannot call a C++ one (upstream #2234, in
+/// `matchReference`): hiredis' function pointer `c->funcs->read(c, buf, …)`
+/// and redis' POSIX `read(fd, buf, n)` are no Qt adapter's `read`.
+pub fn veto_c_method_target(
+    result: Option<ResolvedRef>,
+    reference: &RefView,
+    context: &dyn ResolutionContext,
+) -> Option<ResolvedRef> {
+    let result = result?;
+    if reference.language == Language::C
+        && reference.reference_kind == EdgeKind::Calls
+        && context
+            .get_node_by_id_shared(&result.target_node_id)
+            .is_some_and(|target| target.kind == NodeKind::Method)
+    {
+        return None;
+    }
+    Some(result)
+}
+
+/// How a bare Objective-C name is written at its site (upstream #2150
+/// `objcCallShape`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ObjcCallShape {
+    /// C call syntax (`completionBlock()`): a function, a block or a function
+    /// pointer, never a method or property.
+    CCall,
+    /// A message to `self` or `[self class]`, whose receiver the extractor
+    /// drops.
+    SelfSend,
+    /// A message to `super`.
+    SuperSend,
+}
+
+/// The shape of the Objective-C call `reference` (a bare name or selector) on
+/// its line, `None` when the line shows neither.
+fn objc_call_shape(reference: &RefView, context: &dyn ResolutionContext) -> Option<ObjcCallShape> {
+    static SELECTOR: OnceLock<Regex> = OnceLock::new();
+    static MESSAGE: OnceLock<Regex> = OnceLock::new();
+    static SUPER: OnceLock<Regex> = OnceLock::new();
+    static SELF: OnceLock<Regex> = OnceLock::new();
+    if reference.language != Language::ObjC
+        || reference.reference_kind != EdgeKind::Calls
+        || !SELECTOR
+            .get_or_init(|| {
+                Regex::new(r"^[A-Za-z_][0-9A-Za-z_]*:*(?:[0-9A-Za-z_]+:)*$").expect("selector")
+            })
+            .is_match(&reference.reference_name)
+    {
+        return None;
+    }
+    let facts = context.source_facts(&reference.file_path)?;
+    let index = usize::try_from(reference.line - 1)
+        .ok()
+        .filter(|&index| index < facts.line_count())?;
+    let line = facts.line(index);
+    let name = reference.reference_name.split(':').next()?;
+    if name.is_empty() {
+        return None;
+    }
+    let word = Regex::new(&format!(r"\b{}\b", regex_escape(name))).ok()?;
+    let message = MESSAGE.get_or_init(|| Regex::new(r"\[\s*[\w.]+\s+$").expect("message"));
+    let to_super = SUPER.get_or_init(|| Regex::new(r"\[\s*super\s+$").expect("super"));
+    let to_self =
+        SELF.get_or_init(|| Regex::new(r"\[\s*(?:self|\[\s*self\s+class\s*\])\s+$").expect("self"));
+    let mut shape = None;
+    for found in word.find_iter(line) {
+        // Not a member written after `.` (`object.name`), nor the tail of a
+        // longer word.
+        if line[..found.start()]
+            .chars()
+            .next_back()
+            .is_some_and(|c| c == '.' || c == '_' || c.is_alphanumeric())
+        {
+            continue;
+        }
+        let before = &line[..found.start()];
+        let after = &line[found.end()..];
+        if after.trim_start().starts_with('(') && !message.is_match(before) {
+            shape.get_or_insert(ObjcCallShape::CCall);
+        } else if to_super.is_match(before) {
+            return Some(ObjcCallShape::SuperSend);
+        } else if to_self.is_match(before) {
+            return Some(ObjcCallShape::SelfSend);
+        }
+    }
+    shape
+}
+
+/// A member of an Objective-C class, which C call syntax never names
+/// (upstream #2150 `OBJC_MEMBER_KINDS`).
+fn is_objc_member_kind(kind: NodeKind) -> bool {
+    matches!(
+        kind,
+        NodeKind::Method | NodeKind::Property | NodeKind::Field
+    )
 }
 
 /// The name matcher's self vetoes (upstream `matchReference`): a result that

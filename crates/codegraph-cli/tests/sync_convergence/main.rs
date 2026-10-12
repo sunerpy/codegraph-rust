@@ -706,6 +706,8 @@ matrix! {
     cpp_macro_closer_moves_a_declaration_out_of_the_namespace,
     cpp_free_operator_moves_out_of_the_macro_namespace,
     cpp_opener_definition_stops_opening_a_namespace,
+    c_call_ignores_an_added_cpp_method,
+    objc_c_call_ignores_an_added_method,
     java_subclass_gains_a_base_its_caller_reaches,
     typescript_dollar_import_reaches_an_added_module,
     typescript_dollar_default_export_names_another_declaration,

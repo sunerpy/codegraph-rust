@@ -2260,9 +2260,13 @@ impl ReferenceResolver {
         // function-local shadow (#2226).
         // A call reaches the overload its arguments fit (upstream #2212,
         // #2213, #2238, #2241), before the test-suite rule judges the target.
-        let name_result = crate::name_matcher::veto_js_local_shadow(
-            crate::name_matcher::veto_self_target(
-                self.gate_language(match_reference(reference, context), reference, context),
+        let name_result = crate::name_matcher::veto_c_method_target(
+            crate::name_matcher::veto_js_local_shadow(
+                crate::name_matcher::veto_self_target(
+                    self.gate_language(match_reference(reference, context), reference, context),
+                    reference,
+                    context,
+                ),
                 reference,
                 context,
             ),

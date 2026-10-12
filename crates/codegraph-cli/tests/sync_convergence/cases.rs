@@ -2473,6 +2473,45 @@ pub fn cpp_opener_definition_stops_opening_a_namespace() -> Case {
         .edge_after("function run", "calls", "function pipe")
 }
 
+/// Upstream #2234 (W4-CPP-08): a C++ header adding a method named like a C
+/// file's call never gives that call a method: C has no methods.
+pub fn c_call_ignores_an_added_cpp_method() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::C, Language::Cpp])
+        .file(
+            "src/util.c",
+            "#include <unistd.h>\n\nlong slurp(int fd, char *buf, long n) {\n    return read(fd, buf, n);\n}\n",
+        )
+        .write(
+            "deps/hiredis/adapters/qt.hpp",
+            "class RedisQtAdapter {\npublic:\n    void read() { }\n};\n",
+        )
+        .no_edge_after("function slurp", "calls", "method RedisQtAdapter::read")
+}
+
+/// Upstream #2150's C-call half (W4-CPP-08): an Objective-C class adding a
+/// method named like a block a method calls in C call syntax never takes
+/// that call.
+pub fn objc_c_call_ignores_an_added_method() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::ObjC])
+        .file(
+            "Core/SDCache.h",
+            "#import <Foundation/Foundation.h>\n@interface SDCache : NSObject\n- (void)storeWithCompletion:(void (^)(void))completionBlock image:(id)image;\n@end\n",
+        )
+        .file(
+            "Core/SDCache.m",
+            "#import \"SDCache.h\"\n@implementation SDCache\n- (void)storeWithCompletion:(void (^)(void))completionBlock image:(id)image {\n    completionBlock();\n}\n@end\n",
+        )
+        .write(
+            "Core/SDOperation.m",
+            "#import <Foundation/Foundation.h>\n@interface SDOperation : NSObject\n- (void)completionBlock;\n@end\n@implementation SDOperation\n- (void)completionBlock {\n}\n@end\n",
+        )
+        .no_edge_after(
+            "method SDCache::storeWithCompletion:image:",
+            "calls",
+            "method SDOperation::completionBlock",
+        )
+}
+
 /// Upstream #1789's prerequisite phase: once `Child` gains `extends Base`
 /// in the file that also calls `c.run()` on a `Child`, the call reaches
 /// `Base::run`, the extends edge resolved before the call, as on a fresh

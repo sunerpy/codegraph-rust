@@ -6766,4 +6766,77 @@ class basic_json
             ["extends google::protobuf::Message (src/google/protobuf/message.h) qualified-name"]
         );
     }
+
+    /// Upstream #2234 (`d9d457d5`): C has no methods and cannot call a C++
+    /// one: redis' POSIX `read(fd, buf, n)` calls and hiredis' function
+    /// pointer `c->funcs->read(c, buf, …)` all went to the Qt adapter's
+    /// `RedisQtAdapter::read` in a C++ header.
+    #[test]
+    fn pr2234_a_c_call_never_reaches_a_cpp_method() {
+        let project = Project::new()
+            .file(
+                "deps/hiredis/adapters/qt.hpp",
+                "class RedisQtAdapter {\npublic:\n    void read() { }\n};\n",
+            )
+            .file(
+                "src/util.c",
+                "#include <unistd.h>\n\nlong slurp(int fd, char *buf, long n) {\n    return read(fd, buf, n);\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        assert_eq!(
+            callers(graph, "RedisQtAdapter::read"),
+            Vec::<String>::new(),
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream #2150 (`b238e240`), its C-call half: Objective-C C call
+    /// syntax (`completionBlock()`) calls a block, a function or a function
+    /// pointer, never a method or property (SDWebImage's block parameter
+    /// reached `SDPrefetchToken`'s `completionBlock` property).
+    #[test]
+    fn pr2150_objective_c_c_call_syntax_never_reaches_a_method_or_property() {
+        let project = Project::new()
+            .file(
+                "Core/SDPrefetchToken.h",
+                "#import <Foundation/Foundation.h>\n@interface SDPrefetchToken : NSObject\n@property (nonatomic, copy) void (^completionBlock)(void);\n@end\n",
+            )
+            .file(
+                "Core/SDOperation.h",
+                "#import <Foundation/Foundation.h>\n@interface SDOperation : NSObject\n- (void)completionBlock;\n@end\n",
+            )
+            .file(
+                "Core/SDOperation.m",
+                "#import \"SDOperation.h\"\n@implementation SDOperation\n- (void)completionBlock {\n}\n@end\n",
+            )
+            .file(
+                "Core/SDCache.h",
+                "#import <Foundation/Foundation.h>\n@interface SDCache : NSObject\n- (void)storeWithCompletion:(void (^)(void))completionBlock image:(id)image;\n@end\n",
+            )
+            .file(
+                "Core/SDCache.m",
+                "#import \"SDCache.h\"\n@implementation SDCache\n- (void)storeWithCompletion:(void (^)(void))completionBlock image:(id)image {\n    completionBlock();\n}\n@end\n",
+            )
+            .index();
+        let graph = project.graph();
+        let caller: Vec<&str> = graph
+            .nodes
+            .iter()
+            .filter(|node| {
+                node.file_path == "Core/SDCache.m" && node.name.starts_with("storeWithCompletion")
+            })
+            .map(|node| node.id.as_str())
+            .collect();
+        assert!(!caller.is_empty(), "{}", graph.report());
+        let targets: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.kind == "calls" && caller.contains(&edge.source.as_str()))
+            .filter_map(|edge| graph.node(&edge.target))
+            .map(|node| format!("{} {}", node.kind, node.qualified_name))
+            .collect();
+        assert_eq!(targets, Vec::<String>::new(), "{}", graph.report());
+    }
 }
