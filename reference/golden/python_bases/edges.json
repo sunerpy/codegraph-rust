@@ -120,6 +120,18 @@
     "target": "class:a14afda3fa296e6da71c03fc0b7d2601"
   },
   {
+    "col": 12,
+    "kind": "instantiates",
+    "line": 7,
+    "metadata": {
+      "confidence": 0.85,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "function:7a3344a7ac17b30aaa3f83a44206faa5",
+    "target": "class:a14afda3fa296e6da71c03fc0b7d2601"
+  },
+  {
     "col": 15,
     "kind": "calls",
     "line": 7,
@@ -173,7 +185,7 @@
     "line": 1,
     "metadata": {
       "confidence": 0.9,
-      "resolvedBy": "exact-match"
+      "resolvedBy": "import"
     },
     "provenance": null,
     "source": "file:pkg/__init__.py",
@@ -185,7 +197,7 @@
     "line": 2,
     "metadata": {
       "confidence": 0.9,
-      "resolvedBy": "exact-match"
+      "resolvedBy": "import"
     },
     "provenance": null,
     "source": "file:pkg/service.py",

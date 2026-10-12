@@ -138,6 +138,7 @@ pub struct SourceFacts {
     awaited_index: OnceLock<Arc<AwaitedIndex>>,
     rust_use_scopes: OnceLock<crate::rust_lexical::RustUseScopes>,
     python_from_imports: OnceLock<HashMap<String, String>>,
+    python_module_symbols: Mutex<HashMap<(String, usize), Option<String>>>,
     minified_script: OnceLock<bool>,
     csharp_scopes: OnceLock<Arc<crate::csharp_scopes::CsharpScopes>>,
     sfc_script_blocks: OnceLock<Vec<crate::sfc_scripts::ScriptBlock>>,
@@ -168,6 +169,7 @@ impl SourceFacts {
             awaited_index: OnceLock::new(),
             rust_use_scopes: OnceLock::new(),
             python_from_imports: OnceLock::new(),
+            python_module_symbols: Mutex::new(HashMap::new()),
             minified_script: OnceLock::new(),
             csharp_scopes: OnceLock::new(),
             sfc_script_blocks: OnceLock::new(),
@@ -399,6 +401,33 @@ impl SourceFacts {
         scan: impl FnOnce(&str) -> HashMap<String, String>,
     ) -> &HashMap<String, String> {
         self.python_from_imports.get_or_init(|| scan(&self.source))
+    }
+
+    /// Memoised id of the definition this Python module offers as `name`
+    /// when asked `depth` modules into a re-export walk; `compute` runs at
+    /// most once per `(name, depth)`, without the lock held, so a walk may
+    /// come back to this module.
+    pub(crate) fn python_module_symbol(
+        &self,
+        name: &str,
+        depth: usize,
+        compute: impl FnOnce() -> Option<String>,
+    ) -> Option<String> {
+        let key = (name.to_string(), depth);
+        if let Some(known) = self
+            .python_module_symbols
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&key)
+        {
+            return known.clone();
+        }
+        let found = compute();
+        self.python_module_symbols
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(key, found.clone());
+        found
     }
 
     /// The C# namespace blocks and `using` directives of the raw source,

@@ -852,21 +852,31 @@ fn extract_js_imports(content: &str) -> Vec<ImportMapping> {
     mappings
 }
 
-/// `extractPythonImports` (`import-resolver.ts:717-765`).
+/// `extractPythonImports` (`import-resolver.ts:717-765`), over the code
+/// alone: a docstring's `from x import y` binds nothing, and a parenthesized
+/// list (`from x import (\n    A,\n    B,\n)`, upstream #2291) binds every
+/// name in it, whatever its comments hold.
 fn extract_python_imports(content: &str) -> Vec<ImportMapping> {
     static FROM_RE: OnceLock<Regex> = OnceLock::new();
     static IMP_RE: OnceLock<Regex> = OnceLock::new();
-    let from_re = FROM_RE
-        .get_or_init(|| Regex::new(r"from\s+([\w.]+)\s+import\s+([^#\n]+)").expect("py from"));
+    let from_re = FROM_RE.get_or_init(|| {
+        Regex::new(r"from\s+([\w.]+)\s+import\s+(\([^)]*\)|[^#\n]+)").expect("py from")
+    });
     let imp_re = IMP_RE.get_or_init(|| {
         Regex::new(r"(?m)^import\s+([\w.]+)(?:\s+as\s+(\w+))?").expect("py import")
     });
+    let content = crate::strip_comments::strip_comments_for_regex(
+        content,
+        crate::strip_comments::CommentLang::Python,
+    );
 
     let mut mappings = Vec::new();
 
-    for caps in from_re.captures_iter(content) {
+    for caps in from_re.captures_iter(&content) {
         let source = caps.get(1).map(|m| m.as_str()).unwrap_or_default();
-        let imports = caps.get(2).map(|m| m.as_str()).unwrap_or_default();
+        let imports = caps.get(2).map(|m| m.as_str()).unwrap_or_default().trim();
+        let imports = imports.strip_prefix('(').unwrap_or(imports);
+        let imports = imports.strip_suffix(')').unwrap_or(imports);
         for raw in imports.split(',') {
             let name = raw.trim();
             if let Some((orig, alias)) = parse_as_alias(name) {
@@ -889,7 +899,7 @@ fn extract_python_imports(content: &str) -> Vec<ImportMapping> {
         }
     }
 
-    for caps in imp_re.captures_iter(content) {
+    for caps in imp_re.captures_iter(&content) {
         let source = caps.get(1).map(|m| m.as_str()).unwrap_or_default();
         let alias = caps.get(2).map(|m| m.as_str());
         let local_name = alias
@@ -1907,23 +1917,11 @@ pub fn resolve_via_import(
                     None
                 };
 
+                // Python symbols are never marked exported; a named import
+                // names the module's own top-level definition (#1820), or
+                // one it re-exports (#2247).
                 let python_symbol = |name: &str| {
-                    // Python symbols are never marked exported; a named import
-                    // names the module's own top-level definition (#1820).
-                    context
-                        .get_nodes_in_file_shared(&resolved_path)
-                        .into_iter()
-                        .find(|node| {
-                            node.name == name
-                                && !node.qualified_name.contains("::")
-                                && matches!(
-                                    node.kind,
-                                    NodeKind::Class
-                                        | NodeKind::Function
-                                        | NodeKind::Variable
-                                        | NodeKind::Constant
-                                )
-                        })
+                    python_module_symbol(&resolved_path, name, context)
                         .map(|node| node.as_ref().clone())
                 };
                 let wanted_python_name =
@@ -2919,28 +2917,20 @@ fn lookup_python_module_member(
         };
     }
 
-    let mut targets = context
-        .get_nodes_in_file_shared(resolved_path)
-        .into_iter()
-        .filter(|n| {
-            n.name == member
-                && matches!(
-                    n.kind,
-                    NodeKind::Function | NodeKind::Class | NodeKind::Variable | NodeKind::Constant
-                )
-        });
-    let Some(target) = targets.next() else {
+    // The module's own top-level definition, which must be unique, or one
+    // it re-exports (a package's `__init__.py`, upstream #2248).
+    let own = python_top_level_symbols(resolved_path, member, context);
+    let target = match own.as_slice() {
+        [target] => Some(Arc::clone(target)),
+        [] => python_module_symbol(resolved_path, member, context),
+        _ => None,
+    };
+    let Some(target) = target else {
         return PythonModuleMemberLookup {
             claimed: true,
             resolved: None,
         };
     };
-    if targets.next().is_some() {
-        return PythonModuleMemberLookup {
-            claimed: true,
-            resolved: None,
-        };
-    }
 
     PythonModuleMemberLookup {
         claimed: true,
@@ -3081,6 +3071,221 @@ fn resolve_python_absolute_module(
         confidence: 0.9,
         resolved_by: ResolvedBy::Import,
     })
+}
+
+/// How many modules deep a Python re-export walk goes (upstream #2247).
+const PYTHON_REEXPORT_DEPTH: usize = 3;
+
+/// The top-level classes, functions and values named `name` in the Python
+/// module `file`, in source order.
+fn python_top_level_symbols(
+    file: &str,
+    name: &str,
+    context: &dyn ResolutionContext,
+) -> Vec<Arc<Node>> {
+    let mut symbols: Vec<Arc<Node>> = context
+        .get_nodes_in_file_shared(file)
+        .into_iter()
+        .filter(|node| {
+            node.name == name
+                && !node.qualified_name.contains("::")
+                && matches!(
+                    node.kind,
+                    NodeKind::Class | NodeKind::Function | NodeKind::Variable | NodeKind::Constant
+                )
+        })
+        .collect();
+    symbols.sort_by(|a, b| {
+        (a.start_line, a.start_column, &a.id).cmp(&(b.start_line, b.start_column, &b.id))
+    });
+    symbols
+}
+
+/// The definition the Python module `file` offers as `name` (upstream #2247
+/// `pythonModuleSymbol`): its own top-level class, function or value, else
+/// the one it re-exports by name (`from .tokens import Token`) or through a
+/// star import (`from .users import *`), three modules deep.
+///
+/// Where upstream takes the first hit, this fails closed: two imports
+/// rebinding the name (`try: from .fast import Parser` / `except
+/// ImportError: from .slow import Parser`), or star-imported modules
+/// offering different definitions, leave it unresolved. Each `(module, name,
+/// depth)` answer is memoised for the pass; the walk is a function of the
+/// files alone, so the order in which references ask cannot change it.
+pub(crate) fn python_module_symbol(
+    file: &str,
+    name: &str,
+    context: &dyn ResolutionContext,
+) -> Option<Arc<Node>> {
+    python_module_symbol_at(file, name, context, 0)
+}
+
+fn python_module_symbol_at(
+    file: &str,
+    name: &str,
+    context: &dyn ResolutionContext,
+    depth: usize,
+) -> Option<Arc<Node>> {
+    let compute = || python_module_symbol_uncached(file, name, context, depth);
+    let id = match context.source_facts(file) {
+        Some(facts) => facts.python_module_symbol(name, depth, compute),
+        None => compute(),
+    }?;
+    context.get_node_by_id_shared(&id)
+}
+
+fn python_module_symbol_uncached(
+    file: &str,
+    name: &str,
+    context: &dyn ResolutionContext,
+    depth: usize,
+) -> Option<String> {
+    if let Some(own) = python_top_level_symbols(file, name, context).first() {
+        return Some(own.id.clone());
+    }
+    if depth >= PYTHON_REEXPORT_DEPTH {
+        return None;
+    }
+    let follow = |source: &str, exported: &str| {
+        let target = python_import_target(source, file, context)?;
+        python_module_symbol_at(&target, exported, context, depth + 1)
+    };
+    let named: Vec<ImportMapping> = context
+        .get_import_mappings(file, Language::Python)
+        .into_iter()
+        .filter(|imp| !imp.is_namespace && imp.local_name == name)
+        .collect();
+    match named.as_slice() {
+        [] => {}
+        [imp] => {
+            if let Some(node) = follow(&imp.source, &imp.exported_name) {
+                return Some(node.id.clone());
+            }
+        }
+        _ => return None,
+    }
+    // A star import is not among the import mappings: read it here.
+    let mut found: Option<Arc<Node>> = None;
+    for source in python_star_imports(file, context) {
+        let Some(node) = follow(&source, name) else {
+            continue;
+        };
+        if found.as_ref().is_some_and(|seen| seen.id != node.id) {
+            return None;
+        }
+        found = Some(node);
+    }
+    found.map(|node| node.id.clone())
+}
+
+/// The file a Python import of `source` in `file` names, other than `file`.
+fn python_import_target(
+    source: &str,
+    file: &str,
+    context: &dyn ResolutionContext,
+) -> Option<String> {
+    resolve_import_path(source, file, Language::Python, context)
+        .or_else(|| find_python_module_file(source, context, file))
+        .filter(|target| target != file)
+}
+
+/// The modules Python `code` star-imports (`from .users import *`), in
+/// source order.
+fn python_star_modules(code: &str) -> Vec<String> {
+    static STAR: OnceLock<Regex> = OnceLock::new();
+    let star = STAR.get_or_init(|| {
+        Regex::new(r"(?m)^\s*from\s+([\w.]+)\s+import\s+\*").expect("python star import")
+    });
+    star.captures_iter(code)
+        .filter_map(|captures| captures.get(1))
+        .map(|module| module.as_str().to_string())
+        .collect()
+}
+
+/// The modules `file` star-imports, read from its code (comments and
+/// docstrings blanked).
+fn python_star_imports(file: &str, context: &dyn ResolutionContext) -> Vec<String> {
+    context
+        .source_facts(file)
+        .map(|facts| python_star_modules(facts.python_comment_free().0))
+        .unwrap_or_default()
+}
+
+/// The names a Python import statement of `file` can re-export to the files
+/// that import `file`, as [`python_module_symbol`] reads them: what a `from
+/// … import a, b as c` binds, and for `from m import *` every name module
+/// `m` offers, its own top-level definitions and what it re-exports in turn,
+/// as deep as the walk looks. Sync touches these when the statement comes or
+/// goes, since an importer's name then moves without any node of that name
+/// changing.
+pub fn python_reexported_names(
+    file: &str,
+    statement: &str,
+    context: &dyn ResolutionContext,
+) -> BTreeSet<String> {
+    let mut names: BTreeSet<String> = extract_import_mappings(statement, Language::Python)
+        .into_iter()
+        .filter(|mapping| !mapping.is_namespace)
+        .map(|mapping| mapping.local_name)
+        .collect();
+    let code = crate::strip_comments::strip_comments_for_regex(
+        statement,
+        crate::strip_comments::CommentLang::Python,
+    );
+    let mut seen = std::collections::HashMap::new();
+    for module in python_star_modules(&code) {
+        if let Some(target) = python_import_target(&module, file, context) {
+            python_offered_names(&target, 1, context, &mut names, &mut seen);
+        }
+    }
+    names
+}
+
+/// Every name the walk can find in the Python module `file` when it arrives
+/// there `depth` modules deep.
+fn python_offered_names(
+    file: &str,
+    depth: usize,
+    context: &dyn ResolutionContext,
+    names: &mut BTreeSet<String>,
+    seen: &mut std::collections::HashMap<String, usize>,
+) {
+    // A module already read at this depth or shallower offered all of this.
+    if seen.get(file).is_some_and(|&at| at <= depth) {
+        return;
+    }
+    seen.insert(file.to_string(), depth);
+    names.extend(
+        context
+            .get_nodes_in_file_shared(file)
+            .into_iter()
+            .filter(|node| {
+                !node.qualified_name.contains("::")
+                    && matches!(
+                        node.kind,
+                        NodeKind::Class
+                            | NodeKind::Function
+                            | NodeKind::Variable
+                            | NodeKind::Constant
+                    )
+            })
+            .map(|node| node.name.clone()),
+    );
+    if depth >= PYTHON_REEXPORT_DEPTH {
+        return;
+    }
+    names.extend(
+        context
+            .get_import_mappings(file, Language::Python)
+            .into_iter()
+            .filter(|mapping| !mapping.is_namespace)
+            .map(|mapping| mapping.local_name),
+    );
+    for module in python_star_imports(file, context) {
+        if let Some(target) = python_import_target(&module, file, context) {
+            python_offered_names(&target, depth + 1, context, names, seen);
+        }
+    }
 }
 
 /// Find a Python module file by its absolute dotted path (`a.b.c` →
@@ -4134,6 +4339,33 @@ const { x, y: z } = require('./other');
         assert!(
             m.iter()
                 .any(|x| x.local_name == "sys" && x.source == "sys" && x.is_namespace)
+        );
+    }
+
+    /// Upstream #2291's case: a parenthesized from-import binds every name
+    /// it lists, a comment in it holds none, and a docstring imports nothing.
+    #[test]
+    fn extract_python_imports_reads_parenthesized_lists_over_code_only() {
+        let content = "\nfrom store.base import (\n    Base,\n    helper as h,  # a comment, with a comma and a call()\n)\n\"\"\"\nfrom docstring import NotAnImport\n\"\"\"\nfrom store.rows import (Row, Col)\n";
+        let mappings = extract_import_mappings(content, Language::Python);
+        let found: Vec<(&str, &str, &str)> = mappings
+            .iter()
+            .map(|m| {
+                (
+                    m.local_name.as_str(),
+                    m.exported_name.as_str(),
+                    m.source.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            found,
+            [
+                ("Base", "Base", "store.base"),
+                ("h", "helper", "store.base"),
+                ("Row", "Row", "store.rows"),
+                ("Col", "Col", "store.rows"),
+            ]
         );
     }
 

@@ -341,12 +341,36 @@ fn python_ref_class(
     reference: &RefView,
     context: &dyn ResolutionContext,
 ) -> Option<Node> {
+    let imports = context.get_import_mappings(&reference.file_path, Language::Python);
+    // `import pkg.mod` then `pkg.mod.Cls`: the mapping keys the module by its
+    // last segment (upstream #2291). Two modules with the same last segment
+    // (`import a.foo`, `import b.foo`) share the key: refuse.
+    let mut name = name.to_string();
+    if let Some(module) = imports.iter().find(|import| {
+        import.is_namespace
+            && name
+                .strip_prefix(import.source.as_str())
+                .and_then(|rest| rest.strip_prefix('.'))
+                .is_some_and(|member| {
+                    !member.is_empty()
+                        && member
+                            .bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+                })
+    }) {
+        if imports
+            .iter()
+            .filter(|import| import.local_name == module.local_name)
+            .count()
+            != 1
+        {
+            return None;
+        }
+        name = format!("{}.{}", module.local_name, &name[module.source.len() + 1..]);
+    }
+    let name = name.as_str();
     let root = name.split('.').next().unwrap_or(name);
-    if context
-        .get_import_mappings(&reference.file_path, Language::Python)
-        .iter()
-        .any(|import| import.local_name == root)
-    {
+    if imports.iter().any(|import| import.local_name == root) {
         let mut lookup = reference.clone();
         lookup.reference_name = name.to_string();
         lookup.reference_kind = EdgeKind::References;

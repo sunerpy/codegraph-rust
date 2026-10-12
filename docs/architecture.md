@@ -140,7 +140,9 @@ streaming path for very large graphs), then applies deterministic strategies:
    follows `module.exports`, `exports.name = …`, a `require(…).member` and a
    `.default` the way the module exports them; `export * as ns` exports the
    namespace alone, a namespace import's `z.core.fn()` continues into it, and
-   `import { default as X }` is the default import);
+   `import { default as X }` is the default import; a Python name imported
+   from a package follows the package's named and star re-exports to its
+   definition, three modules deep);
 2. qualified, scoped, receiver/type, lexical, and exact-name matching (a
    receiver written as, or inferred to be, a type the project does not declare
    stops the name guesses, except that a C# call still reaches the one
@@ -288,7 +290,10 @@ a backend's sign of dropped events, or (on Windows) drift found by an idle
 sentinel escalates to one full reconcile, reported as RECOVERING until it
 commits. A sync re-resolves the references that name what it changed, a
 qualified one (`User.create`) by its last segment as well (at most 500 per
-segment); an import
+segment); a Python import statement that comes or goes counts the names it
+can re-export as changed (what it binds, and for a star import every name the
+module offers, as deep as the re-export walk looks), since an importer's name
+then moves with no node of it changing; an import
 names a file, a folder or a namespace rather than a symbol, so the parked
 imports an added file or a changed file's namespace can satisfy (by the file's
 name and stem, its folder's, or the namespace's whole name) send their files

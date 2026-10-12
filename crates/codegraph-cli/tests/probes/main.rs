@@ -2717,15 +2717,22 @@ mod js {
 }
 
 mod python {
-    use super::support::{Graph, Project};
+    use super::support::{EdgeRow, Graph, Project};
 
-    /// `file: qualified` of every `calls` edge out of `file`'s nodes, sorted.
-    fn calls_from(graph: &Graph, file: &str) -> Vec<String> {
+    /// `file: qualified` of every `kind` edge out of `file`'s nodes that
+    /// `keep` accepts, sorted.
+    fn edges_where(
+        graph: &Graph,
+        file: &str,
+        kind: &str,
+        keep: impl Fn(&EdgeRow) -> bool,
+    ) -> Vec<String> {
         let mut out: Vec<String> = graph
             .edges
             .iter()
             .filter(|edge| {
-                edge.kind == "calls"
+                edge.kind == kind
+                    && keep(edge)
                     && graph
                         .node(&edge.source)
                         .is_some_and(|node| node.file_path == file)
@@ -2735,6 +2742,16 @@ mod python {
             .collect();
         out.sort();
         out
+    }
+
+    /// `file: qualified` of every `kind` edge out of `file`'s nodes, sorted.
+    fn edges_from(graph: &Graph, file: &str, kind: &str) -> Vec<String> {
+        edges_where(graph, file, kind, |_| true)
+    }
+
+    /// `file: qualified` of every `calls` edge out of `file`'s nodes, sorted.
+    fn calls_from(graph: &Graph, file: &str) -> Vec<String> {
+        edges_from(graph, file, "calls")
     }
 
     /// `file: qualified` of every `calls` edge out of the node named `name`.
@@ -2865,5 +2882,178 @@ mod python {
         // A parameter is its own value: a fixture another module defines,
         // with no conftest above the caller, is out of reach.
         assert_eq!(calls_from(graph, "src/runner.py"), Vec::<String>::new());
+    }
+
+    /// Upstream #2247 (`6d8802ce`): a name imported from a package follows
+    /// the package's re-exports to its definition, by name (`from .tokens
+    /// import Token`) and through a star import (`from .users import *`),
+    /// never to a test's or a migration's namesake.
+    #[test]
+    fn pr2247_an_imported_name_follows_the_package_reexports() {
+        let project = Project::new()
+            .file("netbox/users/__init__.py", "")
+            .file(
+                "netbox/users/models/__init__.py",
+                "from .tokens import Token\nfrom .users import *\n",
+            )
+            .file("netbox/users/models/users.py", "class User:\n    pass\n")
+            .file("netbox/users/models/tokens.py", "class Token:\n    pass\n")
+            .file("netbox/extras/tests/test_templatetags.py", "class User:\n    pass\n")
+            .file("netbox/alembic/versions/0001_tokens.py", "class Token:\n    pass\n")
+            .file(
+                "netbox/core/views.py",
+                "from users.models import Token, User\n\n\ndef make():\n    return User(), Token()\n",
+            )
+            .index();
+        let graph = project.graph();
+        assert_eq!(
+            edges_from(graph, "netbox/core/views.py", "instantiates"),
+            [
+                "netbox/users/models/tokens.py: Token",
+                "netbox/users/models/users.py: User"
+            ],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// The re-export walk fails closed: two star-imported modules that both
+    /// define the name, two imports rebinding it, a cycle of star imports
+    /// and a chain four modules deep all leave the name unresolved.
+    #[test]
+    fn pr2247_an_ambiguous_or_endless_reexport_stays_unresolved() {
+        let project = Project::new()
+            .file("app/__init__.py", "")
+            .file("app/both/__init__.py", "from .one import *\nfrom .two import *\n")
+            .file("app/both/one.py", "class Client:\n    pass\n")
+            .file("app/both/two.py", "class Client:\n    pass\n")
+            .file(
+                "app/rebound/__init__.py",
+                "try:\n    from .fast import Parser\nexcept ImportError:\n    from .slow import Parser\n",
+            )
+            .file("app/rebound/fast.py", "class Parser:\n    pass\n")
+            .file("app/rebound/slow.py", "class Parser:\n    pass\n")
+            .file("app/loop/__init__.py", "from .a import *\n")
+            .file("app/loop/a.py", "from .b import *\n")
+            .file("app/loop/b.py", "from .a import *\n")
+            .file("app/deep/__init__.py", "from .l1 import *\n")
+            .file("app/deep/l1.py", "from .l2 import *\n")
+            .file("app/deep/l2.py", "from .l3 import *\n")
+            .file("app/deep/l3.py", "from .l4 import *\n")
+            .file("app/deep/l4.py", "class Engine:\n    pass\n")
+            .file("app/near/__init__.py", "from .l1 import *\n")
+            .file("app/near/l1.py", "from .l2 import *\n")
+            .file("app/near/l2.py", "from .l3 import *\n")
+            .file("app/near/l3.py", "class Motor:\n    pass\n")
+            .file(
+                "app/use.py",
+                "from app.both import Client\nfrom app.rebound import Parser\nfrom app.loop import Missing\nfrom app.deep import Engine\nfrom app.near import Motor\n\n\ndef build():\n    return Client(), Parser(), Missing(), Engine(), Motor()\n",
+            )
+            .file("other/client.py", "class Client:\n    pass\n")
+            .index();
+        let graph = project.graph();
+        // Three modules deep is followed; four is not. (What the import
+        // declines, name matching may still guess, as before.)
+        assert_eq!(
+            edges_where(graph, "app/use.py", "instantiates", |edge| {
+                edge.resolved_by() == Some("import")
+            }),
+            ["app/near/l3.py: Motor"],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream #2248 (`34ede4de`): a module member used through the
+    /// imported module (`generic.ObjectEditView` after `from netbox.views
+    /// import generic`) follows the package's re-exports too.
+    #[test]
+    fn pr2248_a_module_member_follows_the_package_reexports() {
+        let project = Project::new()
+            .file("netbox/netbox/__init__.py", "")
+            .file("netbox/netbox/views/__init__.py", "")
+            .file(
+                "netbox/netbox/views/generic/__init__.py",
+                "from .object_views import *\n",
+            )
+            .file(
+                "netbox/netbox/views/generic/object_views.py",
+                "class ObjectEditView:\n    pass\n",
+            )
+            .file(
+                "netbox/dcim/views.py",
+                "from netbox.views import generic\n\n\nclass DeviceEditView(generic.ObjectEditView):\n    pass\n",
+            )
+            .file("netbox/extras/views.py", "class ObjectEditView:\n    pass\n")
+            .index();
+        let graph = project.graph();
+        assert_eq!(
+            edges_from(graph, "netbox/dcim/views.py", "extends"),
+            ["netbox/netbox/views/generic/object_views.py: ObjectEditView"],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream #2291 (`f838c5a0`, parts b and c): a parenthesized
+    /// from-import, one name per line and with a comment holding a call,
+    /// binds every name it lists; and `pkg.mod.Cls` is the class `import
+    /// pkg.mod` names, unless another import shares the module's last
+    /// segment.
+    #[test]
+    fn pr2291_parenthesized_imports_and_dotted_module_classes_resolve() {
+        let project = Project::new()
+            .file("store/__init__.py", "")
+            .file(
+                "store/base.py",
+                "class Base:\n    def fetch(self, ids):\n        return ids\n\n\ndef helper():\n    return 1\n",
+            )
+            .file("decoy/base.py", "class Base:\n    pass\n\n\ndef helper():\n    return 2\n")
+            .file(
+                "store/rows.py",
+                "from store.base import (\n    Base,\n    helper as h,  # a comment, with a comma and a call()\n)\n\n\nclass Row(Base):\n    def load(self):\n        return h()\n",
+            )
+            .file("alpha/__init__.py", "")
+            .file("beta/__init__.py", "")
+            .file("alpha/foo.py", "class Client:\n    def fetch(self):\n        return 1\n")
+            .file("beta/foo.py", "class Client:\n    def fetch(self):\n        return 2\n")
+            .file(
+                "one.py",
+                "import alpha.foo\n\n\nclass Sub(alpha.foo.Client):\n    pass\n\n\ndef go(pool, s: Sub):\n    pool.submit(s.fetch)\n",
+            )
+            .file(
+                "two.py",
+                "import beta.foo\nimport alpha.foo\n\n\nclass Sub(alpha.foo.Client):\n    pass\n\n\ndef go(pool, s: Sub):\n    pool.submit(s.fetch)\n",
+            )
+            .index();
+        let graph = project.graph();
+        // Name matching guessed `Base` before; the import binds it now.
+        assert_eq!(
+            edges_where(graph, "store/rows.py", "extends", |edge| {
+                edge.resolved_by() == Some("import")
+            }),
+            ["store/base.py: Base"],
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            calls_from(graph, "store/rows.py"),
+            ["store/base.py: helper"],
+            "{}",
+            graph.report()
+        );
+        let fn_ref = |edge: &EdgeRow| edge.metadata["fnRef"] == true;
+        assert_eq!(
+            edges_where(graph, "one.py", "references", fn_ref),
+            ["alpha/foo.py: Client::fetch"],
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            edges_where(graph, "two.py", "references", fn_ref),
+            Vec::<String>::new(),
+            "{}",
+            graph.report()
+        );
     }
 }

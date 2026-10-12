@@ -1089,6 +1089,168 @@ pub fn python_call_becomes_a_local_binding_body_edit() -> Case {
         .no_edge_after("function test_version", "calls", "function view")
 }
 
+/// Upstream #2247: a name a package star-imports from a module reaches that
+/// module's class once the module appears, ahead of a test's namesake.
+pub fn python_star_reexport_of_an_added_module() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Python])
+        .file("users/__init__.py", "")
+        .file("users/models/__init__.py", "from .users import *\n")
+        .file("extras/tests/test_tags.py", "class User:\n    pass\n")
+        .file(
+            "core/views.py",
+            "from users.models import User\n\n\ndef make():\n    return User()\n",
+        )
+        .write("users/models/users.py", "class User:\n    pass\n")
+        .edge_after(
+            "function make",
+            "instantiates",
+            "class User @users/models/users.py",
+        )
+}
+
+/// Upstream #2247: a package that comes to star-import a module re-exports
+/// its class, so an unchanged importer's call binds it, as a fresh index of
+/// the edit finds.
+pub fn python_package_gains_a_star_reexport() -> Case {
+    Case::new(Change::ReexportEdit, &[Language::Python])
+        .file("users/__init__.py", "")
+        .file("users/models/__init__.py", "")
+        .file("users/models/users.py", "class User:\n    pass\n")
+        .file("extras/tests/test_tags.py", "class User:\n    pass\n")
+        .file(
+            "core/views.py",
+            "from users.models import User\n\n\ndef make():\n    return User()\n",
+        )
+        .write("users/models/__init__.py", "from .users import *\n")
+        .edge_after(
+            "function make",
+            "instantiates",
+            "class User @users/models/users.py",
+        )
+}
+
+/// Upstream #2247: a package that stops star-importing a module no longer
+/// re-exports its class, so an unchanged importer's import-bound call goes,
+/// as a fresh index of the edit finds.
+pub fn python_package_drops_a_star_reexport() -> Case {
+    Case::new(Change::ReexportEdit, &[Language::Python])
+        .file("users/__init__.py", "")
+        .file("users/models/__init__.py", "from .users import *\n")
+        .file("users/models/users.py", "class User:\n    pass\n")
+        .file("extras/tests/test_tags.py", "class User:\n    pass\n")
+        .file(
+            "core/views.py",
+            "from users.models import User\n\n\ndef make():\n    return User()\n",
+        )
+        .write("users/models/__init__.py", "")
+        .edge_before(
+            "function make",
+            "instantiates",
+            "class User @users/models/users.py",
+        )
+}
+
+/// Upstream #2247: deleting the package module that re-exported a class
+/// takes the import binding with it, as a fresh index of the edit finds.
+pub fn python_reexporting_package_is_deleted() -> Case {
+    Case::new(Change::DeleteImportedModule, &[Language::Python])
+        .file("users/__init__.py", "")
+        .file("users/models/__init__.py", "from .tokens import Token\n")
+        .file("users/models/tokens.py", "class Token:\n    pass\n")
+        .file(
+            "alembic/versions/0001_tokens.py",
+            "class Token:\n    pass\n",
+        )
+        .file(
+            "core/views.py",
+            "from users.models import Token\n\n\ndef make():\n    return Token()\n",
+        )
+        .remove("users/models/__init__.py")
+        .edge_before(
+            "function make",
+            "instantiates",
+            "class Token @users/models/tokens.py",
+        )
+}
+
+/// Upstream #2247 and #2291 (c): a package's named re-export moves to
+/// another module, written as a parenthesized list, and an unchanged
+/// importer's call follows it.
+pub fn python_named_reexport_moves_to_another_module() -> Case {
+    Case::new(Change::ReexportEdit, &[Language::Python])
+        .file("users/__init__.py", "")
+        .file("users/models/__init__.py", "from .legacy import Token\n")
+        .file("users/models/legacy.py", "class Token:\n    pass\n")
+        .file("users/models/tokens.py", "class Token:\n    pass\n")
+        .file(
+            "core/views.py",
+            "from users.models import Token\n\n\ndef make():\n    return Token()\n",
+        )
+        .write(
+            "users/models/__init__.py",
+            "from .tokens import (\n    Token,  # moved()\n)\n",
+        )
+        .edge_before(
+            "function make",
+            "instantiates",
+            "class Token @users/models/legacy.py",
+        )
+        .edge_after(
+            "function make",
+            "instantiates",
+            "class Token @users/models/tokens.py",
+        )
+        .no_edge_after(
+            "function make",
+            "instantiates",
+            "class Token @users/models/legacy.py",
+        )
+}
+
+/// Upstream #2248: a module member used through the imported module follows
+/// a star re-export its package comes to make.
+pub fn python_module_member_reexport_appears() -> Case {
+    Case::new(Change::ReexportEdit, &[Language::Python])
+        .file("netbox/__init__.py", "")
+        .file("netbox/views/__init__.py", "")
+        .file("netbox/views/generic/__init__.py", "")
+        .file(
+            "netbox/views/generic/object_views.py",
+            "class ObjectEditView:\n    pass\n",
+        )
+        .file("extras/views.py", "class ObjectEditView:\n    pass\n")
+        .file(
+            "dcim/views.py",
+            "from netbox.views import generic\n\n\nclass DeviceEditView(generic.ObjectEditView):\n    pass\n",
+        )
+        .write(
+            "netbox/views/generic/__init__.py",
+            "from .object_views import *\n",
+        )
+        .edge_after(
+            "class DeviceEditView",
+            "extends",
+            "class ObjectEditView @netbox/views/generic/object_views.py",
+        )
+}
+
+/// Upstream #2291 (b): `alpha.foo.Client` through `import alpha.foo` is the
+/// module's class once the module appears, so a method value on a subclass
+/// reaches its method.
+pub fn python_dotted_module_class_of_an_added_module() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Python])
+        .file("alpha/__init__.py", "")
+        .file(
+            "one.py",
+            "import alpha.foo\n\n\nclass Sub(alpha.foo.Client):\n    pass\n\n\ndef go(pool, s: Sub):\n    pool.submit(s.fetch)\n",
+        )
+        .write(
+            "alpha/foo.py",
+            "class Client:\n    def fetch(self):\n        return 1\n",
+        )
+        .edge_after("function go", "references", "method Client::fetch")
+}
+
 /// Upstream #2263: a CommonJS `require('./application')` imports that file once
 /// it appears, though the binding is only ever used as a value.
 pub fn javascript_require_imports_an_added_module() -> Case {

@@ -64,10 +64,14 @@ pub enum Change {
     HeaderFlip,
     /// A `.js` file gains Flow's `@flow` pragma, so it is read as TSX.
     PragmaFlip,
+    /// A module's re-exports change: a name an unchanged file imports
+    /// through it now means another definition, though no node of that
+    /// name changed.
+    ReexportEdit,
 }
 
 impl Change {
-    const ALL: [Self; 9] = [
+    const ALL: [Self; 10] = [
         Self::AddImportTarget,
         Self::BodyEdit,
         Self::RenameSymbol,
@@ -77,6 +81,7 @@ impl Change {
         Self::ControlFile,
         Self::HeaderFlip,
         Self::PragmaFlip,
+        Self::ReexportEdit,
     ];
 }
 
@@ -610,6 +615,13 @@ matrix! {
     python_bare_call_ignores_an_added_method,
     python_outside_import_ignores_an_added_function,
     python_call_becomes_a_local_binding_body_edit,
+    python_star_reexport_of_an_added_module,
+    python_package_gains_a_star_reexport,
+    python_package_drops_a_star_reexport,
+    python_reexporting_package_is_deleted,
+    python_named_reexport_moves_to_another_module,
+    python_module_member_reexport_appears,
+    python_dotted_module_class_of_an_added_module,
     javascript_require_imports_an_added_module,
     javascript_require_member_reaches_an_added_module,
     typescript_require_default_of_an_added_es_module,

@@ -597,6 +597,22 @@ fn sync_paths_with_store(
     }
 
     if changed {
+        // What a changed Python import statement re-exports moves for its
+        // module's importers without any node of those names changing.
+        if !changed_names.python_imports.is_empty() {
+            let context = codegraph_resolve::StoreResolutionContext::new(
+                store,
+                project_root.to_string_lossy(),
+            )
+            .with_max_file_size(scope.options.max_file_size);
+            for (file, statement) in &changed_names.python_imports {
+                changed_names.any.extend(
+                    codegraph_resolve::import_resolver::python_reexported_names(
+                        file, statement, &context,
+                    ),
+                );
+            }
+        }
         let name_list: Vec<String> = changed_names.any.iter().cloned().collect();
         for affected in store.reference_sites_of_edges_to_named_targets(&name_list)? {
             if !reindexed.contains(&affected.file_path) {
@@ -957,10 +973,24 @@ fn remove_tracked_file(
         merge_dependent_site(dependent_sites, dependent_fallbacks, dependent);
     }
     changed_names.note_removed(node_names_in_file(store, relative)?);
+    changed_names.python_imports.extend(
+        python_import_statements(&store.nodes_by_file_path(relative)?)
+            .into_iter()
+            .map(|statement| (relative.to_string(), statement)),
+    );
     delete_unresolved_refs_by_file(store, relative)?;
     store.delete_file_record(relative)?;
     outcome.files_removed += 1;
     Ok(true)
+}
+
+/// The text of every Python import statement among `nodes`.
+fn python_import_statements(nodes: &[Node]) -> BTreeSet<String> {
+    nodes
+        .iter()
+        .filter(|node| node.kind == NodeKind::Import && node.language == Language::Python)
+        .filter_map(|node| node.signature.clone())
+        .collect()
 }
 
 /// Re-extract `relative` from the bytes `sync_one` already read and hashed, so
@@ -1057,6 +1087,15 @@ fn reextract_into_store(
             changed_names.module_names.insert(node.name.clone());
         }
     }
+    let (before, after) = (
+        python_import_statements(&old_nodes),
+        python_import_statements(&result.nodes),
+    );
+    changed_names.python_imports.extend(
+        before
+            .symmetric_difference(&after)
+            .map(|statement| (relative.to_string(), statement.clone())),
+    );
 
     delete_unresolved_refs_by_file(store, relative)?;
     store.delete_file_record(relative)?;
@@ -1085,6 +1124,10 @@ struct ChangedNames {
     /// The namespaces and modules the changed files declare, which a parked
     /// import may name whole (`using Foo.Bar`, `import com.z.*`).
     module_names: HashSet<String>,
+    /// The Python import statements that came or went, by file: a package
+    /// re-exports what they bind (upstream #2247), so the names they can
+    /// carry are touched once the store holds the new files.
+    python_imports: BTreeSet<(String, String)>,
 }
 
 /// How many parked imports one retry key may wake (upstream's per-name ceiling).
