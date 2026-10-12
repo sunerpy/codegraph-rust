@@ -70,6 +70,10 @@ pub(crate) use erlang::{
 pub use gdscript::GDSCRIPT_SPEC;
 pub use go::GO_SPEC;
 pub use java::JAVA_SPEC;
+pub(crate) use java::{
+    LOMBOK_LOG_ANNOTATIONS, has_word, lombok_annotation_names, lombok_getter_name,
+    lombok_setter_name, modifier_text, normalize_java_type,
+};
 pub use javascript::JAVASCRIPT_SPEC;
 pub use jsx::JSX_SPEC;
 pub use kotlin::KOTLIN_SPEC;

@@ -288,6 +288,12 @@ pub struct NodeRow {
     pub start_line: i64,
     pub end_line: i64,
     pub is_exported: bool,
+    pub is_static: bool,
+    pub visibility: Option<String>,
+    pub signature: Option<String>,
+    pub docstring: Option<String>,
+    pub decorators: Value,
+    pub return_type: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -352,7 +358,8 @@ impl Graph {
         let nodes = rows(
             &conn,
             "SELECT id, kind, name, qualified_name, file_path, language, start_line, end_line, \
-             is_exported FROM nodes ORDER BY id",
+             is_exported, is_static, visibility, signature, docstring, decorators, return_type \
+             FROM nodes ORDER BY id",
             |row| {
                 Ok(NodeRow {
                     id: row.get(0)?,
@@ -364,6 +371,12 @@ impl Graph {
                     start_line: row.get(6)?,
                     end_line: row.get(7)?,
                     is_exported: row.get(8)?,
+                    is_static: row.get(9)?,
+                    visibility: row.get(10)?,
+                    signature: row.get(11)?,
+                    docstring: row.get(12)?,
+                    decorators: json_column(row, 13)?,
+                    return_type: row.get(14)?,
                 })
             },
         );

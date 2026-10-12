@@ -2898,6 +2898,70 @@ pub fn kotlin_gradle_script_follows_a_project_head_change() -> Case {
         .edge_after("file:app/build.gradle.kts", "calls", "method Other::foo")
 }
 
+/// Upstream #912: Lombok's members are nodes of the class's file, so `@Data`
+/// written onto a class gives an unchanged file's `user.getName()` its
+/// target, as on a fresh index.
+pub fn java_lombok_data_appears_on_a_class() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Java])
+        .file(
+            "model/User.java",
+            "package model;\n\npublic class User {\n    private String name;\n}\n",
+        )
+        .file(
+            "svc/UserService.java",
+            "package svc;\n\nimport model.User;\n\nclass UserService {\n    String describe(User user) {\n        return user.getName();\n    }\n}\n",
+        )
+        .write(
+            "model/User.java",
+            "package model;\n\nimport lombok.Data;\n\n@Data\npublic class User {\n    private String name;\n}\n",
+        )
+        .edge_after(
+            "method svc::UserService::describe",
+            "calls",
+            "method model::User::getName",
+        )
+}
+
+/// Upstream #912: a hand-written accessor replaces the one Lombok would
+/// generate, so an unchanged caller's edge moves to it, as on a fresh index.
+pub fn java_lombok_hand_written_getter_replaces_the_generated_one() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Java])
+        .file(
+            "model/Account.java",
+            "package model;\n\nimport lombok.Getter;\n\n@Getter\npublic class Account {\n    private int balance;\n}\n",
+        )
+        .file(
+            "svc/Report.java",
+            "package svc;\n\nimport model.Account;\n\nclass Report {\n    int total(Account account) {\n        return account.getBalance();\n    }\n}\n",
+        )
+        .write(
+            "model/Account.java",
+            "package model;\n\nimport lombok.Getter;\n\n@Getter\npublic class Account {\n    private int balance;\n\n    public int getBalance() { return balance < 0 ? 0 : balance; }\n}\n",
+        )
+        .edge_before("method svc::Report::total", "calls", "method model::Account::getBalance")
+        .edge_after("method svc::Report::total", "calls", "method model::Account::getBalance")
+}
+
+/// Upstream #912: a field leaving a `@Data` class takes its accessors with
+/// it, so an unchanged caller's edge goes, as on a fresh index (where the
+/// accessor no longer exists).
+pub fn java_lombok_field_removal_drops_its_accessor() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Java])
+        .file(
+            "model/User.java",
+            "package model;\n\nimport lombok.Data;\n\n@Data\npublic class User {\n    private String name;\n    private int age;\n}\n",
+        )
+        .file(
+            "svc/UserService.java",
+            "package svc;\n\nimport model.User;\n\nclass UserService {\n    int age(User user) {\n        return user.getAge();\n    }\n}\n",
+        )
+        .write(
+            "model/User.java",
+            "package model;\n\nimport lombok.Data;\n\n@Data\npublic class User {\n    private String name;\n}\n",
+        )
+        .edge_before("method svc::UserService::age", "calls", "method model::User::getAge")
+}
+
 /// Upstream #2194: a Java enum constant's body declares methods, so an edit
 /// to that body gains the call it adds, as on a fresh index.
 pub fn java_enum_constant_body_edit() -> Case {

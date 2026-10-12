@@ -7353,6 +7353,182 @@ mod java {
             graph.report()
         );
     }
+
+    /// Whether `node` is one Lombok generates here: it carries the `lombok`
+    /// decorator.
+    fn is_lombok(node: &super::support::NodeRow) -> bool {
+        node.decorators
+            .as_array()
+            .is_some_and(|decorators| decorators.iter().any(|d| d == "lombok"))
+    }
+
+    /// Upstream #912 (`826810f1`): the members Lombok generates are nodes,
+    /// marked with a `lombok` decorator and a docstring naming the
+    /// annotation, and calls to them resolve; a static field gets no
+    /// accessor. Upstream's fixture, verbatim.
+    #[test]
+    fn pr912_lombok_members_are_synthesized_and_resolve() {
+        let project = Project::new()
+            .file(
+                "model/User.java",
+                "package model;\nimport lombok.Data;\nimport lombok.Builder;\nimport lombok.extern.slf4j.Slf4j;\n\n@Data\n@Builder\n@Slf4j\npublic class User {\n    private String name;\n    private boolean active;\n    private static final int MAX = 10;\n}\n",
+            )
+            .file(
+                "svc/UserService.java",
+                "package svc;\nimport model.User;\n\nclass UserService {\n    String describe(User user) {\n        user.setActive(true);\n        return user.getName();\n    }\n    User make() {\n        return User.builder();\n    }\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        let synthesized = |name: &str| {
+            graph
+                .nodes
+                .iter()
+                .find(|node| node.name == name && is_lombok(node))
+                .unwrap_or_else(|| panic!("no synthesized {name}\n{}", graph.report()))
+        };
+        for name in [
+            "getName",
+            "setName",
+            "isActive",
+            "setActive",
+            "builder",
+            "equals",
+            "hashCode",
+            "toString",
+        ] {
+            let node = synthesized(name);
+            assert_eq!(node.kind, "method", "{name}");
+            assert_eq!(node.file_path, "model/User.java", "{name}");
+            assert_eq!(node.qualified_name, format!("model::User::{name}"));
+        }
+        let get_name = synthesized("getName");
+        assert_eq!(
+            get_name.docstring.as_deref(),
+            Some("Lombok-generated (@Data)")
+        );
+        assert_eq!(get_name.signature.as_deref(), Some("String getName()"));
+        assert_eq!(get_name.return_type.as_deref(), Some("String"));
+        assert_eq!(get_name.visibility.as_deref(), Some("public"));
+        assert_eq!(get_name.start_line, 10);
+        assert_eq!(
+            synthesized("isActive").signature.as_deref(),
+            Some("boolean isActive()")
+        );
+        assert_eq!(
+            synthesized("setName").signature.as_deref(),
+            Some("void setName(String name)")
+        );
+        let builder = synthesized("builder");
+        assert_eq!(
+            builder.signature.as_deref(),
+            Some("static User.UserBuilder builder()")
+        );
+        assert!(builder.is_static);
+        assert_eq!(builder.return_type.as_deref(), Some("UserBuilder"));
+        assert_eq!(
+            builder.docstring.as_deref(),
+            Some("Lombok-generated (@Builder)")
+        );
+        let log = synthesized("log");
+        assert_eq!(log.kind, "field");
+        assert!(log.is_static);
+        assert_eq!(log.visibility.as_deref(), Some("private"));
+        assert_eq!(log.signature.as_deref(), Some("Logger log"));
+        assert_eq!(log.docstring.as_deref(), Some("Lombok-generated (@Slf4j)"));
+        assert!(
+            !graph
+                .nodes
+                .iter()
+                .any(|node| node.name == "getMAX" || node.name == "getMax"),
+            "{}",
+            graph.report()
+        );
+        let calls = calls_in(graph, "svc/UserService.java");
+        for call in [
+            "svc::UserService::describe -> model::User::getName",
+            "svc::UserService::describe -> model::User::setActive",
+            "svc::UserService::make -> model::User::builder",
+        ] {
+            assert!(
+                calls.contains(&call.to_string()),
+                "{call}\n{}",
+                graph.report()
+            );
+        }
+    }
+
+    /// Upstream #912: a member the source declares is never generated
+    /// again; the other fields still get theirs.
+    #[test]
+    fn pr912_lombok_never_overrides_a_hand_written_accessor() {
+        let project = Project::new()
+            .file(
+                "model/Account.java",
+                "package model;\nimport lombok.Getter;\n\n@Getter\npublic class Account {\n    private int balance;\n    private String owner;\n\n    // explicit getter — Lombok skips it, so must we\n    public int getBalance() { return balance < 0 ? 0 : balance; }\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        let balance: Vec<_> = graph
+            .nodes
+            .iter()
+            .filter(|node| node.name == "getBalance")
+            .collect();
+        assert_eq!(balance.len(), 1, "{}", graph.report());
+        assert!(!is_lombok(balance[0]), "{}", graph.report());
+        assert!(
+            graph
+                .nodes
+                .iter()
+                .any(|node| node.name == "getOwner" && is_lombok(node)),
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream #912: field-level `@Getter` / `@Setter`, a `final` field
+    /// gets no setter, and a field without either gets nothing.
+    #[test]
+    fn pr912_lombok_field_annotations_and_final_fields() {
+        let project = Project::new()
+            .file(
+                "model/Box.java",
+                "package model;\nimport lombok.Getter;\nimport lombok.Setter;\n\npublic class Box {\n    @Getter @Setter private String label;\n    @Getter private final long id;     // final → getter only, no setter\n    private int hidden;                // no annotation → nothing\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        let lombok = |name: &str| {
+            graph
+                .nodes
+                .iter()
+                .any(|node| node.name == name && is_lombok(node))
+        };
+        assert!(lombok("getLabel"), "{}", graph.report());
+        assert!(lombok("setLabel"), "{}", graph.report());
+        assert!(lombok("getId"), "{}", graph.report());
+        assert!(
+            !graph.nodes.iter().any(|node| node.name == "setId"),
+            "{}",
+            graph.report()
+        );
+        assert!(
+            !graph.nodes.iter().any(|node| node.name == "getHidden"),
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream #912: a plain Java class gets nothing.
+    #[test]
+    fn pr912_a_plain_java_class_gets_no_synthesized_members() {
+        let project = Project::new()
+            .file(
+                "model/Plain.java",
+                "package model;\n\npublic class Plain {\n    private int value;\n    public int getValue() { return value; }\n    public void setValue(int v) { this.value = v; }\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        assert!(!graph.nodes.iter().any(is_lombok), "{}", graph.report());
+    }
 }
 
 mod kotlin {

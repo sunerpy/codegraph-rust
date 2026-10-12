@@ -2982,10 +2982,262 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
         self.open_cpp_class_scope(&class_node.id, resolved_body);
         self.extract_inheritance(node, &class_node.id);
         self.extract_decorators_for(node, &class_node.id);
-        self.node_stack.push(class_node.id);
+        self.node_stack.push(class_node.id.clone());
         let body = self.resolve_body(node).unwrap_or(node);
         self.visit_named_children(body);
+        // After the body, so a hand-written member wins, and while the class
+        // is on the stack, so containment and qualified names attach.
+        if self.spec.language() == Language::Java {
+            self.synthesize_lombok_members(node, &class_node);
+        }
         self.node_stack.pop();
+    }
+
+    /// The members Lombok generates at compile time, which no source declares
+    /// (upstream #912 `synthesizeLombokMembers`): getters and setters for
+    /// `@Getter` / `@Setter` (class or field), `@Data` (setters for non-final
+    /// fields) and `@Value` (getters), `builder()` for `@Builder` /
+    /// `@SuperBuilder`, `toString` / `equals` / `hashCode` for `@Data`,
+    /// `@Value`, `@ToString` and `@EqualsAndHashCode`, and the `log` field of
+    /// the `@Log*` family. Each is anchored on the field's or the class's name
+    /// token, marked with a `lombok` decorator and a docstring naming its
+    /// annotation, and never replaces a member the class declares (methods
+    /// and fields apart). Constructors, fluent builder setters and
+    /// `@Accessors(fluent = true)` names are not generated.
+    fn synthesize_lombok_members(&mut self, class: SyntaxNode<'tree>, class_node: &Node) {
+        use crate::lang::{
+            LOMBOK_LOG_ANNOTATIONS, has_word, lombok_annotation_names, lombok_getter_name,
+            lombok_setter_name, modifier_text, normalize_java_type,
+        };
+        let class_annotations = lombok_annotation_names(class, self.source);
+        let has = |name: &str| class_annotations.iter().any(|a| a == name);
+        let class_getter = has("Getter");
+        let class_setter = has("Setter");
+        let data = has("Data");
+        let value = has("Value");
+        let builder = has("Builder") || has("SuperBuilder");
+        let to_string = data || value || has("ToString");
+        let equals = data || value || has("EqualsAndHashCode");
+        let log = class_annotations
+            .iter()
+            .find(|a| LOMBOK_LOG_ANNOTATIONS.contains(&a.as_str()))
+            .cloned();
+        let Some(body) = child_by_field(class, "body") else {
+            return;
+        };
+        let fields: Vec<SyntaxNode<'tree>> = body
+            .named_children(&mut body.walk())
+            .filter(|child| child.kind() == "field_declaration")
+            .collect();
+        let lombok_class = class_getter
+            || class_setter
+            || data
+            || value
+            || builder
+            || to_string
+            || equals
+            || log.is_some();
+        if !lombok_class
+            && !fields
+                .iter()
+                .any(|field| !lombok_annotation_names(*field, self.source).is_empty())
+        {
+            return;
+        }
+        // What the class declares itself: Lombok never replaces it.
+        let mut taken_methods: HashSet<String> = HashSet::new();
+        let mut taken_fields: HashSet<String> = HashSet::new();
+        for node in &self.nodes {
+            if node.file_path != self.file_path
+                || node.qualified_name != format!("{}::{}", class_node.qualified_name, node.name)
+            {
+                continue;
+            }
+            match node.kind {
+                NodeKind::Method | NodeKind::Function => {
+                    taken_methods.insert(node.name.clone());
+                }
+                NodeKind::Field | NodeKind::Variable | NodeKind::Constant | NodeKind::Property => {
+                    taken_fields.insert(node.name.clone());
+                }
+                _ => {}
+            }
+        }
+        let class_name_node = child_by_field(class, "name").unwrap_or(class);
+        let class_name = class_node.name.clone();
+        let mut emit = |walker: &mut Self,
+                        name: String,
+                        anchor: SyntaxNode<'tree>,
+                        signature: String,
+                        annotation: &str,
+                        is_static: bool,
+                        return_type: Option<String>| {
+            if name.is_empty() || !taken_methods.insert(name.clone()) {
+                return;
+            }
+            walker.create_node(
+                NodeKind::Method,
+                &name,
+                anchor,
+                NodeExtra {
+                    visibility: Some("public".to_string()),
+                    signature: Some(signature),
+                    docstring: Some(format!("Lombok-generated ({annotation})")),
+                    decorators: vec!["lombok".to_string()],
+                    is_static,
+                    return_type,
+                    ..NodeExtra::default()
+                },
+            );
+        };
+        for field in fields {
+            let modifiers = modifier_text(field, self.source);
+            // Lombok skips static fields.
+            if has_word(&modifiers, "static") {
+                continue;
+            }
+            let is_final = has_word(&modifiers, "final");
+            let field_annotations = lombok_annotation_names(field, self.source);
+            let field_getter = field_annotations.iter().any(|a| a == "Getter");
+            let field_setter = field_annotations.iter().any(|a| a == "Setter");
+            let want_getter = class_getter || data || value || field_getter;
+            let want_setter = (class_setter || data || field_setter) && !is_final;
+            if !want_getter && !want_setter {
+                continue;
+            }
+            let type_node = child_by_field(field, "type");
+            let type_text = type_node.map_or_else(
+                || "Object".to_string(),
+                |node| node_text(node, self.source).trim().to_string(),
+            );
+            let boolean_primitive = type_node.is_some_and(|node| node.kind() == "boolean_type");
+            let return_type = type_node.and_then(|node| normalize_java_type(node, self.source));
+            let declarators: Vec<SyntaxNode<'tree>> = field
+                .named_children(&mut field.walk())
+                .filter(|child| child.kind() == "variable_declarator")
+                .collect();
+            for declarator in declarators {
+                let Some(name_node) = child_by_field(declarator, "name") else {
+                    continue;
+                };
+                let field_name = node_text(name_node, self.source).trim().to_string();
+                if field_name.is_empty() {
+                    continue;
+                }
+                if want_getter {
+                    let getter = lombok_getter_name(&field_name, boolean_primitive);
+                    let annotation = if field_getter {
+                        "@Getter"
+                    } else if data {
+                        "@Data"
+                    } else if value {
+                        "@Value"
+                    } else {
+                        "@Getter"
+                    };
+                    let signature = format!("{type_text} {getter}()");
+                    emit(
+                        self,
+                        getter,
+                        name_node,
+                        signature,
+                        annotation,
+                        false,
+                        return_type.clone(),
+                    );
+                }
+                if want_setter {
+                    let setter = lombok_setter_name(&field_name, boolean_primitive);
+                    let annotation = if field_setter {
+                        "@Setter"
+                    } else if data {
+                        "@Data"
+                    } else {
+                        "@Setter"
+                    };
+                    let signature = format!("void {setter}({type_text} {field_name})");
+                    emit(self, setter, name_node, signature, annotation, false, None);
+                }
+            }
+        }
+        if builder {
+            let annotation = if has("SuperBuilder") {
+                "@SuperBuilder"
+            } else {
+                "@Builder"
+            };
+            emit(
+                self,
+                "builder".to_string(),
+                class_name_node,
+                format!("static {class_name}.{class_name}Builder builder()"),
+                annotation,
+                true,
+                Some(format!("{class_name}Builder")),
+            );
+        }
+        if to_string {
+            let annotation = if data {
+                "@Data"
+            } else if value {
+                "@Value"
+            } else {
+                "@ToString"
+            };
+            emit(
+                self,
+                "toString".to_string(),
+                class_name_node,
+                "String toString()".to_string(),
+                annotation,
+                false,
+                None,
+            );
+        }
+        if equals {
+            let annotation = if data {
+                "@Data"
+            } else if value {
+                "@Value"
+            } else {
+                "@EqualsAndHashCode"
+            };
+            emit(
+                self,
+                "equals".to_string(),
+                class_name_node,
+                "boolean equals(Object o)".to_string(),
+                annotation,
+                false,
+                None,
+            );
+            emit(
+                self,
+                "hashCode".to_string(),
+                class_name_node,
+                "int hashCode()".to_string(),
+                annotation,
+                false,
+                None,
+            );
+        }
+        if let Some(log) = log
+            && taken_fields.insert("log".to_string())
+        {
+            self.create_node(
+                NodeKind::Field,
+                "log",
+                class_name_node,
+                NodeExtra {
+                    visibility: Some("private".to_string()),
+                    is_static: true,
+                    signature: Some("Logger log".to_string()),
+                    docstring: Some(format!("Lombok-generated (@{log})")),
+                    decorators: vec!["lombok".to_string()],
+                    ..NodeExtra::default()
+                },
+            );
+        }
     }
 
     fn extract_struct(&mut self, node: SyntaxNode<'tree>) {
@@ -9025,6 +9277,205 @@ class Widget: Base, Named {}
 "#;
         let (_, refs) = run("s.swift", src, Language::Swift);
         assert!(has_ref(&refs, EdgeKind::Extends, "Base"));
+    }
+
+    /// Upstream #912: Lombok's members are nodes of their class, in
+    /// upstream's order (a local class's first: it is done during the body
+    /// walk), anchored on the field's or the class's name token;
+    /// a static field gets none, `@Value` makes no setter, a member the class
+    /// declares (or a nested class's) is not generated again only when it is
+    /// the class's own, and a local class gets its members too.
+    #[test]
+    fn lombok_members_are_synthesized_in_upstreams_order() {
+        let src = "package app;\n\nimport lombok.*;\n\n@lombok.Value\n@SuperBuilder\n@CommonsLog\n@Slf4j\npublic class Point {\n    int x, y;\n    boolean isOn;\n    Boolean ready;\n    java.util.List<String> tags;\n    static int count;\n    private Object log;\n\n    class Inner {\n        int getX() { return 0; }\n    }\n\n    void build() {\n        @Getter class Local {\n            String label;\n        }\n    }\n}\n";
+        let (nodes, _) = run("src/app/Point.java", src, Language::Java);
+        // Qualified name, kind, line, column, signature, docstring, static.
+        type Synthesized<'a> = (
+            String,
+            NodeKind,
+            i64,
+            i64,
+            Option<&'a str>,
+            Option<&'a str>,
+            bool,
+        );
+        let lombok: Vec<Synthesized> = nodes
+            .iter()
+            .filter(|node| node.decorators.iter().any(|d| d == "lombok"))
+            .map(|node| {
+                (
+                    node.qualified_name.clone(),
+                    node.kind,
+                    node.start_line,
+                    node.start_column,
+                    node.signature.as_deref(),
+                    node.docstring.as_deref(),
+                    node.is_static,
+                )
+            })
+            .collect();
+        let value = Some("Lombok-generated (@Value)");
+        let method = |qualified: &str, line, column, signature, docstring, is_static| {
+            (
+                qualified.to_string(),
+                NodeKind::Method,
+                line,
+                column,
+                Some(signature),
+                docstring,
+                is_static,
+            )
+        };
+        assert_eq!(
+            lombok,
+            [
+                method(
+                    "app::Point::build::Local::getLabel",
+                    23,
+                    19,
+                    "String getLabel()",
+                    Some("Lombok-generated (@Getter)"),
+                    false
+                ),
+                method("app::Point::getX", 10, 8, "int getX()", value, false),
+                method("app::Point::getY", 10, 11, "int getY()", value, false),
+                method("app::Point::isOn", 11, 12, "boolean isOn()", value, false),
+                method(
+                    "app::Point::getReady",
+                    12,
+                    12,
+                    "Boolean getReady()",
+                    value,
+                    false
+                ),
+                method(
+                    "app::Point::getTags",
+                    13,
+                    27,
+                    "java.util.List<String> getTags()",
+                    value,
+                    false
+                ),
+                method(
+                    "app::Point::getLog",
+                    15,
+                    19,
+                    "Object getLog()",
+                    value,
+                    false
+                ),
+                method(
+                    "app::Point::builder",
+                    9,
+                    13,
+                    "static Point.PointBuilder builder()",
+                    Some("Lombok-generated (@SuperBuilder)"),
+                    true
+                ),
+                method(
+                    "app::Point::toString",
+                    9,
+                    13,
+                    "String toString()",
+                    value,
+                    false
+                ),
+                method(
+                    "app::Point::equals",
+                    9,
+                    13,
+                    "boolean equals(Object o)",
+                    value,
+                    false
+                ),
+                method(
+                    "app::Point::hashCode",
+                    9,
+                    13,
+                    "int hashCode()",
+                    value,
+                    false
+                ),
+            ]
+        );
+        let get_tags = node(&nodes, NodeKind::Method, "getTags");
+        assert_eq!(get_tags.return_type.as_deref(), Some("List"));
+        assert_eq!(get_tags.visibility.as_deref(), Some("public"));
+        assert_eq!(node(&nodes, NodeKind::Method, "isOn").return_type, None);
+        assert_eq!(
+            node(&nodes, NodeKind::Method, "builder")
+                .return_type
+                .as_deref(),
+            Some("PointBuilder")
+        );
+        // The class declares its own `log`, so no logger is generated, and a
+        // nested class's `getX` does not hide the outer one's.
+        assert!(!nodes.iter().any(|n| n.kind == NodeKind::Field
+            && n.name == "log"
+            && n.decorators.iter().any(|d| d == "lombok")));
+        assert!(
+            nodes
+                .iter()
+                .any(|n| n.qualified_name == "app::Point::Inner::getX" && n.decorators.is_empty())
+        );
+        assert!(!nodes.iter().any(|n| n.name.starts_with("set")));
+        assert!(!nodes.iter().any(|n| n.name == "getCount"));
+    }
+
+    /// Upstream #912: a setter for every non-final field of a `@Data` class,
+    /// a class-level `@Getter` with a field-level `@Setter`, and the logger of
+    /// the first `@Log*` annotation.
+    #[test]
+    fn lombok_setters_and_the_logger_follow_their_annotations() {
+        let src = "package app;\n\n@Getter\n@Log4j2\n@Slf4j\nclass Bean {\n    @Setter private int a;\n    private final int b = 1;\n    @lombok.Setter boolean isOk;\n}\n\n@Data\nclass Row {\n    private final long id;\n    private String name;\n}\n";
+        let (nodes, _) = run("src/app/Bean.java", src, Language::Java);
+        let names = |class: &str| {
+            let mut out: Vec<String> = nodes
+                .iter()
+                .filter(|n| n.decorators.iter().any(|d| d == "lombok"))
+                .filter(|n| n.qualified_name.starts_with(&format!("app::{class}::")))
+                .map(|n| {
+                    format!(
+                        "{:?} {} {}",
+                        n.kind,
+                        n.name,
+                        n.docstring.as_deref().unwrap_or("")
+                    )
+                })
+                .collect();
+            out.sort();
+            out
+        };
+        assert_eq!(
+            names("Bean"),
+            [
+                "Field log Lombok-generated (@Log4j2)",
+                "Method getA Lombok-generated (@Getter)",
+                "Method getB Lombok-generated (@Getter)",
+                "Method isOk Lombok-generated (@Getter)",
+                "Method setA Lombok-generated (@Setter)",
+                "Method setOk Lombok-generated (@Setter)",
+            ]
+        );
+        assert_eq!(
+            names("Row"),
+            [
+                "Method equals Lombok-generated (@Data)",
+                "Method getId Lombok-generated (@Data)",
+                "Method getName Lombok-generated (@Data)",
+                "Method hashCode Lombok-generated (@Data)",
+                "Method setName Lombok-generated (@Data)",
+                "Method toString Lombok-generated (@Data)",
+            ]
+        );
+        let log = node(&nodes, NodeKind::Field, "log");
+        assert!(log.is_static);
+        assert_eq!(log.visibility.as_deref(), Some("private"));
+        assert_eq!(log.signature.as_deref(), Some("Logger log"));
+        assert_eq!(
+            node(&nodes, NodeKind::Method, "setOk").signature.as_deref(),
+            Some("void setOk(boolean isOk)")
+        );
     }
 
     /// Upstream #2174: a Kotlin infix call is a call of the infix function
