@@ -802,3 +802,47 @@ fn continuations_splice_before_comments_and_macro_values_keep_their_number() {
         );
     }
 }
+
+/// Upstream #2292 (#2127): resolving a project whose call site reaches a deep
+/// include graph of value-guarded headers (`#define H_0_a 1`, which the walk
+/// does not read as a guard) finishes, and keeps #1838's suppression: the
+/// macro the unit reaches binds to no decoy function, and the decoy's own
+/// caller still reaches it.
+#[test]
+fn a_deep_include_graph_keeps_macro_suppression() {
+    let mut fixture: Vec<(String, String)> = Vec::new();
+    let depth = 24;
+    for d in 0..depth {
+        for side in ["a", "b"] {
+            let guard = format!("H_{d}_{side}");
+            let next = if d + 1 < depth {
+                format!("#include \"h{}_a.h\"\n#include \"h{}_b.h\"\n", d + 1, d + 1)
+            } else {
+                String::new()
+            };
+            fixture.push((
+                format!("h{d}_{side}.h"),
+                format!(
+                    "#ifndef {guard}\n#define {guard} 1\n{next}#define M_{d}_{side}(x) (x)\nint f_{d}_{side}(int);\n#endif\n"
+                ),
+            ));
+        }
+    }
+    fixture.extend(files(&[
+        ("trace.h", "#define TRACE(v) ((void)(v))\n"),
+        (
+            "unit.cpp",
+            "#include \"h0_a.h\"\n#include \"h0_b.h\"\n#include \"trace.h\"\nvoid unit() { TRACE(1); }\n",
+        ),
+        (
+            "decoy.cpp",
+            "void TRACE(int v) {}\nvoid caller() { TRACE(2); }\n",
+        ),
+    ]));
+    let graph = resolve_project("deep-include-walk", &fixture);
+    assert_eq!(graph.calls("unit"), Vec::<String>::new());
+    assert_eq!(
+        graph.calls("caller"),
+        ["function TRACE (decoy.cpp)".to_string()]
+    );
+}
