@@ -637,6 +637,7 @@ matrix! {
     typescript_require_default_of_an_added_es_module,
     typescript_namespace_reexport_member_reaches_an_added_module,
     typescript_dollar_import_reaches_an_added_module,
+    typescript_dollar_default_export_names_another_declaration,
     java_super_call_in_an_override_body_edit,
     java_annotation_ignores_a_case_variant_method_body_edit,
     typescript_outside_type_call_ignores_an_added_method,

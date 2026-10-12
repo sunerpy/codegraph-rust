@@ -1373,6 +1373,13 @@ fn rust_use_path_is_out_of_repo(
     true
 }
 
+/// A JavaScript identifier without escapes: an `ID_Start` letter, `$` or
+/// `_`, then `ID_Continue`, `$`, ZWNJ or ZWJ. Upstream's `[A-Za-z_$][\w$]*`
+/// (#2378, #2384) is its ASCII subset; the `\w+` the local alias forms read
+/// before took the Unicode letters but not `$`, so `export default items$;`
+/// bound nothing.
+const JS_IDENTIFIER: &str = r"[\p{ID_Start}_$][\p{ID_Continue}$\x{200C}\x{200D}]*";
+
 /// Extract JS/TS cross-file re-exports and explicit local export aliases
 /// (`extractReExports`, `import-resolver.ts:989-1042`).
 pub fn extract_re_exports(content: &str, language: Language) -> Vec<ReExport> {
@@ -1402,16 +1409,20 @@ pub fn extract_re_exports(content: &str, language: Language) -> Vec<ReExport> {
         Regex::new(r#"export\s*\{([^}]+)\}\s*from\s*['"]([^'"]+)['"]"#).expect("reexport named")
     });
     let local_const_re = LOCAL_CONST_RE.get_or_init(|| {
-        Regex::new(r"(?m)\bexport[ \t]+const[ \t]+(\w+)[ \t]*=[ \t]*(\w+)[ \t]*(?:;[ \t]*)?$")
-            .expect("local const export alias")
+        Regex::new(&format!(
+            r"(?m)\bexport[ \t]+const[ \t]+({JS_IDENTIFIER})[ \t]*=[ \t]*({JS_IDENTIFIER})[ \t]*(?:;[ \t]*)?$"
+        ))
+        .expect("local const export alias")
     });
     let local_named_re = LOCAL_NAMED_RE.get_or_init(|| {
         Regex::new(r"(?m)\bexport[ \t]*\{([^}]+)\}[ \t]*;?[ \t]*$")
             .expect("local named export alias")
     });
     let local_default_re = LOCAL_DEFAULT_RE.get_or_init(|| {
-        Regex::new(r"(?m)\bexport[ \t]+default[ \t]+(\w+)[ \t]*;?[ \t]*$")
-            .expect("local default export alias")
+        Regex::new(&format!(
+            r"(?m)\bexport[ \t]+default[ \t]+({JS_IDENTIFIER})[ \t]*;?[ \t]*$"
+        ))
+        .expect("local default export alias")
     });
 
     for caps in wildcard_re.captures_iter(&cleaned) {
@@ -4536,6 +4547,49 @@ export const memberAlias = namespace.target;
                 if ["mutableLetAlias", "mutableVarAlias", "callAlias", "memberAlias"]
                     .contains(&exported_name.as_str())
         )));
+    }
+
+    #[test]
+    fn extract_re_exports_reads_dollar_and_unicode_identifiers_in_local_aliases() {
+        let content = "const $fmt = () => 1;\nexport default $fmt;\nfunction make$() {}\nexport const $make = make$;\nexport const café = naïve;\n";
+        let out = extract_re_exports(content, Language::TypeScript);
+        let aliases: Vec<(&str, &str)> = out
+            .iter()
+            .filter_map(|r| match r {
+                ReExport::LocalAlias {
+                    exported_name,
+                    original_name,
+                } => Some((exported_name.as_str(), original_name.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            aliases,
+            [("$make", "make$"), ("café", "naïve"), ("default", "$fmt")]
+        );
+        let trailing = extract_re_exports(
+            "const items$ = {};\nexport default items$;\n",
+            Language::JavaScript,
+        );
+        assert_eq!(
+            trailing,
+            [ReExport::LocalAlias {
+                exported_name: "default".to_string(),
+                original_name: "items$".to_string(),
+            }]
+        );
+        // A default that is no identifier binds nothing new: `42` and a call.
+        let none = extract_re_exports(
+            "export default 42;\nexport default make$();\n",
+            Language::JavaScript,
+        );
+        assert!(
+            none.iter().all(|r| !matches!(
+                r,
+                ReExport::LocalAlias { original_name, .. } if original_name.starts_with("make")
+            )),
+            "{none:?}"
+        );
     }
 
     #[test]

@@ -2022,6 +2022,35 @@ mod js {
         assert!(!names.contains(&"useStore::reset"), "{names:?}");
     }
 
+    /// Upstream #2378 / #2384's identifier grammar in the local alias forms:
+    /// `export default $fmt;`, `export default items$;` and `export const
+    /// $make = make$;` bind the declaration they name, so a default import
+    /// reaches that function or constant rather than the module's first
+    /// exported function. `items$` is not its namesake `items`, the default
+    /// is never another module's `$fmt`, and a function binding `$fmt`
+    /// itself calls its local.
+    #[test]
+    fn pr2378_a_dollar_default_or_const_alias_binds_its_declaration() {
+        let project = Project::new()
+            .file("package.json", "{\"name\":\"web\",\"private\":true}")
+            .file("src/fmt.ts", "export function helper(value: string) {\n  return value;\n}\n\nconst $fmt = (value: string) => value + '!';\n\nexport default $fmt;\n")
+            .file("src/items.ts", "export function reset() {\n  return 0;\n}\n\nexport const items = { grow() { return 0; } };\n\nconst items$ = { grow() { return 1; } };\n\nexport default items$;\n")
+            .file("src/alias.ts", "export function other() {\n  return 2;\n}\n\nfunction make$() {\n  return 1;\n}\n\nexport const $make = make$;\n")
+            .file("src/other.ts", "export function $fmt(value: string) {\n  return value + '?';\n}\n")
+            .file("src/use.ts", "import fmt from './fmt';\nimport store from './items';\nimport { $make } from './alias';\n\nexport function show(value: string) {\n  return fmt(value) + $make() + store.grow();\n}\n\nexport function local(value: string) {\n  const $fmt = (v: string) => v;\n  return $fmt(value);\n}\n")
+            .index();
+        assert_edge!(project, "function show" => calls => "function $fmt @src/fmt.ts", resolved_by = "import");
+        assert_no_edge!(project, "function show" => calls => "function helper");
+        assert_no_edge!(project, "function show" => calls => "function $fmt @src/other.ts");
+        assert_edge!(project, "function show" => calls => "function make$ @src/alias.ts");
+        assert_no_edge!(project, "function show" => calls => "function other");
+        assert_edge!(project, "function show" => calls => "function items$::grow @src/items.ts", resolved_by = "import");
+        assert_no_edge!(project, "function show" => calls => "function items::grow");
+        assert_no_edge!(project, "function show" => calls => "function reset");
+        assert_no_edge!(project, "function local" => calls => "function $fmt @src/fmt.ts");
+        assert_no_edge!(project, "function local" => calls => "function $fmt @src/other.ts");
+    }
+
     /// Upstream #2161 (`2d1b6441`): a `.js` whose leading comments carry
     /// Flow's `@flow` pragma is read as TSX once Flow's own syntax is blanked,
     /// so `render(): React.Node` no longer cuts its class short, and its file

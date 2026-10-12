@@ -1532,6 +1532,28 @@ pub fn typescript_namespace_reexport_member_reaches_an_added_module() -> Case {
         .edge_after("function check", "calls", "function safeParse")
 }
 
+/// Upstream #2378's identifier grammar: `export default $fmt;` that comes
+/// to name `$other` moves an unchanged default importer, as on a fresh
+/// index, rather than both falling back to the first exported function.
+pub fn typescript_dollar_default_export_names_another_declaration() -> Case {
+    Case::new(Change::ReexportEdit, &[Language::TypeScript])
+        .file(
+            "src/fmt.ts",
+            "export function helper(value: string) {\n  return value;\n}\n\nconst $fmt = (value: string) => value + '!';\nconst $other = (value: string) => value + '?';\n\nexport default $fmt;\n",
+        )
+        .file(
+            "src/use.ts",
+            "import fmt from './fmt';\n\nexport function show(value: string) {\n  return fmt(value);\n}\n",
+        )
+        .write(
+            "src/fmt.ts",
+            "export function helper(value: string) {\n  return value;\n}\n\nconst $fmt = (value: string) => value + '!';\nconst $other = (value: string) => value + '?';\n\nexport default $other;\n",
+        )
+        .edge_before("function show", "calls", "function $fmt")
+        .edge_after("function show", "calls", "function $other")
+        .no_edge_after("function show", "calls", "function helper")
+}
+
 /// Upstream #2378: a `$`-named default import binds its module's default
 /// export once the module appears, ahead of another file's namesake.
 pub fn typescript_dollar_import_reaches_an_added_module() -> Case {
