@@ -2693,4 +2693,25 @@ mod js {
             component_calls("components/Dialog.vue")
         );
     }
+
+    /// Upstream #2177 (`48498021`), its JavaScript part: fetch's Response,
+    /// Request and Blob body methods (`text`, `json`, `arrayBuffer`, `blob`,
+    /// `formData`) are builtins, so a call on an untyped receiver is fetch's,
+    /// not a project class's method of that name, whatever the receiver is
+    /// called; a receiver the code constructs still reaches the class.
+    #[test]
+    fn pr2177_fetch_body_methods_need_receiver_evidence() {
+        let project = Project::new()
+            .file("src/file.js", "export class LazyFile {\n  text() { return ''; }\n  json() { return {}; }\n  blob() { return null; }\n  formData() { return null; }\n  arrayBuffer() { return null; }\n}\n\nexport async function load(response, file, lazyFile) {\n  const body = await response.text();\n  await file.text();\n  await lazyFile.json();\n  await lazyFile.blob();\n  await file.arrayBuffer();\n  await file.formData();\n  return body;\n}\n\nexport function local() {\n  const made = new LazyFile();\n  return made.text();\n}\n")
+            .index();
+        let graph = project.graph();
+        let id = |name: &str| the_node(graph, name, None).id.clone();
+        assert_eq!(
+            calls_of(graph, &id("load"), false),
+            Vec::<String>::new(),
+            "{}",
+            graph.report()
+        );
+        assert_eq!(calls_of(graph, &id("local"), false), ["LazyFile::text"]);
+    }
 }

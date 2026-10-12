@@ -1026,6 +1026,22 @@ pub fn vue_template_call_reaches_an_added_composable() -> Case {
     )
 }
 
+/// Upstream #2177: `file.text()` on an untyped receiver is fetch's body
+/// method, so a project class's `text` added later is never its target, as a
+/// fresh index of the edit finds.
+pub fn javascript_fetch_body_call_ignores_an_added_method() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::JavaScript])
+        .file(
+            "src/load.js",
+            "export async function load(file) {\n  return file.text();\n}\n",
+        )
+        .write(
+            "src/LazyFile.js",
+            "export class LazyFile {\n  text() {\n    return '';\n  }\n}\n",
+        )
+        .no_edge_after("function load", "calls", "method LazyFile::text")
+}
+
 /// Upstream #2263: a CommonJS `require('./application')` imports that file once
 /// it appears, though the binding is only ever used as a value.
 pub fn javascript_require_imports_an_added_module() -> Case {

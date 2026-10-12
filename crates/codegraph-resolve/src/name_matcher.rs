@@ -439,14 +439,17 @@ pub(crate) fn is_js_ts(language: Language) -> bool {
 /// Method names that require receiver evidence before a JS/TS call links to
 /// project code (`JS_BUILTIN_METHODS`, upstream v1.6.1 #1987): Array / typed
 /// array and collection, String, Promise, Function, EventTarget /
-/// EventEmitter and iterator methods. Sorted for binary search.
-const JS_BUILTIN_METHODS: [&str; 103] = [
+/// EventEmitter and iterator methods, and fetch's Response / Request / Blob
+/// bodies (upstream #2177). Sorted for binary search.
+const JS_BUILTIN_METHODS: [&str; 108] = [
     "add",
     "addEventListener",
     "addListener",
     "apply",
+    "arrayBuffer",
     "at",
     "bind",
+    "blob",
     "call",
     "catch",
     "charAt",
@@ -473,12 +476,14 @@ const JS_BUILTIN_METHODS: [&str; 103] = [
     "flat",
     "flatMap",
     "forEach",
+    "formData",
     "get",
     "getMaxListeners",
     "has",
     "includes",
     "indexOf",
     "join",
+    "json",
     "keys",
     "lastIndexOf",
     "listenerCount",
@@ -523,6 +528,7 @@ const JS_BUILTIN_METHODS: [&str; 103] = [
     "substr",
     "substring",
     "take",
+    "text",
     "then",
     "throw",
     "toArray",
