@@ -81,7 +81,7 @@ struct TypeName {
 }
 
 /// `SkipList<const char*, Cmp<int>>::Iterator` → `SkipList::Iterator`.
-fn strip_template_arguments(text: &str) -> String {
+pub(crate) fn strip_template_arguments(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut depth = 0usize;
     for c in text.chars() {
@@ -160,13 +160,12 @@ pub(crate) fn is_cpp_pointer_type(raw: &str) -> bool {
 /// The `::` segments of a written type: `const ns::Foo<T>&` → `["ns", "Foo"]`.
 /// `None` when what is written is not a plain (possibly qualified) type name:
 /// `unsigned int`, `decltype(…)`, a function type.
-#[cfg(test)]
-fn cpp_type_segments(raw: &str) -> Option<Vec<String>> {
+pub(crate) fn cpp_type_segments(raw: &str) -> Option<Vec<String>> {
     cpp_type_name(raw).map(|name| name.names)
 }
 
 /// C and C++ declare the names a C++ file can see (a header may be either).
-fn is_c_family(node: &Node) -> bool {
+pub(crate) fn is_c_family(node: &Node) -> bool {
     matches!(node.language, Language::Cpp | Language::C)
 }
 
@@ -184,13 +183,13 @@ fn is_declaring_kind(kind: NodeKind) -> bool {
     )
 }
 
-fn is_class_kind(kind: NodeKind) -> bool {
+pub(crate) fn is_class_kind(kind: NodeKind) -> bool {
     matches!(kind, NodeKind::Class | NodeKind::Struct | NodeKind::Union)
 }
 
 /// Scopes visible from inside the scope `qualified`, innermost first, ending
 /// with the global scope.
-fn scopes_within(qualified: &str) -> Vec<String> {
+pub(crate) fn scopes_within(qualified: &str) -> Vec<String> {
     let parts: Vec<&str> = if qualified.is_empty() {
         Vec::new()
     } else {
@@ -204,7 +203,7 @@ fn scopes_within(qualified: &str) -> Vec<String> {
 
 /// The scope a declaration sits in: `leveldb::MemTable` for
 /// `leveldb::MemTable::Table`.
-fn parent_scope(qualified: &str) -> &str {
+pub(crate) fn parent_scope(qualified: &str) -> &str {
     qualified.rsplit_once("::").map_or("", |(scope, _)| scope)
 }
 
@@ -422,17 +421,28 @@ enum Declared {
     Class(String),
     /// An enum, namespace or other non-class type.
     Other,
-    /// Aliases naming different types, none of them the calling file's.
-    Ambiguous,
+    /// Aliases naming different types, none of them the calling file's:
+    /// rocksdb's `using DBWithTTLImplBase = …;` in each arm of an `#if`.
+    Ambiguous(Vec<Arc<Node>>),
 }
 
+/// Which declarations a lookup can see; every one unless a caller narrows it
+/// (upstream #2407).
+pub(crate) type Visible<'v> = Option<&'v dyn Fn(&Node) -> bool>;
+
 /// C and C++ declarations named `name` that can stand for a type or scope.
-fn type_declarations(name: &str, context: &dyn ResolutionContext) -> Vec<Arc<Node>> {
+fn type_declarations(
+    name: &str,
+    context: &dyn ResolutionContext,
+    visible: Visible<'_>,
+) -> Vec<Arc<Node>> {
     context
         .get_nodes_by_name_shared(name)
         .into_iter()
         .filter(|node| {
-            is_c_family(node) && (node.kind == NodeKind::TypeAlias || is_declaring_kind(node.kind))
+            is_c_family(node)
+                && (node.kind == NodeKind::TypeAlias || is_declaring_kind(node.kind))
+                && visible.is_none_or(|visible| visible(node))
         })
         .collect()
 }
@@ -468,7 +478,10 @@ fn declared_in(
     if here.iter().any(|node| node.kind != NodeKind::TypeAlias) {
         return Some(Declared::Other);
     }
-    Some(pick_alias(&here, reference, context).map_or(Declared::Ambiguous, Declared::Alias))
+    Some(pick_alias(&here, reference, context).map_or_else(
+        || Declared::Ambiguous(here.iter().map(|alias| Arc::clone(alias)).collect()),
+        Declared::Alias,
+    ))
 }
 
 /// One of several aliases a scope declares under one name (a translation unit
@@ -552,7 +565,7 @@ fn collect_template_header(
 
 /// The template parameters in scope where `node` is declared: its own
 /// `template <…>` header and those of the class templates around it.
-fn template_parameters_around(
+pub(crate) fn template_parameters_around(
     node: &Node,
     context: &dyn ResolutionContext,
 ) -> Arc<BTreeSet<String>> {
@@ -725,8 +738,9 @@ fn lookup_unqualified(
     scopes: &[String],
     reference: &RefView,
     context: &dyn ResolutionContext,
+    visible: Visible<'_>,
 ) -> Option<Declared> {
-    let named = type_declarations(name, context);
+    let named = type_declarations(name, context, visible);
     if named.is_empty() {
         return None;
     }
@@ -806,20 +820,115 @@ pub(crate) fn cpp_aliased_type_name(resolved: &CppAliasedType) -> String {
         .join("::")
 }
 
-fn follow(
-    name: &TypeName,
-    scope: &str,
+/// What a C++ type name names when it is looked up for a class (upstream
+/// #2407 `CppNamedClass`).
+#[derive(Debug, Clone)]
+pub(crate) enum CppNamedClass {
+    /// A class, by its qualified name.
+    Class(String),
+    /// An alias that leads to none of the project's classes: one of a type
+    /// outside the project (`template <bool B> using bool_constant =
+    /// std::integral_constant<bool, B>;`), of what a template argument
+    /// decides, or one each `#if` arm declares differently (the first
+    /// declaration).
+    Alias(Arc<Node>),
+    /// No particular class: an enum, a member of a type outside the project.
+    NoClass,
+    /// Nothing in the scopes looked in declares it.
+    NotFound,
+}
+
+/// The class a C++ type written as `written` names, looked up from `scopes`
+/// (innermost first) as a declared type is (a class scope with its bases, a
+/// qualified name a segment at a time) and followed through an alias it
+/// reaches: rocksdb's `InternalIterator` under `using InternalIterator =
+/// InternalIteratorBase<Slice>;` names `InternalIteratorBase` (upstream
+/// #2407 `cppClassNamed`). `visible` narrows the declarations the lookup can
+/// see.
+pub(crate) fn cpp_class_named(
+    written: &str,
+    scopes: &[String],
     reference: &RefView,
     context: &dyn ResolutionContext,
-    hops: u32,
-) -> CppAliased {
-    let scopes = scopes_within(scope);
+    visible: Visible<'_>,
+) -> CppNamedClass {
+    let Some(name) = cpp_type_name(written) else {
+        return CppNamedClass::NoClass;
+    };
+    let (found, next) = lookup_segments(&name, scopes, reference, context, visible);
+    let whole = next == name.names.len();
+    match found {
+        None => CppNamedClass::NotFound,
+        Some(Declared::Other) => CppNamedClass::NoClass,
+        Some(Declared::Class(class)) => CppNamedClass::Class(class),
+        Some(Declared::Ambiguous(mut aliases)) => {
+            // An alias each `#if` arm declares differently: the first
+            // declaration (by path, then line).
+            aliases.sort_by(|a, b| {
+                a.file_path
+                    .cmp(&b.file_path)
+                    .then(a.start_line.cmp(&b.start_line))
+            });
+            match aliases.into_iter().next() {
+                Some(first) if whole => CppNamedClass::Alias(first),
+                _ => CppNamedClass::NoClass,
+            }
+        }
+        Some(Declared::Alias(alias)) => {
+            let written = declaration_text(&alias, context)
+                .and_then(|text| aliased_type_in(&text, &alias.name));
+            // The aliased type is written in the alias's own scope.
+            let parameters = template_parameters_around(&alias, context);
+            let aliased = expand(
+                written.as_deref(),
+                &name.names[next..],
+                &name.templated[next..],
+                parent_scope(&alias.qualified_name),
+                reference,
+                context,
+                1,
+                Some(&parameters),
+            );
+            if let Some(aliased) = aliased.filter(|aliased| !aliased.pointer) {
+                let names: Vec<String> = aliased
+                    .target
+                    .iter()
+                    .chain(&aliased.rest)
+                    .cloned()
+                    .collect();
+                if let Some(class) = class_named(&names, &scopes_within(&aliased.scope), context) {
+                    return CppNamedClass::Class(class);
+                }
+            }
+            // A member of a type outside the project (`Alias::Inner`) is not
+            // the alias.
+            if whole {
+                CppNamedClass::Alias(alias)
+            } else {
+                CppNamedClass::NoClass
+            }
+        }
+    }
+}
+
+/// What a written name declares, looked up from `scopes` (innermost first),
+/// and how many of its segments that took: a class's member is looked up in
+/// the class, and an alias ends the walk (the rest of the name starts at the
+/// returned index). `visible` narrows the declarations the lookup can see.
+fn lookup_segments(
+    name: &TypeName,
+    scopes: &[String],
+    reference: &RefView,
+    context: &dyn ResolutionContext,
+    visible: Visible<'_>,
+) -> (Option<Declared>, usize) {
     let mut found = lookup_unqualified(
         &name.names[0],
         name.templated[0],
-        &scopes,
+        scopes,
         reference,
         context,
+        visible,
     );
     let mut next = 1usize;
     if found.is_none() && name.names.len() > 1 {
@@ -829,7 +938,7 @@ fn follow(
         while end >= 2 && found.is_none() {
             let spelled = &name.names[..end];
             let last = &spelled[end - 1];
-            let named = type_declarations(last, context);
+            let named = type_declarations(last, context, visible);
             let prefix = spelled[..end - 1].join("::");
             found = scopes.iter().find_map(|outer| {
                 let within = if outer.is_empty() {
@@ -860,7 +969,7 @@ fn follow(
         found = member_of(
             &class,
             segment,
-            &type_declarations(segment, context),
+            &type_declarations(segment, context, visible),
             name.templated[next],
             reference,
             context,
@@ -869,6 +978,17 @@ fn follow(
         );
         next += 1;
     }
+    (found, next)
+}
+
+fn follow(
+    name: &TypeName,
+    scope: &str,
+    reference: &RefView,
+    context: &dyn ResolutionContext,
+    hops: u32,
+) -> CppAliased {
+    let (found, next) = lookup_segments(name, &scopes_within(scope), reference, context, None);
     let Some(Declared::Alias(alias)) = found else {
         return CppAliased::NotAnAlias;
     };

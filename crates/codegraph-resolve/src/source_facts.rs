@@ -152,6 +152,7 @@ pub struct SourceFacts {
     cpp_local_alias_lines: Mutex<HashMap<String, Arc<Vec<usize>>>>,
     cpp_template_parameters: Mutex<HashMap<String, Arc<BTreeSet<String>>>>,
     cpp_class_bases: Mutex<HashMap<String, Arc<Vec<String>>>>,
+    cpp_usings: OnceLock<Arc<Vec<crate::cpp_supertypes::CppUsing>>>,
 }
 
 impl SourceFacts {
@@ -191,6 +192,7 @@ impl SourceFacts {
             cpp_local_alias_lines: Mutex::new(HashMap::new()),
             cpp_template_parameters: Mutex::new(HashMap::new()),
             cpp_class_bases: Mutex::new(HashMap::new()),
+            cpp_usings: OnceLock::new(),
         }
     }
 
@@ -542,6 +544,15 @@ impl SourceFacts {
         compute: impl FnOnce(&Self) -> Vec<String>,
     ) -> Arc<Vec<String>> {
         keyed_memo(&self.cpp_class_bases, class_id, || Arc::new(compute(self)))
+    }
+
+    /// The C/C++ `using` declarations, directives and namespace aliases of the
+    /// raw source (upstream #2407); `read` runs once.
+    pub(crate) fn cpp_usings(
+        &self,
+        read: impl FnOnce(&str) -> Vec<crate::cpp_supertypes::CppUsing>,
+    ) -> Arc<Vec<crate::cpp_supertypes::CppUsing>> {
+        Arc::clone(self.cpp_usings.get_or_init(|| Arc::new(read(&self.source))))
     }
 
     /// The C# namespace blocks and `using` directives of the raw source,

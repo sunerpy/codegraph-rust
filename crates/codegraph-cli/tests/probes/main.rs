@@ -111,6 +111,46 @@ fn smoke_file_selector_matches_an_embedded_file_node() {
 /// Upstream #965 (`0a91d0f5`): an import statement is not a definition, so no
 /// reference binds another file's import node by name. App.vue's import of
 /// `vue` used to land on Widget.svelte's import of `vue`.
+/// Upstream #1789's prerequisite phase (W4-CPP-05): the wiring references
+/// (imports, extends, implements) are resolved and persisted before the rest,
+/// so a call on a receiver typed as a subclass declared in the same file
+/// reaches the method its base declares, on a full index and after a sync
+/// that adds the call.
+#[test]
+fn pr1789_a_subclass_call_reaches_the_inherited_method_on_index_and_sync() {
+    const CSHARP_BASE: &str = "namespace Json\n{\n    public abstract class JsonWriter\n    {\n        public virtual void WriteEndObject() { }\n    }\n}\n";
+    const CSHARP_USE: &str = "namespace Json\n{\n    public class JsonTextWriter : JsonWriter\n    {\n        public void Flush() { }\n    }\n\n    public class Program\n    {\n        public void Run()\n        {\n            JsonTextWriter writer = new JsonTextWriter();\n            writer.WriteEndObject();\n        }\n    }\n}\n";
+    const JAVA_BASE: &str = "package app;\n\npublic class Base {\n    public void run() { }\n}\n";
+    const JAVA_USE: &str = "package app;\n\nclass Child extends Base {\n}\n\npublic class Use {\n    public void go() {\n        Child c = new Child();\n        c.run();\n    }\n}\n";
+    let indexed = Project::new()
+        .file("src/JsonWriter.cs", CSHARP_BASE)
+        .file("src/Program.cs", CSHARP_USE)
+        .file("src/app/Base.java", JAVA_BASE)
+        .file("src/app/Use.java", JAVA_USE)
+        .index();
+    assert_edge!(indexed, "method Json::Program::Run" => calls => "method Json::JsonWriter::WriteEndObject");
+    assert_edge!(indexed, "method app::Use::go" => calls => "method app::Base::run");
+
+    let mut synced = Project::new()
+        .file("src/JsonWriter.cs", CSHARP_BASE)
+        .file(
+            "src/Program.cs",
+            "namespace Json\n{\n    public class Program\n    {\n    }\n}\n",
+        )
+        .file("src/app/Base.java", JAVA_BASE)
+        .file(
+            "src/app/Use.java",
+            "package app;\n\npublic class Use {\n}\n",
+        )
+        .index();
+    synced
+        .write("src/Program.cs", CSHARP_USE)
+        .write("src/app/Use.java", JAVA_USE);
+    let graph = synced.sync();
+    assert_edge!(graph, "method Json::Program::Run" => calls => "method Json::JsonWriter::WriteEndObject");
+    assert_edge!(graph, "method app::Use::go" => calls => "method app::Base::run");
+}
+
 #[test]
 fn pr0965_vue_import_never_binds_a_svelte_import_node() {
     let project = Project::new()
@@ -4231,7 +4271,7 @@ mod python {
 }
 
 mod cpp {
-    use super::support::{Graph, Project, assert_edge, assert_unresolved, codegraph};
+    use super::support::{Graph, Project, assert_edge, codegraph};
 
     /// The qualified names of `file`'s nodes of `kind`, sorted.
     fn qualified(graph: &Graph, file: &str, kind: &str) -> Vec<String> {
@@ -4463,9 +4503,9 @@ class Counter {
             named_after(graph, pb_h, &["PROTOBUF_", "ABSL_"]),
             Vec::<String>::new()
         );
-        // The base clause is read; linking `::google::protobuf::Message` from
-        // the global scope is upstream #2407's scope lookup (W4-CPP-05).
-        assert_unresolved!(project, "class google::protobuf::Any" => extends => "::google::protobuf::Message");
+        // The base clause is read, and `::google::protobuf::Message` is found
+        // from the global scope (upstream #2407, W4-CPP-05).
+        assert_edge!(project, "class google::protobuf::Any" => extends => "class google::protobuf::Message");
         assert_eq!(
             qualified(graph, "src/google/protobuf/any.pb.cc", "method"),
             ["google::protobuf::Any::InternalSwap"]
@@ -5116,6 +5156,377 @@ class basic_json
         assert_eq!(
             callees(graph, "app::Run"),
             ["app::DiskStore::Save (store/kinds.h)"],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream #2407's fixture (`cpp-base-class-lookup.test.ts`): protobuf's
+    /// `Message` beside a nested namesake and the PHP extension's C struct,
+    /// leveldb's iterators and test comparator, rocksdb's nested bases,
+    /// aliases and using-directive, googletest's global `::testing::Test`, a
+    /// template parameter, and a using-directive only a header writes.
+    const BASE_LOOKUP: &[(&str, &str)] = &[
+        (
+            "src/google/protobuf/message_lite.h",
+            "namespace google {\nnamespace protobuf {\nnamespace internal {\nclass MessageGlobalsBase {\n public:\n  int default_instance() const { return 0; }\n};\n}  // namespace internal\n}  // namespace protobuf\n}  // namespace google\n",
+        ),
+        (
+            "src/google/protobuf/message.h",
+            "#include \"google/protobuf/message_lite.h\"\nnamespace google {\nnamespace protobuf {\nclass Message {\n public:\n  virtual ~Message();\n  virtual int ByteSizeLong() const = 0;\n};\n}  // namespace protobuf\n}  // namespace google\n",
+        ),
+        (
+            "src/google/protobuf/json/internal/untyped_message.h",
+            "namespace google {\nnamespace protobuf {\nnamespace json_internal {\nclass ResolverPool {\n public:\n  class Message {\n   public:\n    int ByteSizeLong() const { return 0; }\n  };\n};\n}  // namespace json_internal\n}  // namespace protobuf\n}  // namespace google\n",
+        ),
+        (
+            "php/ext/google/protobuf/message.c",
+            "typedef struct {\n  int std;\n} Message;\n",
+        ),
+        (
+            "src/google/protobuf/dynamic_message.cc",
+            "#include \"google/protobuf/message.h\"\nnamespace google {\nnamespace protobuf {\nclass DynamicMessage final : public Message {\n public:\n  int ByteSizeLong() const override { return 1; }\n};\n}  // namespace protobuf\n}  // namespace google\n",
+        ),
+        (
+            "src/google/protobuf/generated_message_bases.h",
+            "#include \"google/protobuf/message.h\"\nnamespace google {\nnamespace protobuf {\nnamespace internal {\nclass ZeroFieldsBase : public Message {\n public:\n  int ByteSizeLong() const override { return 0; }\n};\n}  // namespace internal\n}  // namespace protobuf\n}  // namespace google\n",
+        ),
+        (
+            "src/google/protobuf/any.pb.cc",
+            "#include \"google/protobuf/message_lite.h\"\nnamespace _pbi = ::google::protobuf::internal;\nnamespace google {\nnamespace protobuf {\nstruct AnyGlobalsTypeInternal : ::_pbi::MessageGlobalsBase {\n  int x;\n};\n}  // namespace protobuf\n}  // namespace google\n",
+        ),
+        (
+            "include/leveldb/iterator.h",
+            "namespace leveldb {\nclass Iterator {\n public:\n  virtual ~Iterator();\n  virtual bool Valid() const = 0;\n  virtual void Next() = 0;\n};\n}  // namespace leveldb\n",
+        ),
+        (
+            "db/skiplist.h",
+            "namespace leveldb {\ntemplate <typename Key, class Comparator>\nclass SkipList {\n public:\n  class Iterator {\n   public:\n    bool Valid() const { return node_ != nullptr; }\n    void Next() { node_ = nullptr; }\n    void SeekToFirst() { node_ = nullptr; }\n   private:\n    const char* node_;\n  };\n};\n}  // namespace leveldb\n",
+        ),
+        (
+            "db/db_iter.cc",
+            "#include \"include/leveldb/iterator.h\"\nnamespace leveldb {\nclass DBIter : public Iterator {\n public:\n  bool Valid() const override { return valid_; }\n  void Next() override { valid_ = false; }\n private:\n  bool valid_;\n};\n}  // namespace leveldb\n",
+        ),
+        (
+            "include/leveldb/comparator.h",
+            "namespace leveldb {\nclass Comparator {\n public:\n  virtual int Compare(const char* a, const char* b) const = 0;\n};\n}  // namespace leveldb\n",
+        ),
+        (
+            "db/skiplist_test.cc",
+            "namespace leveldb {\nstruct Comparator {\n  int operator()(const int& a, const int& b) const { return a - b; }\n};\n}  // namespace leveldb\n",
+        ),
+        (
+            "db/db_test.cc",
+            "#include \"include/leveldb/comparator.h\"\nnamespace leveldb {\nclass NumberComparator : public Comparator {\n public:\n  int Compare(const char* a, const char* b) const override { return 0; }\n};\n}  // namespace leveldb\n",
+        ),
+        (
+            "include/leveldb/filter_policy.h",
+            "namespace leveldb {\nclass FilterPolicy {\n public:\n  virtual const char* Name() const = 0;\n};\n}  // namespace leveldb\n",
+        ),
+        (
+            "db/c.cc",
+            "#include \"include/leveldb/filter_policy.h\"\nusing leveldb::FilterPolicy;\nstruct leveldb_filterpolicy_t : public FilterPolicy {\n  const char* Name() const override { return \"c\"; }\n};\n",
+        ),
+        (
+            "cache/clock_cache.h",
+            "namespace rocksdb {\nnamespace clock_cache {\nclass BaseClockTable {\n public:\n  struct BaseOpts {\n    int eviction_effort_cap;\n  };\n};\nclass AutoHyperClockTable : public BaseClockTable {\n public:\n  struct Opts : public BaseOpts {\n    int min_avg_value_size;\n  };\n};\n}  // namespace clock_cache\n}  // namespace rocksdb\n",
+        ),
+        (
+            "cache/lru_cache.h",
+            "namespace rocksdb {\nnamespace lru_cache {\nstruct BaseOpts {\n  int capacity;\n};\n}  // namespace lru_cache\n}  // namespace rocksdb\n",
+        ),
+        (
+            "table/internal_iterator.h",
+            "namespace rocksdb {\nclass Slice {};\ntemplate <class TValue>\nclass InternalIteratorBase {\n public:\n  virtual void Next() = 0;\n  void SeekToFirst() {}\n};\nusing InternalIterator = InternalIteratorBase<Slice>;\ntemplate <bool B> using bool_constant = std::integral_constant<bool, B>;\n}  // namespace rocksdb\n",
+        ),
+        (
+            "table/merging_iterator.cc",
+            "#include \"table/internal_iterator.h\"\nnamespace rocksdb {\nclass MergingIterator : public InternalIterator {\n public:\n  void Next() override {}\n};\nvoid Rewind(MergingIterator* iter) {\n  iter->SeekToFirst();\n}\ntemplate <typename T>\nstruct is_fast_float : bool_constant<sizeof(T) <= sizeof(double)> {};\n}  // namespace rocksdb\n",
+        ),
+        (
+            "include/rocksdb/listener.h",
+            "namespace rocksdb {\nclass EventListener {\n public:\n  virtual void OnFlushCompleted() {}\n};\n}  // namespace rocksdb\n",
+        ),
+        (
+            "examples/compact_files_example.cc",
+            "#include \"include/rocksdb/listener.h\"\nusing namespace rocksdb;\nclass Compactor : public EventListener {\n public:\n  void OnFlushCompleted() override {}\n};\n",
+        ),
+        (
+            "test/gtest/gtest.h",
+            "namespace testing {\nclass Test {\n public:\n  virtual void TestBody() = 0;\n};\nnamespace internal {\nclass SuiteApiResolver {\n public:\n  typedef int Test;\n};\n}  // namespace internal\n}  // namespace testing\n",
+        ),
+        (
+            "test/gtest-extra-test.cc",
+            "#include \"test/gtest/gtest.h\"\nclass single_evaluation_test : public ::testing::Test {\n protected:\n  void TestBody() override {}\n};\n",
+        ),
+        (
+            "util/mixin.h",
+            "class Base {\n public:\n  void Run() {}\n};\ntemplate <class Base>\nclass Logged : public Base {\n public:\n  void Log() {}\n};\n",
+        ),
+        (
+            "util/testharness.h",
+            "#include \"include/leveldb/env.h\"\nusing namespace leveldb;\n",
+        ),
+        (
+            "include/leveldb/env.h",
+            "namespace leveldb {\nclass EnvWrapper {\n public:\n  virtual int NowMicros() { return 0; }\n};\n}  // namespace leveldb\n",
+        ),
+        (
+            "util/env_test.cc",
+            "#include \"util/testharness.h\"\nclass SleepingEnv : public EnvWrapper {\n public:\n  int NowMicros() override { return 1; }\n};\n",
+        ),
+    ];
+
+    fn base_lookup_project() -> super::support::Indexed {
+        BASE_LOOKUP
+            .iter()
+            .fold(Project::new(), |project, (path, text)| {
+                project.file(path, text)
+            })
+            .index()
+    }
+
+    /// The one node qualified `qualified` in `file` (no import).
+    #[track_caller]
+    fn the_class<'g>(graph: &'g Graph, qualified: &str, file: &str) -> &'g super::support::NodeRow {
+        let found: Vec<&super::support::NodeRow> = graph
+            .nodes
+            .iter()
+            .filter(|node| {
+                node.qualified_name == qualified && node.file_path == file && node.kind != "import"
+            })
+            .collect();
+        assert_eq!(found.len(), 1, "{qualified} in {file}: {found:?}");
+        found[0]
+    }
+
+    /// The supertypes of a class, as `kind qualified (file) resolvedBy`.
+    #[track_caller]
+    fn supertypes(graph: &Graph, qualified: &str, file: &str) -> Vec<String> {
+        let id = &the_class(graph, qualified, file).id;
+        let mut out: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|edge| {
+                &edge.source == id && (edge.kind == "extends" || edge.kind == "implements")
+            })
+            .map(|edge| {
+                let target = graph.node(&edge.target);
+                format!(
+                    "{} {} ({}) {}",
+                    edge.kind,
+                    target.map_or("?", |node| node.qualified_name.as_str()),
+                    target.map_or("?", |node| node.file_path.as_str()),
+                    edge.resolved_by().unwrap_or("?")
+                )
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// Upstream #2407 (`4040eab9`): a C++ base class is the one name lookup
+    /// finds from the deriving class: in the namespaces around it, never a
+    /// class another source file defines for itself, a nested class's base in
+    /// its outer class and what that one inherits, through the namespace
+    /// aliases, using-declarations and using-directives the file writes,
+    /// `::testing::Test` from the global scope, an alias followed to the class
+    /// it names (and an alias of an outside type linked itself), a template
+    /// parameter left unresolved, and the only class of that name the file can
+    /// see when the lookup finds none. No C/C++ base reaches another language.
+    #[test]
+    fn pr2407_a_base_class_is_the_class_name_lookup_finds() {
+        let project = base_lookup_project();
+        let graph = project.graph();
+        let report = || graph.report();
+        assert_eq!(
+            supertypes(
+                graph,
+                "google::protobuf::DynamicMessage",
+                "src/google/protobuf/dynamic_message.cc"
+            ),
+            ["extends google::protobuf::Message (src/google/protobuf/message.h) qualified-name"],
+            "{}",
+            report()
+        );
+        assert_eq!(
+            supertypes(
+                graph,
+                "google::protobuf::internal::ZeroFieldsBase",
+                "src/google/protobuf/generated_message_bases.h"
+            ),
+            ["extends google::protobuf::Message (src/google/protobuf/message.h) qualified-name"]
+        );
+        assert_eq!(
+            supertypes(graph, "leveldb::DBIter", "db/db_iter.cc"),
+            ["extends leveldb::Iterator (include/leveldb/iterator.h) qualified-name"]
+        );
+        assert_eq!(
+            supertypes(graph, "leveldb::NumberComparator", "db/db_test.cc"),
+            ["extends leveldb::Comparator (include/leveldb/comparator.h) qualified-name"]
+        );
+        assert_eq!(
+            supertypes(
+                graph,
+                "rocksdb::clock_cache::AutoHyperClockTable::Opts",
+                "cache/clock_cache.h"
+            ),
+            [
+                "extends rocksdb::clock_cache::BaseClockTable::BaseOpts (cache/clock_cache.h) qualified-name"
+            ]
+        );
+        assert_eq!(
+            supertypes(
+                graph,
+                "google::protobuf::AnyGlobalsTypeInternal",
+                "src/google/protobuf/any.pb.cc"
+            ),
+            [
+                "extends google::protobuf::internal::MessageGlobalsBase (src/google/protobuf/message_lite.h) qualified-name"
+            ]
+        );
+        assert_eq!(
+            supertypes(graph, "leveldb_filterpolicy_t", "db/c.cc"),
+            ["extends leveldb::FilterPolicy (include/leveldb/filter_policy.h) qualified-name"]
+        );
+        assert_eq!(
+            supertypes(graph, "Compactor", "examples/compact_files_example.cc"),
+            ["extends rocksdb::EventListener (include/rocksdb/listener.h) qualified-name"]
+        );
+        assert_eq!(
+            supertypes(graph, "single_evaluation_test", "test/gtest-extra-test.cc"),
+            ["extends testing::Test (test/gtest/gtest.h) qualified-name"]
+        );
+        assert_eq!(
+            supertypes(
+                graph,
+                "rocksdb::MergingIterator",
+                "table/merging_iterator.cc"
+            ),
+            ["extends rocksdb::InternalIteratorBase (table/internal_iterator.h) qualified-name"]
+        );
+        // `bool_constant<sizeof(T) <= sizeof(double)>`: the comparison is no
+        // template bracket.
+        assert_eq!(
+            supertypes(graph, "rocksdb::is_fast_float", "table/merging_iterator.cc"),
+            ["extends rocksdb::bool_constant (table/internal_iterator.h) qualified-name"]
+        );
+        assert_eq!(
+            supertypes(graph, "Logged", "util/mixin.h"),
+            Vec::<String>::new()
+        );
+        let logged = &the_class(graph, "Logged", "util/mixin.h").id;
+        assert_eq!(
+            graph
+                .unresolved
+                .iter()
+                .filter(|reference| &reference.from_node_id == logged
+                    && reference.reference_kind == "extends")
+                .map(|reference| reference.reference_name.as_str())
+                .collect::<Vec<_>>(),
+            ["Base"]
+        );
+        // `using namespace leveldb;` is in a header the file includes.
+        assert_eq!(
+            supertypes(graph, "SleepingEnv", "util/env_test.cc"),
+            ["extends leveldb::EnvWrapper (include/leveldb/env.h) exact-match"]
+        );
+        // No C or C++ base reaches a framework resolver or another language.
+        let mut bases = 0;
+        for edge in graph
+            .edges
+            .iter()
+            .filter(|edge| edge.kind == "extends" || edge.kind == "implements")
+        {
+            let (Some(source), Some(target)) = (graph.node(&edge.source), graph.node(&edge.target))
+            else {
+                continue;
+            };
+            if source.language != "cpp" && source.language != "c" {
+                continue;
+            }
+            bases += 1;
+            assert_ne!(
+                edge.resolved_by(),
+                Some("framework"),
+                "{} -> {}",
+                source.qualified_name,
+                target.qualified_name
+            );
+            assert!(
+                target.language == "cpp" || target.language == "c",
+                "{} -> {} ({})",
+                source.qualified_name,
+                target.qualified_name,
+                target.language
+            );
+        }
+        assert!(bases > 0);
+        let c_message = &the_class(graph, "Message", "php/ext/google/protobuf/message.c").id;
+        assert!(
+            !graph
+                .edges
+                .iter()
+                .any(|edge| &edge.target == c_message && edge.kind == "extends"),
+            "{}",
+            report()
+        );
+    }
+
+    /// Upstream #2407: a call to a method a class inherits from the base an
+    /// alias names reaches that base's method (rocksdb's `MergingIterator :
+    /// public InternalIterator`, `using InternalIterator =
+    /// InternalIteratorBase<Slice>;`).
+    #[test]
+    fn pr2407_an_inherited_method_is_found_on_the_base_an_alias_names() {
+        let project = base_lookup_project();
+        let graph = project.graph();
+        assert_eq!(
+            callees(graph, "rocksdb::Rewind"),
+            ["rocksdb::InternalIteratorBase::SeekToFirst (table/internal_iterator.h)"],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream #2426's last case, which needs #2407's lookup: protobuf's
+    /// `FieldDescriptor`, walked in brace scopes after an unknown attribute
+    /// macro broke the tree, keeps its namespaces, and its base
+    /// `internal::SymbolBase` is `google::protobuf::internal::SymbolBase`, not
+    /// the `other::internal::SymbolBase` namesake (W4-CPP-02 carried it here).
+    #[test]
+    fn pr2426_a_class_that_lost_its_namespace_finds_its_base_by_scope_lookup() {
+        let project = Project::new()
+            .file(
+                "src/descriptor.h",
+                "namespace google {\nnamespace protobuf {\n\nclass Names {\n public:\n  NODISCARD absl::string_view name() const {\n    return absl::string_view(payload_);\n  }\n\n private:\n  const char* payload_;\n};\n\nclass FieldDescriptor : private internal::SymbolBase {\n public:\n  int index() const;\n};\n\n}  // namespace protobuf\n}  // namespace google\n",
+            )
+            .file(
+                "src/symbol_base.h",
+                "namespace google {\nnamespace protobuf {\nnamespace internal {\nclass SymbolBase {\n public:\n  int kind() const;\n};\n}  // namespace internal\n}  // namespace protobuf\n}  // namespace google\n",
+            )
+            .file(
+                "src/other.h",
+                "namespace other {\nnamespace internal {\nclass SymbolBase {\n public:\n  int kind() const;\n};\n}  // namespace internal\n}  // namespace other\n",
+            )
+            .index();
+        let graph = project.graph();
+        let derived = &the_class(
+            graph,
+            "google::protobuf::FieldDescriptor",
+            "src/descriptor.h",
+        )
+        .id;
+        let bases: Vec<&str> = graph
+            .edges
+            .iter()
+            .filter(|edge| &edge.source == derived && edge.kind == "extends")
+            .filter_map(|edge| graph.node(&edge.target))
+            .map(|node| node.qualified_name.as_str())
+            .collect();
+        assert_eq!(
+            bases,
+            ["google::protobuf::internal::SymbolBase"],
             "{}",
             graph.report()
         );

@@ -2154,6 +2154,100 @@ pub fn cpp_batch_rewrites_a_base_before_dropping_a_derivation() -> Case {
         )
 }
 
+/// Upstream #2407: a class another source file defines belongs to that
+/// translation unit, so a namesake `leveldb::Comparator` added in a test
+/// source never takes the base of `NumberComparator`, which keeps the header's
+/// `Comparator`, as on a fresh index.
+pub fn cpp_source_file_namesake_does_not_take_a_base() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Cpp])
+        .file(
+            "include/leveldb/comparator.h",
+            "namespace leveldb {\nclass Comparator {\n public:\n  virtual int Compare(const char* a, const char* b) const = 0;\n};\n}  // namespace leveldb\n",
+        )
+        .file(
+            "db/db_test.cc",
+            "#include \"include/leveldb/comparator.h\"\nnamespace leveldb {\nclass NumberComparator : public Comparator {\n public:\n  int Compare(const char* a, const char* b) const override { return 0; }\n};\n}  // namespace leveldb\n",
+        )
+        .write(
+            "db/skiplist_test.cc",
+            "namespace leveldb {\nstruct Comparator {\n  int operator()(const int& a, const int& b) const { return a - b; }\n};\n}  // namespace leveldb\n",
+        )
+        .edge_before(
+            "class leveldb::NumberComparator",
+            "extends",
+            "class leveldb::Comparator @include/leveldb/comparator.h",
+        )
+        .edge_after(
+            "class leveldb::NumberComparator",
+            "extends",
+            "class leveldb::Comparator @include/leveldb/comparator.h",
+        )
+        .no_edge_after(
+            "class leveldb::NumberComparator",
+            "extends",
+            "struct leveldb::Comparator @db/skiplist_test.cc",
+        )
+}
+
+/// Upstream #2407: a using-declaration the deriving file adds before the
+/// class names the base it means, so `public FilterPolicy` moves from the
+/// file's only visible namesake to `leveldb::FilterPolicy`.
+pub fn cpp_using_declaration_names_the_base() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Cpp])
+        .file(
+            "include/leveldb/filter_policy.h",
+            "namespace leveldb {\nclass FilterPolicy {\n public:\n  virtual const char* Name() const = 0;\n};\n}  // namespace leveldb\n",
+        )
+        .file(
+            "include/other/filter_policy.h",
+            "namespace other {\nclass FilterPolicy {\n public:\n  virtual const char* Name() const = 0;\n};\n}  // namespace other\n",
+        )
+        .file(
+            "db/c.cc",
+            "#include \"include/leveldb/filter_policy.h\"\nusing other::FilterPolicy;\nstruct leveldb_filterpolicy_t : public FilterPolicy {\n  const char* Name() const override { return \"c\"; }\n};\n",
+        )
+        .write(
+            "db/c.cc",
+            "#include \"include/leveldb/filter_policy.h\"\nusing leveldb::FilterPolicy;\nstruct leveldb_filterpolicy_t : public FilterPolicy {\n  const char* Name() const override { return \"c\"; }\n};\n",
+        )
+        .edge_before(
+            "struct leveldb_filterpolicy_t",
+            "extends",
+            "class other::FilterPolicy",
+        )
+        .edge_after(
+            "struct leveldb_filterpolicy_t",
+            "extends",
+            "class leveldb::FilterPolicy",
+        )
+        .no_edge_after(
+            "struct leveldb_filterpolicy_t",
+            "extends",
+            "class other::FilterPolicy",
+        )
+}
+
+/// Upstream #1789's prerequisite phase: once `Child` gains `extends Base`
+/// in the file that also calls `c.run()` on a `Child`, the call reaches
+/// `Base::run`, the extends edge resolved before the call, as on a fresh
+/// index.
+pub fn java_subclass_gains_a_base_its_caller_reaches() -> Case {
+    Case::new(Change::EditHeritage, &[Language::Java])
+        .file(
+            "src/app/Base.java",
+            "package app;\n\npublic class Base {\n    public void run() { }\n}\n",
+        )
+        .file(
+            "src/app/Use.java",
+            "package app;\n\nclass Child {\n}\n\npublic class Use {\n    public void go() {\n        Child c = new Child();\n        c.run();\n    }\n}\n",
+        )
+        .write(
+            "src/app/Use.java",
+            "package app;\n\nclass Child extends Base {\n}\n\npublic class Use {\n    public void go() {\n        Child c = new Child();\n        c.run();\n    }\n}\n",
+        )
+        .edge_after("method app::Use::go", "calls", "method app::Base::run")
+}
+
 /// Upstream #2446: a base class defined in a variable declaration (`class
 /// Base { … } base_instance;`) is a node, so a heritage edit in another file
 /// moves the `extends` edge from one such class to another, as on a fresh

@@ -893,6 +893,29 @@ impl Store {
         rows.collect()
     }
 
+    /// One rowid-ordered batch of the unresolved references with `id >
+    /// after_id` whose kind is one of `kinds` (`within`) or none of them.
+    pub fn unresolved_refs_batch_by_kinds(
+        &self,
+        after_id: i64,
+        limit: usize,
+        kinds: &[EdgeKind],
+        within: bool,
+    ) -> rusqlite::Result<Vec<UnresolvedRef>> {
+        let listed = kinds.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+        let sql = format!(
+            "SELECT * FROM unresolved_refs WHERE id > ? AND (reference_kind IN ({listed})) = ? \
+             ORDER BY id LIMIT ?"
+        );
+        let mut stmt = self.conn.prepare_cached(&sql)?;
+        let mut values: Vec<rusqlite::types::Value> = vec![after_id.into()];
+        values.extend(kinds.iter().map(|kind| kind.as_str().to_string().into()));
+        values.push(within.into());
+        values.push((limit as i64).into());
+        let rows = stmt.query_map(rusqlite::params_from_iter(values), row_to_unresolved_ref)?;
+        rows.collect()
+    }
+
     /// Count rows currently in `unresolved_refs`. Sizes the resolve-phase
     /// progress bar; read AFTER framework refs are inserted or the bar overflows.
     pub fn unresolved_refs_count(&self) -> rusqlite::Result<i64> {

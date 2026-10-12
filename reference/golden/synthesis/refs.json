@@ -251,16 +251,6 @@
   },
   {
     "candidates": null,
-    "col": 8,
-    "file_path": "go/store/store.go",
-    "from_node_id": "function:31958cc8a7c1c6134f84b5da2195fa02",
-    "language": "go",
-    "line": 29,
-    "reference_kind": "calls",
-    "reference_name": "s.Get"
-  },
-  {
-    "candidates": null,
     "col": 9,
     "file_path": "js/src/Counter.tsx",
     "from_node_id": "file:js/src/Counter.tsx",

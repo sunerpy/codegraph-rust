@@ -133,7 +133,14 @@ indexes, and migration history.
 ### Resolution
 
 `ReferenceResolver` reads the complete extracted snapshot (or the bounded
-streaming path for very large graphs), then applies deterministic strategies:
+streaming path for very large graphs), then applies deterministic strategies.
+Every entry (the full index's batches, the serial pass, a sync's scoped pass)
+resolves and persists the wiring references first, imports and `extends`/
+`implements` supertypes, and the rest after them, so a call on a receiver
+typed as a subclass reaches a method its base declares within one pass. A C
+or C++ base is resolved only by C++ name lookup (the scopes around the
+deriving class, its file's namespace aliases and `using` lines, a
+translation unit's own classes), never by the strategies below:
 
 1. language-aware imports, re-exports, packages, and paths (a CommonJS
    `require('./x')` imports its file, and a call through a `require` binding

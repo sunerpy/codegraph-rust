@@ -1249,6 +1249,48 @@ fn target_is_visible_across_files(
     true
 }
 
+/// The reference kinds that wire files and types together, which every
+/// persist entry resolves and persists before the rest (upstream #1789
+/// `isPrerequisite`): a call resolved after them sees the `extends` and
+/// `implements` edges they make, so a receiver typed as a subclass reaches a
+/// method its base declares.
+const WIRING_KINDS: [EdgeKind; 3] = [EdgeKind::Imports, EdgeKind::Extends, EdgeKind::Implements];
+
+fn is_wiring_reference(reference: &UnresolvedRef) -> bool {
+    WIRING_KINDS.contains(&reference.reference_kind)
+}
+
+/// `references` split into the wiring ones and the rest, each in its order.
+fn wiring_first(references: Vec<UnresolvedRef>) -> [Vec<UnresolvedRef>; 2] {
+    let (wiring, rest): (Vec<_>, Vec<_>) = references.into_iter().partition(is_wiring_reference);
+    [wiring, rest]
+}
+
+/// `into` with `from` folded in, as one pass over both would report.
+fn merge_resolution(into: &mut ResolutionResult, from: ResolutionResult) {
+    into.stats.total += from.stats.total;
+    into.stats.resolved += from.stats.resolved;
+    into.stats.unresolved += from.stats.unresolved;
+    for (method, count) in from.stats.by_method {
+        *into.stats.by_method.entry(method).or_default() += count;
+    }
+    into.resolved.extend(from.resolved);
+    into.unresolved.extend(from.unresolved);
+}
+
+fn empty_resolution() -> ResolutionResult {
+    ResolutionResult {
+        stats: ResolutionStats {
+            total: 0,
+            resolved: 0,
+            unresolved: 0,
+            by_method: std::collections::BTreeMap::new(),
+        },
+        resolved: Vec::new(),
+        unresolved: Vec::new(),
+    }
+}
+
 /// Orchestrates reference resolution using multiple strategies
 /// (`ReferenceResolver`, `index.ts:199-1189`).
 ///
@@ -1958,6 +2000,14 @@ impl ReferenceResolver {
         if parse_cpp_constructor_reference_name(&reference.reference_name).is_some() {
             return (self.resolve_cpp_constructor(reference, context), None);
         }
+        // A C or C++ base is the class C++ name lookup finds for it, and no
+        // other strategy sees it (upstream #2407).
+        if crate::cpp_supertypes::is_cpp_supertype_ref(reference) {
+            return (
+                crate::cpp_supertypes::match_cpp_supertype(reference, context),
+                None,
+            );
+        }
         if self.is_built_in_or_external(reference) && !imports_its_own_built_in(reference, context)
         {
             return (None, None);
@@ -2630,18 +2680,25 @@ impl ReferenceResolver {
     /// resolved rows so metrics stay accurate.
     pub fn resolve_and_persist(&mut self, store: &mut Store) -> anyhow::Result<ResolutionResult> {
         let unresolved_refs = store.all_unresolved_refs()?;
-        let result = {
-            let context = self.store_context(store);
-            self.resolve_all(&unresolved_refs, &context)
-        };
-
-        let edges = self.create_edges(&result.resolved, store);
-        if !edges.is_empty() {
-            store.insert_edges(&edges)?;
-        }
-
-        if !result.resolved.is_empty() {
-            delete_resolved_rows(store, &result.resolved)?;
+        // The wiring references first, persisted, then the rest against
+        // their edges (upstream #1789).
+        let mut result = empty_resolution();
+        for phase in wiring_first(unresolved_refs.clone()) {
+            if phase.is_empty() {
+                continue;
+            }
+            let phase_result = {
+                let context = self.store_context(store);
+                self.resolve_all(&phase, &context)
+            };
+            let edges = self.create_edges(&phase_result.resolved, store);
+            if !edges.is_empty() {
+                store.insert_edges(&edges)?;
+            }
+            if !phase_result.resolved.is_empty() {
+                delete_resolved_rows(store, &phase_result.resolved)?;
+            }
+            merge_resolution(&mut result, phase_result);
         }
         delete_internal_constructor_rows(store, &unresolved_refs)?;
 
@@ -2811,10 +2868,23 @@ impl ReferenceResolver {
             unresolved: Vec::new(),
         };
 
+        // The wiring references first, every batch of them persisted, then
+        // the rest from the start of the table (upstream #1789).
         let mut cursor: i64 = 0;
+        let mut wiring_phase = true;
         loop {
-            let batch = store.unresolved_refs_batch(cursor, batch_size)?;
+            let batch = store.unresolved_refs_batch_by_kinds(
+                cursor,
+                batch_size,
+                &WIRING_KINDS,
+                wiring_phase,
+            )?;
             if batch.is_empty() {
+                if wiring_phase {
+                    wiring_phase = false;
+                    cursor = 0;
+                    continue;
+                }
                 break;
             }
             cursor = batch
@@ -3015,18 +3085,25 @@ impl ReferenceResolver {
         let by_tails = store.unresolved_refs_by_name_tails(&names, NAME_TAIL_RETRY_CEILING)?;
         let scoped = union_persisted_refs([by_files, by_sites, by_names, by_tails])?;
 
-        let result = {
-            let context = self.store_context(store);
-            self.resolve_all(&scoped, &context)
-        };
-
-        let edges = self.create_edges(&result.resolved, store);
-        if !edges.is_empty() {
-            store.insert_edges(&edges)?;
-        }
-
-        if !result.resolved.is_empty() {
-            delete_resolved_rows(store, &result.resolved)?;
+        // The wiring references first, persisted, then the rest against
+        // their edges, as a full index orders them (upstream #1789).
+        let mut result = empty_resolution();
+        for phase in wiring_first(scoped.clone()) {
+            if phase.is_empty() {
+                continue;
+            }
+            let phase_result = {
+                let context = self.store_context(store);
+                self.resolve_all(&phase, &context)
+            };
+            let edges = self.create_edges(&phase_result.resolved, store);
+            if !edges.is_empty() {
+                store.insert_edges(&edges)?;
+            }
+            if !phase_result.resolved.is_empty() {
+                delete_resolved_rows(store, &phase_result.resolved)?;
+            }
+            merge_resolution(&mut result, phase_result);
         }
         delete_internal_constructor_rows(store, &scoped)?;
 

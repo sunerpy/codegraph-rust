@@ -125,7 +125,7 @@
     "line": 18,
     "metadata": {
       "confidence": 0.9,
-      "resolvedBy": "exact-match"
+      "resolvedBy": "qualified-name"
     },
     "provenance": null,
     "source": "struct:418731e230da99cc3237d0e7e35385f1",
@@ -148,7 +148,7 @@
     "kind": "extends",
     "line": 22,
     "metadata": {
-      "confidence": 0.95,
+      "confidence": 0.9,
       "resolvedBy": "qualified-name"
     },
     "provenance": null,
@@ -161,7 +161,7 @@
     "line": 3,
     "metadata": {
       "confidence": 0.9,
-      "resolvedBy": "exact-match"
+      "resolvedBy": "qualified-name"
     },
     "provenance": null,
     "source": "class:0c060877c79717f6f299b28b7a70963d",
@@ -173,7 +173,7 @@
     "line": 8,
     "metadata": {
       "confidence": 0.9,
-      "resolvedBy": "exact-match"
+      "resolvedBy": "qualified-name"
     },
     "provenance": null,
     "source": "class:76beb6e8a8a91371f90602d5b477891f",
@@ -197,7 +197,7 @@
     "line": 13,
     "metadata": {
       "confidence": 0.9,
-      "resolvedBy": "exact-match"
+      "resolvedBy": "qualified-name"
     },
     "provenance": null,
     "source": "class:1f9695d61900e851f6609231a60ccd9a",
@@ -269,7 +269,7 @@
     "line": 12,
     "metadata": {
       "confidence": 0.9,
-      "resolvedBy": "exact-match"
+      "resolvedBy": "qualified-name"
     },
     "provenance": null,
     "source": "class:d764b8bdd68df1978991f1ac288b8731",
@@ -305,7 +305,7 @@
     "line": 5,
     "metadata": {
       "confidence": 0.9,
-      "resolvedBy": "exact-match"
+      "resolvedBy": "qualified-name"
     },
     "provenance": null,
     "source": "class:663f57ce46858cb3d9b9085a4dcead53",
@@ -340,7 +340,7 @@
     "kind": "extends",
     "line": 11,
     "metadata": {
-      "confidence": 0.95,
+      "confidence": 0.9,
       "resolvedBy": "qualified-name"
     },
     "provenance": null,
@@ -413,7 +413,7 @@
     "line": 13,
     "metadata": {
       "confidence": 0.9,
-      "resolvedBy": "exact-match"
+      "resolvedBy": "qualified-name"
     },
     "provenance": null,
     "source": "class:1f9695d61900e851f6609231a60ccd9a",
@@ -424,7 +424,7 @@
     "kind": "extends",
     "line": 8,
     "metadata": {
-      "confidence": 0.95,
+      "confidence": 0.9,
       "resolvedBy": "qualified-name"
     },
     "provenance": null,

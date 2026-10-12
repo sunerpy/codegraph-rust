@@ -185,6 +185,18 @@
     "target": "method:d5176555171df8f78b032dce7808a6ee"
   },
   {
+    "col": 8,
+    "kind": "calls",
+    "line": 29,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "instance-method"
+    },
+    "provenance": null,
+    "source": "function:31958cc8a7c1c6134f84b5da2195fa02",
+    "target": "method:596ab963c1e8091bdb7dada52f4dfeff"
+  },
+  {
     "col": 9,
     "kind": "calls",
     "line": 5,
