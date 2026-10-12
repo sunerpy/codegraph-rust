@@ -708,6 +708,7 @@ matrix! {
     cpp_opener_definition_stops_opening_a_namespace,
     c_call_ignores_an_added_cpp_method,
     objc_c_call_ignores_an_added_method,
+    cpp_lowercase_macro_class_body_edit,
     java_subclass_gains_a_base_its_caller_reaches,
     typescript_dollar_import_reaches_an_added_module,
     typescript_dollar_default_export_names_another_declaration,

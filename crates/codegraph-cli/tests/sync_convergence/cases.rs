@@ -2512,6 +2512,26 @@ pub fn objc_c_call_ignores_an_added_method() -> Case {
         )
 }
 
+/// Upstream #946 (W4-CPP-10): a class annotated with a lowercase macro
+/// mints no phantom function, before and after an edit of a body in the
+/// same file, and an unchanged caller of the real function keeps its edge.
+pub fn cpp_lowercase_macro_class_body_edit() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Cpp])
+        .file(
+            "src/shapes.cpp",
+            "class my_export Foo : public Base {\n public:\n  void run() {}\n};\nint helper() { return 1; }\n",
+        )
+        .file(
+            "src/use.cpp",
+            "int helper();\nint use() { return helper(); }\n",
+        )
+        .write(
+            "src/shapes.cpp",
+            "class my_export Foo : public Base {\n public:\n  void run() { int x = 0; (void)x; }\n};\nint helper() { return 2; }\n",
+        )
+        .edge_throughout("function use", "calls", "function helper @src/shapes.cpp")
+}
+
 /// Upstream #1789's prerequisite phase: once `Child` gains `extends Base`
 /// in the file that also calls `c.run()` on a `Child`, the call reaches
 /// `Base::run`, the extends edge resolved before the call, as on a fresh

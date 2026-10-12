@@ -140,12 +140,17 @@ impl LanguageSpec for CppSpec {
         }
         None
     }
-    fn is_misparsed_function(&self, name: &str, _node: Node<'_>, _source: &str) -> bool {
+    fn is_misparsed_function(&self, name: &str, node: Node<'_>, _source: &str) -> bool {
         name.starts_with("namespace")
             || matches!(
                 name,
                 "switch" | "if" | "for" | "while" | "do" | "case" | "return"
             )
+            // `class MACRO Name : public Base { … }` misparses to a function
+            // definition named after the class or its base. The ALL-CAPS
+            // export-macro shapes are recovered as classes before this; this is
+            // the fallback for any misparse left (upstream #946).
+            || is_macro_misparsed_type_decl(node)
     }
     fn extract_import(&self, node: Node<'_>, source: &str) -> Option<ImportInfo> {
         include_import(node, source)
@@ -153,6 +158,28 @@ impl LanguageSpec for CppSpec {
     fn pre_parse(&self, source: &str, file_path: &str) -> String {
         pre_parse_cpp_source(source, file_path)
     }
+}
+
+/// tree-sitter's reading of a class or struct annotated with a macro it does
+/// not know (upstream #946 `isMacroMisparsedTypeDecl`): `class MACRO` is an
+/// elaborated type specifier, a *bodyless* `class_specifier` or
+/// `struct_specifier`, and the rest a function definition whose declarator is
+/// no function declarator. A real inline-defined return type (`struct P { int
+/// x; } makeP() { … }`) has a field list, and a real function returning an
+/// elaborated type (`class Foo f() { … }`) has a function declarator.
+fn is_macro_misparsed_type_decl(node: Node<'_>) -> bool {
+    let Some(type_node) = child_by_field(node, "type") else {
+        return false;
+    };
+    if !matches!(type_node.kind(), "class_specifier" | "struct_specifier")
+        || type_node
+            .named_children(&mut type_node.walk())
+            .any(|child| child.kind() == "field_declaration_list")
+    {
+        return false;
+    }
+    !child_by_field(node, "declarator")
+        .is_some_and(|declarator| declarator.kind() == "function_declarator")
 }
 
 /// A C++ pure-virtual declaration is a `field_declaration`, not a
