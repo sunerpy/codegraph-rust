@@ -9,10 +9,11 @@
 //! JavaScript, and `=(?!=)` written `=(?:[^=]|$)` (the same match test
 //! without a lookahead).
 
+use std::cell::OnceCell;
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
-use codegraph_core::types::{Language, Node, NodeKind};
+use codegraph_core::types::{EdgeKind, Language, Node, NodeKind};
 use regex::Regex;
 
 use crate::types::{RefView, ResolutionContext};
@@ -37,6 +38,183 @@ fn scan_from_imports(text: &str) -> HashMap<String, String> {
         }
     }
     names
+}
+
+/// The shape of a Python call that reaches the resolver as a bare name, read
+/// at the call's column (upstream #2125 `pythonCallShape`): `Bare` is
+/// `get(1)`, which cannot mean a method (Python has no implicit self);
+/// `Chained` is a call through a receiver the extractor did not keep, which
+/// can only mean a member of what the chain names last. `self.x()` /
+/// `cls.x()`, and a chain split across lines, have no shape.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PythonCallShape {
+    Bare(BareCall),
+    Chained { owner: String },
+}
+
+/// What a bare call's file says of the name, read on the first candidate of
+/// another file and kept for the rest: it does not depend on the candidate.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct BareCall {
+    imported_from_outside: OnceCell<bool>,
+    locally_bound: OnceCell<bool>,
+}
+
+pub(crate) fn python_call_shape(
+    reference: &RefView,
+    context: &dyn ResolutionContext,
+) -> Option<PythonCallShape> {
+    if reference.language != Language::Python || reference.reference_kind != EdgeKind::Calls {
+        return None;
+    }
+    let name = reference.reference_name.as_str();
+    let plain = name
+        .bytes()
+        .next()
+        .is_some_and(|b| b.is_ascii_alphabetic() || b == b'_')
+        && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_');
+    if !plain {
+        return None;
+    }
+    let facts = context.source_facts(&reference.file_path)?;
+    let line = facts.raw_line(usize::try_from(reference.line).ok()?.checked_sub(1)?)?;
+    let mut column = usize::try_from(reference.column)
+        .unwrap_or(0)
+        .min(line.len());
+    while !line.is_char_boundary(column) {
+        column -= 1;
+    }
+    shape_of_call(&line[column..], name)
+}
+
+/// The shape of the call of `name` that `text` (its line from the call's
+/// column on) starts with.
+fn shape_of_call(text: &str, name: &str) -> Option<PythonCallShape> {
+    static OWNER: OnceLock<Regex> = OnceLock::new();
+    // `name(`, whitespace allowed before the parenthesis.
+    let calls_name = |rest: &str| {
+        rest.strip_prefix(name)
+            .is_some_and(|after| after.trim_start().starts_with('('))
+    };
+    if calls_name(text) {
+        return Some(PythonCallShape::Bare(BareCall::default()));
+    }
+    // `self.name(` / `cls.name(`, read by hand: a pattern built per call
+    // would be compiled once for every Python call of the project.
+    let after_dot = |rest: &str| {
+        rest.trim_start()
+            .strip_prefix('.')
+            .is_some_and(|member| calls_name(member.trim_start()))
+    };
+    if ["self", "cls"]
+        .iter()
+        .any(|own| text.strip_prefix(own).is_some_and(after_dot))
+    {
+        return None;
+    }
+    // The call starts at its receiver, so everything up to the first
+    // `.name(` is the receiver chain.
+    let receiver = text
+        .match_indices('.')
+        .find(|(at, _)| calls_name(text[at + 1..].trim_start()))
+        .map(|(at, _)| &text[..at])?;
+    let owner = OWNER
+        .get_or_init(|| {
+            Regex::new(r"([0-9A-Za-z_]+)\s*(?:\([^()]*\)|\[[^\[\]]*\])?\s*$").expect("chain owner")
+        })
+        .captures(receiver)?
+        .get(1)?
+        .as_str()
+        .to_string();
+    Some(PythonCallShape::Chained { owner })
+}
+
+/// Whether a Python call of `shape` can mean `node` (upstream
+/// `fitsPythonCallShape`): a bare call never a method, nor another file's
+/// symbol when the file takes the name `from` a module outside the project
+/// (`from django.shortcuts import render`) or binds it itself (`view =
+/// SomeView.as_view()`, upstream #2198) unless it is a fixture in reach; a
+/// chained call only a method of a class the chain's last link names
+/// (`self.user_service` → `UserService`) or a function or class of a module
+/// of that name (`app.helpers.slugify()`).
+pub(crate) fn fits_python_call_shape(
+    node: &Node,
+    shape: &PythonCallShape,
+    reference: &RefView,
+    context: &dyn ResolutionContext,
+) -> bool {
+    match shape {
+        PythonCallShape::Bare(call) => {
+            let name = reference.reference_name.as_str();
+            if node.kind == NodeKind::Method {
+                return false;
+            }
+            if node.file_path == reference.file_path {
+                return true;
+            }
+            if *call
+                .imported_from_outside
+                .get_or_init(|| is_python_name_imported_from_outside(name, reference, context))
+            {
+                return false;
+            }
+            is_fixture_in_reach(node, &reference.file_path, context)
+                || !*call
+                    .locally_bound
+                    .get_or_init(|| is_python_locally_bound(name, reference, context))
+        }
+        PythonCallShape::Chained { owner } => {
+            let plain = |text: &str| text.replace('_', "").to_lowercase();
+            if node.kind == NodeKind::Method {
+                let class = node
+                    .qualified_name
+                    .rsplit_once("::")
+                    .map(|(parent, _)| parent.rsplit("::").next().unwrap_or(parent))
+                    .unwrap_or_default();
+                return !class.is_empty() && plain(class) == plain(owner);
+            }
+            let mut parts = node.file_path.rsplit('/');
+            let file = parts.next().unwrap_or_default();
+            let stem = file
+                .strip_suffix(".pyi")
+                .or_else(|| file.strip_suffix(".py"))
+                .unwrap_or(file);
+            stem == owner || (stem == "__init__" && parts.next() == Some(owner.as_str()))
+        }
+    }
+}
+
+/// Whether `file_path` takes `name` `from` a module the project does not
+/// contain (upstream `isPythonNameImportedFromOutside`): `from
+/// django.shortcuts import render`. A relative import is the project's.
+fn is_python_name_imported_from_outside(
+    name: &str,
+    reference: &RefView,
+    context: &dyn ResolutionContext,
+) -> bool {
+    let Some(facts) = context.source_facts(&reference.file_path) else {
+        return false;
+    };
+    let Some(module) = facts
+        .python_from_imports(scan_from_imports)
+        .get(name)
+        .cloned()
+    else {
+        return false;
+    };
+    if module.starts_with('.') {
+        return false;
+    }
+    !facts.node_decision("python_module_local", &module, |_| {
+        let rel = module.replace('.', "/");
+        let (file, package) = (format!("{rel}.py"), format!("{rel}/__init__.py"));
+        context.get_all_files_shared().iter().any(|f| {
+            *f == file
+                || f.ends_with(&format!("/{file}"))
+                || *f == package
+                || f.ends_with(&format!("/{package}"))
+        })
+    })
 }
 
 /// Whether a `from … import` line of `file_path` binds `name`.
@@ -220,7 +398,40 @@ pub(crate) fn is_fixture_in_reach(
 
 #[cfg(test)]
 mod tests {
-    use super::scan_from_imports;
+    use super::{BareCall, PythonCallShape, scan_from_imports, shape_of_call};
+
+    #[test]
+    fn a_call_shape_is_read_from_its_column() {
+        let bare = Some(PythonCallShape::Bare(BareCall::default()));
+        let chained = |owner: &str| {
+            Some(PythonCallShape::Chained {
+                owner: owner.to_string(),
+            })
+        };
+        assert_eq!(shape_of_call("all(1)", "all"), bare);
+        assert_eq!(shape_of_call("render (request, 'x.html')", "render"), bare);
+        assert_eq!(
+            shape_of_call("User.objects.get(pk=1)", "get"),
+            chained("objects")
+        );
+        assert_eq!(
+            shape_of_call("self.client.login(user)", "login"),
+            chained("client")
+        );
+        assert_eq!(
+            shape_of_call("request.POST.get('next')", "get"),
+            chained("POST")
+        );
+        assert_eq!(shape_of_call("make().get(1)", "get"), chained("make"));
+        assert_eq!(shape_of_call("rows[0] . get (1)", "get"), chained("rows"));
+        // The first `.get(` ends the chain: `.getx(` is not it.
+        assert_eq!(shape_of_call("a.getx(1).get(2)", "get"), chained("getx"));
+        // A class's own call, and a chain the line does not hold, have none.
+        assert_eq!(shape_of_call("self.get(1)", "get"), None);
+        assert_eq!(shape_of_call("cls . get(1)", "get"), None);
+        assert_eq!(shape_of_call("get", "get"), None);
+        assert_eq!(shape_of_call("selfish.get(1)", "get"), chained("selfish"));
+    }
 
     #[test]
     fn from_imports_bind_their_last_word() {

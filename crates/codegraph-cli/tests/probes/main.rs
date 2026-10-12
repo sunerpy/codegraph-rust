@@ -2715,3 +2715,155 @@ mod js {
         assert_eq!(calls_of(graph, &id("local"), false), ["LazyFile::text"]);
     }
 }
+
+mod python {
+    use super::support::{Graph, Project};
+
+    /// `file: qualified` of every `calls` edge out of `file`'s nodes, sorted.
+    fn calls_from(graph: &Graph, file: &str) -> Vec<String> {
+        let mut out: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|edge| {
+                edge.kind == "calls"
+                    && graph
+                        .node(&edge.source)
+                        .is_some_and(|node| node.file_path == file)
+            })
+            .filter_map(|edge| graph.node(&edge.target))
+            .map(|node| format!("{}: {}", node.file_path, node.qualified_name))
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// `file: qualified` of every `calls` edge out of the node named `name`.
+    fn calls_of(graph: &Graph, name: &str) -> Vec<String> {
+        let ids: Vec<&str> = graph
+            .nodes
+            .iter()
+            .filter(|node| node.name == name && node.kind != "import")
+            .map(|node| node.id.as_str())
+            .collect();
+        let mut out: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.kind == "calls" && ids.contains(&edge.source.as_str()))
+            .filter_map(|edge| graph.node(&edge.target))
+            .map(|node| format!("{}: {}", node.file_path, node.qualified_name))
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// Upstream #2125 (`99209b6f`): a Python call whose receiver the
+    /// extractor could not keep (`User.objects.get`, `self.client.login`)
+    /// reaches only a member of what its chain names last; a bare call
+    /// (`get(1)`) is no method, and a name taken `from` a module outside the
+    /// project (`from django.shortcuts import render`) is the package's; a
+    /// module path names the module's function; `self.helper()` is the
+    /// class's own.
+    #[test]
+    fn pr2125_a_python_method_is_reached_through_its_receiver() {
+        let project = Project::new()
+            .file("app/tests.py", "class AuthTestCase:\n    def get(self, url):\n        return url\n\n    def login(self, name):\n        return name\n")
+            .file("app/curl.py", "def get(url):\n    return url\n")
+            .file("app/helpers.py", "def slugify(text):\n    return text\n")
+            .file("app/tags.py", "def render(context):\n    return context\n")
+            .file("app/pages.py", "import app.helpers\nfrom django.shortcuts import render\n\ndef page(request):\n    kind = request.POST.get(\"kind\")\n    slug = app.helpers.slugify(kind)\n    return render(request, \"page.html\", {\"slug\": slug})\n")
+            .file("app/views.py", "from django.contrib.auth.models import User\n\nclass Backend:\n    def authenticate(self, username):\n        user = User.objects.get(email=username)\n        self.client.login(username=\"a\")\n        self.helper()\n        self.assertEqual(self.filterset(params, self.queryset).qs.get(), 2)\n        get(1)\n        return user\n\n    def helper(self):\n        return 1\n")
+            .file("app/config.py", "class UserConfig:\n    def all(self):\n        return []\n\n\ndef run(prefs):\n    everything = prefs.objects.all()\n    return all([everything])\n")
+            .file("app/bare.py", "def bare_login():\n    return login(\"x\")\n")
+            .index();
+        let graph = project.graph();
+        let authenticate = calls_of(graph, "authenticate");
+        assert!(
+            !authenticate.contains(&"app/tests.py: AuthTestCase::get".to_string()),
+            "{authenticate:?}"
+        );
+        assert!(
+            !authenticate.contains(&"app/tests.py: AuthTestCase::login".to_string()),
+            "{authenticate:?}"
+        );
+        assert!(
+            authenticate.contains(&"app/views.py: Backend::helper".to_string()),
+            "{authenticate:?}"
+        );
+        let page = calls_of(graph, "page");
+        assert!(!page.contains(&"app/curl.py: get".to_string()), "{page:?}");
+        assert!(
+            !page.contains(&"app/tags.py: render".to_string()),
+            "{page:?}"
+        );
+        assert!(
+            page.contains(&"app/helpers.py: slugify".to_string()),
+            "{page:?}"
+        );
+        // `all(…)` is the builtin and `prefs.objects.all()` a member of
+        // `objects`: neither is `UserConfig.all`.
+        assert_eq!(calls_of(graph, "run"), Vec::<String>::new());
+        // A bare call is no method: Python has no implicit self.
+        assert_eq!(calls_of(graph, "bare_login"), Vec::<String>::new());
+    }
+
+    /// Upstream #2125: a method of a class declared inside a function is in
+    /// scope only in that function, in every language: a `this.run()` in
+    /// another class is not `f`'s local `Local.run`, while the function's own
+    /// code still reaches its local class's method.
+    #[test]
+    fn pr2125_a_method_of_a_local_class_is_reachable_only_in_its_function() {
+        let project = Project::new()
+            .file("tests/test_perms.py", "def test_perm():\n    class Request:\n        def has_perm(self, perm):\n            return perm\n\n        def check(self):\n            return self.has_perm(\"x\")\n\n    return Request().check()\n")
+            .file("web/a.js", "function f() {\n  class Local { run() { return 1; } }\n  return new Local();\n}\nclass Other {\n  go() { return this.run(); }\n}\n")
+            .index();
+        let graph = project.graph();
+        assert_eq!(
+            calls_of(graph, "go"),
+            Vec::<String>::new(),
+            "{}",
+            graph.report()
+        );
+        assert!(
+            calls_of(graph, "check")
+                .contains(&"tests/test_perms.py: test_perm::Request::has_perm".to_string()),
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream #2198 (`71202c38`): a bare Python call to a name its function
+    /// (or module) binds itself is that value, not another file's function
+    /// of the name; a pytest fixture the test takes as a parameter is still
+    /// the fixture, and an imported name is the import's whatever a
+    /// docstring says.
+    #[test]
+    fn pr2198_a_bare_call_to_a_locally_bound_name_is_that_value() {
+        let project = Project::new()
+            .file("tests/test_testing.py", "def view(request):\n    return request\n")
+            .file("tests/test_versioning.py", "class TestVersion:\n    def test_version(self, request):\n        view = MyView.as_view()\n        response = view(request)\n        return response\n")
+            .file("tests/conftest.py", "import pytest\n\n\n@pytest.fixture\ndef user_factory():\n    def make():\n        return 1\n    return make\n")
+            .file("tests/test_users.py", "def test_user(user_factory):\n    user = user_factory()\n    return user\n")
+            .file("app/utils.py", "def user_display(user):\n    return str(user)\n")
+            .file("app/tags.py", "from app.utils import user_display\n\n\ndef user_display_tag(user):\n    \"\"\"\n    {% user_display user as user_display %}\n    \"\"\"\n    return user_display(user)\n")
+            .file("docs/example.py", "import pytest\n\n\n@pytest.fixture\ndef func():\n    return 1\n")
+            .file("src/runner.py", "def _run_both(func):\n    return func()\n")
+            .index();
+        let graph = project.graph();
+        assert!(
+            !calls_from(graph, "tests/test_versioning.py")
+                .contains(&"tests/test_testing.py: view".to_string()),
+            "{}",
+            graph.report()
+        );
+        assert!(
+            calls_from(graph, "tests/test_users.py")
+                .contains(&"tests/conftest.py: user_factory".to_string())
+        );
+        assert!(
+            calls_from(graph, "app/tags.py").contains(&"app/utils.py: user_display".to_string())
+        );
+        // A parameter is its own value: a fixture another module defines,
+        // with no conftest above the caller, is out of reach.
+        assert_eq!(calls_from(graph, "src/runner.py"), Vec::<String>::new());
+    }
+}

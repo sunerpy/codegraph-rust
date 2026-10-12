@@ -1042,6 +1042,53 @@ pub fn javascript_fetch_body_call_ignores_an_added_method() -> Case {
         .no_edge_after("function load", "calls", "method LazyFile::text")
 }
 
+/// Upstream #2125: a bare Python call is no method, so a class with a
+/// method of that name added later is never its target, as a fresh index of
+/// the edit finds.
+pub fn python_bare_call_ignores_an_added_method() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Python])
+        .file(
+            "app/views.py",
+            "def bare_login():\n    return login(\"x\")\n",
+        )
+        .write(
+            "app/tests.py",
+            "class AuthTestCase:\n    def login(self, name):\n        return name\n",
+        )
+        .no_edge_after("function bare_login", "calls", "method AuthTestCase::login")
+}
+
+/// Upstream #2125: a name taken `from` a module outside the project is the
+/// package's, so a project function of that name added later is never the
+/// call's target, as a fresh index of the edit finds.
+pub fn python_outside_import_ignores_an_added_function() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Python])
+        .file(
+            "app/pages.py",
+            "from django.shortcuts import render\n\ndef page(request):\n    return render(request, \"page.html\")\n",
+        )
+        .write("app/tags.py", "def render(context):\n    return context\n")
+        .no_edge_after("function page", "calls", "function render")
+}
+
+/// Upstream #2198: a bare call to a name the function comes to bind itself
+/// is that value, so the edge to another file's function of the name goes,
+/// as a fresh index of the edit finds.
+pub fn python_call_becomes_a_local_binding_body_edit() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Python])
+        .file("tests/test_testing.py", "def view(request):\n    return request\n")
+        .file(
+            "tests/test_versioning.py",
+            "def test_version(request):\n    response = view(request)\n    return response\n",
+        )
+        .write(
+            "tests/test_versioning.py",
+            "def test_version(request):\n    view = MyView.as_view()\n    response = view(request)\n    return response\n",
+        )
+        .edge_before("function test_version", "calls", "function view")
+        .no_edge_after("function test_version", "calls", "function view")
+}
+
 /// Upstream #2263: a CommonJS `require('./application')` imports that file once
 /// it appears, though the binding is only ever used as a value.
 pub fn javascript_require_imports_an_added_module() -> Case {

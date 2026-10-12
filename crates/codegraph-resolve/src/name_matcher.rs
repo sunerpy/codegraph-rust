@@ -348,11 +348,12 @@ fn apply_language_gate<T: Borrow<Node>>(candidates: Vec<T>, reference: &RefView)
 /// `join` defined inside a DIFFERENT function (`isLexicallyReachable`, #1230 /
 /// upstream `c472cfb`).
 ///
-/// A candidate whose `qualified_name` parent resolves to a same-file
-/// function/method ENCLOSING it is kept only when the ref originates inside that
-/// parent's line range. Class members are unaffected (their parent resolves to a
-/// class-like node), as are top-level symbols and C++ namespace-prefixed names
-/// (the prefix has no node).
+/// A candidate that a same-file function/method ENCLOSES, found by walking out
+/// through its `qualified_name` ([`lexical_scope_of`]), is kept only when the
+/// ref originates inside that function's line range. A method of a top-level
+/// class is unaffected, as are top-level symbols and C++ namespace-prefixed
+/// names (the prefix has no node); a method of a class declared inside a
+/// function is scoped by that function (upstream #2125).
 pub(crate) fn is_lexically_reachable(
     candidate: &Node,
     reference: &RefView,
@@ -370,19 +371,20 @@ pub(crate) fn is_lexically_reachable(
     if crate::object_owners::is_unreachable_path_holder(candidate, reference) {
         return false;
     }
-    // A function, or a type (`case class B()` in a test method), declared
-    // inside a function is only in scope in there (upstream #2123).
-    if candidate.kind != NodeKind::Function
-        && !matches!(
-            candidate.kind,
-            NodeKind::Class
-                | NodeKind::Struct
-                | NodeKind::Enum
-                | NodeKind::Interface
-                | NodeKind::Trait
-                | NodeKind::TypeAlias
-        )
-    {
+    // A function, or a type (`case class B()` in a test method), or a
+    // method of such a type, declared inside a function is only in scope in
+    // there (upstream #2123, #2125).
+    if !matches!(
+        candidate.kind,
+        NodeKind::Function
+            | NodeKind::Method
+            | NodeKind::Class
+            | NodeKind::Struct
+            | NodeKind::Enum
+            | NodeKind::Interface
+            | NodeKind::Trait
+            | NodeKind::TypeAlias
+    ) {
         return true;
     }
     // C and C++ have no nested named functions: a function the graph shows
@@ -392,30 +394,43 @@ pub(crate) fn is_lexically_reachable(
     if matches!(candidate.language, Language::C | Language::Cpp) {
         return true;
     }
-    let Some(sep) = candidate.qualified_name.rfind("::") else {
-        return true;
-    };
-    let parent_qualified = &candidate.qualified_name[..sep];
-    if parent_qualified.is_empty() {
-        return true;
+    lexical_scope_of(candidate, context).is_none_or(|(start, end)| {
+        reference.file_path == candidate.file_path
+            && reference.line >= start
+            && reference.line <= end
+    })
+}
+
+/// The innermost function or method BODY that scopes a declaration, walking
+/// out through its qualified name (`test_x::Request::User::has_perm` →
+/// `test_x`, upstream #2125 `lexicalScopeOf`). A method directly on a class
+/// is reachable through its instances, and an object-literal method a
+/// function returns through the object: neither is scoped by the function it
+/// sits in.
+fn lexical_scope_of(candidate: &Node, context: &dyn ResolutionContext) -> Option<(i64, i64)> {
+    let own = candidate.qualified_name.as_str();
+    let parent = own.rsplit_once("::").map_or("", |(parent, _)| parent);
+    let mut qualified = own;
+    while let Some((up, _)) = qualified.rsplit_once("::") {
+        qualified = up;
+        let Some(container) = context
+            .get_nodes_by_qualified_name_shared(qualified)
+            .into_iter()
+            .find(|p| {
+                p.file_path == candidate.file_path
+                    && matches!(p.kind, NodeKind::Function | NodeKind::Method)
+                    && p.start_line <= candidate.start_line
+                    && p.end_line >= candidate.end_line
+            })
+        else {
+            continue;
+        };
+        if candidate.kind == NodeKind::Method && qualified == parent {
+            return None;
+        }
+        return Some((container.start_line, container.end_line));
     }
-    let containers: Vec<Arc<Node>> = context
-        .get_nodes_by_qualified_name_shared(parent_qualified)
-        .into_iter()
-        .filter(|p| {
-            p.file_path == candidate.file_path
-                && matches!(p.kind, NodeKind::Function | NodeKind::Method)
-                && p.start_line <= candidate.start_line
-                && p.end_line >= candidate.end_line
-        })
-        .collect();
-    if containers.is_empty() {
-        return true;
-    }
-    reference.file_path == candidate.file_path
-        && containers
-            .iter()
-            .any(|p| reference.line >= p.start_line && reference.line <= p.end_line)
+    None
 }
 
 /// Languages whose calls are JS/TS calls (upstream `JS_FAMILY`): Vue, Svelte
@@ -2064,8 +2079,16 @@ pub fn match_by_exact_name(
     // winner afterwards — is what lets a legitimate supertype OUTRANK a
     // same-named enum member instead of the whole reference being dropped.
     let bare_go = is_bare_go_call(reference, context);
+    // A Python call's shape at its column decides what it can mean (upstream
+    // #2125): a bare call no method, a chained one a member of its last link.
+    let python_shape = crate::python_values::python_call_shape(reference, context);
     let candidates: Vec<Arc<Node>> = reachable
         .iter()
+        .filter(|n| {
+            python_shape.as_ref().is_none_or(|shape| {
+                crate::python_values::fits_python_call_shape(n, shape, reference, context)
+            })
+        })
         .filter(|n| node_is_eligible_target(reference.reference_kind, n))
         // A Scala type position (`Arbitrary[B]`) never names a method: an
         // `implicit def A: Order[A]` shares its name with half of cats' type
@@ -4735,10 +4758,16 @@ pub fn match_fuzzy(reference: &RefView, context: &dyn ResolutionContext) -> Opti
 
     let callable_kinds = [NodeKind::Function, NodeKind::Method, NodeKind::Class];
     let case_insensitive = is_case_insensitive_language(reference.language);
+    let python_shape = crate::python_values::python_call_shape(reference, context);
     let callable_candidates = apply_language_gate(
         candidates
             .into_iter()
             .filter(|n| callable_kinds.contains(&n.kind))
+            .filter(|n| {
+                python_shape.as_ref().is_none_or(|shape| {
+                    crate::python_values::fits_python_call_shape(n, shape, reference, context)
+                })
+            })
             // `new …MockData()` makes an instance of a type; a method is never
             // what it names (upstream #2141).
             .filter(|n| {
