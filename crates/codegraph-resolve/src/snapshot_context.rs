@@ -184,6 +184,8 @@ struct SnapshotCaches {
     manifest_scopes: BoundedFileMemo<Arc<ManifestScope>>,
     /// The Python write index for the run (upstream #2332).
     python_write_index: OnceLock<Arc<crate::python_globals::PythonWriteIndex>>,
+    /// The C/C++ namespace tables for the run (upstream #2176).
+    cpp_namespace_tables: OnceLock<Arc<crate::cpp_namespaces::CppNamespaceTables>>,
     #[cfg(test)]
     counters: SnapshotCacheCounters,
 }
@@ -201,6 +203,7 @@ impl SnapshotCaches {
             fs_exists: BoundedFileMemo::new(crate::context::FILE_EXISTS_MEMO_LIMIT),
             manifest_scopes: BoundedFileMemo::new(DEFAULT_CACHE_LIMIT),
             python_write_index: OnceLock::new(),
+            cpp_namespace_tables: OnceLock::new(),
             #[cfg(test)]
             counters: SnapshotCacheCounters::default(),
         }
@@ -674,6 +677,14 @@ impl ResolutionContext for SnapshotResolutionContext {
             self.caches
                 .python_write_index
                 .get_or_init(|| Arc::new(crate::python_globals::PythonWriteIndex::build(self))),
+        )
+    }
+
+    fn cpp_namespace_tables(&self) -> Arc<crate::cpp_namespaces::CppNamespaceTables> {
+        Arc::clone(
+            self.caches
+                .cpp_namespace_tables
+                .get_or_init(|| Arc::new(crate::cpp_namespaces::CppNamespaceTables::new())),
         )
     }
 

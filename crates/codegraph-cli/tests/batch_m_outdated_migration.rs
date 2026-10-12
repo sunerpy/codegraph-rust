@@ -448,13 +448,25 @@ fn incremental_sync_on_outdated_v2_forces_all_files() {
     };
     assert_eq!(
         cpp_marker(&paths),
-        vec![("cpp_type_surface_version".to_string(), "1".to_string())],
+        vec![("cpp_type_surface_version".to_string(), "2".to_string())],
         "a migration writes the C/C++ dependents marker"
     );
     assert_eq!(
         cpp_marker(&paths),
         cpp_marker(&IndexPaths::resolve(&peer, None).expect("resolve peer v2 paths")),
         "a forced migration must write the C/C++ marker of `index --force`"
+    );
+    // And the C/C++ namespace rows (W4-CPP-07).
+    let namespace_rows = |paths: &IndexPaths| {
+        Store::open_for_read(paths, deadline(), || false)
+            .expect("readable namespace")
+            .project_metadata_with_prefix("cpp_namespace_surface:")
+            .expect("C/C++ namespace rows")
+    };
+    assert_eq!(
+        namespace_rows(&paths),
+        namespace_rows(&IndexPaths::resolve(&peer, None).expect("resolve peer v2 paths")),
+        "a forced migration must write the C/C++ namespace rows of `index --force`"
     );
 }
 

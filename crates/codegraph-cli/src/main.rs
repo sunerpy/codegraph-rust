@@ -5696,9 +5696,18 @@ fn index_project_inner(
 
     // `None` for an MPEG transport stream named `.ts`: video, not source (#1910).
     // A JavaScript-family module's surface rides along for the consumer to
-    // record once every file row is stored (W4a-F3).
-    type ParsePayload = Option<(String, FileRecord, ExtractionResult, Option<ModuleSurface>)>;
+    // record once every file row is stored (W4a-F3), and so does what a C/C++
+    // file holds for its namespace row (W4-CPP-07).
+    type ParsePayload = Option<(
+        String,
+        FileRecord,
+        ExtractionResult,
+        Option<ModuleSurface>,
+        Option<codegraph_watch::cpp_namespace_rows::NamespaceScan>,
+    )>;
     let mut surfaces: Vec<(String, ModuleSurface)> = Vec::new();
+    let mut namespace_scans: Vec<(String, codegraph_watch::cpp_namespace_rows::NamespaceScan)> =
+        Vec::new();
     let schedule_tracker = tracker.clone();
     let parse_tracker = tracker.clone();
     let buffer_tracker = tracker.clone();
@@ -5753,11 +5762,19 @@ fn index_project_inner(
             };
             parse_tracker.parsed(index, &result);
             let surface = codegraph_watch::module_surfaces::surface_of(relative, language, &source);
-            Ok(Some((relative.clone(), file, result, surface)))
+            let namespace_scan =
+                codegraph_watch::cpp_namespace_rows::scan_of(relative, language, &source);
+            Ok(Some((
+                relative.clone(),
+                file,
+                result,
+                surface,
+                namespace_scan,
+            )))
         },
         |buffered| buffer_tracker.buffered(buffered),
         |index, payload| {
-            let Some((relative, file, mut result, surface)) = payload else {
+            let Some((relative, file, mut result, surface, namespace_scan)) = payload else {
                 files_not_source += 1;
                 persist_tracker.persisted(index);
                 return Ok(());
@@ -5795,6 +5812,9 @@ fn index_project_inner(
             if let Err(error) = persist {
                 persist_tracker.failed(index, &error);
                 return Err(error);
+            }
+            if let Some(scan) = namespace_scan {
+                namespace_scans.push((relative.clone(), scan));
             }
             if let Some(surface) = surface {
                 surfaces.push((relative, surface));
@@ -5838,6 +5858,8 @@ fn index_project_inner(
         &surfaces,
     )?;
     drop(surfaces);
+    codegraph_watch::cpp_namespace_rows::write_index_rows(&store, &mut namespace_scans)?;
+    drop(namespace_scans);
     // A fresh index leaves no C/C++ dependent unrefreshed (W4-CPP-04).
     codegraph_watch::cpp_dependents::write_marker(&store)?;
     finish_phase(&pb, "Persisted nodes");

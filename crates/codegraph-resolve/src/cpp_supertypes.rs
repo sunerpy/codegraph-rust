@@ -27,15 +27,18 @@
 //!    a member of one (`public T::Base`) is whatever a template argument makes
 //!    it: no edge.
 //!
+//! A namespace alias the file does not write is read from the project's
+//! (`namespace py = pybind11;` in another header), and a qualified base is
+//! also a class a namespace macro puts there (`fmt::detail::buffer`, where
+//! `FMT_BEGIN_NAMESPACE` opens `namespace fmt` around `detail::buffer`;
+//! `cpp_namespaces`, upstream #2176).
+//!
 //! When none of that finds the class, a class of that name that is the only
 //! one the file can see is taken: the index loses a class's namespace in a few
 //! shapes (`class PROTOBUF_EXPORT FieldDescriptor`, the classes after a
 //! partial specialization), and the lookup from the wrong scope finds nothing.
 //! Several such classes would be a guess, so there is no edge. Only C and C++
 //! declarations are candidates, and no other strategy sees these references.
-//!
-//! Upstream also reads the project's namespace aliases and fmt's
-//! macro-opened namespaces here; both come with #2176 (W4-CPP-07).
 
 use std::sync::{Arc, OnceLock};
 
@@ -136,14 +139,23 @@ pub(crate) fn match_cpp_supertype(
             Lookup::NoClass | Lookup::NotFound => None,
         }
     };
-    // `::_pbi::MessageGlobalsBase` under `namespace _pbi = ::google::protobuf::internal;`.
-    if segments.len() > 1
-        && let Some(alias) = before
+    // `::_pbi::MessageGlobalsBase` under `namespace _pbi = ::google::protobuf::internal;`,
+    // the file's own alias or else the project's.
+    if segments.len() > 1 {
+        let target = before
             .iter()
             .find(|using| using.kind == UsingKind::Alias && using.name == segments[0])
-        && let Some(hit) = spelled_from(format!("{}{after}", alias.path))
-    {
-        return Some(resolved(hit));
+            .map(|alias| alias.path.clone())
+            .or_else(|| {
+                context
+                    .cpp_namespace_tables()
+                    .namespace_alias(&segments[0], context)
+            });
+        if let Some(target) = target
+            && let Some(hit) = spelled_from(format!("{target}{after}"))
+        {
+            return Some(resolved(hit));
+        }
     }
     if !global {
         // `using leveldb::FilterPolicy;` … `public FilterPolicy`.
@@ -163,6 +175,19 @@ pub(crate) fn match_cpp_supertype(
                 return Some(resolved(hit));
             }
         }
+    }
+    // `fmt::detail::buffer`, where a macro opens `namespace fmt` around
+    // `detail::buffer`.
+    if segments.len() > 1
+        && let Some(hit) = pick(
+            named_classes(&segments, &derived, context, &visible)
+                .into_iter()
+                .filter(|node| crate::cpp_namespaces::macro_qualified_name(node, context) == path)
+                .collect(),
+            &derived,
+        )
+    {
+        return Some(resolved(hit));
     }
     // The only class of that name the file can see, by its qualified tail.
     let suffix = format!("::{path}");

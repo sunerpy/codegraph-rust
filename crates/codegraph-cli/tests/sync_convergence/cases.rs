@@ -2325,6 +2325,154 @@ pub fn cpp_nested_template_member_type_moves_an_unchanged_receiver() -> Case {
         )
 }
 
+/// Upstream #2176 (W4-CPP-07): a namespace alias another header writes
+/// moves, so the unchanged caller's `py::print("hi")` reaches the other
+/// namespace's `print`.
+pub fn cpp_cross_file_namespace_alias_retarget() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Cpp])
+        .file(
+            "include/pybind11/print.h",
+            "#pragma once\nnamespace pybind11 {\ninline void print(const char* text) {}\n}  // namespace pybind11\n",
+        )
+        .file(
+            "include/other/print.h",
+            "#pragma once\nnamespace other {\ninline void print(const char* text) {}\n}  // namespace other\n",
+        )
+        .file(
+            "include/aliases.h",
+            "#pragma once\nnamespace py = pybind11;\n",
+        )
+        .file(
+            "src/main.cc",
+            "#include \"aliases.h\"\nint main() {\n  py::print(\"hi\");\n  return 0;\n}\n",
+        )
+        .write(
+            "include/aliases.h",
+            "#pragma once\nnamespace py = other;\n",
+        )
+        .edge_before("function main", "calls", "function pybind11::print")
+        .edge_after("function main", "calls", "function other::print")
+        .no_edge_after("function main", "calls", "function pybind11::print")
+}
+
+/// Upstream #2176 (W4-CPP-07): the namespace an opener macro opens moves, so
+/// the unchanged caller's `lib::run()` names nothing the header declares.
+pub fn cpp_macro_opener_opens_another_namespace() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Cpp])
+        .file(
+            "include/lib/config.h",
+            "#pragma once\n#define LIB_BEGIN namespace lib {\n#define LIB_END }\n",
+        )
+        .file(
+            "include/lib/run.h",
+            "#pragma once\n#include \"lib/config.h\"\nLIB_BEGIN\ninline int run() { return 0; }\nLIB_END\n",
+        )
+        .file(
+            "src/main.cc",
+            "#include \"lib/run.h\"\nint main() { return lib::run(); }\n",
+        )
+        .write(
+            "include/lib/config.h",
+            "#pragma once\n#define LIB_BEGIN namespace mylib {\n#define LIB_END }\n",
+        )
+        .edge_before("function main", "calls", "function run")
+        .no_edge_after("function main", "calls", "function run")
+}
+
+/// Upstream #2176 (W4-CPP-07): only the header defining a macro alias
+/// changes; the opener another header defines through it, and the header
+/// using that opener, are unchanged, and the caller's `lib::run()` follows.
+pub fn cpp_macro_alias_moves_an_opener_it_feeds() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Cpp])
+        .file(
+            "include/lib/name.h",
+            "#pragma once\n#define LIB_NAME lib\n",
+        )
+        .file(
+            "include/lib/config.h",
+            "#pragma once\n#include \"lib/name.h\"\n#define LIB_BEGIN namespace LIB_NAME {\n#define LIB_END }\n",
+        )
+        .file(
+            "include/lib/run.h",
+            "#pragma once\n#include \"lib/config.h\"\nLIB_BEGIN\ninline int run() { return 0; }\nLIB_END\n",
+        )
+        .file(
+            "src/main.cc",
+            "#include \"lib/run.h\"\nint main() { return lib::run(); }\n",
+        )
+        .write(
+            "include/lib/name.h",
+            "#pragma once\n#define LIB_NAME otherlib\n",
+        )
+        .edge_before("function main", "calls", "function run")
+        .no_edge_after("function main", "calls", "function run")
+}
+
+/// Upstream #2445 (W4-CPP-07): a closer moved above an unchanged
+/// declaration line takes it out of the macro's namespace, so the
+/// unchanged caller's `::pipe(fds)` reaches it (a global name skips a
+/// declaration a macro namespace holds).
+pub fn cpp_macro_closer_moves_a_declaration_out_of_the_namespace() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Cpp])
+        .file(
+            "include/lib/os.hpp",
+            "#pragma once\n#define LIB_BEGIN_NAMESPACE namespace lib {\n#define LIB_END_NAMESPACE }\nLIB_BEGIN_NAMESPACE\n\ninline int pipe(int* fds) { return 0; }\nLIB_END_NAMESPACE\n",
+        )
+        .file(
+            "src/run.cc",
+            "#include \"lib/os.hpp\"\nint run(int* fds) { return ::pipe(fds); }\n",
+        )
+        .write(
+            "include/lib/os.hpp",
+            "#pragma once\n#define LIB_BEGIN_NAMESPACE namespace lib {\n#define LIB_END_NAMESPACE }\nLIB_BEGIN_NAMESPACE\nLIB_END_NAMESPACE\ninline int pipe(int* fds) { return 0; }\n\n",
+        )
+        .edge_after("function run", "calls", "function pipe")
+}
+
+/// The same for a free `operator<<` whose declaration line stays put: the
+/// name lane scans for `operator`, which `::operator<<(…)` writes.
+pub fn cpp_free_operator_moves_out_of_the_macro_namespace() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Cpp])
+        .file(
+            "include/lib/stream.hpp",
+            "#pragma once\n#define LIB_BEGIN_NAMESPACE namespace lib {\n#define LIB_END_NAMESPACE }\nstruct Stream {};\nstruct Value {};\nLIB_BEGIN_NAMESPACE\n\ninline Stream& operator<<(Stream& out, const Value& value) { return out; }\nLIB_END_NAMESPACE\n",
+        )
+        .file(
+            "src/print.cc",
+            "#include \"lib/stream.hpp\"\nvoid print(Stream& out, const Value& value) { ::operator<<(out, value); }\n",
+        )
+        .write(
+            "include/lib/stream.hpp",
+            "#pragma once\n#define LIB_BEGIN_NAMESPACE namespace lib {\n#define LIB_END_NAMESPACE }\nstruct Stream {};\nstruct Value {};\nLIB_BEGIN_NAMESPACE\nLIB_END_NAMESPACE\ninline Stream& operator<<(Stream& out, const Value& value) { return out; }\n\n",
+        )
+        .edge_after("function print", "calls", "function operator<<")
+}
+
+/// Upstream #2445 (W4-CPP-07): only the header defining the opener and
+/// closer changes, and they no longer open a namespace; the unchanged
+/// header using them now declares `pipe` globally, and the unchanged
+/// caller's `::pipe(fds)` reaches it.
+pub fn cpp_opener_definition_stops_opening_a_namespace() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Cpp])
+        .file(
+            "include/lib/config.h",
+            "#pragma once\n#define LIB_BEGIN_NAMESPACE namespace lib {\n#define LIB_END_NAMESPACE }\n",
+        )
+        .file(
+            "include/lib/os.h",
+            "#pragma once\n#include \"lib/config.h\"\nLIB_BEGIN_NAMESPACE\ninline int pipe(int* fds) { return 0; }\nLIB_END_NAMESPACE\n",
+        )
+        .file(
+            "src/run.cc",
+            "#include \"lib/os.h\"\nint run(int* fds) { return ::pipe(fds); }\n",
+        )
+        .write(
+            "include/lib/config.h",
+            "#pragma once\n#define LIB_BEGIN_NAMESPACE\n#define LIB_END_NAMESPACE\n",
+        )
+        .edge_after("function run", "calls", "function pipe")
+}
+
 /// Upstream #1789's prerequisite phase: once `Child` gains `extends Base`
 /// in the file that also calls `c.run()` on a `Child`, the call reaches
 /// `Base::run`, the extends edge resolved before the call, as on a fresh

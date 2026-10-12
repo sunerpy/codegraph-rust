@@ -181,13 +181,29 @@ reconciles every JavaScript-family file before writing it. These rows are no
 canonical surface; the sync matrix checks that a sync leaves them as a fresh
 index writes them.
 
-`cpp_type_surface_version` (1) records that no sync left a C or C++ reference
+Namespace rows record what a qualified C or C++ name reads from a file's own
+text: its namespace aliases (`namespace py = pybind11;`, in `.h`, `.hh`,
+`.hpp`, `.hxx`, `.inl`, `.c`, `.cc`, `.cpp`, `.cxx` files), the namespace
+macros a header defines (`.h`, `.hh`, `.hpp`, `.hxx`, `.h++`, `.inl`, `.ipp`,
+`.tcc`: openers with their body as written, single-parameter openers, closers
+with the scopes they close, identifier macro aliases), and, for a C or C++ file,
+the lines that use an opener or closer the project defines (line, macro, its
+argument). `cpp_namespace_surface:<path>` holds the JSON `{"facts": {"aliases",
+"macros"}, "usage"}`; a file with none of these has no row. A full index and a
+migration write them with the module-surface rows; a sync writes the rows it
+changed last, with the module-surface rows. When an alias or a macro is defined
+in several files, the first by path wins, and within a file its first
+definition.
+
+`cpp_type_surface_version` (2) records that no sync left a C or C++ reference
 unrefreshed whose resolution reads another file's text (a same-stem header's
-declarations, the aliases and class heads an alias lookup walks). A full index
-and a migration write it with the module-surface marker; a sync withdraws it
-before its first mutation and writes it back last, after resolution is
-persisted, and a sync that finds it missing re-resolves every C and C++ file
-before writing it. It is no canonical surface either.
+declarations, the aliases and class heads an alias lookup walks, the namespace
+aliases and macros a qualified name reads) and that the namespace rows are
+current. A full index and a migration write it with the module-surface marker;
+a sync withdraws it before its first mutation and writes it back last, after
+resolution is persisted, and a sync that finds it missing or at another version
+re-resolves every C and C++ file and rebuilds the namespace rows before writing
+it. Neither is a canonical surface.
 
 ## FTS5
 

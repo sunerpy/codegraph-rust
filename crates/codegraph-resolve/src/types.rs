@@ -537,6 +537,14 @@ pub trait ResolutionContext {
     fn python_write_index(&self) -> Arc<crate::python_globals::PythonWriteIndex> {
         Arc::new(crate::python_globals::PythonWriteIndex::build(self))
     }
+
+    /// The project's C/C++ namespace aliases and namespace macros, which a
+    /// qualified C/C++ name reads (upstream #2176). Contexts that live for
+    /// one resolution pass keep one set; the default makes a new one, which
+    /// reads the files again, on each call.
+    fn cpp_namespace_tables(&self) -> Arc<crate::cpp_namespaces::CppNamespaceTables> {
+        Arc::new(crate::cpp_namespaces::CppNamespaceTables::new())
+    }
 }
 
 /// Go module info parsed from `go.mod`.

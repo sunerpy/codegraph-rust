@@ -2161,6 +2161,15 @@ pub fn match_by_qualified_name(
         return None;
     }
 
+    // A C or C++ name written from the global scope is the declaration of
+    // exactly that name (upstream #2445); the partial match below would take
+    // a namesake nested in another namespace or class.
+    if matches!(reference.language, Language::C | Language::Cpp)
+        && reference.reference_name.starts_with("::")
+    {
+        return crate::cpp_namespaces::match_cpp_global_name(reference, context);
+    }
+
     let candidates = context.get_nodes_by_qualified_name_shared(&reference.reference_name);
     if candidates.len() == 1 {
         return Some(ResolvedRef {
@@ -6148,7 +6157,19 @@ pub fn match_reference(
     }
 
     // 4. Fuzzy match.
-    match_fuzzy(reference, context)
+    if let Some(result) = match_fuzzy(reference, context) {
+        return Some(result);
+    }
+
+    // 5. A C / C++ name qualified by a namespace the project opens with a
+    // macro (`fmt::format`, `FMT_BEGIN_NAMESPACE`), which the index cannot
+    // see (upstream #2176).
+    if matches!(reference.language, Language::C | Language::Cpp)
+        && reference.reference_name.contains("::")
+    {
+        return crate::cpp_namespaces::match_cpp_macro_namespaced(reference, context);
+    }
+    None
 }
 
 fn split_erlang_arity(name: &str) -> Option<(&str, &str)> {

@@ -2018,6 +2018,14 @@ impl ReferenceResolver {
         // empty.
         let existence_name = if reference.language == Language::Erlang {
             strip_erlang_arity(&reference.reference_name)
+        } else if matches!(reference.language, Language::C | Language::Cpp) {
+            // A C or C++ name written from the global scope
+            // (`::_pbi::PrivateAccess::GenerateParseTable`, `::memset`)
+            // exists when the name under the `::` does (upstream #2445).
+            reference
+                .reference_name
+                .strip_prefix("::")
+                .unwrap_or(&reference.reference_name)
         } else {
             &reference.reference_name
         };
@@ -3190,11 +3198,14 @@ impl ReferenceResolver {
         }
 
         if matches!(reference.language, Language::C | Language::Cpp) {
-            if name.starts_with("std::") {
+            // A leading `::` names the global scope: `::std::move` is
+            // `std::move`, `::memset` is `memset` (upstream #2445).
+            let scoped = name.strip_prefix("::").unwrap_or(name);
+            if scoped.starts_with("std::") {
                 return true;
             }
-            if c_built_ins().contains(name.as_str()) || cpp_built_ins().contains(name.as_str()) {
-                return !self.has_any_possible_match(name);
+            if c_built_ins().contains(scoped) || cpp_built_ins().contains(scoped) {
+                return !self.has_any_possible_match(scoped);
             }
         }
 

@@ -23,9 +23,11 @@
 //! The surfaces before the change come from one snapshot of the store taken
 //! before the sync first changes a C/C++ file, so a file changed earlier in
 //! the batch, whose nodes took other files' `extends` edges with them, cannot
-//! hide what a later file held. A sync withdraws [`VERSION_KEY`] before its
-//! first change and writes it back once everything resolved; an index without
-//! it re-resolves every C/C++ file once.
+//! hide what a later file held. The names the namespace rows seed
+//! ([`crate::cpp_namespace_rows`], W4-CPP-07) join the name lane. A sync
+//! withdraws [`VERSION_KEY`] before its first change and writes it back once
+//! everything resolved; an index without it, or with an older version,
+//! re-resolves every C/C++ file once and rebuilds the namespace rows.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
@@ -37,8 +39,8 @@ use codegraph_store::Store;
 
 /// Metadata key present when no sync left a C/C++ dependent unrefreshed.
 pub const VERSION_KEY: &str = "cpp_type_surface_version";
-/// Value of [`VERSION_KEY`].
-pub const VERSION: &str = "1";
+/// Value of [`VERSION_KEY`]. 2: the namespace rows exist (W4-CPP-07).
+pub const VERSION: &str = "2";
 
 /// Kinds of the nodes a type surface reads.
 const SURFACE_KINDS: [NodeKind; 5] = [
@@ -84,7 +86,7 @@ fn base_name(written: &str) -> String {
 }
 
 /// Each identifier token of `text`, `[A-Za-z_][A-Za-z0-9_]*`.
-fn identifiers(text: &str) -> impl Iterator<Item = &str> {
+pub(crate) fn identifiers(text: &str) -> impl Iterator<Item = &str> {
     let bytes = text.as_bytes();
     let mut at = 0usize;
     std::iter::from_fn(move || {
@@ -238,6 +240,8 @@ pub(crate) struct CppChanges {
     /// Every changed path a source's receiver inference may read as its
     /// header.
     headers: BTreeSet<String>,
+    /// What the changed files held for their namespace rows (W4-CPP-07).
+    pub(crate) namespaces: crate::cpp_namespace_rows::NamespaceChanges,
 }
 
 impl CppChanges {
@@ -377,7 +381,8 @@ impl CppChanges {
 
     /// The unchanged files this sync must re-resolve whole: every indexed
     /// C/C++ file on `bootstrap`, otherwise the two lanes of the module
-    /// documentation. `reindexed` files resolve anyway and are left out.
+    /// documentation, the name lane also taking the namespace rows'
+    /// `namespace_names`. `reindexed` files resolve anyway and are left out.
     pub(crate) fn dependent_files(
         &self,
         store: &Store,
@@ -385,8 +390,13 @@ impl CppChanges {
         max_file_size: u64,
         reindexed: &HashSet<String>,
         bootstrap: bool,
+        namespace_names: &HashSet<String>,
     ) -> Result<BTreeSet<String>> {
-        if !bootstrap && self.headers.is_empty() && self.snapshot.is_none() {
+        if !bootstrap
+            && self.headers.is_empty()
+            && self.snapshot.is_none()
+            && namespace_names.is_empty()
+        {
             return Ok(BTreeSet::new());
         }
         let files = store.all_files()?;
@@ -409,7 +419,8 @@ impl CppChanges {
                         .cloned(),
                 );
             }
-            let names = self.touched_names(store)?;
+            let mut names = self.touched_names(store)?;
+            names.extend(namespace_names.iter().cloned());
             #[cfg(test)]
             tests::LAST_NAMES.with(|last| {
                 let mut sorted: Vec<String> = names.iter().cloned().collect();

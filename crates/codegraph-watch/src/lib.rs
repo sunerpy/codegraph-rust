@@ -1,4 +1,5 @@
 pub mod cpp_dependents;
+pub mod cpp_namespace_rows;
 mod git;
 pub mod git_pending;
 mod link_state;

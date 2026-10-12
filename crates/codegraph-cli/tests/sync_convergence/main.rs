@@ -344,8 +344,11 @@ fn run_case(name: &str, case: &Case) {
     // fresh index writes them.
     let surface_rows = support::project_metadata_with_prefix(&fresh.db(), "js_module_surface");
     // So is the C/C++ dependents marker (W4-CPP-04): every sync that
-    // succeeded leaves it as a fresh index writes it.
+    // succeeded leaves it as a fresh index writes it, and the namespace rows
+    // (W4-CPP-07) with it.
     let cpp_marker = support::project_metadata_with_prefix(&fresh.db(), "cpp_type_surface");
+    let namespace_rows =
+        support::project_metadata_with_prefix(&fresh.db(), "cpp_namespace_surface");
     for (driver, project) in [("cli", &cli), ("watch", &watch)] {
         let rows = support::project_metadata_with_prefix(&project.db(), "js_module_surface");
         if rows != surface_rows {
@@ -359,6 +362,13 @@ fn run_case(name: &str, case: &Case) {
             divergent.push(format!(
                 "=== {driver} driver: the C/C++ dependents marker differs from a fresh index\n\
                  synced: {marker:#?}\nfresh: {cpp_marker:#?}"
+            ));
+        }
+        let rows = support::project_metadata_with_prefix(&project.db(), "cpp_namespace_surface");
+        if rows != namespace_rows {
+            divergent.push(format!(
+                "=== {driver} driver: the C/C++ namespace rows differ from a fresh index\n\
+                 synced: {rows:#?}\nfresh: {namespace_rows:#?}"
             ));
         }
     }
@@ -690,6 +700,12 @@ matrix! {
     cpp_header_member_becomes_a_library_type,
     cpp_project_declares_a_lowercase_outside_type,
     cpp_nested_template_member_type_moves_an_unchanged_receiver,
+    cpp_cross_file_namespace_alias_retarget,
+    cpp_macro_opener_opens_another_namespace,
+    cpp_macro_alias_moves_an_opener_it_feeds,
+    cpp_macro_closer_moves_a_declaration_out_of_the_namespace,
+    cpp_free_operator_moves_out_of_the_macro_namespace,
+    cpp_opener_definition_stops_opening_a_namespace,
     java_subclass_gains_a_base_its_caller_reaches,
     typescript_dollar_import_reaches_an_added_module,
     typescript_dollar_default_export_names_another_declaration,

@@ -6514,4 +6514,256 @@ class basic_json
             graph.report()
         );
     }
+
+    /// `kind target-qualified (target file)` of every edge leaving a
+    /// function or method named `name` in `file`, sorted.
+    fn edges_from_named(graph: &Graph, file: &str, name: &str) -> Vec<String> {
+        let ids: Vec<&str> = graph
+            .nodes
+            .iter()
+            .filter(|node| {
+                node.file_path == file
+                    && node.name == name
+                    && (node.kind == "function" || node.kind == "method")
+            })
+            .map(|node| node.id.as_str())
+            .collect();
+        assert!(!ids.is_empty(), "no function or method {name} in {file}");
+        let mut out: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.kind != "contains" && ids.contains(&edge.source.as_str()))
+            .filter_map(|edge| {
+                graph.node(&edge.target).map(|target| {
+                    format!(
+                        "{} {} ({})",
+                        edge.kind, target.qualified_name, target.file_path
+                    )
+                })
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// Upstream #2176 (`5844eb89`): a library that opens its namespace with a
+    /// macro (fmt's `FMT_BEGIN_NAMESPACE`, pybind11's
+    /// `PYBIND11_NAMESPACE_BEGIN(PYBIND11_NAMESPACE)`) has its declarations
+    /// indexed without that namespace; a qualified name now reaches the
+    /// declaration the project's own namespace macros put there, through a
+    /// namespace alias (`namespace py = pybind11;`) too.
+    #[test]
+    fn pr2176_a_qualified_name_reaches_a_declaration_in_a_macro_opened_namespace() {
+        let project = Project::new()
+            .file(
+                "include/fmt/base.h",
+                "#pragma once\n#define FMT_BEGIN_NAMESPACE \\\n  namespace fmt {           \\\n  inline namespace v12 {\n#define FMT_END_NAMESPACE \\\n  }                       \\\n  }\n\nFMT_BEGIN_NAMESPACE\nnamespace detail {\ninline int to_unsigned(int value) { return value; }\n}\n\ninline int format(const char* spec) { return detail::to_unsigned(0); }\nFMT_END_NAMESPACE\n",
+            )
+            .file(
+                "include/pybind11/detail/macros.h",
+                "#pragma once\n#define PYBIND11_NAMESPACE pybind11\n#define PYBIND11_NAMESPACE_BEGIN(name) \\\n    namespace name {                   \\\n    PYBIND11_WARNING_PUSH\n#define PYBIND11_NAMESPACE_END(name) \\\n    PYBIND11_WARNING_POP             \\\n    }\n\nPYBIND11_NAMESPACE_BEGIN(PYBIND11_NAMESPACE)\ninline void print(const char* text) {}\nPYBIND11_NAMESPACE_END(PYBIND11_NAMESPACE)\n",
+            )
+            .file(
+                "test/format-test.cc",
+                "#include \"fmt/base.h\"\n#include \"pybind11/detail/macros.h\"\n\nnamespace py = pybind11;\n\nint main() {\n  fmt::format(\"{}\");\n  fmt::detail::to_unsigned(1);\n  py::print(\"hi\");\n  return 0;\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        assert_eq!(
+            edges_from_named(graph, "test/format-test.cc", "main"),
+            [
+                "calls detail::to_unsigned (include/fmt/base.h)",
+                "calls format (include/fmt/base.h)",
+                "calls print (include/pybind11/detail/macros.h)",
+            ],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream #2201 (`116feb46`): `lib::format("{}", x)` among overloads a
+    /// namespace macro opens picks the one the arguments fit: a narrow
+    /// literal the `format_string` overload, a wide one (`L"{}"`) the
+    /// `wformat_string` one, a style argument the style one.
+    #[test]
+    fn pr2201_a_macro_namespaced_call_picks_the_overload_its_arguments_fit() {
+        let project = Project::new()
+            .file(
+                "include/lib/base.h",
+                "#pragma once\n#define LIB_BEGIN_NAMESPACE namespace lib {\n#define LIB_END_NAMESPACE }\n\nLIB_BEGIN_NAMESPACE\ntemplate <typename... T> struct format_string {};\ntemplate <typename... T> struct wformat_string {};\nLIB_END_NAMESPACE\n",
+            )
+            .file(
+                "include/lib/color.h",
+                "#pragma once\n#include \"base.h\"\n\nLIB_BEGIN_NAMESPACE\nstruct text_style {};\n\ntemplate <typename... T>\ninline auto format(const text_style& ts, format_string<T...> fmt, T&&... args) -> int {\n  return 0;\n}\nLIB_END_NAMESPACE\n",
+            )
+            .file(
+                "include/lib/format.h",
+                "#pragma once\n#include \"base.h\"\n\nLIB_BEGIN_NAMESPACE\ntemplate <typename... T>\ninline auto format(format_string<T...> fmt, T&&... args) -> int {\n  return 1;\n}\nLIB_END_NAMESPACE\n",
+            )
+            .file(
+                "include/lib/xchar.h",
+                "#pragma once\n#include \"base.h\"\n\nLIB_BEGIN_NAMESPACE\ntemplate <typename... T>\ninline auto format(wformat_string<T...> fmt, T&&... args) -> int {\n  return 2;\n}\nLIB_END_NAMESPACE\n",
+            )
+            .file(
+                "test/use.cc",
+                "#include \"lib/color.h\"\n#include \"lib/format.h\"\n#include \"lib/xchar.h\"\n\nint narrow() { return lib::format(\"{}\", 1); }\nint wide() { return lib::format(L\"{}\", 2); }\nint styled() { return lib::format(lib::text_style{}, \"{}\", 3); }\n",
+            )
+            .index();
+        let graph = project.graph();
+        let format_from = |caller: &str| -> Vec<String> {
+            edges_from_named(graph, "test/use.cc", caller)
+                .into_iter()
+                .filter(|edge| edge.starts_with("calls format "))
+                .collect()
+        };
+        assert_eq!(
+            format_from("narrow"),
+            ["calls format (include/lib/format.h)"],
+            "{}",
+            graph.report()
+        );
+        assert_eq!(format_from("wide"), ["calls format (include/lib/xchar.h)"]);
+        assert_eq!(
+            format_from("styled"),
+            ["calls format (include/lib/color.h)"]
+        );
+    }
+
+    const PB_INTERNAL: &str = "#pragma once\nnamespace pb {\nnamespace internal {\ninline int Prefetch(const void* ptr) { return ptr != nullptr; }\n}  // namespace internal\n}  // namespace pb\n\nnamespace _pbi = ::pb::internal;\n";
+
+    /// Upstream #2445 (`7a796541`): a C or C++ name written from the global
+    /// scope (`::store::Repair(…)`, `::_pbi::Prefetch(…)` through `namespace
+    /// _pbi = ::pb::internal;`) gets past the name pre-filter and is the
+    /// declaration of exactly that qualified name: never one nested in
+    /// another namespace or class (the wrapper `int close(int fd) { return
+    /// ::close(fd); }`), nor one a namespace macro opens (`struct pipe` in
+    /// `LIB_BEGIN_NAMESPACE`), nor an outside `::testing::` name.
+    #[test]
+    fn pr2445_a_global_scope_name_is_the_declaration_of_exactly_that_name() {
+        let project = Project::new()
+            .file(
+                "src/store/repair.cc",
+                "namespace store {\nint Repair(const char* name) { return name != nullptr; }\nint move(int value) { return value; }\n\nnamespace testing {\nconst char* TempDir() { return \"/tmp/store\"; }\n}  // namespace testing\n}  // namespace store\n",
+            )
+            .file("src/pb/internal.h", PB_INTERNAL)
+            .file(
+                "src/store/posix.cc",
+                "#include <unistd.h>\n\nnamespace store {\nnamespace posix {\nint close(int fd) { return ::close(fd); }\n}  // namespace posix\n}  // namespace store\n",
+            )
+            .file(
+                "tools/repair_tool.cc",
+                "#include <utility>\n#include \"pb/internal.h\"\n\nnamespace tools {\nnamespace store {\nint Repair(const char* name) { return 0; }\n}  // namespace store\n\nint Run(const char* name) {\n  int fixed = ::store::Repair(name);\n  int warmed = ::_pbi::Prefetch(name);\n  return ::std::move(fixed) + warmed;\n}\n}  // namespace tools\n",
+            )
+            .file(
+                "include/lib/os.h",
+                "#pragma once\n#define LIB_BEGIN_NAMESPACE \\\n  namespace lib {           \\\n  inline namespace v1 {\n#define LIB_END_NAMESPACE \\\n  }                       \\\n  }\n\nLIB_BEGIN_NAMESPACE\nstruct pipe {\n  int read_end;\n  int write_end;\n};\nLIB_END_NAMESPACE\n",
+            )
+            .file(
+                "tests/posix-mock.cc",
+                "#include <unistd.h>\n#include \"lib/os.h\"\n\nnamespace test {\nint pipe(int fds[2]) { return ::pipe(fds); }\n}  // namespace test\n",
+            )
+            .file(
+                "tests/repair_test.cc",
+                "#include <gtest/gtest.h>\n\nclass RepairTest : public ::testing::Test {};\n\nint RunAll(int argc, char** argv) {\n  ::testing::InitGoogleTest(&argc, argv);\n  return ::testing::TempDir() != nullptr;\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        // Inside `namespace tools`, `store::Repair` would be tools' own;
+        // `::store::Repair` is the global one.
+        assert_eq!(
+            edges_from_named(graph, "tools/repair_tool.cc", "Run"),
+            [
+                "calls pb::internal::Prefetch (src/pb/internal.h)",
+                "calls store::Repair (src/store/repair.cc)",
+            ],
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            edges_from_named(graph, "src/store/posix.cc", "close"),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            edges_from_named(graph, "tests/posix-mock.cc", "pipe"),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            edges_from_named(graph, "tests/repair_test.cc", "RunAll"),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            supertypes(graph, "RepairTest", "tests/repair_test.cc"),
+            Vec::<String>::new()
+        );
+    }
+
+    /// Upstream #2445: protobuf's C++ `::_pbi::` call beside Swift and
+    /// Objective-C files still links (upstream's Swift ↔ Objective-C bridge
+    /// no longer claims it; no framework claims C++ names here).
+    #[test]
+    fn pr2445_a_global_scope_call_beside_swift_and_objective_c() {
+        let project = Project::new()
+            .file(
+                "objectivec/GPBLegacy.m",
+                "#import <Foundation/Foundation.h>\n\n@interface GPBLegacy : NSObject\n- (void)start;\n@end\n\n@implementation GPBLegacy\n- (void)start {}\n@end\n",
+            )
+            .file(
+                "swift/Bridge.swift",
+                "import Foundation\n\nfinal class Bridge: NSObject {\n  func run() {}\n}\n",
+            )
+            .file("src/pb/internal.h", PB_INTERNAL)
+            .file(
+                "src/message.cc",
+                "#include \"pb/internal.h\"\n\nint Parse(const void* data) { return ::_pbi::Prefetch(data); }\n",
+            )
+            .index();
+        let graph = project.graph();
+        assert_eq!(
+            edges_from_named(graph, "src/message.cc", "Parse"),
+            ["calls pb::internal::Prefetch (src/pb/internal.h)"],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream #2407's final shape with #2176's tables (W4-CPP-07): a base
+    /// named through a namespace alias another header writes, and a base a
+    /// namespace macro puts in its namespace (`fmt::detail::buffer`, indexed
+    /// as `detail::buffer` inside `FMT_BEGIN_NAMESPACE`).
+    #[test]
+    fn pr2407_a_base_through_a_project_alias_or_a_macro_opened_namespace() {
+        let project = Project::new()
+            .file(
+                "include/fmt/base.h",
+                "#pragma once\n#define FMT_BEGIN_NAMESPACE namespace fmt {\n#define FMT_END_NAMESPACE }\nFMT_BEGIN_NAMESPACE\nnamespace detail {\ntemplate <typename T> class buffer {\n public:\n  void push_back(const T& value) {}\n};\n}  // namespace detail\nFMT_END_NAMESPACE\n",
+            )
+            .file(
+                "include/other/buffer.h",
+                "namespace other {\nnamespace detail {\nclass buffer {};\n}  // namespace detail\n}  // namespace other\n",
+            )
+            .file(
+                "src/memory.cc",
+                "#include \"fmt/base.h\"\nclass memory_buffer : public fmt::detail::buffer<char> {};\n",
+            )
+            .file(
+                "src/google/protobuf/message.h",
+                "namespace google {\nnamespace protobuf {\nclass Message {};\n}  // namespace protobuf\n}  // namespace google\nnamespace pb = ::google::protobuf;\n",
+            )
+            .file(
+                "src/generated.cc",
+                "#include \"google/protobuf/message.h\"\nclass Generated : public pb::Message {};\n",
+            )
+            .index();
+        let graph = project.graph();
+        assert_eq!(
+            supertypes(graph, "memory_buffer", "src/memory.cc"),
+            ["extends detail::buffer (include/fmt/base.h) qualified-name"],
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            supertypes(graph, "Generated", "src/generated.cc"),
+            ["extends google::protobuf::Message (src/google/protobuf/message.h) qualified-name"]
+        );
+    }
 }

@@ -325,11 +325,21 @@ C or C++ file, sends every unchanged C or C++ file whose text mentions a
 touched name down the same lane, the names closed over the aliases whose
 declarations mention them and over the classes deriving from a class whose
 bases changed, since an alias lookup reads those declarations by name across
-the project; the `cpp_type_surface_version` marker is withdrawn and restored
-with the surface marker, and an index without it re-resolves every C and C++
-file once (a base that becomes a namesake in another namespace, and a class
-gaining or losing its `template <…>` head while no alias's text changes, are
-not detected); an import
+the project; a C or C++ file whose namespace row moved (a namespace alias or a
+namespace macro definition that came, went or changed, with the names its body
+writes, or a changed use of an opener or closer, with the namespaces it opens,
+closed over every alias and macro whose body names a seed) sends every
+unchanged C or C++ file mentioning a seed down the same lane, together with the
+bare names (an operator's or destructor's first identifier) of the
+declarations whose effective name, macro prefix plus qualified name, moved in
+the changed files that use an opener or closer and in the unchanged files that
+use a seed macro, since a qualified name and a call from the global scope read
+those namespaces from text; the `cpp_type_surface_version` marker is withdrawn
+and restored with the surface marker, and an index without it, or with an
+older version, re-resolves every C and C++ file once and rebuilds the namespace
+rows (a base that becomes a namesake in another namespace, and a class gaining
+or losing its `template <…>` head while no alias's text changes, are not
+detected); an import
 names a file, a folder or a namespace rather than a symbol, so the parked
 imports an added file or a changed file's namespace can satisfy (by the file's
 name and stem, its folder's, or the namespace's whole name) send their files

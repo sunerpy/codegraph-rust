@@ -88,6 +88,7 @@ pub(crate) fn migrate_project(
 
     let mut pending_nodes: Vec<Node> = Vec::with_capacity(NODE_FLUSH_ROWS);
     let mut surfaces = Vec::new();
+    let mut namespace_scans = Vec::new();
     let mut edges: Vec<Edge> = Vec::new();
     let mut refs: Vec<UnresolvedRef> = Vec::new();
     let mut outcome = SyncOutcome {
@@ -130,6 +131,9 @@ pub(crate) fn migrate_project(
         {
             surfaces.push((relative.clone(), surface));
         }
+        if let Some(scan) = crate::cpp_namespace_rows::scan_of(relative, file.language, &source) {
+            namespace_scans.push((relative.clone(), scan));
+        }
         pending_nodes.append(&mut result.nodes);
         if pending_nodes.len() >= NODE_FLUSH_ROWS {
             rebuild.store_mut().upsert_nodes(&pending_nodes)?;
@@ -155,6 +159,8 @@ pub(crate) fn migrate_project(
         &surfaces,
     )?;
     drop(surfaces);
+    crate::cpp_namespace_rows::write_index_rows(rebuild.store(), &mut namespace_scans)?;
+    drop(namespace_scans);
     crate::cpp_dependents::write_marker(rebuild.store())?;
 
     // ALL nodes are persisted before ANY edge, because `insert_edges` drops edges

@@ -640,13 +640,23 @@ fn sync_paths_with_store(
         changed_names.note_all(surfaces.names.iter().cloned());
         // What C/C++ resolution in an unchanged file read from a changed
         // file's text: its same-stem header, or the aliases and class heads
-        // an alias lookup walks (W4-CPP-04).
+        // an alias lookup walks (W4-CPP-04), or the namespace aliases and
+        // macros a qualified name reads (W4-CPP-07).
+        let namespaces = crate::cpp_namespace_rows::namespace_refresh(
+            store,
+            project_root,
+            scope.options.max_file_size,
+            &changed_names.cpp.namespaces,
+            &reindexed,
+            cpp_bootstrap,
+        )?;
         for file in changed_names.cpp.dependent_files(
             store,
             project_root,
             scope.options.max_file_size,
             &reindexed,
             cpp_bootstrap,
+            &namespaces.names,
         )? {
             dependent_sites.remove(&file);
             dependent_fallbacks.insert(file);
@@ -733,8 +743,10 @@ fn sync_paths_with_store(
         )?;
         // Cross-file framework finalization on every sync (upstream index.ts:464).
         resolver.run_post_extract(store)?;
-        // Last: the surface rows, then the marker the first mutation withdrew.
+        // Last: the surface and namespace rows, then the markers the first
+        // mutation withdrew.
         surfaces.write_rows(store)?;
+        namespaces.write_rows(store)?;
         crate::module_surfaces::finish_bootstrap(store)?;
         crate::cpp_dependents::write_marker(store)?;
     }
@@ -995,6 +1007,9 @@ fn sync_one(
     let c_family_before = stored
         .as_ref()
         .is_some_and(|file| crate::cpp_dependents::is_c_family(file.language));
+    let namespace_row_before = stored
+        .as_ref()
+        .is_some_and(|file| crate::cpp_namespace_rows::is_row_file(relative, file.language));
     // Authoritative content gate, port of the upstream hash gate in
     // `upstream extraction/index.ts:1326-1337,1465-1483`.
     if stored.is_some_and(|file| file.content_hash == content_hash) {
@@ -1008,13 +1023,19 @@ fn sync_one(
         importers.insert(dependent.file_path.clone());
         merge_dependent_site(dependent_sites, dependent_fallbacks, dependent);
     }
-    let c_family_after = crate::cpp_dependents::is_c_family(detect_language_of(
-        relative,
-        &source,
-        &scope.options.extensions,
-    ));
+    let language_after = detect_language_of(relative, &source, &scope.options.extensions);
+    let c_family_after = crate::cpp_dependents::is_c_family(language_after);
     let c_family = c_family_after || c_family_before;
     changed_names.cpp.before_change(store, relative, c_family)?;
+    // What the namespace tables read of the file's text (W4-CPP-07).
+    let namespace_row =
+        namespace_row_before || crate::cpp_namespace_rows::is_row_file(relative, language_after);
+    if namespace_row {
+        changed_names
+            .cpp
+            .namespaces
+            .before_change(store, relative)?;
+    }
     reextract_into_store(
         store,
         relative,
@@ -1025,6 +1046,12 @@ fn sync_one(
     changed_names
         .cpp
         .after_change(store, relative, c_family, c_family_after)?;
+    if namespace_row {
+        changed_names.cpp.namespaces.after_change(
+            relative,
+            crate::cpp_namespace_rows::scan_of(relative, language_after, &source),
+        );
+    }
     if let Some(change) = changed_names.js_surfaces.get_mut(relative) {
         change.importers.extend(importers.iter().cloned());
         change.added = added;
@@ -1061,6 +1088,13 @@ fn remove_tracked_file(
     }
     let c_family = crate::cpp_dependents::is_c_family(stored.language);
     changed_names.cpp.before_change(store, relative, c_family)?;
+    if crate::cpp_namespace_rows::is_row_file(relative, stored.language) {
+        changed_names
+            .cpp
+            .namespaces
+            .before_change(store, relative)?;
+        changed_names.cpp.namespaces.after_change(relative, None);
+    }
     changed_names.note_removed(node_names_in_file(store, relative)?);
     let old_nodes = store.nodes_by_file_path(relative)?;
     changed_names.removed_files.insert(relative.to_string());
@@ -2016,6 +2050,77 @@ pub(crate) mod tests {
         write_files(dir.path(), &[CPP_OTHER_EDITED]);
         sync_changed_paths(dir.path(), &db, ["db/other.cc"]).unwrap();
         assert_eq!(cpp_marker(&db), version);
+        assert_eq!(edge_projection(&db), expected);
+    }
+
+    const NS_CONFIG: (&str, &str) = (
+        "include/lib/config.h",
+        "#pragma once\n#define LIB_BEGIN namespace lib {\n#define LIB_END }\n",
+    );
+    const NS_RUN: (&str, &str) = (
+        "include/lib/run.h",
+        "#pragma once\n#include \"lib/config.h\"\nLIB_BEGIN\ninline int run() { return 0; }\nLIB_END\n",
+    );
+    const NS_MAIN: (&str, &str) = (
+        "src/main.cc",
+        "#include \"lib/run.h\"\nint main() { return lib::run(); }\n",
+    );
+
+    fn namespace_rows(db: &Path) -> Vec<(String, String)> {
+        Store::open(db)
+            .unwrap()
+            .project_metadata_with_prefix(codegraph_resolve::cpp_namespaces::ROW_KEY_PREFIX)
+            .unwrap()
+    }
+
+    /// W4-CPP-07: an index whose C/C++ marker is version 1, built before the
+    /// namespace rows existed, has them rebuilt by its next sync, which
+    /// re-resolves every C/C++ file and writes version 2: the call through
+    /// a macro-opened namespace an older sync left without its edge comes
+    /// back.
+    #[test]
+    fn a_version_one_cpp_marker_rebuilds_the_namespace_rows() {
+        let version = Some(crate::cpp_dependents::VERSION.to_string());
+        let dir = TestDir::new("cpp-namespace-bootstrap");
+        let db = default_db_path(dir.path()).unwrap();
+        let initial = [NS_CONFIG, NS_RUN, NS_MAIN, CPP_OTHER];
+        write_files(dir.path(), &initial);
+        sync_changed_paths(dir.path(), &db, initial.iter().map(|(path, _)| *path)).unwrap();
+        assert_eq!(cpp_marker(&db), version);
+        let rows = namespace_rows(&db);
+        assert_eq!(
+            rows.iter().map(|(key, _)| key.as_str()).collect::<Vec<_>>(),
+            [
+                "cpp_namespace_surface:include/lib/config.h",
+                "cpp_namespace_surface:include/lib/run.h",
+            ]
+        );
+        let expected = edge_projection(&db);
+        {
+            let store = Store::open(&db).unwrap();
+            let dropped = store
+                .connection()
+                .execute(
+                    "DELETE FROM edges WHERE kind = 'calls' AND target = (SELECT id FROM nodes \
+                     WHERE name = 'run' AND kind = 'function')",
+                    [],
+                )
+                .unwrap();
+            assert_eq!(dropped, 1, "the call edge an older sync lost");
+            store
+                .delete_project_metadata_with_prefix(
+                    codegraph_resolve::cpp_namespaces::ROW_KEY_PREFIX,
+                )
+                .unwrap();
+            store
+                .set_project_metadata(crate::cpp_dependents::VERSION_KEY, "1")
+                .unwrap();
+        }
+        assert_ne!(edge_projection(&db), expected);
+        write_files(dir.path(), &[CPP_OTHER_EDITED]);
+        sync_changed_paths(dir.path(), &db, ["db/other.cc"]).unwrap();
+        assert_eq!(cpp_marker(&db), version);
+        assert_eq!(namespace_rows(&db), rows);
         assert_eq!(edge_projection(&db), expected);
     }
 

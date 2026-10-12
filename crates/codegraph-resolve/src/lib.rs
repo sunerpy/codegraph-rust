@@ -22,6 +22,7 @@ mod c_macro_visibility;
 mod class_heads;
 pub mod context;
 mod cpp_includers;
+pub mod cpp_namespaces;
 mod cpp_supertypes;
 mod cpp_type_aliases;
 mod csharp_extensions;
