@@ -225,7 +225,7 @@ fn blank_c_designated_macro_args(source: &str) -> String {
 /// Blanking replaces the macro with equal-length ASCII spaces, so every byte
 /// offset — and therefore every line/column and every node ID — is preserved,
 /// exactly like the C++ blanks in `lang/cpp.rs`.
-fn blank_c_leading_attr_macros(source: &str) -> String {
+pub(crate) fn blank_c_leading_attr_macros(source: &str) -> String {
     let attr_macros = attribute_like_defines(source);
     if attr_macros.is_empty() {
         return source.to_string();

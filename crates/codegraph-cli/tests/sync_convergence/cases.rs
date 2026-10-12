@@ -1802,6 +1802,27 @@ pub fn javascript_barrel_chain_follows_the_importer_language() -> Case {
         .edge_after("function check", "calls", "function safeParse @src/b.js")
 }
 
+/// Upstream #2449: a class written around attribute macros (an annotation
+/// after the parameter list, one after a field's name) keeps its method
+/// through a body edit, and an unchanged caller keeps its call.
+pub fn cpp_attribute_macro_class_body_edit() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Cpp])
+        .file(
+            "src/counter.h",
+            "namespace db {\n\nclass Counter {\n public:\n  void IncrementBy(int count) LOCKS_EXCLUDED(mu_) {\n    count_ += count;\n  }\n\n private:\n  int count_ GUARDED_BY(mu_);\n};\n\n}  // namespace db\n",
+        )
+        .file(
+            "src/use.cc",
+            "#include \"counter.h\"\n\nvoid run(db::Counter& counter) {\n  counter.IncrementBy(1);\n}\n",
+        )
+        .write(
+            "src/counter.h",
+            "namespace db {\n\nclass Counter {\n public:\n  void IncrementBy(int count) LOCKS_EXCLUDED(mu_) {\n    count_ += count * 2;\n  }\n\n private:\n  int count_ GUARDED_BY(mu_);\n};\n\n}  // namespace db\n",
+        )
+        .edge_before("function run", "calls", "method db::Counter::IncrementBy")
+        .edge_after("function run", "calls", "method db::Counter::IncrementBy")
+}
+
 /// Upstream #2378's identifier grammar: `export default $fmt;` that comes
 /// to name `$other` moves an unchanged default importer, as on a fresh
 /// index, rather than both falling back to the first exported function.

@@ -178,6 +178,25 @@ below remain immutable historical evidence.
 
 ## Sync log
 
+### 2026-10-12 — `V1_5` #1346's C++ part, and #1070 and #1100 as pre-parse passes, PORTED (W4-CPP-01)
+
+- **What:** the C++ pre-parse now runs upstream `preParseCppSource`'s passes in
+  its order (`b635dd46`): #2186's access-specifier rewrite and
+  mid-declaration conditional flattening; #1070's class-head macros (with
+  #2449's macro runs and arguments) and #1100's inline-specifier macros, which
+  Rust had only as walk-time recoveries (those stay as the fallback); #2449's
+  pointer, trailing, declarator and leading attribute-macro passes; #1346's
+  lone macro lines and directive-line restore. Row 53 of
+  [`V1_5_COMMIT_MANIFEST.md`](V1_5_COMMIT_MANIFEST.md) recorded #1346
+  (`2d72891`) `N/A` with "selected fixes port separately"; that row stays as
+  written.
+- **KEEP-RUST:** in C++ the C leading attribute macro is blanked only with a
+  `#define` proving it, as in C; the lone macro line pass runs for C++ only, so
+  C extraction is byte-identical; an inline-specifier macro inside a literal is
+  never blanked.
+- **Graph:** no golden corpus changes; the precision corpora are reviewed in
+  the W4b evidence.
+
 ### 2026-10-10 — CORRECTED: four ledger and doc statements that disagreed with the code
 
 Found by the 2026-10-10 audit (§1.6 of

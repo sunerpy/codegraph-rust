@@ -7,6 +7,7 @@ mod arkts;
 mod c;
 mod cfml;
 mod cpp;
+mod cpp_preparse;
 mod csharp;
 mod dart;
 mod erlang;
