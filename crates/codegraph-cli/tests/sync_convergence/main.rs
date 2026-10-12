@@ -665,6 +665,7 @@ matrix! {
     javascript_barrel_chain_follows_the_importer_language,
     cpp_attribute_macro_class_body_edit,
     cpp_broken_tree_class_body_edit,
+    cpp_declared_base_class_heritage_edit,
     typescript_dollar_import_reaches_an_added_module,
     typescript_dollar_default_export_names_another_declaration,
     java_super_call_in_an_override_body_edit,

@@ -4231,7 +4231,7 @@ mod python {
 }
 
 mod cpp {
-    use super::support::{Graph, Project, assert_unresolved};
+    use super::support::{Graph, Project, assert_edge, assert_unresolved, codegraph};
 
     /// The qualified names of `file`'s nodes of `kind`, sorted.
     fn qualified(graph: &Graph, file: &str, kind: &str) -> Vec<String> {
@@ -4619,5 +4619,56 @@ class basic_json
                 graph.report()
             );
         }
+    }
+
+    /// Upstream #2446 (`235387ec`): a struct or class defined in the type of
+    /// a variable declaration is a node, so calls on its methods link and a
+    /// base class defined this way has a node to resolve to; an unnamed
+    /// struct is found by its variable's name, documented by the comment
+    /// above the declaration. Before, each declaration was handed whole to
+    /// the variable extractor and the type never became a node.
+    #[test]
+    fn pr2446_types_defined_in_declarations_link_and_are_found() {
+        let project = Project::new()
+            .file(
+                "src/registry.cc",
+                "namespace app {\nstruct Registry { int size() const { return 2; } } registry;\nclass Base { public: virtual int run() { return 1; } } base_instance;\nclass Worker : public Base { public: int run() override { return registry.size(); } };\nint tick() { Worker w; return w.run() + registry.size(); }\n}\n",
+            )
+            .file(
+                "src/setproctitle.c",
+                "/* Saved argv. */\nstatic struct { int argc; char **argv; } SPT;\nint spt_init(int argc) { SPT.argc = argc; return SPT.argc; }\n",
+            )
+            .index();
+        assert_edge!(project, "method app::Worker::run" => calls => "method app::Registry::size");
+        assert_edge!(project, "function app::tick" => calls => "method app::Registry::size");
+        assert_edge!(project, "class app::Worker" => extends => "class app::Base");
+
+        let output = codegraph(
+            project.root(),
+            ["search", "SPT", "-p", ".", "--limit", "5", "--json"],
+        );
+        let results: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("search --json output");
+        let found: Vec<(String, String, Option<String>)> = results
+            .as_array()
+            .expect("search results")
+            .iter()
+            .map(|result| {
+                let node = &result["node"];
+                (
+                    node["kind"].as_str().unwrap_or_default().to_string(),
+                    node["name"].as_str().unwrap_or_default().to_string(),
+                    node["docstring"].as_str().map(str::to_string),
+                )
+            })
+            .collect();
+        assert!(
+            found.contains(&(
+                "struct".to_string(),
+                "SPT".to_string(),
+                Some("Saved argv.".to_string())
+            )),
+            "{found:?}"
+        );
     }
 }

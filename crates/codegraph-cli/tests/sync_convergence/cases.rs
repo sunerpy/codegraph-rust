@@ -1844,6 +1844,29 @@ pub fn cpp_broken_tree_class_body_edit() -> Case {
         .edge_after("function run", "calls", "method rocksdb::clock_cache::AutoTable::Erase")
 }
 
+/// Upstream #2446: a base class defined in a variable declaration (`class
+/// Base { … } base_instance;`) is a node, so a heritage edit in another file
+/// moves the `extends` edge from one such class to another, as on a fresh
+/// index.
+pub fn cpp_declared_base_class_heritage_edit() -> Case {
+    Case::new(Change::EditHeritage, &[Language::Cpp])
+        .file(
+            "src/bases.hpp",
+            "namespace app {\nclass Base { public: virtual int run() { return 1; } } base_instance;\nclass Other { public: virtual int run() { return 2; } } other_instance;\n}  // namespace app\n",
+        )
+        .file(
+            "src/worker.cc",
+            "#include \"bases.hpp\"\n\nnamespace app {\nclass Worker : public Base {\n public:\n  int run() override { return 3; }\n};\n}  // namespace app\n",
+        )
+        .write(
+            "src/worker.cc",
+            "#include \"bases.hpp\"\n\nnamespace app {\nclass Worker : public Other {\n public:\n  int run() override { return 3; }\n};\n}  // namespace app\n",
+        )
+        .edge_before("class app::Worker", "extends", "class app::Base")
+        .edge_after("class app::Worker", "extends", "class app::Other")
+        .no_edge_after("class app::Worker", "extends", "class app::Base")
+}
+
 /// Upstream #2378's identifier grammar: `export default $fmt;` that comes
 /// to name `$other` moves an unchanged default importer, as on a fresh
 /// index, rather than both falling back to the first exported function.

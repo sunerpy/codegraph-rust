@@ -75,12 +75,18 @@ impl LanguageSpec for CppSpec {
         {
             return Some(name);
         }
-        let qid = declarator_qualified_id(child_by_field(node, "declarator")?)?;
-        node_text(qid, source)
-            .rsplit("::")
-            .filter(|part| !part.is_empty())
-            .next()
-            .map(str::to_string)
+        child_by_field(node, "declarator")
+            .and_then(declarator_qualified_id)
+            .and_then(|qid| {
+                node_text(qid, source)
+                    .rsplit("::")
+                    .find(|part| !part.is_empty())
+                    .map(str::to_string)
+            })
+            .or_else(|| crate::lang::c::unnamed_type_variable_name(node, source))
+    }
+    fn declaration_wrapper<'tree>(&self, node: Node<'tree>) -> Option<Node<'tree>> {
+        crate::lang::c::defining_declaration(node)
     }
     fn get_receiver_type(&self, node: Node<'_>, source: &str) -> Option<String> {
         let qid = declarator_qualified_id(child_by_field(node, "declarator")?)?;

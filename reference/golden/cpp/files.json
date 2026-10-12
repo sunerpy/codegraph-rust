@@ -184,7 +184,7 @@
     "errors": null,
     "generated": 0,
     "language": "c",
-    "node_count": 7,
+    "node_count": 8,
     "path": "union_agg.c",
     "size": 278
   },

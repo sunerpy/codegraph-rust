@@ -430,6 +430,12 @@ pub struct TreeSitterWalker<'a, 'tree> {
     cpp_brace_scopes: Option<crate::lang::cpp_brace_scopes::CppBraceScopes>,
     cpp_class_scopes: crate::lang::cpp_brace_scopes::NestedIntervals<String>,
     cpp_class_scope_ids: HashSet<String>,
+    /// C/C++: whether a class, struct, union or enum defined in the type of a
+    /// declaration outside any body is walked (upstream #2446). Not in a C++
+    /// file whose tree has errors and whose braces do not balance: error
+    /// recovery can close a scope at the wrong `}`, and with no brace scopes
+    /// to correct it the walked class would land in the wrong one.
+    walk_declared_types: bool,
 }
 
 /// The parts of a store initializer that its walk must not treat as the
@@ -475,6 +481,7 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             cpp_brace_scopes: None,
             cpp_class_scopes: crate::lang::cpp_brace_scopes::NestedIntervals::default(),
             cpp_class_scope_ids: HashSet::new(),
+            walk_declared_types: false,
         }
     }
 
@@ -487,6 +494,11 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             self.cpp_brace_scopes =
                 crate::lang::cpp_brace_scopes::scan_cpp_brace_scopes(self.source);
         }
+        self.walk_declared_types = match self.spec.language() {
+            Language::C => true,
+            Language::Cpp => !self.root.has_error() || self.cpp_brace_scopes.is_some(),
+            _ => false,
+        };
         let file_node = self.create_file_node();
         let file_id = file_node.id.clone();
         self.nodes.push(file_node);
@@ -699,24 +711,27 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
         } else if has_type(self.spec.variable_types(), node_type)
             && (!self.is_inside_class_like_node() || self.is_type_scope_constant(node))
         {
-            // In a file walked in brace scopes, a class the tree reads as the
-            // type of a declaration (`class X {…}` glued to the tokens after
-            // it by error recovery) is still a class (upstream #2426). In a
-            // class body the children walk reached it; out of one, this
-            // branch skips that walk.
-            if self.cpp_brace_scopes.is_some()
-                && let Some(declared) = child_by_field(node, "type")
-                && matches!(
-                    declared.kind(),
-                    "class_specifier" | "struct_specifier" | "union_specifier" | "enum_specifier"
-                )
-                && child_by_field(declared, "body").is_some()
-            {
-                self.visit_node(declared);
+            // C/C++: a class, struct, union or enum defined in the
+            // declaration's type (`struct Foo { … } foo;`, `static struct { … }
+            // SPT;`) is a definition like one written on its own, and the
+            // variables keep their nodes beside it (upstream #2446). So is a
+            // class the tree reads as a declaration's type in a file walked in
+            // brace scopes (`class X {…}` glued to the tokens after it by error
+            // recovery, #2426). In a class or function body the children walk
+            // reaches it; here, this branch skips that walk.
+            let defined_type = if self.walk_declared_types {
+                child_by_field(node, "type")
+                    .filter(|declared| crate::lang::is_class_like_definition(*declared))
+            } else {
+                None
+            };
+            if let Some(defined) = defined_type {
+                self.visit_node(defined);
             }
             self.maybe_cpp_construction(node);
             self.extract_variable(node);
-            self.scan_fn_ref_subtree(node, 0);
+            // A type walked above captured its own function values.
+            self.scan_fn_ref_subtree_skipping(node, 0, defined_type.map(|defined| defined.id()));
             skip_children = true;
         } else if self.spec.language() == Language::Swift
             && node_type == "protocol_property_declaration"
@@ -6500,7 +6515,21 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
     /// Candidates-only scan of a top-level var-initializer subtree, halting at
     /// nested functions. Ports `scanFnRefSubtree` (tree-sitter.ts:392-409).
     fn scan_fn_ref_subtree(&mut self, node: SyntaxNode<'tree>, depth: u32) {
+        self.scan_fn_ref_subtree_skipping(node, depth, None);
+    }
+
+    /// [`Self::scan_fn_ref_subtree`] past the subtree `walked`, which the
+    /// body walker has already been through (upstream's `walked` set).
+    fn scan_fn_ref_subtree_skipping(
+        &mut self,
+        node: SyntaxNode<'tree>,
+        depth: u32,
+        walked: Option<usize>,
+    ) {
         if crate::function_ref::fn_ref_spec(self.spec.language()).is_none() || depth > 12 {
+            return;
+        }
+        if walked == Some(node.id()) {
             return;
         }
         let node_type = node.kind();
@@ -6520,7 +6549,7 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
         self.maybe_capture_fn_refs(node, node_type);
         for i in 0..node.named_child_count() {
             if let Some(child) = node.named_child(i as u32) {
-                self.scan_fn_ref_subtree(child, depth + 1);
+                self.scan_fn_ref_subtree_skipping(child, depth + 1, walked);
             }
         }
     }
@@ -6666,7 +6695,7 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
         let preceding = if self.spec.language() == Language::Dart {
             self.dart_preceding_docstring(node)
         } else {
-            self.preceding_docstring(node)
+            self.preceding_docstring(self.spec.declaration_wrapper(node).unwrap_or(node))
         }
         .filter(|text| !text.is_empty());
         let body = self.spec.body_docstring(node, self.source);
@@ -11681,7 +11710,7 @@ impl Greet for Bits { fn greet(&self) -> String { "bits".to_string() } }
     }
 
     #[test]
-    fn bodiless_and_anonymous_unions_are_not_indexed() {
+    fn bodiless_unions_are_not_indexed_and_unnamed_ones_take_their_variables_name() {
         let src = concat!(
             "union Fwd;\n",
             "struct FwdS;\n",
@@ -11694,13 +11723,16 @@ impl Greet for Bits { fn greet(&self) -> String { "bits".to_string() } }
         // drops it, the same rule that keeps `struct Foo;` out.
         assert!(!nodes.iter().any(|n| n.name == "Fwd"));
         assert!(!nodes.iter().any(|n| n.name == "FwdS"));
-        // An anonymous union mints nothing, because the anonymous struct beside it
-        // mints nothing — both are consumed by the `declaration` arm.
+        // An unnamed union defined in a declaration is named after the variable
+        // the declaration declares, as the unnamed struct beside it is (upstream
+        // #2446): neither mints an `<anonymous>` node.
         assert!(
             !nodes.iter().any(|n| n.name == "<anonymous>"),
-            "an anonymous aggregate must mint no node: {:?}",
+            "an unnamed aggregate with a variable must mint no anonymous node: {:?}",
             nodes.iter().map(|n| &n.name).collect::<Vec<_>>()
         );
+        assert!(has_node(&nodes, NodeKind::Union, "anon_var"));
+        assert!(has_node(&nodes, NodeKind::Struct, "anon_struct_var"));
         // Positive control, so the negatives cannot pass by the file failing to parse.
         assert!(has_node(&nodes, NodeKind::Union, "Named"));
     }

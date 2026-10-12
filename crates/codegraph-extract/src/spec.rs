@@ -88,6 +88,14 @@ pub trait LanguageSpec: Sync {
         None
     }
 
+    /// The node a declaration is wrapped in, whose preceding comment documents
+    /// it (upstream `getDeclarationWrapper`): a C/C++ type defined in a
+    /// declaration's type, `struct Foo { … } foo;`, is documented by the
+    /// comment above the declaration.
+    fn declaration_wrapper<'tree>(&self, _node: Node<'tree>) -> Option<Node<'tree>> {
+        None
+    }
+
     fn classify_class_node(&self, _node: Node<'_>) -> NodeKind {
         NodeKind::Class
     }

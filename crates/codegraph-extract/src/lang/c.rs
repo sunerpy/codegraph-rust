@@ -59,6 +59,10 @@ impl LanguageSpec for CSpec {
     }
     fn resolve_name(&self, node: Node<'_>, source: &str) -> Option<String> {
         crate::lang::cpp::recover_single_arg_macro_defined_name(node, source)
+            .or_else(|| unnamed_type_variable_name(node, source))
+    }
+    fn declaration_wrapper<'tree>(&self, node: Node<'tree>) -> Option<Node<'tree>> {
+        defining_declaration(node)
     }
     fn name_field(&self) -> &'static str {
         "declarator"
@@ -408,6 +412,47 @@ fn valid_ident(text: &str) -> bool {
         .next()
         .is_some_and(|c| c == '_' || c.is_ascii_alphabetic())
         && chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
+}
+
+/// Whether a C/C++ type specifier defines a class, struct, union or enum,
+/// as opposed to naming one (`struct Foo *p`, the forward declaration
+/// `class Foo;`): upstream `isClassLikeDefinition`.
+pub(crate) fn is_class_like_definition(node: Node<'_>) -> bool {
+    matches!(
+        node.kind(),
+        "class_specifier" | "struct_specifier" | "union_specifier" | "enum_specifier"
+    ) && child_by_field(node, "body").is_some()
+}
+
+/// The `declaration` a class, struct, union or enum is defined in the type of
+/// (`struct Foo { … } foo;`), or `None` for one written on its own, in a
+/// typedef or in a member's type (upstream #2446 `definingDeclaration`).
+pub(crate) fn defining_declaration(node: Node<'_>) -> Option<Node<'_>> {
+    if !is_class_like_definition(node) {
+        return None;
+    }
+    let parent = node.parent()?;
+    (parent.kind() == "declaration"
+        && child_by_field(parent, "type").map(|t| t.id()) == Some(node.id()))
+    .then_some(parent)
+}
+
+/// The name of an unnamed class, struct, union or enum a declaration
+/// defines: the first variable the declaration declares (upstream #2446
+/// `unnamedTypeVariableName`). No code can name the type of `static struct {
+/// … } SPT;`, only `SPT`, so the struct is `SPT`, as `typedef struct { … }
+/// Name;` is `Name`. `None` for a named type, and when the declaration
+/// declares no variable (a function's return type).
+pub(crate) fn unnamed_type_variable_name(node: Node<'_>, source: &str) -> Option<String> {
+    if child_by_field(node, "name").is_some() {
+        return None;
+    }
+    let declaration = defining_declaration(node)?;
+    let mut cursor = declaration.walk();
+    declaration
+        .children_by_field_name("declarator", &mut cursor)
+        .find_map(|declarator| c_declarator_identifier(Some(declarator)))
+        .map(|identifier| node_text(identifier, source))
 }
 
 /// The identifier a C declarator declares (upstream `cDeclaratorIdentifier`):
