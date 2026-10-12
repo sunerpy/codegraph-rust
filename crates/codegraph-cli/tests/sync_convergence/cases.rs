@@ -2624,6 +2624,64 @@ pub fn kotlin_receiver_type_appears_in_another_file() -> Case {
         .edge_after("method app::Use::go", "calls", "method app::Helper::ping")
 }
 
+/// Upstream #2174: a Kotlin infix call is a call, so an infix function
+/// appearing in another file gives an unchanged file's `Column().id eq 3`
+/// its callee, as on a fresh index.
+pub fn kotlin_infix_function_appears_in_another_file() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Kotlin])
+        .file(
+            "src/app/Column.kt",
+            "package app\n\nclass Column {\n    val id: Int = 1\n}\n",
+        )
+        .file(
+            "src/app/Use.kt",
+            "package app\n\nfun same(): Boolean = Column().id eq 3\n",
+        )
+        .write(
+            "src/app/Column.kt",
+            "package app\n\nclass Column {\n    val id: Int = 1\n\n    infix fun eq(other: Int): Boolean = true\n}\n",
+        )
+        .edge_after("function app::same", "calls", "method app::Column::eq")
+}
+
+/// Upstream #2174: a project's bitwise extension on a number type appearing
+/// in another file never takes an unchanged file's `x.inc() and 0xff`, while
+/// another type's infix `and` written alongside it does, as on a fresh index.
+pub fn kotlin_number_bitwise_extension_appears_in_another_file() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Kotlin])
+        .file(
+            "src/app/Use.kt",
+            "package app\n\nfun low(x: Int): Int = x.inc() and 0xff\n",
+        )
+        .write(
+            "src/app/Bits.kt",
+            "package app\n\ninfix fun Int.and(mask: Long): Long = 0\n\nclass Mask {\n    infix fun and(other: Int): Int = other\n}\n",
+        )
+        .no_edge_after("function app::low", "calls", "method Int::and")
+        .edge_after("function app::low", "calls", "method app::Mask::and")
+}
+
+/// Upstream #2182: a `when` guard written into a class keeps the class and
+/// its methods, so an unchanged file's call into it stays, as on a fresh
+/// index.
+pub fn kotlin_when_guard_keeps_the_class_around_it() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Kotlin])
+        .file(
+            "src/app/Dialect.kt",
+            "package app\n\nclass Dialect(private val mode: Int) {\n    fun sql(value: Any?): String = when (value) {\n        is String -> \"text\"\n        else -> \"other\"\n    }\n\n    fun after(): Int = 1\n}\n",
+        )
+        .file(
+            "src/app/Use.kt",
+            "package app\n\nfun use(d: Dialect): Int = d.after()\n",
+        )
+        .write(
+            "src/app/Dialect.kt",
+            "package app\n\nclass Dialect(private val mode: Int) {\n    fun sql(value: Any?): String = when (value) {\n        is String if mode == 2 -> \"text\"\n        else -> $$\"other $mode\"\n    }\n\n    fun after(): Int = 1\n}\n",
+        )
+        .edge_before("function app::use", "calls", "method app::Dialect::after")
+        .edge_after("function app::use", "calls", "method app::Dialect::after")
+}
+
 /// Upstream #2206: a lambda runs on the receiver its function's last
 /// parameter type names, so that function's declaration changing in another
 /// file moves the bare call inside an unchanged lambda, as on a fresh index.

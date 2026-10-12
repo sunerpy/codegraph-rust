@@ -1279,13 +1279,18 @@ pub(crate) fn receiver_name(text: &str) -> String {
 }
 
 /// The receiver a Kotlin chain link `….name(` / `?.name {` is written on, or
-/// `None` for a call with none (upstream #2168 `kotlinChainReceiver`; the
-/// infix-call branch #2174 added is W4-JVM-04's).
+/// `None` for a call with none (upstream #2168 `kotlinChainReceiver`, with
+/// #2174's infix branch).
 fn chain_receiver(reference: &RefView, context: &dyn ResolutionContext) -> Option<String> {
     static SAFE_CALL: OnceLock<Regex> = OnceLock::new();
     static BANG: OnceLock<Regex> = OnceLock::new();
     let line = raw_line(reference, context)?;
-    let start = name_start(reference, &line, &['(', '{'], false)?;
+    let Some(start) = name_start(reference, &line, &['(', '{'], false) else {
+        // An infix call on an expression, `alias(libs.x) apply false`, whose
+        // receiver the extractor could not name.
+        return infix_start(&line, &reference.reference_name)
+            .map(|at| receiver_name(line[..at].trim_end()));
+    };
     let before = &line[..start];
     if !before.trim_end().ends_with('.') {
         return None;
@@ -1297,6 +1302,55 @@ fn chain_receiver(reference: &RefView, context: &dyn ResolutionContext) -> Optio
         .get_or_init(|| Regex::new(r"!!\s*$").expect("not-null"))
         .replace(&before, "");
     Some(receiver_name(&before))
+}
+
+/// Where `name` is written as an infix function on `line` (upstream #2174,
+/// `(?<=[\w)\]"'}]\s+)name\s+(?=[^\s=])`): the first occurrence between
+/// blanks, after a word character, a closing bracket or a quote, and before
+/// something other than `=`.
+fn infix_start(line: &str, name: &str) -> Option<usize> {
+    if name.is_empty() {
+        return None;
+    }
+    line.match_indices(name).map(|(at, _)| at).find(|&at| {
+        let before = line[..at].trim_end();
+        let after = &line[at + name.len()..];
+        before.len() < at
+            && before
+                .chars()
+                .next_back()
+                .is_some_and(|c| is_word_char(c) || matches!(c, ')' | ']' | '"' | '\'' | '}'))
+            && after.trim_start().len() < after.len()
+            && after.trim_start().chars().next().is_some_and(|c| c != '=')
+    })
+}
+
+/// Kotlin's bitwise infix functions and the number types that declare them
+/// (upstream #2174 `KOTLIN_BITWISE_INFIX`, `KOTLIN_NUMBER_TYPES`).
+const KOTLIN_BITWISE_INFIX: [&str; 7] = ["and", "or", "xor", "shl", "shr", "ushr", "inv"];
+const KOTLIN_NUMBER_TYPES: [&str; 9] = [
+    "Byte", "Short", "Int", "Long", "UByte", "UShort", "UInt", "ULong", "Char",
+];
+
+/// Whether `candidate` is a project's bitwise extension on a number type,
+/// okio's `infix fun Byte.and(mask: Int)`, for a Kotlin reference (upstream
+/// #2174 `isKotlinNumberBitwise`). Without the operand's type it cannot be
+/// told from the standard library's own `Int.and` / `Long.shr` members every
+/// other `x and 0xff` / `h shr 8` calls, so it is never a safe edge.
+pub(crate) fn is_kotlin_number_bitwise(candidate: &Node, reference: &RefView) -> bool {
+    static OWNER_SPLIT: OnceLock<Regex> = OnceLock::new();
+    if reference.language != Language::Kotlin
+        || !KOTLIN_BITWISE_INFIX.contains(&candidate.name.as_str())
+    {
+        return false;
+    }
+    let owner_split = OWNER_SPLIT.get_or_init(|| Regex::new(r"::|\.").expect("owner split"));
+    candidate
+        .qualified_name
+        .rsplit_once("::")
+        .filter(|(owner, _)| !owner.is_empty())
+        .and_then(|(owner, _)| owner_split.split(owner).last())
+        .is_some_and(|owner| KOTLIN_NUMBER_TYPES.contains(&owner))
 }
 
 /// The receiver of a Kotlin `calls` reference named like a standard-library

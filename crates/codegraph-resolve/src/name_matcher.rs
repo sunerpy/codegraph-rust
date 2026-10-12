@@ -2148,6 +2148,9 @@ pub fn match_by_exact_name(
             !kotlin_call || crate::kotlin_scope::is_kotlin_top_level_visible(n, reference, context)
         })
         .filter(|n| !kotlin_bare || kotlin_site.reaches(n, context))
+        // A project's bitwise extension on a number type is never the
+        // standard library's `x and 0xff` (upstream #2174).
+        .filter(|n| !crate::kotlin_scope::is_kotlin_number_bitwise(n, reference))
         .cloned()
         .collect();
     let candidates = if kotlin_bare {
@@ -4265,6 +4268,17 @@ pub fn match_method_call(
                 imported_fqn.as_deref(),
                 0,
             ) {
+                // `medium and 0xff` on an Int: the standard library's
+                // member, not a project `Int.and(Long)` (upstream #2174).
+                if reference.language == Language::Kotlin
+                    && context
+                        .get_node_by_id_shared(&typed.target_node_id)
+                        .is_some_and(|target| {
+                            crate::kotlin_scope::is_kotlin_number_bitwise(&target, reference)
+                        })
+                {
+                    return None;
+                }
                 return Some(typed);
             }
             // The receiver's declared type is one the project doesn't declare
@@ -4570,12 +4584,16 @@ pub fn match_method_call(
         narrowed = target_methods.len() != before;
     }
     // A handler the web framework dispatches to (a view's `post`, a
-    // controller's `update`) is never called through an instance by name, and
-    // ruling those out must not leave a lone other one to guess at (upstream
-    // #2175).
+    // controller's `update`) is never called through an instance by name, nor
+    // is a project's bitwise extension on a number type (`x and 0xff` is the
+    // standard library's), and ruling those out must not leave a lone other
+    // one to guess at (upstream #2175, #2174).
     {
         let before = target_methods.len();
-        target_methods.retain(|method| !is_dispatched_handler(method));
+        target_methods.retain(|method| {
+            !is_dispatched_handler(method)
+                && !crate::kotlin_scope::is_kotlin_number_bitwise(method, reference)
+        });
         narrowed |= target_methods.len() != before;
     }
     // A Vue component's own method is reached as `this.m()` inside it, never
@@ -5347,13 +5365,15 @@ pub fn match_fuzzy(reference: &RefView, context: &dyn ResolutionContext) -> Opti
                         .get_or_init(|| crate::java_scope::JavaCallScope::of(reference, context))
                         .reaches(n, reference))
             })
-            // Kotlin's visibility, member reach and standard chain names, as
-            // in exact matching (upstream #2146, #2172, #2168).
+            // Kotlin's visibility, member reach, number bitwise extensions
+            // and standard chain names, as in exact matching (upstream
+            // #2146, #2172, #2174, #2168).
             .filter(|n| {
                 !kotlin_call
                     || crate::kotlin_scope::is_kotlin_top_level_visible(n, reference, context)
             })
             .filter(|n| !kotlin_bare || kotlin_site.reaches(n, context))
+            .filter(|n| !crate::kotlin_scope::is_kotlin_number_bitwise(n, reference))
             .filter(|n| {
                 kotlin_std_chain
                     .as_deref()

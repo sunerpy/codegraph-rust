@@ -806,6 +806,8 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             self.extract_rust_impl_item(node);
         } else if has_type(self.spec.call_types(), node_type) {
             self.extract_call(node);
+        } else if self.spec.language() == Language::Kotlin && node_type == "infix_expression" {
+            self.extract_kotlin_infix_call(node);
         } else if let Some(callee_name) = self.spec.extract_bare_call(node, self.source) {
             if let Some(caller_id) = self.node_stack.last().cloned() {
                 self.push_ref(&caller_id, &callee_name, EdgeKind::Calls, node);
@@ -4699,6 +4701,39 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
         }
     }
 
+    /// A Kotlin infix call, `Users.id eq id1`, `a to b`, `x shouldBe y`, is
+    /// a call of the infix function in the middle (upstream #2174
+    /// `extractKotlinInfixCall`): `receiver.fn` when the left operand is a
+    /// plain name, as `receiver.fn(arg)` would be, else the bare name.
+    /// Nothing recorded it otherwise, so a project's infix DSL had no
+    /// callers. A literal's infix functions are the language's.
+    fn extract_kotlin_infix_call(&mut self, node: SyntaxNode<'tree>) {
+        let Some(caller_id) = self.node_stack.last().cloned() else {
+            return;
+        };
+        if node.named_child_count() != 3 {
+            return;
+        }
+        let (Some(lhs), Some(function)) = (node.named_child(0), node.named_child(1)) else {
+            return;
+        };
+        if function.kind() != "identifier" || is_literal_receiver(lhs) {
+            return;
+        }
+        let name = node_text(function, self.source);
+        let receiver = if lhs.kind() == "identifier" {
+            node_text(lhs, self.source)
+        } else {
+            String::new()
+        };
+        let reference = if receiver.is_empty() || receiver == "this" || receiver == "super" {
+            name
+        } else {
+            format!("{receiver}.{name}")
+        };
+        self.push_ref(&caller_id, &reference, EdgeKind::Calls, node);
+    }
+
     fn extract_call(&mut self, node: SyntaxNode<'tree>) {
         let Some(caller_id) = self.node_stack.last().cloned() else {
             return;
@@ -5461,6 +5496,8 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             if self.extract_construction(node) {
                 return;
             }
+        } else if self.spec.language() == Language::Kotlin && node_type == "infix_expression" {
+            self.extract_kotlin_infix_call(node);
         } else if let Some(callee_name) = self.spec.extract_bare_call(node, self.source) {
             if let Some(caller_id) = self.node_stack.last().cloned() {
                 self.push_ref(&caller_id, &callee_name, EdgeKind::Calls, node);
@@ -8988,6 +9025,44 @@ class Widget: Base, Named {}
 "#;
         let (_, refs) = run("s.swift", src, Language::Swift);
         assert!(has_ref(&refs, EdgeKind::Extends, "Base"));
+    }
+
+    /// Upstream #2174: a Kotlin infix call is a call of the infix function
+    /// in the middle, `receiver.fn` when the left operand is a plain name
+    /// (`this` and `super` are none), else the bare name, at the start of the
+    /// expression; a literal left operand records nothing.
+    #[test]
+    fn kotlin_infix_calls_record_the_infix_function() {
+        let src = "package app\n\nclass Ops(private val id: Column) {\n    fun same(id1: Int) = id eq id1\n\n    fun wire() {\n        single { Ops(Column()) } bind Ops::class\n        val pair = this to id\n        val skip = \"a\" to 1\n        val bits = (id1 shl 2) or 1\n    }\n}\n";
+        let (_, refs) = run("src/app/Ops.kt", src, Language::Kotlin);
+        let column = |line: usize, needle: &str| {
+            src.lines()
+                .nth(line - 1)
+                .and_then(|text| text.find(needle))
+                .expect("needle") as i64
+        };
+        let mut calls: Vec<(&str, i64, i64)> = refs
+            .iter()
+            .filter(|r| r.reference_kind == EdgeKind::Calls)
+            .filter(|r| {
+                matches!(
+                    r.reference_name.as_str(),
+                    "id.eq" | "eq" | "bind" | "to" | "this.to" | "id1.shl" | "or"
+                )
+            })
+            .map(|r| (r.reference_name.as_str(), r.line, r.col))
+            .collect();
+        calls.sort_unstable();
+        assert_eq!(
+            calls,
+            [
+                ("bind", 7, column(7, "single")),
+                ("id.eq", 4, column(4, "id eq")),
+                ("id1.shl", 10, column(10, "id1 shl")),
+                ("or", 10, column(10, "(id1")),
+                ("to", 8, column(8, "this")),
+            ]
+        );
     }
 
     /// Upstream #2194: a Java enum constant or Kotlin enum entry with a body

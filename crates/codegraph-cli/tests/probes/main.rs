@@ -7777,4 +7777,130 @@ mod kotlin {
             graph.report()
         );
     }
+
+    /// Upstream #2174 (`c6491ff6`): a Kotlin infix call, `id eq id1` or
+    /// koin's `single { … } bind Ops::class`, is a call of the infix
+    /// function (`id.eq` when the left operand is a plain name, else bare
+    /// `bind`); a standard infix name on an expression receiver,
+    /// `alias(…) apply false` in a build script, is not a project method's.
+    /// Upstream's fixture, verbatim. Upstream's `id.eq` reaches `Column::eq`
+    /// through the type `id` is declared with in the class, #2171, which
+    /// W4-CS-03 ports; until then it is recorded and left unresolved.
+    #[test]
+    fn pr2174_kotlin_infix_calls_call_the_infix_function() {
+        let project = Project::new()
+            .file(
+                "src/main/kotlin/app/Ops.kt",
+                "package app\n\nclass Column {\n    infix fun eq(other: Int): Boolean = true\n}\n\nclass Definition {\n    infix fun bind(type: Any): Definition = this\n}\n\nfun single(block: () -> Any): Definition = Definition()\n\nclass Ops(private val id: Column) {\n    fun same(id1: Int): Boolean = id eq id1\n\n    fun wire() {\n        single { Ops(Column()) } bind Ops::class\n    }\n}\n\nclass Spec {\n    fun apply(block: Spec.() -> Unit): Spec = this\n}\n",
+            )
+            .file(
+                "build.gradle.kts",
+                "plugins {\n    alias(libs.plugins.kotlin.jvm) apply false\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        let calls = calls_from(graph, "src/main/kotlin/app/Ops.kt");
+        assert!(
+            graph
+                .unresolved
+                .iter()
+                .any(|r| r.file_path == "src/main/kotlin/app/Ops.kt" && r.reference_name == "id.eq"),
+            "{}",
+            graph.report()
+        );
+        assert!(
+            calls.contains(&"app::Definition::bind".to_string()),
+            "{}",
+            graph.report()
+        );
+        let script = calls_from(graph, "build.gradle.kts");
+        assert!(
+            !script.contains(&"app::Spec::apply".to_string()),
+            "{}",
+            graph.report()
+        );
+        assert!(
+            graph
+                .unresolved
+                .iter()
+                .any(|r| r.file_path == "build.gradle.kts" && r.reference_name == "apply"),
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream #2174: a project's bitwise extension on a number type,
+    /// okio's `infix fun Byte.and(mask: Int)`, is never chosen, by name, on a
+    /// typed receiver (`b: Int`) or guessed from the receiver's name
+    /// (`byte shr 4`): the standard library's `Int.and` / `Long.shr` members
+    /// take `x and 0xff`. The calls are still recorded.
+    #[test]
+    fn pr2174_a_project_bitwise_extension_on_a_number_type_is_never_chosen() {
+        let project = Project::new()
+            .file(
+                "src/main/kotlin/okio/Util.kt",
+                "package okio\n\ninfix fun Byte.and(mask: Int): Int = toInt() and mask\n\ninfix fun Int.and(mask: Long): Long = toLong() and mask\n\ninfix fun Byte.shr(bitCount: Int): Int = toInt() shr bitCount\n\nclass Buffer {\n    fun readInt(): Int {\n        val b: Int = 5\n        val medium = 7\n        return (b and 0xff) or (medium shr 8)\n    }\n\n    fun high(bytes: List<Byte>): List<Int> = bytes.map { byte -> byte shr 4 }\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        let bitwise: Vec<&str> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.kind == "calls")
+            .filter_map(|edge| graph.node(&edge.target))
+            .filter(|node| node.name == "and" || node.name == "shr")
+            .map(|node| node.qualified_name.as_str())
+            .collect();
+        assert!(bitwise.is_empty(), "{}", graph.report());
+        let mut recorded: Vec<&str> = graph
+            .unresolved
+            .iter()
+            .filter(|r| r.reference_kind == "calls")
+            .map(|r| r.reference_name.as_str())
+            .filter(|name| name.ends_with("and") || name.ends_with("shr"))
+            .collect();
+        recorded.sort_unstable();
+        assert_eq!(
+            recorded,
+            ["and", "and", "b.and", "byte.shr", "medium.shr", "shr"],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream #2182 (`fcea0222`), the part tree-sitter-kotlin-ng 1.1.0
+    /// still lacks: a `when` guard (`is String if mode == 2 ->`) and a
+    /// multi-dollar string (`$$"…"`) are rewritten, offsets intact, before
+    /// the parse; either one made the file contribute nothing. The grammar
+    /// parses `..<` and a nullable function-type receiver itself (N/A).
+    /// Upstream's fixture, verbatim.
+    #[test]
+    fn pr2182_newer_kotlin_syntax_keeps_the_class_around_it() {
+        let project = Project::new()
+            .file(
+                "src/Dialect.kt",
+                "package app\n\nclass Dialect(private val mode: Int) {\n    fun sql(value: Any?): String = when (value) {\n        is String if mode == 2 -> \"text\"\n        is Int if (\n            mode > 0\n        ) -> \"int\"\n        is Long -> if (mode == 1) \"long\" else \"big\"\n        else -> \"other\"\n    }\n\n    fun ranges(n: Int) {\n        for (i in 0..<n) println(i)\n    }\n\n    fun path(team: String) = $$\"?(@.user.team == $team)\"\n\n    fun adjust(body: Op<Boolean>?.() -> Op<Boolean>): Dialect = this\n\n    fun after(): Int = 1\n}\n\nclass Op<T>\n",
+            )
+            .index();
+        let graph = project.graph();
+        let mut methods: Vec<&str> = graph
+            .nodes
+            .iter()
+            .filter(|node| node.file_path == "src/Dialect.kt" && node.kind == "method")
+            .map(|node| node.qualified_name.as_str())
+            .collect();
+        methods.sort_unstable();
+        assert_eq!(
+            methods,
+            [
+                "app::Dialect::adjust",
+                "app::Dialect::after",
+                "app::Dialect::path",
+                "app::Dialect::ranges",
+                "app::Dialect::sql",
+            ],
+            "{}",
+            graph.report()
+        );
+    }
 }

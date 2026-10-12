@@ -108,6 +108,9 @@ classifications:
   Objective-C; the file's row records the promoted language, the same one its
   nodes carry;
 - `.metal`, `.cu`, and `.cuh` use the C++ grammar with dialect-specific preparse;
+- `.kt` and `.kts` pass a preparse that rewrites syntax newer than
+  `tree-sitter-kotlin-ng` (`when` guards, multi-dollar strings) to same-length
+  equivalents; revisit it when the grammar learns them;
 - a JavaScript or JSX file whose leading comments carry Flow's `@flow` pragma
   (not `@noflow`) is TSX, parsed with the TSX grammar after the TypeScript
   spec's preparse blanks Flow-only syntax in `.js`, `.jsx`, `.mjs` and `.cjs`
