@@ -66,6 +66,8 @@ impl<'tree> ValueRefs<'tree> {
     /// Record a node as it is created: a constant or variable declared at file
     /// scope, or in a class, module, struct or enum, with a distinctive name
     /// is a target; a function, method, constant or variable is a reader.
+    /// `parent_id` is the scope the node is declared in, `None` for a value no
+    /// other scope names by this name.
     pub(crate) fn capture(
         &mut self,
         language: Language,

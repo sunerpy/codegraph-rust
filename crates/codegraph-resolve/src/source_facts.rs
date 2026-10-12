@@ -142,6 +142,7 @@ pub struct SourceFacts {
     csharp_scopes: OnceLock<Arc<crate::csharp_scopes::CsharpScopes>>,
     sfc_script_blocks: OnceLock<Vec<crate::sfc_scripts::ScriptBlock>>,
     js_destructured_calls: OnceLock<Option<crate::destructured_calls::DestructuredFile>>,
+    js_object_scan: OnceLock<Arc<crate::object_owners::JsObjectScan>>,
 }
 
 impl SourceFacts {
@@ -171,6 +172,7 @@ impl SourceFacts {
             csharp_scopes: OnceLock::new(),
             sfc_script_blocks: OnceLock::new(),
             js_destructured_calls: OnceLock::new(),
+            js_object_scan: OnceLock::new(),
         }
     }
 
@@ -279,6 +281,15 @@ impl SourceFacts {
         self.js_destructured_calls
             .get_or_init(|| read(self))
             .as_ref()
+    }
+
+    /// What the object-literal lookups read from this JS/TS file (upstream
+    /// #2363); `read` runs once.
+    pub(crate) fn js_object_scan(
+        &self,
+        read: impl FnOnce(&Self) -> crate::object_owners::JsObjectScan,
+    ) -> Arc<crate::object_owners::JsObjectScan> {
+        Arc::clone(self.js_object_scan.get_or_init(|| Arc::new(read(self))))
     }
 
     /// A Svelte or Vue component's `<script>` blocks (upstream #2227); `read`

@@ -410,8 +410,8 @@ export function localLiteral() {{ local.map(); }}
                 .contains(&"Cart::bind".to_string()),
             "{ext}"
         );
-        // Object-literal members are qualified by their holder here
-        // (upstream keeps the bare member name).
+        // Object-literal members are qualified by their holder, as upstream's
+        // are since #2363.
         assert_eq!(
             project.callees("objectLiteral", Some(&calls)),
             vec!["api::map"],

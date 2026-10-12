@@ -10,6 +10,7 @@ use codegraph_core::types::{
     Edge, EdgeKind, ExtractionResult, Language, Node, NodeKind, ReferenceSubkind, UnresolvedRef,
 };
 use regex::Regex;
+use std::collections::HashMap;
 use std::path::Path;
 use tree_sitter::Node as SyntaxNode;
 
@@ -414,6 +415,14 @@ pub struct TreeSitterWalker<'a, 'tree> {
     /// Set while an exported store's initializer is walked for the store's
     /// own calls; see [`StoreWalk`].
     store_walk: Option<StoreWalk>,
+    /// An object literal hung on a path (`window.App = {…}`, `ns.mod = {…}`)
+    /// is named by the path's last link but qualified by the whole path, and
+    /// its members are qualified under that path (upstream #2363): owner node
+    /// id → path.
+    object_path_owners: HashMap<String, String>,
+    /// Whether this file's named object literals own their function members;
+    /// see [`Self::owns_object_literals`].
+    owns_objects: Option<bool>,
 }
 
 /// The parts of a store initializer that its walk must not treat as the
@@ -454,6 +463,8 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             walk_depth: 0,
             walk_aborted: false,
             store_walk: None,
+            object_path_owners: HashMap::new(),
+            owns_objects: None,
         }
     }
 
@@ -531,6 +542,13 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
         let mut skip_children = false;
 
         self.maybe_capture_fn_refs(node, node_type);
+
+        // `window.App = {…}` / `App.utils = {…}`: the object's functions are
+        // the path's members (upstream #2363). Its whole subtree is handled
+        // there.
+        if node_type == "assignment_expression" && self.extract_assigned_object_owner(node, true) {
+            return;
+        }
 
         if self.extract_c_function_macro(node) {
             return;
@@ -2446,6 +2464,7 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
         }
 
         let start_line = node.start_position().row as u32 + 1;
+        let value_target = !extra.local_value;
         let id = self.node_ids.generate(
             self.file_path,
             kind,
@@ -2488,13 +2507,19 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
 
         self.nodes.push(new_node.clone());
         if crate::value_refs::has_value_refs(self.spec.language()) {
+            // A value no other scope names by this name (a local, or an
+            // object hung on a dotted path, upstream #2363) reads values but
+            // has no scope a read could name it from.
             self.value_refs.capture(
                 self.spec.language(),
                 kind,
                 name,
                 &id,
                 node,
-                self.node_stack.last().map(String::as_str),
+                self.node_stack
+                    .last()
+                    .map(String::as_str)
+                    .filter(|_| value_target),
             );
         }
 
@@ -3270,10 +3295,28 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
                     var_node.id
                 });
             if let Some(value) = value_node {
-                if matches!(value.kind(), "object" | "object_expression") {
-                    if let Some(owner_id) = declared_id.as_deref() {
-                        self.extract_js_object_literal_members(value, owner_id);
-                    }
+                let owned = if declared_id.is_some() {
+                    self.owned_object_value(Some(value))
+                } else {
+                    None
+                };
+                if let (Some(owner_id), Some(object)) = (declared_id.as_deref(), owned) {
+                    // A named object literal owns its function members,
+                    // exported or not (upstream #2363): `const api = { load()
+                    // {…} }` gives `api::load`, and the calls written in a
+                    // member are the member's. The rest of the literal runs
+                    // here, so its calls are the constant's (#693).
+                    self.extract_owned_object_members(object, owner_id, true, false);
+                } else if let Some(owner_id) = declared_id.as_deref().filter(|_| {
+                    matches!(value.kind(), "object" | "object_expression")
+                        && (is_exported || self.is_exported_later(&name))
+                        && object_has_inline_functions(value)
+                }) {
+                    // An exported object of functions none of which a static
+                    // key names (a computed `[key]() {}`) keeps its earlier
+                    // shape: no walk of the whole literal, whose functions
+                    // would count their calls for the constant as well.
+                    self.extract_js_object_literal_members(value, owner_id);
                 } else if let (Some(owner_id), Some(actions)) = (
                     declared_id.as_deref(),
                     (value.kind() == "call_expression")
@@ -3400,6 +3443,243 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
         }
         self.node_stack.pop();
         extracted
+    }
+
+    /// Whether a named object literal in this file owns its function members
+    /// (upstream #2363 `ownsObjectLiterals`): JavaScript and TypeScript, a
+    /// component's script blocks included, but not a generated or minified
+    /// script, named so (`*.min.js`) or not (a bundle, by its content), whose
+    /// one-letter objects would become hundreds of nodes.
+    fn owns_object_literals(&mut self) -> bool {
+        if let Some(owns) = self.owns_objects {
+            return owns;
+        }
+        let owns = matches!(
+            self.spec.language(),
+            Language::TypeScript | Language::Tsx | Language::JavaScript | Language::Jsx
+        ) && !codegraph_core::file_class::is_generated_file(self.file_path)
+            && !codegraph_core::generated_header::is_minified_content(self.file_path, self.source);
+        self.owns_objects = Some(owns);
+        owns
+    }
+
+    /// The function an owned literal's member becomes, named by its static
+    /// key (upstream `ownedMemberFunction`): `load() {…}`, `load: () => {…}`,
+    /// `load: function () {…}`, `load: function* () {…}`. `None` for every
+    /// other member: a computed key, a value, a shorthand, a spread.
+    fn owned_member_function(
+        &self,
+        member: SyntaxNode<'tree>,
+    ) -> Option<(SyntaxNode<'tree>, String)> {
+        let static_key =
+            |key: SyntaxNode<'_>| matches!(key.kind(), "property_identifier" | "string" | "number");
+        match member.kind() {
+            "method_definition" => {
+                let key = child_by_field(member, "name")?;
+                static_key(key).then(|| (member, object_key_name(key, self.source)))
+            }
+            "pair" => {
+                let key = child_by_field(member, "key")?;
+                let value = child_by_field(member, "value")?;
+                (static_key(key)
+                    && matches!(
+                        value.kind(),
+                        "arrow_function" | "function_expression" | "generator_function"
+                    ))
+                .then(|| (value, object_key_name(key, self.source)))
+            }
+            _ => None,
+        }
+    }
+
+    /// `value` when it is an object literal that owns at least one function
+    /// member (upstream `ownedObjectValue`).
+    fn owned_object_value(
+        &mut self,
+        value: Option<SyntaxNode<'tree>>,
+    ) -> Option<SyntaxNode<'tree>> {
+        let value = value?;
+        if !matches!(value.kind(), "object" | "object_expression") || !self.owns_object_literals() {
+            return None;
+        }
+        value
+            .named_children(&mut value.walk())
+            .any(|member| self.owned_member_function(member).is_some())
+            .then_some(value)
+    }
+
+    /// Extract an owned literal's members (upstream
+    /// `extractOwnedObjectMembers`): each function member is a node of its
+    /// own, qualified under the owner, which a literal on the global object
+    /// holds at file scope (`global`). Every other member, a value, a computed
+    /// key or a spread, runs where the literal is written and is walked there:
+    /// under the owner for a module-scope declaration (`values_under_owner`:
+    /// its initializer's calls are the constant's, #693), under the enclosing
+    /// function for a local or an assignment. The literal's shorthand members
+    /// (`{ load }`) go to the function-value capture the same way.
+    fn extract_owned_object_members(
+        &mut self,
+        object: SyntaxNode<'tree>,
+        owner_id: &str,
+        values_under_owner: bool,
+        global: bool,
+    ) {
+        let enclosing = self.node_stack.clone();
+        let mut owner_stack: Vec<String> = if global {
+            enclosing.iter().take(1).cloned().collect()
+        } else {
+            enclosing.clone()
+        };
+        owner_stack.push(owner_id.to_string());
+        let value_stack = if values_under_owner {
+            owner_stack.clone()
+        } else {
+            enclosing.clone()
+        };
+        self.node_stack = value_stack.clone();
+        self.maybe_capture_fn_refs(object, object.kind());
+        for member in object.named_children(&mut object.walk()) {
+            if let Some((function, name)) = self.owned_member_function(member) {
+                self.node_stack = owner_stack.clone();
+                self.extract_function(function, Some(name));
+            } else {
+                self.node_stack = value_stack.clone();
+                self.visit_function_body(member);
+            }
+        }
+        self.node_stack = enclosing;
+    }
+
+    /// `const api = { load() {…} }` written in a function body or an IIFE
+    /// (upstream `extractLocalObjectOwner`): the owner gets the node a
+    /// module-scope declaration would, as a local no other scope reads by
+    /// name, and its members are extracted under it. `false` when the
+    /// declarator holds no owned literal, leaving it to the walk.
+    fn extract_local_object_owner(&mut self, declarator: SyntaxNode<'tree>) -> bool {
+        let Some(name_node) =
+            child_by_field(declarator, "name").filter(|name| name.kind() == "identifier")
+        else {
+            return false;
+        };
+        let Some(object) = self.owned_object_value(child_by_field(declarator, "value")) else {
+            return false;
+        };
+        let kind = if declarator
+            .parent()
+            .is_some_and(|declaration| self.spec.is_const(declaration))
+        {
+            NodeKind::Constant
+        } else {
+            NodeKind::Variable
+        };
+        let Some(owner) = self.create_node(
+            kind,
+            &node_text(name_node, self.source),
+            declarator,
+            NodeExtra {
+                docstring: self.docstring_for(declarator),
+                signature: value_signature(Some(object), self.source),
+                local_value: true,
+                ..NodeExtra::default()
+            },
+        ) else {
+            return false;
+        };
+        self.extract_variable_type_annotation(declarator, &owner.id);
+        self.extract_owned_object_members(object, &owner.id, false, false);
+        true
+    }
+
+    /// `window.App = {…}`, `App.utils = {…}`, `dw_page = {…}`: an object
+    /// literal assigned to a name owns its function members like a declared
+    /// one (upstream `extractAssignedObjectOwner`). Assigned to a plain name,
+    /// an implicit global or a binding declared elsewhere, it is qualified
+    /// like a declaration; only at module level, as in a function it is a
+    /// local being reassigned (a bundle's `e = {…}`). Hung on a path, the
+    /// owner is named by the path's last link and qualified by the path as
+    /// written, so its members read `window.App::init`: a property is reached
+    /// through its object, not through the function that happened to assign
+    /// it. A path on the global object is global wherever it is written, so
+    /// the file holds it. CommonJS export objects and prototypes are no
+    /// namespaces and are left alone; `false` for any assignment not handled.
+    fn extract_assigned_object_owner(
+        &mut self,
+        assignment: SyntaxNode<'tree>,
+        module_level: bool,
+    ) -> bool {
+        let Some(object) = self.owned_object_value(child_by_field(assignment, "right")) else {
+            return false;
+        };
+        let Some(path) = self.object_owner_path(child_by_field(assignment, "left")) else {
+            return false;
+        };
+        if path.len() == 1 && !module_level {
+            return false;
+        }
+        let qualified_name = (path.len() > 1).then(|| path.join("."));
+        let global = path.len() > 1 && matches!(path[0].as_str(), "window" | "globalThis");
+        let saved = self.node_stack.clone();
+        if global {
+            self.node_stack.truncate(1);
+        }
+        let statement = assignment
+            .parent()
+            .filter(|parent| parent.kind() == "expression_statement")
+            .unwrap_or(assignment);
+        // `App.utils` is read as `App.utils`, never as a bare `utils`: only a
+        // name the code reads by that name is a value-read target.
+        let owner = self.create_node(
+            NodeKind::Variable,
+            path.last().map_or("", String::as_str),
+            assignment,
+            NodeExtra {
+                docstring: self.docstring_for(statement),
+                signature: value_signature(Some(object), self.source),
+                qualified_name: qualified_name.clone(),
+                local_value: !(path.len() == 1 || global),
+                ..NodeExtra::default()
+            },
+        );
+        self.node_stack = saved;
+        let Some(owner) = owner else {
+            return false;
+        };
+        if let Some(qualified_name) = qualified_name {
+            self.object_path_owners
+                .insert(owner.id.clone(), qualified_name);
+        }
+        self.extract_owned_object_members(object, &owner.id, false, global);
+        true
+    }
+
+    /// The links of an assignment target written as plain names (upstream
+    /// `objectOwnerPath`): `dw_page` → `[dw_page]`, `window.App` → `[window,
+    /// App]`, `App.utils.dom` → `[App, utils, dom]`; `None` for anything else:
+    /// `this.x`, a computed `a[k]`, a call, CommonJS's `module.exports` /
+    /// `exports.x`, or a prototype.
+    fn object_owner_path(&self, left: Option<SyntaxNode<'tree>>) -> Option<Vec<String>> {
+        let mut path = Vec::new();
+        let mut current = left?;
+        while current.kind() == "member_expression" {
+            let property = child_by_field(current, "property")?;
+            if property.kind() != "property_identifier" {
+                return None;
+            }
+            path.push(node_text(property, self.source));
+            current = child_by_field(current, "object")?;
+        }
+        if current.kind() != "identifier" {
+            return None;
+        }
+        let root = node_text(current, self.source);
+        if matches!(root.as_str(), "module" | "exports")
+            || path.iter().any(|link| link == "prototype")
+        {
+            return None;
+        }
+        path.push(root);
+        path.reverse();
+        Some(path)
     }
 
     /// A constant written in a type's scope that is a value of its own
@@ -4951,6 +5231,16 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
     fn visit_body_node_inner(&mut self, node: SyntaxNode<'tree>) {
         let node_type = node.kind();
         self.maybe_capture_fn_refs(node, node_type);
+        // A named object literal in a body, an IIFE's `const App = {…}` or a
+        // handler map in a function, owns its function members as one at
+        // module scope does, and so does `window.App = {…}` written in here
+        // (upstream #2363). Each handles its whole subtree.
+        if node_type == "variable_declarator" && self.extract_local_object_owner(node) {
+            return;
+        }
+        if node_type == "assignment_expression" && self.extract_assigned_object_owner(node, false) {
+            return;
+        }
         // A function-like macro defined inside a body is still a macro (#1838).
         if self.extract_c_function_macro(node) {
             return;
@@ -6040,6 +6330,13 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
     fn build_qualified_name(&self, name: &str) -> String {
         let mut parts: Vec<&str> = self.namespace_prefix.iter().map(String::as_str).collect();
         for node_id in &self.node_stack {
+            // An object literal hung on a path qualifies what it holds by that
+            // path (`window.App::init`), which already carries its own scope.
+            if let Some(path) = self.object_path_owners.get(node_id) {
+                parts.clear();
+                parts.push(path);
+                continue;
+            }
             if let Some(node) = self.nodes.iter().find(|node| &node.id == node_id) {
                 if node.kind != NodeKind::File {
                     parts.push(node.name.as_str());
@@ -6494,6 +6791,20 @@ struct NodeExtra {
     type_parameters: Vec<String>,
     return_type: Option<String>,
     qualified_name: Option<String>,
+    /// A value no other scope names by this name, a local or an object hung
+    /// on a dotted path: it reads values, but no value read reaches it
+    /// (upstream #2363 `valueTarget = false`).
+    local_value: bool,
+}
+
+/// An object key's name as written, a string key's quotes dropped (upstream
+/// `objectKeyName`).
+fn object_key_name(key: SyntaxNode<'_>, source: &str) -> String {
+    let text = node_text(key, source);
+    let text = text.strip_prefix(['\'', '"', '`']).unwrap_or(&text);
+    text.strip_suffix(['\'', '"', '`'])
+        .unwrap_or(text)
+        .to_string()
 }
 
 fn js_object_member_name(node: SyntaxNode<'_>, source: &str) -> Option<String> {

@@ -2093,9 +2093,18 @@ impl ReferenceResolver {
                 .get_import_mappings(&reference.file_path, reference.language)
                 .iter()
                 .any(|mapping| mapping.is_namespace && mapping.local_name == root);
-            if namespace
-                && let Some(through) =
-                    self.gate_language(resolve_via_import(reference, context), reference, context)
+            if !namespace {
+                // `App.utils.fmt()` through a path an object literal was hung
+                // on (upstream #2363).
+                if let Some(member) = self.gate_language(
+                    crate::object_owners::match_object_path_call(reference, context),
+                    reference,
+                    context,
+                ) {
+                    candidates.push(member);
+                }
+            } else if let Some(through) =
+                self.gate_language(resolve_via_import(reference, context), reference, context)
                 && context
                     .get_node_by_id_shared(&through.target_node_id)
                     .is_some_and(|target| {
@@ -2339,9 +2348,12 @@ impl ReferenceResolver {
         if member.is_empty() {
             return (None, None);
         }
-        let Some(from_node) = context.get_node_by_id_shared(&reference.from_node_id) else {
+        let Some(written) = context.get_node_by_id_shared(&reference.from_node_id) else {
             return (None, None);
         };
+        // Inside an object literal: its own method's `this` is the object, an
+        // arrow member's is the method around the literal (upstream #2363).
+        let from_node = crate::object_owners::this_scope_caller(written, context);
         let class_prefix = if matches!(
             from_node.kind,
             NodeKind::Class
@@ -2402,6 +2414,7 @@ impl ReferenceResolver {
         }
 
         let mut resolved: Vec<ResolvedRef> = Vec::new();
+        let context = self.store_context(store);
         for reference in &deferred {
             let Some(member) = reference.reference_name.strip_prefix("this.") else {
                 continue;
@@ -2409,9 +2422,12 @@ impl ReferenceResolver {
             if member.is_empty() {
                 continue;
             }
-            let Some(from_node) = store.node_by_id(&reference.from_node_id).ok().flatten() else {
+            let Some(written) = context.get_node_by_id_shared(&reference.from_node_id) else {
                 continue;
             };
+            // An arrow member of an object literal has the `this` of the
+            // method around the literal (upstream #2363).
+            let from_node = crate::object_owners::this_scope_caller(written, &context);
             // Class-body-level hooks (Ruby) attribute to the CLASS node itself;
             // members strip the member segment (index.ts:1271-1282).
             let class_name = if is_supertype_bearing_or_module(from_node.kind) {
@@ -2439,6 +2455,7 @@ impl ReferenceResolver {
                 });
             }
         }
+        drop(context);
 
         if resolved.is_empty() {
             return Ok(0);

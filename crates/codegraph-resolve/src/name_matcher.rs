@@ -5,9 +5,7 @@
 //! cross-language family gate — mirror the upstream exactly. Every strategy cites its
 //! upstream source range.
 
-use crate::object_literal::{
-    LiteralLookup, object_literal_property, property_contains, resolve_object_literal_binding,
-};
+use crate::object_literal::{LiteralLookup, object_literal_property, property_contains};
 use crate::source_facts::{SourceFacts, TsFieldDeclaration};
 use crate::strip_comments::{CommentLang, strip_comments_for_regex};
 use crate::types::{
@@ -360,6 +358,18 @@ pub(crate) fn is_lexically_reachable(
     reference: &RefView,
     context: &dyn ResolutionContext,
 ) -> bool {
+    // An object literal's member is reached through its object (upstream
+    // #2363): a bare `load()` or `setTimeout(load)` never means `App.load`,
+    // whatever shares the name.
+    if candidate.kind == NodeKind::Function
+        && is_simple_js_identifier(&reference.reference_name)
+        && !crate::object_owners::is_object_member_reachable_by_name(candidate, reference, context)
+    {
+        return false;
+    }
+    if crate::object_owners::is_unreachable_path_holder(candidate, reference) {
+        return false;
+    }
     // A function, or a type (`case class B()` in a test method), declared
     // inside a function is only in scope in there (upstream #2123).
     if candidate.kind != NodeKind::Function
@@ -580,13 +590,13 @@ fn is_sealed_js_module(file_path: &str, context: &dyn ResolutionContext) -> bool
 }
 
 /// A line-initial `import` statement (`HAS_IMPORT_STATEMENT`).
-fn js_import_marker() -> &'static Regex {
+pub(crate) fn js_import_marker() -> &'static Regex {
     static HAS_IMPORT: OnceLock<Regex> = OnceLock::new();
     HAS_IMPORT.get_or_init(|| Regex::new(r#"(?m)^[ \t]*import[\s{*'"]"#).expect("js import marker"))
 }
 
 /// A line-initial `export` or `declare global` (`HAS_ESM_EXPORT`).
-fn js_export_marker() -> &'static Regex {
+pub(crate) fn js_export_marker() -> &'static Regex {
     static HAS_EXPORT: OnceLock<Regex> = OnceLock::new();
     HAS_EXPORT.get_or_init(|| {
         Regex::new(r"(?m)^[ \t]*export[\s{*]|^[ \t]*declare\s+global(?-u:\b)")
@@ -595,7 +605,7 @@ fn js_export_marker() -> &'static Regex {
 }
 
 /// `module.exports` or `exports.x` / `exports[…]` (`HAS_CJS_EXPORT`).
-fn cjs_export_marker() -> &'static Regex {
+pub(crate) fn cjs_export_marker() -> &'static Regex {
     static HAS_CJS_EXPORT: OnceLock<Regex> = OnceLock::new();
     HAS_CJS_EXPORT.get_or_init(|| {
         Regex::new(r"(?-u:\b)module\.exports(?-u:\b)|(?-u:\b)exports\s*[.\[]")
@@ -1225,7 +1235,11 @@ fn is_imported_module_receiver(
 /// Is the root of a member call's receiver (`CameraManager` in
 /// `CameraManager.x`) one of the file's imports (upstream #2134
 /// `isImportBinding`)?
-fn is_import_binding(receiver: &str, reference: &RefView, context: &dyn ResolutionContext) -> bool {
+pub(crate) fn is_import_binding(
+    receiver: &str,
+    reference: &RefView,
+    context: &dyn ResolutionContext,
+) -> bool {
     let root = receiver.split('.').next().unwrap_or(receiver);
     import_binding_named(root, reference, context).is_some()
 }
@@ -2212,6 +2226,10 @@ pub(crate) fn prefer_call_site_file<T: Borrow<Node>>(
     }
 }
 
+/// Languages whose object literals declare callable members (upstream
+/// `OBJECT_LITERAL_LANGUAGES`): `export const api = { call() {…} }` used as a
+/// namespace (#1573), including the script blocks of single-file components
+/// (#2363).
 pub(crate) fn is_object_literal_language(language: Language) -> bool {
     matches!(
         language,
@@ -2220,6 +2238,9 @@ pub(crate) fn is_object_literal_language(language: Language) -> bool {
             | Language::JavaScript
             | Language::Jsx
             | Language::ArkTs
+            | Language::Vue
+            | Language::Svelte
+            | Language::Astro
     )
 }
 
@@ -3043,7 +3064,10 @@ fn match_ts_this_field_call(
     if !is_ts_field_name(field) {
         return None;
     }
-    let caller = context.get_node_by_id_shared(&reference.from_node_id)?;
+    let written = context.get_node_by_id_shared(&reference.from_node_id)?;
+    // An arrow member of an object literal written in a method has that
+    // method's `this` (upstream #2363).
+    let caller = crate::object_owners::this_scope_caller(written, context);
     let (owner_qualified, _) = caller.qualified_name.rsplit_once("::")?;
     let owner_name = owner_qualified.rsplit("::").next()?;
     let owners = context
@@ -3727,31 +3751,26 @@ pub fn match_method_call(
         }
     }
 
-    // Same-file object-literal namespace: `const api = { call() {} }` followed
-    // by `api.call()`. The callable has a bare qualified name, so resolve it by
-    // direct source-range containment before class-shaped strategies.
-    if is_object_literal_language(reference.language) && !object_or_class.contains('.') {
-        let holders = prefer_call_site_file(
-            context.get_nodes_by_name_shared(&object_or_class),
-            &reference.file_path,
-        );
-        for holder in holders.into_iter().filter(|node| {
-            node.file_path == reference.file_path
-                && matches!(node.kind, NodeKind::Constant | NodeKind::Variable)
-        }) {
-            if let Some(member) = resolve_object_literal_member(
-                &holder,
-                &method_name,
-                reference,
-                context,
-                0.85,
-                ResolvedBy::InstanceMethod,
-            )
-            .or_else(|| resolve_object_literal_binding(&holder, &method_name, reference, context))
-            {
-                return Some(member);
-            }
-        }
+    // Object-literal namespace receiver (#1573): `api.call()` where `api` is a
+    // `const api = { call() {…}, get: () => {…} }`. Its members are functions
+    // inside the constant's extent, found by containment before the
+    // class-shaped strategies. The holder is the one the call can see: in its
+    // own file, the nearest enclosing declaration (an IIFE's `const App`
+    // before the file's); otherwise a global, `window.App = {…}` or a classic
+    // script's top-level `App`, when the file neither imports nor binds the
+    // name (upstream #2363). An imported holder reaches the same member
+    // through the import path.
+    if is_object_literal_language(reference.language)
+        && !object_or_class.contains('.')
+        && let Some(Some(member)) = crate::object_owners::resolve_object_path_member(
+            &object_or_class,
+            &method_name,
+            reference,
+            context,
+            None,
+        )
+    {
+        return Some(member);
     }
 
     // Strategy 1: direct class name match (name-matcher.ts:825-850). When the
@@ -4906,13 +4925,17 @@ fn lookup_callee_return_type(
 /// How a call the extractor recorded by its bare name is written in the
 /// source (upstream #2223 `bareCallReceiver`).
 #[derive(Debug, PartialEq, Eq)]
-enum BareCallReceiver {
+pub(crate) enum BareCallReceiver {
     /// `this.m()`, `self.m()`, `super.m()`, `super().m()`.
     OwnObject,
     /// Any other receiver: `window.$events.m()`, `make().m()`, `self.0.m()`.
+    /// `receiver` is the end of the receiver's text, its last 40 characters;
     /// `links` are the member names between `this` and the method, for a
     /// `this.a.b.m()` chain.
-    Other { links: Vec<String> },
+    Other {
+        receiver: String,
+        links: Vec<String>,
+    },
 }
 
 /// An ASCII word character or `$` (JS `[\w$]`).
@@ -4925,7 +4948,7 @@ fn is_js_word_byte(byte: u8) -> bool {
 /// preceded by a word character and followed (past `<…>` or Scala `[…]` type
 /// arguments) by `(` or `{`, whose preceding text ends in `.` or `?.`.
 /// `None` for a call written bare, or not found.
-fn bare_call_receiver(
+pub(crate) fn bare_call_receiver(
     reference: &RefView,
     context: &dyn ResolutionContext,
 ) -> Option<BareCallReceiver> {
@@ -4982,7 +5005,11 @@ fn bare_call_receiver(
                 .collect()
         })
         .unwrap_or_default();
-    Some(BareCallReceiver::Other { links })
+    let skip = head.chars().count().saturating_sub(40);
+    Some(BareCallReceiver::Other {
+        receiver: head.chars().skip(skip).collect(),
+        links,
+    })
 }
 
 /// Whether a call recorded by its bare name is written on something other
@@ -4991,7 +5018,7 @@ fn bare_call_receiver(
 fn is_collapsed_non_recursion(reference: &RefView, context: &dyn ResolutionContext) -> bool {
     match bare_call_receiver(reference, context) {
         None | Some(BareCallReceiver::OwnObject) => false,
-        Some(BareCallReceiver::Other { links }) => {
+        Some(BareCallReceiver::Other { links, .. }) => {
             !(is_js_family(reference.language)
                 && is_collapsed_self_recursion(&links, reference, context))
         }
@@ -5396,6 +5423,12 @@ pub fn match_reference(
     reference: &RefView,
     context: &dyn ResolutionContext,
 ) -> Option<ResolvedRef> {
+    // `window.App.init()` / a sibling's `this.init()`, recorded by the bare
+    // name: the object they are written on comes first (upstream #2363).
+    if let Some(result) = crate::object_owners::match_collapsed_object_call(reference, context) {
+        return Some(result);
+    }
+
     // 0. File path match.
     if let Some(result) = match_by_file_path(reference, context) {
         return Some(result);

@@ -493,6 +493,18 @@
     "target": "function:f51493c01c858b8d930eebb10d598b30"
   },
   {
+    "col": 6,
+    "kind": "calls",
+    "line": 10,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "constant:e0a6f76bcfc760dc48e6fc82a29d1b60",
+    "target": "function:881216817d6d02e528335a807d20c174"
+  },
+  {
     "col": 7,
     "kind": "imports",
     "line": 3,

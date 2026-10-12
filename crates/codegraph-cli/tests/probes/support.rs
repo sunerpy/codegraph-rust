@@ -287,6 +287,7 @@ pub struct NodeRow {
     pub language: String,
     pub start_line: i64,
     pub end_line: i64,
+    pub is_exported: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -350,8 +351,8 @@ impl Graph {
         let conn = open_immutable(db);
         let nodes = rows(
             &conn,
-            "SELECT id, kind, name, qualified_name, file_path, language, start_line, end_line \
-             FROM nodes ORDER BY id",
+            "SELECT id, kind, name, qualified_name, file_path, language, start_line, end_line, \
+             is_exported FROM nodes ORDER BY id",
             |row| {
                 Ok(NodeRow {
                     id: row.get(0)?,
@@ -362,6 +363,7 @@ impl Graph {
                     language: row.get(5)?,
                     start_line: row.get(6)?,
                     end_line: row.get(7)?,
+                    is_exported: row.get(8)?,
                 })
             },
         );

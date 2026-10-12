@@ -895,6 +895,51 @@ pub fn typescript_value_reference_survives_an_added_namesake() -> Case {
         .edge_throughout("function run", "references", "constant LIMIT_MAX @src/a.ts")
 }
 
+/// Upstream #2363: a classic script's call through a global namespace
+/// reaches the member once the script defining `window.WS = {…}` appears, as
+/// a fresh index of the edit finds.
+pub fn javascript_global_namespace_member_appears() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::JavaScript])
+        .file("use.js", "function viaGlobal() { return WS.wsM(); }\n")
+        .write(
+            "ns.js",
+            "window.WS = { a() { return 1; }, wsM() { return 2; } };\n",
+        )
+        .edge_after("function viaGlobal", "calls", "function window.WS::wsM")
+}
+
+/// Upstream #2363: renaming a global namespace's member drops the call that
+/// reached it from another script, as a fresh index of the edit finds.
+pub fn javascript_global_namespace_member_renamed() -> Case {
+    Case::new(Change::RenameSymbol, &[Language::JavaScript])
+        .file(
+            "ns.js",
+            "window.WS = { a() { return 1; }, wsM() { return 2; } };\n",
+        )
+        .file("use.js", "function viaGlobal() { return WS.wsM(); }\n")
+        .write("ns.js", "window.WS = { renamed() { return 4; } };\n")
+        .edge_before("function viaGlobal", "calls", "function window.WS::wsM")
+        .no_edge_after("function viaGlobal", "calls", "function window.WS::renamed")
+}
+
+/// Upstream #2363: a sibling's `this.render()` inside the methods of an
+/// object hung on `window` follows an edit of the call to another member, as
+/// a fresh index of the edit finds.
+pub fn javascript_object_literal_this_call_body_edit() -> Case {
+    Case::new(Change::BodyEdit, &[Language::JavaScript])
+        .file(
+            "app.js",
+            "window.App = {\n  init: function () { this.render(); },\n  render: function () { return 1; },\n  draw: function () { return 2; },\n};\n",
+        )
+        .write(
+            "app.js",
+            "window.App = {\n  init: function () { this.draw(); },\n  render: function () { return 1; },\n  draw: function () { return 2; },\n};\n",
+        )
+        .edge_before("function window.App::init", "calls", "function window.App::render")
+        .edge_after("function window.App::init", "calls", "function window.App::draw")
+        .no_edge_after("function window.App::init", "calls", "function window.App::render")
+}
+
 /// Upstream #2263: a CommonJS `require('./application')` imports that file once
 /// it appears, though the binding is only ever used as a value.
 pub fn javascript_require_imports_an_added_module() -> Case {

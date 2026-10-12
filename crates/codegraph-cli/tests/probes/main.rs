@@ -1237,7 +1237,7 @@ mod seams {
 /// W4a: the JavaScript/TypeScript resolution family (plan section 3 "W4a").
 /// `cargo test --test probes -- js::` runs them.
 mod js {
-    use super::support::{Graph, Project, assert_edge, assert_no_edge};
+    use super::support::{Graph, NodeRow, Project, assert_edge, assert_no_edge};
 
     /// The qualified names `calls` edges from any node of `file` reach,
     /// sorted (upstream's `callsFrom`).
@@ -2054,5 +2054,440 @@ mod js {
         methods.sort_unstable();
         assert_eq!(methods, ["_renderItems", "render"], "{}", graph.report());
         assert_edge!(project, "method SegmentedControl::render" => calls => "method SegmentedControl::_renderItems");
+    }
+
+    /// The one node with this qualified name (in `file`, when given).
+    #[track_caller]
+    fn the_node<'g>(graph: &'g Graph, qualified: &str, file: Option<&str>) -> &'g NodeRow {
+        let found: Vec<&NodeRow> = graph
+            .nodes
+            .iter()
+            .filter(|node| {
+                node.qualified_name == qualified && file.is_none_or(|file| node.file_path == file)
+            })
+            .collect();
+        assert_eq!(found.len(), 1, "{qualified}:\n{}", graph.report());
+        found[0]
+    }
+
+    /// The qualified names at the other end of a node's `calls` edges, sorted.
+    fn calls_of(graph: &Graph, id: &str, incoming: bool) -> Vec<String> {
+        let mut names: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|edge| {
+                edge.kind == "calls"
+                    && if incoming {
+                        edge.target == id
+                    } else {
+                        edge.source == id
+                    }
+            })
+            .filter_map(|edge| graph.node(if incoming { &edge.source } else { &edge.target }))
+            .map(|node| node.qualified_name.clone())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[track_caller]
+    fn callers_of(graph: &Graph, qualified: &str) -> Vec<String> {
+        calls_of(graph, &the_node(graph, qualified, None).id, true)
+    }
+
+    #[track_caller]
+    fn callees_of(graph: &Graph, qualified: &str) -> Vec<String> {
+        calls_of(graph, &the_node(graph, qualified, None).id, false)
+    }
+
+    /// Upstream #2363 (`f40db4b9`, issue #2300): a named object literal owns
+    /// its function members whether it is exported or not, declared in an
+    /// IIFE, or hung on the global object, and the calls written in a member
+    /// are the member's; `window.WS.wsM()` and another classic script's
+    /// `WS.wsM()` reach `window.WS::wsM`.
+    #[test]
+    fn pr2363_every_named_literal_owns_its_function_members() {
+        let project = Project::new()
+            .file("src/a_export.ts", "export const objTsExp = { tsExpM() { return 1; }, tsExpProp: () => 1 };\n")
+            .file("src/b_plain.ts", "const objTsPlain = { tsPlainM() { return 1; }, tsPlainProp: () => 1 };\n")
+            .file("src/c_export.js", "export const objJsExp = { jsExpM() { return 1; }, jsExpProp: () => 1 };\n")
+            .file("src/d_plain.js", "const objJsPlain = { jsPlainM() { return 1; }, jsPlainProp: () => 1 };\n")
+            .file("src/e_iife.js", "(function () {\n  const objIife = { iifeM() { return 1; } };\n  window.WS = { wsM() { return objIife.iifeM(); } };\n})();\n")
+            .file("src/f_calls.js", "function helper() { return 2; }\nvar store = { shorthand() { return helper(); } };\nfunction useStore() { return store.shorthand(); }\nwindow.api = { load() { return store.shorthand(); } };\nfunction viaWindow() { return window.WS.wsM(); }\nfunction viaGlobal() { return WS.wsM(); }\n")
+            .index();
+        let graph = project.graph();
+        for qualified in [
+            "objTsExp::tsExpM",
+            "objTsExp::tsExpProp",
+            "objTsPlain::tsPlainM",
+            "objTsPlain::tsPlainProp",
+            "objJsExp::jsExpM",
+            "objJsExp::jsExpProp",
+            "objJsPlain::jsPlainM",
+            "objJsPlain::jsPlainProp",
+            "objIife::iifeM",
+            "window.WS::wsM",
+            "store::shorthand",
+            "window.api::load",
+        ] {
+            assert_eq!(
+                the_node(graph, qualified, None).kind,
+                "function",
+                "{qualified}"
+            );
+        }
+        let plain = the_node(graph, "objTsPlain", None);
+        let mut members: Vec<&str> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.kind == "contains" && edge.source == plain.id)
+            .filter_map(|edge| graph.node(&edge.target))
+            .map(|node| node.name.as_str())
+            .collect();
+        members.sort_unstable();
+        assert_eq!(members, ["tsPlainM", "tsPlainProp"]);
+        let ws: Vec<String> = graph
+            .nodes
+            .iter()
+            .filter(|node| node.name == "WS")
+            .map(|node| format!("{} {}", node.kind, node.qualified_name))
+            .collect();
+        assert_eq!(ws, ["variable window.WS"]);
+        // An exported literal's members stay exported, a plain one's do not.
+        assert!(the_node(graph, "objTsExp::tsExpM", None).is_exported);
+        assert!(!the_node(graph, "objTsPlain::tsPlainM", None).is_exported);
+        // The call inside a member is the member's, not the constant's.
+        assert_eq!(callers_of(graph, "helper"), ["store::shorthand"]);
+        assert_eq!(callers_of(graph, "objIife::iifeM"), ["window.WS::wsM"]);
+        assert_eq!(
+            callers_of(graph, "store::shorthand"),
+            ["useStore", "window.api::load"]
+        );
+        assert_eq!(
+            callers_of(graph, "window.WS::wsM"),
+            ["viaGlobal", "viaWindow"]
+        );
+    }
+
+    /// Upstream #2363: a member is reached through the object a call names
+    /// (`App.init()`, `window.App.render()`, `App.utils.pad()`, a sibling's
+    /// `this.render()`), from another classic script too, and never by its
+    /// bare name; a parameter named like the global shadows it.
+    #[test]
+    fn pr2363_a_member_is_reached_through_its_object_never_a_bare_name() {
+        let project = Project::new()
+            .file("app.js", "function init() { return \"global\"; }\nvar App = {\n  init: function () { this.render(); helpers.fmt(); },\n  render: function () { return 1; },\n};\nvar helpers = { fmt() { return 2; } };\nApp.utils = { pad(s) { return s; } };\nfunction boot() { App.init(); App.utils.pad(\"x\"); init(); }\ndw_page = { start() { App.render(); } };\n")
+            .file("page.js", "function main() { App.init(); window.App.render(); dw_page.start(); App.utils.pad(\"y\"); }\nfunction shadow(App) { return App.init(); }\nfunction bare() { return render(); }\n")
+            .index();
+        let graph = project.graph();
+        assert_eq!(
+            callees_of(graph, "boot"),
+            ["App.utils::pad", "App::init", "init"]
+        );
+        assert_eq!(
+            callees_of(graph, "App::init"),
+            ["App::render", "helpers::fmt"]
+        );
+        assert_eq!(callees_of(graph, "dw_page::start"), ["App::render"]);
+        assert_eq!(
+            callees_of(graph, "main"),
+            [
+                "App.utils::pad",
+                "App::init",
+                "App::render",
+                "dw_page::start"
+            ]
+        );
+        assert_eq!(callees_of(graph, "shadow"), Vec::<String>::new());
+        assert_eq!(callees_of(graph, "bare"), Vec::<String>::new());
+        assert_eq!(callers_of(graph, "init"), ["boot"]);
+    }
+
+    /// Upstream #2363: an object hung on a path (`$.event.special.swipe =
+    /// {…}`) or local to an IIFE is no name elsewhere: `this.swipe()` and
+    /// `new this.model()` are not those objects, and a plain script's `$n` is
+    /// its own function.
+    #[test]
+    fn pr2363_a_path_or_iife_object_is_no_name_elsewhere() {
+        let project = Project::new()
+            .file("lib.js", "$.event.special.swipe = { setup: function () { return 1; } };\ntodos.model = { add: function () { return 2; } };\n(function () { var n = { touch: function () { return 3; } }; n.touch(); })();\n")
+            .file("widget.js", "var Widget = {\n  drag: function () { this.swipe(1); },\n  make: function () { return new this.model(); },\n};\n")
+            .file("gwt1.js", "function $n(a) { this.a = a; }\nfunction make1() { return new $n(1); }\n")
+            .file("gwt2.js", "function $n(a) { this.a = a; }\nfunction make2() { return new $n(2); }\n")
+            .index();
+        let graph = project.graph();
+        let edges = |qualified: &str| -> Vec<String> {
+            let id = &the_node(graph, qualified, None).id;
+            let mut out: Vec<String> = graph
+                .edges
+                .iter()
+                .filter(|edge| &edge.source == id && edge.kind != "contains")
+                .filter_map(|edge| {
+                    graph.node(&edge.target).map(|target| {
+                        format!(
+                            "{} {} {}",
+                            edge.kind, target.qualified_name, target.file_path
+                        )
+                    })
+                })
+                .collect();
+            out.sort();
+            out
+        };
+        assert_eq!(
+            the_node(graph, "$.event.special.swipe::setup", None).kind,
+            "function"
+        );
+        assert_eq!(the_node(graph, "n::touch", None).kind, "function");
+        assert_eq!(callers_of(graph, "n::touch"), ["lib.js"]);
+        assert_eq!(edges("Widget::drag"), Vec::<String>::new());
+        assert_eq!(edges("Widget::make"), Vec::<String>::new());
+        assert_eq!(edges("make1"), ["instantiates $n gwt1.js"]);
+        assert_eq!(edges("make2"), ["instantiates $n gwt2.js"]);
+    }
+
+    /// Upstream #2363: each IIFE and function keeps its own literal, and a
+    /// module its private one; a call outside them reaches none.
+    #[test]
+    fn pr2363_each_iife_and_function_keeps_its_own_literal() {
+        let project = Project::new()
+            .file("iife.js", "(function () { const Api = { run() { left(); } }; Api.run(); })();\n(function () { const Api = { run() { right(); } }; Api.run(); })();\nfunction left() {}\nfunction right() {}\nfunction outside() { return Api.run(); }\nfunction a() { const local = { go() { left(); } }; local.go(); }\nfunction b() { const local = { go() { right(); } }; local.go(); }\n")
+            .file("mod.js", "import { x } from \"./x.js\";\nconst Local = { run() { return x; } };\nexport function useLocal() { return Local.run(); }\n")
+            .file("other.js", "import { y } from \"./y.js\";\nexport function nope() { return Local.run(y); }\n")
+            .index();
+        let graph = project.graph();
+        let mut runs: Vec<&NodeRow> = graph
+            .nodes
+            .iter()
+            .filter(|node| node.qualified_name == "Api::run")
+            .collect();
+        runs.sort_by_key(|node| node.start_line);
+        assert_eq!(runs.len(), 2, "{}", graph.report());
+        assert_eq!(calls_of(graph, &runs[0].id, false), ["left"]);
+        assert_eq!(calls_of(graph, &runs[1].id, false), ["right"]);
+        assert_eq!(calls_of(graph, &runs[0].id, true), ["iife.js"]);
+        assert_eq!(calls_of(graph, &runs[1].id, true), ["iife.js"]);
+        // Outside both IIFEs, `Api` is neither of them, not even as a value read.
+        let outside = &the_node(graph, "outside", None).id;
+        assert!(
+            graph
+                .edges
+                .iter()
+                .all(|edge| &edge.source != outside || edge.kind == "contains"),
+            "{}",
+            graph.report()
+        );
+        assert_eq!(callees_of(graph, "a"), ["a::local::go"]);
+        assert_eq!(callees_of(graph, "b"), ["b::local::go"]);
+        assert_eq!(callees_of(graph, "useLocal"), ["Local::run"]);
+        assert_eq!(callees_of(graph, "nope"), Vec::<String>::new());
+    }
+
+    /// Upstream #2363: an arrow member and a value written in a method's
+    /// literal take the method's `this`; an object's own method's `this` is
+    /// the object.
+    #[test]
+    fn pr2363_arrow_members_take_the_this_of_the_method_around_the_literal() {
+        let project = Project::new()
+            .file("app.ts", "class Emitter { on(cb: () => void) { return cb; } }\nexport class App {\n  private emitter = new Emitter();\n  updateScene() { return 1; }\n  createApi() {\n    const api = {\n      updateScene: this.updateScene,\n      onChange: (cb: () => void) => this.emitter.on(cb),\n      refresh: () => this.updateScene(),\n      own() { return this.refresh(); },\n    };\n    return api;\n  }\n}\n")
+            .index();
+        let graph = project.graph();
+        let create_api = &the_node(graph, "App::createApi", None).id;
+        assert!(
+            graph.edges.iter().any(|edge| {
+                &edge.source == create_api
+                    && edge.kind == "references"
+                    && graph
+                        .node(&edge.target)
+                        .is_some_and(|target| target.qualified_name == "App::updateScene")
+            }),
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            callees_of(graph, "App::createApi::api::onChange"),
+            ["Emitter::on"]
+        );
+        assert_eq!(
+            callees_of(graph, "App::createApi::api::refresh"),
+            ["App::updateScene"]
+        );
+        assert_eq!(
+            callees_of(graph, "App::createApi::api::own"),
+            ["App::createApi::api::refresh"]
+        );
+    }
+
+    /// Upstream #2363: a cross-file member edge follows edits of the script
+    /// that defines the namespace.
+    #[test]
+    fn pr2363_a_cross_file_member_edge_follows_edits_of_its_script() {
+        let mut project = Project::new()
+            .file(
+                "ns.js",
+                "window.WS = { a() { return 1; }, wsM() { return 2; } };\n",
+            )
+            .file("use.js", "function viaGlobal() { return WS.wsM(); }\n")
+            .index();
+        assert_eq!(callers_of(project.graph(), "window.WS::wsM"), ["viaGlobal"]);
+        project.write(
+            "ns.js",
+            "// moved\nwindow.WS = {\n  wsM() { return 3; },\n};\n",
+        );
+        assert_eq!(callers_of(project.sync(), "window.WS::wsM"), ["viaGlobal"]);
+        project.write("ns.js", "window.WS = { renamed() { return 4; } };\n");
+        let graph = project.sync();
+        assert!(
+            graph
+                .nodes
+                .iter()
+                .all(|node| node.qualified_name != "window.WS::wsM")
+        );
+        assert_eq!(callees_of(graph, "viaGlobal"), Vec::<String>::new());
+    }
+
+    /// Upstream #2363: an imported literal's member, and a binding
+    /// destructured off a literal, reach the member; a name never
+    /// destructured does not.
+    #[test]
+    fn pr2363_an_imported_literal_and_a_destructured_binding_reach_the_member() {
+        let project = Project::new()
+            .file("api.js", "export const api = { get() { return 1; }, post() { return 2; } };\nconst { post } = api;\nexport function b() { return post(); }\nexport function c() { return get(); }\n")
+            .file("use.js", "import { api } from \"./api.js\";\nexport function a() { return api.get(); }\n")
+            .index();
+        let graph = project.graph();
+        assert_eq!(callees_of(graph, "a"), ["api::get"]);
+        assert_eq!(callees_of(graph, "b"), ["api::post"]);
+        assert_eq!(callees_of(graph, "c"), Vec::<String>::new());
+    }
+
+    /// Upstream #2363: CommonJS exports, prototypes, call arguments, data,
+    /// `this.x = {…}`, a plain name reassigned in a function and minified
+    /// scripts keep their shape: no member nodes.
+    #[test]
+    fn pr2363_commonjs_prototypes_arguments_data_and_minified_scripts_keep_their_shape() {
+        let bundle = "var q={b:function(){return r(1,2)},c:function(s){return s}};window.M={d:function(){return q.b()}};"
+            .repeat(60);
+        let project = Project::new()
+            .file("shapes.js", "module.exports = { cjs() { return 1; } };\nFoo.prototype = { proto() { return 1; } };\nconsume({ ephemeral() { return 1; } });\nconst data = { a: 1, b: [1, 2] };\nthis.state = { onThis() { return 1; } };\n")
+            .file("assets/lib.min.js", "var a={b:function(){return 1},c:function(){return 2}};window.L={d:function(){return a.b()}};\n")
+            .file("assets/bundle.js", &format!("{bundle}\n{bundle}\n"))
+            .file("iife.js", "(function () { var e; if (!e) { e = { getItem: function () { return 1; } }; } })();\n")
+            .index();
+        let graph = project.graph();
+        for name in [
+            "cjs",
+            "proto",
+            "ephemeral",
+            "onThis",
+            "b",
+            "c",
+            "d",
+            "getItem",
+        ] {
+            assert!(
+                graph.nodes.iter().all(|node| node.name != name),
+                "{name}:\n{}",
+                graph.report()
+            );
+        }
+        assert_eq!(the_node(graph, "data", None).kind, "constant");
+    }
+
+    /// Upstream #2363: a `<script setup>` literal's members stay under their
+    /// owner, and a call through the owner reaches them.
+    #[test]
+    fn pr2363_a_script_setup_literal_keeps_its_members_under_their_owner() {
+        let project = Project::new()
+            .file("Panel.vue", "<template><button @click=\"save\">Save</button></template>\n<script setup>\nconst handlers = { onSave() { persist(); } };\nfunction persist() {}\nfunction save() { handlers.onSave(); }\n</script>\n")
+            .index();
+        let graph = project.graph();
+        let owner = &the_node(graph, "handlers", None).id;
+        let member = &the_node(graph, "handlers::onSave", None).id;
+        let parents: Vec<&str> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.kind == "contains" && &edge.target == member)
+            .map(|edge| edge.source.as_str())
+            .collect();
+        assert_eq!(parents, [owner.as_str()]);
+        assert_eq!(callees_of(graph, "handlers::onSave"), ["persist"]);
+        assert_eq!(callees_of(graph, "save"), ["handlers::onSave"]);
+    }
+
+    /// Upstream #2363 (`extraction.test.ts`, #693): a module-scope literal's
+    /// values run where it is written, so their calls are the constant's, and
+    /// each function member's calls are its own; a data literal's calls are
+    /// its constant's too.
+    #[test]
+    fn pr2363_a_module_literal_walks_its_values_under_its_constant() {
+        let project = Project::new()
+            .file("app.ts", "\nconst eager = load();\nconst obj = { handler: () => target(), plain: target() };\nconst list = [() => target()];\nexport const exported = { handler: () => target() };\nconst cfg = { a: compute(), b: [1, 2] };\n")
+            .index();
+        let graph = project.graph();
+        let callers = |name: &str| -> Vec<String> {
+            let mut out: Vec<String> = graph
+                .unresolved
+                .iter()
+                .filter(|reference| {
+                    reference.reference_kind == "calls" && reference.reference_name == name
+                })
+                .map(|reference| {
+                    graph
+                        .node(&reference.from_node_id)
+                        .map_or("?".to_string(), |node| {
+                            format!("{}:{}", node.kind, node.qualified_name)
+                        })
+                })
+                .collect();
+            out.sort();
+            out
+        };
+        assert_eq!(callers("load"), ["constant:eager"]);
+        assert_eq!(
+            callers("target"),
+            [
+                "constant:list",
+                "constant:obj",
+                "function:exported::handler",
+                "function:obj::handler"
+            ]
+        );
+        assert_eq!(callers("compute"), ["constant:cfg"]);
+    }
+
+    /// Upstream #2363's negatives: a namespace two pages define with the same
+    /// member is the caller's own directory's or nobody's; a binding
+    /// destructured under another key, a global whose holder lacks the
+    /// member, and a file that imports the name never reach a global member.
+    #[test]
+    fn pr2363_ambiguous_or_shadowed_holders_stay_unresolved() {
+        let project = Project::new()
+            .file("a/ns.js", "window.App = { go() { return 1; } };\n")
+            .file("b/ns.js", "window.App = { go() { return 2; } };\n")
+            .file("a/use.js", "function near() { return App.go(); }\n")
+            .file("c/use.js", "function far() { return App.go(); }\n")
+            .file("d/keys.js", "var Tool = { load() { return 1; }, x() { return 2; } };\nvar { x: load } = Tool;\nfunction renamed() { return load(); }\n")
+            .file("d/other.js", "window.Other = { ping() { return 1; } };\nfunction missing() { return window.Other.go(); }\n")
+            .file("e/imported.js", "import { App } from './app.js';\nexport function viaImport() { return App.go(); }\n")
+            .index();
+        let graph = project.graph();
+        let go_files = |caller: &str| -> Vec<String> {
+            let id = &the_node(graph, caller, None).id;
+            let mut files: Vec<String> = graph
+                .edges
+                .iter()
+                .filter(|edge| &edge.source == id && edge.kind == "calls")
+                .filter_map(|edge| graph.node(&edge.target))
+                .map(|node| format!("{} {}", node.qualified_name, node.file_path))
+                .collect();
+            files.sort();
+            files
+        };
+        assert_eq!(go_files("near"), ["window.App::go a/ns.js"]);
+        assert_eq!(go_files("far"), Vec::<String>::new());
+        assert_eq!(go_files("renamed"), Vec::<String>::new());
+        assert_eq!(go_files("missing"), Vec::<String>::new());
+        assert_eq!(go_files("viaImport"), Vec::<String>::new());
     }
 }

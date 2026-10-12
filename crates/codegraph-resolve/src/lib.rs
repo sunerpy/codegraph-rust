@@ -33,6 +33,7 @@ pub mod lru_cache;
 mod member_value;
 pub mod name_matcher;
 mod object_literal;
+mod object_owners;
 mod overloads;
 pub mod package_manifests;
 pub mod path_aliases;
