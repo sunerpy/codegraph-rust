@@ -307,7 +307,22 @@ targets their rows recorded or what their sources resolve to now) down the
 whole-file lane and touches the names it declares, since no node records any
 of that text; a sync withdraws the surface marker before its first mutation
 and restores it last, so one that fails in between leaves the next sync to
-reconcile every JavaScript-family file; an import
+reconcile every JavaScript-family file; a changed C or C++ header (`.h`,
+`.hpp`, `.hxx`) sends its same-stem sources (`.c`, `.cc`, `.cpp`, `.cxx`) down
+the whole-file lane, since receiver inference reads a member's declared type
+from it, and a C or C++ file whose type surface moved (an alias that came,
+went or names another type by its recorded declaration, a class-like type or
+enum that came or went under an alias's name, a class whose bases changed),
+compared with one snapshot of the store taken before the sync first changed a
+C or C++ file, sends every unchanged C or C++ file whose text mentions a
+touched name down the same lane, the names closed over the aliases whose
+declarations mention them and over the classes deriving from a class whose
+bases changed, since an alias lookup reads those declarations by name across
+the project; the `cpp_type_surface_version` marker is withdrawn and restored
+with the surface marker, and an index without it re-resolves every C and C++
+file once (a base that becomes a namesake in another namespace, and a class
+gaining or losing its `template <…>` head while no alias's text changes, are
+not detected); an import
 names a file, a folder or a namespace rather than a symbol, so the parked
 imports an added file or a changed file's namespace can satisfy (by the file's
 name and stem, its folder's, or the namespace's whole name) send their files

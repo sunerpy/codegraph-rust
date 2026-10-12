@@ -469,6 +469,7 @@ pub fn extract_source_with_observer(
     observer(ExtractionStage::Walk);
     let parse_has_error = tree.root_node().has_error();
     let mut result = TreeSitterWalker::new(file_path, &parsed_source, spec, tree.root_node())
+        .with_raw_source(source)
         .extract(start.elapsed().as_millis() as i64);
     // A CommonJS `require('./x')` is a file import, as ESM's `import` is
     // (upstream #2263).

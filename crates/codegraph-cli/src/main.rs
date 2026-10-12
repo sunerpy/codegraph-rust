@@ -5838,6 +5838,8 @@ fn index_project_inner(
         &surfaces,
     )?;
     drop(surfaces);
+    // A fresh index leaves no C/C++ dependent unrefreshed (W4-CPP-04).
+    codegraph_watch::cpp_dependents::write_marker(&store)?;
     finish_phase(&pb, "Persisted nodes");
     diagnostic_run.phase_end("node_write", node_write_started.elapsed(), json!({}));
 

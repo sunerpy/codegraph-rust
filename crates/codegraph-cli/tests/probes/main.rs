@@ -4671,4 +4671,453 @@ class basic_json
             "{found:?}"
         );
     }
+
+    /// `calls` edges of every method or function qualified `caller` (a
+    /// prototype and its definition alike), as `qualified (file)`, sorted.
+    fn callees(graph: &Graph, caller: &str) -> Vec<String> {
+        calls_touching(graph, caller, false)
+    }
+
+    /// `calls` edges into every method or function qualified `callee`, as
+    /// `qualified (file)` of the caller, sorted.
+    fn callers(graph: &Graph, callee: &str) -> Vec<String> {
+        calls_touching(graph, callee, true)
+    }
+
+    fn calls_touching(graph: &Graph, qualified: &str, incoming: bool) -> Vec<String> {
+        let ids: Vec<&str> = graph
+            .nodes
+            .iter()
+            .filter(|node| {
+                node.qualified_name == qualified
+                    && (node.kind == "method" || node.kind == "function")
+            })
+            .map(|node| node.id.as_str())
+            .collect();
+        assert!(!ids.is_empty(), "no function or method {qualified}");
+        let mut out: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|edge| {
+                edge.kind == "calls"
+                    && ids.contains(&if incoming {
+                        edge.target.as_str()
+                    } else {
+                        edge.source.as_str()
+                    })
+            })
+            .filter_map(|edge| graph.node(if incoming { &edge.source } else { &edge.target }))
+            .map(|node| format!("{} ({})", node.qualified_name, node.file_path))
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// google/leveldb's shapes, trimmed (upstream #2399's fixture): the skip
+    /// list, the unrelated `Table`, and the decoy `Insert`.
+    const LEVELDB_ALIAS: &[(&str, &str)] = &[
+        (
+            "include/leveldb/table.h",
+            "namespace leveldb {\nclass Table {\n public:\n  explicit Table(int* rep);\n  int ApproximateOffsetOf(int key) const;\n};\n}  // namespace leveldb\n",
+        ),
+        (
+            "util/cache.cc",
+            "namespace leveldb {\nclass HandleTable {\n public:\n  void Insert(int h) { last_ = h; }\n private:\n  int last_;\n};\n}  // namespace leveldb\n",
+        ),
+        (
+            "db/skiplist.h",
+            "namespace leveldb {\ntemplate <typename Key, class Comparator>\nclass SkipList {\n public:\n  explicit SkipList(Comparator cmp, int* arena);\n  void Insert(const Key& key);\n  class Iterator {\n   public:\n    explicit Iterator(const SkipList* list);\n    void Seek(const Key& target);\n  };\n};\ntemplate <typename Key, class Comparator>\nSkipList<Key, Comparator>::SkipList(Comparator cmp, int* arena) {}\ntemplate <typename Key, class Comparator>\nvoid SkipList<Key, Comparator>::Insert(const Key& key) {}\ntemplate <typename Key, class Comparator>\nSkipList<Key, Comparator>::Iterator::Iterator(const SkipList* list) {}\ntemplate <typename Key, class Comparator>\nvoid SkipList<Key, Comparator>::Iterator::Seek(const Key& target) {}\n}  // namespace leveldb\n",
+        ),
+        (
+            "db/memtable.h",
+            "#include \"db/skiplist.h\"\nnamespace leveldb {\nstruct KeyComparator {\n  int operator()(const char* a, const char* b) const;\n};\nclass MemTable {\n public:\n  void Add(const char* buf);\n  bool Get(const char* key);\n  void Rebuild(int* arena);\n  void Index(const char* key);\n private:\n  typedef SkipList<const char*, KeyComparator> Table;\n  using Lookup = Table;\n  Table table_;\n  Lookup lookup_;\n};\n}  // namespace leveldb\n",
+        ),
+        (
+            "db/memtable.cc",
+            "#include \"db/memtable.h\"\nnamespace leveldb {\nvoid MemTable::Add(const char* buf) {\n  table_.Insert(buf);\n}\nbool MemTable::Get(const char* key) {\n  Table::Iterator iter(&table_);\n  iter.Seek(key);\n  return true;\n}\nvoid MemTable::Rebuild(int* arena) {\n  KeyComparator cmp;\n  Table fresh(cmp, &arena[0]);\n  Table stale(&arena[1]);\n}\nvoid MemTable::Index(const char* key) {\n  lookup_.Insert(key);\n}\n}  // namespace leveldb\n",
+        ),
+    ];
+
+    fn leveldb_alias_project(extra: &[(&str, &str)]) -> Project {
+        LEVELDB_ALIAS
+            .iter()
+            .chain(extra)
+            .fold(Project::new(), |project, (path, text)| {
+                project.file(path, text)
+            })
+    }
+
+    /// Upstream #2399 (`02d22aeb`): a C++ receiver declared through a
+    /// `typedef` / `using` alias calls the type the alias names. leveldb's
+    /// `table_.Insert(buf)` on `Table table_;` beside `typedef SkipList<const
+    /// char*, KeyComparator> Table;` reaches `SkipList::Insert`, not
+    /// `HandleTable::Insert` guessed by the receiver's name; `Table::Iterator`
+    /// constructs and calls `SkipList::Iterator`; `Table fresh(cmp, …)`
+    /// constructs `SkipList`, never the outer `leveldb::Table` the alias
+    /// hides; an alias of an alias is followed.
+    #[test]
+    fn pr2399_a_receiver_declared_through_an_alias_calls_the_aliased_type() {
+        let project = leveldb_alias_project(&[]).index();
+        let graph = project.graph();
+        assert_eq!(
+            callees(graph, "leveldb::MemTable::Add"),
+            ["leveldb::SkipList::Insert (db/skiplist.h)"],
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            callers(graph, "leveldb::HandleTable::Insert"),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            callees(graph, "leveldb::MemTable::Get"),
+            [
+                "leveldb::SkipList::Iterator::Iterator (db/skiplist.h)",
+                "leveldb::SkipList::Iterator::Seek (db/skiplist.h)",
+            ]
+        );
+        // `Table stale(&arena[1])` fits no SkipList constructor, and
+        // `leveldb::Table(int*)` is not the `Table` this scope names.
+        assert_eq!(
+            callees(graph, "leveldb::MemTable::Rebuild"),
+            ["leveldb::SkipList::SkipList (db/skiplist.h)"]
+        );
+        assert_eq!(
+            callers(graph, "leveldb::Table::Table"),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            callees(graph, "leveldb::MemTable::Index"),
+            ["leveldb::SkipList::Insert (db/skiplist.h)"]
+        );
+    }
+
+    /// Upstream #2399: an alias spelled from outside its class
+    /// (`MemTable::Table* t`), and one declared in the calling function.
+    #[test]
+    fn pr2399_an_alias_spelled_from_outside_its_class_or_declared_in_the_function() {
+        let project = leveldb_alias_project(&[(
+            "db/builder.cc",
+            "#include \"db/memtable.h\"\nnamespace leveldb {\nvoid Fill(MemTable::Table* t) {\n  t->Insert(\"k\");\n}\nvoid Build(int* arena) {\n  typedef SkipList<const char*, KeyComparator> List;\n  KeyComparator cmp;\n  List list(cmp, &arena[0]);\n  list.Insert(\"k\");\n}\n}  // namespace leveldb\n",
+        )])
+        .index();
+        let graph = project.graph();
+        assert_eq!(
+            callees(graph, "leveldb::Fill"),
+            ["leveldb::SkipList::Insert (db/skiplist.h)"],
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            callees(graph, "leveldb::Build"),
+            [
+                "leveldb::SkipList::Insert (db/skiplist.h)",
+                "leveldb::SkipList::SkipList (db/skiplist.h)",
+            ]
+        );
+    }
+
+    /// Upstream #2399: no method is guessed by the receiver's name when the
+    /// aliased type lacks it: `files_` is a `std::vector`, not `Slice::clear`,
+    /// the one project `clear`, also when the call continues on the next line
+    /// (protobuf's `symbols_by_parent_` / `.insert(…)`).
+    #[test]
+    fn pr2399_no_guess_when_the_aliased_type_lacks_the_method() {
+        let project = leveldb_alias_project(&[
+            (
+                "include/leveldb/slice.h",
+                "namespace leveldb {\nclass Slice {\n public:\n  void clear() { size_ = 0; }\n private:\n  int size_;\n};\n}  // namespace leveldb\n",
+            ),
+            (
+                "db/version_set.h",
+                "#include <vector>\nnamespace leveldb {\nclass VersionSet {\n public:\n  void Clear();\n private:\n  using Table = std::vector<int>;\n  Table files_;\n};\n}  // namespace leveldb\n",
+            ),
+            (
+                "db/version_set.cc",
+                "#include \"db/version_set.h\"\nnamespace leveldb {\nvoid VersionSet::Clear() {\n  files_.clear();\n}\n}  // namespace leveldb\n",
+            ),
+        ])
+        .index();
+        let graph = project.graph();
+        assert_eq!(
+            callees(graph, "leveldb::VersionSet::Clear"),
+            Vec::<String>::new(),
+            "{}",
+            graph.report()
+        );
+
+        let protobuf = Project::new()
+            .file(
+                "src/descriptor.cc",
+                "#include \"absl/container/flat_hash_set.h\"\nnamespace google { namespace protobuf {\nclass Arena {\n public:\n  void insert(int block) {}\n};\nclass FileDescriptorTables {\n public:\n  bool AddAliasUnderParent(int symbol);\n private:\n  typedef absl::flat_hash_set<int> SymbolsByParentSet;\n  SymbolsByParentSet symbols_by_parent_;\n};\nbool FileDescriptorTables::AddAliasUnderParent(int symbol) {\n  return symbols_by_parent_\n      .insert(symbol)\n      .second;\n}\n} }\n",
+            )
+            .index();
+        let graph = protobuf.graph();
+        assert_eq!(
+            callees(
+                graph,
+                "google::protobuf::FileDescriptorTables::AddAliasUnderParent"
+            ),
+            Vec::<String>::new(),
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream #2399: a class declared in an inner scope hides an outer
+    /// alias of the same name; outside it, the alias applies.
+    #[test]
+    fn pr2399_an_inner_class_hides_an_outer_alias_of_its_name() {
+        let project = Project::new()
+            .file(
+                "app/holder.h",
+                "namespace app {\nclass Gadget {\n public:\n  void Spin();\n};\nusing Widget = Gadget;\nclass Holder {\n public:\n  class Widget {\n   public:\n    void Spin();\n  };\n  void Use();\n private:\n  Widget w_;\n};\n}  // namespace app\n",
+            )
+            .file(
+                "app/holder.cc",
+                "#include \"app/holder.h\"\nnamespace app {\nvoid Gadget::Spin() {}\nvoid Holder::Widget::Spin() {}\nvoid Holder::Use() {\n  w_.Spin();\n}\nvoid Twirl(Widget& w) {\n  w.Spin();\n}\n}  // namespace app\n",
+            )
+            .index();
+        let graph = project.graph();
+        assert_eq!(
+            callees(graph, "app::Holder::Use"),
+            ["app::Holder::Widget::Spin (app/holder.cc)"],
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            callees(graph, "app::Twirl"),
+            ["app::Gadget::Spin (app/holder.cc)"]
+        );
+    }
+
+    /// Upstream #2399: an alias a class inherits is found in the base class
+    /// before an enclosing namespace's alias template, and a dependent alias
+    /// (`typename Traits::Field`) is not followed (protobuf's json traits).
+    #[test]
+    fn pr2399_an_inherited_alias_is_found_before_the_namespace() {
+        let project = Project::new()
+            .file(
+                "protobuf/descriptor.h",
+                "namespace google { namespace protobuf {\nclass FieldDescriptor {\n public:\n  bool is_repeated() const;\n};\ninline bool FieldDescriptor::is_repeated() const { return false; }\nclass OneofDescriptor {\n public:\n  bool is_repeated() const { return false; }\n};\n} }\n",
+            )
+            .file(
+                "protobuf/json/traits.h",
+                "#include \"protobuf/descriptor.h\"\nnamespace google { namespace protobuf { namespace json_internal {\ntemplate <typename Traits>\nusing Field = typename Traits::Field;\nstruct Proto2Descriptor {\n  using Field = const FieldDescriptor*;\n};\nstruct ParseProto2Descriptor : Proto2Descriptor {\n  static bool NewMsg(Field f) { return f->is_repeated(); }\n};\n} } }\n",
+            )
+            .index();
+        let graph = project.graph();
+        assert_eq!(
+            callees(
+                graph,
+                "google::protobuf::json_internal::ParseProto2Descriptor::NewMsg"
+            ),
+            ["google::protobuf::FieldDescriptor::is_repeated (protobuf/descriptor.h)"],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream #2399: an alias of a template parameter names no type, so a
+    /// class that shares the alias's name is not it (protobuf's
+    /// `GenericTypeHandler` `using Type = GenericType;` beside the generated
+    /// `Type` message).
+    #[test]
+    fn pr2399_an_alias_of_a_template_parameter_names_no_type() {
+        let project = Project::new()
+            .file(
+                "protobuf/type.pb.h",
+                "namespace google { namespace protobuf {\nclass Type {\n public:\n  void Clear();\n};\ninline void Type::Clear() {}\n} }\n",
+            )
+            .file(
+                "protobuf/repeated_ptr_field.h",
+                "namespace google { namespace protobuf { namespace internal {\ntemplate <typename GenericType>\nclass GenericTypeHandler {\n public:\n  using Type = GenericType;\n  static void Reset(Type* value) { value->Clear(); }\n};\n} } }\n",
+            )
+            .index();
+        let graph = project.graph();
+        assert_eq!(
+            callees(
+                graph,
+                "google::protobuf::internal::GenericTypeHandler::Reset"
+            ),
+            Vec::<String>::new(),
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream #2399: `->` through an alias of an iterator reaches the
+    /// element type, which the alias does not name, so the alias rule leaves
+    /// the call to the guesses (gmock's `ExpectationSet::const_iterator`, a
+    /// `std::set<Expectation>` iterator). Upstream's receiver is `it`; here
+    /// it shares a word with the method's class, since a lone same-named
+    /// method is guessed only then (KEEP-RUST #226).
+    #[test]
+    fn pr2399_an_arrow_through_an_iterator_alias_still_reaches_a_guess() {
+        let project = Project::new()
+            .file(
+                "gmock/expectation.h",
+                "#include <set>\nnamespace testing {\nclass Expectation {\n public:\n  int expectation_base() const { return 0; }\n};\nclass ExpectationSet {\n public:\n  typedef ::std::set<Expectation> Set;\n  typedef Set::const_iterator const_iterator;\n};\nint Describe(const ExpectationSet& set) {\n  ExpectationSet::const_iterator expectation_it;\n  return expectation_it->expectation_base();\n}\n}  // namespace testing\n",
+            )
+            .index();
+        let graph = project.graph();
+        assert_eq!(
+            callees(graph, "testing::Describe"),
+            ["testing::Expectation::expectation_base (gmock/expectation.h)"],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream #2399: a class template's specialization can declare a member
+    /// the template itself does not (rocksdb's `omt_node_templated<omtdata_t,
+    /// true>` adds `get_marked`), so an alias of a project class template
+    /// does not rule a call out. The specialization is indexed as
+    /// `<anonymous>`, as upstream indexes it, so the call is a guess by the
+    /// method's name; upstream's receiver is `node`, and here it shares a word
+    /// with the method, since a lone same-named method is guessed only then
+    /// (KEEP-RUST #226).
+    #[test]
+    fn pr2399_an_alias_of_a_class_template_does_not_rule_a_call_out() {
+        let project = Project::new()
+            .file(
+                "util/omt.h",
+                "namespace toku {\nnamespace omt_internal {\ntemplate <typename omtdata_t, bool subtree_supports_marks>\nclass omt_node_templated {\n public:\n  void clear_stolen_bits() {}\n};\ntemplate <typename omtdata_t>\nclass omt_node_templated<omtdata_t, true> {\n public:\n  bool get_marked() const { return false; }\n};\n}  // namespace omt_internal\ntemplate <typename omtdata_t, bool supports_marks = false>\nclass omt {\n public:\n  bool has_marks() const;\n private:\n  typedef omt_internal::omt_node_templated<omtdata_t, supports_marks> omt_node;\n  omt_node root_;\n};\ntemplate <typename omtdata_t, bool supports_marks>\nbool omt<omtdata_t, supports_marks>::has_marks() const {\n  const omt_node &marked_node = root_;\n  return marked_node.get_marked();\n}\n}  // namespace toku\n",
+            )
+            .index();
+        let graph = project.graph();
+        let names: Vec<String> = callees(graph, "toku::omt::has_marks")
+            .into_iter()
+            .map(|callee| {
+                callee
+                    .split(" (")
+                    .next()
+                    .and_then(|qualified| qualified.rsplit("::").next())
+                    .unwrap_or_default()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(names, ["get_marked"], "{}", graph.report());
+    }
+
+    /// Upstream #2399: a declaration read from another class is not known to
+    /// be the receiver's (fmt's scan.h: `auto data = scan_data<T...>()`
+    /// deduces nothing the reader can see, and the `data` it then finds is
+    /// another class's `const scan_arg* data;`).
+    #[test]
+    fn pr2399_a_declaration_read_from_another_class_is_not_the_receivers() {
+        let project = Project::new()
+            .file(
+                "test/scan.h",
+                "namespace fmt {\nclass basic_scan_arg {\n public:\n  int type() const { return 0; }\n};\nusing scan_arg = basic_scan_arg;\nclass scan_args {\n  const scan_arg* data;\n};\ntemplate <typename... T> class scan_data {\n public:\n  int make_args() { return 0; }\n};\ntemplate <typename... T> int scan() {\n  auto data = scan_data<T...>();\n  return data.make_args();\n}\n}  // namespace fmt\n",
+            )
+            .index();
+        let graph = project.graph();
+        assert_eq!(
+            callees(graph, "fmt::scan"),
+            ["fmt::scan_data::make_args (test/scan.h)"],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream #2399's "no guess" cases hold here before the port too, since
+    /// a lone same-named method is guessed only when the receiver shares a
+    /// word with it (KEEP-RUST #226). With a decoy that does share one
+    /// (`FilesIndex::clear` for `files_`, `ParentSymbols::insert` for
+    /// `symbols_by_parent_`), the base guessed it; the aliased type lacking
+    /// the method now rules the guess out.
+    #[test]
+    fn pr2399_no_guess_even_when_a_decoy_shares_the_receivers_word() {
+        let project = Project::new()
+            .file(
+                "include/leveldb/files_index.h",
+                "namespace leveldb {\nclass FilesIndex {\n public:\n  void clear() { size_ = 0; }\n private:\n  int size_;\n};\n}  // namespace leveldb\n",
+            )
+            .file(
+                "db/version_set.h",
+                "#include <vector>\nnamespace leveldb {\nclass VersionSet {\n public:\n  void Clear();\n private:\n  using Table = std::vector<int>;\n  Table files_;\n};\n}  // namespace leveldb\n",
+            )
+            .file(
+                "db/version_set.cc",
+                "#include \"db/version_set.h\"\nnamespace leveldb {\nvoid VersionSet::Clear() {\n  files_.clear();\n}\n}  // namespace leveldb\n",
+            )
+            .file(
+                "src/descriptor.cc",
+                "#include \"absl/container/flat_hash_set.h\"\nnamespace google { namespace protobuf {\nclass ParentSymbols {\n public:\n  void insert(int block) {}\n};\nclass FileDescriptorTables {\n public:\n  bool AddAliasUnderParent(int symbol);\n private:\n  typedef absl::flat_hash_set<int> SymbolsByParentSet;\n  SymbolsByParentSet symbols_by_parent_;\n};\nbool FileDescriptorTables::AddAliasUnderParent(int symbol) {\n  return symbols_by_parent_\n      .insert(symbol)\n      .second;\n}\n} }\n",
+            )
+            .index();
+        let graph = project.graph();
+        assert_eq!(
+            callees(graph, "leveldb::VersionSet::Clear"),
+            Vec::<String>::new(),
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            callees(
+                graph,
+                "google::protobuf::FileDescriptorTables::AddAliasUnderParent"
+            ),
+            Vec::<String>::new(),
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream #2399's alias choice: two headers declaring the same alias in
+    /// the same scope for different types, neither the calling file's nor its
+    /// header's, name no type to follow (an `#if` arm each, as rocksdb
+    /// writes); the calling file's own declaration of it is the one its
+    /// translation unit sees.
+    #[test]
+    fn pr2399_an_alias_two_headers_declare_differently_is_not_followed() {
+        let ambiguous = Project::new()
+            .file(
+                "store/kinds.h",
+                "namespace app {\nclass MemStore {\n public:\n  void Save() {}\n};\nclass DiskStore {\n public:\n  void Save() {}\n};\n}  // namespace app\n",
+            )
+            .file(
+                "config/fast.h",
+                "#include \"store/kinds.h\"\nnamespace app {\nusing Store = MemStore;\n}  // namespace app\n",
+            )
+            .file(
+                "config/safe.h",
+                "#include \"store/kinds.h\"\nnamespace app {\nusing Store = DiskStore;\n}  // namespace app\n",
+            )
+            .file(
+                "src/use.cc",
+                "#include \"config/fast.h\"\nnamespace app {\nvoid Run() {\n  Store store;\n  store.Save();\n}\n}  // namespace app\n",
+            )
+            .index();
+        let graph = ambiguous.graph();
+        assert_eq!(
+            callees(graph, "app::Run"),
+            Vec::<String>::new(),
+            "{}",
+            graph.report()
+        );
+
+        let own = Project::new()
+            .file(
+                "store/kinds.h",
+                "namespace app {\nclass MemStore {\n public:\n  void Save() {}\n};\nclass DiskStore {\n public:\n  void Save() {}\n};\n}  // namespace app\n",
+            )
+            .file(
+                "config/fast.h",
+                "#include \"store/kinds.h\"\nnamespace app {\nusing Store = MemStore;\n}  // namespace app\n",
+            )
+            .file(
+                "src/use.cc",
+                "#include \"store/kinds.h\"\nnamespace app {\nusing Store = DiskStore;\nvoid Run() {\n  Store store;\n  store.Save();\n}\n}  // namespace app\n",
+            )
+            .index();
+        let graph = own.graph();
+        assert_eq!(
+            callees(graph, "app::Run"),
+            ["app::DiskStore::Save (store/kinds.h)"],
+            "{}",
+            graph.report()
+        );
+    }
 }

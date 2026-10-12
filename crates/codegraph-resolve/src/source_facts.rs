@@ -14,7 +14,7 @@
 use crate::awaited::AwaitedIndex;
 use crate::object_literal::LiteralLookup;
 use crate::strip_comments::{CommentLang, blank_string_contents, strip_comments_for_regex};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
 
 /// Newline positions of a text.
@@ -149,6 +149,9 @@ pub struct SourceFacts {
     sfc_script_blocks: OnceLock<Vec<crate::sfc_scripts::ScriptBlock>>,
     js_destructured_calls: OnceLock<Option<crate::destructured_calls::DestructuredFile>>,
     js_object_scan: OnceLock<Arc<crate::object_owners::JsObjectScan>>,
+    cpp_local_alias_lines: Mutex<HashMap<String, Arc<Vec<usize>>>>,
+    cpp_template_parameters: Mutex<HashMap<String, Arc<BTreeSet<String>>>>,
+    cpp_class_bases: Mutex<HashMap<String, Arc<Vec<String>>>>,
 }
 
 impl SourceFacts {
@@ -185,6 +188,9 @@ impl SourceFacts {
             sfc_script_blocks: OnceLock::new(),
             js_destructured_calls: OnceLock::new(),
             js_object_scan: OnceLock::new(),
+            cpp_local_alias_lines: Mutex::new(HashMap::new()),
+            cpp_template_parameters: Mutex::new(HashMap::new()),
+            cpp_class_bases: Mutex::new(HashMap::new()),
         }
     }
 
@@ -501,6 +507,43 @@ impl SourceFacts {
         found
     }
 
+    /// Memoised lines of the C/C++ function `caller_id` (defined in this file)
+    /// that declare an alias, last first (upstream #2399); `compute` runs at
+    /// most once per function.
+    pub(crate) fn cpp_local_alias_lines(
+        &self,
+        caller_id: &str,
+        compute: impl FnOnce(&Self) -> Vec<usize>,
+    ) -> Arc<Vec<usize>> {
+        keyed_memo(&self.cpp_local_alias_lines, caller_id, || {
+            Arc::new(compute(self))
+        })
+    }
+
+    /// Memoised C++ template parameters in scope where the node `node_id`
+    /// (defined in this file) is declared (upstream #2399); `compute` runs at
+    /// most once per node.
+    pub(crate) fn cpp_template_parameters(
+        &self,
+        node_id: &str,
+        compute: impl FnOnce(&Self) -> BTreeSet<String>,
+    ) -> Arc<BTreeSet<String>> {
+        keyed_memo(&self.cpp_template_parameters, node_id, || {
+            Arc::new(compute(self))
+        })
+    }
+
+    /// Memoised bases the head of the C++ class declaration `class_id`
+    /// (defined in this file) names (upstream #2399); `compute` runs at most
+    /// once per declaration.
+    pub(crate) fn cpp_class_bases(
+        &self,
+        class_id: &str,
+        compute: impl FnOnce(&Self) -> Vec<String>,
+    ) -> Arc<Vec<String>> {
+        keyed_memo(&self.cpp_class_bases, class_id, || Arc::new(compute(self)))
+    }
+
     /// The C# namespace blocks and `using` directives of the raw source,
     /// read once.
     pub(crate) fn csharp_scopes(&self) -> Arc<crate::csharp_scopes::CsharpScopes> {
@@ -573,6 +616,26 @@ impl SourceFacts {
             .insert(key, declaration.clone());
         declaration
     }
+}
+
+/// `map[key]`, computed by `compute` without holding the lock when absent.
+fn keyed_memo<V: Clone>(
+    map: &Mutex<HashMap<String, V>>,
+    key: &str,
+    compute: impl FnOnce() -> V,
+) -> V {
+    if let Some(known) = map
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(key)
+    {
+        return known.clone();
+    }
+    let value = compute();
+    map.lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(key.to_string(), value.clone());
+    value
 }
 
 /// Offsets of `\b(?:kw1|kw2|…)\s` matches: a keyword preceded by a non-word

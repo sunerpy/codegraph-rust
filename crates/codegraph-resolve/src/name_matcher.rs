@@ -2583,6 +2583,19 @@ fn normalize_cpp_type_name(raw: &str) -> String {
         .to_string()
 }
 
+/// A declarator scan's capture that names no type (`return x`, `throw x`,
+/// `delete x`): upstream's `normalizeCppTypeName` reads none in it, and the
+/// scan goes on to earlier lines rather than taking `return` as `x`'s type.
+fn is_cpp_non_type_capture(raw: &str) -> bool {
+    let bare = raw.replace(['*', '&'], " ");
+    let last = bare
+        .split_whitespace()
+        .last()
+        .and_then(|word| word.rsplit("::").next())
+        .unwrap_or_default();
+    last.is_empty() || CPP_NON_TYPE_TOKENS.contains(&last)
+}
+
 /// The char following the receiver word must be a declarator terminator
 /// (`;=,)[{(` or end-of-line) — mirrors the upstream lookahead `(?=[;=,)\[{(]|$)`
 /// (`name-matcher.ts:508`), which the regex crate cannot express directly.
@@ -2653,7 +2666,7 @@ fn resolve_cpp_call_result_type(
             if recv.contains('.') || recv.contains('(') || recv.contains("::") {
                 return None;
             }
-            let recv_type = infer_cpp_receiver_type(recv, reference, context, depth + 1)?;
+            let recv_type = infer_cpp_receiver_type(recv, reference, context, depth + 1, None)?;
             return lookup_callee_return_type(
                 &format!("{recv_type}::{method}"),
                 reference,
@@ -2673,15 +2686,154 @@ fn resolve_cpp_call_result_type(
     None
 }
 
+/// What C++ receiver inference made of a receiver's declared type (upstream
+/// #2399 `CppReceiverDeclaration`).
+#[derive(Debug, Default)]
+struct CppReceiverDeclaration {
+    /// The declared type is an alias, followed to the type it names or naming
+    /// no particular class (a template parameter's type, `typename
+    /// Traits::Field`, a `decltype(…)`).
+    aliased: bool,
+    /// The type as written in the declaration, read the way upstream's
+    /// `normalizeCppTypeName` reads it, without following an alias (`Table`).
+    written: String,
+    /// The type is reached through a pointer (`Table* t`, `using Field =
+    /// const FieldDescriptor*;`).
+    pointer: bool,
+    /// The type is one of the project's class templates, whose
+    /// specializations may add members.
+    class_template: bool,
+}
+
+/// A declared C++ type as receiver inference reads it: as the declaration
+/// wrote it, or, when it is an alias the caller's own declaration uses, the
+/// type the alias names (`cpp_type_aliases`), `None` when that type can't be
+/// known (upstream #2399 `cppDeclaredType`). An alias is never a class, so its
+/// own name is never looked up as one: that is how protobuf's `Field f;
+/// f->number()` (`using Field = const FieldDescriptor*;`) reached the
+/// generated `Field` message's `number`.
+fn cpp_declared_type(
+    raw: &str,
+    normalized: String,
+    in_caller_scope: bool,
+    reference: &RefView,
+    context: &dyn ResolutionContext,
+    found: Option<&mut CppReceiverDeclaration>,
+) -> Option<String> {
+    // A declaration read from elsewhere (an earlier function, another class)
+    // may not be this receiver's, so it is taken as it was before aliases
+    // were followed.
+    if !in_caller_scope {
+        return Some(normalized);
+    }
+    let aliased = crate::cpp_type_aliases::resolve_cpp_aliased_type(raw, reference, context);
+    let followed = match &aliased {
+        crate::cpp_type_aliases::CppAliased::NotAnAlias => return Some(normalized),
+        crate::cpp_type_aliases::CppAliased::Unreadable => None,
+        crate::cpp_type_aliases::CppAliased::Followed(followed) => Some(followed),
+    };
+    if let Some(found) = found {
+        found.aliased = true;
+        found.written = cpp_declared_type_name(raw).unwrap_or_default();
+        found.pointer = followed.map_or_else(
+            || crate::cpp_type_aliases::is_cpp_pointer_type(raw),
+            |followed| followed.pointer,
+        );
+        found.class_template = followed.is_some_and(|followed| followed.class_template);
+    }
+    followed.map(crate::cpp_type_aliases::cpp_aliased_type_name)
+}
+
+/// Is line `line` of `file`, where `text` declares a C++ receiver at byte
+/// `at`, the calling function's own code, or a member declaration of the
+/// caller's class (upstream #2399 `isCppCallersDeclaration`)? Receiver
+/// inference reads back to the top of the file and through the header, so a
+/// declaration it finds elsewhere (an earlier function, another class in the
+/// header, a comment) may be another variable of the same name.
+fn is_cpp_callers_declaration(
+    file: &str,
+    line: i64,
+    text: &str,
+    at: usize,
+    reference: &RefView,
+    context: &dyn ResolutionContext,
+) -> bool {
+    static COMMENT_LINE: OnceLock<Regex> = OnceLock::new();
+    let comment_line =
+        COMMENT_LINE.get_or_init(|| Regex::new(r"^\s*(?://|/\*|\*)").expect("comment line"));
+    if comment_line.is_match(text) || text.find("//").is_some_and(|comment| comment < at) {
+        return false;
+    }
+    let Some(caller) = context.get_node_by_id_shared(&reference.from_node_id) else {
+        return false;
+    };
+    if !matches!(caller.kind, NodeKind::Method | NodeKind::Function) {
+        return false;
+    }
+    if file == reference.file_path && line >= caller.start_line && line <= reference.line {
+        return true;
+    }
+    let Some((owner, _)) = caller.qualified_name.rsplit_once("::") else {
+        return false;
+    };
+    context
+        .get_nodes_by_qualified_name_shared(owner)
+        .iter()
+        .any(|class| {
+            matches!(
+                class.kind,
+                NodeKind::Class | NodeKind::Struct | NodeKind::Union
+            ) && class.file_path == file
+                && line >= class.start_line
+                && line
+                    <= if class.end_line != 0 {
+                        class.end_line
+                    } else {
+                        class.start_line
+                    }
+        })
+}
+
+/// Is the C++ member call `reference` written `receiver.method(…)`, not
+/// through `->` (upstream #2399 `isCppDotCall`)?
+fn is_cpp_dot_call(receiver: &str, reference: &RefView, context: &dyn ResolutionContext) -> bool {
+    let Some(facts) = context.source_facts(&reference.file_path) else {
+        return false;
+    };
+    let Some(index) = usize::try_from(reference.line - 1)
+        .ok()
+        .filter(|&index| index < facts.line_count())
+    else {
+        return false;
+    };
+    let Some(mut rest) = facts
+        .line(index)
+        .get(usize::try_from(reference.column).unwrap_or(0)..)
+        .and_then(|at| at.strip_prefix(receiver))
+    else {
+        return false;
+    };
+    // `symbols_by_parent_` ending its line, `.insert(…)` starting the next.
+    let mut next = index + 1;
+    while rest.trim().is_empty() && next < facts.line_count().min(index + 1 + 3) {
+        rest = facts.line(next);
+        next += 1;
+    }
+    rest.trim_start().starts_with('.')
+}
+
 /// Infer a C++ receiver's declared type by scanning the source backwards from
 /// the call line for its declarator (`inferCppReceiverType`,
 /// `name-matcher.ts:512-567`). Handles `Foo x;`, `auto x = Foo::make();`, and a
-/// `.h/.hpp/.hxx` header fallback.
+/// `.h/.hpp/.hxx` header fallback. A declared type the caller's own code
+/// spells through an alias is the type the alias names (upstream #2399), and
+/// `found` records what the declaration said.
 fn infer_cpp_receiver_type(
     receiver_name: &str,
     reference: &RefView,
     context: &dyn ResolutionContext,
     depth: u32,
+    found: Option<&mut CppReceiverDeclaration>,
 ) -> Option<String> {
     let source = context.read_file(&reference.file_path)?;
     let lines: Vec<&str> = source
@@ -2706,7 +2858,11 @@ fn infer_cpp_receiver_type(
             if !declarator_terminator_ok(line, whole.end()) {
                 continue;
             }
-            let normalized = normalize_cpp_type_name(caps.get(1).map_or("", |m| m.as_str()));
+            let raw = caps.get(1).map_or("", |m| m.as_str());
+            if is_cpp_non_type_capture(raw) {
+                continue;
+            }
+            let normalized = normalize_cpp_type_name(raw);
             if normalized == "auto" {
                 // `auto x = Foo::instance();` — recover the type from the
                 // initializer (call return type / construction).
@@ -2716,7 +2872,22 @@ fn infer_cpp_receiver_type(
                     return Some(init_type);
                 }
             } else if !normalized.is_empty() {
-                return Some(normalized);
+                let in_caller_scope = is_cpp_callers_declaration(
+                    &reference.file_path,
+                    i as i64 + 1,
+                    line,
+                    whole.start(),
+                    reference,
+                    context,
+                );
+                return cpp_declared_type(
+                    raw,
+                    normalized,
+                    in_caller_scope,
+                    reference,
+                    context,
+                    found,
+                );
             }
         }
     }
@@ -2738,7 +2909,11 @@ fn infer_cpp_receiver_type(
         let Some(header_source) = context.read_file(&header_path) else {
             continue;
         };
-        for line in header_source.split('\n').map(|l| l.trim_end_matches('\r')) {
+        for (i, line) in header_source
+            .split('\n')
+            .map(|l| l.trim_end_matches('\r'))
+            .enumerate()
+        {
             if !receiver_pattern.is_match(line) {
                 continue;
             }
@@ -2747,9 +2922,28 @@ fn infer_cpp_receiver_type(
                 if !declarator_terminator_ok(line, whole.end()) {
                     continue;
                 }
-                let normalized = normalize_cpp_type_name(caps.get(1).map_or("", |m| m.as_str()));
+                let raw = caps.get(1).map_or("", |m| m.as_str());
+                if is_cpp_non_type_capture(raw) {
+                    continue;
+                }
+                let normalized = normalize_cpp_type_name(raw);
                 if !normalized.is_empty() && normalized != "auto" {
-                    return Some(normalized);
+                    let in_caller_scope = is_cpp_callers_declaration(
+                        &header_path,
+                        i as i64 + 1,
+                        line,
+                        whole.start(),
+                        reference,
+                        context,
+                    );
+                    return cpp_declared_type(
+                        raw,
+                        normalized,
+                        in_caller_scope,
+                        reference,
+                        context,
+                        found,
+                    );
                 }
             }
         }
@@ -3772,8 +3966,15 @@ pub fn match_method_call(
     // is not an instance call. C++ uses its dedicated inferrer; every other
     // language uses the shared source-based inferrer.
     if is_inferable_receiver_call(&reference.reference_name, reference.language) {
+        let mut cpp_declaration = CppReceiverDeclaration::default();
         let inferred = if reference.language == Language::Cpp {
-            infer_cpp_receiver_type(&object_or_class, reference, context, 0)
+            infer_cpp_receiver_type(
+                &object_or_class,
+                reference,
+                context,
+                0,
+                Some(&mut cpp_declaration),
+            )
         } else {
             // The field lookup runs ONLY where the function-scope scan declined,
             // so it can add an inference but never change one (#1566, ESM only).
@@ -3884,6 +4085,29 @@ pub fn match_method_call(
                         ..typed
                     });
                 }
+            }
+        }
+        if cpp_declaration.aliased {
+            // A C++ receiver the calling function or its class declares
+            // through an alias has the type the alias names. When that type
+            // and its supertypes lack the method (`files_.clear()` through
+            // `using Files = std::vector<int>;`), or the alias names a template
+            // parameter's type, a method picked by the receiver's name below
+            // would be some other type's (upstream #2399).
+            if !cpp_declaration.class_template
+                && (cpp_declaration.pointer
+                    || is_cpp_dot_call(&object_or_class, reference, context))
+            {
+                return None;
+            }
+            // Not so for `it->m()` on an iterator or smart pointer, whose `->`
+            // reaches an element type the alias doesn't name, nor for one of
+            // the project's class templates, whose specializations may declare
+            // members the template itself doesn't (rocksdb's
+            // `omt_node_templated<T, true>` adds `get_marked`): that call goes
+            // on as it did before aliases were followed.
+            if is_undeclared_type_name(&cpp_declaration.written, reference, context) {
+                return None;
             }
         }
     }
@@ -6025,7 +6249,24 @@ mod js_module_tests {
 
 #[cfg(test)]
 mod cpp_declared_type_tests {
-    use super::cpp_declared_type_name;
+    use super::{cpp_declared_type_name, is_cpp_non_type_capture};
+
+    #[test]
+    fn a_capture_naming_no_type_lets_the_declarator_scan_go_on() {
+        for capture in ["return", "return *", "throw", "delete", "sizeof", "", "&"] {
+            assert!(is_cpp_non_type_capture(capture), "{capture:?}");
+        }
+        for capture in [
+            "Table",
+            "const Table&",
+            "SymbolsByParentSet",
+            "leveldb::Table*",
+            "SkipList<Key, Comparator>",
+            "auto",
+        ] {
+            assert!(!is_cpp_non_type_capture(capture), "{capture:?}");
+        }
+    }
 
     #[test]
     fn a_declared_cpp_type_is_read_as_upstream_reads_it() {

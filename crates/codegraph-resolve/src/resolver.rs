@@ -291,10 +291,13 @@ fn cpp_type_spelling_matches(spelled: &str, qualified: &str) -> bool {
 
 /// Pick one C++ type owner without using file proximity as namespace proof.
 /// An unqualified spelling may be resolved by the caller's lexical qualified
-/// scope (longest segment-aligned prefix), otherwise the project must contain
-/// exactly one matching owner. Equal-best candidates remain unresolved.
+/// scope (longest segment-aligned prefix), or by `lexical_scope` when the
+/// spelling was written somewhere else (an alias's own scope), otherwise the
+/// project must contain exactly one matching owner. Equal-best candidates
+/// remain unresolved.
 fn unique_cpp_type_owner(
     mut candidates: Vec<Arc<Node>>,
+    lexical_scope: Option<&str>,
     reference: &RefView,
     context: &dyn ResolutionContext,
 ) -> Option<Arc<Node>> {
@@ -303,11 +306,16 @@ fn unique_cpp_type_owner(
     if candidates.len() == 1 {
         return candidates.pop();
     }
-    let from = context.get_node_by_id_shared(&reference.from_node_id)?;
-    let caller_scope = from
-        .qualified_name
-        .rsplit_once("::")
-        .map_or("", |(scope, _)| scope);
+    let from;
+    let caller_scope = match lexical_scope {
+        Some(scope) => scope,
+        None => {
+            from = context.get_node_by_id_shared(&reference.from_node_id)?;
+            from.qualified_name
+                .rsplit_once("::")
+                .map_or("", |(scope, _)| scope)
+        }
+    };
     let mut scoped = candidates
         .into_iter()
         .filter_map(|candidate| {
@@ -2247,6 +2255,35 @@ impl ReferenceResolver {
         }
         let (spelled_type, call_arity) =
             parse_cpp_constructor_reference_name(&reference.reference_name)?;
+        // A type named through an alias (`Table::Iterator iter(&table_);` under
+        // `typedef SkipList<…> Table;`) constructs the type the alias names,
+        // looked up from where the alias wrote it, never an outer class the
+        // alias hides (upstream #2399).
+        let mut lexical_scope = None;
+        let aliased_spelling;
+        let spelled_type = if spelled_type.starts_with("::") {
+            spelled_type
+        } else {
+            match crate::cpp_type_aliases::resolve_cpp_aliased_type(
+                spelled_type,
+                reference,
+                context,
+            ) {
+                crate::cpp_type_aliases::CppAliased::NotAnAlias => spelled_type,
+                crate::cpp_type_aliases::CppAliased::Unreadable => return None,
+                crate::cpp_type_aliases::CppAliased::Followed(aliased) => {
+                    aliased_spelling = aliased
+                        .target
+                        .iter()
+                        .chain(&aliased.rest)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join("::");
+                    lexical_scope = Some(aliased.scope);
+                    aliased_spelling.as_str()
+                }
+            }
+        };
         let base_name = spelled_type
             .rsplit("::")
             .find(|segment| !segment.is_empty())?;
@@ -2263,7 +2300,7 @@ impl ReferenceResolver {
                     && cpp_type_spelling_matches(spelled_type, &candidate.qualified_name)
             })
             .collect::<Vec<_>>();
-        let owner = unique_cpp_type_owner(owners, reference, context)?;
+        let owner = unique_cpp_type_owner(owners, lexical_scope.as_deref(), reference, context)?;
         let constructor_name = format!("{}::{base_name}", owner.qualified_name);
         let constructors = context
             .get_nodes_by_name_shared(base_name)

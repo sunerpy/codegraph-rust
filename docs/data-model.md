@@ -181,6 +181,14 @@ reconciles every JavaScript-family file before writing it. These rows are no
 canonical surface; the sync matrix checks that a sync leaves them as a fresh
 index writes them.
 
+`cpp_type_surface_version` (1) records that no sync left a C or C++ reference
+unrefreshed whose resolution reads another file's text (a same-stem header's
+declarations, the aliases and class heads an alias lookup walks). A full index
+and a migration write it with the module-surface marker; a sync withdraws it
+before its first mutation and writes it back last, after resolution is
+persisted, and a sync that finds it missing re-resolves every C and C++ file
+before writing it. It is no canonical surface either.
+
 ## FTS5
 
 `nodes_fts` is an external-content FTS5 table over `nodes`:

@@ -1844,6 +1844,316 @@ pub fn cpp_broken_tree_class_body_edit() -> Case {
         .edge_after("function run", "calls", "method rocksdb::clock_cache::AutoTable::Erase")
 }
 
+/// Upstream #2399: an alias retargeted in a header (`typedef SkipList<…>
+/// Table;` becoming `typedef OtherList<…> Table;`) moves an unchanged
+/// caller's `table_.Insert(buf)` to the type the alias now names, as on a
+/// fresh index, though the alias node keeps its identity: a name the unchanged
+/// file uses now means another definition.
+pub fn cpp_alias_retarget_moves_an_unchanged_receiver() -> Case {
+    Case::new(Change::ReexportEdit, &[Language::Cpp])
+        .file(
+            "db/lists.h",
+            "namespace leveldb {\ntemplate <typename Key>\nclass SkipList {\n public:\n  void Insert(const Key& key) {}\n};\ntemplate <typename Key>\nclass OtherList {\n public:\n  void Insert(const Key& key) {}\n};\n}  // namespace leveldb\n",
+        )
+        .file(
+            "db/memtable.h",
+            "#include \"db/lists.h\"\nnamespace leveldb {\nclass MemTable {\n public:\n  void Add(const char* buf);\n private:\n  typedef SkipList<const char*> Table;\n  Table table_;\n};\n}  // namespace leveldb\n",
+        )
+        .file(
+            "db/memtable.cc",
+            "#include \"db/memtable.h\"\nnamespace leveldb {\nvoid MemTable::Add(const char* buf) {\n  table_.Insert(buf);\n}\n}  // namespace leveldb\n",
+        )
+        .write(
+            "db/memtable.h",
+            "#include \"db/lists.h\"\nnamespace leveldb {\nclass MemTable {\n public:\n  void Add(const char* buf);\n private:\n  typedef OtherList<const char*> Table;\n  Table table_;\n};\n}  // namespace leveldb\n",
+        )
+        .edge_before(
+            "method leveldb::MemTable::Add @db/memtable.cc",
+            "calls",
+            "method leveldb::SkipList::Insert",
+        )
+        .edge_after(
+            "method leveldb::MemTable::Add @db/memtable.cc",
+            "calls",
+            "method leveldb::OtherList::Insert",
+        )
+        .no_edge_after(
+            "method leveldb::MemTable::Add @db/memtable.cc",
+            "calls",
+            "method leveldb::SkipList::Insert",
+        )
+}
+
+/// Upstream #2399: an alias template retargeted in a header
+/// (`template <typename K> using Table = SkipList<K>;` naming `OtherList<K>`)
+/// moves the call of an unchanged file that writes `Table<const char*>`,
+/// though the file is no source of that header.
+pub fn cpp_template_alias_retarget_moves_an_unchanged_receiver() -> Case {
+    Case::new(Change::ReexportEdit, &[Language::Cpp])
+        .file(
+            "db/lists.hpp",
+            "namespace leveldb {\ntemplate <typename Key>\nclass SkipList {\n public:\n  void Insert(const Key& key) {}\n};\ntemplate <typename Key>\nclass OtherList {\n public:\n  void Insert(const Key& key) {}\n};\n}  // namespace leveldb\n",
+        )
+        .file(
+            "db/aliases.hpp",
+            "#include \"db/lists.hpp\"\nnamespace leveldb {\ntemplate <typename K>\nusing Table = SkipList<K>;\n}  // namespace leveldb\n",
+        )
+        .file(
+            "db/use.cc",
+            "#include \"db/aliases.hpp\"\nnamespace leveldb {\nvoid Fill() {\n  Table<const char*> table;\n  table.Insert(\"k\");\n}\n}  // namespace leveldb\n",
+        )
+        .write(
+            "db/aliases.hpp",
+            "#include \"db/lists.hpp\"\nnamespace leveldb {\ntemplate <typename K>\nusing Table = OtherList<K>;\n}  // namespace leveldb\n",
+        )
+        .edge_before("function leveldb::Fill", "calls", "method leveldb::SkipList::Insert")
+        .edge_after("function leveldb::Fill", "calls", "method leveldb::OtherList::Insert")
+        .no_edge_after("function leveldb::Fill", "calls", "method leveldb::SkipList::Insert")
+}
+
+/// Upstream #2399: an alias reached through another alias
+/// (`using Lookup = Table;`) moves an unchanged caller that writes only
+/// `Lookup` when `Table` is retargeted, with the header declaring `Lookup`
+/// rewritten in the same batch.
+pub fn cpp_alias_chain_retarget_moves_an_unchanged_receiver() -> Case {
+    Case::new(Change::ReexportEdit, &[Language::Cpp])
+        .file(
+            "db/lists.hpp",
+            "namespace leveldb {\nclass SkipList {\n public:\n  void Insert(int key) {}\n};\nclass OtherList {\n public:\n  void Insert(int key) {}\n};\n}  // namespace leveldb\n",
+        )
+        .file(
+            "db/table.hpp",
+            "#include \"db/lists.hpp\"\nnamespace leveldb {\nusing Table = SkipList;\n}  // namespace leveldb\n",
+        )
+        .file(
+            "db/lookup.hpp",
+            "#include \"db/table.hpp\"\nnamespace leveldb {\nusing Lookup = Table;\n}  // namespace leveldb\n",
+        )
+        .file(
+            "db/fill.cc",
+            "#include \"db/lookup.hpp\"\nnamespace leveldb {\nvoid Fill() {\n  Lookup lookup;\n  lookup.Insert(1);\n}\n}  // namespace leveldb\n",
+        )
+        .write(
+            "db/lookup.hpp",
+            "#include \"db/table.hpp\"\nnamespace leveldb {\n// The skip list's lookup.\nusing Lookup = Table;\n}  // namespace leveldb\n",
+        )
+        .write(
+            "db/table.hpp",
+            "#include \"db/lists.hpp\"\nnamespace leveldb {\nusing Table = OtherList;\n}  // namespace leveldb\n",
+        )
+        .edge_before("function leveldb::Fill", "calls", "method leveldb::SkipList::Insert")
+        .edge_after("function leveldb::Fill", "calls", "method leveldb::OtherList::Insert")
+        .no_edge_after("function leveldb::Fill", "calls", "method leveldb::SkipList::Insert")
+}
+
+/// A member's type changed in a header (`SkipList table_;` becoming
+/// `OtherList table_;`, no alias) moves the call of the header's unchanged
+/// source, which receiver inference reads it from (v0.54.0 already diverged
+/// here; owner 2026-10-12: fixed with W4-CPP-04).
+pub fn cpp_header_member_type_moves_an_unchanged_receiver() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Cpp])
+        .file(
+            "db/lists.hpp",
+            "namespace leveldb {\nclass SkipList {\n public:\n  void Insert(int key) {}\n};\nclass OtherList {\n public:\n  void Insert(int key) {}\n};\n}  // namespace leveldb\n",
+        )
+        .file(
+            "db/memtable.h",
+            "#include \"db/lists.hpp\"\nnamespace leveldb {\nclass MemTable {\n public:\n  void Add(int buf);\n private:\n  SkipList table_;\n};\n}  // namespace leveldb\n",
+        )
+        .file(
+            "db/memtable.cc",
+            "#include \"db/memtable.h\"\nnamespace leveldb {\nvoid MemTable::Add(int buf) {\n  table_.Insert(buf);\n}\n}  // namespace leveldb\n",
+        )
+        .write(
+            "db/memtable.h",
+            "#include \"db/lists.hpp\"\nnamespace leveldb {\nclass MemTable {\n public:\n  void Add(int buf);\n private:\n  OtherList table_;\n};\n}  // namespace leveldb\n",
+        )
+        .edge_before(
+            "method leveldb::MemTable::Add @db/memtable.cc",
+            "calls",
+            "method leveldb::SkipList::Insert",
+        )
+        .edge_after(
+            "method leveldb::MemTable::Add @db/memtable.cc",
+            "calls",
+            "method leveldb::OtherList::Insert",
+        )
+        .no_edge_after(
+            "method leveldb::MemTable::Add @db/memtable.cc",
+            "calls",
+            "method leveldb::SkipList::Insert",
+        )
+}
+
+/// Upstream #2399: a class added in an inner scope hides an outer alias of
+/// its name. `Holder::Use`, out of line in a file no header names as its
+/// source, writes `Widget`; once `Holder` declares its own `Widget` (without
+/// `Spin`), the call no longer reaches `Gadget::Spin` through the alias.
+pub fn cpp_inner_class_added_hides_an_outer_alias() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Cpp])
+        .file(
+            "app/gadget.hpp",
+            "namespace app {\nclass Gadget {\n public:\n  void Spin() {}\n};\nusing Widget = Gadget;\n}  // namespace app\n",
+        )
+        .file(
+            "app/holder.hpp",
+            "#include \"app/gadget.hpp\"\nnamespace app {\nclass Holder {\n public:\n  void Use();\n};\n}  // namespace app\n",
+        )
+        .file(
+            "app/use.cc",
+            "#include \"app/holder.hpp\"\nnamespace app {\nvoid Holder::Use() {\n  Widget w;\n  w.Spin();\n}\n}  // namespace app\n",
+        )
+        .write(
+            "app/holder.hpp",
+            "#include \"app/gadget.hpp\"\nnamespace app {\nclass Holder {\n public:\n  class Widget {\n   public:\n    void Turn() {}\n  };\n  void Use();\n};\n}  // namespace app\n",
+        )
+        .edge_before("method app::Holder::Use", "calls", "method app::Gadget::Spin")
+        .no_edge_after("method app::Holder::Use", "calls", "method app::Gadget::Spin")
+}
+
+/// Upstream #2399: a header the caller does not include declaring the same
+/// alias for another type makes it ambiguous, so the caller no longer follows
+/// it, as on a fresh index.
+pub fn cpp_alias_in_an_unincluded_header_makes_it_ambiguous() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Cpp])
+        .file(
+            "store/kinds.hpp",
+            "namespace app {\nclass MemStore {\n public:\n  void Save() {}\n};\nclass DiskStore {\n public:\n  void Save() {}\n};\n}  // namespace app\n",
+        )
+        .file(
+            "config/fast.hpp",
+            "#include \"store/kinds.hpp\"\nnamespace app {\nusing Store = MemStore;\n}  // namespace app\n",
+        )
+        .file(
+            "src/use.cc",
+            "#include \"config/fast.hpp\"\nnamespace app {\nvoid Run() {\n  Store store;\n  store.Save();\n}\n}  // namespace app\n",
+        )
+        .write(
+            "config/safe.hpp",
+            "#include \"store/kinds.hpp\"\nnamespace app {\nusing Store = DiskStore;\n}  // namespace app\n",
+        )
+        .edge_before("function app::Run", "calls", "method app::MemStore::Save")
+        .no_edge_after("function app::Run", "calls", "method app::MemStore::Save")
+}
+
+/// Upstream #2399: an alias a class inherits follows its base clause. Once
+/// `ParseDescriptor` derives from `Proto3Descriptor` instead, its out-of-line
+/// `NewMsg(Field f)` reaches the other base's `Field`.
+pub fn cpp_base_change_moves_an_inherited_alias() -> Case {
+    Case::new(Change::EditHeritage, &[Language::Cpp])
+        .file("proto/descriptor.hpp", "namespace proto {\nclass FieldDescriptor {\n public:\n  bool is_repeated() const { return false; }\n};\nclass OneofDescriptor {\n public:\n  bool is_repeated() const { return false; }\n};\n}  // namespace proto\n")
+        .file(
+            "proto/traits.hpp",
+            "#include \"proto/descriptor.hpp\"\nnamespace proto {\nstruct Proto2Descriptor {\n  using Field = const FieldDescriptor*;\n};\nstruct Proto3Descriptor {\n  using Field = const OneofDescriptor*;\n};\nstruct ParseDescriptor : Proto2Descriptor {\n  static bool NewMsg(Field f);\n};\n}  // namespace proto\n",
+        )
+        .file(
+            "proto/parse.cc",
+            "#include \"proto/traits.hpp\"\nnamespace proto {\nbool ParseDescriptor::NewMsg(Field f) { return f->is_repeated(); }\n}  // namespace proto\n",
+        )
+        .write(
+            "proto/traits.hpp",
+            "#include \"proto/descriptor.hpp\"\nnamespace proto {\nstruct Proto2Descriptor {\n  using Field = const FieldDescriptor*;\n};\nstruct Proto3Descriptor {\n  using Field = const OneofDescriptor*;\n};\nstruct ParseDescriptor : Proto3Descriptor {\n  static bool NewMsg(Field f);\n};\n}  // namespace proto\n",
+        )
+        .edge_before(
+            "method proto::ParseDescriptor::NewMsg @proto/parse.cc",
+            "calls",
+            "method proto::FieldDescriptor::is_repeated",
+        )
+        .edge_after(
+            "method proto::ParseDescriptor::NewMsg @proto/parse.cc",
+            "calls",
+            "method proto::OneofDescriptor::is_repeated",
+        )
+        .no_edge_after(
+            "method proto::ParseDescriptor::NewMsg @proto/parse.cc",
+            "calls",
+            "method proto::FieldDescriptor::is_repeated",
+        )
+}
+
+/// Upstream #2399: a base two derivations up changing its own base moves the
+/// inherited alias of `StrictParser::NewMsg`, whose out-of-line definition
+/// names only `StrictParser`, in a file that is no header's source.
+pub fn cpp_base_change_reaches_an_out_of_line_method_of_a_derived_class() -> Case {
+    Case::new(Change::EditHeritage, &[Language::Cpp])
+        .file("proto/descriptor.hpp", "namespace proto {\nclass FieldDescriptor {\n public:\n  bool is_repeated() const { return false; }\n};\nclass OneofDescriptor {\n public:\n  bool is_repeated() const { return false; }\n};\n}  // namespace proto\n")
+        .file(
+            "proto/traits.hpp",
+            "#include \"proto/descriptor.hpp\"\nnamespace proto {\nstruct Proto2Descriptor {\n  using Field = const FieldDescriptor*;\n};\nstruct Proto3Descriptor {\n  using Field = const OneofDescriptor*;\n};\nstruct BaseParser : Proto2Descriptor {};\n}  // namespace proto\n",
+        )
+        .file(
+            "proto/parsers.hpp",
+            "#include \"proto/traits.hpp\"\nnamespace proto {\nstruct Parser : BaseParser {};\nstruct StrictParser : Parser {\n  static bool NewMsg(Field f);\n};\n}  // namespace proto\n",
+        )
+        .file(
+            "proto/impl.cc",
+            "#include \"proto/parsers.hpp\"\nnamespace proto {\nbool StrictParser::NewMsg(Field f) { return f->is_repeated(); }\n}  // namespace proto\n",
+        )
+        .write(
+            "proto/traits.hpp",
+            "#include \"proto/descriptor.hpp\"\nnamespace proto {\nstruct Proto2Descriptor {\n  using Field = const FieldDescriptor*;\n};\nstruct Proto3Descriptor {\n  using Field = const OneofDescriptor*;\n};\nstruct BaseParser : Proto3Descriptor {};\n}  // namespace proto\n",
+        )
+        .edge_before(
+            "method proto::StrictParser::NewMsg @proto/impl.cc",
+            "calls",
+            "method proto::FieldDescriptor::is_repeated",
+        )
+        .edge_after(
+            "method proto::StrictParser::NewMsg @proto/impl.cc",
+            "calls",
+            "method proto::OneofDescriptor::is_repeated",
+        )
+        .no_edge_after(
+            "method proto::StrictParser::NewMsg @proto/impl.cc",
+            "calls",
+            "method proto::FieldDescriptor::is_repeated",
+        )
+}
+
+/// Upstream #2399, one batch: `base.hpp` is rewritten first (its nodes go,
+/// and with them `Derived`'s `extends` edge), then `derived.hpp` drops `:
+/// Proto2Descriptor`; the old surface of `derived.hpp` still shows the base,
+/// so `Derived::NewMsg` moves to the namespace's `Field`.
+pub fn cpp_batch_rewrites_a_base_before_dropping_a_derivation() -> Case {
+    Case::new(Change::EditHeritage, &[Language::Cpp])
+        .file("proto/descriptor.hpp", "namespace proto {\nclass FieldDescriptor {\n public:\n  bool is_repeated() const { return false; }\n};\nclass OneofDescriptor {\n public:\n  bool is_repeated() const { return false; }\n};\n}  // namespace proto\n")
+        .file(
+            "proto/base.hpp",
+            "#include \"proto/descriptor.hpp\"\nnamespace proto {\nstruct Proto2Descriptor {\n  using Field = const FieldDescriptor*;\n};\n}  // namespace proto\n",
+        )
+        .file(
+            "proto/derived.hpp",
+            "#include \"proto/base.hpp\"\nnamespace proto {\nusing Field = const OneofDescriptor*;\nstruct Derived : Proto2Descriptor {\n  static bool NewMsg(Field f);\n};\n}  // namespace proto\n",
+        )
+        .file(
+            "proto/use.cc",
+            "#include \"proto/derived.hpp\"\nnamespace proto {\nbool Derived::NewMsg(Field f) { return f->is_repeated(); }\n}  // namespace proto\n",
+        )
+        .write(
+            "proto/base.hpp",
+            "#include \"proto/descriptor.hpp\"\nnamespace proto {\n// Proto2's descriptor traits.\nstruct Proto2Descriptor {\n  using Field = const FieldDescriptor*;\n};\n}  // namespace proto\n",
+        )
+        .write(
+            "proto/derived.hpp",
+            "#include \"proto/base.hpp\"\nnamespace proto {\nusing Field = const OneofDescriptor*;\nstruct Derived {\n  static bool NewMsg(Field f);\n};\n}  // namespace proto\n",
+        )
+        .edge_before(
+            "method proto::Derived::NewMsg @proto/use.cc",
+            "calls",
+            "method proto::FieldDescriptor::is_repeated",
+        )
+        .edge_after(
+            "method proto::Derived::NewMsg @proto/use.cc",
+            "calls",
+            "method proto::OneofDescriptor::is_repeated",
+        )
+        .no_edge_after(
+            "method proto::Derived::NewMsg @proto/use.cc",
+            "calls",
+            "method proto::FieldDescriptor::is_repeated",
+        )
+}
+
 /// Upstream #2446: a base class defined in a variable declaration (`class
 /// Base { … } base_instance;`) is a node, so a heritage edit in another file
 /// moves the `extends` edge from one such class to another, as on a fresh

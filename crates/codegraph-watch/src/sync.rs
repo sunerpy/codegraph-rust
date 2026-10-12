@@ -554,6 +554,9 @@ fn sync_paths_with_store(
     // existed, or a sync failed after its first mutation: this sync
     // reconciles every JavaScript-family file, even with nothing changed.
     let surface_bootstrap = crate::module_surfaces::needs_bootstrap(store)?;
+    // The same for the C/C++ dependents of changed type declarations: every
+    // C/C++ file is re-resolved once (W4-CPP-04).
+    let cpp_bootstrap = crate::cpp_dependents::needs_bootstrap(store)?;
 
     let paths = paths.into_iter().collect::<Vec<_>>();
     let total = paths.len();
@@ -600,7 +603,7 @@ fn sync_paths_with_store(
         on_progress(done + 1, total);
     }
 
-    if changed || surface_bootstrap {
+    if changed || surface_bootstrap || cpp_bootstrap {
         note_python_global_readers(
             project_root,
             store,
@@ -635,6 +638,19 @@ fn sync_paths_with_store(
             dependent_fallbacks.insert(file.clone());
         }
         changed_names.note_all(surfaces.names.iter().cloned());
+        // What C/C++ resolution in an unchanged file read from a changed
+        // file's text: its same-stem header, or the aliases and class heads
+        // an alias lookup walks (W4-CPP-04).
+        for file in changed_names.cpp.dependent_files(
+            store,
+            project_root,
+            scope.options.max_file_size,
+            &reindexed,
+            cpp_bootstrap,
+        )? {
+            dependent_sites.remove(&file);
+            dependent_fallbacks.insert(file);
+        }
         // What a changed Python import statement re-exports moves for its
         // module's importers without any node of those names changing.
         if !changed_names.python_imports.is_empty() {
@@ -720,6 +736,7 @@ fn sync_paths_with_store(
         // Last: the surface rows, then the marker the first mutation withdrew.
         surfaces.write_rows(store)?;
         crate::module_surfaces::finish_bootstrap(store)?;
+        crate::cpp_dependents::write_marker(store)?;
     }
 
     // Orphan sweep (#1187, upstream index.ts:645-682): a full-index resolution
@@ -975,6 +992,9 @@ fn sync_one(
     };
     let content_hash = hash_content(&hash_input);
     let added = stored.is_none();
+    let c_family_before = stored
+        .as_ref()
+        .is_some_and(|file| crate::cpp_dependents::is_c_family(file.language));
     // Authoritative content gate, port of the upstream hash gate in
     // `upstream extraction/index.ts:1326-1337,1465-1483`.
     if stored.is_some_and(|file| file.content_hash == content_hash) {
@@ -988,6 +1008,13 @@ fn sync_one(
         importers.insert(dependent.file_path.clone());
         merge_dependent_site(dependent_sites, dependent_fallbacks, dependent);
     }
+    let c_family_after = crate::cpp_dependents::is_c_family(detect_language_of(
+        relative,
+        &source,
+        &scope.options.extensions,
+    ));
+    let c_family = c_family_after || c_family_before;
+    changed_names.cpp.before_change(store, relative, c_family)?;
     reextract_into_store(
         store,
         relative,
@@ -995,6 +1022,9 @@ fn sync_one(
         changed_names,
         (&metadata, &source, content_hash),
     )?;
+    changed_names
+        .cpp
+        .after_change(store, relative, c_family, c_family_after)?;
     if let Some(change) = changed_names.js_surfaces.get_mut(relative) {
         change.importers.extend(importers.iter().cloned());
         change.added = added;
@@ -1029,6 +1059,8 @@ fn remove_tracked_file(
         importers.insert(dependent.file_path.clone());
         merge_dependent_site(dependent_sites, dependent_fallbacks, dependent);
     }
+    let c_family = crate::cpp_dependents::is_c_family(stored.language);
+    changed_names.cpp.before_change(store, relative, c_family)?;
     changed_names.note_removed(node_names_in_file(store, relative)?);
     let old_nodes = store.nodes_by_file_path(relative)?;
     changed_names.removed_files.insert(relative.to_string());
@@ -1064,6 +1096,9 @@ fn remove_tracked_file(
     }
     delete_unresolved_refs_by_file(store, relative)?;
     store.delete_file_record(relative)?;
+    changed_names
+        .cpp
+        .after_change(store, relative, c_family, false)?;
     outcome.files_removed += 1;
     Ok(true)
 }
@@ -1530,6 +1565,9 @@ struct ChangedNames {
     /// Whether this sync already withdrew the surface version marker, as it
     /// does before its first mutation and restores once everything persisted.
     surface_dirty: bool,
+    /// What the changed C/C++ files held that resolution in other files reads
+    /// (W4-CPP-04).
+    cpp: crate::cpp_dependents::CppChanges,
 }
 
 /// What a changed Python file held before the change. A module global's
@@ -1563,6 +1601,7 @@ impl ChangedNames {
     fn begin_mutation(&mut self, store: &Store) -> Result<()> {
         if !self.surface_dirty {
             store.delete_project_metadata(codegraph_resolve::module_surface::VERSION_KEY)?;
+            crate::cpp_dependents::withdraw_marker(store)?;
             self.surface_dirty = true;
         }
         Ok(())
@@ -1860,6 +1899,151 @@ pub(crate) mod tests {
         assert_eq!(
             edge_projection(&db),
             fresh_edges("surface-fail-fresh-a", &[A, B, TO_A, USE, OTHER_EDITED])
+        );
+    }
+
+    fn cpp_marker(db: &Path) -> Option<String> {
+        Store::open(db)
+            .unwrap()
+            .get_project_metadata(crate::cpp_dependents::VERSION_KEY)
+            .unwrap()
+    }
+
+    const CPP_LISTS: (&str, &str) = (
+        "db/lists.hpp",
+        "namespace leveldb {\nclass SkipList {\n public:\n  void Insert(int key) {}\n};\nclass OtherList {\n public:\n  void Insert(int key) {}\n};\n}  // namespace leveldb\n",
+    );
+    const CPP_LISTS_BODY_EDIT: (&str, &str) = (
+        "db/lists.hpp",
+        "namespace leveldb {\nclass SkipList {\n public:\n  void Insert(int key) { (void)key; }\n};\nclass OtherList {\n public:\n  void Insert(int key) {}\n};\n}  // namespace leveldb\n",
+    );
+    const CPP_TO_SKIP: (&str, &str) = (
+        "db/aliases.hpp",
+        "#include \"db/lists.hpp\"\nnamespace leveldb {\nusing Table = SkipList;\n}  // namespace leveldb\n",
+    );
+    const CPP_TO_OTHER: (&str, &str) = (
+        "db/aliases.hpp",
+        "#include \"db/lists.hpp\"\nnamespace leveldb {\nusing Table = OtherList;\n}  // namespace leveldb\n",
+    );
+    const CPP_USE: (&str, &str) = (
+        "db/use.cc",
+        "#include \"db/aliases.hpp\"\nnamespace leveldb {\nvoid Fill() {\n  Table table;\n  table.Insert(1);\n}\n}  // namespace leveldb\n",
+    );
+    const CPP_OTHER: (&str, &str) = ("db/other.cc", "int other() { return 1; }\n");
+    const CPP_OTHER_EDITED: (&str, &str) = ("db/other.cc", "int other() { return 2; }\n");
+
+    /// W4-CPP-04: a sync failing after its mutations leaves the C/C++ marker
+    /// away, so the next sync, with nothing changed or with an unrelated
+    /// change, re-resolves every C/C++ file and restores it: `use.cc`, which
+    /// the retargeted alias moves, ends where a fresh index puts it.
+    #[test]
+    fn a_cpp_sync_failing_after_its_mutations_leaves_the_next_one_to_reconcile() {
+        let version = Some(crate::cpp_dependents::VERSION.to_string());
+        let dir = TestDir::new("cpp-surface-fail");
+        let db = default_db_path(dir.path()).unwrap();
+        let initial = [CPP_LISTS, CPP_TO_SKIP, CPP_USE, CPP_OTHER];
+        write_files(dir.path(), &initial);
+        sync_changed_paths(dir.path(), &db, initial.iter().map(|(path, _)| *path)).unwrap();
+        assert_eq!(cpp_marker(&db), version);
+
+        let fail_once = |paths: &[&str]| {
+            FAIL_BEFORE_RESOLUTION.with(|fail| fail.set(true));
+            let failed = sync_changed_paths(dir.path(), &db, paths.iter().copied());
+            FAIL_BEFORE_RESOLUTION.with(|fail| fail.set(false));
+            assert!(failed.is_err(), "the injected failure must stop the sync");
+            assert_eq!(
+                cpp_marker(&db),
+                None,
+                "a failed sync leaves the marker away"
+            );
+        };
+
+        write_files(dir.path(), &[CPP_TO_OTHER]);
+        fail_once(&["db/aliases.hpp"]);
+        sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
+        assert_eq!(cpp_marker(&db), version);
+        assert_eq!(
+            edge_projection(&db),
+            fresh_edges(
+                "cpp-surface-fail-fresh-other",
+                &[CPP_LISTS, CPP_TO_OTHER, CPP_USE, CPP_OTHER]
+            )
+        );
+
+        write_files(dir.path(), &[CPP_TO_SKIP]);
+        fail_once(&["db/aliases.hpp"]);
+        write_files(dir.path(), &[CPP_OTHER_EDITED]);
+        sync_changed_paths(dir.path(), &db, ["db/other.cc"]).unwrap();
+        assert_eq!(cpp_marker(&db), version);
+        assert_eq!(
+            edge_projection(&db),
+            fresh_edges(
+                "cpp-surface-fail-fresh-skip",
+                &[CPP_LISTS, CPP_TO_SKIP, CPP_USE, CPP_OTHER_EDITED]
+            )
+        );
+    }
+
+    /// W4-CPP-04: an index without the C/C++ marker (built before it, or
+    /// left by a failed sync) has every C/C++ file re-resolved by its next
+    /// sync: a stale call edge from an unchanged file is corrected.
+    #[test]
+    fn an_index_without_the_cpp_marker_re_resolves_every_cpp_file() {
+        let version = Some(crate::cpp_dependents::VERSION.to_string());
+        let dir = TestDir::new("cpp-surface-bootstrap");
+        let db = default_db_path(dir.path()).unwrap();
+        let initial = [CPP_LISTS, CPP_TO_SKIP, CPP_USE, CPP_OTHER];
+        write_files(dir.path(), &initial);
+        sync_changed_paths(dir.path(), &db, initial.iter().map(|(path, _)| *path)).unwrap();
+        let expected = edge_projection(&db);
+        {
+            let store = Store::open(&db).unwrap();
+            let moved = store
+                .connection()
+                .execute(
+                    "UPDATE edges SET target = (SELECT id FROM nodes WHERE qualified_name = \
+                     'leveldb::OtherList::Insert') WHERE kind = 'calls' AND target = (SELECT id \
+                     FROM nodes WHERE qualified_name = 'leveldb::SkipList::Insert')",
+                    [],
+                )
+                .unwrap();
+            assert_eq!(moved, 1, "the call edge to make stale");
+            store
+                .delete_project_metadata(crate::cpp_dependents::VERSION_KEY)
+                .unwrap();
+        }
+        assert_ne!(edge_projection(&db), expected);
+        write_files(dir.path(), &[CPP_OTHER_EDITED]);
+        sync_changed_paths(dir.path(), &db, ["db/other.cc"]).unwrap();
+        assert_eq!(cpp_marker(&db), version);
+        assert_eq!(edge_projection(&db), expected);
+    }
+
+    /// W4-CPP-04: a header edit that leaves its type surface alone (a
+    /// method's body) touches no name, so no file's text is read; an alias
+    /// retargeted touches its name.
+    #[test]
+    fn only_a_changed_type_surface_touches_names() {
+        let last = || crate::cpp_dependents::tests::LAST_NAMES.with(|last| last.borrow().clone());
+        let dir = TestDir::new("cpp-surface-names");
+        let db = default_db_path(dir.path()).unwrap();
+        let initial = [CPP_LISTS, CPP_TO_SKIP, CPP_USE];
+        write_files(dir.path(), &initial);
+        sync_changed_paths(dir.path(), &db, initial.iter().map(|(path, _)| *path)).unwrap();
+
+        write_files(dir.path(), &[CPP_LISTS_BODY_EDIT]);
+        sync_changed_paths(dir.path(), &db, ["db/lists.hpp"]).unwrap();
+        assert_eq!(last(), Some(Vec::new()));
+
+        write_files(dir.path(), &[CPP_TO_OTHER]);
+        sync_changed_paths(dir.path(), &db, ["db/aliases.hpp"]).unwrap();
+        assert_eq!(last(), Some(vec!["Table".to_string()]));
+        assert_eq!(
+            edge_projection(&db),
+            fresh_edges(
+                "cpp-surface-names-fresh",
+                &[CPP_LISTS_BODY_EDIT, CPP_TO_OTHER, CPP_USE]
+            )
         );
     }
 

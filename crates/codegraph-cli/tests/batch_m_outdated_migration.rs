@@ -439,6 +439,23 @@ fn incremental_sync_on_outdated_v2_forces_all_files() {
         surface_rows(&IndexPaths::resolve(&peer, None).expect("resolve peer v2 paths")),
         "a forced migration must write the module-surface rows of `index --force`"
     );
+    // The C/C++ dependents marker (W4-CPP-04), likewise.
+    let cpp_marker = |paths: &IndexPaths| {
+        Store::open_for_read(paths, deadline(), || false)
+            .expect("readable namespace")
+            .project_metadata_with_prefix("cpp_type_surface")
+            .expect("C/C++ dependents marker")
+    };
+    assert_eq!(
+        cpp_marker(&paths),
+        vec![("cpp_type_surface_version".to_string(), "1".to_string())],
+        "a migration writes the C/C++ dependents marker"
+    );
+    assert_eq!(
+        cpp_marker(&paths),
+        cpp_marker(&IndexPaths::resolve(&peer, None).expect("resolve peer v2 paths")),
+        "a forced migration must write the C/C++ marker of `index --force`"
+    );
 }
 
 /// Migration is a from-source rebuild, so a tracked file that no longer exists

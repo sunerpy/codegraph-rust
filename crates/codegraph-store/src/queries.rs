@@ -865,6 +865,15 @@ impl Store {
         rows.collect()
     }
 
+    /// Every unresolved reference of `kind`, in row order.
+    pub fn unresolved_refs_of_kind(&self, kind: EdgeKind) -> rusqlite::Result<Vec<UnresolvedRef>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT * FROM unresolved_refs WHERE reference_kind = ? ORDER BY id")?;
+        let rows = stmt.query_map([kind.as_str()], row_to_unresolved_ref)?;
+        rows.collect()
+    }
+
     /// Read one rowid-ordered batch of unresolved references with `id > after_id`.
     ///
     /// `id` is the rowid alias (`INTEGER PRIMARY KEY AUTOINCREMENT`), so
@@ -2857,6 +2866,29 @@ mod tests {
         assert_eq!(store.all_unresolved_refs().unwrap().len(), 1);
         let by_file = store.unresolved_refs_by_file_path("src/u.rs").unwrap();
         assert_eq!(by_file[0].reference_name, unresolved.reference_name);
+        let extends = UnresolvedRef {
+            reference_name: "Base".to_string(),
+            reference_kind: EdgeKind::Extends,
+            ..unresolved.clone()
+        };
+        store
+            .insert_unresolved_refs(std::slice::from_ref(&extends))
+            .unwrap();
+        let of_kind = store.unresolved_refs_of_kind(EdgeKind::Extends).unwrap();
+        assert_eq!(
+            of_kind
+                .iter()
+                .map(|reference| reference.reference_name.as_str())
+                .collect::<Vec<_>>(),
+            ["Base"]
+        );
+        assert_eq!(
+            store
+                .unresolved_refs_of_kind(EdgeKind::References)
+                .unwrap()
+                .len(),
+            1
+        );
 
         assert_eq!(store.get_project_metadata("root").unwrap(), None);
         store.set_project_metadata("root", "/tmp/project").unwrap();

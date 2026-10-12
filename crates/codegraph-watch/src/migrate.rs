@@ -155,6 +155,7 @@ pub(crate) fn migrate_project(
         &surfaces,
     )?;
     drop(surfaces);
+    crate::cpp_dependents::write_marker(rebuild.store())?;
 
     // ALL nodes are persisted before ANY edge, because `insert_edges` drops edges
     // whose endpoints are absent. The WAL valve folds the log back during the

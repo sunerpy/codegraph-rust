@@ -343,12 +343,22 @@ fn run_case(name: &str, case: &Case) {
     // canonical surface, but the next sync reads them: a sync leaves them as a
     // fresh index writes them.
     let surface_rows = support::project_metadata_with_prefix(&fresh.db(), "js_module_surface");
+    // So is the C/C++ dependents marker (W4-CPP-04): every sync that
+    // succeeded leaves it as a fresh index writes it.
+    let cpp_marker = support::project_metadata_with_prefix(&fresh.db(), "cpp_type_surface");
     for (driver, project) in [("cli", &cli), ("watch", &watch)] {
         let rows = support::project_metadata_with_prefix(&project.db(), "js_module_surface");
         if rows != surface_rows {
             divergent.push(format!(
                 "=== {driver} driver: module-surface rows differ from a fresh index\n\
                  synced: {rows:#?}\nfresh: {surface_rows:#?}"
+            ));
+        }
+        let marker = support::project_metadata_with_prefix(&project.db(), "cpp_type_surface");
+        if marker != cpp_marker {
+            divergent.push(format!(
+                "=== {driver} driver: the C/C++ dependents marker differs from a fresh index\n\
+                 synced: {marker:#?}\nfresh: {cpp_marker:#?}"
             ));
         }
     }
@@ -666,6 +676,15 @@ matrix! {
     cpp_attribute_macro_class_body_edit,
     cpp_broken_tree_class_body_edit,
     cpp_declared_base_class_heritage_edit,
+    cpp_alias_retarget_moves_an_unchanged_receiver,
+    cpp_template_alias_retarget_moves_an_unchanged_receiver,
+    cpp_alias_chain_retarget_moves_an_unchanged_receiver,
+    cpp_header_member_type_moves_an_unchanged_receiver,
+    cpp_inner_class_added_hides_an_outer_alias,
+    cpp_alias_in_an_unincluded_header_makes_it_ambiguous,
+    cpp_base_change_moves_an_inherited_alias,
+    cpp_base_change_reaches_an_out_of_line_method_of_a_derived_class,
+    cpp_batch_rewrites_a_base_before_dropping_a_derivation,
     typescript_dollar_import_reaches_an_added_module,
     typescript_dollar_default_export_names_another_declaration,
     java_super_call_in_an_override_body_edit,

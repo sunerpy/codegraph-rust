@@ -430,6 +430,9 @@ pub struct TreeSitterWalker<'a, 'tree> {
     cpp_brace_scopes: Option<crate::lang::cpp_brace_scopes::CppBraceScopes>,
     cpp_class_scopes: crate::lang::cpp_brace_scopes::NestedIntervals<String>,
     cpp_class_scope_ids: HashSet<String>,
+    /// The source as written, before the language's pre-parse rewrote it (the
+    /// rewrite keeps every byte offset); `source` when there was none.
+    raw_source: &'a str,
     /// C/C++: whether a class, struct, union or enum defined in the type of a
     /// declaration outside any body is walked (upstream #2446). Not in a C++
     /// file whose tree has errors and whose braces do not balance: error
@@ -482,7 +485,18 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             cpp_class_scopes: crate::lang::cpp_brace_scopes::NestedIntervals::default(),
             cpp_class_scope_ids: HashSet::new(),
             walk_declared_types: false,
+            raw_source: source,
         }
+    }
+
+    /// The source as written, when the pre-parse rewrote it in place; a text
+    /// of another length is ignored.
+    #[must_use]
+    pub fn with_raw_source(mut self, raw_source: &'a str) -> Self {
+        if raw_source.len() == self.source.len() {
+            self.raw_source = raw_source;
+        }
+        self
     }
 
     pub fn extract(mut self, duration_ms: i64) -> ExtractionResult {
@@ -3219,6 +3233,23 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
         }
     }
 
+    /// A C/C++ alias's declaration as written, its signature (KEEP-RUST, owner
+    /// 2026-10-12: upstream records no aliased type): the original source of
+    /// `node`, or of the `template_declaration` it is the body of, whitespace
+    /// collapsed and the trailing `;` dropped. Resolution reads an alias's
+    /// type from this same text (upstream #2399), so a sync sees every change
+    /// to it as a changed node.
+    fn c_family_alias_declaration(&self, node: SyntaxNode<'tree>) -> Option<String> {
+        let span = node
+            .parent()
+            .filter(|parent| parent.kind() == "template_declaration")
+            .unwrap_or(node);
+        let text = self.raw_source.get(span.start_byte()..span.end_byte())?;
+        let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        let declaration = collapsed.strip_suffix(';').unwrap_or(&collapsed).trim_end();
+        (!declaration.is_empty()).then(|| declaration.to_string())
+    }
+
     fn extract_type_alias(&mut self, node: SyntaxNode<'tree>) {
         let name = self.extract_name(node);
         if name == "<anonymous>" {
@@ -3228,6 +3259,10 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             .spec
             .resolve_type_alias_kind(node, self.source)
             .unwrap_or(NodeKind::TypeAlias);
+        let signature = (alias_kind == NodeKind::TypeAlias
+            && matches!(self.spec.language(), Language::C | Language::Cpp))
+        .then(|| self.c_family_alias_declaration(node))
+        .flatten();
         let type_alias_node = self.create_node(
             alias_kind,
             &name,
@@ -3235,6 +3270,7 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             NodeExtra {
                 docstring: self.docstring_for(node),
                 is_exported: self.spec.is_exported(node, self.source),
+                signature,
                 ..NodeExtra::default()
             },
         );
