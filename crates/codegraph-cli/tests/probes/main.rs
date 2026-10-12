@@ -2567,4 +2567,130 @@ mod js {
         assert_eq!(renders(&project, "Toolbar"), ["Icon app/icon.tsx:1"]);
         assert_eq!(renders(&project, "GenericTable"), Vec::<String>::new());
     }
+
+    /// Upstream #2140 (`a3d675ef`): a Vue Options API component's functions
+    /// (`methods`, `computed`, `watch` entries, `data`, lifecycle hooks) are
+    /// method nodes of the component, each owning the calls written in it;
+    /// the member-call and exact-name strategies reach such a method only as
+    /// `this.m()` in its own file, never through `e.preventDefault()` or
+    /// `this.editor.setValue()`. (`@click="handleLogin"` reaching the method
+    /// is upstream's vue-handler synthesizer, W7-18.)
+    #[test]
+    fn pr2140_options_api_functions_are_methods_of_their_component() {
+        let project = Project::new()
+            .file("package.json", "{\"name\":\"admin\",\"dependencies\":{\"vue\":\"^2.6.0\"}}")
+            .file("src/views/login/index.vue", "<template>\n  <form>\n    <button @click=\"handleLogin\">Sign in</button>\n  </form>\n</template>\n\n<script>\nexport default {\n  name: 'Login',\n  data() {\n    return { loading: false }\n  },\n  methods: {\n    handleLogin() {\n      if (this.validate()) {\n        this.loading = true\n      }\n    },\n    validate() {\n      return true\n    }\n  }\n}\n</script>\n")
+            .file("src/components/ImageCropper.vue", "<template><div /></template>\n<script>\nexport default {\n  methods: {\n    preventDefault(e) { return e },\n    setValue(v) { return v },\n    click() { return 1 }\n  }\n}\n</script>\n")
+            .file("src/components/Editor.vue", "<template><input ref=\"input\" /></template>\n<script>\nexport default {\n  methods: {\n    onKey(e) {\n      e.preventDefault()\n      this.editor.setValue(1)\n      this.cropper.preventDefault()\n    }\n  }\n}\n</script>\n")
+            .file("src/components/Tab.vue", "<template><b /></template>\n<script>\nexport default {\n  methods: {\n    focus() { return 1 }\n  }\n}\n</script>\n")
+            .file("src/components/Pane.vue", "<template><i /></template>\n<script>\nexport default {\n  methods: {\n    focus() { return 2 }\n  }\n}\n</script>\n")
+            .file("src/components/Panel.vue", "<template><input ref=\"input\" /></template>\n<script>\nexport default {\n  methods: {\n    open() {\n      this.$refs['input'].focus()\n    }\n  }\n}\n</script>\n")
+            .index();
+        let graph = project.graph();
+        let mut methods: Vec<&str> = graph
+            .nodes
+            .iter()
+            .filter(|node| node.file_path == "src/views/login/index.vue" && node.kind == "method")
+            .map(|node| node.name.as_str())
+            .collect();
+        methods.sort_unstable();
+        assert_eq!(
+            methods,
+            ["data", "handleLogin", "validate"],
+            "{}",
+            graph.report()
+        );
+        assert_eq!(the_node(graph, "index::handleLogin", None).kind, "method");
+        assert_eq!(callees_of(graph, "index::handleLogin"), ["index::validate"]);
+        assert_eq!(callees_of(graph, "Editor::onKey"), Vec::<String>::new());
+        // A template ref names a child this cannot tell apart: neither
+        // component's own `focus`.
+        assert_eq!(callees_of(graph, "Panel::open"), Vec::<String>::new());
+    }
+
+    /// Upstream #2357 (b) (`8998697f`, issue #2340): a call written in a Vue
+    /// template is the component's, at its own line: an interpolation, a
+    /// binding, a handler call; a bare call to the component's own Options
+    /// API method links to it, and the import decides which helper.
+    #[test]
+    fn pr2357_a_template_call_is_the_components() {
+        let project = Project::new()
+            .file("package.json", "{\"name\":\"nuxt-app\",\"dependencies\":{\"nuxt\":\"^4.0.0\"}}")
+            .file("composables/useBar.ts", "export function useBar(x: unknown) { return String(x); }\n")
+            .file("components/H.vue", "<template><div>{{ useBar(link) }}</div></template>\n")
+            .file("components/I.vue", "<template><NuxtLink :to=\"useBar(link.location)\">x</NuxtLink></template>\n")
+            .file("utils/format.ts", "export function formatPrice(n: number) { return `$${n}`; }\n")
+            .file("other/format.ts", "export function formatPrice(n: number) { return n; }\n")
+            .file("components/Setup.vue", "<template>\n  <p>{{ formatPrice(item.price) }}</p>\n  <button @click=\"save(item)\">save</button>\n</template>\n\n<script setup lang=\"ts\">\nimport { formatPrice } from '../utils/format';\nconst props = defineProps<{ item: { price: number } }>();\nfunction save(item: unknown) { return item; }\n</script>\n")
+            .file("components/Options.vue", "<template>\n  <p>{{ total(items) }}</p>\n  <button @click=\"submit(form)\">send</button>\n</template>\n\n<script>\nexport default {\n  methods: {\n    total(items) { return items.length },\n    submit(form) { return form }\n  }\n}\n</script>\n")
+            .file("pages/lists.vue", "<template>\n  <button @click=\"clearError(true)\">x</button>\n</template>\n\n<script setup lang=\"ts\">\nfunction clearError(focus: boolean) { return focus; }\nonDeactivated(() => clearError(false));\n</script>\n")
+            .file("lib/bus.ts", "export class Bus {\n  emit(event: string) { return event; }\n}\n")
+            .file("components/Dialog.vue", "<template>\n  <button @click=\"close\">x</button>\n  <button @click=\"emit('cancel')\">cancel</button>\n  <button @click=\"open = !open\">toggle</button>\n</template>\n\n<script setup lang=\"ts\">\nconst emit = defineEmits(['cancel']);\nlet open = false;\nfunction close() { open = false; }\n</script>\n")
+            .index();
+        let graph = project.graph();
+        let component_calls = |file: &str| -> Vec<String> {
+            let component = graph
+                .nodes
+                .iter()
+                .find(|node| node.file_path == file && node.kind == "component")
+                .unwrap_or_else(|| panic!("component of {file}"));
+            let mut out: Vec<String> = graph
+                .edges
+                .iter()
+                .filter(|edge| edge.source == component.id && edge.kind == "calls")
+                .filter_map(|edge| {
+                    graph.node(&edge.target).map(|target| {
+                        format!(
+                            "{}@{}:{}",
+                            target.name,
+                            target.file_path,
+                            edge.line.unwrap_or(0)
+                        )
+                    })
+                })
+                .collect();
+            out.sort();
+            out
+        };
+        assert_eq!(
+            component_calls("components/H.vue"),
+            ["useBar@composables/useBar.ts:1"]
+        );
+        assert_eq!(
+            component_calls("components/I.vue"),
+            ["useBar@composables/useBar.ts:1"]
+        );
+        assert_eq!(
+            component_calls("components/Setup.vue"),
+            [
+                "formatPrice@utils/format.ts:2",
+                "save@components/Setup.vue:3"
+            ]
+        );
+        // A template calls the component's own methods without `this.`.
+        assert_eq!(
+            component_calls("components/Options.vue"),
+            [
+                "submit@components/Options.vue:3",
+                "total@components/Options.vue:2"
+            ]
+        );
+        // Both calls are the local function's, not Nuxt's `clearError`.
+        assert_eq!(
+            component_calls("pages/lists.vue"),
+            [
+                "clearError@pages/lists.vue:2",
+                "clearError@pages/lists.vue:7"
+            ]
+        );
+        // `emit('cancel')` is the component's `defineEmits` binding, and `open
+        // = !open` calls nothing: neither reaches Bus.emit.
+        assert!(
+            component_calls("components/Dialog.vue")
+                .iter()
+                .all(|call| !call.starts_with("emit@lib/bus.ts")),
+            "{:?}",
+            component_calls("components/Dialog.vue")
+        );
+    }
 }

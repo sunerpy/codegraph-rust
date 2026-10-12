@@ -982,6 +982,50 @@ pub fn typescript_interface_moves_into_a_declare_module_body() -> Case {
         .edge_after("function pick", "references", "interface PluginOptions")
 }
 
+/// Upstream #2140: an Options API method's `this.b()` follows an edit of
+/// the call to another method of the component, as a fresh index of the
+/// edit finds.
+pub fn vue_options_api_this_call_body_edit() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Vue])
+        .file(
+            "src/Form.vue",
+            "<template><form /></template>\n<script>\nexport default {\n  methods: {\n    submit() {\n      this.validate()\n    },\n    validate() {\n      return true\n    },\n    reset() {\n      return false\n    }\n  }\n}\n</script>\n",
+        )
+        .write(
+            "src/Form.vue",
+            "<template><form /></template>\n<script>\nexport default {\n  methods: {\n    submit() {\n      this.reset()\n    },\n    validate() {\n      return true\n    },\n    reset() {\n      return false\n    }\n  }\n}\n</script>\n",
+        )
+        .edge_before("method Form::submit", "calls", "method Form::validate")
+        .edge_after("method Form::submit", "calls", "method Form::reset")
+        .no_edge_after("method Form::submit", "calls", "method Form::validate")
+}
+
+/// Upstream #2357 (b): a call in a component's template reaches the
+/// composable once its module appears, as a fresh index of the edit finds.
+pub fn vue_template_call_reaches_an_added_composable() -> Case {
+    Case::new(
+        Change::AddImportTarget,
+        &[Language::Vue, Language::TypeScript],
+    )
+    .file(
+        "package.json",
+        "{\"name\":\"nuxt-app\",\"dependencies\":{\"nuxt\":\"^4.0.0\"}}\n",
+    )
+    .file(
+        "components/Link.vue",
+        "<template><NuxtLink :to=\"useBar(link.location)\">x</NuxtLink></template>\n",
+    )
+    .write(
+        "composables/useBar.ts",
+        "export function useBar(x: unknown) {\n  return String(x);\n}\n",
+    )
+    .edge_after(
+        "component components/Link.vue::Link",
+        "calls",
+        "function useBar",
+    )
+}
+
 /// Upstream #2263: a CommonJS `require('./application')` imports that file once
 /// it appears, though the binding is only ever used as a value.
 pub fn javascript_require_imports_an_added_module() -> Case {

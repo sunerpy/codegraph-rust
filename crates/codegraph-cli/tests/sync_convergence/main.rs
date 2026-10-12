@@ -604,6 +604,8 @@ matrix! {
     javascript_object_literal_this_call_body_edit,
     tsx_tag_becomes_a_parameter_body_edit,
     typescript_interface_moves_into_a_declare_module_body,
+    vue_options_api_this_call_body_edit,
+    vue_template_call_reaches_an_added_composable,
     javascript_require_imports_an_added_module,
     javascript_require_member_reaches_an_added_module,
     typescript_require_default_of_an_added_es_module,

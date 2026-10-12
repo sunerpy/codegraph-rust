@@ -57,7 +57,7 @@
       "resolvedBy": "import"
     },
     "provenance": null,
-    "source": "file:src/components/Counter.vue",
+    "source": "method:7566b37e2869af6376067732e7d9dea8",
     "target": "function:4969a1ad19a6bf73e764e687c6323329"
   },
   {
@@ -83,6 +83,18 @@
     "provenance": null,
     "source": "component:bf4932bbbd9ae2d8b66cf6b90d96d83a",
     "target": "component:f4f2c5bd83c7e2d2bd25b6aeca79a228"
+  },
+  {
+    "col": 4,
+    "kind": "calls",
+    "line": 24,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "method:007eb306c8cbfdf1e2896699f675a207",
+    "target": "method:7566b37e2869af6376067732e7d9dea8"
   },
   {
     "col": 7,
@@ -197,6 +209,42 @@
     "provenance": null,
     "source": "component:f4f2c5bd83c7e2d2bd25b6aeca79a228",
     "target": "import:53ac2b441303553cd61bae19cf2ca7f6"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "component:f4f2c5bd83c7e2d2bd25b6aeca79a228",
+    "target": "method:007eb306c8cbfdf1e2896699f675a207"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "component:f4f2c5bd83c7e2d2bd25b6aeca79a228",
+    "target": "method:2a3789a77143226f4af615502dda886b"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "component:f4f2c5bd83c7e2d2bd25b6aeca79a228",
+    "target": "method:7566b37e2869af6376067732e7d9dea8"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "component:f4f2c5bd83c7e2d2bd25b6aeca79a228",
+    "target": "method:8586e4fffc2ba2e8b8f5b808ea96dd21"
   },
   {
     "col": null,

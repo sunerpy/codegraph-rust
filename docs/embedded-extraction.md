@@ -29,6 +29,10 @@ The delegated result is folded into the component (upstream `foldScriptResult`, 
 
 PascalCase tags are references directly. Kebab-case tags are converted to PascalCase. Lowercase tags without hyphens are treated as native HTML. Vue built-ins (`Transition`, `TransitionGroup`, `KeepAlive`, `Suspense`, `Teleport`, `Component`, `Slot`) are skipped after kebab-to-Pascal conversion.
 
+A non-setup block's Options API component (upstream #2140): when the default export is the options object, directly or through `defineComponent`, `defineNuxtComponent`, `Vue.extend` or `Vue.component('x', …)`, each function in it, the `methods`, `computed` and `watch` entries (a `get`/`set` or `{ handler }` object included) and the component's own `data`, `setup`, `render`, lifecycle hooks and Nuxt 2 `asyncData` / `fetch` / `head` / `validate` / `middleware`, is a `method` node of the component, `<Component>::<name>`, and the references and edges the script extractor gave the file inside it are its own. Resolution reaches such a method by name only as `this.m()` in its own file: `e.preventDefault()`, `this.editor.setValue()` and a template ref's `this.$refs.x.focus()` never do.
+
+Calls written in the root `<template>` (upstream #2357): a quote-aware tag scanner reads `{{ }}` interpolations and the values of directives (`:x` / `v-bind`, `@x` / `v-on`, `v-if`, `v-show`, `v-model`, `v-for`'s source, custom `v-*`), and a small lexer names each callee the way a script call is named (`useBar`, `store.fetchUsers`). Names the template binds (`v-for` aliases and slot props in their element's subtree, arrow and function parameters), `$` helpers, Vue's template globals, keywords, `new X()`, object-method shorthand, `v-pre` subtrees and a non-HTML template (`lang="pug"`) are skipped. Each call is a `calls` reference from the component at its own line and column; a bare call to the component's own Options API method is linked to it at extraction. A handler written as a bare name (`@click="save"`) is no call here.
+
 ### Offset formula
 
 The offset is line-based. It computes the embedded content offset as:

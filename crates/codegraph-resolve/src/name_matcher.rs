@@ -1244,6 +1244,48 @@ pub(crate) fn is_import_binding(
     import_binding_named(root, reference, context).is_some()
 }
 
+/// A method a Vue Options API component declares for itself:
+/// `index::handleLogin` in `index.vue` (upstream #2140).
+fn is_vue_component_method(node: &Node) -> bool {
+    if node.kind != NodeKind::Method || !node.file_path.ends_with(".vue") {
+        return false;
+    }
+    let base = node.file_path.rsplit('/').next().unwrap_or(&node.file_path);
+    let stem = base.strip_suffix(".vue").unwrap_or(base);
+    node.qualified_name
+        .strip_prefix(stem)
+        .and_then(|rest| rest.strip_prefix("::"))
+        .is_some_and(|name| name == node.name)
+}
+
+/// Whether `reference` is written as `this.<name>(` in the file that declares
+/// `node`.
+fn is_this_call_in_own_file(
+    node: &Node,
+    reference: &RefView,
+    context: &dyn ResolutionContext,
+) -> bool {
+    if node.file_path != reference.file_path {
+        return false;
+    }
+    let Some(line) = context
+        .source_facts(&reference.file_path)
+        .and_then(|facts| {
+            usize::try_from(reference.line)
+                .ok()
+                .and_then(|line| line.checked_sub(1))
+                .and_then(|index| facts.raw_line(index).map(str::to_string))
+        })
+    else {
+        return false;
+    };
+    Regex::new(&format!(
+        r"(?-u:\b)this\s*\??\.\s*{}\s*\(",
+        regex::escape(&node.name)
+    ))
+    .is_ok_and(|pattern| pattern.is_match(&line))
+}
+
 /// A plain JS identifier, `/^[A-Za-z_$][\w$]*$/`.
 pub(crate) fn is_simple_js_identifier(name: &str) -> bool {
     let mut bytes = name.bytes();
@@ -2035,6 +2077,15 @@ pub fn match_by_exact_name(
         // #2120: mocha's global `it(…)` bound an interface's `it` property). A
         // bare Rust call cannot reach a method (P15 R1).
         .filter(|n| !((bare_js || bare_go) && is_type_member_kind(n.kind)))
+        // A Vue component's own method is `this.m()` inside that component,
+        // not `this.$refs['input'].click()` on an element another component
+        // renders (upstream #2140).
+        .filter(|n| {
+            !(reference.reference_kind == EdgeKind::Calls
+                && is_js_family(reference.language)
+                && is_vue_component_method(n)
+                && !is_this_call_in_own_file(n, reference, context))
+        })
         .filter(|n| !(rust_bare && n.kind == NodeKind::Method))
         // A Rust method call whose receiver was dropped reaches only a method:
         // never a function, type, enum member or import (P15 R2).
@@ -3930,6 +3981,18 @@ pub fn match_method_call(
     {
         let before = target_methods.len();
         target_methods.retain(|method| !is_dispatched_handler(method));
+        narrowed |= target_methods.len() != before;
+    }
+    // A Vue component's own method is reached as `this.m()` inside it, never
+    // as `e.preventDefault()` on an event nor `this.editor.setValue()` on
+    // something the component holds (upstream #2140). A template ref
+    // (`this.$refs.form.validate()`) names a child this cannot tell apart.
+    if is_js_family(reference.language) {
+        let before = target_methods.len();
+        target_methods.retain(|method| {
+            !is_vue_component_method(method)
+                || (object_or_class == "this" && method.file_path == reference.file_path)
+        });
         narrowed |= target_methods.len() != before;
     }
 

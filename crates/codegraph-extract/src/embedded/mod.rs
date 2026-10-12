@@ -6,6 +6,8 @@ pub mod razor;
 mod shared;
 pub mod svelte;
 pub mod vue;
+mod vue_options_api;
+mod vue_template_calls;
 
 use codegraph_core::types::{ExtractionResult, Language};
 use std::path::Path;
