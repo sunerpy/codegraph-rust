@@ -98,12 +98,19 @@ impl LanguageSpec for CSpec {
     }
     fn pre_parse(&self, source: &str, _file_path: &str) -> String {
         let blanked = blank_c_designated_macro_args(source);
+        // Upstream's deferral round 2 (#1353), in its order.
+        let blanked = crate::lang::c_preparse::blank_c_round_two(&blanked);
         let blanked = blank_c_leading_attr_macros(&blanked);
-        if crate::lang::cpp::looks_like_cuda_source(&blanked) {
+        let blanked = if crate::lang::cpp::looks_like_cuda_source(&blanked) {
             crate::lang::cpp::blank_cuda_constructs_str(&blanked)
         } else {
             blanked
-        }
+        };
+        // Every directive line as written (upstream #1346), then the one pass
+        // that edits a `#define` on purpose.
+        crate::lang::c_preparse::blank_c_named_variadic_define_dots(
+            &crate::lang::cpp_preparse::restore_directive_lines(source, &blanked),
+        )
     }
 }
 

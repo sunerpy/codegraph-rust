@@ -5,6 +5,7 @@
 
 mod arkts;
 mod c;
+mod c_preparse;
 mod cfml;
 mod cpp;
 pub(crate) mod cpp_brace_scopes;

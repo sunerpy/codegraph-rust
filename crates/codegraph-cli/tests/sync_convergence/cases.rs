@@ -2532,6 +2532,22 @@ pub fn cpp_lowercase_macro_class_body_edit() -> Case {
         .edge_throughout("function use", "calls", "function helper @src/shapes.cpp")
 }
 
+/// Upstream #1353 (W4-CPP-11): a C23 `auto` local no longer hides the call
+/// in its initializer, before and after a body edit.
+pub fn c_auto_local_initializer_call_body_edit() -> Case {
+    Case::new(Change::BodyEdit, &[Language::C])
+        .file("src/hb.c", "int get_hb(void) { return 1; }\n")
+        .file(
+            "src/q.c",
+            "int get_hb(void);\nvoid q(void) { auto hb = get_hb(); (void)hb; }\n",
+        )
+        .write(
+            "src/q.c",
+            "int get_hb(void);\nvoid q(void) { auto hb = get_hb(); (void)hb; (void)0; }\n",
+        )
+        .edge_throughout("function q", "calls", "function get_hb @src/hb.c")
+}
+
 /// Upstream #1789's prerequisite phase: once `Child` gains `extends Base`
 /// in the file that also calls `c.run()` on a `Child`, the call reaches
 /// `Base::run`, the extends edge resolved before the call, as on a fresh
