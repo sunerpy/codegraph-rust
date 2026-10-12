@@ -804,6 +804,8 @@ matrix! {
     typescript_change_a_superclass,
     java_change_a_superclass_and_interface,
     java_bare_call_follows_a_base_change_in_another_file,
+    java_enum_constant_body_edit,
+    kotlin_enum_entry_body_edit,
     java_nested_type_follows_a_base_change_in_another_file,
     java_nested_type_ignores_an_added_namesake,
     java_import_package_appears_in_the_project,

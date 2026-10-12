@@ -2569,6 +2569,44 @@ pub fn java_subclass_gains_a_base_its_caller_reaches() -> Case {
         .edge_after("method app::Use::go", "calls", "method app::Base::run")
 }
 
+/// Upstream #2194: a Java enum constant's body declares methods, so an edit
+/// to that body gains the call it adds, as on a fresh index.
+pub fn java_enum_constant_body_edit() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Java])
+        .file(
+            "src/app/Util.java",
+            "package app;\n\npublic class Util {\n    public static int twice(int x) { return 2 * x; }\n}\n",
+        )
+        .file(
+            "src/app/Op.java",
+            "package app;\n\npublic enum Op {\n    PLUS {\n        int apply(int a) { return a; }\n    };\n\n    abstract int apply(int a);\n}\n",
+        )
+        .write(
+            "src/app/Op.java",
+            "package app;\n\npublic enum Op {\n    PLUS {\n        int apply(int a) { return Util.twice(a); }\n    };\n\n    abstract int apply(int a);\n}\n",
+        )
+        .edge_after("method app::Op::PLUS::apply", "calls", "method app::Util::twice")
+}
+
+/// Upstream #2194: a Kotlin enum entry's body declares methods, so an edit to
+/// that body gains the call it adds, as on a fresh index.
+pub fn kotlin_enum_entry_body_edit() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Kotlin])
+        .file(
+            "src/app/Tools.kt",
+            "package app\n\nfun size(): Int = 3\n",
+        )
+        .file(
+            "src/app/Factory.kt",
+            "package app\n\nenum class Factory {\n    NewBuffer {\n        override fun pipe(): Int = 1\n    };\n\n    abstract fun pipe(): Int\n}\n",
+        )
+        .write(
+            "src/app/Factory.kt",
+            "package app\n\nenum class Factory {\n    NewBuffer {\n        override fun pipe(): Int = size()\n    };\n\n    abstract fun pipe(): Int\n}\n",
+        )
+        .edge_after("method app::Factory::NewBuffer::pipe", "calls", "function app::size")
+}
+
 /// Upstream #2126: a bare call reaches a method of a supertype the classes
 /// around it name in their heads, so a base changed in another file moves the
 /// call of an unchanged subclass, as on a fresh index.

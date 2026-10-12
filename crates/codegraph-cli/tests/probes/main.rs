@@ -6844,6 +6844,89 @@ class basic_json
 mod java {
     use super::support::{Graph, Project};
 
+    /// `qualified` of every method of `file`, sorted.
+    fn methods_in(graph: &Graph, file: &str) -> Vec<String> {
+        let mut out: Vec<String> = graph
+            .nodes
+            .iter()
+            .filter(|node| node.kind == "method" && node.file_path == file)
+            .map(|node| node.qualified_name.clone())
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// `source -> target` of every `calls` edge out of `file`, by qualified
+    /// name, sorted.
+    fn calls_in(graph: &Graph, file: &str) -> Vec<String> {
+        let mut out: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.kind == "calls")
+            .filter_map(|edge| {
+                let source = graph.node(&edge.source)?;
+                let target = graph.node(&edge.target)?;
+                (source.file_path == file)
+                    .then(|| format!("{} -> {}", source.qualified_name, target.qualified_name))
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// Upstream #2194 (`ad77e5fc`): a Java enum constant or Kotlin enum entry
+    /// with a body of its own declares members, and the calls in them are
+    /// calls; jsoup's tokenizer (an enum whose every state implements `read`)
+    /// was absent from the graph.
+    #[test]
+    fn pr2194_enum_constant_bodies_declare_methods_and_calls() {
+        let project = Project::new()
+            .file(
+                "src/main/java/app/Op.java",
+                "package app;\n\npublic enum Op {\n  PLUS {\n    @Override\n    int apply(int a, int b) {\n      return helper(a) + b;\n    }\n  },\n  MINUS {\n    @Override\n    int apply(int a, int b) { return a - b; }\n  };\n\n  abstract int apply(int a, int b);\n\n  static int helper(int x) { return x; }\n}\n",
+            )
+            .file(
+                "src/main/kotlin/app/Factory.kt",
+                "package app\n\nenum class Factory {\n  NewBuffer {\n    override val isOneByteAtATime: Boolean\n      get() = false\n\n    override fun pipe(): Int {\n      val buffer = 1\n      return helper(buffer)\n    }\n  },\n  Other {\n    override val isOneByteAtATime: Boolean = true\n    override fun pipe(): Int = 2\n  };\n\n  abstract val isOneByteAtATime: Boolean\n  abstract fun pipe(): Int\n\n  fun helper(x: Int): Int = x\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        assert_eq!(
+            methods_in(graph, "src/main/java/app/Op.java"),
+            [
+                "app::Op::MINUS::apply",
+                "app::Op::PLUS::apply",
+                "app::Op::apply",
+                "app::Op::helper",
+            ],
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            calls_in(graph, "src/main/java/app/Op.java"),
+            ["app::Op::PLUS::apply -> app::Op::helper"],
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            methods_in(graph, "src/main/kotlin/app/Factory.kt"),
+            [
+                "app::Factory::NewBuffer::pipe",
+                "app::Factory::Other::pipe",
+                "app::Factory::helper",
+                "app::Factory::pipe",
+            ],
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            calls_in(graph, "src/main/kotlin/app/Factory.kt"),
+            ["app::Factory::NewBuffer::pipe -> app::Factory::helper"],
+            "{}",
+            graph.report()
+        );
+    }
+
     /// `kind qualified-name` of every edge but `contains` and `imports` out
     /// of `file`'s nodes, sorted.
     fn edges_from(graph: &Graph, file: &str) -> Vec<String> {

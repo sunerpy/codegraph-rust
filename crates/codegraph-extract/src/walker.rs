@@ -3165,7 +3165,25 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
         for i in 0..body.named_child_count() {
             if let Some(child) = body.named_child(i as u32) {
                 if has_type(self.spec.enum_member_types(), child.kind()) {
-                    self.extract_enum_member(child);
+                    let member = self.extract_enum_member(child);
+                    // Java's `PLUS { int apply(…) { … } }`, Kotlin's `NewBuffer
+                    // { override fun pipe() … }`: the constant's own body
+                    // declares members of its own (upstream #2194). Only a
+                    // `class_body` child is a body: a Rust struct-like variant's
+                    // fields are not.
+                    let mut cursor = child.walk();
+                    let entry_body = child
+                        .named_children(&mut cursor)
+                        .find(|inner| inner.kind() == "class_body");
+                    if let (Some(member), Some(entry_body)) = (member, entry_body) {
+                        self.node_stack.push(member.id);
+                        for j in 0..entry_body.named_child_count() {
+                            if let Some(inner) = entry_body.named_child(j as u32) {
+                                self.visit_node(inner);
+                            }
+                        }
+                        self.node_stack.pop();
+                    }
                 } else {
                     self.visit_node(child);
                 }
@@ -3174,7 +3192,9 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
         self.node_stack.pop();
     }
 
-    fn extract_enum_member(&mut self, node: SyntaxNode<'tree>) {
+    /// The enum members `node` declares; returns the first, which owns the
+    /// body a Java or Kotlin constant may have.
+    fn extract_enum_member(&mut self, node: SyntaxNode<'tree>) -> Option<Node> {
         // tree-sitter.ts:1105-1131. The upstream WASM swift grammar exposes no
         // `name` field on enum_entry, so its identifier loop emits one member
         // per simple_identifier (`case put, delete` → put AND delete).
@@ -3186,37 +3206,40 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             node.children_by_field_name("name", &mut cursor).collect();
         drop(cursor);
         if name_nodes.len() == 1 {
-            self.create_node(
+            return self.create_node(
                 NodeKind::EnumMember,
                 &node_text(name_nodes[0], self.source),
                 node,
                 NodeExtra::default(),
             );
-            return;
         }
         if name_nodes.len() > 1 {
+            let mut first = None;
             for name_node in name_nodes {
-                self.create_node(
+                let created = self.create_node(
                     NodeKind::EnumMember,
                     &node_text(name_node, self.source),
                     name_node,
                     NodeExtra::default(),
                 );
+                first = first.or(created);
             }
-            return;
+            return first;
         }
+        let mut first = None;
         for i in 0..node.named_child_count() {
             if let Some(child) = node.named_child(i as u32) {
                 if matches!(
                     child.kind(),
                     "simple_identifier" | "identifier" | "property_identifier"
                 ) {
-                    self.create_node(
+                    let created = self.create_node(
                         NodeKind::EnumMember,
                         &node_text(child, self.source),
                         child,
                         NodeExtra::default(),
                     );
+                    first = first.or(created);
                 }
             }
         }
@@ -3224,13 +3247,14 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
         // child); its own text is the member name. Emit from the node text when
         // the name-field / id-child paths above found nothing.
         if node.kind() == "enum_value" {
-            self.create_node(
+            return self.create_node(
                 NodeKind::EnumMember,
                 &node_text(node, self.source),
                 node,
                 NodeExtra::default(),
             );
         }
+        first
     }
 
     /// A C/C++ alias's declaration as written, its signature (KEEP-RUST, owner
@@ -6527,6 +6551,9 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
                         | NodeKind::Trait
                         | NodeKind::Enum
                         | NodeKind::Module
+                        // A Java or Kotlin enum constant with a body of its
+                        // own (upstream #2194, see `extract_enum`).
+                        | NodeKind::EnumMember
                 )
         })
     }
@@ -8961,6 +8988,50 @@ class Widget: Base, Named {}
 "#;
         let (_, refs) = run("s.swift", src, Language::Swift);
         assert!(has_ref(&refs, EdgeKind::Extends, "Base"));
+    }
+
+    /// Upstream #2194: a Java enum constant or Kotlin enum entry with a body
+    /// of its own declares members under the constant; a Rust struct-like
+    /// variant's fields are no body.
+    #[test]
+    fn enum_constant_bodies_declare_members_under_the_constant() {
+        let qualified = |nodes: &[Node], kind: NodeKind| {
+            let mut out: Vec<String> = nodes
+                .iter()
+                .filter(|node| node.kind == kind)
+                .map(|node| node.qualified_name.clone())
+                .collect();
+            out.sort();
+            out
+        };
+        let java = "package app;\n\npublic enum Op {\n  PLUS {\n    int apply(int a) { return a; }\n  },\n  MINUS;\n\n  int apply(int a) { return 0; }\n}\n";
+        let (nodes, _) = run("src/app/Op.java", java, Language::Java);
+        assert_eq!(
+            qualified(&nodes, NodeKind::Method),
+            ["app::Op::PLUS::apply", "app::Op::apply"]
+        );
+        assert_eq!(
+            qualified(&nodes, NodeKind::EnumMember),
+            ["app::Op::MINUS", "app::Op::PLUS"]
+        );
+        let kotlin = "package app\n\nenum class Factory {\n  NewBuffer {\n    override val single: Boolean = false\n    override fun pipe(): Int = 1\n  };\n\n  abstract val single: Boolean\n  abstract fun pipe(): Int\n}\n";
+        let (nodes, _) = run("src/app/Factory.kt", kotlin, Language::Kotlin);
+        assert_eq!(
+            qualified(&nodes, NodeKind::Method),
+            ["app::Factory::NewBuffer::pipe", "app::Factory::pipe"]
+        );
+        assert_eq!(
+            qualified(&nodes, NodeKind::Field),
+            ["app::Factory::NewBuffer::single", "app::Factory::single"]
+        );
+        let rust = "enum Shape {\n    Rect { width: u32 },\n    Dot,\n}\n";
+        let (nodes, _) = run("src/shape.rs", rust, Language::Rust);
+        assert!(
+            !nodes
+                .iter()
+                .any(|node| node.qualified_name.starts_with("Shape::Rect::")),
+            "{nodes:#?}"
+        );
     }
 
     #[test]
