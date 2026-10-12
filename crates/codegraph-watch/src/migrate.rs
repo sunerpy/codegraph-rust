@@ -87,6 +87,7 @@ pub(crate) fn migrate_project(
     rebuild.set_bulk_index_pragmas()?;
 
     let mut pending_nodes: Vec<Node> = Vec::with_capacity(NODE_FLUSH_ROWS);
+    let mut surfaces = Vec::new();
     let mut edges: Vec<Edge> = Vec::new();
     let mut refs: Vec<UnresolvedRef> = Vec::new();
     let mut outcome = SyncOutcome {
@@ -125,6 +126,10 @@ pub(crate) fn migrate_project(
         };
 
         rebuild.store().upsert_file(&file)?;
+        if let Some(surface) = crate::module_surfaces::surface_of(relative, file.language, &source)
+        {
+            surfaces.push((relative.clone(), surface));
+        }
         pending_nodes.append(&mut result.nodes);
         if pending_nodes.len() >= NODE_FLUSH_ROWS {
             rebuild.store_mut().upsert_nodes(&pending_nodes)?;
@@ -142,6 +147,14 @@ pub(crate) fn migrate_project(
         rebuild.store_mut().upsert_nodes(&pending_nodes)?;
     }
     drop(pending_nodes);
+    // Every file row is stored, as in the CLI full index at the same point.
+    crate::module_surfaces::write_index_rows(
+        rebuild.store(),
+        project_root,
+        options.max_file_size,
+        &surfaces,
+    )?;
+    drop(surfaces);
 
     // ALL nodes are persisted before ANY edge, because `insert_edges` drops edges
     // whose endpoints are absent. The WAL valve folds the log back during the

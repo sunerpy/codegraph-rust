@@ -1311,6 +1311,28 @@ impl Store {
             .execute("DELETE FROM project_metadata WHERE key = ?", [key])
     }
 
+    /// Every `project_metadata` row whose key starts with `prefix`, by key.
+    pub fn project_metadata_with_prefix(
+        &self,
+        prefix: &str,
+    ) -> rusqlite::Result<Vec<(String, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT key, value FROM project_metadata WHERE substr(key, 1, ?2) = ?1 ORDER BY key",
+        )?;
+        let rows = stmt.query_map(params![prefix, prefix.chars().count() as i64], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?;
+        rows.collect()
+    }
+
+    /// Delete every `project_metadata` row whose key starts with `prefix`.
+    pub fn delete_project_metadata_with_prefix(&self, prefix: &str) -> rusqlite::Result<usize> {
+        self.conn.execute(
+            "DELETE FROM project_metadata WHERE substr(key, 1, ?2) = ?1",
+            params![prefix, prefix.chars().count() as i64],
+        )
+    }
+
     /// `project_metadata` key for the incomplete-resolution MARKER (#1187).
     ///
     /// A full-index resolution pass SETS this at its start and DELETES it only on
@@ -2408,6 +2430,49 @@ mod tests {
 
     fn store(test_name: &str) -> Store {
         Store::open(&temp_db_path(test_name)).expect("open temp store")
+    }
+
+    #[test]
+    fn project_metadata_prefix_reads_and_deletes_only_its_rows() {
+        let store = store("metadata-prefix");
+        for (key, value) in [
+            ("surface:src/b.ts", "2"),
+            ("surface:src/a.ts", "1"),
+            ("surfaces", "other"),
+            ("indexed_with_version", "0.1.0"),
+        ] {
+            store.set_project_metadata(key, value).unwrap();
+        }
+        assert_eq!(
+            store.project_metadata_with_prefix("surface:").unwrap(),
+            [
+                ("surface:src/a.ts".to_string(), "1".to_string()),
+                ("surface:src/b.ts".to_string(), "2".to_string()),
+            ]
+        );
+        assert_eq!(
+            store
+                .delete_project_metadata_with_prefix("surface:")
+                .unwrap(),
+            2
+        );
+        assert!(
+            store
+                .project_metadata_with_prefix("surface:")
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            store.get_project_metadata("surfaces").unwrap().as_deref(),
+            Some("other")
+        );
+        assert_eq!(
+            store
+                .get_project_metadata("indexed_with_version")
+                .unwrap()
+                .as_deref(),
+            Some("0.1.0")
+        );
     }
 
     fn node(id: &str, name: &str, file_path: &str) -> Node {

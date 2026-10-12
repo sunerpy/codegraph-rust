@@ -2,6 +2,7 @@ mod git;
 pub mod git_pending;
 mod link_state;
 mod migrate;
+pub mod module_surfaces;
 mod policy;
 mod sync;
 mod watcher;

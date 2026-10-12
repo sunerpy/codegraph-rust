@@ -160,6 +160,25 @@ edges, so it can recompute them without re-reading every file (migration 9).
 | `value`      | TEXT not null    | serialized value   |
 | `updated_at` | INTEGER not null | epoch milliseconds |
 
+Module-surface rows record what other files' resolution reads from a
+JavaScript-family module's own text, which no node records: its re-exports and
+export aliases, the CommonJS default, whether it has an `export default`
+statement, the names its export lists give, whether it is a sealed module, and a
+Vue or Svelte component's `<script>` blocks. `js_module_surface:<path>` holds the
+JSON `{"digest", "sources", "targets"}`: the sha256 of the canonical encoding of
+those facts, the specifiers the module forwards, and the project file each
+resolved to when the row was written (`null` when none). A file whose surface is
+the default one (an ES module none of whose text another file reads) has no
+row. `js_module_surface_version` records the row format.
+
+A full index and a migration write every row and the marker once the file rows
+are stored, before resolution. A sync withdraws the marker before its first
+mutation and writes the rows it changed, then the marker, only after resolution
+is persisted. A sync that finds the marker missing, or another format,
+reconciles every JavaScript-family file before writing it. These rows are no
+canonical surface; the sync matrix checks that a sync leaves them as a fresh
+index writes them.
+
 ## FTS5
 
 `nodes_fts` is an external-content FTS5 table over `nodes`:

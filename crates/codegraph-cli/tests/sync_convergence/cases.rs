@@ -1555,6 +1555,232 @@ pub fn typescript_namespace_reexport_member_reaches_an_added_module() -> Case {
         .edge_after("function check", "calls", "function safeParse")
 }
 
+/// Two modules exporting the same function, for the re-export edit cases.
+const JS_REEXPORT_A: &str = "export function safeParse(value: unknown) {\n  return value;\n}\n";
+const JS_REEXPORT_B: &str = "export function safeParse(value: unknown) {\n  return [value];\n}\n";
+
+/// Upstream #2192: a namespace re-export that comes to name another module
+/// moves an unchanged caller's member call there, although the barrel holds
+/// no node either side of the edit.
+pub fn typescript_namespace_reexport_names_another_module() -> Case {
+    Case::new(Change::ReexportEdit, &[Language::TypeScript])
+        .file("src/a.ts", JS_REEXPORT_A)
+        .file("src/b.ts", JS_REEXPORT_B)
+        .file("src/external.ts", "export * as core from './a';\n")
+        .file(
+            "src/use.ts",
+            "import * as z from './external';\n\nexport function check() {\n  return z.core.safeParse(1);\n}\n",
+        )
+        .write("src/external.ts", "export * as core from './b';\n")
+        .edge_before("function check", "calls", "function safeParse @src/a.ts")
+        .edge_after("function check", "calls", "function safeParse @src/b.ts")
+}
+
+/// A named re-export (`export { safeParse as parse } from …`) that comes to
+/// name another module moves an unchanged importer's call there.
+pub fn typescript_named_reexport_names_another_module() -> Case {
+    Case::new(Change::ReexportEdit, &[Language::TypeScript])
+        .file("src/a.ts", JS_REEXPORT_A)
+        .file("src/b.ts", JS_REEXPORT_B)
+        .file("src/external.ts", "export { safeParse as parse } from './a';\n")
+        .file(
+            "src/use.ts",
+            "import { parse } from './external';\n\nexport function check() {\n  return parse(1);\n}\n",
+        )
+        .write("src/external.ts", "export { safeParse as parse } from './b';\n")
+        .edge_before("function check", "calls", "function safeParse @src/a.ts")
+        .edge_after("function check", "calls", "function safeParse @src/b.ts")
+}
+
+/// A wildcard re-export behind a second barrel that comes to name another
+/// module moves a caller importing the outer barrel.
+pub fn typescript_nested_wildcard_reexport_names_another_module() -> Case {
+    Case::new(Change::ReexportEdit, &[Language::TypeScript])
+        .file("src/a.ts", JS_REEXPORT_A)
+        .file("src/b.ts", JS_REEXPORT_B)
+        .file("src/inner.ts", "export * from './a';\n")
+        .file("src/index.ts", "export * from './inner';\n")
+        .file(
+            "src/use.ts",
+            "import { safeParse } from './index';\n\nexport function check() {\n  return safeParse(1);\n}\n",
+        )
+        .write("src/inner.ts", "export * from './b';\n")
+        .edge_before("function check", "calls", "function safeParse @src/a.ts")
+        .edge_after("function check", "calls", "function safeParse @src/b.ts")
+}
+
+/// A local export clause (`export { impl as api }`) and an `export default`
+/// statement that come to name another declaration move unchanged
+/// importers, although every declaration keeps its node.
+pub fn typescript_local_export_alias_names_another_declaration() -> Case {
+    Case::new(Change::ReexportEdit, &[Language::TypeScript])
+        .file(
+            "src/api.ts",
+            "function impl() {\n  return 1;\n}\n\nfunction other() {\n  return 2;\n}\n\nexport { impl as api };\nexport default impl;\n",
+        )
+        .file(
+            "src/use.ts",
+            "import run, { api } from './api';\n\nexport function check() {\n  return api() + run();\n}\n",
+        )
+        .write(
+            "src/api.ts",
+            "function impl() {\n  return 1;\n}\n\nfunction other() {\n  return 2;\n}\n\nexport { other as api };\nexport default other;\n",
+        )
+        .edge_before("function check", "calls", "function impl")
+        .edge_after("function check", "calls", "function other")
+        .no_edge_after("function check", "calls", "function impl")
+}
+
+/// A barrel that comes to re-export a name binds an unchanged importer's
+/// call that resolved nowhere before.
+pub fn typescript_barrel_gains_a_named_reexport() -> Case {
+    Case::new(Change::ReexportEdit, &[Language::TypeScript])
+        .file("src/a.ts", JS_REEXPORT_A)
+        .file("src/external.ts", "export const version = 1;\n")
+        .file(
+            "src/use.ts",
+            "import { parse } from './external';\n\nexport function check() {\n  return parse(1);\n}\n",
+        )
+        .write(
+            "src/external.ts",
+            "export const version = 1;\nexport { safeParse as parse } from './a';\n",
+        )
+        .edge_after("function check", "calls", "function safeParse @src/a.ts")
+}
+
+/// Upstream #2162: a binding an export list stops naming is an unexported
+/// module binding, out of another file's name match, although its node is
+/// unchanged.
+pub fn javascript_export_list_drops_a_binding() -> Case {
+    Case::new(Change::ReexportEdit, &[Language::JavaScript])
+        .file(
+            "src/lib.js",
+            "function helper() {\n  return 1;\n}\n\nexport { helper };\n",
+        )
+        .file(
+            "src/use.js",
+            "function run() {\n  return helper();\n}\n\nmodule.exports = run;\n",
+        )
+        .write(
+            "src/lib.js",
+            "function helper() {\n  return 1;\n}\n\nexport {};\n",
+        )
+        .edge_before("function run", "calls", "function helper")
+}
+
+/// Upstream #2162: a binding an export list comes to name is a module
+/// export again, so another file's name match reaches it.
+pub fn javascript_export_list_gains_a_binding() -> Case {
+    Case::new(Change::ReexportEdit, &[Language::JavaScript])
+        .file(
+            "src/lib.js",
+            "function helper() {\n  return 1;\n}\n\nexport {};\n",
+        )
+        .file(
+            "src/use.js",
+            "function run() {\n  return helper();\n}\n\nmodule.exports = run;\n",
+        )
+        .write(
+            "src/lib.js",
+            "function helper() {\n  return 1;\n}\n\nexport { helper };\n",
+        )
+        .edge_after("function run", "calls", "function helper")
+}
+
+/// Upstream #2189: `module.exports = require('./a')` that comes to forward
+/// another module moves an unchanged CommonJS caller of the default.
+pub fn javascript_commonjs_forward_names_another_module() -> Case {
+    Case::new(Change::ReexportEdit, &[Language::JavaScript])
+        .file("src/a.js", "module.exports = function safeParse(value) {\n  return value;\n};\n")
+        .file("src/b.js", "module.exports = function safeParse(value) {\n  return [value];\n};\n")
+        .file("src/external.js", "module.exports = require('./a');\n")
+        .file(
+            "src/use.js",
+            "const parse = require('./external');\n\nfunction check() {\n  return parse(1);\n}\n\nmodule.exports = check;\n",
+        )
+        .write("src/external.js", "module.exports = require('./b');\n")
+        .edge_before("function check", "calls", "function safeParse @src/a.js")
+        .edge_after("function check", "calls", "function safeParse @src/b.js")
+}
+
+/// A sealed module (an import and no export) keeps its bindings from other
+/// files; once it gains a CommonJS export (its import and its function's
+/// node untouched), a classic script's `helper()` reaches it.
+pub fn javascript_sealed_module_gains_a_commonjs_export() -> Case {
+    Case::new(Change::ReexportEdit, &[Language::JavaScript])
+        .file("src/x.js", "export const x = 1;\n")
+        .file(
+            "src/lib.js",
+            "import { x } from './x';\nfunction helper() {\n  return 1;\n}\n",
+        )
+        .file("src/use.js", "function run() {\n  return helper();\n}\n")
+        .write(
+            "src/lib.js",
+            "import { x } from './x';\nfunction helper() {\n  return 1;\n}\nmodule.exports = {};\n",
+        )
+        .edge_after("function run", "calls", "function helper")
+}
+
+/// Upstream #2227: what a Svelte component's instance `<script>` declares is
+/// its own; once the block becomes `context="module"` (the function's node
+/// untouched), another file's call reaches it.
+pub fn svelte_instance_script_becomes_a_module_script() -> Case {
+    Case::new(Change::ReexportEdit, &[Language::Svelte, Language::TypeScript])
+        .file("package.json", "{\"name\":\"web\",\"private\":true,\"dependencies\":{\"svelte\":\"^4\"}}\n")
+        .file(
+            "src/Widget.svelte",
+            "<script>\n  export function helper() {\n    return 1;\n  }\n</script>\n\n<p>hi</p>\n",
+        )
+        .file("src/use.ts", "export function run() {\n  return helper();\n}\n")
+        .write(
+            "src/Widget.svelte",
+            "<script context=\"module\">\n  export function helper() {\n    return 1;\n  }\n</script>\n\n<p>hi</p>\n",
+        )
+        .edge_after("function run", "calls", "function helper @src/Widget.svelte")
+}
+
+/// A barrel forwarded through a tsconfig `paths` alias (`@mid`) is deleted:
+/// the outer barrel's alias source names no file any more, so an unchanged
+/// caller's call through both is no import resolution, as on a fresh index
+/// (which falls back to a name match). Only the target the outer barrel's
+/// row recorded finds the caller.
+pub fn typescript_alias_forwarded_barrel_is_deleted() -> Case {
+    Case::new(Change::DeleteImportedModule, &[Language::TypeScript])
+        .file(
+            "tsconfig.json",
+            "{\"compilerOptions\":{\"baseUrl\":\".\",\"paths\":{\"@mid\":[\"src/mid.ts\"]}}}\n",
+        )
+        .file("src/a.ts", JS_REEXPORT_A)
+        .file("src/mid.ts", "export * from './a';\n")
+        .file("src/index.ts", "export * from '@mid';\n")
+        .file(
+            "src/use.ts",
+            "import { safeParse } from './index';\n\nexport function check() {\n  return safeParse(1);\n}\n",
+        )
+        .remove("src/mid.ts")
+        .edge_before("function check", "calls", "function safeParse @src/a.ts")
+}
+
+/// A workspace package's entry barrel moves into a subdirectory: the
+/// package name no longer names a file, so an unchanged caller importing a
+/// barrel that forwards the package is no import resolution, as on a fresh
+/// index.
+pub fn typescript_workspace_entry_barrel_is_renamed() -> Case {
+    Case::new(Change::DeleteImportedModule, &[Language::TypeScript])
+        .file("package.json", "{\"name\":\"root\",\"private\":true,\"workspaces\":[\"packages/*\"]}\n")
+        .file("packages/mid/package.json", "{\"name\":\"mid\",\"version\":\"1.0.0\"}\n")
+        .file("packages/mid/index.ts", "export * from './a';\n")
+        .file("packages/mid/a.ts", JS_REEXPORT_A)
+        .file("packages/mid/lib/a.ts", JS_REEXPORT_B)
+        .file("src/index.ts", "export * from 'mid';\n")
+        .file(
+            "src/use.ts",
+            "import { safeParse } from './index';\n\nexport function check() {\n  return safeParse(1);\n}\n",
+        )
+        .rename("packages/mid/index.ts", "packages/mid/lib/index.ts")
+        .edge_before("function check", "calls", "function safeParse @packages/mid/a.ts")
+}
+
 /// Upstream #2378's identifier grammar: `export default $fmt;` that comes
 /// to name `$other` moves an unchanged default importer, as on a fresh
 /// index, rather than both falling back to the first exported function.

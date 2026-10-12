@@ -419,6 +419,26 @@ fn incremental_sync_on_outdated_v2_forces_all_files() {
     .expect("canonicalize peer db");
     diff_canonical(&rebuilt, &migrated, None)
         .expect("a forced migration must equal a fresh v2 `index --force`");
+    // The module-surface rows and marker (W4a-F3) are no canonical surface,
+    // but the next sync reads them: a migration writes what a full index does.
+    let surface_rows = |paths: &IndexPaths| {
+        Store::open_for_read(paths, deadline(), || false)
+            .expect("readable namespace")
+            .project_metadata_with_prefix("js_module_surface")
+            .expect("module-surface rows")
+    };
+    let migrated_rows = surface_rows(&paths);
+    assert!(
+        migrated_rows
+            .iter()
+            .any(|(key, _)| key == "js_module_surface_version"),
+        "a migration writes the module-surface marker: {migrated_rows:?}"
+    );
+    assert_eq!(
+        migrated_rows,
+        surface_rows(&IndexPaths::resolve(&peer, None).expect("resolve peer v2 paths")),
+        "a forced migration must write the module-surface rows of `index --force`"
+    );
 }
 
 /// Migration is a from-source rebuild, so a tracked file that no longer exists

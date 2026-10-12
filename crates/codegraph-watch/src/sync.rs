@@ -550,6 +550,10 @@ fn sync_paths_with_store(
     let mut dependent_fallbacks = BTreeSet::new();
     let mut reindexed = HashSet::new();
     let mut changed_names = ChangedNames::default();
+    // An index without the module-surface marker was built before the rows
+    // existed, or a sync failed after its first mutation: this sync
+    // reconciles every JavaScript-family file, even with nothing changed.
+    let surface_bootstrap = crate::module_surfaces::needs_bootstrap(store)?;
 
     let paths = paths.into_iter().collect::<Vec<_>>();
     let total = paths.len();
@@ -596,7 +600,7 @@ fn sync_paths_with_store(
         on_progress(done + 1, total);
     }
 
-    if changed {
+    if changed || surface_bootstrap {
         note_python_global_readers(
             project_root,
             store,
@@ -614,6 +618,23 @@ fn sync_paths_with_store(
             &mut dependent_sites,
             &mut dependent_fallbacks,
         )?;
+        // What other files read from a changed JavaScript-family module's
+        // text no node records (W4a-F3): the files resolving through it, up
+        // the barrels that forward it, re-resolve whole.
+        let surfaces = crate::module_surfaces::note_surface_changes(
+            store,
+            project_root,
+            scope.options.max_file_size,
+            &changed_names.js_surfaces,
+            &reindexed,
+            !changed_names.added_files.is_empty() || !changed_names.removed_files.is_empty(),
+            surface_bootstrap,
+        )?;
+        for file in &surfaces.files {
+            dependent_sites.remove(file);
+            dependent_fallbacks.insert(file.clone());
+        }
+        changed_names.note_all(surfaces.names.iter().cloned());
         // What a changed Python import statement re-exports moves for its
         // module's importers without any node of those names changing.
         if !changed_names.python_imports.is_empty() {
@@ -684,6 +705,10 @@ fn sync_paths_with_store(
         )?;
         let mut scope_files = reindexed.clone();
         scope_files.extend(fallback_files);
+        #[cfg(test)]
+        if tests::FAIL_BEFORE_RESOLUTION.with(std::cell::Cell::get) {
+            bail!("injected sync failure before resolution");
+        }
         resolver.resolve_incremental_and_persist(
             store,
             &scope_files,
@@ -692,6 +717,9 @@ fn sync_paths_with_store(
         )?;
         // Cross-file framework finalization on every sync (upstream index.ts:464).
         resolver.run_post_extract(store)?;
+        // Last: the surface rows, then the marker the first mutation withdrew.
+        surfaces.write_rows(store)?;
+        crate::module_surfaces::finish_bootstrap(store)?;
     }
 
     // Orphan sweep (#1187, upstream index.ts:645-682): a full-index resolution
@@ -954,6 +982,7 @@ fn sync_one(
         return Ok(false);
     }
 
+    changed_names.begin_mutation(store)?;
     let mut importers = BTreeSet::new();
     for dependent in store.reference_sites_dependent_on_file(relative)? {
         importers.insert(dependent.file_path.clone());
@@ -966,6 +995,10 @@ fn sync_one(
         changed_names,
         (&metadata, &source, content_hash),
     )?;
+    if let Some(change) = changed_names.js_surfaces.get_mut(relative) {
+        change.importers.extend(importers.iter().cloned());
+        change.added = added;
+    }
     if let Some(change) = changed_names.python_files.get_mut(relative) {
         change.importers.extend(importers);
     }
@@ -986,11 +1019,11 @@ fn remove_tracked_file(
     dependent_fallbacks: &mut BTreeSet<String>,
     changed_names: &mut ChangedNames,
 ) -> Result<bool> {
-    let was_tracked = store.file_by_path(relative)?.is_some();
-    if !was_tracked {
+    let Some(stored) = store.file_by_path(relative)? else {
         outcome.files_ignored += 1;
         return Ok(false);
-    }
+    };
+    changed_names.begin_mutation(store)?;
     let mut importers = BTreeSet::new();
     for dependent in store.reference_sites_dependent_on_file(relative)? {
         importers.insert(dependent.file_path.clone());
@@ -998,6 +1031,18 @@ fn remove_tracked_file(
     }
     changed_names.note_removed(node_names_in_file(store, relative)?);
     let old_nodes = store.nodes_by_file_path(relative)?;
+    changed_names.removed_files.insert(relative.to_string());
+    if codegraph_resolve::module_surface::has_module_surface(relative, stored.language) {
+        let change = changed_names
+            .js_surfaces
+            .entry(relative.to_string())
+            .or_default();
+        change.old = crate::module_surfaces::old_row(store, relative)?;
+        change.new = None;
+        change.removed = true;
+        change.importers.extend(importers.iter().cloned());
+        change.note_nodes(&old_nodes);
+    }
     let statements = python_import_statements(&old_nodes);
     changed_names.python_imports.extend(
         statements
@@ -1374,9 +1419,23 @@ fn reextract_into_store(
     // #2204), and that verdict is read from the script's text: a script that
     // was or is generated can flip it with every node where it was, so all of
     // its names are touched and the refs naming them resolve afresh.
-    let was_generated = store
-        .file_by_path(relative)?
-        .is_some_and(|stored| stored.generated);
+    let stored = store.file_by_path(relative)?;
+    let was_generated = stored.as_ref().is_some_and(|stored| stored.generated);
+    // A JavaScript-family module's surface is read from its text, which is
+    // gone after this (W4a-F3): keep the row it had and the surface it has.
+    if codegraph_resolve::module_surface::has_module_surface(relative, file.language)
+        || stored.as_ref().is_some_and(|stored| {
+            codegraph_resolve::module_surface::has_module_surface(relative, stored.language)
+        })
+    {
+        let change = changed_names
+            .js_surfaces
+            .entry(relative.to_string())
+            .or_default();
+        change.old = crate::module_surfaces::old_row(store, relative)?;
+        change.new = crate::module_surfaces::surface_of(relative, file.language, source);
+        change.note_nodes(old_nodes.iter().chain(&result.nodes));
+    }
     if is_minifiable_script(relative) && (was_generated || file.generated) {
         changed_names.note_all(
             old_nodes
@@ -1463,6 +1522,14 @@ struct ChangedNames {
     /// What each changed Python file held before the change, for the module
     /// globals it declares or can write (upstream #2291 a).
     python_files: BTreeMap<String, PythonFileChange>,
+    /// What each changed JavaScript-family file's module surface was and is
+    /// (W4a-F3).
+    js_surfaces: BTreeMap<String, crate::module_surfaces::SurfaceChange>,
+    /// The files this sync removed.
+    removed_files: BTreeSet<String>,
+    /// Whether this sync already withdrew the surface version marker, as it
+    /// does before its first mutation and restores once everything persisted.
+    surface_dirty: bool,
 }
 
 /// What a changed Python file held before the change. A module global's
@@ -1490,6 +1557,17 @@ struct PythonFileChange {
 const IMPORT_RETRY_CEILING: usize = 500;
 
 impl ChangedNames {
+    /// Withdraw the module-surface version marker before this sync's first
+    /// mutation: a sync that fails after it leaves the marker absent, and the
+    /// next sync reconciles every JavaScript-family file (W4a-F3).
+    fn begin_mutation(&mut self, store: &Store) -> Result<()> {
+        if !self.surface_dirty {
+            store.delete_project_metadata(codegraph_resolve::module_surface::VERSION_KEY)?;
+            self.surface_dirty = true;
+        }
+        Ok(())
+    }
+
     /// What an import of an added file can be written as, and the namespaces
     /// and modules the changed files declare (upstream #2392).
     fn import_retry_keys(&self) -> (Vec<String>, Vec<String>) {
@@ -1620,6 +1698,12 @@ pub(crate) mod tests {
 
     static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
+    thread_local! {
+        /// Fail the next sync after its mutations, before resolution.
+        pub(crate) static FAIL_BEFORE_RESOLUTION: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
+    }
+
     pub(crate) struct TestDir {
         path: PathBuf,
     }
@@ -1665,6 +1749,118 @@ pub(crate) mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.path);
         }
+    }
+
+    /// Every edge but `contains` as `file:source -[kind]-> file:target
+    /// metadata`, sorted: what a fresh sync of the same files must match.
+    fn edge_projection(db: &Path) -> Vec<String> {
+        let store = Store::open(db).unwrap();
+        let mut stmt = store
+            .connection()
+            .prepare(
+                r#"SELECT src.file_path || ':' || src.qualified_name || ' -[' || e.kind || ']-> '
+                    || tgt.file_path || ':' || tgt.qualified_name || ' ' || COALESCE(e.metadata, '')
+                FROM edges e
+                JOIN nodes src ON src.id = e.source
+                JOIN nodes tgt ON tgt.id = e.target
+                WHERE e.kind != 'contains'
+                ORDER BY 1"#,
+            )
+            .unwrap();
+        stmt.query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
+    fn surface_marker(db: &Path) -> Option<String> {
+        Store::open(db)
+            .unwrap()
+            .get_project_metadata(codegraph_resolve::module_surface::VERSION_KEY)
+            .unwrap()
+    }
+
+    fn write_files(root: &Path, files: &[(&str, &str)]) {
+        for (path, contents) in files {
+            let full = root.join(path);
+            fs::create_dir_all(full.parent().unwrap()).unwrap();
+            fs::write(full, contents).unwrap();
+        }
+    }
+
+    /// The edges a sync into an empty index gives `files`.
+    fn fresh_edges(name: &str, files: &[(&str, &str)]) -> Vec<String> {
+        let dir = TestDir::new(name);
+        write_files(dir.path(), files);
+        let db = default_db_path(dir.path()).unwrap();
+        sync_changed_paths(dir.path(), &db, files.iter().map(|(path, _)| *path)).unwrap();
+        edge_projection(&db)
+    }
+
+    /// A sync with no transaction around it can fail after its mutations
+    /// (W4a-F3): the module-surface marker its first mutation withdrew stays
+    /// away, so the next sync, with nothing changed or with an unrelated
+    /// change, reconciles every JavaScript-family file and restores it.
+    #[test]
+    fn a_sync_failing_after_its_mutations_leaves_the_next_one_to_reconcile() {
+        const A: (&str, &str) = (
+            "src/a.ts",
+            "export function safeParse(value: unknown) {\n  return value;\n}\n",
+        );
+        const B: (&str, &str) = (
+            "src/b.ts",
+            "export function safeParse(value: unknown) {\n  return [value];\n}\n",
+        );
+        const USE: (&str, &str) = (
+            "src/use.ts",
+            "import * as z from './external';\n\nexport function check() {\n  return z.core.safeParse(1);\n}\n",
+        );
+        const TO_A: (&str, &str) = ("src/external.ts", "export * as core from './a';\n");
+        const TO_B: (&str, &str) = ("src/external.ts", "export * as core from './b';\n");
+        const OTHER: (&str, &str) = ("src/other.ts", "export const other = 1;\n");
+        const OTHER_EDITED: (&str, &str) = ("src/other.ts", "export const other = 2;\n");
+        let version = Some(codegraph_resolve::module_surface::VERSION.to_string());
+
+        let dir = TestDir::new("surface-fail");
+        let db = default_db_path(dir.path()).unwrap();
+        let initial = [A, B, TO_A, USE, OTHER];
+        write_files(dir.path(), &initial);
+        sync_changed_paths(dir.path(), &db, initial.iter().map(|(path, _)| *path)).unwrap();
+        assert_eq!(surface_marker(&db), version);
+
+        let fail_once = |paths: &[&str]| {
+            FAIL_BEFORE_RESOLUTION.with(|fail| fail.set(true));
+            let failed = sync_changed_paths(dir.path(), &db, paths.iter().copied());
+            FAIL_BEFORE_RESOLUTION.with(|fail| fail.set(false));
+            assert!(failed.is_err(), "the injected failure must stop the sync");
+            assert_eq!(
+                surface_marker(&db),
+                None,
+                "a failed sync leaves the marker away"
+            );
+        };
+
+        // The barrel moves to `b`; the sync fails before resolving, and a
+        // sync with nothing changed reconciles.
+        write_files(dir.path(), &[TO_B]);
+        fail_once(&["src/external.ts"]);
+        sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
+        assert_eq!(surface_marker(&db), version);
+        assert_eq!(
+            edge_projection(&db),
+            fresh_edges("surface-fail-fresh-b", &[A, B, TO_B, USE, OTHER])
+        );
+
+        // Back to `a`, failing again; an unrelated change reconciles.
+        write_files(dir.path(), &[TO_A]);
+        fail_once(&["src/external.ts"]);
+        write_files(dir.path(), &[OTHER_EDITED]);
+        sync_changed_paths(dir.path(), &db, ["src/other.ts"]).unwrap();
+        assert_eq!(surface_marker(&db), version);
+        assert_eq!(
+            edge_projection(&db),
+            fresh_edges("surface-fail-fresh-a", &[A, B, TO_A, USE, OTHER_EDITED])
+        );
     }
 
     #[test]

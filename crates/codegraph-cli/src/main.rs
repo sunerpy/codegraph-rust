@@ -28,6 +28,7 @@ use codegraph_graph::query::{SearchOptions, search_nodes};
 use codegraph_graph::{segment_match, segments};
 use codegraph_mcp::{McpServer, RunUntilAdoption};
 use codegraph_resolve::ReferenceResolver;
+use codegraph_resolve::module_surface::ModuleSurface;
 use codegraph_store::queries::SearchResult;
 use codegraph_store::{CorruptReason, ExtractionStatus, IndexLease, SlotOutcome, Store};
 use diagnostics::{DiagnosticArgs, DiagnosticRun, IndexTracker};
@@ -5694,7 +5695,10 @@ fn index_project_inner(
     let parse_started = std::time::Instant::now();
 
     // `None` for an MPEG transport stream named `.ts`: video, not source (#1910).
-    type ParsePayload = Option<(String, FileRecord, ExtractionResult)>;
+    // A JavaScript-family module's surface rides along for the consumer to
+    // record once every file row is stored (W4a-F3).
+    type ParsePayload = Option<(String, FileRecord, ExtractionResult, Option<ModuleSurface>)>;
+    let mut surfaces: Vec<(String, ModuleSurface)> = Vec::new();
     let schedule_tracker = tracker.clone();
     let parse_tracker = tracker.clone();
     let buffer_tracker = tracker.clone();
@@ -5748,11 +5752,12 @@ fn index_project_inner(
                 generated: detect_generated_file(relative, &hash_input),
             };
             parse_tracker.parsed(index, &result);
-            Ok(Some((relative.clone(), file, result)))
+            let surface = codegraph_watch::module_surfaces::surface_of(relative, language, &source);
+            Ok(Some((relative.clone(), file, result, surface)))
         },
         |buffered| buffer_tracker.buffered(buffered),
         |index, payload| {
-            let Some((_relative, file, mut result)) = payload else {
+            let Some((relative, file, mut result, surface)) = payload else {
                 files_not_source += 1;
                 persist_tracker.persisted(index);
                 return Ok(());
@@ -5791,6 +5796,9 @@ fn index_project_inner(
                 persist_tracker.failed(index, &error);
                 return Err(error);
             }
+            if let Some(surface) = surface {
+                surfaces.push((relative, surface));
+            }
             persist_tracker.persisted(index);
             Ok(())
         },
@@ -5821,6 +5829,15 @@ fn index_project_inner(
         store.upsert_nodes(&pending_nodes)?;
     }
     drop(pending_nodes);
+    // Every file row is stored: the module-surface rows can resolve what
+    // their barrels forward (W4a-F3).
+    codegraph_watch::module_surfaces::write_index_rows(
+        &store,
+        project,
+        options.max_file_size,
+        &surfaces,
+    )?;
+    drop(surfaces);
     finish_phase(&pb, "Persisted nodes");
     diagnostic_run.phase_end("node_write", node_write_started.elapsed(), json!({}));
 

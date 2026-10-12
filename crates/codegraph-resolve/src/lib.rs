@@ -32,6 +32,7 @@ mod js_store;
 mod jsx_tags;
 pub mod lru_cache;
 mod member_value;
+pub mod module_surface;
 pub mod name_matcher;
 mod object_literal;
 mod object_owners;

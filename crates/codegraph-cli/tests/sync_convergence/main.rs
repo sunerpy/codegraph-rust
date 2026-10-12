@@ -339,6 +339,19 @@ fn run_case(name: &str, case: &Case) {
             ));
         }
     }
+    // The module-surface rows and their version marker (W4a-F3) are no
+    // canonical surface, but the next sync reads them: a sync leaves them as a
+    // fresh index writes them.
+    let surface_rows = support::project_metadata_with_prefix(&fresh.db(), "js_module_surface");
+    for (driver, project) in [("cli", &cli), ("watch", &watch)] {
+        let rows = support::project_metadata_with_prefix(&project.db(), "js_module_surface");
+        if rows != surface_rows {
+            divergent.push(format!(
+                "=== {driver} driver: module-surface rows differ from a fresh index\n\
+                 synced: {rows:#?}\nfresh: {surface_rows:#?}"
+            ));
+        }
+    }
     assert!(
         divergent.is_empty(),
         "[{name}] incremental sync after a {:?} edit diverges from a fresh index\n\
@@ -637,6 +650,18 @@ matrix! {
     javascript_require_member_reaches_an_added_module,
     typescript_require_default_of_an_added_es_module,
     typescript_namespace_reexport_member_reaches_an_added_module,
+    typescript_namespace_reexport_names_another_module,
+    typescript_named_reexport_names_another_module,
+    typescript_nested_wildcard_reexport_names_another_module,
+    typescript_local_export_alias_names_another_declaration,
+    javascript_commonjs_forward_names_another_module,
+    typescript_barrel_gains_a_named_reexport,
+    javascript_export_list_drops_a_binding,
+    javascript_export_list_gains_a_binding,
+    javascript_sealed_module_gains_a_commonjs_export,
+    svelte_instance_script_becomes_a_module_script,
+    typescript_alias_forwarded_barrel_is_deleted,
+    typescript_workspace_entry_barrel_is_renamed,
     typescript_dollar_import_reaches_an_added_module,
     typescript_dollar_default_export_names_another_declaration,
     java_super_call_in_an_override_body_edit,
@@ -746,6 +771,121 @@ matrix! {
     typescript_react_dependency_appears_in_package_json,
     c_header_flips_to_cpp,
     javascript_file_gains_the_flow_pragma,
+}
+
+/// An index built before the module-surface rows existed (W4a-F3) can hold
+/// an edge an older sync left stale: such a sync re-extracted a barrel that
+/// came to forward another module and never refreshed the barrel's importers.
+/// The test fakes that index (the barrel's file row says its new text, its
+/// importer's edge still goes the old way, no marker and no rows), then an
+/// unrelated edit is synced: both drivers must reconcile every
+/// JavaScript-family file, match a fresh index, and leave the rows and marker
+/// a fresh index writes.
+#[test]
+fn surface_bootstrap_reconciles_an_index_built_before_the_rows() {
+    const A: &str = "export function safeParse(value: unknown) {\n  return value;\n}\n";
+    const B: &str = "export function safeParse(value: unknown) {\n  return [value];\n}\n";
+    const USE: &str = "import { safeParse } from './index';\n\nexport function check() {\n  return safeParse(1);\n}\n";
+    const TO_B: &str = "export * from './b';\n";
+    const OTHER: &str = "export const other = 2;\n";
+    let before = [
+        ("src/a.ts", A),
+        ("src/b.ts", B),
+        ("src/index.ts", "export * from './a';\n"),
+        ("src/use.ts", USE),
+        ("src/other.ts", "export const other = 1;\n"),
+    ];
+    let index_stale = |label: &str| {
+        let mut project = before
+            .iter()
+            .fold(
+                support::Project::named(label),
+                |project, (path, contents)| project.file(path, contents),
+            )
+            .index();
+        project.write("src/index.ts", TO_B);
+        let db = project.db();
+        let disk = fs::metadata(project.root().join("src/index.ts")).unwrap();
+        let modified = disk
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        let updated = conn
+            .execute(
+                "UPDATE files SET content_hash = ?1, size = ?2, modified_at = ?3 WHERE path = 'src/index.ts'",
+                rusqlite::params![
+                    codegraph_core::node_id::hash_content(TO_B),
+                    TO_B.len() as i64,
+                    modified
+                ],
+            )
+            .unwrap();
+        assert_eq!(updated, 1);
+        conn.execute(
+            "DELETE FROM project_metadata WHERE substr(key, 1, 17) = 'js_module_surface'",
+            [],
+        )
+        .unwrap();
+        conn.close().unwrap();
+        project.reload();
+        assert!(
+            !project
+                .graph()
+                .edges_matching("function check", "calls", "function safeParse @src/a.ts")
+                .is_empty(),
+            "the faked index keeps the stale edge\n{}",
+            project.graph().report()
+        );
+        project.write("src/other.ts", OTHER);
+        project
+    };
+
+    let mut cli = index_stale("cli");
+    cli.sync();
+    let mut watch = index_stale("watch");
+    watcher_sync(&watch, &["src/other.ts"]);
+    watch.reload();
+
+    let fresh = [
+        ("src/a.ts", A),
+        ("src/b.ts", B),
+        ("src/index.ts", TO_B),
+        ("src/use.ts", USE),
+        ("src/other.ts", OTHER),
+    ]
+    .iter()
+    .fold(
+        support::Project::named("fresh"),
+        |project, (path, contents)| project.file(path, contents),
+    )
+    .index();
+    let expected = canonicalize_db(&fresh.db()).expect("canonicalize the fresh index");
+    for (driver, project) in [("cli", &cli), ("watch", &watch)] {
+        let actual = canonicalize_db(&project.db()).expect("canonicalize the synced index");
+        if let Err(diff) = diff_canonical(&expected, &actual, None) {
+            panic!(
+                "[{driver}] the reconciled index differs from a fresh one\n{}{diff}",
+                readable_difference(fresh.graph(), project.graph()),
+            );
+        }
+    }
+    let surface_rows = support::project_metadata_with_prefix(&fresh.db(), "js_module_surface");
+    assert!(
+        surface_rows
+            .iter()
+            .any(|(key, _)| key == "js_module_surface_version"),
+        "{surface_rows:?}"
+    );
+    for (driver, project) in [("cli", &cli), ("watch", &watch)] {
+        assert_eq!(
+            support::project_metadata_with_prefix(&project.db(), "js_module_surface"),
+            surface_rows,
+            "[{driver}] module-surface rows"
+        );
+    }
 }
 
 #[test]

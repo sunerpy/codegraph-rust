@@ -786,6 +786,26 @@ fn node_kind(kind: &str) -> &str {
     kind
 }
 
+/// The `project_metadata` rows of `db` whose key starts with `prefix`, by
+/// key. The sync matrix compares the module-surface rows a sync leaves with a
+/// fresh index's; the probes do not read them.
+#[allow(dead_code)]
+#[track_caller]
+pub fn project_metadata_with_prefix(db: &Path, prefix: &str) -> Vec<(String, String)> {
+    let conn = open_immutable(db);
+    let mut stmt = conn
+        .prepare(
+            "SELECT key, value FROM project_metadata WHERE substr(key, 1, ?2) = ?1 ORDER BY key",
+        )
+        .expect("prepare the project_metadata read");
+    stmt.query_map(
+        rusqlite::params![prefix, prefix.chars().count() as i64],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+    .and_then(|rows| rows.collect::<rusqlite::Result<Vec<_>>>())
+    .unwrap_or_else(|err| panic!("read project_metadata of {}: {err}", db.display()))
+}
+
 /// Opens `db` read-only with `immutable=1`: no lock, no `-wal`/`-shm`.
 ///
 /// An immutable connection does not read a write-ahead log, so a non-empty one

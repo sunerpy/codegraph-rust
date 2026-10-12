@@ -298,7 +298,16 @@ method values that read through a module global it declares or can write, in
 that module and its importers, since the global's type is read from statements
 no node records; a changed `conftest.py`, or a module one pulls in, refreshes
 the functions under its reach that take a parameter named like one of its
-fixtures, since a fixture's return type types that parameter; an import
+fixtures, since a fixture's return type types that parameter; a
+JavaScript-family file whose module surface moved (its re-exports, export
+aliases and lists, CommonJS default, sealed-ness or component scripts, kept as
+a digest per file in `project_metadata`), and every file that came or went,
+sends the direct dependents of it and of the barrels that forward it (by the
+targets their rows recorded or what their sources resolve to now) down the
+whole-file lane and touches the names it declares, since no node records any
+of that text; a sync withdraws the surface marker before its first mutation
+and restores it last, so one that fails in between leaves the next sync to
+reconcile every JavaScript-family file; an import
 names a file, a folder or a namespace rather than a symbol, so the parked
 imports an added file or a changed file's namespace can satisfy (by the file's
 name and stem, its folder's, or the namespace's whole name) send their files

@@ -595,19 +595,23 @@ fn is_sealed_js_module(file_path: &str, context: &dyn ResolutionContext) -> bool
     let Some(facts) = context.source_facts(file_path) else {
         return false;
     };
-    facts.js_sealed_module(|facts| {
-        let source = facts.source();
-        if !source.contains("import") {
-            return false;
-        }
-        // CommonJS assignments can execute inside template interpolations,
-        // which the blanked view hides, so this exemption reads raw source.
-        if cjs_export_marker().is_match(source) {
-            return false;
-        }
-        let code = facts.ts_blanked();
-        js_import_marker().is_match(code) && !js_export_marker().is_match(code)
-    })
+    facts.js_sealed_module(is_sealed_by_text)
+}
+
+/// The text half of [`is_sealed_js_module`]: an `import` statement and no
+/// `export`, in a file with no CommonJS export.
+pub(crate) fn is_sealed_by_text(facts: &crate::source_facts::SourceFacts) -> bool {
+    let source = facts.source();
+    if !source.contains("import") {
+        return false;
+    }
+    // CommonJS assignments can execute inside template interpolations,
+    // which the blanked view hides, so this exemption reads raw source.
+    if cjs_export_marker().is_match(source) {
+        return false;
+    }
+    let code = facts.ts_blanked();
+    js_import_marker().is_match(code) && !js_export_marker().is_match(code)
 }
 
 /// A line-initial `import` statement (`HAS_IMPORT_STATEMENT`).
@@ -703,7 +707,9 @@ fn is_unexported_module_binding(candidate: &Node, context: &dyn ResolutionContex
 
 /// The names an ES module's export lists name, or `None` for a file that is
 /// no ES module (no `import` / `export`, CommonJS, or `declare global`).
-fn read_module_exports(facts: &crate::source_facts::SourceFacts) -> Option<HashSet<String>> {
+pub(crate) fn read_module_exports(
+    facts: &crate::source_facts::SourceFacts,
+) -> Option<HashSet<String>> {
     static EXPORT_LIST: OnceLock<Regex> = OnceLock::new();
     static EXPORT_DEFAULT_NAME: OnceLock<Regex> = OnceLock::new();
     static EXPORT_DEFAULT_OBJECT: OnceLock<Regex> = OnceLock::new();

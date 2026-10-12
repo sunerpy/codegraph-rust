@@ -2206,7 +2206,8 @@ fn resolve_java_imported_reference(
 
 /// What `module.exports = …` (also `exports = module.exports = …`) default
 /// exports (upstream #2189 `commonJsDefaultExport`).
-enum CommonJsDefault {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CommonJsDefault {
     /// The module it forwards: `module.exports = require('./lib/express')`.
     Forward(String),
     /// The name it binds: `createApplication`, `function name(`, `class Name`.
@@ -2217,11 +2218,15 @@ fn commonjs_default_export(
     file_path: &str,
     context: &dyn ResolutionContext,
 ) -> Option<CommonJsDefault> {
-    static COMMONJS_DEFAULT_EXPORT: OnceLock<Regex> = OnceLock::new();
     if !is_js_family_file(file_path) {
         return None;
     }
-    let source = context.read_file_shared(file_path)?;
+    commonjs_default_of(&context.read_file_shared(file_path)?)
+}
+
+/// [`commonjs_default_export`] read from a JS-family file's text.
+pub(crate) fn commonjs_default_of(source: &str) -> Option<CommonJsDefault> {
+    static COMMONJS_DEFAULT_EXPORT: OnceLock<Regex> = OnceLock::new();
     if !source.contains("module.exports") {
         return None;
     }
@@ -2231,7 +2236,7 @@ fn commonjs_default_export(
         )
         .expect("commonjs default export")
     });
-    let captures = pattern.captures(&source)?;
+    let captures = pattern.captures(source)?;
     if let Some(forward) = captures.get(1) {
         return Some(CommonJsDefault::Forward(forward.as_str().to_string()));
     }
@@ -2243,7 +2248,7 @@ fn commonjs_default_export(
 }
 
 /// `[cm]?[jt]sx?`: a JS-family file (upstream `JS_FAMILY_FILE`).
-fn is_js_family_file(file_path: &str) -> bool {
+pub(crate) fn is_js_family_file(file_path: &str) -> bool {
     let Some((_, extension)) = file_path.rsplit_once('.') else {
         return false;
     };
@@ -2287,6 +2292,18 @@ fn commonjs_alias_target(
         .map(|n| n.as_ref().clone())
 }
 
+/// Whether a JS-family file's text holds an `export default` statement
+/// (upstream #2433 `ESM_DEFAULT_EXPORT_RE`).
+pub(crate) fn has_esm_default_statement(source: &str) -> bool {
+    static ESM_DEFAULT_EXPORT: OnceLock<Regex> = OnceLock::new();
+    source.contains("default")
+        && ESM_DEFAULT_EXPORT
+            .get_or_init(|| {
+                Regex::new(r"(?m)^[ \t]*export\s+default(?-u:\b)").expect("export default")
+            })
+            .is_match(source)
+}
+
 /// The declaration an ES module default-exports, when it has an ESM default
 /// export at all (upstream #2433 `hasEsmDefaultExport` / `esmDefaultExport`):
 /// the component a single-file component file is, else what an `export
@@ -2299,7 +2316,6 @@ fn esm_default_export(
     re_exports: &[ReExport],
     context: &dyn ResolutionContext,
 ) -> Option<Node> {
-    static ESM_DEFAULT_EXPORT: OnceLock<Regex> = OnceLock::new();
     if let Some(component) = nodes_in_file
         .iter()
         .find(|n| n.is_exported && n.kind == NodeKind::Component)
@@ -2309,14 +2325,7 @@ fn esm_default_export(
     if !is_js_family_file(file_path) {
         return None;
     }
-    let source = context.read_file_shared(file_path)?;
-    if !source.contains("default")
-        || !ESM_DEFAULT_EXPORT
-            .get_or_init(|| {
-                Regex::new(r"(?m)^[ \t]*export\s+default(?-u:\b)").expect("export default")
-            })
-            .is_match(&source)
-    {
+    if !has_esm_default_statement(&context.read_file_shared(file_path)?) {
         return None;
     }
     let bound = re_exports.iter().find_map(|rex| match rex {
