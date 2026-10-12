@@ -626,6 +626,7 @@ matrix! {
     python_fixture_returns_another_class,
     python_conftest_plugs_a_fixture_module,
     python_plugged_fixture_returns_another_class,
+    python_aliased_plugged_fixture_returns_another_class,
     python_closer_conftest_overrides_a_fixture,
     python_django_manager_result_body_edit,
     python_module_global_retyped_in_its_module,

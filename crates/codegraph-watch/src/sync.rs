@@ -1150,13 +1150,11 @@ fn note_python_fixture_readers(
             }
             continue;
         }
-        // Only a module that imports pytest can define a fixture.
-        if names.is_empty()
-            || !change
-                .statements
-                .iter()
-                .any(|statement| statement.contains("pytest"))
-        {
+        // Resolution takes a decorator spelled `fixture` (`@pytest.fixture`,
+        // `@fixture` imported from anywhere) as a fixture, never asking what
+        // the module imports, so every changed module a conftest pulls in is
+        // followed.
+        if names.is_empty() {
             continue;
         }
         let pluggers = match &conftests {

@@ -1331,6 +1331,29 @@ pub fn python_plugged_fixture_returns_another_class() -> Case {
         .edge_after("function test_board", "calls", "method Stray::pin")
 }
 
+/// Upstream #2228: a fixture decorated through an alias (`from helpers
+/// import fixture`, `@fixture`) in a module a conftest pulls in is a fixture
+/// by its decorator alone, as on a fresh index; coming to return another
+/// class, it retypes an unchanged test's parameter although the module never
+/// names pytest.
+pub fn python_aliased_plugged_fixture_returns_another_class() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Python])
+        .file("app/models.py", PYTHON_FIXTURE_MODELS)
+        .file("helpers.py", "from pytest import fixture\n")
+        .file("tests/conftest.py", "from tests.fixtures.plugged import *  # noqa\n")
+        .file(
+            "tests/fixtures/plugged.py",
+            "from helpers import fixture\nfrom app.models import Board, Stray\n\n\n@fixture\ndef board():\n    return Board()\n",
+        )
+        .file("tests/test_board.py", "def test_board(board):\n    board.pin()\n")
+        .write(
+            "tests/fixtures/plugged.py",
+            "from helpers import fixture\nfrom app.models import Board, Stray\n\n\n@fixture\ndef board():\n    return Stray()\n",
+        )
+        .edge_before("function test_board", "calls", "method Board::pin")
+        .edge_after("function test_board", "calls", "method Stray::pin")
+}
+
 /// Upstream #2228: a closer conftest's fixture of the same name, added
 /// later, is what an unchanged test below it takes.
 pub fn python_closer_conftest_overrides_a_fixture() -> Case {
