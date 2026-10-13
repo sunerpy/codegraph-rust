@@ -5755,6 +5755,298 @@ pub fn cfml_inherited_method_body_edit() -> Case {
         .edge_throughout("method Handler::index", "calls", "method Base::getSetting")
 }
 
+/// Upstream #1152: a dotted component path names its supertype by
+/// directory, so the component it names appearing in another file links the
+/// unchanged subclass, as on a fresh index.
+pub fn cfml_dotted_extends_of_an_added_component() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Cfml])
+        .file(
+            "handlers/Main.cfc",
+            "component extends=\"coldbox.system.web.Controller\" {\n  function index() {\n    return handle();\n  }\n}\n",
+        )
+        .write(
+            "system/web/Controller.cfc",
+            "component {\n  function handle() {\n    return 1;\n  }\n}\n",
+        )
+        .edge_after(
+            "class handlers/Main.cfc::Main",
+            "extends",
+            "class system/web/Controller.cfc::Controller",
+        )
+}
+
+/// Upstream #1152: among same-named components the one whose directories
+/// corroborate the most of the path wins, so a better-corroborated one
+/// appearing in another file takes the unchanged subclass's `extends`.
+pub fn cfml_dotted_extends_takes_a_better_corroborated_component() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Cfml])
+        .file("web/Controller.cfc", "component {\n}\n")
+        .file(
+            "handlers/Main.cfc",
+            "component extends=\"coldbox.system.web.Controller\" {\n}\n",
+        )
+        .write("system/web/Controller.cfc", "component {\n}\n")
+        .edge_before(
+            "class handlers/Main.cfc::Main",
+            "extends",
+            "class web/Controller.cfc::Controller",
+        )
+        .edge_after(
+            "class handlers/Main.cfc::Main",
+            "extends",
+            "class system/web/Controller.cfc::Controller",
+        )
+        .no_edge_after(
+            "class handlers/Main.cfc::Main",
+            "extends",
+            "class web/Controller.cfc::Controller",
+        )
+}
+
+/// Upstream #1152 / #1154: a relative component path (FW/1's `../base`)
+/// resolves against the referencing file once the component appears.
+pub fn cfml_relative_extends_of_an_added_component() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Cfml])
+        .file(
+            "examples/sub/app.cfc",
+            "component extends=\"../base\" {\n}\n",
+        )
+        .write(
+            "examples/base.cfc",
+            "component {\n  function shared() {\n    return 1;\n  }\n}\n",
+        )
+        .edge_after(
+            "class examples/sub/app.cfc::app",
+            "extends",
+            "class examples/base.cfc::base",
+        )
+}
+
+/// Upstream #1155: a receiver typed by its declaration reaches the method its
+/// component declares, so the method appearing in that component's file
+/// links the unchanged call, and never the same-named method of another.
+pub fn cfml_typed_receiver_reaches_a_method_its_type_gains() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Cfml])
+        .file(
+            "svc/UserService.cfc",
+            "component {\n  function load(any u) {\n    return u;\n  }\n}\n",
+        )
+        .file(
+            "svc/OrderService.cfc",
+            "component {\n  function save(any o) {\n    return o;\n  }\n}\n",
+        )
+        .file(
+            "handlers/Main.cfc",
+            "component {\n  function bare() {\n    var svc = new UserService();\n    return svc.save(1);\n  }\n}\n",
+        )
+        .write(
+            "svc/UserService.cfc",
+            "component {\n  function load(any u) {\n    return u;\n  }\n  function save(any u) {\n    return u;\n  }\n}\n",
+        )
+        .edge_after("method Main::bare", "calls", "method UserService::save")
+        .no_edge_after("method Main::bare", "calls", "method OrderService::save")
+}
+
+/// W4-CF-02: a same-named component appearing in another directory leaves
+/// the unchanged caller's bare type name ambiguous, so its call loses its
+/// edge, while a written path still tells the components apart.
+pub fn cfml_typed_receiver_namesake_appears() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Cfml])
+        .file(
+            "a/UserService.cfc",
+            "component {\n  function save(any u) {\n    return u;\n  }\n}\n",
+        )
+        .file(
+            "handlers/Main.cfc",
+            "component {\n  function bare() {\n    var svc = new UserService();\n    return svc.save(1);\n  }\n  function dotted() {\n    var svc = new a.UserService();\n    return svc.save(2);\n  }\n}\n",
+        )
+        .write(
+            "b/UserService.cfc",
+            "component {\n  function save(any u) {\n    return u;\n  }\n}\n",
+        )
+        .edge_before(
+            "method Main::bare",
+            "calls",
+            "method UserService::save @a/UserService.cfc",
+        )
+        .no_edge_after(
+            "method Main::bare",
+            "calls",
+            "method UserService::save @a/UserService.cfc",
+        )
+        .no_edge_after(
+            "method Main::bare",
+            "calls",
+            "method UserService::save @b/UserService.cfc",
+        )
+        .edge_after(
+            "method Main::dotted",
+            "calls",
+            "method UserService::save @a/UserService.cfc",
+        )
+}
+
+/// W4-CF-02: once the namesake leaves, the unchanged caller's bare type
+/// name names one component again, and its call, unresolved while the two
+/// stood side by side, reaches it.
+pub fn cfml_typed_receiver_namesake_leaves() -> Case {
+    Case::new(Change::DeleteImportedModule, &[Language::Cfml])
+        .file(
+            "a/UserService.cfc",
+            "component {\n  function save(any u) {\n    return u;\n  }\n}\n",
+        )
+        .file(
+            "b/UserService.cfc",
+            "component {\n  function save(any u) {\n    return u;\n  }\n}\n",
+        )
+        .file(
+            "handlers/Main.cfc",
+            "component {\n  function bare() {\n    var svc = new UserService();\n    return svc.save(1);\n  }\n}\n",
+        )
+        .remove("b/UserService.cfc")
+        .edge_after(
+            "method Main::bare",
+            "calls",
+            "method UserService::save @a/UserService.cfc",
+        )
+}
+
+/// More unresolved `….save` calls than one tail retries in a sync
+/// (`NAME_TAIL_RETRY_CEILING`, 500): untyped receivers no `save` is named
+/// after.
+static CFML_UNTYPED_SAVE_CALLS: LazyLock<String> = LazyLock::new(|| {
+    let mut text = String::from("component {\n  function noise() {\n");
+    for index in 0..501 {
+        text.push_str(&format!("    n{index}.save({index});\n"));
+    }
+    text.push_str("    return 0;\n  }\n}\n");
+    text
+});
+
+/// W4-CF-02: the namesake leaving settles the unchanged caller's parked
+/// typed call even when more parked calls share its tail than the name-tail
+/// retry wakes.
+pub fn cfml_typed_receiver_namesake_leaves_past_the_tail_ceiling() -> Case {
+    Case::new(Change::DeleteImportedModule, &[Language::Cfml])
+        .file(
+            "a/UserService.cfc",
+            "component {\n  function save(any u) {\n    return u;\n  }\n}\n",
+        )
+        .file(
+            "b/UserService.cfc",
+            "component {\n  function save(any u) {\n    return u;\n  }\n}\n",
+        )
+        .file(
+            "handlers/Main.cfc",
+            "component {\n  function bare() {\n    var svc = new UserService();\n    return svc.save(1);\n  }\n}\n",
+        )
+        .file("handlers/Noise.cfc", CFML_UNTYPED_SAVE_CALLS.as_str())
+        .remove("b/UserService.cfc")
+        .edge_after(
+            "method Main::bare",
+            "calls",
+            "method UserService::save @a/UserService.cfc",
+        )
+}
+
+/// W4-CF-02: a namesake whose directories corroborate more of the written
+/// path takes the unchanged caller's typed call.
+pub fn cfml_typed_receiver_takes_a_better_corroborated_namesake() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Cfml])
+        .file(
+            "a/UserService.cfc",
+            "component {\n  function save(any u) {\n    return u;\n  }\n}\n",
+        )
+        .file(
+            "handlers/Main.cfc",
+            "component {\n  function dotted() {\n    var svc = new x.a.UserService();\n    return svc.save(1);\n  }\n}\n",
+        )
+        .write(
+            "x/a/UserService.cfc",
+            "component {\n  function save(any u) {\n    return u;\n  }\n}\n",
+        )
+        .edge_before(
+            "method Main::dotted",
+            "calls",
+            "method UserService::save @a/UserService.cfc",
+        )
+        .edge_after(
+            "method Main::dotted",
+            "calls",
+            "method UserService::save @x/a/UserService.cfc",
+        )
+        .no_edge_after(
+            "method Main::dotted",
+            "calls",
+            "method UserService::save @a/UserService.cfc",
+        )
+}
+
+/// Upstream #2296: a `<cfscript>` block at component scope declares the
+/// component's methods, read with the cfscript grammar in place; editing a
+/// method's body moves its call.
+pub fn cfml_script_tag_method_body_edit() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Cfml])
+        .file(
+            "mod/Helpers.cfc",
+            "component {\n  function first() {\n    return 1;\n  }\n  function second() {\n    return 2;\n  }\n}\n",
+        )
+        .file(
+            "mod/ModuleConfig.cfc",
+            "<cfcomponent>\n<cfscript>\nfunction configure() {\n  var helpers = new Helpers();\n  return helpers.first();\n}\n</cfscript>\n</cfcomponent>\n",
+        )
+        .write(
+            "mod/ModuleConfig.cfc",
+            "<cfcomponent>\n<cfscript>\nfunction configure() {\n  var helpers = new Helpers();\n  return helpers.second();\n}\n</cfscript>\n</cfcomponent>\n",
+        )
+        .edge_before("method ModuleConfig::configure", "calls", "method Helpers::first")
+        .edge_after("method ModuleConfig::configure", "calls", "method Helpers::second")
+}
+
+/// Upstream #2296: a `<cfquery>` body's `#hash#` calls and a method wrapped
+/// in `<cfprocessingdirective>` are the method's; an edit to the SQL moves
+/// the call.
+pub fn cfml_query_body_in_a_wrapped_method_edit() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Cfml])
+        .file(
+            "Application.cfc",
+            "<cfcomponent>\n<cfprocessingdirective suppresswhitespace=\"true\">\n<cffunction name=\"onRequestStart\">\n<cfquery name=\"q\">SELECT #firstColumn()# FROM t</cfquery>\n</cffunction>\n<cffunction name=\"firstColumn\"><cfreturn \"a\"></cffunction>\n<cffunction name=\"secondColumn\"><cfreturn \"b\"></cffunction>\n</cfprocessingdirective>\n</cfcomponent>\n",
+        )
+        .write(
+            "Application.cfc",
+            "<cfcomponent>\n<cfprocessingdirective suppresswhitespace=\"true\">\n<cffunction name=\"onRequestStart\">\n<cfquery name=\"q\">SELECT #secondColumn()# FROM t</cfquery>\n</cffunction>\n<cffunction name=\"firstColumn\"><cfreturn \"a\"></cffunction>\n<cffunction name=\"secondColumn\"><cfreturn \"b\"></cffunction>\n</cfprocessingdirective>\n</cfcomponent>\n",
+        )
+        .edge_before(
+            "method Application::onRequestStart",
+            "calls",
+            "method Application::firstColumn",
+        )
+        .edge_after(
+            "method Application::onRequestStart",
+            "calls",
+            "method Application::secondColumn",
+        )
+}
+
+/// Upstream #2296: `<cfinterface>` is an interface, so a component's
+/// `implements` reaches it once the file appears.
+pub fn cfml_implements_an_added_interface_tag() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Cfml])
+        .file(
+            "model/Catalog.cfc",
+            "<cfcomponent implements=\"ISearchable\">\n<cffunction name=\"search\" access=\"public\"></cffunction>\n</cfcomponent>\n",
+        )
+        .write(
+            "model/ISearchable.cfc",
+            "<cfinterface>\n<cffunction name=\"search\" access=\"public\"></cffunction>\n</cfinterface>\n",
+        )
+        .edge_after(
+            "class model/Catalog.cfc::Catalog",
+            "implements",
+            "interface model/ISearchable.cfc::ISearchable",
+        )
+}
+
 pub fn cfml_change_a_base_component() -> Case {
     Case::new(Change::EditHeritage, &[Language::Cfml])
         .file(

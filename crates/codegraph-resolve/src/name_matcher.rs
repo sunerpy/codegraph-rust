@@ -3796,6 +3796,35 @@ fn local_receiver_type_patterns_tagged(language: Language, r: &str) -> Vec<(Rege
             format!(r"\b{r}\b\s*=\s*([A-Z][\w.]*)\s*\("),
             format!(r"\b{r}\b\s*:\s*([A-Z][\w.]*)"),
         ],
+        // CFML (upstream #1155): `svc = new UserService()` / `new
+        // path.to.UserService()` (the type is the last segment; the path
+        // tells same-named components apart, `cfml_scope::typed_receiver_call`),
+        // `createObject("component", "path.to.X")` and the one-argument
+        // `createObject("path.to.X")`, a typed cfscript parameter
+        // (`required UserService svc`; CFML's built-in types are lowercase by
+        // convention), a `<cfargument>` and a component `property` (WireBox's
+        // `inject` included), either attribute order. The scan reads raw
+        // lines, so tag markup (`<cfset svc = new X()>`) matches too.
+        Language::Cfml => vec![
+            format!(r"\b{r}\b\s*=\s*new\s+([A-Za-z_][\w.]*)"),
+            format!(
+                r#"\b{r}\b\s*=\s*[Cc]reate[Oo]bject\s*\(\s*["']component["']\s*,\s*["']([\w.]+)["']"#
+            ),
+            format!(r#"\b{r}\b\s*=\s*[Cc]reate[Oo]bject\s*\(\s*["']([\w.]+)["']\s*\)"#),
+            format!(r"\b([A-Z][\w.]*)\s+{r}\b\s*[=;,)]"),
+            format!(
+                r#"(?i)\bcfargument[^>\n]*\bname\s*=\s*["']{r}["'][^>\n]*\btype\s*=\s*["']([\w.]+)["']"#
+            ),
+            format!(
+                r#"(?i)\bcfargument[^>\n]*\btype\s*=\s*["']([\w.]+)["'][^>\n]*\bname\s*=\s*["']{r}["']"#
+            ),
+            format!(
+                r#"(?i)\b(?:cf)?property\b[^;\n]*\bname\s*=\s*["']{r}["'][^;\n]*\b(?:type|inject)\s*=\s*["']([\w.]+)["']"#
+            ),
+            format!(
+                r#"(?i)\b(?:cf)?property\b[^;\n]*\b(?:type|inject)\s*=\s*["']([\w.]+)["'][^;\n]*\bname\s*=\s*["']{r}["']"#
+            ),
+        ],
         Language::Rust => vec![
             format!(r"\blet\s+(?:mut\s+)?{r}\b(?:\s*:[^=]+)?\s*=\s*&?(?:mut\s+)?([A-Z]\w*)"),
             format!(r"\b{r}\s*:\s*&?(?:mut\s+)?([A-Z]\w*)"),
@@ -3880,9 +3909,42 @@ pub(crate) fn infer_local_receiver_type(
     reference: &RefView,
     context: &dyn ResolutionContext,
 ) -> Option<String> {
-    let escaped = regex_escape(receiver_name);
-    let patterns = local_receiver_type_patterns_tagged(reference.language, &escaped);
-    if patterns.is_empty() {
+    infer_local_receiver_declaration(receiver_name, reference, context).map(|(name, _)| name)
+}
+
+/// [`infer_local_receiver_type`] with the type as the declaration writes it
+/// beside its name (`a.UserService` beside `UserService`): a CFML component
+/// path says which of several same-named components it is (W4-CF-02;
+/// upstream keeps it as `decl.raw`, for Go).
+pub(crate) fn infer_local_receiver_declaration(
+    receiver_name: &str,
+    reference: &RefView,
+    context: &dyn ResolutionContext,
+) -> Option<(String, String)> {
+    // CFML scopes (upstream #1155): `variables.svc` / `this.svc` name a
+    // component field whose assignment or `property` usually lives outside
+    // the calling function (the init pseudo-constructor, WireBox injection),
+    // and `local.svc` / `arguments.svc` a function local or argument. The
+    // scope is stripped so the declarations match the bare name, and a
+    // component field is looked for in the whole file: the nearest
+    // declaration above the call still wins, then the rest of the file below.
+    let (scan_receiver, component_scoped) = match cfml_scoped_receiver(receiver_name, reference) {
+        Some((scope, member)) => (
+            member,
+            matches!(scope, CfmlScope::Variables | CfmlScope::This),
+        ),
+        None => (receiver_name, false),
+    };
+    let escaped = regex_escape(scan_receiver);
+    // A CFML scan compiles its eight patterns only once a line could match
+    // one ([`cfml_line_may_declare`]): compiled for every member call, they
+    // made re-resolving a file of a few hundred calls take seconds.
+    let lazy = reference.language == Language::Cfml;
+    let compiled: OnceCell<Vec<(Regex, PatternCheck)>> = OnceCell::new();
+    let patterns = || {
+        compiled.get_or_init(|| local_receiver_type_patterns_tagged(reference.language, &escaped))
+    };
+    if !lazy && patterns().is_empty() {
         return None;
     }
     let source = context.read_file(&reference.file_path)?;
@@ -3894,29 +3956,112 @@ pub(crate) fn infer_local_receiver_type(
         return None;
     }
     let call_idx = ((reference.line - 1).max(0) as usize).min(lines.len() - 1);
-    let start_idx = (enclosing_scope_start_line(reference, context) - 1).max(0) as usize;
-
-    for i in (start_idx..=call_idx).rev() {
-        let line = lines[i];
-        // A generated/minified line is not where a human declaration lives, and
-        // regexing multi-KB text per ref is pure waste — skip it.
+    let start_idx = if component_scoped {
+        0
+    } else {
+        (enclosing_scope_start_line(reference, context) - 1).max(0) as usize
+    };
+    let match_line = |line: &str| -> Option<(String, String)> {
+        // A generated/minified line is not where a human declaration lives,
+        // and regexing multi-KB text per ref is pure waste — skip it.
         if line.len() > 10_000 {
-            continue;
+            return None;
         }
-        for (re, check) in &patterns {
+        if lazy && !cfml_line_may_declare(line, scan_receiver) {
+            return None;
+        }
+        for (re, check) in patterns() {
             if let Some(caps) = re.captures(line) {
                 if let (Some(whole), Some(m)) = (caps.get(0), caps.get(1)) {
                     if !check.passes(line, whole, m) {
                         continue;
                     }
                     if let Some(ty) = normalize_inferred_type_name(m.as_str()) {
-                        return Some(ty);
+                        return Some((ty, m.as_str().to_string()));
                     }
                 }
             }
         }
+        None
+    };
+    for i in (start_idx..=call_idx).rev() {
+        if let Some(declared) = match_line(lines[i]) {
+            return Some(declared);
+        }
+    }
+    if component_scoped {
+        for line in &lines[call_idx + 1..] {
+            if let Some(declared) = match_line(line) {
+                return Some(declared);
+            }
+        }
     }
     None
+}
+
+/// Whether `line` could match a CFML receiver pattern for `receiver`
+/// ([`local_receiver_type_patterns_tagged`]); never false where one does.
+/// The `new`, `createObject` and typed-parameter forms all write the
+/// receiver followed, past whitespace, by `=`, `;`, `,` or `)`; the
+/// `<cfargument>` and `property` forms, which read the receiver in any case,
+/// an `=` on a line naming `cfargument` or `property` (no letter of either
+/// folds to a non-ASCII one, so ASCII lowercasing finds every case).
+fn cfml_line_may_declare(line: &str, receiver: &str) -> bool {
+    if line.contains('=') {
+        let lower = line.to_ascii_lowercase();
+        if lower.contains("cfargument") || lower.contains("property") {
+            return true;
+        }
+    }
+    let Some(first) = receiver.chars().next() else {
+        return true;
+    };
+    let mut from = 0;
+    while let Some(at) = line[from..].find(receiver) {
+        let start = from + at;
+        if line[start + receiver.len()..]
+            .trim_start()
+            .starts_with(['=', ';', ',', ')'])
+        {
+            return true;
+        }
+        // Occurrences may overlap (`aa` in `aaa`).
+        from = start + first.len_utf8();
+    }
+    false
+}
+
+/// The CFML scope a receiver is written through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CfmlScope {
+    Variables,
+    This,
+    Local,
+    Arguments,
+}
+
+/// A CFML receiver written through a scope (`variables.svc`,
+/// `arguments.svc`; upstream's `/^(variables|this|local|arguments)\.(.+)$/i`):
+/// the scope and the rest.
+fn cfml_scoped_receiver<'r>(
+    receiver: &'r str,
+    reference: &RefView,
+) -> Option<(CfmlScope, &'r str)> {
+    if reference.language != Language::Cfml {
+        return None;
+    }
+    let (scope, rest) = receiver.split_once('.')?;
+    if rest.is_empty() {
+        return None;
+    }
+    let scope = match scope.to_ascii_lowercase().as_str() {
+        "variables" => CfmlScope::Variables,
+        "this" => CfmlScope::This,
+        "local" => CfmlScope::Local,
+        "arguments" => CfmlScope::Arguments,
+        _ => return None,
+    };
+    Some((scope, rest))
 }
 
 /// The C# keyword type (`string`, `int`, …) a local or parameter named
@@ -4613,6 +4758,9 @@ pub fn match_method_call(
     // language uses the shared source-based inferrer.
     if is_inferable_receiver_call(&reference.reference_name, reference.language) {
         let mut cpp_declaration = CppReceiverDeclaration::default();
+        // A CFML type as its declaration writes it: the component path tells
+        // same-named components apart (W4-CF-02).
+        let mut cfml_written: Option<String> = None;
         let mut inferred = if reference.language == Language::Cpp {
             infer_cpp_receiver_type(
                 &object_or_class,
@@ -4624,7 +4772,13 @@ pub fn match_method_call(
         } else {
             // The field lookup runs ONLY where the function-scope scan declined,
             // so it can add an inference but never change one (#1566, ESM only).
-            infer_local_receiver_type(&object_or_class, reference, context)
+            infer_local_receiver_declaration(&object_or_class, reference, context)
+                .map(|(name, written)| {
+                    if reference.language == Language::Cfml {
+                        cfml_written = Some(written);
+                    }
+                    name
+                })
                 .or_else(|| infer_class_field_receiver_type(&object_or_class, reference, context))
                 // A pytest test's parameter is what its fixture returns:
                 // flaskbb's `cli_runner.invoke(…)` is click's `CliRunner`, not
@@ -4727,16 +4881,37 @@ pub fn match_method_call(
             } else {
                 None
             };
-            if let Some(typed) = resolve_method_on_type(
-                &inferred,
-                &method_name,
-                reference,
-                context,
-                0.9,
-                ResolvedBy::InstanceMethod,
-                imported_fqn.as_deref(),
-                0,
-            ) {
+            let typed = if reference.language == Language::Cfml {
+                match crate::cfml_scope::typed_receiver_call(
+                    cfml_written.as_deref().unwrap_or(&inferred),
+                    &method_name,
+                    reference,
+                    context,
+                ) {
+                    crate::cfml_scope::TypedReceiverCall::Method(method) => Some(ResolvedRef {
+                        original: reference.clone(),
+                        target_node_id: method.id.clone(),
+                        confidence: 0.9,
+                        resolved_by: ResolvedBy::InstanceMethod,
+                    }),
+                    // The receiver is one of the namesakes and nothing says
+                    // which: a method picked by name below is a guess.
+                    crate::cfml_scope::TypedReceiverCall::Ambiguous => return None,
+                    crate::cfml_scope::TypedReceiverCall::Missing => None,
+                }
+            } else {
+                resolve_method_on_type(
+                    &inferred,
+                    &method_name,
+                    reference,
+                    context,
+                    0.9,
+                    ResolvedBy::InstanceMethod,
+                    imported_fqn.as_deref(),
+                    0,
+                )
+            };
+            if let Some(typed) = typed {
                 // `medium and 0xff` on an Int: the standard library's
                 // member, not a project `Int.and(Long)` (upstream #2174).
                 if reference.language == Language::Kotlin
@@ -12565,6 +12740,46 @@ mod tests {
         let ctx = Ctx::default().file("a.ts", "function f() {\n  lg.log();\n}\n");
         let r = refv("lg.log", EdgeKind::Calls, "a.ts", Language::TypeScript, 2);
         assert!(infer_local_receiver_type("lg", &r, &ctx).is_none());
+    }
+
+    #[test]
+    fn cfml_line_prefilter_admits_every_line_a_receiver_pattern_matches() {
+        let lines = [
+            "    var svc = new UserService();",
+            "<cfset svc = new app.models.UserService()>",
+            "    svc = createObject(\"component\", \"svc.UserService\");",
+            "    svc=CreateObject('svc.OrderService')",
+            "  function process(required UserService svc) {",
+            "  function process(UserService svc, any other) {",
+            "    UserService svc;",
+            "  <cfargument name=\"svc\" type=\"svc.UserService\">",
+            "  <CFARGUMENT type='UserService' NAME='SVC'>",
+            "  property name=\"svc\" inject=\"UserService\";",
+            "  <cfproperty type=\"UserService\" name=\"svc\">",
+            "    return svc.save(1);",
+            "    svc.save(1);",
+            "    n50.save(svc);",
+            "    var other = svc;",
+        ];
+        let patterns = local_receiver_type_patterns_tagged(Language::Cfml, "svc");
+        let mut declaring = 0;
+        for line in lines {
+            let matched = patterns.iter().any(|(re, check)| {
+                re.captures(line).is_some_and(|caps| {
+                    matches!((caps.get(0), caps.get(1)), (Some(whole), Some(m)) if check.passes(line, whole, m))
+                })
+            });
+            if matched {
+                declaring += 1;
+                assert!(cfml_line_may_declare(line, "svc"), "{line}");
+            }
+        }
+        assert_eq!(declaring, 11);
+        // A plain member call declares nothing, so no pattern is compiled
+        // for it.
+        assert!(!cfml_line_may_declare("    svc.save(1);", "svc"));
+        assert!(!cfml_line_may_declare("    n50.save(50);", "n5"));
+        assert!(cfml_line_may_declare("    aaa = new X();", "aa"));
     }
 
     #[test]

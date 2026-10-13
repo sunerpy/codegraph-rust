@@ -399,8 +399,12 @@ withdrawn and restored with the others; a `.cfc` file whose component row moved
 re-resolves, whole, the unchanged components whose `extends` names a class the
 changed files declare (closing over every component extending a reached name),
 since a bare call in a component reads its `extends` chain from the components'
-text; the `cfml_heads_version` marker is withdrawn and restored with the
-others; an
+text, and the unchanged CFML files holding a reference written with a receiver
+whose last segment names a method a changed component gained or lost (every
+method of one that came, went or was renamed) re-resolve whole, however many
+there are, since a typed call waits while components of its type's name in
+several files declare the method; the `cfml_heads_version` marker is withdrawn
+and restored with the others; an
 import names a file, a folder or a namespace rather than a symbol, so the parked
 imports an added file or a changed file's namespace can satisfy (by the file's
 name and stem, its folder's, or the namespace's whole name) send their files

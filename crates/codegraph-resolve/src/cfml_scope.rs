@@ -16,7 +16,7 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 
 use crate::csharp_types::js_regex;
-use crate::types::{RefView, ResolutionContext};
+use crate::types::{RefView, ResolutionContext, ResolvedBy, ResolvedRef};
 
 /// How many component files one chain holds (upstream's 30).
 const CHAIN_LIMIT: usize = 30;
@@ -198,6 +198,259 @@ pub(crate) fn is_cfml_method_in_scope(
         return true;
     }
     chain(&reference.file_path, context).contains(&method.file_path)
+}
+
+/// Whether `reference` names a CFML supertype by its component path
+/// (upstream #1152): an `extends` or `implements` written with a `.` or a
+/// `/`. A dotted `calls` ref is a member-access chain, never a path.
+pub(crate) fn is_cfml_component_path_ref(reference: &RefView) -> bool {
+    reference.language == Language::Cfml
+        && matches!(
+            reference.reference_kind,
+            EdgeKind::Extends | EdgeKind::Implements
+        )
+        && (reference.reference_name.contains('.') || reference.reference_name.contains('/'))
+}
+
+/// The CFML supertype a component path names (upstream
+/// `resolveCfmlComponentPath`, #1152 / #1154). Two forms exist:
+///
+/// - Relative, `extends="../base"` / `"./base"` (FW/1): resolved against the
+///   referencing file's directory; the class named by the last segment whose
+///   file is exactly that path (any case) is it.
+/// - Dotted, `extends="coldbox.system.web.Controller"`: dots are directories
+///   from the webroot or a mapping, whose leading segments may not exist in
+///   the repository (in coldbox itself the path is `system/web/
+///   Controller.cfc`). Among the CFML classes and interfaces of the last
+///   segment's name, the one whose parent directories match the most
+///   segments right to left (any case) is it; one matching none is an
+///   out-of-repository library's (mxunit, testbox), and a tie is no edge.
+///
+/// No other strategy sees the reference: the whole path can only mis-match.
+pub(crate) fn resolve_cfml_component_path(
+    reference: &RefView,
+    context: &dyn ResolutionContext,
+) -> Option<ResolvedRef> {
+    let candidates = |name: &str| -> Vec<Arc<Node>> {
+        context
+            .get_nodes_by_name_shared(name)
+            .into_iter()
+            .filter(|node| {
+                matches!(node.kind, NodeKind::Class | NodeKind::Interface)
+                    && node.language == Language::Cfml
+            })
+            .collect()
+    };
+    let norm = |path: &str| path.replace('\\', "/").to_ascii_lowercase();
+    let name = &reference.reference_name;
+    if name.contains('/') {
+        let rel = strip_cfc_suffix(name);
+        let from = reference.file_path.replace('\\', "/");
+        let mut parts: Vec<&str> = from.split('/').collect();
+        parts.pop();
+        for segment in rel.split('/') {
+            match segment {
+                "" | "." => {}
+                ".." => {
+                    parts.pop()?;
+                }
+                other => parts.push(other),
+            }
+        }
+        let class_name = parts.last().copied().filter(|n| !n.is_empty())?;
+        let want = norm(&format!("{}.cfc", parts.join("/")));
+        let mut found: Vec<Arc<Node>> = candidates(class_name)
+            .into_iter()
+            .filter(|candidate| norm(&candidate.file_path) == want)
+            .collect();
+        found.sort_by(|a, b| a.id.cmp(&b.id));
+        let target = found.into_iter().next()?;
+        return Some(ResolvedRef {
+            original: reference.clone(),
+            target_node_id: target.id.clone(),
+            confidence: 0.95,
+            resolved_by: ResolvedBy::FilePath,
+        });
+    }
+    let segments: Vec<&str> = name
+        .split('.')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    if segments.len() < 2 {
+        return None;
+    }
+    let class_name = segments[segments.len() - 1];
+    let directories = &segments[..segments.len() - 1];
+    let mut best: Option<Arc<Node>> = None;
+    let mut best_score = 0usize;
+    let mut tie = false;
+    let mut all = candidates(class_name);
+    all.sort_by(|a, b| {
+        (&a.file_path, a.start_line, &a.id).cmp(&(&b.file_path, b.start_line, &b.id))
+    });
+    for candidate in all {
+        let score = corroboration(directories, &candidate.file_path);
+        if score > best_score {
+            best = Some(candidate);
+            best_score = score;
+            tie = false;
+        } else if score == best_score && score > 0 {
+            tie = true;
+        }
+    }
+    if best_score == 0 || tie {
+        return None;
+    }
+    let best = best?;
+    Some(ResolvedRef {
+        original: reference.clone(),
+        target_node_id: best.id.clone(),
+        confidence: 0.9,
+        resolved_by: ResolvedBy::QualifiedName,
+    })
+}
+
+/// How many of a dotted component path's directories `file_path`'s own
+/// directories corroborate, right to left and in any case (upstream #1154):
+/// `system/web/Controller.cfc` corroborates two of `coldbox.system.web`.
+fn corroboration(directories: &[&str], file_path: &str) -> usize {
+    let path = file_path.replace('\\', "/");
+    let mut dirs: Vec<&str> = path.split('/').collect();
+    dirs.pop();
+    let mut score = 0usize;
+    while score < directories.len()
+        && score < dirs.len()
+        && directories[directories.len() - 1 - score]
+            .eq_ignore_ascii_case(dirs[dirs.len() - 1 - score])
+    {
+        score += 1;
+    }
+    score
+}
+
+/// What a call on a typed CFML receiver reaches ([`typed_receiver_call`]).
+#[derive(Debug)]
+pub(crate) enum TypedReceiverCall {
+    /// The method of the receiver's type, or of a supertype, the call means.
+    Method(Arc<Node>),
+    /// Components of the type's name in several files declare the method and
+    /// nothing written tells which one the receiver is.
+    Ambiguous,
+    /// Neither the type nor a supertype declares the method.
+    Missing,
+}
+
+/// The method a call on a CFML receiver reaches when its declaration writes
+/// its type as `written` (upstream #1155): `svc.save()` after `var svc = new
+/// a.UserService()`, `createObject("component", "a.UserService")` or a
+/// `<cfargument type="a.UserService">`.
+///
+/// Upstream reduces the written type to its last segment and, when
+/// components of that name in several files declare the method, takes the
+/// first. Here (KEEP-RUST, fail closed) the component is told apart the way
+/// CFML finds it: a dotted path by the directories its file corroborates,
+/// right to left and in any case, as an `extends` path is (#1154); a bare
+/// name by the call's own directory, which CFML searches first. No
+/// corroboration, a tie, or namesakes of a supertype (reached by its name
+/// alone) are [`TypedReceiverCall::Ambiguous`]. A method in one file only is
+/// the type's whatever the path says, as upstream has it.
+pub(crate) fn typed_receiver_call(
+    written: &str,
+    method_name: &str,
+    reference: &RefView,
+    context: &dyn ResolutionContext,
+) -> TypedReceiverCall {
+    let segments: Vec<&str> = written
+        .split('.')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    let Some((type_name, directories)) = segments.split_last() else {
+        return TypedReceiverCall::Missing;
+    };
+    typed_method_on(type_name, directories, method_name, reference, context, 0)
+}
+
+/// [`typed_receiver_call`] on the type `type_name` written under
+/// `directories`, walking supertypes as `resolve_method_on_type` does.
+fn typed_method_on(
+    type_name: &str,
+    directories: &[&str],
+    method_name: &str,
+    reference: &RefView,
+    context: &dyn ResolutionContext,
+    depth: u32,
+) -> TypedReceiverCall {
+    let want = format!("{type_name}::{method_name}");
+    let nested = format!("::{want}");
+    let matches: Vec<Arc<Node>> = context
+        .get_nodes_by_name_shared(method_name)
+        .into_iter()
+        .filter(|m| {
+            m.kind == NodeKind::Method
+                && crate::name_matcher::same_language_family(m.language, reference.language)
+                && (m.qualified_name == want || m.qualified_name.ends_with(&nested))
+        })
+        .collect();
+    if matches.is_empty() {
+        if depth < 4 {
+            for supertype in context.get_supertypes(type_name, reference.language) {
+                match typed_method_on(&supertype, &[], method_name, reference, context, depth + 1) {
+                    TypedReceiverCall::Missing => {}
+                    reached => return reached,
+                }
+            }
+        }
+        return TypedReceiverCall::Missing;
+    }
+    let files: BTreeSet<&str> = matches.iter().map(|m| m.file_path.as_str()).collect();
+    if files.len() == 1 {
+        return TypedReceiverCall::Method(Arc::clone(&matches[0]));
+    }
+    if depth > 0 {
+        return TypedReceiverCall::Ambiguous;
+    }
+    let chosen = if directories.is_empty() {
+        let here = directory_of(&reference.file_path);
+        let local: Vec<&str> = files
+            .iter()
+            .copied()
+            .filter(|file| directory_of(file) == here)
+            .collect();
+        match local.as_slice() {
+            [only] => Some(*only),
+            _ => None,
+        }
+    } else {
+        let mut best: Option<&str> = None;
+        let mut best_score = 0usize;
+        let mut tie = false;
+        for file in &files {
+            let score = corroboration(directories, file);
+            if score > best_score {
+                best = Some(file);
+                best_score = score;
+                tie = false;
+            } else if score == best_score && score > 0 {
+                tie = true;
+            }
+        }
+        best.filter(|_| !tie)
+    };
+    match chosen.and_then(|file| matches.iter().find(|m| m.file_path == file)) {
+        Some(method) => TypedReceiverCall::Method(Arc::clone(method)),
+        None => TypedReceiverCall::Ambiguous,
+    }
+}
+
+/// `name` without a trailing `.cfc` (any case).
+fn strip_cfc_suffix(name: &str) -> &str {
+    if is_component_file(name) {
+        &name[..name.len() - 4]
+    } else {
+        name
+    }
 }
 
 /// Key prefix of the CFML component rows (W4-CF-01): one `project_metadata`

@@ -2035,6 +2035,16 @@ impl ReferenceResolver {
         {
             return (None, None);
         }
+        // A CFML supertype written as a component path (upstream #1152,
+        // #1154) has a dedicated, path-corroborated matcher and no fallback:
+        // the class is indexed under the last segment only, so the whole path
+        // could only ever mis-match downstream.
+        if crate::cfml_scope::is_cfml_component_path_ref(reference) {
+            return (
+                crate::cfml_scope::resolve_cfml_component_path(reference, context),
+                None,
+            );
+        }
 
         // Fast pre-filter (index.ts:664-670). The `FrameworkResolver`
         // claims-reference escape is a no-op while the extension-point list is

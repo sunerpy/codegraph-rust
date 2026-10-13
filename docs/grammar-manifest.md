@@ -49,7 +49,7 @@ grammar crates.
 | `nix`               | `tree-sitter-nix`        | `.nix`                                                                 |
 | `terraform`         | `tree-sitter-hcl`        | `.tf`, `.tfvars`, `.tofu`                                              |
 | `erlang`            | `tree-sitter-erlang`     | `.erl`, `.hrl`                                                         |
-| `cfml`              | `tree-sitter-cfml`       | dual script/tag entry selected from source                             |
+| `cfml`              | `tree-sitter-cfml`       | script/tag entry by source; `<cfscript>`/`<cfquery>` bodies in place   |
 | `gdscript`          | `tree-sitter-gdscript`   | `.gd`; framework resolution adds Godot relationships                   |
 
 `LanguageSpec` maps grammar node types to symbols and unresolved references, and

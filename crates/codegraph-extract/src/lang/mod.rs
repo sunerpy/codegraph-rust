@@ -45,7 +45,8 @@ pub use c::C_SPEC;
 pub(crate) use c::{c_declarator_identifier, is_class_like_definition};
 pub use cfml::CFML_SPEC;
 pub(crate) use cfml::{
-    cfml_component_name_from_path, cfml_string_attr_value, cfml_tag_attr, is_bare_script_cfml,
+    cfml_component_attr, cfml_component_name_from_path, cfml_start_tag, cfml_tag_attr,
+    cfml_tag_attr_value_node, cfml_tag_name, is_bare_script_cfml,
 };
 pub use cpp::{
     CPP_CONSTRUCTOR_REFERENCE_PREFIX, CPP_SPEC, CppConstructorShape,

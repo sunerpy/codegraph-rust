@@ -1284,7 +1284,7 @@ fn remove_tracked_file(
         .note(store, relative, &old_nodes, None)?;
     changed_names.members.note(store, relative, None)?;
     changed_names.ruby.note(store, relative, None)?;
-    changed_names.cfml.note(store, relative, None)?;
+    changed_names.cfml.note(store, relative, &old_nodes, None)?;
     delete_unresolved_refs_by_file(store, relative)?;
     store.delete_file_record(relative)?;
     changed_names
@@ -1680,6 +1680,7 @@ fn reextract_into_store(
     changed_names.cfml.note(
         store,
         relative,
+        &old_nodes,
         Some((file.language, source, &result.nodes)),
     )?;
     // No name in another file resolves into a minified script (upstream
@@ -3408,8 +3409,88 @@ pub(crate) mod tests {
         );
     }
 
+    const CFML_USER_A: (&str, &str) = (
+        "a/UserService.cfc",
+        "component {\n  function save(any u) {\n    return u;\n  }\n}\n",
+    );
+    const CFML_USER_B: (&str, &str) = (
+        "b/UserService.cfc",
+        "component {\n  function save(any u) {\n    return u;\n  }\n}\n",
+    );
+    const CFML_TYPED_TEMPLATE: (&str, &str) = (
+        "views/page.cfm",
+        "<cfset svc = new UserService()>\n<cfoutput>#svc.save(1)#</cfoutput>\n",
+    );
+    const CFML_TYPED_SCRIPT: (&str, &str) =
+        ("views/run.cfs", "svc = new UserService();\nsvc.save(2);\n");
+
+    /// W4-CF-02: a sync that removes one of two same-named components and
+    /// fails before resolving leaves the typed calls of a template and a
+    /// script parked; the next sync, with nothing changed or an unrelated
+    /// change, re-resolves every CFML file, so they reach the remaining
+    /// component as a fresh index has them.
+    #[test]
+    fn a_cfml_typed_call_parked_by_a_failed_sync_reaches_the_remaining_namesake() {
+        let reaches = |db: &Path| {
+            edge_projection(db)
+                .iter()
+                .filter(|edge| edge.contains("-[calls]-> a/UserService.cfc"))
+                .count()
+        };
+        for unrelated in [false, true] {
+            let dir = TestDir::new(if unrelated {
+                "cfml-typed-fail-unrelated"
+            } else {
+                "cfml-typed-fail"
+            });
+            let db = default_db_path(dir.path()).unwrap();
+            let initial = [
+                CFML_USER_A,
+                CFML_USER_B,
+                CFML_TYPED_TEMPLATE,
+                CFML_TYPED_SCRIPT,
+                CFML_SPARE,
+            ];
+            write_files(dir.path(), &initial);
+            sync_changed_paths(dir.path(), &db, initial.iter().map(|(path, _)| *path)).unwrap();
+            assert_eq!(reaches(&db), 0, "{:#?}", edge_projection(&db));
+
+            std::fs::remove_file(dir.path().join(CFML_USER_B.0)).unwrap();
+            FAIL_BEFORE_RESOLUTION.with(|fail| fail.set(true));
+            let failed = sync_changed_paths(dir.path(), &db, [CFML_USER_B.0]);
+            FAIL_BEFORE_RESOLUTION.with(|fail| fail.set(false));
+            assert!(failed.is_err(), "the injected failure must stop the sync");
+            assert_eq!(
+                cfml_marker(&db),
+                None,
+                "a failed sync leaves the marker away"
+            );
+
+            let spare = if unrelated {
+                write_files(dir.path(), &[CFML_SPARE_EDITED]);
+                sync_changed_paths(dir.path(), &db, [CFML_SPARE.0]).unwrap();
+                CFML_SPARE_EDITED
+            } else {
+                sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
+                CFML_SPARE
+            };
+            assert_eq!(
+                cfml_marker(&db),
+                Some(crate::cfml_heads::VERSION.to_string())
+            );
+            let fresh = [CFML_USER_A, CFML_TYPED_TEMPLATE, CFML_TYPED_SCRIPT, spare];
+            let name = if unrelated {
+                "cfml-typed-fresh-unrelated"
+            } else {
+                "cfml-typed-fresh"
+            };
+            assert_eq!(edge_projection(&db), fresh_edges(name, &fresh));
+            assert_eq!(reaches(&db), 2, "{:#?}", edge_projection(&db));
+        }
+    }
+
     /// W4-CF-01: an index without the CFML marker or its rows (built before
-    /// them) has every `.cfc` file re-resolved and every row rebuilt by its
+    /// them) has every CFML file re-resolved and every row rebuilt by its
     /// next sync: the bare call an older sync left without its edge comes
     /// back.
     #[test]

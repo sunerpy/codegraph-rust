@@ -9524,6 +9524,9 @@ mod ruby {
 mod cfml {
     use super::support::{Graph, Project};
 
+    /// A case: its files, as (path, contents), and the edges it must hold.
+    type Fixture<'a> = (&'a [(&'a str, &'a str)], &'a [&'a str]);
+
     /// The qualified name of what every `calls` edge out of `file` reaches,
     /// sorted.
     fn call_targets(graph: &Graph, file: &str) -> Vec<String> {
@@ -9541,6 +9544,437 @@ mod cfml {
             .collect();
         out.sort();
         out
+    }
+
+    /// `source-name kind target-qualified-name @target-file` of every edge of
+    /// `kinds`, sorted.
+    fn edges_of(graph: &Graph, kinds: &[&str]) -> Vec<String> {
+        let mut out: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|edge| kinds.contains(&edge.kind.as_str()))
+            .filter_map(|edge| {
+                let source = graph.node(&edge.source)?;
+                let target = graph.node(&edge.target)?;
+                Some(format!(
+                    "{} {} {} @{}",
+                    source.name, edge.kind, target.qualified_name, target.file_path
+                ))
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// Upstream #2296 (issue #2091): calls written in `<cfset>`, `<cfif>` and
+    /// `<cfreturn>` reach the methods they call; a `<cffunction>` wrapped in
+    /// `<cfprocessingdirective>` (the Application.cfc shape) is indexed with
+    /// its calls; `<cfinterface>` is an interface `implements` resolves to.
+    /// Upstream's fixture.
+    #[test]
+    fn pr2296_tag_based_cfml_calls_wrapped_functions_and_interfaces_are_indexed() {
+        let project = Project::new()
+            .file(
+                "model/Svc.cfc",
+                "<cfcomponent>\n\t<cffunction name=\"a\">\n\t\t<cfset x = b(1)>\n\t\t<cfif c(2)></cfif>\n\t\t<cfreturn d()>\n\t</cffunction>\n\t<cffunction name=\"b\"></cffunction>\n\t<cffunction name=\"c\"></cffunction>\n\t<cffunction name=\"d\"></cffunction>\n</cfcomponent>\n",
+            )
+            .file(
+                "Application.cfc",
+                "<cfcomponent>\n\t<cfprocessingdirective suppresswhitespace=\"true\">\n\t\t<cffunction name=\"onRequestStart\">\n\t\t\t<cfset loadConfig()>\n\t\t</cffunction>\n\t\t<cffunction name=\"loadConfig\"></cffunction>\n\t</cfprocessingdirective>\n</cfcomponent>\n",
+            )
+            .file(
+                "model/ISearchable.cfc",
+                "<cfinterface>\n\t<cffunction name=\"search\" access=\"public\"></cffunction>\n</cfinterface>\n",
+            )
+            .file(
+                "model/Catalog.cfc",
+                "<cfcomponent implements=\"ISearchable\">\n\t<cffunction name=\"search\" access=\"public\"></cffunction>\n</cfcomponent>\n",
+            )
+            .index();
+        let graph = project.graph();
+        let calls = edges_of(graph, &["calls"]);
+        for expected in [
+            "a calls Svc::b @model/Svc.cfc",
+            "a calls Svc::c @model/Svc.cfc",
+            "a calls Svc::d @model/Svc.cfc",
+            "onRequestStart calls Application::loadConfig @Application.cfc",
+        ] {
+            assert!(
+                calls.contains(&expected.to_string()),
+                "{calls:#?}\n{}",
+                graph.report()
+            );
+        }
+        assert_eq!(calls.len(), 4, "{calls:#?}");
+        let iface = graph
+            .nodes
+            .iter()
+            .find(|node| node.file_path == "model/ISearchable.cfc" && node.kind == "interface")
+            .expect("the interface is indexed");
+        assert_eq!(iface.name, "ISearchable");
+        assert_eq!(
+            edges_of(graph, &["implements"]),
+            ["Catalog implements model/ISearchable.cfc::ISearchable @model/ISearchable.cfc"]
+        );
+    }
+
+    /// Upstream #1152 / #1154: a CFML supertype written as a dotted component
+    /// path resolves to the class whose directories corroborate the path,
+    /// right to left and in any case, even when the mapping root is not in
+    /// the repository (the ColdBox shape); an uncorroborated namesake (an
+    /// out-of-repository mxunit supertype) and a corroboration tie are no
+    /// edge. Upstream's fixtures.
+    #[test]
+    fn pr1152_a_dotted_cfml_component_path_is_corroborated_by_its_directories() {
+        let cases: [Fixture; 5] = [
+            (
+                &[
+                    (
+                        "system/web/Controller.cfc",
+                        "component {\n  function handle() { return 1; }\n}\n",
+                    ),
+                    (
+                        "handlers/Main.cfc",
+                        "component extends=\"coldbox.system.web.Controller\" {\n  function index() { return 1; }\n}\n",
+                    ),
+                ],
+                &["Main extends system/web/Controller.cfc::Controller @system/web/Controller.cfc"],
+            ),
+            (
+                &[
+                    ("system/web/Controller.cfc", "component {}\n"),
+                    ("other/Controller.cfc", "component {}\n"),
+                    (
+                        "handlers/Main.cfc",
+                        "component extends=\"coldbox.system.web.Controller\" {}\n",
+                    ),
+                ],
+                &["Main extends system/web/Controller.cfc::Controller @system/web/Controller.cfc"],
+            ),
+            (
+                &[
+                    ("system/web/Controller.cfc", "component {}\n"),
+                    (
+                        "handlers/Main.cfc",
+                        "component extends=\"COLDBOX.System.Web.Controller\" {}\n",
+                    ),
+                ],
+                &["Main extends system/web/Controller.cfc::Controller @system/web/Controller.cfc"],
+            ),
+            (
+                &[
+                    ("lib/TestCase.cfc", "component {}\n"),
+                    (
+                        "tests/MyTest.cfc",
+                        "component extends=\"mxunit.framework.TestCase\" {}\n",
+                    ),
+                ],
+                &[],
+            ),
+            (
+                &[
+                    ("a/models/User.cfc", "component {}\n"),
+                    ("b/models/User.cfc", "component {}\n"),
+                    (
+                        "handlers/Main.cfc",
+                        "component extends=\"models.User\" {}\n",
+                    ),
+                ],
+                &[],
+            ),
+        ];
+        for (files, expected) in cases {
+            let mut project = Project::new();
+            for (path, contents) in files {
+                project = project.file(path, contents);
+            }
+            let project = project.index();
+            assert_eq!(
+                edges_of(project.graph(), &["extends", "implements"]),
+                expected,
+                "{}",
+                project.graph().report()
+            );
+        }
+    }
+
+    /// Upstream #1152 / #1154: a relative component path (`../base`,
+    /// `./app`, the FW/1 shape) resolves against the referencing file; a
+    /// dotted `implements` reaches an interface; the tag-based `extends`
+    /// attribute and a lowercase path (`framework.one`) resolve the same
+    /// way; and a dotted `calls` reference (a member chain) is never taken
+    /// for a component path. Upstream's fixtures.
+    #[test]
+    fn pr1152_relative_tag_based_and_implements_component_paths_resolve() {
+        let cases: [Fixture; 5] = [
+            (
+                &[
+                    (
+                        "examples/base.cfc",
+                        "component {\n  function shared() { return 1; }\n}\n",
+                    ),
+                    ("examples/sub/app.cfc", "component extends=\"../base\" {}\n"),
+                    (
+                        "examples/sub/sibling.cfc",
+                        "component extends=\"./app\" {}\n",
+                    ),
+                ],
+                &[
+                    "app extends examples/base.cfc::base @examples/base.cfc",
+                    "sibling extends examples/sub/app.cfc::app @examples/sub/app.cfc",
+                ],
+            ),
+            (
+                &[
+                    (
+                        "app/interfaces/IService.cfc",
+                        "interface {\n  public string function getName();\n}\n",
+                    ),
+                    (
+                        "app/services/Greeter.cfc",
+                        "component implements=\"app.interfaces.IService\" {\n  public string function getName() { return \"hi\"; }\n}\n",
+                    ),
+                ],
+                &[
+                    "Greeter implements app/interfaces/IService.cfc::IService @app/interfaces/IService.cfc",
+                ],
+            ),
+            (
+                &[
+                    ("system/Base.cfc", "component {}\n"),
+                    (
+                        "legacy/Old.cfc",
+                        "<cfcomponent extends=\"app.system.Base\">\n<cffunction name=\"run\"><cfreturn 1></cffunction>\n</cfcomponent>\n",
+                    ),
+                ],
+                &["Old extends system/Base.cfc::Base @system/Base.cfc"],
+            ),
+            (
+                &[
+                    (
+                        "framework/one.cfc",
+                        "component {\n  function onRequest() { return 1; }\n}\n",
+                    ),
+                    (
+                        "Application.cfc",
+                        "component extends=\"framework.one\" {}\n",
+                    ),
+                ],
+                &["Application extends framework/one.cfc::one @framework/one.cfc"],
+            ),
+            (
+                &[
+                    ("util/getName.cfc", "component {}\n"),
+                    (
+                        "svc/Caller.cfc",
+                        "component {\n  function go() { return variables.dsn.getName(); }\n}\n",
+                    ),
+                ],
+                &[],
+            ),
+        ];
+        for (files, expected) in cases {
+            let mut project = Project::new();
+            for (path, contents) in files {
+                project = project.file(path, contents);
+            }
+            let project = project.index();
+            let graph = project.graph();
+            let mut edges = edges_of(graph, &["extends", "implements"]);
+            edges.extend(
+                edges_of(graph, &["calls"])
+                    .into_iter()
+                    .filter(|edge| edge.starts_with("go ") || edge.starts_with("Caller ")),
+            );
+            assert_eq!(edges, expected, "{}", graph.report());
+        }
+    }
+
+    /// Upstream #1155: a CFML receiver is typed by its declaration (`new`,
+    /// a dotted path included; `createObject` in both forms; a typed cfscript
+    /// parameter; a `<cfargument>` read inside a `<cfscript>` body), and the
+    /// call goes to that component's method, never the same-named one of
+    /// another; a type that does not declare the method is no edge. The
+    /// methods are scoped under their component in all three extraction
+    /// paths. Upstream's fixtures.
+    #[test]
+    fn pr1155_cfml_receivers_are_typed_by_their_declarations() {
+        let user = "component {\n  function save(any u) { return u; }\n}\n";
+        let order = "component {\n  function save(any o) { return o; }\n}\n";
+        let project = Project::new()
+            .file("svc/UserService.cfc", user)
+            .file("svc/OrderService.cfc", order)
+            .file(
+                "tag/TagService.cfc",
+                "<cfcomponent>\n<cffunction name=\"save\"><cfreturn 1></cffunction>\n</cfcomponent>\n",
+            )
+            .file(
+                "mod/ModuleConfig.cfc",
+                "<cfcomponent>\n<cfscript>\nfunction configure() { return 1; }\n</cfscript>\n</cfcomponent>\n",
+            )
+            .file(
+                "handlers/Main.cfc",
+                "component {\n  function bare() {\n    var svc = new UserService();\n    return svc.save(1);\n  }\n  function dotted() {\n    var svc2 = new svc.UserService();\n    return svc2.save(2);\n  }\n}\n",
+            )
+            .file(
+                "handlers/Legacy.cfc",
+                "component {\n  function classic() {\n    var svc = createObject(\"component\", \"svc.UserService\");\n    return svc.save(1);\n  }\n  function modern() {\n    var svc2 = CreateObject(\"svc.OrderService\");\n    return svc2.save(2);\n  }\n}\n",
+            )
+            .file(
+                "handlers/Typed.cfc",
+                "component {\n  function process(required UserService svc) {\n    return svc.save(1);\n  }\n}\n",
+            )
+            .file(
+                "handlers/TagTyped.cfc",
+                "<cfcomponent>\n<cffunction name=\"tagged\">\n  <cfargument name=\"svc\" type=\"svc.UserService\">\n  <cfscript>\n    return svc.save(1);\n  </cfscript>\n</cffunction>\n</cfcomponent>\n",
+            )
+            .file(
+                "handlers/Wrong.cfc",
+                "component {\n  function go() {\n    var svc = new UserService();\n    return svc.destroyEverything();\n  }\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        let methods: Vec<String> = graph
+            .nodes
+            .iter()
+            .filter(|node| node.kind == "method")
+            .map(|node| node.qualified_name.clone())
+            .collect();
+        for scoped in [
+            "UserService::save",
+            "TagService::save",
+            "ModuleConfig::configure",
+        ] {
+            assert!(methods.contains(&scoped.to_string()), "{methods:?}");
+        }
+        let calls = edges_of(graph, &["calls"]);
+        assert_eq!(
+            calls,
+            [
+                "bare calls UserService::save @svc/UserService.cfc",
+                "classic calls UserService::save @svc/UserService.cfc",
+                "dotted calls UserService::save @svc/UserService.cfc",
+                "modern calls OrderService::save @svc/OrderService.cfc",
+                "process calls UserService::save @svc/UserService.cfc",
+                "tagged calls UserService::save @svc/UserService.cfc",
+            ],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream #1155: a component field reached through `variables.` is
+    /// typed by its pseudo-constructor assignment even below the call, or by
+    /// a WireBox-injected `property` (the ColdBox DI shape). Upstream's
+    /// fixtures.
+    #[test]
+    fn pr1155_cfml_component_fields_are_typed_from_anywhere_in_the_file() {
+        let user = "component {\n  function save(any u) { return u; }\n}\n";
+        let order = "component {\n  function save(any o) { return o; }\n}\n";
+        let project = Project::new()
+            .file("svc/UserService.cfc", user)
+            .file("svc/OrderService.cfc", order)
+            .file(
+                "handlers/Fielded.cfc",
+                "component {\n  function handle() {\n    return variables.svc.save(1);\n  }\n  function init() {\n    variables.svc = new UserService();\n    return this;\n  }\n}\n",
+            )
+            .file(
+                "handlers/Injected.cfc",
+                "component {\n  property name=\"svc\" inject=\"UserService\";\n\n  function handleInjected() {\n    return variables.svc.save(1);\n  }\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        assert_eq!(
+            edges_of(graph, &["calls"])
+                .into_iter()
+                .filter(|edge| edge.contains("::save"))
+                .collect::<Vec<_>>(),
+            [
+                "handle calls UserService::save @svc/UserService.cfc",
+                "handleInjected calls UserService::save @svc/UserService.cfc",
+            ],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// W4-CF-02 (KEEP-RUST over upstream #1155, which takes the first): when
+    /// same-named components in several files declare the method, a typed
+    /// receiver's written path decides, by the directories its file
+    /// corroborates, and a bare type name by the call's own directory; no
+    /// corroboration, a tie, or namesakes of a supertype reached by name are
+    /// no edge. A lone component of the name is the type's, as upstream has
+    /// it.
+    #[test]
+    fn pr1155_same_named_cfml_components_are_told_apart_by_their_path() {
+        let save = "component {\n  function save(any u) { return u; }\n}\n";
+        let cases: [Fixture; 4] = [
+            (
+                &[
+                    ("a/UserService.cfc", save),
+                    ("b/UserService.cfc", save),
+                    (
+                        "handlers/Main.cfc",
+                        "component {\n  function dottedA() {\n    var svc = new a.UserService();\n    return svc.save(1);\n  }\n  function dottedB() {\n    var svc = createObject(\"component\", \"b.UserService\");\n    return svc.save(2);\n  }\n  function bare() {\n    var svc = new UserService();\n    return svc.save(3);\n  }\n  function uncorroborated() {\n    var svc = new zz.UserService();\n    return svc.save(4);\n  }\n}\n",
+                    ),
+                    (
+                        "a/Caller.cfc",
+                        "component {\n  function beside() {\n    var svc = new UserService();\n    return svc.save(5);\n  }\n}\n",
+                    ),
+                ],
+                &[
+                    "beside calls UserService::save @a/UserService.cfc",
+                    "dottedA calls UserService::save @a/UserService.cfc",
+                    "dottedB calls UserService::save @b/UserService.cfc",
+                ],
+            ),
+            (
+                &[
+                    ("p/a/UserService.cfc", save),
+                    ("q/a/UserService.cfc", save),
+                    (
+                        "handlers/Main.cfc",
+                        "component {\n  function tied() {\n    var svc = new a.UserService();\n    return svc.save(1);\n  }\n  function deeper() {\n    var svc = new p.a.UserService();\n    return svc.save(2);\n  }\n}\n",
+                    ),
+                ],
+                &["deeper calls UserService::save @p/a/UserService.cfc"],
+            ),
+            (
+                &[
+                    ("a/Base.cfc", save),
+                    ("b/Base.cfc", save),
+                    ("b/Child.cfc", "component extends=\"b.Base\" {\n}\n"),
+                    (
+                        "handlers/Main.cfc",
+                        "component {\n  function inherited() {\n    var base = new Child();\n    return base.save(1);\n  }\n}\n",
+                    ),
+                ],
+                &[],
+            ),
+            (
+                &[
+                    ("svc/UserService.cfc", save),
+                    (
+                        "handlers/Main.cfc",
+                        "component {\n  function lone() {\n    var svc = new zz.UserService();\n    return svc.save(1);\n  }\n}\n",
+                    ),
+                ],
+                &["lone calls UserService::save @svc/UserService.cfc"],
+            ),
+        ];
+        for (files, expected) in cases {
+            let mut project = Project::new();
+            for (path, contents) in files {
+                project = project.file(path, contents);
+            }
+            let project = project.index();
+            assert_eq!(
+                edges_of(project.graph(), &["calls"]),
+                expected,
+                "{}",
+                project.graph().report()
+            );
+        }
     }
 
     /// Upstream #2148: a bare call in a component reaches only its own
