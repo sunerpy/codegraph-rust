@@ -418,8 +418,16 @@ written with a receiver ending in one down the whole-file lane however many
 there are, since a type reference, a bare call's hierarchy and a type-path call
 read whether a node is an extension, its scope, its heads and the path its
 extension writes from the declarations' text; the `swift_heads_version` marker
-is withdrawn and restored with the others; an
-import names a file, a folder or a namespace rather than a symbol, so the parked
+is withdrawn and restored with the others; an Objective-C file whose head row
+moved (a class came or went or its `@interface` names another superclass, a
+property is declared with another type) touches the names of the members of
+every class above a changed class or type, before the change and after it, and
+every name declared in a file named after one, sending the unchanged
+Objective-C files with unresolved messages written with a receiver ending in
+one down the whole-file lane however many there are, since a message to `self`
+or `super`, an untyped receiver and a typed local read a hierarchy from the
+heads' text; the `objc_heads_version` marker is withdrawn and restored with the
+others; an import names a file, a folder or a namespace rather than a symbol, so the parked
 imports an added file or a changed file's namespace can satisfy (by the file's
 name and stem, its folder's, or the namespace's whole name) send their files
 down the whole-file re-resolution lane, which rebuilds an unchanged file's

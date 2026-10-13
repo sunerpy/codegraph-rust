@@ -4052,6 +4052,177 @@ pub fn swift_typed_property_follows_an_inherited_declaration() -> Case {
         )
 }
 
+/// Upstream #2150 (W4-SW-04): a message to `self` reaches the sender's
+/// hierarchy, so it follows a middle class's superclass changed in another
+/// file.
+pub fn objc_self_send_follows_a_superclass_change_in_another_file() -> Case {
+    Case::new(Change::EditHeritage, &[Language::ObjC])
+        .file(
+            "Core/SDBase.m",
+            "@interface SDBase : NSObject\n@end\n@implementation SDBase\n- (void)prepare {\n}\n@end\n",
+        )
+        .file(
+            "Core/SDOther.m",
+            "@interface SDOther : NSObject\n@end\n@implementation SDOther\n- (void)prepare {\n}\n@end\n",
+        )
+        .file("Core/SDMiddle.h", "@interface SDMiddle : SDBase\n@end\n")
+        .file(
+            "Core/SDCache.m",
+            "@interface SDCache : SDMiddle\n@end\n@implementation SDCache\n- (void)run {\n    [self prepare];\n}\n@end\n",
+        )
+        .write("Core/SDMiddle.h", "@interface SDMiddle : SDOther\n@end\n")
+        .edge_before("method SDCache::run", "calls", "method SDBase::prepare")
+        .edge_after("method SDCache::run", "calls", "method SDOther::prepare")
+        .no_edge_after("method SDCache::run", "calls", "method SDBase::prepare")
+}
+
+/// Upstream #2179 (W4-SW-04): `[super init]` goes past the sender, to the
+/// superclass its header, changed apart from the implementation, names.
+pub fn objc_super_send_follows_the_header_of_its_class() -> Case {
+    Case::new(Change::EditHeritage, &[Language::ObjC])
+        .file(
+            "Base.m",
+            "@interface Base : NSObject\n@end\n@implementation Base\n- (instancetype)init {\n    return self;\n}\n@end\n",
+        )
+        .file(
+            "Mid.m",
+            "@interface Mid : NSObject\n@end\n@implementation Mid\n- (instancetype)init {\n    return self;\n}\n@end\n",
+        )
+        .file("Child.h", "@interface Child : Base\n@end\n")
+        .file(
+            "Child.m",
+            "#import \"Child.h\"\n@implementation Child\n- (instancetype)init {\n    self = [super init];\n    return self;\n}\n@end\n",
+        )
+        .write("Child.h", "@interface Child : Mid\n@end\n")
+        .edge_before("method Child::init", "calls", "method Base::init")
+        .edge_after("method Child::init", "calls", "method Mid::init")
+        .no_edge_after("method Child::init", "calls", "method Base::init")
+}
+
+/// Upstream #2150 (W4-SW-04): an untyped receiver ending in a property keeps
+/// the one method of its name while the property's declared type has the
+/// method's owner, and loses it when another file retypes the property.
+pub fn objc_typed_property_receiver_follows_a_declared_type_change() -> Case {
+    Case::new(Change::EditHeritage, &[Language::ObjC])
+        .file(
+            "RLMSet.m",
+            "@interface RLMSet : NSObject\n@end\n@implementation RLMSet\n- (BOOL)containsObject:(id)object {\n    return NO;\n}\n@end\n",
+        )
+        .file(
+            "AllTypesObject.h",
+            "@interface AllTypesObject : NSObject\n@property (nonatomic) RLMSet<NSString *> *anyDataObj;\n@end\n",
+        )
+        .file(
+            "Tests.m",
+            "@interface Tests : NSObject\n@end\n@implementation Tests\n- (void)run:(AllTypesObject *)managed {\n    [managed.anyDataObj containsObject:@\"x\"];\n}\n@end\n",
+        )
+        .write(
+            "AllTypesObject.h",
+            "@interface AllTypesObject : NSObject\n@property (nonatomic) NSSet<NSString *> *anyDataObj;\n@end\n",
+        )
+        .edge_before("method Tests::run:", "calls", "method RLMSet::containsObject:")
+        .no_edge_after("method Tests::run:", "calls", "method RLMSet::containsObject:")
+}
+
+/// Upstream #2150 (W4-SW-04): a property's declared type that comes to
+/// inherit the method's owner in another file settles the parked message on
+/// the property, written with a keyword selector.
+pub fn objc_typed_property_receiver_reaches_an_owner_its_type_comes_to_inherit() -> Case {
+    Case::new(Change::EditHeritage, &[Language::ObjC])
+        .file(
+            "RLMCollection.m",
+            "@interface RLMCollection : NSObject\n@end\n@implementation RLMCollection\n- (BOOL)containsObject:(id)object {\n    return NO;\n}\n@end\n",
+        )
+        .file("RLMArray.h", "@interface RLMArray : NSObject\n@end\n")
+        .file(
+            "Owner.h",
+            "@interface Owner : NSObject\n@property (nonatomic) RLMArray *items;\n@end\n",
+        )
+        .file(
+            "Tests.m",
+            "@interface Tests : NSObject\n@end\n@implementation Tests\n- (void)run:(Owner *)owner {\n    [owner.items containsObject:@\"x\"];\n}\n@end\n",
+        )
+        .write("RLMArray.h", "@interface RLMArray : RLMCollection\n@end\n")
+        .edge_after("method Tests::run:", "calls", "method RLMCollection::containsObject:")
+}
+
+/// More unresolved `….next` calls than one tail retries in a sync: CFML
+/// calls on receivers no `next` is named after, cheap to resolve.
+static UNTYPED_NEXT_CALLS: LazyLock<String> = LazyLock::new(|| {
+    let mut text = String::from("component {\n  function noise() {\n");
+    for index in 0..501 {
+        text.push_str(&format!("    n{index}.next({index});\n"));
+    }
+    text.push_str("    return 0;\n  }\n}\n");
+    text
+});
+
+/// Upstream #2150 (W4-SW-04): a local typed by its declaration
+/// (`FMResultSet *rs`) reaches the method its type comes to inherit in
+/// another file, however many parked calls share the tail.
+pub fn objc_typed_local_reaches_an_inherited_method_past_the_tail_ceiling() -> Case {
+    Case::new(Change::EditHeritage, &[Language::ObjC, Language::Cfml])
+        .file(
+            "FMBase.m",
+            "@interface FMBase : NSObject\n@end\n@implementation FMBase\n- (BOOL)next {\n    return NO;\n}\n@end\n",
+        )
+        .file("FMResultSet.h", "@interface FMResultSet : NSObject\n@end\n")
+        .file(
+            "Reader.m",
+            "@interface Reader : NSObject\n@end\n@implementation Reader\n- (void)read {\n    FMResultSet *rs = nil;\n    [rs next];\n}\n@end\n",
+        )
+        .file("noise/Noise.cfc", UNTYPED_NEXT_CALLS.as_str())
+        .write("FMResultSet.h", "@interface FMResultSet : FMBase\n@end\n")
+        .edge_after("method Reader::read", "calls", "method FMBase::next")
+}
+
+/// Upstream #2150's system table (W4-SW-04): a UIView category's method
+/// that appears is what a UIImageView category's `[self …]` sends to.
+pub fn objc_category_send_reaches_a_system_superclass_category_that_appears() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::ObjC])
+        .file(
+            "SDDecoy.m",
+            "@interface SDDecoy : NSObject\n@end\n@implementation SDDecoy\n- (void)sd_internalSetImageWithURL:(NSURL *)url {\n}\n@end\n",
+        )
+        .file(
+            "UIImageView+WebCache.m",
+            "@implementation UIImageView (WebCache)\n- (void)sd_setImageWithURL:(NSURL *)url {\n    [self sd_internalSetImageWithURL:url];\n}\n@end\n",
+        )
+        .write(
+            "UIView+WebCache.m",
+            "@implementation UIView (WebCache)\n- (void)sd_internalSetImageWithURL:(NSURL *)url {\n}\n@end\n",
+        )
+        .edge_after(
+            "method UIImageView::sd_setImageWithURL:",
+            "calls",
+            "method UIView::sd_internalSetImageWithURL:",
+        )
+        .no_edge_after(
+            "method UIImageView::sd_setImageWithURL:",
+            "calls",
+            "method SDDecoy::sd_internalSetImageWithURL:",
+        )
+}
+
+/// Upstream #2242 (W4-SW-04): a class conforming to its namesake protocol
+/// keeps implementing its own header's when a copy of the header appears.
+pub fn objc_namesake_protocol_keeps_its_own_header_when_a_copy_appears() -> Case {
+    const HEADER: &str = "@protocol SDDiskCache <NSObject>\n- (NSData *)dataForKey:(NSString *)key;\n@end\n\n@interface SDDiskCache : NSObject <SDDiskCache>\n@end\n";
+    Case::new(Change::AddCompetitor, &[Language::ObjC])
+        .file("Core/SDDiskCache.h", HEADER)
+        .write("include/SDDiskCache.h", HEADER)
+        .edge_throughout(
+            "class SDDiskCache @Core/SDDiskCache.h",
+            "implements",
+            "protocol SDDiskCache @Core/SDDiskCache.h",
+        )
+        .no_edge_after(
+            "class SDDiskCache @Core/SDDiskCache.h",
+            "implements",
+            "protocol SDDiskCache @include/SDDiskCache.h",
+        )
+}
+
 /// #897: a Kotlin function's value reference follows the object constant it
 /// reads.
 pub fn kotlin_object_constant_reader_body_edit() -> Case {

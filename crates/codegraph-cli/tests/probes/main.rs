@@ -10548,3 +10548,274 @@ mod swift {
         );
     }
 }
+
+mod objc {
+    use super::support::{Graph, Project};
+
+    /// The calls out of `file`, as their targets' qualified names, sorted.
+    fn calls_from(graph: &Graph, file: &str) -> Vec<String> {
+        let mut out: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|e| e.kind == "calls")
+            .filter(|e| graph.node(&e.source).is_some_and(|n| n.file_path == file))
+            .filter_map(|e| graph.node(&e.target))
+            .map(|n| n.qualified_name.clone())
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// Upstream #2150: a message to `self` or `super` (the extractor drops
+    /// the receiver) reaches a method of the sender's hierarchy, never a
+    /// proxy class's `class`; C call syntax never names a method or
+    /// property; a message to an untyped local needs its declaration
+    /// (`FMResultSet *rs`) or a receiver named after the class. Upstream's
+    /// fixture.
+    #[test]
+    fn pr2150_an_objc_message_reached_by_name_alone_must_be_in_reach() {
+        let project = Project::new()
+            .file(
+                "Core/SDWeakProxy.h",
+                "#import <Foundation/Foundation.h>\n@interface SDWeakProxy : NSProxy\n- (Class)class;\n- (BOOL)respondsToSelector:(SEL)aSelector;\n@end\n",
+            )
+            .file(
+                "Core/SDWeakProxy.m",
+                "#import \"SDWeakProxy.h\"\n@implementation SDWeakProxy\n- (Class)class {\n    return nil;\n}\n- (BOOL)respondsToSelector:(SEL)aSelector {\n    return NO;\n}\n@end\n",
+            )
+            .file(
+                "Core/SDPrefetchToken.h",
+                "#import <Foundation/Foundation.h>\n@interface SDPrefetchToken : NSObject\n@property (nonatomic, copy) void (^completionBlock)(void);\n@end\n",
+            )
+            .file(
+                "Core/FMResultSet.h",
+                "#import <Foundation/Foundation.h>\n@interface FMResultSet : NSObject\n- (BOOL)next;\n@end\n",
+            )
+            .file(
+                "Core/FMResultSet.m",
+                "#import \"FMResultSet.h\"\n@implementation FMResultSet\n- (BOOL)next {\n    return NO;\n}\n@end\n",
+            )
+            .file(
+                "Core/SDBase.h",
+                "#import <Foundation/Foundation.h>\n@interface SDBase : NSObject\n- (void)prepare;\n@end\n",
+            )
+            .file(
+                "Core/SDBase.m",
+                "#import \"SDBase.h\"\n@implementation SDBase\n- (void)prepare {\n}\n@end\n",
+            )
+            .file(
+                "Core/SDCache.h",
+                "#import \"SDBase.h\"\n@interface SDCache : SDBase\n- (void)storeWithCompletion:(void (^)(void))completionBlock image:(id)image;\n@end\n",
+            )
+            .file(
+                "Core/SDCache.m",
+                "#import \"SDCache.h\"\n#import \"FMResultSet.h\"\n@implementation SDCache\n- (void)storeWithCompletion:(void (^)(void))completionBlock image:(id)image {\n    Class cls = [self class];\n    [super prepare];\n    [self helper];\n    FMResultSet *rs = [self query];\n    while ([rs next]) {\n    }\n    if ([image respondsToSelector:@selector(copy)]) {\n    }\n    completionBlock();\n}\n- (void)helper {\n}\n- (FMResultSet *)query {\n    return nil;\n}\n@end\n",
+            )
+            .index();
+        let graph = project.graph();
+        let report = graph.report();
+        let method = graph
+            .nodes
+            .iter()
+            .find(|n| n.qualified_name == "SDCache::storeWithCompletion:image:")
+            .unwrap_or_else(|| panic!("{report}"));
+        let mut targets: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|e| e.kind == "calls" && e.source == method.id)
+            .filter_map(|e| graph.node(&e.target))
+            .map(|n| n.qualified_name.clone())
+            .collect();
+        targets.sort();
+        assert_eq!(
+            targets,
+            [
+                "FMResultSet::next",
+                "SDBase::prepare",
+                "SDCache::helper",
+                "SDCache::query"
+            ],
+            "{report}"
+        );
+    }
+
+    /// Upstream #2150: an untyped receiver keeps the one method of its name
+    /// when it ends in a property whose declared type has the method's
+    /// owner (`managed.anyDataObj`, an `RLMSet *`), and not when it names
+    /// nothing the owner is (`image`). A class receiver reaches the class
+    /// method it inherits.
+    #[test]
+    fn pr2150_a_class_or_typed_property_receiver_keeps_its_inherited_method() {
+        let project = Project::new()
+            .file(
+                "RLMObject.h",
+                "#import <Foundation/Foundation.h>\n@interface RLMObject : NSObject\n+ (id)objectsInRealm:(id)realm;\n@end\n",
+            )
+            .file(
+                "RLMObject.m",
+                "#import \"RLMObject.h\"\n@implementation RLMObject\n+ (id)objectsInRealm:(id)realm {\n    return nil;\n}\n@end\n",
+            )
+            .file(
+                "RLMSet.h",
+                "#import <Foundation/Foundation.h>\n@interface RLMSet<T> : NSObject\n- (BOOL)containsObject:(id)object;\n@end\n",
+            )
+            .file(
+                "RLMSet.m",
+                "#import \"RLMSet.h\"\n@implementation RLMSet\n- (BOOL)containsObject:(id)object {\n    return NO;\n}\n@end\n",
+            )
+            .file(
+                "AllTypesObject.h",
+                "#import \"RLMObject.h\"\n#import \"RLMSet.h\"\n@interface AllTypesObject : RLMObject\n@property (nonatomic) RLMSet<NSString *> *anyDataObj;\n@end\n",
+            )
+            .file(
+                "Tests.m",
+                "#import \"AllTypesObject.h\"\n@interface Tests : NSObject\n@end\n@implementation Tests\n- (void)run:(AllTypesObject *)managed image:(id)image {\n    [AllTypesObject objectsInRealm:nil];\n    [managed.anyDataObj containsObject:@\"x\"];\n    [image containsObject:@\"y\"];\n}\n@end\n",
+            )
+            .index();
+        let graph = project.graph();
+        assert_eq!(
+            calls_from(graph, "Tests.m"),
+            ["RLMObject::objectsInRealm:", "RLMSet::containsObject:"],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream #2150: a method parameter's declaration
+    /// (`(nullable FMResultSet *)rs`) types the messages to it, and a
+    /// function the parameter's name shadows (`rs(void)`) types nothing.
+    #[test]
+    fn pr2150_a_typed_parameter_types_its_messages() {
+        let project = Project::new()
+            .file(
+                "FMResultSet.m",
+                "@interface FMResultSet : NSObject\n@end\n@implementation FMResultSet\n- (BOOL)next {\n    return NO;\n}\n@end\n",
+            )
+            .file(
+                "FMCursor.m",
+                "@interface FMCursor : NSObject\n@end\n@implementation FMCursor\n- (BOOL)next {\n    return NO;\n}\n@end\n",
+            )
+            .file(
+                "Reader.m",
+                "@interface Reader : NSObject\n@end\n@implementation Reader\n- (void)read:(nullable FMResultSet *)rs {\n    [rs next];\n}\n- (void)scan {\n    FMCursor *rs(void);\n    [rs next];\n}\n@end\n",
+            )
+            .index();
+        let graph = project.graph();
+        let report = graph.report();
+        let calls_of = |method: &str| -> Vec<String> {
+            let id = &graph
+                .nodes
+                .iter()
+                .find(|n| n.qualified_name == method)
+                .unwrap_or_else(|| panic!("{report}"))
+                .id;
+            let mut out: Vec<String> = graph
+                .edges
+                .iter()
+                .filter(|e| e.kind == "calls" && &e.source == id)
+                .filter_map(|e| graph.node(&e.target))
+                .map(|n| n.qualified_name.clone())
+                .collect();
+            out.sort();
+            out
+        };
+        assert_eq!(calls_of("Reader::read:"), ["FMResultSet::next"], "{report}");
+        assert!(calls_of("Reader::scan").is_empty(), "{report}");
+    }
+
+    /// Upstream #2150's system table: a category on UIImageView sending
+    /// `[self sd_internalSetImageWithURL:]` reaches the UIView category's
+    /// method, UIView being UIImageView's superclass, and not another
+    /// class's method of that name.
+    #[test]
+    fn pr2150_a_category_on_a_system_class_reaches_its_superclass_category() {
+        let project = Project::new()
+            .file(
+                "UIView+WebCache.m",
+                "#import <UIKit/UIKit.h>\n@implementation UIView (WebCache)\n- (void)sd_internalSetImageWithURL:(NSURL *)url {\n}\n@end\n",
+            )
+            .file(
+                "SDDecoy.m",
+                "#import <Foundation/Foundation.h>\n@interface SDDecoy : NSObject\n@end\n@implementation SDDecoy\n- (void)sd_internalSetImageWithURL:(NSURL *)url {\n}\n@end\n",
+            )
+            .file(
+                "UIImageView+WebCache.m",
+                "#import <UIKit/UIKit.h>\n@implementation UIImageView (WebCache)\n- (void)sd_setImageWithURL:(NSURL *)url {\n    [self sd_internalSetImageWithURL:url];\n}\n@end\n",
+            )
+            .index();
+        let graph = project.graph();
+        assert_eq!(
+            calls_from(graph, "UIImageView+WebCache.m"),
+            ["UIView::sd_internalSetImageWithURL:"],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream #2179: `[super init]` goes past the class it is written in,
+    /// to the superclass's `init`, or for an NSObject subclass to no project
+    /// method at all. Upstream's fixture.
+    #[test]
+    fn pr2179_a_message_to_super_reaches_the_superclass() {
+        let project = Project::new()
+            .file(
+                "Base.h",
+                "#import <Foundation/Foundation.h>\n@interface Base : NSObject\n- (instancetype)init;\n@end\n",
+            )
+            .file(
+                "Base.m",
+                "#import \"Base.h\"\n@implementation Base\n- (instancetype)init {\n    self = [super init];\n    return self;\n}\n@end\n",
+            )
+            .file("Child.h", "#import \"Base.h\"\n@interface Child : Base\n@end\n")
+            .file(
+                "Child.m",
+                "#import \"Child.h\"\n@implementation Child\n- (instancetype)init {\n    self = [super init];\n    return self;\n}\n@end\n",
+            )
+            .file(
+                "Other.m",
+                "#import <Foundation/Foundation.h>\n@interface Other : NSObject\n@end\n@implementation Other\n- (instancetype)init {\n    self = [super init];\n    return self;\n}\n@end\n",
+            )
+            .index();
+        let graph = project.graph();
+        let report = graph.report();
+        assert_eq!(calls_from(graph, "Child.m"), ["Base::init"], "{report}");
+        assert!(calls_from(graph, "Base.m").is_empty(), "{report}");
+        assert!(calls_from(graph, "Other.m").is_empty(), "{report}");
+    }
+
+    /// Upstream #2242: a class conforming to a protocol of its own name
+    /// (SDWebImage's `@interface SDDiskCache : NSObject <SDDiskCache>`,
+    /// its header copied into `include/`) implements the protocol in its
+    /// own header. Upstream's fixture.
+    #[test]
+    fn pr2242_a_class_conforming_to_its_namesake_protocol_implements_it() {
+        let header = "#import <Foundation/Foundation.h>\n\n@protocol SDDiskCache <NSObject>\n- (nullable NSData *)dataForKey:(nonnull NSString *)key;\n@end\n\n@interface SDDiskCache : NSObject <SDDiskCache>\n@end\n";
+        let project = Project::new()
+            .file("SDWebImage/Core/SDDiskCache.h", header)
+            .file("SDWebImage/include/SDWebImage/SDDiskCache.h", header)
+            .file(
+                "Examples/SwiftUIDemo/ContentView.swift",
+                "import SwiftUI\n\nstruct ContentView: View {\n    var body: some View { Text(\"x\") }\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        let class = graph
+            .nodes
+            .iter()
+            .find(|n| n.kind == "class" && n.file_path == "SDWebImage/Core/SDDiskCache.h")
+            .unwrap_or_else(|| panic!("{}", graph.report()));
+        let targets: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|e| e.kind == "implements" && e.source == class.id)
+            .filter_map(|e| graph.node(&e.target))
+            .map(|n| format!("{} {}", n.kind, n.file_path))
+            .collect();
+        assert_eq!(
+            targets,
+            ["protocol SDWebImage/Core/SDDiskCache.h"],
+            "{}",
+            graph.report()
+        );
+    }
+}

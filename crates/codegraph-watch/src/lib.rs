@@ -10,6 +10,7 @@ mod link_state;
 pub mod member_surfaces;
 mod migrate;
 pub mod module_surfaces;
+pub mod objc_heads;
 mod policy;
 pub mod ruby_heads;
 pub mod scala_surfaces;

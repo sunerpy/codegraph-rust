@@ -583,6 +583,11 @@ pub trait ResolutionContext {
     fn swift_tables(&self) -> Arc<crate::swift_type_visibility::SwiftTables> {
         Arc::new(crate::swift_type_visibility::SwiftTables::new())
     }
+
+    /// The Objective-C superclass memo of one resolution pass (W4-SW-04).
+    fn objc_tables(&self) -> Arc<crate::objc_scope::ObjcTables> {
+        Arc::new(crate::objc_scope::ObjcTables::new())
+    }
 }
 
 /// Go module info parsed from `go.mod`.

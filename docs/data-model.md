@@ -306,6 +306,17 @@ head rows under `swift_heads_version` (2); a sync that finds it
 missing or at another version re-resolves every Swift file and rebuilds the
 rows. Neither is a canonical surface.
 
+Objective-C head rows record what a message reached by name reads of a file's
+classes and properties: `objc_heads:<path>` holds the JSON `{"entries":
+[{"kind", "name", "written"}]}`, one entry per class (`@interface`,
+`@implementation` and category alike) and property, sorted, with the
+superclass a class's first line names after `@interface Name :` and the class
+a property's `@property` line declares it as, or `null`. A file with neither
+has no row. They are written, withdrawn and checked like the head rows under
+`objc_heads_version` (1); a sync that finds it missing or at another version
+re-resolves every Objective-C file and rebuilds the rows. Neither is a
+canonical surface.
+
 ## FTS5
 
 `nodes_fts` is an external-content FTS5 table over `nodes`:

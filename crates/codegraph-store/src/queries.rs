@@ -1081,6 +1081,21 @@ impl Store {
         Ok(out)
     }
 
+    /// The unresolved references of `language`, in id order: a lane whose
+    /// language writes tails the shared tail lookup cannot read (an
+    /// Objective-C keyword selector, `cache.storeImage:forKey:`) filters them
+    /// itself.
+    pub fn unresolved_refs_of_language(
+        &self,
+        language: Language,
+    ) -> rusqlite::Result<Vec<UnresolvedRef>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT * FROM unresolved_refs WHERE language = ?1 ORDER BY id")?;
+        let rows = stmt.query_map([language.as_str()], row_to_unresolved_ref)?;
+        rows.collect()
+    }
+
     /// The unresolved references written with a qualifier (`User.create`,
     /// `objectType.IsEnum`) whose [`reference_name_tail`] is one of `names`,
     /// the symbol names a sync's changed files touched (upstream #1240's

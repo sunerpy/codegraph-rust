@@ -53,7 +53,9 @@ pub(crate) fn declared_supertypes(class: &Node, context: &dyn ResolutionContext)
         }
         Language::Dart => return dart_supertypes_of(&class.name, context),
         Language::Swift => return swift_supertypes_of(&class.name, context),
-        Language::ObjC => return objc_supertypes_of(&class.name, context),
+        Language::ObjC => {
+            return crate::objc_scope::objc_supertypes_of(&class.name, context).to_vec();
+        }
         Language::Scala => return scala_supertypes_of(&class.name, context),
         _ => {}
     }
@@ -360,27 +362,6 @@ fn swift_supertypes_of(type_name: &str, context: &dyn ResolutionContext) -> Vec<
     crate::swift_scope::swift_decl_of(type_name, context)
         .supers
         .clone()
-}
-
-/// The superclasses an Objective-C class's `@interface` declarations name
-/// (upstream `objcSupertypesOf`), without the system classes'.
-fn objc_supertypes_of(name: &str, context: &dyn ResolutionContext) -> Vec<String> {
-    static INTERFACE: OnceLock<Regex> = OnceLock::new();
-    let interface = INTERFACE
-        .get_or_init(|| Regex::new(r"@interface\s+\w+\s*:\s*(\w+)").expect("objc interface"));
-    let mut supers: Vec<String> = Vec::new();
-    for decl in context.get_nodes_by_name_shared(name) {
-        if decl.kind != NodeKind::Class || decl.language != Language::ObjC {
-            continue;
-        }
-        let line = head_lines(&decl, 1, " ", context);
-        if let Some(sup) = interface.captures(&line).map(|c| c[1].to_string())
-            && !supers.contains(&sup)
-        {
-            supers.push(sup);
-        }
-    }
-    supers
 }
 
 /// Upstream `SCALA_TYPE_KINDS`.

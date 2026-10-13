@@ -567,6 +567,7 @@ fn sync_paths_with_store(
     let ruby_bootstrap = crate::ruby_heads::needs_bootstrap(store)?;
     let cfml_bootstrap = crate::cfml_heads::needs_bootstrap(store)?;
     let swift_bootstrap = crate::swift_heads::needs_bootstrap(store)?;
+    let objc_bootstrap = crate::objc_heads::needs_bootstrap(store)?;
 
     let paths = paths.into_iter().collect::<Vec<_>>();
     let total = paths.len();
@@ -624,6 +625,7 @@ fn sync_paths_with_store(
         || ruby_bootstrap
         || cfml_bootstrap
         || swift_bootstrap
+        || objc_bootstrap
     {
         note_python_global_readers(
             project_root,
@@ -809,6 +811,23 @@ fn sync_paths_with_store(
             dependent_fallbacks.insert(file.clone());
         }
         changed_names.note_all(swift.names.iter().cloned());
+        // And what a message to `self` or `super`, an untyped receiver and a
+        // typed local read of the Objective-C classes' heads and properties'
+        // declared types (W4-SW-04).
+        let objc = crate::objc_heads::objc_refresh(
+            store,
+            project_root,
+            scope.options.max_file_size,
+            &changed_names.objc,
+            &reindexed,
+            &changed_names.removed_files,
+            objc_bootstrap,
+        )?;
+        for file in &objc.files {
+            dependent_sites.remove(file);
+            dependent_fallbacks.insert(file.clone());
+        }
+        changed_names.note_all(objc.names.iter().cloned());
         // What a changed Python import statement re-exports moves for its
         // module's importers without any node of those names changing.
         if !changed_names.python_imports.is_empty() {
@@ -903,6 +922,7 @@ fn sync_paths_with_store(
         ruby.write_rows(store)?;
         cfml.write_rows(store)?;
         swift.write_rows(store)?;
+        objc.write_rows(store)?;
         crate::module_surfaces::finish_bootstrap(store)?;
         crate::cpp_dependents::write_marker(store)?;
         crate::java_heads::write_marker(store)?;
@@ -913,6 +933,7 @@ fn sync_paths_with_store(
         crate::ruby_heads::write_marker(store)?;
         crate::cfml_heads::write_marker(store)?;
         crate::swift_heads::write_marker(store)?;
+        crate::objc_heads::write_marker(store)?;
     }
 
     // Orphan sweep (#1187, upstream index.ts:645-682): a full-index resolution
@@ -1308,6 +1329,7 @@ fn remove_tracked_file(
     changed_names
         .swift
         .note(store, relative, &old_nodes, None)?;
+    changed_names.objc.note(store, relative, None)?;
     delete_unresolved_refs_by_file(store, relative)?;
     store.delete_file_record(relative)?;
     changed_names
@@ -1712,6 +1734,11 @@ fn reextract_into_store(
         &old_nodes,
         Some((file.language, source, &result.nodes)),
     )?;
+    changed_names.objc.note(
+        store,
+        relative,
+        Some((file.language, source, &result.nodes)),
+    )?;
     // No name in another file resolves into a minified script (upstream
     // #2204), and that verdict is read from the script's text: a script that
     // was or is generated can flip it with every node where it was, so all of
@@ -1852,6 +1879,9 @@ struct ChangedNames {
     /// reads: component classes and `extends` (W4-CF-01).
     cfml: crate::cfml_heads::CfmlChanges,
     swift: crate::swift_heads::SwiftChanges,
+    /// What the changed files held that an Objective-C message in other
+    /// files reads: class heads and property types (W4-SW-04).
+    objc: crate::objc_heads::ObjcChanges,
 }
 
 /// What a changed Python file held before the change. A module global's
@@ -1894,6 +1924,7 @@ impl ChangedNames {
             crate::ruby_heads::withdraw_marker(store)?;
             crate::cfml_heads::withdraw_marker(store)?;
             crate::swift_heads::withdraw_marker(store)?;
+            crate::objc_heads::withdraw_marker(store)?;
             self.surface_dirty = true;
         }
         Ok(())
@@ -3609,6 +3640,168 @@ pub(crate) mod tests {
             assert_eq!(edge_projection(&db), fresh_edges(name, &fresh));
             assert!(!in_scope(&db), "{:#?}", edge_projection(&db));
         }
+    }
+
+    fn objc_marker(db: &Path) -> Option<String> {
+        Store::open(db)
+            .unwrap()
+            .get_project_metadata(crate::objc_heads::VERSION_KEY)
+            .unwrap()
+    }
+
+    const OBJC_BASE: (&str, &str) = (
+        "Core/SDBase.m",
+        "@interface SDBase : NSObject\n@end\n@implementation SDBase\n- (void)prepare {\n}\n@end\n",
+    );
+    const OBJC_OTHER: (&str, &str) = (
+        "Core/SDOther.m",
+        "@interface SDOther : NSObject\n@end\n@implementation SDOther\n- (void)prepare {\n}\n@end\n",
+    );
+    const OBJC_MIDDLE_BASE: (&str, &str) =
+        ("Core/SDMiddle.h", "@interface SDMiddle : SDBase\n@end\n");
+    const OBJC_MIDDLE_OTHER: (&str, &str) =
+        ("Core/SDMiddle.h", "@interface SDMiddle : SDOther\n@end\n");
+    const OBJC_CACHE: (&str, &str) = (
+        "Core/SDCache.m",
+        "@interface SDCache : SDMiddle\n@end\n@implementation SDCache\n- (void)run {\n    [self prepare];\n}\n@end\n",
+    );
+    const OBJC_SPARE: (&str, &str) = ("Core/SDSpare.m", "@interface SDSpare : NSObject\n@end\n");
+    const OBJC_SPARE_EDITED: (&str, &str) = (
+        "Core/SDSpare.m",
+        "@interface SDSpare : NSObject\n@property (nonatomic) NSURL *url;\n@end\n",
+    );
+
+    /// W4-SW-04: a sync failing after its mutations leaves the Objective-C
+    /// marker away, so the next sync, with nothing changed or with an
+    /// unrelated change, re-resolves every Objective-C file and rebuilds the
+    /// rows: the subclass's `[self prepare]`, whose hierarchy now passes the
+    /// other base, ends where a fresh index puts it.
+    #[test]
+    fn an_objc_sync_failing_after_its_mutations_leaves_the_next_one_to_reconcile() {
+        let to_other = |db: &Path| {
+            edge_projection(db).iter().any(|edge| {
+                edge.contains("SDCache::run -[calls]-> Core/SDOther.m:SDOther::prepare")
+            })
+        };
+        for unrelated in [false, true] {
+            let dir = TestDir::new(if unrelated {
+                "objc-heads-fail-unrelated"
+            } else {
+                "objc-heads-fail"
+            });
+            let db = default_db_path(dir.path()).unwrap();
+            let initial = [
+                OBJC_BASE,
+                OBJC_OTHER,
+                OBJC_MIDDLE_BASE,
+                OBJC_CACHE,
+                OBJC_SPARE,
+            ];
+            write_files(dir.path(), &initial);
+            sync_changed_paths(dir.path(), &db, initial.iter().map(|(path, _)| *path)).unwrap();
+            assert_eq!(
+                objc_marker(&db),
+                Some(crate::objc_heads::VERSION.to_string())
+            );
+            assert!(!to_other(&db), "{:#?}", edge_projection(&db));
+
+            write_files(dir.path(), &[OBJC_MIDDLE_OTHER]);
+            FAIL_BEFORE_RESOLUTION.with(|fail| fail.set(true));
+            let failed = sync_changed_paths(dir.path(), &db, [OBJC_MIDDLE_OTHER.0]);
+            FAIL_BEFORE_RESOLUTION.with(|fail| fail.set(false));
+            assert!(failed.is_err(), "the injected failure must stop the sync");
+            assert_eq!(
+                objc_marker(&db),
+                None,
+                "a failed sync leaves the marker away"
+            );
+
+            let spare = if unrelated {
+                write_files(dir.path(), &[OBJC_SPARE_EDITED]);
+                sync_changed_paths(dir.path(), &db, [OBJC_SPARE.0]).unwrap();
+                OBJC_SPARE_EDITED
+            } else {
+                sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
+                OBJC_SPARE
+            };
+            assert_eq!(
+                objc_marker(&db),
+                Some(crate::objc_heads::VERSION.to_string())
+            );
+            let fresh = [OBJC_BASE, OBJC_OTHER, OBJC_MIDDLE_OTHER, OBJC_CACHE, spare];
+            let name = if unrelated {
+                "objc-heads-fresh-unrelated"
+            } else {
+                "objc-heads-fresh"
+            };
+            assert_eq!(edge_projection(&db), fresh_edges(name, &fresh));
+            assert!(to_other(&db), "{:#?}", edge_projection(&db));
+        }
+    }
+
+    fn objc_rows(db: &Path) -> Vec<(String, String)> {
+        Store::open(db)
+            .unwrap()
+            .project_metadata_with_prefix(codegraph_resolve::objc_scope::HEAD_ROW_KEY_PREFIX)
+            .unwrap()
+    }
+
+    /// W4-SW-04: an index whose Objective-C marker and rows alone are gone
+    /// (the other markers written back) has every Objective-C file
+    /// re-resolved and every row rebuilt by its next sync, even one with
+    /// nothing changed: the self-send an older sync lost comes back.
+    #[test]
+    fn an_index_without_only_the_objc_marker_rebuilds_its_rows_with_nothing_changed() {
+        let version = Some(crate::objc_heads::VERSION.to_string());
+        let dir = TestDir::new("objc-heads-bootstrap");
+        let db = default_db_path(dir.path()).unwrap();
+        let initial = [
+            OBJC_BASE,
+            OBJC_OTHER,
+            OBJC_MIDDLE_BASE,
+            OBJC_CACHE,
+            OBJC_SPARE,
+        ];
+        write_files(dir.path(), &initial);
+        sync_changed_paths(dir.path(), &db, initial.iter().map(|(path, _)| *path)).unwrap();
+        assert_eq!(objc_marker(&db), version);
+        let rows = objc_rows(&db);
+        assert!(
+            rows.iter()
+                .any(|(key, _)| key == "objc_heads:Core/SDMiddle.h"),
+            "{rows:#?}"
+        );
+        let expected = edge_projection(&db);
+        {
+            let store = Store::open(&db).unwrap();
+            let dropped = store
+                .connection()
+                .execute(
+                    "DELETE FROM edges WHERE kind = 'calls' AND target = (SELECT id FROM nodes \
+                     WHERE qualified_name = 'SDBase::prepare')",
+                    [],
+                )
+                .unwrap();
+            assert_eq!(dropped, 1, "the call edge an older sync lost");
+            store
+                .delete_project_metadata_with_prefix(
+                    codegraph_resolve::objc_scope::HEAD_ROW_KEY_PREFIX,
+                )
+                .unwrap();
+            store
+                .delete_project_metadata(crate::objc_heads::VERSION_KEY)
+                .unwrap();
+        }
+        assert_ne!(edge_projection(&db), expected);
+        assert_eq!(
+            swift_marker(&db),
+            Some(crate::swift_heads::VERSION.to_string()),
+            "the other markers stay"
+        );
+        sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
+        assert_eq!(objc_marker(&db), version);
+        assert_eq!(objc_rows(&db), rows);
+        assert_eq!(edge_projection(&db), expected);
     }
 
     /// W4-CF-01: an index without the CFML marker or its rows (built before

@@ -2338,8 +2338,13 @@ pub fn match_by_exact_name(
     // #2125): a bare call no method, a chained one a member of its last link.
     let python_shape = crate::python_values::python_call_shape(reference, context);
     // An Objective-C name in C call syntax calls a function, a block or a
-    // function pointer, never a method or property (upstream #2150).
-    let objc_c_call = objc_call_shape(reference, context) == Some(ObjcCallShape::CCall);
+    // function pointer, never a method or property; a message to `self` or
+    // `super` reaches the sender's hierarchy, past the sender for `super`
+    // (upstream #2150, #2179).
+    let objc_shape = objc_call_shape(reference, context);
+    let objc_c_call = objc_shape == Some(ObjcCallShape::CCall);
+    let objc_send = objc_send_target(objc_shape);
+    let objc_hierarchy = OnceCell::new();
     // A bare Java call reaches a method in scope (upstream #2126), and a bare
     // Java type name a type in reach (upstream #2236), both read once.
     let java_bare = crate::java_scope::is_java_bare_call(reference);
@@ -2373,7 +2378,19 @@ pub fn match_by_exact_name(
                 crate::python_values::fits_python_call_shape(n, shape, reference, context)
             })
         })
-        .filter(|n| !(objc_c_call && is_objc_member_kind(n.kind)))
+        .filter(|n| !(objc_c_call && crate::objc_scope::is_objc_member_kind(n.kind)))
+        .filter(|n| {
+            objc_send.is_none_or(|to_super| {
+                crate::objc_scope::is_objc_self_send_target(
+                    n,
+                    reference,
+                    objc_hierarchy
+                        .get_or_init(|| crate::objc_scope::objc_hierarchy_at(reference, context))
+                        .as_deref(),
+                    to_super,
+                )
+            })
+        })
         .filter(|n| node_is_eligible_target(reference.reference_kind, n))
         // A Scala type position (`Arbitrary[B]`) never names a method: an
         // `implicit def A: Order[A]` shares its name with half of cats' type
@@ -3789,6 +3806,19 @@ fn local_receiver_type_patterns_tagged(language: Language, r: &str) -> Vec<(Rege
             }
             return out;
         }
+        // `FMResultSet *rs = …`, `NSString * _Nullable name;`, a block's
+        // `^(FMResultSet *rs)`, never a function `Foo *rs(void)` (upstream's
+        // `(?!\s*\()`, read here as the character after the name), and a
+        // method parameter, `- (void)read:(nullable FMResultSet *)rs`
+        // (upstream #2150).
+        Language::ObjC => vec![
+            format!(
+                r"\b([A-Z]\w*)\s*(?:<[^<>;]*>\s*)?\*\s*(?:(?:_Nullable|_Nonnull|__strong|__weak|__unsafe_unretained|const)\s+)*{r}\b(?:\s*$|\s*[^\s(])"
+            ),
+            format!(
+                r"\(\s*(?:(?:nullable|nonnull|__kindof)\s+)*([A-Z]\w*)\s*(?:<[^<>)]*>\s*)?\*[^)]*\)\s*{r}\b"
+            ),
+        ],
         // A generic or array type (`Pair<L, R> pair`, `String[] args`) and an
         // enhanced-for variable (upstream #2171).
         Language::Java => vec![
@@ -3951,10 +3981,11 @@ pub(crate) fn infer_local_receiver_declaration(
         None => (receiver_name, false),
     };
     let escaped = regex_escape(scan_receiver);
-    // A CFML scan compiles its eight patterns only once a line could match
-    // one ([`cfml_line_may_declare`]): compiled for every member call, they
-    // made re-resolving a file of a few hundred calls take seconds.
-    let lazy = reference.language == Language::Cfml;
+    // A CFML or Objective-C scan compiles its patterns only once a line could
+    // match one ([`line_may_declare`]): compiled for every member call,
+    // CFML's eight made re-resolving a file of a few hundred calls take
+    // seconds.
+    let lazy = matches!(reference.language, Language::Cfml | Language::ObjC);
     let compiled: OnceCell<Vec<(Regex, PatternCheck)>> = OnceCell::new();
     let patterns = || {
         compiled.get_or_init(|| local_receiver_type_patterns_tagged(reference.language, &escaped))
@@ -3982,7 +4013,7 @@ pub(crate) fn infer_local_receiver_declaration(
         if line.len() > 10_000 {
             return None;
         }
-        if lazy && !cfml_line_may_declare(line, scan_receiver) {
+        if lazy && !line_may_declare(reference.language, line, scan_receiver) {
             return None;
         }
         for (re, check) in patterns() {
@@ -4012,6 +4043,17 @@ pub(crate) fn infer_local_receiver_declaration(
         }
     }
     None
+}
+
+/// Whether `line` could match a lazily compiled receiver pattern of
+/// `language` for `receiver`; never false where one does.
+fn line_may_declare(language: Language, line: &str, receiver: &str) -> bool {
+    match language {
+        Language::Cfml => cfml_line_may_declare(line, receiver),
+        // Both Objective-C forms write a `*` and the receiver.
+        Language::ObjC => line.contains('*') && line.contains(receiver),
+        _ => true,
+    }
 }
 
 /// Whether `line` could match a CFML receiver pattern for `receiver`
@@ -5368,15 +5410,22 @@ pub fn match_method_call(
     // it with a trailing number dropped (`executor1` -> Executor; upstream
     // #2148).
     let untyped = crate::ruby_scope::is_untyped_receiver_language(reference.language);
+    // An Objective-C receiver also names the owner when it names a class, or
+    // ends in a property declared with a type, whose hierarchy has it
+    // (upstream #2150): `[managed.anyDataObj containsObject:]` is RLMSet's.
+    let objc_reaches = OnceCell::new();
+    let names_owner = |method: &Node| {
+        crate::kotlin_scope::shares_receiver_word(&object_or_class, method)
+            || (reference.language == Language::ObjC
+                && *objc_reaches.get_or_init(|| {
+                    crate::objc_scope::objc_receiver_reaches(&object_or_class, method, context)
+                }))
+    };
     if target_methods.len() == 1
         && !narrowed
         && target_methods[0].language == reference.language
         && (receiver_shares_word(&object_or_class, &target_methods[0].qualified_name)
-            || (untyped
-                && crate::kotlin_scope::shares_receiver_word(
-                    &object_or_class,
-                    &target_methods[0],
-                )))
+            || (untyped && names_owner(&target_methods[0])))
         // A test double is only what a test names (upstream #2197).
         && !is_unnamed_test_double(&target_methods[0], &object_or_class, reference, context)
         && !(std && !crate::kotlin_scope::shares_receiver_word(link, &target_methods[0]))
@@ -5387,7 +5436,7 @@ pub fn match_method_call(
         // #2147).
         && !(untyped
             && !crate::ruby_scope::is_self_receiver(&object_or_class)
-            && !crate::kotlin_scope::shares_receiver_word(&object_or_class, &target_methods[0]))
+            && !names_owner(&target_methods[0]))
     {
         return Some(ResolvedRef {
             original: reference.clone(),
@@ -6128,7 +6177,10 @@ pub fn match_fuzzy(reference: &RefView, context: &dyn ResolutionContext) -> Opti
     let callable_kinds = [NodeKind::Function, NodeKind::Method, NodeKind::Class];
     let case_insensitive = is_case_insensitive_language(reference.language);
     let python_shape = crate::python_values::python_call_shape(reference, context);
-    let objc_c_call = objc_call_shape(reference, context) == Some(ObjcCallShape::CCall);
+    let objc_shape = objc_call_shape(reference, context);
+    let objc_c_call = objc_shape == Some(ObjcCallShape::CCall);
+    let objc_send = objc_send_target(objc_shape);
+    let objc_hierarchy = OnceCell::new();
     let java_bare = crate::java_scope::is_java_bare_call(reference);
     let java_call_scope = OnceCell::new();
     let ruby_bare = crate::ruby_scope::is_ruby_bare_call(reference);
@@ -6148,8 +6200,24 @@ pub fn match_fuzzy(reference: &RefView, context: &dyn ResolutionContext) -> Opti
         candidates
             .into_iter()
             .filter(|n| callable_kinds.contains(&n.kind))
-            // C call syntax in Objective-C is no message (upstream #2150).
-            .filter(|n| !(objc_c_call && is_objc_member_kind(n.kind)))
+            // C call syntax in Objective-C is no message, and a message to
+            // `self` or `super` stays in the sender's hierarchy (upstream
+            // #2150, #2179).
+            .filter(|n| !(objc_c_call && crate::objc_scope::is_objc_member_kind(n.kind)))
+            .filter(|n| {
+                objc_send.is_none_or(|to_super| {
+                    crate::objc_scope::is_objc_self_send_target(
+                        n,
+                        reference,
+                        objc_hierarchy
+                            .get_or_init(|| {
+                                crate::objc_scope::objc_hierarchy_at(reference, context)
+                            })
+                            .as_deref(),
+                        to_super,
+                    )
+                })
+            })
             // A bare Java call reaches a method in scope (upstream #2126).
             .filter(|n| {
                 !(java_bare
@@ -6709,7 +6777,26 @@ fn other_supertype_named(
                 })
         })
         .collect();
-    let [candidate] = candidates.as_slice() else {
+    // Among several, the declaring file's own, then for `implements` a
+    // protocol, interface or trait (upstream #2242): SDWebImage's
+    // `@interface SDWebImageCacheKeyFilter : NSObject <SDWebImageCacheKeyFilter>`.
+    let mut pool = candidates;
+    if pool.len() > 1 && pool.iter().any(|n| n.file_path == reference.file_path) {
+        pool.retain(|n| n.file_path == reference.file_path);
+    }
+    let conformable = |n: &Arc<Node>| {
+        matches!(
+            n.kind,
+            NodeKind::Protocol | NodeKind::Interface | NodeKind::Trait
+        )
+    };
+    if pool.len() > 1
+        && reference.reference_kind == EdgeKind::Implements
+        && pool.iter().any(conformable)
+    {
+        pool.retain(conformable);
+    }
+    let [candidate] = pool.as_slice() else {
         return None;
     };
     Some(ResolvedRef {
@@ -6951,6 +7038,16 @@ enum ObjcCallShape {
     SuperSend,
 }
 
+/// Whether a shape is a message to `self` (`Some(false)`) or to `super`
+/// (`Some(true)`), which reach only the sender's hierarchy.
+fn objc_send_target(shape: Option<ObjcCallShape>) -> Option<bool> {
+    match shape {
+        Some(ObjcCallShape::SelfSend) => Some(false),
+        Some(ObjcCallShape::SuperSend) => Some(true),
+        _ => None,
+    }
+}
+
 /// The shape of the Objective-C call `reference` (a bare name or selector) on
 /// its line, `None` when the line shows neither.
 fn objc_call_shape(reference: &RefView, context: &dyn ResolutionContext) -> Option<ObjcCallShape> {
@@ -7004,15 +7101,6 @@ fn objc_call_shape(reference: &RefView, context: &dyn ResolutionContext) -> Opti
         }
     }
     shape
-}
-
-/// A member of an Objective-C class, which C call syntax never names
-/// (upstream #2150 `OBJC_MEMBER_KINDS`).
-fn is_objc_member_kind(kind: NodeKind) -> bool {
-    matches!(
-        kind,
-        NodeKind::Method | NodeKind::Property | NodeKind::Field
-    )
 }
 
 /// The name matcher's self vetoes (upstream `matchReference`): a result that
@@ -12754,9 +12842,11 @@ mod tests {
 
     #[test]
     fn local_receiver_type_patterns_empty_for_unpatterned_language() {
-        // C/ObjC have no shared patterns (C++ uses its own inferrer) → empty.
+        // C has no shared patterns (C++ uses its own inferrer) → empty;
+        // Objective-C has its declaration and parameter forms (upstream
+        // #2150).
         assert!(local_receiver_type_patterns(Language::C, "lg").is_empty());
-        assert!(local_receiver_type_patterns(Language::ObjC, "lg").is_empty());
+        assert_eq!(local_receiver_type_patterns(Language::ObjC, "lg").len(), 2);
         assert!(!local_receiver_type_patterns(Language::TypeScript, "lg").is_empty());
     }
 

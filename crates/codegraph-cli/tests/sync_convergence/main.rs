@@ -365,6 +365,8 @@ fn run_case(name: &str, case: &Case) {
     let cfml_rows = support::project_metadata_with_prefix(&fresh.db(), "cfml_heads");
     // And the Swift head rows and their marker (W4-SW-01).
     let swift_rows = support::project_metadata_with_prefix(&fresh.db(), "swift_heads");
+    // And the Objective-C head rows and their marker (W4-SW-04).
+    let objc_rows = support::project_metadata_with_prefix(&fresh.db(), "objc_heads");
     for (driver, project) in [("cli", &cli), ("watch", &watch)] {
         let rows = support::project_metadata_with_prefix(&project.db(), "js_module_surface");
         if rows != surface_rows {
@@ -441,6 +443,13 @@ fn run_case(name: &str, case: &Case) {
             divergent.push(format!(
                 "=== {driver} driver: the Swift head rows differ from a fresh index\n\
                  synced: {rows:#?}\nfresh: {swift_rows:#?}"
+            ));
+        }
+        let rows = support::project_metadata_with_prefix(&project.db(), "objc_heads");
+        if rows != objc_rows {
+            divergent.push(format!(
+                "=== {driver} driver: the Objective-C head rows differ from a fresh index\n\
+                 synced: {rows:#?}\nfresh: {objc_rows:#?}"
             ));
         }
     }
@@ -845,6 +854,13 @@ matrix! {
     swift_type_path_call_drops_a_namesake_an_extension_loses,
     swift_bare_call_follows_a_superclass_change_in_another_file,
     swift_typed_property_follows_an_inherited_declaration,
+    objc_self_send_follows_a_superclass_change_in_another_file,
+    objc_super_send_follows_the_header_of_its_class,
+    objc_typed_property_receiver_follows_a_declared_type_change,
+    objc_typed_property_receiver_reaches_an_owner_its_type_comes_to_inherit,
+    objc_typed_local_reaches_an_inherited_method_past_the_tail_ceiling,
+    objc_category_send_reaches_a_system_superclass_category_that_appears,
+    objc_namesake_protocol_keeps_its_own_header_when_a_copy_appears,
     typescript_value_reader_body_edit,
     astro_frontmatter_call_body_edit,
     go_value_initializer_body_edit,
