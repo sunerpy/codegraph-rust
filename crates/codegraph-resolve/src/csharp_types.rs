@@ -38,9 +38,10 @@ pub fn is_csharp_type_kind(kind: NodeKind) -> bool {
 /// order mark, which upstream's `^\s*namespace` / `^\s*using` read past.
 const JS_SPACE: &str = r"[\t\n\x0B\x0C\r \x{A0}\x{1680}\x{2000}-\x{200A}\x{2028}\x{2029}\x{202F}\x{205F}\x{3000}\x{FEFF}]";
 
-/// A pattern with every `\s` read as JavaScript's.
-fn js_regex(pattern: &str) -> Regex {
-    Regex::new(&pattern.replace(r"\s", JS_SPACE)).expect("C# reader pattern")
+/// A pattern with every `\s` read as JavaScript's (the C# readers, and the
+/// Ruby head reader of W4-RB-01).
+pub(crate) fn js_regex(pattern: &str) -> Regex {
+    Regex::new(&pattern.replace(r"\s", JS_SPACE)).expect("JavaScript-whitespace reader pattern")
 }
 
 /// JavaScript's `\w`.

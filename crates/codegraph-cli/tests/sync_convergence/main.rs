@@ -359,6 +359,8 @@ fn run_case(name: &str, case: &Case) {
     let csharp_rows = support::project_metadata_with_prefix(&fresh.db(), "csharp_surface");
     // And the member surface rows and their marker (W4-CS-03).
     let member_rows = support::project_metadata_with_prefix(&fresh.db(), "member_surface");
+    // And the Ruby head rows and their marker (W4-RB-01).
+    let ruby_rows = support::project_metadata_with_prefix(&fresh.db(), "ruby_heads");
     for (driver, project) in [("cli", &cli), ("watch", &watch)] {
         let rows = support::project_metadata_with_prefix(&project.db(), "js_module_surface");
         if rows != surface_rows {
@@ -414,6 +416,13 @@ fn run_case(name: &str, case: &Case) {
             divergent.push(format!(
                 "=== {driver} driver: the member surface rows differ from a fresh index\n\
                  synced: {rows:#?}\nfresh: {member_rows:#?}"
+            ));
+        }
+        let rows = support::project_metadata_with_prefix(&project.db(), "ruby_heads");
+        if rows != ruby_rows {
+            divergent.push(format!(
+                "=== {driver} driver: the Ruby head rows differ from a fresh index\n\
+                 synced: {rows:#?}\nfresh: {ruby_rows:#?}"
             ));
         }
     }
@@ -917,6 +926,12 @@ matrix! {
     csharp_field_initializer_body_edit,
     csharp_target_typed_new_of_an_added_class,
     csharp_type_position_ignores_an_added_constant,
+    ruby_bare_call_follows_a_mixin_added_in_another_file,
+    ruby_bare_call_follows_a_superclass_change_in_another_file,
+    ruby_mixin_resolves_to_a_nearer_module_that_appears,
+    ruby_bare_call_ignores_an_added_unrelated_method,
+    ruby_untyped_receiver_ignores_a_lone_added_method,
+    ruby_ancestor_method_body_edit,
     solidity_change_a_base_contract,
     cfml_change_a_base_component,
     python_add_a_same_named_competitor,

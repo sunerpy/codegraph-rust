@@ -10,6 +10,7 @@ pub mod member_surfaces;
 mod migrate;
 pub mod module_surfaces;
 mod policy;
+pub mod ruby_heads;
 pub mod scala_surfaces;
 mod sync;
 mod watcher;

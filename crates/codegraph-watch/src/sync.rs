@@ -564,6 +564,7 @@ fn sync_paths_with_store(
     let scala_bootstrap = crate::scala_surfaces::needs_bootstrap(store)?;
     let csharp_bootstrap = crate::csharp_surfaces::needs_bootstrap(store)?;
     let member_bootstrap = crate::member_surfaces::needs_bootstrap(store)?;
+    let ruby_bootstrap = crate::ruby_heads::needs_bootstrap(store)?;
 
     let paths = paths.into_iter().collect::<Vec<_>>();
     let total = paths.len();
@@ -618,6 +619,7 @@ fn sync_paths_with_store(
         || scala_bootstrap
         || csharp_bootstrap
         || member_bootstrap
+        || ruby_bootstrap
     {
         note_python_global_readers(
             project_root,
@@ -757,6 +759,21 @@ fn sync_paths_with_store(
             dependent_sites.remove(file);
             dependent_fallbacks.insert(file.clone());
         }
+        // And what a bare Ruby call reads of the classes and modules its
+        // class inherits and mixes in (W4-RB-01).
+        let ruby = crate::ruby_heads::ruby_refresh(
+            store,
+            project_root,
+            scope.options.max_file_size,
+            &changed_names.ruby,
+            &reindexed,
+            &changed_names.removed_files,
+            ruby_bootstrap,
+        )?;
+        for file in &ruby.files {
+            dependent_sites.remove(file);
+            dependent_fallbacks.insert(file.clone());
+        }
         // What a changed Python import statement re-exports moves for its
         // module's importers without any node of those names changing.
         if !changed_names.python_imports.is_empty() {
@@ -848,6 +865,7 @@ fn sync_paths_with_store(
         scala.write_rows(store)?;
         csharp.write_rows(store)?;
         members.write_rows(store)?;
+        ruby.write_rows(store)?;
         crate::module_surfaces::finish_bootstrap(store)?;
         crate::cpp_dependents::write_marker(store)?;
         crate::java_heads::write_marker(store)?;
@@ -855,6 +873,7 @@ fn sync_paths_with_store(
         crate::scala_surfaces::write_marker(store)?;
         crate::csharp_surfaces::write_marker(store)?;
         crate::member_surfaces::write_marker(store)?;
+        crate::ruby_heads::write_marker(store)?;
     }
 
     // Orphan sweep (#1187, upstream index.ts:645-682): a full-index resolution
@@ -1245,6 +1264,7 @@ fn remove_tracked_file(
         .csharp
         .note(store, relative, &old_nodes, None)?;
     changed_names.members.note(store, relative, None)?;
+    changed_names.ruby.note(store, relative, None)?;
     delete_unresolved_refs_by_file(store, relative)?;
     store.delete_file_record(relative)?;
     changed_names
@@ -1632,6 +1652,11 @@ fn reextract_into_store(
         relative,
         Some((file.language, source, &result.nodes)),
     )?;
+    changed_names.ruby.note(
+        store,
+        relative,
+        Some((file.language, source, &result.nodes)),
+    )?;
     // No name in another file resolves into a minified script (upstream
     // #2204), and that verdict is read from the script's text: a script that
     // was or is generated can flip it with every node where it was, so all of
@@ -1765,6 +1790,9 @@ struct ChangedNames {
     /// What the changed files held that member-type inference in other
     /// files reads: class heads and member lines (W4-CS-03).
     members: crate::member_surfaces::MemberChanges,
+    /// What the changed files held that a bare Ruby call in other files
+    /// reads: class and module heads and mixins (W4-RB-01).
+    ruby: crate::ruby_heads::RubyChanges,
 }
 
 /// What a changed Python file held before the change. A module global's
@@ -1804,6 +1832,7 @@ impl ChangedNames {
             crate::scala_surfaces::withdraw_marker(store)?;
             crate::csharp_surfaces::withdraw_marker(store)?;
             crate::member_surfaces::withdraw_marker(store)?;
+            crate::ruby_heads::withdraw_marker(store)?;
             self.surface_dirty = true;
         }
         Ok(())
@@ -3041,6 +3070,187 @@ pub(crate) mod tests {
         // The edited file's row is its new one.
         rebuilt.retain(|(key, _)| key != "member_surface:src/Json/Spare.cs");
         wanted.retain(|(key, _)| key != "member_surface:src/Json/Spare.cs");
+        assert_eq!(rebuilt, wanted);
+        assert_eq!(edge_projection(&db), expected);
+    }
+
+    fn ruby_marker(db: &Path) -> Option<String> {
+        Store::open(db)
+            .unwrap()
+            .get_project_metadata(crate::ruby_heads::VERSION_KEY)
+            .unwrap()
+    }
+
+    fn ruby_rows(db: &Path) -> Vec<(String, String)> {
+        Store::open(db)
+            .unwrap()
+            .project_metadata_with_prefix(codegraph_resolve::ruby_scope::HEAD_ROW_KEY_PREFIX)
+            .unwrap()
+    }
+
+    const RUBY_HELPERS: (&str, &str) = (
+        "lib/helpers.rb",
+        "module Helpers\n  def helper\n    1\n  end\nend\n",
+    );
+    const RUBY_OTHER_HELPERS: (&str, &str) = (
+        "lib/other_helpers.rb",
+        "module OtherHelpers\n  def helper\n    2\n  end\nend\n",
+    );
+    const RUBY_BASE_HELPERS: (&str, &str) = ("lib/base.rb", "class Base\n  include Helpers\nend\n");
+    const RUBY_BASE_OTHER: (&str, &str) =
+        ("lib/base.rb", "class Base\n  include OtherHelpers\nend\n");
+    const RUBY_FOO: (&str, &str) = (
+        "lib/foo.rb",
+        "class Foo < Base\n  def run\n    helper()\n  end\nend\n",
+    );
+    const RUBY_SPARE: (&str, &str) = ("lib/spare.rb", "class Spare\nend\n");
+    const RUBY_SPARE_EDITED: (&str, &str) = (
+        "lib/spare.rb",
+        "class Spare\n  def count\n    1\n  end\nend\n",
+    );
+
+    fn ruby_run_reaches(db: &Path, file: &str) -> bool {
+        edge_projection(db)
+            .iter()
+            .any(|edge| edge.contains(&format!("Foo::run -[calls]-> {file}")))
+    }
+
+    /// W4-RB-01: a sync failing after its mutations leaves the Ruby marker
+    /// away, so the next sync, with nothing changed or with an unrelated
+    /// change, re-resolves every Ruby file and rebuilds the rows: `Foo`'s
+    /// bare call through the module its superclass mixes in ends where a
+    /// fresh index puts it.
+    #[test]
+    fn a_ruby_sync_failing_after_its_mutations_leaves_the_next_one_to_reconcile() {
+        let version = Some(crate::ruby_heads::VERSION.to_string());
+        let dir = TestDir::new("ruby-heads-fail");
+        let db = default_db_path(dir.path()).unwrap();
+        let initial = [
+            RUBY_HELPERS,
+            RUBY_OTHER_HELPERS,
+            RUBY_BASE_HELPERS,
+            RUBY_FOO,
+            RUBY_SPARE,
+        ];
+        write_files(dir.path(), &initial);
+        sync_changed_paths(dir.path(), &db, initial.iter().map(|(path, _)| *path)).unwrap();
+        assert_eq!(ruby_marker(&db), version);
+        assert!(
+            ruby_run_reaches(&db, "lib/helpers.rb"),
+            "{:#?}",
+            edge_projection(&db)
+        );
+
+        let fail_once = |paths: &[&str]| {
+            FAIL_BEFORE_RESOLUTION.with(|fail| fail.set(true));
+            let failed = sync_changed_paths(dir.path(), &db, paths.iter().copied());
+            FAIL_BEFORE_RESOLUTION.with(|fail| fail.set(false));
+            assert!(failed.is_err(), "the injected failure must stop the sync");
+            assert_eq!(
+                ruby_marker(&db),
+                None,
+                "a failed sync leaves the marker away"
+            );
+        };
+
+        write_files(dir.path(), &[RUBY_BASE_OTHER]);
+        fail_once(&["lib/base.rb"]);
+        sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
+        assert_eq!(ruby_marker(&db), version);
+        let fresh = [
+            RUBY_HELPERS,
+            RUBY_OTHER_HELPERS,
+            RUBY_BASE_OTHER,
+            RUBY_FOO,
+            RUBY_SPARE,
+        ];
+        assert_eq!(
+            edge_projection(&db),
+            fresh_edges("ruby-heads-fail-other", &fresh)
+        );
+        assert!(
+            ruby_run_reaches(&db, "lib/other_helpers.rb"),
+            "{:#?}",
+            edge_projection(&db)
+        );
+
+        write_files(dir.path(), &[RUBY_BASE_HELPERS]);
+        fail_once(&["lib/base.rb"]);
+        write_files(dir.path(), &[RUBY_SPARE_EDITED]);
+        sync_changed_paths(dir.path(), &db, ["lib/spare.rb"]).unwrap();
+        assert_eq!(ruby_marker(&db), version);
+        let fresh = [
+            RUBY_HELPERS,
+            RUBY_OTHER_HELPERS,
+            RUBY_BASE_HELPERS,
+            RUBY_FOO,
+            RUBY_SPARE_EDITED,
+        ];
+        assert_eq!(
+            edge_projection(&db),
+            fresh_edges("ruby-heads-fail-helpers", &fresh)
+        );
+        assert!(
+            ruby_run_reaches(&db, "lib/helpers.rb"),
+            "{:#?}",
+            edge_projection(&db)
+        );
+    }
+
+    /// W4-RB-01: an index without the Ruby marker or its rows (built before
+    /// them) has every Ruby file re-resolved and every row rebuilt by its
+    /// next sync: the bare call an older sync left without its edge comes
+    /// back.
+    #[test]
+    fn an_index_without_the_ruby_marker_rebuilds_the_head_rows() {
+        let version = Some(crate::ruby_heads::VERSION.to_string());
+        let dir = TestDir::new("ruby-heads-bootstrap");
+        let db = default_db_path(dir.path()).unwrap();
+        let initial = [
+            RUBY_HELPERS,
+            RUBY_OTHER_HELPERS,
+            RUBY_BASE_HELPERS,
+            RUBY_FOO,
+            RUBY_SPARE,
+        ];
+        write_files(dir.path(), &initial);
+        sync_changed_paths(dir.path(), &db, initial.iter().map(|(path, _)| *path)).unwrap();
+        assert_eq!(ruby_marker(&db), version);
+        let rows = ruby_rows(&db);
+        assert!(
+            rows.iter().any(|(key, _)| key == "ruby_heads:lib/base.rb"),
+            "{rows:#?}"
+        );
+        let expected = edge_projection(&db);
+        {
+            let store = Store::open(&db).unwrap();
+            let dropped = store
+                .connection()
+                .execute(
+                    "DELETE FROM edges WHERE kind = 'calls' AND target = (SELECT id FROM nodes \
+                     WHERE qualified_name = 'Helpers::helper')",
+                    [],
+                )
+                .unwrap();
+            assert_eq!(dropped, 1, "the call edge an older sync lost");
+            store
+                .delete_project_metadata_with_prefix(
+                    codegraph_resolve::ruby_scope::HEAD_ROW_KEY_PREFIX,
+                )
+                .unwrap();
+            store
+                .delete_project_metadata(crate::ruby_heads::VERSION_KEY)
+                .unwrap();
+        }
+        assert_ne!(edge_projection(&db), expected);
+        write_files(dir.path(), &[RUBY_SPARE_EDITED]);
+        sync_changed_paths(dir.path(), &db, ["lib/spare.rb"]).unwrap();
+        assert_eq!(ruby_marker(&db), version);
+        let mut rebuilt = ruby_rows(&db);
+        let mut wanted = rows;
+        // The edited file's row is its new one.
+        rebuilt.retain(|(key, _)| key != "ruby_heads:lib/spare.rb");
+        wanted.retain(|(key, _)| key != "ruby_heads:lib/spare.rb");
         assert_eq!(rebuilt, wanted);
         assert_eq!(edge_projection(&db), expected);
     }

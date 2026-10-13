@@ -50,6 +50,7 @@ pub mod pathutil;
 pub mod python_globals;
 mod python_values;
 pub mod resolver;
+pub mod ruby_scope;
 mod rust_lexical;
 pub mod scala_scope;
 pub mod sfc_scripts;

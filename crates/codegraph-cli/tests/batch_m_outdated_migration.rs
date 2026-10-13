@@ -836,6 +836,72 @@ fn outdated_migration_writes_the_member_surface_rows_of_index_force() {
     );
 }
 
+/// W4-RB-01: a migration writes the Ruby head rows and their marker a fresh
+/// `index --force` writes.
+#[test]
+fn outdated_migration_writes_the_ruby_head_rows_of_index_force() {
+    let dir = TestDir::new("outdated-ruby-heads");
+    let project = dir.path().join("mini");
+    for (path, contents) in [
+        ("lib/base.rb", "class Base\n  include Helpers\nend\n"),
+        (
+            "lib/foo.rb",
+            "class Foo < Base\n  def run\n    helper()\n  end\nend\n",
+        ),
+        ("src/notes.ts", "export const notes = 1;\n"),
+    ] {
+        let full = project.join(path);
+        fs::create_dir_all(full.parent().unwrap()).expect("create the source directory");
+        fs::write(full, contents).expect("write a source file");
+    }
+    let run = cli(&["init", project.to_str().unwrap()]);
+    assert!(
+        run.ok,
+        "setup: `codegraph init` must succeed (stdout={}, stderr={})",
+        run.stdout, run.stderr
+    );
+    let paths = IndexPaths::resolve(&project, None).expect("resolve v2 paths");
+    stage_state_slot(
+        &paths,
+        100,
+        CURRENT_STORAGE_PROTOCOL,
+        CURRENT_EXTRACTION_VERSION - 1,
+        "current",
+    );
+    let run = cli(&["sync", project.to_str().unwrap()]);
+    assert!(
+        run.ok,
+        "sync must migrate an Outdated namespace: stdout={}, stderr={}",
+        run.stdout, run.stderr
+    );
+    let (_scratch, peer) = fresh_force_peer("outdated-ruby-heads", &project);
+    let head_rows = |paths: &IndexPaths| {
+        Store::open_for_read(paths, deadline(), || false)
+            .expect("readable namespace")
+            .project_metadata_with_prefix("ruby_heads")
+            .expect("ruby head rows")
+    };
+    let migrated = head_rows(&paths);
+    // No row for the TypeScript file: only Ruby files have one.
+    assert_eq!(
+        migrated
+            .iter()
+            .map(|(key, _)| key.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "ruby_heads:lib/base.rb",
+            "ruby_heads:lib/foo.rb",
+            "ruby_heads_version",
+        ],
+        "a migration writes the head rows and their marker: {migrated:?}"
+    );
+    assert_eq!(
+        migrated,
+        head_rows(&IndexPaths::resolve(&peer, None).expect("resolve peer v2 paths")),
+        "a forced migration must write the Ruby head rows of `index --force`"
+    );
+}
+
 /// Migration is a from-source rebuild, so a tracked file that no longer exists
 /// on disk disappears from the migrated index and the result still equals a
 /// fresh `index --force` over the surviving tree.

@@ -9326,3 +9326,197 @@ mod csharp {
         );
     }
 }
+
+mod ruby {
+    use super::support::{Graph, Indexed, Project};
+
+    /// The qualified name of what every `calls` edge out of `file` reaches,
+    /// sorted (upstream's `callsFrom`).
+    fn call_targets(graph: &Graph, file: &str) -> Vec<String> {
+        let mut out: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.kind == "calls")
+            .filter(|edge| {
+                graph
+                    .node(&edge.source)
+                    .is_some_and(|node| node.file_path == file)
+            })
+            .filter_map(|edge| graph.node(&edge.target))
+            .map(|node| node.qualified_name.clone())
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// Upstream's #2147 fixture (`df761e45`).
+    fn project() -> Indexed {
+        Project::new()
+            .file(
+                "lib/app/ext/regexp.rb",
+                "module App\n\
+                \x20 module Ext\n\
+                \x20   module Expression\n\
+                \x20     def loc\n\
+                \x20       @loc\n\
+                \x20     end\n\
+                \x20   end\n\
+                \x20 end\n\
+                end\n",
+            )
+            .file(
+                "lib/app/lsp/runtime.rb",
+                "module App\n\
+                \x20 module LSP\n\
+                \x20   class Runtime\n\
+                \x20     def format(text)\n\
+                \x20       text\n\
+                \x20     end\n\
+                \x20   end\n\
+                \x20 end\n\
+                end\n",
+            )
+            .file(
+                "lib/app/web_push_request.rb",
+                "class WebPushRequest\n\
+                \x20 def legacy_encrypt(payload)\n\
+                \x20   payload\n\
+                \x20 end\n\
+                end\n",
+            )
+            .file(
+                "lib/app/cop/base.rb",
+                "module App\n\
+                \x20 module Cop\n\
+                \x20   module RangeHelp\n\
+                \x20     def range_between(a, b)\n\
+                \x20       [a, b]\n\
+                \x20     end\n\
+                \x20   end\n\
+                \n\
+                \x20   class Base\n\
+                \x20     def add_offense(node)\n\
+                \x20       node\n\
+                \x20     end\n\
+                \x20   end\n\
+                \x20 end\n\
+                end\n",
+            )
+            .file(
+                "lib/app/cop/style/foo.rb",
+                "module App\n\
+                \x20 module Cop\n\
+                \x20   module Style\n\
+                \x20     class Foo < Base\n\
+                \x20       include RangeHelp\n\
+                \n\
+                \x20       MSG = 'Use %<x>s.'\n\
+                \n\
+                \x20       def on_send(node, web_push_request)\n\
+                \x20         selector = node.loc\n\
+                \x20         web_push_request.legacy_encrypt(selector)\n\
+                \x20         add_offense(node)\n\
+                \x20         range_between(1, 2)\n\
+                \x20         format(MSG, x: 1)\n\
+                \x20       end\n\
+                \x20     end\n\
+                \x20   end\n\
+                \x20 end\n\
+                end\n",
+            )
+            .file(
+                "lib/app/greeting.rb",
+                "module Greeting\n\
+                \x20 def greet\n\
+                \x20   \"Hello, \" + display_name()\n\
+                \x20 end\n\
+                end\n",
+            )
+            .file(
+                "lib/app/person.rb",
+                "class Person\n\
+                \x20 include Greeting\n\
+                \n\
+                \x20 def display_name\n\
+                \x20   'Ada'\n\
+                \x20 end\n\
+                end\n",
+            )
+            .index()
+    }
+
+    /// Upstream #2147: a bare Ruby call written inside a class is a call on
+    /// `self`, so it reaches only the class's own methods, its superclasses'
+    /// and the modules mixed into any of them (rubocop's `format(…)`,
+    /// Kernel's, is no LSP runtime's `format`); a call through an untyped
+    /// receiver takes the one method of its name only when the receiver is
+    /// named after its owner (`web_push_request.legacy_encrypt`, but not
+    /// `node.loc`). Upstream's fixture.
+    #[test]
+    fn pr2147_ruby_calls_by_name_alone_keep_the_ancestry_and_named_receivers() {
+        let project = project();
+        assert_eq!(
+            call_targets(project.graph(), "lib/app/cop/style/foo.rb"),
+            [
+                "App::Cop::Base::add_offense",
+                "App::Cop::RangeHelp::range_between",
+                "WebPushRequest::legacy_encrypt",
+            ],
+            "{}",
+            project.graph().report()
+        );
+    }
+
+    /// Upstream #2147's receiver gate is about the method's owner, not the
+    /// method: `user_name.name` shares `name` with `Person::name` itself
+    /// (enough for the receiver-word rule every language has here, #226) but
+    /// nothing with `Person`, so the one `name` is no guess; `person.name` is.
+    #[test]
+    fn pr2147_an_untyped_ruby_receiver_must_name_the_methods_owner() {
+        let project = Project::new()
+            .file(
+                "lib/person.rb",
+                "class Person\n  def name\n    'Ada'\n  end\nend\n",
+            )
+            .file(
+                "lib/report.rb",
+                "class Report\n  def run(user_name, person)\n    user_name.name\n    person.name\n  end\nend\n",
+            )
+            .index();
+        let graph = project.graph();
+        let calls: Vec<(i64, String)> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.kind == "calls")
+            .filter(|edge| {
+                graph
+                    .node(&edge.source)
+                    .is_some_and(|node| node.file_path == "lib/report.rb")
+            })
+            .filter_map(|edge| {
+                graph
+                    .node(&edge.target)
+                    .map(|node| (edge.line.unwrap_or_default(), node.qualified_name.clone()))
+            })
+            .collect();
+        assert_eq!(
+            calls,
+            [(4, "Person::name".to_string())],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream #2147: a call in a module body is not judged, as a module's
+    /// methods run on whatever includes it. Upstream's fixture.
+    #[test]
+    fn pr2147_a_call_in_a_ruby_module_body_is_not_judged() {
+        let project = project();
+        assert_eq!(
+            call_targets(project.graph(), "lib/app/greeting.rb"),
+            ["Person::display_name"],
+            "{}",
+            project.graph().report()
+        );
+    }
+}

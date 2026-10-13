@@ -568,6 +568,11 @@ pub trait ResolutionContext {
     fn member_tables(&self) -> Arc<crate::member_types::MemberTables> {
         Arc::new(crate::member_types::MemberTables::new())
     }
+
+    /// The Ruby ancestry walk's memo of one resolution pass (W4-RB-01).
+    fn ruby_tables(&self) -> Arc<crate::ruby_scope::RubyTables> {
+        Arc::new(crate::ruby_scope::RubyTables::new())
+    }
 }
 
 /// Go module info parsed from `go.mod`.

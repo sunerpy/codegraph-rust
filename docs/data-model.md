@@ -273,6 +273,16 @@ has no row. They are written, withdrawn and checked like the head rows under
 version re-resolves every C#, Java and Kotlin file and rebuilds the rows.
 Neither is a canonical surface.
 
+Ruby head rows record what a bare Ruby call reads of a file's classes and
+modules: `ruby_heads:<path>` holds the JSON `{"entries": [{"qualified_name",
+"kind", "superclass", "mixins"}]}`, one entry per class and module in file
+order, with the superclass its first line writes (`::` kept when it roots the
+name) and every `include`, `extend` and `prepend` constant a line of its body
+writes, as written. A file with no class or module has no row. They are
+written, withdrawn and checked like the head rows under `ruby_heads_version`
+(1); a sync that finds it missing or at another version re-resolves every Ruby
+file and rebuilds the rows. Neither is a canonical surface.
+
 ## FTS5
 
 `nodes_fts` is an external-content FTS5 table over `nodes`:

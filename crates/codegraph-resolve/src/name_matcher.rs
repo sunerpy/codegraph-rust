@@ -2345,6 +2345,8 @@ pub fn match_by_exact_name(
     let java_bare = crate::java_scope::is_java_bare_call(reference);
     let java_call_scope = OnceCell::new();
     let java_type_site = crate::java_scope::JavaTypeSite::new(reference);
+    // A bare Ruby call inside a class reaches its ancestry (upstream #2147).
+    let ruby_bare = crate::ruby_scope::is_ruby_bare_call(reference);
     // A Kotlin call reaches a top-level declaration only where it is visible
     // (upstream #2146), a bare one only a member in reach (#2172, #2206,
     // #2232), and a standard-library name on an untyped chain link only a
@@ -2426,6 +2428,14 @@ pub fn match_by_exact_name(
                 && !java_call_scope
                     .get_or_init(|| crate::java_scope::JavaCallScope::of(reference, context))
                     .reaches(n, reference))
+        })
+        // rubocop's `format(…)`, Kernel's, is no LSP runtime's `format`: a
+        // bare call in a class reaches only the class's ancestry (upstream
+        // #2147).
+        .filter(|n| {
+            !(ruby_bare
+                && n.kind == NodeKind::Method
+                && !crate::ruby_scope::is_ruby_method_in_scope(n, reference, context))
         })
         // Ahead of the ranking, so a visible namesake wins: retrofit's tests'
         // `new Builder()` is not a wire converter test's nested
@@ -5159,6 +5169,14 @@ pub fn match_method_call(
         // A test double is only what a test names (upstream #2197).
         && !is_unnamed_test_double(&target_methods[0], &object_or_class, reference, context)
         && !(std && !crate::kotlin_scope::shares_receiver_word(link, &target_methods[0]))
+        // Where nothing types a receiver, the one method of that name must
+        // also belong to something the receiver is named after
+        // (`web_push_request.legacy_encrypt` -> WebPushRequest; rubocop's
+        // `node.loc` went to the project's one `loc` 1,201 times; upstream
+        // #2147).
+        && !(crate::ruby_scope::is_untyped_receiver_language(reference.language)
+            && !crate::ruby_scope::is_self_receiver(&object_or_class)
+            && !crate::kotlin_scope::shares_receiver_word(&object_or_class, &target_methods[0]))
     {
         return Some(ResolvedRef {
             original: reference.clone(),
@@ -5902,6 +5920,7 @@ pub fn match_fuzzy(reference: &RefView, context: &dyn ResolutionContext) -> Opti
     let objc_c_call = objc_call_shape(reference, context) == Some(ObjcCallShape::CCall);
     let java_bare = crate::java_scope::is_java_bare_call(reference);
     let java_call_scope = OnceCell::new();
+    let ruby_bare = crate::ruby_scope::is_ruby_bare_call(reference);
     let kotlin_call = crate::kotlin_scope::is_kotlin_call(reference);
     let kotlin_bare =
         kotlin_call && crate::kotlin_scope::is_receiver_less_kotlin_call(reference, context);
@@ -5925,6 +5944,12 @@ pub fn match_fuzzy(reference: &RefView, context: &dyn ResolutionContext) -> Opti
                     && !java_call_scope
                         .get_or_init(|| crate::java_scope::JavaCallScope::of(reference, context))
                         .reaches(n, reference))
+            })
+            // A bare Ruby call in a class, only its ancestry (upstream #2147).
+            .filter(|n| {
+                !(ruby_bare
+                    && n.kind == NodeKind::Method
+                    && !crate::ruby_scope::is_ruby_method_in_scope(n, reference, context))
             })
             // Kotlin's visibility, member reach, number bitwise extensions
             // and standard chain names, as in exact matching (upstream

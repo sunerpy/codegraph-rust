@@ -388,6 +388,12 @@ re-resolves, whole, the unchanged files declaring a class of a name the changed
 classes reach (closing over every head naming a reached name), since a call
 through an inherited member reads its type from the classes it inherits by
 name; a method body edit changes no row; the `member_surface_version` marker is
+withdrawn and restored with the others; a Ruby file whose head row moved (a
+class or module came or went, or its superclass or mixins changed) re-resolves,
+whole, the unchanged files declaring a class or module the changed qualified
+names reach (closing over every declaration writing a constant whose last
+segment is a reached name's), since a bare call in a class reads the class's
+ancestry from its declarations' source; the `ruby_heads_version` marker is
 withdrawn and restored with the others; an
 import names a file, a folder or a namespace rather than a symbol, so the parked
 imports an added file or a changed file's namespace can satisfy (by the file's

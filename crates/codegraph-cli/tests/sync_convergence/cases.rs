@@ -5722,6 +5722,142 @@ pub fn ruby_add_a_same_named_competitor() -> Case {
         .edge_before("method App::run", "calls", "method Greeter::greet")
 }
 
+/// Upstream #2147: a bare Ruby call in a class reaches the modules its
+/// ancestors mix in, read from their source, so a superclass gaining an
+/// `include` in another file links an unchanged subclass's call.
+pub fn ruby_bare_call_follows_a_mixin_added_in_another_file() -> Case {
+    Case::new(Change::EditHeritage, &[Language::Ruby])
+        .file(
+            "lib/helpers.rb",
+            "module Helpers\n  def helper\n    1\n  end\nend\n",
+        )
+        .file("lib/base.rb", "class Base\nend\n")
+        .file(
+            "lib/foo.rb",
+            "class Foo < Base\n  def run\n    helper()\n  end\nend\n",
+        )
+        .write("lib/base.rb", "class Base\n  include Helpers\nend\n")
+        .edge_after("method Foo::run", "calls", "method Helpers::helper")
+}
+
+/// Upstream #2147: a bare Ruby call follows the superclass chain, so a
+/// middle class changing its superclass in another file moves an unchanged
+/// leaf's call.
+pub fn ruby_bare_call_follows_a_superclass_change_in_another_file() -> Case {
+    Case::new(Change::EditHeritage, &[Language::Ruby])
+        .file(
+            "lib/first.rb",
+            "class First\n  def setup\n    1\n  end\nend\n",
+        )
+        .file(
+            "lib/second.rb",
+            "class Second\n  def setup\n    2\n  end\nend\n",
+        )
+        .file("lib/middle.rb", "class Middle < First\nend\n")
+        .file(
+            "lib/leaf.rb",
+            "class Leaf < Middle\n  def run\n    setup()\n  end\nend\n",
+        )
+        .write("lib/middle.rb", "class Middle < Second\nend\n")
+        .edge_before("method Leaf::run", "calls", "method First::setup")
+        .edge_after("method Leaf::run", "calls", "method Second::setup")
+}
+
+/// Upstream #2147: a mixed-in constant is resolved against the lexical
+/// nesting, so a nearer module of that name appearing in another file takes
+/// the `include` over, and an unchanged class's call to the farther module's
+/// method is gone, as on a fresh index.
+pub fn ruby_mixin_resolves_to_a_nearer_module_that_appears() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Ruby])
+        .file(
+            "lib/app/range_help.rb",
+            "module App\n  module RangeHelp\n    def range_between(a, b)\n      [a, b]\n    end\n  end\nend\n",
+        )
+        .file(
+            "lib/app/style/foo.rb",
+            "module App\n  module Style\n    class Foo\n      include RangeHelp\n\n      def run\n        range_between(1, 2)\n      end\n    end\n  end\nend\n",
+        )
+        .write(
+            "lib/app/style/range_help.rb",
+            "module App\n  module Style\n    module RangeHelp\n    end\n  end\nend\n",
+        )
+        .edge_before(
+            "method App::Style::Foo::run",
+            "calls",
+            "method App::RangeHelp::range_between",
+        )
+        .no_edge_after(
+            "method App::Style::Foo::run",
+            "calls",
+            "method App::RangeHelp::range_between",
+        )
+}
+
+/// Upstream #2147: a bare Ruby call in a class never reaches a method outside
+/// its ancestry, so an unrelated class's `format` added in another file
+/// leaves rubocop's Kernel `format(…)` unresolved.
+pub fn ruby_bare_call_ignores_an_added_unrelated_method() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Ruby])
+        .file(
+            "lib/base.rb",
+            "class Base\n  def add_offense(node)\n    node\n  end\nend\n",
+        )
+        .file(
+            "lib/foo.rb",
+            "class Foo < Base\n  def run(node)\n    add_offense(node)\n    format(\"x\")\n  end\nend\n",
+        )
+        .write(
+            "lib/runtime.rb",
+            "class Runtime\n  def format(text)\n    text\n  end\nend\n",
+        )
+        .edge_throughout("method Foo::run", "calls", "method Base::add_offense")
+        .no_edge_after("method Foo::run", "calls", "method Runtime::format")
+}
+
+/// Upstream #2147: a Ruby call through an untyped receiver takes the one
+/// method of its name only when the receiver is named after its owner, so a
+/// lone `loc` added in another file is not `node.loc`.
+pub fn ruby_untyped_receiver_ignores_a_lone_added_method() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Ruby])
+        .file(
+            "lib/web_push_request.rb",
+            "class WebPushRequest\n  def legacy_encrypt(payload)\n    payload\n  end\nend\n",
+        )
+        .file(
+            "lib/sender.rb",
+            "class Sender\n  def run(web_push_request, node)\n    web_push_request.legacy_encrypt(1)\n    node.loc\n  end\nend\n",
+        )
+        .write(
+            "lib/expression.rb",
+            "module Expression\n  def loc\n    @loc\n  end\nend\n",
+        )
+        .edge_throughout(
+            "method Sender::run",
+            "calls",
+            "method WebPushRequest::legacy_encrypt",
+        )
+        .no_edge_after("method Sender::run", "calls", "method Expression::loc")
+}
+
+/// Upstream #2147: an ancestor's method body changing leaves the unchanged
+/// subclass's bare call where it was.
+pub fn ruby_ancestor_method_body_edit() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Ruby])
+        .file(
+            "lib/base.rb",
+            "class Base\n  def add_offense(node)\n    node\n  end\nend\n",
+        )
+        .file(
+            "lib/foo.rb",
+            "class Foo < Base\n  def run(node)\n    add_offense(node)\n  end\nend\n",
+        )
+        .write(
+            "lib/base.rb",
+            "class Base\n  def add_offense(node)\n    [node]\n  end\nend\n",
+        )
+        .edge_throughout("method Foo::run", "calls", "method Base::add_offense")
+}
+
 pub fn php_add_a_same_named_competitor() -> Case {
     Case::new(Change::AddCompetitor, &[Language::Php])
         .file(

@@ -191,6 +191,7 @@ struct SnapshotCaches {
     scala_tables: OnceLock<Arc<crate::scala_scope::ScalaTables>>,
     csharp_tables: OnceLock<Arc<crate::csharp_types::CsharpTables>>,
     member_tables: OnceLock<Arc<crate::member_types::MemberTables>>,
+    ruby_tables: OnceLock<Arc<crate::ruby_scope::RubyTables>>,
     #[cfg(test)]
     counters: SnapshotCacheCounters,
 }
@@ -213,6 +214,7 @@ impl SnapshotCaches {
             scala_tables: OnceLock::new(),
             csharp_tables: OnceLock::new(),
             member_tables: OnceLock::new(),
+            ruby_tables: OnceLock::new(),
             #[cfg(test)]
             counters: SnapshotCacheCounters::default(),
         }
@@ -726,6 +728,14 @@ impl ResolutionContext for SnapshotResolutionContext {
             self.caches
                 .member_tables
                 .get_or_init(|| Arc::new(crate::member_types::MemberTables::new())),
+        )
+    }
+
+    fn ruby_tables(&self) -> Arc<crate::ruby_scope::RubyTables> {
+        Arc::clone(
+            self.caches
+                .ruby_tables
+                .get_or_init(|| Arc::new(crate::ruby_scope::RubyTables::new())),
         )
     }
 
