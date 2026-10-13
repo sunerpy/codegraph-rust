@@ -157,6 +157,10 @@ pub struct SourceFacts {
     java_heads: Mutex<HashMap<String, Arc<crate::java_scope::JavaHead>>>,
     kotlin_file_scope: OnceLock<Arc<crate::kotlin_scope::KotlinFileScope>>,
     kotlin_brace_frames: OnceLock<Arc<Vec<crate::kotlin_scope::BraceFrame>>>,
+    scala_imports: OnceLock<Arc<crate::scala_scope::ScalaImports>>,
+    scala_holder_package: OnceLock<Option<String>>,
+    scala_package_object_package: OnceLock<Option<String>>,
+    local_declaration_scopes: Mutex<HashMap<String, Option<(i64, i64)>>>,
 }
 
 impl SourceFacts {
@@ -201,6 +205,10 @@ impl SourceFacts {
             java_heads: Mutex::new(HashMap::new()),
             kotlin_file_scope: OnceLock::new(),
             kotlin_brace_frames: OnceLock::new(),
+            scala_imports: OnceLock::new(),
+            scala_holder_package: OnceLock::new(),
+            scala_package_object_package: OnceLock::new(),
+            local_declaration_scopes: Mutex::new(HashMap::new()),
         }
     }
 
@@ -581,6 +589,53 @@ impl SourceFacts {
         read: impl FnOnce(&Self) -> crate::java_scope::JavaHead,
     ) -> Arc<crate::java_scope::JavaHead> {
         keyed_memo(&self.java_heads, declaration_id, || Arc::new(read(self)))
+    }
+
+    /// What a Scala file's imports bring in (upstream `scalaImportsOf`),
+    /// read once.
+    pub(crate) fn scala_imports(&self) -> Arc<crate::scala_scope::ScalaImports> {
+        Arc::clone(
+            self.scala_imports
+                .get_or_init(|| Arc::new(crate::scala_scope::ScalaImports::read(&self.source))),
+        )
+    }
+
+    /// The last segment of a Scala file's last package clause (upstream
+    /// #2199), read once.
+    pub(crate) fn scala_holder_package(&self) -> Option<String> {
+        self.scala_holder_package
+            .get_or_init(|| crate::scala_scope::scala_holder_package(&self.source))
+            .clone()
+    }
+
+    /// The package a Scala file's `package object` opens (upstream #2230),
+    /// read once.
+    pub(crate) fn scala_package_object_package(&self) -> Option<String> {
+        self.scala_package_object_package
+            .get_or_init(|| crate::scala_scope::scala_package_object_package(&self.source))
+            .clone()
+    }
+
+    /// The lines a declaration of this file with id `id` is local to
+    /// (upstream #2193 `localDeclarationScope`), computed once.
+    pub(crate) fn local_declaration_scope(
+        &self,
+        id: &str,
+        compute: impl FnOnce() -> Option<(i64, i64)>,
+    ) -> Option<(i64, i64)> {
+        if let Some(hit) = self
+            .local_declaration_scopes
+            .lock()
+            .ok()
+            .and_then(|memo| memo.get(id).copied())
+        {
+            return hit;
+        }
+        let scope = compute();
+        if let Ok(mut memo) = self.local_declaration_scopes.lock() {
+            memo.insert(id.to_string(), scope);
+        }
+        scope
     }
 
     /// The package and imports of a Kotlin file (upstream #2146), read once.

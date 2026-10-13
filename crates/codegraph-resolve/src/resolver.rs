@@ -1215,6 +1215,15 @@ fn target_is_visible_across_files(
     if c_family_static_function_is_file_local(target, reference, context) {
         return false;
     }
+    // A Scala package object's member is in scope in its package and those
+    // under it, or through an import: cats.laws' `Eq` is the `cats` package
+    // object's alias, not the `algebra` one's (upstream #2230).
+    if target.language == Language::Scala
+        && reference.language == Language::Scala
+        && !crate::scala_scope::is_scala_package_object_member_visible(target, reference, context)
+    {
+        return false;
+    }
     if matches!(
         target.language,
         Language::Kotlin

@@ -8,6 +8,7 @@ mod link_state;
 mod migrate;
 pub mod module_surfaces;
 mod policy;
+pub mod scala_surfaces;
 mod sync;
 mod watcher;
 mod worktree;

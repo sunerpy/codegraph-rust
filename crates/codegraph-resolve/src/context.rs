@@ -64,6 +64,7 @@ struct Caches {
     cpp_namespace_tables: Option<Arc<crate::cpp_namespaces::CppNamespaceTables>>,
     /// The Kotlin tables for the pass (upstream #2172).
     kotlin_tables: Option<Arc<crate::kotlin_scope::KotlinTables>>,
+    scala_tables: Option<Arc<crate::scala_scope::ScalaTables>>,
 }
 
 /// Bound on memoized existence answers; the memo restarts past it, as upstream.
@@ -94,6 +95,7 @@ impl Caches {
             python_write_index: None,
             cpp_namespace_tables: None,
             kotlin_tables: None,
+            scala_tables: None,
         }
     }
 }
@@ -135,6 +137,7 @@ impl<'a> StoreResolutionContext<'a> {
         c.python_write_index = None;
         c.cpp_namespace_tables = None;
         c.kotlin_tables = None;
+        c.scala_tables = None;
     }
 
     fn cached_all_files(&self) -> Arc<Vec<String>> {
@@ -478,6 +481,15 @@ impl ResolutionContext for StoreResolutionContext<'_> {
                 .borrow_mut()
                 .kotlin_tables
                 .get_or_insert_with(|| Arc::new(crate::kotlin_scope::KotlinTables::new())),
+        )
+    }
+
+    fn scala_tables(&self) -> Arc<crate::scala_scope::ScalaTables> {
+        Arc::clone(
+            self.caches
+                .borrow_mut()
+                .scala_tables
+                .get_or_insert_with(|| Arc::new(crate::scala_scope::ScalaTables::new())),
         )
     }
 

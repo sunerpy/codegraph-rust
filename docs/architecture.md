@@ -360,7 +360,17 @@ lambdas are passed to a function whose receiver moved, and touches, for the name
 lane, the members of every type that joined or left the project-wide receiver
 types and of every owner a Gradle script reads that came or left as a project
 class name, since none of those facts is a node; the `kotlin_surface_version`
-marker is withdrawn and restored with the others; an import
+marker is withdrawn and restored with the others; a Scala file whose surface row
+moved re-resolves, whole, the unchanged Scala files whose walks start from a
+name its changed heads or package objects reach (closing over every head and
+package object naming a reached name), and touches, for the name lane, the
+functions and `val`s whose `extension` or block reading flipped (by node id),
+every name of the file when the package its package object opens changed, and
+its top-level types when the package holding them changed, sending the unchanged
+files with references to those names written with a receiver down the
+whole-file lane too, however many there are, since none of those facts is a
+node; the `scala_surface_version` marker is withdrawn and restored with the
+others; an import
 names a file, a folder or a namespace rather than a symbol, so the parked
 imports an added file or a changed file's namespace can satisfy (by the file's
 name and stem, its folder's, or the namespace's whole name) send their files

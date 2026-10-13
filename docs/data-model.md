@@ -235,6 +235,21 @@ checked like the head rows under `kotlin_surface_version` (1); a sync that finds
 it missing or at another version re-resolves every Kotlin file and rebuilds the
 rows. Neither is a canonical surface.
 
+Scala surface rows record what Scala resolution reads of a Scala file by the
+readers it uses: `scala_surface:<path>` holds the JSON `{"heads",
+"package_objects", "starts", "extension_functions", "block_locals",
+"object_package", "holder"}`: each type head's name and the supertypes that
+declaration names (in node order), each `package object X extends …`'s name and
+supertypes (in text order, `.scala` files only), sorted, the names the file's
+own walks start from (its type names, every type a `new … with …` names, the
+objects it imports whole, its package segments), the functions an `extension`
+line marks and the `val`s a block of a class body scopes (by node id and name),
+the package its package object opens and the last segment of its last package
+clause. A file with none of these has no row. They are written, withdrawn and
+checked like the head rows under `scala_surface_version` (1); a sync that finds
+it missing or at another version re-resolves every Scala file and rebuilds the
+rows. Neither is a canonical surface.
+
 ## FTS5
 
 `nodes_fts` is an external-content FTS5 table over `nodes`:

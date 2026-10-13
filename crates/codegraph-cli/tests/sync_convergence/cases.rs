@@ -4531,6 +4531,379 @@ pub fn dart_change_a_mixin() -> Case {
         .edge_throughout("class Duck", "extends", "class Bird")
 }
 
+/// Upstream #2160: a bare Scala call reaches the members of the supertypes
+/// the heads of the types around it name, read from source by name, so
+/// another file changing a base's head moves an unchanged file's call, as
+/// on a fresh index.
+pub fn scala_bare_call_follows_a_base_change_in_another_file() -> Case {
+    Case::new(Change::EditHeritage, &[Language::Scala])
+        .file(
+            "src/app/Base.scala",
+            "package app\n\ntrait Base extends HelperA\n",
+        )
+        .file(
+            "src/app/HelperA.scala",
+            "package app\n\ntrait HelperA {\n  def helper(): Int = 1\n}\n",
+        )
+        .file(
+            "src/app/HelperB.scala",
+            "package app\n\ntrait HelperB {\n  def helper(): Int = 2\n}\n",
+        )
+        .file(
+            "src/app/Use.scala",
+            "package app\n\nobject Use extends Base {\n  def local(): Int = helper()\n}\n",
+        )
+        .write(
+            "src/app/Base.scala",
+            "package app\n\ntrait Base extends HelperB\n",
+        )
+        .edge_before("method Use::local", "calls", "method HelperA::helper")
+        .edge_after("method Use::local", "calls", "method HelperB::helper")
+}
+
+/// Upstream #2193: an imported package object's supertypes are in scope, and
+/// the graph holds no node for `package object api extends Api`, so a change
+/// of what it extends moves an unchanged importer's bare call, as on a fresh
+/// index.
+pub fn scala_imported_package_object_changes_its_supertype() -> Case {
+    Case::new(Change::EditHeritage, &[Language::Scala])
+        .file(
+            "src/app/Api.scala",
+            "package app\n\ntrait Api {\n  def multipart(s: String): String = s\n}\n",
+        )
+        .file(
+            "src/app/Api2.scala",
+            "package app\n\ntrait Api2 {\n  def multipart(s: String): String = s\n}\n",
+        )
+        .file(
+            "src/app/api/package.scala",
+            "package app\n\npackage object api extends Api\n",
+        )
+        .file(
+            "src/app/client/Client.scala",
+            "package app.client\n\nimport app.api._\n\nclass Client {\n  def send(): String = multipart(\"x\")\n}\n",
+        )
+        .write(
+            "src/app/api/package.scala",
+            "package app\n\npackage object api extends Api2\n",
+        )
+        .edge_before("method Client::send", "calls", "method Api::multipart")
+        .edge_after("method Client::send", "calls", "method Api2::multipart")
+}
+
+/// Upstream #2193 through a package object: an imported package object's
+/// supertypes are walked by their heads, so a head change of what the
+/// package object extends, in another file, moves an unchanged importer's
+/// bare call, as on a fresh index (the closure runs through the package
+/// object's entry).
+pub fn scala_package_object_supertype_head_changes_in_another_file() -> Case {
+    Case::new(Change::EditHeritage, &[Language::Scala])
+        .file(
+            "src/app/BaseA.scala",
+            "package app\n\ntrait BaseA {\n  def multipart(s: String): String = s\n}\n",
+        )
+        .file(
+            "src/app/BaseB.scala",
+            "package app\n\ntrait BaseB {\n  def multipart(s: String): String = s\n}\n",
+        )
+        .file("src/app/Api.scala", "package app\n\ntrait Api extends BaseA\n")
+        .file(
+            "src/app/api/package.scala",
+            "package app\n\npackage object api extends Api\n",
+        )
+        .file(
+            "src/app/client/Client.scala",
+            "package app.client\n\nimport app.api._\n\nclass Client {\n  def send(): String = multipart(\"x\")\n}\n",
+        )
+        .write("src/app/Api.scala", "package app\n\ntrait Api extends BaseB\n")
+        .edge_before("method Client::send", "calls", "method BaseA::multipart")
+        .edge_after("method Client::send", "calls", "method BaseB::multipart")
+}
+
+/// Upstream #2230: a package object's member is in scope through an import
+/// of its package, read from its file's text, so renaming the package object
+/// (its members keep their nodes) drops an unchanged importer's reference,
+/// as on a fresh index.
+pub fn scala_package_object_is_renamed_under_its_members() -> Case {
+    Case::new(Change::RenameSymbol, &[Language::Scala])
+        .file(
+            "src/algebra/package.scala",
+            "package object algebra {\n  type Eq[A] = Int\n}\n",
+        )
+        .file(
+            "src/algebra/laws/RingLaws.scala",
+            "package algebra.laws\n\nimport algebra._\n\ntrait RingLaws {\n  def eqv[A](eq: Eq[A]): Boolean = true\n}\n",
+        )
+        .write(
+            "src/algebra/package.scala",
+            "package object algebra2 {\n  type Eq[A] = Int\n}\n",
+        )
+        .edge_before("method RingLaws::eqv", "references", "type_alias Eq")
+}
+
+/// Upstream #2199: a type as a chain link is named by what holds it, a
+/// top-level type's file's package, read from its text, so moving the type's
+/// file to another package (its node unchanged) drops an unchanged caller's
+/// `app.client.Response(200)`, as on a fresh index.
+pub fn scala_chain_link_type_changes_its_package() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Scala])
+        .file(
+            "src/app/client/Response.scala",
+            "package app.client\n\ncase class Response(code: Int)\n",
+        )
+        .file(
+            "src/app/Use.scala",
+            "package app\n\nclass Use {\n  def make(): Any = app.client.Response(200)\n}\n",
+        )
+        .write(
+            "src/app/client/Response.scala",
+            "package app.clients\n\ncase class Response(code: Int)\n",
+        )
+        .edge_before("method Use::make", "instantiates", "class Response")
+}
+
+/// Upstream #2193: a Scala `val` written in a block of a class body is that
+/// block's, read from the class's braces, so wrapping a member `val` in a
+/// block (its node unchanged) drops a subclass's call in another file, as on
+/// a fresh index.
+pub fn scala_member_val_becomes_block_local() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Scala])
+        .file(
+            "src/app/ASuite.scala",
+            "package app\n\nclass ASuite {\n  def test(name: String)(body: => Unit): Unit = ()\n  // block\n    val f = (i: Int) => i\n  // end\n}\n",
+        )
+        .file(
+            "src/app/BSuite.scala",
+            "package app\n\nclass BSuite extends ASuite {\n  def go(): Int = f(1)\n}\n",
+        )
+        .write(
+            "src/app/ASuite.scala",
+            "package app\n\nclass ASuite {\n  def test(name: String)(body: => Unit): Unit = ()\n  test(\"a\") {\n    val f = (i: Int) => i\n  }\n}\n",
+        )
+        .edge_before("method BSuite::go", "calls", "field ASuite::f")
+}
+
+/// Upstream #2160: a chain link reaches a package object's function only
+/// when it is an `extension` method, read from the lines above it, so an
+/// `extension` line appearing above an unchanged function lets an unchanged
+/// file's chain link reach it, as on a fresh index.
+pub fn scala_function_becomes_an_extension_method() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Scala])
+        .file(
+            "src/app/tools/package.scala",
+            "package app\n\npackage object tools {\n  val x = 1\n  def double(n: Int): Int = n * 2\n}\n",
+        )
+        .file(
+            "src/app/Use.scala",
+            "package app\n\nimport app.tools._\n\nobject Use {\n  def run(): Int = List(1).double(2)\n}\n",
+        )
+        .write(
+            "src/app/tools/package.scala",
+            "package app\n\npackage object tools {\n  extension (s: String) def shout: String = s\n  def double(n: Int): Int = n * 2\n}\n",
+        )
+        .edge_after("method Use::run", "calls", "function double")
+}
+
+/// Upstream #2193: two same-named `val f` of one file, `A`'s and `C`'s,
+/// trade their block and member states with every node in place; a
+/// subclass of `C` in another file gains its call to `C::f`, as on a fresh
+/// index (the facts compare by node id, not by name).
+pub fn scala_same_named_vals_trade_block_and_member_states() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Scala])
+        .file(
+            "src/app/Suites.scala",
+            "package app\n\nclass A {\n  def test(n: String)(b: => Unit): Unit = ()\n  // block\n    val f = (i: Int) => i\n  // end\n}\n\nclass C {\n  def test(n: String)(b: => Unit): Unit = ()\n  test(\"c\") {\n    val f = (i: Int) => i\n  }\n}\n",
+        )
+        .file(
+            "src/app/D.scala",
+            "package app\n\nclass D extends C {\n  def go(): Int = f(1)\n}\n",
+        )
+        .write(
+            "src/app/Suites.scala",
+            "package app\n\nclass A {\n  def test(n: String)(b: => Unit): Unit = ()\n  test(\"a\") {\n    val f = (i: Int) => i\n  }\n}\n\nclass C {\n  def test(n: String)(b: => Unit): Unit = ()\n  // block\n    val f = (i: Int) => i\n  // end\n}\n",
+        )
+        .edge_after("method D::go", "calls", "field C::f")
+}
+
+/// Upstream #2199 past the name lane's per-tail ceiling: 501 parked
+/// `app.client.Response(…)` calls all reach `Response` once its file moves
+/// into `app.client`, as on a fresh index (the lane re-resolves their file
+/// whole, however many share the tail).
+pub fn scala_holder_change_reaches_past_the_tail_ceiling() -> Case {
+    static CALLS: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        let mut calls = String::from("package app\n\nclass Use {\n");
+        for i in 0..501 {
+            calls.push_str(&format!(
+                "  def make{i}(): Any = app.client.Response({i})\n"
+            ));
+        }
+        calls.push_str("}\n");
+        calls
+    });
+    let calls: &'static str = CALLS.as_str();
+    Case::new(Change::BodyEdit, &[Language::Scala])
+        .file(
+            "src/app/client/Response.scala",
+            "package app.clients\n\ncase class Response(code: Int)\n",
+        )
+        .file("src/app/Use.scala", calls)
+        .write(
+            "src/app/client/Response.scala",
+            "package app.client\n\ncase class Response(code: Int)\n",
+        )
+        .edge_after("method Use::make500", "instantiates", "class Response")
+}
+
+/// Upstream #2160: a body edit in a base changes no head, so no unchanged
+/// file re-resolves, and the subclass's bare call stays.
+pub fn scala_base_body_edit_keeps_a_bare_call() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Scala])
+        .file(
+            "src/app/Base.scala",
+            "package app\n\ntrait Base {\n  def assist(): Int = 1\n}\n",
+        )
+        .file(
+            "src/app/Child.scala",
+            "package app\n\nclass Child extends Base {\n  def go(): Int = assist()\n}\n",
+        )
+        .write(
+            "src/app/Base.scala",
+            "package app\n\ntrait Base {\n  def assist(): Int = {\n    2\n  }\n}\n",
+        )
+        .edge_throughout("method Child::go", "calls", "method Base::assist")
+}
+
+/// Upstream #2160 in a batch: the base and the type between it and an
+/// unchanged subclass both change in one sync; the subclass's bare call
+/// reaches what the new middle type names, as on a fresh index.
+pub fn scala_batch_rewrites_a_base_and_a_middle_type() -> Case {
+    Case::new(Change::EditHeritage, &[Language::Scala])
+        .file(
+            "src/app/Root.scala",
+            "package app\n\ntrait Root {\n  def assist(): Int = 1\n}\n",
+        )
+        .file(
+            "src/app/Other.scala",
+            "package app\n\ntrait Other {\n  def assist(): Int = 2\n}\n",
+        )
+        .file(
+            "src/app/Spare.scala",
+            "package app\n\ntrait Spare {\n  def assist(): Int = 3\n}\n",
+        )
+        .file(
+            "src/app/Base.scala",
+            "package app\n\ntrait Base extends Root\n",
+        )
+        .file(
+            "src/app/Mid.scala",
+            "package app\n\ntrait Mid extends Base\n",
+        )
+        .file(
+            "src/app/Child.scala",
+            "package app\n\nclass Child extends Mid {\n  def go(): Int = assist()\n}\n",
+        )
+        .write(
+            "src/app/Base.scala",
+            "package app\n\ntrait Base extends Other\n",
+        )
+        .write(
+            "src/app/Mid.scala",
+            "package app\n\ntrait Mid extends Spare\n",
+        )
+        .edge_before("method Child::go", "calls", "method Root::assist")
+        .edge_after("method Child::go", "calls", "method Spare::assist")
+}
+
+/// Upstream #2230, the other way round: a package object taking the name
+/// an unchanged file imports (its members keep their nodes) gives that
+/// file's reference its target, as on a fresh index.
+pub fn scala_package_object_takes_an_imported_name() -> Case {
+    Case::new(Change::RenameSymbol, &[Language::Scala])
+        .file(
+            "src/algebra/package.scala",
+            "package object algebra2 {\n  type Eq[A] = Int\n}\n",
+        )
+        .file(
+            "src/algebra/laws/RingLaws.scala",
+            "package algebra.laws\n\nimport algebra._\n\ntrait RingLaws {\n  def eqv[A](eq: Eq[A]): Boolean = true\n}\n",
+        )
+        .write(
+            "src/algebra/package.scala",
+            "package object algebra {\n  type Eq[A] = Int\n}\n",
+        )
+        .edge_after("method RingLaws::eqv", "references", "type_alias Eq")
+}
+
+/// Upstream #2199, the other way round: a type's file moving into the
+/// package an unchanged caller's chain names (the type's node unchanged)
+/// gives `app.client.Response(200)` its target, as on a fresh index.
+pub fn scala_chain_link_type_moves_into_the_named_package() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Scala])
+        .file(
+            "src/app/client/Response.scala",
+            "package app.clients\n\ncase class Response(code: Int)\n",
+        )
+        .file(
+            "src/app/Use.scala",
+            "package app\n\nclass Use {\n  def make(): Any = app.client.Response(200)\n}\n",
+        )
+        .write(
+            "src/app/client/Response.scala",
+            "package app.client\n\ncase class Response(code: Int)\n",
+        )
+        .edge_after("method Use::make", "instantiates", "class Response")
+}
+
+/// Upstream #2193, the other way round: a block's `val` becoming a member of
+/// the class body (its node unchanged) gives a subclass's call in another
+/// file its target, as on a fresh index.
+pub fn scala_block_local_val_becomes_a_member() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Scala])
+        .file(
+            "src/app/ASuite.scala",
+            "package app\n\nclass ASuite {\n  def test(name: String)(body: => Unit): Unit = ()\n  test(\"a\") {\n    val f = (i: Int) => i\n  }\n}\n",
+        )
+        .file(
+            "src/app/BSuite.scala",
+            "package app\n\nclass BSuite extends ASuite {\n  def go(): Int = f(1)\n}\n",
+        )
+        .write(
+            "src/app/ASuite.scala",
+            "package app\n\nclass ASuite {\n  def test(name: String)(body: => Unit): Unit = ()\n  // block\n    val f = (i: Int) => i\n  // end\n}\n",
+        )
+        .edge_after("method BSuite::go", "calls", "field ASuite::f")
+}
+
+/// Upstream #2123's type scope reads the heads of every declaration named
+/// like a type around the reference, another file's included, so a
+/// same-named class's head changing in another file moves an unchanged
+/// file's type reference, as on a fresh index.
+pub fn scala_type_reference_follows_a_namesake_head_in_another_file() -> Case {
+    Case::new(Change::EditHeritage, &[Language::Scala])
+        .file(
+            "src/app/HasA.scala",
+            "package app\n\ntrait HasA {\n  type A = Int\n}\n",
+        )
+        .file(
+            "src/app/HasB.scala",
+            "package app\n\ntrait HasB {\n  type A = Long\n}\n",
+        )
+        .file(
+            "src/other/Child.scala",
+            "package other\n\nclass Child extends HasA\n",
+        )
+        .file(
+            "src/app/Child.scala",
+            "package app\n\nclass Child {\n  def get(): A = ???\n}\n",
+        )
+        .write(
+            "src/other/Child.scala",
+            "package other\n\nclass Child extends HasB\n",
+        )
+        .edge_before("method Child::get", "references", "type_alias HasA::A")
+        .edge_after("method Child::get", "references", "type_alias HasB::A")
+}
+
 pub fn scala_change_a_parent_trait() -> Case {
     Case::new(Change::EditHeritage, &[Language::Scala])
         .file(

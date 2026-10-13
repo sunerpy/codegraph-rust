@@ -561,6 +561,7 @@ fn sync_paths_with_store(
     // packages: every Java file is re-resolved once (W4-JVM-01).
     let java_bootstrap = crate::java_heads::needs_bootstrap(store)?;
     let kotlin_bootstrap = crate::kotlin_surfaces::needs_bootstrap(store)?;
+    let scala_bootstrap = crate::scala_surfaces::needs_bootstrap(store)?;
 
     let paths = paths.into_iter().collect::<Vec<_>>();
     let total = paths.len();
@@ -607,7 +608,13 @@ fn sync_paths_with_store(
         on_progress(done + 1, total);
     }
 
-    if changed || surface_bootstrap || cpp_bootstrap || java_bootstrap || kotlin_bootstrap {
+    if changed
+        || surface_bootstrap
+        || cpp_bootstrap
+        || java_bootstrap
+        || kotlin_bootstrap
+        || scala_bootstrap
+    {
         note_python_global_readers(
             project_root,
             store,
@@ -698,6 +705,22 @@ fn sync_paths_with_store(
             dependent_fallbacks.insert(file.clone());
         }
         changed_names.note_all(kotlin.names.iter().cloned());
+        // And Scala's: the heads and package objects its walks pass through,
+        // and what a candidate's own text says of it (W4-SC-01).
+        let scala = crate::scala_surfaces::scala_refresh(
+            store,
+            project_root,
+            scope.options.max_file_size,
+            &changed_names.scala,
+            &reindexed,
+            &changed_names.removed_files,
+            scala_bootstrap,
+        )?;
+        for file in &scala.files {
+            dependent_sites.remove(file);
+            dependent_fallbacks.insert(file.clone());
+        }
+        changed_names.note_all(scala.names.iter().cloned());
         // What a changed Python import statement re-exports moves for its
         // module's importers without any node of those names changing.
         if !changed_names.python_imports.is_empty() {
@@ -786,10 +809,12 @@ fn sync_paths_with_store(
         namespaces.write_rows(store)?;
         java.write_rows(store)?;
         kotlin.write_rows(store)?;
+        scala.write_rows(store)?;
         crate::module_surfaces::finish_bootstrap(store)?;
         crate::cpp_dependents::write_marker(store)?;
         crate::java_heads::write_marker(store)?;
         crate::kotlin_surfaces::write_marker(store)?;
+        crate::scala_surfaces::write_marker(store)?;
     }
 
     // Orphan sweep (#1187, upstream index.ts:645-682): a full-index resolution
@@ -1173,6 +1198,9 @@ fn remove_tracked_file(
     changed_names
         .kotlin
         .note(store, relative, &old_nodes, None)?;
+    changed_names
+        .scala
+        .note(store, relative, &old_nodes, None)?;
     delete_unresolved_refs_by_file(store, relative)?;
     store.delete_file_record(relative)?;
     changed_names
@@ -1543,6 +1571,12 @@ fn reextract_into_store(
         &old_nodes,
         Some((file.language, source, &result.nodes)),
     )?;
+    changed_names.scala.note(
+        store,
+        relative,
+        &old_nodes,
+        Some((file.language, source, &result.nodes)),
+    )?;
     // No name in another file resolves into a minified script (upstream
     // #2204), and that verdict is read from the script's text: a script that
     // was or is generated can flip it with every node where it was, so all of
@@ -1667,6 +1701,9 @@ struct ChangedNames {
     /// What the changed files held that Kotlin resolution in other files
     /// reads: surfaces and class names (W4-JVM-03).
     kotlin: crate::kotlin_surfaces::KotlinChanges,
+    /// What the changed files held that Scala resolution in other files
+    /// reads: heads, package objects and text facts (W4-SC-01).
+    scala: crate::scala_surfaces::ScalaChanges,
 }
 
 /// What a changed Python file held before the change. A module global's
@@ -1703,6 +1740,7 @@ impl ChangedNames {
             crate::cpp_dependents::withdraw_marker(store)?;
             crate::java_heads::withdraw_marker(store)?;
             crate::kotlin_surfaces::withdraw_marker(store)?;
+            crate::scala_surfaces::withdraw_marker(store)?;
             self.surface_dirty = true;
         }
         Ok(())
@@ -2427,6 +2465,179 @@ pub(crate) mod tests {
         // The edited file's row is its new one.
         rebuilt.retain(|(key, _)| key != "kotlin_surface:src/app/Spare.kt");
         wanted.retain(|(key, _)| key != "kotlin_surface:src/app/Spare.kt");
+        assert_eq!(rebuilt, wanted);
+        assert_eq!(edge_projection(&db), expected);
+    }
+
+    fn scala_marker(db: &Path) -> Option<String> {
+        Store::open(db)
+            .unwrap()
+            .get_project_metadata(crate::scala_surfaces::VERSION_KEY)
+            .unwrap()
+    }
+
+    fn scala_rows(db: &Path) -> Vec<(String, String)> {
+        Store::open(db)
+            .unwrap()
+            .project_metadata_with_prefix(codegraph_resolve::scala_scope::SURFACE_ROW_KEY_PREFIX)
+            .unwrap()
+    }
+
+    const SCALA_ROOT: (&str, &str) = (
+        "src/app/Root.scala",
+        "package app\n\ntrait Root {\n  def assist(): Int = 1\n}\n",
+    );
+    const SCALA_OTHER: (&str, &str) = (
+        "src/app/Other.scala",
+        "package app\n\ntrait Other {\n  def assist(): Int = 2\n}\n",
+    );
+    const SCALA_BASE_ROOT: (&str, &str) = (
+        "src/app/Base.scala",
+        "package app\n\ntrait Base extends Root\n",
+    );
+    const SCALA_BASE_OTHER: (&str, &str) = (
+        "src/app/Base.scala",
+        "package app\n\ntrait Base extends Other\n",
+    );
+    const SCALA_CHILD: (&str, &str) = (
+        "src/app/Child.scala",
+        "package app\n\nclass Child extends Base {\n  def go(): Int = assist()\n}\n",
+    );
+    const SCALA_SPARE: (&str, &str) = ("src/app/Spare.scala", "package app\n\nclass Spare\n");
+    const SCALA_SPARE_EDITED: (&str, &str) = (
+        "src/app/Spare.scala",
+        "package app\n\nclass Spare {\n  val count = 1\n}\n",
+    );
+
+    /// W4-SC-01: a sync failing after its mutations leaves the Scala marker
+    /// away, so the next sync, with nothing changed or with an unrelated
+    /// change, re-resolves every Scala file and rebuilds the surface rows:
+    /// `Child`'s bare call, which the changed base moves, ends where a fresh
+    /// index puts it.
+    #[test]
+    fn a_scala_sync_failing_after_its_mutations_leaves_the_next_one_to_reconcile() {
+        let version = Some(crate::scala_surfaces::VERSION.to_string());
+        let dir = TestDir::new("scala-surface-fail");
+        let db = default_db_path(dir.path()).unwrap();
+        let initial = [
+            SCALA_ROOT,
+            SCALA_OTHER,
+            SCALA_BASE_ROOT,
+            SCALA_CHILD,
+            SCALA_SPARE,
+        ];
+        write_files(dir.path(), &initial);
+        sync_changed_paths(dir.path(), &db, initial.iter().map(|(path, _)| *path)).unwrap();
+        assert_eq!(scala_marker(&db), version);
+
+        let fail_once = |paths: &[&str]| {
+            FAIL_BEFORE_RESOLUTION.with(|fail| fail.set(true));
+            let failed = sync_changed_paths(dir.path(), &db, paths.iter().copied());
+            FAIL_BEFORE_RESOLUTION.with(|fail| fail.set(false));
+            assert!(failed.is_err(), "the injected failure must stop the sync");
+            assert_eq!(
+                scala_marker(&db),
+                None,
+                "a failed sync leaves the marker away"
+            );
+        };
+
+        write_files(dir.path(), &[SCALA_BASE_OTHER]);
+        fail_once(&["src/app/Base.scala"]);
+        sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
+        assert_eq!(scala_marker(&db), version);
+        let fresh = [
+            SCALA_ROOT,
+            SCALA_OTHER,
+            SCALA_BASE_OTHER,
+            SCALA_CHILD,
+            SCALA_SPARE,
+        ];
+        assert_eq!(
+            edge_projection(&db),
+            fresh_edges("scala-surface-fail-other", &fresh)
+        );
+        assert!(
+            edge_projection(&db)
+                .iter()
+                .any(|edge| edge.contains("Child::go -[calls]-> src/app/Other.scala")),
+            "{:#?}",
+            edge_projection(&db)
+        );
+
+        write_files(dir.path(), &[SCALA_BASE_ROOT]);
+        fail_once(&["src/app/Base.scala"]);
+        write_files(dir.path(), &[SCALA_SPARE_EDITED]);
+        sync_changed_paths(dir.path(), &db, ["src/app/Spare.scala"]).unwrap();
+        assert_eq!(scala_marker(&db), version);
+        let fresh = [
+            SCALA_ROOT,
+            SCALA_OTHER,
+            SCALA_BASE_ROOT,
+            SCALA_CHILD,
+            SCALA_SPARE_EDITED,
+        ];
+        assert_eq!(
+            edge_projection(&db),
+            fresh_edges("scala-surface-fail-root", &fresh)
+        );
+    }
+
+    /// W4-SC-01: an index without the Scala marker or its surface rows (built
+    /// before them) has every Scala file re-resolved and every row rebuilt by
+    /// its next sync: the bare call an older sync left without its edge comes
+    /// back.
+    #[test]
+    fn an_index_without_the_scala_marker_rebuilds_the_surface_rows() {
+        let version = Some(crate::scala_surfaces::VERSION.to_string());
+        let dir = TestDir::new("scala-surface-bootstrap");
+        let db = default_db_path(dir.path()).unwrap();
+        let initial = [
+            SCALA_ROOT,
+            SCALA_OTHER,
+            SCALA_BASE_ROOT,
+            SCALA_CHILD,
+            SCALA_SPARE,
+        ];
+        write_files(dir.path(), &initial);
+        sync_changed_paths(dir.path(), &db, initial.iter().map(|(path, _)| *path)).unwrap();
+        assert_eq!(scala_marker(&db), version);
+        let rows = scala_rows(&db);
+        assert!(
+            rows.iter()
+                .any(|(key, _)| key == "scala_surface:src/app/Base.scala"),
+            "{rows:#?}"
+        );
+        let expected = edge_projection(&db);
+        {
+            let store = Store::open(&db).unwrap();
+            let dropped = store
+                .connection()
+                .execute(
+                    "DELETE FROM edges WHERE kind = 'calls' AND target = (SELECT id FROM nodes \
+                     WHERE qualified_name = 'Root::assist')",
+                    [],
+                )
+                .unwrap();
+            assert_eq!(dropped, 1, "the call edge an older sync lost");
+            store
+                .delete_project_metadata_with_prefix(
+                    codegraph_resolve::scala_scope::SURFACE_ROW_KEY_PREFIX,
+                )
+                .unwrap();
+            store
+                .delete_project_metadata(crate::scala_surfaces::VERSION_KEY)
+                .unwrap();
+        }
+        assert_ne!(edge_projection(&db), expected);
+        write_files(dir.path(), &[SCALA_SPARE_EDITED]);
+        sync_changed_paths(dir.path(), &db, ["src/app/Spare.scala"]).unwrap();
+        assert_eq!(scala_marker(&db), version);
+        let mut rebuilt = scala_rows(&db);
+        let mut wanted = rows;
+        // The edited file's row is its new one.
+        rebuilt.retain(|(key, _)| key != "scala_surface:src/app/Spare.scala");
+        wanted.retain(|(key, _)| key != "scala_surface:src/app/Spare.scala");
         assert_eq!(rebuilt, wanted);
         assert_eq!(edge_projection(&db), expected);
     }

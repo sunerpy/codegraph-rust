@@ -553,6 +553,11 @@ pub trait ResolutionContext {
     fn kotlin_tables(&self) -> Arc<crate::kotlin_scope::KotlinTables> {
         Arc::new(crate::kotlin_scope::KotlinTables::new())
     }
+
+    /// The project-wide Scala facts of one resolution pass (W4-SC-01).
+    fn scala_tables(&self) -> Arc<crate::scala_scope::ScalaTables> {
+        Arc::new(crate::scala_scope::ScalaTables::new())
+    }
 }
 
 /// Go module info parsed from `go.mod`.

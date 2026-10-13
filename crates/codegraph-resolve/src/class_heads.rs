@@ -379,39 +379,62 @@ fn is_scala_type(node: &Node) -> bool {
 /// The simple names a Scala type's declarations extend or mix in (upstream
 /// `scalaSupertypesOf`).
 pub(crate) fn scala_supertypes_of(type_name: &str, context: &dyn ResolutionContext) -> Vec<String> {
-    static CLAUSE: OnceLock<Regex> = OnceLock::new();
-    static NAME: OnceLock<Regex> = OnceLock::new();
-    let clause_re =
-        CLAUSE.get_or_init(|| Regex::new(r"(?s)\bextends\b(.*)$").expect("scala clause"));
-    let name_re = NAME.get_or_init(|| Regex::new(r"[A-Za-z_][\w.]*").expect("scala name"));
     let mut names = Vec::new();
     for decl in context.get_nodes_by_name_shared(type_name) {
         if !is_scala_type(&decl) {
             continue;
         }
-        let text = head_lines(&decl, 13, " ", context);
-        let mut depth = 0usize;
-        let mut flat = String::new();
-        for ch in text.chars() {
-            match ch {
-                '[' | '(' => depth += 1,
-                ']' | ')' => depth = depth.saturating_sub(1),
-                '{' | '=' if depth == 0 => break,
-                _ if depth == 0 => flat.push(ch),
-                _ => {}
-            }
+        if let Some(facts) = context.source_facts(&decl.file_path) {
+            names.extend(scala_declaration_supertypes(&facts, &decl));
         }
-        let clause = clause_re
-            .captures(&flat)
-            .map(|c| c[1].to_string())
-            .unwrap_or_default();
-        names.extend(name_re.find_iter(&clause).filter_map(|m| {
-            let simple = m.as_str().rsplit('.').next().unwrap_or_default();
-            (simple != "with" && simple != "derives" && simple != type_name)
-                .then(|| simple.to_string())
-        }));
     }
     names
+}
+
+/// The simple names one Scala type declaration extends or mixes in, read
+/// from the 13 lines from its start up to its body or `=` (the per-declaration
+/// part of upstream `scalaSupertypesOf`).
+pub(crate) fn scala_declaration_supertypes(
+    facts: &crate::source_facts::SourceFacts,
+    decl: &Node,
+) -> Vec<String> {
+    static CLAUSE: OnceLock<Regex> = OnceLock::new();
+    static NAME: OnceLock<Regex> = OnceLock::new();
+    let clause_re =
+        CLAUSE.get_or_init(|| Regex::new(r"(?s)\bextends\b(.*)$").expect("scala clause"));
+    let name_re = NAME.get_or_init(|| Regex::new(r"[A-Za-z_][\w.]*").expect("scala name"));
+    let start = usize::try_from(decl.start_line)
+        .unwrap_or(1)
+        .saturating_sub(1);
+    let end = start.saturating_add(13).min(facts.line_count());
+    let text = if start < end {
+        facts.join_lines(start, end, " ")
+    } else {
+        String::new()
+    };
+    let mut depth = 0usize;
+    let mut flat = String::new();
+    for ch in text.chars() {
+        match ch {
+            '[' | '(' => depth += 1,
+            ']' | ')' => depth = depth.saturating_sub(1),
+            '{' | '=' if depth == 0 => break,
+            _ if depth == 0 => flat.push(ch),
+            _ => {}
+        }
+    }
+    let clause = clause_re
+        .captures(&flat)
+        .map(|c| c[1].to_string())
+        .unwrap_or_default();
+    name_re
+        .find_iter(&clause)
+        .filter_map(|m| {
+            let simple = m.as_str().rsplit('.').next().unwrap_or_default();
+            (simple != "with" && simple != "derives" && simple != decl.name)
+                .then(|| simple.to_string())
+        })
+        .collect()
 }
 
 #[cfg(test)]

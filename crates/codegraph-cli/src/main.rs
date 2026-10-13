@@ -5707,12 +5707,14 @@ fn index_project_inner(
         Option<codegraph_watch::cpp_namespace_rows::NamespaceScan>,
         Option<codegraph_resolve::java_scope::HeadRow>,
         Option<codegraph_resolve::kotlin_scope::KotlinSurface>,
+        Option<codegraph_resolve::scala_scope::ScalaSurface>,
     )>;
     let mut surfaces: Vec<(String, ModuleSurface)> = Vec::new();
     let mut namespace_scans: Vec<(String, codegraph_watch::cpp_namespace_rows::NamespaceScan)> =
         Vec::new();
     let mut head_rows: Vec<(String, codegraph_resolve::java_scope::HeadRow)> = Vec::new();
     let mut kotlin_rows: Vec<(String, codegraph_resolve::kotlin_scope::KotlinSurface)> = Vec::new();
+    let mut scala_rows: Vec<(String, codegraph_resolve::scala_scope::ScalaSurface)> = Vec::new();
     let schedule_tracker = tracker.clone();
     let parse_tracker = tracker.clone();
     let buffer_tracker = tracker.clone();
@@ -5776,6 +5778,8 @@ fn index_project_inner(
                 &source,
                 &result.nodes,
             );
+            let scala_row =
+                codegraph_watch::scala_surfaces::row_of(relative, language, &source, &result.nodes);
             Ok(Some((
                 relative.clone(),
                 file,
@@ -5784,12 +5788,21 @@ fn index_project_inner(
                 namespace_scan,
                 head_row,
                 kotlin_row,
+                scala_row,
             )))
         },
         |buffered| buffer_tracker.buffered(buffered),
         |index, payload| {
-            let Some((relative, file, mut result, surface, namespace_scan, head_row, kotlin_row)) =
-                payload
+            let Some((
+                relative,
+                file,
+                mut result,
+                surface,
+                namespace_scan,
+                head_row,
+                kotlin_row,
+                scala_row,
+            )) = payload
             else {
                 files_not_source += 1;
                 persist_tracker.persisted(index);
@@ -5837,6 +5850,9 @@ fn index_project_inner(
             }
             if let Some(row) = kotlin_row {
                 kotlin_rows.push((relative.clone(), row));
+            }
+            if let Some(row) = scala_row {
+                scala_rows.push((relative.clone(), row));
             }
             if let Some(surface) = surface {
                 surfaces.push((relative, surface));
@@ -5886,11 +5902,14 @@ fn index_project_inner(
     drop(head_rows);
     codegraph_watch::kotlin_surfaces::write_index_rows(&store, &mut kotlin_rows)?;
     drop(kotlin_rows);
-    // A fresh index leaves no C/C++ (W4-CPP-04), Java (W4-JVM-01) or Kotlin
-    // (W4-JVM-03) dependent unrefreshed.
+    codegraph_watch::scala_surfaces::write_index_rows(&store, &mut scala_rows)?;
+    drop(scala_rows);
+    // A fresh index leaves no C/C++ (W4-CPP-04), Java (W4-JVM-01), Kotlin
+    // (W4-JVM-03) or Scala (W4-SC-01) dependent unrefreshed.
     codegraph_watch::cpp_dependents::write_marker(&store)?;
     codegraph_watch::java_heads::write_marker(&store)?;
     codegraph_watch::kotlin_surfaces::write_marker(&store)?;
+    codegraph_watch::scala_surfaces::write_marker(&store)?;
     finish_phase(&pb, "Persisted nodes");
     diagnostic_run.phase_end("node_write", node_write_started.elapsed(), json!({}));
 

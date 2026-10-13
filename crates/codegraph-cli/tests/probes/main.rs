@@ -2352,6 +2352,40 @@ mod js {
         assert_eq!(callees_of(graph, "nope"), Vec::<String>::new());
     }
 
+    /// Upstream #2193 (`8410db42`), the part #2363's local owners rely on: a
+    /// `const` declared in a function body is that body's alone, so a bare
+    /// `handlers()` or `new handlers()` in another function of the file never
+    /// reaches the multi-line function `a`'s local owner `a::handlers`, while
+    /// `a`'s own `handlers.load()` still does (carried from W4-JS-07).
+    #[test]
+    fn pr2193_a_function_local_owner_is_no_name_in_another_function() {
+        let project = Project::new()
+            .file(
+                "src/app.js",
+                "function a() {\n  const handlers = {\n    load() { return 1; },\n  };\n  return handlers.load();\n}\n\nfunction b() {\n  return handlers();\n}\n\nfunction c() {\n  return new handlers();\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        for function in ["b", "c"] {
+            let id = &the_node(graph, function, None).id;
+            assert!(
+                graph.edges.iter().all(|edge| &edge.source != id
+                    || edge.kind == "contains"
+                    || graph
+                        .node(&edge.target)
+                        .is_none_or(|target| !target.qualified_name.starts_with("a::"))),
+                "{function}: {}",
+                graph.report()
+            );
+        }
+        assert_eq!(
+            callees_of(graph, "a"),
+            ["a::handlers::load"],
+            "{}",
+            graph.report()
+        );
+    }
+
     /// Upstream #2363: an arrow member and a value written in a method's
     /// literal take the method's `this`; an object's own method's `this` is
     /// the object.
@@ -8075,6 +8109,310 @@ mod kotlin {
                 "app::Dialect::ranges",
                 "app::Dialect::sql",
             ],
+            "{}",
+            graph.report()
+        );
+    }
+}
+
+mod scala {
+    use super::support::{Graph, Project};
+
+    /// `target qualified-name:line` of every edge of `kinds` out of `file`'s
+    /// nodes, sorted.
+    fn edges_from(graph: &Graph, file: &str, kinds: &[&str]) -> Vec<String> {
+        let mut out: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|edge| kinds.contains(&edge.kind.as_str()))
+            .filter(|edge| {
+                graph
+                    .node(&edge.source)
+                    .is_some_and(|node| node.file_path == file)
+            })
+            .filter_map(|edge| {
+                let target = graph.node(&edge.target)?;
+                Some(format!(
+                    "{}:{}",
+                    target.qualified_name,
+                    edge.line.unwrap_or_default()
+                ))
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// The files the edges of `kinds` out of `file` land in, sorted.
+    fn target_files(graph: &Graph, file: &str, kinds: &[&str]) -> Vec<String> {
+        let mut out: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|edge| kinds.contains(&edge.kind.as_str()))
+            .filter(|edge| {
+                graph
+                    .node(&edge.source)
+                    .is_some_and(|node| node.file_path == file)
+            })
+            .filter_map(|edge| graph.node(&edge.target))
+            .map(|node| node.file_path.clone())
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// Upstream #2160 (`7aa124c0`): a bare Scala name reached by name alone
+    /// is in reach: a parameter binds `f`, a later chain link reaches a
+    /// member of what its receiver is named after, and otherwise a member of
+    /// the types around it and their supertypes. Upstream's fixture, with two
+    /// changes: its `val parser = new OptionParser[Int]("scopt") { head(…) }`
+    /// sits in a `def`, as the extractor does not walk a Scala `val`'s
+    /// initializer (pre-existing, upstream #1802, recorded for the owner), and
+    /// an `Other` class declares `head` and `map` too, so each assertion has a
+    /// namesake to reject. A `More` object adds a bare call and a chain link
+    /// whose only same-named candidates are an unrelated class's.
+    #[test]
+    fn pr2160_bare_scala_calls_stay_in_reach() {
+        let project = Project::new()
+            .file(
+                "src/main/scala/app/FreeT.scala",
+                "package app\n\nfinal case class FlatMapped[A](f: A => A)\n",
+            )
+            .file(
+                "src/main/scala/app/LazyOps.scala",
+                "package app\n\nclass LazyOps[A](xs: List[A]) {\n  def map[B](g: A => B): List[B] = xs.map(g)\n}\n",
+            )
+            .file(
+                "src/main/scala/app/OptionParser.scala",
+                "package app\n\nabstract class OptionParser[C](name: String) {\n  def head(xs: String*): Unit = ()\n}\n",
+            )
+            .file(
+                "src/main/scala/app/Base.scala",
+                "package app\n\ntrait Base {\n  def helper(): Int = 1\n}\n",
+            )
+            .file(
+                "src/main/scala/app/Request.scala",
+                "package app\n\nclass Request {\n  def send(backend: String): String = backend\n}\n",
+            )
+            .file(
+                "src/main/scala/app/Use.scala",
+                "package app\n\nobject Use extends Base {\n  def tabulate[A](f: Boolean => A): (A, A) = (f(true), f(false))\n  def twice(fa: List[Int]): List[Int] = fa.iterator.map(_ + 1).toList\n  def run(basicRequest: Request): String = basicRequest.send(\"b\")\n  def local(): Int = helper()\n  def parser(): OptionParser[Int] = new OptionParser[Int](\"scopt\") {\n    head(\"scopt\", \"3.x\")\n  }\n}\n",
+            )
+            .file(
+                "src/main/scala/app/Other.scala",
+                "package app\n\nclass Other {\n  def head(xs: String*): Unit = ()\n  def map(i: Int): Int = i\n}\n",
+            )
+            .file(
+                "src/main/scala/app/Unrelated.scala",
+                "package app\n\nclass Unrelated {\n  def helper2(): Int = 1\n  def size2(): Int = 2\n}\n",
+            )
+            .file(
+                "src/main/scala/app/More.scala",
+                "package app\n\nobject More extends Base {\n  def other(): Int = helper2()\n  def chain(): Int = List(1).size2()\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        // The one `helper2` and the one `size2` are an unrelated class's: out
+        // of reach of a bare call and of a chain link on `List(1)`.
+        let more = edges_from(graph, "src/main/scala/app/More.scala", &["calls"]);
+        assert!(
+            !more.iter().any(|call| call.starts_with("Unrelated::")),
+            "{}",
+            graph.report()
+        );
+        let calls = edges_from(graph, "src/main/scala/app/Use.scala", &["calls"]);
+        let has = |suffix: &str| calls.iter().any(|call| call.contains(suffix));
+        assert!(!has("FlatMapped::f:"), "{}", graph.report());
+        assert!(!has("LazyOps::map:"), "{}", graph.report());
+        assert!(!has("Other::map:"), "{}", graph.report());
+        assert!(has("Request::send:"), "{}", graph.report());
+        assert!(has("Base::helper:"), "{}", graph.report());
+        assert!(has("OptionParser::head:"), "{}", graph.report());
+        assert!(!has("Other::head:"), "{}", graph.report());
+    }
+
+    /// Upstream #2193 (`8410db42`): a `val` written in a block of a class
+    /// body is that block's, a class-body binder counts only in a block still
+    /// open at the site, and a package object's supertypes are in scope where
+    /// it is imported and in its own package. Upstream's fixture, verbatim.
+    #[test]
+    fn pr2193_block_local_vals_and_package_objects() {
+        let project = Project::new()
+            .file(
+                "src/test/scala/app/ASuite.scala",
+                "package app\n\nclass ASuite {\n  def test(name: String)(body: => Unit): Unit = ()\n\n  test(\"a\") {\n    val f = (i: Int) => i\n    f(1)\n  }\n\n  test(\"c\") {\n    f(2)\n  }\n}\n",
+            )
+            .file(
+                "src/test/scala/app/BSuite.scala",
+                "package app\n\nimport app.syntax.all._\n\nclass BSuite {\n  def test(name: String)(body: => Unit): Unit = ()\n  def forAll(p: (Int, Int => Int) => Boolean): Unit = ()\n\n  test(\"b\") {\n    forAll { (e: Int, f: Int => Int) =>\n      f(e) == 1\n    }\n  }\n}\n",
+            )
+            .file(
+                "src/main/scala/app/syntax/all.scala",
+                "package app.syntax\n\nobject all\n",
+            )
+            .file(
+                "src/main/scala/app/Api.scala",
+                "package app\n\ntrait Api {\n  def multipart(s: String): String = s\n}\n",
+            )
+            .file(
+                "src/main/scala/app/api/package.scala",
+                "package app\n\npackage object api extends Api\n",
+            )
+            .file(
+                "src/main/scala/app/client/Client.scala",
+                "package app.client\n\nimport app.api._\n\nclass Client {\n  def send(): String = multipart(\"x\")\n}\n",
+            )
+            .file(
+                "src/main/scala/app/api/Inner.scala",
+                "package app.api\n\nclass Inner {\n  def send(): String = multipart(\"y\")\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        let a_suite: Vec<String> = edges_from(graph, "src/test/scala/app/ASuite.scala", &["calls"])
+            .into_iter()
+            .filter(|call| call.starts_with("ASuite::f"))
+            .collect();
+        assert_eq!(a_suite, ["ASuite::f:8"], "{}", graph.report());
+        assert!(
+            !edges_from(graph, "src/test/scala/app/BSuite.scala", &["calls"])
+                .iter()
+                .any(|call| call.contains("::f:")),
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            edges_from(graph, "src/main/scala/app/client/Client.scala", &["calls"]),
+            ["Api::multipart:6"],
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            edges_from(graph, "src/main/scala/app/api/Inner.scala", &["calls"]),
+            ["Api::multipart:4"],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream #2199 (`7493fdef`): a chain link is never an object named
+    /// like the member, and reaches a type the receiver's package path names
+    /// (`app.client.Response(200)`, recorded as `client.Response` here, KEEP-RUST
+    /// G14). Upstream's fixture, verbatim.
+    #[test]
+    fn pr2199_a_chain_link_is_never_an_object_named_like_the_member() {
+        let project = Project::new()
+            .file(
+                "src/main/scala/alleycats/std/map.scala",
+                "package alleycats.std\n\nobject map {\n  val instances: Int = 1\n}\n",
+            )
+            .file(
+                "src/main/scala/app/client/Response.scala",
+                "package app.client\n\ncase class Response(code: Int)\n",
+            )
+            .file(
+                "src/main/scala/app/Use.scala",
+                "package app\n\nclass Use {\n  def gen[A](a: A): List[A] = List(a)\n  def run(): List[Int] = gen[Int](1).map { x => x + 1 }\n  def make(): Any = app.client.Response(200)\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        let files = target_files(
+            graph,
+            "src/main/scala/app/Use.scala",
+            &["calls", "instantiates"],
+        );
+        assert!(
+            !files.contains(&"src/main/scala/alleycats/std/map.scala".to_string()),
+            "{}",
+            graph.report()
+        );
+        assert!(
+            files.contains(&"src/main/scala/app/client/Response.scala".to_string()),
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream #2217 (`fa43e259`): a kind-projector placeholder in a type is
+    /// no reference to a `*` method. Upstream's fixture, verbatim.
+    #[test]
+    fn pr2217_a_symbolic_name_in_a_type_is_never_an_operator() {
+        let project = Project::new()
+            .file(
+                "src/main/scala/algebra/Signed.scala",
+                "package algebra\n\nobject Signed {\n  sealed abstract class Sign(val toInt: Int) {\n    def *(that: Sign): Sign = this\n  }\n}\n",
+            )
+            .file(
+                "src/main/scala/cats/Align.scala",
+                "package cats\n\ntrait Align[F[_]]\n\nobject Align {\n  implicit def catsAlignForEither[A]: Align[Either[A, *]] = null\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        let names: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.kind == "references")
+            .filter(|edge| {
+                graph
+                    .node(&edge.source)
+                    .is_some_and(|node| node.file_path == "src/main/scala/cats/Align.scala")
+            })
+            .filter_map(|edge| graph.node(&edge.target))
+            .map(|node| node.name.clone())
+            .collect();
+        assert!(!names.contains(&"*".to_string()), "{}", graph.report());
+    }
+
+    /// Upstream #2230 (`3878123f`): a package object's member is in scope in
+    /// its package and those under it, or through an import of its package.
+    /// Upstream's fixture, verbatim.
+    #[test]
+    fn pr2230_a_package_object_member_is_in_scope_in_its_package_or_by_import() {
+        let project = Project::new()
+            .file(
+                "algebra-core/src/main/scala/algebra/package.scala",
+                "package object algebra {\n  type Eq[A] = cats.kernel.Eq[A]\n}\n",
+            )
+            .file(
+                "core/src/main/scala/cats/package.scala",
+                "package object cats {\n  type Eq[A] = cats.kernel.Eq[A]\n}\n",
+            )
+            .file(
+                "laws/src/main/scala/cats/laws/FunctorLaws.scala",
+                "package cats\npackage laws\n\ntrait FunctorLaws {\n  def identity[A](eq: Eq[A]): Boolean = true\n}\n",
+            )
+            .file(
+                "algebra-laws/src/main/scala/algebra/laws/RingLaws.scala",
+                "package algebra.laws\n\nimport algebra._\n\ntrait RingLaws {\n  def eqv[A](eq: Eq[A]): Boolean = true\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        let eq_files = |file: &str| {
+            let mut out: Vec<String> = graph
+                .edges
+                .iter()
+                .filter(|edge| edge.kind == "references")
+                .filter(|edge| {
+                    graph
+                        .node(&edge.source)
+                        .is_some_and(|node| node.file_path == file)
+                })
+                .filter_map(|edge| graph.node(&edge.target))
+                .filter(|node| node.name == "Eq")
+                .map(|node| node.file_path.clone())
+                .collect();
+            out.sort();
+            out.dedup();
+            out
+        };
+        assert_eq!(
+            eq_files("laws/src/main/scala/cats/laws/FunctorLaws.scala"),
+            ["core/src/main/scala/cats/package.scala"],
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            eq_files("algebra-laws/src/main/scala/algebra/laws/RingLaws.scala"),
+            ["algebra-core/src/main/scala/algebra/package.scala"],
             "{}",
             graph.report()
         );

@@ -372,6 +372,18 @@ pub(crate) fn is_lexically_reachable(
     if crate::object_owners::is_unreachable_path_holder(candidate, reference) {
         return false;
     }
+    // A `val` / `const` declared in a function body is that body's alone, and
+    // a Scala `val` filed under its class but written in a block of the
+    // class body that block's (upstream #2193).
+    if matches!(candidate.kind, NodeKind::Variable | NodeKind::Constant)
+        || (candidate.kind == NodeKind::Field && candidate.language == Language::Scala)
+    {
+        return local_declaration_scope(candidate, context).is_none_or(|(start, end)| {
+            reference.file_path == candidate.file_path
+                && reference.line >= start
+                && reference.line <= end
+        });
+    }
     // A function, or a type (`case class B()` in a test method), or a
     // method of such a type, declared inside a function is only in scope in
     // there (upstream #2123, #2125).
@@ -400,6 +412,87 @@ pub(crate) fn is_lexically_reachable(
             && reference.line >= start
             && reference.line <= end
     })
+}
+
+/// The lines a variable declaration is in scope for when it is local
+/// (upstream #2193 `localDeclarationScope`): the innermost function or
+/// method of its file whose lines hold its start, or, for a Scala `val` the
+/// graph files under its class but written inside a block of the class body,
+/// that block. `None` for a declaration at file, class or object level. C and
+/// C++ nesting is not trusted (see [`is_lexically_reachable`]), and a Lua
+/// global assigned inside a function is still global.
+pub(crate) fn local_declaration_scope(
+    candidate: &Node,
+    context: &dyn ResolutionContext,
+) -> Option<(i64, i64)> {
+    if matches!(candidate.language, Language::C | Language::Cpp) {
+        return None;
+    }
+    let compute = || {
+        if matches!(candidate.language, Language::Lua | Language::Luau)
+            && !is_lua_local(candidate, context)
+        {
+            return None;
+        }
+        let mut scope: Option<(i64, i64)> = None;
+        for n in context
+            .get_nodes_in_file_shared(&candidate.file_path)
+            .iter()
+        {
+            if !matches!(n.kind, NodeKind::Function | NodeKind::Method) || n.id == candidate.id {
+                continue;
+            }
+            if n.start_line > candidate.start_line
+                || n.end_line < candidate.start_line
+                || n.start_line == n.end_line
+            {
+                continue;
+            }
+            if n.start_line == candidate.start_line && n.start_column >= candidate.start_column {
+                continue;
+            }
+            if scope.is_none_or(|(start, end)| n.end_line - n.start_line < end - start) {
+                scope = Some((n.start_line, n.end_line));
+            }
+        }
+        if scope.is_none()
+            && candidate.kind == NodeKind::Field
+            && candidate.language == Language::Scala
+        {
+            scope = crate::scala_scope::scala_block_of(candidate, context);
+        }
+        scope
+    };
+    match context.source_facts(&candidate.file_path) {
+        Some(facts) => facts.local_declaration_scope(&candidate.id, compute),
+        None => compute(),
+    }
+}
+
+/// Whether a Lua declaration is a `local` one, read from its line (upstream
+/// #2143 `isLuaLocal`, which #2193 reads).
+fn is_lua_local(candidate: &Node, context: &dyn ResolutionContext) -> bool {
+    if !matches!(
+        candidate.kind,
+        NodeKind::Variable | NodeKind::Constant | NodeKind::Function
+    ) {
+        return false;
+    }
+    let Some(facts) = context.source_facts(&candidate.file_path) else {
+        return false;
+    };
+    let Some(index) = usize::try_from(candidate.start_line)
+        .ok()
+        .and_then(|line| line.checked_sub(1))
+        .filter(|&index| index < facts.line_count())
+    else {
+        return false;
+    };
+    facts
+        .line(index)
+        .trim_start()
+        .strip_prefix("local")
+        .is_some_and(|rest| !rest.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_'))
 }
 
 /// The innermost function or method BODY that scopes a declaration, walking
@@ -2069,6 +2162,7 @@ pub fn match_by_exact_name(
         kotlin_call && crate::kotlin_scope::is_receiver_less_kotlin_call(reference, context);
     let kotlin_site = crate::kotlin_scope::KotlinSite::new(reference);
     let kotlin_std_chain = crate::kotlin_scope::std_chain_receiver(reference, context);
+    let scala_bare = crate::scala_scope::is_scala_bare_call(reference);
     let candidates: Vec<Arc<Node>> = reachable
         .iter()
         .filter(|n| {
@@ -2080,13 +2174,15 @@ pub fn match_by_exact_name(
         .filter(|n| node_is_eligible_target(reference.reference_kind, n))
         // A Scala type position (`Arbitrary[B]`) never names a method: an
         // `implicit def A: Order[A]` shares its name with half of cats' type
-        // parameters (upstream #2123).
+        // parameters (upstream #2123). Nor does a kind-projector placeholder
+        // (`F[*]`, `G[?]`, upstream #2217).
         .filter(|n| {
             !(reference.language == Language::Scala
                 && reference.reference_kind == EdgeKind::References
-                && reference
+                && (reference
                     .reference_name
                     .starts_with(|c: char| c.is_ascii_uppercase())
+                    || crate::scala_scope::is_symbolic_name(&reference.reference_name))
                 && matches!(n.kind, NodeKind::Method | NodeKind::Function))
         })
         // A receiver-less JS/TS or Go call cannot reach a member of a type: a
@@ -2151,6 +2247,22 @@ pub fn match_by_exact_name(
         // A project's bitwise extension on a number type is never the
         // standard library's `x and 0xff` (upstream #2174).
         .filter(|n| !crate::kotlin_scope::is_kotlin_number_bitwise(n, reference))
+        // A bare Scala name reaches only a member in reach (upstream #2160,
+        // #2193, #2199).
+        .filter(|n| {
+            !scala_bare || crate::scala_scope::is_scala_member_in_scope(n, reference, context)
+        })
+        // A Scala package object's member, only where it is in scope, ahead
+        // of the ranking, so cats.laws' `Eq` can be the `cats` package
+        // object's (upstream #2230).
+        .filter(|n| {
+            !(reference.language == Language::Scala
+                && n.language == Language::Scala
+                && n.file_path != reference.file_path
+                && !crate::scala_scope::is_scala_package_object_member_visible(
+                    n, reference, context,
+                ))
+        })
         .cloned()
         .collect();
     let candidates = if kotlin_bare {
@@ -5351,6 +5463,7 @@ pub fn match_fuzzy(reference: &RefView, context: &dyn ResolutionContext) -> Opti
         kotlin_call && crate::kotlin_scope::is_receiver_less_kotlin_call(reference, context);
     let kotlin_site = crate::kotlin_scope::KotlinSite::new(reference);
     let kotlin_std_chain = crate::kotlin_scope::std_chain_receiver(reference, context);
+    let scala_bare = crate::scala_scope::is_scala_bare_call(reference);
     let callable_candidates = apply_language_gate(
         candidates
             .into_iter()
@@ -5378,6 +5491,10 @@ pub fn match_fuzzy(reference: &RefView, context: &dyn ResolutionContext) -> Opti
                 kotlin_std_chain
                     .as_deref()
                     .is_none_or(|receiver| crate::kotlin_scope::is_std_chain_target(n, receiver))
+            })
+            // A bare Scala name, only a member in reach (upstream #2160).
+            .filter(|n| {
+                !scala_bare || crate::scala_scope::is_scala_member_in_scope(n, reference, context)
             })
             .filter(|n| {
                 python_shape.as_ref().is_none_or(|shape| {
@@ -6243,6 +6360,31 @@ pub fn match_reference(
         return None;
     }
 
+    // A symbolic name in a Scala type is a type (`F ~> G`) or a
+    // kind-projector placeholder (`Either[A, *]`), never an operator method,
+    // by any strategy (upstream #2217).
+    if let Some(result) = crate::scala_scope::match_scala_symbolic_type(reference, context) {
+        return result;
+    }
+
+    // A Scala chain link the extractor records with its last receiver
+    // segment, `b.c` for `a.b.c()` (KEEP-RUST G14), is the bare `c` upstream
+    // records: what the receiver strategies below choose must pass
+    // upstream's chain-link rule for it, and when they choose nothing the
+    // bare name matches as upstream matches it (upstream #2160, #2199).
+    let scala_link =
+        crate::scala_scope::scala_nested_chain_link(reference, context).map(|bare| RefView {
+            reference_name: bare,
+            ..reference.clone()
+        });
+    let in_link_scope = |result: ResolvedRef| -> Option<ResolvedRef> {
+        let Some(bare) = scala_link.as_ref() else {
+            return Some(result);
+        };
+        let target = context.get_node_by_id_shared(&result.target_node_id)?;
+        crate::scala_scope::is_scala_member_in_scope(&target, bare, context).then_some(result)
+    };
+
     // `window.App.init()` / a sibling's `this.init()`, recorded by the bare
     // name: the object they are written on comes first (upstream #2363).
     if let Some(result) = crate::object_owners::match_collapsed_object_call(reference, context) {
@@ -6331,7 +6473,7 @@ pub fn match_reference(
             | Language::Scala
             | Language::Dart
     ) {
-        if let Some(result) = match_dotted_call_chain(reference, context) {
+        if let Some(result) = match_dotted_call_chain(reference, context).and_then(&in_link_scope) {
             return Some(result);
         }
     }
@@ -6349,8 +6491,16 @@ pub fn match_reference(
     }
 
     // 2. Method call pattern.
-    if let Some(result) = match_method_call(reference, context) {
+    if let Some(result) = match_method_call(reference, context).and_then(&in_link_scope) {
         return Some(result);
+    }
+    if let Some(bare) = scala_link.as_ref() {
+        return match_by_exact_name(bare, context)
+            .or_else(|| match_fuzzy(bare, context))
+            .map(|result| ResolvedRef {
+                original: reference.clone(),
+                ..result
+            });
     }
 
     // 3. Exact name match.

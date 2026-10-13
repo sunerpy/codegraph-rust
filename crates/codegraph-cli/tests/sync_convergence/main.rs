@@ -353,6 +353,8 @@ fn run_case(name: &str, case: &Case) {
     let head_rows = support::project_metadata_with_prefix(&fresh.db(), "java_type_heads");
     // And the Kotlin surface rows and their marker (W4-JVM-03).
     let kotlin_rows = support::project_metadata_with_prefix(&fresh.db(), "kotlin_surface");
+    // And the Scala surface rows and their marker (W4-SC-01).
+    let scala_rows = support::project_metadata_with_prefix(&fresh.db(), "scala_surface");
     for (driver, project) in [("cli", &cli), ("watch", &watch)] {
         let rows = support::project_metadata_with_prefix(&project.db(), "js_module_surface");
         if rows != surface_rows {
@@ -387,6 +389,13 @@ fn run_case(name: &str, case: &Case) {
             divergent.push(format!(
                 "=== {driver} driver: the Kotlin surface rows differ from a fresh index\n\
                  synced: {rows:#?}\nfresh: {kotlin_rows:#?}"
+            ));
+        }
+        let rows = support::project_metadata_with_prefix(&project.db(), "scala_surface");
+        if rows != scala_rows {
+            divergent.push(format!(
+                "=== {driver} driver: the Scala surface rows differ from a fresh index\n\
+                 synced: {rows:#?}\nfresh: {scala_rows:#?}"
             ));
         }
     }
@@ -848,6 +857,21 @@ matrix! {
     go_change_an_embedded_struct,
     dart_change_a_mixin,
     scala_change_a_parent_trait,
+    scala_bare_call_follows_a_base_change_in_another_file,
+    scala_imported_package_object_changes_its_supertype,
+    scala_package_object_is_renamed_under_its_members,
+    scala_chain_link_type_changes_its_package,
+    scala_member_val_becomes_block_local,
+    scala_function_becomes_an_extension_method,
+    scala_type_reference_follows_a_namesake_head_in_another_file,
+    scala_package_object_takes_an_imported_name,
+    scala_chain_link_type_moves_into_the_named_package,
+    scala_block_local_val_becomes_a_member,
+    scala_base_body_edit_keeps_a_bare_call,
+    scala_batch_rewrites_a_base_and_a_middle_type,
+    scala_same_named_vals_trade_block_and_member_states,
+    scala_holder_change_reaches_past_the_tail_ceiling,
+    scala_package_object_supertype_head_changes_in_another_file,
     solidity_change_a_base_contract,
     cfml_change_a_base_component,
     python_add_a_same_named_competitor,
