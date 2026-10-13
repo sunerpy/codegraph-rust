@@ -4791,6 +4791,159 @@ pub fn csharp_type_moves_into_an_imported_namespace() -> Case {
         )
 }
 
+const SPEC_A: &str =
+    "namespace App.Specs;\n\npublic abstract class SpecA\n{\n    protected void Check() { }\n}\n";
+const SPEC_B: &str =
+    "namespace App.Specs;\n\npublic abstract class SpecB\n{\n    protected void Check() { }\n}\n";
+const SPEC_LEAF: &str = "namespace App.Specs;\n\npublic class Leaf : Middle\n{\n    public void Runs()\n    {\n        Check();\n    }\n}\n";
+
+/// Upstream #2151: a bare C# call reaches a member of the bases the heads
+/// around it list, so a middle type in another file changing its base moves
+/// an unchanged subclass's call.
+pub fn csharp_bare_call_follows_a_base_change_in_another_file() -> Case {
+    Case::new(Change::EditHeritage, &[Language::CSharp])
+        .file("src/Specs/SpecA.cs", SPEC_A)
+        .file("src/Specs/SpecB.cs", SPEC_B)
+        .file(
+            "src/Specs/Middle.cs",
+            "namespace App.Specs;\n\npublic abstract class Middle : SpecA\n{\n}\n",
+        )
+        .file("src/Specs/Leaf.cs", SPEC_LEAF)
+        .write(
+            "src/Specs/Middle.cs",
+            "namespace App.Specs;\n\npublic abstract class Middle : SpecB\n{\n}\n",
+        )
+        .edge_before(
+            "method App.Specs::Leaf::Runs",
+            "calls",
+            "method App.Specs::SpecA::Check",
+        )
+        .edge_after(
+            "method App.Specs::Leaf::Runs",
+            "calls",
+            "method App.Specs::SpecB::Check",
+        )
+}
+
+/// Upstream #2151 reads a head nine lines deep, two more than #2220's
+/// reader: a base list on a head's eighth line moves an unchanged
+/// subclass's bare call.
+pub fn csharp_bare_call_follows_a_long_head_in_another_file() -> Case {
+    Case::new(Change::EditHeritage, &[Language::CSharp])
+        .file("src/Specs/SpecA.cs", SPEC_A)
+        .file("src/Specs/SpecB.cs", SPEC_B)
+        .file(
+            "src/Specs/Middle.cs",
+            "namespace App.Specs;\n\npublic abstract class Middle\n\n\n\n\n\n\n    : SpecA\n{\n}\n",
+        )
+        .file("src/Specs/Leaf.cs", SPEC_LEAF)
+        .write(
+            "src/Specs/Middle.cs",
+            "namespace App.Specs;\n\npublic abstract class Middle\n\n\n\n\n\n\n    : SpecB\n{\n}\n",
+        )
+        .edge_before(
+            "method App.Specs::Leaf::Runs",
+            "calls",
+            "method App.Specs::SpecA::Check",
+        )
+        .edge_after(
+            "method App.Specs::Leaf::Runs",
+            "calls",
+            "method App.Specs::SpecB::Check",
+        )
+}
+
+const BUILDER: &str = "namespace App.Execution;\n\npublic static class ExpressionBuilder\n{\n    public static object Call(object target) => target;\n}\n";
+const CATALOG: &str = "namespace App.Specs;\n\npublic class CatalogSpec\n{\n    public object Runs(object token)\n    {\n        return Call(token);\n    }\n}\n";
+
+/// Upstream #2151: a `global using static` in any file brings its type's
+/// members into reach of every file, so it appearing reaches an unchanged
+/// file's bare call.
+pub fn csharp_global_using_static_appears() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::CSharp])
+        .file("src/Execution/ExpressionBuilder.cs", BUILDER)
+        .file("src/Specs/CatalogSpec.cs", CATALOG)
+        .write(
+            "src/GlobalUsings.cs",
+            "global using static App.Execution.ExpressionBuilder;\n",
+        )
+        .edge_after(
+            "method App.Specs::CatalogSpec::Runs",
+            "calls",
+            "method App.Execution::ExpressionBuilder::Call",
+        )
+}
+
+/// Upstream #2151: the file holding a `global using static` leaves, and the
+/// unchanged file's bare call is out of reach again.
+pub fn csharp_global_using_static_leaves() -> Case {
+    Case::new(Change::DeleteImportedModule, &[Language::CSharp])
+        .file("src/Execution/ExpressionBuilder.cs", BUILDER)
+        .file("src/Specs/CatalogSpec.cs", CATALOG)
+        .file(
+            "src/GlobalUsings.cs",
+            "global using static App.Execution.ExpressionBuilder;\n",
+        )
+        .remove("src/GlobalUsings.cs")
+        .edge_before(
+            "method App.Specs::CatalogSpec::Runs",
+            "calls",
+            "method App.Execution::ExpressionBuilder::Call",
+        )
+        .no_edge_after(
+            "method App.Specs::CatalogSpec::Runs",
+            "calls",
+            "method App.Execution::ExpressionBuilder::Call",
+        )
+}
+
+/// Upstream #2151: a project file's `<Using … Static="true"/>` brings its
+/// type's members into reach. A `.csproj` is no source file, so a sync that
+/// sees only it re-resolves nothing.
+pub fn csharp_csproj_static_using_appears() -> Case {
+    Case::new(Change::ControlFile, &[Language::CSharp])
+        .file("src/App.csproj", UNIT_CSPROJ)
+        .file("src/Execution/ExpressionBuilder.cs", BUILDER)
+        .file("src/Specs/CatalogSpec.cs", CATALOG)
+        .write(
+            "src/App.csproj",
+            "<Project Sdk=\"Microsoft.NET.Sdk\">\n  <ItemGroup>\n    <Using Include=\"App.Execution.ExpressionBuilder\" Static=\"true\"/>\n  </ItemGroup>\n</Project>\n",
+        )
+        .edge_after(
+            "method App.Specs::CatalogSpec::Runs",
+            "calls",
+            "method App.Execution::ExpressionBuilder::Call",
+        )
+}
+
+/// Upstream #2151: a bare name reaches only a member in scope, so another
+/// class gaining a property of that name is no competitor.
+pub fn csharp_bare_name_ignores_an_added_property() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::CSharp])
+        .file(
+            "src/Specs/SpecBase.cs",
+            "namespace App.Specs;\n\npublic abstract class SpecBase\n{\n    protected TimeSpan Level { get; set; }\n}\n",
+        )
+        .file(
+            "src/Specs/CatalogSpec.cs",
+            "namespace App.Specs;\n\npublic class CatalogSpec : SpecBase\n{\n    public int Runs()\n    {\n        return Level.Seconds;\n    }\n}\n",
+        )
+        .write(
+            "tests/Other.cs",
+            "namespace App.Tests;\n\npublic class Other\n{\n    public TimeSpan Level { get; set; }\n}\n",
+        )
+        .edge_throughout(
+            "method App.Specs::CatalogSpec::Runs",
+            "references",
+            "property App.Specs::SpecBase::Level",
+        )
+        .no_edge_after(
+            "method App.Specs::CatalogSpec::Runs",
+            "references",
+            "property App.Tests::Other::Level",
+        )
+}
+
 /// Upstream #2121: a type position names a type, so a property of the same
 /// name appearing elsewhere is no competitor.
 pub fn csharp_type_position_ignores_an_added_property() -> Case {

@@ -251,13 +251,16 @@ it missing or at another version re-resolves every Scala file and rebuilds the
 rows. Neither is a canonical surface.
 
 C# surface rows record what C# resolution reads of a C# file by the readers it
-uses: `csharp_surface:<path>` holds the JSON `{"globals", "heads"}`: sorted, the
-namespaces its `global using`s import, and each class, interface, struct and
-enum head's name, qualified name and the bases it lists (in node order; a head
-listing no base has no entry). A file with neither has no row. They are
-written, withdrawn and checked like the head rows under `csharp_surface_version`
-(1); a sync that finds it missing or at another version re-resolves every C#
-file and rebuilds the rows. Neither is a canonical surface.
+uses: `csharp_surface:<path>` holds the JSON `{"globals", "global_statics",
+"heads"}`: sorted, the namespaces its `global using`s import and the types its
+`global using static`s name, and each class, interface, struct and enum head's
+name, qualified name and the bases each of the two readers reads from it
+(`bases`, seven lines; `supers`, nine lines with `<…>` and `(…)` dropped; in
+node order; a head listing no base to either has no entry). A file with none of
+these has no row. They are written, withdrawn and checked like the head rows
+under `csharp_surface_version` (2); a sync that finds it missing or at another
+version re-resolves every C# file and rebuilds the rows. Neither is a canonical
+surface.
 
 ## FTS5
 

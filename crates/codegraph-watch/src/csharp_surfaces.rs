@@ -3,16 +3,18 @@
 //! unchanged file as a fresh index would.
 //!
 //! A bare C# type name is visible through the `global using`s of every file
-//! of its project, and a nested type by bare name only from its owner or a
-//! type deriving from it, which the heads of the owner's partial parts and of
-//! the bases they name say, read from source by name in every file. The text
-//! is gone once a file changes on disk, so every full index and migration
+//! of its project, a nested type by bare name only from its owner or a type
+//! deriving from it, and a bare member name only in the types around it, the
+//! bases they list or a type a `global using static` of any file names
+//! (W4-CS-02). The heads of a type's partial parts and of the bases they name
+//! are read from source by name in every file, by two readers. The text is
+//! gone once a file changes on disk, so every full index and migration
 //! writes a row per C# file ([`CsharpSurface`]), and a sync compares a changed
 //! file's row with its new text:
 //!
-//! - a changed file whose `global using`s changed re-resolves every unchanged
-//!   C# file whole (the project boundary is a `.csproj`, which is no source
-//!   file);
+//! - a changed file whose `global using`s or `global using static`s changed
+//!   re-resolves every unchanged C# file whole (the project boundary is a
+//!   `.csproj`, which is no source file);
 //! - heads that came, went or changed seed a closure over every head naming
 //!   one; the unchanged files declaring a C# type of a closure name
 //!   re-resolve whole;
@@ -37,8 +39,9 @@ use codegraph_store::Store;
 
 /// Metadata key present when no sync left a C# dependent unrefreshed.
 pub const VERSION_KEY: &str = "csharp_surface_version";
-/// Value of [`VERSION_KEY`].
-pub const VERSION: &str = "1";
+/// Value of [`VERSION_KEY`]: 2 since the rows carry `global_statics` and
+/// each head's `supers` (W4-CS-02).
+pub const VERSION: &str = "2";
 
 /// `source`'s surface row, `None` when it records nothing: a file that is no
 /// C# file, holds nothing a row records, or is not text.
@@ -214,8 +217,14 @@ fn read_text(project_root: &Path, path: &str, max_file_size: u64) -> Option<Stri
     }
 }
 
-fn globals(row: Option<&CsharpSurface>) -> &[String] {
-    row.map_or(&[], |row| row.globals.as_slice())
+/// Whether a change moved what every file of a project reads of the file:
+/// its `global using`s or `global using static`s.
+fn shared_usings_changed(change: &Change) -> bool {
+    let globals = |row: Option<&CsharpSurface>| {
+        row.map(|row| (row.globals.clone(), row.global_statics.clone()))
+            .unwrap_or_default()
+    };
+    globals(change.old_row.as_ref()) != globals(change.new_row.as_ref())
 }
 
 /// Each name's entries of `heads`, in file order.
@@ -249,8 +258,8 @@ fn seeds(changes: &CsharpChanges) -> BTreeSet<String> {
 }
 
 /// `seeds` and the name of every head (every unchanged file's row and each
-/// changed file's new one) listing a name already reached as a base, until
-/// none is added.
+/// changed file's new one) listing a name already reached as a base to
+/// either reader, until none is added.
 fn closure<'r>(
     rows: impl IntoIterator<Item = &'r CsharpSurface>,
     seeds: BTreeSet<String>,
@@ -258,7 +267,7 @@ fn closure<'r>(
     let mut naming: HashMap<&str, BTreeSet<&str>> = HashMap::new();
     for row in rows {
         for head in &row.heads {
-            for base in &head.bases {
+            for base in head.bases.iter().chain(&head.supers) {
                 naming
                     .entry(base.as_str())
                     .or_default()
@@ -321,7 +330,7 @@ pub(crate) fn csharp_refresh(
             refresh.rows.insert(path.clone(), change.new_row.clone());
         }
         refresh.names.extend(change.owner_flips.iter().cloned());
-        globals_changed |= globals(change.old_row.as_ref()) != globals(change.new_row.as_ref());
+        globals_changed |= shared_usings_changed(change);
     }
     if globals_changed {
         for file in store.all_files()? {
@@ -376,6 +385,7 @@ mod tests {
             name: name.to_string(),
             qualified_name: format!("Lib::{name}"),
             bases: bases.iter().map(|s| s.to_string()).collect(),
+            supers: bases.iter().map(|s| s.to_string()).collect(),
         }
     }
 
@@ -442,9 +452,56 @@ mod tests {
     fn unchanged_heads_seed_nothing() {
         let row = CsharpSurface {
             globals: vec!["App.Support".to_string()],
+            global_statics: vec!["App.Execution.ExpressionBuilder".to_string()],
             heads: vec![head("Reader", &["Base"])],
         };
         assert!(seeds(&change(row.clone(), row)).is_empty());
+    }
+
+    #[test]
+    fn a_base_only_the_second_reader_sees_seeds_its_name_and_closes() {
+        let mut middle = head("Middle", &[]);
+        middle.supers = vec!["SpecA".to_string()];
+        let mut moved = middle.clone();
+        moved.supers = vec!["SpecB".to_string()];
+        let changes = change(
+            CsharpSurface {
+                heads: vec![middle],
+                ..CsharpSurface::default()
+            },
+            CsharpSurface {
+                heads: vec![moved],
+                ..CsharpSurface::default()
+            },
+        );
+        let seeds = seeds(&changes);
+        assert_eq!(seeds, BTreeSet::from(["Middle".to_string()]));
+        let mut leaf = head("Leaf", &[]);
+        leaf.supers = vec!["Middle".to_string()];
+        let row = CsharpSurface {
+            heads: vec![leaf],
+            ..CsharpSurface::default()
+        };
+        assert_eq!(
+            closure([&row], seeds),
+            BTreeSet::from(["Leaf".to_string(), "Middle".to_string()])
+        );
+    }
+
+    #[test]
+    fn a_global_using_or_global_using_static_moving_is_a_shared_change() {
+        let with = |globals: &[&str], statics: &[&str]| CsharpSurface {
+            globals: globals.iter().map(|s| s.to_string()).collect(),
+            global_statics: statics.iter().map(|s| s.to_string()).collect(),
+            ..CsharpSurface::default()
+        };
+        let changed = |old: CsharpSurface, new: CsharpSurface| {
+            let changes = change(old, new);
+            shared_usings_changed(changes.changes.values().next().unwrap())
+        };
+        assert!(changed(with(&["A"], &[]), with(&["B"], &[])));
+        assert!(changed(with(&[], &[]), with(&[], &["App.Builder"])));
+        assert!(!changed(with(&["A"], &["S"]), with(&["A"], &["S"])));
     }
 
     fn node(kind: NodeKind, name: &str, qualified_name: &str, line: i64) -> Node {
@@ -489,6 +546,7 @@ mod tests {
     fn rows_round_trip() {
         let row = CsharpSurface {
             globals: vec!["Unit.Support".to_string()],
+            global_statics: vec!["Unit.Support.Some".to_string()],
             heads: vec![head("Reader", &["Base", "IDisposable"])],
         };
         assert_eq!(CsharpSurface::decode(&row.encode()), Some(row));

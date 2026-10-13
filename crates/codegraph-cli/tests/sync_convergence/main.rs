@@ -890,6 +890,13 @@ matrix! {
     csharp_nested_owner_becomes_a_namespace,
     csharp_type_moves_into_an_imported_namespace,
     csharp_type_position_ignores_an_added_property,
+    csharp_bare_call_follows_a_base_change_in_another_file,
+    csharp_bare_call_follows_a_long_head_in_another_file,
+    csharp_global_using_static_appears,
+    csharp_global_using_static_leaves,
+    #[ignore = "W5-06: a .csproj or .props change does not re-resolve the project's C# files"]
+    csharp_csproj_static_using_appears,
+    csharp_bare_name_ignores_an_added_property,
     solidity_change_a_base_contract,
     cfml_change_a_base_component,
     python_add_a_same_named_competitor,

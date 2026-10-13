@@ -701,7 +701,10 @@ fn outdated_migration_writes_the_csharp_surface_rows_of_index_force() {
             "src/Lib/Leaf.cs",
             "namespace Lib\n{\n    public class Leaf : Reader\n    {\n        object Peek() => State.Start;\n    }\n}\n",
         ),
-        ("src/GlobalUsings.cs", "global using Lib;\n"),
+        (
+            "src/GlobalUsings.cs",
+            "global using Lib;\nglobal using static Lib.Reader;\n",
+        ),
         (
             "src/Plain.cs",
             "namespace Lib\n{\n    public class Plain\n    {\n    }\n}\n",

@@ -1000,6 +1000,70 @@ fn is_receiver_less_call(reference: &RefView, context: &dyn ResolutionContext) -
     BARE_CALL_KEYWORDS.contains(&&before[before.len() - word_len..])
 }
 
+/// Whether the line of a bare reference shows no receiver before its name
+/// (upstream `hasNoReceiverOnLine`, #2091): the name at the reference's
+/// column, or ending there, else its first `name(` on the line, has no `.`
+/// before it. A name not on its line at all is a link of a chain written
+/// across lines. Read case-insensitively, as upstream reads it.
+pub(crate) fn has_no_receiver_on_line(
+    reference: &RefView,
+    context: &dyn ResolutionContext,
+) -> bool {
+    let Some(index) = usize::try_from(reference.line)
+        .ok()
+        .and_then(|line| line.checked_sub(1))
+    else {
+        return true;
+    };
+    let Some(facts) = context.source_facts(&reference.file_path) else {
+        return true;
+    };
+    let Some(line) = facts.raw_line(index) else {
+        return true;
+    };
+    let lower = line.to_ascii_lowercase();
+    let name = reference.reference_name.to_ascii_lowercase();
+    let column = usize::try_from(reference.column).unwrap_or(0);
+    let named_at = |start: usize| {
+        lower
+            .get(start..)
+            .is_some_and(|rest| rest.starts_with(&name))
+    };
+    let start = if named_at(column) {
+        Some(column)
+    } else if column >= name.len() && named_at(column - name.len()) {
+        Some(column - name.len())
+    } else {
+        first_call_of(&lower, &name)
+    };
+    let Some(start) = start else {
+        return false;
+    };
+    !line[..start]
+        .trim_end_matches(codegraph_core::generated_header::is_js_whitespace)
+        .ends_with('.')
+}
+
+/// The offset of the first `name(` in `line` that no word character or `$`
+/// precedes (upstream's `(?<![\w$])name\s*\(`).
+fn first_call_of(line: &str, name: &str) -> Option<usize> {
+    if name.is_empty() {
+        return None;
+    }
+    line.char_indices().map(|(at, _)| at).find(|&at| {
+        if !line[at..].starts_with(name) {
+            return false;
+        }
+        let free = line[..at]
+            .chars()
+            .next_back()
+            .is_none_or(|before| !(is_ascii_word_char(before) || before == '$'));
+        free && line[at + name.len()..]
+            .trim_start_matches(codegraph_core::generated_header::is_js_whitespace)
+            .starts_with('(')
+    })
+}
+
 /// A receiver-less JS/TS call can never bind to a method (#1714).
 pub(crate) fn is_bare_js_call(reference: &RefView, context: &dyn ResolutionContext) -> bool {
     is_js_family(reference.language) && is_receiver_less_call(reference, context)
@@ -2164,6 +2228,9 @@ pub fn match_by_exact_name(
     let kotlin_std_chain = crate::kotlin_scope::std_chain_receiver(reference, context);
     let scala_bare = crate::scala_scope::is_scala_bare_call(reference);
     let csharp_type_ref = crate::csharp_types::is_csharp_type_ref(reference, context);
+    // A bare C# name whose line shows no receiver (upstream #2151).
+    let csharp_bare = crate::csharp_types::is_csharp_bare_name(reference)
+        && has_no_receiver_on_line(reference, context);
     let candidates: Vec<Arc<Node>> = reachable
         .iter()
         .filter(|n| {
@@ -2256,6 +2323,11 @@ pub fn match_by_exact_name(
         // A C# type position names a type, never a member sharing its name
         // (upstream #2121).
         .filter(|n| !csharp_type_ref || crate::csharp_types::can_name_in_type_position(n))
+        // A bare C# name is a member of the types around it, of their bases
+        // or of a static using's type (upstream #2151).
+        .filter(|n| {
+            !csharp_bare || crate::csharp_types::is_csharp_member_in_scope(n, reference, context)
+        })
         // A C# type name is a type its namespaces can see, and a nested one
         // only from inside its owner, ahead of the ranking, so a visible
         // namesake wins (upstream #2216, #2220).
@@ -5514,6 +5586,9 @@ pub fn match_fuzzy(reference: &RefView, context: &dyn ResolutionContext) -> Opti
     let kotlin_std_chain = crate::kotlin_scope::std_chain_receiver(reference, context);
     let scala_bare = crate::scala_scope::is_scala_bare_call(reference);
     let csharp_type_ref = crate::csharp_types::is_csharp_type_ref(reference, context);
+    // A bare C# name whose line shows no receiver (upstream #2151).
+    let csharp_bare = crate::csharp_types::is_csharp_bare_name(reference)
+        && has_no_receiver_on_line(reference, context);
     let callable_candidates = apply_language_gate(
         candidates
             .into_iter()
@@ -5548,6 +5623,11 @@ pub fn match_fuzzy(reference: &RefView, context: &dyn ResolutionContext) -> Opti
             })
             // A C# type position, only a type (upstream #2121).
             .filter(|n| !csharp_type_ref || crate::csharp_types::can_name_in_type_position(n))
+            // A bare C# name, only a member in scope (upstream #2151).
+            .filter(|n| {
+                !csharp_bare
+                    || crate::csharp_types::is_csharp_member_in_scope(n, reference, context)
+            })
             .filter(|n| {
                 python_shape.as_ref().is_none_or(|shape| {
                     crate::python_values::fits_python_call_shape(n, shape, reference, context)
@@ -13109,6 +13189,40 @@ mod tests {
         let mut reference = refv(name, kind, path, lang, line);
         reference.column = column;
         reference
+    }
+
+    #[test]
+    fn no_receiver_on_line_reads_the_name_or_its_first_call() {
+        let source = "        AssertValid();\n        this.Check();\n        Easing.Linear\n    .Select(x => x)\n        var t = TestContext.Current;\n        Foo.\tCall(token);\n        x = $call(1); Call(2);\n";
+        let ctx = Ctx::default().file("A.cs", source);
+        let none = |name: &str, line: i64, column: i64| {
+            has_no_receiver_on_line(
+                &at_column(
+                    name,
+                    EdgeKind::Calls,
+                    "A.cs",
+                    Language::CSharp,
+                    line,
+                    column,
+                ),
+                &ctx,
+            )
+        };
+        assert!(none("AssertValid", 1, 8));
+        assert!(!none("Check", 2, 13), "`this.` is a receiver");
+        assert!(none("Easing", 3, 8));
+        assert!(none("easing", 3, 8), "read case-insensitively");
+        assert!(!none("Select", 4, 0), "the name is on the line after a `.`");
+        assert!(none("TestContext", 5, 27), "a column at the name's end");
+        assert!(
+            !none("Call", 6, 0),
+            "the first `Call(` follows a `.` and blanks"
+        );
+        assert!(none("Call", 7, 0), "`$call(` is no call of `Call`");
+        assert!(
+            !none("Missing", 1, 0),
+            "a name off its line is a chain link"
+        );
     }
 
     #[test]

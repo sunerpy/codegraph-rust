@@ -8519,6 +8519,134 @@ mod csharp {
         );
     }
 
+    const PR2151_FILES: [(&str, &str); 5] = [
+        (
+            "tests/OrderProcessorTests.cs",
+            "namespace App.Tests;\n\npublic class OrderProcessorTests\n{\n    public TestContext TestContext { get; set; } = null!;\n}\n",
+        ),
+        (
+            "src/Animations/AnimationBase.cs",
+            "namespace App.Animations;\n\npublic abstract class AnimationBase\n{\n    public EasingType Easing { get; set; }\n}\n",
+        ),
+        (
+            "src/Execution/ExpressionBuilder.cs",
+            "namespace App.Execution;\n\npublic static class ExpressionBuilder\n{\n    public static object Call(object target) => target;\n}\n",
+        ),
+        (
+            "src/Specs/SpecBase.cs",
+            "namespace App.Specs;\n\npublic abstract class SpecBase\n{\n    protected void AssertValid() { }\n}\n",
+        ),
+        (
+            "src/Specs/CatalogSpec.cs",
+            "namespace App.Specs;\n\npublic class CatalogSpec : SpecBase\n{\n    public void Runs()\n    {\n        var token = TestContext.Current.CancellationToken;\n        var easing = Easing.Linear;\n        AssertValid();\n        Call(token);\n    }\n}\n",
+        ),
+    ];
+
+    /// What the `calls` and `references` edges out of `CatalogSpec.cs` reach.
+    fn catalog_targets(graph: &Graph) -> Vec<String> {
+        let mut out: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.kind == "calls" || edge.kind == "references")
+            .filter(|edge| {
+                graph
+                    .node(&edge.source)
+                    .is_some_and(|node| node.file_path == "src/Specs/CatalogSpec.cs")
+            })
+            .filter_map(|edge| graph.node(&edge.target))
+            .map(|node| node.qualified_name.clone())
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// Upstream #2151 (`6eb08d68`): a bare C# name (`TestContext`, `Easing`,
+    /// `Helper()`) is a member of the types around it, of their bases, or of
+    /// a type a static using brings in, never another class's property:
+    /// eShop's `TestContext.Current` reached another test class's
+    /// `TestContext` property. Upstream's fixture, where a project file's
+    /// `<Using … Static="true"/>` brings `ExpressionBuilder` in; then the
+    /// same tree without it (`Call` is out of reach), with a `global using
+    /// static` in another file, and with the file's own `using static`.
+    #[test]
+    fn pr2151_a_bare_csharp_name_reaches_only_members_in_scope() {
+        let with = |extra: &[(&str, &str)], catalog: Option<&str>| {
+            let mut project = Project::new();
+            for (path, contents) in PR2151_FILES {
+                let contents = match (path, catalog) {
+                    ("src/Specs/CatalogSpec.cs", Some(catalog)) => catalog,
+                    _ => contents,
+                };
+                project = project.file(path, contents);
+            }
+            for (path, contents) in extra {
+                project = project.file(path, contents);
+            }
+            project.index()
+        };
+        let csproj = (
+            "src/App.csproj",
+            "<Project Sdk=\"Microsoft.NET.Sdk\">\n  <ItemGroup>\n    <Using Include=\"App.Execution.ExpressionBuilder\" Static=\"true\"/>\n  </ItemGroup>\n</Project>\n",
+        );
+        let upstream = with(&[csproj], None);
+        let targets = catalog_targets(upstream.graph());
+        assert!(
+            !targets
+                .iter()
+                .any(|t| t == "App.Tests::OrderProcessorTests::TestContext"),
+            "{targets:?}"
+        );
+        assert!(
+            !targets
+                .iter()
+                .any(|t| t == "App.Animations::AnimationBase::Easing"),
+            "{targets:?}"
+        );
+        assert!(
+            targets
+                .iter()
+                .any(|t| t == "App.Specs::SpecBase::AssertValid"),
+            "{targets:?}"
+        );
+        assert!(
+            targets
+                .iter()
+                .any(|t| t == "App.Execution::ExpressionBuilder::Call"),
+            "{targets:?}"
+        );
+
+        let call = "App.Execution::ExpressionBuilder::Call";
+        let bare = with(&[], None);
+        assert!(
+            !catalog_targets(bare.graph()).iter().any(|t| t == call),
+            "{}",
+            bare.graph().report()
+        );
+        let global = with(
+            &[(
+                "src/GlobalUsings.cs",
+                "global using static App.Execution.ExpressionBuilder;\n",
+            )],
+            None,
+        );
+        assert!(
+            catalog_targets(global.graph()).iter().any(|t| t == call),
+            "{}",
+            global.graph().report()
+        );
+        let own = with(
+            &[],
+            Some(
+                "using static App.Execution.ExpressionBuilder;\nnamespace App.Specs;\n\npublic class CatalogSpec : SpecBase\n{\n    public void Runs()\n    {\n        var token = TestContext.Current.CancellationToken;\n        var easing = Easing.Linear;\n        AssertValid();\n        Call(token);\n    }\n}\n",
+            ),
+        );
+        assert!(
+            catalog_targets(own.graph()).iter().any(|t| t == call),
+            "{}",
+            own.graph().report()
+        );
+    }
+
     /// Upstream #2216 (`a8b578f7`): a bare C# type name means a type its file
     /// can see: one in its own namespace or an enclosing one, one a `using`
     /// imports, or the one an alias names. Newtonsoft's `async Task` tests

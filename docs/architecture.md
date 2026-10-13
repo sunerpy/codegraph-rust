@@ -370,13 +370,15 @@ its top-level types when the package holding them changed, sending the unchanged
 files with references to those names written with a receiver down the
 whole-file lane too, however many there are, since none of those facts is a
 node; the `scala_surface_version` marker is withdrawn and restored with the
-others; a C# file whose `global using`s changed re-resolves every unchanged C#
-file whole, since every file of a project reads them and the project is a
-`.csproj`, which is no source file (a `.csproj` or `.props` change itself is not
-yet detected); one whose surface row's heads moved re-resolves, whole, the
-unchanged files declaring a C# type of a name those heads reach (closing over
-every head listing a reached name as a base), since a nested type is reached
-from a type deriving from its owner through heads read by name; and a C# type
+others; a C# file whose `global using`s or `global using static`s changed
+re-resolves every unchanged C# file whole, since every file of a project reads
+the first and every file the second, and the project is a `.csproj`, which is
+no source file (a `.csproj` or `.props` change itself is not yet detected); one
+whose surface row's heads moved re-resolves, whole, the unchanged files
+declaring a C# type of a name those heads reach (closing over every head
+listing a reached name as a base to either reader), since a nested type is
+reached from a type deriving from its owner, and a bare member from the types
+around it and their bases, through heads read by name; and a C# type
 that keeps its node while its owner turns from a type into a namespace of the
 same name, or back, has its name touched for the name lane; the
 `csharp_surface_version` marker is withdrawn and restored with the others; an
