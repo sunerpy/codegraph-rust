@@ -9067,4 +9067,262 @@ mod csharp {
             "method App::Report::Render" => calls => "method App.Utilities::StringUtils::StartsWith"
         );
     }
+
+    /// The qualified name of what every `kind` edge out of the node of `file`
+    /// named `qualified_name` reaches, sorted (upstream's
+    /// `targets(member(…), kind)`).
+    fn member_targets(graph: &Graph, file: &str, qualified_name: &str, kind: &str) -> Vec<String> {
+        let member = graph
+            .nodes
+            .iter()
+            .find(|node| node.file_path == file && node.qualified_name == qualified_name)
+            .unwrap_or_else(|| panic!("{qualified_name} is indexed\n{}", graph.report()));
+        let mut out: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.source == member.id && edge.kind == kind)
+            .filter_map(|edge| graph.node(&edge.target))
+            .map(|node| node.qualified_name.clone())
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// Upstream #2345 (`489b4749`), its C# half: a property's accessor bodies
+    /// and expression body are walked as the property, so the calls,
+    /// instantiations and static reads written there belong to it, and a
+    /// method passed as a value there is the property's reference, captured
+    /// once. Upstream's fixture.
+    #[test]
+    fn pr2345_csharp_accessor_bodies_are_walked_as_the_property() {
+        let project = Project::new()
+            .file(
+                "Helper.cs",
+                "public static class Helper {\n\
+                \x20   public static int Compute(int n) => n;\n\
+                \x20   public static void Store(int n) {}\n\
+                \x20   public static int Arrow() => 1;\n\
+                \x20   public static int GetA() => 1;\n\
+                \x20   public static void SetA(int v) {}\n\
+                }\n\
+                public class Widget {}\n\
+                public static class Defaults { public const string Name = \"x\"; }\n",
+            )
+            .file(
+                "Box.cs",
+                "public class Box {\n\
+                \x20   private int _x;\n\
+                \x20   public int Value {\n\
+                \x20       get { return Helper.Compute(_x); }\n\
+                \x20       set { Helper.Store(value); _x = value; }\n\
+                \x20   }\n\
+                \x20   public int Arrow => Helper.Arrow();\n\
+                \x20   public int Both { get => Helper.GetA(); set => Helper.SetA(value); }\n\
+                \x20   public Widget Made { get { return new Widget(); } }\n\
+                \x20   public string Label { get { return Defaults.Name; } }\n\
+                \x20   private void Handle(int v) { }\n\
+                \x20   public System.Action<int> Handler { get { return Pick(Handle); } }\n\
+                }\n",
+            )
+            .index();
+        let graph = project.graph();
+        let targets = |name: &str, kind: &str| member_targets(graph, "Box.cs", name, kind);
+
+        assert_eq!(
+            targets("Box::Value", "calls"),
+            ["Helper::Compute", "Helper::Store"]
+        );
+        assert_eq!(targets("Box::Arrow", "calls"), ["Helper::Arrow"]);
+        assert_eq!(
+            targets("Box::Both", "calls"),
+            ["Helper::GetA", "Helper::SetA"]
+        );
+        assert_eq!(targets("Box::Made", "instantiates"), ["Widget"]);
+        assert!(targets("Box::Label", "references").contains(&"Defaults".to_owned()));
+        // A method passed as a value inside an accessor is the property's
+        // reference, captured once, not the class's as well.
+        assert!(targets("Box::Handler", "references").contains(&"Box::Handle".to_owned()));
+        assert!(!targets("Box", "references").contains(&"Box::Handle".to_owned()));
+        assert!(targets("Box", "calls").is_empty(), "{}", graph.report());
+    }
+
+    /// Upstream #2348 (`355afc70`): a C# field declarator and a property's
+    /// `= initializer` are walked as the member they initialize, so `private
+    /// readonly ILogger _log = LogManager.GetLogger(typeof(Box));` calls
+    /// `GetLogger` from `_log`; a target-typed `new()` there instantiates the
+    /// declared type; lambdas and function values belong to the member;
+    /// attributes are not walked. Upstream's fixture.
+    #[test]
+    fn pr2348_csharp_initializers_are_walked_as_their_member() {
+        let project = Project::new()
+            .file(
+                "Lib.cs",
+                "namespace Lib\n\
+                {\n\
+                \x20   public class Crate { }\n\
+                }\n\
+                public interface ILogger { }\n\
+                public static class LogManager\n\
+                {\n\
+                \x20   public static ILogger GetLogger(System.Type t) => null;\n\
+                }\n\
+                public static class Helper\n\
+                {\n\
+                \x20   public static int Compute(int n) => n;\n\
+                \x20   public static int Seed() => 1;\n\
+                \x20   public static void Register(System.Action a) { }\n\
+                \x20   public static System.Action Wrap(System.Action a) => a;\n\
+                }\n\
+                public class Widget\n\
+                {\n\
+                \x20   public Widget() { }\n\
+                \x20   public Widget(int n) { }\n\
+                \x20   public int Size { get; set; }\n\
+                }\n\
+                public class Bag<T> { }\n\
+                public static class Defaults\n\
+                {\n\
+                \x20   public const string Name = \"x\";\n\
+                \x20   public static readonly Widget Empty = new Widget();\n\
+                }\n",
+            )
+            .file(
+                "Box.cs",
+                "using Lib;\n\
+                \n\
+                public class Box\n\
+                {\n\
+                \x20   private readonly ILogger _log = LogManager.GetLogger(typeof(Box));\n\
+                \x20   private int _a = 1, _b = Helper.Compute(2);\n\
+                \x20   private static readonly int Max = Helper.Seed();\n\
+                \x20   private readonly Widget _made = new Widget(3);\n\
+                \x20   private readonly Widget _typed = new() { Size = Helper.Seed() };\n\
+                \x20   private Widget? _maybe = new();\n\
+                \x20   private readonly Bag<Widget> _bag = new();\n\
+                \x20   private readonly Lib.Crate _crate = new();\n\
+                \x20   private readonly string _label = Defaults.Name;\n\
+                \x20   private readonly System.Func<int, int> _square = x => Helper.Compute(x * x);\n\
+                \x20   private readonly System.Action _later = () => Helper.Register(Handle);\n\
+                \x20   private readonly System.Action _direct = Handle;\n\
+                \x20   [System.Obsolete(\"use Helper.Seed()\")] private int _flagged;\n\
+                \x20   public Bag<Widget> Items { get; } = new Bag<Widget>();\n\
+                \x20   public Widget Made { get; set; } = new();\n\
+                \x20   public Widget Copy { get; } = Defaults.Empty;\n\
+                \x20   public System.Action Wrapped { get; } = Helper.Wrap(Handle);\n\
+                \x20   public int Seeded { get; } = Helper.Seed();\n\
+                \x20   private static void Handle() { }\n\
+                }\n",
+            )
+            .index();
+        let graph = project.graph();
+        let targets = |name: &str, kind: &str| member_targets(graph, "Box.cs", name, kind);
+        let kind_of = |name: &str| {
+            graph
+                .nodes
+                .iter()
+                .find(|node| node.file_path == "Box.cs" && node.qualified_name == name)
+                .map(|node| node.kind.clone())
+        };
+
+        // Calls, per declarator.
+        assert_eq!(targets("Box::_log", "calls"), ["LogManager::GetLogger"]);
+        assert!(targets("Box::_a", "calls").is_empty());
+        assert_eq!(targets("Box::_b", "calls"), ["Helper::Compute"]);
+        assert_eq!(kind_of("Box::Max").as_deref(), Some("constant"));
+        assert_eq!(targets("Box::Max", "calls"), ["Helper::Seed"]);
+        assert_eq!(targets("Box::Seeded", "calls"), ["Helper::Seed"]);
+
+        // Instantiations, including a target-typed `new()` of the declared
+        // type.
+        assert_eq!(targets("Box::_made", "instantiates"), ["Widget"]);
+        assert_eq!(targets("Box::_typed", "instantiates"), ["Widget"]);
+        assert_eq!(targets("Box::_typed", "calls"), ["Helper::Seed"]);
+        assert_eq!(targets("Box::_maybe", "instantiates"), ["Widget"]);
+        assert_eq!(targets("Box::_bag", "instantiates"), ["Bag"]);
+        assert_eq!(targets("Box::_crate", "instantiates"), ["Lib::Crate"]);
+        assert_eq!(targets("Box::Items", "instantiates"), ["Bag"]);
+        assert_eq!(targets("Box::Made", "instantiates"), ["Widget"]);
+
+        // Static reads.
+        assert!(targets("Box::_label", "references").contains(&"Defaults".to_owned()));
+        assert!(targets("Box::Copy", "references").contains(&"Defaults".to_owned()));
+
+        // Lambda bodies belong to the member the lambda initializes.
+        assert_eq!(targets("Box::_square", "calls"), ["Helper::Compute"]);
+        assert_eq!(targets("Box::_later", "calls"), ["Helper::Register"]);
+
+        // A method passed as a value is the member's reference, captured
+        // once, not the class's as well.
+        assert!(targets("Box::_later", "references").contains(&"Box::Handle".to_owned()));
+        assert!(targets("Box::_direct", "references").contains(&"Box::Handle".to_owned()));
+        assert_eq!(targets("Box::Wrapped", "calls"), ["Helper::Wrap"]);
+        assert!(targets("Box::Wrapped", "references").contains(&"Box::Handle".to_owned()));
+        assert!(!targets("Box", "references").contains(&"Box::Handle".to_owned()));
+
+        // Attribute arguments are not an initializer, and the class itself
+        // calls and creates nothing.
+        assert!(targets("Box::_flagged", "calls").is_empty());
+        assert!(targets("Box", "calls").is_empty(), "{}", graph.report());
+        assert!(
+            targets("Box", "instantiates").is_empty(),
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream #2348 (`355afc70`, issue #2337): a C# type position never
+    /// names a constant, the kind `const` and `static readonly` fields get:
+    /// `new Version(5, 18)` bound to a claim-name `const string Version`, and
+    /// `static readonly Meter Meter = new(…)` instantiated itself. Upstream's
+    /// fixture.
+    #[test]
+    fn pr2348_a_csharp_type_position_never_names_a_constant() {
+        let project = Project::new()
+            .file(
+                "src/Claims.cs",
+                "namespace App;\n\
+                public static class ClaimTypes {\n\
+                \x20   public const string Version = \"v\";\n\
+                }\n",
+            )
+            .file(
+                "src/Encoder.cs",
+                "namespace App;\n\
+                using System;\n\
+                public class ValueFormatter { }\n\
+                public class Encoder {\n\
+                \x20   private static readonly Version MinVersion = new Version(5, 18);\n\
+                \x20   private static readonly Meter Meter = new(\"app\");\n\
+                \x20   private static readonly ValueFormatter ValueFormatter = new();\n\
+                \x20   public void Check() { var v = new Version(1, 0); }\n\
+                }\n",
+            )
+            .index();
+        let graph = project.graph();
+        let mut targets: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|edge| ["references", "instantiates", "type_of"].contains(&edge.kind.as_str()))
+            .filter_map(|edge| {
+                let source = graph.node(&edge.source)?;
+                let target = graph.node(&edge.target)?;
+                (source.file_path == "src/Encoder.cs" && source.kind != "file").then(|| {
+                    format!(
+                        "{} {} {}:{}",
+                        source.name, edge.kind, target.kind, target.qualified_name
+                    )
+                })
+            })
+            .collect();
+        targets.sort();
+        assert!(
+            !targets.iter().any(|target| target.contains(" constant:")),
+            "{targets:?}"
+        );
+        assert!(
+            targets.contains(&"ValueFormatter instantiates class:App::ValueFormatter".to_owned()),
+            "{targets:?}\n{}",
+            graph.report()
+        );
+    }
 }

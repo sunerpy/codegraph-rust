@@ -131,12 +131,19 @@ pub(crate) fn is_csharp_type_ref(reference: &RefView, context: &dyn ResolutionCo
 }
 
 /// Whether a candidate can be what a C# type position names: a property, a
-/// method (a constructor is one), an enum case or a field shares the type's
-/// name, not its meaning (upstream #2121 `canNameInTypePosition`).
+/// method (a constructor is one), an enum case, a field or a constant (the
+/// kind a `const` / `static readonly` field gets) shares the type's name, not
+/// its meaning (upstream #2121 `canNameInTypePosition`, constants since
+/// #2348: `new Version(5, 18)` beside a `const string Version`, and `static
+/// readonly Meter Meter = new(…)` instantiating itself).
 pub(crate) fn can_name_in_type_position(candidate: &Node) -> bool {
     !matches!(
         candidate.kind,
-        NodeKind::Property | NodeKind::Method | NodeKind::EnumMember | NodeKind::Field
+        NodeKind::Property
+            | NodeKind::Method
+            | NodeKind::EnumMember
+            | NodeKind::Field
+            | NodeKind::Constant
     )
 }
 

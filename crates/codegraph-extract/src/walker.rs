@@ -752,7 +752,8 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             self.maybe_cpp_construction(node);
             self.extract_variable(node);
             // A type walked above captured its own function values.
-            self.scan_fn_ref_subtree_skipping(node, 0, defined_type.map(|defined| defined.id()));
+            let walked = defined_type.map(|defined| defined.id());
+            self.scan_fn_ref_subtree(node, 0, walked.as_slice());
             skip_children = true;
         } else if self.spec.language() == Language::Swift
             && node_type == "protocol_property_declaration"
@@ -802,12 +803,39 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
         } else if has_type(self.spec.property_types(), node_type)
             && self.is_inside_class_like_node()
         {
-            self.extract_property(node);
-            self.scan_fn_ref_subtree(node, 0);
+            let prop_id = self.extract_property(node);
+            // The code a property runs is the property's: its calls,
+            // instantiations and reads attribute to it, as a method's do
+            // (upstream #2345, #2348).
+            let bodies = if prop_id.is_some() {
+                self.property_bodies(node)
+            } else {
+                Vec::new()
+            };
+            if let Some(prop_id) = prop_id.filter(|_| !bodies.is_empty()) {
+                self.node_stack.push(prop_id);
+                let declared_type = child_by_field(node, "type");
+                for body in &bodies {
+                    self.extract_target_typed_new(Some(*body), declared_type);
+                    self.visit_function_body(*body);
+                }
+                self.node_stack.pop();
+            }
+            // Whatever the body walk didn't cover (a C# property's
+            // attributes, any other language's whole declaration) is scanned
+            // for function-as-value candidates (#756); the bodies captured
+            // their own.
+            let walked = bodies.iter().map(|body| body.id()).collect::<Vec<_>>();
+            self.scan_fn_ref_subtree(node, 0, &walked);
             skip_children = true;
         } else if has_type(self.spec.field_types(), node_type) && self.is_inside_class_like_node() {
-            self.extract_field(node);
-            self.scan_fn_ref_subtree(node, 0);
+            let walked = self.extract_field(node);
+            // Scan the declaration for function-as-value candidates (#756):
+            // Java `List<IntConsumer> table = List.of(Main::cb)`. A C#
+            // declarator `extract_field` walked captured its own (`List<
+            // Action<int>> table = new() { TargetCb }` is the field's), so
+            // the scan skips it.
+            self.scan_fn_ref_subtree(node, 0, &walked);
             skip_children = true;
         } else if is_rust_impl_item(self.spec.language(), node_type) {
             self.extract_rust_impl_item(node);
@@ -4624,13 +4652,15 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
         }
     }
 
-    fn extract_property(&mut self, node: SyntaxNode<'tree>) {
+    /// A `property` node for `node`, with its type annotations; returns its
+    /// id.
+    fn extract_property(&mut self, node: SyntaxNode<'tree>) -> Option<String> {
         let name = self
             .spec
             .extract_property_name(node, self.source)
             .unwrap_or_else(|| self.extract_name(node));
         let signature = property_or_field_signature(node, &name, self.source);
-        if let Some(prop_node) = self.create_node(
+        let prop_node = self.create_node(
             NodeKind::Property,
             &name,
             node,
@@ -4640,9 +4670,66 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
                 is_static: self.spec.is_static(node, self.source),
                 ..NodeExtra::default()
             },
-        ) {
-            self.extract_type_annotations(node, &prop_node.id);
+        )?;
+        self.extract_type_annotations(node, &prop_node.id);
+        Some(prop_node.id)
+    }
+
+    /// The parts of a property declaration that run code, for the body
+    /// walker (upstream `propertyBodies`, #2345 and #2348): each C#
+    /// accessor's body (`get { … }`, `set => …`) and the property's `value`,
+    /// an expression body's `=> …` or an `= initializer`. Its attributes are
+    /// not walked. Other languages have none here (VB.NET's whole
+    /// declaration joins with VB.NET support).
+    fn property_bodies(&self, node: SyntaxNode<'tree>) -> Vec<SyntaxNode<'tree>> {
+        if self.spec.language() != Language::CSharp {
+            return Vec::new();
         }
+        let mut bodies = Vec::new();
+        if let Some(accessors) = child_by_field(node, "accessors") {
+            for accessor in accessors.named_children(&mut accessors.walk()) {
+                if accessor.kind() == "accessor_declaration"
+                    && let Some(body) = child_by_field(accessor, "body")
+                {
+                    bodies.push(body);
+                }
+            }
+        }
+        if let Some(value) = child_by_field(node, "value") {
+            bodies.push(value);
+        }
+        bodies
+    }
+
+    /// A C# target-typed `new()` names no type, which is why
+    /// [`INSTANTIATION_KINDS`] leaves `implicit_object_creation_expression`
+    /// out. As a field's or property's initializer, though, it constructs the
+    /// declared type: `private readonly List<Foo> _items = new();`
+    /// instantiates `List`, as `new List<Foo>()` does (upstream
+    /// `extractTargetTypedNew`, #2348). Emitted from the node-stack top, the
+    /// member.
+    fn extract_target_typed_new(
+        &mut self,
+        value: Option<SyntaxNode<'tree>>,
+        declared_type: Option<SyntaxNode<'tree>>,
+    ) {
+        if self.spec.language() != Language::CSharp {
+            return;
+        }
+        let Some(value) =
+            value.filter(|value| value.kind() == "implicit_object_creation_expression")
+        else {
+            return;
+        };
+        let Some(class_name) =
+            declared_type.and_then(|declared| csharp_class_type_name(declared, self.source))
+        else {
+            return;
+        };
+        let Some(from_node_id) = self.node_stack.last().cloned() else {
+            return;
+        };
+        self.push_ref(&from_node_id, &class_name, EdgeKind::Instantiates, value);
     }
 
     /// Swift computed property (`b3f59c7`): a `property_declaration` whose body
@@ -4703,7 +4790,10 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
         }
     }
 
-    fn extract_field(&mut self, node: SyntaxNode<'tree>) {
+    /// A node per declarator of a class field declaration. Returns the C#
+    /// declarators it walked, for the function-as-value scan to skip.
+    fn extract_field(&mut self, node: SyntaxNode<'tree>) -> Vec<usize> {
+        let mut walked = Vec::new();
         let declarators = field_declarators(node).collect::<Vec<_>>();
         if declarators.is_empty() && self.spec.language() == Language::Solidity {
             // #1170 — Solidity `state_variable_declaration` / `struct_member` /
@@ -4726,7 +4816,7 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
                     self.extract_type_annotations(node, &field_node.id);
                 }
             }
-            return;
+            return walked;
         }
         if declarators.is_empty() && self.spec.language() == Language::Php {
             // A property's name nests as `property_element → variable_name →
@@ -4766,7 +4856,7 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
                     self.extract_type_annotations(node, &field_node.id);
                 }
             }
-            return;
+            return walked;
         }
 
         // #897 — a Java `static final` or C# `const` / `static readonly` field
@@ -4778,6 +4868,11 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
         } else {
             NodeKind::Field
         };
+        // C# carries the declared type on the `variable_declaration` wrapper.
+        let declared_type = node
+            .named_children(&mut node.walk())
+            .find(|child| child.kind() == "variable_declaration")
+            .and_then(|declaration| child_by_field(declaration, "type"));
         for declarator in declarators {
             let Some(name_node) = child_by_field(declarator, "name").or_else(|| {
                 declarator
@@ -4800,8 +4895,25 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
                 },
             ) {
                 self.extract_type_annotations(node, &field_node.id);
+                // C# writes `= expr` as the declarator's last, unnamed child,
+                // so the whole declarator is walked with its field on the
+                // stack: the initializer's calls, instantiations, reads and
+                // function values are the field's (upstream #2348).
+                // Attributes sit on the declaration and stay unwalked.
+                if self.spec.language() == Language::CSharp {
+                    self.node_stack.push(field_node.id);
+                    let initializer = declarator
+                        .named_child_count()
+                        .checked_sub(1)
+                        .and_then(|last| declarator.named_child(last as u32));
+                    self.extract_target_typed_new(initializer, declared_type);
+                    walked.push(declarator.id());
+                    self.visit_function_body(declarator);
+                    self.node_stack.pop();
+                }
             }
         }
+        walked
     }
 
     fn extract_import(&mut self, node: SyntaxNode<'tree>) {
@@ -6909,23 +7021,14 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
     }
 
     /// Candidates-only scan of a top-level var-initializer subtree, halting at
-    /// nested functions. Ports `scanFnRefSubtree` (tree-sitter.ts:392-409).
-    fn scan_fn_ref_subtree(&mut self, node: SyntaxNode<'tree>, depth: u32) {
-        self.scan_fn_ref_subtree_skipping(node, depth, None);
-    }
-
-    /// [`Self::scan_fn_ref_subtree`] past the subtree `walked`, which the
-    /// body walker has already been through (upstream's `walked` set).
-    fn scan_fn_ref_subtree_skipping(
-        &mut self,
-        node: SyntaxNode<'tree>,
-        depth: u32,
-        walked: Option<usize>,
-    ) {
+    /// nested functions and past the subtrees `walked`, which the body walker
+    /// has already been through (upstream's `walked` set). Ports
+    /// `scanFnRefSubtree` (tree-sitter.ts:392-409).
+    fn scan_fn_ref_subtree(&mut self, node: SyntaxNode<'tree>, depth: u32, walked: &[usize]) {
         if crate::function_ref::fn_ref_spec(self.spec.language()).is_none() || depth > 12 {
             return;
         }
-        if walked == Some(node.id()) {
+        if walked.contains(&node.id()) {
             return;
         }
         let node_type = node.kind();
@@ -6945,7 +7048,7 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
         self.maybe_capture_fn_refs(node, node_type);
         for i in 0..node.named_child_count() {
             if let Some(child) = node.named_child(i as u32) {
-                self.scan_fn_ref_subtree_skipping(child, depth + 1, walked);
+                self.scan_fn_ref_subtree(child, depth + 1, walked);
             }
         }
     }
@@ -7824,6 +7927,27 @@ fn field_declarators(node: SyntaxNode<'_>) -> impl Iterator<Item = SyntaxNode<'_
         })
         .collect::<Vec<_>>();
     direct.into_iter().chain(wrapped)
+}
+
+/// The class a C# declared type names, as `new T()` would name it (upstream
+/// `csharpClassTypeName`, #2348): `Foo`, `List<Foo>` → `List`, `Ns.Foo` and
+/// `global::Foo` → `Foo`, `Foo?` → `Foo`. Predefined, array, tuple and
+/// pointer types name no class.
+fn csharp_class_type_name(node: SyntaxNode<'_>, source: &str) -> Option<String> {
+    match node.kind() {
+        "identifier" => Some(node_text(node, source)).filter(|name| !name.is_empty()),
+        "generic_name" => node
+            .named_children(&mut node.walk())
+            .find(|child| child.kind() == "identifier")
+            .and_then(|name| csharp_class_type_name(name, source)),
+        "qualified_name" | "alias_qualified_name" => {
+            child_by_field(node, "name").and_then(|name| csharp_class_type_name(name, source))
+        }
+        "nullable_type" => {
+            child_by_field(node, "type").and_then(|inner| csharp_class_type_name(inner, source))
+        }
+        _ => None,
+    }
 }
 
 fn property_or_field_signature(node: SyntaxNode<'_>, name: &str, source: &str) -> Option<String> {
@@ -10084,6 +10208,78 @@ class Widget {
         let (nodes, _) = run("W.cs", src, Language::CSharp);
         assert!(has_node(&nodes, NodeKind::Class, "Widget"));
         assert!(has_node(&nodes, NodeKind::Method, "Render"));
+    }
+
+    /// Upstream #2348: a target-typed `new()` initializing a field or
+    /// property instantiates the class its declared type names, by the
+    /// type's last segment and without type arguments or `?`; a predefined,
+    /// array or tuple type names none, and in a method body it stays
+    /// invisible.
+    #[test]
+    fn csharp_target_typed_new_names_the_declared_class() {
+        let src = r#"
+class Box {
+    private Foo _a = new();
+    private List<Foo> _b = new();
+    private Ns.Bar _c = new();
+    private global::Baz _d = new();
+    private Qux? _e = new();
+    private int _f = new();
+    private Foo[] _g = new();
+    private (int, int) _h = new();
+    public Item P { get; } = new();
+    public void Run() { Widget w = new(); }
+}
+"#;
+        let (nodes, refs) = run("Box.cs", src, Language::CSharp);
+        let created = |member: &str| -> Vec<String> {
+            let from = nodes
+                .iter()
+                .find(|n| n.name == member)
+                .unwrap_or_else(|| panic!("missing {member}"));
+            refs.iter()
+                .filter(|r| r.from_node_id == from.id && r.reference_kind == EdgeKind::Instantiates)
+                .map(|r| r.reference_name.clone())
+                .collect()
+        };
+        assert_eq!(created("_a"), ["Foo"]);
+        assert_eq!(created("_b"), ["List"]);
+        assert_eq!(created("_c"), ["Bar"]);
+        assert_eq!(created("_d"), ["Baz"]);
+        assert_eq!(created("_e"), ["Qux"]);
+        assert!(created("_f").is_empty());
+        assert!(created("_g").is_empty());
+        assert!(created("_h").is_empty());
+        assert_eq!(created("P"), ["Item"]);
+        assert!(created("Run").is_empty());
+        assert!(!has_ref(&refs, EdgeKind::Instantiates, "Widget"));
+    }
+
+    /// Upstream #2345 and #2348: a C# property's accessor bodies and value,
+    /// and a field declarator, are walked as that member, while the
+    /// attributes on the declaration are not.
+    #[test]
+    fn csharp_member_bodies_are_walked_without_their_attributes() {
+        let src = r#"
+class Box {
+    [Obsolete(Reason())] public int P { get { return Get(); } set { Put(value); } }
+    [Obsolete(Reason())] private int _f = Seed();
+}
+"#;
+        let (nodes, refs) = run("Box.cs", src, Language::CSharp);
+        let calls = |member: &str| -> Vec<String> {
+            let from = nodes
+                .iter()
+                .find(|n| n.name == member)
+                .unwrap_or_else(|| panic!("missing {member}"));
+            refs.iter()
+                .filter(|r| r.from_node_id == from.id && r.reference_kind == EdgeKind::Calls)
+                .map(|r| r.reference_name.clone())
+                .collect()
+        };
+        assert_eq!(calls("P"), ["Get", "Put"]);
+        assert_eq!(calls("_f"), ["Seed"]);
+        assert!(!has_ref(&refs, EdgeKind::Calls, "Reason"));
     }
 
     #[test]

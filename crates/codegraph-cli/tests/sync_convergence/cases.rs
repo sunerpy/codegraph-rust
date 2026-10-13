@@ -5067,6 +5067,93 @@ pub fn java_type_parameter_bound_changes_in_another_file() -> Case {
         .edge_after("method app::Leaf::runs", "calls", "method app::SecondInit::createContext")
 }
 
+/// Upstream #2345: a C# property's accessor body is walked as the property,
+/// so its call on a class added later in another file links after the sync,
+/// as on a fresh index.
+pub fn csharp_accessor_body_call_of_an_added_class() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::CSharp])
+        .file(
+            "src/Box.cs",
+            "namespace App\n{\n    public class Box\n    {\n        public int Value\n        {\n            get { return Helper.Compute(1); }\n        }\n        public int Arrow => Helper.Compute(2);\n    }\n}\n",
+        )
+        .write(
+            "src/Helper.cs",
+            "namespace App\n{\n    public static class Helper\n    {\n        public static int Compute(int n) => n;\n    }\n}\n",
+        )
+        .edge_after("property App::Box::Value", "calls", "method App::Helper::Compute")
+        .edge_after("property App::Box::Arrow", "calls", "method App::Helper::Compute")
+}
+
+/// Upstream #2348: a C# field's initializer is walked as the field, so
+/// editing which method it calls moves the field's edge.
+pub fn csharp_field_initializer_body_edit() -> Case {
+    Case::new(Change::BodyEdit, &[Language::CSharp])
+        .file(
+            "src/Helper.cs",
+            "namespace App\n{\n    public static class Helper\n    {\n        public static int Compute(int n) => n;\n        public static int Seed() => 1;\n    }\n}\n",
+        )
+        .file(
+            "src/Box.cs",
+            "namespace App\n{\n    public class Box\n    {\n        private int _a = 1, _b = Helper.Compute(2);\n        public int Seeded { get; } = Helper.Compute(3);\n    }\n}\n",
+        )
+        .write(
+            "src/Box.cs",
+            "namespace App\n{\n    public class Box\n    {\n        private int _a = 1, _b = Helper.Seed();\n        public int Seeded { get; } = Helper.Seed();\n    }\n}\n",
+        )
+        .edge_before("field App::Box::_b", "calls", "method App::Helper::Compute")
+        .edge_before("property App::Box::Seeded", "calls", "method App::Helper::Compute")
+        .edge_after("field App::Box::_b", "calls", "method App::Helper::Seed")
+        .edge_after("property App::Box::Seeded", "calls", "method App::Helper::Seed")
+        .no_edge_after("field App::Box::_b", "calls", "method App::Helper::Compute")
+}
+
+/// Upstream #2348: a C# target-typed `new()` initializing a field or
+/// property instantiates the declared type, so a class of that name added
+/// later in another file is instantiated after the sync, as on a fresh index.
+pub fn csharp_target_typed_new_of_an_added_class() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::CSharp])
+        .file(
+            "src/Box.cs",
+            "namespace App\n{\n    public class Box\n    {\n        private readonly Widget _w = new();\n        public Widget? Made { get; } = new();\n    }\n}\n",
+        )
+        .write(
+            "src/Widget.cs",
+            "namespace App\n{\n    public class Widget { }\n}\n",
+        )
+        .edge_after("field App::Box::_w", "instantiates", "class App::Widget")
+        .edge_after("property App::Box::Made", "instantiates", "class App::Widget")
+}
+
+/// Upstream #2348 (issue #2337, its three-file repro): a C# type position
+/// never names a constant, so a `private const string Station` added beside
+/// the consumer leaves `new Station { … }` on the class it imports, after the
+/// sync as on a fresh index.
+pub fn csharp_type_position_ignores_an_added_constant() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::CSharp])
+        .file(
+            "src/Core/Station.cs",
+            "namespace Demo.Core;\n\npublic class Station\n{\n    public string Id { get; set; }\n}\n",
+        )
+        .file(
+            "tests/App.Tests/Consumer.cs",
+            "using Demo.Core;\n\nnamespace Demo.Tests\n{\n    public class Consumer\n    {\n        public Station Make() => new Station { Id = \"a\" };\n    }\n}\n",
+        )
+        .write(
+            "tests/App.Tests/ConstHolder.cs",
+            "namespace Demo.Tests\n{\n    public class ConstHolder\n    {\n        private const string Station = \"S1\";\n\n        public string Get() => Station;\n    }\n}\n",
+        )
+        .edge_throughout(
+            "method Demo.Tests::Consumer::Make",
+            "instantiates",
+            "class Demo.Core::Station",
+        )
+        .no_edge_after(
+            "method Demo.Tests::Consumer::Make",
+            "instantiates",
+            "constant Demo.Tests::ConstHolder::Station",
+        )
+}
+
 /// Upstream #2171, Java: a field the base declares types the subclass's
 /// call through it, so the base changing the field's type in another file
 /// moves the unchanged subclass's call.
