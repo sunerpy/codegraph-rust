@@ -283,6 +283,15 @@ written, withdrawn and checked like the head rows under `ruby_heads_version`
 (1); a sync that finds it missing or at another version re-resolves every Ruby
 file and rebuilds the rows. Neither is a canonical surface.
 
+CFML component rows record what a bare call in a component reads of a `.cfc`
+file: `cfml_heads:<path>` holds the JSON `{"components", "extends"}`, the
+lowercased names of the classes the file declares and the `extends` path its
+text writes before its first function, as written. A `.cfc` file with neither
+has no row. They are written, withdrawn and checked like the head rows under
+`cfml_heads_version` (1); a sync that finds it missing or at another version
+re-resolves every `.cfc` file and rebuilds the rows. Neither is a canonical
+surface.
+
 ## FTS5
 
 `nodes_fts` is an external-content FTS5 table over `nodes`:

@@ -5631,6 +5631,130 @@ pub fn solidity_change_a_base_contract() -> Case {
         .edge_after("class Token", "extends", "class Pausable")
 }
 
+/// Upstream #2148: a bare call in a component reaches the components its
+/// `extends` chain names, read from their source, so a middle component
+/// extending another base in another file moves an unchanged leaf's call.
+pub fn cfml_bare_call_follows_an_extends_change_in_another_file() -> Case {
+    Case::new(Change::EditHeritage, &[Language::Cfml])
+        .file(
+            "system/First.cfc",
+            "component {\n  function getSetting( name ) {\n    return 1;\n  }\n}\n",
+        )
+        .file(
+            "system/Second.cfc",
+            "component {\n  function getSetting( name ) {\n    return 2;\n  }\n}\n",
+        )
+        .file("system/Middle.cfc", "component extends=\"First\" {\n}\n")
+        .file(
+            "system/Handler.cfc",
+            "component extends=\"Middle\" {\n  function index() {\n    return getSetting( \"appName\" );\n  }\n}\n",
+        )
+        .write("system/Middle.cfc", "component extends=\"Second\" {\n}\n")
+        .edge_before("method Handler::index", "calls", "method First::getSetting")
+        .edge_after("method Handler::index", "calls", "method Second::getSetting")
+}
+
+/// Upstream #2148: a bare `extends` name means a component of the same
+/// directory first, so one appearing beside the handler takes the chain
+/// over, and the call to the farther base's method is gone, as on a fresh
+/// index.
+pub fn cfml_bare_extends_takes_a_component_that_appears_beside_it() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Cfml])
+        .file(
+            "lib/Base.cfc",
+            "component {\n  function getSetting( name ) {\n    return 1;\n  }\n}\n",
+        )
+        .file(
+            "app/Handler.cfc",
+            "component extends=\"Base\" {\n  function index() {\n    return getSetting( \"appName\" );\n  }\n}\n",
+        )
+        .write("app/Base.cfc", "component {\n}\n")
+        .edge_before("method Handler::index", "calls", "method Base::getSetting")
+        .no_edge_after("method Handler::index", "calls", "method Base::getSetting")
+}
+
+/// Upstream #2148: a bare call in a component never reaches a method
+/// outside its chain, so a date helper's `now` added in another file leaves
+/// the built-in `now()` unresolved.
+pub fn cfml_bare_call_ignores_an_added_built_in_namesake() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Cfml])
+        .file(
+            "system/Base.cfc",
+            "component {\n  function getSetting( name ) {\n    return 1;\n  }\n}\n",
+        )
+        .file(
+            "system/Handler.cfc",
+            "component extends=\"Base\" {\n  function index() {\n    var stamp = now();\n    return getSetting( \"appName\" );\n  }\n}\n",
+        )
+        .write(
+            "system/core/DateTimeHelper.cfc",
+            "component {\n  function now() {\n    return 0;\n  }\n}\n",
+        )
+        .edge_throughout("method Handler::index", "calls", "method Base::getSetting")
+        .no_edge_after("method Handler::index", "calls", "method DateTimeHelper::now")
+}
+
+/// Upstream #2148: a CFML call through an untyped receiver takes the one
+/// method of its name only when the receiver is named after its component,
+/// so an interceptor buffer's lone `keyExists` added in another file is not
+/// `server.keyExists`.
+pub fn cfml_untyped_receiver_ignores_a_lone_added_method() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Cfml])
+        .file(
+            "system/models/UserService.cfc",
+            "component {\n  function list() {\n    return [];\n  }\n}\n",
+        )
+        .file(
+            "system/Handler.cfc",
+            "component {\n  function index( userService ) {\n    var lucee = server.keyExists( \"lucee\" );\n    return userService.list();\n  }\n}\n",
+        )
+        .write(
+            "system/core/InterceptorBuffer.cfc",
+            "component {\n  function keyExists( required key ) {\n    return false;\n  }\n}\n",
+        )
+        .edge_throughout("method Handler::index", "calls", "method UserService::list")
+        .no_edge_after(
+            "method Handler::index",
+            "calls",
+            "method InterceptorBuffer::keyExists",
+        )
+}
+
+/// Upstream #2148's relaxation: a receiver whose whole name spells a
+/// component (`cbsecurity` -> CBSecurity) takes that component's method once
+/// it appears in another file.
+pub fn cfml_receiver_named_after_an_added_component() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Cfml])
+        .file(
+            "system/Guard.cfc",
+            "component {\n  function guard( cbsecurity ) {\n    return cbsecurity.secure( \"x\" );\n  }\n}\n",
+        )
+        .write(
+            "system/security/CBSecurity.cfc",
+            "component {\n  function secure( event ) {\n    return true;\n  }\n}\n",
+        )
+        .edge_after("method Guard::guard", "calls", "method CBSecurity::secure")
+}
+
+/// Upstream #2148: an inherited method's body changing leaves the unchanged
+/// component's bare call where it was.
+pub fn cfml_inherited_method_body_edit() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Cfml])
+        .file(
+            "system/Base.cfc",
+            "component {\n  function getSetting( name ) {\n    return 1;\n  }\n}\n",
+        )
+        .file(
+            "system/Handler.cfc",
+            "component extends=\"app.system.Base\" {\n  function index() {\n    return getSetting( \"appName\" );\n  }\n}\n",
+        )
+        .write(
+            "system/Base.cfc",
+            "component {\n  function getSetting( name ) {\n    return 2;\n  }\n}\n",
+        )
+        .edge_throughout("method Handler::index", "calls", "method Base::getSetting")
+}
+
 pub fn cfml_change_a_base_component() -> Case {
     Case::new(Change::EditHeritage, &[Language::Cfml])
         .file(

@@ -19,6 +19,7 @@
 mod alias_binding;
 mod awaited;
 mod c_macro_visibility;
+pub mod cfml_scope;
 mod class_heads;
 pub mod context;
 mod cpp_includers;

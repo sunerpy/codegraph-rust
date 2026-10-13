@@ -257,10 +257,12 @@ pub(crate) fn is_ruby_method_in_scope(
 }
 
 /// Languages whose receivers nothing types, where a unique method name alone
-/// is no evidence (upstream `UNTYPED_RECEIVER_LANGUAGES`; Ruby here, the
-/// others with their items).
+/// is no evidence (upstream `UNTYPED_RECEIVER_LANGUAGES`: Ruby since
+/// W4-RB-01, CFML since W4-CF-01, the others with their items). CFML's
+/// `server.keyExists()` is the struct member function, not the one component
+/// method named `keyExists`.
 pub(crate) fn is_untyped_receiver_language(language: Language) -> bool {
-    language == Language::Ruby
+    matches!(language, Language::Ruby | Language::Cfml)
 }
 
 /// The receivers the untyped-receiver gate never judges (upstream

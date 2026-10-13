@@ -9520,3 +9520,182 @@ mod ruby {
         );
     }
 }
+
+mod cfml {
+    use super::support::{Graph, Project};
+
+    /// The qualified name of what every `calls` edge out of `file` reaches,
+    /// sorted.
+    fn call_targets(graph: &Graph, file: &str) -> Vec<String> {
+        let mut out: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.kind == "calls")
+            .filter(|edge| {
+                graph
+                    .node(&edge.source)
+                    .is_some_and(|node| node.file_path == file)
+            })
+            .filter_map(|edge| graph.node(&edge.target))
+            .map(|node| node.qualified_name.clone())
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// Upstream #2148: a bare call in a component reaches only its own
+    /// methods and those of the components it `extends` (read from source,
+    /// the path matched by its longest suffix), so coldbox's `now()`, the
+    /// built-in, is no date helper's `now`; a call through an untyped
+    /// receiver takes the one method of its name only when the receiver is
+    /// named after its component (`server.keyExists` is the struct member
+    /// function). Upstream's fixture.
+    #[test]
+    fn pr2148_cfml_calls_by_name_alone_keep_the_extends_chain_and_named_receivers() {
+        let project = Project::new()
+            .file(
+                "system/core/DateTimeHelper.cfc",
+                "component {\n\
+                \x20 function now() {\n\
+                \x20   return createObject( \"java\", \"java.time.LocalDateTime\" ).now();\n\
+                \x20 }\n\
+                }\n",
+            )
+            .file(
+                "system/core/InterceptorBuffer.cfc",
+                "component {\n\
+                \x20 function keyExists( required key ) {\n\
+                \x20   return false;\n\
+                \x20 }\n\
+                }\n",
+            )
+            .file(
+                "system/Base.cfc",
+                "component {\n\
+                \x20 function getSetting( required name ) {\n\
+                \x20   return \"\";\n\
+                \x20 }\n\
+                }\n",
+            )
+            .file(
+                "system/models/UserService.cfc",
+                "component {\n\
+                \x20 function list() {\n\
+                \x20   return [];\n\
+                \x20 }\n\
+                }\n",
+            )
+            .file(
+                "system/Handler.cfc",
+                "component extends=\"app.system.Base\" {\n\
+                \x20 function index( event, rc, prc, userService ) {\n\
+                \x20   var stamp = now();\n\
+                \x20   var lucee = server.keyExists( \"lucee\" );\n\
+                \x20   var name = getSetting( \"appName\" );\n\
+                \x20   var users = userService.list();\n\
+                \x20   return stamp;\n\
+                \x20 }\n\
+                }\n",
+            )
+            .index();
+        assert_eq!(
+            call_targets(project.graph(), "system/Handler.cfc"),
+            ["Base::getSetting", "UserService::list"],
+            "{}",
+            project.graph().report()
+        );
+    }
+
+    /// Upstream #2148's receiver relaxations: the receiver's whole name
+    /// spelling its component (`cbsecurity` -> CBSecurity) or a word with a
+    /// trailing number dropped (`executor1` -> Executor) names the owner, so
+    /// the one method of that name is taken.
+    #[test]
+    fn pr2148_a_cfml_receiver_named_after_its_component_takes_its_method() {
+        let project = Project::new()
+            .file(
+                "system/security/CBSecurity.cfc",
+                "component {\n  function secure( event ) {\n    return true;\n  }\n}\n",
+            )
+            .file(
+                "system/Executor.cfc",
+                "component {\n  function run() {\n    return 1;\n  }\n}\n",
+            )
+            .file(
+                "system/Guard.cfc",
+                "component {\n  function guard( cbsecurity, executor1, scheduler ) {\n    cbsecurity.secure( \"x\" );\n    executor1.run();\n    scheduler.run();\n  }\n}\n",
+            )
+            .index();
+        // `scheduler` names neither owner: the one `run` is no guess for it.
+        assert_eq!(
+            call_targets(project.graph(), "system/Guard.cfc"),
+            ["CBSecurity::secure", "Executor::run"],
+            "{}",
+            project.graph().report()
+        );
+    }
+
+    /// Upstream #2148: a dotted `extends` path picks, among the components of
+    /// its last segment's name, the one ending in the longest suffix of the
+    /// path, so `app.system.Base` is `system/Base.cfc`, not `other/Base.cfc`,
+    /// and the bare call reaches only that base's method.
+    #[test]
+    fn pr2148_a_dotted_cfml_extends_takes_the_longest_matching_suffix() {
+        let project = Project::new()
+            .file(
+                "system/Base.cfc",
+                "component {\n  function getSetting( name ) {\n    return 1;\n  }\n}\n",
+            )
+            .file(
+                "other/Base.cfc",
+                "component {\n  function getSetting( name ) {\n    return 2;\n  }\n}\n",
+            )
+            .file(
+                "app/Handler.cfc",
+                "component extends=\"app.system.Base\" {\n  function index() {\n    return getSetting( \"x\" );\n  }\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        let calls: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.kind == "calls")
+            .filter(|edge| {
+                graph
+                    .node(&edge.source)
+                    .is_some_and(|node| node.file_path == "app/Handler.cfc")
+            })
+            .filter_map(|edge| graph.node(&edge.target))
+            .map(|node| format!("{}:{}", node.file_path, node.qualified_name))
+            .collect();
+        assert_eq!(
+            calls,
+            ["system/Base.cfc:Base::getSetting"],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream #2148: a bare call in a `.cfm` template is not judged (a
+    /// ColdBox view runs inside the renderer's scope), so the one project
+    /// function of its name is still taken.
+    #[test]
+    fn pr2148_a_bare_call_in_a_cfml_template_is_not_judged() {
+        let project = Project::new()
+            .file(
+                "system/Helpers.cfc",
+                "component {\n  function formatStamp( value ) {\n    return value;\n  }\n}\n",
+            )
+            .file(
+                "views/main.cfm",
+                "<cfoutput>#formatStamp( now() )#</cfoutput>\n<cfscript>\n  formatStamp( 1 );\n</cfscript>\n",
+            )
+            .index();
+        let targets = call_targets(project.graph(), "views/main.cfm");
+        assert!(
+            targets.contains(&"Helpers::formatStamp".to_string()),
+            "{targets:?}\n{}",
+            project.graph().report()
+        );
+    }
+}

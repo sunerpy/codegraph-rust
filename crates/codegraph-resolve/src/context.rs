@@ -68,6 +68,7 @@ struct Caches {
     csharp_tables: Option<Arc<crate::csharp_types::CsharpTables>>,
     member_tables: Option<Arc<crate::member_types::MemberTables>>,
     ruby_tables: Option<Arc<crate::ruby_scope::RubyTables>>,
+    cfml_tables: Option<Arc<crate::cfml_scope::CfmlTables>>,
 }
 
 /// Bound on memoized existence answers; the memo restarts past it, as upstream.
@@ -102,6 +103,7 @@ impl Caches {
             csharp_tables: None,
             member_tables: None,
             ruby_tables: None,
+            cfml_tables: None,
         }
     }
 }
@@ -147,6 +149,7 @@ impl<'a> StoreResolutionContext<'a> {
         c.csharp_tables = None;
         c.member_tables = None;
         c.ruby_tables = None;
+        c.cfml_tables = None;
     }
 
     fn cached_all_files(&self) -> Arc<Vec<String>> {
@@ -526,6 +529,15 @@ impl ResolutionContext for StoreResolutionContext<'_> {
                 .borrow_mut()
                 .ruby_tables
                 .get_or_insert_with(|| Arc::new(crate::ruby_scope::RubyTables::new())),
+        )
+    }
+
+    fn cfml_tables(&self) -> Arc<crate::cfml_scope::CfmlTables> {
+        Arc::clone(
+            self.caches
+                .borrow_mut()
+                .cfml_tables
+                .get_or_insert_with(|| Arc::new(crate::cfml_scope::CfmlTables::new())),
         )
     }
 

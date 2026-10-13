@@ -565,6 +565,7 @@ fn sync_paths_with_store(
     let csharp_bootstrap = crate::csharp_surfaces::needs_bootstrap(store)?;
     let member_bootstrap = crate::member_surfaces::needs_bootstrap(store)?;
     let ruby_bootstrap = crate::ruby_heads::needs_bootstrap(store)?;
+    let cfml_bootstrap = crate::cfml_heads::needs_bootstrap(store)?;
 
     let paths = paths.into_iter().collect::<Vec<_>>();
     let total = paths.len();
@@ -620,6 +621,7 @@ fn sync_paths_with_store(
         || csharp_bootstrap
         || member_bootstrap
         || ruby_bootstrap
+        || cfml_bootstrap
     {
         note_python_global_readers(
             project_root,
@@ -774,6 +776,21 @@ fn sync_paths_with_store(
             dependent_sites.remove(file);
             dependent_fallbacks.insert(file.clone());
         }
+        // And what a bare CFML call in a component reads of the components
+        // its `extends` chain reaches (W4-CF-01).
+        let cfml = crate::cfml_heads::cfml_refresh(
+            store,
+            project_root,
+            scope.options.max_file_size,
+            &changed_names.cfml,
+            &reindexed,
+            &changed_names.removed_files,
+            cfml_bootstrap,
+        )?;
+        for file in &cfml.files {
+            dependent_sites.remove(file);
+            dependent_fallbacks.insert(file.clone());
+        }
         // What a changed Python import statement re-exports moves for its
         // module's importers without any node of those names changing.
         if !changed_names.python_imports.is_empty() {
@@ -866,6 +883,7 @@ fn sync_paths_with_store(
         csharp.write_rows(store)?;
         members.write_rows(store)?;
         ruby.write_rows(store)?;
+        cfml.write_rows(store)?;
         crate::module_surfaces::finish_bootstrap(store)?;
         crate::cpp_dependents::write_marker(store)?;
         crate::java_heads::write_marker(store)?;
@@ -874,6 +892,7 @@ fn sync_paths_with_store(
         crate::csharp_surfaces::write_marker(store)?;
         crate::member_surfaces::write_marker(store)?;
         crate::ruby_heads::write_marker(store)?;
+        crate::cfml_heads::write_marker(store)?;
     }
 
     // Orphan sweep (#1187, upstream index.ts:645-682): a full-index resolution
@@ -1265,6 +1284,7 @@ fn remove_tracked_file(
         .note(store, relative, &old_nodes, None)?;
     changed_names.members.note(store, relative, None)?;
     changed_names.ruby.note(store, relative, None)?;
+    changed_names.cfml.note(store, relative, None)?;
     delete_unresolved_refs_by_file(store, relative)?;
     store.delete_file_record(relative)?;
     changed_names
@@ -1657,6 +1677,11 @@ fn reextract_into_store(
         relative,
         Some((file.language, source, &result.nodes)),
     )?;
+    changed_names.cfml.note(
+        store,
+        relative,
+        Some((file.language, source, &result.nodes)),
+    )?;
     // No name in another file resolves into a minified script (upstream
     // #2204), and that verdict is read from the script's text: a script that
     // was or is generated can flip it with every node where it was, so all of
@@ -1793,6 +1818,9 @@ struct ChangedNames {
     /// What the changed files held that a bare Ruby call in other files
     /// reads: class and module heads and mixins (W4-RB-01).
     ruby: crate::ruby_heads::RubyChanges,
+    /// What the changed files held that a bare CFML call in other files
+    /// reads: component classes and `extends` (W4-CF-01).
+    cfml: crate::cfml_heads::CfmlChanges,
 }
 
 /// What a changed Python file held before the change. A module global's
@@ -1833,6 +1861,7 @@ impl ChangedNames {
             crate::csharp_surfaces::withdraw_marker(store)?;
             crate::member_surfaces::withdraw_marker(store)?;
             crate::ruby_heads::withdraw_marker(store)?;
+            crate::cfml_heads::withdraw_marker(store)?;
             self.surface_dirty = true;
         }
         Ok(())
@@ -3251,6 +3280,189 @@ pub(crate) mod tests {
         // The edited file's row is its new one.
         rebuilt.retain(|(key, _)| key != "ruby_heads:lib/spare.rb");
         wanted.retain(|(key, _)| key != "ruby_heads:lib/spare.rb");
+        assert_eq!(rebuilt, wanted);
+        assert_eq!(edge_projection(&db), expected);
+    }
+
+    fn cfml_marker(db: &Path) -> Option<String> {
+        Store::open(db)
+            .unwrap()
+            .get_project_metadata(crate::cfml_heads::VERSION_KEY)
+            .unwrap()
+    }
+
+    fn cfml_rows(db: &Path) -> Vec<(String, String)> {
+        Store::open(db)
+            .unwrap()
+            .project_metadata_with_prefix(codegraph_resolve::cfml_scope::HEAD_ROW_KEY_PREFIX)
+            .unwrap()
+    }
+
+    const CFML_FIRST: (&str, &str) = (
+        "system/First.cfc",
+        "component {\n  function getSetting( name ) {\n    return 1;\n  }\n}\n",
+    );
+    const CFML_SECOND: (&str, &str) = (
+        "system/Second.cfc",
+        "component {\n  function getSetting( name ) {\n    return 2;\n  }\n}\n",
+    );
+    const CFML_MIDDLE_FIRST: (&str, &str) =
+        ("system/Middle.cfc", "component extends=\"First\" {\n}\n");
+    const CFML_MIDDLE_SECOND: (&str, &str) =
+        ("system/Middle.cfc", "component extends=\"Second\" {\n}\n");
+    const CFML_HANDLER: (&str, &str) = (
+        "system/Handler.cfc",
+        "component extends=\"Middle\" {\n  function index() {\n    return getSetting( \"appName\" );\n  }\n}\n",
+    );
+    const CFML_SPARE: (&str, &str) = ("system/Spare.cfc", "component {\n}\n");
+    const CFML_SPARE_EDITED: (&str, &str) = (
+        "system/Spare.cfc",
+        "component {\n  function count() {\n    return 1;\n  }\n}\n",
+    );
+
+    fn cfml_index_reaches(db: &Path, file: &str) -> bool {
+        edge_projection(db)
+            .iter()
+            .any(|edge| edge.contains(&format!("Handler::index -[calls]-> {file}")))
+    }
+
+    /// W4-CF-01: a sync failing after its mutations leaves the CFML marker
+    /// away, so the next sync, with nothing changed or with an unrelated
+    /// change, re-resolves every `.cfc` file and rebuilds the rows: the
+    /// handler's bare call through the chain its middle component extends
+    /// ends where a fresh index puts it.
+    #[test]
+    fn a_cfml_sync_failing_after_its_mutations_leaves_the_next_one_to_reconcile() {
+        let version = Some(crate::cfml_heads::VERSION.to_string());
+        let dir = TestDir::new("cfml-heads-fail");
+        let db = default_db_path(dir.path()).unwrap();
+        let initial = [
+            CFML_FIRST,
+            CFML_SECOND,
+            CFML_MIDDLE_FIRST,
+            CFML_HANDLER,
+            CFML_SPARE,
+        ];
+        write_files(dir.path(), &initial);
+        sync_changed_paths(dir.path(), &db, initial.iter().map(|(path, _)| *path)).unwrap();
+        assert_eq!(cfml_marker(&db), version);
+        assert!(
+            cfml_index_reaches(&db, "system/First.cfc"),
+            "{:#?}",
+            edge_projection(&db)
+        );
+
+        let fail_once = |paths: &[&str]| {
+            FAIL_BEFORE_RESOLUTION.with(|fail| fail.set(true));
+            let failed = sync_changed_paths(dir.path(), &db, paths.iter().copied());
+            FAIL_BEFORE_RESOLUTION.with(|fail| fail.set(false));
+            assert!(failed.is_err(), "the injected failure must stop the sync");
+            assert_eq!(
+                cfml_marker(&db),
+                None,
+                "a failed sync leaves the marker away"
+            );
+        };
+
+        write_files(dir.path(), &[CFML_MIDDLE_SECOND]);
+        fail_once(&["system/Middle.cfc"]);
+        sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
+        assert_eq!(cfml_marker(&db), version);
+        let fresh = [
+            CFML_FIRST,
+            CFML_SECOND,
+            CFML_MIDDLE_SECOND,
+            CFML_HANDLER,
+            CFML_SPARE,
+        ];
+        assert_eq!(
+            edge_projection(&db),
+            fresh_edges("cfml-heads-fail-second", &fresh)
+        );
+        assert!(
+            cfml_index_reaches(&db, "system/Second.cfc"),
+            "{:#?}",
+            edge_projection(&db)
+        );
+
+        write_files(dir.path(), &[CFML_MIDDLE_FIRST]);
+        fail_once(&["system/Middle.cfc"]);
+        write_files(dir.path(), &[CFML_SPARE_EDITED]);
+        sync_changed_paths(dir.path(), &db, ["system/Spare.cfc"]).unwrap();
+        assert_eq!(cfml_marker(&db), version);
+        let fresh = [
+            CFML_FIRST,
+            CFML_SECOND,
+            CFML_MIDDLE_FIRST,
+            CFML_HANDLER,
+            CFML_SPARE_EDITED,
+        ];
+        assert_eq!(
+            edge_projection(&db),
+            fresh_edges("cfml-heads-fail-first", &fresh)
+        );
+        assert!(
+            cfml_index_reaches(&db, "system/First.cfc"),
+            "{:#?}",
+            edge_projection(&db)
+        );
+    }
+
+    /// W4-CF-01: an index without the CFML marker or its rows (built before
+    /// them) has every `.cfc` file re-resolved and every row rebuilt by its
+    /// next sync: the bare call an older sync left without its edge comes
+    /// back.
+    #[test]
+    fn an_index_without_the_cfml_marker_rebuilds_the_component_rows() {
+        let version = Some(crate::cfml_heads::VERSION.to_string());
+        let dir = TestDir::new("cfml-heads-bootstrap");
+        let db = default_db_path(dir.path()).unwrap();
+        let initial = [
+            CFML_FIRST,
+            CFML_SECOND,
+            CFML_MIDDLE_FIRST,
+            CFML_HANDLER,
+            CFML_SPARE,
+        ];
+        write_files(dir.path(), &initial);
+        sync_changed_paths(dir.path(), &db, initial.iter().map(|(path, _)| *path)).unwrap();
+        assert_eq!(cfml_marker(&db), version);
+        let rows = cfml_rows(&db);
+        assert!(
+            rows.iter()
+                .any(|(key, _)| key == "cfml_heads:system/Middle.cfc"),
+            "{rows:#?}"
+        );
+        let expected = edge_projection(&db);
+        {
+            let store = Store::open(&db).unwrap();
+            let dropped = store
+                .connection()
+                .execute(
+                    "DELETE FROM edges WHERE kind = 'calls' AND target = (SELECT id FROM nodes \
+                     WHERE qualified_name = 'First::getSetting')",
+                    [],
+                )
+                .unwrap();
+            assert_eq!(dropped, 1, "the call edge an older sync lost");
+            store
+                .delete_project_metadata_with_prefix(
+                    codegraph_resolve::cfml_scope::HEAD_ROW_KEY_PREFIX,
+                )
+                .unwrap();
+            store
+                .delete_project_metadata(crate::cfml_heads::VERSION_KEY)
+                .unwrap();
+        }
+        assert_ne!(edge_projection(&db), expected);
+        write_files(dir.path(), &[CFML_SPARE_EDITED]);
+        sync_changed_paths(dir.path(), &db, ["system/Spare.cfc"]).unwrap();
+        assert_eq!(cfml_marker(&db), version);
+        let mut rebuilt = cfml_rows(&db);
+        let mut wanted = rows;
+        // The edited file's row is its new one.
+        rebuilt.retain(|(key, _)| key != "cfml_heads:system/Spare.cfc");
+        wanted.retain(|(key, _)| key != "cfml_heads:system/Spare.cfc");
         assert_eq!(rebuilt, wanted);
         assert_eq!(edge_projection(&db), expected);
     }

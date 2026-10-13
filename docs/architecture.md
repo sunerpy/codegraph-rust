@@ -394,7 +394,13 @@ whole, the unchanged files declaring a class or module the changed qualified
 names reach (closing over every declaration writing a constant whose last
 segment is a reached name's), since a bare call in a class reads the class's
 ancestry from its declarations' source; the `ruby_heads_version` marker is
-withdrawn and restored with the others; an
+withdrawn and restored with the others; a `.cfc` file whose component row moved
+(it came or went, declares other classes, or extends something else)
+re-resolves, whole, the unchanged components whose `extends` names a class the
+changed files declare (closing over every component extending a reached name),
+since a bare call in a component reads its `extends` chain from the components'
+text; the `cfml_heads_version` marker is withdrawn and restored with the
+others; an
 import names a file, a folder or a namespace rather than a symbol, so the parked
 imports an added file or a changed file's namespace can satisfy (by the file's
 name and stem, its folder's, or the namespace's whole name) send their files

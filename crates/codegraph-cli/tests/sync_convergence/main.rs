@@ -361,6 +361,8 @@ fn run_case(name: &str, case: &Case) {
     let member_rows = support::project_metadata_with_prefix(&fresh.db(), "member_surface");
     // And the Ruby head rows and their marker (W4-RB-01).
     let ruby_rows = support::project_metadata_with_prefix(&fresh.db(), "ruby_heads");
+    // And the CFML component rows and their marker (W4-CF-01).
+    let cfml_rows = support::project_metadata_with_prefix(&fresh.db(), "cfml_heads");
     for (driver, project) in [("cli", &cli), ("watch", &watch)] {
         let rows = support::project_metadata_with_prefix(&project.db(), "js_module_surface");
         if rows != surface_rows {
@@ -423,6 +425,13 @@ fn run_case(name: &str, case: &Case) {
             divergent.push(format!(
                 "=== {driver} driver: the Ruby head rows differ from a fresh index\n\
                  synced: {rows:#?}\nfresh: {ruby_rows:#?}"
+            ));
+        }
+        let rows = support::project_metadata_with_prefix(&project.db(), "cfml_heads");
+        if rows != cfml_rows {
+            divergent.push(format!(
+                "=== {driver} driver: the CFML component rows differ from a fresh index\n\
+                 synced: {rows:#?}\nfresh: {cfml_rows:#?}"
             ));
         }
     }
@@ -934,6 +943,12 @@ matrix! {
     ruby_ancestor_method_body_edit,
     solidity_change_a_base_contract,
     cfml_change_a_base_component,
+    cfml_bare_call_follows_an_extends_change_in_another_file,
+    cfml_bare_extends_takes_a_component_that_appears_beside_it,
+    cfml_bare_call_ignores_an_added_built_in_namesake,
+    cfml_untyped_receiver_ignores_a_lone_added_method,
+    cfml_receiver_named_after_an_added_component,
+    cfml_inherited_method_body_edit,
     python_add_a_same_named_competitor,
     arkts_add_a_same_named_competitor,
     kotlin_add_a_same_named_competitor,

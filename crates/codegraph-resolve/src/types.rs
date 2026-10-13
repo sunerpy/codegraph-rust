@@ -573,6 +573,11 @@ pub trait ResolutionContext {
     fn ruby_tables(&self) -> Arc<crate::ruby_scope::RubyTables> {
         Arc::new(crate::ruby_scope::RubyTables::new())
     }
+
+    /// The CFML `extends` chains of one resolution pass (W4-CF-01).
+    fn cfml_tables(&self) -> Arc<crate::cfml_scope::CfmlTables> {
+        Arc::new(crate::cfml_scope::CfmlTables::new())
+    }
 }
 
 /// Go module info parsed from `go.mod`.
