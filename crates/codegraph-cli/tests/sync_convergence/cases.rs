@@ -4944,6 +4944,202 @@ pub fn csharp_bare_name_ignores_an_added_property() -> Case {
         )
 }
 
+const CS_JSON_WRITER: &str = "namespace App.Json;\n\npublic class JsonWriter\n{\n    public void WriteValue(string value) { }\n}\n";
+const CS_OTHER_WRITER: &str = "namespace App.Json;\n\npublic class OtherWriter\n{\n    public void WriteValue(string value) { }\n}\n";
+const CS_TRACE_WRITER: &str = "namespace App.Json;\n\npublic class TraceWriter : WriterBase\n{\n    public void Trace(string value)\n    {\n        Writer.WriteValue(value);\n    }\n}\n";
+
+/// Upstream #2171: a call through a member a class inherits is a call on
+/// the type the base declares it with, so the base changing that type in
+/// another file moves an unchanged subclass's call.
+pub fn csharp_inherited_member_type_changes_in_another_file() -> Case {
+    Case::new(Change::EditHeritage, &[Language::CSharp])
+        .file("src/Json/JsonWriter.cs", CS_JSON_WRITER)
+        .file("src/Json/OtherWriter.cs", CS_OTHER_WRITER)
+        .file(
+            "src/Json/WriterBase.cs",
+            "namespace App.Json;\n\npublic abstract class WriterBase\n{\n    protected JsonWriter Writer { get; set; }\n}\n",
+        )
+        .file("src/Json/TraceWriter.cs", CS_TRACE_WRITER)
+        .write(
+            "src/Json/WriterBase.cs",
+            "namespace App.Json;\n\npublic abstract class WriterBase\n{\n    protected OtherWriter Writer { get; set; }\n}\n",
+        )
+        .edge_before(
+            "method App.Json::TraceWriter::Trace",
+            "calls",
+            "method App.Json::JsonWriter::WriteValue",
+        )
+        .edge_after(
+            "method App.Json::TraceWriter::Trace",
+            "calls",
+            "method App.Json::OtherWriter::WriteValue",
+        )
+}
+
+/// Upstream #2171: a method body edit in the base changes no member line,
+/// so no unchanged file re-resolves and the subclass's typed call stays.
+pub fn csharp_inherited_member_body_edit() -> Case {
+    Case::new(Change::BodyEdit, &[Language::CSharp])
+        .file("src/Json/JsonWriter.cs", CS_JSON_WRITER)
+        .file(
+            "src/Json/WriterBase.cs",
+            "namespace App.Json;\n\npublic abstract class WriterBase\n{\n    protected JsonWriter Writer { get; set; }\n\n    protected int Depth()\n    {\n        return 1;\n    }\n}\n",
+        )
+        .file("src/Json/TraceWriter.cs", CS_TRACE_WRITER)
+        .write(
+            "src/Json/WriterBase.cs",
+            "namespace App.Json;\n\npublic abstract class WriterBase\n{\n    protected JsonWriter Writer { get; set; }\n\n    protected int Depth()\n    {\n        return 2;\n    }\n}\n",
+        )
+        .edge_throughout(
+            "method App.Json::TraceWriter::Trace",
+            "calls",
+            "method App.Json::JsonWriter::WriteValue",
+        )
+}
+
+/// Upstream #2171: a member typed by a base's type parameter is the type
+/// argument a class between it and the caller gives, so that middle class
+/// changing its argument in another file moves an unchanged leaf's call.
+pub fn csharp_middle_type_argument_changes_in_another_file() -> Case {
+    Case::new(Change::EditHeritage, &[Language::CSharp])
+        .file(
+            "src/Tests/IntegrationTest.cs",
+            "namespace App.Tests;\n\npublic abstract class IntegrationTest<TFixture> where TFixture : new()\n{\n    protected TFixture Fixture { get; private set; }\n}\n",
+        )
+        .file(
+            "src/Tests/FirstInit.cs",
+            "namespace App.Tests;\n\npublic class FirstInit\n{\n    public object CreateContext() => null;\n}\n",
+        )
+        .file(
+            "src/Tests/SecondInit.cs",
+            "namespace App.Tests;\n\npublic class SecondInit\n{\n    public object CreateContext() => null;\n}\n",
+        )
+        .file(
+            "src/Tests/Middle.cs",
+            "namespace App.Tests;\n\npublic abstract class Middle : IntegrationTest<FirstInit>\n{\n}\n",
+        )
+        .file(
+            "src/Tests/Leaf.cs",
+            "namespace App.Tests;\n\npublic class Leaf : Middle\n{\n    public object Runs()\n    {\n        return Fixture.CreateContext();\n    }\n}\n",
+        )
+        .write(
+            "src/Tests/Middle.cs",
+            "namespace App.Tests;\n\npublic abstract class Middle : IntegrationTest<SecondInit>\n{\n}\n",
+        )
+        .edge_before(
+            "method App.Tests::Leaf::Runs",
+            "calls",
+            "method App.Tests::FirstInit::CreateContext",
+        )
+        .edge_after(
+            "method App.Tests::Leaf::Runs",
+            "calls",
+            "method App.Tests::SecondInit::CreateContext",
+        )
+}
+
+/// Upstream #2171, Java: a member typed by a type parameter the subclass
+/// gives no argument for is the parameter's bound, so the base changing the
+/// bound in another file moves an unchanged subclass's call.
+pub fn java_type_parameter_bound_changes_in_another_file() -> Case {
+    Case::new(Change::EditHeritage, &[Language::Java])
+        .file(
+            "src/main/java/app/IntegrationTest.java",
+            "package app;\n\npublic abstract class IntegrationTest<T extends FirstInit> {\n    protected T fixture;\n}\n",
+        )
+        .file(
+            "src/main/java/app/FirstInit.java",
+            "package app;\n\npublic class FirstInit {\n    public Object createContext() { return null; }\n}\n",
+        )
+        .file(
+            "src/main/java/app/SecondInit.java",
+            "package app;\n\npublic class SecondInit {\n    public Object createContext() { return null; }\n}\n",
+        )
+        .file(
+            "src/main/java/app/Leaf.java",
+            "package app;\n\npublic class Leaf extends IntegrationTest {\n    public Object runs() {\n        return fixture.createContext();\n    }\n}\n",
+        )
+        .write(
+            "src/main/java/app/IntegrationTest.java",
+            "package app;\n\npublic abstract class IntegrationTest<T extends SecondInit> {\n    protected T fixture;\n}\n",
+        )
+        .edge_before("method app::Leaf::runs", "calls", "method app::FirstInit::createContext")
+        .edge_after("method app::Leaf::runs", "calls", "method app::SecondInit::createContext")
+}
+
+/// Upstream #2171, Java: a field the base declares types the subclass's
+/// call through it, so the base changing the field's type in another file
+/// moves the unchanged subclass's call.
+pub fn java_inherited_field_type_changes_in_another_file() -> Case {
+    Case::new(Change::EditHeritage, &[Language::Java])
+        .file(
+            "src/main/java/app/JsonWriter.java",
+            "package app;\n\npublic class JsonWriter {\n    public void writeValue(String value) { }\n}\n",
+        )
+        .file(
+            "src/main/java/app/OtherWriter.java",
+            "package app;\n\npublic class OtherWriter {\n    public void writeValue(String value) { }\n}\n",
+        )
+        .file(
+            "src/main/java/app/WriterBase.java",
+            "package app;\n\npublic abstract class WriterBase {\n    protected JsonWriter writer;\n}\n",
+        )
+        .file(
+            "src/main/java/app/TraceWriter.java",
+            "package app;\n\npublic class TraceWriter extends WriterBase {\n    public void trace(String value) {\n        writer.writeValue(value);\n    }\n}\n",
+        )
+        .write(
+            "src/main/java/app/WriterBase.java",
+            "package app;\n\npublic abstract class WriterBase {\n    protected OtherWriter writer;\n}\n",
+        )
+        .edge_before(
+            "method app::TraceWriter::trace",
+            "calls",
+            "method app::JsonWriter::writeValue",
+        )
+        .edge_after(
+            "method app::TraceWriter::trace",
+            "calls",
+            "method app::OtherWriter::writeValue",
+        )
+}
+
+/// Upstream #2171, Kotlin: a property the base declares types the
+/// subclass's call through it, across files.
+pub fn kotlin_inherited_property_type_changes_in_another_file() -> Case {
+    Case::new(Change::EditHeritage, &[Language::Kotlin])
+        .file(
+            "src/main/kotlin/app/JsonWriter.kt",
+            "package app\n\nclass JsonWriter {\n    fun writeValue(value: String) {}\n}\n",
+        )
+        .file(
+            "src/main/kotlin/app/OtherWriter.kt",
+            "package app\n\nclass OtherWriter {\n    fun writeValue(value: String) {}\n}\n",
+        )
+        .file(
+            "src/main/kotlin/app/WriterBase.kt",
+            "package app\n\nopen class WriterBase {\n    protected val writer: JsonWriter = JsonWriter()\n}\n",
+        )
+        .file(
+            "src/main/kotlin/app/TraceWriter.kt",
+            "package app\n\nclass TraceWriter : WriterBase() {\n    fun trace(value: String) {\n        writer.writeValue(value)\n    }\n}\n",
+        )
+        .write(
+            "src/main/kotlin/app/WriterBase.kt",
+            "package app\n\nopen class WriterBase {\n    protected val writer: OtherWriter = OtherWriter()\n}\n",
+        )
+        .edge_before(
+            "method app::TraceWriter::trace",
+            "calls",
+            "method app::JsonWriter::writeValue",
+        )
+        .edge_after(
+            "method app::TraceWriter::trace",
+            "calls",
+            "method app::OtherWriter::writeValue",
+        )
+}
+
 /// Upstream #2121: a type position names a type, so a property of the same
 /// name appearing elsewhere is no competitor.
 pub fn csharp_type_position_ignores_an_added_property() -> Case {

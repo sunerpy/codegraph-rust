@@ -6,6 +6,7 @@ pub mod git_pending;
 pub mod java_heads;
 pub mod kotlin_surfaces;
 mod link_state;
+pub mod member_surfaces;
 mod migrate;
 pub mod module_surfaces;
 mod policy;

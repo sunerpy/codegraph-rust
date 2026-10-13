@@ -381,7 +381,14 @@ reached from a type deriving from its owner, and a bare member from the types
 around it and their bases, through heads read by name; and a C# type
 that keeps its node while its owner turns from a type into a namespace of the
 same name, or back, has its name touched for the name lane; the
-`csharp_surface_version` marker is withdrawn and restored with the others; an
+`csharp_surface_version` marker is withdrawn and restored with the others; a
+C#, Java or Kotlin file whose member surface row moved (a class's head, type
+parameters or member-level lines changed, by a digest, or a class came or went)
+re-resolves, whole, the unchanged files declaring a class of a name the changed
+classes reach (closing over every head naming a reached name), since a call
+through an inherited member reads its type from the classes it inherits by
+name; a method body edit changes no row; the `member_surface_version` marker is
+withdrawn and restored with the others; an
 import names a file, a folder or a namespace rather than a symbol, so the parked
 imports an added file or a changed file's namespace can satisfy (by the file's
 name and stem, its folder's, or the namespace's whole name) send their files

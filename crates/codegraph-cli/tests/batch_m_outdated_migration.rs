@@ -762,6 +762,80 @@ fn outdated_migration_writes_the_csharp_surface_rows_of_index_force() {
     );
 }
 
+/// W4-CS-03: a migration writes the member surface rows and their marker a
+/// fresh `index --force` writes.
+#[test]
+fn outdated_migration_writes_the_member_surface_rows_of_index_force() {
+    let dir = TestDir::new("outdated-member-surfaces");
+    let project = dir.path().join("mini");
+    for (path, contents) in [
+        (
+            "src/Json/WriterBase.cs",
+            "namespace App.Json;\n\npublic abstract class WriterBase\n{\n    protected JsonWriter Writer { get; set; }\n}\n",
+        ),
+        (
+            "src/main/java/app/WriterBase.java",
+            "package app;\n\npublic abstract class WriterBase {\n    protected JsonWriter writer;\n}\n",
+        ),
+        (
+            "src/main/kotlin/app/WriterBase.kt",
+            "package app\n\nopen class WriterBase {\n    protected val writer: JsonWriter = JsonWriter()\n}\n",
+        ),
+        ("src/notes.ts", "export const notes = 1;\n"),
+    ] {
+        let full = project.join(path);
+        fs::create_dir_all(full.parent().unwrap()).expect("create the source directory");
+        fs::write(full, contents).expect("write a source file");
+    }
+    let run = cli(&["init", project.to_str().unwrap()]);
+    assert!(
+        run.ok,
+        "setup: `codegraph init` must succeed (stdout={}, stderr={})",
+        run.stdout, run.stderr
+    );
+    let paths = IndexPaths::resolve(&project, None).expect("resolve v2 paths");
+    stage_state_slot(
+        &paths,
+        100,
+        CURRENT_STORAGE_PROTOCOL,
+        CURRENT_EXTRACTION_VERSION - 1,
+        "current",
+    );
+    let run = cli(&["sync", project.to_str().unwrap()]);
+    assert!(
+        run.ok,
+        "sync must migrate an Outdated namespace: stdout={}, stderr={}",
+        run.stdout, run.stderr
+    );
+    let (_scratch, peer) = fresh_force_peer("outdated-member-surfaces", &project);
+    let surface_rows = |paths: &IndexPaths| {
+        Store::open_for_read(paths, deadline(), || false)
+            .expect("readable namespace")
+            .project_metadata_with_prefix("member_surface")
+            .expect("member surface rows")
+    };
+    let migrated = surface_rows(&paths);
+    // No row for the TypeScript file: only C#, Java and Kotlin have one.
+    assert_eq!(
+        migrated
+            .iter()
+            .map(|(key, _)| key.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "member_surface:src/Json/WriterBase.cs",
+            "member_surface:src/main/java/app/WriterBase.java",
+            "member_surface:src/main/kotlin/app/WriterBase.kt",
+            "member_surface_version",
+        ],
+        "a migration writes the surface rows and their marker: {migrated:?}"
+    );
+    assert_eq!(
+        migrated,
+        surface_rows(&IndexPaths::resolve(&peer, None).expect("resolve peer v2 paths")),
+        "a forced migration must write the member surface rows of `index --force`"
+    );
+}
+
 /// Migration is a from-source rebuild, so a tracked file that no longer exists
 /// on disk disappears from the migrated index and the result still equals a
 /// fresh `index --force` over the surviving tree.

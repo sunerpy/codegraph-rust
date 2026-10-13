@@ -563,6 +563,11 @@ pub trait ResolutionContext {
     fn csharp_tables(&self) -> Arc<crate::csharp_types::CsharpTables> {
         Arc::new(crate::csharp_types::CsharpTables::new())
     }
+
+    /// The member-type walk's memos of one resolution pass (W4-CS-03).
+    fn member_tables(&self) -> Arc<crate::member_types::MemberTables> {
+        Arc::new(crate::member_types::MemberTables::new())
+    }
 }
 
 /// Go module info parsed from `go.mod`.

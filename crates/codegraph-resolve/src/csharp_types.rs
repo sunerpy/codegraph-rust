@@ -188,6 +188,8 @@ pub struct CsharpTables {
     /// The types the static usings of the project files from a directory up
     /// and every `global using static` bring in (#2151), by directory.
     project_static_usings: Mutex<HashMap<String, Arc<HashSet<String>>>>,
+    /// The types a file's `using Name = …;` aliases name (#2171), by file.
+    aliases: Mutex<HashMap<String, Arc<HashMap<String, String>>>>,
 }
 
 impl CsharpTables {
@@ -281,6 +283,56 @@ pub fn project_file_static_usings(text: &str) -> Vec<String> {
         .captures_iter(text)
         .map(|caps| caps[1].to_string())
         .collect()
+}
+
+/// The `using Name = Some.Namespace.Type;` (or `global using`) aliases of
+/// `text` and the simple name of the type each names, as upstream #2171's
+/// `^\s*(?:global\s+)?using\s+([A-Za-z_]\w*)\s*=\s*(?:global::)?([\w.]+)\s*(?:<[^;>]*>)?\s*;`
+/// reads them.
+pub fn using_alias_types(text: &str) -> Vec<(String, String)> {
+    static ALIAS: OnceLock<Regex> = OnceLock::new();
+    ALIAS
+        .get_or_init(|| {
+            js_regex(
+                r"(?m)^\s*(?:global\s+)?using\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?:global::)?([A-Za-z0-9_.]+)\s*(?:<[^;>]*>)?\s*;",
+            )
+        })
+        .captures_iter(text)
+        .map(|caps| (caps[1].to_string(), last_segment(&caps[2]).to_string()))
+        .collect()
+}
+
+/// The type a C# file's `using` alias names `name` as, by its simple name
+/// (upstream #2171 `csharpUsingAlias`), read once per file and pass.
+pub(crate) fn csharp_using_alias(
+    name: &str,
+    reference: &RefView,
+    context: &dyn ResolutionContext,
+) -> Option<String> {
+    if !is_simple_identifier(name) {
+        return None;
+    }
+    let tables = context.csharp_tables();
+    let cached = tables
+        .aliases
+        .lock()
+        .ok()
+        .and_then(|memo| memo.get(&reference.file_path).cloned());
+    let aliases = match cached {
+        Some(hit) => hit,
+        None => {
+            let aliases: HashMap<String, String> = context
+                .source_facts(&reference.file_path)
+                .map(|facts| using_alias_types(facts.source()).into_iter().collect())
+                .unwrap_or_default();
+            let aliases = Arc::new(aliases);
+            if let Ok(mut memo) = tables.aliases.lock() {
+                memo.insert(reference.file_path.clone(), Arc::clone(&aliases));
+            }
+            aliases
+        }
+    };
+    aliases.get(name).cloned()
 }
 
 /// The last `.` segment of a dotted name (`split('.').pop()`).

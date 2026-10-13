@@ -357,6 +357,8 @@ fn run_case(name: &str, case: &Case) {
     let scala_rows = support::project_metadata_with_prefix(&fresh.db(), "scala_surface");
     // And the C# surface rows and their marker (W4-CS-01).
     let csharp_rows = support::project_metadata_with_prefix(&fresh.db(), "csharp_surface");
+    // And the member surface rows and their marker (W4-CS-03).
+    let member_rows = support::project_metadata_with_prefix(&fresh.db(), "member_surface");
     for (driver, project) in [("cli", &cli), ("watch", &watch)] {
         let rows = support::project_metadata_with_prefix(&project.db(), "js_module_surface");
         if rows != surface_rows {
@@ -405,6 +407,13 @@ fn run_case(name: &str, case: &Case) {
             divergent.push(format!(
                 "=== {driver} driver: the C# surface rows differ from a fresh index\n\
                  synced: {rows:#?}\nfresh: {csharp_rows:#?}"
+            ));
+        }
+        let rows = support::project_metadata_with_prefix(&project.db(), "member_surface");
+        if rows != member_rows {
+            divergent.push(format!(
+                "=== {driver} driver: the member surface rows differ from a fresh index\n\
+                 synced: {rows:#?}\nfresh: {member_rows:#?}"
             ));
         }
     }
@@ -897,6 +906,12 @@ matrix! {
     #[ignore = "W5-06: a .csproj or .props change does not re-resolve the project's C# files"]
     csharp_csproj_static_using_appears,
     csharp_bare_name_ignores_an_added_property,
+    csharp_inherited_member_type_changes_in_another_file,
+    csharp_inherited_member_body_edit,
+    java_inherited_field_type_changes_in_another_file,
+    kotlin_inherited_property_type_changes_in_another_file,
+    csharp_middle_type_argument_changes_in_another_file,
+    java_type_parameter_bound_changes_in_another_file,
     solidity_change_a_base_contract,
     cfml_change_a_base_component,
     python_add_a_same_named_competitor,

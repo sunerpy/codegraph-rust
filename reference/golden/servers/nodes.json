@@ -19,7 +19,7 @@
     "start_column": 0,
     "start_line": 8,
     "type_parameters": null,
-    "visibility": "private"
+    "visibility": "internal"
   },
   {
     "decorators": null,

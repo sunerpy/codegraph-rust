@@ -262,6 +262,17 @@ under `csharp_surface_version` (2); a sync that finds it missing or at another
 version re-resolves every C# file and rebuilds the rows. Neither is a canonical
 surface.
 
+Member surface rows record what a C#, Java or Kotlin call through a declared
+member reads of a file's classes: `member_surface:<path>` holds the JSON
+`{"classes": [{"name", "qualified_name", "supers", "digest"}]}`, one entry per
+class, struct, interface and enum in node order, with the supertypes its head
+names and a digest of its member-level lines, its head (nine lines, cut at the
+first `{`) and the type parameters it declares. A file with no such declaration
+has no row. They are written, withdrawn and checked like the head rows under
+`member_surface_version` (1); a sync that finds it missing or at another
+version re-resolves every C#, Java and Kotlin file and rebuilds the rows.
+Neither is a canonical surface.
+
 ## FTS5
 
 `nodes_fts` is an external-content FTS5 table over `nodes`:

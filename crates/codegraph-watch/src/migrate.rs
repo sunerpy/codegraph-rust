@@ -93,6 +93,7 @@ pub(crate) fn migrate_project(
     let mut kotlin_rows = Vec::new();
     let mut scala_rows = Vec::new();
     let mut csharp_rows = Vec::new();
+    let mut member_rows = Vec::new();
     let mut edges: Vec<Edge> = Vec::new();
     let mut refs: Vec<UnresolvedRef> = Vec::new();
     let mut outcome = SyncOutcome {
@@ -154,6 +155,9 @@ pub(crate) fn migrate_project(
         if let Some(row) = crate::csharp_surfaces::row_of(file.language, &source, &result.nodes) {
             csharp_rows.push((relative.clone(), row));
         }
+        if let Some(row) = crate::member_surfaces::row_of(file.language, &source, &result.nodes) {
+            member_rows.push((relative.clone(), row));
+        }
         pending_nodes.append(&mut result.nodes);
         if pending_nodes.len() >= NODE_FLUSH_ROWS {
             rebuild.store_mut().upsert_nodes(&pending_nodes)?;
@@ -189,11 +193,14 @@ pub(crate) fn migrate_project(
     drop(scala_rows);
     crate::csharp_surfaces::write_index_rows(rebuild.store(), &mut csharp_rows)?;
     drop(csharp_rows);
+    crate::member_surfaces::write_index_rows(rebuild.store(), &mut member_rows)?;
+    drop(member_rows);
     crate::cpp_dependents::write_marker(rebuild.store())?;
     crate::java_heads::write_marker(rebuild.store())?;
     crate::kotlin_surfaces::write_marker(rebuild.store())?;
     crate::scala_surfaces::write_marker(rebuild.store())?;
     crate::csharp_surfaces::write_marker(rebuild.store())?;
+    crate::member_surfaces::write_marker(rebuild.store())?;
 
     // ALL nodes are persisted before ANY edge, because `insert_edges` drops edges
     // whose endpoints are absent. The WAL valve folds the log back during the

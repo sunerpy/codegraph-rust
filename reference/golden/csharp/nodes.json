@@ -657,7 +657,7 @@
     "start_column": 8,
     "start_line": 10,
     "type_parameters": null,
-    "visibility": "private"
+    "visibility": "public"
   },
   {
     "decorators": null,

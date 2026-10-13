@@ -66,6 +66,7 @@ struct Caches {
     kotlin_tables: Option<Arc<crate::kotlin_scope::KotlinTables>>,
     scala_tables: Option<Arc<crate::scala_scope::ScalaTables>>,
     csharp_tables: Option<Arc<crate::csharp_types::CsharpTables>>,
+    member_tables: Option<Arc<crate::member_types::MemberTables>>,
 }
 
 /// Bound on memoized existence answers; the memo restarts past it, as upstream.
@@ -98,6 +99,7 @@ impl Caches {
             kotlin_tables: None,
             scala_tables: None,
             csharp_tables: None,
+            member_tables: None,
         }
     }
 }
@@ -141,6 +143,7 @@ impl<'a> StoreResolutionContext<'a> {
         c.kotlin_tables = None;
         c.scala_tables = None;
         c.csharp_tables = None;
+        c.member_tables = None;
     }
 
     fn cached_all_files(&self) -> Arc<Vec<String>> {
@@ -502,6 +505,15 @@ impl ResolutionContext for StoreResolutionContext<'_> {
                 .borrow_mut()
                 .csharp_tables
                 .get_or_insert_with(|| Arc::new(crate::csharp_types::CsharpTables::new())),
+        )
+    }
+
+    fn member_tables(&self) -> Arc<crate::member_types::MemberTables> {
+        Arc::clone(
+            self.caches
+                .borrow_mut()
+                .member_tables
+                .get_or_insert_with(|| Arc::new(crate::member_types::MemberTables::new())),
         )
     }
 

@@ -232,6 +232,51 @@ fn csharp_extension_choice(
     current: &str,
     arguments: &[String],
 ) -> Option<String> {
+    let chosen = csharp_extension_chosen(set, current, arguments)?;
+    match chosen.as_slice() {
+        [] => None,
+        [id] => Some(id.clone()),
+        _ => chosen
+            .iter()
+            .any(|id| id == current)
+            .then(|| current.to_string()),
+    }
+}
+
+/// The one of `candidates` (C# extension overloads of one type, from any of
+/// its partial parts' files) an instance-style call with `arguments` takes by
+/// [`csharp_extension_choice`]'s rules, or `None` when none or several do
+/// (W3-05c, for a receiver of a C# keyword type now that the receiver-word
+/// guess no longer reads the method's own name, upstream #2171).
+pub(crate) fn csharp_extension_unique_choice(
+    candidates: &[Arc<Node>],
+    arguments: &[String],
+    context: &dyn ResolutionContext,
+) -> Option<String> {
+    let (first, rest) = candidates.split_first()?;
+    let owner = owner_of(&first.qualified_name);
+    let set = OverloadSet {
+        name: first.name.clone(),
+        owner: owner.rsplit("::").next().unwrap_or(owner).to_string(),
+        own: overload_of(first, &first.name, context),
+        siblings: rest
+            .iter()
+            .map(|other| (other.id.clone(), overload_of(other, &first.name, context)))
+            .collect(),
+    };
+    match csharp_extension_chosen(&set, &first.id, arguments)?.as_slice() {
+        [id] => Some(id.clone()),
+        _ => None,
+    }
+}
+
+/// The overloads [`csharp_extension_choice`] chooses between, best form
+/// first applied: `None` when the current target is no extension method.
+fn csharp_extension_chosen(
+    set: &OverloadSet,
+    current: &str,
+    arguments: &[String],
+) -> Option<Vec<String>> {
     let receiver = set.own.as_ref().and_then(receiver_key)?;
     let count = arguments.len();
     let array_last = arguments.last().is_some_and(|arg| is_array_creation(arg));
@@ -295,14 +340,7 @@ fn csharp_extension_choice(
             chosen = packs;
         }
     }
-    match chosen.as_slice() {
-        [] => None,
-        [(id, _)] => Some((*id).to_string()),
-        _ => chosen
-            .iter()
-            .any(|(id, _)| *id == current)
-            .then(|| current.to_string()),
-    }
+    Some(chosen.iter().map(|(id, _)| (*id).to_string()).collect())
 }
 
 /// A C# extension overload's `this` type as written, then its `where`
@@ -493,42 +531,44 @@ fn overload_set_of(id: &str, context: &dyn ResolutionContext) -> Option<Overload
     if siblings.is_empty() {
         return None;
     }
-    let arity = |node: &Node| -> Option<Overload> {
-        let list = paren_list_after(&node.file_path, node.start_line, 0, &own.name, context)?;
-        let params: Vec<String> = split_top_level(&list)
-            .into_iter()
-            .filter(|p| !p.is_empty() && p != "void")
-            .collect();
-        let min = params
-            .iter()
-            .filter(|p| !p.contains('=') && !is_pack(p))
-            .count();
-        let max = (!params.iter().any(|p| is_pack(p))).then_some(params.len());
-        let extension = node.language == Language::CSharp
-            && params
-                .first()
-                .is_some_and(|first| crate::csharp_extensions::is_this_parameter(first));
-        let (type_params, constraints) = if extension {
-            generic_head(&node.file_path, node.start_line, &own.name, context)
-        } else {
-            (Vec::new(), String::new())
-        };
-        Some(Overload {
-            arity: Arity { min, max },
-            extension,
-            params,
-            type_params,
-            constraints,
-        })
-    };
     Some(OverloadSet {
         name: own.name.clone(),
         owner: owner.rsplit("::").next().unwrap_or(owner).to_string(),
-        own: arity(&own),
+        own: overload_of(&own, &own.name, context),
         siblings: siblings
             .iter()
-            .map(|sibling| (sibling.id.clone(), arity(sibling)))
+            .map(|sibling| (sibling.id.clone(), overload_of(sibling, &own.name, context)))
             .collect(),
+    })
+}
+
+/// The declared parameters of the overload `node` of a method named `name`.
+fn overload_of(node: &Node, name: &str, context: &dyn ResolutionContext) -> Option<Overload> {
+    let list = paren_list_after(&node.file_path, node.start_line, 0, name, context)?;
+    let params: Vec<String> = split_top_level(&list)
+        .into_iter()
+        .filter(|p| !p.is_empty() && p != "void")
+        .collect();
+    let min = params
+        .iter()
+        .filter(|p| !p.contains('=') && !is_pack(p))
+        .count();
+    let max = (!params.iter().any(|p| is_pack(p))).then_some(params.len());
+    let extension = node.language == Language::CSharp
+        && params
+            .first()
+            .is_some_and(|first| crate::csharp_extensions::is_this_parameter(first));
+    let (type_params, constraints) = if extension {
+        generic_head(&node.file_path, node.start_line, name, context)
+    } else {
+        (Vec::new(), String::new())
+    };
+    Some(Overload {
+        arity: Arity { min, max },
+        extension,
+        params,
+        type_params,
+        constraints,
     })
 }
 

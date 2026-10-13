@@ -6912,6 +6912,91 @@ mod java {
         out
     }
 
+    /// The qualified name of what every `calls` edge out of `file` reaches,
+    /// sorted (upstream's `callsFrom`).
+    fn call_targets(graph: &Graph, file: &str) -> Vec<String> {
+        let mut out: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.kind == "calls")
+            .filter(|edge| {
+                graph
+                    .node(&edge.source)
+                    .is_some_and(|node| node.file_path == file)
+            })
+            .filter_map(|edge| graph.node(&edge.target))
+            .map(|node| node.qualified_name.clone())
+            .collect();
+        out.sort();
+        out
+    }
+    /// Upstream #2171 (`f9530d7d`), its Java half: a receiver's declared
+    /// type is read through generics and for-each loops (`final Pair<L, R>
+    /// pair`, `for (Element el : this)`), from a field of the class (`private
+    /// DateFormat dateTimeParser;`, outside the project, so no edge), or as
+    /// the bound of a type parameter (`T extends ExceptionContext`); a
+    /// constant's receiver is its type (`Phase.CONTROLLERS.getPhase()`).
+    /// Upstream's fixture.
+    #[test]
+    fn pr2171_java_calls_through_declared_receivers_use_their_type() {
+        let project = Project::new()
+            .file(
+                "src/main/java/app/Pair.java",
+                "package app;\n\npublic abstract class Pair<L, R> {\n    public abstract L getKey();\n}\n",
+            )
+            .file(
+                "src/main/java/app/MutablePair.java",
+                "package app;\n\npublic class MutablePair<L, R> extends Pair<L, R> {\n    private L left;\n\n    public L getKey() { return left; }\n\n    /**\n     * Copies the key of each element into this pair.\n     */\n    public void setValue(final Pair<L, R> pair) {\n        left = pair.getKey();\n    }\n}\n",
+            )
+            .file(
+                "src/main/java/app/DateParser.java",
+                "package app;\n\npublic interface DateParser {\n    Object parse(String source);\n}\n",
+            )
+            .file(
+                "src/main/java/app/Element.java",
+                "package app;\n\npublic class Element {\n    public void val(String value) { }\n}\n",
+            )
+            .file(
+                "src/main/java/app/Elements.java",
+                "package app;\n\nimport java.util.ArrayList;\n\npublic class Elements extends ArrayList<Element> {\n    public Elements val(String value) {\n        for (Element element : this)\n            element.val(value);\n        return this;\n    }\n}\n",
+            )
+            .file(
+                "src/main/java/app/Phase.java",
+                "package app;\n\npublic enum Phase {\n    CONTROLLERS;\n\n    public int getPhase() { return 0; }\n}\n",
+            )
+            .file(
+                "src/main/java/app/ExceptionContext.java",
+                "package app;\n\npublic interface ExceptionContext {\n    int getContextEntries();\n}\n",
+            )
+            .file(
+                "src/test/java/app/DateUtilsTest.java",
+                "package app;\n\nimport java.text.DateFormat;\n\npublic abstract class DateUtilsTest<T extends ExceptionContext> {\n    private DateFormat dateTimeParser;\n    protected T exceptionContext;\n\n    void rounds() throws Exception {\n        dateTimeParser.parse(\"January 1, 2008\");\n        exceptionContext.getContextEntries();\n        Phase.CONTROLLERS.getPhase();\n    }\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        assert_eq!(
+            call_targets(graph, "src/main/java/app/MutablePair.java"),
+            ["app::Pair::getKey"],
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            call_targets(graph, "src/main/java/app/Elements.java"),
+            ["app::Element::val"],
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            call_targets(graph, "src/test/java/app/DateUtilsTest.java"),
+            [
+                "app::ExceptionContext::getContextEntries",
+                "app::Phase::getPhase"
+            ],
+            "{}",
+            graph.report()
+        );
+    }
+
     /// Upstream #2194 (`ad77e5fc`): a Java enum constant or Kotlin enum entry
     /// with a body of its own declares members, and the calls in them are
     /// calls; jsoup's tokenizer (an enum whose every state implements `read`)
@@ -7997,9 +8082,9 @@ mod kotlin {
     /// function (`id.eq` when the left operand is a plain name, else bare
     /// `bind`); a standard infix name on an expression receiver,
     /// `alias(…) apply false` in a build script, is not a project method's.
-    /// Upstream's fixture, verbatim. Upstream's `id.eq` reaches `Column::eq`
-    /// through the type `id` is declared with in the class, #2171, which
-    /// W4-CS-03 ports; until then it is recorded and left unresolved.
+    /// Upstream's fixture, verbatim: `id.eq` reaches `Column::eq` through the
+    /// type the class declares `id` with (`class Ops(private val id:
+    /// Column)`, upstream #2171, W4-CS-03).
     #[test]
     fn pr2174_kotlin_infix_calls_call_the_infix_function() {
         let project = Project::new()
@@ -8015,10 +8100,7 @@ mod kotlin {
         let graph = project.graph();
         let calls = calls_from(graph, "src/main/kotlin/app/Ops.kt");
         assert!(
-            graph
-                .unresolved
-                .iter()
-                .any(|r| r.file_path == "src/main/kotlin/app/Ops.kt" && r.reference_name == "id.eq"),
+            calls.contains(&"app::Column::eq".to_string()),
             "{}",
             graph.report()
         );
@@ -8424,7 +8506,7 @@ mod scala {
 }
 
 mod csharp {
-    use super::support::{Graph, Project};
+    use super::support::{Graph, Project, assert_edge, assert_no_edge};
 
     /// `kind qualified-name` of every node of `file` but its file node.
     fn qualified_names(graph: &Graph, file: &str) -> Vec<String> {
@@ -8835,6 +8917,154 @@ mod csharp {
                 .any(|target| target == "enum src/Lib/Writer.cs:Lib::Writer::State"),
             "{current:?}\n{}",
             graph.report()
+        );
+    }
+
+    /// The qualified name of what every `calls` edge out of `file` reaches,
+    /// sorted (upstream's `callsFrom`).
+    fn call_targets(graph: &Graph, file: &str) -> Vec<String> {
+        let mut out: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.kind == "calls")
+            .filter(|edge| {
+                graph
+                    .node(&edge.source)
+                    .is_some_and(|node| node.file_path == file)
+            })
+            .filter_map(|edge| graph.node(&edge.target))
+            .map(|node| node.qualified_name.clone())
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// Upstream #2171 (`f9530d7d`): a C# call through a field, property or
+    /// parameter is a call on the type it is declared with, read from the
+    /// class's member declarations, those it inherits (with the type
+    /// arguments the subclass gives), or a using alias, never a guess at a
+    /// same-named method; a C# interface's members are public and a type in a
+    /// namespace is internal; a standard .NET name on an untyped receiver
+    /// (`table.Columns.Add(…)`) is no project method unless the receiver
+    /// names its owner. Upstream's fixture.
+    #[test]
+    fn pr2171_csharp_calls_through_declared_members_use_the_member_type() {
+        let project = Project::new()
+            .file(
+                "src/Json/JsonWriter.cs",
+                "namespace App.Json;\n\npublic abstract class JsonWriter\n{\n    public virtual void WriteValue(string value) { }\n}\n",
+            )
+            .file(
+                "src/Json/TraceJsonWriter.cs",
+                "using System.IO;\n\nnamespace App.Json;\n\ninternal class TraceJsonWriter : JsonWriter\n{\n    private readonly JsonWriter _innerWriter;\n    /* a block comment naming the _textWriter field */\n    private readonly TextWriter _textWriter;\n\n    public override void WriteValue(string value)\n    {\n        _innerWriter.WriteValue(value);\n        _textWriter.Write(value);\n    }\n}\n",
+            )
+            .file(
+                "tests/ThrowingWriter.cs",
+                "using System.IO;\n\nnamespace App.Tests;\n\npublic class ThrowingWriter : TextWriter\n{\n    public override void Write(string value) { }\n}\n",
+            )
+            .file(
+                "tests/XUnitAssert.cs",
+                "namespace App.Tests;\n\npublic static class XUnitAssert\n{\n    public static void AreEqual(object a, object b) { }\n}\n",
+            )
+            .file(
+                "src/DefaultJsonNameTable.cs",
+                "namespace App;\n\npublic class DefaultJsonNameTable\n{\n    public void Add(string key) { }\n}\n",
+            )
+            .file(
+                "src/Services/IFixUriService.cs",
+                "namespace App.Services;\n\npublic interface IFixUriService\n{\n    void FixBasketItemPictureUri(string uri);\n}\n",
+            )
+            .file(
+                "src/Services/FixUriService.cs",
+                "namespace App.Services;\n\npublic class FixUriService : IFixUriService\n{\n    public void FixBasketItemPictureUri(string uri) { }\n}\n",
+            )
+            .file(
+                "src/Services/BasketService.cs",
+                "namespace App.Services;\n\npublic class BasketService\n{\n    private readonly IFixUriService _fixUriService;\n\n    public void Load(string uri)\n    {\n        _fixUriService.FixBasketItemPictureUri(uri);\n    }\n}\n",
+            )
+            .file(
+                "tests/Integration/IntegrationTest.cs",
+                "namespace App.Tests.Integration;\n\npublic abstract class IntegrationTest<TFixture> where TFixture : new()\n{\n    protected TFixture Fixture { get; private set; }\n}\n\npublic class DropCreateDatabaseAlways\n{\n    public object CreateContext() => null;\n}\n",
+            )
+            .file(
+                "tests/Integration/QueryTests.cs",
+                "using Assert = App.Tests.XUnitAssert;\n\nnamespace App.Tests.Integration;\n\npublic class QueryTests : IntegrationTest<QueryTests.DatabaseInitializer>\n{\n    public class DatabaseInitializer : DropCreateDatabaseAlways { }\n\n    public void Runs()\n    {\n        var context = Fixture.CreateContext();\n        Assert.AreEqual(1, 1);\n        var table = MakeTable();\n        table.Columns.Add(\"price\");\n    }\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        assert_eq!(
+            call_targets(graph, "src/Json/TraceJsonWriter.cs"),
+            ["App.Json::JsonWriter::WriteValue"],
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            call_targets(graph, "src/Services/BasketService.cs"),
+            ["App.Services::IFixUriService::FixBasketItemPictureUri"],
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            call_targets(graph, "tests/Integration/QueryTests.cs"),
+            [
+                "App.Tests.Integration::DropCreateDatabaseAlways::CreateContext",
+                "App.Tests::XUnitAssert::AreEqual"
+            ],
+            "{}",
+            graph.report()
+        );
+        let visibility = |file: &str, kind: &str| {
+            graph
+                .nodes
+                .iter()
+                .find(|node| node.file_path == file && node.kind == kind)
+                .and_then(|node| node.visibility.clone())
+        };
+        assert_eq!(
+            visibility("src/Services/IFixUriService.cs", "method").as_deref(),
+            Some("public")
+        );
+        assert_eq!(
+            visibility("src/Json/TraceJsonWriter.cs", "class").as_deref(),
+            Some("internal")
+        );
+    }
+
+    /// KEEP-RUST (W3-05c, adapted to upstream #2171): a C# receiver declared
+    /// with a keyword type (`string message`) reaches the project's extension
+    /// method for it now that the receiver-word guess no longer reads the
+    /// method's own name. When several overloads of one type fit, C#'s rules
+    /// pick one, also across a `partial static class` split over files (an
+    /// array creation at a `params` position takes the `params` overload); a
+    /// standard .NET name (`message.StartsWith(".")`) stays the keyword
+    /// type's own method.
+    #[test]
+    fn keyword_typed_receivers_reach_extension_overloads_across_partial_parts() {
+        let project = Project::new()
+            .file(
+                "src/Utilities/StringUtils.cs",
+                "namespace App.Utilities\n{\n    internal static partial class StringUtils\n    {\n        public static string FormatWith(this string format, IFormatProvider provider, object? arg0)\n        {\n            return format;\n        }\n    }\n}\n",
+            )
+            .file(
+                "src/Utilities/StringUtils.Params.cs",
+                "namespace App.Utilities\n{\n    internal static partial class StringUtils\n    {\n        public static string FormatWith(this string format, IFormatProvider provider, params object?[] args)\n        {\n            return format;\n        }\n\n        public static bool StartsWith(this string source, char value)\n        {\n            return false;\n        }\n    }\n}\n",
+            )
+            .file(
+                "src/App/Report.cs",
+                "using App.Utilities;\n\nnamespace App\n{\n    public class Report\n    {\n        public string Render(string message, object? a, object? b)\n        {\n            if (message.StartsWith(\".\")) { }\n            return message.FormatWith(null, new object?[] { a, b });\n        }\n    }\n}\n",
+            )
+            .index();
+        assert_edge!(
+            project,
+            "method App::Report::Render" => calls => "method App.Utilities::StringUtils::FormatWith @src/Utilities/StringUtils.Params.cs:5"
+        );
+        assert_no_edge!(
+            project,
+            "method App::Report::Render" => calls => "method App.Utilities::StringUtils::FormatWith @src/Utilities/StringUtils.cs:5"
+        );
+        assert_no_edge!(
+            project,
+            "method App::Report::Render" => calls => "method App.Utilities::StringUtils::StartsWith"
         );
     }
 }

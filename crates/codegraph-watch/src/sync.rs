@@ -563,6 +563,7 @@ fn sync_paths_with_store(
     let kotlin_bootstrap = crate::kotlin_surfaces::needs_bootstrap(store)?;
     let scala_bootstrap = crate::scala_surfaces::needs_bootstrap(store)?;
     let csharp_bootstrap = crate::csharp_surfaces::needs_bootstrap(store)?;
+    let member_bootstrap = crate::member_surfaces::needs_bootstrap(store)?;
 
     let paths = paths.into_iter().collect::<Vec<_>>();
     let total = paths.len();
@@ -616,6 +617,7 @@ fn sync_paths_with_store(
         || kotlin_bootstrap
         || scala_bootstrap
         || csharp_bootstrap
+        || member_bootstrap
     {
         note_python_global_readers(
             project_root,
@@ -740,6 +742,21 @@ fn sync_paths_with_store(
             dependent_fallbacks.insert(file.clone());
         }
         changed_names.note_all(csharp.names.iter().cloned());
+        // And what a C#, Java or Kotlin call through a declared member reads
+        // of the classes it inherits (W4-CS-03).
+        let members = crate::member_surfaces::member_refresh(
+            store,
+            project_root,
+            scope.options.max_file_size,
+            &changed_names.members,
+            &reindexed,
+            &changed_names.removed_files,
+            member_bootstrap,
+        )?;
+        for file in &members.files {
+            dependent_sites.remove(file);
+            dependent_fallbacks.insert(file.clone());
+        }
         // What a changed Python import statement re-exports moves for its
         // module's importers without any node of those names changing.
         if !changed_names.python_imports.is_empty() {
@@ -830,12 +847,14 @@ fn sync_paths_with_store(
         kotlin.write_rows(store)?;
         scala.write_rows(store)?;
         csharp.write_rows(store)?;
+        members.write_rows(store)?;
         crate::module_surfaces::finish_bootstrap(store)?;
         crate::cpp_dependents::write_marker(store)?;
         crate::java_heads::write_marker(store)?;
         crate::kotlin_surfaces::write_marker(store)?;
         crate::scala_surfaces::write_marker(store)?;
         crate::csharp_surfaces::write_marker(store)?;
+        crate::member_surfaces::write_marker(store)?;
     }
 
     // Orphan sweep (#1187, upstream index.ts:645-682): a full-index resolution
@@ -1225,6 +1244,7 @@ fn remove_tracked_file(
     changed_names
         .csharp
         .note(store, relative, &old_nodes, None)?;
+    changed_names.members.note(store, relative, None)?;
     delete_unresolved_refs_by_file(store, relative)?;
     store.delete_file_record(relative)?;
     changed_names
@@ -1607,6 +1627,11 @@ fn reextract_into_store(
         &old_nodes,
         Some((file.language, source, &result.nodes)),
     )?;
+    changed_names.members.note(
+        store,
+        relative,
+        Some((file.language, source, &result.nodes)),
+    )?;
     // No name in another file resolves into a minified script (upstream
     // #2204), and that verdict is read from the script's text: a script that
     // was or is generated can flip it with every node where it was, so all of
@@ -1737,6 +1762,9 @@ struct ChangedNames {
     /// What the changed files held that C# resolution in other files reads:
     /// `global using`s, heads and owners (W4-CS-01).
     csharp: crate::csharp_surfaces::CsharpChanges,
+    /// What the changed files held that member-type inference in other
+    /// files reads: class heads and member lines (W4-CS-03).
+    members: crate::member_surfaces::MemberChanges,
 }
 
 /// What a changed Python file held before the change. A module global's
@@ -1775,6 +1803,7 @@ impl ChangedNames {
             crate::kotlin_surfaces::withdraw_marker(store)?;
             crate::scala_surfaces::withdraw_marker(store)?;
             crate::csharp_surfaces::withdraw_marker(store)?;
+            crate::member_surfaces::withdraw_marker(store)?;
             self.surface_dirty = true;
         }
         Ok(())
@@ -2823,6 +2852,196 @@ pub(crate) mod tests {
         sync_changed_paths(dir.path(), &db, ["src/Lib/Spare.cs"]).unwrap();
         assert_eq!(csharp_marker(&db), version);
         assert_eq!(csharp_rows(&db), rows);
+        assert_eq!(edge_projection(&db), expected);
+    }
+
+    fn member_marker(db: &Path) -> Option<String> {
+        Store::open(db)
+            .unwrap()
+            .get_project_metadata(crate::member_surfaces::VERSION_KEY)
+            .unwrap()
+    }
+
+    fn member_rows(db: &Path) -> Vec<(String, String)> {
+        Store::open(db)
+            .unwrap()
+            .project_metadata_with_prefix(codegraph_resolve::member_types::SURFACE_ROW_KEY_PREFIX)
+            .unwrap()
+    }
+
+    const MEMBER_JSON: (&str, &str) = (
+        "src/Json/JsonWriter.cs",
+        "namespace App.Json;\n\npublic class JsonWriter\n{\n    public void WriteValue(string value) { }\n}\n",
+    );
+    const MEMBER_OTHER: (&str, &str) = (
+        "src/Json/OtherWriter.cs",
+        "namespace App.Json;\n\npublic class OtherWriter\n{\n    public void WriteValue(string value) { }\n}\n",
+    );
+    const MEMBER_BASE_JSON: (&str, &str) = (
+        "src/Json/WriterBase.cs",
+        "namespace App.Json;\n\npublic abstract class WriterBase\n{\n    protected JsonWriter Writer { get; set; }\n}\n",
+    );
+    const MEMBER_BASE_OTHER: (&str, &str) = (
+        "src/Json/WriterBase.cs",
+        "namespace App.Json;\n\npublic abstract class WriterBase\n{\n    protected OtherWriter Writer { get; set; }\n}\n",
+    );
+    const MEMBER_TRACE: (&str, &str) = (
+        "src/Json/TraceWriter.cs",
+        "namespace App.Json;\n\npublic class TraceWriter : WriterBase\n{\n    public void Trace(string value)\n    {\n        Writer.WriteValue(value);\n    }\n}\n",
+    );
+    const MEMBER_SPARE: (&str, &str) = (
+        "src/Json/Spare.cs",
+        "namespace App.Json;\n\npublic class Spare\n{\n}\n",
+    );
+    const MEMBER_SPARE_EDITED: (&str, &str) = (
+        "src/Json/Spare.cs",
+        "namespace App.Json;\n\npublic class Spare\n{\n    int Count() => 1;\n}\n",
+    );
+
+    fn trace_reaches(db: &Path, file: &str) -> bool {
+        edge_projection(db)
+            .iter()
+            .any(|edge| edge.contains(&format!("TraceWriter::Trace -[calls]-> {file}")))
+    }
+
+    /// W4-CS-03: a sync failing after its mutations leaves the member marker
+    /// away, so the next sync, with nothing changed or with an unrelated
+    /// change, re-resolves every member-typed file and rebuilds the rows:
+    /// `TraceWriter`'s call through the member its base declares ends where
+    /// a fresh index puts it.
+    #[test]
+    fn a_member_sync_failing_after_its_mutations_leaves_the_next_one_to_reconcile() {
+        let version = Some(crate::member_surfaces::VERSION.to_string());
+        let dir = TestDir::new("member-surface-fail");
+        let db = default_db_path(dir.path()).unwrap();
+        let initial = [
+            MEMBER_JSON,
+            MEMBER_OTHER,
+            MEMBER_BASE_JSON,
+            MEMBER_TRACE,
+            MEMBER_SPARE,
+        ];
+        write_files(dir.path(), &initial);
+        sync_changed_paths(dir.path(), &db, initial.iter().map(|(path, _)| *path)).unwrap();
+        assert_eq!(member_marker(&db), version);
+        assert!(
+            trace_reaches(&db, "src/Json/JsonWriter.cs"),
+            "{:#?}",
+            edge_projection(&db)
+        );
+
+        let fail_once = |paths: &[&str]| {
+            FAIL_BEFORE_RESOLUTION.with(|fail| fail.set(true));
+            let failed = sync_changed_paths(dir.path(), &db, paths.iter().copied());
+            FAIL_BEFORE_RESOLUTION.with(|fail| fail.set(false));
+            assert!(failed.is_err(), "the injected failure must stop the sync");
+            assert_eq!(
+                member_marker(&db),
+                None,
+                "a failed sync leaves the marker away"
+            );
+        };
+
+        write_files(dir.path(), &[MEMBER_BASE_OTHER]);
+        fail_once(&["src/Json/WriterBase.cs"]);
+        sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
+        assert_eq!(member_marker(&db), version);
+        let fresh = [
+            MEMBER_JSON,
+            MEMBER_OTHER,
+            MEMBER_BASE_OTHER,
+            MEMBER_TRACE,
+            MEMBER_SPARE,
+        ];
+        assert_eq!(
+            edge_projection(&db),
+            fresh_edges("member-surface-fail-other", &fresh)
+        );
+        assert!(
+            trace_reaches(&db, "src/Json/OtherWriter.cs"),
+            "{:#?}",
+            edge_projection(&db)
+        );
+
+        write_files(dir.path(), &[MEMBER_BASE_JSON]);
+        fail_once(&["src/Json/WriterBase.cs"]);
+        write_files(dir.path(), &[MEMBER_SPARE_EDITED]);
+        sync_changed_paths(dir.path(), &db, ["src/Json/Spare.cs"]).unwrap();
+        assert_eq!(member_marker(&db), version);
+        let fresh = [
+            MEMBER_JSON,
+            MEMBER_OTHER,
+            MEMBER_BASE_JSON,
+            MEMBER_TRACE,
+            MEMBER_SPARE_EDITED,
+        ];
+        assert_eq!(
+            edge_projection(&db),
+            fresh_edges("member-surface-fail-json", &fresh)
+        );
+        assert!(
+            trace_reaches(&db, "src/Json/JsonWriter.cs"),
+            "{:#?}",
+            edge_projection(&db)
+        );
+    }
+
+    /// W4-CS-03: an index without the member marker or its rows (built before
+    /// them) has every member-typed file re-resolved and every row rebuilt by
+    /// its next sync: the call an older sync left without its edge comes
+    /// back.
+    #[test]
+    fn an_index_without_the_member_marker_rebuilds_the_surface_rows() {
+        let version = Some(crate::member_surfaces::VERSION.to_string());
+        let dir = TestDir::new("member-surface-bootstrap");
+        let db = default_db_path(dir.path()).unwrap();
+        let initial = [
+            MEMBER_JSON,
+            MEMBER_OTHER,
+            MEMBER_BASE_JSON,
+            MEMBER_TRACE,
+            MEMBER_SPARE,
+        ];
+        write_files(dir.path(), &initial);
+        sync_changed_paths(dir.path(), &db, initial.iter().map(|(path, _)| *path)).unwrap();
+        assert_eq!(member_marker(&db), version);
+        let rows = member_rows(&db);
+        assert!(
+            rows.iter()
+                .any(|(key, _)| key == "member_surface:src/Json/WriterBase.cs"),
+            "{rows:#?}"
+        );
+        let expected = edge_projection(&db);
+        {
+            let store = Store::open(&db).unwrap();
+            let dropped = store
+                .connection()
+                .execute(
+                    "DELETE FROM edges WHERE kind = 'calls' AND target = (SELECT id FROM nodes \
+                     WHERE qualified_name = 'App.Json::JsonWriter::WriteValue')",
+                    [],
+                )
+                .unwrap();
+            assert_eq!(dropped, 1, "the call edge an older sync lost");
+            store
+                .delete_project_metadata_with_prefix(
+                    codegraph_resolve::member_types::SURFACE_ROW_KEY_PREFIX,
+                )
+                .unwrap();
+            store
+                .delete_project_metadata(crate::member_surfaces::VERSION_KEY)
+                .unwrap();
+        }
+        assert_ne!(edge_projection(&db), expected);
+        write_files(dir.path(), &[MEMBER_SPARE_EDITED]);
+        sync_changed_paths(dir.path(), &db, ["src/Json/Spare.cs"]).unwrap();
+        assert_eq!(member_marker(&db), version);
+        let mut rebuilt = member_rows(&db);
+        let mut wanted = rows;
+        // The edited file's row is its new one.
+        rebuilt.retain(|(key, _)| key != "member_surface:src/Json/Spare.cs");
+        wanted.retain(|(key, _)| key != "member_surface:src/Json/Spare.cs");
+        assert_eq!(rebuilt, wanted);
         assert_eq!(edge_projection(&db), expected);
     }
 

@@ -61,15 +61,38 @@ pub(crate) fn extension_method_target(
                 })
         })
         .collect();
-    match fitting.as_slice() {
-        [only] => Some(ResolvedRef {
-            original: reference.clone(),
-            target_node_id: only.id.clone(),
-            confidence: 0.9,
-            resolved_by: ResolvedBy::InstanceMethod,
-        }),
-        _ => None,
-    }
+    let chosen = match fitting.as_slice() {
+        [only] => only.id.clone(),
+        // Overloads of one type that all take the call: C#'s overload rules
+        // may still pick one (`format.FormatWith(provider, new object?[] {
+        // … })` takes the `params` overload); a pick by position never.
+        [first, rest @ ..]
+            if rest.iter().all(|other| {
+                owner_of(&other.qualified_name) == owner_of(&first.qualified_name)
+            }) =>
+        {
+            let arguments = if arguments.trim().is_empty() {
+                Vec::new()
+            } else {
+                split_top_level(&arguments)
+            };
+            crate::overloads::csharp_extension_unique_choice(&fitting, &arguments, context)?
+        }
+        _ => return None,
+    };
+    Some(ResolvedRef {
+        original: reference.clone(),
+        target_node_id: chosen,
+        confidence: 0.9,
+        resolved_by: ResolvedBy::InstanceMethod,
+    })
+}
+
+/// What a qualified name is declared in: all but its last `::` segment.
+fn owner_of(qualified_name: &str) -> &str {
+    qualified_name
+        .rsplit_once("::")
+        .map_or("", |(owner, _)| owner)
 }
 
 /// Whether `method` declares a `this` parameter of `receiver_type` and takes

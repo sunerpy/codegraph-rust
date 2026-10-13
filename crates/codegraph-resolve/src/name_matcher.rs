@@ -5,6 +5,7 @@
 //! cross-language family gate — mirror the upstream exactly. Every strategy cites its
 //! upstream source range.
 
+use crate::member_types::TYPE_ARGS;
 use crate::object_literal::{LiteralLookup, object_literal_property, property_contains};
 use crate::source_facts::{SourceFacts, TsFieldDeclaration};
 use crate::strip_comments::{CommentLang, strip_comments_for_regex};
@@ -1284,6 +1285,133 @@ fn receiver_link(receiver: &str) -> &str {
     match links.next() {
         Some(owner) if constant => owner,
         _ => last,
+    }
+}
+
+/// Methods of .NET's base types, collections, streams, strings, LINQ and
+/// reflection (upstream #2171 `CSHARP_STD_METHODS`): names a project type
+/// overrides or wraps, which a call through an untyped receiver means only
+/// when the receiver is named after the owner.
+const CSHARP_STD_METHODS: [&str; 108] = [
+    "ToString",
+    "Equals",
+    "GetHashCode",
+    "GetType",
+    "CompareTo",
+    "Add",
+    "AddRange",
+    "Remove",
+    "RemoveAt",
+    "RemoveAll",
+    "Contains",
+    "ContainsKey",
+    "ContainsValue",
+    "Clear",
+    "Insert",
+    "IndexOf",
+    "CopyTo",
+    "ToArray",
+    "ToList",
+    "ToDictionary",
+    "GetEnumerator",
+    "MoveNext",
+    "Reset",
+    "TryGetValue",
+    "GetValueOrDefault",
+    "TryAdd",
+    "Write",
+    "WriteLine",
+    "WriteAsync",
+    "WriteLineAsync",
+    "Read",
+    "ReadAsync",
+    "ReadLine",
+    "ReadToEnd",
+    "Flush",
+    "FlushAsync",
+    "Close",
+    "Dispose",
+    "DisposeAsync",
+    "Parse",
+    "TryParse",
+    "Format",
+    "Join",
+    "Split",
+    "Replace",
+    "Substring",
+    "Trim",
+    "TrimStart",
+    "TrimEnd",
+    "StartsWith",
+    "EndsWith",
+    "ToUpper",
+    "ToLower",
+    "ToUpperInvariant",
+    "ToLowerInvariant",
+    "Select",
+    "Where",
+    "First",
+    "FirstOrDefault",
+    "Single",
+    "SingleOrDefault",
+    "Last",
+    "LastOrDefault",
+    "Any",
+    "All",
+    "Count",
+    "Sum",
+    "Max",
+    "Min",
+    "OrderBy",
+    "OrderByDescending",
+    "GroupBy",
+    "Skip",
+    "Take",
+    "Distinct",
+    "Concat",
+    "Cast",
+    "OfType",
+    "Aggregate",
+    "Invoke",
+    "DynamicInvoke",
+    "GetMethod",
+    "GetProperty",
+    "GetField",
+    "GetConstructor",
+    "GetCustomAttributes",
+    "GetGenericArguments",
+    "MakeGenericType",
+    "IsAssignableFrom",
+    "ConfigureAwait",
+    "Wait",
+    "ContinueWith",
+    "Append",
+    "AppendLine",
+    "Peek",
+    "Push",
+    "Pop",
+    "Enqueue",
+    "Dequeue",
+    "HasFlag",
+    "Find",
+    "FindAll",
+    "ForEach",
+    "Sort",
+    "Reverse",
+    "Clone",
+    "Seek",
+    "SetLength",
+];
+
+/// The standard-library method names of a language whose untyped-receiver
+/// guesses need the receiver to name the owner (upstream #2171
+/// `stdMethodNames`, without Go's set, which W4-GO-03 brings).
+fn is_std_method_name(language: Language, name: &str) -> bool {
+    match language {
+        Language::CSharp => CSHARP_STD_METHODS.contains(&name),
+        Language::Rust => is_rust_std_method(name),
+        Language::Kotlin => crate::kotlin_scope::is_kotlin_std_method(name),
+        _ => false,
     }
 }
 
@@ -3626,17 +3754,23 @@ fn local_receiver_type_patterns_tagged(language: Language, r: &str) -> Vec<(Rege
             }
             return out;
         }
+        // A generic or array type (`Pair<L, R> pair`, `String[] args`) and an
+        // enhanced-for variable (upstream #2171).
         Language::Java => vec![
             format!(r"\b{r}\b\s*=\s*new\s+([A-Za-z_][\w.]*)"),
-            format!(r"\b([A-Z][\w.]*)\s+{r}\b\s*[=;,)]"),
+            format!(r"\b([A-Z][\w.]*)\s*{TYPE_ARGS}\s+{r}\b\s*[=;,)]"),
+            format!(r"\bfor\s*\(\s*(?:final\s+)?([A-Z][\w.]*)\s*{TYPE_ARGS}\s+{r}\s*:"),
         ],
         Language::Kotlin => vec![
             format!(r"\b{r}\b\s*=\s*([A-Z][\w.]*)\s*\("),
             format!(r"\b{r}\b\s*:\s*([A-Z][\w.]*)"),
         ],
+        // A generic, nullable or array type (`List<string> names`,
+        // `JProperty? p`) and a `foreach` variable (upstream #2171).
         Language::CSharp => vec![
             format!(r"\b{r}\b\s*=\s*new\s+([A-Za-z_][\w.]*)"),
-            format!(r"\b([A-Z][\w.]*)\s+{r}\b\s*[=;,)]"),
+            format!(r"\b([A-Z][\w.]*)\s*{TYPE_ARGS}\??\s+{r}\b\s*[=;,)]"),
+            format!(r"\bforeach\s*\(\s*([A-Z][\w.]*)\s*{TYPE_ARGS}\??\s+{r}\s+in\b"),
         ],
         Language::Swift => vec![
             format!(r"\b{r}\b\s*=\s*([A-Z][\w.]*)\s*\("),
@@ -3763,6 +3897,35 @@ pub(crate) fn infer_local_receiver_type(
         }
     }
     None
+}
+
+/// The C# keyword type (`string`, `int`, …) a local or parameter named
+/// `receiver_name` is declared with between the enclosing scope's start and
+/// the call, as [`infer_local_receiver_type`] scans (KEEP-RUST, W3-05c).
+fn csharp_keyword_local_type(
+    receiver_name: &str,
+    reference: &RefView,
+    context: &dyn ResolutionContext,
+) -> Option<String> {
+    let pattern = Regex::new(&format!(
+        r"(?-u:\b)(string|object|int|long|short|byte|bool|char|double|float|decimal|uint|ulong|ushort|sbyte)\??\s+{}(?-u:\b)\s*[=;,)]",
+        regex_escape(receiver_name)
+    ))
+    .ok()?;
+    let source = context.read_file(&reference.file_path)?;
+    let lines: Vec<&str> = source
+        .split('\n')
+        .map(|l| l.trim_end_matches('\r'))
+        .collect();
+    if lines.is_empty() {
+        return None;
+    }
+    let call_idx = ((reference.line - 1).max(0) as usize).min(lines.len() - 1);
+    let start_idx = (enclosing_scope_start_line(reference, context) - 1).max(0) as usize;
+    (start_idx..=call_idx)
+        .rev()
+        .filter(|&i| lines[i].len() <= 10_000)
+        .find_map(|i| pattern.captures(lines[i]).map(|caps| caps[1].to_string()))
 }
 
 /// Span end of `node`, falling back to its start when `end_line` was not
@@ -4430,7 +4593,7 @@ pub fn match_method_call(
     // language uses the shared source-based inferrer.
     if is_inferable_receiver_call(&reference.reference_name, reference.language) {
         let mut cpp_declaration = CppReceiverDeclaration::default();
-        let inferred = if reference.language == Language::Cpp {
+        let mut inferred = if reference.language == Language::Cpp {
             infer_cpp_receiver_type(
                 &object_or_class,
                 reference,
@@ -4458,6 +4621,74 @@ pub fn match_method_call(
                         .flatten()
                 })
         };
+        // A field or property of the class around the call, or of one it
+        // inherits, is its declared type (upstream #2171): Newtonsoft's
+        // `_innerWriter.WriteValue(…)` is JsonWriter's.
+        if inferred.is_none()
+            && crate::member_types::is_member_typed_language(reference.language)
+            && is_dot_call(&reference.reference_name)
+        {
+            inferred = crate::member_types::infer_member_receiver_type(
+                &object_or_class,
+                reference,
+                context,
+            );
+            // A member of a built-in type (`string _name`, `int count`) has
+            // no project method; a C# one keeps the project's extension
+            // method for it (KEEP-RUST, W3-05c), unless the name is one the
+            // keyword type declares itself.
+            if let Some(keyword) = inferred
+                .as_deref()
+                .filter(|t| t.starts_with(|c: char| c.is_ascii_lowercase()))
+            {
+                if reference.language != Language::CSharp
+                    || is_std_method_name(Language::CSharp, &method_name)
+                {
+                    return None;
+                }
+                return crate::csharp_extensions::extension_method_target(
+                    keyword,
+                    &method_name,
+                    reference,
+                    context,
+                );
+            }
+        }
+        // A C# local or parameter of a keyword type (`this string format`) is
+        // an outside type as well: only the project's extension method for it
+        // (KEEP-RUST, W3-05c; the scorer below no longer takes the method's
+        // own words, upstream #2171).
+        if inferred.is_none()
+            && reference.language == Language::CSharp
+            && is_dot_call(&reference.reference_name)
+            && let Some(keyword) = csharp_keyword_local_type(&object_or_class, reference, context)
+        {
+            // `s.StartsWith(".")` is `string.StartsWith`, never a project
+            // extension of that name (upstream #2171's standard names).
+            if is_std_method_name(Language::CSharp, &method_name) {
+                return None;
+            }
+            return crate::csharp_extensions::extension_method_target(
+                &keyword,
+                &method_name,
+                reference,
+                context,
+            );
+        }
+        // A type parameter is its bound; with none, only `Object`'s methods.
+        if let Some(type_name) = inferred.clone()
+            && crate::member_types::is_member_typed_language(reference.language)
+            && !context
+                .get_nodes_by_name_shared(&type_name)
+                .iter()
+                .any(|n| crate::kotlin_scope::is_method_owner_kind(n))
+        {
+            match crate::member_types::type_parameter_bound(&type_name, reference, context) {
+                crate::member_types::TypeParameterBound::Unbounded => return None,
+                crate::member_types::TypeParameterBound::Bound(bound) => inferred = Some(bound),
+                crate::member_types::TypeParameterBound::NotParameter => {}
+            }
+        }
         if let Some(inferred) = inferred {
             // #1566 — an inferred type the call site cannot SEE is not this
             // project's type: a built-in `Map` must never resolve onto a
@@ -4744,11 +4975,63 @@ pub fn match_method_call(
     // (`Exception.Create(…)` in Delphi, `Collections.sort(…)`,
     // `Object.assign(…)`) is a type from outside it: a same-named method of
     // some project type is a guess (upstream #2166).
+    // A C# using alias names its type: `using Assert =
+    // Newtonsoft.Json.Tests.XUnitAssert;` (upstream #2171).
+    if reference.language == Language::CSharp
+        && let Some(aliased) =
+            crate::csharp_types::csharp_using_alias(&object_or_class, reference, context)
+    {
+        return resolve_method_on_type(
+            &aliased,
+            &method_name,
+            reference,
+            context,
+            0.9,
+            ResolvedBy::InstanceMethod,
+            None,
+            0,
+        );
+    }
+    // In C# and Java a capitalized receiver is a type: a project property of
+    // that name elsewhere (a test object's `DateTime`) does not make
+    // `DateTime.Parse(…)` the project's (upstream #2171).
+    let types_only = matches!(reference.language, Language::CSharp | Language::Java);
     if names_external_type(&object_or_class, reference.language)
         && !context
             .get_nodes_by_name_shared(&object_or_class)
             .iter()
-            .any(|n| same_language_family(n.language, reference.language))
+            .any(|n| {
+                same_language_family(n.language, reference.language)
+                    && (!types_only
+                        || crate::kotlin_scope::is_method_owner_kind(n)
+                        || matches!(
+                            n.kind,
+                            NodeKind::Enum | NodeKind::Namespace | NodeKind::Module
+                        ))
+            })
+    {
+        return None;
+    }
+    // `string.Equals(…)`, `object.ReferenceEquals(…)`: a C# keyword type.
+    if reference.language == Language::CSharp
+        && matches!(
+            object_or_class.as_str(),
+            "string"
+                | "object"
+                | "int"
+                | "long"
+                | "short"
+                | "byte"
+                | "bool"
+                | "char"
+                | "double"
+                | "float"
+                | "decimal"
+                | "uint"
+                | "ulong"
+                | "ushort"
+                | "sbyte"
+        )
     {
         return None;
     }
@@ -4833,6 +5116,12 @@ pub fn match_method_call(
     // as `e.preventDefault()` on an event nor `this.editor.setValue()` on
     // something the component holds (upstream #2140). A template ref
     // (`this.$refs.form.validate()`) names a child this cannot tell apart.
+    // Production code never calls into a test suite (upstream #2171): its
+    // methods were never in the running, so ruling them out may leave one.
+    if !codegraph_core::file_class::is_test_path(&reference.file_path) {
+        target_methods
+            .retain(|method| !codegraph_core::file_class::is_test_path(&method.file_path));
+    }
     if is_js_family(reference.language) {
         let before = target_methods.len();
         target_methods.retain(|method| {
@@ -4841,6 +5130,14 @@ pub fn match_method_call(
         });
         narrowed |= target_methods.len() != before;
     }
+    // What the receiver is named after is its last link (a constant's type):
+    // `builder.tokeniser` is a Tokeniser, `table.Columns` no kind of table. A
+    // standard-library method name on it (`reader.Value.ToString()`,
+    // `sym.map(…)`) is the library type's unless the receiver names the
+    // owner (upstream #2171).
+    let link = receiver_link(&object_or_class);
+    let std = is_std_method_name(reference.language, &method_name)
+        && !matches!(object_or_class.as_str(), "self" | "Self" | "this" | "base");
 
     // A SINGLE same-named candidate is not on its own evidence that the receiver
     // is that candidate's type. Without the overlap check this branch bound every
@@ -4861,6 +5158,7 @@ pub fn match_method_call(
         && receiver_shares_word(&object_or_class, &target_methods[0].qualified_name)
         // A test double is only what a test names (upstream #2197).
         && !is_unnamed_test_double(&target_methods[0], &object_or_class, reference, context)
+        && !(std && !crate::kotlin_scope::shares_receiver_word(link, &target_methods[0]))
     {
         return Some(ResolvedRef {
             original: reference.clone(),
@@ -4874,16 +5172,41 @@ pub fn match_method_call(
         // Same-file candidates first, so a score tie (`score > best_score` keeps
         // the first seen) resolves to the call site's own file (#1079).
         let ordered = prefer_call_site_file(target_methods, &reference.file_path);
+        let receiver_words = split_camel_case(link);
+        let head = receiver_words.last().map(|w| w.to_ascii_lowercase());
         let mut best_match: Option<&Node> = None;
         let mut best_score = 0i64;
         for method in &ordered {
+            if std && !crate::kotlin_scope::shares_receiver_word(link, method) {
+                continue;
+            }
             // A test double is only what a test constructs or names, never a
             // guess from `response.json()` in a file that never mentions it
             // (upstream #2175).
             if is_unnamed_test_double(method, &object_or_class, reference, context) {
                 continue;
             }
-            let mut score = receiver_word_overlap(&object_or_class, &method.qualified_name) as i64;
+            // The owner type's own name, not its namespace (`eShop.ClientApp…`
+            // shares `Client` with every `httpClient`) nor the method's
+            // (upstream #2171).
+            let class_words = if method.qualified_name.contains("::") {
+                split_camel_case(member_owner_name(&method.qualified_name))
+            } else {
+                Vec::new()
+            };
+            let mut score = receiver_words
+                .iter()
+                .filter(|w| class_words.iter().any(|cw| cw.eq_ignore_ascii_case(w)))
+                .count() as i64;
+            // The receiver's head noun naming the owner's: `bookPage` is a
+            // Page before it is anything of a Book's.
+            if head.as_ref().is_some_and(|head| {
+                class_words
+                    .last()
+                    .is_some_and(|cw| cw.eq_ignore_ascii_case(head))
+            }) {
+                score += 1;
+            }
             if method.language == reference.language {
                 score += 1;
             }

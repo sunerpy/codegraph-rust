@@ -228,7 +228,7 @@ pub(crate) fn is_member_class_kind(kind: NodeKind) -> bool {
 }
 
 /// Upstream `isMethodOwnerKind`.
-fn is_method_owner_kind(node: &Node) -> bool {
+pub(crate) fn is_method_owner_kind(node: &Node) -> bool {
     matches!(
         node.kind,
         NodeKind::Class | NodeKind::Struct | NodeKind::Union | NodeKind::Interface
@@ -1374,6 +1374,11 @@ pub(crate) fn is_std_chain_target(candidate: &Node, receiver: &str) -> bool {
         return true;
     }
     receiver == "this" || (!receiver.is_empty() && shares_receiver_word(receiver, candidate))
+}
+
+/// Whether `name` is one of [`KOTLIN_STD_METHODS`].
+pub(crate) fn is_kotlin_std_method(name: &str) -> bool {
+    KOTLIN_STD_METHODS.contains(&name)
 }
 
 /// Upstream `sharesReceiverWord`: the receiver's last link names the owner

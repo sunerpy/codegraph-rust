@@ -97,7 +97,26 @@ impl LanguageSpec for CSharpSpec {
                 }
             }
         }
-        Some("private".to_string())
+        // No modifier: an interface's members are public, a type declared in
+        // a namespace (or the file) is internal, and a class or struct member
+        // is private (upstream #2171).
+        let container = match node.parent() {
+            Some(parent) if parent.kind() == "declaration_list" => parent.parent(),
+            other => other,
+        };
+        Some(
+            match container.map(|container| container.kind()) {
+                Some("interface_declaration") => "public",
+                None
+                | Some(
+                    "compilation_unit"
+                    | "namespace_declaration"
+                    | "file_scoped_namespace_declaration",
+                ) => "internal",
+                _ => "private",
+            }
+            .to_string(),
+        )
     }
     fn is_static(&self, node: Node<'_>, _source: &str) -> bool {
         has_modifier(node, "static")
