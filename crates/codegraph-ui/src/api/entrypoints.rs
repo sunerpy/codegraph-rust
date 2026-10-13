@@ -11,12 +11,15 @@ use std::collections::HashMap;
 use std::time::Instant;
 
 use codegraph_core::file_class::is_generated_file;
-use codegraph_core::types::{Node, NodeKind};
+use codegraph_core::generated_header::is_js_whitespace;
+use codegraph_core::types::{EdgeKind, Node, NodeKind};
+use codegraph_store::TopCallingFile;
 use serde::Serialize;
 use serde_json::{Value, json};
 
 use super::Ctx;
 use super::routes::{WireRoute, build_routes};
+use super::source::read_indexed_file_text;
 use super::stats::frameworks;
 use super::wire::{
     WireList, WireNodeRef, is_test_file, is_test_path, locale_compare, to_node_ref, to_posix_path,
@@ -34,6 +37,8 @@ const SCAN_ROWS: i64 = 400;
 const MAX_FILES_PER_DIR: usize = 2;
 /// Test paths per reach query.
 const TEST_CHUNK: usize = 500;
+/// A Swift file read for its `#Preview` blocks, at most.
+const MAX_PREVIEW_SCAN: u64 = 1024 * 1024;
 
 /// Kinds that are bookkeeping rather than something to read first.
 fn is_non_hub_kind(kind: NodeKind) -> bool {
@@ -140,7 +145,7 @@ fn route_entries(ctx: &Ctx<'_>, limit: i64) -> ApiResult<Value> {
 }
 
 fn executable_files(ctx: &Ctx<'_>, limit: usize) -> ApiResult<WireList<WireEntryFile>> {
-    let ranked = ctx.store.top_calling_files(SCAN_ROWS)?;
+    let ranked = without_previews(ctx, ctx.store.top_calling_files(SCAN_ROWS)?)?;
     let ids: Vec<String> = ranked.iter().map(|r| r.node_id.clone()).collect();
     let nodes = ctx.store.nodes_by_ids(&ids)?;
 
@@ -186,6 +191,133 @@ fn executable_files(ctx: &Ctx<'_>, limit: usize) -> ApiResult<WireList<WireEntry
     // overstatement.
     let total = eligible.max(items.len());
     Ok(wire_list(items, total))
+}
+
+/// The ranking with a Swift file's `#Preview { … }` calls taken out (upstream
+/// `withoutPreviews`, #2109).
+///
+/// A preview sits at the top level of a SwiftUI view's file, so its body's
+/// constructions are module-level edges out of the file — and every view with
+/// a preview ranked as "a file that runs something". A preview is Xcode's
+/// canvas, never code the app runs. A file whose only module-level calls are
+/// previews leaves the list; the rest are re-ranked on what is left.
+fn without_previews(ctx: &Ctx<'_>, rows: Vec<TopCallingFile>) -> ApiResult<Vec<TopCallingFile>> {
+    let mut adjusted = false;
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        if !row.file_path.ends_with(".swift") {
+            out.push(row);
+            continue;
+        }
+        let spans = read_indexed_file_text(ctx, &row.file_path, MAX_PREVIEW_SCAN)
+            .filter(|text| text.contains("#Preview"))
+            .map(|text| swift_preview_spans(&text))
+            .unwrap_or_default();
+        if spans.is_empty() {
+            out.push(row);
+            continue;
+        }
+        let in_preview = ctx
+            .store
+            .outgoing_edges_from(
+                std::slice::from_ref(&row.node_id),
+                &[EdgeKind::Calls, EdgeKind::Instantiates],
+            )?
+            .iter()
+            .filter(|edge| {
+                edge.line
+                    .is_some_and(|line| spans.iter().any(|&(from, to)| line >= from && line <= to))
+            })
+            .count() as i64;
+        if in_preview == 0 {
+            out.push(row);
+            continue;
+        }
+        adjusted = true;
+        let calls = row.calls - in_preview;
+        if calls > 0 {
+            out.push(TopCallingFile {
+                calls,
+                score: calls * (1 + row.reaches),
+                ..row
+            });
+        }
+    }
+    if adjusted {
+        // The scan's own order: score, then calls, then path.
+        out.sort_by(|a, b| {
+            b.score
+                .cmp(&a.score)
+                .then(b.calls.cmp(&a.calls))
+                .then_with(|| a.file_path.cmp(&b.file_path))
+        });
+    }
+    Ok(out)
+}
+
+/// The line spans (1-based, inclusive) of a Swift file's top-level
+/// `#Preview { … }` macros, trailing closures included — WidgetKit's
+/// `#Preview(as: .systemSmall) { … } timeline: { … }` is one preview.
+fn swift_preview_spans(text: &str) -> Vec<(i64, i64)> {
+    let lines: Vec<&str> = text
+        .split('\n')
+        .map(|line| line.strip_suffix('\r').unwrap_or(line))
+        .collect();
+    let mut spans = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        if !opens_preview(lines[i]) {
+            i += 1;
+            continue;
+        }
+        let mut depth = 0i64;
+        let mut opened = false;
+        let mut end = None;
+        'scan: for (j, line) in lines.iter().enumerate().skip(i) {
+            for (c, ch) in line.char_indices() {
+                if ch == '{' {
+                    depth += 1;
+                    opened = true;
+                } else if ch == '}' && opened {
+                    depth -= 1;
+                    if depth == 0 {
+                        // Another trailing closure (`} timeline: {`) continues the macro.
+                        let next = lines.get(j + 1).copied().unwrap_or("");
+                        if !opens_trailing_closure(&format!("{} {next}", &line[c + 1..])) {
+                            end = Some(j);
+                            break 'scan;
+                        }
+                    }
+                }
+            }
+        }
+        let Some(end) = end else {
+            break;
+        };
+        spans.push((i as i64 + 1, end as i64 + 1));
+        i = end + 1;
+    }
+    spans
+}
+
+/// `^#Preview\b`: the line opens a preview macro, not `#PreviewProvider`.
+fn opens_preview(line: &str) -> bool {
+    line.strip_prefix("#Preview")
+        .is_some_and(|rest| !rest.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_'))
+}
+
+/// `^\s*\w+\s*:\s*\{`: what follows a closing brace opens another labelled
+/// trailing closure.
+fn opens_trailing_closure(rest: &str) -> bool {
+    let rest = rest.trim_start_matches(is_js_whitespace);
+    let after_label = rest.trim_start_matches(|c: char| c.is_ascii_alphanumeric() || c == '_');
+    if after_label.len() == rest.len() {
+        return false;
+    }
+    after_label
+        .trim_start_matches(is_js_whitespace)
+        .strip_prefix(':')
+        .is_some_and(|rest| rest.trim_start_matches(is_js_whitespace).starts_with('{'))
 }
 
 fn test_files(ctx: &Ctx<'_>, limit: usize) -> ApiResult<WireList<WireEntryTest>> {
@@ -289,6 +421,42 @@ mod tests {
         assert_eq!(directory_of("main.rs"), ".");
         assert_eq!(directory_of("src/bin/main.rs"), "src/bin");
         assert_eq!(directory_of("src\\win\\main.rs"), "src/win");
+    }
+
+    /// Upstream `swiftPreviewSpans`' fixture (#2109).
+    #[test]
+    fn finds_a_files_top_level_previews_a_widgets_timeline_closure_included() {
+        let text = [
+            "struct Row: View {",
+            "  var body: some View { Text(\"x\") }",
+            "}",
+            "",
+            "#Preview {",
+            "  Row()",
+            "}",
+            "",
+            "#Preview(as: .systemSmall) {",
+            "  AccountWidget()",
+            "} timeline: {",
+            "  Entry(date: Date())",
+            "}",
+            "let later = Row()",
+        ]
+        .join("\n");
+        assert_eq!(swift_preview_spans(&text), vec![(5, 7), (9, 13)]);
+    }
+
+    #[test]
+    fn a_preview_provider_or_an_unclosed_preview_is_no_span() {
+        assert!(swift_preview_spans("#PreviewProvider {\n}\n").is_empty());
+        assert!(swift_preview_spans("  #Preview {\n}\n").is_empty());
+        assert_eq!(
+            swift_preview_spans("#Preview {\r\n  Row()\r\n}\r\n#Preview {\n  Row(\n"),
+            vec![(1, 3)]
+        );
+        assert!(opens_trailing_closure(" timeline : {"));
+        assert!(!opens_trailing_closure(" .padding()"));
+        assert!(!opens_trailing_closure(" : {"));
     }
 
     #[test]

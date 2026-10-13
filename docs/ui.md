@@ -124,6 +124,11 @@ The entry points' hubs leave out symbols in test files and in generated files
 (the indexed flag or the path convention), so a vendored bundle's one-letter
 functions, depended on by the bundle alone, never top the list.
 
+The files that run something do not count the calls inside a Swift file's
+top-level `#Preview { … }` macros, trailing closures included: a preview is
+Xcode's canvas, so a view whose only top-level calls are previews leaves the
+list, and a file with other top-level calls is ranked on those.
+
 ## Differences from upstream
 
 The wire shapes, limits, error codes and refusals follow upstream `v1.6.1`. Where

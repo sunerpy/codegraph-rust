@@ -289,3 +289,76 @@ export function warm(): string {
     assert!(!names.contains(&"n"), "{names:?}");
     assert!(!names.contains(&"t"), "{names:?}");
 }
+
+/// Upstream #2109(c): a SwiftUI view's top-level `#Preview { … }` is Xcode's
+/// canvas, so its constructions do not make the view a file that runs
+/// something; a file with a real top-level call beside a widget's preview
+/// keeps that one.
+#[tokio::test]
+async fn lists_no_swiftui_preview_as_a_file_that_runs_something() {
+    let project = Project::indexed(&[
+        (
+            "App/HomeView.swift",
+            "import SwiftUI
+struct HomeView: View {
+    var body: some View { Text(\"Home\") }
+}
+
+#Preview {
+    HomeView()
+}
+",
+        ),
+        (
+            "App/main.swift",
+            "import Foundation
+let server = Server()
+server.start()
+",
+        ),
+        (
+            "App/Server.swift",
+            "final class Server {
+    func start() {}
+}
+",
+        ),
+        (
+            "App/App.swift",
+            "import SwiftUI
+@main
+struct HomeApp: App {
+    var body: some Scene { WindowGroup { HomeView() } }
+}
+",
+        ),
+        (
+            "Widgets/Board.swift",
+            "import SwiftUI
+let shared = Server()
+shared.start()
+
+#Preview(as: .systemSmall) {
+    HomeView()
+} timeline: {
+    Server()
+}
+",
+        ),
+    ]);
+    let body = project.viewer().json("/api/entrypoints").await;
+    let files = files_of(&body["files"]);
+    assert!(files.contains(&"App/main.swift".to_string()), "{files:?}");
+    assert!(
+        !files.contains(&"App/HomeView.swift".to_string()),
+        "{files:?}"
+    );
+    let board = body["files"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["file"] == "Widgets/Board.swift")
+        .unwrap_or_else(|| panic!("{files:?}"))
+        .clone();
+    assert_eq!(board["calls"], 1, "{board}");
+}
