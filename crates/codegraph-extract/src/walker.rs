@@ -162,6 +162,24 @@ const MEMBER_SHAPED_CALLEE_KINDS: [&str; 6] = [
     "qualified_identifier",
 ];
 
+/// A Swift receiver that is a path of types, two segments or more, each
+/// capitalized and not led by `Self.` (upstream #2118
+/// `SWIFT_TYPE_PATH_RECEIVER`): `API.PackageController.GetRoute`, its
+/// whitespace dropped.
+fn swift_type_path_receiver(text: &str) -> Option<String> {
+    let path: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+    if path.starts_with("Self.") {
+        return None;
+    }
+    let segments: Vec<&str> = path.split('.').collect();
+    let capitalized = |segment: &str| {
+        let mut chars = segment.chars();
+        chars.next().is_some_and(|c| c.is_ascii_uppercase())
+            && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+    };
+    (segments.len() >= 2 && segments.iter().all(|segment| capitalized(segment))).then_some(path)
+}
+
 fn is_member_shaped_callee(node: SyntaxNode<'_>) -> bool {
     MEMBER_SHAPED_CALLEE_KINDS.contains(&node.kind())
 }
@@ -5844,6 +5862,21 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
                             // the scope and read the member's declaration.
                             callee_name =
                                 format!("{}.{method_name}", node_text(receiver, self.source));
+                        } else if self.spec.language() == Language::Swift
+                            && receiver.kind() == "navigation_expression"
+                            && let Some(path) =
+                                swift_type_path_receiver(&node_text(receiver, self.source))
+                        {
+                            // A Swift call through a type path (upstream
+                            // #2118), `API.PackageController.GetRoute.query(on:)`
+                            // on one line or split before the `.query`, keeps
+                            // the path: its last segment alone matched
+                            // whichever type's `query` came first. The resolver
+                            // finds the member on the type the path names, or
+                            // leaves the call unresolved. An instance chain
+                            // (`self.store.load()`) or a mixed path
+                            // (`URLSession.shared.data`) is no type path.
+                            callee_name = format!("{path}.{method_name}");
                         } else if is_member_shaped_callee(receiver) {
                             // #1496 — outside TS/JS (handled above), a receiver
                             // that is itself member-shaped (`self.mailer`,

@@ -3847,6 +3847,211 @@ pub fn swift_extension_beside_a_reference_keeps_the_declaration() -> Case {
         )
 }
 
+/// Upstream #2118 (W4-SW-02): a type-path call's member is owned through
+/// the path its extension writes; an edit to that path in another file keeps
+/// every node id, yet the unchanged call no longer names the type.
+pub fn swift_type_path_call_follows_an_extension_path_change() -> Case {
+    Case::new(Change::EditHeritage, &[Language::Swift])
+        .file(
+            "Sources/App/API.swift",
+            "enum API {\n    enum Ctl {}\n}\nenum Other {\n    enum Ctl {}\n}\nextension API.Ctl {\n    enum GetRoute {\n        static func query() -> Int { 1 }\n    }\n}\n",
+        )
+        .file(
+            "Sources/App/Health.swift",
+            "enum Health {\n    static func one() -> Int { API.Ctl.GetRoute.query() }\n}\n",
+        )
+        .write(
+            "Sources/App/API.swift",
+            "enum API {\n    enum Ctl {}\n}\nenum Other {\n    enum Ctl {}\n}\nextension Other.Ctl {\n    enum GetRoute {\n        static func query() -> Int { 1 }\n    }\n}\n",
+        )
+        .edge_before("method Health::one", "calls", "method Ctl::GetRoute::query")
+        .no_edge_after("method Health::one", "calls", "method Ctl::GetRoute::query")
+}
+
+/// Upstream #2118 (W4-SW-02): an unresolved type-path call waits for the
+/// path an extension in a third file writes to name its type; no node id
+/// moves, and the call's own qualifier binds a file that does not change.
+pub fn swift_type_path_call_reaches_an_extension_that_now_writes_its_path() -> Case {
+    Case::new(Change::EditHeritage, &[Language::Swift])
+        .file(
+            "Sources/App/API.swift",
+            "enum API {\n    enum Ctl {}\n}\nenum Other {\n    enum Ctl {}\n}\n",
+        )
+        .file(
+            "Sources/App/Routes.swift",
+            "extension Other.Ctl {\n    enum GetRoute {\n        static func query() -> Int { 1 }\n    }\n}\n",
+        )
+        .file(
+            "Sources/App/Health.swift",
+            "enum Health {\n    static func one() -> Int { API.Ctl.GetRoute.query() }\n}\n",
+        )
+        .write(
+            "Sources/App/Routes.swift",
+            "extension API.Ctl {\n    enum GetRoute {\n        static func query() -> Int { 1 }\n    }\n}\n",
+        )
+        .edge_after("method Health::one", "calls", "method Ctl::GetRoute::query")
+}
+
+/// More unresolved `….query` calls than one tail retries in a sync (the
+/// ceiling counts every language's): CFML calls on receivers no `query` is
+/// named after, cheap to resolve.
+static UNTYPED_QUERY_CALLS: LazyLock<String> = LazyLock::new(|| {
+    let mut text = String::from("component {\n  function noise() {\n");
+    for index in 0..501 {
+        text.push_str(&format!("    n{index}.query({index});\n"));
+    }
+    text.push_str("    return 0;\n  }\n}\n");
+    text
+});
+
+/// Upstream #2118 (W4-SW-02): a member a standalone extension gains
+/// settles the parked type-path call of its name in a third file, however
+/// many parked calls share its tail.
+pub fn swift_type_path_call_reaches_a_member_an_extension_gains_past_the_tail_ceiling() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Swift, Language::Cfml])
+        .file("Sources/App/API.swift", "enum API {\n    enum GetRoute {}\n}\n")
+        .file(
+            "Sources/App/Routes.swift",
+            "extension API.GetRoute {\n    static func list() -> Int { 1 }\n}\n",
+        )
+        .file(
+            "Sources/App/Health.swift",
+            "enum Health {\n    static func one() -> Int { API.GetRoute.query() }\n}\n",
+        )
+        .file("noise/Noise.cfc", UNTYPED_QUERY_CALLS.as_str())
+        .write(
+            "Sources/App/Routes.swift",
+            "extension API.GetRoute {\n    static func list() -> Int { 1 }\n    static func query() -> Int { 2 }\n}\n",
+        )
+        .edge_after("method Health::one", "calls", "method GetRoute::query")
+}
+
+/// Upstream #2118 (W4-SW-02): a standalone extension already declaring a
+/// `query` under another owner gains the path's own, and later loses it: the
+/// parked type-path call in a third file follows both, however many parked
+/// calls share the tail.
+pub fn swift_type_path_call_follows_a_second_namesake_an_extension_gains() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Swift, Language::Cfml])
+        .file("Sources/App/API.swift", "enum API {\n    enum GetRoute {}\n}\n")
+        .file(
+            "Sources/App/Routes.swift",
+            "extension API.GetRoute {\n    static func list() -> Int { 1 }\n}\nenum Elsewhere {\n    static func query() -> Int { 0 }\n}\n",
+        )
+        .file(
+            "Sources/App/Health.swift",
+            "enum Health {\n    static func one() -> Int { API.GetRoute.query() }\n}\n",
+        )
+        .file("noise/Noise.cfc", UNTYPED_QUERY_CALLS.as_str())
+        .write(
+            "Sources/App/Routes.swift",
+            "extension API.GetRoute {\n    static func list() -> Int { 1 }\n    static func query() -> Int { 2 }\n}\nenum Elsewhere {\n    static func query() -> Int { 0 }\n}\n",
+        )
+        .edge_after("method Health::one", "calls", "method GetRoute::query")
+        .no_edge_after("method Health::one", "calls", "method Elsewhere::query")
+}
+
+/// Upstream #2118 (W4-SW-02): the reverse: the path's own `query` leaves the
+/// extension, the other owner's stays.
+pub fn swift_type_path_call_drops_a_namesake_an_extension_loses() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Swift, Language::Cfml])
+        .file("Sources/App/API.swift", "enum API {\n    enum GetRoute {}\n}\n")
+        .file(
+            "Sources/App/Routes.swift",
+            "extension API.GetRoute {\n    static func list() -> Int { 1 }\n    static func query() -> Int { 2 }\n}\nenum Elsewhere {\n    static func query() -> Int { 0 }\n}\n",
+        )
+        .file(
+            "Sources/App/Health.swift",
+            "enum Health {\n    static func one() -> Int { API.GetRoute.query() }\n}\n",
+        )
+        .file("noise/Noise.cfc", UNTYPED_QUERY_CALLS.as_str())
+        .write(
+            "Sources/App/Routes.swift",
+            "extension API.GetRoute {\n    static func list() -> Int { 1 }\n}\nenum Elsewhere {\n    static func query() -> Int { 0 }\n}\n",
+        )
+        .edge_before("method Health::one", "calls", "method GetRoute::query")
+        .no_edge_after("method Health::one", "calls", "method Elsewhere::query")
+}
+
+/// Upstream #2118 (W4-SW-02): a type-path call waits for the member the
+/// path's type gains.
+pub fn swift_type_path_call_reaches_a_member_its_type_gains() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Swift])
+        .file(
+            "Sources/App/API.swift",
+            "enum API {\n    enum GetRoute {\n        static func list() -> Int { 1 }\n    }\n}\nenum Other {\n    static func query() -> Int { 2 }\n}\n",
+        )
+        .file(
+            "Sources/App/Health.swift",
+            "enum Health {\n    static func one() -> Int { API.GetRoute.query() }\n}\n",
+        )
+        .write(
+            "Sources/App/API.swift",
+            "enum API {\n    enum GetRoute {\n        static func list() -> Int { 1 }\n        static func query() -> Int { 3 }\n    }\n}\nenum Other {\n    static func query() -> Int { 2 }\n}\n",
+        )
+        .edge_after("method Health::one", "calls", "method API::GetRoute::query")
+        .no_edge_after("method Health::one", "calls", "method Other::query")
+}
+
+/// Upstream #2170 (W4-SW-02): a bare call reaches the members of the types
+/// the class around it inherits, read from their heads two levels up; the
+/// middle class's head naming another base in its own file moves the
+/// unchanged grandchild's call, though nothing the grandchild writes names
+/// the middle class.
+pub fn swift_bare_call_follows_a_superclass_change_in_another_file() -> Case {
+    Case::new(Change::EditHeritage, &[Language::Swift])
+        .file(
+            "Sources/Charts/Base.swift",
+            "class ChartViewBase {\n    func reset() {}\n}\nclass OtherBase {\n    func reset() {}\n}\n",
+        )
+        .file("Sources/Charts/Middle.swift", "class Middle: ChartViewBase {\n}\n")
+        .file("Sources/Charts/Leaf.swift", "class Leaf: Middle {\n}\n")
+        .file(
+            "Sources/Charts/Grand.swift",
+            "class Grand: Leaf {\n    func tap() {\n        reset()\n    }\n}\n",
+        )
+        .write("Sources/Charts/Middle.swift", "class Middle: OtherBase {\n}\n")
+        .edge_before("method Grand::tap", "calls", "method ChartViewBase::reset")
+        .edge_after("method Grand::tap", "calls", "method OtherBase::reset")
+        .no_edge_after("method Grand::tap", "calls", "method ChartViewBase::reset")
+}
+
+/// Upstream #2205 (W4-SW-02): a call on a property a superclass in another
+/// file declares with a type follows the declared type.
+pub fn swift_typed_property_follows_an_inherited_declaration() -> Case {
+    Case::new(Change::EditHeritage, &[Language::Swift])
+        .file(
+            "Sources/Cache/Caches.swift",
+            "class ImageCache {\n    func imageCachedType(forKey key: String) -> Int { 0 }\n}\nclass DiskBackend {\n    func imageCachedType(forKey key: String) -> Int { 1 }\n}\n",
+        )
+        .file(
+            "Tests/AppTests/BaseTests.swift",
+            "class BaseTests {\n    var store: ImageCache!\n}\n",
+        )
+        .file(
+            "Tests/AppTests/StoreTests.swift",
+            "class StoreTests: BaseTests {\n    func testType() {\n        _ = store.imageCachedType(forKey: \"a\")\n    }\n}\n",
+        )
+        .write(
+            "Tests/AppTests/BaseTests.swift",
+            "class BaseTests {\n    var store: DiskBackend!\n}\n",
+        )
+        .edge_before(
+            "method StoreTests::testType",
+            "calls",
+            "method ImageCache::imageCachedType",
+        )
+        .edge_after(
+            "method StoreTests::testType",
+            "calls",
+            "method DiskBackend::imageCachedType",
+        )
+        .no_edge_after(
+            "method StoreTests::testType",
+            "calls",
+            "method ImageCache::imageCachedType",
+        )
+}
+
 /// #897: a Kotlin function's value reference follows the object constant it
 /// reads.
 pub fn kotlin_object_constant_reader_body_edit() -> Case {

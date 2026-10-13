@@ -33,7 +33,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::csharp_types::js_regex;
 use crate::source_facts::SourceFacts;
-use crate::types::{RefView, ResolutionContext, ResolvedRef};
+use crate::types::{RefView, ResolutionContext, ResolvedBy, ResolvedRef};
 
 /// The kinds a Swift type declaration is indexed as (upstream `TYPE_KINDS`).
 fn is_type_kind(kind: NodeKind) -> bool {
@@ -60,11 +60,32 @@ pub struct SwiftTables {
     conformances: Mutex<HashMap<String, Arc<Vec<String>>>>,
     inherited: Mutex<HashMap<String, Arc<BTreeSet<String>>>>,
     declaration: Mutex<HashMap<String, Option<Arc<Node>>>>,
+    owners: Mutex<HashMap<String, Option<String>>>,
+    decls: Mutex<HashMap<String, Arc<crate::swift_scope::SwiftDecl>>>,
+    hierarchies: Mutex<HashMap<String, Arc<HashMap<String, usize>>>>,
 }
 
 impl SwiftTables {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// [`crate::swift_scope::swift_decl_of`]'s memo.
+    pub(crate) fn decl(&self, type_name: &str) -> Option<Arc<crate::swift_scope::SwiftDecl>> {
+        memo_get(&self.decls, type_name)
+    }
+
+    pub(crate) fn set_decl(&self, type_name: &str, decl: Arc<crate::swift_scope::SwiftDecl>) {
+        memo_set(&self.decls, type_name.to_string(), decl);
+    }
+
+    /// The memo of the hierarchies around call sites, by file and line.
+    pub(crate) fn hierarchy(&self, key: &str) -> Option<Arc<HashMap<String, usize>>> {
+        memo_get(&self.hierarchies, key)
+    }
+
+    pub(crate) fn set_hierarchy(&self, key: String, hierarchy: Arc<HashMap<String, usize>>) {
+        memo_set(&self.hierarchies, key, hierarchy);
     }
 }
 
@@ -636,6 +657,241 @@ pub(crate) fn gate_swift_type_target(
     }
 }
 
+/// A call through a type path, `API.PackageController.GetRoute.query`: at
+/// least two capitalized segments before the member, not led by `Self.`
+/// (upstream `SWIFT_TYPE_PATH_CALL`; the extractor keeps the path only for
+/// those).
+pub(crate) fn is_swift_type_path_call(reference: &RefView) -> bool {
+    if reference.language != Language::Swift || reference.reference_kind != EdgeKind::Calls {
+        return false;
+    }
+    let name = reference.reference_name.as_str();
+    if name.starts_with("Self.") {
+        return false;
+    }
+    let segments: Vec<&str> = name.split('.').collect();
+    let Some((member, path)) = segments.split_last() else {
+        return false;
+    };
+    let capitalized = |segment: &str| {
+        let mut chars = segment.chars();
+        chars.next().is_some_and(|c| c.is_ascii_uppercase())
+            && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+    };
+    path.len() >= 2 && path.iter().all(|segment| capitalized(segment)) && is_identifier(member)
+}
+
+/// What a type-path call can name: a method, a function, or a case with
+/// associated values (`Gitlab.Error.requestFailed(status:)`).
+fn is_path_member_kind(kind: NodeKind) -> bool {
+    matches!(
+        kind,
+        NodeKind::Method | NodeKind::Function | NodeKind::EnumMember
+    )
+}
+
+/// `API.PackageController.GetRoute.query(on:)` lands on the `query` of the
+/// type the path names, and `API.PackageController.Model(name:)` on that
+/// nested type, never on the member's name alone (upstream #2118
+/// `resolveSwiftTypePathCall`): in a Vapor app every route's type has a
+/// `query`. A path the call's own namespace lets it shorten
+/// (`PackageController.GetRoute` inside `extension API`) or a module
+/// qualifier (`Vapor.HTTPStatus`) still fits. No type on the path, or two,
+/// leaves the call unresolved; the caller tries nothing else.
+pub(crate) fn resolve_swift_type_path_call(
+    reference: &RefView,
+    context: &dyn ResolutionContext,
+) -> Option<ResolvedRef> {
+    let name = reference.reference_name.as_str();
+    let dot = name.rfind('.')?;
+    let member = &name[dot + 1..];
+    let path = name[..dot].replace('.', "::");
+    let candidates = context.get_nodes_by_name_shared(member);
+    let on_path = |kinds: &dyn Fn(NodeKind) -> bool| -> Vec<Arc<Node>> {
+        let mut exact = Vec::new();
+        let mut shortened = Vec::new();
+        for n in &candidates {
+            if n.language != Language::Swift || !kinds(n.kind) {
+                continue;
+            }
+            if is_type_kind(n.kind) && is_swift_extension(n, context) {
+                continue;
+            }
+            let Some(owner) = owner_path(n, context) else {
+                continue;
+            };
+            if owner == path {
+                exact.push(Arc::clone(n));
+            } else if owner.ends_with(&format!("::{path}"))
+                || module_qualified(&owner, &path, context)
+            {
+                shortened.push(Arc::clone(n));
+            }
+        }
+        if exact.is_empty() { shortened } else { exact }
+    };
+    // `API.PackageController.Model(name:)` constructs a nested type.
+    let mut fit = if member.starts_with(|c: char| c.is_ascii_uppercase()) {
+        on_path(&is_type_kind)
+    } else {
+        Vec::new()
+    };
+    if fit.is_empty() {
+        fit = on_path(&is_path_member_kind);
+    }
+    // The Composable Architecture's `@Reducer enum Path { case detail(Detail)
+    // }` generates `Path.State` and `Path.Action` with the same cases, so
+    // `Path.State.detail(…)` constructs the case written in `Path`.
+    if fit.is_empty()
+        && let Some(reducer) = path
+            .strip_suffix("::State")
+            .or_else(|| path.strip_suffix("::Action"))
+            .filter(|reducer| !reducer.is_empty())
+    {
+        fit = candidates
+            .iter()
+            .filter(|n| {
+                n.language == Language::Swift
+                    && n.kind == NodeKind::EnumMember
+                    && owner_path(n, context).is_some_and(|owner| {
+                        owner == reducer || owner.ends_with(&format!("::{reducer}"))
+                    })
+                    && is_reducer_enum(n, context)
+            })
+            .cloned()
+            .collect();
+    }
+    let owners: BTreeSet<Option<String>> = fit.iter().map(|n| owner_path(n, context)).collect();
+    if fit.is_empty() || owners.len() > 1 {
+        return None;
+    }
+    // Of one type's overloads, the first declared.
+    let target = fit
+        .into_iter()
+        .min_by(|a, b| (&a.file_path, a.start_line).cmp(&(&b.file_path, b.start_line)))?;
+    Some(ResolvedRef {
+        original: reference.clone(),
+        target_node_id: target.id.clone(),
+        confidence: 0.9,
+        resolved_by: ResolvedBy::QualifiedName,
+    })
+}
+
+/// Is this case declared in a `@Reducer enum`? (upstream `isReducerEnum`.)
+fn is_reducer_enum(member: &Node, context: &dyn ResolutionContext) -> bool {
+    let Some(owner) = context
+        .get_nodes_in_file_shared(&member.file_path)
+        .into_iter()
+        .filter(|t| {
+            t.kind == NodeKind::Enum
+                && t.start_line <= member.start_line
+                && t.end_line >= member.end_line
+        })
+        .max_by_key(|t| t.start_line)
+    else {
+        return false;
+    };
+    context
+        .source_facts(&owner.file_path)
+        .is_some_and(|facts| has_reducer_attribute(&facts, &owner))
+}
+
+/// Whether `@Reducer` is written on an enum's first line or the line above
+/// it (the node starts at its attributes).
+fn has_reducer_attribute(facts: &SourceFacts, owner: &Node) -> bool {
+    let text: Vec<&str> = (owner.start_line - 1..=owner.start_line + 1)
+        .filter_map(|line| line_of(facts, line))
+        .collect();
+    reducer_attribute().is_match(&text.join(" "))
+}
+
+/// `@Reducer` as a whole word.
+fn reducer_attribute() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| Regex::new(r"@Reducer(?-u:\b)").expect("Swift reducer pattern"))
+}
+
+/// `Vapor::HTTPStatus` for a type `HTTPStatus`: a qualifier that names no
+/// project type is a module (upstream `moduleQualified`).
+fn module_qualified(owner: &str, path: &str, context: &dyn ResolutionContext) -> bool {
+    let Some(head) = path.strip_suffix(&format!("::{owner}")) else {
+        return false;
+    };
+    !head.contains("::")
+        && !context
+            .get_nodes_by_name_shared(head)
+            .iter()
+            .any(|n| is_swift_type(n))
+}
+
+/// The full path of the type a member is declared on (upstream
+/// `ownerPath`). Its qualified name starts at the outermost declaration in
+/// its file, and an extension is named by its last segment (the members of
+/// `extension API.PackageController { enum GetRoute { … } }` are
+/// `PackageController::GetRoute::…`), so the outermost extension's written
+/// path is read back from its line. `None` for a top-level function.
+fn owner_path(member: &Node, context: &dyn ResolutionContext) -> Option<String> {
+    let tables = context.swift_tables();
+    if let Some(hit) = memo_get(&tables.owners, &member.id) {
+        return hit;
+    }
+    let path = member
+        .qualified_name
+        .rfind("::")
+        .map(|cut| member.qualified_name[..cut].to_string())
+        .map(|path| {
+            let first = path.split("::").next().unwrap_or(&path).to_string();
+            let outer = context
+                .get_nodes_in_file_shared(&member.file_path)
+                .into_iter()
+                .filter(|t| {
+                    t.name == first
+                        && is_type_kind(t.kind)
+                        && t.start_line <= member.start_line
+                        && t.end_line >= member.end_line
+                })
+                .min_by_key(|t| t.start_line);
+            match outer.and_then(|outer| extended_path(&outer, context)) {
+                Some(extended) => format!("{extended}{}", &path[first.len()..]),
+                None => path,
+            }
+        });
+    memo_set(&tables.owners, member.id.clone(), path.clone());
+    path
+}
+
+/// `extension API.PackageController {` → `API::PackageController`; `None`
+/// for anything but an extension of a nested type (upstream `extendedPath`).
+fn extended_path(node: &Node, context: &dyn ResolutionContext) -> Option<String> {
+    if !is_swift_extension(node, context) {
+        return None;
+    }
+    let facts = context.source_facts(&node.file_path)?;
+    extended_path_in(&facts, node)
+}
+
+/// [`extended_path`]'s reading of an extension's head.
+fn extended_path_in(facts: &SourceFacts, node: &Node) -> Option<String> {
+    static WRITTEN: OnceLock<Regex> = OnceLock::new();
+    let first = line_of(facts, node.start_line).unwrap_or("");
+    let column = usize::try_from(node.start_column).unwrap_or(0);
+    let mut parts: Vec<&str> = vec![first.get(column..).unwrap_or("")];
+    for line in node.start_line + 1..=node.start_line + 3 {
+        if let Some(text) = line_of(facts, line) {
+            parts.push(text);
+        }
+    }
+    let head = string_literal()
+        .replace_all(&parts.join(" "), "\"\"")
+        .into_owned();
+    let written = WRITTEN.get_or_init(|| {
+        js_regex(r"(?-u:\b)extension\s+((?:[A-Za-z_][A-Za-z0-9_]*\s*\.\s*)+[A-Za-z_][A-Za-z0-9_]*)")
+    });
+    let path = written.captures(&head)?.get(1)?.as_str();
+    let path: String = path.chars().filter(|c| !c.is_whitespace()).collect();
+    Some(path.replace('.', "::"))
+}
+
 /// Key prefix of the Swift head rows (W4-SW-01): one `project_metadata` row
 /// per Swift file, written by every full index and migration and kept current
 /// by sync.
@@ -646,14 +902,19 @@ pub fn head_row_key(file_path: &str) -> String {
     format!("{HEAD_ROW_KEY_PREFIX}{file_path}")
 }
 
-/// One Swift type declaration, as the readers above take it from the text:
-/// whether it is an extension and what its head names.
+/// One Swift type declaration, as the readers of this module and of
+/// [`crate::swift_scope`] take it from the text: whether it is an extension,
+/// what its head names (by both readers), the nested path an extension
+/// writes, and whether an enum is a TCA `@Reducer`.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct HeadEntry {
     pub qualified_name: String,
     pub kind: String,
     pub extension: bool,
     pub supertypes: Vec<String>,
+    pub inherits: Vec<String>,
+    pub written: Option<String>,
+    pub reducer: bool,
 }
 
 impl HeadEntry {
@@ -680,11 +941,17 @@ impl HeadRow {
         let mut entries: Vec<HeadEntry> = nodes
             .iter()
             .filter(|node| is_swift_type(node))
-            .map(|node| HeadEntry {
-                qualified_name: node.qualified_name.clone(),
-                kind: node.kind.as_str().to_string(),
-                extension: node.kind == NodeKind::Class && declares_extension(&facts, node),
-                supertypes: head_supertypes(&facts, node),
+            .map(|node| {
+                let extension = node.kind == NodeKind::Class && declares_extension(&facts, node);
+                HeadEntry {
+                    qualified_name: node.qualified_name.clone(),
+                    kind: node.kind.as_str().to_string(),
+                    extension,
+                    supertypes: head_supertypes(&facts, node),
+                    inherits: crate::class_heads::swift_head_in(&facts, node).supers,
+                    written: extension.then(|| extended_path_in(&facts, node)).flatten(),
+                    reducer: node.kind == NodeKind::Enum && has_reducer_attribute(&facts, node),
+                }
             })
             .collect();
         entries.sort();
@@ -835,12 +1102,18 @@ mod tests {
                     kind: "struct".to_string(),
                     extension: false,
                     supertypes: vec!["View".to_string()],
+                    inherits: vec!["View".to_string()],
+                    written: None,
+                    reducer: false,
                 },
                 HeadEntry {
                     qualified_name: "View".to_string(),
                     kind: "class".to_string(),
                     extension: true,
                     supertypes: Vec::new(),
+                    inherits: Vec::new(),
+                    written: None,
+                    reducer: false,
                 },
             ]
         );

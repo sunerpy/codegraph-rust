@@ -262,15 +262,16 @@ under `csharp_surface_version` (2); a sync that finds it missing or at another
 version re-resolves every C# file and rebuilds the rows. Neither is a canonical
 surface.
 
-Member surface rows record what a C#, Java or Kotlin call through a declared
+Member surface rows record what a C#, Java, Kotlin or Swift call through a declared
 member reads of a file's classes: `member_surface:<path>` holds the JSON
 `{"classes": [{"name", "qualified_name", "supers", "digest"}]}`, one entry per
 class, struct, interface and enum in node order, with the supertypes its head
 names and a digest of its member-level lines, its head (nine lines, cut at the
 first `{`) and the type parameters it declares. A file with no such declaration
 has no row. They are written, withdrawn and checked like the head rows under
-`member_surface_version` (1); a sync that finds it missing or at another
-version re-resolves every C#, Java and Kotlin file and rebuilds the rows.
+`member_surface_version` (2); a sync that finds it missing or at another
+version re-resolves every C#, Java, Kotlin and Swift file and rebuilds the
+rows.
 Neither is a canonical surface.
 
 Ruby head rows record what a bare Ruby call reads of a file's classes and
@@ -294,11 +295,14 @@ surface.
 
 Swift head rows record what Swift type resolution reads of a file's type
 declarations: `swift_heads:<path>` holds the JSON `{"entries":
-[{"qualified_name", "kind", "extension", "supertypes"}]}`, one entry per class,
-struct, enum, protocol and type alias, sorted, with whether the declaration is
-an `extension` and the last segments of the supertypes its head names. A file
-with no type declaration has no row. They are written, withdrawn and checked
-like the head rows under `swift_heads_version` (1); a sync that finds it
+[{"qualified_name", "kind", "extension", "supertypes", "inherits", "written",
+"reducer"}]}`, one entry per class, struct, enum, protocol and type alias,
+sorted, with whether the declaration is an `extension`, the last segments of
+the supertypes its head names by the two readers resolution uses, the nested
+path an extension writes (`API::PackageController` for `extension
+API.PackageController`) and whether an enum is a TCA `@Reducer`. A file with no
+type declaration has no row. They are written, withdrawn and checked like the
+head rows under `swift_heads_version` (2); a sync that finds it
 missing or at another version re-resolves every Swift file and rebuilds the
 rows. Neither is a canonical surface.
 

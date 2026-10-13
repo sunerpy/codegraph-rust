@@ -276,68 +276,90 @@ fn dart_supertypes_of(type_name: &str, context: &dyn ResolutionContext) -> Vec<S
     names
 }
 
-/// Upstream `SWIFT_TYPE_KINDS` (a protocol is extracted as its own kind here).
-fn is_swift_type(node: &Node) -> bool {
-    node.language == Language::Swift
-        && matches!(
-            node.kind,
-            NodeKind::Class
-                | NodeKind::Struct
-                | NodeKind::Enum
-                | NodeKind::Interface
-                | NodeKind::Protocol
-        )
+/// A Swift declaration's head, read up to its body with comments, attribute
+/// arguments and generic parameters dropped (upstream `swiftHeadOf`):
+/// `@objc(ChartViewBase) open class ChartViewBase<T>: NSUIView,
+/// ChartDataProvider where T: Equatable {` names `NSUIView`,
+/// `ChartDataProvider`; and whether the declaration is an `extension`.
+pub(crate) struct SwiftHead {
+    pub(crate) supers: Vec<String>,
+    pub(crate) extension: bool,
 }
 
-/// What a Swift type's declarations inherit or conform to (upstream
-/// `swiftDeclOf` / `swiftHeadOf`), without the standard library's.
-fn swift_supertypes_of(type_name: &str, context: &dyn ResolutionContext) -> Vec<String> {
+pub(crate) fn swift_head_of(decl: &Node, context: &dyn ResolutionContext) -> SwiftHead {
+    match context.source_facts(&decl.file_path) {
+        Some(facts) => swift_head_in(&facts, decl),
+        None => SwiftHead {
+            supers: Vec::new(),
+            extension: false,
+        },
+    }
+}
+
+/// [`swift_head_of`] over a file's facts.
+pub(crate) fn swift_head_in(facts: &crate::source_facts::SourceFacts, decl: &Node) -> SwiftHead {
     static HEAD: OnceLock<Regex> = OnceLock::new();
     static CLAUSE: OnceLock<Regex> = OnceLock::new();
     static LAST_WORD: OnceLock<Regex> = OnceLock::new();
     let head_re = HEAD.get_or_init(|| {
-        Regex::new(r"(?s)\b(?:class|struct|enum|protocol|extension|actor)\s+[\w.]+\s*(.*)$")
+        Regex::new(r"(?s)\b(class|struct|enum|protocol|extension|actor)\s+[\w.]+\s*(.*)$")
             .expect("swift head")
     });
     let clause_re =
         CLAUSE.get_or_init(|| Regex::new(r"(?s)^:(.*?)(?:\bwhere\b|$)").expect("swift clause"));
     let last_word =
         LAST_WORD.get_or_init(|| Regex::new(r"([A-Za-z_]\w*)\s*$").expect("swift word"));
-    let mut names = Vec::new();
-    for decl in context.get_nodes_by_name_shared(type_name) {
-        if !is_swift_type(&decl) {
-            continue;
+    let span = usize::try_from(decl.end_line - decl.start_line + 1)
+        .unwrap_or(1)
+        .clamp(1, 21);
+    let start = usize::try_from(decl.start_line)
+        .unwrap_or(1)
+        .saturating_sub(1);
+    let end = start.saturating_add(span).min(facts.line_count());
+    let lines = if start < end {
+        facts.join_lines(start, end, "\n")
+    } else {
+        String::new()
+    };
+    let text = strip_c_comments(&lines);
+    let mut depth = 0usize;
+    let mut flat = String::new();
+    for ch in text.chars() {
+        match ch {
+            '<' | '(' => depth += 1,
+            '>' | ')' => depth = depth.saturating_sub(1),
+            '{' if depth == 0 => break,
+            _ if depth == 0 => flat.push(ch),
+            _ => {}
         }
-        let span = usize::try_from(decl.end_line - decl.start_line + 1)
-            .unwrap_or(1)
-            .clamp(1, 21);
-        let text = strip_c_comments(&head_lines(&decl, span, "\n", context));
-        let mut depth = 0usize;
-        let mut flat = String::new();
-        for ch in text.chars() {
-            match ch {
-                '<' | '(' => depth += 1,
-                '>' | ')' => depth = depth.saturating_sub(1),
-                '{' if depth == 0 => break,
-                _ if depth == 0 => flat.push(ch),
-                _ => {}
-            }
-        }
-        let Some(head) = head_re.captures(&flat) else {
-            continue;
-        };
-        let rest = head[1].trim().to_string();
-        let clause = clause_re
-            .captures(&rest)
-            .map(|c| c[1].to_string())
-            .unwrap_or_default();
-        names.extend(
-            clause
-                .split(',')
-                .filter_map(|item| last_word.captures(item.trim()).map(|c| c[1].to_string())),
-        );
     }
-    names
+    let Some(head) = head_re.captures(&flat) else {
+        return SwiftHead {
+            supers: Vec::new(),
+            extension: false,
+        };
+    };
+    let rest = head[2].trim().to_string();
+    let clause = clause_re
+        .captures(&rest)
+        .map(|c| c[1].to_string())
+        .unwrap_or_default();
+    SwiftHead {
+        supers: clause
+            .split(',')
+            .filter_map(|item| last_word.captures(item.trim()).map(|c| c[1].to_string()))
+            .collect(),
+        extension: &head[1] == "extension",
+    }
+}
+
+/// What a Swift type's declarations inherit or conform to, the standard
+/// collections' refinements and UIKit / AppKit ancestry first (upstream
+/// `swiftDeclOf(…).supers`, #2170).
+fn swift_supertypes_of(type_name: &str, context: &dyn ResolutionContext) -> Vec<String> {
+    crate::swift_scope::swift_decl_of(type_name, context)
+        .supers
+        .clone()
 }
 
 /// The superclasses an Objective-C class's `@interface` declarations name

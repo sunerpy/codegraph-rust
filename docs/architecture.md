@@ -382,7 +382,7 @@ around it and their bases, through heads read by name; and a C# type
 that keeps its node while its owner turns from a type into a namespace of the
 same name, or back, has its name touched for the name lane; the
 `csharp_surface_version` marker is withdrawn and restored with the others; a
-C#, Java or Kotlin file whose member surface row moved (a class's head, type
+C#, Java, Kotlin or Swift file whose member surface row moved (a class's head, type
 parameters or member-level lines changed, by a digest, or a class came or went)
 re-resolves, whole, the unchanged files declaring a class of a name the changed
 classes reach (closing over every head naming a reached name), since a call
@@ -406,13 +406,19 @@ there are, since a typed call waits while components of its type's name in
 several files declare the method; the `cfml_heads_version` marker is withdrawn
 and restored with the others; a Swift file whose head row moved (a type
 declaration came or went, became or stopped being an extension, moved to
-another qualified name, or names other supertypes) re-resolves, whole, the
-unchanged Swift files holding a reference to a name the changed declarations
-reach, resolved or parked, or declaring a type of one (closing over every head
-naming a reached name), since a type reference reads whether a node is an
-extension, a nested type's scope, a qualifier and an extended conformance from
-the declarations' text; the `swift_heads_version` marker is withdrawn and
-restored with the others; an
+another qualified name, names other supertypes, writes another nested path, or
+became or stopped being a `@Reducer` enum) re-resolves, whole, the unchanged
+Swift files holding a reference to a name the changed declarations reach,
+resolved or parked, or declaring a type of one (closing over every head naming
+a reached name), and touches every name the file declared or declares (a
+changed Swift file whose row stayed touches each name it now declares under
+other qualified names than before, as when a standalone extension gains or
+loses a member), sending the unchanged Swift files with unresolved references
+written with a receiver ending in one down the whole-file lane however many
+there are, since a type reference, a bare call's hierarchy and a type-path call
+read whether a node is an extension, its scope, its heads and the path its
+extension writes from the declarations' text; the `swift_heads_version` marker
+is withdrawn and restored with the others; an
 import names a file, a folder or a namespace rather than a symbol, so the parked
 imports an added file or a changed file's namespace can satisfy (by the file's
 name and stem, its folder's, or the namespace's whole name) send their files

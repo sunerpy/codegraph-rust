@@ -16,6 +16,17 @@
 //! reference to a reached name, resolved or not, or declaring a type of one,
 //! re-resolve whole.
 //!
+//! A call through a type path (W4-SW-02, upstream #2118) reads the path an
+//! extension of a nested type writes (`extension API.PackageController`) and
+//! whether an enum is a TCA `@Reducer`; a bare or `self.` call reads the
+//! heads of the types around it by a second reader (upstream #2170). Both
+//! are in the entries, and a file whose entries changed also touches every
+//! name it declared or declares (any other changed file, the names whose
+//! declarations, by qualified name, came, went or moved), for the name lane
+//! and, for the unchanged Swift files holding unresolved references written
+//! with a receiver ending in one, for the whole-file lane however many there
+//! are.
+//!
 //! The rows are written last, with the other rows. An index without the
 //! marker at [`VERSION`] re-resolves every Swift file once and rebuilds the
 //! rows.
@@ -34,7 +45,7 @@ use codegraph_store::Store;
 /// Metadata key present when no sync left a Swift dependent unrefreshed.
 pub const VERSION_KEY: &str = "swift_heads_version";
 /// Value of [`VERSION_KEY`].
-pub const VERSION: &str = "1";
+pub const VERSION: &str = "2";
 
 /// `source`'s head row, `None` when it records nothing: a file that is no
 /// Swift file, declares no type, or is not text.
@@ -92,6 +103,24 @@ fn read_row(store: &Store, path: &str) -> Result<Option<HeadRow>> {
 struct Change {
     old_row: Option<HeadRow>,
     new_row: Option<HeadRow>,
+    /// The qualified names the file declared before and after, by name.
+    old_names: BTreeMap<String, Vec<String>>,
+    new_names: BTreeMap<String, Vec<String>>,
+}
+
+/// Each name `nodes` declare, with the qualified names declaring it, sorted.
+fn node_names(nodes: &[Node]) -> BTreeMap<String, Vec<String>> {
+    let mut names: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for node in nodes {
+        names
+            .entry(node.name.clone())
+            .or_default()
+            .push(node.qualified_name.clone());
+    }
+    for qualified in names.values_mut() {
+        qualified.sort();
+    }
+    names
 }
 
 /// What a sync's changed files held for the Swift lane.
@@ -101,18 +130,20 @@ pub(crate) struct SwiftChanges {
 }
 
 impl SwiftChanges {
-    /// `path` changed (its old row still in the store) to `new` (its
-    /// language, text and nodes), or left the index (`None`).
+    /// `path` changed (its old row still in the store, its old nodes
+    /// `old_nodes`) to `new` (its language, text and nodes), or left the
+    /// index (`None`).
     pub(crate) fn note(
         &mut self,
         store: &Store,
         path: &str,
+        old_nodes: &[Node],
         new: Option<(Language, &SourceText, &[Node])>,
     ) -> Result<()> {
         let old_row = read_row(store, path)?;
-        let new_row = match new {
-            Some((language, source, nodes)) => row_of(language, source, nodes),
-            None => None,
+        let (new_row, new_names) = match new {
+            Some((language, source, nodes)) => (row_of(language, source, nodes), node_names(nodes)),
+            None => (None, BTreeMap::new()),
         };
         if old_row.is_none() && new_row.is_none() && !self.changes.contains_key(path) {
             return Ok(());
@@ -124,9 +155,11 @@ impl SwiftChanges {
             .entry(path.to_string())
             .or_insert_with(|| Change {
                 old_row,
+                old_names: node_names(old_nodes),
                 ..Change::default()
             });
         change.new_row = new_row;
+        change.new_names = new_names;
         Ok(())
     }
 }
@@ -136,6 +169,10 @@ impl SwiftChanges {
 pub(crate) struct SwiftRefresh {
     /// Unchanged files to re-resolve whole.
     pub(crate) files: BTreeSet<String>,
+    /// Names to touch for the name lane: every name a file whose entries
+    /// changed declared or declares, and in the other changed files the names
+    /// whose declarations, by qualified name, differ.
+    pub(crate) names: BTreeSet<String>,
     /// Rows to write once the sync's resolution is persisted (`None`
     /// deletes).
     rows: BTreeMap<String, Option<HeadRow>>,
@@ -209,7 +246,7 @@ fn closure<'r>(
     let mut naming: HashMap<&str, BTreeSet<&str>> = HashMap::new();
     for row in rows {
         for entry in &row.entries {
-            for supertype in &entry.supertypes {
+            for supertype in entry.supertypes.iter().chain(&entry.inherits) {
                 naming
                     .entry(supertype.as_str())
                     .or_default()
@@ -269,6 +306,31 @@ pub(crate) fn swift_refresh(
     for (path, change) in &changes.changes {
         if change.old_row.is_some() || change.new_row.is_some() {
             refresh.rows.insert(path.clone(), change.new_row.clone());
+        }
+        if change.old_row != change.new_row {
+            refresh.names.extend(change.old_names.keys().cloned());
+            refresh.names.extend(change.new_names.keys().cloned());
+        } else {
+            // A member declared under another owner, or a second one of its
+            // name (`extension API.GetRoute` gaining `query()` beside an
+            // `Elsewhere.query()`), settles the type-path calls of its name.
+            for name in change.old_names.keys().chain(change.new_names.keys()) {
+                if change.old_names.get(name) != change.new_names.get(name) {
+                    refresh.names.insert(name.clone());
+                }
+            }
+        }
+    }
+    // A call written with a receiver (`API.PackageController.GetRoute.query`)
+    // waits for its tail's name, which the name lane retries only up to a
+    // per-tail ceiling: the unchanged Swift files holding such references to
+    // a touched name re-resolve whole instead.
+    if !refresh.names.is_empty() {
+        let names: Vec<String> = refresh.names.iter().cloned().collect();
+        for reference in store.unresolved_refs_by_name_tails(&names, usize::MAX)? {
+            if reference.language == Language::Swift && unchanged(&reference.file_path) {
+                refresh.files.insert(reference.file_path);
+            }
         }
     }
     let seeds = seeds(changes);
@@ -332,6 +394,9 @@ mod tests {
             kind: if extension { "class" } else { "struct" }.to_string(),
             extension,
             supertypes: supertypes.iter().map(|s| s.to_string()).collect(),
+            inherits: supertypes.iter().map(|s| s.to_string()).collect(),
+            written: None,
+            reducer: false,
         }
     }
 
@@ -348,6 +413,7 @@ mod tests {
             Change {
                 old_row: old,
                 new_row: new,
+                ..Change::default()
             },
         );
         changes

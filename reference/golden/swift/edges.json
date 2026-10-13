@@ -4,12 +4,12 @@
     "kind": "calls",
     "line": 12,
     "metadata": {
-      "confidence": 0.85,
-      "resolvedBy": "qualified-name"
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
     },
     "provenance": null,
     "source": "method:f7c6eb334dea73aa3b78c0e47f419235",
-    "target": "method:426c41f82b05bbab4c4473baf5fa5c19"
+    "target": "method:bcfcd79fcf00e45b1c54b8bf6e234a3a"
   },
   {
     "col": 15,
@@ -17,11 +17,11 @@
     "line": 12,
     "metadata": {
       "confidence": 0.9,
-      "resolvedBy": "exact-match"
+      "resolvedBy": "qualified-name"
     },
     "provenance": null,
     "source": "method:f7c6eb334dea73aa3b78c0e47f419235",
-    "target": "method:bcfcd79fcf00e45b1c54b8bf6e234a3a"
+    "target": "method:426c41f82b05bbab4c4473baf5fa5c19"
   },
   {
     "col": 15,

@@ -2363,6 +2363,9 @@ pub fn match_by_exact_name(
     // A bare C# name whose line shows no receiver (upstream #2151).
     let csharp_bare = crate::csharp_types::is_csharp_bare_name(reference)
         && has_no_receiver_on_line(reference, context);
+    // How a bare-named Swift call is written decides what it can mean
+    // (upstream #2170).
+    let swift_shape = crate::swift_scope::swift_call_shape(reference, context);
     let candidates: Vec<Arc<Node>> = reachable
         .iter()
         .filter(|n| {
@@ -2496,10 +2499,22 @@ pub fn match_by_exact_name(
                     n, reference, context,
                 ))
         })
+        // Charts' `min(a, b)` is no range type's `min` field, `super.init(…)`
+        // no Objective-C demo's `init` (upstream #2170).
+        .filter(|n| {
+            swift_shape.as_ref().is_none_or(|shape| {
+                crate::swift_scope::is_swift_call_target(n, shape, reference, context)
+            })
+        })
         .cloned()
         .collect();
     let candidates = if kotlin_bare {
         kotlin_site.lexical(candidates, context)
+    } else if swift_shape
+        .as_ref()
+        .is_some_and(|shape| shape.shape != crate::swift_scope::Shape::Chained)
+    {
+        crate::swift_scope::nearest_swift_members(candidates, reference, context)
     } else {
         candidates
     };
@@ -6128,6 +6143,7 @@ pub fn match_fuzzy(reference: &RefView, context: &dyn ResolutionContext) -> Opti
     // A bare C# name whose line shows no receiver (upstream #2151).
     let csharp_bare = crate::csharp_types::is_csharp_bare_name(reference)
         && has_no_receiver_on_line(reference, context);
+    let swift_shape = crate::swift_scope::swift_call_shape(reference, context);
     let callable_candidates = apply_language_gate(
         candidates
             .into_iter()
@@ -6182,6 +6198,12 @@ pub fn match_fuzzy(reference: &RefView, context: &dyn ResolutionContext) -> Opti
             .filter(|n| {
                 python_shape.as_ref().is_none_or(|shape| {
                     crate::python_values::fits_python_call_shape(n, shape, reference, context)
+                })
+            })
+            // A Swift call's shape, as in exact matching (upstream #2170).
+            .filter(|n| {
+                swift_shape.as_ref().is_none_or(|shape| {
+                    crate::swift_scope::is_swift_call_target(n, shape, reference, context)
                 })
             })
             // `new …MockData()` makes an instance of a type; a method is never
@@ -7043,6 +7065,13 @@ pub fn match_reference(
         return None;
     }
 
+    // A Swift call through a type path (`API.PackageController.GetRoute.query`)
+    // resolves on the type the path names, or not at all: the strategies below
+    // would bind it by the member's name alone (upstream #2118).
+    if crate::swift_type_visibility::is_swift_type_path_call(reference) {
+        return crate::swift_type_visibility::resolve_swift_type_path_call(reference, context);
+    }
+
     // A symbolic name in a Scala type is a type (`F ~> G`) or a
     // kind-projector placeholder (`Either[A, *]`), never an operator method,
     // by any strategy (upstream #2217).
@@ -7060,12 +7089,31 @@ pub fn match_reference(
             reference_name: bare,
             ..reference.clone()
         });
+    // So is a Swift one (`entries.removeAll` for `axis.entries.removeAll()`,
+    // KEEP-RUST #1496): upstream's chained-call rule for the bare name
+    // (#2170).
+    let swift_link =
+        crate::swift_scope::swift_nested_chain_link(reference, context).map(|bare| RefView {
+            reference_name: bare,
+            ..reference.clone()
+        });
     let in_link_scope = |result: ResolvedRef| -> Option<ResolvedRef> {
-        let Some(bare) = scala_link.as_ref() else {
-            return Some(result);
-        };
-        let target = context.get_node_by_id_shared(&result.target_node_id)?;
-        crate::scala_scope::is_scala_member_in_scope(&target, bare, context).then_some(result)
+        if let Some(bare) = scala_link.as_ref() {
+            let target = context.get_node_by_id_shared(&result.target_node_id)?;
+            return crate::scala_scope::is_scala_member_in_scope(&target, bare, context)
+                .then_some(result);
+        }
+        if let Some(bare) = swift_link.as_ref() {
+            let target = context.get_node_by_id_shared(&result.target_node_id)?;
+            let shape = crate::swift_scope::swift_call_shape(bare, context);
+            return shape
+                .as_ref()
+                .is_none_or(|shape| {
+                    crate::swift_scope::is_swift_call_target(&target, shape, bare, context)
+                })
+                .then_some(result);
+        }
+        Some(result)
     };
 
     // `window.App.init()` / a sibling's `this.init()`, recorded by the bare
@@ -7177,7 +7225,7 @@ pub fn match_reference(
     if let Some(result) = match_method_call(reference, context).and_then(&in_link_scope) {
         return Some(result);
     }
-    if let Some(bare) = scala_link.as_ref() {
+    if let Some(bare) = scala_link.as_ref().or(swift_link.as_ref()) {
         return match_by_exact_name(bare, context)
             .or_else(|| match_fuzzy(bare, context))
             .map(|result| ResolvedRef {

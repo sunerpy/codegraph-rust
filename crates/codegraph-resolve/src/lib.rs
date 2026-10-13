@@ -58,6 +58,7 @@ pub mod sfc_scripts;
 pub mod snapshot_context;
 pub mod source_facts;
 pub mod strip_comments;
+mod swift_scope;
 pub mod swift_type_visibility;
 mod type_parameters;
 pub mod types;

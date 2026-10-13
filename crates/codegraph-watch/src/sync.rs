@@ -808,6 +808,7 @@ fn sync_paths_with_store(
             dependent_sites.remove(file);
             dependent_fallbacks.insert(file.clone());
         }
+        changed_names.note_all(swift.names.iter().cloned());
         // What a changed Python import statement re-exports moves for its
         // module's importers without any node of those names changing.
         if !changed_names.python_imports.is_empty() {
@@ -1304,7 +1305,9 @@ fn remove_tracked_file(
     changed_names.members.note(store, relative, None)?;
     changed_names.ruby.note(store, relative, None)?;
     changed_names.cfml.note(store, relative, &old_nodes, None)?;
-    changed_names.swift.note(store, relative, None)?;
+    changed_names
+        .swift
+        .note(store, relative, &old_nodes, None)?;
     delete_unresolved_refs_by_file(store, relative)?;
     store.delete_file_record(relative)?;
     changed_names
@@ -1706,6 +1709,7 @@ fn reextract_into_store(
     changed_names.swift.note(
         store,
         relative,
+        &old_nodes,
         Some((file.language, source, &result.nodes)),
     )?;
     // No name in another file resolves into a minified script (upstream

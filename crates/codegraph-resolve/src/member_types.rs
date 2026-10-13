@@ -21,12 +21,12 @@ use regex::Regex;
 use crate::types::{RefView, ResolutionContext};
 
 /// The languages whose fields and properties declare their type where the
-/// class declares them (upstream `MEMBER_TYPED_LANGUAGES` as #2181 left it;
-/// Swift joins with #2205).
+/// class declares them (upstream `MEMBER_TYPED_LANGUAGES`; Swift joined with
+/// #2205).
 pub fn is_member_typed_language(language: Language) -> bool {
     matches!(
         language,
-        Language::CSharp | Language::Java | Language::Kotlin
+        Language::CSharp | Language::Java | Language::Kotlin | Language::Swift
     )
 }
 
@@ -183,7 +183,10 @@ pub(crate) fn infer_member_receiver_type(
     reference: &RefView,
     context: &dyn ResolutionContext,
 ) -> Option<String> {
-    let name = receiver.strip_prefix("this.").unwrap_or(receiver);
+    let name = receiver
+        .strip_prefix("this.")
+        .or_else(|| receiver.strip_prefix("self."))
+        .unwrap_or(receiver);
     if !is_simple_name(name) {
         return None;
     }
@@ -238,7 +241,7 @@ fn binds_name_itself(function: &Node, name: &str, context: &dyn ResolutionContex
     let r = regex::escape(name);
     let w = "[A-Za-z0-9_]";
     let binds = Regex::new(&format!(
-        r"(?-u:\b)(?:var|val|out\s+[{w}.<>?]+|foreach\s*\(\s*[{w}.<>?,\s]+?)\s+{r}(?-u:\b)|(?-u:\b)for\s*\([^;)]*\s{r}\s*:|(?-u:\b){r}\s*=>|[(,]\s*{r}\s*(?:,[^()]*)?\)\s*=>|(?-u:\b){r}\s*(?:,[^{{}}]*)?->"
+        r"(?-u:\b)(?:var|val|let|out\s+[{w}.<>?]+|foreach\s*\(\s*[{w}.<>?,\s]+?)\s+{r}(?-u:\b)|(?-u:\b)for\s*\([^;)]*\s{r}\s*:|(?-u:\b){r}\s*=>|[(,]\s*{r}\s*(?:,[^()]*)?\)\s*=>|(?-u:\b){r}\s*(?:,[^{{}}]*)?->"
     ))
     .is_ok_and(|binds| binds.is_match(&body));
     memo_set(&tables.shadows, key, binds);
@@ -435,9 +438,9 @@ fn class_member_type(class: &Node, name: &str, context: &dyn ResolutionContext) 
         return hit;
     }
     let r = regex::escape(name);
-    let pattern = if class.language == Language::Kotlin {
+    let pattern = if matches!(class.language, Language::Kotlin | Language::Swift) {
         Regex::new(&format!(
-            r"(?-u:\b)(?:val|var)\s+{r}\s*:\s*([A-Z][A-Za-z0-9_.]*)"
+            r"(?-u:\b)(?:val|var|let)\s+{r}\s*:\s*([A-Z][A-Za-z0-9_.]*)"
         ))
     } else {
         Regex::new(&format!(

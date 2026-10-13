@@ -34,7 +34,7 @@ use codegraph_store::Store;
 /// unrefreshed.
 pub const VERSION_KEY: &str = "member_surface_version";
 /// Value of [`VERSION_KEY`].
-pub const VERSION: &str = "1";
+pub const VERSION: &str = "2";
 
 /// `source`'s member surface row, `None` when it records nothing: a file in
 /// no member-typed language, one without a class, or one that is not text.

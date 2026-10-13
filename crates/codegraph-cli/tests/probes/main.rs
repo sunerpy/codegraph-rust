@@ -10314,4 +10314,237 @@ mod swift {
             project.graph().report()
         );
     }
+
+    /// Upstream #2118: a call through a type path lands on the type the path
+    /// names (declared nested, in `extension API.PackageController`, in
+    /// `extension A.B.C`, shortened inside its namespace, or module-qualified),
+    /// a nested type's initializer, a case with associated values or the case
+    /// a TCA `@Reducer enum` generates its `State` from, or nowhere. Upstream's
+    /// fixture.
+    #[test]
+    fn pr2118_a_call_through_a_type_path_lands_on_the_type_it_names() {
+        let project = Project::new()
+            .file(
+                "Sources/App/API.swift",
+                "enum API {}\nextension API {\n    enum PackageController {\n        enum GetRoute {\n            static func query(on db: Int) -> Int { db }\n            static func query(on db: Int, limit: Int) -> Int { db + limit }\n        }\n        struct Model { let name: String }\n    }\n}\nextension API.PackageController {\n    enum ShowRoute {\n        static func query(on db: Int) -> Int { db }\n    }\n}\nextension API.DependencyController.GetRoute {\n    static func query(on db: Int) -> Int { db }\n}\nextension API {\n    enum DependencyController {\n        enum GetRoute {}\n        static func inside() -> Int { PackageController.GetRoute.query(on: 0) }\n    }\n}\n",
+            )
+            .file(
+                "Sources/App/Other.swift",
+                "enum Other { static func query(on db: Int) -> Int { db } }\nenum Gitlab { enum Error: Swift.Error { case requestFailed(status: Int) } }\nenum Remote { enum Error: Swift.Error { case requestFailed(status: Int) } }\nstruct Detail {}\nenum Screens {\n    @Reducer\n    enum Path { case detail(Detail) }\n}\nenum Zed { enum GetRoute { static func query(on db: Int) -> Int { db } } }\nenum Yon { enum GetRoute { static func query(on db: Int) -> Int { db } } }\n",
+            )
+            .file(
+                "Sources/App/Basics.swift",
+                "struct BasicsView {}\nstruct ObservableBasicsView {}\nextension BasicsView { struct Feature {} }\nextension ObservableBasicsView { struct Feature {} }\nextension BasicsView.Feature { struct State {} }\nextension ObservableBasicsView.Feature { struct State {} }\n",
+            )
+            .file(
+                "Sources/App/Health.swift",
+                "import Foundation\nenum Health {\n    static func one() -> Int { API.PackageController.GetRoute.query(on: 1) }\n    static func two() -> Int {\n        API.PackageController.GetRoute\n            .query(on: 2)\n    }\n    static func three() -> Int { Other.query(on: 3) }\n    static func four() -> Int { API.PackageController.ShowRoute.query(on: 4) }\n    static func five() -> Int { API.DependencyController.GetRoute.query(on: 5) }\n    static func six() -> API.PackageController.Model { API.PackageController.Model(name: \"x\") }\n    static func seven() -> Int { App.Zed.GetRoute.query(on: 7) }\n    static func eight() -> Int { Missing.Thing.query(on: 8) }\n    static func nine() -> Int { API.PackageController.GetRoute.nothing(on: 9) }\n    static func ten() throws { throw Gitlab.Error.requestFailed(status: 10) }\n    static func eleven() { _ = Screens.Path.State.detail(Detail()) }\n    static func twelve() { _ = ObservableBasicsView.Feature.State() }\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        let reached = |caller: &str| -> Vec<String> {
+            let from = graph
+                .nodes
+                .iter()
+                .find(|n| n.name == caller && n.kind == "method")
+                .unwrap_or_else(|| panic!("{caller}\n{}", graph.report()));
+            let mut out: Vec<String> = graph
+                .edges
+                .iter()
+                .filter(|e| e.source == from.id && (e.kind == "calls" || e.kind == "instantiates"))
+                .filter_map(|e| graph.node(&e.target))
+                .filter(|n| n.language == "swift")
+                .map(|n| format!("{}:{}", n.qualified_name, n.start_line))
+                .collect();
+            out.sort();
+            out
+        };
+        let report = graph.report();
+        // The first declared of GetRoute's two overloads.
+        assert_eq!(
+            reached("one"),
+            ["API::PackageController::GetRoute::query:5"],
+            "{report}"
+        );
+        assert_eq!(
+            reached("two"),
+            ["API::PackageController::GetRoute::query:5"],
+            "{report}"
+        );
+        assert_eq!(reached("three"), ["Other::query:1"], "{report}");
+        // Declared in `extension API.PackageController { enum ShowRoute … }`.
+        assert_eq!(
+            reached("four"),
+            ["PackageController::ShowRoute::query:13"],
+            "{report}"
+        );
+        // Declared in `extension API.DependencyController.GetRoute { … }`.
+        assert_eq!(reached("five"), ["GetRoute::query:17"], "{report}");
+        // A nested type's initializer.
+        assert_eq!(
+            reached("six"),
+            ["API::PackageController::Model:8"],
+            "{report}"
+        );
+        // A module qualifier.
+        assert_eq!(reached("seven"), ["Zed::GetRoute::query:9"], "{report}");
+        // No such type, and no such member: nothing, not some other type's
+        // `query`.
+        assert!(reached("eight").is_empty(), "{report}");
+        assert!(reached("nine").is_empty(), "{report}");
+        // A case with associated values.
+        assert_eq!(
+            reached("ten"),
+            ["Gitlab::Error::requestFailed:2"],
+            "{report}"
+        );
+        // The case a TCA `@Reducer enum` generates its State from.
+        assert!(
+            reached("eleven").contains(&"Screens::Path::detail:7".to_string()),
+            "{report}"
+        );
+        // Two types share the qualified name `Feature::State`; the extension
+        // each is declared in tells them apart.
+        assert_eq!(reached("twelve"), ["Feature::State:6"], "{report}");
+        // Shortened inside its namespace.
+        assert_eq!(
+            reached("inside"),
+            ["API::PackageController::GetRoute::query:5"],
+            "{report}"
+        );
+    }
+
+    /// The calls out of `file`, as their targets' qualified names, sorted.
+    fn calls_from(graph: &Graph, file: &str) -> Vec<String> {
+        let mut out: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|e| e.kind == "calls")
+            .filter(|e| graph.node(&e.source).is_some_and(|n| n.file_path == file))
+            .filter_map(|e| graph.node(&e.target))
+            .map(|n| n.qualified_name.clone())
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// Upstream #2170: a bare, `self.` or `super.` Swift call reaches the
+    /// nearest member of the types around it and what they inherit (UIKit
+    /// ancestry included), `super.` the inherited only; down a longer chain
+    /// a standard-library name needs the receiver to name the owner or a
+    /// label only the project's method takes; a playground's global is no
+    /// call target. Upstream's fixture.
+    #[test]
+    fn pr2170_a_swift_call_reached_by_name_follows_how_it_is_written() {
+        let project = Project::new()
+            .file(
+                "Sources/Charts/Utils/Sequence+KeyPath.swift",
+                "extension Sequence {\n    func max<T: Comparable>(by keyPath: KeyPath<Element, T>) -> Element? {\n        return nil\n    }\n}\n",
+            )
+            .file(
+                "Sources/Charts/Renderers/Renderer.swift",
+                "open class Renderer {\n    public struct XBounds {\n        public var min: Int = 0\n    }\n}\n",
+            )
+            .file(
+                "Sources/Charts/Data/ChartData.swift",
+                "open class ChartData {\n    open func removeAll() { }\n}\n",
+            )
+            .file(
+                "Sources/Charts/Formatters/Formatter.swift",
+                "open class Formatter {\n    open func reset() { }\n}\n",
+            )
+            .file(
+                "Sources/Charts/Charts/ChartViewBase.swift",
+                "open class ChartViewBase: NSObject {\n    open func highlightValue(_ h: Int) { }\n    open func reset() { }\n}\n",
+            )
+            .file(
+                "Sources/Charts/Charts/BarChartView.swift",
+                "open class BarChartView: ChartViewBase {\n    open override func highlightValue(_ h: Int) { }\n}\n",
+            )
+            .file(
+                "Sources/Charts/Charts/BarLineChartViewBase.swift",
+                "open class BarLineChartViewBase: ChartViewBase {\n    open func tapped(axis: Axis) {\n        highlightValue(1)\n        let widest = max(1, 2)\n        let narrowest = min(3, 4)\n        super.reset()\n        axis.entries.removeAll()\n    }\n}\n",
+            )
+            .file(
+                "Sources/Charts/Wrapper/KingfisherWrapper.swift",
+                "public struct KingfisherWrapper<Base> {\n    public let base: Base\n}\n\nextension KingfisherWrapper where Base == Data {\n    func contains(jpeg marker: Int) -> Bool {\n        return false\n    }\n}\n",
+            )
+            .file(
+                "Sources/Charts/Wrapper/Decoder.swift",
+                "final class Decoder {\n    func scan(data: Data) -> Bool {\n        return data.kf.contains(jpeg: 0xC2)\n    }\n}\n",
+            )
+            .file(
+                "Demo/Extensions/UIViewController+Bar.swift",
+                "extension UIViewController {\n    func setupOperationBar() { }\n}\n",
+            )
+            .file(
+                "Demo/Controllers/ListController.swift",
+                "class ListController: UICollectionViewController {\n    override func viewDidLoad() {\n        setupOperationBar()\n    }\n}\n",
+            )
+            .file("Demo/Chart.playground/Contents.swift", "let min = 20.0\n")
+            .index();
+        let graph = project.graph();
+        let report = graph.report();
+        assert_eq!(
+            calls_from(graph, "Sources/Charts/Charts/BarLineChartViewBase.swift"),
+            ["ChartViewBase::highlightValue", "ChartViewBase::reset"],
+            "{report}"
+        );
+        assert_eq!(
+            calls_from(graph, "Sources/Charts/Wrapper/Decoder.swift"),
+            ["KingfisherWrapper::contains"],
+            "{report}"
+        );
+        assert_eq!(
+            calls_from(graph, "Demo/Controllers/ListController.swift"),
+            ["UIViewController::setupOperationBar"],
+            "{report}"
+        );
+    }
+
+    /// Upstream #2205: a call on a property the type around it declares with
+    /// a type reaches that type's method, not a subclass override elsewhere
+    /// (upstream's fixture), even when the property's name shares no word
+    /// with its type, and a function's own `let` shadows the property.
+    #[test]
+    fn pr2205_a_call_on_a_typed_swift_property_is_a_member_of_its_type() {
+        let project = Project::new()
+            .file(
+                "Sources/Cache/ImageCache.swift",
+                "open class ImageCache {\n    open func imageCachedType(forKey key: String) -> Int {\n        return 0\n    }\n}\n",
+            )
+            .file(
+                "Sources/Cache/Disk.swift",
+                "open class DiskBackend {\n    open func imageCachedType(forKey key: String) -> Int {\n        return 2\n    }\n}\n",
+            )
+            .file(
+                "Tests/KingfisherTests/ImagePrefetcherTests.swift",
+                "class EvictingPrefetchCache: ImageCache {\n    override func imageCachedType(forKey key: String) -> Int {\n        return 1\n    }\n}\n",
+            )
+            .file(
+                "Tests/KingfisherTests/ImageCacheTests.swift",
+                "class ImageCacheTests {\n    var cache: ImageCache!\n\n    func testCachedType() {\n        _ = cache.imageCachedType(forKey: \"a\")\n        _ = self.cache.imageCachedType(forKey: \"b\")\n    }\n}\n",
+            )
+            .file(
+                "Tests/KingfisherTests/StoreTests.swift",
+                "class StoreTests {\n    var store: ImageCache!\n\n    func testCachedType() {\n        _ = store.imageCachedType(forKey: \"a\")\n        _ = self.store.imageCachedType(forKey: \"b\")\n    }\n    func testShadowed() {\n        let store = DiskBackend()\n        _ = store.imageCachedType(forKey: \"c\")\n    }\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        let report = graph.report();
+        assert_eq!(
+            calls_from(graph, "Tests/KingfisherTests/ImageCacheTests.swift"),
+            ["ImageCache::imageCachedType", "ImageCache::imageCachedType"],
+            "{report}"
+        );
+        assert_eq!(
+            calls_from(graph, "Tests/KingfisherTests/StoreTests.swift"),
+            [
+                "DiskBackend::imageCachedType",
+                "ImageCache::imageCachedType",
+                "ImageCache::imageCachedType",
+            ],
+            "{report}"
+        );
+    }
 }
