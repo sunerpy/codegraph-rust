@@ -2509,6 +2509,58 @@ pub fn objc_c_call_ignores_an_added_method() -> Case {
         )
 }
 
+/// Layers of the deep include graph of [`cpp_macro_visibility_through_a_deep_include_graph`].
+const DEEP_INCLUDE_LAYERS: usize = 20;
+
+/// Two value-guarded headers per layer (`#define H_3_a 1`, a guard the walk
+/// cannot decide from the guard alone), each including both headers of the
+/// next layer: without upstream #2292's re-entry skip a walk rescans them on
+/// every one of the 2^depth inclusion paths.
+static DEEP_INCLUDE_HEADERS: LazyLock<Vec<(String, String)>> = LazyLock::new(|| {
+    let mut headers = Vec::new();
+    for depth in 0..DEEP_INCLUDE_LAYERS {
+        for side in ["a", "b"] {
+            let guard = format!("H_{depth}_{side}");
+            let next = if depth + 1 < DEEP_INCLUDE_LAYERS {
+                format!("#include \"h{0}_a.h\"\n#include \"h{0}_b.h\"\n", depth + 1)
+            } else {
+                String::new()
+            };
+            headers.push((
+                format!("src/h{depth}_{side}.h"),
+                format!(
+                    "#ifndef {guard}\n#define {guard} 1\n{next}#define M_{depth}_{side}(x) (x)\nint f_{depth}_{side}(int);\n#endif\n"
+                ),
+            ));
+        }
+    }
+    headers
+});
+
+/// Upstream #2292: the macro-visibility walk bounded by re-entry skips and an
+/// event budget gives the answers of the full walk, so a header that defines
+/// `TRACE` leaving the project, behind a deep value-guarded include graph,
+/// turns the unchanged unit's `TRACE(1)` from a macro call into a call of the
+/// project's `TRACE`, after the sync as on a fresh index.
+pub fn cpp_macro_visibility_through_a_deep_include_graph() -> Case {
+    let mut case = Case::new(Change::DeleteImportedModule, &[Language::Cpp]);
+    for (path, contents) in DEEP_INCLUDE_HEADERS.iter() {
+        case = case.file(path.as_str(), contents.as_str());
+    }
+    case.file("src/trace.h", "#define TRACE(v) ((void)(v))\n")
+        .file(
+            "src/unit.cpp",
+            "#include \"h0_a.h\"\n#include \"h0_b.h\"\n#include \"trace.h\"\nvoid unit() { TRACE(1); }\n",
+        )
+        .file(
+            "src/decoy.cpp",
+            "void TRACE(int v) {}\nvoid caller() { TRACE(2); }\n",
+        )
+        .remove("src/trace.h")
+        .edge_throughout("function caller", "calls", "function TRACE @src/decoy.cpp")
+        .edge_after("function unit", "calls", "function TRACE @src/decoy.cpp")
+}
+
 /// Upstream #946 (W4-CPP-10): a class annotated with a lowercase macro
 /// mints no phantom function, before and after an edit of a body in the
 /// same file, and an unchanged caller of the real function keeps its edge.

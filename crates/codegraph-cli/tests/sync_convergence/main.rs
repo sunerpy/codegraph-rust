@@ -753,6 +753,7 @@ matrix! {
     cpp_opener_definition_stops_opening_a_namespace,
     c_call_ignores_an_added_cpp_method,
     objc_c_call_ignores_an_added_method,
+    cpp_macro_visibility_through_a_deep_include_graph,
     cpp_lowercase_macro_class_body_edit,
     c_auto_local_initializer_call_body_edit,
     java_subclass_gains_a_base_its_caller_reaches,
