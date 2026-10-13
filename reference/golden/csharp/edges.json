@@ -8,7 +8,7 @@
       "resolvedBy": "qualified-name"
     },
     "provenance": null,
-    "source": "namespace:8f15a54d8f657c2e21df81a2391cb68a",
+    "source": "file:src/App/Store.cs",
     "target": "namespace:3e83f5e99261c9962bbe69f744dc37c2"
   },
   {
@@ -57,7 +57,7 @@
     },
     "provenance": null,
     "source": "method:360b9af06af1e876cce7cf4bcfe932b0",
-    "target": "method:3c79942d42476aa1e0551872721f401d"
+    "target": "class:cac67137c3d2c62db6f57e129ef207e9"
   },
   {
     "col": 24,
@@ -117,7 +117,7 @@
     },
     "provenance": null,
     "source": "method:360b9af06af1e876cce7cf4bcfe932b0",
-    "target": "method:3c79942d42476aa1e0551872721f401d"
+    "target": "class:cac67137c3d2c62db6f57e129ef207e9"
   },
   {
     "col": 29,
@@ -396,6 +396,33 @@
     "metadata": null,
     "provenance": null,
     "source": "file:src/App/Nested.cs",
+    "target": "namespace:0c0d9a94311b32249abb443486d33c6f"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:src/App/Nested.cs",
+    "target": "namespace:84a45d69b807c1cf144107fb36370b4a"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:src/App/Nested.cs",
+    "target": "namespace:c9ae04dd0a248bd63b3a7cc19a49b3e1"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:src/App/Nested.cs",
     "target": "namespace:d9b07aaf620ea2c53e1d29a5773c522e"
   },
   {
@@ -406,6 +433,42 @@
     "provenance": null,
     "source": "file:src/App/Partial.cs",
     "target": "namespace:b57432c45cb41b525dc96e64e176fe0a"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:src/App/Store.cs",
+    "target": "import:218d43326e4679c3443e1e03ae7f0b39"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:src/App/Store.cs",
+    "target": "import:4d81e002609cb31fe68bf38f8347d842"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:src/App/Store.cs",
+    "target": "import:a61dcb9985112af14a86dd433e13e8aa"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:src/App/Store.cs",
+    "target": "import:c800b5aa11d1f24b57b99408fd19a63e"
   },
   {
     "col": null,
@@ -440,6 +503,15 @@
     "line": null,
     "metadata": null,
     "provenance": null,
+    "source": "namespace:0c0d9a94311b32249abb443486d33c6f",
+    "target": "class:08b67a2ee8674fd4a62153a6bed6f23c"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
     "source": "namespace:3e83f5e99261c9962bbe69f744dc37c2",
     "target": "class:0ecb615bc3c80b8c54500a537bbecdd9"
   },
@@ -451,6 +523,15 @@
     "provenance": null,
     "source": "namespace:3e83f5e99261c9962bbe69f744dc37c2",
     "target": "class:1c6d7a083cd0e7b23c17d4e8c4f6242d"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "namespace:84a45d69b807c1cf144107fb36370b4a",
+    "target": "class:cf86dd351af1c0398d876c988cf28158"
   },
   {
     "col": null,
@@ -486,42 +567,6 @@
     "metadata": null,
     "provenance": null,
     "source": "namespace:8f15a54d8f657c2e21df81a2391cb68a",
-    "target": "import:218d43326e4679c3443e1e03ae7f0b39"
-  },
-  {
-    "col": null,
-    "kind": "contains",
-    "line": null,
-    "metadata": null,
-    "provenance": null,
-    "source": "namespace:8f15a54d8f657c2e21df81a2391cb68a",
-    "target": "import:4d81e002609cb31fe68bf38f8347d842"
-  },
-  {
-    "col": null,
-    "kind": "contains",
-    "line": null,
-    "metadata": null,
-    "provenance": null,
-    "source": "namespace:8f15a54d8f657c2e21df81a2391cb68a",
-    "target": "import:a61dcb9985112af14a86dd433e13e8aa"
-  },
-  {
-    "col": null,
-    "kind": "contains",
-    "line": null,
-    "metadata": null,
-    "provenance": null,
-    "source": "namespace:8f15a54d8f657c2e21df81a2391cb68a",
-    "target": "import:c800b5aa11d1f24b57b99408fd19a63e"
-  },
-  {
-    "col": null,
-    "kind": "contains",
-    "line": null,
-    "metadata": null,
-    "provenance": null,
-    "source": "namespace:8f15a54d8f657c2e21df81a2391cb68a",
     "target": "interface:26f33931f5c1df4f0f8c3a5d94640af1"
   },
   {
@@ -548,25 +593,7 @@
     "line": null,
     "metadata": null,
     "provenance": null,
-    "source": "namespace:d9b07aaf620ea2c53e1d29a5773c522e",
-    "target": "class:08b67a2ee8674fd4a62153a6bed6f23c"
-  },
-  {
-    "col": null,
-    "kind": "contains",
-    "line": null,
-    "metadata": null,
-    "provenance": null,
-    "source": "namespace:d9b07aaf620ea2c53e1d29a5773c522e",
-    "target": "class:44b1a5717fab501e1d3c501196a79b82"
-  },
-  {
-    "col": null,
-    "kind": "contains",
-    "line": null,
-    "metadata": null,
-    "provenance": null,
-    "source": "namespace:d9b07aaf620ea2c53e1d29a5773c522e",
+    "source": "namespace:c9ae04dd0a248bd63b3a7cc19a49b3e1",
     "target": "class:cf3cd15792b0b5d6ee49a7b43f64342d"
   },
   {
@@ -576,6 +603,6 @@
     "metadata": null,
     "provenance": null,
     "source": "namespace:d9b07aaf620ea2c53e1d29a5773c522e",
-    "target": "class:cf86dd351af1c0398d876c988cf28158"
+    "target": "class:44b1a5717fab501e1d3c501196a79b82"
   }
 ]

@@ -2163,6 +2163,7 @@ pub fn match_by_exact_name(
     let kotlin_site = crate::kotlin_scope::KotlinSite::new(reference);
     let kotlin_std_chain = crate::kotlin_scope::std_chain_receiver(reference, context);
     let scala_bare = crate::scala_scope::is_scala_bare_call(reference);
+    let csharp_type_ref = crate::csharp_types::is_csharp_type_ref(reference, context);
     let candidates: Vec<Arc<Node>> = reachable
         .iter()
         .filter(|n| {
@@ -2252,6 +2253,18 @@ pub fn match_by_exact_name(
         .filter(|n| {
             !scala_bare || crate::scala_scope::is_scala_member_in_scope(n, reference, context)
         })
+        // A C# type position names a type, never a member sharing its name
+        // (upstream #2121).
+        .filter(|n| !csharp_type_ref || crate::csharp_types::can_name_in_type_position(n))
+        // A C# type name is a type its namespaces can see, and a nested one
+        // only from inside its owner, ahead of the ranking, so a visible
+        // namesake wins (upstream #2216, #2220).
+        .filter(|n| {
+            !crate::csharp_types::is_csharp_bare_type_candidate(n, reference)
+                || (crate::csharp_types::is_csharp_nested_type_in_scope(n, reference, context)
+                    && (n.file_path == reference.file_path
+                        || crate::csharp_types::is_csharp_type_visible(n, reference, context)))
+        })
         // A Scala package object's member, only where it is in scope, ahead
         // of the ranking, so cats.laws' `Eq` can be the `cats` package
         // object's (upstream #2230).
@@ -2331,7 +2344,28 @@ pub fn match_by_qualified_name(
         return crate::cpp_namespaces::match_cpp_global_name(reference, context);
     }
 
-    let candidates = context.get_nodes_by_qualified_name_shared(&reference.reference_name);
+    let mut candidates = context.get_nodes_by_qualified_name_shared(&reference.reference_name);
+    // A C# `using X.Y;` names a namespace: one the project declares, else it
+    // is the file's own (external) using, never another file's using of that
+    // name (upstream #2220).
+    if reference.language == Language::CSharp && reference.reference_kind == EdgeKind::Imports {
+        let namespaces: Vec<Arc<Node>> = candidates
+            .iter()
+            .filter(|n| n.kind == NodeKind::Namespace)
+            .cloned()
+            .collect();
+        candidates = if namespaces.is_empty() {
+            candidates
+                .into_iter()
+                .filter(|n| n.kind != NodeKind::Import || n.file_path == reference.file_path)
+                .collect()
+        } else {
+            prefer_call_site_file(namespaces, &reference.file_path)
+                .into_iter()
+                .take(1)
+                .collect()
+        };
+    }
     if candidates.len() == 1 {
         return Some(ResolvedRef {
             original: reference.clone(),
@@ -4547,11 +4581,26 @@ pub fn match_method_call(
 
     // Strategy 1: direct class name match (name-matcher.ts:825-850). When the
     // receiver names a class in several files, try the call site's own file
-    // first (#1079).
-    for class_node in prefer_call_site_file(
+    // first (#1079), and a C# class the call's namespaces can see before one
+    // they can't: serilog's `Some.InformationEvent()` in Serilog.Tests is its
+    // own Support namespace's `Some` (upstream #2220).
+    let mut class_candidates = prefer_call_site_file(
         context.get_nodes_by_name_shared(&object_or_class),
         &reference.file_path,
-    ) {
+    );
+    if reference.language == Language::CSharp && class_candidates.len() > 1 {
+        let type_ref = RefView {
+            reference_name: object_or_class.clone(),
+            ..reference.clone()
+        };
+        let (visible, hidden): (Vec<Arc<Node>>, Vec<Arc<Node>>) =
+            class_candidates.into_iter().partition(|c| {
+                c.language != Language::CSharp
+                    || crate::csharp_types::is_csharp_type_visible(c, &type_ref, context)
+            });
+        class_candidates = visible.into_iter().chain(hidden).collect();
+    }
+    for class_node in class_candidates {
         // A Scala `object` owns methods callable as `Obj.method()` (#1824).
         if matches!(
             class_node.kind,
@@ -5464,6 +5513,7 @@ pub fn match_fuzzy(reference: &RefView, context: &dyn ResolutionContext) -> Opti
     let kotlin_site = crate::kotlin_scope::KotlinSite::new(reference);
     let kotlin_std_chain = crate::kotlin_scope::std_chain_receiver(reference, context);
     let scala_bare = crate::scala_scope::is_scala_bare_call(reference);
+    let csharp_type_ref = crate::csharp_types::is_csharp_type_ref(reference, context);
     let callable_candidates = apply_language_gate(
         candidates
             .into_iter()
@@ -5496,6 +5546,8 @@ pub fn match_fuzzy(reference: &RefView, context: &dyn ResolutionContext) -> Opti
             .filter(|n| {
                 !scala_bare || crate::scala_scope::is_scala_member_in_scope(n, reference, context)
             })
+            // A C# type position, only a type (upstream #2121).
+            .filter(|n| !csharp_type_ref || crate::csharp_types::can_name_in_type_position(n))
             .filter(|n| {
                 python_shape.as_ref().is_none_or(|shape| {
                     crate::python_values::fits_python_call_shape(n, shape, reference, context)

@@ -250,6 +250,15 @@ checked like the head rows under `scala_surface_version` (1); a sync that finds
 it missing or at another version re-resolves every Scala file and rebuilds the
 rows. Neither is a canonical surface.
 
+C# surface rows record what C# resolution reads of a C# file by the readers it
+uses: `csharp_surface:<path>` holds the JSON `{"globals", "heads"}`: sorted, the
+namespaces its `global using`s import, and each class, interface, struct and
+enum head's name, qualified name and the bases it lists (in node order; a head
+listing no base has no entry). A file with neither has no row. They are
+written, withdrawn and checked like the head rows under `csharp_surface_version`
+(1); a sync that finds it missing or at another version re-resolves every C#
+file and rebuilds the rows. Neither is a canonical surface.
+
 ## FTS5
 
 `nodes_fts` is an external-content FTS5 table over `nodes`:

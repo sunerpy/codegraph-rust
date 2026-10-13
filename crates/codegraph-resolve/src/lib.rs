@@ -27,6 +27,7 @@ mod cpp_supertypes;
 mod cpp_type_aliases;
 mod csharp_extensions;
 mod csharp_scopes;
+pub mod csharp_types;
 pub mod destructured_calls;
 pub mod framework; // the FrameworkResolver extension point
 pub mod frameworks; // concrete react/vue/nestjs FrameworkResolvers

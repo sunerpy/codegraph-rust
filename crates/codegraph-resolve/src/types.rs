@@ -558,6 +558,11 @@ pub trait ResolutionContext {
     fn scala_tables(&self) -> Arc<crate::scala_scope::ScalaTables> {
         Arc::new(crate::scala_scope::ScalaTables::new())
     }
+
+    /// The project-wide C# facts of one resolution pass (W4-CS-01).
+    fn csharp_tables(&self) -> Arc<crate::csharp_types::CsharpTables> {
+        Arc::new(crate::csharp_types::CsharpTables::new())
+    }
 }
 
 /// Go module info parsed from `go.mod`.

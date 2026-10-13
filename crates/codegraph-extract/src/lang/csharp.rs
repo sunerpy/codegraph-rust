@@ -56,8 +56,11 @@ impl LanguageSpec for CSharpSpec {
     fn property_types(&self) -> &'static [&'static str] {
         &["property_declaration"]
     }
+    /// A file-scoped `namespace Foo;` covers the whole file; a block
+    /// `namespace Foo { … }` only its body, which the walker scopes
+    /// (upstream #2220).
     fn package_types(&self) -> &'static [&'static str] {
-        &["namespace_declaration", "file_scoped_namespace_declaration"]
+        &["file_scoped_namespace_declaration"]
     }
     fn name_field(&self) -> &'static str {
         "name"

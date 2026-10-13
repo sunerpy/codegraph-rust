@@ -657,6 +657,13 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
         let node_type = node.kind();
         let mut skip_children = false;
 
+        if self.spec.language() == Language::CSharp
+            && node_type == "namespace_declaration"
+            && self.visit_csharp_block_namespace(node)
+        {
+            return;
+        }
+
         self.maybe_capture_fn_refs(node, node_type);
 
         // `window.App = {…}` / `App.utils = {…}`: the object's functions are
@@ -825,6 +832,43 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
         if !skip_children {
             self.visit_named_children(node);
         }
+    }
+
+    /// A C# block namespace scopes only its own body (upstream #2220):
+    /// serilog's Guard.cs opens `namespace JetBrains.Annotations { … }` and
+    /// then declares `static class Guard` at the top level, and a file's
+    /// second namespace is its own. A namespace written inside another is
+    /// `Outer.Inner`, the dotted name a type's qualified name leads with, so
+    /// it takes the outer's place on the scope while its body is walked.
+    fn visit_csharp_block_namespace(&mut self, node: SyntaxNode<'tree>) -> bool {
+        let Some(name) = self.spec.extract_package(node, self.source) else {
+            return false;
+        };
+        let outer = self
+            .node_stack
+            .last()
+            .and_then(|id| self.nodes.iter().find(|n| &n.id == id))
+            .filter(|n| n.kind == NodeKind::Namespace)
+            .map(|n| (n.id.clone(), n.name.clone()));
+        if outer.is_some() {
+            self.node_stack.pop();
+        }
+        let full = outer.as_ref().map_or_else(
+            || name.clone(),
+            |(_, outer_name)| format!("{outer_name}.{name}"),
+        );
+        let namespace = self.create_node(NodeKind::Namespace, &full, node, NodeExtra::default());
+        if let Some(namespace) = &namespace {
+            self.node_stack.push(namespace.id.clone());
+        }
+        self.visit_named_children(node);
+        if namespace.is_some() {
+            self.node_stack.pop();
+        }
+        if let Some((id, _)) = outer {
+            self.node_stack.push(id);
+        }
+        true
     }
 
     fn visit_named_children(&mut self, node: SyntaxNode<'tree>) {

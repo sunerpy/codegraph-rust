@@ -562,6 +562,7 @@ fn sync_paths_with_store(
     let java_bootstrap = crate::java_heads::needs_bootstrap(store)?;
     let kotlin_bootstrap = crate::kotlin_surfaces::needs_bootstrap(store)?;
     let scala_bootstrap = crate::scala_surfaces::needs_bootstrap(store)?;
+    let csharp_bootstrap = crate::csharp_surfaces::needs_bootstrap(store)?;
 
     let paths = paths.into_iter().collect::<Vec<_>>();
     let total = paths.len();
@@ -614,6 +615,7 @@ fn sync_paths_with_store(
         || java_bootstrap
         || kotlin_bootstrap
         || scala_bootstrap
+        || csharp_bootstrap
     {
         note_python_global_readers(
             project_root,
@@ -721,6 +723,23 @@ fn sync_paths_with_store(
             dependent_fallbacks.insert(file.clone());
         }
         changed_names.note_all(scala.names.iter().cloned());
+        // And C#'s: the `global using`s of a project's files, the heads a
+        // nested type is reached through, and owners that flipped between a
+        // type and a namespace (W4-CS-01).
+        let csharp = crate::csharp_surfaces::csharp_refresh(
+            store,
+            project_root,
+            scope.options.max_file_size,
+            &changed_names.csharp,
+            &reindexed,
+            &changed_names.removed_files,
+            csharp_bootstrap,
+        )?;
+        for file in &csharp.files {
+            dependent_sites.remove(file);
+            dependent_fallbacks.insert(file.clone());
+        }
+        changed_names.note_all(csharp.names.iter().cloned());
         // What a changed Python import statement re-exports moves for its
         // module's importers without any node of those names changing.
         if !changed_names.python_imports.is_empty() {
@@ -810,11 +829,13 @@ fn sync_paths_with_store(
         java.write_rows(store)?;
         kotlin.write_rows(store)?;
         scala.write_rows(store)?;
+        csharp.write_rows(store)?;
         crate::module_surfaces::finish_bootstrap(store)?;
         crate::cpp_dependents::write_marker(store)?;
         crate::java_heads::write_marker(store)?;
         crate::kotlin_surfaces::write_marker(store)?;
         crate::scala_surfaces::write_marker(store)?;
+        crate::csharp_surfaces::write_marker(store)?;
     }
 
     // Orphan sweep (#1187, upstream index.ts:645-682): a full-index resolution
@@ -1201,6 +1222,9 @@ fn remove_tracked_file(
     changed_names
         .scala
         .note(store, relative, &old_nodes, None)?;
+    changed_names
+        .csharp
+        .note(store, relative, &old_nodes, None)?;
     delete_unresolved_refs_by_file(store, relative)?;
     store.delete_file_record(relative)?;
     changed_names
@@ -1577,6 +1601,12 @@ fn reextract_into_store(
         &old_nodes,
         Some((file.language, source, &result.nodes)),
     )?;
+    changed_names.csharp.note(
+        store,
+        relative,
+        &old_nodes,
+        Some((file.language, source, &result.nodes)),
+    )?;
     // No name in another file resolves into a minified script (upstream
     // #2204), and that verdict is read from the script's text: a script that
     // was or is generated can flip it with every node where it was, so all of
@@ -1704,6 +1734,9 @@ struct ChangedNames {
     /// What the changed files held that Scala resolution in other files
     /// reads: heads, package objects and text facts (W4-SC-01).
     scala: crate::scala_surfaces::ScalaChanges,
+    /// What the changed files held that C# resolution in other files reads:
+    /// `global using`s, heads and owners (W4-CS-01).
+    csharp: crate::csharp_surfaces::CsharpChanges,
 }
 
 /// What a changed Python file held before the change. A module global's
@@ -1741,6 +1774,7 @@ impl ChangedNames {
             crate::java_heads::withdraw_marker(store)?;
             crate::kotlin_surfaces::withdraw_marker(store)?;
             crate::scala_surfaces::withdraw_marker(store)?;
+            crate::csharp_surfaces::withdraw_marker(store)?;
             self.surface_dirty = true;
         }
         Ok(())
@@ -2639,6 +2673,156 @@ pub(crate) mod tests {
         rebuilt.retain(|(key, _)| key != "scala_surface:src/app/Spare.scala");
         wanted.retain(|(key, _)| key != "scala_surface:src/app/Spare.scala");
         assert_eq!(rebuilt, wanted);
+        assert_eq!(edge_projection(&db), expected);
+    }
+
+    fn csharp_marker(db: &Path) -> Option<String> {
+        Store::open(db)
+            .unwrap()
+            .get_project_metadata(crate::csharp_surfaces::VERSION_KEY)
+            .unwrap()
+    }
+
+    fn csharp_rows(db: &Path) -> Vec<(String, String)> {
+        Store::open(db)
+            .unwrap()
+            .project_metadata_with_prefix(codegraph_resolve::csharp_types::SURFACE_ROW_KEY_PREFIX)
+            .unwrap()
+    }
+
+    const CSHARP_BASE: (&str, &str) = (
+        "src/Lib/Base.cs",
+        "namespace Lib\n{\n    public class Reader\n    {\n        internal enum State { Start, Done }\n    }\n}\n",
+    );
+    const CSHARP_MIDDLE_READER: (&str, &str) = (
+        "src/Lib/Middle.cs",
+        "namespace Lib\n{\n    public class Middle : Reader\n    {\n    }\n}\n",
+    );
+    const CSHARP_MIDDLE_ALONE: (&str, &str) = (
+        "src/Lib/Middle.cs",
+        "namespace Lib\n{\n    public class Middle\n    {\n    }\n}\n",
+    );
+    const CSHARP_LEAF: (&str, &str) = (
+        "src/Lib/Leaf.cs",
+        "namespace Lib\n{\n    public class Leaf : Middle\n    {\n        object Peek() => State.Start;\n    }\n}\n",
+    );
+    const CSHARP_SPARE: (&str, &str) = (
+        "src/Lib/Spare.cs",
+        "namespace Lib\n{\n    public class Spare\n    {\n    }\n}\n",
+    );
+    const CSHARP_SPARE_EDITED: (&str, &str) = (
+        "src/Lib/Spare.cs",
+        "namespace Lib\n{\n    public class Spare\n    {\n        int Count() => 1;\n    }\n}\n",
+    );
+
+    fn leaf_reaches_state(db: &Path) -> bool {
+        edge_projection(db)
+            .iter()
+            .any(|edge| edge.contains("Leaf::Peek -[references]-> src/Lib/Base.cs"))
+    }
+
+    /// W4-CS-01: a sync failing after its mutations leaves the C# marker
+    /// away, so the next sync, with nothing changed or with an unrelated
+    /// change, re-resolves every C# file and rebuilds the surface rows:
+    /// `Leaf`'s reference to the nested `State`, which the changed middle
+    /// type moves, ends where a fresh index puts it.
+    #[test]
+    fn a_csharp_sync_failing_after_its_mutations_leaves_the_next_one_to_reconcile() {
+        let version = Some(crate::csharp_surfaces::VERSION.to_string());
+        let dir = TestDir::new("csharp-surface-fail");
+        let db = default_db_path(dir.path()).unwrap();
+        let initial = [CSHARP_BASE, CSHARP_MIDDLE_READER, CSHARP_LEAF, CSHARP_SPARE];
+        write_files(dir.path(), &initial);
+        sync_changed_paths(dir.path(), &db, initial.iter().map(|(path, _)| *path)).unwrap();
+        assert_eq!(csharp_marker(&db), version);
+        assert!(leaf_reaches_state(&db), "{:#?}", edge_projection(&db));
+
+        let fail_once = |paths: &[&str]| {
+            FAIL_BEFORE_RESOLUTION.with(|fail| fail.set(true));
+            let failed = sync_changed_paths(dir.path(), &db, paths.iter().copied());
+            FAIL_BEFORE_RESOLUTION.with(|fail| fail.set(false));
+            assert!(failed.is_err(), "the injected failure must stop the sync");
+            assert_eq!(
+                csharp_marker(&db),
+                None,
+                "a failed sync leaves the marker away"
+            );
+        };
+
+        write_files(dir.path(), &[CSHARP_MIDDLE_ALONE]);
+        fail_once(&["src/Lib/Middle.cs"]);
+        sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
+        assert_eq!(csharp_marker(&db), version);
+        let fresh = [CSHARP_BASE, CSHARP_MIDDLE_ALONE, CSHARP_LEAF, CSHARP_SPARE];
+        assert_eq!(
+            edge_projection(&db),
+            fresh_edges("csharp-surface-fail-alone", &fresh)
+        );
+        assert!(!leaf_reaches_state(&db), "{:#?}", edge_projection(&db));
+
+        write_files(dir.path(), &[CSHARP_MIDDLE_READER]);
+        fail_once(&["src/Lib/Middle.cs"]);
+        write_files(dir.path(), &[CSHARP_SPARE_EDITED]);
+        sync_changed_paths(dir.path(), &db, ["src/Lib/Spare.cs"]).unwrap();
+        assert_eq!(csharp_marker(&db), version);
+        let fresh = [
+            CSHARP_BASE,
+            CSHARP_MIDDLE_READER,
+            CSHARP_LEAF,
+            CSHARP_SPARE_EDITED,
+        ];
+        assert_eq!(
+            edge_projection(&db),
+            fresh_edges("csharp-surface-fail-reader", &fresh)
+        );
+        assert!(leaf_reaches_state(&db), "{:#?}", edge_projection(&db));
+    }
+
+    /// W4-CS-01: an index without the C# marker or its surface rows (built
+    /// before them) has every C# file re-resolved and every row rebuilt by its
+    /// next sync: the reference an older sync left without its edge comes
+    /// back.
+    #[test]
+    fn an_index_without_the_csharp_marker_rebuilds_the_surface_rows() {
+        let version = Some(crate::csharp_surfaces::VERSION.to_string());
+        let dir = TestDir::new("csharp-surface-bootstrap");
+        let db = default_db_path(dir.path()).unwrap();
+        let initial = [CSHARP_BASE, CSHARP_MIDDLE_READER, CSHARP_LEAF, CSHARP_SPARE];
+        write_files(dir.path(), &initial);
+        sync_changed_paths(dir.path(), &db, initial.iter().map(|(path, _)| *path)).unwrap();
+        assert_eq!(csharp_marker(&db), version);
+        let rows = csharp_rows(&db);
+        assert!(
+            rows.iter()
+                .any(|(key, _)| key == "csharp_surface:src/Lib/Middle.cs"),
+            "{rows:#?}"
+        );
+        let expected = edge_projection(&db);
+        {
+            let store = Store::open(&db).unwrap();
+            let dropped = store
+                .connection()
+                .execute(
+                    "DELETE FROM edges WHERE kind = 'references' AND target = (SELECT id FROM \
+                     nodes WHERE qualified_name = 'Lib::Reader::State')",
+                    [],
+                )
+                .unwrap();
+            assert_eq!(dropped, 1, "the reference edge an older sync lost");
+            store
+                .delete_project_metadata_with_prefix(
+                    codegraph_resolve::csharp_types::SURFACE_ROW_KEY_PREFIX,
+                )
+                .unwrap();
+            store
+                .delete_project_metadata(crate::csharp_surfaces::VERSION_KEY)
+                .unwrap();
+        }
+        assert_ne!(edge_projection(&db), expected);
+        write_files(dir.path(), &[CSHARP_SPARE_EDITED]);
+        sync_changed_paths(dir.path(), &db, ["src/Lib/Spare.cs"]).unwrap();
+        assert_eq!(csharp_marker(&db), version);
+        assert_eq!(csharp_rows(&db), rows);
         assert_eq!(edge_projection(&db), expected);
     }
 

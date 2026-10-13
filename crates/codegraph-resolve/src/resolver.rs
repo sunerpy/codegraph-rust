@@ -1215,6 +1215,15 @@ fn target_is_visible_across_files(
     if c_family_static_function_is_file_local(target, reference, context) {
         return false;
     }
+    // A C# type is in reach of the namespaces that can see it, and a nested
+    // one only from inside its owner or a type deriving from it (upstream
+    // #2216, #2220).
+    if crate::csharp_types::is_csharp_bare_type_candidate(target, reference)
+        && (!crate::csharp_types::is_csharp_type_visible(target, reference, context)
+            || !crate::csharp_types::is_csharp_nested_type_in_scope(target, reference, context))
+    {
+        return false;
+    }
     // A Scala package object's member is in scope in its package and those
     // under it, or through an import: cats.laws' `Eq` is the `cats` package
     // object's alias, not the `algebra` one's (upstream #2230).

@@ -370,8 +370,17 @@ its top-level types when the package holding them changed, sending the unchanged
 files with references to those names written with a receiver down the
 whole-file lane too, however many there are, since none of those facts is a
 node; the `scala_surface_version` marker is withdrawn and restored with the
-others; an import
-names a file, a folder or a namespace rather than a symbol, so the parked
+others; a C# file whose `global using`s changed re-resolves every unchanged C#
+file whole, since every file of a project reads them and the project is a
+`.csproj`, which is no source file (a `.csproj` or `.props` change itself is not
+yet detected); one whose surface row's heads moved re-resolves, whole, the
+unchanged files declaring a C# type of a name those heads reach (closing over
+every head listing a reached name as a base), since a nested type is reached
+from a type deriving from its owner through heads read by name; and a C# type
+that keeps its node while its owner turns from a type into a namespace of the
+same name, or back, has its name touched for the name lane; the
+`csharp_surface_version` marker is withdrawn and restored with the others; an
+import names a file, a folder or a namespace rather than a symbol, so the parked
 imports an added file or a changed file's namespace can satisfy (by the file's
 name and stem, its folder's, or the namespace's whole name) send their files
 down the whole-file re-resolution lane, which rebuilds an unchanged file's

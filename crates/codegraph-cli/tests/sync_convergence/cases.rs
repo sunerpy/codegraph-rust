@@ -113,11 +113,8 @@ pub fn csharp_using_of_an_added_namespace() -> Case {
             "src/Models.cs",
             "namespace App.Models { public class User {} }\n",
         )
-        .edge_after(
-            "namespace App @src/Svc.cs",
-            "imports",
-            "namespace App.Models",
-        )
+        // A `using` outside a block namespace is its file's (upstream #2220).
+        .edge_after("file:src/Svc.cs", "imports", "namespace App.Models")
 }
 
 /// Upstream #2392 (3): a Java import links the class a later file declares.
@@ -4618,6 +4615,208 @@ pub fn scala_package_object_supertype_head_changes_in_another_file() -> Case {
         .write("src/app/Api.scala", "package app\n\ntrait Api extends BaseB\n")
         .edge_before("method Client::send", "calls", "method BaseA::multipart")
         .edge_after("method Client::send", "calls", "method BaseB::multipart")
+}
+
+// ----- C# namespaces, usings and nested types (W4-CS-01) --------------------
+
+const UNIT_CSPROJ: &str = "<Project Sdk=\"Microsoft.NET.Sdk\"></Project>\n";
+// `public`: until W4-CS-03 (#2171) reads a C# type without a modifier as
+// `internal`, it is `private` to other files.
+const UNIT_SOME: &str = "namespace Unit.Support;\n\npublic static class Some\n{\n    public static int InformationEvent() => 1;\n}\n";
+const UNIT_LOG_TESTS: &str =
+    "namespace Unit.Context;\n\nclass LogTests\n{\n    Some Make() => null;\n}\n";
+
+/// Upstream #2216/#2220: a project's `global using` brings a namespace into
+/// every file of the project, so a file that comes to declare one makes a
+/// bare type name in an unchanged file of that project visible, as on a fresh
+/// index.
+pub fn csharp_global_using_appears_for_its_project() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::CSharp])
+        .file("test/Unit/Unit.csproj", UNIT_CSPROJ)
+        .file("test/Unit/Support/Some.cs", UNIT_SOME)
+        .file("test/Unit/LogTests.cs", UNIT_LOG_TESTS)
+        .write("test/Unit/GlobalUsings.cs", "global using Unit.Support;\n")
+        .edge_after(
+            "method Unit.Context::LogTests::Make",
+            "references",
+            "class Unit.Support::Some",
+        )
+}
+
+/// Upstream #2216/#2220: the file holding a project's `global using` leaves,
+/// and the bare type name it made visible in an unchanged file is no longer
+/// in reach.
+pub fn csharp_global_using_leaves_its_project() -> Case {
+    Case::new(Change::DeleteImportedModule, &[Language::CSharp])
+        .file("test/Unit/Unit.csproj", UNIT_CSPROJ)
+        .file("test/Unit/Support/Some.cs", UNIT_SOME)
+        .file("test/Unit/LogTests.cs", UNIT_LOG_TESTS)
+        .file("test/Unit/GlobalUsings.cs", "global using Unit.Support;\n")
+        .remove("test/Unit/GlobalUsings.cs")
+        .edge_before(
+            "method Unit.Context::LogTests::Make",
+            "references",
+            "class Unit.Support::Some",
+        )
+        .no_edge_after(
+            "method Unit.Context::LogTests::Make",
+            "references",
+            "class Unit.Support::Some",
+        )
+}
+
+/// Upstream #2216: a project file's `<Using Include>` imports a namespace
+/// into the project's files. A `.csproj` is no source file, so a sync that
+/// sees only it re-resolves nothing.
+pub fn csharp_csproj_using_appears() -> Case {
+    Case::new(Change::ControlFile, &[Language::CSharp])
+        .file("test/Unit/Unit.csproj", UNIT_CSPROJ)
+        .file("test/Unit/Support/Some.cs", UNIT_SOME)
+        .file("test/Unit/LogTests.cs", UNIT_LOG_TESTS)
+        .write(
+            "test/Unit/Unit.csproj",
+            "<Project Sdk=\"Microsoft.NET.Sdk\">\n  <ItemGroup>\n    <Using Include=\"Unit.Support\" />\n  </ItemGroup>\n</Project>\n",
+        )
+        .edge_after(
+            "method Unit.Context::LogTests::Make",
+            "references",
+            "class Unit.Support::Some",
+        )
+}
+
+/// Upstream #2220: a nested type is reached by bare name from a type
+/// deriving from its owner through any partial part, so a partial part in
+/// another file gaining the base brings the unchanged part's reference in.
+pub fn csharp_partial_part_gains_a_base() -> Case {
+    Case::new(Change::EditHeritage, &[Language::CSharp])
+        .file(
+            "src/Lib/Reader.cs",
+            "namespace Lib\n{\n    public abstract class Reader\n    {\n        internal enum State { Start, Done }\n    }\n\n    public partial class TextReader\n    {\n    }\n}\n",
+        )
+        .file(
+            "src/Lib/TextReader.Async.cs",
+            "namespace Lib\n{\n    public partial class TextReader\n    {\n        object Peek() => State.Start;\n    }\n}\n",
+        )
+        .write(
+            "src/Lib/Reader.cs",
+            "namespace Lib\n{\n    public abstract class Reader\n    {\n        internal enum State { Start, Done }\n    }\n\n    public partial class TextReader : Reader\n    {\n    }\n}\n",
+        )
+        .edge_after(
+            "method Lib::TextReader::Peek",
+            "references",
+            "enum Lib::Reader::State",
+        )
+}
+
+/// Upstream #2220 through a middle type: the type between an unchanged
+/// subclass and the owner of a nested type drops its base, so the subclass's
+/// reference to the nested type leaves, though neither its file nor the
+/// owner's changed.
+pub fn csharp_middle_type_drops_its_base() -> Case {
+    Case::new(Change::EditHeritage, &[Language::CSharp])
+        .file(
+            "src/Lib/Base.cs",
+            "namespace Lib\n{\n    public class Reader\n    {\n        internal enum State { Start, Done }\n    }\n}\n",
+        )
+        .file(
+            "src/Lib/Middle.cs",
+            "namespace Lib\n{\n    public class Middle : Reader\n    {\n    }\n}\n",
+        )
+        .file(
+            "src/Lib/Leaf.cs",
+            "namespace Lib\n{\n    public class Leaf : Middle\n    {\n        object Peek() => State.Start;\n    }\n}\n",
+        )
+        .write(
+            "src/Lib/Middle.cs",
+            "namespace Lib\n{\n    public class Middle\n    {\n    }\n}\n",
+        )
+        .edge_before(
+            "method Lib::Leaf::Peek",
+            "references",
+            "enum Lib::Reader::State",
+        )
+        .no_edge_after(
+            "method Lib::Leaf::Peek",
+            "references",
+            "enum Lib::Reader::State",
+        )
+}
+
+/// Upstream #2220: a type declared in a class is nested, one declared in a
+/// namespace of the same name is not. The class becomes the namespace; the
+/// declaration keeps its node and qualified name, and an unchanged file in a
+/// namespace under it now reaches it, as on a fresh index.
+pub fn csharp_nested_owner_becomes_a_namespace() -> Case {
+    Case::new(Change::EditHeritage, &[Language::CSharp])
+        .file(
+            "src/Owner.cs",
+            "class Owner\n{\n    public class Nested { }\n}\n",
+        )
+        .file(
+            "src/Use.cs",
+            "namespace Owner.Users\n{\n    class Use\n    {\n        Nested Make() => null;\n    }\n}\n",
+        )
+        .write(
+            "src/Owner.cs",
+            "namespace Owner\n{\n    public class Nested { }\n}\n",
+        )
+        .edge_after(
+            "method Owner.Users::Use::Make",
+            "references",
+            "class Owner::Nested",
+        )
+}
+
+/// Upstream #2216: a type moving into a namespace an unchanged file imports
+/// comes into its reach (its qualified name changes, which the name lane
+/// already follows).
+pub fn csharp_type_moves_into_an_imported_namespace() -> Case {
+    Case::new(Change::RenameSymbol, &[Language::CSharp])
+        .file(
+            "src/Models/User.cs",
+            "namespace App.Old\n{\n    public class User { }\n}\n",
+        )
+        .file(
+            "src/Svc.cs",
+            "using App.Models;\n\nnamespace App.Services\n{\n    class Svc\n    {\n        User Find() => null;\n    }\n}\n",
+        )
+        .write(
+            "src/Models/User.cs",
+            "namespace App.Models\n{\n    public class User { }\n}\n",
+        )
+        .edge_after(
+            "method App.Services::Svc::Find",
+            "references",
+            "class App.Models::User",
+        )
+}
+
+/// Upstream #2121: a type position names a type, so a property of the same
+/// name appearing elsewhere is no competitor.
+pub fn csharp_type_position_ignores_an_added_property() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::CSharp])
+        .file(
+            "src/TypeMap.cs",
+            "namespace App;\npublic class TypeMap { }\n",
+        )
+        .file(
+            "src/Profile.cs",
+            "namespace App;\npublic class Profile {\n    public void Configure(TypeMap typeMap) { }\n}\n",
+        )
+        .write(
+            "src/Holder.cs",
+            "namespace App;\npublic class Holder {\n    public TypeMap TypeMap { get; set; }\n}\n",
+        )
+        .edge_throughout(
+            "method App::Profile::Configure",
+            "references",
+            "class App::TypeMap",
+        )
+        .no_edge_after(
+            "method App::Profile::Configure",
+            "references",
+            "property App::Holder::TypeMap",
+        )
 }
 
 /// Upstream #2230: a package object's member is in scope through an import

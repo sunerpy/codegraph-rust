@@ -161,6 +161,7 @@ pub struct SourceFacts {
     scala_holder_package: OnceLock<Option<String>>,
     scala_package_object_package: OnceLock<Option<String>>,
     local_declaration_scopes: Mutex<HashMap<String, Option<(i64, i64)>>>,
+    csharp_namespace_scope: OnceLock<Arc<crate::csharp_types::CsharpNamespaceScope>>,
 }
 
 impl SourceFacts {
@@ -209,6 +210,7 @@ impl SourceFacts {
             scala_holder_package: OnceLock::new(),
             scala_package_object_package: OnceLock::new(),
             local_declaration_scopes: Mutex::new(HashMap::new()),
+            csharp_namespace_scope: OnceLock::new(),
         }
     }
 
@@ -636,6 +638,18 @@ impl SourceFacts {
             memo.insert(id.to_string(), scope);
         }
         scope
+    }
+
+    /// The namespaces a C# file runs in and imports (upstream #2216
+    /// `csharpNamespaceScope`), computed once.
+    pub(crate) fn csharp_namespace_scope(
+        &self,
+        compute: impl FnOnce() -> crate::csharp_types::CsharpNamespaceScope,
+    ) -> Arc<crate::csharp_types::CsharpNamespaceScope> {
+        Arc::clone(
+            self.csharp_namespace_scope
+                .get_or_init(|| Arc::new(compute())),
+        )
     }
 
     /// The package and imports of a Kotlin file (upstream #2146), read once.

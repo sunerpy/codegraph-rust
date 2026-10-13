@@ -189,6 +189,7 @@ struct SnapshotCaches {
     /// The Kotlin tables for the run (upstream #2172).
     kotlin_tables: OnceLock<Arc<crate::kotlin_scope::KotlinTables>>,
     scala_tables: OnceLock<Arc<crate::scala_scope::ScalaTables>>,
+    csharp_tables: OnceLock<Arc<crate::csharp_types::CsharpTables>>,
     #[cfg(test)]
     counters: SnapshotCacheCounters,
 }
@@ -209,6 +210,7 @@ impl SnapshotCaches {
             cpp_namespace_tables: OnceLock::new(),
             kotlin_tables: OnceLock::new(),
             scala_tables: OnceLock::new(),
+            csharp_tables: OnceLock::new(),
             #[cfg(test)]
             counters: SnapshotCacheCounters::default(),
         }
@@ -706,6 +708,14 @@ impl ResolutionContext for SnapshotResolutionContext {
             self.caches
                 .scala_tables
                 .get_or_init(|| Arc::new(crate::scala_scope::ScalaTables::new())),
+        )
+    }
+
+    fn csharp_tables(&self) -> Arc<crate::csharp_types::CsharpTables> {
+        Arc::clone(
+            self.caches
+                .csharp_tables
+                .get_or_init(|| Arc::new(crate::csharp_types::CsharpTables::new())),
         )
     }
 

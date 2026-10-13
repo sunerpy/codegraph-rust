@@ -355,6 +355,8 @@ fn run_case(name: &str, case: &Case) {
     let kotlin_rows = support::project_metadata_with_prefix(&fresh.db(), "kotlin_surface");
     // And the Scala surface rows and their marker (W4-SC-01).
     let scala_rows = support::project_metadata_with_prefix(&fresh.db(), "scala_surface");
+    // And the C# surface rows and their marker (W4-CS-01).
+    let csharp_rows = support::project_metadata_with_prefix(&fresh.db(), "csharp_surface");
     for (driver, project) in [("cli", &cli), ("watch", &watch)] {
         let rows = support::project_metadata_with_prefix(&project.db(), "js_module_surface");
         if rows != surface_rows {
@@ -396,6 +398,13 @@ fn run_case(name: &str, case: &Case) {
             divergent.push(format!(
                 "=== {driver} driver: the Scala surface rows differ from a fresh index\n\
                  synced: {rows:#?}\nfresh: {scala_rows:#?}"
+            ));
+        }
+        let rows = support::project_metadata_with_prefix(&project.db(), "csharp_surface");
+        if rows != csharp_rows {
+            divergent.push(format!(
+                "=== {driver} driver: the C# surface rows differ from a fresh index\n\
+                 synced: {rows:#?}\nfresh: {csharp_rows:#?}"
             ));
         }
     }
@@ -872,6 +881,15 @@ matrix! {
     scala_same_named_vals_trade_block_and_member_states,
     scala_holder_change_reaches_past_the_tail_ceiling,
     scala_package_object_supertype_head_changes_in_another_file,
+    csharp_global_using_appears_for_its_project,
+    csharp_global_using_leaves_its_project,
+    #[ignore = "W5-06: a .csproj or .props change does not re-resolve the project's C# files"]
+    csharp_csproj_using_appears,
+    csharp_partial_part_gains_a_base,
+    csharp_middle_type_drops_its_base,
+    csharp_nested_owner_becomes_a_namespace,
+    csharp_type_moves_into_an_imported_namespace,
+    csharp_type_position_ignores_an_added_property,
     solidity_change_a_base_contract,
     cfml_change_a_base_component,
     python_add_a_same_named_competitor,

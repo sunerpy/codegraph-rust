@@ -1663,7 +1663,7 @@
     "kind": "import",
     "language": "csharp",
     "name": "Microsoft.AspNetCore.Mvc",
-    "qualified_name": "App.Controllers::Microsoft.AspNetCore.Mvc",
+    "qualified_name": "Microsoft.AspNetCore.Mvc",
     "return_type": null,
     "signature": "using Microsoft.AspNetCore.Mvc;",
     "start_column": 0,

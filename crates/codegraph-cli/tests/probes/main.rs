@@ -305,12 +305,19 @@ mod seams {
                 "src/Other.cs",
                 "using System.Text;\nnamespace App { class Other {} }\n",
             )
+            .file(
+                "src/Scoped.cs",
+                "using System.Text;\nnamespace App;\nclass Scoped {}\n",
+            )
             .index();
 
-        // A C# file's usings are its namespace's references.
-        assert_unresolved!(project, "namespace App @src/Svc.cs" => imports => "System");
-        assert_unresolved!(project, "namespace App @src/Svc.cs" => imports => "System.Text");
-        assert_unresolved!(project, "namespace App @src/Other.cs" => imports => "System.Text");
+        // A `using` outside a block namespace is its file's reference, as a
+        // block namespace holds only its body (upstream #2220); a file-scoped
+        // namespace holds its file's usings.
+        assert_unresolved!(project, "file:src/Svc.cs" => imports => "System");
+        assert_unresolved!(project, "file:src/Svc.cs" => imports => "System.Text");
+        assert_unresolved!(project, "file:src/Other.cs" => imports => "System.Text");
+        assert_unresolved!(project, "namespace App @src/Scoped.cs" => imports => "System.Text");
     }
 
     /// Upstream #2120 (`7a51969f`), its general half: a receiver-less JS/TS
@@ -797,16 +804,13 @@ mod seams {
         assert_no_edge!(project, "method App.Serialization::Reader::Tick" => calls => "method App.Utilities::TypeExtensions::Scale");
         assert_no_edge!(project, "method App.Serialization::Reader::Text" => calls => "method App.Model::Money::ToString");
         assert_edge!(project, "method App.First::A::Seen" => calls => "method App.Hidden::HiddenExtensions::IsHidden");
-        // `B` is in `App.Second`; the extraction still files it under the
-        // file's first namespace until W4-CS-01 (#2220), the scope reader
-        // does not.
-        assert_no_edge!(project, "method App.First::B::Unseen" => calls => "method App.Hidden::HiddenExtensions::IsHidden");
-        assert_unresolved!(project, "method App.First::B::Unseen" => calls => "type.IsHidden");
+        // `B` is in `App.Second`, whose block imports no `App.Hidden`.
+        assert_no_edge!(project, "method App.Second::B::Unseen" => calls => "method App.Hidden::HiddenExtensions::IsHidden");
+        assert_unresolved!(project, "method App.Second::B::Unseen" => calls => "type.IsHidden");
         // An enclosing namespace's extension is in scope in a nested one; a
-        // nested one's is not in scope outside it (both files under `Outer`
-        // by the extraction, see above).
-        assert_edge!(project, "method Outer::Deep::Down" => calls => "method Outer::OuterExtensions::IsOuter");
-        assert_no_edge!(project, "method Outer::Top::Up" => calls => "method Outer::InnerExtensions::IsInner");
+        // nested one's is not in scope outside it.
+        assert_edge!(project, "method Outer.Inner::Deep::Down" => calls => "method Outer::OuterExtensions::IsOuter");
+        assert_no_edge!(project, "method Outer::Top::Up" => calls => "method Outer.Inner::InnerExtensions::IsInner");
         assert_unresolved!(project, "method Outer::Top::Up" => calls => "type.IsInner");
 
         // The same overload pair with an attributed `this` parameter.
@@ -8414,6 +8418,294 @@ mod scala {
             eq_files("algebra-laws/src/main/scala/algebra/laws/RingLaws.scala"),
             ["algebra-core/src/main/scala/algebra/package.scala"],
             "{}",
+            graph.report()
+        );
+    }
+}
+
+mod csharp {
+    use super::support::{Graph, Project};
+
+    /// `kind qualified-name` of every node of `file` but its file node.
+    fn qualified_names(graph: &Graph, file: &str) -> Vec<String> {
+        graph
+            .nodes
+            .iter()
+            .filter(|node| node.file_path == file && node.kind != "file")
+            .map(|node| format!("{} {}", node.kind, node.qualified_name))
+            .collect()
+    }
+
+    /// `kind file:qualified-name` of what the edges out of `file`'s nodes at
+    /// `line` (of `kind`, when given) reach, sorted.
+    fn targets_at(graph: &Graph, file: &str, line: i64, kind: Option<&str>) -> Vec<String> {
+        let mut out: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.line == Some(line))
+            .filter(|edge| kind.is_none_or(|kind| edge.kind == kind))
+            .filter(|edge| {
+                graph
+                    .node(&edge.source)
+                    .is_some_and(|node| node.file_path == file)
+            })
+            .filter_map(|edge| graph.node(&edge.target))
+            .map(|node| format!("{} {}:{}", node.kind, node.file_path, node.qualified_name))
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// Upstream #2121 (`e453e820`), its C# half: a type position names a
+    /// type. `Type sourceType`, `List<int>` and `new TypeMap()` bound to
+    /// whichever same-named member was nearest: an attribute's `Type`
+    /// property, a test class's `List` property, the `TypeMap` property beside
+    /// the `TypeMap` class. Upstream's fixture.
+    #[test]
+    fn pr2121_a_csharp_type_position_names_a_type_never_a_member() {
+        let project = Project::new()
+            .file(
+                "src/TypeMap.cs",
+                "namespace App;\npublic class TypeMap {\n    public string Name { get; set; }\n}\n\
+                 public class MemberMap {\n    public MemberMap() { }\n}\n",
+            )
+            .file(
+                "src/Attrs.cs",
+                "namespace App;\npublic class ValueConverterAttribute {\n    public System.Type Type { get; set; }\n}\n\
+                 public class Source {\n    public System.Collections.Generic.List<int> List { get; set; }\n}\n",
+            )
+            .file(
+                "src/Profile.cs",
+                "namespace App;\nusing System;\nusing System.Collections.Generic;\npublic class Profile {\n\
+                 \x20   public TypeMap TypeMap { get; set; }\n\
+                 \x20   public void Configure(TypeMap typeMap, MemberMap memberMap, Type sourceType) {\n\
+                 \x20       var items = new List<int>();\n\
+                 \x20       var copy = new TypeMap();\n    }\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+
+        let configure = graph
+            .nodes
+            .iter()
+            .find(|node| node.kind == "method" && node.name == "Configure")
+            .expect("Configure is indexed");
+        let targets: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.source == configure.id)
+            .filter(|edge| ["references", "instantiates", "type_of"].contains(&edge.kind.as_str()))
+            .filter_map(|edge| graph.node(&edge.target))
+            .map(|node| format!("{}:{}", node.kind, node.name))
+            .collect();
+        assert!(
+            targets.contains(&"class:TypeMap".to_owned()),
+            "{}",
+            graph.report()
+        );
+        assert!(
+            targets.contains(&"class:MemberMap".to_owned()),
+            "{}",
+            graph.report()
+        );
+        // A property, a constructor, or a type the project only has a member
+        // named after.
+        assert!(
+            !targets
+                .iter()
+                .any(|target| target.starts_with("property:") || target.starts_with("method:")),
+            "{targets:?}\n{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream #2216 (`a8b578f7`): a bare C# type name means a type its file
+    /// can see: one in its own namespace or an enclosing one, one a `using`
+    /// imports, or the one an alias names. Newtonsoft's `async Task` tests
+    /// (`using System.Threading.Tasks;`) bound `Task` to a test class of that
+    /// name. Upstream's fixture.
+    #[test]
+    fn pr2216_a_bare_csharp_type_name_is_one_its_namespaces_see() {
+        let project = Project::new()
+            .file(
+                "src/App.Tests/Schema/Generator.cs",
+                "namespace App.Tests.Schema\n{\n    public class Task\n    {\n    }\n}\n",
+            )
+            .file(
+                "src/App.Tests/Reader/ReadTests.cs",
+                "using System.Threading.Tasks;\n\nnamespace App.Tests.Reader\n{\n    public class ReadTests\n    {\n\
+                 \x20       public async Task Read()\n        {\n\
+                 \x20           await System.Threading.Tasks.Task.Yield();\n        }\n    }\n}\n",
+            )
+            .file(
+                "src/App.Tests/Schema/Planner.cs",
+                "namespace App.Tests.Schema\n{\n    public class Planner\n    {\n\
+                 \x20       public Task Next() { return new Task(); }\n    }\n}\n",
+            )
+            .file(
+                "src/App.Tests/Other/Aliased.cs",
+                "using Task = App.Tests.Schema.Task;\n\nnamespace App.Tests.Other\n{\n    public class Aliased\n    {\n\
+                 \x20       public Task Make() { return new Task(); }\n    }\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        let reaches_task = |file: &str| {
+            graph.edges.iter().any(|edge| {
+                graph
+                    .node(&edge.source)
+                    .is_some_and(|node| node.file_path == file)
+                    && graph
+                        .node(&edge.target)
+                        .is_some_and(|node| node.qualified_name == "App.Tests.Schema::Task")
+            })
+        };
+
+        assert!(
+            !reaches_task("src/App.Tests/Reader/ReadTests.cs"),
+            "{}",
+            graph.report()
+        );
+        assert!(
+            reaches_task("src/App.Tests/Schema/Planner.cs"),
+            "{}",
+            graph.report()
+        );
+        assert!(
+            reaches_task("src/App.Tests/Other/Aliased.cs"),
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream #2220 (`ff75a6ca`): C# names follow the language's scopes. A
+    /// block `namespace X { … }` holds only its body, and a file's second
+    /// namespace, or one nested in another (`Beta.Inner`), is its own; `using
+    /// X;` names the project's namespace X; a `global using` is its own
+    /// project's (serilog's two test projects each `global using` their own
+    /// `Support`, and both define `Some`); a nested type is reached by bare
+    /// name only from inside its owner or a type deriving from it, through any
+    /// partial part. Upstream's fixture.
+    #[test]
+    fn pr2220_csharp_namespaces_usings_and_nested_types_follow_their_scopes() {
+        let project = Project::new()
+            .file("src/Lib/Lib.csproj", "<Project Sdk=\"Microsoft.NET.Sdk\"></Project>\n")
+            .file(
+                "src/Lib/Guard.cs",
+                "using JetBrains.Annotations;\n\nnamespace JetBrains.Annotations\n{\n\
+                 \x20   sealed class NoEnumerationAttribute : System.Attribute { }\n}\n\n\
+                 static class Guard\n{\n\
+                 \x20   public static T AgainstNull<T>(T value) where T : class => value;\n}\n",
+            )
+            .file(
+                "src/Lib/Multi.cs",
+                "namespace Alpha\n{\n    class X { }\n}\n\nnamespace Beta\n{\n    class Y { }\n\n\
+                 \x20   namespace Inner\n    {\n        class Z { }\n    }\n}\n",
+            )
+            .file(
+                "src/Lib/Uses.cs",
+                "using Beta;\n\nnamespace Gamma\n{\n    class Consumer { }\n}\n",
+            )
+            .file(
+                "src/Lib/Reader.cs",
+                "namespace Lib\n{\n    public abstract class Reader\n    {\n\
+                 \x20       internal enum State { Start, Done }\n    }\n\n\
+                 \x20   public partial class TextReader : Reader\n    {\n    }\n}\n",
+            )
+            .file(
+                "src/Lib/TextReader.Async.cs",
+                "namespace Lib\n{\n    public partial class TextReader\n    {\n\
+                 \x20       object Peek() => State.Start;\n    }\n}\n",
+            )
+            .file(
+                "src/Lib/Writer.cs",
+                "namespace Lib\n{\n    public abstract class Writer\n    {\n\
+                 \x20       internal enum State { Start, Done }\n\n\
+                 \x20       object Current() => State.Done;\n    }\n}\n",
+            )
+            .file("test/Unit/Unit.csproj", "<Project Sdk=\"Microsoft.NET.Sdk\"></Project>\n")
+            .file("test/Unit/GlobalUsings.cs", "global using Unit.Support;\n")
+            .file(
+                "test/Unit/Support/Some.cs",
+                "namespace Unit.Support;\n\nstatic class Some\n{\n\
+                 \x20   public static int InformationEvent() => 1;\n}\n",
+            )
+            .file(
+                "test/Unit/LogTests.cs",
+                "namespace Unit.Context;\n\nclass LogTests\n{\n    int Run() => Some.InformationEvent();\n}\n",
+            )
+            .file(
+                "test/Unit/MappingTests.cs",
+                "namespace Unit.Mapping;\n\nclass FirstCase\n{\n    class Source { }\n\
+                 \x20   object Make() => new Source();\n}\n\nclass SecondCase\n{\n    class Source { }\n\
+                 \x20   object Make() => new Source();\n}\n",
+            )
+            .file("test/Perf/Perf.csproj", "<Project Sdk=\"Microsoft.NET.Sdk\"></Project>\n")
+            .file("test/Perf/GlobalUsings.cs", "global using Perf.Support;\n")
+            .file(
+                "test/Perf/Support/Some.cs",
+                "namespace Perf.Support;\n\nstatic class Some\n{\n\
+                 \x20   public static int InformationEvent() => 2;\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+
+        // A block namespace qualifies only its own body.
+        let guard = qualified_names(graph, "src/Lib/Guard.cs");
+        for expected in [
+            "class JetBrains.Annotations::NoEnumerationAttribute",
+            "class Guard",
+            "method Guard::AgainstNull",
+        ] {
+            assert!(
+                guard.iter().any(|name| name == expected),
+                "{expected}: {guard:?}"
+            );
+        }
+        let multi = qualified_names(graph, "src/Lib/Multi.cs");
+        for expected in ["class Alpha::X", "class Beta::Y", "class Beta.Inner::Z"] {
+            assert!(
+                multi.iter().any(|name| name == expected),
+                "{expected}: {multi:?}"
+            );
+        }
+
+        // A using names the project's namespace.
+        assert_eq!(
+            targets_at(graph, "src/Lib/Uses.cs", 1, Some("imports")),
+            ["namespace src/Lib/Multi.cs:Beta"],
+            "{}",
+            graph.report()
+        );
+
+        // A global using is its own project's.
+        assert_eq!(
+            targets_at(graph, "test/Unit/LogTests.cs", 5, Some("calls")),
+            ["method test/Unit/Support/Some.cs:Unit.Support::Some::InformationEvent"],
+            "{}",
+            graph.report()
+        );
+
+        // A nested type is its owner's, or a derived type's through any
+        // partial part.
+        assert_eq!(
+            targets_at(graph, "test/Unit/MappingTests.cs", 12, Some("instantiates")),
+            ["class test/Unit/MappingTests.cs:Unit.Mapping::SecondCase::Source"],
+            "{}",
+            graph.report()
+        );
+        let peek = targets_at(graph, "src/Lib/TextReader.Async.cs", 5, None);
+        assert!(
+            peek.iter()
+                .any(|target| target == "enum src/Lib/Reader.cs:Lib::Reader::State"),
+            "{peek:?}\n{}",
+            graph.report()
+        );
+        let current = targets_at(graph, "src/Lib/Writer.cs", 7, None);
+        assert!(
+            current
+                .iter()
+                .any(|target| target == "enum src/Lib/Writer.cs:Lib::Writer::State"),
+            "{current:?}\n{}",
             graph.report()
         );
     }
