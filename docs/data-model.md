@@ -289,8 +289,18 @@ lowercased names of the classes the file declares and the `extends` path its
 text writes before its first function, as written. A `.cfc` file with neither
 has no row. They are written, withdrawn and checked like the head rows under
 `cfml_heads_version` (1); a sync that finds it missing or at another version
-re-resolves every `.cfc` file and rebuilds the rows. Neither is a canonical
+re-resolves every CFML file and rebuilds the rows. Neither is a canonical
 surface.
+
+Swift head rows record what Swift type resolution reads of a file's type
+declarations: `swift_heads:<path>` holds the JSON `{"entries":
+[{"qualified_name", "kind", "extension", "supertypes"}]}`, one entry per class,
+struct, enum, protocol and type alias, sorted, with whether the declaration is
+an `extension` and the last segments of the supertypes its head names. A file
+with no type declaration has no row. They are written, withdrawn and checked
+like the head rows under `swift_heads_version` (1); a sync that finds it
+missing or at another version re-resolves every Swift file and rebuilds the
+rows. Neither is a canonical surface.
 
 ## FTS5
 

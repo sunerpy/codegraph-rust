@@ -193,6 +193,7 @@ struct SnapshotCaches {
     member_tables: OnceLock<Arc<crate::member_types::MemberTables>>,
     ruby_tables: OnceLock<Arc<crate::ruby_scope::RubyTables>>,
     cfml_tables: OnceLock<Arc<crate::cfml_scope::CfmlTables>>,
+    swift_tables: OnceLock<Arc<crate::swift_type_visibility::SwiftTables>>,
     #[cfg(test)]
     counters: SnapshotCacheCounters,
 }
@@ -217,6 +218,7 @@ impl SnapshotCaches {
             member_tables: OnceLock::new(),
             ruby_tables: OnceLock::new(),
             cfml_tables: OnceLock::new(),
+            swift_tables: OnceLock::new(),
             #[cfg(test)]
             counters: SnapshotCacheCounters::default(),
         }
@@ -641,6 +643,17 @@ impl ResolutionContext for SnapshotResolutionContext {
         }
         let mut supertypes: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         for tn in &type_nodes {
+            // A Swift conformance to a type the project only extends
+            // (SwiftUI's `View`) resolves to nothing, an extension being no
+            // type, yet the members its extensions add are still the
+            // conformer's (upstream #2107).
+            if language == Language::Swift {
+                for name in crate::swift_type_visibility::extended_conformances(tn, self).iter() {
+                    if name != type_name {
+                        supertypes.insert(name.clone());
+                    }
+                }
+            }
             let Some(adjacency) = self.edges.get(&tn.id) else {
                 continue;
             };
@@ -746,6 +759,14 @@ impl ResolutionContext for SnapshotResolutionContext {
             self.caches
                 .cfml_tables
                 .get_or_init(|| Arc::new(crate::cfml_scope::CfmlTables::new())),
+        )
+    }
+
+    fn swift_tables(&self) -> Arc<crate::swift_type_visibility::SwiftTables> {
+        Arc::clone(
+            self.caches
+                .swift_tables
+                .get_or_init(|| Arc::new(crate::swift_type_visibility::SwiftTables::new())),
         )
     }
 

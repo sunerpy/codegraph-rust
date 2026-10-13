@@ -10133,3 +10133,185 @@ mod cfml {
         );
     }
 }
+
+mod swift {
+    use super::support::{Graph, Project};
+
+    /// Every non-`contains` edge as `kind source -> target (file:line)`,
+    /// upstream's `edges()` shape, sorted.
+    fn edges(graph: &Graph) -> Vec<String> {
+        let mut out: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.kind != "contains")
+            .filter_map(|edge| {
+                let source = graph.node(&edge.source)?;
+                let target = graph.node(&edge.target)?;
+                let file = target
+                    .file_path
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(&target.file_path);
+                Some(format!(
+                    "{} {} -> {} ({file}:{})",
+                    edge.kind, source.qualified_name, target.qualified_name, target.start_line
+                ))
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// Upstream #2107: an extension is not the type it extends. A reference to
+    /// an SDK type the project only extends is no edge; one that reached a
+    /// type's extension moves to its declaration; a nested type is reached
+    /// bare only from its parent's scope; and a conforming type still reaches
+    /// the members the SDK type's extensions add. Upstream's fixture.
+    #[test]
+    fn pr2107_an_extension_is_not_the_type_it_extends() {
+        let project = Project::new()
+            .file(
+                "App/DesignSystem/Card.swift",
+                "import SwiftUI\nextension View {\n    func cardStyle() -> some View { padding() }\n}\n",
+            )
+            .file(
+                "App/DesignSystem/Text+Style.swift",
+                "import SwiftUI\nextension Text {\n    func headline() -> Text { bold() }\n}\n",
+            )
+            .file(
+                "App/Models/Account.swift",
+                "struct Account {\n    let id: String\n}\n",
+            )
+            .file(
+                "App/Other/Account+Display.swift",
+                "extension Account {\n    var display: String { id }\n}\nstruct AccountRow {\n    let account: Account\n}\n",
+            )
+            .file(
+                "App/Home/HomeView.swift",
+                "import SwiftUI\nstruct HomeView: View {\n    @State private var count = 0\n    var last: Result<Int, LoadError>?\n    var body: some View {\n        Text(\"Hello\").headline()\n    }\n}\nfunc makeHome() -> some View {\n    HomeView().cardStyle()\n}\nenum LoadError: Error {\n    case offline\n}\n",
+            )
+            .file(
+                "App/Home/ListViewModel.swift",
+                "public final class ListViewModel {\n    public enum State { case loading, loaded }\n    public struct Result { let ok: Bool }\n    var state: State = .loading\n    var latest: Result?\n}\n",
+            )
+            .index();
+        let all = edges(project.graph());
+        let report = project.graph().report();
+        // `struct HomeView: View`, `-> some View`, `Text("Hello")`: SwiftUI's,
+        // not the extension files'.
+        assert!(
+            !all.iter()
+                .any(|e| e.contains(" -> View (") || e.contains(" -> Text (")),
+            "{all:#?}\n{report}"
+        );
+        // `AccountRow` sits in the extension's own file; proximity used to
+        // pick the extension.
+        assert_eq!(
+            all.iter()
+                .filter(|e| e.contains(" -> Account ("))
+                .collect::<Vec<_>>(),
+            ["references AccountRow -> Account (Account.swift:1)"],
+            "{report}"
+        );
+        // HomeView's `Result<Int, LoadError>` is Swift's and its `@State`
+        // SwiftUI's; inside ListViewModel, `State` and `Result` are its own.
+        assert_eq!(
+            all.iter()
+                .filter(
+                    |e| e.contains("ListViewModel::State") || e.contains("ListViewModel::Result")
+                )
+                .collect::<Vec<_>>(),
+            [
+                "references ListViewModel -> ListViewModel::Result (ListViewModel.swift:3)",
+                "references ListViewModel -> ListViewModel::State (ListViewModel.swift:2)",
+            ],
+            "{report}"
+        );
+        // `HomeView().cardStyle()`: `cardStyle` comes from `extension View`,
+        // and HomeView conforms to View.
+        for expected in [
+            "calls makeHome -> View::cardStyle (Card.swift:3)",
+            "calls HomeView::body -> Text::headline (Text+Style.swift:3)",
+        ] {
+            assert!(all.contains(&expected.to_string()), "{all:#?}\n{report}");
+        }
+    }
+
+    /// Upstream #2107: a subclass names its superclass's nested type bare, a
+    /// generic qualifier is not part of a type's path, and inside `extension
+    /// Socket.Option` the bare `Option` is the type itself (Rust also keeps
+    /// the property's type annotation, W2-03c, so a `references` edge joins
+    /// upstream's `instantiates`). Upstream's fixture.
+    #[test]
+    fn pr2107_the_scopes_that_can_name_a_nested_type_bare() {
+        let project = Project::new()
+            .file(
+                "Sources/Core/Channel.swift",
+                "class BaseChannel {\n    enum ReadResult { case some, none }\n}\nfinal class StreamChannel: BaseChannel {\n    var last: ReadResult?\n}\n",
+            )
+            .file(
+                "Sources/Core/Future.swift",
+                "struct Future<Value> {\n    struct Isolated { let id: Int }\n}\nstruct Waiter {\n    var isolated: Future<Int>.Isolated?\n}\n",
+            )
+            .file(
+                "Sources/Core/Socket.swift",
+                "enum Socket {\n    struct Option { let raw: Int }\n}\nextension Socket.Option {\n    static let none: Option = Option(raw: 0)\n}\n",
+            )
+            .index();
+        let all = edges(project.graph());
+        let report = project.graph().report();
+        for expected in [
+            "references StreamChannel -> BaseChannel::ReadResult (Channel.swift:2)",
+            "references Waiter -> Future::Isolated (Future.swift:2)",
+        ] {
+            assert!(all.contains(&expected.to_string()), "{all:#?}\n{report}");
+        }
+        assert_eq!(
+            all.iter()
+                .filter(|e| e.contains(" -> Socket::Option ")
+                    || e.ends_with("-> Option (Socket.swift:4)"))
+                .collect::<Vec<_>>(),
+            [
+                "instantiates Option -> Socket::Option (Socket.swift:2)",
+                "references Option -> Socket::Option (Socket.swift:2)",
+            ],
+            "{report}"
+        );
+    }
+
+    /// Upstream #2107: the index keeps `Build.Id` and `Package.Id` as refs
+    /// named `Id`; the line says which nested type each is. Upstream's
+    /// fixture; its qualified construction (`API.PackageController.Model(…)`)
+    /// is a type-path call here, W4-SW-02's.
+    #[test]
+    fn pr2107_a_qualified_type_name_lands_on_the_type_on_that_path() {
+        let project = Project::new()
+            .file(
+                "Sources/App/Models/Build.swift",
+                "import Foundation\nfinal class Build {\n    typealias Id = UUID\n}\n",
+            )
+            .file(
+                "Sources/App/Models/Package.swift",
+                "import Foundation\nfinal class Package {\n    typealias Id = UUID\n}\n",
+            )
+            .file(
+                "Sources/App/Commands/Trigger.swift",
+                "struct Trigger {\n    let build: Build.Id\n    let package: Package.Id\n}\n",
+            )
+            .index();
+        let all = edges(project.graph());
+        assert_eq!(
+            all.iter()
+                .filter(|e| e.starts_with("references Trigger -> "))
+                .collect::<Vec<_>>(),
+            [
+                "references Trigger -> Build (Build.swift:2)",
+                "references Trigger -> Build::Id (Build.swift:3)",
+                "references Trigger -> Package (Package.swift:2)",
+                "references Trigger -> Package::Id (Package.swift:3)",
+            ],
+            "{}",
+            project.graph().report()
+        );
+    }
+}

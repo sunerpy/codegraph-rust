@@ -1660,6 +1660,10 @@ impl ReferenceResolver {
     ) -> (Option<ResolvedRef>, Option<DeferredIntent>) {
         let (resolved, deferred) = self.resolve_one_pure_inner(reference, context);
         let resolved = self.gate_target_kind(resolved, reference, context);
+        // A Swift type reference never lands on an `extension X {}` node, nor
+        // on a nested type it cannot name bare (upstream #2107).
+        let resolved =
+            crate::swift_type_visibility::gate_swift_type_target(resolved, reference, context);
         // A name a declaration around the reference declares as a type
         // parameter (`def f[A]`, `class Foo<T>`) is that parameter, whichever
         // strategy chose a namesake (upstream #2123).

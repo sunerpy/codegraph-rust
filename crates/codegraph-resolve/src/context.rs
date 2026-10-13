@@ -69,6 +69,7 @@ struct Caches {
     member_tables: Option<Arc<crate::member_types::MemberTables>>,
     ruby_tables: Option<Arc<crate::ruby_scope::RubyTables>>,
     cfml_tables: Option<Arc<crate::cfml_scope::CfmlTables>>,
+    swift_tables: Option<Arc<crate::swift_type_visibility::SwiftTables>>,
 }
 
 /// Bound on memoized existence answers; the memo restarts past it, as upstream.
@@ -104,6 +105,7 @@ impl Caches {
             member_tables: None,
             ruby_tables: None,
             cfml_tables: None,
+            swift_tables: None,
         }
     }
 }
@@ -150,6 +152,7 @@ impl<'a> StoreResolutionContext<'a> {
         c.member_tables = None;
         c.ruby_tables = None;
         c.cfml_tables = None;
+        c.swift_tables = None;
     }
 
     fn cached_all_files(&self) -> Arc<Vec<String>> {
@@ -416,6 +419,17 @@ impl ResolutionContext for StoreResolutionContext<'_> {
         }
         let mut supertypes: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         for tn in &type_nodes {
+            // A Swift conformance to a type the project only extends
+            // (SwiftUI's `View`) resolves to nothing, an extension being no
+            // type, yet the members its extensions add are still the
+            // conformer's (upstream #2107).
+            if language == Language::Swift {
+                for name in crate::swift_type_visibility::extended_conformances(tn, self).iter() {
+                    if name != type_name {
+                        supertypes.insert(name.clone());
+                    }
+                }
+            }
             for edge_kind in [EdgeKind::Implements, EdgeKind::Extends] {
                 let edges = self
                     .store
@@ -538,6 +552,15 @@ impl ResolutionContext for StoreResolutionContext<'_> {
                 .borrow_mut()
                 .cfml_tables
                 .get_or_insert_with(|| Arc::new(crate::cfml_scope::CfmlTables::new())),
+        )
+    }
+
+    fn swift_tables(&self) -> Arc<crate::swift_type_visibility::SwiftTables> {
+        Arc::clone(
+            self.caches
+                .borrow_mut()
+                .swift_tables
+                .get_or_insert_with(|| Arc::new(crate::swift_type_visibility::SwiftTables::new())),
         )
     }
 

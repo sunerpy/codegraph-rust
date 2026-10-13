@@ -404,7 +404,15 @@ whose last segment names a method a changed component gained or lost (every
 method of one that came, went or was renamed) re-resolve whole, however many
 there are, since a typed call waits while components of its type's name in
 several files declare the method; the `cfml_heads_version` marker is withdrawn
-and restored with the others; an
+and restored with the others; a Swift file whose head row moved (a type
+declaration came or went, became or stopped being an extension, moved to
+another qualified name, or names other supertypes) re-resolves, whole, the
+unchanged Swift files holding a reference to a name the changed declarations
+reach, resolved or parked, or declaring a type of one (closing over every head
+naming a reached name), since a type reference reads whether a node is an
+extension, a nested type's scope, a qualifier and an extended conformance from
+the declarations' text; the `swift_heads_version` marker is withdrawn and
+restored with the others; an
 import names a file, a folder or a namespace rather than a symbol, so the parked
 imports an added file or a changed file's namespace can satisfy (by the file's
 name and stem, its folder's, or the namespace's whole name) send their files

@@ -13,6 +13,7 @@ pub mod module_surfaces;
 mod policy;
 pub mod ruby_heads;
 pub mod scala_surfaces;
+pub mod swift_heads;
 mod sync;
 mod watcher;
 mod worktree;

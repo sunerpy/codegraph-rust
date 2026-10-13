@@ -578,6 +578,11 @@ pub trait ResolutionContext {
     fn cfml_tables(&self) -> Arc<crate::cfml_scope::CfmlTables> {
         Arc::new(crate::cfml_scope::CfmlTables::new())
     }
+
+    /// The Swift type-visibility memos of one resolution pass (W4-SW-01).
+    fn swift_tables(&self) -> Arc<crate::swift_type_visibility::SwiftTables> {
+        Arc::new(crate::swift_type_visibility::SwiftTables::new())
+    }
 }
 
 /// Go module info parsed from `go.mod`.

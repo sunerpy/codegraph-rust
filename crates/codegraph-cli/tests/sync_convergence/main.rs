@@ -363,6 +363,8 @@ fn run_case(name: &str, case: &Case) {
     let ruby_rows = support::project_metadata_with_prefix(&fresh.db(), "ruby_heads");
     // And the CFML component rows and their marker (W4-CF-01).
     let cfml_rows = support::project_metadata_with_prefix(&fresh.db(), "cfml_heads");
+    // And the Swift head rows and their marker (W4-SW-01).
+    let swift_rows = support::project_metadata_with_prefix(&fresh.db(), "swift_heads");
     for (driver, project) in [("cli", &cli), ("watch", &watch)] {
         let rows = support::project_metadata_with_prefix(&project.db(), "js_module_surface");
         if rows != surface_rows {
@@ -432,6 +434,13 @@ fn run_case(name: &str, case: &Case) {
             divergent.push(format!(
                 "=== {driver} driver: the CFML component rows differ from a fresh index\n\
                  synced: {rows:#?}\nfresh: {cfml_rows:#?}"
+            ));
+        }
+        let rows = support::project_metadata_with_prefix(&project.db(), "swift_heads");
+        if rows != swift_rows {
+            divergent.push(format!(
+                "=== {driver} driver: the Swift head rows differ from a fresh index\n\
+                 synced: {rows:#?}\nfresh: {swift_rows:#?}"
             ));
         }
     }
@@ -823,6 +832,11 @@ matrix! {
     java_overloads_keep_their_callers,
     jsx_component_body_edit,
     swift_method_body_edit,
+    swift_extension_becomes_a_declaration,
+    swift_subclass_scope_follows_a_superclass_change_in_another_file,
+    swift_conformer_head_moves_an_extension_method_call,
+    swift_declaration_of_an_extended_type_appears,
+    swift_extension_beside_a_reference_keeps_the_declaration,
     typescript_value_reader_body_edit,
     astro_frontmatter_call_body_edit,
     go_value_initializer_body_edit,

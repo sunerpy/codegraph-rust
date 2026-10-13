@@ -3708,6 +3708,145 @@ pub fn swift_method_body_edit() -> Case {
         .edge_throughout("function tick", "instantiates", "class Counter")
 }
 
+/// Upstream #2107 (W4-SW-01): an extension is not the type, so a reference
+/// beside it reaches the declaration elsewhere; turned into a class of the
+/// same name it keeps its node id, yet it is now the nearer declaration the
+/// unchanged reference reaches.
+pub fn swift_extension_becomes_a_declaration() -> Case {
+    Case::new(Change::EditHeritage, &[Language::Swift])
+        .file(
+            "App/Models/Account.swift",
+            "struct Account {\n    let id: String\n}\n",
+        )
+        .file(
+            "App/Other/Account+Display.swift",
+            "extension Account {\n    var display: String { id }\n}\n",
+        )
+        .file(
+            "App/Other/AccountRow.swift",
+            "struct AccountRow {\n    let account: Account\n}\n",
+        )
+        .write(
+            "App/Other/Account+Display.swift",
+            "class Account {\n    var display: String { \"x\" }\n}\n",
+        )
+        .edge_before(
+            "struct AccountRow",
+            "references",
+            "struct Account @App/Models/Account.swift",
+        )
+        .edge_after(
+            "struct AccountRow",
+            "references",
+            "class Account @App/Other/Account+Display.swift",
+        )
+        .no_edge_after(
+            "struct AccountRow",
+            "references",
+            "struct Account @App/Models/Account.swift",
+        )
+}
+
+/// Upstream #2107 (W4-SW-01): a subclass names a nested type of its
+/// superclass's superclass bare; once the middle class's head names another
+/// superclass in its own file, the unchanged subclass's reference is out of
+/// scope.
+pub fn swift_subclass_scope_follows_a_superclass_change_in_another_file() -> Case {
+    Case::new(Change::EditHeritage, &[Language::Swift])
+        .file(
+            "Sources/Core/Channel.swift",
+            "class BaseChannel {\n    enum ReadResult { case some, none }\n}\nclass OtherChannel {\n}\n",
+        )
+        .file(
+            "Sources/Core/Middle.swift",
+            "class MiddleChannel: BaseChannel {\n}\n",
+        )
+        .file(
+            "Sources/Core/Stream.swift",
+            "final class StreamChannel: MiddleChannel {\n    var last: ReadResult?\n}\n",
+        )
+        .write(
+            "Sources/Core/Middle.swift",
+            "class MiddleChannel: OtherChannel {\n}\n",
+        )
+        .edge_before(
+            "class StreamChannel",
+            "references",
+            "enum BaseChannel::ReadResult",
+        )
+        .no_edge_after(
+            "class StreamChannel",
+            "references",
+            "enum BaseChannel::ReadResult",
+        )
+}
+
+/// Upstream #2107 (W4-SW-01): a conformance to a type the project only
+/// extends is read from the conformer's head, so an unchanged caller's
+/// typed call follows the head to the other extension's method.
+pub fn swift_conformer_head_moves_an_extension_method_call() -> Case {
+    Case::new(Change::EditHeritage, &[Language::Swift])
+        .file(
+            "App/Card.swift",
+            "extension View {\n    func cardStyle() -> Int { 1 }\n}\n",
+        )
+        .file(
+            "App/ShapeCard.swift",
+            "extension Shape {\n    func cardStyle() -> Int { 2 }\n}\n",
+        )
+        .file("App/Home.swift", "struct HomeView: View {\n}\n")
+        .file(
+            "App/Main.swift",
+            "func makeHome() -> Int {\n    return HomeView().cardStyle()\n}\n",
+        )
+        .write("App/Home.swift", "struct HomeView: Shape {\n}\n")
+        .edge_before("function makeHome", "calls", "method View::cardStyle")
+        .edge_after("function makeHome", "calls", "method Shape::cardStyle")
+        .no_edge_after("function makeHome", "calls", "method View::cardStyle")
+}
+
+/// Upstream #2107 (W4-SW-01): a conformance to a type the project only
+/// extends is no edge, until a declaration of the type appears.
+pub fn swift_declaration_of_an_extended_type_appears() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Swift])
+        .file(
+            "App/Card.swift",
+            "extension View {\n    func cardStyle() -> Int { 1 }\n}\n",
+        )
+        .file("App/Home.swift", "struct HomeView: View {\n}\n")
+        .write("App/View.swift", "protocol View {\n}\n")
+        .no_edge_after("struct HomeView", "extends", "class View @App/Card.swift")
+        .edge_after(
+            "struct HomeView",
+            "implements",
+            "interface View @App/View.swift",
+        )
+}
+
+/// Upstream #2107 (W4-SW-01): an extension appearing beside an unchanged
+/// reference to its type is not the type; the reference keeps the
+/// declaration.
+pub fn swift_extension_beside_a_reference_keeps_the_declaration() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Swift])
+        .file(
+            "App/Models/Account.swift",
+            "struct Account {\n    let id: String\n}\n",
+        )
+        .file(
+            "App/Rows/AccountRow.swift",
+            "struct AccountRow {\n    let account: Account\n}\n",
+        )
+        .write(
+            "App/Rows/Account+Display.swift",
+            "extension Account {\n    var display: String { id }\n}\n",
+        )
+        .edge_throughout(
+            "struct AccountRow",
+            "references",
+            "struct Account @App/Models/Account.swift",
+        )
+}
+
 /// #897: a Kotlin function's value reference follows the object constant it
 /// reads.
 pub fn kotlin_object_constant_reader_body_edit() -> Case {

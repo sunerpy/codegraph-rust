@@ -96,6 +96,7 @@ pub(crate) fn migrate_project(
     let mut member_rows = Vec::new();
     let mut ruby_rows = Vec::new();
     let mut cfml_rows = Vec::new();
+    let mut swift_rows = Vec::new();
     let mut edges: Vec<Edge> = Vec::new();
     let mut refs: Vec<UnresolvedRef> = Vec::new();
     let mut outcome = SyncOutcome {
@@ -168,6 +169,9 @@ pub(crate) fn migrate_project(
         {
             cfml_rows.push((relative.clone(), row));
         }
+        if let Some(row) = crate::swift_heads::row_of(file.language, &source, &result.nodes) {
+            swift_rows.push((relative.clone(), row));
+        }
         pending_nodes.append(&mut result.nodes);
         if pending_nodes.len() >= NODE_FLUSH_ROWS {
             rebuild.store_mut().upsert_nodes(&pending_nodes)?;
@@ -209,6 +213,8 @@ pub(crate) fn migrate_project(
     drop(ruby_rows);
     crate::cfml_heads::write_index_rows(rebuild.store(), &mut cfml_rows)?;
     drop(cfml_rows);
+    crate::swift_heads::write_index_rows(rebuild.store(), &mut swift_rows)?;
+    drop(swift_rows);
     crate::cpp_dependents::write_marker(rebuild.store())?;
     crate::java_heads::write_marker(rebuild.store())?;
     crate::kotlin_surfaces::write_marker(rebuild.store())?;
@@ -217,6 +223,7 @@ pub(crate) fn migrate_project(
     crate::member_surfaces::write_marker(rebuild.store())?;
     crate::ruby_heads::write_marker(rebuild.store())?;
     crate::cfml_heads::write_marker(rebuild.store())?;
+    crate::swift_heads::write_marker(rebuild.store())?;
 
     // ALL nodes are persisted before ANY edge, because `insert_edges` drops edges
     // whose endpoints are absent. The WAL valve folds the log back during the

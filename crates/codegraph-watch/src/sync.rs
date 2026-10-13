@@ -566,6 +566,7 @@ fn sync_paths_with_store(
     let member_bootstrap = crate::member_surfaces::needs_bootstrap(store)?;
     let ruby_bootstrap = crate::ruby_heads::needs_bootstrap(store)?;
     let cfml_bootstrap = crate::cfml_heads::needs_bootstrap(store)?;
+    let swift_bootstrap = crate::swift_heads::needs_bootstrap(store)?;
 
     let paths = paths.into_iter().collect::<Vec<_>>();
     let total = paths.len();
@@ -622,6 +623,7 @@ fn sync_paths_with_store(
         || member_bootstrap
         || ruby_bootstrap
         || cfml_bootstrap
+        || swift_bootstrap
     {
         note_python_global_readers(
             project_root,
@@ -791,6 +793,21 @@ fn sync_paths_with_store(
             dependent_sites.remove(file);
             dependent_fallbacks.insert(file.clone());
         }
+        // And what a Swift type reference reads of the type declarations'
+        // heads: extension or not, and the supertypes they name (W4-SW-01).
+        let swift = crate::swift_heads::swift_refresh(
+            store,
+            project_root,
+            scope.options.max_file_size,
+            &changed_names.swift,
+            &reindexed,
+            &changed_names.removed_files,
+            swift_bootstrap,
+        )?;
+        for file in &swift.files {
+            dependent_sites.remove(file);
+            dependent_fallbacks.insert(file.clone());
+        }
         // What a changed Python import statement re-exports moves for its
         // module's importers without any node of those names changing.
         if !changed_names.python_imports.is_empty() {
@@ -884,6 +901,7 @@ fn sync_paths_with_store(
         members.write_rows(store)?;
         ruby.write_rows(store)?;
         cfml.write_rows(store)?;
+        swift.write_rows(store)?;
         crate::module_surfaces::finish_bootstrap(store)?;
         crate::cpp_dependents::write_marker(store)?;
         crate::java_heads::write_marker(store)?;
@@ -893,6 +911,7 @@ fn sync_paths_with_store(
         crate::member_surfaces::write_marker(store)?;
         crate::ruby_heads::write_marker(store)?;
         crate::cfml_heads::write_marker(store)?;
+        crate::swift_heads::write_marker(store)?;
     }
 
     // Orphan sweep (#1187, upstream index.ts:645-682): a full-index resolution
@@ -1285,6 +1304,7 @@ fn remove_tracked_file(
     changed_names.members.note(store, relative, None)?;
     changed_names.ruby.note(store, relative, None)?;
     changed_names.cfml.note(store, relative, &old_nodes, None)?;
+    changed_names.swift.note(store, relative, None)?;
     delete_unresolved_refs_by_file(store, relative)?;
     store.delete_file_record(relative)?;
     changed_names
@@ -1683,6 +1703,11 @@ fn reextract_into_store(
         &old_nodes,
         Some((file.language, source, &result.nodes)),
     )?;
+    changed_names.swift.note(
+        store,
+        relative,
+        Some((file.language, source, &result.nodes)),
+    )?;
     // No name in another file resolves into a minified script (upstream
     // #2204), and that verdict is read from the script's text: a script that
     // was or is generated can flip it with every node where it was, so all of
@@ -1822,6 +1847,7 @@ struct ChangedNames {
     /// What the changed files held that a bare CFML call in other files
     /// reads: component classes and `extends` (W4-CF-01).
     cfml: crate::cfml_heads::CfmlChanges,
+    swift: crate::swift_heads::SwiftChanges,
 }
 
 /// What a changed Python file held before the change. A module global's
@@ -1863,6 +1889,7 @@ impl ChangedNames {
             crate::member_surfaces::withdraw_marker(store)?;
             crate::ruby_heads::withdraw_marker(store)?;
             crate::cfml_heads::withdraw_marker(store)?;
+            crate::swift_heads::withdraw_marker(store)?;
             self.surface_dirty = true;
         }
         Ok(())
@@ -3486,6 +3513,97 @@ pub(crate) mod tests {
             };
             assert_eq!(edge_projection(&db), fresh_edges(name, &fresh));
             assert_eq!(reaches(&db), 2, "{:#?}", edge_projection(&db));
+        }
+    }
+
+    fn swift_marker(db: &Path) -> Option<String> {
+        Store::open(db)
+            .unwrap()
+            .get_project_metadata(crate::swift_heads::VERSION_KEY)
+            .unwrap()
+    }
+
+    const SWIFT_CHANNEL: (&str, &str) = (
+        "Sources/Core/Channel.swift",
+        "class BaseChannel {\n    enum ReadResult { case some, none }\n}\nclass OtherChannel {\n}\n",
+    );
+    const SWIFT_MIDDLE_BASE: (&str, &str) = (
+        "Sources/Core/Middle.swift",
+        "class MiddleChannel: BaseChannel {\n}\n",
+    );
+    const SWIFT_MIDDLE_OTHER: (&str, &str) = (
+        "Sources/Core/Middle.swift",
+        "class MiddleChannel: OtherChannel {\n}\n",
+    );
+    const SWIFT_STREAM: (&str, &str) = (
+        "Sources/Core/Stream.swift",
+        "final class StreamChannel: MiddleChannel {\n    var last: ReadResult?\n}\n",
+    );
+    const SWIFT_SPARE: (&str, &str) = ("Sources/Core/Spare.swift", "struct Spare {\n}\n");
+    const SWIFT_SPARE_EDITED: (&str, &str) = (
+        "Sources/Core/Spare.swift",
+        "struct Spare {\n    let count = 1\n}\n",
+    );
+
+    /// W4-SW-01: a sync failing after its mutations leaves the Swift marker
+    /// away, so the next sync, with nothing changed or with an unrelated
+    /// change, re-resolves every Swift file and rebuilds the rows: the
+    /// subclass's bare nested type, out of scope once the middle class names
+    /// another superclass, ends where a fresh index puts it.
+    #[test]
+    fn a_swift_sync_failing_after_its_mutations_leaves_the_next_one_to_reconcile() {
+        let in_scope = |db: &Path| {
+            edge_projection(db)
+                .iter()
+                .any(|edge| edge.contains("StreamChannel -[references]-> Sources/Core/Channel.swift:BaseChannel::ReadResult"))
+        };
+        for unrelated in [false, true] {
+            let dir = TestDir::new(if unrelated {
+                "swift-heads-fail-unrelated"
+            } else {
+                "swift-heads-fail"
+            });
+            let db = default_db_path(dir.path()).unwrap();
+            let initial = [SWIFT_CHANNEL, SWIFT_MIDDLE_BASE, SWIFT_STREAM, SWIFT_SPARE];
+            write_files(dir.path(), &initial);
+            sync_changed_paths(dir.path(), &db, initial.iter().map(|(path, _)| *path)).unwrap();
+            assert_eq!(
+                swift_marker(&db),
+                Some(crate::swift_heads::VERSION.to_string())
+            );
+            assert!(in_scope(&db), "{:#?}", edge_projection(&db));
+
+            write_files(dir.path(), &[SWIFT_MIDDLE_OTHER]);
+            FAIL_BEFORE_RESOLUTION.with(|fail| fail.set(true));
+            let failed = sync_changed_paths(dir.path(), &db, [SWIFT_MIDDLE_OTHER.0]);
+            FAIL_BEFORE_RESOLUTION.with(|fail| fail.set(false));
+            assert!(failed.is_err(), "the injected failure must stop the sync");
+            assert_eq!(
+                swift_marker(&db),
+                None,
+                "a failed sync leaves the marker away"
+            );
+
+            let spare = if unrelated {
+                write_files(dir.path(), &[SWIFT_SPARE_EDITED]);
+                sync_changed_paths(dir.path(), &db, [SWIFT_SPARE.0]).unwrap();
+                SWIFT_SPARE_EDITED
+            } else {
+                sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
+                SWIFT_SPARE
+            };
+            assert_eq!(
+                swift_marker(&db),
+                Some(crate::swift_heads::VERSION.to_string())
+            );
+            let fresh = [SWIFT_CHANNEL, SWIFT_MIDDLE_OTHER, SWIFT_STREAM, spare];
+            let name = if unrelated {
+                "swift-heads-fresh-unrelated"
+            } else {
+                "swift-heads-fresh"
+            };
+            assert_eq!(edge_projection(&db), fresh_edges(name, &fresh));
+            assert!(!in_scope(&db), "{:#?}", edge_projection(&db));
         }
     }
 
