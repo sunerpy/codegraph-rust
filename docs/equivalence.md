@@ -1078,35 +1078,42 @@ The `generated_golden_matches_committed_erlang_fixture` and
 ### CFML fixture
 
 A twelfth golden fixture, `reference/golden/cfml/`, guards CFML / ColdFusion
-extraction (upstream #1153 / `816bacb`, the scope-B extraction slice only). CFML
-is a **new `Language::Cfml` variant** backed by the **dual-grammar
-`tree-sitter-cfml`** crate (`.cfc`/`.cfm`/`.cfs` → `Language::Cfml`). A file's
-dialect is picked by a first-token sniff (`is_bare_script_cfml`): script files
-parse with the bundled `cfscript` grammar and drive the generic type-set
-dispatch; tag files parse with the `cfml` tag grammar and are handled by the
-`Language::Cfml`-guarded `visit_cfml_node` walker extension. The corpus
-(`crates/codegraph-bench/fixtures/cfml/`) has three deterministic files — a
-script `Base.cfc`, a tag `Widget.cfm`, and a bare-script `Gadget.cfs`. What it
-guards:
+extraction. CFML is a **`Language::Cfml` variant** backed by the
+**dual-grammar `tree-sitter-cfml`** crate (`.cfc`/`.cfm`/`.cfs` →
+`Language::Cfml`). A file's dialect is picked by a first-token sniff
+(`is_bare_script_cfml`): script files parse with the bundled `cfscript` grammar
+and drive the generic type-set dispatch; tag files parse with the `cfml` tag
+grammar and are walked by the `Language::Cfml`-guarded tag walker
+(`walk_cfml_program`). The corpus (`crates/codegraph-bench/fixtures/cfml/`) has
+three deterministic files — a script `Base.cfc`, a tag `Widget.cfm`, and a
+bare-script `Gadget.cfs`. What it guards:
 
 - all three files with `"language": "cfml"`;
 - `Base.cfc` (script) → `NodeKind::Class` `Base` (named from the FILE — the
-  cfscript `component` is unnamed) + `NodeKind::Function` `ping`;
-- `Widget.cfm` (tag) → `NodeKind::Class` `Widget` (from the `name` tag-attr) +
-  `NodeKind::Method` `doThing` (access `public`, returntype `void`), and a tag
-  `extends="Base"` → `Extends`;
+  cfscript `component` is unnamed) + `NodeKind::Method` `Base::ping`;
+- `Widget.cfm` (tag) → `NodeKind::Class` `Widget` (from the `name` tag-attr,
+  spanning to its close tag on line 5) + `NodeKind::Method` `Widget::doThing`
+  (access `public`, returntype `void`), and a tag `extends="Base"` → `Extends`;
 - `Gadget.cfs` (bare script) → `NodeKind::Class` `Gadget` (from the FILE) +
-  `NodeKind::Property` `x` + `NodeKind::Function` `doThing`, and a script-style
-  `extends="Base"` (`component_attribute`) → `Extends`;
+  `NodeKind::Property` `x` + `NodeKind::Method` `Gadget::doThing`, and a
+  script-style `extends="Base"` (`component_attribute`) → `Extends`, recorded
+  at the attribute value;
 - both `extends Base` refs RESOLVE to the `Base.cfc` component (edges);
   `Gadget.doThing`'s `helper()` call → an unresolved `helper` ref.
 
-The `<cfscript>`-in-tag-body re-parse delegation, the `cfquery` SQL-body
-extraction (`LANGUAGE_CFQUERY`), and the CFML framework RESOLVER bridges
-(FW/1 / ColdBox / CFWheels, dotted/relative inheritance, receiver-type inference)
-are all **DEFERRED**. Adding the variant is byte-neutral for `colby.schema.sql`
-(language is a stored TEXT value, not DDL) and for the eleven existing goldens
-(none holds a `.cfc`/`.cfm`/`.cfs` file).
+The corpus holds none of the other CFML shapes [languages.md](languages.md)
+describes: `<cfinterface>`, tag expressions, the `<cfscript>` and `<cfquery>`
+bodies read in place with their own grammars, scope-prefixed and typed
+receivers (upstream #1155), component-path inheritance (upstream #1152 / #1154:
+FW/1's relative `../base`, ColdBox's dotted `coldbox.system.web.Controller`),
+the `extends`-chain scope of a bare call and the untyped-receiver gate. Those
+are guarded by the CFML probes, the walker's unit tests and the
+sync-convergence matrix, not by this golden. A `<cfscript>` or `<cfquery>` body
+nested past the walker's depth limit fails its whole file with the depth error,
+as a deep tag tree does (`crates/codegraph-extract/tests/deep_nesting.rs`).
+Adding the variant was byte-neutral for `colby.schema.sql` (language is a
+stored TEXT value, not DDL) and for the eleven goldens before it (none holds a
+`.cfc`/`.cfm`/`.cfs` file).
 
 Regenerate it with `scripts/regen-goldens.sh --write cfml` (the shared recipe in [Regenerating goldens](#regenerating-goldens)).
 
