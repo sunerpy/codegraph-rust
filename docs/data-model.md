@@ -319,8 +319,8 @@ canonical surface.
 
 Go head rows record what a Go call reads of a file's type declarations:
 `go_heads:<path>` holds the JSON `{"entries": [{"name", "embeds", "mentions",
-"digest", "imports"}]}`, one entry per struct, interface and type alias,
-sorted, with the names of the types its declaration embeds, every name its
+"digest", "imports"}]}`, one entry per struct, interface and type alias (a defined type `type A B` or an
+alias `type A = B`), sorted, with the names of the types its declaration embeds, every name its
 declaration's text mentions, a 64-bit FNV-1a digest of that text (comments
 stripped), and the import path each package qualifier the declaration writes
 binds in its file (`dep=example.com/app/store1`). A file

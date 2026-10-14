@@ -278,15 +278,12 @@ fn first_qualifier_of<'l>(line: &'l str, name: &str) -> Option<&'l str> {
     })
 }
 
-/// The import a Go reference is written through — `context` in
-/// `context.Context`, `store` in `store.Manager` — read from its line, since
-/// the index keeps only the name (upstream `goRefQualifier`). `None` for a
-/// name written bare, or through anything that is not one of the file's
-/// imports.
-pub(crate) fn go_ref_qualifier(
-    reference: &RefView,
-    context: &dyn ResolutionContext,
-) -> Option<ImportMapping> {
+/// The package name a Go reference is written through, as spelled — the
+/// operand of the selector it is written as, or else the qualifier right
+/// before the name at the reference's column, or the line's only spelling of
+/// the name — read from its line, since the index keeps only the name
+/// (upstream `goRefQualification`'s `written`, #2397, #2448).
+fn go_written_qualifier(reference: &RefView, context: &dyn ResolutionContext) -> Option<String> {
     if reference.language != Language::Go || reference.reference_kind == EdgeKind::Imports {
         return None;
     }
@@ -300,19 +297,96 @@ pub(crate) fn go_ref_qualifier(
         .filter(|&index| index < facts.line_count())?;
     let line = facts.line(index);
     let at = usize::try_from(reference.column.max(0)).ok()?;
-    // The qualifier right before the name at the reference's column, or the
-    // line's only spelling of the name.
-    let qualifier = if line.get(at..).is_some_and(|rest| rest.starts_with(name)) {
-        qualifier_before(&line[..at])
+    if let Some(written) = dotted_qualifier(&reference.reference_name, line, at, name) {
+        return written.map(str::to_string);
+    }
+    if line.get(at..).is_some_and(|rest| rest.starts_with(name)) {
+        qualifier_before(&line[..at]).map(str::to_string)
     } else if !written_bare(line, name) {
-        first_qualifier_of(line, name)
+        first_qualifier_of(line, name).map(str::to_string)
     } else {
         None
-    }?;
+    }
+}
+
+/// What a dotted Go reference is written through: upstream records a
+/// selector of one or two hops (`pkg.F`, `x.f.M`) dotted, and only its first
+/// segment can be a package, whatever else the line writes — `perr` in
+/// `klog.Error(perr.Error())`, `cmp` in `cmp.Diff(…)` beside a `Diff:`
+/// (upstream #2448). The extractor keeps a chain's last receiver segment
+/// (#1496), so the operand is read back at the column. A chain of more hops,
+/// which upstream records bare, is read as a bare name is (`None`); a chain
+/// whose root is no plain name — a call's result (`Chain(…).Handler`,
+/// `makeOuter().bar.Run`), a conversion, an index — has no package.
+fn dotted_qualifier<'l>(
+    reference_name: &str,
+    line: &'l str,
+    column: usize,
+    name: &str,
+) -> Option<Option<&'l str>> {
+    reference_name.split_once('.')?;
+    let at_start = line
+        .get(..column)
+        .is_some_and(|before| !before.trim_end_matches([' ', '\t']).ends_with('.'));
+    if at_start {
+        let (links, _) = selector_chain(line, column);
+        if links.last() == Some(&name) {
+            match links.len() {
+                2 | 3 => return Some(Some(links[0])),
+                0 | 1 => {}
+                _ => return None,
+            }
+        }
+    }
+    Some(None)
+}
+
+/// The import a Go reference is written through — `context` in
+/// `context.Context`, `store` in `store.Manager` (upstream `goRefQualifier`).
+/// `None` for a name written bare, or through anything that is not one of
+/// the file's imports.
+pub(crate) fn go_ref_qualifier(
+    reference: &RefView,
+    context: &dyn ResolutionContext,
+) -> Option<ImportMapping> {
+    let written = go_written_qualifier(reference, context)?;
     context
         .get_import_mappings(&reference.file_path, Language::Go)
         .into_iter()
-        .find(|import| import.local_name == qualifier)
+        .find(|import| import.local_name == written)
+}
+
+/// Whether a Go reference is written through a package that is none of its
+/// file's imports as the index knows them (upstream `isGoUnknownQualified`,
+/// #2397): `yaml` in `yaml.Node` under an unaliased `import
+/// "go.yaml.in/yaml/v3"`, recorded under its last path element. Which
+/// package that is cannot be told from here.
+pub(crate) fn is_go_unknown_qualified(
+    reference: &RefView,
+    context: &dyn ResolutionContext,
+) -> bool {
+    go_written_qualifier(reference, context).is_some_and(|written| {
+        !context
+            .get_import_mappings(&reference.file_path, Language::Go)
+            .iter()
+            .any(|import| import.local_name == written)
+    })
+}
+
+/// Whether a Go reference is written through an imported package from
+/// outside the project's modules — `context.Context`, `fmt.Errorf`, a
+/// third-party `gin.H` (upstream `isGoExternalQualified`, #2233, with
+/// #2361's package directories).
+pub(crate) fn is_go_external_qualified(
+    reference: &RefView,
+    context: &dyn ResolutionContext,
+) -> bool {
+    let Some(import) = go_ref_qualifier(reference, context) else {
+        return false;
+    };
+    !(import.source.starts_with('.')
+        || import.source.contains("/internal/")
+        || go_import_package_dir(&import.source, Some(&reference.file_path), context).is_some())
 }
 
 /// Whether `candidate` lives in the project package a Go reference is written
@@ -554,7 +628,30 @@ pub(crate) fn resolve_go_method_in_package(
     if depth >= 4 {
         return Some(None);
     }
+    let mut unplaced = 0;
     for declaration in &types {
+        // An alias is the type it names, and has that type's methods
+        // (upstream #2417).
+        if let Some(aliased) = alias_target(declaration, context) {
+            match aliased {
+                Some(target) => {
+                    if let Some(via) = crate::name_matcher::resolve_method_on_type(
+                        &target.name,
+                        method_name,
+                        reference,
+                        context,
+                        confidence,
+                        resolved_by,
+                        Some(&target.pkg_dir),
+                        depth + 1,
+                    ) {
+                        return Some(Some(via));
+                    }
+                }
+                None => unplaced += 1,
+            }
+            continue;
+        }
         for embedded in embedded_types(declaration, context).iter() {
             if let Some(via) = crate::name_matcher::resolve_method_on_type(
                 &embedded.name,
@@ -570,7 +667,124 @@ pub(crate) fn resolve_go_method_in_package(
             }
         }
     }
+    // An alias of a type from outside the project (`type Ctx =
+    // context.Context`) or of no named type declares nothing here: the method
+    // is looked up by name, as it was before aliases had nodes.
+    if unplaced == types.len() {
+        return None;
+    }
     Some(None)
+}
+
+/// The type a Go alias names, with the directory of the package that
+/// declares it (upstream `goAliasTarget`, #2417): `mvccpb.Event` for `type
+/// Event = mvccpb.Event`, `Local` for `type Ptr = *Local`, `List` for `type
+/// Items[T any] = List[T]`, read from the declaration as an embedding is.
+/// `Some(None)` for an alias of anything else: a type from outside the
+/// project's packages, a predeclared one, a `func(…)` or `map[…]…`. `None`
+/// when the node is no alias: a struct, an interface, or a defined type
+/// (`type Dur int`), which declares a type of its own.
+fn alias_target(type_node: &Node, context: &dyn ResolutionContext) -> Option<Option<GoTypeRef>> {
+    if type_node.kind != NodeKind::TypeAlias {
+        return None;
+    }
+    let facts = context.source_facts(&type_node.file_path)?;
+    let start = usize::try_from(type_node.start_line.saturating_sub(1)).unwrap_or(0);
+    let end = usize::try_from(type_node.end_line.max(type_node.start_line))
+        .unwrap_or(0)
+        .min(facts.line_count());
+    let column = usize::try_from(type_node.start_column.max(0)).unwrap_or(0);
+    // From the alias's name, where the node starts, to the end of its type.
+    let declaration = (start..end)
+        .map(|index| {
+            let line = facts.line(index);
+            let line = if index == start {
+                line.get(column..).unwrap_or_default()
+            } else {
+                line
+            };
+            strip_go_line_comments(line)
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let rest = &declaration[alias_head_end(&declaration)?..];
+    Some(alias_named_type(rest).and_then(|(qualifier, name)| {
+        let pkg_dir = match &qualifier {
+            Some(qualifier) => {
+                go_qualifier_package_dir(qualifier, &type_node.file_path, context).flatten()
+            }
+            None => Some(package_dir_of(&type_node.file_path)),
+        }?;
+        (qualifier.is_some() || !GO_BUILTIN_FIELD_TYPES.contains(&name.as_str()))
+            .then_some(GoTypeRef { name, pkg_dir })
+    }))
+}
+
+/// Where the type of an alias declaration starts, past `Name =` or `Name[T
+/// any] =` (upstream's `/^\s*[A-Za-z_]\w*\s*(?:\[[^\]]*\])?\s*=/`); `None` for
+/// a defined type, which has no `=` there.
+fn alias_head_end(declaration: &str) -> Option<usize> {
+    let mut at = declaration.len() - declaration.trim_start().len();
+    let bytes = declaration.as_bytes();
+    if at >= bytes.len() || !(bytes[at].is_ascii_alphabetic() || bytes[at] == b'_') {
+        return None;
+    }
+    while at < bytes.len() && is_word_byte(bytes[at]) {
+        at += 1;
+    }
+    while at < bytes.len() && bytes[at].is_ascii_whitespace() {
+        at += 1;
+    }
+    if at < bytes.len() && bytes[at] == b'[' {
+        let close = declaration[at..].find(']')?;
+        at += close + 1;
+        while at < bytes.len() && bytes[at].is_ascii_whitespace() {
+            at += 1;
+        }
+    }
+    (at < bytes.len() && bytes[at] == b'=').then_some(at + 1)
+}
+
+/// The named type an alias's right-hand side is: `T`, `*T` or `pkg.T`, each
+/// perhaps with type arguments (upstream's
+/// `/^\s*(?:\*\s*)?([A-Za-z_]\w*)(?:\s*\.\s*([A-Za-z_]\w*))?\s*(?:\[.*\])?\s*;?\s*$/`),
+/// as `(qualifier, name)`.
+fn alias_named_type(text: &str) -> Option<(Option<String>, String)> {
+    let mut rest = text.trim_start();
+    if let Some(after) = rest.strip_prefix('*') {
+        rest = after.trim_start();
+    }
+    let word = |text: &str| -> usize {
+        text.bytes()
+            .position(|b| !is_word_byte(b))
+            .unwrap_or(text.len())
+    };
+    let first_end = word(rest);
+    let first = &rest[..first_end];
+    if !is_identifier(first) {
+        return None;
+    }
+    rest = &rest[first_end..];
+    let mut result = (None, first.to_string());
+    let trimmed = rest.trim_start();
+    if let Some(after) = trimmed.strip_prefix('.') {
+        let after = after.trim_start();
+        let end = word(after);
+        let second = &after[..end];
+        if !is_identifier(second) {
+            return None;
+        }
+        result = (Some(first.to_string()), second.to_string());
+        rest = &after[end..];
+    }
+    let mut tail = rest.trim();
+    if tail.starts_with('[') {
+        // `(?:\[.*\])?`: a bracketed run to the last `]`.
+        let close = tail.rfind(']')?;
+        tail = tail[close + 1..].trim();
+    }
+    let tail = tail.strip_suffix(';').unwrap_or(tail).trim();
+    tail.is_empty().then_some(result)
 }
 
 /// The type a field of `declaration` (a Go struct) is declared with, as
@@ -1062,6 +1276,67 @@ mod tests {
         assert_eq!(retargeted.entries[0].digest, row.entries[0].digest);
         assert_ne!(retargeted.entries[0], row.entries[0]);
         assert_eq!(HeadRow::decode(&row.encode()), Some(row));
+    }
+
+    #[test]
+    fn a_dotted_reference_is_written_through_its_operand() {
+        let line = "\tklog.Error(perr.Error())";
+        assert_eq!(
+            dotted_qualifier("klog.Error", line, 1, "Error"),
+            Some(Some("klog"))
+        );
+        assert_eq!(
+            dotted_qualifier("perr.Error", line, 12, "Error"),
+            Some(Some("perr"))
+        );
+        // Two hops, kept as their last receiver segment.
+        let line = "\t\tzap.String(\"id\", t.ID.String()),";
+        assert_eq!(
+            dotted_qualifier("ID.String", line, 19, "String"),
+            Some(Some("t"))
+        );
+        // Three hops are recorded bare upstream: read as a bare name.
+        let line = "\te.cfg.logger.Error(\"x\", zap.Error(err))";
+        assert_eq!(dotted_qualifier("logger.Error", line, 1, "Error"), None);
+        // A factory call's result has no package; a bare name is read from
+        // its line.
+        // The root of the chain is a call's result: no package, whatever the
+        // stored name's head is.
+        assert_eq!(
+            dotted_qualifier("bar.Run", "\tmakeOuter().bar.Run()", 1, "Run"),
+            Some(None)
+        );
+        let line = "\tr.Mount(\"/w\", Chain(func(next http.Handler) http.Handler {";
+        assert_eq!(
+            dotted_qualifier("Chain().Handler", line, 15, "Handler"),
+            Some(None)
+        );
+        assert_eq!(
+            dotted_qualifier("Message", "func f(src proto.Message)", 17, "Message"),
+            None
+        );
+    }
+
+    #[test]
+    fn an_alias_names_one_type_or_none() {
+        assert_eq!(alias_head_end("Event = mvccpb.Event"), Some(7));
+        assert_eq!(alias_head_end("Items[T any] = List[T]"), Some(14));
+        assert_eq!(alias_head_end("Dur int"), None);
+        assert_eq!(
+            alias_named_type(" mvccpb.Event"),
+            Some((Some("mvccpb".to_string()), "Event".to_string()))
+        );
+        assert_eq!(
+            alias_named_type(" *Local"),
+            Some((None, "Local".to_string()))
+        );
+        assert_eq!(
+            alias_named_type(" List[T]"),
+            Some((None, "List".to_string()))
+        );
+        assert_eq!(alias_named_type(" map[string]*KeyValue"), None);
+        assert_eq!(alias_named_type(" func(ctx context.Context) error"), None);
+        assert_eq!(alias_named_type(" []WatchResponse"), None);
     }
 
     #[test]

@@ -4139,6 +4139,14 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             }
             if let Some(value) = child_by_field(node, "value") {
                 self.extract_type_refs_from_subtree(value, &type_alias_node.id);
+            } else if self.spec.language() == Language::Go {
+                // Go's `type Event = mvccpb.Event` names its type in the
+                // `type` field, and so does a defined type, `type WatchChan
+                // <-chan WatchResponse` (upstream #2417, #2441).
+                for name_node in go_alias_type_names(node, self.source) {
+                    let name = node_text(name_node, self.source);
+                    self.push_ref(&type_alias_node.id, &name, EdgeKind::References, name_node);
+                }
             }
         }
     }
@@ -7775,17 +7783,43 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
         let mut comments = Vec::new();
         while let Some(current) = sibling {
             if is_comment_kind(current.kind()) {
-                comments.push(clean_comment(&node_text(current, self.source)));
+                comments.push(current);
                 sibling = current.prev_named_sibling();
             } else {
                 break;
             }
         }
-        if comments.is_empty() {
+        comments.reverse();
+        // The comments the run opens with that belong to the line above: one
+        // written after code on its line, and any that begins on the line such
+        // a comment ends (upstream #2438, Go).
+        let mut first = 0;
+        if self.spec.docstring_skips_trailing_comments() {
+            let mut end_row = None;
+            for comment in &comments {
+                let trails = match end_row {
+                    None => follows_code_on_its_line(*comment, self.source),
+                    Some(row) => comment.start_position().row == row,
+                };
+                if !trails {
+                    break;
+                }
+                end_row = Some(comment.end_position().row);
+                first += 1;
+            }
+        }
+        if first == comments.len() {
             return None;
         }
-        comments.reverse();
-        Some(comments.join("\n").trim().to_string())
+        Some(
+            comments[first..]
+                .iter()
+                .map(|comment| clean_comment(&node_text(*comment, self.source)))
+                .collect::<Vec<_>>()
+                .join("\n")
+                .trim()
+                .to_string(),
+        )
     }
 
     fn extract_rust_impl_item(&mut self, node: SyntaxNode<'tree>) {
@@ -8542,6 +8576,67 @@ fn go_embedded_type_name<'tree>(
     }
     (ty.kind() == "type_identifier" && !is_go_predeclared_type(&node_text(ty, source)))
         .then_some(ty)
+}
+
+/// Whether code comes before `node` on the line it starts on.
+fn follows_code_on_its_line(node: SyntaxNode<'_>, source: &str) -> bool {
+    let bytes = source.as_bytes();
+    let mut at = node.start_byte();
+    while at > 0 && matches!(bytes[at - 1], b' ' | b'\t') {
+        at -= 1;
+    }
+    at > 0 && !matches!(bytes[at - 1], b'\n' | b'\r')
+}
+
+/// The name nodes of the types a Go `type_spec` or `type_alias` names on its
+/// right-hand side, in source order (upstream `goAliasTypeNames`, #2417 and
+/// #2441): an alias's (`Event` in `type Event = mvccpb.Event`) and a defined
+/// type's (`WatchResponse` in `type WatchChan <-chan WatchResponse`), each
+/// where it is written, so resolution reads a package qualifier back. Not
+/// the declaration's own type parameters, Go's predeclared types, or its own
+/// name written bare (the declaration itself, in a recursive `type stateFn
+/// func(*Lexer) stateFn`); a name written through a package is that
+/// package's whatever this one declares.
+fn go_alias_type_names<'tree>(node: SyntaxNode<'tree>, source: &str) -> Vec<SyntaxNode<'tree>> {
+    let Some(ty) = child_by_field(node, "type") else {
+        return Vec::new();
+    };
+    let own = child_by_field(node, "name").map(|name| node_text(name, source));
+    let mut params: HashSet<String> = HashSet::new();
+    if let Some(list) = child_by_field(node, "type_parameters") {
+        for declaration in list.named_children(&mut list.walk()) {
+            for child in declaration.named_children(&mut declaration.walk()) {
+                if child.kind() == "identifier" {
+                    params.insert(node_text(child, source));
+                }
+            }
+        }
+    }
+    fn walk<'tree>(
+        node: SyntaxNode<'tree>,
+        qualified: bool,
+        source: &str,
+        own: Option<&str>,
+        params: &HashSet<String>,
+        out: &mut Vec<SyntaxNode<'tree>>,
+    ) {
+        if node.kind() == "type_identifier" {
+            let text = node_text(node, source);
+            if !is_go_predeclared_type(&text)
+                && (qualified || (!params.contains(&text) && own != Some(text.as_str())))
+            {
+                out.push(node);
+            }
+            return;
+        }
+        let qualified = node.kind() == "qualified_type";
+        for child in node.named_children(&mut node.walk()) {
+            walk(child, qualified, source, own, params, out);
+        }
+    }
+    let mut names = Vec::new();
+    walk(ty, false, source, own.as_deref(), &params, &mut names);
+    names
 }
 
 /// Go's predeclared types (upstream `GO_PREDECLARED_TYPES`).

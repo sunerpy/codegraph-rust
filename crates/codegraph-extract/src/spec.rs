@@ -96,6 +96,13 @@ pub trait LanguageSpec: Sync {
         None
     }
 
+    /// Whether a docstring leaves out the comments that belong to the line
+    /// above it (upstream `docstringSkipsTrailingComments`): one written after
+    /// code on its line, and any that begins on the line such a comment ends.
+    fn docstring_skips_trailing_comments(&self) -> bool {
+        false
+    }
+
     fn classify_class_node(&self, _node: Node<'_>) -> NodeKind {
         NodeKind::Class
     }

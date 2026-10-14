@@ -86,6 +86,30 @@
     "target": "function:f4cd691a149da8dd44acd2922aa4d033"
   },
   {
+    "col": 13,
+    "kind": "references",
+    "line": 23,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "type_alias:b5301b86cc312dc26e5a815ef5279bb9",
+    "target": "struct:606f2ccca37614d5812343568306d220"
+  },
+  {
+    "col": 13,
+    "kind": "references",
+    "line": 25,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "type_alias:4e82facd9388f91a1177551ba34204b8",
+    "target": "struct:606f2ccca37614d5812343568306d220"
+  },
+  {
     "col": 16,
     "kind": "references",
     "line": 9,
@@ -432,6 +456,15 @@
     "provenance": null,
     "source": "file:go/store/store.go",
     "target": "type_alias:4e82facd9388f91a1177551ba34204b8"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:go/store/store.go",
+    "target": "type_alias:b5301b86cc312dc26e5a815ef5279bb9"
   },
   {
     "col": null,

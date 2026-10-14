@@ -1209,12 +1209,15 @@ fn target_is_visible_across_files(
     reference: &RefView,
     context: &dyn ResolutionContext,
 ) -> bool {
-    // Through one of the project's Go packages, only that package's symbol:
-    // a `job.OPCommand` result type is not the method `Context.OPCommand`
-    // beside it (upstream #2322).
+    // Go's `context.Context`, `http.Handler`: written through a package from
+    // outside the project, so nothing in it, not even the same file's method
+    // `Stream.Context` (upstream #2233); through one of the project's
+    // packages, only that package's symbol: a `job.OPCommand` result type is
+    // not the method `Context.OPCommand` beside it (upstream #2322).
     if target.language == Language::Go
         && reference.language == Language::Go
-        && !crate::go_packages::is_in_go_qualifier_package(target, reference, context)
+        && (crate::go_packages::is_go_external_qualified(reference, context)
+            || !crate::go_packages::is_in_go_qualifier_package(target, reference, context))
     {
         return false;
     }
@@ -1987,6 +1990,21 @@ impl ReferenceResolver {
         context: &dyn ResolutionContext,
     ) -> Option<ResolvedRef> {
         let result = result?;
+        // A Go type embedded through a package (`yaml.Node`) is that
+        // package's, and so is the type a Go alias names: when the package is
+        // none of the file's imports as indexed, the type found by its bare
+        // name is another package's namesake, or the alias itself (upstream
+        // #2397, #2417).
+        if reference.language == Language::Go
+            && (crate::types::is_inheritance_ref(reference.reference_kind)
+                || (reference.reference_kind == EdgeKind::References
+                    && context
+                        .get_node_by_id_shared(&reference.from_node_id)
+                        .is_some_and(|from| from.kind == NodeKind::TypeAlias)))
+            && crate::go_packages::is_go_unknown_qualified(reference, context)
+        {
+            return None;
+        }
         if !crate::types::is_inheritance_ref(reference.reference_kind)
             && reference.reference_kind != EdgeKind::Imports
         {

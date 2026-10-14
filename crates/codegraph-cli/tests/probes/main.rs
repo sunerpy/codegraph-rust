@@ -10821,7 +10821,7 @@ mod objc {
 }
 
 mod go {
-    use super::support::{Graph, Project};
+    use super::support::{Graph, NodeRow, Project, codegraph};
 
     /// `file::qualifiedName` of every `kind` target of the symbol `name` in
     /// `file`, sorted (upstream's `targets` / `callTargets`).
@@ -10841,6 +10841,58 @@ mod go {
         out.sort();
         out
     }
+
+    /// `kind name` of every node of `file` but the file and its imports, in
+    /// source order (upstream's `declarations`).
+    fn declarations(graph: &Graph, file: &str) -> Vec<String> {
+        let mut nodes: Vec<_> = graph
+            .nodes
+            .iter()
+            .filter(|n| n.file_path == file && n.kind != "file" && n.kind != "import")
+            .collect();
+        nodes.sort_by_key(|n| n.start_line);
+        nodes
+            .iter()
+            .map(|n| format!("{} {}", n.kind, n.name))
+            .collect()
+    }
+
+    /// `source name` of every `references` reference out of a type
+    /// declaration of `file`, resolved or not, sorted (upstream's `typeRefs`).
+    fn type_refs(graph: &Graph, file: &str) -> Vec<String> {
+        let is_type = |kind: &str| matches!(kind, "type_alias" | "struct" | "interface");
+        let mut out: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|e| e.kind == "references")
+            .filter_map(|e| Some((graph.node(&e.source)?, graph.node(&e.target)?)))
+            .filter(|(source, _)| source.file_path == file && is_type(&source.kind))
+            .map(|(source, target)| format!("{} {}", source.name, target.name))
+            .chain(
+                graph
+                    .unresolved
+                    .iter()
+                    .filter(|r| r.reference_kind == "references")
+                    .filter_map(|r| Some((graph.node(&r.from_node_id)?, r)))
+                    .filter(|(source, _)| source.file_path == file && is_type(&source.kind))
+                    .map(|(source, r)| format!("{} {}", source.name, r.reference_name)),
+            )
+            .collect();
+        out.sort();
+        out
+    }
+
+    fn docstring_of(graph: &Graph, file: &str, kind: &str, name: &str) -> Option<String> {
+        let found: Vec<_> = graph
+            .nodes
+            .iter()
+            .filter(|n| n.file_path == file && n.kind == kind && n.name == name)
+            .collect();
+        assert_eq!(found.len(), 1, "{kind} {name}\n{}", graph.report());
+        found[0].docstring.clone()
+    }
+
+    const ALIAS_SOURCE: &str = "package clientv3\n\nimport (\n\t\"context\"\n\n\t\"go.etcd.io/etcd/api/v3/mvccpb\"\n)\n\n// Event is the event a watcher reports.\ntype Event = mvccpb.Event\n\ntype WatchChan <-chan WatchResponse\n\ntype WatchResponse struct {\n\tEvents []*Event\n}\n\ntype (\n\t// Local names a type of this package.\n\tLocal   = WatchResponse\n\tPtr     = *WatchResponse\n\tSlice   = []WatchResponse\n\tHandler = func(ctx context.Context, r WatchResponse) error\n\tIndex   = map[string]*mvccpb.KeyValue\n\tDefined WatchResponse\n)\n\ntype Plain = List[WatchResponse]\n\ntype Anon = struct {\n\tKey string\n}\n\ntype Closer = interface {\n\tClose() error\n}\n\ntype Type = string\n\ntype Word = uint\n";
 
     const STORE: &str = "package store\n\ntype Manager struct{}\n\nfunc New() *Manager { return &Manager{} }\n\nfunc (m *Manager) CreateItem(name string) error { return nil }\n";
     const CLOCK: &str = "package clock\n\nfunc Now() int { return 0 }\n";
@@ -11112,5 +11164,708 @@ mod go {
             targets(graph, file, "AddItem", "calls"),
             ["internal/store/store.go::Manager::CreateItem"]
         );
+    }
+
+    /// Every `references` reference out of a type declaration of `file`
+    /// sits on the name it writes, where resolution reads a package
+    /// qualifier back (upstream's `expectRefsOnTheirNames`).
+    #[track_caller]
+    fn assert_type_refs_on_their_names(graph: &Graph, file: &str, source: &str) {
+        let lines: Vec<&str> = source.lines().collect();
+        let is_type = |id: &str| {
+            graph.node(id).is_some_and(|n| {
+                n.file_path == file
+                    && matches!(n.kind.as_str(), "type_alias" | "struct" | "interface")
+            })
+        };
+        let resolved = graph
+            .edges
+            .iter()
+            .filter(|e| e.kind == "references" && is_type(&e.source))
+            .filter_map(|e| Some((graph.node(&e.target)?.name.as_str(), e.line?, e.col?)));
+        let unresolved = graph
+            .unresolved
+            .iter()
+            .filter(|r| r.reference_kind == "references" && is_type(&r.from_node_id))
+            .map(|r| (r.reference_name.as_str(), r.line, r.col));
+        let mut seen = 0;
+        for (name, line, col) in resolved.chain(unresolved) {
+            let text = lines[usize::try_from(line - 1).unwrap()];
+            assert!(
+                text.get(usize::try_from(col).unwrap()..)
+                    .is_some_and(|rest| rest.starts_with(name)),
+                "{name} at {line}:{col} of {file}: {text:?}"
+            );
+            seen += 1;
+        }
+        assert!(seen > 0, "no type references in {file}");
+    }
+
+    /// Each LF fixture as written, then with CRLF line ends.
+    fn with_line_ends(source: &str) -> [(&'static str, String); 2] {
+        [
+            ("LF", source.to_string()),
+            ("CRLF", source.replace('\n', "\r\n")),
+        ]
+    }
+
+    /// Upstream #2417: an alias is a node of the kind a declaration of its
+    /// type gets, nested under its file, documented as any type declaration
+    /// is, and references the types it names, each on its name; a defined
+    /// type references its own (#2441). Upstream's fixtures, LF and CRLF.
+    /// Its generic aliases need no fallback here: the grammar has their rule.
+    #[test]
+    fn pr2417_an_alias_is_a_node_that_references_the_types_it_names() {
+        let generic = "package clientv3\n\ntype List[T any] struct {\n\titems []T\n}\n\n// Set is a set of comparable values.\ntype Set[T comparable] = map[T]struct{}\n\ntype Items[T any] = List[T]\n\ntype Pairs[K comparable, V any] = map[K]List[V]\n";
+        for ((label, aliases), (_, generic)) in with_line_ends(ALIAS_SOURCE)
+            .into_iter()
+            .zip(with_line_ends(generic))
+        {
+            let project = Project::new()
+                .file("client/v3/watch.go", &aliases)
+                .file("client/v3/set.go", &generic)
+                .index();
+            let graph = project.graph();
+            let report = graph.report();
+            let file = "client/v3/watch.go";
+            assert_eq!(
+                declarations(graph, file),
+                [
+                    "type_alias Event",
+                    "type_alias WatchChan",
+                    "struct WatchResponse",
+                    "type_alias Local",
+                    "type_alias Ptr",
+                    "type_alias Slice",
+                    "type_alias Handler",
+                    "type_alias Index",
+                    "type_alias Defined",
+                    "type_alias Plain",
+                    "struct Anon",
+                    "interface Closer",
+                    "method Close",
+                    "type_alias Type",
+                    "type_alias Word",
+                ],
+                "{label}\n{report}"
+            );
+            let event = node_in(graph, file, "Event");
+            assert_eq!(event.kind, "type_alias", "{label}");
+            assert!(event.is_exported, "{label}");
+            assert_eq!(event.start_line, 10, "{label}");
+            assert!(
+                graph.edges.iter().any(|e| e.kind == "contains"
+                    && e.source == format!("file:{file}")
+                    && e.target == event.id),
+                "{label}\n{report}"
+            );
+            assert_eq!(
+                docstring_of(graph, file, "type_alias", "Local").as_deref(),
+                Some("Local names a type of this package."),
+                "{label}"
+            );
+            // #2438: a type declared on its own keeps the comment above it.
+            assert_eq!(
+                event.docstring.as_deref(),
+                Some("Event is the event a watcher reports."),
+                "{label}"
+            );
+            assert_eq!(
+                type_refs(graph, file),
+                [
+                    "Defined WatchResponse",
+                    "Event Event",
+                    "Handler Context",
+                    "Handler WatchResponse",
+                    "Index KeyValue",
+                    "Local WatchResponse",
+                    "Plain List",
+                    "Plain WatchResponse",
+                    "Ptr WatchResponse",
+                    "Slice WatchResponse",
+                    "WatchChan WatchResponse",
+                ],
+                "{label}\n{report}"
+            );
+            assert_type_refs_on_their_names(graph, file, &aliases);
+            let set = "client/v3/set.go";
+            assert_eq!(
+                declarations(graph, set),
+                [
+                    "struct List",
+                    "type_alias Set",
+                    "type_alias Items",
+                    "type_alias Pairs"
+                ],
+                "{label}"
+            );
+            assert!(node_in(graph, set, "Set").is_exported, "{label}");
+            assert_eq!(
+                type_refs(graph, set),
+                ["Items List", "Pairs List"],
+                "{label}"
+            );
+            assert_type_refs_on_their_names(graph, set, &generic);
+        }
+    }
+
+    /// The one node named `name` in `file`, imports aside.
+    #[track_caller]
+    fn node_in<'g>(graph: &'g Graph, file: &str, name: &str) -> &'g NodeRow {
+        let found: Vec<_> = graph
+            .nodes
+            .iter()
+            .filter(|n| n.file_path == file && n.name == name && n.kind != "import")
+            .collect();
+        assert_eq!(found.len(), 1, "{name} in {file}\n{}", graph.report());
+        found[0]
+    }
+
+    /// `kind file:qualifiedName` of each edge but `contains` out of the one
+    /// node named `name` in `file`, sorted and deduplicated (upstream's
+    /// `linksFrom`).
+    #[track_caller]
+    fn links_from(graph: &Graph, file: &str, name: &str) -> Vec<String> {
+        let id = &node_in(graph, file, name).id;
+        let mut out: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|e| e.kind != "contains" && &e.source == id)
+            .filter_map(|e| graph.node(&e.target).map(|t| (e.kind.as_str(), t)))
+            .map(|(kind, t)| format!("{kind} {}:{}", t.file_path, t.qualified_name))
+            .collect();
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// `kind name` of every unresolved reference out of the one node named
+    /// `name` in `file`.
+    #[track_caller]
+    fn unresolved_from(graph: &Graph, file: &str, name: &str) -> Vec<String> {
+        let id = &node_in(graph, file, name).id;
+        graph
+            .unresolved
+            .iter()
+            .filter(|r| &r.from_node_id == id)
+            .map(|r| format!("{} {}", r.reference_kind, r.reference_name))
+            .collect()
+    }
+
+    /// Upstream #2417: an indexed module resolves through its aliases — an
+    /// alias references the type it names in the package it is written
+    /// through, a bare name in the alias's package is the alias, a method
+    /// called on an alias is the aliased type's (through two aliases, one of
+    /// a pointer, too), and an alias written through a package the index does
+    /// not know links to nothing. Upstream's fixture; its `implements` half
+    /// (an alias owning the methods written on it) is W7-15's.
+    #[test]
+    fn pr2417_an_indexed_go_module_resolves_through_its_aliases() {
+        let project = Project::new()
+            .file("go.mod", "module go.etcd.io/etcd\n\ngo 1.24\n")
+            .file(
+                "api/v3/mvccpb/kv.go",
+                "package mvccpb\n\ntype Event struct {\n\tType int\n}\n\nfunc (e *Event) IsCreate() bool { return e.Type == 0 }\n",
+            )
+            .file(
+                "alpha/event.go",
+                "package alpha\n\ntype Event struct{}\n\nfunc (e *Event) IsCreate() bool { return false }\n",
+            )
+            .file(
+                "client/v3/watch.go",
+                "package clientv3\n\nimport \"go.etcd.io/etcd/api/v3/mvccpb\"\n\ntype Event = mvccpb.Event\n\ntype WatchResponse struct {\n\tEvents []*Event\n}\n\nfunc (wr *WatchResponse) Err() error { return nil }\n\ntype (\n\tLocal = WatchResponse\n\tPtr   = *Local\n)\n\nfunc newEvent() Event { return Event{} }\n\nfunc isCreate(e *Event) bool { return e.IsCreate() }\n\nfunc check(p Ptr) error { return p.Err() }\n",
+            )
+            .file(
+                "client/v3/list.go",
+                "package clientv3\n\ntype List[T any] struct{ items []T }\n\nfunc (l *List[T]) Len() int { return len(l.items) }\n\ntype Items[T any] = List[T]\n\nfunc count(xs *Items[int]) int { return xs.Len() }\n",
+            )
+            .file(
+                "discovery/kuma.go",
+                "package discovery\n\ntype Config interface {\n\tName() string\n}\n\ntype SDConfig struct{}\n\ntype KumaSDConfig = SDConfig\n\nfunc (*KumaSDConfig) Name() string { return \"kuma\" }\n",
+            )
+            .file(
+                "watcher/watcher.go",
+                "package watcher\n\nimport \"go.etcd.io/etcd/client/v3\"\n\n// The package is clientv3, though the index knows the import as v3 or client.\ntype Event = clientv3.Event\n",
+            )
+            .index();
+        let graph = project.graph();
+        let report = graph.report();
+        let links = |file: &str, name: &str| links_from(graph, file, name);
+        assert_eq!(
+            links("client/v3/watch.go", "Event"),
+            ["references api/v3/mvccpb/kv.go:Event"],
+            "{report}"
+        );
+        assert_eq!(
+            links("client/v3/watch.go", "Local"),
+            ["references client/v3/watch.go:WatchResponse"]
+        );
+        assert_eq!(
+            links("client/v3/watch.go", "Ptr"),
+            ["references client/v3/watch.go:Local"]
+        );
+        assert_eq!(
+            links("client/v3/list.go", "Items"),
+            ["references client/v3/list.go:List"]
+        );
+        assert_eq!(
+            links("client/v3/watch.go", "newEvent"),
+            [
+                "instantiates client/v3/watch.go:Event",
+                "references client/v3/watch.go:Event"
+            ]
+        );
+        assert_eq!(
+            links("client/v3/watch.go", "isCreate"),
+            [
+                "calls api/v3/mvccpb/kv.go:Event::IsCreate",
+                "references client/v3/watch.go:Event"
+            ]
+        );
+        assert_eq!(
+            links("client/v3/watch.go", "check"),
+            [
+                "calls client/v3/watch.go:WatchResponse::Err",
+                "references client/v3/watch.go:Ptr"
+            ]
+        );
+        assert_eq!(
+            links("client/v3/list.go", "count"),
+            [
+                "calls client/v3/list.go:List::Len",
+                "references client/v3/list.go:Items"
+            ]
+        );
+        // Upstream also has `implements discovery/kuma.go:Config` here: W7-15.
+        assert!(
+            links("discovery/kuma.go", "KumaSDConfig")
+                .contains(&"references discovery/kuma.go:SDConfig".to_string()),
+            "{report}"
+        );
+        // Not to itself, nor to client/v3's, mvccpb's or alpha's `Event`.
+        assert!(links("watcher/watcher.go", "Event").is_empty(), "{report}");
+        assert_eq!(
+            unresolved_from(graph, "watcher/watcher.go", "Event"),
+            ["references Event"]
+        );
+    }
+
+    /// Upstream #2441: a defined type is still one `type_alias` node, and
+    /// references each type its right-hand side names, on the name: not the
+    /// predeclared types, its own type parameters, or its own name written
+    /// bare. Upstream's fixture, LF and CRLF.
+    #[test]
+    fn pr2441_a_defined_type_references_each_type_it_names() {
+        let source = "package gin\n\nimport (\n\t\"context\"\n\n\t\"github.com/gin-gonic/gin/render\"\n)\n\n// HandlerFunc defines the handler used by gin middleware as return value.\ntype HandlerFunc func(*Context)\n\n// HandlersChain defines a HandlerFunc slice.\ntype HandlersChain []HandlerFunc\n\ntype Context struct {\n\thandlers HandlersChain\n}\n\ntype WatchChan <-chan WatchResponse\n\ntype WatchResponse struct{}\n\ntype (\n\t// Render names another package's type of its own name.\n\tRender   render.Render\n\tLookup   map[Key]*WatchResponse\n\tGrid     [4][4]Cell\n\tPipeline func(ctx context.Context, in <-chan Cell) (Key, error)\n\tWrapped  (Cell)\n\tNamed    Cell\n\tTables   map[string]struct {\n\t\tcell Cell\n\t\t*Key\n\t}\n)\n\ntype Generic[T any] List[T]\n\ntype Pair[K comparable, V any] map[K]List[V]\n\ntype stateFn func(*Lexer) stateFn\n\ntype Tree []*Tree\n\ntype List[T any] struct {\n\titems []T\n}\n\ntype Cell struct{}\n\ntype Key string\n\ntype Dur int\n\ntype Mode uint8\n\ntype Lexer struct{}\n";
+        for (label, text) in with_line_ends(source) {
+            let project = Project::new().file("gin.go", &text).index();
+            let graph = project.graph();
+            let report = graph.report();
+            assert_eq!(
+                declarations(graph, "gin.go"),
+                [
+                    "type_alias HandlerFunc",
+                    "type_alias HandlersChain",
+                    "struct Context",
+                    "type_alias WatchChan",
+                    "struct WatchResponse",
+                    "type_alias Render",
+                    "type_alias Lookup",
+                    "type_alias Grid",
+                    "type_alias Pipeline",
+                    "type_alias Wrapped",
+                    "type_alias Named",
+                    "type_alias Tables",
+                    "type_alias Generic",
+                    "type_alias Pair",
+                    "type_alias stateFn",
+                    "type_alias Tree",
+                    "struct List",
+                    "struct Cell",
+                    "type_alias Key",
+                    "type_alias Dur",
+                    "type_alias Mode",
+                    "struct Lexer",
+                ],
+                "{label}\n{report}"
+            );
+            assert_eq!(
+                type_refs(graph, "gin.go"),
+                [
+                    "Generic List",
+                    "Grid Cell",
+                    "HandlerFunc Context",
+                    "HandlersChain HandlerFunc",
+                    "Lookup Key",
+                    "Lookup WatchResponse",
+                    "Named Cell",
+                    "Pair List",
+                    "Pipeline Cell",
+                    "Pipeline Context",
+                    "Pipeline Key",
+                    "Render Render",
+                    "Tables Cell",
+                    "Tables Key",
+                    "WatchChan WatchResponse",
+                    "Wrapped Cell",
+                    "stateFn Lexer",
+                ],
+                "{label}\n{report}"
+            );
+            assert_type_refs_on_their_names(graph, "gin.go", &text);
+            // `render.Render` is written through its package: the reference
+            // sits on the second `Render`.
+            let render = &node_in(graph, "gin.go", "Render").id;
+            let lines: Vec<&str> = text.lines().collect();
+            let before: Vec<String> = graph
+                .unresolved
+                .iter()
+                .filter(|r| &r.from_node_id == render && r.reference_name == "Render")
+                .map(|r| {
+                    let line = lines[usize::try_from(r.line - 1).unwrap()];
+                    line[..usize::try_from(r.col).unwrap()]
+                        .trim_start()
+                        .to_string()
+                })
+                .collect();
+            assert_eq!(before, ["Render   render."], "{label}\n{report}");
+        }
+    }
+
+    /// Upstream #2441: an indexed module links its defined types — a bare
+    /// name is its own package's type, `pb.PutResponse` the import's, a name
+    /// written through a package the index does not know links to nothing,
+    /// a recursive type has no edge or row for its own name, a defined type
+    /// has none of its underlying type's methods, and impact on a type
+    /// reaches the defined types built from it. Upstream's fixture, LF and
+    /// CRLF.
+    #[test]
+    fn pr2441_an_indexed_go_module_links_its_defined_types() {
+        let module: [(&str, &str); 6] = [
+            ("go.mod", "module go.etcd.io/etcd\n\ngo 1.24\n"),
+            (
+                "api/v3/etcdserverpb/rpc.pb.go",
+                "package etcdserverpb\n\ntype PutResponse struct {\n\tHeader *ResponseHeader\n}\n\ntype ResponseHeader struct{}\n\nfunc (m *PutResponse) GetHeader() *ResponseHeader { return m.Header }\n",
+            ),
+            (
+                "alpha/names.go",
+                "package alpha\n\ntype PutResponse struct{}\n\nfunc (m *PutResponse) GetHeader() int { return 0 }\n\ntype WatchResponse struct{}\n\ntype Context struct{}\n\ntype Op struct{}\n\ntype watcher struct{}\n",
+            ),
+            (
+                "client/v3/watch.go",
+                "package clientv3\n\nimport pb \"go.etcd.io/etcd/api/v3/etcdserverpb\"\n\ntype PutResponse pb.PutResponse\n\ntype WatchChan <-chan WatchResponse\n\ntype WatchResponse struct {\n\tCanceled bool\n}\n\ntype Op struct{}\n\ntype watcher struct{}\n\nfunc (w *watcher) Watch() WatchChan { return nil }\n\nfunc header(r *PutResponse) { r.GetHeader() }\n\ntype stateFn func(*watcher) stateFn\n",
+            ),
+            (
+                "client/v3/ordering/util.go",
+                "package ordering\n\nimport \"go.etcd.io/etcd/client/v3\"\n\ntype OrderViolationFunc func(op clientv3.Op) error\n",
+            ),
+            (
+                "gin/gin.go",
+                "package gin\n\ntype HandlerFunc func(*Context)\n\ntype HandlersChain []HandlerFunc\n\ntype Context struct {\n\thandlers HandlersChain\n}\n\ntype Engine struct{}\n\nfunc (engine *Engine) Use(middleware ...HandlerFunc) {}\n",
+            ),
+        ];
+        for crlf in [false, true] {
+            let label = if crlf { "CRLF" } else { "LF" };
+            let project = module
+                .iter()
+                .fold(Project::new(), |project, (path, text)| {
+                    let text = if crlf {
+                        text.replace('\n', "\r\n")
+                    } else {
+                        (*text).to_string()
+                    };
+                    project.file(path, &text)
+                })
+                .index();
+            let graph = project.graph();
+            let report = graph.report();
+            let links = |file: &str, name: &str| links_from(graph, file, name);
+            assert_eq!(
+                links("client/v3/watch.go", "WatchChan"),
+                ["references client/v3/watch.go:WatchResponse"],
+                "{label}\n{report}"
+            );
+            assert_eq!(
+                links("gin/gin.go", "HandlerFunc"),
+                ["references gin/gin.go:Context"],
+                "{label}"
+            );
+            assert_eq!(
+                links("gin/gin.go", "HandlersChain"),
+                ["references gin/gin.go:HandlerFunc"],
+                "{label}"
+            );
+            assert_eq!(
+                links("client/v3/watch.go", "PutResponse"),
+                ["references api/v3/etcdserverpb/rpc.pb.go:PutResponse"],
+                "{label}\n{report}"
+            );
+            assert_eq!(
+                links("client/v3/watch.go", "stateFn"),
+                ["references client/v3/watch.go:watcher"],
+                "{label}"
+            );
+            assert!(
+                unresolved_from(graph, "client/v3/watch.go", "stateFn").is_empty(),
+                "{label}"
+            );
+            assert!(
+                links("client/v3/ordering/util.go", "OrderViolationFunc").is_empty(),
+                "{label}"
+            );
+            assert_eq!(
+                unresolved_from(graph, "client/v3/ordering/util.go", "OrderViolationFunc"),
+                ["references Op"],
+                "{label}"
+            );
+            // Go has no `GetHeader` on a type defined from pb.PutResponse.
+            assert_eq!(
+                links("client/v3/watch.go", "header"),
+                ["references client/v3/watch.go:PutResponse"],
+                "{label}\n{report}"
+            );
+            let impact = |file: &str, name: &str| -> Vec<String> {
+                let output = codegraph(
+                    project.root(),
+                    [
+                        "impact", name, "-p", ".", "--depth", "3", "--file", file, "--json",
+                    ],
+                );
+                let value: serde_json::Value =
+                    serde_json::from_slice(&output.stdout).expect("impact --json output");
+                let mut out: Vec<String> = value["definitions"]
+                    .as_array()
+                    .expect("impact definitions")
+                    .iter()
+                    .flat_map(|d| d["affected"].as_array().expect("affected").iter())
+                    .filter_map(|a| graph.node(a["id"].as_str()?))
+                    .map(|n| format!("{}:{}", n.file_path, n.qualified_name))
+                    .collect();
+                out.sort();
+                out.dedup();
+                out
+            };
+            assert_eq!(
+                impact("client/v3/watch.go", "WatchResponse"),
+                [
+                    "client/v3/watch.go:WatchChan",
+                    "client/v3/watch.go:WatchResponse",
+                    "client/v3/watch.go:watcher::Watch",
+                ],
+                "{label}"
+            );
+            assert_eq!(
+                impact("gin/gin.go", "Context"),
+                [
+                    "gin/gin.go:Context",
+                    "gin/gin.go:Engine::Use",
+                    "gin/gin.go:HandlerFunc",
+                    "gin/gin.go:HandlersChain",
+                ],
+                "{label}"
+            );
+        }
+    }
+
+    /// Upstream #2233: a Go name written through an import from outside the
+    /// module (`context.Context`, testify's `require.Contains`) is that
+    /// package's, never a project symbol of its name, not even the same
+    /// file's method; a name through one of the module's own packages still
+    /// resolves. Upstream's fixture.
+    #[test]
+    fn pr2233_a_go_name_through_an_outside_package_is_never_a_project_symbol() {
+        let project = Project::new()
+            .file("go.mod", "module github.com/gofiber/fiber/v3\n\ngo 1.22\n")
+            .file(
+                "middleware/sse/sse.go",
+                "package sse\n\nimport (\n\t\"context\"\n\n\t\"github.com/gofiber/fiber/v3/extractors\"\n)\n\ntype Stream struct{}\n\nfunc (s *Stream) Context() context.Context {\n\treturn nil\n}\n\nfunc run(ctx context.Context) bool {\n\treturn extractors.Contains(\"a\", \"b\")\n}\n",
+            )
+            .file(
+                "extractors/extractors.go",
+                "package extractors\n\nfunc Contains(haystack, needle string) bool {\n\treturn true\n}\n",
+            )
+            .file(
+                "middleware/sse/sse_test.go",
+                "package sse\n\nimport (\n\t\"testing\"\n\n\t\"github.com/stretchr/testify/require\"\n)\n\nfunc TestStream(t *testing.T) {\n\trequire.Contains(t, \"abc\", \"a\")\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        let report = graph.report();
+        let targets_from = |file: &str| -> Vec<String> {
+            graph
+                .edges
+                .iter()
+                .filter(|e| e.kind != "contains")
+                .filter(|e| graph.node(&e.source).is_some_and(|n| n.file_path == file))
+                .filter_map(|e| graph.node(&e.target))
+                .map(|n| n.qualified_name.clone())
+                .collect()
+        };
+        let sse = targets_from("middleware/sse/sse.go");
+        assert!(!sse.contains(&"Stream::Context".to_string()), "{report}");
+        assert!(
+            !targets_from("middleware/sse/sse_test.go").contains(&"Contains".to_string()),
+            "{report}"
+        );
+        assert!(sse.contains(&"Contains".to_string()), "{report}");
+    }
+
+    /// Upstream #2448 (its first half; locals named like an import are
+    /// W4-GO-03's): a dotted call is written through its own operand, the
+    /// only part that can be a package, whatever else its line spells —
+    /// neither a second spelling of the name (`Diff:` beside `cmp.Diff`) nor
+    /// another selector before it (`klog.Error(perr.Error())`, etcd's
+    /// `zap.String("…", p.id.String())`). Upstream's fixture, with etcd's
+    /// line beside it.
+    #[test]
+    fn pr2448_a_dotted_go_call_is_written_through_its_own_receiver() {
+        let example = "package example\n\nimport (\n\t\"errors\"\n\t\"testing\"\n\n\t\"github.com/distribution/distribution/v3\"\n\t\"github.com/google/go-cmp/cmp\"\n\t\"github.com/opencontainers/go-digest\"\n\t\"github.com/patrickmn/go-cache\"\n\t\"k8s.io/klog/v2\"\n)\n\ntype parseError struct{}\n\nfunc (e *parseError) Error() string { return \"parse\" }\n\ntype lru struct{}\n\nfunc (l *lru) Get(key string) string { return key }\n\ntype Server struct {\n\tcache *lru\n}\n\nfunc (s *Server) Lookup(key string) string {\n\treturn s.cache.Get(key)\n}\n\nfunc NewServer() *Server {\n\t_ = cache.New(0, 0)\n\treturn &Server{cache: &lru{}}\n}\n\nfunc Run(dig string) {\n\tklog.Infof(\"Log using Infof, key: %s\", \"value\")\n\terr := errors.New(\"fail\")\n\tklog.Errorf(\"Log using Errorf, err: %v\", err)\n\tdesc := &distribution.Descriptor{Digest: digest.Digest(dig)}\n\t_ = desc\n\tperr := &parseError{}\n\tklog.Error(perr.Error())\n}\n\nfunc TestParser(t *testing.T) {\n\tt.Errorf(\"Unexpected policy! Diff:\\n%s\", cmp.Diff(\"a\", \"b\"))\n}\n";
+        let project = Project::new()
+            .file("go.mod", "module example.com/app\n\ngo 1.22\n")
+            .file(
+                "logging/wrapper.go",
+                "package logging\n\n// An adapter with klog's method names, like kubernetes' etcd3 logger.\ntype klogWrapper struct{}\n\nfunc (klogWrapper) Infof(format string, args ...interface{})  {}\nfunc (klogWrapper) Errorf(format string, args ...interface{}) {}\n",
+            )
+            .file(
+                "registry/suite.go",
+                "package registry\n\ntype Suite struct{}\n\nfunc (s *Suite) Digest(v string) string { return v }\n",
+            )
+            .file(
+                "diff/differ.go",
+                "package diff\n\ntype Differ struct{}\n\nfunc (d *Differ) Diff(a, b string) string { return a + b }\n",
+            )
+            .file("example/example.go", example)
+            .file(
+                "rafthttp/peer.go",
+                "package rafthttp\n\nimport \"go.uber.org/zap\"\n\ntype ID uint64\n\nfunc (i ID) String() string { return \"\" }\n\ntype peer struct {\n\tid ID\n}\n\nfunc (p *peer) send(lg *zap.Logger) {\n\tlg.Info(\"sent\", zap.String(\"remote-peer-id\", p.id.String()))\n}\n",
+            )
+            .file("chain/chain.go", CHAIN)
+            .file("app/start.go", START)
+            .index();
+        let graph = project.graph();
+        let report = graph.report();
+        // What the edges out of `file` on the line holding `snippet` reach.
+        let reached_at = |file: &str, text: &str, snippet: &str| -> Vec<String> {
+            let line = text
+                .lines()
+                .position(|l| l.contains(snippet))
+                .unwrap_or_else(|| panic!("no {snippet} in {file}"));
+            let line = i64::try_from(line + 1).unwrap();
+            graph
+                .edges
+                .iter()
+                .filter(|e| e.kind != "contains" && e.line == Some(line))
+                .filter(|e| graph.node(&e.source).is_some_and(|n| n.file_path == file))
+                .filter_map(|e| graph.node(&e.target))
+                .map(|n| n.qualified_name.clone())
+                .collect()
+        };
+        let at = |snippet: &str| reached_at("example/example.go", example, snippet);
+        assert!(
+            !at("cmp.Diff(\"a\", \"b\")").contains(&"Differ::Diff".to_string()),
+            "{report}"
+        );
+        assert!(
+            at("klog.Error(perr.Error())").contains(&"parseError::Error".to_string()),
+            "{report}"
+        );
+        assert!(
+            at("s.cache.Get(key)").contains(&"lru::Get".to_string()),
+            "{report}"
+        );
+        let peer = "package rafthttp\n\nimport \"go.uber.org/zap\"\n\ntype ID uint64\n\nfunc (i ID) String() string { return \"\" }\n\ntype peer struct {\n\tid ID\n}\n\nfunc (p *peer) send(lg *zap.Logger) {\n\tlg.Info(\"sent\", zap.String(\"remote-peer-id\", p.id.String()))\n}\n";
+        assert_eq!(
+            reached_at("rafthttp/peer.go", peer, "p.id.String()"),
+            ["ID::String"],
+            "{report}"
+        );
+        // A field of a call's result named like an outside import (`bar`) is
+        // no package: the stored name's head is not what the line writes.
+        assert!(
+            reached_at("app/start.go", START, "makeOuter().bar.Run()")
+                .contains(&"barRunner::Run".to_string()),
+            "{report}"
+        );
+        // chi's `Chain(…).Handler(h)` on a line spelling `http.Handler`: a
+        // call on a factory's result, which no package qualifies.
+        assert!(
+            reached_at("chain/chain.go", CHAIN, "}).Handler(h)")
+                .contains(&"Middlewares::Handler".to_string()),
+            "{report}"
+        );
+    }
+
+    const START: &str = "package app\n\nimport \"github.com/acme/bar\"\n\ntype barRunner struct{}\n\nfunc (b *barRunner) Run() {}\n\ntype outer struct {\n\tbar *barRunner\n}\n\nfunc makeOuter() *outer { return &outer{} }\n\nfunc start() {\n\t_ = bar.Version\n\tmakeOuter().bar.Run()\n}\n";
+
+    const CHAIN: &str = "package chain\n\nimport \"net/http\"\n\ntype Middlewares []func(http.Handler) http.Handler\n\nfunc Chain(middlewares ...func(http.Handler) http.Handler) Middlewares { return middlewares }\n\nfunc (mws Middlewares) Handler(h http.Handler) http.Handler { return h }\n\nfunc mount(h http.Handler) http.Handler {\n\treturn Chain(func(next http.Handler) http.Handler { return next }).Handler(h)\n}\n";
+
+    /// Upstream #2438: a type declared on its own takes the comment above
+    /// `type`; a group's comment is the group's unless the group holds one
+    /// type without a comment of its own; a comment after code on its line is
+    /// that line's, never the next declaration's. Upstream's fixture, less its
+    /// `const sides` (a Go constant carries no docstring here: pre-existing).
+    #[test]
+    fn pr2438_a_go_type_declared_on_its_own_keeps_its_doc_comment() {
+        let source = "// Copyright 2026 The Shapes Authors.\n\n// Package shapes is documented.\npackage shapes\n\ntype Bare struct{}\n\n// Point is documented on its own.\ntype Point struct{ X, Y int }\n\n// Shape is an interface documented on its own.\ntype Shape interface {\n\tArea() float64\n}\n\n// ID is a defined type documented on its own.\ntype ID int\n\n// Set is a generic type documented on its own.\ntype Set[T comparable] map[T]struct{}\n\n// Alias is an alias documented on its own.\ntype Alias = Point\n\n/*\nBox is documented in a block comment.\n*/\ntype Box struct{}\n\n// Kinds of shapes. The comment documents the group.\ntype (\n\tCircle struct{}\n\t// Square is documented inside the group.\n\tSquare struct{}\n)\n\n// Lone is the only member of its group.\ntype (\n\tLone int\n)\n\n// A group of one whose member has its own comment.\ntype (\n\t// Own is documented inside its group.\n\tOwn int\n)\n\n// Pair groups a type with its alias.\ntype (\n\tFirst  int\n\tSecond = First\n)\n\ntype (\n\tCelsius float64 // degrees C.\n\tKelvin  float64\n)\n\n// sides is documented above its line.\nconst sides = 4 /* four */ // sides of a square.\n\n// Rect is documented below a constant's line.\ntype Rect struct{}\n\nvar origin = Point{} // the origin.\ntype Polygon struct{}\n\n// Area is documented as before.\nfunc Area(s Shape) float64 { return s.Area() }\n\n// Norm is documented as before.\nfunc (p Point) Norm() int { return p.X } // Norm's line comment.\nfunc Next() int { return 0 }\n";
+        for (label, text) in with_line_ends(source) {
+            let project = Project::new().file("shapes/shapes.go", &text).index();
+            let graph = project.graph();
+            let file = "shapes/shapes.go";
+            let doc = |kind: &str, name: &str| docstring_of(graph, file, kind, name);
+            let found: Vec<(&str, Option<String>)> = [
+                ("struct", "Bare"),
+                ("struct", "Point"),
+                ("interface", "Shape"),
+                ("type_alias", "ID"),
+                ("type_alias", "Set"),
+                ("type_alias", "Alias"),
+                ("struct", "Box"),
+                ("struct", "Circle"),
+                ("struct", "Square"),
+                ("type_alias", "Lone"),
+                ("type_alias", "Own"),
+                ("type_alias", "First"),
+                ("type_alias", "Second"),
+                ("type_alias", "Celsius"),
+                ("type_alias", "Kelvin"),
+                ("struct", "Rect"),
+                ("struct", "Polygon"),
+                ("function", "Area"),
+                ("method", "Norm"),
+                ("function", "Next"),
+            ]
+            .into_iter()
+            .map(|(kind, name)| (name, doc(kind, name)))
+            .collect();
+            let want: Vec<(&str, Option<String>)> = [
+                ("Bare", None),
+                ("Point", Some("Point is documented on its own.")),
+                (
+                    "Shape",
+                    Some("Shape is an interface documented on its own."),
+                ),
+                ("ID", Some("ID is a defined type documented on its own.")),
+                ("Set", Some("Set is a generic type documented on its own.")),
+                ("Alias", Some("Alias is an alias documented on its own.")),
+                ("Box", Some("Box is documented in a block comment.")),
+                ("Circle", None),
+                ("Square", Some("Square is documented inside the group.")),
+                ("Lone", Some("Lone is the only member of its group.")),
+                ("Own", Some("Own is documented inside its group.")),
+                ("First", None),
+                ("Second", None),
+                ("Celsius", None),
+                ("Kelvin", None),
+                ("Rect", Some("Rect is documented below a constant's line.")),
+                ("Polygon", None),
+                ("Area", Some("Area is documented as before.")),
+                ("Norm", Some("Norm is documented as before.")),
+                ("Next", None),
+            ]
+            .into_iter()
+            .map(|(name, doc)| (name, doc.map(str::to_string)))
+            .collect();
+            assert_eq!(found, want, "{label}");
+        }
     }
 }

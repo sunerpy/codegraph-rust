@@ -22,7 +22,7 @@
     "errors": null,
     "generated": 0,
     "language": "go",
-    "node_count": 11,
+    "node_count": 12,
     "path": "go/store/store.go",
     "size": 429
   },

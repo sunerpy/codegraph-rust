@@ -4252,6 +4252,123 @@ pub fn go_qualified_type_reference_reaches_a_package_type_that_appears() -> Case
         .no_edge_after("method Context::OPCommand", "references", "method Context::OPCommand")
 }
 
+/// Upstream #2417 (W4-GO-02): a method called on an alias is the aliased
+/// type's, so it follows the alias retargeted in another file of the
+/// package.
+pub fn go_alias_method_follows_an_alias_target_change_in_another_file() -> Case {
+    Case::new(Change::EditHeritage, &[Language::Go])
+        .file("go.mod", "module example.com/app\n\ngo 1.24\n")
+        .file(
+            "a/event.go",
+            "package a\n\ntype Event struct{}\n\nfunc (e *Event) IsCreate() bool { return true }\n",
+        )
+        .file(
+            "b/event.go",
+            "package b\n\ntype Event struct{}\n\nfunc (e *Event) IsCreate() bool { return false }\n",
+        )
+        .file(
+            "w/alias.go",
+            "package w\n\nimport \"example.com/app/a\"\n\ntype Event = a.Event\n",
+        )
+        .file(
+            "w/use.go",
+            "package w\n\nfunc isCreate(e *Event) bool { return e.IsCreate() }\n",
+        )
+        .write(
+            "w/alias.go",
+            "package w\n\nimport \"example.com/app/b\"\n\ntype Event = b.Event\n",
+        )
+        .edge_before("function isCreate", "calls", "method Event::IsCreate @a/event.go")
+        .edge_after("function isCreate", "calls", "method Event::IsCreate @b/event.go")
+        .no_edge_after("function isCreate", "calls", "method Event::IsCreate @a/event.go")
+}
+
+/// Upstream #2417 (W4-GO-02): a method called through two aliases follows
+/// the middle one, changed in another file of the package.
+pub fn go_alias_chain_follows_a_middle_alias_change_in_another_file() -> Case {
+    Case::new(Change::EditHeritage, &[Language::Go])
+        .file("go.mod", "module example.com/app\n\ngo 1.24\n")
+        .file(
+            "w/types.go",
+            "package w\n\ntype A struct{}\n\nfunc (a *A) Err() error { return nil }\n\ntype B struct{}\n\nfunc (b *B) Err() error { return nil }\n",
+        )
+        .file("w/ptr.go", "package w\n\ntype Ptr = *Local\n")
+        .file("w/local.go", "package w\n\ntype Local = A\n")
+        .file(
+            "w/use.go",
+            "package w\n\nfunc check(p Ptr) error { return p.Err() }\n",
+        )
+        .write("w/local.go", "package w\n\ntype Local = B\n")
+        .edge_before("function check", "calls", "method A::Err")
+        .edge_after("function check", "calls", "method B::Err")
+        .no_edge_after("function check", "calls", "method A::Err")
+}
+
+/// Upstream #2417 (W4-GO-02): a method called on a type an alias that
+/// appears declares is the aliased type's, never a namesake's.
+pub fn go_alias_method_reaches_the_aliased_type_once_the_alias_appears() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Go])
+        .file("go.mod", "module example.com/app\n\ngo 1.24\n")
+        .file(
+            "a/event.go",
+            "package a\n\ntype Event struct{}\n\nfunc (e *Event) IsCreate() bool { return true }\n",
+        )
+        .file(
+            "b/event.go",
+            "package b\n\ntype Event struct{}\n\nfunc (e *Event) IsCreate() bool { return false }\n",
+        )
+        .file(
+            "w/use.go",
+            "package w\n\nfunc isCreate(e *Event) bool { return e.IsCreate() }\n",
+        )
+        .write(
+            "w/alias.go",
+            "package w\n\nimport \"example.com/app/b\"\n\ntype Event = b.Event\n",
+        )
+        .edge_after("function isCreate", "calls", "method Event::IsCreate @b/event.go")
+        .no_edge_after("function isCreate", "calls", "method Event::IsCreate @a/event.go")
+}
+
+/// Upstream #2441 (W4-GO-02): a defined type references the type its own
+/// package gains, never another package's namesake.
+pub fn go_defined_type_reaches_a_type_its_package_gains() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Go])
+        .file("go.mod", "module example.com/app\n\ngo 1.24\n")
+        .file(
+            "alpha/names.go",
+            "package alpha\n\ntype WatchResponse struct{}\n",
+        )
+        .file(
+            "w/chan.go",
+            "package w\n\ntype WatchChan <-chan WatchResponse\n",
+        )
+        .write("w/resp.go", "package w\n\ntype WatchResponse struct{}\n")
+        .edge_after(
+            "type_alias WatchChan",
+            "references",
+            "struct WatchResponse @w/resp.go",
+        )
+        .no_edge_after(
+            "type_alias WatchChan",
+            "references",
+            "struct WatchResponse @alpha/names.go",
+        )
+}
+
+/// Upstream #2233 (W4-GO-02): a name written through a package from
+/// outside the project's modules never reaches a namesake that appears.
+pub fn go_external_qualified_reference_never_reaches_a_namesake_that_appears() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Go])
+        .file("go.mod", "module example.com/app\n\ngo 1.24\n")
+        .file(
+            "w/handler.go",
+            "package w\n\nimport \"context\"\n\ntype Handler func(ctx context.Context) error\n\ntype Ctx = context.Context\n",
+        )
+        .write("w/context.go", "package w\n\ntype Context struct{}\n")
+        .no_edge_after("type_alias Handler", "references", "struct Context")
+        .no_edge_after("type_alias Ctx", "references", "struct Context")
+}
+
 /// Upstream #2150 (W4-SW-04): a message to `self` reaches the sender's
 /// hierarchy, so it follows a middle class's superclass changed in another
 /// file.

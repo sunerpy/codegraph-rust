@@ -353,7 +353,7 @@
   },
   {
     "decorators": null,
-    "docstring": null,
+    "docstring": "Emitter writes CRUD scaffolding for a table.",
     "end_column": 1,
     "end_line": 6,
     "file_path": "generator.go",

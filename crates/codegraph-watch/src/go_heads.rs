@@ -3,18 +3,19 @@
 //! unchanged file as a fresh index would.
 //!
 //! A receiver typed by its declaration reaches the methods its declaring
-//! package has, then those of the types its declaration embeds, read from
-//! that declaration's text; a field chain `s.db.CreateItem()` reaches the
-//! method on the type the field's declaration names (upstream #2361,
-//! #1276). The text is gone once a file changes on disk, so every full index
-//! and migration writes a row per Go file with an entry per type
-//! declaration ([`HeadRow`]: what it embeds, every name it mentions, a digest
-//! of its text). A sync compares a changed file's row with its new text: a
-//! type whose entries changed, and every name its old or new declaration
-//! mentions, seed the embedding closures above them, before the change and
-//! after it. Every method of a type of those closures is touched for the
-//! name lane, and the unchanged Go files holding an unresolved call written
-//! with a receiver ending in one re-resolve whole, however many there are.
+//! package has, then those of the types its declaration embeds or, for an
+//! alias, of the type it names (W4-GO-02), read from that declaration's text;
+//! a field chain `s.db.CreateItem()` reaches the method on the type the
+//! field's declaration names (upstream #2361, #1276). The text is gone once a
+//! file changes on disk, so every full index and migration writes a row per
+//! Go file with an entry per type declaration ([`HeadRow`]: what it embeds,
+//! every name it mentions, a digest of its text). A sync compares a changed
+//! file's row with its new text: a type whose entries changed, and every name
+//! its old or new declaration mentions, seed the embedding closures above
+//! them, before the change and after it. Every method of a type of those
+//! closures is touched for the name lane, and the unchanged Go files holding
+//! an unresolved call written with a receiver ending in one re-resolve whole,
+//! however many there are.
 //!
 //! The rows are written last, with the other rows. An index without the
 //! marker at [`VERSION`] re-resolves every Go file once and rebuilds the

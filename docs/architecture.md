@@ -432,8 +432,8 @@ text changed) touches the methods of every type its old and new declarations
 mention and of the types those embed, before the change and after it, sending
 the unchanged Go files with unresolved calls written with a receiver ending in
 one down the whole-file lane however many there are, since a receiver's
-embeddings and a field chain's field type are read from the declarations'
-text; the `go_heads_version` marker is withdrawn and restored with the others;
+embeddings, an alias's target and a field chain's field type are read from the
+declarations' text; the `go_heads_version` marker is withdrawn and restored with the others;
 an import names a file, a folder or a namespace rather than a symbol, so the parked
 imports an added file or a changed file's namespace can satisfy (by the file's
 name and stem, its folder's, or the namespace's whole name) send their files
