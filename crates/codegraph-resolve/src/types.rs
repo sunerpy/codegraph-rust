@@ -518,6 +518,14 @@ pub trait ResolutionContext {
         self.get_go_module().into_iter().collect()
     }
 
+    /// The project's Rust crates and the ones its manifests depend on, from
+    /// every `Cargo.toml` at or above an indexed `.rs` file (upstream #2214).
+    /// Contexts that live for one resolution pass read them once; the default
+    /// knows none.
+    fn get_rust_crates(&self) -> Arc<crate::rust_scope::RustCrates> {
+        crate::rust_scope::no_rust_crates()
+    }
+
     /// Re-exports declared by a file (`getReExports?`, `types.ts:119-125`).
     /// Empty when the file has none.
     fn get_re_exports(&self, _file_path: &str, _language: Language) -> Vec<ReExport> {

@@ -252,6 +252,7 @@ struct NodeSnapshot {
     workspace_packages: Option<WorkspacePackages>,
     go_module: Option<GoModule>,
     go_modules: Vec<GoModule>,
+    rust_crates: Arc<crate::rust_scope::RustCrates>,
 }
 
 /// A `Sync`, immutable [`ResolutionContext`] over a precomputed [`NodeSnapshot`]
@@ -383,6 +384,10 @@ impl SnapshotResolutionContext {
         let workspace_packages = load_workspace_packages(&project_root);
         let go_module = crate::context::load_go_module_pub(&project_root);
         let go_modules = crate::context::load_go_modules_pub(&project_root, &all_file_paths);
+        let rust_crates = Arc::new(crate::rust_scope::load_rust_crates(
+            &project_root,
+            &all_file_paths,
+        ));
 
         Ok(Self {
             snapshot: Arc::new(NodeSnapshot {
@@ -402,6 +407,7 @@ impl SnapshotResolutionContext {
                 workspace_packages,
                 go_module,
                 go_modules,
+                rust_crates,
             }),
             caches: Arc::new(SnapshotCaches::new()),
             max_file_size: codegraph_core::config::DEFAULT_MAX_FILE_SIZE,
@@ -804,6 +810,10 @@ impl ResolutionContext for SnapshotResolutionContext {
 
     fn get_go_modules(&self) -> Vec<GoModule> {
         self.snapshot.go_modules.clone()
+    }
+
+    fn get_rust_crates(&self) -> Arc<crate::rust_scope::RustCrates> {
+        Arc::clone(&self.snapshot.rust_crates)
     }
 
     fn get_re_exports(&self, file_path: &str, language: Language) -> Vec<ReExport> {

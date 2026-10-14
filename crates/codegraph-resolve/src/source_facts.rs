@@ -137,6 +137,12 @@ pub struct SourceFacts {
     awaited_raw_names: OnceLock<HashSet<String>>,
     awaited_index: OnceLock<Arc<AwaitedIndex>>,
     rust_use_scopes: OnceLock<crate::rust_lexical::RustUseScopes>,
+    /// What the file's `use` items bring in, read against the crates of the
+    /// pass that first asked.
+    rust_uses: OnceLock<(
+        Arc<crate::rust_scope::RustCrates>,
+        Arc<crate::rust_scope::RustUses>,
+    )>,
     python_from_imports: OnceLock<HashMap<String, String>>,
     python_module_symbols: Mutex<HashMap<(String, usize), Option<String>>>,
     python_file_scan: OnceLock<Arc<crate::python_globals::PythonFileScan>>,
@@ -187,6 +193,7 @@ impl SourceFacts {
             awaited_raw_names: OnceLock::new(),
             awaited_index: OnceLock::new(),
             rust_use_scopes: OnceLock::new(),
+            rust_uses: OnceLock::new(),
             python_from_imports: OnceLock::new(),
             python_module_symbols: Mutex::new(HashMap::new()),
             python_file_scan: OnceLock::new(),
@@ -225,9 +232,32 @@ impl SourceFacts {
     /// glob (KEEP-RUST, P15 R4); see [`crate::rust_lexical::RustUseScopes`]. The
     /// file's `use` items are scanned once, on first ask.
     pub(crate) fn rust_use_in_scope(&self, offset: usize, name: &str) -> bool {
+        self.rust_use_scopes().covers(offset, name)
+    }
+
+    fn rust_use_scopes(&self) -> &crate::rust_lexical::RustUseScopes {
         self.rust_use_scopes
             .get_or_init(|| crate::rust_lexical::RustUseScopes::scan(&self.source))
-            .covers(offset, name)
+    }
+
+    /// What the file's `use` items bring in, outside crates told apart by
+    /// `crates` (upstream #2214 `rustUsesOf`), read once per crate set.
+    pub(crate) fn rust_uses(
+        &self,
+        crates: &Arc<crate::rust_scope::RustCrates>,
+    ) -> Arc<crate::rust_scope::RustUses> {
+        let read = || {
+            Arc::new(crate::rust_scope::RustUses::read(
+                self.rust_use_scopes(),
+                crates,
+            ))
+        };
+        let (cached_crates, uses) = self.rust_uses.get_or_init(|| (Arc::clone(crates), read()));
+        if Arc::ptr_eq(cached_crates, crates) || cached_crates == crates {
+            Arc::clone(uses)
+        } else {
+            read()
+        }
     }
 
     /// Line index of the raw source.

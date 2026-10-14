@@ -12816,3 +12816,230 @@ mod go {
         }
     }
 }
+
+mod rust {
+    use super::support::{Graph, Project};
+
+    /// `kind:qualifiedName` of every `calls` / `references` / `instantiates`
+    /// target out of the functions named `name` (upstream's `targets`).
+    fn targets(graph: &Graph, name: &str) -> Vec<String> {
+        let from: Vec<&str> = graph
+            .nodes
+            .iter()
+            .filter(|n| n.kind == "function" && n.name == name)
+            .map(|n| n.id.as_str())
+            .collect();
+        graph
+            .edges
+            .iter()
+            .filter(|e| matches!(e.kind.as_str(), "calls" | "references" | "instantiates"))
+            .filter(|e| from.contains(&e.source.as_str()))
+            .filter_map(|e| graph.node(&e.target))
+            .map(|n| format!("{}:{}", n.kind, n.qualified_name))
+            .collect()
+    }
+
+    /// The files every edge but `contains` out of `file`'s nodes lands in
+    /// (upstream's `targetsFrom`).
+    fn target_files(graph: &Graph, file: &str) -> Vec<String> {
+        graph
+            .edges
+            .iter()
+            .filter(|e| e.kind != "contains")
+            .filter(|e| graph.node(&e.source).is_some_and(|n| n.file_path == file))
+            .filter_map(|e| graph.node(&e.target))
+            .map(|n| n.file_path.clone())
+            .collect()
+    }
+
+    /// Upstream #2124: a bare Rust name reaches only what is in scope —
+    /// `Some(x)` / `Ok(x)` the prelude's, not a project variant or a struct
+    /// another file declares; a variant through a `use` of its enum's `*`; a
+    /// path (`crate::error::Result`) is no prelude lookup; a same-file struct
+    /// shadows the prelude. Upstream's fixture, its hygiene structs `pub` (a
+    /// private one is out of reach already), with the audit's `drop(v)`: with
+    /// no `use` it is the prelude's, not a `pub fn drop` in `util.rs`; a `use`
+    /// of it, or a glob over its module, shadows the prelude.
+    #[test]
+    fn pr2124_a_bare_rust_name_reaches_what_is_in_scope() {
+        let project = Project::new()
+            .file("Cargo.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\n")
+            .file(
+                "src/lowargs.rs",
+                "pub enum EncodingMode {\n    Auto,\n    Some(u8),\n    Disabled,\n}\n\npub enum ParseResult<T> {\n    Ok(T),\n    Err(String),\n}\n",
+            )
+            .file(
+                "src/hygiene.rs",
+                "pub struct Ok;\npub struct Result;\n\nfn local() -> Ok { Ok }\n",
+            )
+            .file(
+                "src/decompress.rs",
+                "pub fn find(cmd: u8) -> Option<u8> {\n    if cmd > 0 { return Some(cmd); }\n    let r: std::result::Result<u8, ()> = Ok(cmd);\n    None\n}\n",
+            )
+            .file(
+                "src/error.rs",
+                "pub struct Error;\npub type Result<T> = std::result::Result<T, Error>;\n",
+            )
+            .file(
+                "src/api.rs",
+                "pub fn load() -> crate::error::Result<u8> { unimplemented!() }\n",
+            )
+            .file(
+                "src/modes.rs",
+                "use crate::lowargs::EncodingMode::*;\n\npub fn pick() -> crate::lowargs::EncodingMode { Some(1) }\n",
+            )
+            .file("src/util.rs", "pub fn drop<T>(_value: T) {}\n")
+            .file(
+                "src/release.rs",
+                "pub fn release(v: Vec<u8>) {\n    drop(v);\n}\n",
+            )
+            .file(
+                "src/flush.rs",
+                "use crate::util::drop;\n\npub fn flush(v: Vec<u8>) {\n    drop(v);\n}\n",
+            )
+            .file(
+                "src/tidy.rs",
+                "use crate::util::*;\n\npub fn tidy(v: Vec<u8>) {\n    drop(v);\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        let report = graph.report();
+        let find: Vec<String> = targets(graph, "find")
+            .into_iter()
+            .filter(|t| t.contains("Some") || t.contains("Ok") || t.contains("Result"))
+            .collect();
+        assert!(find.is_empty(), "{find:?}\n{report}");
+        assert!(
+            !targets(graph, "release").contains(&"function:drop".to_string()),
+            "{report}"
+        );
+        assert!(
+            targets(graph, "flush").contains(&"function:drop".to_string()),
+            "{report}"
+        );
+        assert!(
+            targets(graph, "tidy").contains(&"function:drop".to_string()),
+            "{report}"
+        );
+        assert!(
+            targets(graph, "pick").contains(&"enum_member:EncodingMode::Some".to_string()),
+            "{report}"
+        );
+        // A path names its module: `crate::error::Result` is `error.rs`'s
+        // alias, not `hygiene.rs`'s struct.
+        let load = targets(graph, "load");
+        assert!(
+            load.contains(&"type_alias:Result".to_string())
+                && !load.contains(&"struct:Result".to_string()),
+            "{load:?}\n{report}"
+        );
+        assert!(
+            targets(graph, "local").contains(&"struct:Ok".to_string()),
+            "{report}"
+        );
+    }
+
+    /// Upstream #2214: a bare Rust type or function from another file is in
+    /// scope only through a `use` that binds it or a glob over its module; one
+    /// the file imports from outside the project (`use
+    /// std::task::{Context, Poll}`) is that outside item; a path names its
+    /// module (`io::Result` under `use std::io` is std's, `std::io::Error`
+    /// too); a crate-local `use` and an inline test module still reach the
+    /// project's item. Upstream's fixture, with two more: an outside import
+    /// shadows a project glob (`poll.rs`), and a crate `Cargo.toml` depends on
+    /// is outside the project (`use futures::Stream`).
+    #[test]
+    fn pr2214_a_rust_name_is_in_scope_only_through_its_module_or_a_use() {
+        let project = Project::new()
+            .file(
+                "Cargo.toml",
+                "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[dependencies]\nfutures = \"0.3\"\n",
+            )
+            .file(
+                "src/lib.rs",
+                "pub mod runtime;\npub mod io;\npub mod net;\npub mod stream;\npub mod poll;\npub mod source;\npub mod sink;\npub mod handle;\n",
+            )
+            .file("src/stream.rs", "pub trait Stream {}\n")
+            .file(
+                "src/poll.rs",
+                "use crate::runtime::context::*;\nuse std::task::Context;\n\npub fn wake(cx: &mut Context<'_>) {\n    let _ = cx;\n}\n",
+            )
+            .file(
+                "src/source.rs",
+                "use futures::Stream;\n\npub fn drain(s: impl Stream) {\n    let _ = s;\n}\n",
+            )
+            .file(
+                "src/sink.rs",
+                "use crate::stream::Stream;\n\npub fn fill(s: impl Stream) {\n    let _ = s;\n}\n",
+            )
+            .file(
+                "src/runtime/mod.rs",
+                "pub mod context;\npub mod task;\npub mod driver;\n",
+            )
+            .file(
+                "src/runtime/context.rs",
+                "pub struct Context {\n    pub depth: u8,\n}\n\npub fn try_current() -> u8 {\n    0\n}\n",
+            )
+            .file(
+                "src/handle.rs",
+                "pub fn current() -> u8 {\n    try_current()\n}\n",
+            )
+            .file(
+                "src/runtime/task/mod.rs",
+                "pub type Result<T> = std::result::Result<T, ()>;\n",
+            )
+            .file("src/io/mod.rs", "pub mod copy;\n")
+            .file("src/io/copy.rs", "pub struct Error;\n")
+            .file(
+                "src/net.rs",
+                "use std::io;\nuse std::task::{Context, Poll};\n\npub fn poll_ready(cx: &mut Context<'_>) -> Poll<io::Result<()>> {\n    let _ = cx;\n    Poll::Ready(Ok(()))\n}\n\npub fn fail() -> std::io::Error {\n    std::io::Error::other(\"x\")\n}\n",
+            )
+            .file(
+                "src/runtime/driver.rs",
+                "use crate::runtime::context::Context;\n\npub fn enter(ctx: &Context) -> u8 {\n    ctx.depth\n}\n",
+            )
+            .file("tests/support/panic.rs", "pub fn test_panic() {}\n")
+            .file(
+                "tests/io_panic.rs",
+                "mod support {\n    pub mod panic;\n}\n\nuse support::panic::test_panic;\n\n#[test]\nfn panics() {\n    test_panic();\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        let report = graph.report();
+        let net = target_files(graph, "src/net.rs");
+        for outside in [
+            "src/runtime/context.rs",
+            "src/runtime/task/mod.rs",
+            "src/io/copy.rs",
+        ] {
+            assert!(!net.contains(&outside.to_string()), "{outside}\n{report}");
+        }
+        assert!(
+            target_files(graph, "src/runtime/driver.rs")
+                .contains(&"src/runtime/context.rs".to_string()),
+            "{report}"
+        );
+        assert!(
+            target_files(graph, "tests/io_panic.rs")
+                .contains(&"tests/support/panic.rs".to_string()),
+            "{report}"
+        );
+        // The audit's `try_current()` with no `use`: another file's function.
+        assert!(
+            !target_files(graph, "src/handle.rs").contains(&"src/runtime/context.rs".to_string()),
+            "{report}"
+        );
+        assert!(
+            !target_files(graph, "src/poll.rs").contains(&"src/runtime/context.rs".to_string()),
+            "{report}"
+        );
+        assert!(
+            !target_files(graph, "src/source.rs").contains(&"src/stream.rs".to_string()),
+            "{report}"
+        );
+        assert!(
+            target_files(graph, "src/sink.rs").contains(&"src/stream.rs".to_string()),
+            "{report}"
+        );
+    }
+}

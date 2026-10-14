@@ -5173,6 +5173,117 @@ pub fn rust_delete_a_used_module() -> Case {
         .edge_before("file:src/lib.rs", "imports", "function helper")
 }
 
+/// Upstream #2214 (W4-RS-01): another file's item is in scope through a glob
+/// over its module, so a bare call links the item that module gains.
+pub fn rust_glob_module_gains_an_item() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Rust])
+        .file(
+            "Cargo.toml",
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+        )
+        .file("src/lib.rs", "mod util;\nmod other;\nmod run;\n")
+        .file("src/util.rs", "pub fn other_helper() {}\n")
+        .file("src/other.rs", "pub fn helper() {}\n")
+        .file(
+            "src/run.rs",
+            "use crate::util::*;\n\npub fn run() {\n    helper();\n}\n",
+        )
+        .write("src/util.rs", "pub fn helper() {}\n")
+        .edge_after("function run", "calls", "function helper @src/util.rs")
+        .no_edge_after("function run", "calls", "function helper @src/other.rs")
+}
+
+/// Upstream #2214 (W4-RS-01): a namesake that appears in a module the file
+/// neither imports nor globs is out of scope.
+pub fn rust_out_of_scope_namesake_appears() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Rust])
+        .file(
+            "Cargo.toml",
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+        )
+        .file("src/lib.rs", "mod util;\nmod other;\nmod run;\n")
+        .file("src/util.rs", "pub fn helper() {}\n")
+        .file("src/other.rs", "pub fn unrelated() {}\n")
+        .file(
+            "src/run.rs",
+            "use crate::util::*;\n\npub fn run() {\n    helper();\n}\n",
+        )
+        .write("src/other.rs", "pub fn helper() {}\n")
+        .edge_before("function run", "calls", "function helper @src/util.rs")
+        .edge_after("function run", "calls", "function helper @src/util.rs")
+        .no_edge_after("function run", "calls", "function helper @src/other.rs")
+}
+
+/// Upstream #2124 (W4-RS-01): a bare prelude name is the prelude's, so a
+/// project `drop` that appears without a `use` of it is not what it calls.
+pub fn rust_prelude_name_ignores_a_project_namesake_that_appears() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Rust])
+        .file(
+            "Cargo.toml",
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+        )
+        .file("src/lib.rs", "mod util;\nmod release;\n")
+        .file("src/util.rs", "pub fn keep() {}\n")
+        .file(
+            "src/release.rs",
+            "pub fn release(v: Vec<u8>) {\n    drop(v);\n}\n",
+        )
+        .write(
+            "src/util.rs",
+            "pub fn keep() {}\n\npub fn drop<T>(_value: T) {}\n",
+        )
+        .no_edge_after("function release", "calls", "function drop")
+}
+
+/// Upstream #2124 (W4-RS-01): an enum variant is in scope through a glob over
+/// its enum, so renaming the enum in another file takes it out of scope.
+pub fn rust_glob_variant_leaves_when_its_enum_is_renamed() -> Case {
+    Case::new(Change::RenameSymbol, &[Language::Rust])
+        .file(
+            "Cargo.toml",
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+        )
+        .file("src/lib.rs", "mod lowargs;\nmod modes;\n")
+        .file(
+            "src/lowargs.rs",
+            "pub enum Mode {\n    Auto,\n    Some(u8),\n}\n",
+        )
+        .file(
+            "src/modes.rs",
+            "use crate::lowargs::Mode::*;\n\npub fn pick() {\n    let _ = Some(1);\n}\n",
+        )
+        .write(
+            "src/lowargs.rs",
+            "pub enum Kind {\n    Auto,\n    Some(u8),\n}\n",
+        )
+        .edge_before("function pick", "calls", "enum_member Mode::Some")
+        .no_edge_after("function pick", "calls", "enum_member Kind::Some")
+}
+
+/// Upstream #2214 (W4-RS-01): a crate the manifest comes to depend on is
+/// outside the project, so a name the file imports from it is no project
+/// item. `Cargo.toml` is not a source file; W5-06 makes its change
+/// re-resolve the project's Rust files.
+pub fn rust_cargo_dependency_appears() -> Case {
+    Case::new(Change::ControlFile, &[Language::Rust])
+        .file(
+            "Cargo.toml",
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+        )
+        .file("src/lib.rs", "mod stream;\nmod source;\n")
+        .file("src/stream.rs", "pub trait Stream {}\n")
+        .file(
+            "src/source.rs",
+            "use futures::Stream;\n\npub fn drain(s: impl Stream) {\n    let _ = s;\n}\n",
+        )
+        .write(
+            "Cargo.toml",
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[dependencies]\nfutures = \"0.3\"\n",
+        )
+        .edge_before("function drain", "references", "trait Stream")
+        .no_edge_after("function drain", "references", "trait Stream")
+}
+
 pub fn dart_delete_an_imported_library() -> Case {
     Case::new(Change::DeleteImportedModule, &[Language::Dart])
         .file(

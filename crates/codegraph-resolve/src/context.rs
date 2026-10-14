@@ -49,6 +49,7 @@ struct Caches {
     project_aliases: Option<Option<AliasMap>>,
     go_module: Option<Option<GoModule>>,
     go_modules: Option<Vec<GoModule>>,
+    rust_crates: Option<Arc<crate::rust_scope::RustCrates>>,
     workspace_packages: Option<Option<WorkspacePackages>>,
     /// Each directory's package.json / Deno import-map scope for the pass.
     manifest_scopes: HashMap<String, Arc<ManifestScope>>,
@@ -94,6 +95,7 @@ impl Caches {
             project_aliases: None,
             go_module: None,
             go_modules: None,
+            rust_crates: None,
             workspace_packages: None,
             manifest_scopes: HashMap::new(),
             all_files: None,
@@ -617,6 +619,18 @@ impl ResolutionContext for StoreResolutionContext<'_> {
         let modules = load_go_modules(&self.project_root, &self.get_all_files());
         self.caches.borrow_mut().go_modules = Some(modules.clone());
         modules
+    }
+
+    fn get_rust_crates(&self) -> Arc<crate::rust_scope::RustCrates> {
+        if let Some(cached) = self.caches.borrow().rust_crates.clone() {
+            return cached;
+        }
+        let crates = Arc::new(crate::rust_scope::load_rust_crates(
+            &self.project_root,
+            &self.get_all_files(),
+        ));
+        self.caches.borrow_mut().rust_crates = Some(Arc::clone(&crates));
+        crates
     }
 
     fn get_re_exports(&self, file_path: &str, language: Language) -> Vec<ReExport> {

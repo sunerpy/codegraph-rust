@@ -1685,6 +1685,9 @@ impl ReferenceResolver {
             context,
             &self.type_parameters,
         );
+        // A bare Rust name reaches only what is in scope, whichever strategy
+        // chose it (upstream #2214 `gateRustScope`).
+        let resolved = crate::rust_scope::gate_rust_scope(resolved, reference, context);
         let resolved = self.gate_import_locality(resolved, reference, context);
         let resolved = self.gate_c_macro_calls(resolved, reference, context);
         let resolved = self.forward_alias_binding(resolved, reference, context);

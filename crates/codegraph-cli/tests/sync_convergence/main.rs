@@ -913,6 +913,12 @@ matrix! {
     mybatis_rename_an_included_fragment,
     typescript_delete_an_imported_module,
     rust_delete_a_used_module,
+    rust_glob_module_gains_an_item,
+    rust_out_of_scope_namesake_appears,
+    rust_prelude_name_ignores_a_project_namesake_that_appears,
+    rust_glob_variant_leaves_when_its_enum_is_renamed,
+    #[ignore = "W5-06: a Cargo.toml change does not re-resolve the project's Rust files"]
+    rust_cargo_dependency_appears,
     dart_delete_an_imported_library,
     astro_delete_an_imported_module,
     lua_delete_a_required_module,

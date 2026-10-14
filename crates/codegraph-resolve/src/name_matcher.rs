@@ -2430,6 +2430,8 @@ pub fn match_by_exact_name(
     }
     let rust_bare = rust_shape == Some(RustCallShape::Bare);
     let rust_method = rust_shape == Some(RustCallShape::Method);
+    // A bare Rust name reaches what is in scope (upstream #2124, #2214).
+    let rust_scoped = crate::rust_scope::is_rust_bare_identifier(reference);
     let same_name = context.get_nodes_by_name_shared(&reference.reference_name);
     // `NAME(...)` where NAME is a function-like macro somewhere in the project
     // is an expansion or a call to a same-named function — never the macro
@@ -2565,6 +2567,11 @@ pub fn match_by_exact_name(
                 && is_rust_prelude_variant(&reference.reference_name)
                 && !rust_variant_import_in_scope(reference, context))
         })
+        // Another file's item only through a `use` that binds it or a glob
+        // over its module, a prelude name only through a project `use`, an
+        // enum variant only through a `use` of it and its enum, a path's
+        // name only in that path's module (upstream #2124, #2214).
+        .filter(|n| !rust_scoped || crate::rust_scope::is_rust_name_in_scope(n, reference, context))
         // A name the file binds itself shadows every other file's symbol of
         // that name, so a bare call has no cross-file candidate.
         .filter(|n| {
@@ -6402,6 +6409,7 @@ pub fn match_fuzzy(reference: &RefView, context: &dyn ResolutionContext) -> Opti
         && has_no_receiver_on_line(reference, context);
     let swift_shape = crate::swift_scope::swift_call_shape(reference, context);
     let go_shape = crate::go_calls::go_call_shape(reference, context);
+    let rust_scoped = crate::rust_scope::is_rust_bare_identifier(reference);
     let callable_candidates = apply_language_gate(
         candidates
             .into_iter()
@@ -6485,6 +6493,10 @@ pub fn match_fuzzy(reference: &RefView, context: &dyn ResolutionContext) -> Opti
                 go_shape
                     .as_ref()
                     .is_none_or(|shape| crate::go_calls::is_go_call_target(n, shape))
+            })
+            // A bare Rust name, only what is in scope (upstream #2124, #2214).
+            .filter(|n| {
+                !rust_scoped || crate::rust_scope::is_rust_name_in_scope(n, reference, context)
             })
             // `new …MockData()` makes an instance of a type; a method is never
             // what it names (upstream #2141).
@@ -14310,7 +14322,9 @@ mod tests {
 
     #[test]
     fn rust_receiver_gates_narrow_exact_name_candidates() {
-        let source = "fn f() {\n    root().join(x);\n    store().nodes_by_ids(x);\n    helper();\n    root().build();\n    Err(1);\n}\n";
+        // The trailing `use` brings `util.rs`'s `helper` into scope: another
+        // file's function is reached only through one (upstream #2214).
+        let source = "fn f() {\n    root().join(x);\n    store().nodes_by_ids(x);\n    helper();\n    root().build();\n    Err(1);\n}\nuse crate::util::helper;\n";
         let method = |name: &str, qualified: &str| {
             mk(
                 &format!("method:{name}"),
@@ -14369,6 +14383,12 @@ mod tests {
             .file("src/a.rs", source)
             .name("helper", vec![method("helper", "Store::helper")]);
         assert_eq!(target(&at("helper", 4), &ctx), None);
+        // Without that `use`, `util.rs`'s `helper` is out of scope (#2214).
+        let unimported = source.replace("use crate::util::helper;\n", "");
+        let ctx = Ctx::default()
+            .file("src/a.rs", &unimported)
+            .name("helper", vec![function("helper")]);
+        assert_eq!(target(&at("helper", 4), &ctx), None);
         // R4: a bare `Err` is the prelude's unless a `use` in scope imports one.
         let variant = mk(
             "enum_member:Err",
@@ -14399,8 +14419,9 @@ mod tests {
     fn rust_receiver_gates_close_the_fuzzy_fallback() {
         // Only the lowercase index holds `join` / `helper`, so the fuzzy
         // fallback is the one strategy that finds them; the shapes still gate
-        // them. (Fuzzy matching is exact-case in Rust, upstream #2139.)
-        let source = "fn f() {\n    root().join(x);\n    helper(x);\n}\n";
+        // them. (Fuzzy matching is exact-case in Rust, upstream #2139.) The
+        // trailing `use` brings `x.rs`'s `helper` into scope (upstream #2214).
+        let source = "fn f() {\n    root().join(x);\n    helper(x);\n}\nuse crate::x::helper;\n";
         let lone = |name: &str, kind: NodeKind| {
             vec![mk(
                 &format!("{kind:?}:{name}"),
@@ -14438,6 +14459,74 @@ mod tests {
             fuzzy("helper", 3, &ctx).is_some(),
             "a bare call may still reach a function"
         );
+        let ctx = Ctx::default()
+            .file("src/a.rs", &source.replace("use crate::x::helper;\n", ""))
+            .lower("helper", lone("helper", NodeKind::Function));
+        assert!(
+            fuzzy("helper", 3, &ctx).is_none(),
+            "another file's function only through a `use`"
+        );
+    }
+
+    #[test]
+    fn rust_scope_gate_declines_any_strategys_out_of_scope_target() {
+        // Upstream #2214 `gateRustScope`: whichever strategy chose another
+        // file's item for a bare Rust name, it stands only when in scope.
+        let helper = mk(
+            "function:helper",
+            NodeKind::Function,
+            "helper",
+            "helper",
+            "src/util.rs",
+            Language::Rust,
+        );
+        let chosen = |reference: &RefView| ResolvedRef {
+            original: reference.clone(),
+            target_node_id: "function:helper".to_string(),
+            confidence: 0.9,
+            resolved_by: ResolvedBy::QualifiedName,
+        };
+        let gate = |source: &str, reference: &RefView| {
+            let ctx = Ctx::default()
+                .file(&reference.file_path, source)
+                .node_by_id(helper.clone());
+            crate::rust_scope::gate_rust_scope(Some(chosen(reference)), reference, &ctx)
+                .map(|r| r.target_node_id)
+        };
+        let source = "fn f() {\n    helper();\n}\n";
+        let bare = at_column("helper", EdgeKind::Calls, "src/a.rs", Language::Rust, 2, 4);
+        assert_eq!(gate(source, &bare), None, "no `use` brings it in");
+        let imported = format!("{source}use crate::util::helper;\n");
+        assert_eq!(
+            gate(&imported, &bare).as_deref(),
+            Some("function:helper"),
+            "a `use` binds it"
+        );
+        let globbed = format!("{source}use crate::util::*;\n");
+        assert_eq!(
+            gate(&globbed, &bare).as_deref(),
+            Some("function:helper"),
+            "a glob over its module brings it in"
+        );
+        // Only bare Rust names are judged.
+        let dotted = at_column(
+            "x.helper",
+            EdgeKind::Calls,
+            "src/a.rs",
+            Language::Rust,
+            2,
+            4,
+        );
+        assert_eq!(gate(source, &dotted).as_deref(), Some("function:helper"));
+        let other = at_column(
+            "helper",
+            EdgeKind::Calls,
+            "src/a.ts",
+            Language::TypeScript,
+            2,
+            4,
+        );
+        assert_eq!(gate(source, &other).as_deref(), Some("function:helper"));
     }
 
     #[test]
