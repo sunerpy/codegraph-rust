@@ -5306,6 +5306,117 @@ pub fn rust_variant_path_leaves_the_enum_when_the_variant_is_renamed() -> Case {
         .no_edge_after("function pick", "references", "enum Mode")
 }
 
+/// Upstream #2177 (W4-RS-03): a CamelCase path receiver the project does
+/// not declare is an outside type; once another file declares it, the call
+/// is the project's.
+pub fn rust_outside_type_receiver_reaches_a_type_the_project_gains() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Rust])
+        .file(
+            "Cargo.toml",
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+        )
+        .file("src/lib.rs", "mod config;\nmod run;\nmod builder;\n")
+        .file(
+            "src/config.rs",
+            "pub struct BuilderConfig;\n\nimpl BuilderConfig {\n    pub fn new() -> Self {\n        BuilderConfig\n    }\n}\n",
+        )
+        .file("src/builder.rs", "pub fn unrelated() {}\n")
+        .file(
+            "src/run.rs",
+            "use crate::builder::Builder;\n\npub fn run() {\n    let _b = Builder::new();\n}\n",
+        )
+        .write(
+            "src/builder.rs",
+            "pub struct Builder;\n\nimpl Builder {\n    pub fn new() -> Self {\n        Builder\n    }\n}\n",
+        )
+        .no_edge_after("function run", "calls", "method BuilderConfig::new")
+        .edge_after("function run", "calls", "method Builder::new")
+}
+
+/// Upstream #2177 (W4-RS-03): once the project type a path receiver names is
+/// renamed away, the receiver is an outside type, and the call reaches no
+/// project method of another type by word overlap.
+pub fn rust_outside_type_receiver_leaves_when_the_project_type_is_renamed() -> Case {
+    Case::new(Change::RenameSymbol, &[Language::Rust])
+        .file(
+            "Cargo.toml",
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+        )
+        .file("src/lib.rs", "mod config;\nmod run;\nmod builder;\n")
+        .file(
+            "src/config.rs",
+            "pub struct BuilderConfig;\n\nimpl BuilderConfig {\n    pub fn new() -> Self {\n        BuilderConfig\n    }\n}\n",
+        )
+        .file(
+            "src/builder.rs",
+            "pub struct Builder;\n\nimpl Builder {\n    pub fn new() -> Self {\n        Builder\n    }\n}\n",
+        )
+        .file(
+            "src/run.rs",
+            "use crate::builder::Builder;\n\npub fn run() {\n    let _b = Builder::new();\n}\n",
+        )
+        .write(
+            "src/builder.rs",
+            "pub struct Assembler;\n\nimpl Assembler {\n    pub fn new() -> Self {\n        Assembler\n    }\n}\n",
+        )
+        .edge_before("function run", "calls", "method Builder::new")
+        .no_edge_after("function run", "calls", "method BuilderConfig::new")
+        .no_edge_after("function run", "calls", "method Assembler::new")
+}
+
+/// Upstream #2177 (W4-RS-03): a path receiver is a declared type once a
+/// type alias of its name appears in another file, which changes no node of
+/// the method's name.
+pub fn rust_alias_receiver_reaches_a_method_once_the_alias_appears() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Rust])
+        .file(
+            "Cargo.toml",
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+        )
+        .file("src/lib.rs", "mod widget;\nmod alias;\nmod run;\n")
+        .file(
+            "src/widget.rs",
+            "pub struct Widget;\n\nimpl Widget {\n    pub fn fresh() -> Self {\n        Widget\n    }\n}\n",
+        )
+        .file("src/alias.rs", "pub fn unrelated() {}\n")
+        .file(
+            "src/run.rs",
+            "use crate::alias::WidgetRef;\n\npub fn run() {\n    let _w = WidgetRef::fresh();\n}\n",
+        )
+        .write(
+            "src/alias.rs",
+            "pub type WidgetRef = crate::widget::Widget;\n\npub fn unrelated() {}\n",
+        )
+        .edge_after("function run", "calls", "method Widget::fresh")
+}
+
+/// Upstream #2177 (W4-RS-03): a path receiver is an outside type once the
+/// type alias of its name leaves another file, which changes no node of the
+/// method's name.
+pub fn rust_alias_receiver_leaves_the_method_when_the_alias_goes() -> Case {
+    Case::new(Change::DeleteImportedModule, &[Language::Rust])
+        .file(
+            "Cargo.toml",
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+        )
+        .file("src/lib.rs", "mod widget;\nmod alias;\nmod run;\n")
+        .file(
+            "src/widget.rs",
+            "pub struct Widget;\n\nimpl Widget {\n    pub fn fresh() -> Self {\n        Widget\n    }\n}\n",
+        )
+        .file(
+            "src/alias.rs",
+            "pub type WidgetRef = crate::widget::Widget;\n\npub fn unrelated() {}\n",
+        )
+        .file(
+            "src/run.rs",
+            "use crate::alias::WidgetRef;\n\npub fn run() {\n    let _w = WidgetRef::fresh();\n}\n",
+        )
+        .write("src/alias.rs", "pub fn unrelated() {}\n")
+        .edge_before("function run", "calls", "method Widget::fresh")
+        .no_edge_after("function run", "calls", "method Widget::fresh")
+}
+
 /// Upstream #2214 (W4-RS-01): a crate the manifest comes to depend on is
 /// outside the project, so a name the file imports from it is no project
 /// item. `Cargo.toml` is not a source file; W5-06 makes its change

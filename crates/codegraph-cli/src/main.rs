@@ -5993,6 +5993,7 @@ fn index_project_inner(
     codegraph_watch::swift_heads::write_marker(&store)?;
     codegraph_watch::objc_heads::write_marker(&store)?;
     codegraph_watch::go_heads::write_marker(&store)?;
+    codegraph_watch::rust_receivers::write_marker(&store)?;
     finish_phase(&pb, "Persisted nodes");
     diagnostic_run.phase_end("node_write", node_write_started.elapsed(), json!({}));
 

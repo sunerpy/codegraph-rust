@@ -13482,4 +13482,183 @@ mod rust {
             graph.report()
         );
     }
+
+    /// `Owner::member` of every call edge out of `file` (upstream's
+    /// `callsFrom`), sorted.
+    fn calls_from(graph: &Graph, file: &str) -> Vec<String> {
+        let mut calls: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|e| e.kind == "calls")
+            .filter(|e| graph.node(&e.source).is_some_and(|n| n.file_path == file))
+            .filter_map(|e| graph.node(&e.target))
+            .map(|n| n.qualified_name.clone())
+            .collect();
+        calls.sort();
+        calls
+    }
+
+    /// Upstream #2177's Rust half: a CamelCase path receiver the project
+    /// doesn't declare (`Vec::new`, `String::from`) is an outside type, a
+    /// lowercase module path (`task::spawn`) never reaches a method, and a
+    /// link further down a multi-line chain is named after the chain's head
+    /// (`bat()\n.stdout(…)` is assert_cmd's, `Arg::new(…)\n.value_hint(…)`
+    /// the project's). Upstream's fixture, with the audit's `String::from` to
+    /// a `StringBuilder::from` and a project trait's associated function
+    /// reached through the trait.
+    #[test]
+    fn pr2177_rust_calls_on_outside_types_and_module_paths_stay_outside() {
+        let project = Project::new()
+            .file(
+                "src/lib.rs",
+                "pub struct VecWithInitialized;\nimpl VecWithInitialized {\n    pub fn new() -> Self { VecWithInitialized }\n}\n\npub struct TaskTracker;\nimpl TaskTracker {\n    pub fn spawn(&self) {}\n}\n\npub struct OutputType;\nimpl OutputType {\n    pub fn stdout(&self) {}\n}\n\npub struct Arg;\nimpl Arg {\n    pub fn new(name: &str) -> Arg { Arg }\n    pub fn value_hint(self, hint: u8) -> Arg { self }\n}\n\npub struct StringBuilder;\nimpl StringBuilder {\n    pub fn from(text: &str) -> Self { StringBuilder }\n}\n\npub trait Plugin {\n    fn create() -> Self;\n}\n\npub struct Widget;\nimpl Widget {\n    pub fn fresh() -> Self { Widget }\n}\npub type WidgetRef = Widget;\n\npub fn run() {\n    let v: Vec<u8> = Vec::new();\n    task::spawn(async {});\n    bat()\n        .assert()\n        .stdout(\"x\");\n    let a = Arg::new(\"cmd\")\n        .value_hint(1);\n    let s = String::from(\"x\");\n    let r = WidgetRef::fresh();\n}\n\npub fn make<P: Plugin>() -> P {\n    <P as Plugin>::create()\n}\n\npub fn build() -> u8 {\n    let _b = Plugin::create;\n    0\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        let calls = calls_from(graph, "src/lib.rs");
+        for outside in [
+            "VecWithInitialized::new",
+            "TaskTracker::spawn",
+            "OutputType::stdout",
+            "StringBuilder::from",
+        ] {
+            assert!(
+                !calls.contains(&outside.to_string()),
+                "{outside}: {calls:?}\n{}",
+                graph.report()
+            );
+        }
+        assert!(
+            calls.contains(&"Arg::value_hint".to_string()),
+            "{calls:?}\n{}",
+            graph.report()
+        );
+        // A project type alias is a declared type: `WidgetRef::fresh()` keeps
+        // its guess (`trait` and `type_alias` count, upstream #2177).
+        assert!(
+            calls.contains(&"Widget::fresh".to_string()),
+            "{calls:?}\n{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream #2231: a path through a generic type parameter (`T::Output`)
+    /// names no project item, not even the alias another impl in its own file
+    /// declares.
+    #[test]
+    fn pr2231_a_generic_parameter_path_names_no_alias_of_its_file() {
+        let project = Project::new()
+            .file("Cargo.toml", "[package]\nname = \"app\"\n")
+            .file(
+                "src/lib.rs",
+                "pub struct Wrapper;\n\nimpl std::ops::Add for Wrapper {\n    type Output = Wrapper;\n    fn add(self, _other: Wrapper) -> Wrapper {\n        Wrapper\n    }\n}\n\npub fn sum<T: std::ops::Add>(a: T, b: T) -> T::Output {\n    a + b\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        let sum = graph
+            .nodes
+            .iter()
+            .find(|n| n.kind == "function" && n.name == "sum")
+            .expect("sum");
+        let targets: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|e| e.kind == "references" && e.source == sum.id)
+            .filter_map(|e| graph.node(&e.target))
+            .map(|t| format!("{} {}", t.kind, t.qualified_name))
+            .collect();
+        assert!(
+            !targets.iter().any(|t| t.starts_with("type_alias")),
+            "{targets:?}\n{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream #2231: `Self::Error` in a trait is the trait's own associated
+    /// type, never an impl's alias in another file nor a struct of that name,
+    /// and in an impl the alias that impl declares.
+    #[test]
+    fn pr2231_a_self_path_reads_its_own_impl_or_trait() {
+        let project = Project::new()
+            .file("Cargo.toml", "[package]\nname = \"serde\"\n")
+            .file("src/de/value.rs", "pub struct Error {\n    msg: String,\n}\n")
+            .file(
+                "src/de/mod.rs",
+                "pub mod value;\npub mod unit;\n\npub trait Deserializer {\n    type Error;\n    fn deserialize_unit(self) -> Result<(), Self::Error>;\n}\n",
+            )
+            .file(
+                "src/de/unit.rs",
+                "use crate::de::value::Error;\n\npub struct Unit;\n\nimpl crate::de::Deserializer for Unit {\n    type Error = Error;\n    fn deserialize_unit(self) -> Result<(), Self::Error> {\n        Ok(())\n    }\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        let targets_at = |file: &str, line: i64| -> Vec<String> {
+            graph
+                .edges
+                .iter()
+                .filter(|e| e.kind == "references" && e.line == Some(line))
+                .filter(|e| graph.node(&e.source).is_some_and(|n| n.file_path == file))
+                .filter_map(|e| graph.node(&e.target))
+                .map(|t| format!("{} {} {}:{}", t.kind, t.name, t.file_path, t.start_line))
+                .collect()
+        };
+        let in_trait = targets_at("src/de/mod.rs", 6);
+        assert!(
+            !in_trait.iter().any(|t| t.contains(" Error ")),
+            "{in_trait:?}\n{}",
+            graph.report()
+        );
+        let in_impl = targets_at("src/de/unit.rs", 7);
+        assert!(
+            in_impl.contains(&"type_alias Error src/de/unit.rs:6".to_string()),
+            "{in_impl:?}\n{}",
+            graph.report()
+        );
+        assert!(
+            !in_impl.iter().any(|t| t.contains("src/de/value.rs")),
+            "{in_impl:?}\n{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream #2231: `Self::Error` in a signature is the enclosing impl's
+    /// own associated type, and `V::Value` an associated type of a generic's
+    /// bound — never a struct of that name. Upstream's fixture.
+    #[test]
+    fn pr2231_self_and_generic_parameter_paths_name_no_struct() {
+        let project = Project::new()
+            .file("Cargo.toml", "[package]\nname = \"serde\"\n")
+            .file(
+                "src/de/value.rs",
+                "pub struct Error {\n    msg: String,\n}\n\npub struct Value;\n",
+            )
+            .file(
+                "src/private/de.rs",
+                "use crate::de::value::{Error, Value};\n\npub trait Deserializer {\n    type Error;\n}\n\npub struct ContentDeserializer<E> {\n    err: E,\n}\n\nimpl<E> Deserializer for ContentDeserializer<E> {\n    type Error = E;\n\n    fn deserialize_any<V: Visitor>(self, visitor: V) -> Result<V::Value, Self::Error> {\n        todo!()\n    }\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        let targets: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|e| e.kind == "references" && e.line == Some(14))
+            .filter(|e| {
+                graph
+                    .node(&e.source)
+                    .is_some_and(|n| n.file_path == "src/private/de.rs")
+            })
+            .filter_map(|e| graph.node(&e.target))
+            .map(|t| format!("{} {}:{}", t.kind, t.file_path, t.start_line))
+            .collect();
+        assert!(
+            targets.contains(&"type_alias src/private/de.rs:12".to_string()),
+            "{targets:?}\n{}",
+            graph.report()
+        );
+        assert!(
+            !targets.iter().any(|t| t.contains("src/de/value.rs")),
+            "{targets:?}\n{}",
+            graph.report()
+        );
+    }
 }

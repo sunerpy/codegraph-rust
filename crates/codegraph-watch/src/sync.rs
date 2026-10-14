@@ -569,6 +569,9 @@ fn sync_paths_with_store(
     let swift_bootstrap = crate::swift_heads::needs_bootstrap(store)?;
     let objc_bootstrap = crate::objc_heads::needs_bootstrap(store)?;
     let go_bootstrap = crate::go_heads::needs_bootstrap(store)?;
+    // And for the Rust files writing a path receiver whose type came or
+    // went: every Rust file is re-resolved once (W4-RS-03).
+    let rust_bootstrap = crate::rust_receivers::needs_bootstrap(store)?;
 
     let paths = paths.into_iter().collect::<Vec<_>>();
     let total = paths.len();
@@ -628,6 +631,7 @@ fn sync_paths_with_store(
         || swift_bootstrap
         || objc_bootstrap
         || go_bootstrap
+        || rust_bootstrap
     {
         note_python_global_readers(
             project_root,
@@ -846,6 +850,28 @@ fn sync_paths_with_store(
             dependent_fallbacks.insert(file.clone());
         }
         changed_names.note_all(go.names.iter().cloned());
+        // A CamelCase path receiver is an outside type unless the project
+        // declares a type, trait or alias of its name (upstream #2177): the
+        // unchanged Rust files writing a name that came or went as a
+        // receiver re-resolve the references written through it.
+        let receiver_dependents = crate::rust_receivers::receiver_dependents(
+            store,
+            project_root,
+            scope.options.max_file_size,
+            &changed_names.rust_receiver_types,
+            &reindexed,
+            &changed_names.removed_files,
+        )?;
+        if rust_bootstrap {
+            for file in crate::rust_receivers::every_rust_file(
+                store,
+                &reindexed,
+                &changed_names.removed_files,
+            )? {
+                dependent_sites.remove(&file);
+                dependent_fallbacks.insert(file);
+            }
+        }
         // What a changed Python import statement re-exports moves for its
         // module's importers without any node of those names changing.
         if !changed_names.python_imports.is_empty() {
@@ -912,6 +938,7 @@ fn sync_paths_with_store(
             &resolver,
             &dependent_sites,
             &dependent_fallbacks,
+            &receiver_dependents,
             &reindexed,
         )?;
         let mut scope_files = reindexed.clone();
@@ -954,6 +981,7 @@ fn sync_paths_with_store(
         crate::swift_heads::write_marker(store)?;
         crate::objc_heads::write_marker(store)?;
         crate::go_heads::write_marker(store)?;
+        crate::rust_receivers::write_marker(store)?;
     }
 
     // Orphan sweep (#1187, upstream index.ts:645-682): a full-index resolution
@@ -996,6 +1024,7 @@ fn sync_paths_with_store(
 /// no fresh ref upgrades that file to the correctness-first whole-file fallback,
 /// which still preserves nodes, `contains` edges, and incoming edges. The returned
 /// site lane plus fallback-file lane are resolved against the final graph.
+#[allow(clippy::too_many_arguments)]
 fn refresh_dependent_refs(
     project_root: &Path,
     store: &mut Store,
@@ -1003,11 +1032,13 @@ fn refresh_dependent_refs(
     resolver: &ReferenceResolver,
     dependent_sites: &BTreeMap<String, BTreeSet<ReferenceSite>>,
     fallback_files: &BTreeSet<String>,
+    receiver_names: &BTreeMap<String, BTreeSet<String>>,
     already_reindexed: &HashSet<String>,
 ) -> Result<(BTreeSet<ReferenceSite>, HashSet<String>)> {
     let dependents = dependent_sites
         .keys()
         .chain(fallback_files)
+        .chain(receiver_names.keys())
         .cloned()
         .collect::<BTreeSet<_>>();
     let mut refreshed_sites = BTreeSet::new();
@@ -1034,20 +1065,36 @@ fn refresh_dependent_refs(
             refreshed_files.insert(relative);
             continue;
         }
-        let Some(sites) = sites else {
+        // The sites of the references written through a Rust receiver whose
+        // type came or went (W4-RS-03) join the file's dependent sites.
+        let mut site_set: BTreeSet<ReferenceSite> = sites.cloned().unwrap_or_default();
+        if let Some(names) = receiver_names.get(&relative) {
+            site_set.extend(
+                refs.iter()
+                    .filter(|reference| {
+                        crate::rust_receivers::is_written_through(&reference.reference_name, names)
+                    })
+                    .map(|reference| ReferenceSite {
+                        from_node_id: reference.from_node_id.clone(),
+                        line: reference.line,
+                        col: reference.col,
+                    }),
+            );
+        }
+        if site_set.is_empty() {
             continue;
-        };
+        }
         let selected = refs
             .into_iter()
             .filter(|reference| {
-                sites
+                site_set
                     .iter()
                     .any(|site| reference_matches_site(reference, site))
             })
             .collect::<Vec<_>>();
-        let site_list = sites.iter().cloned().collect::<Vec<_>>();
+        let site_list = site_set.iter().cloned().collect::<Vec<_>>();
         store.replace_resolution_state_at_sites(&site_list, &selected)?;
-        refreshed_sites.extend(sites.iter().cloned());
+        refreshed_sites.extend(site_set);
     }
     Ok((refreshed_sites, refreshed_files))
 }
@@ -1302,6 +1349,12 @@ fn remove_tracked_file(
     }
     changed_names.note_removed(node_names_in_file(store, relative)?);
     let old_nodes = store.nodes_by_file_path(relative)?;
+    changed_names.rust_receiver_types.extend(
+        old_nodes
+            .iter()
+            .filter(|node| crate::rust_receivers::is_receiver_type(node))
+            .map(|node| node.name.clone()),
+    );
     changed_names.removed_files.insert(relative.to_string());
     if codegraph_resolve::module_surface::has_module_surface(relative, stored.language) {
         let change = changed_names
@@ -1911,6 +1964,10 @@ struct ChangedNames {
     /// What the changed files held that a Go call in other files reads:
     /// type declarations' embeddings and field types (W4-GO-01).
     go: crate::go_heads::GoChanges,
+    /// The Rust type, trait and alias names that came, went or changed: a
+    /// CamelCase path receiver of such a name is the project's or an outside
+    /// type by it (W4-RS-03).
+    rust_receiver_types: BTreeSet<String>,
 }
 
 /// What a changed Python file held before the change. A module global's
@@ -1955,6 +2012,7 @@ impl ChangedNames {
             crate::swift_heads::withdraw_marker(store)?;
             crate::objc_heads::withdraw_marker(store)?;
             crate::go_heads::withdraw_marker(store)?;
+            crate::rust_receivers::withdraw_marker(store)?;
             self.surface_dirty = true;
         }
         Ok(())
@@ -2011,6 +2069,12 @@ impl ChangedNames {
                 touched.insert(name);
                 self.any.insert(name.to_string());
                 self.candidates.insert(name.to_string());
+            }
+        }
+        for node in before.iter().chain(after) {
+            if crate::rust_receivers::is_receiver_type(node) && touched.contains(node.name.as_str())
+            {
+                self.rust_receiver_types.insert(node.name.clone());
             }
         }
         // A Rust variant path reaches an enum only while it declares the
@@ -3936,6 +4000,144 @@ pub(crate) mod tests {
             assert_eq!(edge_projection(&db), fresh_edges(name, &fresh));
             assert!(to_other(&db), "{:#?}", edge_projection(&db));
         }
+    }
+
+    const RS_MANIFEST: (&str, &str) = (
+        "Cargo.toml",
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+    );
+    const RS_LIB: (&str, &str) = (
+        "src/lib.rs",
+        "mod widget;\nmod alias;\nmod run;\nmod spare;\n",
+    );
+    const RS_WIDGET: (&str, &str) = (
+        "src/widget.rs",
+        "pub struct Widget;\n\nimpl Widget {\n    pub fn fresh() -> Self {\n        Widget\n    }\n}\n",
+    );
+    const RS_NO_ALIAS: (&str, &str) = ("src/alias.rs", "pub fn unrelated() {}\n");
+    const RS_ALIAS: (&str, &str) = (
+        "src/alias.rs",
+        "pub type WidgetRef = crate::widget::Widget;\n\npub fn unrelated() {}\n",
+    );
+    const RS_RUN: (&str, &str) = (
+        "src/run.rs",
+        "use crate::alias::WidgetRef;\n\npub fn run() {\n    let _w = WidgetRef::fresh();\n}\n",
+    );
+    const RS_SPARE: (&str, &str) = ("src/spare.rs", "pub fn spare() {}\n");
+    const RS_SPARE_EDITED: (&str, &str) = ("src/spare.rs", "pub fn spare() -> u8 {\n    1\n}\n");
+
+    fn rust_marker(db: &Path) -> Option<String> {
+        Store::open(db)
+            .unwrap()
+            .get_project_metadata(crate::rust_receivers::VERSION_KEY)
+            .unwrap()
+    }
+
+    /// W4-RS-03: a sync that fails after the receiver lane re-parked the
+    /// references written through a type that came leaves the marker away,
+    /// and the next sync — with nothing or something unrelated changed —
+    /// re-resolves every Rust file to what a fresh index holds.
+    #[test]
+    fn a_rust_sync_failing_after_its_mutations_leaves_the_next_one_to_reconcile() {
+        let to_fresh = |db: &Path| {
+            edge_projection(db)
+                .iter()
+                .any(|edge| edge.contains("run -[calls]-> src/widget.rs:Widget::fresh"))
+        };
+        for unrelated in [false, true] {
+            let dir = TestDir::new(if unrelated {
+                "rust-receivers-fail-unrelated"
+            } else {
+                "rust-receivers-fail"
+            });
+            let db = default_db_path(dir.path()).unwrap();
+            let initial = [
+                RS_MANIFEST,
+                RS_LIB,
+                RS_WIDGET,
+                RS_NO_ALIAS,
+                RS_RUN,
+                RS_SPARE,
+            ];
+            write_files(dir.path(), &initial);
+            sync_changed_paths(dir.path(), &db, initial.iter().map(|(path, _)| *path)).unwrap();
+            assert_eq!(
+                rust_marker(&db),
+                Some(crate::rust_receivers::VERSION.to_string())
+            );
+            assert!(!to_fresh(&db), "{:#?}", edge_projection(&db));
+
+            write_files(dir.path(), &[RS_ALIAS]);
+            FAIL_BEFORE_RESOLUTION.with(|fail| fail.set(true));
+            let failed = sync_changed_paths(dir.path(), &db, [RS_ALIAS.0]);
+            FAIL_BEFORE_RESOLUTION.with(|fail| fail.set(false));
+            assert!(failed.is_err(), "the injected failure must stop the sync");
+            assert_eq!(
+                rust_marker(&db),
+                None,
+                "a failed sync leaves the marker away"
+            );
+
+            let spare = if unrelated {
+                write_files(dir.path(), &[RS_SPARE_EDITED]);
+                sync_changed_paths(dir.path(), &db, [RS_SPARE.0]).unwrap();
+                RS_SPARE_EDITED
+            } else {
+                sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
+                RS_SPARE
+            };
+            assert_eq!(
+                rust_marker(&db),
+                Some(crate::rust_receivers::VERSION.to_string())
+            );
+            let fresh = [RS_MANIFEST, RS_LIB, RS_WIDGET, RS_ALIAS, RS_RUN, spare];
+            let name = if unrelated {
+                "rust-receivers-fresh-unrelated"
+            } else {
+                "rust-receivers-fresh"
+            };
+            assert_eq!(edge_projection(&db), fresh_edges(name, &fresh));
+            assert!(to_fresh(&db), "{:#?}", edge_projection(&db));
+        }
+    }
+
+    /// W4-RS-03: an index whose Rust marker alone is gone (the other markers
+    /// written back) has every Rust file re-resolved by its next sync, even
+    /// one with nothing changed.
+    #[test]
+    fn an_index_without_only_the_rust_marker_reresolves_with_nothing_changed() {
+        let version = Some(crate::rust_receivers::VERSION.to_string());
+        let dir = TestDir::new("rust-receivers-bootstrap");
+        let db = default_db_path(dir.path()).unwrap();
+        let initial = [RS_MANIFEST, RS_LIB, RS_WIDGET, RS_ALIAS, RS_RUN, RS_SPARE];
+        write_files(dir.path(), &initial);
+        sync_changed_paths(dir.path(), &db, initial.iter().map(|(path, _)| *path)).unwrap();
+        assert_eq!(rust_marker(&db), version);
+        let expected = edge_projection(&db);
+        {
+            let store = Store::open(&db).unwrap();
+            let dropped = store
+                .connection()
+                .execute(
+                    "DELETE FROM edges WHERE kind = 'calls' AND target = (SELECT id FROM nodes \
+                     WHERE qualified_name = 'Widget::fresh')",
+                    [],
+                )
+                .unwrap();
+            assert_eq!(dropped, 1, "the call edge an older sync lost");
+            store
+                .delete_project_metadata(crate::rust_receivers::VERSION_KEY)
+                .unwrap();
+        }
+        assert_ne!(edge_projection(&db), expected);
+        assert_eq!(
+            go_marker(&db),
+            Some(crate::go_heads::VERSION.to_string()),
+            "the other markers stay"
+        );
+        sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
+        assert_eq!(rust_marker(&db), version);
+        assert_eq!(edge_projection(&db), expected);
     }
 
     /// W4-GO-01: an index whose Go marker and rows alone are gone (the other

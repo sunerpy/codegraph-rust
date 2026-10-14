@@ -280,12 +280,14 @@ fn rust_glob_covers(uses: &RustUses, candidate: &Node, reference: &RefView) -> b
     candidate_dir == reference_dir || candidate_dir == dir(&reference_dir)
 }
 
-/// The path a Rust name is written through on its line, as `(root, seg)` —
-/// `("crate", "error")` for `crate::error::Result`, `("io", "io")` for
-/// `io::Result` — at the reference's column, or else the line's first
-/// `seg::name` when the line writes the name nowhere bare (upstream's two
-/// `pathed` patterns). `seg` is empty for a `::name` written from the root.
-fn written_path(line: &str, column: usize, name: &str) -> Option<(String, String)> {
+/// The path a Rust name is written through on its line, as `(root, seg,
+/// single)` — `("crate", "error", false)` for `crate::error::Result`,
+/// `("io", "io", true)` for `io::Result` — at the reference's column, or else
+/// the line's first `seg::name` when the line writes the name nowhere bare
+/// (upstream's two `pathed` patterns). `seg` is empty for a `::name` written
+/// from the root; `single` says the path names one segment (upstream's empty
+/// first group).
+fn written_path(line: &str, column: usize, name: &str) -> Option<(String, String, bool)> {
     let bytes = line.as_bytes();
     let at_column = line
         .get(column..)
@@ -311,14 +313,15 @@ fn written_path(line: &str, column: usize, name: &str) -> Option<(String, String
         return None;
     }
     occurrences.into_iter().find_map(|at| {
-        let (root, seg) = path_before(line, at);
-        (!seg.is_empty()).then_some((root, seg))
+        let (root, seg, single) = path_before(line, at);
+        (!seg.is_empty()).then_some((root, seg, single))
     })
 }
 
 /// The `root::…::seg::` path that ends right before `end` (after optional
-/// spaces): its first segment and its last one.
-fn path_before(line: &str, end: usize) -> (String, String) {
+/// spaces): its first segment, its last one, and whether it names one
+/// segment at most.
+fn path_before(line: &str, end: usize) -> (String, String, bool) {
     let bytes = line.as_bytes();
     let mut segments: Vec<&str> = Vec::new();
     let mut at = end;
@@ -358,7 +361,12 @@ fn path_before(line: &str, end: usize) -> (String, String) {
         .copied()
         .unwrap_or_default()
         .to_string();
-    (root, seg)
+    let single = segments
+        .iter()
+        .filter(|segment| !segment.is_empty())
+        .count()
+        <= 1;
+    (root, seg, single)
 }
 
 /// Whether the bare Rust name `reference` writes can mean `candidate`
@@ -424,7 +432,20 @@ pub(crate) fn is_rust_name_in_scope(
     } else {
         line.and_then(|line| written_path(line, column, name))
     };
-    if let Some((root, seg)) = pathed {
+    if let Some((root, seg, single)) = pathed {
+        // `Self::Error` in a signature is the enclosing impl's (or trait's)
+        // own associated type, and `V::Value` an associated type of a
+        // generic's bound — never a struct of that name: serde's 334
+        // `Self::Error`s went to `de::value::Error` (upstream #2231).
+        if reference.reference_kind == EdgeKind::References && single {
+            if seg == "Self" {
+                return candidate.kind == NodeKind::TypeAlias
+                    && is_in_enclosing_rust_impl(candidate, reference, &facts);
+            }
+            if is_rust_generic_param(&seg, reference, &facts) {
+                return false;
+            }
+        }
         if matches!(root.as_str(), "std" | "core" | "alloc")
             && candidate.file_path != reference.file_path
         {
@@ -502,6 +523,122 @@ pub(crate) fn is_rust_name_in_scope(
         return uses.bound.contains(name) || rust_glob_covers(&uses, candidate, reference);
     }
     uses.names.contains(name) || rust_glob_covers(&uses, candidate, reference)
+}
+
+/// The 1-based line of the `impl` / `trait` header at or above `reference`'s
+/// line, 0 for none (upstream `rustEnclosingImplLine`).
+fn rust_enclosing_impl_line(
+    reference: &RefView,
+    facts: &crate::source_facts::SourceFacts,
+) -> usize {
+    let last = usize::try_from(reference.line)
+        .unwrap_or(0)
+        .min(facts.line_count());
+    (0..last)
+        .rev()
+        .find(|&index| opens_impl_or_trait(facts.line(index)))
+        .map_or(0, |index| index + 1)
+}
+
+/// Whether `line` opens an `impl` or `trait` (upstream
+/// `/^\s*(?:pub(?:\([^)]*\))?\s+)?(?:unsafe\s+)?(?:impl|trait)\b/`).
+fn opens_impl_or_trait(line: &str) -> bool {
+    let mut rest = line.trim_start();
+    if let Some(after) = rest.strip_prefix("pub") {
+        let after = match after.strip_prefix('(') {
+            Some(inner) => match inner.find(')') {
+                Some(close) => &inner[close + 1..],
+                None => after,
+            },
+            None => after,
+        };
+        if after.starts_with(char::is_whitespace) {
+            rest = after.trim_start();
+        }
+    }
+    if let Some(after) = rest.strip_prefix("unsafe")
+        && after.starts_with(char::is_whitespace)
+    {
+        rest = after.trim_start();
+    }
+    ["impl", "trait"].iter().any(|keyword| {
+        rest.strip_prefix(keyword)
+            .is_some_and(|after| !after.as_bytes().first().is_some_and(|b| is_word_byte(*b)))
+    })
+}
+
+/// Whether `candidate` is declared in the `impl` / `trait` block around
+/// `reference`, above it (upstream `isInEnclosingRustImpl`).
+fn is_in_enclosing_rust_impl(
+    candidate: &Node,
+    reference: &RefView,
+    facts: &crate::source_facts::SourceFacts,
+) -> bool {
+    let header = i64::try_from(rust_enclosing_impl_line(reference, facts)).unwrap_or(0);
+    header > 0
+        && candidate.file_path == reference.file_path
+        && candidate.start_line >= header
+        && candidate.start_line <= reference.line
+}
+
+/// Whether `name` is a generic type parameter of the function or impl around
+/// `reference` (`fn f<V: Visitor>`, `impl<'de, E>`; upstream
+/// `isRustGenericParam`): written inside an angle-bracket list, one nested
+/// list allowed before it, and followed by `:`, `,`, `>` or `=`, between the
+/// enclosing impl's header (the file's start without one) and the
+/// reference's line.
+fn is_rust_generic_param(
+    name: &str,
+    reference: &RefView,
+    facts: &crate::source_facts::SourceFacts,
+) -> bool {
+    if !name.starts_with(|c: char| c.is_ascii_uppercase()) || !name.bytes().all(is_word_byte) {
+        return false;
+    }
+    let from = rust_enclosing_impl_line(reference, facts).saturating_sub(1);
+    let through = usize::try_from(reference.line).unwrap_or(0);
+    let lines = facts.lines();
+    let (Some(start), Some(source)) = (lines.raw_line_start(from), Some(facts.source())) else {
+        return false;
+    };
+    let end = lines
+        .raw_line_start(through)
+        .map_or(source.len(), |next| next.saturating_sub(1));
+    let text = source
+        .get(start..end.max(start))
+        .unwrap_or_default()
+        .as_bytes();
+    let name = name.as_bytes();
+    (0..text.len()).filter(|&at| text[at] == b'<').any(|open| {
+        // Walk the list `open` starts: depth 1 is the list itself, depth 2 one
+        // nested list; a deeper one, or the list's close before the name,
+        // ends the walk.
+        let mut depth = 1;
+        let mut at = open + 1;
+        while at < text.len() {
+            match text[at] {
+                b'<' if depth == 1 => depth = 2,
+                b'<' => return false,
+                b'>' if depth == 2 => depth = 1,
+                b'>' => return false,
+                _ if depth == 1
+                    && text[at..].starts_with(name)
+                    && (at == 0 || !is_word_byte(text[at - 1]))
+                    && !text.get(at + name.len()).is_some_and(|b| is_word_byte(*b)) =>
+                {
+                    let after = text[at + name.len()..]
+                        .iter()
+                        .find(|b| !b.is_ascii_whitespace());
+                    if after.is_some_and(|b| matches!(b, b':' | b',' | b'>' | b'=')) {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+            at += 1;
+        }
+        false
+    })
 }
 
 /// Whether `at` opens with `Self ::` (upstream `/^Self\s*::/`).
@@ -638,12 +775,12 @@ mod tests {
         let column = line.find("Result").unwrap();
         assert_eq!(
             written_path(line, column, "Result"),
-            Some(("crate".into(), "error".into()))
+            Some(("crate".into(), "error".into(), false))
         );
         let line = "pub fn poll_ready(cx: &mut Context<'_>) -> Poll<io::Result<()>> {";
         assert_eq!(
             written_path(line, 0, "Result"),
-            Some(("io".into(), "io".into()))
+            Some(("io".into(), "io".into(), true))
         );
         // Written bare somewhere on the line: no path.
         assert_eq!(
@@ -652,8 +789,45 @@ mod tests {
         );
         assert_eq!(
             written_path("let x = ::serde::Serialize;", 15, "Serialize"),
-            Some(("serde".into(), "serde".into()))
+            Some(("serde".into(), "serde".into(), true))
         );
+    }
+
+    #[test]
+    fn an_impl_or_trait_header_and_a_generic_parameter_are_read_around_a_reference() {
+        assert!(opens_impl_or_trait("impl<'de, E> Deserializer for X<E> {"));
+        assert!(opens_impl_or_trait("    pub(crate) unsafe trait Visit {"));
+        assert!(opens_impl_or_trait("unsafe impl Send for X {}"));
+        assert!(!opens_impl_or_trait("implement();"));
+        assert!(!opens_impl_or_trait("// impl Foo"));
+        let source = "pub struct X;\n\nimpl<E> Deserializer for X<E> {\n    type Error = E;\n\n    fn any<V: Visitor, W>(v: V) -> Result<V::Value, Self::Error> {\n        todo!()\n    }\n}\n";
+        let facts = crate::source_facts::SourceFacts::new(std::sync::Arc::from(source));
+        let reference = RefView {
+            row_id: None,
+            from_node_id: "function:any".into(),
+            reference_name: "Value".into(),
+            reference_kind: EdgeKind::References,
+            line: 6,
+            column: 40,
+            file_path: "src/x.rs".into(),
+            language: Language::Rust,
+            is_function_ref: false,
+            reference_subkind: None,
+        };
+        assert_eq!(rust_enclosing_impl_line(&reference, &facts), 3);
+        for parameter in ["E", "V", "W"] {
+            assert!(
+                is_rust_generic_param(parameter, &reference, &facts),
+                "{parameter}"
+            );
+        }
+        // Upstream's pattern reads any name in a list followed by `:`, `,`,
+        // `>` or `=`, a bound before a comma included (`V: Visitor, W`); a
+        // name outside every list is none.
+        assert!(is_rust_generic_param("Visitor", &reference, &facts));
+        for name in ["X", "Deserializer", "Unit"] {
+            assert!(!is_rust_generic_param(name, &reference, &facts), "{name}");
+        }
     }
 
     #[test]

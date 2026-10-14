@@ -1220,11 +1220,14 @@ fn names_external_type(receiver: &str, language: Language) -> bool {
             && receiver.as_bytes()[1].is_ascii_uppercase();
         return prefixed || receiver == "Exception";
     }
+    // Rust: `Vec::new()`, `String::from(…)`, `Default::default()` — but
+    // `Self::` is the impl's own type, and a SCREAMING_CASE receiver
+    // (`REQ_ID.scope(…)`) a static (upstream #2177).
+    if language == Language::Rust {
+        return receiver != "Self" && receiver.bytes().any(|byte| byte.is_ascii_lowercase());
+    }
     // CUDA and Metal sources are extracted as C++.
-    !matches!(
-        language,
-        Language::Go | Language::C | Language::Cpp | Language::Rust
-    )
+    !matches!(language, Language::Go | Language::C | Language::Cpp)
 }
 
 /// A class, struct, union or interface, or a Scala `object` (upstream
@@ -1813,7 +1816,7 @@ fn rust_method_call_follows(text: &str, name: &str) -> bool {
 /// reached through call chains. A unique project method that shares one of
 /// these names is no evidence of the receiver's type: `root().join(name)` is
 /// `Path::join`. Sorted for binary search; changing it is a resolution change.
-const RUST_STD_METHODS: [&str; 307] = [
+const RUST_STD_METHODS: [&str; 309] = [
     "abs",
     "all",
     "ancestors",
@@ -1890,6 +1893,7 @@ const RUST_STD_METHODS: [&str; 307] = [
     "extend",
     "extend_from_slice",
     "extension",
+    "failure",
     "fetch_add",
     "fetch_sub",
     "file_name",
@@ -2068,6 +2072,7 @@ const RUST_STD_METHODS: [&str; 307] = [
     "step_by",
     "strip_prefix",
     "strip_suffix",
+    "success",
     "sum",
     "swap",
     "take",
@@ -2122,6 +2127,18 @@ const RUST_STD_METHODS: [&str; 307] = [
     "xor",
     "zip",
 ];
+
+/// Whether `receiver` is a Rust module path, every segment lowercase
+/// (upstream `/^[a-z_][\w]*(?:::[a-z_]\w*)*$/`): `task`, `io`, `std::io`.
+fn is_rust_module_path(receiver: &str) -> bool {
+    receiver.split("::").all(|segment| {
+        let mut bytes = segment.bytes();
+        bytes
+            .next()
+            .is_some_and(|first| first.is_ascii_lowercase() || first == b'_')
+            && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    })
+}
 
 fn is_rust_std_method(name: &str) -> bool {
     RUST_STD_METHODS.binary_search(&name).is_ok()
@@ -5456,10 +5473,13 @@ pub fn match_method_call(
             0,
         );
     }
-    // In C# and Java a capitalized receiver is a type: a project property of
-    // that name elsewhere (a test object's `DateTime`) does not make
-    // `DateTime.Parse(…)` the project's (upstream #2171).
-    let types_only = matches!(reference.language, Language::CSharp | Language::Java);
+    // In C#, Java and Rust a capitalized receiver is a type: a project
+    // property of that name elsewhere (a test object's `DateTime`) does not
+    // make `DateTime.Parse(…)` the project's (upstream #2171, #2177).
+    let types_only = matches!(
+        reference.language,
+        Language::CSharp | Language::Java | Language::Rust
+    );
     if names_external_type(&object_or_class, reference.language)
         && !context
             .get_nodes_by_name_shared(&object_or_class)
@@ -5470,9 +5490,22 @@ pub fn match_method_call(
                         || crate::kotlin_scope::is_method_owner_kind(n)
                         || matches!(
                             n.kind,
-                            NodeKind::Enum | NodeKind::Namespace | NodeKind::Module
+                            NodeKind::Enum
+                                | NodeKind::Namespace
+                                | NodeKind::Module
+                                | NodeKind::Trait
+                                | NodeKind::TypeAlias
                         ))
             })
+    {
+        return None;
+    }
+    // Rust `task::spawn(…)` / `io::stdout()`: a function through a module
+    // path — never a method some type of that name owns (upstream #2177).
+    if reference.language == Language::Rust
+        && match_dot_call(&reference.reference_name).is_none()
+        && match_colon_call(&reference.reference_name).is_some()
+        && is_rust_module_path(&object_or_class)
     {
         return None;
     }
@@ -14527,6 +14560,22 @@ mod tests {
             4,
         );
         assert_eq!(gate(source, &other).as_deref(), Some("function:helper"));
+    }
+
+    #[test]
+    fn a_rust_outside_type_or_module_path_receiver_is_read_by_its_case() {
+        // Upstream #2177: a CamelCase receiver is a type, `Self` the impl's
+        // own and a SCREAMING_CASE one a static; a lowercase path a module.
+        assert!(names_external_type("Vec", Language::Rust));
+        assert!(names_external_type("String", Language::Rust));
+        assert!(!names_external_type("Self", Language::Rust));
+        assert!(!names_external_type("REQ_ID", Language::Rust));
+        assert!(!names_external_type("task", Language::Rust));
+        assert!(is_rust_module_path("task"));
+        assert!(is_rust_module_path("std::io"));
+        assert!(is_rust_module_path("_private::fooBar"));
+        assert!(!is_rust_module_path("io::Stdout"));
+        assert!(!is_rust_module_path("Vec"));
     }
 
     #[test]

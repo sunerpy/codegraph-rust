@@ -435,7 +435,11 @@ one down the whole-file lane however many there are, since a receiver's
 embeddings, an alias's target and a field chain's field type are read from the
 declarations' text; the `go_heads_version` marker is withdrawn and restored with the others;
 a Rust enum variant that came, went or changed touches its enum's name, since a variant path
-reaches an enum only while it declares the variant; a bare Rust name's scope reads its own file's `use` items, which re-resolve with it, and the
+reaches an enum only while it declares the variant; a Rust type, trait or alias name that came, went or changed re-resolves, in every unchanged
+Rust file whose text writes it as a path receiver (`Name::`, `Name.`), the references written
+through it, since a CamelCase path receiver is an outside type unless the project declares a
+type of its name, and the `rust_receivers_version` marker is withdrawn and restored with the
+others; a bare Rust name's scope reads its own file's `use` items, which re-resolve with it, and the
 `Cargo.toml` files at or above it, which are no source files (a `Cargo.toml` change itself is not
 yet detected);
 an import names a file, a folder or a namespace rather than a symbol, so the parked

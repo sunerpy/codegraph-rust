@@ -919,6 +919,10 @@ matrix! {
     rust_glob_variant_leaves_when_its_enum_is_renamed,
     rust_variant_path_reaches_the_enum_once_it_declares_the_variant,
     rust_variant_path_leaves_the_enum_when_the_variant_is_renamed,
+    rust_outside_type_receiver_reaches_a_type_the_project_gains,
+    rust_outside_type_receiver_leaves_when_the_project_type_is_renamed,
+    rust_alias_receiver_reaches_a_method_once_the_alias_appears,
+    rust_alias_receiver_leaves_the_method_when_the_alias_goes,
     #[ignore = "W5-06: a Cargo.toml change does not re-resolve the project's Rust files"]
     rust_cargo_dependency_appears,
     dart_delete_an_imported_library,

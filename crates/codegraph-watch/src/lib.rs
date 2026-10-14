@@ -14,6 +14,7 @@ pub mod module_surfaces;
 pub mod objc_heads;
 mod policy;
 pub mod ruby_heads;
+pub mod rust_receivers;
 pub mod scala_surfaces;
 pub mod swift_heads;
 mod sync;
