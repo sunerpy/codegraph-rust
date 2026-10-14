@@ -917,6 +917,8 @@ matrix! {
     rust_out_of_scope_namesake_appears,
     rust_prelude_name_ignores_a_project_namesake_that_appears,
     rust_glob_variant_leaves_when_its_enum_is_renamed,
+    rust_variant_path_reaches_the_enum_once_it_declares_the_variant,
+    rust_variant_path_leaves_the_enum_when_the_variant_is_renamed,
     #[ignore = "W5-06: a Cargo.toml change does not re-resolve the project's Rust files"]
     rust_cargo_dependency_appears,
     dart_delete_an_imported_library,

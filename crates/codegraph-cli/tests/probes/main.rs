@@ -13042,4 +13042,444 @@ mod rust {
             "{report}"
         );
     }
+
+    /// A Rust project of `files` under `src/`, with upstream's #2354 manifest.
+    fn rust_project(files: &[(&str, &str)]) -> super::support::Indexed {
+        let mut project = Project::new().file(
+            "Cargo.toml",
+            "[package]\nname = \"repro\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        );
+        for (file, text) in files {
+            project = project.file(&format!("src/{file}"), text);
+        }
+        project.index()
+    }
+
+    /// The node of `kind` named `name` declared in `src/<file>`.
+    fn declared<'g>(
+        graph: &'g Graph,
+        kind: &str,
+        file: &str,
+        name: &str,
+    ) -> &'g super::support::NodeRow {
+        let path = format!("src/{file}");
+        graph
+            .nodes
+            .iter()
+            .find(|n| n.kind == kind && n.file_path == path && n.name == name)
+            .unwrap_or_else(|| panic!("{kind} {name} in {path}\n{}", graph.report()))
+    }
+
+    /// `file:name` of every symbol with a `references` edge to `id`, `src/`
+    /// left out (upstream's `referencers`).
+    fn referencers(graph: &Graph, id: &str) -> Vec<String> {
+        let names: std::collections::BTreeSet<String> = graph
+            .edges
+            .iter()
+            .filter(|e| e.kind == "references" && e.target == id)
+            .filter_map(|e| graph.node(&e.source))
+            .map(|n| {
+                let file = n.file_path.strip_prefix("src/").unwrap_or(&n.file_path);
+                format!("{file}:{}", n.name)
+            })
+            .collect();
+        names.into_iter().collect()
+    }
+
+    /// `kind:qualifiedName` of every edge but `contains` out of the function
+    /// named `name`.
+    fn outgoing(graph: &Graph, name: &str) -> Vec<String> {
+        let from = graph
+            .nodes
+            .iter()
+            .find(|n| n.kind == "function" && n.name == name)
+            .unwrap_or_else(|| panic!("function {name}\n{}", graph.report()));
+        let mut out: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|e| e.kind != "contains" && e.source == from.id)
+            .filter_map(|e| {
+                graph
+                    .node(&e.target)
+                    .map(|n| format!("{}:{}", e.kind, n.qualified_name))
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    const MODE: &str = "pub enum Mode {\n    A,\n    B,\n    C(u8),\n    D { x: u8 },\n}\n\npub fn takes(_m: Mode) {}\n\npub fn current() -> Mode { Mode::B }\n";
+
+    /// Upstream #2354 (#2328): a variant path in an expression and in match
+    /// arms, written through the module, references the enum.
+    #[test]
+    fn pr2354_a_variant_path_through_its_module_references_the_enum() {
+        let project = rust_project(&[
+            ("mode.rs", MODE),
+            (
+                "variant_use.rs",
+                "use crate::mode;\n\npub fn code(flag: bool) -> u8 {\n    let m = if flag { mode::Mode::A } else { mode::Mode::B };\n    match m {\n        mode::Mode::A => 1,\n        mode::Mode::B => 2,\n        _ => 3,\n    }\n}\n",
+            ),
+            (
+                "main.rs",
+                "mod mode;\nmod variant_use;\n\nfn main() {\n    mode::takes(mode::Mode::A);\n    let _ = variant_use::code(true);\n}\n",
+            ),
+        ]);
+        let graph = project.graph();
+        let mode = declared(graph, "enum", "mode.rs", "Mode");
+        assert_eq!(
+            referencers(graph, &mode.id),
+            [
+                "main.rs:main",
+                "mode.rs:current",
+                "mode.rs:takes",
+                "variant_use.rs:code"
+            ],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream #2354: a bare `Mode::A` after `use crate::mode::Mode;`, at the
+    /// receiver's column.
+    #[test]
+    fn pr2354_a_bare_variant_path_after_a_use_of_its_enum() {
+        let project = rust_project(&[
+            ("lib.rs", "pub mod mode;\npub mod bare;\n"),
+            ("mode.rs", MODE),
+            (
+                "bare.rs",
+                "use crate::mode::{self, Mode};\n\npub fn pick() -> u8 {\n    let _m = Mode::B;\n    0\n}\n\npub fn score() -> u8 {\n    match mode::current() {\n        Mode::A => 1,\n        _ => 0,\n    }\n}\n",
+            ),
+        ]);
+        let graph = project.graph();
+        let mode = declared(graph, "enum", "mode.rs", "Mode");
+        assert_eq!(
+            referencers(graph, &mode.id),
+            [
+                "bare.rs:pick",
+                "bare.rs:score",
+                "mode.rs:current",
+                "mode.rs:takes"
+            ],
+            "{}",
+            graph.report()
+        );
+        let pick = declared(graph, "function", "bare.rs", "pick");
+        let at: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|e| e.kind == "references" && e.source == pick.id)
+            .map(|e| format!("{}:{}", e.line.unwrap_or(0), e.col.unwrap_or(0)))
+            .collect();
+        assert_eq!(at, ["4:13"], "{}", graph.report());
+    }
+
+    /// Upstream #2354: tuple and struct variant patterns, and a variant read
+    /// as a value.
+    #[test]
+    fn pr2354_tuple_and_struct_variant_patterns_and_a_variant_value() {
+        let project = rust_project(&[
+            ("lib.rs", "pub mod mode;\npub mod pat;\n"),
+            ("mode.rs", MODE),
+            (
+                "pat.rs",
+                "use crate::mode::{self, Mode};\n\npub fn tuple() -> u8 {\n    match mode::current() {\n        Mode::C(x) => x,\n        _ => 0,\n    }\n}\n\npub fn structure() -> u8 {\n    if let crate::mode::Mode::D { x } = mode::current() { x } else { 0 }\n}\n\npub fn ctor_value(xs: Vec<u8>) -> usize {\n    xs.into_iter().map(Mode::C).count()\n}\n",
+            ),
+        ]);
+        let graph = project.graph();
+        let mode = declared(graph, "enum", "mode.rs", "Mode");
+        assert_eq!(
+            referencers(graph, &mode.id),
+            [
+                "mode.rs:current",
+                "mode.rs:takes",
+                "pat.rs:ctor_value",
+                "pat.rs:structure",
+                "pat.rs:tuple"
+            ],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream #2354: constructing a tuple or struct variant stays linked to
+    /// the variant itself.
+    #[test]
+    fn pr2354_constructing_a_variant_stays_linked_to_the_variant() {
+        let project = rust_project(&[
+            ("lib.rs", "pub mod mode;\npub mod build;\n"),
+            ("mode.rs", MODE),
+            (
+                "build.rs",
+                "use crate::mode::Mode;\n\npub fn build() {\n    let _c = Mode::C(3);\n    let _d = Mode::D { x: 2 };\n}\n",
+            ),
+        ]);
+        let graph = project.graph();
+        assert_eq!(
+            outgoing(graph, "build"),
+            ["calls:Mode::C", "instantiates:Mode::D"],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream #2354: `Self::A` inside `impl Mode`, in the enum's file and in
+    /// another one.
+    #[test]
+    fn pr2354_self_variant_in_the_enums_impl() {
+        let mode_impl = format!(
+            "{MODE}\nimpl Mode {{\n    pub fn flip(&self) -> u8 {{\n        match self {{\n            Self::A => 1,\n            _ => 0,\n        }}\n    }}\n}}\n"
+        );
+        let project = rust_project(&[
+            ("lib.rs", "pub mod mode;\npub mod ops;\n"),
+            ("mode.rs", &mode_impl),
+            (
+                "ops.rs",
+                "use crate::mode::Mode;\n\nimpl Mode {\n    pub fn is_b(&self) -> bool {\n        if let Self::B = self { true } else { false }\n    }\n}\n",
+            ),
+        ]);
+        let graph = project.graph();
+        let mode = declared(graph, "enum", "mode.rs", "Mode");
+        assert_eq!(
+            referencers(graph, &mode.id),
+            [
+                "mode.rs:current",
+                "mode.rs:flip",
+                "mode.rs:takes",
+                "ops.rs:is_b"
+            ],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream #2354: `Self::A` names the impl's type, never through a path
+    /// written elsewhere on its line (`other::Mode::Z`, whose enum declares no
+    /// `A`).
+    #[test]
+    fn pr2354_a_self_variant_ignores_another_path_on_its_line() {
+        let project = rust_project(&[
+            ("lib.rs", "pub mod mode;\npub mod other;\npub mod ops;\n"),
+            ("mode.rs", MODE),
+            ("other.rs", "pub enum Mode {\n    Y,\n    Z,\n}\n"),
+            (
+                "ops.rs",
+                "use crate::mode::Mode;\nuse crate::other;\n\nimpl Mode {\n    pub fn to_other(&self) -> u8 {\n        match self {\n            Self::A => other::Mode::Z as u8,\n            _ => 0,\n        }\n    }\n}\n",
+            ),
+        ]);
+        let graph = project.graph();
+        let mode = declared(graph, "enum", "mode.rs", "Mode");
+        assert_eq!(
+            referencers(graph, &mode.id),
+            ["mode.rs:current", "mode.rs:takes", "ops.rs:to_other"],
+            "{}",
+            graph.report()
+        );
+        let other = declared(graph, "enum", "other.rs", "Mode");
+        assert_eq!(
+            referencers(graph, &other.id),
+            ["ops.rs:to_other"],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream #2354: a variant imported by name and used bare has no path to
+    /// read the enum from, and never lands on another module's namesake.
+    #[test]
+    fn pr2354_a_variant_imported_by_name_has_no_path_to_read() {
+        let project = rust_project(&[
+            ("lib.rs", "pub mod mode;\npub mod other;\npub mod glob;\n"),
+            ("mode.rs", MODE),
+            ("other.rs", "pub enum Mode {\n    A,\n    Z,\n}\n"),
+            (
+                "glob.rs",
+                "use crate::mode::Mode::*;\n\npub fn bare(m: u8) -> u8 {\n    match m {\n        0 => { let _ = A; 1 }\n        _ => 0,\n    }\n}\n",
+            ),
+        ]);
+        let graph = project.graph();
+        let mode = declared(graph, "enum", "mode.rs", "Mode");
+        assert_eq!(
+            referencers(graph, &mode.id),
+            ["mode.rs:current", "mode.rs:takes"],
+            "{}",
+            graph.report()
+        );
+        let other = declared(graph, "enum", "other.rs", "Mode");
+        assert!(
+            referencers(graph, &other.id).is_empty(),
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream #2354: the path picks the type that declares the variant,
+    /// never a same-named type without it; another crate's enum is its own.
+    #[test]
+    fn pr2354_the_path_picks_the_type_declaring_the_variant() {
+        let project = rust_project(&[
+            (
+                "lib.rs",
+                "pub mod matching;\npub mod other;\npub mod user;\n",
+            ),
+            (
+                "matching.rs",
+                "pub enum Match {\n    None,\n    Ignore,\n}\n",
+            ),
+            ("other.rs", "pub struct Match;\n"),
+            (
+                "user.rs",
+                "use crate::matching::Match;\n\npub enum ColorChoice {\n    Auto,\n    Ansi,\n}\n\npub fn first() -> u8 {\n    let _m = Match::None;\n    0\n}\n\npub fn color() -> u8 {\n    let _c = termcolor::ColorChoice::AlwaysAnsi;\n    0\n}\n",
+            ),
+        ]);
+        let graph = project.graph();
+        let matching = declared(graph, "enum", "matching.rs", "Match");
+        assert_eq!(
+            referencers(graph, &matching.id),
+            ["user.rs:first"],
+            "{}",
+            graph.report()
+        );
+        let other = declared(graph, "struct", "other.rs", "Match");
+        assert!(
+            referencers(graph, &other.id).is_empty(),
+            "{}",
+            graph.report()
+        );
+        let color = declared(graph, "enum", "user.rs", "ColorChoice");
+        assert!(
+            referencers(graph, &color.id).is_empty(),
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream #2354: an associated const or function read through a type is
+    /// not a variant path.
+    #[test]
+    fn pr2354_an_associated_const_or_function_is_no_variant_path() {
+        let mode_impl = format!(
+            "{MODE}\nimpl Mode {{\n    pub const ALL: [u8; 2] = [0, 1];\n    pub fn count() -> usize {{ Self::ALL.len() }}\n}}\n"
+        );
+        let project = rust_project(&[
+            ("lib.rs", "pub mod mode;\npub mod limits;\npub mod user;\n"),
+            ("mode.rs", &mode_impl),
+            (
+                "limits.rs",
+                "pub struct Limits;\n\nimpl Limits {\n    pub const MAX: u8 = 3;\n    pub fn new() -> Self { Limits }\n}\n",
+            ),
+            (
+                "user.rs",
+                "use crate::limits::Limits;\nuse crate::mode::Mode;\n\npub fn cap() -> u8 {\n    Limits::MAX\n}\n\npub fn all() -> usize {\n    Mode::ALL.len()\n}\n\npub fn make() {\n    let _l = Limits::new();\n    let _f = Limits::new;\n}\n",
+            ),
+        ]);
+        let graph = project.graph();
+        let mode = declared(graph, "enum", "mode.rs", "Mode");
+        assert_eq!(
+            referencers(graph, &mode.id),
+            ["mode.rs:current", "mode.rs:takes"],
+            "{}",
+            graph.report()
+        );
+        let limits = declared(graph, "struct", "limits.rs", "Limits");
+        assert!(
+            referencers(graph, &limits.id).is_empty(),
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            outgoing(graph, "make"),
+            ["calls:Limits::new"],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream #2354: std and prelude enums never reach a same-named project
+    /// enum, nor their variants a project variant.
+    #[test]
+    fn pr2354_std_and_prelude_enums_never_reach_a_project_enum() {
+        let project = rust_project(&[
+            ("lib.rs", "pub mod shapes;\npub mod user;\n"),
+            (
+                "shapes.rs",
+                "pub enum Ordering {\n    Less,\n    Greater,\n}\n\npub enum Option {\n    Some,\n    None,\n}\n",
+            ),
+            (
+                "user.rs",
+                "use std::cmp::{self, Ordering};\n\npub fn sorted(a: u8, b: u8) -> bool {\n    a.cmp(&b) == Ordering::Less || b.cmp(&a) == cmp::Ordering::Greater || a.cmp(&b) != std::cmp::Ordering::Less\n}\n\npub fn first(o: Option<u8>) -> u8 {\n    match o {\n        Option::Some(x) => x,\n        Option::None => 0,\n    }\n}\n\npub fn bare(o: Option<u8>, r: Result<u8, ()>) -> u8 {\n    match (o, r) {\n        (Some(x), Ok(_)) => x,\n        (None, Err(())) => 0,\n        _ => 1,\n    }\n}\n",
+            ),
+        ]);
+        let graph = project.graph();
+        for name in ["Ordering", "Option"] {
+            let shape = declared(graph, "enum", "shapes.rs", name);
+            assert!(
+                referencers(graph, &shape.id).is_empty(),
+                "{name}\n{}",
+                graph.report()
+            );
+        }
+        for variant in graph.nodes.iter().filter(|n| n.kind == "enum_member") {
+            assert!(
+                !graph
+                    .edges
+                    .iter()
+                    .any(|e| e.target == variant.id && e.kind != "contains"),
+                "{}\n{}",
+                variant.qualified_name,
+                graph.report()
+            );
+        }
+    }
+
+    /// Upstream #2354: a module path, an associated function and a same-named
+    /// enum elsewhere are not references to the enum.
+    #[test]
+    fn pr2354_a_module_path_or_associated_function_is_no_enum_reference() {
+        let mode_impl =
+            format!("{MODE}\nimpl Mode {{\n    pub fn new() -> Mode {{ Mode::A }}\n}}\n");
+        let project = rust_project(&[
+            (
+                "lib.rs",
+                "pub mod mode;\npub mod other;\npub mod util;\npub mod paths;\n",
+            ),
+            ("mode.rs", &mode_impl),
+            ("other.rs", "pub enum Mode {\n    A,\n    Z,\n}\n"),
+            ("util.rs", "pub fn take(x: u8) -> u8 { x }\n"),
+            (
+                "paths.rs",
+                "use crate::mode;\nuse crate::other;\nuse crate::util;\n\npub fn via_module() -> u8 {\n    util::take(3)\n}\n\npub fn via_ctor() {\n    let _m = mode::Mode::new();\n}\n\npub fn via_other() -> u8 {\n    match other::Mode::A {\n        other::Mode::Z => 1,\n        _ => 0,\n    }\n}\n\npub fn via_mode() {\n    let _m = mode::Mode::A;\n}\n",
+            ),
+        ]);
+        let graph = project.graph();
+        let via_module = declared(graph, "function", "paths.rs", "via_module");
+        assert!(
+            !graph
+                .edges
+                .iter()
+                .any(|e| e.kind == "references" && e.source == via_module.id),
+            "{}",
+            graph.report()
+        );
+        let other = declared(graph, "enum", "other.rs", "Mode");
+        assert_eq!(
+            referencers(graph, &other.id),
+            ["paths.rs:via_other"],
+            "{}",
+            graph.report()
+        );
+        let mode = declared(graph, "enum", "mode.rs", "Mode");
+        assert_eq!(
+            referencers(graph, &mode.id),
+            [
+                "mode.rs:current",
+                "mode.rs:new",
+                "mode.rs:takes",
+                "paths.rs:via_mode"
+            ],
+            "{}",
+            graph.report()
+        );
+    }
 }

@@ -394,7 +394,37 @@ pub(crate) fn is_rust_name_in_scope(
     let column = usize::try_from(reference.column.max(0)).unwrap_or(0);
     let crates = context.get_rust_crates();
     let uses = facts.rust_uses(&crates);
-    if let Some((root, seg)) = line.and_then(|line| written_path(line, column, name)) {
+    // A variant path — `Mode::A`, `mode::Mode::B`, a `Mode::C(x)` pattern, or
+    // `Self::A` in an impl, where the reference names the impl's type — reads
+    // the enum that declares that variant, and nothing else (upstream #2354):
+    // ripgrep's `Match::None` is `ignore`'s enum, not the matcher's `struct
+    // Match`. An associated const or function read the same way
+    // (`Limits::MAX`, `Mode::ALL`) is no variant, so it references no type.
+    let at = line.and_then(|line| line.get(column..)).unwrap_or_default();
+    let type_read =
+        reference.reference_kind == EdgeKind::References && name.bytes().all(is_word_byte);
+    let via_self = type_read && name != "Self" && self_path_at(at);
+    let names_variant = via_self
+        || (at.starts_with(name)
+            && !at
+                .as_bytes()
+                .get(name.len())
+                .is_some_and(|byte| is_word_byte(*byte)));
+    if type_read
+        && names_variant
+        && let Some(variant) = variant_after(at)
+        && !declares_rust_variant(candidate, variant, context)
+    {
+        return false;
+    }
+    // `Self::A` names the impl's type, not whatever path the line writes
+    // elsewhere.
+    let pathed = if via_self {
+        None
+    } else {
+        line.and_then(|line| written_path(line, column, name))
+    };
+    if let Some((root, seg)) = pathed {
         if matches!(root.as_str(), "std" | "core" | "alloc")
             && candidate.file_path != reference.file_path
         {
@@ -472,6 +502,41 @@ pub(crate) fn is_rust_name_in_scope(
         return uses.bound.contains(name) || rust_glob_covers(&uses, candidate, reference);
     }
     uses.names.contains(name) || rust_glob_covers(&uses, candidate, reference)
+}
+
+/// Whether `at` opens with `Self ::` (upstream `/^Self\s*::/`).
+fn self_path_at(at: &str) -> bool {
+    at.strip_prefix("Self")
+        .is_some_and(|rest| rest.trim_start().starts_with("::"))
+}
+
+/// The capitalized member after the word `at` opens with and a `::`
+/// (upstream `/^\w+\s*::\s*([A-Z]\w*)/`): `A` of `Mode::A(x)`.
+fn variant_after(at: &str) -> Option<&str> {
+    let bytes = at.as_bytes();
+    let word = bytes.iter().take_while(|byte| is_word_byte(**byte)).count();
+    if word == 0 {
+        return None;
+    }
+    let rest = at[word..].trim_start().strip_prefix("::")?.trim_start();
+    if !rest.starts_with(|c: char| c.is_ascii_uppercase()) {
+        return None;
+    }
+    let end = rest.bytes().take_while(|byte| is_word_byte(*byte)).count();
+    Some(&rest[..end])
+}
+
+/// Whether `candidate` is a Rust enum that declares `variant` (upstream
+/// `declaresRustVariant`, #2354).
+fn declares_rust_variant(candidate: &Node, variant: &str, context: &dyn ResolutionContext) -> bool {
+    if candidate.kind != NodeKind::Enum {
+        return false;
+    }
+    let qualified = format!("{}::{variant}", candidate.qualified_name);
+    context
+        .get_nodes_in_file_shared(&candidate.file_path)
+        .iter()
+        .any(|node| node.kind == NodeKind::EnumMember && node.qualified_name == qualified)
 }
 
 /// A bare Rust name reaches only what is in scope, whichever strategy chose
@@ -589,6 +654,18 @@ mod tests {
             written_path("let x = ::serde::Serialize;", 15, "Serialize"),
             Some(("serde".into(), "serde".into()))
         );
+    }
+
+    #[test]
+    fn a_variant_path_names_its_member() {
+        assert_eq!(variant_after("Mode::A => 1,"), Some("A"));
+        assert_eq!(variant_after("Mode :: C(x) =>"), Some("C"));
+        assert_eq!(variant_after("Self::Ready"), Some("Ready"));
+        assert_eq!(variant_after("Mode::new()"), None);
+        assert_eq!(variant_after("Mode) {}"), None);
+        assert_eq!(variant_after("::A"), None);
+        assert!(self_path_at("Self ::A"));
+        assert!(!self_path_at("SelfType::A"));
     }
 
     #[test]

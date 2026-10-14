@@ -2003,12 +2003,28 @@ impl ChangedNames {
                 .1
                 .push(candidate_key(node));
         }
+        let mut touched: HashSet<&str> = HashSet::new();
         for (name, (mut old, mut new)) in keys {
             old.sort_unstable();
             new.sort_unstable();
             if old != new {
+                touched.insert(name);
                 self.any.insert(name.to_string());
                 self.candidates.insert(name.to_string());
+            }
+        }
+        // A Rust variant path reaches an enum only while it declares the
+        // variant (upstream #2354), which no enum node records: a variant that
+        // came, went or changed touches its enum's name.
+        for node in before.iter().chain(after) {
+            if node.language == Language::Rust
+                && node.kind == NodeKind::EnumMember
+                && touched.contains(node.name.as_str())
+                && let Some((owner, _)) = node.qualified_name.rsplit_once("::")
+            {
+                let owner = owner.rsplit("::").next().unwrap_or(owner).to_string();
+                self.any.insert(owner.clone());
+                self.candidates.insert(owner);
             }
         }
     }

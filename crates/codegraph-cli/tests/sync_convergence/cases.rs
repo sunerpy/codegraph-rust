@@ -5260,6 +5260,52 @@ pub fn rust_glob_variant_leaves_when_its_enum_is_renamed() -> Case {
         .no_edge_after("function pick", "calls", "enum_member Kind::Some")
 }
 
+/// Upstream #2354 (W4-RS-02): a variant path references the enum only once
+/// the enum, in another file, declares that variant.
+pub fn rust_variant_path_reaches_the_enum_once_it_declares_the_variant() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Rust])
+        .file(
+            "Cargo.toml",
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+        )
+        .file("src/lib.rs", "mod mode;\nmod pick;\n")
+        .file("src/mode.rs", "pub enum Mode {\n    A,\n    B,\n}\n")
+        .file(
+            "src/pick.rs",
+            "use crate::mode::Mode;\n\npub fn pick() {\n    let _ = Mode::C;\n}\n",
+        )
+        .write(
+            "src/mode.rs",
+            "pub enum Mode {\n    A,\n    B,\n    C,\n}\n",
+        )
+        .edge_after("function pick", "references", "enum Mode")
+}
+
+/// Upstream #2354 (W4-RS-02): a variant path leaves the enum when the enum,
+/// in another file, renames that variant.
+pub fn rust_variant_path_leaves_the_enum_when_the_variant_is_renamed() -> Case {
+    Case::new(Change::RenameSymbol, &[Language::Rust])
+        .file(
+            "Cargo.toml",
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+        )
+        .file("src/lib.rs", "mod mode;\nmod pick;\n")
+        .file(
+            "src/mode.rs",
+            "pub enum Mode {\n    A,\n    B,\n    C,\n}\n",
+        )
+        .file(
+            "src/pick.rs",
+            "use crate::mode::Mode;\n\npub fn pick() {\n    let _ = Mode::C;\n}\n",
+        )
+        .write(
+            "src/mode.rs",
+            "pub enum Mode {\n    A,\n    B,\n    D,\n}\n",
+        )
+        .edge_before("function pick", "references", "enum Mode")
+        .no_edge_after("function pick", "references", "enum Mode")
+}
+
 /// Upstream #2214 (W4-RS-01): a crate the manifest comes to depend on is
 /// outside the project, so a name the file imports from it is no project
 /// item. `Cargo.toml` is not a source file; W5-06 makes its change
