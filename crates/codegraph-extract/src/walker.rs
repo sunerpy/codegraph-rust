@@ -1571,7 +1571,10 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             .ok()?;
         let tree = parser.parse(self.source, None)?;
         let root = tree.root_node();
+        // A snippet nested past the limit fails its whole file, as a deep
+        // tag tree does: no partial graph without the snippet.
         if ast_exceeds_safe_depth(root, self.spec.language()) {
+            self.walk_aborted = true;
             return None;
         }
         let mut walker = TreeSitterWalker::new(self.file_path, self.source, self.spec, root);
