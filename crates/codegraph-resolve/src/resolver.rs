@@ -1990,6 +1990,26 @@ impl ReferenceResolver {
         context: &dyn ResolutionContext,
     ) -> Option<ResolvedRef> {
         let result = result?;
+        // A Go call made through an expression — `h.Validate().Error()`, a
+        // `.Metrics()` chained onto the line above — calls a method of
+        // whatever the expression is. A type is called only bare (`T(x)`,
+        // `(*T)(x)`) or through its package; as a struct here it read as an
+        // instantiation (upstream #2408).
+        if reference.language == Language::Go
+            && reference.reference_kind == EdgeKind::Calls
+            && !reference.reference_name.contains('.')
+            && context
+                .get_node_by_id_shared(&result.target_node_id)
+                .is_some_and(|target| {
+                    matches!(
+                        target.kind,
+                        NodeKind::Struct | NodeKind::Interface | NodeKind::TypeAlias
+                    )
+                })
+            && !crate::name_matcher::is_go_bare_name(reference, context)
+        {
+            return None;
+        }
         // A Go type embedded through a package (`yaml.Node`) is that
         // package's, and so is the type a Go alias names: when the package is
         // none of the file's imports as indexed, the type found by its bare
@@ -2004,6 +2024,20 @@ impl ReferenceResolver {
             && crate::go_packages::is_go_unknown_qualified(reference, context)
         {
             return None;
+        }
+        // A Go type position — a parameter or result type, a composite
+        // literal's type — names a type of the package Go reads it from; a
+        // method value (`rs.Get`) and a route's handler are references too,
+        // but values (upstream #2416).
+        if reference.language == Language::Go
+            && !reference.is_function_ref
+            && (reference.reference_kind == EdgeKind::Instantiates
+                || (reference.reference_kind == EdgeKind::References
+                    && context
+                        .get_node_by_id_shared(&reference.from_node_id)
+                        .is_none_or(|from| from.kind != NodeKind::Route)))
+        {
+            return crate::go_packages::go_type_position_target(result, reference, context);
         }
         if !crate::types::is_inheritance_ref(reference.reference_kind)
             && reference.reference_kind != EdgeKind::Imports
@@ -2061,6 +2095,12 @@ impl ReferenceResolver {
                 crate::cpp_supertypes::match_cpp_supertype(reference, context),
                 None,
             );
+        }
+        // A Go call through a type assertion (`srv.(KVServer).Range(ctx,
+        // in)`), which arrives by its bare name, is to a method of the
+        // asserted type, or to nothing the project declares (upstream #2444).
+        if let Some(asserted) = crate::go_packages::match_go_asserted_call(reference, context) {
+            return (asserted, None);
         }
         if self.is_built_in_or_external(reference) && !imports_its_own_built_in(reference, context)
         {

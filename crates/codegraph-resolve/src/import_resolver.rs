@@ -913,51 +913,124 @@ fn extract_python_imports(content: &str) -> Vec<ImportMapping> {
     mappings
 }
 
-/// `extractGoImports` (`import-resolver.ts:770-810`).
+/// `extractGoImports` (upstream #2410). An import is bound to the name
+/// written before its path, or else to the name of the package it imports,
+/// which the path alone doesn't settle: `k8s.io/api/core/v1` is package `v1`,
+/// while `go.yaml.in/yaml/v3` and `gopkg.in/yaml.v3` are `yaml` and
+/// `github.com/mattn/go-sqlite3` is `sqlite3`. So an unaliased import keeps its
+/// last path element and also takes the name goimports assumes for the path,
+/// unless another of the file's imports is bound to that name or a second one
+/// assumes it too. Only the import section is read, without its comments: a
+/// word in one is no name (`"fmt" // for printing` named the next import
+/// `printing`), and an import spelled in a comment or a later string is none.
 fn extract_go_imports(content: &str) -> Vec<ImportMapping> {
     static SINGLE_RE: OnceLock<Regex> = OnceLock::new();
     static BLOCK_RE: OnceLock<Regex> = OnceLock::new();
     static LINE_RE: OnceLock<Regex> = OnceLock::new();
     let single_re = SINGLE_RE.get_or_init(|| {
-        Regex::new(r#"import\s+(?:(\w+)\s+)?["']([^"']+)["']"#).expect("go single")
+        Regex::new(r#"\bimport\s+(?:([A-Za-z_]\w*)[ \t]*)?["']([^"']+)["']"#).expect("go single")
     });
     let block_re =
-        BLOCK_RE.get_or_init(|| Regex::new(r"(?s)import\s*\(\s*([^)]+)\s*\)").expect("go block"));
-    let line_re =
-        LINE_RE.get_or_init(|| Regex::new(r#"(?:(\w+)\s+)?["']([^"']+)["']"#).expect("go line"));
+        BLOCK_RE.get_or_init(|| Regex::new(r"\bimport\s*\(\s*([^)]+)\s*\)").expect("go block"));
+    let line_re = LINE_RE.get_or_init(|| {
+        Regex::new(r#"(?:([A-Za-z_]\w*|\.)[ \t]*)?["']([^"']+)["']"#).expect("go line")
+    });
+    let code = crate::strip_comments::strip_comments_for_regex(
+        &content[..go_imports_end(content)],
+        crate::strip_comments::CommentLang::Go,
+    );
 
-    let mut mappings = Vec::new();
-
-    for caps in single_re.captures_iter(content) {
-        let alias = caps.get(1).map(|m| m.as_str());
-        let source = caps.get(2).map(|m| m.as_str()).unwrap_or_default();
-        let package_name = source.rsplit('/').next().unwrap_or(source);
-        mappings.push(ImportMapping {
-            local_name: alias.unwrap_or(package_name).to_string(),
-            exported_name: "*".to_string(),
-            source: source.to_string(),
-            is_default: false,
-            is_namespace: true,
-        });
+    let mut specs: Vec<(Option<&str>, &str)> = Vec::new();
+    for caps in single_re.captures_iter(&code) {
+        let name = caps.get(1).map(|m| m.as_str());
+        specs.push((name, caps.get(2).map_or("", |m| m.as_str())));
     }
-
-    for caps in block_re.captures_iter(content) {
-        let block = caps.get(1).map(|m| m.as_str()).unwrap_or_default();
+    for caps in block_re.captures_iter(&code) {
+        let block = caps.get(1).map_or("", |m| m.as_str());
         for line_caps in line_re.captures_iter(block) {
-            let alias = line_caps.get(1).map(|m| m.as_str());
-            let source = line_caps.get(2).map(|m| m.as_str()).unwrap_or_default();
-            let package_name = source.rsplit('/').next().unwrap_or(source);
-            mappings.push(ImportMapping {
-                local_name: alias.unwrap_or(package_name).to_string(),
-                exported_name: "*".to_string(),
-                source: source.to_string(),
-                is_default: false,
-                is_namespace: true,
-            });
+            let name = line_caps.get(1).map(|m| m.as_str());
+            specs.push((name, line_caps.get(2).map_or("", |m| m.as_str())));
         }
     }
 
+    let mapping = |local_name: &str, source: &str| ImportMapping {
+        local_name: local_name.to_string(),
+        exported_name: "*".to_string(),
+        source: source.to_string(),
+        is_default: false,
+        is_namespace: true,
+    };
+    // A dot import (`. "pkg"`) binds no name of its own; it stays listed under
+    // its last path element.
+    let mut mappings: Vec<ImportMapping> = specs
+        .iter()
+        .map(|&(name, source)| match name {
+            Some(name) if name != "." => mapping(name, source),
+            _ => mapping(source.rsplit('/').next().unwrap_or(source), source),
+        })
+        .collect();
+    let bound: BTreeSet<String> = mappings.iter().map(|m| m.local_name.clone()).collect();
+    let mut assumed: Vec<(String, Vec<&str>)> = Vec::new();
+    for &(name, source) in &specs {
+        if name.is_some() {
+            continue;
+        }
+        let assumed_name = go_assumed_package_name(source);
+        if assumed_name.is_empty() || bound.contains(&assumed_name) {
+            continue;
+        }
+        match assumed.iter_mut().find(|(name, _)| *name == assumed_name) {
+            Some((_, sources)) => sources.push(source),
+            None => assumed.push((assumed_name, vec![source])),
+        }
+    }
+    // Two imports that assume one name can't both be that package.
+    for (local_name, sources) in &assumed {
+        if let [source] = sources.as_slice() {
+            mappings.push(mapping(local_name, source));
+        }
+    }
     mappings
+}
+
+/// Where a Go file's imports end: at its first other top-level declaration, a
+/// line opening with `func`, `type`, `var` or `const` outside a block comment
+/// (upstream `goImportsEnd`).
+fn go_imports_end(content: &str) -> usize {
+    static DECL_RE: OnceLock<Regex> = OnceLock::new();
+    let decl_re = DECL_RE
+        .get_or_init(|| Regex::new(r"(?m)^(?:func|type|var|const)\b").expect("go declaration"));
+    decl_re
+        .find_iter(content)
+        .map(|found| found.start())
+        .find(|&at| {
+            let open = content[..at].rfind("/*");
+            let close = content[..at].rfind("*/");
+            open.is_none() || close.is_some_and(|close| open < Some(close))
+        })
+        .unwrap_or(content.len())
+}
+
+/// The package name goimports assumes for an import path
+/// (`ImportPathToAssumedName`, upstream `goAssumedPackageName`): its last
+/// element that isn't a major version (`go.yaml.in/yaml/v3` → `yaml`), without
+/// a `go-` prefix (`github.com/mattn/go-sqlite3` → `sqlite3`), cut where an
+/// identifier can't go on (`gopkg.in/yaml.v3` → `yaml`).
+fn go_assumed_package_name(import_path: &str) -> String {
+    let elements: Vec<&str> = import_path.split('/').collect();
+    let mut base = elements.last().copied().unwrap_or_default();
+    let is_major_version = |element: &str| {
+        element
+            .strip_prefix('v')
+            .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+    };
+    if elements.len() > 1 && is_major_version(base) {
+        base = elements[elements.len() - 2];
+    }
+    let base = base.strip_prefix("go-").unwrap_or(base);
+    base.chars()
+        .take_while(|c| c.is_alphabetic() || c.is_numeric() || *c == '_')
+        .collect()
 }
 
 /// `extractJavaImports` (`import-resolver.ts:826-853`): Java's `import
@@ -2840,6 +2913,10 @@ fn resolve_go_cross_package_reference(
     if dot_idx == 0 || crate::go_packages::is_go_chain_link(reference, context) {
         return None;
     }
+    // A parameter or local named like the import holds the call there:
+    // `store := newStore()`, then `store.Get(k)` is no call into package
+    // store (upstream #2448).
+    crate::go_packages::go_ref_qualifier(reference, context)?;
     let receiver = &reference.reference_name[..dot_idx];
     let member = &reference.reference_name[dot_idx + 1..];
     if member.is_empty() {
@@ -4427,6 +4504,92 @@ const { x, y: z } = require('./other');
                 ("Row", "Row", "store.rows"),
                 ("Col", "Col", "store.rows"),
             ]
+        );
+    }
+
+    /// `name <- path` of every Go import mapping of `source`, sorted.
+    fn go_import_names(source: &str) -> Vec<String> {
+        let mut names: Vec<String> = extract_import_mappings(source, Language::Go)
+            .iter()
+            .map(|m| format!("{} <- {}", m.local_name, m.source))
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// Upstream #2410: an unaliased versioned or `go-` import is bound to its
+    /// package's name as well as its last element.
+    #[test]
+    fn a_go_import_takes_the_name_goimports_assumes() {
+        assert_eq!(
+            go_import_names(
+                "package p\nimport (\n\t\"go.yaml.in/yaml/v3\"\n\t\"github.com/mattn/go-sqlite3\"\n\t\"k8s.io/api/core/v1\"\n\t\"github.com/gin-gonic/gin\"\n\t\"gopkg.in/natefinch/lumberjack.v2\"\n)\n"
+            ),
+            [
+                "core <- k8s.io/api/core/v1",
+                "gin <- github.com/gin-gonic/gin",
+                "go-sqlite3 <- github.com/mattn/go-sqlite3",
+                "lumberjack <- gopkg.in/natefinch/lumberjack.v2",
+                "lumberjack.v2 <- gopkg.in/natefinch/lumberjack.v2",
+                "sqlite3 <- github.com/mattn/go-sqlite3",
+                "v1 <- k8s.io/api/core/v1",
+                "v3 <- go.yaml.in/yaml/v3",
+                "yaml <- go.yaml.in/yaml/v3",
+            ]
+        );
+        assert_eq!(
+            go_import_names("package p\n\nimport \"gopkg.in/yaml.v3\"\n"),
+            ["yaml <- gopkg.in/yaml.v3", "yaml.v3 <- gopkg.in/yaml.v3"]
+        );
+    }
+
+    /// Upstream #2410: no assumed name another import holds, or two assume.
+    #[test]
+    fn a_go_import_takes_no_assumed_name_another_holds_or_two_assume() {
+        assert_eq!(
+            go_import_names(
+                "package p\nimport (\n\t\"k8s.io/api/core/v1\"\n\t\"k8s.io/kubernetes/pkg/apis/core\"\n\tyaml \"sigs.k8s.io/yaml\"\n\t\"go.yaml.in/yaml/v3\"\n\t\"github.com/a/semver/v3\"\n\t\"github.com/b/go-semver\"\n)\n"
+            ),
+            [
+                "core <- k8s.io/kubernetes/pkg/apis/core",
+                "go-semver <- github.com/b/go-semver",
+                "v1 <- k8s.io/api/core/v1",
+                "v3 <- github.com/a/semver/v3",
+                "v3 <- go.yaml.in/yaml/v3",
+                "yaml <- sigs.k8s.io/yaml",
+            ]
+        );
+    }
+
+    /// Upstream #2410: a written name is kept, a dot import assumes none, and
+    /// a comment names nothing.
+    #[test]
+    fn a_go_import_keeps_a_written_name_and_reads_none_from_a_comment() {
+        assert_eq!(
+            go_import_names(
+                "package p\nimport (\n\t\"fmt\" // for printing\n\tmetav1 \"k8s.io/apimachinery/pkg/apis/meta/v1\"\n\t_ \"embed\"\n\t. \"github.com/onsi/ginkgo/v2\"\n\t// yaml decoding\n\t\"gopkg.in/yaml.v3\"\n\t/* the store */ \"example.com/app/store\"\n)\nfunc run() {}\n"
+            ),
+            [
+                "_ <- embed",
+                "fmt <- fmt",
+                "metav1 <- k8s.io/apimachinery/pkg/apis/meta/v1",
+                "store <- example.com/app/store",
+                "v2 <- github.com/onsi/ginkgo/v2",
+                "yaml <- gopkg.in/yaml.v3",
+                "yaml.v3 <- gopkg.in/yaml.v3",
+            ]
+        );
+    }
+
+    /// Upstream #2410: only the import declarations, wherever a comment or a
+    /// later string spells one.
+    #[test]
+    fn a_go_file_reads_only_its_import_declarations() {
+        assert_eq!(
+            go_import_names(
+                "/*\nPackage p is a code generator.\nfunc Example() {}\n*/\npackage p\n// import \"example.com/commented\"\nimport (\n\t\"text/template\" // (for the body below)\n\t\"strings\"\n)\nfunc run() string {\n\treturn strings.TrimSpace(`\nimport \"example.com/generated\"\n`)\n}\n"
+            ),
+            ["strings <- strings", "template <- text/template"]
         );
     }
 

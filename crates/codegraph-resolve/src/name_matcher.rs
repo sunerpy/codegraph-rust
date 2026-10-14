@@ -927,7 +927,7 @@ fn is_json_require_signature(signature: &str) -> bool {
 /// Keywords after which a name starts an expression, so the call that follows
 /// has no receiver (`BARE_CALL_KEYWORDS`, upstream v1.6.1; `go`/`defer` are the
 /// Go statement forms).
-const BARE_CALL_KEYWORDS: [&str; 14] = [
+const BARE_CALL_KEYWORDS: [&str; 18] = [
     "return",
     "await",
     "yield",
@@ -942,6 +942,11 @@ const BARE_CALL_KEYWORDS: [&str; 14] = [
     "instanceof",
     "go",
     "defer",
+    // Go: `if T(x)`, `for range f()` (upstream #2408).
+    "if",
+    "switch",
+    "for",
+    "range",
 ];
 
 fn is_ascii_word_char(ch: char) -> bool {
@@ -1075,6 +1080,126 @@ pub(crate) fn is_bare_js_call(reference: &RefView, context: &dyn ResolutionConte
 /// the file does not import (#1857, upstream `isBareGoCall`).
 fn is_bare_go_call(reference: &RefView, context: &dyn ResolutionContext) -> bool {
     reference.language == Language::Go && is_receiver_less_call(reference, context)
+}
+
+/// Whether a Go reference's name is written bare, so that Go reads it from
+/// the reference's own package (upstream `isGoBareName`, #2408): a type `Node`
+/// (variadic `...Node` too), a composite literal `&Event{}`, a call
+/// `Walk(v, n)` or a conversion `(*Block)(pb)`. Not `parser.Node` or
+/// `...chunks.Meta`, written through an import, nor a name reached through a
+/// value: `err[i].Error()`, a `.String()` chained onto the line above.
+pub(crate) fn is_go_bare_name(reference: &RefView, context: &dyn ResolutionContext) -> bool {
+    let name = reference.reference_name.as_str();
+    if reference.language != Language::Go || !is_go_identifier(name) {
+        return false;
+    }
+    if reference.reference_kind == EdgeKind::Calls && is_receiver_less_call(reference, context) {
+        return true;
+    }
+    let Some(facts) = context.source_facts(&reference.file_path) else {
+        return false;
+    };
+    let Some(line) = usize::try_from(reference.line)
+        .ok()
+        .and_then(|line| line.checked_sub(1))
+        .and_then(|index| facts.raw_line(index))
+    else {
+        return false;
+    };
+    let column = usize::try_from(reference.column.max(0)).unwrap_or(0);
+    let Some(rest) = line.get(column..) else {
+        return false;
+    };
+    // A call's column is its expression's: only a conversion's parenthesized
+    // type is still bare there.
+    if reference.reference_kind == EdgeKind::Calls {
+        let Some(inner) = rest.strip_prefix('(') else {
+            return false;
+        };
+        let inner = inner.trim_start();
+        let inner = inner.strip_prefix('*').unwrap_or(inner).trim_start();
+        let Some(after) = inner.strip_prefix(name) else {
+            return false;
+        };
+        return after
+            .trim_start()
+            .strip_prefix(')')
+            .is_some_and(|after| after.trim_start().starts_with('('));
+    }
+    if rest.starts_with(name) {
+        let before = line[..column].trim_end();
+        return !before.ends_with('.') || before.ends_with("...");
+    }
+    // A name recorded away from its spelling (a route's handler, at the start
+    // of its line): its spelling there, outside strings.
+    let code = blank_go_strings(line);
+    code.match_indices(name).any(|(at, _)| {
+        let free = code[..at]
+            .bytes()
+            .next_back()
+            .is_none_or(|byte| !(byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'.'));
+        free && code[at + name.len()..]
+            .bytes()
+            .next()
+            .is_none_or(|byte| !(byte.is_ascii_alphanumeric() || byte == b'_'))
+    })
+}
+
+fn is_go_identifier(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    bytes
+        .next()
+        .is_some_and(|first| first.is_ascii_alphabetic() || first == b'_')
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+}
+
+/// `line` with the contents of its Go string literals blanked (upstream's
+/// `/"(?:[^"\\]|\\.)*"|`[^`]*`/g` replaced by spaces).
+fn blank_go_strings(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.char_indices().peekable();
+    while let Some((_, c)) = chars.next() {
+        match c {
+            '"' => {
+                let mut literal = String::from('"');
+                let mut closed = false;
+                while let Some((_, next)) = chars.next() {
+                    literal.push(next);
+                    if next == '\\' {
+                        if let Some((_, escaped)) = chars.next() {
+                            literal.push(escaped);
+                        }
+                    } else if next == '"' {
+                        closed = true;
+                        break;
+                    }
+                }
+                if closed {
+                    out.extend(std::iter::repeat_n(' ', literal.chars().count()));
+                } else {
+                    out.push_str(&literal);
+                }
+            }
+            '`' => {
+                let mut literal = String::from('`');
+                let mut closed = false;
+                for (_, next) in chars.by_ref() {
+                    literal.push(next);
+                    if next == '`' {
+                        closed = true;
+                        break;
+                    }
+                }
+                if closed {
+                    out.extend(std::iter::repeat_n(' ', literal.chars().count()));
+                } else {
+                    out.push_str(&literal);
+                }
+            }
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 /// Whether a receiver written as `Name` is a type in `language`'s conventions
@@ -1411,6 +1536,7 @@ fn is_std_method_name(language: Language, name: &str) -> bool {
         Language::CSharp => CSHARP_STD_METHODS.contains(&name),
         Language::Rust => is_rust_std_method(name),
         Language::Kotlin => crate::kotlin_scope::is_kotlin_std_method(name),
+        Language::Go => crate::go_calls::is_go_std_method(name),
         _ => false,
     }
 }
@@ -2371,6 +2497,9 @@ pub fn match_by_exact_name(
     // How a bare-named Swift call is written decides what it can mean
     // (upstream #2170).
     let swift_shape = crate::swift_scope::swift_call_shape(reference, context);
+    // How a bare-named Go call is written decides what it can mean (upstream
+    // #2167, #2177).
+    let go_shape = crate::go_calls::go_call_shape(reference, context);
     let candidates: Vec<Arc<Node>> = reachable
         .iter()
         .filter(|n| {
@@ -2410,6 +2539,11 @@ pub fn match_by_exact_name(
         // #2120: mocha's global `it(…)` bound an interface's `it` property). A
         // bare Rust call cannot reach a method (P15 R1).
         .filter(|n| !((bare_js || bare_go) && is_type_member_kind(n.kind)))
+        .filter(|n| {
+            go_shape
+                .as_ref()
+                .is_none_or(|shape| crate::go_calls::is_go_call_target(n, shape))
+        })
         // A Vue component's own method is `this.m()` inside that component,
         // not `this.$refs['input'].click()` on an element another component
         // renders (upstream #2140).
@@ -4902,6 +5036,20 @@ pub fn match_method_call(
                         .flatten()
                 })
         };
+        // A Go parameter named like an import is declared through a package
+        // as often as not (`logger logger.Interface`), which the patterns
+        // above don't read; the scope reader kept its type. Not a field's: in
+        // `metadata.Type.String()` that is the type of `metadata` (upstream
+        // #2448).
+        if inferred.is_none()
+            && reference.language == Language::Go
+            && is_dot_call(&reference.reference_name)
+            && !object_or_class.contains('.')
+            && let Some(declared) = crate::go_packages::go_ref_declared_type(reference, context)
+        {
+            inferred = normalize_inferred_type_name(&declared);
+            go_written = Some(declared);
+        }
         // A field or property of the class around the call, or of one it
         // inherits, is its declared type (upstream #2171): Newtonsoft's
         // `_innerWriter.WriteValue(…)` is JsonWriter's.
@@ -6253,6 +6401,7 @@ pub fn match_fuzzy(reference: &RefView, context: &dyn ResolutionContext) -> Opti
     let csharp_bare = crate::csharp_types::is_csharp_bare_name(reference)
         && has_no_receiver_on_line(reference, context);
     let swift_shape = crate::swift_scope::swift_call_shape(reference, context);
+    let go_shape = crate::go_calls::go_call_shape(reference, context);
     let callable_candidates = apply_language_gate(
         candidates
             .into_iter()
@@ -6330,6 +6479,12 @@ pub fn match_fuzzy(reference: &RefView, context: &dyn ResolutionContext) -> Opti
                 swift_shape.as_ref().is_none_or(|shape| {
                     crate::swift_scope::is_swift_call_target(n, shape, reference, context)
                 })
+            })
+            // A Go call's shape, as in exact matching (upstream #2167).
+            .filter(|n| {
+                go_shape
+                    .as_ref()
+                    .is_none_or(|shape| crate::go_calls::is_go_call_target(n, shape))
             })
             // `new …MockData()` makes an instance of a type; a method is never
             // what it names (upstream #2141).

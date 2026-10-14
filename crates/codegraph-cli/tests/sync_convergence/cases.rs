@@ -4369,6 +4369,68 @@ pub fn go_external_qualified_reference_never_reaches_a_namesake_that_appears() -
         .no_edge_after("type_alias Ctx", "references", "struct Context")
 }
 
+/// Upstream #2444 (W4-GO-03): a call through a type assertion reaches the
+/// asserted type's promoted method, so it follows the type's embedding,
+/// changed in another file.
+pub fn go_asserted_call_follows_an_embedding_change_in_another_file() -> Case {
+    Case::new(Change::EditHeritage, &[Language::Go])
+        .file("go.mod", "module example.com/app\n\ngo 1.22\n")
+        .file(
+            "w/base.go",
+            "package w\n\ntype Base struct{}\n\nfunc (b *Base) Flush() error { return nil }\n\ntype Other struct{}\n\nfunc (o *Other) Flush() error { return nil }\n",
+        )
+        .file("w/wrapper.go", "package w\n\ntype Wrapper struct {\n\t*Base\n}\n")
+        .file("w/use.go", "package w\n\nfunc use(v any) {\n\tv.(*Wrapper).Flush()\n}\n")
+        .write("w/wrapper.go", "package w\n\ntype Wrapper struct {\n\t*Other\n}\n")
+        .edge_before("function use", "calls", "method Base::Flush")
+        .edge_after("function use", "calls", "method Other::Flush")
+        .no_edge_after("function use", "calls", "method Base::Flush")
+}
+
+/// Upstream #2444 (W4-GO-03): a call through a type assertion reaches a
+/// method the asserted interface gains, never a stub's namesake.
+pub fn go_asserted_call_reaches_a_method_the_asserted_type_gains() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Go])
+        .file("go.mod", "module example.com/app\n\ngo 1.22\n")
+        .file(
+            "pb/stub.go",
+            "package pb\n\ntype UnimplementedKVServer struct{}\n\nfunc (UnimplementedKVServer) Range() error { return nil }\n",
+        )
+        .file("pb/server.go", "package pb\n\ntype KVServer interface {\n\tPut() error\n}\n")
+        .file(
+            "pb/handler.go",
+            "package pb\n\nfunc handle(srv interface{}) error {\n\treturn srv.(KVServer).Range()\n}\n",
+        )
+        .write(
+            "pb/server.go",
+            "package pb\n\ntype KVServer interface {\n\tPut() error\n\tRange() error\n}\n",
+        )
+        .edge_after("function handle", "calls", "method KVServer::Range")
+        .no_edge_after("function handle", "calls", "method UnimplementedKVServer::Range")
+}
+
+/// Upstream #2416 (W4-GO-03): a type position reaches the type its package
+/// gains, never the method of its name beside it.
+pub fn go_type_position_reaches_a_type_its_package_gains() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Go])
+        .file("go.mod", "module example.com/app\n\ngo 1.22\n")
+        .file(
+            "mvcc/index.go",
+            "package mvcc\n\ntype treeIndex struct{}\n\nfunc (ti *treeIndex) keyIndex() {}\n\nfunc (ti *treeIndex) KeyIndex(keyi *keyIndex) {}\n",
+        )
+        .write("mvcc/key_index.go", "package mvcc\n\ntype keyIndex struct{}\n")
+        .edge_after(
+            "method treeIndex::KeyIndex",
+            "references",
+            "struct keyIndex @mvcc/key_index.go",
+        )
+        .no_edge_after(
+            "method treeIndex::KeyIndex",
+            "references",
+            "method treeIndex::keyIndex",
+        )
+}
+
 /// Upstream #2150 (W4-SW-04): a message to `self` reaches the sender's
 /// hierarchy, so it follows a middle class's superclass changed in another
 /// file.

@@ -157,6 +157,7 @@ pub struct SourceFacts {
     java_heads: Mutex<HashMap<String, Arc<crate::java_scope::JavaHead>>>,
     kotlin_file_scope: OnceLock<Arc<crate::kotlin_scope::KotlinFileScope>>,
     kotlin_brace_frames: OnceLock<Arc<Vec<crate::kotlin_scope::BraceFrame>>>,
+    go_scope_index: OnceLock<Arc<crate::go_scope::GoScopeIndex>>,
     scala_imports: OnceLock<Arc<crate::scala_scope::ScalaImports>>,
     scala_holder_package: OnceLock<Option<String>>,
     scala_package_object_package: OnceLock<Option<String>>,
@@ -206,6 +207,7 @@ impl SourceFacts {
             java_heads: Mutex::new(HashMap::new()),
             kotlin_file_scope: OnceLock::new(),
             kotlin_brace_frames: OnceLock::new(),
+            go_scope_index: OnceLock::new(),
             scala_imports: OnceLock::new(),
             scala_holder_package: OnceLock::new(),
             scala_package_object_package: OnceLock::new(),
@@ -671,6 +673,15 @@ impl SourceFacts {
         Arc::clone(
             self.kotlin_brace_frames
                 .get_or_init(|| Arc::new(read(&self.source))),
+        )
+    }
+
+    /// The blocks and the parameter and local declarations of a Go file
+    /// (upstream #2448 `goScopeIndex`), read once.
+    pub(crate) fn go_scope_index(&self) -> Arc<crate::go_scope::GoScopeIndex> {
+        Arc::clone(
+            self.go_scope_index
+                .get_or_init(|| Arc::new(crate::go_scope::GoScopeIndex::read(&self.source))),
         )
     }
 

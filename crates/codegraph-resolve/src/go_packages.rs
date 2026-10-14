@@ -228,8 +228,9 @@ pub(crate) fn go_declared_type_package(
 }
 
 /// The identifier right before a trailing `.` of `prefix`, itself not
-/// written after another word or `.` (upstream's
-/// `/(?:^|[^\w.])([A-Za-z_]\w*)\.$/`).
+/// written after another word or `.`, a variadic `...` aside (upstream's
+/// `/(?:^|[^\w.]|\.{3})([A-Za-z_]\w*)\.$/`, #2408: `...chunks.Meta` is
+/// written through `chunks`).
 fn qualifier_before(prefix: &str) -> Option<&str> {
     let head = prefix.strip_suffix('.')?;
     let start = head
@@ -240,7 +241,7 @@ fn qualifier_before(prefix: &str) -> Option<&str> {
     if !is_identifier(qualifier) {
         return None;
     }
-    if head[..start].bytes().next_back() == Some(b'.') {
+    if head[..start].ends_with('.') && !head[..start].ends_with("...") {
         return None;
     }
     Some(qualifier)
@@ -314,79 +315,384 @@ fn go_written_qualifier(reference: &RefView, context: &dyn ResolutionContext) ->
 /// segment can be a package, whatever else the line writes — `perr` in
 /// `klog.Error(perr.Error())`, `cmp` in `cmp.Diff(…)` beside a `Diff:`
 /// (upstream #2448). The extractor keeps a chain's last receiver segment
-/// (#1496), so the operand is read back at the column. A chain of more hops,
-/// which upstream records bare, is read as a bare name is (`None`); a chain
-/// whose root is no plain name — a call's result (`Chain(…).Handler`,
-/// `makeOuter().bar.Run`), a conversion, an index — has no package.
-fn dotted_qualifier<'l>(
-    reference_name: &str,
-    line: &'l str,
+/// (#1496), so the operand is read back at the column, on to the next line
+/// after a line-final `.`. A chain of more hops, which upstream records bare,
+/// is read as a bare name is (`None`); a chain whose root is no plain name — a
+/// call's result (`Chain(…).Handler`, `makeOuter().bar.Run`), a conversion, an
+/// index — has no package. Only where the line shows no chain at the column
+/// is the stored name's head taken, as upstream takes it.
+fn dotted_qualifier<'r>(
+    reference_name: &'r str,
+    line: &'r str,
     column: usize,
     name: &str,
-) -> Option<Option<&'l str>> {
-    reference_name.split_once('.')?;
-    let at_start = line
-        .get(..column)
-        .is_some_and(|before| !before.trim_end_matches([' ', '\t']).ends_with('.'));
-    if at_start {
-        let (links, _) = selector_chain(line, column);
-        if links.last() == Some(&name) {
-            match links.len() {
-                2 | 3 => return Some(Some(links[0])),
-                0 | 1 => {}
-                _ => return None,
-            }
-        }
+) -> Option<Option<&'r str>> {
+    let (head, _) = reference_name.split_once('.')?;
+    let stored_head = Some(is_identifier(head).then_some(head));
+    let Some(before) = line.get(..column) else {
+        return stored_head;
+    };
+    // A reference recorded at its own name with its whole path written
+    // before it — a method value `middleware.Logger`, `c.store.Fetch` — is
+    // written through that path's first segment, as upstream reads it.
+    if line[column..].starts_with(name)
+        && let Some(start) = (column + name.len()).checked_sub(reference_name.len())
+        && line.get(start..column + name.len()) == Some(reference_name)
+    {
+        let lead = line[..start].trim_end_matches([' ', '\t']);
+        let free = lead
+            .bytes()
+            .next_back()
+            .is_none_or(|byte| !(is_word_byte(byte) || byte == b'.'));
+        return if free { stored_head } else { Some(None) };
     }
-    Some(None)
+    // A column inside a chain: its root is not on show.
+    if before.trim_end_matches([' ', '\t']).ends_with('.') {
+        return Some(None);
+    }
+    // A conversion `(*pkg.T)(x)` spells its type, the stored name, inside
+    // the parentheses; any other parenthesized root has no package.
+    if let Some(inner) = line[column..].strip_prefix('(') {
+        let inner = inner.trim_start();
+        let inner = inner.strip_prefix(['*', '&']).unwrap_or(inner).trim_start();
+        let converts = inner
+            .strip_prefix(reference_name)
+            .is_some_and(|after| after.trim_start().starts_with(')'));
+        return if converts { stored_head } else { Some(None) };
+    }
+    let (links, end) = selector_chain(line, column);
+    if links.is_empty() {
+        return stored_head;
+    }
+    let rest = line[end..].trim_start();
+    // The links a chain has, counting the call's own name.
+    let hops = if links.last() == Some(&name) {
+        links.len()
+    } else if rest.starts_with(['(', '[']) {
+        return Some(None);
+    } else if rest == "." {
+        links.len() + 1
+    } else {
+        return stored_head;
+    };
+    match hops {
+        2 | 3 => Some(Some(links[0])),
+        0 | 1 => stored_head,
+        _ => None,
+    }
+}
+
+/// What a Go reference is written through (upstream `GoQualification`).
+#[derive(Debug, Default)]
+pub(crate) struct GoQualification {
+    /// The package name written before the reference's name, as spelled.
+    pub(crate) written: Option<String>,
+    /// The file's import that name is.
+    pub(crate) imported: Option<ImportMapping>,
+    /// For a call through a parameter or local that takes an import's name,
+    /// the type it is declared as, when its declaration writes one
+    /// (`*tokenJWT`, `clock.PassiveClock`)…
+    pub(crate) declared_type: Option<String>,
+    /// …and the import that type is written through — `clock` in a
+    /// parameter `clock clock.PassiveClock`, `atomic` in `cache :=
+    /// &atomic.Bool{}` — or its value comes from: `reflect` in `value :=
+    /// reflect.New(t)`.
+    pub(crate) type_package: Option<ImportMapping>,
+}
+
+/// What a Go reference is written through (upstream `goRefQualification`):
+/// the package name it spells and the import that name is. A call through a
+/// parameter or local that takes the import's name is a call on that
+/// variable (#2448): etcd's `jwt, err := newTokenProviderJWT(…)`, then
+/// `jwt.assign(…)` beside `import "github.com/golang-jwt/jwt/v5"`; a testify
+/// suite's `func (suite *DaoTestSuite) …` beside testify's `suite`. A type's
+/// qualifier is always a package, and a value read through one
+/// (`quota.Name`) is no call.
+pub(crate) fn go_ref_qualification(
+    reference: &RefView,
+    context: &dyn ResolutionContext,
+) -> GoQualification {
+    let Some(written) = go_written_qualifier(reference, context) else {
+        return GoQualification::default();
+    };
+    let imports = context.get_import_mappings(&reference.file_path, Language::Go);
+    let imported = imports
+        .iter()
+        .find(|import| import.local_name == written)
+        .cloned();
+    if imported.is_some()
+        && reference.reference_name.contains('.')
+        && reference.reference_kind == EdgeKind::Calls
+        && let Some(local) = context
+            .source_facts(&reference.file_path)
+            .and_then(|facts| {
+                facts
+                    .go_scope_index()
+                    .local_decl(&written, reference.line, reference.column)
+            })
+    {
+        // A value a package outside the project hands out is of a type it
+        // declares: kubernetes' `clock := clocktesting.NewFakePassiveClock(…)`
+        // has no project method `Now`.
+        let qualifier = local
+            .declared_type
+            .as_deref()
+            .and_then(written_type_package)
+            .or(local.from.as_deref());
+        let type_package = qualifier.and_then(|qualifier| {
+            imports
+                .iter()
+                .find(|import| import.local_name == qualifier)
+                .cloned()
+        });
+        return GoQualification {
+            written: None,
+            imported: None,
+            declared_type: local.declared_type,
+            type_package,
+        };
+    }
+    GoQualification {
+        written: Some(written),
+        imported,
+        declared_type: None,
+        type_package: None,
+    }
+}
+
+/// The package a declared type is written through: `clock` in
+/// `clock.PassiveClock`, `*pkg.T`, `&pkg.T` (upstream's
+/// `/^[*&\s]*([A-Za-z_]\w*)\.[A-Za-z_]\w*$/`).
+fn written_type_package(declared: &str) -> Option<&str> {
+    let rest = declared.trim_start_matches(|c: char| c == '*' || c == '&' || c.is_whitespace());
+    let (qualifier, name) = rest.split_once('.')?;
+    (is_identifier(qualifier) && is_identifier(name)).then_some(qualifier)
 }
 
 /// The import a Go reference is written through — `context` in
 /// `context.Context`, `store` in `store.Manager` (upstream `goRefQualifier`).
-/// `None` for a name written bare, or through anything that is not one of
-/// the file's imports.
+/// `None` for a name written bare, through anything that is not one of the
+/// file's imports, or through a variable named like one.
 pub(crate) fn go_ref_qualifier(
     reference: &RefView,
     context: &dyn ResolutionContext,
 ) -> Option<ImportMapping> {
-    let written = go_written_qualifier(reference, context)?;
-    context
-        .get_import_mappings(&reference.file_path, Language::Go)
-        .into_iter()
-        .find(|import| import.local_name == written)
+    go_ref_qualification(reference, context).imported
+}
+
+/// The type a Go call's receiver, a parameter or local named like an import,
+/// is declared as (`logger logger.Interface`), when its declaration writes
+/// one (upstream #2448).
+pub(crate) fn go_ref_declared_type(
+    reference: &RefView,
+    context: &dyn ResolutionContext,
+) -> Option<String> {
+    go_ref_qualification(reference, context).declared_type
 }
 
 /// Whether a Go reference is written through a package that is none of its
 /// file's imports as the index knows them (upstream `isGoUnknownQualified`,
-/// #2397): `yaml` in `yaml.Node` under an unaliased `import
-/// "go.yaml.in/yaml/v3"`, recorded under its last path element. Which
+/// #2397): `clientv3` in `clientv3.KV` under an unaliased `import
+/// "go.etcd.io/etcd/client/v3"`, a package named neither by its path's last
+/// element (`v3`) nor by the name goimports assumes for it (`client`). Which
 /// package that is cannot be told from here.
 pub(crate) fn is_go_unknown_qualified(
     reference: &RefView,
     context: &dyn ResolutionContext,
 ) -> bool {
-    go_written_qualifier(reference, context).is_some_and(|written| {
-        !context
-            .get_import_mappings(&reference.file_path, Language::Go)
-            .iter()
-            .any(|import| import.local_name == written)
-    })
+    let qualification = go_ref_qualification(reference, context);
+    qualification.written.is_some() && qualification.imported.is_none()
 }
 
 /// Whether a Go reference is written through an imported package from
 /// outside the project's modules — `context.Context`, `fmt.Errorf`, a
-/// third-party `gin.H` (upstream `isGoExternalQualified`, #2233, with
+/// third-party `gin.H` — or is a call on a variable declared as such a
+/// package's type: kubernetes' `clock.Now()` on a parameter `clock
+/// clock.PassiveClock` (upstream `isGoExternalQualified`, #2233, #2448, with
 /// #2361's package directories).
 pub(crate) fn is_go_external_qualified(
     reference: &RefView,
     context: &dyn ResolutionContext,
 ) -> bool {
-    let Some(import) = go_ref_qualifier(reference, context) else {
+    let qualification = go_ref_qualification(reference, context);
+    let Some(import) = qualification.imported.or(qualification.type_package) else {
         return false;
     };
     !(import.source.starts_with('.')
         || import.source.contains("/internal/")
         || go_import_package_dir(&import.source, Some(&reference.file_path), context).is_some())
+}
+
+/// What a Go type position — a parameter or result type, a composite
+/// literal's type, a type an alias or a defined type names — names: a type,
+/// which Go reads from one package (upstream `goTypePositionTarget`, #2416). A
+/// method or a function is never it; Go reaches those only through a value or
+/// a package. Whichever strategy found a declaration of the name, the type is
+/// the one of that name in the reference's own package for a bare name, or in
+/// the imported project package for `pkg.T`; without one there, a method or a
+/// function of the name is nothing the reference means. etcd's `func (ti
+/// *treeIndex) KeyIndex(keyi *keyIndex) *keyIndex` linked both `keyIndex`
+/// types to the method `treeIndex.keyIndex` beside it. A bare name that found
+/// another package's type means its own package's type of that name when
+/// there is one.
+pub(crate) fn go_type_position_target(
+    mut result: ResolvedRef,
+    reference: &RefView,
+    context: &dyn ResolutionContext,
+) -> Option<ResolvedRef> {
+    let Some(target) = context.get_node_by_id_shared(&result.target_node_id) else {
+        return Some(result);
+    };
+    if target.language != Language::Go {
+        return Some(result);
+    }
+    let is_type = is_go_type_kind(target.kind);
+    // A composite literal keeps its package in the name (`config_util.URL`);
+    // a parameter type leaves it on the line.
+    let (qualifier, name) = match reference.reference_name.rsplit_once('.') {
+        Some((qualifier, name)) => (Some(qualifier), name),
+        None => (None, reference.reference_name.as_str()),
+    };
+    // The package's directory: `Some(None)` for a package outside the
+    // project, `None` for a qualifier that is none of the file's imports as
+    // indexed.
+    let mut bare = false;
+    let pkg_dir: Option<Option<String>> = match qualifier {
+        Some(qualifier) => go_qualifier_package_dir(qualifier, &reference.file_path, context),
+        None => match go_written_qualifier(reference, context) {
+            None => {
+                bare = true;
+                Some(Some(package_dir_of(&reference.file_path)))
+            }
+            Some(written) => context
+                .get_import_mappings(&reference.file_path, Language::Go)
+                .iter()
+                .find(|import| import.local_name == written)
+                .map(|import| {
+                    go_import_package_dir(&import.source, Some(&reference.file_path), context)
+                }),
+        },
+    };
+    let pkg_dir = pkg_dir.flatten();
+    if is_type && (!bare || pkg_dir.as_deref() == Some(package_dir_of(&target.file_path).as_str()))
+    {
+        return Some(result);
+    }
+    let types = pkg_dir
+        .map(|dir| package_types(name, &dir, context))
+        .unwrap_or_default();
+    if let Some(first) =
+        crate::name_matcher::prefer_call_site_file(types, &reference.file_path).first()
+    {
+        result.target_node_id = first.id.clone();
+        return Some(result);
+    }
+    is_type.then_some(result)
+}
+
+/// A Go call made through a type assertion — `srv.(KVServer).Range(ctx,
+/// in)`, `c.Reader.(*pipe).Close()`, `v.(storage.Store).Fetch(k)` — calls a
+/// method of the asserted type: its own, the one its interface declares, or
+/// one embedding promotes into it (upstream `matchGoAssertedCall`, #2444). The
+/// call reaches the resolver by its bare name, at the column where its
+/// receiver expression starts, and name matching took any method of that
+/// name: every gRPC handler etcd generates went to the `UnimplementedKVServer`
+/// stub beside the `KVServer` interface. The type is the one Go finds: in the
+/// call's own package or a package it dot-imports for a bare name, in the
+/// imported package for a qualified one, and an alias is the type it names. A
+/// type found in none — from outside the project (`http.Flusher`), predeclared
+/// (`error`) — an alias of such a type, or a type literal links nothing.
+/// `None` when the call is not made through an assertion.
+pub(crate) fn match_go_asserted_call(
+    reference: &RefView,
+    context: &dyn ResolutionContext,
+) -> Option<Option<ResolvedRef>> {
+    if reference.language != Language::Go
+        || reference.reference_kind != EdgeKind::Calls
+        || !is_identifier(&reference.reference_name)
+    {
+        return None;
+    }
+    let asserted = crate::go_calls::go_asserted_type(reference, context)?;
+    let Some((qualifier, type_name)) = crate::go_calls::asserted_type_name(&asserted) else {
+        return Some(None);
+    };
+    let declares = |dir: &str| !package_types(type_name, dir, context).is_empty();
+    let dir = match qualifier {
+        Some(qualifier) => {
+            go_qualifier_package_dir(qualifier, &reference.file_path, context).flatten()
+        }
+        None => std::iter::once(package_dir_of(&reference.file_path))
+            .chain(go_dot_import_dirs(&reference.file_path, context))
+            .find(|dir| declares(dir)),
+    };
+    let Some(dir) = dir.filter(|dir| declares(dir)) else {
+        return Some(None);
+    };
+    // An alias of a type from outside the project (`type Ctx =
+    // context.Context`) has that type's methods, none the project declares.
+    if package_types(type_name, &dir, context)
+        .iter()
+        .all(|declaration| matches!(alias_target(declaration, context), Some(None)))
+    {
+        return Some(None);
+    }
+    Some(crate::name_matcher::resolve_method_on_type(
+        type_name,
+        &reference.reference_name,
+        reference,
+        context,
+        0.9,
+        ResolvedBy::InstanceMethod,
+        Some(&dir),
+        0,
+    ))
+}
+
+/// The project packages a Go file dot-imports (`import .
+/// "example.com/app/storage"`), by directory: their names it reads bare
+/// (upstream `goDotImportDirs`).
+fn go_dot_import_dirs(file_path: &str, context: &dyn ResolutionContext) -> Vec<String> {
+    let Some(facts) = context.source_facts(file_path) else {
+        return Vec::new();
+    };
+    let mut dirs = Vec::new();
+    for index in 0..facts.line_count() {
+        let line = facts.line(index);
+        // The imports come before any other declaration.
+        if ["func", "type", "var", "const"].iter().any(|keyword| {
+            line.strip_prefix(keyword).is_some_and(|rest| {
+                rest.chars()
+                    .next()
+                    .is_none_or(|c| !(c.is_alphanumeric() || c == '_'))
+            })
+        }) {
+            break;
+        }
+        let rest = line.trim_start();
+        let rest = rest
+            .strip_prefix("import")
+            .filter(|rest| rest.starts_with(char::is_whitespace))
+            .map_or(rest, str::trim_start);
+        let Some(rest) = rest.strip_prefix('.') else {
+            continue;
+        };
+        if !rest.starts_with(char::is_whitespace) {
+            continue;
+        }
+        let Some(path) = rest
+            .trim_start()
+            .strip_prefix('"')
+            .and_then(|rest| rest.split_once('"'))
+            .map(|(path, _)| path)
+        else {
+            continue;
+        };
+        if let Some(dir) = go_import_package_dir(path, Some(file_path), context) {
+            dirs.push(dir);
+        }
+    }
+    dirs
 }
 
 /// Whether `candidate` lives in the project package a Go reference is written
@@ -1301,10 +1607,47 @@ mod tests {
         // A factory call's result has no package; a bare name is read from
         // its line.
         // The root of the chain is a call's result: no package, whatever the
-        // stored name's head is.
+        // stored name's head is, on its line or above a link on the next.
         assert_eq!(
             dotted_qualifier("bar.Run", "\tmakeOuter().bar.Run()", 1, "Run"),
             Some(None)
+        );
+        assert_eq!(
+            dotted_qualifier("bar.Run", "\tmakeOuter().", 1, "Run"),
+            Some(None)
+        );
+        // A chain going on below a line-final `.`.
+        assert_eq!(dotted_qualifier("x.Foo", "\tx.", 1, "Foo"), Some(Some("x")));
+        // A conversion through a package, recorded at its parenthesis; a
+        // parenthesized value has no package.
+        let line = "\tdelResp := (*v3.DeleteResponse)(resp)";
+        assert_eq!(
+            dotted_qualifier("v3.DeleteResponse", line, 12, "DeleteResponse"),
+            Some(Some("v3"))
+        );
+        assert_eq!(
+            dotted_qualifier("x.Close", "\t(x).Close()", 1, "Close"),
+            Some(None)
+        );
+        // A method value recorded at its member, its path before it.
+        let line = "\tr.Use(middleware.Logger)";
+        assert_eq!(
+            dotted_qualifier("middleware.Logger", line, 18, "Logger"),
+            Some(Some("middleware"))
+        );
+        let line = "\tgo Submit(c.store.Fetch)";
+        assert_eq!(
+            dotted_qualifier("c.store.Fetch", line, 19, "Fetch"),
+            Some(Some("c"))
+        );
+        assert_eq!(
+            dotted_qualifier("store.Fetch", "\tSubmit(c.store.Fetch)", 16, "Fetch"),
+            Some(None)
+        );
+        // A line that shows no chain at the column: the stored name's head.
+        assert_eq!(
+            dotted_qualifier("pkga.FuncX", "package main", 0, "FuncX"),
+            Some(Some("pkga"))
         );
         let line = "\tr.Mount(\"/w\", Chain(func(next http.Handler) http.Handler {";
         assert_eq!(

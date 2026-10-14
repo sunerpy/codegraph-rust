@@ -11710,94 +11710,1041 @@ mod go {
         assert!(sse.contains(&"Contains".to_string()), "{report}");
     }
 
-    /// Upstream #2448 (its first half; locals named like an import are
-    /// W4-GO-03's): a dotted call is written through its own operand, the
-    /// only part that can be a package, whatever else its line spells —
-    /// neither a second spelling of the name (`Diff:` beside `cmp.Diff`) nor
-    /// another selector before it (`klog.Error(perr.Error())`, etcd's
-    /// `zap.String("…", p.id.String())`). Upstream's fixture, with etcd's
-    /// line beside it.
+    /// Upstream #2448's fixture (`go-ref-qualifier.test.ts`): project
+    /// methods named like outside packages' functions, and locals and
+    /// parameters named like imports.
+    const GO_REF_QUALIFIER: [(&str, &str); 17] = [
+        ("go.mod", "module example.com/app\n\ngo 1.22\n"),
+        (
+            "logging/wrapper.go",
+            "package logging\n\n// An adapter with klog's method names, like kubernetes' etcd3 logger.\ntype klogWrapper struct{}\n\nfunc (klogWrapper) Infof(format string, args ...interface{})  {}\nfunc (klogWrapper) Errorf(format string, args ...interface{}) {}\n",
+        ),
+        (
+            "registry/suite.go",
+            "package registry\n\ntype Suite struct{}\n\nfunc (s *Suite) Digest(v string) string { return v }\n",
+        ),
+        (
+            "diff/differ.go",
+            "package diff\n\ntype Differ struct{}\n\nfunc (d *Differ) Diff(a, b string) string { return a + b }\n",
+        ),
+        (
+            "example/example.go",
+            "package example\n\nimport (\n\t\"errors\"\n\t\"testing\"\n\n\t\"github.com/distribution/distribution/v3\"\n\t\"github.com/google/go-cmp/cmp\"\n\t\"github.com/opencontainers/go-digest\"\n\t\"github.com/patrickmn/go-cache\"\n\t\"k8s.io/klog/v2\"\n)\n\ntype parseError struct{}\n\nfunc (e *parseError) Error() string { return \"parse\" }\n\ntype lru struct{}\n\nfunc (l *lru) Get(key string) string { return key }\n\ntype Server struct {\n\tcache *lru\n}\n\nfunc (s *Server) Lookup(key string) string {\n\treturn s.cache.Get(key)\n}\n\nfunc NewServer() *Server {\n\t_ = cache.New(0, 0)\n\treturn &Server{cache: &lru{}}\n}\n\nfunc Run(dig string) {\n\tklog.Infof(\"Log using Infof, key: %s\", \"value\")\n\terr := errors.New(\"fail\")\n\tklog.Errorf(\"Log using Errorf, err: %v\", err)\n\tdesc := &distribution.Descriptor{Digest: digest.Digest(dig)}\n\t_ = desc\n\tperr := &parseError{}\n\tklog.Error(perr.Error())\n}\n\nfunc TestParser(t *testing.T) {\n\tt.Errorf(\"Unexpected policy! Diff:\\n%s\", cmp.Diff(\"a\", \"b\"))\n}\n",
+        ),
+        (
+            "auth/jwt.go",
+            "package auth\n\nimport \"github.com/golang-jwt/jwt/v5\"\n\ntype tokenJWT struct{ key string }\n\nfunc newTokenProviderJWT(key string) (*tokenJWT, error) { return &tokenJWT{key: key}, nil }\n\nfunc (t *tokenJWT) assign(user string) (string, error) { return user, nil }\n\nfunc (t *tokenJWT) info(token string) (string, bool) { return token, true }\n\n// Named like the package's Parse.\ntype jwtOptions struct{}\n\nfunc (o *jwtOptions) Parse(token string) error { return nil }\n\nfunc parse(token string) {\n\t_, _ = jwt.Parse(token, nil)\n}\n",
+        ),
+        (
+            "auth/jwt_test.go",
+            "package auth\n\nimport (\n\t\"testing\"\n\n\t\"github.com/golang-jwt/jwt/v5\"\n)\n\nfunc TestJWTInfo(t *testing.T) {\n\tjwt, err := newTokenProviderJWT(\"key\")\n\tif err != nil {\n\t\tt.Fatal(err)\n\t}\n\ttoken, _ := jwt.assign(\"abc\")\n\t_, ok := jwt.info(token)\n\t_ = ok\n}\n\nfunc TestJWTParse(t *testing.T) {\n\tjwt, err := jwt.Parse(\"x\", nil)\n\t_, _ = jwt, err\n}\n\nfunc TestJWTClosure(t *testing.T) {\n\tcheck := func(jwt *tokenJWT) {\n\t\tjwt.info(\"t\")\n\t}\n\tcheck(nil)\n\t_, _ = jwt.Parse(\"y\", nil)\n}\n",
+        ),
+        (
+            "compare/compare.go",
+            "package compare\n\nimport \"github.com/google/go-cmp/cmp\"\n\ntype Comparer interface {\n\tCompare(a, b int) int\n}\n\nfunc comparers() []Comparer { return nil }\n\nfunc Check(cmp Comparer) int {\n\treturn cmp.Compare(1, 2)\n}\n\nfunc Report(a, b string) string {\n\tfor _, cmp := range comparers() {\n\t\t_ = cmp.Compare(3, 4)\n\t}\n\treturn cmp.Diff(a, b)\n}\n\nfunc Report2(a, b string) string {\n\tcmp := cmp.Diff(a, b)\n\treturn cmp\n}\n",
+        ),
+        (
+            "clock/clock.go",
+            "package clock\n\nimport \"time\"\n\n// Named like k8s.io/utils/clock's interface.\ntype Clock interface {\n\tNow() time.Time\n}\n",
+        ),
+        (
+            "cache/store.go",
+            "package cache\n\ntype Store interface {\n\tAdd(obj interface{}) error\n}\n",
+        ),
+        (
+            "jobs/logger/logger.go",
+            "package logger\n\ntype Interface interface {\n\tError(v ...interface{})\n\tString() string\n}\n\nfunc Error(v ...interface{}) {}\n",
+        ),
+        (
+            "jobs/transfer/transfer.go",
+            "package transfer\n\ntype Logger struct{}\n\nfunc (l *Logger) Error(v ...interface{}) {}\n",
+        ),
+        (
+            "jobs/job.go",
+            "package jobs\n\nimport (\n\t\"sync/atomic\"\n\t\"time\"\n\n\t\"example.com/app/cache\"\n\t\"example.com/app/jobs/logger\"\n\t\"k8s.io/utils/clock\"\n\tclocktesting \"k8s.io/utils/clock/testing\"\n)\n\nfunc logError(logger logger.Interface, err error) {\n\tlogger.Error(err)\n}\n\nfunc nextCheck(clock clock.PassiveClock) int64 {\n\treturn clock.Now().Unix()\n}\n\nfunc cachedHasSynced(store cache.Store) func() bool {\n\tcache := &atomic.Bool{}\n\tcache.Store(false)\n\treturn cache.Load\n}\n\nfunc describe(logger logger.Interface) string {\n\treturn logger.Kind.String()\n}\n\nfunc elapsed() time.Time {\n\tclock := clocktesting.NewFakePassiveClock(time.Unix(1, 0))\n\tnow := clock.Now()\n\treturn now\n}\n",
+        ),
+        (
+            "robot/model/model.go",
+            "package model\n\ntype Robot struct{ Name string }\n\nfunc (r *Robot) ToJSON() (string, error) { return r.Name, nil }\n",
+        ),
+        (
+            "robot/robot.go",
+            "package robot\n\nimport \"example.com/app/robot/model\"\n\ntype Robot struct {\n\tmodel.Robot\n\tLevel string\n}\n",
+        ),
+        (
+            "scan/job_test.go",
+            "package scan\n\nimport (\n\t\"testing\"\n\n\t\"example.com/app/robot\"\n)\n\nfunc TestJob(t *testing.T) {\n\trobot := &robot.Robot{Level: \"system\"}\n\tdata, _ := robot.ToJSON()\n\t_ = data\n}\n",
+        ),
+        (
+            "store/store.go",
+            "package store\n\nimport \"github.com/patrickmn/go-cache\"\n\ntype store struct{}\n\nfunc (cache *store) Refresh() {\n\tcache.load()\n}\n\nfunc (s *store) load() {}\n\nfunc New() *cache.Cache {\n\treturn cache.New(0, 0)\n}\n",
+        ),
+    ];
+
+    /// Lines beside upstream's: chi's `r.Use(middleware.Logger)` (a method
+    /// value recorded at its member), etcd's `(*v3.DeleteResponse)(resp)` (a
+    /// conversion recorded at its parenthesis), etcd's `zap.String("…",
+    /// p.id.String())`,
+    /// chi's `Chain(…).Handler(h)`, and a field of a call's result named like
+    /// an outside import.
+    const GO_REF_QUALIFIER_EXTRA: [(&str, &str); 6] = [
+        (
+            "app/convert.go",
+            "package app\n\nimport \"example.com/app/mw\"\n\nfunc convert(r any) {\n\t_ = (*mw.Response)(nil)\n}\n",
+        ),
+        (
+            "mw/logger.go",
+            "package mw\n\nfunc Logger(next func()) func() { return next }\n\ntype Response struct{}\n",
+        ),
+        (
+            "app/router.go",
+            "package app\n\nimport \"example.com/app/mw\"\n\ntype router struct{}\n\nfunc (r *router) Use(f func(func()) func()) {}\n\nfunc route(r *router) {\n\tr.Use(mw.Logger)\n}\n",
+        ),
+        (
+            "rafthttp/peer.go",
+            "package rafthttp\n\nimport \"go.uber.org/zap\"\n\ntype ID uint64\n\nfunc (i ID) String() string { return \"\" }\n\ntype peer struct {\n\tid ID\n}\n\nfunc (p *peer) send(lg *zap.Logger) {\n\tlg.Info(\"sent\", zap.String(\"remote-peer-id\", p.id.String()))\n}\n",
+        ),
+        (
+            "chain/chain.go",
+            "package chain\n\nimport \"net/http\"\n\ntype Middlewares []func(http.Handler) http.Handler\n\nfunc Chain(middlewares ...func(http.Handler) http.Handler) Middlewares { return middlewares }\n\nfunc (mws Middlewares) Handler(h http.Handler) http.Handler { return h }\n\nfunc mount(h http.Handler) http.Handler {\n\treturn Chain(func(next http.Handler) http.Handler { return next }).Handler(h)\n}\n",
+        ),
+        (
+            "app/start.go",
+            "package app\n\nimport \"github.com/acme/bar\"\n\ntype barRunner struct{}\n\nfunc (b *barRunner) Run() {}\n\ntype outer struct {\n\tbar *barRunner\n}\n\nfunc makeOuter() *outer { return &outer{} }\n\nfunc start() {\n\t_ = bar.Version\n\tmakeOuter().bar.Run()\n}\n",
+        ),
+    ];
+
+    /// What the edges out of `file`'s nodes on the `nth` line holding
+    /// `snippet` reach, as qualified names (upstream's `reachedAt`).
+    fn reached_at(graph: &Graph, file: &str, snippet: &str, nth: usize) -> Vec<String> {
+        let text = GO_REF_QUALIFIER
+            .iter()
+            .chain(GO_REF_QUALIFIER_EXTRA.iter())
+            .find(|(path, _)| *path == file)
+            .map(|(_, text)| *text)
+            .unwrap_or_else(|| panic!("no {file}"));
+        let line = text
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| line.contains(snippet))
+            .nth(nth - 1)
+            .map(|(index, _)| i64::try_from(index + 1).unwrap())
+            .unwrap_or_else(|| panic!("no {snippet} in {file}"));
+        graph
+            .edges
+            .iter()
+            .filter(|e| e.kind != "contains" && e.line == Some(line))
+            .filter(|e| graph.node(&e.source).is_some_and(|n| n.file_path == file))
+            .filter_map(|e| graph.node(&e.target))
+            .map(|n| n.qualified_name.clone())
+            .collect()
+    }
+
+    fn go_ref_qualifier_project() -> super::support::Indexed {
+        GO_REF_QUALIFIER
+            .iter()
+            .chain(GO_REF_QUALIFIER_EXTRA.iter())
+            .fold(Project::new(), |project, (path, text)| {
+                project.file(path, text)
+            })
+            .index()
+    }
+
+    /// Upstream #2448's first half: a dotted Go call is written through its
+    /// own operand, the only part that can be a package, whatever else its
+    /// line spells — neither a second spelling of the name (`"Log using
+    /// Infof"`, `Digest:`, `Diff:`) nor another selector before it
+    /// (`klog.Error(perr.Error())`). Upstream's fixture, with etcd's, chi's
+    /// and a call result's field's lines beside it.
     #[test]
     fn pr2448_a_dotted_go_call_is_written_through_its_own_receiver() {
-        let example = "package example\n\nimport (\n\t\"errors\"\n\t\"testing\"\n\n\t\"github.com/distribution/distribution/v3\"\n\t\"github.com/google/go-cmp/cmp\"\n\t\"github.com/opencontainers/go-digest\"\n\t\"github.com/patrickmn/go-cache\"\n\t\"k8s.io/klog/v2\"\n)\n\ntype parseError struct{}\n\nfunc (e *parseError) Error() string { return \"parse\" }\n\ntype lru struct{}\n\nfunc (l *lru) Get(key string) string { return key }\n\ntype Server struct {\n\tcache *lru\n}\n\nfunc (s *Server) Lookup(key string) string {\n\treturn s.cache.Get(key)\n}\n\nfunc NewServer() *Server {\n\t_ = cache.New(0, 0)\n\treturn &Server{cache: &lru{}}\n}\n\nfunc Run(dig string) {\n\tklog.Infof(\"Log using Infof, key: %s\", \"value\")\n\terr := errors.New(\"fail\")\n\tklog.Errorf(\"Log using Errorf, err: %v\", err)\n\tdesc := &distribution.Descriptor{Digest: digest.Digest(dig)}\n\t_ = desc\n\tperr := &parseError{}\n\tklog.Error(perr.Error())\n}\n\nfunc TestParser(t *testing.T) {\n\tt.Errorf(\"Unexpected policy! Diff:\\n%s\", cmp.Diff(\"a\", \"b\"))\n}\n";
-        let project = Project::new()
-            .file("go.mod", "module example.com/app\n\ngo 1.22\n")
-            .file(
-                "logging/wrapper.go",
-                "package logging\n\n// An adapter with klog's method names, like kubernetes' etcd3 logger.\ntype klogWrapper struct{}\n\nfunc (klogWrapper) Infof(format string, args ...interface{})  {}\nfunc (klogWrapper) Errorf(format string, args ...interface{}) {}\n",
-            )
-            .file(
-                "registry/suite.go",
-                "package registry\n\ntype Suite struct{}\n\nfunc (s *Suite) Digest(v string) string { return v }\n",
-            )
-            .file(
-                "diff/differ.go",
-                "package diff\n\ntype Differ struct{}\n\nfunc (d *Differ) Diff(a, b string) string { return a + b }\n",
-            )
-            .file("example/example.go", example)
-            .file(
-                "rafthttp/peer.go",
-                "package rafthttp\n\nimport \"go.uber.org/zap\"\n\ntype ID uint64\n\nfunc (i ID) String() string { return \"\" }\n\ntype peer struct {\n\tid ID\n}\n\nfunc (p *peer) send(lg *zap.Logger) {\n\tlg.Info(\"sent\", zap.String(\"remote-peer-id\", p.id.String()))\n}\n",
-            )
-            .file("chain/chain.go", CHAIN)
-            .file("app/start.go", START)
-            .index();
+        let project = go_ref_qualifier_project();
         let graph = project.graph();
         let report = graph.report();
-        // What the edges out of `file` on the line holding `snippet` reach.
-        let reached_at = |file: &str, text: &str, snippet: &str| -> Vec<String> {
-            let line = text
-                .lines()
-                .position(|l| l.contains(snippet))
-                .unwrap_or_else(|| panic!("no {snippet} in {file}"));
-            let line = i64::try_from(line + 1).unwrap();
-            graph
-                .edges
-                .iter()
-                .filter(|e| e.kind != "contains" && e.line == Some(line))
-                .filter(|e| graph.node(&e.source).is_some_and(|n| n.file_path == file))
-                .filter_map(|e| graph.node(&e.target))
-                .map(|n| n.qualified_name.clone())
-                .collect()
-        };
-        let at = |snippet: &str| reached_at("example/example.go", example, snippet);
+        let at = |file: &str, snippet: &str| reached_at(graph, file, snippet, 1);
+        let ex = "example/example.go";
         assert!(
-            !at("cmp.Diff(\"a\", \"b\")").contains(&"Differ::Diff".to_string()),
+            !at(ex, "klog.Infof(").contains(&"klogWrapper::Infof".to_string()),
             "{report}"
         );
         assert!(
-            at("klog.Error(perr.Error())").contains(&"parseError::Error".to_string()),
+            !at(ex, "klog.Errorf(").contains(&"klogWrapper::Errorf".to_string()),
             "{report}"
         );
         assert!(
-            at("s.cache.Get(key)").contains(&"lru::Get".to_string()),
+            !at(ex, "digest.Digest(dig)").contains(&"Suite::Digest".to_string()),
             "{report}"
         );
-        let peer = "package rafthttp\n\nimport \"go.uber.org/zap\"\n\ntype ID uint64\n\nfunc (i ID) String() string { return \"\" }\n\ntype peer struct {\n\tid ID\n}\n\nfunc (p *peer) send(lg *zap.Logger) {\n\tlg.Info(\"sent\", zap.String(\"remote-peer-id\", p.id.String()))\n}\n";
+        assert!(
+            !at(ex, "cmp.Diff(\"a\", \"b\")").contains(&"Differ::Diff".to_string()),
+            "{report}"
+        );
+        assert!(
+            at(ex, "klog.Error(perr.Error())").contains(&"parseError::Error".to_string()),
+            "{report}"
+        );
+        assert!(
+            at(ex, "s.cache.Get(key)").contains(&"lru::Get".to_string()),
+            "{report}"
+        );
         assert_eq!(
-            reached_at("rafthttp/peer.go", peer, "p.id.String()"),
+            at("rafthttp/peer.go", "p.id.String()"),
             ["ID::String"],
             "{report}"
         );
-        // A field of a call's result named like an outside import (`bar`) is
-        // no package: the stored name's head is not what the line writes.
+        // A conversion through a project package, recorded at its parenthesis.
         assert!(
-            reached_at("app/start.go", START, "makeOuter().bar.Run()")
-                .contains(&"barRunner::Run".to_string()),
+            at("app/convert.go", "(*mw.Response)(nil)").contains(&"Response".to_string()),
             "{report}"
         );
-        // chi's `Chain(…).Handler(h)` on a line spelling `http.Handler`: a
-        // call on a factory's result, which no package qualifies.
+        // A value written through a project package, recorded at its member.
         assert!(
-            reached_at("chain/chain.go", CHAIN, "}).Handler(h)")
-                .contains(&"Middlewares::Handler".to_string()),
+            at("app/router.go", "r.Use(mw.Logger)").contains(&"Logger".to_string()),
+            "{report}"
+        );
+        assert!(
+            at("chain/chain.go", "}).Handler(h)").contains(&"Middlewares::Handler".to_string()),
+            "{report}"
+        );
+        assert!(
+            at("app/start.go", "makeOuter().bar.Run()").contains(&"barRunner::Run".to_string()),
             "{report}"
         );
     }
 
-    const START: &str = "package app\n\nimport \"github.com/acme/bar\"\n\ntype barRunner struct{}\n\nfunc (b *barRunner) Run() {}\n\ntype outer struct {\n\tbar *barRunner\n}\n\nfunc makeOuter() *outer { return &outer{} }\n\nfunc start() {\n\t_ = bar.Version\n\tmakeOuter().bar.Run()\n}\n";
+    /// Upstream #2448's second half: a parameter or local named like an
+    /// import is that variable where it is in scope — a closure's parameter,
+    /// a function's, a range variable, a method receiver — and the package
+    /// everywhere else (another function, the declaration's own right-hand
+    /// side, past a closure or a loop that bound the name). Its declared type
+    /// says whose methods it has: an outside package's type or a value an
+    /// outside function hands out has none of the project's, a project
+    /// package's type its own (an embedded type's method too), and a field
+    /// read through the local keeps its own type. Upstream's fixture, less
+    /// the untyped range variable's guessed callee (KEEP-RUST OD-8).
+    #[test]
+    fn pr2448_a_go_local_named_like_an_import_is_that_variable() {
+        let project = go_ref_qualifier_project();
+        let graph = project.graph();
+        let report = graph.report();
+        let at = |file: &str, snippet: &str| reached_at(graph, file, snippet, 1);
+        let has = |reached: Vec<String>, target: &str| reached.contains(&target.to_string());
+        assert!(
+            has(at("auth/jwt_test.go", "jwt.assign("), "tokenJWT::assign"),
+            "{report}"
+        );
+        assert!(
+            has(at("auth/jwt_test.go", "jwt.info(token)"), "tokenJWT::info"),
+            "{report}"
+        );
+        assert!(
+            has(at("auth/jwt_test.go", "jwt.info(\"t\")"), "tokenJWT::info"),
+            "{report}"
+        );
+        assert!(
+            has(
+                at("compare/compare.go", "cmp.Compare(1, 2)"),
+                "Comparer::Compare"
+            ),
+            "{report}"
+        );
+        // A range variable is that variable too (`go_scope`'s unit tests), but
+        // nothing types it: upstream's lone-candidate guess takes
+        // `Comparer::Compare`, which the receiver-word gate keeps from `cmp`
+        // here (#226, KEEP-RUST OD-8).
+        assert!(
+            has(at("store/store.go", "cache.load()"), "store::load"),
+            "{report}"
+        );
+        assert!(
+            !has(
+                at("auth/jwt.go", "jwt.Parse(token, nil)"),
+                "jwtOptions::Parse"
+            ),
+            "{report}"
+        );
+        assert!(
+            !has(
+                at("auth/jwt_test.go", "jwt.Parse(\"x\", nil)"),
+                "jwtOptions::Parse"
+            ),
+            "{report}"
+        );
+        assert!(
+            !has(
+                at("auth/jwt_test.go", "jwt.Parse(\"y\", nil)"),
+                "jwtOptions::Parse"
+            ),
+            "{report}"
+        );
+        assert!(
+            !has(
+                at("compare/compare.go", "return cmp.Diff(a, b)"),
+                "Differ::Diff"
+            ),
+            "{report}"
+        );
+        assert!(
+            !has(
+                at("compare/compare.go", "cmp := cmp.Diff(a, b)"),
+                "Differ::Diff"
+            ),
+            "{report}"
+        );
+        assert!(
+            !has(at("jobs/job.go", "clock.Now()"), "Clock::Now"),
+            "{report}"
+        );
+        assert!(
+            at("jobs/job.go", "cache.Store(false)").is_empty(),
+            "{report}"
+        );
+        assert!(
+            at("jobs/job.go", "now := clock.Now()").is_empty(),
+            "{report}"
+        );
+        assert_eq!(
+            at("jobs/job.go", "logger.Error(err)"),
+            ["Interface::Error"],
+            "{report}"
+        );
+        assert_eq!(
+            at("scan/job_test.go", "robot.ToJSON()"),
+            ["Robot::ToJSON"],
+            "{report}"
+        );
+        assert!(
+            !has(
+                at("jobs/job.go", "logger.Kind.String()"),
+                "Interface::String"
+            ),
+            "{report}"
+        );
+    }
 
-    const CHAIN: &str = "package chain\n\nimport \"net/http\"\n\ntype Middlewares []func(http.Handler) http.Handler\n\nfunc Chain(middlewares ...func(http.Handler) http.Handler) Middlewares { return middlewares }\n\nfunc (mws Middlewares) Handler(h http.Handler) http.Handler { return h }\n\nfunc mount(h http.Handler) http.Handler {\n\treturn Chain(func(next http.Handler) http.Handler { return next }).Handler(h)\n}\n";
+    /// Upstream #2448: the local is read from the file as a sync leaves it —
+    /// the same lines either way, so a stale reading would still see it.
+    #[test]
+    fn pr2448_a_go_local_is_read_from_the_file_a_sync_leaves() {
+        let jwt = GO_REF_QUALIFIER
+            .iter()
+            .find(|(path, _)| *path == "auth/jwt.go")
+            .map(|(_, text)| *text)
+            .unwrap();
+        let use_file = |decl: &str| {
+            format!(
+                "package auth\nimport \"github.com/golang-jwt/jwt/v5\"\nfunc use() {{\n\t{decl}\n\tjwt.assign(\"user\")\n}}\n"
+            )
+        };
+        let mut project = Project::new()
+            .file("go.mod", "module example.com/app\n\ngo 1.22\n")
+            .file("auth/jwt.go", jwt)
+            .file(
+                "auth/use.go",
+                &use_file("jwt, _ := newTokenProviderJWT(\"key\")"),
+            )
+            .index();
+        let assigns = |graph: &Graph| -> Vec<String> {
+            graph
+                .edges
+                .iter()
+                .filter(|e| e.kind != "contains" && e.line == Some(5))
+                .filter(|e| {
+                    graph
+                        .node(&e.source)
+                        .is_some_and(|n| n.file_path == "auth/use.go")
+                })
+                .filter_map(|e| graph.node(&e.target))
+                .map(|n| n.qualified_name.clone())
+                .collect()
+        };
+        assert_eq!(
+            assigns(project.graph()),
+            ["tokenJWT::assign"],
+            "{}",
+            project.graph().report()
+        );
+        project.write("auth/use.go", &use_file("_, _ = jwt.Parse(\"key\", nil)"));
+        let graph = project.sync();
+        assert!(assigns(graph).is_empty(), "{}", graph.report());
+    }
+
+    /// `kind qualifiedName@file` of each edge but `contains` out of the
+    /// nodes of `file`, sorted (upstream's `targetsFrom`).
+    fn targets_from(graph: &Graph, file: &str) -> Vec<String> {
+        let mut out: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|e| e.kind != "contains")
+            .filter(|e| graph.node(&e.source).is_some_and(|n| n.file_path == file))
+            .filter_map(|e| graph.node(&e.target).map(|t| (e.kind.as_str(), t)))
+            .map(|(kind, t)| format!("{kind} {}@{}", t.qualified_name, t.file_path))
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// Upstream #2410: a name written through an unaliased versioned or `go-`
+    /// import (`yaml.Node`, `klog.V(2)`, `semver.Version`, `sqlite3.Error`) is
+    /// that package's, never a project symbol sharing the name, and a project
+    /// import whose path ends in a major version (`example.com/kit/v2`, package
+    /// `kit`) or names a package `v1` still resolves. Upstream's fixture.
+    #[test]
+    fn pr2410_go_references_through_a_versioned_or_go_import() {
+        let project = Project::new()
+            .file("go.mod", "module example.com/app\n\ngo 1.22\n")
+            .file(
+                "other/other.go",
+                "package other\n\ntype Node struct{}\n\ntype Version struct{}\n\ntype Error struct{}\n\nfunc Unmarshal(b []byte, v any) error { return nil }\n\ntype klogWrapper struct{}\n\nfunc (k *klogWrapper) V(level int) bool { return true }\n\nfunc (k *klogWrapper) Infof(format string, args ...any) {}\n",
+            )
+            .file(
+                "store/store.go",
+                "package store\n\nimport (\n\t\"github.com/Masterminds/semver/v3\"\n\t\"github.com/mattn/go-sqlite3\"\n\t\"go.yaml.in/yaml/v3\"\n\t\"k8s.io/klog/v2\"\n)\n\nfunc Load(b []byte, root *yaml.Node, min *semver.Version) error {\n\tif klog.V(2) {\n\t\tklog.Infof(\"loading %d bytes\", len(b))\n\t}\n\tvar e sqlite3.Error\n\t_ = e\n\treturn yaml.Unmarshal(b, root)\n}\n",
+            )
+            .file("kit/go.mod", "module example.com/kit/v2\n\ngo 1.22\n")
+            .file(
+                "kit/kit.go",
+                "package kit\n\ntype Kit struct{}\n\nfunc New() *Kit { return &Kit{} }\n",
+            )
+            .file(
+                "decoy/decoy.go",
+                "package decoy\n\ntype Kit struct{}\n\nfunc New() *Kit { return &Kit{} }\n\nfunc Find(id string) string { return id }\n",
+            )
+            .file("api/core/v1/types.go", "package v1\n\ntype Pod struct{}\n")
+            .file("pkg/apis/core/types.go", "package core\n\ntype Pod struct{}\n")
+            .file(
+                "repo/repo.go",
+                "package repo\n\nfunc Find(id string) string { return id }\n",
+            )
+            .file(
+                "app/app.go",
+                "package app\n\nimport (\n\t\"fmt\" // for printing\n\t\"example.com/app/repo\"\n\t\"example.com/app/api/core/v1\"\n\t\"example.com/app/pkg/apis/core\"\n\t\"example.com/kit/v2\"\n)\n\nfunc Run(p *v1.Pod, q *core.Pod) *kit.Kit {\n\tfmt.Println(repo.Find(\"x\"))\n\treturn kit.New()\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        let report = graph.report();
+        let store: Vec<String> = targets_from(graph, "store/store.go")
+            .into_iter()
+            .filter(|t| t.contains("@other/"))
+            .collect();
+        assert!(store.is_empty(), "{store:?}\n{report}");
+        assert_eq!(
+            targets_from(graph, "app/app.go"),
+            [
+                "calls Find@repo/repo.go",
+                "calls New@kit/kit.go",
+                "references Kit@kit/kit.go",
+                "references Pod@api/core/v1/types.go",
+                "references Pod@pkg/apis/core/types.go",
+            ],
+            "{report}"
+        );
+    }
+
+    /// Upstream #2397 with #2410: an embedded interface or struct links the
+    /// type its package declares — a bare name its own package's, `pkg.T` the
+    /// import's — and nothing for a type from outside the project (`io.Closer`,
+    /// `sync.Mutex`, `yaml.Node` under `go.yaml.in/yaml/v3`) or through a
+    /// package none of the file's imports is named (`clientv3.KV`), whose
+    /// references stay unresolved. Upstream's fixture, less its viewer half.
+    #[test]
+    fn pr2397_an_indexed_go_module_links_embedded_types_in_their_package() {
+        let gin = "package gin\n\ntype HandlerFunc func(*Context)\n\ntype IRoutes interface {\n\tUse(...HandlerFunc) IRoutes\n\tHandle(string, string, ...HandlerFunc) IRoutes\n}\n\ntype IRouter interface {\n\tIRoutes\n\tGroup(string, ...HandlerFunc) *RouterGroup\n}\n";
+        let project = Project::new()
+            .file("go.mod", "module example.com/app\n\ngo 1.22\n")
+            .file(
+                "storage/storage.go",
+                "package storage\n\ntype LabelQuerier interface {\n\tLabelValues(name string) []string\n}\n\ntype Base struct{}\n\nfunc (b *Base) Close() error { return nil }\n",
+            )
+            .file(
+                "other/other.go",
+                "package other\n\ntype Closer interface{ Close() error }\n\ntype Mutex struct{}\n\ntype Reader interface{ Read(p []byte) (int, error) }\n\ntype Node struct{}\n\ntype KV interface{ Get(key string) string }\n",
+            )
+            .file(
+                "store/store.go",
+                "package store\n\nimport (\n\t\"io\"\n\t\"sync\"\n\n\t\"example.com/app/storage\"\n\t\"go.etcd.io/etcd/client/v3\"\n\t\"go.yaml.in/yaml/v3\"\n)\n\n// The package is yaml, though its import path ends in v3.\ntype RuleGroupNode struct {\n\tyaml.Node\n\tName string\n}\n\n// The package is clientv3: not v3, nor the client goimports would assume.\ntype kvPrefix struct {\n\tclientv3.KV\n}\n\ntype Queryable interface{ Q() }\n\ntype Querier interface {\n\tQueryable\n\tio.Closer\n\tstorage.LabelQuerier\n\tSelect(sorted bool) int\n}\n\ntype Number interface {\n\t~int | ~float64\n}\n\ntype Engine struct{}\n\ntype Reader interface{ Read() }\n\ntype List[T any] struct{ items []T }\n\ntype Store struct {\n\t*Engine\n\tReader\n\tsync.Mutex\n\t*storage.Base\n\tList[int]\n}\n",
+            )
+            .file(
+                "wrap/wrap.go",
+                "package wrap\n\nimport \"io\"\n\ntype Reader interface {\n\tio.Reader\n\tPeek() byte\n}\n",
+            )
+            .file("gin/routergroup.go", gin)
+            .file(
+                "parser/ast.go",
+                "package parser\n\ntype Node interface{ String() string }\n\ntype Expr interface {\n\tNode\n\tType() string\n}\n\ntype exprWrapper struct {\n\tNode\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        let report = graph.report();
+        let sources: Vec<&str> = [
+            ("Querier", "store/store.go"),
+            ("Number", "store/store.go"),
+            ("Store", "store/store.go"),
+            ("RuleGroupNode", "store/store.go"),
+            ("kvPrefix", "store/store.go"),
+            ("Reader", "wrap/wrap.go"),
+            ("IRouter", "gin/routergroup.go"),
+            ("Expr", "parser/ast.go"),
+            ("exprWrapper", "parser/ast.go"),
+        ]
+        .iter()
+        .map(|(name, file)| node_in(graph, file, name).id.as_str())
+        .collect();
+        let mut supertypes: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|e| matches!(e.kind.as_str(), "extends" | "implements"))
+            .filter(|e| e.provenance.as_deref() != Some("heuristic"))
+            .filter(|e| sources.contains(&e.source.as_str()))
+            .filter_map(|e| Some((graph.node(&e.source)?, e, graph.node(&e.target)?)))
+            .map(|(s, e, t)| format!("{} {} {}@{}", s.name, e.kind, t.name, t.file_path))
+            .collect();
+        supertypes.sort();
+        assert_eq!(
+            supertypes,
+            [
+                "Expr extends Node@parser/ast.go",
+                "IRouter extends IRoutes@gin/routergroup.go",
+                "Querier extends LabelQuerier@storage/storage.go",
+                "Querier extends Queryable@store/store.go",
+                "Store extends Base@storage/storage.go",
+                "Store extends Engine@store/store.go",
+                "Store extends List@store/store.go",
+                "Store implements Reader@store/store.go",
+                "exprWrapper implements Node@parser/ast.go",
+            ],
+            "{report}"
+        );
+        let unresolved = |file: &str, name: &str| -> Vec<String> {
+            let id = &node_in(graph, file, name).id;
+            let mut out: Vec<String> = graph
+                .unresolved
+                .iter()
+                .filter(|r| &r.from_node_id == id && r.reference_kind == "extends")
+                .map(|r| r.reference_name.clone())
+                .collect();
+            out.sort();
+            out
+        };
+        assert_eq!(unresolved("store/store.go", "Querier"), ["Closer"]);
+        assert_eq!(unresolved("store/store.go", "Store"), ["Mutex"]);
+        assert_eq!(unresolved("store/store.go", "RuleGroupNode"), ["Node"]);
+        assert_eq!(unresolved("store/store.go", "kvPrefix"), ["KV"]);
+        assert_eq!(unresolved("wrap/wrap.go", "Reader"), ["Reader"]);
+        let other: Vec<&str> = ["Closer", "Mutex", "Reader", "Node", "KV"]
+            .iter()
+            .map(|name| node_in(graph, "other/other.go", name).id.as_str())
+            .collect();
+        assert!(
+            !graph
+                .edges
+                .iter()
+                .any(|e| matches!(e.kind.as_str(), "extends" | "implements")
+                    && e.provenance.as_deref() != Some("heuristic")
+                    && other.contains(&e.target.as_str())),
+            "{report}"
+        );
+    }
+
+    /// Upstream #2408: Go reads a name from one package only — a bare one
+    /// from the reference's own, `pkg.Name` from that import's, `x[i].Name()`
+    /// from whatever type `x[i]` has. A bare type is its own package's
+    /// interface, a type through an outside import none of the project's, a
+    /// method called through an expression no instantiation of a namesake
+    /// struct, a result type its package's type and not the method the line
+    /// declares, a variadic `...pkg.T` that import's type, and a conversion or
+    /// a composite literal still its own package's struct. Upstream's fixture,
+    /// less the route handler (a Go framework resolver's route: W7-19i) and
+    /// `var _ error = (*Error)(nil)`'s conversion (a package-level `var`
+    /// initializer's calls are not extracted here: pre-existing).
+    #[test]
+    fn pr2408_a_go_name_is_read_from_the_package_go_reads_it_from() {
+        let project = Project::new()
+            .file("go.mod", "module example.com/app\n\ngo 1.22\n")
+            .file(
+                "promql/parser/ast.go",
+                "package parser\n\ntype Node interface {\n\tString() string\n}\n\ntype Visitor interface {\n\tVisit(node Node, path []Node) (Visitor, error)\n}\n\nfunc Walk(v Visitor, node Node, path []Node) error {\n\treturn nil\n}\n",
+            )
+            .file(
+                "discovery/kubernetes/node.go",
+                "package kubernetes\n\nimport apiv1 \"k8s.io/api/core/v1\"\n\ntype Node struct {\n\tname string\n}\n\nfunc nodeSource(n *apiv1.Node) string {\n\treturn n.Name\n}\n",
+            )
+            .file(
+                "storage/interface.go",
+                "package storage\n\ntype Appender interface {\n\tAppend(ref uint64) error\n}\n\ntype Filter interface {\n\tAccept(value string) bool\n}\n",
+            )
+            .file(
+                "storage/fanout.go",
+                "package storage\n\ntype fanout struct{}\n\nfunc (f *fanout) Appender() Appender {\n\treturn nil\n}\n",
+            )
+            .file("discovery/aws/aws.go", "package aws\n\ntype Filter struct {\n\tName string\n}\n")
+            .file(
+                "web/api/v1/search.go",
+                "package v1\n\nimport \"example.com/app/storage\"\n\ntype ChainFilter struct{}\n\nfunc NewChainFilter(filters ...storage.Filter) *ChainFilter {\n\treturn &ChainFilter{}\n}\n",
+            )
+            .file(
+                "errors.go",
+                "package gin\n\ntype Error struct {\n\tErr error\n}\n\nfunc (msg *Error) Error() string {\n\treturn msg.Err.Error()\n}\n\nvar _ error = (*Error)(nil)\n\nfunc newError(err error) *Error {\n\treturn &Error{Err: err}\n}\n",
+            )
+            .file(
+                "binding/validator.go",
+                "package binding\n\nimport \"strings\"\n\ntype SliceValidationError []error\n\nfunc (err SliceValidationError) Error() string {\n\tvar b strings.Builder\n\tfor i := range err {\n\t\tb.WriteString(err[i].Error())\n\t}\n\treturn b.String()\n}\n",
+            )
+            .file(
+                "handler/handler.go",
+                "package handler\n\ntype Handler struct{}\n\nfunc (h *Handler) Follow(c Context) error {\n\treturn nil\n}\n\ntype Context interface{}\n",
+            )
+            .file("model/user.go", "package model\n\ntype Follow struct {\n\tFollowerID uint\n}\n")
+            .index();
+        let graph = project.graph();
+        let report = graph.report();
+        // `kind file:qualifiedName` of each edge out of `file`'s nodes (named
+        // `from` when given) to a target named `name` (upstream's `linksFrom`).
+        let links = |file: &str, name: &str, from: Option<&str>| -> Vec<String> {
+            let mut out: Vec<String> = graph
+                .edges
+                .iter()
+                .filter(|e| e.kind != "contains")
+                .filter(|e| {
+                    graph.node(&e.source).is_some_and(|n| {
+                        n.file_path == file && from.is_none_or(|from| n.name == from)
+                    })
+                })
+                .filter_map(|e| graph.node(&e.target).map(|t| (e.kind.as_str(), t)))
+                .filter(|(_, t)| t.name == name)
+                .map(|(kind, t)| format!("{kind} {}:{}", t.file_path, t.qualified_name))
+                .collect();
+            out.sort();
+            out.dedup();
+            out
+        };
+        assert_eq!(
+            links("promql/parser/ast.go", "Node", None),
+            ["references promql/parser/ast.go:Node"],
+            "{report}"
+        );
+        assert!(
+            links("discovery/kubernetes/node.go", "Node", None).is_empty(),
+            "{report}"
+        );
+        let errors = links("binding/validator.go", "Error", None);
+        assert!(
+            !errors.iter().any(|l| l.starts_with("instantiates")),
+            "{errors:?}"
+        );
+        assert!(
+            !errors.contains(&"calls errors.go:Error".to_string()),
+            "{errors:?}"
+        );
+        assert_eq!(
+            links("storage/fanout.go", "Appender", None),
+            ["references storage/interface.go:Appender"],
+            "{report}"
+        );
+        assert_eq!(
+            links("web/api/v1/search.go", "Filter", None),
+            ["references storage/interface.go:Filter"],
+            "{report}"
+        );
+        assert_eq!(
+            links("errors.go", "Error", Some("newError")),
+            ["instantiates errors.go:Error", "references errors.go:Error"],
+            "{report}"
+        );
+    }
+
+    /// Upstream #2416: a Go type position — a parameter or result type, a
+    /// composite literal's type — names a type of the package Go reads it
+    /// from, never a method or a function of that name; a generic receiver's
+    /// `[T]` declares `T`. Upstream's fixture.
+    #[test]
+    fn pr2416_a_go_type_position_resolves_to_a_type() {
+        let project = Project::new()
+            .file("go.mod", "module example.com/app\n\ngo 1.22\n")
+            .file(
+                "mvcc/key_index.go",
+                "package mvcc\n\ntype keyIndex struct {\n\tkey []byte\n}\n\ntype revisions []int64\n",
+            )
+            .file(
+                "mvcc/index.go",
+                "package mvcc\n\ntype treeIndex struct {\n\ttree map[string]*keyIndex\n}\n\nfunc (ti *treeIndex) KeyIndex(keyi *keyIndex) *keyIndex {\n\treturn ti.keyIndex(keyi)\n}\n\nfunc (ti *treeIndex) keyIndex(keyi *keyIndex) *keyIndex {\n\treturn &keyIndex{key: keyi.key}\n}\n\nfunc (ti *treeIndex) revisions() revisions {\n\treturn revisions{1, 2}\n}\n",
+            )
+            .file(
+                "mvcc/watchable_store.go",
+                "package mvcc\n\ntype contains interface {\n\tcontains(rev int64) bool\n}\n\nfunc kvsToEvents(c contains, revs [][]byte) {}\n",
+            )
+            .file(
+                "discovery/aws/ec2.go",
+                "package aws\n\nimport \"context\"\n\ntype ec2Client interface {\n\tDescribeInstances(ctx context.Context) error\n}\n\ntype EC2Discovery struct {\n\tclient ec2Client\n}\n\nfunc (d *EC2Discovery) ec2Client(ctx context.Context) (ec2Client, error) {\n\treturn d.client, nil\n}\n",
+            )
+            .file(
+                "util/zeropool/pool.go",
+                "package zeropool\n\ntype Pool[T any] struct {\n\titems []T\n}\n\nfunc (p *Pool[T]) Get() T {\n\tvar zero T\n\treturn zero\n}\n\nfunc (p *Pool[T]) Put(item T) {}\n\ntype LazyLoader[K comparable, V any] struct{}\n\nfunc (l *LazyLoader[K, V]) Load(key K) (V, error) {\n\tvar v V\n\treturn v, nil\n}\n",
+            )
+            .file(
+                "prompb/types.pb.go",
+                "package prompb\n\ntype Histogram struct {\n\tCount isHistogram_Count\n}\n\ntype isHistogram_Count interface {\n\tisHistogram_Count()\n}\n\ntype Histogram_CountInt struct {\n\tCountInt uint64\n}\n\nfunc (*Histogram_CountInt) isHistogram_Count() {}\n\nfunc (m *Histogram) GetCount() isHistogram_Count {\n\treturn m.Count\n}\n",
+            )
+            .file(
+                "prompb/codec.go",
+                "package prompb\n\nfunc FromIntHistogram(count uint64) Histogram {\n\treturn Histogram{\n\t\tCount: &Histogram_CountInt{CountInt: count},\n\t}\n}\n",
+            )
+            .file(
+                "prompb/io/prometheus/write/v2/types.pb.go",
+                "package writev2\n\ntype Histogram_CountInt struct {\n\tCountInt uint64\n}\n\ntype Sample struct {\n\tts int64\n}\n\nfunc (s Sample) T() int64 { return s.ts }\n",
+            )
+            .file("model/value/value.go", "package value\n\ntype T struct{}\n\ntype K struct{}\n")
+            .file(
+                "storage/remote/client_test.go",
+                "package remote\n\nimport (\n\t\"testing\"\n\n\tconfig_util \"github.com/prometheus/common/config\"\n)\n\ntype ClientConfig struct {\n\tURL *config_util.URL\n}\n\nfunc TestStoreHTTPErrorHandling(t *testing.T) {\n\tconf := &ClientConfig{\n\t\tURL: &config_util.URL{URL: nil},\n\t}\n\t_ = conf\n}\n",
+            )
+            .file(
+                "scrape/target.go",
+                "package scrape\n\ntype Target struct{}\n\nfunc (t *Target) URL() string { return \"\" }\n",
+            )
+            .index();
+        let graph = project.graph();
+        let report = graph.report();
+        // `kind file:qualifiedName` of each `references` or `instantiates`
+        // edge out of `file`'s nodes (the one named `from` when given) to a
+        // target named `name` (upstream's `typeLinksFrom`).
+        let type_links = |file: &str, name: &str, from: Option<&str>| -> Vec<String> {
+            let mut out: Vec<String> = graph
+                .edges
+                .iter()
+                .filter(|e| matches!(e.kind.as_str(), "references" | "instantiates"))
+                .filter(|e| {
+                    graph.node(&e.source).is_some_and(|n| {
+                        n.file_path == file && from.is_none_or(|from| n.name == from)
+                    })
+                })
+                .filter_map(|e| graph.node(&e.target).map(|t| (e.kind.as_str(), t)))
+                .filter(|(_, t)| t.name == name)
+                .map(|(kind, t)| format!("{kind} {}:{}", t.file_path, t.qualified_name))
+                .collect();
+            out.sort();
+            out.dedup();
+            out
+        };
+        assert_eq!(
+            type_links("mvcc/index.go", "keyIndex", Some("KeyIndex")),
+            ["references mvcc/key_index.go:keyIndex"],
+            "{report}"
+        );
+        assert_eq!(
+            type_links("mvcc/index.go", "keyIndex", Some("keyIndex")),
+            [
+                "instantiates mvcc/key_index.go:keyIndex",
+                "references mvcc/key_index.go:keyIndex"
+            ],
+            "{report}"
+        );
+        let calls: Vec<&str> = graph
+            .edges
+            .iter()
+            .filter(|e| e.kind == "calls")
+            .filter(|e| {
+                graph
+                    .node(&e.source)
+                    .is_some_and(|n| n.file_path == "mvcc/index.go" && n.name == "KeyIndex")
+            })
+            .filter_map(|e| graph.node(&e.target))
+            .map(|n| n.qualified_name.as_str())
+            .collect();
+        assert_eq!(calls, ["treeIndex::keyIndex"], "{report}");
+        assert_eq!(
+            type_links("mvcc/index.go", "revisions", Some("revisions")),
+            [
+                "instantiates mvcc/key_index.go:revisions",
+                "references mvcc/key_index.go:revisions"
+            ],
+            "{report}"
+        );
+        assert_eq!(
+            type_links("mvcc/watchable_store.go", "contains", Some("kvsToEvents")),
+            ["references mvcc/watchable_store.go:contains"]
+        );
+        assert_eq!(
+            type_links("prompb/types.pb.go", "isHistogram_Count", Some("GetCount")),
+            ["references prompb/types.pb.go:isHistogram_Count"]
+        );
+        assert_eq!(
+            type_links("discovery/aws/ec2.go", "ec2Client", Some("ec2Client")),
+            ["references discovery/aws/ec2.go:ec2Client"],
+            "{report}"
+        );
+        assert_eq!(
+            type_links("prompb/codec.go", "Histogram_CountInt", None),
+            ["instantiates prompb/types.pb.go:Histogram_CountInt"],
+            "{report}"
+        );
+        for (name, from) in [("T", "Get"), ("T", "Put"), ("K", "Load"), ("V", "Load")] {
+            assert!(
+                type_links("util/zeropool/pool.go", name, Some(from)).is_empty(),
+                "{name} from {from}\n{report}"
+            );
+        }
+        assert!(
+            type_links("storage/remote/client_test.go", "URL", None).is_empty(),
+            "{report}"
+        );
+    }
+
+    /// `qualifiedName` of every `calls` target out of the node named `name`
+    /// in `file`, sorted.
+    fn calls_from(graph: &Graph, file: &str, name: &str) -> Vec<String> {
+        let id = &node_in(graph, file, name).id;
+        let mut out: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|e| e.kind == "calls" && &e.source == id)
+            .filter_map(|e| graph.node(&e.target))
+            .map(|n| n.qualified_name.clone())
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// Upstream #2167 (its Go half) and #2177: a call on an expression
+    /// arrives by its bare name, so its shape is read at the call. A
+    /// standard-library method name chained on a receiver not named after a
+    /// project type is the library's (cobra's `Flags().String(…)`, etcd's
+    /// `c.GetLogger().Error(…)`, net/http's `w.Header().Get(…)`); a
+    /// project-specific one keeps its match (`c.Root().Name()`); a chained
+    /// call is never a package function, nor a bare call a method; a link on a
+    /// later line is chained. Upstream's fixtures, with etcd's and cobra's
+    /// lines beside them.
+    #[test]
+    fn pr2167_a_go_call_on_an_expression_is_read_by_its_shape() {
+        let project = Project::new()
+            .file("go.mod", "module example.com/app\n\ngo 1.21\n")
+            .file(
+                "flags.go",
+                "package app\n\ntype customString struct{}\n\nfunc (c customString) String() string { return \"\" }\n\ntype FlagSet struct{}\n\nfunc Flags() *FlagSet { return nil }\n",
+            )
+            .file("cmd.go", "package app\n\nfunc run() {\n\tFlags().String(\"name\", \"\", \"\")\n}\n")
+            .file(
+                "context.go",
+                "package gin\n\ntype Context struct{}\n\nfunc (c *Context) Get(key string) (any, bool) { return nil, false }\n\nfunc handler(w Writer) string {\n\treturn w.Header().Get(\"Content-Type\")\n}\n",
+            )
+            .file(
+                "client/lease.go",
+                "package client\n\ntype ErrKeepAliveHalted struct{}\n\nfunc (e ErrKeepAliveHalted) Error() string { return \"\" }\n\ntype Command struct{}\n\nfunc (c *Command) Name() string { return \"\" }\n\nfunc (c *Command) Root() *Command { return c }\n\nfunc helper() int { return 0 }\n\ntype Client struct{}\n\nfunc (c *Client) GetLogger() *Client { return c }\n\nfunc (c *Client) Info(msg string) {}\n",
+            )
+            .file(
+                "client/retry.go",
+                "package client\n\nfunc retry(c *Client, cmd *Command) {\n\tc.GetLogger().Error(\"getToken failed\")\n\t_ = cmd.Root().Name()\n\t_ = c.GetLogger().helper()\n\tc.GetLogger().\n\t\tInfo(\"done\")\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        let report = graph.report();
+        assert!(
+            !calls_from(graph, "cmd.go", "run")
+                .iter()
+                .any(|t| t.ends_with("customString::String")),
+            "{report}"
+        );
+        assert!(
+            !calls_from(graph, "context.go", "handler").contains(&"Context::Get".to_string()),
+            "{report}"
+        );
+        let retry = calls_from(graph, "client/retry.go", "retry");
+        assert!(
+            !retry.contains(&"ErrKeepAliveHalted::Error".to_string()),
+            "{retry:?}\n{report}"
+        );
+        assert!(
+            retry.contains(&"Command::Name".to_string()),
+            "{retry:?}\n{report}"
+        );
+        assert!(
+            !retry.contains(&"helper".to_string()),
+            "{retry:?}\n{report}"
+        );
+        assert!(
+            retry.contains(&"Client::Info".to_string()),
+            "{retry:?}\n{report}"
+        );
+    }
+
+    /// The module upstream's #2444 resolution tests index (the gRPC handlers
+    /// with CRLF line ends), with namesakes where name matching looked first.
+    const ASSERTED_CALLS: [(&str, &str); 8] = [
+        ("go.mod", "module example.com/app\n\ngo 1.22\n"),
+        (
+            "pb/rpc_grpc.pb.go",
+            "package pb\r\n\r\nimport \"context\"\r\n\r\ntype KVServer interface {\r\n\tRange(context.Context, *RangeRequest) (*RangeResponse, error)\r\n\tPut(context.Context, *RangeRequest) (*RangeResponse, error)\r\n}\r\n\r\ntype UnimplementedKVServer struct{}\r\n\r\nfunc (UnimplementedKVServer) Range(context.Context, *RangeRequest) (*RangeResponse, error) {\r\n\treturn nil, nil\r\n}\r\n\r\nfunc (UnimplementedKVServer) Put(context.Context, *RangeRequest) (*RangeResponse, error) {\r\n\treturn nil, nil\r\n}\r\n\r\ntype RangeRequest struct{}\r\n\r\ntype RangeResponse struct{}\r\n\r\nfunc _KV_Range_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor func(context.Context, interface{}, func(context.Context, interface{}) (interface{}, error)) (interface{}, error)) (interface{}, error) {\r\n\tin := new(RangeRequest)\r\n\tif err := dec(in); err != nil {\r\n\t\treturn nil, err\r\n\t}\r\n\tif interceptor == nil {\r\n\t\treturn srv.(KVServer).Range(ctx, in)\r\n\t}\r\n\thandler := func(ctx context.Context, req interface{}) (interface{}, error) {\r\n\t\treturn srv.(KVServer).Range(ctx, req.(*RangeRequest))\r\n\t}\r\n\treturn interceptor(ctx, in, handler)\r\n}\r\n\r\nfunc _KV_Put_Handler(srv interface{}, ctx context.Context, in *RangeRequest) (interface{}, error) {\r\n\treturn srv.(KVServer).\r\n\t\tPut(ctx, in)\r\n}\r\n",
+        ),
+        (
+            "internal/bufconn/bufconn.go",
+            "package bufconn\n\nimport \"io\"\n\ntype pipe struct{}\n\nfunc (p *pipe) Close() error { return nil }\n\nfunc (p *pipe) closeWrite() error { return nil }\n\nfunc (p *pipe) close() {}\n\ntype conn struct {\n\tio.Reader\n\tio.Writer\n}\n\nfunc (c *conn) Close() error {\n\terr1 := c.Reader.(*pipe).Close()\n\terr2 := c.Writer.(*pipe).closeWrite()\n\tc.Reader.(*pipe).close()\n\tif err1 != nil {\n\t\treturn err1\n\t}\n\treturn err2\n}\n",
+        ),
+        (
+            "alpha/alpha.go",
+            "package alpha\n\ntype Store interface {\n\tFetch(key string) string\n}\n\ntype sink struct{}\n\nfunc (s *sink) Fetch(key string) string { return \"\" }\n\nfunc (s *sink) Flush() error { return nil }\n\nfunc (s *sink) Read(p []byte) (int, error) { return 0, nil }\n\ntype Ctx struct{}\n\nfunc (c *Ctx) Done() <-chan struct{} { return nil }\n",
+        ),
+        (
+            "storage/storage.go",
+            "package storage\n\ntype Store interface {\n\tFetch(key string) string\n}\n\ntype Base struct{}\n\nfunc (b *Base) Flush() error { return nil }\n",
+        ),
+        (
+            "store/store.go",
+            "package store\n\nimport (\n\t\"context\"\n\n\t\"example.com/app/storage\"\n)\n\ntype Reader interface {\n\tRead(p []byte) (int, error)\n}\n\ntype ReadCloser interface {\n\tReader\n\tClose() error\n}\n\ntype Wrapper struct {\n\t*storage.Base\n\tname string\n}\n\ntype Job struct{}\n\nfunc (j *Job) Start() {}\n\ntype Factory interface {\n\tNew() *Job\n}\n\ntype Builder struct{}\n\nfunc (b *Builder) Add(n int) *Builder { return b }\n\ntype Ctx = context.Context\n\ntype Keeper = storage.Store\n",
+        ),
+        (
+            "store/use.go",
+            "package store\n\nimport (\n\t\"net/http\"\n\n\t\"example.com/app/storage\"\n)\n\ntype sink struct{}\n\nfunc (s *sink) Flush() error { return nil }\n\nfunc (s *sink) Read(p []byte) (int, error) { return 0, nil }\n\nfunc (s *sink) Fetch(key string) string { return \"\" }\n\nfunc Use(v any, w http.ResponseWriter, p []byte) string {\n\tv.(*Wrapper).Flush()\n\tv.(ReadCloser).Read(p)\n\tw.(http.Flusher).Flush()\n\treturn v.(storage.Store).Fetch(\"k\")\n}\n\nfunc Anon(v any) string {\n\treturn v.(interface{ Fetch(key string) string }).Fetch(\"k\")\n}\n\nfunc Run(v any) {\n\tv.(Factory).New().Start()\n}\n\nfunc lookup(key string) any { return nil }\n\nfunc Quoted() string {\n\treturn lookup(\")\").(storage.Store).Fetch(\"k\")\n}\n\nfunc (s *sink) Add(n int) *sink { return s }\n\nfunc Build(v any) {\n\tv.(*Builder).Add(1).Add(2)\n}\n\nfunc Wait(v any) {\n\tv.(Ctx).Done()\n}\n\nfunc Keep(v any) string {\n\treturn v.(Keeper).Fetch(\"k\")\n}\n",
+        ),
+        (
+            "dot/dot.go",
+            "package dot\n\nimport . \"example.com/app/storage\"\n\nfunc Get(v any) string {\n\treturn v.(Store).Fetch(\"k\")\n}\n",
+        ),
+    ];
+
+    /// Upstream #2444: a Go call through a type assertion is a call of the
+    /// asserted type's method — its own, the one its interface declares, or
+    /// one embedding promotes into it; written bare, as a pointer, through a
+    /// project package or a dot import, or through an alias — and links
+    /// nothing for a type from outside the project, a type literal or an
+    /// alias of an outside type. A later link of the chain is left to the type
+    /// the call before it returns. Upstream's fixture.
+    #[test]
+    fn pr2444_a_go_call_through_a_type_assertion_reaches_the_asserted_types_method() {
+        let project = ASSERTED_CALLS
+            .iter()
+            .fold(Project::new(), |project, (path, text)| {
+                project.file(path, text)
+            })
+            .index();
+        let graph = project.graph();
+        let report = graph.report();
+        // `line file::qualifiedName` of every call the function or method
+        // `qualified` in `file` makes, sorted (upstream's `calls`).
+        let calls = |file: &str, qualified: &str| -> Vec<String> {
+            let caller = graph
+                .nodes
+                .iter()
+                .find(|n| {
+                    n.file_path == file
+                        && n.qualified_name == qualified
+                        && matches!(n.kind.as_str(), "function" | "method")
+                })
+                .unwrap_or_else(|| panic!("{qualified} in {file}\n{report}"));
+            let mut out: Vec<String> = graph
+                .edges
+                .iter()
+                .filter(|e| e.kind == "calls" && e.source == caller.id)
+                .filter_map(|e| {
+                    let target = graph.node(&e.target)?;
+                    Some(format!(
+                        "{} {}::{}",
+                        e.line?, target.file_path, target.qualified_name
+                    ))
+                })
+                .collect();
+            out.sort();
+            out
+        };
+        assert_eq!(
+            calls("pb/rpc_grpc.pb.go", "_KV_Range_Handler"),
+            [
+                "30 pb/rpc_grpc.pb.go::KVServer::Range",
+                "33 pb/rpc_grpc.pb.go::KVServer::Range",
+            ],
+            "{report}"
+        );
+        // A chain continued on the next line.
+        assert_eq!(
+            calls("pb/rpc_grpc.pb.go", "_KV_Put_Handler"),
+            ["39 pb/rpc_grpc.pb.go::KVServer::Put"],
+            "{report}"
+        );
+        assert_eq!(
+            calls("internal/bufconn/bufconn.go", "conn::Close"),
+            [
+                "19 internal/bufconn/bufconn.go::pipe::Close",
+                "20 internal/bufconn/bufconn.go::pipe::closeWrite",
+                "21 internal/bufconn/bufconn.go::pipe::close",
+            ],
+            "{report}"
+        );
+        // *Wrapper's Flush is promoted from *storage.Base; ReadCloser's Read
+        // from Reader; http.Flusher's Flush links nothing.
+        assert_eq!(
+            calls("store/use.go", "Use"),
+            [
+                "18 storage/storage.go::Base::Flush",
+                "19 store/store.go::Reader::Read",
+                "21 storage/storage.go::Store::Fetch",
+            ],
+            "{report}"
+        );
+        assert_eq!(
+            calls("dot/dot.go", "Get"),
+            ["6 storage/storage.go::Store::Fetch"],
+            "{report}"
+        );
+        // An alias is the type it names.
+        assert_eq!(
+            calls("store/use.go", "Keep"),
+            ["49 storage/storage.go::Store::Fetch"],
+            "{report}"
+        );
+        // A string argument holding a parenthesis is not the end of the call.
+        assert_eq!(
+            calls("store/use.go", "Quoted"),
+            [
+                "35 storage/storage.go::Store::Fetch",
+                "35 store/use.go::lookup",
+            ],
+            "{report}"
+        );
+        assert!(calls("store/use.go", "Anon").is_empty(), "{report}");
+        // Ctx is an alias of context.Context.
+        assert!(calls("store/use.go", "Wait").is_empty(), "{report}");
+        let flush = &node_in(graph, "store/use.go", "Flush").id;
+        assert!(
+            !graph
+                .edges
+                .iter()
+                .any(|e| e.kind == "calls" && &e.target == flush),
+            "{report}"
+        );
+        assert_eq!(
+            calls("store/use.go", "Run"),
+            [
+                "29 store/store.go::Factory::New",
+                "29 store/store.go::Job::Start",
+            ],
+            "{report}"
+        );
+        // Both `Add` calls start at `v`, so nothing tells them apart.
+        let mut build = calls("store/use.go", "Build");
+        build.dedup();
+        assert_eq!(build, ["41 store/store.go::Builder::Add"], "{report}");
+        let decoys: Vec<&str> = graph
+            .nodes
+            .iter()
+            .filter(|n| n.kind == "method")
+            .filter(|n| {
+                n.file_path == "alpha/alpha.go"
+                    || (n.file_path == "store/use.go" && n.qualified_name.starts_with("sink::"))
+                    || (n.file_path == "pb/rpc_grpc.pb.go"
+                        && n.qualified_name.starts_with("UnimplementedKVServer::"))
+            })
+            .map(|n| n.id.as_str())
+            .collect();
+        assert_eq!(decoys.len(), 11, "{report}");
+        for decoy in decoys {
+            assert!(
+                !graph.edges.iter().any(|e| e.kind == "calls"
+                    && e.target == decoy
+                    && e.provenance.as_deref() != Some("heuristic")),
+                "{}\n{report}",
+                graph.describe(decoy)
+            );
+        }
+    }
 
     /// Upstream #2438: a type declared on its own takes the comment above
     /// `type`; a group's comment is the group's unless the group holds one
