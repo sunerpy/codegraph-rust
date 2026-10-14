@@ -1027,6 +1027,8 @@ matrix! {
     cfml_typed_receiver_takes_a_better_corroborated_namesake,
     cfml_script_tag_method_body_edit,
     cfml_query_body_in_a_wrapped_method_edit,
+    cfml_script_tag_body_nested_past_the_depth_limit_drops_the_file,
+    cfml_query_body_nested_past_the_depth_limit_drops_the_file,
     cfml_implements_an_added_interface_tag,
     cfml_bare_call_follows_an_extends_change_in_another_file,
     cfml_bare_extends_takes_a_component_that_appears_beside_it,

@@ -7190,6 +7190,94 @@ pub fn cfml_query_body_in_a_wrapped_method_edit() -> Case {
         )
 }
 
+/// `(((…1)))` nested 400 deep: past the walker's 256-level limit in a
+/// re-parsed `<cfscript>` or `<cfquery>` body, inside a shallow tag tree.
+fn cfml_deep_parentheses() -> String {
+    format!("{}1{}", "(".repeat(400), ")".repeat(400))
+}
+
+static DEEP_SCRIPT_MODULE_CONFIG: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "<cfcomponent>\n<cfscript>\nfunction configure() {{\n  var helpers = new Helpers();\n  var x = {};\n  return helpers.first();\n}}\n</cfscript>\n</cfcomponent>\n",
+        cfml_deep_parentheses()
+    )
+});
+
+static DEEP_QUERY_MODULE_CONFIG: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "<cfcomponent>\n<cffunction name=\"configure\">\n<cfquery name=\"q\">SELECT #{}# FROM t</cfquery>\n<cfreturn first()>\n</cffunction>\n<cffunction name=\"first\"><cfreturn 1></cffunction>\n</cfcomponent>\n",
+        cfml_deep_parentheses()
+    )
+});
+
+/// A `<cfscript>` body nested past the walker's depth limit fails its whole
+/// file: the component's class and methods leave the index, so another
+/// component's `extends` of its name takes the namesake elsewhere, as a fresh
+/// index has it.
+pub fn cfml_script_tag_body_nested_past_the_depth_limit_drops_the_file() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Cfml])
+        .file(
+            "mod/Helpers.cfc",
+            "component {\n  function first() {\n    return 1;\n  }\n}\n",
+        )
+        .file(
+            "mod/ModuleConfig.cfc",
+            "<cfcomponent>\n<cfscript>\nfunction configure() {\n  var helpers = new Helpers();\n  var x = (1);\n  return helpers.first();\n}\n</cfscript>\n</cfcomponent>\n",
+        )
+        .file(
+            "other/ModuleConfig.cfc",
+            "component {\n  function configure() {\n    return 0;\n  }\n}\n",
+        )
+        .file("mod/Child.cfc", "component extends=\"ModuleConfig\" {\n}\n")
+        .write("mod/ModuleConfig.cfc", DEEP_SCRIPT_MODULE_CONFIG.as_str())
+        .edge_before(
+            "method ModuleConfig::configure @mod/ModuleConfig.cfc",
+            "calls",
+            "method Helpers::first",
+        )
+        .edge_before(
+            "class mod/Child.cfc::Child",
+            "extends",
+            "class mod/ModuleConfig.cfc::ModuleConfig",
+        )
+        .edge_after(
+            "class mod/Child.cfc::Child",
+            "extends",
+            "class other/ModuleConfig.cfc::ModuleConfig",
+        )
+}
+
+/// The same for a `<cfquery>` body whose `#hash#` expression nests past the
+/// limit inside a tag function.
+pub fn cfml_query_body_nested_past_the_depth_limit_drops_the_file() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Cfml])
+        .file(
+            "mod/ModuleConfig.cfc",
+            "<cfcomponent>\n<cffunction name=\"configure\">\n<cfquery name=\"q\">SELECT #(1)# FROM t</cfquery>\n<cfreturn first()>\n</cffunction>\n<cffunction name=\"first\"><cfreturn 1></cffunction>\n</cfcomponent>\n",
+        )
+        .file(
+            "other/ModuleConfig.cfc",
+            "component {\n  function configure() {\n    return 0;\n  }\n}\n",
+        )
+        .file("mod/Child.cfc", "component extends=\"ModuleConfig\" {\n}\n")
+        .write("mod/ModuleConfig.cfc", DEEP_QUERY_MODULE_CONFIG.as_str())
+        .edge_before(
+            "method ModuleConfig::configure @mod/ModuleConfig.cfc",
+            "calls",
+            "method ModuleConfig::first @mod/ModuleConfig.cfc",
+        )
+        .edge_before(
+            "class mod/Child.cfc::Child",
+            "extends",
+            "class mod/ModuleConfig.cfc::ModuleConfig",
+        )
+        .edge_after(
+            "class mod/Child.cfc::Child",
+            "extends",
+            "class other/ModuleConfig.cfc::ModuleConfig",
+        )
+}
+
 /// Upstream #2296: `<cfinterface>` is an interface, so a component's
 /// `implements` reaches it once the file appears.
 pub fn cfml_implements_an_added_interface_tag() -> Case {
