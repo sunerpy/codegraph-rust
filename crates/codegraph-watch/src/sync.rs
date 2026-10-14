@@ -568,6 +568,7 @@ fn sync_paths_with_store(
     let cfml_bootstrap = crate::cfml_heads::needs_bootstrap(store)?;
     let swift_bootstrap = crate::swift_heads::needs_bootstrap(store)?;
     let objc_bootstrap = crate::objc_heads::needs_bootstrap(store)?;
+    let go_bootstrap = crate::go_heads::needs_bootstrap(store)?;
 
     let paths = paths.into_iter().collect::<Vec<_>>();
     let total = paths.len();
@@ -626,6 +627,7 @@ fn sync_paths_with_store(
         || cfml_bootstrap
         || swift_bootstrap
         || objc_bootstrap
+        || go_bootstrap
     {
         note_python_global_readers(
             project_root,
@@ -828,6 +830,22 @@ fn sync_paths_with_store(
             dependent_fallbacks.insert(file.clone());
         }
         changed_names.note_all(objc.names.iter().cloned());
+        // And what a Go call reads of the type declarations its receiver's
+        // type and fields reach: embeddings and field types (W4-GO-01).
+        let go = crate::go_heads::go_refresh(
+            store,
+            project_root,
+            scope.options.max_file_size,
+            &changed_names.go,
+            &reindexed,
+            &changed_names.removed_files,
+            go_bootstrap,
+        )?;
+        for file in &go.files {
+            dependent_sites.remove(file);
+            dependent_fallbacks.insert(file.clone());
+        }
+        changed_names.note_all(go.names.iter().cloned());
         // What a changed Python import statement re-exports moves for its
         // module's importers without any node of those names changing.
         if !changed_names.python_imports.is_empty() {
@@ -923,6 +941,7 @@ fn sync_paths_with_store(
         cfml.write_rows(store)?;
         swift.write_rows(store)?;
         objc.write_rows(store)?;
+        go.write_rows(store)?;
         crate::module_surfaces::finish_bootstrap(store)?;
         crate::cpp_dependents::write_marker(store)?;
         crate::java_heads::write_marker(store)?;
@@ -934,6 +953,7 @@ fn sync_paths_with_store(
         crate::cfml_heads::write_marker(store)?;
         crate::swift_heads::write_marker(store)?;
         crate::objc_heads::write_marker(store)?;
+        crate::go_heads::write_marker(store)?;
     }
 
     // Orphan sweep (#1187, upstream index.ts:645-682): a full-index resolution
@@ -1330,6 +1350,7 @@ fn remove_tracked_file(
         .swift
         .note(store, relative, &old_nodes, None)?;
     changed_names.objc.note(store, relative, None)?;
+    changed_names.go.note(store, relative, None)?;
     delete_unresolved_refs_by_file(store, relative)?;
     store.delete_file_record(relative)?;
     changed_names
@@ -1739,6 +1760,11 @@ fn reextract_into_store(
         relative,
         Some((file.language, source, &result.nodes)),
     )?;
+    changed_names.go.note(
+        store,
+        relative,
+        Some((file.language, source, &result.nodes)),
+    )?;
     // No name in another file resolves into a minified script (upstream
     // #2204), and that verdict is read from the script's text: a script that
     // was or is generated can flip it with every node where it was, so all of
@@ -1882,6 +1908,9 @@ struct ChangedNames {
     /// What the changed files held that an Objective-C message in other
     /// files reads: class heads and property types (W4-SW-04).
     objc: crate::objc_heads::ObjcChanges,
+    /// What the changed files held that a Go call in other files reads:
+    /// type declarations' embeddings and field types (W4-GO-01).
+    go: crate::go_heads::GoChanges,
 }
 
 /// What a changed Python file held before the change. A module global's
@@ -1925,6 +1954,7 @@ impl ChangedNames {
             crate::cfml_heads::withdraw_marker(store)?;
             crate::swift_heads::withdraw_marker(store)?;
             crate::objc_heads::withdraw_marker(store)?;
+            crate::go_heads::withdraw_marker(store)?;
             self.surface_dirty = true;
         }
         Ok(())
@@ -3801,6 +3831,144 @@ pub(crate) mod tests {
         sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
         assert_eq!(objc_marker(&db), version);
         assert_eq!(objc_rows(&db), rows);
+        assert_eq!(edge_projection(&db), expected);
+    }
+
+    fn go_marker(db: &Path) -> Option<String> {
+        Store::open(db)
+            .unwrap()
+            .get_project_metadata(crate::go_heads::VERSION_KEY)
+            .unwrap()
+    }
+
+    fn go_rows(db: &Path) -> Vec<(String, String)> {
+        Store::open(db)
+            .unwrap()
+            .project_metadata_with_prefix(codegraph_resolve::go_packages::HEAD_ROW_KEY_PREFIX)
+            .unwrap()
+    }
+
+    const GO_MOD: (&str, &str) = ("go.mod", "module example.com/app\n\ngo 1.22\n");
+    const GO_BASE: (&str, &str) = (
+        "h/base.go",
+        "package h\n\ntype BaseAPI struct{}\n\nfunc (b *BaseAPI) SendError() {}\n\ntype OtherAPI struct{}\n\nfunc (o *OtherAPI) SendError() {}\n",
+    );
+    const GO_SERVER_BASE: (&str, &str) = (
+        "h/server.go",
+        "package h\n\ntype server struct {\n\tBaseAPI\n}\n",
+    );
+    const GO_SERVER_OTHER: (&str, &str) = (
+        "h/server.go",
+        "package h\n\ntype server struct {\n\tOtherAPI\n}\n",
+    );
+    const GO_RUN: (&str, &str) = (
+        "h/run.go",
+        "package h\n\nfunc (s *server) Run() {\n\ts.SendError()\n}\n",
+    );
+    const GO_SPARE: (&str, &str) = ("h/spare.go", "package h\n\ntype spare struct{}\n");
+    const GO_SPARE_EDITED: (&str, &str) = (
+        "h/spare.go",
+        "package h\n\ntype spare struct {\n\tcount int\n}\n",
+    );
+
+    /// W4-GO-01: a sync failing after its mutations leaves the Go marker
+    /// away, so the next sync, with nothing changed or with an unrelated
+    /// change, re-resolves every Go file and rebuilds the rows: the call a
+    /// changed embedding moves ends where a fresh index puts it.
+    #[test]
+    fn a_go_sync_failing_after_its_mutations_leaves_the_next_one_to_reconcile() {
+        let to_other = |db: &Path| {
+            edge_projection(db)
+                .iter()
+                .any(|edge| edge.contains("server::Run -[calls]-> h/base.go:OtherAPI::SendError"))
+        };
+        for unrelated in [false, true] {
+            let dir = TestDir::new(if unrelated {
+                "go-heads-fail-unrelated"
+            } else {
+                "go-heads-fail"
+            });
+            let db = default_db_path(dir.path()).unwrap();
+            let initial = [GO_MOD, GO_BASE, GO_SERVER_BASE, GO_RUN, GO_SPARE];
+            write_files(dir.path(), &initial);
+            sync_changed_paths(dir.path(), &db, initial.iter().map(|(path, _)| *path)).unwrap();
+            assert_eq!(go_marker(&db), Some(crate::go_heads::VERSION.to_string()));
+            assert!(!to_other(&db), "{:#?}", edge_projection(&db));
+
+            write_files(dir.path(), &[GO_SERVER_OTHER]);
+            FAIL_BEFORE_RESOLUTION.with(|fail| fail.set(true));
+            let failed = sync_changed_paths(dir.path(), &db, [GO_SERVER_OTHER.0]);
+            FAIL_BEFORE_RESOLUTION.with(|fail| fail.set(false));
+            assert!(failed.is_err(), "the injected failure must stop the sync");
+            assert_eq!(go_marker(&db), None, "a failed sync leaves the marker away");
+
+            let spare = if unrelated {
+                write_files(dir.path(), &[GO_SPARE_EDITED]);
+                sync_changed_paths(dir.path(), &db, [GO_SPARE.0]).unwrap();
+                GO_SPARE_EDITED
+            } else {
+                sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
+                GO_SPARE
+            };
+            assert_eq!(go_marker(&db), Some(crate::go_heads::VERSION.to_string()));
+            let fresh = [GO_MOD, GO_BASE, GO_SERVER_OTHER, GO_RUN, spare];
+            let name = if unrelated {
+                "go-heads-fresh-unrelated"
+            } else {
+                "go-heads-fresh"
+            };
+            assert_eq!(edge_projection(&db), fresh_edges(name, &fresh));
+            assert!(to_other(&db), "{:#?}", edge_projection(&db));
+        }
+    }
+
+    /// W4-GO-01: an index whose Go marker and rows alone are gone (the other
+    /// markers written back) has every Go file re-resolved and every row
+    /// rebuilt by its next sync, even one with nothing changed.
+    #[test]
+    fn an_index_without_only_the_go_marker_rebuilds_its_rows_with_nothing_changed() {
+        let version = Some(crate::go_heads::VERSION.to_string());
+        let dir = TestDir::new("go-heads-bootstrap");
+        let db = default_db_path(dir.path()).unwrap();
+        let initial = [GO_MOD, GO_BASE, GO_SERVER_BASE, GO_RUN, GO_SPARE];
+        write_files(dir.path(), &initial);
+        sync_changed_paths(dir.path(), &db, initial.iter().map(|(path, _)| *path)).unwrap();
+        assert_eq!(go_marker(&db), version);
+        let rows = go_rows(&db);
+        assert!(
+            rows.iter().any(|(key, _)| key == "go_heads:h/server.go"),
+            "{rows:#?}"
+        );
+        let expected = edge_projection(&db);
+        {
+            let store = Store::open(&db).unwrap();
+            let dropped = store
+                .connection()
+                .execute(
+                    "DELETE FROM edges WHERE kind = 'calls' AND target = (SELECT id FROM nodes \
+                     WHERE qualified_name = 'BaseAPI::SendError')",
+                    [],
+                )
+                .unwrap();
+            assert_eq!(dropped, 1, "the call edge an older sync lost");
+            store
+                .delete_project_metadata_with_prefix(
+                    codegraph_resolve::go_packages::HEAD_ROW_KEY_PREFIX,
+                )
+                .unwrap();
+            store
+                .delete_project_metadata(crate::go_heads::VERSION_KEY)
+                .unwrap();
+        }
+        assert_ne!(edge_projection(&db), expected);
+        assert_eq!(
+            objc_marker(&db),
+            Some(crate::objc_heads::VERSION.to_string()),
+            "the other markers stay"
+        );
+        sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
+        assert_eq!(go_marker(&db), version);
+        assert_eq!(go_rows(&db), rows);
         assert_eq!(edge_projection(&db), expected);
     }
 

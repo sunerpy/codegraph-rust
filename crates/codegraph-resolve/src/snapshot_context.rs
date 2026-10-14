@@ -195,6 +195,7 @@ struct SnapshotCaches {
     cfml_tables: OnceLock<Arc<crate::cfml_scope::CfmlTables>>,
     swift_tables: OnceLock<Arc<crate::swift_type_visibility::SwiftTables>>,
     objc_tables: OnceLock<Arc<crate::objc_scope::ObjcTables>>,
+    go_tables: OnceLock<Arc<crate::go_packages::GoTables>>,
     #[cfg(test)]
     counters: SnapshotCacheCounters,
 }
@@ -221,6 +222,7 @@ impl SnapshotCaches {
             cfml_tables: OnceLock::new(),
             swift_tables: OnceLock::new(),
             objc_tables: OnceLock::new(),
+            go_tables: OnceLock::new(),
             #[cfg(test)]
             counters: SnapshotCacheCounters::default(),
         }
@@ -777,6 +779,14 @@ impl ResolutionContext for SnapshotResolutionContext {
             self.caches
                 .objc_tables
                 .get_or_init(|| Arc::new(crate::objc_scope::ObjcTables::new())),
+        )
+    }
+
+    fn go_tables(&self) -> Arc<crate::go_packages::GoTables> {
+        Arc::clone(
+            self.caches
+                .go_tables
+                .get_or_init(|| Arc::new(crate::go_packages::GoTables::new())),
         )
     }
 

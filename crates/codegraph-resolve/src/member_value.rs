@@ -16,41 +16,8 @@ use codegraph_core::types::{EdgeKind, Language, Node, NodeKind};
 use regex::Regex;
 
 use crate::import_resolver::resolve_via_import;
-use crate::name_matcher::{
-    infer_local_receiver_type, prefer_call_site_file, resolve_method_on_type, same_language_family,
-};
+use crate::name_matcher::{resolve_method_on_type, same_language_family};
 use crate::types::{RefView, ResolutionContext, ResolvedBy, ResolvedRef};
-
-/// Primitive and built-in Go field types: a field of one never names a
-/// project type.
-const GO_BUILTIN_FIELD_TYPES: [&str; 26] = [
-    "string",
-    "bool",
-    "byte",
-    "rune",
-    "error",
-    "any",
-    "int",
-    "int8",
-    "int16",
-    "int32",
-    "int64",
-    "uint",
-    "uint8",
-    "uint16",
-    "uint32",
-    "uint64",
-    "uintptr",
-    "float32",
-    "float64",
-    "complex64",
-    "complex128",
-    "chan",
-    "map",
-    "func",
-    "struct",
-    "interface",
-];
 
 /// Resolve a Python or Go member value `receiver.member` (#1820).
 pub(crate) fn match_member_function_ref(
@@ -93,11 +60,30 @@ pub(crate) fn match_member_function_ref(
         return unique_callable(same_name, reference, context, 0.9);
     }
     if reference.language == Language::Go {
-        if receiver.contains('.') {
-            return match_go_field_chain_value(receiver, member, reference, context);
+        if let Some((base, field)) = receiver.split_once('.') {
+            if base.is_empty() || field.is_empty() || field.contains('.') {
+                return None;
+            }
+            return crate::go_packages::go_field_chain_call(
+                base,
+                field,
+                member,
+                reference,
+                context,
+                0.85,
+                ResolvedBy::FunctionRef,
+            );
         }
-        if let Some(type_name) = infer_local_receiver_type(receiver, reference, context) {
-            return go_method_value(&type_name, member, reference, context);
+        if let Some((type_name, written)) =
+            crate::name_matcher::infer_local_receiver_declaration(receiver, reference, context)
+        {
+            // The package declaring the receiver's type (upstream #2323).
+            let pkg_dir = crate::go_packages::go_declared_type_package(
+                Some(&written),
+                &reference.file_path,
+                context,
+            );
+            return go_method_value(&type_name, member, pkg_dir.as_deref(), reference, context);
         }
         let types = context
             .get_nodes_by_name_shared(receiver)
@@ -110,7 +96,7 @@ pub(crate) fn match_member_function_ref(
         if types > 0 {
             // A method expression `Store.Fetch` names its type directly.
             return (types == 1)
-                .then(|| go_method_value(receiver, member, reference, context))
+                .then(|| go_method_value(receiver, member, None, reference, context))
                 .flatten();
         }
     } else {
@@ -235,6 +221,7 @@ fn unique_callable(
 fn go_method_value(
     type_name: &str,
     member: &str,
+    pkg_dir: Option<&str>,
     reference: &RefView,
     context: &dyn ResolutionContext,
 ) -> Option<ResolvedRef> {
@@ -245,117 +232,9 @@ fn go_method_value(
         context,
         0.9,
         ResolvedBy::FunctionRef,
-        None,
+        pkg_dir,
         0,
     )
-}
-
-/// `base.field.Method` — the field's declared type read off the base type's
-/// own struct declaration (upstream `matchGoFieldChainCall`, #1276/#1316). A
-/// package-qualified field type is followed only when the package is in the
-/// module; built-in types name no project type.
-fn match_go_field_chain_value(
-    receiver_chain: &str,
-    method: &str,
-    reference: &RefView,
-    context: &dyn ResolutionContext,
-) -> Option<ResolvedRef> {
-    let (base, field) = receiver_chain.split_once('.')?;
-    if base.is_empty() || field.is_empty() || field.contains('.') {
-        return None;
-    }
-    let base_type = infer_local_receiver_type(base, reference, context)?;
-    let field_type = Regex::new(&format!(
-        r"(?-u:\b){}\s+\*?\[?\]?([A-Za-z_][\w.]*)",
-        regex::escape(field)
-    ))
-    .ok()?;
-    let structs = prefer_call_site_file(
-        context.get_nodes_by_name_shared(&base_type),
-        &reference.file_path,
-    )
-    .into_iter()
-    .filter(|node| {
-        matches!(node.kind, NodeKind::Struct | NodeKind::Class) && node.language == Language::Go
-    })
-    .collect::<Vec<_>>();
-    for declaration in structs {
-        let Some(facts) = context.source_facts(&declaration.file_path) else {
-            continue;
-        };
-        let start = declaration.start_line.saturating_sub(1).max(0) as usize;
-        let end = (declaration.end_line.max(0) as usize).min(facts.line_count());
-        for index in start..end {
-            let line = strip_go_line_comments(facts.line(index));
-            let Some(raw_type) = field_type
-                .captures(&line)
-                .and_then(|captures| captures.get(1))
-                .map(|capture| capture.as_str().to_string())
-            else {
-                continue;
-            };
-            if let Some((package, _)) = raw_type.split_once('.') {
-                let in_module = context.get_go_modules().iter().any(|module| {
-                    context
-                        .get_import_mappings(&declaration.file_path, Language::Go)
-                        .iter()
-                        .any(|import| {
-                            import.local_name == package
-                                && (import.source == module.module_path
-                                    || import
-                                        .source
-                                        .starts_with(&format!("{}/", module.module_path)))
-                        })
-                });
-                if !in_module {
-                    continue;
-                }
-            }
-            let Some(type_name) = raw_type.rsplit('.').next() else {
-                continue;
-            };
-            if !type_name
-                .chars()
-                .next()
-                .is_some_and(|ch| ch.is_ascii_alphabetic() || ch == '_')
-                || GO_BUILTIN_FIELD_TYPES.contains(&type_name)
-            {
-                continue;
-            }
-            if let Some(resolved) = resolve_method_on_type(
-                type_name,
-                method,
-                reference,
-                context,
-                0.85,
-                ResolvedBy::FunctionRef,
-                None,
-                0,
-            ) {
-                return Some(resolved);
-            }
-        }
-    }
-    None
-}
-
-/// A Go declaration line without its `//` and single-line `/* */` comments.
-fn strip_go_line_comments(line: &str) -> String {
-    let line = line.split("//").next().unwrap_or(line);
-    let mut out = String::with_capacity(line.len());
-    let mut rest = line;
-    while let Some(open) = rest.find("/*") {
-        out.push_str(&rest[..open]);
-        match rest[open + 2..].find("*/") {
-            Some(close) => rest = &rest[open + 2 + close + 2..],
-            None => {
-                rest = "";
-                break;
-            }
-        }
-    }
-    out.push_str(rest);
-    out
 }
 
 /// The project class a Python name refers to: an import binding when the

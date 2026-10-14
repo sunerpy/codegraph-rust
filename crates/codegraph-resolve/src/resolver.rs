@@ -1209,6 +1209,15 @@ fn target_is_visible_across_files(
     reference: &RefView,
     context: &dyn ResolutionContext,
 ) -> bool {
+    // Through one of the project's Go packages, only that package's symbol:
+    // a `job.OPCommand` result type is not the method `Context.OPCommand`
+    // beside it (upstream #2322).
+    if target.language == Language::Go
+        && reference.language == Language::Go
+        && !crate::go_packages::is_in_go_qualifier_package(target, reference, context)
+    {
+        return false;
+    }
     if target.file_path == reference.file_path {
         return true;
     }

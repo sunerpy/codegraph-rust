@@ -32,6 +32,7 @@ pub mod csharp_types;
 pub mod destructured_calls;
 pub mod framework; // the FrameworkResolver extension point
 pub mod frameworks; // concrete react/vue/nestjs FrameworkResolvers
+pub mod go_packages;
 pub mod import_resolver;
 pub mod java_scope;
 mod js_store;

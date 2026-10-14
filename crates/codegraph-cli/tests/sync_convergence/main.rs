@@ -367,6 +367,8 @@ fn run_case(name: &str, case: &Case) {
     let swift_rows = support::project_metadata_with_prefix(&fresh.db(), "swift_heads");
     // And the Objective-C head rows and their marker (W4-SW-04).
     let objc_rows = support::project_metadata_with_prefix(&fresh.db(), "objc_heads");
+    // And the Go head rows and their marker (W4-GO-01).
+    let go_rows = support::project_metadata_with_prefix(&fresh.db(), "go_heads");
     for (driver, project) in [("cli", &cli), ("watch", &watch)] {
         let rows = support::project_metadata_with_prefix(&project.db(), "js_module_surface");
         if rows != surface_rows {
@@ -450,6 +452,13 @@ fn run_case(name: &str, case: &Case) {
             divergent.push(format!(
                 "=== {driver} driver: the Objective-C head rows differ from a fresh index\n\
                  synced: {rows:#?}\nfresh: {objc_rows:#?}"
+            ));
+        }
+        let rows = support::project_metadata_with_prefix(&project.db(), "go_heads");
+        if rows != go_rows {
+            divergent.push(format!(
+                "=== {driver} driver: the Go head rows differ from a fresh index\n\
+                 synced: {rows:#?}\nfresh: {go_rows:#?}"
             ));
         }
     }
@@ -854,6 +863,13 @@ matrix! {
     swift_type_path_call_drops_a_namesake_an_extension_loses,
     swift_bare_call_follows_a_superclass_change_in_another_file,
     swift_typed_property_follows_an_inherited_declaration,
+    go_embedded_method_follows_an_embedding_change_in_another_file,
+    go_field_chain_follows_a_field_type_change_in_another_file,
+    go_field_chain_reaches_a_retyped_field_past_the_tail_ceiling,
+    go_field_chain_follows_an_import_retarget_in_the_declaring_file,
+    go_embedded_method_follows_an_import_retarget_in_the_declaring_file,
+    go_unexported_receiver_reaches_a_method_its_package_gains,
+    go_qualified_type_reference_reaches_a_package_type_that_appears,
     objc_self_send_follows_a_superclass_change_in_another_file,
     objc_super_send_follows_the_header_of_its_class,
     objc_typed_property_receiver_follows_a_declared_type_change,

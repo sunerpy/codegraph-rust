@@ -4,6 +4,7 @@ pub mod cpp_namespace_rows;
 pub mod csharp_surfaces;
 mod git;
 pub mod git_pending;
+pub mod go_heads;
 pub mod java_heads;
 pub mod kotlin_surfaces;
 mod link_state;

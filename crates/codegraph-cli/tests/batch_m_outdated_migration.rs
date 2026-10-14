@@ -1040,6 +1040,69 @@ fn outdated_migration_writes_the_swift_head_rows_of_index_force() {
     );
 }
 
+/// W4-GO-01: a migration writes the Go head rows (each type declaration's
+/// embeddings, mentions and digest) and their marker as `index --force`
+/// does.
+#[test]
+fn outdated_migration_writes_the_go_head_rows_of_index_force() {
+    let dir = TestDir::new("outdated-go-heads");
+    let project = dir.path().join("mini");
+    for (path, contents) in [
+        ("go.mod", "module example.com/app\n\ngo 1.22\n"),
+        (
+            "h/server.go",
+            "package h\n\ntype server struct {\n\tBaseAPI\n\tstore *store\n}\n",
+        ),
+        ("h/run.go", "package h\n\nfunc (s *server) Run() {}\n"),
+    ] {
+        let full = project.join(path);
+        fs::create_dir_all(full.parent().unwrap()).expect("create the source directory");
+        fs::write(full, contents).expect("write a source file");
+    }
+    let run = cli(&["init", project.to_str().unwrap()]);
+    assert!(
+        run.ok,
+        "setup: `codegraph init` must succeed (stdout={}, stderr={})",
+        run.stdout, run.stderr
+    );
+    let paths = IndexPaths::resolve(&project, None).expect("resolve v2 paths");
+    stage_state_slot(
+        &paths,
+        100,
+        CURRENT_STORAGE_PROTOCOL,
+        CURRENT_EXTRACTION_VERSION - 1,
+        "current",
+    );
+    let run = cli(&["sync", project.to_str().unwrap()]);
+    assert!(
+        run.ok,
+        "sync must migrate an Outdated namespace: stdout={}, stderr={}",
+        run.stdout, run.stderr
+    );
+    let (_scratch, peer) = fresh_force_peer("outdated-go-heads", &project);
+    let head_rows = |paths: &IndexPaths| {
+        Store::open_for_read(paths, deadline(), || false)
+            .expect("readable namespace")
+            .project_metadata_with_prefix("go_heads")
+            .expect("go head rows")
+    };
+    let migrated = head_rows(&paths);
+    // No row for a file that declares no type.
+    assert_eq!(
+        migrated
+            .iter()
+            .map(|(key, _)| key.as_str())
+            .collect::<Vec<_>>(),
+        ["go_heads:h/server.go", "go_heads_version"],
+        "a migration writes the head rows and their marker: {migrated:?}"
+    );
+    assert_eq!(
+        migrated,
+        head_rows(&IndexPaths::resolve(&peer, None).expect("resolve peer v2 paths")),
+        "a forced migration must write the Go head rows of `index --force`"
+    );
+}
+
 /// W4-SW-04: a migration writes the Objective-C head rows (a class's
 /// written superclass, a property's declared type) and their marker as
 /// `index --force` does.

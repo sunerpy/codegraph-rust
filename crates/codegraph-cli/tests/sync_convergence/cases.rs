@@ -4052,6 +4052,206 @@ pub fn swift_typed_property_follows_an_inherited_declaration() -> Case {
         )
 }
 
+/// Upstream #2323 (W4-GO-01): a method a receiver's type promotes from a
+/// type it embeds follows the embedding, changed in another file of the
+/// package.
+pub fn go_embedded_method_follows_an_embedding_change_in_another_file() -> Case {
+    Case::new(Change::EditHeritage, &[Language::Go])
+        .file("go.mod", "module example.com/app\n\ngo 1.22\n")
+        .file(
+            "h/base.go",
+            "package h\n\ntype BaseAPI struct{}\n\nfunc (b *BaseAPI) SendError() {}\n\ntype OtherAPI struct{}\n\nfunc (o *OtherAPI) SendError() {}\n",
+        )
+        .file("h/server.go", "package h\n\ntype server struct {\n\tBaseAPI\n}\n")
+        .file(
+            "h/run.go",
+            "package h\n\nfunc (s *server) Run() {\n\ts.SendError()\n}\n",
+        )
+        .write("h/server.go", "package h\n\ntype server struct {\n\tOtherAPI\n}\n")
+        .edge_before("method server::Run", "calls", "method BaseAPI::SendError")
+        .edge_after("method server::Run", "calls", "method OtherAPI::SendError")
+        .no_edge_after("method server::Run", "calls", "method BaseAPI::SendError")
+}
+
+/// Upstream #1276 / #2361 (W4-GO-01): a call through a field chain follows
+/// the field's declared type, changed in another file of the package.
+pub fn go_field_chain_follows_a_field_type_change_in_another_file() -> Case {
+    Case::new(Change::EditHeritage, &[Language::Go])
+        .file("go.mod", "module example.com/app\n\ngo 1.22\n")
+        .file(
+            "store/store.go",
+            "package store\n\ntype Manager struct{}\n\nfunc (m *Manager) CreateItem(name string) error { return nil }\n\ntype Archive struct{}\n\nfunc (a *Archive) CreateItem(name string) error { return nil }\n",
+        )
+        .file(
+            "domain/service.go",
+            "package domain\n\nimport \"example.com/app/store\"\n\ntype Service struct {\n\tdb *store.Manager\n}\n",
+        )
+        .file(
+            "domain/add.go",
+            "package domain\n\nfunc (s *Service) Add(name string) error {\n\treturn s.db.CreateItem(name)\n}\n",
+        )
+        .write(
+            "domain/service.go",
+            "package domain\n\nimport \"example.com/app/store\"\n\ntype Service struct {\n\tdb *store.Archive\n}\n",
+        )
+        .edge_before("method Service::Add", "calls", "method Manager::CreateItem")
+        .edge_after("method Service::Add", "calls", "method Archive::CreateItem")
+        .no_edge_after("method Service::Add", "calls", "method Manager::CreateItem")
+}
+
+/// Upstream #2361 (W4-GO-01): a field typed through a package qualifier
+/// follows the import its file retargets under the same name (plan gate
+/// round 1).
+pub fn go_field_chain_follows_an_import_retarget_in_the_declaring_file() -> Case {
+    Case::new(Change::EditHeritage, &[Language::Go])
+        .file("go.mod", "module example.com/app\n\ngo 1.22\n")
+        .file(
+            "store1/store.go",
+            "package store1\n\ntype Manager struct{}\n\nfunc (m *Manager) CreateItem(name string) error { return nil }\n",
+        )
+        .file(
+            "store2/store.go",
+            "package store2\n\ntype Manager struct{}\n\nfunc (m *Manager) CreateItem(name string) error { return nil }\n",
+        )
+        .file(
+            "domain/service.go",
+            "package domain\n\nimport dep \"example.com/app/store1\"\n\ntype Service struct {\n\tdb *dep.Manager\n}\n",
+        )
+        .file(
+            "domain/add.go",
+            "package domain\n\nfunc (s *Service) Add(name string) error {\n\treturn s.db.CreateItem(name)\n}\n",
+        )
+        .write(
+            "domain/service.go",
+            "package domain\n\nimport dep \"example.com/app/store2\"\n\ntype Service struct {\n\tdb *dep.Manager\n}\n",
+        )
+        .edge_before(
+            "method Service::Add",
+            "calls",
+            "method Manager::CreateItem @store1/store.go",
+        )
+        .edge_after(
+            "method Service::Add",
+            "calls",
+            "method Manager::CreateItem @store2/store.go",
+        )
+        .no_edge_after(
+            "method Service::Add",
+            "calls",
+            "method Manager::CreateItem @store1/store.go",
+        )
+}
+
+/// Upstream #2361 (W4-GO-01): an embedding written through a package
+/// qualifier follows the import its file retargets under the same name.
+pub fn go_embedded_method_follows_an_import_retarget_in_the_declaring_file() -> Case {
+    Case::new(Change::EditHeritage, &[Language::Go])
+        .file("go.mod", "module example.com/app\n\ngo 1.22\n")
+        .file(
+            "base1/api.go",
+            "package base1\n\ntype API struct{}\n\nfunc (a *API) Send() {}\n",
+        )
+        .file(
+            "base2/api.go",
+            "package base2\n\ntype API struct{}\n\nfunc (a *API) Send() {}\n",
+        )
+        .file(
+            "h/server.go",
+            "package h\n\nimport base \"example.com/app/base1\"\n\ntype server struct {\n\tbase.API\n}\n",
+        )
+        .file("h/run.go", "package h\n\nfunc (s *server) Run() {\n\ts.Send()\n}\n")
+        .write(
+            "h/server.go",
+            "package h\n\nimport base \"example.com/app/base2\"\n\ntype server struct {\n\tbase.API\n}\n",
+        )
+        .edge_before("method server::Run", "calls", "method API::Send @base1/api.go")
+        .edge_after("method server::Run", "calls", "method API::Send @base2/api.go")
+        .no_edge_after("method server::Run", "calls", "method API::Send @base1/api.go")
+}
+
+/// More unresolved `….CreateItem` calls than one tail retries in a sync:
+/// CFML calls on receivers no `CreateItem` is named after, cheap to resolve.
+static UNTYPED_CREATE_ITEM_CALLS: LazyLock<String> = LazyLock::new(|| {
+    let mut text = String::from("component {\n  function noise() {\n");
+    for index in 0..501 {
+        text.push_str(&format!("    n{index}.CreateItem({index});\n"));
+    }
+    text.push_str("    return 0;\n  }\n}\n");
+    text
+});
+
+/// Upstream #1276 / #2361 (W4-GO-01): a field retyped in another file to a
+/// project type settles the parked call through it, however many parked
+/// calls share the tail.
+pub fn go_field_chain_reaches_a_retyped_field_past_the_tail_ceiling() -> Case {
+    Case::new(Change::EditHeritage, &[Language::Go, Language::Cfml])
+        .file("go.mod", "module example.com/app\n\ngo 1.22\n")
+        .file(
+            "store/store.go",
+            "package store\n\ntype Archive struct{}\n\nfunc (a *Archive) CreateItem(name string) error { return nil }\n",
+        )
+        .file(
+            "domain/service.go",
+            "package domain\n\nimport \"example.com/app/store\"\n\ntype Service struct {\n\tdb *store.Missing\n}\n",
+        )
+        .file(
+            "domain/add.go",
+            "package domain\n\nfunc (s *Service) Add(name string) error {\n\treturn s.db.CreateItem(name)\n}\n",
+        )
+        .file("noise/Noise.cfc", UNTYPED_CREATE_ITEM_CALLS.as_str())
+        .write(
+            "domain/service.go",
+            "package domain\n\nimport \"example.com/app/store\"\n\ntype Service struct {\n\tdb *store.Archive\n}\n",
+        )
+        .edge_after("method Service::Add", "calls", "method Archive::CreateItem")
+}
+
+/// Upstream #2323 (W4-GO-01): a method an unexported receiver's own package
+/// gains is what its call reaches, never another package's same-named
+/// type's.
+pub fn go_unexported_receiver_reaches_a_method_its_package_gains() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Go])
+        .file("go.mod", "module example.com/app\n\ngo 1.22\n")
+        .file(
+            "handlers/server.go",
+            "package handlers\n\ntype server struct{}\n\nfunc (s *server) Create() {\n\ts.Close()\n}\n",
+        )
+        .file(
+            "admin/server.go",
+            "package admin\n\ntype server struct{}\n\nfunc (s *server) Close() {}\n",
+        )
+        .write(
+            "handlers/close.go",
+            "package handlers\n\nfunc (s *server) Close() {}\n",
+        )
+        .edge_after(
+            "method server::Create",
+            "calls",
+            "method server::Close @handlers/close.go",
+        )
+        .no_edge_after(
+            "method server::Create",
+            "calls",
+            "method server::Close @admin/server.go",
+        )
+}
+
+/// Upstream #2322 (W4-GO-01): a type a reference names through a package
+/// lands on that package's type once it appears, never on a same-named
+/// method beside the reference.
+pub fn go_qualified_type_reference_reaches_a_package_type_that_appears() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Go])
+        .file("go.mod", "module example.com/app\n\ngo 1.22\n")
+        .file(
+            "impl/context.go",
+            "package impl\n\nimport \"example.com/app/job\"\n\ntype Context struct{}\n\nfunc (c *Context) OPCommand() (job.OPCommand, bool) {\n\treturn \"\", false\n}\n",
+        )
+        .file("job/doc.go", "package job\n")
+        .write("job/op.go", "package job\n\ntype OPCommand string\n")
+        .edge_after("method Context::OPCommand", "references", "type_alias OPCommand")
+        .no_edge_after("method Context::OPCommand", "references", "method Context::OPCommand")
+}
+
 /// Upstream #2150 (W4-SW-04): a message to `self` reaches the sender's
 /// hierarchy, so it follows a middle class's superclass changed in another
 /// file.

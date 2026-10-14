@@ -10819,3 +10819,298 @@ mod objc {
         );
     }
 }
+
+mod go {
+    use super::support::{Graph, Project};
+
+    /// `file::qualifiedName` of every `kind` target of the symbol `name` in
+    /// `file`, sorted (upstream's `targets` / `callTargets`).
+    fn targets(graph: &Graph, file: &str, name: &str, kind: &str) -> Vec<String> {
+        let source = graph
+            .nodes
+            .iter()
+            .find(|n| n.file_path == file && n.name == name)
+            .unwrap_or_else(|| panic!("{name} in {file}\n{}", graph.report()));
+        let mut out: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|e| e.kind == kind && e.source == source.id)
+            .filter_map(|e| graph.node(&e.target))
+            .map(|n| format!("{}::{}", n.file_path, n.qualified_name))
+            .collect();
+        out.sort();
+        out
+    }
+
+    const STORE: &str = "package store\n\ntype Manager struct{}\n\nfunc New() *Manager { return &Manager{} }\n\nfunc (m *Manager) CreateItem(name string) error { return nil }\n";
+    const CLOCK: &str = "package clock\n\nfunc Now() int { return 0 }\n";
+
+    fn service(module: &str) -> String {
+        format!(
+            "package domain\n\nimport (\n\t\"{module}/internal/store\"\n\t\"{module}/pkg/clock\"\n)\n\ntype Service struct {{\n\tdb *store.Manager\n}}\n\nfunc NewService() *Service {{\n\treturn &Service{{db: store.New()}}\n}}\n\nfunc (s *Service) AddItem(name string) error {{\n\treturn s.db.CreateItem(name)\n}}\n\nfunc Stamp() int {{\n\treturn clock.Now()\n}}\n"
+        )
+    }
+
+    /// Upstream #2323 (via #2361): a call through a method receiver of an
+    /// unexported type, through a field of one, and through a type it
+    /// embeds, all within the receiver's own package; another package's
+    /// same-named types are never targets. Upstream's fixture.
+    #[test]
+    fn pr2361_calls_through_an_unexported_receiver_stay_in_its_package() {
+        let project = Project::new()
+            .file("go.mod", "module example.com/app\n\ngo 1.22\n")
+            .file(
+                "internal/domain/service.go",
+                "package domain\n\ntype Service struct{}\n\nfunc (s *Service) AddItem(name string) error { return nil }\n\nfunc (s *Service) Count() int { return 0 }\n",
+            )
+            .file(
+                "internal/handlers/server.go",
+                "package handlers\n\nimport \"example.com/app/internal/domain\"\n\ntype server struct {\n\tBaseAPI\n\tservice *domain.Service\n\tstore   *store\n}\n\nfunc (s *server) Create(name string) error {\n\ts.store.Put(name)\n\ts.Close()\n\ts.SendError()\n\treturn s.service.AddItem(name)\n}\n\ntype cache[T any] struct {\n\tservice *domain.Service\n}\n\nfunc (c *cache[T]) Size() int {\n\treturn c.service.Count()\n}\n",
+            )
+            .file(
+                "internal/handlers/store.go",
+                "package handlers\n\ntype store struct{}\n\nfunc (st *store) Put(name string) {}\n\nfunc (s *server) Close() {}\n",
+            )
+            .file(
+                "internal/handlers/base.go",
+                "package handlers\n\ntype BaseAPI struct{}\n\nfunc (b *BaseAPI) SendError() {}\n",
+            )
+            .file(
+                "internal/admin/server.go",
+                "package admin\n\ntype server struct {\n\tBaseAPI\n\tstore *store\n}\n\ntype store struct{}\n\nfunc (st *store) Put(name string) {}\n\nfunc (s *server) Close() {}\n\ntype BaseAPI struct{}\n\nfunc (b *BaseAPI) SendError() {}\n",
+            )
+            .index();
+        let graph = project.graph();
+        let report = graph.report();
+        assert_eq!(
+            targets(graph, "internal/handlers/server.go", "Create", "calls"),
+            [
+                "internal/domain/service.go::Service::AddItem",
+                "internal/handlers/base.go::BaseAPI::SendError",
+                "internal/handlers/store.go::server::Close",
+                "internal/handlers/store.go::store::Put",
+            ],
+            "{report}"
+        );
+        assert_eq!(
+            targets(graph, "internal/handlers/server.go", "Size", "calls"),
+            ["internal/domain/service.go::Service::Count"],
+            "{report}"
+        );
+        let admin: Vec<&str> = graph
+            .nodes
+            .iter()
+            .filter(|n| n.file_path == "internal/admin/server.go" && n.kind == "method")
+            .map(|n| n.id.as_str())
+            .collect();
+        assert!(
+            !graph
+                .edges
+                .iter()
+                .any(|e| e.kind == "calls" && admin.contains(&e.target.as_str())),
+            "{report}"
+        );
+    }
+
+    /// Upstream #2322 (via #2361): a module in a subdirectory resolves its
+    /// package-qualified calls, and a call through a struct field typed with
+    /// one of its packages. Upstream's fixture.
+    #[test]
+    fn pr2361_a_go_module_in_a_subdirectory() {
+        let project = Project::new()
+            .file("svc/go.mod", "module example.com/app/svc\n\ngo 1.22\n")
+            .file("svc/internal/store/store.go", STORE)
+            .file("svc/pkg/clock/clock.go", CLOCK)
+            .file(
+                "svc/internal/domain/service.go",
+                &service("example.com/app/svc"),
+            )
+            .file("web/package.json", "{ \"name\": \"web\" }\n")
+            .index();
+        let graph = project.graph();
+        let file = "svc/internal/domain/service.go";
+        assert_eq!(
+            targets(graph, file, "NewService", "calls"),
+            ["svc/internal/store/store.go::New"]
+        );
+        assert_eq!(
+            targets(graph, file, "Stamp", "calls"),
+            ["svc/pkg/clock/clock.go::Now"]
+        );
+        assert_eq!(
+            targets(graph, file, "AddItem", "calls"),
+            ["svc/internal/store/store.go::Manager::CreateItem"]
+        );
+    }
+
+    /// Upstream #2322: modules side by side, etcd's shape. Upstream's
+    /// fixture.
+    #[test]
+    fn pr2361_go_modules_side_by_side() {
+        let project = Project::new()
+            .file("go.mod", "module example.com/etcd/v3\n\ngo 1.22\n")
+            .file(
+                "etcdutl/main.go",
+                "package main\n\nimport \"example.com/etcd/server/v3/storage/wal\"\n\nfunc main() {\n\twal.OpenForRead(\"dir\")\n}\n",
+            )
+            .file("server/go.mod", "module example.com/etcd/server/v3\n\ngo 1.22\n")
+            .file(
+                "server/storage/wal/wal.go",
+                "package wal\n\nfunc OpenForRead(dir string) error { return nil }\n",
+            )
+            .file("server/api/api.go", "package api\n\nfunc Start() int { return 1 }\n")
+            .file(
+                "server/cmd/main.go",
+                "package main\n\nimport (\n\t\"example.com/etcd/server/v3/api\"\n\t\"example.com/tools/lint\"\n)\n\ntype App struct {\n\tlinter *lint.Linter\n}\n\nfunc main() {\n\tapi.Start()\n\tlint.Run()\n}\n\nfunc (a *App) check() {\n\ta.linter.Check()\n}\n",
+            )
+            .file(
+                "server/cmd/ext.go",
+                "package main\n\nimport (\n\t\"example.com/toolsx/api\"\n)\n\nfunc external() {\n\tapi.Start()\n}\n",
+            )
+            .file("tools/go.mod", "module example.com/tools\n\ngo 1.22\n")
+            .file("tools/api/api.go", "package api\n\nfunc Start() int { return 2 }\n")
+            .file(
+                "tools/lint/lint.go",
+                "package lint\n\ntype Linter struct{}\n\nfunc Run() {}\n\nfunc (l *Linter) Check() {}\n",
+            )
+            .file(
+                "tools/gen/gen.go",
+                "package main\n\nimport \"example.com/tools/api\"\n\nfunc generate() {\n\tapi.Start()\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        assert_eq!(
+            targets(graph, "etcdutl/main.go", "main", "calls"),
+            ["server/storage/wal/wal.go::OpenForRead"]
+        );
+        assert_eq!(
+            targets(graph, "tools/gen/gen.go", "generate", "calls"),
+            ["tools/api/api.go::Start"]
+        );
+        assert_eq!(
+            targets(graph, "server/cmd/main.go", "main", "calls"),
+            ["server/api/api.go::Start", "tools/lint/lint.go::Run"]
+        );
+        assert_eq!(
+            targets(graph, "server/cmd/main.go", "check", "calls"),
+            ["tools/lint/lint.go::Linter::Check"]
+        );
+        assert!(targets(graph, "server/cmd/ext.go", "external", "calls").is_empty());
+    }
+
+    /// Upstream #2322: a name written through a package of a nested module
+    /// is that package's; a module under testdata never answers for the
+    /// module it imitates. Upstream's fixture.
+    #[test]
+    fn pr2361_names_written_through_a_package_of_a_nested_module() {
+        let project = Project::new()
+            .file("src/go.mod", "module example.com/harbor/src\n\ngo 1.22\n")
+            .file("src/jobservice/job/op.go", "package job\n\ntype OPCommand string\n")
+            .file(
+                "src/jobservice/impl/context.go",
+                "package impl\n\nimport \"example.com/harbor/src/jobservice/job\"\n\ntype Context struct{}\n\nfunc (c *Context) OPCommand() (job.OPCommand, bool) {\n\treturn \"\", false\n}\n",
+            )
+            .file(
+                "src/pkg/artifact/manager.go",
+                "package artifact\n\ntype Manager interface {\n\tCount() int64\n}\n",
+            )
+            .file(
+                "src/pkg/cached/redis/manager.go",
+                "package redis\n\nimport \"example.com/harbor/src/pkg/artifact\"\n\ntype Manager struct {\n\tdelegator artifact.Manager\n}\n\nfunc (m *Manager) Count() int64 {\n\treturn m.delegator.Count()\n}\n",
+            )
+            .file(
+                "internal/testdata/stub/go.mod",
+                "module example.com/harbor/src\n\ngo 1.22\n",
+            )
+            .file(
+                "internal/testdata/stub/pkg/artifact/manager.go",
+                "package artifact\n\ntype Manager interface {\n\tCount() int64\n}\n",
+            )
+            .file("tools/go.mod", "module example.com/harbor/tools\n\ngo 1.22\n")
+            .file(
+                "tools/report/report.go",
+                "package report\n\nimport \"example.com/harbor/src/pkg/artifact\"\n\ntype Reporter struct {\n\tmgr artifact.Manager\n}\n\nfunc (r *Reporter) Total() int64 {\n\treturn r.mgr.Count()\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        assert_eq!(
+            targets(
+                graph,
+                "src/jobservice/impl/context.go",
+                "OPCommand",
+                "references"
+            ),
+            ["src/jobservice/job/op.go::OPCommand"]
+        );
+        assert_eq!(
+            targets(graph, "src/pkg/cached/redis/manager.go", "Count", "calls"),
+            ["src/pkg/artifact/manager.go::Manager::Count"]
+        );
+        assert_eq!(
+            targets(graph, "tools/report/report.go", "Total", "calls"),
+            ["src/pkg/artifact/manager.go::Manager::Count"]
+        );
+    }
+
+    /// Upstream #2322: two copies declaring one module path resolve each
+    /// one's imports into its own copy. Upstream's fixture.
+    #[test]
+    fn pr2361_two_go_modules_declaring_the_same_path() {
+        let mut project = Project::new();
+        for copy in ["v1", "v2"] {
+            project = project
+                .file(
+                    &format!("{copy}/go.mod"),
+                    "module example.com/app/svc\n\ngo 1.22\n",
+                )
+                .file(&format!("{copy}/internal/store/store.go"), STORE)
+                .file(&format!("{copy}/pkg/clock/clock.go"), CLOCK)
+                .file(
+                    &format!("{copy}/internal/domain/service.go"),
+                    &service("example.com/app/svc"),
+                );
+        }
+        let project = project.index();
+        let graph = project.graph();
+        for copy in ["v1", "v2"] {
+            let file = format!("{copy}/internal/domain/service.go");
+            assert_eq!(
+                targets(graph, &file, "NewService", "calls"),
+                [format!("{copy}/internal/store/store.go::New")]
+            );
+            assert_eq!(
+                targets(graph, &file, "Stamp", "calls"),
+                [format!("{copy}/pkg/clock/clock.go::Now")]
+            );
+        }
+    }
+
+    /// Upstream #2322: a root-level go.mod resolves as before, the field
+    /// chain included. Upstream's fixture.
+    #[test]
+    fn pr2361_a_go_module_at_the_project_root() {
+        let project = Project::new()
+            .file("go.mod", "module example.com/app/svc\n\ngo 1.22\n")
+            .file("internal/store/store.go", STORE)
+            .file("pkg/clock/clock.go", CLOCK)
+            .file(
+                "internal/domain/service.go",
+                &service("example.com/app/svc"),
+            )
+            .index();
+        let graph = project.graph();
+        let file = "internal/domain/service.go";
+        assert_eq!(
+            targets(graph, file, "NewService", "calls"),
+            ["internal/store/store.go::New"]
+        );
+        assert_eq!(
+            targets(graph, file, "Stamp", "calls"),
+            ["pkg/clock/clock.go::Now"]
+        );
+        assert_eq!(
+            targets(graph, file, "AddItem", "calls"),
+            ["internal/store/store.go::Manager::CreateItem"]
+        );
+    }
+}

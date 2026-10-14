@@ -588,6 +588,11 @@ pub trait ResolutionContext {
     fn objc_tables(&self) -> Arc<crate::objc_scope::ObjcTables> {
         Arc::new(crate::objc_scope::ObjcTables::new())
     }
+
+    /// The Go package memos of one resolution pass (W4-GO-01).
+    fn go_tables(&self) -> Arc<crate::go_packages::GoTables> {
+        Arc::new(crate::go_packages::GoTables::new())
+    }
 }
 
 /// Go module info parsed from `go.mod`.

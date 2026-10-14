@@ -2889,6 +2889,26 @@ pub(crate) fn resolve_method_on_type(
         })
         .collect();
 
+    // Go: only the declaring package's methods count, then what its
+    // declaration embeds; `preferred_fqn` is that package's directory
+    // (upstream #2323).
+    if reference.language == Language::Go
+        && let Some(pkg_dir) = preferred_fqn
+        && let Some(scoped) = crate::go_packages::resolve_go_method_in_package(
+            type_name,
+            method_name,
+            pkg_dir,
+            &matches,
+            reference,
+            context,
+            confidence,
+            resolved_by,
+            depth,
+        )
+    {
+        return scoped;
+    }
+
     if matches.is_empty() {
         // Conformance fallback via supertypes (name-matcher.ts:289-305).
         if depth < 4 {
@@ -2910,7 +2930,7 @@ pub(crate) fn resolve_method_on_type(
         return None;
     }
 
-    if matches.len() > 1 {
+    if matches.len() > 1 && reference.language != Language::Go {
         if let Some(fqn) = preferred_fqn {
             let ext = if reference.language == Language::Kotlin {
                 ".kt"
@@ -3877,6 +3897,13 @@ fn local_receiver_type_patterns_tagged(language: Language, r: &str) -> Vec<(Rege
         Language::Go => vec![
             format!(r"\b{r}\b\s*:=\s*&?([A-Za-z_][\w.]*)\s*\{{"),
             format!(r"\bvar\s+{r}\s+\*?([A-Za-z_][\w.]*)"),
+            // A method receiver or parameter of an unexported type — `func (s
+            // *server)`, `func (c *cache[T])`, `func handle(h *handler)`, a
+            // line of a multi-line parameter list or `var (…)` block: a
+            // lowercase type only where a parameter list puts it, after `(`,
+            // `,` or nothing and before `,`, `)` or the line's end (upstream
+            // #2323).
+            format!(r"(?:^|[(,])\s*{r}\s+\*?([a-z_]\w*)\s*(?:\[[^\]]*\])?\s*(?:[,)]|$)"),
             format!(r"\b{r}\s+\*?([A-Z][\w.]*)"),
         ],
         Language::Ruby => vec![format!(r"\b{r}\b\s*=\s*([A-Z][\w:]*)\.new\b")],
@@ -3949,6 +3976,7 @@ pub(crate) fn enclosing_scope_start_line(
 /// languages without patterns or when no declaration is found. Bounded to the
 /// enclosing scope. The caller validates the method via `resolve_method_on_type`,
 /// so a mis-inference produces no edge.
+#[cfg(test)]
 pub(crate) fn infer_local_receiver_type(
     receiver_name: &str,
     reference: &RefView,
@@ -4753,6 +4781,24 @@ pub fn match_method_call(
     let parsed = parse_method_call(&reference.reference_name, reference.language)?;
     let (object_or_class, method_name) = parsed;
 
+    // A Go call through a two-hop field chain, `s.db.CreateItem()`, recorded
+    // by its last receiver segment (`db.CreateItem`, KEEP-RUST #1496): it
+    // resolves through the field's declared type, or not at all (upstream
+    // #1276, #2361).
+    if let Some((base, field)) =
+        crate::go_packages::go_call_chain(reference, &object_or_class, &method_name, context)
+    {
+        return crate::go_packages::go_field_chain_call(
+            &base,
+            &field,
+            &method_name,
+            reference,
+            context,
+            0.85,
+            ResolvedBy::InstanceMethod,
+        );
+    }
+
     // Rust call through one field of the enclosing type — emitted as
     // `self.<field>.<method>`. This branch is exclusive: a missing, external,
     // generic, container, or ambiguous field type must stay unresolved rather
@@ -4816,8 +4862,10 @@ pub fn match_method_call(
     if is_inferable_receiver_call(&reference.reference_name, reference.language) {
         let mut cpp_declaration = CppReceiverDeclaration::default();
         // A CFML type as its declaration writes it: the component path tells
-        // same-named components apart (W4-CF-02).
+        // same-named components apart (W4-CF-02); a Go one, the package
+        // declaring it (W4-GO-01).
         let mut cfml_written: Option<String> = None;
+        let mut go_written: Option<String> = None;
         let mut inferred = if reference.language == Language::Cpp {
             infer_cpp_receiver_type(
                 &object_or_class,
@@ -4833,6 +4881,8 @@ pub fn match_method_call(
                 .map(|(name, written)| {
                     if reference.language == Language::Cfml {
                         cfml_written = Some(written);
+                    } else if reference.language == Language::Go {
+                        go_written = Some(written);
                     }
                     name
                 })
@@ -4932,9 +4982,16 @@ pub fn match_method_call(
                 return None;
             }
             // Java/Kotlin: the file's import pins WHICH same-named class (#314);
-            // other languages disambiguate by call-site file in resolve_method_on_type.
+            // Go: the package declaring the type (#2323); other languages
+            // disambiguate by call-site file in resolve_method_on_type.
             let imported_fqn = if matches!(reference.language, Language::Java | Language::Kotlin) {
                 imported_fqn_of(&inferred, reference, context)
+            } else if reference.language == Language::Go {
+                crate::go_packages::go_declared_type_package(
+                    go_written.as_deref(),
+                    &reference.file_path,
+                    context,
+                )
             } else {
                 None
             };

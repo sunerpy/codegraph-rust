@@ -71,6 +71,7 @@ struct Caches {
     cfml_tables: Option<Arc<crate::cfml_scope::CfmlTables>>,
     swift_tables: Option<Arc<crate::swift_type_visibility::SwiftTables>>,
     objc_tables: Option<Arc<crate::objc_scope::ObjcTables>>,
+    go_tables: Option<Arc<crate::go_packages::GoTables>>,
 }
 
 /// Bound on memoized existence answers; the memo restarts past it, as upstream.
@@ -108,6 +109,7 @@ impl Caches {
             cfml_tables: None,
             swift_tables: None,
             objc_tables: None,
+            go_tables: None,
         }
     }
 }
@@ -156,6 +158,7 @@ impl<'a> StoreResolutionContext<'a> {
         c.cfml_tables = None;
         c.swift_tables = None;
         c.objc_tables = None;
+        c.go_tables = None;
     }
 
     fn cached_all_files(&self) -> Arc<Vec<String>> {
@@ -573,6 +576,15 @@ impl ResolutionContext for StoreResolutionContext<'_> {
                 .borrow_mut()
                 .objc_tables
                 .get_or_insert_with(|| Arc::new(crate::objc_scope::ObjcTables::new())),
+        )
+    }
+
+    fn go_tables(&self) -> Arc<crate::go_packages::GoTables> {
+        Arc::clone(
+            self.caches
+                .borrow_mut()
+                .go_tables
+                .get_or_insert_with(|| Arc::new(crate::go_packages::GoTables::new())),
         )
     }
 

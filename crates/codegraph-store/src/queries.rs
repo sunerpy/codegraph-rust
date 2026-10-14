@@ -259,6 +259,25 @@ impl Store {
         )
     }
 
+    /// The nodes whose qualified name starts with `prefix` (`server::` for
+    /// the members of `server`), read as an index range so the
+    /// `qualified_name` index serves it.
+    pub fn nodes_with_qualified_prefix(&self, prefix: &str) -> rusqlite::Result<Vec<Node>> {
+        let mut upper = prefix.to_string();
+        match upper.pop() {
+            Some(last) => match char::from_u32(u32::from(last) + 1) {
+                Some(next) => upper.push(next),
+                None => return Ok(Vec::new()),
+            },
+            None => return Ok(Vec::new()),
+        }
+        query_nodes(
+            &self.conn,
+            "SELECT * FROM nodes WHERE qualified_name >= ?1 AND qualified_name < ?2 ORDER BY id",
+            [prefix, upper.as_str()],
+        )
+    }
+
     /// Ports `getNodesByIds` from `upstream db/queries.ts:453-488`.
     /// Batch node lookup keyed by id, chunked under SQLite's parameter limit
     /// (`SELECT * FROM nodes WHERE id IN (...)`), returned as an id -> node map.
