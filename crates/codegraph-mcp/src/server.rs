@@ -228,7 +228,7 @@ impl McpServer {
             .or_else(|| use_cwd_for_discovery.then(|| cwd.clone()).flatten());
         let mut root_discovery = ServerRootDiscovery::new(search_from);
         let mut resolved_default = default_project;
-        if let Some(resolution) = root_discovery.initial_resolution() {
+        if let Some(resolution) = root_discovery.startup_resolution() {
             if let Some(root) = resolution.root {
                 if resolution.via_subproject_scan {
                     let relative = root
@@ -285,6 +285,9 @@ impl McpServer {
             return None;
         }
         let resolution = self.root_discovery.retry_resolution()?;
+        if let Some(notice) = self.root_discovery.scan_notice(&resolution) {
+            eprintln!("{notice}");
+        }
         let root = resolution.root?;
         let relative = root
             .strip_prefix(&resolution.search_from)
@@ -550,6 +553,7 @@ impl McpServer {
                     raw_project,
                     self.root_discovery.search_from(),
                     self.root_discovery.known_candidates(),
+                    self.root_discovery.scan_truncated(),
                 );
                 let result = if raw_project.is_some() {
                     ToolResult::error(message)
@@ -817,10 +821,15 @@ mod tests {
         let workspace = workspace("single-child");
         let child = indexed_child(&workspace, "service-a");
 
-        let server = McpServer::new_with_cwd(
+        let mut server = McpServer::new_with_cwd(
             Some(workspace.path().to_path_buf()),
             Some(workspace.path().to_path_buf()),
         );
+        // Construction, which precedes the `initialize` answer, walks upward
+        // only; the downward scan runs on the first retry, which `tools/list`
+        // and every tool call make.
+        assert_eq!(server.default_project(), Some(workspace.path()));
+        server.retry_default_project();
 
         assert_eq!(server.default_project(), Some(child.as_path()));
     }
@@ -830,10 +839,11 @@ mod tests {
         let workspace = workspace("ambiguous");
         let a = indexed_child(&workspace, "service-a");
         let b = indexed_child(&workspace, "service-b");
-        let server = McpServer::new_with_cwd(
+        let mut server = McpServer::new_with_cwd(
             Some(workspace.path().to_path_buf()),
             Some(workspace.path().to_path_buf()),
         );
+        server.retry_default_project();
 
         assert_eq!(server.default_project(), Some(workspace.path()));
         assert_eq!(

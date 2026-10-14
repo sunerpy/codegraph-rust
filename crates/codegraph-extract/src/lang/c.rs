@@ -59,6 +59,10 @@ impl LanguageSpec for CSpec {
     }
     fn resolve_name(&self, node: Node<'_>, source: &str) -> Option<String> {
         crate::lang::cpp::recover_single_arg_macro_defined_name(node, source)
+            .or_else(|| unnamed_type_variable_name(node, source))
+    }
+    fn declaration_wrapper<'tree>(&self, node: Node<'tree>) -> Option<Node<'tree>> {
+        defining_declaration(node)
     }
     fn name_field(&self) -> &'static str {
         "declarator"
@@ -94,12 +98,19 @@ impl LanguageSpec for CSpec {
     }
     fn pre_parse(&self, source: &str, _file_path: &str) -> String {
         let blanked = blank_c_designated_macro_args(source);
+        // Upstream's deferral round 2 (#1353), in its order.
+        let blanked = crate::lang::c_preparse::blank_c_round_two(&blanked);
         let blanked = blank_c_leading_attr_macros(&blanked);
-        if crate::lang::cpp::looks_like_cuda_source(&blanked) {
+        let blanked = if crate::lang::cpp::looks_like_cuda_source(&blanked) {
             crate::lang::cpp::blank_cuda_constructs_str(&blanked)
         } else {
             blanked
-        }
+        };
+        // Every directive line as written (upstream #1346), then the one pass
+        // that edits a `#define` on purpose.
+        crate::lang::c_preparse::blank_c_named_variadic_define_dots(
+            &crate::lang::cpp_preparse::restore_directive_lines(source, &blanked),
+        )
     }
 }
 
@@ -225,7 +236,7 @@ fn blank_c_designated_macro_args(source: &str) -> String {
 /// Blanking replaces the macro with equal-length ASCII spaces, so every byte
 /// offset — and therefore every line/column and every node ID — is preserved,
 /// exactly like the C++ blanks in `lang/cpp.rs`.
-fn blank_c_leading_attr_macros(source: &str) -> String {
+pub(crate) fn blank_c_leading_attr_macros(source: &str) -> String {
     let attr_macros = attribute_like_defines(source);
     if attr_macros.is_empty() {
         return source.to_string();
@@ -408,6 +419,67 @@ fn valid_ident(text: &str) -> bool {
         .next()
         .is_some_and(|c| c == '_' || c.is_ascii_alphabetic())
         && chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
+}
+
+/// Whether a C/C++ type specifier defines a class, struct, union or enum,
+/// as opposed to naming one (`struct Foo *p`, the forward declaration
+/// `class Foo;`): upstream `isClassLikeDefinition`.
+pub(crate) fn is_class_like_definition(node: Node<'_>) -> bool {
+    matches!(
+        node.kind(),
+        "class_specifier" | "struct_specifier" | "union_specifier" | "enum_specifier"
+    ) && child_by_field(node, "body").is_some()
+}
+
+/// The `declaration` a class, struct, union or enum is defined in the type of
+/// (`struct Foo { … } foo;`), or `None` for one written on its own, in a
+/// typedef or in a member's type (upstream #2446 `definingDeclaration`).
+pub(crate) fn defining_declaration(node: Node<'_>) -> Option<Node<'_>> {
+    if !is_class_like_definition(node) {
+        return None;
+    }
+    let parent = node.parent()?;
+    (parent.kind() == "declaration"
+        && child_by_field(parent, "type").map(|t| t.id()) == Some(node.id()))
+    .then_some(parent)
+}
+
+/// The name of an unnamed class, struct, union or enum a declaration
+/// defines: the first variable the declaration declares (upstream #2446
+/// `unnamedTypeVariableName`). No code can name the type of `static struct {
+/// … } SPT;`, only `SPT`, so the struct is `SPT`, as `typedef struct { … }
+/// Name;` is `Name`. `None` for a named type, and when the declaration
+/// declares no variable (a function's return type).
+pub(crate) fn unnamed_type_variable_name(node: Node<'_>, source: &str) -> Option<String> {
+    if child_by_field(node, "name").is_some() {
+        return None;
+    }
+    let declaration = defining_declaration(node)?;
+    let mut cursor = declaration.walk();
+    declaration
+        .children_by_field_name("declarator", &mut cursor)
+        .find_map(|declarator| c_declarator_identifier(Some(declarator)))
+        .map(|identifier| node_text(identifier, source))
+}
+
+/// The identifier a C declarator declares (upstream `cDeclaratorIdentifier`):
+/// through `init_declarator`, `pointer_declarator`, `array_declarator` and
+/// `parenthesized_declarator`, each by its `declarator` field. A
+/// `function_declarator` is a prototype or a function pointer, never a value.
+pub(crate) fn c_declarator_identifier(node: Option<Node<'_>>) -> Option<Node<'_>> {
+    let mut current = node;
+    for _ in 0..12 {
+        let node = current?;
+        match node.kind() {
+            "identifier" => return Some(node),
+            "init_declarator"
+            | "pointer_declarator"
+            | "array_declarator"
+            | "parenthesized_declarator" => current = child_by_field(node, "declarator"),
+            _ => return None,
+        }
+    }
+    None
 }
 
 #[cfg(test)]

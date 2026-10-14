@@ -7,6 +7,7 @@
 //! per-resolver LRU caches the upstream uses (`index.ts:217-250`). Resolution is sync.
 
 use crate::lru_cache::LruCache;
+use crate::package_manifests::{ManifestScope, read_manifest_scope};
 use crate::path_aliases::{AliasMap, load_project_aliases};
 use crate::source_facts::SourceFacts;
 use crate::types::{GoModule, ImportMapping, ReExport, ResolutionContext};
@@ -48,13 +49,30 @@ struct Caches {
     project_aliases: Option<Option<AliasMap>>,
     go_module: Option<Option<GoModule>>,
     go_modules: Option<Vec<GoModule>>,
+    rust_crates: Option<Arc<crate::rust_scope::RustCrates>>,
     workspace_packages: Option<Option<WorkspacePackages>>,
+    /// Each directory's package.json / Deno import-map scope for the pass.
+    manifest_scopes: HashMap<String, Arc<ManifestScope>>,
     all_files: Option<Arc<Vec<String>>>,
     files_by_basename: Option<HashMap<String, Arc<Vec<String>>>>,
     /// Existence answers for the pass: import resolution probes every extension
     /// of a specifier from every importing file, and neither the borrowed store
     /// nor the tree changes within a pass (upstream `fileExistsMemo`).
     file_exists: HashMap<String, bool>,
+    /// The Python write index for the pass (upstream #2332).
+    python_write_index: Option<Arc<crate::python_globals::PythonWriteIndex>>,
+    /// The C/C++ namespace tables for the pass (upstream #2176).
+    cpp_namespace_tables: Option<Arc<crate::cpp_namespaces::CppNamespaceTables>>,
+    /// The Kotlin tables for the pass (upstream #2172).
+    kotlin_tables: Option<Arc<crate::kotlin_scope::KotlinTables>>,
+    scala_tables: Option<Arc<crate::scala_scope::ScalaTables>>,
+    csharp_tables: Option<Arc<crate::csharp_types::CsharpTables>>,
+    member_tables: Option<Arc<crate::member_types::MemberTables>>,
+    ruby_tables: Option<Arc<crate::ruby_scope::RubyTables>>,
+    cfml_tables: Option<Arc<crate::cfml_scope::CfmlTables>>,
+    swift_tables: Option<Arc<crate::swift_type_visibility::SwiftTables>>,
+    objc_tables: Option<Arc<crate::objc_scope::ObjcTables>>,
+    go_tables: Option<Arc<crate::go_packages::GoTables>>,
 }
 
 /// Bound on memoized existence answers; the memo restarts past it, as upstream.
@@ -77,10 +95,23 @@ impl Caches {
             project_aliases: None,
             go_module: None,
             go_modules: None,
+            rust_crates: None,
             workspace_packages: None,
+            manifest_scopes: HashMap::new(),
             all_files: None,
             files_by_basename: None,
             file_exists: HashMap::new(),
+            python_write_index: None,
+            cpp_namespace_tables: None,
+            kotlin_tables: None,
+            scala_tables: None,
+            csharp_tables: None,
+            member_tables: None,
+            ruby_tables: None,
+            cfml_tables: None,
+            swift_tables: None,
+            objc_tables: None,
+            go_tables: None,
         }
     }
 }
@@ -119,6 +150,17 @@ impl<'a> StoreResolutionContext<'a> {
         c.all_files = None;
         c.files_by_basename = None;
         c.file_exists.clear();
+        c.python_write_index = None;
+        c.cpp_namespace_tables = None;
+        c.kotlin_tables = None;
+        c.scala_tables = None;
+        c.csharp_tables = None;
+        c.member_tables = None;
+        c.ruby_tables = None;
+        c.cfml_tables = None;
+        c.swift_tables = None;
+        c.objc_tables = None;
+        c.go_tables = None;
     }
 
     fn cached_all_files(&self) -> Arc<Vec<String>> {
@@ -273,6 +315,15 @@ impl ResolutionContext for StoreResolutionContext<'_> {
         exists
     }
 
+    fn is_indexed_file(&self, file_path: &str) -> bool {
+        let normalized = file_path.replace('\\', "/");
+        self.store
+            .file_by_path(&normalized)
+            .ok()
+            .flatten()
+            .is_some()
+    }
+
     fn read_file(&self, file_path: &str) -> Option<String> {
         self.read_file_shared(file_path)
             .map(|content| content.to_string())
@@ -376,6 +427,17 @@ impl ResolutionContext for StoreResolutionContext<'_> {
         }
         let mut supertypes: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         for tn in &type_nodes {
+            // A Swift conformance to a type the project only extends
+            // (SwiftUI's `View`) resolves to nothing, an extension being no
+            // type, yet the members its extensions add are still the
+            // conformer's (upstream #2107).
+            if language == Language::Swift {
+                for name in crate::swift_type_visibility::extended_conformances(tn, self).iter() {
+                    if name != type_name {
+                        supertypes.insert(name.clone());
+                    }
+                }
+            }
             for edge_kind in [EdgeKind::Implements, EdgeKind::Extends] {
                 let edges = self
                     .store
@@ -429,6 +491,119 @@ impl ResolutionContext for StoreResolutionContext<'_> {
         c.workspace_packages.clone().flatten()
     }
 
+    fn python_write_index(&self) -> Arc<crate::python_globals::PythonWriteIndex> {
+        if let Some(index) = self.caches.borrow().python_write_index.clone() {
+            return index;
+        }
+        let index = Arc::new(crate::python_globals::PythonWriteIndex::build(self));
+        self.caches.borrow_mut().python_write_index = Some(Arc::clone(&index));
+        index
+    }
+
+    fn cpp_namespace_tables(&self) -> Arc<crate::cpp_namespaces::CppNamespaceTables> {
+        Arc::clone(
+            self.caches
+                .borrow_mut()
+                .cpp_namespace_tables
+                .get_or_insert_with(|| Arc::new(crate::cpp_namespaces::CppNamespaceTables::new())),
+        )
+    }
+
+    fn kotlin_tables(&self) -> Arc<crate::kotlin_scope::KotlinTables> {
+        Arc::clone(
+            self.caches
+                .borrow_mut()
+                .kotlin_tables
+                .get_or_insert_with(|| Arc::new(crate::kotlin_scope::KotlinTables::new())),
+        )
+    }
+
+    fn scala_tables(&self) -> Arc<crate::scala_scope::ScalaTables> {
+        Arc::clone(
+            self.caches
+                .borrow_mut()
+                .scala_tables
+                .get_or_insert_with(|| Arc::new(crate::scala_scope::ScalaTables::new())),
+        )
+    }
+
+    fn csharp_tables(&self) -> Arc<crate::csharp_types::CsharpTables> {
+        Arc::clone(
+            self.caches
+                .borrow_mut()
+                .csharp_tables
+                .get_or_insert_with(|| Arc::new(crate::csharp_types::CsharpTables::new())),
+        )
+    }
+
+    fn member_tables(&self) -> Arc<crate::member_types::MemberTables> {
+        Arc::clone(
+            self.caches
+                .borrow_mut()
+                .member_tables
+                .get_or_insert_with(|| Arc::new(crate::member_types::MemberTables::new())),
+        )
+    }
+
+    fn ruby_tables(&self) -> Arc<crate::ruby_scope::RubyTables> {
+        Arc::clone(
+            self.caches
+                .borrow_mut()
+                .ruby_tables
+                .get_or_insert_with(|| Arc::new(crate::ruby_scope::RubyTables::new())),
+        )
+    }
+
+    fn cfml_tables(&self) -> Arc<crate::cfml_scope::CfmlTables> {
+        Arc::clone(
+            self.caches
+                .borrow_mut()
+                .cfml_tables
+                .get_or_insert_with(|| Arc::new(crate::cfml_scope::CfmlTables::new())),
+        )
+    }
+
+    fn swift_tables(&self) -> Arc<crate::swift_type_visibility::SwiftTables> {
+        Arc::clone(
+            self.caches
+                .borrow_mut()
+                .swift_tables
+                .get_or_insert_with(|| Arc::new(crate::swift_type_visibility::SwiftTables::new())),
+        )
+    }
+
+    fn objc_tables(&self) -> Arc<crate::objc_scope::ObjcTables> {
+        Arc::clone(
+            self.caches
+                .borrow_mut()
+                .objc_tables
+                .get_or_insert_with(|| Arc::new(crate::objc_scope::ObjcTables::new())),
+        )
+    }
+
+    fn go_tables(&self) -> Arc<crate::go_packages::GoTables> {
+        Arc::clone(
+            self.caches
+                .borrow_mut()
+                .go_tables
+                .get_or_insert_with(|| Arc::new(crate::go_packages::GoTables::new())),
+        )
+    }
+
+    fn manifest_scope(&self, dir: &str) -> Arc<ManifestScope> {
+        if let Some(scope) = self.caches.borrow().manifest_scopes.get(dir) {
+            return Arc::clone(scope);
+        }
+        // Read without holding the cache: the parent's scope and the
+        // manifests' text come through this context too.
+        let scope = Arc::new(read_manifest_scope(dir, self));
+        self.caches
+            .borrow_mut()
+            .manifest_scopes
+            .insert(dir.to_string(), Arc::clone(&scope));
+        scope
+    }
+
     fn get_go_module(&self) -> Option<GoModule> {
         let mut c = self.caches.borrow_mut();
         if c.go_module.is_none() {
@@ -444,6 +619,18 @@ impl ResolutionContext for StoreResolutionContext<'_> {
         let modules = load_go_modules(&self.project_root, &self.get_all_files());
         self.caches.borrow_mut().go_modules = Some(modules.clone());
         modules
+    }
+
+    fn get_rust_crates(&self) -> Arc<crate::rust_scope::RustCrates> {
+        if let Some(cached) = self.caches.borrow().rust_crates.clone() {
+            return cached;
+        }
+        let crates = Arc::new(crate::rust_scope::load_rust_crates(
+            &self.project_root,
+            &self.get_all_files(),
+        ));
+        self.caches.borrow_mut().rust_crates = Some(Arc::clone(&crates));
+        crates
     }
 
     fn get_re_exports(&self, file_path: &str, language: Language) -> Vec<ReExport> {
@@ -848,6 +1035,10 @@ mod tests {
         assert!(ctx.file_exists("known.ts"));
         assert!(ctx.file_exists("ondisk.ts"));
         assert!(!ctx.file_exists("nowhere.ts"));
+        // Only the index's own files are indexed; the disk fallback is not.
+        assert!(ctx.is_indexed_file("known.ts"));
+        assert!(!ctx.is_indexed_file("ondisk.ts"));
+        assert!(!ctx.is_indexed_file("nowhere.ts"));
         assert!(
             !ctx.file_exists(&format!(
                 "../{}/secret.ts",

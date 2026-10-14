@@ -219,10 +219,32 @@ fn word_positions<'a>(text: &'a str, name: &'a str) -> impl Iterator<Item = usiz
     })
 }
 
+fn is_identifier_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || ch == '_' || ch == '$'
+}
+
+/// Start offsets of `name` in `text` with no identifier character (`$`
+/// included) on either side: `(?<![\w$])NAME(?![\w$])`, since `\b` never
+/// bounds the `$` of `items$` or `$store` (upstream #2378).
+fn identifier_positions<'a>(text: &'a str, name: &'a str) -> impl Iterator<Item = usize> + 'a {
+    text.match_indices(name).filter_map(move |(at, _)| {
+        let before = text[..at]
+            .chars()
+            .next_back()
+            .is_some_and(is_identifier_char);
+        let after = text[at + name.len()..]
+            .chars()
+            .next()
+            .is_some_and(is_identifier_char);
+        (!before && !after).then_some(at)
+    })
+}
+
 /// `hasParameterBinding`: `name` is an arrow parameter (`name =>`) or appears
-/// inside a balanced parameter list that opens a function or arrow body.
+/// inside a balanced parameter list that opens a function or arrow body. The
+/// name is bounded as an identifier, `$` included (upstream #2378).
 pub(crate) fn has_parameter_binding(code: &str, name: &str) -> bool {
-    for at in word_positions(code, name) {
+    for at in identifier_positions(code, name) {
         let rest = code[at + name.len()..].trim_start_matches(char::is_whitespace);
         if rest.starts_with("=>") {
             return true;
@@ -254,7 +276,9 @@ pub(crate) fn has_parameter_binding(code: &str, name: &str) -> bool {
             close += 1;
         }
         if depth == 0
-            && contains_word(&code[open + 1..close - 1], name)
+            && identifier_positions(&code[open + 1..close - 1], name)
+                .next()
+                .is_some()
             && body.is_match(&code[close..])
         {
             return true;
@@ -279,6 +303,33 @@ pub(crate) fn declaration_offsets(code: &str, name: &str) -> Vec<usize> {
             let destructured = rest.strip_prefix('{').is_some_and(|inner| {
                 let inner = inner.split('}').next().unwrap_or(inner);
                 contains_word(inner, name)
+            });
+            direct || destructured
+        })
+        .map(|found| found.start())
+        .collect()
+}
+
+/// `\b(?:const|let|var|function|class)\s+(?:NAME(?![\w$])|\{[^}]*(?<![\w$])NAME(?![\w$]))`
+/// starts: [`declaration_offsets`] with the name bounded as an identifier,
+/// `$` included (upstream #2378's `importShadowedAt`).
+fn identifier_declaration_offsets(code: &str, name: &str) -> Vec<usize> {
+    static KEYWORD: OnceLock<Regex> = OnceLock::new();
+    let keyword = KEYWORD.get_or_init(|| {
+        Regex::new(r"(?-u:\b)(?:const|let|var|function|class)\s+").expect("declaration keyword")
+    });
+    keyword
+        .find_iter(code)
+        .filter(|found| {
+            let rest = &code[found.end()..];
+            let direct = rest.starts_with(name)
+                && !rest[name.len()..]
+                    .chars()
+                    .next()
+                    .is_some_and(is_identifier_char);
+            let destructured = rest.strip_prefix('{').is_some_and(|inner| {
+                let inner = inner.split('}').next().unwrap_or(inner);
+                identifier_positions(inner, name).next().is_some()
             });
             direct || destructured
         })
@@ -347,13 +398,15 @@ pub(crate) fn import_shadowed_at(
         stack
     };
     let scope = stack_at(code.len());
-    declaration_offsets(&code, name).into_iter().any(|at| {
-        let declared = stack_at(at);
-        declared
-            .iter()
-            .enumerate()
-            .all(|(depth, open)| scope.get(depth) == Some(open))
-    })
+    identifier_declaration_offsets(&code, name)
+        .into_iter()
+        .any(|at| {
+            let declared = stack_at(at);
+            declared
+                .iter()
+                .enumerate()
+                .all(|(depth, open)| scope.get(depth) == Some(open))
+        })
 }
 
 /// Infer the project type of an awaited receiver (`inferEsmAwaitedCallType`).
@@ -672,6 +725,11 @@ mod tests {
         assert!(!has_parameter_binding("if (handle) { run(); }", "handle"));
         assert!(!has_parameter_binding("call(handle);", "handle"));
         assert!(!has_parameter_binding("(handler) => 1", "handle"));
+        // A `$` is part of the identifier (upstream #2378).
+        assert!(has_parameter_binding("function f($store) {", "$store"));
+        assert!(has_parameter_binding("items$ => 1", "items$"));
+        assert!(!has_parameter_binding("($stores) => 1", "$store"));
+        assert!(!has_parameter_binding("(items$$) => 1", "items$"));
     }
 
     #[test]
@@ -711,5 +769,21 @@ mod tests {
         let column = source.find('x').unwrap();
         let mapped = map_column(source, &source_lines, &code, &code_lines, 0, column).unwrap();
         assert_eq!(&code[mapped..mapped + 1], "x");
+    }
+
+    #[test]
+    fn import_shadowing_declarations_bound_the_name_as_an_identifier() {
+        use super::identifier_declaration_offsets;
+        assert_eq!(
+            identifier_declaration_offsets("const items$ = 1;", "items$"),
+            [0]
+        );
+        assert_eq!(
+            identifier_declaration_offsets("let { a, $store } = x;", "$store"),
+            [0]
+        );
+        assert!(identifier_declaration_offsets("const items$$ = 1;", "items$").is_empty());
+        assert!(identifier_declaration_offsets("const { $stores } = x;", "$store").is_empty());
+        assert!(identifier_declaration_offsets("const items = 1;", "items$").is_empty());
     }
 }

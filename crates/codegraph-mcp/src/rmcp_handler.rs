@@ -191,7 +191,7 @@ impl CodeGraphHandler {
         let search_from = default_project.clone().or_else(|| cwd.clone());
         let mut discovery = ServerRootDiscovery::new(search_from);
         let mut resolved_default = default_project;
-        if let Some(resolution) = discovery.initial_resolution() {
+        if let Some(resolution) = discovery.startup_resolution() {
             if let Some(root) = resolution.root {
                 if resolution.via_subproject_scan {
                     let relative = root
@@ -251,13 +251,16 @@ impl CodeGraphHandler {
         let Some(discovery) = &self.root_discovery else {
             return;
         };
-        let resolution = discovery
+        let mut discovery = discovery
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .retry_resolution();
-        let Some(resolution) = resolution else {
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(resolution) = discovery.retry_resolution() else {
             return;
         };
+        if let Some(notice) = discovery.scan_notice(&resolution) {
+            eprintln!("{notice}");
+        }
+        drop(discovery);
         let Some(root) = resolution.root else {
             return;
         };
@@ -279,9 +282,9 @@ impl CodeGraphHandler {
         *default = Some(root);
     }
 
-    fn discovery_snapshot(&self) -> (Option<PathBuf>, Vec<PathBuf>) {
+    fn discovery_snapshot(&self) -> (Option<PathBuf>, Vec<PathBuf>, bool) {
         let Some(discovery) = &self.root_discovery else {
-            return (None, Vec::new());
+            return (None, Vec::new(), false);
         };
         let discovery = discovery
             .lock()
@@ -289,6 +292,7 @@ impl CodeGraphHandler {
         (
             discovery.search_from().map(Path::to_path_buf),
             discovery.known_candidates().to_vec(),
+            discovery.scan_truncated(),
         )
     }
 
@@ -527,8 +531,13 @@ impl ServerHandler for CodeGraphHandler {
                 .into());
             }
             crate::roots::ProjectArg::NotIndexed => {
-                let (search_from, candidates) = self.discovery_snapshot();
-                let message = not_indexed_message(raw_project, search_from.as_deref(), &candidates);
+                let (search_from, candidates, truncated) = self.discovery_snapshot();
+                let message = not_indexed_message(
+                    raw_project,
+                    search_from.as_deref(),
+                    &candidates,
+                    truncated,
+                );
                 let result = if raw_project.is_some() {
                     ToolResult::error(message)
                 } else {
@@ -1221,6 +1230,14 @@ mod handler_tests {
             Some(workspace.path.clone()),
             Some(workspace.path.clone()),
         );
+        // Construction, which precedes the `initialize` answer, walks upward
+        // only; the downward scan runs on the first retry, which `tools/list`
+        // and every tool call make before they read the default project.
+        assert_eq!(
+            handler.default_project_snapshot().as_deref(),
+            Some(workspace.path.as_path())
+        );
+        handler.retry_default_project();
 
         assert_eq!(
             handler.default_project_snapshot().as_deref(),
@@ -1240,7 +1257,8 @@ mod handler_tests {
             Some(workspace.path.clone()),
             Some(workspace.path.clone()),
         );
-        let (base, candidates) = handler.discovery_snapshot();
+        handler.retry_default_project();
+        let (base, candidates, _) = handler.discovery_snapshot();
 
         assert_eq!(
             handler.default_project_snapshot().as_deref(),

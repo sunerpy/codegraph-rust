@@ -142,12 +142,97 @@ Canonical fixture files are committed under `reference/golden/<corpus>/`:
 - `files.json`
 - `schema.sql`
 
-Regenerate from a reference SQLite database with:
+Every corpus except `mini` is re-indexable and is regenerated with one recipe:
+copy its source corpus from `crates/codegraph-bench/fixtures/<corpus>/` into a
+clean directory, index it with the current binary
+(`CODEGRAPH_NO_DAEMON=1 CODEGRAPH_NO_WATCH=1 codegraph init`), commit the produced
+database as `reference/golden/<corpus>/colby.db`, and dump the canonical
+artifacts from that same database with `bench --gen-golden`. Never hand-write a
+golden. `scripts/regen-goldens.sh` runs exactly that recipe:
+
+```bash
+cargo build --locked --release -p codegraph-rs -p codegraph-bench
+scripts/regen-goldens.sh --check                 # every corpus; exit 1 on any difference
+scripts/regen-goldens.sh --check cpp go          # only the named corpora
+scripts/regen-goldens.sh --write cpp             # rewrite colby.db + artifacts of cpp only
+scripts/regen-goldens.sh --mini-transplant       # mini; see "Mini schema rebuild" below
+scripts/regen-goldens.sh --mini-resolve          # mini; see "Mini resolution regeneration" below
+```
+
+`--check` writes nothing into the repository; `--write` writes only under
+`reference/golden/<named corpus>/`. Both use `target/release/codegraph` and
+`target/release/bench` unless `CODEGRAPH_BIN` / `BENCH_BIN` say otherwise, and
+work in `mktemp` scratch directories that are removed on exit.
+
+The same comparison runs in the test suite:
+`cargo test -p codegraph-rs --locked --test golden_reextract` indexes every
+re-indexable corpus with the test build of the binary and fails, naming the
+changed artifacts and the canonical row diff, when extraction or resolution
+output moved without its golden being regenerated. `equivalence.rs` (below)
+only proves that each committed `colby.db` agrees with its own JSON; it never
+runs the extractor.
+
+To dump a single database by hand (for example while investigating a diff):
 
 ```bash
 cargo run -p codegraph-bench --bin bench -- \
   --gen-golden reference/golden/mini/colby.db reference/golden/mini
 ```
+
+#### Regeneration log
+
+Every intentional golden change is recorded here with the commit, the corpora
+and artifacts it changed, why the graph change is intended, and the command
+that regenerated it. Older regenerations are described in each corpus section.
+
+| Commit                                                                                                  | Corpus                                                                                                                   | Artifacts                                                                                     | Intent                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   | Command                                                                                                                                                 |
+| ------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `test(bench): add C#, Java, Swift, ObjC, PHP, Vue, Svelte, Python-bases and CommonJS corpora`           | csharp, java, swift, objc, php, vue, svelte, python_bases, commonjs                                                      | all (new corpora)                                                                             | baseline capture of the current extraction and resolution, including the misses later commits correct                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    | `scripts/regen-goldens.sh --write csharp java swift objc php vue svelte python_bases commonjs`                                                          |
+| `test(bench): add router, server, mobile and synthesis corpora`                                         | routers, servers, mobile, synthesis                                                                                      | all (new corpora)                                                                             | baseline capture of today's framework and synthesis output ahead of the framework resolvers and synthesis passes                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         | `scripts/regen-goldens.sh --write routers servers mobile synthesis`                                                                                     |
+| `test(bench): seed the PHP, CommonJS and mobile corpora with the shapes W0-06 requires`                 | php, commonjs, mobile                                                                                                    | all                                                                                           | baseline capture of a `static::` call, `require().member` and a Flutter `pubspec.yaml` app; each adds rows only, no existing row changes                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 | `scripts/regen-goldens.sh --write php commonjs mobile`                                                                                                  |
+| `feat(store): add schema 9 for synthesis inputs and move the extraction version to 22`                  | every corpus, plus `reference/golden/colby.schema.sql`                                                                   | `schema.sql`, `colby.db`                                                                      | schema 9 adds the `synthesis_inputs` table and the `idx_edges_synthesis_site` index; the canonical JSON of every corpus is unchanged                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     | `scripts/regen-goldens.sh --write <every re-indexable corpus>`, then `scripts/regen-goldens.sh --mini-transplant`                                       |
+| `fix(resolve): never offer import statements as name-match candidates`                                  | csharp, erlang, java, mobile, php, python, python_bases, routers, ruby, rust, servers, swift, synthesis, typescript, vue | `edges.json`, `refs.json` (ruby: `edges.json` only), `colby.db`                               | an import statement is not a definition (upstream #965): every `imports` edge exact name matching bound to an import node goes, all but one to the file's own statement, and its ref stays unresolved; PHP `use App\Field;` binds `namespace App\Field` instead, and Ruby `require_relative "logger"` falls through to the fuzzy match `class Logger`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    | `scripts/regen-goldens.sh --write csharp erlang java mobile php python python_bases routers ruby rust servers swift synthesis typescript vue`           |
+| `fix(extract): store the sniffed language on the file row`                                              | cpp, objc                                                                                                                | `files.json`, `colby.db`                                                                      | a `.h` header promoted to C++ or Objective-C by its content records that language on its file row, as its nodes already did (G15): `plain_derived.h` and `ue_actor.h` become `cpp`, `Sources/Base.h` becomes `objc`; no node, edge or reference changes                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  | `scripts/regen-goldens.sh --write cpp objc`                                                                                                             |
+| `feat(extract): extract C# base lists`                                                                  | csharp, servers                                                                                                          | `edges.json` (csharp), `refs.json` (servers), `colby.db`                                      | every `base_list` entry is an `extends` ref (G1, upstream `b712e4de`): csharp `Store : BaseStore, IStore` gains `extends BaseStore` and `implements IStore`; servers' `UsersController : ControllerBase` parks the out-of-repo base as unresolved                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        | `scripts/regen-goldens.sh --write csharp servers`                                                                                                       |
+| `feat(extract): emit instantiations for object creation and literal construction`                       | csharp, go, java, php, rust, servers, synthesis                                                                          | `edges.json`, `refs.json`, `nodes.json`/`files.json` (java), `colby.db`                       | object creation and literal construction yield `instantiates` (G2, upstream INSTANTIATION_KINDS): Java/C#/PHP `object_creation_expression`, Go `composite_literal` (package qualifier kept), Rust `struct_expression`, Scala `instance_expression`; a Java anonymous class `new Runnable() { ... }` becomes class `<Runnable$anon@24>`, which extends `Runnable` and owns `run`, so `run`'s call to `helper` now leaves `run`; out-of-repo types (`ArrayList`, `gin.H`) and PHP `new self()`/`new static()` park unresolved                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              | `scripts/regen-goldens.sh --write csharp go java php rust servers synthesis`                                                                            |
+| `feat(extract): type-annotation references for Rust and Go`                                             | go, rust, servers, synthesis                                                                                             | `edges.json`, `refs.json`, `colby.db`                                                         | parameter and return types of Rust and Go functions and methods are `references` (G3, upstream TYPE_ANNOTATION_LANGUAGES), with upstream's shared builtin set skipped (Go `int`, `error`, ...): rust `make_bits` references union `Bits`, go `ComputePay` references `Payroll`; `Self`, `Option`, `Result` and framework types (`Router`, `HttpResponse`, gin `Context`) park unresolved                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 | `scripts/regen-goldens.sh --write go rust servers synthesis`                                                                                            |
+| `feat(extract): type-annotation references for Java, Kotlin and Scala`                                  | java, kotlin, mobile, servers, synthesis                                                                                 | `edges.json`, `refs.json`, `colby.db`                                                         | parameter and return types are `references` (G3): Java through the grammar's fields (a field's type too, a qualified name by its last segment), Kotlin through kotlin-ng's unnamed parameter and return types (an extension receiver is not one), Scala through every curried parameter list, the return type and type-parameter bounds: java `Main::build` references `Square`, servers' `UserController::userService` references `UserService`; framework and standard types (`Action`, `Promise`, `ApplicationEventPublisher`, `Map`, `Result`) and Kotlin type parameters (`T`) park unresolved                                                                                                                                                                                                                                                                                                                                                                                                                                                                      | `scripts/regen-goldens.sh --write java kotlin mobile servers synthesis`                                                                                 |
+| `feat(extract): type-annotation references for C#, Swift, Dart and PHP`                                 | csharp, mobile, servers                                                                                                  | `edges.json`, `refs.json`, `colby.db`                                                         | annotated types are `references` (G3): C# type positions only (a property's `type`, a method's `returns`, a field's declaration type, each parameter's `type`; `predefined_type` skipped, a qualified name by its last segment), Swift parameter and return types, Dart signatures, PHP parameter and return hints (primitives and pseudo-types skipped); a Swift composition continued on an `&` line keeps its types (#2108's residue). csharp `Store::Map` and `Store::map` reference `TypeMap`; `User::Make`'s `Store` binds the same-named constructor `Store::Store` until C# type positions take only type candidates (#2121, W4-CS-01); framework types (`IActionResult`, `BuildContext`, vapor's `Request`) park unresolved                                                                                                                                                                                                                                                                                                                                     | `scripts/regen-goldens.sh --write csharp mobile servers`                                                                                                |
+| `feat(extract): Objective-C message sends and interface supertypes`                                     | mobile, objc                                                                                                             | `edges.json`, `refs.json`, `colby.db`                                                         | a message send is a call named by its full selector (G5, upstream `61153f96`): a `self`/`super` receiver leaves the bare selector, so `[self ping]` and `[super ping]` reach `Base::ping`; another receiver is written before it (`Base.new`, `greeter.greet:`), a class receiver also references the class (it replaces the `instantiates` the receiver-named call used to get), and a unary message to a class factory keeps the chain (`Greeter.alloc().init`); `@interface Sub : Base <Doer>` extends `Base` and implements `Doer`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   | `scripts/regen-goldens.sh --write mobile objc`                                                                                                          |
+| `feat(extract): Python class bases`                                                                     | python_bases                                                                                                             | `edges.json`, `refs.json`, `colby.db`                                                         | each identifier or dotted base of a Python class is an `extends` ref (G6, upstream v1.0.1); `metaclass=` and subscripted generics are not: `User` extends `Base` and `Mixin`, `Admin` extends `User`, and the metaclass's own base `type` parks unresolved                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               | `scripts/regen-goldens.sh --write python_bases`                                                                                                         |
+| `feat(extract): PHP extends and implements`                                                             | php, servers                                                                                                             | `edges.json`, `refs.json`, `colby.db`                                                         | a PHP `base_clause` is `extends` and a `class_interface_clause` is `implements`, every listed name by its last `\` segment (G7): `Controller` extends `App::Base`, `FirstName` and `Registry` extend `App\Field::Base`, `FirstName` implements `Renders`; framework bases (`TestCase`, laravel `Controller`, drupal `ControllerBase`) park unresolved                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    | `scripts/regen-goldens.sh --write php servers`                                                                                                          |
+| `feat(extract): delegate Vue SFC scripts to the TypeScript extractor`                                   | routers, vue                                                                                                             | all, `colby.db`                                                                               | each `<script>` block is extracted by the TypeScript or JavaScript extractor at its file lines (G8, upstream vue-extractor.ts): function bodies' calls (`go` calls `helper` and `increment`), top-level constants (`msg`, nuxt `route`, `id`) and their initializers' calls, and import nodes now appear; a function's qualified name is the TypeScript extractor's (`go`, not `App.vue::go`), node ids unchanged. The block's top-level imports lose their ref until the next commit folds the block into the file                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      | `scripts/regen-goldens.sh --write routers vue`                                                                                                          |
+| `fix(extract): fold SFC scripts into the component's file node`                                         | routers, svelte, vue                                                                                                     | all, `colby.db`                                                                               | an SFC has one file node, `file:<path>`, holding its component (G9, upstream #2268); the component holds what a script holds at its top level; a per-instance script's (`<script setup>`, a Svelte instance script) top-level calls, a top-level constant's initializer's included, are the component's, while imports and a module-level script's calls stay with the file: svelte `Widget` calls `doSetup` and `formatLabel`, vue `App` calls `helper`, `App.vue` imports `Counter.vue`, `helper` and `useCounter`. New `file:` nodes only, every existing node id unchanged (OD-5)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    | `scripts/regen-goldens.sh --write routers svelte vue`                                                                                                   |
+| `feat(extract): Go struct and interface embedding`                                                      | synthesis                                                                                                                | `edges.json`, `colby.db`                                                                      | a Go struct's unnamed field and an interface's lone named type are `extends` refs (G10, upstream `1244c621`, #2397), `pkg.T` by `T` and `T[X]` by `T`, predeclared types skipped: `MemStore` extends `base`, `Store` extends `Getter`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    | `scripts/regen-goldens.sh --write synthesis`                                                                                                            |
+| `fix(extract): keep the receiver of Ruby method calls`                                                  | ruby, servers                                                                                                            | `edges.json`, `refs.json`, `colby.db`                                                         | a Ruby call with a receiver is named `receiver.method` (G11, upstream #2147's extraction half): `self`/`super` leave the bare name, a constant receiver is also a reference, `Foo.new` stays an instantiation. `Formatter.shout` now resolves by qualified name and references `Formatter`; `message.upcase` and rails `Rails.application.routes.draw` keep their receivers; `@logger.log` no longer resolves by its bare name to `Logger::log` and parks unresolved, as upstream leaves an instance-variable receiver                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   | `scripts/regen-goldens.sh --write ruby servers`                                                                                                         |
+| `fix(extract): keep the scope of C++ qualified calls`                                                   | cpp                                                                                                                      | `edges.json`, `colby.db`                                                                      | a C++ call keeps the scope it is written with (G13): `ns::compute()` is recorded as `ns::compute` and binds `ns::compute` by its qualified name (it bound by exact name before), and `simulator::ManifestStartup::Apply(1)` by its full path (the partial `ManifestStartup::Apply` match before); a call from the global scope, `::f()`, is recorded as `::f`, which the resolver leaves unresolved. Two edges change their `resolvedBy` or confidence; nodes, refs and files are unchanged                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              | `scripts/regen-goldens.sh --write cpp`                                                                                                                  |
+| `feat(extract): same-file value references for TypeScript, JavaScript, Go and Python`                   | mobile                                                                                                                   | `edges.json`, `colby.db`                                                                      | a symbol has a `references` edge, `{"valueRef": true}`, to a distinctively named constant or variable of its own file that it reads (upstream #895, #897): rn `listen` reads `PICTURE_TAKEN` and expo-modules `hello` reads `HelloModule`. Edges only: nodes, refs and files are unchanged, and every other corpus is identical                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          | `scripts/regen-goldens.sh --write mobile`                                                                                                               |
+| `feat(extract): static member reads`                                                                    | csharp, swift                                                                                                            | `refs.json`, `edges.json`, `colby.db`                                                         | a read through a type, a static member or an enum value, references the type (G4, upstream `STATIC_MEMBER_LANGS`): csharp `new Store(Console.Out)` parks `Console` unresolved, and swift `Client::run` references enum `API` through `API.DependencyController.GetRoute.query()`. Nodes unchanged; the other corpora hold no such read                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   | `scripts/regen-goldens.sh --write csharp swift`                                                                                                         |
+| `feat(extract): same-file value references for PHP, Scala, Rust, Ruby, C and Pascal`                    | cpp, synthesis                                                                                                           | `nodes.json`, `edges.json`, `files.json`, `colby.db`                                          | value references reach six more languages (upstream #897), and the values they read become nodes: a C file-scope initialized, pointer or array declaration (cpp `plain_header_negatives.h` `header_text`, synthesis `c/src/ops.c` `ops`, both constants; the header stays C), a Ruby constant, a Rust module `const`/`static`, a PHP file-scope `const`, a Pascal unit `const`; a Scala `object` value is a constant, no longer a field (OD-5, node id changes; no corpus has one). Neither new constant is read by name, so no value reference is added                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 | `scripts/regen-goldens.sh --write cpp synthesis`                                                                                                        |
+| `feat(extract): same-file value references for Java, C#, Kotlin, Swift and Dart`                        | servers, swift                                                                                                           | `nodes.json`, `edges.json`, `files.json`, `colby.db`                                          | value references reach the last five languages (upstream #897), and the values they read become nodes: a Swift stored property (servers vapor `Package.swift` `let package` a constant; swift `HomeView::title`, `Client::cache`, `Cache::imageCachedType` fields), a Kotlin property, a Dart `static_final_declaration`. A Java `static final` and a C# `const` / `static readonly` field is a constant, no longer a field (OD-5, node id changes; no corpus has one). No value reference is added: none of these is read by a distinctive name                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         | `scripts/regen-goldens.sh --write servers swift`                                                                                                        |
+| `fix(extract): C++ scoped reads reference the type they read through`                                   | cpp                                                                                                                      | `edges.json`, `colby.db`                                                                      | a C++ read through a capitalized scope references it (G4): tree-sitter-cpp writes every scope as a `namespace_identifier`, which upstream's static-member pass never reads, so its C++ reads linked nothing. `run_manifest` now references `simulator::ManifestStartup` through `simulator::ManifestStartup::Apply(1)` (the inner path's scope; the call itself stays the call's). Nodes and refs unchanged                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              | `scripts/regen-goldens.sh --write cpp`                                                                                                                  |
+| `fix(resolve): an imports reference binds the file it names, never its own import statement`            | arkts, mini, mobile, objc, python_bases, routers, servers, svelte, typescript, vue                                       | `edges.json`, `refs.json` (routers: `edges.json` only), `colby.db`                            | an `imports` reference never binds its own import statement (upstream #2392): all 34 `qualified-name` edges from a file to its own `import` node go (17 TS/JS/TSX, 6 Python, 4 Objective-C, 3 Vue, and one each for ArkTS, Dart, Go and Svelte); a JS-family module path names a file (#2263), so 16 of them become `import` edges to the file the path resolves to, and 18 park unresolved: `./missing.js`, `../foo`, `Foundation/Foundation.h`, `package:flutter/material.dart`, three iOS headers, Python `.models`/`.user`/`.base`/`django.urls`/`django.http`/`.`, `github.com/gin-gonic/gin`, and the Vue and Svelte relative paths, which upstream's JS path rule does not cover either; two `file-path` edges (0.7) become `import` edges (0.9): routers' `../views/Home.vue` keeps its target, and typescript's `./collision.js` moves from `collision.js` to `collision.ts`, the file `viaCollision()` already resolved to; mini also gains the unresolved `function_ref` `this.value`, see [Mini resolution regeneration](#mini-resolution-regeneration-od-4) | `scripts/regen-goldens.sh --write arkts mobile objc python_bases routers servers svelte typescript vue`, then `scripts/regen-goldens.sh --mini-resolve` |
+| `fix(resolve): out-of-repo and namespace receivers never reach S2/S3`                                   | commonjs, routers, servers                                                                                               | `edges.json`, `refs.json`, `colby.db`                                                         | a name the file binds from a package outside the repository names nothing in it (upstream #2120, #2134): commonjs `request(createApp())` and servers `express()` no longer bind the `const request = require('supertest')` / `const express = require('express')` binding they call through, and routers' Angular `@Component(...)` (from `@angular/core`) no longer binds, as a call and as a decorator, the React app's `Component` function in `Team.tsx` (a cross-language 0.5 guess); all four park unresolved                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      | `scripts/regen-goldens.sh --write commonjs routers servers`                                                                                             |
+| `fix(resolve): fuzzy matching ignores case only where the language does`                                | ruby                                                                                                                     | `edges.json`, `refs.json`, `colby.db`                                                         | the last-resort fuzzy match compares names exactly outside PHP, Pascal and CFML (upstream #2139), and a fuzzy `instantiates` never names a method (#2141 c): ruby's `require_relative "logger"` no longer fuzzy-matches `class Logger` (the fallback the `never offer import statements` row above left it) and parks unresolved, as upstream's does                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     | `scripts/regen-goldens.sh --write ruby`                                                                                                                 |
+| `fix(resolve): S1 walks declared supertypes; S3 skips dispatched handlers, test doubles and the caller` | python_bases                                                                                                             | `edges.json`, `refs.json`, `colby.db`                                                         | a call through a class name reaches the class method the class inherits, by the supertypes its declaration head names (upstream #2180): python_bases' `User.create()` in `pkg/service.py`, the classmethod `User` inherits from `Base`, now resolves to `Base::create` (`qualified-name`, 0.8) instead of staying unresolved; the Strategy 3 rules of #2175, #2197 and #2221 move nothing in the corpora                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 | `scripts/regen-goldens.sh --write python_bases`                                                                                                         |
+| `feat(resolve): a call reaches the overload its arguments fit`                                          | csharp, swift                                                                                                            | `edges.json`, `colby.db`                                                                      | a call reaches the same-owner overload its argument count fits, defaults and varargs counted, and in Swift the one its argument labels spell (upstream #2212, #2213, #2238, #2241): csharp `Log(message) => Log(message, 0)` and swift `store(key:)`'s `store(key: key, value: 0)` move from the caller itself to the two-parameter overload, and swift `cache.store(key: "a")` in `Client::run` from `store(key:value:)` to `store(key:)`; only the targets move                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        | `scripts/regen-goldens.sh --write csharp swift`                                                                                                         |
+| `feat(resolve): follow functions destructured from call results`                                        | commonjs, synthesis, vue                                                                                                 | `refs.json`, `edges.json` (vue), `colby.db`                                                   | a module-scope destructuring declaration's initializer runs (upstream #2357): commonjs `const { setCharset } = require('../lib/app')` and `const { default: Service } = require('./service')` and synthesis `const { EventEmitter } = require('events')` gain the file's `require` call ref (unresolved, like every `require`), and vue's `<script setup>` `const { count, increment } = useCounter(0)` its component's import edge to `useCounter`; a bare call through a name destructured from a call's result reaches what the callee returns under that key (upstream #2163): vue's `increment()` in `go` moves from unresolved to `useCounter::increment` (instance-method)                                                                                                                                                                                                                                                                                                                                                                                        | `scripts/regen-goldens.sh --write commonjs synthesis vue`                                                                                               |
+| `feat(extract): CommonJS requires import their files`                                                   | commonjs, servers                                                                                                        | `edges.json`, `colby.db`                                                                      | a local `require('./x')` is a file-level `imports` edge to that file (upstream #2263): commonjs gains eight (`require('../')` from `test/` reaches the root `index.js`, #2189) and servers' `require('./routes/users')` one; calls through require bindings follow CommonJS exports (upstream #2189, #2433): `require('./util').wrap` in `chain.js` moves from the local constant to `util.js::wrap`, `createApp()` through `require('../')` to `index.js`'s `app` (its `module.exports = app`), and `setCharset` and `new Service()` keep their targets, now resolved by import                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         | `scripts/regen-goldens.sh --write commonjs servers`                                                                                                     |
+| `feat(extract): every named object literal owns its members`                                            | typescript                                                                                                               | `edges.json`, `colby.db`                                                                      | a named object literal owns its function members, exported or not, in a function or an IIFE, or hung on a path, and a module-scope literal's other values run where it is written (upstream #2363, #693): typescript `namespace.ts`'s `nested: { run() { helper(); } }` value was walked by nothing, and its `helper()` call is now the constant `api`'s (one `calls` edge, `exact-match`); no node or reference changes, as every other literal in the corpora is a module-scope one whose members already had nodes                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    | `scripts/regen-goldens.sh --write typescript`                                                                                                           |
+| `feat(extract): Vue Options API members and template calls`                                             | vue                                                                                                                      | all, `colby.db`                                                                               | an Options API component's functions are method nodes of the component (upstream #2140): vue `Counter.vue` gains `data`, `doubled`, `bump` and `mounted` with their `contains` edges; `bump` now makes the `helper()` call the file made, and `mounted`'s `this.bump()`, unresolved from the file, reaches `bump`. Template calls (upstream #2357 b) add none here: `{{ total }}` reads a value and `@click="bump"` names a handler                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      | `scripts/regen-goldens.sh --write vue`                                                                                                                  |
+| `feat(resolve): Python imports follow package re-exports and module members`                            | python_bases                                                                                                             | `edges.json`, `refs.json`, `colby.db`                                                         | a Python name imported from a package follows the package's named and star re-exports to its definition, three modules deep, and so does a module member used through an imported module (upstream #2247, #2248): python_bases' `from .models import User` in `pkg/__init__.py` and `from pkg.models import User` in `pkg/service.py`, both re-exported by `pkg/models/__init__.py`'s `from .user import *`, keep their `imports` edges to `User`, now bound by `import` instead of `exact-match` (0.9 both), and `models.User()` after `from pkg import models`, unresolved before, now instantiates `User` (`import`, 0.85); parenthesized from-imports and `pkg.mod.Cls` through `import pkg.mod` (#2291 b, c) move nothing in the corpora                                                                                                                                                                                                                                                                                                                            | `scripts/regen-goldens.sh --write python_bases`                                                                                                         |
+| `feat(resolve): pytest fixtures type parameters; Django managers; keyword arguments are not bindings`   | python_bases                                                                                                             | `edges.json`, `colby.db`                                                                      | a pytest test's parameter is the class its in-reach fixture returns (upstream #2228): python_bases' `test_admin(admin)` in `tests/test_service.py` takes `Admin()` from the `admin` fixture of `tests/conftest.py`, so its `admin.run()` call keeps its target `Admin::run` but is typed (`instance-method` 0.9) instead of guessed from the receiver's name (0.8); the Django manager and keyword-argument rules (#2175, #2169 Python parts) move nothing in the corpora                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                | `scripts/regen-goldens.sh --write python_bases`                                                                                                         |
+| `feat(extract): types defined in variable declarations`                                                 | cpp                                                                                                                      | `nodes.json`, `edges.json`, `files.json`, `colby.db`                                          | a struct, union or enum defined in a declaration's type is a node (upstream #2446), and an unnamed one takes the name of the first variable the declaration declares: `union_agg.c:8` `union { int q; } anon_var;` is `union anon_var`, contained by its file; no other node, edge or reference changes                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  | `scripts/regen-goldens.sh --write cpp`                                                                                                                  |
+| `feat(resolve): typedef and using-alias receivers`                                                      | cpp                                                                                                                      | `nodes.json`, `colby.db`                                                                      | a C or C++ `type_alias` node records its declaration as written in `signature` (KEEP-RUST, owner 2026-10-12: upstream records no aliased type; a sync compares it to tell an alias that names another type): `attr_macro.c`'s `UINT32` gains `typedef unsigned int UINT32`. Receivers declared through an alias (upstream #2399) move no golden edge: no corpus calls through one                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        | `scripts/regen-goldens.sh --write cpp`                                                                                                                  |
+| `feat(resolve): base classes by C++ name lookup`                                                        | cpp, synthesis                                                                                                           | `edges.json`, `refs.json` (synthesis), `colby.db`                                             | a C or C++ base is resolved only by C++ name lookup (upstream #2407): every cpp `extends` edge keeps its target and is now `qualified-name` at 0.9 (it was `exact-match` 0.9 or `qualified-name` 0.95); and every entry resolves imports and supertypes before the rest (upstream #1789's prerequisite phase), so synthesis's Go `Use(s Store)`'s `s.Get("a")` reaches `Getter::Get` through `Store`'s embedded `Getter`, its parked `s.Get` ref gone                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    | `scripts/regen-goldens.sh --write cpp synthesis`                                                                                                        |
+| `fix(resolve): Java bare calls, outside imports and type names by package`                              | java                                                                                                                     | `edges.json`, `refs.json`, `colby.db`                                                         | a bare Java call reaches only a method of a class around it, of a supertype their heads name, or of a static import (upstream #2126): java's `MainTest.checks` calls `verify(service)` under `import static org.mockito.Mockito.verify;`, which no longer reaches `app.b::EmailVerificationService::verify` (the `calls` edge is gone and the reference stays parked, `MainTest.java:16`); outside imports (upstream #2195) and type-name visibility (upstream #2236) move nothing else in the corpora                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   | `scripts/regen-goldens.sh --write java`                                                                                                                 |
+| `feat(extract): enum constant bodies`                                                                   | java                                                                                                                     | `nodes.json`, `edges.json`, `files.json`, `colby.db`                                          | a Java enum constant or Kotlin enum entry with a body of its own declares its members under the constant (upstream #2194): java's `Main.Op` gains `Op::ADD::apply` and `Op::SUB::apply` (contained by `ADD` and `SUB`), `ADD::apply` calls `Op::combine`, and `Main.java`'s node count goes from 15 to 17                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                | `scripts/regen-goldens.sh --write java`                                                                                                                 |
+| `fix(resolve): C# type positions, namespace-scoped type names and block namespaces`                     | csharp, servers                                                                                                          | `nodes.json`, `edges.json`, `refs.json`, `files.json` (csharp), `colby.db`                    | a block `namespace X { … }` qualifies only its body (upstream #2220): csharp's `Nested.cs` gains the `Outer.Inner`, `JetBrains.Annotations` and `Second` namespace nodes, `Deep` and its methods become `Outer.Inner::Deep…` (`Shallow::Call` instantiates `Outer.Inner::Deep`), `Guard` is `JetBrains.Annotations::Guard` and `Two` `Second::Two` (`Nested.cs`'s node count goes from 9 to 12); the `using`s outside a block namespace are their file's, so `Store.cs`'s four and servers' `UsersController.cs`'s import nodes lose the namespace prefix and its file node holds them and their references; a C# type position names only a type (upstream #2121), so `User::Make`'s `Store` return and parameter types reference the class `App::Store`, not its constructor; namespace visibility (upstream #2216) moves nothing else in the corpora                                                                                                                                                                                                                  | `scripts/regen-goldens.sh --write csharp servers`                                                                                                       |
+| `feat(resolve): calls through declared members use the member type`                                     | csharp, servers                                                                                                          | `nodes.json`, `colby.db`                                                                      | a C# declaration without an access modifier is `public` in an interface and `internal` in a namespace or the file (upstream #2171): csharp's `IStore::Save` and servers' `Greeter` change visibility; calls through declared members, the receiver-word scorer's owner-only words and the standard-name rule move no edge in the corpora                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 | `scripts/regen-goldens.sh --write csharp servers`                                                                                                       |
+| `feat(extract): C# accessor bodies, initializers and target-typed new`                                  | csharp                                                                                                                   | `edges.json`, `colby.db`                                                                      | a C# property's accessor bodies and expression body, and each field declarator's initializer, are walked as that member (upstream #2345, #2348): csharp's `Store::Count` (`get { return Measure(); }`) and `Store::Size` (`=> Measure()`) call `Store::Measure`, the field `seed` (`= Seed()`) calls `BaseStore::Seed`, and `map` (`TypeMap map = new();`, a target-typed `new()`) instantiates `App.Support::TypeMap`; a constant is no longer a type position's candidate, which moves no edge in the corpora                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          | `scripts/regen-goldens.sh --write csharp`                                                                                                               |
+| `feat(extract): CFML container tags, cfinterface, cfscript-in-tag re-parse and cfquery`                 | cfml                                                                                                                     | `nodes.json`, `edges.json`, `colby.db`                                                        | a tag `<cfcomponent>` spans to its close tag (upstream #2296's tag walk): cfml's `Widget.cfm::Widget` ends at line 5, not 1; a bare-script `extends` is recorded at its attribute value, as upstream records it: `Gadget.cfs::Gadget`'s `extends` edge to `Base` moves from column 0 to 18. The corpus has no `<cfscript>`, `<cfquery>`, `<cfinterface>`, container-wrapped function, component path or typed receiver, so nothing else moves                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            | `scripts/regen-goldens.sh --write cfml`                                                                                                                 |
+| `fix(resolve): Swift call shapes, type paths, typed properties and labels`                              | swift                                                                                                                    | `edges.json`, `colby.db`                                                                      | a Swift call through a type path keeps the path and lands on the type it names (upstream #2118): swift's `Client::run` still calls `API::DependencyController::GetRoute::query`, now by the type-path rule at confidence 0.9 instead of 0.85. The corpus's bare `min(1, 2)` reaches no project member before or after, and `cache.store(…)` already reached `Cache::store`, so nothing else moves                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        | `scripts/regen-goldens.sh --write swift`                                                                                                                |
+| `feat(extract): Go type aliases, defined types and standalone doc comments`                             | go, synthesis                                                                                                            | go: `nodes.json`, `colby.db`; synthesis: `nodes.json`, `edges.json`, `files.json`, `colby.db` | a type declared on its own takes the comment above `type` (upstream #2438): go's `generator.go::Emitter` gains its docstring; a `type A = B` alias is a node that references the type it names (upstream #2417) and a defined type references the types it is defined from (upstream #2441): synthesis's `go/store/store.go` gains `type_alias Alias` (contained by its file) and the `references` of `Alias` and `Defined` to `MemStore`. Nothing else moves                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            | `scripts/regen-goldens.sh --write go synthesis`                                                                                                         |
 
 The canonicalizer strips inherently unstable timestamp columns
 (`nodes.updated_at`, `files.modified_at`, `files.indexed_at`), parses JSON text
@@ -182,25 +267,7 @@ The minimal source corpus lives at `crates/codegraph-bench/fixtures/godot/`
 (`project.godot`, `game_flow.gd`, `stage_manager.gd`, `main.tscn`,
 `effect_manager.gd`, `effect_manager.gd.uid`, `combo_ui.tscn`).
 
-Regenerate the committed database + canonical JSON reproducibly from the corpus:
-
-```bash
-# 1. Copy the corpus to a clean directory (keeps the workspace index out of it).
-rm -rf /tmp/cg-fixture-godot
-cp -r crates/codegraph-bench/fixtures/godot /tmp/cg-fixture-godot
-
-# 2. Index it with OUR binary (never hand-write the golden).
-cargo build --release -p codegraph-rs
-CODEGRAPH_NO_DAEMON=1 CODEGRAPH_NO_WATCH=1 \
-  ./target/release/codegraph init /tmp/cg-fixture-godot
-
-# 3. Commit the produced database as the fixture's colby.db.
-cp /tmp/cg-fixture-godot/.codegraph/codegraph.db reference/golden/godot/colby.db
-
-# 4. Dump the canonical golden JSON + schema from that database.
-cargo run -p codegraph-bench --bin bench -- \
-  --gen-golden reference/golden/godot/colby.db reference/golden/godot
-```
+Regenerate it with `scripts/regen-goldens.sh --write godot` (the shared recipe in [Regenerating goldens](#regenerating-goldens)).
 
 The extraction and `--gen-golden` steps are both byte-stable: re-running the
 index or the dump reproduces identical `nodes.json`/`edges.json`/`refs.json`/
@@ -236,10 +303,12 @@ extraction (upstream #1110) that the other fixtures cannot reach — there are n
 `.rb` files in `mini`/`godot`. It captures the four receiver-bearing-call edge
 shapes:
 
-- **instance-method call** — `@logger.log(message)` resolving to `Logger#log`
-  (a `Calls` edge to the METHOD name, not the receiver).
-- **class-method call** — `Formatter.shout(message)` resolving to
-  `Formatter.shout` (a `Calls` edge to the method name).
+- **instance-method call** — `@logger.log(message)` is recorded with its
+  receiver, `@logger.log` (G11), and stays unresolved: an instance variable
+  carries no type the resolver reads, as upstream leaves it.
+- **class-method call** — `Formatter.shout(message)` is recorded as
+  `Formatter.shout` and resolves to it by qualified name; the constant
+  receiver is also a `References` edge to `Formatter`.
 - **`Const.new` construction** — `Logger.new` recorded as an `Instantiates` edge
   to the receiver class `Logger`, not a `Calls` edge to `new`.
 - **bare `include`** — `include Greeting` still records an `Implements` edge
@@ -248,25 +317,7 @@ shapes:
 The minimal source corpus lives at `crates/codegraph-bench/fixtures/ruby/`
 (`service.rb`, `logger.rb`).
 
-Regenerate the committed database + canonical JSON reproducibly from the corpus:
-
-```bash
-# 1. Copy the corpus to a clean directory (keeps the workspace index out of it).
-rm -rf /tmp/cg-fixture-ruby
-cp -r crates/codegraph-bench/fixtures/ruby /tmp/cg-fixture-ruby
-
-# 2. Index it with OUR binary (never hand-write the golden).
-cargo build --release -p codegraph-rs
-CODEGRAPH_NO_DAEMON=1 CODEGRAPH_NO_WATCH=1 \
-  ./target/release/codegraph init /tmp/cg-fixture-ruby
-
-# 3. Commit the produced database as the fixture's colby.db.
-cp /tmp/cg-fixture-ruby/.codegraph/codegraph.db reference/golden/ruby/colby.db
-
-# 4. Dump the canonical golden JSON + schema from that database.
-cargo run -p codegraph-bench --bin bench -- \
-  --gen-golden reference/golden/ruby/colby.db reference/golden/ruby
-```
+Regenerate it with `scripts/regen-goldens.sh --write ruby` (the shared recipe in [Regenerating goldens](#regenerating-goldens)).
 
 Like the Godot fixture, both the index and the dump are byte-stable, and the
 `generated_golden_matches_committed_ruby_fixture` and
@@ -314,26 +365,7 @@ Since extraction version 14 the `pkg/__init__.py` file node carries its module
 docstring (upstream #1905): a bare string literal first in a module, class or
 function body is that node's docstring, joined after any preceding comment.
 
-Regenerate the committed database and canonical artifacts from a clean corpus:
-
-```bash
-# 1. Copy the corpus to a clean directory (keeps the workspace index out of it).
-rm -rf /tmp/cg-fixture-python
-cp -r crates/codegraph-bench/fixtures/python /tmp/cg-fixture-python
-
-# 2. Index it with OUR release binary (never hand-write the golden).
-cargo build --release -p codegraph-rs
-CODEGRAPH_NO_DAEMON=1 CODEGRAPH_NO_WATCH=1 \
-  ./target/release/codegraph init /tmp/cg-fixture-python
-
-# 3. Commit the produced database as the fixture's colby.db.
-mkdir -p reference/golden/python
-cp /tmp/cg-fixture-python/.codegraph/codegraph.db reference/golden/python/colby.db
-
-# 4. Dump canonical JSON + schema from that exact database.
-cargo run -p codegraph-bench --bin bench -- \
-  --gen-golden reference/golden/python/colby.db reference/golden/python
-```
+Regenerate it with `scripts/regen-goldens.sh --write python` (the shared recipe in [Regenerating goldens](#regenerating-goldens)).
 
 As with every fixture, compare only `nodes.json`, `edges.json`, `refs.json`,
 `files.json`, and `schema.sql` byte-for-byte. `colby.db` itself is not a
@@ -354,19 +386,14 @@ class method with a nullable generic return, and an extension function. The
 `Processor` primary constructor is the negative boundary: the class signature
 stays null and no constructor method is synthesized.
 
-Regenerate the committed database and canonical artifacts from a clean corpus:
+A Kotlin property's declared type is a `References` from the property node
+(W2-03d), which upstream does not read: a deliberate difference (KEEP-RUST,
+OD-8, owner decision 2026-10-11). `Processor`'s `val id: Int` is a constructor
+parameter, which mints no property node, so the fixture is unchanged;
+`kotlin_property_types_are_references` in `type_references.rs` and the sync
+case `kotlin_property_type_of_an_added_class` pin the behavior.
 
-```bash
-rm -rf /tmp/cg-fixture-kotlin
-cp -r crates/codegraph-bench/fixtures/kotlin /tmp/cg-fixture-kotlin
-cargo build --release -p codegraph-rs
-CODEGRAPH_NO_DAEMON=1 CODEGRAPH_NO_WATCH=1 \
-  ./target/release/codegraph init /tmp/cg-fixture-kotlin
-mkdir -p reference/golden/kotlin
-cp /tmp/cg-fixture-kotlin/.codegraph/codegraph.db reference/golden/kotlin/colby.db
-cargo run -p codegraph-bench --bin bench -- \
-  --gen-golden reference/golden/kotlin/colby.db reference/golden/kotlin
-```
+Regenerate it with `scripts/regen-goldens.sh --write kotlin` (the shared recipe in [Regenerating goldens](#regenerating-goldens)).
 
 As with every fixture, only the five text artifacts are byte-compared;
 `colby.db` is not byte-reproducible. Compare `schema.sql` by normalized statement
@@ -389,19 +416,7 @@ fixes from upstream #1823 and #1824. Its two-file corpus under
   `trait`; the inheritance edge resolves to the trait even when the object
   appears first in the file.
 
-Regenerate it from the committed source corpus:
-
-```bash
-rm -rf /tmp/cg-fixture-scala
-cp -r crates/codegraph-bench/fixtures/scala /tmp/cg-fixture-scala
-cargo build --release -p codegraph-rs
-CODEGRAPH_NO_DAEMON=1 CODEGRAPH_NO_WATCH=1 \
-  ./target/release/codegraph init /tmp/cg-fixture-scala
-mkdir -p reference/golden/scala
-cp /tmp/cg-fixture-scala/.codegraph/codegraph.db reference/golden/scala/colby.db
-cargo run -p codegraph-bench --bin bench -- \
-  --gen-golden reference/golden/scala/colby.db reference/golden/scala
-```
+Regenerate it with `scripts/regen-goldens.sh --write scala` (the shared recipe in [Regenerating goldens](#regenerating-goldens)).
 
 `generated_golden_matches_committed_scala_fixture` and
 `scala_db_is_self_equivalent_to_scala_golden` pin the canonical artifacts and
@@ -416,19 +431,16 @@ corpus at `crates/codegraph-bench/fixtures/dart/extension_type.dart` proves an
 ordinary-class control. This prevents either the old top-level-function shape
 or the later complete member drop from returning unnoticed.
 
-Regenerate it from the committed source corpus:
+Since `feat(extract): Dart mixins, implements, mixin applications and member
+docs`, a mixin application `class A = B with M;` is named `A` rather than
+`<anonymous>`, so its node id changes; the formula does not, the name is one of
+its inputs (OD-5). No committed corpus holds a mixin application, a `with` or
+`implements` list, a member dartdoc or a generic call, so no golden changed
+(`scripts/regen-goldens.sh --check`: every corpus identical); the extractor
+tests `inheritance_clauses`, `dart_member_docs` and `dart_generic_calls` pin
+the behavior.
 
-```bash
-rm -rf /tmp/cg-fixture-dart
-cp -r crates/codegraph-bench/fixtures/dart /tmp/cg-fixture-dart
-cargo build --release -p codegraph-rs
-CODEGRAPH_NO_DAEMON=1 CODEGRAPH_NO_WATCH=1 \
-  ./target/release/codegraph init /tmp/cg-fixture-dart
-mkdir -p reference/golden/dart
-cp /tmp/cg-fixture-dart/.codegraph/codegraph.db reference/golden/dart/colby.db
-cargo run -p codegraph-bench --bin bench -- \
-  --gen-golden reference/golden/dart/colby.db reference/golden/dart
-```
+Regenerate it with `scripts/regen-goldens.sh --write dart` (the shared recipe in [Regenerating goldens](#regenerating-goldens)).
 
 `generated_golden_matches_committed_dart_fixture` and
 `dart_db_is_self_equivalent_to_dart_golden` enforce the same two-layer
@@ -465,8 +477,9 @@ Three further files exercise the Release D C++ extraction gains:
 
 - **namespace prefix + `ns::fn()` resolution** — `namespaced.cpp` defines
   `namespace ns { void compute() {} }` (qualified name `ns::compute`) and calls
-  `ns::compute()` from `run_namespaced`; the call resolves to a `Calls` edge via
-  the existing qualified-name matcher (no resolver change).
+  `ns::compute()` from `run_namespaced`. The extractor records the call with
+  the scope it is written with, `ns::compute` (G13), so it resolves to a `Calls`
+  edge through the qualified-name matcher (`resolvedBy: qualified-name`).
 - **template-argument call stripping** — `templated_call.cpp` defines
   `template <typename T> void process(T)` and calls `process<int>(0)`; the
   `<int>` template args are stripped at extraction so the call links to `process`.
@@ -502,7 +515,8 @@ __attribute__((section(".init")))` is visible IN THIS FILE — the pass demands
   the method at `simulator::ManifestStartup::Apply` (matching the class node's
   `simulator::ManifestStartup`) plus the `Calls` edge
   `run_manifest → simulator::ManifestStartup::Apply` resolved by
-  `qualified-name` — the edge that a namespace-less qualifier loses.
+  `qualified-name` — the edge that a namespace-less qualifier loses. The call
+  is recorded by its full path, an exact qualified-name match.
 
 - **out-of-line template method receivers** (upstream #1309) —
   `template_method.cpp` declares `template <typename T> class Box` with `get` /
@@ -552,11 +566,12 @@ family rather than the dialect.
 - **C union** — `union_agg.c` (the second `.c` file, so the C walker is under test)
   covers `union Named` plus both `typedef union` RE-KINDS (`AnonU` and `NamedU` were
   `type_alias` before and are `union` now — node ids change), with `struct Ctl` /
-  `AnonS` as controls and three negatives: `union Fwd;` (bodiless forward
-  declaration, stays unindexed, `struct FwdS;` as its control) and
-  `union { int q; } anon_var;` (anonymous, mints nothing, as the anonymous struct
-  already did). `typedef union NamedTag { … } NamedU;` mints exactly ONE node named
-  `NamedU`; the tag never becomes a node.
+  `AnonS` as controls, the negatives `union Fwd;` and `struct FwdS;` (bodiless
+  forward declarations, unindexed), and `union { int q; } anon_var;`, the unnamed
+  union defined in a declaration, which is `union anon_var`: it takes its
+  variable's name (upstream #2446; it minted nothing before).
+  `typedef union NamedTag { … } NamedU;` mints exactly ONE node named `NamedU`;
+  the tag never becomes a node.
 - **C++ union member method** — `union_agg.cpp` gives `union WithMethod` and
   `struct SWithMethod` a SAME-NAMED `read_field`, plus one call on each receiver.
   Before the fix the union's member leaked to file scope as a free `function`, so
@@ -615,25 +630,7 @@ which maps to `Language::C` by extension); `ue_actor.h` deliberately uses `.h` t
 guard the content-based C++ reclassification, and `attr_macro.c` uses `.c` so the
 C walker (not the C++ one) is the thing under test.
 
-Regenerate the committed database + canonical JSON reproducibly from the corpus:
-
-```bash
-# 1. Copy the corpus to a clean directory (keeps the workspace index out of it).
-rm -rf /tmp/cg-fixture-cpp
-cp -r crates/codegraph-bench/fixtures/cpp /tmp/cg-fixture-cpp
-
-# 2. Index it with OUR binary (never hand-write the golden).
-cargo build --release -p codegraph-rs
-CODEGRAPH_NO_DAEMON=1 CODEGRAPH_NO_WATCH=1 \
-  ./target/release/codegraph init /tmp/cg-fixture-cpp
-
-# 3. Commit the produced database as the fixture's colby.db.
-cp /tmp/cg-fixture-cpp/.codegraph/codegraph.db reference/golden/cpp/colby.db
-
-# 4. Dump the canonical golden JSON + schema from that database.
-cargo run -p codegraph-bench --bin bench -- \
-  --gen-golden reference/golden/cpp/colby.db reference/golden/cpp
-```
+Regenerate it with `scripts/regen-goldens.sh --write cpp` (the shared recipe in [Regenerating goldens](#regenerating-goldens)).
 
 Like the Ruby fixture, both the index and the dump are byte-stable, and the
 `generated_golden_matches_committed_cpp_fixture` and
@@ -675,32 +672,16 @@ and `self.field.method()` resolution:
   global same-name guess. Genuine `self.run()` recursion keeps its self-edge,
   now at qualified-name confidence rather than proximity confidence.
 
-**The Rust corpus deliberately makes NO instantiation claim.** An `instantiates` edge
-fires only for the CALL-EXPRESSION construction form: `TupleStruct(2)` yes, a bare
-path `UnitStruct` no, a struct literal `Bits { i: 0 }` no. A Rust union is
-constructible only as `Bits { … }`, so no Rust union can ever emit that edge —
-`make_unit` / `make_bits` are return-type references, not instantiation assertions,
-and the golden carries zero `instantiates` edges. Instantiation is pinned in C++
-instead (`instantiate_agg.cpp` / `instantiate_rank.cpp`), which is upstream's own
-shape. The corpus carries **no `Cargo.toml`**: it is indexed, not compiled, and a
-manifest inside the workspace tree could confuse `cargo`.
+**Rust instantiation.** A struct expression is an instantiation, as upstream
+records it: `Bits { i: 0 }` in `make_bits` instantiates the union `Bits`, and
+`Own { .. }` in `Own::from` instantiates `Own`. The corpus carries
+**no `Cargo.toml`**: it is indexed, not compiled, and a manifest inside the
+workspace tree could confuse `cargo`.
 
 The four source files are `lib.rs`, `consumer.rs`, `impl_ownership.rs`, and
 `self_field.rs`.
 
-Regenerate reproducibly (identical recipe to the C++ fixture, substituting `rust`):
-
-```bash
-mkdir -p reference/golden/rust
-rm -rf /tmp/cg-fixture-rust
-cp -r crates/codegraph-bench/fixtures/rust /tmp/cg-fixture-rust
-cargo build --release -p codegraph-rs
-CODEGRAPH_NO_DAEMON=1 CODEGRAPH_NO_WATCH=1 \
-  ./target/release/codegraph init /tmp/cg-fixture-rust
-cp /tmp/cg-fixture-rust/.codegraph/codegraph.db reference/golden/rust/colby.db
-cargo run -p codegraph-bench --bin bench -- \
-  --gen-golden reference/golden/rust/colby.db reference/golden/rust
-```
+Regenerate it with `scripts/regen-goldens.sh --write rust` (the shared recipe in [Regenerating goldens](#regenerating-goldens)).
 
 `generated_golden_matches_committed_rust_fixture` and
 `rust_db_is_self_equivalent_to_rust_golden` enforce byte-stability.
@@ -721,19 +702,7 @@ table fields. Its single `handlers.lua` source pins:
 - `localFn()`, `M.assignedFn()`, and `M:assignedFn()` resolving to the intended
   target, with dot and colon calls sharing `M::assignedFn`.
 
-Regenerate reproducibly:
-
-```bash
-mkdir -p reference/golden/lua
-rm -rf /tmp/cg-fixture-lua
-cp -r crates/codegraph-bench/fixtures/lua /tmp/cg-fixture-lua
-cargo build --release -p codegraph-rs
-CODEGRAPH_NO_DAEMON=1 CODEGRAPH_NO_WATCH=1 \
-  ./target/release/codegraph init /tmp/cg-fixture-lua
-cp /tmp/cg-fixture-lua/.codegraph/codegraph.db reference/golden/lua/colby.db
-cargo run -p codegraph-bench --bin bench -- \
-  --gen-golden reference/golden/lua/colby.db reference/golden/lua
-```
+Regenerate it with `scripts/regen-goldens.sh --write lua` (the shared recipe in [Regenerating goldens](#regenerating-goldens)).
 
 `generated_golden_matches_committed_lua_fixture` and
 `lua_db_is_self_equivalent_to_lua_golden` enforce byte-stability.
@@ -766,19 +735,7 @@ Six files pin BOTH values of the flag, three each way:
 the ranking effect observable: without the content signal the generated definition
 wins on name overlap alone.
 
-Regenerate reproducibly (identical recipe to the Rust fixture, substituting `go`):
-
-```bash
-mkdir -p reference/golden/go
-rm -rf /tmp/cg-fixture-go
-cp -r crates/codegraph-bench/fixtures/go /tmp/cg-fixture-go
-cargo build --release -p codegraph-rs
-CODEGRAPH_NO_DAEMON=1 CODEGRAPH_NO_WATCH=1 \
-  ./target/release/codegraph init /tmp/cg-fixture-go
-cp /tmp/cg-fixture-go/.codegraph/codegraph.db reference/golden/go/colby.db
-cargo run -p codegraph-bench --bin bench -- \
-  --gen-golden reference/golden/go/colby.db reference/golden/go
-```
+Regenerate it with `scripts/regen-goldens.sh --write go` (the shared recipe in [Regenerating goldens](#regenerating-goldens)).
 
 `generated_golden_matches_committed_go_fixture` and
 `go_db_is_self_equivalent_to_go_golden` enforce byte-stability.
@@ -799,41 +756,18 @@ migration order while a freshly-created one carries them in `BASE_SCHEMA` order.
 That is why `mini` and `godot` used to carry `idx_edges_identity` LAST while the
 other corpora carried it alphabetically.
 
-For a schema migration, rebuild `mini` on the fresh schema and transplant its rows:
+For a schema migration, rebuild `mini` on the fresh schema and transplant its rows.
+`scripts/regen-goldens.sh --mini-transplant` does exactly this: a fresh `init` over
+`crates/codegraph-bench/fixtures/mini/` creates a database from the current
+`BASE_SCHEMA`, its freshly-extracted rows are replaced with mini's committed rows
+(an `ATTACH` of `reference/golden/mini/colby.db`), the result is committed as
+`colby.db`, and the JSON + schema goldens are re-derived from it:
 
 ```bash
-# 1. A fresh index over mini's own fixture → a database created from the CURRENT
-#    BASE_SCHEMA, so every index lands in declaration order.
-rm -rf /tmp/mini-rebuild && mkdir -p /tmp/mini-rebuild
-cp -a crates/codegraph-bench/fixtures/mini/. /tmp/mini-rebuild/
-CODEGRAPH_NO_DAEMON=1 CODEGRAPH_NO_WATCH=1 \
-  ./target/release/codegraph init /tmp/mini-rebuild
-DB=/tmp/mini-rebuild/.codegraph/codegraph.db
-
-# 2. Replace its freshly-extracted rows with mini's COMMITTED rows, preserving
-#    the upstream-derived values instead of re-extracting them. Run from the repo
-#    root — the ATTACH path is relative.
-sqlite3 "$DB" "
-  ATTACH DATABASE 'reference/golden/mini/colby.db' AS src;
-  BEGIN;
-  DELETE FROM unresolved_refs; DELETE FROM edges; DELETE FROM files;
-  DELETE FROM nodes; DELETE FROM project_metadata;
-  INSERT INTO nodes            SELECT * FROM src.nodes;
-  INSERT INTO edges            SELECT * FROM src.edges;
-  INSERT INTO unresolved_refs  SELECT * FROM src.unresolved_refs;
-  INSERT INTO project_metadata SELECT * FROM src.project_metadata;
-  INSERT INTO files (path, content_hash, language, size, modified_at, indexed_at, node_count, errors)
-    SELECT path, content_hash, language, size, modified_at, indexed_at, node_count, errors FROM src.files;
-  COMMIT;
-  DETACH src;"
-
-# 3. Commit as the fixture's colby.db, then re-derive the JSON + schema goldens.
-cp "$DB" reference/golden/mini/colby.db
-cargo run -p codegraph-bench --bin bench -- \
-  --gen-golden reference/golden/mini/colby.db reference/golden/mini
+scripts/regen-goldens.sh --mini-transplant
 ```
 
-Two constraints in that transplant are load-bearing:
+Two constraints in that transplant are load-bearing, and the script keeps both:
 
 - **The `files` insert MUST use an explicit column list.** `SELECT *` fails with
   `table files has N columns but 8 values were supplied` once a column is added,
@@ -858,6 +792,32 @@ diff reference/golden/mini/schema.sql reference/golden/cpp/schema.sql           
 
 That last `diff` is the real proof: the rebuilt `mini` schema is now the same text
 as a freshly-created corpus's, so every corpus `schema.sql` shares one hash.
+
+### Mini resolution regeneration (OD-4)
+
+A change that moves how `mini` resolves (its edges or unresolved references)
+regenerates those two tables from Rust output while its nodes, files and project
+metadata stay upstream-derived (decision OD-4 of the v0.55 program).
+`scripts/regen-goldens.sh --mini-resolve` does that: the same fresh `init` as the
+transplant, then mini's committed nodes, files and project metadata replace the
+fresh ones, and the fresh `edges` and `unresolved_refs` stay. It refuses to run
+unless the fresh node ids equal the committed ones, so every regenerated edge
+and reference points at a node the golden keeps. Each regenerated row is listed
+here with its reason:
+
+- `fix(resolve): an imports reference binds the file it names, never its own
+import statement`: `imports file:src/app.ts -> import:4ec14e7f…`
+  (`qualified-name`, 0.95: the file's own `./math` statement) is gone, and
+  `imports file:src/app.ts -> file:src/math.ts` (`import`, 0.9) replaces it
+  (upstream #2392 and #2263). The first Rust regeneration of mini's references
+  also adds the unresolved `function_ref` `this.value` at `src/math.ts:9:26`
+  from `Counter::increment`: the argument in `add(this.value, step)` is a
+  function-as-value candidate, and a `this.<member>` candidate is always kept
+  (upstream `flushFnRefCandidates`). It binds nothing, since `value` is a field,
+  and mini's committed rows came from an upstream build that did not record it.
+
+The final OD-4 parity run of upstream `b635dd46` on `mini` checks these rows
+against upstream's own output.
 
 ### Metal fixture
 
@@ -905,17 +865,7 @@ The CUDA blank fires for `.cu`/`.cuh` files OR any C/C++-family file whose conte
 carries a strong CUDA marker (`__global__`/`__device__`/`__constant__`/
 `cudaStream_t`), so CUDA living in `.h`/`.hpp` headers is recognized.
 
-Regenerate both new fixtures reproducibly (identical recipe to the C++ fixture,
-substituting `metal`/`cuda`):
-
-```bash
-rm -rf /tmp/cg-fixture-metal && cp -r crates/codegraph-bench/fixtures/metal /tmp/cg-fixture-metal
-cargo build --release -p codegraph-rs
-CODEGRAPH_NO_DAEMON=1 CODEGRAPH_NO_WATCH=1 ./target/release/codegraph init /tmp/cg-fixture-metal
-cp /tmp/cg-fixture-metal/.codegraph/codegraph.db reference/golden/metal/colby.db
-cargo run -p codegraph-bench --bin bench -- --gen-golden reference/golden/metal/colby.db reference/golden/metal
-# …and the same for cuda.
-```
+Regenerate both fixtures with `scripts/regen-goldens.sh --write metal cuda` (the shared recipe in [Regenerating goldens](#regenerating-goldens)).
 
 The `generated_golden_matches_committed_{metal,cuda}_fixture` and
 `{metal,cuda}_db_is_self_equivalent_to_{metal,cuda}_golden` tests in
@@ -936,7 +886,9 @@ MyView` with a `build()` method, and a plain `class Model`. The golden must show
 - `component.ets` with `"language": "arkts"`;
 - `MyView` as a `NodeKind::Struct` with its `build` method as a member (via the
   existing `extract_struct` path — no walker change);
-- `helper`/`driver` functions, the `Model` class, and the `../foo` import node;
+- `helper`/`driver` functions, the `Model` class, and the `../foo` import node,
+  whose `imports` reference stays unresolved: no file answers `../foo`, and an
+  import never binds its own statement (upstream #2392);
 - the `driver` → `helper` `Calls` edge (plain `call_expression`);
 - the `MyView::build` → `helper` `Calls` edge from line 12. `tree-sitter-arkts`
   0.3 parses the call inside the `@Component struct`'s `build()` method; 0.2 did
@@ -951,16 +903,7 @@ edges) and does NOT override `extract_modifiers` (the decorator hook). Adding th
 variant is byte-neutral for `colby.schema.sql` (language is a stored TEXT value,
 not DDL) and for the six existing goldens (none holds a `.ets` file).
 
-Regenerate reproducibly (identical recipe to the C++ fixture, substituting
-`arkts`):
-
-```bash
-rm -rf /tmp/cg-fixture-arkts && cp -r crates/codegraph-bench/fixtures/arkts /tmp/cg-fixture-arkts
-cargo build --release -p codegraph-rs
-CODEGRAPH_NO_DAEMON=1 CODEGRAPH_NO_WATCH=1 ./target/release/codegraph init /tmp/cg-fixture-arkts
-cp /tmp/cg-fixture-arkts/.codegraph/codegraph.db reference/golden/arkts/colby.db
-cargo run -p codegraph-bench --bin bench -- --gen-golden reference/golden/arkts/colby.db reference/golden/arkts
-```
+Regenerate it with `scripts/regen-goldens.sh --write arkts` (the shared recipe in [Regenerating goldens](#regenerating-goldens)).
 
 The `generated_golden_matches_committed_arkts_fixture` and
 `arkts_db_is_self_equivalent_to_arkts_golden` tests in
@@ -1001,16 +944,7 @@ post-resolution state. No `FrameworkResolver` impl is involved; the
 `colby.schema.sql` (language is a stored TEXT value, not DDL) and for the seven
 existing goldens (none holds a `.sol` file).
 
-Regenerate reproducibly (identical recipe to the ArkTS fixture, substituting
-`solidity`):
-
-```bash
-rm -rf /tmp/cg-fixture-solidity && cp -r crates/codegraph-bench/fixtures/solidity /tmp/cg-fixture-solidity
-cargo build --release -p codegraph-rs
-CODEGRAPH_NO_DAEMON=1 CODEGRAPH_NO_WATCH=1 ./target/release/codegraph init /tmp/cg-fixture-solidity
-cp /tmp/cg-fixture-solidity/.codegraph/codegraph.db reference/golden/solidity/colby.db
-cargo run -p codegraph-bench --bin bench -- --gen-golden reference/golden/solidity/colby.db reference/golden/solidity
-```
+Regenerate it with `scripts/regen-goldens.sh --write solidity` (the shared recipe in [Regenerating goldens](#regenerating-goldens)).
 
 The `generated_golden_matches_committed_solidity_fixture` and
 `solidity_db_is_self_equivalent_to_solidity_golden` tests in
@@ -1049,16 +983,7 @@ resolve code binds anything. Adding the variant is byte-neutral for
 `colby.schema.sql` (language is a stored TEXT value, not DDL) and for the eight
 existing goldens (none holds a `.nix` file).
 
-Regenerate reproducibly (identical recipe to the Solidity fixture, substituting
-`nix`):
-
-```bash
-rm -rf /tmp/cg-fixture-nix && cp -r crates/codegraph-bench/fixtures/nix /tmp/cg-fixture-nix
-cargo build --release -p codegraph-rs
-CODEGRAPH_NO_DAEMON=1 CODEGRAPH_NO_WATCH=1 ./target/release/codegraph init /tmp/cg-fixture-nix
-cp /tmp/cg-fixture-nix/.codegraph/codegraph.db reference/golden/nix/colby.db
-cargo run -p codegraph-bench --bin bench -- --gen-golden reference/golden/nix/colby.db reference/golden/nix
-```
+Regenerate it with `scripts/regen-goldens.sh --write nix` (the shared recipe in [Regenerating goldens](#regenerating-goldens)).
 
 The `generated_golden_matches_committed_nix_fixture` and
 `nix_db_is_self_equivalent_to_nix_golden` tests in
@@ -1102,16 +1027,7 @@ top-level-assignment `var.X` ref, and the `module.M:output.<out>` scoped half of
 byte-neutral for `colby.schema.sql` (language is a stored TEXT value, not DDL)
 and for the nine existing goldens (none holds a `.tf`/`.tfvars`/`.tofu` file).
 
-Regenerate reproducibly (identical recipe to the Nix fixture, substituting
-`terraform`):
-
-```bash
-rm -rf /tmp/cg-fixture-terraform && cp -r crates/codegraph-bench/fixtures/terraform /tmp/cg-fixture-terraform
-cargo build --release -p codegraph-rs
-CODEGRAPH_NO_DAEMON=1 CODEGRAPH_NO_WATCH=1 ./target/release/codegraph init /tmp/cg-fixture-terraform
-cp /tmp/cg-fixture-terraform/.codegraph/codegraph.db reference/golden/terraform/colby.db
-cargo run -p codegraph-bench --bin bench -- --gen-golden reference/golden/terraform/colby.db reference/golden/terraform
-```
+Regenerate it with `scripts/regen-goldens.sh --write terraform` (the shared recipe in [Regenerating goldens](#regenerating-goldens)).
 
 The `generated_golden_matches_committed_terraform_fixture` and
 `terraform_db_is_self_equivalent_to_terraform_golden` tests in
@@ -1153,16 +1069,7 @@ dispatch, dynamic MFA targets, behaviour callback contracts, and
 node lookup normalize Erlang's source spelling `mod:fn/3` to the stored
 `mod::fn/3` form.
 
-Regenerate reproducibly (identical recipe to the Terraform fixture, substituting
-`erlang`):
-
-```bash
-rm -rf /tmp/cg-fixture-erlang && cp -r crates/codegraph-bench/fixtures/erlang /tmp/cg-fixture-erlang
-cargo build --release -p codegraph-rs
-CODEGRAPH_NO_DAEMON=1 CODEGRAPH_NO_WATCH=1 ./target/release/codegraph init /tmp/cg-fixture-erlang
-cp /tmp/cg-fixture-erlang/.codegraph/codegraph.db reference/golden/erlang/colby.db
-cargo run -p codegraph-bench --bin bench -- --gen-golden reference/golden/erlang/colby.db reference/golden/erlang
-```
+Regenerate it with `scripts/regen-goldens.sh --write erlang` (the shared recipe in [Regenerating goldens](#regenerating-goldens)).
 
 The `generated_golden_matches_committed_erlang_fixture` and
 `erlang_db_is_self_equivalent_to_erlang_golden` tests in
@@ -1171,45 +1078,44 @@ The `generated_golden_matches_committed_erlang_fixture` and
 ### CFML fixture
 
 A twelfth golden fixture, `reference/golden/cfml/`, guards CFML / ColdFusion
-extraction (upstream #1153 / `816bacb`, the scope-B extraction slice only). CFML
-is a **new `Language::Cfml` variant** backed by the **dual-grammar
-`tree-sitter-cfml`** crate (`.cfc`/`.cfm`/`.cfs` → `Language::Cfml`). A file's
-dialect is picked by a first-token sniff (`is_bare_script_cfml`): script files
-parse with the bundled `cfscript` grammar and drive the generic type-set
-dispatch; tag files parse with the `cfml` tag grammar and are handled by the
-`Language::Cfml`-guarded `visit_cfml_node` walker extension. The corpus
-(`crates/codegraph-bench/fixtures/cfml/`) has three deterministic files — a
-script `Base.cfc`, a tag `Widget.cfm`, and a bare-script `Gadget.cfs`. What it
-guards:
+extraction. CFML is a **`Language::Cfml` variant** backed by the
+**dual-grammar `tree-sitter-cfml`** crate (`.cfc`/`.cfm`/`.cfs` →
+`Language::Cfml`). A file's dialect is picked by a first-token sniff
+(`is_bare_script_cfml`): script files parse with the bundled `cfscript` grammar
+and drive the generic type-set dispatch; tag files parse with the `cfml` tag
+grammar and are walked by the `Language::Cfml`-guarded tag walker
+(`walk_cfml_program`). The corpus (`crates/codegraph-bench/fixtures/cfml/`) has
+three deterministic files — a script `Base.cfc`, a tag `Widget.cfm`, and a
+bare-script `Gadget.cfs`. What it guards:
 
 - all three files with `"language": "cfml"`;
 - `Base.cfc` (script) → `NodeKind::Class` `Base` (named from the FILE — the
-  cfscript `component` is unnamed) + `NodeKind::Function` `ping`;
-- `Widget.cfm` (tag) → `NodeKind::Class` `Widget` (from the `name` tag-attr) +
-  `NodeKind::Method` `doThing` (access `public`, returntype `void`), and a tag
-  `extends="Base"` → `Extends`;
+  cfscript `component` is unnamed) + `NodeKind::Method` `Base::ping`;
+- `Widget.cfm` (tag) → `NodeKind::Class` `Widget` (from the `name` tag-attr,
+  spanning to its close tag on line 5) + `NodeKind::Method` `Widget::doThing`
+  (access `public`, returntype `void`), and a tag `extends="Base"` → `Extends`;
 - `Gadget.cfs` (bare script) → `NodeKind::Class` `Gadget` (from the FILE) +
-  `NodeKind::Property` `x` + `NodeKind::Function` `doThing`, and a script-style
-  `extends="Base"` (`component_attribute`) → `Extends`;
+  `NodeKind::Property` `x` + `NodeKind::Method` `Gadget::doThing`, and a
+  script-style `extends="Base"` (`component_attribute`) → `Extends`, recorded
+  at the attribute value;
 - both `extends Base` refs RESOLVE to the `Base.cfc` component (edges);
   `Gadget.doThing`'s `helper()` call → an unresolved `helper` ref.
 
-The `<cfscript>`-in-tag-body re-parse delegation, the `cfquery` SQL-body
-extraction (`LANGUAGE_CFQUERY`), and the CFML framework RESOLVER bridges
-(FW/1 / ColdBox / CFWheels, dotted/relative inheritance, receiver-type inference)
-are all **DEFERRED**. Adding the variant is byte-neutral for `colby.schema.sql`
-(language is a stored TEXT value, not DDL) and for the eleven existing goldens
-(none holds a `.cfc`/`.cfm`/`.cfs` file).
+The corpus holds none of the other CFML shapes [languages.md](languages.md)
+describes: `<cfinterface>`, tag expressions, the `<cfscript>` and `<cfquery>`
+bodies read in place with their own grammars, scope-prefixed and typed
+receivers (upstream #1155), component-path inheritance (upstream #1152 / #1154:
+FW/1's relative `../base`, ColdBox's dotted `coldbox.system.web.Controller`),
+the `extends`-chain scope of a bare call and the untyped-receiver gate. Those
+are guarded by the CFML probes, the walker's unit tests and the
+sync-convergence matrix, not by this golden. A `<cfscript>` or `<cfquery>` body
+nested past the walker's depth limit fails its whole file with the depth error,
+as a deep tag tree does (`crates/codegraph-extract/tests/deep_nesting.rs`).
+Adding the variant was byte-neutral for `colby.schema.sql` (language is a
+stored TEXT value, not DDL) and for the eleven goldens before it (none holds a
+`.cfc`/`.cfm`/`.cfs` file).
 
-Regenerate reproducibly (identical recipe, substituting `cfml`):
-
-```bash
-rm -rf /tmp/cg-fixture-cfml && cp -r crates/codegraph-bench/fixtures/cfml /tmp/cg-fixture-cfml
-cargo build --release -p codegraph-rs
-CODEGRAPH_NO_DAEMON=1 CODEGRAPH_NO_WATCH=1 ./target/release/codegraph init /tmp/cg-fixture-cfml
-cp /tmp/cg-fixture-cfml/.codegraph/codegraph.db reference/golden/cfml/colby.db
-cargo run -p codegraph-bench --bin bench -- --gen-golden reference/golden/cfml/colby.db reference/golden/cfml
-```
+Regenerate it with `scripts/regen-goldens.sh --write cfml` (the shared recipe in [Regenerating goldens](#regenerating-goldens)).
 
 The `generated_golden_matches_committed_cfml_fixture` and
 `cfml_db_is_self_equivalent_to_cfml_golden` tests in
@@ -1245,6 +1151,12 @@ edge; and no
 `Calls` edge may target either the exported `Constant` `constAlias` or the
 JavaScript `collisionTarget` in `collision.js`.
 
+Each module specifier is a file-level `imports` edge to the file it names,
+found the way the call resolution finds it: `./collision.js` reaches
+`collision.ts`, as `viaCollision()` does. `./missing.js` names no file, so its
+`imports` reference is unresolved too; an import never binds its own statement
+(upstream #2392 and #2263).
+
 The expanded corpus also pins:
 
 - local `api.run()` / `api.stop()` and imported `api.run()` / `api.stop()` to
@@ -1253,6 +1165,10 @@ The expanded corpus also pins:
   from becoming the target, while nested `api.nested.run()` remains unresolved;
   since extraction version 14 it is retained as the qualified call site
   `api.nested.run` (upstream #1862), which only a framework resolver may bind;
+- the nested literal's `run()` is no member of `api`, but the value holding
+  it runs where the literal is written, so its `helper()` call is a call from
+  the constant `api` (upstream #2363, #693), beside the calls `api::run` and
+  `api::stop` make themselves;
 - `tsconfig.json` extends the JSONC/trailing-comma
   `config/tsconfig.base.json`; the declaring config's `baseUrl` resolves
   `@fixture/aliased` to `src/aliased.ts`;
@@ -1276,19 +1192,7 @@ all four canonical JSON artifacts and proving the original 14-file rows
 byte-for-byte unchanged. This is the required review shape for future corpus
 growth: an additive fixture must not silently perturb old resolution confidence.
 
-Regenerate the committed database and canonical artifacts from a clean corpus:
-
-```bash
-rm -rf /tmp/cg-fixture-typescript
-cp -r crates/codegraph-bench/fixtures/typescript /tmp/cg-fixture-typescript
-cargo build --release -p codegraph-rs
-CODEGRAPH_NO_DAEMON=1 CODEGRAPH_NO_WATCH=1 \
-  ./target/release/codegraph init /tmp/cg-fixture-typescript
-mkdir -p reference/golden/typescript
-cp /tmp/cg-fixture-typescript/.codegraph/codegraph.db reference/golden/typescript/colby.db
-cargo run -p codegraph-bench --bin bench -- \
-  --gen-golden reference/golden/typescript/colby.db reference/golden/typescript
-```
+Regenerate it with `scripts/regen-goldens.sh --write typescript` (the shared recipe in [Regenerating goldens](#regenerating-goldens)).
 
 The `generated_golden_matches_committed_typescript_fixture` and
 `typescript_db_is_self_equivalent_to_typescript_golden` tests in
@@ -1296,6 +1200,106 @@ The `generated_golden_matches_committed_typescript_fixture` and
 self-equivalence. As for every fixture below the Godot caveats, do not compare
 `colby.db` bytes; compare the four JSON artifacts byte-for-byte and compare
 `schema.sql` as a normalized statement set when statement order differs.
+
+### Baseline corpora for C#, Java, Swift, Objective-C, PHP, Vue, Svelte, Python bases and CommonJS
+
+These nine corpora pin languages and shapes the older corpora never exercised.
+Each was captured with the extraction and resolution as they stood when the
+corpus was added, deliberately including what that code got wrong, so every later
+correction shows up as a diff attributable to one change:
+
+- **`csharp`**: a `base_list` with a class base and an interface, target-typed
+  `new()`, property accessor bodies and expression-bodied members, field
+  initializers, nested and sibling block namespaces, `using static`, a partial
+  class split across declarations, and an overload that delegates to its
+  sibling. It declares no extension method, so the rule that a call on an
+  outside type reaches the project's one in-scope extension method for it
+  (W3-05c; KEEP-RUST, OD-8: upstream resolves no extension method) moves
+  nothing here; the probe
+  `pr2169_a_csharp_call_on_an_outside_type_reaches_the_projects_extension_method`
+  and the sync case `csharp_extension_method_call_body_edit` pin it. What it
+  cannot tell apart: two outside types with one simple name from different
+  namespaces (`System.Threading.Timer` and `System.Timers.Timer`), imported by
+  different files, as every typed resolution by simple name. An extension
+  call's overloads compete only when their `this` types and `where` clauses
+  agree token by token (spacing and comments aside, the method's own type
+  parameters numbered by first use); two spellings of one type (`int` and
+  `System.Int32`, an alias) keep the target the name match chose, as does an
+  overload choice that needs argument types.
+- **`java`**: `extends`/`implements`, object creation and an anonymous class,
+  enum constants with their own bodies, a static import, two same-named `Field`
+  classes in different packages, test-only imports of Mockito helpers, and the
+  `pick(int)`/`pick(String)` overload pair.
+- **`swift`**: a protocol and its conformance, an extension of a struct, nested
+  types reached through a type path (`API.DependencyController.GetRoute.query()`)
+  beside a same-named path elsewhere, an overload family distinguished by
+  argument labels, and a `#Preview` block.
+- **`objc`**: `@interface Sub : Base <Doer>`, message sends to `self`, `super`
+  and a class, and a plain C call inside a method.
+- **`php`**: namespaces with `use` imports, `extends`/`implements`,
+  `$this`/`self`/`static`/`parent` calls, calls written after `=>` in an array literal, a
+  case-variant call to a global function, and a namespace-qualified class name
+  (`Field\FirstName::make()`). It declares no class property, so W2-03d's
+  property `field` nodes (as upstream's `extractField`) and their type
+  references (KEEP-RUST, OD-8: upstream reads no property type) move nothing
+  here; `php_class_properties_are_field_nodes`,
+  `php_property_types_are_references` and the sync case
+  `php_property_type_of_an_added_class` pin them.
+- **`vue`**: a `<script setup>` component calling an imported composable and a
+  local function from the template, and an Options API component with `data`,
+  `computed`, `methods` and a lifecycle hook.
+- **`svelte`**: a component with a module script and an instance script whose
+  top-level statement calls an imported function.
+- **`python_bases`**: a class with two bases and a metaclass keyword, a
+  classmethod reached through a subclass, `super()` calls, a pytest fixture
+  feeding a test parameter, and a package that re-exports a class through `*`,
+  which `from pkg.models import User` and `models.User()` follow to its
+  definition (upstream #2247, #2248).
+- **`commonjs`**: `require('../')`, `module.exports = X`,
+  `exports.default`, a destructured `{ default: X }` require, `require().member`,
+  a `var` list declaring two requires, and a test that requires an out-of-repo
+  package.
+
+Regenerate any of them with `scripts/regen-goldens.sh --write <corpus>` (the
+shared recipe in [Regenerating goldens](#regenerating-goldens)); `golden_reextract`
+and the `golden_corpora!` pairs in `equivalence.rs` pin them like every other
+corpus.
+
+### Framework and synthesis corpora
+
+Four multi-project corpora give the framework resolvers and the synthesis passes
+a baseline before they land. Each project directory carries the manifest that
+framework detection reads (`package.json`, `pom.xml`, `pubspec.yaml`,
+`composer.json`, `Gemfile`, `*.csproj`, `Package.swift`, `Cargo.toml`, `go.mod`,
+`build.sbt`),
+and the projects deliberately share symbol names, so name matching that crosses
+project boundaries is visible in the golden:
+
+- **`routers`**: React Router, Next.js (`app/` and `pages/`), Expo Router
+  (including a `+api` file), Vue Router, Nuxt, SvelteKit (a `(group)` folder
+  and a parameter matcher), Angular and TanStack Router apps side by side,
+  each with links and programmatic navigation.
+- **`servers`**: Express (a mounted router, inline and function-expression
+  handlers, middleware), NestJS (global prefix and URI versioning), Flask
+  (`route` and `add_url_rule`), Django, FastAPI (router prefix), Spring,
+  Laravel (array and string controllers, a prefix group), Rails (`resources`
+  with `only`/`except`, a namespace), ASP.NET (a controller and a minimal API),
+  Vapor, axum, actix-web, Gin, Play and a Drupal `routing.yml`.
+- **`mobile`**: React Native native modules (Java and Objective-C halves, an
+  event name held in a constant, a `requireNativeComponent` view), an Expo
+  module (Swift and Kotlin definitions called through `requireNativeModule`),
+  a Swift class called from Objective-C, and a Flutter app whose
+  `pubspec.yaml` names the Flutter SDK.
+- **`synthesis`**: an event emitter and a handler table, a React component that
+  re-renders a child, Redux Toolkit and Pinia stores, Go interface embedding with
+  implicit implementations, a type alias and a defined type, a C function-pointer
+  table, Kotlin `expect`/`actual`, a MyBatis mapper, a Celery task, and Spring
+  application events.
+
+At capture time the golden still contains cross-project misses (for example an
+Angular `@Component` decorator bound to a React file's `Component`); the commits
+that scope resolution to its own project remove them, and the diff records it.
+Regenerate any of them with `scripts/regen-goldens.sh --write <corpus>`.
 
 ### Retrieval and ranking wave (golden-neutral)
 

@@ -236,6 +236,7 @@ struct ScannedUse {
     module_open: Option<usize>,
     glob: bool,
     names: Vec<String>,
+    tree: UseTreeFacts,
 }
 
 #[derive(Debug)]
@@ -246,6 +247,19 @@ struct UseItem {
     module: Option<usize>,
     glob: bool,
     names: Vec<String>,
+    tree: UseTreeFacts,
+}
+
+/// What one `use` item's tree spells (upstream #2214 `rustUsesOf`).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct UseTreeFacts {
+    /// The tree's first path segment (`std`, `crate`, `futures`), `::`-rooted
+    /// paths included.
+    pub(crate) root: String,
+    /// Every identifier the tree spells, its path segments included.
+    pub(crate) idents: Vec<String>,
+    /// The segment before each `::*` (`super` in `use super::*`).
+    pub(crate) glob_modules: Vec<String>,
 }
 
 impl RustUseScopes {
@@ -288,6 +302,7 @@ impl RustUseScopes {
                         .find(|&j| mask[j] && bytes[j] == b';')
                         .unwrap_or(bytes.len());
                     let (glob, names) = use_tree_names(bytes, &mask, i + 3, end);
+                    let tree = use_tree_facts(bytes, &mask, i + 3, end);
                     found.push(ScannedUse {
                         block_open: stack.last().copied(),
                         module_open: stack
@@ -297,6 +312,7 @@ impl RustUseScopes {
                             .copied(),
                         glob,
                         names,
+                        tree,
                     });
                     // A use tree's own braces balance inside the item.
                     i = end;
@@ -319,6 +335,7 @@ impl RustUseScopes {
                 module: found.module_open.filter(|_| balanced),
                 glob: found.glob,
                 names: found.names,
+                tree: found.tree,
             })
             .collect();
         let modules = if balanced {
@@ -330,6 +347,14 @@ impl RustUseScopes {
             Vec::new()
         };
         Self { uses, modules }
+    }
+
+    /// Every `use` item of the file, wherever it is visible: the names it
+    /// brings into scope and what its tree spells.
+    pub(crate) fn items(&self) -> impl Iterator<Item = (&[String], &UseTreeFacts)> {
+        self.uses
+            .iter()
+            .map(|item| (item.names.as_slice(), &item.tree))
     }
 
     /// Whether a `use` visible at byte `offset` names `name` or is a glob.
@@ -412,6 +437,67 @@ fn use_tree_names(bytes: &[u8], mask: &[bool], start: usize, end: usize) -> (boo
         names.push(name);
     }
     (glob, names)
+}
+
+/// What a use tree in `bytes[start..end]` spells: its first path segment,
+/// every identifier, and the segment before each `::*`.
+fn use_tree_facts(bytes: &[u8], mask: &[bool], start: usize, end: usize) -> UseTreeFacts {
+    let mut facts = UseTreeFacts::default();
+    // The root is the tree's first segment, after an optional `::`: a tree
+    // that opens with a group (`use {std::io, crate::x};`) has none.
+    let mut j = start;
+    while j < end && (!mask[j] || bytes[j].is_ascii_whitespace() || bytes[j] == b':') {
+        j += 1;
+    }
+    if let Some((ident, _)) = (j < end).then(|| read_ident(bytes, j)).flatten() {
+        facts.root = ident.to_string();
+    }
+    // The identifier before the last `::`, for a `*` after it (`a::*`,
+    // `a::{b, *}` takes `a`).
+    let mut last_ident: Option<String> = None;
+    let mut before_group: Vec<Option<String>> = Vec::new();
+    let mut j = start;
+    while j < end {
+        if !mask[j] || bytes[j].is_ascii_whitespace() {
+            j += 1;
+            continue;
+        }
+        match bytes[j] {
+            b'*' => {
+                let module = last_ident
+                    .clone()
+                    .or_else(|| before_group.last().cloned().flatten());
+                if let Some(module) = module {
+                    facts.glob_modules.push(module);
+                }
+                j += 1;
+            }
+            b'{' => {
+                before_group.push(last_ident.take());
+                j += 1;
+            }
+            b'}' => {
+                before_group.pop();
+                last_ident = None;
+                j += 1;
+            }
+            b',' => {
+                last_ident = None;
+                j += 1;
+            }
+            b':' => j += 1,
+            _ => {
+                let Some((ident, after)) = read_ident(bytes, j) else {
+                    j += 1;
+                    continue;
+                };
+                facts.idents.push(ident.to_string());
+                last_ident = Some(ident.to_string());
+                j = after;
+            }
+        }
+    }
+    facts
 }
 
 /// Whether the code byte at `i` starts the keyword `word`, on word boundaries.
@@ -516,6 +602,33 @@ mod tests {
         for not_introduced in ["Err", "Ok", "None", "Outcome", "a", "_"] {
             assert!(!scopes.covers(call, not_introduced), "{not_introduced}");
         }
+    }
+
+    #[test]
+    fn a_use_tree_spells_its_root_identifiers_and_glob_modules() {
+        let src = "use ::std::task::{Context, Poll};\nuse crate::glob::*;\nuse super::*;\nuse a::{b::{self, *}, c as d};\n";
+        let scopes = RustUseScopes::scan(src);
+        let trees: Vec<(String, Vec<String>, Vec<String>)> = scopes
+            .items()
+            .map(|(_, tree)| {
+                (
+                    tree.root.clone(),
+                    tree.idents.clone(),
+                    tree.glob_modules.clone(),
+                )
+            })
+            .collect();
+        assert_eq!(trees[0].0, "std");
+        assert_eq!(trees[0].1, ["std", "task", "Context", "Poll"]);
+        assert_eq!(trees[1].2, ["glob"]);
+        assert_eq!(trees[2].2, ["super"]);
+        assert_eq!(trees[3].1, ["a", "b", "self", "c", "as", "d"]);
+        assert_eq!(trees[3].2, ["b"]);
+        // A tree that opens with a group has no root.
+        let scopes = RustUseScopes::scan("use {std::io, crate::x::Y};\n");
+        let (names, tree) = scopes.items().next().expect("one use item");
+        assert_eq!(tree.root, "");
+        assert_eq!(names, ["io", "Y"]);
     }
 
     #[test]

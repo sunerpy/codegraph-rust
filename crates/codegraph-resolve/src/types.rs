@@ -280,8 +280,25 @@ pub enum ReExport {
         /// Module specifier of the upstream module.
         source: String,
     },
+    /// `export * as ns from 'source'`: only `ns` is exported, the module's
+    /// members through it (upstream #2192).
+    Namespace {
+        /// The namespace's name as exported by THIS file.
+        exported_name: String,
+        /// Module specifier of the upstream module.
+        source: String,
+    },
     /// An explicit local export alias such as `export { original as alias }`.
     LocalAlias {
+        /// Name as exported by THIS file.
+        exported_name: String,
+        /// Name of the local declaration.
+        original_name: String,
+    },
+    /// A CommonJS export of a local binding by name (upstream #2189):
+    /// `exports.setCharset = function setCharset(…)`, `module.exports.x =
+    /// impl`, `module.exports = { parse, format: formatDate }`.
+    CommonJsAlias {
         /// Name as exported by THIS file.
         exported_name: String,
         /// Name of the local declaration.
@@ -366,6 +383,16 @@ pub trait ResolutionContext {
     }
     /// Check if a file exists (`fileExists`).
     fn file_exists(&self, file_path: &str) -> bool;
+    /// Whether `file_path` (project-relative) is one of the files the index
+    /// holds. Unlike [`Self::file_exists`], which also answers from the
+    /// filesystem, a directory or a `node_modules` file is never one.
+    fn is_indexed_file(&self, file_path: &str) -> bool {
+        let normalized = file_path.replace('\\', "/");
+        let basename = normalized.rsplit('/').next().unwrap_or(&normalized);
+        self.get_files_by_basename_shared(basename)
+            .iter()
+            .any(|file| file.replace('\\', "/") == normalized)
+    }
     /// Read file content (`readFile`); `None` when unreadable.
     fn read_file(&self, file_path: &str) -> Option<String>;
     /// Whether [`Self::read_file`] can produce source text.
@@ -467,6 +494,15 @@ pub trait ResolutionContext {
         None
     }
 
+    /// The package names `dir`'s package.json chain and Deno import maps own
+    /// and depend on (upstream #2128 `manifestScope`). `dir` is the
+    /// project-relative directory of an indexed file (`""` for the root). The
+    /// default reads it uncached; the store and snapshot contexts keep each
+    /// directory's for the pass.
+    fn manifest_scope(&self, dir: &str) -> Arc<crate::package_manifests::ManifestScope> {
+        Arc::new(crate::package_manifests::read_manifest_scope(dir, self))
+    }
+
     /// Go module info from `go.mod` (`getGoModule?`). `None` for non-Go /
     /// module-less projects (`types.ts:104-111`).
     fn get_go_module(&self) -> Option<GoModule> {
@@ -482,6 +518,14 @@ pub trait ResolutionContext {
         self.get_go_module().into_iter().collect()
     }
 
+    /// The project's Rust crates and the ones its manifests depend on, from
+    /// every `Cargo.toml` at or above an indexed `.rs` file (upstream #2214).
+    /// Contexts that live for one resolution pass read them once; the default
+    /// knows none.
+    fn get_rust_crates(&self) -> Arc<crate::rust_scope::RustCrates> {
+        crate::rust_scope::no_rust_crates()
+    }
+
     /// Re-exports declared by a file (`getReExports?`, `types.ts:119-125`).
     /// Empty when the file has none.
     fn get_re_exports(&self, _file_path: &str, _language: Language) -> Vec<ReExport> {
@@ -492,6 +536,70 @@ pub trait ResolutionContext {
     /// `types.ts:135-141`). Empty by default.
     fn get_cpp_include_dirs(&self) -> Vec<String> {
         Vec::new()
+    }
+
+    /// Python files by the words they spell after `.`, `'` or `"`, which a
+    /// module global's write scan reads (upstream #2332). Contexts that live
+    /// for one resolution pass build it once; the default builds it on each
+    /// call.
+    fn python_write_index(&self) -> Arc<crate::python_globals::PythonWriteIndex> {
+        Arc::new(crate::python_globals::PythonWriteIndex::build(self))
+    }
+
+    /// The project's C/C++ namespace aliases and namespace macros, which a
+    /// qualified C/C++ name reads (upstream #2176). Contexts that live for
+    /// one resolution pass keep one set; the default makes a new one, which
+    /// reads the files again, on each call.
+    fn cpp_namespace_tables(&self) -> Arc<crate::cpp_namespaces::CppNamespaceTables> {
+        Arc::new(crate::cpp_namespaces::CppNamespaceTables::new())
+    }
+
+    /// The project-wide Kotlin facts a bare Kotlin call reads (upstream
+    /// #2172's receiver types). Contexts that live for one resolution pass
+    /// keep one set; the default makes a new one, which reads the files
+    /// again, on each call.
+    fn kotlin_tables(&self) -> Arc<crate::kotlin_scope::KotlinTables> {
+        Arc::new(crate::kotlin_scope::KotlinTables::new())
+    }
+
+    /// The project-wide Scala facts of one resolution pass (W4-SC-01).
+    fn scala_tables(&self) -> Arc<crate::scala_scope::ScalaTables> {
+        Arc::new(crate::scala_scope::ScalaTables::new())
+    }
+
+    /// The project-wide C# facts of one resolution pass (W4-CS-01).
+    fn csharp_tables(&self) -> Arc<crate::csharp_types::CsharpTables> {
+        Arc::new(crate::csharp_types::CsharpTables::new())
+    }
+
+    /// The member-type walk's memos of one resolution pass (W4-CS-03).
+    fn member_tables(&self) -> Arc<crate::member_types::MemberTables> {
+        Arc::new(crate::member_types::MemberTables::new())
+    }
+
+    /// The Ruby ancestry walk's memo of one resolution pass (W4-RB-01).
+    fn ruby_tables(&self) -> Arc<crate::ruby_scope::RubyTables> {
+        Arc::new(crate::ruby_scope::RubyTables::new())
+    }
+
+    /// The CFML `extends` chains of one resolution pass (W4-CF-01).
+    fn cfml_tables(&self) -> Arc<crate::cfml_scope::CfmlTables> {
+        Arc::new(crate::cfml_scope::CfmlTables::new())
+    }
+
+    /// The Swift type-visibility memos of one resolution pass (W4-SW-01).
+    fn swift_tables(&self) -> Arc<crate::swift_type_visibility::SwiftTables> {
+        Arc::new(crate::swift_type_visibility::SwiftTables::new())
+    }
+
+    /// The Objective-C superclass memo of one resolution pass (W4-SW-04).
+    fn objc_tables(&self) -> Arc<crate::objc_scope::ObjcTables> {
+        Arc::new(crate::objc_scope::ObjcTables::new())
+    }
+
+    /// The Go package memos of one resolution pass (W4-GO-01).
+    fn go_tables(&self) -> Arc<crate::go_packages::GoTables> {
+        Arc::new(crate::go_packages::GoTables::new())
     }
 }
 

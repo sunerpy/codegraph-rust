@@ -330,6 +330,30 @@ impl ControlHandle {
     }
 }
 
+/// The version this daemon announces in its hello: its own build's. A
+/// `test-hooks` build may announce `CODEGRAPH_TEST_DAEMON_HELLO_VERSION`
+/// instead, so a test can stand up a daemon that claims to be an older or a
+/// newer release.
+fn hello_version() -> String {
+    #[cfg(feature = "test-hooks")]
+    if let Ok(version) = std::env::var("CODEGRAPH_TEST_DAEMON_HELLO_VERSION") {
+        return version;
+    }
+    env!("CARGO_PKG_VERSION").to_string()
+}
+
+/// Whether a `test-hooks` build was asked (`CODEGRAPH_TEST_DAEMON_IGNORE_CONTROL`)
+/// to close every control frame's connection without an answer, the way a
+/// wedged or pre-control-protocol daemon fails to drain. Always false in a
+/// normal build.
+fn ignores_control_frames() -> bool {
+    #[cfg(feature = "test-hooks")]
+    if std::env::var_os("CODEGRAPH_TEST_DAEMON_IGNORE_CONTROL").is_some() {
+        return true;
+    }
+    false
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DaemonHello<'a> {
@@ -375,8 +399,9 @@ pub(crate) async fn serve_session_async(
         }
     }
 
+    let version = hello_version();
     let hello = DaemonHello {
-        codegraph: env!("CARGO_PKG_VERSION"),
+        codegraph: &version,
         pid: std::process::id(),
         socket_path,
         protocol: 1,
@@ -413,6 +438,10 @@ pub(crate) async fn serve_session_async(
     // `uninit --force` holds the namespace's exclusive lease.
     if let Some(frame) = parse_control_frame(&line) {
         drop(guard);
+        if ignores_control_frames() {
+            debug!("test hook: closing a control frame's connection unanswered");
+            return Ok(());
+        }
         return serve_control_frame(send, &frame, control.as_ref()).await;
     }
     if !run_mcp {

@@ -5,8 +5,11 @@
 
 mod arkts;
 mod c;
+mod c_preparse;
 mod cfml;
 mod cpp;
+pub(crate) mod cpp_brace_scopes;
+mod cpp_preparse;
 mod csharp;
 mod dart;
 mod erlang;
@@ -39,9 +42,11 @@ use crate::spec::LanguageSpec;
 
 pub use arkts::ARKTS_SPEC;
 pub use c::C_SPEC;
+pub(crate) use c::{c_declarator_identifier, is_class_like_definition};
 pub use cfml::CFML_SPEC;
 pub(crate) use cfml::{
-    cfml_component_name_from_path, cfml_string_attr_value, cfml_tag_attr, is_bare_script_cfml,
+    cfml_component_attr, cfml_component_name_from_path, cfml_start_tag, cfml_tag_attr,
+    cfml_tag_attr_value_node, cfml_tag_name, is_bare_script_cfml,
 };
 pub use cpp::{
     CPP_CONSTRUCTOR_REFERENCE_PREFIX, CPP_SPEC, CppConstructorShape,
@@ -53,7 +58,9 @@ pub(crate) use cpp::{
     recover_explicit_operator_call,
 };
 pub use csharp::CSHARP_SPEC;
+pub(crate) use csharp::csharp_base_type_name;
 pub use dart::DART_SPEC;
+pub(crate) use dart::{dart_member_wrappers, dart_prefix, dart_supertype_name};
 pub use erlang::ERLANG_SPEC;
 pub(crate) use erlang::{
     erlang_atom_text, erlang_call_ref_name, erlang_clause_header, erlang_clause_name,
@@ -64,6 +71,10 @@ pub(crate) use erlang::{
 pub use gdscript::GDSCRIPT_SPEC;
 pub use go::GO_SPEC;
 pub use java::JAVA_SPEC;
+pub(crate) use java::{
+    LOMBOK_LOG_ANNOTATIONS, has_word, lombok_annotation_names, lombok_getter_name,
+    lombok_setter_name, modifier_text, normalize_java_type,
+};
 pub use javascript::JAVASCRIPT_SPEC;
 pub use jsx::JSX_SPEC;
 pub use kotlin::KOTLIN_SPEC;

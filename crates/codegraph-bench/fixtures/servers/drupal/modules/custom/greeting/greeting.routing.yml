@@ -1,0 +1,6 @@
+greeting.hello:
+  path: '/hello'
+  defaults:
+    _controller: '\Drupal\greeting\Controller\GreetingController::hello'
+  requirements:
+    _permission: 'access content'

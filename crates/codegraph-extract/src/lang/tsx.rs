@@ -73,6 +73,9 @@ impl LanguageSpec for TsxSpec {
     fn return_field(&self) -> &'static str {
         TYPESCRIPT_SPEC.return_field()
     }
+    fn pre_parse(&self, source: &str, file_path: &str) -> String {
+        TYPESCRIPT_SPEC.pre_parse(source, file_path)
+    }
     fn resolve_body<'tree>(&self, node: Node<'tree>, body_field: &str) -> Option<Node<'tree>> {
         TYPESCRIPT_SPEC.resolve_body(node, body_field)
     }

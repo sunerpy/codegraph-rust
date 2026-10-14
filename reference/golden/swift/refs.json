@@ -1,0 +1,42 @@
+[
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "Sources/App/Client.swift",
+    "from_node_id": "file:Sources/App/Client.swift",
+    "language": "swift",
+    "line": 1,
+    "reference_kind": "imports",
+    "reference_name": "Foundation"
+  },
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "Sources/App/Models.swift",
+    "from_node_id": "file:Sources/App/Models.swift",
+    "language": "swift",
+    "line": 1,
+    "reference_kind": "imports",
+    "reference_name": "Foundation"
+  },
+  {
+    "candidates": null,
+    "col": 23,
+    "file_path": "Sources/App/Client.swift",
+    "from_node_id": "method:f7c6eb334dea73aa3b78c0e47f419235",
+    "language": "swift",
+    "line": 10,
+    "reference_kind": "calls",
+    "reference_name": "min"
+  },
+  {
+    "candidates": null,
+    "col": 60,
+    "file_path": "Sources/App/Models.swift",
+    "from_node_id": "method:4c18eb24701cbafdb9f4f85979b12ab2",
+    "language": "swift",
+    "line": 12,
+    "reference_kind": "calls",
+    "reference_name": "value.uppercased"
+  }
+]

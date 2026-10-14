@@ -14,7 +14,7 @@
 use crate::awaited::AwaitedIndex;
 use crate::object_literal::LiteralLookup;
 use crate::strip_comments::{CommentLang, blank_string_contents, strip_comments_for_regex};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
 
 /// Newline positions of a text.
@@ -125,6 +125,7 @@ pub struct SourceFacts {
     python_comment_free: OnceLock<(String, LineIndex)>,
     ts_blanked: OnceLock<String>,
     js_sealed_module: OnceLock<bool>,
+    js_module_exports: OnceLock<Option<HashSet<String>>>,
     js_binding_sites: OnceLock<LocalBindingSites>,
     js_local_bindings: Mutex<HashMap<String, bool>>,
     node_decisions: Mutex<HashMap<(&'static str, String), bool>>,
@@ -136,6 +137,38 @@ pub struct SourceFacts {
     awaited_raw_names: OnceLock<HashSet<String>>,
     awaited_index: OnceLock<Arc<AwaitedIndex>>,
     rust_use_scopes: OnceLock<crate::rust_lexical::RustUseScopes>,
+    /// What the file's `use` items bring in, read against the crates of the
+    /// pass that first asked.
+    rust_uses: OnceLock<(
+        Arc<crate::rust_scope::RustCrates>,
+        Arc<crate::rust_scope::RustUses>,
+    )>,
+    python_from_imports: OnceLock<HashMap<String, String>>,
+    python_module_symbols: Mutex<HashMap<(String, usize), Option<String>>>,
+    python_file_scan: OnceLock<Arc<crate::python_globals::PythonFileScan>>,
+    python_name_scans: Mutex<HashMap<String, Arc<crate::python_globals::NameScan>>>,
+    python_globals: Mutex<HashMap<String, Arc<crate::python_globals::GlobalMemo>>>,
+    python_plugged_modules: OnceLock<Vec<String>>,
+    python_fixture_types: Mutex<HashMap<String, Option<String>>>,
+    minified_script: OnceLock<bool>,
+    csharp_scopes: OnceLock<Arc<crate::csharp_scopes::CsharpScopes>>,
+    sfc_script_blocks: OnceLock<Vec<crate::sfc_scripts::ScriptBlock>>,
+    js_destructured_calls: OnceLock<Option<crate::destructured_calls::DestructuredFile>>,
+    js_object_scan: OnceLock<Arc<crate::object_owners::JsObjectScan>>,
+    cpp_local_alias_lines: Mutex<HashMap<String, Arc<Vec<usize>>>>,
+    cpp_template_parameters: Mutex<HashMap<String, Arc<BTreeSet<String>>>>,
+    cpp_class_bases: Mutex<HashMap<String, Arc<Vec<String>>>>,
+    cpp_usings: OnceLock<Arc<Vec<crate::cpp_supertypes::CppUsing>>>,
+    java_file_scope: OnceLock<Arc<crate::java_scope::JavaFileScope>>,
+    java_heads: Mutex<HashMap<String, Arc<crate::java_scope::JavaHead>>>,
+    kotlin_file_scope: OnceLock<Arc<crate::kotlin_scope::KotlinFileScope>>,
+    kotlin_brace_frames: OnceLock<Arc<Vec<crate::kotlin_scope::BraceFrame>>>,
+    go_scope_index: OnceLock<Arc<crate::go_scope::GoScopeIndex>>,
+    scala_imports: OnceLock<Arc<crate::scala_scope::ScalaImports>>,
+    scala_holder_package: OnceLock<Option<String>>,
+    scala_package_object_package: OnceLock<Option<String>>,
+    local_declaration_scopes: Mutex<HashMap<String, Option<(i64, i64)>>>,
+    csharp_namespace_scope: OnceLock<Arc<crate::csharp_types::CsharpNamespaceScope>>,
 }
 
 impl SourceFacts {
@@ -148,6 +181,7 @@ impl SourceFacts {
             python_comment_free: OnceLock::new(),
             ts_blanked: OnceLock::new(),
             js_sealed_module: OnceLock::new(),
+            js_module_exports: OnceLock::new(),
             js_binding_sites: OnceLock::new(),
             js_local_bindings: Mutex::new(HashMap::new()),
             node_decisions: Mutex::new(HashMap::new()),
@@ -159,6 +193,33 @@ impl SourceFacts {
             awaited_raw_names: OnceLock::new(),
             awaited_index: OnceLock::new(),
             rust_use_scopes: OnceLock::new(),
+            rust_uses: OnceLock::new(),
+            python_from_imports: OnceLock::new(),
+            python_module_symbols: Mutex::new(HashMap::new()),
+            python_file_scan: OnceLock::new(),
+            python_name_scans: Mutex::new(HashMap::new()),
+            python_globals: Mutex::new(HashMap::new()),
+            python_plugged_modules: OnceLock::new(),
+            python_fixture_types: Mutex::new(HashMap::new()),
+            minified_script: OnceLock::new(),
+            csharp_scopes: OnceLock::new(),
+            sfc_script_blocks: OnceLock::new(),
+            js_destructured_calls: OnceLock::new(),
+            js_object_scan: OnceLock::new(),
+            cpp_local_alias_lines: Mutex::new(HashMap::new()),
+            cpp_template_parameters: Mutex::new(HashMap::new()),
+            cpp_class_bases: Mutex::new(HashMap::new()),
+            cpp_usings: OnceLock::new(),
+            java_file_scope: OnceLock::new(),
+            java_heads: Mutex::new(HashMap::new()),
+            kotlin_file_scope: OnceLock::new(),
+            kotlin_brace_frames: OnceLock::new(),
+            go_scope_index: OnceLock::new(),
+            scala_imports: OnceLock::new(),
+            scala_holder_package: OnceLock::new(),
+            scala_package_object_package: OnceLock::new(),
+            local_declaration_scopes: Mutex::new(HashMap::new()),
+            csharp_namespace_scope: OnceLock::new(),
         }
     }
 
@@ -171,9 +232,32 @@ impl SourceFacts {
     /// glob (KEEP-RUST, P15 R4); see [`crate::rust_lexical::RustUseScopes`]. The
     /// file's `use` items are scanned once, on first ask.
     pub(crate) fn rust_use_in_scope(&self, offset: usize, name: &str) -> bool {
+        self.rust_use_scopes().covers(offset, name)
+    }
+
+    fn rust_use_scopes(&self) -> &crate::rust_lexical::RustUseScopes {
         self.rust_use_scopes
             .get_or_init(|| crate::rust_lexical::RustUseScopes::scan(&self.source))
-            .covers(offset, name)
+    }
+
+    /// What the file's `use` items bring in, outside crates told apart by
+    /// `crates` (upstream #2214 `rustUsesOf`), read once per crate set.
+    pub(crate) fn rust_uses(
+        &self,
+        crates: &Arc<crate::rust_scope::RustCrates>,
+    ) -> Arc<crate::rust_scope::RustUses> {
+        let read = || {
+            Arc::new(crate::rust_scope::RustUses::read(
+                self.rust_use_scopes(),
+                crates,
+            ))
+        };
+        let (cached_crates, uses) = self.rust_uses.get_or_init(|| (Arc::clone(crates), read()));
+        if Arc::ptr_eq(cached_crates, crates) || cached_crates == crates {
+            Arc::clone(uses)
+        } else {
+            read()
+        }
     }
 
     /// Line index of the raw source.
@@ -247,6 +331,44 @@ impl SourceFacts {
     /// Memoised sealed-module decision for this file; `compute` runs once.
     pub fn js_sealed_module(&self, compute: impl FnOnce(&Self) -> bool) -> bool {
         *self.js_sealed_module.get_or_init(|| compute(self))
+    }
+
+    /// The names this ES module's export lists name, or `None` when it is no
+    /// ES module (upstream #2162); `read` runs once.
+    pub fn js_module_exports(
+        &self,
+        read: impl FnOnce(&Self) -> Option<HashSet<String>>,
+    ) -> Option<&HashSet<String>> {
+        self.js_module_exports.get_or_init(|| read(self)).as_ref()
+    }
+
+    /// This file's `const { … } = f(…)` statements, or `None` when it has none
+    /// (upstream #2163); `read` runs once.
+    pub fn js_destructured_calls(
+        &self,
+        read: impl FnOnce(&Self) -> Option<crate::destructured_calls::DestructuredFile>,
+    ) -> Option<&crate::destructured_calls::DestructuredFile> {
+        self.js_destructured_calls
+            .get_or_init(|| read(self))
+            .as_ref()
+    }
+
+    /// What the object-literal lookups read from this JS/TS file (upstream
+    /// #2363); `read` runs once.
+    pub(crate) fn js_object_scan(
+        &self,
+        read: impl FnOnce(&Self) -> crate::object_owners::JsObjectScan,
+    ) -> Arc<crate::object_owners::JsObjectScan> {
+        Arc::clone(self.js_object_scan.get_or_init(|| Arc::new(read(self))))
+    }
+
+    /// A Svelte or Vue component's `<script>` blocks (upstream #2227); `read`
+    /// runs once.
+    pub fn sfc_script_blocks(
+        &self,
+        read: impl FnOnce(&Self) -> Vec<crate::sfc_scripts::ScriptBlock>,
+    ) -> &[crate::sfc_scripts::ScriptBlock] {
+        self.sfc_script_blocks.get_or_init(|| read(self))
     }
 
     /// Memoised "is `name` bound locally in this file" decision; `compute`
@@ -340,6 +462,274 @@ impl SourceFacts {
         self.awaited_raw_names.get_or_init(|| scan(&self.source))
     }
 
+    /// What the raw source's `from <module> import <name>` lines bind, name
+    /// to module; `scan` runs once.
+    pub(crate) fn python_from_imports(
+        &self,
+        scan: impl FnOnce(&str) -> HashMap<String, String>,
+    ) -> &HashMap<String, String> {
+        self.python_from_imports.get_or_init(|| scan(&self.source))
+    }
+
+    /// Memoised id of the definition this Python module offers as `name`
+    /// when asked `depth` modules into a re-export walk; `compute` runs at
+    /// most once per `(name, depth)`, without the lock held, so a walk may
+    /// come back to this module.
+    pub(crate) fn python_module_symbol(
+        &self,
+        name: &str,
+        depth: usize,
+        compute: impl FnOnce() -> Option<String>,
+    ) -> Option<String> {
+        let key = (name.to_string(), depth);
+        if let Some(known) = self
+            .python_module_symbols
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&key)
+        {
+            return known.clone();
+        }
+        let found = compute();
+        self.python_module_symbols
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(key, found.clone());
+        found
+    }
+
+    /// The statement starts and `__main__` blocks of the Python code, read
+    /// once.
+    pub(crate) fn python_file_scan(
+        &self,
+        build: impl FnOnce(&Self) -> crate::python_globals::PythonFileScan,
+    ) -> Arc<crate::python_globals::PythonFileScan> {
+        Arc::clone(self.python_file_scan.get_or_init(|| Arc::new(build(self))))
+    }
+
+    /// The memoised answers this Python file gives about `name`.
+    pub(crate) fn python_name_scan(&self, name: &str) -> Arc<crate::python_globals::NameScan> {
+        Arc::clone(
+            self.python_name_scans
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .entry(name.to_string())
+                .or_default(),
+        )
+    }
+
+    /// The memoised answers about the module global `id` this file declares.
+    pub(crate) fn python_global_memo(&self, id: &str) -> Arc<crate::python_globals::GlobalMemo> {
+        Arc::clone(
+            self.python_globals
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .entry(id.to_string())
+                .or_default(),
+        )
+    }
+
+    /// The fixture modules the `conftest.py` files above this Python file
+    /// pull in; `scan` runs once.
+    pub(crate) fn python_plugged_modules(&self, scan: impl FnOnce() -> Vec<String>) -> &[String] {
+        self.python_plugged_modules.get_or_init(scan)
+    }
+
+    /// Memoised class a pytest fixture parameter of this file is (`key`
+    /// names the test and the parameter); `compute` runs at most once per
+    /// key, without the lock held.
+    pub(crate) fn python_fixture_type(
+        &self,
+        key: &str,
+        compute: impl FnOnce() -> Option<String>,
+    ) -> Option<String> {
+        if let Some(known) = self
+            .python_fixture_types
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(key)
+        {
+            return known.clone();
+        }
+        let found = compute();
+        self.python_fixture_types
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(key.to_string(), found.clone());
+        found
+    }
+
+    /// Memoised lines of the C/C++ function `caller_id` (defined in this file)
+    /// that declare an alias, last first (upstream #2399); `compute` runs at
+    /// most once per function.
+    pub(crate) fn cpp_local_alias_lines(
+        &self,
+        caller_id: &str,
+        compute: impl FnOnce(&Self) -> Vec<usize>,
+    ) -> Arc<Vec<usize>> {
+        keyed_memo(&self.cpp_local_alias_lines, caller_id, || {
+            Arc::new(compute(self))
+        })
+    }
+
+    /// Memoised C++ template parameters in scope where the node `node_id`
+    /// (defined in this file) is declared (upstream #2399); `compute` runs at
+    /// most once per node.
+    pub(crate) fn cpp_template_parameters(
+        &self,
+        node_id: &str,
+        compute: impl FnOnce(&Self) -> BTreeSet<String>,
+    ) -> Arc<BTreeSet<String>> {
+        keyed_memo(&self.cpp_template_parameters, node_id, || {
+            Arc::new(compute(self))
+        })
+    }
+
+    /// Memoised bases the head of the C++ class declaration `class_id`
+    /// (defined in this file) names (upstream #2399); `compute` runs at most
+    /// once per declaration.
+    pub(crate) fn cpp_class_bases(
+        &self,
+        class_id: &str,
+        compute: impl FnOnce(&Self) -> Vec<String>,
+    ) -> Arc<Vec<String>> {
+        keyed_memo(&self.cpp_class_bases, class_id, || Arc::new(compute(self)))
+    }
+
+    /// The C/C++ `using` declarations, directives and namespace aliases of the
+    /// raw source (upstream #2407); `read` runs once.
+    pub(crate) fn cpp_usings(
+        &self,
+        read: impl FnOnce(&str) -> Vec<crate::cpp_supertypes::CppUsing>,
+    ) -> Arc<Vec<crate::cpp_supertypes::CppUsing>> {
+        Arc::clone(self.cpp_usings.get_or_init(|| Arc::new(read(&self.source))))
+    }
+
+    /// The package and imports of a Java file (upstream #2126, #2236), read
+    /// once.
+    pub(crate) fn java_file_scope(&self) -> Arc<crate::java_scope::JavaFileScope> {
+        Arc::clone(
+            self.java_file_scope
+                .get_or_init(|| Arc::new(crate::java_scope::JavaFileScope::read(&self.source))),
+        )
+    }
+
+    /// Memoised supertype names the head of the Java type declaration
+    /// `declaration_id` (defined in this file) writes (upstream #2126,
+    /// #2236); `read` runs at most once per declaration.
+    pub(crate) fn java_head(
+        &self,
+        declaration_id: &str,
+        read: impl FnOnce(&Self) -> crate::java_scope::JavaHead,
+    ) -> Arc<crate::java_scope::JavaHead> {
+        keyed_memo(&self.java_heads, declaration_id, || Arc::new(read(self)))
+    }
+
+    /// What a Scala file's imports bring in (upstream `scalaImportsOf`),
+    /// read once.
+    pub(crate) fn scala_imports(&self) -> Arc<crate::scala_scope::ScalaImports> {
+        Arc::clone(
+            self.scala_imports
+                .get_or_init(|| Arc::new(crate::scala_scope::ScalaImports::read(&self.source))),
+        )
+    }
+
+    /// The last segment of a Scala file's last package clause (upstream
+    /// #2199), read once.
+    pub(crate) fn scala_holder_package(&self) -> Option<String> {
+        self.scala_holder_package
+            .get_or_init(|| crate::scala_scope::scala_holder_package(&self.source))
+            .clone()
+    }
+
+    /// The package a Scala file's `package object` opens (upstream #2230),
+    /// read once.
+    pub(crate) fn scala_package_object_package(&self) -> Option<String> {
+        self.scala_package_object_package
+            .get_or_init(|| crate::scala_scope::scala_package_object_package(&self.source))
+            .clone()
+    }
+
+    /// The lines a declaration of this file with id `id` is local to
+    /// (upstream #2193 `localDeclarationScope`), computed once.
+    pub(crate) fn local_declaration_scope(
+        &self,
+        id: &str,
+        compute: impl FnOnce() -> Option<(i64, i64)>,
+    ) -> Option<(i64, i64)> {
+        if let Some(hit) = self
+            .local_declaration_scopes
+            .lock()
+            .ok()
+            .and_then(|memo| memo.get(id).copied())
+        {
+            return hit;
+        }
+        let scope = compute();
+        if let Ok(mut memo) = self.local_declaration_scopes.lock() {
+            memo.insert(id.to_string(), scope);
+        }
+        scope
+    }
+
+    /// The namespaces a C# file runs in and imports (upstream #2216
+    /// `csharpNamespaceScope`), computed once.
+    pub(crate) fn csharp_namespace_scope(
+        &self,
+        compute: impl FnOnce() -> crate::csharp_types::CsharpNamespaceScope,
+    ) -> Arc<crate::csharp_types::CsharpNamespaceScope> {
+        Arc::clone(
+            self.csharp_namespace_scope
+                .get_or_init(|| Arc::new(compute())),
+        )
+    }
+
+    /// The package and imports of a Kotlin file (upstream #2146), read once.
+    pub(crate) fn kotlin_file_scope(&self) -> Arc<crate::kotlin_scope::KotlinFileScope> {
+        Arc::clone(
+            self.kotlin_file_scope
+                .get_or_init(|| Arc::new(crate::kotlin_scope::KotlinFileScope::read(&self.source))),
+        )
+    }
+
+    /// The type bodies of a Kotlin file read from its braces (upstream
+    /// #2172 `kotlinBraceFrames`); `read` runs once. A lambda's frame reads
+    /// the receiver its function's declaration names in another file, which
+    /// a pass does not change either.
+    pub(crate) fn kotlin_brace_frames(
+        &self,
+        read: impl FnOnce(&str) -> Vec<crate::kotlin_scope::BraceFrame>,
+    ) -> Arc<Vec<crate::kotlin_scope::BraceFrame>> {
+        Arc::clone(
+            self.kotlin_brace_frames
+                .get_or_init(|| Arc::new(read(&self.source))),
+        )
+    }
+
+    /// The blocks and the parameter and local declarations of a Go file
+    /// (upstream #2448 `goScopeIndex`), read once.
+    pub(crate) fn go_scope_index(&self) -> Arc<crate::go_scope::GoScopeIndex> {
+        Arc::clone(
+            self.go_scope_index
+                .get_or_init(|| Arc::new(crate::go_scope::GoScopeIndex::read(&self.source))),
+        )
+    }
+
+    /// The C# namespace blocks and `using` directives of the raw source,
+    /// read once.
+    pub(crate) fn csharp_scopes(&self) -> Arc<crate::csharp_scopes::CsharpScopes> {
+        Arc::clone(
+            self.csharp_scopes
+                .get_or_init(|| Arc::new(crate::csharp_scopes::CsharpScopes::read(&self.source))),
+        )
+    }
+
+    /// Whether the raw source is a minified or bundled script; `detect` runs
+    /// once.
+    pub(crate) fn minified_script(&self, detect: impl FnOnce(&str) -> bool) -> bool {
+        *self.minified_script.get_or_init(|| detect(&self.source))
+    }
+
     /// The awaited-binding index over [`Self::ts_blanked`]; `build` runs once.
     pub(crate) fn awaited_index(
         &self,
@@ -397,6 +787,26 @@ impl SourceFacts {
             .insert(key, declaration.clone());
         declaration
     }
+}
+
+/// `map[key]`, computed by `compute` without holding the lock when absent.
+fn keyed_memo<V: Clone>(
+    map: &Mutex<HashMap<String, V>>,
+    key: &str,
+    compute: impl FnOnce() -> V,
+) -> V {
+    if let Some(known) = map
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(key)
+    {
+        return known.clone();
+    }
+    let value = compute();
+    map.lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(key.to_string(), value.clone());
+    value
 }
 
 /// Offsets of `\b(?:kw1|kw2|…)\s` matches: a keyword preceded by a non-word

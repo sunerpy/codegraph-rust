@@ -37,7 +37,7 @@ use codegraph_core::IndexPaths;
 use codegraph_core::generated_header::detect_generated_file;
 use codegraph_core::node_id::hash_content;
 use codegraph_core::types::{Edge, FileRecord, Node, UnresolvedRef};
-use codegraph_extract::detect_language_with;
+use codegraph_extract::detect_language_of;
 use codegraph_resolve::ReferenceResolver;
 use codegraph_store::StoreWriteAuthorization;
 
@@ -87,6 +87,18 @@ pub(crate) fn migrate_project(
     rebuild.set_bulk_index_pragmas()?;
 
     let mut pending_nodes: Vec<Node> = Vec::with_capacity(NODE_FLUSH_ROWS);
+    let mut surfaces = Vec::new();
+    let mut namespace_scans = Vec::new();
+    let mut head_rows = Vec::new();
+    let mut kotlin_rows = Vec::new();
+    let mut scala_rows = Vec::new();
+    let mut csharp_rows = Vec::new();
+    let mut member_rows = Vec::new();
+    let mut ruby_rows = Vec::new();
+    let mut cfml_rows = Vec::new();
+    let mut swift_rows = Vec::new();
+    let mut objc_rows = Vec::new();
+    let mut go_rows = Vec::new();
     let mut edges: Vec<Edge> = Vec::new();
     let mut refs: Vec<UnresolvedRef> = Vec::new();
     let mut outcome = SyncOutcome {
@@ -111,7 +123,7 @@ pub(crate) fn migrate_project(
         let file = FileRecord {
             path: relative.clone(),
             content_hash: hash_content(&hash_input),
-            language: detect_language_with(relative, &options.extensions),
+            language: detect_language_of(relative, &source, &options.extensions),
             size: metadata.len() as i64,
             modified_at: modified_millis(&metadata),
             indexed_at: now_millis(),
@@ -125,6 +137,49 @@ pub(crate) fn migrate_project(
         };
 
         rebuild.store().upsert_file(&file)?;
+        if let Some(surface) = crate::module_surfaces::surface_of(relative, file.language, &source)
+        {
+            surfaces.push((relative.clone(), surface));
+        }
+        if let Some(scan) = crate::cpp_namespace_rows::scan_of(relative, file.language, &source) {
+            namespace_scans.push((relative.clone(), scan));
+        }
+        if let Some(row) = crate::java_heads::row_of(file.language, &source, &result.nodes) {
+            head_rows.push((relative.clone(), row));
+        }
+        if let Some(row) =
+            crate::kotlin_surfaces::row_of(relative, file.language, &source, &result.nodes)
+        {
+            kotlin_rows.push((relative.clone(), row));
+        }
+        if let Some(row) =
+            crate::scala_surfaces::row_of(relative, file.language, &source, &result.nodes)
+        {
+            scala_rows.push((relative.clone(), row));
+        }
+        if let Some(row) = crate::csharp_surfaces::row_of(file.language, &source, &result.nodes) {
+            csharp_rows.push((relative.clone(), row));
+        }
+        if let Some(row) = crate::member_surfaces::row_of(file.language, &source, &result.nodes) {
+            member_rows.push((relative.clone(), row));
+        }
+        if let Some(row) = crate::ruby_heads::row_of(file.language, &source, &result.nodes) {
+            ruby_rows.push((relative.clone(), row));
+        }
+        if let Some(row) =
+            crate::cfml_heads::row_of(relative, file.language, &source, &result.nodes)
+        {
+            cfml_rows.push((relative.clone(), row));
+        }
+        if let Some(row) = crate::swift_heads::row_of(file.language, &source, &result.nodes) {
+            swift_rows.push((relative.clone(), row));
+        }
+        if let Some(row) = crate::objc_heads::row_of(file.language, &source, &result.nodes) {
+            objc_rows.push((relative.clone(), row));
+        }
+        if let Some(row) = crate::go_heads::row_of(file.language, &source, &result.nodes) {
+            go_rows.push((relative.clone(), row));
+        }
         pending_nodes.append(&mut result.nodes);
         if pending_nodes.len() >= NODE_FLUSH_ROWS {
             rebuild.store_mut().upsert_nodes(&pending_nodes)?;
@@ -142,6 +197,48 @@ pub(crate) fn migrate_project(
         rebuild.store_mut().upsert_nodes(&pending_nodes)?;
     }
     drop(pending_nodes);
+    // Every file row is stored, as in the CLI full index at the same point.
+    crate::module_surfaces::write_index_rows(
+        rebuild.store(),
+        project_root,
+        options.max_file_size,
+        &surfaces,
+    )?;
+    drop(surfaces);
+    crate::cpp_namespace_rows::write_index_rows(rebuild.store(), &mut namespace_scans)?;
+    drop(namespace_scans);
+    crate::java_heads::write_index_rows(rebuild.store(), &mut head_rows)?;
+    drop(head_rows);
+    crate::kotlin_surfaces::write_index_rows(rebuild.store(), &mut kotlin_rows)?;
+    drop(kotlin_rows);
+    crate::scala_surfaces::write_index_rows(rebuild.store(), &mut scala_rows)?;
+    drop(scala_rows);
+    crate::csharp_surfaces::write_index_rows(rebuild.store(), &mut csharp_rows)?;
+    drop(csharp_rows);
+    crate::member_surfaces::write_index_rows(rebuild.store(), &mut member_rows)?;
+    drop(member_rows);
+    crate::ruby_heads::write_index_rows(rebuild.store(), &mut ruby_rows)?;
+    drop(ruby_rows);
+    crate::cfml_heads::write_index_rows(rebuild.store(), &mut cfml_rows)?;
+    drop(cfml_rows);
+    crate::swift_heads::write_index_rows(rebuild.store(), &mut swift_rows)?;
+    drop(swift_rows);
+    crate::objc_heads::write_index_rows(rebuild.store(), &mut objc_rows)?;
+    drop(objc_rows);
+    crate::go_heads::write_index_rows(rebuild.store(), &mut go_rows)?;
+    drop(go_rows);
+    crate::cpp_dependents::write_marker(rebuild.store())?;
+    crate::java_heads::write_marker(rebuild.store())?;
+    crate::kotlin_surfaces::write_marker(rebuild.store())?;
+    crate::scala_surfaces::write_marker(rebuild.store())?;
+    crate::csharp_surfaces::write_marker(rebuild.store())?;
+    crate::member_surfaces::write_marker(rebuild.store())?;
+    crate::ruby_heads::write_marker(rebuild.store())?;
+    crate::cfml_heads::write_marker(rebuild.store())?;
+    crate::swift_heads::write_marker(rebuild.store())?;
+    crate::objc_heads::write_marker(rebuild.store())?;
+    crate::go_heads::write_marker(rebuild.store())?;
+    crate::rust_receivers::write_marker(rebuild.store())?;
 
     // ALL nodes are persisted before ANY edge, because `insert_edges` drops edges
     // whose endpoints are absent. The WAL valve folds the log back during the

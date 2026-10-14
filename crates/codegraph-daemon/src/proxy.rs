@@ -64,6 +64,60 @@ pub enum ProxyOutcome {
     VersionMismatch,
 }
 
+/// How a running daemon's build compares with this one, read from its hello.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DaemonPeer {
+    /// The same version and protocol: attach to it.
+    Same,
+    /// A plain `X.Y.Z` release older than this plain `X.Y.Z` build. A launcher
+    /// replaces it (upstream #2343).
+    OlderRelease { version: String },
+    /// Anything else: a newer release, a prerelease, an unknown version, or
+    /// another protocol at the same version. It is never stopped, so two
+    /// installs cannot take turns replacing each other's daemon.
+    Foreign { version: Option<String> },
+}
+
+/// Classify a daemon hello against this build; see [`DaemonPeer`].
+#[must_use]
+pub fn classify_daemon_hello(hello: &Value) -> DaemonPeer {
+    classify_against(hello, env!("CARGO_PKG_VERSION"))
+}
+
+fn classify_against(hello: &Value, ours: &str) -> DaemonPeer {
+    let version = hello.get("codegraph").and_then(Value::as_str);
+    let protocol = hello.get("protocol").and_then(Value::as_u64);
+    if version == Some(ours) && protocol == Some(EXPECTED_PROTOCOL) {
+        return DaemonPeer::Same;
+    }
+    match (
+        version,
+        version.and_then(plain_release),
+        plain_release(ours),
+    ) {
+        (Some(version), Some(peer), Some(ours)) if peer < ours => DaemonPeer::OlderRelease {
+            version: version.to_string(),
+        },
+        _ => DaemonPeer::Foreign {
+            version: version.map(str::to_string),
+        },
+    }
+}
+
+/// `X.Y.Z` with three all-digit parts and nothing else, or `None`: a
+/// prerelease or build suffix is never ordered against a release.
+fn plain_release(version: &str) -> Option<(u64, u64, u64)> {
+    let mut parts = version.split('.');
+    let mut next = || {
+        parts
+            .next()
+            .filter(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+            .and_then(|part| part.parse::<u64>().ok())
+    };
+    let release = (next()?, next()?, next()?);
+    parts.next().is_none().then_some(release)
+}
+
 /// Verify the daemon hello matches THIS build: `codegraph` version equals
 /// `CARGO_PKG_VERSION` and `protocol` equals [`EXPECTED_PROTOCOL`].
 ///
@@ -688,6 +742,65 @@ mod tests {
         assert!(
             start.elapsed() < Duration::from_millis(500),
             "a pre-signaled wait must not park"
+        );
+    }
+
+    #[test]
+    fn only_an_older_plain_release_is_classified_for_replacement() {
+        let hello = |version: Option<&str>, protocol: u64| match version {
+            Some(version) => json!({ "codegraph": version, "protocol": protocol }),
+            None => json!({ "protocol": protocol }),
+        };
+        let ours = "0.55.0";
+        assert_eq!(
+            classify_against(&hello(Some(ours), EXPECTED_PROTOCOL), ours),
+            DaemonPeer::Same
+        );
+        for older in ["0.54.0", "0.54.12", "0.0.1"] {
+            assert_eq!(
+                classify_against(&hello(Some(older), EXPECTED_PROTOCOL), ours),
+                DaemonPeer::OlderRelease {
+                    version: older.to_string()
+                },
+                "{older}"
+            );
+        }
+        for foreign in [
+            "0.55.1",
+            "1.0.0",
+            "0.56.0-rc.1",
+            "0.54.0-rc.1",
+            "0.54",
+            "0.54.0.1",
+            "v0.54.0",
+            "0.54.x",
+            "",
+        ] {
+            assert_eq!(
+                classify_against(&hello(Some(foreign), EXPECTED_PROTOCOL), ours),
+                DaemonPeer::Foreign {
+                    version: Some(foreign.to_string())
+                },
+                "{foreign:?}"
+            );
+        }
+        assert_eq!(
+            classify_against(&hello(None, EXPECTED_PROTOCOL), ours),
+            DaemonPeer::Foreign { version: None }
+        );
+        // Another protocol at the same version is never replaced either.
+        assert_eq!(
+            classify_against(&hello(Some(ours), EXPECTED_PROTOCOL + 1), ours),
+            DaemonPeer::Foreign {
+                version: Some(ours.to_string())
+            }
+        );
+        // A prerelease build never replaces anything.
+        assert_eq!(
+            classify_against(&hello(Some("0.54.0"), EXPECTED_PROTOCOL), "0.55.0-dev"),
+            DaemonPeer::Foreign {
+                version: Some("0.54.0".to_string())
+            }
         );
     }
 

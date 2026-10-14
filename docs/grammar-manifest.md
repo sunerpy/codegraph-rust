@@ -49,7 +49,7 @@ grammar crates.
 | `nix`               | `tree-sitter-nix`        | `.nix`                                                                 |
 | `terraform`         | `tree-sitter-hcl`        | `.tf`, `.tfvars`, `.tofu`                                              |
 | `erlang`            | `tree-sitter-erlang`     | `.erl`, `.hrl`                                                         |
-| `cfml`              | `tree-sitter-cfml`       | dual script/tag entry selected from source                             |
+| `cfml`              | `tree-sitter-cfml`       | script/tag entry by source; `<cfscript>`/`<cfquery>` bodies in place   |
 | `gdscript`          | `tree-sitter-gdscript`   | `.gd`; framework resolution adds Godot relationships                   |
 
 `LanguageSpec` maps grammar node types to symbols and unresolved references, and
@@ -105,8 +105,16 @@ emit SQL-related mapper symbols from XML without adding `.sql` source support.
 classifications:
 
 - `.h` begins as C, then masked source heuristics may promote it to C++ or
-  Objective-C;
+  Objective-C; the file's row records the promoted language, the same one its
+  nodes carry;
 - `.metal`, `.cu`, and `.cuh` use the C++ grammar with dialect-specific preparse;
+- `.kt` and `.kts` pass a preparse that rewrites syntax newer than
+  `tree-sitter-kotlin-ng` (`when` guards, multi-dollar strings) to same-length
+  equivalents; revisit it when the grammar learns them;
+- a JavaScript or JSX file whose leading comments carry Flow's `@flow` pragma
+  (not `@noflow`) is TSX, parsed with the TSX grammar after the TypeScript
+  spec's preparse blanks Flow-only syntax in `.js`, `.jsx`, `.mjs` and `.cjs`
+  files; its row records `tsx`, the language its nodes carry;
 - `.xsjs` and `.xsjslib` use JavaScript;
 - `.dfm` and `.fmx` use the Pascal language ID but custom extraction;
 - `project.godot` is detected by filename because it has no extension;

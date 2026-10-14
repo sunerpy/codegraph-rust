@@ -419,6 +419,818 @@ fn incremental_sync_on_outdated_v2_forces_all_files() {
     .expect("canonicalize peer db");
     diff_canonical(&rebuilt, &migrated, None)
         .expect("a forced migration must equal a fresh v2 `index --force`");
+    // The module-surface rows and marker (W4a-F3) are no canonical surface,
+    // but the next sync reads them: a migration writes what a full index does.
+    let surface_rows = |paths: &IndexPaths| {
+        Store::open_for_read(paths, deadline(), || false)
+            .expect("readable namespace")
+            .project_metadata_with_prefix("js_module_surface")
+            .expect("module-surface rows")
+    };
+    let migrated_rows = surface_rows(&paths);
+    assert!(
+        migrated_rows
+            .iter()
+            .any(|(key, _)| key == "js_module_surface_version"),
+        "a migration writes the module-surface marker: {migrated_rows:?}"
+    );
+    assert_eq!(
+        migrated_rows,
+        surface_rows(&IndexPaths::resolve(&peer, None).expect("resolve peer v2 paths")),
+        "a forced migration must write the module-surface rows of `index --force`"
+    );
+    // The C/C++ dependents marker (W4-CPP-04), likewise.
+    let cpp_marker = |paths: &IndexPaths| {
+        Store::open_for_read(paths, deadline(), || false)
+            .expect("readable namespace")
+            .project_metadata_with_prefix("cpp_type_surface")
+            .expect("C/C++ dependents marker")
+    };
+    assert_eq!(
+        cpp_marker(&paths),
+        vec![("cpp_type_surface_version".to_string(), "2".to_string())],
+        "a migration writes the C/C++ dependents marker"
+    );
+    assert_eq!(
+        cpp_marker(&paths),
+        cpp_marker(&IndexPaths::resolve(&peer, None).expect("resolve peer v2 paths")),
+        "a forced migration must write the C/C++ marker of `index --force`"
+    );
+    // And the C/C++ namespace rows (W4-CPP-07).
+    let namespace_rows = |paths: &IndexPaths| {
+        Store::open_for_read(paths, deadline(), || false)
+            .expect("readable namespace")
+            .project_metadata_with_prefix("cpp_namespace_surface:")
+            .expect("C/C++ namespace rows")
+    };
+    assert_eq!(
+        namespace_rows(&paths),
+        namespace_rows(&IndexPaths::resolve(&peer, None).expect("resolve peer v2 paths")),
+        "a forced migration must write the C/C++ namespace rows of `index --force`"
+    );
+}
+
+/// W4-JVM-01: a migration writes the Java head rows and their marker a
+/// fresh `index --force` writes, so the next sync compares a changed Java
+/// file's heads with what it held.
+#[test]
+fn outdated_migration_writes_the_java_head_rows_of_index_force() {
+    let dir = TestDir::new("outdated-java-heads");
+    let project = dir.path().join("mini");
+    for (path, contents) in [
+        (
+            "src/app/Root.java",
+            "package app;\n\npublic class Root {\n    protected void assist() { }\n}\n",
+        ),
+        (
+            "src/app/Base.java",
+            "package app;\n\npublic class Base extends Root implements Runnable {\n    public void run() { }\n}\n",
+        ),
+        (
+            "src/app/Child.java",
+            "package app;\n\npublic class Child extends Base {\n    void go() {\n        assist();\n    }\n}\n",
+        ),
+    ] {
+        let full = project.join(path);
+        fs::create_dir_all(full.parent().unwrap()).expect("create the source directory");
+        fs::write(full, contents).expect("write a source file");
+    }
+    let run = cli(&["init", project.to_str().unwrap()]);
+    assert!(
+        run.ok,
+        "setup: `codegraph init` must succeed (stdout={}, stderr={})",
+        run.stdout, run.stderr
+    );
+    let paths = IndexPaths::resolve(&project, None).expect("resolve v2 paths");
+    stage_state_slot(
+        &paths,
+        100,
+        CURRENT_STORAGE_PROTOCOL,
+        CURRENT_EXTRACTION_VERSION - 1,
+        "current",
+    );
+    let run = cli(&["sync", project.to_str().unwrap()]);
+    assert!(
+        run.ok,
+        "sync must migrate an Outdated namespace: stdout={}, stderr={}",
+        run.stdout, run.stderr
+    );
+    let (_scratch, peer) = fresh_force_peer("outdated-java-heads", &project);
+    let head_rows = |paths: &IndexPaths| {
+        Store::open_for_read(paths, deadline(), || false)
+            .expect("readable namespace")
+            .project_metadata_with_prefix("java_type_heads")
+            .expect("Java head rows")
+    };
+    let migrated = head_rows(&paths);
+    assert_eq!(
+        migrated
+            .iter()
+            .map(|(key, _)| key.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "java_type_heads:src/app/Base.java",
+            "java_type_heads:src/app/Child.java",
+            "java_type_heads_version",
+        ],
+        "a migration writes the head rows and their marker: {migrated:?}"
+    );
+    assert_eq!(
+        migrated,
+        head_rows(&IndexPaths::resolve(&peer, None).expect("resolve peer v2 paths")),
+        "a forced migration must write the Java head rows of `index --force`"
+    );
+}
+
+/// W4-JVM-03: a migration writes the Kotlin surface rows and their marker a
+/// fresh `index --force` writes.
+#[test]
+fn outdated_migration_writes_the_kotlin_surface_rows_of_index_force() {
+    let dir = TestDir::new("outdated-kotlin-surfaces");
+    let project = dir.path().join("mini");
+    for (path, contents) in [
+        (
+            "src/app/Root.kt",
+            "package app\n\nopen class Root {\n    fun assist() { }\n}\n",
+        ),
+        (
+            "src/app/Child.kt",
+            "package app\n\nclass Child : Root() {\n    fun go() {\n        assist()\n    }\n}\n",
+        ),
+        (
+            "src/app/Dsl.kt",
+            "package app\n\ntypealias Block = Root.() -> Unit\n\nfun configure(block: Block) { }\n",
+        ),
+    ] {
+        let full = project.join(path);
+        fs::create_dir_all(full.parent().unwrap()).expect("create the source directory");
+        fs::write(full, contents).expect("write a source file");
+    }
+    let run = cli(&["init", project.to_str().unwrap()]);
+    assert!(
+        run.ok,
+        "setup: `codegraph init` must succeed (stdout={}, stderr={})",
+        run.stdout, run.stderr
+    );
+    let paths = IndexPaths::resolve(&project, None).expect("resolve v2 paths");
+    stage_state_slot(
+        &paths,
+        100,
+        CURRENT_STORAGE_PROTOCOL,
+        CURRENT_EXTRACTION_VERSION - 1,
+        "current",
+    );
+    let run = cli(&["sync", project.to_str().unwrap()]);
+    assert!(
+        run.ok,
+        "sync must migrate an Outdated namespace: stdout={}, stderr={}",
+        run.stdout, run.stderr
+    );
+    let (_scratch, peer) = fresh_force_peer("outdated-kotlin-surfaces", &project);
+    let surface_rows = |paths: &IndexPaths| {
+        Store::open_for_read(paths, deadline(), || false)
+            .expect("readable namespace")
+            .project_metadata_with_prefix("kotlin_surface")
+            .expect("Kotlin surface rows")
+    };
+    let migrated = surface_rows(&paths);
+    assert_eq!(
+        migrated
+            .iter()
+            .map(|(key, _)| key.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "kotlin_surface:src/app/Child.kt",
+            "kotlin_surface:src/app/Dsl.kt",
+            "kotlin_surface:src/app/Root.kt",
+            "kotlin_surface_version",
+        ],
+        "a migration writes the surface rows and their marker: {migrated:?}"
+    );
+    assert_eq!(
+        migrated,
+        surface_rows(&IndexPaths::resolve(&peer, None).expect("resolve peer v2 paths")),
+        "a forced migration must write the Kotlin surface rows of `index --force`"
+    );
+}
+
+/// W4-SC-01: a migration writes the Scala surface rows and their marker a
+/// fresh `index --force` writes.
+#[test]
+fn outdated_migration_writes_the_scala_surface_rows_of_index_force() {
+    let dir = TestDir::new("outdated-scala-surfaces");
+    let project = dir.path().join("mini");
+    for (path, contents) in [
+        (
+            "src/app/Root.scala",
+            "package app\n\ntrait Root {\n  def assist(): Int = 1\n}\n",
+        ),
+        (
+            "src/app/Child.scala",
+            "package app\n\nclass Child extends Root {\n  def go(): Int = assist()\n}\n",
+        ),
+        (
+            "src/app/api/package.scala",
+            "package app\n\npackage object api extends Root\n",
+        ),
+    ] {
+        let full = project.join(path);
+        fs::create_dir_all(full.parent().unwrap()).expect("create the source directory");
+        fs::write(full, contents).expect("write a source file");
+    }
+    let run = cli(&["init", project.to_str().unwrap()]);
+    assert!(
+        run.ok,
+        "setup: `codegraph init` must succeed (stdout={}, stderr={})",
+        run.stdout, run.stderr
+    );
+    let paths = IndexPaths::resolve(&project, None).expect("resolve v2 paths");
+    stage_state_slot(
+        &paths,
+        100,
+        CURRENT_STORAGE_PROTOCOL,
+        CURRENT_EXTRACTION_VERSION - 1,
+        "current",
+    );
+    let run = cli(&["sync", project.to_str().unwrap()]);
+    assert!(
+        run.ok,
+        "sync must migrate an Outdated namespace: stdout={}, stderr={}",
+        run.stdout, run.stderr
+    );
+    let (_scratch, peer) = fresh_force_peer("outdated-scala-surfaces", &project);
+    let surface_rows = |paths: &IndexPaths| {
+        Store::open_for_read(paths, deadline(), || false)
+            .expect("readable namespace")
+            .project_metadata_with_prefix("scala_surface")
+            .expect("Scala surface rows")
+    };
+    let migrated = surface_rows(&paths);
+    assert_eq!(
+        migrated
+            .iter()
+            .map(|(key, _)| key.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "scala_surface:src/app/Child.scala",
+            "scala_surface:src/app/Root.scala",
+            "scala_surface:src/app/api/package.scala",
+            "scala_surface_version",
+        ],
+        "a migration writes the surface rows and their marker: {migrated:?}"
+    );
+    assert_eq!(
+        migrated,
+        surface_rows(&IndexPaths::resolve(&peer, None).expect("resolve peer v2 paths")),
+        "a forced migration must write the Scala surface rows of `index --force`"
+    );
+}
+
+/// W4-CS-01: a migration writes the C# surface rows and their marker a fresh
+/// `index --force` writes.
+#[test]
+fn outdated_migration_writes_the_csharp_surface_rows_of_index_force() {
+    let dir = TestDir::new("outdated-csharp-surfaces");
+    let project = dir.path().join("mini");
+    for (path, contents) in [
+        (
+            "src/Lib/Base.cs",
+            "namespace Lib\n{\n    public class Reader\n    {\n        internal enum State { Start, Done }\n    }\n}\n",
+        ),
+        (
+            "src/Lib/Leaf.cs",
+            "namespace Lib\n{\n    public class Leaf : Reader\n    {\n        object Peek() => State.Start;\n    }\n}\n",
+        ),
+        (
+            "src/GlobalUsings.cs",
+            "global using Lib;\nglobal using static Lib.Reader;\n",
+        ),
+        (
+            "src/Plain.cs",
+            "namespace Lib\n{\n    public class Plain\n    {\n    }\n}\n",
+        ),
+    ] {
+        let full = project.join(path);
+        fs::create_dir_all(full.parent().unwrap()).expect("create the source directory");
+        fs::write(full, contents).expect("write a source file");
+    }
+    let run = cli(&["init", project.to_str().unwrap()]);
+    assert!(
+        run.ok,
+        "setup: `codegraph init` must succeed (stdout={}, stderr={})",
+        run.stdout, run.stderr
+    );
+    let paths = IndexPaths::resolve(&project, None).expect("resolve v2 paths");
+    stage_state_slot(
+        &paths,
+        100,
+        CURRENT_STORAGE_PROTOCOL,
+        CURRENT_EXTRACTION_VERSION - 1,
+        "current",
+    );
+    let run = cli(&["sync", project.to_str().unwrap()]);
+    assert!(
+        run.ok,
+        "sync must migrate an Outdated namespace: stdout={}, stderr={}",
+        run.stdout, run.stderr
+    );
+    let (_scratch, peer) = fresh_force_peer("outdated-csharp-surfaces", &project);
+    let surface_rows = |paths: &IndexPaths| {
+        Store::open_for_read(paths, deadline(), || false)
+            .expect("readable namespace")
+            .project_metadata_with_prefix("csharp_surface")
+            .expect("C# surface rows")
+    };
+    let migrated = surface_rows(&paths);
+    // `Plain.cs` and `Base.cs` hold no head with a base and no global using.
+    assert_eq!(
+        migrated
+            .iter()
+            .map(|(key, _)| key.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "csharp_surface:src/GlobalUsings.cs",
+            "csharp_surface:src/Lib/Leaf.cs",
+            "csharp_surface_version",
+        ],
+        "a migration writes the surface rows and their marker: {migrated:?}"
+    );
+    assert_eq!(
+        migrated,
+        surface_rows(&IndexPaths::resolve(&peer, None).expect("resolve peer v2 paths")),
+        "a forced migration must write the C# surface rows of `index --force`"
+    );
+}
+
+/// W4-CS-03: a migration writes the member surface rows and their marker a
+/// fresh `index --force` writes.
+#[test]
+fn outdated_migration_writes_the_member_surface_rows_of_index_force() {
+    let dir = TestDir::new("outdated-member-surfaces");
+    let project = dir.path().join("mini");
+    for (path, contents) in [
+        (
+            "src/Json/WriterBase.cs",
+            "namespace App.Json;\n\npublic abstract class WriterBase\n{\n    protected JsonWriter Writer { get; set; }\n}\n",
+        ),
+        (
+            "src/main/java/app/WriterBase.java",
+            "package app;\n\npublic abstract class WriterBase {\n    protected JsonWriter writer;\n}\n",
+        ),
+        (
+            "src/main/kotlin/app/WriterBase.kt",
+            "package app\n\nopen class WriterBase {\n    protected val writer: JsonWriter = JsonWriter()\n}\n",
+        ),
+        ("src/notes.ts", "export const notes = 1;\n"),
+    ] {
+        let full = project.join(path);
+        fs::create_dir_all(full.parent().unwrap()).expect("create the source directory");
+        fs::write(full, contents).expect("write a source file");
+    }
+    let run = cli(&["init", project.to_str().unwrap()]);
+    assert!(
+        run.ok,
+        "setup: `codegraph init` must succeed (stdout={}, stderr={})",
+        run.stdout, run.stderr
+    );
+    let paths = IndexPaths::resolve(&project, None).expect("resolve v2 paths");
+    stage_state_slot(
+        &paths,
+        100,
+        CURRENT_STORAGE_PROTOCOL,
+        CURRENT_EXTRACTION_VERSION - 1,
+        "current",
+    );
+    let run = cli(&["sync", project.to_str().unwrap()]);
+    assert!(
+        run.ok,
+        "sync must migrate an Outdated namespace: stdout={}, stderr={}",
+        run.stdout, run.stderr
+    );
+    let (_scratch, peer) = fresh_force_peer("outdated-member-surfaces", &project);
+    let surface_rows = |paths: &IndexPaths| {
+        Store::open_for_read(paths, deadline(), || false)
+            .expect("readable namespace")
+            .project_metadata_with_prefix("member_surface")
+            .expect("member surface rows")
+    };
+    let migrated = surface_rows(&paths);
+    // No row for the TypeScript file: only C#, Java and Kotlin have one.
+    assert_eq!(
+        migrated
+            .iter()
+            .map(|(key, _)| key.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "member_surface:src/Json/WriterBase.cs",
+            "member_surface:src/main/java/app/WriterBase.java",
+            "member_surface:src/main/kotlin/app/WriterBase.kt",
+            "member_surface_version",
+        ],
+        "a migration writes the surface rows and their marker: {migrated:?}"
+    );
+    assert_eq!(
+        migrated,
+        surface_rows(&IndexPaths::resolve(&peer, None).expect("resolve peer v2 paths")),
+        "a forced migration must write the member surface rows of `index --force`"
+    );
+}
+
+/// W4-RB-01: a migration writes the Ruby head rows and their marker a fresh
+/// `index --force` writes.
+#[test]
+fn outdated_migration_writes_the_ruby_head_rows_of_index_force() {
+    let dir = TestDir::new("outdated-ruby-heads");
+    let project = dir.path().join("mini");
+    for (path, contents) in [
+        ("lib/base.rb", "class Base\n  include Helpers\nend\n"),
+        (
+            "lib/foo.rb",
+            "class Foo < Base\n  def run\n    helper()\n  end\nend\n",
+        ),
+        ("src/notes.ts", "export const notes = 1;\n"),
+    ] {
+        let full = project.join(path);
+        fs::create_dir_all(full.parent().unwrap()).expect("create the source directory");
+        fs::write(full, contents).expect("write a source file");
+    }
+    let run = cli(&["init", project.to_str().unwrap()]);
+    assert!(
+        run.ok,
+        "setup: `codegraph init` must succeed (stdout={}, stderr={})",
+        run.stdout, run.stderr
+    );
+    let paths = IndexPaths::resolve(&project, None).expect("resolve v2 paths");
+    stage_state_slot(
+        &paths,
+        100,
+        CURRENT_STORAGE_PROTOCOL,
+        CURRENT_EXTRACTION_VERSION - 1,
+        "current",
+    );
+    let run = cli(&["sync", project.to_str().unwrap()]);
+    assert!(
+        run.ok,
+        "sync must migrate an Outdated namespace: stdout={}, stderr={}",
+        run.stdout, run.stderr
+    );
+    let (_scratch, peer) = fresh_force_peer("outdated-ruby-heads", &project);
+    let head_rows = |paths: &IndexPaths| {
+        Store::open_for_read(paths, deadline(), || false)
+            .expect("readable namespace")
+            .project_metadata_with_prefix("ruby_heads")
+            .expect("ruby head rows")
+    };
+    let migrated = head_rows(&paths);
+    // No row for the TypeScript file: only Ruby files have one.
+    assert_eq!(
+        migrated
+            .iter()
+            .map(|(key, _)| key.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "ruby_heads:lib/base.rb",
+            "ruby_heads:lib/foo.rb",
+            "ruby_heads_version",
+        ],
+        "a migration writes the head rows and their marker: {migrated:?}"
+    );
+    assert_eq!(
+        migrated,
+        head_rows(&IndexPaths::resolve(&peer, None).expect("resolve peer v2 paths")),
+        "a forced migration must write the Ruby head rows of `index --force`"
+    );
+}
+
+/// W4-CF-01: a migration writes the CFML component rows and their marker a
+/// fresh `index --force` writes.
+#[test]
+fn outdated_migration_writes_the_cfml_component_rows_of_index_force() {
+    let dir = TestDir::new("outdated-cfml-heads");
+    let project = dir.path().join("mini");
+    for (path, contents) in [
+        (
+            "system/Base.cfc",
+            "component {\n  function getSetting( name ) {\n    return 1;\n  }\n}\n",
+        ),
+        (
+            "system/Handler.cfc",
+            "component extends=\"app.system.Base\" {\n  function index() {\n    return getSetting( \"x\" );\n  }\n}\n",
+        ),
+        ("views/main.cfm", "<cfoutput>#now()#</cfoutput>\n"),
+    ] {
+        let full = project.join(path);
+        fs::create_dir_all(full.parent().unwrap()).expect("create the source directory");
+        fs::write(full, contents).expect("write a source file");
+    }
+    let run = cli(&["init", project.to_str().unwrap()]);
+    assert!(
+        run.ok,
+        "setup: `codegraph init` must succeed (stdout={}, stderr={})",
+        run.stdout, run.stderr
+    );
+    let paths = IndexPaths::resolve(&project, None).expect("resolve v2 paths");
+    stage_state_slot(
+        &paths,
+        100,
+        CURRENT_STORAGE_PROTOCOL,
+        CURRENT_EXTRACTION_VERSION - 1,
+        "current",
+    );
+    let run = cli(&["sync", project.to_str().unwrap()]);
+    assert!(
+        run.ok,
+        "sync must migrate an Outdated namespace: stdout={}, stderr={}",
+        run.stdout, run.stderr
+    );
+    let (_scratch, peer) = fresh_force_peer("outdated-cfml-heads", &project);
+    let head_rows = |paths: &IndexPaths| {
+        Store::open_for_read(paths, deadline(), || false)
+            .expect("readable namespace")
+            .project_metadata_with_prefix("cfml_heads")
+            .expect("cfml component rows")
+    };
+    let migrated = head_rows(&paths);
+    // No row for the template: only `.cfc` files have one.
+    assert_eq!(
+        migrated
+            .iter()
+            .map(|(key, _)| key.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "cfml_heads:system/Base.cfc",
+            "cfml_heads:system/Handler.cfc",
+            "cfml_heads_version",
+        ],
+        "a migration writes the component rows and their marker: {migrated:?}"
+    );
+    assert_eq!(
+        migrated,
+        head_rows(&IndexPaths::resolve(&peer, None).expect("resolve peer v2 paths")),
+        "a forced migration must write the CFML component rows of `index --force`"
+    );
+}
+
+/// W4-SW-01: a migration writes the Swift head rows and their marker a
+/// fresh `index --force` writes.
+#[test]
+fn outdated_migration_writes_the_swift_head_rows_of_index_force() {
+    let dir = TestDir::new("outdated-swift-heads");
+    let project = dir.path().join("mini");
+    for (path, contents) in [
+        (
+            "App/Card.swift",
+            "import SwiftUI\nextension View {\n    func cardStyle() -> some View { padding() }\n}\n",
+        ),
+        (
+            "App/HomeView.swift",
+            "import SwiftUI\nstruct HomeView: View {\n    var body: some View { Text(\"x\") }\n}\n",
+        ),
+        ("App/main.swift", "print(1)\n"),
+    ] {
+        let full = project.join(path);
+        fs::create_dir_all(full.parent().unwrap()).expect("create the source directory");
+        fs::write(full, contents).expect("write a source file");
+    }
+    let run = cli(&["init", project.to_str().unwrap()]);
+    assert!(
+        run.ok,
+        "setup: `codegraph init` must succeed (stdout={}, stderr={})",
+        run.stdout, run.stderr
+    );
+    let paths = IndexPaths::resolve(&project, None).expect("resolve v2 paths");
+    stage_state_slot(
+        &paths,
+        100,
+        CURRENT_STORAGE_PROTOCOL,
+        CURRENT_EXTRACTION_VERSION - 1,
+        "current",
+    );
+    let run = cli(&["sync", project.to_str().unwrap()]);
+    assert!(
+        run.ok,
+        "sync must migrate an Outdated namespace: stdout={}, stderr={}",
+        run.stdout, run.stderr
+    );
+    let (_scratch, peer) = fresh_force_peer("outdated-swift-heads", &project);
+    let head_rows = |paths: &IndexPaths| {
+        Store::open_for_read(paths, deadline(), || false)
+            .expect("readable namespace")
+            .project_metadata_with_prefix("swift_heads")
+            .expect("swift head rows")
+    };
+    let migrated = head_rows(&paths);
+    // No row for a file that declares no type.
+    assert_eq!(
+        migrated
+            .iter()
+            .map(|(key, _)| key.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "swift_heads:App/Card.swift",
+            "swift_heads:App/HomeView.swift",
+            "swift_heads_version",
+        ],
+        "a migration writes the head rows and their marker: {migrated:?}"
+    );
+    assert_eq!(
+        migrated,
+        head_rows(&IndexPaths::resolve(&peer, None).expect("resolve peer v2 paths")),
+        "a forced migration must write the Swift head rows of `index --force`"
+    );
+}
+
+/// W4-GO-01: a migration writes the Go head rows (each type declaration's
+/// embeddings, mentions and digest) and their marker as `index --force`
+/// does.
+#[test]
+fn outdated_migration_writes_the_go_head_rows_of_index_force() {
+    let dir = TestDir::new("outdated-go-heads");
+    let project = dir.path().join("mini");
+    for (path, contents) in [
+        ("go.mod", "module example.com/app\n\ngo 1.22\n"),
+        (
+            "h/server.go",
+            "package h\n\ntype server struct {\n\tBaseAPI\n\tstore *store\n}\n",
+        ),
+        ("h/run.go", "package h\n\nfunc (s *server) Run() {}\n"),
+    ] {
+        let full = project.join(path);
+        fs::create_dir_all(full.parent().unwrap()).expect("create the source directory");
+        fs::write(full, contents).expect("write a source file");
+    }
+    let run = cli(&["init", project.to_str().unwrap()]);
+    assert!(
+        run.ok,
+        "setup: `codegraph init` must succeed (stdout={}, stderr={})",
+        run.stdout, run.stderr
+    );
+    let paths = IndexPaths::resolve(&project, None).expect("resolve v2 paths");
+    stage_state_slot(
+        &paths,
+        100,
+        CURRENT_STORAGE_PROTOCOL,
+        CURRENT_EXTRACTION_VERSION - 1,
+        "current",
+    );
+    let run = cli(&["sync", project.to_str().unwrap()]);
+    assert!(
+        run.ok,
+        "sync must migrate an Outdated namespace: stdout={}, stderr={}",
+        run.stdout, run.stderr
+    );
+    let (_scratch, peer) = fresh_force_peer("outdated-go-heads", &project);
+    let head_rows = |paths: &IndexPaths| {
+        Store::open_for_read(paths, deadline(), || false)
+            .expect("readable namespace")
+            .project_metadata_with_prefix("go_heads")
+            .expect("go head rows")
+    };
+    let migrated = head_rows(&paths);
+    // No row for a file that declares no type.
+    assert_eq!(
+        migrated
+            .iter()
+            .map(|(key, _)| key.as_str())
+            .collect::<Vec<_>>(),
+        ["go_heads:h/server.go", "go_heads_version"],
+        "a migration writes the head rows and their marker: {migrated:?}"
+    );
+    assert_eq!(
+        migrated,
+        head_rows(&IndexPaths::resolve(&peer, None).expect("resolve peer v2 paths")),
+        "a forced migration must write the Go head rows of `index --force`"
+    );
+}
+
+/// W4-RS-03: a migration writes the Rust receiver marker as `index --force`
+/// does, so the next sync does not re-resolve every Rust file again.
+#[test]
+fn outdated_migration_writes_the_rust_receiver_marker_of_index_force() {
+    let dir = TestDir::new("outdated-rust-receivers");
+    let project = dir.path().join("mini");
+    for (path, contents) in [
+        (
+            "Cargo.toml",
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+        ),
+        (
+            "src/lib.rs",
+            "pub struct Widget;\n\npub fn run() {\n    let _ = Vec::<u8>::new();\n}\n",
+        ),
+    ] {
+        let full = project.join(path);
+        fs::create_dir_all(full.parent().unwrap()).expect("create the source directory");
+        fs::write(full, contents).expect("write a source file");
+    }
+    let run = cli(&["init", project.to_str().unwrap()]);
+    assert!(
+        run.ok,
+        "setup: `codegraph init` must succeed (stdout={}, stderr={})",
+        run.stdout, run.stderr
+    );
+    let paths = IndexPaths::resolve(&project, None).expect("resolve v2 paths");
+    stage_state_slot(
+        &paths,
+        100,
+        CURRENT_STORAGE_PROTOCOL,
+        CURRENT_EXTRACTION_VERSION - 1,
+        "current",
+    );
+    let run = cli(&["sync", project.to_str().unwrap()]);
+    assert!(
+        run.ok,
+        "sync must migrate an Outdated namespace: stdout={}, stderr={}",
+        run.stdout, run.stderr
+    );
+    let (_scratch, peer) = fresh_force_peer("outdated-rust-receivers", &project);
+    let marker = |paths: &IndexPaths| {
+        Store::open_for_read(paths, deadline(), || false)
+            .expect("readable namespace")
+            .project_metadata_with_prefix("rust_receivers")
+            .expect("rust receiver marker")
+    };
+    let migrated = marker(&paths);
+    assert_eq!(
+        migrated,
+        [("rust_receivers_version".to_string(), "1".to_string())],
+        "a migration writes the marker: {migrated:?}"
+    );
+    assert_eq!(
+        migrated,
+        marker(&IndexPaths::resolve(&peer, None).expect("resolve peer v2 paths")),
+        "a forced migration must write the marker of `index --force`"
+    );
+}
+
+/// W4-SW-04: a migration writes the Objective-C head rows (a class's
+/// written superclass, a property's declared type) and their marker as
+/// `index --force` does.
+#[test]
+fn outdated_migration_writes_the_objc_head_rows_of_index_force() {
+    let dir = TestDir::new("outdated-objc-heads");
+    let project = dir.path().join("mini");
+    for (path, contents) in [
+        (
+            "Core/SDCache.h",
+            "@interface SDCache : SDBase\n@property (nonatomic) NSURL *url;\n@end\n",
+        ),
+        (
+            "Core/SDCache.m",
+            "#import \"SDCache.h\"\n@implementation SDCache\n- (void)run {\n    [self prepare];\n}\n@end\n",
+        ),
+        ("Core/util.m", "int twice(int x) {\n    return x * 2;\n}\n"),
+    ] {
+        let full = project.join(path);
+        fs::create_dir_all(full.parent().unwrap()).expect("create the source directory");
+        fs::write(full, contents).expect("write a source file");
+    }
+    let run = cli(&["init", project.to_str().unwrap()]);
+    assert!(
+        run.ok,
+        "setup: `codegraph init` must succeed (stdout={}, stderr={})",
+        run.stdout, run.stderr
+    );
+    let paths = IndexPaths::resolve(&project, None).expect("resolve v2 paths");
+    stage_state_slot(
+        &paths,
+        100,
+        CURRENT_STORAGE_PROTOCOL,
+        CURRENT_EXTRACTION_VERSION - 1,
+        "current",
+    );
+    let run = cli(&["sync", project.to_str().unwrap()]);
+    assert!(
+        run.ok,
+        "sync must migrate an Outdated namespace: stdout={}, stderr={}",
+        run.stdout, run.stderr
+    );
+    let (_scratch, peer) = fresh_force_peer("outdated-objc-heads", &project);
+    let head_rows = |paths: &IndexPaths| {
+        Store::open_for_read(paths, deadline(), || false)
+            .expect("readable namespace")
+            .project_metadata_with_prefix("objc_heads")
+            .expect("objc head rows")
+    };
+    let migrated = head_rows(&paths);
+    // No row for a file that declares no class or property.
+    assert_eq!(
+        migrated
+            .iter()
+            .map(|(key, _)| key.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "objc_heads:Core/SDCache.h",
+            "objc_heads:Core/SDCache.m",
+            "objc_heads_version",
+        ],
+        "a migration writes the head rows and their marker: {migrated:?}"
+    );
+    assert_eq!(
+        migrated,
+        head_rows(&IndexPaths::resolve(&peer, None).expect("resolve peer v2 paths")),
+        "a forced migration must write the Objective-C head rows of `index --force`"
+    );
 }
 
 /// Migration is a from-source rebuild, so a tracked file that no longer exists

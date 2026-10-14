@@ -34,7 +34,7 @@ expect() {
 
 run A_repository "$root"; expect A_repository zero 'only all-success exits zero'
 B=$(fixture B_pristine); run B_pristine "$B"; expect B_pristine zero 'release topology'
-C=$(fixture C_needs); mutate "$C/.github/workflows/ci.yml" '    needs: [workspace-version, linux, windows-clippy, windows-test, macos-watcher, audit]' '    needs: [workspace-version, linux, windows-clippy, macos-watcher, audit]'; run C_needs "$C"; expect C_needs nonzero 'MISMATCH \[gate-needs\]'
+C=$(fixture C_needs); mutate "$C/.github/workflows/ci.yml" '    needs: [workspace-version, linux, windows-clippy, windows-test, macos-watcher, ui, audit]' '    needs: [workspace-version, linux, windows-clippy, macos-watcher, ui, audit]'; run C_needs "$C"; expect C_needs nonzero 'MISMATCH \[gate-needs\]'
 D=$(fixture D_always); mutate "$D/.github/workflows/ci.yml" '    if: always()' '    if: success()'; run D_always "$D"; expect D_always nonzero 'MISMATCH \[gate-always\]'
 E=$(fixture E_new_job); mutate "$E/.github/workflows/ci.yml" '  ci-success:' $'  fuzz:\n    name: Fuzz\n    runs-on: ubuntu-24.04\n    steps:\n      - run: echo fuzz\n\n  ci-success:'; run E_new_job "$E"; expect E_new_job nonzero 'fuzz'
 F=$(fixture F_coverage); mutate "$F/codecov.yml" '        informational: true' '        informational: false'; run F_coverage "$F"; expect F_coverage nonzero 'MISMATCH \[coverage\]'

@@ -5,7 +5,10 @@
 //! edge from whatever holds it points at the symbol. `dead` is an inference on
 //! top of that fact, and every step of it is subtractive — a candidate leaves
 //! the list the moment there is any reason to believe something outside the
-//! graph reaches it: exported or declared in a header; in a test, generated or
+//! graph reaches it: exported (a TypeScript `declare module 'x'` or `declare
+//! global` body exports what it declares, which merges into a library's or
+//! the global scope's type, upstream #2418) or declared in a header; in a
+//! test, generated or
 //! vendored file; abstract or declared on an interface; decorated; overriding
 //! an ancestor's member (or an ancestor we cannot read); named something the
 //! language calls by itself; in an in-file test scope; in a component file

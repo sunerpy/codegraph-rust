@@ -1,5 +1,5 @@
 //! Task 26 full benchmark pipeline: Rust `codegraph` CLI vs the upstream
-//! TypeScript CLI on the three pinned corpora.
+//! TypeScript CLI on the pinned corpora.
 //!
 //! Methodology is documented in `docs/benchmark.md`. The pipeline:
 //!
@@ -41,6 +41,13 @@ fn corpus_query(name: &str) -> &'static str {
         "fd-small" => "Walk",
         "tokio-medium" => "Runtime",
         "typescript-large" => "Parser",
+        "express-medium" => "createApplication",
+        "leveldb-small" => "DBImpl",
+        "gson-medium" => "Gson",
+        "newtonsoft-large" => "JsonSerializer",
+        "alamofire-small" => "Session",
+        "redis-medium" => "processCommand",
+        "kong-medium" => "init_worker",
         _ => "main",
     }
 }

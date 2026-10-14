@@ -2,8 +2,8 @@ use codegraph_core::types::{EdgeKind, ExtractionResult, Language, NodeKind};
 use regex::Regex;
 
 use crate::embedded::shared::{
-    block_line_ranges, component_node, empty_result, extract_script_blocks, merge_delegated_result,
-    unresolved_ref,
+    ScriptFold, block_line_ranges, component_node, contains_edge, empty_result,
+    extract_script_blocks, fold_script_result, sfc_file_node, unresolved_ref,
 };
 
 const SVELTE_RUNES: &[&str] = &[
@@ -30,13 +30,21 @@ impl<'a> SvelteExtractor<'a> {
     pub fn extract(self) -> ExtractionResult {
         let start = std::time::Instant::now();
         let mut result = empty_result(0);
+        // The SFC's one file node holds the component (upstream #2268).
+        let file_node = sfc_file_node(self.file_path, self.source, Language::Svelte);
         let component = component_node(self.file_path, self.source, Language::Svelte, ".svelte");
         let component_id = component.id.clone();
+        result
+            .edges
+            .push(contains_edge(&file_node.id, &component_id));
+        result.nodes.push(file_node);
         result.nodes.push(component);
 
-        let module_regex = Regex::new(r#"context\s*=\s*["']module["']"#).unwrap();
+        // Svelte 4's `context="module"`, Svelte 5's bare `module` attribute.
+        let module_regex =
+            Regex::new(r#"context\s*=\s*["']module["']|(?:^|\s)module(?:[\s=]|$)"#).unwrap();
         for block in extract_script_blocks(self.source) {
-            let _is_module = module_regex.is_match(&block.attrs);
+            let is_module = module_regex.is_match(&block.attrs);
             let language = if block.is_typescript {
                 Language::TypeScript
             } else {
@@ -44,13 +52,18 @@ impl<'a> SvelteExtractor<'a> {
             };
             let delegated =
                 crate::engine::extract_source(self.file_path, &block.content, Some(language));
-            merge_delegated_result(
+            // An instance script runs per component instance; a module script
+            // runs once, as the file.
+            fold_script_result(
                 &mut result,
                 delegated,
-                &component_id,
-                self.file_path,
-                Language::Svelte,
-                block.line_offset,
+                &ScriptFold {
+                    file_path: self.file_path,
+                    component_id: &component_id,
+                    line_offset: block.line_offset,
+                    language: Language::Svelte,
+                    per_instance: !is_module,
+                },
             );
         }
 

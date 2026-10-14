@@ -83,21 +83,7 @@ pub fn project_service_broker(no_watch: bool) -> codegraph_mcp::ProjectServiceBr
 /// lease serializes writers; this final catch-up runs after whichever pass won
 /// the lease and therefore observes its result before the tool query executes.
 pub fn retain_project_daemon(project_root: &Path, no_watch: bool) -> Result<ProjectDaemonLease> {
-    let paths = IndexPaths::resolve(project_root, std::env::var("CODEGRAPH_DIR").ok().as_deref())?;
-    let project_root = paths.project().to_path_buf();
-    if !paths.current_root().is_dir() || !paths.current_db().is_file() {
-        bail!(
-            "refusing live services for unindexed project {}; run `codegraph init {}` first",
-            project_root.display(),
-            project_root.display()
-        );
-    }
-    if let Some(reason) = codegraph_watch::too_broad_root_reason(&project_root) {
-        bail!(
-            "refusing live services for {}: {reason}",
-            project_root.display()
-        );
-    }
+    let project_root = live_service_root(project_root)?;
 
     if !daemon_owner_live(&project_root) {
         // Liveness-gated cleanup only; a live owner's rendezvous is never
@@ -117,6 +103,59 @@ pub fn retain_project_daemon(project_root: &Path, no_watch: bool) -> Result<Proj
         )
     })?;
     Ok(lease)
+}
+
+/// Start/attach the existing project's shared daemon and retain a passive
+/// session connection, WITHOUT the synchronous catch-up
+/// [`retain_project_daemon`] waits for.
+///
+/// A cold-start stdio session uses this after it has already answered its
+/// handshake: the session reads the index the daemon writes, and this
+/// connection is what keeps the daemon from idle-exiting while the session
+/// lives. A daemon started here therefore runs its usual startup catch-up.
+pub fn retain_project_daemon_passive(
+    project_root: &Path,
+    no_watch: bool,
+) -> Result<ProjectDaemonLease> {
+    let project_root = live_service_root(project_root)?;
+    if !daemon_owner_live(&project_root) {
+        let _ = crate::clear_stale_daemon_socket(&project_root);
+        let executable = std::env::current_exe().context("resolving codegraph executable")?;
+        crate::spawn_detached_daemon(&executable, &project_root, no_watch)
+            .context("starting shared daemon for a stdio session")?;
+    }
+    connect_project_daemon_bounded(project_root)
+}
+
+/// Retain a passive connection to a daemon this process has just spawned,
+/// waiting for its socket without starting another one: a fresh daemon may not
+/// have published its pid yet, and a second spawn would only lose the pid-lock
+/// race.
+pub fn attach_project_daemon_passive(project_root: &Path) -> Result<ProjectDaemonLease> {
+    let project_root = live_service_root(project_root)?;
+    connect_project_daemon_bounded(project_root)
+}
+
+/// Resolve `project_root` to its index's project and refuse an unindexed or
+/// too-broad root before any process or sync action, so no live-service path
+/// ever creates `.codegraph`.
+fn live_service_root(project_root: &Path) -> Result<PathBuf> {
+    let paths = IndexPaths::resolve(project_root, std::env::var("CODEGRAPH_DIR").ok().as_deref())?;
+    let project_root = paths.project().to_path_buf();
+    if !paths.current_root().is_dir() || !paths.current_db().is_file() {
+        bail!(
+            "refusing live services for unindexed project {}; run `codegraph init {}` first",
+            project_root.display(),
+            project_root.display()
+        );
+    }
+    if let Some(reason) = codegraph_watch::too_broad_root_reason(&project_root) {
+        bail!(
+            "refusing live services for {}: {reason}",
+            project_root.display()
+        );
+    }
+    Ok(project_root)
 }
 
 fn daemon_owner_live(project_root: &Path) -> bool {

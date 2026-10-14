@@ -24,6 +24,8 @@ pub enum CommentLang {
     Swift,
     Go,
     Rust,
+    /// C and C++ (upstream's `c` / `cpp`).
+    Cpp,
 }
 
 /// Replace comments + string literals with spaces, preserving offsets.
@@ -38,7 +40,7 @@ pub fn strip_comments_for_regex(content: &str, lang: CommentLang) -> String {
         CommentLang::Go => strip_go(content),
         // allowSingleQuoteStrings only for JS/TS (strip-comments.ts:55).
         CommentLang::JavaScript | CommentLang::TypeScript => strip_c_style(content, true),
-        CommentLang::Java | CommentLang::CSharp | CommentLang::Swift => {
+        CommentLang::Java | CommentLang::CSharp | CommentLang::Swift | CommentLang::Cpp => {
             strip_c_style(content, false)
         }
     }

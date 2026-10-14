@@ -1,0 +1,65 @@
+[
+  {
+    "content_hash": "9d000ff738651ac5bfcf149b67030d27327d4e986370ce44a4bcd3844c4caac7",
+    "errors": null,
+    "generated": 0,
+    "language": "javascript",
+    "node_count": 2,
+    "path": "index.js",
+    "size": 72
+  },
+  {
+    "content_hash": "a2e74612004d307f64d99c1f7b2812c4b0a372001e7983954c6513e7f92f2cf2",
+    "errors": null,
+    "generated": 0,
+    "language": "javascript",
+    "node_count": 5,
+    "path": "lib/app.js",
+    "size": 358
+  },
+  {
+    "content_hash": "62ed0e8252cccf9a16a43e7be30b934159e03fd6bdfb3332c12b8908dc7be217",
+    "errors": null,
+    "generated": 0,
+    "language": "javascript",
+    "node_count": 3,
+    "path": "lib/chain.js",
+    "size": 146
+  },
+  {
+    "content_hash": "97553bcf137c9ed3b6f14e8803b80e20825c11954150346751c380cf458f3905",
+    "errors": null,
+    "generated": 0,
+    "language": "javascript",
+    "node_count": 2,
+    "path": "lib/format.js",
+    "size": 108
+  },
+  {
+    "content_hash": "61bb6c33b9f8574c8879a515a9b371ae409a2f0ced9e2e5422259648f15ddd53",
+    "errors": null,
+    "generated": 0,
+    "language": "javascript",
+    "node_count": 3,
+    "path": "lib/service.js",
+    "size": 98
+  },
+  {
+    "content_hash": "193283047e7752dfc5371b33385f931a7e4d7adc755b07157a97bb4a2633c88f",
+    "errors": null,
+    "generated": 0,
+    "language": "javascript",
+    "node_count": 2,
+    "path": "lib/util.js",
+    "size": 84
+  },
+  {
+    "content_hash": "26eaa89cc59a00de07f23a4f665adf3f1f02765c6ed728af08f3fb6dea9adcd7",
+    "errors": null,
+    "generated": 0,
+    "language": "javascript",
+    "node_count": 3,
+    "path": "test/app.test.js",
+    "size": 242
+  }
+]

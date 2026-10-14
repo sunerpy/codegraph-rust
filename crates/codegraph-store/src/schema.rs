@@ -161,6 +161,19 @@ CREATE INDEX IF NOT EXISTS idx_unresolved_file_path ON unresolved_refs(file_path
 CREATE INDEX IF NOT EXISTS idx_unresolved_from_name ON unresolved_refs(from_node_id, reference_name);
 CREATE INDEX IF NOT EXISTS idx_edges_provenance ON edges(provenance);
 
+-- Synthesized-edge registration sites, so a sync can find the synthesized
+-- edges a changed file wired without scanning every edge. The CASE guards
+-- skip malformed metadata; synthesis queries must use the same expressions
+-- for SQLite to pick the partial index.
+CREATE INDEX IF NOT EXISTS idx_edges_synthesis_site ON edges(CASE WHEN json_valid(metadata) THEN json_extract(metadata, '$.registeredAt') END)
+    WHERE CASE WHEN json_valid(metadata) THEN json_extract(metadata, '$.synthesizedBy') END IS NOT NULL;
+
+-- Files that fed the synthesis passes, kept so a later sync that deletes or
+-- edits one knows the synthesized edges must be recomputed.
+CREATE TABLE IF NOT EXISTS synthesis_inputs (
+    file_path TEXT PRIMARY KEY REFERENCES files(path) ON DELETE CASCADE
+);
+
 -- Project metadata for version/provenance tracking
 CREATE TABLE IF NOT EXISTS project_metadata (
     key TEXT PRIMARY KEY,

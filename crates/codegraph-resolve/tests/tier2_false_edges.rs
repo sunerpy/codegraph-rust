@@ -336,29 +336,28 @@ fn bound_project_map_resolves_through_both_import_routes() {
 // ============ Item 6 — kind eligibility and import locality (#1537/#1536) ====
 
 #[test]
-fn phantom_import_binds_only_the_import_node() {
+fn phantom_import_binds_nothing_and_stays_unresolved() {
     // Given `import * as path from 'node:path'` and an unrelated class carrying a
     // `path` property,
     // When resolution runs,
-    // Then the ONLY `imports` edge is the legitimate one to the `node:path`
-    // import node. The second assertion is what stops an implementation from
-    // passing by deleting all `imports` edges.
+    // Then the import binds no in-repo symbol, nor its own import statement,
+    // which is no definition (upstream #965). The second assertion is what stops
+    // an implementation from passing by dropping the reference: it stays parked
+    // as unresolved, where a later sync can retry it.
     let g = resolve_fixture("esm_import");
     let described = g.described(EdgeKind::Imports);
-    let to_non_import = g
-        .of_kind(EdgeKind::Imports)
+    assert!(
+        g.of_kind(EdgeKind::Imports).is_empty(),
+        "an out-of-repo import must bind neither an in-repo symbol nor itself: {described:?}"
+    );
+    let parked = g
+        .store
+        .all_unresolved_refs()
+        .expect("read unresolved refs")
         .into_iter()
-        .filter(|e| g.node(&e.target).kind != NodeKind::Import)
+        .filter(|r| r.reference_kind == EdgeKind::Imports && r.reference_name == "node:path")
         .count();
-    assert_eq!(
-        to_non_import, 0,
-        "an out-of-repo import must not bind an in-repo symbol: {described:?}"
-    );
-    assert_eq!(
-        g.of_kind(EdgeKind::Imports).len(),
-        1,
-        "and the edge to the import node itself must survive: {described:?}"
-    );
+    assert_eq!(parked, 1, "the `node:path` import stays unresolved");
 }
 
 #[test]
@@ -399,11 +398,13 @@ fn in_repo_rust_trait_implements_survives() {
         "Sha256Port"
     );
 
+    // The `use` statements of the out-of-repo `std` and of `crate` itself bind
+    // nothing: an import statement is never a name-match target (upstream #965).
     let imports = g.described(EdgeKind::Imports);
     assert_eq!(
         g.of_kind(EdgeKind::Imports).len(),
-        3,
-        "the in-repo `use` must keep resolving: {imports:?}"
+        1,
+        "only the in-repo `use` resolves: {imports:?}"
     );
     let to_trait = g
         .of_kind(EdgeKind::Imports)

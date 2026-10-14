@@ -56,6 +56,8 @@ codegraph-bench = { path = "../codegraph-bench" }
 # while this package's test targets are built. A normal binary build uses the
 # feature-free dependency declared above.
 codegraph-store = { path = "../codegraph-store", features = ["test-hooks"] }
+# Same for the daemon's hello-version and control-frame seams (daemon_handover.rs).
+codegraph-daemon = { path = "../codegraph-daemon", features = ["test-hooks"] }
 rstest = { workspace = true }
 assert_fs = { workspace = true }
 assert_cmd = { workspace = true }

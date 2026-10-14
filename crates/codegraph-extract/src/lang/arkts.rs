@@ -171,7 +171,9 @@ impl LanguageSpec for ArkTsSpec {
             }
             current = parent.parent();
         }
-        false
+        // TypeScript's ambient module bodies, as the TypeScript spec reads
+        // them (upstream #2418: ArkTS shares the TypeScript extractor).
+        super::typescript::is_ambient_export(node)
     }
 
     fn is_async(&self, node: Node<'_>) -> bool {

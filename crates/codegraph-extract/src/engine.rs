@@ -202,6 +202,115 @@ pub fn detect_language_with(
     Language::Unknown
 }
 
+/// The language `file_path` is indexed as, given its `source`: the language
+/// of its extension, except that a `.h` header holding C++ or Objective-C is
+/// that language, and a JavaScript file carrying Flow's `@flow` pragma is TSX.
+/// Extraction parses a file with it and every path that records a file row
+/// stores it, so the row agrees with the file's nodes.
+pub fn detect_language_for_source(
+    file_path: &str,
+    source: &str,
+    overrides: &ExtensionOverrides,
+) -> Language {
+    sniff_flow_language(
+        sniff_header_language(
+            file_path,
+            detect_language_with(file_path, overrides),
+            source,
+        ),
+        source,
+    )
+}
+
+/// [`detect_language_for_source`] for a file as the bounded reader returned
+/// it. A file over the size limit was never read, so only its extension
+/// decides; it has no nodes to disagree with.
+pub fn detect_language_of(
+    file_path: &str,
+    source: &SourceText,
+    overrides: &ExtensionOverrides,
+) -> Language {
+    match source {
+        SourceText::Text(text) => detect_language_for_source(file_path, text, overrides),
+        SourceText::Oversize(_) | SourceText::MpegTransportStream => {
+            detect_language_with(file_path, overrides)
+        }
+    }
+}
+
+/// `language` refined by `source` when `file_path` is a `.h` header of it:
+/// C++ or Objective-C content makes the header that language.
+fn sniff_header_language(file_path: &str, language: Language, source: &str) -> Language {
+    let header = Path::new(file_path)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("h"));
+    if language != Language::C || !header {
+        language
+    } else if looks_like_cpp(source) {
+        Language::Cpp
+    } else if looks_like_objc(source) {
+        Language::ObjC
+    } else {
+        language
+    }
+}
+
+/// `language` refined by `source` when it is JavaScript: a Flow-typed file
+/// (upstream #2161) is read as TSX. The JavaScript grammar cannot parse Flow's
+/// annotations (`render(): React.Node` cut a class short), TypeScript's syntax
+/// covers most of Flow's, and the TypeScript spec's `pre_parse` blanks the
+/// rest.
+fn sniff_flow_language(language: Language, source: &str) -> Language {
+    if matches!(language, Language::JavaScript | Language::Jsx) && has_flow_pragma(source) {
+        Language::Tsx
+    } else {
+        language
+    }
+}
+
+/// Whether a JavaScript file's leading comments carry Flow's `@flow` pragma
+/// and not `@noflow` (upstream `hasFlowPragma`): the comments, after an
+/// optional shebang line, before any code in the first 4096 UTF-16 code units.
+pub(crate) fn has_flow_pragma(source: &str) -> bool {
+    static FLOW: OnceLock<Regex> = OnceLock::new();
+    static NOFLOW: OnceLock<Regex> = OnceLock::new();
+    let mut units = 0;
+    let head = source
+        .char_indices()
+        .find(|(_, ch)| {
+            units += ch.len_utf16();
+            units > 4096
+        })
+        .map_or(source, |(at, _)| &source[..at]);
+    let head = head
+        .strip_prefix("#!")
+        .and_then(|rest| rest.split_once('\n'))
+        .map_or(head, |(_, rest)| rest);
+    let mut lead = 0;
+    loop {
+        let rest = &head[lead..];
+        let code = rest.trim_start_matches(codegraph_core::generated_header::is_js_whitespace);
+        let comment = if let Some(line) = code.strip_prefix("//") {
+            2 + line.find('\n').unwrap_or(line.len())
+        } else if let Some(block) = code.strip_prefix("/*") {
+            match block.find("*/") {
+                Some(close) => 2 + close + 2,
+                None => break,
+            }
+        } else {
+            break;
+        };
+        lead += rest.len() - code.len() + comment;
+    }
+    let lead = &head[..lead];
+    FLOW.get_or_init(|| Regex::new(r"@flow(?-u:\b)").expect("flow pragma"))
+        .is_match(lead)
+        && !NOFLOW
+            .get_or_init(|| Regex::new(r"@noflow(?-u:\b)").expect("noflow pragma"))
+            .is_match(lead)
+}
+
 /// A `.h` file maps to `Language::C` by extension, but may hold C++ or
 /// Objective-C. The ordinary unique-C++ probes retain their bounded 8 KiB pass;
 /// a second full-source pass recognizes a plain class/struct base clause, whose
@@ -287,20 +396,17 @@ pub fn extract_source_with_observer(
 ) -> ExtractionResult {
     let start = Instant::now();
     observer(ExtractionStage::DetectLanguage);
-    let mut language = language.unwrap_or_else(|| detect_language_with(file_path, overrides));
+    let named = language;
+    let language = language.unwrap_or_else(|| detect_language_with(file_path, overrides));
     observer(ExtractionStage::Prepare);
-    if language == Language::C
-        && Path::new(file_path)
-            .extension()
-            .and_then(|ext| ext.to_str())
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("h"))
-    {
-        if looks_like_cpp(source) {
-            language = Language::Cpp;
-        } else if looks_like_objc(source) {
-            language = Language::ObjC;
-        }
-    }
+    let language = sniff_header_language(file_path, language, source);
+    // A caller that names the language (an embedded block's delegation) keeps
+    // it, as upstream's `language || detectLanguage(filePath, source)` does.
+    let language = if named.is_none() {
+        sniff_flow_language(language, source)
+    } else {
+        language
+    };
     observer(ExtractionStage::Embedded);
     if let Some(result) = crate::embedded::extract_embedded(file_path, source, language) {
         return result;
@@ -363,7 +469,24 @@ pub fn extract_source_with_observer(
     observer(ExtractionStage::Walk);
     let parse_has_error = tree.root_node().has_error();
     let mut result = TreeSitterWalker::new(file_path, &parsed_source, spec, tree.root_node())
+        .with_raw_source(source)
         .extract(start.elapsed().as_millis() as i64);
+    // A CommonJS `require('./x')` is a file import, as ESM's `import` is
+    // (upstream #2263).
+    if result
+        .nodes
+        .iter()
+        .any(|node| node.kind == codegraph_core::types::NodeKind::File)
+    {
+        result
+            .unresolved_references
+            .extend(crate::commonjs_requires::require_refs(
+                file_path,
+                &parsed_source,
+                tree.root_node(),
+                language,
+            ));
+    }
     if parse_has_error
         && result
             .nodes
@@ -893,20 +1016,61 @@ pub fn size_skip_result(file_path: &str, size: u64, max: u64) -> ExtractionResul
         nodes: Vec::new(),
         edges: Vec::new(),
         unresolved_references: Vec::new(),
-        errors: vec![format!(
-            "File exceeds max size ({size} > {max}): {file_path}"
-        )],
+        errors: vec![format!("{SIZE_SKIP_PREFIX} ({size} > {max}): {file_path}")],
         duration_ms: 0,
     }
 }
 
-/// The project-root `.gitignore`, read with git's own rules through the
-/// `ignore` crate, as upstream reads it with the `ignore` package: a leading or
-/// inner `/` anchors a rule to the root, a slash-less rule applies at any
-/// depth, `*` and `**` glob, a trailing `/` matches directories only, and `!`
-/// re-includes. Shared with `codegraph-watch`, so the watcher's `.gitignore`
-/// verdict is the scan's by construction. An unreadable, non-UTF-8 or NUL-laden
-/// file is treated as absent and an unparseable line is skipped, never fatal.
+/// The repository's own exclude file, relative to the project root. git reads
+/// it beside every `.gitignore` for files nobody wants committed (upstream
+/// #1728).
+pub const REPOSITORY_EXCLUDE: &str = ".git/info/exclude";
+
+/// The largest exclude file read; a bigger one is treated as absent.
+const REPOSITORY_EXCLUDE_MAX_BYTES: u64 = 1024 * 1024;
+
+/// The directory holding [`REPOSITORY_EXCLUDE`], when both it and `.git` are
+/// real directories of the project root. A `.git` file (a linked worktree or a
+/// submodule) names a git directory outside the project, and a symlinked
+/// `.git` or `info` can lead there too, so none of them is followed.
+pub fn repository_exclude_dir(root: &Path) -> Option<PathBuf> {
+    let real_dir = |path: &Path| {
+        fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_dir())
+    };
+    let git = root.join(".git");
+    let info = git.join("info");
+    (real_dir(&git) && real_dir(&info)).then_some(info)
+}
+
+/// The text of [`REPOSITORY_EXCLUDE`]: a regular file (not a link) in
+/// [`repository_exclude_dir`], read through the bounded source reader, so it
+/// is stat-ed before it is opened and a FIFO there is never opened. `None`
+/// when there is no such file, or it is unreadable, over the size limit or
+/// NUL-laden.
+pub fn read_repository_exclude(root: &Path) -> Option<String> {
+    let path = repository_exclude_dir(root)?.join("exclude");
+    if !fs::symlink_metadata(&path).ok()?.file_type().is_file() {
+        return None;
+    }
+    match read_source_file(&path, REPOSITORY_EXCLUDE, REPOSITORY_EXCLUDE_MAX_BYTES)
+        .ok()?
+        .1
+    {
+        SourceText::Text(text) if !text.contains('\0') => Some(text),
+        _ => None,
+    }
+}
+
+/// The project-root `.gitignore`, together with the repository's own
+/// [`REPOSITORY_EXCLUDE`], read with git's own rules through the `ignore`
+/// crate, as upstream reads them with the `ignore` package: a leading or inner
+/// `/` anchors a rule to the root, a slash-less rule applies at any depth, `*`
+/// and `**` glob, a trailing `/` matches directories only, and `!` re-includes.
+/// git ranks a `.gitignore` above the exclude file, so the exclude rules are
+/// read first and a `.gitignore` line wins a conflict with them. Shared with
+/// `codegraph-watch`, so the watcher's verdict is the scan's by construction.
+/// An unreadable, non-UTF-8 or NUL-laden `.gitignore` is treated as absent and
+/// an unparseable line is skipped, never fatal.
 #[derive(Debug, Clone, Default)]
 pub struct RootGitignore {
     matcher: Option<ignore::gitignore::Gitignore>,
@@ -914,17 +1078,19 @@ pub struct RootGitignore {
 
 impl RootGitignore {
     pub fn load(root: &Path) -> Self {
-        let Ok(text) = fs::read_to_string(root.join(".gitignore")) else {
-            return Self::default();
-        };
-        if text.contains('\0') {
-            return Self::default();
-        }
+        let gitignore = fs::read_to_string(root.join(".gitignore"))
+            .ok()
+            .filter(|text| !text.contains('\0'));
         // Rooted at `.` so a root-relative candidate is never prefix-stripped.
         let mut builder = ignore::gitignore::GitignoreBuilder::new(".");
-        for line in text.lines() {
-            // An invalid glob drops only its own line; the rest still apply.
-            let _ = builder.add_line(None, line);
+        for text in [read_repository_exclude(root), gitignore]
+            .into_iter()
+            .flatten()
+        {
+            for line in text.lines() {
+                // An invalid glob drops only its own line; the rest still apply.
+                let _ = builder.add_line(None, line);
+            }
         }
         let matcher = builder.build().ok().filter(|matcher| !matcher.is_empty());
         Self { matcher }
@@ -1134,6 +1300,46 @@ fn is_extractable_source_path(relative: &str, overrides: &ExtensionOverrides) ->
             || is_file_level_only_language(language))
 }
 
+/// Why an indexed file whose content is current has none of the symbols it
+/// should have (upstream #2336). A content-hash comparison calls such a file
+/// up to date, so only its stored row can tell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MissingSymbols {
+    /// Stored with no nodes and no recorded reason; every parse stores at least
+    /// the file node, so the row was wiped and a rebuild restores it.
+    NeedsReindex,
+    /// A recorded parse failure left it without symbols; it stays this way
+    /// until the file or the parser changes.
+    ParseError,
+}
+
+/// Classify one stored file row; `None` when it has its symbols or is empty on
+/// purpose (a file over the size limit, a file-level-only language).
+#[must_use]
+pub fn missing_symbols(file: &codegraph_core::types::FileRecord) -> Option<MissingSymbols> {
+    let collapsed = file
+        .errors
+        .iter()
+        .any(|error| error.contains(PARSE_COLLAPSE_WARNING));
+    if file.node_count > 0 {
+        return collapsed.then_some(MissingSymbols::ParseError);
+    }
+    if is_file_level_only_language(file.language) {
+        return None;
+    }
+    if file.errors.is_empty() {
+        return Some(MissingSymbols::NeedsReindex);
+    }
+    let skipped_for_size = file
+        .errors
+        .iter()
+        .all(|error| error.starts_with(SIZE_SKIP_PREFIX));
+    (!skipped_for_size).then_some(MissingSymbols::ParseError)
+}
+
+/// The start of the error [`size_skip_result`] records.
+const SIZE_SKIP_PREFIX: &str = "File exceeds max size";
+
 fn is_file_level_only_language(language: Language) -> bool {
     matches!(
         language,
@@ -1156,6 +1362,46 @@ fn normalize_path(path: impl AsRef<Path>) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn missing_symbols_classifies_stored_rows_like_upstream() {
+        use codegraph_core::types::FileRecord;
+        let row = |language: Language, node_count: i64, errors: &[&str]| FileRecord {
+            path: "src/a.ts".to_string(),
+            content_hash: String::new(),
+            language,
+            size: 1,
+            modified_at: 0,
+            indexed_at: 0,
+            node_count,
+            errors: errors.iter().map(|error| (*error).to_string()).collect(),
+            generated: false,
+        };
+        let collapsed = format!(
+            "src/a.ts: {PARSE_COLLAPSE_WARNING} - the file is indexed but contributes nothing to the graph"
+        );
+        assert_eq!(missing_symbols(&row(Language::TypeScript, 3, &[])), None);
+        assert_eq!(
+            missing_symbols(&row(Language::TypeScript, 1, &[&collapsed])),
+            Some(MissingSymbols::ParseError)
+        );
+        assert_eq!(
+            missing_symbols(&row(Language::TypeScript, 0, &[])),
+            Some(MissingSymbols::NeedsReindex)
+        );
+        assert_eq!(missing_symbols(&row(Language::Yaml, 0, &[])), None);
+        assert_eq!(missing_symbols(&row(Language::GodotScene, 0, &[])), None);
+        let oversized = size_skip_result("src/a.ts", 9, 4).errors;
+        let oversized = oversized.iter().map(String::as_str).collect::<Vec<_>>();
+        assert_eq!(
+            missing_symbols(&row(Language::TypeScript, 0, &oversized)),
+            None
+        );
+        assert_eq!(
+            missing_symbols(&row(Language::TypeScript, 0, &["could not read the file"])),
+            Some(MissingSymbols::ParseError)
+        );
+    }
+
     use super::*;
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::SystemTime;
@@ -1986,6 +2232,121 @@ mod tests {
     fn dot_h_plain_c_stays_c() {
         let result = extract_source("plain.h", "int add(int a, int b);\n", None);
         assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+    }
+
+    /// Upstream #2161's Flow-typed component (`__tests__/flow-js.test.ts`).
+    const FLOW_COMPONENT: &str = "/**\n * @flow strict-local\n * @format\n */\nimport typeof * as React from 'react';\nimport * as React from 'react';\n\ntype Props = $ReadOnly<{|\n  values: ?Array<string>,\n  onChange?: ?(event: {nativeEvent: {value: string}, ...}) => mixed,\n|}>;\n\nopaque type Token = string;\n\nclass SegmentedControl extends React.Component<Props> {\n  render(): React.Node {\n    return this._renderItems();\n  }\n\n  _renderItems(): React.Node {\n    return null;\n  }\n}\n\nmodule.exports = SegmentedControl;\n";
+
+    #[test]
+    fn a_flow_pragma_reads_a_javascript_file_as_tsx() {
+        let none = ExtensionOverrides::default();
+        let detect = |path: &str, source: &str| detect_language_for_source(path, source, &none);
+        assert_eq!(
+            detect("js/SegmentedControl.js", FLOW_COMPONENT),
+            Language::Tsx
+        );
+        assert_eq!(
+            detect("js/plain.js", "function plain() {}"),
+            Language::JavaScript
+        );
+        assert_eq!(
+            detect("js/x.js", "// @noflow\nconst a = 1;"),
+            Language::JavaScript
+        );
+        assert_eq!(
+            detect("js/x.jsx", "// @flow\nconst a = <b />;"),
+            Language::Tsx
+        );
+        assert_eq!(
+            detect("js/x.mjs", "/* @flow */\nexport const a = 1;"),
+            Language::Tsx
+        );
+        // Only JavaScript reads the pragma.
+        assert_eq!(
+            detect("src/x.ts", "// @flow\nconst a = 1;"),
+            Language::TypeScript
+        );
+        // A shebang line comes first; a byte-order mark is whitespace.
+        assert_eq!(
+            detect("bin/cli.js", "#!/usr/bin/env node\n// @flow\nmain();"),
+            Language::Tsx
+        );
+        assert_eq!(
+            detect("js/bom.js", "\u{feff}// @flow\nconst a = 1;"),
+            Language::Tsx
+        );
+    }
+
+    #[test]
+    fn the_flow_pragma_is_read_from_the_leading_comments_only() {
+        for source in [
+            "const a = 1; // @flow\n",
+            "'use strict';\n// @flow\n",
+            "/* @flowtype */\nconst a = 1;\n",
+            "// @flow\n// @noflow\nconst a = 1;\n",
+            "/* @flow\nconst a = 1;\n",
+            "#!/usr/bin/env node // @flow",
+        ] {
+            assert!(!has_flow_pragma(source), "{source:?}");
+        }
+        assert!(has_flow_pragma("// a\n\n/* b */ /** @flow */\n"));
+        // The leading comments are read in the first 4096 UTF-16 code units
+        // (`é` is one unit and two bytes).
+        assert!(has_flow_pragma(&format!(
+            "// {}\n// @flow\n",
+            "é".repeat(4000)
+        )));
+        assert!(!has_flow_pragma(&format!(
+            "// {}\n// @flow\n",
+            "é".repeat(4096)
+        )));
+    }
+
+    #[test]
+    fn the_typescript_specs_blank_flow_syntax_keeping_every_offset() {
+        let flow_only = Regex::new(r"\{\||\|\}|import\s+typeof|opaque\s+type|:\s*\?Array")
+            .expect("Flow-only syntax");
+        for language in [Language::TypeScript, Language::Tsx] {
+            let spec = crate::lang::spec_for_language(language).expect("TypeScript spec");
+            let out = spec.pre_parse(FLOW_COMPONENT, "js/SegmentedControl.js");
+            assert_eq!(out.len(), FLOW_COMPONENT.len());
+            assert_eq!(out.lines().count(), FLOW_COMPONENT.lines().count());
+            assert!(!flow_only.is_match(&out), "{out}");
+            // Not a Flow file, or not a JavaScript path: unchanged.
+            assert_eq!(
+                spec.pre_parse("const a = {| b |};", "plain.js"),
+                "const a = {| b |};"
+            );
+            assert_eq!(spec.pre_parse(FLOW_COMPONENT, "src/x.tsx"), FLOW_COMPONENT);
+        }
+    }
+
+    #[test]
+    fn a_flow_typed_javascript_file_keeps_its_class_and_methods() {
+        let flow = extract_source("js/SegmentedControl.js", FLOW_COMPONENT, None);
+        let mut methods: Vec<(&str, Language)> = flow
+            .nodes
+            .iter()
+            .filter(|node| node.kind == codegraph_core::types::NodeKind::Method)
+            .map(|node| (node.name.as_str(), node.language))
+            .collect();
+        methods.sort_by_key(|(name, _)| *name);
+        assert_eq!(
+            methods,
+            [("_renderItems", Language::Tsx), ("render", Language::Tsx)]
+        );
+        // A caller that names the language keeps it.
+        let named = extract_source(
+            "js/SegmentedControl.js",
+            FLOW_COMPONENT,
+            Some(Language::JavaScript),
+        );
+        assert!(
+            named
+                .nodes
+                .iter()
+                .all(|node| node.language == Language::JavaScript)
+        );
     }
 
     fn cpp_raw_string(delimiter: &str) -> String {

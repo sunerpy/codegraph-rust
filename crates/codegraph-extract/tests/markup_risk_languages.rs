@@ -4,6 +4,23 @@ use std::fs;
 
 const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/markup_risk");
 
+/// `(kind, qualified name)` of every field, property, variable and constant.
+fn value_nodes(result: &ExtractionResult) -> Vec<(NodeKind, String)> {
+    let mut nodes: Vec<_> = result
+        .nodes
+        .iter()
+        .filter(|node| {
+            matches!(
+                node.kind,
+                NodeKind::Field | NodeKind::Property | NodeKind::Variable | NodeKind::Constant
+            )
+        })
+        .map(|node| (node.kind, node.qualified_name.clone()))
+        .collect();
+    nodes.sort_by(|a, b| (format!("{:?}", a.0), &a.1).cmp(&(format!("{:?}", b.0), &b.1)));
+    nodes
+}
+
 #[test]
 fn lang_markup_risk_file_level_only_languages_are_empty() {
     // Upstream grammars.ts:332-334 and tree-sitter.ts:4382-4387 return no extractor nodes.
@@ -209,17 +226,15 @@ fn lang_markup_risk_kotlin_extracts_upstream_symbol_set() {
 
     let repo = assert_node(&result, NodeKind::Class, "Repo");
     assert_eq!(repo.visibility.as_deref(), Some("public"));
-    // The upstream emits NO field/property/variable nodes for kotlin
-    // property_declaration: extractField (tree-sitter.ts:1180-1278) and
-    // extractVariable (tree-sitter.ts:1382-1463) find no declarators in the
-    // kotlin grammar shape. `val name` / `val topLevel` must NOT be nodes.
-    assert!(
-        !result.nodes.iter().any(|node| matches!(
-            node.kind,
-            NodeKind::Field | NodeKind::Property | NodeKind::Variable | NodeKind::Constant
-        )),
-        "kotlin must not emit field/property/variable nodes: {:#?}",
-        result.nodes
+    // Since upstream #897 a Kotlin property is a node by where it is declared:
+    // a class's `val name` a field, the top-level `val topLevel` a constant. A
+    // constructor parameter (`private val db`) is none.
+    assert_eq!(
+        value_nodes(&result),
+        [
+            (NodeKind::Constant, "com.example.demo::topLevel".to_string()),
+            (NodeKind::Field, "com.example.demo::Repo::name".to_string()),
+        ]
     );
 
     let fetch = assert_node(&result, NodeKind::Method, "fetch");
@@ -332,15 +347,16 @@ fn lang_markup_risk_swift_extracts_upstream_symbol_set() {
     let top_level = assert_node(&result, NodeKind::Function, "topLevel");
     assert!(!top_level.is_async);
 
-    // Stored properties are NOT nodes (tree-sitter.ts:453-487); the wrapper
-    // attribute decorates the enclosing type instead.
-    assert!(
-        !result.nodes.iter().any(|node| matches!(
-            node.kind,
-            NodeKind::Field | NodeKind::Property | NodeKind::Variable | NodeKind::Constant
-        )),
-        "swift must not emit field/property/variable nodes: {:#?}",
-        result.nodes
+    // Since upstream #897 a stored property is a node (an instance one a
+    // field, the top-level `let answer` a constant); the wrapper attribute
+    // still decorates the enclosing type (tree-sitter.ts:453-487).
+    assert_eq!(
+        value_nodes(&result),
+        [
+            (NodeKind::Constant, "answer".to_string()),
+            (NodeKind::Field, "Greeter::name".to_string()),
+            (NodeKind::Field, "Point::x".to_string()),
+        ]
     );
 
     // Golden unresolved references from the upstream branches:

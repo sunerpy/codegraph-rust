@@ -119,7 +119,7 @@ guardrail:
 
 script-tests:
 	@for test_script in scripts/tests/*.test.sh; do \
-		echo "Running $$test_script"; bash "$$test_script"; \
+		echo "Running $$test_script"; bash "$$test_script" || exit 1; \
 	done
 
 # Keep all supported local/CI entry points byte-for-byte equivalent in ordering.

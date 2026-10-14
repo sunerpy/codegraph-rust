@@ -458,13 +458,16 @@ fn kotlin_private_and_rust_module_visibility_are_enforced() {
         vec!["visible"]
     );
 
+    // `use super::*` brings the parent's items into scope (upstream #2214:
+    // another file's item is reached only through a `use` or a glob); the
+    // private `hidden` of a sibling stays out of reach.
     let rust = resolve_project(
         "rust-module-visibility",
         &[
             ("src/net.rs", "fn shared() {}\npub fn exported() {}\n"),
             (
                 "src/net/tcp.rs",
-                "pub fn open() { shared(); hidden(); exported(); }\n",
+                "use super::*;\n\npub fn open() { shared(); hidden(); exported(); }\n",
             ),
             ("src/util.rs", "fn hidden() {}\n"),
         ],

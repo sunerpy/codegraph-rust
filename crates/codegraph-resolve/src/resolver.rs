@@ -10,9 +10,9 @@
 use crate::alias_binding::resolve_alias_binding;
 use crate::framework::FrameworkResolver;
 use crate::import_resolver::{
-    PhpImportedStaticCallResolution, is_bound_to_out_of_repo_module, is_php_include_path_ref,
-    python_module_member_is_claimed, resolve_jvm_import, resolve_php_imported_static_call,
-    resolve_via_import,
+    PhpImportedStaticCallResolution, is_bound_to_out_of_repo_module, is_js_path_import_ref,
+    is_lua_require_ref, is_php_include_path_ref, python_module_member_is_claimed,
+    resolve_jvm_import, resolve_php_imported_static_call, resolve_via_import,
 };
 use crate::name_matcher::{
     crosses_code_boundary, gate_language_match, is_js_name_target_visible,
@@ -291,10 +291,13 @@ fn cpp_type_spelling_matches(spelled: &str, qualified: &str) -> bool {
 
 /// Pick one C++ type owner without using file proximity as namespace proof.
 /// An unqualified spelling may be resolved by the caller's lexical qualified
-/// scope (longest segment-aligned prefix), otherwise the project must contain
-/// exactly one matching owner. Equal-best candidates remain unresolved.
+/// scope (longest segment-aligned prefix), or by `lexical_scope` when the
+/// spelling was written somewhere else (an alias's own scope), otherwise the
+/// project must contain exactly one matching owner. Equal-best candidates
+/// remain unresolved.
 fn unique_cpp_type_owner(
     mut candidates: Vec<Arc<Node>>,
+    lexical_scope: Option<&str>,
     reference: &RefView,
     context: &dyn ResolutionContext,
 ) -> Option<Arc<Node>> {
@@ -303,11 +306,16 @@ fn unique_cpp_type_owner(
     if candidates.len() == 1 {
         return candidates.pop();
     }
-    let from = context.get_node_by_id_shared(&reference.from_node_id)?;
-    let caller_scope = from
-        .qualified_name
-        .rsplit_once("::")
-        .map_or("", |(scope, _)| scope);
+    let from;
+    let caller_scope = match lexical_scope {
+        Some(scope) => scope,
+        None => {
+            from = context.get_node_by_id_shared(&reference.from_node_id)?;
+            from.qualified_name
+                .rsplit_once("::")
+                .map_or("", |(scope, _)| scope)
+        }
+    };
     let mut scoped = candidates
         .into_iter()
         .filter_map(|candidate| {
@@ -435,6 +443,35 @@ fn js_built_ins() -> &'static BTreeSet<&'static str> {
         .into_iter()
         .collect()
     })
+}
+
+/// Languages that see the JS built-ins (upstream `isBuiltInOrExternal`'s
+/// `isJsTs`): the script languages, ArkTS and, since #2128, Vue, Svelte and
+/// Astro components.
+fn has_js_built_ins(language: Language) -> bool {
+    matches!(
+        language,
+        Language::TypeScript
+            | Language::JavaScript
+            | Language::Tsx
+            | Language::Jsx
+            | Language::ArkTs
+            | Language::Vue
+            | Language::Svelte
+            | Language::Astro
+    )
+}
+
+/// Does the file import its own binding of a JS built-in's name
+/// (`import Map from './Map.svelte'`)? Then the reference is that import,
+/// not the built-in (upstream #2128).
+fn imports_its_own_built_in(reference: &RefView, context: &dyn ResolutionContext) -> bool {
+    has_js_built_ins(reference.language)
+        && js_built_ins().contains(reference.reference_name.as_str())
+        && context
+            .get_import_mappings(&reference.file_path, reference.language)
+            .iter()
+            .any(|mapping| mapping.local_name == reference.reference_name)
 }
 
 /// React hooks from React itself (`REACT_HOOKS`, `index.ts:75-78`).
@@ -1146,15 +1183,66 @@ fn rust_method_is_in_trait_impl(facts: &SourceFacts, start_line: i64) -> bool {
     }
 }
 
+/// A minified or bundled script, by name (`jquery.min.js`, `underscore-min.js`)
+/// or by its text (upstream #2204 `isMinifiedScript`, judged once per file and
+/// pass).
+fn is_minified_script(file_path: &str, context: &dyn ResolutionContext) -> bool {
+    if !codegraph_core::generated_header::is_minifiable_script(file_path) {
+        return false;
+    }
+    let lower = file_path.to_ascii_lowercase();
+    if [".min.js", "-min.js", ".min.mjs", "-min.mjs"]
+        .iter()
+        .any(|suffix| lower.ends_with(suffix))
+    {
+        return true;
+    }
+    context.source_facts(file_path).is_some_and(|facts| {
+        facts.minified_script(|source| {
+            codegraph_core::generated_header::is_minified_content(file_path, source)
+        })
+    })
+}
+
 fn target_is_visible_across_files(
     target: &Node,
     reference: &RefView,
     context: &dyn ResolutionContext,
 ) -> bool {
+    // Go's `context.Context`, `http.Handler`: written through a package from
+    // outside the project, so nothing in it, not even the same file's method
+    // `Stream.Context` (upstream #2233); through one of the project's
+    // packages, only that package's symbol: a `job.OPCommand` result type is
+    // not the method `Context.OPCommand` beside it (upstream #2322).
+    if target.language == Language::Go
+        && reference.language == Language::Go
+        && (crate::go_packages::is_go_external_qualified(reference, context)
+            || !crate::go_packages::is_in_go_qualifier_package(target, reference, context))
+    {
+        return false;
+    }
     if target.file_path == reference.file_path {
         return true;
     }
     if c_family_static_function_is_file_local(target, reference, context) {
+        return false;
+    }
+    // A C# type is in reach of the namespaces that can see it, and a nested
+    // one only from inside its owner or a type deriving from it (upstream
+    // #2216, #2220).
+    if crate::csharp_types::is_csharp_bare_type_candidate(target, reference)
+        && (!crate::csharp_types::is_csharp_type_visible(target, reference, context)
+            || !crate::csharp_types::is_csharp_nested_type_in_scope(target, reference, context))
+    {
+        return false;
+    }
+    // A Scala package object's member is in scope in its package and those
+    // under it, or through an import: cats.laws' `Eq` is the `cats` package
+    // object's alias, not the `algebra` one's (upstream #2230).
+    if target.language == Language::Scala
+        && reference.language == Language::Scala
+        && !crate::scala_scope::is_scala_package_object_member_visible(target, reference, context)
+    {
         return false;
     }
     if matches!(
@@ -1191,6 +1279,48 @@ fn target_is_visible_across_files(
     true
 }
 
+/// The reference kinds that wire files and types together, which every
+/// persist entry resolves and persists before the rest (upstream #1789
+/// `isPrerequisite`): a call resolved after them sees the `extends` and
+/// `implements` edges they make, so a receiver typed as a subclass reaches a
+/// method its base declares.
+const WIRING_KINDS: [EdgeKind; 3] = [EdgeKind::Imports, EdgeKind::Extends, EdgeKind::Implements];
+
+fn is_wiring_reference(reference: &UnresolvedRef) -> bool {
+    WIRING_KINDS.contains(&reference.reference_kind)
+}
+
+/// `references` split into the wiring ones and the rest, each in its order.
+fn wiring_first(references: Vec<UnresolvedRef>) -> [Vec<UnresolvedRef>; 2] {
+    let (wiring, rest): (Vec<_>, Vec<_>) = references.into_iter().partition(is_wiring_reference);
+    [wiring, rest]
+}
+
+/// `into` with `from` folded in, as one pass over both would report.
+fn merge_resolution(into: &mut ResolutionResult, from: ResolutionResult) {
+    into.stats.total += from.stats.total;
+    into.stats.resolved += from.stats.resolved;
+    into.stats.unresolved += from.stats.unresolved;
+    for (method, count) in from.stats.by_method {
+        *into.stats.by_method.entry(method).or_default() += count;
+    }
+    into.resolved.extend(from.resolved);
+    into.unresolved.extend(from.unresolved);
+}
+
+fn empty_resolution() -> ResolutionResult {
+    ResolutionResult {
+        stats: ResolutionStats {
+            total: 0,
+            resolved: 0,
+            unresolved: 0,
+            by_method: std::collections::BTreeMap::new(),
+        },
+        resolved: Vec::new(),
+        unresolved: Vec::new(),
+    }
+}
+
 /// Orchestrates reference resolution using multiple strategies
 /// (`ReferenceResolver`, `index.ts:199-1189`).
 ///
@@ -1215,6 +1345,15 @@ pub struct ReferenceResolver {
     /// entry is a pure function of the files, so evaluation order cannot reach
     /// the output.
     macro_visibility: std::sync::Mutex<crate::c_macro_visibility::MacroVisibility>,
+    /// The C/C++ include graph the test-suite rule reads (upstream #2421),
+    /// filled on demand and cleared with the other resolution caches.
+    cpp_includers: std::sync::Mutex<crate::cpp_includers::CppIncluders>,
+    /// Same-owner overload sets by method id (upstream #2212), filled on
+    /// demand and cleared with the other resolution caches.
+    overload_sets: crate::overloads::OverloadSets,
+    /// Declared type and Scala value parameters by declaration id (upstream
+    /// #2123), filled on demand and cleared with the other resolution caches.
+    type_parameters: std::sync::Mutex<crate::type_parameters::TypeParameterMemos>,
     /// `this.<member>` fn-refs whose member wasn't on the enclosing class
     /// itself — retried in the supertype pass once implements/extends edges
     /// exist (`deferredThisMemberRefs`, index.ts:214 / #808). A `Mutex` (not
@@ -1240,6 +1379,9 @@ impl ReferenceResolver {
             framework_resolver_extensions: Vec::new(),
             known_names: None,
             macro_visibility: std::sync::Mutex::default(),
+            cpp_includers: std::sync::Mutex::default(),
+            overload_sets: std::sync::Mutex::default(),
+            type_parameters: std::sync::Mutex::default(),
             deferred_this_member_refs: std::sync::Mutex::new(Vec::new()),
             deferred_chain_refs: std::sync::Mutex::new(Vec::new()),
         }
@@ -1369,17 +1511,28 @@ impl ReferenceResolver {
     ) -> FrameworkExtractionCollection {
         let mut collection = FrameworkExtractionCollection::default();
         for relative in relative_files {
-            let language = codegraph_extract::detect_language_with(relative, extensions);
-            let has_applicable = self
-                .framework_resolver_extensions
-                .iter()
-                .any(|resolver| applies_to_language(resolver.as_ref(), language));
+            let detected = codegraph_extract::detect_language_with(relative, extensions);
+            // A `.h` header may turn out C++ or Objective-C once read, so it
+            // is read whenever a resolver applies to any language it can be.
+            let candidates: &[Language] = if detected == Language::C {
+                &[Language::C, Language::Cpp, Language::ObjC]
+            } else {
+                std::slice::from_ref(&detected)
+            };
+            let has_applicable = self.framework_resolver_extensions.iter().any(|resolver| {
+                candidates
+                    .iter()
+                    .any(|&language| applies_to_language(resolver.as_ref(), language))
+            });
             if !has_applicable {
                 continue;
             }
             let Some(content) = read_file(relative) else {
                 continue;
             };
+            // The file's language as extraction and its file row see it.
+            let language =
+                codegraph_extract::detect_language_for_source(relative, &content, extensions);
             for resolver in &self.framework_resolver_extensions {
                 if !applies_to_language(resolver.as_ref(), language) {
                     continue;
@@ -1410,6 +1563,18 @@ impl ReferenceResolver {
         self.known_names = Some(names);
         *self
             .macro_visibility
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Default::default();
+        *self
+            .cpp_includers
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Default::default();
+        self.overload_sets
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+        *self
+            .type_parameters
             .get_mut()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Default::default();
     }
@@ -1507,6 +1672,22 @@ impl ReferenceResolver {
     ) -> (Option<ResolvedRef>, Option<DeferredIntent>) {
         let (resolved, deferred) = self.resolve_one_pure_inner(reference, context);
         let resolved = self.gate_target_kind(resolved, reference, context);
+        // A Swift type reference never lands on an `extension X {}` node, nor
+        // on a nested type it cannot name bare (upstream #2107).
+        let resolved =
+            crate::swift_type_visibility::gate_swift_type_target(resolved, reference, context);
+        // A name a declaration around the reference declares as a type
+        // parameter (`def f[A]`, `class Foo<T>`) is that parameter, whichever
+        // strategy chose a namesake (upstream #2123).
+        let resolved = crate::type_parameters::gate_type_parameter(
+            resolved,
+            reference,
+            context,
+            &self.type_parameters,
+        );
+        // A bare Rust name reaches only what is in scope, whichever strategy
+        // chose it (upstream #2214 `gateRustScope`).
+        let resolved = crate::rust_scope::gate_rust_scope(resolved, reference, context);
         let resolved = self.gate_import_locality(resolved, reference, context);
         let resolved = self.gate_c_macro_calls(resolved, reference, context);
         let resolved = self.forward_alias_binding(resolved, reference, context);
@@ -1519,9 +1700,161 @@ impl ReferenceResolver {
             }
             _ => self.gate_language(resolved, reference, context),
         };
+        let resolved = self.gate_super_self_call(resolved, reference, context);
         let resolved = self.gate_language_visibility(resolved, reference, context);
         let resolved = self.gate_js_visibility(resolved, reference, context);
+        // A JSX tag naming a local of its component renders that local
+        // (upstream #2442).
+        let resolved = crate::jsx_tags::gate_jsx_local_tag(resolved, reference, context);
         (resolved, deferred)
+    }
+
+    /// `super.didMoveToWindow()` inside an override of `didMoveToWindow` calls
+    /// the parent's implementation, never the method making the call
+    /// (upstream #2136 `gateSuperSelfCall`). Extraction keeps a `super` call
+    /// under the bare method name, so every strategy found the enclosing
+    /// method itself. Only a call written through `super` / `base` (C#) /
+    /// `[super …]` (Objective-C) / `parent::` (PHP) / `super().` /
+    /// `super(C, self).` (Python) is declined; real recursion keeps its edge.
+    fn gate_super_self_call(
+        &self,
+        result: Option<ResolvedRef>,
+        reference: &RefView,
+        context: &dyn ResolutionContext,
+    ) -> Option<ResolvedRef> {
+        let result = result?;
+        if reference.reference_kind != EdgeKind::Calls
+            || result.target_node_id != reference.from_node_id
+        {
+            return Some(result);
+        }
+        let name = &reference.reference_name;
+        let name = &name[name.rfind(['.', ':']).map_or(0, |cut| cut + 1)..];
+        if !crate::name_matcher::is_simple_js_identifier(name) {
+            return Some(result);
+        }
+        let Some(line) = usize::try_from(reference.line)
+            .ok()
+            .and_then(|line| line.checked_sub(1))
+            .and_then(|index| {
+                context
+                    .source_facts(&reference.file_path)
+                    .and_then(|facts| facts.raw_line(index).map(str::to_string))
+            })
+        else {
+            return Some(result);
+        };
+        let via_super = Regex::new(&format!(
+            r"(?:(?-u:\b)(?:super|base)\s*(?:\(\s*(?:[A-Za-z0-9_.]+\s*,\s*[A-Za-z0-9_]+)?\s*\))?\s*\??\.\s*|\[\s*super\s+|(?-u:\b)parent\s*::\s*){}(?-u:\b)",
+            regex::escape(name)
+        ));
+        match via_super {
+            Ok(via_super) if via_super.is_match(&line) => None,
+            _ => Some(result),
+        }
+    }
+
+    /// A test suite is not linked into the program, so no name match from a
+    /// non-test file reaches a symbol in one (upstream #2209): typeorm's
+    /// `Record<K, V>` is not a test entity `Record`. Test-support code a
+    /// project ships (`testing/`, `fakes/`, a `*-test` module) stays in reach,
+    /// and so does a C or C++ file the reference's translation unit includes,
+    /// whatever its name (#2421). No name match from another file reaches
+    /// into a minified script either (#2204). Upstream checks both in
+    /// `isVisibleAcrossFiles`, which it applies to the name match and fuzzy's
+    /// survivor only, so an import still binds what it names.
+    fn gate_test_suite(
+        &self,
+        result: Option<ResolvedRef>,
+        reference: &RefView,
+        context: &dyn ResolutionContext,
+    ) -> Option<ResolvedRef> {
+        let result = result?;
+        let Some(target) = context.get_node_by_id_shared(&result.target_node_id) else {
+            return Some(result);
+        };
+        if target.file_path == reference.file_path {
+            return Some(result);
+        }
+        // A vendored minified bundle keeps mangled one-letter names, so a name
+        // written in another file never means one of them (upstream #2204,
+        // in `isVisibleAcrossFiles` beside this rule): healthchecks' `$(…)`,
+        // jQuery loaded as a global, went to a helper inside
+        // bootstrap-native.min.js. Calls inside a bundle still resolve.
+        if is_minified_script(&target.file_path, context) {
+            return None;
+        }
+        if codegraph_core::file_class::is_test_suite_path(&target.file_path)
+            && !codegraph_core::file_class::is_test_path(&reference.file_path)
+            && !self.is_included_cpp_test_suite(&target, reference, context)
+        {
+            return None;
+        }
+        // A top-level binding an ES module does not export (upstream #2162):
+        // sveltekit's `generate_manifest.js` keeps an unexported `resolve`
+        // that twenty other files' `resolve(…)` calls went to.
+        if !crate::name_matcher::is_name_match_reachable(&target, reference, context) {
+            return None;
+        }
+        // A Svelte component's instance script, or a Vue SFC's `<script
+        // setup>`, is private to the component (upstream #2227):
+        // shadcn-svelte's `<Item.Root>` (a namespace import) went to a
+        // `type Item` one example component declares for itself.
+        if crate::sfc_scripts::is_sfc_private(&target, context) {
+            return None;
+        }
+        // A bare Java type name is its package's, an import's, or a nested
+        // type in reach (upstream #2236).
+        if !crate::java_scope::is_java_type_visible(&target, reference, context) {
+            return None;
+        }
+        Some(result)
+    }
+
+    /// Whether a C or C++ file named like a test suite is part of `reference`'s
+    /// translation unit (upstream #2421 `isIncludedCppTestSuite`): the
+    /// reference's file includes it, or, for a definition in a source file,
+    /// the same-named test-suite header it includes (`conformance_test.cc` →
+    /// `conformance_test.h`).
+    fn is_included_cpp_test_suite(
+        &self,
+        candidate: &Node,
+        reference: &RefView,
+        context: &dyn ResolutionContext,
+    ) -> bool {
+        let c_family = |language| matches!(language, Language::C | Language::Cpp);
+        if !c_family(candidate.language) || !c_family(reference.language) {
+            return false;
+        }
+        let mut includers = self
+            .cpp_includers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if includers
+            .includers(&candidate.file_path, context)
+            .contains(&reference.file_path)
+        {
+            return true;
+        }
+        let stem = crate::cpp_includers::file_stem(&candidate.file_path);
+        for include in context.get_nodes_in_file_shared(&candidate.file_path) {
+            if include.kind != NodeKind::Import
+                || crate::cpp_includers::file_stem(&include.name) != stem
+            {
+                continue;
+            }
+            if let Some(header) = includers.included_file_of(&include, context)
+                && header != candidate.file_path
+                && crate::cpp_includers::file_stem(&header) == stem
+                && codegraph_core::file_class::is_test_suite_path(&header)
+                && includers
+                    .includers(&header, context)
+                    .contains(&reference.file_path)
+            {
+                return true;
+            }
+        }
+        false
     }
 
     /// C/C++ preprocessor binding gate (upstream #1838). A call spelled like
@@ -1660,6 +1993,55 @@ impl ReferenceResolver {
         context: &dyn ResolutionContext,
     ) -> Option<ResolvedRef> {
         let result = result?;
+        // A Go call made through an expression — `h.Validate().Error()`, a
+        // `.Metrics()` chained onto the line above — calls a method of
+        // whatever the expression is. A type is called only bare (`T(x)`,
+        // `(*T)(x)`) or through its package; as a struct here it read as an
+        // instantiation (upstream #2408).
+        if reference.language == Language::Go
+            && reference.reference_kind == EdgeKind::Calls
+            && !reference.reference_name.contains('.')
+            && context
+                .get_node_by_id_shared(&result.target_node_id)
+                .is_some_and(|target| {
+                    matches!(
+                        target.kind,
+                        NodeKind::Struct | NodeKind::Interface | NodeKind::TypeAlias
+                    )
+                })
+            && !crate::name_matcher::is_go_bare_name(reference, context)
+        {
+            return None;
+        }
+        // A Go type embedded through a package (`yaml.Node`) is that
+        // package's, and so is the type a Go alias names: when the package is
+        // none of the file's imports as indexed, the type found by its bare
+        // name is another package's namesake, or the alias itself (upstream
+        // #2397, #2417).
+        if reference.language == Language::Go
+            && (crate::types::is_inheritance_ref(reference.reference_kind)
+                || (reference.reference_kind == EdgeKind::References
+                    && context
+                        .get_node_by_id_shared(&reference.from_node_id)
+                        .is_some_and(|from| from.kind == NodeKind::TypeAlias)))
+            && crate::go_packages::is_go_unknown_qualified(reference, context)
+        {
+            return None;
+        }
+        // A Go type position — a parameter or result type, a composite
+        // literal's type — names a type of the package Go reads it from; a
+        // method value (`rs.Get`) and a route's handler are references too,
+        // but values (upstream #2416).
+        if reference.language == Language::Go
+            && !reference.is_function_ref
+            && (reference.reference_kind == EdgeKind::Instantiates
+                || (reference.reference_kind == EdgeKind::References
+                    && context
+                        .get_node_by_id_shared(&reference.from_node_id)
+                        .is_none_or(|from| from.kind != NodeKind::Route)))
+        {
+            return crate::go_packages::go_type_position_target(result, reference, context);
+        }
         if !crate::types::is_inheritance_ref(reference.reference_kind)
             && reference.reference_kind != EdgeKind::Imports
         {
@@ -1668,6 +2050,17 @@ impl ReferenceResolver {
         let Some(target) = context.get_node_by_id_shared(&result.target_node_id) else {
             return Some(result);
         };
+        // #2392 — an `imports` reference never names the import statement it
+        // was written in. A module path no file answers (`./missing`,
+        // `stdio.h`, `pkg.mod`) reaches that statement by its qualified name;
+        // as an edge to itself it is never retried, while a failed reference is
+        // retried by the sync that adds the file it names.
+        if reference.reference_kind == EdgeKind::Imports
+            && target.kind == NodeKind::Import
+            && target.file_path == reference.file_path
+        {
+            return None;
+        }
         if crate::types::node_is_eligible_target(reference.reference_kind, &target) {
             return Some(result);
         }
@@ -1698,8 +2091,33 @@ impl ReferenceResolver {
         if parse_cpp_constructor_reference_name(&reference.reference_name).is_some() {
             return (self.resolve_cpp_constructor(reference, context), None);
         }
-        if self.is_built_in_or_external(reference) {
+        // A C or C++ base is the class C++ name lookup finds for it, and no
+        // other strategy sees it (upstream #2407).
+        if crate::cpp_supertypes::is_cpp_supertype_ref(reference) {
+            return (
+                crate::cpp_supertypes::match_cpp_supertype(reference, context),
+                None,
+            );
+        }
+        // A Go call through a type assertion (`srv.(KVServer).Range(ctx,
+        // in)`), which arrives by its bare name, is to a method of the
+        // asserted type, or to nothing the project declares (upstream #2444).
+        if let Some(asserted) = crate::go_packages::match_go_asserted_call(reference, context) {
+            return (asserted, None);
+        }
+        if self.is_built_in_or_external(reference) && !imports_its_own_built_in(reference, context)
+        {
             return (None, None);
+        }
+        // A CFML supertype written as a component path (upstream #1152,
+        // #1154) has a dedicated, path-corroborated matcher and no fallback:
+        // the class is indexed under the last segment only, so the whole path
+        // could only ever mis-match downstream.
+        if crate::cfml_scope::is_cfml_component_path_ref(reference) {
+            return (
+                crate::cfml_scope::resolve_cfml_component_path(reference, context),
+                None,
+            );
         }
 
         // Fast pre-filter (index.ts:664-670). The `FrameworkResolver`
@@ -1707,11 +2125,22 @@ impl ReferenceResolver {
         // empty.
         let existence_name = if reference.language == Language::Erlang {
             strip_erlang_arity(&reference.reference_name)
+        } else if matches!(reference.language, Language::C | Language::Cpp) {
+            // A C or C++ name written from the global scope
+            // (`::_pbi::PrivateAccess::GenerateParseTable`, `::memset`)
+            // exists when the name under the `::` does (upstream #2445).
+            reference
+                .reference_name
+                .strip_prefix("::")
+                .unwrap_or(&reference.reference_name)
         } else {
             &reference.reference_name
         };
         let call_result_chain = is_call_result_chain(reference);
-        if !self.has_any_possible_match_for(existence_name, reference.language)
+        // A JS/TS module path names a file, not a symbol (#2263); a CommonJS
+        // `require('./x')` has no node of that name to pass the check.
+        if !is_js_path_import_ref(reference)
+            && !self.has_any_possible_match_for(existence_name, reference.language)
             && !self.matches_any_import(reference, context)
             && !self
                 .framework_resolver_extensions
@@ -1786,9 +2215,16 @@ impl ReferenceResolver {
 
         let mut candidates: Vec<ResolvedRef> = Vec::new();
 
-        // Strategy 1: `FrameworkResolver` extension point (index.ts:695-701).
-        // Empty in v1 → no candidates contributed.
-        for resolver in &self.framework_resolver_extensions {
+        // Strategy 1: `FrameworkResolver` extension point (index.ts:695-701),
+        // by the resolvers that read this reference's language (upstream
+        // #2415): Express's `logger` rule took a Go result type for the
+        // method itself. Bridges list the language their references are
+        // written in.
+        for resolver in self
+            .framework_resolver_extensions
+            .iter()
+            .filter(|resolver| resolves_language(resolver.as_ref(), reference.language))
+        {
             if let Some(result) = self.gate_framework_resolver_extension_language(
                 resolver.resolve(reference, context),
                 reference,
@@ -1819,6 +2255,47 @@ impl ReferenceResolver {
             return (candidates.into_iter().reduce(highest_confidence), None);
         }
         if is_unresolved_js_member_call(reference) {
+            // A path through module namespaces is not untyped:
+            // `z.coerce.number()` after `import * as z`, where the barrel has
+            // `export * as coerce` (upstream #2192). Only the import resolver
+            // answers it, and only with a callable or a value; any framework
+            // result is preserved beside it.
+            let root = reference
+                .reference_name
+                .split('.')
+                .next()
+                .unwrap_or_default();
+            let namespace = context
+                .get_import_mappings(&reference.file_path, reference.language)
+                .iter()
+                .any(|mapping| mapping.is_namespace && mapping.local_name == root);
+            if !namespace {
+                // `App.utils.fmt()` through a path an object literal was hung
+                // on (upstream #2363).
+                if let Some(member) = self.gate_language(
+                    crate::object_owners::match_object_path_call(reference, context),
+                    reference,
+                    context,
+                ) {
+                    candidates.push(member);
+                }
+            } else if let Some(through) =
+                self.gate_language(resolve_via_import(reference, context), reference, context)
+                && context
+                    .get_node_by_id_shared(&through.target_node_id)
+                    .is_some_and(|target| {
+                        matches!(
+                            target.kind,
+                            NodeKind::Function
+                                | NodeKind::Method
+                                | NodeKind::Class
+                                | NodeKind::Constant
+                                | NodeKind::Variable
+                        )
+                    })
+            {
+                candidates.push(through);
+            }
             return (candidates.into_iter().reduce(highest_confidence), None);
         }
 
@@ -1830,8 +2307,18 @@ impl ReferenceResolver {
         if crate::name_matcher::rust_call_shape(reference, context)
             == Some(crate::name_matcher::RustCallShape::Method)
         {
-            if let Some(result) = self.gate_language(
-                crate::name_matcher::match_rust_lost_receiver_call(reference, context),
+            // A name match like Strategy 3's, so its self vetoes apply
+            // (upstream #2223: `self.0.into_route(state)` inside `into_route`).
+            if let Some(result) = self.gate_test_suite(
+                crate::name_matcher::veto_self_target(
+                    self.gate_language(
+                        crate::name_matcher::match_rust_lost_receiver_call(reference, context),
+                        reference,
+                        context,
+                    ),
+                    reference,
+                    context,
+                ),
                 reference,
                 context,
             ) {
@@ -1841,8 +2328,19 @@ impl ReferenceResolver {
         }
 
         // Strategy 2: import-based resolution (index.ts:704-708).
-        if let Some(import_result) =
-            self.gate_language(resolve_via_import(reference, context), reference, context)
+        // `self.get_ip()` is a method call on the instance even when the file
+        // also imports a function named `get_ip`: the import never names it
+        // (upstream #2290).
+        let python_self_call = reference.language == Language::Python
+            && reference.reference_kind == EdgeKind::Calls
+            && context
+                .get_import_mappings(&reference.file_path, reference.language)
+                .iter()
+                .any(|mapping| mapping.local_name == reference.reference_name)
+            && crate::python_values::is_python_self_call(reference, context);
+        if !python_self_call
+            && let Some(import_result) =
+                self.gate_language(resolve_via_import(reference, context), reference, context)
         {
             if import_result.confidence >= 0.9 {
                 return (Some(import_result), None);
@@ -1851,7 +2349,9 @@ impl ReferenceResolver {
         }
 
         // PHP include path: never fall through to name-matcher (index.ts:714-720).
-        if is_php_include_path_ref(reference) {
+        // A Lua / Luau `require` reaches a module file or nothing: its leaf
+        // name-matched the local it is assigned to (#2392).
+        if is_php_include_path_ref(reference) || is_lua_require_ref(reference) {
             return (candidates.into_iter().reduce(highest_confidence), None);
         }
 
@@ -1862,10 +2362,28 @@ impl ReferenceResolver {
             return (candidates.into_iter().reduce(highest_confidence), None);
         }
 
-        // Strategy 3: name matching (index.ts:723-726).
-        if let Some(name_result) =
-            self.gate_language(match_reference(reference, context), reference, context)
-        {
+        // Strategy 3: name matching (index.ts:723-726), with the name
+        // matcher's self vetoes (upstream #2221, #2223, #2229) and the JS/TS
+        // function-local shadow (#2226).
+        // A call reaches the overload its arguments fit (upstream #2212,
+        // #2213, #2238, #2241), before the test-suite rule judges the target.
+        let name_result = crate::name_matcher::veto_c_method_target(
+            crate::name_matcher::veto_js_local_shadow(
+                crate::name_matcher::veto_self_target(
+                    self.gate_language(match_reference(reference, context), reference, context),
+                    reference,
+                    context,
+                ),
+                reference,
+                context,
+            ),
+            reference,
+            context,
+        )
+        .map(|result| {
+            crate::overloads::retarget_overload(result, reference, context, &self.overload_sets)
+        });
+        if let Some(name_result) = self.gate_test_suite(name_result, reference, context) {
             candidates.push(name_result);
         }
 
@@ -1906,6 +2424,35 @@ impl ReferenceResolver {
         }
         let (spelled_type, call_arity) =
             parse_cpp_constructor_reference_name(&reference.reference_name)?;
+        // A type named through an alias (`Table::Iterator iter(&table_);` under
+        // `typedef SkipList<…> Table;`) constructs the type the alias names,
+        // looked up from where the alias wrote it, never an outer class the
+        // alias hides (upstream #2399).
+        let mut lexical_scope = None;
+        let aliased_spelling;
+        let spelled_type = if spelled_type.starts_with("::") {
+            spelled_type
+        } else {
+            match crate::cpp_type_aliases::resolve_cpp_aliased_type(
+                spelled_type,
+                reference,
+                context,
+            ) {
+                crate::cpp_type_aliases::CppAliased::NotAnAlias => spelled_type,
+                crate::cpp_type_aliases::CppAliased::Unreadable => return None,
+                crate::cpp_type_aliases::CppAliased::Followed(aliased) => {
+                    aliased_spelling = aliased
+                        .target
+                        .iter()
+                        .chain(&aliased.rest)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join("::");
+                    lexical_scope = Some(aliased.scope);
+                    aliased_spelling.as_str()
+                }
+            }
+        };
         let base_name = spelled_type
             .rsplit("::")
             .find(|segment| !segment.is_empty())?;
@@ -1922,7 +2469,7 @@ impl ReferenceResolver {
                     && cpp_type_spelling_matches(spelled_type, &candidate.qualified_name)
             })
             .collect::<Vec<_>>();
-        let owner = unique_cpp_type_owner(owners, reference, context)?;
+        let owner = unique_cpp_type_owner(owners, lexical_scope.as_deref(), reference, context)?;
         let constructor_name = format!("{}::{base_name}", owner.qualified_name);
         let constructors = context
             .get_nodes_by_name_shared(base_name)
@@ -2021,9 +2568,12 @@ impl ReferenceResolver {
         if member.is_empty() {
             return (None, None);
         }
-        let Some(from_node) = context.get_node_by_id_shared(&reference.from_node_id) else {
+        let Some(written) = context.get_node_by_id_shared(&reference.from_node_id) else {
             return (None, None);
         };
+        // Inside an object literal: its own method's `this` is the object, an
+        // arrow member's is the method around the literal (upstream #2363).
+        let from_node = crate::object_owners::this_scope_caller(written, context);
         let class_prefix = if matches!(
             from_node.kind,
             NodeKind::Class
@@ -2084,6 +2634,7 @@ impl ReferenceResolver {
         }
 
         let mut resolved: Vec<ResolvedRef> = Vec::new();
+        let context = self.store_context(store);
         for reference in &deferred {
             let Some(member) = reference.reference_name.strip_prefix("this.") else {
                 continue;
@@ -2091,9 +2642,12 @@ impl ReferenceResolver {
             if member.is_empty() {
                 continue;
             }
-            let Some(from_node) = store.node_by_id(&reference.from_node_id).ok().flatten() else {
+            let Some(written) = context.get_node_by_id_shared(&reference.from_node_id) else {
                 continue;
             };
+            // An arrow member of an object literal has the `this` of the
+            // method around the literal (upstream #2363).
+            let from_node = crate::object_owners::this_scope_caller(written, &context);
             // Class-body-level hooks (Ruby) attribute to the CLASS node itself;
             // members strip the member segment (index.ts:1271-1282).
             let class_name = if is_supertype_bearing_or_module(from_node.kind) {
@@ -2121,6 +2675,7 @@ impl ReferenceResolver {
                 });
             }
         }
+        drop(context);
 
         if resolved.is_empty() {
             return Ok(0);
@@ -2244,18 +2799,25 @@ impl ReferenceResolver {
     /// resolved rows so metrics stay accurate.
     pub fn resolve_and_persist(&mut self, store: &mut Store) -> anyhow::Result<ResolutionResult> {
         let unresolved_refs = store.all_unresolved_refs()?;
-        let result = {
-            let context = self.store_context(store);
-            self.resolve_all(&unresolved_refs, &context)
-        };
-
-        let edges = self.create_edges(&result.resolved, store);
-        if !edges.is_empty() {
-            store.insert_edges(&edges)?;
-        }
-
-        if !result.resolved.is_empty() {
-            delete_resolved_rows(store, &result.resolved)?;
+        // The wiring references first, persisted, then the rest against
+        // their edges (upstream #1789).
+        let mut result = empty_resolution();
+        for phase in wiring_first(unresolved_refs.clone()) {
+            if phase.is_empty() {
+                continue;
+            }
+            let phase_result = {
+                let context = self.store_context(store);
+                self.resolve_all(&phase, &context)
+            };
+            let edges = self.create_edges(&phase_result.resolved, store);
+            if !edges.is_empty() {
+                store.insert_edges(&edges)?;
+            }
+            if !phase_result.resolved.is_empty() {
+                delete_resolved_rows(store, &phase_result.resolved)?;
+            }
+            merge_resolution(&mut result, phase_result);
         }
         delete_internal_constructor_rows(store, &unresolved_refs)?;
 
@@ -2425,10 +2987,23 @@ impl ReferenceResolver {
             unresolved: Vec::new(),
         };
 
+        // The wiring references first, every batch of them persisted, then
+        // the rest from the start of the table (upstream #1789).
         let mut cursor: i64 = 0;
+        let mut wiring_phase = true;
         loop {
-            let batch = store.unresolved_refs_batch(cursor, batch_size)?;
+            let batch = store.unresolved_refs_batch_by_kinds(
+                cursor,
+                batch_size,
+                &WIRING_KINDS,
+                wiring_phase,
+            )?;
             if batch.is_empty() {
+                if wiring_phase {
+                    wiring_phase = false;
+                    cursor = 0;
+                    continue;
+                }
                 break;
             }
             cursor = batch
@@ -2624,20 +3199,30 @@ impl ReferenceResolver {
         let by_files = store.unresolved_refs_by_files(&files)?;
         let by_sites = store.unresolved_refs_by_sites(&sites)?;
         let by_names = store.unresolved_refs_by_names(&names)?;
-        let scoped = union_persisted_refs([by_files, by_sites, by_names])?;
+        // A qualified reference (`User.create`) waits for its tail's name:
+        // the whole-name lookup above never matches it (upstream #1240).
+        let by_tails = store.unresolved_refs_by_name_tails(&names, NAME_TAIL_RETRY_CEILING)?;
+        let scoped = union_persisted_refs([by_files, by_sites, by_names, by_tails])?;
 
-        let result = {
-            let context = self.store_context(store);
-            self.resolve_all(&scoped, &context)
-        };
-
-        let edges = self.create_edges(&result.resolved, store);
-        if !edges.is_empty() {
-            store.insert_edges(&edges)?;
-        }
-
-        if !result.resolved.is_empty() {
-            delete_resolved_rows(store, &result.resolved)?;
+        // The wiring references first, persisted, then the rest against
+        // their edges, as a full index orders them (upstream #1789).
+        let mut result = empty_resolution();
+        for phase in wiring_first(scoped.clone()) {
+            if phase.is_empty() {
+                continue;
+            }
+            let phase_result = {
+                let context = self.store_context(store);
+                self.resolve_all(&phase, &context)
+            };
+            let edges = self.create_edges(&phase_result.resolved, store);
+            if !edges.is_empty() {
+                store.insert_edges(&edges)?;
+            }
+            if !phase_result.resolved.is_empty() {
+                delete_resolved_rows(store, &phase_result.resolved)?;
+            }
+            merge_resolution(&mut result, phase_result);
         }
         delete_internal_constructor_rows(store, &scoped)?;
 
@@ -2653,10 +3238,7 @@ impl ReferenceResolver {
     /// (`isBuiltInOrExternal`, `index.ts:982-1081`).
     fn is_built_in_or_external(&self, reference: &RefView) -> bool {
         let name = &reference.reference_name;
-        let is_js_ts = matches!(
-            reference.language,
-            Language::TypeScript | Language::JavaScript | Language::Tsx | Language::Jsx
-        );
+        let is_js_ts = has_js_built_ins(reference.language);
 
         if is_js_ts && js_built_ins().contains(name.as_str()) {
             return true;
@@ -2727,11 +3309,14 @@ impl ReferenceResolver {
         }
 
         if matches!(reference.language, Language::C | Language::Cpp) {
-            if name.starts_with("std::") {
+            // A leading `::` names the global scope: `::std::move` is
+            // `std::move`, `::memset` is `memset` (upstream #2445).
+            let scoped = name.strip_prefix("::").unwrap_or(name);
+            if scoped.starts_with("std::") {
                 return true;
             }
-            if c_built_ins().contains(name.as_str()) || cpp_built_ins().contains(name.as_str()) {
-                return !self.has_any_possible_match(name);
+            if c_built_ins().contains(scoped) || cpp_built_ins().contains(scoped) {
+                return !self.has_any_possible_match(scoped);
             }
         }
 
@@ -2947,6 +3532,15 @@ fn build_edge_metadata(reference: &ResolvedRef) -> serde_json::Value {
     serde_json::Value::Object(map)
 }
 
+/// Does a `FrameworkResolver`'s `resolve()` read a reference written in
+/// `language`? (`getResolvingFrameworks`, upstream #2415): its
+/// `resolve_languages`, which default to its `languages`; none = universal.
+fn resolves_language(resolver: &dyn FrameworkResolver, language: Language) -> bool {
+    resolver
+        .resolve_languages()
+        .is_none_or(|langs| langs.contains(&language))
+}
+
 /// Does a `FrameworkResolver` apply to `language`? (`getApplicableFrameworks`,
 /// `frameworks/index.ts:104-111`): no `languages` list = universal.
 fn applies_to_language(resolver: &dyn FrameworkResolver, language: Language) -> bool {
@@ -3078,6 +3672,11 @@ fn delete_internal_constructor_rows(
     }
     Ok(())
 }
+
+/// How many qualified references one tail may wake in a sync (upstream's
+/// per-name retry ceiling): a tail more share is a name too common for one
+/// new definition to settle.
+const NAME_TAIL_RETRY_CEILING: usize = 500;
 
 fn union_persisted_refs(
     lanes: impl IntoIterator<Item = Vec<UnresolvedRef>>,
@@ -3367,6 +3966,61 @@ mod tests {
             EdgeKind::Calls,
             Language::TypeScript
         )));
+        // Vue, Svelte and Astro components and ArkTS see the same built-ins
+        // (upstream #2128).
+        assert!(r.is_built_in_or_external(&mk_ref("fetch", EdgeKind::Calls, Language::Svelte)));
+        assert!(r.is_built_in_or_external(&mk_ref("console.log", EdgeKind::Calls, Language::Vue)));
+        assert!(r.is_built_in_or_external(&mk_ref("Map", EdgeKind::Calls, Language::Astro)));
+        assert!(r.is_built_in_or_external(&mk_ref("JSON.parse", EdgeKind::Calls, Language::ArkTs)));
+        assert!(!r.is_built_in_or_external(&mk_ref("t", EdgeKind::Calls, Language::Vue)));
+    }
+
+    #[test]
+    fn a_package_is_outside_only_when_a_manifest_declares_it() {
+        use crate::package_manifests::is_declared_outside_package;
+        let files = [
+            (
+                "package.json",
+                r#"{"name":"root","dependencies":{"lodash":"^4"}}"#,
+            ),
+            (
+                "frontend/package.json",
+                r#"{"name":"frontend","dependencies":{"dayjs":"*","@app/shared":"workspace:*"},"devDependencies":{"@sveltejs/kit":"*"}}"#,
+            ),
+            (
+                "deno/deno.jsonc",
+                "{\n  // JSR packages\n  \"imports\": {\"@oak/oak\": \"jsr:@oak/oak@^17\", \"app/\": \"../src/\",},\n}\n",
+            ),
+            ("kit/package.json", r#"{"name":"@sveltejs/kit"}"#),
+        ];
+        let ctx = MinimalCtx {
+            files: files
+                .iter()
+                .map(|(path, text)| ((*path).to_string(), (*text).to_string()))
+                .collect(),
+        };
+        let outside = |source: &str, from: &str| is_declared_outside_package(source, from, &ctx);
+        // Declared by the file's package.json or an enclosing one.
+        assert!(outside("dayjs/plugin/utc", "frontend/pages/a.vue"));
+        assert!(outside("lodash", "frontend/pages/a.vue"));
+        assert!(outside("lodash", "src/a.ts"));
+        assert!(!outside("dayjs", "src/a.ts"));
+        // A `workspace:` dependency and the package itself are the project's.
+        assert!(!outside("@app/shared", "frontend/pages/a.vue"));
+        assert!(!outside("frontend/utils", "frontend/pages/a.vue"));
+        // An alias nothing declares stays the project's.
+        assert!(!outside("$lib/design", "frontend/pages/a.vue"));
+        assert!(!outside("~/composables/store", "frontend/pages/a.vue"));
+        // Node built-ins, runtime schemes, `@std/…`, Deno import maps.
+        assert!(outside("fs/promises", "src/a.ts"));
+        assert!(outside("node:sqlite", "src/a.ts"));
+        assert!(outside("@std/assert", "src/a.ts"));
+        assert!(outside("@oak/oak", "deno/main.ts"));
+        assert!(!outside("app/handlers", "deno/main.ts"));
+        // A framework's virtual module, unless the repository is that framework.
+        assert!(outside("$app/navigation", "frontend/routes/+page.svelte"));
+        assert!(outside("astro:content", "src/pages/a.astro"));
+        assert!(!outside("$app/navigation", "kit/src/runtime/a.js"));
     }
 
     #[test]

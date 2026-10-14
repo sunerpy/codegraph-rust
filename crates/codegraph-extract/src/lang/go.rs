@@ -37,7 +37,8 @@ impl LanguageSpec for GoSpec {
         &[]
     }
     fn type_alias_types(&self) -> &'static [&'static str] {
-        &["type_spec"]
+        // `type A B` and `type A = B` (upstream #2417).
+        &["type_spec", "type_alias"]
     }
     fn import_types(&self) -> &'static [&'static str] {
         &["import_declaration"]
@@ -109,6 +110,32 @@ impl LanguageSpec for GoSpec {
             .trim()
             .to_string();
         is_identifier(&text).then_some(text)
+    }
+
+    /// A type declared on its own, `type Foo struct{…}`, is a
+    /// `type_declaration` holding one spec, and its doc comment comes before
+    /// the declaration, outside the spec (upstream #2438). A member of a
+    /// `type ( … )` group has its comment beside it in the parentheses, and
+    /// the comment above the group is the group's. A group of one is that
+    /// type's declaration, as go doc reads it, unless its member has a
+    /// comment of its own.
+    fn declaration_wrapper<'tree>(&self, node: Node<'tree>) -> Option<Node<'tree>> {
+        let parent = node.parent()?;
+        if parent.kind() != "type_declaration" || parent.named_child(0) != Some(node) {
+            return None;
+        }
+        let specs = parent
+            .named_children(&mut parent.walk())
+            .filter(|child| matches!(child.kind(), "type_spec" | "type_alias"))
+            .count();
+        (specs == 1).then_some(parent)
+    }
+
+    /// A comment after code on its line (`const sides = 4 // sides of a
+    /// square.`) is that line's, never the doc of the declaration below it
+    /// (upstream #2438).
+    fn docstring_skips_trailing_comments(&self) -> bool {
+        true
     }
 
     fn resolve_type_alias_kind(&self, node: Node<'_>, _source: &str) -> Option<NodeKind> {

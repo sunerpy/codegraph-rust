@@ -1,0 +1,1 @@
+{ "name": "expo-hello", "private": true, "dependencies": { "expo-modules-core": "1.11.0" } }

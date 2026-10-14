@@ -1,6 +1,16 @@
 [
   {
     "candidates": null,
+    "col": 0,
+    "file_path": "consumer.rs",
+    "from_node_id": "file:consumer.rs",
+    "language": "rust",
+    "line": 1,
+    "reference_kind": "imports",
+    "reference_name": "crate"
+  },
+  {
+    "candidates": null,
     "col": 12,
     "file_path": "consumer.rs",
     "from_node_id": "file:consumer.rs",
@@ -21,6 +31,16 @@
   },
   {
     "candidates": null,
+    "col": 23,
+    "file_path": "impl_ownership.rs",
+    "from_node_id": "method:6ddb55846e243b76871de524e0099384",
+    "language": "rust",
+    "line": 64,
+    "reference_kind": "references",
+    "reference_name": "Self"
+  },
+  {
+    "candidates": null,
     "col": 25,
     "file_path": "consumer.rs",
     "from_node_id": "file:consumer.rs",
@@ -28,6 +48,36 @@
     "line": 1,
     "reference_kind": "imports",
     "reference_name": "crate::UnitStruct"
+  },
+  {
+    "candidates": null,
+    "col": 26,
+    "file_path": "impl_ownership.rs",
+    "from_node_id": "method:f294207696d1ddfe946d6b27cdd55c4e",
+    "language": "rust",
+    "line": 32,
+    "reference_kind": "references",
+    "reference_name": "Option"
+  },
+  {
+    "candidates": null,
+    "col": 30,
+    "file_path": "self_field.rs",
+    "from_node_id": "method:0326afb997c4dbc35f03f7054a7fec4a",
+    "language": "rust",
+    "line": 66,
+    "reference_kind": "references",
+    "reference_name": "Option"
+  },
+  {
+    "candidates": null,
+    "col": 30,
+    "file_path": "self_field.rs",
+    "from_node_id": "method:1664cb1c390283048a9ac640a8797063",
+    "language": "rust",
+    "line": 58,
+    "reference_kind": "references",
+    "reference_name": "Option"
   },
   {
     "candidates": null,

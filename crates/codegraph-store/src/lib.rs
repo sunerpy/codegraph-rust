@@ -28,7 +28,8 @@ pub use index_state_publisher::{
     ParentSyncStatus, PublishedState, StatePublishError, publish_index_state,
 };
 pub use queries::{
-    CODEGRAPH_NO_WAL_DEFER, CODEGRAPH_WAL_VALVE_MB, DEFAULT_WAL_VALVE_MB, wal_valve_threshold_bytes,
+    CODEGRAPH_NO_WAL_DEFER, CODEGRAPH_WAL_VALVE_MB, DEFAULT_WAL_VALVE_MB, import_path_keys,
+    reference_name_tail, wal_valve_threshold_bytes,
 };
 pub use rebuild::{
     ActiveFullRebuild, FullRebuild, RebuildError, RebuildKind, begin_full_rebuild,

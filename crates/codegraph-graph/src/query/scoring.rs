@@ -539,7 +539,8 @@ fn matches_separator_test(lower_name: &str) -> bool {
     }
     let stem = &lower_name[..dot];
     let stem_chars: Vec<char> = stem.chars().collect();
-    for marker in ["test", "tests", "spec", "specs"] {
+    // `unittest(s)`: Google's C++ `foo_unittest.cc` (upstream #2434).
+    for marker in ["test", "tests", "unittest", "unittests", "spec", "specs"] {
         if let Some(pos) = stem.rfind(marker)
             && pos + marker.len() == stem.len()
             && pos > 0
@@ -944,6 +945,10 @@ mod tests {
         assert!(is_test_file("FooTest.java"));
         assert!(is_test_file("FooSpec.scala"));
         assert!(is_test_file("MyTestCase.cs"));
+        // Google's C++ unittests (upstream #2434); a bare `unittest.go` is code.
+        assert!(is_test_path("src/stack_unittest.cc"));
+        assert!(is_test_path("src/stack_unittests.cc"));
+        assert!(!is_test_path("cmd/promtool/unittest.go"));
     }
 
     #[test]

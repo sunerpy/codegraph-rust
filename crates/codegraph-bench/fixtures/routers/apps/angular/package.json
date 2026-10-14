@@ -1,0 +1,1 @@
+{ "name": "angular-app", "private": true, "dependencies": { "@angular/core": "17.2.0", "@angular/router": "17.2.0" } }

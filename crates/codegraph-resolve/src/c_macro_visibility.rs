@@ -17,6 +17,13 @@
 //! its own name is how that function gets called and hides nothing.
 //! Object-like definitions take part in conditions but never enter the
 //! per-root timelines.
+//!
+//! A guard the walk cannot decide (`#define X_H 1`, or any header reached
+//! under an unknown `#if`) re-enters its header on every inclusion path, which
+//! is exponential in the include graph's depth (upstream #2292, #2127). A
+//! re-entry that provably repeats an earlier visit which changed nothing is
+//! skipped, and a hard budget bounds whatever is left: past it, nothing is
+//! known and nothing is suppressed.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, LazyLock};
@@ -86,12 +93,36 @@ enum FileEvent {
         op: BranchOp,
         expression: String,
         guard: bool,
+        line: usize,
     },
-    Once,
+    Once {
+        line: usize,
+    },
 }
 
-/// Per root file: macro name → `(root line, defined)` events in root order.
-type Timeline = BTreeMap<String, Vec<(usize, Truth)>>;
+impl FileEvent {
+    fn line(&self) -> usize {
+        match self {
+            Self::Define { line, .. }
+            | Self::Undef { line, .. }
+            | Self::Include { line, .. }
+            | Self::Branch { line, .. }
+            | Self::Once { line } => *line,
+        }
+    }
+}
+
+/// Per root file: macro name → `(root line, defined)` events in root order;
+/// from `cutoff` on (the root line where the walk's budget ran out), nothing
+/// is known.
+#[derive(Debug, Default)]
+struct Timeline {
+    events: BTreeMap<String, Vec<(usize, Truth)>>,
+    cutoff: Option<usize>,
+}
+
+/// Directive events one translation-unit walk may evaluate (upstream #2292).
+const WALK_EVENT_BUDGET: usize = 1_000_000;
 
 /// Roots kept at once; a pure cache, so eviction only costs a recomputation.
 const ROOT_TIMELINE_CAP: usize = 32;
@@ -163,7 +194,11 @@ pub(crate) fn is_visible_macro(
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .timeline_for(&reference.file_path, reference.language, context);
     let line = usize::try_from(reference.line).unwrap_or(0);
+    if timeline.cutoff.is_some_and(|cutoff| line >= cutoff) {
+        return false;
+    }
     timeline
+        .events
         .get(&reference.reference_name)
         .and_then(|events| events.iter().rev().find(|(at, _)| *at <= line))
         .is_some_and(|(_, defined)| *defined == Some(true))
@@ -217,6 +252,7 @@ impl MacroVisibility {
                     op,
                     expression,
                     guard,
+                    line: index + 1,
                 });
                 continue;
             }
@@ -246,7 +282,7 @@ impl MacroVisibility {
                 });
             }
             if PRAGMA_ONCE.is_match(text) {
-                events.push(FileEvent::Once);
+                events.push(FileEvent::Once { line: index + 1 });
             }
         }
         let events = Arc::new(events);
@@ -322,18 +358,25 @@ impl MacroVisibility {
         while let Some(frame) = walk.stack.last_mut() {
             let Some(event) = frame.events.get(frame.next).cloned() else {
                 let done = walk.stack.pop().expect("a frame to pop");
-                walk.scanning.remove(&done.file);
+                walk.leave(done);
                 continue;
             };
             frame.next += 1;
             let (file, active, include_line) =
                 (frame.file.clone(), frame.active, frame.include_line);
             let at = |line: usize| include_line.unwrap_or(line);
+            // Past the budget the timeline is unknown from this line on.
+            if walk.budget == 0 {
+                walk.timeline.cutoff = Some(at(event.line()));
+                break;
+            }
+            walk.budget -= 1;
             match event {
                 FileEvent::Branch {
                     op,
                     expression,
                     guard,
+                    ..
                 } => {
                     let known = walk
                         .definitions
@@ -374,9 +417,13 @@ impl MacroVisibility {
                     }
                 }
                 _ if active == Some(false) => {}
-                FileEvent::Once => {
+                FileEvent::Once { .. } => {
                     let prior = walk.once.get(&file).copied().unwrap_or(Some(false));
-                    walk.once.insert(file, or(prior, active));
+                    let next = or(prior, active);
+                    if next != prior {
+                        walk.version += 1;
+                    }
+                    walk.once.insert(file, next);
                 }
                 FileEvent::Include { quote, spec, line } => {
                     if let Some(target) =
@@ -431,9 +478,21 @@ struct Frame {
     branches: Vec<(Truth, Truth)>,
     /// The root file's line of the outermost `#include`, for nested events.
     include_line: Option<usize>,
+    /// [`Walk::version`] when the visit began.
+    start: u64,
+    /// Where the visit's own include cycles begin in [`Walk::cuts`].
+    first_cut: usize,
 }
 
-#[derive(Default)]
+/// What one finished visit of a file saw.
+struct Visit {
+    inherited: Truth,
+    start: u64,
+    end: u64,
+    /// The files on the recursion stack it did not re-enter.
+    cuts: Vec<String>,
+}
+
 struct Walk {
     stack: Vec<Frame>,
     definitions: HashMap<String, Definition>,
@@ -441,6 +500,30 @@ struct Walk {
     macro_names: HashSet<String>,
     once: HashMap<String, Truth>,
     timeline: Timeline,
+    /// Bumped by every change a later directive could observe: a
+    /// definition, `#pragma once`, the macro-name set.
+    version: u64,
+    /// The include cycles the recursion stack cut, in visit order.
+    cuts: Vec<String>,
+    visits: HashMap<String, Visit>,
+    budget: usize,
+}
+
+impl Default for Walk {
+    fn default() -> Self {
+        Self {
+            stack: Vec::new(),
+            definitions: HashMap::new(),
+            scanning: HashSet::new(),
+            macro_names: HashSet::new(),
+            once: HashMap::new(),
+            timeline: Timeline::default(),
+            version: 0,
+            cuts: Vec::new(),
+            visits: HashMap::new(),
+            budget: WALK_EVENT_BUDGET,
+        }
+    }
 }
 
 impl Walk {
@@ -452,10 +535,26 @@ impl Walk {
         cache: &mut MacroVisibility,
         context: &dyn ResolutionContext,
     ) -> Option<Frame> {
-        if inherited == Some(false)
-            || self.scanning.contains(file)
-            || self.once.get(file).copied() == Some(Some(true))
+        if inherited == Some(false) || self.once.get(file).copied() == Some(Some(true)) {
+            return None;
+        }
+        if self.scanning.contains(file) {
+            self.cuts.push(file.to_string());
+            return None;
+        }
+        // A visit that changed nothing, entered again with the same inherited
+        // truth while nothing has changed since, would start from the same
+        // state, take the same branches and change nothing again; the events
+        // it would record repeat each name's current state, already its last
+        // event. The include cycles it cut must still be cut.
+        if let Some(seen) = self.visits.get(file)
+            && seen.inherited == inherited
+            && seen.start == seen.end
+            && seen.end == self.version
+            && seen.cuts.iter().all(|cut| self.scanning.contains(cut))
         {
+            let cuts = seen.cuts.clone();
+            self.cuts.extend(cuts);
             return None;
         }
         self.scanning.insert(file.to_string());
@@ -467,7 +566,30 @@ impl Walk {
             active: inherited,
             branches: Vec::new(),
             include_line,
+            start: self.version,
+            first_cut: self.cuts.len(),
         })
+    }
+
+    /// A visit is done: remember what it saw.
+    fn leave(&mut self, frame: Frame) {
+        self.scanning.remove(&frame.file);
+        let mut own: Vec<String> = Vec::new();
+        for cut in self.cuts.drain(frame.first_cut..) {
+            if !own.contains(&cut) {
+                own.push(cut);
+            }
+        }
+        self.cuts.extend(own.iter().cloned());
+        self.visits.insert(
+            frame.file,
+            Visit {
+                inherited: frame.inherited,
+                start: frame.start,
+                end: self.version,
+                cuts: own,
+            },
+        );
     }
 
     /// What an `#if` expression says, as far as the source decides it: the
@@ -511,19 +633,29 @@ impl Walk {
         } else {
             None
         };
-        self.definitions.insert(
-            name.to_string(),
-            Definition {
-                defined,
-                value,
-                macro_,
+        let next = Definition {
+            defined,
+            value,
+            macro_,
+        };
+        let unchanged = prior.map_or(
+            next.defined.is_none() && next.value.is_none() && next.macro_.is_none(),
+            |prior| {
+                prior.defined == next.defined
+                    && prior.value == next.value
+                    && prior.macro_ == next.macro_
             },
         );
-        if function_like {
-            self.macro_names.insert(name.to_string());
+        if !unchanged {
+            self.version += 1;
+        }
+        self.definitions.insert(name.to_string(), next);
+        if function_like && self.macro_names.insert(name.to_string()) {
+            self.version += 1;
         }
         if self.macro_names.contains(name) {
             self.timeline
+                .events
                 .entry(name.to_string())
                 .or_default()
                 .push((line, macro_));
@@ -1220,6 +1352,229 @@ fn skip_literal(bytes: &[u8], start: usize, quote: u8) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// In-memory files where every name is both a function-like macro and a
+    /// function, so a call's visibility is read from its translation unit
+    /// (upstream #2292's `contextOver`).
+    struct FilesContext {
+        files: HashMap<String, String>,
+    }
+
+    impl ResolutionContext for FilesContext {
+        fn get_nodes_in_file(&self, _file_path: &str) -> Vec<Node> {
+            Vec::new()
+        }
+        fn get_nodes_by_name(&self, name: &str) -> Vec<Node> {
+            let node = |kind: NodeKind, signature: Option<String>| Node {
+                id: format!("{}:{name}", kind.as_str()),
+                kind,
+                name: name.to_string(),
+                qualified_name: name.to_string(),
+                file_path: "elsewhere.c".to_string(),
+                language: Language::Cpp,
+                start_line: 1,
+                end_line: 1,
+                start_column: 0,
+                end_column: 0,
+                docstring: None,
+                signature,
+                visibility: None,
+                is_exported: false,
+                is_async: false,
+                is_static: false,
+                is_abstract: false,
+                decorators: Vec::new(),
+                type_parameters: Vec::new(),
+                return_type: None,
+                updated_at: 0,
+            };
+            vec![
+                node(NodeKind::Constant, Some(format!("#define {name}(v) (v)"))),
+                node(NodeKind::Function, None),
+            ]
+        }
+        fn get_nodes_by_qualified_name(&self, _qualified_name: &str) -> Vec<Node> {
+            Vec::new()
+        }
+        fn get_nodes_by_kind(&self, _kind: NodeKind) -> Vec<Node> {
+            Vec::new()
+        }
+        fn file_exists(&self, file_path: &str) -> bool {
+            self.files.contains_key(file_path)
+        }
+        fn read_file(&self, file_path: &str) -> Option<String> {
+            self.files.get(file_path).cloned()
+        }
+        fn get_project_root(&self) -> &str {
+            "/proj"
+        }
+        fn get_all_files(&self) -> Vec<String> {
+            let mut files: Vec<String> = self.files.keys().cloned().collect();
+            files.sort();
+            files
+        }
+        fn get_nodes_by_lower_name(&self, _lower_name: &str) -> Vec<Node> {
+            Vec::new()
+        }
+        fn get_node_by_id(&self, _id: &str) -> Option<Node> {
+            None
+        }
+        fn get_import_mappings(
+            &self,
+            _file_path: &str,
+            _language: Language,
+        ) -> Vec<crate::types::ImportMapping> {
+            Vec::new()
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum Guard {
+        Value,
+        Bare,
+        UnknownFlag,
+    }
+
+    /// `depth` layers of two headers; each includes both headers of the next
+    /// layer (upstream #2292's `layeredHeaders`).
+    fn layered_headers(depth: usize, guard: Guard) -> Vec<(String, String)> {
+        let mut files = Vec::new();
+        for d in 0..depth {
+            for side in ["a", "b"] {
+                let name = format!("H_{d}_{side}");
+                let open = match guard {
+                    Guard::Value => format!("#ifndef {name}\n#define {name} 1\n"),
+                    Guard::Bare => format!("#ifndef {name}\n#define {name}\n"),
+                    Guard::UnknownFlag => format!("#ifdef USE_{d}\n"),
+                };
+                let next = if d + 1 < depth {
+                    format!("#include \"h{}_a.h\"\n#include \"h{}_b.h\"\n", d + 1, d + 1)
+                } else {
+                    String::new()
+                };
+                files.push((
+                    format!("h{d}_{side}.h"),
+                    format!(
+                        "{open}{next}#define M_{d}_{side}(x) (x)\nint f_{d}_{side}(int);\n#endif\n"
+                    ),
+                ));
+            }
+        }
+        files
+    }
+
+    fn visible(files: &[(String, String)], name: &str, line: i64) -> bool {
+        let context = FilesContext {
+            files: files.iter().cloned().collect(),
+        };
+        let cache = std::sync::Mutex::new(MacroVisibility::default());
+        let reference = RefView {
+            row_id: None,
+            from_node_id: "function:unit".to_string(),
+            reference_name: name.to_string(),
+            reference_kind: EdgeKind::Calls,
+            line,
+            column: 0,
+            file_path: "unit.cpp".to_string(),
+            language: Language::Cpp,
+            is_function_ref: false,
+            reference_subkind: None,
+        };
+        is_visible_macro(&cache, &reference, &context)
+    }
+
+    fn deep_unit(depth: usize, guard: Guard) -> Vec<(String, String)> {
+        let mut files = layered_headers(depth, guard);
+        files.push((
+            "trace.h".to_string(),
+            "#define TRACE(v) ((void)(v))\n".to_string(),
+        ));
+        files.push((
+            "unit.cpp".to_string(),
+            "#include \"h0_a.h\"\n#include \"h0_b.h\"\n#include \"trace.h\"\nvoid unit() { TRACE(1); }\n".to_string(),
+        ));
+        files
+    }
+
+    /// Upstream #2292 (#2127): a layered include graph whose guards the walk
+    /// cannot decide used to cost 2^depth header scans; 21 layers, the depth
+    /// the audit measured at 4 s, now walk in well under a second.
+    #[test]
+    fn a_21_layer_include_graph_is_walked_in_under_a_second() {
+        for guard in [Guard::Value, Guard::Bare, Guard::UnknownFlag] {
+            let files = deep_unit(21, guard);
+            let started = std::time::Instant::now();
+            assert!(visible(&files, "TRACE", 4), "{guard:?}");
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(1),
+                "{guard:?}: {:?}",
+                started.elapsed()
+            );
+        }
+    }
+
+    /// Upstream #2292's own case: 40 layers (2^40 inclusion paths), with the
+    /// answers unchanged: a header macro under an undecidable guard is not
+    /// definitely visible, and a call above the include defining `TRACE` is
+    /// still a call.
+    #[test]
+    fn a_40_layer_include_graph_keeps_its_answers() {
+        for guard in [Guard::Value, Guard::Bare, Guard::UnknownFlag] {
+            let files = deep_unit(40, guard);
+            let started = std::time::Instant::now();
+            assert!(visible(&files, "TRACE", 4), "{guard:?}");
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(1),
+                "{guard:?}: {:?}",
+                started.elapsed()
+            );
+            assert_eq!(
+                visible(&files, "M_39_a", 4),
+                matches!(guard, Guard::Bare),
+                "{guard:?}"
+            );
+            assert!(!visible(&files, "TRACE", 2), "{guard:?}");
+        }
+    }
+
+    /// Upstream #2292: a walk that cannot be shortened (a known flag toggled
+    /// on every inclusion, no guards) stops at its budget, and suppresses
+    /// nothing past the line where it stopped.
+    #[test]
+    fn a_walk_past_its_budget_suppresses_nothing_after_the_cut() {
+        let mut files: Vec<(String, String)> = vec![
+            (
+                "toggle.h".to_string(),
+                "#ifdef T\n#undef T\n#else\n#define T\n#endif\n".to_string(),
+            ),
+            (
+                "unit.cpp".to_string(),
+                "#define T\n#define TRACE(v) ((void)(v))\nvoid before() { TRACE(1); }\n#include \"h0.h\"\nvoid after() { TRACE(2); }\n".to_string(),
+            ),
+        ];
+        for d in 0..22 {
+            files.push((
+                format!("h{d}.h"),
+                if d + 1 < 22 {
+                    format!(
+                        "#include \"toggle.h\"\n#include \"h{}.h\"\n#include \"h{}.h\"\n",
+                        d + 1,
+                        d + 1
+                    )
+                } else {
+                    "#include \"toggle.h\"\n".to_string()
+                },
+            ));
+        }
+        let started = std::time::Instant::now();
+        assert!(visible(&files, "TRACE", 3));
+        assert!(!visible(&files, "TRACE", 5));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(30),
+            "{:?}",
+            started.elapsed()
+        );
+    }
 
     #[test]
     fn directive_lines_drop_comments_but_keep_directive_text() {

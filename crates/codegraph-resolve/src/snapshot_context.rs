@@ -29,6 +29,7 @@
 
 use crate::context::{DEFAULT_CACHE_LIMIT, order_candidates};
 use crate::import_resolver;
+use crate::package_manifests::{ManifestScope, read_manifest_scope};
 use crate::path_aliases::{AliasMap, load_project_aliases};
 use crate::pathutil;
 use crate::source_facts::SourceFacts;
@@ -178,6 +179,23 @@ struct SnapshotCaches {
     /// same candidates are probed from every importing file, and the tree does
     /// not change within a pass (upstream `fileExistsMemo`).
     fs_exists: BoundedFileMemo<bool>,
+    /// Each directory's package.json / Deno import-map scope (upstream
+    /// #2128 `manifestScopes`).
+    manifest_scopes: BoundedFileMemo<Arc<ManifestScope>>,
+    /// The Python write index for the run (upstream #2332).
+    python_write_index: OnceLock<Arc<crate::python_globals::PythonWriteIndex>>,
+    /// The C/C++ namespace tables for the run (upstream #2176).
+    cpp_namespace_tables: OnceLock<Arc<crate::cpp_namespaces::CppNamespaceTables>>,
+    /// The Kotlin tables for the run (upstream #2172).
+    kotlin_tables: OnceLock<Arc<crate::kotlin_scope::KotlinTables>>,
+    scala_tables: OnceLock<Arc<crate::scala_scope::ScalaTables>>,
+    csharp_tables: OnceLock<Arc<crate::csharp_types::CsharpTables>>,
+    member_tables: OnceLock<Arc<crate::member_types::MemberTables>>,
+    ruby_tables: OnceLock<Arc<crate::ruby_scope::RubyTables>>,
+    cfml_tables: OnceLock<Arc<crate::cfml_scope::CfmlTables>>,
+    swift_tables: OnceLock<Arc<crate::swift_type_visibility::SwiftTables>>,
+    objc_tables: OnceLock<Arc<crate::objc_scope::ObjcTables>>,
+    go_tables: OnceLock<Arc<crate::go_packages::GoTables>>,
     #[cfg(test)]
     counters: SnapshotCacheCounters,
 }
@@ -193,6 +211,18 @@ impl SnapshotCaches {
             import_mappings: BoundedFileMemo::new(DEFAULT_CACHE_LIMIT),
             re_exports: BoundedFileMemo::new(DEFAULT_CACHE_LIMIT),
             fs_exists: BoundedFileMemo::new(crate::context::FILE_EXISTS_MEMO_LIMIT),
+            manifest_scopes: BoundedFileMemo::new(DEFAULT_CACHE_LIMIT),
+            python_write_index: OnceLock::new(),
+            cpp_namespace_tables: OnceLock::new(),
+            kotlin_tables: OnceLock::new(),
+            scala_tables: OnceLock::new(),
+            csharp_tables: OnceLock::new(),
+            member_tables: OnceLock::new(),
+            ruby_tables: OnceLock::new(),
+            cfml_tables: OnceLock::new(),
+            swift_tables: OnceLock::new(),
+            objc_tables: OnceLock::new(),
+            go_tables: OnceLock::new(),
             #[cfg(test)]
             counters: SnapshotCacheCounters::default(),
         }
@@ -222,6 +252,7 @@ struct NodeSnapshot {
     workspace_packages: Option<WorkspacePackages>,
     go_module: Option<GoModule>,
     go_modules: Vec<GoModule>,
+    rust_crates: Arc<crate::rust_scope::RustCrates>,
 }
 
 /// A `Sync`, immutable [`ResolutionContext`] over a precomputed [`NodeSnapshot`]
@@ -353,6 +384,10 @@ impl SnapshotResolutionContext {
         let workspace_packages = load_workspace_packages(&project_root);
         let go_module = crate::context::load_go_module_pub(&project_root);
         let go_modules = crate::context::load_go_modules_pub(&project_root, &all_file_paths);
+        let rust_crates = Arc::new(crate::rust_scope::load_rust_crates(
+            &project_root,
+            &all_file_paths,
+        ));
 
         Ok(Self {
             snapshot: Arc::new(NodeSnapshot {
@@ -372,6 +407,7 @@ impl SnapshotResolutionContext {
                 workspace_packages,
                 go_module,
                 go_modules,
+                rust_crates,
             }),
             caches: Arc::new(SnapshotCaches::new()),
             max_file_size: codegraph_core::config::DEFAULT_MAX_FILE_SIZE,
@@ -510,6 +546,12 @@ impl ResolutionContext for SnapshotResolutionContext {
         })
     }
 
+    fn is_indexed_file(&self, file_path: &str) -> bool {
+        self.snapshot
+            .known_file_paths
+            .contains(&file_path.replace('\\', "/"))
+    }
+
     fn read_file(&self, file_path: &str) -> Option<String> {
         self.read_file_cached(file_path)
             .as_deref()
@@ -611,6 +653,17 @@ impl ResolutionContext for SnapshotResolutionContext {
         }
         let mut supertypes: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         for tn in &type_nodes {
+            // A Swift conformance to a type the project only extends
+            // (SwiftUI's `View`) resolves to nothing, an extension being no
+            // type, yet the members its extensions add are still the
+            // conformer's (upstream #2107).
+            if language == Language::Swift {
+                for name in crate::swift_type_visibility::extended_conformances(tn, self).iter() {
+                    if name != type_name {
+                        supertypes.insert(name.clone());
+                    }
+                }
+            }
             let Some(adjacency) = self.edges.get(&tn.id) else {
                 continue;
             };
@@ -655,12 +708,112 @@ impl ResolutionContext for SnapshotResolutionContext {
         self.snapshot.workspace_packages.clone()
     }
 
+    fn python_write_index(&self) -> Arc<crate::python_globals::PythonWriteIndex> {
+        Arc::clone(
+            self.caches
+                .python_write_index
+                .get_or_init(|| Arc::new(crate::python_globals::PythonWriteIndex::build(self))),
+        )
+    }
+
+    fn cpp_namespace_tables(&self) -> Arc<crate::cpp_namespaces::CppNamespaceTables> {
+        Arc::clone(
+            self.caches
+                .cpp_namespace_tables
+                .get_or_init(|| Arc::new(crate::cpp_namespaces::CppNamespaceTables::new())),
+        )
+    }
+
+    fn kotlin_tables(&self) -> Arc<crate::kotlin_scope::KotlinTables> {
+        Arc::clone(
+            self.caches
+                .kotlin_tables
+                .get_or_init(|| Arc::new(crate::kotlin_scope::KotlinTables::new())),
+        )
+    }
+
+    fn scala_tables(&self) -> Arc<crate::scala_scope::ScalaTables> {
+        Arc::clone(
+            self.caches
+                .scala_tables
+                .get_or_init(|| Arc::new(crate::scala_scope::ScalaTables::new())),
+        )
+    }
+
+    fn csharp_tables(&self) -> Arc<crate::csharp_types::CsharpTables> {
+        Arc::clone(
+            self.caches
+                .csharp_tables
+                .get_or_init(|| Arc::new(crate::csharp_types::CsharpTables::new())),
+        )
+    }
+
+    fn member_tables(&self) -> Arc<crate::member_types::MemberTables> {
+        Arc::clone(
+            self.caches
+                .member_tables
+                .get_or_init(|| Arc::new(crate::member_types::MemberTables::new())),
+        )
+    }
+
+    fn ruby_tables(&self) -> Arc<crate::ruby_scope::RubyTables> {
+        Arc::clone(
+            self.caches
+                .ruby_tables
+                .get_or_init(|| Arc::new(crate::ruby_scope::RubyTables::new())),
+        )
+    }
+
+    fn cfml_tables(&self) -> Arc<crate::cfml_scope::CfmlTables> {
+        Arc::clone(
+            self.caches
+                .cfml_tables
+                .get_or_init(|| Arc::new(crate::cfml_scope::CfmlTables::new())),
+        )
+    }
+
+    fn swift_tables(&self) -> Arc<crate::swift_type_visibility::SwiftTables> {
+        Arc::clone(
+            self.caches
+                .swift_tables
+                .get_or_init(|| Arc::new(crate::swift_type_visibility::SwiftTables::new())),
+        )
+    }
+
+    fn objc_tables(&self) -> Arc<crate::objc_scope::ObjcTables> {
+        Arc::clone(
+            self.caches
+                .objc_tables
+                .get_or_init(|| Arc::new(crate::objc_scope::ObjcTables::new())),
+        )
+    }
+
+    fn go_tables(&self) -> Arc<crate::go_packages::GoTables> {
+        Arc::clone(
+            self.caches
+                .go_tables
+                .get_or_init(|| Arc::new(crate::go_packages::GoTables::new())),
+        )
+    }
+
+    fn manifest_scope(&self, dir: &str) -> Arc<ManifestScope> {
+        // A directory's parent is another key, so the memo never re-enters
+        // the entry it is filling.
+        self.caches
+            .manifest_scopes
+            .get_or_init(dir, || Arc::new(read_manifest_scope(dir, self)))
+    }
+
     fn get_go_module(&self) -> Option<GoModule> {
         self.snapshot.go_module.clone()
     }
 
     fn get_go_modules(&self) -> Vec<GoModule> {
         self.snapshot.go_modules.clone()
+    }
+
+    fn get_rust_crates(&self) -> Arc<crate::rust_scope::RustCrates> {
+        Arc::clone(&self.snapshot.rust_crates)
     }
 
     fn get_re_exports(&self, file_path: &str, language: Language) -> Vec<ReExport> {
@@ -834,6 +987,9 @@ mod tests {
         assert!(ctx.file_exists("a.ts"));
         assert!(ctx.file_exists("ondisk.ts"));
         assert!(!ctx.file_exists("nowhere.ts"));
+        // Only the index's own files are indexed; the disk fallback is not.
+        assert!(ctx.is_indexed_file("a.ts"));
+        assert!(!ctx.is_indexed_file("ondisk.ts"));
         assert!(
             !ctx.file_exists(&format!(
                 "../{}/secret.ts",

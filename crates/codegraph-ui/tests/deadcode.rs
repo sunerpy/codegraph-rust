@@ -439,3 +439,124 @@ fn still_lists_what_nothing_reaches_outside_such_a_class() {
         assert!(listed.contains(&name.to_string()), "{name} in {listed:?}");
     }
 }
+
+/* ------------- a declaration that merges into a type outside the index #2418 -- */
+
+/// What chart.js and the runtime read through the types these declarations
+/// merge into: nothing in the repository names them.
+const MERGED: [&str; 4] = [
+    "PluginOptionsByType",
+    "TooltipPositionerMap",
+    "Window",
+    "ProcessEnv",
+];
+
+fn ambient_merges() -> Project {
+    Project::indexed(&[
+        (
+            "src/chart.registry.ts",
+            "import { Chart, Tooltip, type ChartType } from 'chart.js';
+
+interface VerticalHoverLinePluginOptions {
+  color?: string;
+}
+
+declare module 'chart.js' {
+  interface PluginOptionsByType<TType extends ChartType> {
+    verticalHoverLine: TType extends 'line' ? VerticalHoverLinePluginOptions : never;
+  }
+  interface TooltipPositionerMap {
+    top: (items: unknown[]) => { x: number; y: number };
+  }
+}
+
+export function registerChartConfiguration(): void {
+  Chart.register(Tooltip);
+}
+
+function unusedChartHelper(): void {}
+",
+        ),
+        (
+            "src/app.config.ts",
+            "declare global {
+  interface Window {
+    __conduit_debug__?: { token(): string | null };
+  }
+  namespace NodeJS {
+    interface ProcessEnv {
+      API_URL?: string;
+    }
+  }
+}
+
+// In a module file this namespace is the file's own: it merges with nothing.
+declare namespace Settings {
+  interface NotMergedAnywhere {
+    retries: number;
+  }
+}
+
+export const appConfig = { providers: [] };
+",
+        ),
+        (
+            "src/main.ts",
+            "import { registerChartConfiguration } from './chart.registry';
+import { appConfig } from './app.config';
+
+registerChartConfiguration();
+export const config = appConfig;
+",
+        ),
+    ])
+}
+
+#[test]
+fn does_not_list_what_a_declare_module_or_declare_global_block_declares() {
+    let project = ambient_merges();
+    for corroborated in [true, false] {
+        let report = report(&project, |q| {
+            if !corroborated {
+                q.read_source = None;
+            }
+        });
+        let listed = names(&report);
+        for name in MERGED {
+            assert!(!listed.contains(&name.to_string()), "{name} in {listed:?}");
+        }
+        // TypeScript exports them without the keyword, so the exported rule
+        // takes them, and counts them.
+        assert_eq!(
+            report.excluded.exported,
+            MERGED.len(),
+            "{:?}",
+            report.excluded
+        );
+    }
+}
+
+#[test]
+fn lists_merged_declarations_as_exported_when_exported_symbols_are_asked_for() {
+    let project = ambient_merges();
+    let report = report(&project, |q| q.include_exported = true);
+    for name in MERGED {
+        assert!(
+            report
+                .entries
+                .iter()
+                .find(|entry| entry.node.name == name)
+                .is_some_and(|entry| entry.exported),
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn still_lists_what_nothing_reaches_beside_merged_declarations() {
+    let project = ambient_merges();
+    let listed = names(&report(&project, |_| {}));
+    for name in ["unusedChartHelper", "NotMergedAnywhere"] {
+        assert!(listed.contains(&name.to_string()), "{name} in {listed:?}");
+    }
+}

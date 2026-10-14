@@ -16,41 +16,8 @@ use codegraph_core::types::{EdgeKind, Language, Node, NodeKind};
 use regex::Regex;
 
 use crate::import_resolver::resolve_via_import;
-use crate::name_matcher::{
-    infer_local_receiver_type, prefer_call_site_file, resolve_method_on_type, same_language_family,
-};
+use crate::name_matcher::{resolve_method_on_type, same_language_family};
 use crate::types::{RefView, ResolutionContext, ResolvedBy, ResolvedRef};
-
-/// Primitive and built-in Go field types: a field of one never names a
-/// project type.
-const GO_BUILTIN_FIELD_TYPES: [&str; 26] = [
-    "string",
-    "bool",
-    "byte",
-    "rune",
-    "error",
-    "any",
-    "int",
-    "int8",
-    "int16",
-    "int32",
-    "int64",
-    "uint",
-    "uint8",
-    "uint16",
-    "uint32",
-    "uint64",
-    "uintptr",
-    "float32",
-    "float64",
-    "complex64",
-    "complex128",
-    "chan",
-    "map",
-    "func",
-    "struct",
-    "interface",
-];
 
 /// Resolve a Python or Go member value `receiver.member` (#1820).
 pub(crate) fn match_member_function_ref(
@@ -62,15 +29,26 @@ pub(crate) fn match_member_function_ref(
     let root = receiver.split('.').next().unwrap_or(receiver);
     // An import is authoritative even when it points outside the project.
     if imports.iter().any(|import| import.local_name == root) {
-        if reference.language == Language::Python
-            && let Some(class) = python_ref_class(receiver, reference, context)
-        {
-            return unique_callable(
-                python_members(&class, member, reference, context, &mut HashSet::new()),
-                reference,
-                context,
-                0.9,
-            );
+        if reference.language == Language::Python {
+            if let Some(class) = python_ref_class(receiver, reference, context) {
+                return unique_callable(
+                    python_members(&class, member, reference, context, &mut HashSet::new()),
+                    reference,
+                    context,
+                    0.9,
+                );
+            }
+            // `mod.global` / an imported `global` itself (upstream #2291).
+            if let Some(global) =
+                crate::python_globals::imported_global(receiver, reference, context)
+            {
+                return unique_callable(
+                    crate::python_globals::global_members(&global, member, reference, context),
+                    reference,
+                    context,
+                    0.9,
+                );
+            }
         }
         let imported = resolve_via_import(reference, context)?;
         let node = context.get_node_by_id_shared(&imported.target_node_id)?;
@@ -82,11 +60,30 @@ pub(crate) fn match_member_function_ref(
         return unique_callable(same_name, reference, context, 0.9);
     }
     if reference.language == Language::Go {
-        if receiver.contains('.') {
-            return match_go_field_chain_value(receiver, member, reference, context);
+        if let Some((base, field)) = receiver.split_once('.') {
+            if base.is_empty() || field.is_empty() || field.contains('.') {
+                return None;
+            }
+            return crate::go_packages::go_field_chain_call(
+                base,
+                field,
+                member,
+                reference,
+                context,
+                0.85,
+                ResolvedBy::FunctionRef,
+            );
         }
-        if let Some(type_name) = infer_local_receiver_type(receiver, reference, context) {
-            return go_method_value(&type_name, member, reference, context);
+        if let Some((type_name, written)) =
+            crate::name_matcher::infer_local_receiver_declaration(receiver, reference, context)
+        {
+            // The package declaring the receiver's type (upstream #2323).
+            let pkg_dir = crate::go_packages::go_declared_type_package(
+                Some(&written),
+                &reference.file_path,
+                context,
+            );
+            return go_method_value(&type_name, member, pkg_dir.as_deref(), reference, context);
         }
         let types = context
             .get_nodes_by_name_shared(receiver)
@@ -99,7 +96,7 @@ pub(crate) fn match_member_function_ref(
         if types > 0 {
             // A method expression `Store.Fetch` names its type directly.
             return (types == 1)
-                .then(|| go_method_value(receiver, member, reference, context))
+                .then(|| go_method_value(receiver, member, None, reference, context))
                 .flatten();
         }
     } else {
@@ -128,7 +125,20 @@ pub(crate) fn match_member_function_ref(
         {
             python_field_type(field, owner.as_deref()?, reference, context)
         } else {
-            python_local_type(receiver, reference, context)
+            let local = python_local_type(receiver, reference, context);
+            // An untyped module global of this file (upstream #2291).
+            if local.is_none()
+                && let Some(global) =
+                    crate::python_globals::own_file_global(receiver, reference, context)
+            {
+                return unique_callable(
+                    crate::python_globals::global_members(&global, member, reference, context),
+                    reference,
+                    context,
+                    0.9,
+                );
+            }
+            local
         };
         // A type name used directly (`Store.fetch`) is scoped like an annotation.
         if type_name.is_none()
@@ -211,6 +221,7 @@ fn unique_callable(
 fn go_method_value(
     type_name: &str,
     member: &str,
+    pkg_dir: Option<&str>,
     reference: &RefView,
     context: &dyn ResolutionContext,
 ) -> Option<ResolvedRef> {
@@ -221,132 +232,48 @@ fn go_method_value(
         context,
         0.9,
         ResolvedBy::FunctionRef,
-        None,
+        pkg_dir,
         0,
     )
 }
 
-/// `base.field.Method` — the field's declared type read off the base type's
-/// own struct declaration (upstream `matchGoFieldChainCall`, #1276/#1316). A
-/// package-qualified field type is followed only when the package is in the
-/// module; built-in types name no project type.
-fn match_go_field_chain_value(
-    receiver_chain: &str,
-    method: &str,
-    reference: &RefView,
-    context: &dyn ResolutionContext,
-) -> Option<ResolvedRef> {
-    let (base, field) = receiver_chain.split_once('.')?;
-    if base.is_empty() || field.is_empty() || field.contains('.') {
-        return None;
-    }
-    let base_type = infer_local_receiver_type(base, reference, context)?;
-    let field_type = Regex::new(&format!(
-        r"(?-u:\b){}\s+\*?\[?\]?([A-Za-z_][\w.]*)",
-        regex::escape(field)
-    ))
-    .ok()?;
-    let structs = prefer_call_site_file(
-        context.get_nodes_by_name_shared(&base_type),
-        &reference.file_path,
-    )
-    .into_iter()
-    .filter(|node| {
-        matches!(node.kind, NodeKind::Struct | NodeKind::Class) && node.language == Language::Go
-    })
-    .collect::<Vec<_>>();
-    for declaration in structs {
-        let Some(facts) = context.source_facts(&declaration.file_path) else {
-            continue;
-        };
-        let start = declaration.start_line.saturating_sub(1).max(0) as usize;
-        let end = (declaration.end_line.max(0) as usize).min(facts.line_count());
-        for index in start..end {
-            let line = strip_go_line_comments(facts.line(index));
-            let Some(raw_type) = field_type
-                .captures(&line)
-                .and_then(|captures| captures.get(1))
-                .map(|capture| capture.as_str().to_string())
-            else {
-                continue;
-            };
-            if let Some((package, _)) = raw_type.split_once('.') {
-                let in_module = context.get_go_modules().iter().any(|module| {
-                    context
-                        .get_import_mappings(&declaration.file_path, Language::Go)
-                        .iter()
-                        .any(|import| {
-                            import.local_name == package
-                                && (import.source == module.module_path
-                                    || import
-                                        .source
-                                        .starts_with(&format!("{}/", module.module_path)))
-                        })
-                });
-                if !in_module {
-                    continue;
-                }
-            }
-            let Some(type_name) = raw_type.rsplit('.').next() else {
-                continue;
-            };
-            if !type_name
-                .chars()
-                .next()
-                .is_some_and(|ch| ch.is_ascii_alphabetic() || ch == '_')
-                || GO_BUILTIN_FIELD_TYPES.contains(&type_name)
-            {
-                continue;
-            }
-            if let Some(resolved) = resolve_method_on_type(
-                type_name,
-                method,
-                reference,
-                context,
-                0.85,
-                ResolvedBy::FunctionRef,
-                None,
-                0,
-            ) {
-                return Some(resolved);
-            }
-        }
-    }
-    None
-}
-
-/// A Go declaration line without its `//` and single-line `/* */` comments.
-fn strip_go_line_comments(line: &str) -> String {
-    let line = line.split("//").next().unwrap_or(line);
-    let mut out = String::with_capacity(line.len());
-    let mut rest = line;
-    while let Some(open) = rest.find("/*") {
-        out.push_str(&rest[..open]);
-        match rest[open + 2..].find("*/") {
-            Some(close) => rest = &rest[open + 2 + close + 2..],
-            None => {
-                rest = "";
-                break;
-            }
-        }
-    }
-    out.push_str(rest);
-    out
-}
-
 /// The project class a Python name refers to: an import binding when the
 /// name's root is imported, else the one same-file class of that name.
-fn python_ref_class(
+pub(crate) fn python_ref_class(
     name: &str,
     reference: &RefView,
     context: &dyn ResolutionContext,
 ) -> Option<Node> {
+    let imports = context.get_import_mappings(&reference.file_path, Language::Python);
+    // `import pkg.mod` then `pkg.mod.Cls`: the mapping keys the module by its
+    // last segment (upstream #2291). Two modules with the same last segment
+    // (`import a.foo`, `import b.foo`) share the key: refuse.
+    let mut name = name.to_string();
+    if let Some(module) = imports.iter().find(|import| {
+        import.is_namespace
+            && name
+                .strip_prefix(import.source.as_str())
+                .and_then(|rest| rest.strip_prefix('.'))
+                .is_some_and(|member| {
+                    !member.is_empty()
+                        && member
+                            .bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+                })
+    }) {
+        if imports
+            .iter()
+            .filter(|import| import.local_name == module.local_name)
+            .count()
+            != 1
+        {
+            return None;
+        }
+        name = format!("{}.{}", module.local_name, &name[module.source.len() + 1..]);
+    }
+    let name = name.as_str();
     let root = name.split('.').next().unwrap_or(name);
-    if context
-        .get_import_mappings(&reference.file_path, Language::Python)
-        .iter()
-        .any(|import| import.local_name == root)
-    {
+    if imports.iter().any(|import| import.local_name == root) {
         let mut lookup = reference.clone();
         lookup.reference_name = name.to_string();
         lookup.reference_kind = EdgeKind::References;
@@ -374,7 +301,11 @@ fn python_ref_class(
 }
 
 /// The classes named in a Python class's base list, resolved from its file.
-fn python_bases(class: &Node, reference: &RefView, context: &dyn ResolutionContext) -> Vec<Node> {
+pub(crate) fn python_bases(
+    class: &Node,
+    reference: &RefView,
+    context: &dyn ResolutionContext,
+) -> Vec<Node> {
     let Some(facts) = context.source_facts(&class.file_path) else {
         return Vec::new();
     };
@@ -404,7 +335,7 @@ fn python_bases(class: &Node, reference: &RefView, context: &dyn ResolutionConte
         .collect()
 }
 
-fn python_derives_from(
+pub(crate) fn python_derives_from(
     class: &Node,
     base: &Node,
     reference: &RefView,
@@ -424,7 +355,7 @@ fn python_derives_from(
 /// What `class.member` names: an instance or class assignment shadows any
 /// method (the class itself is returned, which is not callable), else the
 /// class's own method, else what its bases provide.
-fn python_members(
+pub(crate) fn python_members(
     class: &Node,
     member: &str,
     reference: &RefView,

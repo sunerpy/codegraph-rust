@@ -90,6 +90,10 @@ impl LanguageSpec for KotlinSpec {
         "type"
     }
 
+    fn pre_parse(&self, source: &str, _file_path: &str) -> String {
+        rewrite_newer_kotlin_syntax(source)
+    }
+
     fn resolve_body<'tree>(&self, node: Node<'tree>, _body_field: &str) -> Option<Node<'tree>> {
         // Upstream kotlin.ts:174-196 resolves Kotlin bodies by child type rather
         // than field name because the upstream grammar historically had no fields.
@@ -322,6 +326,138 @@ fn has_descendant_kind(node: Node<'_>, kind: &str) -> bool {
     false
 }
 
+/// Kotlin syntax newer than tree-sitter-kotlin-ng 1.1.0, rewritten to an
+/// older equivalent of the same length so every offset survives (upstream
+/// #2182 `rewriteNewerKotlinSyntax`); either one otherwise made the file
+/// contribute nothing:
+///
+/// - a `when` guard (Kotlin 2.1), `is H2Dialect if dialect.mode == X ->`,
+///   becomes a second condition, `is H2Dialect,   dialect.mode == X ->`, so
+///   the guard's references are kept;
+/// - a multi-dollar string (2.1), `$$"?(@.a == $x)"`, loses its prefix.
+///
+/// The grammar parses an open-ended range (`1..<n`) and a nullable
+/// function-type receiver (`Op<Boolean>?.() -> …`) itself, so upstream's
+/// other two rewrites have nothing to do here.
+pub(crate) fn rewrite_newer_kotlin_syntax(source: &str) -> String {
+    let mut out = source.as_bytes().to_vec();
+    // Upstream's guard: a file with no ` if` is left alone, even when a
+    // guard is written after a tab.
+    if source.contains(" if") {
+        rewrite_when_guards(&mut out);
+    }
+    if source.contains("$$") {
+        blank_multi_dollar_prefixes(&mut out);
+    }
+    // Only ASCII bytes were replaced, by ASCII bytes.
+    String::from_utf8(out).unwrap_or_else(|_| source.to_string())
+}
+
+/// Upstream's `WHEN_GUARD`,
+/// `^([ \t]*!?(?:is|in)[ \t]+(?:(?!->)[^\n])*?[\w>?)\]'"])([ \t]+)if(?=[ \t(])`
+/// (global, multiline), replaced by the condition, a comma and the gap and
+/// `if` as spaces. The condition stops short of `->`: `is X -> if (…)` is a
+/// branch whose body is an `if`.
+fn rewrite_when_guards(bytes: &mut [u8]) {
+    let mut resume = 0;
+    for start in js_line_starts(bytes) {
+        if start < resume {
+            continue;
+        }
+        if let Some((comma, end)) = when_guard_at(bytes, start) {
+            bytes[comma] = b',';
+            bytes[comma + 1..end].fill(b' ');
+            resume = end;
+        }
+    }
+}
+
+/// The positions JavaScript's multiline `^` matches at: the start and after
+/// every line terminator (`\n`, `\r`, U+2028, U+2029).
+fn js_line_starts(bytes: &[u8]) -> Vec<usize> {
+    let mut starts = vec![0];
+    for (at, &byte) in bytes.iter().enumerate() {
+        if byte == b'\n' || byte == b'\r' {
+            starts.push(at + 1);
+        } else if byte == 0xE2
+            && bytes.get(at + 1) == Some(&0x80)
+            && matches!(bytes.get(at + 2), Some(0xA8 | 0xA9))
+        {
+            starts.push(at + 3);
+        }
+    }
+    starts
+}
+
+/// A `when` guard starting at line start `start`: the position of the gap
+/// after the condition and the end of `if`.
+fn when_guard_at(bytes: &[u8], start: usize) -> Option<(usize, usize)> {
+    let blank = |at: usize| matches!(bytes.get(at), Some(b' ' | b'\t'));
+    let mut at = start;
+    while blank(at) {
+        at += 1;
+    }
+    if bytes.get(at) == Some(&b'!') {
+        at += 1;
+    }
+    if !matches!(bytes.get(at..at + 2), Some(b"is" | b"in")) {
+        return None;
+    }
+    at += 2;
+    if !blank(at) {
+        return None;
+    }
+    while blank(at) {
+        at += 1;
+    }
+    loop {
+        let byte = *bytes.get(at)?;
+        if byte.is_ascii_alphanumeric()
+            || matches!(byte, b'_' | b'>' | b'?' | b')' | b']' | b'\'' | b'"')
+        {
+            let mut gap_end = at + 1;
+            while blank(gap_end) {
+                gap_end += 1;
+            }
+            if gap_end > at + 1
+                && bytes.get(gap_end..gap_end + 2) == Some(b"if")
+                && matches!(bytes.get(gap_end + 2), Some(b' ' | b'\t' | b'('))
+            {
+                return Some((at + 1, gap_end + 2));
+            }
+        }
+        // The condition goes on through any character but a line feed and
+        // the start of `->`.
+        if byte == b'\n' || (byte == b'-' && bytes.get(at + 1) == Some(&b'>')) {
+            return None;
+        }
+        at += 1;
+    }
+}
+
+/// Upstream's `MULTI_DOLLAR_STRING`, `(?<![\w$"])\$\$+(?=")` (global),
+/// blanked.
+fn blank_multi_dollar_prefixes(bytes: &mut [u8]) {
+    let mut at = 0;
+    while at < bytes.len() {
+        if bytes[at] != b'$' {
+            at += 1;
+            continue;
+        }
+        let mut end = at;
+        while bytes.get(end) == Some(&b'$') {
+            end += 1;
+        }
+        let after_word = at > 0
+            && (bytes[at - 1].is_ascii_alphanumeric()
+                || matches!(bytes[at - 1], b'_' | b'$' | b'"'));
+        if !after_word && end - at >= 2 && bytes.get(end) == Some(&b'"') {
+            bytes[at..end].fill(b' ');
+        }
+        at = end;
+    }
+}
+
 fn is_ident(text: &str) -> bool {
     let mut chars = text.chars();
     chars
@@ -516,5 +652,82 @@ fun String.decorate(prefix: String): String = prefix + this
         let import = first_of_kind(tree.root_node(), "import").unwrap();
         let info = KOTLIN_SPEC.extract_import(import, src).unwrap();
         assert!(info.module_name.contains("Helper") || !info.module_name.is_empty());
+    }
+
+    /// Upstream #2182's fixture: a `when` guard and a multi-dollar string
+    /// are rewritten with every offset intact, and the result parses; the
+    /// grammar's own `..<` and nullable function-type receiver stay.
+    #[test]
+    fn newer_syntax_is_rewritten_with_every_offset_intact() {
+        let src = "package app\n\nclass Dialect(private val mode: Int) {\n    fun sql(value: Any?): String = when (value) {\n        is String if mode == 2 -> \"text\"\n        is Int if (\n            mode > 0\n        ) -> \"int\"\n        is Long -> if (mode == 1) \"long\" else \"big\"\n        else -> \"other\"\n    }\n\n    fun ranges(n: Int) {\n        for (i in 0..<n) println(i)\n    }\n\n    fun path(team: String) = $$\"?(@.user.team == $team)\"\n\n    fun adjust(body: Op<Boolean>?.() -> Op<Boolean>): Dialect = this\n\n    fun after(): Int = 1\n}\n\nclass Op<T>\n";
+        assert!(parse(src).root_node().has_error());
+        let out = rewrite_newer_kotlin_syntax(src);
+        assert_eq!(out.len(), src.len());
+        assert!(out.contains("is String,   mode == 2 ->"));
+        assert!(out.contains("is Int,   (\n"));
+        assert!(out.contains("is Long -> if (mode == 1)"));
+        assert!(out.contains("0..<n"));
+        assert!(out.contains("=   \"?(@.user.team == $team)\""));
+        assert!(out.contains("Op<Boolean>?.() -> Op<Boolean>"));
+        assert!(!parse(&out).root_node().has_error());
+    }
+
+    #[test]
+    fn when_guards_follow_upstreams_pattern() {
+        let rewrite = |src: &str| rewrite_newer_kotlin_syntax(src);
+        // `!is`, `in`, a type argument and a closing bracket end a condition.
+        assert_eq!(
+            rewrite("  !in 1..3 if ok -> 1\n  is Map<*, *> if (x) -> 2\n  is A? if y -> 3\n"),
+            "  !in 1..3,   ok -> 1\n  is Map<*, *>,   (x) -> 2\n  is A?,   y -> 3\n"
+        );
+        // Not a guard: `if` after `->`, not at a line's condition, not
+        // followed by a blank or `(`, not after a blank.
+        for src in [
+            "  is Long -> if (a) 1 else 2\n",
+            "  x is Long if (a) -> 1\n",
+            "  is Long ifx -> 1\n",
+            "  is Long iff (a) -> 1\n",
+            "  isLong if (a) -> 1\n",
+            "  is Long,if (a) -> 1\n",
+        ] {
+            assert_eq!(rewrite(src), src);
+        }
+        // The first ` if` on the line is the guard's.
+        assert_eq!(
+            rewrite("  is A if b if c -> 1\n"),
+            "  is A,   b if c -> 1\n"
+        );
+        // A tab gap counts, but only in a file with a ` if` somewhere.
+        assert_eq!(rewrite("  is A\tif b -> 1\n"), "  is A\tif b -> 1\n");
+        assert_eq!(
+            rewrite("  is A\tif b -> 1\n  // if\n"),
+            "  is A,   b -> 1\n  // if\n"
+        );
+        // CRLF lines and a guard on the line after a lone carriage return.
+        assert_eq!(
+            rewrite("  is A if b -> 1\r\n  is B if c -> 2\r  is C if d -> 3"),
+            "  is A,   b -> 1\r\n  is B,   c -> 2\r  is C,   d -> 3"
+        );
+        // Non-ASCII text survives.
+        assert_eq!(rewrite("  is Ä if é -> \"ü\"\n"), "  is Ä if é -> \"ü\"\n");
+        assert_eq!(
+            rewrite("  is Aä if é -> \"ü\"\n"),
+            "  is Aä if é -> \"ü\"\n"
+        );
+        assert_eq!(rewrite("  is A if é -> \"ü\"\n"), "  is A,   é -> \"ü\"\n");
+    }
+
+    #[test]
+    fn multi_dollar_prefixes_follow_upstreams_pattern() {
+        let rewrite = |src: &str| rewrite_newer_kotlin_syntax(src);
+        assert_eq!(rewrite("val a = $$\"x $y\""), "val a =   \"x $y\"");
+        assert_eq!(rewrite("val a = $$$\"x\""), "val a =    \"x\"");
+        assert_eq!(rewrite("f($$\"x\")"), "f(  \"x\")");
+        // After a word character, a `$` or a quote, or not before a quote.
+        for src in ["x$$\"y\"", "\"$$\"", "a $$ b", "a $\"b\""] {
+            assert_eq!(rewrite(src), src);
+        }
+        // Upstream blanks a run closing a plain string, too.
+        assert_eq!(rewrite("\"cost $$\""), "\"cost   \"");
     }
 }
