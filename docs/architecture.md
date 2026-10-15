@@ -297,7 +297,14 @@ a backend's sign of dropped events, or (on Windows) drift found by an idle
 sentinel escalates to one full reconcile, reported as RECOVERING until it
 commits. A sync re-resolves the references that name what it changed, a
 qualified one (`User.create`) by its last segment as well (at most 500 per
-segment); a Python import statement that comes or goes counts the names it
+segment); a PHP node that only moved (its id changed with its line, nothing a
+reference reads did) changes no name: the edges into its file re-resolve at
+their sites, and the references elsewhere to a node of its name keep their
+targets unless the order of that name's nodes in its file changed (as upstream
+pairs a re-indexed file's old and new nodes and keeps the edges whose target
+only moved), while a moved node of another language still touches its name,
+since resolution there reads declaration text no node records (a C function's
+`static`); a Python import statement that comes or goes counts the names it
 can re-export as changed (what it binds, and for a star import every name the
 module offers, as deep as the re-export walk looks), since an importer's name
 then moves with no node of it changing; and a changed Python file refreshes the
@@ -434,6 +441,16 @@ the unchanged Go files with unresolved calls written with a receiver ending in
 one down the whole-file lane however many there are, since a receiver's
 embeddings, an alias's target and a field chain's field type are read from the
 declarations' text; the `go_heads_version` marker is withdrawn and restored with the others;
+a PHP file whose head row moved (a type came, went or changed kind, or its `extends` or
+trait `use`s name other types, read through its file's imports) touches the names of the
+methods of every type a changed type's ancestry gained or lost and of a type that changed kind,
+re-resolves whole every unchanged PHP file declaring a type the ancestry gained or lost or a type
+below a changed one whose ancestry starts or stops leaving the repository, and retries at its site
+every unresolved call written with a receiver named after a class at or below a changed one,
+however many there are, since a `$this`, `self`, `static` or `parent` call and an untyped receiver
+read an ancestry from the heads' text (where an ancestry below a changed type reaches the
+resolver's 80-type walk limit, every file declaring a type above or below it re-resolves whole);
+the `php_heads_version` marker is withdrawn and restored with the others;
 a Rust enum variant that came, went or changed touches its enum's name, since a variant path
 reaches an enum only while it declares the variant; a Rust type, trait or alias name that came, went or changed re-resolves, in every unchanged
 Rust file whose text writes it as a path receiver (`Name::`, `Name.`), the references written

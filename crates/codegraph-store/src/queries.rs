@@ -1115,6 +1115,62 @@ impl Store {
         rows.collect()
     }
 
+    /// The unresolved references of `language` written with a receiver,
+    /// `receiver.member`, whose member (the text after the last `.`) is one of
+    /// `members`, in id order and with no ceiling: a lane that knows which
+    /// members can have moved retries every call of them (W4-PHP-01). The
+    /// match runs in SQL, so the language's other references are never read.
+    pub fn unresolved_refs_of_language_by_members(
+        &self,
+        language: Language,
+        members: &[String],
+    ) -> rusqlite::Result<Vec<UnresolvedRef>> {
+        let mut unique: Vec<&str> = members
+            .iter()
+            .map(String::as_str)
+            .filter(|member| !member.is_empty() && !member.contains('.'))
+            .collect();
+        unique.sort_unstable();
+        unique.dedup();
+        let mut out: BTreeMap<i64, UnresolvedRef> = BTreeMap::new();
+        for chunk in unique.chunks(SQLITE_PARAM_CHUNK_SIZE - 1) {
+            let clauses = (0..chunk.len())
+                .map(|index| format!("reference_name GLOB ?{}", index + 2))
+                .collect::<Vec<_>>()
+                .join(" OR ");
+            let sql = format!(
+                "SELECT * FROM unresolved_refs WHERE language = ?1 AND ({clauses}) ORDER BY id"
+            );
+            // `*`, `?` and `[` are GLOB's own; a bracket makes each literal.
+            let patterns: Vec<String> = chunk
+                .iter()
+                .map(|member| {
+                    let mut escaped = String::from("*.");
+                    for c in member.chars() {
+                        match c {
+                            '*' => escaped.push_str("[*]"),
+                            '?' => escaped.push_str("[?]"),
+                            '[' => escaped.push_str("[[]"),
+                            _ => escaped.push(c),
+                        }
+                    }
+                    escaped
+                })
+                .collect();
+            let language = language.as_str();
+            let mut params: Vec<&dyn ToSql> = vec![&language];
+            params.extend(patterns.iter().map(|p| p as &dyn ToSql));
+            let mut stmt = self.conn.prepare(&sql)?;
+            for reference in stmt.query_map(params.as_slice(), row_to_unresolved_ref)? {
+                let reference = reference?;
+                if let Some(id) = reference.id {
+                    out.insert(id, reference);
+                }
+            }
+        }
+        Ok(out.into_values().collect())
+    }
+
     /// The unresolved references written with a qualifier (`User.create`,
     /// `objectType.IsEnum`) whose [`reference_name_tail`] is one of `names`,
     /// the symbol names a sync's changed files touched (upstream #1240's
@@ -3571,6 +3627,61 @@ mod tests {
             .unwrap();
         assert_eq!(by_names.len(), 1);
         assert_eq!(by_names[0].reference_name, "Target");
+    }
+
+    #[test]
+    fn unresolved_refs_of_a_language_are_found_by_their_member() {
+        let mut store = store("by-members");
+        store
+            .upsert_nodes(&[
+                node("function:src1", "src1", "a.php"),
+                node("function:src2", "src2", "b.rb"),
+            ])
+            .unwrap();
+        let mk = |from: &str, name: &str, file: &str, lang: Language| UnresolvedRef {
+            id: None,
+            from_node_id: from.to_string(),
+            reference_name: name.to_string(),
+            reference_kind: EdgeKind::Calls,
+            line: 1,
+            col: 0,
+            candidates: None,
+            file_path: file.to_string(),
+            language: lang,
+            is_function_ref: false,
+            reference_subkind: None,
+        };
+        store
+            .insert_unresolved_refs(&[
+                mk("function:src1", "page.save", "a.php", Language::Php),
+                mk("function:src1", "this.repo.save", "a.php", Language::Php),
+                mk("function:src1", "page.saveAll", "a.php", Language::Php),
+                mk("function:src1", "save", "a.php", Language::Php),
+                mk("function:src1", "x.a_b", "a.php", Language::Php),
+                mk("function:src1", "x.a*b", "a.php", Language::Php),
+                mk("function:src2", "page.save", "b.rb", Language::Ruby),
+            ])
+            .unwrap();
+        let names = |members: &[&str]| -> Vec<String> {
+            let members: Vec<String> = members.iter().map(|m| (*m).to_string()).collect();
+            store
+                .unresolved_refs_of_language_by_members(Language::Php, &members)
+                .unwrap()
+                .into_iter()
+                .map(|reference| reference.reference_name)
+                .collect()
+        };
+        // The member after the last `.`, whole: not a bare name, not a longer
+        // member, not another language's.
+        assert_eq!(names(&["save"]), ["page.save", "this.repo.save"]);
+        // GLOB's own characters match only themselves.
+        assert_eq!(names(&["a*b"]), ["x.a*b"]);
+        assert_eq!(
+            names(&["a_b", "save"]),
+            ["page.save", "this.repo.save", "x.a_b"]
+        );
+        assert!(names(&[]).is_empty());
+        assert!(names(&["repo.save"]).is_empty());
     }
 
     #[test]

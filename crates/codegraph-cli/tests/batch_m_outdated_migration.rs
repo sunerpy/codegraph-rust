@@ -1233,6 +1233,83 @@ fn outdated_migration_writes_the_objc_head_rows_of_index_force() {
     );
 }
 
+/// W4-PHP-01: a migration writes the PHP head rows (a type's kind and the
+/// supertypes its `extends` and trait `use`s name, through its file's
+/// imports) and their marker as `index --force` does.
+#[test]
+fn outdated_migration_writes_the_php_head_rows_of_index_force() {
+    let dir = TestDir::new("outdated-php-heads");
+    let project = dir.path().join("mini");
+    for (path, contents) in [
+        (
+            "src/Child.php",
+            "<?php\nnamespace App;\n\nuse Vendor\\Base;\n\nclass Child extends Base\n{\n    use Greets;\n\n    public function run()\n    {\n        $this->prepare();\n    }\n}\n",
+        ),
+        (
+            "src/Greets.php",
+            "<?php\nnamespace App;\n\ntrait Greets\n{\n    public function hello() {}\n}\n",
+        ),
+        (
+            "src/helpers.php",
+            "<?php\nfunction twice($x)\n{\n    return $x * 2;\n}\n",
+        ),
+    ] {
+        let full = project.join(path);
+        fs::create_dir_all(full.parent().unwrap()).expect("create the source directory");
+        fs::write(full, contents).expect("write a source file");
+    }
+    let run = cli(&["init", project.to_str().unwrap()]);
+    assert!(
+        run.ok,
+        "setup: `codegraph init` must succeed (stdout={}, stderr={})",
+        run.stdout, run.stderr
+    );
+    let paths = IndexPaths::resolve(&project, None).expect("resolve v2 paths");
+    stage_state_slot(
+        &paths,
+        100,
+        CURRENT_STORAGE_PROTOCOL,
+        CURRENT_EXTRACTION_VERSION - 1,
+        "current",
+    );
+    let run = cli(&["sync", project.to_str().unwrap()]);
+    assert!(
+        run.ok,
+        "sync must migrate an Outdated namespace: stdout={}, stderr={}",
+        run.stdout, run.stderr
+    );
+    let (_scratch, peer) = fresh_force_peer("outdated-php-heads", &project);
+    let head_rows = |paths: &IndexPaths| {
+        Store::open_for_read(paths, deadline(), || false)
+            .expect("readable namespace")
+            .project_metadata_with_prefix("php_heads")
+            .expect("php head rows")
+    };
+    let migrated = head_rows(&paths);
+    // No row for a file that declares no type.
+    assert_eq!(
+        migrated
+            .iter()
+            .map(|(key, _)| key.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "php_heads:src/Child.php",
+            "php_heads:src/Greets.php",
+            "php_heads_version",
+        ],
+        "a migration writes the head rows and their marker: {migrated:?}"
+    );
+    assert!(
+        migrated[0].1.contains("Vendor::Base") && migrated[0].1.contains("App::Greets"),
+        "a row names the supertypes through the file's imports: {migrated:?}"
+    );
+    assert_eq!(
+        migrated,
+        head_rows(&IndexPaths::resolve(&peer, None).expect("resolve peer v2 paths")),
+        "a forced migration must write the PHP head rows of `index --force`"
+    );
+}
+
 /// Migration is a from-source rebuild, so a tracked file that no longer exists
 /// on disk disappears from the migrated index and the result still equals a
 /// fresh `index --force` over the surviving tree.

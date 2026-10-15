@@ -2519,6 +2519,9 @@ pub fn match_by_exact_name(
     // How a bare-named Go call is written decides what it can mean (upstream
     // #2167, #2177).
     let go_shape = crate::go_calls::go_call_shape(reference, context);
+    // A PHP call through `$this`, `self`, `static` or `parent` stays in the
+    // class hierarchy (upstream #2142).
+    let php_self = crate::php_scope::php_self_scope(reference, context);
     let candidates: Vec<Arc<Node>> = reachable
         .iter()
         .filter(|n| {
@@ -2562,6 +2565,13 @@ pub fn match_by_exact_name(
             go_shape
                 .as_ref()
                 .is_none_or(|shape| crate::go_calls::is_go_call_target(n, shape))
+        })
+        // `$this->assertEquals()` in a test of a vendor base class is no
+        // comparator's method (upstream #2142).
+        .filter(|n| {
+            php_self
+                .as_ref()
+                .is_none_or(|scope| n.kind == NodeKind::Method && scope.admits(n, context))
         })
         // A Vue component's own method is `this.m()` inside that component,
         // not `this.$refs['input'].click()` on an element another component
@@ -3905,7 +3915,7 @@ pub(crate) fn local_receiver_type_patterns(
 /// What a receiver-type pattern needs checked beyond its regex, which the
 /// `regex` crate cannot say: it has no look-around.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PatternCheck {
+pub enum PatternCheck {
     /// Nothing beyond the match.
     None,
     /// The Lua/Luau `receiver: Type` ANNOTATION: `lg:Log()` is byte-identical
@@ -3921,12 +3931,7 @@ pub(crate) enum PatternCheck {
 impl PatternCheck {
     /// Whether a match of the pattern in `text` (`whole`, with its type
     /// `capture`) passes.
-    pub(crate) fn passes(
-        self,
-        text: &str,
-        whole: regex::Match<'_>,
-        capture: regex::Match<'_>,
-    ) -> bool {
+    pub fn passes(self, text: &str, whole: regex::Match<'_>, capture: regex::Match<'_>) -> bool {
         match self {
             Self::None => true,
             Self::LuaAnnotation => !lua_annotation_is_method_call(text, capture.end()),
@@ -4167,14 +4172,22 @@ pub(crate) fn infer_local_receiver_declaration(
         None => (receiver_name, false),
     };
     let escaped = regex_escape(scan_receiver);
-    // A CFML or Objective-C scan compiles its patterns only once a line could
-    // match one ([`line_may_declare`]): compiled for every member call,
+    // A CFML, Objective-C or PHP scan compiles its patterns only once a line
+    // could match one ([`line_may_declare`]): compiled for every member call,
     // CFML's eight made re-resolving a file of a few hundred calls take
-    // seconds.
-    let lazy = matches!(reference.language, Language::Cfml | Language::ObjC);
-    let compiled: OnceCell<Vec<(Regex, PatternCheck)>> = OnceCell::new();
+    // seconds, and a PHP pair costs a millisecond and a megabyte.
+    let lazy = matches!(
+        reference.language,
+        Language::Cfml | Language::ObjC | Language::Php
+    );
+    let compiled: OnceCell<Arc<Vec<(Regex, PatternCheck)>>> = OnceCell::new();
     let patterns = || {
-        compiled.get_or_init(|| local_receiver_type_patterns_tagged(reference.language, &escaped))
+        compiled.get_or_init(|| {
+            context.compiled_patterns(
+                &format!("receiver:{}:{escaped}", reference.language.as_str()),
+                &|| local_receiver_type_patterns_tagged(reference.language, &escaped),
+            )
+        })
     };
     if !lazy && patterns().is_empty() {
         return None;
@@ -4202,7 +4215,7 @@ pub(crate) fn infer_local_receiver_declaration(
         if lazy && !line_may_declare(reference.language, line, scan_receiver) {
             return None;
         }
-        for (re, check) in patterns() {
+        for (re, check) in patterns().iter() {
             if let Some(caps) = re.captures(line) {
                 if let (Some(whole), Some(m)) = (caps.get(0), caps.get(1)) {
                     if !check.passes(line, whole, m) {
@@ -4238,8 +4251,58 @@ fn line_may_declare(language: Language, line: &str, receiver: &str) -> bool {
         Language::Cfml => cfml_line_may_declare(line, receiver),
         // Both Objective-C forms write a `*` and the receiver.
         Language::ObjC => line.contains('*') && line.contains(receiver),
+        // `$x = new T` writes the receiver, then past whitespace `=` and
+        // `new`; `T $x` writes `$` and the receiver after whitespace (an `&`
+        // between).
+        Language::Php => {
+            writes_assignment_of(line, receiver, "new") || writes_typed_variable(line, receiver)
+        }
         _ => true,
     }
+}
+
+/// The byte offsets where `needle` starts in `text`, overlapping ones
+/// included (`aa` twice in `aaa`).
+fn occurrences<'t>(text: &'t str, needle: &'t str) -> impl Iterator<Item = usize> + 't {
+    let step = needle.chars().next().map_or(1, char::len_utf8);
+    let mut from = 0;
+    std::iter::from_fn(move || {
+        if needle.is_empty() || from > text.len() {
+            return None;
+        }
+        let at = from + text[from..].find(needle)?;
+        from = at + step;
+        Some(at)
+    })
+}
+
+/// Whether `text` writes `name` followed, past whitespace, by `=` and then,
+/// past whitespace, by `next`: what `{name}\b\s*=\s*{next}` needs (never
+/// false where that matches).
+fn writes_assignment_of(text: &str, name: &str, next: &str) -> bool {
+    occurrences(text, name).any(|at| {
+        text[at + name.len()..]
+            .trim_start()
+            .strip_prefix('=')
+            .is_some_and(|rest| rest.trim_start().starts_with(next))
+    })
+}
+
+/// Whether `text` writes `$name` after a word and whitespace, an optional
+/// `&` between: what `[\w\\]\s+&?\$name` needs (never false where that
+/// matches; any non-ASCII character counts as a word's).
+fn writes_typed_variable(text: &str, name: &str) -> bool {
+    let variable = format!("${name}");
+    occurrences(text, &variable).any(|at| {
+        let before = &text[..at];
+        let before = before.strip_suffix('&').unwrap_or(before);
+        before.ends_with(char::is_whitespace)
+            && before
+                .trim_end()
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '\\' || !c.is_ascii())
+    })
 }
 
 /// Whether `line` could match a CFML receiver pattern for `receiver`
@@ -4775,17 +4838,32 @@ fn php_property_type_patterns(escaped_prop: &str) -> Vec<Regex> {
 /// parameter itself), so a same-named variable in another method can never type
 /// the property. Ports `inferPhpAssignedPropertyType` (`name-matcher.ts:1396-1445`).
 fn infer_php_assigned_property_type(
+    prop: &str,
     escaped_prop: &str,
     lines: &[&str],
     call_idx: usize,
+    context: &dyn ResolutionContext,
 ) -> Option<String> {
-    let assign_re = Regex::new(&format!(r"\$this->{escaped_prop}\b\s*=\s*\$(\w+)\b")).ok()?;
+    // Compiled only once a line writes `$this->prop =` and then a `$`.
+    let compiled: OnceCell<Arc<Vec<(Regex, PatternCheck)>>> = OnceCell::new();
+    let property = format!("this->{prop}");
     let assign_at = |i: usize| -> Option<String> {
         let line = lines.get(i)?;
-        if line.len() > 10_000 {
+        if line.len() > 10_000 || !writes_assignment_of(line, &property, "$") {
             return None;
         }
-        assign_re
+        compiled
+            .get_or_init(|| {
+                context.compiled_patterns(&format!("php-assignment:{escaped_prop}"), &|| {
+                    Regex::new(&format!(r"\$this->{escaped_prop}\b\s*=\s*\$(\w+)\b"))
+                        .ok()
+                        .map(|re| (re, PatternCheck::None))
+                        .into_iter()
+                        .collect()
+                })
+            })
+            .first()?
+            .0
             .captures(line)
             .and_then(|c| c.get(1))
             .map(|m| m.as_str().to_string())
@@ -4854,7 +4932,13 @@ fn infer_php_property_receiver_type(
 ) -> Option<String> {
     let prop = receiver_with_prefix.strip_prefix("this->")?;
     let escaped = regex_escape(prop);
-    let patterns = php_property_type_patterns(&escaped);
+    // Compiled only once a line could match one: `… ?Foo $prop` writes the
+    // property after whitespace, `$this->prop = new Foo` its assignment.
+    let compiled: OnceCell<Arc<Vec<(Regex, PatternCheck)>>> = OnceCell::new();
+    let property = format!("this->{prop}");
+    let may_declare = |line: &str| {
+        writes_typed_variable(line, prop) || writes_assignment_of(line, &property, "new")
+    };
     let source = context.read_file(&reference.file_path)?;
     let lines: Vec<&str> = source
         .split('\n')
@@ -4868,10 +4952,18 @@ fn infer_php_property_receiver_type(
     for line in &lines {
         // A generated/minified line is not where a human declaration lives, and
         // regexing multi-KB text per ref is pure waste — skip it.
-        if line.len() > 10_000 {
+        if line.len() > 10_000 || !may_declare(line) {
             continue;
         }
-        for re in &patterns {
+        let patterns = compiled.get_or_init(|| {
+            context.compiled_patterns(&format!("php-property:{escaped}"), &|| {
+                php_property_type_patterns(&escaped)
+                    .into_iter()
+                    .map(|re| (re, PatternCheck::None))
+                    .collect()
+            })
+        });
+        for (re, _) in patterns.iter() {
             if let Some(caps) = re.captures(line) {
                 if let Some(m) = caps.get(1) {
                     if let Some(ty) = normalize_inferred_type_name(m.as_str()) {
@@ -4883,7 +4975,7 @@ fn infer_php_property_receiver_type(
     }
 
     // Classic pre-7.4 untyped-property-assigned-in-constructor second chance.
-    infer_php_assigned_property_type(&escaped, &lines, call_idx)
+    infer_php_assigned_property_type(prop, &escaped, &lines, call_idx, context)
 }
 
 /// Try to resolve by method name on a class/object (`matchMethodCall`,
@@ -5659,11 +5751,18 @@ pub fn match_method_call(
     // ends in a property declared with a type, whose hierarchy has it
     // (upstream #2150): `[managed.anyDataObj containsObject:]` is RLMSet's.
     let objc_reaches = OnceCell::new();
+    // A PHP one, when it names a class whose ancestry has it (upstream
+    // #2152): `$page->save()` is Entity's, Page extending it.
+    let php_reaches = OnceCell::new();
     let names_owner = |method: &Node| {
         crate::kotlin_scope::shares_receiver_word(&object_or_class, method)
             || (reference.language == Language::ObjC
                 && *objc_reaches.get_or_init(|| {
                     crate::objc_scope::objc_receiver_reaches(&object_or_class, method, context)
+                }))
+            || (reference.language == Language::Php
+                && *php_reaches.get_or_init(|| {
+                    crate::php_scope::php_receiver_reaches(&object_or_class, method, context)
                 }))
     };
     if target_methods.len() == 1
@@ -6443,6 +6542,7 @@ pub fn match_fuzzy(reference: &RefView, context: &dyn ResolutionContext) -> Opti
     let swift_shape = crate::swift_scope::swift_call_shape(reference, context);
     let go_shape = crate::go_calls::go_call_shape(reference, context);
     let rust_scoped = crate::rust_scope::is_rust_bare_identifier(reference);
+    let php_self = crate::php_scope::php_self_scope(reference, context);
     let callable_candidates = apply_language_gate(
         candidates
             .into_iter()
@@ -6530,6 +6630,13 @@ pub fn match_fuzzy(reference: &RefView, context: &dyn ResolutionContext) -> Opti
             // A bare Rust name, only what is in scope (upstream #2124, #2214).
             .filter(|n| {
                 !rust_scoped || crate::rust_scope::is_rust_name_in_scope(n, reference, context)
+            })
+            // A PHP call through `$this` / `self` / `parent`, only the class
+            // hierarchy's method (upstream #2142).
+            .filter(|n| {
+                php_self
+                    .as_ref()
+                    .is_none_or(|scope| n.kind == NodeKind::Method && scope.admits(n, context))
             })
             // `new …MockData()` makes an instance of a type; a method is never
             // what it names (upstream #2141).
@@ -13175,6 +13282,65 @@ mod tests {
         assert!(!cfml_line_may_declare("    svc.save(1);", "svc"));
         assert!(!cfml_line_may_declare("    n50.save(50);", "n5"));
         assert!(cfml_line_may_declare("    aaa = new X();", "aa"));
+    }
+
+    #[test]
+    fn php_line_prefilters_admit_every_line_a_pattern_matches() {
+        let lines = [
+            "        $repo = new UserRepository();",
+            "        $repo=new \\App\\Repo;",
+            "        repo  =  new  Repo();",
+            "    public function handle(UserRepository $repo) {",
+            "    public function handle(Repo &$repo, $other) {",
+            "    private readonly ?Repo $repo;",
+            "    public function __construct(protected Repo $repo) {}",
+            "        $this->repo = new Repo();",
+            "        $this->repo = $repo;",
+            "        $this->repo->save();",
+            "        $repo->save();",
+            "        if ($repo == new Repo()) {}",
+            "        $repos = new Repo();",
+        ];
+        let receiver = local_receiver_type_patterns_tagged(Language::Php, "repo");
+        let property = php_property_type_patterns("repo");
+        let assignment = Regex::new(r"\$this->repo\b\s*=\s*\$(\w+)\b").unwrap();
+        let (mut by_receiver, mut by_property, mut by_assignment) = (0, 0, 0);
+        for line in lines {
+            if receiver.iter().any(|(re, _)| re.is_match(line)) {
+                by_receiver += 1;
+                assert!(line_may_declare(Language::Php, line, "repo"), "{line}");
+            }
+            if property.iter().any(|re| re.is_match(line)) {
+                by_property += 1;
+                assert!(
+                    writes_typed_variable(line, "repo")
+                        || writes_assignment_of(line, "this->repo", "new"),
+                    "{line}"
+                );
+            }
+            if assignment.is_match(line) {
+                by_assignment += 1;
+                assert!(writes_assignment_of(line, "this->repo", "$"), "{line}");
+            }
+        }
+        assert_eq!((by_receiver, by_property, by_assignment), (8, 3, 1));
+        // A plain member call declares nothing, so no pattern is compiled
+        // for it.
+        assert!(!line_may_declare(
+            Language::Php,
+            "        $repo->save();",
+            "repo"
+        ));
+        assert!(!writes_assignment_of(
+            "        $this->repo->save();",
+            "this->repo",
+            "new"
+        ));
+        assert!(!writes_typed_variable(
+            "        $this->repo->save();",
+            "repo"
+        ));
+        assert!(writes_assignment_of("    aaa = new X();", "aa", "new"));
     }
 
     #[test]

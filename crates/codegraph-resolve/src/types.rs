@@ -582,6 +582,27 @@ pub trait ResolutionContext {
         Arc::new(crate::ruby_scope::RubyTables::new())
     }
 
+    /// The PHP file scopes and supertypes for the pass (upstream #2142).
+    /// Contexts that live for one resolution pass build them once; the
+    /// default builds fresh tables on each call.
+    fn php_tables(&self) -> Arc<crate::php_scope::PhpTables> {
+        Arc::new(crate::php_scope::PhpTables::new())
+    }
+
+    /// The compiled pattern set `build` makes for `key` (a receiver's type
+    /// patterns, a PHP property's). A context that resolves one sync's
+    /// references in turn keeps the last few, since the same receivers recur
+    /// within a file; one shared by a parallel pass compiles each time, as a
+    /// set takes a megabyte or more (W4-PHP-01).
+    fn compiled_patterns(
+        &self,
+        key: &str,
+        build: &dyn Fn() -> Vec<(regex::Regex, crate::name_matcher::PatternCheck)>,
+    ) -> Arc<Vec<(regex::Regex, crate::name_matcher::PatternCheck)>> {
+        let _ = key;
+        Arc::new(build())
+    }
+
     /// The CFML `extends` chains of one resolution pass (W4-CF-01).
     fn cfml_tables(&self) -> Arc<crate::cfml_scope::CfmlTables> {
         Arc::new(crate::cfml_scope::CfmlTables::new())

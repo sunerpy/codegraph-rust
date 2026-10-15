@@ -369,6 +369,8 @@ fn run_case(name: &str, case: &Case) {
     let objc_rows = support::project_metadata_with_prefix(&fresh.db(), "objc_heads");
     // And the Go head rows and their marker (W4-GO-01).
     let go_rows = support::project_metadata_with_prefix(&fresh.db(), "go_heads");
+    // And the PHP head rows and their marker (W4-PHP-01).
+    let php_rows = support::project_metadata_with_prefix(&fresh.db(), "php_heads");
     for (driver, project) in [("cli", &cli), ("watch", &watch)] {
         let rows = support::project_metadata_with_prefix(&project.db(), "js_module_surface");
         if rows != surface_rows {
@@ -459,6 +461,13 @@ fn run_case(name: &str, case: &Case) {
             divergent.push(format!(
                 "=== {driver} driver: the Go head rows differ from a fresh index\n\
                  synced: {rows:#?}\nfresh: {go_rows:#?}"
+            ));
+        }
+        let rows = support::project_metadata_with_prefix(&project.db(), "php_heads");
+        if rows != php_rows {
+            divergent.push(format!(
+                "=== {driver} driver: the PHP head rows differ from a fresh index\n\
+                 synced: {rows:#?}\nfresh: {php_rows:#?}"
             ));
         }
     }
@@ -885,6 +894,34 @@ matrix! {
     objc_typed_local_reaches_an_inherited_method_past_the_tail_ceiling,
     objc_category_send_reaches_a_system_superclass_category_that_appears,
     objc_namesake_protocol_keeps_its_own_header_when_a_copy_appears,
+    php_this_call_follows_an_ancestor_extends_change,
+    typescript_line_shift_above_a_function_keeps_namesake_edges_elsewhere,
+    php_line_shift_in_a_base_class_keeps_its_callers,
+    c_static_function_becomes_visible_with_a_line_added_above,
+    php_base_this_call_leaves_a_deeper_subclass_method_once_a_middle_class_is_rebased,
+    php_this_call_reaches_a_method_once_a_middle_class_extends_its_class,
+    php_this_call_follows_a_trait_use_change_in_an_ancestor,
+    php_parent_call_follows_an_import_retarget_in_an_ancestor_file,
+    php_this_call_leaves_a_repository_trait_once_the_outside_base_appears,
+    php_this_call_leaves_a_method_once_its_trait_becomes_a_class,
+    php_this_call_reaches_a_method_once_its_class_becomes_a_trait,
+    php_this_call_reaches_a_repository_trait_once_its_imported_base_is_deleted,
+    php_untyped_receiver_leaves_a_method_its_class_stops_inheriting,
+    php_untyped_receiver_reaches_an_inherited_method_past_the_tail_ceiling,
+    php_untyped_receiver_reaches_a_method_its_ancestor_gains_past_the_tail_ceiling,
+    php_untyped_receiver_leaves_a_method_a_seed_pushes_past_the_walk_limit,
+    #[ignore = "W5-07: a call through a class name reads its supertypes from the class heads, which no sync lane records"]
+    php_inherited_static_call_follows_a_class_head_spread_past_its_third_line,
+    #[ignore = "W5-07: a call through a class name reads its supertypes from the class heads, which no sync lane records"]
+    python_inherited_classmethod_follows_a_base_change_in_another_file,
+    #[ignore = "W5-07: a call through a class name reads its supertypes from the class heads, which no sync lane records"]
+    python_inherited_classmethod_follows_a_base_change_beside_its_old_target,
+    #[ignore = "W5-07: a call through a class name reads its supertypes from the class heads, which no sync lane records"]
+    java_inherited_static_call_follows_a_base_change_in_another_file,
+    #[ignore = "W5-07: a call through a class name reads its supertypes from the class heads, which no sync lane records"]
+    csharp_inherited_static_call_follows_a_base_change_in_another_file,
+    #[ignore = "W5-07: a call through a class name reads its supertypes from the class heads, which no sync lane records"]
+    swift_inherited_class_method_follows_a_base_change_in_another_file,
     typescript_value_reader_body_edit,
     astro_frontmatter_call_body_edit,
     go_value_initializer_body_edit,

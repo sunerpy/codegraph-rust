@@ -12,6 +12,7 @@ pub mod member_surfaces;
 mod migrate;
 pub mod module_surfaces;
 pub mod objc_heads;
+pub mod php_heads;
 mod policy;
 pub mod ruby_heads;
 pub mod rust_receivers;

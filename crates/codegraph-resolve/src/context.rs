@@ -69,11 +69,26 @@ struct Caches {
     csharp_tables: Option<Arc<crate::csharp_types::CsharpTables>>,
     member_tables: Option<Arc<crate::member_types::MemberTables>>,
     ruby_tables: Option<Arc<crate::ruby_scope::RubyTables>>,
+    php_tables: Option<Arc<crate::php_scope::PhpTables>>,
+    /// The last few compiled pattern sets, most recent last
+    /// ([`ResolutionContext::compiled_patterns`]).
+    patterns: std::collections::VecDeque<CompiledPatterns>,
     cfml_tables: Option<Arc<crate::cfml_scope::CfmlTables>>,
     swift_tables: Option<Arc<crate::swift_type_visibility::SwiftTables>>,
     objc_tables: Option<Arc<crate::objc_scope::ObjcTables>>,
     go_tables: Option<Arc<crate::go_packages::GoTables>>,
 }
+
+/// A compiled pattern set by its key.
+type CompiledPatterns = (
+    String,
+    Arc<Vec<(regex::Regex, crate::name_matcher::PatternCheck)>>,
+);
+
+/// The most compiled pattern sets a store context keeps: a set takes a
+/// megabyte or more (CFML's eight about 3.3 MB), so a few, enough for the
+/// receivers one file's references write in turn.
+const PATTERN_MEMO_LIMIT: usize = 8;
 
 /// Bound on memoized existence answers; the memo restarts past it, as upstream.
 pub(crate) const FILE_EXISTS_MEMO_LIMIT: usize = 200_000;
@@ -108,6 +123,8 @@ impl Caches {
             csharp_tables: None,
             member_tables: None,
             ruby_tables: None,
+            php_tables: None,
+            patterns: std::collections::VecDeque::new(),
             cfml_tables: None,
             swift_tables: None,
             objc_tables: None,
@@ -157,6 +174,8 @@ impl<'a> StoreResolutionContext<'a> {
         c.csharp_tables = None;
         c.member_tables = None;
         c.ruby_tables = None;
+        c.php_tables = None;
+        c.patterns.clear();
         c.cfml_tables = None;
         c.swift_tables = None;
         c.objc_tables = None;
@@ -552,6 +571,39 @@ impl ResolutionContext for StoreResolutionContext<'_> {
                 .ruby_tables
                 .get_or_insert_with(|| Arc::new(crate::ruby_scope::RubyTables::new())),
         )
+    }
+
+    fn php_tables(&self) -> Arc<crate::php_scope::PhpTables> {
+        Arc::clone(
+            self.caches
+                .borrow_mut()
+                .php_tables
+                .get_or_insert_with(|| Arc::new(crate::php_scope::PhpTables::new())),
+        )
+    }
+
+    fn compiled_patterns(
+        &self,
+        key: &str,
+        build: &dyn Fn() -> Vec<(regex::Regex, crate::name_matcher::PatternCheck)>,
+    ) -> Arc<Vec<(regex::Regex, crate::name_matcher::PatternCheck)>> {
+        {
+            let mut c = self.caches.borrow_mut();
+            if let Some(at) = c.patterns.iter().position(|(k, _)| k == key)
+                && let Some(entry) = c.patterns.remove(at)
+            {
+                let set = Arc::clone(&entry.1);
+                c.patterns.push_back(entry);
+                return set;
+            }
+        }
+        let set = Arc::new(build());
+        let mut c = self.caches.borrow_mut();
+        while c.patterns.len() >= PATTERN_MEMO_LIMIT {
+            c.patterns.pop_front();
+        }
+        c.patterns.push_back((key.to_string(), Arc::clone(&set)));
+        set
     }
 
     fn cfml_tables(&self) -> Arc<crate::cfml_scope::CfmlTables> {

@@ -263,7 +263,10 @@ pub(crate) fn is_ruby_method_in_scope(
 /// one component method named `keyExists`; Objective-C's
 /// `image.respondsToSelector:` is NSObject's, not a proxy class's override.
 pub(crate) fn is_untyped_receiver_language(language: Language) -> bool {
-    matches!(language, Language::Ruby | Language::Cfml | Language::ObjC)
+    matches!(
+        language,
+        Language::Ruby | Language::Cfml | Language::ObjC | Language::Php
+    )
 }
 
 /// The receivers the untyped-receiver gate never judges (upstream

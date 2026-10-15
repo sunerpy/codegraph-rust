@@ -13662,3 +13662,206 @@ mod rust {
         );
     }
 }
+
+mod php {
+    use super::support::{Graph, Project};
+
+    /// `Owner::member` of every call edge out of the method named `method` in
+    /// `file`, sorted (upstream's `callees`).
+    fn callees(graph: &Graph, file: &str, method: &str) -> Vec<String> {
+        let from = graph
+            .nodes
+            .iter()
+            .find(|n| n.kind == "method" && n.name == method && n.file_path == file)
+            .unwrap_or_else(|| panic!("method {method} in {file}\n{}", graph.report()));
+        let mut out: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|e| e.kind == "calls" && e.source == from.id)
+            .filter_map(|e| graph.node(&e.target))
+            .map(|n| n.qualified_name.clone())
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// Upstream #2142: `$this->m()`, `self::m()`, `static::m()` and
+    /// `parent::m()` name a method of the class the call is written in, a
+    /// class it extends, or a trait any of them uses — never another class's
+    /// method that shares the name; inside a trait `$this` is the using class,
+    /// a base may call what a subclass defines, and past an ancestor outside
+    /// the repository the repository's traits still count. Upstream's fixture.
+    #[test]
+    fn pr2142_php_this_self_and_parent_calls_stay_in_the_class_hierarchy() {
+        let project = Project::new()
+            .file(
+                "core/lib/StringTranslationTrait.php",
+                "<?php\nnamespace Drupal\\Core\\StringTranslation;\ntrait StringTranslationTrait {\n  protected function t($string) { return $string; }\n}\n",
+            )
+            .file(
+                "core/lib/Views.php",
+                "<?php\nnamespace Drupal\\views;\nclass Views {\n  public static function t($s) { return $s; }\n}\n",
+            )
+            .file(
+                "core/lib/MarkupComparator.php",
+                "<?php\nnamespace Drupal\\TestTools\\Comparator;\nclass MarkupInterfaceComparator {\n  public function assertEquals($expected, $actual) {}\n}\n",
+            )
+            .file(
+                "core/lib/FormBase.php",
+                "<?php\nnamespace Drupal\\Core\\Form;\nuse Drupal\\Core\\StringTranslation\\StringTranslationTrait;\nabstract class FormBase {\n  use StringTranslationTrait;\n  public function setUp() {}\n  protected function helper() {}\n}\n",
+            )
+            .file(
+                "core/modules/my/MyForm.php",
+                "<?php\nnamespace Drupal\\my\\Form;\nuse Drupal\\Core\\Form\\FormBase;\nclass MyForm extends FormBase {\n  public function setUp() {\n    parent::setUp();\n    $this->helper();\n    return $this->t('Hi');\n  }\n}\n",
+            )
+            .file(
+                "core/tests/NodeTest.php",
+                "<?php\nnamespace Drupal\\Tests\\node;\nuse PHPUnit\\Framework\\TestCase;\nclass NodeTest extends TestCase {\n  public function testTitle() {\n    $this->assertEquals(1, 1);\n  }\n}\n",
+            )
+            .file(
+                "src/Testing/InteractsWithTime.php",
+                "<?php\nnamespace Illuminate\\Foundation\\Testing\\Concerns;\ntrait InteractsWithTime {\n  public function travelTo($date) {}\n}\n",
+            )
+            .file(
+                "src/Validation/ValidatesAttributes.php",
+                "<?php\nnamespace Illuminate\\Validation\\Concerns;\ntrait ValidatesAttributes {\n  public function validateSame($attribute) { return $this->getValue($attribute); }\n}\n",
+            )
+            .file(
+                "src/Validation/Validator.php",
+                "<?php\nnamespace Illuminate\\Validation;\nuse Illuminate\\Validation\\Concerns\\ValidatesAttributes;\nclass Validator {\n  use ValidatesAttributes;\n  public function getValue($attribute) { return null; }\n}\n",
+            )
+            .file(
+                "app/Entity.php",
+                "<?php\nnamespace BookStack\\Entities;\nabstract class Entity {\n  public function parentBook() { return $this->book(); }\n}\n",
+            )
+            .file(
+                "app/Page.php",
+                "<?php\nnamespace BookStack\\Entities;\nclass Page extends Entity {\n  public function book() { return null; }\n}\n",
+            )
+            .file(
+                "tests/QueueTest.php",
+                "<?php\nnamespace Illuminate\\Tests\\Integration;\nuse Orchestra\\Testbench\\TestCase;\nclass QueueTest extends TestCase {\n  public function testDelay() {\n    $this->travelTo('2000-01-02');\n  }\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        let report = graph.report();
+        assert_eq!(
+            callees(graph, "core/modules/my/MyForm.php", "setUp"),
+            [
+                "Drupal\\Core\\Form::FormBase::helper",
+                "Drupal\\Core\\Form::FormBase::setUp",
+                "Drupal\\Core\\StringTranslation::StringTranslationTrait::t",
+            ],
+            "{report}"
+        );
+        assert!(
+            callees(graph, "core/tests/NodeTest.php", "testTitle").is_empty(),
+            "{report}"
+        );
+        assert_eq!(
+            callees(
+                graph,
+                "src/Validation/ValidatesAttributes.php",
+                "validateSame"
+            ),
+            ["Illuminate\\Validation::Validator::getValue"],
+            "{report}"
+        );
+        assert_eq!(
+            callees(graph, "app/Entity.php", "parentBook"),
+            ["BookStack\\Entities::Page::book"],
+            "{report}"
+        );
+        assert_eq!(
+            callees(graph, "tests/QueueTest.php", "testDelay"),
+            ["Illuminate\\Foundation\\Testing\\Concerns::InteractsWithTime::travelTo"],
+            "{report}"
+        );
+    }
+
+    /// Upstream #2142's rule at the exact-name step: a same-namespace class's
+    /// method of the name is the one candidate there, and it is no ancestor's
+    /// of a test class extending PHPUnit's `TestCase`; a trait the test uses
+    /// is.
+    #[test]
+    fn pr2142_a_this_call_in_a_vendor_subclass_skips_a_same_namespace_namesake() {
+        let project = Project::new()
+            .file(
+                "tests/Fixtures.php",
+                "<?php\nnamespace App\\Tests;\n\nclass Fixtures\n{\n    public function seed() {}\n}\n",
+            )
+            .file(
+                "tests/CreatesUsers.php",
+                "<?php\nnamespace App\\Tests;\n\ntrait CreatesUsers\n{\n    public function makeUser() {}\n}\n",
+            )
+            .file(
+                "tests/UserTest.php",
+                "<?php\nnamespace App\\Tests;\n\nuse PHPUnit\\Framework\\TestCase;\n\nclass UserTest extends TestCase\n{\n    use CreatesUsers;\n\n    public function testSeed()\n    {\n        $this->seed();\n        $this->makeUser();\n    }\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        assert_eq!(
+            callees(graph, "tests/UserTest.php", "testSeed"),
+            ["App\\Tests::CreatesUsers::makeUser"],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream #2152: a PHP call through a receiver nothing typed takes the
+    /// one project method of that name only when the receiver is named after
+    /// its class, or after a class that inherits it (`$page->save()` → Page
+    /// extends Entity). Upstream's fixture.
+    #[test]
+    fn pr2152_a_php_untyped_receiver_keeps_a_unique_method_only_when_named_for_it() {
+        let project = Project::new()
+            .file(
+                "src/Models/Entity.php",
+                "<?php\nnamespace App\\Models;\n\nabstract class Entity\n{\n    public function save(): bool { return true; }\n}\n",
+            )
+            .file(
+                "src/Models/Page.php",
+                "<?php\nnamespace App\\Models;\n\nclass Page extends Entity\n{\n}\n",
+            )
+            .file(
+                "src/Helper/ProgressBar.php",
+                "<?php\nnamespace App\\Helper;\n\nclass ProgressBar\n{\n    public function getMessage(): string { return ''; }\n}\n",
+            )
+            .file(
+                "src/Uploads/UserAvatars.php",
+                "<?php\nnamespace App\\Uploads;\n\nclass UserAvatars\n{\n    public function assignToUser($user): void {}\n}\n",
+            )
+            .file(
+                "src/Controller.php",
+                "<?php\nnamespace App;\n\nfunction handle($page, $avatars, $user)\n{\n    try {\n        $page->save();\n        $avatars->assignToUser($user);\n    } catch (\\Exception $e) {\n        return $e->getMessage();\n    }\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        let mut targets: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|e| e.kind == "calls")
+            .filter(|e| {
+                graph
+                    .node(&e.source)
+                    .is_some_and(|n| n.file_path == "src/Controller.php")
+            })
+            .filter_map(|e| graph.node(&e.target))
+            .map(|n| n.qualified_name.clone())
+            .collect();
+        targets.sort();
+        let report = graph.report();
+        assert!(
+            targets.contains(&"App\\Models::Entity::save".to_string()),
+            "{targets:?}\n{report}"
+        );
+        assert!(
+            targets.contains(&"App\\Uploads::UserAvatars::assignToUser".to_string()),
+            "{targets:?}\n{report}"
+        );
+        assert!(
+            !targets.contains(&"App\\Helper::ProgressBar::getMessage".to_string()),
+            "{targets:?}\n{report}"
+        );
+    }
+}

@@ -4602,6 +4602,611 @@ pub fn objc_namesake_protocol_keeps_its_own_header_when_a_copy_appears() -> Case
         )
 }
 
+/// A line added above a function moves its id: the edge into it follows it,
+/// and an edge to a namesake in another file stays as a fresh index has it
+/// (a moved TypeScript node still touches its name; W4-PHP-01's move-aware
+/// touch is PHP's only).
+pub fn typescript_line_shift_above_a_function_keeps_namesake_edges_elsewhere() -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript])
+        .file("src/a.ts", "export function run() {\n  return 1;\n}\n")
+        .file("src/b.ts", "export function run() {\n  return 2;\n}\n")
+        .file(
+            "src/main.ts",
+            "import { run } from './b';\n\nexport function main() {\n  return run();\n}\n",
+        )
+        .file(
+            "src/other.ts",
+            "import { run } from './a';\n\nexport function other() {\n  return run();\n}\n",
+        )
+        .write(
+            "src/a.ts",
+            "// One line above the function moves its id.\nexport function run() {\n  return 1;\n}\n",
+        )
+        .edge_throughout("function main", "calls", "function run @src/b.ts")
+        .edge_throughout("function other", "calls", "function run @src/a.ts")
+}
+
+/// A C function's `static` is read from its declaration's text, which no node
+/// records: a blank line added above a `static` function that loses `static`
+/// moves its id and nothing its node holds, and makes it visible to another
+/// file's parked call, so a moved C node keeps touching its name (W4-PHP-01's
+/// move-aware touch is PHP's only). A comment there would not do: it becomes
+/// the node's docstring.
+pub fn c_static_function_becomes_visible_with_a_line_added_above() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::C])
+        .file("a.c", "static int f(void) {\n  return 1;\n}\n")
+        .file("b.c", "int g(void) {\n  return f();\n}\n")
+        .write("a.c", "\nint f(void) {\n  return 1;\n}\n")
+        .edge_after("function g", "calls", "function f @a.c")
+}
+
+/// The same for a PHP base class: a line above its methods moves their ids;
+/// the subclass's `$this->prepare()` follows the moved method.
+pub fn php_line_shift_in_a_base_class_keeps_its_callers() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Php])
+        .file(
+            "src/Base.php",
+            "<?php\nnamespace App;\n\nclass Base\n{\n    public function prepare() {}\n}\n",
+        )
+        .file(
+            "src/Other.php",
+            "<?php\nnamespace App;\n\nclass Other\n{\n    public function prepare() {}\n}\n",
+        )
+        .file(
+            "src/Child.php",
+            "<?php\nnamespace App;\n\nclass Child extends Base\n{\n    public function run()\n    {\n        $this->prepare();\n    }\n}\n",
+        )
+        .write(
+            "src/Base.php",
+            "<?php\nnamespace App;\n\n/** The base. */\nclass Base\n{\n    public function prepare() {}\n}\n",
+        )
+        .edge_throughout("method App::Child::run", "calls", "method App::Base::prepare")
+}
+
+/// Upstream #2142 (W4-PHP-01): `$this->m()` reaches the class's ancestry, so
+/// it follows a middle class's `extends` changed in another file.
+pub fn php_this_call_follows_an_ancestor_extends_change() -> Case {
+    Case::new(Change::EditHeritage, &[Language::Php])
+        .file(
+            "src/Base.php",
+            "<?php\nnamespace App;\n\nclass Base\n{\n    public function prepare() {}\n}\n",
+        )
+        .file(
+            "src/Other.php",
+            "<?php\nnamespace App;\n\nclass Other\n{\n    public function prepare() {}\n}\n",
+        )
+        .file(
+            "src/Middle.php",
+            "<?php\nnamespace App;\n\nclass Middle extends Base\n{\n}\n",
+        )
+        .file(
+            "src/Child.php",
+            "<?php\nnamespace App;\n\nclass Child extends Middle\n{\n    public function run()\n    {\n        $this->prepare();\n    }\n}\n",
+        )
+        .write(
+            "src/Middle.php",
+            "<?php\nnamespace App;\n\nclass Middle extends Other\n{\n}\n",
+        )
+        .edge_before("method App::Child::run", "calls", "method App::Base::prepare")
+        .edge_after("method App::Child::run", "calls", "method App::Other::prepare")
+        .no_edge_after("method App::Child::run", "calls", "method App::Base::prepare")
+}
+
+/// Upstream #2142 (W4-PHP-01): a base class's `$this->m()` reaches a
+/// subclass's method, so it leaves a deeper subclass's method once a middle
+/// class between them is rebased in another file.
+pub fn php_base_this_call_leaves_a_deeper_subclass_method_once_a_middle_class_is_rebased() -> Case {
+    Case::new(Change::EditHeritage, &[Language::Php])
+        .file(
+            "src/Entity.php",
+            "<?php\nnamespace App;\n\nabstract class Entity\n{\n    public function parentBook()\n    {\n        return $this->book();\n    }\n}\n",
+        )
+        .file(
+            "src/Other.php",
+            "<?php\nnamespace App;\n\nclass Other\n{\n}\n",
+        )
+        .file(
+            "src/Middle.php",
+            "<?php\nnamespace App;\n\nclass Middle extends Entity\n{\n}\n",
+        )
+        .file(
+            "src/Page.php",
+            "<?php\nnamespace App;\n\nclass Page extends Middle\n{\n    public function book() { return null; }\n}\n",
+        )
+        .write(
+            "src/Middle.php",
+            "<?php\nnamespace App;\n\nclass Middle extends Other\n{\n}\n",
+        )
+        .edge_before("method App::Entity::parentBook", "calls", "method App::Page::book")
+        .no_edge_after("method App::Entity::parentBook", "calls", "method App::Page::book")
+}
+
+/// Upstream #2142 (W4-PHP-01): a parked `$this->m()` resolves once a middle
+/// class in another file comes to extend the method's class.
+pub fn php_this_call_reaches_a_method_once_a_middle_class_extends_its_class() -> Case {
+    Case::new(Change::EditHeritage, &[Language::Php])
+        .file(
+            "src/Base.php",
+            "<?php\nnamespace App;\n\nclass Base\n{\n    public function prepare() {}\n}\n",
+        )
+        .file(
+            "src/Middle.php",
+            "<?php\nnamespace App;\n\nclass Middle\n{\n}\n",
+        )
+        .file(
+            "src/Child.php",
+            "<?php\nnamespace App;\n\nclass Child extends Middle\n{\n    public function run()\n    {\n        $this->prepare();\n    }\n}\n",
+        )
+        .write(
+            "src/Middle.php",
+            "<?php\nnamespace App;\n\nclass Middle extends Base\n{\n}\n",
+        )
+        .edge_after("method App::Child::run", "calls", "method App::Base::prepare")
+}
+
+/// Upstream #2142 (W4-PHP-01): a trait an ancestor `use`s is in the
+/// ancestry, so `$this->m()` follows the trait an ancestor's body switches
+/// to.
+pub fn php_this_call_follows_a_trait_use_change_in_an_ancestor() -> Case {
+    Case::new(Change::EditHeritage, &[Language::Php])
+        .file(
+            "src/Greets.php",
+            "<?php\nnamespace App;\n\ntrait Greets\n{\n    public function hello() {}\n}\n",
+        )
+        .file(
+            "src/Waves.php",
+            "<?php\nnamespace App;\n\ntrait Waves\n{\n    public function hello() {}\n}\n",
+        )
+        .file(
+            "src/Base.php",
+            "<?php\nnamespace App;\n\nclass Base\n{\n    use Greets;\n}\n",
+        )
+        .file(
+            "src/Child.php",
+            "<?php\nnamespace App;\n\nclass Child extends Base\n{\n    public function run()\n    {\n        $this->hello();\n    }\n}\n",
+        )
+        .write(
+            "src/Base.php",
+            "<?php\nnamespace App;\n\nclass Base\n{\n    use Waves;\n}\n",
+        )
+        .edge_before("method App::Child::run", "calls", "method App::Greets::hello")
+        .edge_after("method App::Child::run", "calls", "method App::Waves::hello")
+        .no_edge_after("method App::Child::run", "calls", "method App::Greets::hello")
+}
+
+/// Upstream #2142 (W4-PHP-01): an ancestor's `extends` names a class through
+/// its own file's `use` imports, so `parent::m()` follows an import an
+/// ancestor's file retargets.
+pub fn php_parent_call_follows_an_import_retarget_in_an_ancestor_file() -> Case {
+    Case::new(Change::EditHeritage, &[Language::Php])
+        .file(
+            "src/One/Base.php",
+            "<?php\nnamespace App\\One;\n\nclass Base\n{\n    public function boot() {}\n}\n",
+        )
+        .file(
+            "src/Two/Base.php",
+            "<?php\nnamespace App\\Two;\n\nclass Base\n{\n    public function boot() {}\n}\n",
+        )
+        .file(
+            "src/Middle.php",
+            "<?php\nnamespace App;\n\nuse App\\One\\Base;\n\nclass Middle extends Base\n{\n}\n",
+        )
+        .file(
+            "src/Child.php",
+            "<?php\nnamespace App;\n\nclass Child extends Middle\n{\n    public function boot()\n    {\n        parent::boot();\n    }\n}\n",
+        )
+        .write(
+            "src/Middle.php",
+            "<?php\nnamespace App;\n\nuse App\\Two\\Base;\n\nclass Middle extends Base\n{\n}\n",
+        )
+        .edge_before("method App::Child::boot", "calls", "method App\\One::Base::boot")
+        .edge_after("method App::Child::boot", "calls", "method App\\Two::Base::boot")
+        .no_edge_after("method App::Child::boot", "calls", "method App\\One::Base::boot")
+}
+
+/// Upstream #2142 (W4-PHP-01): past an ancestor outside the repository a
+/// repository trait's method is in reach, so `$this->m()` leaves the trait
+/// once the ancestor's declaration appears.
+pub fn php_this_call_leaves_a_repository_trait_once_the_outside_base_appears() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Php])
+        .file(
+            "src/Testing/InteractsWithTime.php",
+            "<?php\nnamespace Illuminate\\Foundation\\Testing\\Concerns;\n\ntrait InteractsWithTime\n{\n    public function travelTo($date) {}\n}\n",
+        )
+        .file(
+            "tests/QueueTest.php",
+            "<?php\nnamespace Illuminate\\Tests\\Integration;\n\nuse Orchestra\\Testbench\\TestCase;\n\nclass QueueTest extends TestCase\n{\n    public function testDelay()\n    {\n        $this->travelTo('2000-01-02');\n    }\n}\n",
+        )
+        .write(
+            "testbench/TestCase.php",
+            "<?php\nnamespace Orchestra\\Testbench;\n\nclass TestCase\n{\n}\n",
+        )
+        .edge_before(
+            "method Illuminate\\Tests\\Integration::QueueTest::testDelay",
+            "calls",
+            "method Illuminate\\Foundation\\Testing\\Concerns::InteractsWithTime::travelTo",
+        )
+        .no_edge_after(
+            "method Illuminate\\Tests\\Integration::QueueTest::testDelay",
+            "calls",
+            "method Illuminate\\Foundation\\Testing\\Concerns::InteractsWithTime::travelTo",
+        )
+}
+
+/// Upstream #2142 (W4-PHP-01): past an ancestor outside the repository only
+/// a trait's method is in reach, so `$this->m()` leaves the method once its
+/// trait becomes a class.
+pub fn php_this_call_leaves_a_method_once_its_trait_becomes_a_class() -> Case {
+    Case::new(Change::EditHeritage, &[Language::Php])
+        .file(
+            "src/Testing/InteractsWithTime.php",
+            "<?php\nnamespace Illuminate\\Foundation\\Testing\\Concerns;\n\ntrait InteractsWithTime\n{\n    public function travelTo($date) {}\n}\n",
+        )
+        .file(
+            "tests/QueueTest.php",
+            "<?php\nnamespace Illuminate\\Tests\\Integration;\n\nuse Orchestra\\Testbench\\TestCase;\n\nclass QueueTest extends TestCase\n{\n    public function testDelay()\n    {\n        $this->travelTo('2000-01-02');\n    }\n}\n",
+        )
+        .write(
+            "src/Testing/InteractsWithTime.php",
+            "<?php\nnamespace Illuminate\\Foundation\\Testing\\Concerns;\n\nclass InteractsWithTime\n{\n    public function travelTo($date) {}\n}\n",
+        )
+        .edge_before(
+            "method Illuminate\\Tests\\Integration::QueueTest::testDelay",
+            "calls",
+            "method Illuminate\\Foundation\\Testing\\Concerns::InteractsWithTime::travelTo",
+        )
+        .no_edge_after(
+            "method Illuminate\\Tests\\Integration::QueueTest::testDelay",
+            "calls",
+            "method Illuminate\\Foundation\\Testing\\Concerns::InteractsWithTime::travelTo",
+        )
+}
+
+/// Upstream #2142 (W4-PHP-01): the other way, `$this->m()` reaches the
+/// method once its class becomes a trait. The call was parked, so nothing
+/// resolved into the changed file, and the method itself did not change.
+pub fn php_this_call_reaches_a_method_once_its_class_becomes_a_trait() -> Case {
+    Case::new(Change::EditHeritage, &[Language::Php])
+        .file(
+            "src/Testing/InteractsWithTime.php",
+            "<?php\nnamespace Illuminate\\Foundation\\Testing\\Concerns;\n\nclass InteractsWithTime\n{\n    public function travelTo($date) {}\n}\n",
+        )
+        .file(
+            "tests/QueueTest.php",
+            "<?php\nnamespace Illuminate\\Tests\\Integration;\n\nuse Orchestra\\Testbench\\TestCase;\n\nclass QueueTest extends TestCase\n{\n    public function testDelay()\n    {\n        $this->travelTo('2000-01-02');\n    }\n}\n",
+        )
+        .write(
+            "src/Testing/InteractsWithTime.php",
+            "<?php\nnamespace Illuminate\\Foundation\\Testing\\Concerns;\n\ntrait InteractsWithTime\n{\n    public function travelTo($date) {}\n}\n",
+        )
+        .edge_after(
+            "method Illuminate\\Tests\\Integration::QueueTest::testDelay",
+            "calls",
+            "method Illuminate\\Foundation\\Testing\\Concerns::InteractsWithTime::travelTo",
+        )
+}
+
+/// Upstream #2142 (W4-PHP-01): the same rule the other way, through a
+/// removal: once the file declaring an imported base is deleted, the
+/// ancestry leaves the repository and a repository trait's method is in
+/// reach.
+pub fn php_this_call_reaches_a_repository_trait_once_its_imported_base_is_deleted() -> Case {
+    Case::new(Change::DeleteImportedModule, &[Language::Php])
+        .file(
+            "src/Concerns/Travels.php",
+            "<?php\nnamespace App\\Concerns;\n\ntrait Travels\n{\n    public function travel() {}\n}\n",
+        )
+        .file(
+            "src/Base/Middle.php",
+            "<?php\nnamespace App\\Base;\n\nclass Middle\n{\n}\n",
+        )
+        .file(
+            "src/Child.php",
+            "<?php\nnamespace App;\n\nuse App\\Base\\Middle;\n\nclass Child extends Middle\n{\n    public function run()\n    {\n        $this->travel();\n    }\n}\n",
+        )
+        .remove("src/Base/Middle.php")
+        .edge_after(
+            "method App::Child::run",
+            "calls",
+            "method App\\Concerns::Travels::travel",
+        )
+}
+
+/// Upstream #2152 (W4-PHP-01): an untyped receiver keeps the one method of
+/// its name while the class it is named after inherits it, so it leaves the
+/// method when that class's `extends` changes in another file.
+pub fn php_untyped_receiver_leaves_a_method_its_class_stops_inheriting() -> Case {
+    Case::new(Change::EditHeritage, &[Language::Php])
+        .file(
+            "src/Models/Entity.php",
+            "<?php\nnamespace App\\Models;\n\nabstract class Entity\n{\n    public function save(): bool { return true; }\n}\n",
+        )
+        .file(
+            "src/Models/Record.php",
+            "<?php\nnamespace App\\Models;\n\nclass Record\n{\n}\n",
+        )
+        .file(
+            "src/Models/Page.php",
+            "<?php\nnamespace App\\Models;\n\nclass Page extends Entity\n{\n}\n",
+        )
+        .file(
+            "src/Controller.php",
+            "<?php\nnamespace App;\n\nfunction handle($page)\n{\n    $page->save();\n}\n",
+        )
+        .write(
+            "src/Models/Page.php",
+            "<?php\nnamespace App\\Models;\n\nclass Page extends Record\n{\n}\n",
+        )
+        .edge_before("function App::handle", "calls", "method App\\Models::Entity::save")
+        .no_edge_after("function App::handle", "calls", "method App\\Models::Entity::save")
+}
+
+/// Unresolved PHP calls through receivers nothing names a class after, all
+/// written `$nN->save()`: 501 of them share the tail `save`, one past the
+/// name lane's per-tail ceiling.
+static UNTYPED_SAVE_CALLS: LazyLock<String> = LazyLock::new(|| {
+    let mut text = String::from("<?php\nnamespace Noise;\n\nfunction noise()\n{\n");
+    for index in 0..501 {
+        text.push_str(&format!("    $n{index}->save();\n"));
+    }
+    text.push_str("}\n");
+    text
+});
+
+/// Upstream #2152 (W4-PHP-01): an untyped receiver reaches a method its
+/// class's ancestor gains, with no head changing, however many parked calls
+/// share the tail.
+pub fn php_untyped_receiver_reaches_a_method_its_ancestor_gains_past_the_tail_ceiling() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Php])
+        .file(
+            "src/Models/Entity.php",
+            "<?php\nnamespace App\\Models;\n\nabstract class Entity\n{\n    public function load(): void {}\n}\n",
+        )
+        .file(
+            "src/Models/Page.php",
+            "<?php\nnamespace App\\Models;\n\nclass Page extends Entity\n{\n}\n",
+        )
+        .file(
+            "src/Controller.php",
+            "<?php\nnamespace App;\n\nfunction handle($page)\n{\n    $page->save();\n}\n",
+        )
+        .file("noise/Noise.php", UNTYPED_SAVE_CALLS.as_str())
+        .write(
+            "src/Models/Entity.php",
+            "<?php\nnamespace App\\Models;\n\nabstract class Entity\n{\n    public function load(): void {}\n    public function save(): bool { return true; }\n}\n",
+        )
+        .edge_after("function App::handle", "calls", "method App\\Models::Entity::save")
+}
+
+/// Traits `B1` … `B78` used by a trait `B`, the five `S1` … `S5`, and `B77`'s
+/// method `m77`: with `Widget extends S { use B; }` the resolver's 80-type
+/// walk from `Widget` visits `B77` last, until `S` uses the five traits.
+static WIDGET_TRAITS: LazyLock<String> = LazyLock::new(|| {
+    let mut text = String::from("<?php\nnamespace App;\n\n");
+    for index in 1..=78 {
+        if index == 77 {
+            text.push_str("trait B77\n{\n    public function m77() {}\n}\n\n");
+        } else {
+            text.push_str(&format!("trait B{index}\n{{\n}}\n\n"));
+        }
+    }
+    for index in 1..=5 {
+        text.push_str(&format!("trait S{index}\n{{\n}}\n\n"));
+    }
+    let uses: Vec<String> = (1..=78).map(|index| format!("B{index}")).collect();
+    text.push_str(&format!("trait B\n{{\n    use {};\n}}\n", uses.join(", ")));
+    text
+});
+
+/// Upstream #2152 (W4-PHP-01) at the walk limit: a seed whose ancestry grows
+/// pushes another branch of a subclass's ancestry past the resolver's 80
+/// types, so a receiver named after the subclass leaves that branch's method.
+pub fn php_untyped_receiver_leaves_a_method_a_seed_pushes_past_the_walk_limit() -> Case {
+    Case::new(Change::EditHeritage, &[Language::Php])
+        .file("src/Traits.php", WIDGET_TRAITS.as_str())
+        .file("src/S.php", "<?php\nnamespace App;\n\nclass S\n{\n}\n")
+        .file(
+            "src/Widget.php",
+            "<?php\nnamespace App;\n\nclass Widget extends S\n{\n    use B;\n}\n",
+        )
+        .file(
+            "src/Controller.php",
+            "<?php\nnamespace App;\n\nfunction handle($widget)\n{\n    $widget->m77();\n}\n",
+        )
+        .write(
+            "src/S.php",
+            "<?php\nnamespace App;\n\nclass S\n{\n    use S1, S2, S3, S4, S5;\n}\n",
+        )
+        .edge_before("function App::handle", "calls", "method App::B77::m77")
+        .no_edge_after("function App::handle", "calls", "method App::B77::m77")
+}
+
+/// Upstream #2152 (W4-PHP-01): an untyped receiver reaches the method the
+/// class it is named after comes to inherit in another file, however many
+/// parked calls share the tail.
+pub fn php_untyped_receiver_reaches_an_inherited_method_past_the_tail_ceiling() -> Case {
+    Case::new(Change::EditHeritage, &[Language::Php])
+        .file(
+            "src/Models/Entity.php",
+            "<?php\nnamespace App\\Models;\n\nabstract class Entity\n{\n    public function save(): bool { return true; }\n}\n",
+        )
+        .file(
+            "src/Models/Page.php",
+            "<?php\nnamespace App\\Models;\n\nclass Page\n{\n}\n",
+        )
+        .file(
+            "src/Controller.php",
+            "<?php\nnamespace App;\n\nfunction handle($page)\n{\n    $page->save();\n}\n",
+        )
+        .file("noise/Noise.php", UNTYPED_SAVE_CALLS.as_str())
+        .write(
+            "src/Models/Page.php",
+            "<?php\nnamespace App\\Models;\n\nclass Page extends Entity\n{\n}\n",
+        )
+        .edge_after("function App::handle", "calls", "method App\\Models::Entity::save")
+}
+
+// ----- a call through a class name and the heads it reads (W5-07) ------------
+//
+// Upstream #2180 (W3-06): a call through a class name reaches the method the
+// class inherits, walking the supertypes each class's head names, read from
+// source (`class_heads::declared_supertypes`). No sync lane records those
+// heads, so a head changed in one file leaves such a call in an unchanged
+// file at its old target (W5-07 adds the lane).
+
+/// A PHP class head spread over more lines: `extends Base` past the head's
+/// third line, which `declared_supertypes` reads, though within the fifth,
+/// which the `php_heads` rows record. A fresh index no longer walks to `Base`
+/// for `Child::method()` and resolves it by the method's name instead.
+pub fn php_inherited_static_call_follows_a_class_head_spread_past_its_third_line() -> Case {
+    Case::new(Change::EditHeritage, &[Language::Php])
+        .file(
+            "src/Base.php",
+            "<?php\nnamespace App;\n\nclass Base\n{\n    public function method() {}\n}\n",
+        )
+        .file(
+            "src/Child.php",
+            "<?php\nnamespace App;\n\nclass Child extends Base\n{\n}\n",
+        )
+        .file(
+            "src/User.php",
+            "<?php\nnamespace App;\n\nclass User\n{\n    public function run()\n    {\n        Child::method();\n    }\n}\n",
+        )
+        .write(
+            "src/Child.php",
+            "<?php\nnamespace App;\n\nclass Child\n\n\nextends Base\n{\n}\n",
+        )
+        .edge_throughout("method App::User::run", "calls", "method App::Base::method")
+}
+
+/// A Python class's base changed in its own file moves `User.create()` in
+/// an unchanged file to the new base's classmethod.
+pub fn python_inherited_classmethod_follows_a_base_change_in_another_file() -> Case {
+    Case::new(Change::EditHeritage, &[Language::Python])
+        .file(
+            "pkg/base.py",
+            "class Base:\n    @classmethod\n    def create(cls):\n        return cls()\n",
+        )
+        .file(
+            "pkg/other.py",
+            "class Other:\n    @classmethod\n    def create(cls):\n        return cls()\n",
+        )
+        .file(
+            "pkg/user.py",
+            "from pkg.base import Base\nfrom pkg.other import Other\n\n\nclass User(Base):\n    pass\n",
+        )
+        .file(
+            "pkg/service.py",
+            "from pkg.user import User\n\n\ndef make():\n    return User.create()\n",
+        )
+        .write(
+            "pkg/user.py",
+            "from pkg.base import Base\nfrom pkg.other import Other\n\n\nclass User(Other):\n    pass\n",
+        )
+        .edge_before("function make", "calls", "method Base::create")
+        .edge_after("function make", "calls", "method Other::create")
+}
+
+/// The same with the call beside its old target: the unchanged file holds
+/// both `Base.create` and `User.create()`, so the edge to move is a same-file
+/// one.
+pub fn python_inherited_classmethod_follows_a_base_change_beside_its_old_target() -> Case {
+    Case::new(Change::EditHeritage, &[Language::Python])
+        .file(
+            "pkg/service.py",
+            "from pkg.user import User\n\n\nclass Base:\n    @classmethod\n    def create(cls):\n        return cls()\n\n\ndef make():\n    return User.create()\n",
+        )
+        .file(
+            "pkg/other.py",
+            "class Other:\n    @classmethod\n    def create(cls):\n        return cls()\n",
+        )
+        .file(
+            "pkg/user.py",
+            "from pkg.service import Base\nfrom pkg.other import Other\n\n\nclass User(Base):\n    pass\n",
+        )
+        .write(
+            "pkg/user.py",
+            "from pkg.service import Base\nfrom pkg.other import Other\n\n\nclass User(Other):\n    pass\n",
+        )
+        .edge_before("function make", "calls", "method Base::create")
+        .edge_after("function make", "calls", "method Other::create")
+}
+
+/// The same for a Java class's `extends`.
+pub fn java_inherited_static_call_follows_a_base_change_in_another_file() -> Case {
+    Case::new(Change::EditHeritage, &[Language::Java])
+        .file(
+            "src/app/Base.java",
+            "package app;\n\npublic class Base {\n    public static int create() { return 1; }\n}\n",
+        )
+        .file(
+            "src/app/Other.java",
+            "package app;\n\npublic class Other {\n    public static int create() { return 2; }\n}\n",
+        )
+        .file(
+            "src/app/User.java",
+            "package app;\n\npublic class User extends Base {\n}\n",
+        )
+        .file(
+            "src/app/Service.java",
+            "package app;\n\npublic class Service {\n    public int make() {\n        return User.create();\n    }\n}\n",
+        )
+        .write(
+            "src/app/User.java",
+            "package app;\n\npublic class User extends Other {\n}\n",
+        )
+        .edge_before("method app::Service::make", "calls", "method app::Base::create")
+        .edge_after("method app::Service::make", "calls", "method app::Other::create")
+}
+
+/// The same for a C# class's base list.
+pub fn csharp_inherited_static_call_follows_a_base_change_in_another_file() -> Case {
+    Case::new(Change::EditHeritage, &[Language::CSharp])
+        .file(
+            "src/Base.cs",
+            "namespace App;\n\npublic class Base\n{\n    public static int Create() => 1;\n}\n",
+        )
+        .file(
+            "src/Other.cs",
+            "namespace App;\n\npublic class Other\n{\n    public static int Create() => 2;\n}\n",
+        )
+        .file(
+            "src/User.cs",
+            "namespace App;\n\npublic class User : Base\n{\n}\n",
+        )
+        .file(
+            "src/Service.cs",
+            "namespace App;\n\npublic class Service\n{\n    public int Make()\n    {\n        return User.Create();\n    }\n}\n",
+        )
+        .write(
+            "src/User.cs",
+            "namespace App;\n\npublic class User : Other\n{\n}\n",
+        )
+        .edge_before("method App::Service::Make", "calls", "method App::Base::Create")
+        .edge_after("method App::Service::Make", "calls", "method App::Other::Create")
+}
+
+/// The same for a Swift class's superclass.
+pub fn swift_inherited_class_method_follows_a_base_change_in_another_file() -> Case {
+    Case::new(Change::EditHeritage, &[Language::Swift])
+        .file(
+            "src/Base.swift",
+            "class Base {\n    class func create() -> Int { return 1 }\n}\n",
+        )
+        .file(
+            "src/Other.swift",
+            "class Other {\n    class func create() -> Int { return 2 }\n}\n",
+        )
+        .file("src/User.swift", "class User: Base {\n}\n")
+        .file(
+            "src/Service.swift",
+            "func make() -> Int {\n    return User.create()\n}\n",
+        )
+        .write("src/User.swift", "class User: Other {\n}\n")
+        .edge_before("function make", "calls", "method Base::create")
+        .edge_after("function make", "calls", "method Other::create")
+}
+
 /// #897: a Kotlin function's value reference follows the object constant it
 /// reads.
 pub fn kotlin_object_constant_reader_body_edit() -> Case {

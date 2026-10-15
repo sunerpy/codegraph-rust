@@ -52,6 +52,7 @@ mod overloads;
 pub mod package_manifests;
 pub mod path_aliases;
 pub mod pathutil;
+pub mod php_scope;
 pub mod python_globals;
 mod python_values;
 pub mod resolver;

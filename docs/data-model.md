@@ -329,6 +329,16 @@ like the head rows under `go_heads_version` (1); a sync that finds it missing
 or at another version re-resolves every Go file and rebuilds the rows. Neither
 is a canonical surface.
 
+PHP head rows record what a PHP call reads of a file's types: `php_heads:<path>`
+holds the JSON `{"entries": [{"qualified_name", "kind", "supers"}]}`, one entry
+per class, trait, interface and enum, sorted, with the qualified names
+(`App\\Models::Entity`) its `extends` clause and its body's trait `use`s name,
+each read through the file's `namespace` and `use` imports. A file with no type
+has no row. They are written, withdrawn and checked like the head rows under
+`php_heads_version` (1); a sync that finds it missing or at another version
+re-resolves every PHP file and rebuilds the rows. Neither is a canonical
+surface.
+
 The Rust receiver lane stores no rows, only its marker: `rust_receivers_version`
 (1) is written by a full index, a migration and every sync whose resolution is
 persisted, and withdrawn with the others before a sync's first change. A sync

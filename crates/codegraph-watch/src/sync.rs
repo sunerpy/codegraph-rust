@@ -572,6 +572,9 @@ fn sync_paths_with_store(
     // And for the Rust files writing a path receiver whose type came or
     // went: every Rust file is re-resolved once (W4-RS-03).
     let rust_bootstrap = crate::rust_receivers::needs_bootstrap(store)?;
+    // And for the PHP files whose calls walk other files' class heads:
+    // every PHP file is re-resolved once (W4-PHP-01).
+    let php_bootstrap = crate::php_heads::needs_bootstrap(store)?;
 
     let paths = paths.into_iter().collect::<Vec<_>>();
     let total = paths.len();
@@ -632,6 +635,7 @@ fn sync_paths_with_store(
         || objc_bootstrap
         || go_bootstrap
         || rust_bootstrap
+        || php_bootstrap
     {
         note_python_global_readers(
             project_root,
@@ -850,6 +854,36 @@ fn sync_paths_with_store(
             dependent_fallbacks.insert(file.clone());
         }
         changed_names.note_all(go.names.iter().cloned());
+        // And what a PHP call through `$this`, `self`, `static` or `parent`,
+        // or through a receiver named after a class, reads of the ancestry's
+        // heads: `extends` and trait `use`s (W4-PHP-01).
+        let php = crate::php_heads::php_refresh(
+            store,
+            project_root,
+            scope.options.max_file_size,
+            &changed_names.php,
+            &reindexed,
+            &changed_names.removed_files,
+            php_bootstrap,
+        )?;
+        for file in &php.files {
+            dependent_sites.remove(file);
+            dependent_fallbacks.insert(file.clone());
+        }
+        for affected in &php.sites {
+            merge_dependent_site(
+                &mut dependent_sites,
+                &mut dependent_fallbacks,
+                affected.clone(),
+            );
+        }
+        let moved_names: Vec<String> = php.moved_names.iter().cloned().collect();
+        for affected in store.reference_sites_of_edges_to_named_targets(&moved_names)? {
+            if !reindexed.contains(&affected.file_path) {
+                merge_dependent_site(&mut dependent_sites, &mut dependent_fallbacks, affected);
+            }
+        }
+        changed_names.note_all(php.names.iter().cloned());
         // A CamelCase path receiver is an outside type unless the project
         // declares a type, trait or alias of its name (upstream #2177): the
         // unchanged Rust files writing a name that came or went as a
@@ -969,6 +1003,7 @@ fn sync_paths_with_store(
         swift.write_rows(store)?;
         objc.write_rows(store)?;
         go.write_rows(store)?;
+        php.write_rows(store)?;
         crate::module_surfaces::finish_bootstrap(store)?;
         crate::cpp_dependents::write_marker(store)?;
         crate::java_heads::write_marker(store)?;
@@ -982,6 +1017,7 @@ fn sync_paths_with_store(
         crate::objc_heads::write_marker(store)?;
         crate::go_heads::write_marker(store)?;
         crate::rust_receivers::write_marker(store)?;
+        crate::php_heads::write_marker(store)?;
     }
 
     // Orphan sweep (#1187, upstream index.ts:645-682): a full-index resolution
@@ -1404,6 +1440,7 @@ fn remove_tracked_file(
         .note(store, relative, &old_nodes, None)?;
     changed_names.objc.note(store, relative, None)?;
     changed_names.go.note(store, relative, None)?;
+    changed_names.php.note(store, relative, &old_nodes, None)?;
     delete_unresolved_refs_by_file(store, relative)?;
     store.delete_file_record(relative)?;
     changed_names
@@ -1746,6 +1783,19 @@ fn reextract_into_store(
     // (`ChangedNames::note_candidates`). Editing the tail of a file (no line
     // shift for earlier symbols) therefore contributes no names, keeping the
     // re-resolve scope minimal.
+    //
+    // A PHP node whose id changed only because it moved is the exception
+    // (W4-PHP-01): every fact another file's resolution reads of a PHP
+    // declaration is in its node or in the `php_heads` rows, which the PHP
+    // lane compares, so it changes nothing elsewhere. The edges into this file
+    // re-resolve through `reference_sites_dependent_on_file` above, and a
+    // reference in another file reads this file's candidates' positions only
+    // to order them among themselves (`order_candidates`): its id touches its
+    // name only when the order of that name's nodes in this file changed too
+    // (upstream likewise pairs a re-indexed file's old and new nodes by
+    // identity and keeps the edges whose target only moved,
+    // `pairReindexedNodes`). Other languages read declaration text no node
+    // records (a C function's `static`), so their moved nodes still touch.
     let old_nodes = store.nodes_by_file_path(relative)?;
     let old_ids: HashSet<(&str, &str)> = old_nodes
         .iter()
@@ -1756,8 +1806,18 @@ fn reextract_into_store(
         .iter()
         .map(|node| (node.id.as_str(), node.name.as_str()))
         .collect();
+    let order_before = positioned_candidate_keys(&old_nodes);
+    let order_after = positioned_candidate_keys(&result.nodes);
+    let not_only_php: HashSet<&str> = old_nodes
+        .iter()
+        .chain(&result.nodes)
+        .filter(|node| node.language != Language::Php)
+        .map(|node| node.name.as_str())
+        .collect();
     for (_, name) in old_ids.symmetric_difference(&new_ids) {
-        changed_names.any.insert((*name).to_string());
+        if not_only_php.contains(*name) || order_before.get(*name) != order_after.get(*name) {
+            changed_names.any.insert((*name).to_string());
+        }
     }
     changed_names.note_candidates(&old_nodes, &result.nodes);
     // What other files' Java resolution reads of this one's text and
@@ -1816,6 +1876,12 @@ fn reextract_into_store(
     changed_names.go.note(
         store,
         relative,
+        Some((file.language, source, &result.nodes)),
+    )?;
+    changed_names.php.note(
+        store,
+        relative,
+        &old_nodes,
         Some((file.language, source, &result.nodes)),
     )?;
     // No name in another file resolves into a minified script (upstream
@@ -1968,6 +2034,9 @@ struct ChangedNames {
     /// CamelCase path receiver of such a name is the project's or an outside
     /// type by it (W4-RS-03).
     rust_receiver_types: BTreeSet<String>,
+    /// What the changed files held that a PHP call in other files reads:
+    /// class, trait, interface and enum heads (W4-PHP-01).
+    php: crate::php_heads::PhpChanges,
 }
 
 /// What a changed Python file held before the change. A module global's
@@ -2013,6 +2082,7 @@ impl ChangedNames {
             crate::objc_heads::withdraw_marker(store)?;
             crate::go_heads::withdraw_marker(store)?;
             crate::rust_receivers::withdraw_marker(store)?;
+            crate::php_heads::withdraw_marker(store)?;
             self.surface_dirty = true;
         }
         Ok(())
@@ -2112,6 +2182,27 @@ fn declares_csharp_extension_method(source: &str) -> bool {
         }
         before.ends_with('(')
     })
+}
+
+/// Each name's [`candidate_key`]s among `nodes`, in the order of the nodes'
+/// positions: what a ref in another file sees of them, ordered as
+/// `order_candidates` orders one file's candidates.
+fn positioned_candidate_keys(nodes: &[Node]) -> BTreeMap<&str, Vec<String>> {
+    let mut by_name: BTreeMap<&str, Vec<(i64, i64, String)>> = BTreeMap::new();
+    for node in nodes {
+        by_name.entry(node.name.as_str()).or_default().push((
+            node.start_line,
+            node.start_column,
+            candidate_key(node),
+        ));
+    }
+    by_name
+        .into_iter()
+        .map(|(name, mut keyed)| {
+            keyed.sort();
+            (name, keyed.into_iter().map(|(_, _, key)| key).collect())
+        })
+        .collect()
 }
 
 /// A node as a ref in ANOTHER file sees it during resolution: every field but
@@ -3911,6 +4002,157 @@ pub(crate) mod tests {
         sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
         assert_eq!(objc_marker(&db), version);
         assert_eq!(objc_rows(&db), rows);
+        assert_eq!(edge_projection(&db), expected);
+    }
+
+    fn php_marker(db: &Path) -> Option<String> {
+        Store::open(db)
+            .unwrap()
+            .get_project_metadata(crate::php_heads::VERSION_KEY)
+            .unwrap()
+    }
+
+    const PHP_BASE: (&str, &str) = (
+        "src/Base.php",
+        "<?php\nnamespace App;\n\nclass Base\n{\n    public function prepare() {}\n}\n",
+    );
+    const PHP_OTHER: (&str, &str) = (
+        "src/Other.php",
+        "<?php\nnamespace App;\n\nclass Other\n{\n    public function prepare() {}\n}\n",
+    );
+    const PHP_MIDDLE_BASE: (&str, &str) = (
+        "src/Middle.php",
+        "<?php\nnamespace App;\n\nclass Middle extends Base\n{\n}\n",
+    );
+    const PHP_MIDDLE_OTHER: (&str, &str) = (
+        "src/Middle.php",
+        "<?php\nnamespace App;\n\nclass Middle extends Other\n{\n}\n",
+    );
+    const PHP_CHILD: (&str, &str) = (
+        "src/Child.php",
+        "<?php\nnamespace App;\n\nclass Child extends Middle\n{\n    public function run()\n    {\n        $this->prepare();\n    }\n}\n",
+    );
+    const PHP_SPARE: (&str, &str) = (
+        "src/Spare.php",
+        "<?php\nnamespace App;\n\nclass Spare\n{\n}\n",
+    );
+    const PHP_SPARE_EDITED: (&str, &str) = (
+        "src/Spare.php",
+        "<?php\nnamespace App;\n\nclass Spare\n{\n    public function idle() {}\n}\n",
+    );
+
+    /// W4-PHP-01: a sync failing after its mutations leaves the PHP marker
+    /// away, so the next sync, with nothing changed or with an unrelated
+    /// change, re-resolves every PHP file and rebuilds the rows: the
+    /// subclass's `$this->prepare()`, whose ancestry now passes the other
+    /// base, ends where a fresh index puts it.
+    #[test]
+    fn a_php_sync_failing_after_its_mutations_leaves_the_next_one_to_reconcile() {
+        let to_other = |db: &Path| {
+            edge_projection(db).iter().any(|edge| {
+                edge.contains("App::Child::run -[calls]-> src/Other.php:App::Other::prepare")
+            })
+        };
+        for unrelated in [false, true] {
+            let dir = TestDir::new(if unrelated {
+                "php-heads-fail-unrelated"
+            } else {
+                "php-heads-fail"
+            });
+            let db = default_db_path(dir.path()).unwrap();
+            let initial = [PHP_BASE, PHP_OTHER, PHP_MIDDLE_BASE, PHP_CHILD, PHP_SPARE];
+            write_files(dir.path(), &initial);
+            sync_changed_paths(dir.path(), &db, initial.iter().map(|(path, _)| *path)).unwrap();
+            assert_eq!(php_marker(&db), Some(crate::php_heads::VERSION.to_string()));
+            assert!(!to_other(&db), "{:#?}", edge_projection(&db));
+
+            write_files(dir.path(), &[PHP_MIDDLE_OTHER]);
+            FAIL_BEFORE_RESOLUTION.with(|fail| fail.set(true));
+            let failed = sync_changed_paths(dir.path(), &db, [PHP_MIDDLE_OTHER.0]);
+            FAIL_BEFORE_RESOLUTION.with(|fail| fail.set(false));
+            assert!(failed.is_err(), "the injected failure must stop the sync");
+            assert_eq!(
+                php_marker(&db),
+                None,
+                "a failed sync leaves the marker away"
+            );
+
+            let spare = if unrelated {
+                write_files(dir.path(), &[PHP_SPARE_EDITED]);
+                sync_changed_paths(dir.path(), &db, [PHP_SPARE.0]).unwrap();
+                PHP_SPARE_EDITED
+            } else {
+                sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
+                PHP_SPARE
+            };
+            assert_eq!(php_marker(&db), Some(crate::php_heads::VERSION.to_string()));
+            let fresh = [PHP_BASE, PHP_OTHER, PHP_MIDDLE_OTHER, PHP_CHILD, spare];
+            let name = if unrelated {
+                "php-heads-fresh-unrelated"
+            } else {
+                "php-heads-fresh"
+            };
+            assert_eq!(edge_projection(&db), fresh_edges(name, &fresh));
+            assert!(to_other(&db), "{:#?}", edge_projection(&db));
+        }
+    }
+
+    fn php_rows(db: &Path) -> Vec<(String, String)> {
+        Store::open(db)
+            .unwrap()
+            .project_metadata_with_prefix(codegraph_resolve::php_scope::HEAD_ROW_KEY_PREFIX)
+            .unwrap()
+    }
+
+    /// W4-PHP-01: an index whose PHP marker and rows alone are gone (the
+    /// other markers written back) has every PHP file re-resolved and every
+    /// row rebuilt by its next sync, even one with nothing changed: the
+    /// `$this` call an older sync lost comes back.
+    #[test]
+    fn an_index_without_only_the_php_marker_rebuilds_its_rows_with_nothing_changed() {
+        let version = Some(crate::php_heads::VERSION.to_string());
+        let dir = TestDir::new("php-heads-bootstrap");
+        let db = default_db_path(dir.path()).unwrap();
+        let initial = [PHP_BASE, PHP_OTHER, PHP_MIDDLE_BASE, PHP_CHILD, PHP_SPARE];
+        write_files(dir.path(), &initial);
+        sync_changed_paths(dir.path(), &db, initial.iter().map(|(path, _)| *path)).unwrap();
+        assert_eq!(php_marker(&db), version);
+        let rows = php_rows(&db);
+        assert!(
+            rows.iter()
+                .any(|(key, _)| key == "php_heads:src/Middle.php"),
+            "{rows:#?}"
+        );
+        let expected = edge_projection(&db);
+        {
+            let store = Store::open(&db).unwrap();
+            let dropped = store
+                .connection()
+                .execute(
+                    "DELETE FROM edges WHERE kind = 'calls' AND target = (SELECT id FROM nodes \
+                     WHERE qualified_name = 'App::Base::prepare')",
+                    [],
+                )
+                .unwrap();
+            assert_eq!(dropped, 1, "the call edge an older sync lost");
+            store
+                .delete_project_metadata_with_prefix(
+                    codegraph_resolve::php_scope::HEAD_ROW_KEY_PREFIX,
+                )
+                .unwrap();
+            store
+                .delete_project_metadata(crate::php_heads::VERSION_KEY)
+                .unwrap();
+        }
+        assert_ne!(edge_projection(&db), expected);
+        assert_eq!(
+            objc_marker(&db),
+            Some(crate::objc_heads::VERSION.to_string()),
+            "the other markers stay"
+        );
+        sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
+        assert_eq!(php_marker(&db), version);
+        assert_eq!(php_rows(&db), rows);
         assert_eq!(edge_projection(&db), expected);
     }
 
