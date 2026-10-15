@@ -14232,3 +14232,168 @@ mod php {
         );
     }
 }
+
+mod lua {
+    use super::support::{Graph, Project};
+
+    /// `file: qualified_name` of every call edge out of `file`'s nodes, sorted
+    /// (upstream's `callsFrom`).
+    fn calls_from(graph: &Graph, file: &str) -> Vec<String> {
+        let mut out: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|e| e.kind == "calls")
+            .filter(|e| graph.node(&e.source).is_some_and(|n| n.file_path == file))
+            .filter_map(|e| graph.node(&e.target))
+            .map(|n| format!("{}: {}", n.file_path, n.qualified_name))
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// Upstream #2143: a Lua `local` belongs to its chunk, another file can
+    /// never name it; a global function stays reachable. kong's spec helpers'
+    /// `local it = it` took busted's `it(…)` in every other spec file.
+    /// Upstream's fixture.
+    #[test]
+    fn pr2143_a_lua_local_is_invisible_outside_its_file() {
+        let project = Project::new()
+            .file(
+                "spec/helpers.lua",
+                "local it = it\nlocal ipairs = ipairs\nlocal function helper() return 1 end\nfunction global_helper() return 2 end\nreturn {}\n",
+            )
+            .file(
+                "spec/plugin_spec.lua",
+                "describe(\"plugin\", function()\n  it(\"works\", function()\n    for _, v in ipairs({ 1 }) do helper(v) end\n    global_helper()\n  end)\nend)\n",
+            )
+            .index();
+        let graph = project.graph();
+        assert_eq!(
+            calls_from(graph, "spec/plugin_spec.lua"),
+            vec!["spec/helpers.lua: global_helper".to_string()],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream #2202: a bare Lua call reaches neither a table's method nor,
+    /// for a Lua global, a project namesake; a function's own alias of a host
+    /// table's member still reaches the method of the table named after its
+    /// holder. Upstream's fixture.
+    #[test]
+    fn pr2202_a_bare_lua_call_is_luas_global_never_a_tables_method() {
+        let project = Project::new()
+            .file(
+                "lua/app/linked_list.lua",
+                "local LinkedList = {}\n\nfunction LinkedList:ipairs()\n  return function() end\nend\n\nreturn LinkedList\n",
+            )
+            .file(
+                "lua/app/response.lua",
+                "local _RESPONSE = {}\n\nfunction _RESPONSE.error(status)\n  return status\nend\n\nreturn _RESPONSE\n",
+            )
+            .file(
+                "lua/app/request.lua",
+                "local _REQUEST = {}\n\nfunction _REQUEST.get_query()\n  return {}\nend\n\nreturn _REQUEST\n",
+            )
+            .file(
+                "lua/app/handler.lua",
+                "local M = {}\n\nfunction M.run(items)\n  for _, v in ipairs(items) do\n    if not v then\n      error(\"missing\")\n    end\n  end\n  local get_query = kong.request.get_query\n  return get_query()\nend\n\nreturn M\n",
+            )
+            .index();
+        let graph = project.graph();
+        let calls = calls_from(graph, "lua/app/handler.lua");
+        let report = graph.report();
+        assert!(
+            !calls.iter().any(|c| c.ends_with("LinkedList::ipairs")),
+            "{calls:?}\n{report}"
+        );
+        assert!(
+            !calls.iter().any(|c| c.ends_with("_RESPONSE::error")),
+            "{calls:?}\n{report}"
+        );
+        assert!(
+            calls.iter().any(|c| c.ends_with("_REQUEST::get_query")),
+            "{calls:?}\n{report}"
+        );
+    }
+
+    /// Upstream #2202, the method half on its own: a bare call named like no
+    /// Lua global (`render(…)` on a parameter) is no exact match for a
+    /// table's method of its name, here two of them, the nearer beside the
+    /// caller. A lone one is still the last-resort guess (fuzzy, 0.5), as
+    /// upstream's fuzzy matcher has no Lua rule.
+    #[test]
+    fn pr2202_a_bare_lua_call_never_reaches_a_tables_method_of_its_name() {
+        let project = Project::new()
+            .file(
+                "lua/app/component.lua",
+                "local Component = {}\n\nfunction Component:render()\n  return 1\nend\n\nreturn Component\n",
+            )
+            .file(
+                "lib/other/pure.lua",
+                "local PureComponent = {}\n\nfunction PureComponent:render()\n  return 2\nend\n\nreturn PureComponent\n",
+            )
+            .file(
+                "lua/app/forward.lua",
+                "local function forward(render)\n  return render()\nend\n\nreturn forward\n",
+            )
+            .index();
+        let graph = project.graph();
+        assert_eq!(
+            calls_from(graph, "lua/app/forward.lua"),
+            Vec::<String>::new(),
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream #2188: a bare Lua call through a `local` alias reaches what
+    /// the alias names: a module's member, also one the module hands out
+    /// under another name or re-exports from a module of its own; the
+    /// standard library and an outside module are no edge. Upstream's
+    /// fixture.
+    #[test]
+    fn pr2188_a_bare_lua_call_follows_a_local_alias() {
+        let project = Project::new()
+            .file(
+                "kong/tools/string.lua",
+                "local _M = {}\n\nfunction _M.splitn(value)\n  return value\nend\n\nreturn _M\n",
+            )
+            .file(
+                "kong/pdk/phases.lua",
+                "local function check_phase(accepted)\n  return accepted\nend\n\nreturn {\n  check = check_phase,\n}\n",
+            )
+            .file(
+                "kong/handler.lua",
+                "local type = type\nlocal fmt = string.format\nlocal splitn = require(\"kong.tools.string\").splitn\nlocal phase_checker = require \"kong.pdk.phases\"\nlocal check_phase = phase_checker.check\nlocal cjson_encode = require(\"cjson\").encode\n\nlocal function run(v)\n  check_phase(\"access\")\n  if type(v) ~= \"string\" then\n    error(fmt(\"bad %s\", v))\n  end\n  return splitn(v), cjson_encode(v)\nend\n\nreturn { run = run }\n",
+            )
+            .file(
+                "spec/internal/misc.lua",
+                "local function unindent(s)\n  return s\nend\n\nreturn { unindent = unindent }\n",
+            )
+            .file(
+                "spec/helpers.lua",
+                "local misc = require(\"spec.internal.misc\")\n\nreturn {\n  unindent = misc.unindent,\n}\n",
+            )
+            .file(
+                "spec/handler_spec.lua",
+                "local helpers = require \"spec.helpers\"\nlocal unindent = helpers.unindent\n\ndescribe(\"handler\", function()\n  it(\"runs\", function()\n    unindent(\"a\")\n  end)\nend)\n",
+            )
+            .index();
+        let graph = project.graph();
+        let report = graph.report();
+        assert_eq!(
+            calls_from(graph, "kong/handler.lua"),
+            vec![
+                "kong/pdk/phases.lua: check_phase".to_string(),
+                "kong/tools/string.lua: _M::splitn".to_string(),
+            ],
+            "{report}"
+        );
+        assert_eq!(
+            calls_from(graph, "spec/handler_spec.lua"),
+            vec!["spec/internal/misc.lua: unindent".to_string()],
+            "{report}"
+        );
+    }
+}

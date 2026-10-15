@@ -589,6 +589,13 @@ pub trait ResolutionContext {
         Arc::new(crate::php_scope::PhpTables::new())
     }
 
+    /// The Lua module-member memo for the pass (upstream #2188). Contexts that
+    /// live for one resolution pass keep one; the default builds a fresh one
+    /// on each call.
+    fn lua_tables(&self) -> Arc<crate::lua_scope::LuaTables> {
+        Arc::new(crate::lua_scope::LuaTables::new())
+    }
+
     /// The compiled pattern set `build` makes for `key` (a receiver's type
     /// patterns, a PHP property's). A context that resolves one sync's
     /// references in turn keeps the last few, since the same receivers recur

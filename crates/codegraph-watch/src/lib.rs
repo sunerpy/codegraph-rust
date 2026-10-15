@@ -9,6 +9,7 @@ pub mod go_heads;
 pub mod java_heads;
 pub mod kotlin_surfaces;
 mod link_state;
+pub mod lua_modules;
 pub mod member_surfaces;
 mod migrate;
 pub mod module_surfaces;

@@ -193,6 +193,7 @@ struct SnapshotCaches {
     member_tables: OnceLock<Arc<crate::member_types::MemberTables>>,
     ruby_tables: OnceLock<Arc<crate::ruby_scope::RubyTables>>,
     php_tables: OnceLock<Arc<crate::php_scope::PhpTables>>,
+    lua_tables: OnceLock<Arc<crate::lua_scope::LuaTables>>,
     cfml_tables: OnceLock<Arc<crate::cfml_scope::CfmlTables>>,
     swift_tables: OnceLock<Arc<crate::swift_type_visibility::SwiftTables>>,
     objc_tables: OnceLock<Arc<crate::objc_scope::ObjcTables>>,
@@ -221,6 +222,7 @@ impl SnapshotCaches {
             member_tables: OnceLock::new(),
             ruby_tables: OnceLock::new(),
             php_tables: OnceLock::new(),
+            lua_tables: OnceLock::new(),
             cfml_tables: OnceLock::new(),
             swift_tables: OnceLock::new(),
             objc_tables: OnceLock::new(),
@@ -771,6 +773,14 @@ impl ResolutionContext for SnapshotResolutionContext {
             self.caches
                 .php_tables
                 .get_or_init(|| Arc::new(crate::php_scope::PhpTables::new())),
+        )
+    }
+
+    fn lua_tables(&self) -> Arc<crate::lua_scope::LuaTables> {
+        Arc::clone(
+            self.caches
+                .lua_tables
+                .get_or_init(|| Arc::new(crate::lua_scope::LuaTables::new())),
         )
     }
 

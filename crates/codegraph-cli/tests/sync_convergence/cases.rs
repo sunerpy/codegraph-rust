@@ -5295,6 +5295,282 @@ pub fn php_function_called_in_another_case_from_the_global_namespace_reaches_it_
         .edge_after("method App::Page::show", "calls", "function helper")
 }
 
+/// Upstream #2143 (W4-LUA-01): a Lua function another file calls leaves its
+/// callers once it is declared `local`, on the same line, so no node of it
+/// changes.
+pub fn lua_function_made_local_leaves_its_callers_in_another_file() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Lua])
+        .file(
+            "spec/helpers.lua",
+            "function helper()\n  return 1\nend\n\nreturn {}\n",
+        )
+        .file("spec/plugin_spec.lua", "helper()\n")
+        .write(
+            "spec/helpers.lua",
+            "local function helper()\n  return 1\nend\n\nreturn {}\n",
+        )
+        .edge_before("file:spec/plugin_spec.lua", "calls", "function helper")
+        .no_edge_after("file:spec/plugin_spec.lua", "calls", "function helper")
+}
+
+/// The reverse: a `local` function another file calls is reached once it is
+/// made global.
+pub fn lua_local_function_made_global_reaches_its_callers_in_another_file() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Lua])
+        .file(
+            "spec/helpers.lua",
+            "local function helper()\n  return 1\nend\n\nreturn {}\n",
+        )
+        .file("spec/plugin_spec.lua", "helper()\n")
+        .write(
+            "spec/helpers.lua",
+            "function helper()\n  return 1\nend\n\nreturn {}\n",
+        )
+        .edge_after("file:spec/plugin_spec.lua", "calls", "function helper")
+}
+
+/// Upstream #2188 (W4-LUA-01): a call through `local cp = phases.check`
+/// reaches the function the module starts handing out under `check`, though
+/// no node of the module changes.
+pub fn lua_alias_reaches_a_member_its_module_starts_exporting() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Lua])
+        .file(
+            "kong/pdk/phases.lua",
+            "local function check_phase(accepted)\n  return accepted\nend\n\nreturn {\n}\n",
+        )
+        .file(
+            "kong/handler.lua",
+            "local phases = require \"kong.pdk.phases\"\nlocal cp = phases.check\n\nlocal function run()\n  cp(\"access\")\nend\n\nreturn { run = run }\n",
+        )
+        .write(
+            "kong/pdk/phases.lua",
+            "local function check_phase(accepted)\n  return accepted\nend\n\nreturn {\n  check = check_phase,\n}\n",
+        )
+        .edge_after("function run", "calls", "function check_phase")
+}
+
+/// The same two modules away: `helpers` re-exports `misc.unindent`, and
+/// `misc` starts handing out its `undent` under `unindent`.
+pub fn lua_alias_reaches_a_member_re_exported_from_a_module_two_away() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Lua])
+        .file(
+            "spec/internal/misc.lua",
+            "local function undent(s)\n  return s\nend\n\nreturn {}\n",
+        )
+        .file(
+            "spec/helpers.lua",
+            "local misc = require(\"spec.internal.misc\")\n\nreturn {\n  unindent = misc.unindent,\n}\n",
+        )
+        .file(
+            "spec/handler_spec.lua",
+            "local helpers = require \"spec.helpers\"\nlocal unindent = helpers.unindent\n\nunindent(\"a\")\n",
+        )
+        .write(
+            "spec/internal/misc.lua",
+            "local function undent(s)\n  return s\nend\n\nreturn { unindent = undent }\n",
+        )
+        .edge_after("file:spec/handler_spec.lua", "calls", "function undent")
+}
+
+/// A call through an alias of a module that appears later reaches the
+/// module's member (the alias is not named after it).
+pub fn lua_alias_reaches_a_member_of_a_module_that_appears() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Lua])
+        .file(
+            "kong/handler.lua",
+            "local phases = require \"kong.pdk.phases\"\nlocal cp = phases.check\n\nlocal function run()\n  cp(\"access\")\nend\n\nreturn { run = run }\n",
+        )
+        .write(
+            "kong/pdk/phases.lua",
+            "local function check_phase(accepted)\n  return accepted\nend\n\nreturn {\n  check = check_phase,\n}\n",
+        )
+        .edge_after("function run", "calls", "function check_phase")
+}
+
+/// A call through `local snooze = ngx.sleep` reaches the project's own
+/// `function ngx.sleep` once one appears: the alias reads every node named
+/// `sleep`, and the call is named `snooze`.
+pub fn lua_alias_of_a_library_function_reaches_the_patch_that_appears() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Lua])
+        .file(
+            "app/main.lua",
+            "local snooze = ngx.sleep\n\nlocal function run()\n  snooze(1)\nend\n\nreturn { run = run }\n",
+        )
+        .write(
+            "lib/patch.lua",
+            "function ngx.sleep(seconds)\n  return seconds\nend\n",
+        )
+        .edge_after("function run", "calls", "method ngx::sleep")
+}
+
+/// The reverse: the call leaves the patch once a second one appears, since
+/// an alias of a library function names it only while the project has one.
+pub fn lua_alias_of_a_library_function_leaves_the_patch_once_a_second_appears() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Lua])
+        .file(
+            "app/main.lua",
+            "local snooze = ngx.sleep\n\nlocal function run()\n  snooze(1)\nend\n\nreturn { run = run }\n",
+        )
+        .file(
+            "lib/patch.lua",
+            "function ngx.sleep(seconds)\n  return seconds\nend\n",
+        )
+        .write(
+            "lib/other_patch.lua",
+            "function ngx.sleep(seconds)\n  return seconds + 1\nend\n",
+        )
+        .edge_before("function run", "calls", "method ngx::sleep")
+        .no_edge_after("function run", "calls", "method ngx::sleep")
+}
+
+/// The same through a module: `util` hands out `M.snooze = ngx.sleep`, so a
+/// call through `local nap = util.snooze` reaches the patch that appears
+/// though neither file changes, and the caller's own text never names
+/// `sleep`.
+pub fn lua_alias_through_a_module_reaches_the_library_patch_that_appears() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Lua])
+        .file("app/util.lua", "local M = {}\nM.snooze = ngx.sleep\nreturn M\n")
+        .file(
+            "app/main.lua",
+            "local util = require \"app.util\"\nlocal nap = util.snooze\n\nlocal function run()\n  nap(1)\nend\n\nreturn { run = run }\n",
+        )
+        .write(
+            "lib/patch.lua",
+            "function ngx.sleep(seconds)\n  return seconds\nend\n",
+        )
+        .edge_after("function run", "calls", "method ngx::sleep")
+}
+
+/// The same with the module itself edited in that sync, its surface kept:
+/// its callers still reach the patch that appears beside it.
+pub fn lua_alias_through_a_changed_module_reaches_the_library_patch_that_appears() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Lua])
+        .file("app/util.lua", "local M = {}\nM.snooze = ngx.sleep\nreturn M\n")
+        .file(
+            "app/main.lua",
+            "local util = require \"app.util\"\nlocal nap = util.snooze\n\nlocal function run()\n  nap(1)\nend\n\nreturn { run = run }\n",
+        )
+        .write(
+            "app/util.lua",
+            "local M = {}\nM.snooze = ngx.sleep\nM.idle = 1\nreturn M\n",
+        )
+        .write(
+            "lib/patch.lua",
+            "function ngx.sleep(seconds)\n  return seconds\nend\n",
+        )
+        .edge_after("function run", "calls", "method ngx::sleep")
+}
+
+/// A call through `local respond = kong.response.exit` reaches the one
+/// method `exit` of a table named for `response` once it appears.
+pub fn lua_alias_of_a_host_table_member_reaches_the_method_that_appears() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Lua])
+        .file(
+            "app/main.lua",
+            "local respond = kong.response.exit\n\nlocal function run()\n  respond(200)\nend\n\nreturn { run = run }\n",
+        )
+        .write(
+            "kong/pdk/response.lua",
+            "local response = {}\n\nfunction response.exit(status)\n  return status\nend\n\nreturn response\n",
+        )
+        .edge_after("function run", "calls", "method response::exit")
+}
+
+/// A `require` an alias reads through, written with a trailing comment,
+/// spread over lines, or as one target of several: the module starting to
+/// export the member reaches every call, as the resolver reads each one.
+pub fn lua_alias_through_a_commented_spread_or_multi_target_require_reaches_a_new_export() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Lua])
+        .file(
+            "kong/pdk/phases.lua",
+            "local function check_phase(accepted)\n  return accepted\nend\n\nreturn {\n}\n",
+        )
+        .file(
+            "kong/handler.lua",
+            "local p1 = require \"kong.pdk.phases\" -- phases\nlocal p2 = require(\n  \"kong.pdk.phases\"\n)\nlocal n, p3 = 1, require \"kong.pdk.phases\"\nlocal c1 = p1.check\nlocal c2 = p2.check\nlocal c3 = p3.check\n\nlocal function run()\n  c1(\"a\")\n  c2(\"b\")\n  c3(\"c\")\nend\n\nreturn { run = run }\n",
+        )
+        .write(
+            "kong/pdk/phases.lua",
+            "local function check_phase(accepted)\n  return accepted\nend\n\nreturn {\n  check = check_phase,\n}\n",
+        )
+        .edge_after("function run", "calls", "function check_phase")
+}
+
+/// A module two away starts handing out the member while the module in the
+/// middle, which re-exports it, changes in the same sync without its
+/// surface changing: the unchanged caller still reaches the member.
+pub fn lua_alias_reaches_a_new_export_through_a_middle_module_edited_in_the_same_sync() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Lua])
+        .file(
+            "spec/internal/misc.lua",
+            "local function undent(s)\n  return s\nend\n\nreturn {}\n",
+        )
+        .file(
+            "spec/helpers.lua",
+            "local misc = require(\"spec.internal.misc\")\n\nreturn {\n  unindent = misc.unindent,\n}\n",
+        )
+        .file(
+            "spec/handler_spec.lua",
+            "local helpers = require \"spec.helpers\"\nlocal unindent = helpers.unindent\n\nunindent(\"a\")\n",
+        )
+        .write(
+            "spec/internal/misc.lua",
+            "local function undent(s)\n  return s\nend\n\nreturn { unindent = undent }\n",
+        )
+        .write(
+            "spec/helpers.lua",
+            "local misc = require(\"spec.internal.misc\")\n\nreturn {\n  unindent = misc.unindent,\n}\n-- reviewed\n",
+        )
+        .edge_after("file:spec/handler_spec.lua", "calls", "function undent")
+}
+
+/// Of two `local function helper` in one file, the first, which a name in
+/// another file matches first, is made global: that file's call reaches it,
+/// though the file still declares a local `helper`.
+pub fn lua_the_first_of_two_local_namesakes_made_global_reaches_its_callers_in_another_file() -> Case
+{
+    Case::new(Change::BodyEdit, &[Language::Lua])
+        .file(
+            "spec/helpers.lua",
+            "local function helper()\n  return 0\nend\n\nlocal function helper()\n  return 1\nend\n\nreturn {}\n",
+        )
+        .file("spec/plugin_spec.lua", "helper()\n")
+        .write(
+            "spec/helpers.lua",
+            "function helper()\n  return 0\nend\n\nlocal function helper()\n  return 1\nend\n\nreturn {}\n",
+        )
+        .edge_after("file:spec/plugin_spec.lua", "calls", "function helper")
+}
+
+/// A module re-exports the first of two same-named `local` aliases; the two
+/// swap places, so a caller through it reaches the other module's member,
+/// though the module declares the same aliases as before.
+pub fn lua_alias_follows_the_first_of_two_same_named_aliases_after_they_swap() -> Case {
+    Case::new(Change::ReexportEdit, &[Language::Lua])
+        .file(
+            "spec/internal/misc.lua",
+            "local function undent(s)\n  return s\nend\n\nreturn { unindent = undent }\n",
+        )
+        .file(
+            "spec/internal/other.lua",
+            "local function dedent(s)\n  return s\nend\n\nreturn { unindent = dedent }\n",
+        )
+        .file(
+            "spec/helpers.lua",
+            "local unindent = require(\"spec.internal.misc\").unindent\nlocal unindent = require(\"spec.internal.other\").unindent\n\nreturn {}\n",
+        )
+        .file(
+            "spec/handler_spec.lua",
+            "local helpers = require \"spec.helpers\"\nlocal unindent = helpers.unindent\n\nunindent(\"a\")\n",
+        )
+        .write(
+            "spec/helpers.lua",
+            "local unindent = require(\"spec.internal.other\").unindent\nlocal unindent = require(\"spec.internal.misc\").unindent\n\nreturn {}\n",
+        )
+        .edge_before("file:spec/handler_spec.lua", "calls", "function undent")
+        .edge_after("file:spec/handler_spec.lua", "calls", "function dedent")
+}
+
 // ----- a call through a class name and the heads it reads (W5-07) ------------
 //
 // Upstream #2180 (W3-06): a call through a class name reaches the method the

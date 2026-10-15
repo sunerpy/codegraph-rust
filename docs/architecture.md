@@ -451,6 +451,18 @@ however many there are, since a `$this`, `self`, `static` or `parent` call and a
 read an ancestry from the heads' text (where an ancestry below a changed type reaches the
 resolver's 80-type walk limit, every file declaring a type above or below it re-resolves whole);
 the `php_heads_version` marker is withdrawn and restored with the others;
+a Lua file whose module row moved touches the name of each declaration that became or stopped
+being `local`, since a `local` is invisible outside its file, and when the digest of what an
+alias through it reads changed (its functions, its variables and their locality, in source
+order, each name's first export), or it came or went, re-resolves whole every unchanged Lua
+file whose aliases `require` it and the files requiring those, four modules deep, passing
+through the files the sync changed by what they read before the change and after it; an
+unchanged Lua file whose aliases or exports read a touched name through a global table
+(`local snooze = ngx.sleep` reads every node named `sleep`) re-resolves whole and counts as
+such a module, and so does a changed one for the files requiring it; the
+`lua_modules_version` marker is withdrawn and restored with the others, and a sync that finds
+it missing, or a row it cannot read, withdraws it before changing anything and re-resolves
+every Lua file;
 a Rust enum variant that came, went or changed touches its enum's name, since a variant path
 reaches an enum only while it declares the variant; a Rust type, trait or alias name that came, went or changed re-resolves, in every unchanged
 Rust file whose text writes it as a path receiver (`Name::`, `Name.`), the references written

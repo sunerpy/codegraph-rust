@@ -473,6 +473,24 @@ fn incremental_sync_on_outdated_v2_forces_all_files() {
         case_marker(&IndexPaths::resolve(&peer, None).expect("resolve peer v2 paths")),
         "a forced migration must write the case-folded marker of `index --force`"
     );
+    // The Lua module marker (W4-LUA-01), likewise; its rows are
+    // `outdated_migration_writes_the_lua_module_rows_of_index_force`'s.
+    let lua_rows = |paths: &IndexPaths| {
+        Store::open_for_read(paths, deadline(), || false)
+            .expect("readable namespace")
+            .project_metadata_with_prefix("lua_module")
+            .expect("Lua module rows")
+    };
+    assert_eq!(
+        lua_rows(&paths),
+        vec![("lua_modules_version".to_string(), "1".to_string())],
+        "a migration writes the Lua module marker"
+    );
+    assert_eq!(
+        lua_rows(&paths),
+        lua_rows(&IndexPaths::resolve(&peer, None).expect("resolve peer v2 paths")),
+        "a forced migration must write the Lua module marker of `index --force`"
+    );
     // And the C/C++ namespace rows (W4-CPP-07).
     let namespace_rows = |paths: &IndexPaths| {
         Store::open_for_read(paths, deadline(), || false)
@@ -1247,6 +1265,80 @@ fn outdated_migration_writes_the_objc_head_rows_of_index_force() {
         migrated,
         head_rows(&IndexPaths::resolve(&peer, None).expect("resolve peer v2 paths")),
         "a forced migration must write the Objective-C head rows of `index --force`"
+    );
+}
+
+/// W4-LUA-01: a migration writes the Lua module rows (a file's locals, the
+/// modules its aliases `require`, what it reads through a global table and a
+/// digest of what an alias through it reads) and their marker as `index
+/// --force` does.
+#[test]
+fn outdated_migration_writes_the_lua_module_rows_of_index_force() {
+    let dir = TestDir::new("outdated-lua-modules");
+    let project = dir.path().join("mini");
+    for (path, contents) in [
+        (
+            "kong/pdk/phases.lua",
+            "local function check_phase(accepted)\n  return accepted\nend\n\nreturn {\n  check = check_phase,\n}\n",
+        ),
+        (
+            "kong/handler.lua",
+            "local phases = require \"kong.pdk.phases\"\nlocal cp = phases.check\nlocal snooze = ngx.sleep\n\nlocal function run()\n  cp(\"access\")\n  snooze(1)\nend\n\nreturn { run = run }\n",
+        ),
+    ] {
+        let full = project.join(path);
+        fs::create_dir_all(full.parent().unwrap()).expect("create the source directory");
+        fs::write(full, contents).expect("write a source file");
+    }
+    let run = cli(&["init", project.to_str().unwrap()]);
+    assert!(
+        run.ok,
+        "setup: `codegraph init` must succeed (stdout={}, stderr={})",
+        run.stdout, run.stderr
+    );
+    let paths = IndexPaths::resolve(&project, None).expect("resolve v2 paths");
+    stage_state_slot(
+        &paths,
+        100,
+        CURRENT_STORAGE_PROTOCOL,
+        CURRENT_EXTRACTION_VERSION - 1,
+        "current",
+    );
+    let run = cli(&["sync", project.to_str().unwrap()]);
+    assert!(
+        run.ok,
+        "sync must migrate an Outdated namespace: stdout={}, stderr={}",
+        run.stdout, run.stderr
+    );
+    let (_scratch, peer) = fresh_force_peer("outdated-lua-modules", &project);
+    let module_rows = |paths: &IndexPaths| {
+        Store::open_for_read(paths, deadline(), || false)
+            .expect("readable namespace")
+            .project_metadata_with_prefix("lua_module")
+            .expect("Lua module rows")
+    };
+    let migrated = module_rows(&paths);
+    assert_eq!(
+        migrated
+            .iter()
+            .map(|(key, _)| key.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "lua_module:kong/handler.lua",
+            "lua_module:kong/pdk/phases.lua",
+            "lua_modules_version",
+        ],
+        "a migration writes the module rows and their marker: {migrated:?}"
+    );
+    assert!(
+        migrated[0].1.contains("\"kong.pdk.phases\"") && migrated[0].1.contains("\"sleep\""),
+        "a row names the modules its aliases require and what it reads through a \
+         global table: {migrated:?}"
+    );
+    assert_eq!(
+        migrated,
+        module_rows(&IndexPaths::resolve(&peer, None).expect("resolve peer v2 paths")),
+        "a forced migration must write the Lua module rows of `index --force`"
     );
 }
 

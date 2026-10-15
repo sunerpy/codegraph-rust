@@ -70,6 +70,7 @@ struct Caches {
     member_tables: Option<Arc<crate::member_types::MemberTables>>,
     ruby_tables: Option<Arc<crate::ruby_scope::RubyTables>>,
     php_tables: Option<Arc<crate::php_scope::PhpTables>>,
+    lua_tables: Option<Arc<crate::lua_scope::LuaTables>>,
     /// The last few compiled pattern sets, most recent last
     /// ([`ResolutionContext::compiled_patterns`]).
     patterns: std::collections::VecDeque<CompiledPatterns>,
@@ -124,6 +125,7 @@ impl Caches {
             member_tables: None,
             ruby_tables: None,
             php_tables: None,
+            lua_tables: None,
             patterns: std::collections::VecDeque::new(),
             cfml_tables: None,
             swift_tables: None,
@@ -175,6 +177,7 @@ impl<'a> StoreResolutionContext<'a> {
         c.member_tables = None;
         c.ruby_tables = None;
         c.php_tables = None;
+        c.lua_tables = None;
         c.patterns.clear();
         c.cfml_tables = None;
         c.swift_tables = None;
@@ -579,6 +582,15 @@ impl ResolutionContext for StoreResolutionContext<'_> {
                 .borrow_mut()
                 .php_tables
                 .get_or_insert_with(|| Arc::new(crate::php_scope::PhpTables::new())),
+        )
+    }
+
+    fn lua_tables(&self) -> Arc<crate::lua_scope::LuaTables> {
+        Arc::clone(
+            self.caches
+                .borrow_mut()
+                .lua_tables
+                .get_or_insert_with(|| Arc::new(crate::lua_scope::LuaTables::new())),
         )
     }
 

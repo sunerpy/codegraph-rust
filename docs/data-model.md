@@ -339,6 +339,21 @@ has no row. They are written, withdrawn and checked like the head rows under
 re-resolves every PHP file and rebuilds the rows. Neither is a canonical
 surface.
 
+Lua module rows record what a Lua call in another file reads of a Lua file:
+`lua_module:<path>` holds the JSON `{"locals", "reads", "globals", "surface"}`:
+every `local` declaration in source order as `[name, kind, line]`, the modules
+its aliases `require` (read from each variable's initializer, as resolution
+reads it, and from every `local … = …` line), the last member of every dotted
+chain written after an `=` (each shorter chain's too, read in the code and with
+its comments removed), and a digest of its functions and its variables with
+their locality, both in source order, and of the first export of each name with
+the declaration of the local its right side starts from. Every Lua file has a
+row. They are written, withdrawn and checked like the head rows under
+`lua_modules_version` (1); a sync that finds it missing or at another version,
+or a row it cannot read, withdraws the marker before changing anything,
+re-resolves every Lua file and rebuilds the rows, even with nothing changed.
+Neither is a canonical surface.
+
 The Rust receiver lane stores no rows, only its marker: `rust_receivers_version`
 (1) is written by a full index, a migration and every sync whose resolution is
 persisted, and withdrawn with the others before a sync's first change. A sync

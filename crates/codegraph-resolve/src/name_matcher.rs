@@ -472,7 +472,7 @@ pub(crate) fn local_declaration_scope(
 
 /// Whether a Lua declaration is a `local` one, read from its line (upstream
 /// #2143 `isLuaLocal`, which #2193 reads).
-fn is_lua_local(candidate: &Node, context: &dyn ResolutionContext) -> bool {
+pub(crate) fn is_lua_local(candidate: &Node, context: &dyn ResolutionContext) -> bool {
     if !matches!(
         candidate.kind,
         NodeKind::Variable | NodeKind::Constant | NodeKind::Function
@@ -2411,6 +2411,7 @@ pub fn match_by_exact_name(
 ) -> Option<ResolvedRef> {
     let bare_js = is_bare_js_call(reference, context);
     let bare_php = crate::php_scope::is_bare_php_call(reference, context);
+    let lua_bare = crate::lua_scope::is_lua_bare_call(reference);
     // A type, a value or an import the file binds from a package outside the
     // repository names nothing in it, whatever kind of reference it is
     // (upstream #2134).
@@ -2569,6 +2570,9 @@ pub fn match_by_exact_name(
         // A bare PHP call is a function call: nothing else is callable without
         // a receiver (upstream #2103).
         .filter(|n| !(bare_php && n.kind != NodeKind::Function))
+        // Nor is a table's method (`function M.x`, `function M:x`) in Lua,
+        // without its table (upstream #2202).
+        .filter(|n| !(lua_bare && n.kind == NodeKind::Method))
         .filter(|n| {
             go_shape
                 .as_ref()
@@ -7547,6 +7551,26 @@ pub fn match_reference(
     // by any strategy (upstream #2217).
     if let Some(result) = crate::scala_scope::match_scala_symbolic_type(reference, context) {
         return result;
+    }
+
+    // A bare Lua call through a `local` alias reaches what the alias names
+    // (upstream #2188); `ipairs(t)` is Lua's, unless the file defines its own
+    // (upstream #2202: telescope's 122 `for _, v in ipairs(…)` went to a
+    // linked list's `ipairs` method).
+    if crate::lua_scope::is_lua_bare_call(reference) {
+        if let Some(aliased) = crate::lua_scope::lua_alias_target(reference, context) {
+            return aliased;
+        }
+        if crate::lua_scope::LUA_GLOBAL_FUNCTIONS.contains(&reference.reference_name.as_str())
+            && !context
+                .get_nodes_in_file_shared(&reference.file_path)
+                .iter()
+                .any(|node| {
+                    node.name == reference.reference_name && node.kind == NodeKind::Function
+                })
+        {
+            return None;
+        }
     }
 
     // A Scala chain link the extractor records with its last receiver

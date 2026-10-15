@@ -578,6 +578,15 @@ fn sync_paths_with_store(
     // And for the PHP, Pascal and CFML references retried by a name in any
     // case: every file of those languages is re-resolved once (W4-PHP-03).
     let case_bootstrap = crate::case_folded::needs_bootstrap(store)?;
+    // And for the Lua files whose calls read other files' locals and module
+    // exports: every Lua file is re-resolved once (W4-LUA-01). A rebuild for
+    // an unreadable row starts with the marker current, and a sync with
+    // nothing changed never withdraws it: withdraw it before anything
+    // changes, so one stopping partway leaves the next to rebuild again.
+    let lua_bootstrap = crate::lua_modules::needs_bootstrap(store)?;
+    if lua_bootstrap {
+        crate::lua_modules::withdraw_marker(store)?;
+    }
 
     let paths = paths.into_iter().collect::<Vec<_>>();
     let total = paths.len();
@@ -640,6 +649,7 @@ fn sync_paths_with_store(
         || rust_bootstrap
         || php_bootstrap
         || case_bootstrap
+        || lua_bootstrap
     {
         note_python_global_readers(
             project_root,
@@ -888,6 +898,23 @@ fn sync_paths_with_store(
             }
         }
         changed_names.note_all(php.names.iter().cloned());
+        // What a Lua call in an unchanged file read of a changed one: which
+        // names it declares `local`, what its module hands out (W4-LUA-01).
+        let lua = crate::lua_modules::lua_refresh(
+            store,
+            project_root,
+            scope.options.max_file_size,
+            &changed_names.lua,
+            &changed_names.any,
+            &reindexed,
+            &changed_names.removed_files,
+            lua_bootstrap,
+        )?;
+        for file in &lua.files {
+            dependent_sites.remove(file);
+            dependent_fallbacks.insert(file.clone());
+        }
+        changed_names.note_all(lua.names.iter().cloned());
         // A CamelCase path receiver is an outside type unless the project
         // declares a type, trait or alias of its name (upstream #2177): the
         // unchanged Rust files writing a name that came or went as a
@@ -1030,6 +1057,7 @@ fn sync_paths_with_store(
         objc.write_rows(store)?;
         go.write_rows(store)?;
         php.write_rows(store)?;
+        lua.write_rows(store)?;
         crate::module_surfaces::finish_bootstrap(store)?;
         crate::cpp_dependents::write_marker(store)?;
         crate::java_heads::write_marker(store)?;
@@ -1045,6 +1073,7 @@ fn sync_paths_with_store(
         crate::rust_receivers::write_marker(store)?;
         crate::php_heads::write_marker(store)?;
         crate::case_folded::write_marker(store)?;
+        crate::lua_modules::write_marker(store)?;
     }
 
     // Orphan sweep (#1187, upstream index.ts:645-682): a full-index resolution
@@ -1468,6 +1497,7 @@ fn remove_tracked_file(
     changed_names.objc.note(store, relative, None)?;
     changed_names.go.note(store, relative, None)?;
     changed_names.php.note(store, relative, &old_nodes, None)?;
+    changed_names.lua.note(store, relative, None)?;
     delete_unresolved_refs_by_file(store, relative)?;
     store.delete_file_record(relative)?;
     changed_names
@@ -1911,6 +1941,11 @@ fn reextract_into_store(
         &old_nodes,
         Some((file.language, source, &result.nodes)),
     )?;
+    changed_names.lua.note(
+        store,
+        relative,
+        Some((file.language, source, &result.nodes)),
+    )?;
     // No name in another file resolves into a minified script (upstream
     // #2204), and that verdict is read from the script's text: a script that
     // was or is generated can flip it with every node where it was, so all of
@@ -2064,6 +2099,9 @@ struct ChangedNames {
     /// What the changed files held that a PHP call in other files reads:
     /// class, trait, interface and enum heads (W4-PHP-01).
     php: crate::php_heads::PhpChanges,
+    /// What the changed files held that a Lua call in other files reads:
+    /// their locals and module surface (W4-LUA-01).
+    lua: crate::lua_modules::LuaChanges,
 }
 
 /// What a changed Python file held before the change. A module global's
@@ -2111,6 +2149,7 @@ impl ChangedNames {
             crate::rust_receivers::withdraw_marker(store)?;
             crate::php_heads::withdraw_marker(store)?;
             crate::case_folded::withdraw_marker(store)?;
+            crate::lua_modules::withdraw_marker(store)?;
             self.surface_dirty = true;
         }
         Ok(())
@@ -2292,6 +2331,10 @@ pub(crate) mod tests {
     thread_local! {
         /// Fail the next sync after its mutations, before resolution.
         pub(crate) static FAIL_BEFORE_RESOLUTION: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
+        /// Fail the next Lua row rebuild once the old rows are purged and
+        /// one is written back.
+        pub(crate) static FAIL_AFTER_LUA_ROW_PURGE: std::cell::Cell<bool> =
             const { std::cell::Cell::new(false) };
     }
 
@@ -4312,6 +4355,235 @@ pub(crate) mod tests {
         );
         sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
         assert_eq!(case_folded_marker(&db), version);
+        assert_eq!(edge_projection(&db), expected);
+    }
+
+    fn lua_marker(db: &Path) -> Option<String> {
+        Store::open(db)
+            .unwrap()
+            .get_project_metadata(crate::lua_modules::VERSION_KEY)
+            .unwrap()
+    }
+
+    fn lua_rows(db: &Path) -> Vec<(String, String)> {
+        Store::open(db)
+            .unwrap()
+            .project_metadata_with_prefix(codegraph_resolve::lua_scope::MODULE_ROW_KEY_PREFIX)
+            .unwrap()
+    }
+
+    const LUA_PHASES: (&str, &str) = (
+        "kong/pdk/phases.lua",
+        "local function check_phase(accepted)\n  return accepted\nend\n\nreturn {\n}\n",
+    );
+    const LUA_PHASES_EXPORTING: (&str, &str) = (
+        "kong/pdk/phases.lua",
+        "local function check_phase(accepted)\n  return accepted\nend\n\nreturn {\n  check = check_phase,\n}\n",
+    );
+    const LUA_HANDLER: (&str, &str) = (
+        "kong/handler.lua",
+        "local phases = require \"kong.pdk.phases\"\nlocal cp = phases.check\n\nlocal function run()\n  cp(\"access\")\nend\n\nreturn { run = run }\n",
+    );
+    const LUA_SPARE: (&str, &str) = ("kong/spare.lua", "return {}\n");
+    const LUA_SPARE_EDITED: (&str, &str) = ("kong/spare.lua", "local idle = 1\nreturn {}\n");
+
+    /// W4-LUA-01: a sync failing after its mutations leaves the Lua marker
+    /// away, so the next sync, with nothing changed or with an unrelated
+    /// change, re-resolves every Lua file: the call through `local cp =
+    /// phases.check` reaches what the failed sync's module started handing
+    /// out, as a fresh index has it.
+    #[test]
+    fn a_lua_sync_failing_after_its_mutations_leaves_the_next_one_to_reconcile() {
+        let to_check = |db: &Path| {
+            edge_projection(db)
+                .iter()
+                .any(|edge| edge.contains("-[calls]-> kong/pdk/phases.lua:check_phase"))
+        };
+        for unrelated in [false, true] {
+            let dir = TestDir::new(if unrelated {
+                "lua-modules-fail-unrelated"
+            } else {
+                "lua-modules-fail"
+            });
+            let db = default_db_path(dir.path()).unwrap();
+            let initial = [LUA_PHASES, LUA_HANDLER, LUA_SPARE];
+            write_files(dir.path(), &initial);
+            sync_changed_paths(dir.path(), &db, initial.iter().map(|(path, _)| *path)).unwrap();
+            assert_eq!(
+                lua_marker(&db),
+                Some(crate::lua_modules::VERSION.to_string())
+            );
+            assert!(!to_check(&db), "{:#?}", edge_projection(&db));
+
+            write_files(dir.path(), &[LUA_PHASES_EXPORTING]);
+            FAIL_BEFORE_RESOLUTION.with(|fail| fail.set(true));
+            let failed = sync_changed_paths(dir.path(), &db, [LUA_PHASES.0]);
+            FAIL_BEFORE_RESOLUTION.with(|fail| fail.set(false));
+            assert!(failed.is_err(), "the injected failure must stop the sync");
+            assert_eq!(
+                lua_marker(&db),
+                None,
+                "a failed sync leaves the marker away"
+            );
+
+            let spare = if unrelated {
+                write_files(dir.path(), &[LUA_SPARE_EDITED]);
+                sync_changed_paths(dir.path(), &db, [LUA_SPARE.0]).unwrap();
+                LUA_SPARE_EDITED
+            } else {
+                sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
+                LUA_SPARE
+            };
+            assert_eq!(
+                lua_marker(&db),
+                Some(crate::lua_modules::VERSION.to_string())
+            );
+            let fresh = [LUA_PHASES_EXPORTING, LUA_HANDLER, spare];
+            let name = if unrelated {
+                "lua-modules-fresh-unrelated"
+            } else {
+                "lua-modules-fresh"
+            };
+            assert_eq!(edge_projection(&db), fresh_edges(name, &fresh));
+            assert!(to_check(&db), "{:#?}", edge_projection(&db));
+        }
+    }
+
+    /// W4-LUA-01: an index whose Lua marker and rows alone are gone has every
+    /// Lua file re-resolved and every row rebuilt by its next sync, even one
+    /// with nothing changed: the alias call an older sync lost comes back.
+    #[test]
+    fn an_index_without_only_the_lua_marker_rebuilds_its_rows_with_nothing_changed() {
+        let version = Some(crate::lua_modules::VERSION.to_string());
+        let dir = TestDir::new("lua-modules-bootstrap");
+        let db = default_db_path(dir.path()).unwrap();
+        let initial = [LUA_PHASES_EXPORTING, LUA_HANDLER, LUA_SPARE];
+        write_files(dir.path(), &initial);
+        sync_changed_paths(dir.path(), &db, initial.iter().map(|(path, _)| *path)).unwrap();
+        assert_eq!(lua_marker(&db), version);
+        let rows = lua_rows(&db);
+        assert_eq!(rows.len(), 3, "{rows:#?}");
+        let expected = edge_projection(&db);
+        {
+            let store = Store::open(&db).unwrap();
+            let dropped = store
+                .connection()
+                .execute(
+                    "DELETE FROM edges WHERE kind = 'calls' AND target = (SELECT id FROM nodes \
+                     WHERE name = 'check_phase')",
+                    [],
+                )
+                .unwrap();
+            assert_eq!(dropped, 1, "the call edge an older sync lost");
+            store
+                .delete_project_metadata_with_prefix(
+                    codegraph_resolve::lua_scope::MODULE_ROW_KEY_PREFIX,
+                )
+                .unwrap();
+            store
+                .delete_project_metadata(crate::lua_modules::VERSION_KEY)
+                .unwrap();
+        }
+        assert_ne!(edge_projection(&db), expected);
+        assert_eq!(
+            php_marker(&db),
+            Some(crate::php_heads::VERSION.to_string()),
+            "the other markers stay"
+        );
+        sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
+        assert_eq!(lua_marker(&db), version);
+        assert_eq!(lua_rows(&db), rows);
+        assert_eq!(edge_projection(&db), expected);
+    }
+
+    /// W4-LUA-01: an index whose Lua marker is current but one of whose rows
+    /// cannot be read has every Lua file re-resolved and every row rebuilt by
+    /// its next sync, even one with nothing changed.
+    #[test]
+    fn an_index_with_an_unreadable_lua_row_rebuilds_its_rows_with_nothing_changed() {
+        let version = Some(crate::lua_modules::VERSION.to_string());
+        let dir = TestDir::new("lua-modules-unreadable-row");
+        let db = default_db_path(dir.path()).unwrap();
+        let initial = [LUA_PHASES_EXPORTING, LUA_HANDLER, LUA_SPARE];
+        write_files(dir.path(), &initial);
+        sync_changed_paths(dir.path(), &db, initial.iter().map(|(path, _)| *path)).unwrap();
+        assert_eq!(lua_marker(&db), version);
+        let rows = lua_rows(&db);
+        let expected = edge_projection(&db);
+        {
+            let store = Store::open(&db).unwrap();
+            let dropped = store
+                .connection()
+                .execute(
+                    "DELETE FROM edges WHERE kind = 'calls' AND target = (SELECT id FROM nodes \
+                     WHERE name = 'check_phase')",
+                    [],
+                )
+                .unwrap();
+            assert_eq!(dropped, 1, "the call edge an older sync lost");
+            store
+                .set_project_metadata(
+                    &codegraph_resolve::lua_scope::module_row_key(LUA_HANDLER.0),
+                    "{not a row",
+                )
+                .unwrap();
+        }
+        assert_ne!(edge_projection(&db), expected);
+        sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
+        assert_eq!(lua_marker(&db), version);
+        assert_eq!(lua_rows(&db), rows);
+        assert_eq!(edge_projection(&db), expected);
+    }
+
+    /// W4-LUA-01: a rebuild for an unreadable row starts with the Lua marker
+    /// still current and withdraws it before it changes anything, so one
+    /// stopping once the old rows are purged and only one is written back
+    /// leaves the next sync, with nothing changed, to rebuild them all and
+    /// re-resolve every Lua file.
+    #[test]
+    fn a_lua_row_rebuild_stopping_partway_leaves_the_next_sync_to_finish_it() {
+        let version = Some(crate::lua_modules::VERSION.to_string());
+        let dir = TestDir::new("lua-modules-rebuild-partway");
+        let db = default_db_path(dir.path()).unwrap();
+        let initial = [LUA_PHASES_EXPORTING, LUA_HANDLER, LUA_SPARE];
+        write_files(dir.path(), &initial);
+        sync_changed_paths(dir.path(), &db, initial.iter().map(|(path, _)| *path)).unwrap();
+        let rows = lua_rows(&db);
+        assert_eq!(rows.len(), 3, "{rows:#?}");
+        let expected = edge_projection(&db);
+        Store::open(&db)
+            .unwrap()
+            .set_project_metadata(
+                &codegraph_resolve::lua_scope::module_row_key(LUA_HANDLER.0),
+                "{not a row",
+            )
+            .unwrap();
+        FAIL_AFTER_LUA_ROW_PURGE.with(|fail| fail.set(true));
+        let failed = sync_changed_paths(dir.path(), &db, Vec::<&str>::new());
+        FAIL_AFTER_LUA_ROW_PURGE.with(|fail| fail.set(false));
+        assert!(
+            failed.is_err(),
+            "the injected failure must stop the rebuild"
+        );
+        assert_eq!(
+            lua_marker(&db),
+            None,
+            "the rebuild withdrew the marker first"
+        );
+        assert_eq!(lua_rows(&db).len(), 1, "{:#?}", lua_rows(&db));
+        let dropped = Store::open(&db)
+            .unwrap()
+            .connection()
+            .execute(
+                "DELETE FROM edges WHERE kind = 'calls' AND target = (SELECT id FROM nodes \
+                 WHERE name = 'check_phase')",
+                [],
+            )
+            .unwrap();
+        assert_eq!(dropped, 1, "the call edge a later loss takes");
+        sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
+        assert_eq!(lua_marker(&db), version);
+        assert_eq!(lua_rows(&db), rows);
         assert_eq!(edge_projection(&db), expected);
     }
 

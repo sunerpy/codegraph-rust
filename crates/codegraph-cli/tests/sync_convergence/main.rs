@@ -371,6 +371,7 @@ fn run_case(name: &str, case: &Case) {
     let go_rows = support::project_metadata_with_prefix(&fresh.db(), "go_heads");
     // And the PHP head rows and their marker (W4-PHP-01).
     let php_rows = support::project_metadata_with_prefix(&fresh.db(), "php_heads");
+    let lua_rows = support::project_metadata_with_prefix(&fresh.db(), "lua_module");
     for (driver, project) in [("cli", &cli), ("watch", &watch)] {
         let rows = support::project_metadata_with_prefix(&project.db(), "js_module_surface");
         if rows != surface_rows {
@@ -468,6 +469,13 @@ fn run_case(name: &str, case: &Case) {
             divergent.push(format!(
                 "=== {driver} driver: the PHP head rows differ from a fresh index\n\
                  synced: {rows:#?}\nfresh: {php_rows:#?}"
+            ));
+        }
+        let rows = support::project_metadata_with_prefix(&project.db(), "lua_module");
+        if rows != lua_rows {
+            divergent.push(format!(
+                "=== {driver} driver: the Lua module rows differ from a fresh index\n\
+                 synced: {rows:#?}\nfresh: {lua_rows:#?}"
             ));
         }
     }
@@ -919,6 +927,20 @@ matrix! {
     php_function_called_from_the_global_namespace_reaches_it_once_it_appears,
     php_call_in_another_case_reaches_a_function_that_appears,
     pascal_call_in_another_case_reaches_a_function_that_appears,
+    lua_function_made_local_leaves_its_callers_in_another_file,
+    lua_local_function_made_global_reaches_its_callers_in_another_file,
+    lua_alias_reaches_a_member_its_module_starts_exporting,
+    lua_alias_reaches_a_member_re_exported_from_a_module_two_away,
+    lua_alias_reaches_a_member_of_a_module_that_appears,
+    lua_alias_of_a_library_function_reaches_the_patch_that_appears,
+    lua_alias_of_a_library_function_leaves_the_patch_once_a_second_appears,
+    lua_alias_through_a_module_reaches_the_library_patch_that_appears,
+    lua_alias_through_a_changed_module_reaches_the_library_patch_that_appears,
+    lua_alias_of_a_host_table_member_reaches_the_method_that_appears,
+    lua_alias_through_a_commented_spread_or_multi_target_require_reaches_a_new_export,
+    lua_alias_reaches_a_new_export_through_a_middle_module_edited_in_the_same_sync,
+    lua_the_first_of_two_local_namesakes_made_global_reaches_its_callers_in_another_file,
+    lua_alias_follows_the_first_of_two_same_named_aliases_after_they_swap,
     php_call_in_another_case_leaves_a_function_once_a_namesake_in_another_case_appears,
     php_function_called_in_another_case_from_the_global_namespace_reaches_it_once_it_appears,
     #[ignore = "W5-07: a call through a class name reads its supertypes from the class heads, which no sync lane records"]

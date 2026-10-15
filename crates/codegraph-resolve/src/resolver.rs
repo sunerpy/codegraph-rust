@@ -1252,6 +1252,18 @@ fn target_is_visible_across_files(
     {
         return false;
     }
+    // A Lua `local` belongs to its chunk: kong's spec helpers' `local it = it`
+    // took busted's `it(…)` in every other spec file. Its module can still
+    // hand it out (`return { check = check_phase }`) to a file that names it
+    // through a `require` alias (upstream #2143, #2188).
+    if crate::lua_scope::is_lua(target.language)
+        && crate::name_matcher::is_lua_local(target, context)
+    {
+        return crate::lua_scope::is_lua_bare_call(reference)
+            && crate::lua_scope::lua_alias_target(reference, context)
+                .flatten()
+                .is_some_and(|aliased| aliased.target_node_id == target.id);
+    }
     // A bare PHP class name is its namespace's class, or the one a `use`
     // names (upstream #2235).
     if !crate::php_scope::is_php_class_visible(target, reference, context) {

@@ -3746,7 +3746,7 @@ fn resolve_rust_module_file(
 
 /// Lua / Luau `require("a.b.c")` dotted module path → module file. Ports
 /// `resolveLuaRequire`.
-fn resolve_lua_require(
+pub(crate) fn resolve_lua_require(
     reference: &RefView,
     context: &dyn ResolutionContext,
 ) -> Option<ResolvedRef> {
