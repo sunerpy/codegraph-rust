@@ -451,6 +451,12 @@ however many there are, since a `$this`, `self`, `static` or `parent` call and a
 read an ancestry from the heads' text (where an ancestry below a changed type reaches the
 resolver's 80-type walk limit, every file declaring a type above or below it re-resolves whole);
 the `php_heads_version` marker is withdrawn and restored with the others;
+a touched name also retries every parked PHP, Pascal and CFML reference whose name equals it in
+ASCII lowercase and re-resolves at its site every edge from those languages to a node whose
+lowercased name equals it, since their names ignore case and a namesake in another case coming
+or going changes the one candidate a case-insensitive match keeps; those retries live in the
+sync's memory, so the `case_folded_names_version` marker is withdrawn and restored with the
+others, and a sync that finds it missing re-resolves every PHP, Pascal and CFML file;
 a Lua file whose module row moved touches the name of each declaration that became or stopped
 being `local`, since a `local` is invisible outside its file, and when the digest of what an
 alias through it reads changed (its functions, its variables and their locality, in source

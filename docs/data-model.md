@@ -354,6 +354,12 @@ or a row it cannot read, withdraws the marker before changing anything,
 re-resolves every Lua file and rebuilds the rows, even with nothing changed.
 Neither is a canonical surface.
 
+The case-folded lane stores no rows, only its marker:
+`case_folded_names_version` (1) is written by a full index, a migration and
+every sync whose resolution is persisted, and withdrawn with the others before
+a sync's first change. A sync that finds it missing or at another version
+re-resolves every PHP, Pascal and CFML file. It is not a canonical surface.
+
 The Rust receiver lane stores no rows, only its marker: `rust_receivers_version`
 (1) is written by a full index, a migration and every sync whose resolution is
 persisted, and withdrawn with the others before a sync's first change. A sync
