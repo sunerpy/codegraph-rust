@@ -1252,6 +1252,16 @@ fn target_is_visible_across_files(
     {
         return false;
     }
+    // An R test file runs in an environment of its own (testthat): its
+    // top-level `c <- ggplot(…)` is not what the package's 2,843 `c(…)` calls
+    // mean, nor another test's. The `helper-*.R` and `setup-*.R` files are
+    // sourced for every test, so theirs are shared (upstream #2144).
+    if target.language == Language::R
+        && matches!(target.kind, NodeKind::Variable | NodeKind::Constant)
+        && crate::r_scope::is_r_test_environment(&target.file_path)
+    {
+        return false;
+    }
     // A Lua `local` belongs to its chunk: kong's spec helpers' `local it = it`
     // took busted's `it(…)` in every other spec file. Its module can still
     // hand it out (`return { check = check_phase }`) to a file that names it
@@ -2422,14 +2432,18 @@ impl ReferenceResolver {
         }
 
         // Strategy 3: name matching (index.ts:723-726), with the name
-        // matcher's self vetoes (upstream #2221, #2223, #2229) and the JS/TS
-        // function-local shadow (#2226).
+        // matcher's self vetoes (upstream #2221, #2223, #2229), the JS/TS
+        // function-local shadow (#2226) and R's data bindings (#2239).
         // A call reaches the overload its arguments fit (upstream #2212,
         // #2213, #2238, #2241), before the test-suite rule judges the target.
         let name_result = crate::name_matcher::veto_c_method_target(
-            crate::name_matcher::veto_js_local_shadow(
-                crate::name_matcher::veto_self_target(
-                    self.gate_language(match_reference(reference, context), reference, context),
+            crate::r_scope::veto_r_data_binding(
+                crate::name_matcher::veto_js_local_shadow(
+                    crate::name_matcher::veto_self_target(
+                        self.gate_language(match_reference(reference, context), reference, context),
+                        reference,
+                        context,
+                    ),
                     reference,
                     context,
                 ),

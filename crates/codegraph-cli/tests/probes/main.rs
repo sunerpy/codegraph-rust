@@ -14397,3 +14397,133 @@ mod lua {
         );
     }
 }
+
+mod r {
+    use super::support::{Graph, Project};
+
+    /// `name@file` of every call edge out of `file`'s nodes, sorted
+    /// (upstream's fixture helper).
+    fn targets(graph: &Graph, file: &str) -> Vec<String> {
+        let mut out: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|e| e.kind == "calls")
+            .filter(|e| graph.node(&e.source).is_some_and(|n| n.file_path == file))
+            .filter_map(|e| graph.node(&e.target))
+            .map(|n| format!("{}@{}", n.name, n.file_path))
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// Upstream #2144: testthat runs each test file in an environment of its
+    /// own, so a variable one test assigns is invisible to the package and to
+    /// other tests; a `helper-*.R` (or `setup-*.R`) file is sourced for every
+    /// test and stays shared, and a package function a factory makes stays
+    /// callable. Upstream's fixture, plus a second test file calling a name
+    /// the first assigns at its top level.
+    #[test]
+    fn pr2144_an_r_test_files_top_level_variables_stay_in_that_file() {
+        let project = Project::new()
+            .file("DESCRIPTION", "Package: demo\n")
+            .file(
+                "R/geom-point.R",
+                "geom_point <- make_constructor(GeomPoint)\ntable_of <- function() {\n  c(\"a\", \"b\")\n}\n",
+            )
+            .file(
+                "tests/testthat/helper-s3.R",
+                "quux <- structure(list(), class = \"quux\")\n",
+            )
+            .file(
+                "tests/testthat/setup-data.R",
+                "rows <- data.frame(x = 1)\n",
+            )
+            .file(
+                "tests/testthat/test-scales.R",
+                "c <- ggplot(df, aes(x, y))\nfixture <- data.frame(y = 2)\ntest_that(\"works\", {\n  geom_point()\n  quux()\n})\n",
+            )
+            .file(
+                "tests/testthat/test-other.R",
+                "test_that(\"other\", {\n  fixture()\n  rows()\n})\n",
+            )
+            .index();
+        let graph = project.graph();
+        let report = graph.report();
+        assert_eq!(
+            targets(graph, "R/geom-point.R"),
+            Vec::<String>::new(),
+            "{report}"
+        );
+        assert_eq!(
+            targets(graph, "tests/testthat/test-scales.R"),
+            vec![
+                "geom_point@R/geom-point.R".to_string(),
+                "quux@tests/testthat/helper-s3.R".to_string(),
+            ],
+            "{report}"
+        );
+        assert_eq!(
+            targets(graph, "tests/testthat/test-other.R"),
+            vec!["rows@tests/testthat/setup-data.R".to_string()],
+            "{report}"
+        );
+    }
+
+    /// Upstream #2239: R looks a call's name up among functions only, so a
+    /// data binding that shadows a base function (`c <- data_frame(b = 3)`)
+    /// is never what `c(1, 2)` calls; a project binding a factory makes
+    /// (`geom_point <- make_constructor(…)`) stays. Upstream's fixture.
+    #[test]
+    fn pr2239_an_r_call_skips_a_data_binding_shadowing_a_base_function() {
+        let project = Project::new()
+            .file("DESCRIPTION", "Package: ggplot2\n")
+            .file(
+                "R/geom-point.R",
+                "geom_point <- make_constructor(GeomPoint, position = \"identity\")\n",
+            )
+            .file(
+                "tests/testthat/test-facet-wrap.R",
+                "a <- data_frame(a = 1:3)\nc <- data_frame(b = 3)\n\ntest_that(\"facets\", {\n  p <- geom_point()\n  expect_equal(c(1, 2), a$a)\n})\n",
+            )
+            .index();
+        let graph = project.graph();
+        let report = graph.report();
+        let names: Vec<String> = targets(graph, "tests/testthat/test-facet-wrap.R")
+            .into_iter()
+            .map(|t| t.split('@').next().unwrap_or_default().to_string())
+            .collect();
+        assert!(!names.contains(&"c".to_string()), "{names:?}\n{report}");
+        assert!(
+            names.contains(&"geom_point".to_string()),
+            "{names:?}\n{report}"
+        );
+    }
+
+    /// Upstream #2177, the R part: a plain call is a function call, never an
+    /// object's method: base R's `range(x)` is no ggproto Coord's `range`.
+    /// Upstream's fixture.
+    #[test]
+    fn pr2177_a_bare_r_call_is_a_function_not_an_objects_method() {
+        let project = Project::new()
+            .file(
+                "R/coord.R",
+                "Coord <- ggproto(\"Coord\",\n  range = function(panel_params) {\n    list(x = panel_params$x$dimension())\n  }\n)\n\nscale_limits <- function(x) {\n  range(x)\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        let calls: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|e| e.kind == "calls")
+            .filter(|e| {
+                graph
+                    .node(&e.source)
+                    .is_some_and(|n| n.file_path == "R/coord.R")
+            })
+            .filter_map(|e| graph.node(&e.target))
+            .map(|n| n.qualified_name.clone())
+            .filter(|q| q.ends_with("range"))
+            .collect();
+        assert_eq!(calls, Vec::<String>::new(), "{}", graph.report());
+    }
+}

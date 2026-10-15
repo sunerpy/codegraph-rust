@@ -587,6 +587,10 @@ fn sync_paths_with_store(
     if lua_bootstrap {
         crate::lua_modules::withdraw_marker(store)?;
     }
+    // And for the R calls of a base function's name whose binding's line a
+    // failed sync may have changed: every R file is re-resolved once
+    // (W4-R-01).
+    let r_bootstrap = crate::r_bindings::needs_bootstrap(store)?;
 
     let paths = paths.into_iter().collect::<Vec<_>>();
     let total = paths.len();
@@ -650,6 +654,7 @@ fn sync_paths_with_store(
         || php_bootstrap
         || case_bootstrap
         || lua_bootstrap
+        || r_bootstrap
     {
         note_python_global_readers(
             project_root,
@@ -927,6 +932,14 @@ fn sync_paths_with_store(
             &reindexed,
             &changed_names.removed_files,
         )?;
+        if r_bootstrap {
+            for file in
+                crate::r_bindings::every_r_file(store, &reindexed, &changed_names.removed_files)?
+            {
+                dependent_sites.remove(&file);
+                dependent_fallbacks.insert(file);
+            }
+        }
         if case_bootstrap {
             for file in crate::case_folded::every_case_insensitive_file(
                 store,
@@ -1074,6 +1087,7 @@ fn sync_paths_with_store(
         crate::php_heads::write_marker(store)?;
         crate::case_folded::write_marker(store)?;
         crate::lua_modules::write_marker(store)?;
+        crate::r_bindings::write_marker(store)?;
     }
 
     // Orphan sweep (#1187, upstream index.ts:645-682): a full-index resolution
@@ -1946,6 +1960,15 @@ fn reextract_into_store(
         relative,
         Some((file.language, source, &result.nodes)),
     )?;
+    // An R call of a base function's name skips a data binding of it unless
+    // the binding's line holds a function (upstream #2239), and that line is
+    // read from source, which no node records: a changed R file touches the
+    // names it binds that way, before the change and after it (W4-R-01).
+    changed_names.note_all(
+        codegraph_resolve::r_scope::r_base_bindings(&old_nodes)
+            .chain(codegraph_resolve::r_scope::r_base_bindings(&result.nodes))
+            .collect::<Vec<_>>(),
+    );
     // No name in another file resolves into a minified script (upstream
     // #2204), and that verdict is read from the script's text: a script that
     // was or is generated can flip it with every node where it was, so all of
@@ -2150,6 +2173,7 @@ impl ChangedNames {
             crate::php_heads::withdraw_marker(store)?;
             crate::case_folded::withdraw_marker(store)?;
             crate::lua_modules::withdraw_marker(store)?;
+            crate::r_bindings::withdraw_marker(store)?;
             self.surface_dirty = true;
         }
         Ok(())
@@ -4584,6 +4608,110 @@ pub(crate) mod tests {
         sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
         assert_eq!(lua_marker(&db), version);
         assert_eq!(lua_rows(&db), rows);
+        assert_eq!(edge_projection(&db), expected);
+    }
+
+    fn r_marker(db: &Path) -> Option<String> {
+        Store::open(db)
+            .unwrap()
+            .get_project_metadata(crate::r_bindings::VERSION_KEY)
+            .unwrap()
+    }
+
+    const R_DATA: (&str, &str) = ("R/data.R", "c <- list(f = 1)\n");
+    const R_DATA_FUNCTION: (&str, &str) = ("R/data.R", "c <- list(f = function(x) x)\n");
+    const R_USE: (&str, &str) = ("R/use.R", "use <- function() {\n  c(1, 2)\n}\n");
+    const R_SPARE: (&str, &str) = ("R/spare.R", "spare <- function() 1\n");
+    const R_SPARE_EDITED: (&str, &str) = ("R/spare.R", "spare <- function() 2\n");
+
+    /// W4-R-01: a sync failing after it wrote `c <- list(f = function(x)
+    /// x)`, before resolving, leaves the next sync, with nothing changed or
+    /// with an unrelated change, to bring the call in another file to `c`, as
+    /// a fresh index has it: no node of `c` changed, and its line is what
+    /// the data-binding rule reads (upstream #2239).
+    #[test]
+    fn an_r_sync_failing_after_its_mutations_leaves_the_next_one_to_reconcile() {
+        let to_c = |db: &Path| {
+            edge_projection(db)
+                .iter()
+                .any(|edge| edge.contains("-[calls]-> R/data.R:c"))
+        };
+        for unrelated in [false, true] {
+            let dir = TestDir::new(if unrelated {
+                "r-bindings-fail-unrelated"
+            } else {
+                "r-bindings-fail"
+            });
+            let db = default_db_path(dir.path()).unwrap();
+            let initial = [R_DATA, R_USE, R_SPARE];
+            write_files(dir.path(), &initial);
+            sync_changed_paths(dir.path(), &db, initial.iter().map(|(path, _)| *path)).unwrap();
+            assert_eq!(r_marker(&db), Some(crate::r_bindings::VERSION.to_string()));
+            assert!(!to_c(&db), "{:#?}", edge_projection(&db));
+
+            write_files(dir.path(), &[R_DATA_FUNCTION]);
+            FAIL_BEFORE_RESOLUTION.with(|fail| fail.set(true));
+            let failed = sync_changed_paths(dir.path(), &db, [R_DATA.0]);
+            FAIL_BEFORE_RESOLUTION.with(|fail| fail.set(false));
+            assert!(failed.is_err(), "the injected failure must stop the sync");
+            assert_eq!(r_marker(&db), None, "a failed sync leaves the marker away");
+
+            let spare = if unrelated {
+                write_files(dir.path(), &[R_SPARE_EDITED]);
+                sync_changed_paths(dir.path(), &db, [R_SPARE.0]).unwrap();
+                R_SPARE_EDITED
+            } else {
+                sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
+                R_SPARE
+            };
+            let fresh = [R_DATA_FUNCTION, R_USE, spare];
+            let name = if unrelated {
+                "r-bindings-fresh-unrelated"
+            } else {
+                "r-bindings-fresh"
+            };
+            assert_eq!(edge_projection(&db), fresh_edges(name, &fresh));
+            assert!(to_c(&db), "{:#?}", edge_projection(&db));
+            assert_eq!(r_marker(&db), Some(crate::r_bindings::VERSION.to_string()));
+        }
+    }
+
+    /// W4-R-01: an index whose R marker alone is gone has every R file
+    /// re-resolved by its next sync, even one with nothing changed: the call
+    /// an older sync lost comes back.
+    #[test]
+    fn an_index_without_only_the_r_marker_re_resolves_with_nothing_changed() {
+        let version = Some(crate::r_bindings::VERSION.to_string());
+        let dir = TestDir::new("r-bindings-bootstrap");
+        let db = default_db_path(dir.path()).unwrap();
+        let initial = [R_DATA_FUNCTION, R_USE, R_SPARE];
+        write_files(dir.path(), &initial);
+        sync_changed_paths(dir.path(), &db, initial.iter().map(|(path, _)| *path)).unwrap();
+        assert_eq!(r_marker(&db), version);
+        let expected = edge_projection(&db);
+        {
+            let store = Store::open(&db).unwrap();
+            let dropped = store
+                .connection()
+                .execute(
+                    "DELETE FROM edges WHERE kind = 'calls' AND target = (SELECT id FROM nodes \
+                     WHERE name = 'c')",
+                    [],
+                )
+                .unwrap();
+            assert_eq!(dropped, 1, "the call edge an older sync lost");
+            store
+                .delete_project_metadata(crate::r_bindings::VERSION_KEY)
+                .unwrap();
+        }
+        assert_ne!(edge_projection(&db), expected);
+        assert_eq!(
+            lua_marker(&db),
+            Some(crate::lua_modules::VERSION.to_string()),
+            "the other markers stay"
+        );
+        sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
+        assert_eq!(r_marker(&db), version);
         assert_eq!(edge_projection(&db), expected);
     }
 

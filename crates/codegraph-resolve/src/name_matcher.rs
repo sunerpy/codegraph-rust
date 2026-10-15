@@ -2485,6 +2485,9 @@ pub fn match_by_exact_name(
     // winner afterwards — is what lets a legitimate supertype OUTRANK a
     // same-named enum member instead of the whole reference being dropped.
     let bare_go = is_bare_go_call(reference, context);
+    // A plain R call is a function call, never an object's method (upstream
+    // #2177).
+    let bare_r = crate::r_scope::is_bare_r_call(reference, context);
     // A Python call's shape at its column decides what it can mean (upstream
     // #2125): a bare call no method, a chained one a member of its last link.
     let python_shape = crate::python_values::python_call_shape(reference, context);
@@ -2566,7 +2569,7 @@ pub fn match_by_exact_name(
         // method (#1714, #1857), nor a property, field or enum case (upstream
         // #2120: mocha's global `it(…)` bound an interface's `it` property). A
         // bare Rust call cannot reach a method (P15 R1).
-        .filter(|n| !((bare_js || bare_go) && is_type_member_kind(n.kind)))
+        .filter(|n| !((bare_js || bare_go || bare_r) && is_type_member_kind(n.kind)))
         // A bare PHP call is a function call: nothing else is callable without
         // a receiver (upstream #2103).
         .filter(|n| !(bare_php && n.kind != NodeKind::Function))
@@ -6560,10 +6563,13 @@ pub fn match_fuzzy(reference: &RefView, context: &dyn ResolutionContext) -> Opti
     let go_shape = crate::go_calls::go_call_shape(reference, context);
     let rust_scoped = crate::rust_scope::is_rust_bare_identifier(reference);
     let php_self = crate::php_scope::php_self_scope(reference, context);
+    let bare_r = crate::r_scope::is_bare_r_call(reference, context);
     let callable_candidates = apply_language_gate(
         candidates
             .into_iter()
             .filter(|n| callable_kinds.contains(&n.kind))
+            // A plain R call is no object's method (upstream #2177).
+            .filter(|n| !(bare_r && n.kind == NodeKind::Method))
             // C call syntax in Objective-C is no message, and a message to
             // `self` or `super` stays in the sender's hierarchy (upstream
             // #2150, #2179).

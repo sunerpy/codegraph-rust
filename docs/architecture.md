@@ -457,6 +457,11 @@ lowercased name equals it, since their names ignore case and a namesake in anoth
 or going changes the one candidate a case-insensitive match keeps; those retries live in the
 sync's memory, so the `case_folded_names_version` marker is withdrawn and restored with the
 others, and a sync that finds it missing re-resolves every PHP, Pascal and CFML file;
+a changed R file touches each name of a base function it binds as a variable or constant, before
+the change and after it, since whether such a binding is what a call of its name means is read
+from its line, which no node records (`c <- list(f = function(x) x)`, upstream #2239); the
+`r_base_bindings_version` marker is withdrawn and restored with the others, and a sync that
+finds it missing re-resolves every R file;
 a Lua file whose module row moved touches the name of each declaration that became or stopped
 being `local`, since a `local` is invisible outside its file, and when the digest of what an
 alias through it reads changed (its functions, its variables and their locality, in source

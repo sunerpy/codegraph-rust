@@ -941,6 +941,11 @@ matrix! {
     lua_alias_reaches_a_new_export_through_a_middle_module_edited_in_the_same_sync,
     lua_the_first_of_two_local_namesakes_made_global_reaches_its_callers_in_another_file,
     lua_alias_follows_the_first_of_two_same_named_aliases_after_they_swap,
+    r_test_file_variable_stays_out_of_another_test_that_calls_its_name,
+    r_test_variable_moved_to_a_helper_reaches_the_other_tests,
+    r_base_named_binding_whose_line_gains_a_function_reaches_its_callers,
+    r_base_named_binding_whose_line_loses_its_function_leaves_its_callers,
+    r_bare_call_stays_off_an_objects_method_that_appears,
     php_call_in_another_case_leaves_a_function_once_a_namesake_in_another_case_appears,
     php_function_called_in_another_case_from_the_global_namespace_reaches_it_once_it_appears,
     #[ignore = "W5-07: a call through a class name reads its supertypes from the class heads, which no sync lane records"]

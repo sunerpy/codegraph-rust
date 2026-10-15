@@ -254,6 +254,7 @@ pub(crate) fn migrate_project(
     crate::php_heads::write_marker(rebuild.store())?;
     crate::case_folded::write_marker(rebuild.store())?;
     crate::lua_modules::write_marker(rebuild.store())?;
+    crate::r_bindings::write_marker(rebuild.store())?;
 
     // ALL nodes are persisted before ANY edge, because `insert_edges` drops edges
     // whose endpoints are absent. The WAL valve folds the log back during the

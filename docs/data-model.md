@@ -360,6 +360,12 @@ every sync whose resolution is persisted, and withdrawn with the others before
 a sync's first change. A sync that finds it missing or at another version
 re-resolves every PHP, Pascal and CFML file. It is not a canonical surface.
 
+The R base-binding lane stores no rows, only its marker:
+`r_base_bindings_version` (1) is written by a full index, a migration and every
+sync whose resolution is persisted, and withdrawn with the others before a
+sync's first change. A sync that finds it missing or at another version
+re-resolves every R file. It is not a canonical surface.
+
 The Rust receiver lane stores no rows, only its marker: `rust_receivers_version`
 (1) is written by a full index, a migration and every sync whose resolution is
 persisted, and withdrawn with the others before a sync's first change. A sync

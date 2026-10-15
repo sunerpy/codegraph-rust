@@ -5571,6 +5571,86 @@ pub fn lua_alias_follows_the_first_of_two_same_named_aliases_after_they_swap() -
         .edge_after("file:spec/handler_spec.lua", "calls", "function dedent")
 }
 
+/// Upstream #2144 (W4-R-01): a variable a test file assigns at its top
+/// level stays out of another test's call of its name when it appears.
+pub fn r_test_file_variable_stays_out_of_another_test_that_calls_its_name() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::R])
+        .file("DESCRIPTION", "Package: demo\n")
+        .file(
+            "tests/testthat/test-other.R",
+            "test_that(\"other\", {\n  fixture()\n})\n",
+        )
+        .write(
+            "tests/testthat/test-scales.R",
+            "fixture <- data.frame(y = 2)\ntest_that(\"works\", {\n  expect_true(TRUE)\n})\n",
+        )
+        .no_edge_after(
+            "file:tests/testthat/test-other.R",
+            "calls",
+            "variable fixture",
+        )
+}
+
+/// The same variable, its file renamed to a `helper-*.R` every test
+/// sources: the other test's call reaches it.
+pub fn r_test_variable_moved_to_a_helper_reaches_the_other_tests() -> Case {
+    Case::new(Change::RenameSymbol, &[Language::R])
+        .file("DESCRIPTION", "Package: demo\n")
+        .file(
+            "tests/testthat/test-data.R",
+            "fixture <- data.frame(y = 2)\n",
+        )
+        .file(
+            "tests/testthat/test-other.R",
+            "test_that(\"other\", {\n  fixture()\n})\n",
+        )
+        .rename("tests/testthat/test-data.R", "tests/testthat/helper-data.R")
+        .edge_after(
+            "file:tests/testthat/test-other.R",
+            "calls",
+            "variable fixture",
+        )
+}
+
+/// Upstream #2239 (W4-R-01): a binding named like a base function is what a
+/// call of the name means only while its line holds a function; the line
+/// gaining one (`c <- list(f = function(x) x)`, still the same variable)
+/// brings the call in another file to it.
+pub fn r_base_named_binding_whose_line_gains_a_function_reaches_its_callers() -> Case {
+    Case::new(Change::BodyEdit, &[Language::R])
+        .file("DESCRIPTION", "Package: demo\n")
+        .file("R/data.R", "c <- list(f = 1)\n")
+        .file("R/use.R", "use <- function() {\n  c(1, 2)\n}\n")
+        .write("R/data.R", "c <- list(f = function(x) x)\n")
+        .edge_after("function use", "calls", "variable c")
+}
+
+/// The reverse: the line losing its function takes the call off it.
+pub fn r_base_named_binding_whose_line_loses_its_function_leaves_its_callers() -> Case {
+    Case::new(Change::BodyEdit, &[Language::R])
+        .file("DESCRIPTION", "Package: demo\n")
+        .file("R/data.R", "c <- list(f = function(x) x)\n")
+        .file("R/use.R", "use <- function() {\n  c(1, 2)\n}\n")
+        .write("R/data.R", "c <- list(f = 1)\n")
+        .edge_before("function use", "calls", "variable c")
+        .no_edge_after("function use", "calls", "variable c")
+}
+
+/// Upstream #2177, the R part (W4-R-01): a plain call stays off an object's
+/// method of its name when one appears.
+pub fn r_bare_call_stays_off_an_objects_method_that_appears() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::R])
+        .file(
+            "R/scale.R",
+            "scale_limits <- function(x) {\n  range(x)\n}\n",
+        )
+        .write(
+            "R/coord.R",
+            "Coord <- ggproto(\"Coord\",\n  range = function(panel_params) {\n    list(x = panel_params$x$dimension())\n  }\n)\n",
+        )
+        .no_edge_after("function scale_limits", "calls", "method Coord::range")
+}
+
 // ----- a call through a class name and the heads it reads (W5-07) ------------
 //
 // Upstream #2180 (W3-06): a call through a class name reaches the method the

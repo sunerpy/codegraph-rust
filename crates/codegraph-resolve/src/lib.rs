@@ -56,6 +56,7 @@ pub mod pathutil;
 pub mod php_scope;
 pub mod python_globals;
 mod python_values;
+pub mod r_scope;
 pub mod resolver;
 pub mod ruby_scope;
 mod rust_lexical;

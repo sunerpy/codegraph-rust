@@ -473,6 +473,23 @@ fn incremental_sync_on_outdated_v2_forces_all_files() {
         case_marker(&IndexPaths::resolve(&peer, None).expect("resolve peer v2 paths")),
         "a forced migration must write the case-folded marker of `index --force`"
     );
+    // The R base-binding marker (W4-R-01), likewise.
+    let r_marker = |paths: &IndexPaths| {
+        Store::open_for_read(paths, deadline(), || false)
+            .expect("readable namespace")
+            .project_metadata_with_prefix("r_base_bindings")
+            .expect("R base-binding marker")
+    };
+    assert_eq!(
+        r_marker(&paths),
+        vec![("r_base_bindings_version".to_string(), "1".to_string())],
+        "a migration writes the R base-binding marker"
+    );
+    assert_eq!(
+        r_marker(&paths),
+        r_marker(&IndexPaths::resolve(&peer, None).expect("resolve peer v2 paths")),
+        "a forced migration must write the R base-binding marker of `index --force`"
+    );
     // The Lua module marker (W4-LUA-01), likewise; its rows are
     // `outdated_migration_writes_the_lua_module_rows_of_index_force`'s.
     let lua_rows = |paths: &IndexPaths| {
