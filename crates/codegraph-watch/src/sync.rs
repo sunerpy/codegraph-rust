@@ -575,6 +575,9 @@ fn sync_paths_with_store(
     // And for the PHP files whose calls walk other files' class heads:
     // every PHP file is re-resolved once (W4-PHP-01).
     let php_bootstrap = crate::php_heads::needs_bootstrap(store)?;
+    // And for the PHP, Pascal and CFML references retried by a name in any
+    // case: every file of those languages is re-resolved once (W4-PHP-03).
+    let case_bootstrap = crate::case_folded::needs_bootstrap(store)?;
 
     let paths = paths.into_iter().collect::<Vec<_>>();
     let total = paths.len();
@@ -636,6 +639,7 @@ fn sync_paths_with_store(
         || go_bootstrap
         || rust_bootstrap
         || php_bootstrap
+        || case_bootstrap
     {
         note_python_global_readers(
             project_root,
@@ -896,6 +900,16 @@ fn sync_paths_with_store(
             &reindexed,
             &changed_names.removed_files,
         )?;
+        if case_bootstrap {
+            for file in crate::case_folded::every_case_insensitive_file(
+                store,
+                &reindexed,
+                &changed_names.removed_files,
+            )? {
+                dependent_sites.remove(&file);
+                dependent_fallbacks.insert(file);
+            }
+        }
         if rust_bootstrap {
             for file in crate::rust_receivers::every_rust_file(
                 store,
@@ -924,6 +938,18 @@ fn sync_paths_with_store(
         }
         let name_list: Vec<String> = changed_names.any.iter().cloned().collect();
         for affected in store.reference_sites_of_edges_to_named_targets(&name_list)? {
+            if !reindexed.contains(&affected.file_path) {
+                merge_dependent_site(&mut dependent_sites, &mut dependent_fallbacks, affected);
+            }
+        }
+        // A PHP, Pascal or CFML reference reaches a target by its name in any
+        // case (upstream #2141's pre-filter, then the case-insensitive match),
+        // so a touched name moves the edges to its namesakes in other cases
+        // too, in either file (W4-PHP-03).
+        for affected in store.reference_sites_of_edges_to_folded_targets(
+            &codegraph_resolve::CASE_INSENSITIVE_LANGUAGES,
+            &name_list,
+        )? {
             if !reindexed.contains(&affected.file_path) {
                 merge_dependent_site(&mut dependent_sites, &mut dependent_fallbacks, affected);
             }
@@ -1018,6 +1044,7 @@ fn sync_paths_with_store(
         crate::go_heads::write_marker(store)?;
         crate::rust_receivers::write_marker(store)?;
         crate::php_heads::write_marker(store)?;
+        crate::case_folded::write_marker(store)?;
     }
 
     // Orphan sweep (#1187, upstream index.ts:645-682): a full-index resolution
@@ -2083,6 +2110,7 @@ impl ChangedNames {
             crate::go_heads::withdraw_marker(store)?;
             crate::rust_receivers::withdraw_marker(store)?;
             crate::php_heads::withdraw_marker(store)?;
+            crate::case_folded::withdraw_marker(store)?;
             self.surface_dirty = true;
         }
         Ok(())
@@ -4153,6 +4181,137 @@ pub(crate) mod tests {
         sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
         assert_eq!(php_marker(&db), version);
         assert_eq!(php_rows(&db), rows);
+        assert_eq!(edge_projection(&db), expected);
+    }
+
+    fn case_folded_marker(db: &Path) -> Option<String> {
+        Store::open(db)
+            .unwrap()
+            .get_project_metadata(crate::case_folded::VERSION_KEY)
+            .unwrap()
+    }
+
+    const PAS_VIEW: (&str, &str) = (
+        "View.pas",
+        "unit View;\ninterface\nfunction Render: Integer;\nimplementation\nfunction Render: Integer;\nbegin\n  Result := formatprice(10);\nend;\nend.\n",
+    );
+    const PAS_PRICES: (&str, &str) = (
+        "Prices.pas",
+        "unit Prices;\ninterface\nimplementation\nfunction FormatPrice(Amount: Integer): Integer;\nbegin\n  Result := Amount;\nend;\nend.\n",
+    );
+    const PAS_SPARE: (&str, &str) = (
+        "Spare.pas",
+        "unit Spare;\ninterface\nimplementation\nend.\n",
+    );
+    const PAS_SPARE_EDITED: (&str, &str) = (
+        "Spare.pas",
+        "unit Spare;\ninterface\nimplementation\nprocedure Idle;\nbegin\nend;\nend.\n",
+    );
+
+    /// W4-PHP-03: a sync failing after its mutations leaves the case-folded
+    /// marker away, so the next sync, with nothing changed or with an
+    /// unrelated change, re-resolves every PHP, Pascal and CFML file: the
+    /// Pascal `formatprice(10)` reaches the `FormatPrice` the failed sync
+    /// indexed, as a fresh index has it.
+    #[test]
+    fn a_case_folded_sync_failing_after_its_mutations_leaves_the_next_one_to_reconcile() {
+        let to_price = |db: &Path| {
+            edge_projection(db)
+                .iter()
+                .any(|edge| edge.contains("-[calls]-> Prices.pas:FormatPrice"))
+        };
+        for unrelated in [false, true] {
+            let dir = TestDir::new(if unrelated {
+                "case-folded-fail-unrelated"
+            } else {
+                "case-folded-fail"
+            });
+            let db = default_db_path(dir.path()).unwrap();
+            let initial = [PAS_VIEW, PAS_SPARE];
+            write_files(dir.path(), &initial);
+            sync_changed_paths(dir.path(), &db, initial.iter().map(|(path, _)| *path)).unwrap();
+            assert_eq!(
+                case_folded_marker(&db),
+                Some(crate::case_folded::VERSION.to_string())
+            );
+            assert!(!to_price(&db), "{:#?}", edge_projection(&db));
+
+            write_files(dir.path(), &[PAS_PRICES]);
+            FAIL_BEFORE_RESOLUTION.with(|fail| fail.set(true));
+            let failed = sync_changed_paths(dir.path(), &db, [PAS_PRICES.0]);
+            FAIL_BEFORE_RESOLUTION.with(|fail| fail.set(false));
+            assert!(failed.is_err(), "the injected failure must stop the sync");
+            assert_eq!(
+                case_folded_marker(&db),
+                None,
+                "a failed sync leaves the marker away"
+            );
+
+            let spare = if unrelated {
+                write_files(dir.path(), &[PAS_SPARE_EDITED]);
+                sync_changed_paths(dir.path(), &db, [PAS_SPARE.0]).unwrap();
+                PAS_SPARE_EDITED
+            } else {
+                sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
+                PAS_SPARE
+            };
+            assert_eq!(
+                case_folded_marker(&db),
+                Some(crate::case_folded::VERSION.to_string())
+            );
+            let fresh = [PAS_VIEW, PAS_PRICES, spare];
+            let name = if unrelated {
+                "case-folded-fresh-unrelated"
+            } else {
+                "case-folded-fresh"
+            };
+            assert_eq!(edge_projection(&db), fresh_edges(name, &fresh));
+            assert!(to_price(&db), "{:#?}", edge_projection(&db));
+        }
+    }
+
+    /// W4-PHP-03: an index whose case-folded marker alone is gone has every
+    /// PHP, Pascal and CFML file re-resolved by its next sync, even one with
+    /// nothing changed: the case-folded call an older sync lost comes back.
+    #[test]
+    fn an_index_without_only_the_case_folded_marker_re_resolves_with_nothing_changed() {
+        let version = Some(crate::case_folded::VERSION.to_string());
+        let dir = TestDir::new("case-folded-bootstrap");
+        let db = default_db_path(dir.path()).unwrap();
+        let initial = [PAS_VIEW, PAS_PRICES, PAS_SPARE];
+        write_files(dir.path(), &initial);
+        sync_changed_paths(dir.path(), &db, initial.iter().map(|(path, _)| *path)).unwrap();
+        assert_eq!(case_folded_marker(&db), version);
+        let expected = edge_projection(&db);
+        assert!(
+            expected
+                .iter()
+                .any(|edge| edge.contains("-[calls]-> Prices.pas:FormatPrice")),
+            "{expected:#?}"
+        );
+        {
+            let store = Store::open(&db).unwrap();
+            let dropped = store
+                .connection()
+                .execute(
+                    "DELETE FROM edges WHERE kind = 'calls' AND target = (SELECT id FROM nodes \
+                     WHERE name = 'FormatPrice')",
+                    [],
+                )
+                .unwrap();
+            assert_eq!(dropped, 1, "the call edge an older sync lost");
+            store
+                .delete_project_metadata(crate::case_folded::VERSION_KEY)
+                .unwrap();
+        }
+        assert_ne!(edge_projection(&db), expected);
+        assert_eq!(
+            php_marker(&db),
+            Some(crate::php_heads::VERSION.to_string()),
+            "the other markers stay"
+        );
+        sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
+        assert_eq!(case_folded_marker(&db), version);
         assert_eq!(edge_projection(&db), expected);
     }
 

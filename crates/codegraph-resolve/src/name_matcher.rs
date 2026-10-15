@@ -1575,8 +1575,12 @@ fn is_unnamed_test_double(
 /// Languages whose identifiers resolve regardless of case (upstream
 /// `CASE_INSENSITIVE_LANGUAGES`: PHP, Pascal/Delphi, CFML; COBOL is not
 /// extracted, and VB.NET joins with its extractor).
+pub const CASE_INSENSITIVE_LANGUAGES: [Language; 3] =
+    [Language::Php, Language::Pascal, Language::Cfml];
+
+/// Whether `language` is one of [`CASE_INSENSITIVE_LANGUAGES`].
 pub(crate) fn is_case_insensitive_language(language: Language) -> bool {
-    matches!(language, Language::Php | Language::Pascal | Language::Cfml)
+    CASE_INSENSITIVE_LANGUAGES.contains(&language)
 }
 
 /// What only exists inside a type, reachable through a receiver alone

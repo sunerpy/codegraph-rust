@@ -1,3 +1,4 @@
+pub mod case_folded;
 pub mod cfml_heads;
 pub mod cpp_dependents;
 pub mod cpp_namespace_rows;

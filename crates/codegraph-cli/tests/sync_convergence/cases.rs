@@ -5230,6 +5230,71 @@ pub fn php_function_called_from_the_global_namespace_reaches_it_once_it_appears(
         .edge_after("method App::Page::show", "calls", "function helper")
 }
 
+/// Upstream #2141 (a) (W4-PHP-03): `formatprice(10)` links `FormatPrice`
+/// once a file declares it, as PHP names functions in any case.
+pub fn php_call_in_another_case_reaches_a_function_that_appears() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Php])
+        .file(
+            "src/view.php",
+            "<?php\nfunction render() { return formatprice(10); }\n",
+        )
+        .write(
+            "src/helpers.php",
+            "<?php\nfunction FormatPrice($amount) { return $amount; }\n",
+        )
+        .edge_after("function render", "calls", "function FormatPrice")
+}
+
+/// The same for Pascal (W4-PHP-03): `formatprice(10)` links `FormatPrice`
+/// once a unit declares it once.
+pub fn pascal_call_in_another_case_reaches_a_function_that_appears() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Pascal])
+        .file(
+            "View.pas",
+            "unit View;\ninterface\nfunction Render: Integer;\nimplementation\nfunction Render: Integer;\nbegin\n  Result := formatprice(10);\nend;\nend.\n",
+        )
+        .write(
+            "Prices.pas",
+            "unit Prices;\ninterface\nimplementation\nfunction FormatPrice(Amount: Integer): Integer;\nbegin\n  Result := Amount;\nend;\nend.\n",
+        )
+        .edge_after("file:View.pas", "calls", "function FormatPrice")
+}
+
+/// The same call leaves `FormatPrice` once a method named `formatPrice`
+/// appears elsewhere: the name now matches two nodes in some case, and the
+/// last-resort match takes only a single one.
+pub fn php_call_in_another_case_leaves_a_function_once_a_namesake_in_another_case_appears() -> Case
+{
+    Case::new(Change::AddCompetitor, &[Language::Php])
+        .file(
+            "src/helpers.php",
+            "<?php\nfunction FormatPrice($amount) { return $amount; }\n",
+        )
+        .file(
+            "src/view.php",
+            "<?php\nfunction render() { return formatprice(10); }\n",
+        )
+        .write(
+            "src/Money.php",
+            "<?php\nclass Money\n{\n    public function formatPrice() { return 0; }\n}\n",
+        )
+        .edge_before("function render", "calls", "function FormatPrice")
+        .no_edge_after("function render", "calls", "function FormatPrice")
+}
+
+/// W4-PHP-02's rooted form in another case (W4-PHP-03): `\HELPER()` links
+/// `helper` once a file declares it.
+pub fn php_function_called_in_another_case_from_the_global_namespace_reaches_it_once_it_appears()
+-> Case {
+    Case::new(Change::AddCompetitor, &[Language::Php])
+        .file(
+            "app/Page.php",
+            "<?php\nnamespace App;\n\nclass Page\n{\n    public function show()\n    {\n        return \\HELPER();\n    }\n}\n",
+        )
+        .write("app/helpers.php", "<?php\nfunction helper() { return 1; }\n")
+        .edge_after("method App::Page::show", "calls", "function helper")
+}
+
 // ----- a call through a class name and the heads it reads (W5-07) ------------
 //
 // Upstream #2180 (W3-06): a call through a class name reaches the method the

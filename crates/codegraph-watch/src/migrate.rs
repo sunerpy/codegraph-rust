@@ -246,6 +246,7 @@ pub(crate) fn migrate_project(
     crate::go_heads::write_marker(rebuild.store())?;
     crate::rust_receivers::write_marker(rebuild.store())?;
     crate::php_heads::write_marker(rebuild.store())?;
+    crate::case_folded::write_marker(rebuild.store())?;
 
     // ALL nodes are persisted before ANY edge, because `insert_edges` drops edges
     // whose endpoints are absent. The WAL valve folds the log back during the

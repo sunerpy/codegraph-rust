@@ -456,6 +456,23 @@ fn incremental_sync_on_outdated_v2_forces_all_files() {
         cpp_marker(&IndexPaths::resolve(&peer, None).expect("resolve peer v2 paths")),
         "a forced migration must write the C/C++ marker of `index --force`"
     );
+    // The case-folded retries' marker (W4-PHP-03), likewise.
+    let case_marker = |paths: &IndexPaths| {
+        Store::open_for_read(paths, deadline(), || false)
+            .expect("readable namespace")
+            .project_metadata_with_prefix("case_folded_names")
+            .expect("case-folded marker")
+    };
+    assert_eq!(
+        case_marker(&paths),
+        vec![("case_folded_names_version".to_string(), "1".to_string())],
+        "a migration writes the case-folded marker"
+    );
+    assert_eq!(
+        case_marker(&paths),
+        case_marker(&IndexPaths::resolve(&peer, None).expect("resolve peer v2 paths")),
+        "a forced migration must write the case-folded marker of `index --force`"
+    );
     // And the C/C++ namespace rows (W4-CPP-07).
     let namespace_rows = |paths: &IndexPaths| {
         Store::open_for_read(paths, deadline(), || false)

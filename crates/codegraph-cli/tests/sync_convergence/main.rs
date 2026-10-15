@@ -917,6 +917,10 @@ matrix! {
     php_qualified_static_call_reaches_a_class_that_appears_past_the_tail_ceiling,
     php_qualified_static_call_reaches_a_method_its_class_gains_past_the_tail_ceiling,
     php_function_called_from_the_global_namespace_reaches_it_once_it_appears,
+    php_call_in_another_case_reaches_a_function_that_appears,
+    pascal_call_in_another_case_reaches_a_function_that_appears,
+    php_call_in_another_case_leaves_a_function_once_a_namesake_in_another_case_appears,
+    php_function_called_in_another_case_from_the_global_namespace_reaches_it_once_it_appears,
     #[ignore = "W5-07: a call through a class name reads its supertypes from the class heads, which no sync lane records"]
     php_inherited_static_call_follows_a_class_head_spread_past_its_third_line,
     #[ignore = "W5-07: a call through a class name reads its supertypes from the class heads, which no sync lane records"]

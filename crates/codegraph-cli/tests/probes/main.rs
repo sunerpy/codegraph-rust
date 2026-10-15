@@ -13993,6 +13993,31 @@ mod php {
         );
     }
 
+    /// Upstream #2141 (a): PHP names functions in any case, so a call written
+    /// in another case than its function (`formatprice(10)` for
+    /// `FormatPrice`) passes the name pre-filter and reaches it. Upstream's
+    /// fixture.
+    #[test]
+    fn pr2141_a_php_call_in_another_case_reaches_its_function() {
+        let project = Project::new()
+            .file(
+                "src/helpers.php",
+                "<?php\nfunction FormatPrice($amount) { return $amount; }\n",
+            )
+            .file(
+                "src/view.php",
+                "<?php\nfunction render() { return formatprice(10); }\n",
+            )
+            .index();
+        let graph = project.graph();
+        assert_eq!(
+            edges_from(graph, "src/view.php"),
+            vec!["render calls FormatPrice".to_string()],
+            "{}",
+            graph.report()
+        );
+    }
+
     /// Upstream #2235: an unqualified PHP class name is the current
     /// namespace's class or the one a `use` imports; PHP never falls back to
     /// another namespace for classes. koel's `extends Request` all went to the

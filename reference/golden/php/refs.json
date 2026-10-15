@@ -51,16 +51,6 @@
   },
   {
     "candidates": null,
-    "col": 23,
-    "file_path": "src/Controller.php",
-    "from_node_id": "method:d7e53b91aba4c60a50c0023d3ae0b6fa",
-    "language": "php",
-    "line": 24,
-    "reference_kind": "calls",
-    "reference_name": "formatprice"
-  },
-  {
-    "candidates": null,
     "col": 29,
     "file_path": "tests/ControllerTest.php",
     "from_node_id": "class:82ee0565e7bb3f0efd92d1ef50aa4660",

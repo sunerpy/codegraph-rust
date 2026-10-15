@@ -1360,6 +1360,9 @@ pub struct ReferenceResolver {
     /// Distinct symbol names known to the graph, for the fast pre-filter
     /// (`knownNames`, `index.ts:224`). Populated by `warm_caches`.
     known_names: Option<BTreeSet<String>>,
+    /// `known_names` lowercased, built the first time a language whose names
+    /// ignore case asks (upstream #2141 `knownLowerNames`).
+    known_lower_names: std::sync::OnceLock<BTreeSet<String>>,
     /// Per-file directive summaries and per-root macro timelines for C/C++
     /// translation-unit macro visibility (#1838), filled on demand by the
     /// parallel resolver and cleared with the other resolution caches. Every
@@ -1399,6 +1402,7 @@ impl ReferenceResolver {
             max_file_size: codegraph_core::config::DEFAULT_MAX_FILE_SIZE,
             framework_resolver_extensions: Vec::new(),
             known_names: None,
+            known_lower_names: std::sync::OnceLock::new(),
             macro_visibility: std::sync::Mutex::default(),
             cpp_includers: std::sync::Mutex::default(),
             overload_sets: std::sync::Mutex::default(),
@@ -1582,6 +1586,7 @@ impl ReferenceResolver {
     pub fn warm_caches(&mut self, context: &dyn ResolutionContext) {
         let names: BTreeSet<String> = context.known_node_names().into_iter().collect();
         self.known_names = Some(names);
+        self.known_lower_names = std::sync::OnceLock::new();
         *self
             .macro_visibility
             .get_mut()
@@ -2178,6 +2183,11 @@ impl ReferenceResolver {
         // `require('./x')` has no node of that name to pass the check.
         if !is_js_path_import_ref(reference)
             && !self.has_any_possible_match_for(existence_name, reference.language)
+            // PHP, Pascal and CFML names ignore case: `formatprice()` calls
+            // `FormatPrice`, which the exact-name set never lists (upstream
+            // #2141).
+            && !(crate::name_matcher::is_case_insensitive_language(reference.language)
+                && self.has_any_possible_match_ignoring_case(existence_name))
             && !self.matches_any_import(reference, context)
             && !self
                 .framework_resolver_extensions
@@ -3246,6 +3256,12 @@ impl ReferenceResolver {
         // however many share the method's tail.
         let rooted: Vec<String> = names.iter().map(|name| format!("\\{name}")).collect();
         let by_rooted = store.unresolved_refs_by_folded_names(&[Language::Php], &rooted)?;
+        // A PHP, Pascal or CFML name in another case (`formatprice()`) waits
+        // for its name in any case (W4-PHP-03).
+        let by_folded = store.unresolved_refs_by_folded_names(
+            &crate::name_matcher::CASE_INSENSITIVE_LANGUAGES,
+            &names,
+        )?;
         let by_php_classes: Vec<UnresolvedRef> = if names.is_empty() {
             Vec::new()
         } else {
@@ -3272,6 +3288,7 @@ impl ReferenceResolver {
             by_names,
             by_tails,
             by_rooted,
+            by_folded,
             by_php_classes,
         ])?;
 
@@ -3460,6 +3477,26 @@ impl ReferenceResolver {
     /// Lua/Luau method calls use `receiver:method`, while R member calls use
     /// `receiver$method`. Admit those forms when either side is a known project
     /// symbol without interpreting their separators in unrelated languages.
+    /// [`Self::has_any_possible_match`] for a language whose names ignore case
+    /// (upstream #2141 `hasAnyPossibleMatchIgnoringCase`): the name, or any
+    /// `.` / `::` / `->` part of it, lowercased, among the known names
+    /// lowercased once.
+    fn has_any_possible_match_ignoring_case(&self, name: &str) -> bool {
+        let Some(known) = &self.known_names else {
+            return true;
+        };
+        let lower_known = self
+            .known_lower_names
+            .get_or_init(|| known.iter().map(|name| name.to_lowercase()).collect());
+        let lower = name.to_lowercase();
+        lower_known.contains(&lower)
+            || lower
+                .split("::")
+                .flat_map(|part| part.split("->"))
+                .flat_map(|part| part.split('.'))
+                .any(|part| !part.is_empty() && lower_known.contains(part))
+    }
+
     fn has_any_possible_match_for(&self, name: &str, language: Language) -> bool {
         if self.has_any_possible_match(name) {
             return true;
@@ -4166,6 +4203,26 @@ mod tests {
         assert!(r.has_any_possible_match("path/to/Foo"));
         // nothing known.
         assert!(!r.has_any_possible_match("unrelated.symbol"));
+    }
+
+    #[test]
+    fn has_any_possible_match_ignoring_case_folds_the_name_and_its_parts() {
+        // Upstream #2141 (a): a name, or any `.` / `::` / `->` part of it, in
+        // any case.
+        let mut r = ReferenceResolver::new("/root");
+        r.known_names = Some(BTreeSet::from([
+            "FormatPrice".to_string(),
+            "Money".to_string(),
+        ]));
+        assert!(r.has_any_possible_match_ignoring_case("formatprice"));
+        assert!(r.has_any_possible_match_ignoring_case("x.FORMATPRICE"));
+        assert!(r.has_any_possible_match_ignoring_case("money::make"));
+        assert!(r.has_any_possible_match_ignoring_case("$a->formatPrice"));
+        assert!(!r.has_any_possible_match_ignoring_case("price"));
+        // The case-sensitive set alone still drops it.
+        assert!(!r.has_any_possible_match("formatprice"));
+        // Without warmed caches, everything is a possible match.
+        assert!(ReferenceResolver::new("/root").has_any_possible_match_ignoring_case("x"));
     }
 
     #[test]

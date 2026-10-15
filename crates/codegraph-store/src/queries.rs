@@ -1216,6 +1216,53 @@ impl Store {
         Ok(out.into_values().collect())
     }
 
+    /// Sites of the surviving non-`contains` edges whose source is written in
+    /// one of `languages` and whose target is named like one of `names` in
+    /// any ASCII case, in either file relation: a case-insensitive language's
+    /// fuzzy match keeps a target only while it is the one node of its name in
+    /// any case, so a namesake that comes, goes or changes in another case
+    /// moves it (W4-PHP-03).
+    pub fn reference_sites_of_edges_to_folded_targets(
+        &self,
+        languages: &[Language],
+        names: &[String],
+    ) -> rusqlite::Result<Vec<FileReferenceSite>> {
+        if languages.is_empty() || names.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut unique = names.to_vec();
+        unique.sort_unstable();
+        unique.dedup();
+        let languages: Vec<&str> = languages.iter().map(|language| language.as_str()).collect();
+        let language_slots = std::iter::repeat_n("?", languages.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut out = BTreeSet::new();
+        for chunk in unique.chunks(SQLITE_PARAM_CHUNK_SIZE - languages.len()) {
+            let name_slots = std::iter::repeat_n("lower(?)", chunk.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                r#"SELECT src.file_path, e.source, e.line, e.col
+                FROM edges e
+                JOIN nodes tgt ON tgt.id = e.target
+                JOIN nodes src ON src.id = e.source
+                WHERE lower(tgt.name) IN ({name_slots})
+                  AND src.language IN ({language_slots})
+                  AND e.kind != 'contains'
+                ORDER BY src.file_path, e.source, e.line, e.col"#
+            );
+            let mut params: Vec<&dyn ToSql> = chunk.iter().map(|name| name as &dyn ToSql).collect();
+            params.extend(languages.iter().map(|language| language as &dyn ToSql));
+            let mut stmt = self.conn.prepare(&sql)?;
+            let rows = stmt.query_map(params.as_slice(), row_to_file_reference_site)?;
+            for row in rows {
+                out.insert(row?);
+            }
+        }
+        Ok(out.into_iter().collect())
+    }
+
     /// The unresolved PHP calls through a class written with a namespace
     /// (`F\FirstName::make()`, recorded `F\FirstName.make`), in id order: a
     /// sync retries those through a class whose name came or went, with no
@@ -3687,6 +3734,56 @@ mod tests {
             .unwrap();
         assert_eq!(by_names.len(), 1);
         assert_eq!(by_names[0].reference_name, "Target");
+    }
+
+    #[test]
+    fn edge_sites_are_found_by_folded_target_names_in_both_file_relations() {
+        let mut store = store("folded-targets");
+        let php = |id: &str, name: &str, file: &str| {
+            let mut n = node(id, name, file);
+            n.language = Language::Php;
+            n
+        };
+        let mut js = node("function:js", "caller", "c.js");
+        js.language = Language::JavaScript;
+        store
+            .upsert_nodes(&[
+                php("function:render", "render", "view.php"),
+                php("function:FormatPrice", "FormatPrice", "helpers.php"),
+                php("function:local", "Local", "view.php"),
+                js.clone(),
+            ])
+            .unwrap();
+        let edge = |source: &str, target: &str, line: i64| Edge {
+            id: None,
+            source: source.to_string(),
+            target: target.to_string(),
+            kind: EdgeKind::Calls,
+            metadata: None,
+            line: Some(line),
+            col: Some(0),
+            provenance: None,
+        };
+        store
+            .insert_edges(&[
+                edge("function:render", "function:FormatPrice", 2),
+                edge("function:render", "function:local", 3),
+                edge("function:js", "function:FormatPrice", 4),
+            ])
+            .unwrap();
+        let sites = |names: &[&str]| -> Vec<(String, i64)> {
+            let names: Vec<String> = names.iter().map(|n| (*n).to_string()).collect();
+            store
+                .reference_sites_of_edges_to_folded_targets(&[Language::Php], &names)
+                .unwrap()
+                .into_iter()
+                .map(|s| (s.file_path, s.site.map_or(0, |site| site.line)))
+                .collect()
+        };
+        // Cross-file and same-file edges, from the languages asked for only.
+        assert_eq!(sites(&["formatPRICE"]), [("view.php".to_string(), 2)]);
+        assert_eq!(sites(&["LOCAL"]), [("view.php".to_string(), 3)]);
+        assert!(sites(&["price"]).is_empty());
     }
 
     #[test]
