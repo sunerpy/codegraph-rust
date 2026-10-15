@@ -13864,4 +13864,346 @@ mod php {
             "{targets:?}\n{report}"
         );
     }
+
+    /// `kind qualified_name` of every non-`contains`, non-`imports` edge
+    /// target out of `file`'s nodes, as `source kind target`, sorted
+    /// (upstream's `edgesFrom`).
+    fn edges_from(graph: &Graph, file: &str) -> Vec<String> {
+        let mut out: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|e| e.kind != "contains" && e.kind != "imports")
+            .filter_map(|e| {
+                let source = graph.node(&e.source).filter(|n| n.file_path == file)?;
+                let target = graph.node(&e.target)?;
+                Some(format!(
+                    "{} {} {}",
+                    source.name, e.kind, target.qualified_name
+                ))
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// Upstream #2103 (its PHP half): PHP has no implicit `$this`, so a call
+    /// written without a receiver is a function call: BookStack's every
+    /// `return redirect(…)` went to `ApiDocsController::redirect`, every
+    /// `return view(…)` to a `$view` field. `$this->m()` and a project helper
+    /// function still bind. Upstream's fixture.
+    #[test]
+    fn pr2103_a_bare_php_call_is_a_function_call() {
+        let project = Project::new()
+            .file(
+                "app/Http/Controllers/BookController.php",
+                "<?php\nclass BookController {\n    public function show(string $slug) {\n        $book = Book::findBySlug($slug);\n        if (is_null($book)) {\n            return redirect('/books');\n        }\n        return view('books.show', ['book' => $book]);\n    }\n    public function store() {\n        return redirect()->back()->withErrors(['name' => 'required']);\n    }\n}\n",
+            )
+            .file(
+                "app/Http/Controllers/DocsController.php",
+                "<?php\nclass DocsController { public function redirect() { return 1; } }\n",
+            )
+            .file("app/Views/Block.php", "<?php\nclass Block { public $view; }\n")
+            .file(
+                "app/Models/View.php",
+                "<?php\nclass View { public static function incrementFor($x) {} }\n",
+            )
+            .file(
+                "app/helpers.php",
+                "<?php\nfunction format_title($t) { return ucfirst($t); }\n",
+            )
+            .file(
+                "app/Http/Controllers/PageController.php",
+                "<?php\nclass PageController {\n    public function show() {\n        $this->setTitle(format_title('x'));\n    }\n    protected function setTitle($t) {}\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        let report = graph.report();
+        let bound: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|e| e.kind == "calls")
+            .filter(|e| {
+                graph
+                    .node(&e.source)
+                    .is_some_and(|n| n.file_path == "app/Http/Controllers/BookController.php")
+            })
+            .filter_map(|e| graph.node(&e.target))
+            .map(|n| format!("{} {}", n.kind, n.name))
+            .collect();
+        for wrong in ["method redirect", "field view", "class View"] {
+            assert!(!bound.contains(&wrong.to_string()), "{bound:?}\n{report}");
+        }
+        assert_eq!(
+            callees(graph, "app/Http/Controllers/PageController.php", "show"),
+            vec![
+                "PageController::setTitle".to_string(),
+                "format_title".to_string()
+            ],
+            "{report}"
+        );
+    }
+
+    /// Upstream #2103's form: `\\helper()` calls the global function `helper`,
+    /// never a method of the name (KEEP-RUST: the extractor keeps the `\\` in
+    /// the name).
+    #[test]
+    fn pr2103_a_php_function_called_from_the_global_namespace_is_that_function() {
+        let project = Project::new()
+            .file("app/helpers.php", "<?php\nfunction helper() { return 1; }\n")
+            .file(
+                "app/Decoy.php",
+                "<?php\nclass Decoy\n{\n    public function helper() { return 2; }\n}\n",
+            )
+            .file(
+                "app/Page.php",
+                "<?php\nnamespace App;\n\nclass Page\n{\n    public function show()\n    {\n        return \\helper();\n    }\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        assert_eq!(
+            callees(graph, "app/Page.php", "show"),
+            vec!["helper".to_string()],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream #2141 (b): a call after `=>` in a PHP array is a bare call,
+    /// not a member call (`'total' => count($items)` went to a same-named
+    /// method: 166 wrong edges on BookStack). Upstream's fixture.
+    #[test]
+    fn pr2141_a_php_call_after_an_array_arrow_is_a_function_call() {
+        let project = Project::new()
+            .file(
+                "app/CommentTree.php",
+                "<?php\nclass CommentTree {\n  public function count(): int { return 0; }\n}\n",
+            )
+            .file("app/helpers.php", "<?php\nfunction user() { return null; }\n")
+            .file(
+                "app/Controller.php",
+                "<?php\nfunction summary($items) {\n  return ['total' => count($items), 'by' => user()];\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        assert_eq!(
+            edges_from(graph, "app/Controller.php"),
+            vec!["summary calls user".to_string()],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream #2235: an unqualified PHP class name is the current
+    /// namespace's class or the one a `use` imports; PHP never falls back to
+    /// another namespace for classes. koel's `extends Request` all went to the
+    /// first `Request` indexed. Upstream's fixture.
+    #[test]
+    fn pr2235_a_bare_php_class_name_is_its_namespaces_or_the_imported_one() {
+        let project = Project::new()
+            .file(
+                "app/Http/Requests/API/Interaction/Request.php",
+                "<?php\n\nnamespace App\\Http\\Requests\\API\\Interaction;\n\nabstract class Request {}\n",
+            )
+            .file(
+                "app/Http/Requests/API/Request.php",
+                "<?php\n\nnamespace App\\Http\\Requests\\API;\n\nabstract class Request {}\n",
+            )
+            .file(
+                "app/Http/Requests/API/DeleteSongsRequest.php",
+                "<?php\n\nnamespace App\\Http\\Requests\\API;\n\nclass DeleteSongsRequest extends Request {}\n",
+            )
+            .file(
+                "app/Http/Requests/API/Playlist/PlaylistSongUpdateRequest.php",
+                "<?php\n\nnamespace App\\Http\\Requests\\API\\Playlist;\n\nuse App\\Http\\Requests\\API\\Request;\n\nclass PlaylistSongUpdateRequest extends Request {}\n",
+            )
+            .file(
+                "app/Http/Integrations/SearchRequest.php",
+                "<?php\n\nnamespace App\\Http\\Integrations;\n\nuse Saloon\\Http\\Request;\n\nclass SearchRequest extends Request {}\n",
+            )
+            .index();
+        let graph = project.graph();
+        let report = graph.report();
+        assert_eq!(
+            edges_from(graph, "app/Http/Requests/API/DeleteSongsRequest.php"),
+            vec!["DeleteSongsRequest extends App\\Http\\Requests\\API::Request".to_string()],
+            "{report}"
+        );
+        assert_eq!(
+            edges_from(
+                graph,
+                "app/Http/Requests/API/Playlist/PlaylistSongUpdateRequest.php"
+            ),
+            vec!["PlaylistSongUpdateRequest extends App\\Http\\Requests\\API::Request".to_string()],
+            "{report}"
+        );
+        assert_eq!(
+            edges_from(graph, "app/Http/Integrations/SearchRequest.php"),
+            Vec::<String>::new(),
+            "{report}"
+        );
+    }
+
+    /// Upstream #2286 for a class body's trait list: `use Shared, Sub\Logs;`
+    /// names `App\Shared` and `App\Sub\Logs`, never another namespace's traits
+    /// of those names (the extractor records each entry as written).
+    #[test]
+    fn pr2286_a_php_trait_list_names_each_trait_as_written() {
+        let project = Project::new()
+            .file(
+                "app/Shared.php",
+                "<?php\nnamespace App;\n\ntrait Shared\n{\n}\n",
+            )
+            .file(
+                "app/Sub/Logs.php",
+                "<?php\nnamespace App\\Sub;\n\ntrait Logs\n{\n}\n",
+            )
+            .file(
+                "lib/Logs.php",
+                "<?php\nnamespace Lib;\n\ntrait Logs\n{\n}\n",
+            )
+            .file(
+                "app/Page.php",
+                "<?php\nnamespace App;\n\nclass Page\n{\n    use Shared,\n        Sub\\Logs;\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        assert_eq!(
+            edges_from(graph, "app/Page.php"),
+            vec![
+                "Page implements App::Shared".to_string(),
+                "Page implements App\\Sub::Logs".to_string(),
+            ],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream #2286 (#2256): a PHP class written with a namespace in its
+    /// name resolves to that class: through a `use … as Alias;` namespace
+    /// alias, relative to the current namespace, or fully qualified, for
+    /// `new`, `extends`, `implements` and static calls, and never to a
+    /// same-named class elsewhere when the named one is outside the project.
+    /// Upstream's fixtures.
+    #[test]
+    fn pr2286_a_php_class_written_with_a_namespace_resolves_to_that_class() {
+        let fields = "<?php\nnamespace App\\Fields;\n\ninterface Field {}\nclass Base {}\nclass FirstName extends Base implements Field\n{\n    public static function make(): self { return new self(); }\n}\n";
+        let first_name = |ns: &str| {
+            format!(
+                "<?php\nnamespace {ns};\n\nclass FirstName\n{{\n    public function label(): string {{ return 'First name'; }}\n}}\n"
+            )
+        };
+        let consumer = |use_line: &str, expr: &str| {
+            format!(
+                "<?php\nnamespace App\\Blocks\\Personal;\n\n{use_line}\n\nclass Personal\n{{\n    public function fields(): array\n    {{\n        return [{expr}];\n    }}\n}}\n"
+            )
+        };
+        // Through an alias, past a same-named class elsewhere, and deeper.
+        let project = Project::new()
+            .file(
+                "app/Blocks/Personal/Fields/FirstName.php",
+                &first_name("App\\Blocks\\Personal\\Fields"),
+            )
+            .file("app/Blocks/Other/FirstName.php", &first_name("App\\Blocks\\Other"))
+            .file(
+                "app/Blocks/Personal/Fields/Text/FirstName.php",
+                &first_name("App\\Blocks\\Personal\\Fields\\Text"),
+            )
+            .file(
+                "app/Blocks/Personal/Personal.php",
+                &consumer(
+                    "use App\\Blocks\\Personal\\Fields as Field;",
+                    "new Field\\FirstName(), new Field\\Text\\FirstName(), new Elsewhere\\FirstName()",
+                ),
+            )
+            .index();
+        let graph = project.graph();
+        assert_eq!(
+            edges_from(graph, "app/Blocks/Personal/Personal.php"),
+            vec![
+                "fields instantiates App\\Blocks\\Personal\\Fields::FirstName".to_string(),
+                "fields instantiates App\\Blocks\\Personal\\Fields\\Text::FirstName".to_string(),
+            ],
+            "{}",
+            graph.report()
+        );
+        // `extends`, `implements` and a static call through an alias.
+        let project = Project::new()
+            .file("app/Fields/FirstName.php", fields)
+            .file(
+                "app/Personal.php",
+                "<?php\nnamespace App;\n\nuse App\\Fields as F;\n\nclass Personal extends F\\Base implements F\\Field\n{\n    public function make() { return F\\FirstName::make(); }\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        assert_eq!(
+            edges_from(graph, "app/Personal.php"),
+            vec![
+                "Personal extends App\\Fields::Base".to_string(),
+                "Personal implements App\\Fields::Field".to_string(),
+                "make calls App\\Fields::FirstName::make".to_string(),
+            ],
+            "{}",
+            graph.report()
+        );
+        // Relative to the current namespace.
+        let project = Project::new()
+            .file("app/Fields/FirstName.php", fields)
+            .file(
+                "app/Personal.php",
+                "<?php\nnamespace App;\n\nclass Personal extends Fields\\Base\n{\n    public function a() { return new Fields\\FirstName(); }\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        assert_eq!(
+            edges_from(graph, "app/Personal.php"),
+            vec![
+                "Personal extends App\\Fields::Base".to_string(),
+                "a instantiates App\\Fields::FirstName".to_string(),
+            ],
+            "{}",
+            graph.report()
+        );
+        // Fully qualified, beside a same-named class of the current namespace.
+        let project = Project::new()
+            .file("app/Fields/FirstName.php", fields)
+            .file("app/Other/FirstName.php", &first_name("App\\Other"))
+            .file(
+                "app/Personal.php",
+                "<?php\nnamespace App\\Other;\n\nclass Personal extends \\App\\Fields\\Base\n{\n    public function a() { return new \\App\\Fields\\FirstName(); }\n    public function b() { return \\App\\Fields\\FirstName::make(); }\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        assert_eq!(
+            edges_from(graph, "app/Personal.php"),
+            vec![
+                "Personal extends App\\Fields::Base".to_string(),
+                "a instantiates App\\Fields::FirstName".to_string(),
+                "b calls App\\Fields::FirstName::make".to_string(),
+            ],
+            "{}",
+            graph.report()
+        );
+        // Outside the project: no same-named project node of any kind, a type
+        // hint included, nor past a line break after `new` (KEEP-RUST: the
+        // extractor records `FirstName` for each of them). A comment right
+        // after `new` the extractor records as the class name itself.
+        let project = Project::new()
+            .file("app/Fields/FirstName.php", fields)
+            .file(
+                "app/helpers.php",
+                "<?php\nnamespace App;\n\nfunction FirstName() {}\n\nenum Kind\n{\n    case FirstName;\n}\n",
+            )
+            .file(
+                "app/Personal.php",
+                "<?php\nnamespace App;\n\nuse Vendor\\Lib as L;\n\nclass Personal extends L\\Base\n{\n    public function a() { return new \\Vendor\\Lib\\FirstName(); }\n    public function b() { return L\\FirstName::make(); }\n    public function c(L\\FirstName $name) {}\n    public function d() { return [new /* outside */ L\\FirstName(), new\n        \\Vendor\\Lib\\FirstName()]; }\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        assert_eq!(
+            edges_from(graph, "app/Personal.php"),
+            Vec::<String>::new(),
+            "{}",
+            graph.report()
+        );
+    }
 }

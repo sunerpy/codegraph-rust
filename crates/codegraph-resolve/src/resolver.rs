@@ -1204,6 +1204,22 @@ fn is_minified_script(file_path: &str, context: &dyn ResolutionContext) -> bool 
     })
 }
 
+/// `reference` named without the `\` of a PHP call to a function in the
+/// global namespace (`\helper()`), or `None` for any other reference.
+fn php_rooted_function_call(reference: &RefView) -> Option<RefView> {
+    let name = reference.reference_name.strip_prefix('\\')?;
+    (reference.language == Language::Php
+        && reference.reference_kind == EdgeKind::Calls
+        && !name.is_empty()
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_'))
+    .then(|| RefView {
+        reference_name: name.to_string(),
+        ..reference.clone()
+    })
+}
+
 fn target_is_visible_across_files(
     target: &Node,
     reference: &RefView,
@@ -1234,6 +1250,11 @@ fn target_is_visible_across_files(
         && (!crate::csharp_types::is_csharp_type_visible(target, reference, context)
             || !crate::csharp_types::is_csharp_nested_type_in_scope(target, reference, context))
     {
+        return false;
+    }
+    // A bare PHP class name is its namespace's class, or the one a `use`
+    // names (upstream #2235).
+    if !crate::php_scope::is_php_class_visible(target, reference, context) {
         return false;
     }
     // A Scala package object's member is in scope in its package and those
@@ -1670,6 +1691,12 @@ impl ReferenceResolver {
         reference: &RefView,
         context: &dyn ResolutionContext,
     ) -> (Option<ResolvedRef>, Option<DeferredIntent>) {
+        // A PHP function called from the global namespace (`\helper()`) is
+        // `helper` (upstream #2103's form). KEEP-RUST: the extractor keeps
+        // the `\` in the name, upstream's records the name without it.
+        if let Some(rooted) = php_rooted_function_call(reference) {
+            return self.resolve_one_pure(&rooted, context);
+        }
         let (resolved, deferred) = self.resolve_one_pure_inner(reference, context);
         let resolved = self.gate_target_kind(resolved, reference, context);
         // A Swift type reference never lands on an `extension X {}` node, nor
@@ -2118,6 +2145,16 @@ impl ReferenceResolver {
                 crate::cfml_scope::resolve_cfml_component_path(reference, context),
                 None,
             );
+        }
+        // A PHP class written with a namespace in it: `new Alias\X()` through a
+        // `use Ns as Alias;` namespace alias, `extends Sub\Base`, `\Ns\X::make()`
+        // (upstream #2286). The pre-filter below would drop most of these
+        // before any import strategy ran, and PHP gives each one exactly one
+        // meaning; resolve it first.
+        if let Some(claimed) =
+            crate::import_resolver::resolve_php_qualified_class_ref(reference, context)
+        {
+            return (self.gate_language(claimed, reference, context), None);
         }
 
         // Fast pre-filter (index.ts:664-670). The `FrameworkResolver`
@@ -3202,7 +3239,41 @@ impl ReferenceResolver {
         // A qualified reference (`User.create`) waits for its tail's name:
         // the whole-name lookup above never matches it (upstream #1240).
         let by_tails = store.unresolved_refs_by_name_tails(&names, NAME_TAIL_RETRY_CEILING)?;
-        let scoped = union_persisted_refs([by_files, by_sites, by_names, by_tails])?;
+        // PHP (W4-PHP-02): a call to a global function written `\helper()`
+        // waits for `helper` in any case, as PHP names functions, and a static
+        // call through a class written with a namespace
+        // (`F\FirstName::make()`) for the class's or the method's name,
+        // however many share the method's tail.
+        let rooted: Vec<String> = names.iter().map(|name| format!("\\{name}")).collect();
+        let by_rooted = store.unresolved_refs_by_folded_names(&[Language::Php], &rooted)?;
+        let by_php_classes: Vec<UnresolvedRef> = if names.is_empty() {
+            Vec::new()
+        } else {
+            store
+                .unresolved_php_calls_through_qualified_classes()?
+                .into_iter()
+                .filter(|reference| {
+                    reference
+                        .reference_name
+                        .rsplit_once('.')
+                        .is_some_and(|(class, member)| {
+                            changed_names.contains(member)
+                                || class
+                                    .rsplit('\\')
+                                    .next()
+                                    .is_some_and(|class| changed_names.contains(class))
+                        })
+                })
+                .collect()
+        };
+        let scoped = union_persisted_refs([
+            by_files,
+            by_sites,
+            by_names,
+            by_tails,
+            by_rooted,
+            by_php_classes,
+        ])?;
 
         // The wiring references first, persisted, then the rest against
         // their edges, as a full index orders them (upstream #1789).
@@ -5429,6 +5500,48 @@ mod tests {
             },
         );
         assert!(target.is_none());
+    }
+
+    /// Upstream #2235: whichever strategy chose it, a bare PHP class name
+    /// reaches another file's class only when it is the one its file's
+    /// namespace or `use` names.
+    #[test]
+    fn a_php_class_of_another_namespace_is_invisible_across_files() {
+        let mut reference = mk_ref("Request", EdgeKind::Extends, Language::Php);
+        reference.file_path = "app/API/DeleteSongsRequest.php".to_string();
+        reference.line = 5;
+        reference.column = 33;
+        let ctx = MinimalCtx {
+            files: HashMap::from([(
+                reference.file_path.clone(),
+                "<?php\n\nnamespace App\\API;\n\nclass DeleteSongsRequest extends Request {}\n"
+                    .to_string(),
+            )]),
+        };
+        let class = |qualified_name: &str, file: &str| {
+            let mut node = mk_node2(
+                &format!("class:{qualified_name}"),
+                NodeKind::Class,
+                "Request",
+                file,
+                Language::Php,
+            );
+            node.qualified_name = qualified_name.to_string();
+            node
+        };
+        assert!(!target_is_visible_across_files(
+            &class(
+                "App\\API\\Interaction::Request",
+                "app/API/Interaction/Request.php"
+            ),
+            &reference,
+            &ctx
+        ));
+        assert!(target_is_visible_across_files(
+            &class("App\\API::Request", "app/API/Request.php"),
+            &reference,
+            &ctx
+        ));
     }
 
     #[test]

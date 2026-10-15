@@ -1700,6 +1700,136 @@ fn drop_last_segment(path: &str) -> Vec<&str> {
     }
 }
 
+/// The qualified name (`App\Fields::FirstName`) of the class a PHP class
+/// name written with a namespace in it (`Field\FirstName`, `\Ns\X`) names at
+/// `reference`, read as PHP reads it: a leading `\` makes it absolute;
+/// otherwise a first segment a `use` imports is replaced by what it imports,
+/// and any other name is relative to the namespace the reference is in.
+pub(crate) fn php_qualified_class_qn(
+    name: &str,
+    reference: &RefView,
+    context: &dyn ResolutionContext,
+) -> String {
+    let fqn = if let Some(rooted) = name.strip_prefix('\\') {
+        rooted.to_string()
+    } else {
+        let head = name.split('\\').next().unwrap_or(name);
+        match context
+            .get_import_mappings(&reference.file_path, reference.language)
+            .into_iter()
+            .find(|import| import.local_name == head)
+        {
+            Some(import) => format!(
+                "{}{}",
+                import.source.trim_start_matches('\\'),
+                &name[head.len()..]
+            ),
+            // `namespace App;` applies until the next namespace statement.
+            None => match context
+                .get_nodes_in_file_shared(&reference.file_path)
+                .into_iter()
+                .filter(|node| {
+                    node.kind == NodeKind::Namespace && node.start_line <= reference.line
+                })
+                .max_by(|a, b| {
+                    (a.start_line, a.start_column, &b.id).cmp(&(
+                        b.start_line,
+                        b.start_column,
+                        &a.id,
+                    ))
+                }) {
+                Some(namespace) => format!("{}\\{name}", namespace.qualified_name),
+                None => name.to_string(),
+            },
+        }
+    };
+    match fqn.rsplit_once('\\') {
+        Some((namespace, last)) => format!("{namespace}::{last}"),
+        None => fqn,
+    }
+}
+
+/// A PHP class written with a namespace in it (upstream
+/// `resolvePhpQualifiedClassRef`, #2256 / #2286). `use App\Fields as Field;`
+/// aliases a namespace, so `new Field\FirstName()`, `extends Field\Base` and
+/// `Field\FirstName::make()` all name `App\Fields\FirstName`. PHP reads a
+/// qualified name one way: a leading `\` makes it absolute; otherwise a first
+/// segment a `use` imports is replaced by what it imports, and any other name
+/// is relative to the current namespace. `None` when the ref is not a
+/// qualified class name (or names a method the class inherits); `Some(None)`
+/// when it is but no single project class has that name, so it lives outside
+/// the project and the name fallbacks must not guess. KEEP-RUST: a static
+/// call is recorded as written (`Field\FirstName.make`), the other class
+/// name refs by their last segment, whose written name is read back from the
+/// source ([`crate::php_scope::php_written_class_name`]).
+pub(crate) fn resolve_php_qualified_class_ref(
+    reference: &RefView,
+    context: &dyn ResolutionContext,
+) -> Option<Option<ResolvedRef>> {
+    if reference.language != Language::Php {
+        return None;
+    }
+    let (name, member) = if reference.reference_kind == codegraph_core::types::EdgeKind::Calls {
+        // A static call on the class: `Field\FirstName::make()` is written
+        // `Field\FirstName.make`.
+        static CALL: OnceLock<Regex> = OnceLock::new();
+        let call = CALL
+            .get_or_init(|| {
+                Regex::new(r"^(.*\\[^\\.:]+)(?:\.|::)([0-9A-Za-z_]+)$").expect("php qualified call")
+            })
+            .captures(&reference.reference_name)?;
+        (call[1].to_string(), Some(call[2].to_string()))
+    } else {
+        (
+            crate::php_scope::php_written_class_name(reference, context)?,
+            None,
+        )
+    };
+    if !name.contains('\\') {
+        return None;
+    }
+    let qualified_name = php_qualified_class_qn(&name, reference, context);
+    let classes: Vec<Arc<Node>> = context
+        .get_nodes_by_qualified_name_shared(&qualified_name)
+        .into_iter()
+        .filter(|node| node.language == Language::Php && is_static_member_container(node.kind))
+        .collect();
+    // A type mention can name something other than a class (a namespaced
+    // constant or function), so it keeps the ordinary strategies.
+    let [owner] = classes.as_slice() else {
+        return (reference.reference_kind != codegraph_core::types::EdgeKind::References)
+            .then_some(None);
+    };
+    let Some(member) = member else {
+        return Some(Some(ResolvedRef {
+            original: reference.clone(),
+            target_node_id: owner.id.clone(),
+            confidence: 0.95,
+            resolved_by: ResolvedBy::Import,
+        }));
+    };
+    let methods: Vec<Arc<Node>> = context
+        .get_nodes_by_qualified_name_shared(&format!("{}::{member}", owner.qualified_name))
+        .into_iter()
+        .filter(|node| {
+            node.language == Language::Php
+                && node.kind == NodeKind::Method
+                && node.file_path == owner.file_path
+        })
+        .collect();
+    // A method the class inherits is left to the strategies that walk
+    // supertypes.
+    let [method] = methods.as_slice() else {
+        return None;
+    };
+    Some(Some(ResolvedRef {
+        original: reference.clone(),
+        target_node_id: method.id.clone(),
+        confidence: 0.95,
+        resolved_by: ResolvedBy::Import,
+    }))
+}
+
 /// Resolve a PHP scoped call through the exact class namespace named by its
 /// local `use` binding.
 ///

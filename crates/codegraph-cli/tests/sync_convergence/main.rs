@@ -910,6 +910,13 @@ matrix! {
     php_untyped_receiver_reaches_an_inherited_method_past_the_tail_ceiling,
     php_untyped_receiver_reaches_a_method_its_ancestor_gains_past_the_tail_ceiling,
     php_untyped_receiver_leaves_a_method_a_seed_pushes_past_the_walk_limit,
+    php_bare_call_reaches_a_function_that_appears,
+    php_bare_class_name_reaches_a_class_added_to_its_namespace,
+    php_namespace_alias_instantiation_reaches_a_class_that_appears,
+    php_qualified_static_call_leaves_a_class_moved_to_another_namespace,
+    php_qualified_static_call_reaches_a_class_that_appears_past_the_tail_ceiling,
+    php_qualified_static_call_reaches_a_method_its_class_gains_past_the_tail_ceiling,
+    php_function_called_from_the_global_namespace_reaches_it_once_it_appears,
     #[ignore = "W5-07: a call through a class name reads its supertypes from the class heads, which no sync lane records"]
     php_inherited_static_call_follows_a_class_head_spread_past_its_third_line,
     #[ignore = "W5-07: a call through a class name reads its supertypes from the class heads, which no sync lane records"]

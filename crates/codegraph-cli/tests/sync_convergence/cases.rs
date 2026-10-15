@@ -5046,6 +5046,190 @@ pub fn php_untyped_receiver_reaches_an_inherited_method_past_the_tail_ceiling() 
         .edge_after("function App::handle", "calls", "method App\\Models::Entity::save")
 }
 
+/// Upstream #2103 (W4-PHP-02): a bare PHP call is a function call, so it
+/// stays parked beside a same-named method and links the function once a
+/// file declares it.
+pub fn php_bare_call_reaches_a_function_that_appears() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Php])
+        .file(
+            "app/Http/Controllers/DocsController.php",
+            "<?php\nclass DocsController\n{\n    public function redirect() { return 1; }\n}\n",
+        )
+        .file(
+            "app/Http/Controllers/BookController.php",
+            "<?php\nclass BookController\n{\n    public function show()\n    {\n        return redirect('/books');\n    }\n}\n",
+        )
+        .write(
+            "app/helpers.php",
+            "<?php\nfunction redirect($to) { return $to; }\n",
+        )
+        .no_edge_after(
+            "method BookController::show",
+            "calls",
+            "method DocsController::redirect",
+        )
+        .edge_after("method BookController::show", "calls", "function redirect")
+}
+
+/// Upstream #2235 (W4-PHP-02): a bare PHP class name is its namespace's
+/// class or the imported one, so `extends Request` waits for the class its
+/// own namespace declares, past another namespace's `Request`.
+pub fn php_bare_class_name_reaches_a_class_added_to_its_namespace() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Php])
+        .file(
+            "app/Http/Requests/API/Interaction/Request.php",
+            "<?php\n\nnamespace App\\Http\\Requests\\API\\Interaction;\n\nabstract class Request {}\n",
+        )
+        .file(
+            "app/Http/Requests/API/DeleteSongsRequest.php",
+            "<?php\n\nnamespace App\\Http\\Requests\\API;\n\nclass DeleteSongsRequest extends Request {}\n",
+        )
+        .write(
+            "app/Http/Requests/API/Request.php",
+            "<?php\n\nnamespace App\\Http\\Requests\\API;\n\nabstract class Request {}\n",
+        )
+        .no_edge_after(
+            "class App\\Http\\Requests\\API::DeleteSongsRequest",
+            "extends",
+            "class App\\Http\\Requests\\API\\Interaction::Request",
+        )
+        .edge_after(
+            "class App\\Http\\Requests\\API::DeleteSongsRequest",
+            "extends",
+            "class App\\Http\\Requests\\API::Request",
+        )
+}
+
+/// Upstream #2286 (W4-PHP-02): `new Field\FirstName()` through a namespace
+/// alias names one class, never a same-named class elsewhere; it links once
+/// a file declares the named one.
+pub fn php_namespace_alias_instantiation_reaches_a_class_that_appears() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Php])
+        .file(
+            "app/Other/FirstName.php",
+            "<?php\nnamespace App\\Other;\n\nclass FirstName\n{\n}\n",
+        )
+        .file(
+            "app/Personal.php",
+            "<?php\nnamespace App;\n\nuse App\\Fields as Field;\n\nclass Personal\n{\n    public function fields()\n    {\n        return [new Field\\FirstName()];\n    }\n}\n",
+        )
+        .write(
+            "app/Fields/FirstName.php",
+            "<?php\nnamespace App\\Fields;\n\nclass FirstName\n{\n}\n",
+        )
+        .no_edge_after(
+            "method App::Personal::fields",
+            "instantiates",
+            "class App\\Other::FirstName",
+        )
+        .edge_after(
+            "method App::Personal::fields",
+            "instantiates",
+            "class App\\Fields::FirstName",
+        )
+}
+
+/// Upstream #2286 (W4-PHP-02): `F\FirstName::make()` leaves the method once
+/// its class moves to another namespace, and no same-named method takes it.
+pub fn php_qualified_static_call_leaves_a_class_moved_to_another_namespace() -> Case {
+    Case::new(Change::RenameSymbol, &[Language::Php])
+        .file(
+            "app/Fields/FirstName.php",
+            "<?php\nnamespace App\\Fields;\n\nclass FirstName\n{\n    public static function make() { return new static(); }\n}\n",
+        )
+        .file(
+            "app/Personal.php",
+            "<?php\nnamespace App;\n\nuse App\\Fields as F;\n\nclass Personal\n{\n    public function build()\n    {\n        return F\\FirstName::make();\n    }\n}\n",
+        )
+        .write(
+            "app/Fields/FirstName.php",
+            "<?php\nnamespace App\\Moved;\n\nclass FirstName\n{\n    public static function make() { return new static(); }\n}\n",
+        )
+        .edge_before(
+            "method App::Personal::build",
+            "calls",
+            "method App\\Fields::FirstName::make",
+        )
+        .no_edge_after(
+            "method App::Personal::build",
+            "calls",
+            "method App\\Moved::FirstName::make",
+        )
+}
+
+/// 501 parked static calls of `make` through classes the project lacks, so
+/// the shared tail retry skips that tail.
+static QUALIFIED_MAKE_CALLS: LazyLock<String> = LazyLock::new(|| {
+    let mut text = String::from("<?php\nnamespace Noise;\n\nfunction noise()\n{\n");
+    for index in 0..501 {
+        text.push_str(&format!("    Missing{index}::make();\n"));
+    }
+    text.push_str("}\n");
+    text
+});
+
+/// Upstream #2286 (W4-PHP-02): `F\FirstName::make()` links the class once a
+/// file declares it, however many parked calls share the `make` tail.
+pub fn php_qualified_static_call_reaches_a_class_that_appears_past_the_tail_ceiling() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Php])
+        .file(
+            "app/Personal.php",
+            "<?php\nnamespace App;\n\nuse App\\Fields as F;\n\nclass Personal\n{\n    public function build()\n    {\n        return F\\FirstName::make();\n    }\n}\n",
+        )
+        .file("noise/Noise.php", QUALIFIED_MAKE_CALLS.as_str())
+        .write(
+            "app/Fields/FirstName.php",
+            "<?php\nnamespace App\\Fields;\n\nclass FirstName\n{\n    public static function make() { return new static(); }\n}\n",
+        )
+        .edge_after(
+            "method App::Personal::build",
+            "calls",
+            "method App\\Fields::FirstName::make",
+        )
+}
+
+/// Upstream #2286 (W4-PHP-02): `F\FirstName::make()` links the method its
+/// class gains, however many parked calls share the `make` tail.
+pub fn php_qualified_static_call_reaches_a_method_its_class_gains_past_the_tail_ceiling() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Php])
+        .file(
+            "app/Fields/FirstName.php",
+            "<?php\nnamespace App\\Fields;\n\nclass FirstName\n{\n}\n",
+        )
+        .file(
+            "app/Personal.php",
+            "<?php\nnamespace App;\n\nuse App\\Fields as F;\n\nclass Personal\n{\n    public function build()\n    {\n        return F\\FirstName::make();\n    }\n}\n",
+        )
+        .file("noise/Noise.php", QUALIFIED_MAKE_CALLS.as_str())
+        .write(
+            "app/Fields/FirstName.php",
+            "<?php\nnamespace App\\Fields;\n\nclass FirstName\n{\n    public static function make() { return new static(); }\n}\n",
+        )
+        .edge_after(
+            "method App::Personal::build",
+            "calls",
+            "method App\\Fields::FirstName::make",
+        )
+}
+
+/// Upstream #2103's form (W4-PHP-02): `\helper()` links the global function
+/// once a file declares it (KEEP-RUST: the reference keeps the `\` in its
+/// name, so it waits for `helper` under `\helper`).
+pub fn php_function_called_from_the_global_namespace_reaches_it_once_it_appears() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Php])
+        .file(
+            "app/Decoy.php",
+            "<?php\nclass Decoy\n{\n    public function helper() { return 2; }\n}\n",
+        )
+        .file(
+            "app/Page.php",
+            "<?php\nnamespace App;\n\nclass Page\n{\n    public function show()\n    {\n        return \\helper();\n    }\n}\n",
+        )
+        .write("app/helpers.php", "<?php\nfunction helper() { return 1; }\n")
+        .no_edge_after("method App::Page::show", "calls", "method Decoy::helper")
+        .edge_after("method App::Page::show", "calls", "function helper")
+}
+
 // ----- a call through a class name and the heads it reads (W5-07) ------------
 //
 // Upstream #2180 (W3-06): a call through a class name reaches the method the

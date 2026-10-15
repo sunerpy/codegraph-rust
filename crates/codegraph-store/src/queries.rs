@@ -1171,6 +1171,66 @@ impl Store {
         Ok(out.into_values().collect())
     }
 
+    /// The unresolved references written in one of `languages`, whose names
+    /// ignore case, named like one of `names` in any ASCII case (SQLite's
+    /// `lower`, as the case-insensitive node lookup folds), in id order: a
+    /// sync retries `\HELPER()` once a `helper` comes or goes (W4-PHP-02). No
+    /// index folds case, so those languages' rows are scanned.
+    pub fn unresolved_refs_by_folded_names(
+        &self,
+        languages: &[Language],
+        names: &[String],
+    ) -> rusqlite::Result<Vec<UnresolvedRef>> {
+        if languages.is_empty() || names.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut unique = names.to_vec();
+        unique.sort_unstable();
+        unique.dedup();
+        let languages: Vec<&str> = languages.iter().map(|language| language.as_str()).collect();
+        let language_slots = std::iter::repeat_n("?", languages.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut out: BTreeMap<i64, UnresolvedRef> = BTreeMap::new();
+        for chunk in unique.chunks(SQLITE_PARAM_CHUNK_SIZE - languages.len()) {
+            let name_slots = std::iter::repeat_n("lower(?)", chunk.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT * FROM unresolved_refs WHERE language IN ({language_slots}) \
+                 AND lower(reference_name) IN ({name_slots}) ORDER BY id"
+            );
+            let mut params: Vec<&dyn ToSql> = languages
+                .iter()
+                .map(|language| language as &dyn ToSql)
+                .collect();
+            params.extend(chunk.iter().map(|name| name as &dyn ToSql));
+            let mut stmt = self.conn.prepare(&sql)?;
+            for reference in stmt.query_map(params.as_slice(), row_to_unresolved_ref)? {
+                let reference = reference?;
+                if let Some(id) = reference.id {
+                    out.insert(id, reference);
+                }
+            }
+        }
+        Ok(out.into_values().collect())
+    }
+
+    /// The unresolved PHP calls through a class written with a namespace
+    /// (`F\FirstName::make()`, recorded `F\FirstName.make`), in id order: a
+    /// sync retries those through a class whose name came or went, with no
+    /// ceiling (W4-PHP-02).
+    pub fn unresolved_php_calls_through_qualified_classes(
+        &self,
+    ) -> rusqlite::Result<Vec<UnresolvedRef>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT * FROM unresolved_refs WHERE language = 'php' AND reference_kind = 'calls' \
+             AND instr(reference_name, '\\') > 0 AND instr(reference_name, '.') > 0 ORDER BY id",
+        )?;
+        let rows = stmt.query_map([], row_to_unresolved_ref)?;
+        rows.collect()
+    }
+
     /// The unresolved references written with a qualifier (`User.create`,
     /// `objectType.IsEnum`) whose [`reference_name_tail`] is one of `names`,
     /// the symbol names a sync's changed files touched (upstream #1240's
@@ -3627,6 +3687,61 @@ mod tests {
             .unwrap();
         assert_eq!(by_names.len(), 1);
         assert_eq!(by_names[0].reference_name, "Target");
+    }
+
+    #[test]
+    fn unresolved_refs_are_found_by_folded_names_and_qualified_php_classes() {
+        let mut store = store("folded-names");
+        store
+            .upsert_nodes(&[
+                node("function:src1", "src1", "a.php"),
+                node("function:src2", "src2", "b.js"),
+            ])
+            .unwrap();
+        let mk = |from: &str, name: &str, file: &str, lang: Language| UnresolvedRef {
+            id: None,
+            from_node_id: from.to_string(),
+            reference_name: name.to_string(),
+            reference_kind: EdgeKind::Calls,
+            line: 1,
+            col: 0,
+            candidates: None,
+            file_path: file.to_string(),
+            language: lang,
+            is_function_ref: false,
+            reference_subkind: None,
+        };
+        store
+            .insert_unresolved_refs(&[
+                mk("function:src1", "\\HELPER", "a.php", Language::Php),
+                mk("function:src1", "\\helper", "a.php", Language::Php),
+                mk("function:src1", "\\helperx", "a.php", Language::Php),
+                mk("function:src1", "F\\FirstName.make", "a.php", Language::Php),
+                mk("function:src1", "Plain.make", "a.php", Language::Php),
+                mk("function:src2", "\\HELPER", "b.js", Language::JavaScript),
+            ])
+            .unwrap();
+        let folded: Vec<String> = store
+            .unresolved_refs_by_folded_names(&[Language::Php], &["\\Helper".to_string()])
+            .unwrap()
+            .into_iter()
+            .map(|reference| reference.reference_name)
+            .collect();
+        // Any ASCII case of the whole name, and only the languages asked for.
+        assert_eq!(folded, ["\\HELPER", "\\helper"]);
+        assert!(
+            store
+                .unresolved_refs_by_folded_names(&[], &["\\helper".to_string()])
+                .unwrap()
+                .is_empty()
+        );
+        let qualified: Vec<String> = store
+            .unresolved_php_calls_through_qualified_classes()
+            .unwrap()
+            .into_iter()
+            .map(|reference| reference.reference_name)
+            .collect();
+        assert_eq!(qualified, ["F\\FirstName.make"]);
     }
 
     #[test]

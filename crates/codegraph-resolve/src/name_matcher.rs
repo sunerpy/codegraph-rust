@@ -2406,6 +2406,7 @@ pub fn match_by_exact_name(
     context: &dyn ResolutionContext,
 ) -> Option<ResolvedRef> {
     let bare_js = is_bare_js_call(reference, context);
+    let bare_php = crate::php_scope::is_bare_php_call(reference, context);
     // A type, a value or an import the file binds from a package outside the
     // repository names nothing in it, whatever kind of reference it is
     // (upstream #2134).
@@ -2561,6 +2562,9 @@ pub fn match_by_exact_name(
         // #2120: mocha's global `it(…)` bound an interface's `it` property). A
         // bare Rust call cannot reach a method (P15 R1).
         .filter(|n| !((bare_js || bare_go) && is_type_member_kind(n.kind)))
+        // A bare PHP call is a function call: nothing else is callable without
+        // a receiver (upstream #2103).
+        .filter(|n| !(bare_php && n.kind != NodeKind::Function))
         .filter(|n| {
             go_shape
                 .as_ref()
@@ -2639,6 +2643,11 @@ pub fn match_by_exact_name(
         // `new Builder()` is not a wire converter test's nested
         // `CrashingPhone.Builder` (upstream #2236).
         .filter(|n| java_type_site.visible(n, context))
+        // A bare PHP class name, only its namespace's or the imported one, ahead
+        // of the ranking: koel's `extends Request` under `use
+        // App\Http\Requests\API\Request;` is that class, not the first `Request`
+        // indexed (upstream #2235).
+        .filter(|n| crate::php_scope::is_php_class_visible(n, reference, context))
         .filter(|n| {
             kotlin_std_chain
                 .as_deref()
@@ -6689,6 +6698,11 @@ pub fn match_fuzzy(reference: &RefView, context: &dyn ResolutionContext) -> Opti
         || out_of_repo
         || (candidate.kind == NodeKind::Method
             && (is_bare_go_call(reference, context) || rust_shape == Some(RustCallShape::Bare)))
+        // A bare PHP call is a function call (case-insensitive, so fuzzy may
+        // find one): never the class `View` for `view(…)`, never a method
+        // (upstream #2103).
+        || (candidate.kind != NodeKind::Function
+            && crate::php_scope::is_bare_php_call(reference, context))
         // A builtin method call (`res.text()`) whose only same-named project
         // symbol is some function's closure must decline (#1708).
         || !is_lexically_reachable(candidate, reference, context)

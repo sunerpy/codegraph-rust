@@ -60,6 +60,18 @@
     "target": "method:bf2947abaa4894c57661972a5c400d18"
   },
   {
+    "col": 16,
+    "kind": "calls",
+    "line": 20,
+    "metadata": {
+      "confidence": 0.95,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "method:d7e53b91aba4c60a50c0023d3ae0b6fa",
+    "target": "method:4e32dd7e5c8e93e94ca89040929d64b5"
+  },
+  {
     "col": 17,
     "kind": "calls",
     "line": 21,
@@ -105,7 +117,7 @@
     },
     "provenance": null,
     "source": "method:d7e53b91aba4c60a50c0023d3ae0b6fa",
-    "target": "method:e822dba813ffc7afcfa32af0dbe94cc3"
+    "target": "function:2cc0f6065efcdb5218875d548c90e125"
   },
   {
     "col": 23,
