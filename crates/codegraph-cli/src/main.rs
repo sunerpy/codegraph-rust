@@ -5717,6 +5717,7 @@ fn index_project_inner(
         Option<codegraph_resolve::go_packages::HeadRow>,
         Option<codegraph_resolve::php_scope::HeadRow>,
         Option<codegraph_resolve::lua_scope::LuaModuleRow>,
+        Option<codegraph_resolve::dart_scope::HeadRow>,
     )>;
     let mut surfaces: Vec<(String, ModuleSurface)> = Vec::new();
     let mut namespace_scans: Vec<(String, codegraph_watch::cpp_namespace_rows::NamespaceScan)> =
@@ -5734,6 +5735,7 @@ fn index_project_inner(
     let mut go_rows: Vec<(String, codegraph_resolve::go_packages::HeadRow)> = Vec::new();
     let mut php_rows: Vec<(String, codegraph_resolve::php_scope::HeadRow)> = Vec::new();
     let mut lua_rows: Vec<(String, codegraph_resolve::lua_scope::LuaModuleRow)> = Vec::new();
+    let mut dart_rows: Vec<(String, codegraph_resolve::dart_scope::HeadRow)> = Vec::new();
     let schedule_tracker = tracker.clone();
     let parse_tracker = tracker.clone();
     let buffer_tracker = tracker.clone();
@@ -5811,6 +5813,7 @@ fn index_project_inner(
             let go_row = codegraph_watch::go_heads::row_of(language, &source, &result.nodes);
             let php_row = codegraph_watch::php_heads::row_of(language, &source, &result.nodes);
             let lua_row = codegraph_watch::lua_modules::row_of(language, &source, &result.nodes);
+            let dart_row = codegraph_watch::dart_heads::row_of(language, &source, &result.nodes);
             Ok(Some((
                 relative.clone(),
                 file,
@@ -5829,6 +5832,7 @@ fn index_project_inner(
                 go_row,
                 php_row,
                 lua_row,
+                dart_row,
             )))
         },
         |buffered| buffer_tracker.buffered(buffered),
@@ -5851,6 +5855,7 @@ fn index_project_inner(
                 go_row,
                 php_row,
                 lua_row,
+                dart_row,
             )) = payload
             else {
                 files_not_source += 1;
@@ -5930,6 +5935,9 @@ fn index_project_inner(
             if let Some(row) = lua_row {
                 lua_rows.push((relative.clone(), row));
             }
+            if let Some(row) = dart_row {
+                dart_rows.push((relative.clone(), row));
+            }
             if let Some(surface) = surface {
                 surfaces.push((relative, surface));
             }
@@ -5998,12 +6006,14 @@ fn index_project_inner(
     drop(php_rows);
     codegraph_watch::lua_modules::write_index_rows(&store, &mut lua_rows)?;
     drop(lua_rows);
+    codegraph_watch::dart_heads::write_index_rows(&store, &mut dart_rows)?;
+    drop(dart_rows);
     // A fresh index leaves no C/C++ (W4-CPP-04), Java (W4-JVM-01), Kotlin
     // (W4-JVM-03), Scala (W4-SC-01), C# (W4-CS-01), member-walk (W4-CS-03)
     // Ruby (W4-RB-01), CFML (W4-CF-01), Swift (W4-SW-01), Objective-C
     // (W4-SW-04), Go (W4-GO-01), Rust receiver (W4-RS-03), PHP
-    // (W4-PHP-01), case-folded (W4-PHP-03), Lua (W4-LUA-01) or R
-    // base-binding (W4-R-01) dependent unrefreshed.
+    // (W4-PHP-01), case-folded (W4-PHP-03), Lua (W4-LUA-01), R base-binding
+    // (W4-R-01) or Dart head (W4-DART-01) dependent unrefreshed.
     codegraph_watch::cpp_dependents::write_marker(&store)?;
     codegraph_watch::java_heads::write_marker(&store)?;
     codegraph_watch::kotlin_surfaces::write_marker(&store)?;
@@ -6020,6 +6030,7 @@ fn index_project_inner(
     codegraph_watch::case_folded::write_marker(&store)?;
     codegraph_watch::lua_modules::write_marker(&store)?;
     codegraph_watch::r_bindings::write_marker(&store)?;
+    codegraph_watch::dart_heads::write_marker(&store)?;
     finish_phase(&pb, "Persisted nodes");
     diagnostic_run.phase_end("node_write", node_write_started.elapsed(), json!({}));
 

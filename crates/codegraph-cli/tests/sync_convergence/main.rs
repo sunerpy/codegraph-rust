@@ -372,6 +372,7 @@ fn run_case(name: &str, case: &Case) {
     // And the PHP head rows and their marker (W4-PHP-01).
     let php_rows = support::project_metadata_with_prefix(&fresh.db(), "php_heads");
     let lua_rows = support::project_metadata_with_prefix(&fresh.db(), "lua_module");
+    let dart_rows = support::project_metadata_with_prefix(&fresh.db(), "dart_heads");
     for (driver, project) in [("cli", &cli), ("watch", &watch)] {
         let rows = support::project_metadata_with_prefix(&project.db(), "js_module_surface");
         if rows != surface_rows {
@@ -476,6 +477,13 @@ fn run_case(name: &str, case: &Case) {
             divergent.push(format!(
                 "=== {driver} driver: the Lua module rows differ from a fresh index\n\
                  synced: {rows:#?}\nfresh: {lua_rows:#?}"
+            ));
+        }
+        let rows = support::project_metadata_with_prefix(&project.db(), "dart_heads");
+        if rows != dart_rows {
+            divergent.push(format!(
+                "=== {driver} driver: the Dart head rows differ from a fresh index\n\
+                 synced: {rows:#?}\nfresh: {dart_rows:#?}"
             ));
         }
     }
@@ -946,6 +954,15 @@ matrix! {
     r_base_named_binding_whose_line_gains_a_function_reaches_its_callers,
     r_base_named_binding_whose_line_loses_its_function_leaves_its_callers,
     r_bare_call_stays_off_an_objects_method_that_appears,
+    dart_bare_call_reaches_a_method_of_a_base_its_superclass_starts_to_extend,
+    dart_bare_call_leaves_a_method_of_a_base_its_superclass_stops_extending,
+    dart_bare_call_reaches_an_extension_member_once_it_is_on_the_callers_base,
+    dart_bare_call_reaches_an_extension_member_once_its_superclass_extends_the_on_type,
+    dart_bare_call_reaches_a_member_whose_base_its_superclass_brings_nearer,
+    dart_bare_call_leaves_a_member_pushed_past_the_walk_limit,
+    dart_core_method_call_leaves_an_extension_moved_to_another_type,
+    dart_bare_call_leaves_an_extension_member_once_the_extension_is_unnamed,
+    dart_core_method_call_reaches_an_extension_moved_onto_its_type_past_the_tail_ceiling,
     php_call_in_another_case_leaves_a_function_once_a_namesake_in_another_case_appears,
     php_function_called_in_another_case_from_the_global_namespace_reaches_it_once_it_appears,
     #[ignore = "W5-07: a call through a class name reads its supertypes from the class heads, which no sync lane records"]

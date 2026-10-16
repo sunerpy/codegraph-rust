@@ -596,6 +596,14 @@ pub trait ResolutionContext {
         Arc::new(crate::lua_scope::LuaTables::new())
     }
 
+    /// The Dart hierarchy memo for the pass (upstream #2145): declaration
+    /// heads, supertypes by name and call-site hierarchies. Contexts that
+    /// live for one resolution pass keep one; the default builds a fresh one
+    /// on each call.
+    fn dart_tables(&self) -> Arc<crate::dart_scope::DartTables> {
+        Arc::new(crate::dart_scope::DartTables::new())
+    }
+
     /// The compiled pattern set `build` makes for `key` (a receiver's type
     /// patterns, a PHP property's). A context that resolves one sync's
     /// references in turn keeps the last few, since the same receivers recur

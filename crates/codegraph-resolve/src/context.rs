@@ -71,6 +71,7 @@ struct Caches {
     ruby_tables: Option<Arc<crate::ruby_scope::RubyTables>>,
     php_tables: Option<Arc<crate::php_scope::PhpTables>>,
     lua_tables: Option<Arc<crate::lua_scope::LuaTables>>,
+    dart_tables: Option<Arc<crate::dart_scope::DartTables>>,
     /// The last few compiled pattern sets, most recent last
     /// ([`ResolutionContext::compiled_patterns`]).
     patterns: std::collections::VecDeque<CompiledPatterns>,
@@ -126,6 +127,7 @@ impl Caches {
             ruby_tables: None,
             php_tables: None,
             lua_tables: None,
+            dart_tables: None,
             patterns: std::collections::VecDeque::new(),
             cfml_tables: None,
             swift_tables: None,
@@ -178,6 +180,7 @@ impl<'a> StoreResolutionContext<'a> {
         c.ruby_tables = None;
         c.php_tables = None;
         c.lua_tables = None;
+        c.dart_tables = None;
         c.patterns.clear();
         c.cfml_tables = None;
         c.swift_tables = None;
@@ -591,6 +594,15 @@ impl ResolutionContext for StoreResolutionContext<'_> {
                 .borrow_mut()
                 .lua_tables
                 .get_or_insert_with(|| Arc::new(crate::lua_scope::LuaTables::new())),
+        )
+    }
+
+    fn dart_tables(&self) -> Arc<crate::dart_scope::DartTables> {
+        Arc::clone(
+            self.caches
+                .borrow_mut()
+                .dart_tables
+                .get_or_insert_with(|| Arc::new(crate::dart_scope::DartTables::new())),
         )
     }
 

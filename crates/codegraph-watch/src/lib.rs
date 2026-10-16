@@ -3,6 +3,7 @@ pub mod cfml_heads;
 pub mod cpp_dependents;
 pub mod cpp_namespace_rows;
 pub mod csharp_surfaces;
+pub mod dart_heads;
 mod git;
 pub mod git_pending;
 pub mod go_heads;

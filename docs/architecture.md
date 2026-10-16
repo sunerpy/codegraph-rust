@@ -457,6 +457,14 @@ lowercased name equals it, since their names ignore case and a namesake in anoth
 or going changes the one candidate a case-insensitive match keeps; those retries live in the
 sync's memory, so the `case_folded_names_version` marker is withdrawn and restored with the
 others, and a sync that finds it missing re-resolves every PHP, Pascal and CFML file;
+a Dart file whose head row moved (a type came, went, became or stopped being an extension, names
+other supertypes, or sits `on` another type) touches the names of the members of every type of a
+changed type's ancestry, before the change and after it, and of every extension `on` one of those,
+and retries at its site every parked Dart call written with a receiver to a member of such a name,
+however many there are, since a bare call's class hierarchy and an extension's owner are read from
+the heads' text; the `dart_heads_version` marker is withdrawn and restored with the others, and a
+sync that finds it missing, or a row it cannot read, withdraws it before changing anything and
+re-resolves every Dart file;
 a changed R file touches each name of a base function it binds as a variable or constant, before
 the change and after it, since whether such a binding is what a call of its name means is read
 from its line, which no node records (`c <- list(f = function(x) x)`, upstream #2239); the

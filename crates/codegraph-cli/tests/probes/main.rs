@@ -14527,3 +14527,217 @@ mod r {
         assert_eq!(calls, Vec::<String>::new(), "{}", graph.report());
     }
 }
+
+mod dart_scope {
+    use super::support::{Graph, Project};
+
+    /// `from -> Owner::name` of every call edge out of `file`, sorted
+    /// (upstream's fixture helper).
+    fn calls_from(graph: &Graph, file: &str) -> Vec<String> {
+        let mut out: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|e| e.kind == "calls")
+            .filter(|e| graph.node(&e.source).is_some_and(|n| n.file_path == file))
+            .filter_map(|e| {
+                let source = graph.node(&e.source)?;
+                let target = graph.node(&e.target)?;
+                Some(format!("{} -> {}", source.name, target.qualified_name))
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// Upstream #2145: a bare Dart call reaches a method only through the
+    /// class it is written in (its members, what it extends, mixes in or
+    /// implements, or an extension on one of those), the nearest one winning;
+    /// outside any class, none. Upstream's fixture, plus an override in
+    /// another file nearer than the method it overrides beside the call, and
+    /// a chain whose links are written below its start.
+    #[test]
+    fn pr2145_a_bare_dart_call_stays_in_the_class_hierarchy() {
+        let project = Project::new()
+            .file("pubspec.yaml", "name: app\n")
+            .file(
+                "lib/handler.dart",
+                "class TestHandler {\n  void expect(Object value) {}\n  void test(String name) {}\n}\n\nabstract class HttpHeaders {\n  void add(String name, Object value);\n  void clear();\n}\n",
+            )
+            .file(
+                "lib/bloc.dart",
+                "abstract class Emittable<S> {\n  void emit(S state);\n}\n\nabstract class BlocBase<S> implements Emittable<S> {\n  @override\n  void emit(S state) {}\n}\n\nabstract class Cubit<S> extends BlocBase<S> {}\n\nclass CounterCubit extends Cubit<int> {\n  void increment() => emit(1);\n}\n",
+            )
+            .file(
+                "lib/notifier.dart",
+                "class Listenable {}\n\nmixin SingleMixin on Listenable {\n  void refresh() {}\n}\n\nclass ListNotifier extends Listenable {}\n\nclass ListNotifierSingle = ListNotifier with SingleMixin;\n\nclass RxList extends ListNotifierSingle {\n  void add(Object item) {\n    refresh();\n  }\n}\n",
+            )
+            .file(
+                "lib/element.dart",
+                "abstract class AnyNotifier<S> {}\n\nextension NotifierX<S> on AnyNotifier<S> {\n  void requireElement() {}\n}\n\nclass Notifier<\n  // the state\n  S\n> //\n    extends\n        AnyNotifier<\n          S\n        > {\n  void read() {\n    requireElement();\n  }\n}\n",
+            )
+            .file(
+                "lib/list_ext.dart",
+                "extension ListExtension<E> on List<E> {\n  void addIf(bool condition, E item) {\n    if (condition) add(item);\n  }\n}\n",
+            )
+            .file(
+                "lib/login.dart",
+                "class LoginState {\n  LoginState withEmail(String e) => this;\n  LoginState withPassword(String p) => this;\n}\n\nLoginState build() => LoginState().withEmail('a').withPassword('b');\n\nLoginState spread() => LoginState()\n    .withEmail('a')\n    .withPassword('b');\n",
+            )
+            .file(
+                "test/handler_test.dart",
+                "import 'package:test/test.dart';\n\nvoid main() {\n  test('works', () {\n    expect(1, 1);\n  });\n}\n",
+            )
+            .file(
+                "lib/override.dart",
+                "class Root {\n  void notify(int x) {}\n}\n\nclass Leaf extends Middle {\n  void run() {\n    notify(1);\n  }\n}\n",
+            )
+            .file(
+                "lib/middle.dart",
+                "class Middle extends Root {\n  @override\n  void notify(int x) {}\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        let report = graph.report();
+        assert_eq!(
+            calls_from(graph, "test/handler_test.dart"),
+            Vec::<String>::new(),
+            "{report}"
+        );
+        assert_eq!(
+            calls_from(graph, "lib/bloc.dart"),
+            vec!["increment -> BlocBase::emit".to_string()],
+            "{report}"
+        );
+        assert_eq!(
+            calls_from(graph, "lib/notifier.dart"),
+            vec!["add -> SingleMixin::refresh".to_string()],
+            "{report}"
+        );
+        assert_eq!(
+            calls_from(graph, "lib/element.dart"),
+            vec!["read -> NotifierX::requireElement".to_string()],
+            "{report}"
+        );
+        assert_eq!(
+            calls_from(graph, "lib/list_ext.dart"),
+            Vec::<String>::new(),
+            "{report}"
+        );
+        assert!(
+            calls_from(graph, "lib/login.dart")
+                .contains(&"build -> LoginState::withPassword".to_string()),
+            "{report}"
+        );
+        // A chain spread over lines keeps its links' methods too.
+        let login = calls_from(graph, "lib/login.dart");
+        for link in ["withEmail", "withPassword"] {
+            assert!(
+                login.contains(&format!("spread -> LoginState::{link}")),
+                "{login:?}\n{report}"
+            );
+        }
+        assert_eq!(
+            calls_from(graph, "lib/override.dart"),
+            vec!["run -> Middle::notify".to_string()],
+            "{report}"
+        );
+    }
+
+    /// Upstream #2207: a Dart core method name on an untyped receiver is the
+    /// core type's unless the receiver names the owner, and an extension's
+    /// owner is the type it is `on`: getx's `ext.endsWith(".avi")` is no
+    /// `extension RxStringExt on Rx<String>`'s. Upstream's fixture.
+    #[test]
+    fn pr2207_a_dart_core_method_name_on_an_untyped_receiver_is_the_core_types() {
+        let project = Project::new()
+            .file("pubspec.yaml", "name: app\n")
+            .file(
+                "lib/rx_string.dart",
+                "class Rx<T> {\n  Rx(this.value);\n  T value;\n}\n\nextension RxStringExt on Rx<String> {\n  bool endsWith(String other) => value.endsWith(other);\n}\n\nextension RxnStringExt on Rx<String?> {\n  bool endsWith(String other) => false;\n}\n",
+            )
+            .file(
+                "lib/get_utils.dart",
+                "class GetUtils {\n  static bool isVideo(String filePath) {\n    var ext = filePath.toLowerCase();\n    return ext.endsWith(\".avi\");\n  }\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        let targets: Vec<String> = calls_from(graph, "lib/get_utils.dart");
+        assert!(
+            !targets.iter().any(|t| t.ends_with("StringExt::endsWith")),
+            "{targets:?}\n{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream #2237: an unnamed `extension on X` is never `X` (here the
+    /// extractor names it `<anonymous>`) and applies only in its own
+    /// library: flutter_test's `find.text(…)` in another package is no
+    /// `extension on TaskStatus { String get text }`. Upstream's fixture,
+    /// its second check asked of the extension's file; plus a bare call of
+    /// such an extension's member from a subclass in another file, which the
+    /// class-hierarchy scope (#2145) alone would admit.
+    #[test]
+    fn pr2237_an_unnamed_dart_extension_applies_only_in_its_library() {
+        let project = Project::new()
+            .file("pubspec.yaml", "name: bloc_lint\n")
+            .file(
+                "lib/src/rules/avoid_build_context_extensions.dart",
+                "import 'package:analyzer/dart/ast/token.dart';\n\nextension on Token {\n  bool get isBlocType => lexeme.endsWith('Bloc');\n}\n",
+            )
+            .file(
+                "lib/src/linter.dart",
+                "import 'package:analyzer/dart/ast/token.dart';\n\nclass Linter {\n  void visit(Token beginToken) {}\n}\n",
+            )
+            .file(
+                "examples/visualizer/lib/timeline_page.dart",
+                "enum TaskStatus { queued, done }\n\nextension on TaskStatus {\n  String get text => 'x';\n}\n\nString label(TaskStatus status) => status.text;\n",
+            )
+            .file(
+                "examples/counter/test/counter_page_test.dart",
+                "import 'package:flutter_test/flutter_test.dart';\n\nvoid main() {\n  testWidgets('shows', (tester) async {\n    expect(find.text('0'), findsOneWidget);\n  });\n}\n",
+            )
+            .file(
+                "lib/src/foo.dart",
+                "class Foo {}\n\nextension on Foo {\n  void helper() {}\n}\n\nclass Near extends Foo {\n  void run() {\n    helper();\n  }\n}\n",
+            )
+            .file(
+                "lib/src/bar.dart",
+                "import 'foo.dart';\n\nclass Bar extends Foo {\n  void run() {\n    helper();\n  }\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        let targets_from = |file: &str| -> Vec<String> {
+            graph
+                .edges
+                .iter()
+                .filter(|e| e.kind != "contains")
+                .filter(|e| graph.node(&e.source).is_some_and(|n| n.file_path == file))
+                .filter_map(|e| graph.node(&e.target))
+                .map(|t| format!("{}:{}", t.file_path, t.qualified_name))
+                .collect()
+        };
+        let report = graph.report();
+        assert!(
+            !targets_from("lib/src/linter.dart")
+                .iter()
+                .any(|t| t.starts_with("lib/src/rules/avoid_build_context_extensions.dart:")),
+            "{report}"
+        );
+        assert!(
+            !targets_from("examples/counter/test/counter_page_test.dart")
+                .iter()
+                .any(|t| t.starts_with("examples/visualizer/lib/timeline_page.dart:")),
+            "{report}"
+        );
+        assert_eq!(
+            calls_from(graph, "lib/src/foo.dart"),
+            vec!["run -> <anonymous>::helper".to_string()],
+            "{report}"
+        );
+        assert_eq!(
+            calls_from(graph, "lib/src/bar.dart"),
+            Vec::<String>::new(),
+            "{report}"
+        );
+    }
+}

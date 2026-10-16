@@ -1540,8 +1540,24 @@ fn is_std_method_name(language: Language, name: &str) -> bool {
         Language::Rust => is_rust_std_method(name),
         Language::Kotlin => crate::kotlin_scope::is_kotlin_std_method(name),
         Language::Go => crate::go_calls::is_go_std_method(name),
+        Language::Dart => crate::dart_scope::DART_STD_METHODS.contains(&name),
         _ => false,
     }
+}
+
+/// Whether a receiver is named after the owner of `method`, for a Dart
+/// extension's member the type it is `on` (upstream #2207
+/// `receiverNamesOwner`): getx's `ext.endsWith(".avi")` on a String shares a
+/// word with `RxStringExt`, none with its `Rx<String>`.
+fn receiver_names_owner(receiver: &str, method: &Node, context: &dyn ResolutionContext) -> bool {
+    if let Some(qualified_name) = crate::dart_scope::dart_receiver_owner(method, context) {
+        let on = Node {
+            qualified_name,
+            ..method.clone()
+        };
+        return crate::kotlin_scope::shares_receiver_word(receiver, &on);
+    }
+    crate::kotlin_scope::shares_receiver_word(receiver, method)
 }
 
 /// A method of a test double (`MockedResponse`, `_FakeHTTPResponse`) the
@@ -2488,6 +2504,9 @@ pub fn match_by_exact_name(
     // A plain R call is a function call, never an object's method (upstream
     // #2177).
     let bare_r = crate::r_scope::is_bare_r_call(reference, context);
+    // A bare Dart call stays in the class hierarchy it is written in
+    // (upstream #2145).
+    let dart_bare = crate::dart_scope::is_dart_bare_call(reference, context);
     // A Python call's shape at its column decides what it can mean (upstream
     // #2125): a bare call no method, a chained one a member of its last link.
     let python_shape = crate::python_values::python_call_shape(reference, context);
@@ -2650,6 +2669,15 @@ pub fn match_by_exact_name(
                 && n.kind == NodeKind::Method
                 && !crate::cfml_scope::is_cfml_method_in_scope(n, reference, context))
         })
+        // riverpod's tests' `test(…)`, package:test's function, is no
+        // `ProviderContainer.test`: a bare Dart call reaches only a member of
+        // the class it is written in, of what that class extends, mixes in or
+        // implements, or of an extension on one of those (upstream #2145).
+        .filter(|n| {
+            !(dart_bare
+                && crate::dart_scope::is_dart_member(n)
+                && !crate::dart_scope::is_dart_method_in_scope(n, reference, context))
+        })
         // Ahead of the ranking, so a visible namesake wins: retrofit's tests'
         // `new Builder()` is not a wire converter test's nested
         // `CrashingPhone.Builder` (upstream #2236).
@@ -2715,6 +2743,10 @@ pub fn match_by_exact_name(
         .collect();
     let candidates = if kotlin_bare {
         kotlin_site.lexical(candidates, context)
+    } else if dart_bare {
+        // Of those, the nearest: bloc's `emit(…)` in a `Cubit` is
+        // `BlocBase.emit`, not the `Emittable` interface's (upstream #2145).
+        crate::dart_scope::nearest_dart_members(candidates, reference, context)
     } else if swift_shape
         .as_ref()
         .is_some_and(|shape| shape.shape != crate::swift_scope::Shape::Chained)
@@ -5792,7 +5824,7 @@ pub fn match_method_call(
             || (untyped && names_owner(&target_methods[0])))
         // A test double is only what a test names (upstream #2197).
         && !is_unnamed_test_double(&target_methods[0], &object_or_class, reference, context)
-        && !(std && !crate::kotlin_scope::shares_receiver_word(link, &target_methods[0]))
+        && !(std && !receiver_names_owner(link, &target_methods[0], context))
         // Where nothing types a receiver, the one method of that name must
         // also belong to something the receiver is named after
         // (`web_push_request.legacy_encrypt` -> WebPushRequest; rubocop's
@@ -5819,7 +5851,7 @@ pub fn match_method_call(
         let mut best_match: Option<&Node> = None;
         let mut best_score = 0i64;
         for method in &ordered {
-            if std && !crate::kotlin_scope::shares_receiver_word(link, method) {
+            if std && !receiver_names_owner(link, method, context) {
                 continue;
             }
             // A test double is only what a test constructs or names, never a
@@ -6564,12 +6596,19 @@ pub fn match_fuzzy(reference: &RefView, context: &dyn ResolutionContext) -> Opti
     let rust_scoped = crate::rust_scope::is_rust_bare_identifier(reference);
     let php_self = crate::php_scope::php_self_scope(reference, context);
     let bare_r = crate::r_scope::is_bare_r_call(reference, context);
+    let dart_bare = crate::dart_scope::is_dart_bare_call(reference, context);
     let callable_candidates = apply_language_gate(
         candidates
             .into_iter()
             .filter(|n| callable_kinds.contains(&n.kind))
             // A plain R call is no object's method (upstream #2177).
             .filter(|n| !(bare_r && n.kind == NodeKind::Method))
+            // A bare Dart call stays in its class hierarchy (upstream #2145).
+            .filter(|n| {
+                !(dart_bare
+                    && crate::dart_scope::is_dart_member(n)
+                    && !crate::dart_scope::is_dart_method_in_scope(n, reference, context))
+            })
             // C call syntax in Objective-C is no message, and a message to
             // `self` or `super` stays in the sender's hierarchy (upstream
             // #2150, #2179).

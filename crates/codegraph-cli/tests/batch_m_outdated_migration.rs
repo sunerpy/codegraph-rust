@@ -473,6 +473,24 @@ fn incremental_sync_on_outdated_v2_forces_all_files() {
         case_marker(&IndexPaths::resolve(&peer, None).expect("resolve peer v2 paths")),
         "a forced migration must write the case-folded marker of `index --force`"
     );
+    // The Dart head marker (W4-DART-01), likewise; its rows are
+    // `outdated_migration_writes_the_dart_head_rows_of_index_force`'s.
+    let dart_rows = |paths: &IndexPaths| {
+        Store::open_for_read(paths, deadline(), || false)
+            .expect("readable namespace")
+            .project_metadata_with_prefix("dart_heads")
+            .expect("Dart head rows")
+    };
+    assert_eq!(
+        dart_rows(&paths),
+        vec![("dart_heads_version".to_string(), "1".to_string())],
+        "a migration writes the Dart head marker"
+    );
+    assert_eq!(
+        dart_rows(&paths),
+        dart_rows(&IndexPaths::resolve(&peer, None).expect("resolve peer v2 paths")),
+        "a forced migration must write the Dart head marker of `index --force`"
+    );
     // The R base-binding marker (W4-R-01), likewise.
     let r_marker = |paths: &IndexPaths| {
         Store::open_for_read(paths, deadline(), || false)
@@ -1282,6 +1300,74 @@ fn outdated_migration_writes_the_objc_head_rows_of_index_force() {
         migrated,
         head_rows(&IndexPaths::resolve(&peer, None).expect("resolve peer v2 paths")),
         "a forced migration must write the Objective-C head rows of `index --force`"
+    );
+}
+
+/// W4-DART-01: a migration writes the Dart head rows (each type
+/// declaration's name, whether it is an extension and the supertypes its
+/// head names) and their marker as `index --force` does.
+#[test]
+fn outdated_migration_writes_the_dart_head_rows_of_index_force() {
+    let dir = TestDir::new("outdated-dart-heads");
+    let project = dir.path().join("mini");
+    for (path, contents) in [
+        ("pubspec.yaml", "name: app\n"),
+        (
+            "lib/cubit.dart",
+            "class Cubit extends Base with Mixed {}\n\nextension Helpers on Cubit {\n  void helper() {}\n}\n",
+        ),
+        ("lib/main.dart", "void main() {}\n"),
+    ] {
+        let full = project.join(path);
+        fs::create_dir_all(full.parent().unwrap()).expect("create the source directory");
+        fs::write(full, contents).expect("write a source file");
+    }
+    let run = cli(&["init", project.to_str().unwrap()]);
+    assert!(
+        run.ok,
+        "setup: `codegraph init` must succeed (stdout={}, stderr={})",
+        run.stdout, run.stderr
+    );
+    let paths = IndexPaths::resolve(&project, None).expect("resolve v2 paths");
+    stage_state_slot(
+        &paths,
+        100,
+        CURRENT_STORAGE_PROTOCOL,
+        CURRENT_EXTRACTION_VERSION - 1,
+        "current",
+    );
+    let run = cli(&["sync", project.to_str().unwrap()]);
+    assert!(
+        run.ok,
+        "sync must migrate an Outdated namespace: stdout={}, stderr={}",
+        run.stdout, run.stderr
+    );
+    let (_scratch, peer) = fresh_force_peer("outdated-dart-heads", &project);
+    let head_rows = |paths: &IndexPaths| {
+        Store::open_for_read(paths, deadline(), || false)
+            .expect("readable namespace")
+            .project_metadata_with_prefix("dart_heads")
+            .expect("Dart head rows")
+    };
+    let migrated = head_rows(&paths);
+    // No row for a file that declares no type.
+    assert_eq!(
+        migrated
+            .iter()
+            .map(|(key, _)| key.as_str())
+            .collect::<Vec<_>>(),
+        ["dart_heads:lib/cubit.dart", "dart_heads_version"],
+        "a migration writes the head rows and their marker: {migrated:?}"
+    );
+    assert!(
+        migrated[0].1.contains("\"Base\",\"Mixed\"")
+            && migrated[0].1.contains("\"extension\":true"),
+        "a row names the supertypes and the extension: {migrated:?}"
+    );
+    assert_eq!(
+        migrated,
+        head_rows(&IndexPaths::resolve(&peer, None).expect("resolve peer v2 paths")),
+        "a forced migration must write the Dart head rows of `index --force`"
     );
 }
 

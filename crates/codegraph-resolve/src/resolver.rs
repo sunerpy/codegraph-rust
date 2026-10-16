@@ -1252,6 +1252,13 @@ fn target_is_visible_across_files(
     {
         return false;
     }
+    // An unnamed Dart `extension on X` applies only where it is declared
+    // (upstream #2237): a subclass's bare call in another file is no member
+    // of it, though the extension sits `on` its base (#2145). The extractor
+    // names it `<anonymous>`, so no name means it.
+    if crate::dart_scope::is_dart_unnamed_extension_member(target, context) {
+        return false;
+    }
     // An R test file runs in an environment of its own (testthat): its
     // top-level `c <- ggplot(…)` is not what the package's 2,843 `c(…)` calls
     // mean, nor another test's. The `helper-*.R` and `setup-*.R` files are

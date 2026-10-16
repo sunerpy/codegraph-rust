@@ -5651,6 +5651,213 @@ pub fn r_bare_call_stays_off_an_objects_method_that_appears() -> Case {
         .no_edge_after("function scale_limits", "calls", "method Coord::range")
 }
 
+/// Upstream #2145 (W4-DART-01): a bare Dart call in a subclass reaches the
+/// method of a base its superclass, in another file, starts to extend: the
+/// hierarchy is read from the class heads, and no node of `emit` changed.
+pub fn dart_bare_call_reaches_a_method_of_a_base_its_superclass_starts_to_extend() -> Case {
+    Case::new(Change::EditHeritage, &[Language::Dart])
+        .file("pubspec.yaml", "name: app\n")
+        .file("lib/base.dart", "class Base {\n  void emit(int x) {}\n}\n")
+        .file("lib/cubit.dart", "class Cubit {}\n")
+        .file(
+            "lib/sub.dart",
+            "class Sub extends Cubit {\n  void run() {\n    emit(1);\n  }\n}\n",
+        )
+        .write("lib/cubit.dart", "class Cubit extends Base {}\n")
+        .edge_after("method Sub::run", "calls", "method Base::emit")
+}
+
+/// The reverse: the superclass stops extending the base, so the call leaves
+/// its method.
+pub fn dart_bare_call_leaves_a_method_of_a_base_its_superclass_stops_extending() -> Case {
+    Case::new(Change::EditHeritage, &[Language::Dart])
+        .file("pubspec.yaml", "name: app\n")
+        .file("lib/base.dart", "class Base {\n  void emit(int x) {}\n}\n")
+        .file("lib/cubit.dart", "class Cubit extends Base {}\n")
+        .file(
+            "lib/sub.dart",
+            "class Sub extends Cubit {\n  void run() {\n    emit(1);\n  }\n}\n",
+        )
+        .write("lib/cubit.dart", "class Cubit {}\n")
+        .edge_before("method Sub::run", "calls", "method Base::emit")
+        .no_edge_after("method Sub::run", "calls", "method Base::emit")
+}
+
+/// An extension in another file comes to sit `on` the caller's base: a bare
+/// call of its member there reaches it.
+pub fn dart_bare_call_reaches_an_extension_member_once_it_is_on_the_callers_base() -> Case {
+    Case::new(Change::EditHeritage, &[Language::Dart])
+        .file("pubspec.yaml", "name: app\n")
+        .file("lib/base.dart", "class Base {}\n\nclass Other {}\n")
+        .file(
+            "lib/ext.dart",
+            "extension Helpers on Other {\n  void helper() {}\n}\n",
+        )
+        .file(
+            "lib/sub.dart",
+            "class Sub extends Base {\n  void run() {\n    helper();\n  }\n}\n",
+        )
+        .write(
+            "lib/ext.dart",
+            "extension Helpers on Base {\n  void helper() {}\n}\n",
+        )
+        .edge_after("method Sub::run", "calls", "method Helpers::helper")
+}
+
+/// A superclass in another file starts to extend the type an extension sits
+/// `on`: a bare call of the extension's member in the subclass reaches it,
+/// though neither the extension nor the call changed.
+pub fn dart_bare_call_reaches_an_extension_member_once_its_superclass_extends_the_on_type() -> Case
+{
+    Case::new(Change::EditHeritage, &[Language::Dart])
+        .file("pubspec.yaml", "name: app\n")
+        .file("lib/base.dart", "class Base {}\n")
+        .file(
+            "lib/ext.dart",
+            "extension Helpers on Base {\n  void helper() {}\n}\n",
+        )
+        .file("lib/cubit.dart", "class Cubit {}\n")
+        .file(
+            "lib/sub.dart",
+            "class Sub extends Cubit {\n  void run() {\n    helper();\n  }\n}\n",
+        )
+        .write("lib/cubit.dart", "class Cubit extends Base {}\n")
+        .edge_after("method Sub::run", "calls", "method Helpers::helper")
+}
+
+/// A superclass in another file moves a base nearer without the base
+/// coming or going: the subclass's bare call now reaches that base's member
+/// rather than a farther one through its mixin.
+pub fn dart_bare_call_reaches_a_member_whose_base_its_superclass_brings_nearer() -> Case {
+    Case::new(Change::EditHeritage, &[Language::Dart])
+        .file("pubspec.yaml", "name: app\n")
+        .file("lib/c.dart", "class C {\n  void m() {}\n}\n")
+        .file(
+            "lib/b.dart",
+            "class B2 extends C {}\n\nclass B extends B2 {}\n",
+        )
+        .file(
+            "lib/d.dart",
+            "class D {\n  void m() {}\n}\n\nclass F extends D {}\n\nclass E extends F {}\n",
+        )
+        .file("lib/a.dart", "class A extends B {}\n")
+        .file(
+            "lib/sub.dart",
+            "class Sub extends A with E {\n  void run() {\n    m();\n  }\n}\n",
+        )
+        .write("lib/a.dart", "class A extends C {}\n")
+        .edge_before("method Sub::run", "calls", "method D::m")
+        .edge_after("method Sub::run", "calls", "method C::m")
+}
+
+/// Forty types, so that a head naming them all pushes the rest of a
+/// hierarchy past the resolver's walk limit.
+static FORTY_TYPES: LazyLock<String> = LazyLock::new(|| {
+    (1..=40)
+        .map(|index| format!("class X{index} {{}}\n"))
+        .collect()
+});
+
+/// A superclass in another file comes to implement forty types: the walk
+/// from the subclass stops before reaching its mixin's base, so the bare
+/// call leaves that base's member, though no member came or went.
+pub fn dart_bare_call_leaves_a_member_pushed_past_the_walk_limit() -> Case {
+    Case::new(Change::EditHeritage, &[Language::Dart])
+        .file("pubspec.yaml", "name: app\n")
+        .file("lib/m.dart", "class M1 {\n  void m() {}\n}\n\nclass M extends M1 {}\n")
+        .file("lib/x.dart", FORTY_TYPES.as_str())
+        .file("lib/mid.dart", "class Mid {}\n")
+        .file(
+            "lib/sub.dart",
+            "class Sub extends Mid with M {\n  void run() {\n    m();\n  }\n}\n",
+        )
+        .write(
+            "lib/mid.dart",
+            "class Mid implements X1, X2, X3, X4, X5, X6, X7, X8, X9, X10, X11, X12, X13, X14, X15, X16, X17, X18, X19, X20, X21, X22, X23, X24, X25, X26, X27, X28, X29, X30, X31, X32, X33, X34, X35, X36, X37, X38, X39, X40 {}\n",
+        )
+        .edge_before("method Sub::run", "calls", "method M1::m")
+        .no_edge_after("method Sub::run", "calls", "method M1::m")
+}
+
+/// Upstream #2207 (W4-DART-01): a core method name on an untyped receiver
+/// reaches an extension's member only through a receiver named after the
+/// type it is `on`; the extension moving to another type takes the call off
+/// it, though no node of `endsWith` changed.
+pub fn dart_core_method_call_leaves_an_extension_moved_to_another_type() -> Case {
+    Case::new(Change::EditHeritage, &[Language::Dart])
+        .file("pubspec.yaml", "name: app\n")
+        .file(
+            "lib/rx.dart",
+            "extension RxStringExt on Rx<String> {\n  bool endsWith(String s) => true;\n}\n",
+        )
+        .file(
+            "lib/use.dart",
+            "bool isVideo() {\n  var stringValue = load();\n  return stringValue.endsWith(\".avi\");\n}\n",
+        )
+        .write(
+            "lib/rx.dart",
+            "extension RxStringExt on Rx<int> {\n  bool endsWith(String s) => true;\n}\n",
+        )
+        .edge_before("function isVideo", "calls", "method RxStringExt::endsWith")
+        .no_edge_after("function isVideo", "calls", "method RxStringExt::endsWith")
+}
+
+/// 501 parked calls of `endsWith` through receivers named after nothing,
+/// so the shared tail retry skips that tail.
+static ENDS_WITH_CALLS: LazyLock<String> = LazyLock::new(|| {
+    let mut text = String::from("void noise() {\n");
+    for index in 0..501 {
+        text.push_str(&format!("  missing{index}.endsWith('x');\n"));
+    }
+    text.push_str("}\n");
+    text
+});
+
+/// The reverse, past the tail ceiling: the extension moving onto `Rx<String>`
+/// brings `stringValue.endsWith(…)` to it, however many parked calls share
+/// the `endsWith` tail.
+pub fn dart_core_method_call_reaches_an_extension_moved_onto_its_type_past_the_tail_ceiling() -> Case
+{
+    Case::new(Change::EditHeritage, &[Language::Dart])
+        .file("pubspec.yaml", "name: app\n")
+        .file(
+            "lib/rx.dart",
+            "extension RxStringExt on Rx<int> {\n  bool endsWith(String s) => true;\n}\n",
+        )
+        .file(
+            "lib/use.dart",
+            "bool isVideo() {\n  var stringValue = load();\n  return stringValue.endsWith(\".avi\");\n}\n",
+        )
+        .file("noise/noise.dart", ENDS_WITH_CALLS.as_str())
+        .write(
+            "lib/rx.dart",
+            "extension RxStringExt on Rx<String> {\n  bool endsWith(String s) => true;\n}\n",
+        )
+        .edge_after("function isVideo", "calls", "method RxStringExt::endsWith")
+}
+
+/// Upstream #2237 (W4-DART-01): an extension losing its name applies only in
+/// its own file, so a subclass's bare call in another file leaves its member.
+pub fn dart_bare_call_leaves_an_extension_member_once_the_extension_is_unnamed() -> Case {
+    Case::new(Change::RenameSymbol, &[Language::Dart])
+        .file("pubspec.yaml", "name: app\n")
+        .file("lib/foo_type.dart", "class Foo {}\n")
+        .file(
+            "lib/foo.dart",
+            "extension Helpers on Foo {\n  void helper() {}\n}\n",
+        )
+        .file(
+            "lib/bar.dart",
+            "class Bar extends Foo {\n  void run() {\n    helper();\n  }\n}\n",
+        )
+        .write(
+            "lib/foo.dart",
+            "extension on Foo {\n  void helper() {}\n}\n",
+        )
+        .edge_before("method Bar::run", "calls", "method Helpers::helper")
+        .no_edge_after("method Bar::run", "calls", "method <anonymous>::helper")
+}
+
 // ----- a call through a class name and the heads it reads (W5-07) ------------
 //
 // Upstream #2180 (W3-06): a call through a class name reaches the method the

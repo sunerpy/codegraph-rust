@@ -339,6 +339,18 @@ has no row. They are written, withdrawn and checked like the head rows under
 re-resolves every PHP file and rebuilds the rows. Neither is a canonical
 surface.
 
+Dart head rows record what a bare Dart call reads of a file's types:
+`dart_heads:<path>` holds the JSON `{"entries": [{"name", "extension", "supers",
+"on"}]}`, one entry per class, mixin, enum and extension in source order, with
+whether it is an extension, the names its head extends, mixes in, implements or
+sits `on` (comments and type arguments dropped), and the type the first line of
+its name's first declaration puts an extension `on`, type arguments kept. A file
+with no type declaration has no row. They are written, withdrawn and checked
+like the head rows under `dart_heads_version` (1); a sync that finds it missing
+or at another version, or a row it cannot read, withdraws the marker before
+changing anything, re-resolves every Dart file and rebuilds the rows. Neither is
+a canonical surface.
+
 Lua module rows record what a Lua call in another file reads of a Lua file:
 `lua_module:<path>` holds the JSON `{"locals", "reads", "globals", "surface"}`:
 every `local` declaration in source order as `[name, kind, line]`, the modules
