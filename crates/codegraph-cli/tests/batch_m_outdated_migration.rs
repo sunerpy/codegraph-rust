@@ -491,6 +491,24 @@ fn incremental_sync_on_outdated_v2_forces_all_files() {
         dart_rows(&IndexPaths::resolve(&peer, None).expect("resolve peer v2 paths")),
         "a forced migration must write the Dart head marker of `index --force`"
     );
+    // The Dart library marker (W4-DART-02), likewise; its rows are
+    // `outdated_migration_writes_the_dart_library_rows_of_index_force`'s.
+    let dart_library_marker = |paths: &IndexPaths| {
+        Store::open_for_read(paths, deadline(), || false)
+            .expect("readable namespace")
+            .get_project_metadata("dart_libraries_version")
+            .expect("Dart library marker")
+    };
+    assert_eq!(
+        dart_library_marker(&paths).as_deref(),
+        Some("1"),
+        "a migration writes the Dart library marker"
+    );
+    assert_eq!(
+        dart_library_marker(&paths),
+        dart_library_marker(&IndexPaths::resolve(&peer, None).expect("resolve peer v2 paths")),
+        "a forced migration must write the Dart library marker of `index --force`"
+    );
     // The R base-binding marker (W4-R-01), likewise.
     let r_marker = |paths: &IndexPaths| {
         Store::open_for_read(paths, deadline(), || false)
@@ -1368,6 +1386,84 @@ fn outdated_migration_writes_the_dart_head_rows_of_index_force() {
         migrated,
         head_rows(&IndexPaths::resolve(&peer, None).expect("resolve peer v2 paths")),
         "a forced migration must write the Dart head rows of `index --force`"
+    );
+}
+
+/// W4-DART-02: a migration writes the Dart library rows (a file's `library`
+/// name, `part of` target, parts, and imports and exports with their
+/// prefixes and combinators) and their marker as `index --force` does.
+#[test]
+fn outdated_migration_writes_the_dart_library_rows_of_index_force() {
+    let dir = TestDir::new("outdated-dart-libraries");
+    let project = dir.path().join("mini");
+    for (path, contents) in [
+        ("pubspec.yaml", "name: app\n"),
+        (
+            "lib/app.dart",
+            "library app;\n\nimport 'src/util.dart' as util show helper;\nexport 'src/util.dart' hide hidden;\n\npart 'piece.dart';\n",
+        ),
+        ("lib/piece.dart", "part of 'app.dart';\n\nint run() => 1;\n"),
+        (
+            "lib/src/util.dart",
+            "int helper() => 1;\nint hidden() => 2;\n",
+        ),
+    ] {
+        let full = project.join(path);
+        fs::create_dir_all(full.parent().unwrap()).expect("create the source directory");
+        fs::write(full, contents).expect("write a source file");
+    }
+    let run = cli(&["init", project.to_str().unwrap()]);
+    assert!(
+        run.ok,
+        "setup: `codegraph init` must succeed (stdout={}, stderr={})",
+        run.stdout, run.stderr
+    );
+    let paths = IndexPaths::resolve(&project, None).expect("resolve v2 paths");
+    stage_state_slot(
+        &paths,
+        100,
+        CURRENT_STORAGE_PROTOCOL,
+        CURRENT_EXTRACTION_VERSION - 1,
+        "current",
+    );
+    let run = cli(&["sync", project.to_str().unwrap()]);
+    assert!(
+        run.ok,
+        "sync must migrate an Outdated namespace: stdout={}, stderr={}",
+        run.stdout, run.stderr
+    );
+    let (_scratch, peer) = fresh_force_peer("outdated-dart-libraries", &project);
+    let library_rows = |paths: &IndexPaths| {
+        Store::open_for_read(paths, deadline(), || false)
+            .expect("readable namespace")
+            .project_metadata_with_prefix("dart_librar")
+            .expect("Dart library rows")
+    };
+    let migrated = library_rows(&paths);
+    // No row for a file without a directive.
+    assert_eq!(
+        migrated
+            .iter()
+            .map(|(key, _)| key.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "dart_libraries_version",
+            "dart_library:lib/app.dart",
+            "dart_library:lib/piece.dart"
+        ],
+        "a migration writes the library rows and their marker: {migrated:?}"
+    );
+    assert!(
+        migrated[1].1.contains("\"prefix\":\"util\"")
+            && migrated[1].1.contains("\"show\":[\"helper\"]")
+            && migrated[1].1.contains("\"hide\":[\"hidden\"]")
+            && migrated[1].1.contains("\"parts\":[\"piece.dart\"]"),
+        "a row records the directives: {migrated:?}"
+    );
+    assert_eq!(
+        migrated,
+        library_rows(&IndexPaths::resolve(&peer, None).expect("resolve peer v2 paths")),
+        "a forced migration must write the Dart library rows of `index --force`"
     );
 }
 

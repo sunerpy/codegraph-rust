@@ -195,6 +195,7 @@ struct SnapshotCaches {
     php_tables: OnceLock<Arc<crate::php_scope::PhpTables>>,
     lua_tables: OnceLock<Arc<crate::lua_scope::LuaTables>>,
     dart_tables: OnceLock<Arc<crate::dart_scope::DartTables>>,
+    dart_libraries: OnceLock<Arc<crate::dart_libraries::DartLibraries>>,
     cfml_tables: OnceLock<Arc<crate::cfml_scope::CfmlTables>>,
     swift_tables: OnceLock<Arc<crate::swift_type_visibility::SwiftTables>>,
     objc_tables: OnceLock<Arc<crate::objc_scope::ObjcTables>>,
@@ -225,6 +226,7 @@ impl SnapshotCaches {
             php_tables: OnceLock::new(),
             lua_tables: OnceLock::new(),
             dart_tables: OnceLock::new(),
+            dart_libraries: OnceLock::new(),
             cfml_tables: OnceLock::new(),
             swift_tables: OnceLock::new(),
             objc_tables: OnceLock::new(),
@@ -791,6 +793,14 @@ impl ResolutionContext for SnapshotResolutionContext {
             self.caches
                 .dart_tables
                 .get_or_init(|| Arc::new(crate::dart_scope::DartTables::new())),
+        )
+    }
+
+    fn dart_libraries(&self) -> Arc<crate::dart_libraries::DartLibraries> {
+        Arc::clone(
+            self.caches
+                .dart_libraries
+                .get_or_init(|| Arc::new(crate::dart_libraries::DartLibraries::new())),
         )
     }
 

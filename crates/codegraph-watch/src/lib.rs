@@ -4,6 +4,7 @@ pub mod cpp_dependents;
 pub mod cpp_namespace_rows;
 pub mod csharp_surfaces;
 pub mod dart_heads;
+pub mod dart_libraries;
 mod git;
 pub mod git_pending;
 pub mod go_heads;

@@ -1115,6 +1115,39 @@ impl Store {
         rows.collect()
     }
 
+    /// The files of `language` whose `extends` or `implements` references
+    /// name `name`, resolved (to a node of that name) or parked (W4-DART-02).
+    pub fn files_with_inheritance_refs_to(
+        &self,
+        language: Language,
+        name: &str,
+    ) -> rusqlite::Result<BTreeSet<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT s.file_path FROM edges e \
+             JOIN nodes s ON s.id = e.source JOIN nodes t ON t.id = e.target \
+             WHERE e.kind IN ('extends', 'implements') AND t.name = ?2 AND s.language = ?1 \
+             UNION SELECT file_path FROM unresolved_refs \
+             WHERE reference_kind IN ('extends', 'implements') AND reference_name = ?2 \
+             AND language = ?1",
+        )?;
+        stmt.query_map(params![language.as_str(), name], |row| row.get(0))?
+            .collect()
+    }
+
+    /// The names `file`'s `extends` and `implements` references write: the
+    /// target's name of a resolved one, the reference's own of a parked one
+    /// (W4-DART-02).
+    pub fn inheritance_ref_names_in_file(&self, file: &str) -> rusqlite::Result<BTreeSet<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT t.name FROM edges e \
+             JOIN nodes s ON s.id = e.source JOIN nodes t ON t.id = e.target \
+             WHERE e.kind IN ('extends', 'implements') AND s.file_path = ?1 \
+             UNION SELECT reference_name FROM unresolved_refs \
+             WHERE reference_kind IN ('extends', 'implements') AND file_path = ?1",
+        )?;
+        stmt.query_map(params![file], |row| row.get(0))?.collect()
+    }
+
     /// The unresolved references of `language` written with a receiver,
     /// `receiver.member`, whose member (the text after the last `.`) is one of
     /// `members`, in id order and with no ceiling: a lane that knows which

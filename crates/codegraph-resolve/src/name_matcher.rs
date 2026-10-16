@@ -2507,6 +2507,15 @@ pub fn match_by_exact_name(
     // A bare Dart call stays in the class hierarchy it is written in
     // (upstream #2145).
     let dart_bare = crate::dart_scope::is_dart_bare_call(reference, context);
+    // A Dart type name — a declared type, a supertype, the `Color` of
+    // `Color.red` — is in scope as a call is, or through its import prefix
+    // (upstream #2386).
+    let dart_type_ref = crate::dart_libraries::is_dart_type_ref(reference);
+    let dart_prefix = if dart_type_ref {
+        crate::dart_libraries::dart_import_prefix_of(reference, context)
+    } else {
+        None
+    };
     // A Python call's shape at its column decides what it can mean (upstream
     // #2125): a bare call no method, a chained one a member of its last link.
     let python_shape = crate::python_values::python_call_shape(reference, context);
@@ -2678,6 +2687,26 @@ pub fn match_by_exact_name(
                 && crate::dart_scope::is_dart_member(n)
                 && !crate::dart_scope::is_dart_method_in_scope(n, reference, context))
         })
+        // bloc's brick hook calls `info(…)` on mason's `Logger`, no enum
+        // constant of bloc_lint's: a bare Dart call reaches a type's value
+        // only from inside the type, as its methods (upstream #2386).
+        .filter(|n| {
+            !(dart_bare
+                && crate::dart_libraries::is_dart_type_value(n)
+                && !crate::dart_scope::is_dart_method_in_scope(n, reference, context))
+        })
+        // A receiver-less Dart name reaches only what its library declares or
+        // imports, ahead of the ranking, so a visible namesake wins (upstream
+        // #2386).
+        .filter(|n| {
+            !((dart_bare || dart_type_ref)
+                && !crate::dart_libraries::is_dart_top_level_visible(
+                    n,
+                    reference,
+                    context,
+                    dart_prefix.as_deref(),
+                ))
+        })
         // Ahead of the ranking, so a visible namesake wins: retrofit's tests'
         // `new Builder()` is not a wire converter test's nested
         // `CrashingPhone.Builder` (upstream #2236).
@@ -2744,9 +2773,16 @@ pub fn match_by_exact_name(
     let candidates = if kotlin_bare {
         kotlin_site.lexical(candidates, context)
     } else if dart_bare {
-        // Of those, the nearest: bloc's `emit(…)` in a `Cubit` is
-        // `BlocBase.emit`, not the `Emittable` interface's (upstream #2145).
-        crate::dart_scope::nearest_dart_members(candidates, reference, context)
+        // Of those, the library's own (upstream #2386), then the nearest:
+        // bloc's `emit(…)` in a `Cubit` is `BlocBase.emit`, not the
+        // `Emittable` interface's (upstream #2145).
+        crate::dart_scope::nearest_dart_members(
+            crate::dart_libraries::prefer_own_dart_library(candidates, reference, context),
+            reference,
+            context,
+        )
+    } else if dart_type_ref && dart_prefix.is_none() {
+        crate::dart_libraries::prefer_own_dart_library(candidates, reference, context)
     } else if swift_shape
         .as_ref()
         .is_some_and(|shape| shape.shape != crate::swift_scope::Shape::Chained)
@@ -6597,6 +6633,12 @@ pub fn match_fuzzy(reference: &RefView, context: &dyn ResolutionContext) -> Opti
     let php_self = crate::php_scope::php_self_scope(reference, context);
     let bare_r = crate::r_scope::is_bare_r_call(reference, context);
     let dart_bare = crate::dart_scope::is_dart_bare_call(reference, context);
+    let dart_type_ref = crate::dart_libraries::is_dart_type_ref(reference);
+    let dart_prefix = if dart_type_ref {
+        crate::dart_libraries::dart_import_prefix_of(reference, context)
+    } else {
+        None
+    };
     let callable_candidates = apply_language_gate(
         candidates
             .into_iter()
@@ -6608,6 +6650,17 @@ pub fn match_fuzzy(reference: &RefView, context: &dyn ResolutionContext) -> Opti
                 !(dart_bare
                     && crate::dart_scope::is_dart_member(n)
                     && !crate::dart_scope::is_dart_method_in_scope(n, reference, context))
+            })
+            // A receiver-less Dart name, only what its library sees (upstream
+            // #2386).
+            .filter(|n| {
+                !((dart_bare || dart_type_ref)
+                    && !crate::dart_libraries::is_dart_top_level_visible(
+                        n,
+                        reference,
+                        context,
+                        dart_prefix.as_deref(),
+                    ))
             })
             // C call syntax in Objective-C is no message, and a message to
             // `self` or `super` stays in the sender's hierarchy (upstream
@@ -6720,6 +6773,11 @@ pub fn match_fuzzy(reference: &RefView, context: &dyn ResolutionContext) -> Opti
         .filter(|n| n.language == reference.language)
         .cloned()
         .collect();
+    // Upstream #2386 also prefers a Dart library's own declaration here. The
+    // port leaves it out, as it can never apply: exact matching keeps every
+    // own declaration this strategy keeps, so it has resolved the name
+    // already, and where exact matching declines past the ambiguity ceiling,
+    // this strategy declines first, on the unfiltered set.
     let final_candidates = if !same_language.is_empty() {
         same_language
     } else {

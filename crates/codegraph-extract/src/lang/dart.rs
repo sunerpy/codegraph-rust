@@ -58,7 +58,12 @@ impl LanguageSpec for DartSpec {
     }
 
     fn import_types(&self) -> &'static [&'static str] {
-        &["import_or_export"]
+        // `part 'x.g.dart';` is a library naming one of its own files — a
+        // generated part, often. Its URI resolves as an import's does, so the
+        // library links the part's file the way it links a file it imports,
+        // and a change to the part reaches whatever depends on the library.
+        // `part of` adds nothing to that edge, and stays out (upstream #2391).
+        &["import_or_export", "part_directive"]
     }
 
     fn call_types(&self) -> &'static [&'static str] {
@@ -203,10 +208,16 @@ impl LanguageSpec for DartSpec {
 
     fn extract_import(&self, node: Node<'_>, source: &str) -> Option<ImportInfo> {
         let signature = node_text(node, source).trim().to_string();
-        let module_name = node
-            .named_children(&mut node.walk())
-            .find(|child| matches!(child.kind(), "library_import" | "library_export"))
-            .and_then(|lib| first_descendant_kind(lib, "string_literal"))
+        // A part holds its `uri` directly; an import or export inside its
+        // `library_import` / `library_export`.
+        let holder = if node.kind() == "part_directive" {
+            node.child_by_field_name("uri")
+        } else {
+            node.named_children(&mut node.walk())
+                .find(|child| matches!(child.kind(), "library_import" | "library_export"))
+        };
+        let module_name = holder
+            .and_then(|holder| first_descendant_kind(holder, "string_literal"))
             .map(|lit| node_text(lit, source).replace(['\'', '"'], ""));
         module_name
             .filter(|m| !m.is_empty())

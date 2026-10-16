@@ -465,6 +465,25 @@ however many there are, since a bare call's class hierarchy and an extension's o
 the heads' text; the `dart_heads_version` marker is withdrawn and restored with the others, and a
 sync that finds it missing, or a row it cannot read, withdraws it before changing anything and
 re-resolves every Dart file;
+a Dart file whose library row moved, or a Dart file added or removed, has the sync read the Dart
+library model twice, from the rows before the change and after it: an unchanged Dart file whose
+scope (its library and the files its imports apply from), imported libraries (an unprefixed import
+naming no project library left out) or directive targets moved re-resolves whole, and, library by
+library, every name a namespace brings in or lets out before against after (a file joining or
+leaving it touches its top-level names and its unnamed extensions' members) is touched for the
+name lane, since a receiver-less Dart name reaches what its library and the libraries it imports
+export along export chains read from the files' heads; a type whose reach moved for a file that
+writes it in an `extends` or `implements` touches, too, the names of the members of its ancestry
+and of the extensions `on` one of those types (read from the head rows), and retries at its site
+every parked Dart call written with a receiver to such a name, however many there are, since a
+call on a subclass reaches them through that edge; an added Dart file retries at its site every
+parked Dart import whose URI ends in its name, however many there are; a moved Dart import
+node touches no name, since no resolution reads one and its URI, written as a bare file name,
+names every file of that name; the `dart_libraries_version` marker is withdrawn and restored with
+the others, and a sync that finds it missing, or a row it cannot read, withdraws it before
+changing anything and re-resolves every Dart file; the `pubspec.yaml` and `pubspec_overrides.yaml`
+files a Dart file's package and `path:` dependencies are read from are no source files (a change to
+one itself is not yet detected);
 a changed R file touches each name of a base function it binds as a variable or constant, before
 the change and after it, since whether such a binding is what a call of its name means is read
 from its line, which no node records (`c <- list(f = function(x) x)`, upstream #2239); the

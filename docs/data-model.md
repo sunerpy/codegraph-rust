@@ -351,6 +351,19 @@ or at another version, or a row it cannot read, withdraws the marker before
 changing anything, re-resolves every Dart file and rebuilds the rows. Neither is
 a canonical surface.
 
+Dart library rows record what a Dart name or import reads of a file's
+directives: `dart_library:<path>` holds the JSON `{"library", "part_of_uri",
+"part_of_name", "parts", "imports", "exports"}`, each key only when the file has
+it: the `library` name, the URI or library name its `part of` gives, its `part`
+URIs, and each `import` and `export` in source order as `{"uris", "prefix",
+"show", "hide"}` (the URI and its conditional alternatives, the `as` prefix, and
+the names its combinators let through or hide, sorted). A file with no
+directive has no row. They are written, withdrawn and checked like the head
+rows under `dart_libraries_version` (1); a sync that finds it missing or at
+another version, or a row it cannot read, withdraws the marker before changing
+anything, re-resolves every Dart file and rebuilds the rows. Neither is a
+canonical surface.
+
 Lua module rows record what a Lua call in another file reads of a Lua file:
 `lua_module:<path>` holds the JSON `{"locals", "reads", "globals", "surface"}`:
 every `local` declaration in source order as `[name, kind, line]`, the modules

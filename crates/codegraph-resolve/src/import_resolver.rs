@@ -650,6 +650,17 @@ pub fn is_lua_require_ref(reference: &RefView) -> bool {
         && reference.reference_kind == codegraph_core::types::EdgeKind::Imports
 }
 
+/// A Dart `import`, `export` or `part` (upstream `isDartImportRef`, #2388):
+/// its name is the URI, which names one file or none — `dart:async`, a
+/// package from outside the project, a generated part nobody committed — and
+/// never a symbol: the name-matcher took the URI's last segment for a file
+/// name (`package:flutter/foundation.dart` went to riverpod's own
+/// foundation.dart) or bound it to the file's own `import` node.
+pub fn is_dart_import_ref(reference: &RefView) -> bool {
+    reference.language == Language::Dart
+        && reference.reference_kind == codegraph_core::types::EdgeKind::Imports
+}
+
 /// Is this reference a PHP include/require PATH (vs a namespace `use` symbol)?
 /// (`isPhpIncludePathRef`, `import-resolver.ts:541-547`).
 pub fn is_php_include_path_ref(reference: &RefView) -> bool {
@@ -1947,6 +1958,30 @@ pub fn resolve_via_import(
             .into_iter()
             .find(|n| n.kind == NodeKind::File && n.file_path == file)
     {
+        return Some(ResolvedRef {
+            original: reference.clone(),
+            target_node_id: file_node.id.clone(),
+            confidence: 0.9,
+            resolved_by: ResolvedBy::Import,
+        });
+    }
+    // A Dart `import` / `export` URI names a library file, and a `part` URI
+    // one of the library's own files: `package:app/x.dart` is app's
+    // lib/x.dart, any other path is from the file the directive is in
+    // (upstream #2388, #2391).
+    if is_dart_import_ref(reference) {
+        let file = crate::dart_libraries::dart_directive_file(
+            &reference.file_path,
+            &reference.reference_name,
+            context,
+        )?;
+        if file == reference.file_path {
+            return None;
+        }
+        let file_node = context
+            .get_nodes_in_file_shared(&file)
+            .into_iter()
+            .find(|n| n.kind == NodeKind::File)?;
         return Some(ResolvedRef {
             original: reference.clone(),
             target_node_id: file_node.id.clone(),

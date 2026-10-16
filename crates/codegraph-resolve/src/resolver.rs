@@ -10,9 +10,10 @@
 use crate::alias_binding::resolve_alias_binding;
 use crate::framework::FrameworkResolver;
 use crate::import_resolver::{
-    PhpImportedStaticCallResolution, is_bound_to_out_of_repo_module, is_js_path_import_ref,
-    is_lua_require_ref, is_php_include_path_ref, python_module_member_is_claimed,
-    resolve_jvm_import, resolve_php_imported_static_call, resolve_via_import,
+    PhpImportedStaticCallResolution, is_bound_to_out_of_repo_module, is_dart_import_ref,
+    is_js_path_import_ref, is_lua_require_ref, is_php_include_path_ref,
+    python_module_member_is_claimed, resolve_jvm_import, resolve_php_imported_static_call,
+    resolve_via_import,
 };
 use crate::name_matcher::{
     crosses_code_boundary, gate_language_match, is_js_name_target_visible,
@@ -1252,11 +1253,17 @@ fn target_is_visible_across_files(
     {
         return false;
     }
-    // An unnamed Dart `extension on X` applies only where it is declared
-    // (upstream #2237): a subclass's bare call in another file is no member
-    // of it, though the extension sits `on` its base (#2145). The extractor
-    // names it `<anonymous>`, so no name means it.
-    if crate::dart_scope::is_dart_unnamed_extension_member(target, context) {
+    // An unnamed Dart `extension on X` applies only in its own library, the
+    // file and its parts (upstream #2237, #2386): a subclass's bare call in
+    // another library is no member of it, though the extension sits `on` its
+    // base (#2145). The extractor names it `<anonymous>`, so no name means it.
+    if crate::dart_scope::is_dart_unnamed_extension_member(target, context)
+        && !crate::dart_libraries::in_same_dart_library(
+            &reference.file_path,
+            &target.file_path,
+            context,
+        )
+    {
         return false;
     }
     // An R test file runs in an environment of its own (testthat): its
@@ -2426,8 +2433,13 @@ impl ReferenceResolver {
 
         // PHP include path: never fall through to name-matcher (index.ts:714-720).
         // A Lua / Luau `require` reaches a module file or nothing: its leaf
-        // name-matched the local it is assigned to (#2392).
-        if is_php_include_path_ref(reference) || is_lua_require_ref(reference) {
+        // name-matched the local it is assigned to (#2392). So does a Dart
+        // import's URI: `package:flutter/foundation.dart` matched by its last
+        // segment went to riverpod's own foundation.dart (#2388).
+        if is_php_include_path_ref(reference)
+            || is_lua_require_ref(reference)
+            || is_dart_import_ref(reference)
+        {
             return (candidates.into_iter().reduce(highest_confidence), None);
         }
 

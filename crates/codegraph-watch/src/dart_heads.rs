@@ -451,6 +451,66 @@ pub(crate) fn dart_refresh(
     Ok(refresh)
 }
 
+/// The names of the members a call can reach through any of `types` (W4-DART-02):
+/// the members of every type of their ancestries, as the head rows after
+/// this sync name them, and of the extensions `on` one of those types. A
+/// subclass that gains or loses one of `types` as its supertype moves the
+/// calls on it to these.
+pub(crate) fn member_names_through(
+    store: &Store,
+    changes: &DartChanges,
+    types: &BTreeSet<String>,
+) -> Result<BTreeSet<String>> {
+    let mut names = BTreeSet::new();
+    if types.is_empty() {
+        return Ok(names);
+    }
+    let mut rows: Vec<(String, HeadRow)> = Vec::new();
+    for (key, value) in store.project_metadata_with_prefix(HEAD_ROW_KEY_PREFIX)? {
+        let Some(path) = key.strip_prefix(HEAD_ROW_KEY_PREFIX) else {
+            continue;
+        };
+        if changes.changes.contains_key(path) {
+            continue;
+        }
+        // An unreadable row is the bootstrap's to rebuild.
+        if let Some(row) = HeadRow::decode(&value) {
+            rows.push((path.to_string(), row));
+        }
+    }
+    for (path, change) in &changes.changes {
+        if let Some(row) = &change.new_row {
+            rows.push((path.clone(), row.clone()));
+        }
+    }
+    let up = links(rows.iter().map(|(_, row)| row));
+    let mut owners: BTreeSet<String> = BTreeSet::new();
+    for name in types {
+        owners.extend(closure(&up, name));
+    }
+    let extensions: Vec<String> = rows
+        .iter()
+        .flat_map(|(_, row)| &row.entries)
+        .filter(|entry| entry.extension && entry.supers.iter().any(|sup| owners.contains(sup)))
+        .map(|entry| entry.name.clone())
+        .collect();
+    owners.extend(extensions);
+    for (path, row) in &rows {
+        if !row.entries.iter().any(|entry| owners.contains(&entry.name)) {
+            continue;
+        }
+        for node in store.nodes_by_file_path(path)? {
+            if node.language == Language::Dart
+                && codegraph_resolve::dart_scope::is_dart_member(&node)
+                && member_owner(&node.qualified_name).is_some_and(|owner| owners.contains(owner))
+            {
+                names.insert(node.name);
+            }
+        }
+    }
+    Ok(names)
+}
+
 /// Every Dart file re-resolves and every row is rebuilt from disk (a changed
 /// file's from its new text).
 fn rebuild(

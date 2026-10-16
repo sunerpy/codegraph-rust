@@ -102,17 +102,17 @@ pub(crate) const DART_STD_METHODS: [&str; 61] = [
 ];
 
 /// JavaScript's `\s`.
-fn is_js_space(c: char) -> bool {
+pub(crate) fn is_js_space(c: char) -> bool {
     codegraph_core::generated_header::is_js_whitespace(c)
 }
 
 /// An ASCII word character or `$` (`[\w$]`).
-fn is_dart_name_char(c: char) -> bool {
+pub(crate) fn is_dart_name_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_' || c == '$'
 }
 
 /// Whether `name` is written as a Dart identifier (`^[A-Za-z_$][\w$]*$`).
-fn is_dart_identifier(name: &str) -> bool {
+pub(crate) fn is_dart_identifier(name: &str) -> bool {
     name.chars()
         .next()
         .is_some_and(|first| first.is_ascii_alphabetic() || first == '_' || first == '$')
@@ -121,7 +121,7 @@ fn is_dart_identifier(name: &str) -> bool {
 
 /// Whether a node kind is one a Dart type declaration takes (upstream
 /// `DART_TYPE_KINDS`; the extractor files mixins and extensions as classes).
-pub(crate) fn is_dart_type_kind(kind: NodeKind) -> bool {
+pub fn is_dart_type_kind(kind: NodeKind) -> bool {
     matches!(
         kind,
         NodeKind::Class | NodeKind::Interface | NodeKind::Enum | NodeKind::Struct | NodeKind::Trait
@@ -144,7 +144,11 @@ pub fn member_owner(qualified_name: &str) -> Option<&str> {
 }
 
 /// Line `line` (1-based) of `file`, as stored.
-fn source_line(file: &str, line: i64, context: &dyn ResolutionContext) -> Option<String> {
+pub(crate) fn source_line(
+    file: &str,
+    line: i64,
+    context: &dyn ResolutionContext,
+) -> Option<String> {
     let facts = context.source_facts(file)?;
     let index = usize::try_from(line).ok()?.checked_sub(1)?;
     facts.raw_line(index).map(str::to_string)
@@ -182,21 +186,38 @@ pub(crate) fn is_receiver_less_dart_call(
     };
     let name = reference.reference_name.as_str();
     let column = usize::try_from(reference.column.max(0)).unwrap_or(0);
-    let starts_at = |at: usize| line.get(at..).is_some_and(|rest| rest.starts_with(name));
-    let found = if starts_at(column) {
+    // KEEP-RUST: this extractor places a chain link's reference at the
+    // chain's start, so the name is read as a whole word: `ticker.tick(…)`
+    // arrives at `ticker`, which begins with `tick`.
+    let word_at = |text: &str, at: usize| {
+        text.get(at..).is_some_and(|rest| rest.starts_with(name))
+            && !text[..at]
+                .chars()
+                .next_back()
+                .is_some_and(is_dart_name_char)
+            && !text[at + name.len()..]
+                .chars()
+                .next()
+                .is_some_and(is_dart_name_char)
+    };
+    let first_word = |text: &str| {
+        text.match_indices(name)
+            .map(|(at, _)| at)
+            .find(|at| word_at(text, *at))
+    };
+    let found = if word_at(&line, column) {
         Some((line.clone(), column))
-    } else if column >= name.len() && starts_at(column - name.len()) {
+    } else if column >= name.len() && word_at(&line, column - name.len()) {
         Some((line.clone(), column - name.len()))
-    } else if let Some(at) = line.find(name) {
+    } else if let Some(at) = first_word(&line) {
         Some((line.clone(), at))
     } else {
-        // KEEP-RUST: this extractor places a chain link's reference at the
-        // chain's start, so a link written on a later line (`LoginState()`,
-        // then `.withEmail(e)` below it) is read on the first line below that
+        // KEEP-RUST: a link written on a later line (`LoginState()`, then
+        // `.withEmail(e)` below it) is read on the first line below that
         // holds its name.
         (1..=CHAIN_LINES).find_map(|offset| {
             let text = source_line(&reference.file_path, reference.line + offset, context)?;
-            let at = text.find(name)?;
+            let at = first_word(&text)?;
             Some((text, at))
         })
     };
@@ -608,8 +629,8 @@ fn extension_named_in(text: &str) -> Option<bool> {
 }
 
 /// Whether a Dart method belongs to an unnamed `extension on X`, which
-/// applies only where it is declared (upstream `isDartUnnamedExtensionMember`;
-/// its own file until W4-DART-02 reads Dart libraries).
+/// applies only in its own library (upstream `isDartUnnamedExtensionMember`;
+/// the resolver asks [`crate::dart_libraries::in_same_dart_library`]).
 pub(crate) fn is_dart_unnamed_extension_member(
     method: &Node,
     context: &dyn ResolutionContext,

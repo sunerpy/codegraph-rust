@@ -9184,3 +9184,466 @@ pub fn javascript_file_gains_the_flow_pragma() -> Case {
         )
         .file_language_after("js/SegmentedControl.js", "tsx")
 }
+
+// ----- Dart libraries (W4-DART-02: upstream #2386, #2388, #2391) ----------
+
+/// A barrel's `show` gains a name: an unchanged importer's bare call of it
+/// reaches the declaration, though no node of that name changed.
+pub fn dart_export_show_gains_a_name_an_unchanged_importer_calls() -> Case {
+    Case::new(Change::ReexportEdit, &[Language::Dart])
+        .file("pubspec.yaml", "name: app\n")
+        .file(
+            "lib/src/impl.dart",
+            "int shown() => 1;\nint later() => 2;\n",
+        )
+        .file("lib/kit.dart", "export 'src/impl.dart' show shown;\n")
+        .file(
+            "lib/main.dart",
+            "import 'kit.dart';\n\nint run() => later();\n",
+        )
+        .write(
+            "lib/kit.dart",
+            "export 'src/impl.dart' show shown, later;\n",
+        )
+        .edge_after("function run", "calls", "function later")
+}
+
+/// The reverse: a barrel comes to `hide` a name, so the unchanged
+/// importer's call leaves it.
+pub fn dart_export_hide_drops_a_name_an_unchanged_importer_calls() -> Case {
+    Case::new(Change::ReexportEdit, &[Language::Dart])
+        .file("pubspec.yaml", "name: app\n")
+        .file(
+            "lib/src/impl.dart",
+            "int shown() => 1;\nint later() => 2;\n",
+        )
+        .file("lib/kit.dart", "export 'src/impl.dart';\n")
+        .file(
+            "lib/main.dart",
+            "import 'kit.dart';\n\nint run() => later();\n",
+        )
+        .write("lib/kit.dart", "export 'src/impl.dart' hide later;\n")
+        .edge_before("function run", "calls", "function later")
+        .no_edge_after("function run", "calls", "function later")
+}
+
+/// A library comes to list a part that declares a name: an unchanged part's
+/// bare call moves from the imported namesake to the library's own.
+pub fn dart_part_joins_its_library_and_shadows_an_imported_name() -> Case {
+    Case::new(Change::ReexportEdit, &[Language::Dart])
+        .file("pubspec.yaml", "name: app\n")
+        .file("lib/a_util.dart", "int helper() => 1;\n")
+        .file(
+            "lib/feature.dart",
+            "import 'a_util.dart';\n\npart 'other.dart';\n",
+        )
+        .file(
+            "lib/other.dart",
+            "part of 'feature.dart';\n\nint run() => helper();\n",
+        )
+        .file(
+            "lib/extra.dart",
+            "part of 'feature.dart';\n\nint helper() => 2;\n",
+        )
+        .write(
+            "lib/feature.dart",
+            "import 'a_util.dart';\n\npart 'other.dart';\npart 'extra.dart';\n",
+        )
+        .edge_before("function run", "calls", "function helper @lib/a_util.dart")
+        .edge_after("function run", "calls", "function helper @lib/extra.dart")
+}
+
+/// A library gains an import: an unchanged part's bare call reaches what it
+/// brings in, though no node of that name changed.
+pub fn dart_library_import_reaches_its_unchanged_part() -> Case {
+    Case::new(Change::ReexportEdit, &[Language::Dart])
+        .file("pubspec.yaml", "name: app\n")
+        .file("lib/util.dart", "int helper() => 1;\n")
+        .file("lib/lib.dart", "part 'piece.dart';\n")
+        .file(
+            "lib/piece.dart",
+            "part of 'lib.dart';\n\nint run() => helper();\n",
+        )
+        .write(
+            "lib/lib.dart",
+            "import 'util.dart';\n\npart 'piece.dart';\n",
+        )
+        .edge_after("function run", "calls", "function helper")
+}
+
+/// The reverse: the library drops the import, so the part's call leaves it.
+pub fn dart_library_import_leaves_its_unchanged_part() -> Case {
+    Case::new(Change::ReexportEdit, &[Language::Dart])
+        .file("pubspec.yaml", "name: app\n")
+        .file("lib/util.dart", "int helper() => 1;\n")
+        .file(
+            "lib/lib.dart",
+            "import 'util.dart';\n\npart 'piece.dart';\n",
+        )
+        .file(
+            "lib/piece.dart",
+            "part of 'lib.dart';\n\nint run() => helper();\n",
+        )
+        .write("lib/lib.dart", "part 'piece.dart';\n")
+        .edge_before("function run", "calls", "function helper")
+        .no_edge_after("function run", "calls", "function helper")
+}
+
+/// A library's two import prefixes swap: an unchanged part's `p.Report`
+/// moves to the library the prefix now names.
+pub fn dart_import_prefix_swap_moves_an_unchanged_parts_type() -> Case {
+    Case::new(Change::ReexportEdit, &[Language::Dart])
+        .file("pubspec.yaml", "name: app\n")
+        .file("lib/a.dart", "class Report {}\n")
+        .file("lib/b.dart", "class Report {}\n")
+        .file(
+            "lib/lib.dart",
+            "import 'a.dart' as p;\nimport 'b.dart' as q;\n\npart 'piece.dart';\n",
+        )
+        .file(
+            "lib/piece.dart",
+            "part of 'lib.dart';\n\nvoid run(p.Report r) {}\n",
+        )
+        .write(
+            "lib/lib.dart",
+            "import 'a.dart' as q;\nimport 'b.dart' as p;\n\npart 'piece.dart';\n",
+        )
+        .edge_before("function run", "references", "class Report @lib/a.dart")
+        .edge_after("function run", "references", "class Report @lib/b.dart")
+}
+
+/// A library takes the name an unchanged part's `part of` gives: the part
+/// joins it, so its bare call, which saw every file while its library was
+/// unknown, reaches only what the library imports.
+pub fn dart_library_name_brings_in_an_unchanged_part() -> Case {
+    Case::new(Change::ReexportEdit, &[Language::Dart])
+        .file("pubspec.yaml", "name: app\n")
+        .file("lib/util.dart", "int helper() => 1;\n")
+        .file("lib/aaa.dart", "int helper() => 2;\n")
+        .file(
+            "lib/models.dart",
+            "library app.old;\n\nimport 'util.dart';\n\npart 'user.dart';\n",
+        )
+        .file(
+            "lib/user.dart",
+            "part of app.models;\n\nint run() => helper();\n",
+        )
+        .write(
+            "lib/models.dart",
+            "library app.models;\n\nimport 'util.dart';\n\npart 'user.dart';\n",
+        )
+        .edge_before("function run", "calls", "function helper @lib/aaa.dart")
+        .edge_after("function run", "calls", "function helper @lib/util.dart")
+}
+
+/// The library an unchanged part names by URI appears: the part takes its
+/// imports, so its bare call reaches the one name they bring in.
+pub fn dart_library_of_an_unchanged_part_appears() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Dart])
+        .file("pubspec.yaml", "name: app\n")
+        .file("lib/util.dart", "int helper() => 1;\n")
+        .file("lib/other.dart", "int helper() => 2;\n")
+        .file(
+            "lib/user.dart",
+            "part of 'models.dart';\n\nint run() => helper();\n",
+        )
+        .write(
+            "lib/models.dart",
+            "import 'util.dart';\n\npart 'user.dart';\n",
+        )
+        .edge_after("function run", "calls", "function helper @lib/util.dart")
+}
+
+/// A second package of a name gains its first Dart file: an unchanged
+/// file outside both can no longer tell which `package:example/x.dart` it
+/// imports.
+pub fn dart_same_named_package_gains_its_first_dart_file() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Dart])
+        .file("packages/a/pubspec.yaml", "name: example\n")
+        .file("packages/a/lib/x.dart", "int fromA() => 1;\n")
+        .file("packages/b/pubspec.yaml", "name: example\n")
+        .file("tool/pubspec.yaml", "name: tool\n")
+        .file(
+            "tool/bin/run.dart",
+            "import 'package:example/x.dart';\n\nint run() => fromA();\n",
+        )
+        .write("packages/b/lib/y.dart", "int fromB() => 2;\n")
+        .edge_before(
+            "file:tool/bin/run.dart",
+            "imports",
+            "file:packages/a/lib/x.dart",
+        )
+        .no_edge_after(
+            "file:tool/bin/run.dart",
+            "imports",
+            "file:packages/a/lib/x.dart",
+        )
+}
+
+/// A part that declares a name is deleted: an unchanged part's bare call
+/// falls back to the imported namesake.
+pub fn dart_delete_a_part_that_shadowed_an_imported_name() -> Case {
+    Case::new(Change::DeleteImportedModule, &[Language::Dart])
+        .file("pubspec.yaml", "name: app\n")
+        .file("lib/a_util.dart", "int helper() => 1;\n")
+        .file(
+            "lib/feature.dart",
+            "import 'a_util.dart';\n\npart 'other.dart';\npart 'extra.dart';\n",
+        )
+        .file(
+            "lib/other.dart",
+            "part of 'feature.dart';\n\nint run() => helper();\n",
+        )
+        .file(
+            "lib/extra.dart",
+            "part of 'feature.dart';\n\nint helper() => 2;\n",
+        )
+        .remove("lib/extra.dart")
+        .edge_before("function run", "calls", "function helper @lib/extra.dart")
+        .edge_after("function run", "calls", "function helper @lib/a_util.dart")
+}
+
+/// A library comes to list the part an unnamed extension sits in: an
+/// unchanged part's bare call reaches the extension's member, which applies
+/// in every file of its library and in no other.
+pub fn dart_unnamed_extension_reaches_a_part_once_its_file_joins_the_library() -> Case {
+    Case::new(Change::ReexportEdit, &[Language::Dart])
+        .file("pubspec.yaml", "name: app\n")
+        .file("lib/shapes.dart", "part 'use.dart';\n\nclass Shape {}\n")
+        .file(
+            "lib/area_ext.dart",
+            "part of 'shapes.dart';\n\nextension on Shape {\n  int area() => 1;\n}\n",
+        )
+        .file(
+            "lib/use.dart",
+            "part of 'shapes.dart';\n\nclass Square extends Shape {\n  int twice() => area();\n}\n",
+        )
+        .write(
+            "lib/shapes.dart",
+            "part 'use.dart';\npart 'area_ext.dart';\n\nclass Shape {}\n",
+        )
+        .edge_after("method Square::twice", "calls", "method <anonymous>::area")
+}
+
+/// A package's pubspec.yaml renames it: an unchanged file's
+/// `package:kit/…` import no longer names its file.
+pub fn dart_pubspec_rename_strands_a_package_import() -> Case {
+    Case::new(Change::ControlFile, &[Language::Dart])
+        .file("pubspec.yaml", "name: app\n")
+        .file("packages/kit/pubspec.yaml", "name: kit\n")
+        .file("packages/kit/lib/kit.dart", "int shown() => 1;\n")
+        .file(
+            "lib/main.dart",
+            "import 'package:kit/kit.dart';\n\nint run() => shown();\n",
+        )
+        .write("packages/kit/pubspec.yaml", "name: kit2\n")
+        .edge_before(
+            "file:lib/main.dart",
+            "imports",
+            "file:packages/kit/lib/kit.dart",
+        )
+        .no_edge_after(
+            "file:lib/main.dart",
+            "imports",
+            "file:packages/kit/lib/kit.dart",
+        )
+}
+
+/// An app's pubspec.yaml comes to depend on one of two same-named packages
+/// by `path:`: its unchanged import now names that package's file.
+pub fn dart_pubspec_path_dependency_picks_a_same_named_package() -> Case {
+    Case::new(Change::ControlFile, &[Language::Dart])
+        .file("examples/login/pubspec.yaml", "name: login\n")
+        .file("examples/login/packages/auth/pubspec.yaml", "name: auth\n")
+        .file(
+            "examples/login/packages/auth/lib/auth.dart",
+            "class Auth {}\n",
+        )
+        .file("examples/other/pubspec.yaml", "name: other\n")
+        .file("examples/other/packages/auth/pubspec.yaml", "name: auth\n")
+        .file(
+            "examples/other/packages/auth/lib/auth.dart",
+            "class Auth {}\n",
+        )
+        .file(
+            "examples/login/lib/app.dart",
+            "import 'package:auth/auth.dart';\n\nclass App {}\n",
+        )
+        .write(
+            "examples/login/pubspec.yaml",
+            "name: login\ndependencies:\n  auth:\n    path: packages/auth\n",
+        )
+        .edge_after(
+            "file:examples/login/lib/app.dart",
+            "imports",
+            "file:examples/login/packages/auth/lib/auth.dart",
+        )
+}
+
+/// 501 parked imports of `main.dart` files the project lacks: more than the
+/// shared import-key lookup wakes for one key.
+static MAIN_IMPORTS: LazyLock<String> = LazyLock::new(|| {
+    let mut text = String::new();
+    for index in 0..501 {
+        text.push_str(&format!("import 'gen{index}/main.dart';\n"));
+    }
+    text.push_str("\nvoid noise() {}\n");
+    text
+});
+
+/// A Dart import links the file it names once it appears, however many
+/// parked imports share the file's name. No pubspec.yaml: the files' scopes
+/// are unknown, so the library models of the sync's two states see the same
+/// for them, and only the uncapped retry of the parked imports links them.
+pub fn dart_import_of_an_added_library_past_the_import_key_ceiling() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Dart])
+        .file("lib/noise.dart", MAIN_IMPORTS.as_str())
+        .file(
+            "lib/app.dart",
+            "import 'gen7/main.dart';\n\nvoid run() {}\n",
+        )
+        .write("lib/gen7/main.dart", "class Main {}\n")
+        .edge_after("file:lib/app.dart", "imports", "file:lib/gen7/main.dart")
+        .edge_after("file:lib/noise.dart", "imports", "file:lib/gen7/main.dart")
+}
+
+/// Two barrels trade a name in one edit: one stops exporting it as the
+/// other starts, so its importers' calls move both ways at once (each
+/// library's namespace is compared on its own).
+pub fn dart_two_barrels_trade_an_exported_name() -> Case {
+    Case::new(Change::ReexportEdit, &[Language::Dart])
+        .file("pubspec.yaml", "name: app\n")
+        .file("lib/src/x.dart", "int foo() => 1;\nint bar() => 2;\n")
+        .file("lib/a.dart", "export 'src/x.dart' show foo;\n")
+        .file("lib/b.dart", "export 'src/x.dart' hide foo;\n")
+        .file(
+            "lib/use_a.dart",
+            "import 'a.dart';\n\nint runA() => foo();\n",
+        )
+        .file(
+            "lib/use_b.dart",
+            "import 'b.dart';\n\nint runB() => foo();\n",
+        )
+        .write("lib/a.dart", "export 'src/x.dart' hide foo;\n")
+        .write("lib/b.dart", "export 'src/x.dart' show foo;\n")
+        .edge_before("function runA", "calls", "function foo")
+        .no_edge_after("function runA", "calls", "function foo")
+        .edge_after("function runB", "calls", "function foo")
+}
+
+/// A library's directives move down a line: their import nodes move, and
+/// nothing another file resolves changes (no resolution reads a Dart import
+/// node, so a moved one touches no name).
+pub fn dart_library_directives_move_down_a_line() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Dart])
+        .file("pubspec.yaml", "name: app\n")
+        .file("lib/util.dart", "int helper() => 1;\n")
+        .file(
+            "lib/lib.dart",
+            "import 'util.dart';\n\npart 'piece.dart';\n",
+        )
+        .file(
+            "lib/piece.dart",
+            "part of 'lib.dart';\n\nint run() => helper();\n",
+        )
+        .file(
+            "lib/main.dart",
+            "import 'lib.dart';\nimport 'util.dart';\n\nint go() => helper();\n",
+        )
+        .write(
+            "lib/lib.dart",
+            "// The library.\nimport 'util.dart';\n\npart 'piece.dart';\n",
+        )
+        .edge_throughout("function run", "calls", "function helper")
+        .edge_throughout("file:lib/main.dart", "imports", "file:lib/lib.dart")
+}
+
+/// A barrel comes to hide a base type: a subclass in another library loses
+/// it, so a call on the subclass in a third file no longer reaches the
+/// base's method through it (bloc's `export 'src/cubit.dart' hide Cubit`
+/// moved `cubit.close()` in its tests).
+pub fn dart_hidden_base_type_leaves_a_call_on_its_subclass() -> Case {
+    Case::new(Change::ReexportEdit, &[Language::Dart])
+        .file("pubspec.yaml", "name: app\n")
+        .file("lib/src/base.dart", "class Base {\n  void close() {}\n}\n")
+        .file(
+            "lib/src/cubit.dart",
+            "import 'base.dart';\n\nabstract class Cubit extends Base {}\n",
+        )
+        .file("lib/kit.dart", "export 'src/base.dart';\nexport 'src/cubit.dart';\n")
+        .file(
+            "test/seeded.dart",
+            "import 'package:app/kit.dart';\n\nclass Seeded extends Cubit {}\n",
+        )
+        .file("test/other.dart", "class Other {\n  void close() {}\n}\n")
+        .file(
+            "test/use.dart",
+            "import 'seeded.dart';\n\nvoid run() {\n  final cubit = Seeded();\n  cubit.close();\n}\n",
+        )
+        .write(
+            "lib/kit.dart",
+            "export 'src/base.dart';\nexport 'src/cubit.dart' hide Cubit;\n",
+        )
+        .edge_before("function run", "calls", "method Base::close")
+}
+
+/// 501 parked `x.close()` calls: more than the shared tail retry wakes for
+/// one tail.
+static CLOSE_CALLS: LazyLock<String> = LazyLock::new(|| {
+    let mut text = String::from("void noise() {\n");
+    for index in 0..501 {
+        text.push_str(&format!("  missing{index}.close();\n"));
+    }
+    text.push_str("}\n");
+    text
+});
+
+/// The reverse, past the tail ceiling: the barrel stops hiding the base
+/// type, so the call on the subclass reaches the base's method through it,
+/// however many parked calls share the method's name.
+pub fn dart_shown_base_type_brings_its_method_to_a_call_on_its_subclass_past_the_tail_ceiling()
+-> Case {
+    Case::new(Change::ReexportEdit, &[Language::Dart])
+        .file("pubspec.yaml", "name: app\n")
+        .file("lib/src/base.dart", "class Base {\n  void close() {}\n}\n")
+        .file(
+            "lib/src/cubit.dart",
+            "import 'base.dart';\n\nabstract class Cubit extends Base {}\n",
+        )
+        .file(
+            "lib/kit.dart",
+            "export 'src/base.dart';\nexport 'src/cubit.dart' hide Cubit;\n",
+        )
+        .file(
+            "test/seeded.dart",
+            "import 'package:app/kit.dart';\n\nclass Seeded extends Cubit {}\n",
+        )
+        .file(
+            "test/use.dart",
+            "import 'seeded.dart';\n\nvoid run() {\n  final cubit = Seeded();\n  cubit.close();\n}\n",
+        )
+        .file("test/noise.dart", CLOSE_CALLS.as_str())
+        .write("lib/kit.dart", "export 'src/base.dart';\nexport 'src/cubit.dart';\n")
+        .edge_after("function run", "calls", "method Base::close")
+}
+
+/// The library a subclass sits in comes to import its base type: the
+/// subclass gains the base's members, so a call on it in another file
+/// reaches the base's method (the part re-resolves whole; the call's file is
+/// unchanged).
+pub fn dart_library_import_brings_a_base_method_to_a_call_on_its_parts_subclass() -> Case {
+    Case::new(Change::ReexportEdit, &[Language::Dart])
+        .file("pubspec.yaml", "name: app\n")
+        .file("lib/base.dart", "class Base {\n  void close() {}\n}\n")
+        .file("lib/models.dart", "part 'seeded.dart';\n")
+        .file(
+            "lib/seeded.dart",
+            "part of 'models.dart';\n\nclass Seeded extends Base {}\n",
+        )
+        .file(
+            "lib/use.dart",
+            "import 'models.dart';\n\nvoid run() {\n  final cubit = Seeded();\n  cubit.close();\n}\n",
+        )
+        .write("lib/models.dart", "import 'base.dart';\n\npart 'seeded.dart';\n")
+        .edge_after("function run", "calls", "method Base::close")
+}

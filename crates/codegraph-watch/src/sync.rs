@@ -599,6 +599,12 @@ fn sync_paths_with_store(
     if dart_bootstrap {
         crate::dart_heads::withdraw_marker(store)?;
     }
+    // And for the Dart names and imports that read other files' directives:
+    // every Dart file is re-resolved once (W4-DART-02).
+    let dart_library_bootstrap = crate::dart_libraries::needs_bootstrap(store)?;
+    if dart_library_bootstrap {
+        crate::dart_libraries::withdraw_marker(store)?;
+    }
 
     let paths = paths.into_iter().collect::<Vec<_>>();
     let total = paths.len();
@@ -664,6 +670,7 @@ fn sync_paths_with_store(
         || lua_bootstrap
         || r_bootstrap
         || dart_bootstrap
+        || dart_library_bootstrap
     {
         note_python_global_readers(
             project_root,
@@ -936,6 +943,34 @@ fn sync_paths_with_store(
             );
         }
         changed_names.note_all(dart.names.iter().cloned());
+        // What a Dart name or import in an unchanged file read of a changed
+        // file's directives: its library's parts, its exports, its imports
+        // (W4-DART-02).
+        let dart_libraries = crate::dart_libraries::dart_library_refresh(
+            store,
+            project_root,
+            scope.options.max_file_size,
+            &changed_names.dart_libraries,
+            &changed_names.dart,
+            &changed_names.added_files,
+            &reindexed,
+            &changed_names.removed_files,
+            dart_library_bootstrap,
+        )?;
+        for file in &dart_libraries.files {
+            dependent_sites.remove(file);
+            dependent_fallbacks.insert(file.clone());
+        }
+        for affected in &dart_libraries.sites {
+            if !dependent_fallbacks.contains(&affected.file_path) {
+                merge_dependent_site(
+                    &mut dependent_sites,
+                    &mut dependent_fallbacks,
+                    affected.clone(),
+                );
+            }
+        }
+        changed_names.note_all(dart_libraries.names.iter().cloned());
         // What a Lua call in an unchanged file read of a changed one: which
         // names it declares `local`, what its module hands out (W4-LUA-01).
         let lua = crate::lua_modules::lua_refresh(
@@ -1104,6 +1139,7 @@ fn sync_paths_with_store(
         go.write_rows(store)?;
         php.write_rows(store)?;
         dart.write_rows(store)?;
+        dart_libraries.write_rows(store)?;
         lua.write_rows(store)?;
         crate::module_surfaces::finish_bootstrap(store)?;
         crate::cpp_dependents::write_marker(store)?;
@@ -1123,6 +1159,7 @@ fn sync_paths_with_store(
         crate::lua_modules::write_marker(store)?;
         crate::r_bindings::write_marker(store)?;
         crate::dart_heads::write_marker(store)?;
+        crate::dart_libraries::write_marker(store)?;
     }
 
     // Orphan sweep (#1187, upstream index.ts:645-682): a full-index resolution
@@ -1548,6 +1585,7 @@ fn remove_tracked_file(
     changed_names.php.note(store, relative, &old_nodes, None)?;
     changed_names.lua.note(store, relative, None)?;
     changed_names.dart.note(store, relative, None)?;
+    changed_names.dart_libraries.note(store, relative, None)?;
     delete_unresolved_refs_by_file(store, relative)?;
     store.delete_file_record(relative)?;
     changed_names
@@ -1901,8 +1939,14 @@ fn reextract_into_store(
     // name only when the order of that name's nodes in this file changed too
     // (upstream likewise pairs a re-indexed file's old and new nodes by
     // identity and keeps the edges whose target only moved,
-    // `pairReindexedNodes`). Other languages read declaration text no node
-    // records (a C function's `static`), so their moved nodes still touch.
+    // `pairReindexedNodes`). A Dart import node is the other exception
+    // (W4-DART-02): no resolution reads one, since a Dart `import`, `export`
+    // or `part` links the file its URI names and no name binds an import
+    // node, while its URI, when written as a bare file name, names every file
+    // of that name (an `import 'internals.dart';` moving one line down
+    // re-resolved riverpod's 112 imports of its `internals.dart` files).
+    // Other languages read declaration text no node records (a C function's
+    // `static`), so their moved nodes still touch.
     let old_nodes = store.nodes_by_file_path(relative)?;
     let old_ids: HashSet<(&str, &str)> = old_nodes
         .iter()
@@ -1915,14 +1959,17 @@ fn reextract_into_store(
         .collect();
     let order_before = positioned_candidate_keys(&old_nodes);
     let order_after = positioned_candidate_keys(&result.nodes);
-    let not_only_php: HashSet<&str> = old_nodes
+    let touched_when_moved: HashSet<&str> = old_nodes
         .iter()
         .chain(&result.nodes)
-        .filter(|node| node.language != Language::Php)
+        .filter(|node| {
+            node.language != Language::Php
+                && !(node.language == Language::Dart && node.kind == NodeKind::Import)
+        })
         .map(|node| node.name.as_str())
         .collect();
     for (_, name) in old_ids.symmetric_difference(&new_ids) {
-        if not_only_php.contains(*name) || order_before.get(*name) != order_after.get(*name) {
+        if touched_when_moved.contains(*name) || order_before.get(*name) != order_after.get(*name) {
             changed_names.any.insert((*name).to_string());
         }
     }
@@ -2001,6 +2048,9 @@ fn reextract_into_store(
         relative,
         Some((file.language, source, &result.nodes)),
     )?;
+    changed_names
+        .dart_libraries
+        .note(store, relative, Some((file.language, source)))?;
     // An R call of a base function's name skips a data binding of it unless
     // the binding's line holds a function (upstream #2239), and that line is
     // read from source, which no node records: a changed R file touches the
@@ -2169,6 +2219,9 @@ struct ChangedNames {
     /// What the changed files held that a bare Dart call in other files
     /// reads: their types' heads (W4-DART-01).
     dart: crate::dart_heads::DartChanges,
+    /// What the changed files held that a Dart name or import in other files
+    /// reads: their directives (W4-DART-02).
+    dart_libraries: crate::dart_libraries::DartLibraryChanges,
 }
 
 /// What a changed Python file held before the change. A module global's
@@ -2219,6 +2272,7 @@ impl ChangedNames {
             crate::lua_modules::withdraw_marker(store)?;
             crate::r_bindings::withdraw_marker(store)?;
             crate::dart_heads::withdraw_marker(store)?;
+            crate::dart_libraries::withdraw_marker(store)?;
             self.surface_dirty = true;
         }
         Ok(())
@@ -2254,14 +2308,19 @@ impl ChangedNames {
     /// outside the file sees them, comparing the two sides as multisets of
     /// [`candidate_key`]s.
     fn note_candidates(&mut self, before: &[Node], after: &[Node]) {
+        // No resolution reads a Dart import node (W4-DART-02; see
+        // `reextract_into_store`): an edited directive touches nothing by its
+        // URI.
+        let candidate =
+            |node: &&Node| !(node.language == Language::Dart && node.kind == NodeKind::Import);
         let mut keys: BTreeMap<&str, (Vec<String>, Vec<String>)> = BTreeMap::new();
-        for node in before {
+        for node in before.iter().filter(candidate) {
             keys.entry(&node.name)
                 .or_default()
                 .0
                 .push(candidate_key(node));
         }
-        for node in after {
+        for node in after.iter().filter(candidate) {
             keys.entry(&node.name)
                 .or_default()
                 .1
@@ -2408,6 +2467,10 @@ pub(crate) mod tests {
         /// Fail the next Dart row rebuild once the old rows are purged and
         /// one is written back.
         pub(crate) static FAIL_AFTER_DART_ROW_PURGE: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
+        /// Fail the next Dart library row rebuild once the old rows are
+        /// purged and one is written back.
+        pub(crate) static FAIL_AFTER_DART_LIBRARY_ROW_PURGE: std::cell::Cell<bool> =
             const { std::cell::Cell::new(false) };
     }
 
@@ -4944,6 +5007,208 @@ pub(crate) mod tests {
         sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
         assert_eq!(dart_marker(&db), version);
         assert_eq!(dart_rows(&db), rows);
+        assert_eq!(edge_projection(&db), expected);
+    }
+
+    fn dart_library_marker(db: &Path) -> Option<String> {
+        Store::open(db)
+            .unwrap()
+            .get_project_metadata(crate::dart_libraries::VERSION_KEY)
+            .unwrap()
+    }
+
+    fn dart_library_rows(db: &Path) -> Vec<(String, String)> {
+        Store::open(db)
+            .unwrap()
+            .project_metadata_with_prefix(codegraph_resolve::dart_libraries::LIBRARY_ROW_KEY_PREFIX)
+            .unwrap()
+    }
+
+    const DART_PUBSPEC: (&str, &str) = ("pubspec.yaml", "name: app\n");
+    const DART_UTIL: (&str, &str) = ("lib/util.dart", "int helper() => 1;\n");
+    const DART_LIB: (&str, &str) = ("lib/lib.dart", "part 'piece.dart';\n");
+    const DART_LIB_IMPORTING: (&str, &str) = (
+        "lib/lib.dart",
+        "import 'util.dart';\n\npart 'piece.dart';\n",
+    );
+    const DART_PIECE: (&str, &str) = (
+        "lib/piece.dart",
+        "part of 'lib.dart';\n\nint run() => helper();\n",
+    );
+
+    fn reaches_helper(db: &Path) -> bool {
+        edge_projection(db)
+            .iter()
+            .any(|edge| edge.contains("-[calls]-> lib/util.dart:helper"))
+    }
+
+    /// W4-DART-02: a sync failing after it wrote the library's new import,
+    /// before resolving, leaves the next sync, with nothing changed or with
+    /// an unrelated change, to bring the unchanged part's `helper()` to what
+    /// the import brings in, as a fresh index has it.
+    #[test]
+    fn a_dart_library_sync_failing_after_its_mutations_leaves_the_next_one_to_reconcile() {
+        for unrelated in [false, true] {
+            let dir = TestDir::new(if unrelated {
+                "dart-libraries-fail-unrelated"
+            } else {
+                "dart-libraries-fail"
+            });
+            let db = default_db_path(dir.path()).unwrap();
+            let initial = [DART_UTIL, DART_LIB, DART_PIECE, DART_SPARE];
+            write_files(dir.path(), &[DART_PUBSPEC]);
+            write_files(dir.path(), &initial);
+            sync_changed_paths(dir.path(), &db, initial.iter().map(|(path, _)| *path)).unwrap();
+            assert_eq!(
+                dart_library_marker(&db),
+                Some(crate::dart_libraries::VERSION.to_string())
+            );
+            assert!(!reaches_helper(&db), "{:#?}", edge_projection(&db));
+
+            write_files(dir.path(), &[DART_LIB_IMPORTING]);
+            FAIL_BEFORE_RESOLUTION.with(|fail| fail.set(true));
+            let failed = sync_changed_paths(dir.path(), &db, [DART_LIB.0]);
+            FAIL_BEFORE_RESOLUTION.with(|fail| fail.set(false));
+            assert!(failed.is_err(), "the injected failure must stop the sync");
+            assert_eq!(
+                dart_library_marker(&db),
+                None,
+                "a failed sync leaves the marker away"
+            );
+
+            let spare = if unrelated {
+                write_files(dir.path(), &[DART_SPARE_EDITED]);
+                sync_changed_paths(dir.path(), &db, [DART_SPARE.0]).unwrap();
+                DART_SPARE_EDITED
+            } else {
+                sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
+                DART_SPARE
+            };
+            assert_eq!(
+                dart_library_marker(&db),
+                Some(crate::dart_libraries::VERSION.to_string())
+            );
+            let fresh = [
+                DART_PUBSPEC,
+                DART_UTIL,
+                DART_LIB_IMPORTING,
+                DART_PIECE,
+                spare,
+            ];
+            let name = if unrelated {
+                "dart-libraries-fresh-unrelated"
+            } else {
+                "dart-libraries-fresh"
+            };
+            assert_eq!(edge_projection(&db), fresh_edges(name, &fresh));
+            assert!(reaches_helper(&db), "{:#?}", edge_projection(&db));
+        }
+    }
+
+    /// W4-DART-02: an index whose Dart library marker and rows alone are
+    /// gone has every Dart file re-resolved and every row rebuilt by its next
+    /// sync, even one with nothing changed: the call an older sync lost comes
+    /// back.
+    #[test]
+    fn an_index_without_only_the_dart_library_marker_rebuilds_its_rows_with_nothing_changed() {
+        let version = Some(crate::dart_libraries::VERSION.to_string());
+        let dir = TestDir::new("dart-libraries-bootstrap");
+        let db = default_db_path(dir.path()).unwrap();
+        let initial = [DART_UTIL, DART_LIB_IMPORTING, DART_PIECE, DART_SPARE];
+        write_files(dir.path(), &[DART_PUBSPEC]);
+        write_files(dir.path(), &initial);
+        sync_changed_paths(dir.path(), &db, initial.iter().map(|(path, _)| *path)).unwrap();
+        assert_eq!(dart_library_marker(&db), version);
+        let rows = dart_library_rows(&db);
+        assert_eq!(rows.len(), 2, "{rows:#?}");
+        let expected = edge_projection(&db);
+        assert!(reaches_helper(&db), "{expected:#?}");
+        {
+            let store = Store::open(&db).unwrap();
+            let dropped = store
+                .connection()
+                .execute(
+                    "DELETE FROM edges WHERE kind = 'calls' AND target = (SELECT id FROM nodes \
+                     WHERE file_path = 'lib/util.dart' AND name = 'helper')",
+                    [],
+                )
+                .unwrap();
+            assert_eq!(dropped, 1, "the call edge an older sync lost");
+            store
+                .delete_project_metadata_with_prefix(
+                    codegraph_resolve::dart_libraries::LIBRARY_ROW_KEY_PREFIX,
+                )
+                .unwrap();
+            store
+                .delete_project_metadata(crate::dart_libraries::VERSION_KEY)
+                .unwrap();
+        }
+        assert_ne!(edge_projection(&db), expected);
+        assert_eq!(
+            dart_marker(&db),
+            Some(crate::dart_heads::VERSION.to_string()),
+            "the other markers stay"
+        );
+        sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
+        assert_eq!(dart_library_marker(&db), version);
+        assert_eq!(dart_library_rows(&db), rows);
+        assert_eq!(edge_projection(&db), expected);
+    }
+
+    /// W4-DART-02: a marker still current over a row that cannot be read
+    /// rebuilds the rows and re-resolves every Dart file in a sync with
+    /// nothing changed; a rebuild stopping once the old rows are purged and
+    /// one is written back leaves the marker away, so the next sync finishes
+    /// it.
+    #[test]
+    fn a_dart_library_row_that_cannot_be_read_is_rebuilt_even_after_a_rebuild_stops_partway() {
+        let version = Some(crate::dart_libraries::VERSION.to_string());
+        let dir = TestDir::new("dart-libraries-unreadable");
+        let db = default_db_path(dir.path()).unwrap();
+        let initial = [DART_UTIL, DART_LIB_IMPORTING, DART_PIECE, DART_SPARE];
+        write_files(dir.path(), &[DART_PUBSPEC]);
+        write_files(dir.path(), &initial);
+        sync_changed_paths(dir.path(), &db, initial.iter().map(|(path, _)| *path)).unwrap();
+        let rows = dart_library_rows(&db);
+        let expected = edge_projection(&db);
+        Store::open(&db)
+            .unwrap()
+            .set_project_metadata(
+                &codegraph_resolve::dart_libraries::library_row_key(DART_PIECE.0),
+                "{not a row",
+            )
+            .unwrap();
+        FAIL_AFTER_DART_LIBRARY_ROW_PURGE.with(|fail| fail.set(true));
+        let failed = sync_changed_paths(dir.path(), &db, Vec::<&str>::new());
+        FAIL_AFTER_DART_LIBRARY_ROW_PURGE.with(|fail| fail.set(false));
+        assert!(
+            failed.is_err(),
+            "the injected failure must stop the rebuild"
+        );
+        assert_eq!(
+            dart_library_marker(&db),
+            None,
+            "the rebuild withdrew the marker first"
+        );
+        assert_eq!(
+            dart_library_rows(&db).len(),
+            1,
+            "{:#?}",
+            dart_library_rows(&db)
+        );
+        let dropped = Store::open(&db)
+            .unwrap()
+            .connection()
+            .execute(
+                "DELETE FROM edges WHERE kind = 'calls' AND target = (SELECT id FROM nodes \
+                 WHERE file_path = 'lib/util.dart' AND name = 'helper')",
+                [],
+            )
+            .unwrap();
+        assert_eq!(dropped, 1, "the call edge a later loss takes");
+        sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
+        assert_eq!(dart_library_marker(&db), version);
+        assert_eq!(dart_library_rows(&db), rows);
         assert_eq!(edge_projection(&db), expected);
     }
 

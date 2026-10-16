@@ -14643,6 +14643,30 @@ mod dart_scope {
         );
     }
 
+    /// A call whose receiver's name begins with the called name is no bare
+    /// call: this extractor records `ticker.tick()` written in another call's
+    /// arguments at the chain's start, `ticker`, so the receiver-less reader
+    /// takes the name as a whole word (KEEP-RUST adaptation of #2145's
+    /// reader, found by W4-DART-02's precision run on bloc's flutter_timer
+    /// tests).
+    #[test]
+    fn pr2145_a_call_whose_receiver_begins_with_its_name_is_no_bare_call() {
+        let project = Project::new()
+            .file("pubspec.yaml", "name: app\n")
+            .file("lib/ticker.dart", "class Ticker {\n  void tick() {}\n}\n")
+            .file(
+                "lib/main.dart",
+                "import 'ticker.dart';\n\nvoid run(Ticker ticker) {\n  when(() => ticker.tick()).then();\n}\n\nvoid when(Object f) {}\n",
+            )
+            .index();
+        let graph = project.graph();
+        assert!(
+            calls_from(graph, "lib/main.dart").contains(&"run -> Ticker::tick".to_string()),
+            "{}",
+            graph.report()
+        );
+    }
+
     /// Upstream #2207: a Dart core method name on an untyped receiver is the
     /// core type's unless the receiver names the owner, and an extension's
     /// owner is the type it is `on`: getx's `ext.endsWith(".avi")` is no
@@ -14738,6 +14762,676 @@ mod dart_scope {
             calls_from(graph, "lib/src/bar.dart"),
             Vec::<String>::new(),
             "{report}"
+        );
+    }
+}
+
+/// Upstream #2386, #2388 and #2391: a Dart library is a file and its parts;
+/// a name written without a receiver reaches only what that library declares
+/// or what a library it imports exports, and an `import`, `export` or `part`
+/// links the file its URI names.
+mod dart_libraries {
+    use super::support::{self, Graph, Project};
+
+    /// `<kind> <line> -> <target file>:<target qualified name>` for every
+    /// edge out of `file` but `contains`, sorted (upstream's `edgesFrom`,
+    /// without the reference name, which an edge does not keep here).
+    fn edges_from(graph: &Graph, file: &str) -> Vec<String> {
+        let mut out: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|e| e.kind != "contains")
+            .filter(|e| graph.node(&e.source).is_some_and(|n| n.file_path == file))
+            .filter_map(|e| {
+                let target = graph.node(&e.target)?;
+                Some(format!(
+                    "{} {} -> {}:{}",
+                    e.kind,
+                    e.line.unwrap_or_default(),
+                    target.file_path,
+                    target.qualified_name
+                ))
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// `<line> -> <target>` for every `imports` edge out of `file`, a file by
+    /// its path and anything else by kind, file and name (upstream's
+    /// `importsFrom`), sorted.
+    fn imports_from(graph: &Graph, file: &str) -> Vec<String> {
+        let mut out: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|e| e.kind == "imports")
+            .filter(|e| graph.node(&e.source).is_some_and(|n| n.file_path == file))
+            .filter_map(|e| {
+                let target = graph.node(&e.target)?;
+                let named = if target.kind == "file" {
+                    target.file_path.clone()
+                } else {
+                    format!("{} {}#{}", target.kind, target.file_path, target.name)
+                };
+                Some(format!("{} -> {named}", e.line.unwrap_or_default()))
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// The URIs of `file`'s imports left unresolved, sorted.
+    fn unresolved_imports_of(graph: &Graph, file: &str) -> Vec<String> {
+        let mut out: Vec<String> = graph
+            .unresolved
+            .iter()
+            .filter(|r| r.file_path == file && r.reference_kind == "imports")
+            .map(|r| r.reference_name.clone())
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// `<name> | <signature>` of each import node in `file`, sorted.
+    fn import_nodes_in(graph: &Graph, file: &str) -> Vec<String> {
+        let mut out: Vec<String> = graph
+            .nodes
+            .iter()
+            .filter(|n| n.file_path == file && n.kind == "import")
+            .map(|n| format!("{} | {}", n.name, n.signature.clone().unwrap_or_default()))
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// Upstream #2386: a receiver-less Dart call, constructor call or type
+    /// name links only to a top-level declaration its library can see — its
+    /// own (the file and its parts) or one a library it imports without a
+    /// prefix exports, through `export` chains and `show` / `hide` — and a
+    /// type written through an import prefix (`p.Report`) is what that import
+    /// exports. A library's own declaration shadows an imported one, and a
+    /// bare call never reaches another type's enum constant or static
+    /// constant. Upstream's fixture. Two of its cases need what W4-DART-03
+    /// ports and are checked there: a field's type (`final Box<int> box;`,
+    /// #2360) and a typed receiver's call into an unnamed extension in
+    /// another part (`s.area()`, #2376); the unnamed extension's reach
+    /// across its library is checked here through a bare call instead.
+    #[test]
+    fn pr2386_a_bare_dart_name_reaches_only_what_its_library_can_see() {
+        let project = Project::new()
+            .file("pubspec.yaml", "name: app\n")
+            .file(
+                "test/integration/annotated.dart",
+                "part 'annotated.g.dart';\n\nString family(Object ref, int id) => 'family $id';\n",
+            )
+            .file(
+                "test/integration/annotated.g.dart",
+                "part of 'annotated.dart';\n\nString annotatedGenerated(Object ref) => family(ref, 1);\n",
+            )
+            .file(
+                "test/integration/async.dart",
+                "import 'dart:async';\n\npart 'async.g.dart';\n\nFuture<String> family(Object ref, int first) async => '$first';\n\nclass GenericClass {}\n",
+            )
+            .file(
+                "test/integration/async.g.dart",
+                "part of 'async.dart';\n\nFuture<String> asyncGenerated(Object ref) {\n  return family(ref, 2);\n}\n\nfinal GenericClass generic = GenericClass();\n",
+            )
+            .file("test/integration/annotated_types.dart", "class GenericClass {}\n")
+            .file(
+                "test/third_party/fake_async.dart",
+                "T fakeAsync<T>(T Function(Object async) callback) => callback(Object());\n",
+            )
+            .file(
+                "test/src/core/devtool_test.dart",
+                "import 'package:fake_async/fake_async.dart';\n\nvoid main() {\n  fakeAsync((async) {});\n}\n",
+            )
+            .file("test/old/utils.dart", "List<Object> errorsOf(void Function() cb) => [];\n")
+            .file("test/src/utils.dart", "List<Object> errorsOf(void Function() cb) => [];\n")
+            .file(
+                "test/feature/uni_directional_test.dart",
+                "import '../src/utils.dart';\n\nvoid main() {\n  errorsOf(() {});\n}\n",
+            )
+            .file("packages/kit/pubspec.yaml", "name: kit\n")
+            .file(
+                "packages/kit/lib/kit.dart",
+                "export 'src/impl.dart'\n    show\n        // the public API\n        shown,\n        Widget;\nexport 'src/cond_stub.dart' if (dart.library.io) 'src/cond_io.dart';\n",
+            )
+            .file(
+                "packages/kit/lib/src/impl.dart",
+                "int shown() => 1;\nint notShown() => 2;\nclass Widget {}\n",
+            )
+            .file("packages/kit/lib/src/cond_stub.dart", "int platformName() => 0;\n")
+            .file("packages/kit/lib/src/cond_io.dart", "int platformName() => 1;\n")
+            .file(
+                "packages/kit/lib/src/prefixed.dart",
+                "int viaPrefix() => 3;\nclass Report {}\n",
+            )
+            .file(
+                "packages/kit/lib/src/hidden.dart",
+                "int hiddenOne() => 4;\nint keptOne() => 5;\n",
+            )
+            .file(
+                "lib/main.dart",
+                "import 'package:kit/kit.dart';\nimport 'package:kit/src/prefixed.dart' as p;\nimport 'package:kit/src/hidden.dart' hide hiddenOne;\n\nvoid run(p.Report report) {\n  shown();\n  notShown();\n  platformName();\n  viaPrefix();\n  hiddenOne();\n  keptOne();\n  Widget();\n}\n",
+            )
+            .file("lib/a_report.dart", "class Report {}\n")
+            .file(
+                "lib/named.dart",
+                "library app.named;\n\npart 'named_part.dart';\n\nint namedHelper() => 6;\n",
+            )
+            .file(
+                "lib/named_part.dart",
+                "part of app.named;\n\nint usesNamed() => namedHelper();\n",
+            )
+            .file("lib/other_named.dart", "int namedHelper() => 7;\n")
+            .file("lib/a_util.dart", "int helper() => 1;\n")
+            .file(
+                "lib/feature.dart",
+                "import 'a_util.dart';\n\npart 'feature_part.dart';\n\nint runFeature() => helper();\n",
+            )
+            .file("lib/feature_part.dart", "part of 'feature.dart';\n\nint helper() => 2;\n")
+            .file(
+                "lib/kinds.dart",
+                "enum Level { info, warning }\n\nclass TypeChecker {\n  static const allOf = 'any';\n}\n",
+            )
+            .file(
+                "lib/check.dart",
+                "import 'package:mason_logger/mason_logger.dart';\nimport 'package:matcher/matcher.dart';\n\nvoid check(Object value) {\n  info('checking');\n  expect(value, allOf([isNotNull]));\n}\n",
+            )
+            .file(
+                "lib/colors.dart",
+                "import 'package:flutter/material.dart';\n\nextension on Color {\n  Color brighten() => this;\n}\n",
+            )
+            .file(
+                "lib/shapes/shapes.dart",
+                "part 'area_ext.dart';\npart 'use.dart';\n\nclass Shape {}\n",
+            )
+            .file(
+                "lib/shapes/area_ext.dart",
+                "part of 'shapes.dart';\n\nextension on Shape {\n  int area() => 1;\n}\n",
+            )
+            .file(
+                "lib/shapes/use.dart",
+                "part of 'shapes.dart';\n\nclass Square extends Shape {\n  int twice() => area() * 2;\n}\n",
+            )
+            .file(
+                "lib/circle.dart",
+                "import 'shapes/shapes.dart';\n\nclass Circle extends Shape {\n  int twice() => area() * 2;\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        let report = graph.report();
+
+        // A generated part calls and names its own library's declarations.
+        let generated = edges_from(graph, "test/integration/async.g.dart");
+        assert!(
+            generated.contains(&"calls 4 -> test/integration/async.dart:family".to_string()),
+            "{generated:?}\n{report}"
+        );
+        assert!(
+            !generated.iter().any(|e| e.contains("annotated")),
+            "{generated:?}\n{report}"
+        );
+        let generic: Vec<&String> = generated
+            .iter()
+            .filter(|e| e.contains("GenericClass"))
+            .collect();
+        assert!(!generic.is_empty(), "{generated:?}\n{report}");
+        assert!(
+            generic
+                .iter()
+                .all(|e| e.ends_with("test/integration/async.dart:GenericClass")),
+            "{generated:?}\n{report}"
+        );
+        // A package function no imported library declares links nothing.
+        assert!(
+            !edges_from(graph, "test/src/core/devtool_test.dart")
+                .iter()
+                .any(|e| e.contains("fake_async")),
+            "{report}"
+        );
+        // The imported library, not a namesake no import names.
+        assert!(
+            edges_from(graph, "test/feature/uni_directional_test.dart")
+                .contains(&"calls 4 -> test/src/utils.dart:errorsOf".to_string()),
+            "{report}"
+        );
+        // Export chains, `show`, `hide` and import prefixes.
+        let main = edges_from(graph, "lib/main.dart");
+        for wanted in [
+            "calls 6 -> packages/kit/lib/src/impl.dart:shown",
+            "calls 11 -> packages/kit/lib/src/hidden.dart:keptOne",
+            "instantiates 12 -> packages/kit/lib/src/impl.dart:Widget",
+        ] {
+            assert!(
+                main.contains(&wanted.to_string()),
+                "{wanted}\n{main:?}\n{report}"
+            );
+        }
+        assert!(
+            main.iter()
+                .any(|e| e.starts_with("calls 8 -> packages/kit/lib/src/cond_")
+                    && e.ends_with(".dart:platformName")),
+            "{main:?}\n{report}"
+        );
+        assert!(
+            !main.iter().any(|e| e.ends_with(":notShown")
+                || e.ends_with(":viaPrefix")
+                || e.ends_with(":hiddenOne")),
+            "{main:?}\n{report}"
+        );
+        assert_eq!(
+            main.iter()
+                .filter(|e| e.ends_with(":Report"))
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec!["references 5 -> packages/kit/lib/src/prefixed.dart:Report".to_string()],
+            "{report}"
+        );
+        // A part names its library by the library's name.
+        assert!(
+            edges_from(graph, "lib/named_part.dart")
+                .contains(&"calls 3 -> lib/named.dart:namedHelper".to_string()),
+            "{report}"
+        );
+        // The library's own declaration shadows the imported one.
+        assert_eq!(
+            edges_from(graph, "lib/feature.dart")
+                .into_iter()
+                .filter(|e| e.ends_with(":helper"))
+                .collect::<Vec<_>>(),
+            vec!["calls 5 -> lib/feature_part.dart:helper".to_string()],
+            "{report}"
+        );
+        // No bare call reaches another type's enum constant or static constant.
+        assert_eq!(
+            edges_from(graph, "lib/check.dart")
+                .into_iter()
+                .filter(|e| !e.starts_with("imports "))
+                .collect::<Vec<_>>(),
+            Vec::<String>::new(),
+            "{report}"
+        );
+        // An unnamed extension on Color is no Color.
+        assert!(
+            !edges_from(graph, "lib/colors.dart")
+                .iter()
+                .any(|e| e.contains("Color")),
+            "{report}"
+        );
+        // An unnamed extension applies in every file of its library, and in
+        // no other library.
+        assert!(
+            edges_from(graph, "lib/shapes/use.dart")
+                .contains(&"calls 4 -> lib/shapes/area_ext.dart:<anonymous>::area".to_string()),
+            "{report}"
+        );
+        assert!(
+            !edges_from(graph, "lib/circle.dart")
+                .iter()
+                .any(|e| e.ends_with("::area")),
+            "{report}"
+        );
+    }
+
+    /// Upstream #2386: a type written through an import prefix is what that
+    /// import exports, though a library imported without a prefix exports a
+    /// type of that name too; the type written without the prefix is that
+    /// library's.
+    #[test]
+    fn pr2386_a_prefixed_dart_type_is_what_its_prefix_imports() {
+        let project = Project::new()
+            .file("pubspec.yaml", "name: app\n")
+            .file("lib/reports.dart", "class Report {}\n")
+            .file("lib/other_reports.dart", "class Report {}\n")
+            .file(
+                "lib/use.dart",
+                "import 'reports.dart';\nimport 'other_reports.dart' as p;\n\nvoid run(p.Report a, Report b) {}\n",
+            )
+            .index();
+        let graph = project.graph();
+        let mut columns: Vec<(i64, String)> = graph
+            .edges
+            .iter()
+            .filter(|e| e.kind == "references")
+            .filter(|e| {
+                graph
+                    .node(&e.source)
+                    .is_some_and(|n| n.file_path == "lib/use.dart")
+            })
+            .filter_map(|e| {
+                let target = graph.node(&e.target)?;
+                Some((e.col.unwrap_or_default(), target.file_path.clone()))
+            })
+            .collect();
+        columns.sort();
+        assert_eq!(
+            columns,
+            vec![
+                (11, "lib/other_reports.dart".to_string()),
+                (21, "lib/reports.dart".to_string()),
+            ],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream #2386: a Dart file in no package — a mason brick's template,
+    /// whose `package:{{name}}/…` imports no pubspec.yaml explains — is
+    /// resolved as before, by name.
+    #[test]
+    fn pr2386_dart_files_outside_any_package_resolve_by_name() {
+        let project = Project::new()
+            .file(
+                "bricks/feature/__brick__/helper.dart",
+                "int helper() => 1;\n",
+            )
+            .file(
+                "bricks/feature/__brick__/page.dart",
+                "import 'package:{{name}}/helper.dart';\n\nint page() => helper();\n",
+            )
+            .index();
+        let graph = project.graph();
+        assert!(
+            edges_from(graph, "bricks/feature/__brick__/page.dart")
+                .contains(&"calls 3 -> bricks/feature/__brick__/helper.dart:helper".to_string()),
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream #2388: an `import` or `export` links the one project file its
+    /// URI names — `package:<name>/<path>` is `<root>/lib/<path>` of the
+    /// package whose pubspec.yaml says `name: <name>`, anything else a path
+    /// from the importing file — or nothing: a `dart:` library, a package
+    /// outside the project, a file the project does not have. Same-named
+    /// packages are told apart by the importer's own package, then by its
+    /// `path:` dependency. Upstream's fixture.
+    #[test]
+    fn pr2388_a_dart_import_links_the_file_its_uri_names() {
+        let project = Project::new()
+            .file("packages/riverpod/pubspec.yaml", "name: riverpod\n")
+            .file(
+                "packages/riverpod/lib/riverpod.dart",
+                "export 'src/core/foundation.dart';\nexport 'package:meta/meta.dart' show internal;\n",
+            )
+            .file("packages/riverpod/lib/src/core/foundation.dart", "class ProviderBase {}\n")
+            .file(
+                "packages/riverpod/lib/src/core/container.dart",
+                "import 'dart:async';\n\nimport 'package:meta/meta.dart';\n\nimport 'foundation.dart';\n\nclass Container extends ProviderBase {}\n",
+            )
+            .file("examples/pub/pubspec.yaml", "name: pub\n")
+            .file(
+                "examples/pub/lib/pub_repository.dart",
+                "import 'package:flutter/foundation.dart';\nimport 'package:riverpod/riverpod.dart';\nimport 'package:riverpod/src/core/foundation.dart' as core;\n\nclass PubRepository {}\n",
+            )
+            .file("packages/bloc_tools/pubspec.yaml", "name: bloc_tools\n")
+            .file(
+                "packages/bloc_tools/lib/src/command_runner.dart",
+                "import 'package:args/command_runner.dart';\n\nclass BlocToolsCommandRunner {}\n",
+            )
+            .file("examples/flutter_counter/pubspec.yaml", "name: flutter_counter\n")
+            .file(
+                "examples/flutter_counter/integration_test/app_test.dart",
+                "import 'package:integration_test/integration_test.dart';\n\nvoid main() {}\n",
+            )
+            .file(
+                "examples/flutter_counter/test_driver/integration_test.dart",
+                "import 'package:integration_test/integration_test_driver.dart';\n\nFuture<void> main() async {}\n",
+            )
+            .file("pubspec.yaml", "name: app\n")
+            .file("test/src/utils.dart", "int errorsOf() => 0;\n")
+            .file("test/old/utils.dart", "int errorsOf() => 0;\n")
+            .file(
+                "test/feature/uni_directional_test.dart",
+                "import '../src/utils.dart';\n\nvoid main() {}\n",
+            )
+            .file("website/docs/cancel/detail_screen/codegen.dart", "class DetailScreen {}\n")
+            .file(
+                "website/i18n/it/cancel/home_screen.dart",
+                "import 'detail_screen/codegen.dart';\n\nclass HomeScreen {}\n",
+            )
+            .file(
+                "examples/login_a/pubspec.yaml",
+                "name: login_a\ndependencies:\n  auth_repo:\n    # the app's own copy\n    path: packages/auth_repo\n  bloc: ^9.0.0\n",
+            )
+            .file("examples/login_a/packages/auth_repo/pubspec.yaml", "name: auth_repo\n")
+            .file(
+                "examples/login_a/packages/auth_repo/lib/auth_repo.dart",
+                "class AuthRepo {}\n",
+            )
+            .file(
+                "examples/login_a/lib/app.dart",
+                "import 'package:auth_repo/auth_repo.dart';\n\nclass AppA {}\n",
+            )
+            .file(
+                "examples/login_b/pubspec.yaml",
+                "name: login_b\ndependencies:\n  auth_repo: { path: \"packages/auth_repo\" }\n",
+            )
+            .file("examples/login_b/packages/auth_repo/pubspec.yaml", "name: auth_repo\n")
+            .file(
+                "examples/login_b/packages/auth_repo/lib/auth_repo.dart",
+                "class AuthRepo {}\n",
+            )
+            .file(
+                "examples/login_b/lib/app.dart",
+                "import 'package:auth_repo/auth_repo.dart';\n\nclass AppB {}\n",
+            )
+            .file("examples/login_c/pubspec.yaml", "name: login_c\n")
+            .file(
+                "examples/login_c/lib/app.dart",
+                "import 'package:auth_repo/auth_repo.dart';\n\nclass AppC {}\n",
+            )
+            .file("packages/a/example/pubspec.yaml", "name: example\n")
+            .file(
+                "packages/a/example/lib/main.dart",
+                "import 'package:example/src/screen.dart';\n\nvoid main() {}\n",
+            )
+            .file("packages/a/example/lib/src/screen.dart", "class ScreenA {}\n")
+            .file("packages/b/example/pubspec.yaml", "name: example\n")
+            .file("packages/b/example/lib/src/screen.dart", "class ScreenB {}\n")
+            .file(
+                "packages/riverpod/lib/src/missing_user.dart",
+                "import 'package:riverpod/src/core/foundation.g.dart';\nimport 'package:riverpod/src/missing_user.dart';\n",
+            )
+            .index();
+        let graph = project.graph();
+        let report = graph.report();
+        let none = Vec::<String>::new();
+        assert_eq!(
+            imports_from(graph, "examples/pub/lib/pub_repository.dart"),
+            vec![
+                "2 -> packages/riverpod/lib/riverpod.dart".to_string(),
+                "3 -> packages/riverpod/lib/src/core/foundation.dart".to_string(),
+            ],
+            "{report}"
+        );
+        assert_eq!(
+            unresolved_imports_of(graph, "examples/pub/lib/pub_repository.dart"),
+            vec!["package:flutter/foundation.dart".to_string()],
+            "{report}"
+        );
+        for file in [
+            "packages/bloc_tools/lib/src/command_runner.dart",
+            "examples/flutter_counter/integration_test/app_test.dart",
+            "examples/flutter_counter/test_driver/integration_test.dart",
+            "website/i18n/it/cancel/home_screen.dart",
+            "packages/riverpod/lib/src/missing_user.dart",
+            "examples/login_c/lib/app.dart",
+        ] {
+            assert_eq!(imports_from(graph, file), none, "{file}\n{report}");
+        }
+        assert_eq!(
+            imports_from(graph, "packages/riverpod/lib/src/core/container.dart"),
+            vec!["5 -> packages/riverpod/lib/src/core/foundation.dart".to_string()],
+            "{report}"
+        );
+        assert_eq!(
+            unresolved_imports_of(graph, "packages/riverpod/lib/src/core/container.dart"),
+            vec![
+                "dart:async".to_string(),
+                "package:meta/meta.dart".to_string()
+            ],
+            "{report}"
+        );
+        assert_eq!(
+            imports_from(graph, "packages/riverpod/lib/riverpod.dart"),
+            vec!["1 -> packages/riverpod/lib/src/core/foundation.dart".to_string()],
+            "{report}"
+        );
+        assert_eq!(
+            imports_from(graph, "test/feature/uni_directional_test.dart"),
+            vec!["1 -> test/src/utils.dart".to_string()],
+            "{report}"
+        );
+        assert_eq!(
+            imports_from(graph, "examples/login_a/lib/app.dart"),
+            vec!["1 -> examples/login_a/packages/auth_repo/lib/auth_repo.dart".to_string()],
+            "{report}"
+        );
+        assert_eq!(
+            imports_from(graph, "examples/login_b/lib/app.dart"),
+            vec!["1 -> examples/login_b/packages/auth_repo/lib/auth_repo.dart".to_string()],
+            "{report}"
+        );
+        assert_eq!(
+            imports_from(graph, "packages/a/example/lib/main.dart"),
+            vec!["1 -> packages/a/example/lib/src/screen.dart".to_string()],
+            "{report}"
+        );
+    }
+
+    /// Upstream #2391: `part '<uri>';` mints an import node and links the
+    /// library's file to the part's by the URI rules an import follows, so a
+    /// change to a part reaches what depends on its library; `part of`
+    /// records nothing. Upstream's fixture (its viewer rails are W7's).
+    #[test]
+    fn pr2391_a_dart_library_links_the_files_its_parts_name() {
+        let project = Project::new()
+            .file("pubspec.yaml", "name: app\n")
+            .file(
+                "lib/src/framework.dart",
+                "import 'dart:async';\n\nimport 'package:meta/meta.dart';\n\npart 'core/element.dart';\npart \"core/container.dart\";\npart 'framework.g.dart';\n",
+            )
+            .file(
+                "lib/src/core/element.dart",
+                "part of '../framework.dart';\n\nclass Element {}\n",
+            )
+            .file(
+                "lib/src/core/container.dart",
+                "part of '../framework.dart';\n\nclass Container {}\n",
+            )
+            .file(
+                "lib/src/framework.g.dart",
+                "// GENERATED CODE - DO NOT MODIFY BY HAND\n\npart of 'framework.dart';\n\nString _$frameworkHash() => 'abc';\n",
+            )
+            .file("lib/app.dart", "export 'src/framework.dart';\n")
+            .file(
+                "test/framework_test.dart",
+                "import 'package:app/app.dart';\n\nvoid main() {}\n",
+            )
+            .file("packages/kit/pubspec.yaml", "name: kit\n")
+            .file("packages/kit/lib/kit.dart", "part 'package:kit/src/widgets.dart';\n")
+            .file(
+                "packages/kit/lib/src/widgets.dart",
+                "part of 'package:kit/kit.dart';\n\nclass Widget {}\n",
+            )
+            .file("lib/legacy/models.dart", "library app.models;\n\npart 'user.dart';\n")
+            .file("lib/legacy/user.dart", "part of app.models;\n\nclass User {}\n")
+            .file("examples/a/pubspec.yaml", "name: a\n")
+            .file("examples/a/lib/main.dart", "part 'main.g.dart';\n\nvoid main() {}\n")
+            .file("examples/b/pubspec.yaml", "name: b\n")
+            .file("examples/b/lib/main.dart", "part 'main.g.dart';\n\nvoid main() {}\n")
+            .file("examples/b/lib/main.g.dart", "part of 'main.dart';\n")
+            .index();
+        let graph = project.graph();
+        let report = graph.report();
+        let none = Vec::<String>::new();
+        assert_eq!(
+            imports_from(graph, "lib/src/framework.dart"),
+            vec![
+                "5 -> lib/src/core/element.dart".to_string(),
+                "6 -> lib/src/core/container.dart".to_string(),
+                "7 -> lib/src/framework.g.dart".to_string(),
+            ],
+            "{report}"
+        );
+        assert_eq!(
+            unresolved_imports_of(graph, "lib/src/framework.dart"),
+            vec![
+                "dart:async".to_string(),
+                "package:meta/meta.dart".to_string()
+            ],
+            "{report}"
+        );
+        assert_eq!(
+            import_nodes_in(graph, "lib/src/framework.dart"),
+            vec![
+                "core/container.dart | part \"core/container.dart\";".to_string(),
+                "core/element.dart | part 'core/element.dart';".to_string(),
+                "dart:async | import 'dart:async';".to_string(),
+                "framework.g.dart | part 'framework.g.dart';".to_string(),
+                "package:meta/meta.dart | import 'package:meta/meta.dart';".to_string(),
+            ],
+            "{report}"
+        );
+        assert_eq!(
+            imports_from(graph, "packages/kit/lib/kit.dart"),
+            vec!["1 -> packages/kit/lib/src/widgets.dart".to_string()],
+            "{report}"
+        );
+        assert_eq!(
+            imports_from(graph, "lib/legacy/models.dart"),
+            vec!["3 -> lib/legacy/user.dart".to_string()],
+            "{report}"
+        );
+        for part in [
+            "lib/src/core/element.dart",
+            "lib/src/framework.g.dart",
+            "packages/kit/lib/src/widgets.dart",
+            "lib/legacy/user.dart",
+        ] {
+            assert_eq!(imports_from(graph, part), none, "{part}\n{report}");
+            assert_eq!(unresolved_imports_of(graph, part), none, "{part}\n{report}");
+            assert_eq!(import_nodes_in(graph, part), none, "{part}\n{report}");
+        }
+        assert_eq!(
+            imports_from(graph, "examples/a/lib/main.dart"),
+            none,
+            "{report}"
+        );
+        assert_eq!(
+            unresolved_imports_of(graph, "examples/a/lib/main.dart"),
+            vec!["main.g.dart".to_string()],
+            "{report}"
+        );
+        assert_eq!(
+            imports_from(graph, "examples/b/lib/main.dart"),
+            vec!["1 -> examples/b/lib/main.g.dart".to_string()],
+            "{report}"
+        );
+        // A change to a part reaches its library and what imports it.
+        let output = support::codegraph(
+            project.root(),
+            ["affected", "lib/src/core/element.dart", "-p", "."],
+        );
+        let affected: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("affected output");
+        let mut files: Vec<String> = affected["affectedFiles"]
+            .as_array()
+            .expect("affectedFiles")
+            .iter()
+            .filter_map(|f| f.as_str().map(str::to_string))
+            .collect();
+        files.sort();
+        assert_eq!(
+            files,
+            vec![
+                "lib/app.dart".to_string(),
+                "lib/src/framework.dart".to_string(),
+                "test/framework_test.dart".to_string(),
+            ],
+            "{affected}\n{report}"
         );
     }
 }

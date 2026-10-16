@@ -373,6 +373,8 @@ fn run_case(name: &str, case: &Case) {
     let php_rows = support::project_metadata_with_prefix(&fresh.db(), "php_heads");
     let lua_rows = support::project_metadata_with_prefix(&fresh.db(), "lua_module");
     let dart_rows = support::project_metadata_with_prefix(&fresh.db(), "dart_heads");
+    // And the Dart library rows (W4-DART-02).
+    let dart_library_rows = support::project_metadata_with_prefix(&fresh.db(), "dart_library");
     for (driver, project) in [("cli", &cli), ("watch", &watch)] {
         let rows = support::project_metadata_with_prefix(&project.db(), "js_module_surface");
         if rows != surface_rows {
@@ -484,6 +486,13 @@ fn run_case(name: &str, case: &Case) {
             divergent.push(format!(
                 "=== {driver} driver: the Dart head rows differ from a fresh index\n\
                  synced: {rows:#?}\nfresh: {dart_rows:#?}"
+            ));
+        }
+        let rows = support::project_metadata_with_prefix(&project.db(), "dart_library");
+        if rows != dart_library_rows {
+            divergent.push(format!(
+                "=== {driver} driver: the Dart library rows differ from a fresh index\n\
+                 synced: {rows:#?}\nfresh: {dart_library_rows:#?}"
             ));
         }
     }
@@ -963,6 +972,27 @@ matrix! {
     dart_core_method_call_leaves_an_extension_moved_to_another_type,
     dart_bare_call_leaves_an_extension_member_once_the_extension_is_unnamed,
     dart_core_method_call_reaches_an_extension_moved_onto_its_type_past_the_tail_ceiling,
+    dart_export_show_gains_a_name_an_unchanged_importer_calls,
+    dart_export_hide_drops_a_name_an_unchanged_importer_calls,
+    dart_part_joins_its_library_and_shadows_an_imported_name,
+    dart_library_import_reaches_its_unchanged_part,
+    dart_library_import_leaves_its_unchanged_part,
+    dart_import_prefix_swap_moves_an_unchanged_parts_type,
+    dart_library_name_brings_in_an_unchanged_part,
+    dart_library_of_an_unchanged_part_appears,
+    dart_same_named_package_gains_its_first_dart_file,
+    dart_delete_a_part_that_shadowed_an_imported_name,
+    dart_unnamed_extension_reaches_a_part_once_its_file_joins_the_library,
+    dart_import_of_an_added_library_past_the_import_key_ceiling,
+    dart_two_barrels_trade_an_exported_name,
+    dart_library_directives_move_down_a_line,
+    dart_hidden_base_type_leaves_a_call_on_its_subclass,
+    dart_shown_base_type_brings_its_method_to_a_call_on_its_subclass_past_the_tail_ceiling,
+    dart_library_import_brings_a_base_method_to_a_call_on_its_parts_subclass,
+    #[ignore = "W5-06: a pubspec.yaml change does not re-resolve the project's Dart files"]
+    dart_pubspec_rename_strands_a_package_import,
+    #[ignore = "W5-06: a pubspec.yaml change does not re-resolve the project's Dart files"]
+    dart_pubspec_path_dependency_picks_a_same_named_package,
     php_call_in_another_case_leaves_a_function_once_a_namesake_in_another_case_appears,
     php_function_called_in_another_case_from_the_global_namespace_reaches_it_once_it_appears,
     #[ignore = "W5-07: a call through a class name reads its supertypes from the class heads, which no sync lane records"]
