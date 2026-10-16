@@ -145,6 +145,18 @@ pub(crate) struct DartChanges {
 }
 
 impl DartChanges {
+    /// The names of the extensions a changed file declared or declares
+    /// (W4-DART-03b).
+    pub(crate) fn extension_names(&self) -> BTreeSet<String> {
+        self.changes
+            .values()
+            .flat_map(|change| change.old_row.iter().chain(change.new_row.iter()))
+            .flat_map(|row| &row.entries)
+            .filter(|entry| entry.extension)
+            .map(|entry| entry.name.clone())
+            .collect()
+    }
+
     /// `path` changed (its old row still in the store) to `new` (its
     /// language, text and nodes), or left the index (`None`).
     pub(crate) fn note(
@@ -496,6 +508,90 @@ pub(crate) fn dart_refresh(
         }
     }
     Ok(refresh)
+}
+
+/// The types whose members a lookup on a type at or below one of `seeds`
+/// can reach that a change of their heads can move (W4-DART-03b): every type
+/// of each seed's ancestry, before the change and after it (past the
+/// resolver's walk limit, the whole ancestry of every type below the seed),
+/// and the extensions `on` one of those types; with a seed that came or
+/// went, every extension, as a new type is a project type an extension `on`
+/// any type applies to.
+pub(crate) fn ancestry_owners(
+    store: &Store,
+    changes: &DartChanges,
+    seeds: &BTreeSet<String>,
+) -> Result<BTreeSet<String>> {
+    if seeds.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+    let mut stored: Vec<(String, HeadRow)> = Vec::new();
+    for (key, value) in store.project_metadata_with_prefix(HEAD_ROW_KEY_PREFIX)? {
+        let Some(path) = key.strip_prefix(HEAD_ROW_KEY_PREFIX) else {
+            continue;
+        };
+        if changes.changes.contains_key(path) {
+            continue;
+        }
+        // An unreadable row is the bootstrap's to rebuild.
+        if let Some(row) = HeadRow::decode(&value) {
+            stored.push((path.to_string(), row));
+        }
+    }
+    let rows_with = |old: bool| {
+        stored
+            .iter()
+            .map(|(_, row)| row)
+            .chain(changes.changes.values().filter_map(move |change| {
+                if old {
+                    &change.old_row
+                } else {
+                    &change.new_row
+                }
+                .as_ref()
+            }))
+    };
+    let (up_before, up_after) = (links(rows_with(true)), links(rows_with(false)));
+    let (down_before, down_after) = (down_links(rows_with(true)), down_links(rows_with(false)));
+    let declared = |old: bool| -> BTreeMap<&str, usize> {
+        let mut out: BTreeMap<&str, usize> = BTreeMap::new();
+        for row in rows_with(old) {
+            for entry in &row.entries {
+                *out.entry(entry.name.as_str()).or_default() += 1;
+            }
+        }
+        out
+    };
+    let (declared_before, declared_after) = (declared(true), declared(false));
+    let mut owners: BTreeSet<String> = BTreeSet::new();
+    let mut every_extension = false;
+    for seed in seeds {
+        owners.extend(closure(&up_before, seed));
+        owners.extend(closure(&up_after, seed));
+        every_extension |= declared_before.get(seed.as_str()) != declared_after.get(seed.as_str());
+        let mut below = closure(&down_before, seed);
+        below.extend(closure(&down_after, seed));
+        for name in &below {
+            let (before, after) = (closure(&up_before, name), closure(&up_after, name));
+            if before.len() >= HIERARCHY_LIMIT || after.len() >= HIERARCHY_LIMIT {
+                owners.extend(before);
+                owners.extend(after);
+            }
+        }
+    }
+    let extensions: Vec<String> = rows_with(true)
+        .chain(rows_with(false))
+        .flat_map(|row| &row.entries)
+        .filter(|entry| {
+            entry.extension
+                && (every_extension
+                    || entry.supers.iter().any(|sup| owners.contains(sup))
+                    || entry.on.as_ref().is_some_and(|on| owners.contains(on)))
+        })
+        .map(|entry| entry.name.clone())
+        .collect();
+    owners.extend(extensions);
+    Ok(owners)
 }
 
 /// The names of the members a call can reach through any of `types` (W4-DART-02):

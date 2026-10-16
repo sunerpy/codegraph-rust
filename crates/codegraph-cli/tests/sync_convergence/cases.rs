@@ -10072,3 +10072,727 @@ pub fn dart_getter_read_reaches_a_getter_an_existing_extension_gains_past_the_ta
         )
         .edge_after("function read", "calls", "method BoxX::area")
 }
+
+static WRAP_CALLS: LazyLock<String> = LazyLock::new(|| {
+    let mut text = String::from("void noise() {\n");
+    for index in 0..501 {
+        text.push_str(&format!("  missing{index}.wrap();\n"));
+    }
+    text.push_str("}\n");
+    text
+});
+
+/// Upstream #2376 (W4-DART-03b): a later link of a chain calls a member of
+/// what the chain before it evaluates to, typed by each link's declared
+/// return type: retyped in another file, the link moves, though its own
+/// name's declarations did not change.
+pub fn dart_chain_link_follows_a_return_type_retyped_in_another_file() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Dart])
+        .file("pubspec.yaml", "name: app\n")
+        .file(
+            "lib/items.dart",
+            "class Item {\n  void save() {}\n  Item touch() => this;\n}\n\nclass Other {\n  void save() {}\n  Other touch() => this;\n}\n",
+        )
+        .file(
+            "lib/repo.dart",
+            "import 'items.dart';\n\nclass Repo {\n  Item load() => Item();\n}\n",
+        )
+        .file(
+            "lib/use.dart",
+            "import 'repo.dart';\n\nvoid run(Repo r) {\n  r.load().save();\n}\n",
+        )
+        .write(
+            "lib/repo.dart",
+            "import 'items.dart';\n\nclass Repo {\n  Other load() => Other();\n}\n",
+        )
+        .edge_before("function run", "calls", "method Item::save")
+        .edge_after("function run", "calls", "method Other::save")
+}
+
+/// A chain's head call types it by the function's declared return type.
+pub fn dart_chain_link_follows_a_top_level_functions_return_type() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Dart])
+        .file("pubspec.yaml", "name: app\n")
+        .file(
+            "lib/items.dart",
+            "class Item {\n  void save() {}\n  Item touch() => this;\n}\n\nclass Other {\n  void save() {}\n  Other touch() => this;\n}\n",
+        )
+        .file(
+            "lib/make.dart",
+            "import 'items.dart';\n\nItem make() => Item();\n",
+        )
+        .file(
+            "lib/use.dart",
+            "import 'make.dart';\n\nvoid run() {\n  make().touch().save();\n}\n",
+        )
+        .write(
+            "lib/make.dart",
+            "import 'items.dart';\n\nOther make() => Other();\n",
+        )
+        .edge_before("function run", "calls", "method Item::save")
+        .edge_after("function run", "calls", "method Other::save")
+}
+
+/// `FutureProvider.autoDispose.family()` is the `family` of the builder the
+/// type's static constant holds: another builder there, and the link and the
+/// one after it move.
+pub fn dart_chain_link_follows_a_static_constants_initializer() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Dart])
+        .file("pubspec.yaml", "name: app\n")
+        .file(
+            "lib/items.dart",
+            "class Item {\n  void save() {}\n  Item touch() => this;\n}\n\nclass Other {\n  void save() {}\n  Other touch() => this;\n}\n",
+        )
+        .file(
+            "lib/builders.dart",
+            "import 'items.dart';\n\nclass FBuilder {\n  const FBuilder();\n  Item family() => Item();\n}\n\nclass SBuilder {\n  const SBuilder();\n  Other family() => Other();\n}\n",
+        )
+        .file(
+            "lib/providers.dart",
+            "import 'builders.dart';\n\nclass FutureProvider {\n  static const autoDispose = FBuilder();\n}\n",
+        )
+        .file(
+            "lib/use.dart",
+            "import 'providers.dart';\n\nvoid run() {\n  FutureProvider.autoDispose.family().save();\n}\n",
+        )
+        .write(
+            "lib/providers.dart",
+            "import 'builders.dart';\n\nclass FutureProvider {\n  static const autoDispose = SBuilder();\n}\n",
+        )
+        .edge_before("function run", "calls", "method FBuilder::family")
+        .edge_after("function run", "calls", "method SBuilder::family")
+        .edge_before("function run", "calls", "method Item::save")
+        .edge_after("function run", "calls", "method Other::save")
+}
+
+/// A top-level constant heading a chain is typed by its initializer, read
+/// back from where it ends: an edit past what its node records of it (the
+/// first hundred characters) still moves the chain (W4-DART-03b's top-level
+/// lines).
+pub fn dart_chain_link_follows_the_end_of_a_long_top_level_initializer() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Dart])
+        .file("pubspec.yaml", "name: app\n")
+        .file(
+            "lib/items.dart",
+            "class Item {\n  void save() {}\n  Item touch() => this;\n}\n\nclass Other {\n  void save() {}\n  Other touch() => this;\n}\n",
+        )
+        .file(
+            "lib/maker.dart",
+            "import 'items.dart';\n\nclass Maker {\n  static Maker make(int a, int b, int c, int d, int e, int f, int g, int h, int i, int j, int k, int l, int m, int n, int o, int p, int q, int r, int s, int t, int u, int v, int w, int x, int y, int z, int aa, int bb, int cc, int dd, int ee, int ff, int gg) => Maker();\n  Item item() => Item();\n  Other other() => Other();\n}\n",
+        )
+        .file(
+            "lib/consts.dart",
+            "import 'maker.dart';\n\nfinal thing = Maker.make(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33).item();\n",
+        )
+        .file(
+            "lib/use.dart",
+            "import 'consts.dart';\n\nvoid run() {\n  thing.touch().save();\n}\n",
+        )
+        .write(
+            "lib/consts.dart",
+            "import 'maker.dart';\n\nfinal thing = Maker.make(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33).other();\n",
+        )
+        .edge_before("function run", "calls", "method Item::save")
+        .edge_after("function run", "calls", "method Other::save")
+}
+
+/// An extension on a type parameter of its own (`extension X<T> on T`)
+/// reaches every project type: added in another file, its member and the
+/// link after it come into reach.
+pub fn dart_chain_link_after_a_universal_extension_it_gains() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Dart])
+        .file("pubspec.yaml", "name: app\n")
+        .file(
+            "lib/items.dart",
+            "class Item {\n  void save() {}\n  Item touch() => this;\n}\n\nclass Other {\n  void save() {}\n  Other touch() => this;\n}\n",
+        )
+        .file(
+            "lib/ext.dart",
+            "import 'items.dart';\n",
+        )
+        .file(
+            "lib/use.dart",
+            "import 'items.dart';\nimport 'ext.dart';\n\nvoid run(Item i) {\n  i.touch().wrap().save();\n}\n",
+        )
+        .write(
+            "lib/ext.dart",
+            "import 'items.dart';\n\nextension Wrap<T> on T {\n  Other wrap() => Other();\n}\n",
+        )
+        .edge_after("function run", "calls", "method Wrap::wrap")
+        .edge_after("function run", "calls", "method Other::save")
+}
+
+/// No call runs a setter: a method turned into one, its signature unchanged,
+/// leaves the chain's link (W4-DART-03b's member statements).
+pub fn dart_chain_link_leaves_a_method_that_becomes_a_setter() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Dart])
+        .file("pubspec.yaml", "name: app\n")
+        .file(
+            "lib/holder.dart",
+            "class Holder {\n  void value(int v) {}\n}\n\nclass Box {\n  Holder wrap() => Holder();\n}\n",
+        )
+        .file(
+            "lib/use.dart",
+            "import 'holder.dart';\n\nvoid run(Box b) {\n  b.wrap().value(1);\n}\n",
+        )
+        .write(
+            "lib/holder.dart",
+            "class Holder {\n  set value(int v) {}\n}\n\nclass Box {\n  Holder wrap() => Holder();\n}\n",
+        )
+        .edge_before("function run", "calls", "method Holder::value")
+}
+
+/// `T read<T>()` called as `read<Repo>()` is a Repo: the method's own type
+/// parameters, renamed, no longer give it the call's type argument.
+pub fn dart_chain_link_follows_a_methods_own_type_parameters() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Dart])
+        .file("pubspec.yaml", "name: app\n")
+        .file(
+            "lib/items.dart",
+            "class Item {\n  void save() {}\n  Item touch() => this;\n}\n\nclass Other {\n  void save() {}\n  Other touch() => this;\n}\n",
+        )
+        .file(
+            "lib/ref.dart",
+            "class Ref {\n  T read<T>(Object p) => throw 0;\n}\n",
+        )
+        .file(
+            "lib/repo.dart",
+            "import 'items.dart';\n\nclass Repo {\n  Item load() => Item();\n}\n",
+        )
+        .file(
+            "lib/use.dart",
+            "import 'ref.dart';\nimport 'repo.dart';\n\nvoid run(Ref ref) {\n  ref.read<Repo>(1).load().save();\n}\n",
+        )
+        .write(
+            "lib/ref.dart",
+            "class Ref {\n  T read<U>(Object p) => throw 0;\n}\n",
+        )
+        .edge_before("function run", "calls", "method Repo::load")
+        .edge_before("function run", "calls", "method Item::save")
+}
+
+/// A chain through fields of what a call returns (`make().box.item.save()`)
+/// reads each field's declared type from its class: retyped there, the
+/// links after it move, though the calling file writes no class.
+pub fn dart_chain_link_through_fields_of_a_call_result_follows_a_retyping() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Dart])
+        .file("pubspec.yaml", "name: app\n")
+        .file(
+            "lib/items.dart",
+            "class Item {\n  void save() {}\n  Item touch() => this;\n}\n\nclass Other {\n  void save() {}\n  Other touch() => this;\n}\n",
+        )
+        .file(
+            "lib/boxes.dart",
+            "import 'items.dart';\n\nclass Box {\n  final Item item = Item();\n}\n\nclass Shelf {\n  final Other item = Other();\n}\n",
+        )
+        .file(
+            "lib/crate.dart",
+            "import 'boxes.dart';\n\nclass Crate {\n  final Box box = Box();\n}\n\nCrate make() => Crate();\n",
+        )
+        .file(
+            "lib/use.dart",
+            "import 'crate.dart';\n\nvoid run() {\n  make().box.item.save();\n}\n",
+        )
+        .write(
+            "lib/crate.dart",
+            "import 'boxes.dart';\n\nclass Crate {\n  final Shelf box = Shelf();\n}\n\nCrate make() => Crate();\n",
+        )
+        .edge_before("function run", "calls", "method Item::save")
+        .edge_after("function run", "calls", "method Other::save")
+}
+
+/// A local heading a chain is typed by its initializer (`final item =
+/// r.load();`): the initializer's call retyped in another file moves the
+/// chain written after it.
+pub fn dart_chain_link_through_a_local_follows_its_initializers_return_type() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Dart])
+        .file("pubspec.yaml", "name: app\n")
+        .file(
+            "lib/items.dart",
+            "class Item {\n  void save() {}\n  Item touch() => this;\n}\n\nclass Other {\n  void save() {}\n  Other touch() => this;\n}\n",
+        )
+        .file(
+            "lib/repo.dart",
+            "import 'items.dart';\n\nclass Repo {\n  Item load() => Item();\n}\n",
+        )
+        .file(
+            "lib/use.dart",
+            "import 'repo.dart';\n\nvoid run(Repo r) {\n  final item = r.load();\n  item.touch().save();\n}\n",
+        )
+        .write(
+            "lib/repo.dart",
+            "import 'items.dart';\n\nclass Repo {\n  Other load() => Other();\n}\n",
+        )
+        .edge_before("function run", "calls", "method Item::save")
+        .edge_after("function run", "calls", "method Other::save")
+}
+
+/// A getter's value called (`b.family().save()`) is what its type's `call`
+/// returns: retyped, the link after it moves, though the chain never writes
+/// `call`.
+pub fn dart_chain_link_follows_a_retyped_call_method() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Dart])
+        .file("pubspec.yaml", "name: app\n")
+        .file(
+            "lib/items.dart",
+            "class Item {\n  void save() {}\n  Item touch() => this;\n}\n\nclass Other {\n  void save() {}\n  Other touch() => this;\n}\n",
+        )
+        .file(
+            "lib/family.dart",
+            "import 'items.dart';\n\nclass Family {\n  Item call() => Item();\n}\n",
+        )
+        .file(
+            "lib/builder.dart",
+            "import 'family.dart';\n\nclass Builder {\n  Family get family => Family();\n}\n",
+        )
+        .file(
+            "lib/use.dart",
+            "import 'builder.dart';\n\nvoid run(Builder b) {\n  b.family().save();\n}\n",
+        )
+        .write(
+            "lib/family.dart",
+            "import 'items.dart';\n\nclass Family {\n  Other call() => Other();\n}\n",
+        )
+        .edge_before("function run", "calls", "method Item::save")
+        .edge_after("function run", "calls", "method Other::save")
+}
+
+/// A top-level constant heading a chain is typed by what its initializer's
+/// function returns: retyped in a third file, the chain moves, though its
+/// file names neither the function nor its type.
+pub fn dart_chain_link_through_a_constant_follows_the_function_its_initializer_calls() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Dart])
+        .file("pubspec.yaml", "name: app\n")
+        .file(
+            "lib/repos.dart",
+            "import 'items.dart';\n\nclass Repo {\n  Item load() => Item();\n}\n\nclass OtherRepo {\n  Other load() => Other();\n}\n",
+        )
+        .file(
+            "lib/items.dart",
+            "class Item {\n  void save() {}\n  Item touch() => this;\n}\n\nclass Other {\n  void save() {}\n  Other touch() => this;\n}\n",
+        )
+        .file(
+            "lib/makers.dart",
+            "import 'repos.dart';\n\nRepo makeRepo() => Repo();\n",
+        )
+        .file(
+            "lib/consts.dart",
+            "import 'makers.dart';\n\nfinal repo = makeRepo();\n",
+        )
+        .file(
+            "lib/use.dart",
+            "import 'consts.dart';\n\nvoid run() {\n  repo.load().touch().save();\n}\n",
+        )
+        .write(
+            "lib/makers.dart",
+            "import 'repos.dart';\n\nOtherRepo makeRepo() => OtherRepo();\n",
+        )
+        .edge_before("function run", "calls", "method Item::save")
+        .edge_after("function run", "calls", "method Other::save")
+}
+
+/// A field declared without a type is typed by its initializer: the function
+/// it calls retyped in another file moves a chain through the field.
+pub fn dart_chain_link_through_a_field_initializer_follows_the_function_it_calls() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Dart])
+        .file("pubspec.yaml", "name: app\n")
+        .file(
+            "lib/items.dart",
+            "class Item {\n  void save() {}\n  Item touch() => this;\n}\n\nclass Other {\n  void save() {}\n  Other touch() => this;\n}\n",
+        )
+        .file(
+            "lib/caches.dart",
+            "import 'items.dart';\n\nclass Cache {\n  Item get() => Item();\n}\n\nclass OtherCache {\n  Other get() => Other();\n}\n",
+        )
+        .file(
+            "lib/makers.dart",
+            "import 'caches.dart';\n\nCache makeCache() => Cache();\n",
+        )
+        .file(
+            "lib/box.dart",
+            "import 'makers.dart';\n\nclass Box {\n  final cache = makeCache();\n}\n",
+        )
+        .file(
+            "lib/use.dart",
+            "import 'box.dart';\n\nvoid run(Box b) {\n  b.cache.get().save();\n}\n",
+        )
+        .write(
+            "lib/makers.dart",
+            "import 'caches.dart';\n\nOtherCache makeCache() => OtherCache();\n",
+        )
+        .edge_before("function run", "calls", "method Cache::get")
+        .edge_after("function run", "calls", "method OtherCache::get")
+        .edge_before("function run", "calls", "method Item::save")
+        .edge_after("function run", "calls", "method Other::save")
+}
+
+/// A getter an extension adds is a link of the chain (`c.manager.read()`):
+/// added in another file, the call through it comes into reach.
+pub fn dart_chain_link_after_an_extension_getter_its_receiver_gains() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Dart])
+        .file("pubspec.yaml", "name: app\n")
+        .file(
+            "lib/manager.dart",
+            "class Manager {\n  void read() {}\n}\n\nclass OtherManager {\n  void read() {}\n}\n\nclass Container {\n  final Manager inner = Manager();\n}\n",
+        )
+        .file(
+            "lib/ext.dart",
+            "import 'manager.dart';\n",
+        )
+        .file(
+            "lib/use.dart",
+            "import 'manager.dart';\nimport 'ext.dart';\n\nvoid run(Container c) {\n  c.manager.read();\n}\n",
+        )
+        .write(
+            "lib/ext.dart",
+            "import 'manager.dart';\n\nextension ContainerX on Container {\n  Manager get manager => inner;\n}\n",
+        )
+        .edge_after("function run", "calls", "method ContainerX::manager")
+        .edge_after("function run", "calls", "method Manager::read")
+}
+
+/// A link reaches a member through the lineage of the type the link before
+/// it returns: that type stops extending the base declaring it, and the
+/// link and the one after it link nothing.
+pub fn dart_chain_link_leaves_a_member_a_base_of_an_inner_type_drops() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Dart])
+        .file("pubspec.yaml", "name: app\n")
+        .file(
+            "lib/items.dart",
+            "class Item {\n  void save() {}\n  Item touch() => this;\n}\n\nclass Other {\n  void save() {}\n  Other touch() => this;\n}\n",
+        )
+        .file(
+            "lib/base.dart",
+            "import 'items.dart';\n\nclass Base {\n  Other wrap() => Other();\n}\n",
+        )
+        .file(
+            "lib/inner.dart",
+            "import 'base.dart';\n\nclass Inner extends Base {}\n",
+        )
+        .file(
+            "lib/repo.dart",
+            "import 'inner.dart';\n\nclass Repo {\n  Inner load() => Inner();\n}\n",
+        )
+        .file(
+            "lib/use.dart",
+            "import 'repo.dart';\n\nvoid run(Repo r) {\n  r.load().wrap().save();\n}\n",
+        )
+        .write(
+            "lib/inner.dart",
+            "import 'base.dart';\n\nclass Inner {}\n",
+        )
+        .edge_before("function run", "calls", "method Base::wrap")
+        .edge_before("function run", "calls", "method Other::save")
+}
+
+/// The same past the tail ceiling: 501 parked calls share the tail `wrap`.
+pub fn dart_chain_link_after_a_universal_extension_it_gains_past_the_tail_ceiling() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Dart])
+        .file("pubspec.yaml", "name: app\n")
+        .file(
+            "lib/items.dart",
+            "class Item {\n  void save() {}\n  Item touch() => this;\n}\n\nclass Other {\n  void save() {}\n  Other touch() => this;\n}\n",
+        )
+        .file(
+            "lib/ext.dart",
+            "import 'items.dart';\n",
+        )
+        .file(
+            "lib/use.dart",
+            "import 'items.dart';\nimport 'ext.dart';\n\nvoid run(Item i) {\n  i.touch().wrap().save();\n}\n",
+        )
+        .file("noise/noise.dart", WRAP_CALLS.as_str())
+        .write(
+            "lib/ext.dart",
+            "import 'items.dart';\n\nextension Wrap<T> on T {\n  Other wrap() => Other();\n}\n",
+        )
+        .edge_after("function run", "calls", "method Wrap::wrap")
+        .edge_after("function run", "calls", "method Other::save")
+}
+
+/// A getter typed by a type parameter of its class (`Item get held` in
+/// `Holder<Item>`) says nothing; once the class stops declaring that
+/// parameter, `Item` is the type, though no member of the class changed
+/// (W4-DART-03b: a class head that changed moves every member's name).
+pub fn dart_chain_link_follows_a_class_head_that_stops_declaring_a_type_parameter() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Dart])
+        .file("pubspec.yaml", "name: app\n")
+        .file("lib/items.dart", "class Item {\n  void save() {}\n  Item touch() => this;\n}\n\nclass Other {\n  void save() {}\n  Other touch() => this;\n}\n")
+        .file(
+            "lib/holder.dart",
+            "import 'items.dart';\n\nclass Holder<Item> {\n  Item get held => throw 0;\n}\n",
+        )
+        .file(
+            "lib/use.dart",
+            "import 'holder.dart';\n\nvoid run(Holder h) {\n  h.held.save();\n}\n",
+        )
+        .write(
+            "lib/holder.dart",
+            "import 'items.dart';\n\nclass Holder<X> {\n  Item get held => throw 0;\n}\n",
+        )
+        .edge_after("function run", "calls", "method Item::save")
+}
+
+/// The type a chain's local is initialized through goes with its file: the
+/// links after the local link nothing, though their own targets stayed.
+pub fn dart_chain_link_through_a_local_of_a_deleted_type_links_nothing() -> Case {
+    Case::new(Change::DeleteImportedModule, &[Language::Dart])
+        .file("pubspec.yaml", "name: app\n")
+        .file("lib/items.dart", "class Item {\n  void save() {}\n  Item touch() => this;\n}\n\nclass Other {\n  void save() {}\n  Other touch() => this;\n}\n")
+        .file(
+            "lib/repo.dart",
+            "import 'items.dart';\n\nclass Repo {\n  Item load() => Item();\n}\n",
+        )
+        .file(
+            "lib/use.dart",
+            "import 'repo.dart';\n\nvoid run(Repo r) {\n  final item = r.load();\n  item.touch().save();\n}\n",
+        )
+        .remove("lib/repo.dart")
+        .edge_before("function run", "calls", "method Item::save")
+}
+
+/// An extension's member answers a lookup on the type it is `on`, whatever
+/// the chain names: the extension moves to another type, and the link to it
+/// and the link after it link nothing, though no member changed
+/// (W4-DART-03b).
+pub fn dart_chain_link_leaves_an_extension_that_moves_to_another_type() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Dart])
+        .file("pubspec.yaml", "name: app\n")
+        .file("lib/items.dart", "class Item {\n  void save() {}\n  Item touch() => this;\n}\n\nclass Other {\n  void save() {}\n  Other touch() => this;\n}\n")
+        .file(
+            "lib/ext.dart",
+            "import 'items.dart';\n\nextension Wrap on Item {\n  Other wrap() => Other();\n}\n",
+        )
+        .file(
+            "lib/use.dart",
+            "import 'items.dart';\nimport 'ext.dart';\n\nvoid run(Item i) {\n  i.touch().wrap().save();\n}\n",
+        )
+        .write(
+            "lib/ext.dart",
+            "import 'items.dart';\n\nextension Wrap on Other {\n  Other wrap() => Other();\n}\n",
+        )
+        .edge_before("function run", "calls", "method Wrap::wrap")
+        .edge_before("function run", "calls", "method Other::save")
+}
+
+/// A constant an initializer types through an extension's member is what
+/// the member returns: the extension moves to another type, and a chain
+/// headed by the constant in another file links nothing, though neither
+/// file names the extension (W4-DART-03b).
+pub fn dart_chain_link_through_a_constant_an_extension_types_leaves_with_it() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Dart])
+        .file("pubspec.yaml", "name: app\n")
+        .file("lib/items.dart", "class Item {\n  void save() {}\n  Item touch() => this;\n}\n\nclass Other {\n  void save() {}\n  Other touch() => this;\n}\n")
+        .file(
+            "lib/ext.dart",
+            "import 'items.dart';\n\nextension Wrap on Item {\n  Other wrap() => Other();\n}\n",
+        )
+        .file(
+            "lib/w.dart",
+            "import 'items.dart';\nimport 'ext.dart';\n\nfinal w = Item().wrap();\n",
+        )
+        .file(
+            "lib/use.dart",
+            "import 'items.dart';\nimport 'w.dart';\n\nvoid run() {\n  w.touch().save();\n}\n",
+        )
+        .write(
+            "lib/ext.dart",
+            "import 'items.dart';\n\nextension Wrap on Other {\n  Other wrap() => Other();\n}\n",
+        )
+        .edge_before("function run", "calls", "method Other::save")
+}
+
+/// A class head that changes moves the lookups on the class, reached
+/// through a function typed by it in another file: once the head stops
+/// declaring the type parameter its getter returns, the getter's type is
+/// the class it names (W4-DART-03b).
+pub fn dart_chain_link_through_a_function_typed_by_a_class_whose_head_changes() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Dart])
+        .file("pubspec.yaml", "name: app\n")
+        .file("lib/items.dart", "class Item {\n  void save() {}\n  Item touch() => this;\n}\n\nclass Other {\n  void save() {}\n  Other touch() => this;\n}\n")
+        .file(
+            "lib/holder.dart",
+            "import 'items.dart';\n\nclass Holder<Item> {\n  Item get held => throw 0;\n}\n",
+        )
+        .file(
+            "lib/make.dart",
+            "import 'holder.dart';\n\nHolder makeHolder() => Holder();\n",
+        )
+        .file(
+            "lib/use.dart",
+            "import 'make.dart';\n\nvoid run() {\n  makeHolder().held.save();\n}\n",
+        )
+        .write(
+            "lib/holder.dart",
+            "import 'items.dart';\n\nclass Holder<X> {\n  Item get held => throw 0;\n}\n",
+        )
+        .edge_after("function run", "calls", "method Item::save")
+}
+
+/// A static constant's initializer calls the function its own library
+/// holds: a file declaring `pick` becomes a part of that library, and a
+/// chain through the constant in a file that imports neither moves with it,
+/// though no declaration changed (W4-DART-03b; the names a library's
+/// visibility moved).
+pub fn dart_chain_link_through_a_static_constant_follows_a_part_joining_its_library() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Dart])
+        .file("pubspec.yaml", "name: app\n")
+        .file("lib/items.dart", "class Item {\n  void save() {}\n  Item touch() => this;\n}\n\nclass Other {\n  void save() {}\n  Other touch() => this;\n}\n")
+        .file("lib/b.dart", "import 'items.dart';\n\nOther pick() => Other();\n")
+        .file("lib/pa.dart", "import 'items.dart';\n\nItem pick() => Item();\n")
+        .file("lib/holder.dart", "class Holder {\n  static final p = pick();\n}\n")
+        .file(
+            "lib/use.dart",
+            "void run() {\n  Holder.p.touch().save();\n}\n",
+        )
+        .write(
+            "lib/holder.dart",
+            "import 'items.dart';\n\npart 'pa.dart';\n\nclass Holder {\n  static final p = pick();\n}\n",
+        )
+        .write("lib/pa.dart", "part of 'holder.dart';\n\nItem pick() => Item();\n")
+        .edge_after("function run", "calls", "method Item::save")
+}
+
+/// A chain's head naming a local is the local's declaration, unless a type
+/// of its name exists: once one comes, the head is that type, and a link it
+/// declares nothing for links nothing, though the chain names nothing the
+/// new type declares (W4-DART-03b; a local's name is read only as a
+/// type's).
+pub fn dart_chain_link_headed_by_a_local_follows_a_type_of_its_name() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Dart])
+        .file("pubspec.yaml", "name: app\n")
+        .file("lib/items.dart", "class Item {\n  void save() {}\n  Item touch() => this;\n}\n\nclass Other {\n  void save() {}\n  Other touch() => this;\n}\n")
+        .file("lib/box.dart", "import 'items.dart';\n")
+        .file(
+            "lib/use.dart",
+            "import 'items.dart';\nimport 'box.dart';\n\nvoid run() {\n  final box = Item();\n  box.touch().save();\n}\n",
+        )
+        .write("lib/box.dart", "import 'items.dart';\n\nclass box {}\n")
+        .edge_before("function run", "calls", "method Item::save")
+}
+
+/// A field a type gains through the base its base comes to extend is read
+/// through a chain on the type, typed in another file: the field has no node,
+/// so the names a lookup on the type reaches are read from the declarations
+/// of its ancestry (W4-DART-03b).
+pub fn dart_chain_link_reads_a_field_its_type_gains_through_a_base() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Dart])
+        .file("pubspec.yaml", "name: app\n")
+        .file("lib/items.dart", "class Item {\n  void save() {}\n  Item touch() => this;\n}\n\nclass Other {\n  void save() {}\n  Other touch() => this;\n}\n")
+        .file(
+            "lib/base.dart",
+            "import 'items.dart';\n\nclass Base {}\n\nclass Holder {\n  final Item item = Item();\n}\n",
+        )
+        .file(
+            "lib/make.dart",
+            "import 'base.dart';\n\nclass Child extends Base {}\n\nChild makeChild() => Child();\n",
+        )
+        .file(
+            "lib/use.dart",
+            "import 'make.dart';\n\nvoid run() {\n  makeChild().item.save();\n}\n",
+        )
+        .write(
+            "lib/base.dart",
+            "import 'items.dart';\n\nclass Base extends Holder {}\n\nclass Holder {\n  final Item item = Item();\n}\n",
+        )
+        .edge_after("function run", "calls", "method Item::save")
+}
+
+/// An extension `on` the base a type's base comes to extend answers a link
+/// on the type: the names a lookup reaches include the extensions on its
+/// ancestry (W4-DART-03b).
+pub fn dart_chain_link_reaches_an_extension_on_a_base_its_type_gains() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Dart])
+        .file("pubspec.yaml", "name: app\n")
+        .file("lib/items.dart", "class Item {\n  void save() {}\n  Item touch() => this;\n}\n\nclass Other {\n  void save() {}\n  Other touch() => this;\n}\n")
+        .file(
+            "lib/base.dart",
+            "import 'items.dart';\n\nclass Base {}\n\nclass Holder {}\n\nextension HolderX on Holder {\n  Other wrap() => Other();\n}\n",
+        )
+        .file(
+            "lib/make.dart",
+            "import 'base.dart';\n\nclass Child extends Base {}\n\nChild makeChild() => Child();\n",
+        )
+        .file(
+            "lib/use.dart",
+            "import 'items.dart';\nimport 'base.dart';\nimport 'make.dart';\n\nvoid run() {\n  makeChild().wrap().save();\n}\n",
+        )
+        .write(
+            "lib/base.dart",
+            "import 'items.dart';\n\nclass Base extends Holder {}\n\nclass Holder {}\n\nextension HolderX on Holder {\n  Other wrap() => Other();\n}\n",
+        )
+        .edge_after("function run", "calls", "method Other::save")
+}
+
+/// An extension `on` any type applies to a project type only: once the type
+/// a function returns comes, a chain on the function's result reaches the
+/// extension's member, though no name the chain writes changed
+/// (W4-DART-03b).
+pub fn dart_chain_link_reaches_an_extension_on_any_type_once_its_type_comes() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Dart])
+        .file("pubspec.yaml", "name: app\n")
+        .file(
+            "lib/also.dart",
+            "extension Also<T> on T {\n  T also() => this;\n}\n",
+        )
+        .file(
+            "lib/make.dart",
+            "import 'fresh.dart';\n\nFresh makeFresh() => Fresh();\n",
+        )
+        .file(
+            "lib/use.dart",
+            "import 'also.dart';\nimport 'make.dart';\n\nvoid run() {\n  makeFresh().also();\n}\n",
+        )
+        .write("lib/fresh.dart", "class Fresh {\n  void go() {}\n}\n")
+        .edge_after("function run", "calls", "method Also::also")
+}
+
+/// A chain written in a type reads the type: `this` and a receiver-less
+/// head are typed by it, so its links move with the type's lineage, though
+/// the chain names nothing that changed (W4-DART-03b).
+pub fn dart_chain_link_in_a_type_follows_a_base_its_base_gains() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Dart])
+        .file("pubspec.yaml", "name: app\n")
+        .file("lib/items.dart", "class Item {\n  void save() {}\n  Item touch() => this;\n}\n\nclass Other {\n  void save() {}\n  Other touch() => this;\n}\n")
+        .file(
+            "lib/base.dart",
+            "import 'items.dart';\n\nclass Base {}\n\nclass Mixer {\n  Other wrap() => Other();\n}\n",
+        )
+        .file(
+            "lib/child.dart",
+            "import 'items.dart';\nimport 'base.dart';\n\nclass Child extends Base {\n  void run() {\n    this.wrap().save();\n    wrap().touch();\n  }\n}\n",
+        )
+        .write(
+            "lib/base.dart",
+            "import 'items.dart';\n\nclass Base extends Mixer {}\n\nclass Mixer {\n  Other wrap() => Other();\n}\n",
+        )
+        .edge_after("method Child::run", "calls", "method Other::save")
+        .edge_after("method Child::run", "calls", "method Other::touch")
+}
+
+/// An unnamed extension applies only in its own library: once its file
+/// becomes a part of the chain's library, its member and the link after it
+/// come into reach, though neither file of the chain changed.
+pub fn dart_chain_link_reaches_an_unnamed_extension_once_its_file_joins_the_library() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Dart])
+        .file("pubspec.yaml", "name: app\n")
+        .file("lib/items.dart", "class Item {\n  void save() {}\n}\n")
+        .file(
+            "lib/shapes.dart",
+            "class Shape {}\n\nclass Wrap {\n  Shape get shape => Shape();\n}\n",
+        )
+        .file(
+            "lib/use.dart",
+            "import 'items.dart';\nimport 'shapes.dart';\n\npart 'ext.dart';\n\nvoid run(Wrap w) {\n  w.shape.area().save();\n}\n",
+        )
+        .file(
+            "lib/ext.dart",
+            "import 'items.dart';\nimport 'shapes.dart';\n\nextension on Shape {\n  Item area() => Item();\n}\n",
+        )
+        .write(
+            "lib/ext.dart",
+            "part of 'use.dart';\n\nextension on Shape {\n  Item area() => Item();\n}\n",
+        )
+        .edge_after("function run", "calls", "method <anonymous>::area")
+        .edge_after("function run", "calls", "method Item::save")
+}

@@ -364,7 +364,7 @@ pub(crate) fn angle_arguments(text: &str) -> Vec<String> {
 /// The type parameters a class declares: `TFixture` for `class
 /// IntegrationTest<TFixture>` (upstream `declaredTypeParameters`, four lines
 /// of its head).
-fn class_type_parameters(decl: &Node, context: &dyn ResolutionContext) -> Vec<String> {
+pub(crate) fn class_type_parameters(decl: &Node, context: &dyn ResolutionContext) -> Vec<String> {
     context
         .source_facts(&decl.file_path)
         .map(|facts| class_type_parameters_in(&facts, decl))
@@ -384,6 +384,25 @@ fn class_type_parameters_in(facts: &crate::source_facts::SourceFacts, decl: &Nod
     } else {
         String::new()
     };
+    // The pattern writes the name, then past whitespace `<`: a head writing
+    // no such thing (occurrences may overlap, `$a` in `$a$a`) compiles
+    // nothing.
+    let name = decl.name.as_str();
+    let mut from = 0;
+    let mut written = false;
+    while !name.is_empty()
+        && let Some(found) = head.get(from..).and_then(|rest| rest.find(name))
+    {
+        let at = from + found;
+        if head[at + name.len()..].trim_start().starts_with('<') {
+            written = true;
+            break;
+        }
+        from = at + name.chars().next().map_or(1, char::len_utf8);
+    }
+    if !written {
+        return Vec::new();
+    }
     let Ok(at) = Regex::new(&format!(r"(?-u:\b){}\s*<", regex::escape(&decl.name))) else {
         return Vec::new();
     };
@@ -439,7 +458,11 @@ fn head_type_arguments(class: &Node, sup: &str, context: &dyn ResolutionContext)
 /// member-level lines (upstream `classMemberType`); inside parentheses at
 /// member depth is a method's parameter list, only the head's (a primary
 /// constructor's) declares members.
-fn class_member_type(class: &Node, name: &str, context: &dyn ResolutionContext) -> Option<String> {
+pub(crate) fn class_member_type(
+    class: &Node,
+    name: &str,
+    context: &dyn ResolutionContext,
+) -> Option<String> {
     let tables = context.member_tables();
     let key = (class.id.clone(), name.to_string());
     if let Some(hit) = memo_get(&tables.member_types, &key) {
@@ -654,6 +677,10 @@ pub struct MemberClass {
     /// before and after.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub lines: Vec<String>,
+    /// A Dart class's member declarations, as a chain's typing reads them
+    /// ([`crate::dart_chains::dart_statements`], W4-DART-03b).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub statements: Vec<String>,
 }
 
 impl MemberClass {
@@ -675,6 +702,10 @@ impl MemberClass {
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MemberSurface {
     pub classes: Vec<MemberClass>,
+    /// A Dart file's top-level declarations, its types' bodies shown as
+    /// `{}`, as a chain's typing reads them (W4-DART-03b).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub top: Vec<String>,
 }
 
 impl MemberSurface {
@@ -682,6 +713,8 @@ impl MemberSurface {
     /// `nodes`.
     pub fn of(source: &str, nodes: &[Node]) -> Self {
         let facts = crate::source_facts::SourceFacts::new(Arc::from(source));
+        let dart_file = nodes.iter().any(|node| node.language == Language::Dart);
+        let code = dart_file.then(|| facts.dart_code());
         let mut ordered: Vec<&Node> = nodes
             .iter()
             .filter(|node| has_member_surface(node.language) && is_member_class_kind(node.kind))
@@ -729,15 +762,22 @@ impl MemberSurface {
                     } else {
                         Vec::new()
                     },
+                    statements: match (&code, dart) {
+                        (Some(code), true) => crate::dart_chains::dart_class_statements(code, node),
+                        _ => Vec::new(),
+                    },
                 }
             })
             .collect();
-        Self { classes }
+        let top = code.map_or_else(Vec::new, |code| {
+            crate::dart_chains::dart_statements(&code.text, 0, code.text.len())
+        });
+        Self { classes, top }
     }
 
-    /// No class: no row records it.
+    /// No class and no top-level declaration: no row records it.
     pub fn is_empty(&self) -> bool {
-        self.classes.is_empty()
+        self.classes.is_empty() && self.top.is_empty()
     }
 
     pub fn encode(&self) -> String {

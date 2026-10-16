@@ -26,7 +26,7 @@ pub const HIERARCHY_LIMIT: usize = 40;
 const HEAD_LINES: i64 = 40;
 
 /// How many lines below a chain's start its later links are looked for.
-const CHAIN_LINES: i64 = 40;
+pub(crate) const CHAIN_LINES: i64 = 40;
 
 /// Past any real member's depth: an extension member only applies when no
 /// instance member does (upstream `DART_EXTENSION_RANK`).
@@ -177,60 +177,20 @@ fn source_lines(file: &str, first: i64, last: i64, context: &dyn ResolutionConte
 /// level, so the later links of a chain (`LoginState().withEmail(e)
 /// .withPassword(p)`) arrive as bare names, their line showing
 /// `.withPassword(` all the same. A spread's `...items()` is no receiver.
+/// Read by [`crate::dart_chains::receiver_less_at`].
 pub(crate) fn is_receiver_less_dart_call(
     reference: &RefView,
     context: &dyn ResolutionContext,
 ) -> bool {
-    let Some(line) = source_line(&reference.file_path, reference.line, context) else {
+    let Some(facts) = context.source_facts(&reference.file_path) else {
         return true;
     };
-    let name = reference.reference_name.as_str();
-    let column = usize::try_from(reference.column.max(0)).unwrap_or(0);
-    // KEEP-RUST: this extractor places a chain link's reference at the
-    // chain's start, so the name is read as a whole word: `ticker.tick(…)`
-    // arrives at `ticker`, which begins with `tick`.
-    let word_at = |text: &str, at: usize| {
-        text.get(at..).is_some_and(|rest| rest.starts_with(name))
-            && !text[..at]
-                .chars()
-                .next_back()
-                .is_some_and(is_dart_name_char)
-            && !text[at + name.len()..]
-                .chars()
-                .next()
-                .is_some_and(is_dart_name_char)
-    };
-    let first_word = |text: &str| {
-        text.match_indices(name)
-            .map(|(at, _)| at)
-            .find(|at| word_at(text, *at))
-    };
-    let found = if word_at(&line, column) {
-        Some((line.clone(), column))
-    } else if column >= name.len() && word_at(&line, column - name.len()) {
-        Some((line.clone(), column - name.len()))
-    } else if let Some(at) = first_word(&line) {
-        Some((line.clone(), at))
-    } else {
-        // KEEP-RUST: a link written on a later line (`LoginState()`, then
-        // `.withEmail(e)` below it) is read on the first line below that
-        // holds its name.
-        (1..=CHAIN_LINES).find_map(|offset| {
-            let text = source_line(&reference.file_path, reference.line + offset, context)?;
-            let at = first_word(&text)?;
-            Some((text, at))
-        })
-    };
-    let Some((text, start)) = found else {
-        return true;
-    };
-    let before = text[..start].trim_end_matches(is_js_space);
-    if !before.ends_with('.') {
-        return true;
-    }
-    before
-        .strip_suffix("...")
-        .is_some_and(|rest| !rest.ends_with('.'))
+    crate::dart_chains::receiver_less_at(
+        &facts.dart_code(),
+        &reference.reference_name,
+        reference.line,
+        reference.column,
+    )
 }
 
 /// A Dart `calls` reference written as a bare identifier at its call site.
@@ -375,12 +335,16 @@ pub struct DartTables {
     supers: Mutex<HashMap<String, Arc<Vec<String>>>>,
     hierarchies: Mutex<HashMap<(String, i64), Arc<Hierarchy>>>,
     /// Each type name's lineage ([`crate::dart_members`]).
-    pub(crate) lineages: Mutex<HashMap<String, Arc<HashMap<String, u64>>>>,
+    pub(crate) lineages: Mutex<HashMap<String, Arc<crate::dart_members::Lineage>>>,
     /// Each member's extension, by node id, `None` for a type's own member.
     pub(crate) extension_owners:
         Mutex<HashMap<String, Option<Arc<crate::dart_members::ExtensionOwner>>>>,
     /// Whether each method is a getter, by node id.
     pub(crate) getters: Mutex<HashMap<String, bool>>,
+    /// Whether each method is a setter, by node id ([`crate::dart_chains`]).
+    pub(crate) setters: Mutex<HashMap<String, bool>>,
+    /// Each function's declared return type as a chain reads it, by node id.
+    pub(crate) return_types: Mutex<HashMap<String, Option<Arc<crate::dart_chains::ReturnInfo>>>>,
 }
 
 /// The types around a call site, by supertype distance.

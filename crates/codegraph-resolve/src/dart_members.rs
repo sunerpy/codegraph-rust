@@ -26,21 +26,40 @@ use crate::dart_scope::{
 };
 use crate::types::{RefView, ResolutionContext, ResolvedBy, ResolvedRef};
 
-/// The extension a Dart member is declared in: the types it is `on`, and
-/// whether it is named (upstream `dartExtensionOwner`).
+/// Past any lineage's depth (at most [`HIERARCHY_LIMIT`]): an extension on
+/// a type parameter of its own is the least specific (upstream
+/// `DART_UNIVERSAL_RANK`, #2376).
+const UNIVERSAL_RANK: u64 = 100;
+
+/// The extension a Dart member is declared in: the types it is `on`, whether
+/// it is named, and whether it is `on` a type parameter of its own
+/// (`extension ObjectX<T> on T`, which every type has) (upstream
+/// `dartExtensionOwner`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExtensionOwner {
     pub on: Vec<String>,
     pub named: bool,
+    pub universal: bool,
+}
+
+/// A Dart type's lineage: each type of it by supertype distance, and the
+/// order the walk reached them in.
+#[derive(Debug, Default)]
+pub(crate) struct Lineage {
+    pub(crate) depths: HashMap<String, u64>,
+    pub(crate) order: Vec<(String, u64)>,
+}
+
+impl Lineage {
+    pub(crate) fn get(&self, name: &str) -> Option<&u64> {
+        self.depths.get(name)
+    }
 }
 
 /// A Dart type and every type it extends, mixes in or implements, by
 /// supertype distance, at most [`HIERARCHY_LIMIT`] of them (upstream
 /// `dartLineage`).
-pub(crate) fn dart_lineage(
-    type_name: &str,
-    context: &dyn ResolutionContext,
-) -> Arc<HashMap<String, u64>> {
+pub(crate) fn dart_lineage(type_name: &str, context: &dyn ResolutionContext) -> Arc<Lineage> {
     let tables = context.dart_tables();
     if let Some(hit) = tables
         .lineages
@@ -50,25 +69,26 @@ pub(crate) fn dart_lineage(
     {
         return hit;
     }
-    let mut depths: HashMap<String, u64> = HashMap::new();
+    let mut lineage = Lineage::default();
     let mut queue: VecDeque<(String, u64)> = VecDeque::from([(type_name.to_string(), 0)]);
-    while depths.len() < HIERARCHY_LIMIT {
+    while lineage.depths.len() < HIERARCHY_LIMIT {
         let Some((name, depth)) = queue.pop_front() else {
             break;
         };
-        if depths.contains_key(&name) {
+        if lineage.depths.contains_key(&name) {
             continue;
         }
-        depths.insert(name.clone(), depth);
+        lineage.depths.insert(name.clone(), depth);
+        lineage.order.push((name.clone(), depth));
         for sup in dart_supertypes_of(&name, context).iter() {
             queue.push_back((sup.clone(), depth + 1));
         }
     }
-    let depths = Arc::new(depths);
+    let lineage = Arc::new(lineage);
     if let Ok(mut memo) = tables.lineages.lock() {
-        memo.insert(type_name.to_string(), Arc::clone(&depths));
+        memo.insert(type_name.to_string(), Arc::clone(&lineage));
     }
-    depths
+    lineage
 }
 
 /// The extension `member` is declared in, or `None` for a class's, mixin's or
@@ -104,9 +124,13 @@ pub(crate) fn dart_extension_owner(
         })
         .and_then(|owner| {
             let named = dart_extension_named(&owner, context)?;
+            let on = dart_head_of(&owner, context).supers.clone();
+            let universal = on.len() == 1
+                && crate::member_types::class_type_parameters(&owner, context).contains(&on[0]);
             Some(Arc::new(ExtensionOwner {
-                on: dart_head_of(&owner, context).supers.clone(),
+                on,
                 named,
+                universal,
             }))
         });
     if let Ok(mut memo) = tables.extension_owners.lock() {
@@ -168,15 +192,19 @@ pub fn declares_getter(head: &str, name: &str) -> bool {
 /// declares, else one an extension `on` such a type adds, an unnamed one only
 /// in the reference's library. `accept` narrows the candidates (a read wants a
 /// getter). Ties go to the reference's own file, then the nearest directory.
-/// The flag says whether the member is an extension's.
+/// `min_depth` 1 skips the type's own members, as `super.` does (#2376). The
+/// flag says whether the member is an extension's.
 pub(crate) fn dart_member_of(
     type_name: &str,
     name: &str,
     reference: &RefView,
     context: &dyn ResolutionContext,
     accept: &dyn Fn(&Node) -> bool,
+    min_depth: u64,
 ) -> Option<(Arc<Node>, bool)> {
     let lineage = dart_lineage(type_name, context);
+    let depth_of = |t: &str| lineage.get(t).copied().filter(|depth| *depth >= min_depth);
+    let mut is_project_type: Option<bool> = None;
     let mut best: Vec<Arc<Node>> = Vec::new();
     let mut best_rank = u64::MAX;
     for member in context.get_nodes_by_name_shared(name) {
@@ -193,17 +221,33 @@ pub(crate) fn dart_member_of(
             {
                 continue;
             }
-            let Some(on) = extension.on.iter().filter_map(|on| lineage.get(on)).min() else {
-                continue;
+            // `extension ObjectX<T> on T` reaches every type, after every
+            // extension that names one of its lineage, when the type is the
+            // project's, so what it declares is known: a List's own `cast`
+            // is not ObjectX's.
+            let on = if extension.universal {
+                let project = *is_project_type.get_or_insert_with(|| {
+                    context
+                        .get_nodes_by_name_shared(type_name)
+                        .iter()
+                        .any(|node| node.language == Language::Dart && is_dart_type_kind(node.kind))
+                });
+                if !project {
+                    continue;
+                }
+                UNIVERSAL_RANK
+            } else {
+                let Some(on) = extension.on.iter().filter_map(|on| depth_of(on)).min() else {
+                    continue;
+                };
+                on
             };
             EXTENSION_RANK + on
         } else {
-            let Some(depth) =
-                member_owner(&member.qualified_name).and_then(|owner| lineage.get(owner))
-            else {
+            let Some(depth) = member_owner(&member.qualified_name).and_then(depth_of) else {
                 continue;
             };
-            *depth
+            depth
         };
         if rank < best_rank {
             best_rank = rank;
@@ -241,7 +285,7 @@ pub(crate) fn dart_extension_member_of(
     reference: &RefView,
     context: &dyn ResolutionContext,
 ) -> Option<Arc<Node>> {
-    let (node, via_extension) = dart_member_of(type_name, name, reference, context, &|_| true)?;
+    let (node, via_extension) = dart_member_of(type_name, name, reference, context, &|_| true, 0)?;
     via_extension.then_some(node)
 }
 
@@ -295,9 +339,14 @@ pub fn match_dart_member_read(
                 crate::member_types::infer_member_receiver_type(receiver, reference, context)
             })?
     };
-    let (getter, _) = dart_member_of(&type_name, member, reference, context, &|node| {
-        is_dart_getter(node, context)
-    })?;
+    let (getter, _) = dart_member_of(
+        &type_name,
+        member,
+        reference,
+        context,
+        &|node| is_dart_getter(node, context),
+        0,
+    )?;
     Some(ResolvedRef {
         original: reference.clone(),
         target_node_id: getter.id.clone(),

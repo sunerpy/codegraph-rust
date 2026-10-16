@@ -268,11 +268,15 @@ holds the JSON `{"classes": [{"name", "qualified_name", "supers", "digest"}]}`,
 one entry per class, struct, interface and enum in node order, with the
 supertypes its head names and a digest of its member-level lines, its head (nine
 lines, cut at the first `{`) and the type parameters it declares. A Dart entry
-also holds `head`, the digest of its head and type parameters alone, and
+also holds `head`, the digest of its head and type parameters alone,
 `lines`, its member-level lines as `<depth>\t<text>`, so a sync can read the
-type a member had before and the members its ancestry declared. A file with no such declaration has no row. They are
+type a member had before and the members its ancestry declared, and
+`statements`, its member declarations as a chain's typing reads them
+(whitespace collapsed, a block shown as `{}`, an argument or parameter list as
+`()`, a function's arrow body as `=> ;`); a Dart file's row also holds `top`,
+its top-level declarations the same way, a type's body shown as `{}`. A file with no such declaration has no row. They are
 written, withdrawn and checked like the head rows under `member_surface_version`
-(3); a sync that finds it missing or at another version re-resolves every C#,
+(4); a sync that finds it missing or at another version re-resolves every C#,
 Java, Kotlin, Swift and Dart file and rebuilds the rows.
 Neither is a canonical surface.
 

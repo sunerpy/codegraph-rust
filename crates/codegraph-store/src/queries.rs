@@ -828,6 +828,16 @@ impl Store {
         rows.collect()
     }
 
+    /// The paths of the files of `language`, in path order (W4-DART-03b: a
+    /// sync lane reading every Dart file's text needs no other column).
+    pub fn file_paths_of_language(&self, language: Language) -> rusqlite::Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT path FROM files WHERE language = ?1 ORDER BY path")?;
+        let rows = stmt.query_map([language.as_str()], |row| row.get(0))?;
+        rows.collect()
+    }
+
     /// Files stored with no nodes or with recorded extraction errors: the only
     /// rows that can be missing their symbols (upstream #2336's
     /// `getFilesWithoutNodesOrWithErrors`). A healthy index has few, so this
@@ -2148,6 +2158,30 @@ impl Store {
             }
         }
         Ok(out)
+    }
+
+    /// The `calls` edges whose source is a node of `file_path` that have a
+    /// site, with the name of the node each reaches (W4-DART-03b: a sync tells
+    /// the chain links among a file's calls by the member each names). The
+    /// `CROSS JOIN` keeps the file's nodes the outer loop: left to itself the
+    /// planner walks every `calls` edge of the project through the kind index.
+    pub fn call_sites_in_file(
+        &self,
+        file_path: &str,
+    ) -> rusqlite::Result<Vec<(String, i64, i64, String)>> {
+        let mut stmt = self.conn.prepare(
+            r#"SELECT e.source, e.line, e.col, tgt.name
+            FROM nodes src
+            CROSS JOIN edges e ON e.source = src.id
+            JOIN nodes tgt ON tgt.id = e.target
+            WHERE src.file_path = ?1 AND e.kind = 'calls'
+              AND e.line IS NOT NULL AND e.col IS NOT NULL
+            ORDER BY e.source, e.line, e.col, tgt.name"#,
+        )?;
+        let rows = stmt.query_map([file_path], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })?;
+        rows.collect()
     }
 
     /// Precise source-site counterpart of

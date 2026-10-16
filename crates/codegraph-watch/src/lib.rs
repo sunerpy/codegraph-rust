@@ -3,6 +3,7 @@ pub mod cfml_heads;
 pub mod cpp_dependents;
 pub mod cpp_namespace_rows;
 pub mod csharp_surfaces;
+mod dart_chains;
 pub mod dart_heads;
 pub mod dart_libraries;
 mod git;

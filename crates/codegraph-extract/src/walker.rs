@@ -184,6 +184,12 @@ fn is_member_shaped_callee(node: SyntaxNode<'_>) -> bool {
     MEMBER_SHAPED_CALLEE_KINDS.contains(&node.kind())
 }
 
+/// A Dart member access through `?.` (`x?.m`), whose `object` and
+/// `property` fields are a `member_expression`'s.
+fn is_dart_null_aware_member(node: SyntaxNode<'_>) -> bool {
+    node.kind() == "null_aware_member_expression"
+}
+
 /// The member segment of a member-shaped node: `property` (TS/JS), `field`
 /// (Go/Rust/C/C++), else the second named child (Python `attribute`, Swift
 /// `navigation_expression`, C++ `qualified_identifier`).
@@ -5848,7 +5854,13 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             // template arguments are stripped below.
             let cpp_scoped =
                 self.spec.language() == Language::Cpp && func.kind() == "qualified_identifier";
-            if is_member_shaped_callee(func) && !cpp_scoped {
+            // KEEP-RUST: a Dart call through `?.` (`x?.m()`) is a member call
+            // as `x.m()` is (upstream's grammar reads both as one selector
+            // kind); this grammar gives it a node of its own.
+            let dart = self.spec.language() == Language::Dart;
+            if (is_member_shaped_callee(func) || (dart && is_dart_null_aware_member(func)))
+                && !cpp_scoped
+            {
                 if let Some(property) = member_name_of(func) {
                     let method_name = node_text(property, self.source);
                     let ts_js = is_ts_js_chain_language(self.spec.language());
@@ -5880,7 +5892,15 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
                             "identifier" | "simple_identifier" | "field_identifier"
                         ) {
                             let receiver_name = node_text(receiver, self.source);
-                            if matches!(receiver_name.as_str(), "self" | "this" | "cls" | "super") {
+                            // KEEP-RUST: a Dart `self` or `cls` is a variable
+                            // like any other (upstream records `self.m()` as
+                            // `self.m`); only `this` and `super` are the object.
+                            let own = if dart {
+                                matches!(receiver_name.as_str(), "this" | "super")
+                            } else {
+                                matches!(receiver_name.as_str(), "self" | "this" | "cls" | "super")
+                            };
+                            if own {
                                 callee_name = method_name;
                             } else {
                                 callee_name = format!("{receiver_name}.{method_name}");
@@ -6049,7 +6069,9 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
                             // (`self.store.load()`) or a mixed path
                             // (`URLSession.shared.data`) is no type path.
                             callee_name = format!("{path}.{method_name}");
-                        } else if is_member_shaped_callee(receiver) {
+                        } else if is_member_shaped_callee(receiver)
+                            || (dart && is_dart_null_aware_member(receiver))
+                        {
                             // #1496 — outside TS/JS (handled above), a receiver
                             // that is itself member-shaped (`self.mailer`,
                             // `holder.values`, `a.b.c`) keeps its LAST segment,

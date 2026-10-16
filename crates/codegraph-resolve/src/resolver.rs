@@ -2184,6 +2184,13 @@ impl ReferenceResolver {
                 None,
             );
         }
+        // So does a later link of a Dart call chain (`X.autoDispose.family(…)`,
+        // `events.map(f).transform(…)`), which arrives by its bare name or by
+        // its receiver's last segment: a member of what the chain's head and
+        // links are declared to be, or nothing (upstream #2376).
+        if let Some(result) = crate::dart_chains::dart_chain_link(reference, context) {
+            return (result, None);
+        }
         // A Go call through a type assertion (`srv.(KVServer).Range(ctx,
         // in)`), which arrives by its bare name, is to a method of the
         // asserted type, or to nothing the project declares (upstream #2444).

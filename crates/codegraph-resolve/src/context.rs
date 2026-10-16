@@ -76,6 +76,8 @@ struct Caches {
     /// The last few compiled pattern sets, most recent last
     /// ([`ResolutionContext::compiled_patterns`]).
     patterns: std::collections::VecDeque<CompiledPatterns>,
+    /// The last few nodes read by id, most recent last.
+    nodes_by_id: std::collections::VecDeque<(String, Option<Arc<Node>>)>,
     cfml_tables: Option<Arc<crate::cfml_scope::CfmlTables>>,
     swift_tables: Option<Arc<crate::swift_type_visibility::SwiftTables>>,
     objc_tables: Option<Arc<crate::objc_scope::ObjcTables>>,
@@ -92,6 +94,10 @@ type CompiledPatterns = (
 /// megabyte or more (CFML's eight about 3.3 MB), so a few, enough for the
 /// receivers one file's references write in turn.
 const PATTERN_MEMO_LIMIT: usize = 8;
+
+/// The most nodes a store context keeps by id: the gates one reference passes
+/// read its target's node in turn, each a query of its own otherwise.
+const NODE_BY_ID_MEMO_LIMIT: usize = 8;
 
 /// Bound on memoized existence answers; the memo restarts past it, as upstream.
 pub(crate) const FILE_EXISTS_MEMO_LIMIT: usize = 200_000;
@@ -131,6 +137,7 @@ impl Caches {
             dart_tables: None,
             dart_libraries: None,
             patterns: std::collections::VecDeque::new(),
+            nodes_by_id: std::collections::VecDeque::new(),
             cfml_tables: None,
             swift_tables: None,
             objc_tables: None,
@@ -185,6 +192,7 @@ impl<'a> StoreResolutionContext<'a> {
         c.dart_tables = None;
         c.dart_libraries = None;
         c.patterns.clear();
+        c.nodes_by_id.clear();
         c.cfml_tables = None;
         c.swift_tables = None;
         c.objc_tables = None;
@@ -426,7 +434,27 @@ impl ResolutionContext for StoreResolutionContext<'_> {
     }
 
     fn get_node_by_id(&self, id: &str) -> Option<Node> {
-        self.store.node_by_id(id).ok().flatten()
+        self.get_node_by_id_shared(id)
+            .map(|node| node.as_ref().clone())
+    }
+
+    fn get_node_by_id_shared(&self, id: &str) -> Option<Arc<Node>> {
+        if let Some((_, node)) = self
+            .caches
+            .borrow()
+            .nodes_by_id
+            .iter()
+            .find(|(key, _)| key == id)
+        {
+            return node.clone();
+        }
+        let node = self.store.node_by_id(id).ok().flatten().map(Arc::new);
+        let mut c = self.caches.borrow_mut();
+        if c.nodes_by_id.len() >= NODE_BY_ID_MEMO_LIMIT {
+            c.nodes_by_id.pop_front();
+        }
+        c.nodes_by_id.push_back((id.to_string(), node.clone()));
+        node
     }
 
     fn get_supertypes(&self, type_name: &str, language: Language) -> Vec<String> {

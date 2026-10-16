@@ -120,6 +120,19 @@ impl LanguageSpec for DartSpec {
             return Some(class_name);
         }
         let sig = dart_inner_signature(node);
+        // KEEP-RUST: this grammar wraps the return type in the signature's
+        // `return_type` field, a `type` whose own `type_identifier`s are the
+        // name and any import prefix before it (`p.Foo<T>?` holds `p`, `Foo`
+        // and the type arguments). The last of them is the type upstream
+        // names; a function, record or `void` type names none.
+        if let Some(written) = child_by_field(sig, "return_type") {
+            let last = written
+                .named_children(&mut written.walk())
+                .filter(|child| child.kind() == "type_identifier")
+                .last()?;
+            let name = node_text(last, source);
+            return is_ident(&name).then_some(name);
+        }
         let ret_type = sig
             .named_children(&mut sig.walk())
             .find(|child| child.kind() == "type_identifier")?;
@@ -165,8 +178,17 @@ impl LanguageSpec for DartSpec {
     }
 
     fn is_static(&self, node: Node<'_>, _source: &str) -> bool {
-        node.kind() == "method_signature"
-            && (0..node.child_count()).any(|i| node.child(i).is_some_and(|c| c.kind() == "static"))
+        // KEEP-RUST: a member with a body is a `method_declaration` here,
+        // its `static` in the `method_signature` it holds; upstream's grammar
+        // makes that signature the member itself.
+        let signature = if node.kind() == "method_declaration" {
+            child_by_field(node, "signature").unwrap_or(node)
+        } else {
+            node
+        };
+        signature.kind() == "method_signature"
+            && (0..signature.child_count())
+                .any(|i| signature.child(i).is_some_and(|c| c.kind() == "static"))
     }
 
     fn resolve_name(&self, node: Node<'_>, _source: &str) -> Option<String> {

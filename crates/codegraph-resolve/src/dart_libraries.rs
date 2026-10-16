@@ -1433,6 +1433,24 @@ impl DartLibraries {
             .collect()
     }
 
+    /// The prefixes `file`'s own imports declare (`import '…' as p`,
+    /// `deferred as p`), which upstream #2376 reads from the file itself.
+    pub fn import_prefixes_of(
+        &self,
+        file: &str,
+        context: &dyn ResolutionContext,
+    ) -> BTreeSet<String> {
+        self.directives_of(file, context)
+            .map(|directives| {
+                directives
+                    .imports
+                    .iter()
+                    .filter_map(|import| import.prefix.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// The library `file` belongs to, if known.
     pub fn library_of_file(&self, file: &str, context: &dyn ResolutionContext) -> Option<String> {
         self.library_of(file, context)

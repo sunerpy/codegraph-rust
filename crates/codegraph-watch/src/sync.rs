@@ -996,6 +996,30 @@ fn sync_paths_with_store(
             }
         }
         changed_names.note_all(dart_libraries.names.iter().cloned());
+        // What a later link of a Dart call chain in an unchanged file read of
+        // a changed file's declarations, or of a library's visibility: by the
+        // names its file writes, or through a declaration naming one
+        // (W4-DART-03b). A bootstrap of the Dart or member rows re-resolves
+        // every Dart file already.
+        let dart_chains = if dart_bootstrap || member_bootstrap {
+            Vec::new()
+        } else {
+            crate::dart_chains::chain_refresh(
+                store,
+                project_root,
+                scope.options.max_file_size,
+                &changed_names.members,
+                &dart_libraries.names,
+                &changed_names.dart,
+                &reindexed,
+                &changed_names.removed_files,
+            )?
+        };
+        for affected in dart_chains {
+            if !dependent_fallbacks.contains(&affected.file_path) {
+                merge_dependent_site(&mut dependent_sites, &mut dependent_fallbacks, affected);
+            }
+        }
         // What a Lua call in an unchanged file read of a changed one: which
         // names it declares `local`, what its module hands out (W4-LUA-01).
         let lua = crate::lua_modules::lua_refresh(
@@ -3600,9 +3624,10 @@ pub(crate) mod tests {
     }
 
     /// W4-DART-03: Dart files have member surface rows too (a member read
-    /// types its receiver by the fields of the classes around it), so an
-    /// index whose member marker is missing, or at the version before Dart
-    /// had rows, re-resolves every Dart file once and writes their rows.
+    /// types its receiver by the fields of the classes around it, a chain
+    /// link by their statements), so an index whose member marker is
+    /// missing, or at a version before the rows held what is read now,
+    /// re-resolves every Dart file once and writes their rows.
     #[test]
     fn an_index_without_the_member_marker_rebuilds_the_dart_rows() {
         const SHAPES: (&str, &str) = ("lib/shapes.dart", "class Box {\n  int get area => 1;\n}\n");
@@ -3652,8 +3677,10 @@ pub(crate) mod tests {
                     codegraph_resolve::member_types::SURFACE_ROW_KEY_PREFIX,
                 )
                 .unwrap();
+            // The version before Dart rows kept their statements
+            // (W4-DART-03b).
             store
-                .set_project_metadata(crate::member_surfaces::VERSION_KEY, "2")
+                .set_project_metadata(crate::member_surfaces::VERSION_KEY, "3")
                 .unwrap();
         }
         assert_ne!(edge_projection(&db), expected);

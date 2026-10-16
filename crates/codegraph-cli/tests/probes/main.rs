@@ -14852,10 +14852,10 @@ mod dart_libraries {
     /// exports. A library's own declaration shadows an imported one, and a
     /// bare call never reaches another type's enum constant or static
     /// constant. Upstream's fixture. Its field-type case (`final Box<int>
-    /// box;`, #2360) came with W4-DART-03; its typed receiver's call into an
-    /// unnamed extension in another part (`s.area()`, #2376) is W4-DART-03's
-    /// chain typing, so the unnamed extension's reach across its library is
-    /// checked here through a bare call.
+    /// box;`, #2360) and its typed receiver's call into an unnamed extension
+    /// in another part (`s.area()`) came with W4-DART-03; the unnamed
+    /// extension's reach across its library is checked through a bare call
+    /// too.
     #[test]
     fn pr2386_a_bare_dart_name_reaches_only_what_its_library_can_see() {
         let project = Project::new()
@@ -14961,7 +14961,7 @@ mod dart_libraries {
             )
             .file(
                 "lib/shapes/use.dart",
-                "part of 'shapes.dart';\n\nclass Square extends Shape {\n  int twice() => area() * 2;\n}\n",
+                "part of 'shapes.dart';\n\nint total(Shape s) => s.area();\n\nclass Square extends Shape {\n  int twice() => area() * 2;\n}\n",
             )
             .file(
                 "lib/circle.dart",
@@ -15079,11 +15079,15 @@ mod dart_libraries {
         );
         // An unnamed extension applies in every file of its library, and in
         // no other library.
-        assert!(
-            edges_from(graph, "lib/shapes/use.dart")
-                .contains(&"calls 4 -> lib/shapes/area_ext.dart:<anonymous>::area".to_string()),
-            "{report}"
-        );
+        for edge in [
+            "calls 3 -> lib/shapes/area_ext.dart:<anonymous>::area",
+            "calls 6 -> lib/shapes/area_ext.dart:<anonymous>::area",
+        ] {
+            assert!(
+                edges_from(graph, "lib/shapes/use.dart").contains(&edge.to_string()),
+                "{edge}\n{report}"
+            );
+        }
         assert!(
             !edges_from(graph, "lib/circle.dart")
                 .iter()
@@ -16046,5 +16050,580 @@ mod dart_reads {
             ["BoxHidden::hidden"],
             "{report}"
         );
+    }
+}
+
+/// W4-DART-03b: a later link of a Dart call chain calls a member of what the
+/// chain before it evaluates to (upstream #2376, #2383).
+mod dart_chains {
+    use super::support::{Graph, Project};
+
+    /// `<caller name> -> <target qualified name>` for every `calls` edge out
+    /// of a file's nodes, sorted (upstream's `callsFrom`).
+    fn calls_from(graph: &Graph, file: &str) -> Vec<String> {
+        let mut out: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|e| e.kind == "calls")
+            .filter_map(|e| {
+                let source = graph.node(&e.source)?;
+                (source.file_path == file).then_some(())?;
+                Some(format!(
+                    "{} -> {}",
+                    source.name,
+                    graph.node(&e.target)?.qualified_name
+                ))
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// Upstream #2376 (`dart-chain-links.test.ts`, its fixture): a later link
+    /// of a chain calls a member of what the chain before it evaluates to,
+    /// typed from the head and each link's declared type, or nothing: a
+    /// Stream's `transform` is no project method of that name,
+    /// `X.autoDispose.family(…)` is the `family` of the builder X's constant
+    /// holds, a fluent chain stays on the type each link returns, `super.m()`
+    /// is the superclass's, `context.read<T>()` hands back a T, a
+    /// parenthesized receiver is what its last operand is, and a getter an
+    /// annotated extension adds is in the chain.
+    #[test]
+    fn pr2376_a_dart_chain_link_calls_a_member_of_what_the_chain_before_it_is() {
+        let project = Project::new()
+            .file("pubspec.yaml", "name: app\n")
+            .file("lib/pipe.dart", "class BlocPipe {\n  Object? transform(Object? value) => value;\n}\n")
+            .file("lib/bloc.dart", "import 'dart:async';\n\nclass Bloc<E> {\n  Stream<dynamic> transformEvents(Stream<E> events, Stream<dynamic> Function(E) mapper) {\n    return events\n        .map(mapper)\n        .transform<dynamic>(const _FlatMap<dynamic>());\n  }\n}\n\nclass _FlatMap<T> {\n  const _FlatMap();\n}\n")
+            .file("lib/builders.dart", "class FutureProviderBuilder {\n  const FutureProviderBuilder();\n\n  FutureProviderFamilyBuilder get family => const FutureProviderFamilyBuilder();\n}\n\nclass FutureProviderFamilyBuilder {\n  const FutureProviderFamilyBuilder();\n\n  Object call(Object create) => create;\n}\n\nclass StateProviderBuilder {\n  const StateProviderBuilder();\n\n  StateProviderFamilyBuilder get family => const StateProviderFamilyBuilder();\n}\n\nclass StateProviderFamilyBuilder {\n  const StateProviderFamilyBuilder();\n\n  Object call(Object create) => create;\n}\n")
+            .file("lib/providers.dart", "import 'builders.dart';\n\nclass FutureProvider {\n  static const autoDispose = FutureProviderBuilder();\n}\n\nclass StateProvider {\n  static const autoDispose = StateProviderBuilder();\n}\n")
+            .file("lib/app.dart", "import 'providers.dart';\n\nfinal users = FutureProvider.autoDispose.family<int, String>((ref, id) => 0);\nfinal counts = StateProvider.autoDispose\n    .family<int, String>((ref, id) => 0);\n")
+            .file("lib/sign_up/sign_up_state.dart", "class SignUpState {\n  const SignUpState();\n\n  SignUpState withEmail(String email) => this;\n  SignUpState withPassword(String password) => this;\n}\n")
+            .file("test/sign_up/login_state.dart", "class LoginState {\n  const LoginState();\n\n  LoginState withEmail(String email) => this;\n  LoginState withPassword(String password) => this;\n}\n")
+            .file("test/sign_up/sign_up_state_test.dart", "import 'package:app/sign_up/sign_up_state.dart';\n\nvoid main() {\n  final constructed = SignUpState().withEmail('a').withPassword('b');\n  final constant = const SignUpState().withEmail('a');\n}\n")
+            .file("lib/counter.dart", "abstract class BlocEventSink<E> {\n  void add(E event);\n}\n\nabstract class BlocBase<S> {\n  Future<void> close() async {}\n}\n\nabstract class Bloc<E, S> extends BlocBase<S> implements BlocEventSink<E> {\n  @override\n  void add(E event) {}\n\n  @override\n  Future<void> close() async {\n    await super.close();\n  }\n}\n\nclass CounterBloc extends Bloc<int, int> {\n  void increment() {}\n}\n")
+            .file("lib/counter_view.dart", "import 'package:flutter/widgets.dart';\nimport 'counter.dart';\n\nclass CounterView {\n  void onTap(BuildContext context) {\n    context.read<CounterBloc>().add(1);\n  }\n}\n")
+            .file("lib/todo.dart", "class Todo {\n  const Todo();\n\n  Todo copyWith({String? title}) => this;\n}\n")
+            .file("lib/edit_todo.dart", "import 'todo.dart';\n\nclass EditTodoState {\n  const EditTodoState({this.initialTodo});\n\n  final Todo? initialTodo;\n\n  EditTodoState copyWith({Todo? initialTodo}) => this;\n}\n\nclass EditTodoBloc {\n  EditTodoState state = const EditTodoState();\n\n  void submit() {\n    final todo = (state.initialTodo ?? const Todo()).copyWith(title: 'x');\n  }\n}\n")
+            .file("lib/container.dart", "import 'package:meta/meta.dart';\n\nclass ProviderPointerManager {\n  void readPointer(Object provider) {}\n}\n\nclass ProviderContainer {\n  final ProviderPointerManager _pointerManager = ProviderPointerManager();\n}\n\n@internal\nextension ProviderContainerTest on ProviderContainer {\n  ProviderPointerManager get pointerManager => _pointerManager;\n}\n\nvoid probe(ProviderContainer container) {\n  container.pointerManager.readPointer(1);\n}\n")
+            .file("lib/other_manager.dart", "class OtherManager {\n  void readPointer(Object provider) {}\n}\n")
+            .index();
+        let graph = project.graph();
+        let report = graph.report();
+        assert_eq!(
+            calls_from(graph, "lib/bloc.dart"),
+            Vec::<String>::new(),
+            "{report}"
+        );
+        assert_eq!(
+            calls_from(graph, "lib/app.dart"),
+            [
+                "counts -> StateProviderBuilder::family",
+                "users -> FutureProviderBuilder::family",
+            ],
+            "{report}"
+        );
+        assert_eq!(
+            calls_from(graph, "test/sign_up/sign_up_state_test.dart"),
+            [
+                "main -> SignUpState::withEmail",
+                "main -> SignUpState::withEmail",
+                "main -> SignUpState::withPassword",
+            ],
+            "{report}"
+        );
+        assert_eq!(
+            calls_from(graph, "lib/counter.dart"),
+            ["close -> BlocBase::close"],
+            "{report}"
+        );
+        assert_eq!(
+            calls_from(graph, "lib/counter_view.dart"),
+            ["onTap -> Bloc::add"],
+            "{report}"
+        );
+        assert_eq!(
+            calls_from(graph, "lib/edit_todo.dart"),
+            ["submit -> Todo::copyWith"],
+            "{report}"
+        );
+        assert_eq!(
+            calls_from(graph, "lib/container.dart"),
+            [
+                "probe -> ProviderContainerTest::pointerManager",
+                "probe -> ProviderPointerManager::readPointer",
+            ],
+            "{report}"
+        );
+    }
+
+    /// Upstream #2383 (`dart-generic-factory-chain.test.ts`, its fixtures): a
+    /// call chained on a generic static factory calls a member of the type
+    /// the factory's type argument names, whether the factory is the
+    /// project's (`static T of<T>(…)`, its own type parameter given by the
+    /// call) or a package's (an outside `of<T>(…)` hands back its T), wrapped,
+    /// through an import prefix, through `?.`, or inherited; never a member
+    /// found by its name, and nothing without a type argument. KEEP-RUST: the
+    /// extractor records every such link by its bare name, so upstream's
+    /// fallback in `matchDottedCallChain` has no counterpart: the chain is
+    /// typed at the call site either way.
+    #[test]
+    fn pr2383_a_chain_on_a_generic_lookup_calls_a_member_of_its_type_argument() {
+        let library = Project::new()
+            .file("pubspec.yaml", "name: app\nenvironment:\n  sdk: \">=3.0.0 <4.0.0\"\n")
+            .file("lib/bloc_provider.dart", "class BlocProvider<T> {\n  const BlocProvider();\n\n  static T of<T>(Object context, {bool listen = false}) => throw 0;\n\n  static T? maybeOf<T>(Object context, {bool listen = false}) => null;\n}\n")
+            .file("lib/bloc.dart", "abstract class Bloc<E, S> {\n  void add(E event) {}\n}\n")
+            .file("lib/counter/counter_cubit.dart", "class CounterCubit {\n  void increment() {}\n}\n")
+            .file("lib/counter/counter_bloc.dart", "import '../bloc.dart';\n\nclass CounterBloc extends Bloc<int, int> {}\n")
+            .file("lib/counter/step_counter.dart", "class StepCounter {\n  void increment() {}\n  void decrement() {}\n  void saveTodo(Object todo) {}\n}\n")
+            .file("lib/counter/counter_page.dart", "import '../bloc_provider.dart';\nimport 'counter_cubit.dart';\nimport 'counter_cubit.dart' as cubits;\nimport 'counter_bloc.dart';\n\nclass Button {\n  const Button({Object? onPressed});\n}\n\nclass CounterPage {\n  void tap(Object context) {\n    BlocProvider.of<CounterCubit>(context, listen: false).increment();\n  }\n\n  void tapWrapped(Object context) {\n    BlocProvider.of<CounterCubit>(context, listen: false)\n        .increment();\n  }\n\n  void tapPrefixed(Object context) {\n    BlocProvider.of<cubits.CounterCubit>(context, listen: false).increment();\n  }\n\n  void tapMaybe(Object context) {\n    BlocProvider.maybeOf<CounterCubit>(context, listen: false)?.increment();\n  }\n\n  void tapBloc(Object context) {\n    BlocProvider.of<CounterBloc>(context, listen: false).add(1);\n  }\n\n  void tapMissing(Object context) {\n    BlocProvider.of<CounterCubit>(context, listen: false).decrement();\n  }\n\n  void tapInferred(Object context) {\n    BlocProvider.of(context, listen: false).increment();\n  }\n\n  // Parsed as two comparisons, so increment arrives by its bare name.\n  void tapRecovered(Object context) {\n    BlocProvider.of<CounterCubit>(context).increment();\n  }\n\n  Object build(Object context) => Button(\n        onPressed: () => BlocProvider.of<CounterCubit>(context, listen: false).increment(),\n      );\n}\n")
+            .index();
+        let graph = library.graph();
+        let report = graph.report();
+        assert_eq!(
+            calls_from(graph, "lib/counter/counter_page.dart"),
+            [
+                "build -> BlocProvider::of",
+                "build -> CounterCubit::increment",
+                "tap -> BlocProvider::of",
+                "tap -> CounterCubit::increment",
+                "tapBloc -> Bloc::add",
+                "tapBloc -> BlocProvider::of",
+                "tapInferred -> BlocProvider::of",
+                "tapMaybe -> BlocProvider::maybeOf",
+                "tapMaybe -> CounterCubit::increment",
+                "tapMissing -> BlocProvider::of",
+                "tapPrefixed -> BlocProvider::of",
+                "tapPrefixed -> CounterCubit::increment",
+                "tapRecovered -> BlocProvider::of",
+                "tapRecovered -> CounterCubit::increment",
+                "tapWrapped -> BlocProvider::of",
+                "tapWrapped -> CounterCubit::increment",
+            ],
+            "{report}"
+        );
+        let app = Project::new()
+            .file("pubspec.yaml", "name: app\nenvironment:\n  sdk: \">=3.0.0 <4.0.0\"\n")
+            .file("lib/counter/counter_cubit.dart", "class CounterCubit {\n  void increment() {}\n}\n")
+            .file("lib/counter/step_counter.dart", "class StepCounter {\n  void increment() {}\n  void decrement() {}\n  void saveTodo(Object todo) {}\n}\n")
+            .file("lib/todos/todos_repository.dart", "class TodosRepository {\n  void saveTodo(Object todo) {}\n}\n")
+            .file("lib/counter/counter_page.dart", "import 'package:flutter_bloc/flutter_bloc.dart';\nimport '../todos/todos_repository.dart';\nimport 'counter_cubit.dart';\n\nclass CounterPage {\n  void tap(Object context) {\n    BlocProvider.of<CounterCubit>(context, listen: false).increment();\n  }\n\n  void save(Object context, Object todo) {\n    RepositoryProvider.of<TodosRepository>(context, listen: false).saveTodo(todo);\n  }\n\n  void tapInferred(Object context) {\n    BlocProvider.of(context, listen: false).increment();\n  }\n\n  // Parsed as two comparisons, so increment arrives by its bare name.\n  void tapRecovered(Object context) {\n    BlocProvider.of<CounterCubit>(context).increment();\n  }\n}\n")
+            .index();
+        let graph = app.graph();
+        let report = graph.report();
+        assert_eq!(
+            calls_from(graph, "lib/counter/counter_page.dart"),
+            [
+                "save -> TodosRepository::saveTodo",
+                "tap -> CounterCubit::increment",
+                "tapRecovered -> CounterCubit::increment",
+            ],
+            "{report}"
+        );
+    }
+
+    /// KEEP-RUST: each piece of evidence a chain's typing reads, as upstream
+    /// #2376 reads it: an import prefix before the head names a library; a
+    /// `const` / `new` head's named constructor is its own link, and one the
+    /// index holds no node for constructs its type; a call through a type
+    /// reaches only its static members (a factory, not an instance getter of
+    /// its name); a called value runs its type's `call`; a lookup its type
+    /// declares answers for itself, its type argument does not; a return type
+    /// that is a type parameter of the declaring class says nothing; an
+    /// initializer's type arguments end nothing; a constant's declared type
+    /// wins; an uppercase constant is a value; an abstract getter's type and a
+    /// member-level initializer type a field, a method body's local of its
+    /// name does not; no call runs a setter; an enum value is its enum; a
+    /// `toString()` is a String; `(o as T)` is a T; a method named without a
+    /// call is no value; a `catch` variable says no type; a bare call in a
+    /// class is a member of it first; a closure's untyped parameter hides a
+    /// field of its name. And the reading of a reference placed where its
+    /// chain starts: a receiver-less call of the name inside the chain's
+    /// arguments is that call's own; an arrow this grammar ended in front of
+    /// a call (`() => a ?? b.load()`, recorded by the bare name where the
+    /// arrow's tail starts) is a chain link written after `b.`, which links
+    /// nothing rather than a namesake.
+    #[test]
+    fn keep_rust_dart_chain_typing_reads_the_evidence_upstream_reads() {
+        let project = Project::new()
+            .file("pubspec.yaml", "name: app\n")
+            .file("lib/types.dart", "class Item {\n  void save() {}\n  Item touch() => this;\n}\n\nclass Other {\n  void save() {}\n}\n\nclass Repo {\n  Item load() => Item();\n  static Repo create() => Repo();\n}\n\nclass Konst {\n  const Konst();\n  const Konst.named();\n  factory Konst.build() => const Konst();\n  Item make() => Item();\n}\n\nclass Res {\n  Res();\n  Item get error => Item();\n  Other other() => Other();\n\n  factory Res.error() => Res();\n}\n\nclass Family {\n  Item call() => Item();\n}\n\nclass Builder {\n  Family get family => Family();\n}\n\nclass Store {\n  read<T>() => null;\n}\n\nclass Holder<Item> {\n  Item get held => throw 0;\n}\n\nclass Pair<A, B> {\n  static Pair<A, B> of<A, B>() => throw 0;\n  Item first() => Item();\n}\n\nabstract class Src {\n  Item get item;\n}\n\nclass Late {\n  void m() {\n    final cache = Other();\n  }\n\n  final cache = Cache();\n}\n\nclass Cache {\n  Item get() => Item();\n}\n\nclass Slot {\n  set value(int v) {}\n}\n\nclass Box {\n  Slot wrap() => Slot();\n}\n\nclass A {\n  B next() => B();\n}\n\nclass B {\n  void m() {}\n}\n\nclass Field {\n  final A a = A();\n\n  void viaClosure() {\n    [1].forEach((a) => a.next().m());\n  }\n\n  Item make() => Item();\n\n  void viaMember() {\n    make().touch();\n  }\n}\n\nenum Mode { dark }\n\nextension ModeX on Mode {\n  Item label() => Item();\n}\n\nextension StringX on String {\n  Item asItem() => Item();\n}\n\nRepo make() => Repo();\n\nObject makeAny() => Object();\n\nfinal Repo declared = makeAny();\n\nfinal pair = Pair.of<int, String>();\n\nfinal Cfg = Repo();\n\nItem wrapIt(Object o) => Item();\n\nvoid touch() {}\n")
+            .file(
+                "lib/lib.dart",
+                "import 'types.dart';\nimport 'other.dart';\n\npart 'part.dart';\n\nItem mk2() => Item();\n",
+            )
+            .file("lib/other.dart", "import 'types.dart';\n\nOther mk2() => Other();\n")
+            .file("lib/part.dart", "part of 'lib.dart';\n\nvoid inPart() {\n  mk2().save();\n}\n")
+            .file("lib/use.dart", "import 'types.dart';\nimport 'types.dart' as t;\n\nvoid prefixedChain() {\n  t.Repo.create().load().save();\n}\n\nvoid prefixedFactory() {\n  t.Konst.build();\n}\n\nvoid namedConst() {\n  const Konst.named().make().save();\n  Konst.named().make().save();\n  Konst.build().make().save();\n}\n\nvoid staticAgainstInstance() {\n  Res.error().other().save();\n}\n\nvoid calledValues(Family fam, Builder b) {\n  fam().save();\n  b.family().save();\n}\n\nvoid declaredLookup(Store store) {\n  store.read<Repo>().load();\n}\n\nvoid ownersParameter(Holder holder) {\n  holder.held.save();\n}\n\nvoid typeArgumentsInInitializer() {\n  pair.first().save();\n}\n\nvoid declaredConstant() {\n  declared.load().save();\n}\n\nvoid uppercaseConstant() {\n  Cfg.load().save();\n}\n\nvoid abstractGetter(Src s) {\n  s.item.save();\n}\n\nvoid memberLevelField(Late late) {\n  late.cache.get().save();\n}\n\nvoid noSetterCall(Box box) {\n  box.wrap().value(1);\n}\n\nvoid enumValue() {\n  Mode.dark.label().save();\n}\n\nvoid toStringIsAString() {\n  make().toString().asItem().save();\n}\n\nvoid cast(Object o) {\n  (o as Item?)!.touch();\n}\n\nvoid tearOff(Item item) {\n  item.touch.save();\n}\n\nvoid caught(Repo r) {\n  try {} catch (r) {\n    r.load().save();\n  }\n}\n\nvoid innerFirst() {\n  wrapIt(touch()).touch();\n}\n\nvoid misparsedArrow(Repo? a, Repo b) {\n  final f = () => a ?? b.load();\n}\n")
+            .index();
+        let graph = project.graph();
+        let report = graph.report();
+        let from = |file: &str, caller: &str| -> Vec<String> {
+            calls_from(graph, file)
+                .into_iter()
+                .filter(|edge| edge.starts_with(&format!("{caller} -> ")))
+                .collect()
+        };
+        let use_from = |caller: &str| from("lib/use.dart", caller);
+        assert_eq!(
+            use_from("prefixedChain"),
+            [
+                "prefixedChain -> Item::save",
+                "prefixedChain -> Repo::create",
+                "prefixedChain -> Repo::load"
+            ],
+            "{report}"
+        );
+        assert_eq!(
+            use_from("namedConst"),
+            [
+                "namedConst -> Item::save",
+                "namedConst -> Item::save",
+                "namedConst -> Item::save",
+                "namedConst -> Konst::build",
+                "namedConst -> Konst::make",
+                "namedConst -> Konst::make",
+                "namedConst -> Konst::make"
+            ],
+            "{report}"
+        );
+        assert_eq!(
+            use_from("staticAgainstInstance"),
+            [
+                "staticAgainstInstance -> Other::save",
+                "staticAgainstInstance -> Res::error",
+                "staticAgainstInstance -> Res::other"
+            ],
+            "{report}"
+        );
+        assert_eq!(
+            use_from("calledValues"),
+            [
+                "calledValues -> Builder::family",
+                "calledValues -> Item::save",
+                "calledValues -> Item::save"
+            ],
+            "{report}"
+        );
+        assert_eq!(
+            use_from("declaredLookup"),
+            ["declaredLookup -> Store::read"],
+            "{report}"
+        );
+        assert_eq!(
+            use_from("ownersParameter"),
+            ["ownersParameter -> Holder::held"],
+            "{report}"
+        );
+        assert_eq!(
+            use_from("typeArgumentsInInitializer"),
+            [
+                "typeArgumentsInInitializer -> Item::save",
+                "typeArgumentsInInitializer -> Pair::first"
+            ],
+            "{report}"
+        );
+        // The call through the constant itself is the plain path's, which
+        // reads no other file's constant; the link after it is typed by it.
+        assert_eq!(
+            use_from("declaredConstant"),
+            ["declaredConstant -> Item::save"],
+            "{report}"
+        );
+        // The call through the constant itself is the plain path's, which
+        // reads no other file's constant; the link after it is typed by it.
+        assert_eq!(
+            use_from("uppercaseConstant"),
+            ["uppercaseConstant -> Item::save"],
+            "{report}"
+        );
+        assert_eq!(
+            use_from("abstractGetter"),
+            ["abstractGetter -> Item::save"],
+            "{report}"
+        );
+        assert_eq!(
+            use_from("memberLevelField"),
+            [
+                "memberLevelField -> Cache::get",
+                "memberLevelField -> Item::save"
+            ],
+            "{report}"
+        );
+        assert_eq!(
+            use_from("noSetterCall"),
+            ["noSetterCall -> Box::wrap"],
+            "{report}"
+        );
+        assert_eq!(
+            use_from("enumValue"),
+            ["enumValue -> Item::save", "enumValue -> ModeX::label"],
+            "{report}"
+        );
+        assert_eq!(
+            use_from("toStringIsAString"),
+            [
+                "toStringIsAString -> Item::save",
+                "toStringIsAString -> StringX::asItem",
+                "toStringIsAString -> make"
+            ],
+            "{report}"
+        );
+        // A named factory reached through a prefixed type is its static
+        // member, by the `Konst.build(` its head writes.
+        assert_eq!(
+            use_from("prefixedFactory"),
+            ["prefixedFactory -> Konst::build"],
+            "{report}"
+        );
+        // A part's library holds the function its call names.
+        assert_eq!(
+            from("lib/part.dart", "inPart"),
+            ["inPart -> Item::save", "inPart -> mk2"],
+            "{report}"
+        );
+        assert_eq!(use_from("cast"), ["cast -> Item::touch"], "{report}");
+        assert_eq!(use_from("tearOff"), Vec::<String>::new(), "{report}");
+        // `r.load()` is the plain path's (it reads the parameter); the link
+        // after it reads the `catch` variable, which says no type.
+        assert_eq!(use_from("caught"), ["caught -> Repo::load"], "{report}");
+        assert_eq!(
+            use_from("innerFirst"),
+            [
+                "innerFirst -> Item::touch",
+                "innerFirst -> touch",
+                "innerFirst -> wrapIt"
+            ],
+            "{report}"
+        );
+        assert_eq!(use_from("misparsedArrow"), Vec::<String>::new(), "{report}");
+        assert_eq!(
+            from("lib/types.dart", "viaClosure"),
+            ["viaClosure -> A::next"],
+            "{report}"
+        );
+        assert_eq!(
+            from("lib/types.dart", "viaMember"),
+            ["viaMember -> Field::make", "viaMember -> Item::touch"],
+            "{report}"
+        );
+    }
+
+    /// KEEP-RUST: a later link is read back after the place the extractor
+    /// put it, in the encoding the extractor wrote. A link after a receiver
+    /// no chain reads (`fs[0]().m()`) links nothing, not a namesake of the
+    /// type around it; a bare link and a link past a segment at one place
+    /// (`x.s.save().save()`) are each their own; an uppercase constant heads
+    /// a chain as the value it holds, not as a type.
+    #[test]
+    fn keep_rust_dart_chain_links_are_read_back_as_the_extractor_recorded_them() {
+        let project = Project::new()
+            .file("pubspec.yaml", "name: app\n")
+            .file(
+                "lib/types.dart",
+                "class Item {\n  void save() {}\n}\n\nclass Other {\n  Item save() => Item();\n}\n\nclass Holder {\n  Other get s => Other();\n}\n\nclass Repo {\n  Item load() => Item();\n}\n\nfinal Instance = Repo();\n",
+            )
+            .file(
+                "lib/use.dart",
+                "import 'types.dart';\n\nclass Box {\n  void m() {}\n\n  void unreadable(List<Function> fs) {\n    fs[0]().m();\n  }\n}\n\nvoid encodings(Holder x) {\n  x.s.save().save();\n}\n\nvoid uppercase() {\n  Instance.load().save();\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        let report = graph.report();
+        let calls = calls_from(graph, "lib/use.dart");
+        assert!(
+            !calls.contains(&"unreadable -> Box::m".to_string()),
+            "{report}"
+        );
+        assert!(
+            calls.contains(&"encodings -> Other::save".to_string())
+                && calls.contains(&"encodings -> Item::save".to_string()),
+            "{report}"
+        );
+        assert!(
+            calls.contains(&"uppercase -> Item::save".to_string()),
+            "{report}"
+        );
+    }
+
+    /// KEEP-RUST: the extractor keeps a member chain's last segment
+    /// (`x.a.m()` is `a.m`, #1496), records a call through `?.` as it
+    /// records one through `.` (`y?.m()` is `y.m`, `make()?.load()` is
+    /// `load`), and places every reference of a chain where the chain starts:
+    /// the link is the call written after that position as the reference
+    /// records it, on its line or below it, so a receiver-less call of the
+    /// name before it (`touch(); r.load().touch();`) is not it. One chain's
+    /// links of a name carry one reference, which links only what all of them
+    /// reach (`b.add().add()` does; `p.flip().flip().flip()`, a Q's then a
+    /// P's, links nothing). A field's initializer types it (`this._cache`),
+    /// a static method's and a top-level constant's declared types type the
+    /// links after them, and an extension on a type parameter of its own
+    /// applies to a project type. The extractor now reads a method's return
+    /// type and `static` through the signature this grammar wraps them in.
+    #[test]
+    fn keep_rust_dart_chain_links_recorded_past_a_member_or_through_null_aware_calls() {
+        let project = Project::new()
+            .file("pubspec.yaml", "name: app\n")
+            .file("lib/types.dart", "class Item {\n  void save() {}\n  Item touch() => this;\n}\n\nclass Repo {\n  Item load() => Item();\n  static Repo create() => Repo();\n}\n\nclass A {\n  void m() {}\n  B next() => B();\n}\n\nclass B {\n  void m() {}\n  A next() => A();\n}\n\nclass P {\n  Q flip() => Q();\n}\n\nclass Q {\n  P flip() => P();\n}\n\nclass Builder {\n  Builder add() => this;\n}\n\nclass Cache {\n  Item get() => Item();\n}\n\nclass X {\n  final A a;\n  final _cache = Cache();\n  X(this.a);\n\n  void viaThis() {\n    this.a.m();\n    this._cache.get().save();\n  }\n}\n\nclass Y {\n  void m() {}\n  X go(Object o) => X(A());\n}\n\nclass W {\n  final B a;\n  W(this.a);\n}\n\nclass Base {\n  void dispose() {}\n}\n\nclass Child extends Base {\n  @override\n  void dispose() {\n    super.dispose();\n  }\n}\n\nextension ObjectX<T> on T {\n  T also() => this;\n}\n\nfinal repo = Repo();\n\nRepo make() => Repo();\n\nvoid go() {}\n\nvoid touch() {}\n\nclass Konst {\n  const Konst();\n}\n")
+            .file(
+                "lib/prefixed.dart",
+                "import 'types.dart' as t;\n\nvoid prefixed() {\n  final k = const t.Konst();\n  final n = new t.Konst();\n}\n",
+            )
+            .file("lib/use.dart", "import 'types.dart';\n\nvoid viaMember(X x, X? n) {\n  x.a.m();\n  x.a?.m();\n  n?.a.m();\n}\n\nvoid twoChains(Y y, W w) {\n  y.go(1).a.m();\n  w.a.m();\n}\n\nvoid nullAware(Y? y, Object? u) {\n  y?.m();\n  make()?.load().save();\n  u?.unknown();\n}\n\nvoid multiLine(Repo r) {\n  r\n      .load()\n      .save();\n}\n\nvoid nested(Y y) {\n  y.go(go()).a.m();\n}\n\nvoid sameLine(Repo r) {\n  touch(); r.load().touch();\n}\n\nvoid repeated(A a, P p, Builder b) {\n  a.next().next().m();\n  p.flip().flip().flip();\n  b.add().add().add();\n}\n\nvoid statics() {\n  Repo.create().load().save();\n}\n\nvoid topLevel() {\n  repo.load().touch().save();\n}\n\nvoid universal(Item item) {\n  item.touch().also().save();\n}\n\nvoid selfNamed() {\n  final self = Item();\n  self.touch().save();\n}\n")
+            .index();
+        let graph = project.graph();
+        let report = graph.report();
+        let from = |caller: &str| -> Vec<String> {
+            calls_from(graph, "lib/use.dart")
+                .into_iter()
+                .filter(|edge| edge.starts_with(&format!("{caller} -> ")))
+                .collect()
+        };
+        assert_eq!(
+            from("viaMember"),
+            [
+                "viaMember -> A::m",
+                "viaMember -> A::m",
+                "viaMember -> A::m"
+            ],
+            "{report}"
+        );
+        // Each chain's link is its own: `w.a.m()` below is another chain's,
+        // through a W's B.
+        assert_eq!(
+            from("twoChains"),
+            [
+                "twoChains -> A::m",
+                "twoChains -> B::m",
+                "twoChains -> Y::go"
+            ],
+            "{report}"
+        );
+        assert_eq!(
+            from("nullAware"),
+            [
+                "nullAware -> Item::save",
+                "nullAware -> Repo::load",
+                "nullAware -> Y::m",
+                "nullAware -> make"
+            ],
+            "{report}"
+        );
+        assert!(
+            graph
+                .unresolved
+                .iter()
+                .any(|r| r.reference_name == "u.unknown"),
+            "{report}"
+        );
+        assert_eq!(
+            from("multiLine"),
+            ["multiLine -> Item::save", "multiLine -> Repo::load"],
+            "{report}"
+        );
+        assert_eq!(
+            from("nested"),
+            ["nested -> A::m", "nested -> Y::go", "nested -> go"],
+            "{report}"
+        );
+        assert_eq!(
+            from("sameLine"),
+            [
+                "sameLine -> Item::touch",
+                "sameLine -> Repo::load",
+                "sameLine -> touch"
+            ],
+            "{report}"
+        );
+        assert_eq!(
+            from("repeated"),
+            [
+                "repeated -> A::m",
+                "repeated -> A::next",
+                "repeated -> B::next",
+                // `b.add` and both links: one site, one edge.
+                "repeated -> Builder::add",
+                "repeated -> P::flip",
+            ],
+            "{report}"
+        );
+        assert_eq!(
+            from("statics"),
+            [
+                "statics -> Item::save",
+                "statics -> Repo::create",
+                "statics -> Repo::load"
+            ],
+            "{report}"
+        );
+        assert_eq!(
+            from("topLevel"),
+            [
+                "topLevel -> Item::save",
+                "topLevel -> Item::touch",
+                "topLevel -> Repo::load"
+            ],
+            "{report}"
+        );
+        // `also` returns its extension's own `T`: what it is called on says
+        // nothing more, so `save` links nothing.
+        assert_eq!(
+            from("universal"),
+            ["universal -> Item::touch", "universal -> ObjectX::also"],
+            "{report}"
+        );
+        // A Dart `self` is a variable like any other, not the object as in
+        // Python or Rust: `self.touch()` is a call through it, and the link
+        // after it is typed by its declaration.
+        assert_eq!(
+            from("selfNamed"),
+            ["selfNamed -> Item::save", "selfNamed -> Item::touch"],
+            "{report}"
+        );
+        assert_eq!(
+            calls_from(graph, "lib/types.dart"),
+            [
+                "dispose -> Base::dispose",
+                "viaThis -> A::m",
+                "viaThis -> Cache::get",
+                "viaThis -> Item::save",
+            ],
+            "{report}"
+        );
+        // A constructor called through an import prefix is no chain link: it
+        // instantiates what that import exports.
+        let mut built: Vec<(Option<i64>, String)> = graph
+            .edges
+            .iter()
+            .filter(|e| e.kind == "instantiates")
+            .filter(|e| {
+                graph
+                    .node(&e.source)
+                    .is_some_and(|n| n.qualified_name == "prefixed")
+            })
+            .filter_map(|e| Some((e.line, graph.node(&e.target)?.qualified_name.clone())))
+            .collect();
+        built.sort();
+        assert_eq!(
+            built,
+            [
+                (Some(4), "Konst".to_string()),
+                (Some(5), "Konst".to_string())
+            ],
+            "{report}"
+        );
+        let create = graph
+            .nodes
+            .iter()
+            .find(|n| n.qualified_name == "Repo::create")
+            .expect("Repo::create");
+        assert!(create.is_static, "{report}");
+        assert_eq!(create.return_type.as_deref(), Some("Repo"), "{report}");
+        let touch = graph
+            .nodes
+            .iter()
+            .find(|n| n.qualified_name == "Item::touch")
+            .expect("Item::touch");
+        assert!(!touch.is_static, "{report}");
+        assert_eq!(touch.return_type.as_deref(), Some("Item"), "{report}");
     }
 }

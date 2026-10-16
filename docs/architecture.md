@@ -470,9 +470,10 @@ however many there are, since a bare call's class hierarchy and an extension's o
 the heads' text; a non-extension type whose head moved, came or went has the unchanged Dart files
 that reference it or a type below it (an edge to such a type before the change or after it, or a
 reference left unresolved, by its name or through it as a receiver), and the files declaring a
-type below one such a file declares, re-resolve whole, since a member read or a call on a receiver
-typed by it reaches members through its lineage and the receiver is typed by what its file writes
-or by a field of a class it extends; a getter, an extension's member or a type's constant that a
+type below one such a file declares, retry at their sites the references written with a receiver
+to a member of a type whose distance from it changed or of an extension `on` one, parked or
+resolved, since a member read or a call on a receiver typed by it reaches members through its
+lineage and the receiver is typed by what its file writes or by a field of a class it extends; a getter, an extension's member or a type's constant that a
 changed file newly declares (no declaration of the file had its qualified name, kind and signature
 before) on a type that existed before, or on an extension, retries at its site every parked Dart
 reference written with a receiver to its name, however many there are, since a member read, a
@@ -498,6 +499,24 @@ the others, and a sync that finds it missing, or a row it cannot read, withdraws
 changing anything and re-resolves every Dart file; the `pubspec.yaml` and `pubspec_overrides.yaml`
 files a Dart file's package and `path:` dependencies are read from are no source files (a change to
 one itself is not yet detected);
+a changed Dart file moves the later links of the call chains in unchanged Dart files through the
+names its declarations changed (a member or top-level declaration, as the member surface rows keep
+it, came, went or reads otherwise; a member of an extension whose head changed, came or went; a
+name a library's visibility moved; and what a constant or field whose untyped initializer names
+one declares, until none is added) and through a class whose head changed, came or went, which
+moves every lookup on it and on the types below it: what every declaration whose type names such
+a class declares joins it (a member typed by one, a subtype, whose head names it, an untyped
+initializer naming one, never a constructor, until none is added), and a chain reading one of
+those names moves only when it also reads a name the class's ancestry declares, before the change
+or after it, or an extension on a type of it (every extension's, for a class that came or went),
+since a chain's typing reads other files only through names its file writes or a declaration it
+read on the way names; in each unchanged Dart file writing such names, the parked chain links and
+the call edges of the chain links whose typing reads them are retried at their sites, read as the
+typing reads them: the chain's head, links and type arguments, not a call's arguments, the type it
+is written in, and for a local or a parameter the declaration the typing's own lookup finds (its
+declared type, or what its initializer reads in turn), its name read only as a type's; every chain
+link is retried when a `call` method is among the names; the lane rides on the member surface rows,
+so a sync that rebuilds them re-resolves every Dart file;
 a changed R file touches each name of a base function it binds as a variable or constant, before
 the change and after it, since whether such a binding is what a call of its name means is read
 from its line, which no node records (`c <- list(f = function(x) x)`, upstream #2239); the

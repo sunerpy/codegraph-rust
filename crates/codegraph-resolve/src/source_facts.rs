@@ -169,6 +169,7 @@ pub struct SourceFacts {
     scala_package_object_package: OnceLock<Option<String>>,
     local_declaration_scopes: Mutex<HashMap<String, Option<(i64, i64)>>>,
     csharp_namespace_scope: OnceLock<Arc<crate::csharp_types::CsharpNamespaceScope>>,
+    dart_code: OnceLock<Arc<crate::dart_chains::DartCode>>,
 }
 
 impl SourceFacts {
@@ -220,12 +221,22 @@ impl SourceFacts {
             scala_package_object_package: OnceLock::new(),
             local_declaration_scopes: Mutex::new(HashMap::new()),
             csharp_namespace_scope: OnceLock::new(),
+            dart_code: OnceLock::new(),
         }
     }
 
     /// The raw source text.
     pub fn source(&self) -> &str {
         &self.source
+    }
+
+    /// The file's Dart code with comments and string contents blanked, read
+    /// once (W4-DART-03, upstream #2376 `dartCodeOf`).
+    pub(crate) fn dart_code(&self) -> Arc<crate::dart_chains::DartCode> {
+        Arc::clone(
+            self.dart_code
+                .get_or_init(|| Arc::new(crate::dart_chains::DartCode::of(&self.source))),
+        )
     }
 
     /// Whether a Rust `use` item visible at byte `offset` names `name` or is a

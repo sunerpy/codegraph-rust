@@ -54,15 +54,12 @@ void run() {}
     assert!(result.errors.is_empty(), "{:?}", result.errors);
 
     // tree-sitter-dart wraps the return in `function_signature > type >
-    // type_identifier`, but DartSpec::get_return_type / get_signature look for
-    // a DIRECT `type_identifier` child of the signature, so the return type is
-    // not surfaced (ret == None) and the signature carries only the params.
+    // type_identifier`: DartSpec::get_return_type reads it from the
+    // signature's `return_type` field (W4-DART-03), the name without its type
+    // arguments; get_signature still looks for a DIRECT `type_identifier`
+    // child, so the signature carries only the params.
     let compute = assert_node(&result.nodes, NodeKind::Function, "compute");
-    assert!(
-        compute.return_type.is_none(),
-        "wrapped `type` node hides the return type; got {:?}",
-        compute.return_type
-    );
+    assert_eq!(compute.return_type.as_deref(), Some("int"));
     assert!(
         compute
             .signature
@@ -82,7 +79,7 @@ void run() {}
     );
 
     let collect = assert_node(&result.nodes, NodeKind::Function, "collect");
-    assert!(collect.return_type.is_none());
+    assert_eq!(collect.return_type.as_deref(), Some("List"));
 
     let run = assert_node(&result.nodes, NodeKind::Function, "run");
     assert!(
@@ -95,8 +92,9 @@ void run() {}
 
 // ---------------------------------------------------------------------------
 // Dart — class-body methods (method_declaration): params in signature,
-// getter/setter accessors, body-call extraction, and the honest false results
-// of is_static / is_async / get_return_type under tree-sitter-dart.
+// getter/setter accessors, body-call extraction, the static flag and return
+// type read through the signature it holds, and the honest false is_async under
+// tree-sitter-dart.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -134,12 +132,13 @@ class Service {
         add.signature
     );
 
-    // Class-body methods parse as `method_declaration`, but DartSpec::is_static
-    // only detects the `static` token on a `method_signature`, and DartSpec::
-    // is_async only inspects a next-sibling `function_body`, which does not
-    // exist for a method_declaration; so both flags stay false for real Dart.
+    // Class-body methods parse as `method_declaration`: DartSpec::is_static
+    // reads the `static` token from the `method_signature` it holds
+    // (W4-DART-03), but DartSpec::is_async only inspects a next-sibling
+    // `function_body`, which does not exist for a method_declaration, so that
+    // flag stays false for real Dart.
     let tag = assert_node(&result.nodes, NodeKind::Method, "tag");
-    assert!(!tag.is_static);
+    assert!(tag.is_static);
     let load = assert_node(&result.nodes, NodeKind::Method, "load");
     assert!(!load.is_async);
 
@@ -151,7 +150,7 @@ class Service {
     );
 
     let make = assert_node(&result.nodes, NodeKind::Method, "make");
-    assert!(make.return_type.is_none());
+    assert_eq!(make.return_type.as_deref(), Some("Widget"));
     assert!(
         result
             .unresolved_references

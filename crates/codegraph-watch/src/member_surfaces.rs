@@ -43,7 +43,7 @@ use codegraph_store::Store;
 /// unrefreshed.
 pub const VERSION_KEY: &str = "member_surface_version";
 /// Value of [`VERSION_KEY`].
-pub const VERSION: &str = "3";
+pub const VERSION: &str = "4";
 
 /// `source`'s member surface row, `None` when it records nothing: a file in
 /// no member-typed language, one without a class, or one that is not text.
@@ -137,6 +137,19 @@ impl MemberChanges {
             });
         change.new_row = new_row;
         Ok(())
+    }
+
+    /// Each changed file's rows, before and after (W4-DART-03b).
+    pub(crate) fn rows(
+        &self,
+    ) -> impl Iterator<Item = (&str, Option<&MemberSurface>, Option<&MemberSurface>)> {
+        self.changes.iter().map(|(path, change)| {
+            (
+                path.as_str(),
+                change.old_row.as_ref(),
+                change.new_row.as_ref(),
+            )
+        })
     }
 }
 
@@ -505,6 +518,7 @@ mod tests {
             digest: digest.to_string(),
             head: String::new(),
             lines: Vec::new(),
+            statements: Vec::new(),
         }
     }
 
@@ -523,8 +537,14 @@ mod tests {
         changes.changes.insert(
             "src/A.cs".to_string(),
             Change {
-                old_row: Some(MemberSurface { classes: old }),
-                new_row: Some(MemberSurface { classes: new }),
+                old_row: Some(MemberSurface {
+                    classes: old,
+                    ..MemberSurface::default()
+                }),
+                new_row: Some(MemberSurface {
+                    classes: new,
+                    ..MemberSurface::default()
+                }),
             },
         );
         changes
@@ -544,6 +564,7 @@ mod tests {
                 class("Deeper", &["TraceWriter"], "dddd"),
                 class("Other", &["Root"], "eeee"),
             ],
+            ..MemberSurface::default()
         };
         assert_eq!(
             closure([&row], seeds),
@@ -619,6 +640,7 @@ mod tests {
                 dart_class("Root", &[], "r", &["final int size = 0;"]),
                 dart_class("Other", &[], "o", &["String label = '';"]),
             ],
+            ..MemberSurface::default()
         }];
         for (changed, wanted) in [
             (
@@ -668,6 +690,7 @@ mod tests {
     fn rows_round_trip() {
         let row = MemberSurface {
             classes: vec![class("Base", &["Root", "IFoo"], "0123456789abcdef")],
+            top: vec!["final repo = makeRepo();".to_string()],
         };
         assert_eq!(MemberSurface::decode(&row.encode()), Some(row));
         assert_eq!(MemberSurface::decode("not json"), None);

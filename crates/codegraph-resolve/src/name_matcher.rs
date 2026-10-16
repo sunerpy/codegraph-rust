@@ -4221,11 +4221,25 @@ pub(crate) fn enclosing_scope_start_line(
     reference: &RefView,
     context: &dyn ResolutionContext,
 ) -> i64 {
+    scope_start_line_in(
+        context
+            .get_nodes_in_file_shared(&reference.file_path)
+            .iter()
+            .map(AsRef::as_ref),
+        reference.language,
+        reference.line,
+    )
+}
+
+/// [`enclosing_scope_start_line`] of 1-based `line` among a file's `nodes`.
+pub(crate) fn scope_start_line_in<'n>(
+    nodes: impl IntoIterator<Item = &'n Node>,
+    language: Language,
+    line: i64,
+) -> i64 {
     let mut start = 1i64;
-    for n in context.get_nodes_in_file_shared(&reference.file_path) {
-        if !matches!(n.kind, NodeKind::Function | NodeKind::Method)
-            || n.language != reference.language
-        {
+    for n in nodes {
+        if !matches!(n.kind, NodeKind::Function | NodeKind::Method) || n.language != language {
             continue;
         }
         let end = if n.end_line != 0 {
@@ -4233,7 +4247,7 @@ pub(crate) fn enclosing_scope_start_line(
         } else {
             n.start_line
         };
-        if n.start_line <= reference.line && end >= reference.line && n.start_line >= start {
+        if n.start_line <= line && end >= line && n.start_line >= start {
             start = n.start_line;
         }
     }
@@ -4279,13 +4293,13 @@ pub(crate) fn infer_local_receiver_declaration(
         None => (receiver_name, false),
     };
     let escaped = regex_escape(scan_receiver);
-    // A CFML, Objective-C or PHP scan compiles its patterns only once a line
-    // could match one ([`line_may_declare`]): compiled for every member call,
-    // CFML's eight made re-resolving a file of a few hundred calls take
+    // A CFML, Objective-C, PHP or Dart scan compiles its patterns only once a
+    // line could match one ([`line_may_declare`]): compiled for every member
+    // call, CFML's eight made re-resolving a file of a few hundred calls take
     // seconds, and a PHP pair costs a millisecond and a megabyte.
     let lazy = matches!(
         reference.language,
-        Language::Cfml | Language::ObjC | Language::Php
+        Language::Cfml | Language::ObjC | Language::Php | Language::Dart
     );
     let compiled: OnceCell<Arc<Vec<(Regex, PatternCheck)>>> = OnceCell::new();
     let patterns = || {
@@ -4364,8 +4378,21 @@ fn line_may_declare(language: Language, line: &str, receiver: &str) -> bool {
         Language::Php => {
             writes_assignment_of(line, receiver, "new") || writes_typed_variable(line, receiver)
         }
+        // `x = Foo(` and `Foo x;` both write the receiver followed, past
+        // whitespace, by `=`, `;`, `,` or `)`.
+        Language::Dart => writes_before_terminator(line, receiver),
         _ => true,
     }
+}
+
+/// Whether `line` writes `name` followed, past whitespace, by `=`, `;`, `,`
+/// or `)`: what `{name}\b\s*[=;,)]` needs (never false where that matches).
+fn writes_before_terminator(line: &str, name: &str) -> bool {
+    occurrences(line, name).any(|at| {
+        line[at + name.len()..]
+            .trim_start()
+            .starts_with(['=', ';', ',', ')'])
+    })
 }
 
 /// The byte offsets where `needle` starts in `text`, overlapping ones
@@ -4426,22 +4453,7 @@ fn cfml_line_may_declare(line: &str, receiver: &str) -> bool {
             return true;
         }
     }
-    let Some(first) = receiver.chars().next() else {
-        return true;
-    };
-    let mut from = 0;
-    while let Some(at) = line[from..].find(receiver) {
-        let start = from + at;
-        if line[start + receiver.len()..]
-            .trim_start()
-            .starts_with(['=', ';', ',', ')'])
-        {
-            return true;
-        }
-        // Occurrences may overlap (`aa` in `aaa`).
-        from = start + first.len_utf8();
-    }
-    false
+    receiver.is_empty() || writes_before_terminator(line, receiver)
 }
 
 /// The CFML scope a receiver is written through.
@@ -13519,6 +13531,41 @@ mod tests {
             "repo"
         ));
         assert!(writes_assignment_of("    aaa = new X();", "aa", "new"));
+    }
+
+    #[test]
+    fn dart_line_prefilter_admits_every_line_a_pattern_matches() {
+        let lines = [
+            "    final repo = Repo();",
+            "    var repo=Repo.named();",
+            "    Repo repo;",
+            "    Repo repo = makeRepo();",
+            "  void go(Repo repo, int n) {",
+            "  void go(Repo repo) {",
+            "    repo\u{a0}= Repo();",
+            "    repo.save();",
+            "    if (repo == Repo()) {}",
+            "    final repos = Repo();",
+            "    expect(repo, isNotNull);",
+        ];
+        let patterns = local_receiver_type_patterns_tagged(Language::Dart, "repo");
+        assert_eq!(patterns.len(), 2);
+        let mut matched = 0;
+        for line in lines {
+            if patterns.iter().any(|(re, _)| re.is_match(line)) {
+                matched += 1;
+                assert!(line_may_declare(Language::Dart, line, "repo"), "{line}");
+            }
+        }
+        assert_eq!(matched, 7);
+        // A plain member call declares nothing, so no pattern is compiled
+        // for it.
+        assert!(!line_may_declare(
+            Language::Dart,
+            "    repo.save();",
+            "repo"
+        ));
+        assert!(writes_before_terminator("    aaa = X();", "aa"));
     }
 
     #[test]
