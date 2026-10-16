@@ -12,6 +12,18 @@
     "target": "function:9d698f98ac710022ccb314f81e102bce"
   },
   {
+    "col": 22,
+    "kind": "instantiates",
+    "line": 3,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "function:50a37489458bbc7176f70d6d71b158e3",
+    "target": "class:18d5cdc4c3c6e9e4170973689ae3ed4e"
+  },
+  {
     "col": 24,
     "kind": "calls",
     "line": 15,
@@ -34,18 +46,6 @@
     "provenance": null,
     "source": "method:b9e09b3b72138d018e6e7c4f6f7a7b73",
     "target": "class:3a57e87d807eb4d2915da3f5943b6ea0"
-  },
-  {
-    "col": 28,
-    "kind": "references",
-    "line": 3,
-    "metadata": {
-      "confidence": 0.9,
-      "resolvedBy": "exact-match"
-    },
-    "provenance": null,
-    "source": "function:50a37489458bbc7176f70d6d71b158e3",
-    "target": "class:18d5cdc4c3c6e9e4170973689ae3ed4e"
   },
   {
     "col": 49,

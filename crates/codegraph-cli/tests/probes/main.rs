@@ -14851,11 +14851,11 @@ mod dart_libraries {
     /// type written through an import prefix (`p.Report`) is what that import
     /// exports. A library's own declaration shadows an imported one, and a
     /// bare call never reaches another type's enum constant or static
-    /// constant. Upstream's fixture. Two of its cases need what W4-DART-03
-    /// ports and are checked there: a field's type (`final Box<int> box;`,
-    /// #2360) and a typed receiver's call into an unnamed extension in
-    /// another part (`s.area()`, #2376); the unnamed extension's reach
-    /// across its library is checked here through a bare call instead.
+    /// constant. Upstream's fixture. Its field-type case (`final Box<int>
+    /// box;`, #2360) came with W4-DART-03; its typed receiver's call into an
+    /// unnamed extension in another part (`s.area()`, #2376) is W4-DART-03's
+    /// chain typing, so the unnamed extension's reach across its library is
+    /// checked here through a bare call.
     #[test]
     fn pr2386_a_bare_dart_name_reaches_only_what_its_library_can_see() {
         let project = Project::new()
@@ -14941,6 +14941,15 @@ mod dart_libraries {
             .file(
                 "lib/colors.dart",
                 "import 'package:flutter/material.dart';\n\nextension on Color {\n  Color brighten() => this;\n}\n",
+            )
+            .file("lib/models/box.dart", "class Box<T> {\n  T? value;\n}\n")
+            .file(
+                "lib/widgets/box_ext.dart",
+                "import '../models/box.dart';\n\nextension<T> on Box<T> {\n  bool get isEmpty => value == null;\n}\n",
+            )
+            .file(
+                "lib/widgets/panel.dart",
+                "import '../models/box.dart';\nimport 'box_ext.dart';\n\nclass Panel {\n  final Box<int> box;\n  Panel(this.box);\n}\n",
             )
             .file(
                 "lib/shapes/shapes.dart",
@@ -15052,11 +15061,20 @@ mod dart_libraries {
             Vec::<String>::new(),
             "{report}"
         );
-        // An unnamed extension on Color is no Color.
+        // An unnamed extension on Color is no Color, nor a generic one on
+        // `Box<T>` a `Box` (a field's type, #2360).
         assert!(
             !edges_from(graph, "lib/colors.dart")
                 .iter()
                 .any(|e| e.contains("Color")),
+            "{report}"
+        );
+        assert_eq!(
+            edges_from(graph, "lib/widgets/panel.dart")
+                .into_iter()
+                .filter(|e| e.ends_with(":Box"))
+                .collect::<Vec<_>>(),
+            vec!["references 5 -> lib/models/box.dart:Box".to_string()],
             "{report}"
         );
         // An unnamed extension applies in every file of its library, and in
@@ -15432,6 +15450,601 @@ mod dart_libraries {
                 "test/framework_test.dart".to_string(),
             ],
             "{affected}\n{report}"
+        );
+    }
+}
+
+/// W4-DART-03: Dart getter reads, the types a declaration or body names, and
+/// initializers (upstream #2360, #2367).
+mod dart_reads {
+    use super::support::{Graph, NodeRow, Project};
+
+    /// The node with qualified name `qualified`, in `file` when one is given.
+    #[track_caller]
+    fn node<'g>(graph: &'g Graph, file: Option<&str>, qualified: &str) -> &'g NodeRow {
+        let found: Vec<&NodeRow> = graph
+            .nodes
+            .iter()
+            .filter(|n| n.qualified_name == qualified && file.is_none_or(|f| n.file_path == f))
+            .collect();
+        assert_eq!(found.len(), 1, "one node {qualified}\n{}", graph.report());
+        found[0]
+    }
+
+    /// `<edge kind> <source qualified name>` of each `calls`, `references` or
+    /// `instantiates` edge into the node `qualified`, sorted (upstream's
+    /// `callersOf`).
+    fn callers_of(graph: &Graph, qualified: &str) -> Vec<String> {
+        let target = node(graph, None, qualified).id.clone();
+        let mut out: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|e| {
+                e.target == target
+                    && matches!(e.kind.as_str(), "calls" | "references" | "instantiates")
+            })
+            .filter_map(|e| {
+                Some(format!(
+                    "{} {}",
+                    e.kind,
+                    graph.node(&e.source)?.qualified_name
+                ))
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// `<source kind> <source qualified name>` of each `kind` edge into the
+    /// node `qualified`, sorted and de-duplicated (upstream's `referrers` and
+    /// `sources`).
+    fn sources(graph: &Graph, file: Option<&str>, qualified: &str, kind: &str) -> Vec<String> {
+        let target = node(graph, file, qualified).id.clone();
+        let mut out: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|e| e.target == target && e.kind == kind)
+            .filter_map(|e| {
+                let source = graph.node(&e.source)?;
+                Some(format!("{} {}", source.kind, source.qualified_name))
+            })
+            .collect();
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// The qualified names of the targets of `from`'s `kind` edges, sorted
+    /// and de-duplicated (upstream's `targets`).
+    fn targets(graph: &Graph, file: &str, qualified: &str, kind: &str) -> Vec<String> {
+        let source = node(graph, Some(file), qualified).id.clone();
+        let mut out: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|e| e.source == source && e.kind == kind)
+            .filter_map(|e| Some(graph.node(&e.target)?.qualified_name.clone()))
+            .collect();
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// Upstream #2338 (`dart-getter-reads.test.ts`, its fixture): a getter
+    /// read runs the getter, so it links, as a call, the getter the
+    /// receiver's type reaches — declared on it, inherited, or added by an
+    /// extension, on an enum too — through a parameter, a local, a field or a
+    /// type named directly; a field read, an outside type's getter, an
+    /// untyped receiver and another library's unnamed extension link
+    /// nothing. A member an extension adds to an enum is reached by a call.
+    #[test]
+    fn pr2360_a_dart_getter_read_links_the_getter_its_receiver_reaches() {
+        let project = Project::new()
+            .file("pubspec.yaml", "name: repro\nenvironment:\n  sdk: \">=3.0.0 <4.0.0\"\n")
+            .file(
+                "lib/shape.dart",
+                "enum Shape { circle, square }\n\nextension ShapeInfo on Shape {\n  String get label => name.toUpperCase();\n  String shout() => name.toUpperCase();\n}\n\nclass Box {\n  const Box(this.size);\n  final int size;\n  int get area => size * size;\n  int grow() => size + 1;\n}\n\nextension BoxActions on Box {\n  int twice() => size * 2;\n}\n",
+            )
+            .file(
+                "lib/use.dart",
+                "import 'shape.dart';\n\nString a(Shape s) => s.label;   // getter, extension on enum\nString b(Shape s) => s.shout(); // method, extension on enum\nint c(Box x) => x.area;         // getter, plain class\nint d(Box x) => x.grow();       // method, plain class\nint e(Box x) => x.twice();      // method, extension on class\n",
+            )
+            .file(
+                "lib/render.dart",
+                "import 'shape.dart';\n\nclass Square extends Box {\n  const Square(int size) : super(size);\n  static Square get unit => const Square(1);\n}\n\nclass Renderer {\n  final Box box;\n  final Shape shape;\n  Renderer(this.box, this.shape);\n\n  int paint(Box other) {\n    final local = Box(2);\n    return other.area + local.area;\n  }\n\n  int viaField() {\n    return box.area;\n  }\n\n  String tag() {\n    final text = shape.label;\n    return text + shape.shout();\n  }\n}\n\nint inherited(Square s) {\n  return s.area;\n}\n\nSquare staticGetter() => Square.unit;\n",
+            )
+            .file(
+                "lib/other.dart",
+                "class Panel {\n  int get size => 0;\n  int get length => 0;\n  int get grow => 0;\n}\n\nextension on Box {\n  int get hidden => 0;\n}\n",
+            )
+            .file(
+                "lib/negatives.dart",
+                "import 'shape.dart';\n\nint fieldRead(Box x) => x.size;           // a field, not Panel's getter\nint outside(List<int> xs) => xs.length;   // a getter of a type outside the project\nint untyped(dynamic d) => d.area;         // nothing says what d is\nint unnamed(Box x) => x.hidden;           // an unnamed extension in another library\nint Function() tearOff(Box x) => x.grow;  // a method read as a value, not run\n",
+            )
+            .index();
+        let graph = project.graph();
+        let report = graph.report();
+
+        // Reads on a plain class, through a parameter, a local and a field,
+        // and an inherited getter.
+        assert_eq!(
+            callers_of(graph, "Box::area"),
+            [
+                "calls Renderer::paint",
+                "calls Renderer::paint",
+                "calls Renderer::viaField",
+                "calls c",
+                "calls inherited",
+            ],
+            "{report}"
+        );
+        // A getter an extension on an enum adds.
+        assert_eq!(
+            callers_of(graph, "ShapeInfo::label"),
+            ["calls Renderer::tag", "calls a"],
+            "{report}"
+        );
+        // A static getter read through its class.
+        assert_eq!(
+            callers_of(graph, "Square::unit"),
+            ["calls staticGetter"],
+            "{report}"
+        );
+        // A field, an outside type, an untyped receiver, an unnamed extension
+        // of another library: nothing.
+        let negatives: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|e| e.kind == "calls")
+            .filter(|e| {
+                graph
+                    .node(&e.source)
+                    .is_some_and(|n| n.file_path == "lib/negatives.dart")
+            })
+            .map(|e| graph.describe_edge(e))
+            .collect();
+        assert_eq!(negatives, Vec::<String>::new(), "{report}");
+        assert_eq!(
+            callers_of(graph, "Panel::size"),
+            Vec::<String>::new(),
+            "{report}"
+        );
+        assert_eq!(
+            callers_of(graph, "Panel::length"),
+            Vec::<String>::new(),
+            "{report}"
+        );
+        // A method an extension on an enum adds, and the class's own methods
+        // and extensions.
+        assert_eq!(
+            callers_of(graph, "ShapeInfo::shout"),
+            ["calls Renderer::tag", "calls b"],
+            "{report}"
+        );
+        assert_eq!(callers_of(graph, "Box::grow"), ["calls d"], "{report}");
+        assert_eq!(
+            callers_of(graph, "BoxActions::twice"),
+            ["calls e"],
+            "{report}"
+        );
+    }
+
+    /// Upstream #2327 (`dart-type-positions.test.ts`, its fixture): the type an
+    /// extension is `on`, a field's type (an enum's too), a top-level
+    /// variable's (the file's), a constant's initializer and every type a
+    /// body names (locals, generic arguments, casts, type tests, catch
+    /// clauses) are references; a constructor call instantiates without one,
+    /// and an import prefix names nothing. As amended by #2367: a `static
+    /// const` field's initializer constructs from its constant.
+    #[test]
+    fn pr2360_the_types_a_dart_declaration_or_body_names_are_referenced() {
+        let project = Project::new()
+            .file("pubspec.yaml", "name: repro\nenvironment:\n  sdk: \">=3.0.0 <4.0.0\"\n")
+            .file("lib/report.dart", "class Report {\n  final int score;\n  const Report(this.score);\n}\n")
+            .file("lib/a_parameter.dart", "import 'report.dart';\n\nint score(Report r) => r.score;\n")
+            .file("lib/b_return_generic.dart", "import 'report.dart';\n\nFuture<Report?> load() async => null;\n")
+            .file("lib/c_extension_on.dart", "import 'report.dart';\n\nextension ReportX on Report {\n  bool get high => score > 5;\n}\n")
+            .file("lib/d_field_type.dart", "import 'report.dart';\n\nclass Holder {\n  final Report report;\n  const Holder(this.report);\n}\n")
+            .file("lib/e_toplevel_initializer_generic.dart", "import 'report.dart';\n\nclass Family<T, A> {\n  const Family();\n}\n\nfinal reportProvider = Family<Report?, String>();\n")
+            .file("lib/f_expression_generic.dart", "import 'report.dart';\n\nvoid run() {\n  Future<Report?>.value(null);\n}\n")
+            .file("lib/model.dart", "class Score {\n  const Score(this.value);\n  final int value;\n}\n\nclass ScoreError implements Exception {}\n")
+            .file("lib/node.dart", "class Node {\n  Node? next;\n}\n")
+            .file(
+                "lib/more.dart",
+                "import 'model.dart' as m;\nimport 'model.dart' as M;\nimport 'model.dart';\n\nextension ScoresX on List<Score> {\n  int get total => length;\n}\n\nenum Grade {\n  a(null);\n  const Grade(this.best);\n  final Score? best;\n}\n\nclass Board {\n  Score? top;\n  final List<Score> all = [];\n  static const Score zero = Score(0);\n  var cache = <String, Score>{};\n  late final m.Score prefixed;\n  late final M.Score upper;\n}\n\nScore? current;\nfinal scores = <Score>[];\n\nint body(Object o) {\n  final Score s = o as Score;\n  if (o is Score) {}\n  final made = Score(1);\n  final built = const Score(2);\n  try {} on ScoreError catch (_) {}\n  return s.value + made.value + built.value;\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        let report = graph.report();
+
+        assert_eq!(
+            sources(graph, None, "Report", "references"),
+            [
+                "class Holder",
+                "class ReportX",
+                "constant reportProvider",
+                "function load",
+                "function run",
+                "function score",
+            ],
+            "{report}"
+        );
+        assert_eq!(
+            sources(graph, None, "Score", "references"),
+            [
+                "class Board",
+                "class ScoresX",
+                "constant scores",
+                "enum Grade",
+                "file lib/more.dart",
+                "function body",
+            ],
+            "{report}"
+        );
+        assert_eq!(
+            sources(graph, None, "ScoreError", "references"),
+            ["function body"],
+            "{report}"
+        );
+        // `Score(1)` and `const Score(2)` instantiate, and reference nothing of
+        // their own; nor does the import prefix `m`.
+        let body = node(graph, None, "body").id.clone();
+        let score = node(graph, None, "Score").id.clone();
+        let mut lines: Vec<i64> = graph
+            .edges
+            .iter()
+            .filter(|e| e.source == body && e.target == score && e.kind == "references")
+            .filter_map(|e| e.line)
+            .collect();
+        lines.sort_unstable();
+        lines.dedup();
+        // Upstream's lines 26 and 27: this fixture adds an uppercase prefix's
+        // import and field above them.
+        assert_eq!(lines, [28, 29], "{report}");
+        let mut built: Vec<i64> = graph
+            .edges
+            .iter()
+            .filter(|e| e.source == body && e.target == score && e.kind == "instantiates")
+            .filter_map(|e| e.line)
+            .collect();
+        built.sort_unstable();
+        assert_eq!(built, [30, 31], "{report}");
+        assert_eq!(
+            sources(graph, None, "Score", "instantiates"),
+            ["constant Board::zero", "function body"],
+            "{report}"
+        );
+        assert!(
+            !graph
+                .unresolved
+                .iter()
+                .any(|r| r.file_path == "lib/more.dart"
+                    && matches!(r.reference_name.as_str(), "m" | "M")),
+            "{report}"
+        );
+        // A class whose field holds its own type names itself: no self-edge.
+        assert_eq!(
+            sources(graph, None, "Node", "references"),
+            Vec::<String>::new(),
+            "{report}"
+        );
+    }
+
+    /// Upstream #2367 (`dart-initializer-calls.test.ts`, its fixture): a
+    /// `final` / `const` initializer is code its constant runs, a field's or a
+    /// `var`'s is its class's or the file's, a local declaration's second
+    /// variable stays its function's, and a function passed as a value is
+    /// captured once. A call through a type's static constant calls that
+    /// constant. KEEP-RUST: this grammar ends an arrow function in front of
+    /// the call its body makes (`(ref) => createDio()`), which reads as the
+    /// call its body ends with.
+    #[test]
+    fn pr2367_a_dart_initializer_belongs_to_its_constant_class_or_file() {
+        let project = Project::new()
+            .file("pubspec.yaml", "name: app\nenvironment:\n  sdk: \">=3.0.0 <4.0.0\"\n")
+            .file(
+                "lib/riverpod.dart",
+                "class Ref {\n  T watch<T>(Object provider) => throw 0;\n  T read<T>(Object provider) => throw 0;\n}\n\nclass Provider<T> {\n  Provider(T Function(Ref ref) create);\n\n  static const autoDispose = AutoDisposeProviderBuilder();\n}\n\nclass AutoDisposeProviderBuilder {\n  const AutoDisposeProviderBuilder();\n\n  Provider<T> call<T>(T Function(Ref ref) create) => Provider(create);\n}\n\nclass ProviderFamilyBuilder {\n  Object autoDispose() => this;\n}\n\nclass StateNotifierProvider<N, S> {\n  StateNotifierProvider(N Function(Ref ref) create);\n}\n\nclass FutureProvider<T> {\n  FutureProvider(Future<T> Function(Ref ref) create);\n\n  static const family = FutureProviderFamilyBuilder();\n}\n\nclass FutureProviderFamilyBuilder {\n  const FutureProviderFamilyBuilder();\n\n  FutureProvider<T> call<T, A>(Future<T> Function(Ref ref, A arg) create) => throw 0;\n}\n",
+            )
+            .file(
+                "lib/builders.dart",
+                "class AutoDisposeFutureProviderBuilder {\n  Object family() => this;\n}\n",
+            )
+            .file(
+                "lib/data.dart",
+                "class Dio {}\n\nclass Api {\n  Api(Dio dio);\n}\n\nclass Repository {\n  Repository(Dio dio);\n}\n\nclass Counter {\n  Counter(Api api);\n}\n\nDio createDio() => Dio();\nvoid register(void Function() cb) {}\nint start() => 0;\n",
+            )
+            .file(
+                "lib/providers.dart",
+                "import 'riverpod.dart';\nimport 'data.dart';\n\nfinal dioProvider = Provider((ref) => createDio());\nfinal apiProvider = Provider((ref) => Api(ref.watch(dioProvider)));\nfinal repoProvider = Provider((ref) => Repository(ref.watch(dioProvider)));\nfinal counterProvider = StateNotifierProvider<Counter, int>((ref) => Counter(ref.read(apiProvider)));\n",
+            )
+            .file(
+                "lib/more.dart",
+                "import 'riverpod.dart';\nimport 'data.dart';\nimport 'providers.dart';\n\nfinal typedProvider = Provider((Ref ref) => ref.read(dioProvider));\nfinal blockProvider = Provider((ref) {\n  final dio = createDio();\n  return Repository(dio);\n});\nvoid onTap() {}\nfinal wired = register(onTap);\nfinal handler = onTap;\nvar cache = createDio();\nvar registry = <String, Dio>{};\nlate final lazyRepo = Repository(createDio());\nfinal autoProvider = Provider.autoDispose((ref) => createDio());\nfinal userProvider = FutureProvider.family((ref, int id) async => Api(createDio()));\n\nProvider<Dio> makeAuto() => Provider.autoDispose((ref) => Dio());\n\nclass Service {\n  static final instance = Service._(createDio());\n  static var shared = Api(createDio());\n  final repo = Repository(Dio());\n  final Dio dio;\n  Service._(this.dio);\n\n  int run() {\n    var total = 0;\n    for (var i = 0, j = start(); i < j; i++) {\n      total += i;\n    }\n    return total;\n  }\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        let report = graph.report();
+        let providers = "lib/providers.dart";
+        let more = "lib/more.dart";
+
+        // The providers construct what they build and call what they build it with.
+        assert_eq!(
+            targets(graph, providers, "dioProvider", "calls"),
+            ["createDio"],
+            "{report}"
+        );
+        // The call is written where the arrow's tail starts (KEEP-RUST: this
+        // grammar ends the arrow in front of the call its body makes).
+        let dio = node(graph, Some(providers), "dioProvider").id.clone();
+        let at: Vec<(Option<i64>, Option<i64>)> = graph
+            .edges
+            .iter()
+            .filter(|e| e.source == dio && e.kind == "calls")
+            .map(|e| (e.line, e.col))
+            .collect();
+        assert_eq!(at, [(Some(4), Some(38))], "{report}");
+        // A `var`'s initializer is walked as a body, for the file: the types
+        // it names too.
+        assert!(
+            sources(graph, None, "Dio", "references").contains(&"file lib/more.dart".to_string()),
+            "{report}"
+        );
+        assert_eq!(
+            targets(graph, providers, "apiProvider", "instantiates"),
+            ["Api", "Provider"],
+            "{report}"
+        );
+        assert_eq!(
+            targets(graph, providers, "repoProvider", "instantiates"),
+            ["Provider", "Repository"],
+            "{report}"
+        );
+        assert_eq!(
+            targets(graph, providers, "counterProvider", "instantiates"),
+            ["Counter", "StateNotifierProvider"],
+            "{report}"
+        );
+        // A typed closure parameter types its receiver; a block-bodied closure is walked whole.
+        assert_eq!(
+            targets(graph, more, "typedProvider", "calls"),
+            ["Ref::read"],
+            "{report}"
+        );
+        assert_eq!(
+            targets(graph, more, "blockProvider", "calls"),
+            ["createDio"],
+            "{report}"
+        );
+        assert_eq!(
+            targets(graph, more, "blockProvider", "instantiates"),
+            ["Provider", "Repository"],
+            "{report}"
+        );
+        // A function passed as a value, or held by a constant, is the
+        // constant's reference, captured once.
+        assert_eq!(
+            targets(graph, more, "wired", "calls"),
+            ["register"],
+            "{report}"
+        );
+        assert_eq!(
+            sources(graph, Some(more), "onTap", "references"),
+            ["constant handler", "constant wired"],
+            "{report}"
+        );
+        let on_tap = node(graph, Some(more), "onTap").id.clone();
+        assert_eq!(
+            graph
+                .edges
+                .iter()
+                .filter(|e| e.target == on_tap && e.kind == "references")
+                .count(),
+            2,
+            "{report}"
+        );
+        // `var` and `late final` mint no node: the file runs them.
+        assert_eq!(
+            targets(graph, more, more, "calls"),
+            ["createDio"],
+            "{report}"
+        );
+        assert_eq!(
+            targets(graph, more, more, "instantiates"),
+            ["Repository"],
+            "{report}"
+        );
+        // A `static final` is the class's constant; a `static var` and an
+        // instance field mint no node, so they are the class's.
+        assert_eq!(
+            targets(graph, more, "Service::instance", "calls"),
+            ["Service::_", "createDio"],
+            "{report}"
+        );
+        assert_eq!(
+            targets(graph, more, "Service", "calls"),
+            ["createDio"],
+            "{report}"
+        );
+        assert_eq!(
+            targets(graph, more, "Service", "instantiates"),
+            ["Api", "Dio", "Repository"],
+            "{report}"
+        );
+        // `Provider.autoDispose(…)` calls the static constant, whose own
+        // initializer constructs the builder, and not a same-named method of
+        // another type, in its file or not.
+        let auto_dispose = node(graph, Some("lib/riverpod.dart"), "Provider::autoDispose");
+        assert_eq!(auto_dispose.kind, "constant", "{report}");
+        assert_eq!(
+            targets(graph, more, "autoProvider", "calls"),
+            ["Provider::autoDispose", "createDio"],
+            "{report}"
+        );
+        assert_eq!(
+            targets(graph, more, "makeAuto", "calls"),
+            ["Provider::autoDispose"],
+            "{report}"
+        );
+        assert_eq!(
+            targets(
+                graph,
+                "lib/riverpod.dart",
+                "Provider::autoDispose",
+                "instantiates"
+            ),
+            ["AutoDisposeProviderBuilder"],
+            "{report}"
+        );
+        assert_eq!(
+            sources(graph, None, "ProviderFamilyBuilder::autoDispose", "calls"),
+            Vec::<String>::new(),
+            "{report}"
+        );
+        assert_eq!(
+            targets(graph, more, "userProvider", "calls"),
+            ["FutureProvider::family", "createDio"],
+            "{report}"
+        );
+        assert_eq!(
+            sources(
+                graph,
+                None,
+                "AutoDisposeFutureProviderBuilder::family",
+                "calls"
+            ),
+            Vec::<String>::new(),
+            "{report}"
+        );
+        // Each provider and declaration above is a caller of what it builds.
+        assert_eq!(
+            sources(graph, None, "createDio", "calls"),
+            [
+                "class Service",
+                "constant Service::instance",
+                "constant autoProvider",
+                "constant blockProvider",
+                "constant dioProvider",
+                "constant userProvider",
+                "file lib/more.dart",
+            ],
+            "{report}"
+        );
+        assert_eq!(
+            sources(graph, None, "Repository", "instantiates"),
+            [
+                "class Service",
+                "constant blockProvider",
+                "constant repoProvider",
+                "file lib/more.dart",
+            ],
+            "{report}"
+        );
+        // A local declaration's second variable is its function's, once.
+        assert_eq!(
+            targets(graph, more, "Service::run", "calls"),
+            ["start"],
+            "{report}"
+        );
+        let run = node(graph, Some(more), "Service::run").id.clone();
+        assert_eq!(
+            graph
+                .edges
+                .iter()
+                .filter(|e| e.source == run && e.kind == "calls")
+                .count(),
+            1,
+            "{report}"
+        );
+        assert_eq!(
+            sources(graph, None, "start", "calls"),
+            ["method Service::run"],
+            "{report}"
+        );
+    }
+
+    /// KEEP-RUST (W4-DART-03): what this grammar writes differently from
+    /// upstream's. A `new` or `const` call writes its class, and a named
+    /// constructor, in its `type` (`const Foo.named()`, a prefixed
+    /// `const p.Foo()`), and calls them; an arrow function ended in front of
+    /// the call or member access its body makes reads as the tail's: its
+    /// receiver typed (`(Ref ref) => ref.watch(x)` is `Ref`'s `watch`, and
+    /// `ref.read(x)` no namesake's `read` when `Ref` declares none), its
+    /// static read the type's, its member read the getter's.
+    #[test]
+    fn keep_rust_dart_constructor_calls_and_arrow_tails_read_as_written() {
+        let project = Project::new()
+            .file("pubspec.yaml", "name: app\n")
+            .file(
+                "lib/kit.dart",
+                "class Foo {\n  const Foo();\n}\n\nclass Ref {\n  int watch(Object p) => 0;\n}\n\nclass Box {\n  int read() => 1;\n  int get area => 1;\n}\n\nenum Mode { dark }\n",
+            )
+            .file(
+                "lib/use.dart",
+                "import 'kit.dart';\nimport 'kit.dart' as p;\n\nvoid build() {\n  final a = new Foo();\n  final b = const p.Foo();\n  final c = new Foo.named();\n  final d = (Ref ref) => ref.watch(1);\n  final g = (Ref ref) => ref.read(1);\n  final e = (Object x) => Mode.dark;\n  final f = (Box b) => b.area;\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        let report = graph.report();
+        let mut built: Vec<(Option<i64>, String)> = graph
+            .edges
+            .iter()
+            .filter(|e| e.kind == "instantiates")
+            .filter(|e| {
+                graph
+                    .node(&e.source)
+                    .is_some_and(|n| n.qualified_name == "build")
+            })
+            .filter_map(|e| Some((e.line, graph.node(&e.target)?.qualified_name.clone())))
+            .collect();
+        built.sort();
+        assert_eq!(
+            built,
+            [(Some(5), "Foo".to_string()), (Some(6), "Foo".to_string())],
+            "{report}"
+        );
+        assert!(
+            graph
+                .unresolved
+                .iter()
+                .any(|r| r.reference_name == "Foo.named" && r.reference_kind == "calls"),
+            "{report}"
+        );
+        assert_eq!(
+            targets(graph, "lib/use.dart", "build", "calls"),
+            ["Box::area", "Ref::watch"],
+            "{report}"
+        );
+        assert!(
+            targets(graph, "lib/use.dart", "build", "references").contains(&"Mode".to_string()),
+            "{report}"
+        );
+    }
+
+    /// Upstream #2338's `dartMemberOf`: an unnamed extension applies only in
+    /// its own library, so for a read in another one it is no candidate at
+    /// all, and a named extension's getter of the same rank answers, though
+    /// the unnamed one sits nearer the read (the tie would go to it).
+    #[test]
+    fn pr2360_an_unnamed_extension_of_another_library_is_passed_over_for_a_named_one() {
+        let project = Project::new()
+            .file("pubspec.yaml", "name: app\n")
+            .file("lib/box.dart", "class Box {}\n")
+            .file(
+                "lib/a/other.dart",
+                "import '../box.dart';\n\nextension on Box {\n  int get hidden => 0;\n}\n",
+            )
+            .file(
+                "lib/b/named.dart",
+                "import '../box.dart';\n\nextension BoxHidden on Box {\n  int get hidden => 1;\n}\n",
+            )
+            .file("lib/a/use.dart", "import '../box.dart';\n\nint read(Box x) => x.hidden;\n")
+            .index();
+        let graph = project.graph();
+        let report = graph.report();
+        assert_eq!(
+            targets(graph, "lib/a/use.dart", "read", "calls"),
+            ["BoxHidden::hidden"],
+            "{report}"
         );
     }
 }

@@ -30,7 +30,7 @@ const CHAIN_LINES: i64 = 40;
 
 /// Past any real member's depth: an extension member only applies when no
 /// instance member does (upstream `DART_EXTENSION_RANK`).
-const EXTENSION_RANK: u64 = 1000;
+pub(crate) const EXTENSION_RANK: u64 = 1000;
 
 /// No path from the call site's classes to a member's owner.
 const OUT_OF_SCOPE: u64 = u64::MAX;
@@ -374,6 +374,13 @@ pub struct DartTables {
     heads: Mutex<HashMap<String, Arc<DartHead>>>,
     supers: Mutex<HashMap<String, Arc<Vec<String>>>>,
     hierarchies: Mutex<HashMap<(String, i64), Arc<Hierarchy>>>,
+    /// Each type name's lineage ([`crate::dart_members`]).
+    pub(crate) lineages: Mutex<HashMap<String, Arc<HashMap<String, u64>>>>,
+    /// Each member's extension, by node id, `None` for a type's own member.
+    pub(crate) extension_owners:
+        Mutex<HashMap<String, Option<Arc<crate::dart_members::ExtensionOwner>>>>,
+    /// Whether each method is a getter, by node id.
+    pub(crate) getters: Mutex<HashMap<String, bool>>,
 }
 
 /// The types around a call site, by supertype distance.
@@ -386,7 +393,7 @@ impl DartTables {
 }
 
 /// `decl`'s head, read once per pass.
-fn dart_head_of(decl: &Node, context: &dyn ResolutionContext) -> Arc<DartHead> {
+pub(crate) fn dart_head_of(decl: &Node, context: &dyn ResolutionContext) -> Arc<DartHead> {
     let tables = context.dart_tables();
     if let Some(hit) = tables
         .heads
@@ -410,7 +417,7 @@ fn dart_head_of(decl: &Node, context: &dyn ResolutionContext) -> Arc<DartHead> {
 }
 
 /// `nodes` in source order (start line, column, id).
-fn in_order(mut nodes: Vec<Arc<Node>>) -> Vec<Arc<Node>> {
+pub(crate) fn in_order(mut nodes: Vec<Arc<Node>>) -> Vec<Arc<Node>> {
     nodes.sort_by(|a, b| {
         (a.start_line, a.start_column, &a.id).cmp(&(b.start_line, b.start_column, &b.id))
     });
@@ -420,7 +427,10 @@ fn in_order(mut nodes: Vec<Arc<Node>>) -> Vec<Arc<Node>> {
 /// The names every Dart declaration of `type_name` extends, mixes in,
 /// implements or sits `on` (upstream `dartSupertypesOf`), the declarations
 /// in path and line order.
-fn dart_supertypes_of(type_name: &str, context: &dyn ResolutionContext) -> Arc<Vec<String>> {
+pub(crate) fn dart_supertypes_of(
+    type_name: &str,
+    context: &dyn ResolutionContext,
+) -> Arc<Vec<String>> {
     let tables = context.dart_tables();
     if let Some(hit) = tables
         .supers
@@ -596,7 +606,7 @@ fn unnamed_extension() -> &'static Regex {
 /// head past the annotations it starts with (upstream `dartExtensionDecl`):
 /// `Some(false)` for an unnamed `extension on X`, `None` for a class, mixin
 /// or enum, or an `extension type`.
-fn dart_extension_named(node: &Node, context: &dyn ResolutionContext) -> Option<bool> {
+pub(crate) fn dart_extension_named(node: &Node, context: &dyn ResolutionContext) -> Option<bool> {
     if node.language != Language::Dart || node.kind != NodeKind::Class {
         return None;
     }

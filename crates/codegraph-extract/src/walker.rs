@@ -764,7 +764,12 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             return;
         }
 
-        self.maybe_capture_fn_refs(node, node_type);
+        // A Dart constant's declaration is walked as its constant's body,
+        // which captures its function values once, for the constant
+        // (upstream #2367).
+        if !(self.spec.language() == Language::Dart && node_type == "static_final_declaration") {
+            self.maybe_capture_fn_refs(node, node_type);
+        }
 
         // `window.App = {…}` / `App.utils = {…}`: the object's functions are
         // the path's members (upstream #2363). Its whole subtree is handled
@@ -4876,20 +4881,155 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
     /// `static` `const`/`final`, the shared constant; an instance field or a
     /// local is another node kind. Its children stay visited, as before.
     fn visit_dart_node(&mut self, node: SyntaxNode<'tree>) -> bool {
-        if node.kind() == "static_final_declaration"
-            && let Some(name_node) = child_by_field(node, "name")
-        {
-            self.create_node(
-                NodeKind::Constant,
-                &node_text(name_node, self.source),
-                node,
-                NodeExtra {
-                    signature: value_signature(child_by_field(node, "value"), self.source),
-                    ..NodeExtra::default()
-                },
-            );
+        match node.kind() {
+            "static_final_declaration" => self.extract_dart_constant(node),
+            // A field's declared type is its class's, and a top-level
+            // variable's the file's: neither declaration mints a node of its
+            // own (upstream #2360). Each initializer is walked as its entry
+            // is reached, below.
+            "declaration" | "top_level_variable_declaration"
+                if node.kind() == "top_level_variable_declaration"
+                    || crate::lang::is_dart_field_declaration(node) =>
+            {
+                if let Some(owner_id) = self.node_stack.last().cloned() {
+                    for child in node.named_children(&mut node.walk()) {
+                        if !matches!(
+                            child.kind(),
+                            "initialized_identifier_list" | "static_final_declaration_list"
+                        ) {
+                            self.push_dart_type_refs(child, &owner_id);
+                        }
+                    }
+                }
+                false
+            }
+            // A field's initializer, or a top-level variable's, is code its
+            // class or the file runs, walked as a body is (upstream #2367).
+            "initialized_identifier" if crate::lang::is_dart_field_or_top_level_entry(node) => {
+                self.visit_function_body(node);
+                true
+            }
+            _ => false,
         }
-        false
+    }
+
+    /// A Dart `final` / `const` declaration: a constant, whose initializer is
+    /// code it runs (upstream #2367) — riverpod's `final repoProvider =
+    /// Provider((ref) => Repository(ref.watch(dioProvider)));` calls
+    /// `Provider`, `Repository` and `ref.watch` — walked as a body for it:
+    /// calls, instantiations, static and member reads, the types it names
+    /// (`Family<Report?, String>()`, #2360), closures and function values.
+    fn extract_dart_constant(&mut self, node: SyntaxNode<'tree>) -> bool {
+        let Some(name_node) = child_by_field(node, "name") else {
+            return false;
+        };
+        let Some(constant) = self.create_node(
+            NodeKind::Constant,
+            &node_text(name_node, self.source),
+            node,
+            NodeExtra {
+                signature: value_signature(child_by_field(node, "value"), self.source),
+                ..NodeExtra::default()
+            },
+        ) else {
+            return false;
+        };
+        self.node_stack.push(constant.id);
+        self.visit_function_body(node);
+        self.node_stack.pop();
+        true
+    }
+
+    /// A `references` ref from `from_node_id` for every type named inside
+    /// `node` that names one (upstream #2327 `pushDartTypeRefs`).
+    fn push_dart_type_refs(&mut self, node: SyntaxNode<'tree>, from_node_id: &str) {
+        if node.kind() == "type_identifier" {
+            if self.is_dart_type_name(node) {
+                let name = node_text(node, self.source);
+                self.push_ref(from_node_id, &name, EdgeKind::References, node);
+            }
+            return;
+        }
+        for child in node.named_children(&mut node.walk()) {
+            self.push_dart_type_refs(child, from_node_id);
+        }
+    }
+
+    /// Whether a Dart `type_identifier` names a type a reference should point
+    /// at (upstream `isDartTypeName`): Dart writes types UpperCamel (`_Private`
+    /// and `$Generated` too), so a lowercase one is a built-in (`num`,
+    /// `dynamic`). Two more are no type of their own: the import prefix of
+    /// `p.Foo`, and the class a `new` / `const` constructor call names, which
+    /// the call links (in this grammar, the first `type` of the call).
+    fn is_dart_type_name(&self, node: SyntaxNode<'tree>) -> bool {
+        let text = node_text(node, self.source);
+        if !crate::lang::dart_writes_a_type(&text) || is_builtin_type(&text) {
+            return false;
+        }
+        if node.next_sibling().is_some_and(|next| next.kind() == ".") {
+            return false;
+        }
+        let Some(ty) = node.parent().filter(|parent| parent.kind() == "type") else {
+            return true;
+        };
+        !ty.parent().is_some_and(|call| {
+            matches!(call.kind(), "new_expression" | "const_object_expression")
+                && child_by_field(call, "type").is_some_and(|first| first.id() == ty.id())
+        })
+    }
+
+    /// What a Dart body names beside its calls (upstream #2360): a member read
+    /// `x.area`, and a type — a local's declared type, a generic argument
+    /// (`Future<Report?>.value(null)`), a cast, a type test, a catch clause.
+    fn extract_dart_body_refs(&mut self, node: SyntaxNode<'tree>) {
+        let Some(owner_id) = self.node_stack.last().cloned() else {
+            return;
+        };
+        match node.kind() {
+            "member_expression" | "null_aware_member_expression" => {
+                self.extract_dart_member_read(node, &owner_id);
+            }
+            "type_identifier" if self.is_dart_type_name(node) => {
+                let name = node_text(node, self.source);
+                self.push_ref(&owner_id, &name, EdgeKind::References, node);
+            }
+            _ => {}
+        }
+    }
+
+    /// A Dart member read — `x.area`, `s?.label`, `Config.instance` — as the
+    /// ref `<receiver>.<member>`, positioned on the member's name (upstream
+    /// #2338 `dartMemberRead`). Reading a getter runs it, so the resolver links
+    /// the read to a getter, as a call, and to nothing else. The receiver must
+    /// be a plain name, the one shape whose type the resolver can look up
+    /// (past an arrow this grammar ended in front of it, [`crate::lang::dart_arrow_tail`]);
+    /// a member that is called (`x.grow()`) is the call's, and an assignment's
+    /// target is no `member_expression` here.
+    fn extract_dart_member_read(&mut self, node: SyntaxNode<'tree>, owner_id: &str) {
+        let callee = match node.parent() {
+            Some(parent) if parent.kind() == "instantiation_expression" => parent,
+            _ => node,
+        };
+        if self.is_callee_of_call(callee) {
+            return;
+        }
+        let Some(member) = child_by_field(node, "property").filter(|m| m.kind() == "identifier")
+        else {
+            return;
+        };
+        let Some(receiver) = child_by_field(node, "object").map(crate::lang::dart_arrow_tail)
+        else {
+            return;
+        };
+        if receiver.kind() != "identifier" {
+            return;
+        }
+        let name = format!(
+            "{}.{}",
+            node_text(receiver, self.source),
+            node_text(member, self.source)
+        );
+        self.push_ref(owner_id, &name, EdgeKind::References, member);
     }
 
     /// A Pascal unit or class `const` (upstream `extractPascalConst`). A
@@ -5677,13 +5817,30 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
         // #2375 — a Dart generic call `ref.read<Repo>(p)` wraps its callee in
         // an `instantiation_expression`; the type arguments are no part of
         // the name it calls.
+        // KEEP-RUST: an arrow this grammar ended in front of the call
+        // (`(ref) => createDio()`, read as a call of `(ref) => createDio`)
+        // calls what its body ends with ([`crate::lang::dart_arrow_tail`]).
         let func = func.map(|func| {
-            if self.spec.language() == Language::Dart && func.kind() == "instantiation_expression" {
-                child_by_field(func, "function").unwrap_or(func)
-            } else {
-                func
+            let mut func = func;
+            while self.spec.language() == Language::Dart {
+                let next = match func.kind() {
+                    "instantiation_expression" => child_by_field(func, "function").unwrap_or(func),
+                    "function_expression" => crate::lang::dart_arrow_tail(func),
+                    _ => func,
+                };
+                if next.id() == func.id() {
+                    break;
+                }
+                func = next;
             }
+            func
         });
+        // Such a call is written where that tail starts.
+        let position = if self.spec.language() == Language::Dart {
+            crate::lang::dart_misparsed_call_start(node).unwrap_or(node)
+        } else {
+            node
+        };
         if let Some(func) = func {
             // G13 — a C++ call keeps the scope it is written with: `ns::f()`
             // calls `ns::f`, `Base::m()` calls `Base::m`, and `::f()`, from
@@ -5706,6 +5863,10 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
                         .map(|receiver| {
                             if ts_js {
                                 peel_ts_js_receiver(receiver)
+                            } else if self.spec.language() == Language::Dart {
+                                // `(ref) => ref.read(p)`, read as `.read(p)` on
+                                // `(ref) => ref` (upstream #2375 `dartReceiverOf`).
+                                crate::lang::dart_arrow_tail(receiver)
                             } else {
                                 receiver
                             }
@@ -5927,7 +6088,7 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
         }
         callee_name = self.maybe_strip_cpp_template_call(callee_name);
         if !callee_name.is_empty() {
-            self.push_ref(&caller_id, &callee_name, EdgeKind::Calls, node);
+            self.push_ref(&caller_id, &callee_name, EdgeKind::Calls, position);
         }
     }
 
@@ -6425,7 +6586,10 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             self.extract_jsx_component_ref(node);
         } else if has_type(self.spec.call_types(), node_type) {
             self.extract_call(node);
-        } else if INSTANTIATION_KINDS.contains(&node_type) {
+        } else if INSTANTIATION_KINDS.contains(&node_type) && self.spec.language() != Language::Dart
+        {
+            // Dart's `new Foo.named()` names its class and constructor as a
+            // `const` one does (`DartSpec::extract_bare_call`, below).
             if self.extract_construction(node) {
                 return;
             }
@@ -6440,6 +6604,10 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
         // G4 — a static-member or enum-value read: `Enum.value`,
         // `Type.CONST`, `Foo::BAR`.
         self.extract_static_member_ref(node);
+
+        if self.spec.language() == Language::Dart {
+            self.extract_dart_body_refs(node);
+        }
 
         if node_type == "variable_declarator" {
             if let Some(owner_id) = self.node_stack.last().cloned() {
@@ -6614,7 +6782,10 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
         if self.is_callee_of_call(callee) {
             return;
         }
-        let Some(receiver) = child_by_field(node, "object") else {
+        // Past an arrow this grammar ended in front of the access (upstream
+        // #2375 `dartReceiverOf`).
+        let Some(receiver) = child_by_field(node, "object").map(crate::lang::dart_arrow_tail)
+        else {
             return;
         };
         if receiver.kind() != "identifier" {
@@ -6972,6 +7143,18 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
                 _ => {}
             }
         }
+        // The type an extension is `on` is one it depends on (`extension
+        // ReportX on Report`, `on List<Report>`): no supertype, a
+        // `references` ref, as a C# extension method's `this Report r` gets
+        // (upstream #2327).
+        if node.kind() == "extension_declaration" {
+            let on_types: Vec<_> = node
+                .children_by_field_name("class", &mut node.walk())
+                .collect();
+            for on_type in on_types {
+                self.push_dart_type_refs(on_type, class_id);
+            }
+        }
     }
 
     fn extract_type_annotations(&mut self, node: SyntaxNode<'tree>, node_id: &str) {
@@ -7157,8 +7340,12 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
     /// constructed class and perhaps its constructor (`= _Impl.create`); only
     /// an UpperCamel name there is a type.
     fn extract_dart_type_annotations(&mut self, node: SyntaxNode<'tree>, node_id: &str) {
+        // A function's body names types of its own, which the body walk
+        // takes (upstream #2360's body branch); the signature is walked here.
         let node = match node.kind() {
-            "method_declaration" => child_by_field(node, "signature").unwrap_or(node),
+            "method_declaration" | "function_declaration" => {
+                child_by_field(node, "signature").unwrap_or(node)
+            }
             _ => node,
         };
         let signature = if node.kind() == "method_signature" {
@@ -7181,7 +7368,7 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
         if signature.kind() == "redirecting_factory_constructor_signature" {
             for child in signature.named_children(&mut signature.walk()) {
                 if child.kind() != "type_identifier"
-                    || dart_names_a_type(&node_text(child, self.source))
+                    || crate::lang::dart_writes_a_type(&node_text(child, self.source))
                 {
                     self.extract_type_refs_from_subtree(child, node_id);
                 }
@@ -8720,14 +8907,6 @@ fn is_php_pseudo_type(name: &str) -> bool {
             | "string"
             | "bool"
     )
-}
-
-/// Dart writes type names UpperCamel, after any leading `_` or `$`.
-fn dart_names_a_type(name: &str) -> bool {
-    name.trim_start_matches(['_', '$'])
-        .chars()
-        .next()
-        .is_some_and(|c| c.is_ascii_uppercase())
 }
 
 /// The kotlin-ng node kinds a type is written as.

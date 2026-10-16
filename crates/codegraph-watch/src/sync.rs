@@ -943,6 +943,31 @@ fn sync_paths_with_store(
             );
         }
         changed_names.note_all(dart.names.iter().cloned());
+        // What a Dart member read or a call on a typed receiver in an
+        // unchanged file read of a changed file's heads, and the members it
+        // waited for (W4-DART-03). Both ride on the Dart heads marker.
+        for affected in crate::dart_heads::typed_receiver_sites(
+            store,
+            &changed_names.dart,
+            &reindexed,
+            &changed_names.removed_files,
+        )? {
+            if !dependent_fallbacks.contains(&affected.file_path) {
+                merge_dependent_site(&mut dependent_sites, &mut dependent_fallbacks, affected);
+            }
+        }
+        for affected in crate::dart_heads::new_member_sites(
+            store,
+            project_root,
+            scope.options.max_file_size,
+            &changed_names.dart,
+            &reindexed,
+            &changed_names.removed_files,
+        )? {
+            if !dependent_fallbacks.contains(&affected.file_path) {
+                merge_dependent_site(&mut dependent_sites, &mut dependent_fallbacks, affected);
+            }
+        }
         // What a Dart name or import in an unchanged file read of a changed
         // file's directives: its library's parts, its exports, its imports
         // (W4-DART-02).
@@ -3571,6 +3596,71 @@ pub(crate) mod tests {
         rebuilt.retain(|(key, _)| key != "member_surface:src/Json/Spare.cs");
         wanted.retain(|(key, _)| key != "member_surface:src/Json/Spare.cs");
         assert_eq!(rebuilt, wanted);
+        assert_eq!(edge_projection(&db), expected);
+    }
+
+    /// W4-DART-03: Dart files have member surface rows too (a member read
+    /// types its receiver by the fields of the classes around it), so an
+    /// index whose member marker is missing, or at the version before Dart
+    /// had rows, re-resolves every Dart file once and writes their rows.
+    #[test]
+    fn an_index_without_the_member_marker_rebuilds_the_dart_rows() {
+        const SHAPES: (&str, &str) = ("lib/shapes.dart", "class Box {\n  int get area => 1;\n}\n");
+        const BASE: (&str, &str) = (
+            "lib/base.dart",
+            "import 'shapes.dart';\n\nclass Base {\n  Base(this.shape);\n  final Box shape;\n}\n",
+        );
+        const SUB: (&str, &str) = (
+            "lib/sub.dart",
+            "import 'base.dart';\n\nclass Sub extends Base {\n  Sub(super.shape);\n\n  int measure() => shape.area;\n}\n",
+        );
+        const SPARE: (&str, &str) = ("lib/spare.dart", "int spare() => 1;\n");
+        const SPARE_EDITED: (&str, &str) = ("lib/spare.dart", "int spare() => 2;\n");
+        let version = Some(crate::member_surfaces::VERSION.to_string());
+        let dir = TestDir::new("member-surface-dart-bootstrap");
+        let db = default_db_path(dir.path()).unwrap();
+        let initial = [("pubspec.yaml", "name: app\n"), SHAPES, BASE, SUB, SPARE];
+        write_files(dir.path(), &initial);
+        sync_changed_paths(dir.path(), &db, initial.iter().map(|(path, _)| *path)).unwrap();
+        assert_eq!(member_marker(&db), version);
+        let rows = member_rows(&db);
+        assert!(
+            rows.iter()
+                .any(|(key, _)| key == "member_surface:lib/base.dart"),
+            "{rows:#?}"
+        );
+        let expected = edge_projection(&db);
+        assert!(
+            expected
+                .iter()
+                .any(|edge| edge.contains("Sub::measure -[calls]-> lib/shapes.dart")),
+            "{expected:#?}"
+        );
+        {
+            let store = Store::open(&db).unwrap();
+            let dropped = store
+                .connection()
+                .execute(
+                    "DELETE FROM edges WHERE kind = 'calls' AND target = (SELECT id FROM nodes \
+                     WHERE qualified_name = 'Box::area')",
+                    [],
+                )
+                .unwrap();
+            assert_eq!(dropped, 1, "the read edge an older index lacked");
+            store
+                .delete_project_metadata_with_prefix(
+                    codegraph_resolve::member_types::SURFACE_ROW_KEY_PREFIX,
+                )
+                .unwrap();
+            store
+                .set_project_metadata(crate::member_surfaces::VERSION_KEY, "2")
+                .unwrap();
+        }
+        assert_ne!(edge_projection(&db), expected);
+        write_files(dir.path(), &[SPARE_EDITED]);
+        sync_changed_paths(dir.path(), &db, ["lib/spare.dart"]).unwrap();
+        assert_eq!(member_marker(&db), version);
+        assert_eq!(member_rows(&db), rows);
         assert_eq!(edge_projection(&db), expected);
     }
 

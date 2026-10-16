@@ -9647,3 +9647,428 @@ pub fn dart_library_import_brings_a_base_method_to_a_call_on_its_parts_subclass(
         .write("lib/models.dart", "import 'base.dart';\n\npart 'seeded.dart';\n")
         .edge_after("function run", "calls", "method Base::close")
 }
+
+// ----- W4-DART-03: getter reads, extension members, static constants -------
+
+/// 501 parked reads of `area` through receivers nothing types, so the shared
+/// tail retry skips that tail.
+static AREA_READS: LazyLock<String> = LazyLock::new(|| {
+    let mut text = String::from("int noise() {\n  var total = 0;\n");
+    for index in 0..501 {
+        text.push_str(&format!("  total += missing{index}.area;\n"));
+    }
+    text.push_str("  return total;\n}\n");
+    text
+});
+
+/// Upstream #2338 (W4-DART-03): a getter read links the getter its
+/// receiver's type gains in another file; a field read before, it linked
+/// nothing.
+pub fn dart_getter_read_reaches_a_getter_its_type_gains() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Dart])
+        .file("pubspec.yaml", "name: app\n")
+        .file("lib/box.dart", "class Box {\n  final int size = 1;\n}\n")
+        .file(
+            "lib/use.dart",
+            "import 'box.dart';\n\nint read(Box x) => x.area;\n",
+        )
+        .write(
+            "lib/box.dart",
+            "class Box {\n  final int size = 1;\n  int get area => size * size;\n}\n",
+        )
+        .edge_after("function read", "calls", "method Box::area")
+}
+
+/// The same past the tail ceiling: 501 parked reads share the tail `area`.
+pub fn dart_getter_read_reaches_a_getter_its_type_gains_past_the_tail_ceiling() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Dart])
+        .file("pubspec.yaml", "name: app\n")
+        .file("lib/box.dart", "class Box {\n  final int size = 1;\n}\n")
+        .file(
+            "lib/use.dart",
+            "import 'box.dart';\n\nint read(Box x) => x.area;\n",
+        )
+        .file("noise/noise.dart", AREA_READS.as_str())
+        .write(
+            "lib/box.dart",
+            "class Box {\n  final int size = 1;\n  int get area => size * size;\n}\n",
+        )
+        .edge_after("function read", "calls", "method Box::area")
+}
+
+/// The reverse: the getter moves to another type, and the read, through a
+/// receiver of the first, links nothing: never a getter found by its name.
+pub fn dart_getter_read_leaves_a_getter_its_type_drops() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Dart])
+        .file("pubspec.yaml", "name: app\n")
+        .file(
+            "lib/box.dart",
+            "class Box {\n  final int size = 1;\n  int get area => size * size;\n}\n\nclass Other {}\n",
+        )
+        .file("lib/use.dart", "import 'box.dart';\n\nint read(Box x) => x.area;\n")
+        .write(
+            "lib/box.dart",
+            "class Box {\n  final int size = 1;\n}\n\nclass Other {\n  int get area => 1;\n}\n",
+        )
+        .edge_before("function read", "calls", "method Box::area")
+        .no_edge_after("function read", "calls", "method Other::area")
+}
+
+/// A field of the base class, declared in another file, types the read in
+/// the subclass (upstream #2171's walk through the hierarchy): retyped there,
+/// the read moves, though nothing in the subclass's file changed.
+pub fn dart_getter_read_through_an_inherited_field_follows_its_retyping() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Dart])
+        .file("pubspec.yaml", "name: app\n")
+        .file(
+            "lib/shapes.dart",
+            "class Box {\n  int get area => 1;\n}\n\nclass Panel {\n  int get area => 2;\n}\n",
+        )
+        .file(
+            "lib/base.dart",
+            "import 'shapes.dart';\n\nclass Base {\n  Base(this.shape);\n  final Box shape;\n}\n",
+        )
+        .file(
+            "lib/sub.dart",
+            "import 'base.dart';\n\nclass Sub extends Base {\n  Sub(super.shape);\n\n  int measure() => shape.area;\n}\n",
+        )
+        .write(
+            "lib/base.dart",
+            "import 'shapes.dart';\n\nclass Base {\n  Base(this.shape);\n  final Panel shape;\n}\n",
+        )
+        .edge_before("method Sub::measure", "calls", "method Box::area")
+        .edge_after("method Sub::measure", "calls", "method Panel::area")
+}
+
+/// The receiver's type, declared in another file, comes to extend another
+/// base: the read moves to that base's getter.
+pub fn dart_getter_read_follows_its_receiver_types_new_base() -> Case {
+    Case::new(Change::EditHeritage, &[Language::Dart])
+        .file("pubspec.yaml", "name: app\n")
+        .file(
+            "lib/shapes.dart",
+            "class Box {\n  int get area => 1;\n}\n\nclass Panel {\n  int get area => 2;\n}\n",
+        )
+        .file(
+            "lib/square.dart",
+            "import 'shapes.dart';\n\nclass Square extends Box {}\n",
+        )
+        .file(
+            "lib/use.dart",
+            "import 'square.dart';\n\nint read(Square s) => s.area;\n",
+        )
+        .write(
+            "lib/square.dart",
+            "import 'shapes.dart';\n\nclass Square extends Panel {}\n",
+        )
+        .edge_before("function read", "calls", "method Box::area")
+        .edge_after("function read", "calls", "method Panel::area")
+}
+
+/// 501 parked calls of `shout` through receivers nothing types.
+static SHOUT_CALLS: LazyLock<String> = LazyLock::new(|| {
+    let mut text = String::from("void noise() {\n");
+    for index in 0..501 {
+        text.push_str(&format!("  missing{index}.shout();\n"));
+    }
+    text.push_str("}\n");
+    text
+});
+
+/// Upstream #2338: an extension on an enum, in a file added later, brings
+/// the member a call on a receiver of the enum's type makes.
+pub fn dart_call_on_an_enum_reaches_a_member_an_added_extension_brings() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Dart])
+        .file("pubspec.yaml", "name: app\n")
+        .file("lib/shape.dart", "enum Shape { circle }\n")
+        .file(
+            "lib/use.dart",
+            "import 'shape.dart';\n\nString loud(Shape s) => s.shout();\n",
+        )
+        .write(
+            "lib/info.dart",
+            "import 'shape.dart';\n\nextension ShapeInfo on Shape {\n  String shout() => name;\n}\n",
+        )
+        .edge_after("function loud", "calls", "method ShapeInfo::shout")
+}
+
+/// The same past the tail ceiling: 501 parked calls share the tail `shout`.
+pub fn dart_call_on_an_enum_reaches_a_member_an_added_extension_brings_past_the_tail_ceiling()
+-> Case {
+    Case::new(Change::AddCompetitor, &[Language::Dart])
+        .file("pubspec.yaml", "name: app\n")
+        .file("lib/shape.dart", "enum Shape { circle }\n")
+        .file(
+            "lib/use.dart",
+            "import 'shape.dart';\n\nString loud(Shape s) => s.shout();\n",
+        )
+        .file("noise/noise.dart", SHOUT_CALLS.as_str())
+        .write(
+            "lib/info.dart",
+            "import 'shape.dart';\n\nextension ShapeInfo on Shape {\n  String shout() => name;\n}\n",
+        )
+        .edge_after("function loud", "calls", "method ShapeInfo::shout")
+}
+
+/// A getter an extension in a file added later brings to the receiver's
+/// type, past the tail ceiling.
+pub fn dart_getter_read_reaches_a_getter_an_added_extension_brings_past_the_tail_ceiling() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Dart])
+        .file("pubspec.yaml", "name: app\n")
+        .file("lib/box.dart", "class Box {\n  final int size = 1;\n}\n")
+        .file(
+            "lib/use.dart",
+            "import 'box.dart';\n\nint read(Box x) => x.area;\n",
+        )
+        .file("noise/noise.dart", AREA_READS.as_str())
+        .write(
+            "lib/box_x.dart",
+            "import 'box.dart';\n\nextension BoxX on Box {\n  int get area => size * size;\n}\n",
+        )
+        .edge_after("function read", "calls", "method BoxX::area")
+}
+
+/// Upstream #2367: a call through a type's name links the static constant the
+/// type gains, not another type's same-named method.
+pub fn dart_call_through_a_type_reaches_the_static_constant_it_gains() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Dart])
+        .file("pubspec.yaml", "name: app\n")
+        .file(
+            "lib/builders.dart",
+            "class Builder {\n  const Builder();\n  Object call(Object create) => create;\n}\n\nclass Other {\n  Object autoDispose(Object create) => create;\n}\n",
+        )
+        .file("lib/provider.dart", "import 'builders.dart';\n\nclass Provider {}\n")
+        .file(
+            "lib/use.dart",
+            "import 'provider.dart';\n\nfinal p = Provider.autoDispose(1);\n",
+        )
+        .write(
+            "lib/provider.dart",
+            "import 'builders.dart';\n\nclass Provider {\n  static const autoDispose = Builder();\n}\n",
+        )
+        .edge_after("constant p", "calls", "constant Provider::autoDispose")
+}
+
+/// 501 parked calls of `autoDispose` through types the project lacks.
+static AUTO_DISPOSE_CALLS: LazyLock<String> = LazyLock::new(|| {
+    let mut text = String::new();
+    for index in 0..501 {
+        text.push_str(&format!(
+            "final noise{index} = Missing{index}.autoDispose(1);\n"
+        ));
+    }
+    text
+});
+
+/// The same past the tail ceiling, no method of the name anywhere: 501
+/// parked calls share the tail `autoDispose`.
+pub fn dart_call_through_a_type_reaches_the_static_constant_it_gains_past_the_tail_ceiling() -> Case
+{
+    Case::new(Change::BodyEdit, &[Language::Dart])
+        .file("pubspec.yaml", "name: app\n")
+        .file(
+            "lib/builders.dart",
+            "class Builder {\n  const Builder();\n  Object call(Object create) => create;\n}\n",
+        )
+        .file("lib/provider.dart", "import 'builders.dart';\n\nclass Provider {}\n")
+        .file(
+            "lib/use.dart",
+            "import 'provider.dart';\n\nfinal p = Provider.autoDispose(1);\n",
+        )
+        .file("noise/noise.dart", AUTO_DISPOSE_CALLS.as_str())
+        .write(
+            "lib/provider.dart",
+            "import 'builders.dart';\n\nclass Provider {\n  static const autoDispose = Builder();\n}\n",
+        )
+        .edge_after("constant p", "calls", "constant Provider::autoDispose")
+}
+
+/// Upstream #2367: an initializer's calls are its constant's, a field's its
+/// class's; the callee, added in another file later, links.
+pub fn dart_initializer_calls_reach_a_function_added_in_another_file() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Dart])
+        .file("pubspec.yaml", "name: app\n")
+        .file(
+            "lib/use.dart",
+            "import 'data.dart';\n\nfinal dioProvider = Provider((ref) => createDio());\n\nclass Service {\n  final dio = createDio();\n}\n\nclass Provider {\n  Provider(Object create);\n}\n",
+        )
+        .write("lib/data.dart", "Object createDio() => Object();\n")
+        .edge_after("constant dioProvider", "calls", "function createDio")
+        .edge_after("class Service", "calls", "function createDio")
+}
+
+/// Upstream #2327: a field's type is its class's reference, and a type an
+/// extension is `on` the extension's; the type, added later, links.
+pub fn dart_field_and_extension_types_reach_a_type_added_in_another_file() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Dart])
+        .file("pubspec.yaml", "name: app\n")
+        .file(
+            "lib/holder.dart",
+            "import 'report.dart';\n\nclass Holder {\n  const Holder(this.report);\n  final Report report;\n}\n\nextension ReportX on Report {\n  bool get high => true;\n}\n",
+        )
+        .write("lib/report.dart", "class Report {}\n")
+        .edge_after("class Holder", "references", "class Report")
+        .edge_after("class ReportX", "references", "class Report")
+}
+
+/// The receiver's type, declared in another file, goes: the read through it
+/// links nothing, though no name of the read's file changed.
+pub fn dart_getter_read_through_a_deleted_type_links_nothing() -> Case {
+    Case::new(Change::DeleteImportedModule, &[Language::Dart])
+        .file("pubspec.yaml", "name: app\n")
+        .file("lib/shapes.dart", "class Box {\n  int get area => 1;\n}\n")
+        .file(
+            "lib/square.dart",
+            "import 'shapes.dart';\n\nclass Square extends Box {}\n",
+        )
+        .file(
+            "lib/use.dart",
+            "import 'square.dart';\n\nint read(Square s) => s.area;\n",
+        )
+        .remove("lib/square.dart")
+        .edge_before("function read", "calls", "method Box::area")
+        .no_edge_after("function read", "calls", "method Box::area")
+}
+
+/// A type the read's file already names comes to be declared, extending a
+/// type with the getter: the read links it. The read's file imports nothing
+/// (a receiver's type is read from its declaration, whatever the file
+/// imports), so no directive of it moves.
+pub fn dart_getter_read_through_a_type_that_appears_reaches_its_base() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Dart])
+        .file("pubspec.yaml", "name: app\n")
+        .file("lib/shapes.dart", "class Box {\n  int get area => 1;\n}\n")
+        .file("lib/use.dart", "int read(Square s) => s.area;\n")
+        .write(
+            "lib/square.dart",
+            "import 'shapes.dart';\n\nclass Square extends Box {}\n",
+        )
+        .edge_after("function read", "calls", "method Box::area")
+}
+
+/// 501 parked calls of `make` through types the project lacks.
+static MAKE_CALLS: LazyLock<String> = LazyLock::new(|| {
+    let mut text = String::new();
+    for index in 0..501 {
+        text.push_str(&format!("final noise{index} = Missing{index}.make();\n"));
+    }
+    text
+});
+
+/// A type that appears with a static member a constant calls through it,
+/// past the tail ceiling: the call names the type only as its receiver (the
+/// calling file imports nothing, so no directive of it moves).
+pub fn dart_call_through_a_type_that_appears_reaches_its_member_past_the_tail_ceiling() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Dart])
+        .file("pubspec.yaml", "name: app\n")
+        .file("lib/use.dart", "final made = Square.make();\n")
+        .file("noise/noise.dart", MAKE_CALLS.as_str())
+        .write(
+            "lib/square.dart",
+            "class Square {\n  static Square make() => Square();\n}\n",
+        )
+        .edge_after("constant made", "calls", "method Square::make")
+}
+
+/// A field of a base class types a read in a subclass by a type that comes
+/// to extend another base: the subclass's file names neither type, yet its
+/// read moves.
+pub fn dart_getter_read_through_an_inherited_field_follows_its_types_new_base() -> Case {
+    Case::new(Change::EditHeritage, &[Language::Dart])
+        .file("pubspec.yaml", "name: app\n")
+        .file(
+            "lib/shapes.dart",
+            "class Box {\n  int get area => 1;\n}\n\nclass Panel {\n  int get area => 2;\n}\n",
+        )
+        .file(
+            "lib/square.dart",
+            "import 'shapes.dart';\n\nclass Square extends Box {}\n",
+        )
+        .file(
+            "lib/base.dart",
+            "import 'square.dart';\n\nclass Base {\n  Base(this.shape);\n  final Square shape;\n}\n",
+        )
+        .file(
+            "lib/sub.dart",
+            "import 'base.dart';\n\nclass Sub extends Base {\n  Sub(super.shape);\n\n  int measure() => shape.area;\n}\n",
+        )
+        .write(
+            "lib/square.dart",
+            "import 'shapes.dart';\n\nclass Square extends Panel {}\n",
+        )
+        .edge_before("method Sub::measure", "calls", "method Box::area")
+        .edge_after("method Sub::measure", "calls", "method Panel::area")
+}
+
+/// The same, the read's file declaring the base it leaves: a same-file edge
+/// moves too.
+pub fn dart_getter_read_leaves_a_base_of_its_own_file_its_receivers_type_stops_extending() -> Case {
+    Case::new(Change::EditHeritage, &[Language::Dart])
+        .file("pubspec.yaml", "name: app\n")
+        .file("lib/shapes.dart", "class Box {\n  int get area => 1;\n}\n")
+        .file(
+            "lib/square.dart",
+            "import 'use.dart';\n\nclass Square extends Panel {}\n",
+        )
+        .file(
+            "lib/use.dart",
+            "import 'square.dart';\n\nclass Panel {\n  int get area => 2;\n}\n\nint read(Square s) => s.area;\n",
+        )
+        .write(
+            "lib/square.dart",
+            "import 'shapes.dart';\n\nclass Square extends Box {}\n",
+        )
+        .edge_before("function read", "calls", "method Panel::area")
+        .edge_after("function read", "calls", "method Box::area")
+}
+
+/// A class comes to extend another base, which declares the field a
+/// subclass reads through with another type: the read moves, though no type
+/// the subclass's file names changed (the member lane, the head rule).
+pub fn dart_getter_read_through_a_field_its_class_inherits_from_a_new_base() -> Case {
+    Case::new(Change::EditHeritage, &[Language::Dart])
+        .file("pubspec.yaml", "name: app\n")
+        .file(
+            "lib/shapes.dart",
+            "class Box {\n  int get area => 1;\n}\n\nclass Panel {\n  int get area => 2;\n}\n",
+        )
+        .file(
+            "lib/holders.dart",
+            "import 'shapes.dart';\n\nclass BoxHolder {\n  BoxHolder(this.shape);\n  final Box shape;\n}\n\nclass PanelHolder {\n  PanelHolder(this.shape);\n  final Panel shape;\n}\n",
+        )
+        .file(
+            "lib/base.dart",
+            "import 'holders.dart';\n\nclass Base extends BoxHolder {\n  Base(super.shape);\n}\n",
+        )
+        .file(
+            "lib/sub.dart",
+            "import 'base.dart';\n\nclass Sub extends Base {\n  Sub(super.shape);\n\n  int measure() => shape.area;\n}\n",
+        )
+        .write(
+            "lib/base.dart",
+            "import 'holders.dart';\n\nclass Base extends PanelHolder {\n  Base(super.shape);\n}\n",
+        )
+        .edge_before("method Sub::measure", "calls", "method Box::area")
+        .edge_after("method Sub::measure", "calls", "method Panel::area")
+}
+
+/// An extension that already sits `on` the receiver's type gains the getter,
+/// past the tail ceiling: no head moved, so only the new member's name says
+/// which parked reads to retry.
+pub fn dart_getter_read_reaches_a_getter_an_existing_extension_gains_past_the_tail_ceiling() -> Case
+{
+    Case::new(Change::BodyEdit, &[Language::Dart])
+        .file("pubspec.yaml", "name: app\n")
+        .file("lib/box.dart", "class Box {\n  final int size = 1;\n}\n")
+        .file(
+            "lib/box_x.dart",
+            "import 'box.dart';\n\nextension BoxX on Box {\n  int twice() => size * 2;\n}\n",
+        )
+        .file("lib/use.dart", "import 'box.dart';\n\nint read(Box x) => x.area;\n")
+        .file("noise/noise.dart", AREA_READS.as_str())
+        .write(
+            "lib/box_x.dart",
+            "import 'box.dart';\n\nextension BoxX on Box {\n  int twice() => size * 2;\n  int get area => size * size;\n}\n",
+        )
+        .edge_after("function read", "calls", "method BoxX::area")
+}

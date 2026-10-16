@@ -94,13 +94,21 @@ fn php_class_constant_and_static_property_reads_reference_their_class() {
 }
 
 /// Dart writes a member access as a `member_expression`; one that is a
-/// call's callee, generic or not, is the call's.
+/// call's callee, generic or not, is the call's. A read through a plain name
+/// is also a member read of its own, `<receiver>.<member>`, for the getter
+/// it may run (upstream #2360); one through a longer path is not.
 #[test]
 fn dart_member_reads_reference_their_type() {
     let source = "int level(context) {\n  final p = Theme.of(context);\n  final q = Provider.of<int>(context);\n  return Color.red.index + Limits.max + context.size;\n}\n";
     assert_eq!(
         member_reads("lib/level.dart", source, Language::Dart),
-        pairs(&[("level", "Color"), ("level", "Limits")])
+        pairs(&[
+            ("level", "Color"),
+            ("level", "Color.red"),
+            ("level", "Limits"),
+            ("level", "Limits.max"),
+            ("level", "context.size"),
+        ])
     );
 }
 

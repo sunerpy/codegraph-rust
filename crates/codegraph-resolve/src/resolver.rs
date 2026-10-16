@@ -1769,6 +1769,14 @@ impl ReferenceResolver {
             _ => self.gate_language(resolved, reference, context),
         };
         let resolved = self.gate_super_self_call(resolved, reference, context);
+        // A Dart class whose field holds its own type (`class Node { Node?
+        // next; }`) names itself: a self-edge that says nothing (upstream
+        // #2327).
+        let resolved = resolved.filter(|result| {
+            !(reference.language == Language::Dart
+                && reference.reference_kind == EdgeKind::References
+                && result.target_node_id == reference.from_node_id)
+        });
         let resolved = self.gate_language_visibility(resolved, reference, context);
         let resolved = self.gate_js_visibility(resolved, reference, context);
         // A JSX tag naming a local of its component renders that local
@@ -2164,6 +2172,15 @@ impl ReferenceResolver {
         if crate::cpp_supertypes::is_cpp_supertype_ref(reference) {
             return (
                 crate::cpp_supertypes::match_cpp_supertype(reference, context),
+                None,
+            );
+        }
+        // A Dart member read (`x.area`) links the getter the receiver's type
+        // reaches, as a call, or nothing: never a guess by name (upstream
+        // #2338).
+        if crate::dart_members::is_dart_member_read(reference) {
+            return (
+                crate::dart_members::match_dart_member_read(reference, context),
                 None,
             );
         }
@@ -2839,6 +2856,13 @@ impl ReferenceResolver {
             .iter()
             .map(|reference| {
                 let mut kind = reference.original.reference_kind;
+
+                // A Dart member read runs the getter it links (upstream #2338's
+                // `edgeKind: 'calls'`): `calls` is what callers, impact and
+                // flows follow.
+                if crate::dart_members::is_dart_member_read(&reference.original) {
+                    kind = EdgeKind::Calls;
+                }
 
                 // Promote extends → implements (index.ts:756-764).
                 if kind == EdgeKind::Extends {

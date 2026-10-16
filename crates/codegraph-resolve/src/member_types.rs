@@ -30,6 +30,14 @@ pub fn is_member_typed_language(language: Language) -> bool {
     )
 }
 
+/// The languages whose files record a member surface row: the member-typed
+/// ones, and Dart, whose member reads type a receiver by the fields of the
+/// class around it and of what that class extends (W4-DART-03, upstream
+/// #2338's `inferMemberReceiverType`).
+pub fn has_member_surface(language: Language) -> bool {
+    is_member_typed_language(language) || language == Language::Dart
+}
+
 /// Upstream `MEMBER_CLASS_KINDS` (`record` has no kind of its own here).
 pub fn is_member_class_kind(kind: NodeKind) -> bool {
     matches!(
@@ -437,8 +445,22 @@ fn class_member_type(class: &Node, name: &str, context: &dyn ResolutionContext) 
     if let Some(hit) = memo_get(&tables.member_types, &key) {
         return hit;
     }
+    let found = member_type_in_lines(&class_member_lines(class, context), name, class.language);
+    memo_set(&tables.member_types, key, found.clone());
+    found
+}
+
+/// The type the member-level `lines` of a class of `language` declare a
+/// member `name` with ([`class_member_type`] over lines read once): the first
+/// line whose declaration of `name` names a type, outside a member's
+/// parameter list.
+pub fn member_type_in_lines(
+    lines: &[(String, usize)],
+    name: &str,
+    language: Language,
+) -> Option<String> {
     let r = regex::escape(name);
-    let pattern = if matches!(class.language, Language::Kotlin | Language::Swift) {
+    let pattern = if matches!(language, Language::Kotlin | Language::Swift) {
         Regex::new(&format!(
             r"(?-u:\b)(?:val|var|let)\s+{r}\s*:\s*([A-Z][A-Za-z0-9_.]*)"
         ))
@@ -447,28 +469,23 @@ fn class_member_type(class: &Node, name: &str, context: &dyn ResolutionContext) 
             r"(?:^|[\s(,])([A-Za-z_][A-Za-z0-9_.]*)\s*{TYPE_ARGS}\??\s+{r}\s*(?:[=;,)]|\{{)"
         ))
     };
-    let mut found = None;
-    if let Ok(pattern) = pattern {
-        for (text, depth) in class_member_lines(class, context).iter() {
-            if !text.contains(name) {
-                continue;
-            }
-            let Some(caps) = pattern.captures(text) else {
-                continue;
-            };
-            let at = caps.get(0).map_or(0, |m| m.start());
-            let before = &text[..at];
-            let in_parens =
-                *depth == 1 && before.matches('(').count() > before.matches(')').count();
-            let written = caps.get(1).map_or("", |m| m.as_str());
-            if !in_parens && !MEMBER_TYPE_NON_TYPES.contains(&written) {
-                found = crate::name_matcher::normalize_inferred_type_name(written);
-                break;
-            }
+    let pattern = pattern.ok()?;
+    for (text, depth) in lines {
+        if !text.contains(name) {
+            continue;
+        }
+        let Some(caps) = pattern.captures(text) else {
+            continue;
+        };
+        let at = caps.get(0).map_or(0, |m| m.start());
+        let before = &text[..at];
+        let in_parens = *depth == 1 && before.matches('(').count() > before.matches(')').count();
+        let written = caps.get(1).map_or("", |m| m.as_str());
+        if !in_parens && !MEMBER_TYPE_NON_TYPES.contains(&written) {
+            return crate::name_matcher::normalize_inferred_type_name(written);
         }
     }
-    memo_set(&tables.member_types, key, found.clone());
-    found
+    None
 }
 
 /// A class's own member-declaration lines with their brace depth: those at
@@ -628,6 +645,28 @@ pub struct MemberClass {
     pub qualified_name: String,
     pub supers: Vec<String>,
     pub digest: String,
+    /// A Dart class's digest of its head and type parameters alone, so a sync
+    /// tells a change of its members from one of its head (W4-DART-03).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub head: String,
+    /// A Dart class's member-level lines, `<depth>\t<text>`, which the walk
+    /// reads a member's type from: a sync compares the types of the members
+    /// before and after.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lines: Vec<String>,
+}
+
+impl MemberClass {
+    /// [`Self::lines`] as [`member_type_in_lines`] reads them.
+    pub fn member_lines(&self) -> Vec<(String, usize)> {
+        self.lines
+            .iter()
+            .filter_map(|line| {
+                let (depth, text) = line.split_once('\t')?;
+                Some((text.to_string(), depth.parse().ok()?))
+            })
+            .collect()
+    }
 }
 
 /// What other files' member walks (W4-CS-03, upstream #2171) read of one C#,
@@ -645,9 +684,7 @@ impl MemberSurface {
         let facts = crate::source_facts::SourceFacts::new(Arc::from(source));
         let mut ordered: Vec<&Node> = nodes
             .iter()
-            .filter(|node| {
-                is_member_typed_language(node.language) && is_member_class_kind(node.kind)
-            })
+            .filter(|node| has_member_surface(node.language) && is_member_class_kind(node.kind))
             .collect();
         ordered.sort_by(|a, b| {
             (a.start_line, a.start_column, &a.id).cmp(&(b.start_line, b.start_column, &b.id))
@@ -656,26 +693,42 @@ impl MemberSurface {
             .into_iter()
             .map(|node| {
                 let mut read = String::new();
-                for (text, depth) in member_lines_of(&facts, node) {
+                let member_lines = member_lines_of(&facts, node);
+                for (text, depth) in &member_lines {
                     read.push_str(&format!("{depth}\t{text}\n"));
                 }
-                read.push_str("\n--head--\n");
+                let mut head_read = String::from("\n--head--\n");
                 let start = usize::try_from(node.start_line)
                     .unwrap_or(1)
                     .saturating_sub(1);
                 let end = (start + 9).min(facts.line_count());
                 if start < end {
                     let head = facts.join_lines(start, end, " ");
-                    read.push_str(head.split('{').next().unwrap_or_default());
+                    head_read.push_str(head.split('{').next().unwrap_or_default());
                 }
-                read.push_str("\n--parameters--\n");
-                read.push_str(&class_type_parameters_in(&facts, node).join(","));
+                head_read.push_str("\n--parameters--\n");
+                head_read.push_str(&class_type_parameters_in(&facts, node).join(","));
+                read.push_str(&head_read);
                 let digest = codegraph_core::node_id::hash_content(&read);
+                let dart = node.language == Language::Dart;
                 MemberClass {
                     name: node.name.clone(),
                     qualified_name: node.qualified_name.clone(),
                     supers: crate::class_heads::class_head_supertypes_in(&facts, node),
                     digest: digest[..16].to_string(),
+                    head: if dart {
+                        codegraph_core::node_id::hash_content(&head_read)[..16].to_string()
+                    } else {
+                        String::new()
+                    },
+                    lines: if dart {
+                        member_lines
+                            .iter()
+                            .map(|(text, depth)| format!("{depth}\t{text}"))
+                            .collect()
+                    } else {
+                        Vec::new()
+                    },
                 }
             })
             .collect();

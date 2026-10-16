@@ -30,7 +30,7 @@ use std::path::Path;
 
 use anyhow::Result;
 use codegraph_core::source_file::{SourceText, read_source_file};
-use codegraph_core::types::{Language, Node};
+use codegraph_core::types::{Language, Node, NodeKind};
 use codegraph_resolve::dart_scope::{
     HEAD_ROW_KEY_PREFIX, HIERARCHY_LIMIT, HeadRow, head_row_key, member_owner,
 };
@@ -105,12 +105,43 @@ fn read_row(store: &Store, path: &str) -> Result<Option<HeadRow>> {
 struct Change {
     old_row: Option<HeadRow>,
     new_row: Option<HeadRow>,
+    /// The members the file declared before the change, by qualified name,
+    /// kind and signature (W4-DART-03).
+    old_members: BTreeSet<MemberKey>,
+}
+
+/// A Dart member as a sync tells a new one from one that moved: its
+/// qualified name, kind and signature (a method becoming a getter drops its
+/// parameter list).
+type MemberKey = (String, &'static str, Option<String>);
+
+/// The members among `nodes` whose names a member read, a typed call or a
+/// call through a type waits for: methods and constants a type owns.
+fn member_keys(nodes: &[Node]) -> BTreeSet<MemberKey> {
+    nodes
+        .iter()
+        .filter(|node| {
+            node.language == Language::Dart
+                && matches!(node.kind, NodeKind::Method | NodeKind::Constant)
+                && member_owner(&node.qualified_name).is_some()
+        })
+        .map(|node| {
+            (
+                node.qualified_name.clone(),
+                node.kind.as_str(),
+                node.signature.clone(),
+            )
+        })
+        .collect()
 }
 
 /// What a sync's changed files held for the Dart lane.
 #[derive(Debug, Default)]
 pub(crate) struct DartChanges {
     changes: BTreeMap<String, Change>,
+    /// The files whose edges reached a type of a changed file whose head
+    /// moved or went, read before the change replaced its nodes.
+    mentions: BTreeSet<String>,
 }
 
 impl DartChanges {
@@ -127,15 +158,31 @@ impl DartChanges {
         if old_row.is_none() && new_row.is_none() {
             return Ok(());
         }
+        // The edges into the old declarations of a type whose head moves or
+        // goes, while they are still there (W4-DART-03).
+        let (old, new_declared) = (
+            declared_by_name(old_row.as_ref()),
+            declared_by_name(new_row.as_ref()),
+        );
+        let moved: Vec<String> = old
+            .iter()
+            .filter(|(name, entries)| new_declared.get(*name) != Some(*entries))
+            .map(|(name, _)| (*name).to_string())
+            .collect();
+        if !moved.is_empty() {
+            self.mentions
+                .extend(store.source_files_of_edges_to_named_targets(&moved)?);
+        }
         // A file changed twice in one sync keeps what it held before the
         // first change.
-        let change = self
-            .changes
-            .entry(path.to_string())
-            .or_insert_with(|| Change {
+        let change = match self.changes.entry(path.to_string()) {
+            std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::btree_map::Entry::Vacant(entry) => entry.insert(Change {
                 old_row,
+                old_members: member_keys(&store.nodes_by_file_path(path)?),
                 ..Change::default()
-            });
+            }),
+        };
         change.new_row = new_row;
         Ok(())
     }
@@ -511,6 +558,327 @@ pub(crate) fn member_names_through(
     Ok(names)
 }
 
+/// The references in unchanged Dart files that a typed receiver may now
+/// resolve differently through the lineage of a type whose head moved
+/// (W4-DART-03), at their sites: a member read or a call through a receiver
+/// typed `U` reaches a member of `U`'s lineage (upstream #2338's
+/// `dartMemberOf`, and `resolve_method_on_type` before it). When `U` is at or
+/// below a non-extension type whose supertypes changed, came or went, a type
+/// of that lineage can come into it, leave it, or move in the ranking only as
+/// its distance from the changed type changed (past the resolver's walk
+/// limit, the whole ancestry counts), and only a member of such a type, or
+/// of an extension `on` one, can change what the receiver reaches. A
+/// receiver is typed by a declaration its file writes (`U x`, `x = U(…)`,
+/// `U.name`), which references `U`, or by a field of the class around it or
+/// of a class that one extends, whose file references `U`: so, in the files
+/// referencing such a type (through an edge, before the change or after it,
+/// or a reference left unresolved, by its name or through it as a receiver)
+/// and in the files declaring a type below one such a file declares, the
+/// references written with a receiver to such a member's name, parked or
+/// resolved, are retried. An extension's head reaches its members' calls by
+/// their names, in [`dart_refresh`].
+pub(crate) fn typed_receiver_sites(
+    store: &Store,
+    changes: &DartChanges,
+    reindexed: &HashSet<String>,
+    removed: &BTreeSet<String>,
+) -> Result<Vec<FileReferenceSite>> {
+    let unchanged = |path: &str| !reindexed.contains(path) && !removed.contains(path);
+    let seeds: BTreeSet<String> = seeds(changes)
+        .into_iter()
+        .filter(|seed| {
+            changes.changes.values().any(|change| {
+                [&change.old_row, &change.new_row].into_iter().any(|row| {
+                    row.iter()
+                        .flat_map(|row| &row.entries)
+                        .any(|entry| entry.name == *seed && !entry.extension)
+                })
+            })
+        })
+        .collect();
+    if seeds.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut stored: Vec<(String, HeadRow)> = Vec::new();
+    for (key, value) in store.project_metadata_with_prefix(HEAD_ROW_KEY_PREFIX)? {
+        let Some(path) = key.strip_prefix(HEAD_ROW_KEY_PREFIX) else {
+            continue;
+        };
+        if changes.changes.contains_key(path) {
+            continue;
+        }
+        // An unreadable row is the bootstrap's to rebuild.
+        if let Some(row) = HeadRow::decode(&value) {
+            stored.push((path.to_string(), row));
+        }
+    }
+    let rows_with = |old: bool| {
+        stored.iter().map(|(path, row)| (path.as_str(), row)).chain(
+            changes.changes.iter().filter_map(move |(path, change)| {
+                let row = if old {
+                    &change.old_row
+                } else {
+                    &change.new_row
+                };
+                row.as_ref().map(|row| (path.as_str(), row))
+            }),
+        )
+    };
+    let (up_before, up_after) = (
+        links(rows_with(true).map(|(_, row)| row)),
+        links(rows_with(false).map(|(_, row)| row)),
+    );
+    let (down_before, down_after) = (
+        down_links(rows_with(true).map(|(_, row)| row)),
+        down_links(rows_with(false).map(|(_, row)| row)),
+    );
+    // The types whose distance from a seed changed, and a seed that came or
+    // went itself: its own members came or went with it.
+    let declared = |old: bool| -> BTreeMap<String, usize> {
+        let mut out: BTreeMap<String, usize> = BTreeMap::new();
+        for (_, row) in rows_with(old) {
+            for entry in &row.entries {
+                *out.entry(entry.name.clone()).or_default() += 1;
+            }
+        }
+        out
+    };
+    let (declared_before, declared_after) = (declared(true), declared(false));
+    let mut moved: BTreeSet<String> = BTreeSet::new();
+    let mut typed: BTreeSet<String> = BTreeSet::new();
+    for seed in &seeds {
+        if declared_before.get(seed) != declared_after.get(seed) {
+            moved.insert(seed.clone());
+        }
+        let (from_before, from_after) = (depths(&up_before, seed), depths(&up_after, seed));
+        for name in from_before.keys().chain(from_after.keys()) {
+            if from_before.get(name) != from_after.get(name) {
+                moved.insert(name.clone());
+            }
+        }
+        let mut below = closure(&down_before, seed);
+        below.extend(closure(&down_after, seed));
+        for name in &below {
+            let (reach_before, reach_after) = (closure(&up_before, name), closure(&up_after, name));
+            if reach_before.len() >= HIERARCHY_LIMIT || reach_after.len() >= HIERARCHY_LIMIT {
+                moved.extend(reach_before);
+                moved.extend(reach_after);
+            }
+        }
+        typed.extend(below);
+    }
+    // Their members and the members of the extensions on one of them.
+    let mut owners = moved.clone();
+    owners.extend(
+        rows_with(true)
+            .chain(rows_with(false))
+            .flat_map(|(_, row)| &row.entries)
+            .filter(|entry| entry.extension && entry.supers.iter().any(|sup| moved.contains(sup)))
+            .map(|entry| entry.name.clone()),
+    );
+    let declaring: BTreeSet<&str> = rows_with(false)
+        .filter(|(_, row)| row.entries.iter().any(|entry| owners.contains(&entry.name)))
+        .map(|(path, _)| path)
+        .collect();
+    let mut members: BTreeSet<String> = BTreeSet::new();
+    for path in declaring {
+        for node in store.nodes_by_file_path(path)? {
+            if node.language == Language::Dart
+                && codegraph_resolve::dart_scope::is_dart_member(&node)
+                && member_owner(&node.qualified_name).is_some_and(|owner| owners.contains(owner))
+            {
+                members.insert(node.name);
+            }
+        }
+    }
+    if members.is_empty() {
+        return Ok(Vec::new());
+    }
+    // The files a receiver typed by one of `typed` can be written in.
+    let names: Vec<String> = typed.iter().cloned().collect();
+    let mut referencing: BTreeSet<String> = changes.mentions.clone();
+    referencing.extend(store.source_files_of_edges_to_named_targets(&names)?);
+    referencing.extend(
+        store
+            .unresolved_refs_by_names(&names)?
+            .into_iter()
+            .filter(|reference| reference.language == Language::Dart)
+            .map(|reference| reference.file_path),
+    );
+    // A call through the type (`U.make()`) names it only as its receiver.
+    referencing.extend(
+        store
+            .unresolved_refs_of_language_through(Language::Dart, &names)?
+            .into_iter()
+            .map(|reference| reference.file_path),
+    );
+    // The types the referencing files declare, and every type below one.
+    let mut below: BTreeSet<String> = BTreeSet::new();
+    for (path, row) in rows_with(false) {
+        if referencing.contains(path) {
+            for entry in &row.entries {
+                below.extend(closure(&down_after, &entry.name));
+            }
+        }
+    }
+    for (path, row) in rows_with(false) {
+        if row.entries.iter().any(|entry| below.contains(&entry.name)) {
+            referencing.insert(path.to_string());
+        }
+    }
+    referencing.retain(|path| unchanged(path));
+    if referencing.is_empty() {
+        return Ok(Vec::new());
+    }
+    let members: Vec<String> = members.into_iter().collect();
+    let mut sites: BTreeSet<FileReferenceSite> = BTreeSet::new();
+    for reference in store.unresolved_refs_of_language_by_members(Language::Dart, &members)? {
+        if referencing.contains(&reference.file_path) {
+            sites.insert(FileReferenceSite {
+                file_path: reference.file_path,
+                site: Some(ReferenceSite {
+                    from_node_id: reference.from_node_id,
+                    line: reference.line,
+                    col: reference.col,
+                }),
+            });
+        }
+    }
+    for site in store
+        .reference_sites_of_edges_to_named_targets(&members)?
+        .into_iter()
+        .chain(store.reference_sites_of_same_file_edges_to_named_targets(&members)?)
+    {
+        if referencing.contains(&site.file_path) {
+            sites.insert(site);
+        }
+    }
+    Ok(sites.into_iter().collect())
+}
+
+/// The unresolved Dart references in unchanged files that a member a changed
+/// file newly declares may now satisfy, at their sites (W4-DART-03): a member
+/// read waits for a getter (upstream #2338), a call on a typed receiver for a
+/// member an extension adds, and a call through a type for its static
+/// constant (#2367). They wait by the member's name, which the shared tail
+/// lookup caps at 500 per tail, so the parked Dart ones to such a member's
+/// name are retried here, however many there are. A member is new when no
+/// declaration of the file had its qualified name, kind and signature before
+/// (one that only moved down makes nothing reachable). A new type's members
+/// are left to [`typed_receiver_files`]: only a file naming the type can type
+/// a receiver by it.
+pub(crate) fn new_member_sites(
+    store: &Store,
+    project_root: &Path,
+    max_file_size: u64,
+    changes: &DartChanges,
+    reindexed: &HashSet<String>,
+    removed: &BTreeSet<String>,
+) -> Result<Vec<FileReferenceSite>> {
+    let unchanged = |path: &str| !reindexed.contains(path) && !removed.contains(path);
+    let mut existing: Option<BTreeSet<String>> = None;
+    let mut names: BTreeSet<String> = BTreeSet::new();
+    for (path, change) in &changes.changes {
+        let Some(row) = &change.new_row else {
+            continue;
+        };
+        let nodes = store.nodes_by_file_path(path)?;
+        let added: Vec<&Node> = nodes
+            .iter()
+            .filter(|node| {
+                member_keys(std::slice::from_ref(node))
+                    .iter()
+                    .any(|key| !change.old_members.contains(key))
+            })
+            .collect();
+        if added.is_empty() {
+            continue;
+        }
+        let extensions: BTreeSet<&str> = row
+            .entries
+            .iter()
+            .filter(|entry| entry.extension)
+            .map(|entry| entry.name.as_str())
+            .collect();
+        // The types declared before this sync, anywhere.
+        let existing = match &mut existing {
+            Some(existing) => existing,
+            slot => {
+                let mut names: BTreeSet<String> = BTreeSet::new();
+                for (key, value) in store.project_metadata_with_prefix(HEAD_ROW_KEY_PREFIX)? {
+                    let changed = key
+                        .strip_prefix(HEAD_ROW_KEY_PREFIX)
+                        .is_some_and(|path| changes.changes.contains_key(path));
+                    if !changed && let Some(row) = HeadRow::decode(&value) {
+                        names.extend(row.entries.into_iter().map(|entry| entry.name));
+                    }
+                }
+                for change in changes.changes.values() {
+                    names.extend(
+                        change
+                            .old_row
+                            .iter()
+                            .flat_map(|row| &row.entries)
+                            .map(|entry| entry.name.clone()),
+                    );
+                }
+                slot.insert(names)
+            }
+        };
+        let lines: Vec<String> = read_text(project_root, path, max_file_size)
+            .map(|text| text.split('\n').map(str::to_string).collect())
+            .unwrap_or_default();
+        for node in added {
+            let Some(owner) = member_owner(&node.qualified_name) else {
+                continue;
+            };
+            let extension = extensions.contains(owner);
+            if !extension && !existing.contains(owner) {
+                continue;
+            }
+            let member = node.kind == NodeKind::Constant || extension || is_getter_at(&lines, node);
+            if member {
+                names.insert(node.name.clone());
+            }
+        }
+    }
+    if names.is_empty() {
+        return Ok(Vec::new());
+    }
+    let members: Vec<String> = names.into_iter().collect();
+    Ok(store
+        .unresolved_refs_of_language_by_members(Language::Dart, &members)?
+        .into_iter()
+        .filter(|reference| unchanged(&reference.file_path))
+        .map(|reference| FileReferenceSite {
+            file_path: reference.file_path,
+            site: Some(ReferenceSite {
+                from_node_id: reference.from_node_id,
+                line: reference.line,
+                col: reference.col,
+            }),
+        })
+        .collect())
+}
+
+/// Whether `node` is declared a getter in the file whose lines are `lines`,
+/// as the resolver reads it ([`codegraph_resolve::dart_members::declares_getter`]).
+fn is_getter_at(lines: &[String], node: &Node) -> bool {
+    let at = |line: i64| {
+        usize::try_from(line - 1)
+            .ok()
+            .and_then(|index| lines.get(index))
+            .map_or("", |text| text.trim_end_matches('\r'))
+    };
+    let from = usize::try_from(node.start_column.max(0)).unwrap_or(0);
+    let head = format!(
+        "{} {}",
+        at(node.start_line).get(from..).unwrap_or(""),
+        at(node.start_line + 1)
+    );
+    codegraph_resolve::dart_members::declares_getter(&head, &node.name)
+}
+
 /// Every Dart file re-resolves and every row is rebuilt from disk (a changed
 /// file's from its new text).
 fn rebuild(
@@ -566,6 +934,7 @@ mod tests {
             Change {
                 old_row: old.map(|entries| HeadRow { entries }),
                 new_row: new.map(|entries| HeadRow { entries }),
+                ..Change::default()
             },
         );
         changes

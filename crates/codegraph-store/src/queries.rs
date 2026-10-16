@@ -1204,6 +1204,62 @@ impl Store {
         Ok(out.into_values().collect())
     }
 
+    /// The unresolved references written in `language` through one of
+    /// `receivers`, named `<receiver>.<…>` (`Provider.autoDispose`), in id
+    /// order: a sync retries those whose receiver's type came or went
+    /// (W4-DART-03), which the tail lookup never names.
+    pub fn unresolved_refs_of_language_through(
+        &self,
+        language: Language,
+        receivers: &[String],
+    ) -> rusqlite::Result<Vec<UnresolvedRef>> {
+        let mut unique: Vec<&str> = receivers
+            .iter()
+            .map(String::as_str)
+            .filter(|receiver| !receiver.is_empty())
+            .collect();
+        unique.sort_unstable();
+        unique.dedup();
+        let mut out: BTreeMap<i64, UnresolvedRef> = BTreeMap::new();
+        for chunk in unique.chunks(SQLITE_PARAM_CHUNK_SIZE - 1) {
+            let clauses = (0..chunk.len())
+                .map(|index| format!("reference_name GLOB ?{}", index + 2))
+                .collect::<Vec<_>>()
+                .join(" OR ");
+            let sql = format!(
+                "SELECT * FROM unresolved_refs WHERE language = ?1 AND ({clauses}) ORDER BY id"
+            );
+            // `*`, `?` and `[` are GLOB's own; a bracket makes each literal.
+            let patterns: Vec<String> = chunk
+                .iter()
+                .map(|receiver| {
+                    let mut escaped = String::new();
+                    for c in receiver.chars() {
+                        match c {
+                            '*' => escaped.push_str("[*]"),
+                            '?' => escaped.push_str("[?]"),
+                            '[' => escaped.push_str("[[]"),
+                            _ => escaped.push(c),
+                        }
+                    }
+                    escaped.push_str(".*");
+                    escaped
+                })
+                .collect();
+            let language = language.as_str();
+            let mut params: Vec<&dyn ToSql> = vec![&language];
+            params.extend(patterns.iter().map(|p| p as &dyn ToSql));
+            let mut stmt = self.conn.prepare(&sql)?;
+            for reference in stmt.query_map(params.as_slice(), row_to_unresolved_ref)? {
+                let reference = reference?;
+                if let Some(id) = reference.id {
+                    out.insert(id, reference);
+                }
+            }
+        }
+        Ok(out.into_values().collect())
+    }
+
     /// The unresolved references written in one of `languages`, whose names
     /// ignore case, named like one of `names` in any ASCII case (SQLite's
     /// `lower`, as the case-insensitive node lookup folds), in id order: a

@@ -3183,6 +3183,25 @@ pub(crate) fn resolve_method_on_type(
                 }
             }
         }
+        // A Dart extension's member: no declaration of the type has it, so an
+        // extension `on` the type (or a supertype) supplies it — `s.shout()`
+        // on an enum through `extension ShapeInfo on Shape` (upstream #2338).
+        if reference.language == Language::Dart
+            && depth == 0
+            && let Some(member) = crate::dart_members::dart_extension_member_of(
+                type_name,
+                method_name,
+                reference,
+                context,
+            )
+        {
+            return Some(ResolvedRef {
+                original: reference.clone(),
+                target_node_id: member.id.clone(),
+                confidence,
+                resolved_by,
+            });
+        }
         return None;
     }
 
@@ -5574,6 +5593,20 @@ pub fn match_method_call(
             if class_node.language != reference.language {
                 continue;
             }
+            // A Dart call through a type's static constant invokes the value
+            // it holds, not another builder's same-named method (upstream
+            // #2367).
+            if reference.language == Language::Dart
+                && let Some(holder) =
+                    crate::dart_members::dart_static_constant_of(&class_node, &method_name, context)
+            {
+                return Some(ResolvedRef {
+                    original: reference.clone(),
+                    target_node_id: holder.id.clone(),
+                    confidence: 0.85,
+                    resolved_by: ResolvedBy::QualifiedName,
+                });
+            }
             if let Some(method_node) = find_method_in_class(&class_node, &method_name, context) {
                 return Some(ResolvedRef {
                     original: reference.clone(),
@@ -6492,7 +6525,7 @@ fn insert_camel_spaces(s: &str) -> String {
 
 /// Compute directory proximity between two file paths (`computePathProximity`,
 /// `name-matcher.ts:953-968`).
-fn compute_path_proximity(file_path1: &str, file_path2: &str) -> f64 {
+pub(crate) fn compute_path_proximity(file_path1: &str, file_path2: &str) -> f64 {
     let dir1: Vec<&str> = drop_last(file_path1);
     let dir2: Vec<&str> = drop_last(file_path2);
     let mut shared = 0usize;

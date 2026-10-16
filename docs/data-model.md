@@ -263,15 +263,17 @@ version re-resolves every C# file and rebuilds the rows. Neither is a canonical
 surface.
 
 Member surface rows record what a C#, Java, Kotlin or Swift call through a declared
-member reads of a file's classes: `member_surface:<path>` holds the JSON
-`{"classes": [{"name", "qualified_name", "supers", "digest"}]}`, one entry per
-class, struct, interface and enum in node order, with the supertypes its head
-names and a digest of its member-level lines, its head (nine lines, cut at the
-first `{`) and the type parameters it declares. A file with no such declaration
-has no row. They are written, withdrawn and checked like the head rows under
-`member_surface_version` (2); a sync that finds it missing or at another
-version re-resolves every C#, Java, Kotlin and Swift file and rebuilds the
-rows.
+member, or a Dart member read, reads of a file's classes: `member_surface:<path>`
+holds the JSON `{"classes": [{"name", "qualified_name", "supers", "digest"}]}`,
+one entry per class, struct, interface and enum in node order, with the
+supertypes its head names and a digest of its member-level lines, its head (nine
+lines, cut at the first `{`) and the type parameters it declares. A Dart entry
+also holds `head`, the digest of its head and type parameters alone, and
+`lines`, its member-level lines as `<depth>\t<text>`, so a sync can read the
+type a member had before and the members its ancestry declared. A file with no such declaration has no row. They are
+written, withdrawn and checked like the head rows under `member_surface_version`
+(3); a sync that finds it missing or at another version re-resolves every C#,
+Java, Kotlin, Swift and Dart file and rebuilds the rows.
 Neither is a canonical surface.
 
 Ruby head rows record what a bare Ruby call reads of a file's classes and

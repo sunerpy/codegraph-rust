@@ -30,6 +30,7 @@ mod csharp_extensions;
 mod csharp_scopes;
 pub mod csharp_types;
 pub mod dart_libraries;
+pub mod dart_members;
 pub mod dart_scope;
 pub mod destructured_calls;
 pub mod framework; // the FrameworkResolver extension point

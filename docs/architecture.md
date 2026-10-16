@@ -389,12 +389,17 @@ around it and their bases, through heads read by name; and a C# type
 that keeps its node while its owner turns from a type into a namespace of the
 same name, or back, has its name touched for the name lane; the
 `csharp_surface_version` marker is withdrawn and restored with the others; a
-C#, Java, Kotlin or Swift file whose member surface row moved (a class's head, type
+C#, Java, Kotlin, Swift or Dart file whose member surface row moved (a class's head, type
 parameters or member-level lines changed, by a digest, or a class came or went)
 re-resolves, whole, the unchanged files declaring a class of a name the changed
 classes reach (closing over every head naming a reached name), since a call
 through an inherited member reads its type from the classes it inherits by
-name; a method body edit changes no row; the `member_surface_version` marker is
+name; a Dart class that neither came nor went narrows that: when its head,
+supertypes and qualified name stayed, the types of its members are read from
+its member lines before and after, and when its head changed, every member a
+class of its ancestry declares, before the change or after it, counts; an
+unchanged file below it then re-resolves whole only when it writes such a
+member as a receiver (`shape.` or `shape?.`); a method body edit changes no row; the `member_surface_version` marker is
 withdrawn and restored with the others; a Ruby file whose head row moved (a
 class or module came or went, or its superclass or mixins changed) re-resolves,
 whole, the unchanged files declaring a class or module the changed qualified
@@ -462,7 +467,16 @@ other supertypes, or sits `on` another type) touches the names of the members of
 changed type's ancestry, before the change and after it, and of every extension `on` one of those,
 and retries at its site every parked Dart call written with a receiver to a member of such a name,
 however many there are, since a bare call's class hierarchy and an extension's owner are read from
-the heads' text; the `dart_heads_version` marker is withdrawn and restored with the others, and a
+the heads' text; a non-extension type whose head moved, came or went has the unchanged Dart files
+that reference it or a type below it (an edge to such a type before the change or after it, or a
+reference left unresolved, by its name or through it as a receiver), and the files declaring a
+type below one such a file declares, re-resolve whole, since a member read or a call on a receiver
+typed by it reaches members through its lineage and the receiver is typed by what its file writes
+or by a field of a class it extends; a getter, an extension's member or a type's constant that a
+changed file newly declares (no declaration of the file had its qualified name, kind and signature
+before) on a type that existed before, or on an extension, retries at its site every parked Dart
+reference written with a receiver to its name, however many there are, since a member read, a
+typed call and a call through a type wait for one by name; the `dart_heads_version` marker is withdrawn and restored with the others, and a
 sync that finds it missing, or a row it cannot read, withdraws it before changing anything and
 re-resolves every Dart file;
 a Dart file whose library row moved, or a Dart file added or removed, has the sync read the Dart
