@@ -1035,6 +1035,13 @@ matrix! {
     dart_chain_link_reads_a_field_its_type_gains_through_a_base,
     dart_chain_link_reaches_an_extension_on_a_base_its_type_gains,
     dart_chain_link_reaches_an_extension_on_any_type_once_its_type_comes,
+    dart_parameter_call_links_nothing_when_a_namesake_appears,
+    dart_handler_parameter_call_links_nothing_when_its_base_gains_the_method,
+    dart_local_function_call_keeps_its_local_when_a_namesake_appears,
+    dart_call_through_a_type_reaches_a_const_constructor_it_gains,
+    dart_bare_call_leaves_a_method_that_becomes_a_constructor,
+    dart_bare_call_reaches_a_constructor_that_becomes_a_method,
+    dart_call_through_a_type_reaches_a_factory_added_below_a_getter_of_its_name,
     #[ignore = "W5-06: a pubspec.yaml change does not re-resolve the project's Dart files"]
     dart_pubspec_rename_strands_a_package_import,
     #[ignore = "W5-06: a pubspec.yaml change does not re-resolve the project's Dart files"]

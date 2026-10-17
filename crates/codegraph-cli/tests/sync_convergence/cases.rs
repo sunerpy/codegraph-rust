@@ -9849,6 +9849,141 @@ pub fn dart_call_through_a_type_reaches_the_static_constant_it_gains() -> Case {
         .edge_after("constant p", "calls", "constant Provider::autoDispose")
 }
 
+/// A namesake appears for a call a parameter covers (upstream #2379): the
+/// parked call stays unlinked, while the same call outside the parameter's
+/// function reaches it.
+pub fn dart_parameter_call_links_nothing_when_a_namesake_appears() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Dart])
+        .file("pubspec.yaml", "name: app\n")
+        .file(
+            "lib/run.dart",
+            "import 'create.dart';\n\nvoid run(void Function() create) {\n  create();\n}\n\nvoid later() {\n  create();\n}\n",
+        )
+        .write("lib/create.dart", "void create() {}\n")
+        .edge_after("function later", "calls", "function create")
+        .no_edge_after("function run", "calls", "function create")
+}
+
+/// The same for a bloc handler's `emit` parameter, the method it would
+/// otherwise reach arriving in its base class's file.
+pub fn dart_handler_parameter_call_links_nothing_when_its_base_gains_the_method() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Dart])
+        .file("pubspec.yaml", "name: app\n")
+        .file("lib/bloc.dart", "class Bloc<S> {\n  void on(void Function(Object event, Object emit) handler) {}\n}\n")
+        .file(
+            "lib/counter.dart",
+            "import 'bloc.dart';\n\nclass CounterBloc extends Bloc<int> {\n  void onReset(String event, Object emit) {\n    emit(0);\n  }\n\n  void bump() => emit(2);\n}\n",
+        )
+        .write(
+            "lib/bloc.dart",
+            "class Bloc<S> {\n  void on(void Function(Object event, Object emit) handler) {}\n\n  void emit(S state) {}\n}\n",
+        )
+        .edge_after("method CounterBloc::bump", "calls", "method Bloc::emit")
+        .no_edge_after("method CounterBloc::onReset", "calls", "method Bloc::emit")
+}
+
+/// A local function is nearer than a namesake an imported file comes to
+/// declare, and the parameter it shadows outside its block covers the call
+/// there (upstream #2379; W4-DART-03c, a W4-DART-01 regression).
+pub fn dart_local_function_call_keeps_its_local_when_a_namesake_appears() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Dart])
+        .file("pubspec.yaml", "name: app\n")
+        .file(
+            "lib/wire.dart",
+            "import 'make.dart';\n\nint outer(int Function() make) {\n  int helper() {\n    int make() => 2;\n    return make();\n  }\n\n  return helper() + make();\n}\n",
+        )
+        .write("lib/make.dart", "int make() => 1;\n")
+        .edge_throughout("function outer::helper", "calls", "function outer::make")
+        .edge_throughout("function outer", "calls", "function outer::helper")
+        .no_edge_after("function outer", "calls", "function make")
+}
+
+/// A type gains the named `const` constructor a call through it names
+/// (upstream #2380): the call reaches it, never another type's member of
+/// that name.
+pub fn dart_call_through_a_type_reaches_a_const_constructor_it_gains() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Dart])
+        .file("pubspec.yaml", "name: app\n")
+        .file("lib/provider.dart", "class BlocProvider {\n  const BlocProvider();\n}\n")
+        .file("lib/other.dart", "class RepositoryProvider {\n  RepositoryProvider.value();\n}\n")
+        .file(
+            "lib/use.dart",
+            "import 'provider.dart';\nimport 'other.dart';\n\nfinal p = BlocProvider.value();\nfinal q = BlocProvider<int>.value();\n",
+        )
+        .write(
+            "lib/provider.dart",
+            "class BlocProvider {\n  const BlocProvider();\n\n  const BlocProvider.value();\n}\n",
+        )
+        .edge_after("constant p", "calls", "method BlocProvider::value")
+        .edge_after("constant q", "calls", "method BlocProvider::value")
+        .no_edge_after("constant p", "calls", "method RepositoryProvider::value")
+}
+
+/// A static method turns into a named constructor on the same line, so its
+/// node keeps its id: a bare call in a subclass leaves it, as a constructor
+/// is reached only through its class (upstream #2380).
+pub fn dart_bare_call_leaves_a_method_that_becomes_a_constructor() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Dart])
+        .file("pubspec.yaml", "name: app\n")
+        .file(
+            "lib/base.dart",
+            "class Base {\n  static Base value() => Base();\n}\n",
+        )
+        .file(
+            "lib/sub.dart",
+            "import 'base.dart';\n\nclass Sub extends Base {\n  Object m() => value();\n}\n",
+        )
+        .write("lib/base.dart", "class Base {\n  const Base.value();\n}\n")
+        .edge_before("method Sub::m", "calls", "method Base::value")
+        .no_edge_after("method Sub::m", "calls", "method Base::value")
+}
+
+/// The reverse: a named constructor turns into a static method on its line,
+/// and the bare call in the subclass reaches it.
+pub fn dart_bare_call_reaches_a_constructor_that_becomes_a_method() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Dart])
+        .file("pubspec.yaml", "name: app\n")
+        .file("lib/base.dart", "class Base {\n  const Base.value();\n}\n")
+        .file(
+            "lib/sub.dart",
+            "import 'base.dart';\n\nclass Sub extends Base {\n  Object m() => value();\n}\n",
+        )
+        .write(
+            "lib/base.dart",
+            "class Base {\n  static Base value() => Base();\n}\n",
+        )
+        .edge_after("method Sub::m", "calls", "method Base::value")
+}
+
+/// A factory comes to sit below an instance getter of its name: a call
+/// through the type reaches the factory, not the getter (upstream #2380).
+pub fn dart_call_through_a_type_reaches_a_factory_added_below_a_getter_of_its_name() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Dart])
+        .file("pubspec.yaml", "name: app\n")
+        .file(
+            "lib/async_value.dart",
+            "class AsyncValue {\n  const AsyncValue._();\n\n  Object? get error => null;\n}\n",
+        )
+        .file(
+            "lib/use.dart",
+            "import 'async_value.dart';\n\nObject fail(Object e) => AsyncValue.error(e);\n",
+        )
+        .write(
+            "lib/async_value.dart",
+            "class AsyncValue {\n  const AsyncValue._();\n\n  Object? get error => null;\n\n  const factory AsyncValue.error(Object error) = _Error;\n}\n\nclass _Error extends AsyncValue {\n  const _Error(this.error) : super._();\n\n  @override\n  final Object error;\n}\n",
+        )
+        .edge_after(
+            "function fail",
+            "calls",
+            "method AsyncValue::error @lib/async_value.dart:6",
+        )
+        .no_edge_after(
+            "function fail",
+            "calls",
+            "method AsyncValue::error @lib/async_value.dart:4",
+        )
+}
+
 /// 501 parked calls of `autoDispose` through types the project lacks.
 static AUTO_DISPOSE_CALLS: LazyLock<String> = LazyLock::new(|| {
     let mut text = String::new();

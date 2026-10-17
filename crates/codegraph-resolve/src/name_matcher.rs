@@ -496,6 +496,12 @@ pub(crate) fn is_lua_local(candidate: &Node, context: &dyn ResolutionContext) ->
         .is_some_and(|rest| !rest.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_'))
 }
 
+/// Whether a same-file function or method encloses `candidate`, found by
+/// walking out through its qualified name ([`lexical_scope_of`]).
+pub(crate) fn is_in_function_body(candidate: &Node, context: &dyn ResolutionContext) -> bool {
+    lexical_scope_of(candidate, context).is_some()
+}
+
 /// The innermost function or method BODY that scopes a declaration, walking
 /// out through its qualified name (`test_x::Request::User::has_perm` →
 /// `test_x`, upstream #2125 `lexicalScopeOf`). A method directly on a class
@@ -2684,8 +2690,17 @@ pub fn match_by_exact_name(
         // implements, or of an extension on one of those (upstream #2145).
         .filter(|n| {
             !(dart_bare
-                && crate::dart_scope::is_dart_member(n)
+                && crate::dart_scope::is_dart_type_member(n, context)
                 && !crate::dart_scope::is_dart_method_in_scope(n, reference, context))
+        })
+        // A Dart constructor is reached through its class (`Foo.named(…)`,
+        // `@Foo.named(…)`), never by its name alone: not a bare call, not the
+        // last link of a chain, not an annotation (riverpod's 210 `@internal`
+        // annotations went to its providers' `internal` constructors,
+        // upstream #2380).
+        .filter(|n| {
+            !(reference.language == Language::Dart
+                && crate::dart_members::is_dart_constructor(n, context))
         })
         // bloc's brick hook calls `info(…)` on mason's `Logger`, no enum
         // constant of bloc_lint's: a bare Dart call reaches a type's value
@@ -5224,6 +5239,21 @@ pub fn match_method_call(
         }
     }
 
+    // A Dart call through a type's name is to that type's own member, or to
+    // nothing in the project (upstream #2380): the static constant a call
+    // through the type invokes (#2367) among them.
+    if reference.language == Language::Dart
+        && is_dot_call(&reference.reference_name)
+        && let Some(own) = crate::dart_members::match_dart_type_member_call(
+            &object_or_class,
+            &method_name,
+            reference,
+            context,
+        )
+    {
+        return own;
+    }
+
     // Receiver-type inference (#1108/#1125): only for a simple `obj.method` /
     // `obj:method` (Lua) / `obj$method` (R) shape — a `Class::method` colon-call
     // is not an instance call. C++ uses its dedicated inferrer; every other
@@ -5604,20 +5634,6 @@ pub fn match_method_call(
         {
             if class_node.language != reference.language {
                 continue;
-            }
-            // A Dart call through a type's static constant invokes the value
-            // it holds, not another builder's same-named method (upstream
-            // #2367).
-            if reference.language == Language::Dart
-                && let Some(holder) =
-                    crate::dart_members::dart_static_constant_of(&class_node, &method_name, context)
-            {
-                return Some(ResolvedRef {
-                    original: reference.clone(),
-                    target_node_id: holder.id.clone(),
-                    confidence: 0.85,
-                    resolved_by: ResolvedBy::QualifiedName,
-                });
             }
             if let Some(method_node) = find_method_in_class(&class_node, &method_name, context) {
                 return Some(ResolvedRef {
@@ -6693,8 +6709,13 @@ pub fn match_fuzzy(reference: &RefView, context: &dyn ResolutionContext) -> Opti
             // A bare Dart call stays in its class hierarchy (upstream #2145).
             .filter(|n| {
                 !(dart_bare
-                    && crate::dart_scope::is_dart_member(n)
+                    && crate::dart_scope::is_dart_type_member(n, context)
                     && !crate::dart_scope::is_dart_method_in_scope(n, reference, context))
+            })
+            // A Dart constructor, only through its class (upstream #2380).
+            .filter(|n| {
+                !(reference.language == Language::Dart
+                    && crate::dart_members::is_dart_constructor(n, context))
             })
             // A receiver-less Dart name, only what its library sees (upstream
             // #2386).
@@ -8028,6 +8049,9 @@ pub fn match_function_ref(
     let mut candidates: Vec<Arc<Node>> = named
         .iter()
         .filter(|n| is_lexically_reachable(n, reference, context))
+        // A Dart constructor is torn off through its class, never by a bare
+        // name (upstream #2380).
+        .filter(|n| !crate::dart_members::is_dart_constructor(n, context))
         .cloned()
         .collect();
     if candidates.is_empty() {

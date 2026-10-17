@@ -30,9 +30,7 @@ use codegraph_core::types::{EdgeKind, Language, Node, NodeKind};
 use regex::Regex;
 
 use crate::dart_members::{dart_lineage, dart_member_of, is_dart_getter};
-use crate::dart_scope::{
-    CHAIN_LINES, in_order, is_dart_identifier, is_dart_type_kind, source_line,
-};
+use crate::dart_scope::{CHAIN_LINES, in_order, is_dart_identifier, is_dart_type_kind};
 use crate::types::{RefView, ResolutionContext, ResolvedBy, ResolvedRef};
 
 /// Lookups that hand back an instance of the one type they are given:
@@ -1243,96 +1241,11 @@ impl Typing<'_> {
         own
     }
 
-    /// The static member `name` the Dart type `type_name` itself declares, a
-    /// static method or getter, a named constructor or factory, a static
-    /// constant, an enum value, preferring the site's file, then the nearest
-    /// (upstream `dartStaticMember`). Static members are not inherited.
+    /// The static member `name` the Dart type `type_name` itself declares
+    /// ([`crate::dart_members::dart_static_member`]), preferring the site's
+    /// file.
     fn static_member(&self, type_name: &str, name: &str, site: &Site) -> Option<Arc<Node>> {
-        let owners: Vec<Arc<Node>> = self
-            .context
-            .get_nodes_by_name_shared(type_name)
-            .into_iter()
-            .filter(|node| node.language == Language::Dart && is_dart_type_kind(node.kind))
-            .collect();
-        if owners.is_empty() {
-            return None;
-        }
-        let found: Vec<Arc<Node>> = self
-            .context
-            .get_nodes_by_name_shared(name)
-            .into_iter()
-            .filter(|member| {
-                member.language == Language::Dart
-                    && matches!(
-                        member.kind,
-                        NodeKind::Method
-                            | NodeKind::Function
-                            | NodeKind::Constant
-                            | NodeKind::EnumMember
-                    )
-                    && owners.iter().any(|owner| {
-                        owner.file_path == member.file_path
-                            && member.qualified_name == format!("{}::{name}", owner.qualified_name)
-                    })
-                    && !is_setter(member, self.context)
-                    && self.is_static_member(member, type_name)
-            })
-            .collect();
-        if found.len() <= 1 {
-            return found.into_iter().next();
-        }
-        if let Some(own) = found
-            .iter()
-            .find(|member| member.file_path == site.view.file_path)
-        {
-            return Some(Arc::clone(own));
-        }
-        found.into_iter().reduce(|chosen, next| {
-            let proximity = |node: &Node| {
-                crate::name_matcher::compute_path_proximity(&site.view.file_path, &node.file_path)
-            };
-            if proximity(&next) > proximity(&chosen) {
-                next
-            } else {
-                chosen
-            }
-        })
-    }
-
-    /// Whether a member of the Dart type `owner` is reached through the type
-    /// itself: a static member, constant or enum value, or a named
-    /// constructor or factory (`factory ProviderContainer.test(…)`), not an
-    /// instance member sharing a constructor's name (upstream #2376's
-    /// `isDartStaticMember`).
-    fn is_static_member(&self, member: &Node, owner: &str) -> bool {
-        if member.is_static
-            || member.kind == NodeKind::Constant
-            || member.kind == NodeKind::EnumMember
-        {
-            return true;
-        }
-        let line = |at: i64| {
-            source_line(&member.file_path, at, self.context)
-                .map(|text| text.trim_end_matches('\r').to_string())
-                .unwrap_or_default()
-        };
-        let first = line(member.start_line);
-        let from = floor_boundary(
-            &first,
-            usize::try_from(member.start_column.max(0)).unwrap_or(0),
-        );
-        let head = format!(
-            "{} {} {}",
-            &first[from..],
-            line(member.start_line + 1),
-            line(member.start_line + 2)
-        );
-        Regex::new(&format!(
-            r"(?:^|[^A-Za-z0-9_$.]){}\s*\.\s*{}\s*[(<]",
-            regex::escape(owner),
-            regex::escape(&member.name)
-        ))
-        .is_ok_and(|named| named.is_match(&head))
+        crate::dart_members::dart_static_member(type_name, name, &site.view.file_path, self.context)
     }
 
     /// The function a bare Dart call `name(…)` means: a member of the type
@@ -1581,14 +1494,10 @@ pub(crate) fn is_setter(node: &Node, context: &dyn ResolutionContext) -> bool {
     {
         return hit;
     }
-    let line = source_line(&node.file_path, node.start_line, context).unwrap_or_default();
-    let from = floor_boundary(
-        &line,
-        usize::try_from(node.start_column.max(0)).unwrap_or(0),
-    );
+    let (head, _) = crate::dart_scope::dart_member_head(node, context);
     // The pattern writes `set` and the name; a line writing neither compiles
     // nothing.
-    let head = &line[from..];
+    let head = head.as_str();
     let setter = head.contains("set")
         && head.contains(node.name.as_str())
         && Regex::new(&format!(

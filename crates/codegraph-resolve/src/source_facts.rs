@@ -170,6 +170,7 @@ pub struct SourceFacts {
     local_declaration_scopes: Mutex<HashMap<String, Option<(i64, i64)>>>,
     csharp_namespace_scope: OnceLock<Arc<crate::csharp_types::CsharpNamespaceScope>>,
     dart_code: OnceLock<Arc<crate::dart_chains::DartCode>>,
+    dart_local_scopes: OnceLock<Arc<crate::dart_local_scope::DartLocalScopes>>,
 }
 
 impl SourceFacts {
@@ -222,6 +223,7 @@ impl SourceFacts {
             local_declaration_scopes: Mutex::new(HashMap::new()),
             csharp_namespace_scope: OnceLock::new(),
             dart_code: OnceLock::new(),
+            dart_local_scopes: OnceLock::new(),
         }
     }
 
@@ -237,6 +239,16 @@ impl SourceFacts {
             self.dart_code
                 .get_or_init(|| Arc::new(crate::dart_chains::DartCode::of(&self.source))),
         )
+    }
+
+    /// The parameters, loop variables and locals the Dart file binds, read
+    /// once (W4-DART-03c, upstream #2379 `fileScopes`).
+    pub(crate) fn dart_local_scopes(&self) -> Arc<crate::dart_local_scope::DartLocalScopes> {
+        Arc::clone(self.dart_local_scopes.get_or_init(|| {
+            Arc::new(crate::dart_local_scope::DartLocalScopes::of(
+                &self.dart_code().text,
+            ))
+        }))
     }
 
     /// Whether a Rust `use` item visible at byte `offset` names `name` or is a

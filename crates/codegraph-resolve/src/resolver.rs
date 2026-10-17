@@ -1753,6 +1753,9 @@ impl ReferenceResolver {
             context,
             &self.type_parameters,
         );
+        // A Dart call to a parameter or local calls that, never a namesake
+        // (upstream #2379 `gateDartLocal`).
+        let resolved = crate::dart_local_scope::gate_dart_local(resolved, reference, context);
         // A bare Rust name reaches only what is in scope, whichever strategy
         // chose it (upstream #2214 `gateRustScope`).
         let resolved = crate::rust_scope::gate_rust_scope(resolved, reference, context);

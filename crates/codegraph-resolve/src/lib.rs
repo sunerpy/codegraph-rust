@@ -31,6 +31,7 @@ mod csharp_scopes;
 pub mod csharp_types;
 pub mod dart_chains;
 pub mod dart_libraries;
+mod dart_local_scope;
 pub mod dart_members;
 pub mod dart_scope;
 pub mod destructured_calls;

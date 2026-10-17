@@ -30,10 +30,16 @@ impl LanguageSpec for DartSpec {
     }
 
     fn method_types(&self) -> &'static [&'static str] {
+        // `const` constructors and redirecting factories have signature kinds
+        // of their own: flutter_bloc's `const BlocProvider.value(…)` is one,
+        // and without its node a `BlocProvider.value(…)` call went to another
+        // class's `value` (upstream #2380).
         &[
             "method_signature",
             "method_declaration",
             "constructor_signature",
+            "constant_constructor_signature",
+            "redirecting_factory_constructor_signature",
         ]
     }
 
@@ -146,6 +152,9 @@ impl LanguageSpec for DartSpec {
         let params = sig
             .named_children(&mut sig.walk())
             .find(|child| child.kind() == "formal_parameter_list");
+        // KEEP-RUST: upstream skips a redirecting factory's target here (`=
+        // _Impl` is no return type); this grammar writes the target as a
+        // `type`, never a `type_identifier` of the signature (#2380).
         let ret_type = sig
             .named_children(&mut sig.walk())
             .find(|child| matches!(child.kind(), "type_identifier" | "void_type"));
@@ -225,7 +234,13 @@ impl LanguageSpec for DartSpec {
     }
 
     fn is_misparsed_function(&self, _name: &str, node: Node<'_>, source: &str) -> bool {
-        dart_ctor_info(node, source).is_some_and(|(class_name, ctor_name)| class_name == ctor_name)
+        // A `const` constructor or redirecting factory is nothing else, so one
+        // that names no enclosing type is error recovery's, and skipped
+        // (upstream #2380).
+        match dart_ctor_info(node, source) {
+            Some((class_name, ctor_name)) => class_name == ctor_name,
+            None => is_dart_bodiless_constructor(node.kind()),
+        }
     }
 
     fn extract_import(&self, node: Node<'_>, source: &str) -> Option<ImportInfo> {
@@ -481,11 +496,23 @@ fn dart_inner_signature(node: Node<'_>) -> Node<'_> {
     node
 }
 
+/// The constructors that never have a body — `const Foo.bar();` and a
+/// redirecting factory `const factory Foo.bar() = _Bar;` — each parse as a
+/// signature kind of their own, inside a `declaration` (upstream #2380
+/// `DART_BODILESS_CTORS`).
+pub(crate) fn is_dart_bodiless_constructor(kind: &str) -> bool {
+    matches!(
+        kind,
+        "constant_constructor_signature" | "redirecting_factory_constructor_signature"
+    )
+}
+
 fn dart_constructor_signature(node: Node<'_>) -> Option<Node<'_>> {
     if matches!(
         node.kind(),
         "factory_constructor_signature" | "constructor_signature"
-    ) {
+    ) || is_dart_bodiless_constructor(node.kind())
+    {
         return Some(node);
     }
     if node.kind() == "method_signature" {
@@ -526,8 +553,11 @@ fn dart_enclosing_type_name(node: Node<'_>, source: &str) -> Option<String> {
 
 fn dart_ctor_info(node: Node<'_>, source: &str) -> Option<(String, String)> {
     let ctor = dart_constructor_signature(node)?;
+    // The names before the parameters: a redirecting factory names its target
+    // after them (`factory Foo() = _Impl<T>.named;`, upstream #2380).
     let ids = ctor
         .named_children(&mut ctor.walk())
+        .take_while(|child| child.kind() != "formal_parameter_list")
         .filter(|child| child.kind() == "identifier")
         .collect::<Vec<_>>();
     let class_name = dart_enclosing_type_name(node, source)?;

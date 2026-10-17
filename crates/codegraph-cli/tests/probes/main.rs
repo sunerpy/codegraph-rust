@@ -16273,6 +16273,8 @@ mod dart_chains {
             ],
             "{report}"
         );
+        // `const Konst.named();` is indexed since upstream #2380, so both
+        // calls of it link the constructor, the chains typed as before.
         assert_eq!(
             use_from("namedConst"),
             [
@@ -16282,7 +16284,9 @@ mod dart_chains {
                 "namedConst -> Konst::build",
                 "namedConst -> Konst::make",
                 "namedConst -> Konst::make",
-                "namedConst -> Konst::make"
+                "namedConst -> Konst::make",
+                "namedConst -> Konst::named",
+                "namedConst -> Konst::named"
             ],
             "{report}"
         );
@@ -16625,5 +16629,579 @@ mod dart_chains {
             .expect("Item::touch");
         assert!(!touch.is_static, "{report}");
         assert_eq!(touch.return_type.as_deref(), Some("Item"), "{report}");
+    }
+}
+
+mod dart_local_scope {
+    use super::support::{Graph, Project};
+
+    /// `<target qualified name>:<line>` of each call or construction out of
+    /// the node `qualified` of `file`, sorted (upstream's `calls`).
+    fn calls(graph: &Graph, file: &str, qualified: &str) -> Vec<String> {
+        let node = graph
+            .nodes
+            .iter()
+            .find(|n| n.file_path == file && n.qualified_name == qualified)
+            .unwrap_or_else(|| panic!("{file} {qualified}\n{}", graph.report()));
+        let mut out: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|e| e.source == node.id && (e.kind == "calls" || e.kind == "instantiates"))
+            .filter_map(|e| {
+                Some(format!(
+                    "{}:{}",
+                    graph.node(&e.target)?.qualified_name,
+                    e.line?
+                ))
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// KEEP-RUST: the extractor records a chain's later link where the chain
+    /// starts, so whether a call has a receiver is read as the bare-call
+    /// rules read it: `repo.build().create()` calls `Builder.create`, though
+    /// the local it initializes, written nearer the chain's start, is named
+    /// `create` too. A local function is no member: inside a method it is
+    /// nearer than the method the class inherits, and a spread's `...items()`
+    /// calls its parameter (W4-DART-03c).
+    #[test]
+    fn keep_rust_a_chain_link_and_a_local_function_are_read_as_written() {
+        let project = Project::new()
+            .file("pubspec.yaml", "name: app\n")
+            .file(
+                "lib/repo.dart",
+                "class Item {}\n\nclass Builder {\n  Item create() => Item();\n}\n\nclass Repo {\n  Builder build() => Builder();\n}\n\nvoid make(Repo repo) {\n  final create = repo.build().create();\n  print(create);\n}\n\nclass Base {\n  void local() {}\n}\n\nclass Sub extends Base {\n  void m() {\n    void local() {}\n    local();\n  }\n}\n\nList<int> items() => [];\n\nList<int> spread(List<int> Function() items) => [...items()];\n",
+            )
+            .index();
+        let graph = project.graph();
+        let report = graph.report();
+        assert_eq!(
+            calls(graph, "lib/repo.dart", "make"),
+            ["Builder::create:12", "Repo::build:12"],
+            "{report}"
+        );
+        assert_eq!(
+            calls(graph, "lib/repo.dart", "Sub::m"),
+            ["Sub::m::local:23"],
+            "{report}"
+        );
+        // A spread's call has no receiver: the parameter it calls.
+        assert_eq!(
+            calls(graph, "lib/repo.dart", "spread"),
+            Vec::<String>::new(),
+            "{report}"
+        );
+    }
+
+    /// Upstream #2379 (`dart-local-call-scope.test.ts`, its fixture): a bare
+    /// Dart call to a name a parameter or local around it binds calls that
+    /// parameter or local, never a namesake elsewhere — riverpod's
+    /// `create(ref, arg)`, a closure's parameter, a loop variable, a test's
+    /// mock, a bloc handler's `emit` parameter — while calls the binding does
+    /// not cover, `this.` calls and calls to a local function link as before.
+    /// KEEP-RUST: the extractor qualifies a local function by the function
+    /// it is declared in (`outer::helper`, `outer::make`; upstream's are
+    /// `helper`, `make`), and attributes a call in a local function's body to
+    /// the function around it too.
+    #[test]
+    fn pr2379_a_dart_call_to_a_parameter_or_local_calls_that() {
+        let project = Project::new()
+            .file("pubspec.yaml", "name: app\nenvironment:\n  sdk: \">=3.0.0 <4.0.0\"\n")
+            .file("doc/mutation.dart", "class Mutation<T> {\n  Object call(String key) => key;\n}\n\nfinal create = Mutation<Object>();\nfinal createTodo = create('create_todo');\n")
+            .file("lib/family.dart", "class Ref {}\n\nclass Override {\n  Override(Object Function(Ref ref) build);\n}\n\nmixin FunctionalFamilyOverride<CreatedT, ArgT> {\n  ArgT get argument => throw 0;\n\n  Override overrideWith(CreatedT Function(Ref ref, ArgT arg) create) {\n    return Override((ref) => create(ref, argument) as Object);\n  }\n}\n\nclass Cache<T> {\n  final _values = <Object, T>{};\n\n  T upsert(Object key, T Function() create) {\n    final existing = _values[key];\n    if (existing != null) return existing;\n    final created = create();\n    _values[key] = created;\n    return created;\n  }\n}\n\nclass Holder {\n  void create() {}\n\n  void run(void Function() create) {\n    this.create();\n    create();\n  }\n}\n\nenum Kind { set, list }\n\nR pick<R>({required R Function() set, required R Function() list}) => set();\n\nclass Box {}\n\nBox? find() => null;\n\nvoid check() {\n  final Box? box = find();\n  print(box);\n  Box();\n}\n")
+            .file("test/matrix.dart", "typedef Factory = Object Function(Object Function(Object ref, Object? arg) create, {String? name});\n\nfinal factories = <Factory>[\n  (create, {name}) => create(Object(), name),\n];\n\nfinal generic = <T>(T Function() create) => create();\n")
+            .file("test/other_test.dart", "void listener() {}\n\nvoid fn() {}\n")
+            .file("test/listener_test.dart", "class Listener<T> {\n  void call(T? previous, T next) {}\n}\n\nvoid main() {\n  final listener = Listener<int>();\n  listener(0, 1);\n\n  void Function() build = () {};\n  build();\n\n  for (final fn in <void Function()>[]) {\n    fn();\n  }\n\n  final (create, _) = (() => 0, 1);\n  create();\n}\n")
+            .file("lib/bloc.dart", "abstract class Emitter<S> {\n  void call(S state);\n}\n\nclass Bloc<S> {\n  void emit(S state) {}\n\n  void on<E>(void Function(E event, Emitter<S> emit) handler) {}\n}\n\nclass CounterBloc extends Bloc<int> {\n  CounterBloc() {\n    on<String>((event, emit) => emit(1));\n  }\n\n  void onReset(String event, Emitter<int> emit) {\n    emit(0);\n  }\n\n  void bump() => emit(2);\n}\n")
+            .file("lib/util.dart", "void notify(int value) {}\n")
+            .file("lib/wire.dart", "import 'util.dart';\n\nvoid wire(List<int> values) {\n  values.forEach((notify) => print(notify));\n  notify(1);\n  for (final notify in values) {\n    print(notify);\n  }\n  notify(2);\n}\n\nint outer(int Function() make) {\n  int helper() {\n    int make() => 2;\n    return make();\n  }\n\n  return helper() + make();\n}\n")
+            .index();
+        let graph = project.graph();
+        let report = graph.report();
+        let none = Vec::<String>::new();
+
+        // Only the docs example's own file calls into it.
+        let docs: Vec<&str> = graph
+            .nodes
+            .iter()
+            .filter(|n| n.file_path == "doc/mutation.dart")
+            .map(|n| n.id.as_str())
+            .collect();
+        let mut callers: Vec<&str> = graph
+            .edges
+            .iter()
+            .filter(|e| {
+                (e.kind == "calls" || e.kind == "instantiates") && docs.contains(&e.target.as_str())
+            })
+            .filter_map(|e| Some(graph.node(&e.source)?.file_path.as_str()))
+            .collect();
+        callers.dedup();
+        assert_eq!(callers, ["doc/mutation.dart"], "{report}");
+
+        // A parameter: a method's, a function-typed one inside a closure,
+        // closures' in initializers; one may be named `set`.
+        assert_eq!(
+            calls(
+                graph,
+                "lib/family.dart",
+                "FunctionalFamilyOverride::overrideWith"
+            ),
+            ["Override:11"],
+            "{report}"
+        );
+        assert_eq!(
+            calls(graph, "lib/family.dart", "Cache::upsert"),
+            none,
+            "{report}"
+        );
+        assert_eq!(calls(graph, "lib/family.dart", "pick"), none, "{report}");
+        assert_eq!(
+            calls(graph, "test/matrix.dart", "factories"),
+            none,
+            "{report}"
+        );
+        assert_eq!(
+            calls(graph, "test/matrix.dart", "generic"),
+            none,
+            "{report}"
+        );
+
+        // A parameter shadows a method of the class, which `this.` still
+        // reaches.
+        assert_eq!(
+            calls(graph, "lib/family.dart", "Holder::run"),
+            ["Holder::create:31"],
+            "{report}"
+        );
+
+        // A local: a mock, a function-typed variable, a loop variable, a
+        // destructured one.
+        assert_eq!(
+            calls(graph, "test/listener_test.dart", "main"),
+            ["Listener:6"],
+            "{report}"
+        );
+        let other: Vec<&str> = graph
+            .nodes
+            .iter()
+            .filter(|n| n.file_path == "test/other_test.dart")
+            .map(|n| n.id.as_str())
+            .collect();
+        assert!(
+            !graph
+                .edges
+                .iter()
+                .any(|e| e.kind == "calls" && other.contains(&e.target.as_str())),
+            "{report}"
+        );
+
+        // A handler's `Emitter` parameter is not `Bloc.emit`; a bare call of
+        // the inherited method is.
+        assert_eq!(
+            calls(graph, "lib/bloc.dart", "CounterBloc"),
+            ["Bloc::on:13"],
+            "{report}"
+        );
+        assert_eq!(
+            calls(graph, "lib/bloc.dart", "CounterBloc::onReset"),
+            none,
+            "{report}"
+        );
+        assert_eq!(
+            calls(graph, "lib/bloc.dart", "CounterBloc::bump"),
+            ["Bloc::emit:20"],
+            "{report}"
+        );
+
+        // A sibling closure's parameter and a finished loop's variable cover
+        // nothing after them.
+        assert_eq!(
+            calls(graph, "lib/wire.dart", "wire"),
+            ["notify:5", "notify:9"],
+            "{report}"
+        );
+
+        // A local function is nearer than the parameter it shadows, inside
+        // its block only.
+        assert_eq!(
+            calls(graph, "lib/wire.dart", "outer::helper"),
+            ["outer::make:15"],
+            "{report}"
+        );
+        let outer = calls(graph, "lib/wire.dart", "outer");
+        assert!(outer.contains(&"outer::helper:18".to_string()), "{report}");
+        assert!(!outer.contains(&"outer::make:18".to_string()), "{report}");
+
+        // A nullable typed local's type is not a binding: `Box()` still
+        // constructs `Box`.
+        assert_eq!(
+            calls(graph, "lib/family.dart", "check"),
+            ["Box:47", "find:45"],
+            "{report}"
+        );
+    }
+}
+
+mod dart_constructors {
+    use super::support::{Graph, NodeRow, Project};
+
+    fn find<'g>(graph: &'g Graph, file: &str, qualified: &str) -> Option<&'g NodeRow> {
+        graph
+            .nodes
+            .iter()
+            .find(|n| n.file_path == file && n.qualified_name == qualified)
+    }
+
+    fn node<'g>(graph: &'g Graph, file: &str, qualified: &str) -> &'g NodeRow {
+        find(graph, file, qualified)
+            .unwrap_or_else(|| panic!("{file} {qualified}\n{}", graph.report()))
+    }
+
+    /// The qualified names `from`'s `kind` edges reach, deduplicated and
+    /// sorted (upstream's `targets`).
+    fn targets(graph: &Graph, from: &NodeRow, kind: &str) -> Vec<String> {
+        let mut out: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|e| e.source == from.id && e.kind == kind)
+            .filter_map(|e| Some(graph.node(&e.target)?.qualified_name.clone()))
+            .collect();
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// `<kind> <source qualified name>` of every edge but `contains` into
+    /// `to`, deduplicated and sorted (upstream's `sources`).
+    fn sources(graph: &Graph, to: &NodeRow) -> Vec<String> {
+        let mut out: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|e| e.target == to.id && e.kind != "contains")
+            .filter_map(|e| {
+                Some(format!(
+                    "{} {}",
+                    e.kind,
+                    graph.node(&e.source)?.qualified_name
+                ))
+            })
+            .collect();
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// KEEP-RUST (W4-DART-03c): this grammar puts the annotations of a
+    /// member with a body inside the declaration its node is made of, so a
+    /// member's node starts at its annotations where upstream's starts at its
+    /// signature. Whether a member is a constructor, a getter or a setter is
+    /// read past them: riverpod's `@visibleForTesting factory
+    /// ProviderContainer.test(…)` is a constructor its 1269 calls reach, an
+    /// annotated getter is read, and an annotated setter is no call target.
+    #[test]
+    fn keep_rust_a_dart_members_head_is_read_past_its_annotations() {
+        let project = Project::new()
+            .file("pubspec.yaml", "name: app\n")
+            .file(
+                "lib/container.dart",
+                "class Item {\n  void save() {}\n}\n\nclass ProviderContainer {\n  ProviderContainer();\n\n  /// For tests.\n  @visibleForTesting\n  // ignore: invalid_use\n  factory ProviderContainer.test({int retry = 0}) {\n    return ProviderContainer();\n  }\n\n  @override\n  @protected\n  Item get item => Item();\n}\n\nclass Slot {\n  @override\n  set value(int v) {}\n}\n\nclass Box {\n  Slot wrap() => Slot();\n}\n",
+            )
+            .file(
+                "lib/use.dart",
+                "import 'container.dart';\n\nvoid made() {\n  ProviderContainer.test();\n}\n\nvoid read(ProviderContainer container) {\n  container.item.save();\n}\n\nvoid write(Box box) {\n  box.wrap().value(1);\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        let report = graph.report();
+        let use_calls = |name: &str| targets(graph, node(graph, "lib/use.dart", name), "calls");
+        assert_eq!(use_calls("made"), ["ProviderContainer::test"], "{report}");
+        assert_eq!(
+            use_calls("read"),
+            ["Item::save", "ProviderContainer::item"],
+            "{report}"
+        );
+        assert_eq!(use_calls("write"), ["Box::wrap"], "{report}");
+    }
+
+    /// A constructor is torn off through its class, never by its name alone
+    /// (upstream #2380): a function value `internal` passed on, which no
+    /// local binds, is not `ChangeNotifierProvider.internal`.
+    #[test]
+    fn pr2380_a_dart_constructor_is_no_bare_function_value() {
+        let project = Project::new()
+            .file("pubspec.yaml", "name: app\n")
+            .file(
+                "lib/provider.dart",
+                "class ChangeNotifierProvider {\n  const ChangeNotifierProvider.internal();\n\n  void wire() => register(internal);\n}\n\nvoid register(Object Function() make) {}\n",
+            )
+            .index();
+        let graph = project.graph();
+        let report = graph.report();
+        let internal = node(
+            graph,
+            "lib/provider.dart",
+            "ChangeNotifierProvider::internal",
+        );
+        assert_eq!(sources(graph, internal), Vec::<String>::new(), "{report}");
+        // The function value is recorded, and left unresolved.
+        assert!(
+            graph
+                .unresolved
+                .iter()
+                .any(|r| r.reference_name == "internal" && r.line == 4),
+            "{report}"
+        );
+        assert_eq!(
+            targets(
+                graph,
+                node(graph, "lib/provider.dart", "ChangeNotifierProvider::wire"),
+                "calls"
+            ),
+            ["register"],
+            "{report}"
+        );
+    }
+
+    /// Upstream #2380 (`dart-const-constructors.test.ts`, its fixture): named
+    /// `const` constructors and redirecting factories are methods named by the
+    /// constructor, returning their class, with a parameters-only signature
+    /// (the unnamed ones stay unindexed, and a redirect's target names
+    /// nothing); a redirecting factory refers to the class it constructs; and
+    /// a call through a type's name reaches that type's own constructor or
+    /// static member, type arguments or not, or nothing: never another type's
+    /// member of that name, a supertype's, a same-file look-alike's, an
+    /// instance getter sharing a factory's name, or a project method sharing
+    /// an SDK call's name. A constructor is never reached by a bare name, the
+    /// last link of a chain or an annotation. KEEP-RUST: the extractor keeps
+    /// `BlocProvider<Object>.value(…)` by its member at the chain's start, and
+    /// the chain reader types `BlocProvider<Object>` as the type (W4-DART-03b)
+    /// where upstream records `BlocProvider.value`; the edges are the same.
+    #[test]
+    fn pr2380_a_dart_call_through_a_type_reaches_that_types_own_constructor() {
+        let project = Project::new()
+            .file("pubspec.yaml", "name: app\nenvironment:\n  sdk: \">=3.0.0 <4.0.0\"\n")
+            .file("lib/bloc_provider.dart", "class BlocProvider<T> {\n  const BlocProvider({required T Function() create}) : _create = create, _value = null;\n\n  const BlocProvider.value({required T value}) : this._(value: value);\n\n  const BlocProvider._({T? value}) : _create = null, _value = value;\n\n  final T Function()? _create;\n  final T? _value;\n\n  void handle(Object value) => accept(value);\n}\n\nvoid accept(Object o) {}\n")
+            .file("lib/repository_provider.dart", "class RepositoryProvider<T> {\n  RepositoryProvider({required T Function() create});\n\n  RepositoryProvider.value({required T value});\n\n  static T of<T>(Object context) => throw 0;\n}\n")
+            .file("lib/new_car_state.dart", "class NewCarState {\n  const NewCarState._({this.brands = const []});\n\n  const NewCarState.initial() : this._();\n\n  const factory NewCarState.loading() = _Loading;\n\n  const factory NewCarState() = _Loading.named;\n\n  const factory NewCarState.fromJson(Map<String, Object?> json) = _Loading.fromJson;\n\n  final List<String> brands;\n}\n\nclass _Loading extends NewCarState {\n  const _Loading() : super._();\n\n  const _Loading.named() : super._();\n\n  const _Loading.fromJson(Map<String, Object?> json) : super._();\n}\n")
+            .file("lib/profile_wizard_state.dart", "class ProfileWizardState {\n  ProfileWizardState.initial() : step = 0;\n\n  final int step;\n\n  Object fromJson(Object json) => json;\n}\n")
+            .file("lib/family.dart", "class EmptyFamily extends Family {\n  EmptyFamily._() : super._();\n}\n\nclass Family {\n  const Family._();\n\n  static Family make() => Family._();\n}\n")
+            .file("lib/sub.dart", "abstract class Base {\n  const Base();\n\n  factory Base.named() => const _BaseImpl();\n}\n\nclass _BaseImpl extends Base {\n  const _BaseImpl();\n}\n\nclass Sub extends Base {\n  const Sub();\n\n  const factory Sub.named() = _SubImpl;\n}\n\nclass _SubImpl extends Sub {\n  const _SubImpl();\n}\n")
+            .file("lib/analysis_options.dart", "class AnalysisOptions {\n  const AnalysisOptions(this.path);\n\n  factory AnalysisOptions.parse(String path) => AnalysisOptions(path);\n\n  final String path;\n}\n")
+            .file("lib/linter.dart", "extension on Uri {\n  String get canonicalizedPath => path;\n}\n")
+            .file("lib/async_value.dart", "sealed class AsyncValue<T> {\n  const AsyncValue._();\n\n  Object? get error => null;\n\n  const factory AsyncValue.error(Object error) = AsyncError<T>;\n}\n\nclass AsyncError<T> extends AsyncValue<T> {\n  const AsyncError(this.error) : super._();\n\n  @override\n  final Object error;\n}\n\nObject fail(Object e) => AsyncValue.error(e);\n")
+            .file("lib/change_notifier_provider.dart", "class ChangeNotifierProvider {\n  const ChangeNotifierProvider.internal();\n}\n")
+            .file("lib/scope.dart", "import 'package:meta/meta.dart';\n\n@internal\nObject guarded() => 0;\n")
+            .file("lib/app.dart", "import 'bloc_provider.dart';\nimport 'repository_provider.dart';\nimport 'new_car_state.dart';\nimport 'sub.dart';\n\nObject build(Object counter) => BlocProvider.value(value: counter);\nObject typed(Object counter) => BlocProvider<Object>.value(value: counter);\nObject typedRepository(Object repository) => RepositoryProvider<Object>.value(value: repository);\nNewCarState start() => NewCarState.initial();\nNewCarState load() => NewCarState.loading();\nSub sub() => Sub.named();\nObject find(Object context) => BlocProvider.of(context);\nUri link() => Uri.parse('https://example.com');\nObject tail(dynamic box) => box.inner.value(1);\n")
+            .index();
+        let graph = project.graph();
+        let report = graph.report();
+        let none = Vec::<String>::new();
+
+        let value = node(graph, "lib/bloc_provider.dart", "BlocProvider::value");
+        assert_eq!(value.kind, "method", "{report}");
+        assert_eq!(
+            value.return_type.as_deref(),
+            Some("BlocProvider"),
+            "{report}"
+        );
+        assert_eq!(
+            value.signature.as_deref(),
+            Some("({required T value})"),
+            "{report}"
+        );
+        node(graph, "lib/bloc_provider.dart", "BlocProvider::_");
+        assert!(
+            find(
+                graph,
+                "lib/bloc_provider.dart",
+                "BlocProvider::BlocProvider"
+            )
+            .is_none(),
+            "{report}"
+        );
+        node(graph, "lib/new_car_state.dart", "NewCarState::initial");
+        let loading = node(graph, "lib/new_car_state.dart", "NewCarState::loading");
+        assert_eq!(loading.signature.as_deref(), Some("()"), "{report}");
+        assert!(
+            find(graph, "lib/new_car_state.dart", "NewCarState::NewCarState").is_none(),
+            "{report}"
+        );
+        assert!(
+            find(graph, "lib/new_car_state.dart", "NewCarState::named").is_none(),
+            "{report}"
+        );
+        node(graph, "lib/new_car_state.dart", "_Loading::named");
+        node(graph, "lib/sub.dart", "Sub::named");
+        // A redirecting factory refers to the class it constructs, and not to
+        // that class's constructor as if it were a type.
+        assert_eq!(
+            targets(graph, loading, "references"),
+            ["_Loading"],
+            "{report}"
+        );
+        assert_eq!(
+            targets(
+                graph,
+                node(graph, "lib/new_car_state.dart", "NewCarState::fromJson"),
+                "references"
+            ),
+            ["_Loading"],
+            "{report}"
+        );
+        assert_eq!(
+            sources(
+                graph,
+                node(
+                    graph,
+                    "lib/profile_wizard_state.dart",
+                    "ProfileWizardState::fromJson"
+                )
+            ),
+            none,
+            "{report}"
+        );
+
+        // Each call reaches the constructor of the type it names, type
+        // arguments or not...
+        let app = |name: &str| node(graph, "lib/app.dart", name);
+        assert_eq!(
+            targets(graph, app("build"), "calls"),
+            ["BlocProvider::value"],
+            "{report}"
+        );
+        assert_eq!(
+            targets(graph, app("typed"), "calls"),
+            ["BlocProvider::value"],
+            "{report}"
+        );
+        assert_eq!(
+            targets(graph, app("typedRepository"), "calls"),
+            ["RepositoryProvider::value"],
+            "{report}"
+        );
+        assert_eq!(
+            targets(graph, app("start"), "calls"),
+            ["NewCarState::initial"],
+            "{report}"
+        );
+        assert_eq!(
+            targets(graph, app("load"), "calls"),
+            ["NewCarState::loading"],
+            "{report}"
+        );
+        assert_eq!(
+            targets(graph, app("sub"), "calls"),
+            ["Sub::named"],
+            "{report}"
+        );
+        assert_eq!(
+            targets(
+                graph,
+                node(graph, "lib/family.dart", "Family::make"),
+                "calls"
+            ),
+            ["Family::_"],
+            "{report}"
+        );
+        // A constructor, not the instance getter that shares its name.
+        let factory = graph
+            .nodes
+            .iter()
+            .find(|n| {
+                n.file_path == "lib/async_value.dart"
+                    && n.qualified_name == "AsyncValue::error"
+                    && n.signature.as_deref() == Some("(Object error)")
+            })
+            .unwrap_or_else(|| panic!("the error factory\n{report}"));
+        let fail = node(graph, "lib/async_value.dart", "fail");
+        let called: Vec<&str> = graph
+            .edges
+            .iter()
+            .filter(|e| e.source == fail.id && e.kind == "calls")
+            .map(|e| e.target.as_str())
+            .collect();
+        assert_eq!(called, [factory.id.as_str()], "{report}");
+        // ...and never another type's member of that name.
+        assert_eq!(
+            sources(
+                graph,
+                node(
+                    graph,
+                    "lib/repository_provider.dart",
+                    "RepositoryProvider::value"
+                )
+            ),
+            ["calls typedRepository"],
+            "{report}"
+        );
+        assert_eq!(
+            sources(
+                graph,
+                node(
+                    graph,
+                    "lib/profile_wizard_state.dart",
+                    "ProfileWizardState::initial"
+                )
+            ),
+            none,
+            "{report}"
+        );
+        assert_eq!(
+            sources(graph, node(graph, "lib/family.dart", "EmptyFamily::_")),
+            none,
+            "{report}"
+        );
+        assert_eq!(
+            sources(graph, node(graph, "lib/sub.dart", "Base::named")),
+            none,
+            "{report}"
+        );
+        // A member the named type does not declare is outside the project.
+        assert_eq!(targets(graph, app("find"), "calls"), none, "{report}");
+        assert_eq!(
+            sources(
+                graph,
+                node(
+                    graph,
+                    "lib/repository_provider.dart",
+                    "RepositoryProvider::of"
+                )
+            ),
+            none,
+            "{report}"
+        );
+        assert_eq!(targets(graph, app("link"), "calls"), none, "{report}");
+        assert_eq!(
+            sources(
+                graph,
+                node(graph, "lib/analysis_options.dart", "AnalysisOptions::parse")
+            ),
+            none,
+            "{report}"
+        );
+
+        // A constructor is only ever reached through its class: a parameter
+        // that shares its name, the last link of a chain, or an annotation is
+        // not it.
+        assert_eq!(targets(graph, app("tail"), "calls"), none, "{report}");
+        assert_eq!(
+            sources(graph, value),
+            ["calls build", "calls typed"],
+            "{report}"
+        );
+        assert_eq!(
+            sources(
+                graph,
+                node(
+                    graph,
+                    "lib/change_notifier_provider.dart",
+                    "ChangeNotifierProvider::internal"
+                )
+            ),
+            none,
+            "{report}"
+        );
     }
 }

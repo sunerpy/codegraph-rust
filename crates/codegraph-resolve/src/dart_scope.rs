@@ -130,10 +130,24 @@ pub fn is_dart_type_kind(kind: NodeKind) -> bool {
 
 /// A member of a Dart type: a method, or an abstract member written without
 /// a body, which the extractor records as a function the type owns
-/// (upstream `isDartMember`).
+/// (upstream `isDartMember`), read from the node alone: a function declared
+/// in a body counts too ([`is_dart_type_member`]).
 pub fn is_dart_member(node: &Node) -> bool {
     node.kind == NodeKind::Method
         || (node.kind == NodeKind::Function && node.qualified_name.contains("::"))
+}
+
+/// A member of a Dart type (upstream `isDartMember`). KEEP-RUST: the
+/// extractor qualifies a function declared in a body by the function around
+/// it (`outer::make`, upstream's is `make`), so a function a same-file
+/// function or method encloses is a local one, no member: a bare call in
+/// there reaches it, as v0.54.0 linked it (W4-DART-03c, a W4-DART-01
+/// regression upstream #2379's fixture shows).
+pub(crate) fn is_dart_type_member(node: &Node, context: &dyn ResolutionContext) -> bool {
+    node.kind == NodeKind::Method
+        || (node.kind == NodeKind::Function
+            && node.qualified_name.contains("::")
+            && !crate::name_matcher::is_in_function_body(node, context))
 }
 
 /// The name of the type that owns a member, the last segment before its
@@ -343,6 +357,9 @@ pub struct DartTables {
     pub(crate) getters: Mutex<HashMap<String, bool>>,
     /// Whether each method is a setter, by node id ([`crate::dart_chains`]).
     pub(crate) setters: Mutex<HashMap<String, bool>>,
+    /// Whether each method is a named constructor, by node id
+    /// ([`crate::dart_members::is_dart_constructor`]).
+    pub(crate) constructors: Mutex<HashMap<String, bool>>,
     /// Each function's declared return type as a chain reads it, by node id.
     pub(crate) return_types: Mutex<HashMap<String, Option<Arc<crate::dart_chains::ReturnInfo>>>>,
 }
@@ -525,7 +542,7 @@ pub(crate) fn nearest_dart_members(
 ) -> Vec<Arc<Node>> {
     if candidates
         .iter()
-        .filter(|node| is_dart_member(node))
+        .filter(|node| is_dart_type_member(node, context))
         .count()
         < 2
     {
@@ -533,7 +550,7 @@ pub(crate) fn nearest_dart_members(
     }
     let depths: HashMap<String, u64> = candidates
         .iter()
-        .filter(|node| is_dart_member(node))
+        .filter(|node| is_dart_type_member(node, context))
         .map(|node| (node.id.clone(), dart_member_depth(node, reference, context)))
         .collect();
     let nearest = depths.values().copied().min().unwrap_or(OUT_OF_SCOPE);
@@ -541,6 +558,37 @@ pub(crate) fn nearest_dart_members(
         .into_iter()
         .filter(|node| depths.get(&node.id).is_none_or(|depth| *depth == nearest))
         .collect()
+}
+
+/// The line a Dart member's signature starts on, from where it starts, and
+/// the line after it: past the annotations and `//` comments its node opens
+/// with. KEEP-RUST: this grammar puts the annotations of a member with a body
+/// inside the declaration its node is made of (`@visibleForTesting` above
+/// `factory ProviderContainer.test(…)`), where upstream's node starts at the
+/// signature, which is where upstream's getter, setter and constructor tests
+/// read from (W4-DART-03c).
+pub(crate) fn dart_member_head(node: &Node, context: &dyn ResolutionContext) -> (String, String) {
+    let text = source_lines(
+        &node.file_path,
+        node.start_line,
+        node.start_line + HEAD_LINES,
+        context,
+    );
+    let first_end = text.find('\n').unwrap_or(text.len());
+    let mut from = usize::try_from(node.start_column.max(0))
+        .unwrap_or(0)
+        .min(first_end);
+    while !text.is_char_boundary(from) {
+        from -= 1;
+    }
+    let text = &text[from..];
+    let rest = &text[leading_annotations()
+        .find(text)
+        .map_or(0, |found| found.end())..];
+    let mut lines = rest.splitn(3, '\n');
+    let signature = lines.next().unwrap_or("").to_string();
+    let next = lines.next().unwrap_or("").to_string();
+    (signature, next)
 }
 
 /// Leading annotations and `//` comments of a declaration's head.

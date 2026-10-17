@@ -7388,11 +7388,22 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             node
         };
         if signature.kind() == "redirecting_factory_constructor_signature" {
+            // KEEP-RUST: this grammar writes the target as `type`s of the
+            // signature (`= p.Impl.named` one holding `p`, `Impl` and
+            // `named`; the `<T>` of `= Impl<T>` a second), upstream's as
+            // `type_identifier`s of the signature itself (#2380).
             for child in signature.named_children(&mut signature.walk()) {
-                if child.kind() != "type_identifier"
-                    || crate::lang::dart_writes_a_type(&node_text(child, self.source))
-                {
-                    self.extract_type_refs_from_subtree(child, node_id);
+                let parts: Vec<SyntaxNode<'tree>> = if child.kind() == "type" {
+                    child.named_children(&mut child.walk()).collect()
+                } else {
+                    vec![child]
+                };
+                for part in parts {
+                    if part.kind() != "type_identifier"
+                        || crate::lang::dart_writes_a_type(&node_text(part, self.source))
+                    {
+                        self.extract_type_refs_from_subtree(part, node_id);
+                    }
                 }
             }
             return;

@@ -22,7 +22,7 @@ use codegraph_core::types::{EdgeKind, Language, Node, NodeKind};
 use crate::dart_scope::{
     EXTENSION_RANK, HIERARCHY_LIMIT, dart_extension_named, dart_head_of, dart_supertypes_of,
     in_order, is_dart_identifier, is_dart_member, is_dart_name_char, is_dart_type_kind,
-    is_js_space, member_owner, source_line,
+    is_js_space, member_owner,
 };
 use crate::types::{RefView, ResolutionContext, ResolvedBy, ResolvedRef};
 
@@ -155,11 +155,8 @@ pub(crate) fn is_dart_getter(node: &Node, context: &dyn ResolutionContext) -> bo
     {
         return hit;
     }
-    let line = source_line(&node.file_path, node.start_line, context).unwrap_or_default();
-    let next = source_line(&node.file_path, node.start_line + 1, context).unwrap_or_default();
-    let from = usize::try_from(node.start_column.max(0)).unwrap_or(0);
-    let head = format!("{} {next}", line.get(from..).unwrap_or(""));
-    let getter = declares_getter(&head, &node.name);
+    let (signature, next) = crate::dart_scope::dart_member_head(node, context);
+    let getter = declares_getter(&format!("{signature} {next}"), &node.name);
     if let Ok(mut memo) = tables.getters.lock() {
         memo.insert(node.id.clone(), getter);
     }
@@ -355,24 +352,163 @@ pub fn match_dart_member_read(
     })
 }
 
-/// The static constant `name` a Dart type declares, which a call through the
-/// type invokes (upstream #2367): riverpod's `FutureProvider.autoDispose(…)`
-/// calls `static const autoDispose = AutoDisposeFutureProviderBuilder();`. A
-/// Dart type cannot also declare a method of that name, and static members
-/// are not inherited, so its own constant is the callee.
-pub(crate) fn dart_static_constant_of(
-    class_node: &Node,
+/// Whether a Dart method is a named constructor — `Foo.named(…)`, `factory
+/// Foo.of(…)`, `const Foo.value(…)`, `const factory Foo.x() = _X;` — read
+/// from its declaration (upstream #2380 `isDartConstructor`). Dart reaches
+/// one only through its class (`Foo.value(…)`, the tear-off `Foo.value`),
+/// never by a bare name: a parameter `value` passed on is not `const
+/// BlocProvider.value(…)`.
+pub(crate) fn is_dart_constructor(node: &Node, context: &dyn ResolutionContext) -> bool {
+    if node.language != Language::Dart || node.kind != NodeKind::Method {
+        return false;
+    }
+    let tables = context.dart_tables();
+    if let Some(hit) = tables
+        .constructors
+        .lock()
+        .ok()
+        .and_then(|memo| memo.get(&node.id).copied())
+    {
+        return hit;
+    }
+    let owner = member_owner(&node.qualified_name).unwrap_or("");
+    let constructor = !owner.is_empty()
+        && declares_constructor(
+            &crate::dart_scope::dart_member_head(node, context).0,
+            owner,
+            &node.name,
+        );
+    if let Ok(mut memo) = tables.constructors.lock() {
+        memo.insert(node.id.clone(), constructor);
+    }
+    constructor
+}
+
+/// Whether a declaration's head opens a constructor `owner.name`
+/// (`^(?:(?:const|factory|external)\s+)*owner\s*\.\s*name(?![\w$])`).
+fn declares_constructor(head: &str, owner: &str, name: &str) -> bool {
+    let mut rest = head;
+    while let Some(after) = ["const", "factory", "external"]
+        .iter()
+        .find_map(|keyword| rest.strip_prefix(keyword))
+    {
+        let spaced = after.trim_start_matches(is_js_space);
+        if spaced.len() == after.len() {
+            break;
+        }
+        rest = spaced;
+    }
+    let Some(rest) = rest.strip_prefix(owner) else {
+        return false;
+    };
+    let Some(rest) = rest.trim_start_matches(is_js_space).strip_prefix('.') else {
+        return false;
+    };
+    rest.trim_start_matches(is_js_space)
+        .strip_prefix(name)
+        .is_some_and(|after| !after.starts_with(is_dart_name_char))
+}
+
+/// Whether a member of a Dart type is reached through the type itself: a
+/// static member, constant or enum value, or a named constructor or factory
+/// (`factory ProviderContainer.test(…)`), not an instance member sharing a
+/// constructor's name (`AsyncValue`'s `error` getter beside its
+/// `AsyncValue.error(…)` factory, even declared on the line above it;
+/// upstream `isDartStaticMember`).
+pub(crate) fn is_dart_static_member(member: &Node, context: &dyn ResolutionContext) -> bool {
+    member.is_static
+        || member.kind == NodeKind::Constant
+        || member.kind == NodeKind::EnumMember
+        || is_dart_constructor(member, context)
+}
+
+/// The static member `name` the Dart type `type_name` itself declares — a
+/// static method or getter, a named constructor or factory, a static
+/// constant, an enum value — preferring the file `file_path`, then the
+/// nearest (upstream `dartStaticMember`). Static members are not inherited.
+pub(crate) fn dart_static_member(
+    type_name: &str,
     name: &str,
+    file_path: &str,
     context: &dyn ResolutionContext,
 ) -> Option<Arc<Node>> {
-    let qualified_name = format!("{}::{name}", class_node.qualified_name);
-    in_order(context.get_nodes_in_file_shared(&class_node.file_path))
+    let owners: Vec<Arc<Node>> = context
+        .get_nodes_by_name_shared(type_name)
         .into_iter()
-        .find(|node| {
-            node.kind == NodeKind::Constant
-                && node.name == name
-                && node.qualified_name == qualified_name
+        .filter(|node| node.language == Language::Dart && is_dart_type_kind(node.kind))
+        .collect();
+    if owners.is_empty() {
+        return None;
+    }
+    let found: Vec<Arc<Node>> = context
+        .get_nodes_by_name_shared(name)
+        .into_iter()
+        .filter(|member| {
+            member.language == Language::Dart
+                && matches!(
+                    member.kind,
+                    NodeKind::Method
+                        | NodeKind::Function
+                        | NodeKind::Constant
+                        | NodeKind::EnumMember
+                )
+                && owners.iter().any(|owner| {
+                    owner.file_path == member.file_path
+                        && member.qualified_name == format!("{}::{name}", owner.qualified_name)
+                })
+                && !crate::dart_chains::is_setter(member, context)
+                && is_dart_static_member(member, context)
         })
+        .collect();
+    if found.len() <= 1 {
+        return found.into_iter().next();
+    }
+    if let Some(own) = found.iter().find(|member| member.file_path == file_path) {
+        return Some(Arc::clone(own));
+    }
+    found.into_iter().reduce(|chosen, next| {
+        let proximity =
+            |node: &Node| crate::name_matcher::compute_path_proximity(file_path, &node.file_path);
+        if proximity(&next) > proximity(&chosen) {
+            next
+        } else {
+            chosen
+        }
+    })
+}
+
+/// A Dart call through a type's name — `BlocProvider.value(…)`, riverpod's
+/// `FutureProvider.autoDispose(…)` — is to one of that type's own
+/// constructors or static members, or to nothing the project declares
+/// (upstream #2380 `matchDartTypeMemberCall`). Dart inherits none of them, so
+/// a guess past the type is always wrong: flutter_bloc's
+/// `BlocProvider.value(…)` went to `RepositoryProvider`'s `value`, and a
+/// static constant's callee is the value it holds (`static const autoDispose
+/// = AutoDisposeFutureProviderBuilder();`). `None` when the receiver names no
+/// Dart type of the project.
+pub(crate) fn match_dart_type_member_call(
+    type_name: &str,
+    member: &str,
+    reference: &RefView,
+    context: &dyn ResolutionContext,
+) -> Option<Option<ResolvedRef>> {
+    if !context
+        .get_nodes_by_name_shared(type_name)
+        .iter()
+        .any(|node| node.language == Language::Dart && is_dart_type_kind(node.kind))
+    {
+        return None;
+    }
+    let own = dart_static_member(type_name, member, &reference.file_path, context);
+    Some(
+        own.filter(|own| own.kind != NodeKind::EnumMember)
+            .map(|own| ResolvedRef {
+                original: reference.clone(),
+                target_node_id: own.id.clone(),
+                confidence: 0.85,
+                resolved_by: ResolvedBy::QualifiedName,
+            }),
+    )
 }
 
 #[cfg(test)]
@@ -396,6 +532,60 @@ mod tests {
         ];
         for (head, name, expected) in cases {
             assert_eq!(declares_getter(head, name), expected, "{head:?}");
+        }
+    }
+
+    /// Expected values from upstream #2380's `isDartConstructor` pattern on
+    /// the same heads.
+    #[test]
+    fn a_constructor_is_declared_owner_dot_name_after_its_modifiers() {
+        let cases: [(&str, &str, &str, bool); 14] = [
+            (
+                "const BlocProvider.value({required T value})",
+                "BlocProvider",
+                "value",
+                true,
+            ),
+            (
+                "const factory NewCarState.loading() = _Loading;",
+                "NewCarState",
+                "loading",
+                true,
+            ),
+            (
+                "factory Base.named() => const _BaseImpl();",
+                "Base",
+                "named",
+                true,
+            ),
+            ("external const Foo.ext();", "Foo", "ext", true),
+            (
+                "RepositoryProvider.value({required T value});",
+                "RepositoryProvider",
+                "value",
+                true,
+            ),
+            ("Foo . bar()", "Foo", "bar", true),
+            ("const  factory  Foo.bar()", "Foo", "bar", true),
+            ("const _$Foo.create()", "_$Foo", "create", true),
+            ("Object? get error => null;", "AsyncValue", "error", false),
+            (
+                "static Family make() => Family._();",
+                "Family",
+                "make",
+                false,
+            ),
+            ("const Foo.barBaz()", "Foo", "bar", false),
+            ("const Foo.bar$x()", "Foo", "bar", false),
+            ("constFoo.bar()", "Foo", "bar", false),
+            ("@internal const Foo.bar()", "Foo", "bar", false),
+        ];
+        for (head, owner, name, expected) in cases {
+            assert_eq!(
+                declares_constructor(head, owner, name),
+                expected,
+                "{head:?}"
+            );
         }
     }
 
