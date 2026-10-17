@@ -1020,6 +1020,23 @@ fn sync_paths_with_store(
                 merge_dependent_site(&mut dependent_sites, &mut dependent_fallbacks, affected);
             }
         }
+        // What a Dart call through an import prefix in an unchanged file
+        // waits for: a top-level declaration of its member's name the prefix
+        // brings in (W4-DART-03d). A bootstrap of the Dart, member or library
+        // rows re-resolves every Dart file already.
+        if !(dart_bootstrap || member_bootstrap || dart_library_bootstrap) {
+            for affected in crate::dart_libraries::prefixed_call_sites(
+                store,
+                &changed_names.dart_libraries,
+                &changed_names.candidates,
+                &reindexed,
+                &changed_names.removed_files,
+            )? {
+                if !dependent_fallbacks.contains(&affected.file_path) {
+                    merge_dependent_site(&mut dependent_sites, &mut dependent_fallbacks, affected);
+                }
+            }
+        }
         // What a Lua call in an unchanged file read of a changed one: which
         // names it declares `local`, what its module hands out (W4-LUA-01).
         let lua = crate::lua_modules::lua_refresh(

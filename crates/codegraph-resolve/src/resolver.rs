@@ -2194,6 +2194,15 @@ impl ReferenceResolver {
         if let Some(result) = crate::dart_chains::dart_chain_link(reference, context) {
             return (result, None);
         }
+        // A Dart annotation (`@riverpod`, `@Riverpod(…)`) is a constant or a
+        // constructor call, as written: never a method or function by its
+        // name (upstream #2390).
+        if crate::dart_annotations::is_dart_annotation(reference) {
+            return (
+                crate::dart_annotations::match_dart_annotation(reference, context),
+                None,
+            );
+        }
         // A Go call through a type assertion (`srv.(KVServer).Range(ctx,
         // in)`), which arrives by its bare name, is to a method of the
         // asserted type, or to nothing the project declares (upstream #2444).

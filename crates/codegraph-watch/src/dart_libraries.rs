@@ -22,7 +22,11 @@
 //!   every changed file does);
 //! - a Dart file added, the parked Dart imports whose URI ends in its name
 //!   are retried at their sites, however many there are (the shared
-//!   import-key lookup caps them).
+//!   import-key lookup caps them);
+//! - a name that came, went or whose reach moved, the parked Dart calls
+//!   through an import prefix to it (`fmt.describe(…)`, upstream #2389) are
+//!   retried at their sites, however many there are (the shared tail lookup
+//!   caps them): [`prefixed_call_sites`].
 //!
 //! A pubspec.yaml change is W5-06's control-file lane.
 //!
@@ -446,6 +450,63 @@ pub(crate) fn dart_library_refresh(
         }
     }
     Ok(refresh)
+}
+
+/// The parked Dart calls through an import prefix in unchanged files that a
+/// declaration of one of `names` may now satisfy, at their sites (upstream
+/// #2389): `fmt.describe(…)` calls the top-level declaration the prefixed
+/// import brings in, and waits for it by its member's name, which the shared
+/// tail lookup caps at 500 per tail. The parked calls written through a name
+/// some Dart file imports a library as, before or after the change, are
+/// retried here, however many there are; a file whose own prefixes moved
+/// re-resolves whole ([`dart_library_refresh`]).
+pub(crate) fn prefixed_call_sites(
+    store: &Store,
+    changes: &DartLibraryChanges,
+    names: &HashSet<String>,
+    reindexed: &HashSet<String>,
+    removed: &BTreeSet<String>,
+) -> Result<Vec<FileReferenceSite>> {
+    if names.is_empty() {
+        return Ok(Vec::new());
+    }
+    let unchanged = |path: &str| !reindexed.contains(path) && !removed.contains(path);
+    let mut prefixes: BTreeSet<String> = BTreeSet::new();
+    let rows = store
+        .project_metadata_with_prefix(LIBRARY_ROW_KEY_PREFIX)?
+        .into_iter()
+        .filter_map(|(_, value)| LibraryRow::decode(&value));
+    let new_rows = changes
+        .changes
+        .values()
+        .filter_map(|change| change.new_row.clone());
+    for row in rows.chain(new_rows) {
+        prefixes.extend(row.imports.into_iter().filter_map(|import| import.prefix));
+    }
+    if prefixes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let receivers: Vec<String> = prefixes.into_iter().collect();
+    Ok(store
+        .unresolved_refs_of_language_through(Language::Dart, &receivers)?
+        .into_iter()
+        .filter(|reference| {
+            reference.reference_kind == EdgeKind::Calls
+                && unchanged(&reference.file_path)
+                && reference
+                    .reference_name
+                    .split_once('.')
+                    .is_some_and(|(_, member)| names.contains(member))
+        })
+        .map(|reference| FileReferenceSite {
+            file_path: reference.file_path,
+            site: Some(ReferenceSite {
+                from_node_id: reference.from_node_id,
+                line: reference.line,
+                col: reference.col,
+            }),
+        })
+        .collect())
 }
 
 /// Every Dart file re-resolves and every row is rebuilt from disk (a changed

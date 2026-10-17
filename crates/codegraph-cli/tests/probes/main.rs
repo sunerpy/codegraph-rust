@@ -17205,3 +17205,237 @@ mod dart_constructors {
         );
     }
 }
+
+mod dart_prefixes {
+    use super::support::{Graph, Project};
+
+    /// `<kind> <line> -> <target file>:<target qualified name>` for every call
+    /// or construction out of `file`'s nodes, sorted (upstream's `callsFrom`,
+    /// without the reference name: KEEP-RUST, a chain's link is recorded by
+    /// its member where the chain starts).
+    fn calls_from(graph: &Graph, file: &str) -> Vec<String> {
+        let mut out: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|e| e.kind == "calls" || e.kind == "instantiates")
+            .filter_map(|e| {
+                let source = graph.node(&e.source)?;
+                (source.file_path == file).then_some(())?;
+                let target = graph.node(&e.target)?;
+                Some(format!(
+                    "{} {} -> {}:{}",
+                    e.kind, e.line?, target.file_path, target.qualified_name
+                ))
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// Upstream #2389 (`dart-import-prefix-calls.test.ts`, its fixture): a
+    /// Dart call through an import prefix calls a top-level declaration the
+    /// libraries imported with that prefix export, `export` chains, `show`
+    /// and `hide` followed and a part taking its library's prefixes, or
+    /// nothing in the project (a package outside the repository, a name not
+    /// shown or hidden, a deferred library's `loadLibrary`); a constructor
+    /// call constructs the prefixed library's class, and a chain headed by
+    /// the prefix (`p.Box.create()`, `p.Box<int>.named()`) is on the type the
+    /// prefix brings in. Never another library's namesake or a method by the
+    /// receiver's name; a parameter named like the prefix is the parameter.
+    /// KEEP-RUST: `const kit.Box.named()` is read as the named constructor it
+    /// calls (W4-DART-03a), so it links `Box.named` of the type kit brings
+    /// in, where upstream records `kit.named` and links nothing.
+    #[test]
+    fn pr2389_a_dart_call_through_an_import_prefix_reaches_what_that_import_exports() {
+        let project = Project::new()
+            .file("pubspec.yaml", "name: app\n")
+            .file("lib/legacy.dart", "class Http {\n  Future<String> get(Uri url) async => '';\n}\n\nclass Client {\n  Client();\n  static Client fromEnv() => Client();\n}\n\nclass Formatter {\n  String describe(Object value) => '';\n}\n\nclass Loader {\n  int load() => 0;\n}\n\nclass Report {\n  Report.empty();\n  static Report blank() => Report.empty();\n}\n\nclass Box<T> {\n  const Box.named();\n  static Box<int> create() => const Box.named();\n}\n\nString describe(Object value) => 'legacy';\nint shown() => 0;\n")
+            .file("lib/src/format.dart", "String describe(Object value) => '$value';\n\nclass Report {\n  Report();\n  Report.empty();\n  static Report blank() => Report();\n}\n")
+            .file("lib/src/tools.dart", "int secret() => 1;\nint open() => 2;\n")
+            .file("lib/lazy.dart", "int load() => 1;\n")
+            .file("packages/kit/pubspec.yaml", "name: kit\n")
+            .file("packages/kit/lib/kit.dart", "export 'src/impl.dart' show shown, Widget, Box, named;\n")
+            .file("packages/kit/lib/src/impl.dart", "int shown() => 1;\nint notShown() => 2;\nint named() => 3;\n\nclass Widget {\n  Widget();\n}\n\nclass Box<T> {\n  const Box.named();\n  static Box<int> create() => const Box.named();\n}\n")
+            .file("lib/net.dart", "import 'package:http/http.dart' as http;\n\nFuture<void> fetch() async {\n  await http.get(Uri.parse('https://example.com'));\n  http.Client();\n  http.Client.fromEnv();\n}\n")
+            .file("lib/app.dart", "import 'package:kit/kit.dart' as kit;\nimport 'src/format.dart' as fmt;\nimport 'src/tools.dart' as tools hide secret;\nimport 'lazy.dart' deferred as lazy;\n\npart 'app_part.dart';\n\nString run(Object value) {\n  fmt.Report();\n  fmt.Report.empty();\n  fmt.Report.blank();\n  kit.shown();\n  kit.notShown();\n  kit.Widget();\n  tools.open();\n  tools.secret();\n  final box = kit.Box<int>.named();\n  kit.Box.create();\n  const kit.Box.named();\n  return fmt.describe(value);\n}\n\nFuture<int> boot() async {\n  await lazy.loadLibrary();\n  return lazy.load();\n}\n")
+            .file("lib/app_part.dart", "part of 'app.dart';\n\nString again(Object value) => fmt.describe(value);\n")
+            .file("lib/shadow.dart", "import 'package:http/http.dart' as http;\nimport 'legacy.dart';\n\nFuture<String> viaParameter(Http http) => http.get(Uri());\n")
+            .index();
+        let graph = project.graph();
+        let report = graph.report();
+        assert_eq!(
+            calls_from(graph, "lib/net.dart"),
+            Vec::<String>::new(),
+            "{report}"
+        );
+        let app = calls_from(graph, "lib/app.dart");
+        for edge in [
+            "calls 20 -> lib/src/format.dart:describe",
+            "calls 25 -> lib/lazy.dart:load",
+            "calls 12 -> packages/kit/lib/src/impl.dart:shown",
+            "instantiates 14 -> packages/kit/lib/src/impl.dart:Widget",
+            "calls 15 -> lib/src/tools.dart:open",
+            "instantiates 9 -> lib/src/format.dart:Report",
+            "calls 10 -> lib/src/format.dart:Report::empty",
+            "calls 11 -> lib/src/format.dart:Report::blank",
+            "calls 17 -> packages/kit/lib/src/impl.dart:Box::named",
+            "calls 18 -> packages/kit/lib/src/impl.dart:Box::create",
+            "calls 19 -> packages/kit/lib/src/impl.dart:Box::named",
+        ] {
+            assert!(app.contains(&edge.to_string()), "{edge}\n{report}");
+        }
+        // Not shown by kit.dart, hidden from `tools`, the deferred library's
+        // own `loadLibrary`: lines 13, 16 and 24.
+        assert!(
+            !app.iter().any(|edge| [" 13 ", " 16 ", " 24 "]
+                .iter()
+                .any(|line| edge.contains(line))),
+            "{report}"
+        );
+        assert_eq!(
+            calls_from(graph, "lib/app_part.dart"),
+            ["calls 3 -> lib/src/format.dart:describe"],
+            "{report}"
+        );
+        assert!(
+            !app.iter().any(|edge| edge.contains("lib/legacy.dart")),
+            "{report}"
+        );
+        assert_eq!(
+            calls_from(graph, "lib/shadow.dart"),
+            ["calls 4 -> lib/legacy.dart:Http::get"],
+            "{report}"
+        );
+    }
+
+    /// A chain headed by an import prefix (upstream #2389's
+    /// `typeDartPrefixedHead`) is typed from what the prefix brings in: a
+    /// function's declared return type, a constant's type; a member or a
+    /// parameter named like the prefix hides it, there, as it hides a plain
+    /// prefixed call. A null-aware `fmt?.describe(…)` is written on no
+    /// prefix, whatever `fmt` names.
+    #[test]
+    fn pr2389_a_prefixed_chain_is_typed_from_what_its_prefix_brings_in() {
+        let project = Project::new()
+            .file("pubspec.yaml", "name: app\n")
+            .file(
+                "lib/src/format.dart",
+                "class Item {\n  void save() {}\n}\n\nItem make() => Item();\n\nconst config = Item();\n\nString describe(Object value) => '';\n",
+            )
+            .file(
+                "lib/legacy.dart",
+                "class Other {\n  void save() {}\n}\n\nOther make() => Other();\n\nclass Fmt {\n  String describe(Object value) => '';\n\n  Other make() => Other();\n}\n",
+            )
+            .file(
+                "lib/app.dart",
+                "import 'src/format.dart' as fmt;\nimport 'legacy.dart';\n\nvoid viaFunction() {\n  fmt.make().save();\n}\n\nvoid viaConstant() {\n  fmt.config.save();\n}\n\nvoid viaParameter(Fmt fmt) {\n  fmt.describe(1);\n}\n\nclass Holder {\n  final Fmt fmt = Fmt();\n\n  void viaMember() {\n    fmt.describe(2);\n  }\n}\n\nvoid viaParameterChain(Fmt fmt) {\n  fmt.make().save();\n}\n\nvoid viaNullableParameter(Fmt? fmt) {\n  fmt?.describe(3);\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        let report = graph.report();
+        let calls = calls_from(graph, "lib/app.dart");
+        for edge in [
+            "calls 5 -> lib/src/format.dart:make",
+            "calls 5 -> lib/src/format.dart:Item::save",
+            "calls 9 -> lib/src/format.dart:Item::save",
+            "calls 13 -> lib/legacy.dart:Fmt::describe",
+            "calls 20 -> lib/legacy.dart:Fmt::describe",
+            "calls 25 -> lib/legacy.dart:Fmt::make",
+            "calls 25 -> lib/legacy.dart:Other::save",
+        ] {
+            assert!(calls.contains(&edge.to_string()), "{edge}\n{report}");
+        }
+        assert!(
+            !calls
+                .iter()
+                .any(|edge| edge.contains("Other") && !edge.starts_with("calls 25 ")),
+            "{report}"
+        );
+        assert!(
+            !calls
+                .iter()
+                .any(|edge| edge == "calls 25 -> lib/src/format.dart:Item::save"),
+            "{report}"
+        );
+        assert!(
+            !calls
+                .iter()
+                .any(|edge| edge.contains("format.dart:describe")),
+            "{report}"
+        );
+    }
+
+    /// `<decorated> -> <target kind> <target file>:<target qualified name>`
+    /// for each `decorates` edge, sorted (upstream's `decorations`).
+    fn decorations(graph: &Graph) -> Vec<String> {
+        let mut out: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|e| e.kind == "decorates")
+            .filter_map(|e| {
+                let from = graph.node(&e.source)?;
+                let to = graph.node(&e.target)?;
+                Some(format!(
+                    "{} -> {} {}:{}",
+                    from.qualified_name, to.kind, to.file_path, to.qualified_name
+                ))
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// Upstream #2390 (`dart-annotation-targets.test.ts`, its fixture): a
+    /// Dart annotation is a constant expression, so it links what it is
+    /// written as: a constant or (called) a class its library sees, through
+    /// its import prefix; a type's static constant, enum value or (called)
+    /// named constructor; on a member, a static constant of the type around
+    /// it. Never a method, getter or function: `@riverpod` is
+    /// riverpod_annotation's constant, not the analyzer's extension getter,
+    /// and `@meta.protected` / `@meta.immutable` are package:meta's. KEEP-RUST:
+    /// this grammar writes a dotted annotation's name as a `qualified` node,
+    /// recorded by its last name as upstream records it.
+    #[test]
+    fn pr2390_a_dart_annotation_links_what_it_is_written_as() {
+        let project = Project::new()
+            .file("packages/riverpod_annotation/pubspec.yaml", "name: riverpod_annotation\n")
+            .file("packages/riverpod_annotation/lib/riverpod_annotation.dart", "export 'src/riverpod_annotation.dart';\n")
+            .file("packages/riverpod_annotation/lib/src/riverpod_annotation.dart", "final class Riverpod {\n  const Riverpod({this.keepAlive = false});\n\n  const Riverpod.forever() : keepAlive = true;\n\n  static const scoped = Riverpod();\n\n  final bool keepAlive;\n}\n\nconst riverpod = Riverpod();\n\nenum Retry { never, always }\n")
+            .file("packages/riverpod_analyzer_utils/pubspec.yaml", "name: riverpod_analyzer_utils\n")
+            .file("packages/riverpod_analyzer_utils/lib/src/nodes.dart", "part 'nodes/annotation.dart';\n\nconst _ast = Object();\n\nclass AnnotatedNode {}\n\nbool protected(Object node) => true;\n")
+            .file("packages/riverpod_analyzer_utils/lib/src/nodes/annotation.dart", "part of '../nodes.dart';\n\n@_ast\nextension RiverpodAnnotatedAnnotatedNodeOfX on AnnotatedNode {\n  Object? get riverpod => null;\n}\n")
+            .file("examples/counter/pubspec.yaml", "name: counter\n")
+            .file("examples/counter/lib/counter.dart", "import 'package:meta/meta.dart' as meta;\nimport 'package:riverpod_annotation/riverpod_annotation.dart';\n\n@riverpod\nint counter(Object ref) => 0;\n\n@riverpod\n// expect_lint: functional_ref\nint linted(Object ref) => 0;\n\n@Riverpod(keepAlive: true)\nclass Todos {\n  static const marker = Riverpod();\n\n  @marker\n  void add() {}\n\n  @meta.protected\n  void reset() {}\n}\n\n@Riverpod.forever()\nint kept(Object ref) => 0;\n\n@Riverpod.scoped\nint scopedCounter(Object ref) => 0;\n\n@Retry.always\nint retried(Object ref) => 0;\n\n@meta.immutable\nclass Frozen {}\n")
+            .file("examples/counter/lib/immutable.dart", "const immutable = Object();\n")
+            .index();
+        let graph = project.graph();
+        let report = graph.report();
+        let annotation = "packages/riverpod_annotation/lib/src/riverpod_annotation.dart";
+        let app = "examples/counter/lib/counter.dart";
+        let expected: Vec<String> = [
+            "RiverpodAnnotatedAnnotatedNodeOfX -> constant packages/riverpod_analyzer_utils/lib/src/nodes.dart:_ast".to_string(),
+            format!("Todos -> class {annotation}:Riverpod"),
+            format!("Todos::add -> constant {app}:Todos::marker"),
+            format!("counter -> constant {annotation}:riverpod"),
+            format!("kept -> method {annotation}:Riverpod::forever"),
+            format!("linted -> constant {annotation}:riverpod"),
+            format!("retried -> enum_member {annotation}:Retry::always"),
+            format!("scopedCounter -> constant {annotation}:Riverpod::scoped"),
+        ]
+        .into_iter()
+        .collect();
+        let mut expected = expected;
+        expected.sort();
+        assert_eq!(decorations(graph), expected, "{report}");
+        // The dotted ones are recorded, and left to package:meta.
+        for name in ["protected", "immutable"] {
+            assert!(
+                graph
+                    .unresolved
+                    .iter()
+                    .any(|r| r.reference_kind == "decorates" && r.reference_name == name),
+                "{name}\n{report}"
+            );
+        }
+    }
+}

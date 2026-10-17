@@ -1042,6 +1042,13 @@ matrix! {
     dart_bare_call_leaves_a_method_that_becomes_a_constructor,
     dart_bare_call_reaches_a_constructor_that_becomes_a_method,
     dart_call_through_a_type_reaches_a_factory_added_below_a_getter_of_its_name,
+    dart_prefixed_call_reaches_a_name_its_barrel_starts_to_show,
+    dart_prefixed_call_leaves_a_name_its_barrel_stops_showing,
+    dart_prefixed_call_in_a_part_follows_a_prefix_its_library_gains,
+    dart_chain_through_a_prefix_reaches_the_member_its_type_gains,
+    dart_annotation_reaches_a_constant_its_imported_library_gains,
+    dart_prefixed_call_reaches_a_function_its_library_gains_past_the_tail_ceiling,
+    dart_prefixed_call_reaches_a_name_its_barrel_starts_to_show_past_the_tail_ceiling,
     #[ignore = "W5-06: a pubspec.yaml change does not re-resolve the project's Dart files"]
     dart_pubspec_rename_strands_a_package_import,
     #[ignore = "W5-06: a pubspec.yaml change does not re-resolve the project's Dart files"]

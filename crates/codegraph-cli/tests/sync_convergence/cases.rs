@@ -9984,6 +9984,204 @@ pub fn dart_call_through_a_type_reaches_a_factory_added_below_a_getter_of_its_na
         )
 }
 
+/// A call through an import prefix reaches a name the prefixed package's
+/// barrel starts to show (upstream #2389): the caller's file is unchanged.
+pub fn dart_prefixed_call_reaches_a_name_its_barrel_starts_to_show() -> Case {
+    Case::new(Change::ReexportEdit, &[Language::Dart])
+        .file("pubspec.yaml", "name: app\n")
+        .file("packages/kit/pubspec.yaml", "name: kit\n")
+        .file(
+            "packages/kit/lib/kit.dart",
+            "export 'src/impl.dart' show shown;\n",
+        )
+        .file(
+            "packages/kit/lib/src/impl.dart",
+            "int shown() => 1;\nint notShown() => 2;\n",
+        )
+        .file(
+            "lib/app.dart",
+            "import 'package:kit/kit.dart' as kit;\n\nint run() => kit.notShown() + kit.shown();\n",
+        )
+        .write(
+            "packages/kit/lib/kit.dart",
+            "export 'src/impl.dart' show shown, notShown;\n",
+        )
+        .edge_throughout("function run", "calls", "function shown")
+        .edge_after("function run", "calls", "function notShown")
+}
+
+/// The reverse: the barrel stops showing the name, and the call links
+/// nothing.
+pub fn dart_prefixed_call_leaves_a_name_its_barrel_stops_showing() -> Case {
+    Case::new(Change::ReexportEdit, &[Language::Dart])
+        .file("pubspec.yaml", "name: app\n")
+        .file("packages/kit/pubspec.yaml", "name: kit\n")
+        .file(
+            "packages/kit/lib/kit.dart",
+            "export 'src/impl.dart' show shown, notShown;\n",
+        )
+        .file(
+            "packages/kit/lib/src/impl.dart",
+            "int shown() => 1;\nint notShown() => 2;\n",
+        )
+        .file(
+            "lib/app.dart",
+            "import 'package:kit/kit.dart' as kit;\n\nint run() => kit.notShown() + kit.shown();\n",
+        )
+        .write(
+            "packages/kit/lib/kit.dart",
+            "export 'src/impl.dart' show shown;\n",
+        )
+        .edge_before("function run", "calls", "function notShown")
+        .no_edge_after("function run", "calls", "function notShown")
+}
+
+/// A part takes its library's import prefixes: the library gains the import,
+/// and the unchanged part's prefixed call reaches what it brings in.
+pub fn dart_prefixed_call_in_a_part_follows_a_prefix_its_library_gains() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Dart])
+        .file("pubspec.yaml", "name: app\n")
+        .file("lib/format.dart", "String describe(Object value) => '';\n")
+        .file("lib/app.dart", "part 'app_part.dart';\n")
+        .file(
+            "lib/app_part.dart",
+            "part of 'app.dart';\n\nString again(Object value) => fmt.describe(value);\n",
+        )
+        .write(
+            "lib/app.dart",
+            "import 'format.dart' as fmt;\n\npart 'app_part.dart';\n",
+        )
+        .edge_after("function again", "calls", "function describe")
+}
+
+/// A chain through an import prefix is on the type the prefix brings in: it
+/// reaches the static member that type gains, never a namesake's (upstream
+/// #2389).
+pub fn dart_chain_through_a_prefix_reaches_the_member_its_type_gains() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Dart])
+        .file("pubspec.yaml", "name: app\n")
+        .file("packages/kit/pubspec.yaml", "name: kit\n")
+        .file("packages/kit/lib/kit.dart", "export 'src/impl.dart';\n")
+        .file(
+            "packages/kit/lib/src/impl.dart",
+            "class Box {\n  const Box();\n}\n",
+        )
+        .file(
+            "lib/legacy.dart",
+            "class Box {\n  static Box create() => Box();\n}\n",
+        )
+        .file(
+            "lib/app.dart",
+            "import 'package:kit/kit.dart' as kit;\nimport 'legacy.dart';\n\nObject run() => kit.Box.create();\n",
+        )
+        .write(
+            "packages/kit/lib/src/impl.dart",
+            "class Box {\n  const Box();\n\n  static Box create() => const Box();\n}\n",
+        )
+        .edge_after(
+            "function run",
+            "calls",
+            "method Box::create @packages/kit/lib/src/impl.dart",
+        )
+        .no_edge_after("function run", "calls", "method Box::create @lib/legacy.dart")
+}
+
+/// An annotation is a constant: it reaches the one its imported library
+/// gains, never a getter of the name (upstream #2390).
+pub fn dart_annotation_reaches_a_constant_its_imported_library_gains() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Dart])
+        .file("pubspec.yaml", "name: app\n")
+        .file(
+            "lib/annotation.dart",
+            "class Riverpod {\n  const Riverpod();\n}\n",
+        )
+        .file(
+            "lib/nodes.dart",
+            "extension Annotated on Object {\n  Object? get riverpod => null;\n}\n",
+        )
+        .file(
+            "lib/app.dart",
+            "import 'annotation.dart';\nimport 'nodes.dart';\n\n@riverpod\nint counter() => 0;\n",
+        )
+        .write(
+            "lib/annotation.dart",
+            "class Riverpod {\n  const Riverpod();\n}\n\nconst riverpod = Riverpod();\n",
+        )
+        .edge_after("function counter", "decorates", "constant riverpod")
+        .no_edge_after(
+            "function counter",
+            "decorates",
+            "method Annotated::riverpod",
+        )
+}
+
+/// 501 parked calls of `describe` through types the project lacks.
+static DESCRIBE_CALLS: LazyLock<String> = LazyLock::new(|| {
+    let mut text = String::new();
+    for index in 0..501 {
+        text.push_str(&format!(
+            "final noise{index} = Missing{index}.describe(1);\n"
+        ));
+    }
+    text
+});
+
+/// A call through an import prefix reaches the function its prefixed library
+/// gains, past the tail ceiling: 501 parked calls share the tail `describe`
+/// (upstream #2389).
+pub fn dart_prefixed_call_reaches_a_function_its_library_gains_past_the_tail_ceiling() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Dart])
+        .file("pubspec.yaml", "name: app\n")
+        .file("lib/format.dart", "int unrelated() => 0;\n")
+        .file(
+            "lib/app.dart",
+            "import 'format.dart' as fmt;\n\nString run(Object value) => fmt.describe(value);\n",
+        )
+        .file("noise/noise.dart", DESCRIBE_CALLS.as_str())
+        .write(
+            "lib/format.dart",
+            "int unrelated() => 0;\n\nString describe(Object value) => '';\n",
+        )
+        .edge_after("function run", "calls", "function describe")
+}
+
+/// 501 parked calls of `notShown` through types the project lacks.
+static NOT_SHOWN_CALLS: LazyLock<String> = LazyLock::new(|| {
+    let mut text = String::new();
+    for index in 0..501 {
+        text.push_str(&format!(
+            "final noise{index} = Missing{index}.notShown();\n"
+        ));
+    }
+    text
+});
+
+/// The same for a name the prefixed package's barrel starts to show, past
+/// the tail ceiling: no declaration of the name comes or goes.
+pub fn dart_prefixed_call_reaches_a_name_its_barrel_starts_to_show_past_the_tail_ceiling() -> Case {
+    Case::new(Change::ReexportEdit, &[Language::Dart])
+        .file("pubspec.yaml", "name: app\n")
+        .file("packages/kit/pubspec.yaml", "name: kit\n")
+        .file(
+            "packages/kit/lib/kit.dart",
+            "export 'src/impl.dart' show shown;\n",
+        )
+        .file(
+            "packages/kit/lib/src/impl.dart",
+            "int shown() => 1;\nint notShown() => 2;\n",
+        )
+        .file(
+            "lib/app.dart",
+            "import 'package:kit/kit.dart' as kit;\n\nint run() => kit.notShown();\n",
+        )
+        .file("noise/noise.dart", NOT_SHOWN_CALLS.as_str())
+        .write(
+            "packages/kit/lib/kit.dart",
+            "export 'src/impl.dart' show shown, notShown;\n",
+        )
+        .edge_after("function run", "calls", "function notShown")
+}
+
 /// 501 parked calls of `autoDispose` through types the project lacks.
 static AUTO_DISPOSE_CALLS: LazyLock<String> = LazyLock::new(|| {
     let mut text = String::new();

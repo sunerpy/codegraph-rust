@@ -760,7 +760,7 @@ fn read_chain(text: &str, end: usize) -> Option<Chain> {
 /// The `>` closing a Dart type argument list opened at `open`, one followed by
 /// a call, a member or another `>` (which a comparison's `<` never is)
 /// (upstream `dartTypeArgumentsEnd`).
-fn type_arguments_end(text: &[u8], open: usize) -> Option<usize> {
+pub(crate) fn type_arguments_end(text: &[u8], open: usize) -> Option<usize> {
     let mut depth = 0i64;
     let mut k = open;
     while k < text.len() && k - open < 400 {
@@ -833,12 +833,15 @@ fn group_close(text: &[u8], open: usize) -> Option<usize> {
 }
 
 /// What a chain evaluates to: an instance of `type_name`, or (`is_static`)
-/// the type itself, before a static member (upstream `DartValue`).
+/// the type itself, before a static member — of the type the file `owner`
+/// declares, when the chain says which (`p.Box` names the one `p` brings in,
+/// upstream #2389) (upstream `DartValue`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Value {
     type_name: String,
     is_static: bool,
     via_super: bool,
+    owner: Option<String>,
 }
 
 fn instance(type_name: String) -> Value {
@@ -846,6 +849,7 @@ fn instance(type_name: String) -> Value {
         type_name,
         is_static: false,
         via_super: false,
+        owner: None,
     }
 }
 
@@ -917,33 +921,43 @@ impl Typing<'_> {
                 type_args,
                 call,
                 keyword,
+                start,
                 ..
             } => {
-                let (mut name, mut type_args, mut call, mut keyword) =
-                    (name.as_str(), type_args.as_slice(), *call, keyword.as_str());
                 // `p.Provider.autoDispose`: an import prefix names a library,
-                // so the chain starts at the link after it.
+                // so the chain starts at the link after it, which names what
+                // that library exports (upstream #2389). A parameter, local
+                // or member named like the prefix hides it.
                 if let Some(first) = links.first()
-                    && !call
+                    && !*call
                     && type_args.is_empty()
                     && !first.index
-                    && self.import_prefixes(&site.view.file_path).contains(name)
+                    && crate::dart_libraries::dart_import_prefixes(
+                        &site.view.file_path,
+                        self.context,
+                    )
+                    .contains(name.as_str())
+                    && !crate::dart_prefixes::is_dart_name_hidden(
+                        name,
+                        &site.view.file_path,
+                        site.view.line,
+                        *start,
+                        self.context,
+                    )
                 {
-                    name = &first.name;
-                    type_args = &first.type_args;
-                    call = first.call;
-                    keyword = "";
                     links = &links[1..];
+                    self.prefixed_head(name, first, site, depth)
+                } else {
+                    // `const Foo.named(…)`: the named constructor is the
+                    // head's own link.
+                    if (keyword == "const" || keyword == "new")
+                        && !*call
+                        && links.first().is_some_and(|link| link.call)
+                    {
+                        links = &links[1..];
+                    }
+                    self.type_head(name, type_args, *call, keyword, site, depth)
                 }
-                // `const Foo.named(…)`: the named constructor is the head's
-                // own link.
-                if (keyword == "const" || keyword == "new")
-                    && !call
-                    && links.first().is_some_and(|link| link.call)
-                {
-                    links = &links[1..];
-                }
-                self.type_head(name, type_args, call, keyword, site, depth)
             }
         };
         for link in links {
@@ -975,18 +989,10 @@ impl Typing<'_> {
         value
     }
 
-    /// The import prefixes the site's file declares (upstream #2376 reads the
-    /// file's own `import … as p`; W4-DART-02's directives).
-    fn import_prefixes(&self, file: &str) -> BTreeSet<String> {
-        self.context
-            .dart_libraries()
-            .import_prefixes_of(file, self.context)
-    }
-
     /// Whether the type a chain has reached declares the member a link names.
     fn link_declared(&self, value: &Value, link: &Link, site: &Site) -> bool {
         if value.is_static {
-            self.static_member(&value.type_name, &link.name, site)
+            self.static_member(&value.type_name, &link.name, site, value.owner.as_deref())
                 .is_some()
         } else {
             dart_member_of(
@@ -1044,6 +1050,7 @@ impl Typing<'_> {
                 type_name: own.name.clone(),
                 is_static: false,
                 via_super: name == "super",
+                owner: None,
             });
         }
         if matches!(keyword, "const" | "new" | "as") {
@@ -1084,6 +1091,7 @@ impl Typing<'_> {
                 type_name: name.to_string(),
                 is_static: true,
                 via_super: false,
+                owner: None,
             });
         }
         self.variable_type(name, site, depth).map(instance)
@@ -1096,7 +1104,9 @@ impl Typing<'_> {
             return None;
         }
         if value.is_static {
-            let Some(member) = self.static_member(&value.type_name, &link.name, site) else {
+            let Some(member) =
+                self.static_member(&value.type_name, &link.name, site, value.owner.as_deref())
+            else {
                 // `BlocProvider.value(…)`: a constructor the index holds no
                 // node for.
                 return (link.call && self.is_type_name(&value.type_name))
@@ -1243,9 +1253,67 @@ impl Typing<'_> {
 
     /// The static member `name` the Dart type `type_name` itself declares
     /// ([`crate::dart_members::dart_static_member`]), preferring the site's
-    /// file.
-    fn static_member(&self, type_name: &str, name: &str, site: &Site) -> Option<Arc<Node>> {
-        crate::dart_members::dart_static_member(type_name, name, &site.view.file_path, self.context)
+    /// file; of the type the file `owner` declares, when given.
+    fn static_member(
+        &self,
+        type_name: &str,
+        name: &str,
+        site: &Site,
+        owner: Option<&str>,
+    ) -> Option<Arc<Node>> {
+        crate::dart_members::dart_static_member(
+            type_name,
+            name,
+            &site.view.file_path,
+            self.context,
+            &|type_node| owner.is_none_or(|owner| type_node.file_path == owner),
+        )
+    }
+
+    /// What the first link after an import prefix evaluates to —
+    /// `p.Provider` before a static member, `p.Report(…)`, `p.make(…)`,
+    /// `p.config` — read from the top-level declarations the prefixed import
+    /// brings in, and nothing when it brings in none of that name: a package
+    /// outside the repository, whatever the project declares under the name
+    /// elsewhere (upstream #2389 `typeDartPrefixedHead`).
+    fn prefixed_head(&self, prefix: &str, link: &Link, site: &Site, depth: u32) -> Option<Value> {
+        let found = crate::dart_prefixes::dart_prefixed_decls(
+            prefix,
+            &link.name,
+            &site.view.file_path,
+            self.context,
+        );
+        let types: Vec<&Arc<Node>> = found
+            .iter()
+            .filter(|node| is_dart_type_kind(node.kind))
+            .collect();
+        if !types.is_empty() {
+            return Some(Value {
+                type_name: link.name.clone(),
+                is_static: !link.call,
+                via_super: false,
+                owner: (types.len() == 1).then(|| types[0].file_path.clone()),
+            });
+        }
+        let [decl] = found.as_slice() else {
+            return None;
+        };
+        if decl.kind == NodeKind::Function {
+            return if link.call {
+                self.return_type(decl, &link.type_args).map(instance)
+            } else {
+                None
+            };
+        }
+        if !matches!(decl.kind, NodeKind::Constant | NodeKind::Variable) {
+            return None;
+        }
+        let held = self.constant_type(decl, site, depth)?;
+        if link.call {
+            self.call_result(&held, &link.type_args, site)
+        } else {
+            Some(instance(held))
+        }
     }
 
     /// The function a bare Dart call `name(…)` means: a member of the type
@@ -1740,7 +1808,12 @@ fn match_link(
             if receiver.is_static {
                 // Static members are the type's own: `p.Provider.autoDispose(…)`
                 // calls the constant, as `Provider.autoDispose(…)` does.
-                let found = typing.static_member(&receiver.type_name, member, &site)?;
+                let found = typing.static_member(
+                    &receiver.type_name,
+                    member,
+                    &site,
+                    receiver.owner.as_deref(),
+                )?;
                 (found.kind != NodeKind::EnumMember)
                     .then(|| (found.id.clone(), ResolvedBy::QualifiedName))
             } else {

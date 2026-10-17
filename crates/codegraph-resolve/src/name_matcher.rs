@@ -6578,7 +6578,7 @@ fn drop_last(path: &str) -> Vec<&str> {
 
 /// Find the best matching node among multiple candidates (`findBestMatch`,
 /// `name-matcher.ts:973-1055`).
-fn find_best_match<'a, T: Borrow<Node>>(
+pub(crate) fn find_best_match<'a, T: Borrow<Node>>(
     reference: &RefView,
     candidates: &'a [T],
 ) -> Option<&'a Node> {
@@ -7713,6 +7713,14 @@ pub fn match_reference(
     // would bind it by the member's name alone (upstream #2118).
     if crate::swift_type_visibility::is_swift_type_path_call(reference) {
         return crate::swift_type_visibility::resolve_swift_type_path_call(reference, context);
+    }
+
+    // A Dart call through an import prefix (`http.get(…)`) is to what the
+    // prefixed import exports, or to nothing: the strategies below would take
+    // the prefix for a receiver and guess a method by its name (upstream
+    // #2389).
+    if let Some(prefixed) = crate::dart_prefixes::match_dart_prefixed_call(reference, context) {
+        return prefixed;
     }
 
     // A symbolic name in a Scala type is a type (`F ~> G`) or a

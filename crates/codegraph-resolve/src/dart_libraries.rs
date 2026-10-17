@@ -571,6 +571,7 @@ pub struct DartLibraries {
     members: Mutex<HashMap<String, Arc<BTreeSet<String>>>>,
     exports: Mutex<HashMap<String, Arc<Namespace>>>,
     scopes: Mutex<HashMap<String, Option<Arc<FileScope>>>>,
+    prefixes: Mutex<HashMap<String, Arc<BTreeSet<String>>>>,
 }
 
 fn memo_get<K, V>(memo: &Mutex<HashMap<K, V>>, key: &K) -> Option<V>
@@ -1433,22 +1434,39 @@ impl DartLibraries {
             .collect()
     }
 
-    /// The prefixes `file`'s own imports declare (`import '…' as p`,
-    /// `deferred as p`), which upstream #2376 reads from the file itself.
-    pub fn import_prefixes_of(
+    /// The import prefixes written in `file` can stand for — the `p` of
+    /// `import '…' as p` and `deferred as p` — read from the imports of its
+    /// library, which a part takes from the file it is part of (upstream
+    /// #2389 `dartImportPrefixes`).
+    pub fn import_prefixes_in(
         &self,
         file: &str,
         context: &dyn ResolutionContext,
-    ) -> BTreeSet<String> {
-        self.directives_of(file, context)
-            .map(|directives| {
-                directives
-                    .imports
-                    .iter()
-                    .filter_map(|import| import.prefix.clone())
-                    .collect()
-            })
-            .unwrap_or_default()
+    ) -> Arc<BTreeSet<String>> {
+        if let Some(hit) = memo_get(&self.prefixes, &file.to_string()) {
+            return hit;
+        }
+        // Records each part's parent, a library in no package included.
+        self.library_of(file, context);
+        let mut prefixes = BTreeSet::new();
+        let mut current = Some(file.to_string());
+        for _ in 0..32 {
+            let Some(at) = current else {
+                break;
+            };
+            if let Some(directives) = self.directives_of(&at, context) {
+                prefixes.extend(
+                    directives
+                        .imports
+                        .iter()
+                        .filter_map(|import| import.prefix.clone()),
+                );
+            }
+            current = self.parent_of(&at);
+        }
+        let prefixes = Arc::new(prefixes);
+        memo_set(&self.prefixes, file.to_string(), Arc::clone(&prefixes));
+        prefixes
     }
 
     /// The library `file` belongs to, if known.
@@ -1734,6 +1752,15 @@ pub(crate) fn dart_import_prefix_of(
     let word = &before[before.len() - run..];
     let word = word.trim_start_matches(|c: char| c.is_ascii_digit());
     (!word.is_empty()).then(|| word.to_string())
+}
+
+/// The import prefixes written in `file` can stand for, its library's
+/// ([`DartLibraries::import_prefixes_in`]).
+pub(crate) fn dart_import_prefixes(
+    file: &str,
+    context: &dyn ResolutionContext,
+) -> Arc<BTreeSet<String>> {
+    context.dart_libraries().import_prefixes_in(file, context)
 }
 
 /// Whether a Dart name written without a receiver — a call, a type — can mean

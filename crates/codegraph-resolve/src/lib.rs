@@ -29,10 +29,12 @@ mod cpp_type_aliases;
 mod csharp_extensions;
 mod csharp_scopes;
 pub mod csharp_types;
+mod dart_annotations;
 pub mod dart_chains;
 pub mod dart_libraries;
 mod dart_local_scope;
 pub mod dart_members;
+mod dart_prefixes;
 pub mod dart_scope;
 pub mod destructured_calls;
 pub mod framework; // the FrameworkResolver extension point

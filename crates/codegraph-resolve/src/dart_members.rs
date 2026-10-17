@@ -287,7 +287,7 @@ pub(crate) fn dart_extension_member_of(
 }
 
 /// `x.area` / `Config.instance`: the receiver and member of a Dart member read.
-fn member_read_parts(name: &str) -> Option<(&str, &str)> {
+pub(crate) fn member_read_parts(name: &str) -> Option<(&str, &str)> {
     let (receiver, member) = name.split_once('.')?;
     (is_dart_identifier(receiver) && is_dart_identifier(member)).then_some((receiver, member))
 }
@@ -426,16 +426,21 @@ pub(crate) fn is_dart_static_member(member: &Node, context: &dyn ResolutionConte
 /// static method or getter, a named constructor or factory, a static
 /// constant, an enum value — preferring the file `file_path`, then the
 /// nearest (upstream `dartStaticMember`). Static members are not inherited.
+/// `is_owner` narrows the types of that name to the one meant (the one an
+/// import prefix brings in, upstream #2389).
 pub(crate) fn dart_static_member(
     type_name: &str,
     name: &str,
     file_path: &str,
     context: &dyn ResolutionContext,
+    is_owner: &dyn Fn(&Node) -> bool,
 ) -> Option<Arc<Node>> {
     let owners: Vec<Arc<Node>> = context
         .get_nodes_by_name_shared(type_name)
         .into_iter()
-        .filter(|node| node.language == Language::Dart && is_dart_type_kind(node.kind))
+        .filter(|node| {
+            node.language == Language::Dart && is_dart_type_kind(node.kind) && is_owner(node)
+        })
         .collect();
     if owners.is_empty() {
         return None;
@@ -485,7 +490,11 @@ pub(crate) fn dart_static_member(
 /// `BlocProvider.value(…)` went to `RepositoryProvider`'s `value`, and a
 /// static constant's callee is the value it holds (`static const autoDispose
 /// = AutoDisposeFutureProviderBuilder();`). `None` when the receiver names no
-/// Dart type of the project.
+/// Dart type of the project. KEEP-RUST: a call through a type written behind
+/// an import prefix (`p.Box.create()`, `p.Box<int>.named()`) is a chain's
+/// link here, typed through the prefix ([`crate::dart_chains`]), where
+/// upstream #2389 reads the prefix back from the line in this matcher
+/// (`dartTypeCallPrefix`, for its `Box.named` record of such a call).
 pub(crate) fn match_dart_type_member_call(
     type_name: &str,
     member: &str,
@@ -499,7 +508,7 @@ pub(crate) fn match_dart_type_member_call(
     {
         return None;
     }
-    let own = dart_static_member(type_name, member, &reference.file_path, context);
+    let own = dart_static_member(type_name, member, &reference.file_path, context, &|_| true);
     Some(
         own.filter(|own| own.kind != NodeKind::EnumMember)
             .map(|own| ResolvedRef {

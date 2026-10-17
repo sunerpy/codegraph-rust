@@ -87,6 +87,21 @@ impl DartLocalScopes {
     }
 }
 
+/// Whether a parameter, local or local function `name` is bound at byte
+/// offset `at` of the Dart file `file`: where it hides a library name, an
+/// import prefix among them — `http.get(…)` with a parameter `http` calls the
+/// parameter's (upstream #2389 `isDartLocallyBound`).
+pub(crate) fn is_dart_locally_bound(
+    file: &str,
+    name: &str,
+    at: usize,
+    context: &dyn ResolutionContext,
+) -> bool {
+    context
+        .source_facts(file)
+        .is_some_and(|facts| facts.dart_local_scopes().nearest(name, at).is_some())
+}
+
 /// The resolved reference, or `None` when it is a receiver-less Dart call
 /// (or a function passed by name) whose name a parameter or local around it
 /// binds (upstream `gateDartLocal`).

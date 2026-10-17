@@ -7593,6 +7593,14 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
                 target = Some(child);
                 break;
             }
+            // KEEP-RUST: this grammar writes a dotted Dart annotation's name
+            // as a `qualified` node (`@meta.immutable`, `@Riverpod.scoped`,
+            // `@p.Foo.named(…)`), which is recorded by its last name, as
+            // upstream records it (#2390).
+            if child.kind() == "qualified" && self.spec.language() == Language::Dart {
+                target = Some(child);
+                break;
+            }
         }
         let Some(target) = target else { return };
         let mut name = node_text(target, self.source);
