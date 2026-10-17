@@ -2446,6 +2446,24 @@ impl ChangedNames {
                 self.rust_receiver_types.insert(node.name.clone());
             }
         }
+        // A bare Erlang call is written with its arity (`do_get/3`, upstream
+        // #1610) and waits for it under that name, which no node carries: a
+        // function that came, went or changed touches it, so a call parked
+        // until the module it imports from, or a header, declares the
+        // function is retried however many share its name (W4-ERL-01).
+        for node in before.iter().chain(after) {
+            if node.language == Language::Erlang
+                && node.kind == NodeKind::Function
+                && touched.contains(node.name.as_str())
+                && let Some(written) = node.qualified_name.rsplit("::").next()
+                && written.len() > node.name.len()
+                && written.starts_with(node.name.as_str())
+                && written[node.name.len()..].starts_with('/')
+            {
+                self.any.insert(written.to_string());
+                self.candidates.insert(written.to_string());
+            }
+        }
         // A Rust variant path reaches an enum only while it declares the
         // variant (upstream #2354), which no enum node records: a variant that
         // came, went or changed touches its enum's name.

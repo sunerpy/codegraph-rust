@@ -304,7 +304,10 @@ targets unless the order of that name's nodes in its file changed (as upstream
 pairs a re-indexed file's old and new nodes and keeps the edges whose target
 only moved), while a moved node of another language still touches its name,
 since resolution there reads declaration text no node records (a C function's
-`static`); a Python import statement that comes or goes counts the names it
+`static`); an Erlang function that came, went or changed touches its name with
+its arity as well (`do_get/3`), the name a bare call is written and parked
+under, so a call waiting for the module it imports from or a header to declare
+the function is retried however many share it; a Python import statement that comes or goes counts the names it
 can re-export as changed (what it binds, and for a star import every name the
 module offers, as deep as the re-export walk looks), since an importer's name
 then moves with no node of it changing; and a changed Python file refreshes the

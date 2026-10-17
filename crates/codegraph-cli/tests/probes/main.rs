@@ -17515,3 +17515,101 @@ mod solidity_scope {
         );
     }
 }
+
+mod erlang_imports {
+    use super::support::{Graph, Project};
+
+    /// The qualified names of every call edge out of `file`'s nodes, sorted
+    /// (upstream's `callsFrom`).
+    fn calls_from(graph: &Graph, file: &str) -> Vec<String> {
+        let mut out: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|e| e.kind == "calls")
+            .filter_map(|e| {
+                let source = graph.node(&e.source)?;
+                (source.file_path == file).then_some(())?;
+                Some(graph.node(&e.target)?.qualified_name.clone())
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// Upstream #2178 (b) (`solidity-erlang-call-scope.test.ts`, its Erlang
+    /// fixture): another module's function is called bare only through
+    /// `-import(Mod, [f/N])`: cowboy's `-import(req_SUITE, [do_get/3])` went
+    /// to compress_SUITE's `do_get/3`.
+    #[test]
+    fn pr2178_a_bare_erlang_call_reaches_the_module_it_is_imported_from() {
+        let project = Project::new()
+            .file("test/req_SUITE.erl", "-module(req_SUITE).\n-export([do_get/3]).\n\ndo_get(Path, Headers, Config) -> {Path, Headers, Config}.\n")
+            .file("test/compress_SUITE.erl", "-module(compress_SUITE).\n-export([do_get/3]).\n\ndo_get(Path, Headers, Config) -> {Path, Headers, Config}.\n")
+            .file("test/static_handler_SUITE.erl", "-module(static_handler_SUITE).\n-export([etag/1]).\n-import(req_SUITE, [do_get/3]).\n\netag(Config) -> do_get(\"/etag\", [], Config).\n")
+            .index();
+        let graph = project.graph();
+        assert_eq!(
+            calls_from(graph, "test/static_handler_SUITE.erl"),
+            ["req_SUITE::do_get/3"],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// An import list is read as Erlang writes it: a quoted atom is one name,
+    /// whatever comma or slash it holds, and a `%` comment between entries is
+    /// no entry (plan gate round 1).
+    #[test]
+    fn keep_rust_an_erlang_import_list_with_quoted_atoms_and_comments() {
+        let project = Project::new()
+            .file("test/req_SUITE.erl", "-module(req_SUITE).\n-export(['foo,bar'/1, 'a/b'/2, do_get/3]).\n\n'foo,bar'(X) -> X.\n'a/b'(X, Y) -> {X, Y}.\ndo_get(Path, Headers, Config) -> {Path, Headers, Config}.\n")
+            .file("test/compress_SUITE.erl", "-module(compress_SUITE).\n-export(['foo,bar'/1, 'a/b'/2, do_get/3]).\n\n'foo,bar'(X) -> X.\n'a/b'(X, Y) -> {X, Y}.\ndo_get(Path, Headers, Config) -> {Path, Headers, Config}.\n")
+            .file("test/quoted_SUITE.erl", "-module(quoted_SUITE).\n-export([run/1]).\n-import(req_SUITE, ['foo,bar'/1, % the odd one, not/9\n                    'a/b'/2,\n                    do_get/3]).\n\nrun(C) -> 'foo,bar'(C), 'a/b'(C, C), do_get(\"/\", [], C).\n")
+            .index();
+        let graph = project.graph();
+        assert_eq!(
+            calls_from(graph, "test/quoted_SUITE.erl"),
+            [
+                "req_SUITE::a/b/2",
+                "req_SUITE::do_get/3",
+                "req_SUITE::foo,bar/1"
+            ],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// With no `-import`, another module's function is never guessed; a
+    /// function a `.hrl` declares is (a module includes it); an import list
+    /// spread over lines, with quoted atoms, names its functions; a module
+    /// the project lacks links nothing; a call inside a `.hrl` reaches what
+    /// it reached before.
+    #[test]
+    fn keep_rust_an_erlang_import_list_and_headers_are_read_as_written() {
+        let project = Project::new()
+            .file("test/req_SUITE.erl", "-module(req_SUITE).\n-export([do_get/3, do_put/2]).\n\ndo_get(Path, Headers, Config) -> {Path, Headers, Config}.\ndo_put(Path, Config) -> {Path, Config}.\n")
+            .file("test/compress_SUITE.erl", "-module(compress_SUITE).\n-export([do_get/3, do_put/2, map/2]).\n\ndo_get(Path, Headers, Config) -> {Path, Headers, Config}.\ndo_put(Path, Config) -> {Path, Config}.\nmap(F, L) -> {F, L}.\n")
+            .file("src/fmt_util.erl", "-module(fmt_util).\n-export([describe/1]).\n\ndescribe(Value) -> Value.\n")
+            .file("include/helpers.hrl", "helper(Config) -> describe(Config).\n")
+            .file("test/plain_SUITE.erl", "-module(plain_SUITE).\n-export([etag/1]).\n-include(\"../include/helpers.hrl\").\n\netag(Config) -> do_get(\"/etag\", [], Config), helper(Config).\n")
+            .file("test/multi_SUITE.erl", "-module(multi_SUITE).\n-export([put/1, mapped/1]).\n-import(req_SUITE,\n        [do_get/3,\n         'do_put'/2]).\n-import(lists, [map/2]).\n\nput(Config) -> do_put(\"/put\", Config).\nmapped(L) -> map(fun(X) -> X end, L).\n")
+            .index();
+        let graph = project.graph();
+        let report = graph.report();
+        assert_eq!(
+            calls_from(graph, "test/plain_SUITE.erl"),
+            ["helper/1"],
+            "{report}"
+        );
+        assert_eq!(
+            calls_from(graph, "test/multi_SUITE.erl"),
+            ["req_SUITE::do_put/2"],
+            "{report}"
+        );
+        assert_eq!(
+            calls_from(graph, "include/helpers.hrl"),
+            ["fmt_util::describe/1"],
+            "{report}"
+        );
+    }
+}

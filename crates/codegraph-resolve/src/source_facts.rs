@@ -171,6 +171,7 @@ pub struct SourceFacts {
     csharp_namespace_scope: OnceLock<Arc<crate::csharp_types::CsharpNamespaceScope>>,
     dart_code: OnceLock<Arc<crate::dart_chains::DartCode>>,
     dart_local_scopes: OnceLock<Arc<crate::dart_local_scope::DartLocalScopes>>,
+    erlang_imports: OnceLock<Arc<Vec<crate::erlang_imports::ErlangImport>>>,
 }
 
 impl SourceFacts {
@@ -224,6 +225,7 @@ impl SourceFacts {
             csharp_namespace_scope: OnceLock::new(),
             dart_code: OnceLock::new(),
             dart_local_scopes: OnceLock::new(),
+            erlang_imports: OnceLock::new(),
         }
     }
 
@@ -249,6 +251,15 @@ impl SourceFacts {
                 &self.dart_code().text,
             ))
         }))
+    }
+
+    /// The `-import` attributes of the Erlang file, read once (W4-ERL-01,
+    /// upstream #2178 `erlangImportedModule`).
+    pub(crate) fn erlang_imports(&self) -> Arc<Vec<crate::erlang_imports::ErlangImport>> {
+        Arc::clone(
+            self.erlang_imports
+                .get_or_init(|| Arc::new(crate::erlang_imports::erlang_imports_of(&self.source))),
+        )
     }
 
     /// Whether a Rust `use` item visible at byte `offset` names `name` or is a

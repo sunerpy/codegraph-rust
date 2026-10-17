@@ -37,6 +37,7 @@ pub mod dart_members;
 mod dart_prefixes;
 pub mod dart_scope;
 pub mod destructured_calls;
+mod erlang_imports;
 pub mod framework; // the FrameworkResolver extension point
 pub mod frameworks; // concrete react/vue/nestjs FrameworkResolvers
 mod go_calls;

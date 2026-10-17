@@ -7854,6 +7854,37 @@ pub fn match_reference(
                 resolved_by: ResolvedBy::ExactMatch,
             });
         }
+        // Another module's function is called bare only through `-import(Mod,
+        // [f/N])`, or from a `.hrl` a module includes (upstream #2178):
+        // cowboy's `-import(req_SUITE, [do_get/3])` went to compress_SUITE's
+        // `do_get/3`.
+        let imports = context
+            .source_facts(&reference.file_path)
+            .map(|facts| facts.erlang_imports())
+            .unwrap_or_default();
+        if let Some(module) = crate::erlang_imports::imported_module(&imports, name, arity) {
+            let prefix = format!("{module}::");
+            return candidates
+                .iter()
+                .find(|candidate| candidate.qualified_name.starts_with(&prefix))
+                .map(|chosen| ResolvedRef {
+                    original: reference.clone(),
+                    target_node_id: chosen.id.clone(),
+                    confidence: 0.9,
+                    resolved_by: ResolvedBy::ExactMatch,
+                });
+        }
+        let candidates: Vec<Arc<Node>> =
+            if crate::erlang_imports::is_erlang_header(&reference.file_path) {
+                candidates
+            } else {
+                candidates
+                    .into_iter()
+                    .filter(|candidate| {
+                        crate::erlang_imports::is_erlang_header(&candidate.file_path)
+                    })
+                    .collect()
+            };
         if candidates.len() == 1 {
             return Some(ResolvedRef {
                 original: reference.clone(),

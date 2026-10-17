@@ -6521,6 +6521,93 @@ pub fn terraform_rename_a_variable() -> Case {
         )
 }
 
+/// Upstream #2178 (b): a bare call another module's function answers only
+/// through `-import`: the imported module gains it, and the call links it,
+/// never the namesake of a module it does not import.
+pub fn erlang_imported_call_reaches_a_function_its_module_gains() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Erlang])
+        .file(
+            "test/req_SUITE.erl",
+            "-module(req_SUITE).\n-export([other/0]).\n\nother() -> ok.\n",
+        )
+        .file(
+            "test/compress_SUITE.erl",
+            "-module(compress_SUITE).\n-export([do_get/3]).\n\ndo_get(Path, Headers, Config) -> {Path, Headers, Config}.\n",
+        )
+        .file(
+            "test/static_handler_SUITE.erl",
+            "-module(static_handler_SUITE).\n-export([etag/1]).\n-import(req_SUITE, [do_get/3]).\n\netag(Config) -> do_get(\"/etag\", [], Config).\n",
+        )
+        .write(
+            "test/req_SUITE.erl",
+            "-module(req_SUITE).\n-export([other/0, do_get/3]).\n\nother() -> ok.\n\ndo_get(Path, Headers, Config) -> {Path, Headers, Config}.\n",
+        )
+        .edge_after(
+            "function static_handler_SUITE::etag/1",
+            "calls",
+            "function req_SUITE::do_get/3",
+        )
+        .no_edge_after(
+            "function static_handler_SUITE::etag/1",
+            "calls",
+            "function compress_SUITE::do_get/3",
+        )
+}
+
+/// A bare call with no `-import` reaches a function a header gains, and no
+/// other module's.
+pub fn erlang_bare_call_reaches_a_function_its_header_gains() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Erlang])
+        .file("include/helpers.hrl", "-define(TIMEOUT, 100).\n")
+        .file(
+            "src/other.erl",
+            "-module(other).\n-export([helper/1]).\n\nhelper(Config) -> Config.\n",
+        )
+        .file(
+            "src/plain.erl",
+            "-module(plain).\n-export([run/1]).\n-include(\"../include/helpers.hrl\").\n\nrun(Config) -> helper(Config).\n",
+        )
+        .write(
+            "include/helpers.hrl",
+            "-define(TIMEOUT, 100).\n\nhelper(Config) -> Config.\n",
+        )
+        .edge_after("function plain::run/1", "calls", "function helper/1")
+        .no_edge_after("function plain::run/1", "calls", "function other::helper/1")
+}
+
+/// 501 parked bare calls of `do_get/3` that no module imports.
+static PARKED_DO_GET_CALLS: LazyLock<String> = LazyLock::new(|| {
+    let mut text = String::from("-module(noise).\n-export([]).\n\n");
+    for index in 0..501 {
+        text.push_str(&format!("n{index}(C) -> do_get(\"/{index}\", [], C).\n"));
+    }
+    text
+});
+
+/// The imported module gains the function past the tail ceiling: 501 parked
+/// calls share the tail `do_get`.
+pub fn erlang_imported_call_reaches_a_function_its_module_gains_past_the_tail_ceiling() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Erlang])
+        .file(
+            "test/req_SUITE.erl",
+            "-module(req_SUITE).\n-export([other/0]).\n\nother() -> ok.\n",
+        )
+        .file(
+            "test/static_handler_SUITE.erl",
+            "-module(static_handler_SUITE).\n-export([etag/1]).\n-import(req_SUITE, [do_get/3]).\n\netag(Config) -> do_get(\"/etag\", [], Config).\n",
+        )
+        .file("test/noise.erl", PARKED_DO_GET_CALLS.as_str())
+        .write(
+            "test/req_SUITE.erl",
+            "-module(req_SUITE).\n-export([other/0, do_get/3]).\n\nother() -> ok.\n\ndo_get(Path, Headers, Config) -> {Path, Headers, Config}.\n",
+        )
+        .edge_after(
+            "function static_handler_SUITE::etag/1",
+            "calls",
+            "function req_SUITE::do_get/3",
+        )
+}
+
 pub fn erlang_rename_a_remotely_called_function() -> Case {
     Case::new(Change::RenameSymbol, &[Language::Erlang])
         .file(
