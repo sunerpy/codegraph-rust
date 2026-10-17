@@ -569,6 +569,7 @@ fn sync_paths_with_store(
     let swift_bootstrap = crate::swift_heads::needs_bootstrap(store)?;
     let objc_bootstrap = crate::objc_heads::needs_bootstrap(store)?;
     let go_bootstrap = crate::go_heads::needs_bootstrap(store)?;
+    let solidity_bootstrap = crate::solidity_heads::needs_bootstrap(store)?;
     // And for the Rust files writing a path receiver whose type came or
     // went: every Rust file is re-resolved once (W4-RS-03).
     let rust_bootstrap = crate::rust_receivers::needs_bootstrap(store)?;
@@ -664,6 +665,7 @@ fn sync_paths_with_store(
         || swift_bootstrap
         || objc_bootstrap
         || go_bootstrap
+        || solidity_bootstrap
         || rust_bootstrap
         || php_bootstrap
         || case_bootstrap
@@ -839,6 +841,30 @@ fn sync_paths_with_store(
         for file in &cfml.files {
             dependent_sites.remove(file);
             dependent_fallbacks.insert(file.clone());
+        }
+        // And what a bare Solidity call reads of the `is` clauses of the
+        // contracts its chain reaches (W4-SOL-01).
+        let solidity = crate::solidity_heads::solidity_refresh(
+            store,
+            project_root,
+            scope.options.max_file_size,
+            &changed_names.solidity,
+            &reindexed,
+            &changed_names.removed_files,
+            solidity_bootstrap,
+        )?;
+        for file in &solidity.files {
+            dependent_sites.remove(file);
+            dependent_fallbacks.insert(file.clone());
+        }
+        for affected in &solidity.sites {
+            if !dependent_fallbacks.contains(&affected.file_path) {
+                merge_dependent_site(
+                    &mut dependent_sites,
+                    &mut dependent_fallbacks,
+                    affected.clone(),
+                );
+            }
         }
         // And what a Swift type reference reads of the type declarations'
         // heads: extension or not, and the supertypes they name (W4-SW-01).
@@ -1200,6 +1226,7 @@ fn sync_paths_with_store(
         members.write_rows(store)?;
         ruby.write_rows(store)?;
         cfml.write_rows(store)?;
+        solidity.write_rows(store)?;
         swift.write_rows(store)?;
         objc.write_rows(store)?;
         go.write_rows(store)?;
@@ -1216,6 +1243,7 @@ fn sync_paths_with_store(
         crate::member_surfaces::write_marker(store)?;
         crate::ruby_heads::write_marker(store)?;
         crate::cfml_heads::write_marker(store)?;
+        crate::solidity_heads::write_marker(store)?;
         crate::swift_heads::write_marker(store)?;
         crate::objc_heads::write_marker(store)?;
         crate::go_heads::write_marker(store)?;
@@ -1643,6 +1671,7 @@ fn remove_tracked_file(
     changed_names.members.note(store, relative, None)?;
     changed_names.ruby.note(store, relative, None)?;
     changed_names.cfml.note(store, relative, &old_nodes, None)?;
+    changed_names.solidity.note(store, relative, None)?;
     changed_names
         .swift
         .note(store, relative, &old_nodes, None)?;
@@ -2082,6 +2111,11 @@ fn reextract_into_store(
         &old_nodes,
         Some((file.language, source, &result.nodes)),
     )?;
+    changed_names.solidity.note(
+        store,
+        relative,
+        Some((file.language, source, &result.nodes)),
+    )?;
     changed_names.swift.note(
         store,
         relative,
@@ -2265,6 +2299,9 @@ struct ChangedNames {
     /// What the changed files held that a bare CFML call in other files
     /// reads: component classes and `extends` (W4-CF-01).
     cfml: crate::cfml_heads::CfmlChanges,
+    /// What the changed files held that a bare Solidity call in other files
+    /// reads: their types and `is` clauses (W4-SOL-01).
+    solidity: crate::solidity_heads::SolidityChanges,
     swift: crate::swift_heads::SwiftChanges,
     /// What the changed files held that an Objective-C message in other
     /// files reads: class heads and property types (W4-SW-04).
@@ -2329,6 +2366,7 @@ impl ChangedNames {
             crate::member_surfaces::withdraw_marker(store)?;
             crate::ruby_heads::withdraw_marker(store)?;
             crate::cfml_heads::withdraw_marker(store)?;
+            crate::solidity_heads::withdraw_marker(store)?;
             crate::swift_heads::withdraw_marker(store)?;
             crate::objc_heads::withdraw_marker(store)?;
             crate::go_heads::withdraw_marker(store)?;
@@ -5677,6 +5715,104 @@ pub(crate) mod tests {
         // The edited file's row is its new one.
         rebuilt.retain(|(key, _)| key != "cfml_heads:system/Spare.cfc");
         wanted.retain(|(key, _)| key != "cfml_heads:system/Spare.cfc");
+        assert_eq!(rebuilt, wanted);
+        assert_eq!(edge_projection(&db), expected);
+    }
+
+    const SOL_CONTEXT: (&str, &str) = (
+        "contracts/utils/Context.sol",
+        "pragma solidity ^0.8.20;\n\nabstract contract Context {\n    function _msgSender() internal view virtual returns (address) {\n        return msg.sender;\n    }\n}\n",
+    );
+    const SOL_OVERRIDE: (&str, &str) = (
+        "contracts/metatx/ERC2771Context.sol",
+        "pragma solidity ^0.8.20;\n\nimport {Context} from \"../utils/Context.sol\";\n\nabstract contract ERC2771Context is Context {\n    function _msgSender() internal view virtual override returns (address) {\n        return msg.sender;\n    }\n}\n",
+    );
+    const SOL_MIDDLE: (&str, &str) = (
+        "contracts/Middle.sol",
+        "pragma solidity ^0.8.20;\n\nimport \"./utils/Context.sol\";\n\nabstract contract Middle is Context {}\n",
+    );
+    const SOL_GOVERNOR: (&str, &str) = (
+        "contracts/governance/Governor.sol",
+        "pragma solidity ^0.8.20;\n\nimport \"../Middle.sol\";\n\nabstract contract Governor is Middle {\n    function castVote() public returns (address) {\n        return _msgSender();\n    }\n}\n",
+    );
+    const SOL_SPARE: (&str, &str) = (
+        "contracts/Spare.sol",
+        "pragma solidity ^0.8.20;\n\ncontract Spare {}\n",
+    );
+    const SOL_SPARE_EDITED: (&str, &str) = (
+        "contracts/Spare.sol",
+        "pragma solidity ^0.8.20;\n\ncontract Spare {\n    uint256 internal count;\n}\n",
+    );
+
+    fn solidity_rows(db: &Path) -> Vec<(String, String)> {
+        Store::open(db)
+            .unwrap()
+            .project_metadata_with_prefix(codegraph_resolve::solidity_scope::HEAD_ROW_KEY_PREFIX)
+            .unwrap()
+    }
+
+    /// W4-SOL-01: an index without the Solidity marker (built before it, or
+    /// left by a failed sync) has every Solidity file re-resolved by its next
+    /// sync and its head rows rebuilt: a bare call an older index linked
+    /// wrongly from an unchanged contract ends where a fresh index puts it.
+    #[test]
+    fn an_index_without_the_solidity_marker_rebuilds_the_head_rows() {
+        let version = Some(crate::solidity_heads::VERSION.to_string());
+        let dir = TestDir::new("solidity-heads-bootstrap");
+        let db = default_db_path(dir.path()).unwrap();
+        let initial = [
+            SOL_CONTEXT,
+            SOL_OVERRIDE,
+            SOL_MIDDLE,
+            SOL_GOVERNOR,
+            SOL_SPARE,
+        ];
+        write_files(dir.path(), &initial);
+        sync_changed_paths(dir.path(), &db, initial.iter().map(|(path, _)| *path)).unwrap();
+        let marker = || {
+            Store::open(&db)
+                .unwrap()
+                .get_project_metadata(crate::solidity_heads::VERSION_KEY)
+                .unwrap()
+        };
+        assert_eq!(marker(), version);
+        let rows = solidity_rows(&db);
+        assert!(
+            rows.iter()
+                .any(|(key, _)| key == "solidity_heads:contracts/Middle.sol"),
+            "{rows:#?}"
+        );
+        let expected = edge_projection(&db);
+        {
+            let store = Store::open(&db).unwrap();
+            let moved = store
+                .connection()
+                .execute(
+                    "UPDATE edges SET target = (SELECT id FROM nodes WHERE qualified_name = \
+                     'ERC2771Context::_msgSender') WHERE kind = 'calls' AND target = (SELECT id \
+                     FROM nodes WHERE qualified_name = 'Context::_msgSender')",
+                    [],
+                )
+                .unwrap();
+            assert_eq!(moved, 1, "the call edge an older index linked elsewhere");
+            store
+                .delete_project_metadata_with_prefix(
+                    codegraph_resolve::solidity_scope::HEAD_ROW_KEY_PREFIX,
+                )
+                .unwrap();
+            store
+                .delete_project_metadata(crate::solidity_heads::VERSION_KEY)
+                .unwrap();
+        }
+        assert_ne!(edge_projection(&db), expected);
+        write_files(dir.path(), &[SOL_SPARE_EDITED]);
+        sync_changed_paths(dir.path(), &db, ["contracts/Spare.sol"]).unwrap();
+        assert_eq!(marker(), version);
+        let mut rebuilt = solidity_rows(&db);
+        let mut wanted = rows;
+        // The edited file's row is its new one.
+        rebuilt.retain(|(key, _)| key != "solidity_heads:contracts/Spare.sol");
+        wanted.retain(|(key, _)| key != "solidity_heads:contracts/Spare.sol");
         assert_eq!(rebuilt, wanted);
         assert_eq!(edge_projection(&db), expected);
     }

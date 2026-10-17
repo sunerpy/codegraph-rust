@@ -8210,6 +8210,85 @@ pub fn solidity_change_a_base_contract() -> Case {
         .edge_after("class Token", "extends", "class Pausable")
 }
 
+/// OpenZeppelin's `Context` and its `ERC2771Context` override, which a bare
+/// call reaches only through the caller's `is` chain (upstream #2178).
+fn solidity_context_case(change: Change, middle: &'static str) -> Case {
+    Case::new(change, &[Language::Solidity])
+        .file(
+            "contracts/utils/Context.sol",
+            "pragma solidity ^0.8.20;\n\nabstract contract Context {\n    function _msgSender() internal view virtual returns (address) {\n        return msg.sender;\n    }\n}\n",
+        )
+        .file(
+            "contracts/metatx/ERC2771Context.sol",
+            "pragma solidity ^0.8.20;\n\nimport {Context} from \"../utils/Context.sol\";\n\nabstract contract ERC2771Context is Context {\n    function _msgSender() internal view virtual override returns (address) {\n        return msg.sender;\n    }\n}\n",
+        )
+        .file("contracts/Middle.sol", middle)
+        .file(
+            "contracts/Inner.sol",
+            "pragma solidity ^0.8.20;\n\nimport \"./Middle.sol\";\n\nabstract contract Inner is Middle {}\n",
+        )
+        .file(
+            "contracts/governance/Governor.sol",
+            "pragma solidity ^0.8.20;\n\nimport \"../Inner.sol\";\n\nabstract contract Governor is Inner {\n    function castVote() public returns (address) {\n        return _msgSender();\n    }\n}\n",
+        )
+}
+
+const MIDDLE_ALONE: &str = "pragma solidity ^0.8.20;\n\nabstract contract Middle {}\n";
+const MIDDLE_IS_CONTEXT: &str = "pragma solidity ^0.8.20;\n\nimport \"./utils/Context.sol\";\n\nabstract contract Middle is Context {}\n";
+const LEGACY_MIDDLE_IS_CONTEXT: &str = "pragma solidity ^0.8.20;\n\nimport \"../utils/Context.sol\";\n\nabstract contract Middle is Context {}\n";
+
+/// A base two steps up an unchanged contract's chain comes to inherit
+/// `Context`: the unchanged contract's bare call reaches Context's function,
+/// never the override of a contract it does not inherit (upstream #2178).
+pub fn solidity_bare_call_reaches_a_function_its_chain_comes_to_inherit() -> Case {
+    solidity_context_case(Change::EditHeritage, MIDDLE_ALONE)
+        .write("contracts/Middle.sol", MIDDLE_IS_CONTEXT)
+        .edge_after(
+            "method Governor::castVote",
+            "calls",
+            "method Context::_msgSender",
+        )
+        .no_edge_after(
+            "method Governor::castVote",
+            "calls",
+            "method ERC2771Context::_msgSender",
+        )
+}
+
+/// The reverse: the base stops inheriting it, and the call links nothing.
+pub fn solidity_bare_call_leaves_a_function_its_chain_stops_inheriting() -> Case {
+    solidity_context_case(Change::EditHeritage, MIDDLE_IS_CONTEXT)
+        .write("contracts/Middle.sol", MIDDLE_ALONE)
+        .edge_before(
+            "method Governor::castVote",
+            "calls",
+            "method Context::_msgSender",
+        )
+        .no_edge_after(
+            "method Governor::castVote",
+            "calls",
+            "method Context::_msgSender",
+        )
+        .no_edge_after(
+            "method Governor::castVote",
+            "calls",
+            "method ERC2771Context::_msgSender",
+        )
+}
+
+/// A second declaration of a base's name appears in another file: the chain
+/// reads every declaration of a name, so the unchanged contract's call
+/// reaches what the new one inherits.
+pub fn solidity_bare_call_follows_a_namesake_base_that_appears() -> Case {
+    solidity_context_case(Change::AddCompetitor, MIDDLE_ALONE)
+        .write("contracts/legacy/Middle.sol", LEGACY_MIDDLE_IS_CONTEXT)
+        .edge_after(
+            "method Governor::castVote",
+            "calls",
+            "method Context::_msgSender",
+        )
+}
+
 /// Upstream #2148: a bare call in a component reaches the components its
 /// `extends` chain names, read from their source, so a middle component
 /// extending another base in another file moves an unchanged leaf's call.

@@ -71,6 +71,7 @@ pub mod rust_scope;
 pub mod scala_scope;
 pub mod sfc_scripts;
 pub mod snapshot_context;
+pub mod solidity_scope;
 pub mod source_facts;
 pub mod strip_comments;
 mod swift_scope;

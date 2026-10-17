@@ -82,6 +82,7 @@ struct Caches {
     swift_tables: Option<Arc<crate::swift_type_visibility::SwiftTables>>,
     objc_tables: Option<Arc<crate::objc_scope::ObjcTables>>,
     go_tables: Option<Arc<crate::go_packages::GoTables>>,
+    solidity_tables: Option<Arc<crate::solidity_scope::SolidityTables>>,
 }
 
 /// A compiled pattern set by its key.
@@ -142,6 +143,7 @@ impl Caches {
             swift_tables: None,
             objc_tables: None,
             go_tables: None,
+            solidity_tables: None,
         }
     }
 }
@@ -197,6 +199,7 @@ impl<'a> StoreResolutionContext<'a> {
         c.swift_tables = None;
         c.objc_tables = None;
         c.go_tables = None;
+        c.solidity_tables = None;
     }
 
     fn cached_all_files(&self) -> Arc<Vec<String>> {
@@ -703,6 +706,15 @@ impl ResolutionContext for StoreResolutionContext<'_> {
                 .borrow_mut()
                 .go_tables
                 .get_or_insert_with(|| Arc::new(crate::go_packages::GoTables::new())),
+        )
+    }
+
+    fn solidity_tables(&self) -> Arc<crate::solidity_scope::SolidityTables> {
+        Arc::clone(
+            self.caches
+                .borrow_mut()
+                .solidity_tables
+                .get_or_insert_with(|| Arc::new(crate::solidity_scope::SolidityTables::new())),
         )
     }
 

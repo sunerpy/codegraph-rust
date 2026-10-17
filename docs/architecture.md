@@ -416,7 +416,15 @@ whose last segment names a method a changed component gained or lost (every
 method of one that came, went or was renamed) re-resolve whole, however many
 there are, since a typed call waits while components of its type's name in
 several files declare the method; the `cfml_heads_version` marker is withdrawn
-and restored with the others; a Swift file whose head row moved (a type
+and restored with the others; a Solidity file whose head row moved (a type
+came or went, or its `is` clause names other bases) retries, at their sites,
+the calls in the unchanged Solidity files declaring a type of a moved name or
+one below it (closing over every head naming a reached name) that name a
+method of a type which entered or left the chain of a type the file declares,
+resolved or parked, since a bare call reads its contract's `is` chain from the
+declarations' heads (a file with a chain at the resolver's limit of 60 names
+re-resolves whole); the `solidity_heads_version` marker is withdrawn and
+restored with the others; a Swift file whose head row moved (a type
 declaration came or went, became or stopped being an extension, moved to
 another qualified name, names other supertypes, writes another nested path, or
 became or stopped being a `@Reducer` enum) re-resolves, whole, the unchanged

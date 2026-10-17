@@ -2513,6 +2513,9 @@ pub fn match_by_exact_name(
     // A bare Dart call stays in the class hierarchy it is written in
     // (upstream #2145).
     let dart_bare = crate::dart_scope::is_dart_bare_call(reference, context);
+    // A bare Solidity call stays in the `is` chain of the contract it is
+    // written in (upstream #2178).
+    let solidity_bare = crate::solidity_scope::is_receiver_less_solidity_call(reference, context);
     // A Dart type name — a declared type, a supertype, the `Color` of
     // `Color.red` — is in scope as a call is, or through its import prefix
     // (upstream #2386).
@@ -2683,6 +2686,14 @@ pub fn match_by_exact_name(
             !(cfml_bare
                 && n.kind == NodeKind::Method
                 && !crate::cfml_scope::is_cfml_method_in_scope(n, reference, context))
+        })
+        // OpenZeppelin's `_msgSender()` in a Context-derived Governor is
+        // Context's, no ERC2771Context override: a bare Solidity call reaches
+        // a function of the contract around it or of one it inherits
+        // (upstream #2178).
+        .filter(|n| {
+            !(solidity_bare
+                && !crate::solidity_scope::is_solidity_member_in_scope(n, reference, context))
         })
         // riverpod's tests' `test(…)`, package:test's function, is no
         // `ProviderContainer.test`: a bare Dart call reaches only a member of
@@ -6700,6 +6711,7 @@ pub fn match_fuzzy(reference: &RefView, context: &dyn ResolutionContext) -> Opti
     } else {
         None
     };
+    let solidity_bare = crate::solidity_scope::is_receiver_less_solidity_call(reference, context);
     let callable_candidates = apply_language_gate(
         candidates
             .into_iter()
@@ -6765,6 +6777,12 @@ pub fn match_fuzzy(reference: &RefView, context: &dyn ResolutionContext) -> Opti
                 !(cfml_bare
                     && n.kind == NodeKind::Method
                     && !crate::cfml_scope::is_cfml_method_in_scope(n, reference, context))
+            })
+            // A bare Solidity call, only its contract's `is` chain (upstream
+            // #2178).
+            .filter(|n| {
+                !(solidity_bare
+                    && !crate::solidity_scope::is_solidity_member_in_scope(n, reference, context))
             })
             // Kotlin's visibility, member reach, number bitwise extensions
             // and standard chain names, as in exact matching (upstream

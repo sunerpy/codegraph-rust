@@ -96,6 +96,7 @@ pub(crate) fn migrate_project(
     let mut member_rows = Vec::new();
     let mut ruby_rows = Vec::new();
     let mut cfml_rows = Vec::new();
+    let mut solidity_rows = Vec::new();
     let mut swift_rows = Vec::new();
     let mut objc_rows = Vec::new();
     let mut go_rows = Vec::new();
@@ -175,6 +176,9 @@ pub(crate) fn migrate_project(
         {
             cfml_rows.push((relative.clone(), row));
         }
+        if let Some(row) = crate::solidity_heads::row_of(file.language, &source, &result.nodes) {
+            solidity_rows.push((relative.clone(), row));
+        }
         if let Some(row) = crate::swift_heads::row_of(file.language, &source, &result.nodes) {
             swift_rows.push((relative.clone(), row));
         }
@@ -237,6 +241,8 @@ pub(crate) fn migrate_project(
     drop(ruby_rows);
     crate::cfml_heads::write_index_rows(rebuild.store(), &mut cfml_rows)?;
     drop(cfml_rows);
+    crate::solidity_heads::write_index_rows(rebuild.store(), &mut solidity_rows)?;
+    drop(solidity_rows);
     crate::swift_heads::write_index_rows(rebuild.store(), &mut swift_rows)?;
     drop(swift_rows);
     crate::objc_heads::write_index_rows(rebuild.store(), &mut objc_rows)?;
@@ -259,6 +265,7 @@ pub(crate) fn migrate_project(
     crate::member_surfaces::write_marker(rebuild.store())?;
     crate::ruby_heads::write_marker(rebuild.store())?;
     crate::cfml_heads::write_marker(rebuild.store())?;
+    crate::solidity_heads::write_marker(rebuild.store())?;
     crate::swift_heads::write_marker(rebuild.store())?;
     crate::objc_heads::write_marker(rebuild.store())?;
     crate::go_heads::write_marker(rebuild.store())?;

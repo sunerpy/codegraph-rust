@@ -23,6 +23,7 @@ pub mod r_bindings;
 pub mod ruby_heads;
 pub mod rust_receivers;
 pub mod scala_surfaces;
+pub mod solidity_heads;
 pub mod swift_heads;
 mod sync;
 mod watcher;

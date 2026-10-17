@@ -1059,6 +1059,78 @@ fn outdated_migration_writes_the_cfml_component_rows_of_index_force() {
     );
 }
 
+/// W4-SOL-01: a migration writes the Solidity head rows and their marker a
+/// fresh `index --force` writes.
+#[test]
+fn outdated_migration_writes_the_solidity_head_rows_of_index_force() {
+    let dir = TestDir::new("outdated-solidity-heads");
+    let project = dir.path().join("mini");
+    for (path, contents) in [
+        (
+            "contracts/Context.sol",
+            "pragma solidity ^0.8.20;\n\nabstract contract Context {\n    function _msgSender() internal view virtual returns (address) {\n        return msg.sender;\n    }\n}\n",
+        ),
+        (
+            "contracts/Governor.sol",
+            "pragma solidity ^0.8.20;\n\nimport \"./Context.sol\";\n\nabstract contract Governor is Context {\n    function castVote() public returns (address) {\n        return _msgSender();\n    }\n}\n",
+        ),
+        (
+            "contracts/Free.sol",
+            "pragma solidity ^0.8.20;\n\nfunction helper() pure returns (uint256) {\n    return 1;\n}\n",
+        ),
+    ] {
+        let full = project.join(path);
+        fs::create_dir_all(full.parent().unwrap()).expect("create the source directory");
+        fs::write(full, contents).expect("write a source file");
+    }
+    let run = cli(&["init", project.to_str().unwrap()]);
+    assert!(
+        run.ok,
+        "setup: `codegraph init` must succeed (stdout={}, stderr={})",
+        run.stdout, run.stderr
+    );
+    let paths = IndexPaths::resolve(&project, None).expect("resolve v2 paths");
+    stage_state_slot(
+        &paths,
+        100,
+        CURRENT_STORAGE_PROTOCOL,
+        CURRENT_EXTRACTION_VERSION - 1,
+        "current",
+    );
+    let run = cli(&["sync", project.to_str().unwrap()]);
+    assert!(
+        run.ok,
+        "sync must migrate an Outdated namespace: stdout={}, stderr={}",
+        run.stdout, run.stderr
+    );
+    let (_scratch, peer) = fresh_force_peer("outdated-solidity-heads", &project);
+    let head_rows = |paths: &IndexPaths| {
+        Store::open_for_read(paths, deadline(), || false)
+            .expect("readable namespace")
+            .project_metadata_with_prefix("solidity_heads")
+            .expect("solidity head rows")
+    };
+    let migrated = head_rows(&paths);
+    // No row for the file with a free function only: it declares no type.
+    assert_eq!(
+        migrated
+            .iter()
+            .map(|(key, _)| key.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "solidity_heads:contracts/Context.sol",
+            "solidity_heads:contracts/Governor.sol",
+            "solidity_heads_version",
+        ],
+        "a migration writes the head rows and their marker: {migrated:?}"
+    );
+    assert_eq!(
+        migrated,
+        head_rows(&IndexPaths::resolve(&peer, None).expect("resolve peer v2 paths")),
+        "a forced migration must write the Solidity head rows of `index --force`"
+    );
+}
+
 /// W4-SW-01: a migration writes the Swift head rows and their marker a
 /// fresh `index --force` writes.
 #[test]

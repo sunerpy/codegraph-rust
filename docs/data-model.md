@@ -299,6 +299,15 @@ has no row. They are written, withdrawn and checked like the head rows under
 re-resolves every CFML file and rebuilds the rows. Neither is a canonical
 surface.
 
+Solidity head rows record what a bare Solidity call reads of a file's type
+declarations: `solidity_heads:<path>` holds the JSON `{"types": [{"name",
+"supers"}]}`, one entry per contract, interface, library and struct, sorted,
+with the bases its `is` clause names as resolution reads them. A file with no
+type has no row. They are written, withdrawn and checked like the head rows
+under `solidity_heads_version` (1); a sync that finds it missing or at another
+version re-resolves every Solidity file and rebuilds the rows. Neither is a
+canonical surface.
+
 Swift head rows record what Swift type resolution reads of a file's type
 declarations: `swift_heads:<path>` holds the JSON `{"entries":
 [{"qualified_name", "kind", "extension", "supertypes", "inherits", "written",

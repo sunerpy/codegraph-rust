@@ -17439,3 +17439,79 @@ mod dart_prefixes {
         }
     }
 }
+
+mod solidity_scope {
+    use super::support::{Graph, Project};
+
+    /// The qualified names of every call edge out of `file`'s nodes, sorted
+    /// (upstream's `callsFrom`).
+    fn calls_from(graph: &Graph, file: &str) -> Vec<String> {
+        let mut out: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|e| e.kind == "calls")
+            .filter_map(|e| {
+                let source = graph.node(&e.source)?;
+                (source.file_path == file).then_some(())?;
+                Some(graph.node(&e.target)?.qualified_name.clone())
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// Upstream #2178 (a) (`solidity-erlang-call-scope.test.ts`, its
+    /// Solidity fixture): a Solidity call written without a receiver reaches
+    /// a function of the contract around it or of one it inherits through
+    /// its `is` clause, never a sibling's override: OpenZeppelin's
+    /// `_msgSender()` in a Context-derived Governor went to ERC2771Context's.
+    /// The files sit in OpenZeppelin's directories: side by side, as
+    /// upstream's fixture has them, the ranking already picks Context's.
+    #[test]
+    fn pr2178_a_bare_solidity_call_reaches_the_inherited_function_not_a_sibling_override() {
+        let project = Project::new()
+            .file("contracts/utils/Context.sol", "pragma solidity ^0.8.20;\n\nabstract contract Context {\n    function _msgSender() internal view virtual returns (address) {\n        return msg.sender;\n    }\n}\n")
+            .file("contracts/metatx/ERC2771Context.sol", "pragma solidity ^0.8.20;\n\nimport {Context} from \"../utils/Context.sol\";\n\nabstract contract ERC2771Context is Context {\n    function _msgSender() internal view virtual override returns (address) {\n        return msg.sender;\n    }\n}\n")
+            .file("contracts/governance/Governor.sol", "pragma solidity ^0.8.20;\n\nimport {Context} from \"../utils/Context.sol\";\n\nabstract contract Governor is Context {\n    function castVote() public returns (address) {\n        return _msgSender();\n    }\n}\n")
+            .index();
+        let graph = project.graph();
+        assert_eq!(
+            calls_from(graph, "contracts/governance/Governor.sol"),
+            ["Context::_msgSender"],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// The `is` clause is read as written: constructor arguments dropped, a
+    /// base named through an import alias by its last name, a head spread
+    /// over lines with comments in it, the chain followed through the bases'
+    /// own heads; a contract it does not inherit is passed over even in the
+    /// same file. A call with a receiver, a library function called through
+    /// its library (`MathLib.add(…)`) and a free function are not judged;
+    /// outside any contract a bare call reaches no member.
+    /// KEEP-RUST: a `//` comment in the head drops only the rest of its own
+    /// line (upstream joins the head's lines before dropping it, so the
+    /// bases written below it are lost).
+    #[test]
+    fn keep_rust_a_solidity_is_clause_is_read_as_written() {
+        let project = Project::new()
+            .file("contracts/Base.sol", "pragma solidity ^0.8.20;\n\nabstract contract Ownable {\n    function _checkOwner() internal view virtual {}\n}\n\nabstract contract Pausable {\n    function _requireNotPaused() internal view virtual {}\n}\n\nabstract contract Nonces {\n    function _useNonce(address owner) internal virtual returns (uint256) {\n        return 0;\n    }\n}\n\nabstract contract Middle is Nonces {}\n\nlibrary MathLib {\n    function add(uint256 a, uint256 b) internal pure returns (uint256) {\n        return a + b;\n    }\n}\n\nfunction freeHelper() pure returns (uint256) {\n    return 3;\n}\n")
+            .file("contracts/Vault.sol", "pragma solidity ^0.8.20;\n\nimport \"./Base.sol\" as B;\n\ncontract Sibling {\n    function _checkOwner() internal view {}\n    function _requireNotPaused() internal view {}\n    function _useNonce(address owner) internal returns (uint256) {\n        return 1;\n    }\n    function helper() public pure returns (uint256) {\n        return 2;\n    }\n}\n\ncontract Vault is\n    Ownable(msg.sender), // the owner\n    B.Pausable,\n    /* nonces */ Middle\n{\n    Sibling sibling;\n\n    function run() public returns (uint256) {\n        _checkOwner();\n        _requireNotPaused();\n        _useNonce(msg.sender);\n        sibling.helper();\n        MathLib.add(1, 2);\n        return freeHelper();\n    }\n}\n\nfunction loose() pure returns (uint256) {\n    return helper();\n}\n")
+            .index();
+        let graph = project.graph();
+        assert_eq!(
+            calls_from(graph, "contracts/Vault.sol"),
+            [
+                "MathLib::add",
+                "Nonces::_useNonce",
+                "Ownable::_checkOwner",
+                "Pausable::_requireNotPaused",
+                "Sibling::helper",
+                "freeHelper",
+            ],
+            "{}",
+            graph.report()
+        );
+    }
+}

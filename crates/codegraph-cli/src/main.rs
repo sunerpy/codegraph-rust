@@ -5712,6 +5712,7 @@ fn index_project_inner(
         Option<codegraph_resolve::member_types::MemberSurface>,
         Option<codegraph_resolve::ruby_scope::HeadRow>,
         Option<codegraph_resolve::cfml_scope::HeadRow>,
+        Option<codegraph_resolve::solidity_scope::HeadRow>,
         Option<codegraph_resolve::swift_type_visibility::HeadRow>,
         Option<codegraph_resolve::objc_scope::HeadRow>,
         Option<codegraph_resolve::go_packages::HeadRow>,
@@ -5730,6 +5731,7 @@ fn index_project_inner(
     let mut member_rows: Vec<(String, codegraph_resolve::member_types::MemberSurface)> = Vec::new();
     let mut ruby_rows: Vec<(String, codegraph_resolve::ruby_scope::HeadRow)> = Vec::new();
     let mut cfml_rows: Vec<(String, codegraph_resolve::cfml_scope::HeadRow)> = Vec::new();
+    let mut solidity_rows: Vec<(String, codegraph_resolve::solidity_scope::HeadRow)> = Vec::new();
     let mut swift_rows: Vec<(String, codegraph_resolve::swift_type_visibility::HeadRow)> =
         Vec::new();
     let mut objc_rows: Vec<(String, codegraph_resolve::objc_scope::HeadRow)> = Vec::new();
@@ -5811,6 +5813,8 @@ fn index_project_inner(
             let ruby_row = codegraph_watch::ruby_heads::row_of(language, &source, &result.nodes);
             let cfml_row =
                 codegraph_watch::cfml_heads::row_of(relative, language, &source, &result.nodes);
+            let solidity_row =
+                codegraph_watch::solidity_heads::row_of(language, &source, &result.nodes);
             let swift_row = codegraph_watch::swift_heads::row_of(language, &source, &result.nodes);
             let objc_row = codegraph_watch::objc_heads::row_of(language, &source, &result.nodes);
             let go_row = codegraph_watch::go_heads::row_of(language, &source, &result.nodes);
@@ -5831,6 +5835,7 @@ fn index_project_inner(
                 member_row,
                 ruby_row,
                 cfml_row,
+                solidity_row,
                 swift_row,
                 objc_row,
                 go_row,
@@ -5855,6 +5860,7 @@ fn index_project_inner(
                 member_row,
                 ruby_row,
                 cfml_row,
+                solidity_row,
                 swift_row,
                 objc_row,
                 go_row,
@@ -5925,6 +5931,9 @@ fn index_project_inner(
             }
             if let Some(row) = cfml_row {
                 cfml_rows.push((relative.clone(), row));
+            }
+            if let Some(row) = solidity_row {
+                solidity_rows.push((relative.clone(), row));
             }
             if let Some(row) = swift_row {
                 swift_rows.push((relative.clone(), row));
@@ -6005,6 +6014,8 @@ fn index_project_inner(
     drop(ruby_rows);
     codegraph_watch::cfml_heads::write_index_rows(&store, &mut cfml_rows)?;
     drop(cfml_rows);
+    codegraph_watch::solidity_heads::write_index_rows(&store, &mut solidity_rows)?;
+    drop(solidity_rows);
     codegraph_watch::swift_heads::write_index_rows(&store, &mut swift_rows)?;
     drop(swift_rows);
     codegraph_watch::objc_heads::write_index_rows(&store, &mut objc_rows)?;
@@ -6034,6 +6045,7 @@ fn index_project_inner(
     codegraph_watch::member_surfaces::write_marker(&store)?;
     codegraph_watch::ruby_heads::write_marker(&store)?;
     codegraph_watch::cfml_heads::write_marker(&store)?;
+    codegraph_watch::solidity_heads::write_marker(&store)?;
     codegraph_watch::swift_heads::write_marker(&store)?;
     codegraph_watch::objc_heads::write_marker(&store)?;
     codegraph_watch::go_heads::write_marker(&store)?;

@@ -645,6 +645,11 @@ pub trait ResolutionContext {
     fn go_tables(&self) -> Arc<crate::go_packages::GoTables> {
         Arc::new(crate::go_packages::GoTables::new())
     }
+
+    /// The Solidity `is`-chain memos of one resolution pass (W4-SOL-01).
+    fn solidity_tables(&self) -> Arc<crate::solidity_scope::SolidityTables> {
+        Arc::new(crate::solidity_scope::SolidityTables::new())
+    }
 }
 
 /// Go module info parsed from `go.mod`.

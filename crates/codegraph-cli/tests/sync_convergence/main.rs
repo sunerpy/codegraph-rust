@@ -363,6 +363,8 @@ fn run_case(name: &str, case: &Case) {
     let ruby_rows = support::project_metadata_with_prefix(&fresh.db(), "ruby_heads");
     // And the CFML component rows and their marker (W4-CF-01).
     let cfml_rows = support::project_metadata_with_prefix(&fresh.db(), "cfml_heads");
+    // And the Solidity head rows and their marker (W4-SOL-01).
+    let solidity_rows = support::project_metadata_with_prefix(&fresh.db(), "solidity_heads");
     // And the Swift head rows and their marker (W4-SW-01).
     let swift_rows = support::project_metadata_with_prefix(&fresh.db(), "swift_heads");
     // And the Objective-C head rows and their marker (W4-SW-04).
@@ -444,6 +446,13 @@ fn run_case(name: &str, case: &Case) {
             divergent.push(format!(
                 "=== {driver} driver: the CFML component rows differ from a fresh index\n\
                  synced: {rows:#?}\nfresh: {cfml_rows:#?}"
+            ));
+        }
+        let rows = support::project_metadata_with_prefix(&project.db(), "solidity_heads");
+        if rows != solidity_rows {
+            divergent.push(format!(
+                "=== {driver} driver: the Solidity head rows differ from a fresh index\n\
+                 synced: {rows:#?}\nfresh: {solidity_rows:#?}"
             ));
         }
         let rows = support::project_metadata_with_prefix(&project.db(), "swift_heads");
@@ -1198,6 +1207,9 @@ matrix! {
     ruby_untyped_receiver_ignores_a_lone_added_method,
     ruby_ancestor_method_body_edit,
     solidity_change_a_base_contract,
+    solidity_bare_call_reaches_a_function_its_chain_comes_to_inherit,
+    solidity_bare_call_leaves_a_function_its_chain_stops_inheriting,
+    solidity_bare_call_follows_a_namesake_base_that_appears,
     cfml_change_a_base_component,
     cfml_dotted_extends_of_an_added_component,
     cfml_dotted_extends_takes_a_better_corroborated_component,
