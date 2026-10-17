@@ -2,8 +2,8 @@
 //! shape at `b635dd46`): a bare call reaches a function of the contract,
 //! interface or library around it, or of one it inherits through its `is`
 //! clause, or a free function; never another contract's override.
-//! OpenZeppelin's `_msgSender()` in a Context-derived Governor went to
-//! ERC2771Context's override 84 times.
+//! OpenZeppelin's `_msgSender()` in Context-derived contracts went to
+//! ERC2771Context's override 83 times.
 //!
 //! The `is` chain is read from the declarations' heads, as upstream reads
 //! them: by the names they write, every declaration of a name counted.
