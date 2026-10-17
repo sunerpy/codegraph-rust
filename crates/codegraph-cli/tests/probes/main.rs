@@ -17913,3 +17913,213 @@ mod shopify_themes {
         );
     }
 }
+
+mod pascal_includes {
+    use super::support::{Graph, Project};
+
+    const DIRECTIVES: &str = "{ Compiler version switches }\n{$IFDEF VER150}\n  {$DEFINE DELPHI7}\n{$ENDIF}\n{$IFNDEF FPC}\n  {$WARN SYMBOL_PLATFORM OFF}\n{$ELSE}\n  {$MODE DELPHI}{$H+}\n{$ENDIF}\n";
+    const ROUTINES: &str = "procedure Foo;\nbegin\n  WriteLn('foo');\nend;\n\nfunction Bar(A: Integer): Integer;\nbegin\n  Result := A + 1;\nend;\n";
+
+    fn language_of<'g>(graph: &'g Graph, path: &str) -> Option<&'g str> {
+        graph
+            .files
+            .iter()
+            .find(|file| file.path == path)
+            .map(|file| file.language.as_str())
+    }
+
+    /// `kind:name:language` of every node in `path` but its file node, sorted
+    /// (upstream's `symbolsIn`).
+    fn symbols_in(graph: &Graph, path: &str) -> Vec<String> {
+        let mut out: Vec<String> = graph
+            .nodes
+            .iter()
+            .filter(|node| node.file_path == path && node.kind != "file")
+            .map(|node| format!("{}:{}:{}", node.kind, node.name, node.language))
+            .collect();
+        out.sort();
+        out
+    }
+
+    fn has_no_errors(graph: &Graph, path: &str) -> bool {
+        graph
+            .files
+            .iter()
+            .find(|file| file.path == path)
+            .is_some_and(|file| file.errors.is_null() || file.errors == serde_json::json!([]))
+    }
+
+    /// Upstream #2289 (`pascal-inc-detection.test.ts`): a tree of Pascal
+    /// includes with no `.pas` file indexes them as Pascal.
+    #[test]
+    fn pr2289_a_tree_of_pascal_includes_indexes_as_pascal() {
+        let project = Project::new()
+            .file("inc/defs.inc", DIRECTIVES)
+            .file("inc/routines.inc", ROUTINES)
+            .index();
+        let graph = project.graph();
+        assert_eq!(
+            language_of(graph, "inc/defs.inc"),
+            Some("pascal"),
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            language_of(graph, "inc/routines.inc"),
+            Some("pascal"),
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            symbols_in(graph, "inc/routines.inc"),
+            ["function:Bar:pascal", "function:Foo:pascal"],
+            "{}",
+            graph.report()
+        );
+        assert!(
+            has_no_errors(graph, "inc/routines.inc"),
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream #2289: each include is classified by its content, and a sync
+    /// of edited includes keeps the language.
+    #[test]
+    fn pr2289_each_include_is_classified_by_content_and_sync_keeps_it() {
+        let mut project = Project::new()
+            .file(
+                "U.pas",
+                "unit U;\n\ninterface\n\n{$I defs.inc}\n\nprocedure Foo;\n\nimplementation\n\n{$I routines.inc}\n\nend.\n",
+            )
+            .file("defs.inc", DIRECTIVES)
+            .file("routines.inc", ROUTINES)
+            .file(
+                "drupal/mymodule.inc",
+                "<?php\n\nfunction mymodule_helper() {\n  return 1;\n}\n",
+            )
+            .file("native/table.inc", "#define X 1\n#define Y 2\n")
+            .index();
+        let graph = project.graph();
+        let report = graph.report();
+        assert_eq!(language_of(graph, "defs.inc"), Some("pascal"), "{report}");
+        assert_eq!(
+            language_of(graph, "routines.inc"),
+            Some("pascal"),
+            "{report}"
+        );
+        assert_eq!(
+            language_of(graph, "drupal/mymodule.inc"),
+            Some("php"),
+            "{report}"
+        );
+        assert_eq!(
+            language_of(graph, "native/table.inc"),
+            Some("php"),
+            "{report}"
+        );
+        // A directive-only fragment: a file record, no symbols, no errors.
+        assert_eq!(
+            symbols_in(graph, "defs.inc"),
+            Vec::<String>::new(),
+            "{report}"
+        );
+        assert!(has_no_errors(graph, "defs.inc"), "{report}");
+        assert_eq!(
+            symbols_in(graph, "routines.inc"),
+            ["function:Bar:pascal", "function:Foo:pascal"],
+            "{report}"
+        );
+        assert_eq!(
+            symbols_in(graph, "drupal/mymodule.inc"),
+            ["function:mymodule_helper:php"],
+            "{report}"
+        );
+
+        project.write(
+            "defs.inc",
+            &format!("{DIRECTIVES}{{$DEFINE USE_FAST_MM}}\n"),
+        );
+        project.write(
+            "routines.inc",
+            &format!("{ROUTINES}procedure Baz;\nbegin\nend;\n"),
+        );
+        let graph = project.sync();
+        let report = graph.report();
+        assert_eq!(language_of(graph, "defs.inc"), Some("pascal"), "{report}");
+        assert_eq!(
+            language_of(graph, "routines.inc"),
+            Some("pascal"),
+            "{report}"
+        );
+        assert_eq!(
+            symbols_in(graph, "routines.inc"),
+            [
+                "function:Bar:pascal",
+                "function:Baz:pascal",
+                "function:Foo:pascal"
+            ],
+            "{report}"
+        );
+        assert_eq!(
+            language_of(graph, "drupal/mymodule.inc"),
+            Some("php"),
+            "{report}"
+        );
+    }
+
+    /// Upstream #2289: a `codegraph.json` mapping for `.inc` is the project's
+    /// answer, kept through index and sync.
+    #[test]
+    fn pr2289_a_codegraph_json_inc_mapping_is_not_second_guessed() {
+        let mut project = Project::new()
+            .file(
+                ".codegraph/codegraph.json",
+                "{ \"extensions\": { \".inc\": \"php\" } }\n",
+            )
+            .file("defs.inc", DIRECTIVES)
+            .index();
+        assert_eq!(
+            language_of(project.graph(), "defs.inc"),
+            Some("php"),
+            "{}",
+            project.graph().report()
+        );
+        project.write("defs.inc", &format!("{DIRECTIVES}{{$DEFINE MORE}}\n"));
+        let graph = project.sync();
+        assert_eq!(
+            language_of(graph, "defs.inc"),
+            Some("php"),
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// KEEP-RUST: an override never claims a built-in extension, so a
+    /// mapping of `.inc` to another language turns the content reading off
+    /// and leaves `.inc` PHP (upstream would take the mapping).
+    #[test]
+    fn keep_rust_an_inc_mapping_to_another_language_leaves_it_php() {
+        let project = Project::new()
+            .file(
+                ".codegraph/codegraph.json",
+                "{ \"extensions\": { \".inc\": \"pascal\" } }\n",
+            )
+            .file("defs.inc", DIRECTIVES)
+            .file("page.inc", "<?php echo 1;\n")
+            .index();
+        let graph = project.graph();
+        assert_eq!(
+            language_of(graph, "defs.inc"),
+            Some("php"),
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            language_of(graph, "page.inc"),
+            Some("php"),
+            "{}",
+            graph.report()
+        );
+    }
+}

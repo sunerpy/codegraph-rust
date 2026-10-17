@@ -117,6 +117,12 @@ classifications:
   spec's preparse blanks Flow-only syntax in `.js`, `.jsx`, `.mjs` and `.cjs`
   files; its row records `tsx`, the language its nodes carry;
 - `.xsjs` and `.xsjslib` use JavaScript;
+- `.inc` begins as PHP; an include with no PHP open tag (`<?php`, `<?=`) and a
+  line shape only Pascal writes (a compiler directive, a `;`-closed routine
+  header, `unit` or `uses`, a `const`, `var` or `type` section, a `begin` …
+  `end;` pair, Lazarus' `{%MainUnit}`) is Pascal, and its row records
+  `pascal`; a project that maps `.inc` in `codegraph.json` turns this off,
+  and its mapping, like any of a built-in extension, leaves `.inc` PHP;
 - `.dfm` and `.fmx` use the Pascal language ID but custom extraction;
 - `project.godot` is detected by filename because it has no extension;
 - project extension overrides can claim only extensions left unclaimed by built-in

@@ -15,6 +15,7 @@ pub mod ext_config;
 pub mod function_ref;
 pub mod lang;
 mod links;
+mod pascal_include;
 pub mod spec;
 pub mod syntax_tokens;
 mod value_refs;

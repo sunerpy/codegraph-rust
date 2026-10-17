@@ -9490,6 +9490,34 @@ pub fn liquid_json_template_gains_its_own_themes_section() -> Case {
 
 // ----- a `.h` header changes from C to C++ ----------------------------------
 
+/// A unit calling `Helper` (W4-PAS-01).
+const PASCAL_VIEW: &str = "unit View;\ninterface\nfunction Render: Integer;\nimplementation\nfunction Render: Integer;\nbegin\n  Result := Helper(10);\nend;\nend.\n";
+/// An include declaring `Helper`, of Pascal shapes.
+const PASCAL_HELPER_INCLUDE: &str =
+    "function Helper(Amount: Integer): Integer;\nbegin\n  Result := Amount;\nend;\n";
+
+/// Upstream #2289: an `.inc` include whose content turns from PHP to Pascal
+/// is read as Pascal, and the routine it now declares is called.
+pub fn pascal_include_flips_from_php_and_its_routine_is_called() -> Case {
+    Case::new(Change::HeaderFlip, &[Language::Pascal, Language::Php])
+        .file("View.pas", PASCAL_VIEW)
+        .file("routines.inc", "<?php\necho 1;\n")
+        .write("routines.inc", PASCAL_HELPER_INCLUDE)
+        .edge_after("file:View.pas", "calls", "function Helper")
+        .file_language_after("routines.inc", "pascal")
+}
+
+/// Upstream #2289: an `.inc` include that opens a PHP tag is PHP again, and
+/// the routine it declared leaves.
+pub fn pascal_include_flips_to_php_and_its_routine_leaves() -> Case {
+    Case::new(Change::HeaderFlip, &[Language::Pascal, Language::Php])
+        .file("View.pas", PASCAL_VIEW)
+        .file("routines.inc", PASCAL_HELPER_INCLUDE)
+        .write("routines.inc", "<?php\necho 1;\n")
+        .edge_before("file:View.pas", "calls", "function Helper")
+        .file_language_after("routines.inc", "php")
+}
+
 pub fn c_header_flips_to_cpp() -> Case {
     Case::new(Change::HeaderFlip, &[Language::C, Language::Cpp])
         .file(

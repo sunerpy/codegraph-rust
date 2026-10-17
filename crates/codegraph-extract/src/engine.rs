@@ -209,21 +209,27 @@ pub fn detect_language_with(
 
 /// The language `file_path` is indexed as, given its `source`: the language
 /// of its extension, except that a `.h` header holding C++ or Objective-C is
-/// that language, and a JavaScript file carrying Flow's `@flow` pragma is TSX.
-/// Extraction parses a file with it and every path that records a file row
-/// stores it, so the row agrees with the file's nodes.
+/// that language, a JavaScript file carrying Flow's `@flow` pragma is TSX,
+/// and an `.inc` include of Pascal shapes is Pascal. Extraction parses a file
+/// with it and every path that records a file row stores it, so the row
+/// agrees with the file's nodes.
 pub fn detect_language_for_source(
     file_path: &str,
     source: &str,
     overrides: &ExtensionOverrides,
 ) -> Language {
-    sniff_flow_language(
-        sniff_header_language(
-            file_path,
-            detect_language_with(file_path, overrides),
+    sniff_include_language(
+        file_path,
+        sniff_flow_language(
+            sniff_header_language(
+                file_path,
+                detect_language_with(file_path, overrides),
+                source,
+            ),
             source,
         ),
         source,
+        overrides,
     )
 }
 
@@ -256,6 +262,33 @@ fn sniff_header_language(file_path: &str, language: Language, source: &str) -> L
         Language::Cpp
     } else if looks_like_objc(source) {
         Language::ObjC
+    } else {
+        language
+    }
+}
+
+/// `language` refined by `source` when `file_path` is an `.inc` include of
+/// it (upstream #2279): PHP's include extension and Pascal's too, so an
+/// untagged include of Pascal shapes is Pascal
+/// ([`crate::pascal_include::looks_like_pascal_include`]). A project that
+/// maps `.inc` in `codegraph.json` has answered, and is not second-guessed;
+/// its mapping, like any of a built-in extension, leaves `.inc` PHP.
+fn sniff_include_language(
+    file_path: &str,
+    language: Language,
+    source: &str,
+    overrides: &ExtensionOverrides,
+) -> Language {
+    let include = Path::new(file_path)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("inc"));
+    if language == Language::Php
+        && include
+        && overrides.language_for("inc").is_none()
+        && crate::pascal_include::looks_like_pascal_include(source)
+    {
+        Language::Pascal
     } else {
         language
     }
@@ -408,7 +441,12 @@ pub fn extract_source_with_observer(
     // A caller that names the language (an embedded block's delegation) keeps
     // it, as upstream's `language || detectLanguage(filePath, source)` does.
     let language = if named.is_none() {
-        sniff_flow_language(language, source)
+        sniff_include_language(
+            file_path,
+            sniff_flow_language(language, source),
+            source,
+            overrides,
+        )
     } else {
         language
     };

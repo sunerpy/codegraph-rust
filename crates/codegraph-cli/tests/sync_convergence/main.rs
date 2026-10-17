@@ -61,7 +61,8 @@ pub enum Change {
     /// `config.toml` or `codegraph.json`, or a Shopify theme marker
     /// (`layout/theme.liquid`, `config/settings_schema.json`).
     ControlFile,
-    /// A `.h` header changes from C to C++ content.
+    /// A `.h` header changes from C to C++ content, or an `.inc` include
+    /// between PHP and Pascal content.
     HeaderFlip,
     /// A `.js` file gains Flow's `@flow` pragma, so it is read as TSX.
     PragmaFlip,
@@ -1268,6 +1269,8 @@ matrix! {
     liquid_json_template_loses_its_own_themes_section,
     liquid_json_template_gains_its_own_themes_section,
     c_header_flips_to_cpp,
+    pascal_include_flips_from_php_and_its_routine_is_called,
+    pascal_include_flips_to_php_and_its_routine_leaves,
     javascript_file_gains_the_flow_pragma,
 }
 
