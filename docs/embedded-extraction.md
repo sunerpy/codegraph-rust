@@ -87,7 +87,9 @@ Tree-sitter 0.26 note: `QueryCursor::matches()` returns a `StreamingIterator`, n
 ### Liquid
 
 - Liquid is not delegated to tree-sitter; it is a template-specific regex/JSON extractor.
-- `.json` Shopify OS 2.0 templates are parsed as JSON and `sections.*.type` becomes `sections/<type>.liquid` references.
+- A Shopify theme is a directory holding `layout/theme.liquid` or `config/settings_schema.json` beside its theme folders (`assets`, `blocks`, `config`, `layout`, `locales`, `sections`, `snippets`, `templates`, in any case), looked for under the project root. A marker counts wherever it is in the project, ignored or not: it only tells a theme apart.
+- `.json` Shopify OS 2.0 templates and section groups, JSON under a theme's `templates/` or `sections/` (nested or not), are parsed as JSON and `sections.*.type` becomes `sections/<type>.liquid` references. JSON in folders of those names that no theme holds (a .NET project template's `templates/<name>/.template.config/template.json`, schematics, CMS content) is not Liquid, and without a project root no JSON is. A marker that comes or goes reclassifies the theme's unchanged JSON on the next sync, and `status`'s git fast path declines a marker among its candidates.
+- A `sections/<name>.liquid` or `snippets/<name>.liquid` reference made in a file inside a theme (the directory holding the nearest theme folder the file sits in, when it holds a marker) resolves to that theme's own file or stays unresolved: Shopify never looks in another theme. A reference made in no theme resolves by path as before.
 - `.liquid` templates scan:
   - snippets: `/\{%[-]?\s*(render|include)\s+['"]([^'"]+)['"]/g` → `snippets/<name>.liquid`.
   - sections: `/\{%[-]?\s*section\s+['"]([^'"]+)['"]/g` → `sections/<name>.liquid`.

@@ -2203,6 +2203,12 @@ impl ReferenceResolver {
                 None,
             );
         }
+        // A section or snippet a Shopify theme's file names is that theme's
+        // own, or nothing: Shopify never looks in another theme (upstream
+        // #2396).
+        if let Some(result) = crate::shopify_themes::match_shopify_theme_file(reference, context) {
+            return (result, None);
+        }
         // A Go call through a type assertion (`srv.(KVServer).Range(ctx,
         // in)`), which arrives by its bare name, is to a method of the
         // asserted type, or to nothing the project declares (upstream #2444).

@@ -22,7 +22,12 @@
 //!   `assume-unchanged` or `skip-worktree` entry, or an ignored path the scan
 //!   would keep;
 //! - git may call changed bytes clean: `core.autocrlf`, any gitattributes
-//!   source, or a case-insensitive or Unicode-precomposing name match.
+//!   source, or a case-insensitive or Unicode-precomposing name match;
+//! - a Shopify theme marker among the candidates, one git may hide (an
+//!   ignored marker, or an ignored `config/` or `layout/` beside a theme's
+//!   JSON folders), or a theme the index records whose markers are all gone:
+//!   a marker's coming or going makes the theme's unchanged JSON templates
+//!   source or not (W4-LIQ-01).
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -369,7 +374,8 @@ fn index_flags(root: &Path, repo: &Repo) -> Option<IndexFlags> {
     Some(flags)
 }
 
-/// Whether git ignores a path the scan would keep: a working-tree change
+/// Whether git ignores a path the scan would keep, or one that may hold a
+/// Shopify theme marker (which counts though ignored): a working-tree change
 /// there is invisible to `git status`. `None` when git fails.
 fn ignores_scanned_path(root: &Path, repo: &Repo, options: &ExtractOptions) -> Option<bool> {
     let out = git(
@@ -390,8 +396,11 @@ fn ignores_scanned_path(root: &Path, repo: &Repo, options: &ExtractOptions) -> O
         let Some(relative) = repo.rebase(&entry) else {
             continue;
         };
-        // An attributes file applies whether or not git ignores it.
-        if Path::new(&relative).file_name() == Some(std::ffi::OsStr::new(".gitattributes")) {
+        // An attributes file applies whether or not git ignores it, and so
+        // does a theme marker (W4-LIQ-01).
+        if Path::new(&relative).file_name() == Some(std::ffi::OsStr::new(".gitattributes"))
+            || crate::shopify_themes::may_hide_a_marker(root, &relative)
+        {
             return Some(true);
         }
         let membership = match relative.strip_suffix('/') {
@@ -567,6 +576,13 @@ pub(crate) fn git_fast_pending(
     let mut candidates = status;
     candidates.extend(committed);
     candidates.extend(record.dirty);
+    if candidates
+        .iter()
+        .any(|path| codegraph_extract::embedded::shopify::is_shopify_theme_marker(path))
+        || crate::shopify_themes::a_recorded_theme_lost_its_marker(store, root)?
+    {
+        return Ok(None);
+    }
     let mut pending = PendingChanges::default();
     for relative in candidates {
         let full = root.join(&relative);

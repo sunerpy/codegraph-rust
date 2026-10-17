@@ -71,6 +71,7 @@ mod rust_lexical;
 pub mod rust_scope;
 pub mod scala_scope;
 pub mod sfc_scripts;
+mod shopify_themes;
 pub mod snapshot_context;
 pub mod solidity_scope;
 pub mod source_facts;

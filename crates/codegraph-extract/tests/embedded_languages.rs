@@ -72,7 +72,9 @@ fn liquid_extracts_template_nodes_and_shopify_json_section_refs() {
         4,
     );
 
-    let json = extract_fixture("templates/product.json", None);
+    // A JSON template is Liquid inside a Shopify theme, which takes the
+    // project root to find (upstream #2393); here it is extracted as one.
+    let json = extract_fixture("templates/product.json", Some(Language::Liquid));
     assert_no_errors(&json);
     assert_ref(
         &json,
@@ -86,7 +88,7 @@ fn liquid_extracts_template_nodes_and_shopify_json_section_refs() {
         "sections/related-products.liquid",
         1,
     );
-    assert_eq!(detect_language("templates/product.json"), Language::Liquid);
+    assert_eq!(detect_language("templates/product.json"), Language::Unknown);
     println!("liquid original-line assertions passed");
 }
 

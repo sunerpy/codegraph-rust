@@ -17613,3 +17613,303 @@ mod erlang_imports {
         );
     }
 }
+
+mod shopify_themes {
+    use super::support::{Graph, Project};
+
+    /// A JSON template naming one section `type` (upstream's `jsonTemplate`).
+    fn json_template(section: &str) -> String {
+        format!("{{\"sections\":{{\"main\":{{\"type\":\"{section}\"}}}},\"order\":[\"main\"]}}")
+    }
+
+    /// The indexed JSON files, sorted (upstream's `indexedJson`).
+    fn indexed_json(graph: &Graph) -> Vec<String> {
+        let mut out: Vec<String> = graph
+            .files
+            .iter()
+            .map(|file| file.path.clone())
+            .filter(|path| path.ends_with(".json"))
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// The other files `file`'s nodes link to, sorted and deduplicated
+    /// (upstream's `getFileDependencies`).
+    fn links_of(graph: &Graph, file: &str) -> Vec<String> {
+        let mut out: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.kind != "contains")
+            .filter_map(|edge| {
+                let source = graph.node(&edge.source)?;
+                let target = graph.node(&edge.target)?;
+                (source.file_path == file && target.file_path != file)
+                    .then(|| target.file_path.clone())
+            })
+            .collect();
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// The other files whose nodes link to `file`, sorted and deduplicated
+    /// (upstream's `getFileDependents`).
+    fn dependents_of(graph: &Graph, file: &str) -> Vec<String> {
+        let mut out: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.kind != "contains")
+            .filter_map(|edge| {
+                let source = graph.node(&edge.source)?;
+                let target = graph.node(&edge.target)?;
+                (target.file_path == file && source.file_path != file)
+                    .then(|| source.file_path.clone())
+            })
+            .collect();
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// Upstream #2393: JSON in `templates/` or `sections/` folders that no
+    /// Shopify theme holds (jasontaylordev/CleanArchitecture's .NET project
+    /// template, a CMS's content) is not Liquid, even when a Liquid file is
+    /// named like one of its "types".
+    #[test]
+    fn pr2393_json_under_templates_or_sections_outside_a_theme_is_left_out() {
+        let project = Project::new()
+            .file(
+                "templates/ca-use-case/.template.config/dotnetcli.host.json",
+                "{\"symbolInfo\":{\"UseCase\":{\"longName\":\"name\"}}}",
+            )
+            .file(
+                "templates/ca-use-case/.template.config/template.json",
+                "{\"identity\":\"CleanArchitecture.UseCase\",\"sections\":{\"main\":{\"type\":\"hero\"}}}",
+            )
+            .file("sections/home.json", &json_template("hero"))
+            .file("sections/hero.liquid", "<h1>{{ page.title }}</h1>\n")
+            .index();
+        let graph = project.graph();
+        assert_eq!(
+            indexed_json(graph),
+            Vec::<String>::new(),
+            "{}",
+            graph.report()
+        );
+        assert!(
+            graph
+                .files
+                .iter()
+                .any(|file| file.path == "sections/hero.liquid"),
+            "the Liquid file itself is still indexed:\n{}",
+            graph.report()
+        );
+        assert_eq!(
+            dependents_of(graph, "sections/hero.liquid"),
+            Vec::<String>::new(),
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream #2393: a theme in a subdirectory with no `layout/theme.liquid`
+    /// committed is marked by its `config/settings_schema.json`; the same
+    /// JSON under `tools/templates/` is in no theme.
+    #[test]
+    fn pr2393_a_settings_schema_marks_a_theme_in_a_subdirectory() {
+        let project = Project::new()
+            .file(
+                "theme/config/settings_schema.json",
+                "[{\"name\":\"theme_info\"}]",
+            )
+            .file(
+                "theme/sections/main-product.liquid",
+                "<div>{{ product.title }}</div>\n",
+            )
+            .file(
+                "theme/templates/product.json",
+                &json_template("main-product"),
+            )
+            .file(
+                "tools/templates/product.json",
+                &json_template("main-product"),
+            )
+            .index();
+        let graph = project.graph();
+        assert_eq!(
+            indexed_json(graph),
+            ["theme/templates/product.json"],
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            dependents_of(graph, "theme/sections/main-product.liquid"),
+            ["theme/templates/product.json"],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream #2393: JSON stored as Liquid leaves once its folder is no
+    /// longer a theme, and comes back when it is one again, without a
+    /// re-index (a full sync here; the scoped sync is the sync matrix's).
+    #[test]
+    fn pr2393_json_templates_leave_and_return_with_the_theme_marker() {
+        let mut project = Project::new()
+            .file("layout/theme.liquid", "{{ content_for_layout }}\n")
+            .file(
+                "sections/main-product.liquid",
+                "<div>{{ product.title }}</div>\n",
+            )
+            .file("templates/page.json", &json_template("main-product"))
+            .file("templates/product.json", &json_template("main-product"))
+            .index();
+        assert_eq!(
+            indexed_json(project.graph()),
+            ["templates/page.json", "templates/product.json"],
+            "{}",
+            project.graph().report()
+        );
+
+        project.remove("layout/theme.liquid");
+        let graph = project.sync();
+        assert_eq!(
+            indexed_json(graph),
+            Vec::<String>::new(),
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            dependents_of(graph, "sections/main-product.liquid"),
+            Vec::<String>::new(),
+            "{}",
+            graph.report()
+        );
+
+        project.write("config/settings_schema.json", "[]");
+        let graph = project.sync();
+        assert_eq!(
+            indexed_json(graph),
+            ["templates/page.json", "templates/product.json"],
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            dependents_of(graph, "sections/main-product.liquid"),
+            ["templates/page.json", "templates/product.json"],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// A theme at the project root, a theme in a folder marked only by its
+    /// settings schema, and one in a folder with no 404 section and no price
+    /// snippet of its own: the shape of panoply/syncify's example themes
+    /// (upstream's `severalThemes`).
+    fn several_themes() -> Project {
+        Project::new()
+            .file(
+                "layout/theme.liquid",
+                "{% section 'header' %}{{ content_for_layout }}\n",
+            )
+            .file("sections/header.liquid", "{% render 'price' %}\n")
+            .file("sections/main.liquid", "<main></main>\n")
+            .file("snippets/price.liquid", "{{ product.price | money }}\n")
+            .file("straps/dusk/config/settings_schema.json", "[]")
+            .file(
+                "straps/dusk/sections/404.liquid",
+                "<h1>{{ 'templates.404.title' | t }}</h1>\n",
+            )
+            .file("straps/dusk/templates/404.json", &json_template("404"))
+            .file(
+                "examples/tailwind/layout/theme.liquid",
+                "{% section 'header' %}{{ content_for_layout }}\n",
+            )
+            .file(
+                "examples/tailwind/sections/header.liquid",
+                "{% liquid\n  render 'price'\n  render 'icon'\n%}\n",
+            )
+            .file(
+                "examples/tailwind/sections/main.liquid",
+                "<main class=\"p-4\"></main>\n",
+            )
+            .file("examples/tailwind/snippets/icon.liquid", "<svg></svg>\n")
+            .file(
+                "examples/tailwind/templates/index.json",
+                &json_template("main"),
+            )
+            .file(
+                "examples/tailwind/templates/404.json",
+                &json_template("404"),
+            )
+            // Liquid in no theme: an app's theme extension.
+            .file(
+                "extensions/reviews/blocks/stars.liquid",
+                "{% render 'star' %}\n",
+            )
+            .file("extensions/reviews/snippets/star.liquid", "<svg></svg>\n")
+    }
+
+    /// Upstream #2396: a `{% render %}`, a `{% section %}` or a JSON
+    /// template's section `type` is looked up in the theme the file belongs
+    /// to, never in another one. What the theme lacks stays unlinked;
+    /// outside any theme, a path resolves as before.
+    #[test]
+    fn pr2396_a_themes_sections_and_snippets_link_only_inside_that_theme() {
+        let project = several_themes().index();
+        let graph = project.graph();
+        let expected: [(&str, &[&str]); 8] = [
+            ("layout/theme.liquid", &["sections/header.liquid"]),
+            ("sections/header.liquid", &["snippets/price.liquid"]),
+            (
+                "straps/dusk/templates/404.json",
+                &["straps/dusk/sections/404.liquid"],
+            ),
+            (
+                "examples/tailwind/layout/theme.liquid",
+                &["examples/tailwind/sections/header.liquid"],
+            ),
+            (
+                "examples/tailwind/templates/index.json",
+                &["examples/tailwind/sections/main.liquid"],
+            ),
+            ("examples/tailwind/templates/404.json", &[]),
+            (
+                "examples/tailwind/sections/header.liquid",
+                &["examples/tailwind/snippets/icon.liquid"],
+            ),
+            (
+                "extensions/reviews/blocks/stars.liquid",
+                &["extensions/reviews/snippets/star.liquid"],
+            ),
+        ];
+        for (file, links) in expected {
+            assert_eq!(links_of(graph, file), links, "{file}\n{}", graph.report());
+        }
+    }
+
+    /// Upstream #2396: sync resolves again what named a deleted file, and
+    /// another theme's 404 section is no stand-in for the theme's own.
+    #[test]
+    fn pr2396_a_themes_references_stay_inside_it_when_its_section_is_deleted() {
+        let mut project = several_themes()
+            .file("examples/tailwind/sections/404.liquid", "<h1>404</h1>\n")
+            .index();
+        assert_eq!(
+            links_of(project.graph(), "examples/tailwind/templates/404.json"),
+            ["examples/tailwind/sections/404.liquid"],
+            "{}",
+            project.graph().report()
+        );
+
+        project.remove("examples/tailwind/sections/404.liquid");
+        let graph = project.sync();
+        assert_eq!(
+            links_of(graph, "examples/tailwind/templates/404.json"),
+            Vec::<String>::new(),
+            "{}",
+            graph.report()
+        );
+    }
+}

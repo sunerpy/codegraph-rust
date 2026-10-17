@@ -242,6 +242,7 @@ pub(crate) fn migrate_project(
     crate::cfml_heads::write_index_rows(rebuild.store(), &mut cfml_rows)?;
     drop(cfml_rows);
     crate::solidity_heads::write_index_rows(rebuild.store(), &mut solidity_rows)?;
+    crate::shopify_themes::write_index_row(rebuild.store(), project_root)?;
     drop(solidity_rows);
     crate::swift_heads::write_index_rows(rebuild.store(), &mut swift_rows)?;
     drop(swift_rows);
@@ -266,6 +267,7 @@ pub(crate) fn migrate_project(
     crate::ruby_heads::write_marker(rebuild.store())?;
     crate::cfml_heads::write_marker(rebuild.store())?;
     crate::solidity_heads::write_marker(rebuild.store())?;
+    crate::shopify_themes::write_marker(rebuild.store())?;
     crate::swift_heads::write_marker(rebuild.store())?;
     crate::objc_heads::write_marker(rebuild.store())?;
     crate::go_heads::write_marker(rebuild.store())?;

@@ -6015,6 +6015,7 @@ fn index_project_inner(
     codegraph_watch::cfml_heads::write_index_rows(&store, &mut cfml_rows)?;
     drop(cfml_rows);
     codegraph_watch::solidity_heads::write_index_rows(&store, &mut solidity_rows)?;
+    codegraph_watch::shopify_themes::write_index_row(&store, project)?;
     drop(solidity_rows);
     codegraph_watch::swift_heads::write_index_rows(&store, &mut swift_rows)?;
     drop(swift_rows);
@@ -6046,6 +6047,7 @@ fn index_project_inner(
     codegraph_watch::ruby_heads::write_marker(&store)?;
     codegraph_watch::cfml_heads::write_marker(&store)?;
     codegraph_watch::solidity_heads::write_marker(&store)?;
+    codegraph_watch::shopify_themes::write_marker(&store)?;
     codegraph_watch::swift_heads::write_marker(&store)?;
     codegraph_watch::objc_heads::write_marker(&store)?;
     codegraph_watch::go_heads::write_marker(&store)?;

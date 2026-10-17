@@ -9296,6 +9296,198 @@ pub fn typescript_react_dependency_appears_in_package_json() -> Case {
         .edge_after("function page", "calls", "function src/hooks.ts::useCart")
 }
 
+// ----- Shopify theme markers (W4-LIQ-01: upstream #2393, #2396) ---------
+
+/// A JSON template naming the section `main-product`.
+const PRODUCT_TEMPLATE: &str =
+    "{\"sections\":{\"main\":{\"type\":\"main-product\"}},\"order\":[\"main\"]}";
+/// A JSON template naming the section `404`.
+const NOT_FOUND_TEMPLATE: &str =
+    "{\"sections\":{\"main\":{\"type\":\"404\"}},\"order\":[\"main\"]}";
+
+/// Upstream #2393: an unchanged JSON template becomes Liquid once its folder
+/// gains a theme's settings schema, which is no source file itself.
+pub fn liquid_json_template_joins_a_theme_once_its_settings_schema_appears() -> Case {
+    Case::new(Change::ControlFile, &[Language::Liquid])
+        .file(
+            "sections/main-product.liquid",
+            "<div>{{ product.title }}</div>\n",
+        )
+        .file("templates/product.json", PRODUCT_TEMPLATE)
+        .write("config/settings_schema.json", "[]")
+        .edge_after(
+            "file:templates/product.json",
+            "references",
+            "file:sections/main-product.liquid",
+        )
+        .file_language_after("templates/product.json", "liquid")
+}
+
+/// Upstream #2393: unchanged JSON templates leave the index once their
+/// folder loses the theme's layout.
+pub fn liquid_json_templates_leave_once_the_theme_layout_goes() -> Case {
+    Case::new(Change::ControlFile, &[Language::Liquid])
+        .file("layout/theme.liquid", "{{ content_for_layout }}\n")
+        .file(
+            "sections/main-product.liquid",
+            "<div>{{ product.title }}</div>\n",
+        )
+        .file("templates/product.json", PRODUCT_TEMPLATE)
+        .file("templates/page.json", PRODUCT_TEMPLATE)
+        .remove("layout/theme.liquid")
+        .edge_before(
+            "file:templates/product.json",
+            "references",
+            "file:sections/main-product.liquid",
+        )
+        .edge_before(
+            "file:templates/page.json",
+            "references",
+            "file:sections/main-product.liquid",
+        )
+}
+
+/// Upstream #2393: theme folders are named in any case; an unchanged JSON
+/// template in a theme's `Templates/` joins once the theme is marked.
+pub fn liquid_json_template_in_a_mixed_case_folder_joins_a_marked_theme() -> Case {
+    Case::new(Change::ControlFile, &[Language::Liquid])
+        .file(
+            "Shop/sections/main-product.liquid",
+            "<div>{{ product.title }}</div>\n",
+        )
+        .file("Shop/Templates/product.json", PRODUCT_TEMPLATE)
+        .write("Shop/config/settings_schema.json", "[]")
+        .edge_after(
+            "file:Shop/Templates/product.json",
+            "references",
+            "file:Shop/sections/main-product.liquid",
+        )
+        .file_language_after("Shop/Templates/product.json", "liquid")
+}
+
+/// Upstream #2393: a marker counts though ignored, wherever it is; the
+/// unchanged JSON template joins once an ignored settings schema appears.
+pub fn liquid_json_template_joins_a_theme_through_an_ignored_settings_schema() -> Case {
+    Case::new(Change::ControlFile, &[Language::Liquid])
+        .file(".gitignore", "config/\n")
+        .file(
+            "sections/main-product.liquid",
+            "<div>{{ product.title }}</div>\n",
+        )
+        .file("templates/product.json", PRODUCT_TEMPLATE)
+        .write("config/settings_schema.json", "[]")
+        .edge_after(
+            "file:templates/product.json",
+            "references",
+            "file:sections/main-product.liquid",
+        )
+        .file_language_after("templates/product.json", "liquid")
+}
+
+/// Upstream #2393: the unchanged JSON template leaves once an ignored
+/// settings schema, its theme's only marker, is removed.
+pub fn liquid_json_template_leaves_once_an_ignored_settings_schema_goes() -> Case {
+    Case::new(Change::ControlFile, &[Language::Liquid])
+        .file(".gitignore", "config/\n")
+        .file("config/settings_schema.json", "[]")
+        .file(
+            "sections/main-product.liquid",
+            "<div>{{ product.title }}</div>\n",
+        )
+        .file("templates/product.json", PRODUCT_TEMPLATE)
+        .remove("config/settings_schema.json")
+        .edge_before(
+            "file:templates/product.json",
+            "references",
+            "file:sections/main-product.liquid",
+        )
+}
+
+/// Upstream #2396: an unchanged section's `render` stops reaching the root
+/// theme's snippet once its folder is a theme of its own, which lacks it.
+pub fn liquid_render_stays_in_a_folder_once_it_is_marked_a_theme() -> Case {
+    Case::new(Change::ControlFile, &[Language::Liquid])
+        .file("layout/theme.liquid", "{{ content_for_layout }}\n")
+        .file("snippets/price.liquid", "{{ product.price | money }}\n")
+        .file("shop/sections/header.liquid", "{% render 'price' %}\n")
+        .write("shop/config/settings_schema.json", "[]")
+        .edge_before(
+            "file:shop/sections/header.liquid",
+            "references",
+            "file:snippets/price.liquid",
+        )
+        .no_edge_after(
+            "file:shop/sections/header.liquid",
+            "references",
+            "file:snippets/price.liquid",
+        )
+}
+
+/// Upstream #2396: an unchanged section's `render` reaches the root theme's
+/// snippet by its path once its folder is no theme any more.
+pub fn liquid_render_leaves_a_folder_theme_once_its_marker_goes() -> Case {
+    Case::new(Change::ControlFile, &[Language::Liquid])
+        .file("layout/theme.liquid", "{{ content_for_layout }}\n")
+        .file("snippets/price.liquid", "{{ product.price | money }}\n")
+        .file("shop/config/settings_schema.json", "[]")
+        .file("shop/sections/header.liquid", "{% render 'price' %}\n")
+        .remove("shop/config/settings_schema.json")
+        .edge_after(
+            "file:shop/sections/header.liquid",
+            "references",
+            "file:snippets/price.liquid",
+        )
+}
+
+/// Upstream #2396: a theme's JSON template whose own section is deleted
+/// links no other theme's copy.
+pub fn liquid_json_template_loses_its_own_themes_section() -> Case {
+    Case::new(Change::DeleteImportedModule, &[Language::Liquid])
+        .file(
+            "examples/tailwind/layout/theme.liquid",
+            "{{ content_for_layout }}\n",
+        )
+        .file("examples/tailwind/sections/404.liquid", "<h1>404</h1>\n")
+        .file("examples/tailwind/templates/404.json", NOT_FOUND_TEMPLATE)
+        .file("straps/dusk/config/settings_schema.json", "[]")
+        .file("straps/dusk/sections/404.liquid", "<h1>Not found</h1>\n")
+        .remove("examples/tailwind/sections/404.liquid")
+        .edge_before(
+            "file:examples/tailwind/templates/404.json",
+            "references",
+            "file:examples/tailwind/sections/404.liquid",
+        )
+        .no_edge_after(
+            "file:examples/tailwind/templates/404.json",
+            "references",
+            "file:straps/dusk/sections/404.liquid",
+        )
+}
+
+/// Upstream #2396: a theme's JSON template links the section its own theme
+/// gains, and no other theme's copy.
+pub fn liquid_json_template_gains_its_own_themes_section() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Liquid])
+        .file(
+            "examples/tailwind/layout/theme.liquid",
+            "{{ content_for_layout }}\n",
+        )
+        .file("examples/tailwind/templates/404.json", NOT_FOUND_TEMPLATE)
+        .file("straps/dusk/config/settings_schema.json", "[]")
+        .file("straps/dusk/sections/404.liquid", "<h1>Not found</h1>\n")
+        .write("examples/tailwind/sections/404.liquid", "<h1>404</h1>\n")
+        .edge_after(
+            "file:examples/tailwind/templates/404.json",
+            "references",
+            "file:examples/tailwind/sections/404.liquid",
+        )
+        .no_edge_after(
+            "file:examples/tailwind/templates/404.json",
+            "references",
+            "file:straps/dusk/sections/404.liquid",
+        )
+}
+
 // ----- a `.h` header changes from C to C++ ----------------------------------
 
 pub fn c_header_flips_to_cpp() -> Case {

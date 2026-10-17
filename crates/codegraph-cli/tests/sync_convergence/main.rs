@@ -57,8 +57,9 @@ pub enum Change {
     /// A second declaration of an already-referenced name appears elsewhere.
     AddCompetitor,
     /// A project control file changes: `package.json`, `tsconfig.json`, the
-    /// root `.gitignore`, `.git/info/exclude`, or the index root's
-    /// `config.toml` or `codegraph.json`.
+    /// root `.gitignore`, `.git/info/exclude`, the index root's
+    /// `config.toml` or `codegraph.json`, or a Shopify theme marker
+    /// (`layout/theme.liquid`, `config/settings_schema.json`).
     ControlFile,
     /// A `.h` header changes from C to C++ content.
     HeaderFlip,
@@ -377,6 +378,8 @@ fn run_case(name: &str, case: &Case) {
     let dart_rows = support::project_metadata_with_prefix(&fresh.db(), "dart_heads");
     // And the Dart library rows (W4-DART-02).
     let dart_library_rows = support::project_metadata_with_prefix(&fresh.db(), "dart_library");
+    // And the Shopify theme row and its marker (W4-LIQ-01).
+    let shopify_rows = support::project_metadata_with_prefix(&fresh.db(), "shopify_themes");
     for (driver, project) in [("cli", &cli), ("watch", &watch)] {
         let rows = support::project_metadata_with_prefix(&project.db(), "js_module_surface");
         if rows != surface_rows {
@@ -502,6 +505,13 @@ fn run_case(name: &str, case: &Case) {
             divergent.push(format!(
                 "=== {driver} driver: the Dart library rows differ from a fresh index\n\
                  synced: {rows:#?}\nfresh: {dart_library_rows:#?}"
+            ));
+        }
+        let rows = support::project_metadata_with_prefix(&project.db(), "shopify_themes");
+        if rows != shopify_rows {
+            divergent.push(format!(
+                "=== {driver} driver: the Shopify theme row differs from a fresh index\n\
+                 synced: {rows:#?}\nfresh: {shopify_rows:#?}"
             ));
         }
     }
@@ -1248,6 +1258,15 @@ matrix! {
     typescript_tsconfig_paths_alias_appears,
     #[ignore = "unscheduled, found by W0-04: a package.json framework dependency change does not re-run framework detection"]
     typescript_react_dependency_appears_in_package_json,
+    liquid_json_template_joins_a_theme_once_its_settings_schema_appears,
+    liquid_json_templates_leave_once_the_theme_layout_goes,
+    liquid_json_template_in_a_mixed_case_folder_joins_a_marked_theme,
+    liquid_json_template_joins_a_theme_through_an_ignored_settings_schema,
+    liquid_json_template_leaves_once_an_ignored_settings_schema_goes,
+    liquid_render_stays_in_a_folder_once_it_is_marked_a_theme,
+    liquid_render_leaves_a_folder_theme_once_its_marker_goes,
+    liquid_json_template_loses_its_own_themes_section,
+    liquid_json_template_gains_its_own_themes_section,
     c_header_flips_to_cpp,
     javascript_file_gains_the_flow_pragma,
 }

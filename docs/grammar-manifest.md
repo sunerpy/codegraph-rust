@@ -94,7 +94,8 @@ silently become “41” in another page.
 smoke-tested even though their current production paths are file/custom level.
 `tree-sitter-html`, `tree-sitter-css`, and `tree-sitter-json` are also ABI-smoke
 helpers; HTML/CSS/general JSON are not standalone `Language` IDs. Shopify JSON is
-claimed only by the Liquid embedded detector.
+claimed only by the Liquid detector, and only inside a Shopify theme under the
+project root.
 
 SQL is not a standalone language ID or extension mapping. MyBatis extraction can
 emit SQL-related mapper symbols from XML without adding `.sql` source support.

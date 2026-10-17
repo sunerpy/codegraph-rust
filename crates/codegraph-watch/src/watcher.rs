@@ -325,7 +325,9 @@ fn watch_registration(backend: WatchBackend) -> WatchRegistration {
 /// The walk reuses the SAME [`WatchPolicy`] already built in
 /// [`ProjectWatcher::start`] (its `normalize_relative` + `should_watch_dir`), so
 /// the watch-registration set matches the extract-side ignore set exactly. When a
-/// directory is ignored, the walk does not descend into it at all.
+/// directory is ignored, the walk does not descend into it at all; an ignored
+/// `config/` or `layout/` is still watched itself, for a Shopify theme marker
+/// (W4-LIQ-01).
 ///
 /// Pure and deterministic: the result is sorted, always includes `root` itself,
 /// and `read_dir`/metadata errors on any subdir are tolerated (that subdir is
@@ -368,7 +370,15 @@ fn collect_watch_tree(root: &Path, policy: &WatchPolicy) -> (Vec<PathBuf>, bool)
             match policy.normalize_relative(&path) {
                 // PRUNE: do not descend into an ignored subtree at all. This is
                 // what keeps us out of node_modules/.venv/__pycache__/.git/etc.
-                Some(relative) if !policy.should_watch_dir(&relative) => continue,
+                // An ignored `config/` or `layout/` is still watched, not below
+                // it, for a Shopify theme marker, which counts wherever it is
+                // (W4-LIQ-01).
+                Some(relative) if !policy.should_watch_dir(&relative) => {
+                    if policy.watches_for_theme_markers(&relative) {
+                        dirs.push(path);
+                    }
+                    continue;
+                }
                 // A path that doesn't normalize (escape / root) is not pushed.
                 None => continue,
                 Some(_) => stack.push(path),
@@ -559,6 +569,21 @@ fn register_new_dirs_with(
     }
     for dir in collect_watch_dirs(new_dir, policy) {
         register(&dir, RecursiveMode::NonRecursive);
+    }
+}
+
+/// Register a NonRecursive watch for the newly-created directory `dir` alone,
+/// an ignored one watched for a Shopify theme marker (W4-LIQ-01), on
+/// per-directory backends; a no-op on the recursive ones.
+fn register_marker_dir(watcher: &SharedWatcher, dir: &Path) {
+    if watch_registration(platform_watch_backend()) == WatchRegistration::SingleRootRecursive {
+        return;
+    }
+    let Ok(mut guard) = watcher.lock() else {
+        return;
+    };
+    if let Some(watcher) = guard.as_mut() {
+        let _ = watcher.watch(dir, RecursiveMode::NonRecursive);
     }
 }
 
@@ -1711,6 +1736,24 @@ fn event_loop(ctx: EventLoopCtx) {
                                     first_seen_ms: now,
                                     last_seen_ms: now,
                                 });
+                        } else if runtime_scope.policy.watches_for_theme_markers(&relative) {
+                            // An ignored `config/` or `layout/` removed or moved
+                            // away takes its theme marker with it, though no
+                            // event may name the marker (W4-LIQ-01).
+                            let now = epoch_millis();
+                            for marker in
+                                codegraph_extract::embedded::shopify::shopify_markers_in_folder(
+                                    &relative,
+                                )
+                            {
+                                pending
+                                    .entry(marker)
+                                    .and_modify(|info| info.last_seen_ms = now)
+                                    .or_insert(PendingInfo {
+                                        first_seen_ms: now,
+                                        last_seen_ms: now,
+                                    });
+                            }
                         }
                         continue;
                     }
@@ -1719,6 +1762,34 @@ fn event_loop(ctx: EventLoopCtx) {
                     // `collect_watch_dirs`). Register it (and any non-ignored
                     // descendants created in the same burst, e.g. `mkdir -p`) so
                     // edits inside it are seen without a server restart.
+                    // A new ignored `config/` or `layout/` is watched for a theme
+                    // marker alone; a marker written before the watch counts as
+                    // seen (W4-LIQ-01).
+                    if path.is_dir()
+                        && !runtime_scope.policy.should_watch_dir(&relative)
+                        && runtime_scope.policy.watches_for_theme_markers(&relative)
+                        && !fs::symlink_metadata(&path)
+                            .is_ok_and(|meta| meta.file_type().is_symlink())
+                    {
+                        register_marker_dir(&watcher, &path);
+                        known_dirs.insert(relative.clone());
+                        let now = epoch_millis();
+                        for entry in fs::read_dir(&path).into_iter().flatten().flatten() {
+                            let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+                                continue;
+                            };
+                            let marker = format!("{relative}/{name}");
+                            if runtime_scope.policy.may_mark_a_theme(&marker) {
+                                pending
+                                    .entry(marker)
+                                    .and_modify(|info| info.last_seen_ms = now)
+                                    .or_insert(PendingInfo {
+                                        first_seen_ms: now,
+                                        last_seen_ms: now,
+                                    });
+                            }
+                        }
+                    }
                     if path.is_dir() && runtime_scope.policy.should_watch_dir(&relative) {
                         // A new link is the scan's to follow (above); a new real
                         // directory holding a link is a topology change too.
@@ -1748,9 +1819,14 @@ fn event_loop(ctx: EventLoopCtx) {
                             }
                         }
                     }
+                    // A Shopify theme marker need not be source, nor in scope,
+                    // yet its coming or going reclassifies the theme's JSON
+                    // templates: the sync it is handed to reads the theme
+                    // (W4-LIQ-01).
                     if runtime_scope.policy.should_handle_file(&relative)
                         || (runtime_scope.policy.allows_file_path(&relative)
                             && maybe_deleted_source(&relative))
+                        || runtime_scope.policy.may_mark_a_theme(&relative)
                     {
                         let now = epoch_millis();
                         // A file link aliasing this path is the same content
@@ -4070,6 +4146,158 @@ mod tests {
         assert!(
             seen,
             "editing src/app.ts should trigger a sync of that path"
+        );
+    }
+
+    /// W4-LIQ-01: a Shopify theme marker is no source file here, yet its
+    /// coming reaches the sync, which reclassifies the theme's JSON
+    /// templates; other JSON beside it does not.
+    #[test]
+    fn a_shopify_theme_marker_reaches_the_sync_though_it_is_not_source() {
+        let _env = crate::test_env::env_guard();
+        let dir = crate::sync::tests::TestDir::new("watch-shopify-marker");
+        fs::create_dir_all(dir.path().join("config")).unwrap();
+        fs::create_dir_all(dir.path().join("templates")).unwrap();
+        fs::write(dir.path().join("templates/product.json"), "{}").unwrap();
+
+        let synced = Arc::new(Mutex::new(Vec::<Vec<String>>::new()));
+        let recorder = Arc::clone(&synced);
+        let sync_fn: SyncFn = Arc::new(move |paths| {
+            recorder.lock().unwrap().push(paths.clone());
+            Ok(SyncOutcome {
+                files_checked: paths.len(),
+                ..Default::default()
+            })
+        });
+        let watcher = ProjectWatcher::start(
+            dir.path(),
+            WatchOptions {
+                debounce: Duration::from_millis(50),
+                sync_fn: Some(sync_fn),
+                ..WatchOptions::default()
+            },
+        )
+        .unwrap()
+        .unwrap();
+
+        // Give the OS watch registration a moment, then write the theme's
+        // settings data (no marker) and its settings schema (a marker).
+        std::thread::sleep(Duration::from_millis(150));
+        fs::write(dir.path().join("config/settings_data.json"), "{}").unwrap();
+        fs::write(dir.path().join("config/settings_schema.json"), "[]").unwrap();
+
+        let mut seen = false;
+        for _ in 0..40 {
+            std::thread::sleep(Duration::from_millis(50));
+            if synced
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|paths| paths.iter().any(|p| p == "config/settings_schema.json"))
+            {
+                seen = true;
+                break;
+            }
+        }
+        watcher.stop();
+        let synced = synced.lock().unwrap().clone();
+        assert!(seen, "the marker should reach a sync: {synced:?}");
+        assert!(
+            !synced
+                .iter()
+                .any(|paths| paths.iter().any(|p| p == "config/settings_data.json")),
+            "JSON that marks no theme is not handed on: {synced:?}"
+        );
+    }
+
+    /// W4-LIQ-01: a Shopify theme marker counts though ignored, so an ignored
+    /// `config/` is still watched for one (itself, not below it, on
+    /// per-directory backends), whether it exists at start or comes later,
+    /// and its marker reaches the sync.
+    #[test]
+    fn an_ignored_shopify_marker_folder_is_watched_for_its_marker() {
+        let _env = crate::test_env::env_guard();
+        let dir = crate::sync::tests::TestDir::new("watch-shopify-ignored-marker");
+        fs::write(dir.path().join(".gitignore"), "config/\n").unwrap();
+        fs::create_dir_all(dir.path().join("config")).unwrap();
+        fs::create_dir_all(dir.path().join("templates")).unwrap();
+        fs::create_dir_all(dir.path().join("shop/templates")).unwrap();
+
+        let synced = Arc::new(Mutex::new(Vec::<Vec<String>>::new()));
+        let recorder = Arc::clone(&synced);
+        let sync_fn: SyncFn = Arc::new(move |paths| {
+            recorder.lock().unwrap().push(paths.clone());
+            Ok(SyncOutcome {
+                files_checked: paths.len(),
+                ..Default::default()
+            })
+        });
+        let watcher = ProjectWatcher::start(
+            dir.path(),
+            WatchOptions {
+                debounce: Duration::from_millis(50),
+                sync_fn: Some(sync_fn),
+                ..WatchOptions::default()
+            },
+        )
+        .unwrap()
+        .unwrap();
+        // Whether a batch after the first `since` names `path`.
+        let reached = |path: &str, since: usize| {
+            for _ in 0..40 {
+                std::thread::sleep(Duration::from_millis(50));
+                if synced
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .skip(since)
+                    .any(|paths| paths.iter().any(|p| p == path))
+                {
+                    return true;
+                }
+            }
+            false
+        };
+        let batches = || synced.lock().unwrap().len();
+
+        // Give the OS watch registration a moment, then mark the root theme.
+        std::thread::sleep(Duration::from_millis(150));
+        fs::write(dir.path().join("config/settings_schema.json"), "[]").unwrap();
+        let root_marker = reached("config/settings_schema.json", 0);
+        // An ignored `config/` made after start is watched too.
+        fs::create_dir_all(dir.path().join("shop/config")).unwrap();
+        std::thread::sleep(Duration::from_millis(150));
+        fs::write(dir.path().join("shop/config/settings_schema.json"), "[]").unwrap();
+        let folder_marker = reached("shop/config/settings_schema.json", 0);
+        // A marker folder moved away, or removed whole, takes its marker with
+        // it, though no event need name the marker.
+        let since = batches();
+        fs::rename(
+            dir.path().join("shop/config"),
+            dir.path().join("shop/config-old"),
+        )
+        .unwrap();
+        let moved_away = reached("shop/config/settings_schema.json", since);
+        let since = batches();
+        fs::remove_dir_all(dir.path().join("config")).unwrap();
+        let removed = reached("config/settings_schema.json", since);
+        watcher.stop();
+        let synced = synced.lock().unwrap().clone();
+        assert!(
+            root_marker,
+            "the root theme's marker should reach a sync: {synced:?}"
+        );
+        assert!(
+            folder_marker,
+            "the folder theme's marker should reach a sync: {synced:?}"
+        );
+        assert!(
+            moved_away,
+            "a marker moved away with its folder should reach a sync: {synced:?}"
+        );
+        assert!(
+            removed,
+            "a marker removed with its folder should reach a sync: {synced:?}"
         );
     }
 

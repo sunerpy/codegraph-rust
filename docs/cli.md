@@ -84,6 +84,11 @@ inventory still answers whenever git might not see a change:
   case-insensitive or Unicode-precomposing name match (`core.ignorecase`, the
   macOS and Windows default; `core.precomposeunicode`). On those systems the full
   inventory answers;
+- a Shopify theme marker (`layout/theme.liquid`, `config/settings_schema.json`)
+  is among the candidates, git may hide one (it ignores a marker, or a
+  `config/` or `layout/` directory beside a `templates/` or `sections/` folder),
+  or a theme the index records has lost every marker: a marker's coming or
+  going makes the theme's unchanged JSON templates source or not;
 - git is missing or does not answer within 10 seconds.
 
 Git runs without optional locks, so `status` never rewrites `.git/index`.
@@ -1170,7 +1175,12 @@ up by the next full `sync`.
 
 This keeps the total watch count well inside the OS inotify limit on large trees
 and makes daemon startup fast. A newly-created non-ignored directory is picked up
-automatically on its create event — no restart required.
+automatically on its create event — no restart required. One kind of ignored
+directory is still watched, itself and not below it: a `config/` or `layout/`
+directory, which may hold a Shopify theme marker (`config/settings_schema.json`,
+`layout/theme.liquid`). A marker counts though ignored, since it only tells a
+theme's JSON templates apart, and the watcher hands its events to the sync; a
+marker folder removed or moved away takes its marker with it.
 
 A settled burst normally syncs exactly the paths its events named. Three cases
 make it run one full project reconcile instead, the same pass `codegraph sync`

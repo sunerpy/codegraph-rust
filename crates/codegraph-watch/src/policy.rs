@@ -137,6 +137,24 @@ impl WatchPolicy {
         !self.is_always_ignored(relative) && !self.is_ignored(relative, false)
     }
 
+    /// Whether `relative` is a Shopify theme marker a sync must hear of,
+    /// ignored or not (W4-LIQ-01): a marker counts wherever it is, since it
+    /// only tells a theme's JSON templates apart.
+    pub fn may_mark_a_theme(&self, relative: &str) -> bool {
+        !self.is_always_ignored(relative)
+            && codegraph_extract::embedded::shopify::is_shopify_theme_marker(relative)
+    }
+
+    /// Whether the directory `relative`, which this policy does not watch, is
+    /// still watched (not below it) for a Shopify theme marker: a `config/` or
+    /// `layout/` directory, in any case (W4-LIQ-01).
+    pub fn watches_for_theme_markers(&self, relative: &str) -> bool {
+        !self.is_always_ignored(relative)
+            && codegraph_extract::embedded::shopify::is_shopify_marker_folder(
+                relative.rsplit('/').next().unwrap_or(relative),
+            )
+    }
+
     pub fn should_watch_dir(&self, relative: &str) -> bool {
         !self.is_always_ignored(relative) && !self.is_ignored(relative, true)
     }

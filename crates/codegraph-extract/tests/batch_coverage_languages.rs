@@ -970,11 +970,70 @@ fn detect_language_routes_embedded_and_shopify_json_paths() {
     assert_eq!(detect_language("comp.vue"), Language::Vue);
     assert_eq!(detect_language("page.astro"), Language::Astro);
     assert_eq!(detect_language("theme.liquid"), Language::Liquid);
-    // Shopify template JSON under templates/ or sections/ routes to Liquid.
-    assert_eq!(detect_language("templates/product.json"), Language::Liquid);
-    assert_eq!(detect_language("sections/header.json"), Language::Liquid);
+    // Shopify template JSON is Liquid only inside a theme under the project
+    // root (upstream #2393): without a root there is no theme to look for.
+    assert_eq!(detect_language("templates/product.json"), Language::Unknown);
+    assert_eq!(detect_language("sections/header.json"), Language::Unknown);
     // A plain JSON elsewhere is not a Shopify liquid template.
     assert_eq!(detect_language("data/config.json"), Language::Unknown);
+}
+
+/// Upstream #2393's `reads JSON under templates/ or sections/ as Liquid only
+/// inside a theme under the project root`.
+#[test]
+fn shopify_json_is_liquid_only_inside_a_theme_under_the_project_root() {
+    use codegraph_extract::detect_language_with;
+    use codegraph_extract::ext_config::ExtensionOverrides;
+    let root = std::env::temp_dir().join(format!("codegraph-shopify-{}", std::process::id()));
+    std::fs::create_dir_all(root.join("shop/layout")).unwrap();
+    std::fs::write(root.join("shop/layout/theme.liquid"), "").unwrap();
+    let themed = ExtensionOverrides::default().with_project_root(&root);
+    for file in [
+        "shop/templates/product.json",
+        "shop/templates/customers/login.json",
+        "shop/sections/header-group.json",
+    ] {
+        assert_eq!(
+            detect_language_with(file, &themed),
+            Language::Liquid,
+            "{file}"
+        );
+        assert_eq!(
+            detect_language_with(file, &ExtensionOverrides::default()),
+            Language::Unknown,
+            "{file}"
+        );
+    }
+    // Beside the theme, not in it; and the theme's other JSON was never a template.
+    for file in [
+        "templates/product.json",
+        "other/sections/header-group.json",
+        "shop/config/settings_data.json",
+    ] {
+        assert_eq!(
+            detect_language_with(file, &themed),
+            Language::Unknown,
+            "{file}"
+        );
+    }
+    // Outside a theme, JSON gets whatever the project maps `.json` to, as any
+    // other JSON does.
+    std::fs::write(
+        root.join("codegraph.json"),
+        r#"{"extensions": {".json": "yaml"}}"#,
+    )
+    .unwrap();
+    let mapped =
+        ExtensionOverrides::load_from_file(&root.join("codegraph.json")).with_project_root(&root);
+    assert_eq!(
+        detect_language_with("templates/product.json", &mapped),
+        Language::Yaml
+    );
+    assert_eq!(
+        detect_language_with("shop/templates/product.json", &mapped),
+        Language::Liquid
+    );
+    std::fs::remove_dir_all(&root).unwrap();
 }
 
 // ---------------------------------------------------------------------------

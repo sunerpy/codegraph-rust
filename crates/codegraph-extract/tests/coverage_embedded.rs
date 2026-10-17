@@ -150,7 +150,8 @@ fn liquid_json_template_dedups_section_type_refs() {
 "#;
     let result = extract_source("templates/product.json", source, Some(Language::Liquid));
     assert!(result.errors.is_empty(), "{:?}", result.errors);
-    assert_eq!(detect_language("templates/product.json"), Language::Liquid);
+    // Without the project root no theme can hold it (upstream #2393).
+    assert_eq!(detect_language("templates/product.json"), Language::Unknown);
     // Duplicate section type is emitted only once (BTreeSet dedup).
     let main_refs = result
         .unresolved_references

@@ -308,6 +308,18 @@ under `solidity_heads_version` (1); a sync that finds it missing or at another
 version re-resolves every Solidity file and rebuilds the rows. Neither is a
 canonical surface.
 
+The Shopify theme row records which directories hold a Shopify theme whose
+files the index holds: `shopify_themes` holds the sorted JSON array of the theme
+roots the indexed Liquid files sit in (project-relative, `""` for the project
+root), read from the theme markers on disk. Every full index, migration and sync
+writes it, last, under the `shopify_themes_version` marker (1), withdrawn and
+restored like the head rows; a sync that finds the marker missing or at another
+version hands every indexed JSON template to its per-path pass, re-resolves
+every Liquid file and rebuilds the row. A sync records the roots it found moved
+under `shopify_themes_pending` before its per-path pass and deletes the key once
+it finishes; the next sync takes up any roots a stopped one left there. None of
+them is a canonical surface.
+
 Swift head rows record what Swift type resolution reads of a file's type
 declarations: `swift_heads:<path>` holds the JSON `{"entries":
 [{"qualified_name", "kind", "extension", "supertypes", "inherits", "written",

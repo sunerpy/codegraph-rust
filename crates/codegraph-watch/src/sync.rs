@@ -607,10 +607,33 @@ fn sync_paths_with_store(
         crate::dart_libraries::withdraw_marker(store)?;
     }
 
-    let paths = paths.into_iter().collect::<Vec<_>>();
+    // A Shopify theme whose marker came or went reclassifies its JSON
+    // templates and moves the references its Liquid files make (W4-LIQ-01):
+    // the templates join the paths, which the pass below keeps or drops as
+    // the scan would.
+    let shopify_bootstrap = crate::shopify_themes::needs_bootstrap(store)?;
+    let mut paths = paths
+        .into_iter()
+        .map(|path| path.as_ref().to_path_buf())
+        .collect::<Vec<_>>();
+    let requested = paths
+        .iter()
+        .filter_map(|path| policy.normalize_relative(path))
+        .collect::<Vec<_>>();
+    let shopify = crate::shopify_themes::theme_refresh(
+        store,
+        project_root,
+        requested.iter().map(String::as_str),
+        shopify_bootstrap,
+    )?;
+    paths.extend(shopify.json_paths.iter().map(std::path::PathBuf::from));
+    #[cfg(test)]
+    if tests::FAIL_AFTER_SHOPIFY_REFRESH.with(std::cell::Cell::get) {
+        bail!("injected sync failure after the theme lane's refresh");
+    }
     let total = paths.len();
     for (done, path) in paths.into_iter().enumerate() {
-        let Some(relative) = policy.normalize_relative(path.as_ref()) else {
+        let Some(relative) = policy.normalize_relative(path.as_path()) else {
             outcome.files_ignored += 1;
             on_progress(done + 1, total);
             continue;
@@ -673,6 +696,8 @@ fn sync_paths_with_store(
         || r_bootstrap
         || dart_bootstrap
         || dart_library_bootstrap
+        || shopify_bootstrap
+        || !shopify.moved.is_empty()
     {
         note_python_global_readers(
             project_root,
@@ -864,6 +889,14 @@ fn sync_paths_with_store(
                     &mut dependent_fallbacks,
                     affected.clone(),
                 );
+            }
+        }
+        // And what a section or snippet reference in a Shopify theme's file
+        // reads of the theme's markers (W4-LIQ-01).
+        for file in shopify.liquid_files(store)? {
+            if !reindexed.contains(&file) {
+                dependent_sites.remove(&file);
+                dependent_fallbacks.insert(file);
             }
         }
         // And what a Swift type reference reads of the type declarations'
@@ -1227,6 +1260,7 @@ fn sync_paths_with_store(
         ruby.write_rows(store)?;
         cfml.write_rows(store)?;
         solidity.write_rows(store)?;
+        shopify.write_row(store, project_root)?;
         swift.write_rows(store)?;
         objc.write_rows(store)?;
         go.write_rows(store)?;
@@ -1244,6 +1278,7 @@ fn sync_paths_with_store(
         crate::ruby_heads::write_marker(store)?;
         crate::cfml_heads::write_marker(store)?;
         crate::solidity_heads::write_marker(store)?;
+        crate::shopify_themes::write_marker(store)?;
         crate::swift_heads::write_marker(store)?;
         crate::objc_heads::write_marker(store)?;
         crate::go_heads::write_marker(store)?;
@@ -2367,6 +2402,7 @@ impl ChangedNames {
             crate::ruby_heads::withdraw_marker(store)?;
             crate::cfml_heads::withdraw_marker(store)?;
             crate::solidity_heads::withdraw_marker(store)?;
+            crate::shopify_themes::withdraw_marker(store)?;
             crate::swift_heads::withdraw_marker(store)?;
             crate::objc_heads::withdraw_marker(store)?;
             crate::go_heads::withdraw_marker(store)?;
@@ -2593,6 +2629,10 @@ pub(crate) mod tests {
         /// Fail the next Dart library row rebuild once the old rows are
         /// purged and one is written back.
         pub(crate) static FAIL_AFTER_DART_LIBRARY_ROW_PURGE: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
+        /// Fail the next sync once the theme lane recorded what it found
+        /// moved, before the per-path pass.
+        pub(crate) static FAIL_AFTER_SHOPIFY_REFRESH: std::cell::Cell<bool> =
             const { std::cell::Cell::new(false) };
     }
 
@@ -5833,6 +5873,164 @@ pub(crate) mod tests {
         wanted.retain(|(key, _)| key != "solidity_heads:contracts/Spare.sol");
         assert_eq!(rebuilt, wanted);
         assert_eq!(edge_projection(&db), expected);
+    }
+
+    const LIQ_LAYOUT: (&str, &str) = (
+        "layout/theme.liquid",
+        "{% section 'main-product' %}{{ content_for_layout }}\n",
+    );
+    const LIQ_SECTION: (&str, &str) = (
+        "sections/main-product.liquid",
+        "<div>{{ product.title }}</div>\n",
+    );
+    const LIQ_TEMPLATE: (&str, &str) = (
+        "templates/product.json",
+        "{\"sections\":{\"main\":{\"type\":\"main-product\"}},\"order\":[\"main\"]}",
+    );
+    const LIQ_SPARE: (&str, &str) = ("src/spare.ts", "export const spare = 1;\n");
+
+    fn stored_paths(db: &Path) -> Vec<String> {
+        Store::open(db)
+            .unwrap()
+            .all_files()
+            .unwrap()
+            .into_iter()
+            .map(|file| file.path)
+            .collect()
+    }
+
+    /// W4-LIQ-01: an index without the Shopify theme marker (left by a
+    /// failed sync, which withdraws it first) has its next sync hand every
+    /// indexed JSON template to the per-path pass: one that no theme holds
+    /// any more leaves though the row never recorded its theme, and the row
+    /// and the marker are written again.
+    #[test]
+    fn an_index_without_the_shopify_marker_rechecks_every_json_template() {
+        let version = Some(crate::shopify_themes::VERSION.to_string());
+        let dir = TestDir::new("shopify-themes-bootstrap");
+        let db = default_db_path(dir.path()).unwrap();
+        let initial = [LIQ_LAYOUT, LIQ_SECTION, LIQ_TEMPLATE, LIQ_SPARE];
+        write_files(dir.path(), &initial);
+        sync_changed_paths(dir.path(), &db, initial.iter().map(|(path, _)| *path)).unwrap();
+        let metadata = |key: &str| Store::open(&db).unwrap().get_project_metadata(key).unwrap();
+        assert_eq!(metadata(crate::shopify_themes::VERSION_KEY), version);
+        assert_eq!(
+            metadata(crate::shopify_themes::ROW_KEY).as_deref(),
+            Some("[\"\"]")
+        );
+        assert!(
+            stored_paths(&db).contains(&LIQ_TEMPLATE.0.to_string()),
+            "{:?}",
+            stored_paths(&db)
+        );
+        {
+            let store = Store::open(&db).unwrap();
+            store
+                .delete_project_metadata(crate::shopify_themes::ROW_KEY)
+                .unwrap();
+            store
+                .delete_project_metadata(crate::shopify_themes::VERSION_KEY)
+                .unwrap();
+        }
+        fs::remove_file(dir.path().join(LIQ_LAYOUT.0)).unwrap();
+        sync_changed_paths(dir.path(), &db, [LIQ_LAYOUT.0]).unwrap();
+        assert_eq!(metadata(crate::shopify_themes::VERSION_KEY), version);
+        assert_eq!(
+            metadata(crate::shopify_themes::ROW_KEY).as_deref(),
+            Some("[]")
+        );
+        assert_eq!(
+            stored_paths(&db),
+            [LIQ_SECTION.0, LIQ_SPARE.0],
+            "a JSON template no theme holds leaves"
+        );
+        assert_eq!(
+            edge_projection(&db),
+            fresh_edges(
+                "shopify-themes-bootstrap-fresh",
+                &[LIQ_SECTION, LIQ_TEMPLATE, LIQ_SPARE]
+            )
+        );
+    }
+
+    /// W4-LIQ-01: a sync that stops after the theme lane found a theme come
+    /// or go, before the per-path pass stored or dropped any of its JSON,
+    /// leaves the moved roots recorded: the next sync with nothing changed,
+    /// or with an unrelated change, takes them up, though no indexed file
+    /// points at the theme (one of JSON templates only), with the marker in
+    /// place or withdrawn by the stopped sync's first change.
+    #[test]
+    fn a_sync_stopped_before_a_shopify_themes_json_moved_leaves_it_to_the_next() {
+        const TEMPLATE: (&str, &str) = (
+            "shop/templates/index.json",
+            "{\"sections\":{\"main\":{\"type\":\"main\"}},\"order\":[\"main\"]}",
+        );
+        const SCHEMA: (&str, &str) = ("shop/config/settings_schema.json", "[]");
+        const SPARE_EDITED: (&str, &str) = ("src/spare.ts", "export const spare = 2;\n");
+        let version = Some(crate::shopify_themes::VERSION.to_string());
+        let dir = TestDir::new("shopify-themes-pending");
+        let db = default_db_path(dir.path()).unwrap();
+        let initial = [TEMPLATE, LIQ_SPARE];
+        write_files(dir.path(), &initial);
+        sync_changed_paths(dir.path(), &db, initial.iter().map(|(path, _)| *path)).unwrap();
+        assert_eq!(
+            stored_paths(&db),
+            [LIQ_SPARE.0],
+            "no theme holds the JSON yet"
+        );
+        let metadata = |key: &str| Store::open(&db).unwrap().get_project_metadata(key).unwrap();
+        let fail_once = |paths: &[&str]| {
+            FAIL_AFTER_SHOPIFY_REFRESH.with(|fail| fail.set(true));
+            let failed = sync_changed_paths(dir.path(), &db, paths.iter().copied());
+            FAIL_AFTER_SHOPIFY_REFRESH.with(|fail| fail.set(false));
+            assert!(failed.is_err(), "the injected failure must stop the sync");
+            assert_eq!(
+                metadata(crate::shopify_themes::PENDING_KEY).as_deref(),
+                Some("[\"shop\"]")
+            );
+        };
+
+        // The schema comes and the sync stops; one with nothing changed
+        // takes the theme's JSON in.
+        write_files(dir.path(), &[SCHEMA]);
+        fail_once(&[SCHEMA.0]);
+        assert_eq!(stored_paths(&db), [LIQ_SPARE.0]);
+        sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
+        assert_eq!(stored_paths(&db), [TEMPLATE.0, LIQ_SPARE.0]);
+        assert_eq!(metadata(crate::shopify_themes::PENDING_KEY), None);
+        assert_eq!(
+            metadata(crate::shopify_themes::ROW_KEY).as_deref(),
+            Some("[\"shop\"]")
+        );
+
+        // The schema goes and the sync stops; an unrelated change takes the
+        // JSON out.
+        fs::remove_file(dir.path().join(SCHEMA.0)).unwrap();
+        fail_once(&[SCHEMA.0]);
+        write_files(dir.path(), &[SPARE_EDITED]);
+        sync_changed_paths(dir.path(), &db, [LIQ_SPARE.0]).unwrap();
+        assert_eq!(stored_paths(&db), [LIQ_SPARE.0]);
+        assert_eq!(metadata(crate::shopify_themes::PENDING_KEY), None);
+
+        // It comes again and the sync stops with the marker withdrawn, as its
+        // first change would; one with nothing changed takes the JSON in.
+        write_files(dir.path(), &[SCHEMA]);
+        fail_once(&[SCHEMA.0]);
+        Store::open(&db)
+            .unwrap()
+            .delete_project_metadata(crate::shopify_themes::VERSION_KEY)
+            .unwrap();
+        sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
+        assert_eq!(stored_paths(&db), [TEMPLATE.0, LIQ_SPARE.0]);
+        assert_eq!(metadata(crate::shopify_themes::VERSION_KEY), version);
+        assert_eq!(metadata(crate::shopify_themes::PENDING_KEY), None);
+        assert_eq!(
+            edge_projection(&db),
+            fresh_edges(
+                "shopify-themes-pending-fresh",
+                &[TEMPLATE, SCHEMA, SPARE_EDITED]
+            )
+        );
     }
 
     /// W4-CPP-04: an index without the C/C++ marker (built before it, or

@@ -427,7 +427,20 @@ method of a type which entered or left the chain of a type the file declares,
 resolved or parked, since a bare call reads its contract's `is` chain from the
 declarations' heads (a file with a chain at the resolver's limit of 60 names
 re-resolves whole); the `solidity_heads_version` marker is withdrawn and
-restored with the others; a Swift file whose head row moved (a type
+restored with the others; a Shopify theme root that came or went (a
+`layout/theme.liquid` or `config/settings_schema.json` appeared in or left the
+directory holding a theme's folders, read against the `shopify_themes` row)
+hands the theme's JSON templates, on disk and indexed, in its `templates/` and
+`sections/` folders of any case, to the per-path pass, which keeps or drops
+each as a scan would, and re-resolves the theme's unchanged Liquid files whole,
+since a JSON template is Liquid, and a section or snippet reference links its
+file, only inside a theme; the moved roots are recorded before the pass, so a
+sync that stops partway leaves them to the next; a marker counts though
+ignored, so the watcher hands its events to the sync whether or not it is
+source or in scope, watches an ignored `config/` or `layout/` itself for one,
+and counts a marker folder removed or moved away as its marker gone; the
+`shopify_themes_version` marker is withdrawn and restored with the others; a
+Swift file whose head row moved (a type
 declaration came or went, became or stopped being an extension, moved to
 another qualified name, names other supertypes, writes another nested path, or
 became or stopped being a `@Reducer` enum) re-resolves, whole, the unchanged

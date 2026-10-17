@@ -181,6 +181,11 @@ pub fn detect_language_with(
 ) -> Language {
     let path = file_path.as_ref();
     let normalized = normalize_path(path);
+    // A Shopify theme's JSON template or section group is Liquid, and only
+    // inside a theme under the project root (upstream #2393).
+    if crate::embedded::shopify::is_shopify_liquid_json(&normalized, overrides.project_root()) {
+        return Language::Liquid;
+    }
     if let Some(language) = crate::embedded::detect_embedded_language(&normalized) {
         return language;
     }
@@ -1296,7 +1301,7 @@ fn is_extractable_source_path(relative: &str, overrides: &ExtensionOverrides) ->
     let language = detect_language_with(relative, overrides);
     language != Language::Unknown
         && (crate::lang::spec_for_language(language).is_some()
-            || crate::embedded::is_embedded_source_path(relative)
+            || crate::embedded::is_embedded_source_path(relative, overrides.project_root())
             || is_file_level_only_language(language))
 }
 
