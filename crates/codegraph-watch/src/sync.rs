@@ -1247,11 +1247,15 @@ fn sync_paths_with_store(
         if tests::FAIL_BEFORE_RESOLUTION.with(std::cell::Cell::get) {
             bail!("injected sync failure before resolution");
         }
+        // A qualified reference (`util::double/1`) is retried by its whole
+        // name too, however many share its tail (W5-05).
+        let mut retry_names = changed_names.any.clone();
+        retry_names.extend(changed_names.qualified.iter().cloned());
         resolver.resolve_incremental_and_persist(
             store,
             &scope_files,
             &scope_sites,
-            &changed_names.any,
+            &retry_names,
         )?;
         // Cross-file framework finalization on every sync (upstream index.ts:464).
         resolver.run_post_extract(store)?;
@@ -1673,6 +1677,7 @@ fn remove_tracked_file(
     }
     changed_names.note_removed(node_names_in_file(store, relative)?);
     let old_nodes = store.nodes_by_file_path(relative)?;
+    changed_names.note_qualified(&old_nodes);
     changed_names.rust_receiver_types.extend(
         old_nodes
             .iter()
@@ -2309,6 +2314,12 @@ struct ChangedNames {
     candidates: HashSet<String>,
     /// The files this sync added: a parked import may name one (#2392).
     added_files: BTreeSet<String>,
+    /// The qualified names (`util::double/1`, `app.CommonMapper::userColumns`)
+    /// of every node whose name a changed candidate touched, on both sides of
+    /// the change, and of a removed file's nodes. A reference written
+    /// qualified waits under that whole name; its tail retry skips a tail
+    /// more than the ceiling share, the whole-name lookup does not (W5-05).
+    qualified: BTreeSet<String>,
     /// The files whose import of an edited module holds a binding the import
     /// did not resolve, read before the module's old nodes went (#2450):
     /// the edit may give the module what the binding imports under another
@@ -2452,6 +2463,17 @@ impl ChangedNames {
         (path_keys.into_iter().collect(), names)
     }
 
+    /// The qualified names of `nodes` a qualified reference can be written
+    /// as: those with a `::`.
+    fn note_qualified<'a>(&mut self, nodes: impl IntoIterator<Item = &'a Node>) {
+        self.qualified.extend(
+            nodes
+                .into_iter()
+                .filter(|node| node.qualified_name.contains("::"))
+                .map(|node| node.qualified_name.clone()),
+        );
+    }
+
     /// Every node of a file left the index: all its names are touched.
     fn note_removed(&mut self, names: HashSet<String>) {
         self.note_all(names);
@@ -2498,6 +2520,15 @@ impl ChangedNames {
                 self.candidates.insert(name.to_string());
             }
         }
+        // A candidate's key holds its qualified name, which its id does not:
+        // a mapper namespace or an Erlang `-module` renamed in place moves
+        // the name a qualified reference waits under, though no id changes.
+        let moved: Vec<&Node> = before
+            .iter()
+            .chain(after)
+            .filter(|node| candidate(node) && touched.contains(node.name.as_str()))
+            .collect();
+        self.note_qualified(moved);
         for node in before.iter().chain(after) {
             if crate::rust_receivers::is_receiver_type(node) && touched.contains(node.name.as_str())
             {

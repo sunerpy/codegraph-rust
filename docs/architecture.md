@@ -297,7 +297,11 @@ a backend's sign of dropped events, or (on Windows) drift found by an idle
 sentinel escalates to one full reconcile, reported as RECOVERING until it
 commits. A sync re-resolves the references that name what it changed, a
 qualified one (`User.create`) by its last segment as well (at most 500 per
-segment); a PHP node that only moved (its id changed with its line, nothing a
+segment), and one written with `::` (an Erlang `util::double/1`, a MyBatis
+include's `app.CommonMapper::userColumns`) by the whole qualified name of a node
+that came, went or changed, however many share its segment, since a node's id
+holds no qualified name (a mapper namespace renamed in place keeps every id);
+a PHP node that only moved (its id changed with its line, nothing a
 reference reads did) changes no name: the edges into its file re-resolve at
 their sites, and the references elsewhere to a node of its name keep their
 targets unless the order of that name's nodes in its file changed (as upstream

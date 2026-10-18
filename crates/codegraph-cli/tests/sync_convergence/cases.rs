@@ -3728,38 +3728,113 @@ pub fn r_source_of_an_added_file() -> Case {
         .edge_after("function summarise", "calls", "function scale_values")
 }
 
-/// Found by this matrix: the remote call is parked as `util::double/1`, a name
-/// no added node carries, so the sync never retries it.
+const ERLANG_MAIN: &str = "-module(main).\n-export([run/1]).\n\nrun(X) -> util:double(X).\n";
+const ERLANG_UTIL: &str = "-module(util).\n-export([double/1]).\n\ndouble(X) -> X * 2.\n";
+const USER_MAPPER: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<mapper namespace=\"app.UserMapper\">\n  <select id=\"findAll\" resultType=\"app.User\">\n    SELECT <include refid=\"app.CommonMapper.userColumns\"/> FROM users\n  </select>\n</mapper>\n";
+const COMMON_MAPPER: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<mapper namespace=\"app.CommonMapper\">\n  <sql id=\"userColumns\">id, name, email</sql>\n</mapper>\n";
+
+/// Found by W0-04: the call is parked as `util::double/1`, which no added
+/// node is named; it is retried by its tail (W5-05a) and by its whole
+/// qualified name (W5-05).
 pub fn erlang_remote_call_into_an_added_module() -> Case {
     Case::new(Change::AddImportTarget, &[Language::Erlang])
-        .file(
-            "src/main.erl",
-            "-module(main).\n-export([run/1]).\n\nrun(X) -> util:double(X).\n",
-        )
-        .write(
-            "src/util.erl",
-            "-module(util).\n-export([double/1]).\n\ndouble(X) -> X * 2.\n",
-        )
+        .file("src/main.erl", ERLANG_MAIN)
+        .write("src/util.erl", ERLANG_UTIL)
         .edge_after("function main::run/1", "calls", "function util::double/1")
 }
 
-/// Found by this matrix: the include is parked as
-/// `app.CommonMapper::userColumns`, which no added node is named.
+/// Found by W0-04: the include is parked as `app.CommonMapper::userColumns`,
+/// which no added node is named; it is retried by its tail (W5-05a) and by
+/// its whole qualified name (W5-05).
 pub fn mybatis_include_of_an_added_fragment() -> Case {
     Case::new(Change::AddImportTarget, &[Language::Xml])
-        .file(
-            "mapper/UserMapper.xml",
-            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<mapper namespace=\"app.UserMapper\">\n  <select id=\"findAll\" resultType=\"app.User\">\n    SELECT <include refid=\"app.CommonMapper.userColumns\"/> FROM users\n  </select>\n</mapper>\n",
-        )
-        .write(
-            "mapper/CommonMapper.xml",
-            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<mapper namespace=\"app.CommonMapper\">\n  <sql id=\"userColumns\">id, name, email</sql>\n</mapper>\n",
-        )
+        .file("mapper/UserMapper.xml", USER_MAPPER)
+        .write("mapper/CommonMapper.xml", COMMON_MAPPER)
         .edge_after(
             "method app.UserMapper::findAll",
             "references",
             "method app.CommonMapper::userColumns",
         )
+}
+
+/// More unresolved `….double` and `….userColumns` calls than one tail
+/// retries in a sync: CFML calls on receivers nothing is named after.
+static UNTYPED_DOUBLE_CALLS: LazyLock<String> = LazyLock::new(|| untyped_calls("double"));
+static UNTYPED_USER_COLUMNS_CALLS: LazyLock<String> =
+    LazyLock::new(|| untyped_calls("userColumns"));
+
+fn untyped_calls(method: &str) -> String {
+    let mut text = String::from("component {\n  function noise() {\n");
+    for index in 0..501 {
+        text.push_str(&format!("    n{index}.{method}({index});\n"));
+    }
+    text.push_str("    return 0;\n  }\n}\n");
+    text
+}
+
+/// W5-05: the parked remote call is found by its whole qualified name when
+/// more parked calls share its tail than one tail retries.
+pub fn erlang_remote_call_into_an_added_module_past_the_tail_ceiling() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Erlang, Language::Cfml])
+        .file("src/main.erl", ERLANG_MAIN)
+        .file("noise/Noise.cfc", UNTYPED_DOUBLE_CALLS.as_str())
+        .write("src/util.erl", ERLANG_UTIL)
+        .edge_after("function main::run/1", "calls", "function util::double/1")
+}
+
+/// W5-05, found by its plan gate: the module renamed in place keeps every
+/// node id (an id holds no qualified name), and the parked call is found by
+/// the qualified name the rename gave the function, past the tail ceiling.
+pub fn erlang_remote_call_follows_a_module_renamed_in_place_past_the_tail_ceiling() -> Case {
+    Case::new(Change::RenameSymbol, &[Language::Erlang, Language::Cfml])
+        .file("src/main.erl", ERLANG_MAIN)
+        .file(
+            "src/util.erl",
+            "-module(utils).\n-export([double/1]).\n\ndouble(X) -> X * 2.\n",
+        )
+        .file("noise/Noise.cfc", UNTYPED_DOUBLE_CALLS.as_str())
+        .write("src/util.erl", ERLANG_UTIL)
+        .edge_after("function main::run/1", "calls", "function util::double/1")
+}
+
+/// W5-05, found by its plan gate: a mapper namespace renamed in place, past
+/// the tail ceiling.
+pub fn mybatis_include_follows_a_namespace_renamed_in_place_past_the_tail_ceiling() -> Case {
+    Case::new(Change::RenameSymbol, &[Language::Xml, Language::Cfml])
+        .file("mapper/UserMapper.xml", USER_MAPPER)
+        .file(
+            "mapper/CommonMapper.xml",
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<mapper namespace=\"app.Other\">\n  <sql id=\"userColumns\">id, name, email</sql>\n</mapper>\n",
+        )
+        .file("noise/Noise.cfc", UNTYPED_USER_COLUMNS_CALLS.as_str())
+        .write("mapper/CommonMapper.xml", COMMON_MAPPER)
+        .edge_after(
+            "method app.UserMapper::findAll",
+            "references",
+            "method app.CommonMapper::userColumns",
+        )
+}
+
+/// W5-05: the module the remote call reaches is deleted.
+pub fn erlang_remote_call_into_a_deleted_module() -> Case {
+    Case::new(Change::DeleteImportedModule, &[Language::Erlang])
+        .file("src/main.erl", ERLANG_MAIN)
+        .file("src/util.erl", ERLANG_UTIL)
+        .edge_before("function main::run/1", "calls", "function util::double/1")
+        .remove("src/util.erl")
+}
+
+/// W5-05: the mapper the include reaches is deleted.
+pub fn mybatis_include_of_a_deleted_fragment() -> Case {
+    Case::new(Change::DeleteImportedModule, &[Language::Xml])
+        .file("mapper/UserMapper.xml", USER_MAPPER)
+        .file("mapper/CommonMapper.xml", COMMON_MAPPER)
+        .edge_before(
+            "method app.UserMapper::findAll",
+            "references",
+            "method app.CommonMapper::userColumns",
+        )
+        .remove("mapper/CommonMapper.xml")
 }
 
 // ----- a body changes, every declaration keeps its identity ----------------

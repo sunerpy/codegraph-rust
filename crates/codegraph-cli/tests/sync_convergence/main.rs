@@ -900,10 +900,13 @@ matrix! {
     liquid_json_template_section_of_an_added_section,
     razor_reference_to_an_added_class,
     r_source_of_an_added_file,
-    #[ignore = "unscheduled, found by W0-04: an Erlang remote call `util:double/1` is not retried when module util appears"]
     erlang_remote_call_into_an_added_module,
-    #[ignore = "unscheduled, found by W0-04: a MyBatis include of another mapper's fragment is not retried when that mapper appears"]
     mybatis_include_of_an_added_fragment,
+    erlang_remote_call_into_an_added_module_past_the_tail_ceiling,
+    erlang_remote_call_follows_a_module_renamed_in_place_past_the_tail_ceiling,
+    mybatis_include_follows_a_namespace_renamed_in_place_past_the_tail_ceiling,
+    erlang_remote_call_into_a_deleted_module,
+    mybatis_include_of_a_deleted_fragment,
     typescript_pr2288_same_named_methods_keep_typed_callers,
     java_overloads_keep_their_callers,
     jsx_component_body_edit,
