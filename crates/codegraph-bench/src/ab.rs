@@ -44,7 +44,9 @@ use crate::graph_diff::{
     GraphFingerprint, ScratchDir, canonicalize_checked, differing_surfaces, fingerprint,
     sha256_file,
 };
-use crate::metrics::{mad, median, read_proc_status_kb};
+#[cfg(unix)]
+use crate::metrics::read_proc_status_kb;
+use crate::metrics::{mad, median};
 use crate::report::{command_stdout, read_cpu_model, read_mem_total_kb, read_os_pretty_name};
 
 /// Environment variable that sets the thread count of each timed run.
