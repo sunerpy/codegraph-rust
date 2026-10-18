@@ -17204,6 +17204,64 @@ mod dart_constructors {
             "{report}"
         );
     }
+
+    /// KEEP-RUST (W4d end review): a named constructor is reached through
+    /// its class, never through a value of it. Upstream's member lookup reads
+    /// one as an instance member, so `x.value()` on a parameter typed `Foo`,
+    /// a local initialized from a call, or the last link of a chain typed
+    /// `Foo` called `Foo.value`'s constructor over the `value()` an extension
+    /// on `Foo` brings; with no such member it links nothing, also through the
+    /// matcher's fallbacks that read a receiver `bar` as the class `Bar` or
+    /// score a receiver's words (`barValue`).
+    #[test]
+    fn keep_rust_a_dart_value_never_calls_a_named_constructor_of_its_type() {
+        let project = Project::new()
+            .file("pubspec.yaml", "name: app\nenvironment:\n  sdk: \">=3.0.0 <4.0.0\"\n")
+            .file("lib/foo.dart", "class Foo {\n  const Foo.value(this.v);\n\n  final int v;\n}\n\nFoo build() => const Foo.value(1);\n\nextension FooX on Foo {\n  int value() => v;\n}\n")
+            .file("lib/bar.dart", "class Bar {\n  const Bar.empty();\n}\n\nBar make() => const Bar.empty();\n")
+            .file("lib/use.dart", "import 'foo.dart';\nimport 'bar.dart';\n\nint viaParameter(Foo x) => x.value();\n\nint viaLocal() {\n  final Foo y = build();\n  return y.value();\n}\n\nint viaChain() => build().value();\n\nFoo viaType() => Foo.value(2);\n\nvoid emptyParameter(Bar b) => b.empty();\n\nvoid emptyChain() => make().empty();\n\nvoid emptyNamed(Bar bar) => bar.empty();\n\nvoid emptyWord(Bar barValue) => barValue.empty();\n\nvoid emptyUntyped(dynamic bar) => bar.empty();\n")
+            .index();
+        let graph = project.graph();
+        let report = graph.report();
+        let none = Vec::<String>::new();
+        let usage = |name: &str| node(graph, "lib/use.dart", name);
+        for caller in ["viaParameter", "viaLocal", "viaChain"] {
+            assert!(
+                targets(graph, usage(caller), "calls").contains(&"FooX::value".to_string()),
+                "{caller}\n{report}"
+            );
+        }
+        // Through its class, the constructor is still what the call means.
+        assert_eq!(
+            targets(graph, usage("viaType"), "calls"),
+            ["Foo::value"],
+            "{report}"
+        );
+        assert_eq!(
+            sources(graph, node(graph, "lib/foo.dart", "Foo::value")),
+            ["calls build", "calls viaType"],
+            "{report}"
+        );
+        // No member of that name: nothing to call, whatever the receiver is
+        // named (`bar` reads as the class `Bar`, `barValue` shares its word)
+        // or however little is known of it.
+        for caller in ["emptyParameter", "emptyNamed", "emptyWord", "emptyUntyped"] {
+            assert_eq!(
+                targets(graph, usage(caller), "calls"),
+                none,
+                "{caller}\n{report}"
+            );
+        }
+        assert_eq!(
+            sources(graph, node(graph, "lib/bar.dart", "Bar::empty")),
+            ["calls make"],
+            "{report}"
+        );
+        assert!(
+            !targets(graph, usage("emptyChain"), "calls").contains(&"Bar::empty".to_string()),
+            "{report}"
+        );
+    }
 }
 
 mod dart_prefixes {

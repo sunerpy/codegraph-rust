@@ -3168,10 +3168,13 @@ pub(crate) fn resolve_method_on_type(
         .into_iter()
         .filter(|m| {
             // One language family shares one type system: a `.tsx` caller
-            // reaches a `.ts` class's method (upstream #1862).
+            // reaches a `.ts` class's method (upstream #1862). A Dart named
+            // constructor is reached through its class, never a value of it
+            // ([`callable_on_a_value`]).
             m.kind == NodeKind::Method
                 && same_language_family(m.language, reference.language)
                 && (m.qualified_name == want || m.qualified_name.ends_with(&format!("::{want}")))
+                && callable_on_a_value(m, reference, context)
         })
         .collect();
 
@@ -5838,7 +5841,9 @@ pub fn match_method_call(
             if class_node.language != reference.language {
                 continue;
             }
-            if let Some(method_node) = find_method_in_class(&class_node, &method_name, context) {
+            if let Some(method_node) =
+                find_method_in_class(&class_node, &method_name, context, &|_| true)
+            {
                 return Some(ResolvedRef {
                     original: reference.clone(),
                     target_node_id: method_node.id,
@@ -5993,7 +5998,10 @@ pub fn match_method_call(
                 if class_node.language != reference.language {
                     continue;
                 }
-                if let Some(method_node) = find_method_in_class(&class_node, &method_name, context)
+                if let Some(method_node) =
+                    find_method_in_class(&class_node, &method_name, context, &|method| {
+                        callable_on_a_value(method, reference, context)
+                    })
                 {
                     return Some(ResolvedRef {
                         original: reference.clone(),
@@ -6016,7 +6024,11 @@ pub fn match_method_call(
     }
     let methods: Vec<Arc<Node>> = method_candidates
         .into_iter()
-        .filter(|n| n.kind == NodeKind::Method && n.name == method_name)
+        .filter(|n| {
+            n.kind == NodeKind::Method
+                && n.name == method_name
+                && callable_on_a_value(n, reference, context)
+        })
         .collect();
     let same_language: Vec<Arc<Node>> = methods
         .iter()
@@ -6671,6 +6683,7 @@ fn find_method_in_class(
     class_node: &Node,
     method_name: &str,
     context: &dyn ResolutionContext,
+    accept: &dyn Fn(&Node) -> bool,
 ) -> Option<Node> {
     context
         .get_nodes_in_file_shared(&class_node.file_path)
@@ -6679,8 +6692,23 @@ fn find_method_in_class(
             n.kind == NodeKind::Method
                 && n.name == method_name
                 && n.qualified_name.contains(&class_node.name)
+                && accept(n)
         })
         .map(|node| node.as_ref().clone())
+}
+
+/// Whether `method` can be what a call through a value means: a Dart named
+/// constructor is reached through its class only (KEEP-RUST, W4d end; the
+/// type path is [`crate::dart_members::match_dart_type_member_call`]), so the
+/// value strategies never offer one.
+fn callable_on_a_value(
+    method: &Node,
+    reference: &RefView,
+    context: &dyn ResolutionContext,
+) -> bool {
+    !(reference.language == Language::Dart
+        && method.language == Language::Dart
+        && crate::dart_members::is_dart_constructor(method, context))
 }
 
 fn capitalize(s: &str) -> String {

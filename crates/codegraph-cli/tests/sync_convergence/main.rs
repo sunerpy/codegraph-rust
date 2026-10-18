@@ -986,6 +986,8 @@ matrix! {
     dart_bare_call_reaches_a_method_of_a_base_its_superclass_starts_to_extend,
     dart_bare_call_leaves_a_method_of_a_base_its_superclass_stops_extending,
     dart_bare_call_reaches_an_extension_member_once_it_is_on_the_callers_base,
+    dart_value_call_named_like_a_constructor_reaches_an_added_extension_member,
+    dart_value_call_named_like_a_constructor_leaves_a_removed_extension_member,
     dart_bare_call_reaches_an_extension_member_once_its_superclass_extends_the_on_type,
     dart_bare_call_reaches_a_member_whose_base_its_superclass_brings_nearer,
     dart_bare_call_leaves_a_member_pushed_past_the_walk_limit,

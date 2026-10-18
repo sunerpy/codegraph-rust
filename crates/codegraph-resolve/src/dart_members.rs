@@ -190,7 +190,10 @@ pub fn declares_getter(head: &str, name: &str) -> bool {
 /// in the reference's library. `accept` narrows the candidates (a read wants a
 /// getter). Ties go to the reference's own file, then the nearest directory.
 /// `min_depth` 1 skips the type's own members, as `super.` does (#2376). The
-/// flag says whether the member is an extension's.
+/// flag says whether the member is an extension's. A named constructor is
+/// the type's, never a value's (KEEP-RUST: upstream's `dartMemberOf` reads
+/// one as an instance member, so `x.value()` on a `Foo` reached `Foo.value`'s
+/// constructor over an extension's `value()`).
 pub(crate) fn dart_member_of(
     type_name: &str,
     name: &str,
@@ -205,7 +208,11 @@ pub(crate) fn dart_member_of(
     let mut best: Vec<Arc<Node>> = Vec::new();
     let mut best_rank = u64::MAX;
     for member in context.get_nodes_by_name_shared(name) {
-        if member.language != Language::Dart || !is_dart_member(&member) || !accept(&member) {
+        if member.language != Language::Dart
+            || !is_dart_member(&member)
+            || !accept(&member)
+            || is_dart_constructor(&member, context)
+        {
             continue;
         }
         let rank = if let Some(extension) = dart_extension_owner(&member, context) {

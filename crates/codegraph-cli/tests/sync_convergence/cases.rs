@@ -10178,6 +10178,55 @@ pub fn dart_call_on_an_enum_reaches_a_member_an_added_extension_brings() -> Case
         .edge_after("function loud", "calls", "method ShapeInfo::shout")
 }
 
+/// A class declares a named constructor `Foo.value`; an extension in a file
+/// added later brings an instance `value()`. A call on a parameter of the
+/// type and the last link of a chain typed to it reach the extension's member,
+/// never the constructor (KEEP-RUST, W4d end).
+pub fn dart_value_call_named_like_a_constructor_reaches_an_added_extension_member() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Dart])
+        .file("pubspec.yaml", "name: app\n")
+        .file(
+            "lib/foo.dart",
+            "class Foo {\n  const Foo.value(this.v);\n\n  final int v;\n}\n\nFoo build() => const Foo.value(1);\n",
+        )
+        .file(
+            "lib/use.dart",
+            "import 'foo.dart';\n\nint viaParameter(Foo x) => x.value();\n\nint viaChain() => build().value();\n",
+        )
+        .write(
+            "lib/ext.dart",
+            "import 'foo.dart';\n\nextension FooX on Foo {\n  int value() => v;\n}\n",
+        )
+        .edge_after("function viaParameter", "calls", "method FooX::value")
+        .edge_after("function viaChain", "calls", "method FooX::value")
+}
+
+/// The extension that brought `value()` to a class with a named constructor
+/// `Foo.value` goes away: calls through values of the type, receivers named
+/// `foo` and `fooValue` included, link nothing rather than fall back to the
+/// constructor (KEEP-RUST, W4d end).
+pub fn dart_value_call_named_like_a_constructor_leaves_a_removed_extension_member() -> Case {
+    Case::new(Change::DeleteImportedModule, &[Language::Dart])
+        .file("pubspec.yaml", "name: app\n")
+        .file(
+            "lib/foo.dart",
+            "class Foo {\n  const Foo.value(this.v);\n\n  final int v;\n}\n",
+        )
+        .file(
+            "lib/ext.dart",
+            "import 'foo.dart';\n\nextension FooX on Foo {\n  int value() => v;\n}\n",
+        )
+        .file(
+            "lib/use.dart",
+            "import 'foo.dart';\nimport 'ext.dart';\n\nint viaNamed(Foo foo) => foo.value();\n\nint viaWord(Foo fooValue) => fooValue.value();\n",
+        )
+        .remove("lib/ext.dart")
+        .edge_before("function viaNamed", "calls", "method FooX::value")
+        .edge_before("function viaWord", "calls", "method FooX::value")
+        .no_edge_after("function viaNamed", "calls", "method Foo::value")
+        .no_edge_after("function viaWord", "calls", "method Foo::value")
+}
+
 /// The same past the tail ceiling: 501 parked calls share the tail `shout`.
 pub fn dart_call_on_an_enum_reaches_a_member_an_added_extension_brings_past_the_tail_ceiling()
 -> Case {
