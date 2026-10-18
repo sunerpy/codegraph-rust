@@ -711,8 +711,9 @@ pub(crate) fn is_sealed_by_text(facts: &crate::source_facts::SourceFacts) -> boo
     if cjs_export_marker().is_match(source) {
         return false;
     }
-    let code = facts.ts_blanked();
-    js_import_marker().is_match(code) && !js_export_marker().is_match(code)
+    facts.with_ts_blanked(|code| {
+        js_import_marker().is_match(code) && !js_export_marker().is_match(code)
+    })
 }
 
 /// A line-initial `import` statement (`HAS_IMPORT_STATEMENT`).
@@ -811,14 +812,17 @@ fn is_unexported_module_binding(candidate: &Node, context: &dyn ResolutionContex
 pub(crate) fn read_module_exports(
     facts: &crate::source_facts::SourceFacts,
 ) -> Option<HashSet<String>> {
+    facts.with_ts_blanked(|code| module_exports_in(facts.source(), code))
+}
+
+/// [`read_module_exports`] over the file's `source` and its blanked `code`.
+fn module_exports_in(source: &str, code: &str) -> Option<HashSet<String>> {
     static EXPORT_LIST: OnceLock<Regex> = OnceLock::new();
     static EXPORT_DEFAULT_NAME: OnceLock<Regex> = OnceLock::new();
     static EXPORT_DEFAULT_OBJECT: OnceLock<Regex> = OnceLock::new();
     static DECLARE_GLOBAL: OnceLock<Regex> = OnceLock::new();
     static AS: OnceLock<Regex> = OnceLock::new();
     static IDENTIFIER: OnceLock<Regex> = OnceLock::new();
-    let source = facts.source();
-    let code = facts.ts_blanked();
     let module = (js_import_marker().is_match(code) || js_export_marker().is_match(code))
         && !cjs_export_marker().is_match(source)
         && !DECLARE_GLOBAL
@@ -3312,6 +3316,47 @@ fn build_declarator_regex(escaped_receiver: &str) -> Regex {
     .expect("declarator regex")
 }
 
+/// [`build_declarator_regex`]'s pattern spelled over ASCII, for a line of
+/// ASCII text: there each class and word boundary matches exactly what the
+/// Unicode one does, and none builds the UTF-8 automata a Unicode class
+/// compiles to (`\w`, `\s`, a negated class), which made the pattern a
+/// leveldb index compiled for most member calls cost most of its memory
+/// over v0.54.0 at 32 threads (W4d end).
+fn build_ascii_declarator_regex(escaped_receiver: &str) -> Regex {
+    // `\s` is `[\x09-\x0D\x20]` on ASCII, `\w` `[0-9A-Za-z_]`, and
+    // `[^;=(){}]` every other ASCII character.
+    Regex::new(&format!(
+        r"([A-Za-z_][0-9A-Za-z_:]*(?:[\x09-\x0D\x20]*<[\x00-\x27\x2A-\x3A\x3C\x3E-\x7A\x7C\x7E\x7F]+>)?(?:[\x09-\x0D\x20]*[*&]+)?)[\x09-\x0D\x20]*(?-u:\b){escaped_receiver}(?-u:\b)"
+    ))
+    .expect("ASCII declarator regex")
+}
+
+/// Whether `line` could match [`build_declarator_regex`]'s pattern for
+/// `receiver`; never false where it does. The pattern writes the receiver as
+/// a word right after a type, past whitespace, and a type ends in a word
+/// character, `:`, `>`, `*` or `&`.
+fn may_declare_cpp_receiver(line: &str, receiver: &str) -> bool {
+    receiver.is_empty()
+        || word_occurrences(line, receiver).any(|at| {
+            line[..at]
+                .trim_end()
+                .chars()
+                .next_back()
+                .is_some_and(|c| is_regex_word_char(c) || matches!(c, ':' | '>' | '*' | '&'))
+        })
+}
+
+/// Whether `line` could be one [`CppRebinding::rebinds`] reads for
+/// `receiver`; never false where it is. A range-`for` writes `for` and the
+/// receiver before a `:`, a structured binding `auto` and a `[`.
+fn may_rebind_cpp_receiver(line: &str, receiver: &str) -> bool {
+    receiver.is_empty()
+        || (line.contains("for")
+            && occurrences(line, receiver)
+                .any(|at| line[at + receiver.len()..].trim_start().starts_with(':')))
+        || (line.contains("auto") && line.contains('['))
+}
+
 /// Does a `>` in a declared C++ type close no `<` (upstream #2443
 /// `cppTypeBeganAbove`)? Then the type began on an earlier line (rocksdb's
 /// `std::unique_ptr<BlobContents>>>& blob_reqs` under
@@ -3783,25 +3828,39 @@ fn infer_cpp_receiver_type(
     }
     let call_line_index = ((reference.line - 1).max(0) as usize).min(lines.len() - 1);
     let escaped = regex_escape(receiver_name);
-    let receiver_pattern = Regex::new(&format!(r"\b{escaped}\b")).ok()?;
-    let declarator_regex = build_declarator_regex(&escaped);
+    // The receiver's word is read without a pattern ([`writes_word`]), and
+    // the declarator and rebinding patterns compile only once a line could
+    // match them: compiled for every member call, the three made most of a
+    // leveldb index.
+    let declarator_regex: OnceCell<Regex> = OnceCell::new();
+    let ascii_declarator_regex: OnceCell<Regex> = OnceCell::new();
+    let declarator = |line: &str| {
+        if line.is_ascii() {
+            ascii_declarator_regex.get_or_init(|| build_ascii_declarator_regex(&escaped))
+        } else {
+            declarator_regex.get_or_init(|| build_declarator_regex(&escaped))
+        }
+    };
     let mut rebinding: Option<Option<CppRebinding>> = None;
 
     for i in (0..=call_line_index).rev() {
         let text = lines[i];
-        if text.is_empty() || !receiver_pattern.is_match(text) {
+        if text.is_empty() || !writes_word(text, receiver_name) {
             continue;
         }
         let Some(line) = cpp_code_of(text) else {
             continue;
         };
-        if !receiver_pattern.is_match(&line) {
+        if !writes_word(&line, receiver_name) {
             continue;
         }
-        let declarator = declarator_regex.captures(&line).filter(|caps| {
-            caps.get(0)
-                .is_some_and(|whole| declarator_terminator_ok(&line, whole.end()))
-        });
+        let declarator = may_declare_cpp_receiver(&line, receiver_name)
+            .then(|| declarator(&line).captures(&line))
+            .flatten()
+            .filter(|caps| {
+                caps.get(0)
+                    .is_some_and(|whole| declarator_terminator_ok(&line, whole.end()))
+            });
         if let Some(caps) = declarator {
             let raw = caps.get(1).map_or("", |m| m.as_str());
             match normalize_cpp_type_name(raw) {
@@ -3852,6 +3911,7 @@ fn infer_cpp_receiver_type(
                 None => {}
             }
         } else if let Some(found) = found.as_deref_mut()
+            && may_rebind_cpp_receiver(&line, receiver_name)
             && rebinding
                 .get_or_insert_with(|| CppRebinding::new(&escaped))
                 .as_ref()
@@ -3883,13 +3943,16 @@ fn infer_cpp_receiver_type(
             .map(|l| l.trim_end_matches('\r'))
             .enumerate()
         {
-            if !receiver_pattern.is_match(text) {
+            if !writes_word(text, receiver_name) {
                 continue;
             }
             let Some(line) = cpp_code_of(text) else {
                 continue;
             };
-            let Some(caps) = declarator_regex.captures(&line) else {
+            if !may_declare_cpp_receiver(&line, receiver_name) {
+                continue;
+            }
+            let Some(caps) = declarator(&line).captures(&line) else {
                 continue;
             };
             let Some(whole) = caps.get(0) else { continue };
@@ -4424,6 +4487,21 @@ fn line_may_declare(language: Language, line: &str, receiver: &str) -> bool {
                 .trim_start()
                 .starts_with([':', '='])
         }),
+        // `svc = new T` and `svc: T`: the receiver followed, past
+        // whitespace, by `=` and `new`, or by `:` and an uppercase letter.
+        Language::TypeScript | Language::Tsx | Language::JavaScript | Language::Jsx => {
+            writes_assignment_of(line, receiver, "new")
+                || occurrences(line, receiver).any(|at| {
+                    line[at + receiver.len()..]
+                        .trim_start()
+                        .strip_prefix(':')
+                        .is_some_and(|annotation| {
+                            annotation
+                                .trim_start()
+                                .starts_with(|c: char| c.is_ascii_uppercase())
+                        })
+                })
+        }
         // Every other language's patterns write the receiver followed by
         // whitespace (Go's `r T`) or by `=`, `;`, `,`, `)`, `<` (R's `<-`) or
         // a `:` that a type annotation or `:=` follows: past whitespace an
@@ -4510,6 +4588,40 @@ fn occurrences<'t>(text: &'t str, needle: &'t str) -> impl Iterator<Item = usize
         from = at + step;
         Some(at)
     })
+}
+
+/// Whether `c` is a word character as the `regex` crate's Unicode `\w` and
+/// `\b` read one.
+fn is_regex_word_char(c: char) -> bool {
+    if c.is_ascii() {
+        return c.is_ascii_alphanumeric() || c == '_';
+    }
+    static WORD: OnceLock<Regex> = OnceLock::new();
+    let word = WORD.get_or_init(|| Regex::new(r"\A\w\z").expect("word character"));
+    word.is_match(c.encode_utf8(&mut [0; 4]))
+}
+
+/// The byte offsets where `text` writes `word` with a word boundary, as the
+/// `regex` crate's Unicode `\b` reads one, at both ends.
+fn word_occurrences<'t>(text: &'t str, word: &'t str) -> impl Iterator<Item = usize> + 't {
+    let boundary = move |at: usize| {
+        text[..at]
+            .chars()
+            .next_back()
+            .is_some_and(is_regex_word_char)
+            != text[at..].chars().next().is_some_and(is_regex_word_char)
+    };
+    occurrences(text, word).filter(move |&at| boundary(at) && boundary(at + word.len()))
+}
+
+/// Whether `text` matches `\b{word}\b` for a literal `word`, read without
+/// compiling the pattern.
+fn writes_word(text: &str, word: &str) -> bool {
+    if word.is_empty() {
+        // `\b\b` is any boundary, which a word character makes.
+        return text.chars().any(is_regex_word_char);
+    }
+    word_occurrences(text, word).next().is_some()
 }
 
 /// Whether `text` writes `name` followed, past whitespace, by `=` and then,
@@ -7569,25 +7681,88 @@ fn js_code_binds_name(name: &str, function: &Node, line: i64, facts: &SourceFact
         &facts.join_lines(start, through, "\n"),
         crate::strip_comments::CommentLang::JavaScript,
     );
-    let Some(patterns) = js_local_patterns(name) else {
-        return false;
-    };
-    // A plain declaration. Destructuring re-binds what a call returns under
-    // the same name (`const { t } = useI18n()`), which is the same-named
-    // function more often than not, so `const a, …` / `[a]` / `{ a }` forms
-    // (`(?!\s*[,\]}])` upstream) do not count.
-    let declared = patterns.declared.find_iter(&code).any(|found| {
-        !code[found.end()..]
-            .trim_start()
-            .starts_with([',', ']', '}'])
-    });
+    if js_declares_name(&code, name) {
+        return true;
+    }
     // A parameter list, never a control-flow head (`if (openMarkerClose) {`):
     // tried at each `(` not preceded by `if` / `while` / `for` / `switch` /
-    // `with` (upstream's `(?=\()(?<!…)` lookbehind).
-    declared
-        || code.match_indices('(').any(|(at, _)| {
-            !follows_control_keyword(&code[..at]) && patterns.parameter.is_match(&code[at..])
-        })
+    // `with` (upstream's `(?=\()(?<!…)` lookbehind). The pattern compiles
+    // only once a `(` opens what could be such a list with the name in it:
+    // compiled and kept for every name, it and the declaration pattern held
+    // a hundred megabytes of a typescript-large index (W4d end).
+    let parameter: OnceCell<Option<Regex>> = OnceCell::new();
+    code.match_indices('(').any(|(at, _)| {
+        may_open_js_parameters(&code, at, name)
+            && !follows_control_keyword(&code[..at])
+            && parameter
+                .get_or_init(|| js_parameter_pattern(name))
+                .as_ref()
+                .is_some_and(|pattern| pattern.is_match(&code[at..]))
+    })
+}
+
+/// Whether `code` declares `name` with `var` / `let` / `const`: a match of
+/// `(?-u:\b)(?:const|let|var)\s+{name}(?-u:\b)`, found left to right without
+/// overlap, that no `,`, `]` or `}` follows past whitespace. Destructuring
+/// re-binds what a call returns under the same name (`const { t } =
+/// useI18n()`), which is the same-named function more often than not, so
+/// `const a, …` / `[a]` / `{ a }` forms (`(?!\s*[,\]}])` upstream) do not
+/// count. `name` is a simple JS identifier.
+fn js_declares_name(code: &str, name: &str) -> bool {
+    let bytes = code.as_bytes();
+    let is_word = |at: usize| {
+        bytes
+            .get(at)
+            .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+    };
+    let name_ends_in_word = name
+        .bytes()
+        .next_back()
+        .is_some_and(|byte| byte.is_ascii_alphanumeric() || byte == b'_');
+    // Where the last match ended: the next one starts at or after it.
+    let mut searched = 0;
+    for at in 0..bytes.len() {
+        if at < searched || (at > 0 && is_word(at - 1)) {
+            continue;
+        }
+        let Some(keyword) = ["const", "let", "var"]
+            .into_iter()
+            .find(|keyword| bytes[at..].starts_with(keyword.as_bytes()))
+        else {
+            continue;
+        };
+        let after = &code[at + keyword.len()..];
+        let spaced = after.trim_start();
+        if spaced.len() == after.len() || !spaced.starts_with(name) {
+            continue;
+        }
+        let end = code.len() - spaced.len() + name.len();
+        if name_ends_in_word == is_word(end) {
+            continue;
+        }
+        if !code[end..].trim_start().starts_with([',', ']', '}']) {
+            return true;
+        }
+        searched = end;
+    }
+    false
+}
+
+/// Whether the `(` at byte `at` of `code` could open a parameter list
+/// [`js_parameter_pattern`] matches; never false where it does. The pattern
+/// reads no parenthesis inside the list, so the list ends at the first one
+/// after `at`, a `)`, holds `name`, and is followed, past whitespace, by
+/// `=>`, `{` or a return type's `:`.
+fn may_open_js_parameters(code: &str, at: usize, name: &str) -> bool {
+    let list = &code[at + 1..];
+    let Some(close) = list.find(['(', ')']) else {
+        return false;
+    };
+    if list.as_bytes()[close] != b')' || !list[..close].contains(name) {
+        return false;
+    }
+    let tail = list[close + 1..].trim_start();
+    tail.starts_with("=>") || tail.starts_with(['{', ':'])
 }
 
 /// Whether `before` ends, past trailing whitespace, with `if`, `while`,
@@ -7606,59 +7781,16 @@ fn follows_control_keyword(before: &str) -> bool {
         })
 }
 
-/// [`js_code_binds_name`]'s patterns for one plain identifier.
-struct JsLocalPatterns {
-    declared: Regex,
-    /// [`LocalBindingPatterns`]' parameter form, its return type kept to one
-    /// line (`(?::[^=;{}()\n]*)?`), so a ternary's `: data.slice()` below
-    /// `filter(canRowExpand)` is no return type.
-    parameter: Regex,
-}
-
-/// Patterns by name, cached like [`local_binding_patterns`].
-fn js_local_patterns(name: &str) -> Option<Arc<JsLocalPatterns>> {
-    const CAP: usize = 1024;
-    type PatternCache = (
-        HashMap<String, Option<Arc<JsLocalPatterns>>>,
-        std::collections::VecDeque<String>,
-    );
-    static CACHE: OnceLock<Mutex<PatternCache>> = OnceLock::new();
-    let cache =
-        CACHE.get_or_init(|| Mutex::new((HashMap::new(), std::collections::VecDeque::new())));
-    if let Some(patterns) = cache
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .0
-        .get(name)
-    {
-        return patterns.clone();
-    }
+/// The parameter form of [`js_code_binds_name`] for one plain identifier:
+/// [`LocalBindingPatterns`]' parameter form, its return type kept to one
+/// line (`(?::[^=;{}()\n]*)?`), so a ternary's `: data.slice()` below
+/// `filter(canRowExpand)` is no return type.
+fn js_parameter_pattern(name: &str) -> Option<Regex> {
     let n = regex::escape(name);
-    let declared = Regex::new(&format!(r"(?-u:\b)(?:const|let|var)\s+{n}(?-u:\b)")).ok();
-    let parameter = Regex::new(&format!(
+    Regex::new(&format!(
         r"^\(\s*(?:(?:\.\.\.)?[0-9A-Za-z_$]+(?:\s*(?:\?\s*)?:[^,()]+|\s*=[^,()]+|\s*),\s*)*{n}(?-u:\b)(?:\s*\??\s*:[^,()]*)?(?:\s*=[^,()]*)?(?:\s*,\s*[^()]*)?\)\s*(?::[^=;{{}}()\n]*)?(?:=>|\{{)"
     ))
-    .ok();
-    let patterns = declared.zip(parameter).map(|(declared, parameter)| {
-        Arc::new(JsLocalPatterns {
-            declared,
-            parameter,
-        })
-    });
-    let mut guard = cache
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let (map, order) = &mut *guard;
-    if !map.contains_key(name) {
-        if map.len() >= CAP
-            && let Some(oldest) = order.pop_front()
-        {
-            map.remove(&oldest);
-        }
-        map.insert(name.to_string(), patterns.clone());
-        order.push_back(name.to_string());
-    }
-    patterns
+    .ok()
 }
 
 /// C has no methods, and C code cannot call a C++ one (upstream #2234, in
@@ -13918,6 +14050,219 @@ mod tests {
             "    list.add(1);",
             "list"
         ));
+    }
+
+    /// The JS-family arm admits only what its two patterns write, a `new`
+    /// assignment and an uppercase annotation (W4d end, typescript-large):
+    /// the other shapes the generic rule admits compile nothing here.
+    #[test]
+    fn js_receiver_prefilter_admits_new_assignments_and_annotations_only() {
+        for line in [
+            "  const svc = new UserService();",
+            "  svc =new Svc()",
+            "  let svc: UserService;",
+            "  function f(svc : Svc) {}",
+        ] {
+            assert!(
+                line_may_declare(Language::TypeScript, line, "svc"),
+                "{line}"
+            );
+        }
+        for line in [
+            "  use(svc, 1);",
+            "  return svc;",
+            "  if (svc) {",
+            "  svc = other;",
+            "  svc <T>()",
+            "  const x = { svc: value };",
+            "  svc.save();",
+        ] {
+            assert!(
+                !line_may_declare(Language::TypeScript, line, "svc"),
+                "{line}"
+            );
+            assert!(
+                !line_may_declare(Language::JavaScript, line, "svc"),
+                "{line}"
+            );
+        }
+    }
+
+    /// [`js_declares_name`] finds what the declaration pattern found, and
+    /// [`may_open_js_parameters`] admits every `(` the parameter pattern
+    /// matches at (W4d end, typescript-large).
+    #[test]
+    fn js_binding_readers_agree_with_the_patterns_they_replace() {
+        let codes = [
+            "const x = 1;",
+            "let  x\n= 2",
+            "var x, y",
+            "const { x } = f()",
+            "const [x] = g()",
+            "constx = 1",
+            "myconst x = 1",
+            "_let x = 1",
+            "const xy = 1",
+            "const x$ = 1",
+            "const $x = 1",
+            "let x$y = 1",
+            "var a$var a$var",
+            "var a$var, a$var",
+            "const\tx\u{85}",
+            "const é x",
+            "éconst x",
+            "let\u{a0}x = 3",
+            "  return x;",
+            "function f(x) { return x; }",
+            "const f = (a, x: number) => a;",
+            "const f = (x = 1, ...rest) => x",
+            "f(x);",
+            "if (x) {",
+            "(x): Foo => x",
+            "(a: Map<K, V>, x) => 1",
+            "(\n  x,\n  y\n) {",
+            "( x ) =>",
+            "(a = (x), b) => 1",
+        ];
+        for name in ["x", "x$", "$x", "a$var", "xy"] {
+            let n = regex::escape(name);
+            let declared =
+                Regex::new(&format!(r"(?-u:\b)(?:const|let|var)\s+{n}(?-u:\b)")).unwrap();
+            let parameter = js_parameter_pattern(name).unwrap();
+            for code in codes {
+                let expected = declared.find_iter(code).any(|found| {
+                    !code[found.end()..]
+                        .trim_start()
+                        .starts_with([',', ']', '}'])
+                });
+                assert_eq!(
+                    js_declares_name(code, name),
+                    expected,
+                    "{name:?} in {code:?}"
+                );
+                for (at, _) in code.match_indices('(') {
+                    if parameter.is_match(&code[at..]) {
+                        assert!(
+                            may_open_js_parameters(code, at, name),
+                            "{name:?} at {at} in {code:?}"
+                        );
+                    }
+                }
+            }
+        }
+        // A call's parentheses, or ones another `(` interrupts, open no list.
+        assert!(!may_open_js_parameters("f(x);", 1, "x"));
+        assert!(!may_open_js_parameters("g(f(x)) => 1", 1, "x"));
+        assert!(may_open_js_parameters("(x): Foo => x", 0, "x"));
+    }
+
+    /// [`writes_word`] reads `\b{word}\b` as the `regex` crate does, Unicode
+    /// word characters on either side included, without compiling it.
+    #[test]
+    fn writes_word_reads_a_word_as_the_regex_crate_does() {
+        let texts = [
+            "db->Get(k);",
+            "  auto db = Open();",
+            "dbs.size()",
+            "my_db.size()",
+            "éa.foo",
+            "a.fooé",
+            "x(a.foo)",
+            "a.foo",
+            "día = 1;",
+            "el día.x()",
+            "_día",
+            "a.b.c",
+            "",
+            "  ",
+            "αβ γ",
+        ];
+        for word in ["db", "a.foo", "día", "a.b", "foo", "γ", ""] {
+            let pattern = Regex::new(&format!(r"\b{}\b", regex_escape(word))).unwrap();
+            for text in texts {
+                assert_eq!(
+                    writes_word(text, word),
+                    pattern.is_match(text),
+                    "{word:?} in {text:?}"
+                );
+            }
+        }
+    }
+
+    /// The C++ receiver scan compiles its declarator and rebinding patterns
+    /// only once a line could match them (W4d end, leveldb): every line
+    /// either pattern matches is admitted, and the call lines are not.
+    #[test]
+    fn cpp_receiver_prefilters_admit_every_line_their_patterns_match() {
+        let receiver = "db";
+        let escaped = regex_escape(receiver);
+        let declarator = build_declarator_regex(&escaped);
+        let rebinding = CppRebinding::new(&escaped).unwrap();
+        let calls = [
+            "  db->Get(k);",
+            "  if (db != nullptr) {",
+            "  x = db.size();",
+            "  Use(db, 1);",
+        ];
+        let lines = [
+            "  DB* db = nullptr;",
+            "  DB *db;",
+            "  std::unique_ptr<DB> db(Open());",
+            "  const Options& db = opts;",
+            "  ns::Db db;",
+            "  auto db = DB::Open(o);",
+            "Status Open(const Options& o, DB** dbptr, DB* db) {",
+            "  for (const auto& db : dbs) {",
+            "  for (DB* db: all) {",
+            "  auto& [db, ok] = Open();",
+            "  auto [ok, db] = pair;",
+            "  Foo::db",
+            "  return db;",
+            "  Größe db;",
+        ];
+        let (mut declared, mut rebound) = (0, 0);
+        for line in lines.iter().chain(&calls) {
+            if declarator.is_match(line) {
+                declared += 1;
+                assert!(may_declare_cpp_receiver(line, receiver), "{line}");
+            }
+            if rebinding.rebinds(line) {
+                rebound += 1;
+                assert!(may_rebind_cpp_receiver(line, receiver), "{line}");
+            }
+        }
+        assert_eq!((declared, rebound), (12, 4));
+        // On an ASCII line the ASCII-spelled pattern captures what the Unicode
+        // one captures.
+        let ascii = build_ascii_declarator_regex(&escaped);
+        let templates = [
+            "  std::map<int, std::vector<Foo*>> db = make();",
+            "  Foo<a=b> db;",
+            "  Foo<x{y}> db;",
+            "  Foo<x(y)> db;",
+            "  Foo<x;y> db;",
+            "  const char* const db = \"x\";",
+            "\tDB\t*\tdb;",
+            "  Foo<\x01~|\x7F> db;",
+            "  Foo\x0B<T>\x0C&db",
+            "  a::b:: db",
+        ];
+        for line in lines
+            .iter()
+            .chain(&calls)
+            .chain(&templates)
+            .filter(|line| line.is_ascii())
+        {
+            let capture = |re: &Regex| {
+                re.captures(line)
+                    .map(|caps| (caps.get(0).unwrap().range(), caps[1].to_string()))
+            };
+            assert_eq!(capture(&ascii), capture(&declarator), "{line}");
+        }
+        for call in calls {
+            assert!(!may_declare_cpp_receiver(call, receiver), "{call}");
+            assert!(!may_rebind_cpp_receiver(call, receiver), "{call}");
+        }
     }
 
     /// [`has_receiver_patterns`] names exactly the languages

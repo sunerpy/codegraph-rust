@@ -308,10 +308,15 @@ fn split_top_level(text: &str) -> Vec<&str> {
 /// `None` when `text` declares no alias of that name.
 fn aliased_type_in(text: &str, name: &str) -> Option<String> {
     let escaped = regex::escape(name);
-    if let Some(using) = word_regex(&format!(
-        r"\busing\s+{escaped}\s*(?:\[\[[^\]]*\]\]\s*)?=\s*([^;]+)"
-    ))
-    .and_then(|pattern| pattern.captures(text))
+    // Each pattern compiles only when `text` writes what it needs.
+    if let Some(using) = (text.contains("using") && text.contains(name))
+        .then(|| {
+            word_regex(&format!(
+                r"\busing\s+{escaped}\s*(?:\[\[[^\]]*\]\]\s*)?=\s*([^;]+)"
+            ))
+        })
+        .flatten()
+        .and_then(|pattern| pattern.captures(text))
     {
         return Some(using[1].trim().to_string());
     }
@@ -321,6 +326,9 @@ fn aliased_type_in(text: &str, name: &str) -> Option<String> {
     // `typedef Foo* FooPtr, FooObj;` indexes its first declarator; the type is
     // what precedes that declarator's name.
     let first = split_top_level(typedef.get(1)?.as_str())[0];
+    if !first.trim_end().ends_with(name) {
+        return None;
+    }
     let declared = word_regex(&format!(r"^([\s\S]*?)\b{escaped}\s*$"))?.captures(first)?;
     let written = declared[1].trim();
     (!written.is_empty()).then(|| written.to_string())
@@ -397,16 +405,25 @@ fn local_aliased_type(
     }
     let facts = context.source_facts(&reference.file_path)?;
     let escaped = regex::escape(name);
-    let declares = word_regex(&format!(
-        r"\b(?:using\s+{escaped}\s*=|typedef\b[^;]*\b{escaped}\s*[;,])"
-    ))?;
+    // Compiled once a line writes the name: most functions declare no alias.
+    let declares: std::cell::OnceCell<Option<Regex>> = std::cell::OnceCell::new();
     let call_line = line_index(reference.line);
     for &index in local_alias_lines(caller, &facts).iter() {
         if index > call_line {
             continue;
         }
         let line = facts.line(index);
-        if line.contains(name) && declares.is_match(line) {
+        if !line.contains(name) {
+            continue;
+        }
+        let declares = declares
+            .get_or_init(|| {
+                word_regex(&format!(
+                    r"\b(?:using\s+{escaped}\s*=|typedef\b[^;]*\b{escaped}\s*[;,])"
+                ))
+            })
+            .as_ref()?;
+        if declares.is_match(line) {
             return Some(aliased_type_in(line, name));
         }
     }

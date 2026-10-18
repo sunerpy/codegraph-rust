@@ -344,10 +344,32 @@ impl SourceFacts {
 
     /// [`Self::ts_comment_free`] with every string and template literal's
     /// contents blanked too (`blankStringContents(stripCommentsForRegex(…))`),
-    /// so line-anchored patterns see only code.
+    /// so line-anchored patterns see only code. The comment-free text it is
+    /// made from is kept only when [`Self::ts_comment_free`] was asked for.
     pub fn ts_blanked(&self) -> &str {
-        self.ts_blanked
-            .get_or_init(|| blank_string_contents(self.ts_comment_free().0))
+        self.ts_blanked.get_or_init(|| self.make_ts_blanked())
+    }
+
+    /// `read` over [`Self::ts_blanked`]'s text without keeping it: the text
+    /// another reader kept, else one made for `read` and dropped after. For
+    /// a fact read once per file (whether it is an ES module, what it
+    /// exports), so a file that answers it only for other files' references
+    /// keeps no copy of itself.
+    pub fn with_ts_blanked<T>(&self, read: impl FnOnce(&str) -> T) -> T {
+        match self.ts_blanked.get() {
+            Some(code) => read(code),
+            None => read(&self.make_ts_blanked()),
+        }
+    }
+
+    fn make_ts_blanked(&self) -> String {
+        match self.ts_comment_free.get() {
+            Some((code, _)) => blank_string_contents(code),
+            None => blank_string_contents(&strip_comments_for_regex(
+                &self.source,
+                CommentLang::TypeScript,
+            )),
+        }
     }
 
     /// Where a JS/TS local binding can start in the raw source.
@@ -996,6 +1018,21 @@ mod tests {
             None
         );
         assert_eq!(runs, 1);
+    }
+
+    /// A module fact read from a transient blanked copy reads the text
+    /// [`SourceFacts::ts_blanked`] keeps, whichever comes first.
+    #[test]
+    fn with_ts_blanked_reads_the_text_ts_blanked_keeps() {
+        let source = "import a from 'x'; // export b\n# c\nconst s = `t ${'u'}`; /* export d */\n";
+        let transient = SourceFacts::new(Arc::from(source));
+        let read = transient.with_ts_blanked(str::to_string);
+        let kept = SourceFacts::new(Arc::from(source));
+        assert_eq!(read, kept.ts_blanked());
+        assert_eq!(kept.with_ts_blanked(str::to_string), kept.ts_blanked());
+        let comment_free_first = SourceFacts::new(Arc::from(source));
+        let _ = comment_free_first.ts_comment_free();
+        assert_eq!(comment_free_first.with_ts_blanked(str::to_string), read);
     }
 
     #[test]
