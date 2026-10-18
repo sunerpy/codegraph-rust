@@ -1207,6 +1207,13 @@ fn sync_paths_with_store(
                 dependent_fallbacks.insert(parked.file_path);
             }
         }
+        // #2450 — and so do the importers of an edited module whose statement
+        // holds a binding the import did not resolve (read in `sync_one`).
+        for importer in std::mem::take(&mut changed_names.binding_importers) {
+            if !reindexed.contains(&importer) {
+                dependent_fallbacks.insert(importer);
+            }
+        }
         let mut resolver = ReferenceResolver::new(project_root.to_string_lossy())
             .with_max_file_size(scope.options.max_file_size);
         {
@@ -1581,6 +1588,16 @@ fn sync_one(
     for dependent in store.reference_sites_dependent_on_file(relative)? {
         importers.insert(dependent.file_path.clone());
         merge_dependent_site(dependent_sites, dependent_fallbacks, dependent);
+    }
+    // #2450 — an importer whose statement of this module holds a binding
+    // the import did not resolve (`W` of `import { Widget as W } from
+    // './widgets/Widget'`, parked or matched by its name) may bind to what
+    // the edit gives the module. Read here: re-extraction drops the old
+    // nodes, and the edges into them with them.
+    if !added {
+        changed_names
+            .binding_importers
+            .extend(store.importers_with_unbound_bindings(relative)?);
     }
     let language_after = detect_language_of(relative, &source, &scope.options.extensions);
     let c_family_after = crate::cpp_dependents::is_c_family(language_after);
@@ -2292,6 +2309,11 @@ struct ChangedNames {
     candidates: HashSet<String>,
     /// The files this sync added: a parked import may name one (#2392).
     added_files: BTreeSet<String>,
+    /// The files whose import of an edited module holds a binding the import
+    /// did not resolve, read before the module's old nodes went (#2450):
+    /// the edit may give the module what the binding imports under another
+    /// name, which no name lookup finds.
+    binding_importers: BTreeSet<String>,
     /// The namespaces and modules the changed files declare, which a parked
     /// import may name whole (`using Foo.Bar`, `import com.z.*`).
     module_names: HashSet<String>,

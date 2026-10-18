@@ -762,8 +762,12 @@ macro_rules! matrix {
 matrix! {
     typescript_named_import_of_an_added_file,
     typescript_default_import_of_an_added_file,
-    #[ignore = "W5-03 #2450: a reference through an aliased import binding does not link a module that appears later"]
     typescript_aliased_named_import_of_an_added_file,
+    typescript_aliased_named_import_gains_its_export,
+    tsx_aliased_component_import_gains_its_export,
+    typescript_aliased_named_import_leaves_a_namesake_when_its_module_gains_the_export,
+    typescript_aliased_named_import_leaves_an_in_module_namesake_when_its_module_gains_the_export,
+    typescript_aliased_named_import_loses_its_export,
     tsx_component_import_of_an_added_file,
     python_from_import_of_an_added_module,
     php_include_of_an_added_file,

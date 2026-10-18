@@ -573,7 +573,12 @@ references written as a path (a Liquid `{% render 'price' %}` waits under
 `price` for `snippets/price.liquid`), send their files
 down the whole-file re-resolution lane, which rebuilds an unchanged file's
 resolved edges and keeps what its extraction produced (`contains` edges and
-same-file value references). Each mutation acquires the
+same-file value references). An edited JavaScript-family module sends down the
+same lane each importer whose statement of it holds a binding the import did not
+resolve, parked or matched by its name (`W` of `import { Widget as W }` while
+the module declares no `Widget`), read before the module's old nodes go: the
+edit may give the module what the binding imports under another name, which no
+name lookup finds. Each mutation acquires the
 store's short-lived `index.lock` writer authority; readers use corroborated state
 and shared leases. A separate persistent `writer.pid` file carries an OS kernel
 exclusive lock for the lifetime of the ONE process allowed to run watcher/catch-up

@@ -1479,6 +1479,56 @@ impl Store {
             .collect())
     }
 
+    /// The JavaScript-family files whose import of `file` holds a binding that
+    /// does not resolve into it (upstream #2450): another file X with an
+    /// `imports` edge into `file`'s file node, X's `import` node around that
+    /// edge's line, and within that node's lines either an unresolved
+    /// `imports` reference other than the statement's own path (`W` of
+    /// `import { Widget as W } from './widgets/Widget'` while the module
+    /// declares no `Widget`) or an `imports` edge from X that import
+    /// resolution did not make (`resolvedBy` other than `import`: `W` matched
+    /// by its name, to a namesake in the module or elsewhere). The statement's
+    /// edge to the file node itself is its path, not a binding. An edit that
+    /// gives the module what such a binding imports reaches it by no name, as
+    /// the binding is written under its own. Read it before `file`'s old
+    /// nodes go: the edges into them go with them. Sorted, each file once.
+    pub fn importers_with_unbound_bindings(&self, file: &str) -> rusqlite::Result<Vec<String>> {
+        // CROSS JOIN pins the order: from the file's node to the edges into
+        // it, never from every `imports` edge (`idx_edges_kind`).
+        let mut stmt = self.conn.prepare_cached(
+            r#"SELECT DISTINCT s.file_path
+            FROM nodes f
+            CROSS JOIN edges e ON e.target = f.id AND e.kind = 'imports'
+            CROSS JOIN nodes s ON s.id = e.source
+            CROSS JOIN nodes i ON i.file_path = s.file_path AND i.kind = 'import'
+                AND i.start_line <= e.line AND e.line <= i.end_line
+            WHERE f.file_path = ?1 AND f.kind = 'file' AND s.file_path <> ?1
+                AND i.language IN
+                    ('typescript', 'tsx', 'javascript', 'jsx', 'arkts', 'svelte', 'vue', 'astro')
+                AND (
+                    EXISTS (
+                        SELECT 1 FROM unresolved_refs u
+                        WHERE u.file_path = s.file_path AND u.reference_kind = 'imports'
+                            AND u.line BETWEEN i.start_line AND i.end_line
+                            AND u.reference_name <> i.name
+                    )
+                    OR EXISTS (
+                        SELECT 1 FROM nodes x
+                        CROSS JOIN edges b ON b.source = x.id AND b.kind = 'imports'
+                        WHERE x.file_path = s.file_path
+                            AND b.line BETWEEN i.start_line AND i.end_line
+                            AND b.target <> f.id
+                            AND (CASE WHEN json_valid(b.metadata)
+                                THEN json_extract(b.metadata, '$.resolvedBy') END)
+                                IS NOT 'import'
+                    )
+                )
+            ORDER BY 1"#,
+        )?;
+        let rows = stmt.query_map([file], |row| row.get::<_, String>(0))?;
+        rows.collect()
+    }
+
     /// Ports `getStats` count SQL from `upstream db/queries.ts:1746-1756`.
     pub fn counts(&self) -> rusqlite::Result<StoreCounts> {
         self.conn.query_row(

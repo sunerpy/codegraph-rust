@@ -52,6 +52,119 @@ pub fn typescript_aliased_named_import_of_an_added_file() -> Case {
         .edge_after("function build", "instantiates", "class Widget")
 }
 
+/// Upstream #2450: an edit that gives the module the name an aliased binding
+/// imports links the binding and its uses, which are written under the
+/// alias.
+pub fn typescript_aliased_named_import_gains_its_export() -> Case {
+    Case::new(Change::RenameSymbol, &[Language::TypeScript])
+        .file(
+            "src/main.ts",
+            "import { Widget as Wrapper } from './widget';\n\nexport function build(): Wrapper {\n  return new Wrapper();\n}\n",
+        )
+        .file("src/widget.ts", "export class Placeholder {}\n")
+        .write("src/widget.ts", "export class Widget {}\n")
+        .edge_after("file:src/main.ts", "imports", "class Widget")
+        .edge_after("function build", "instantiates", "class Widget")
+}
+
+/// Upstream #2450 (luci-go's milo): the same through a tsconfig alias, the
+/// binding rendered as a JSX tag.
+pub fn tsx_aliased_component_import_gains_its_export() -> Case {
+    Case::new(Change::RenameSymbol, &[Language::Tsx])
+        .file(
+            "tsconfig.json",
+            "{\"compilerOptions\":{\"baseUrl\":\".\",\"paths\":{\"@/*\":[\"src/*\"]}}}",
+        )
+        .file(
+            "src/pages/groups_page.test.tsx",
+            "import { Component as GroupsPageWrapper } from '@/pages/groups_page';\nexport const page = <GroupsPageWrapper />;\n",
+        )
+        .file(
+            "src/pages/groups_page.tsx",
+            "export function Placeholder() { return null; }\n",
+        )
+        .write(
+            "src/pages/groups_page.tsx",
+            "export function Component() { return null; }\n",
+        )
+        .edge_after(
+            "file:src/pages/groups_page.test.tsx",
+            "imports",
+            "function Component",
+        )
+        .edge_after("constant page", "references", "function Component")
+}
+
+/// Upstream #2450, found by W5-03's plan gate: while the module declares no
+/// `Widget`, the binding `W` is linked by its name to a `W` elsewhere; once
+/// the module gains `Widget`, the binding and its use leave that namesake.
+pub fn typescript_aliased_named_import_leaves_a_namesake_when_its_module_gains_the_export() -> Case
+{
+    Case::new(Change::RenameSymbol, &[Language::TypeScript])
+        .file(
+            "src/draw.ts",
+            "import { Widget as W } from './widgets/Widget';\n\nexport function paint() {\n  return new W();\n}\n",
+        )
+        .file("src/widgets/Widget.ts", "export class Placeholder {}\n")
+        .file("src/other.ts", "export class W {}\n")
+        .edge_before("function paint", "instantiates", "class W")
+        .write("src/widgets/Widget.ts", "export class Widget {}\n")
+        .edge_after("function paint", "instantiates", "class Widget")
+        .no_edge_after("function paint", "instantiates", "class W")
+}
+
+/// Upstream #2450, found by W5-03's plan gate: the binding `W` is matched by
+/// its name to the module's own `W` and its use to a `class W` elsewhere;
+/// once the module gains `Widget`, both reach it.
+pub fn typescript_aliased_named_import_leaves_an_in_module_namesake_when_its_module_gains_the_export()
+-> Case {
+    Case::new(Change::RenameSymbol, &[Language::TypeScript])
+        .file(
+            "src/draw.ts",
+            "import { Widget as W } from './mod';
+
+export function paint() {
+  return new W();
+}
+",
+        )
+        .file(
+            "src/mod.ts",
+            "export const W = 1;
+export class Placeholder {}
+",
+        )
+        .file(
+            "src/other.ts",
+            "export class W {}
+",
+        )
+        .edge_before("function paint", "instantiates", "class W")
+        .write(
+            "src/mod.ts",
+            "export const W = 1;
+export class Widget {}
+",
+        )
+        .edge_after("file:src/draw.ts", "imports", "class Widget")
+        .edge_after("function paint", "instantiates", "class Widget")
+        .no_edge_after("function paint", "instantiates", "class W")
+}
+
+/// Upstream #2450, the other way: the module renames the declaration the
+/// aliased binding imports, and the binding's uses leave it.
+pub fn typescript_aliased_named_import_loses_its_export() -> Case {
+    Case::new(Change::RenameSymbol, &[Language::TypeScript])
+        .file(
+            "src/main.ts",
+            "import { Widget as Wrapper } from './widget';\n\nexport function build(): Wrapper {\n  return new Wrapper();\n}\n",
+        )
+        .file("src/widget.ts", "export class Widget {}\n")
+        .edge_before("function build", "instantiates", "class Widget")
+        .write("src/widget.ts", "export class Gadget {}\n")
+        .no_edge_after("function build", "instantiates", "class Gadget")
+}
+
 pub fn tsx_component_import_of_an_added_file() -> Case {
     Case::new(Change::AddImportTarget, &[Language::Tsx])
         .file(

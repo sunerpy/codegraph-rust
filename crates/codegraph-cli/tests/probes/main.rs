@@ -18155,6 +18155,312 @@ mod shopify_themes {
     }
 }
 
+mod import_bindings {
+    use super::support::{Graph, Project};
+
+    /// The files that reach a module through a binding the module does not
+    /// declare by that name (upstream #2450's `IMPORTERS`): a default import
+    /// of a module whose default has another name, an aliased import through
+    /// a tsconfig alias, a namespace import, default imports called, built
+    /// and extended, an Express router mounted through a default import, and
+    /// Vue, Svelte and Astro components imported by default.
+    const IMPORTERS: [(&str, &str); 12] = [
+        (
+            "package.json",
+            "{\"name\":\"app\",\"dependencies\":{\"express\":\"^4\",\"vue\":\"^3\",\"svelte\":\"^4\",\"astro\":\"^4\"}}",
+        ),
+        (
+            "tsconfig.json",
+            "{\"compilerOptions\":{\"baseUrl\":\".\",\"paths\":{\"@/*\":[\"src/*\"]}}}",
+        ),
+        (
+            "src/routes/routes.ts",
+            "import tagsController from './tag/tag.controller';\nexport const routes = [tagsController];\n",
+        ),
+        (
+            "src/pages/groups_page.test.tsx",
+            "import { Component as GroupsPageWrapper } from '@/pages/groups_page';\nexport const page = <GroupsPageWrapper />;\n",
+        ),
+        (
+            "src/use-ns.ts",
+            "import * as NS from './ns';\nexport const all = NS;\n",
+        ),
+        (
+            "src/call.ts",
+            "import runIt from './handler';\nexport function go() { return runIt(); }\n",
+        ),
+        (
+            "src/draw.ts",
+            "import { Widget as W } from './widgets/Widget';\nexport function paint() { return new W(); }\n",
+        ),
+        (
+            "src/admin.ts",
+            "import Base from './base';\nexport class Admin extends Base {}\n",
+        ),
+        (
+            "backend/server.js",
+            "import express from 'express';\nimport uploadRoutes from './routes/uploadRoutes.js';\nconst app = express();\napp.use('/api/upload', uploadRoutes);\nexport default app;\n",
+        ),
+        (
+            "src/layouts/LayoutMain.vue",
+            "<template><Error404 /></template>\n<script setup>\nimport Error404 from '@/views/error/404.vue';\n</script>\n",
+        ),
+        (
+            "src/App.svelte",
+            "<script>\n  import Banner from './lib/Hero.svelte';\n</script>\n<Banner />\n",
+        ),
+        (
+            "src/pages/index.astro",
+            "---\nimport Shell from '../layouts/BaseLayout.astro';\n---\n<Shell><h1>Home</h1></Shell>\n",
+        ),
+    ];
+
+    /// The modules they import (upstream's `MODULES`).
+    const MODULES: [(&str, &str); 10] = [
+        (
+            "src/routes/tag/tag.controller.ts",
+            "const router = { list() { return []; } };\nexport default router;\n",
+        ),
+        (
+            "src/pages/groups_page.tsx",
+            "export function Component() { return null; }\n",
+        ),
+        ("src/ns.ts", "export const member = 1;\n"),
+        (
+            "src/handler.ts",
+            "export default function handle() { return 1; }\n",
+        ),
+        ("src/widgets/Widget.ts", "export class Widget {}\n"),
+        ("src/base.ts", "export default class BaseUser {}\n"),
+        (
+            "backend/routes/uploadRoutes.js",
+            "import express from 'express';\nconst router = express.Router();\nrouter.post('/', (req, res) => res.send('ok'));\nexport default router;\n",
+        ),
+        (
+            "src/views/error/404.vue",
+            "<template><p>Not found</p></template>\n",
+        ),
+        ("src/lib/Hero.svelte", "<h1>Hero</h1>\n"),
+        (
+            "src/layouts/BaseLayout.astro",
+            "<html><body><slot /></body></html>\n",
+        ),
+    ];
+
+    /// What this port's fresh index links from the importers to the modules
+    /// (upstream's `LINKS`, in this port's graph: it links neither Astro's
+    /// `Shell` to the `BaseLayout` component nor Express's mount of
+    /// `uploadRoutes` to its `router`, upstream's two other links).
+    const LINKS: [&str; 20] = [
+        "calls function src/call.ts -> function src/handler.ts::handle",
+        "extends class src/admin.ts -> class src/base.ts::BaseUser",
+        "imports file backend/server.js -> file backend/routes/uploadRoutes.js::uploadRoutes.js",
+        "imports file src/App.svelte -> component src/lib/Hero.svelte::Hero",
+        "imports file src/App.svelte -> file src/lib/Hero.svelte::Hero.svelte",
+        "imports file src/admin.ts -> file src/base.ts::base.ts",
+        "imports file src/call.ts -> file src/handler.ts::handler.ts",
+        "imports file src/draw.ts -> class src/widgets/Widget.ts::Widget",
+        "imports file src/draw.ts -> file src/widgets/Widget.ts::Widget.ts",
+        "imports file src/layouts/LayoutMain.vue -> component src/views/error/404.vue::404",
+        "imports file src/layouts/LayoutMain.vue -> file src/views/error/404.vue::404.vue",
+        "imports file src/pages/groups_page.test.tsx -> file src/pages/groups_page.tsx::groups_page.tsx",
+        "imports file src/pages/groups_page.test.tsx -> function src/pages/groups_page.tsx::Component",
+        "imports file src/pages/index.astro -> file src/layouts/BaseLayout.astro::BaseLayout.astro",
+        "imports file src/routes/routes.ts -> file src/routes/tag/tag.controller.ts::tag.controller.ts",
+        "imports file src/use-ns.ts -> file src/ns.ts::ns.ts",
+        "instantiates function src/draw.ts -> class src/widgets/Widget.ts::Widget",
+        "references component src/App.svelte -> component src/lib/Hero.svelte::Hero",
+        "references component src/layouts/LayoutMain.vue -> component src/views/error/404.vue::404",
+        "references constant src/pages/groups_page.test.tsx -> function src/pages/groups_page.tsx::Component",
+    ];
+
+    fn project_of(files: &[(&str, &str)]) -> Project {
+        files.iter().fold(Project::new(), |project, (path, text)| {
+            project.file(path, text)
+        })
+    }
+
+    fn every_file() -> Vec<(&'static str, &'static str)> {
+        IMPORTERS.iter().chain(&MODULES).copied().collect()
+    }
+
+    /// Every edge from another file to a module's, by its kind and its ends'
+    /// kinds and files, sorted and deduplicated.
+    fn links(graph: &Graph) -> Vec<String> {
+        let mut out: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.kind != "contains")
+            .filter_map(|edge| {
+                let source = graph.node(&edge.source)?;
+                let target = graph.node(&edge.target)?;
+                (source.file_path != target.file_path
+                    && MODULES.iter().any(|(path, _)| *path == target.file_path))
+                .then(|| {
+                    format!(
+                        "{} {} {} -> {} {}::{}",
+                        edge.kind,
+                        source.kind,
+                        source.file_path,
+                        target.kind,
+                        target.file_path,
+                        target.name
+                    )
+                })
+            })
+            .collect();
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// Every edge by its ends, kind, site and how it resolved, sorted: what a
+    /// sync has to match a fresh index of the same files on.
+    fn edge_set(graph: &Graph) -> Vec<String> {
+        let mut out: Vec<String> = graph
+            .edges
+            .iter()
+            .map(|edge| {
+                format!(
+                    "{} {} -> {} @{:?}:{:?} {}",
+                    edge.kind, edge.source, edge.target, edge.line, edge.col, edge.metadata
+                )
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    #[track_caller]
+    fn assert_fresh(synced: &Graph, files: &[(&str, &str)]) {
+        let fresh = project_of(files).index();
+        assert_eq!(
+            edge_set(synced),
+            edge_set(fresh.graph()),
+            "the synced graph is a fresh index's\nsynced:\n{}\nfresh:\n{}",
+            synced.report(),
+            fresh.graph().report()
+        );
+    }
+
+    /// A module before the edit that gives it what its importers import
+    /// (upstream's `stub`).
+    fn stub(path: &str) -> &'static str {
+        if path.ends_with(".vue") {
+            "<template><p></p></template>\n"
+        } else if path.ends_with(".svelte") || path.ends_with(".astro") {
+            "<p></p>\n"
+        } else {
+            "export const placeholder = 1;\n"
+        }
+    }
+
+    /// Upstream #2450: the modules added after their importers link them on
+    /// the next sync, the importers unchanged.
+    #[test]
+    fn pr2450_a_module_added_after_its_importers_links_them() {
+        let mut project = project_of(&IMPORTERS).index();
+        assert_eq!(links(project.graph()), Vec::<String>::new());
+        for (path, text) in MODULES {
+            project.write(path, text);
+        }
+        let synced = project.sync().clone();
+        assert_eq!(links(&synced), LINKS, "{}", synced.report());
+        assert_fresh(&synced, &every_file());
+    }
+
+    /// Upstream #2450: the modules deleted and then restored link their
+    /// importers again.
+    #[test]
+    fn pr2450_a_module_restored_after_a_delete_links_them_again() {
+        let mut project = project_of(&every_file()).index();
+        assert_eq!(
+            links(project.graph()),
+            LINKS,
+            "{}",
+            project.graph().report()
+        );
+        for (path, _) in MODULES {
+            project.remove(path);
+        }
+        let graph = project.sync();
+        assert_eq!(links(graph), Vec::<String>::new(), "{}", graph.report());
+        for (path, text) in MODULES {
+            project.write(path, text);
+        }
+        let synced = project.sync().clone();
+        assert_eq!(links(&synced), LINKS, "{}", synced.report());
+        assert_fresh(&synced, &every_file());
+    }
+
+    /// Upstream #2450: an edit that gives each module what its importers
+    /// import links them; an aliased binding (`W`, `GroupsPageWrapper`) is
+    /// written under a name the module never declares.
+    #[test]
+    fn pr2450_an_edit_that_gives_the_module_its_import_links_the_importers() {
+        let stubs: Vec<(&str, &str)> = MODULES
+            .iter()
+            .map(|(path, _)| (*path, stub(path)))
+            .collect();
+        let initial: Vec<(&str, &str)> = IMPORTERS.iter().copied().chain(stubs).collect();
+        let mut project = project_of(&initial).index();
+        for (path, text) in MODULES {
+            project.write(path, text);
+        }
+        let synced = project.sync().clone();
+        assert_eq!(links(&synced), LINKS, "{}", synced.report());
+        assert_fresh(&synced, &every_file());
+    }
+
+    /// Upstream #2450 (vben's `{ VbenFormSchema as FormSchema }`): a binding
+    /// its module never declares is linked by its own name, to the
+    /// declaration a sync adds elsewhere.
+    #[test]
+    fn pr2450_a_binding_its_module_never_declares_links_by_its_own_name() {
+        let initial = [
+            ("src/lib.ts", "export const unrelated = 1;\n"),
+            (
+                "src/form.ts",
+                "import type { VbenFormSchema as FormSchema } from './lib';\nexport type Schema = FormSchema;\n",
+            ),
+        ];
+        let added = (
+            "src/types.ts",
+            "export type FormSchema = { field: string };\n",
+        );
+        let mut project = project_of(&initial).index();
+        project.write(added.0, added.1);
+        let synced = project.sync().clone();
+        let mut to_form_schema: Vec<String> = synced
+            .edges
+            .iter()
+            .filter_map(|edge| {
+                let source = synced.node(&edge.source)?;
+                let target = synced.node(&edge.target)?;
+                (source.file_path == "src/form.ts" && target.name == "FormSchema").then(|| {
+                    format!(
+                        "{} {} -> {} {}",
+                        edge.kind, source.kind, target.kind, target.file_path
+                    )
+                })
+            })
+            .collect();
+        to_form_schema.sort();
+        assert_eq!(
+            to_form_schema,
+            [
+                "imports file -> type_alias src/types.ts",
+                "references type_alias -> type_alias src/types.ts",
+            ],
+            "{}",
+            synced.report()
+        );
+        let mut every_file = initial.to_vec();
+        every_file.push(added);
+        assert_fresh(&synced, &every_file);
+    }
+}
+
 mod pascal_includes {
     use super::support::{Graph, Project};
 
