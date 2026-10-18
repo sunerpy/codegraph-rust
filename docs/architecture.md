@@ -577,7 +577,15 @@ references written as a path (a Liquid `{% render 'price' %}` waits under
 `price` for `snippets/price.liquid`), send their files
 down the whole-file re-resolution lane, which rebuilds an unchanged file's
 resolved edges and keeps what its extraction produced (`contains` edges and
-same-file value references). An edited JavaScript-family module sends down the
+same-file value references). A call through a class name (`User.create()`)
+reads the supertypes each class head names, at most five levels up, which no
+node records: every index and sync keeps a `class_heads:` row per file declaring
+such a type, with what each declaration's own head writes, and a sync seeds the
+types whose entries came, went or changed, re-resolves at their sites the edges
+to methods named like those of a seed's old or new supertypes (five levels up),
+and retries the calls parked through a seed or a type up to four levels below
+it, however many there are; the `class_heads_version` marker is withdrawn and
+restored with the others. An edited JavaScript-family module sends down the
 same lane each importer whose statement of it holds a binding the import did not
 resolve, parked or matched by its name (`W` of `import { Widget as W }` while
 the module declares no `Widget`), read before the module's old nodes go: the

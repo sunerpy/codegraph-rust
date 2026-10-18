@@ -1084,18 +1084,24 @@ matrix! {
     dart_pubspec_path_dependency_picks_a_same_named_package,
     php_call_in_another_case_leaves_a_function_once_a_namesake_in_another_case_appears,
     php_function_called_in_another_case_from_the_global_namespace_reaches_it_once_it_appears,
-    #[ignore = "W5-07: a call through a class name reads its supertypes from the class heads, which no sync lane records"]
     php_inherited_static_call_follows_a_class_head_spread_past_its_third_line,
-    #[ignore = "W5-07: a call through a class name reads its supertypes from the class heads, which no sync lane records"]
     python_inherited_classmethod_follows_a_base_change_in_another_file,
-    #[ignore = "W5-07: a call through a class name reads its supertypes from the class heads, which no sync lane records"]
     python_inherited_classmethod_follows_a_base_change_beside_its_old_target,
-    #[ignore = "W5-07: a call through a class name reads its supertypes from the class heads, which no sync lane records"]
     java_inherited_static_call_follows_a_base_change_in_another_file,
-    #[ignore = "W5-07: a call through a class name reads its supertypes from the class heads, which no sync lane records"]
     csharp_inherited_static_call_follows_a_base_change_in_another_file,
-    #[ignore = "W5-07: a call through a class name reads its supertypes from the class heads, which no sync lane records"]
     swift_inherited_class_method_follows_a_base_change_in_another_file,
+    ruby_class_method_follows_a_base_change_in_another_file,
+    kotlin_class_name_call_follows_a_base_change_in_another_file,
+    dart_class_name_call_reaches_no_inherited_static_member,
+    scala_object_call_follows_a_base_change_in_another_file,
+    objc_class_message_follows_a_base_change_in_another_file,
+    pascal_class_function_call_follows_a_base_change_in_another_file,
+    typescript_static_call_through_an_imported_subclass_reads_no_head,
+    python_inherited_classmethod_leaves_a_deleted_base,
+    python_inherited_classmethod_follows_a_middle_class_base_change,
+    python_inherited_classmethod_leaves_a_base_pushed_past_five_levels,
+    python_parked_class_method_reaches_a_base_its_middle_class_gains,
+    python_inherited_classmethod_follows_a_base_two_levels_above_the_changed_head,
     typescript_value_reader_body_edit,
     astro_frontmatter_call_body_edit,
     go_value_initializer_body_edit,

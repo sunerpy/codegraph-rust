@@ -81,6 +81,12 @@ fn first_line<'f>(facts: &'f SourceFacts, node: &Node) -> Option<&'f str> {
     (index < facts.line_count()).then(|| facts.line(index))
 }
 
+/// The superclass the `@interface` on `decl`'s first line writes, the part
+/// one Objective-C class declaration adds to [`objc_supertypes_of`].
+pub(crate) fn written_superclass_of(facts: &SourceFacts, decl: &Node) -> Option<String> {
+    first_line(facts, decl).and_then(written_superclass)
+}
+
 /// The superclasses an Objective-C class's `@interface` declarations name,
 /// or its UIKit / AppKit superclass when none does (upstream
 /// `objcSupertypesOf`).

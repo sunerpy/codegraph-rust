@@ -9,6 +9,7 @@ use std::sync::OnceLock;
 use codegraph_core::types::{Language, Node, NodeKind};
 use regex::Regex;
 
+use crate::source_facts::SourceFacts;
 use crate::types::ResolutionContext;
 
 /// Lines `start_line - 1 .. start_line - 1 + count` of `node`'s file joined
@@ -22,6 +23,20 @@ fn head_lines(
     let Some(facts) = context.source_facts(&node.file_path) else {
         return String::new();
     };
+    let start = usize::try_from(node.start_line)
+        .unwrap_or(1)
+        .saturating_sub(1);
+    let end = start.saturating_add(count).min(facts.line_count());
+    if start >= end {
+        return String::new();
+    }
+    facts.join_lines(start, end, separator)
+}
+
+/// Lines `start_line - 1 .. start_line - 1 + count` of `node` in `facts`
+/// joined by `separator`, clamped to the file ([`head_lines`] over facts
+/// already read).
+fn facts_lines(facts: &SourceFacts, node: &Node, count: usize, separator: &str) -> String {
     let start = usize::try_from(node.start_line)
         .unwrap_or(1)
         .saturating_sub(1);
@@ -59,20 +74,25 @@ pub(crate) fn declared_supertypes(class: &Node, context: &dyn ResolutionContext)
         Language::Scala => return scala_supertypes_of(&class.name, context),
         _ => {}
     }
+    three_line_supertypes(class.language, &head_lines(class, 3, " ", context))
+}
+
+/// The supertypes the first three lines of a Pascal, Python, Ruby, PHP or
+/// TS/JS type declaration, `head`, name.
+fn three_line_supertypes(language: Language, head: &str) -> Vec<String> {
     static PASCAL: OnceLock<Regex> = OnceLock::new();
     static PYTHON: OnceLock<Regex> = OnceLock::new();
     static PYTHON_KEYWORD: OnceLock<Regex> = OnceLock::new();
     static RUBY: OnceLock<Regex> = OnceLock::new();
     static EXTENDS: OnceLock<Regex> = OnceLock::new();
-    let head = head_lines(class, 3, " ", context);
-    let clause = match class.language {
+    let clause = match language {
         Language::Pascal => PASCAL
             .get_or_init(|| Regex::new(r"(?i)=\s*class\s*\(([^)]*)\)").expect("pascal head"))
-            .captures(&head)
+            .captures(head)
             .map(|c| c[1].to_string()),
         Language::Python => PYTHON
             .get_or_init(|| Regex::new(r"\bclass\s+\w+\s*\(([^)]*)\)").expect("python head"))
-            .captures(&head)
+            .captures(head)
             .map(|c| {
                 PYTHON_KEYWORD
                     .get_or_init(|| Regex::new(r"\w+\s*=\s*[\w.]+").expect("python keyword"))
@@ -81,7 +101,7 @@ pub(crate) fn declared_supertypes(class: &Node, context: &dyn ResolutionContext)
             }),
         Language::Ruby => RUBY
             .get_or_init(|| Regex::new(r"\bclass\s+[\w:]+\s*<\s*([\w:]+)").expect("ruby head"))
-            .captures(&head)
+            .captures(head)
             .map(|c| c[1].to_string()),
         Language::Php
         | Language::TypeScript
@@ -89,11 +109,77 @@ pub(crate) fn declared_supertypes(class: &Node, context: &dyn ResolutionContext)
         | Language::JavaScript
         | Language::Jsx => EXTENDS
             .get_or_init(|| Regex::new(r"\bextends\s+([\w.\\]+)").expect("extends head"))
-            .captures(&head)
+            .captures(head)
             .map(|c| c[1].to_string()),
         _ => None,
     };
     clause.map(|clause| head_names(&clause)).unwrap_or_default()
+}
+
+/// A node an S1 walk starts from or steps to in the languages whose heads it
+/// reads per declaration: a class, struct, union or interface.
+fn is_method_owner_kind(node: &Node) -> bool {
+    matches!(
+        node.kind,
+        NodeKind::Class | NodeKind::Struct | NodeKind::Union | NodeKind::Interface
+    )
+}
+
+/// The supertypes `decl` writes in its own head: what one declaration adds
+/// to [`declared_supertypes`] of its type, read from its own file's
+/// `facts`, or `None` for a node no such read covers (the sync's
+/// `class_heads` rows hold these, W5-07). In the Java-family, Pascal,
+/// Python, Ruby, PHP and TS/JS heads a class, struct, union or interface is
+/// read as itself; Dart, Swift, Objective-C and Scala read every declaration
+/// of the type's name, one of which `decl` is, and [`name_supertypes`] adds
+/// what the name alone brings.
+pub fn declaration_heads(facts: &SourceFacts, decl: &Node) -> Option<Vec<String>> {
+    match decl.language {
+        Language::Java | Language::CSharp | Language::Kotlin => {
+            is_method_owner_kind(decl).then(|| class_head_supertypes_in(facts, decl))
+        }
+        Language::Dart => is_dart_type(decl).then(|| dart_declaration_supertypes(facts, decl)),
+        Language::Swift => crate::swift_scope::is_swift_type_kind(decl.kind)
+            .then(|| swift_head_in(facts, decl).supers),
+        Language::ObjC => (decl.kind == NodeKind::Class).then(|| {
+            crate::objc_scope::written_superclass_of(facts, decl)
+                .into_iter()
+                .collect()
+        }),
+        Language::Scala => is_scala_type(decl).then(|| scala_declaration_supertypes(facts, decl)),
+        Language::Pascal
+        | Language::Python
+        | Language::Ruby
+        | Language::Php
+        | Language::TypeScript
+        | Language::Tsx
+        | Language::JavaScript
+        | Language::Jsx => is_method_owner_kind(decl)
+            .then(|| three_line_supertypes(decl.language, &facts_lines(facts, decl, 3, " "))),
+        _ => None,
+    }
+}
+
+/// What [`declared_supertypes`] reads for a `language` type named `name`
+/// beyond its declarations' own heads: a Swift standard collection's
+/// refinements or a UIKit / AppKit class's superclass, and for
+/// Objective-C that superclass when no declaration writes one
+/// (`written` is false).
+pub fn name_supertypes(language: Language, name: &str, written: bool) -> Vec<String> {
+    match language {
+        Language::Swift => match crate::swift_scope::swift_std_supers(name) {
+            Some(supers) => supers.iter().map(|s| (*s).to_string()).collect(),
+            None => crate::swift_scope::objc_system_super(name)
+                .map(str::to_string)
+                .into_iter()
+                .collect(),
+        },
+        Language::ObjC if !written => crate::objc_scope::system_superclass(name)
+            .map(str::to_string)
+            .into_iter()
+            .collect(),
+        _ => Vec::new(),
+    }
 }
 
 /// The simple names in a supertype clause: each `[A-Za-z_][\w.:\\]*` by its
@@ -232,6 +318,22 @@ fn is_dart_type(node: &Node) -> bool {
 /// The simple names a Dart type's declarations extend, mix in, implement or
 /// sit `on` (upstream `dartSupertypesOf` / `dartHeadOf`).
 fn dart_supertypes_of(type_name: &str, context: &dyn ResolutionContext) -> Vec<String> {
+    let mut names = Vec::new();
+    for decl in context.get_nodes_by_name_shared(type_name) {
+        if !is_dart_type(&decl) {
+            continue;
+        }
+        if let Some(facts) = context.source_facts(&decl.file_path) {
+            names.extend(dart_declaration_supertypes(&facts, &decl));
+        }
+    }
+    names
+}
+
+/// The simple names one Dart type declaration extends, mixes in, implements
+/// or sits `on`, read from its own head (the per-declaration part of
+/// [`dart_supertypes_of`]).
+fn dart_declaration_supertypes(facts: &SourceFacts, decl: &Node) -> Vec<String> {
     static KEYWORD: OnceLock<Regex> = OnceLock::new();
     static CLAUSE: OnceLock<Regex> = OnceLock::new();
     static WORD: OnceLock<Regex> = OnceLock::new();
@@ -241,41 +343,33 @@ fn dart_supertypes_of(type_name: &str, context: &dyn ResolutionContext) -> Vec<S
         Regex::new(r"(?s)(?:\b(?:extends|with|implements|on)\b|=)(.*)$").expect("dart clause")
     });
     let word = WORD.get_or_init(|| Regex::new(r"[A-Za-z_$][A-Za-z0-9_$]*").expect("dart word"));
-    let mut names = Vec::new();
-    for decl in context.get_nodes_by_name_shared(type_name) {
-        if !is_dart_type(&decl) {
-            continue;
+    let span = usize::try_from(decl.end_line - decl.start_line + 1)
+        .unwrap_or(1)
+        .clamp(1, 41);
+    let text = strip_c_comments(&facts_lines(facts, decl, span, "\n"));
+    let mut depth = 0usize;
+    let mut flat = String::new();
+    for ch in text.chars() {
+        match ch {
+            '<' => depth += 1,
+            '>' => depth = depth.saturating_sub(1),
+            '{' | ';' if depth == 0 => break,
+            _ if depth == 0 => flat.push(ch),
+            _ => {}
         }
-        let span = usize::try_from(decl.end_line - decl.start_line + 1)
-            .unwrap_or(1)
-            .clamp(1, 41);
-        let text = strip_c_comments(&head_lines(&decl, span, "\n", context));
-        let mut depth = 0usize;
-        let mut flat = String::new();
-        for ch in text.chars() {
-            match ch {
-                '<' => depth += 1,
-                '>' => depth = depth.saturating_sub(1),
-                '{' | ';' if depth == 0 => break,
-                _ if depth == 0 => flat.push(ch),
-                _ => {}
-            }
-        }
-        let head = keyword
-            .find(&flat)
-            .map_or(flat.as_str(), |m| &flat[m.start()..]);
-        let clause = clause_re
-            .captures(head)
-            .map(|c| c[1].to_string())
-            .unwrap_or_default();
-        names.extend(
-            word.find_iter(&clause)
-                .map(|m| m.as_str())
-                .filter(|w| !matches!(*w, "extends" | "with" | "implements" | "on"))
-                .map(str::to_string),
-        );
     }
-    names
+    let head = keyword
+        .find(&flat)
+        .map_or(flat.as_str(), |m| &flat[m.start()..]);
+    let clause = clause_re
+        .captures(head)
+        .map(|c| c[1].to_string())
+        .unwrap_or_default();
+    word.find_iter(&clause)
+        .map(|m| m.as_str())
+        .filter(|w| !matches!(*w, "extends" | "with" | "implements" | "on"))
+        .map(str::to_string)
+        .collect()
 }
 
 /// A Swift declaration's head, read up to its body with comments, attribute
@@ -442,7 +536,140 @@ pub(crate) fn scala_declaration_supertypes(
 
 #[cfg(test)]
 mod tests {
-    use super::clause_type_names;
+    use super::{clause_type_names, declaration_heads, name_supertypes};
+    use crate::source_facts::SourceFacts;
+    use codegraph_core::types::{Language, Node, NodeKind};
+
+    fn decl(language: Language, kind: NodeKind, name: &str, lines: (i64, i64)) -> Node {
+        Node {
+            id: format!("{}:{name}", kind.as_str()),
+            kind,
+            name: name.to_string(),
+            qualified_name: name.to_string(),
+            file_path: "f".to_string(),
+            language,
+            start_line: lines.0,
+            end_line: lines.1,
+            start_column: 0,
+            end_column: 0,
+            docstring: None,
+            signature: None,
+            visibility: None,
+            is_exported: false,
+            is_async: false,
+            is_static: false,
+            is_abstract: false,
+            decorators: Vec::new(),
+            type_parameters: Vec::new(),
+            return_type: None,
+            updated_at: 0,
+        }
+    }
+
+    fn heads(text: &str, node: &Node) -> Option<Vec<String>> {
+        declaration_heads(&SourceFacts::new(text.into()), node)
+    }
+
+    /// W5-07: each language's head is read as `declared_supertypes` reads
+    /// it, one declaration at a time: the TS/JS head's first three lines, a
+    /// Java head up to its body, a Dart type's `extends`/`with`/
+    /// `implements`, a Swift extension's conformances, an Objective-C
+    /// `@interface`'s superclass, a Scala object's `extends`; a node no walk
+    /// reads has none.
+    #[test]
+    fn declaration_heads_read_each_head_as_the_walk_does() {
+        use Language::*;
+        assert_eq!(
+            heads(
+                "class User(Base, metaclass=Meta):\n    pass\n",
+                &decl(Python, NodeKind::Class, "User", (1, 2))
+            ),
+            Some(vec!["Base".to_string()])
+        );
+        // Past the third line a TS/JS head is not read.
+        assert_eq!(
+            heads(
+                "export class User\n\n\nextends Base {}\n",
+                &decl(TypeScript, NodeKind::Class, "User", (1, 4))
+            ),
+            Some(Vec::new())
+        );
+        assert_eq!(
+            heads(
+                "public class User\n    extends Base\n    implements Runnable {\n}\n",
+                &decl(Java, NodeKind::Class, "User", (1, 4))
+            ),
+            Some(vec!["Base".to_string(), "Runnable".to_string()])
+        );
+        assert_eq!(
+            heads(
+                "class User extends Base with Mixin implements Api {}\n",
+                &decl(Dart, NodeKind::Class, "User", (1, 1))
+            ),
+            Some(vec![
+                "Base".to_string(),
+                "Mixin".to_string(),
+                "Api".to_string()
+            ])
+        );
+        assert_eq!(
+            heads(
+                "extension User: Codable {\n}\n",
+                &decl(Swift, NodeKind::Class, "User", (1, 2))
+            ),
+            Some(vec!["Codable".to_string()])
+        );
+        assert_eq!(
+            heads(
+                "@interface User : Base <Api>\n@end\n",
+                &decl(ObjC, NodeKind::Class, "User", (1, 2))
+            ),
+            Some(vec!["Base".to_string()])
+        );
+        assert_eq!(
+            heads(
+                "object User extends Base with Api\n",
+                &decl(Scala, NodeKind::Module, "User", (1, 1))
+            ),
+            Some(vec!["Base".to_string(), "Api".to_string()])
+        );
+        assert_eq!(
+            heads(
+                "def make():\n    pass\n",
+                &decl(Python, NodeKind::Function, "make", (1, 2))
+            ),
+            None
+        );
+        assert_eq!(
+            heads(
+                "package main\n",
+                &decl(Go, NodeKind::Struct, "User", (1, 1))
+            ),
+            None
+        );
+    }
+
+    /// W5-07: what a walk reads for a name beyond its declarations' heads: a
+    /// Swift standard collection's refinements, a UIKit class's superclass,
+    /// and for Objective-C that superclass only when no declaration writes
+    /// one.
+    #[test]
+    fn name_supertypes_add_what_the_name_alone_brings() {
+        assert_eq!(
+            name_supertypes(Language::Swift, "Collection", true),
+            ["Sequence"]
+        );
+        assert_eq!(
+            name_supertypes(Language::Swift, "UIViewController", true),
+            ["UIResponder"]
+        );
+        assert_eq!(
+            name_supertypes(Language::ObjC, "UIViewController", false),
+            ["UIResponder"]
+        );
+        assert!(name_supertypes(Language::ObjC, "UIViewController", true).is_empty());
+        assert!(name_supertypes(Language::Python, "Collection", false).is_empty());
+    }
 
     #[test]
     fn a_clause_names_each_type_before_a_comma_the_end_or_implements() {

@@ -576,6 +576,9 @@ fn sync_paths_with_store(
     // And for the PHP files whose calls walk other files' class heads:
     // every PHP file is re-resolved once (W4-PHP-01).
     let php_bootstrap = crate::php_heads::needs_bootstrap(store)?;
+    // And for the calls through a class name whose walk reads other files'
+    // class heads: every file such a walk reads is re-resolved once (W5-07).
+    let class_heads_bootstrap = crate::class_heads::needs_bootstrap(store)?;
     // And for the PHP, Pascal and CFML references retried by a name in any
     // case: every file of those languages is re-resolved once (W4-PHP-03).
     let case_bootstrap = crate::case_folded::needs_bootstrap(store)?;
@@ -691,6 +694,7 @@ fn sync_paths_with_store(
         || solidity_bootstrap
         || rust_bootstrap
         || php_bootstrap
+        || class_heads_bootstrap
         || case_bootstrap
         || lua_bootstrap
         || r_bootstrap
@@ -978,6 +982,40 @@ fn sync_paths_with_store(
             }
         }
         changed_names.note_all(php.names.iter().cloned());
+        // What a call through a class name reads of the heads its walk climbs
+        // (upstream #2180, W5-07): the edges to the methods the walk through a
+        // changed head can reach re-resolve at their sites, in either file, and
+        // the calls parked through a receiver below it are retried.
+        let class_heads = crate::class_heads::class_head_refresh(
+            store,
+            project_root,
+            scope.options.max_file_size,
+            &changed_names.class_heads,
+            &reindexed,
+            &changed_names.removed_files,
+            class_heads_bootstrap,
+        )?;
+        for file in &class_heads.files {
+            dependent_sites.remove(file);
+            dependent_fallbacks.insert(file.clone());
+        }
+        for affected in &class_heads.sites {
+            merge_dependent_site(
+                &mut dependent_sites,
+                &mut dependent_fallbacks,
+                affected.clone(),
+            );
+        }
+        let head_target_names: Vec<String> = class_heads.names.iter().cloned().collect();
+        for affected in store
+            .reference_sites_of_edges_to_named_targets(&head_target_names)?
+            .into_iter()
+            .chain(store.reference_sites_of_same_file_edges_to_named_targets(&head_target_names)?)
+        {
+            if !reindexed.contains(&affected.file_path) {
+                merge_dependent_site(&mut dependent_sites, &mut dependent_fallbacks, affected);
+            }
+        }
         // What a bare Dart call reads of the class heads of a changed file's
         // types, and a core method name of an extension's `on` type
         // (W4-DART-01).
@@ -1276,6 +1314,7 @@ fn sync_paths_with_store(
         objc.write_rows(store)?;
         go.write_rows(store)?;
         php.write_rows(store)?;
+        class_heads.write_rows(store)?;
         dart.write_rows(store)?;
         dart_libraries.write_rows(store)?;
         lua.write_rows(store)?;
@@ -1295,6 +1334,7 @@ fn sync_paths_with_store(
         crate::go_heads::write_marker(store)?;
         crate::rust_receivers::write_marker(store)?;
         crate::php_heads::write_marker(store)?;
+        crate::class_heads::write_marker(store)?;
         crate::case_folded::write_marker(store)?;
         crate::lua_modules::write_marker(store)?;
         crate::r_bindings::write_marker(store)?;
@@ -1735,6 +1775,7 @@ fn remove_tracked_file(
     changed_names.objc.note(store, relative, None)?;
     changed_names.go.note(store, relative, None)?;
     changed_names.php.note(store, relative, &old_nodes, None)?;
+    changed_names.class_heads.note(store, relative, None)?;
     changed_names.lua.note(store, relative, None)?;
     changed_names.dart.note(store, relative, None)?;
     changed_names.dart_libraries.note(store, relative, None)?;
@@ -2195,6 +2236,11 @@ fn reextract_into_store(
         &old_nodes,
         Some((file.language, source, &result.nodes)),
     )?;
+    changed_names.class_heads.note(
+        store,
+        relative,
+        Some((file.language, source, &result.nodes)),
+    )?;
     changed_names.lua.note(
         store,
         relative,
@@ -2384,6 +2430,9 @@ struct ChangedNames {
     /// What the changed files held that a PHP call in other files reads:
     /// class, trait, interface and enum heads (W4-PHP-01).
     php: crate::php_heads::PhpChanges,
+    /// What the changed files' type declarations' heads were and are, for a
+    /// walk from a class name (W5-07).
+    class_heads: crate::class_heads::ClassHeadChanges,
     /// What the changed files held that a Lua call in other files reads:
     /// their locals and module surface (W4-LUA-01).
     lua: crate::lua_modules::LuaChanges,
@@ -2441,6 +2490,7 @@ impl ChangedNames {
             crate::go_heads::withdraw_marker(store)?;
             crate::rust_receivers::withdraw_marker(store)?;
             crate::php_heads::withdraw_marker(store)?;
+            crate::class_heads::withdraw_marker(store)?;
             crate::case_folded::withdraw_marker(store)?;
             crate::lua_modules::withdraw_marker(store)?;
             crate::r_bindings::withdraw_marker(store)?;
@@ -4643,6 +4693,154 @@ pub(crate) mod tests {
         sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
         assert_eq!(php_marker(&db), version);
         assert_eq!(php_rows(&db), rows);
+        assert_eq!(edge_projection(&db), expected);
+    }
+
+    fn class_heads_marker(db: &Path) -> Option<String> {
+        Store::open(db)
+            .unwrap()
+            .get_project_metadata(crate::class_heads::VERSION_KEY)
+            .unwrap()
+    }
+
+    fn class_head_rows(db: &Path) -> Vec<(String, String)> {
+        Store::open(db)
+            .unwrap()
+            .project_metadata_with_prefix(crate::class_heads::ROW_KEY_PREFIX)
+            .unwrap()
+    }
+
+    const PY_BASE: (&str, &str) = (
+        "pkg/base.py",
+        "class Base:\n    @classmethod\n    def create(cls):\n        return cls()\n",
+    );
+    const PY_OTHER: (&str, &str) = (
+        "pkg/other.py",
+        "class Other:\n    @classmethod\n    def create(cls):\n        return cls()\n",
+    );
+    const PY_USER_BASE: (&str, &str) = (
+        "pkg/user.py",
+        "from pkg.base import Base\nfrom pkg.other import Other\n\n\nclass User(Base):\n    pass\n",
+    );
+    const PY_USER_OTHER: (&str, &str) = (
+        "pkg/user.py",
+        "from pkg.base import Base\nfrom pkg.other import Other\n\n\nclass User(Other):\n    pass\n",
+    );
+    const PY_SERVICE: (&str, &str) = (
+        "pkg/service.py",
+        "from pkg.user import User\n\n\ndef make():\n    return User.create()\n",
+    );
+    const PY_SPARE: (&str, &str) = ("pkg/spare.py", "def idle():\n    return 0\n");
+    const PY_SPARE_EDITED: (&str, &str) = ("pkg/spare.py", "def idle():\n    return 1\n");
+
+    /// W5-07: a sync failing after its mutations leaves the class-head marker
+    /// away, so the next sync, with nothing changed or with an unrelated
+    /// change, re-resolves every file a walk from a class name reads and
+    /// rebuilds the rows: `User.create()`, whose class now extends the other
+    /// base, ends where a fresh index puts it.
+    #[test]
+    fn a_class_head_sync_failing_after_its_mutations_leaves_the_next_one_to_reconcile() {
+        let to_other = |db: &Path| {
+            edge_projection(db)
+                .iter()
+                .any(|edge| edge.contains("make -[calls]-> pkg/other.py:Other::create"))
+        };
+        for unrelated in [false, true] {
+            let dir = TestDir::new(if unrelated {
+                "class-heads-fail-unrelated"
+            } else {
+                "class-heads-fail"
+            });
+            let db = default_db_path(dir.path()).unwrap();
+            let initial = [PY_BASE, PY_OTHER, PY_USER_BASE, PY_SERVICE, PY_SPARE];
+            write_files(dir.path(), &initial);
+            sync_changed_paths(dir.path(), &db, initial.iter().map(|(path, _)| *path)).unwrap();
+            assert_eq!(
+                class_heads_marker(&db),
+                Some(crate::class_heads::VERSION.to_string())
+            );
+            assert!(!to_other(&db), "{:#?}", edge_projection(&db));
+
+            write_files(dir.path(), &[PY_USER_OTHER]);
+            FAIL_BEFORE_RESOLUTION.with(|fail| fail.set(true));
+            let failed = sync_changed_paths(dir.path(), &db, [PY_USER_OTHER.0]);
+            FAIL_BEFORE_RESOLUTION.with(|fail| fail.set(false));
+            assert!(failed.is_err(), "the injected failure must stop the sync");
+            assert_eq!(
+                class_heads_marker(&db),
+                None,
+                "a failed sync leaves the marker away"
+            );
+
+            let spare = if unrelated {
+                write_files(dir.path(), &[PY_SPARE_EDITED]);
+                sync_changed_paths(dir.path(), &db, [PY_SPARE.0]).unwrap();
+                PY_SPARE_EDITED
+            } else {
+                sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
+                PY_SPARE
+            };
+            assert_eq!(
+                class_heads_marker(&db),
+                Some(crate::class_heads::VERSION.to_string())
+            );
+            let fresh = [PY_BASE, PY_OTHER, PY_USER_OTHER, PY_SERVICE, spare];
+            let name = if unrelated {
+                "class-heads-fresh-unrelated"
+            } else {
+                "class-heads-fresh"
+            };
+            assert_eq!(edge_projection(&db), fresh_edges(name, &fresh));
+            assert!(to_other(&db), "{:#?}", edge_projection(&db));
+        }
+    }
+
+    /// W5-07: an index whose class-head marker and rows alone are gone (the
+    /// other markers written back) has every file a walk reads re-resolved
+    /// and every row rebuilt by its next sync, even one with nothing
+    /// changed: the class-name call an older sync lost comes back.
+    #[test]
+    fn an_index_without_only_the_class_head_marker_rebuilds_its_rows_with_nothing_changed() {
+        let version = Some(crate::class_heads::VERSION.to_string());
+        let dir = TestDir::new("class-heads-bootstrap");
+        let db = default_db_path(dir.path()).unwrap();
+        let initial = [PY_BASE, PY_OTHER, PY_USER_BASE, PY_SERVICE, PY_SPARE];
+        write_files(dir.path(), &initial);
+        sync_changed_paths(dir.path(), &db, initial.iter().map(|(path, _)| *path)).unwrap();
+        assert_eq!(class_heads_marker(&db), version);
+        let rows = class_head_rows(&db);
+        assert!(
+            rows.iter().any(|(key, _)| key == "class_heads:pkg/user.py"),
+            "{rows:#?}"
+        );
+        let expected = edge_projection(&db);
+        {
+            let store = Store::open(&db).unwrap();
+            let dropped = store
+                .connection()
+                .execute(
+                    "DELETE FROM edges WHERE kind = 'calls' AND target = (SELECT id FROM nodes \
+                     WHERE qualified_name = 'Base::create')",
+                    [],
+                )
+                .unwrap();
+            assert_eq!(dropped, 1, "the call edge an older sync lost");
+            store
+                .delete_project_metadata_with_prefix(crate::class_heads::ROW_KEY_PREFIX)
+                .unwrap();
+            store
+                .delete_project_metadata(crate::class_heads::VERSION_KEY)
+                .unwrap();
+        }
+        assert_ne!(edge_projection(&db), expected);
+        assert_eq!(
+            php_marker(&db),
+            Some(crate::php_heads::VERSION.to_string()),
+            "the other markers stay"
+        );
+        sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
+        assert_eq!(class_heads_marker(&db), version);
+        assert_eq!(class_head_rows(&db), rows);
         assert_eq!(edge_projection(&db), expected);
     }
 

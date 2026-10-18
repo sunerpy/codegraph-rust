@@ -1758,6 +1758,80 @@ fn outdated_migration_writes_the_php_head_rows_of_index_force() {
     );
 }
 
+/// W5-07: a migration writes the class-head rows (each type declaration's
+/// language, name and the supertypes its own head writes) and their marker
+/// as `index --force` does.
+#[test]
+fn outdated_migration_writes_the_class_head_rows_of_index_force() {
+    let dir = TestDir::new("outdated-class-heads");
+    let project = dir.path().join("mini");
+    for (path, contents) in [
+        (
+            "pkg/user.py",
+            "from pkg.base import Base\n\n\nclass User(Base):\n    pass\n",
+        ),
+        (
+            "pkg/base.py",
+            "class Base:\n    @classmethod\n    def create(cls):\n        return cls()\n",
+        ),
+        ("pkg/helpers.py", "def twice(x):\n    return x * 2\n"),
+    ] {
+        let full = project.join(path);
+        fs::create_dir_all(full.parent().unwrap()).expect("create the source directory");
+        fs::write(full, contents).expect("write a source file");
+    }
+    let run = cli(&["init", project.to_str().unwrap()]);
+    assert!(
+        run.ok,
+        "setup: `codegraph init` must succeed (stdout={}, stderr={})",
+        run.stdout, run.stderr
+    );
+    let paths = IndexPaths::resolve(&project, None).expect("resolve v2 paths");
+    stage_state_slot(
+        &paths,
+        100,
+        CURRENT_STORAGE_PROTOCOL,
+        CURRENT_EXTRACTION_VERSION - 1,
+        "current",
+    );
+    let run = cli(&["sync", project.to_str().unwrap()]);
+    assert!(
+        run.ok,
+        "sync must migrate an Outdated namespace: stdout={}, stderr={}",
+        run.stdout, run.stderr
+    );
+    let (_scratch, peer) = fresh_force_peer("outdated-class-heads", &project);
+    let head_rows = |paths: &IndexPaths| {
+        Store::open_for_read(paths, deadline(), || false)
+            .expect("readable namespace")
+            .project_metadata_with_prefix("class_heads")
+            .expect("class head rows")
+    };
+    let migrated = head_rows(&paths);
+    // No row for a file that declares no type.
+    assert_eq!(
+        migrated
+            .iter()
+            .map(|(key, _)| key.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "class_heads:pkg/base.py",
+            "class_heads:pkg/user.py",
+            "class_heads_version",
+        ],
+        "a migration writes the head rows and their marker: {migrated:?}"
+    );
+    assert!(
+        migrated[1].1.contains("\"User\"") && migrated[1].1.contains("\"Base\""),
+        "a row names the type and the supertype its head writes: {migrated:?}"
+    );
+    assert_eq!(
+        migrated,
+        head_rows(&IndexPaths::resolve(&peer, None).expect("resolve peer v2 paths")),
+        "a forced migration must write the class-head rows of `index --force`"
+    );
+}
+
 /// Migration is a from-source rebuild, so a tracked file that no longer exists
 /// on disk disappears from the migrated index and the result still equals a
 /// fresh `index --force` over the surviving tree.

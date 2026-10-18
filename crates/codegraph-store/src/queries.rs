@@ -1419,6 +1419,36 @@ impl Store {
             .collect())
     }
 
+    /// The unresolved references written through one of `receivers`
+    /// (`User.create`, `User::create`): a name that starts with the receiver
+    /// and then `.` or `::`, each found by a range over `idx_unresolved_name`,
+    /// however many there are (W5-07). Each row once, ordered by id.
+    pub fn unresolved_refs_by_receivers(
+        &self,
+        receivers: &[String],
+    ) -> rusqlite::Result<Vec<UnresolvedRef>> {
+        let mut out: BTreeMap<i64, UnresolvedRef> = BTreeMap::new();
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT * FROM unresolved_refs WHERE reference_name >= ?1 AND reference_name < ?2",
+        )?;
+        for receiver in receivers {
+            // The byte after each separator bounds the range: `.` is 0x2E and
+            // `/` 0x2F, `:` is 0x3A and `;` 0x3B.
+            for (low, high) in [
+                (format!("{receiver}."), format!("{receiver}/")),
+                (format!("{receiver}::"), format!("{receiver}:;")),
+            ] {
+                for reference in stmt.query_map(params![low, high], row_to_unresolved_ref)? {
+                    let reference = reference?;
+                    if let Some(id) = reference.id {
+                        out.entry(id).or_insert(reference);
+                    }
+                }
+            }
+        }
+        Ok(out.into_values().collect())
+    }
+
     /// The parked imports a sync that adds files should retry (upstream
     /// `getRetryableFailedImports`, #2392). An import names a file, a folder or
     /// a namespace, which the symbol-name lookup cannot match, so it is found by

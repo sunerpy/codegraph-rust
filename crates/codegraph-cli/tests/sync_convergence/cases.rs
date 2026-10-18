@@ -6067,9 +6067,9 @@ pub fn dart_bare_call_leaves_an_extension_member_once_the_extension_is_unnamed()
 //
 // Upstream #2180 (W3-06): a call through a class name reaches the method the
 // class inherits, walking the supertypes each class's head names, read from
-// source (`class_heads::declared_supertypes`). No sync lane records those
-// heads, so a head changed in one file leaves such a call in an unchanged
-// file at its old target (W5-07 adds the lane).
+// source (`class_heads::declared_supertypes`). The `class_heads` lane records
+// those heads, so a head changed in one file moves such a call in an
+// unchanged file (W5-07).
 
 /// A PHP class head spread over more lines: `extends Base` past the head's
 /// third line, which `declared_supertypes` reads, though within the fifth,
@@ -6222,6 +6222,288 @@ pub fn swift_inherited_class_method_follows_a_base_change_in_another_file() -> C
         .write("src/User.swift", "class User: Other {\n}\n")
         .edge_before("function make", "calls", "method Base::create")
         .edge_after("function make", "calls", "method Other::create")
+}
+
+/// The same for a Ruby class's `<` (converged before W5-07: the Ruby lane's
+/// rows hold the same heads).
+pub fn ruby_class_method_follows_a_base_change_in_another_file() -> Case {
+    Case::new(Change::EditHeritage, &[Language::Ruby])
+        .file(
+            "lib/base.rb",
+            "class Base\n  def self.create\n    new\n  end\nend\n",
+        )
+        .file(
+            "lib/other.rb",
+            "class Other\n  def self.create\n    new\n  end\nend\n",
+        )
+        .file("lib/user.rb", "class User < Base\nend\n")
+        .file("lib/service.rb", "def make\n  User.create\nend\n")
+        .write("lib/user.rb", "class User < Other\nend\n")
+        .edge_before("function make", "calls", "method Base::create")
+        .edge_after("function make", "calls", "method Other::create")
+}
+
+/// The same for a Kotlin class's supertype list.
+pub fn kotlin_class_name_call_follows_a_base_change_in_another_file() -> Case {
+    Case::new(Change::EditHeritage, &[Language::Kotlin])
+        .file(
+            "src/Base.kt",
+            "open class Base {\n    fun create(): Int = 1\n}\n",
+        )
+        .file(
+            "src/Other.kt",
+            "open class Other {\n    fun create(): Int = 2\n}\n",
+        )
+        .file("src/User.kt", "class User : Base()\n")
+        .file("src/Service.kt", "fun make(): Int = User.create()\n")
+        .write("src/User.kt", "class User : Other()\n")
+        .edge_before("function make", "calls", "method Base::create")
+        .edge_after("function make", "calls", "method Other::create")
+}
+
+/// Not through the walk: a Dart call through a type's name reaches that
+/// type's own static members only (W4-DART-03c), so `User.create()` stays
+/// unresolved whichever base `User` extends.
+pub fn dart_class_name_call_reaches_no_inherited_static_member() -> Case {
+    Case::new(Change::EditHeritage, &[Language::Dart])
+        .file(
+            "lib/base.dart",
+            "class Base {\n  static int create() => 1;\n}\n",
+        )
+        .file(
+            "lib/other.dart",
+            "class Other {\n  static int create() => 2;\n}\n",
+        )
+        .file(
+            "lib/user.dart",
+            "import 'base.dart';\nimport 'other.dart';\n\nclass User extends Base {}\n",
+        )
+        .file(
+            "lib/service.dart",
+            "import 'user.dart';\n\nint make() => User.create();\n",
+        )
+        .write(
+            "lib/user.dart",
+            "import 'base.dart';\nimport 'other.dart';\n\nclass User extends Other {}\n",
+        )
+        .no_edge_after("function make", "calls", "method Base::create")
+        .no_edge_after("function make", "calls", "method Other::create")
+}
+
+/// The same for a Scala object's `extends`.
+pub fn scala_object_call_follows_a_base_change_in_another_file() -> Case {
+    Case::new(Change::EditHeritage, &[Language::Scala])
+        .file(
+            "src/Base.scala",
+            "abstract class Base {\n  def create(): Int = 1\n}\n",
+        )
+        .file(
+            "src/Other.scala",
+            "abstract class Other {\n  def create(): Int = 2\n}\n",
+        )
+        .file("src/User.scala", "object User extends Base\n")
+        .file(
+            "src/Service.scala",
+            "object Service {\n  def make(): Int = User.create()\n}\n",
+        )
+        .write("src/User.scala", "object User extends Other\n")
+        .edge_before("method Service::make", "calls", "method Base::create")
+        .edge_after("method Service::make", "calls", "method Other::create")
+}
+
+/// The same for an Objective-C `@interface`'s superclass (converged before
+/// W5-07: the Objective-C lane's rows hold the same superclass).
+pub fn objc_class_message_follows_a_base_change_in_another_file() -> Case {
+    Case::new(Change::EditHeritage, &[Language::ObjC])
+        .file(
+            "src/Base.m",
+            "@interface Base : NSObject\n+ (int)create;\n@end\n\n@implementation Base\n+ (int)create { return 1; }\n@end\n",
+        )
+        .file(
+            "src/Other.m",
+            "@interface Other : NSObject\n+ (int)create;\n@end\n\n@implementation Other\n+ (int)create { return 2; }\n@end\n",
+        )
+        .file(
+            "src/User.m",
+            "@interface User : Base\n@end\n\n@implementation User\n@end\n",
+        )
+        .file(
+            "src/Service.m",
+            "int make(void) {\n    return [User create];\n}\n",
+        )
+        .write(
+            "src/User.m",
+            "@interface User : Other\n@end\n\n@implementation User\n@end\n",
+        )
+        .edge_before("function make", "calls", "method Base::create")
+        .edge_after("function make", "calls", "method Other::create")
+}
+
+/// The same for a Pascal `class(…)` head.
+pub fn pascal_class_function_call_follows_a_base_change_in_another_file() -> Case {
+    Case::new(Change::EditHeritage, &[Language::Pascal])
+        .file(
+            "Base.pas",
+            "unit Base;\ninterface\ntype\n  TBase = class\n    class function Make: Integer;\n  end;\nimplementation\nclass function TBase.Make: Integer;\nbegin\n  Result := 1;\nend;\nend.\n",
+        )
+        .file(
+            "Other.pas",
+            "unit Other;\ninterface\ntype\n  TOther = class\n    class function Make: Integer;\n  end;\nimplementation\nclass function TOther.Make: Integer;\nbegin\n  Result := 2;\nend;\nend.\n",
+        )
+        .file(
+            "User.pas",
+            "unit User;\ninterface\nuses Base, Other;\ntype\n  TUser = class(TBase)\n  end;\nimplementation\nend.\n",
+        )
+        .file(
+            "Service.pas",
+            "unit Service;\ninterface\nuses User;\nfunction Run: Integer;\nimplementation\nfunction Run: Integer;\nbegin\n  Result := TUser.Make();\nend;\nend.\n",
+        )
+        .write(
+            "User.pas",
+            "unit User;\ninterface\nuses Base, Other;\ntype\n  TUser = class(TOther)\n  end;\nimplementation\nend.\n",
+        )
+        .edge_before("file:Service.pas", "calls", "method TBase::Make")
+        .edge_after("file:Service.pas", "calls", "method TOther::Make")
+}
+
+/// Not through the walk: a TS call of a static method through an imported
+/// class reads as an instantiation of that class, whichever base it
+/// extends.
+pub fn typescript_static_call_through_an_imported_subclass_reads_no_head() -> Case {
+    Case::new(Change::EditHeritage, &[Language::TypeScript])
+        .file(
+            "src/base.ts",
+            "export class Base {\n  static create(): number {\n    return 1;\n  }\n}\n",
+        )
+        .file(
+            "src/other.ts",
+            "export class Other {\n  static create(): number {\n    return 2;\n  }\n}\n",
+        )
+        .file(
+            "src/user.ts",
+            "import { Base } from './base';\nimport { Other } from './other';\n\nexport class User extends Base {}\n",
+        )
+        .file(
+            "src/service.ts",
+            "import { User } from './user';\n\nexport function make(): number {\n  return User.create();\n}\n",
+        )
+        .write(
+            "src/user.ts",
+            "import { Base } from './base';\nimport { Other } from './other';\n\nexport class User extends Other {}\n",
+        )
+        .edge_throughout("function make", "instantiates", "class User")
+}
+
+const PY_BASE: &str = "class Base:\n    @classmethod\n    def create(cls):\n        return cls()\n";
+const PY_OTHER: &str =
+    "class Other:\n    @classmethod\n    def create(cls):\n        return cls()\n";
+const PY_SERVICE: &str = "from pkg.user import User\n\n\ndef make():\n    return User.create()\n";
+
+/// The base's file deleted: `User.create()` leaves its classmethod.
+pub fn python_inherited_classmethod_leaves_a_deleted_base() -> Case {
+    Case::new(Change::DeleteImportedModule, &[Language::Python])
+        .file("pkg/base.py", PY_BASE)
+        .file(
+            "pkg/user.py",
+            "from pkg.base import Base\n\n\nclass User(Base):\n    pass\n",
+        )
+        .file("pkg/service.py", PY_SERVICE)
+        .edge_before("function make", "calls", "method Base::create")
+        .remove("pkg/base.py")
+}
+
+/// Two levels up: the middle class's base changes, and `User.create()`
+/// through it follows.
+pub fn python_inherited_classmethod_follows_a_middle_class_base_change() -> Case {
+    Case::new(Change::EditHeritage, &[Language::Python])
+        .file("pkg/base.py", PY_BASE)
+        .file("pkg/other.py", PY_OTHER)
+        .file(
+            "pkg/mid.py",
+            "from pkg.base import Base\nfrom pkg.other import Other\n\n\nclass Mid(Base):\n    pass\n",
+        )
+        .file(
+            "pkg/user.py",
+            "from pkg.mid import Mid\n\n\nclass User(Mid):\n    pass\n",
+        )
+        .file("pkg/service.py", PY_SERVICE)
+        .write(
+            "pkg/mid.py",
+            "from pkg.base import Base\nfrom pkg.other import Other\n\n\nclass Mid(Other):\n    pass\n",
+        )
+        .edge_before("function make", "calls", "method Base::create")
+        .edge_after("function make", "calls", "method Other::create")
+}
+
+/// A call parked while no class above `User` has `create` is retried once
+/// the middle class's new base has it: the walk from `User` reads the middle
+/// class's head, one level down from the change.
+pub fn python_parked_class_method_reaches_a_base_its_middle_class_gains() -> Case {
+    Case::new(Change::EditHeritage, &[Language::Python])
+        .file("pkg/base.py", "class Base:\n    pass\n")
+        .file("pkg/other.py", PY_OTHER)
+        .file(
+            "pkg/mid.py",
+            "from pkg.base import Base\nfrom pkg.other import Other\n\n\nclass Mid(Base):\n    pass\n",
+        )
+        .file(
+            "pkg/user.py",
+            "from pkg.mid import Mid\n\n\nclass User(Mid):\n    pass\n",
+        )
+        .file("pkg/service.py", PY_SERVICE)
+        .write(
+            "pkg/mid.py",
+            "from pkg.base import Base\nfrom pkg.other import Other\n\n\nclass Mid(Other):\n    pass\n",
+        )
+        .edge_after("function make", "calls", "method Other::create")
+}
+
+/// The changed head's old and new targets two levels above it: `User`
+/// moves from a middle class over `Base` to one over `Other`.
+pub fn python_inherited_classmethod_follows_a_base_two_levels_above_the_changed_head() -> Case {
+    Case::new(Change::EditHeritage, &[Language::Python])
+        .file("pkg/base.py", PY_BASE)
+        .file("pkg/other.py", PY_OTHER)
+        .file(
+            "pkg/mids.py",
+            "from pkg.base import Base\nfrom pkg.other import Other\n\n\nclass Mid1(Base):\n    pass\n\n\nclass Mid2(Other):\n    pass\n",
+        )
+        .file(
+            "pkg/user.py",
+            "from pkg.mids import Mid1, Mid2\n\n\nclass User(Mid1):\n    pass\n",
+        )
+        .file("pkg/service.py", PY_SERVICE)
+        .write(
+            "pkg/user.py",
+            "from pkg.mids import Mid1, Mid2\n\n\nclass User(Mid2):\n    pass\n",
+        )
+        .edge_before("function make", "calls", "method Base::create")
+        .edge_after("function make", "calls", "method Other::create")
+}
+
+/// Five levels up the base is in reach; the fourth class's head changed to
+/// one more level puts it at the sixth, past the walk.
+pub fn python_inherited_classmethod_leaves_a_base_pushed_past_five_levels() -> Case {
+    Case::new(Change::EditHeritage, &[Language::Python])
+        .file("pkg/base.py", PY_BASE)
+        .file(
+            "pkg/levels.py",
+            "from pkg.base import Base\n\n\nclass L5(Base):\n    pass\n\n\nclass L3(L4):\n    pass\n\n\nclass L2(L3):\n    pass\n\n\nclass L1(L2):\n    pass\n",
+        )
+        .file(
+            "pkg/l4.py",
+            "from pkg.base import Base\n\n\nclass L4(Base):\n    pass\n",
+        )
+        .file(
+            "pkg/user.py",
+            "from pkg.levels import L1\n\n\nclass User(L1):\n    pass\n",
+        )
+        .file("pkg/service.py", PY_SERVICE)
+        .edge_before("function make", "calls", "method Base::create")
+        .write(
+            "pkg/l4.py",
+            "from pkg.levels import L5\n\n\nclass L4(L5):\n    pass\n",
+        )
 }
 
 /// #897: a Kotlin function's value reference follows the object constant it

@@ -101,6 +101,7 @@ pub(crate) fn migrate_project(
     let mut objc_rows = Vec::new();
     let mut go_rows = Vec::new();
     let mut php_rows = Vec::new();
+    let mut class_head_rows = Vec::new();
     let mut lua_rows = Vec::new();
     let mut dart_rows = Vec::new();
     let mut dart_library_rows = Vec::new();
@@ -191,6 +192,9 @@ pub(crate) fn migrate_project(
         if let Some(row) = crate::php_heads::row_of(file.language, &source, &result.nodes) {
             php_rows.push((relative.clone(), row));
         }
+        if let Some(row) = crate::class_heads::row_of(file.language, &source, &result.nodes) {
+            class_head_rows.push((relative.clone(), row));
+        }
         if let Some(row) = crate::lua_modules::row_of(file.language, &source, &result.nodes) {
             lua_rows.push((relative.clone(), row));
         }
@@ -252,6 +256,8 @@ pub(crate) fn migrate_project(
     drop(go_rows);
     crate::php_heads::write_index_rows(rebuild.store(), &mut php_rows)?;
     drop(php_rows);
+    crate::class_heads::write_index_rows(rebuild.store(), &mut class_head_rows)?;
+    drop(class_head_rows);
     crate::lua_modules::write_index_rows(rebuild.store(), &mut lua_rows)?;
     drop(lua_rows);
     crate::dart_heads::write_index_rows(rebuild.store(), &mut dart_rows)?;
@@ -273,6 +279,7 @@ pub(crate) fn migrate_project(
     crate::go_heads::write_marker(rebuild.store())?;
     crate::rust_receivers::write_marker(rebuild.store())?;
     crate::php_heads::write_marker(rebuild.store())?;
+    crate::class_heads::write_marker(rebuild.store())?;
     crate::case_folded::write_marker(rebuild.store())?;
     crate::lua_modules::write_marker(rebuild.store())?;
     crate::r_bindings::write_marker(rebuild.store())?;

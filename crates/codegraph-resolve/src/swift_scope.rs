@@ -342,7 +342,7 @@ fn swift_declares_label(n: &Node, label: &str, context: &dyn ResolutionContext) 
 /// What the standard library's collection types and protocols refine, so a
 /// project extension of `Collection` is in reach of a type that conforms to
 /// `RandomAccessCollection` (upstream `SWIFT_STD_SUPERS`).
-fn swift_std_supers(type_name: &str) -> Option<&'static [&'static str]> {
+pub(crate) fn swift_std_supers(type_name: &str) -> Option<&'static [&'static str]> {
     const RANDOM_MUTABLE_REPLACEABLE: &[&str] = &[
         "RandomAccessCollection",
         "MutableCollection",
@@ -407,7 +407,7 @@ pub(crate) fn objc_system_super(type_name: &str) -> Option<&'static str> {
 
 /// Swift declarations a member hangs off (upstream `SWIFT_TYPE_KINDS`):
 /// types, protocols, and extensions (extracted as classes).
-fn is_swift_type_kind(kind: NodeKind) -> bool {
+pub(crate) fn is_swift_type_kind(kind: NodeKind) -> bool {
     matches!(
         kind,
         NodeKind::Class | NodeKind::Struct | NodeKind::Enum | NodeKind::Interface

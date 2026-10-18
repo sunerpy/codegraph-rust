@@ -5728,6 +5728,7 @@ fn index_project_inner(
         Option<codegraph_resolve::objc_scope::HeadRow>,
         Option<codegraph_resolve::go_packages::HeadRow>,
         Option<codegraph_resolve::php_scope::HeadRow>,
+        Option<codegraph_watch::class_heads::HeadsRow>,
         Option<codegraph_resolve::lua_scope::LuaModuleRow>,
         Option<codegraph_resolve::dart_scope::HeadRow>,
         Option<codegraph_resolve::dart_libraries::LibraryRow>,
@@ -5748,6 +5749,7 @@ fn index_project_inner(
     let mut objc_rows: Vec<(String, codegraph_resolve::objc_scope::HeadRow)> = Vec::new();
     let mut go_rows: Vec<(String, codegraph_resolve::go_packages::HeadRow)> = Vec::new();
     let mut php_rows: Vec<(String, codegraph_resolve::php_scope::HeadRow)> = Vec::new();
+    let mut class_head_rows: Vec<(String, codegraph_watch::class_heads::HeadsRow)> = Vec::new();
     let mut lua_rows: Vec<(String, codegraph_resolve::lua_scope::LuaModuleRow)> = Vec::new();
     let mut dart_rows: Vec<(String, codegraph_resolve::dart_scope::HeadRow)> = Vec::new();
     let mut dart_library_rows: Vec<(String, codegraph_resolve::dart_libraries::LibraryRow)> =
@@ -5830,6 +5832,8 @@ fn index_project_inner(
             let objc_row = codegraph_watch::objc_heads::row_of(language, &source, &result.nodes);
             let go_row = codegraph_watch::go_heads::row_of(language, &source, &result.nodes);
             let php_row = codegraph_watch::php_heads::row_of(language, &source, &result.nodes);
+            let class_head_row =
+                codegraph_watch::class_heads::row_of(language, &source, &result.nodes);
             let lua_row = codegraph_watch::lua_modules::row_of(language, &source, &result.nodes);
             let dart_row = codegraph_watch::dart_heads::row_of(language, &source, &result.nodes);
             let dart_library_row = codegraph_watch::dart_libraries::row_of(language, &source);
@@ -5851,6 +5855,7 @@ fn index_project_inner(
                 objc_row,
                 go_row,
                 php_row,
+                class_head_row,
                 lua_row,
                 dart_row,
                 dart_library_row,
@@ -5876,6 +5881,7 @@ fn index_project_inner(
                 objc_row,
                 go_row,
                 php_row,
+                class_head_row,
                 lua_row,
                 dart_row,
                 dart_library_row,
@@ -5958,6 +5964,9 @@ fn index_project_inner(
             if let Some(row) = php_row {
                 php_rows.push((relative.clone(), row));
             }
+            if let Some(row) = class_head_row {
+                class_head_rows.push((relative.clone(), row));
+            }
             if let Some(row) = lua_row {
                 lua_rows.push((relative.clone(), row));
             }
@@ -6036,6 +6045,8 @@ fn index_project_inner(
     drop(go_rows);
     codegraph_watch::php_heads::write_index_rows(&store, &mut php_rows)?;
     drop(php_rows);
+    codegraph_watch::class_heads::write_index_rows(&store, &mut class_head_rows)?;
+    drop(class_head_rows);
     codegraph_watch::lua_modules::write_index_rows(&store, &mut lua_rows)?;
     drop(lua_rows);
     codegraph_watch::dart_heads::write_index_rows(&store, &mut dart_rows)?;
@@ -6064,6 +6075,7 @@ fn index_project_inner(
     codegraph_watch::go_heads::write_marker(&store)?;
     codegraph_watch::rust_receivers::write_marker(&store)?;
     codegraph_watch::php_heads::write_marker(&store)?;
+    codegraph_watch::class_heads::write_marker(&store)?;
     codegraph_watch::case_folded::write_marker(&store)?;
     codegraph_watch::lua_modules::write_marker(&store)?;
     codegraph_watch::r_bindings::write_marker(&store)?;
