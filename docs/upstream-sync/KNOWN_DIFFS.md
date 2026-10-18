@@ -188,28 +188,35 @@ alone, which gives colby's result (one scan in place of a regex compiled per
 name, a per-pass memo, a pattern rewritten for Rust's regex engine), is not
 listed.
 
-### Resolution (OD-8)
+### Resolution
 
-- **Receiver words (#226).** A method call on a receiver nothing types binds a
-  single or best candidate only when the receiver shares a word with the owner,
-  where colby guesses. For the untyped-receiver languages (Ruby, CFML,
-  Objective-C, PHP) colby's owner-word rule also admits one
+- **Receiver words (#226, OD-8).** A method call on a receiver nothing types
+  binds a single or best candidate only when the receiver shares a word with
+  the owner, where colby guesses. For the untyped-receiver languages (Ruby,
+  CFML, Objective-C, PHP) colby's owner-word rule also admits one
   (`name_matcher.rs`).
-- **Nested receivers (#1496, G14).** A call down a longer chain (`a.b.c()`,
-  and TS/JS `this.a.b.m()`) keeps its last receiver segment (`b.c`) where colby
-  records the bare `c`. Scala, Swift and Go read colby's link back from the
-  source and hold the result to colby's chain rule (`scala_scope.rs`,
+- **Nested receivers (#1496, G14, OD-8).** A call down a longer chain
+  (`a.b.c()`, and TS/JS `this.a.b.m()`) keeps its last receiver segment (`b.c`)
+  where colby records the bare `c`. Scala, Swift and Go read colby's link back
+  from the source and hold the result to colby's chain rule (`scala_scope.rs`,
   `swift_scope.rs`, `go_packages.rs`).
-- **Rust calls that lost their receiver (P15, the Rust half of #2167).** A
+- **Rust calls that lost their receiver (P15, the Rust half of #2167, OD-8).** A
   call the extractor recorded under a bare name binds only a same-named method,
   never through a `use`, a fuzzy guess or a std method's name; a bare `Ok`,
   `Err`, `Some` or `None` is the prelude's unless a `use` in scope imports a
   project variant (`name_matcher.rs`, `rust_lexical.rs`).
-- **Untyped Python method values (#2218).** `self.store.fetch` stays
+- **Untyped Python method values (#2218, OD-8).** `self.store.fetch` stays
   unresolved even when one project method bears the name (`member_value.rs`).
-- **C# extension methods (W3-05c, owner 2026-10-11).** A call on an outside
-  type reaches the one project extension method in scope that takes it as
-  `this`; colby resolves no extension method (`csharp_extensions.rs`).
+- **C# extension methods (W3-05c, owner 2026-10-11, OD-8).** A call on an
+  outside type reaches the one project extension method in scope that takes it
+  as `this`; colby resolves no extension method (`csharp_extensions.rs`).
+- **Dart named constructors (#2380).** A named constructor, indexed as a
+  method, is reached only by a call written through its class (`Foo.value(2)`).
+  A call through a value of that type (a typed parameter or local, a chain's
+  last link), or through a receiver the matcher reads as the class (`foo`) or
+  scores by its words (`fooValue`), calls an instance or extension member of
+  that name, or nothing, where colby's member lookup and receiver guesses take
+  the constructor (`dart_members.rs`, `name_matcher.rs`).
 
 ### Extraction
 
