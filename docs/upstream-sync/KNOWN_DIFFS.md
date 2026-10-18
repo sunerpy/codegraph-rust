@@ -172,3 +172,131 @@ confined to `codegraph_explore` and `codegraph_status`.
 These are Tier-2 text-formatting differences (identical input schemas; equal
 output structure), not Tier-3 allowlist rules: they do not change a value the
 oracle compares on the SQLite golden surfaces.
+
+## Kept different on purpose (KEEP-RUST)
+
+Where the port reads a shape differently from colby on purpose, the decision is
+listed here with the module that carries it; the behavior itself is described
+in the language rows of [`languages.md`](../languages.md), the corpus sections
+of [`equivalence.md`](../equivalence.md) and the module docs. Each one leaves
+a guess unresolved, gives the same graph whatever order the files were indexed
+in, reads the source as it is written where colby misreads it, follows a
+grammar or extractor shape that is not colby's, or, by the owner's decision,
+records what colby does not. None is a Tier-3 rule: the goldens pin this
+port's own output, these differences included. A difference of mechanism
+alone, which gives colby's result (one scan in place of a regex compiled per
+name, a per-pass memo, a pattern rewritten for Rust's regex engine), is not
+listed.
+
+### Resolution (OD-8)
+
+- **Receiver words (#226).** A method call on a receiver nothing types binds a
+  single or best candidate only when the receiver shares a word with the owner,
+  where colby guesses. For the untyped-receiver languages (Ruby, CFML,
+  Objective-C, PHP) colby's owner-word rule also admits one
+  (`name_matcher.rs`).
+- **Nested receivers (#1496, G14).** A call down a longer chain (`a.b.c()`,
+  and TS/JS `this.a.b.m()`) keeps its last receiver segment (`b.c`) where colby
+  records the bare `c`. Scala, Swift and Go read colby's link back from the
+  source and hold the result to colby's chain rule (`scala_scope.rs`,
+  `swift_scope.rs`, `go_packages.rs`).
+- **Rust calls that lost their receiver (P15, the Rust half of #2167).** A
+  call the extractor recorded under a bare name binds only a same-named method,
+  never through a `use`, a fuzzy guess or a std method's name; a bare `Ok`,
+  `Err`, `Some` or `None` is the prelude's unless a `use` in scope imports a
+  project variant (`name_matcher.rs`, `rust_lexical.rs`).
+- **Untyped Python method values (#2218).** `self.store.fetch` stays
+  unresolved even when one project method bears the name (`member_value.rs`).
+- **C# extension methods (W3-05c, owner 2026-10-11).** A call on an outside
+  type reaches the one project extension method in scope that takes it as
+  `this`; colby resolves no extension method (`csharp_extensions.rs`).
+
+### Extraction
+
+- **Value references (#897, OD-8).** Always on: colby's
+  `CODEGRAPH_VALUE_REFS=0` switch is not ported (`value_refs.rs`).
+- **Property types (W2-03d, owner 2026-10-11, OD-8).** A Kotlin or PHP
+  property's declared type is a `references` edge from its field; colby reads
+  none. A Swift property's type annotation is a reference too (W2-03c), which in
+  `extension Socket.Option { static let none: Option = … }` reaches
+  `Socket::Option`, an edge colby's graph lacks.
+- **C/C++ alias signatures (W4-CPP-04, owner 2026-10-12, OD-8).** A
+  `type_alias` node's `signature` is its declaration as written; colby records
+  no aliased type (`walker.rs`).
+- **C/C++ pre-parse.** In C++ the C leading attribute macro is blanked only
+  with an object-like `#define` proving it; the inline-macro pass never blanks
+  inside a string literal (colby spares raw strings only); lone macro lines are
+  blanked in C++ only (`lang/cpp.rs`, `lang/cpp_preparse.rs`).
+- **CFML fragments.** A `<cfscript>` or `<cfquery>` body is walked in the
+  file's own tree, so its ids and columns are the file's (colby re-parses the
+  text and shifts its lines); a function re-kinded as a method gets a method's
+  id; a top-level `var` local is no node (`walker.rs`).
+- **MyBatis.** A self-closing `<sqlMap resource="…"/>` is a config's list
+  entry, never a map's root (`embedded/mybatis.rs`).
+- **Dart positions.** The later links of a call chain, and a call through an
+  import prefix, are recorded where the chain starts (colby records them past
+  the name), and resolution reads them back from there; a function declared in
+  a body is qualified by the function around it (`outer::make`, colby's is
+  `make`); local-scope offsets are bytes, colby's UTF-16 code units
+  (`dart_chains.rs`, `dart_prefixes.rs`, `dart_local_scope.rs`,
+  `dart_scope.rs`).
+
+### Path order, not index order
+
+Where a walk is capped or the first declaration wins, colby reads same-named
+declarations in index order and the port in path order, so the cap cuts in
+the same place on every index: Java supertypes (#2126), Kotlin declarations,
+typealiases and receiver files, Ruby and PHP ancestries, CFML component files,
+Swift's `declarationFor` and Objective-C supertypes. C/C++ namespace aliases,
+openers, closers and macro aliases take the first definition in path order
+(colby takes the last macro alias and closer), and same-named aliases from two
+`#if` branches the first in byte order of path (colby sorts with
+`localeCompare`). Java's ancestor walk (#2236) reads each type once, at the
+nearest level, where colby memoises a type at the depth it was first asked for
+and so depends on resolution order; a Lua module member is memoised per lookup
+depth for the same reason (`lua_scope.rs`).
+
+### The source as written
+
+- **Java anonymous classes.** `new LinkedTreeMapIterator<…>() { … }` has the
+  type it instantiates as its supertype, so its body's calls reach the base's
+  methods; colby reads only the declaration's head (`java_scope.rs`).
+- **Solidity `is` clauses.** A `//` comment drops only the rest of its line;
+  colby joins the lines first, so a comment in a head drops the bases below it
+  (`solidity_scope.rs`).
+- **Erlang `-import` lists.** Read entry by entry, a quoted atom whole, so
+  `foo/2` inside `'x,foo'/2` is not imported (`erlang_imports.rs`).
+- **C/C++ macro visibility.** An `#if` expression is evaluated whole (colby
+  reads a literal, one `defined` test or a bare name), and only a whole-file
+  `#ifndef X` / empty `#define X` pair is an include guard, so a feature-flag
+  default or a fallback function-like macro hides no call
+  (`c_macro_visibility.rs`).
+- **JS/TS.** A store action binds only through a store a Zustand factory
+  builds on its initializer's call path (colby checks that for selectors only,
+  `js_store.rs`); a field ending in `$` is a whole token (`name_matcher.rs`);
+  local and default export aliases take Unicode identifiers, colby's ASCII ones
+  only (`import_resolver.rs`).
+- **PHP.** A class name reference is recorded by its last segment and its
+  written name read back from the source; a rooted `\strlen()` keeps its `\`
+  and resolves as `strlen` (`php_scope.rs`, `import_resolver.rs`).
+- **Dart libraries.** Only an indexed file's directives are read, a URI whose
+  path leaves the project names nothing, an export chain is followed at most 64
+  libraries deep (colby recurses without a bound), and a field's initializer is
+  read only at its class's member level (`dart_libraries.rs`,
+  `dart_chains.rs`).
+- **Shopify themes.** A marker path is probed only once it is proven lexically
+  inside the project, and marker names match in any case
+  (`embedded/shopify.rs`).
+- **Pascal `.inc`.** An `.inc` override turns the content sniff off and the
+  file stays PHP (an override never claims a built-in extension), and a file
+  over the size limit keeps its extension's language (`pascal_include.rs`).
+
+### Sync lanes
+
+Several rules above read text across files, so an edit can change what a
+reference in an unchanged file resolves to. The watch crate keeps sync lanes
+for them that colby's sync has no counterpart for, each with a version marker
+withdrawn before the sync's first write and restored once it has resolved
+([Daemon and watch lifecycle](../architecture.md#daemon-and-watch-lifecycle)).
+The Shopify theme lane also covers a scoped sync: a theme marker added or
+removed converges there, where colby's needs a full sync.
