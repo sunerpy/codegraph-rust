@@ -4318,15 +4318,16 @@ pub(crate) fn infer_local_receiver_declaration(
         ),
         None => (receiver_name, false),
     };
+    // A language with no receiver patterns has no declaration to find.
+    if !has_receiver_patterns(reference.language) {
+        return None;
+    }
     let escaped = regex_escape(scan_receiver);
-    // A CFML, Objective-C, PHP or Dart scan compiles its patterns only once a
-    // line could match one ([`line_may_declare`]): compiled for every member
-    // call, CFML's eight made re-resolving a file of a few hundred calls take
-    // seconds, and a PHP pair costs a millisecond and a megabyte.
-    let lazy = matches!(
-        reference.language,
-        Language::Cfml | Language::ObjC | Language::Php | Language::Dart
-    );
+    // The scan compiles its patterns only once a line could match one
+    // ([`line_may_declare`]): compiled for every member call, CFML's eight
+    // made re-resolving a file of a few hundred calls take seconds, a PHP
+    // pair costs a millisecond and a megabyte, and C#'s and Java's, with
+    // their type arguments, three quarters of a Newtonsoft index.
     let compiled: OnceCell<Arc<Vec<(Regex, PatternCheck)>>> = OnceCell::new();
     let patterns = || {
         compiled.get_or_init(|| {
@@ -4336,9 +4337,6 @@ pub(crate) fn infer_local_receiver_declaration(
             )
         })
     };
-    if !lazy && patterns().is_empty() {
-        return None;
-    }
     let source = context.read_file(&reference.file_path)?;
     let lines: Vec<&str> = source
         .split('\n')
@@ -4359,7 +4357,7 @@ pub(crate) fn infer_local_receiver_declaration(
         if line.len() > 10_000 {
             return None;
         }
-        if lazy && !line_may_declare(reference.language, line, scan_receiver) {
+        if !line_may_declare(reference.language, line, scan_receiver) {
             return None;
         }
         for (re, check) in patterns().iter() {
@@ -4407,8 +4405,86 @@ fn line_may_declare(language: Language, line: &str, receiver: &str) -> bool {
         // `x = Foo(` and `Foo x;` both write the receiver followed, past
         // whitespace, by `=`, `;`, `,` or `)`.
         Language::Dart => writes_before_terminator(line, receiver),
-        _ => true,
+        // The same, and C#'s `foreach (T x in` the receiver, whitespace and
+        // `in`.
+        Language::CSharp => {
+            writes_before_terminator(line, receiver) || writes_before_word(line, receiver, "in")
+        }
+        // The same, and Java's enhanced-for variable before `:`.
+        Language::Java => {
+            writes_before_terminator(line, receiver)
+                || occurrences(line, receiver)
+                    .any(|at| line[at + receiver.len()..].trim_start().starts_with(':'))
+        }
+        // `let conn = …` and `let conn: <any type> = …` (the annotation is
+        // `[^=]+`, so `crate::db::Connection` too), and `conn: &mut T`: the
+        // receiver followed, past whitespace, by `:` or `=`.
+        Language::Rust => occurrences(line, receiver).any(|at| {
+            line[at + receiver.len()..]
+                .trim_start()
+                .starts_with([':', '='])
+        }),
+        // Every other language's patterns write the receiver followed by
+        // whitespace (Go's `r T`) or by `=`, `;`, `,`, `)`, `<` (R's `<-`) or
+        // a `:` that a type annotation or `:=` follows: past whitespace an
+        // uppercase letter, a quote, `&`, `mut` or `=` (so Lua's `svc:call()`
+        // and an object literal's `svc: value` are no declaration).
+        _ => occurrences(line, receiver).any(|at| {
+            let rest = &line[at + receiver.len()..];
+            if rest.starts_with(char::is_whitespace) {
+                return true;
+            }
+            match rest.chars().next() {
+                Some('=' | ';' | ',' | ')' | '<') => true,
+                Some(':') => {
+                    let annotation = rest[1..].trim_start();
+                    annotation.starts_with(|c: char| c.is_ascii_uppercase())
+                        || annotation.starts_with(['"', '\'', '&', '='])
+                        || annotation.starts_with("mut")
+                }
+                _ => false,
+            }
+        }),
     }
+}
+
+/// Whether [`local_receiver_type_patterns_tagged`] has patterns for
+/// `language` (`receiver_patterns_cover_every_language_with_patterns` keeps
+/// the two in step).
+fn has_receiver_patterns(language: Language) -> bool {
+    matches!(
+        language,
+        Language::TypeScript
+            | Language::Tsx
+            | Language::JavaScript
+            | Language::Jsx
+            | Language::Python
+            | Language::ObjC
+            | Language::Java
+            | Language::Kotlin
+            | Language::CSharp
+            | Language::Swift
+            | Language::Cfml
+            | Language::Rust
+            | Language::Go
+            | Language::Ruby
+            | Language::Scala
+            | Language::Dart
+            | Language::Php
+            | Language::Lua
+            | Language::Luau
+            | Language::R
+            | Language::Pascal
+    )
+}
+
+/// Whether `line` writes `name`, whitespace and then the word `word`: what
+/// `{name}\s+{word}\b` needs (never false where that matches).
+fn writes_before_word(line: &str, name: &str, word: &str) -> bool {
+    occurrences(line, name).any(|at| {
+        let rest = &line[at + name.len()..];
+        rest.starts_with(char::is_whitespace) && rest.trim_start().starts_with(word)
+    })
 }
 
 /// Whether `line` writes `name` followed, past whitespace, by `=`, `;`, `,`
@@ -4523,11 +4599,6 @@ fn csharp_keyword_local_type(
     reference: &RefView,
     context: &dyn ResolutionContext,
 ) -> Option<String> {
-    let pattern = Regex::new(&format!(
-        r"(?-u:\b)(string|object|int|long|short|byte|bool|char|double|float|decimal|uint|ulong|ushort|sbyte)\??\s+{}(?-u:\b)\s*[=;,)]",
-        regex_escape(receiver_name)
-    ))
-    .ok()?;
     let source = context.read_file(&reference.file_path)?;
     let lines: Vec<&str> = source
         .split('\n')
@@ -4538,10 +4609,19 @@ fn csharp_keyword_local_type(
     }
     let call_idx = ((reference.line - 1).max(0) as usize).min(lines.len() - 1);
     let start_idx = (enclosing_scope_start_line(reference, context) - 1).max(0) as usize;
-    (start_idx..=call_idx)
+    // The pattern writes the receiver followed, past whitespace, by `=`, `;`,
+    // `,` or `)`: only such a line can match, and most calls have none.
+    let mut candidates = (start_idx..=call_idx)
         .rev()
-        .filter(|&i| lines[i].len() <= 10_000)
-        .find_map(|i| pattern.captures(lines[i]).map(|caps| caps[1].to_string()))
+        .filter(|&i| lines[i].len() <= 10_000 && writes_before_terminator(lines[i], receiver_name))
+        .peekable();
+    candidates.peek()?;
+    let pattern = Regex::new(&format!(
+        r"(?-u:\b)(string|object|int|long|short|byte|bool|char|double|float|decimal|uint|ulong|ushort|sbyte)\??\s+{}(?-u:\b)\s*[=;,)]",
+        regex_escape(receiver_name)
+    ))
+    .ok()?;
+    candidates.find_map(|i| pattern.captures(lines[i]).map(|caps| caps[1].to_string()))
 }
 
 /// Span end of `node`, falling back to its start when `end_line` was not
@@ -7401,7 +7481,10 @@ pub fn veto_js_local_shadow(
     context: &dyn ResolutionContext,
 ) -> Option<ResolvedRef> {
     let result = result?;
-    if !is_js_local_ref_kind(reference.reference_kind) {
+    // Only a JS/TS function binds a local here ([`js_function_local_scope`]
+    // answers `None` for any other language), so nothing else is read for
+    // another language's reference.
+    if !is_js_family(reference.language) || !is_js_local_ref_kind(reference.reference_kind) {
         return Some(result);
     }
     let Some(target) = context.get_node_by_id_shared(&result.target_node_id) else {
@@ -7416,6 +7499,13 @@ pub fn veto_js_local_shadow(
 /// Whether `node` lies outside the function that binds the reference's name
 /// itself ([`js_function_local_scope`]; upstream `isOutsideJsLocal`).
 fn is_outside_js_local(node: &Node, reference: &RefView, context: &dyn ResolutionContext) -> bool {
+    // Only a function that binds the name itself has a local of it; most do
+    // not, so that is read first and the receiver (a regex per call) only
+    // for one that does.
+    let Some((start, end)) = js_function_local_scope(&reference.reference_name, reference, context)
+    else {
+        return false;
+    };
     // `const indexName = this.dataSource.namingStrategy.indexName(…)`: a
     // member, whatever the local's name.
     if reference.reference_kind == EdgeKind::Calls
@@ -7423,13 +7513,7 @@ fn is_outside_js_local(node: &Node, reference: &RefView, context: &dyn Resolutio
     {
         return false;
     }
-    js_function_local_scope(&reference.reference_name, reference, context).is_some_and(
-        |(start, end)| {
-            !(node.file_path == reference.file_path
-                && start <= node.start_line
-                && node.start_line <= end)
-        },
-    )
+    !(node.file_path == reference.file_path && start <= node.start_line && node.start_line <= end)
 }
 
 /// The lines of the JS/TS function a reference sits in when that function
@@ -13647,6 +13731,206 @@ mod tests {
             "repo"
         ));
         assert!(writes_before_terminator("    aaa = X();", "aa"));
+    }
+
+    /// The receiver scan compiles its patterns only once a line could match
+    /// one (W4d end, the A/B's Newtonsoft and gson regressions): for every
+    /// language with patterns, a line a pattern matches is admitted, and a
+    /// plain member call is not.
+    #[test]
+    fn every_line_prefilter_admits_every_line_a_receiver_pattern_matches() {
+        let cases: &[(Language, &str, &[&str], usize)] = &[
+            (
+                Language::CSharp,
+                "writer",
+                &[
+                    "    JsonTextWriter writer = new JsonTextWriter(sw);",
+                    "    var writer = new JsonTextWriter(sw);",
+                    "    List<string> writer;",
+                    "  void Go(JsonWriter writer, int n) {",
+                    "  void Go(JsonWriter? writer) {",
+                    "    Dictionary<string, List<int>> writer = Make();",
+                    "    foreach (JProperty writer in props) {",
+                    "    foreach (JProperty writer\tin props) {",
+                    "    writer.WriteEndObject();",
+                    "    if (writer == null) {}",
+                    "    writers = new X();",
+                ],
+                8,
+            ),
+            (
+                Language::Java,
+                "list",
+                &[
+                    "    List<String> list = new ArrayList<>();",
+                    "    ArrayList list;",
+                    "    String[] list = args;",
+                    "  void go(Map<K, V> list, int n) {",
+                    "    for (final Item list : items) {",
+                    "    for (Item list: items) {",
+                    "    list = new ArrayList();",
+                    "    list.add(1);",
+                    "    lists = new ArrayList();",
+                ],
+                7,
+            ),
+            (
+                Language::TypeScript,
+                "svc",
+                &[
+                    "  const svc = new UserService();",
+                    "  let svc: UserService;",
+                    "  function f(svc: Svc) {}",
+                    "  svc.save();",
+                ],
+                3,
+            ),
+            (
+                Language::Python,
+                "lg",
+                &[
+                    "    lg = Logger()",
+                    "    lg: Logger = make()",
+                    "    lg: \"Logger\" = make()",
+                    "    lg = Group.objects.create(name=n)",
+                    "    lg.info(1)",
+                ],
+                4,
+            ),
+            (
+                Language::Kotlin,
+                "svc",
+                &[
+                    "    val svc = Service()",
+                    "    fun go(svc: Service) {",
+                    "    svc.call()",
+                ],
+                2,
+            ),
+            (
+                Language::Swift,
+                "svc",
+                &[
+                    "    let svc = Service()",
+                    "    var svc: Service",
+                    "    svc.call()",
+                ],
+                2,
+            ),
+            (
+                Language::Rust,
+                "conn",
+                &[
+                    "    let mut conn = Connection::open();",
+                    "    let conn: &Pool = pool;",
+                    "    let conn: crate::db::Connection = Connection::open();",
+                    "    let conn:std::sync::Arc<Pool> = Pool::new();",
+                    "    fn go(conn: &mut Connection) {",
+                    "    conn.execute();",
+                ],
+                5,
+            ),
+            (
+                Language::Go,
+                "s",
+                &[
+                    "\ts := &server{",
+                    "\tvar s *Server",
+                    "func (s *server) Run() {",
+                    "\ts Server",
+                    "\ts.Run()",
+                ],
+                4,
+            ),
+            (
+                Language::Ruby,
+                "svc",
+                &["    svc = Service.new", "    svc.call"],
+                1,
+            ),
+            (
+                Language::Scala,
+                "svc",
+                &[
+                    "    val svc = new Service()",
+                    "    def go(svc: Service) = 1",
+                    "    svc.call()",
+                ],
+                2,
+            ),
+            (
+                Language::Lua,
+                "svc",
+                &[
+                    "local svc = Service.new()",
+                    "local svc = Service()",
+                    "svc:call()",
+                ],
+                2,
+            ),
+            (
+                Language::R,
+                "svc",
+                &["svc <- Service$new()", "svc = Service$new()", "svc$call()"],
+                2,
+            ),
+            (
+                Language::Pascal,
+                "svc",
+                &[
+                    "  svc: TService;",
+                    "  svc := TService.Create;",
+                    "  svc.Run;",
+                ],
+                2,
+            ),
+        ];
+        for (language, receiver, lines, expected) in cases {
+            let patterns = local_receiver_type_patterns_tagged(*language, &regex_escape(receiver));
+            assert!(!patterns.is_empty(), "{language:?}");
+            let mut matched = 0;
+            for line in *lines {
+                if patterns.iter().any(|(re, _)| re.is_match(line)) {
+                    matched += 1;
+                    assert!(
+                        line_may_declare(*language, line, receiver),
+                        "{language:?}: {line}"
+                    );
+                }
+            }
+            assert_eq!(matched, *expected, "{language:?}");
+            // The last line is a plain member call: nothing is compiled for it.
+            let call = lines.last().unwrap();
+            if *language != Language::CSharp && *language != Language::Java {
+                assert!(
+                    !line_may_declare(*language, call, receiver),
+                    "{language:?}: {call}"
+                );
+            }
+        }
+        assert!(!line_may_declare(
+            Language::CSharp,
+            "    writer.WriteEndObject();",
+            "writer"
+        ));
+        assert!(!line_may_declare(
+            Language::Java,
+            "    list.add(1);",
+            "list"
+        ));
+    }
+
+    /// [`has_receiver_patterns`] names exactly the languages
+    /// [`local_receiver_type_patterns_tagged`] has patterns for.
+    #[test]
+    fn receiver_patterns_cover_every_language_with_patterns() {
+        for language in Language::ALL {
+            assert_eq!(
+                has_receiver_patterns(language),
+                !local_receiver_type_patterns_tagged(language, "x").is_empty(),
+                "{language:?}"
+            );
+        }
     }
 
     #[test]
