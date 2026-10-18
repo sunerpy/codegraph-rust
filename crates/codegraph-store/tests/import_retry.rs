@@ -43,6 +43,47 @@ fn a_path_import_waits_under_its_last_segments_stem() {
     assert_eq!(reference_name_tail("greet", EdgeKind::Calls), "greet");
 }
 
+/// Upstream #2403's `referenceNameTail` cases, in this port's keys: a
+/// reference written as a path waits under its file's stem, which the import
+/// path keys of the file it names carry (upstream parks it under the file
+/// name and rewrote the stored tails; this port stores none). A call's `/`
+/// is in its arguments or a division, never a path.
+#[test]
+fn a_path_reference_waits_under_a_key_of_the_file_it_names() {
+    let references = |name: &str| reference_name_tail(name, EdgeKind::References);
+    for (name, file) in [
+        ("snippets/price.liquid", "snippets/price.liquid"),
+        ("sections/404.liquid", "sections/404.liquid"),
+        ("snippets/icon.logo.liquid", "snippets/icon.logo.liquid"),
+    ] {
+        let tail = references(name);
+        assert!(
+            import_path_keys(file).contains(&tail),
+            "{name} waits under {tail:?}, a key of {file}: {:?}",
+            import_path_keys(file)
+        );
+    }
+    assert_eq!(references("snippets/price.liquid"), "price");
+    assert_eq!(references("snippets/icon.logo.liquid"), "icon");
+    assert_eq!(references("Foo.Bar"), "Bar");
+    assert_eq!(
+        reference_name_tail(
+            "assert.logfile(\"logs/error.log\").has.line",
+            EdgeKind::Calls
+        ),
+        "line"
+    );
+    assert_eq!(
+        reference_name_tail("(rss_kb / 1024.0).to_i", EdgeKind::Calls),
+        "to_i"
+    );
+    assert_eq!(reference_name_tail("lists::map/2", EdgeKind::Calls), "map");
+    assert_eq!(
+        reference_name_tail("package:app/b.dart", EdgeKind::Imports),
+        "b"
+    );
+}
+
 fn store(label: &str) -> Store {
     let path = std::env::temp_dir().join(format!(
         "codegraph-store-import-retry-{label}-{}-{}.db",

@@ -3549,7 +3549,7 @@ pub fn c_include_of_an_added_header() -> Case {
         .edge_after("function main", "calls", "function helper @util.c")
 }
 
-/// Upstream #2403: a Liquid `render` gains its snippet only on a fresh index.
+/// Upstream #2403: a Liquid `render` links the snippet a sync adds later.
 pub fn liquid_render_of_an_added_snippet() -> Case {
     Case::new(Change::AddImportTarget, &[Language::Liquid])
         .file(
@@ -3564,6 +3564,23 @@ pub fn liquid_render_of_an_added_snippet() -> Case {
             "file:templates/product.liquid",
             "references",
             "file:snippets/price.liquid",
+        )
+}
+
+/// Upstream #2403: a JSON template's section `type` links the section a sync
+/// adds later, inside the template's theme.
+pub fn liquid_json_template_section_of_an_added_section() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Liquid])
+        .file("layout/theme.liquid", "{{ content_for_layout }}\n")
+        .file(
+            "templates/404.json",
+            "{\"sections\":{\"main\":{\"type\":\"404\"}},\"order\":[\"main\"]}",
+        )
+        .write("sections/404.liquid", "<h1>404</h1>\n")
+        .edge_after(
+            "file:templates/404.json",
+            "references",
+            "file:sections/404.liquid",
         )
 }
 

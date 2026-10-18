@@ -17866,47 +17866,86 @@ mod shopify_themes {
     /// snippet of its own: the shape of panoply/syncify's example themes
     /// (upstream's `severalThemes`).
     fn several_themes() -> Project {
-        Project::new()
-            .file(
+        project_of(&several_themes_files())
+    }
+
+    /// The files of [`several_themes`], by path.
+    fn several_themes_files() -> Vec<(&'static str, String)> {
+        vec![
+            (
                 "layout/theme.liquid",
-                "{% section 'header' %}{{ content_for_layout }}\n",
-            )
-            .file("sections/header.liquid", "{% render 'price' %}\n")
-            .file("sections/main.liquid", "<main></main>\n")
-            .file("snippets/price.liquid", "{{ product.price | money }}\n")
-            .file("straps/dusk/config/settings_schema.json", "[]")
-            .file(
+                "{% section 'header' %}{{ content_for_layout }}\n".to_string(),
+            ),
+            (
+                "sections/header.liquid",
+                "{% render 'price' %}\n".to_string(),
+            ),
+            ("sections/main.liquid", "<main></main>\n".to_string()),
+            (
+                "snippets/price.liquid",
+                "{{ product.price | money }}\n".to_string(),
+            ),
+            ("straps/dusk/config/settings_schema.json", "[]".to_string()),
+            (
                 "straps/dusk/sections/404.liquid",
-                "<h1>{{ 'templates.404.title' | t }}</h1>\n",
-            )
-            .file("straps/dusk/templates/404.json", &json_template("404"))
-            .file(
+                "<h1>{{ 'templates.404.title' | t }}</h1>\n".to_string(),
+            ),
+            ("straps/dusk/templates/404.json", json_template("404")),
+            (
                 "examples/tailwind/layout/theme.liquid",
-                "{% section 'header' %}{{ content_for_layout }}\n",
-            )
-            .file(
+                "{% section 'header' %}{{ content_for_layout }}\n".to_string(),
+            ),
+            (
                 "examples/tailwind/sections/header.liquid",
-                "{% liquid\n  render 'price'\n  render 'icon'\n%}\n",
-            )
-            .file(
+                "{% liquid\n  render 'price'\n  render 'icon'\n%}\n".to_string(),
+            ),
+            (
                 "examples/tailwind/sections/main.liquid",
-                "<main class=\"p-4\"></main>\n",
-            )
-            .file("examples/tailwind/snippets/icon.liquid", "<svg></svg>\n")
-            .file(
+                "<main class=\"p-4\"></main>\n".to_string(),
+            ),
+            (
+                "examples/tailwind/snippets/icon.liquid",
+                "<svg></svg>\n".to_string(),
+            ),
+            (
                 "examples/tailwind/templates/index.json",
-                &json_template("main"),
-            )
-            .file(
-                "examples/tailwind/templates/404.json",
-                &json_template("404"),
-            )
+                json_template("main"),
+            ),
+            ("examples/tailwind/templates/404.json", json_template("404")),
             // Liquid in no theme: an app's theme extension.
-            .file(
+            (
                 "extensions/reviews/blocks/stars.liquid",
-                "{% render 'star' %}\n",
-            )
-            .file("extensions/reviews/snippets/star.liquid", "<svg></svg>\n")
+                "{% render 'star' %}\n".to_string(),
+            ),
+            (
+                "extensions/reviews/snippets/star.liquid",
+                "<svg></svg>\n".to_string(),
+            ),
+        ]
+    }
+
+    /// A project of `files`, not yet indexed.
+    fn project_of(files: &[(&str, String)]) -> Project {
+        files.iter().fold(Project::new(), |project, (path, text)| {
+            project.file(path, text)
+        })
+    }
+
+    /// Every edge by its ends, kind, site and how it resolved, sorted: what a
+    /// sync has to match a fresh index of the same files on.
+    fn edge_set(graph: &Graph) -> Vec<String> {
+        let mut out: Vec<String> = graph
+            .edges
+            .iter()
+            .map(|edge| {
+                format!(
+                    "{} {} -> {} @{:?}:{:?} {}",
+                    edge.kind, edge.source, edge.target, edge.line, edge.col, edge.metadata
+                )
+            })
+            .collect();
+        out.sort();
+        out
     }
 
     /// Upstream #2396: a `{% render %}`, a `{% section %}` or a JSON
@@ -17967,6 +18006,150 @@ mod shopify_themes {
             links_of(graph, "examples/tailwind/templates/404.json"),
             Vec::<String>::new(),
             "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream #2403: a section or snippet added after the files naming it
+    /// links them on the next sync, in its own theme only, as a fresh index
+    /// of the same files does; a deleted snippet's references wait for it
+    /// the same way. (The port retries a parked path reference by its stem,
+    /// which an added file's import path keys carry, since W5-01.)
+    #[test]
+    fn pr2403_a_section_or_snippet_that_appears_later_links_the_files_naming_it() {
+        let later: [(&str, &str); 4] = [
+            ("sections/404.liquid", "<h1>404</h1>\n"),
+            ("snippets/price.liquid", "{{ product.price | money }}\n"),
+            ("examples/tailwind/sections/404.liquid", "<h1>404</h1>\n"),
+            ("extensions/reviews/snippets/star.liquid", "<svg></svg>\n"),
+        ];
+        let naming = [
+            "templates/404.json",
+            "sections/header.liquid",
+            "examples/tailwind/templates/404.json",
+            "examples/tailwind/sections/header.liquid",
+            "extensions/reviews/blocks/stars.liquid",
+        ];
+        let links = |graph: &Graph| -> Vec<(&str, Vec<String>)> {
+            naming
+                .iter()
+                .map(|file| (*file, links_of(graph, file)))
+                .collect()
+        };
+        let mut initial: Vec<(&str, String)> = several_themes_files()
+            .into_iter()
+            .filter(|(path, _)| !later.iter().any(|(added, _)| added == path))
+            .collect();
+        initial.push(("templates/404.json", json_template("404")));
+        let mut project = project_of(&initial).index();
+        assert_eq!(
+            links(project.graph()),
+            [
+                ("templates/404.json", vec![]),
+                ("sections/header.liquid", vec![]),
+                ("examples/tailwind/templates/404.json", vec![]),
+                (
+                    "examples/tailwind/sections/header.liquid",
+                    vec!["examples/tailwind/snippets/icon.liquid".to_string()],
+                ),
+                ("extensions/reviews/blocks/stars.liquid", vec![]),
+            ],
+            "{}",
+            project.graph().report()
+        );
+
+        for (path, text) in later {
+            project.write(path, text);
+        }
+        let synced = project.sync().clone();
+        assert_eq!(
+            links(&synced),
+            [
+                (
+                    "templates/404.json",
+                    vec!["sections/404.liquid".to_string()],
+                ),
+                (
+                    "sections/header.liquid",
+                    vec!["snippets/price.liquid".to_string()],
+                ),
+                (
+                    "examples/tailwind/templates/404.json",
+                    vec!["examples/tailwind/sections/404.liquid".to_string()],
+                ),
+                // The root theme's new price snippet is not this theme's.
+                (
+                    "examples/tailwind/sections/header.liquid",
+                    vec!["examples/tailwind/snippets/icon.liquid".to_string()],
+                ),
+                (
+                    "extensions/reviews/blocks/stars.liquid",
+                    vec!["extensions/reviews/snippets/star.liquid".to_string()],
+                ),
+            ],
+            "{}",
+            synced.report()
+        );
+        let mut every_file = initial.clone();
+        every_file.extend(later.iter().map(|(path, text)| (*path, text.to_string())));
+        let fresh = project_of(&every_file).index();
+        assert_eq!(
+            edge_set(&synced),
+            edge_set(fresh.graph()),
+            "the synced graph is a fresh index's\nsynced:\n{}\nfresh:\n{}",
+            synced.report(),
+            fresh.graph().report()
+        );
+
+        project.remove("snippets/price.liquid");
+        let graph = project.sync();
+        assert_eq!(
+            links_of(graph, "sections/header.liquid"),
+            Vec::<String>::new(),
+            "{}",
+            graph.report()
+        );
+        project.write("snippets/price.liquid", later[1].1);
+        let graph = project.sync();
+        assert_eq!(
+            links_of(graph, "sections/header.liquid"),
+            ["snippets/price.liquid"],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream #2403 (`sync-path-reference-retry.test.ts`): a theme's
+    /// `{% render %}` and a JSON template's section link the snippet and the
+    /// section a sync adds, and nothing is left waiting for either.
+    #[test]
+    fn pr2403_a_theme_links_a_section_and_a_snippet_added_after_it() {
+        let mut project = Project::new()
+            .file(
+                "layout/theme.liquid",
+                "{% render 'price' %}{{ content_for_layout }}\n",
+            )
+            .file("templates/404.json", &json_template("404"))
+            .index();
+        project
+            .write("sections/404.liquid", "<h1>404</h1>\n")
+            .write("snippets/price.liquid", "{{ product.price }}\n");
+        let graph = project.sync();
+        assert_eq!(
+            links_of(graph, "templates/404.json"),
+            ["sections/404.liquid"],
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            links_of(graph, "layout/theme.liquid"),
+            ["snippets/price.liquid"],
+            "{}",
+            graph.report()
+        );
+        assert!(
+            graph.unresolved.is_empty(),
+            "nothing waits for the added files:\n{}",
             graph.report()
         );
     }

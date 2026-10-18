@@ -568,7 +568,9 @@ others; a bare Rust name's scope reads its own file's `use` items, which re-reso
 yet detected);
 an import names a file, a folder or a namespace rather than a symbol, so the parked
 imports an added file or a changed file's namespace can satisfy (by the file's
-name and stem, its folder's, or the namespace's whole name) send their files
+name and stem, its folder's, or the namespace's whole name), and the parked
+references written as a path (a Liquid `{% render 'price' %}` waits under
+`price` for `snippets/price.liquid`), send their files
 down the whole-file re-resolution lane, which rebuilds an unchanged file's
 resolved edges and keeps what its extraction produced (`contains` edges and
 same-file value references). Each mutation acquires the

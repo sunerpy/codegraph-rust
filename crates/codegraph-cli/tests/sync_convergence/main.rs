@@ -892,8 +892,8 @@ matrix! {
     kotlin_property_type_of_an_added_class,
     php_property_type_of_an_added_class,
     c_include_of_an_added_header,
-    #[ignore = "W5-02 #2403: a Liquid `render` does not link a snippet that appears later"]
     liquid_render_of_an_added_snippet,
+    liquid_json_template_section_of_an_added_section,
     razor_reference_to_an_added_class,
     r_source_of_an_added_file,
     #[ignore = "unscheduled, found by W0-04: an Erlang remote call `util:double/1` is not retried when module util appears"]
