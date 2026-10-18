@@ -152,7 +152,10 @@ For each corpus, thread count, and run, the harness:
    `CODEGRAPH_NO_DAEMON=1`, and `CODEGRAPH_NO_WATCH=1`, and with `CODEGRAPH_DIR`
    removed from the environment;
 3. records the wall time from spawn to exit, polled every millisecond, and the
-   peak RSS reported by `wait4` (`ru_maxrss`; not collected on Windows);
+   peak RSS: on Linux the child's own `VmHWM`, read from `/proc/<pid>/status`
+   at each poll, since `wait4`'s `ru_maxrss` also counts the address space the
+   child was forked from (the harness's, which grows with every database it
+   canonicalizes); `ru_maxrss` on other Unix hosts; not collected on Windows;
 4. checks `.codegraph/codegraph.db` with `PRAGMA quick_check`, canonicalizes it
    through the [equivalence oracle](equivalence.md), and fingerprints it; and
 5. deletes the project.

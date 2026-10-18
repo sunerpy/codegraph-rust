@@ -224,7 +224,7 @@ fn duration_to_ms(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1000.0
 }
 
-fn read_proc_status_kb(pid: u32, field: &str) -> Option<u64> {
+pub(crate) fn read_proc_status_kb(pid: u32, field: &str) -> Option<u64> {
     let status = fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
     status.lines().find_map(|line| {
         let value = line.strip_prefix(field)?.trim();

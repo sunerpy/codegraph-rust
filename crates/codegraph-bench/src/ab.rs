@@ -6,8 +6,13 @@
 //! `RAYON_NUM_THREADS=<threads>`, `CODEGRAPH_NO_DAEMON=1` and
 //! `CODEGRAPH_NO_WATCH=1`, and with `CODEGRAPH_DIR` removed. The CLI has no
 //! thread flag; parsing and resolution run on rayon's global pool, which reads
-//! `RAYON_NUM_THREADS`. Each run records its wall time, its peak RSS (`wait4`
-//! `ru_maxrss` on Unix) and the canonical fingerprint of the database it wrote.
+//! `RAYON_NUM_THREADS`. Each run records its wall time, its peak RSS and the
+//! canonical fingerprint of the database it wrote. On Linux the peak RSS is the
+//! child's own `VmHWM`, polled from `/proc/<pid>/status` while it runs:
+//! `wait4`'s `ru_maxrss` also counts the address space the child was forked
+//! from, the harness's own, which grows as it canonicalizes each database, so
+//! every run after a large corpus read the harness's size. Other Unix hosts
+//! report `ru_maxrss`.
 //!
 //! Baseline and candidate runs alternate (even runs baseline first, odd runs
 //! candidate first). The first run of every (corpus, binary, threads) cell is a
@@ -39,7 +44,7 @@ use crate::graph_diff::{
     GraphFingerprint, ScratchDir, canonicalize_checked, differing_surfaces, fingerprint,
     sha256_file,
 };
-use crate::metrics::{mad, median};
+use crate::metrics::{mad, median, read_proc_status_kb};
 use crate::report::{command_stdout, read_cpu_model, read_mem_total_kb, read_os_pretty_name};
 
 /// Environment variable that sets the thread count of each timed run.
@@ -771,6 +776,9 @@ fn wait_measured(child: Child, started: Instant, timeout: Duration) -> Result<Me
     // and `wait4` overwrites it when it reaps the child.
     let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
     let mut killed = false;
+    // The child's own high-water mark (see the module comment): read while
+    // it runs, as a reaped process has no memory figures left.
+    let mut polled_peak_kb: Option<u64> = None;
     loop {
         // SAFETY: `pid` is this process's own child, which only this loop ever
         // reaps (the std `Child` handle is dropped without waiting), and both
@@ -785,6 +793,11 @@ fn wait_measured(child: Child, started: Instant, timeout: Duration) -> Result<Me
                 continue;
             }
             return Err(error).context("waiting for the child process");
+        }
+        if cfg!(target_os = "linux")
+            && let Some(kb) = read_proc_status_kb(child.id(), "VmHWM:")
+        {
+            polled_peak_kb = polled_peak_kb.max(Some(kb));
         }
         if !killed && started.elapsed() > timeout {
             // SAFETY: the child has not been reaped yet, so its pid still names
@@ -807,10 +820,15 @@ fn wait_measured(child: Child, started: Instant, timeout: Duration) -> Result<Me
     } else {
         Exit::Unknown
     };
+    let peak_rss_kb = if cfg!(target_os = "linux") {
+        polled_peak_kb
+    } else {
+        max_rss_kb(&usage)
+    };
     Ok(Measured {
         exit,
         wall,
-        peak_rss_kb: max_rss_kb(&usage),
+        peak_rss_kb,
     })
 }
 
@@ -939,7 +957,9 @@ impl AbEnvironment {
 }
 
 fn rss_collector() -> &'static str {
-    if cfg!(target_os = "macos") {
+    if cfg!(target_os = "linux") {
+        "VmHWM of /proc/<pid>/status, polled every millisecond (KiB)"
+    } else if cfg!(target_os = "macos") {
         "wait4 rusage ru_maxrss (bytes, reported in KiB)"
     } else if cfg!(unix) {
         "wait4 rusage ru_maxrss (KiB)"
@@ -1135,6 +1155,25 @@ fn budget_text(verdict: &BudgetVerdict) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A run's peak RSS is the child's own, not the address space it was
+    /// forked from: with the harness holding 256 MiB, a `sleep` still
+    /// reports a few MiB (W4d end: `ru_maxrss` read every run after the
+    /// typescript-large corpus as the harness's 414 MiB).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_runs_peak_rss_is_the_childs_own_not_the_harnesss() {
+        let held = vec![1u8; 256 << 20];
+        let touched: u64 = held.iter().step_by(4096).map(|&b| u64::from(b)).sum();
+        assert!(touched > 0);
+        let mut command = Command::new("sleep");
+        command.arg("0.2");
+        let measured = spawn_measured(&mut command, Duration::from_secs(30)).expect("sleep runs");
+        assert!(matches!(measured.exit, Exit::Code(0)));
+        let peak = measured.peak_rss_kb.expect("the child's VmHWM is read");
+        assert!(peak < 64 << 10, "a sleep's peak RSS is {peak} KiB");
+        drop(held);
+    }
 
     fn ratios(wall: f64, rows: f64, rate: f64, rss: Option<f64>) -> Ratios {
         Ratios {
