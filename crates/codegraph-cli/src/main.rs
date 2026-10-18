@@ -1194,6 +1194,15 @@ fn self_update_rate_limit_hint() -> &'static str {
     "if this is a GitHub API rate limit, authenticate with:\n  GITHUB_TOKEN=$(gh auth token) codegraph self-update"
 }
 
+/// The newest release's version in a `get_latest_release` listing (self_update
+/// 1.x returns the listing, newest first, where 0.x returned the release).
+fn newest_release_version(releases: &self_update::Releases) -> Result<String> {
+    releases
+        .latest()
+        .map(|release| release.version().to_string())
+        .context("the GitHub release listing holds no release")
+}
+
 fn cmd_self_update(check: bool, force: bool, tag: Option<String>) -> Result<()> {
     use self_update::cargo_crate_version;
 
@@ -1224,9 +1233,10 @@ fn cmd_self_update(check: bool, force: bool, tag: Option<String>) -> Result<()> 
                 self_update_rate_limit_hint()
             )
         })?;
+        let latest = newest_release_version(&latest)?;
         let current = cargo_crate_version!();
-        if self_update::version::bump_is_greater(current, &latest.version).unwrap_or(false) {
-            println!("codegraph {current} -> {} available", latest.version);
+        if self_update::version::bump_is_greater(current, &latest).unwrap_or(false) {
+            println!("codegraph {current} -> {latest} available");
             println!("run `codegraph self-update` to install it");
         } else {
             println!("codegraph {current} is up to date");
@@ -1254,17 +1264,18 @@ fn cmd_self_update(check: bool, force: bool, tag: Option<String>) -> Result<()> 
                     self_update_rate_limit_hint()
                 )
             })?;
+            let latest = newest_release_version(&latest)?;
             let current = cargo_crate_version!();
-            if should_skip_update(current, &latest.version, force, false) {
+            if should_skip_update(current, &latest, force, false) {
                 println!("codegraph {current} is already up to date");
                 return Ok(());
             }
-            latest_update_tag(&latest.version)
+            latest_update_tag(&latest)
         }
     };
 
     let mut builder = configure();
-    builder.target_version_tag(&target_tag);
+    builder.release_tag(target_tag.as_str());
     let updater = builder
         .build()
         .context("configuring the self-update backend")?;
@@ -1275,7 +1286,7 @@ fn cmd_self_update(check: bool, force: bool, tag: Option<String>) -> Result<()> 
             self_update_rate_limit_hint()
         )
     })?;
-    if status.updated() {
+    if status.is_updated() {
         println!("Updated codegraph to {}", status.version());
     } else {
         println!("codegraph {} is already up to date", status.version());

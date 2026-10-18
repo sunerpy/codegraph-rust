@@ -75,12 +75,12 @@ indicatif = { version = "0.18", features = ["rayon"] }
 jsonc-parser = { version = "0.34", features = ["cst", "serde"] }
 
 # Self-update from GitHub Releases (mise-style `codegraph self-update`)
-# self_update 0.43+ moved to quick-xml ^0.38 (fixes RUSTSEC-2026-0194/0195) and
-# indicatif ^0.18; the builder API used by cmd_self_update is unchanged (no break
-# until the 1.0.0-rc line). 0.44 also made the HTTP client optional: `reqwest` must
-# be listed explicitly, and `rustls` gates on it (`reqwest?/rustls`), so keep both
-# to get reqwest+rustls (no native-tls/OpenSSL) as before. Keep default-features=false.
-self_update = { version = "0.44", default-features = false, features = ["reqwest", "rustls", "archive-tar", "archive-zip", "compression-flate2", "compression-zip-deflate"] }
+# self_update 1.3.1 extracts zip archives through zip ^9 (RUSTSEC-2026-0367/0368/
+# 0369 hit zip 6, which 0.44 required). Since 1.0 each backend, the progress bar
+# and the tar.gz decoder are features of their own (`github`, `progress-bar`,
+# `compression-tar-gz`), and quick-xml only comes with the `s3` backend. The HTTP
+# client stays reqwest with rustls (no native-tls/OpenSSL). Keep default-features=false.
+self_update = { version = "1.3.1", default-features = false, features = ["reqwest", "rustls", "github", "progress-bar", "archive-tar", "archive-zip", "compression-tar-gz", "compression-zip-deflate"] }
 
 # Benchmarking
 criterion = "0.8"
