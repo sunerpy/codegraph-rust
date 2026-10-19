@@ -1804,36 +1804,61 @@ fn cmd_sync(path: Option<PathBuf>, quiet: bool, diagnostics: DiagnosticArgs) -> 
     })?;
     finish_phase(&bar, "Synced files");
     diagnostic_run.relocate_to_index_root(paths.current_root());
-    if let Some(sink) = &diagnostic_sink
-        && let Ok(store) = open_store(&project)
-    {
-        for relative in &outcome.changed_paths {
-            let record = store.file_by_path(relative).ok().flatten();
+    let emit_file_complete =
+        |sink: &diagnostics::DiagnosticSink,
+         relative: &str,
+         record: Option<&codegraph_core::types::FileRecord>| {
             sink.emit(
                 "file_complete",
                 json!({
                     "file": relative,
                     "status": if record.is_some() { "reindexed" } else { "removed" },
-                    "language": record.as_ref().map(|file| file.language.to_string()),
-                    "sizeBytes": record.as_ref().map(|file| file.size),
-                    "nodes": record.as_ref().map(|file| file.node_count),
+                    "language": record.map(|file| file.language.to_string()),
+                    "sizeBytes": record.map(|file| file.size),
+                    "nodes": record.map(|file| file.node_count),
                     "edges": serde_json::Value::Null,
                     "references": serde_json::Value::Null,
-                    "errors": record.as_ref().map(|file| file.errors.len()),
+                    "errors": record.map(|file| file.errors.len()),
                 }),
             );
-        }
-    }
+        };
     let mut sync_warnings = Vec::new();
-    if let Ok(store) = open_store(&project) {
-        for relative in &outcome.changed_paths {
-            if let Some(record) = store.file_by_path(relative)? {
-                sync_warnings.extend(
-                    record
-                        .errors
-                        .into_iter()
-                        .filter(|error| codegraph_extract::is_extraction_warning(error)),
-                );
+    if let Some(records) = &outcome.changed_records {
+        // The rows the sync left, handed back by its writer: no second open
+        // of the index, which reads the whole database (W5-09d).
+        if let Some(sink) = &diagnostic_sink {
+            for (relative, record) in records {
+                emit_file_complete(sink, relative, record.as_ref());
+            }
+        }
+        for record in records.iter().filter_map(|(_, record)| record.as_ref()) {
+            sync_warnings.extend(
+                record
+                    .errors
+                    .iter()
+                    .filter(|error| codegraph_extract::is_extraction_warning(error))
+                    .cloned(),
+            );
+        }
+    } else {
+        if let Some(sink) = &diagnostic_sink
+            && let Ok(store) = open_store(&project)
+        {
+            for relative in &outcome.changed_paths {
+                let record = store.file_by_path(relative).ok().flatten();
+                emit_file_complete(sink, relative, record.as_ref());
+            }
+        }
+        if let Ok(store) = open_store(&project) {
+            for relative in &outcome.changed_paths {
+                if let Some(record) = store.file_by_path(relative)? {
+                    sync_warnings.extend(
+                        record
+                            .errors
+                            .into_iter()
+                            .filter(|error| codegraph_extract::is_extraction_warning(error)),
+                    );
+                }
             }
         }
     }

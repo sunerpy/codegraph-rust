@@ -116,6 +116,11 @@ pub struct SyncOutcome {
     /// though they are no source files. `None` when the sync did not read
     /// them.
     pub control_paths: Option<crate::control_inputs::RecordedInputs>,
+    /// Each of `changed_paths` with its file row as this sync left it (`None`
+    /// for a removed file), read by the writer before it returned, so a caller
+    /// reports on the sync without opening the index again (W5-09d). `None`
+    /// when the outcome did not come from a sync that read them.
+    pub changed_records: Option<Vec<(String, Option<FileRecord>)>>,
 }
 
 /// Read-only difference between the current project scope and the persisted
@@ -1471,9 +1476,22 @@ fn sync_paths_with_store(
     outcome.duration_ms = started.elapsed().as_millis();
     let mut changed_paths: Vec<String> = reindexed.into_iter().collect();
     changed_paths.sort();
+    outcome.changed_records = Some(changed_records(store, &changed_paths)?);
     outcome.changed_paths = changed_paths;
     outcome.control_paths = Some(crate::control_inputs::recorded_paths(store)?);
     Ok(outcome)
+}
+
+/// Each of `paths` with its file row in `store` (`None` once removed), in
+/// order: what [`SyncOutcome::changed_records`] carries.
+pub(crate) fn changed_records(
+    store: &Store,
+    paths: &[String],
+) -> Result<Vec<(String, Option<FileRecord>)>> {
+    paths
+        .iter()
+        .map(|path| Ok((path.clone(), store.file_by_path(path)?)))
+        .collect()
 }
 
 /// Rebuild only the affected source-site groups of unchanged dependent files,
@@ -7132,6 +7150,63 @@ pub(crate) mod tests {
         // Then: nothing was reindexed, so changed_paths is empty.
         assert_eq!(second.files_reindexed, 0);
         assert!(second.changed_paths.is_empty());
+    }
+
+    /// W5-09d: the outcome carries each changed path's row as the sync left
+    /// it, the same row a later read-only open finds, and `None` for a file
+    /// the sync removed.
+    #[test]
+    fn changed_records_are_the_rows_the_sync_left() {
+        let dir = TestDir::new("watch-changed-records");
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::write(
+            dir.path().join("src/app.ts"),
+            "export function answer() { return 42; }\n",
+        )
+        .unwrap();
+        fs::write(dir.path().join("src/gone.ts"), "export const gone = 1;\n").unwrap();
+        let db = default_db_path(dir.path()).unwrap();
+        let _ = sync_changed_paths(dir.path(), &db, ["src/app.ts", "src/gone.ts"]).unwrap();
+
+        fs::write(
+            dir.path().join("src/app.ts"),
+            "export function answer() { return 43; }\nexport function more() {}\n",
+        )
+        .unwrap();
+        fs::remove_file(dir.path().join("src/gone.ts")).unwrap();
+        let outcome = sync_changed_paths(dir.path(), &db, ["src/app.ts", "src/gone.ts"]).unwrap();
+
+        let records = outcome.changed_records.expect("a sync hands its rows back");
+        assert_eq!(
+            records
+                .iter()
+                .map(|(path, _)| path.as_str())
+                .collect::<Vec<_>>(),
+            outcome
+                .changed_paths
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+        );
+        let paths = IndexPaths::resolve(dir.path(), None).unwrap();
+        let store =
+            Store::open_for_read(&paths, Instant::now() + Duration::from_secs(10), || false)
+                .unwrap();
+        for (path, record) in &records {
+            assert_eq!(record, &store.file_by_path(path).unwrap(), "{path}");
+        }
+        let app = records
+            .iter()
+            .find(|(path, _)| path == "src/app.ts")
+            .and_then(|(_, record)| record.as_ref())
+            .expect("the edited file keeps its row");
+        assert_eq!(app.node_count, 3, "the row after the edit, with `more`");
+        assert!(
+            records
+                .iter()
+                .any(|(path, record)| path == "src/gone.ts" && record.is_none()),
+            "the removed file has no row"
+        );
     }
 
     #[test]

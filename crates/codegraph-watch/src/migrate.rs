@@ -344,6 +344,9 @@ pub(crate) fn migrate_project(
         )?;
     }
 
+    // The rows the rebuild wrote, read before it closes (W5-09d).
+    outcome.changed_records = Some(crate::sync::changed_records(rebuild.store(), &candidates)?);
+
     // Explicit fallible finalization: pragma restore, checkpoint + compaction,
     // extraction stamp, stamp checkpoint, connection close, and only then the
     // atomic `phase=current` publication.
