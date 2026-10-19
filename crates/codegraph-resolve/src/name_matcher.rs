@@ -361,29 +361,64 @@ pub(crate) fn is_lexically_reachable(
     reference: &RefView,
     context: &dyn ResolutionContext,
 ) -> bool {
+    is_reachable_within(candidate, reference, context, &CandidateReach::default())
+}
+
+/// What reaching a candidate by name depends on that no reference changes,
+/// each read once it is needed (W5-08): a name's candidates keep it for the
+/// pass ([`NameMatcherTables::named_candidates`]).
+#[derive(Debug, Default)]
+pub(crate) struct CandidateReach {
+    /// [`candidate_scope`].
+    scope: OnceLock<Option<(i64, i64)>>,
+    /// The object literal a function is a member of.
+    object_owner: OnceLock<Option<Arc<Node>>>,
+}
+
+/// [`is_lexically_reachable`] with what the candidate's own reach depends on
+/// kept in `reach`: what is left depends on the reference.
+fn is_reachable_within(
+    candidate: &Node,
+    reference: &RefView,
+    context: &dyn ResolutionContext,
+    reach: &CandidateReach,
+) -> bool {
     // An object literal's member is reached through its object (upstream
     // #2363): a bare `load()` or `setTimeout(load)` never means `App.load`,
     // whatever shares the name.
     if candidate.kind == NodeKind::Function
         && is_simple_js_identifier(&reference.reference_name)
-        && !crate::object_owners::is_object_member_reachable_by_name(candidate, reference, context)
+        && let Some(owner) = reach
+            .object_owner
+            .get_or_init(|| crate::object_owners::object_literal_owner_of(candidate, context))
+        && !crate::object_owners::is_member_reachable_through(owner, candidate, reference, context)
     {
         return false;
     }
     if crate::object_owners::is_unreachable_path_holder(candidate, reference) {
         return false;
     }
+    reach
+        .scope
+        .get_or_init(|| candidate_scope(candidate, context))
+        .is_none_or(|(start, end)| {
+            reference.file_path == candidate.file_path
+                && reference.line >= start
+                && reference.line <= end
+        })
+}
+
+/// The lines a candidate is in scope for, when it is local to them: what
+/// reaching it by name depends on that no reference changes (W5-08), which
+/// a name's candidates keep for the pass ([`NameMatcherTables`]).
+fn candidate_scope(candidate: &Node, context: &dyn ResolutionContext) -> Option<(i64, i64)> {
     // A `val` / `const` declared in a function body is that body's alone, and
     // a Scala `val` filed under its class but written in a block of the
     // class body that block's (upstream #2193).
     if matches!(candidate.kind, NodeKind::Variable | NodeKind::Constant)
         || (candidate.kind == NodeKind::Field && candidate.language == Language::Scala)
     {
-        return local_declaration_scope(candidate, context).is_none_or(|(start, end)| {
-            reference.file_path == candidate.file_path
-                && reference.line >= start
-                && reference.line <= end
-        });
+        return local_declaration_scope(candidate, context);
     }
     // A function, or a type (`case class B()` in a test method), or a
     // method of such a type, declared inside a function is only in scope in
@@ -399,20 +434,16 @@ pub(crate) fn is_lexically_reachable(
             | NodeKind::Trait
             | NodeKind::TypeAlias
     ) {
-        return true;
+        return None;
     }
     // C and C++ have no nested named functions: a function the graph shows
     // inside another is an extraction artifact (a macro whose designated
     // initializers derail tree-sitter-c error recovery), not a scope, so it
     // stays reachable (`NO_NESTED_FUNCTIONS`, upstream #1708).
     if matches!(candidate.language, Language::C | Language::Cpp) {
-        return true;
+        return None;
     }
-    lexical_scope_of(candidate, context).is_none_or(|(start, end)| {
-        reference.file_path == candidate.file_path
-            && reference.line >= start
-            && reference.line <= end
-    })
+    lexical_scope_of(candidate, context)
 }
 
 /// The lines a variable declaration is in scope for when it is local
@@ -436,11 +467,8 @@ pub(crate) fn local_declaration_scope(
             return None;
         }
         let mut scope: Option<(i64, i64)> = None;
-        for n in context
-            .get_nodes_in_file_shared(&candidate.file_path)
-            .iter()
-        {
-            if !matches!(n.kind, NodeKind::Function | NodeKind::Method) || n.id == candidate.id {
+        for n in &context.file_callables(&candidate.file_path).in_file_order {
+            if n.id == candidate.id {
                 continue;
             }
             if n.start_line > candidate.start_line
@@ -464,10 +492,7 @@ pub(crate) fn local_declaration_scope(
         }
         scope
     };
-    match context.source_facts(&candidate.file_path) {
-        Some(facts) => facts.local_declaration_scope(&candidate.id, compute),
-        None => compute(),
-    }
+    compute()
 }
 
 /// Whether a Lua declaration is a `local` one, read from its line (upstream
@@ -507,31 +532,330 @@ pub(crate) fn is_in_function_body(candidate: &Node, context: &dyn ResolutionCont
 /// `test_x`, upstream #2125 `lexicalScopeOf`). A method directly on a class
 /// is reachable through its instances, and an object-literal method a
 /// function returns through the object: neither is scoped by the function it
-/// sits in.
+/// sits in. Production contexts look the container up in the candidate's
+/// own file ([`FileCallables`]), not through every node of its name
+/// (W5-08).
 fn lexical_scope_of(candidate: &Node, context: &dyn ResolutionContext) -> Option<(i64, i64)> {
     let own = candidate.qualified_name.as_str();
     let parent = own.rsplit_once("::").map_or("", |(parent, _)| parent);
     let mut qualified = own;
+    let tables = context.name_matcher_tables();
     while let Some((up, _)) = qualified.rsplit_once("::") {
         qualified = up;
-        let Some(container) = context
-            .get_nodes_by_qualified_name_shared(qualified)
-            .into_iter()
-            .find(|p| {
-                p.file_path == candidate.file_path
-                    && matches!(p.kind, NodeKind::Function | NodeKind::Method)
-                    && p.start_line <= candidate.start_line
-                    && p.end_line >= candidate.end_line
-            })
-        else {
+        // No function or method of the project bears the name: none of the
+        // candidate's file does either (W5-08).
+        if !tables.names_a_callable(qualified, || context.has_callable_named(qualified)) {
+            continue;
+        }
+        let Some(container) = context.enclosing_function_lines(
+            &candidate.file_path,
+            qualified,
+            candidate.start_line,
+            candidate.end_line,
+        ) else {
             continue;
         };
         if candidate.kind == NodeKind::Method && qualified == parent {
             return None;
         }
-        return Some((container.start_line, container.end_line));
+        return Some(container);
     }
     None
+}
+
+/// The lines of the first function or method of `file_path` named
+/// `qualified` whose lines hold `start..=end`, through the qualified-name
+/// lookup: the default of [`ResolutionContext::enclosing_function_lines`],
+/// which the per-file index of a production context must match.
+pub(crate) fn enclosing_by_qualified_name<C: ResolutionContext + ?Sized>(
+    context: &C,
+    file_path: &str,
+    qualified: &str,
+    start: i64,
+    end: i64,
+) -> Option<(i64, i64)> {
+    context
+        .get_nodes_by_qualified_name_shared(qualified)
+        .into_iter()
+        .find(|p| {
+            p.file_path == file_path
+                && matches!(p.kind, NodeKind::Function | NodeKind::Method)
+                && p.start_line <= start
+                && p.end_line >= end
+        })
+        .map(|p| (p.start_line, p.end_line))
+}
+
+/// The functions and methods of one file, read once per pass (W5-08), for
+/// the two walks that read them:
+/// - by qualified name, each name's in the order the qualified-name lookup
+///   lists them ([`crate::context`]'s `order_candidates`: start line, start
+///   column, id), as line ranges, so the first that encloses a declaration
+///   is the one the lookup would find ([`lexical_scope_of`]);
+/// - all of them by start line ([`local_declaration_scope`], whose answer
+///   no order among the same line's functions changes).
+#[derive(Debug, Default)]
+pub struct FileCallables {
+    in_file_order: Vec<Arc<Node>>,
+    /// Built on first use.
+    by_qualified_name: OnceLock<HashMap<String, Vec<(i64, i64)>>>,
+}
+
+impl FileCallables {
+    /// The index of a file's functions and methods among `nodes`, which are
+    /// by start line (the rest are skipped).
+    pub fn of(nodes: &[Arc<Node>]) -> Self {
+        Self {
+            in_file_order: nodes
+                .iter()
+                .filter(|node| matches!(node.kind, NodeKind::Function | NodeKind::Method))
+                .cloned()
+                .collect(),
+            ..Self::default()
+        }
+    }
+
+    /// The lines of the first function or method named `qualified` whose
+    /// lines hold `start..=end`.
+    pub fn first_enclosing(&self, qualified: &str, start: i64, end: i64) -> Option<(i64, i64)> {
+        self.by_qualified_name
+            .get_or_init(|| {
+                let mut found: HashMap<String, Vec<&Node>> = HashMap::new();
+                for node in &self.in_file_order {
+                    found
+                        .entry(node.qualified_name.clone())
+                        .or_default()
+                        .push(node);
+                }
+                found
+                    .into_iter()
+                    .map(|(name, mut list)| {
+                        list.sort_by(|a, b| {
+                            a.start_line
+                                .cmp(&b.start_line)
+                                .then(a.start_column.cmp(&b.start_column))
+                                .then(a.id.cmp(&b.id))
+                        });
+                        let ranges = list
+                            .into_iter()
+                            .map(|node| (node.start_line, node.end_line))
+                            .collect();
+                        (name, ranges)
+                    })
+                    .collect()
+            })
+            .get(qualified)?
+            .iter()
+            .find(|(from, to)| *from <= start && *to >= end)
+            .copied()
+    }
+}
+
+/// The methods of one file by owner (the segment of a method's qualified
+/// name before its own) and name, each the first in the file's node order
+/// ([`ResolutionContext::get_nodes_in_file_shared`]), read once per pass for
+/// [`inherited_class_method`] (W5-08).
+#[derive(Debug, Default)]
+pub struct FileMethods {
+    first: HashMap<(String, String), Arc<Node>>,
+}
+
+impl FileMethods {
+    /// The methods among `nodes`, a file's nodes in its order.
+    pub fn of(nodes: &[Arc<Node>]) -> Self {
+        let mut first: HashMap<(String, String), Arc<Node>> = HashMap::new();
+        for node in nodes.iter().filter(|node| node.kind == NodeKind::Method) {
+            first
+                .entry((
+                    member_owner_name(&node.qualified_name).to_string(),
+                    node.name.clone(),
+                ))
+                .or_insert_with(|| Arc::clone(node));
+        }
+        Self { first }
+    }
+
+    /// The file's first method named `name` of `owner`.
+    pub fn method_of(&self, owner: &str, name: &str) -> Option<Arc<Node>> {
+        self.first
+            .get(&(owner.to_string(), name.to_string()))
+            .cloned()
+    }
+}
+
+/// One memo of [`NameMatcherTables`].
+type Memo<K, V> = std::sync::RwLock<HashMap<K, V>>;
+
+/// A name's candidates, each with its [`CandidateReach`].
+type NamedCandidates = Vec<(Arc<Node>, CandidateReach)>;
+
+/// The name matcher's memos for one resolution pass (W5-08): what a call
+/// through a class name inherits, by the reference's language, the class
+/// name and the method name. The nodes do not change during a pass, so the
+/// answer does not either.
+#[derive(Debug, Default)]
+pub struct NameMatcherTables {
+    inherited: Memo<(Language, String, String), Option<Arc<Node>>>,
+    /// The walks from the classes of a language and a name, as far as some
+    /// method's search took them ([`SupertypeWalk`]).
+    walks: Memo<(Language, String), Arc<Mutex<SupertypeWalk>>>,
+    /// The candidates of a name with their reach ([`Self::named_candidates`]).
+    named: Memo<String, Arc<NamedCandidates>>,
+    /// Whether a function or method of the project has the qualified name.
+    callable_names: Memo<String, bool>,
+    /// The owner names of the project's methods of a name.
+    method_owners: Memo<String, Arc<HashSet<String>>>,
+    /// The files holding a method of a name.
+    method_files: Memo<String, Arc<HashSet<String>>>,
+    /// The object-literal holders (constants and variables) of a name, by
+    /// the path each is reached by.
+    holders: Memo<String, Arc<HoldersByPath>>,
+    /// The declarations of a language and name that own methods.
+    owners: Memo<(Language, String), Arc<Vec<Arc<Node>>>>,
+}
+
+/// Constants and variables by the path each is reached by, each path's in
+/// the name lookup's order.
+pub(crate) type HoldersByPath = HashMap<String, Vec<Arc<Node>>>;
+
+/// The most answers a memo of the pass keeps before starting over.
+const INHERITED_MEMO_LIMIT: usize = 65_536;
+
+/// [`memo_or`] for a memo keyed by a string, read without allocating.
+fn memo_or_str<V: Clone>(memo: &Memo<String, V>, key: &str, compute: impl FnOnce() -> V) -> V {
+    if let Some(hit) = memo
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(key)
+    {
+        return hit.clone();
+    }
+    memo_or(memo, key.to_string(), compute)
+}
+
+/// Read a memo of [`NameMatcherTables`], or compute and keep the answer.
+fn memo_or<K, V>(memo: &Memo<K, V>, key: K, compute: impl FnOnce() -> V) -> V
+where
+    K: std::hash::Hash + Eq,
+    V: Clone,
+{
+    if let Some(hit) = memo
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(&key)
+    {
+        return hit.clone();
+    }
+    let value = compute();
+    let mut memo = memo
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if memo.len() >= INHERITED_MEMO_LIMIT {
+        memo.clear();
+    }
+    memo.insert(key, value.clone());
+    value
+}
+
+impl NameMatcherTables {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// [`inherited_class_method`] of the classes named `class` in
+    /// `language` for `method`, computed once per pass.
+    fn inherited_method(
+        &self,
+        language: Language,
+        class: &str,
+        method: &str,
+        compute: impl FnOnce() -> Option<Arc<Node>>,
+    ) -> Option<Arc<Node>> {
+        memo_or(
+            &self.inherited,
+            (language, class.to_string(), method.to_string()),
+            compute,
+        )
+    }
+
+    /// The walk from the classes named `class` in `language`, started once
+    /// per pass from `classes`.
+    fn supertype_walk(
+        &self,
+        language: Language,
+        class: &str,
+        classes: impl FnOnce() -> Vec<Arc<Node>>,
+    ) -> Arc<Mutex<SupertypeWalk>> {
+        memo_or(&self.walks, (language, class.to_string()), || {
+            Arc::new(Mutex::new(SupertypeWalk::new(classes())))
+        })
+    }
+
+    /// Whether a function or method of the project has the qualified name
+    /// `qualified`, computed once per pass.
+    fn names_a_callable(&self, qualified: &str, compute: impl FnOnce() -> bool) -> bool {
+        memo_or_str(&self.callable_names, qualified, compute)
+    }
+
+    /// The owner names (the segment before a method's own in its qualified
+    /// name) of the project's methods named `name`, computed once per pass.
+    fn method_owners(
+        &self,
+        name: &str,
+        compute: impl FnOnce() -> HashSet<String>,
+    ) -> Arc<HashSet<String>> {
+        memo_or_str(&self.method_owners, name, || Arc::new(compute()))
+    }
+
+    /// The files holding a method named `name`, computed once per pass.
+    fn method_files(
+        &self,
+        name: &str,
+        compute: impl FnOnce() -> HashSet<String>,
+    ) -> Arc<HashSet<String>> {
+        memo_or_str(&self.method_files, name, || Arc::new(compute()))
+    }
+
+    /// The constants and variables named `name` of an object-literal
+    /// language by their paths, computed once per pass.
+    pub(crate) fn object_holders(
+        &self,
+        name: &str,
+        compute: impl FnOnce() -> HoldersByPath,
+    ) -> Arc<HoldersByPath> {
+        memo_or_str(&self.holders, name, || Arc::new(compute()))
+    }
+
+    /// The declarations named `name` in `language` that own methods, in the
+    /// name lookup's order, computed once per pass.
+    fn owners_named(
+        &self,
+        language: Language,
+        name: &str,
+        compute: impl FnOnce() -> Vec<Arc<Node>>,
+    ) -> Arc<Vec<Arc<Node>>> {
+        memo_or(&self.owners, (language, name.to_string()), || {
+            Arc::new(compute())
+        })
+    }
+
+    /// The nodes named `name`, as `nodes` lists them, each with its
+    /// [`CandidateReach`] once read: a pass reads every reference of a name
+    /// against the same candidates (W5-08).
+    fn named_candidates(
+        &self,
+        name: &str,
+        nodes: impl FnOnce() -> Vec<Arc<Node>>,
+    ) -> Arc<NamedCandidates> {
+        memo_or_str(&self.named, name, || {
+            Arc::new(
+                nodes()
+                    .into_iter()
+                    .map(|node| (node, CandidateReach::default()))
+                    .collect(),
+            )
+        })
+    }
 }
 
 /// Languages whose calls are JS/TS calls (upstream `JS_FAMILY`): Vue, Svelte
@@ -1319,48 +1643,128 @@ fn member_owner_name(qualified_name: &str) -> &str {
         .unwrap_or_default()
 }
 
-/// A method named `name` on a supertype of `classes`, nearest first, at most
-/// five levels up (upstream #2180 `inheritedClassMethod`).
+/// A method named `name` on a supertype of the walk's classes, nearest
+/// first, at most five levels up (upstream #2180 `inheritedClassMethod`):
+/// the first declaration the walk visits with such a method.
 fn inherited_class_method(
-    classes: &[Arc<Node>],
+    walk: &Mutex<SupertypeWalk>,
     name: &str,
     context: &dyn ResolutionContext,
 ) -> Option<Arc<Node>> {
-    let mut seen: std::collections::HashSet<String> =
-        classes.iter().map(|class| class.id.clone()).collect();
-    let mut frontier: Vec<Arc<Node>> = classes.to_vec();
-    for _ in 0..5 {
-        if frontier.is_empty() {
-            break;
-        }
-        let mut next = Vec::new();
-        for class in &frontier {
-            for supertype in crate::class_heads::declared_supertypes(class, context) {
-                for decl in context.get_nodes_by_name_shared(&supertype) {
-                    if decl.language != class.language
-                        || !is_method_owner(&decl)
-                        || !seen.insert(decl.id.clone())
-                    {
-                        continue;
-                    }
-                    if let Some(method) = context
-                        .get_nodes_in_file_shared(&decl.file_path)
-                        .into_iter()
-                        .find(|n| {
-                            n.kind == NodeKind::Method
-                                && n.name == name
-                                && member_owner_name(&n.qualified_name) == decl.name
-                        })
-                    {
-                        return Some(method);
-                    }
-                    next.push(decl);
-                }
-            }
-        }
-        frontier = next;
+    // Only a declaration some method of the name names as its owner can hold
+    // it: the others' files are not read (W5-08).
+    let owners = context.name_matcher_tables().method_owners(name, || {
+        context
+            .get_nodes_by_name_shared(name)
+            .iter()
+            .filter(|node| node.kind == NodeKind::Method)
+            .map(|node| member_owner_name(&node.qualified_name).to_string())
+            .collect()
+    });
+    if owners.is_empty() {
+        return None;
     }
-    None
+    let mut walk = walk.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let method = |decl: &Arc<Node>| {
+        if !owners.contains(decl.name.as_str()) {
+            return None;
+        }
+        context
+            .file_methods(&decl.file_path)
+            .method_of(&decl.name, name)
+    };
+    if let Some(found) = walk.visited.iter().find_map(method) {
+        return Some(found);
+    }
+    loop {
+        let from = walk.visited.len();
+        if !walk.step(context) {
+            return None;
+        }
+        if let Some(found) = walk.visited[from..].iter().find_map(method) {
+            return Some(found);
+        }
+    }
+}
+
+/// The walk of upstream #2180 from the classes of one language and name,
+/// level by level up to five: each class's declared supertypes, each name's
+/// declarations of the class's language that own methods, every declaration
+/// once. The walk stops at the first declaration with the method it looks
+/// for; the declarations it visits before that are the same, in the same
+/// order, whatever the method, so the declarations visited so far serve
+/// every method name's search, and a search that finds none there carries
+/// the walk on, one class at a time, as far as it needs (W5-08).
+#[derive(Debug)]
+pub(crate) struct SupertypeWalk {
+    /// The declarations visited so far, in the walk's order.
+    visited: Vec<Arc<Node>>,
+    seen: std::collections::HashSet<String>,
+    /// The languages and supertype names the walk has taken the
+    /// declarations of: every declaration of one met again is seen already.
+    expanded: std::collections::HashSet<(Language, String)>,
+    /// The level being expanded, the next of its classes, and the next level.
+    frontier: Vec<Arc<Node>>,
+    cursor: usize,
+    next: Vec<Arc<Node>>,
+    level: usize,
+}
+
+impl SupertypeWalk {
+    fn new(classes: Vec<Arc<Node>>) -> Self {
+        Self {
+            visited: Vec::new(),
+            seen: classes.iter().map(|class| class.id.clone()).collect(),
+            expanded: std::collections::HashSet::new(),
+            frontier: classes,
+            cursor: 0,
+            next: Vec::new(),
+            level: 0,
+        }
+    }
+
+    /// Expand the next class: its supertypes' declarations join the visited
+    /// ones. `false` once the walk is done.
+    fn step(&mut self, context: &dyn ResolutionContext) -> bool {
+        let tables = context.name_matcher_tables();
+        if self.cursor == self.frontier.len() {
+            self.level += 1;
+            self.frontier = std::mem::take(&mut self.next);
+            self.cursor = 0;
+        }
+        if self.level >= 5 || self.frontier.is_empty() {
+            return false;
+        }
+        let class = Arc::clone(&self.frontier[self.cursor]);
+        self.cursor += 1;
+        for supertype in crate::class_heads::declared_supertypes(&class, context) {
+            // A name's declarations of the language, once taken, are all
+            // seen: the name met again adds none.
+            let key = (class.language, supertype);
+            if self.expanded.contains(&key) {
+                continue;
+            }
+            let supertype = &key.1;
+            // The name's declarations of the class's language that own
+            // methods, in the name lookup's order, read once per pass.
+            let owners = tables.owners_named(class.language, supertype, || {
+                context
+                    .get_nodes_by_name_shared(supertype)
+                    .into_iter()
+                    .filter(|decl| decl.language == class.language && is_method_owner(decl))
+                    .collect()
+            });
+            for decl in owners.iter() {
+                if !self.seen.insert(decl.id.clone()) {
+                    continue;
+                }
+                self.visited.push(Arc::clone(decl));
+                self.next.push(Arc::clone(decl));
+            }
+            self.expanded.insert(key);
+        }
+        true
+    }
 }
 
 /// A request handler the web framework dispatches to: a Django / DRF /
@@ -2481,7 +2885,12 @@ pub fn match_by_exact_name(
     let rust_method = rust_shape == Some(RustCallShape::Method);
     // A bare Rust name reaches what is in scope (upstream #2124, #2214).
     let rust_scoped = crate::rust_scope::is_rust_bare_identifier(reference);
-    let same_name = context.get_nodes_by_name_shared(&reference.reference_name);
+    let named = context
+        .name_matcher_tables()
+        .named_candidates(&reference.reference_name, || {
+            context.get_nodes_by_name_shared(&reference.reference_name)
+        });
+    let same_name = named.iter().map(|(node, _)| node);
     // `NAME(...)` where NAME is a function-like macro somewhere in the project
     // is an expansion or a call to a same-named function — never the macro
     // itself (#1839), and never a type that happens to share the name (#2070:
@@ -2491,19 +2900,24 @@ pub fn match_by_exact_name(
     let macro_call = reference.reference_kind == EdgeKind::Calls
         && matches!(reference.language, Language::C | Language::Cpp)
         && same_name
-            .iter()
+            .clone()
             .any(|n| crate::c_macro_visibility::is_define_constant(n));
-    let reachable: Vec<Arc<Node>> = apply_language_gate(same_name, reference)
-        .into_iter()
+    drop(same_name);
+    let gated = reference.reference_kind == EdgeKind::References;
+    let reachable: Vec<Arc<Node>> = named
+        .iter()
+        // The language gate ([`apply_language_gate`]).
+        .filter(|(n, _)| !gated || same_language_family(n.language, reference.language))
         // An `import` node is a statement, not a definition: a reference never
         // binds one by name, its own or another file's, and an import named
         // like a definition never makes that definition look ambiguous
         // (upstream #965, `0a91d0f5`). Linking an import to what it names is
         // the import resolver's job.
-        .filter(|n| n.kind != NodeKind::Import)
-        .filter(|n| !macro_call || matches!(n.kind, NodeKind::Function | NodeKind::Method))
+        .filter(|(n, _)| n.kind != NodeKind::Import)
+        .filter(|(n, _)| !macro_call || matches!(n.kind, NodeKind::Function | NodeKind::Method))
         // Nested locals are only reachable from inside their container (#1230).
-        .filter(|n| is_lexically_reachable(n, reference, context))
+        .filter(|(n, reach)| is_reachable_within(n, reference, context, reach))
+        .map(|(n, _)| Arc::clone(n))
         .collect();
 
     // A same-named non-type is not a supertype, and a type member is not
@@ -4403,15 +4817,20 @@ pub(crate) fn infer_local_receiver_declaration(
             )
         })
     };
-    let source = context.read_file(&reference.file_path)?;
-    let lines: Vec<&str> = source
-        .split('\n')
-        .map(|l| l.trim_end_matches('\r'))
-        .collect();
-    if lines.is_empty() {
+    // The file's lines, `split('\n')` with each `\r` trimmed, from its
+    // cached facts rather than a copy split per call (W5-08).
+    let facts = context.source_facts(&reference.file_path)?;
+    let line_count = facts.lines().raw_line_count();
+    let line = |index: usize| {
+        facts
+            .raw_line(index)
+            .unwrap_or_default()
+            .trim_end_matches('\r')
+    };
+    if line_count == 0 {
         return None;
     }
-    let call_idx = ((reference.line - 1).max(0) as usize).min(lines.len() - 1);
+    let call_idx = ((reference.line - 1).max(0) as usize).min(line_count - 1);
     let start_idx = if component_scoped {
         0
     } else {
@@ -4441,13 +4860,13 @@ pub(crate) fn infer_local_receiver_declaration(
         None
     };
     for i in (start_idx..=call_idx).rev() {
-        if let Some(declared) = match_line(lines[i]) {
+        if let Some(declared) = match_line(line(i)) {
             return Some(declared);
         }
     }
     if component_scoped {
-        for line in &lines[call_idx + 1..] {
-            if let Some(declared) = match_line(line) {
+        for i in call_idx + 1..line_count {
+            if let Some(declared) = match_line(line(i)) {
                 return Some(declared);
             }
         }
@@ -4778,11 +5197,6 @@ fn infer_class_field_receiver_type(
     if !is_esm_language(reference.language) {
         return None;
     }
-    let escaped = regex_escape(receiver_name);
-    let patterns = local_receiver_type_patterns_tagged(reference.language, &escaped);
-    if patterns.is_empty() {
-        return None;
-    }
 
     let in_file = context.get_nodes_in_file_shared(&reference.file_path);
     let enclosing = in_file
@@ -4804,6 +5218,13 @@ fn infer_class_field_receiver_type(
             && n.qualified_name == want
             && n.language == reference.language
     })?;
+    // Compiled only for a field the call's class declares: the answer is
+    // the same, and most receivers are none (W5-08).
+    let escaped = regex_escape(receiver_name);
+    let patterns = local_receiver_type_patterns_tagged(reference.language, &escaped);
+    if patterns.is_empty() {
+        return None;
+    }
 
     let source = context.read_file(&reference.file_path)?;
     let line = source
@@ -5855,19 +6276,45 @@ pub fn match_method_call(
     }
     // A class method the named class inherits (Horse's `THorse.Get(…)` is
     // THorseCore's, three `class(…)` heads up) before any guess by name
-    // (upstream #2180).
-    let named_classes: Vec<Arc<Node>> = context
-        .get_nodes_by_name_shared(&object_or_class)
-        .into_iter()
-        .filter(|class_node| {
-            class_node.language == reference.language
-                && (matches!(
-                    class_node.kind,
-                    NodeKind::Class | NodeKind::Struct | NodeKind::Union | NodeKind::Interface
-                ) || crate::types::is_scala_singleton(class_node))
-        })
-        .collect();
-    if let Some(inherited) = inherited_class_method(&named_classes, &method_name, context) {
+    // (upstream #2180). The answer depends only on the language and the two
+    // names, so a pass computes it once (W5-08).
+    let tables = context.name_matcher_tables();
+    let inherited =
+        tables.inherited_method(reference.language, &object_or_class, &method_name, || {
+            // The walk finds a method of the name or nothing: with no method
+            // of the name in the project, nothing (W5-08).
+            if tables
+                .method_owners(&method_name, || {
+                    context
+                        .get_nodes_by_name_shared(&method_name)
+                        .iter()
+                        .filter(|node| node.kind == NodeKind::Method)
+                        .map(|node| member_owner_name(&node.qualified_name).to_string())
+                        .collect()
+                })
+                .is_empty()
+            {
+                return None;
+            }
+            let walk = tables.supertype_walk(reference.language, &object_or_class, || {
+                context
+                    .get_nodes_by_name_shared(&object_or_class)
+                    .into_iter()
+                    .filter(|class_node| {
+                        class_node.language == reference.language
+                            && (matches!(
+                                class_node.kind,
+                                NodeKind::Class
+                                    | NodeKind::Struct
+                                    | NodeKind::Union
+                                    | NodeKind::Interface
+                            ) || crate::types::is_scala_singleton(class_node))
+                    })
+                    .collect()
+            });
+            inherited_class_method(&walk, &method_name, context)
+        });
+    if let Some(inherited) = inherited {
         return Some(ResolvedRef {
             original: reference.clone(),
             target_node_id: inherited.id.clone(),
@@ -6685,6 +7132,14 @@ fn find_method_in_class(
     context: &dyn ResolutionContext,
     accept: &dyn Fn(&Node) -> bool,
 ) -> Option<Node> {
+    // A file holding no method of the name holds none in the class: its
+    // nodes are not read (W5-08).
+    if context
+        .method_files(method_name)
+        .is_some_and(|files| !files.contains(class_node.file_path.as_str()))
+    {
+        return None;
+    }
     context
         .get_nodes_in_file_shared(&class_node.file_path)
         .into_iter()
@@ -6695,6 +7150,22 @@ fn find_method_in_class(
                 && accept(n)
         })
         .map(|node| node.as_ref().clone())
+}
+
+/// The files holding a method named `name`, once per pass (W5-08): what a
+/// production context's [`ResolutionContext::method_files`] answers.
+pub(crate) fn method_files_of<C: ResolutionContext + ?Sized>(
+    name: &str,
+    context: &C,
+) -> Arc<HashSet<String>> {
+    context.name_matcher_tables().method_files(name, || {
+        context
+            .get_nodes_by_name_shared(name)
+            .iter()
+            .filter(|node| node.kind == NodeKind::Method)
+            .map(|node| node.file_path.clone())
+            .collect()
+    })
 }
 
 /// Whether `method` can be what a call through a value means: a Dart named
@@ -15906,6 +16377,376 @@ mod tests {
         assert_eq!(
             match_fuzzy(&reference, &lone_function).map(|r| r.target_node_id),
             Some("function:save".to_string())
+        );
+    }
+
+    /// W5-08: the per-file index finds the container the qualified-name
+    /// lookup finds, the first in that lookup's order (start line, start
+    /// column, id) of the same file's functions and methods of the name
+    /// whose lines hold the declaration: same-named functions that both
+    /// hold it, an overload signature that holds nothing, a method, a
+    /// class (no scope) and another file's namesake.
+    #[test]
+    fn function_scopes_find_the_container_the_qualified_name_lookup_finds() {
+        let at = |id: &str, kind, qualified: &str, file: &str, lines: (i64, i64), column| {
+            let name = qualified.rsplit("::").next().unwrap_or(qualified);
+            let mut node = mk(id, kind, name, qualified, file, Language::TypeScript);
+            (node.start_line, node.end_line) = lines;
+            node.start_column = column;
+            Arc::new(node)
+        };
+        let nodes = vec![
+            at("f-sig", NodeKind::Function, "f", "a.ts", (1, 1), 0),
+            at("f-b", NodeKind::Function, "f", "a.ts", (3, 20), 4),
+            at("f-a", NodeKind::Function, "f", "a.ts", (3, 20), 0),
+            at("f-outer", NodeKind::Function, "f", "a.ts", (2, 30), 0),
+            at("m", NodeKind::Method, "C::m", "a.ts", (5, 9), 2),
+            at("c", NodeKind::Class, "C", "a.ts", (4, 10), 0),
+            at("f-other", NodeKind::Function, "f", "b.ts", (1, 100), 0),
+        ];
+        let in_file: Vec<Arc<Node>> = nodes
+            .iter()
+            .filter(|node| node.file_path == "a.ts")
+            .cloned()
+            .collect();
+        let scopes = FileCallables::of(&in_file);
+        let mut ordered = nodes.clone();
+        crate::context::order_candidates(&mut ordered);
+        for (qualified, start, end) in [
+            ("f", 6, 7),
+            ("f", 3, 20),
+            ("f", 25, 26),
+            ("f", 1, 1),
+            ("f", 31, 31),
+            ("C::m", 6, 6),
+            ("C", 6, 6),
+            ("g", 1, 1),
+        ] {
+            let lookup = ordered
+                .iter()
+                .find(|p| {
+                    p.file_path == "a.ts"
+                        && matches!(p.kind, NodeKind::Function | NodeKind::Method)
+                        && p.qualified_name == qualified
+                        && p.start_line <= start
+                        && p.end_line >= end
+                })
+                .map(|p| (p.start_line, p.end_line));
+            assert_eq!(
+                scopes.first_enclosing(qualified, start, end),
+                lookup,
+                "{qualified} {start}..={end}"
+            );
+        }
+        assert_eq!(scopes.first_enclosing("f", 6, 7), Some((2, 30)));
+    }
+
+    /// The walk of upstream #2180 as it was written before W5-08, the
+    /// reference the sequence must reproduce.
+    fn reference_inherited_class_method(
+        classes: &[Arc<Node>],
+        name: &str,
+        context: &dyn ResolutionContext,
+    ) -> Option<Arc<Node>> {
+        let mut seen: std::collections::HashSet<String> =
+            classes.iter().map(|class| class.id.clone()).collect();
+        let mut frontier: Vec<Arc<Node>> = classes.to_vec();
+        for _ in 0..5 {
+            if frontier.is_empty() {
+                break;
+            }
+            let mut next = Vec::new();
+            for class in &frontier {
+                for supertype in crate::class_heads::declared_supertypes(class, context) {
+                    for decl in context.get_nodes_by_name_shared(&supertype) {
+                        if decl.language != class.language
+                            || !is_method_owner(&decl)
+                            || !seen.insert(decl.id.clone())
+                        {
+                            continue;
+                        }
+                        if let Some(method) = context
+                            .get_nodes_in_file_shared(&decl.file_path)
+                            .into_iter()
+                            .find(|n| {
+                                n.kind == NodeKind::Method
+                                    && n.name == name
+                                    && member_owner_name(&n.qualified_name) == decl.name
+                            })
+                        {
+                            return Some(method);
+                        }
+                        next.push(decl);
+                    }
+                }
+            }
+            frontier = next;
+        }
+        None
+    }
+
+    /// W5-08: the supertype sequence, read once per class name, finds for
+    /// every method name what the walk found: the nearest level first, a
+    /// level's declarations in the walk's order, each declaration once
+    /// (a diamond), a method of another owner in the same file skipped,
+    /// and nothing past the fifth level.
+    #[test]
+    fn the_supertype_sequence_finds_what_the_inherited_walk_found() {
+        let class = |id: &str, name: &str, file: &str| {
+            let mut node = mk(id, NodeKind::Class, name, name, file, Language::Python);
+            node.start_line = 1;
+            node.end_line = 4;
+            node
+        };
+        let method = |id: &str, owner: &str, name: &str, file: &str| {
+            let mut node = mk(
+                id,
+                NodeKind::Method,
+                name,
+                &format!("{owner}::{name}"),
+                file,
+                Language::Python,
+            );
+            node.start_line = 2;
+            node.end_line = 3;
+            node
+        };
+        let heads = [
+            ("a1.py", "A", "class A(B):\n    pass\n"),
+            ("a2.py", "A", "class A(D):\n    pass\n"),
+            ("b.py", "B", "class B(C):\n    def other(self): pass\n"),
+            ("c.py", "C", "class C(E1):\n    def m(self): pass\n"),
+            ("d.py", "D", "class D(C):\n    def n(self): pass\n"),
+            ("e1.py", "E1", "class E1(E2):\n    pass\n"),
+            ("e2.py", "E2", "class E2(E3):\n    pass\n"),
+            ("e3.py", "E3", "class E3(E4):\n    def deep(self): pass\n"),
+            ("e4.py", "E4", "class E4:\n    def deeper(self): pass\n"),
+        ];
+        let mut ctx = Ctx::default();
+        let mut by_name: HashMap<String, Vec<Node>> = HashMap::new();
+        for (file, name, text) in heads {
+            ctx = ctx.file(file, text);
+            by_name.entry(name.to_string()).or_default().push(class(
+                &format!("class:{file}"),
+                name,
+                file,
+            ));
+        }
+        let methods = [
+            ("b.py", method("method:b-other", "B", "other", "b.py")),
+            ("b.py", method("method:b-both", "B", "both", "b.py")),
+            ("d.py", method("method:d-both", "D", "both", "d.py")),
+            ("c.py", method("method:c-m", "C", "m", "c.py")),
+            ("d.py", method("method:d-n", "D", "n", "d.py")),
+            ("d.py", method("method:d-x", "Other", "x", "d.py")),
+            ("e3.py", method("method:e3-deep", "E3", "deep", "e3.py")),
+            ("e4.py", method("method:e4-deeper", "E4", "deeper", "e4.py")),
+        ];
+        for (file, _, _) in heads {
+            let mut in_file: Vec<Node> = by_name
+                .values()
+                .flatten()
+                .filter(|node| node.file_path == file)
+                .cloned()
+                .collect();
+            in_file.extend(
+                methods
+                    .iter()
+                    .filter(|(f, _)| *f == file)
+                    .map(|(_, node)| node.clone()),
+            );
+            ctx = ctx.nodes_in_file(file, in_file);
+        }
+        // The methods by name too, as a project's lookup lists them.
+        for (_, node) in &methods {
+            by_name
+                .entry(node.name.clone())
+                .or_default()
+                .push(node.clone());
+        }
+        for (name, nodes) in &by_name {
+            ctx = ctx.name(name, nodes.clone());
+        }
+        let classes: Vec<Arc<Node>> = by_name["A"].iter().cloned().map(Arc::new).collect();
+        // One walk serves every name, whichever order the searches come in:
+        // a near method first, then far ones and back.
+        let sequence = Mutex::new(SupertypeWalk::new(classes.clone()));
+        for name in [
+            "n", "deep", "m", "other", "both", "x", "deeper", "missing", "n",
+        ] {
+            assert_eq!(
+                inherited_class_method(&sequence, name, &ctx).map(|n| n.id.clone()),
+                reference_inherited_class_method(&classes, name, &ctx).map(|n| n.id.clone()),
+                "method {name}"
+            );
+        }
+        // And a fresh walk per name agrees too.
+        for name in ["m", "both", "deep", "deeper"] {
+            let fresh = Mutex::new(SupertypeWalk::new(classes.clone()));
+            assert_eq!(
+                inherited_class_method(&fresh, name, &ctx).map(|n| n.id.clone()),
+                reference_inherited_class_method(&classes, name, &ctx).map(|n| n.id.clone()),
+                "fresh walk, method {name}"
+            );
+        }
+        // B and D, then C (once), E1, E2 and E3: the fifth level is the
+        // last one read.
+        assert_eq!(
+            inherited_class_method(&sequence, "deep", &ctx).map(|n| n.id.clone()),
+            Some("method:e3-deep".to_string()),
+            "five levels up"
+        );
+        assert!(
+            inherited_class_method(&sequence, "deeper", &ctx).is_none(),
+            "not six"
+        );
+        assert_eq!(
+            inherited_class_method(&sequence, "m", &ctx).map(|n| n.id.clone()),
+            Some("method:c-m".to_string())
+        );
+        // A level's declarations in the walk's order: B before D.
+        assert_eq!(
+            inherited_class_method(&sequence, "both", &ctx).map(|n| n.id.clone()),
+            Some("method:b-both".to_string())
+        );
+    }
+
+    /// The local scope as computed before W5-08, the reference.
+    fn reference_local_scope(candidate: &Node, nodes: &[Node]) -> Option<(i64, i64)> {
+        let mut scope: Option<(i64, i64)> = None;
+        for n in nodes {
+            if !matches!(n.kind, NodeKind::Function | NodeKind::Method) || n.id == candidate.id {
+                continue;
+            }
+            if n.start_line > candidate.start_line
+                || n.end_line < candidate.start_line
+                || n.start_line == n.end_line
+            {
+                continue;
+            }
+            if n.start_line == candidate.start_line && n.start_column >= candidate.start_column {
+                continue;
+            }
+            if scope.is_none_or(|(start, end)| n.end_line - n.start_line < end - start) {
+                scope = Some((n.start_line, n.end_line));
+            }
+        }
+        scope
+    }
+
+    /// W5-08: a declaration's local scope, read from the per-file index and
+    /// kept for the pass, is the innermost function holding its start as
+    /// before: a same-line function that starts at or after it, a one-line
+    /// function and the declaration itself skipped, the first of equal spans
+    /// kept, whichever lines each holds.
+    #[test]
+    fn a_local_scope_is_the_innermost_function_as_before() {
+        let at = |id: &str, kind, name: &str, lines: (i64, i64), column| {
+            let mut node = mk(id, kind, name, name, "f.py", Language::Python);
+            (node.start_line, node.end_line) = lines;
+            node.start_column = column;
+            node
+        };
+        let nodes = vec![
+            at("function:outer", NodeKind::Function, "outer", (1, 20), 0),
+            at("function:twin-a", NodeKind::Function, "twin_a", (3, 10), 4),
+            at("function:twin-b", NodeKind::Function, "twin_b", (3, 10), 8),
+            at("function:twin-c", NodeKind::Function, "twin_c", (4, 11), 4),
+            at("function:one-line", NodeKind::Function, "one", (5, 5), 4),
+            at("function:self", NodeKind::Function, "itself", (12, 14), 4),
+            at("method:late", NodeKind::Method, "late", (16, 18), 12),
+        ];
+        let candidates = vec![
+            at("variable:in-twins", NodeKind::Variable, "x", (6, 6), 8),
+            at("variable:twin-line", NodeKind::Variable, "y", (3, 3), 6),
+            at("variable:one-line", NodeKind::Variable, "z", (5, 5), 10),
+            at("variable:outer", NodeKind::Variable, "w", (15, 15), 4),
+            at("variable:late-line", NodeKind::Variable, "v", (16, 16), 4),
+            at("variable:outside", NodeKind::Variable, "u", (25, 25), 0),
+            // The same name elsewhere: the pass keeps a scope per id.
+            at("variable:x-again", NodeKind::Variable, "x", (15, 15), 8),
+            nodes[5].clone(),
+        ];
+        let mut in_file = nodes.clone();
+        in_file.extend(candidates.iter().cloned());
+        let ctx = Ctx::default()
+            .file("f.py", "\n".repeat(30).as_str())
+            .nodes_in_file("f.py", in_file.clone());
+        for candidate in &candidates {
+            let expected = reference_local_scope(candidate, &in_file);
+            assert_eq!(
+                local_declaration_scope(candidate, &ctx),
+                expected,
+                "{}",
+                candidate.id
+            );
+        }
+        assert_eq!(
+            local_declaration_scope(&candidates[0], &ctx),
+            Some((3, 10)),
+            "the first of equal spans, not the later (4, 11)"
+        );
+        assert_eq!(
+            local_declaration_scope(&candidates[6], &ctx),
+            Some((1, 20)),
+            "a namesake has its own scope"
+        );
+    }
+
+    /// W5-08: the inherited-method memo is keyed by the reference's
+    /// language as well as the two names: a same-named class of another
+    /// language computes its own answer, the same key reuses it.
+    #[test]
+    fn the_inherited_method_memo_keeps_languages_apart() {
+        let tables = NameMatcherTables::new();
+        let python = Arc::new(mk(
+            "method:py",
+            NodeKind::Method,
+            "create",
+            "Base::create",
+            "base.py",
+            Language::Python,
+        ));
+        let ruby = Arc::new(mk(
+            "method:rb",
+            NodeKind::Method,
+            "create",
+            "Base::create",
+            "base.rb",
+            Language::Ruby,
+        ));
+        let computed = std::cell::Cell::new(0);
+        let python_hit = tables.inherited_method(Language::Python, "User", "create", || {
+            computed.set(computed.get() + 1);
+            Some(Arc::clone(&python))
+        });
+        let ruby_hit = tables.inherited_method(Language::Ruby, "User", "create", || {
+            computed.set(computed.get() + 1);
+            Some(Arc::clone(&ruby))
+        });
+        let python_again = tables.inherited_method(Language::Python, "User", "create", || {
+            computed.set(computed.get() + 1);
+            None
+        });
+        assert_eq!(
+            python_hit.map(|n| n.id.clone()).as_deref(),
+            Some("method:py")
+        );
+        assert_eq!(ruby_hit.map(|n| n.id.clone()).as_deref(), Some("method:rb"));
+        assert_eq!(
+            python_again.map(|n| n.id.clone()).as_deref(),
+            Some("method:py")
+        );
+        assert_eq!(computed.get(), 2, "the same key is computed once");
+        let none = tables.inherited_method(Language::Python, "User", "save", || None);
+        assert!(none.is_none());
+        assert!(
+            tables
+                .inherited_method(Language::Python, "User", "save", || Some(Arc::clone(
+                    &python
+                )))
+                .is_none(),
+            "a remembered miss stays a miss"
         );
     }
 

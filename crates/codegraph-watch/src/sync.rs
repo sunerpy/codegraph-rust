@@ -1379,6 +1379,18 @@ fn sync_paths_with_store(
         if tests::FAIL_BEFORE_RESOLUTION.with(std::cell::Cell::get) {
             bail!("injected sync failure before resolution");
         }
+        // The class-head rows were current when the sync began (no
+        // bootstrap): a class head of a file it did not change is read from
+        // its row, not its file (W5-08).
+        if !class_heads_bootstrap {
+            resolver.trust_recorded_class_heads(
+                reindexed
+                    .iter()
+                    .chain(&changed_names.removed_files)
+                    .cloned()
+                    .collect(),
+            );
+        }
         // A qualified reference (`util::double/1`) is retried by its whole
         // name too, however many share its tail (W5-05).
         let mut retry_names = changed_names.any.clone();

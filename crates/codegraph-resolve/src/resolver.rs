@@ -1390,6 +1390,9 @@ pub struct ReferenceResolver {
     /// Largest file resolution reads, the project's extraction limit
     /// (`indexing.max_file_size`), handed to every context the resolver builds.
     max_file_size: u64,
+    /// The files whose class-head rows the contexts must not read, when the
+    /// rows are trusted ([`Self::trust_recorded_class_heads`]).
+    recorded_heads_stale: Option<Arc<std::collections::HashSet<String>>>,
     /// Detected `FrameworkResolver` implementations (`frameworks` field,
     /// `index.ts:264`). Empty until [`Self::initialize`] detects react/vue/nestjs.
     framework_resolver_extensions: Vec<Box<dyn FrameworkResolver>>,
@@ -1436,6 +1439,7 @@ impl ReferenceResolver {
         Self {
             project_root: project_root.into(),
             max_file_size: codegraph_core::config::DEFAULT_MAX_FILE_SIZE,
+            recorded_heads_stale: None,
             framework_resolver_extensions: Vec::new(),
             known_names: None,
             known_lower_names: std::sync::OnceLock::new(),
@@ -1465,6 +1469,14 @@ impl ReferenceResolver {
     ) -> crate::context::StoreResolutionContext<'a> {
         crate::context::StoreResolutionContext::new(store, &self.project_root)
             .with_max_file_size(self.max_file_size)
+            .with_recorded_class_heads(self.recorded_heads_stale.clone())
+    }
+
+    /// Read class heads from the store's class-head rows for every file but
+    /// `stale` in the contexts this resolver builds (W5-08): a sync whose
+    /// rows were current when it began passes the files it changed.
+    pub fn trust_recorded_class_heads(&mut self, stale: std::collections::HashSet<String>) {
+        self.recorded_heads_stale = Some(Arc::new(stale));
     }
 
     /// Detect the project's frameworks and populate the resolver's
@@ -3353,51 +3365,21 @@ impl ReferenceResolver {
         let by_files = store.unresolved_refs_by_files(&files)?;
         let by_sites = store.unresolved_refs_by_sites(&sites)?;
         let by_names = store.unresolved_refs_by_names(&names)?;
-        // A qualified reference (`User.create`) waits for its tail's name:
-        // the whole-name lookup above never matches it (upstream #1240).
-        let by_tails = store.unresolved_refs_by_name_tails(&names, NAME_TAIL_RETRY_CEILING)?;
-        // PHP (W4-PHP-02): a call to a global function written `\helper()`
-        // waits for `helper` in any case, as PHP names functions, and a static
-        // call through a class written with a namespace
-        // (`F\FirstName::make()`) for the class's or the method's name,
-        // however many share the method's tail.
-        let rooted: Vec<String> = names.iter().map(|name| format!("\\{name}")).collect();
-        let by_rooted = store.unresolved_refs_by_folded_names(&[Language::Php], &rooted)?;
-        // A PHP, Pascal or CFML name in another case (`formatprice()`) waits
+        // What else waits for one of the names, read in one pass (W5-08): a
+        // qualified reference (`User.create`) for its tail's name, which the
+        // whole-name lookup above never matches (upstream #1240); a PHP call
+        // to a global function written `\helper()` for `helper` in any case,
+        // as PHP names functions, and a static call through a class written
+        // with a namespace (`F\FirstName::make()`) for the class's or the
+        // method's name, however many share the method's tail (W4-PHP-02);
+        // and a PHP, Pascal or CFML name in another case (`formatprice()`)
         // for its name in any case (W4-PHP-03).
-        let by_folded = store.unresolved_refs_by_folded_names(
-            &crate::name_matcher::CASE_INSENSITIVE_LANGUAGES,
+        let by_retry = store.unresolved_refs_retried_by_names(
             &names,
+            NAME_TAIL_RETRY_CEILING,
+            &crate::name_matcher::CASE_INSENSITIVE_LANGUAGES,
         )?;
-        let by_php_classes: Vec<UnresolvedRef> = if names.is_empty() {
-            Vec::new()
-        } else {
-            store
-                .unresolved_php_calls_through_qualified_classes()?
-                .into_iter()
-                .filter(|reference| {
-                    reference
-                        .reference_name
-                        .rsplit_once('.')
-                        .is_some_and(|(class, member)| {
-                            changed_names.contains(member)
-                                || class
-                                    .rsplit('\\')
-                                    .next()
-                                    .is_some_and(|class| changed_names.contains(class))
-                        })
-                })
-                .collect()
-        };
-        let scoped = union_persisted_refs([
-            by_files,
-            by_sites,
-            by_names,
-            by_tails,
-            by_rooted,
-            by_folded,
-            by_php_classes,
-        ])?;
+        let scoped = union_persisted_refs([by_files, by_sites, by_names, by_retry])?;
 
         // The wiring references first, persisted, then the rest against
         // their edges, as a full index orders them (upstream #1789).

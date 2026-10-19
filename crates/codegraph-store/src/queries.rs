@@ -212,6 +212,41 @@ impl Store {
         )
     }
 
+    /// The functions and methods of `file_path`, by start line: the file's
+    /// rows of [`Self::nodes_by_file_path`] of those kinds (W5-08). The `+`
+    /// keeps the kind index out of the plan, so the file's own index walks
+    /// its rows, as it does for every node of the file.
+    pub fn callables_by_file_path(&self, file_path: &str) -> rusqlite::Result<Vec<Node>> {
+        query_nodes(
+            &self.conn,
+            "SELECT * FROM nodes WHERE file_path = ? AND +kind IN ('function', 'method') \
+             ORDER BY start_line",
+            [file_path],
+        )
+    }
+
+    /// The methods of `file_path` in the order [`Self::nodes_by_file_path`]
+    /// lists them: the same walk of the file's own index, the other rows
+    /// skipped (W5-08).
+    pub fn methods_by_file_path(&self, file_path: &str) -> rusqlite::Result<Vec<Node>> {
+        query_nodes(
+            &self.conn,
+            "SELECT * FROM nodes WHERE file_path = ? AND +kind = 'method' ORDER BY start_line",
+            [file_path],
+        )
+    }
+
+    /// Whether a function or method has the qualified name `qualified`
+    /// (W5-08): the qualified-name index's rows, none of them read.
+    pub fn has_callable_named(&self, qualified: &str) -> rusqlite::Result<bool> {
+        self.conn
+            .prepare_cached(
+                "SELECT EXISTS (SELECT 1 FROM nodes WHERE qualified_name = ?1 \
+                 AND +kind IN ('function', 'method'))",
+            )?
+            .query_row([qualified], |row| row.get(0))
+    }
+
     /// Count of nodes whose `file_path` matches, for the displayed file-level
     /// symbol total. Reads the live `nodes` table (which includes framework
     /// marker nodes added after the initial extractor), so it can exceed the
@@ -1393,17 +1428,28 @@ impl Store {
             return Ok(Vec::new());
         }
         let names: HashSet<&str> = names.iter().map(String::as_str).collect();
-        let mut stmt = self.conn.prepare(
-            "SELECT * FROM unresolved_refs \
+        // Every dotted or colon reference's name and kind first, the rest of
+        // a row read only for the ones chosen (W5-08): the same rows, the
+        // same order.
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT id, reference_name, reference_kind FROM unresolved_refs \
              WHERE instr(reference_name, '.') > 0 OR instr(reference_name, ':') > 0 ORDER BY id",
         )?;
         let rows = stmt
-            .query_map([], row_to_unresolved_ref)?
+            .query_map([], |row| {
+                let raw_kind = row.get::<_, String>(2)?;
+                let kind = if raw_kind == "function_ref" {
+                    EdgeKind::References
+                } else {
+                    parse_edge_kind(raw_kind)?
+                };
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, kind))
+            })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         let mut buckets: BTreeMap<String, Vec<usize>> = BTreeMap::new();
-        for (index, reference) in rows.iter().enumerate() {
-            let tail = reference_name_tail(&reference.reference_name, reference.reference_kind);
-            if tail != reference.reference_name && names.contains(tail.as_str()) {
+        for (index, (_, name, kind)) in rows.iter().enumerate() {
+            let tail = reference_name_tail(name, *kind);
+            if tail != *name && names.contains(tail.as_str()) {
                 buckets.entry(tail).or_default().push(index);
             }
         }
@@ -1413,10 +1459,110 @@ impl Store {
                 chosen.extend(indexes.iter().copied());
             }
         }
-        Ok(chosen
+        let mut by_id = self
+            .conn
+            .prepare_cached("SELECT * FROM unresolved_refs WHERE id = ?1")?;
+        chosen
             .into_iter()
-            .map(|index| rows[index].clone())
-            .collect())
+            .map(|index| by_id.query_row([rows[index].0], row_to_unresolved_ref))
+            .collect()
+    }
+
+    /// The parked references a sync retries by the names its changed files
+    /// touched that the whole-name lookup ([`Self::unresolved_refs_by_names`])
+    /// never matches, found in one pass over the table (W5-08), each row once
+    /// in id order: a qualified reference by its tail, a tail more than
+    /// `tail_ceiling` share skipped ([`Self::unresolved_refs_by_name_tails`]);
+    /// a PHP call written `\helper()` by its name, and a name of
+    /// `folded_languages`, in any ASCII case
+    /// ([`Self::unresolved_refs_by_folded_names`]); and a PHP call through a
+    /// class written with a namespace whose class or member is one of the
+    /// names ([`Self::unresolved_php_calls_through_qualified_classes`]).
+    pub fn unresolved_refs_retried_by_names(
+        &self,
+        names: &[String],
+        tail_ceiling: usize,
+        folded_languages: &[Language],
+    ) -> rusqlite::Result<Vec<UnresolvedRef>> {
+        if names.is_empty() {
+            return Ok(Vec::new());
+        }
+        let exact: HashSet<&str> = names.iter().map(String::as_str).collect();
+        // SQLite's `lower` folds ASCII letters only, as `to_ascii_lowercase`.
+        let folded: HashSet<String> = names.iter().map(|name| name.to_ascii_lowercase()).collect();
+        let rooted: HashSet<String> = names
+            .iter()
+            .map(|name| format!("\\{name}").to_ascii_lowercase())
+            .collect();
+        let php = Language::Php.as_str();
+        let mut languages: Vec<&str> = folded_languages
+            .iter()
+            .map(|language| language.as_str())
+            .chain([php])
+            .collect();
+        languages.sort_unstable();
+        languages.dedup();
+        let folded_languages: HashSet<&str> = folded_languages
+            .iter()
+            .map(|language| language.as_str())
+            .collect();
+        let sql = format!(
+            "SELECT id, reference_name, reference_kind, language FROM unresolved_refs \
+             WHERE instr(reference_name, '.') > 0 OR instr(reference_name, ':') > 0 \
+             OR language IN ({}) ORDER BY id",
+            std::iter::repeat_n("?", languages.len())
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let mut tails: HashMap<String, Vec<i64>> = HashMap::new();
+        let mut chosen = BTreeSet::new();
+        {
+            let mut stmt = self.conn.prepare_cached(&sql)?;
+            let mut rows = stmt.query(rusqlite::params_from_iter(languages.iter()))?;
+            while let Some(row) = rows.next()? {
+                let id: i64 = row.get(0)?;
+                let name = text_column(row, 1)?;
+                let raw_kind = text_column(row, 2)?;
+                if name.contains(['.', ':']) {
+                    let tail = reference_name_tail_of(name, edge_kind_of(raw_kind)?);
+                    if tail != name && exact.contains(tail) {
+                        tails.entry(tail.to_string()).or_default().push(id);
+                    }
+                }
+                let language = text_column(row, 3)?;
+                let is_php = language == php;
+                let in_any_case = (is_php || folded_languages.contains(language)) && {
+                    let lowered = name.to_ascii_lowercase();
+                    (is_php && rooted.contains(&lowered))
+                        || (folded_languages.contains(language) && folded.contains(&lowered))
+                };
+                let through_class = is_php
+                    && raw_kind == "calls"
+                    && name.contains('\\')
+                    && name.rsplit_once('.').is_some_and(|(class, member)| {
+                        exact.contains(member)
+                            || class
+                                .rsplit('\\')
+                                .next()
+                                .is_some_and(|class| exact.contains(class))
+                    });
+                if in_any_case || through_class {
+                    chosen.insert(id);
+                }
+            }
+        }
+        for ids in tails.values() {
+            if ids.len() <= tail_ceiling {
+                chosen.extend(ids.iter().copied());
+            }
+        }
+        let mut by_id = self
+            .conn
+            .prepare_cached("SELECT * FROM unresolved_refs WHERE id = ?1")?;
+        chosen
+            .into_iter()
+            .map(|id| by_id.query_row([id], row_to_unresolved_ref))
+            .collect()
     }
 
     /// The unresolved references written through one of `receivers`
@@ -2360,9 +2506,93 @@ fn query_nodes<P>(conn: &Connection, sql: &str, params: P) -> rusqlite::Result<V
 where
     P: rusqlite::Params,
 {
-    let mut stmt = conn.prepare(sql)?;
-    let rows = stmt.query_map(params, row_to_node)?;
+    // A statement prepared once per connection, and each field's column
+    // found once per statement rather than by name on every row (W5-08):
+    // the same values [`row_to_node`] reads.
+    let mut stmt = conn.prepare_cached(sql)?;
+    let columns = NodeColumns::of(&stmt)?;
+    let rows = stmt.query_map(params, |row| columns.node(row))?;
     rows.collect()
+}
+
+/// The column each [`Node`] field is read from in one statement's rows.
+struct NodeColumns {
+    id: usize,
+    kind: usize,
+    name: usize,
+    qualified_name: usize,
+    file_path: usize,
+    language: usize,
+    start_line: usize,
+    end_line: usize,
+    start_column: usize,
+    end_column: usize,
+    docstring: usize,
+    signature: usize,
+    visibility: usize,
+    is_exported: usize,
+    is_async: usize,
+    is_static: usize,
+    is_abstract: usize,
+    decorators: usize,
+    type_parameters: usize,
+    return_type: usize,
+    updated_at: usize,
+}
+
+impl NodeColumns {
+    fn of(stmt: &rusqlite::Statement<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            id: stmt.column_index("id")?,
+            kind: stmt.column_index("kind")?,
+            name: stmt.column_index("name")?,
+            qualified_name: stmt.column_index("qualified_name")?,
+            file_path: stmt.column_index("file_path")?,
+            language: stmt.column_index("language")?,
+            start_line: stmt.column_index("start_line")?,
+            end_line: stmt.column_index("end_line")?,
+            start_column: stmt.column_index("start_column")?,
+            end_column: stmt.column_index("end_column")?,
+            docstring: stmt.column_index("docstring")?,
+            signature: stmt.column_index("signature")?,
+            visibility: stmt.column_index("visibility")?,
+            is_exported: stmt.column_index("is_exported")?,
+            is_async: stmt.column_index("is_async")?,
+            is_static: stmt.column_index("is_static")?,
+            is_abstract: stmt.column_index("is_abstract")?,
+            decorators: stmt.column_index("decorators")?,
+            type_parameters: stmt.column_index("type_parameters")?,
+            return_type: stmt.column_index("return_type")?,
+            updated_at: stmt.column_index("updated_at")?,
+        })
+    }
+
+    /// [`row_to_node`] of `row`, by the columns found.
+    fn node(&self, row: &Row<'_>) -> rusqlite::Result<Node> {
+        Ok(Node {
+            id: row.get(self.id)?,
+            kind: parse_node_kind(row.get::<_, String>(self.kind)?)?,
+            name: row.get(self.name)?,
+            qualified_name: row.get(self.qualified_name)?,
+            file_path: row.get(self.file_path)?,
+            language: parse_language(row.get::<_, String>(self.language)?)?,
+            start_line: row.get(self.start_line)?,
+            end_line: row.get(self.end_line)?,
+            start_column: row.get(self.start_column)?,
+            end_column: row.get(self.end_column)?,
+            docstring: row.get(self.docstring)?,
+            signature: row.get(self.signature)?,
+            visibility: row.get(self.visibility)?,
+            is_exported: row.get::<_, i64>(self.is_exported)? == 1,
+            is_async: row.get::<_, i64>(self.is_async)? == 1,
+            is_static: row.get::<_, i64>(self.is_static)? == 1,
+            is_abstract: row.get::<_, i64>(self.is_abstract)? == 1,
+            decorators: parse_json_array(row.get(self.decorators)?)?,
+            type_parameters: parse_json_array(row.get(self.type_parameters)?)?,
+            return_type: row.get(self.return_type)?,
+            updated_at: row.get(self.updated_at)?,
+        })
+    }
 }
 
 fn query_edges<P>(conn: &Connection, sql: &str, params: P) -> rusqlite::Result<Vec<Edge>>
@@ -2455,6 +2685,11 @@ fn millis_column(row: &Row<'_>, name: &str) -> rusqlite::Result<i64> {
 /// (`package:app/b.dart` -> `b`, `./foo` -> `foo`, `inc/db.php` -> `db`): the
 /// stem [`import_path_keys`] takes from a file that could satisfy it.
 pub fn reference_name_tail(reference_name: &str, reference_kind: EdgeKind) -> String {
+    reference_name_tail_of(reference_name, reference_kind).to_string()
+}
+
+/// [`reference_name_tail`] as the part of the name it is.
+fn reference_name_tail_of(reference_name: &str, reference_kind: EdgeKind) -> &str {
     // A reference written as a path, but not an Erlang `fun mod:f/2` value.
     let path_reference = reference_kind == EdgeKind::References
         && reference_name.contains('/')
@@ -2465,14 +2700,14 @@ pub fn reference_name_tail(reference_name: &str, reference_kind: EdgeKind) -> St
             let stem = file_name_stem(&path[slash + 1..]);
             // `..` and `.` name a folder only through the importing file.
             if !stem.chars().all(|c| c == '.') {
-                return stem.to_string();
+                return stem;
             }
         }
     }
     let base = strip_erlang_arity(reference_name);
     match base.rfind(['.', ':']) {
-        Some(idx) => base[idx + 1..].to_string(),
-        None => base.to_string(),
+        Some(idx) => &base[idx + 1..],
+        None => base,
     }
 }
 
@@ -2515,6 +2750,23 @@ pub fn import_path_keys(file_path: &str) -> Vec<String> {
         }
     }
     keys
+}
+
+/// A text column of `row`, borrowed rather than copied.
+fn text_column<'row>(row: &'row Row<'_>, index: usize) -> rusqlite::Result<&'row str> {
+    let value = row.get_ref(index)?;
+    value
+        .as_str()
+        .map_err(|_| rusqlite::Error::InvalidColumnType(index, String::new(), value.data_type()))
+}
+
+/// The edge kind a stored `reference_kind` reads as, a function reference's
+/// as `references` ([`row_to_unresolved_ref`]).
+fn edge_kind_of(raw_kind: &str) -> rusqlite::Result<EdgeKind> {
+    if raw_kind == "function_ref" {
+        return Ok(EdgeKind::References);
+    }
+    edge_kind_named(raw_kind).ok_or_else(|| enum_error(raw_kind.to_string(), "edge kind"))
 }
 
 pub(crate) fn row_to_unresolved_ref(row: &Row<'_>) -> rusqlite::Result<UnresolvedRef> {
@@ -2607,7 +2859,12 @@ fn parse_node_kind(value: String) -> rusqlite::Result<NodeKind> {
 }
 
 fn parse_edge_kind(value: String) -> rusqlite::Result<EdgeKind> {
-    let kind = match value.as_str() {
+    edge_kind_named(&value).ok_or_else(|| enum_error(value, "edge kind"))
+}
+
+/// The edge kind a stored name is, if any.
+fn edge_kind_named(value: &str) -> Option<EdgeKind> {
+    let kind = match value {
         "contains" => EdgeKind::Contains,
         "calls" => EdgeKind::Calls,
         "imports" => EdgeKind::Imports,
@@ -2620,9 +2877,9 @@ fn parse_edge_kind(value: String) -> rusqlite::Result<EdgeKind> {
         "instantiates" => EdgeKind::Instantiates,
         "overrides" => EdgeKind::Overrides,
         "decorates" => EdgeKind::Decorates,
-        _ => return Err(enum_error(value, "edge kind")),
+        _ => return None,
     };
-    Ok(kind)
+    Some(kind)
 }
 
 fn parse_reference_subkind(value: Option<String>) -> rusqlite::Result<Option<ReferenceSubkind>> {
@@ -4042,6 +4299,163 @@ mod tests {
             .map(|reference| reference.reference_name)
             .collect();
         assert_eq!(qualified, ["F\\FirstName.make"]);
+    }
+
+    #[test]
+    fn the_one_pass_retry_reads_what_the_four_lookups_read() {
+        let mut store = store("one-pass-retry");
+        store
+            .upsert_nodes(&[
+                node("function:php", "php", "a.php"),
+                node("function:pas", "pas", "b.pas"),
+                node("function:js", "js", "c.js"),
+            ])
+            .unwrap();
+        let mk = |from: &str, name: &str, kind: EdgeKind, lang: Language| UnresolvedRef {
+            id: None,
+            from_node_id: from.to_string(),
+            reference_name: name.to_string(),
+            reference_kind: kind,
+            line: 1,
+            col: 0,
+            candidates: None,
+            file_path: String::new(),
+            language: lang,
+            is_function_ref: false,
+            reference_subkind: None,
+        };
+        let php = |name: &str, kind| mk("function:php", name, kind, Language::Php);
+        let pas = |name: &str| mk("function:pas", name, EdgeKind::Calls, Language::Pascal);
+        let js = |name: &str, kind| mk("function:js", name, kind, Language::JavaScript);
+        let mut function_ref = js("util.helper", EdgeKind::References);
+        function_ref.is_function_ref = true;
+        store
+            .insert_unresolved_refs(&[
+                php("\\HELPER", EdgeKind::Calls),
+                php("\\helperx", EdgeKind::Calls),
+                php("Helper", EdgeKind::Calls),
+                php("F\\FirstName.make", EdgeKind::Calls),
+                php("F\\Other.helper", EdgeKind::Calls),
+                php("F\\Other.other", EdgeKind::Calls),
+                php("F\\FirstName.make", EdgeKind::References),
+                pas("HELPER"),
+                pas("Unit.Helper"),
+                js("\\HELPER", EdgeKind::Calls),
+                js("HELPER", EdgeKind::Calls),
+                js("a.helper", EdgeKind::Calls),
+                js("b.helper", EdgeKind::Calls),
+                js("c.helper", EdgeKind::Calls),
+                function_ref,
+                js("./lib/helper.js", EdgeKind::Imports),
+                js("mod:make/2", EdgeKind::Calls),
+                js("x.make", EdgeKind::Calls),
+                js("helper", EdgeKind::Calls),
+            ])
+            .unwrap();
+        let folded_languages = [Language::Php, Language::Pascal, Language::Cfml];
+        let ids = |refs: Vec<UnresolvedRef>| -> Vec<i64> {
+            refs.into_iter()
+                .map(|reference| reference.id.unwrap())
+                .collect()
+        };
+        let four = |names: &[String], ceiling: usize| -> Vec<i64> {
+            let rooted: Vec<String> = names.iter().map(|name| format!("\\{name}")).collect();
+            let wanted: HashSet<&str> = names.iter().map(String::as_str).collect();
+            let mut out = BTreeSet::new();
+            out.extend(ids(store
+                .unresolved_refs_by_name_tails(names, ceiling)
+                .unwrap()));
+            out.extend(ids(store
+                .unresolved_refs_by_folded_names(&[Language::Php], &rooted)
+                .unwrap()));
+            out.extend(ids(store
+                .unresolved_refs_by_folded_names(&folded_languages, names)
+                .unwrap()));
+            if !names.is_empty() {
+                out.extend(ids(store
+                    .unresolved_php_calls_through_qualified_classes()
+                    .unwrap()
+                    .into_iter()
+                    .filter(|reference| {
+                        reference
+                            .reference_name
+                            .rsplit_once('.')
+                            .is_some_and(|(class, member)| {
+                                wanted.contains(member)
+                                    || class
+                                        .rsplit('\\')
+                                        .next()
+                                        .is_some_and(|class| wanted.contains(class))
+                            })
+                    })
+                    .collect()));
+            }
+            out.into_iter().collect()
+        };
+        let one = |names: &[String], ceiling: usize| -> Vec<String> {
+            store
+                .unresolved_refs_retried_by_names(names, ceiling, &folded_languages)
+                .unwrap()
+                .into_iter()
+                .map(|reference| reference.reference_name)
+                .collect()
+        };
+        let names =
+            |list: &[&str]| -> Vec<String> { list.iter().map(|n| (*n).to_string()).collect() };
+        for list in [
+            &["helper"][..],
+            &["Helper"],
+            &["make"],
+            &["FirstName"],
+            &["helper", "make"],
+            &["Other"],
+            &["nothing"],
+            &[],
+        ] {
+            for ceiling in [1, 3, 500] {
+                let names = names(list);
+                let read = store
+                    .unresolved_refs_retried_by_names(&names, ceiling, &folded_languages)
+                    .unwrap();
+                assert_eq!(ids(read), four(&names, ceiling), "{list:?} at {ceiling}");
+            }
+        }
+        // Not vacuous: each lane reads its own rows.
+        assert_eq!(
+            one(&names(&["helper"]), 500),
+            [
+                "\\HELPER",
+                "Helper",
+                "F\\Other.helper",
+                "HELPER",
+                "a.helper",
+                "b.helper",
+                "c.helper",
+                "util.helper",
+                "./lib/helper.js",
+            ]
+        );
+        // Six qualified references share the tail `helper`: past a ceiling of
+        // three the tail lane reads none of them, the PHP class lane still
+        // its own. A tail matches in its own case only.
+        assert_eq!(
+            one(&names(&["helper"]), 3),
+            ["\\HELPER", "Helper", "F\\Other.helper", "HELPER"]
+        );
+        assert_eq!(
+            one(&names(&["Helper"]), 500),
+            ["\\HELPER", "Helper", "HELPER", "Unit.Helper"]
+        );
+        assert_eq!(
+            one(&names(&["make"]), 500),
+            [
+                "F\\FirstName.make",
+                "F\\FirstName.make",
+                "mod:make/2",
+                "x.make"
+            ]
+        );
+        assert_eq!(one(&names(&["FirstName"]), 500), ["F\\FirstName.make"]);
     }
 
     #[test]

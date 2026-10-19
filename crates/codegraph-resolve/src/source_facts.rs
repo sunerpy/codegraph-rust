@@ -51,6 +51,12 @@ impl LineIndex {
         }
     }
 
+    /// How many segments `text.split('\n')` yields: one more than the
+    /// newlines (W5-08).
+    pub fn raw_line_count(&self) -> usize {
+        self.newlines.len() + 1
+    }
+
     /// Segment `index` of `text.split('\n')` (a `\r` before the newline is
     /// kept, and a final empty segment after a trailing newline exists).
     pub fn raw_line<'t>(&self, text: &'t str, index: usize) -> Option<&'t str> {
@@ -167,7 +173,6 @@ pub struct SourceFacts {
     scala_imports: OnceLock<Arc<crate::scala_scope::ScalaImports>>,
     scala_holder_package: OnceLock<Option<String>>,
     scala_package_object_package: OnceLock<Option<String>>,
-    local_declaration_scopes: Mutex<HashMap<String, Option<(i64, i64)>>>,
     csharp_namespace_scope: OnceLock<Arc<crate::csharp_types::CsharpNamespaceScope>>,
     dart_code: OnceLock<Arc<crate::dart_chains::DartCode>>,
     dart_local_scopes: OnceLock<Arc<crate::dart_local_scope::DartLocalScopes>>,
@@ -221,7 +226,6 @@ impl SourceFacts {
             scala_imports: OnceLock::new(),
             scala_holder_package: OnceLock::new(),
             scala_package_object_package: OnceLock::new(),
-            local_declaration_scopes: Mutex::new(HashMap::new()),
             csharp_namespace_scope: OnceLock::new(),
             dart_code: OnceLock::new(),
             dart_local_scopes: OnceLock::new(),
@@ -704,28 +708,6 @@ impl SourceFacts {
         self.scala_package_object_package
             .get_or_init(|| crate::scala_scope::scala_package_object_package(&self.source))
             .clone()
-    }
-
-    /// The lines a declaration of this file with id `id` is local to
-    /// (upstream #2193 `localDeclarationScope`), computed once.
-    pub(crate) fn local_declaration_scope(
-        &self,
-        id: &str,
-        compute: impl FnOnce() -> Option<(i64, i64)>,
-    ) -> Option<(i64, i64)> {
-        if let Some(hit) = self
-            .local_declaration_scopes
-            .lock()
-            .ok()
-            .and_then(|memo| memo.get(id).copied())
-        {
-            return hit;
-        }
-        let scope = compute();
-        if let Ok(mut memo) = self.local_declaration_scopes.lock() {
-            memo.insert(id.to_string(), scope);
-        }
-        scope
     }
 
     /// The namespaces a C# file runs in and imports (upstream #2216

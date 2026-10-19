@@ -110,12 +110,9 @@ pub fn write_pubspec_rows(store: &Store, project_root: &Path) -> Result<()> {
 
 /// The indexed Dart files.
 fn dart_files(store: &Store) -> Result<Vec<String>> {
-    Ok(store
-        .all_files()?
-        .into_iter()
-        .filter(|file| file.language == Language::Dart)
-        .map(|file| file.path)
-        .collect())
+    // The paths alone: a CLI sync scans the project, so it reads them every
+    // time, and every file's row would cost more than the rest (W5-08).
+    Ok(store.file_paths_of_language(Language::Dart)?)
 }
 
 /// The pubspec rows this index holds, by directory; `None` when one cannot

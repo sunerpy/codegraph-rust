@@ -35,6 +35,9 @@ pub struct StoreResolutionContext<'a> {
     project_root: String,
     max_file_size: u64,
     caches: RefCell<Caches>,
+    /// The files whose class-head rows are not to be read, when the rows are
+    /// trusted at all ([`Self::with_recorded_class_heads`]).
+    recorded_heads_stale: Option<Arc<std::collections::HashSet<String>>>,
 }
 
 struct Caches {
@@ -46,6 +49,14 @@ struct Caches {
     name_cache: LruCache<String, Vec<Arc<Node>>>,
     lower_name_cache: LruCache<String, Vec<Arc<Node>>>,
     qualified_name_cache: LruCache<String, Vec<Arc<Node>>>,
+    /// Each file's functions and methods by qualified name (W5-08).
+    function_scopes_cache: LruCache<String, Arc<crate::name_matcher::FileCallables>>,
+    /// Each file's methods by owner and name (W5-08).
+    file_methods_cache: LruCache<String, Arc<crate::name_matcher::FileMethods>>,
+    /// Each file's class-head row, as read (W5-08).
+    head_rows: HashMap<String, Option<Arc<crate::class_heads::HeadsRow>>>,
+    /// The name matcher's memos for the pass (W5-08).
+    name_matcher_tables: Option<Arc<crate::name_matcher::NameMatcherTables>>,
     project_aliases: Option<Option<AliasMap>>,
     go_module: Option<Option<GoModule>>,
     go_modules: Option<Vec<GoModule>>,
@@ -117,6 +128,10 @@ impl Caches {
             name_cache: LruCache::new(limit),
             lower_name_cache: LruCache::new(limit),
             qualified_name_cache: LruCache::new(limit),
+            function_scopes_cache: LruCache::new(limit),
+            file_methods_cache: LruCache::new(limit),
+            head_rows: HashMap::new(),
+            name_matcher_tables: None,
             project_aliases: None,
             go_module: None,
             go_modules: None,
@@ -156,6 +171,7 @@ impl<'a> StoreResolutionContext<'a> {
             project_root: project_root.into(),
             max_file_size: codegraph_core::config::DEFAULT_MAX_FILE_SIZE,
             caches: RefCell::new(Caches::new()),
+            recorded_heads_stale: None,
         }
     }
 
@@ -164,6 +180,19 @@ impl<'a> StoreResolutionContext<'a> {
     #[must_use]
     pub fn with_max_file_size(mut self, max_file_size: u64) -> Self {
         self.max_file_size = max_file_size;
+        self
+    }
+
+    /// Trust the store's class-head rows (`class_heads:<path>`) for every
+    /// file but `stale`, the files a sync changed since they were written
+    /// (W5-08): a declaration's own head is then read from its file's row,
+    /// when the row holds one answer for it, instead of the file.
+    #[must_use]
+    pub fn with_recorded_class_heads(
+        mut self,
+        stale: Option<Arc<std::collections::HashSet<String>>>,
+    ) -> Self {
+        self.recorded_heads_stale = stale;
         self
     }
 
@@ -256,7 +285,7 @@ impl ResolutionContext for StoreResolutionContext<'_> {
 
     fn get_nodes_in_file_shared(&self, file_path: &str) -> Vec<Arc<Node>> {
         let mut c = self.caches.borrow_mut();
-        if let Some(cached) = c.node_cache.get(&file_path.to_string()) {
+        if let Some(cached) = c.node_cache.get(file_path) {
             return cached;
         }
         let result: Vec<Arc<Node>> = self
@@ -279,7 +308,7 @@ impl ResolutionContext for StoreResolutionContext<'_> {
 
     fn get_nodes_by_name_shared(&self, name: &str) -> Vec<Arc<Node>> {
         let mut c = self.caches.borrow_mut();
-        if let Some(cached) = c.name_cache.get(&name.to_string()) {
+        if let Some(cached) = c.name_cache.get(name) {
             return cached;
         }
         let mut result = self.store.nodes_by_name(name).unwrap_or_default();
@@ -298,7 +327,7 @@ impl ResolutionContext for StoreResolutionContext<'_> {
 
     fn get_nodes_by_qualified_name_shared(&self, qualified_name: &str) -> Vec<Arc<Node>> {
         let mut c = self.caches.borrow_mut();
-        if let Some(cached) = c.qualified_name_cache.get(&qualified_name.to_string()) {
+        if let Some(cached) = c.qualified_name_cache.get(qualified_name) {
             return cached;
         }
         let mut result = self
@@ -371,7 +400,7 @@ impl ResolutionContext for StoreResolutionContext<'_> {
     fn read_file_shared(&self, file_path: &str) -> Option<Arc<str>> {
         let mut c = self.caches.borrow_mut();
         if c.file_cache.has(&file_path.to_string()) {
-            return c.file_cache.get(&file_path.to_string()).flatten();
+            return c.file_cache.get(file_path).flatten();
         }
         let full_path = Path::new(&self.project_root).join(file_path);
         let content: Option<Arc<str>> =
@@ -384,7 +413,7 @@ impl ResolutionContext for StoreResolutionContext<'_> {
         {
             let mut c = self.caches.borrow_mut();
             if c.source_facts_cache.has(&file_path.to_string()) {
-                return c.source_facts_cache.get(&file_path.to_string()).flatten();
+                return c.source_facts_cache.get(file_path).flatten();
             }
         }
         let facts = self
@@ -422,7 +451,7 @@ impl ResolutionContext for StoreResolutionContext<'_> {
 
     fn get_nodes_by_lower_name_shared(&self, lower_name: &str) -> Vec<Arc<Node>> {
         let mut c = self.caches.borrow_mut();
-        if let Some(cached) = c.lower_name_cache.get(&lower_name.to_string()) {
+        if let Some(cached) = c.lower_name_cache.get(lower_name) {
             return cached;
         }
         let mut result = self
@@ -516,7 +545,7 @@ impl ResolutionContext for StoreResolutionContext<'_> {
 
     fn get_import_mappings(&self, file_path: &str, language: Language) -> Vec<ImportMapping> {
         let mut c = self.caches.borrow_mut();
-        if let Some(cached) = c.import_mapping_cache.get(&file_path.to_string()) {
+        if let Some(cached) = c.import_mapping_cache.get(file_path) {
             return cached;
         }
         drop(c);
@@ -718,6 +747,123 @@ impl ResolutionContext for StoreResolutionContext<'_> {
         )
     }
 
+    fn enclosing_function_lines(
+        &self,
+        file_path: &str,
+        qualified: &str,
+        start: i64,
+        end: i64,
+    ) -> Option<(i64, i64)> {
+        self.file_callables(file_path)
+            .first_enclosing(qualified, start, end)
+    }
+
+    fn file_callables(&self, file_path: &str) -> Arc<crate::name_matcher::FileCallables> {
+        let cached = self
+            .caches
+            .borrow_mut()
+            .function_scopes_cache
+            .get(file_path);
+        if let Some(callables) = cached {
+            return callables;
+        }
+        // Only the file's functions and methods, by start line: the rows the
+        // index keeps (W5-08).
+        let nodes: Vec<Arc<Node>> = self
+            .store
+            .callables_by_file_path(file_path)
+            .unwrap_or_default()
+            .into_iter()
+            .map(Arc::new)
+            .collect();
+        let callables = Arc::new(crate::name_matcher::FileCallables::of(&nodes));
+        self.caches
+            .borrow_mut()
+            .function_scopes_cache
+            .set(file_path.to_string(), Arc::clone(&callables));
+        callables
+    }
+
+    fn file_methods(&self, file_path: &str) -> Arc<crate::name_matcher::FileMethods> {
+        let cached = self.caches.borrow_mut().file_methods_cache.get(file_path);
+        if let Some(methods) = cached {
+            return methods;
+        }
+        // Only the file's methods, in the order its every node is listed
+        // (the same index walk): the rows the methods keep (W5-08).
+        let nodes: Vec<Arc<Node>> = self
+            .store
+            .methods_by_file_path(file_path)
+            .unwrap_or_default()
+            .into_iter()
+            .map(Arc::new)
+            .collect();
+        let methods = Arc::new(crate::name_matcher::FileMethods::of(&nodes));
+        self.caches
+            .borrow_mut()
+            .file_methods_cache
+            .set(file_path.to_string(), Arc::clone(&methods));
+        methods
+    }
+
+    fn recorded_heads(&self, class: &Node) -> Option<Vec<String>> {
+        let stale = self.recorded_heads_stale.as_ref()?;
+        if stale.contains(&class.file_path) {
+            return None;
+        }
+        let cached = self
+            .caches
+            .borrow()
+            .head_rows
+            .get(&class.file_path)
+            .cloned();
+        let row = match cached {
+            Some(row) => row,
+            None => {
+                let row = self
+                    .store
+                    .get_project_metadata(&crate::class_heads::row_key(&class.file_path))
+                    .ok()
+                    .flatten()
+                    .and_then(|value| crate::class_heads::HeadsRow::decode(&value))
+                    .map(Arc::new);
+                self.caches
+                    .borrow_mut()
+                    .head_rows
+                    .insert(class.file_path.clone(), row.clone());
+                row
+            }
+        }?;
+        // The declaration's entries: one answer, or none trusted (two
+        // declarations of the name whose heads differ are told apart only
+        // by reading the file).
+        let mut entries = row
+            .entries
+            .iter()
+            .filter(|entry| entry.language == class.language && entry.name == class.name);
+        let first = entries.next()?;
+        entries
+            .all(|entry| entry.heads == first.heads)
+            .then(|| first.heads.clone())
+    }
+
+    fn has_callable_named(&self, qualified: &str) -> bool {
+        self.store.has_callable_named(qualified).unwrap_or(true)
+    }
+
+    fn method_files(&self, name: &str) -> Option<Arc<std::collections::HashSet<String>>> {
+        Some(crate::name_matcher::method_files_of(name, self))
+    }
+
+    fn name_matcher_tables(&self) -> Arc<crate::name_matcher::NameMatcherTables> {
+        Arc::clone(
+            self.caches
+                .borrow_mut()
+                .name_matcher_tables
+                .get_or_insert_with(|| Arc::new(crate::name_matcher::NameMatcherTables::new())),
+        )
+    }
+
     fn manifest_scope(&self, dir: &str) -> Arc<ManifestScope> {
         if let Some(scope) = self.caches.borrow().manifest_scopes.get(dir) {
             return Arc::clone(scope);
@@ -763,7 +909,7 @@ impl ResolutionContext for StoreResolutionContext<'_> {
 
     fn get_re_exports(&self, file_path: &str, language: Language) -> Vec<ReExport> {
         let mut c = self.caches.borrow_mut();
-        if let Some(cached) = c.re_export_cache.get(&file_path.to_string()) {
+        if let Some(cached) = c.re_export_cache.get(file_path) {
             return cached;
         }
         drop(c);
@@ -1143,6 +1289,55 @@ mod tests {
         assert!(Arc::ptr_eq(&by_file[0], &by_file_cached[0]));
         assert!(ctx.known_node_names().contains(&"foo".to_string()));
         assert_eq!(ctx.get_project_root(), root.to_str().unwrap());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// W5-08: the store context answers a declaration's enclosing function
+    /// from its per-file index exactly as the qualified-name lookup does,
+    /// before and after the index is cached.
+    #[test]
+    fn store_context_encloses_as_the_qualified_name_lookup_does() {
+        let root = temp_root("enclosing");
+        let mut store = open_store(&root);
+        store.upsert_file(&file_record("a.ts", 5)).unwrap();
+        store.upsert_file(&file_record("b.ts", 1)).unwrap();
+        let scoped = |id: &str, kind, qualified: &str, file: &str, lines: (i64, i64), col| {
+            let name = qualified.rsplit("::").next().unwrap_or(qualified);
+            let mut n = node(id, name, kind, file, lines.0, col);
+            n.qualified_name = qualified.to_string();
+            n.end_line = lines.1;
+            n
+        };
+        store
+            .upsert_nodes(&[
+                scoped("f-a", NodeKind::Function, "f", "a.ts", (3, 20), 0),
+                scoped("f-b", NodeKind::Function, "f", "a.ts", (3, 20), 4),
+                scoped("f-outer", NodeKind::Function, "f", "a.ts", (2, 30), 0),
+                scoped("m", NodeKind::Method, "C::m", "a.ts", (5, 9), 2),
+                scoped("c", NodeKind::Class, "C", "a.ts", (4, 10), 0),
+                scoped("f-other", NodeKind::Function, "f", "b.ts", (1, 100), 0),
+            ])
+            .unwrap();
+        let ctx = StoreResolutionContext::new(&store, root.to_str().unwrap());
+        for _ in 0..2 {
+            for (file, qualified, start, end) in [
+                ("a.ts", "f", 6, 7),
+                ("a.ts", "f", 25, 26),
+                ("a.ts", "f", 31, 31),
+                ("a.ts", "C::m", 6, 6),
+                ("a.ts", "C", 6, 6),
+                ("b.ts", "f", 50, 50),
+                ("c.ts", "f", 1, 1),
+            ] {
+                assert_eq!(
+                    ctx.enclosing_function_lines(file, qualified, start, end),
+                    crate::name_matcher::enclosing_by_qualified_name(
+                        &ctx, file, qualified, start, end
+                    ),
+                    "{file} {qualified} {start}..={end}"
+                );
+            }
+        }
         std::fs::remove_dir_all(&root).ok();
     }
 

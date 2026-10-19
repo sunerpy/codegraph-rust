@@ -57,11 +57,88 @@ fn strip_c_comments(text: &str) -> String {
         .into_owned()
 }
 
+/// Whether [`declared_supertypes`] of a `language` declaration reads only
+/// that declaration's own head, so a class-head row's entry for it
+/// ([`declaration_heads`]) is its answer: the Java family and the
+/// three-line heads, not the languages that gather a name's declarations.
+pub fn reads_own_head(language: Language) -> bool {
+    matches!(
+        language,
+        Language::Java
+            | Language::CSharp
+            | Language::Kotlin
+            | Language::Pascal
+            | Language::Python
+            | Language::Ruby
+            | Language::Php
+            | Language::TypeScript
+            | Language::Tsx
+            | Language::JavaScript
+            | Language::Jsx
+    )
+}
+
+/// `project_metadata` key prefix of a file's class-head row (W5-07).
+pub const ROW_KEY_PREFIX: &str = "class_heads:";
+
+/// The `project_metadata` key of `path`'s class-head row.
+pub fn row_key(path: &str) -> String {
+    format!("{ROW_KEY_PREFIX}{path}")
+}
+
+/// One type declaration of a file: the supertypes its own head writes
+/// ([`declaration_heads`]), as a sync's class-head row keeps it (W5-07).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct HeadEntry {
+    pub language: Language,
+    pub name: String,
+    pub heads: Vec<String>,
+}
+
+impl Ord for HeadEntry {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (self.language.as_str(), &self.name, &self.heads).cmp(&(
+            other.language.as_str(),
+            &other.name,
+            &other.heads,
+        ))
+    }
+}
+
+impl PartialOrd for HeadEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// A file's class-head row: its entries, sorted.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct HeadsRow {
+    pub entries: Vec<HeadEntry>,
+}
+
+impl HeadsRow {
+    pub fn encode(&self) -> String {
+        serde_json::to_string(self).unwrap_or_default()
+    }
+
+    pub fn decode(value: &str) -> Option<Self> {
+        serde_json::from_str(value).ok()
+    }
+}
+
 /// The supertypes `class` names in its own head: Pascal `TX = class(TBase)`,
 /// Python `class X(Base):`, Ruby `class X < Base`, PHP / TS / JS
 /// `extends Base`, and the Java-family, Dart, Swift, Objective-C and Scala
 /// heads.
 pub(crate) fn declared_supertypes(class: &Node, context: &dyn ResolutionContext) -> Vec<String> {
+    // A declaration whose own head is what it reads: the sync's row of its
+    // unchanged file holds that answer already (W5-08).
+    if reads_own_head(class.language)
+        && let Some(heads) = context.recorded_heads(class)
+    {
+        return heads;
+    }
     match class.language {
         Language::Java | Language::CSharp | Language::Kotlin => {
             return class_head_supertypes(class, context);

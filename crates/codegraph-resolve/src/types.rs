@@ -650,6 +650,72 @@ pub trait ResolutionContext {
     fn solidity_tables(&self) -> Arc<crate::solidity_scope::SolidityTables> {
         Arc::new(crate::solidity_scope::SolidityTables::new())
     }
+
+    /// The lines of the first function or method of `file_path` named
+    /// `qualified` whose lines hold `start..=end`, in the order the
+    /// qualified-name lookup lists them: a declaration's enclosing scope.
+    /// Production contexts answer from a per-file index kept for the pass,
+    /// which gives the same answer (W5-08).
+    fn enclosing_function_lines(
+        &self,
+        file_path: &str,
+        qualified: &str,
+        start: i64,
+        end: i64,
+    ) -> Option<(i64, i64)> {
+        crate::name_matcher::enclosing_by_qualified_name(self, file_path, qualified, start, end)
+    }
+
+    /// The functions and methods of `file_path`, indexed for the name
+    /// matcher's walks (W5-08). Production contexts keep it for the pass.
+    fn file_callables(&self, file_path: &str) -> Arc<crate::name_matcher::FileCallables> {
+        Arc::new(crate::name_matcher::FileCallables::of(
+            &self.get_nodes_in_file_shared(file_path),
+        ))
+    }
+
+    /// The methods of `file_path` by owner and name, the first of each in
+    /// the file's node order (W5-08). Production contexts keep it for the
+    /// pass.
+    fn file_methods(&self, file_path: &str) -> Arc<crate::name_matcher::FileMethods> {
+        Arc::new(crate::name_matcher::FileMethods::of(
+            &self.get_nodes_in_file_shared(file_path),
+        ))
+    }
+
+    /// Whether a function or method of the project has the qualified name
+    /// `qualified` (W5-08).
+    fn has_callable_named(&self, qualified: &str) -> bool {
+        self.get_nodes_by_qualified_name_shared(qualified)
+            .iter()
+            .any(|node| {
+                matches!(
+                    node.kind,
+                    codegraph_core::types::NodeKind::Function
+                        | codegraph_core::types::NodeKind::Method
+                )
+            })
+    }
+
+    /// The files holding a method named `name`, when the context can list
+    /// them from the same nodes its file lookups read: a class's file
+    /// outside them holds no such method (W5-08). `None`, the default, reads
+    /// every class's file.
+    fn method_files(&self, _name: &str) -> Option<Arc<std::collections::HashSet<String>>> {
+        None
+    }
+
+    /// The supertypes `class`'s own head writes, from a class-head row the
+    /// context trusts for its file (W5-08): `None`, the default, reads the
+    /// source.
+    fn recorded_heads(&self, _class: &Node) -> Option<Vec<String>> {
+        None
+    }
+
+    /// The name matcher's memos of one resolution pass (W5-08).
+    fn name_matcher_tables(&self) -> Arc<crate::name_matcher::NameMatcherTables> {
+        Arc::new(crate::name_matcher::NameMatcherTables::new())
+    }
 }
 
 /// Go module info parsed from `go.mod`.

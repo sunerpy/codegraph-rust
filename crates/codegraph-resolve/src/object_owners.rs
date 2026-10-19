@@ -151,7 +151,10 @@ fn is_object_literal_owner(node: &Node) -> bool {
 /// an owner in its file whose extent holds it. `None` for every other
 /// function: a declaration, a helper nested in a function, a function inside
 /// an initializer that is not an object literal (a module IIFE's own helpers).
-fn object_literal_owner_of(node: &Node, context: &dyn ResolutionContext) -> Option<Arc<Node>> {
+pub(crate) fn object_literal_owner_of(
+    node: &Node,
+    context: &dyn ResolutionContext,
+) -> Option<Arc<Node>> {
     if node.kind != NodeKind::Function || !is_js_family(node.language) {
         return None;
     }
@@ -268,19 +271,20 @@ fn position_within(line: i64, column: i64, node: &Node) -> bool {
 /// load() { load() }`), and a binding destructured off the owner (`const {
 /// load } = App`). A bare `load()`, a callback `setTimeout(load)` or
 /// `window.Other.load()` means a function of that name, or nothing.
-pub(crate) fn is_object_member_reachable_by_name(
+///
+/// `owner` is the member's [`object_literal_owner_of`]; a function that is no
+/// object's member is reached by name as any other.
+pub(crate) fn is_member_reachable_through(
+    owner: &Node,
     node: &Node,
     reference: &RefView,
     context: &dyn ResolutionContext,
 ) -> bool {
-    let Some(owner) = object_literal_owner_of(node, context) else {
-        return true;
-    };
     if reference.file_path == node.file_path {
         // `this` must be that object: written in one of its own methods, not
         // in an arrow member.
         if reference.reference_kind == EdgeKind::Calls
-            && position_within(reference.line, reference.column, &owner)
+            && position_within(reference.line, reference.column, owner)
             && matches!(
                 bare_call_receiver(reference, context),
                 Some(BareCallReceiver::OwnObject)
@@ -308,7 +312,7 @@ pub(crate) fn is_object_member_reachable_by_name(
     }
     destructures_member(
         &reference.file_path,
-        &holder_path(&owner),
+        &holder_path(owner),
         &node.name,
         context,
     )
@@ -324,8 +328,9 @@ fn is_js_word_char(c: char) -> bool {
 /// {…}` are properties, not bindings, so a `this.swipe()` elsewhere is not
 /// that object; one hung on `window` is the global `App`.
 pub(crate) fn is_unreachable_path_holder(node: &Node, reference: &RefView) -> bool {
-    is_path_holder(node)
-        && is_object_literal_owner(node)
+    // The kind first: most candidates are no constant or variable.
+    is_object_literal_owner(node)
+        && is_path_holder(node)
         && is_simple_js_identifier(&reference.reference_name)
         && !on_host_global(last_qualified_segment(&node.qualified_name))
 }
@@ -625,15 +630,25 @@ pub(crate) fn resolve_object_path_member(
 ) -> Option<Option<ResolvedRef>> {
     let via_global = host.is_some();
     let tail = path.rsplit('.').next().unwrap_or(path);
-    let named: Vec<Arc<Node>> = context
-        .get_nodes_by_name_shared(tail)
-        .into_iter()
-        .filter(|node| {
-            matches!(node.kind, NodeKind::Constant | NodeKind::Variable)
+    // The name's object-literal constants and variables by their paths, read
+    // once per pass (W5-08), then this call's own filter.
+    let holders = context.name_matcher_tables().object_holders(tail, || {
+        let mut by_path = crate::name_matcher::HoldersByPath::new();
+        for node in context.get_nodes_by_name_shared(tail) {
+            if matches!(node.kind, NodeKind::Constant | NodeKind::Variable)
                 && is_object_literal_language(node.language)
-                && same_language_family(node.language, reference.language)
-                && holder_path(node) == path
-        })
+            {
+                by_path.entry(holder_path(&node)).or_default().push(node);
+            }
+        }
+        by_path
+    });
+    let named: Vec<Arc<Node>> = holders
+        .get(path)
+        .into_iter()
+        .flatten()
+        .filter(|node| same_language_family(node.language, reference.language))
+        .cloned()
         .collect();
     if named.is_empty() {
         return None;

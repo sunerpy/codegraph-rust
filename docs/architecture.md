@@ -588,8 +588,10 @@ such a type, with what each declaration's own head writes, and a sync seeds the
 types whose entries came, went or changed, re-resolves at their sites the edges
 to methods named like those of a seed's old or new supertypes (five levels up),
 and retries the calls parked through a seed or a type up to four levels below
-it, however many there are; the `class_heads_version` marker is withdrawn and
-restored with the others. Resolution also reads control files, which are no
+it, however many there are; while it resolves, a sync whose rows were current
+as it started reads the heads of a file it neither rebuilds nor removes from
+that file's row rather than its source; the `class_heads_version` marker is
+withdrawn and restored with the others. Resolution also reads control files, which are no
 source files: the JS/TS path-alias configs along their `extends` chains, the
 workspace manifests and the folders a workspace glob lists, the `package.json`
 and Deno manifests above each JavaScript-family file, the C# project files

@@ -34,72 +34,23 @@ use std::sync::Arc;
 use anyhow::Result;
 use codegraph_core::source_file::{SourceText, read_source_file};
 use codegraph_core::types::{Language, Node, NodeKind};
+pub use codegraph_resolve::class_heads::{HeadEntry, HeadsRow, ROW_KEY_PREFIX, row_key};
 use codegraph_resolve::class_heads::{declaration_heads, name_supertypes};
 use codegraph_resolve::source_facts::SourceFacts;
 use codegraph_store::Store;
 use codegraph_store::queries::{FileReferenceSite, ReferenceSite};
-use serde::{Deserialize, Serialize};
 
 /// Metadata key present when no sync left a class-name call unrefreshed.
 pub const VERSION_KEY: &str = "class_heads_version";
 /// Value of [`VERSION_KEY`].
 pub const VERSION: &str = "1";
-/// `project_metadata` key prefix of a file's row.
-pub const ROW_KEY_PREFIX: &str = "class_heads:";
 
 /// How many levels up a walk from a class name goes (`inheritedClassMethod`).
 const WALK_LEVELS: usize = 5;
 
-/// One type declaration of a file: the supertypes its own head writes.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct HeadEntry {
-    pub language: Language,
-    pub name: String,
-    pub heads: Vec<String>,
-}
-
-impl HeadEntry {
-    /// The type this entry declares, as a walk reads it.
-    fn key(&self) -> TypeKey {
-        (self.language.as_str(), self.name.clone())
-    }
-}
-
-impl Ord for HeadEntry {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        (self.language.as_str(), &self.name, &self.heads).cmp(&(
-            other.language.as_str(),
-            &other.name,
-            &other.heads,
-        ))
-    }
-}
-
-impl PartialOrd for HeadEntry {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-/// A file's row: its entries, sorted.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct HeadsRow {
-    pub entries: Vec<HeadEntry>,
-}
-
-impl HeadsRow {
-    fn encode(&self) -> String {
-        serde_json::to_string(self).unwrap_or_default()
-    }
-
-    fn decode(value: &str) -> Option<Self> {
-        serde_json::from_str(value).ok()
-    }
-}
-
-/// The `project_metadata` key of `path`'s row.
-pub fn row_key(path: &str) -> String {
-    format!("{ROW_KEY_PREFIX}{path}")
+/// The type an entry declares, as a walk reads it.
+fn entry_key(entry: &HeadEntry) -> TypeKey {
+    (entry.language.as_str(), entry.name.clone())
 }
 
 /// Whether a file of `language` can declare a type a walk from a class name
@@ -283,7 +234,7 @@ type TypeKey = (&'static str, String);
 fn heads_by_type(row: Option<&HeadsRow>) -> BTreeMap<TypeKey, Vec<&[String]>> {
     let mut out: BTreeMap<TypeKey, Vec<&[String]>> = BTreeMap::new();
     for entry in row.into_iter().flat_map(|row| &row.entries) {
-        out.entry(entry.key())
+        out.entry(entry_key(entry))
             .or_default()
             .push(entry.heads.as_slice());
     }
@@ -320,7 +271,7 @@ fn links<'r>(rows: impl IntoIterator<Item = &'r HeadsRow>) -> (Links, Links) {
     for row in rows {
         for entry in &row.entries {
             written
-                .entry(entry.key())
+                .entry(entry_key(entry))
                 .or_insert_with(|| (entry.language, BTreeSet::new()))
                 .1
                 .extend(entry.heads.iter().cloned());
@@ -470,7 +421,7 @@ pub(crate) fn class_head_refresh(
             .filter(|(_, row)| {
                 row.entries
                     .iter()
-                    .any(|entry| targets.contains(&entry.key()))
+                    .any(|entry| targets.contains(&entry_key(entry)))
             })
             .map(|(path, _)| path)
             .collect();

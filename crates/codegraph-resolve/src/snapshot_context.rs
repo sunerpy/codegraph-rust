@@ -182,6 +182,12 @@ struct SnapshotCaches {
     /// Each directory's package.json / Deno import-map scope (upstream
     /// #2128 `manifestScopes`).
     manifest_scopes: BoundedFileMemo<Arc<ManifestScope>>,
+    /// Each file's functions and methods by qualified name (W5-08).
+    function_scopes: BoundedFileMemo<Arc<crate::name_matcher::FileCallables>>,
+    /// Each file's methods by owner and name (W5-08).
+    file_methods: BoundedFileMemo<Arc<crate::name_matcher::FileMethods>>,
+    /// The name matcher's memos for the run (W5-08).
+    name_matcher_tables: OnceLock<Arc<crate::name_matcher::NameMatcherTables>>,
     /// The Python write index for the run (upstream #2332).
     python_write_index: OnceLock<Arc<crate::python_globals::PythonWriteIndex>>,
     /// The C/C++ namespace tables for the run (upstream #2176).
@@ -217,6 +223,9 @@ impl SnapshotCaches {
             re_exports: BoundedFileMemo::new(DEFAULT_CACHE_LIMIT),
             fs_exists: BoundedFileMemo::new(crate::context::FILE_EXISTS_MEMO_LIMIT),
             manifest_scopes: BoundedFileMemo::new(DEFAULT_CACHE_LIMIT),
+            function_scopes: BoundedFileMemo::new(DEFAULT_CACHE_LIMIT),
+            file_methods: BoundedFileMemo::new(DEFAULT_CACHE_LIMIT),
+            name_matcher_tables: OnceLock::new(),
             python_write_index: OnceLock::new(),
             cpp_namespace_tables: OnceLock::new(),
             kotlin_tables: OnceLock::new(),
@@ -846,6 +855,45 @@ impl ResolutionContext for SnapshotResolutionContext {
         )
     }
 
+    fn enclosing_function_lines(
+        &self,
+        file_path: &str,
+        qualified: &str,
+        start: i64,
+        end: i64,
+    ) -> Option<(i64, i64)> {
+        self.file_callables(file_path)
+            .first_enclosing(qualified, start, end)
+    }
+
+    fn file_callables(&self, file_path: &str) -> Arc<crate::name_matcher::FileCallables> {
+        self.caches.function_scopes.get_or_init(file_path, || {
+            Arc::new(crate::name_matcher::FileCallables::of(
+                &self.get_nodes_in_file_shared(file_path),
+            ))
+        })
+    }
+
+    fn file_methods(&self, file_path: &str) -> Arc<crate::name_matcher::FileMethods> {
+        self.caches.file_methods.get_or_init(file_path, || {
+            Arc::new(crate::name_matcher::FileMethods::of(
+                &self.get_nodes_in_file_shared(file_path),
+            ))
+        })
+    }
+
+    fn method_files(&self, name: &str) -> Option<Arc<std::collections::HashSet<String>>> {
+        Some(crate::name_matcher::method_files_of(name, self))
+    }
+
+    fn name_matcher_tables(&self) -> Arc<crate::name_matcher::NameMatcherTables> {
+        Arc::clone(
+            self.caches
+                .name_matcher_tables
+                .get_or_init(|| Arc::new(crate::name_matcher::NameMatcherTables::new())),
+        )
+    }
+
     fn manifest_scope(&self, dir: &str) -> Arc<ManifestScope> {
         // A directory's parent is another key, so the memo never re-enters
         // the entry it is filling.
@@ -992,6 +1040,56 @@ mod tests {
             }])
             .unwrap();
         store
+    }
+
+    /// W5-08: the snapshot context answers a declaration's enclosing
+    /// function from its per-file memo exactly as the qualified-name lookup
+    /// does, before and after the memo holds the file.
+    #[test]
+    fn snapshot_encloses_as_the_qualified_name_lookup_does() {
+        let root = temp_root("enclosing");
+        let mut store = Store::open(&root.join("index.db")).expect("open");
+        store.upsert_file(&file_record("a.ts", 5)).unwrap();
+        store.upsert_file(&file_record("b.ts", 1)).unwrap();
+        let scoped = |id: &str, kind, qualified: &str, file: &str, lines: (i64, i64), col| {
+            let name = qualified.rsplit("::").next().unwrap_or(qualified);
+            let mut n = node(id, name, kind, file, lines.0, col);
+            n.qualified_name = qualified.to_string();
+            n.end_line = lines.1;
+            n
+        };
+        store
+            .upsert_nodes(&[
+                scoped("f-a", NodeKind::Function, "f", "a.ts", (3, 20), 0),
+                scoped("f-b", NodeKind::Function, "f", "a.ts", (3, 20), 4),
+                scoped("f-outer", NodeKind::Function, "f", "a.ts", (2, 30), 0),
+                scoped("m", NodeKind::Method, "C::m", "a.ts", (5, 9), 2),
+                scoped("c", NodeKind::Class, "C", "a.ts", (4, 10), 0),
+                scoped("f-other", NodeKind::Function, "f", "b.ts", (1, 100), 0),
+            ])
+            .unwrap();
+        let ctx = SnapshotResolutionContext::from_store(&store, root.to_str().unwrap())
+            .expect("snapshot");
+        for _ in 0..2 {
+            for (file, qualified, start, end) in [
+                ("a.ts", "f", 6, 7),
+                ("a.ts", "f", 25, 26),
+                ("a.ts", "f", 31, 31),
+                ("a.ts", "C::m", 6, 6),
+                ("a.ts", "C", 6, 6),
+                ("b.ts", "f", 50, 50),
+                ("c.ts", "f", 1, 1),
+            ] {
+                assert_eq!(
+                    ctx.enclosing_function_lines(file, qualified, start, end),
+                    crate::name_matcher::enclosing_by_qualified_name(
+                        &ctx, file, qualified, start, end
+                    ),
+                    "{file} {qualified} {start}..={end}"
+                );
+            }
+        }
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
