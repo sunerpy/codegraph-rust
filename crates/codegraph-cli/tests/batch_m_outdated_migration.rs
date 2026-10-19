@@ -499,9 +499,10 @@ fn incremental_sync_on_outdated_v2_forces_all_files() {
             .get_project_metadata("dart_libraries_version")
             .expect("Dart library marker")
     };
+    // Version 2 since the pubspec rows (W5-06).
     assert_eq!(
         dart_library_marker(&paths).as_deref(),
-        Some("1"),
+        Some("2"),
         "a migration writes the Dart library marker"
     );
     assert_eq!(
@@ -1531,13 +1532,19 @@ fn outdated_migration_writes_the_dart_head_rows_of_index_force() {
 
 /// W4-DART-02: a migration writes the Dart library rows (a file's `library`
 /// name, `part of` target, parts, and imports and exports with their
-/// prefixes and combinators) and their marker as `index --force` does.
+/// prefixes and combinators) and their marker as `index --force` does, and
+/// (W5-06) the pubspec rows of the folders above the Dart files.
 #[test]
 fn outdated_migration_writes_the_dart_library_rows_of_index_force() {
     let dir = TestDir::new("outdated-dart-libraries");
     let project = dir.path().join("mini");
     for (path, contents) in [
         ("pubspec.yaml", "name: app\n"),
+        (
+            "pubspec_overrides.yaml",
+            "dependency_overrides:\n  kit:\n    path: packages/kit\n",
+        ),
+        ("tools/pubspec.yaml", "name: tools\n"),
         (
             "lib/app.dart",
             "library app;\n\nimport 'src/util.dart' as util show helper;\nexport 'src/util.dart' hide hidden;\n\npart 'piece.dart';\n",
@@ -1579,6 +1586,33 @@ fn outdated_migration_writes_the_dart_library_rows_of_index_force() {
             .project_metadata_with_prefix("dart_librar")
             .expect("Dart library rows")
     };
+    let pubspec_rows = |paths: &IndexPaths| {
+        Store::open_for_read(paths, deadline(), || false)
+            .expect("readable namespace")
+            .project_metadata_with_prefix("dart_pubspec:")
+            .expect("Dart pubspec rows")
+    };
+    let migrated_pubspecs = pubspec_rows(&paths);
+    // One row for the root, which holds both manifests; none for a folder
+    // above no Dart file.
+    assert_eq!(
+        migrated_pubspecs
+            .iter()
+            .map(|(key, _)| key.as_str())
+            .collect::<Vec<_>>(),
+        ["dart_pubspec:"],
+        "a migration writes the pubspec rows: {migrated_pubspecs:?}"
+    );
+    assert!(
+        migrated_pubspecs[0].1.contains("name: app")
+            && migrated_pubspecs[0].1.contains("dependency_overrides"),
+        "a row records both manifests: {migrated_pubspecs:?}"
+    );
+    assert_eq!(
+        migrated_pubspecs,
+        pubspec_rows(&IndexPaths::resolve(&peer, None).expect("resolve peer v2 paths")),
+        "a forced migration must write the Dart pubspec rows of `index --force`"
+    );
     let migrated = library_rows(&paths);
     // No row for a file without a directive.
     assert_eq!(

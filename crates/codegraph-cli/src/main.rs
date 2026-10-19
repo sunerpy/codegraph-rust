@@ -6053,6 +6053,7 @@ fn index_project_inner(
     drop(dart_rows);
     codegraph_watch::dart_libraries::write_index_rows(&store, &mut dart_library_rows)?;
     drop(dart_library_rows);
+    codegraph_watch::dart_libraries::write_pubspec_rows(&store, project)?;
     // A fresh index leaves no C/C++ (W4-CPP-04), Java (W4-JVM-01), Kotlin
     // (W4-JVM-03), Scala (W4-SC-01), C# (W4-CS-01), member-walk (W4-CS-03)
     // Ruby (W4-RB-01), CFML (W4-CF-01), Swift (W4-SW-01), Objective-C

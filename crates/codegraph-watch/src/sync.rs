@@ -704,6 +704,23 @@ fn sync_paths_with_store(
     if control.any() {
         changed_names.begin_mutation(store)?;
     }
+    // The pubspec manifests the Dart library model reads (W5-06), compared
+    // with their rows once the paths are processed: when they moved, the
+    // Dart lane compares the sync's two states, each with its own.
+    let dart_manifests_touched = scanned.is_some()
+        || requested
+            .iter()
+            .any(|path| crate::dart_libraries::is_pubspec_path(path))
+        || changed_names
+            .added_files
+            .iter()
+            .chain(&changed_names.removed_files)
+            .any(|path| path.ends_with(".dart"));
+    let pubspecs =
+        crate::dart_libraries::pubspec_check(store, project_root, dart_manifests_touched)?;
+    if pubspecs.moved() {
+        changed_names.begin_mutation(store)?;
+    }
     let any_bootstrap = surface_bootstrap
         || cpp_bootstrap
         || java_bootstrap
@@ -733,6 +750,7 @@ fn sync_paths_with_store(
     let block = changed
         || any_bootstrap
         || control.any()
+        || pubspecs.moved()
         || crate::control_inputs::frameworks_unchecked(store)?;
     let mut resolver = ReferenceResolver::new(project_root.to_string_lossy())
         .with_max_file_size(scope.options.max_file_size);
@@ -1150,6 +1168,7 @@ fn sync_paths_with_store(
             &changed_names.added_files,
             &reindexed,
             &changed_names.removed_files,
+            &pubspecs,
             dart_library_bootstrap,
         )?;
         for file in &dart_libraries.files {
@@ -5993,6 +6012,176 @@ pub(crate) mod tests {
             assert_eq!(edge_projection(&db), fresh_edges(name, &fresh));
             assert!(reaches_helper(&db), "{:#?}", edge_projection(&db));
         }
+    }
+
+    fn dart_pubspec_rows(db: &Path) -> Vec<(String, String)> {
+        Store::open(db)
+            .unwrap()
+            .project_metadata_with_prefix(codegraph_resolve::dart_libraries::PUBSPEC_ROW_KEY_PREFIX)
+            .unwrap()
+    }
+
+    const KIT_PUBSPEC: (&str, &str) = ("packages/kit/pubspec.yaml", "name: kit\n");
+    const KIT_PUBSPEC_RENAMED: (&str, &str) = ("packages/kit/pubspec.yaml", "name: kit2\n");
+    const KIT_LIB: (&str, &str) = ("packages/kit/lib/kit.dart", "int shown() => 1;\n");
+    const KIT_MAIN: (&str, &str) = (
+        "lib/main.dart",
+        "import 'package:kit/kit.dart';\n\nint run() => shown();\n",
+    );
+
+    fn imports_kit(db: &Path) -> bool {
+        edge_projection(db)
+            .iter()
+            .any(|edge| edge.contains("lib/main.dart -[imports]-> packages/kit/lib/kit.dart"))
+    }
+
+    /// W5-06: a sync failing after a package's pubspec renamed it, before
+    /// resolving, leaves the next sync, with nothing changed or with an
+    /// unrelated change, to strand the import of the old name as a fresh
+    /// index does, and to write the pubspec rows a fresh index writes.
+    #[test]
+    fn a_pubspec_sync_failing_after_its_mutations_leaves_the_next_one_to_reconcile() {
+        for unrelated in [false, true] {
+            let dir = TestDir::new(if unrelated {
+                "dart-pubspec-fail-unrelated"
+            } else {
+                "dart-pubspec-fail"
+            });
+            let db = default_db_path(dir.path()).unwrap();
+            let initial = [DART_PUBSPEC, KIT_PUBSPEC, KIT_LIB, KIT_MAIN, DART_SPARE];
+            write_files(dir.path(), &initial);
+            sync_changed_paths(dir.path(), &db, initial.iter().map(|(path, _)| *path)).unwrap();
+            assert!(imports_kit(&db), "{:#?}", edge_projection(&db));
+            assert_eq!(
+                dart_pubspec_rows(&db).len(),
+                2,
+                "{:#?}",
+                dart_pubspec_rows(&db)
+            );
+
+            write_files(dir.path(), &[KIT_PUBSPEC_RENAMED]);
+            FAIL_BEFORE_RESOLUTION.with(|fail| fail.set(true));
+            let failed = sync_changed_paths(dir.path(), &db, [KIT_PUBSPEC.0]);
+            FAIL_BEFORE_RESOLUTION.with(|fail| fail.set(false));
+            assert!(failed.is_err(), "the injected failure must stop the sync");
+            assert_eq!(
+                dart_library_marker(&db),
+                None,
+                "a failed sync leaves the marker away"
+            );
+
+            let spare = if unrelated {
+                write_files(dir.path(), &[DART_SPARE_EDITED]);
+                sync_changed_paths(dir.path(), &db, [DART_SPARE.0]).unwrap();
+                DART_SPARE_EDITED
+            } else {
+                sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
+                DART_SPARE
+            };
+            assert_eq!(
+                dart_library_marker(&db),
+                Some(crate::dart_libraries::VERSION.to_string())
+            );
+            let fresh = [DART_PUBSPEC, KIT_PUBSPEC_RENAMED, KIT_LIB, KIT_MAIN, spare];
+            let name = if unrelated {
+                "dart-pubspec-fresh-unrelated"
+            } else {
+                "dart-pubspec-fresh"
+            };
+            assert_eq!(edge_projection(&db), fresh_edges(name, &fresh));
+            assert!(!imports_kit(&db), "{:#?}", edge_projection(&db));
+            let rows = dart_pubspec_rows(&db);
+            assert!(
+                rows.iter().any(
+                    |(key, value)| key == "dart_pubspec:packages/kit" && value.contains("kit2")
+                ),
+                "{rows:#?}"
+            );
+        }
+    }
+
+    /// W5-06: an index at the Dart library marker's version 1, which wrote
+    /// no pubspec rows, or with a pubspec row that cannot be read, has every
+    /// Dart file re-resolved and both kinds of row rebuilt by its next sync,
+    /// even one with nothing changed: the import edge an older sync lost
+    /// comes back and the rows are a fresh index's.
+    #[test]
+    fn an_index_at_marker_one_or_with_a_corrupt_pubspec_row_rebuilds_the_rows() {
+        for corrupt in [false, true] {
+            let dir = TestDir::new(if corrupt {
+                "dart-pubspec-corrupt-row"
+            } else {
+                "dart-pubspec-marker-one"
+            });
+            let db = default_db_path(dir.path()).unwrap();
+            let initial = [DART_PUBSPEC, KIT_PUBSPEC, KIT_LIB, KIT_MAIN];
+            write_files(dir.path(), &initial);
+            sync_changed_paths(dir.path(), &db, initial.iter().map(|(path, _)| *path)).unwrap();
+            let expected = edge_projection(&db);
+            let rows = dart_pubspec_rows(&db);
+            assert_eq!(rows.len(), 2, "{rows:#?}");
+            {
+                let store = Store::open(&db).unwrap();
+                let dropped = store
+                    .connection()
+                    .execute(
+                        "DELETE FROM edges WHERE kind = 'imports' AND target = \
+                         (SELECT id FROM nodes WHERE kind = 'file' \
+                         AND file_path = 'packages/kit/lib/kit.dart')",
+                        [],
+                    )
+                    .unwrap();
+                assert_eq!(dropped, 1, "the import edge an older sync lost");
+                if corrupt {
+                    store
+                        .set_project_metadata("dart_pubspec:packages/kit", "not json")
+                        .unwrap();
+                } else {
+                    store
+                        .delete_project_metadata_with_prefix(
+                            codegraph_resolve::dart_libraries::PUBSPEC_ROW_KEY_PREFIX,
+                        )
+                        .unwrap();
+                    store
+                        .set_project_metadata(crate::dart_libraries::VERSION_KEY, "1")
+                        .unwrap();
+                }
+            }
+            sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
+            assert_eq!(edge_projection(&db), expected);
+            assert_eq!(dart_pubspec_rows(&db), rows);
+            assert_eq!(
+                dart_library_marker(&db),
+                Some(crate::dart_libraries::VERSION.to_string())
+            );
+        }
+    }
+
+    /// W5-06: a pubspec the sync is not told of is not read, and one in a
+    /// folder above no Dart file is no input: neither moves anything.
+    #[test]
+    fn a_pubspec_is_read_only_when_a_sync_is_told_of_it() {
+        let dir = TestDir::new("dart-pubspec-untold");
+        let db = default_db_path(dir.path()).unwrap();
+        let initial = [DART_PUBSPEC, KIT_PUBSPEC, KIT_LIB, KIT_MAIN, DART_SPARE];
+        write_files(dir.path(), &initial);
+        sync_changed_paths(dir.path(), &db, initial.iter().map(|(path, _)| *path)).unwrap();
+        let rows = dart_pubspec_rows(&db);
+        write_files(
+            dir.path(),
+            &[KIT_PUBSPEC_RENAMED, ("tools/pubspec.yaml", "name: tools\n")],
+        );
+        write_files(dir.path(), &[DART_SPARE_EDITED]);
+        sync_changed_paths(dir.path(), &db, [DART_SPARE.0]).unwrap();
+        assert!(imports_kit(&db), "an untold rename is not read yet");
+        assert_eq!(dart_pubspec_rows(&db), rows);
+        sync_changed_paths(dir.path(), &db, ["tools/pubspec.yaml"]).unwrap();
+        assert!(!imports_kit(&db), "{:#?}", edge_projection(&db));
+        let rows = dart_pubspec_rows(&db);
+        assert!(
+            !rows.iter().any(|(key, _)| key == "dart_pubspec:tools"),
+            "{rows:#?}"
+        );
     }
 
     /// W4-DART-02: an index whose Dart library marker and rows alone are

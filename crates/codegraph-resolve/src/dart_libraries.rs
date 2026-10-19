@@ -542,6 +542,8 @@ struct ExportWalk {
 struct FixedState {
     files: Vec<String>,
     directives: HashMap<String, Arc<DartDirectives>>,
+    /// The pubspec manifests of the state, by directory ([`pubspec_snapshot`]).
+    manifests: BTreeMap<String, PubspecRow>,
 }
 
 /// What a Dart file's resolution reads of the library model, apart from its
@@ -611,11 +613,81 @@ pub fn pubspec_package_name(text: &str) -> Option<String> {
 /// The text of the project file `relative`, read as a source file is: a
 /// regular file within the size limit, stat first.
 fn read_project_file(context: &dyn ResolutionContext, relative: &str) -> Option<String> {
+    read_file_under(context.get_project_root(), relative)
+}
+
+/// [`read_project_file`] under the project root `project_root`.
+fn read_file_under(project_root: &str, relative: &str) -> Option<String> {
     crate::context::read_source_file(
-        &std::path::Path::new(context.get_project_root()).join(relative),
+        &std::path::Path::new(project_root).join(relative),
         relative,
         codegraph_core::config::DEFAULT_MAX_FILE_SIZE,
     )
+}
+
+/// Metadata key prefix of a directory's pubspec row (W5-06).
+pub const PUBSPEC_ROW_KEY_PREFIX: &str = "dart_pubspec:";
+
+/// The `project_metadata` key of the pubspec row of project directory `dir`
+/// (`""` for the root).
+pub fn pubspec_row_key(dir: &str) -> String {
+    format!("{PUBSPEC_ROW_KEY_PREFIX}{dir}")
+}
+
+/// What the library model reads in one directory: its `pubspec.yaml` and
+/// `pubspec_overrides.yaml`, as [`read_project_file`] reads them (`None` for
+/// a missing or unreadable one).
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PubspecRow {
+    pub pubspec: Option<String>,
+    pub overrides: Option<String>,
+}
+
+impl PubspecRow {
+    pub fn encode(&self) -> String {
+        serde_json::to_string(self).expect("dart pubspec row encodes")
+    }
+
+    pub fn decode(value: &str) -> Option<Self> {
+        serde_json::from_str(value).ok()
+    }
+
+    /// The text of `file`, one of the two manifests.
+    fn text_of(&self, file: &str) -> Option<&str> {
+        match file {
+            "pubspec.yaml" => self.pubspec.as_deref(),
+            "pubspec_overrides.yaml" => self.overrides.as_deref(),
+            _ => None,
+        }
+    }
+}
+
+/// The pubspec manifests the library model reads for the Dart files `files`
+/// of the project at `project_root`: in each directory from a file's up to
+/// the root, `pubspec.yaml` and `pubspec_overrides.yaml`, read as the model
+/// reads them; a directory holding neither is left out (W5-06). A package's
+/// name and its `path:` dependencies are read only in those directories.
+pub fn pubspec_snapshot(project_root: &str, files: &[String]) -> BTreeMap<String, PubspecRow> {
+    let mut dirs: BTreeSet<String> = BTreeSet::new();
+    for file in files.iter().filter(|file| file.ends_with(".dart")) {
+        let mut dir = pathutil::dirname(file);
+        loop {
+            if !dirs.insert(dir.clone()) || dir.is_empty() {
+                break;
+            }
+            dir = pathutil::dirname(&dir);
+        }
+    }
+    dirs.into_iter()
+        .filter_map(|dir| {
+            let row = PubspecRow {
+                pubspec: read_file_under(project_root, &join(&dir, "pubspec.yaml")),
+                overrides: read_file_under(project_root, &join(&dir, "pubspec_overrides.yaml")),
+            };
+            (row != PubspecRow::default()).then_some((dir, row))
+        })
+        .collect()
 }
 
 /// `dir/file`, or `file` at the project root.
@@ -769,10 +841,15 @@ impl DartLibraries {
     }
 
     /// The model of one fixed state of the project's Dart files (a sync's
-    /// before or after): `files` are its indexed Dart files and `directives`
-    /// what each of them holds (a file missing from it holds none). The
-    /// context still says where the project and its pubspec.yaml files are.
-    pub fn of_state(mut files: Vec<String>, directives: HashMap<String, DartDirectives>) -> Self {
+    /// before or after): `files` are its indexed Dart files, `directives`
+    /// what each of them holds (a file missing from it holds none), and
+    /// `manifests` its pubspec manifests by directory ([`pubspec_snapshot`];
+    /// a directory missing from it holds none). Nothing is read from disk.
+    pub fn of_state(
+        mut files: Vec<String>,
+        directives: HashMap<String, DartDirectives>,
+        manifests: BTreeMap<String, PubspecRow>,
+    ) -> Self {
         files.sort();
         files.dedup();
         Self {
@@ -782,8 +859,27 @@ impl DartLibraries {
                     .into_iter()
                     .map(|(file, d)| (file, Arc::new(d)))
                     .collect(),
+                manifests,
             }),
             ..Self::default()
+        }
+    }
+
+    /// The text of manifest `file` in project directory `dir`: the fixed
+    /// state's snapshot, or the file on disk.
+    fn manifest_text(
+        &self,
+        dir: &str,
+        file: &str,
+        context: &dyn ResolutionContext,
+    ) -> Option<String> {
+        match &self.state {
+            Some(state) => state
+                .manifests
+                .get(dir)
+                .and_then(|row| row.text_of(file))
+                .map(str::to_string),
+            None => read_project_file(context, &join(dir, file)),
         }
     }
 
@@ -847,7 +943,8 @@ impl DartLibraries {
                 break hit;
             }
             walked.push(d.clone());
-            if let Some(name) = read_project_file(context, &join(&d, "pubspec.yaml"))
+            if let Some(name) = self
+                .manifest_text(&d, "pubspec.yaml", context)
                 .as_deref()
                 .and_then(pubspec_package_name)
             {
@@ -907,7 +1004,7 @@ impl DartLibraries {
         }
         let mut dirs: Vec<String> = Vec::new();
         for file in ["pubspec_overrides.yaml", "pubspec.yaml"] {
-            let Some(text) = read_project_file(context, &join(&package.root, file)) else {
+            let Some(text) = self.manifest_text(&package.root, file, context) else {
                 continue;
             };
             for written in yaml_path_dependencies(&text, name) {

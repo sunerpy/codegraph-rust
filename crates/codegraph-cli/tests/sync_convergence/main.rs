@@ -383,11 +383,17 @@ fn run_case(name: &str, case: &Case) {
     let dart_library_rows = support::project_metadata_with_prefix(&fresh.db(), "dart_library");
     // And the Shopify theme row and its marker (W4-LIQ-01).
     let shopify_rows = support::project_metadata_with_prefix(&fresh.db(), "shopify_themes");
-    // And the class-head rows (W5-07), the control-input rows and the
-    // detected frameworks (W5-06). An input outside the project is keyed by
+    // And the class-head rows (W5-07), the control-input rows, the
+    // detected frameworks and the Dart pubspec rows (W5-06). An input
+    // outside the project is keyed by
     // the absolute path its reader used, which differs between the trees, so
     // only project paths are compared.
-    for prefix in ["class_heads", "control_inputs", "frameworks_"] {
+    for prefix in [
+        "class_heads",
+        "control_inputs",
+        "frameworks_",
+        "dart_pubspec",
+    ] {
         let fresh_rows = comparable_rows(&fresh.db(), prefix);
         for (driver, project) in [("cli", &cli), ("watch", &watch)] {
             let rows = comparable_rows(&project.db(), prefix);
@@ -1113,10 +1119,12 @@ matrix! {
     dart_annotation_reaches_a_constant_its_imported_library_gains,
     dart_prefixed_call_reaches_a_function_its_library_gains_past_the_tail_ceiling,
     dart_prefixed_call_reaches_a_name_its_barrel_starts_to_show_past_the_tail_ceiling,
-    #[ignore = "W5-06: a pubspec.yaml change does not re-resolve the project's Dart files"]
     dart_pubspec_rename_strands_a_package_import,
-    #[ignore = "W5-06: a pubspec.yaml change does not re-resolve the project's Dart files"]
     dart_pubspec_path_dependency_picks_a_same_named_package,
+    dart_pubspec_overrides_path_dependency_picks_a_same_named_package,
+    dart_ignored_pubspec_overrides_path_dependency_picks_a_same_named_package,
+    dart_pubspec_appears_and_its_folder_becomes_a_package,
+    dart_pubspec_deleted_strands_a_package_import,
     php_call_in_another_case_leaves_a_function_once_a_namesake_in_another_case_appears,
     php_function_called_in_another_case_from_the_global_namespace_reaches_it_once_it_appears,
     php_inherited_static_call_follows_a_class_head_spread_past_its_third_line,

@@ -10802,6 +10802,111 @@ pub fn dart_pubspec_path_dependency_picks_a_same_named_package() -> Case {
         )
 }
 
+/// W5-06: an app's `pubspec_overrides.yaml` comes to name one of two
+/// same-named packages by `path:`: its unchanged import now names that
+/// package's file.
+pub fn dart_pubspec_overrides_path_dependency_picks_a_same_named_package() -> Case {
+    Case::new(Change::ControlFile, &[Language::Dart])
+        .file("examples/login/pubspec.yaml", "name: login\n")
+        .file("examples/login/packages/auth/pubspec.yaml", "name: auth\n")
+        .file(
+            "examples/login/packages/auth/lib/auth.dart",
+            "class Auth {}\n",
+        )
+        .file("examples/other/pubspec.yaml", "name: other\n")
+        .file("examples/other/packages/auth/pubspec.yaml", "name: auth\n")
+        .file(
+            "examples/other/packages/auth/lib/auth.dart",
+            "class Auth {}\n",
+        )
+        .file(
+            "examples/login/lib/app.dart",
+            "import 'package:auth/auth.dart';\n\nclass App {}\n",
+        )
+        .write(
+            "examples/login/pubspec_overrides.yaml",
+            "dependency_overrides:\n  auth:\n    path: packages/auth\n",
+        )
+        .edge_after(
+            "file:examples/login/lib/app.dart",
+            "imports",
+            "file:examples/login/packages/auth/lib/auth.dart",
+        )
+}
+
+/// W5-06: the same through a `pubspec_overrides.yaml` the repository
+/// ignores, as melos writes it: the manifest is no indexed file, so only the
+/// pubspec lane hears of it, and its `path:` still picks the package.
+pub fn dart_ignored_pubspec_overrides_path_dependency_picks_a_same_named_package() -> Case {
+    Case::new(Change::ControlFile, &[Language::Dart])
+        .file(".gitignore", "pubspec_overrides.yaml\n")
+        .file("examples/login/pubspec.yaml", "name: login\n")
+        .file("examples/login/packages/auth/pubspec.yaml", "name: auth\n")
+        .file(
+            "examples/login/packages/auth/lib/auth.dart",
+            "class Auth {}\n",
+        )
+        .file("examples/other/pubspec.yaml", "name: other\n")
+        .file("examples/other/packages/auth/pubspec.yaml", "name: auth\n")
+        .file(
+            "examples/other/packages/auth/lib/auth.dart",
+            "class Auth {}\n",
+        )
+        .file(
+            "examples/login/lib/app.dart",
+            "import 'package:auth/auth.dart';\n\nclass App {}\n",
+        )
+        .write(
+            "examples/login/pubspec_overrides.yaml",
+            "dependency_overrides:\n  auth:\n    path: packages/auth\n",
+        )
+        .edge_after(
+            "file:examples/login/lib/app.dart",
+            "imports",
+            "file:examples/login/packages/auth/lib/auth.dart",
+        )
+}
+
+/// W5-06: a `pubspec.yaml` appearing makes its folder the package it names:
+/// an unchanged file's `package:kit/…` import comes to name its file. The
+/// manifest is an indexed YAML file in the folder `kit`, so the parked
+/// import is also retried under that key (W5-01) and this case converges
+/// without the per-state manifests; the rename and deletion cases need them.
+pub fn dart_pubspec_appears_and_its_folder_becomes_a_package() -> Case {
+    Case::new(Change::ControlFile, &[Language::Dart])
+        .file("pubspec.yaml", "name: app\n")
+        .file("packages/kit/lib/kit.dart", "int shown() => 1;\n")
+        .file(
+            "lib/main.dart",
+            "import 'package:kit/kit.dart';\n\nint run() => shown();\n",
+        )
+        .write("packages/kit/pubspec.yaml", "name: kit\n")
+        .edge_after(
+            "file:lib/main.dart",
+            "imports",
+            "file:packages/kit/lib/kit.dart",
+        )
+}
+
+/// W5-06: a package's `pubspec.yaml` deleted: its folder is no package, so
+/// an unchanged file's `package:kit/…` import no longer names its file.
+pub fn dart_pubspec_deleted_strands_a_package_import() -> Case {
+    Case::new(Change::ControlFile, &[Language::Dart])
+        .file("pubspec.yaml", "name: app\n")
+        .file("packages/kit/pubspec.yaml", "name: kit\n")
+        .file("packages/kit/lib/kit.dart", "int shown() => 1;\n")
+        .file(
+            "lib/main.dart",
+            "import 'package:kit/kit.dart';\n\nint run() => shown();\n",
+        )
+        .remove("packages/kit/pubspec.yaml")
+        .edge_before(
+            "file:lib/main.dart",
+            "imports",
+            "file:packages/kit/lib/kit.dart",
+        )
+}
+
 /// 501 parked imports of `main.dart` files the project lacks: more than the
 /// shared import-key lookup wakes for one key.
 static MAIN_IMPORTS: LazyLock<String> = LazyLock::new(|| {

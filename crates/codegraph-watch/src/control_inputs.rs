@@ -119,11 +119,14 @@ pub fn is_tauri_marker(relative: &str) -> bool {
     TAURI_MARKERS.contains(&relative)
 }
 
-/// Whether `relative` names a control file of any kind, or a Tauri marker:
-/// the watcher hands its events to the sync, though it is no source file.
+/// Whether `relative` names a control file of any kind, a Tauri marker, or
+/// a Dart pubspec manifest (the Dart library lane's): the watcher hands its
+/// events to the sync, though it is no source file.
 pub fn is_control_file(relative: &str) -> bool {
     let name = relative.rsplit('/').next().unwrap_or(relative);
-    is_tauri_marker(relative) || ControlKind::ALL.iter().any(|kind| kind.names_file(name))
+    is_tauri_marker(relative)
+        || ControlKind::ALL.iter().any(|kind| kind.names_file(name))
+        || crate::dart_libraries::is_pubspec_path(relative)
 }
 
 /// A kind's inputs and their digests, by key: a project path for an input
@@ -509,6 +512,9 @@ mod tests {
         assert!(is_control_file("Directory.Build.props"));
         assert!(is_control_file("crates/a/Cargo.toml"));
         assert!(is_control_file("src-tauri/tauri.conf.json"));
+        assert!(is_control_file("packages/kit/pubspec.yaml"));
+        assert!(is_control_file("pubspec_overrides.yaml"));
+        assert!(!is_control_file("pubspec.lock"));
         assert!(!is_control_file("apps/tauri.conf.json"));
         assert!(!is_control_file("src/main.ts"));
         assert!(!is_control_file("cargo.toml"));

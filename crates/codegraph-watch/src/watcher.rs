@@ -4172,8 +4172,8 @@ mod tests {
     }
 
     /// W5-06: a control file a resolver reads is no source file, yet its
-    /// event reaches the sync: a JS, C# or Rust control file and a Tauri
-    /// marker by name; an input the index records (an `extends` target named
+    /// event reaches the sync: a JS, C#, Rust or Dart control file and a
+    /// Tauri marker by name; an input the index records (an `extends` target named
     /// like no control file) by its path, and a directory coming into a
     /// workspace glob's listing, as the watcher read them at start; and an
     /// input the rows come to record, as a sync reports them. JSON no reader
@@ -4270,6 +4270,7 @@ mod tests {
             ("App/App.csproj", "<Project Sdk=\"Microsoft.NET.Sdk\" />\n"),
             ("Cargo.toml", "[package]\nname = \"app\"\n"),
             ("src-tauri/tauri.conf.json", "{}\n"),
+            ("packages/core/pubspec.yaml", "name: core\n"),
         ] {
             write(relative, text);
             if !reached(relative) {

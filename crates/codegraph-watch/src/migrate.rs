@@ -264,6 +264,7 @@ pub(crate) fn migrate_project(
     drop(dart_rows);
     crate::dart_libraries::write_index_rows(rebuild.store(), &mut dart_library_rows)?;
     drop(dart_library_rows);
+    crate::dart_libraries::write_pubspec_rows(rebuild.store(), project_root)?;
     crate::cpp_dependents::write_marker(rebuild.store())?;
     crate::java_heads::write_marker(rebuild.store())?;
     crate::kotlin_surfaces::write_marker(rebuild.store())?;

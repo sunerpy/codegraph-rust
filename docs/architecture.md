@@ -525,8 +525,12 @@ node touches no name, since no resolution reads one and its URI, written as a ba
 names every file of that name; the `dart_libraries_version` marker is withdrawn and restored with
 the others, and a sync that finds it missing, or a row it cannot read, withdraws it before
 changing anything and re-resolves every Dart file; the `pubspec.yaml` and `pubspec_overrides.yaml`
-files a Dart file's package and `path:` dependencies are read from are no source files (a change to
-one itself is not yet detected);
+files a Dart file's package and `path:` dependencies are read from are no source files, so every
+index and sync also keeps a `dart_pubspec:` row per folder above a Dart file that holds one, with
+both texts, and a sync re-reads them (a CLI sync always, a watcher's when a path it was handed is
+named like one, or a Dart file came or went): when they moved, the before and after library models
+each read their own state's manifests, and the same comparison re-resolves what a package renamed,
+a folder becoming a package or a `path:` dependency moved, rather than every Dart file;
 a changed Dart file moves the later links of the call chains in unchanged Dart files through the
 names its declarations changed (a member or top-level declaration, as the member surface rows keep
 it, came, went or reads otherwise; a member of an extension whose head changed, came or went; a

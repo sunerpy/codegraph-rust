@@ -28,7 +28,14 @@
 //!   retried at their sites, however many there are (the shared tail lookup
 //!   caps them): [`prefixed_call_sites`].
 //!
-//! A pubspec.yaml change is W5-06's control-file lane.
+//! The packages come from the `pubspec.yaml` and `pubspec_overrides.yaml`
+//! files above the Dart files, which are no source files: every full index
+//! and migration also writes a row per directory holding one
+//! ([`codegraph_resolve::dart_libraries::PubspecRow`], W5-06). A sync re-reads
+//! them (the CLI's full sync always, a watcher's when a path it was handed is
+//! named like one, or a Dart file came or went) and, when they moved, the two
+//! models see each state's own manifests, so the comparison above covers a
+//! package renamed, a directory becoming a package, or a `path:` dependency.
 //!
 //! The rows are written last, with the other rows. An index without the
 //! marker at [`VERSION`], or with a row it cannot read, re-resolves every
@@ -43,15 +50,27 @@ use codegraph_core::types::{EdgeKind, Language};
 use codegraph_resolve::ResolutionContext;
 use codegraph_resolve::dart_libraries::{
     DartDirectives, DartLibraries, LIBRARY_ROW_KEY_PREFIX, LibraryRow, NameFilter,
-    is_dart_library_decl, library_row_key,
+    PUBSPEC_ROW_KEY_PREFIX, PubspecRow, is_dart_library_decl, library_row_key, pubspec_row_key,
+    pubspec_snapshot,
 };
 use codegraph_store::Store;
 use codegraph_store::queries::{FileReferenceSite, ReferenceSite};
 
 /// Metadata key present when no sync left a Dart dependent unrefreshed.
 pub const VERSION_KEY: &str = "dart_libraries_version";
-/// Value of [`VERSION_KEY`].
-pub const VERSION: &str = "1";
+/// Value of [`VERSION_KEY`]: 2 since the pubspec rows (W5-06), so an index
+/// written before them rebuilds both kinds of row once.
+pub const VERSION: &str = "2";
+
+/// The file names of the manifests the library model reads.
+const MANIFESTS: [&str; 2] = ["pubspec.yaml", "pubspec_overrides.yaml"];
+
+/// Whether project path `relative` is named like a pubspec manifest: the
+/// watcher hands its events to the sync, though it is no source file.
+pub fn is_pubspec_path(relative: &str) -> bool {
+    let name = relative.rsplit('/').next().unwrap_or(relative);
+    MANIFESTS.contains(&name)
+}
 
 /// `source`'s library row, `None` when it records nothing: a file that is no
 /// Dart file, has no directive, or is not text.
@@ -79,6 +98,77 @@ pub fn write_index_rows(store: &Store, rows: &mut [(String, LibraryRow)]) -> Res
     Ok(())
 }
 
+/// Write the pubspec rows of a full index or a migration of the project at
+/// `project_root`, once every file row is stored.
+pub fn write_pubspec_rows(store: &Store, project_root: &Path) -> Result<()> {
+    let files = dart_files(store)?;
+    for (dir, row) in pubspec_snapshot(&project_root.to_string_lossy(), &files) {
+        store.set_project_metadata(&pubspec_row_key(&dir), &row.encode())?;
+    }
+    Ok(())
+}
+
+/// The indexed Dart files.
+fn dart_files(store: &Store) -> Result<Vec<String>> {
+    Ok(store
+        .all_files()?
+        .into_iter()
+        .filter(|file| file.language == Language::Dart)
+        .map(|file| file.path)
+        .collect())
+}
+
+/// The pubspec rows this index holds, by directory; `None` when one cannot
+/// be read.
+fn read_pubspec_rows(store: &Store) -> Result<Option<BTreeMap<String, PubspecRow>>> {
+    let mut rows = BTreeMap::new();
+    for (key, value) in store.project_metadata_with_prefix(PUBSPEC_ROW_KEY_PREFIX)? {
+        let (Some(dir), Some(row)) = (
+            key.strip_prefix(PUBSPEC_ROW_KEY_PREFIX),
+            PubspecRow::decode(&value),
+        ) else {
+            return Ok(None);
+        };
+        rows.insert(dir.to_string(), row);
+    }
+    Ok(Some(rows))
+}
+
+/// What a sync read of the pubspec manifests, after its paths are processed.
+#[derive(Debug, Default)]
+pub(crate) struct PubspecCheck {
+    /// The rows and the manifests on disk now, when the sync read them.
+    read: Option<(BTreeMap<String, PubspecRow>, BTreeMap<String, PubspecRow>)>,
+}
+
+impl PubspecCheck {
+    /// Whether the manifests moved since the rows were written.
+    pub(crate) fn moved(&self) -> bool {
+        self.read.as_ref().is_some_and(|(rows, now)| rows != now)
+    }
+}
+
+/// Re-read the pubspec manifests of the indexed Dart files when `touched`
+/// (a full sync, a path named like a manifest, or a Dart file that came or
+/// went) and compare them with the rows. Rows it cannot read are the
+/// bootstrap's ([`needs_bootstrap`]), which re-reads every manifest.
+pub(crate) fn pubspec_check(
+    store: &Store,
+    project_root: &Path,
+    touched: bool,
+) -> Result<PubspecCheck> {
+    if !touched {
+        return Ok(PubspecCheck::default());
+    }
+    let Some(rows) = read_pubspec_rows(store)? else {
+        return Ok(PubspecCheck::default());
+    };
+    let now = pubspec_snapshot(&project_root.to_string_lossy(), &dart_files(store)?);
+    Ok(PubspecCheck {
+        read: Some((rows, now)),
+    })
+}
+
 /// Whether this index needs every Dart file re-resolved and its rows
 /// rebuilt: its marker is missing or at another version, or a row cannot be
 /// read (failing closed even in a sync with nothing changed).
@@ -89,7 +179,8 @@ pub(crate) fn needs_bootstrap(store: &Store) -> Result<bool> {
     Ok(store
         .project_metadata_with_prefix(LIBRARY_ROW_KEY_PREFIX)?
         .iter()
-        .any(|(_, value)| LibraryRow::decode(value).is_none()))
+        .any(|(_, value)| LibraryRow::decode(value).is_none())
+        || read_pubspec_rows(store)?.is_none())
 }
 
 /// Record that every Dart dependent is current: a full index, a migration,
@@ -166,6 +257,9 @@ pub(crate) struct DartLibraryRefresh {
     rows: BTreeMap<String, Option<LibraryRow>>,
     /// Whether every row was rebuilt, so the prefix is cleared first.
     rebuilt: bool,
+    /// The pubspec rows to write in place of every one, when the sync read
+    /// the manifests.
+    pubspecs: Option<BTreeMap<String, PubspecRow>>,
 }
 
 impl DartLibraryRefresh {
@@ -193,6 +287,12 @@ impl DartLibraryRefresh {
                     store.delete_project_metadata(&key)?;
                 }
                 _ => {}
+            }
+        }
+        if let Some(pubspecs) = &self.pubspecs {
+            store.delete_project_metadata_with_prefix(PUBSPEC_ROW_KEY_PREFIX)?;
+            for (dir, row) in pubspecs {
+                store.set_project_metadata(&pubspec_row_key(dir), &row.encode())?;
             }
         }
         Ok(())
@@ -232,13 +332,17 @@ pub(crate) fn dart_library_refresh(
     added: &BTreeSet<String>,
     reindexed: &HashSet<String>,
     removed: &BTreeSet<String>,
+    pubspecs: &PubspecCheck,
     bootstrap: bool,
 ) -> Result<DartLibraryRefresh> {
     let unchanged = |path: &str| !reindexed.contains(path) && !removed.contains(path);
     if bootstrap {
         return rebuild(store, project_root, max_file_size, changes, &unchanged);
     }
-    let mut refresh = DartLibraryRefresh::default();
+    let mut refresh = DartLibraryRefresh {
+        pubspecs: pubspecs.read.as_ref().map(|(_, now)| now.clone()),
+        ..DartLibraryRefresh::default()
+    };
     for (path, change) in &changes.changes {
         refresh.rows.insert(path.clone(), change.new_row.clone());
     }
@@ -256,7 +360,7 @@ pub(crate) fn dart_library_refresh(
         .changes
         .values()
         .any(|change| change.old_row != change.new_row);
-    if rows_moved || !added_dart.is_empty() || !removed_dart.is_empty() {
+    if rows_moved || !added_dart.is_empty() || !removed_dart.is_empty() || pubspecs.moved() {
         let mut stored: HashMap<String, DartDirectives> = HashMap::new();
         for (key, value) in store.project_metadata_with_prefix(LIBRARY_ROW_KEY_PREFIX)? {
             let Some(path) = key.strip_prefix(LIBRARY_ROW_KEY_PREFIX) else {
@@ -295,8 +399,21 @@ pub(crate) fn dart_library_refresh(
         let context =
             codegraph_resolve::StoreResolutionContext::new(store, project_root.to_string_lossy())
                 .with_max_file_size(max_file_size);
-        let before = DartLibraries::of_state(before_files.clone(), before_directives);
-        let after = DartLibraries::of_state(after_files.clone(), after_directives);
+        // Each state reads its own manifests: the rows before, and what the
+        // sync read now (the rows again when it read nothing, its paths
+        // touching neither a manifest nor which Dart files there are).
+        let (before_manifests, after_manifests) = match &pubspecs.read {
+            Some((rows, now)) => (rows.clone(), now.clone()),
+            None => {
+                let Some(rows) = read_pubspec_rows(store)? else {
+                    return rebuild(store, project_root, max_file_size, changes, &unchanged);
+                };
+                (rows.clone(), rows)
+            }
+        };
+        let before =
+            DartLibraries::of_state(before_files.clone(), before_directives, before_manifests);
+        let after = DartLibraries::of_state(after_files.clone(), after_directives, after_manifests);
         // A file whose scope, imported libraries or directive targets moved
         // re-resolves whole: what its names can see changed, however many
         // names that is.
@@ -520,6 +637,10 @@ fn rebuild(
 ) -> Result<DartLibraryRefresh> {
     let mut refresh = DartLibraryRefresh {
         rebuilt: true,
+        pubspecs: Some(pubspec_snapshot(
+            &project_root.to_string_lossy(),
+            &dart_files(store)?,
+        )),
         ..DartLibraryRefresh::default()
     };
     for file in store.all_files()? {
