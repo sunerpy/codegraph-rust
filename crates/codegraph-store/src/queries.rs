@@ -1615,44 +1615,45 @@ impl Store {
         }
         let path_keys: HashSet<&str> = path_keys.iter().map(String::as_str).collect();
         let names: HashSet<&str> = names.iter().map(String::as_str).collect();
-        let mut stmt = self.conn.prepare(
-            "SELECT * FROM unresolved_refs WHERE reference_kind = 'imports' \
+        // Each candidate row's id, name and kind first, read without copying,
+        // the rest of a row only for the ones chosen (W5-09): the same rows in
+        // the same order.
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT id, reference_name, reference_kind FROM unresolved_refs \
+             WHERE reference_kind = 'imports' \
              OR (reference_kind = 'references' AND instr(reference_name, '/') > 0) ORDER BY id",
         )?;
-        let rows = stmt
-            .query_map([], row_to_unresolved_ref)?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
         // One bucket per (lookup, key), counted against the ceiling apiece.
-        let mut buckets: BTreeMap<(u8, String), Vec<usize>> = BTreeMap::new();
-        for (index, reference) in rows.iter().enumerate() {
-            let name = reference.reference_name.as_str();
-            let tail = reference_name_tail(name, reference.reference_kind);
-            if path_keys.contains(tail.as_str()) {
-                buckets.entry((0, tail.clone())).or_default().push(index);
+        let mut buckets: BTreeMap<(u8, String), Vec<i64>> = BTreeMap::new();
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let id: i64 = row.get(0)?;
+            let name = text_column(row, 1)?;
+            let tail = reference_name_tail_of(name, edge_kind_of(text_column(row, 2)?)?);
+            if path_keys.contains(tail) {
+                buckets.entry((0, tail.to_string())).or_default().push(id);
             }
             if path_keys.contains(name) {
-                buckets
-                    .entry((1, name.to_string()))
-                    .or_default()
-                    .push(index);
+                buckets.entry((1, name.to_string())).or_default().push(id);
             }
             if names.contains(name) && tail != name {
-                buckets
-                    .entry((2, name.to_string()))
-                    .or_default()
-                    .push(index);
+                buckets.entry((2, name.to_string())).or_default().push(id);
             }
         }
+        drop(rows);
         let mut chosen = BTreeSet::new();
-        for indexes in buckets.values() {
-            if indexes.len() <= per_key_ceiling {
-                chosen.extend(indexes.iter().copied());
+        for ids in buckets.values() {
+            if ids.len() <= per_key_ceiling {
+                chosen.extend(ids.iter().copied());
             }
         }
-        Ok(chosen
+        let mut by_id = self
+            .conn
+            .prepare_cached("SELECT * FROM unresolved_refs WHERE id = ?1")?;
+        chosen
             .into_iter()
-            .map(|index| rows[index].clone())
-            .collect())
+            .map(|id| by_id.query_row([id], row_to_unresolved_ref))
+            .collect()
     }
 
     /// The JavaScript-family files whose import of `file` holds a binding that
