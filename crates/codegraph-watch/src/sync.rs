@@ -19,8 +19,9 @@ use codegraph_extract::{
 use codegraph_resolve::ReferenceResolver;
 use codegraph_resolve::framework::FrameworkExtractionContext;
 use codegraph_resolve::frameworks::godot_dsl_config::GodotDslConfig;
-use codegraph_store::queries::{FileReferenceSite, ReferenceSite};
+use codegraph_store::queries::{FileReferenceSite, ReferenceSite, ResolutionReplacement};
 use codegraph_store::{IndexLease, Store, StoreWriteOpen, StoreWritePurpose};
+use rayon::prelude::*;
 
 use crate::git_pending::{GitIndexCapture, PendingSource};
 use crate::link_state::{RehashUnder, record_followed_links};
@@ -1511,14 +1512,22 @@ fn refresh_dependent_refs(
         .collect::<BTreeSet<_>>();
     let mut refreshed_sites = BTreeSet::new();
     let mut refreshed_files = HashSet::new();
-    for relative in dependents {
-        if already_reindexed.contains(&relative) {
-            continue;
-        }
-        if !project_root.join(&relative).exists() {
-            continue;
-        }
-        let refs = extract_dependent_refs(project_root, &relative, scope, resolver)?;
+    let mut replacements = Vec::new();
+    let dependents = dependents
+        .into_iter()
+        .filter(|relative| !already_reindexed.contains(relative))
+        .filter(|relative| project_root.join(relative).exists())
+        .collect::<Vec<_>>();
+    // Each dependent's extraction reads only its own file and the project
+    // scope, so they run in parallel; the store is updated below in the
+    // dependents' order, the first error in that order stopping it, as one
+    // file after another did.
+    let extracted = dependents
+        .par_iter()
+        .map(|relative| extract_dependent_refs(project_root, relative, scope, resolver))
+        .collect::<Vec<_>>();
+    for (relative, refs) in dependents.into_iter().zip(extracted) {
+        let refs = refs?;
         let sites = dependent_sites.get(&relative);
         let needs_fallback = fallback_files.contains(&relative)
             || sites.is_some_and(|sites| {
@@ -1529,7 +1538,10 @@ fn refresh_dependent_refs(
                 })
             });
         if needs_fallback {
-            store.replace_resolution_state_from_file(&relative, &refs)?;
+            replacements.push(ResolutionReplacement::File {
+                file_path: relative.clone(),
+                refs,
+            });
             refreshed_files.insert(relative);
             continue;
         }
@@ -1561,9 +1573,17 @@ fn refresh_dependent_refs(
             })
             .collect::<Vec<_>>();
         let site_list = site_set.iter().cloned().collect::<Vec<_>>();
-        store.replace_resolution_state_at_sites(&site_list, &selected)?;
+        replacements.push(ResolutionReplacement::Sites {
+            sites: site_list,
+            refs: selected,
+        });
         refreshed_sites.extend(site_set);
     }
+    // Every dependent's new state in one transaction: a commit per file cost
+    // more than the writes themselves (W5-09a). Each dependent's references
+    // were read before any of them changed, and no replacement touches
+    // another file's rows.
+    store.replace_resolution_states(&replacements)?;
     Ok((refreshed_sites, refreshed_files))
 }
 

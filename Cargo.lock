@@ -729,6 +729,7 @@ dependencies = [
  "codegraph-store",
  "codegraph-watch",
  "notify",
+ "rayon",
  "rusqlite",
  "serde",
  "serde_json",

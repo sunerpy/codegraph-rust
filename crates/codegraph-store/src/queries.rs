@@ -2279,26 +2279,37 @@ impl Store {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let removed = tx.execute(
-            &format!(
-                r#"DELETE FROM edges
-            WHERE id IN (
-              SELECT e.id
-              FROM edges e
-              JOIN nodes src ON src.id = e.source
-              WHERE src.file_path = ?1
-                AND {RESOLUTION_EDGE}
-            )"#
-            ),
-            [file_path],
-        )?;
-        tx.execute(
-            "DELETE FROM unresolved_refs WHERE file_path = ?1",
-            [file_path],
-        )?;
-        insert_unresolved_refs_in_connection(&tx, refs)?;
+        let removed = replace_file_resolution_in(&tx, file_path, refs)?;
         tx.commit()?;
         Ok(removed)
+    }
+
+    /// Apply `replacements` in order in ONE `BEGIN IMMEDIATE` transaction:
+    /// the statements of [`Self::replace_resolution_state_from_file`] and
+    /// [`Self::replace_resolution_state_at_sites`], committed once for every
+    /// dependent of a sync instead of once per file (W5-09a). A failure keeps
+    /// every old answer, as each file's own transaction did for that file.
+    pub fn replace_resolution_states(
+        &mut self,
+        replacements: &[ResolutionReplacement],
+    ) -> rusqlite::Result<()> {
+        if replacements.is_empty() {
+            return Ok(());
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for replacement in replacements {
+            match replacement {
+                ResolutionReplacement::File { file_path, refs } => {
+                    replace_file_resolution_in(&tx, file_path, refs)?;
+                }
+                ResolutionReplacement::Sites { sites, refs } => {
+                    replace_site_resolution_in(&tx, sites, refs)?;
+                }
+            }
+        }
+        tx.commit()
     }
 
     /// Atomically replace the resolution state of selected source-site sibling
@@ -2312,34 +2323,13 @@ impl Store {
         sites: &[ReferenceSite],
         refs: &[UnresolvedRef],
     ) -> rusqlite::Result<usize> {
-        let unique = sites.iter().cloned().collect::<BTreeSet<_>>();
-        if unique.is_empty() {
+        if sites.is_empty() {
             return Ok(0);
         }
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let mut removed = 0;
-        {
-            let mut delete_edges = tx.prepare_cached(
-                r#"DELETE FROM edges
-                WHERE source = ?1 AND line = ?2 AND col = ?3
-                  AND kind != 'contains'"#,
-            )?;
-            let mut delete_refs = tx.prepare_cached(
-                r#"DELETE FROM unresolved_refs
-                WHERE from_node_id = ?1 AND line = ?2 AND col = ?3"#,
-            )?;
-            for site in unique {
-                removed += delete_edges.execute(params![
-                    site.from_node_id.as_str(),
-                    site.line,
-                    site.col
-                ])?;
-                delete_refs.execute(params![site.from_node_id.as_str(), site.line, site.col])?;
-            }
-        }
-        insert_unresolved_refs_in_connection(&tx, refs)?;
+        let removed = replace_site_resolution_in(&tx, sites, refs)?;
         tx.commit()?;
         Ok(removed)
     }
@@ -2998,6 +2988,82 @@ fn existing_node_ids(
         }
     }
     Ok(out)
+}
+
+/// One dependent's resolution state to replace in
+/// [`Store::replace_resolution_states`].
+#[derive(Debug, Clone)]
+pub enum ResolutionReplacement {
+    /// Every resolution edge and unresolved reference of the file, by these
+    /// references ([`Store::replace_resolution_state_from_file`]).
+    File {
+        file_path: String,
+        refs: Vec<UnresolvedRef>,
+    },
+    /// The site groups, by these references
+    /// ([`Store::replace_resolution_state_at_sites`]).
+    Sites {
+        sites: Vec<ReferenceSite>,
+        refs: Vec<UnresolvedRef>,
+    },
+}
+
+/// The body of [`Store::replace_resolution_state_from_file`], in `tx`.
+fn replace_file_resolution_in(
+    tx: &Connection,
+    file_path: &str,
+    refs: &[UnresolvedRef],
+) -> rusqlite::Result<usize> {
+    let removed = tx.execute(
+        &format!(
+            r#"DELETE FROM edges
+            WHERE id IN (
+              SELECT e.id
+              FROM edges e
+              JOIN nodes src ON src.id = e.source
+              WHERE src.file_path = ?1
+                AND {RESOLUTION_EDGE}
+            )"#
+        ),
+        [file_path],
+    )?;
+    tx.execute(
+        "DELETE FROM unresolved_refs WHERE file_path = ?1",
+        [file_path],
+    )?;
+    insert_unresolved_refs_in_connection(tx, refs)?;
+    Ok(removed)
+}
+
+/// The body of [`Store::replace_resolution_state_at_sites`], in `tx`.
+fn replace_site_resolution_in(
+    tx: &Connection,
+    sites: &[ReferenceSite],
+    refs: &[UnresolvedRef],
+) -> rusqlite::Result<usize> {
+    let unique = sites.iter().cloned().collect::<BTreeSet<_>>();
+    if unique.is_empty() {
+        return Ok(0);
+    }
+    let mut removed = 0;
+    {
+        let mut delete_edges = tx.prepare_cached(
+            r#"DELETE FROM edges
+                WHERE source = ?1 AND line = ?2 AND col = ?3
+                  AND kind != 'contains'"#,
+        )?;
+        let mut delete_refs = tx.prepare_cached(
+            r#"DELETE FROM unresolved_refs
+                WHERE from_node_id = ?1 AND line = ?2 AND col = ?3"#,
+        )?;
+        for site in unique {
+            removed +=
+                delete_edges.execute(params![site.from_node_id.as_str(), site.line, site.col])?;
+            delete_refs.execute(params![site.from_node_id.as_str(), site.line, site.col])?;
+        }
+    }
+    insert_unresolved_refs_in_connection(tx, refs)?;
+    Ok(removed)
 }
 
 /// Insert unresolved references through `conn`, which may be either the Store's
@@ -4299,6 +4365,111 @@ mod tests {
             .map(|reference| reference.reference_name)
             .collect();
         assert_eq!(qualified, ["F\\FirstName.make"]);
+    }
+
+    /// W5-09a: the replacements of a sync's dependents applied in one
+    /// transaction leave what applying them one by one does, each of them
+    /// replacing what it covers: the references and resolution edges at a
+    /// site, and of a whole file.
+    #[test]
+    fn batched_resolution_replacements_match_one_by_one() {
+        let mk = |from: &str, name: &str, line: i64, file: &str| UnresolvedRef {
+            id: None,
+            from_node_id: from.to_string(),
+            reference_name: name.to_string(),
+            reference_kind: EdgeKind::Calls,
+            line,
+            col: 0,
+            candidates: None,
+            file_path: file.to_string(),
+            language: Language::TypeScript,
+            is_function_ref: false,
+            reference_subkind: None,
+        };
+        let build = |name: &str| {
+            let mut store = store(name);
+            store
+                .upsert_nodes(&[
+                    node("function:a", "a", "a.ts"),
+                    node("function:b", "b", "b.ts"),
+                    node("function:t", "t", "t.ts"),
+                ])
+                .unwrap();
+            store
+                .insert_unresolved_refs(&[
+                    mk("function:a", "x", 1, "a.ts"),
+                    mk("function:a", "t", 2, "a.ts"),
+                    mk("function:b", "t", 1, "b.ts"),
+                ])
+                .unwrap();
+            // `t` resolves at both sites: its edges are written and its rows
+            // leave `unresolved_refs`.
+            let resolved: Vec<i64> = ["a.ts", "b.ts"]
+                .into_iter()
+                .flat_map(|file| store.unresolved_refs_by_file_path(file).unwrap())
+                .filter(|reference| reference.reference_name == "t")
+                .map(|reference| reference.id.unwrap())
+                .collect();
+            let call = |source: &str, line: i64| Edge {
+                line: Some(line),
+                col: Some(0),
+                ..edge(source, "function:t", EdgeKind::Calls)
+            };
+            store
+                .insert_edges(&[call("function:a", 2), call("function:b", 1)])
+                .unwrap();
+            store.delete_resolved_unresolved_refs(&resolved).unwrap();
+            store
+        };
+        let site = ReferenceSite {
+            from_node_id: "function:a".to_string(),
+            line: 2,
+            col: 0,
+        };
+        let a_now = vec![mk("function:a", "u", 2, "a.ts")];
+        let b_now = vec![mk("function:b", "v", 1, "b.ts")];
+        let mut one = build("replace-one-by-one");
+        one.replace_resolution_state_at_sites(std::slice::from_ref(&site), &a_now)
+            .unwrap();
+        one.replace_resolution_state_from_file("b.ts", &b_now)
+            .unwrap();
+        let mut batched = build("replace-batched");
+        batched
+            .replace_resolution_states(&[
+                ResolutionReplacement::Sites {
+                    sites: vec![site],
+                    refs: a_now.clone(),
+                },
+                ResolutionReplacement::File {
+                    file_path: "b.ts".to_string(),
+                    refs: b_now.clone(),
+                },
+            ])
+            .unwrap();
+        let refs_of = |store: &Store, file: &str| -> Vec<UnresolvedRef> {
+            let mut refs = store.unresolved_refs_by_file_path(file).unwrap();
+            for reference in &mut refs {
+                reference.id = None;
+            }
+            refs
+        };
+        let state = |store: &Store| {
+            let edges: i64 = store
+                .connection()
+                .query_row("SELECT COUNT(*) FROM edges", [], |row| row.get(0))
+                .unwrap();
+            (refs_of(store, "a.ts"), refs_of(store, "b.ts"), edges)
+        };
+        assert_eq!(state(&batched), state(&one));
+        assert_eq!(
+            state(&batched),
+            (
+                vec![mk("function:a", "x", 1, "a.ts"), a_now[0].clone()],
+                b_now,
+                0
+            ),
+            "each replacement replaced what it covers"
+        );
     }
 
     #[test]
