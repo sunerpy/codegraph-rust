@@ -6133,6 +6133,13 @@ fn index_project_inner(
         let context = resolver.store_context(&store);
         resolver.initialize(&context);
     }
+    // What resolution reads of the control files, and the frameworks it
+    // detected (W5-06), once every file row is stored.
+    codegraph_watch::control_inputs::write_index_rows(
+        &store,
+        project,
+        &resolver.framework_names(),
+    )?;
     if resolver.has_framework_resolvers() {
         let relative_files = store
             .all_files()?

@@ -307,6 +307,13 @@ pub(crate) fn migrate_project(
         let context = resolver.store_context(rebuild.store());
         resolver.initialize(&context);
     }
+    // What resolution reads of the control files, and the frameworks it
+    // detected (W5-06), once every file row is stored.
+    crate::control_inputs::write_index_rows(
+        rebuild.store(),
+        project_root,
+        &resolver.framework_names(),
+    )?;
     if resolver.has_framework_resolvers() {
         let relative_files = rebuild
             .store()

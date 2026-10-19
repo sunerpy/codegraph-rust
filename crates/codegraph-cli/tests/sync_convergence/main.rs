@@ -56,8 +56,10 @@ pub enum Change {
     EditHeritage,
     /// A second declaration of an already-referenced name appears elsewhere.
     AddCompetitor,
-    /// A project control file changes: `package.json`, `tsconfig.json`, the
-    /// root `.gitignore`, `.git/info/exclude`, the index root's
+    /// A project control file changes: one resolution reads (`package.json`,
+    /// `tsconfig.json`, `jsconfig.json` or a config it extends, a workspace
+    /// member's manifest, a `.csproj` or `.props`, a `Cargo.toml`, a Tauri
+    /// config), the root `.gitignore`, `.git/info/exclude`, the index root's
     /// `config.toml` or `codegraph.json`, or a Shopify theme marker
     /// (`layout/theme.liquid`, `config/settings_schema.json`).
     ControlFile,
@@ -381,6 +383,22 @@ fn run_case(name: &str, case: &Case) {
     let dart_library_rows = support::project_metadata_with_prefix(&fresh.db(), "dart_library");
     // And the Shopify theme row and its marker (W4-LIQ-01).
     let shopify_rows = support::project_metadata_with_prefix(&fresh.db(), "shopify_themes");
+    // And the class-head rows (W5-07), the control-input rows and the
+    // detected frameworks (W5-06). An input outside the project is keyed by
+    // the absolute path its reader used, which differs between the trees, so
+    // only project paths are compared.
+    for prefix in ["class_heads", "control_inputs", "frameworks_"] {
+        let fresh_rows = comparable_rows(&fresh.db(), prefix);
+        for (driver, project) in [("cli", &cli), ("watch", &watch)] {
+            let rows = comparable_rows(&project.db(), prefix);
+            if rows != fresh_rows {
+                divergent.push(format!(
+                    "=== {driver} driver: the {prefix} rows differ from a fresh index\n\
+                     synced: {rows:#?}\nfresh: {fresh_rows:#?}"
+                ));
+            }
+        }
+    }
     for (driver, project) in [("cli", &cli), ("watch", &watch)] {
         let rows = support::project_metadata_with_prefix(&project.db(), "js_module_surface");
         if rows != surface_rows {
@@ -525,6 +543,29 @@ fn run_case(name: &str, case: &Case) {
         divergent.join("\n"),
         fresh.graph().report(),
     );
+}
+
+/// The `prefix` rows of `db`, a control-input row's keys outside the project
+/// (absolute paths) dropped.
+fn comparable_rows(db: &Path, prefix: &str) -> Vec<(String, String)> {
+    support::project_metadata_with_prefix(db, prefix)
+        .into_iter()
+        .map(|(key, value)| {
+            if !key.starts_with("control_inputs:") {
+                return (key, value);
+            }
+            let Ok(serde_json::Value::Object(map)) = serde_json::from_str(&value) else {
+                return (key, value);
+            };
+            let kept: serde_json::Map<String, serde_json::Value> = map
+                .into_iter()
+                .filter(|(input, _)| {
+                    !std::path::Path::new(input.trim_start_matches("dir:")).is_absolute()
+                })
+                .collect();
+            (key, serde_json::Value::Object(kept).to_string())
+        })
+        .collect()
 }
 
 /// The watcher-path driver: what the real watcher runs for one event batch.
@@ -752,13 +793,7 @@ macro_rules! matrix {
     };
 }
 
-// Every `#[ignore]` below fails when run. A sync retries an unresolved
-// reference only when its `reference_name` equals the bare name of a node the
-// changed files added or removed (`unresolved_refs_by_names`), so a reference
-// spelled as an alias, a module path or a qualified name stays unresolved after
-// the file that satisfies it appears. `package.json` and `tsconfig.json` are not
-// source files: when only one of them changes, neither driver re-resolves
-// anything.
+// Every `#[ignore]` below fails when run.
 matrix! {
     typescript_named_import_of_an_added_file,
     typescript_default_import_of_an_added_file,
@@ -1143,8 +1178,11 @@ matrix! {
     rust_outside_type_receiver_leaves_when_the_project_type_is_renamed,
     rust_alias_receiver_reaches_a_method_once_the_alias_appears,
     rust_alias_receiver_leaves_the_method_when_the_alias_goes,
-    #[ignore = "W5-06: a Cargo.toml change does not re-resolve the project's Rust files"]
     rust_cargo_dependency_appears,
+    rust_cargo_dependency_leaves,
+    rust_workspace_member_becomes_a_project_crate,
+    rust_first_source_under_a_nested_manifest_makes_its_crate_the_projects,
+    rust_last_source_under_a_nested_manifest_leaves_its_crate_outside,
     dart_delete_an_imported_library,
     astro_delete_an_imported_module,
     lua_delete_a_required_module,
@@ -1205,7 +1243,6 @@ matrix! {
     scala_package_object_supertype_head_changes_in_another_file,
     csharp_global_using_appears_for_its_project,
     csharp_global_using_leaves_its_project,
-    #[ignore = "W5-06: a .csproj or .props change does not re-resolve the project's C# files"]
     csharp_csproj_using_appears,
     csharp_partial_part_gains_a_base,
     csharp_middle_type_drops_its_base,
@@ -1216,8 +1253,13 @@ matrix! {
     csharp_bare_call_follows_a_long_head_in_another_file,
     csharp_global_using_static_appears,
     csharp_global_using_static_leaves,
-    #[ignore = "W5-06: a .csproj or .props change does not re-resolve the project's C# files"]
     csharp_csproj_static_using_appears,
+    csharp_props_using_appears,
+    csharp_implicit_usings_turn_on,
+    csharp_new_csproj_hides_another_projects_global_using,
+    csharp_deleted_csproj_lets_another_projects_global_using_in,
+    csharp_renamed_project_file_keeps_its_using,
+    csharp_upper_case_files_read_their_project_file,
     csharp_bare_name_ignores_an_added_property,
     csharp_inherited_member_type_changes_in_another_file,
     csharp_inherited_member_body_edit,
@@ -1270,10 +1312,20 @@ matrix! {
     python_root_gitignore_hides_a_competitor,
     python_repository_exclude_hides_a_competitor,
     lua_extension_override_appears_in_codegraph_json,
-    #[ignore = "unscheduled, found by W0-04: a tsconfig.json `paths` change does not re-resolve the unchanged importers"]
     typescript_tsconfig_paths_alias_appears,
-    #[ignore = "unscheduled, found by W0-04: a package.json framework dependency change does not re-run framework detection"]
     typescript_react_dependency_appears_in_package_json,
+    javascript_jsconfig_paths_alias_appears,
+    typescript_tsconfig_paths_alias_disappears,
+    typescript_tsconfig_extends_target_appears,
+    typescript_paths_retarget_moves_a_barrel_source,
+    typescript_react_dependency_leaves_package_json,
+    typescript_declared_dependency_makes_a_bare_import_external,
+    typescript_workspace_member_manifest_renames_its_package,
+    typescript_workspace_member_manifest_is_deleted,
+    typescript_workspace_glob_gains_a_member,
+    tauri_config_marker_appears,
+    tauri_command_attribute_makes_an_invoke_call_its_edge,
+    typescript_package_version_bump_keeps_every_edge,
     liquid_json_template_joins_a_theme_once_its_settings_schema_appears,
     liquid_json_templates_leave_once_the_theme_layout_goes,
     liquid_json_template_in_a_mixed_case_folder_joins_a_marked_theme,

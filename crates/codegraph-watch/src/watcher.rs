@@ -1111,6 +1111,17 @@ impl ProjectWatcher {
         // events fail `WatchPolicy::normalize_relative` before classification.
         let project_root = index_paths.project().to_path_buf();
         let control_files = ControlFiles::new(&project_root, &index_paths);
+        // The control inputs the index records (W5-06): their events reach the
+        // sync though they are no source files. An index that cannot be read
+        // yet records none; the first sync refreshes the list.
+        let control_paths = codegraph_store::Store::open_for_read(
+            &index_paths,
+            Instant::now() + Duration::from_secs(2),
+            || false,
+        )
+        .ok()
+        .and_then(|store| crate::control_inputs::recorded_paths(&store).ok())
+        .unwrap_or_default();
         let runtime_scope = RuntimeWatchScope::from_options(&project_root, &options);
         let policy = runtime_scope.policy.clone();
         let db_path = match options.db_path.clone() {
@@ -1307,6 +1318,7 @@ impl ProjectWatcher {
                 lock_recovery_interval,
                 drift_sentinel,
                 drift_check_fn,
+                control_paths,
             });
             loop_finished.store(true, Ordering::SeqCst);
         });
@@ -1584,6 +1596,8 @@ struct EventLoopCtx {
     lock_recovery_interval: Duration,
     drift_sentinel: Option<Duration>,
     drift_check_fn: DriftCheckFn,
+    /// The control inputs the index records (W5-06), refreshed by each sync.
+    control_paths: crate::control_inputs::RecordedInputs,
 }
 
 fn event_loop(ctx: EventLoopCtx) {
@@ -1608,6 +1622,7 @@ fn event_loop(ctx: EventLoopCtx) {
         lock_recovery_interval,
         drift_sentinel,
         drift_check_fn,
+        mut control_paths,
     } = ctx;
     let mut pending = BTreeMap::<String, PendingInfo>::new();
     let mut deadline = None::<Instant>;
@@ -1827,6 +1842,10 @@ fn event_loop(ctx: EventLoopCtx) {
                         || (runtime_scope.policy.allows_file_path(&relative)
                             && maybe_deleted_source(&relative))
                         || runtime_scope.policy.may_mark_a_theme(&relative)
+                        // A control file or an input the index records is
+                        // no source either, yet resolution reads it (W5-06).
+                        || runtime_scope.policy.is_project_control_file(&relative)
+                        || control_paths.may_move(&relative, path.is_dir())
                     {
                         let now = epoch_millis();
                         // A file link aliasing this path is the same content
@@ -1978,6 +1997,9 @@ fn event_loop(ctx: EventLoopCtx) {
                         // edits missed while another writer held the index are in.
                         if full_sync {
                             degraded.recover();
+                        }
+                        if let Some(paths) = &outcome.control_paths {
+                            control_paths.clone_from(paths);
                         }
                         // Preserve the event batch independently of actual DB
                         // mutations. Startup catch-up can win the writer lease and
@@ -4147,6 +4169,148 @@ mod tests {
             seen,
             "editing src/app.ts should trigger a sync of that path"
         );
+    }
+
+    /// W5-06: a control file a resolver reads is no source file, yet its
+    /// event reaches the sync: a JS, C# or Rust control file and a Tauri
+    /// marker by name; an input the index records (an `extends` target named
+    /// like no control file) by its path, and a directory coming into a
+    /// workspace glob's listing, as the watcher read them at start; and an
+    /// input the rows come to record, as a sync reports them. JSON no reader
+    /// reads, and a file in a listed folder, are not handed on.
+    #[test]
+    fn control_files_and_recorded_inputs_reach_the_sync_though_they_are_not_source() {
+        let _env = crate::test_env::env_guard();
+        let dir = crate::sync::tests::TestDir::new("watch-control-inputs");
+        let write = |relative: &str, text: &str| {
+            let path = dir.path().join(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, text).unwrap();
+        };
+        let initial = [
+            (
+                "package.json",
+                "{\"name\":\"root\",\"workspaces\":[\"packages/*\"]}\n",
+            ),
+            (
+                "tsconfig.json",
+                "{\"extends\":\"./configs/base-settings.json\"}\n",
+            ),
+            ("packages/core/package.json", "{\"name\":\"@acme/core\"}\n"),
+            ("src/main.ts", "export const one = 1;\n"),
+        ];
+        for (relative, text) in initial {
+            write(relative, text);
+        }
+        for folder in ["App", "configs", "notes", "shared", "src-tauri"] {
+            fs::create_dir_all(dir.path().join(folder)).unwrap();
+        }
+        let db = crate::sync::default_db_path(dir.path()).unwrap();
+        crate::sync::sync_changed_paths(dir.path(), &db, initial.iter().map(|(path, _)| *path))
+            .unwrap();
+
+        let synced = Arc::new(Mutex::new(Vec::<Vec<String>>::new()));
+        let recorder = Arc::clone(&synced);
+        let sync_fn: SyncFn = Arc::new(move |paths| {
+            let mut synced = recorder.lock().unwrap();
+            synced.push(paths.clone());
+            // Once the `extends` target is heard of, the rows a sync writes
+            // come to record another input, and only it.
+            let recorded = synced
+                .iter()
+                .flatten()
+                .any(|path| path == "configs/base-settings.json")
+                .then(|| crate::control_inputs::RecordedInputs {
+                    paths: ["shared/settings.cfg".to_string()].into(),
+                    member_listings: Default::default(),
+                });
+            Ok(SyncOutcome {
+                files_checked: paths.len(),
+                control_paths: recorded,
+                ..Default::default()
+            })
+        });
+        let watcher = ProjectWatcher::start(
+            dir.path(),
+            WatchOptions {
+                debounce: Duration::from_millis(50),
+                sync_fn: Some(sync_fn),
+                ..WatchOptions::default()
+            },
+        )
+        .unwrap()
+        .unwrap();
+        let reached = |path: &str| {
+            for _ in 0..40 {
+                std::thread::sleep(Duration::from_millis(50));
+                if synced
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|paths| paths.iter().any(|p| p == path))
+                {
+                    return true;
+                }
+            }
+            false
+        };
+
+        // Give the OS watch registration a moment.
+        std::thread::sleep(Duration::from_millis(150));
+        let mut missed = Vec::new();
+        for (relative, text) in [
+            (
+                "package.json",
+                "{\"name\":\"root\",\"workspaces\":[\"packages/*\",\"apps/*\"]}\n",
+            ),
+            (
+                "tsconfig.json",
+                "{\"extends\":\"./configs/base-settings.json\"}\n\n",
+            ),
+            ("App/App.csproj", "<Project Sdk=\"Microsoft.NET.Sdk\" />\n"),
+            ("Cargo.toml", "[package]\nname = \"app\"\n"),
+            ("src-tauri/tauri.conf.json", "{}\n"),
+        ] {
+            write(relative, text);
+            if !reached(relative) {
+                missed.push(relative.to_string());
+            }
+        }
+        let staging = crate::sync::tests::TestDir::new("watch-control-inputs-staging");
+        fs::create_dir_all(staging.path().join("ui")).unwrap();
+        fs::write(
+            staging.path().join("ui/package.json"),
+            "{\"name\":\"@acme/ui\"}\n",
+        )
+        .unwrap();
+        fs::rename(staging.path().join("ui"), dir.path().join("packages/ui")).unwrap();
+        if !reached("packages/ui") {
+            missed.push("packages/ui".to_string());
+        }
+        write("configs/base-settings.json", "{}\n");
+        if !reached("configs/base-settings.json") {
+            missed.push("configs/base-settings.json".to_string());
+        }
+        write("shared/settings.cfg", "shared\n");
+        if !reached("shared/settings.cfg") {
+            missed.push("shared/settings.cfg".to_string());
+        }
+        // What no reader reads, then a source file the batch must reach
+        // after them.
+        write("notes/settings.json", "{}\n");
+        write("packages/readme.txt", "members\n");
+        write("src/fence.ts", "export const fence = 1;\n");
+        let fenced = reached("src/fence.ts");
+        watcher.stop();
+        let synced = synced.lock().unwrap().clone();
+        assert!(missed.is_empty(), "missed {missed:?}: {synced:?}");
+        assert!(fenced, "the fence should reach a sync: {synced:?}");
+        for unread in ["notes/settings.json", "packages/readme.txt"] {
+            assert!(
+                !synced.iter().any(|paths| paths.iter().any(|p| p == unread)),
+                "{unread} is not handed on: {synced:?}"
+            );
+        }
     }
 
     /// W4-LIQ-01: a Shopify theme marker is no source file here, yet its

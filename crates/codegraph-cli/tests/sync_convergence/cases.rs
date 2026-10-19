@@ -7432,6 +7432,97 @@ pub fn rust_cargo_dependency_appears() -> Case {
         .no_edge_after("function drain", "references", "trait Stream")
 }
 
+/// W5-06: the dependency leaving the manifest, the name is the project's
+/// item again.
+pub fn rust_cargo_dependency_leaves() -> Case {
+    Case::new(Change::ControlFile, &[Language::Rust])
+        .file(
+            "Cargo.toml",
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[dependencies]\nfutures = \"0.3\"\n",
+        )
+        .file("src/lib.rs", "mod stream;\nmod source;\n")
+        .file("src/stream.rs", "pub trait Stream {}\n")
+        .file(
+            "src/source.rs",
+            "use futures::Stream;\n\npub fn drain(s: impl Stream) {\n    let _ = s;\n}\n",
+        )
+        .write(
+            "Cargo.toml",
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+        )
+        .edge_after("function drain", "references", "trait Stream")
+}
+
+/// W5-06: a workspace member's manifest appearing makes its crate the
+/// project's, which the other member depended on as an outside one.
+pub fn rust_workspace_member_becomes_a_project_crate() -> Case {
+    Case::new(Change::ControlFile, &[Language::Rust])
+        .file(
+            "Cargo.toml",
+            "[workspace]\nmembers = [\"crates/a\", \"crates/b\"]\n",
+        )
+        .file(
+            "crates/a/Cargo.toml",
+            "[package]\nname = \"alpha\"\nversion = \"0.1.0\"\n\n[dependencies]\nbeta = \"0.1\"\n",
+        )
+        .file(
+            "crates/a/src/lib.rs",
+            "use beta::Thing;\n\npub fn make() -> Thing {\n    Thing\n}\n",
+        )
+        .file("crates/b/src/lib.rs", "pub struct Thing;\n")
+        .write(
+            "crates/b/Cargo.toml",
+            "[package]\nname = \"beta\"\nversion = \"0.1.0\"\n",
+        )
+        .edge_after("function make", "references", "struct Thing")
+}
+
+const GAMMA_MAIN: &str =
+    "mod thing;\nuse gamma::Thing;\n\npub fn make() -> Thing {\n    Thing\n}\n";
+
+/// W5-06: the first `.rs` file under an existing nested manifest makes that
+/// manifest's crate the project's: an unchanged file's `use` of it resolves.
+/// The name lane retries `Thing`, the added struct's name, as well, so this
+/// case converges without the control lane; the deletion below needs it.
+pub fn rust_first_source_under_a_nested_manifest_makes_its_crate_the_projects() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Rust])
+        .file(
+            "Cargo.toml",
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[dependencies]\ngamma = \"0.1\"\n",
+        )
+        .file(
+            "crates/c/Cargo.toml",
+            "[package]\nname = \"gamma\"\nversion = \"0.1.0\"\n",
+        )
+        .file(
+            "src/main.rs",
+            "use gamma::Thing;\n\npub fn make() -> Thing {\n    Thing\n}\n",
+        )
+        .write("crates/c/src/lib.rs", "pub struct Thing;\n")
+        .edge_after("function make", "references", "struct Thing")
+}
+
+/// W5-06: the last `.rs` file under a nested manifest deleted: its crate is
+/// an outside dependency again, so the `use` no longer binds the project's
+/// namesake.
+pub fn rust_last_source_under_a_nested_manifest_leaves_its_crate_outside() -> Case {
+    Case::new(Change::DeleteImportedModule, &[Language::Rust])
+        .file(
+            "Cargo.toml",
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[dependencies]\ngamma = \"0.1\"\n",
+        )
+        .file(
+            "crates/c/Cargo.toml",
+            "[package]\nname = \"gamma\"\nversion = \"0.1.0\"\n",
+        )
+        .file("crates/c/src/lib.rs", "pub struct Other;\n")
+        .file("src/thing.rs", "pub struct Thing;\n")
+        .file("src/main.rs", GAMMA_MAIN)
+        .edge_before("function make", "references", "struct Thing")
+        .remove("crates/c/src/lib.rs")
+        .no_edge_after("function make", "references", "struct Thing")
+}
+
 pub fn dart_delete_an_imported_library() -> Case {
     Case::new(Change::DeleteImportedModule, &[Language::Dart])
         .file(
@@ -8118,6 +8209,127 @@ pub fn csharp_csproj_static_using_appears() -> Case {
             "method App.Specs::CatalogSpec::Runs",
             "calls",
             "method App.Execution::ExpressionBuilder::Call",
+        )
+}
+
+/// W5-06: a `Directory.Build.props` gaining a `<Using Include>` imports the
+/// namespace into the project's files.
+pub fn csharp_props_using_appears() -> Case {
+    Case::new(Change::ControlFile, &[Language::CSharp])
+        .file("Directory.Build.props", "<Project>\n</Project>\n")
+        .file("test/Unit/Unit.csproj", UNIT_CSPROJ)
+        .file("test/Unit/Support/Some.cs", UNIT_SOME)
+        .file("test/Unit/LogTests.cs", UNIT_LOG_TESTS)
+        .write(
+            "Directory.Build.props",
+            "<Project>\n  <ItemGroup>\n    <Using Include=\"Unit.Support\" />\n  </ItemGroup>\n</Project>\n",
+        )
+        .edge_after(
+            "method Unit.Context::LogTests::Make",
+            "references",
+            "class Unit.Support::Some",
+        )
+}
+
+/// W5-06: `<ImplicitUsings>` turned on brings the SDK's namespaces in, a
+/// project type in one of them with them.
+pub fn csharp_implicit_usings_turn_on() -> Case {
+    Case::new(Change::ControlFile, &[Language::CSharp])
+        .file("src/App.csproj", UNIT_CSPROJ)
+        .file(
+            "src/Tasks/Helper.cs",
+            "namespace System.Threading.Tasks;\n\npublic class Helper\n{\n}\n",
+        )
+        .file(
+            "src/App/Consumer.cs",
+            "namespace App;\n\npublic class Consumer\n{\n    Helper Make() => null;\n}\n",
+        )
+        .write(
+            "src/App.csproj",
+            "<Project Sdk=\"Microsoft.NET.Sdk\">\n  <PropertyGroup>\n    <ImplicitUsings>enable</ImplicitUsings>\n  </PropertyGroup>\n</Project>\n",
+        )
+        .edge_after(
+            "method App::Consumer::Make",
+            "references",
+            "class System.Threading.Tasks::Helper",
+        )
+}
+
+const GLOBALS: &str = "global using Unit.Support;\n";
+const TEST_LOG: &str =
+    "namespace Unit.Context;\n\nclass LogTests\n{\n    Some Make() => null;\n}\n";
+
+/// W5-06: a new `.csproj` makes its folder a project of its own, so another
+/// project's `global using` no longer reaches its files.
+pub fn csharp_new_csproj_hides_another_projects_global_using() -> Case {
+    Case::new(Change::ControlFile, &[Language::CSharp])
+        .file("src/App.csproj", UNIT_CSPROJ)
+        .file("src/Globals.cs", GLOBALS)
+        .file("src/Unit/Support/Some.cs", UNIT_SOME)
+        .file("test/LogTests.cs", TEST_LOG)
+        .write("test/Tests.csproj", UNIT_CSPROJ)
+        .edge_before(
+            "method Unit.Context::LogTests::Make",
+            "references",
+            "class Unit.Support::Some",
+        )
+        .no_edge_after(
+            "method Unit.Context::LogTests::Make",
+            "references",
+            "class Unit.Support::Some",
+        )
+}
+
+/// W5-06: the folder's `.csproj` deleted, the other project's `global using`
+/// reaches its files again.
+pub fn csharp_deleted_csproj_lets_another_projects_global_using_in() -> Case {
+    Case::new(Change::ControlFile, &[Language::CSharp])
+        .file("src/App.csproj", UNIT_CSPROJ)
+        .file("src/Globals.cs", GLOBALS)
+        .file("src/Unit/Support/Some.cs", UNIT_SOME)
+        .file("test/LogTests.cs", TEST_LOG)
+        .file("test/Tests.csproj", UNIT_CSPROJ)
+        .remove("test/Tests.csproj")
+        .edge_after(
+            "method Unit.Context::LogTests::Make",
+            "references",
+            "class Unit.Support::Some",
+        )
+}
+
+/// W5-06: the project file renamed (here to a `.props`), its `<Using>` read
+/// under the new name.
+pub fn csharp_renamed_project_file_keeps_its_using() -> Case {
+    Case::new(Change::ControlFile, &[Language::CSharp])
+        .file(
+            "test/Unit/Unit.csproj",
+            "<Project Sdk=\"Microsoft.NET.Sdk\">\n  <ItemGroup>\n    <Using Include=\"Unit.Support\" />\n  </ItemGroup>\n</Project>\n",
+        )
+        .file("test/Unit/Support/Some.cs", UNIT_SOME)
+        .file("test/Unit/LogTests.cs", UNIT_LOG_TESTS)
+        .rename("test/Unit/Unit.csproj", "test/Unit/Renamed.props")
+        .edge_throughout(
+            "method Unit.Context::LogTests::Make",
+            "references",
+            "class Unit.Support::Some",
+        )
+}
+
+/// W5-06: C# files named with an upper-case `.CS` are read as C# from the
+/// index, and their folder's project file is an input like any other's.
+pub fn csharp_upper_case_files_read_their_project_file() -> Case {
+    Case::new(Change::ControlFile, &[Language::CSharp])
+        .file("test/Unit/Unit.csproj", UNIT_CSPROJ)
+        .file("test/Unit/Support/Some.CS", UNIT_SOME)
+        .file("test/Unit/LogTests.CS", UNIT_LOG_TESTS)
+        .write(
+            "test/Unit/Unit.csproj",
+            "<Project Sdk=\"Microsoft.NET.Sdk\">\n  <ItemGroup>\n    <Using Include=\"Unit.Support\" />\n  </ItemGroup>\n</Project>\n",
+        )
+        .edge_after(
+            "method Unit.Context::LogTests::Make",
+            "references",
+            "class Unit.Support::Some",
         )
 }
 
@@ -9781,6 +9993,243 @@ pub fn typescript_react_dependency_appears_in_package_json() -> Case {
         )
         .edge_before("function page", "calls", "function useCart")
         .edge_after("function page", "calls", "function src/hooks.ts::useCart")
+}
+
+/// W5-06: a `jsconfig.json` gaining `paths` makes the alias import resolve.
+pub fn javascript_jsconfig_paths_alias_appears() -> Case {
+    Case::new(Change::ControlFile, &[Language::JavaScript])
+        .file(
+            "src/lib/math.js",
+            "export function double(value) {\n  return value * 2;\n}\n",
+        )
+        .file(
+            "src/main.js",
+            "import { double } from '@lib/math';\n\nexport function run() {\n  return double(2);\n}\n",
+        )
+        .write(
+            "jsconfig.json",
+            "{\"compilerOptions\":{\"baseUrl\":\".\",\"paths\":{\"@lib/*\":[\"src/lib/*\"]}}}",
+        )
+        .edge_after("file:src/main.js", "imports", "function double")
+}
+
+/// W5-06: the tsconfig deleted, the alias import no longer resolves.
+pub fn typescript_tsconfig_paths_alias_disappears() -> Case {
+    Case::new(Change::ControlFile, &[Language::TypeScript])
+        .file(
+            "tsconfig.json",
+            "{\"compilerOptions\":{\"baseUrl\":\".\",\"paths\":{\"@lib/*\":[\"src/lib/*\"]}}}",
+        )
+        .file(
+            "src/lib/math.ts",
+            "export function double(value: number): number {\n  return value * 2;\n}\n",
+        )
+        .file(
+            "src/main.ts",
+            "import { double } from '@lib/math';\n\nexport function run(): number {\n  return double(2);\n}\n",
+        )
+        .edge_before("file:src/main.ts", "imports", "function double")
+        .remove("tsconfig.json")
+}
+
+/// W5-06: the tsconfig `extends` a file that does not exist yet; once it is
+/// created with `paths`, the alias import resolves (the missing target is a
+/// recorded input).
+pub fn typescript_tsconfig_extends_target_appears() -> Case {
+    Case::new(Change::ControlFile, &[Language::TypeScript])
+        .file("tsconfig.json", "{\"extends\":\"./configs/base.json\"}")
+        .file(
+            "src/lib/math.ts",
+            "export function double(value: number): number {\n  return value * 2;\n}\n",
+        )
+        .file(
+            "src/main.ts",
+            "import { double } from '@lib/math';\n\nexport function run(): number {\n  return double(2);\n}\n",
+        )
+        .write(
+            "configs/base.json",
+            "{\"compilerOptions\":{\"baseUrl\":\"..\",\"paths\":{\"@lib/*\":[\"src/lib/*\"]}}}",
+        )
+        .edge_after("file:src/main.ts", "imports", "function double")
+}
+
+/// W5-06: `paths` pointed elsewhere moves what a barrel's alias source
+/// resolves to, and the import through the barrel follows.
+pub fn typescript_paths_retarget_moves_a_barrel_source() -> Case {
+    Case::new(Change::ControlFile, &[Language::TypeScript])
+        .file(
+            "tsconfig.json",
+            "{\"compilerOptions\":{\"baseUrl\":\".\",\"paths\":{\"@lib/*\":[\"src/lib/*\"]}}}",
+        )
+        .file(
+            "src/lib/math.ts",
+            "export function double(value: number): number {\n  return value * 2;\n}\n",
+        )
+        .file(
+            "src/alt/math.ts",
+            "export function double(value: number): number {\n  return value + value;\n}\n",
+        )
+        .file("src/index.ts", "export * from '@lib/math';\n")
+        .file(
+            "src/main.ts",
+            "import { double } from './index';\n\nexport function run(): number {\n  return double(2);\n}\n",
+        )
+        .write(
+            "tsconfig.json",
+            "{\"compilerOptions\":{\"baseUrl\":\".\",\"paths\":{\"@lib/*\":[\"src/alt/*\"]}}}",
+        )
+        .edge_before("function run", "calls", "function double @src/lib/math.ts")
+        .edge_after("function run", "calls", "function double @src/alt/math.ts")
+}
+
+/// W5-06: React leaving `package.json` takes the framework's hook node with
+/// it, and the call resolves by name again.
+pub fn typescript_react_dependency_leaves_package_json() -> Case {
+    Case::new(Change::ControlFile, &[Language::TypeScript])
+        .file(
+            "package.json",
+            "{\"name\":\"web\",\"dependencies\":{\"left-pad\":\"1.3.0\",\"react\":\"18.2.0\"}}\n",
+        )
+        .file(
+            "src/hooks.ts",
+            "export function useCart(): number {\n  return 1;\n}\n",
+        )
+        .file(
+            "src/page.ts",
+            "export function page(): number {\n  return useCart();\n}\n",
+        )
+        .write(
+            "package.json",
+            "{\"name\":\"web\",\"dependencies\":{\"left-pad\":\"1.3.0\"}}\n",
+        )
+        .edge_before("function page", "calls", "function src/hooks.ts::useCart")
+        .edge_after("function page", "calls", "function useCart")
+}
+
+/// W5-06: a package the manifest comes to declare is outside the project,
+/// so the import of its binding no longer reaches a project class by name.
+pub fn typescript_declared_dependency_makes_a_bare_import_external() -> Case {
+    Case::new(Change::ControlFile, &[Language::TypeScript])
+        .file("package.json", "{\"name\":\"web\",\"dependencies\":{}}\n")
+        .file("src/button.ts", "export class Button {}\n")
+        .file(
+            "src/app.ts",
+            "import { Button } from 'ui-kit';\n\nexport const b = new Button();\n",
+        )
+        .write(
+            "package.json",
+            "{\"name\":\"web\",\"dependencies\":{\"ui-kit\":\"1.0.0\"}}\n",
+        )
+        .edge_before("constant b", "instantiates", "class Button")
+        .no_edge_after("constant b", "instantiates", "class Button")
+}
+
+/// W5-06: a workspace member with only its manifest renames its package:
+/// the import of the old name stops being the workspace's.
+pub fn typescript_workspace_member_manifest_renames_its_package() -> Case {
+    Case::new(Change::ControlFile, &[Language::TypeScript])
+        .file(
+            "package.json",
+            "{\"name\":\"root\",\"workspaces\":[\"packages/*\"]}\n",
+        )
+        .file("packages/ui/package.json", "{\"name\":\"@acme/ui\"}\n")
+        .file("src/button.ts", "export class Button {}\n")
+        .file(
+            "src/app.ts",
+            "import { Button } from '@acme/ui';\n\nexport const b = new Button();\n",
+        )
+        .write("packages/ui/package.json", "{\"name\":\"@acme/kit\"}\n")
+        .edge_before("file:src/app.ts", "imports", "class Button")
+}
+
+/// W5-06: a workspace member's manifest deleted: the import of its package
+/// stops resolving into the member.
+pub fn typescript_workspace_member_manifest_is_deleted() -> Case {
+    Case::new(Change::ControlFile, &[Language::TypeScript])
+        .file(
+            "package.json",
+            "{\"name\":\"root\",\"workspaces\":[\"packages/*\"]}\n",
+        )
+        .file("packages/ui/package.json", "{\"name\":\"@acme/ui\"}\n")
+        .file("packages/ui/index.ts", "export class Button {}\n")
+        .file(
+            "src/app.ts",
+            "import { Button } from '@acme/ui';\n\nexport const b = new Button();\n",
+        )
+        .edge_before("file:src/app.ts", "imports", "class Button")
+        .remove("packages/ui/package.json")
+}
+
+/// W5-06: the workspace glob comes to match a new member once its manifest
+/// appears: the import of its package resolves into it.
+pub fn typescript_workspace_glob_gains_a_member() -> Case {
+    Case::new(Change::ControlFile, &[Language::TypeScript])
+        .file(
+            "package.json",
+            "{\"name\":\"root\",\"workspaces\":[\"packages/*\"]}\n",
+        )
+        .file("packages/kit/index.ts", "export class Button {}\n")
+        .file(
+            "src/app.ts",
+            "import { Button } from '@acme/kit';\n\nexport const b = new Button();\n",
+        )
+        .write("packages/kit/package.json", "{\"name\":\"@acme/kit\"}\n")
+        .edge_after("file:src/app.ts", "imports", "class Button")
+}
+
+/// W5-06: a Tauri config appearing makes the project a Tauri one: the
+/// command reference an `invoke` call site gains at extraction, parked here
+/// with no command to bind, and the detected frameworks match a fresh index.
+/// A marker is a JS control input, and the JS files re-resolved whole gather
+/// their framework references again (Tauri makes no node), so this case
+/// converges without the framework lane; the command-attribute case needs it.
+pub fn tauri_config_marker_appears() -> Case {
+    Case::new(Change::ControlFile, &[Language::TypeScript, Language::Rust])
+        .file(
+            "src/main.ts",
+            "import { invoke } from '@tauri-apps/api/core';\n\nexport function run(): Promise<unknown> {\n  return invoke('greet');\n}\n",
+        )
+        .file("src-tauri/src/main.rs", "fn main() {}\n")
+        .write("src-tauri/tauri.conf.json", "{}\n")
+        .edge_throughout("file:src/main.ts", "contains", "function run")
+}
+
+/// W5-06: a `#[tauri::command]` appearing in a Rust file makes the project
+/// a Tauri one, so every file is re-extracted: the command reference the
+/// `invoke` call site gains at extraction binds the command, though no
+/// JavaScript file and no control file changed.
+pub fn tauri_command_attribute_makes_an_invoke_call_its_edge() -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript, Language::Rust])
+        .file(
+            "src/main.ts",
+            "import { invoke } from '@tauri-apps/api/core';\n\nexport function run(): Promise<unknown> {\n  return invoke('greet');\n}\n",
+        )
+        .file(
+            "src-tauri/src/main.rs",
+            "pub fn greet() -> String {\n    String::new()\n}\n\nfn main() {}\n",
+        )
+        .write(
+            "src-tauri/src/main.rs",
+            "#[tauri::command] pub fn greet() -> String {\n    String::new()\n}\n\nfn main() {}\n",
+        )
+        .edge_after("file:src/main.ts", "calls", "function greet")
+}
+
+/// W5-06, fail closed: only the manifest's `version` changes; every JS file
+/// re-resolves and every edge stays.
+pub fn typescript_package_version_bump_keeps_every_edge() -> Case {
+    Case::new(Change::ControlFile, &[Language::TypeScript])
+        .file("package.json", "{\"name\":\"web\",\"version\":\"1.0.0\"}\n")
+        .file(
+            "src/lib/math.ts",
+            "export function double(value: number): number {\n  return value * 2;\n}\n",
+        )
+        .file(
+            "src/main.ts",
+            "import { double } from './lib/math';\n\nexport function run(): number {\n  return double(2);\n}\n",
+        )
+        .write("package.json", "{\"name\":\"web\",\"version\":\"1.0.1\"}\n")
+        .edge_throughout("function run", "calls", "function double")
 }
 
 // ----- Shopify theme markers (W4-LIQ-01: upstream #2393, #2396) ---------

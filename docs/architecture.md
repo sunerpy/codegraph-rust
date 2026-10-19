@@ -387,7 +387,7 @@ node; the `scala_surface_version` marker is withdrawn and restored with the
 others; a C# file whose `global using`s or `global using static`s changed
 re-resolves every unchanged C# file whole, since every file of a project reads
 the first and every file the second, and the project is a `.csproj`, which is
-no source file (a `.csproj` or `.props` change itself is not yet detected); one
+no source file (a `.csproj` or `.props` change is the control-input lane's, below); one
 whose surface row's heads moved re-resolves, whole, the unchanged files
 declaring a C# type of a name those heads reach (closing over every head
 listing a reached name as a base to either reader), since a nested type is
@@ -568,8 +568,8 @@ Rust file whose text writes it as a path receiver (`Name::`, `Name.`), the refer
 through it, since a CamelCase path receiver is an outside type unless the project declares a
 type of its name, and the `rust_receivers_version` marker is withdrawn and restored with the
 others; a bare Rust name's scope reads its own file's `use` items, which re-resolve with it, and the
-`Cargo.toml` files at or above it, which are no source files (a `Cargo.toml` change itself is not
-yet detected);
+`Cargo.toml` files at or above it, which are no source files (a `Cargo.toml` change is the
+control-input lane's, below);
 an import names a file, a folder or a namespace rather than a symbol, so the parked
 imports an added file or a changed file's namespace can satisfy (by the file's
 name and stem, its folder's, or the namespace's whole name), and the parked
@@ -585,7 +585,30 @@ types whose entries came, went or changed, re-resolves at their sites the edges
 to methods named like those of a seed's old or new supertypes (five levels up),
 and retries the calls parked through a seed or a type up to four levels below
 it, however many there are; the `class_heads_version` marker is withdrawn and
-restored with the others. An edited JavaScript-family module sends down the
+restored with the others. Resolution also reads control files, which are no
+source files: the JS/TS path-alias configs along their `extends` chains, the
+workspace manifests and the folders a workspace glob lists, the `package.json`
+and Deno manifests above each JavaScript-family file, the C# project files
+above each C# file, and the `Cargo.toml` files above each Rust file; and the
+frameworks it detects. Each reader reports what it read or probed in the same
+traversal, and every index and sync keeps a `control_inputs:` row per kind
+(`js`, `csharp`, `rust`) holding each input's digest by path (the sha256 of
+its text, or of a listed folder's names; `null` for a missing one; one outside
+the project by the absolute path its reader used), and a `frameworks_detected`
+row. A sync re-reads a kind's inputs (a CLI sync always; a watcher's when a
+path it was handed is a recorded input, a control file of the kind, or a folder
+coming into a workspace glob's listing, or when a file of the kind came, went
+or changed language), whole, with no size or time shortcut; a kind whose inputs
+moved re-resolves every file of its languages whole, and a framework that came
+or went re-extracts every file, since framework nodes are made at extraction.
+The `control_inputs_version` marker is withdrawn and restored with the others,
+and `frameworks_version` only by a sync re-extracting for a framework change.
+The watcher hands a control file's event to the sync, ignored or not, and an
+event for a recorded input, reading the rows at start and after each of its
+syncs; an input in a folder it does not watch (a config an `extends` chain
+reaches in `node_modules`), or one another process's sync comes to record
+before the watcher's next sync, sends no event that reaches a sync: the next
+CLI sync, or a daemon's catch-up sync at start, compares it. An edited JavaScript-family module sends down the
 same lane each importer whose statement of it holds a binding the import did not
 resolve, parked or matched by its name (`W` of `import { Widget as W }` while
 the module declares no `Widget`), read before the module's old nodes go: the

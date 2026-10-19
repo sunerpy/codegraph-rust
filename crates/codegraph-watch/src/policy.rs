@@ -145,6 +145,13 @@ impl WatchPolicy {
             && codegraph_extract::embedded::shopify::is_shopify_theme_marker(relative)
     }
 
+    /// Whether `relative` is a control file a resolver reads, or a Tauri
+    /// config marker, which a sync must hear of though it is no source file
+    /// (W5-06), ignored or not: the readers read it all the same.
+    pub fn is_project_control_file(&self, relative: &str) -> bool {
+        !self.is_always_ignored(relative) && crate::control_inputs::is_control_file(relative)
+    }
+
     /// Whether the directory `relative`, which this policy does not watch, is
     /// still watched (not below it) for a Shopify theme marker: a `config/` or
     /// `layout/` directory, in any case (W4-LIQ-01).

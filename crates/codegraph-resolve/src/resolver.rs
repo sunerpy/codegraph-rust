@@ -1479,6 +1479,19 @@ impl ReferenceResolver {
         !self.framework_resolver_extensions.is_empty()
     }
 
+    /// The names of the detected `FrameworkResolver`s, sorted: what a sync
+    /// compares to know when a framework came or went (W5-06).
+    pub fn framework_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .framework_resolver_extensions
+            .iter()
+            .map(|resolver| resolver.name().to_string())
+            .collect();
+        names.sort();
+        names.dedup();
+        names
+    }
+
     /// Run each detected resolver's `post_extract` finalization and persist the
     /// returned node updates (`runPostExtract`, `index.ts:276-295`). Idempotent —
     /// safe after every index and every incremental sync. Returns the number of

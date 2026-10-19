@@ -376,7 +376,11 @@ fn is_root_dir(dir: &str) -> bool {
 /// The `.csproj` and `.props` files of `dir` (a directory of the project,
 /// `.` for its root), by name: regular files only, a symlink is not followed.
 fn project_files(dir: &str, context: &dyn ResolutionContext) -> Vec<String> {
-    let root = Path::new(context.get_project_root());
+    project_files_in(Path::new(context.get_project_root()), dir)
+}
+
+/// [`project_files`] under the project `root`.
+fn project_files_in(root: &Path, dir: &str) -> Vec<String> {
     let full = if is_root_dir(dir) {
         root.to_path_buf()
     } else {
@@ -396,6 +400,49 @@ fn project_files(dir: &str, context: &dyn ResolutionContext) -> Vec<String> {
         .collect();
     names.sort();
     names
+}
+
+/// What [`csharp_project_usings`] reads for the C# files `files` (project
+/// paths of the files the index holds as C#): each directory from a file's
+/// up to the root, whose `.csproj` / `.props` names it lists (`.` for the
+/// root), and each project file listed, by project path. Sorted, each once;
+/// what a sync compares to know when the project usings may have moved
+/// (W5-06).
+pub fn csharp_project_inputs(
+    root: &Path,
+    files: &[String],
+) -> (Vec<(String, Vec<String>)>, Vec<String>) {
+    let mut dirs: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for file in files {
+        let mut dir = dirname(file).to_string();
+        loop {
+            let at_root = is_root_dir(&dir);
+            dirs.insert(if at_root {
+                ".".to_string()
+            } else {
+                dir.clone()
+            });
+            if at_root {
+                break;
+            }
+            dir = dirname(&dir).to_string();
+        }
+    }
+    let mut listings = Vec::new();
+    let mut project_paths = Vec::new();
+    for dir in dirs {
+        let names = project_files_in(root, &dir);
+        for name in &names {
+            project_paths.push(if dir == "." {
+                name.clone()
+            } else {
+                format!("{dir}/{name}")
+            });
+        }
+        listings.push((dir, names));
+    }
+    project_paths.sort();
+    (listings, project_paths)
 }
 
 /// The `<Using Include="X" />` (not `Static="true"`) of a project file's
@@ -1052,6 +1099,32 @@ pub fn is_csharp_owner_type(candidate: &Node, owner: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn csharp_project_inputs_list_each_folder_up_from_a_file() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("cg-csharp-inputs-{nanos}"));
+        std::fs::create_dir_all(root.join("App/src")).unwrap();
+        std::fs::write(root.join("Directory.Build.props"), "<Project />").unwrap();
+        std::fs::write(root.join("README.md"), "app\n").unwrap();
+        std::fs::write(root.join("App/App.CSPROJ"), "<Project />").unwrap();
+        std::fs::write(root.join("App/src/Program.cs"), "class Program {}\n").unwrap();
+        let (listings, project_files) =
+            csharp_project_inputs(&root, &["App/src/Program.cs".to_string()]);
+        assert_eq!(
+            listings,
+            [
+                (".".to_string(), vec!["Directory.Build.props".to_string()]),
+                ("App".to_string(), vec!["App.CSPROJ".to_string()]),
+                ("App/src".to_string(), Vec::new()),
+            ]
+        );
+        assert_eq!(project_files, ["App/App.CSPROJ", "Directory.Build.props"]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn usings_skip_static_and_read_aliases() {

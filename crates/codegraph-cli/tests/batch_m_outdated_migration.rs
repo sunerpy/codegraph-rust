@@ -1832,6 +1832,114 @@ fn outdated_migration_writes_the_class_head_rows_of_index_force() {
     );
 }
 
+/// W5-06: a migration writes the control-input rows (what resolution read
+/// of the JS/TS configs and manifests, the C# project files and the Cargo
+/// manifests), the detected frameworks and both markers as `index --force`
+/// does.
+#[test]
+fn outdated_migration_writes_the_control_rows_of_index_force() {
+    let dir = TestDir::new("outdated-control-inputs");
+    let project = dir.path().join("mini");
+    for (path, contents) in [
+        (
+            "package.json",
+            "{\"name\":\"web\",\"dependencies\":{\"react\":\"18.2.0\"}}\n",
+        ),
+        (
+            "tsconfig.json",
+            "{\"compilerOptions\":{\"baseUrl\":\".\",\"paths\":{\"@lib/*\":[\"src/lib/*\"]}}}\n",
+        ),
+        (
+            "src/lib/math.ts",
+            "export function double(value: number): number {\n  return value * 2;\n}\n",
+        ),
+        (
+            "src/main.ts",
+            "import { double } from '@lib/math';\n\nexport function run(): number {\n  return double(2);\n}\n",
+        ),
+        ("App/App.csproj", "<Project Sdk=\"Microsoft.NET.Sdk\" />\n"),
+        (
+            "App/Program.cs",
+            "namespace App;\n\npublic class Program {}\n",
+        ),
+        (
+            "Cargo.toml",
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+        ),
+        ("src/lib.rs", "pub fn one() -> u32 {\n    1\n}\n"),
+    ] {
+        let full = project.join(path);
+        fs::create_dir_all(full.parent().unwrap()).expect("create the source directory");
+        fs::write(full, contents).expect("write a source file");
+    }
+    let run = cli(&["init", project.to_str().unwrap()]);
+    assert!(
+        run.ok,
+        "setup: `codegraph init` must succeed (stdout={}, stderr={})",
+        run.stdout, run.stderr
+    );
+    let paths = IndexPaths::resolve(&project, None).expect("resolve v2 paths");
+    stage_state_slot(
+        &paths,
+        100,
+        CURRENT_STORAGE_PROTOCOL,
+        CURRENT_EXTRACTION_VERSION - 1,
+        "current",
+    );
+    let run = cli(&["sync", project.to_str().unwrap()]);
+    assert!(
+        run.ok,
+        "sync must migrate an Outdated namespace: stdout={}, stderr={}",
+        run.stdout, run.stderr
+    );
+    let (_scratch, peer) = fresh_force_peer("outdated-control-inputs", &project);
+    let control_rows = |paths: &IndexPaths| {
+        let store = Store::open_for_read(paths, deadline(), || false).expect("readable namespace");
+        let mut rows = store
+            .project_metadata_with_prefix("control_inputs")
+            .expect("control rows");
+        rows.extend(
+            store
+                .project_metadata_with_prefix("frameworks_")
+                .expect("framework rows"),
+        );
+        rows
+    };
+    let migrated = control_rows(&paths);
+    assert_eq!(
+        migrated
+            .iter()
+            .map(|(key, _)| key.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "control_inputs:csharp",
+            "control_inputs:js",
+            "control_inputs:rust",
+            "control_inputs_version",
+            "frameworks_detected",
+            "frameworks_version",
+        ],
+        "a migration writes the control rows and both markers: {migrated:?}"
+    );
+    for (row, input) in [
+        (0, "\"App/App.csproj\""),
+        (1, "\"tsconfig.json\""),
+        (1, "\"package.json\""),
+        (2, "\"Cargo.toml\""),
+        (4, "\"react\""),
+    ] {
+        assert!(
+            migrated[row].1.contains(input),
+            "row {row} records {input}: {migrated:?}"
+        );
+    }
+    assert_eq!(
+        migrated,
+        control_rows(&IndexPaths::resolve(&peer, None).expect("resolve peer v2 paths")),
+        "a forced migration must write the control rows of `index --force`"
+    );
+}
+
 /// Migration is a from-source rebuild, so a tracked file that no longer exists
 /// on disk disappears from the migrated index and the result still equals a
 /// fresh `index --force` over the surviving tree.

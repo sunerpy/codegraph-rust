@@ -215,6 +215,41 @@ pub fn read_manifest_scope<C: ResolutionContext + ?Sized>(dir: &str, context: &C
     scope
 }
 
+/// The project paths [`read_manifest_scope`] reads for the files `files`
+/// (project paths): `package.json`, `deno.json` and `deno.jsonc` in each
+/// directory from a file's up to the root, a missing one included, sorted,
+/// each once. What a sync compares to know when the manifests may have
+/// moved (W5-06).
+pub fn manifest_inputs(files: &[String]) -> Vec<String> {
+    let mut dirs: BTreeSet<String> = BTreeSet::new();
+    for file in files {
+        let Some(mut dir) = importing_dir(file) else {
+            continue;
+        };
+        loop {
+            dirs.insert(dir.to_string());
+            if dir.is_empty() {
+                break;
+            }
+            dir = dir.rsplit_once('/').map_or("", |(parent, _)| parent);
+        }
+    }
+    let mut out: Vec<String> = dirs
+        .iter()
+        .flat_map(|dir| {
+            ["package.json", "deno.json", "deno.jsonc"].map(|name| {
+                if dir.is_empty() {
+                    name.to_string()
+                } else {
+                    format!("{dir}/{name}")
+                }
+            })
+        })
+        .collect();
+    out.sort();
+    out
+}
+
 /// The directory a project-relative file sits in (`""` at the root), or
 /// `None` for a path that could leave the project (absolute, or with a `..`
 /// segment), whose manifests are never read.
@@ -274,7 +309,27 @@ fn is_sveltekit_virtual(source: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{NODE_BUILTIN_MODULES, importing_dir, is_sveltekit_virtual, package_name};
+    use super::{
+        NODE_BUILTIN_MODULES, importing_dir, is_sveltekit_virtual, manifest_inputs, package_name,
+    };
+
+    #[test]
+    fn manifest_inputs_are_each_folder_up_from_a_file() {
+        let files = [
+            "apps/web/src/main.ts".to_string(),
+            "apps/web/index.ts".to_string(),
+            "../outside.ts".to_string(),
+        ];
+        let mut expected = Vec::new();
+        for dir in ["", "apps/", "apps/web/", "apps/web/src/"] {
+            for name in ["deno.json", "deno.jsonc", "package.json"] {
+                expected.push(format!("{dir}{name}"));
+            }
+        }
+        expected.sort();
+        assert_eq!(manifest_inputs(&files), expected);
+        assert!(manifest_inputs(&[]).is_empty());
+    }
 
     #[test]
     fn node_builtins_are_sorted_for_binary_search() {

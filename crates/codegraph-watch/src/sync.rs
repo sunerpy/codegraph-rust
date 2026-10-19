@@ -110,6 +110,11 @@ pub struct SyncOutcome {
     pub pending_refs_processed: usize,
     pub pending_refs_resolved: usize,
     pub pending_refs_unresolved: usize,
+    /// The control inputs the index records once this sync is done, by
+    /// project path (W5-06): the watcher hands their events to the next sync,
+    /// though they are no source files. `None` when the sync did not read
+    /// them.
+    pub control_paths: Option<crate::control_inputs::RecordedInputs>,
 }
 
 /// Read-only difference between the current project scope and the persisted
@@ -610,6 +615,11 @@ fn sync_paths_with_store(
         crate::dart_libraries::withdraw_marker(store)?;
     }
 
+    // And for the control files resolution reads (W5-06): every file of the
+    // three kinds is re-resolved once. Read here, before a change withdraws
+    // the marker.
+    let control_bootstrap = crate::control_inputs::needs_bootstrap(store)?;
+
     // A Shopify theme whose marker came or went reclassifies its JSON
     // templates and moves the references its Liquid files make (W4-LIQ-01):
     // the templates join the paths, which the pass below keeps or drops as
@@ -671,6 +681,7 @@ fn sync_paths_with_store(
             &mut dependent_fallbacks,
             &mut changed_names,
             !in_scope,
+            false,
         )? {
             changed = true;
             reindexed.insert(relative);
@@ -678,8 +689,22 @@ fn sync_paths_with_store(
         on_progress(done + 1, total);
     }
 
-    if changed
-        || surface_bootstrap
+    // What resolution reads of the control files (W5-06), compared once the
+    // paths are processed and before any lane reads the changes: a kind that
+    // moved re-resolves its files whole below, and a framework that came or
+    // went re-extracts every file now, so the lanes see those files too.
+    let control = crate::control_inputs::check(
+        store,
+        project_root,
+        scanned.is_some(),
+        control_bootstrap,
+        &requested,
+        &changed_names.membership,
+    )?;
+    if control.any() {
+        changed_names.begin_mutation(store)?;
+    }
+    let any_bootstrap = surface_bootstrap
         || cpp_bootstrap
         || java_bootstrap
         || kotlin_bootstrap
@@ -701,8 +726,52 @@ fn sync_paths_with_store(
         || dart_bootstrap
         || dart_library_bootstrap
         || shopify_bootstrap
-        || !shopify.moved.is_empty()
-    {
+        || !shopify.moved.is_empty();
+    // A sync with nothing to do detects no framework: the frameworks read
+    // their control files (`package.json`, the Tauri markers), which are the
+    // JS kind's inputs, and the sources a changed file brings.
+    let block = changed
+        || any_bootstrap
+        || control.any()
+        || crate::control_inputs::frameworks_unchecked(store)?;
+    let mut resolver = ReferenceResolver::new(project_root.to_string_lossy())
+        .with_max_file_size(scope.options.max_file_size);
+    let mut frameworks = Vec::new();
+    let mut frameworks_changed = false;
+    if block {
+        {
+            let context = resolver.store_context(store);
+            resolver.initialize(&context);
+        }
+        frameworks = resolver.framework_names();
+        frameworks_changed = crate::control_inputs::frameworks_changed(store, &frameworks)?;
+    }
+    if frameworks_changed {
+        changed_names.begin_mutation(store)?;
+        crate::control_inputs::withdraw_frameworks_marker(store)?;
+        for file in store.all_files()? {
+            if reindexed.contains(&file.path) || changed_names.removed_files.contains(&file.path) {
+                continue;
+            }
+            if sync_one(
+                project_root,
+                store,
+                &file.path,
+                scope,
+                rehash,
+                &mut outcome,
+                &mut dependent_sites,
+                &mut dependent_fallbacks,
+                &mut changed_names,
+                false,
+                true,
+            )? {
+                reindexed.insert(file.path);
+            }
+        }
+    }
+
+    if block {
         note_python_global_readers(
             project_root,
             store,
@@ -729,7 +798,11 @@ fn sync_paths_with_store(
             scope.options.max_file_size,
             &changed_names.js_surfaces,
             &reindexed,
-            !changed_names.added_files.is_empty() || !changed_names.removed_files.is_empty(),
+            !changed_names.added_files.is_empty()
+                || !changed_names.removed_files.is_empty()
+                || control
+                    .changed
+                    .contains(&crate::control_inputs::ControlKind::Js),
             surface_bootstrap,
         )?;
         for file in &surfaces.files {
@@ -1245,18 +1318,20 @@ fn sync_paths_with_store(
                 dependent_fallbacks.insert(parked.file_path);
             }
         }
+        // W5-06 — a control input that moved re-resolves every file of its
+        // kind whole.
+        for file in crate::control_inputs::files_of(store, &control.changed)? {
+            if !reindexed.contains(&file) {
+                dependent_sites.remove(&file);
+                dependent_fallbacks.insert(file);
+            }
+        }
         // #2450 — and so do the importers of an edited module whose statement
         // holds a binding the import did not resolve (read in `sync_one`).
         for importer in std::mem::take(&mut changed_names.binding_importers) {
             if !reindexed.contains(&importer) {
                 dependent_fallbacks.insert(importer);
             }
-        }
-        let mut resolver = ReferenceResolver::new(project_root.to_string_lossy())
-            .with_max_file_size(scope.options.max_file_size);
-        {
-            let context = resolver.store_context(store);
-            resolver.initialize(&context);
         }
         // Re-run framework per-file extract for reindexed files whose framework
         // nodes/refs were dropped on re-extraction (upstream tree-sitter.ts:4796-4819).
@@ -1315,6 +1390,8 @@ fn sync_paths_with_store(
         go.write_rows(store)?;
         php.write_rows(store)?;
         class_heads.write_rows(store)?;
+        control.write_rows(store)?;
+        crate::control_inputs::write_frameworks(store, &frameworks)?;
         dart.write_rows(store)?;
         dart_libraries.write_rows(store)?;
         lua.write_rows(store)?;
@@ -1335,6 +1412,7 @@ fn sync_paths_with_store(
         crate::rust_receivers::write_marker(store)?;
         crate::php_heads::write_marker(store)?;
         crate::class_heads::write_marker(store)?;
+        crate::control_inputs::write_marker(store)?;
         crate::case_folded::write_marker(store)?;
         crate::lua_modules::write_marker(store)?;
         crate::r_bindings::write_marker(store)?;
@@ -1362,6 +1440,7 @@ fn sync_paths_with_store(
     let mut changed_paths: Vec<String> = reindexed.into_iter().collect();
     changed_paths.sort();
     outcome.changed_paths = changed_paths;
+    outcome.control_paths = Some(crate::control_inputs::recorded_paths(store)?);
     Ok(outcome)
 }
 
@@ -1563,6 +1642,7 @@ fn sync_one(
     dependent_fallbacks: &mut BTreeSet<String>,
     changed_names: &mut ChangedNames,
     force_absent: bool,
+    force_reextract: bool,
 ) -> Result<bool> {
     let full = project_root.join(relative);
     // One stat serves as both the existence check and the (mtime, size) source.
@@ -1589,7 +1669,8 @@ fn sync_one(
     // which stays authoritative — keeping the DB byte-identical to `index
     // --force`. (The equivalence tests edit file content, which changes size
     // and/or mtime, so they correctly fall through and reindex.)
-    if let Some(file) = &stored
+    if !force_reextract
+        && let Some(file) = &stored
         && file.size == metadata.len() as i64
         && file.modified_at == modified_millis(&metadata)
         && !rehash.covers(relative)
@@ -1622,10 +1703,15 @@ fn sync_one(
         .is_some_and(|file| crate::cpp_namespace_rows::is_row_file(relative, file.language));
     // Authoritative content gate, port of the upstream hash gate in
     // `upstream extraction/index.ts:1326-1337,1465-1483`.
-    if stored.is_some_and(|file| file.content_hash == content_hash) {
+    if !force_reextract
+        && stored
+            .as_ref()
+            .is_some_and(|file| file.content_hash == content_hash)
+    {
         outcome.files_skipped_unchanged += 1;
         return Ok(false);
     }
+    let language_before = stored.as_ref().map(|file| file.language);
 
     changed_names.begin_mutation(store)?;
     let mut importers = BTreeSet::new();
@@ -1644,6 +1730,14 @@ fn sync_one(
             .extend(store.importers_with_unbound_bindings(relative)?);
     }
     let language_after = detect_language_of(relative, &source, &scope.options.extensions);
+    // Which files a control file's readers start from (W5-06).
+    if language_before != Some(language_after) {
+        changed_names.membership.push((
+            relative.to_string(),
+            language_before,
+            Some(language_after),
+        ));
+    }
     let c_family_after = crate::cpp_dependents::is_c_family(language_after);
     let c_family = c_family_after || c_family_before;
     changed_names.cpp.before_change(store, relative, c_family)?;
@@ -1701,6 +1795,9 @@ fn remove_tracked_file(
         return Ok(false);
     };
     changed_names.begin_mutation(store)?;
+    changed_names
+        .membership
+        .push((relative.to_string(), Some(stored.language), None));
     let mut importers = BTreeSet::new();
     for dependent in store.reference_sites_dependent_on_file(relative)? {
         importers.insert(dependent.file_path.clone());
@@ -2360,6 +2457,10 @@ struct ChangedNames {
     candidates: HashSet<String>,
     /// The files this sync added: a parked import may name one (#2392).
     added_files: BTreeSet<String>,
+    /// The files that came, went or changed language, with their language
+    /// before and after: which files a control file's readers start from
+    /// (W5-06).
+    membership: Vec<crate::control_inputs::MembershipChange>,
     /// The qualified names (`util::double/1`, `app.CommonMapper::userColumns`)
     /// of every node whose name a changed candidate touched, on both sides of
     /// the change, and of a removed file's nodes. A reference written
@@ -2491,6 +2592,7 @@ impl ChangedNames {
             crate::rust_receivers::withdraw_marker(store)?;
             crate::php_heads::withdraw_marker(store)?;
             crate::class_heads::withdraw_marker(store)?;
+            crate::control_inputs::withdraw_marker(store)?;
             crate::case_folded::withdraw_marker(store)?;
             crate::lua_modules::withdraw_marker(store)?;
             crate::r_bindings::withdraw_marker(store)?;
@@ -4842,6 +4944,313 @@ pub(crate) mod tests {
         assert_eq!(class_heads_marker(&db), version);
         assert_eq!(class_head_rows(&db), rows);
         assert_eq!(edge_projection(&db), expected);
+    }
+
+    fn metadata(db: &Path, key: &str) -> Option<String> {
+        Store::open(db).unwrap().get_project_metadata(key).unwrap()
+    }
+
+    const TS_CONFIG_PLAIN: (&str, &str) = ("tsconfig.json", "{\"compilerOptions\":{}}\n");
+    const TS_CONFIG_PATHS: (&str, &str) = (
+        "tsconfig.json",
+        "{\"compilerOptions\":{\"baseUrl\":\".\",\"paths\":{\"@lib/*\":[\"src/lib/*\"]}}}\n",
+    );
+    const TS_MATH: (&str, &str) = (
+        "src/lib/math.ts",
+        "export function double(value: number): number {\n  return value * 2;\n}\n",
+    );
+    const TS_MAIN: (&str, &str) = (
+        "src/main.ts",
+        "import { double } from '@lib/math';\n\nexport function run(): number {\n  return double(2);\n}\n",
+    );
+    const TS_SPARE: (&str, &str) = ("src/spare.ts", "export const spare = 0;\n");
+    const TS_SPARE_EDITED: (&str, &str) = ("src/spare.ts", "export const spare = 1;\n");
+
+    /// Drops the import edge of `double`, as an older sync could have lost it.
+    const DROP_DOUBLE_IMPORT: &str = "DELETE FROM edges WHERE kind = 'imports' AND target = \
+         (SELECT id FROM nodes WHERE name = 'double' AND kind = 'function')";
+
+    fn imports_double(db: &Path) -> bool {
+        edge_projection(db)
+            .iter()
+            .any(|edge| edge.contains("src/main.ts -[imports]-> src/lib/math.ts:double"))
+    }
+
+    /// W5-06: a sync failing after a control file's change left the control
+    /// marker away, so the next sync, with nothing changed or with an
+    /// unrelated change, re-resolves every JS-family file and rewrites the
+    /// rows: the alias import ends where a fresh index puts it.
+    #[test]
+    fn a_control_input_sync_failing_after_its_mutations_leaves_the_next_one_to_reconcile() {
+        for unrelated in [false, true] {
+            let dir = TestDir::new(if unrelated {
+                "control-inputs-fail-unrelated"
+            } else {
+                "control-inputs-fail"
+            });
+            let db = default_db_path(dir.path()).unwrap();
+            let initial = [TS_CONFIG_PLAIN, TS_MATH, TS_MAIN, TS_SPARE];
+            write_files(dir.path(), &initial);
+            sync_changed_paths(dir.path(), &db, initial.iter().map(|(path, _)| *path)).unwrap();
+            assert_eq!(
+                metadata(&db, crate::control_inputs::VERSION_KEY),
+                Some(crate::control_inputs::VERSION.to_string())
+            );
+            assert!(!imports_double(&db), "{:#?}", edge_projection(&db));
+
+            write_files(dir.path(), &[TS_CONFIG_PATHS]);
+            FAIL_BEFORE_RESOLUTION.with(|fail| fail.set(true));
+            let failed = sync_changed_paths(dir.path(), &db, [TS_CONFIG_PATHS.0]);
+            FAIL_BEFORE_RESOLUTION.with(|fail| fail.set(false));
+            assert!(failed.is_err(), "the injected failure must stop the sync");
+            assert_eq!(
+                metadata(&db, crate::control_inputs::VERSION_KEY),
+                None,
+                "a failed sync leaves the marker away"
+            );
+
+            let spare = if unrelated {
+                write_files(dir.path(), &[TS_SPARE_EDITED]);
+                sync_changed_paths(dir.path(), &db, [TS_SPARE.0]).unwrap();
+                TS_SPARE_EDITED
+            } else {
+                sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
+                TS_SPARE
+            };
+            assert_eq!(
+                metadata(&db, crate::control_inputs::VERSION_KEY),
+                Some(crate::control_inputs::VERSION.to_string())
+            );
+            let fresh = [TS_CONFIG_PATHS, TS_MATH, TS_MAIN, spare];
+            let name = if unrelated {
+                "control-inputs-fresh-unrelated"
+            } else {
+                "control-inputs-fresh"
+            };
+            assert_eq!(edge_projection(&db), fresh_edges(name, &fresh));
+            assert!(imports_double(&db), "{:#?}", edge_projection(&db));
+        }
+    }
+
+    /// W5-06: an index whose control marker alone is gone re-resolves every
+    /// file of the three kinds once, but re-extracts none; one whose
+    /// frameworks marker alone is gone re-extracts every file.
+    #[test]
+    fn a_missing_marker_reresolves_and_a_missing_frameworks_marker_reextracts() {
+        let dir = TestDir::new("control-inputs-markers");
+        let db = default_db_path(dir.path()).unwrap();
+        let initial = [TS_CONFIG_PATHS, TS_MATH, TS_MAIN, TS_SPARE];
+        write_files(dir.path(), &initial);
+        sync_changed_paths(dir.path(), &db, initial.iter().map(|(path, _)| *path)).unwrap();
+        let expected = edge_projection(&db);
+        {
+            let store = Store::open(&db).unwrap();
+            let dropped = store.connection().execute(DROP_DOUBLE_IMPORT, []).unwrap();
+            assert_eq!(dropped, 1, "the import edge an older sync lost");
+            store
+                .delete_project_metadata(crate::control_inputs::VERSION_KEY)
+                .unwrap();
+        }
+        let outcome = sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
+        assert_eq!(outcome.files_reindexed, 0, "no file is re-extracted");
+        assert_eq!(edge_projection(&db), expected);
+        assert_eq!(
+            metadata(&db, crate::control_inputs::VERSION_KEY),
+            Some(crate::control_inputs::VERSION.to_string())
+        );
+
+        Store::open(&db)
+            .unwrap()
+            .delete_project_metadata(crate::control_inputs::FRAMEWORKS_VERSION_KEY)
+            .unwrap();
+        let outcome = sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
+        assert_eq!(
+            outcome.files_reindexed, 3,
+            "every source file is re-extracted"
+        );
+        assert_eq!(edge_projection(&db), expected);
+        assert_eq!(
+            metadata(&db, crate::control_inputs::FRAMEWORKS_VERSION_KEY),
+            Some(crate::control_inputs::FRAMEWORKS_VERSION.to_string())
+        );
+    }
+
+    /// W5-06: a control row that cannot be read counts as changed: its kind
+    /// re-resolves whole and the row is rewritten.
+    #[test]
+    fn a_corrupt_control_row_counts_as_changed() {
+        let dir = TestDir::new("control-inputs-corrupt");
+        let db = default_db_path(dir.path()).unwrap();
+        let initial = [TS_CONFIG_PATHS, TS_MATH, TS_MAIN];
+        write_files(dir.path(), &initial);
+        sync_changed_paths(dir.path(), &db, initial.iter().map(|(path, _)| *path)).unwrap();
+        let expected = edge_projection(&db);
+        let row_key = crate::control_inputs::ControlKind::Js.row_key();
+        let row = metadata(&db, &row_key).expect("the JS row");
+        {
+            let store = Store::open(&db).unwrap();
+            store.connection().execute(DROP_DOUBLE_IMPORT, []).unwrap();
+            store.set_project_metadata(&row_key, "not json").unwrap();
+        }
+        sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
+        assert_eq!(edge_projection(&db), expected);
+        assert_eq!(metadata(&db, &row_key), Some(row));
+    }
+
+    /// W5-06: a control file a watcher event names is read whole, so one
+    /// replaced with its size and modification time kept still counts as
+    /// changed.
+    #[test]
+    fn a_named_control_file_replaced_with_its_size_and_mtime_kept_is_compared() {
+        let dir = TestDir::new("control-inputs-same-stat");
+        let db = default_db_path(dir.path()).unwrap();
+        // The same length as TS_CONFIG_PATHS, aliasing another folder.
+        let elsewhere = (
+            "tsconfig.json",
+            "{\"compilerOptions\":{\"baseUrl\":\".\",\"paths\":{\"@lib/*\":[\"src/xyz/*\"]}}}\n",
+        );
+        assert_eq!(elsewhere.1.len(), TS_CONFIG_PATHS.1.len());
+        let initial = [elsewhere, TS_MATH, TS_MAIN];
+        write_files(dir.path(), &initial);
+        sync_changed_paths(dir.path(), &db, initial.iter().map(|(path, _)| *path)).unwrap();
+        assert!(!imports_double(&db), "{:#?}", edge_projection(&db));
+        let config = dir.path().join("tsconfig.json");
+        let modified = fs::metadata(&config).unwrap().modified().unwrap();
+        fs::write(&config, TS_CONFIG_PATHS.1).unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&config)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+        sync_changed_paths(dir.path(), &db, ["tsconfig.json"]).unwrap();
+        assert!(imports_double(&db), "{:#?}", edge_projection(&db));
+    }
+
+    /// W5-06: a directory coming into a workspace glob's listing moves the
+    /// listing, and so does the listed folder coming whole, though no event
+    /// names a control file in either (each is moved in whole): the members'
+    /// manifests are read, and the imports of their packages resolve as a
+    /// fresh index resolves them.
+    #[test]
+    fn a_member_directory_coming_into_a_workspace_glob_is_compared() {
+        let dir = TestDir::new("control-inputs-member-dir");
+        let db = default_db_path(dir.path()).unwrap();
+        let initial = [
+            (
+                "package.json",
+                "{\"name\":\"root\",\"workspaces\":[\"packages/*\",\"apps/*\"]}\n",
+            ),
+            ("packages/core/package.json", "{\"name\":\"@acme/core\"}\n"),
+            ("src/button.ts", "export class Button {}\n"),
+            (
+                "src/app.ts",
+                "import { Button } from '@acme/ui';\n\nexport const b = new Button();\n",
+            ),
+            (
+                "src/web.ts",
+                "import { Button } from '@acme/web';\n\nexport const w = new Button();\n",
+            ),
+        ];
+        write_files(dir.path(), &initial);
+        sync_changed_paths(dir.path(), &db, initial.iter().map(|(path, _)| *path)).unwrap();
+        let imports_button = |db: &Path, from: &str| {
+            let edge = format!("{from} -[imports]-> src/button.ts:Button");
+            edge_projection(db).iter().any(|e| e.contains(&edge))
+        };
+        assert!(
+            !imports_button(&db, "src/app.ts"),
+            "{:#?}",
+            edge_projection(&db)
+        );
+        assert!(
+            !imports_button(&db, "src/web.ts"),
+            "{:#?}",
+            edge_projection(&db)
+        );
+        let staging = TestDir::new("control-inputs-member-dir-staging");
+        let mut fresh = initial.to_vec();
+
+        let member = ("packages/ui/package.json", "{\"name\":\"@acme/ui\"}\n");
+        write_files(staging.path(), &[("ui/package.json", member.1)]);
+        fs::rename(staging.path().join("ui"), dir.path().join("packages/ui")).unwrap();
+        sync_changed_paths(dir.path(), &db, ["packages/ui"]).unwrap();
+        fresh.push(member);
+        assert_eq!(
+            edge_projection(&db),
+            fresh_edges("control-inputs-member-dir-fresh", &fresh)
+        );
+        assert!(
+            imports_button(&db, "src/app.ts"),
+            "{:#?}",
+            edge_projection(&db)
+        );
+
+        let listed = ("apps/web/package.json", "{\"name\":\"@acme/web\"}\n");
+        write_files(staging.path(), &[listed]);
+        fs::rename(staging.path().join("apps"), dir.path().join("apps")).unwrap();
+        sync_changed_paths(dir.path(), &db, ["apps"]).unwrap();
+        fresh.push(listed);
+        assert_eq!(
+            edge_projection(&db),
+            fresh_edges("control-inputs-listed-dir-fresh", &fresh)
+        );
+        assert!(
+            imports_button(&db, "src/web.ts"),
+            "{:#?}",
+            edge_projection(&db)
+        );
+    }
+
+    /// W5-06: a control file's change re-resolves its kind only when a reader
+    /// reads it. A manifest's `version` bump does (fail closed: its digest
+    /// moved), so the import edge an older sync lost comes back; a manifest
+    /// in a folder no reader reads is no input, so nothing re-resolves and
+    /// the row stays.
+    #[test]
+    fn a_control_file_reresolves_its_kind_only_when_a_reader_reads_it() {
+        let dir = TestDir::new("control-inputs-unread");
+        let db = default_db_path(dir.path()).unwrap();
+        let manifest = ("package.json", "{\"name\":\"web\",\"version\":\"1.0.0\"}\n");
+        let initial = [manifest, TS_CONFIG_PATHS, TS_MATH, TS_MAIN];
+        write_files(dir.path(), &initial);
+        sync_changed_paths(dir.path(), &db, initial.iter().map(|(path, _)| *path)).unwrap();
+        let expected = edge_projection(&db);
+        assert!(imports_double(&db), "{expected:#?}");
+        let lose_the_import = || {
+            let dropped = Store::open(&db)
+                .unwrap()
+                .connection()
+                .execute(DROP_DOUBLE_IMPORT, [])
+                .unwrap();
+            assert_eq!(dropped, 1, "the import edge an older sync lost");
+        };
+
+        lose_the_import();
+        write_files(
+            dir.path(),
+            &[("package.json", "{\"name\":\"web\",\"version\":\"1.0.1\"}\n")],
+        );
+        sync_changed_paths(dir.path(), &db, ["package.json"]).unwrap();
+        assert_eq!(edge_projection(&db), expected, "every JS file re-resolves");
+
+        lose_the_import();
+        let row_key = crate::control_inputs::ControlKind::Js.row_key();
+        let row = metadata(&db, &row_key);
+        write_files(
+            dir.path(),
+            &[("docs/package.json", "{\"name\":\"docs\"}\n")],
+        );
+        let outcome = sync_changed_paths(dir.path(), &db, ["docs/package.json"]).unwrap();
+        assert!(
+            !imports_double(&db),
+            "nothing re-resolves: {:#?}",
+            edge_projection(&db)
+        );
+        assert_eq!(metadata(&db, &row_key), row, "the manifest is no input");
+        let recorded = outcome.control_paths.expect("the recorded inputs");
+        assert!(recorded.may_move("package.json", false));
+        assert!(!recorded.may_move("docs/package.json", false));
     }
 
     fn case_folded_marker(db: &Path) -> Option<String> {

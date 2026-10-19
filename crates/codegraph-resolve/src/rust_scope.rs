@@ -28,18 +28,10 @@ pub struct RustCrates {
     pub dependencies: BTreeSet<String>,
 }
 
-/// No crates, for a context that reads no manifests.
-pub fn no_rust_crates() -> Arc<RustCrates> {
-    static EMPTY: std::sync::OnceLock<Arc<RustCrates>> = std::sync::OnceLock::new();
-    Arc::clone(EMPTY.get_or_init(|| Arc::new(RustCrates::default())))
-}
-
-/// The crates of every `Cargo.toml` at or above an indexed `.rs` file, the
-/// root's included (upstream `rustProjectCrates` / `rustDependencyCrates`,
-/// which read the root manifest and its workspace members). Only a directory
-/// of a project-relative path is probed, and each manifest is read as a source
-/// file is: a regular file within the size limit, stat first.
-pub fn load_rust_crates(project_root: &str, files: &[String]) -> RustCrates {
+/// The project-relative `Cargo.toml` paths [`load_rust_crates`] reads for
+/// `files`: the root's, and one in every directory at or above an indexed
+/// `.rs` file, a missing one included, sorted (W5-06 compares them).
+pub fn rust_manifest_inputs(files: &[String]) -> Vec<String> {
     let mut dirs: BTreeSet<String> = BTreeSet::from([String::new()]);
     for file in files {
         let file = file.replace('\\', "/");
@@ -55,13 +47,31 @@ pub fn load_rust_crates(project_root: &str, files: &[String]) -> RustCrates {
             dir = pathutil::dirname(&dir);
         }
     }
+    dirs.into_iter()
+        .map(|dir| {
+            if dir.is_empty() {
+                "Cargo.toml".to_string()
+            } else {
+                format!("{dir}/Cargo.toml")
+            }
+        })
+        .collect()
+}
+
+/// No crates, for a context that reads no manifests.
+pub fn no_rust_crates() -> Arc<RustCrates> {
+    static EMPTY: std::sync::OnceLock<Arc<RustCrates>> = std::sync::OnceLock::new();
+    Arc::clone(EMPTY.get_or_init(|| Arc::new(RustCrates::default())))
+}
+
+/// The crates of every `Cargo.toml` at or above an indexed `.rs` file, the
+/// root's included (upstream `rustProjectCrates` / `rustDependencyCrates`,
+/// which read the root manifest and its workspace members). Only a directory
+/// of a project-relative path is probed, and each manifest is read as a source
+/// file is: a regular file within the size limit, stat first.
+pub fn load_rust_crates(project_root: &str, files: &[String]) -> RustCrates {
     let mut crates = RustCrates::default();
-    for dir in &dirs {
-        let relative = if dir.is_empty() {
-            "Cargo.toml".to_string()
-        } else {
-            format!("{dir}/Cargo.toml")
-        };
+    for relative in rust_manifest_inputs(files) {
         let Some(text) = crate::context::read_source_file(
             &std::path::Path::new(project_root).join(&relative),
             &relative,
@@ -696,6 +706,24 @@ pub(crate) fn gate_rust_scope(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rust_manifest_inputs_are_the_root_and_each_folder_up_from_a_rust_file() {
+        let files = [
+            "crates/core/src/lib.rs".to_string(),
+            "tools/gen.py".to_string(),
+        ];
+        assert_eq!(
+            rust_manifest_inputs(&files),
+            [
+                "Cargo.toml",
+                "crates/Cargo.toml",
+                "crates/core/Cargo.toml",
+                "crates/core/src/Cargo.toml",
+            ]
+        );
+        assert_eq!(rust_manifest_inputs(&[]), ["Cargo.toml"]);
+    }
 
     #[test]
     fn a_manifest_names_its_package_and_dependencies() {
