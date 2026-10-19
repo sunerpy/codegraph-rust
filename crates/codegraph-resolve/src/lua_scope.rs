@@ -119,6 +119,40 @@ pub struct LuaTables {
     nodes: Mutex<HashMap<String, Arc<Vec<Arc<Node>>>>>,
     /// What each call site's alias names.
     aliases: Mutex<AliasMemo>,
+    /// The project files each `require` path suffix names
+    /// ([`lua_require_matches`]).
+    require_matches: Mutex<HashMap<String, Arc<Vec<String>>>>,
+}
+
+/// The project files a Lua `require` path suffix names, `suffix` itself or
+/// one ending in `/suffix`, in the file list's order, read once per pass
+/// (W5-09): every `require` of a module reads the same list.
+pub(crate) fn lua_require_matches(
+    suffix: &str,
+    context: &dyn ResolutionContext,
+) -> Arc<Vec<String>> {
+    let tables = context.lua_tables();
+    if let Some(hit) = tables
+        .require_matches
+        .lock()
+        .ok()
+        .and_then(|memo| memo.get(suffix).cloned())
+    {
+        return hit;
+    }
+    let slash = format!("/{suffix}");
+    let matches = Arc::new(
+        context
+            .get_all_files_shared()
+            .iter()
+            .filter(|file| file.as_str() == suffix || file.ends_with(&slash))
+            .cloned()
+            .collect::<Vec<_>>(),
+    );
+    if let Ok(mut memo) = tables.require_matches.lock() {
+        memo.insert(suffix.to_string(), Arc::clone(&matches));
+    }
+    matches
 }
 
 /// `(file, line, name)` of a bare call → [`lua_alias_target`]'s answer, the

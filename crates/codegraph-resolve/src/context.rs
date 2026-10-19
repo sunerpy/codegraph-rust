@@ -1292,6 +1292,45 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// W5-09b: the files a Lua `require` suffix names come from one scan of
+    /// the file list per pass, the same files in the same order as scanning
+    /// for each `require`, kept apart per suffix.
+    #[test]
+    fn lua_require_matches_are_the_scan_of_each_suffix() {
+        let root = temp_root("lua-require");
+        let store = open_store(&root);
+        for path in [
+            "a/b.lua",
+            "lib/a/b.lua",
+            "a/b/init.lua",
+            "xa/b.lua",
+            "b.lua",
+            "a/b.luau",
+        ] {
+            store.upsert_file(&file_record(path, 0)).unwrap();
+        }
+        let ctx = StoreResolutionContext::new(&store, root.to_str().unwrap());
+        let files = ctx.get_all_files();
+        let scan = |suffix: &str| -> Vec<String> {
+            files
+                .iter()
+                .filter(|file| file.as_str() == suffix || file.ends_with(&format!("/{suffix}")))
+                .cloned()
+                .collect()
+        };
+        for round in 0..2 {
+            for suffix in ["a/b.lua", "b.lua", "a/b/init.lua", "a/b.luau", "c.lua"] {
+                assert_eq!(
+                    *crate::lua_scope::lua_require_matches(suffix, &ctx),
+                    scan(suffix),
+                    "{suffix}, round {round}"
+                );
+            }
+        }
+        assert_eq!(scan("a/b.lua"), ["a/b.lua", "lib/a/b.lua"]);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     /// W5-08: the store context answers a declaration's enclosing function
     /// from its per-file index exactly as the qualified-name lookup does,
     /// before and after the index is cached.

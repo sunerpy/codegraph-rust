@@ -3800,16 +3800,14 @@ pub(crate) fn resolve_lua_require(
         format!("{base}/init.lua"),
         format!("{base}/init.luau"),
     ];
-    let files = context.get_all_files_shared();
     let shared = |a: &str, b: &str| -> usize {
         a.bytes().zip(b.bytes()).take_while(|(x, y)| x == y).count()
     };
     for suffix in &suffixes {
-        let mut matches: Vec<String> = files
-            .iter()
-            .filter(|f| *f == suffix || f.ends_with(&format!("/{suffix}")))
-            .cloned()
-            .collect();
+        // The files the suffix names, read once per pass (W5-09).
+        let mut matches: Vec<String> = crate::lua_scope::lua_require_matches(suffix, context)
+            .as_ref()
+            .clone();
         if matches.is_empty() {
             continue;
         }
