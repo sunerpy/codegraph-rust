@@ -13,7 +13,7 @@ Provenance:
   `3878d5232057da036ed02ef152528a0806d75415` (`codegraph 0.54.0`), sha256
   `e576ec8c08cd37434204e46e51c52e58b163c0d23f6066f924aee8df58340f31`.
 - Command: `CODEGRAPH_NO_DAEMON=1 CODEGRAPH_NO_WATCH=1 codegraph init <copy of
-  crates/codegraph-bench/fixtures/mini>`, then `.codegraph/codegraph.db` copied
+crates/codegraph-bench/fixtures/mini>`, then `.codegraph/codegraph.db` copied
   here.
 - `codegraph.db` sha256:
   `70f708187bb53b86a7d07a606ef58f10171d9f6fa4fea658eb71c8d6410209a7`.
