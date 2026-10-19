@@ -2,7 +2,7 @@
 
 This is the AS-BUILT storage contract owned by `codegraph-store`.
 
-- Current schema version: **9**
+- Current schema version: **10**
 - Base DDL: `crates/codegraph-store/src/schema.rs`
 - Ordered migrations: `crates/codegraph-store/src/migrations.rs`
 - Connection and lease policy: `crates/codegraph-store/src/connection.rs`
@@ -18,7 +18,11 @@ A new database is configured before its first page is written, then receives the
 complete base schema. The base DDL inserts schema row `1`; initialization also
 records the current version with description `Initial schema includes all
 migrations`. Existing databases run every missing migration in ascending order,
-each in its own transaction.
+each in its own transaction, when a write-capable connection opens a current
+index (a sync, a mutation, a stale-sidecar recovery), under its exclusive lease
+and before its first write; a full rebuild starts a new database at the current
+schema instead. A read-only open never migrates, and nothing it runs reads
+`resolved_refs`.
 
 Migrations that add a column first inspect `PRAGMA table_info`. This makes replay
 safe when a newer base schema already contains the column while still failing
@@ -35,6 +39,7 @@ loudly if the table itself is absent.
 |       7 | Deduplicate edges and add their unique semantic identity index               |
 |       8 | `files.generated` plus the partial generated-file index                      |
 |       9 | `synthesis_inputs` plus the partial synthesized-edge site index              |
+|      10 | `resolved_refs`, the references resolution took out of `unresolved_refs`     |
 
 Schema version and extraction version are independent. A DDL change needs a
 schema migration; a change in graph meaning may need an extraction-version move
@@ -142,6 +147,21 @@ path classification where required.
 | `file_path`                        | TEXT not null default `''`        | source file context (migration 2)             |
 | `language`                         | TEXT not null default `unknown`   | source language (migration 2)                 |
 | `reference_subkind`                | TEXT nullable                     | structural/framework label (migration 6)      |
+
+### `resolved_refs`
+
+The columns of `unresolved_refs`, with `id` the row's id there (an INTEGER
+primary key, not autoincrement), `from_node_id` cascading with its node.
+
+Resolution moves each reference it takes out of `unresolved_refs` (the ones it
+resolves and the C++ internal-constructor references it accounts for) into this
+table, the whole row in the same transaction; an id listed twice moves once.
+Re-extracting a file deletes its rows from both tables, replacing a dependent's
+resolution state deletes them at the replaced sites or for the whole file, and
+a deleted source node cascades. So a file's rows in the two tables are every
+reference of its last extraction, the multiset at each site unchanged, which
+the `resolved_refs_version` marker below vouches for. Migration 10 creates the
+table empty and writes no marker.
 
 ### `synthesis_inputs`
 
@@ -424,6 +444,21 @@ persisted, and withdrawn with the others before a sync's first change. A sync
 that finds it missing or at another version re-resolves every Rust file. It is
 not a canonical surface.
 
+`resolved_refs_version` vouches that every file's rows in `unresolved_refs` and
+`resolved_refs` are what extracting it again gives. Its value is `1:` and the
+sha256 of the inputs that decide what an unchanged file's extraction yields:
+the extension overrides, `max_file_size`, the Godot DSL configuration, the
+extraction version and the `frameworks_detected` row. Only a full index (`init`,
+`index`, the rebuild of an outdated index) writes it, once resolution and
+framework finalization are persisted. A sync reads it before its first change,
+withdraws it with the other markers at that change, and writes it back once the
+sync is persisted only when it held at the start and the digest is the same at
+the end; a sync never creates it. While it holds, a sync re-resolves an
+unchanged dependent from the stored rows instead of extracting it, except
+`project.godot`, whose extraction reads other files. A schema-9 index migrated
+to 10, a sync that failed partway and an index whose inputs moved keep
+extracting dependents until the next full index. It is not a canonical surface.
+
 ## FTS5
 
 `nodes_fts` is an external-content FTS5 table over `nodes`:
@@ -461,7 +496,8 @@ The base schema creates:
   names `synthesizedBy`; `json_valid` guards keep malformed metadata out);
 - file indexes on language, modified time, and the partial `generated = 1` set;
 - unresolved-reference indexes on source node, name, file path, and
-  `(from_node_id, reference_name)`.
+  `(from_node_id, reference_name)`;
+- resolved-reference indexes on `(from_node_id, line, col)` and file path.
 
 The former `idx_edges_source` and `idx_edges_target` are intentionally absent:
 the composite indexes cover their left-prefix lookups and migration 4 removes

@@ -619,7 +619,14 @@ same lane each importer whose statement of it holds a binding the import did not
 resolve, parked or matched by its name (`W` of `import { Widget as W }` while
 the module declares no `Widget`), read before the module's old nodes go: the
 edit may give the module what the binding imports under another name, which no
-name lookup finds. Each mutation acquires the
+name lookup finds. A dependent a sync refreshes keeps its nodes and has its
+references read again: while the `resolved_refs_version` marker a full index
+wrote holds for the current extraction inputs, the ones stored for it (the rows
+resolution moved into `resolved_refs` and the ones still in `unresolved_refs`),
+only at the sites it refreshes unless the file goes whole, and otherwise, and
+always for `project.godot`, whose extraction reads other files, an in-memory
+extraction, run in parallel across the dependents. Every dependent's new
+resolution state is then written in one transaction. Each mutation acquires the
 store's short-lived `index.lock` writer authority; readers use corroborated state
 and shared leases. A separate persistent `writer.pid` file carries an OS kernel
 exclusive lock for the lifetime of the ONE process allowed to run watcher/catch-up

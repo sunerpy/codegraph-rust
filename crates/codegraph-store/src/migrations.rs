@@ -2,7 +2,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::schema::BASE_SCHEMA;
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 9;
+pub const CURRENT_SCHEMA_VERSION: i64 = 10;
 pub const FRESH_SCHEMA_DESCRIPTION: &str = "Initial schema includes all migrations";
 
 const MIGRATIONS: &[Migration] = &[
@@ -97,6 +97,31 @@ const MIGRATIONS: &[Migration] = &[
         CREATE TABLE IF NOT EXISTS synthesis_inputs (
           file_path TEXT PRIMARY KEY REFERENCES files(path) ON DELETE CASCADE
         );
+      "#,
+        adds_column: None,
+    },
+    Migration {
+        version: 10,
+        description: "Add resolved_refs, the references resolution took out of unresolved_refs",
+        // DDL only. The table starts empty and the sync that reads it checks
+        // the `resolved_refs_version` marker, which only a full index writes,
+        // so a migrated index keeps re-extracting dependents until then.
+        sql: r#"
+        CREATE TABLE IF NOT EXISTS resolved_refs (
+            id INTEGER PRIMARY KEY,
+            from_node_id TEXT NOT NULL,
+            reference_name TEXT NOT NULL,
+            reference_kind TEXT NOT NULL,
+            line INTEGER NOT NULL,
+            col INTEGER NOT NULL,
+            candidates TEXT, -- JSON array
+            file_path TEXT NOT NULL DEFAULT '',
+            language TEXT NOT NULL DEFAULT 'unknown',
+            reference_subkind TEXT,
+            FOREIGN KEY (from_node_id) REFERENCES nodes(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_resolved_refs_site ON resolved_refs(from_node_id, line, col);
+        CREATE INDEX IF NOT EXISTS idx_resolved_refs_file_path ON resolved_refs(file_path);
       "#,
         adds_column: None,
     },
@@ -349,6 +374,50 @@ mod tests {
             .unwrap()
             .is_some(),
             "migration 9 creates synthesis_inputs"
+        );
+        assert!(has_index(&conn, "idx_resolved_refs_site"));
+        assert!(has_index(&conn, "idx_resolved_refs_file_path"));
+    }
+
+    /// W5-09e: migration 10 only creates `resolved_refs` and its indexes
+    /// over a schema-9 database: its rows stay, the new table starts empty,
+    /// and no stored-references marker is written, so a sync keeps
+    /// extracting dependents until a full index.
+    #[test]
+    fn migration_v10_creates_an_empty_resolved_refs_and_writes_no_marker() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        ensure_schema_and_migrations(&mut conn).unwrap();
+        // Back to schema 9: without the v10 objects, recorded at 9.
+        conn.execute_batch(
+            "DROP TABLE resolved_refs;
+             INSERT INTO schema_versions (version, applied_at, description) VALUES (9, 0, 'v9');
+             INSERT INTO nodes (id, kind, name, qualified_name, file_path, language, start_line, end_line, start_column, end_column, updated_at)
+               VALUES ('function:a', 'function', 'a', 'a', 'a.ts', 'typescript', 1, 1, 0, 0, 0);
+             INSERT INTO unresolved_refs (from_node_id, reference_name, reference_kind, line, col, file_path, language)
+               VALUES ('function:a', 'b', 'calls', 1, 0, 'a.ts', 'typescript');
+             INSERT INTO project_metadata (key, value, updated_at) VALUES ('indexed_with_extraction_version', '22', 0);",
+        )
+        .unwrap();
+        conn.execute(
+            "DELETE FROM schema_versions WHERE version = ?",
+            [CURRENT_SCHEMA_VERSION],
+        )
+        .unwrap();
+        assert_eq!(get_current_version(&conn).unwrap(), 9);
+        assert!(!has_index(&conn, "idx_resolved_refs_site"));
+
+        ensure_schema_and_migrations(&mut conn).unwrap();
+
+        assert_eq!(get_current_version(&conn).unwrap(), CURRENT_SCHEMA_VERSION);
+        assert!(has_index(&conn, "idx_resolved_refs_site"));
+        assert!(has_index(&conn, "idx_resolved_refs_file_path"));
+        let count = |sql: &str| -> i64 { conn.query_row(sql, [], |row| row.get(0)).unwrap() };
+        assert_eq!(count("SELECT COUNT(*) FROM resolved_refs"), 0);
+        assert_eq!(count("SELECT COUNT(*) FROM unresolved_refs"), 1);
+        assert_eq!(
+            count("SELECT COUNT(*) FROM project_metadata WHERE key = 'resolved_refs_version'"),
+            0,
+            "the migration writes no marker"
         );
     }
 

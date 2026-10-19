@@ -6267,6 +6267,9 @@ fn index_project_inner(
         framework_finalize_started.elapsed(),
         json!({}),
     );
+    // Every reference is now in `unresolved_refs` or `resolved_refs`
+    // (W5-09e).
+    codegraph_watch::resolved_refs::write_marker(&store, &options, &framework_context)?;
     store.set_project_metadata("indexed_with_version", VERSION)?;
     codegraph_watch::record_followed_links(&store, &followed_links)?;
     if let Some(capture) = git_capture {

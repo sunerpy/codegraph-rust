@@ -136,6 +136,14 @@ pub trait FrameworkResolver: Sync {
         None
     }
 
+    /// Whether [`Self::extract`] of `file_path` reads files other than the one
+    /// it is handed, so its references can change while that file does not: a
+    /// sync re-extracts such a file rather than reusing its stored references
+    /// (W5-09e). Defaults to `false`.
+    fn extraction_reads_other_files(&self, _file_path: &str) -> bool {
+        false
+    }
+
     /// Cross-file finalization pass run once after all extraction completes
     /// (`postExtract?`, `types.ts:183-196`). Returns nodes with mutated fields
     /// (node `id` preserved) for the orchestrator to persist. `None` when the

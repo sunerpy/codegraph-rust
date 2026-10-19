@@ -1565,6 +1565,14 @@ impl ReferenceResolver {
         Ok(())
     }
 
+    /// Whether a framework resolver's extraction of `file_path` reads other
+    /// files ([`crate::framework::FrameworkResolver::extraction_reads_other_files`]).
+    pub fn framework_extraction_reads_other_files(&self, file_path: &str) -> bool {
+        self.framework_resolver_extensions
+            .iter()
+            .any(|resolver| resolver.extraction_reads_other_files(file_path))
+    }
+
     /// Collect detected framework nodes and refs without mutating the Store. This
     /// is the selective-sync seam for unchanged dependents: base and framework
     /// refs can be merged and filtered by complete source-site groups first.

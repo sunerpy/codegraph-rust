@@ -516,14 +516,25 @@ impl Store {
                 // write-capable SQLite open.
                 lease.validate_exclusive(paths)?;
                 let db_path = paths.current_db();
-                let conn = Connection::open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_WRITE)
-                    .map_err(|source| StoreError::Open {
-                        path: db_path.clone(),
-                        source,
-                    })?;
+                let mut conn =
+                    Connection::open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_WRITE)
+                        .map_err(|source| StoreError::Open {
+                            path: db_path.clone(),
+                            source,
+                        })?;
                 configure_connection(&conn).map_err(|source| StoreError::Configure {
                     path: db_path.clone(),
                     source,
+                })?;
+                // A Current index this binary did not build may be a schema
+                // behind (an extraction-version-22 index is schema 9 or later,
+                // so this is v10's DDL at most): migrate it under the same
+                // exclusive lease before the first write (W5-09e).
+                migrations::ensure_schema_and_migrations(&mut conn).map_err(|source| {
+                    StoreError::Migrate {
+                        path: db_path.clone(),
+                        source,
+                    }
                 })?;
                 Ok(StoreWriteOpen::Current(Box::new(Self {
                     conn,

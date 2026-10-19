@@ -22,6 +22,7 @@ pub mod objc_heads;
 pub mod php_heads;
 mod policy;
 pub mod r_bindings;
+pub mod resolved_refs;
 pub mod ruby_heads;
 pub mod rust_receivers;
 pub mod scala_surfaces;

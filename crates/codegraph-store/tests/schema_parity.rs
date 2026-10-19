@@ -118,6 +118,64 @@ fn old_v5_database_migrates_to_current_without_data_loss() {
 }
 
 #[test]
+fn v9_database_migrates_to_current_with_an_empty_resolved_refs() {
+    // Given the schema-9 database a release build of 3878d52 wrote for the
+    // mini corpus (crates/codegraph-cli/tests/fixtures/upgrade_schema_9/README.md),
+    let tempdir = TestDir::new();
+    let db_path = tempdir.path().join("codegraph.db");
+    std::fs::copy(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../codegraph-cli/tests/fixtures/upgrade_schema_9/codegraph.db"),
+        &db_path,
+    )
+    .unwrap();
+    let rows = |conn: &rusqlite::Connection| -> Vec<i64> {
+        [
+            "nodes",
+            "edges",
+            "unresolved_refs",
+            "files",
+            "project_metadata",
+        ]
+        .iter()
+        .map(|table| {
+            conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap()
+        })
+        .collect()
+    };
+    let before = {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        assert_eq!(
+            conn.query_row("SELECT MAX(version) FROM schema_versions", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            9
+        );
+        rows(&conn)
+    };
+
+    // When the new binary opens it,
+    let store = Store::open(&db_path).unwrap();
+
+    // Then migration 10 adds an empty `resolved_refs`, keeps every row and
+    // writes no stored-references marker.
+    assert_eq!(store.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
+    assert_eq!(rows(store.connection()), before);
+    let resolved: i64 = store
+        .connection()
+        .query_row("SELECT COUNT(*) FROM resolved_refs", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(resolved, 0);
+    assert_eq!(
+        store.get_project_metadata("resolved_refs_version").unwrap(),
+        None
+    );
+}
+
+#[test]
 fn v8_database_from_v0_54_migrates_to_current_with_synthesis_objects() {
     // Given the schema-8 database the released v0.54.0 binary wrote for the mini
     // corpus (crates/codegraph-cli/tests/fixtures/upgrade_v0_54/README.md),

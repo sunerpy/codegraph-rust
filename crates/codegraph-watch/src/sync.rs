@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 #[cfg(test)]
@@ -625,6 +625,11 @@ fn sync_paths_with_store(
     // three kinds is re-resolved once. Read here, before a change withdraws
     // the marker.
     let control_bootstrap = crate::control_inputs::needs_bootstrap(store)?;
+    // Whether an unchanged dependent's stored references stand in for its
+    // extraction this sync (W5-09e), read before a change withdraws the
+    // marker.
+    let stored_refs_marker =
+        crate::resolved_refs::valid_marker(store, &scope.options, &scope.framework)?;
 
     // A Shopify theme whose marker came or went reclassifies its JSON
     // templates and moves the references its Liquid files make (W4-LIQ-01):
@@ -1358,6 +1363,10 @@ fn sync_paths_with_store(
                 dependent_fallbacks.insert(importer);
             }
         }
+        #[cfg(test)]
+        if tests::FAIL_BEFORE_FRAMEWORK_REFS.with(std::cell::Cell::get) {
+            bail!("injected sync failure before the changed files' framework references");
+        }
         // Re-run framework per-file extract for reindexed files whose framework
         // nodes/refs were dropped on re-extraction (upstream tree-sitter.ts:4796-4819).
         if resolver.has_framework_resolvers() {
@@ -1378,6 +1387,7 @@ fn sync_paths_with_store(
             &dependent_fallbacks,
             &receiver_dependents,
             &reindexed,
+            stored_refs_marker.is_some(),
         )?;
         let mut scope_files = reindexed.clone();
         scope_files.extend(fallback_files);
@@ -1455,6 +1465,12 @@ fn sync_paths_with_store(
         crate::r_bindings::write_marker(store)?;
         crate::dart_heads::write_marker(store)?;
         crate::dart_libraries::write_marker(store)?;
+        crate::resolved_refs::restore_marker(
+            store,
+            &scope.options,
+            &scope.framework,
+            stored_refs_marker.as_deref(),
+        )?;
     }
 
     // Orphan sweep (#1187, upstream index.ts:645-682): a full-index resolution
@@ -1504,13 +1520,15 @@ pub(crate) fn changed_records(
 /// F's content is unchanged on disk, so F's nodes, `contains` edges, and incoming
 /// edges are already identical to a full index and must NOT be touched — deleting
 /// F's nodes would cascade away the edges INTO F and force the same recovery for
-/// F's own dependents (an unbounded closure on hub symbols). So F is extracted in
-/// memory only. Base and framework refs are merged, then every captured site is
-/// refreshed as one indivisible sibling group; unrelated edges and unresolved row
-/// ids stay untouched. A NULL historical edge coordinate or a captured site with
-/// no fresh ref upgrades that file to the correctness-first whole-file fallback,
-/// which still preserves nodes, `contains` edges, and incoming edges. The returned
-/// site lane plus fallback-file lane are resolved against the final graph.
+/// F's own dependents (an unbounded closure on hub symbols). So F's nodes stay
+/// and only its references are read again: the stored ones while the marker
+/// holds (W5-09e), otherwise an in-memory extraction merging base and framework
+/// refs. Every captured site is refreshed as one indivisible sibling group;
+/// unrelated edges and unresolved row ids stay untouched. A NULL historical edge
+/// coordinate or a captured site with no fresh ref upgrades that file to the
+/// correctness-first whole-file fallback, which still preserves nodes,
+/// `contains` edges, and incoming edges. The returned site lane plus
+/// fallback-file lane are resolved against the final graph.
 #[allow(clippy::too_many_arguments)]
 fn refresh_dependent_refs(
     project_root: &Path,
@@ -1521,6 +1539,7 @@ fn refresh_dependent_refs(
     fallback_files: &BTreeSet<String>,
     receiver_names: &BTreeMap<String, BTreeSet<String>>,
     already_reindexed: &HashSet<String>,
+    stored_refs: bool,
 ) -> Result<(BTreeSet<ReferenceSite>, HashSet<String>)> {
     let dependents = dependent_sites
         .keys()
@@ -1536,16 +1555,38 @@ fn refresh_dependent_refs(
         .filter(|relative| !already_reindexed.contains(relative))
         .filter(|relative| project_root.join(relative).exists())
         .collect::<Vec<_>>();
+    // An unchanged dependent's stored references are its last extraction's
+    // while the marker holds (W5-09e), unless a framework's extraction of it
+    // reads other files (`project.godot`); the rest are extracted.
+    let from_store =
+        |relative: &str| stored_refs && !resolver.framework_extraction_reads_other_files(relative);
     // Each dependent's extraction reads only its own file and the project
     // scope, so they run in parallel; the store is updated below in the
     // dependents' order, the first error in that order stopping it, as one
     // file after another did.
-    let extracted = dependents
-        .par_iter()
-        .map(|relative| extract_dependent_refs(project_root, relative, scope, resolver))
-        .collect::<Vec<_>>();
-    for (relative, refs) in dependents.into_iter().zip(extracted) {
-        let refs = refs?;
+    let mut extracted: HashMap<String, Result<Vec<codegraph_core::types::UnresolvedRef>>> =
+        dependents
+            .iter()
+            .filter(|relative| !from_store(relative))
+            .collect::<Vec<_>>()
+            .into_par_iter()
+            .map(|relative| {
+                let refs = extract_dependent_refs(project_root, relative, scope, resolver);
+                (relative.clone(), refs)
+            })
+            .collect();
+    for relative in dependents {
+        // A dependent refreshed at its sites alone reads the stored references
+        // there; one going whole, or read for its Rust receivers, all of them.
+        let site_only =
+            !fallback_files.contains(&relative) && !receiver_names.contains_key(&relative);
+        let (refs, scoped) = match extracted.remove(&relative) {
+            Some(refs) => (refs?, false),
+            None => match dependent_sites.get(&relative).filter(|_| site_only) {
+                Some(sites) => (store.stored_refs_at_sites(sites)?, true),
+                None => (store.stored_refs_of_file(&relative)?, false),
+            },
+        };
         let sites = dependent_sites.get(&relative);
         let needs_fallback = fallback_files.contains(&relative)
             || sites.is_some_and(|sites| {
@@ -1555,7 +1596,16 @@ fn refresh_dependent_refs(
                         .any(|reference| reference_matches_site(reference, site))
                 })
             });
+        #[cfg(test)]
+        tests::note_dependent_refresh(&relative, from_store(&relative), needs_fallback);
         if needs_fallback {
+            // A read scoped to the sites holds only theirs; the whole file
+            // goes back with every reference it has.
+            let refs = if scoped {
+                store.stored_refs_of_file(&relative)?
+            } else {
+                refs
+            };
             replacements.push(ResolutionReplacement::File {
                 file_path: relative.clone(),
                 refs,
@@ -2667,6 +2717,7 @@ impl ChangedNames {
             crate::r_bindings::withdraw_marker(store)?;
             crate::dart_heads::withdraw_marker(store)?;
             crate::dart_libraries::withdraw_marker(store)?;
+            crate::resolved_refs::withdraw_marker(store)?;
             self.surface_dirty = true;
         }
         Ok(())
@@ -2858,6 +2909,10 @@ fn node_names_in_file(store: &Store, relative: &str) -> Result<HashSet<String>> 
 }
 
 fn delete_unresolved_refs_by_file(store: &Store, relative: &str) -> rusqlite::Result<usize> {
+    // The references resolution kept go with the ones it did not (W5-09e).
+    store
+        .connection()
+        .execute("DELETE FROM resolved_refs WHERE file_path = ?", [relative])?;
     store.connection().execute(
         "DELETE FROM unresolved_refs WHERE file_path = ?",
         [relative],
@@ -2908,6 +2963,40 @@ pub(crate) mod tests {
         /// moved, before the per-path pass.
         pub(crate) static FAIL_AFTER_SHOPIFY_REFRESH: std::cell::Cell<bool> =
             const { std::cell::Cell::new(false) };
+        /// Fail the next sync once its changed files' base references are
+        /// written, before their framework references.
+        pub(crate) static FAIL_BEFORE_FRAMEWORK_REFS: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
+        /// How the syncs on this thread refreshed each dependent file.
+        static DEPENDENT_REFRESHES: std::cell::RefCell<Vec<DependentRefresh>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    /// One dependent file a sync refreshed: whether its references came
+    /// from the store (W5-09e) and whether it went whole.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(crate) struct DependentRefresh {
+        pub(crate) file: String,
+        pub(crate) stored: bool,
+        pub(crate) whole: bool,
+    }
+
+    pub(crate) fn note_dependent_refresh(file: &str, stored: bool, whole: bool) {
+        DEPENDENT_REFRESHES.with(|refreshes| {
+            refreshes.borrow_mut().push(DependentRefresh {
+                file: file.to_string(),
+                stored,
+                whole,
+            });
+        });
+    }
+
+    /// The dependent refreshes since the last call, sorted by file.
+    fn take_dependent_refreshes() -> Vec<DependentRefresh> {
+        let mut refreshes =
+            DEPENDENT_REFRESHES.with(|refreshes| std::mem::take(&mut *refreshes.borrow_mut()));
+        refreshes.sort_by(|a, b| a.file.cmp(&b.file));
+        refreshes
     }
 
     pub(crate) struct TestDir {
@@ -7207,6 +7296,469 @@ pub(crate) mod tests {
                 .any(|(path, record)| path == "src/gone.ts" && record.is_none()),
             "the removed file has no row"
         );
+    }
+
+    fn stored_refs_marker(db: &Path) -> Option<String> {
+        Store::open(db)
+            .unwrap()
+            .get_project_metadata(crate::resolved_refs::VERSION_KEY)
+            .unwrap()
+    }
+
+    /// `files` under a full index: a sync, then the rebuild an outdated
+    /// namespace escalates to, which writes the stored-references marker as
+    /// every full index does (W5-09e).
+    fn fully_indexed(name: &str, files: &[(&str, &str)]) -> (TestDir, PathBuf) {
+        let dir = TestDir::new(name);
+        write_files(dir.path(), files);
+        let db = default_db_path(dir.path()).unwrap();
+        sync_changed_paths(dir.path(), &db, files.iter().map(|(path, _)| *path)).unwrap();
+        assert_eq!(
+            stored_refs_marker(&db),
+            None,
+            "a sync never writes the marker"
+        );
+        stage_outdated(&dir);
+        sync_project_once(dir.path()).unwrap();
+        assert!(
+            stored_refs_marker(&db).is_some_and(|marker| marker.starts_with("1:")),
+            "a full index writes the marker"
+        );
+        (dir, db)
+    }
+
+    const STORED_LIB: (&str, &str) = (
+        "src/lib.ts",
+        "export function helper(): number {\n  return 1;\n}\n\nexport function other(): number {\n  return 2;\n}\n",
+    );
+    const STORED_LIB_SHIFTED: (&str, &str) = (
+        "src/lib.ts",
+        "// one line down\nexport function helper(): number {\n  return 1;\n}\n\nexport function other(): number {\n  return 2;\n}\n",
+    );
+    const STORED_A: (&str, &str) = (
+        "src/a.ts",
+        "import { helper } from './lib';\n\nexport function a(): number {\n  return helper();\n}\n",
+    );
+    const STORED_B: (&str, &str) = (
+        "src/b.ts",
+        "import { helper, other } from './lib';\n\nexport function b(): number {\n  return helper() + other();\n}\n",
+    );
+
+    fn refresh(file: &str, stored: bool, whole: bool) -> DependentRefresh {
+        DependentRefresh {
+            file: file.to_string(),
+            stored,
+            whole,
+        }
+    }
+
+    /// W5-09e: under the marker a full index wrote, the dependents of an
+    /// edited file are re-resolved from their stored references, site by
+    /// site, without being extracted; the graph is a fresh index's and the
+    /// marker is back once the sync is persisted.
+    #[test]
+    fn an_unchanged_dependent_is_re_resolved_from_its_stored_references() {
+        let (dir, db) = fully_indexed("stored-refs", &[STORED_LIB, STORED_A, STORED_B]);
+        let marker = stored_refs_marker(&db);
+        take_dependent_refreshes();
+
+        write_files(dir.path(), &[STORED_LIB_SHIFTED]);
+        sync_changed_paths(dir.path(), &db, ["src/lib.ts"]).unwrap();
+
+        assert_eq!(
+            take_dependent_refreshes(),
+            [
+                refresh("src/a.ts", true, false),
+                refresh("src/b.ts", true, false)
+            ]
+        );
+        assert_eq!(
+            edge_projection(&db),
+            fresh_edges(
+                "stored-refs-fresh",
+                &[STORED_LIB_SHIFTED, STORED_A, STORED_B]
+            )
+        );
+        assert_eq!(stored_refs_marker(&db), marker, "the marker is back");
+    }
+
+    /// W5-09e: with no marker, or one a full index did not write for these
+    /// inputs, a dependent is extracted as before, and the sync leaves the
+    /// marker away.
+    #[test]
+    fn without_a_valid_marker_a_dependent_is_extracted() {
+        let dir = TestDir::new("stored-refs-none");
+        write_files(dir.path(), &[STORED_LIB, STORED_A, STORED_B]);
+        let db = default_db_path(dir.path()).unwrap();
+        sync_changed_paths(dir.path(), &db, ["src/lib.ts", "src/a.ts", "src/b.ts"]).unwrap();
+        take_dependent_refreshes();
+
+        write_files(dir.path(), &[STORED_LIB_SHIFTED]);
+        sync_changed_paths(dir.path(), &db, ["src/lib.ts"]).unwrap();
+        assert_eq!(
+            take_dependent_refreshes(),
+            [
+                refresh("src/a.ts", false, false),
+                refresh("src/b.ts", false, false)
+            ]
+        );
+        assert_eq!(stored_refs_marker(&db), None);
+        assert_eq!(
+            edge_projection(&db),
+            fresh_edges(
+                "stored-refs-none-fresh",
+                &[STORED_LIB_SHIFTED, STORED_A, STORED_B]
+            )
+        );
+
+        Store::open(&db)
+            .unwrap()
+            .set_project_metadata(crate::resolved_refs::VERSION_KEY, "1:stale")
+            .unwrap();
+        write_files(dir.path(), &[STORED_LIB]);
+        sync_changed_paths(dir.path(), &db, ["src/lib.ts"]).unwrap();
+        assert_eq!(
+            take_dependent_refreshes(),
+            [
+                refresh("src/a.ts", false, false),
+                refresh("src/b.ts", false, false)
+            ]
+        );
+        assert_eq!(stored_refs_marker(&db), None, "a stale marker is dropped");
+    }
+
+    /// W5-09e: a captured site with no stored reference sends its file down
+    /// the whole-file lane, as a site the extraction cannot reproduce does.
+    #[test]
+    fn a_site_without_stored_references_takes_the_whole_file_lane() {
+        let (dir, db) = fully_indexed("stored-refs-site", &[STORED_LIB, STORED_A, STORED_B]);
+        let gone = Store::open(&db)
+            .unwrap()
+            .connection()
+            .execute(
+                "DELETE FROM resolved_refs WHERE file_path = 'src/a.ts' AND reference_name = 'helper' AND reference_kind = 'calls'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            gone, 1,
+            "the call of `helper` in a.ts was resolved and kept"
+        );
+        take_dependent_refreshes();
+
+        write_files(dir.path(), &[STORED_LIB_SHIFTED]);
+        sync_changed_paths(dir.path(), &db, ["src/lib.ts"]).unwrap();
+        assert_eq!(
+            take_dependent_refreshes(),
+            [
+                refresh("src/a.ts", true, true),
+                refresh("src/b.ts", true, false)
+            ]
+        );
+    }
+
+    const GODOT_PROJECT: (&str, &str) = (
+        "project.godot",
+        "config_version=5\n\n[application]\n\nconfig/name=\"Fixture\"\n\n[autoload]\n\nGameFlow=\"*res://game_flow.gd\"\n",
+    );
+    const GODOT_FLOW: (&str, &str) = (
+        "game_flow.gd",
+        "extends Node\n\nfunc return_to_map() -> void:\n\tpass\n",
+    );
+    const GODOT_FLOW_SHIFTED: (&str, &str) = (
+        "game_flow.gd",
+        "extends Node\n\n# one line down\nfunc return_to_map() -> void:\n\tpass\n",
+    );
+    const GODOT_STAGE: (&str, &str) = (
+        "stage.gd",
+        "extends Node\n\nfunc _goto_map() -> void:\n\tGameFlow.return_to_map()\n",
+    );
+    const GODOT_STAGE_EDITED: (&str, &str) = (
+        "stage.gd",
+        "extends Node\n\nfunc _goto_map() -> void:\n\tGameFlow.return_to_map()\n\tGameFlow.return_to_map()\n",
+    );
+    const GODOT_HUD: (&str, &str) = (
+        "hud.gd",
+        "extends Node\n\nfunc _show_map() -> void:\n\tGameFlow.return_to_map()\n",
+    );
+    const GODOT_SCENE: (&str, &str) = (
+        "main.tscn",
+        "[gd_scene load_steps=2 format=3]\n\n[ext_resource type=\"Script\" path=\"res://stage.gd\" id=\"1_stage\"]\n\n[node name=\"Main\" type=\"Node\"]\nscript = ExtResource(\"1_stage\")\n",
+    );
+
+    /// W5-09e: the marker digests the Godot DSL configuration a `.tres`
+    /// extraction reads, so a changed configuration leaves the dependents
+    /// to extraction and the marker away until the next full index.
+    #[test]
+    fn a_changed_godot_dsl_configuration_leaves_dependents_to_extraction() {
+        let files = [GODOT_PROJECT, GODOT_FLOW, GODOT_STAGE, GODOT_SCENE];
+        let (dir, db) = fully_indexed("stored-refs-dsl", &files);
+        fs::write(
+            index_paths(dir.path()).unwrap().extension_config(),
+            r#"{ "godot": { "dsl": { "resourceFields": ["skill_effect"] } } }"#,
+        )
+        .unwrap();
+        take_dependent_refreshes();
+
+        write_files(dir.path(), &[GODOT_FLOW_SHIFTED]);
+        sync_changed_paths(dir.path(), &db, ["game_flow.gd"]).unwrap();
+        assert_eq!(
+            take_dependent_refreshes(),
+            [refresh("stage.gd", false, false)]
+        );
+        assert_eq!(stored_refs_marker(&db), None);
+    }
+
+    /// W5-09e: a sync failing once a changed file's base references are
+    /// written and before its framework references are, with the file's new
+    /// hash already committed, leaves the marker away: later syncs extract
+    /// their dependents until a full index writes it again.
+    #[test]
+    fn a_sync_failing_before_framework_references_leaves_the_marker_away() {
+        let files = [
+            GODOT_PROJECT,
+            GODOT_FLOW,
+            GODOT_STAGE,
+            GODOT_HUD,
+            GODOT_SCENE,
+        ];
+        let (dir, db) = fully_indexed("stored-refs-fail", &files);
+
+        write_files(dir.path(), &[GODOT_STAGE_EDITED]);
+        FAIL_BEFORE_FRAMEWORK_REFS.with(|fail| fail.set(true));
+        let failed = sync_changed_paths(dir.path(), &db, ["stage.gd"]);
+        FAIL_BEFORE_FRAMEWORK_REFS.with(|fail| fail.set(false));
+        assert!(failed.is_err(), "the injected failure must stop the sync");
+        assert_eq!(stored_refs_marker(&db), None);
+
+        sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
+        assert_eq!(stored_refs_marker(&db), None, "nothing changed");
+        // `stage.gd` lost its framework references with the failure, and
+        // with them its edge into `game_flow.gd`; `hud.gd` kept both.
+        take_dependent_refreshes();
+        write_files(dir.path(), &[GODOT_FLOW_SHIFTED]);
+        sync_changed_paths(dir.path(), &db, ["game_flow.gd"]).unwrap();
+        assert_eq!(
+            take_dependent_refreshes(),
+            [refresh("hud.gd", false, false)]
+        );
+        assert_eq!(stored_refs_marker(&db), None);
+
+        stage_outdated(&dir);
+        sync_project_once(dir.path()).unwrap();
+        assert!(stored_refs_marker(&db).is_some(), "a full index writes it");
+    }
+
+    /// W5-09e: `project.godot`'s extraction maps `uid://` autoloads through
+    /// every `.gd.uid` and `.tscn`, so it is extracted even under the
+    /// marker. No resolution rule gives it an outgoing edge today, so no sync
+    /// reaches it as a dependent: the refresh is driven directly.
+    #[test]
+    fn project_godot_is_extracted_even_under_the_marker() {
+        let project = (
+            "project.godot",
+            "config_version=5\n\n[application]\n\nconfig/name=\"Fixture\"\n\n[autoload]\n\nGameFlow=\"*uid://gfscript\"\n",
+        );
+        let files = [
+            project,
+            GODOT_FLOW,
+            ("game_flow.gd.uid", "uid://gfscript\n"),
+            GODOT_STAGE,
+            GODOT_SCENE,
+        ];
+        let (dir, db) = fully_indexed("stored-refs-godot", &files);
+        let autoloads = |store: &Store| -> Vec<String> {
+            store
+                .stored_refs_of_file("project.godot")
+                .unwrap()
+                .into_iter()
+                .filter(|reference| {
+                    reference.reference_subkind
+                        == Some(codegraph_core::types::ReferenceSubkind::Autoload)
+                })
+                .map(|reference| reference.reference_name)
+                .collect()
+        };
+        let mut store = Store::open(&db).unwrap();
+        assert_eq!(autoloads(&store), ["game_flow.gd"]);
+
+        // The sidecar's uid moves; `project.godot` itself does not change.
+        write_files(dir.path(), &[("game_flow.gd.uid", "uid://other\n")]);
+        let paths = index_paths(dir.path()).unwrap();
+        let scope = ProjectScope::load(dir.path(), &paths).unwrap();
+        let mut resolver = ReferenceResolver::new(dir.path().to_string_lossy())
+            .with_max_file_size(scope.options.max_file_size);
+        {
+            let context = resolver.store_context(&store);
+            resolver.initialize(&context);
+        }
+        take_dependent_refreshes();
+        refresh_dependent_refs(
+            dir.path(),
+            &mut store,
+            &scope,
+            &resolver,
+            &BTreeMap::new(),
+            &BTreeSet::from(["project.godot".to_string(), "stage.gd".to_string()]),
+            &BTreeMap::new(),
+            &HashSet::new(),
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            take_dependent_refreshes(),
+            [
+                refresh("project.godot", false, true),
+                refresh("stage.gd", true, true)
+            ]
+        );
+        assert!(
+            autoloads(&store).is_empty(),
+            "the autoload the sidecar no longer names is gone"
+        );
+    }
+
+    /// W5-09e: a parked path reference of `project.godot` (its main scene,
+    /// before the scene exists) sends it down the whole-file lane once the
+    /// file it names comes, and it is extracted there even under the marker.
+    #[test]
+    fn project_godot_reached_through_a_parked_path_is_extracted() {
+        let project = (
+            "project.godot",
+            "config_version=5\n\n[application]\n\nconfig/name=\"Fixture\"\nrun/main_scene=\"res://scenes/main.tscn\"\n",
+        );
+        let (dir, db) = fully_indexed("stored-refs-godot-path", &[project, GODOT_FLOW]);
+        take_dependent_refreshes();
+
+        let scene = (
+            "scenes/main.tscn",
+            "[gd_scene format=3]\n\n[node name=\"Main\" type=\"Node\"]\n",
+        );
+        write_files(dir.path(), &[scene]);
+        sync_changed_paths(dir.path(), &db, ["scenes/main.tscn"]).unwrap();
+        assert_eq!(
+            take_dependent_refreshes(),
+            [refresh("project.godot", false, true)]
+        );
+        assert_eq!(
+            edge_projection(&db),
+            fresh_edges(
+                "stored-refs-godot-path-fresh",
+                &[project, GODOT_FLOW, scene]
+            )
+        );
+    }
+
+    /// W5-09e: under a full index, every file's stored references (its
+    /// unresolved and resolved rows) are what extracting it again yields,
+    /// row for row, across the languages and frameworks a sync reads.
+    #[test]
+    fn stored_references_are_each_files_extraction() {
+        let files: &[(&str, &str)] = &[
+            STORED_LIB,
+            STORED_A,
+            STORED_B,
+            (
+                "py/util.py",
+                "class Greeter:\n    def greet(self, name):\n        return name\n\n\ndef helper():\n    return Greeter().greet('x')\n",
+            ),
+            (
+                "py/main.py",
+                "from util import helper, Greeter\n\n\ndef main():\n    helper()\n    return Greeter().greet('y')\n",
+            ),
+            (
+                "cs/Lib.cs",
+                "namespace App\n{\n    public enum Mode { A, B }\n\n    public static class Util\n    {\n        public static int Helper() => 1;\n    }\n}\n",
+            ),
+            (
+                "cs/Use.cs",
+                "using App;\n\nnamespace App.Use\n{\n    public class Runner\n    {\n        public Mode Mode = Mode.A;\n\n        public int Run() => Util.Helper();\n    }\n}\n",
+            ),
+            (
+                "rs/lib.rs",
+                "mod util;\n\nuse util::helper;\n\npub struct S;\n\nimpl S {\n    pub fn run(&self) -> u32 {\n        helper()\n    }\n}\n",
+            ),
+            ("rs/util.rs", "pub fn helper() -> u32 {\n    1\n}\n"),
+            (
+                "go/main.go",
+                "package main\n\nfunc main() {\n\thelper()\n}\n",
+            ),
+            (
+                "go/util.go",
+                "package main\n\nfunc helper() int {\n\treturn 1\n}\n",
+            ),
+            (
+                "java/App.java",
+                "package app;\n\npublic class App {\n    public int run() {\n        return new Util().help();\n    }\n}\n",
+            ),
+            (
+                "java/Util.java",
+                "package app;\n\npublic class Util {\n    public int help() {\n        return 1;\n    }\n}\n",
+            ),
+            ("lua/main.lua", "local m = require('mod')\n\nreturn m.f()\n"),
+            (
+                "lua/mod.lua",
+                "local M = {}\n\nfunction M.f()\n  return 1\nend\n\nreturn M\n",
+            ),
+            (
+                "cpp/greeter.h",
+                "class Greeter {\npublic:\n    Greeter();\n    void greet();\n};\n",
+            ),
+            (
+                "cpp/main.cpp",
+                "#include \"greeter.h\"\n\nint main() {\n    Greeter g;\n    g.greet();\n    Greeter* p = new Greeter();\n    p->greet();\n    return 0;\n}\n",
+            ),
+            (
+                "php/A.php",
+                "<?php\nnamespace App;\n\nclass A\n{\n    public function make(): B\n    {\n        return new B();\n    }\n}\n",
+            ),
+            ("php/B.php", "<?php\nnamespace App;\n\nclass B\n{\n}\n"),
+            GODOT_PROJECT,
+            GODOT_FLOW,
+            GODOT_STAGE,
+            GODOT_SCENE,
+        ];
+        let (dir, db) = fully_indexed("stored-refs-equal", files);
+        let store = Store::open(&db).unwrap();
+        let count = |table: &str| -> i64 {
+            store
+                .connection()
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap()
+        };
+        assert!(count("resolved_refs") > 0 && count("unresolved_refs") > 0);
+
+        let paths = index_paths(dir.path()).unwrap();
+        let scope = ProjectScope::load(dir.path(), &paths).unwrap();
+        let mut resolver = ReferenceResolver::new(dir.path().to_string_lossy())
+            .with_max_file_size(scope.options.max_file_size);
+        {
+            let context = resolver.store_context(&store);
+            resolver.initialize(&context);
+        }
+        let rows = |refs: Vec<codegraph_core::types::UnresolvedRef>| -> Vec<String> {
+            let mut rows = refs
+                .iter()
+                .map(|reference| serde_json::to_string(reference).unwrap())
+                .collect::<Vec<_>>();
+            rows.sort();
+            rows
+        };
+        let mut compared = 0;
+        for file in store.all_files().unwrap() {
+            let extracted =
+                extract_dependent_refs(dir.path(), &file.path, &scope, &resolver).unwrap();
+            assert_eq!(
+                rows(store.stored_refs_of_file(&file.path).unwrap()),
+                rows(extracted),
+                "{}",
+                file.path
+            );
+            compared += 1;
+        }
+        assert_eq!(compared, files.len());
     }
 
     #[test]

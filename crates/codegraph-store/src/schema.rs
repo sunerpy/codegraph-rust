@@ -174,6 +174,26 @@ CREATE TABLE IF NOT EXISTS synthesis_inputs (
     file_path TEXT PRIMARY KEY REFERENCES files(path) ON DELETE CASCADE
 );
 
+-- The references a resolution pass took out of unresolved_refs, each whole
+-- row with the id it had there (schema 10). With the rows still unresolved
+-- they are every reference of a file's last extraction, so a sync re-resolves
+-- an unchanged dependent's sites from them instead of re-extracting the file.
+CREATE TABLE IF NOT EXISTS resolved_refs (
+    id INTEGER PRIMARY KEY,
+    from_node_id TEXT NOT NULL,
+    reference_name TEXT NOT NULL,
+    reference_kind TEXT NOT NULL,
+    line INTEGER NOT NULL,
+    col INTEGER NOT NULL,
+    candidates TEXT, -- JSON array
+    file_path TEXT NOT NULL DEFAULT '',
+    language TEXT NOT NULL DEFAULT 'unknown',
+    reference_subkind TEXT,
+    FOREIGN KEY (from_node_id) REFERENCES nodes(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_resolved_refs_site ON resolved_refs(from_node_id, line, col);
+CREATE INDEX IF NOT EXISTS idx_resolved_refs_file_path ON resolved_refs(file_path);
+
 -- Project metadata for version/provenance tracking
 CREATE TABLE IF NOT EXISTS project_metadata (
     key TEXT PRIMARY KEY,

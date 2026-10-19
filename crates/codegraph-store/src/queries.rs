@@ -1001,18 +1001,76 @@ impl Store {
     /// Keying on the row id removes that whole class of loss, and with it the need
     /// for any `id <= max_id` batch guard: an id from batch N cannot name a row in
     /// batch N+1, so a per-batch caller is already precise.
+    ///
+    /// Each row moves whole into `resolved_refs`, keeping its id (schema 10,
+    /// W5-09e): with the rows still unresolved, they stay every reference of
+    /// the file's last extraction. An id listed twice moves once.
     pub fn delete_resolved_unresolved_refs(&mut self, row_ids: &[i64]) -> rusqlite::Result<()> {
         if row_ids.is_empty() {
             return Ok(());
         }
         let tx = self.conn.transaction()?;
         {
+            let mut keep = tx.prepare_cached(&format!(
+                "INSERT OR IGNORE INTO resolved_refs ({UNRESOLVED_REF_COLUMNS}) \
+                 SELECT {UNRESOLVED_REF_COLUMNS} FROM unresolved_refs WHERE id = ?1"
+            ))?;
             let mut stmt = tx.prepare_cached("DELETE FROM unresolved_refs WHERE id = ?")?;
             for row_id in row_ids {
+                keep.execute(params![row_id])?;
                 stmt.execute(params![row_id])?;
             }
         }
         tx.commit()
+    }
+
+    /// [`Self::stored_refs_of_file`] at `sites` only: every stored reference
+    /// whose source and coordinate are one of them, by id and without it.
+    pub fn stored_refs_at_sites(
+        &self,
+        sites: &BTreeSet<ReferenceSite>,
+    ) -> rusqlite::Result<Vec<UnresolvedRef>> {
+        let mut stmt = self.conn.prepare_cached(&format!(
+            "SELECT {UNRESOLVED_REF_COLUMNS} FROM unresolved_refs \
+             WHERE from_node_id = ?1 AND line = ?2 AND col = ?3 \
+             UNION ALL SELECT {UNRESOLVED_REF_COLUMNS} FROM resolved_refs \
+             WHERE from_node_id = ?1 AND line = ?2 AND col = ?3"
+        ))?;
+        let mut out = Vec::new();
+        for site in sites {
+            for reference in stmt.query_map(
+                params![site.from_node_id, site.line, site.col],
+                row_to_unresolved_ref,
+            )? {
+                out.push(reference?);
+            }
+        }
+        out.sort_by_key(|reference| reference.id);
+        for reference in &mut out {
+            reference.id = None;
+        }
+        Ok(out)
+    }
+
+    /// Every reference of `file_path`'s last extraction, the rows resolution
+    /// moved into `resolved_refs` and the ones still in `unresolved_refs`, by
+    /// id and without it (W5-09e): what re-extracting the unchanged file would
+    /// give, as each site's multiset of references. Only valid while the
+    /// `resolved_refs_version` marker is.
+    pub fn stored_refs_of_file(&self, file_path: &str) -> rusqlite::Result<Vec<UnresolvedRef>> {
+        let mut stmt = self.conn.prepare_cached(&format!(
+            "SELECT {UNRESOLVED_REF_COLUMNS} FROM unresolved_refs WHERE file_path = ?1 \
+             UNION ALL SELECT {UNRESOLVED_REF_COLUMNS} FROM resolved_refs WHERE file_path = ?1 \
+             ORDER BY id"
+        ))?;
+        let rows = stmt.query_map([file_path], row_to_unresolved_ref)?;
+        rows.map(|row| {
+            row.map(|mut reference| {
+                reference.id = None;
+                reference
+            })
+        })
+        .collect()
     }
 
     /// Ports `getUnresolvedReferencesByFiles` from `upstream db/queries.ts:1663-1694`.
@@ -2760,6 +2818,10 @@ fn edge_kind_of(raw_kind: &str) -> rusqlite::Result<EdgeKind> {
     edge_kind_named(raw_kind).ok_or_else(|| enum_error(raw_kind.to_string(), "edge kind"))
 }
 
+/// The columns `unresolved_refs` and `resolved_refs` share, in table order.
+const UNRESOLVED_REF_COLUMNS: &str = "id, from_node_id, reference_name, reference_kind, line, col, \
+     candidates, file_path, language, reference_subkind";
+
 pub(crate) fn row_to_unresolved_ref(row: &Row<'_>) -> rusqlite::Result<UnresolvedRef> {
     let raw_kind = row.get::<_, String>("reference_kind")?;
     let is_function_ref = raw_kind == "function_ref";
@@ -2995,7 +3057,7 @@ fn existing_node_ids(
 /// [`Store::replace_resolution_states`].
 #[derive(Debug, Clone)]
 pub enum ResolutionReplacement {
-    /// Every resolution edge and unresolved reference of the file, by these
+    /// Every resolution edge and stored reference of the file, by these
     /// references ([`Store::replace_resolution_state_from_file`]).
     File {
         file_path: String,
@@ -3032,6 +3094,10 @@ fn replace_file_resolution_in(
         "DELETE FROM unresolved_refs WHERE file_path = ?1",
         [file_path],
     )?;
+    tx.execute(
+        "DELETE FROM resolved_refs WHERE file_path = ?1",
+        [file_path],
+    )?;
     insert_unresolved_refs_in_connection(tx, refs)?;
     Ok(removed)
 }
@@ -3057,10 +3123,15 @@ fn replace_site_resolution_in(
             r#"DELETE FROM unresolved_refs
                 WHERE from_node_id = ?1 AND line = ?2 AND col = ?3"#,
         )?;
+        let mut delete_resolved = tx.prepare_cached(
+            r#"DELETE FROM resolved_refs
+                WHERE from_node_id = ?1 AND line = ?2 AND col = ?3"#,
+        )?;
         for site in unique {
             removed +=
                 delete_edges.execute(params![site.from_node_id.as_str(), site.line, site.col])?;
             delete_refs.execute(params![site.from_node_id.as_str(), site.line, site.col])?;
+            delete_resolved.execute(params![site.from_node_id.as_str(), site.line, site.col])?;
         }
     }
     insert_unresolved_refs_in_connection(tx, refs)?;
@@ -4368,10 +4439,110 @@ mod tests {
         assert_eq!(qualified, ["F\\FirstName.make"]);
     }
 
+    /// W5-09e: a reference resolution takes out of `unresolved_refs` moves
+    /// whole into `resolved_refs`, keeping its id, once even when listed
+    /// twice; with the rows still unresolved they are every reference of the
+    /// file, which the stored reads return by id and without it, per file or
+    /// per site.
+    #[test]
+    fn resolved_references_move_whole_and_read_back_as_extracted() {
+        let mut store = store("resolved-refs-move");
+        store
+            .upsert_nodes(&[
+                node("function:a", "a", "a.ts"),
+                node("function:b", "b", "b.ts"),
+            ])
+            .unwrap();
+        let mk = |from: &str, name: &str, line: i64, file: &str| UnresolvedRef {
+            id: None,
+            from_node_id: from.to_string(),
+            reference_name: name.to_string(),
+            reference_kind: EdgeKind::Calls,
+            line,
+            col: 2,
+            candidates: Some(vec!["x".to_string()]),
+            file_path: file.to_string(),
+            language: Language::TypeScript,
+            is_function_ref: false,
+            reference_subkind: None,
+        };
+        let written = vec![
+            mk("function:a", "one", 1, "a.ts"),
+            mk("function:a", "two", 2, "a.ts"),
+            mk("function:a", "two", 2, "a.ts"),
+            mk("function:a", "three", 3, "a.ts"),
+            mk("function:b", "other", 1, "b.ts"),
+        ];
+        store.insert_unresolved_refs(&written).unwrap();
+        let ids: Vec<i64> = store
+            .unresolved_refs_by_file_path("a.ts")
+            .unwrap()
+            .into_iter()
+            .map(|reference| reference.id.unwrap())
+            .collect();
+        // The first `two` and `three` resolve; `three` is listed twice.
+        store
+            .delete_resolved_unresolved_refs(&[ids[1], ids[3], ids[3]])
+            .unwrap();
+        let moved: Vec<(i64, String)> = store
+            .connection()
+            .prepare("SELECT id, reference_name FROM resolved_refs ORDER BY id")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            moved,
+            [(ids[1], "two".to_string()), (ids[3], "three".to_string())]
+        );
+        let back = store.stored_refs_of_file("a.ts").unwrap();
+        let expected: Vec<UnresolvedRef> = written[..4].to_vec();
+        assert_eq!(back, expected, "every reference, by id, without it");
+        let site = |from: &str, line: i64| ReferenceSite {
+            from_node_id: from.to_string(),
+            line,
+            col: 2,
+        };
+        let at_sites = store
+            .stored_refs_at_sites(&BTreeSet::from([site("function:a", 2)]))
+            .unwrap();
+        assert_eq!(at_sites, written[1..3].to_vec(), "the site's multiset");
+
+        // A site replacement and a whole-file replacement clear the stored
+        // references they replace; deleting a file's node cascades.
+        store
+            .replace_resolution_state_at_sites(&[site("function:a", 2)], &[])
+            .unwrap();
+        assert_eq!(
+            store.stored_refs_of_file("a.ts").unwrap(),
+            vec![written[0].clone(), written[3].clone()]
+        );
+        store
+            .replace_resolution_state_from_file("a.ts", &written[..1])
+            .unwrap();
+        assert_eq!(
+            store.stored_refs_of_file("a.ts").unwrap(),
+            written[..1].to_vec()
+        );
+        let b_ids: Vec<i64> = store
+            .unresolved_refs_by_file_path("b.ts")
+            .unwrap()
+            .into_iter()
+            .map(|reference| reference.id.unwrap())
+            .collect();
+        store.delete_resolved_unresolved_refs(&b_ids).unwrap();
+        store
+            .connection()
+            .execute("DELETE FROM nodes WHERE id = 'function:b'", [])
+            .unwrap();
+        assert!(store.stored_refs_of_file("b.ts").unwrap().is_empty());
+    }
+
     /// W5-09a: the replacements of a sync's dependents applied in one
     /// transaction leave what applying them one by one does, each of them
-    /// replacing what it covers: the references and resolution edges at a
-    /// site, and of a whole file.
+    /// replacing what it covers: the stored references (resolved ones too)
+    /// and resolution edges at a site, and of a whole file.
     #[test]
     fn batched_resolution_replacements_match_one_by_one() {
         let mk = |from: &str, name: &str, line: i64, file: &str| UnresolvedRef {
@@ -4404,7 +4575,7 @@ mod tests {
                 ])
                 .unwrap();
             // `t` resolves at both sites: its edges are written and its rows
-            // leave `unresolved_refs`.
+            // move into `resolved_refs`.
             let resolved: Vec<i64> = ["a.ts", "b.ts"]
                 .into_iter()
                 .flat_map(|file| store.unresolved_refs_by_file_path(file).unwrap())
@@ -4447,19 +4618,16 @@ mod tests {
                 },
             ])
             .unwrap();
-        let refs_of = |store: &Store, file: &str| -> Vec<UnresolvedRef> {
-            let mut refs = store.unresolved_refs_by_file_path(file).unwrap();
-            for reference in &mut refs {
-                reference.id = None;
-            }
-            refs
-        };
         let state = |store: &Store| {
             let edges: i64 = store
                 .connection()
                 .query_row("SELECT COUNT(*) FROM edges", [], |row| row.get(0))
                 .unwrap();
-            (refs_of(store, "a.ts"), refs_of(store, "b.ts"), edges)
+            (
+                store.stored_refs_of_file("a.ts").unwrap(),
+                store.stored_refs_of_file("b.ts").unwrap(),
+                edges,
+            )
         };
         assert_eq!(state(&batched), state(&one));
         assert_eq!(

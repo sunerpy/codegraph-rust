@@ -201,6 +201,12 @@ impl FrameworkResolver for GodotResolver {
         false
     }
 
+    /// `project.godot`'s autoloads name scripts by `uid://`, which it maps
+    /// through every `.tscn` and `.gd.uid` file of the project.
+    fn extraction_reads_other_files(&self, file_path: &str) -> bool {
+        godot_project::is_project_godot(file_path)
+    }
+
     /// Per-file Godot parsing dispatch.
     ///
     /// L1 (T3): when the file's basename is `project.godot`, delegate to

@@ -331,6 +331,8 @@ pub(crate) fn migrate_project(
     }
     resolver.resolve_and_persist_batched(rebuild.store_mut(), RESOLVE_BATCH_ROWS)?;
     resolver.run_post_extract(rebuild.store_mut())?;
+    // Every reference is now in `unresolved_refs` or `resolved_refs` (W5-09e).
+    crate::resolved_refs::write_marker(rebuild.store(), options, &scope.framework)?;
     rebuild
         .store()
         .set_project_metadata(INDEXED_WITH_VERSION_KEY, env!("CARGO_PKG_VERSION"))?;
