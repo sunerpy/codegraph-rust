@@ -1257,6 +1257,17 @@ Timeout/debounce values outside their clamp range are silently clamped to the
 nearest bound. `CODEGRAPH_WAL_VALVE_MB` instead falls back to `256` when it is
 empty, non-numeric, zero, or too large to convert safely to bytes.
 
+### Color and progress output
+
+codegraph's own output has no color: every command prints plain text whether
+stdout is a terminal or a pipe, so `NO_COLOR`, `FORCE_COLOR` and `CI` change
+nothing in it. `init`, `index` and `sync` draw a progress bar only on a terminal
+stderr; piped, they print plain lines (`Scanning files…` on stderr, the summary
+on stdout) with no carriage-return rewrites. The help and error text clap prints
+is colored on a color terminal (not `TERM=dumb`) or under `CLICOLOR_FORCE`, and
+`NO_COLOR` turns that off too. Upstream's `--color` and `--no-color` are not
+flags here: passing either is an argument error.
+
 ### Custom extension mapping (`.codegraph/codegraph.json`)
 
 Place a `codegraph.json` inside the `.codegraph/` directory of any project to
