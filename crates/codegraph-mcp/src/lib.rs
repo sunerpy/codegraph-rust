@@ -29,8 +29,8 @@ pub use project_services::{
     ProjectServiceStarter,
 };
 pub use rmcp_handler::{
-    serve_http, serve_http_with_project_services, serve_stdio_rmcp,
-    serve_stdio_rmcp_with_project_services,
+    negotiated_initialize_version, request_declares_protocol_version, serve_http,
+    serve_http_with_project_services, serve_stdio_rmcp, serve_stdio_rmcp_with_project_services,
 };
 pub use roots::{ServerRootResolution, resolve_server_root};
-pub use server::{McpServer, RunUntilAdoption, initialize_result};
+pub use server::{McpServer, RunUntilAdoption, initialize_result, initialize_result_for};

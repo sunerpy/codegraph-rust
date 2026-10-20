@@ -477,6 +477,17 @@ process per project. Multiple agent clients (e.g. Claude Code + Cursor open
 simultaneously) all attach to the same daemon, so the index is loaded and
 maintained once.
 
+A session that attaches to a running daemon is a proxy, and it answers as a
+direct server would. It answers `initialize` itself, at once, with the
+`protocolVersion` the direct server negotiates (the requested version when it
+has an `initialize` handshake, 2024-11-05 for 2026-07-28 or an unknown one), and
+also forwards it to prime the daemon. A `tools/list` after that `initialize`
+that names no protocol version in its `_meta` is answered by the proxy too. A
+2026-07-28 session opens with `server/discover` instead and names its version
+in every request's `_meta`; the proxy forwards its `tools/list`, like every
+other request, and the daemon's handler answers it with
+`resultType: "complete"`.
+
 The daemon runs a file watcher (`codegraph-watch`) that live-reindexes changed
 files. Events are debounced (default ~2 s; tunable via
 `CODEGRAPH_WATCH_DEBOUNCE_MS`) so a burst of saves triggers one incremental

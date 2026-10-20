@@ -28,7 +28,8 @@ use rmcp::handler::server::ServerHandler;
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ErrorData,
     Implementation, InitializeResult, JsonObject, ListToolsResult, MetaObject,
-    PaginatedRequestParams, ProtocolVersion, ServerCapabilities, ServerConfig, Tool,
+    PaginatedRequestParams, ProtocolVersion, RequestMetaObject, ServerCapabilities, ServerConfig,
+    Tool,
 };
 use rmcp::service::{NotificationContext, RequestContext, RoleServer};
 use serde_json::{Value, json};
@@ -428,6 +429,40 @@ fn execute_owned(project_path: &Path, tool_name: &str, args: &Value) -> ToolResu
     engine.execute(tool_name, args)
 }
 
+/// The `protocolVersion` [`CodeGraphHandler::get_info`] offers, which rmcp's
+/// `initialize` negotiation falls back to when it cannot echo the request.
+const FALLBACK_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::V_2024_11_05;
+
+/// The `protocolVersion` an `initialize` asking for `requested` negotiates with
+/// [`CodeGraphHandler`], by the rule rmcp applies to it (the handler supports
+/// every version rmcp knows): a known version that still has an `initialize`
+/// handshake is echoed; 2026-07-28, which has none, an unknown version, or none
+/// at all gets [`FALLBACK_PROTOCOL_VERSION`]. The daemon proxy answers a host's
+/// `initialize` with this, so a proxied session negotiates what a direct one
+/// does.
+pub fn negotiated_initialize_version(requested: Option<&str>) -> String {
+    ProtocolVersion::KNOWN_VERSIONS
+        .iter()
+        .find(|known| Some(known.as_str()) == requested && known.has_initialize())
+        .unwrap_or(&FALLBACK_PROTOCOL_VERSION)
+        .as_str()
+        .to_string()
+}
+
+/// Whether a JSON-RPC request names a protocol version in its `_meta`
+/// (`io.modelcontextprotocol/protocolVersion`), as every request of the
+/// 2026-07-28 lifecycle does. rmcp then serves it by the per-request lifecycle
+/// rules (a 2026-07-28 result carries `resultType`), which only the handler
+/// applies. Read the way rmcp reads it: a value that is not a version string
+/// names none.
+pub fn request_declares_protocol_version(request: &Value) -> bool {
+    request
+        .get("params")
+        .and_then(|params| params.get("_meta"))
+        .and_then(|meta| serde_json::from_value::<RequestMetaObject>(meta.clone()).ok())
+        .is_some_and(|meta| meta.protocol_version().is_some())
+}
+
 impl ServerHandler for CodeGraphHandler {
     fn get_info(&self) -> ServerConfig {
         // capabilities = exactly {"tools":{}} (enable_tools, NO list_changed);
@@ -437,7 +472,7 @@ impl ServerHandler for CodeGraphHandler {
         // — so an `initialize` asking for it gets this fallback too.
         // serverInfo{name,version=crate}; instructions reused verbatim.
         InitializeResult::new(ServerCapabilities::builder().enable_tools().build())
-            .with_protocol_version(ProtocolVersion::V_2024_11_05)
+            .with_protocol_version(FALLBACK_PROTOCOL_VERSION)
             .with_server_info(Implementation::new(SERVER_NAME, SERVER_VERSION))
             .with_instructions(server_instructions())
     }
@@ -1524,4 +1559,72 @@ mod handler_tests {
     }
 
     static TIMEOUT_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+    use rmcp::model::{ClientCapabilities, InitializeRequestParams};
+
+    /// The version rule the daemon proxy answers `initialize` with is the one
+    /// rmcp's own negotiation applies to this handler, case for case.
+    #[test]
+    fn the_negotiated_initialize_version_is_what_rmcp_negotiates_for_the_handler() {
+        let handler = CodeGraphHandler::new(None);
+        for requested in [
+            "2024-11-05",
+            "2025-03-26",
+            "2025-06-18",
+            "2025-11-25",
+            "2026-07-28",
+            "1999-01-01",
+            "2027-01-01",
+        ] {
+            let params = InitializeRequestParams::new(
+                ClientCapabilities::default(),
+                Implementation::new("probe", "0"),
+            )
+            .with_protocol_version(serde_json::from_value(json!(requested)).unwrap());
+            let negotiated = handler
+                .negotiate_initialize(&params)
+                .expect("the handler negotiates every request")
+                .protocol_version;
+            assert_eq!(
+                negotiated_initialize_version(Some(requested)),
+                negotiated.as_str(),
+                "{requested}"
+            );
+        }
+        assert_eq!(
+            negotiated_initialize_version(Some("2025-06-18")),
+            "2025-06-18"
+        );
+        assert_eq!(
+            negotiated_initialize_version(Some("2026-07-28")),
+            "2024-11-05"
+        );
+        assert_eq!(negotiated_initialize_version(None), "2024-11-05");
+    }
+
+    #[test]
+    fn a_request_declares_a_protocol_version_only_with_one_in_its_meta() {
+        let with = |meta: Value| json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {"_meta": meta}});
+        assert!(request_declares_protocol_version(&with(json!({
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientCapabilities": {}
+        }))));
+        assert!(request_declares_protocol_version(&with(json!({
+            "io.modelcontextprotocol/protocolVersion": "2025-06-18"
+        }))));
+        assert!(!request_declares_protocol_version(&with(
+            json!({"progressToken": 1})
+        )));
+        // rmcp reads a value that is not a version string as no version.
+        assert!(!request_declares_protocol_version(&with(json!({
+            "io.modelcontextprotocol/protocolVersion": 123
+        }))));
+        assert!(!request_declares_protocol_version(
+            &json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+        ));
+    }
 }

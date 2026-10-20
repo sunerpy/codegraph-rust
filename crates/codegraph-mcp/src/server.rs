@@ -715,6 +715,18 @@ fn json_response(response: JsonRpcResponse) -> Value {
     }
 }
 
+/// [`initialize_result`] with the `protocolVersion` an `initialize` asking for
+/// `requested` negotiates with the rmcp handler
+/// ([`crate::rmcp_handler::negotiated_initialize_version`]): the answer the
+/// daemon proxy gives a host on the direct server's behalf.
+pub fn initialize_result_for(requested: Option<&str>) -> Value {
+    let mut result = initialize_result();
+    result["protocolVersion"] = json!(crate::rmcp_handler::negotiated_initialize_version(
+        requested
+    ));
+    result
+}
+
 /// The `initialize` result (`session.ts:182-187`).
 pub fn initialize_result() -> Value {
     // NB: `roots` is a CLIENT capability (MCP spec) — never declared here.
