@@ -287,8 +287,24 @@ pub fn resolve_named_tokens(
     opts: &NamedSymbolFlowOptions,
 ) -> rusqlite::Result<NamedSymbolFlow> {
     let directed = opts.mode == FlowMode::Directed;
+    // A directed question names its two ends exactly, as the viewer's links
+    // write a symbol's own name: an Objective-C selector (`initWithFrame:`), a
+    // Ruby predicate (`valid?`), a two-letter method (`ok`, Go's `Do`). The
+    // free-text filter is for a bag of words and dropped each of those,
+    // leaving the other end reported as naming nothing (upstream #2262).
+    let tokens = match (opts.from.as_deref(), opts.to.as_deref()) {
+        (Some(from), Some(to)) if directed && !from.is_empty() && !to.is_empty() => {
+            let mut tokens = vec![normalize_token(from)];
+            let to = normalize_token(to);
+            if !tokens.contains(&to) {
+                tokens.push(to);
+            }
+            tokens
+        }
+        _ => flow_tokens(query),
+    };
     let mut out = NamedSymbolFlow {
-        tokens: flow_tokens(query),
+        tokens,
         ..NamedSymbolFlow::default()
     };
     if out.tokens.len() < 2 {
@@ -397,66 +413,136 @@ fn callers(traverser: &GraphTraverser<'_>, id: &str) -> rusqlite::Result<Vec<Nod
 }
 
 /// One BFS parent entry: where the walk came from, over which edge.
-type Parent = HashMap<String, (Option<String>, Option<Edge>, Node)>;
+struct Hop {
+    prev: Option<String>,
+    edge: Option<Edge>,
+    node: Node,
+}
+
+/// A walk's parent map: how each reached node was reached.
+type Parent = HashMap<String, Hop>;
+
+/// What the named walk's route to a node carries.
+#[derive(Debug, Clone, Copy)]
+struct Route {
+    /// Hops from the seed.
+    depth: usize,
+    /// Unnamed hops the route ends on, held against `max_bridge`.
+    streak: usize,
+    /// Named symbols on the route, the seed and this node included.
+    named: usize,
+}
 
 /// Breadth-first over `calls` edges — synthesized ones included. Every named
 /// symbol is a destination; at most `max_bridge` unnamed symbols between two.
+///
+/// Two routes of the same length to one node are settled by the query's
+/// naming, not by the order the index lists callees in (upstream #2453): the
+/// route ending on fewer unnamed hops wins, then the one through more named
+/// symbols, else the first. An interface method calls every implementation,
+/// so a Flow went through whichever was listed first even when the query
+/// named another. A rival route comes from another node at the same depth, and
+/// every node at one depth is expanded before any at the next, so the choice
+/// is final before anything is reached through it; the expansion order and the
+/// visit cap are unchanged.
 fn walk_calls(
     traverser: &GraphTraverser<'_>,
     seed: &Node,
     named: &HashSet<String>,
     max_hops: usize,
     max_bridge: usize,
-) -> rusqlite::Result<(Parent, Vec<String>)> {
+) -> rusqlite::Result<(Parent, HashMap<String, Route>, Vec<String>)> {
     let mut parent: Parent = HashMap::new();
-    parent.insert(seed.id.clone(), (None, None, seed.clone()));
-    let mut queue: Vec<(String, usize, usize)> = vec![(seed.id.clone(), 0, 0)];
+    parent.insert(
+        seed.id.clone(),
+        Hop {
+            prev: None,
+            edge: None,
+            node: seed.clone(),
+        },
+    );
+    let mut routes: HashMap<String, Route> = HashMap::new();
+    routes.insert(
+        seed.id.clone(),
+        Route {
+            depth: 0,
+            streak: 0,
+            named: usize::from(named.contains(&seed.id)),
+        },
+    );
+    let mut queue: Vec<String> = vec![seed.id.clone()];
     let mut reached: Vec<String> = Vec::new();
     let mut head = 0;
     while head < queue.len() && parent.len() < NAMED_VISIT_CAP {
-        let (id, depth, streak) = queue[head].clone();
+        let id = queue[head].clone();
         head += 1;
+        let at = routes[&id];
         if id != seed.id && named.contains(&id) {
             reached.push(id.clone());
         }
-        if depth + 1 >= max_hops {
+        if at.depth + 1 >= max_hops {
             continue;
         }
         for c in callees(traverser, &id)? {
-            if !is_flow_edge(c.edge.kind) || parent.contains_key(&c.node.id) {
+            if !is_flow_edge(c.edge.kind) {
                 continue;
             }
+            let is_named = named.contains(&c.node.id);
             // A route node is a connector: crossing one costs no bridge budget.
-            let new_streak = if named.contains(&c.node.id) {
+            let streak = if is_named {
                 0
             } else if c.node.kind == NodeKind::Route {
-                streak
+                at.streak
             } else {
-                streak + 1
+                at.streak + 1
             };
-            if new_streak > max_bridge {
+            if streak > max_bridge {
                 continue;
             }
-            let next = c.node.id.clone();
-            parent.insert(next.clone(), (Some(id.clone()), Some(c.edge), c.node));
-            queue.push((next, depth + 1, new_streak));
+            let route = Route {
+                depth: at.depth + 1,
+                streak,
+                named: at.named + usize::from(is_named),
+            };
+            match routes.get(&c.node.id) {
+                // Reached already: only a better route of the same length
+                // replaces it.
+                Some(prior)
+                    if prior.depth != route.depth
+                        || route.streak > prior.streak
+                        || (route.streak == prior.streak && route.named <= prior.named) =>
+                {
+                    continue;
+                }
+                Some(_) => {}
+                None => queue.push(c.node.id.clone()),
+            }
+            routes.insert(c.node.id.clone(), route);
+            parent.insert(
+                c.node.id.clone(),
+                Hop {
+                    prev: Some(id.clone()),
+                    edge: Some(c.edge),
+                    node: c.node,
+                },
+            );
         }
     }
-    Ok((parent, reached))
+    Ok((parent, routes, reached))
 }
 
 fn chain_to(parent: &Parent, target: &str) -> Vec<FlowStep> {
     let mut steps = Vec::new();
     let mut cur = Some(target.to_string());
     while let Some(id) = cur {
-        let Some((prev, edge, node)) = parent.get(&id) else {
+        let Some(hop) = parent.get(&id) else {
             break;
         };
         steps.push(FlowStep {
-            node: node.clone(),
-            edge: edge.clone(),
+            node: hop.node.clone(),
+            edge: hop.edge.clone(),
         });
-        cur = prev.clone();
+        cur = hop.prev.clone();
     }
     steps.reverse();
     steps
@@ -479,7 +565,14 @@ fn walk_bidirectional(
     // forward: id → (prev, edge into it, node), in insertion order.
     let mut forward_order: Vec<String> = vec![seed.id.clone()];
     let mut forward: Parent = HashMap::new();
-    forward.insert(seed.id.clone(), (None, None, seed.clone()));
+    forward.insert(
+        seed.id.clone(),
+        Hop {
+            prev: None,
+            edge: None,
+            node: seed.clone(),
+        },
+    );
     // backward: id → (next towards the sink, the edge out of it); None AT a sink.
     let mut backward: HashMap<String, Option<(String, Edge)>> = HashMap::new();
     let mut back_nodes: HashMap<String, Node> = HashMap::new();
@@ -515,7 +608,11 @@ fn walk_bidirectional(
                     forward_order.push(c.node.id.clone());
                     forward.insert(
                         c.node.id.clone(),
-                        (Some(node.id.clone()), Some(c.edge), c.node.clone()),
+                        Hop {
+                            prev: Some(node.id.clone()),
+                            edge: Some(c.edge),
+                            node: c.node.clone(),
+                        },
                     );
                     next.push(c.node);
                 }
@@ -638,17 +735,22 @@ fn resolve_flow(
     } else {
         let seeds: Vec<Node> = flow.named.values().take(MAX_SEEDS).cloned().collect();
         for seed in &seeds {
-            let (parent, reached) = walk_calls(&traverser, seed, &named_ids, max_hops, max_bridge)?;
-            // Explore's rule: the DEEPEST named sink this seed can reach.
-            let mut deepest: Option<Vec<FlowStep>> = None;
+            let (parent, routes, reached) =
+                walk_calls(&traverser, seed, &named_ids, max_hops, max_bridge)?;
+            // Explore's rule: the DEEPEST named sink this seed can reach; of
+            // two as deep, the one whose route passes more named symbols, as
+            // in the walk (#2453).
+            let mut deepest: Option<(&String, Route)> = None;
             for id in &reached {
-                let steps = chain_to(&parent, id);
-                if deepest.as_ref().is_none_or(|d| steps.len() > d.len()) {
-                    deepest = Some(steps);
+                let at = routes[id];
+                if deepest.is_none_or(|(_, d)| {
+                    at.depth > d.depth || (at.depth == d.depth && at.named > d.named)
+                }) {
+                    deepest = Some((id, at));
                 }
             }
-            if let Some(steps) = deepest {
-                found.push(steps);
+            if let Some((id, _)) = deepest {
+                found.push(chain_to(&parent, id));
             }
         }
     }

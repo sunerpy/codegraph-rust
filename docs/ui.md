@@ -135,6 +135,13 @@ top-level `#Preview { … }` macros, trailing closures included: a preview is
 Xcode's canvas, so a view whose only top-level calls are previews leaves the
 list, and a file with other top-level calls is ranked on those.
 
+A directed Flow (`from` and `to`) looks its two ends up by the names as
+written, a symbol's own name: a two-letter method, a Ruby `valid?` or `save!` and
+an Objective-C selector such as `initWithFrame:` are found as any other name. A
+`symbols` Flow takes the symbol-shaped words of its query, and of two routes of
+one length to a symbol it keeps the one that ends on fewer unnamed symbols, then
+the one through more of the named ones, not the one the index lists first.
+
 ## Differences from upstream
 
 The wire shapes, limits, error codes and refusals follow upstream `v1.6.1`. Where
