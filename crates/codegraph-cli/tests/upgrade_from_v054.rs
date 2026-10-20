@@ -7,8 +7,8 @@
 //! through one of the two paths a user hits: `codegraph sync` from the shell, and
 //! the catch-up sync a daemon or MCP session runs when it first opens the
 //! project. Both must classify the namespace as outdated, rebuild it from source
-//! exactly once, and leave a current schema-9 index whose canonical graph equals
-//! a fresh `init` of the same tree.
+//! exactly once, and leave an index at the current schema whose canonical graph
+//! equals a fresh `init` of the same tree.
 
 use std::fs;
 use std::path::{Path, PathBuf};
