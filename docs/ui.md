@@ -24,7 +24,13 @@ CODEGRAPH_UI=1 codegraph ui --read-only        # refuse every write, saved trail
 
 `[path]` walks up to the nearest directory with an index, like the lifecycle
 commands. Without `--port` the viewer takes 4747, or the next free one of the 20
-ports after it; an explicit `--port` never moves. `CODEGRAPH_BROWSER=<command>`
+ports after it. It walks past a port in use, and past one the system refuses
+where the next may be allowed: on Windows any refused port (another program
+holds it exclusively, or it is in a reserved range, which
+`netsh int ipv4 show excludedportrange protocol=tcp` lists), elsewhere one from
+1024 up; below 1024 off Windows the refusal is the privileged-port rule and the
+walk stops there. An explicit `--port` never moves, and its error names the
+platform's reason. `CODEGRAPH_BROWSER=<command>`
 picks the browser that opens, `CODEGRAPH_BROWSER=none` (or `0`, `false`, `off`)
 opens none. `Ctrl+C` or `SIGTERM` stops it: open streams end first, then the
 server drains.
