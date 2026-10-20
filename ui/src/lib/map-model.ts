@@ -66,10 +66,11 @@ const MIN_NODE_WIDTH = 110;
  *
  * The box clips, so an under-estimate costs a label its last characters to an
  * ellipsis. Padding is the D-05 recipe: the label starts at 44 (tile 22 at 12,
- * then 10), and the box ends 18 past the text.
+ * then 10), and the box ends 18 past the text. The box is `border-box`, so its
+ * border is inside the width too: 1px a side, 1.5px when selected.
  */
 const CHAR_WIDTH = 7.2;
-const LABEL_PADDING = 62;
+const LABEL_PADDING = 44 + 18 + 2 * 1.5;
 
 /** Links below this weight stay hidden until a module they touch is selected. */
 export const MIN_WEIGHT = 4;
@@ -92,10 +93,10 @@ const DECLARED_BASIS_COVERAGE = 0.4;
  * Advance of the 11px meta line in Inter (`caption`), measured in Chrome on
  * 2026-10-03: 4.96–5.45px a character across this repository's meta strings,
  * lower-case-heavy ones widest. 5.5 keeps every one inside its box. (Upstream
- * measured Archivo: 5.9.) Same left inset as the label.
+ * measured Archivo: 5.9.) Same insets and border as the label.
  */
 const META_CHAR_WIDTH = 5.5;
-const META_PADDING = 62;
+const META_PADDING = LABEL_PADDING;
 
 /**
  * A box wide enough for BOTH of its lines.

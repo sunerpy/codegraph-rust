@@ -83,6 +83,17 @@ describe('nodeWidth', () => {
     expect(nodeWidth('src/resolution/(root files)')).toBeGreaterThan(200);
     expect(nodeWidth('src/db', '1218 symbols · 54 files')).toBeGreaterThan(nodeWidth('src/db'));
   });
+
+  it('leaves both lines their whole advance inside the padding and the border', () => {
+    // ModuleNode.svelte: `border-box`, padding 44 left and 18 right, a 1px
+    // border that is 1.5px when selected. JetBrains Mono at 12px advances
+    // 7.2px; the widest meta line measured 5.45px a character.
+    const inside = (width: number) => width - 44 - 18 - 2 * 1.5;
+    const label = 'src/main/…/clinic/(root files)';
+    expect(inside(nodeWidth(label))).toBeGreaterThanOrEqual(label.length * 7.2);
+    const meta = '1218 symbols · 54 files · 80 depend on it';
+    expect(inside(nodeWidth('ui', meta))).toBeGreaterThanOrEqual(meta.length * 5.45);
+  });
 });
 
 describe('box width', () => {
