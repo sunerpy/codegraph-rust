@@ -15,10 +15,12 @@
 //! signal to offer.
 //!
 //! `codegraph-graph`'s `query::scoring::is_test_file` deliberately stays
-//! separate. It answers a BROADER question for FTS relevance damping (it also
-//! treats `examples/`, `demos/`, `benchmarks/`, camelCase `FooTests/` dirs and
-//! `TestCase`-suffixed stems as non-production), so folding it in here would
-//! change search ranking rather than converge a duplicate.
+//! separate. It is upstream's wide `isTestFile`, the reading search ranking and
+//! the viewer use: [`is_test_path`] plus the `examples/`, `samples/`,
+//! `fixtures/`, `benchmarks/`, `demos/` and `integration/` folders of a
+//! project's layout above `src/`. Folding that into [`is_test_file`] would
+//! change what `affected` and the MCP engine call a test rather than converge
+//! a duplicate.
 
 /// Path segments that mark a test tree. Matched as whole `/`-delimited
 /// segments, so a repo-root `e2e/` counts and a `route2e2e.ts` filename

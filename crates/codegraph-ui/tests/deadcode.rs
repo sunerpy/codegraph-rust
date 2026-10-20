@@ -563,13 +563,11 @@ fn still_lists_what_nothing_reaches_beside_merged_declarations() {
 
 /* ------------------------------------- a framework that calls by name -- */
 
-/// Upstream #2405's fixture. The Java beans sit in package `acme`, not
-/// upstream's `demo`: this port reads any `demo/` segment as non-production
-/// code, which would make them tests.
+/// Upstream #2405's fixture.
 fn framework_calls_by_name() -> Project {
     let bean = |name: &str| {
         format!(
-            "package acme;
+            "package demo;
 
 import org.springframework.beans.factory.InitializingBean;
 import org.springframework.stereotype.Component;
@@ -706,11 +704,11 @@ export const declarations = [FirstComponent, SecondComponent, ThirdComponent, De
         ),
         // Java checks the interface itself: Spring calls `afterPropertiesSet` on
         // a bean that implements InitializingBean, never on one with the name.
-        ("src/main/java/acme/FirstBean.java", &first_bean),
-        ("src/main/java/acme/SecondBean.java", &second_bean),
+        ("src/main/java/demo/FirstBean.java", &first_bean),
+        ("src/main/java/demo/SecondBean.java", &second_bean),
         (
-            "src/main/java/acme/LooseBean.java",
-            "package acme;
+            "src/main/java/demo/LooseBean.java",
+            "package demo;
 
 import org.springframework.stereotype.Component;
 
@@ -721,8 +719,8 @@ public class LooseBean {
 ",
         ),
         (
-            "src/main/java/acme/App.java",
-            "package acme;
+            "src/main/java/demo/App.java",
+            "package demo;
 
 public class App {
   public static void main(String[] args) {
@@ -801,7 +799,7 @@ fn infers_a_contract_only_where_the_interface_has_no_runtime_effect() {
     // where every other rule still runs.
     let report = report(&project, |q| q.include_exported = true);
     assert!(
-        listed(&report, "acme::LooseBean::afterPropertiesSet"),
+        listed(&report, "demo::LooseBean::afterPropertiesSet"),
         "{:?}",
         names(&report)
     );

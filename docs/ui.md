@@ -196,11 +196,6 @@ the Rust graph holds different facts, the viewer shows what this index holds:
 - An exported Map writes each box's label, the text the canvas draws and sized
   the box for. Upstream's export writes the id, cut to fit, so a Maven package
   reads `src/main/java/com/ac…` in the image.
-- A folder named `integration`, `sample(s)`, `example(s)`, `fixture(s)`,
-  `benchmark(s)` or `demo(s)` anywhere in a path marks a file as non-production
-  here, a test to the Map. Upstream since `v1.6.1` reads only the layout above a
-  `src/` folder, so a package path such as spring-petclinic's
-  `org/springframework/samples/…` is production code there and test code here.
 
 ## Look and themes
 

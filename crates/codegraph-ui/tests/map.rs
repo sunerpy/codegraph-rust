@@ -409,20 +409,18 @@ async fn does_not_let_one_roots_answer_be_served_for_another() {
 
 /// Upstream #2102: a Maven project keeps its Java under folders that split
 /// nothing; the map counts depth in folders that fork, so it opens on the
-/// packages, each box labelled with the chain elided.
-///
-/// The package path is not petclinic's `org/springframework/samples/…`: this
-/// port still reads any `samples/` segment as non-production code, which
-/// would make every file here a test.
+/// packages, each box labelled with the chain elided. The package path runs
+/// through a `samples` folder, which is production code: only the layout above
+/// `src/` marks code as non-production.
 #[tokio::test]
 async fn opens_a_maven_project_on_its_packages_with_the_chain_elided() {
     let class = |name: &str| format!("public class {name} {{\n  public void run() {{}}\n}}\n");
-    let base = "src/main/java/com/acme/clinic";
-    let tests = "src/test/java/com/acme/clinic/owner";
+    let base = "src/main/java/org/springframework/samples/petclinic";
+    let tests = "src/test/java/org/springframework/samples/petclinic/owner";
     let files: Vec<(String, String)> = vec![
         (
-            format!("{base}/ClinicApplication.java"),
-            class("ClinicApplication"),
+            format!("{base}/PetClinicApplication.java"),
+            class("PetClinicApplication"),
         ),
         (format!("{base}/owner/Owner.java"), class("Owner")),
         (
@@ -449,12 +447,12 @@ async fn opens_a_maven_project_on_its_packages_with_the_chain_elided() {
     for package in ["owner", "vet", "visit", "model"] {
         assert_eq!(
             module(&payload, &format!("{base}/{package}"))["label"],
-            format!("src/main/…/clinic/{package}")
+            format!("src/main/…/petclinic/{package}")
         );
     }
     assert_eq!(
         module(&payload, &format!("{base}/(root files)"))["label"],
-        "src/main/…/clinic/(root files)"
+        "src/main/…/petclinic/(root files)"
     );
     // The test tree's one package is all its bucket holds, so the bucket takes
     // the folder's name, and the label follows.
