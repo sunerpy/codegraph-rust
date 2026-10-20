@@ -63,9 +63,24 @@ pub async fn serve_session_rmcp_async_with_project_services<T>(
 where
     T: AsyncRead + AsyncWrite + Send + Unpin + 'static,
 {
+    serve_handler_async(
+        CodeGraphHandler::new_with_project_services(Some(project_root), project_services),
+        transport,
+    )
+    .await
+}
+
+/// Serve one session over `transport` through `handler`, until the client
+/// disconnects or the transport is force-closed.
+pub(crate) async fn serve_handler_async<T>(
+    handler: CodeGraphHandler,
+    transport: T,
+) -> anyhow::Result<()>
+where
+    T: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+{
     use rmcp::ServiceExt;
 
-    let handler = CodeGraphHandler::new_with_project_services(Some(project_root), project_services);
     let running = handler
         .serve(transport)
         .await
@@ -99,6 +114,24 @@ pub fn serve_session_rmcp_with_project_services<R, W>(
     writer: W,
     project_root: PathBuf,
     project_services: Option<ProjectServiceBroker>,
+) -> anyhow::Result<()>
+where
+    R: BufRead + Send + 'static,
+    W: Write + Send + 'static,
+{
+    serve_handler_blocking(
+        CodeGraphHandler::new_with_project_services(Some(project_root), project_services),
+        reader,
+        writer,
+    )
+}
+
+/// [`serve_session_rmcp_with_project_services`] for a handler the caller built:
+/// the blocking halves bridged onto [`serve_handler_async`].
+pub(crate) fn serve_handler_blocking<R, W>(
+    handler: CodeGraphHandler,
+    reader: R,
+    writer: W,
 ) -> anyhow::Result<()>
 where
     R: BufRead + Send + 'static,
@@ -160,12 +193,7 @@ where
             }
         });
 
-        let serve_result = serve_session_rmcp_async_with_project_services(
-            rmcp_side,
-            project_root,
-            project_services,
-        )
-        .await;
+        let serve_result = serve_handler_async(handler, rmcp_side).await;
 
         // Teardown ORDER guarantees rmcp's final response reaches the writer
         // before we return: drain the pipe to EOF (only after rmcp closed its

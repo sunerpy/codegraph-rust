@@ -3810,6 +3810,11 @@ fn serve_direct_no_services(
             project_root,
             reader,
         } => serve_adopted_project(reader, stdout, project_root, no_watch),
+        // MCP 2026-07-28: the rmcp handler answers the session, still with no
+        // daemon, watcher or catch-up for the broad root.
+        RunUntilAdoption::Inline { first_line, reader } => server
+            .serve_inline(first_line, reader, stdout)
+            .context("serving an MCP 2026-07-28 session at a too-broad root"),
     }
 }
 

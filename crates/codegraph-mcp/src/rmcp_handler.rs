@@ -183,6 +183,25 @@ impl CodeGraphHandler {
         Self::stdio(default_project, cwd, true, None)
     }
 
+    /// The handler a hand-rolled [`crate::McpServer`] hands an inline-lifecycle
+    /// session to ([`crate::McpServer::serve_inline`]), carrying the state that
+    /// server already resolved, so root discovery does not run a second time.
+    pub(crate) fn from_hand_rolled(
+        default_project: Option<PathBuf>,
+        cwd: Option<PathBuf>,
+        no_roots: bool,
+        discovery: ServerRootDiscovery,
+        project_services: Option<ProjectServiceBroker>,
+    ) -> Self {
+        Self {
+            default_project: Arc::new(Mutex::new(default_project)),
+            cwd,
+            no_roots,
+            root_discovery: Some(Arc::new(Mutex::new(discovery))),
+            project_services,
+        }
+    }
+
     fn stdio(
         default_project: Option<PathBuf>,
         cwd: Option<PathBuf>,

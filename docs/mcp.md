@@ -534,7 +534,14 @@ client advertises MCP roots support, the server sends `roots/list`, adopts the
 first indexed root from the client's response, starts or attaches to that root's
 shared project daemon, then proxies the current stdio session to that daemon.
 That lets a single global config recover the real project even when the launch
-CWD was home, without hardcoding `--path`. `CODEGRAPH_FORCE_WATCH` does **not**
+CWD was home, without hardcoding `--path`. An `initialize` is answered with the
+protocol version a direct session would negotiate. A client on MCP 2026-07-28
+opens with `server/discover` instead and names its protocol version in each
+request's `_meta`; such a session is answered throughout by the handler a direct
+session uses, still with no background services for the broad root. That
+lifecycle has no roots, so the session never adopts the client's workspace: its
+tools list `projectPath` as required, and a call that passes one still gets that
+project's shared daemon and watcher (see below). `CODEGRAPH_FORCE_WATCH` does **not**
 override this guard (it only overrides the WSL2 `/mnt/` disable). A real project
 nested under `$HOME` (e.g. `~/projects/myapp`) is unaffected and gets the full
 daemon, watcher, and catch-up. To guarantee per-project services for clients that
