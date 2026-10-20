@@ -92,6 +92,9 @@ impl Change {
 /// One file operation of a case's edit.
 pub enum Op {
     Write(&'static str, &'static str),
+    /// Rewrite a file keeping its modification time: with contents of the
+    /// same length, nothing a stat sees moves.
+    Replace(&'static str, &'static str),
     Remove(&'static str),
     Rename(&'static str, &'static str),
 }
@@ -100,7 +103,7 @@ impl Op {
     /// The paths a watcher event batch for this operation names.
     fn paths(&self) -> Vec<&'static str> {
         match *self {
-            Self::Write(path, _) | Self::Remove(path) => vec![path],
+            Self::Write(path, _) | Self::Replace(path, _) | Self::Remove(path) => vec![path],
             Self::Rename(from, to) => vec![from, to],
         }
     }
@@ -149,6 +152,12 @@ impl Case {
     }
 
     /// Edit: delete a file.
+    /// Rewrite `path` keeping its modification time (see [`Op::Replace`]).
+    pub fn replace(mut self, path: &'static str, contents: &'static str) -> Self {
+        self.edit.push(Op::Replace(path, contents));
+        self
+    }
+
     pub fn remove(mut self, path: &'static str) -> Self {
         self.edit.push(Op::Remove(path));
         self
@@ -226,7 +235,7 @@ impl Case {
         assert!(!self.edit.is_empty(), "a case needs an edit");
         for op in &self.edit {
             match *op {
-                Op::Write(path, contents) => {
+                Op::Write(path, contents) | Op::Replace(path, contents) => {
                     tree.insert(path.to_string(), contents.to_string());
                 }
                 Op::Remove(path) => {
@@ -265,6 +274,12 @@ impl Case {
             match *op {
                 Op::Write(path, contents) => {
                     project.write(path, contents);
+                }
+                Op::Replace(path, contents) => {
+                    let mtime = fs::metadata(project.root().join(path))
+                        .and_then(|metadata| metadata.modified())
+                        .unwrap_or_else(|err| panic!("stat {path}: {err}"));
+                    support::write_file(project.root(), path, contents, mtime);
                 }
                 Op::Remove(path) => {
                     project.remove(path);
@@ -748,6 +763,7 @@ fn describe_edit(edit: &[Op]) -> String {
     edit.iter()
         .map(|op| match *op {
             Op::Write(path, _) => format!("write {path}"),
+            Op::Replace(path, _) => format!("replace {path}, its mtime kept"),
             Op::Remove(path) => format!("remove {path}"),
             Op::Rename(from, to) => format!("rename {from} -> {to}"),
         })
@@ -1321,6 +1337,7 @@ matrix! {
     python_repository_exclude_hides_a_competitor,
     lua_extension_override_appears_in_codegraph_json,
     typescript_tsconfig_paths_alias_appears,
+    typescript_tsconfig_past_64_mib_replaced_with_its_size_and_mtime_kept,
     typescript_react_dependency_appears_in_package_json,
     javascript_jsconfig_paths_alias_appears,
     typescript_tsconfig_paths_alias_disappears,

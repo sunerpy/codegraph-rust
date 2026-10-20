@@ -9971,6 +9971,38 @@ pub fn typescript_tsconfig_paths_alias_appears() -> Case {
         .edge_after("file:src/main.ts", "imports", "function double")
 }
 
+/// A `tsconfig.json` past 64 MiB, its `paths` sending `@lib/*` to `target`,
+/// padded with whitespace to a fixed length.
+fn large_tsconfig(target: &str) -> String {
+    let text = format!(
+        "{{\"compilerOptions\":{{\"baseUrl\":\".\",\"paths\":{{\"@lib/*\":[\"{target}\"]}}}}}}"
+    );
+    format!("{text}{}\n", " ".repeat(64 * 1024 * 1024 + 1))
+}
+
+static LARGE_TSCONFIG_ELSEWHERE: LazyLock<String> = LazyLock::new(|| large_tsconfig("src/xyz/*"));
+static LARGE_TSCONFIG_LIB: LazyLock<String> = LazyLock::new(|| large_tsconfig("src/lib/*"));
+
+/// W5 goal review: a control file is read whole whatever its size. A
+/// `tsconfig.json` past 64 MiB, replaced with its length and modification
+/// time kept, moves the alias, as a fresh index of the new text has it (the
+/// digest once stood in the size and mtime for the text past 64 MiB).
+pub fn typescript_tsconfig_past_64_mib_replaced_with_its_size_and_mtime_kept() -> Case {
+    assert_eq!(LARGE_TSCONFIG_ELSEWHERE.len(), LARGE_TSCONFIG_LIB.len());
+    Case::new(Change::ControlFile, &[Language::TypeScript])
+        .file("tsconfig.json", LARGE_TSCONFIG_ELSEWHERE.as_str())
+        .file(
+            "src/lib/math.ts",
+            "export function double(value: number): number {\n  return value * 2;\n}\n",
+        )
+        .file(
+            "src/main.ts",
+            "import { double } from '@lib/math';\n\nexport function run(): number {\n  return double(2);\n}\n",
+        )
+        .replace("tsconfig.json", LARGE_TSCONFIG_LIB.as_str())
+        .edge_after("file:src/main.ts", "imports", "function double")
+}
+
 /// Found by this matrix: only a fresh index detects React, mints the hook node
 /// and resolves the call through it.
 pub fn typescript_react_dependency_appears_in_package_json() -> Case {
