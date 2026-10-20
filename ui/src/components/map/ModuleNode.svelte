@@ -62,7 +62,8 @@
   }`}
 >
   <span class="tile"><KindGlyph kind="module" size={22} /></span>
-  <span class="name">{module.id}</span>
+  <!-- The label elides a folder chain nothing forks in; the title keeps the full path. -->
+  <span class="name">{module.label || module.id}</span>
   <!-- The same string nodeWidth() sized the box for; they must not drift. -->
   <span class="count" class:island={layout.island}
     >{moduleMetaLabel(module, layout.island)}</span

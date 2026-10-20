@@ -404,3 +404,94 @@ async fn does_not_let_one_roots_answer_be_served_for_another() {
     assert_eq!(all["root"], "");
     assert_ne!(ids(&all), ids(&src));
 }
+
+/* ------------------------- folders nothing forks in, and the opening view -- */
+
+/// Upstream #2102: a Maven project keeps its Java under folders that split
+/// nothing; the map counts depth in folders that fork, so it opens on the
+/// packages, each box labelled with the chain elided.
+///
+/// The package path is not petclinic's `org/springframework/samples/…`: this
+/// port still reads any `samples/` segment as non-production code, which
+/// would make every file here a test.
+#[tokio::test]
+async fn opens_a_maven_project_on_its_packages_with_the_chain_elided() {
+    let class = |name: &str| format!("public class {name} {{\n  public void run() {{}}\n}}\n");
+    let base = "src/main/java/com/acme/clinic";
+    let tests = "src/test/java/com/acme/clinic/owner";
+    let files: Vec<(String, String)> = vec![
+        (
+            format!("{base}/ClinicApplication.java"),
+            class("ClinicApplication"),
+        ),
+        (format!("{base}/owner/Owner.java"), class("Owner")),
+        (
+            format!("{base}/owner/OwnerController.java"),
+            class("OwnerController"),
+        ),
+        (format!("{base}/vet/Vet.java"), class("Vet")),
+        (format!("{base}/visit/Visit.java"), class("Visit")),
+        (format!("{base}/model/BaseEntity.java"), class("BaseEntity")),
+        (
+            format!("{tests}/OwnerControllerTests.java"),
+            class("OwnerControllerTests"),
+        ),
+    ];
+    let refs: Vec<(&str, &str)> = files
+        .iter()
+        .map(|(p, c)| (p.as_str(), c.as_str()))
+        .collect();
+    let project = Project::indexed(&refs);
+    let viewer = project.viewer();
+    let payload = map(&viewer, "").await;
+    assert_eq!(payload["root"], "src", "{payload:#}");
+    assert_eq!(payload["depth"], 2, "{payload:#}");
+    for package in ["owner", "vet", "visit", "model"] {
+        assert_eq!(
+            module(&payload, &format!("{base}/{package}"))["label"],
+            format!("src/main/…/clinic/{package}")
+        );
+    }
+    assert_eq!(
+        module(&payload, &format!("{base}/(root files)"))["label"],
+        "src/main/…/clinic/(root files)"
+    );
+    // The test tree's one package is all its bucket holds, so the bucket takes
+    // the folder's name, and the label follows.
+    let test_module = module(&payload, tests);
+    assert_eq!(test_module["label"], "src/test/…/owner");
+    assert_eq!(test_module["test"], true);
+}
+
+/// Upstream #2270: a source folder whose files all sit in one folder draws
+/// one box at any depth, so the map opens on the repository around it.
+#[tokio::test]
+async fn opens_on_the_repository_when_the_source_folder_is_one_flat_folder() {
+    let mut files: Vec<(String, String)> = (0..12)
+        .map(|i| {
+            (
+                format!("lib/f{i}.js"),
+                format!("export function f{i}() {{ return {i}; }}\n"),
+            )
+        })
+        .collect();
+    files.push((
+        "index.js".to_string(),
+        "export function main() { return 0; }\n".to_string(),
+    ));
+    files.push((
+        "benchmarks/run.js".to_string(),
+        "export function bench() { return 1; }\n".to_string(),
+    ));
+    let refs: Vec<(&str, &str)> = files
+        .iter()
+        .map(|(p, c)| (p.as_str(), c.as_str()))
+        .collect();
+    let project = Project::indexed(&refs);
+    let viewer = project.viewer();
+    let payload = map(&viewer, "").await;
+    assert_eq!(payload["root"], "", "{payload:#}");
+    assert!(ids(&payload).len() > 1, "{:?}", ids(&payload));
+    // Naming the folder still draws it.
+    assert_eq!(map(&viewer, "?root=lib").await["root"], "lib");
+}

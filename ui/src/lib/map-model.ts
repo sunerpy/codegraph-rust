@@ -252,8 +252,8 @@ export interface MapLayoutOptions {
   /** Override the hidden-link floor; 0 draws every link (the Screens view). */
   minWeight?: number;
   /**
-   * The two lines a box is sized for. The Map's boxes show the module id and
-   * its counts; a view that shows something else (a screen's path and its
+   * The two lines a box is sized for. The Map's boxes show the module label
+   * and its counts; a view that shows something else (a screen's path and its
    * component) must size for what it draws, or an opaque id decides the width.
    */
   sizing?: (module: WireMapModule, island: boolean) => { label: string; meta: string };
@@ -420,7 +420,7 @@ export function buildMapLayout(
   const widths = new Map(
     modules.map((m) => {
       const island = islands.has(m.id);
-      const lines = options.sizing?.(m, island) ?? { label: m.id, meta: moduleMetaLabel(m, island) };
+      const lines = options.sizing?.(m, island) ?? { label: m.label || m.id, meta: moduleMetaLabel(m, island) };
       const count = portCount.get(m.id) ?? { top: 0, bottom: 0 };
       const forPorts = (Math.max(count.top, count.bottom) + 1) * portPitch;
       return [m.id, Math.max(nodeWidth(lines.label, lines.meta), forPorts)];

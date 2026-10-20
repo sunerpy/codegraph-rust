@@ -142,6 +142,17 @@ an Objective-C selector such as `initWithFrame:` are found as any other name. A
 one length to a symbol it keeps the one that ends on fewer unnamed symbols, then
 the one through more of the named ones, not the one the index lists first.
 
+The Map, asked for no `root`, opens on the top directory holding a clear
+majority of the non-test symbols, files loose in the repository root counted in
+the whole. When that directory draws one box at every depth (Express's `lib/`,
+an R package's `R/`) and the whole repository draws more, it opens on the whole
+repository instead. A folder with exactly one subfolder and no file of its own,
+read from every indexed file with tests included, is not a level: a Maven or
+Gradle project's `src/main/java/com/acme/app/` counts as one, so the map opens
+on the packages under it. A box's `label` writes such a chain of three or more
+folders `first/…/last` (`src/main/…/app/owner`); the `id`, the box's tooltip
+and the side panel keep the whole path, and every other label is the id.
+
 ## Differences from upstream
 
 The wire shapes, limits, error codes and refusals follow upstream `v1.6.1`. Where
@@ -164,6 +175,14 @@ the Rust graph holds different facts, the viewer shows what this index holds:
   specifier, and the File view lists it that way.
 - The bundle is embedded in the binary, so upstream's `CODEGRAPH_VIEWER_PATH`
   has no counterpart.
+- An exported Map writes each box's label, the text the canvas draws and sized
+  the box for. Upstream's export writes the id, cut to fit, so a Maven package
+  reads `src/main/java/com/ac…` in the image.
+- A folder named `integration`, `sample(s)`, `example(s)`, `fixture(s)`,
+  `benchmark(s)` or `demo(s)` anywhere in a path marks a file as non-production
+  here, a test to the Map. Upstream since `v1.6.1` reads only the layout above a
+  `src/` folder, so a package path such as spring-petclinic's
+  `org/springframework/samples/…` is production code there and test code here.
 
 ## Look and themes
 

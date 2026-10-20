@@ -39,7 +39,7 @@ import type { WireMapLink, WireMapModule } from '../src/lib/api';
 function mod(id: string, over: Partial<WireMapModule> = {}): WireMapModule {
   return {
     id,
-    label: id.slice(id.lastIndexOf('/') + 1) || id,
+    label: over.label ?? id,
     files: over.files ?? 3,
     symbols: over.symbols ?? 30,
     languages: over.languages ?? [{ language: 'typescript', files: over.files ?? 3 }],
@@ -82,6 +82,25 @@ describe('nodeWidth', () => {
     // A long id outgrows the floor; a long meta line outgrows a short id.
     expect(nodeWidth('src/resolution/(root files)')).toBeGreaterThan(200);
     expect(nodeWidth('src/db', '1218 symbols · 54 files')).toBeGreaterThan(nodeWidth('src/db'));
+  });
+});
+
+describe('box width', () => {
+  it('sizes a box for its label, which elides a folder chain, not for its id', () => {
+    const id = 'src/main/java/org/springframework/samples/petclinic/owner';
+    const label = 'src/main/…/petclinic/owner';
+    const layout = buildMapLayout({ modules: [mod(id, { label })], links: [] }, OPTS);
+    const node = layout.nodes.find((n) => n.id === id)!;
+    const meta = moduleMetaLabel(node.module, node.island);
+    expect(node.width).toBe(nodeWidth(label, meta));
+    expect(node.width).toBeLessThan(nodeWidth(id, meta));
+  });
+
+  it('falls back to the id when a payload carries no label', () => {
+    const id = 'src/resolution/(root files)';
+    const layout = buildMapLayout({ modules: [mod(id, { label: '' })], links: [] }, OPTS);
+    const node = layout.nodes[0]!;
+    expect(node.width).toBe(nodeWidth(id, moduleMetaLabel(node.module, node.island)));
   });
 });
 
