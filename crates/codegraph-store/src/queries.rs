@@ -1004,22 +1004,28 @@ impl Store {
     ///
     /// Each row moves whole into `resolved_refs`, keeping its id (schema 10,
     /// W5-09e): with the rows still unresolved, they stay every reference of
-    /// the file's last extraction. An id listed twice moves once.
+    /// the file's last extraction. The ids move a chunk at a time, one
+    /// statement each way (W5-09g); an id listed twice moves once, since its
+    /// first move deleted the row the second would select.
     pub fn delete_resolved_unresolved_refs(&mut self, row_ids: &[i64]) -> rusqlite::Result<()> {
         if row_ids.is_empty() {
             return Ok(());
         }
         let tx = self.conn.transaction()?;
-        {
-            let mut keep = tx.prepare_cached(&format!(
+        for chunk in row_ids.chunks(SQLITE_PARAM_CHUNK_SIZE) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let params = chunk.iter().map(|id| id as &dyn ToSql).collect::<Vec<_>>();
+            tx.prepare_cached(&format!(
                 "INSERT OR IGNORE INTO resolved_refs ({UNRESOLVED_REF_COLUMNS}) \
-                 SELECT {UNRESOLVED_REF_COLUMNS} FROM unresolved_refs WHERE id = ?1"
-            ))?;
-            let mut stmt = tx.prepare_cached("DELETE FROM unresolved_refs WHERE id = ?")?;
-            for row_id in row_ids {
-                keep.execute(params![row_id])?;
-                stmt.execute(params![row_id])?;
-            }
+                 SELECT {UNRESOLVED_REF_COLUMNS} FROM unresolved_refs WHERE id IN ({placeholders})"
+            ))?
+            .execute(params.as_slice())?;
+            tx.prepare_cached(&format!(
+                "DELETE FROM unresolved_refs WHERE id IN ({placeholders})"
+            ))?
+            .execute(params.as_slice())?;
         }
         tx.commit()
     }
@@ -4638,6 +4644,74 @@ mod tests {
                 0
             ),
             "each replacement replaced what it covers"
+        );
+    }
+
+    /// W5-09g: a move spanning several chunks, with ids repeated inside a
+    /// chunk and across chunks, leaves both tables as moving the rows one by
+    /// one does: each listed row moved once, whole and with its id, and every
+    /// other row still unresolved.
+    #[test]
+    fn a_move_across_chunks_moves_each_listed_row_once() {
+        let mut store = store("resolved-refs-chunks");
+        store
+            .upsert_nodes(&[node("function:a", "a", "a.ts")])
+            .unwrap();
+        let refs: Vec<UnresolvedRef> = (0..3_000)
+            .map(|i| UnresolvedRef {
+                id: None,
+                from_node_id: "function:a".to_string(),
+                reference_name: format!("r{i}"),
+                reference_kind: EdgeKind::Calls,
+                line: i + 1,
+                col: 0,
+                candidates: None,
+                file_path: "a.ts".to_string(),
+                language: Language::TypeScript,
+                is_function_ref: false,
+                reference_subkind: None,
+            })
+            .collect();
+        store.insert_unresolved_refs(&refs).unwrap();
+        let ids: Vec<i64> = store
+            .unresolved_refs_by_file_path("a.ts")
+            .unwrap()
+            .into_iter()
+            .map(|reference| reference.id.unwrap())
+            .collect();
+        // Every third row, in reverse, then a repeat of some of them: the
+        // repeats land in the same chunk and in later ones.
+        let mut listed: Vec<i64> = ids.iter().copied().step_by(3).rev().collect();
+        listed.extend(ids.iter().copied().step_by(9));
+        assert!(listed.len() > 2 * SQLITE_PARAM_CHUNK_SIZE);
+        store.delete_resolved_unresolved_refs(&listed).unwrap();
+
+        let id_list = |sql: &str| -> Vec<i64> {
+            store
+                .connection()
+                .prepare(sql)
+                .unwrap()
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        };
+        let moved: BTreeSet<i64> = ids.iter().copied().step_by(3).collect();
+        assert_eq!(
+            id_list("SELECT id FROM resolved_refs ORDER BY id"),
+            moved.iter().copied().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            id_list("SELECT id FROM unresolved_refs ORDER BY id"),
+            ids.iter()
+                .copied()
+                .filter(|id| !moved.contains(id))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            store.stored_refs_of_file("a.ts").unwrap(),
+            refs,
+            "every row, whole, by id"
         );
     }
 
