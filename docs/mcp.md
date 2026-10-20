@@ -682,9 +682,10 @@ telemetry or tracking of any kind**. Set `CODEGRAPH_NO_PROMPT_HOOK=1` (or
 `CODEGRAPH_PROMPT_HOOK=0`) to disable the hook without editing the config. Every
 failure path — kill-switch, non-matching prompt, no index, engine error — exits 0
 with no output; the hook is degradable by contract and never breaks the prompt.
-Host-generated task completions are also discarded before classification when
-their first non-whitespace content is `<task-notification>`; the same text later
-inside a real user discussion does not match that anchored gate.
+Host-generated task completions and subagent hand-backs are also discarded
+before classification when the whole prompt is a `<task-notification>` or an
+`<agent-message …>` envelope; the same text inside a real user discussion does
+not match that anchored gate.
 
 ---
 

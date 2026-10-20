@@ -1340,6 +1340,24 @@ fn is_task_notification_wrapper(prompt: &str) -> bool {
     trimmed.starts_with("<task-notification>") && trimmed.ends_with("</task-notification>")
 }
 
+/// Claude Code hands a subagent's report back to the parent session as a
+/// `<agent-message from="…">…</agent-message>` prompt, which the hook receives
+/// too (#2184). Same rule as [`is_task_notification_wrapper`]: only a prompt
+/// that is entirely that envelope, its opening tag bare or followed by
+/// whitespace and attributes, is skipped (upstream v1.6.2 `isAgentMessage`).
+fn is_agent_message_wrapper(prompt: &str) -> bool {
+    let trimmed = prompt.trim_matches(char::is_whitespace);
+    let Some(rest) = trimmed.strip_prefix("<agent-message") else {
+        return false;
+    };
+    let Some(open_end) = rest.find('>') else {
+        return false;
+    };
+    let attributes = &rest[..open_end];
+    (attributes.is_empty() || attributes.starts_with(char::is_whitespace))
+        && rest[open_end + 1..].ends_with("</agent-message>")
+}
+
 /// `codegraph prompt-hook` — the Claude `UserPromptSubmit` hook entry point,
 /// now a confidence-tiered gate (upstream #1126 + #1136, telemetry EXCLUDED):
 ///
@@ -1380,7 +1398,9 @@ fn cmd_prompt_hook(path: Option<PathBuf>, query: Option<String>) -> Result<()> {
     if query.is_empty() {
         return Ok(());
     }
-    if is_task_notification_wrapper(query) {
+    // System-injected task notifications and subagent hand-backs are not
+    // user prompts (#1832, #2184).
+    if is_task_notification_wrapper(query) || is_agent_message_wrapper(query) {
         return Ok(());
     }
 
@@ -4553,7 +4573,7 @@ mod serve_mode_tests {
 mod prompt_hook_output_tests {
     use super::{
         CLAUDE_CODE_INLINE_HOOK_OUTPUT_LIMIT, PROMPT_HOOK_MAX_INJECT, cap_prompt_hook_injection,
-        is_task_notification_wrapper,
+        is_agent_message_wrapper, is_task_notification_wrapper,
     };
 
     #[test]
@@ -4572,6 +4592,33 @@ mod prompt_hook_output_tests {
         assert!(capped.is_char_boundary(capped.len()));
         assert!(capped.starts_with(&"界".repeat(PROMPT_HOOK_MAX_INJECT / 3)));
         assert!(capped.len() < CLAUDE_CODE_INLINE_HOOK_OUTPUT_LIMIT);
+    }
+
+    #[test]
+    fn agent_message_gate_takes_only_a_prompt_that_is_the_whole_envelope() {
+        assert!(is_agent_message_wrapper(
+            "<agent-message from=\"explorer\">Found Foo() in a.ts</agent-message>"
+        ));
+        assert!(is_agent_message_wrapper(
+            "\n <agent-message>report</agent-message>\n\n"
+        ));
+        assert!(is_agent_message_wrapper(
+            "<agent-message\n  from=\"a\"\n>multi\nline</agent-message>"
+        ));
+        assert!(is_agent_message_wrapper("<agent-message></agent-message>"));
+        assert!(!is_agent_message_wrapper(
+            "Please explain <agent-message> and what calls Foo()"
+        ));
+        assert!(!is_agent_message_wrapper(
+            "<agent-messages>report</agent-messages>"
+        ));
+        assert!(!is_agent_message_wrapper(
+            "<agent-message from=\"a\">report</agent-message>\nNow explain Foo()"
+        ));
+        assert!(!is_agent_message_wrapper(
+            "<agent-message from=\"a\">unterminated"
+        ));
+        assert!(!is_agent_message_wrapper("<agent-message from=\"a\""));
     }
 
     #[test]

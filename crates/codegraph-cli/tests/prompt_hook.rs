@@ -518,3 +518,27 @@ fn host_task_notification_is_silent_only_when_it_is_the_first_content() {
         "a user discussion mentioning the tag later must not be suppressed: {out}"
     );
 }
+
+/// #2184: a subagent's report handed back to the parent session is no user
+/// prompt; a user question that mentions the tag still goes through.
+#[test]
+fn subagent_hand_back_is_silent_only_when_it_is_the_whole_prompt() {
+    let (_dir, project) = index_mini("agent-message");
+    let cwd = serde_json::to_string(project.to_str().unwrap()).unwrap();
+    let hand_back = format!(
+        "{{\"prompt\":\"<agent-message from=\\\"explorer\\\">what calls Counter()</agent-message>\\n\",\"cwd\":{cwd}}}"
+    );
+    let (out, err, ok) = cli_stdin(&["prompt-hook"], &hand_back);
+    assert!(ok, "hand-back run failed: stdout={out} stderr={err}");
+    assert!(out.trim().is_empty(), "a hand-back must be silent: {out}");
+
+    let discussed = format!(
+        "{{\"prompt\":\"Please explain <agent-message> and what calls Counter()\",\"cwd\":{cwd}}}"
+    );
+    let (out, err, ok) = cli_stdin(&["prompt-hook"], &discussed);
+    assert!(ok, "discussion run failed: stdout={out} stderr={err}");
+    assert!(
+        out.contains("<codegraph_context") && out.contains("Counter"),
+        "a user question mentioning the tag must not be suppressed: {out}"
+    );
+}

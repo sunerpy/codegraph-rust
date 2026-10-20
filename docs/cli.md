@@ -1373,10 +1373,11 @@ a query as an argument or reads one from stdin, runs `codegraph_explore` against
 the nearest index, and prints structured context. HIGH-tier Explore text is
 capped at 9,000 UTF-8 bytes so the complete wrapper stays below Claude Code's
 10,000-byte inline hook-output limit; truncation never splits a multi-byte
-character. If the first non-whitespace content is `<task-notification>`, the
-host-generated message is skipped before index work. A user mentioning that tag
-later in a real prompt is not suppressed. If no index is found or no query is
-provided, the hook exits cleanly and silently.
+character. A prompt that is entirely a host envelope, past leading and trailing
+whitespace, is skipped before index work: a `<task-notification>` task completion
+or an `<agent-message …>` subagent hand-back. A real prompt that mentions either
+tag, or adds a question after the envelope, is not suppressed. If no index is
+found or no query is provided, the hook exits cleanly and silently.
 
 `codegraph install --prompt-hook` writes a `UserPromptSubmit` hook into Claude
 Code's config that calls `codegraph prompt-hook` before each prompt. This is
