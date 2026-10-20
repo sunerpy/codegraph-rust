@@ -142,6 +142,12 @@ an Objective-C selector such as `initWithFrame:` are found as any other name. A
 one length to a symbol it keeps the one that ends on fewer unnamed symbols, then
 the one through more of the named ones, not the one the index lists first.
 
+The routes list, and the routes among the entry points, hold one row per
+route: the handler a resolver bound to it, else `inline handler` standing for a
+handler written at the registration, which opens on the route itself and offers
+no Flow. A symbol's members list each member once, never the symbol itself or a
+file.
+
 The Map, asked for no `root`, opens on the top directory holding a clear
 majority of the non-test symbols, files loose in the repository root counted in
 the whole. When that directory draws one box at every depth (Express's `lib/`,

@@ -181,3 +181,24 @@ async fn a_test_suites_routes_are_not_a_routed_app() {
         "the routes exist; they are just not the product's"
     );
 }
+
+/// Upstream #2264: the viewer keys the routes list by route id, so a route is
+/// one row, and a row says whether its handler is written inline.
+#[tokio::test]
+async fn lists_each_route_once_and_says_its_handler_is_not_inline() {
+    let project = routed();
+    let viewer = project.viewer();
+    let body = viewer.json("/api/routes").await;
+    let entries = body["entries"].as_array().unwrap();
+    let mut ids: Vec<&str> = entries
+        .iter()
+        .map(|e| e["routeId"].as_str().unwrap())
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    assert_eq!(ids.len(), entries.len(), "{entries:#?}");
+    assert!(entries.iter().all(|e| e["inline"] == false), "{entries:#?}");
+    let entry = viewer.json("/api/entrypoints").await;
+    let first = &entry["routes"]["items"]["items"][0];
+    assert_eq!(first["inline"], false, "{entry:#}");
+}

@@ -266,6 +266,16 @@ pub fn build(ctx: &Ctx<'_>, node_id: &str) -> ApiResult<Value> {
 }
 
 /// The focal symbol's members in source order, one level of nesting deep.
+/// Whether `child` joins the member list: each member once, and never the
+/// symbol itself or a file. Upstream recorded a Vue / Svelte / Astro component
+/// as containing its script's file node and every symbol in it, so the walk
+/// one level down met those symbols again, and a member listed twice is a
+/// repeated key the viewer cannot draw (upstream #2264). This index records
+/// neither; the walk keeps the list drawable whatever the graph holds.
+fn admit_member(seen: &mut HashSet<String>, child: &Node) -> bool {
+    child.kind != NodeKind::File && seen.insert(child.id.clone())
+}
+
 fn build_members(
     ctx: &Ctx<'_>,
     focal: &Node,
@@ -273,9 +283,12 @@ fn build_members(
     endpoints: &HashMap<String, Node>,
     overrides: Option<&HashMap<String, OverrideMatch>>,
 ) -> ApiResult<(Vec<WireMember>, usize)> {
+    let mut seen: HashSet<String> = HashSet::from([focal.id.clone()]);
     let mut direct: Vec<(Node, String, usize)> = Vec::new();
     for edge in contains_out {
-        if let Some(child) = endpoints.get(&edge.target) {
+        if let Some(child) = endpoints.get(&edge.target)
+            && admit_member(&mut seen, child)
+        {
             direct.push((child.clone(), focal.id.clone(), 1));
         }
     }
@@ -292,7 +305,9 @@ fn build_members(
         let targets: Vec<String> = grand_edges.iter().map(|e| e.target.clone()).collect();
         let grand_nodes = ctx.store.nodes_by_ids(&targets)?;
         for edge in &grand_edges {
-            if let Some(child) = grand_nodes.get(&edge.target) {
+            if let Some(child) = grand_nodes.get(&edge.target)
+                && admit_member(&mut seen, child)
+            {
                 nested.push((child.clone(), edge.source.clone(), 2));
             }
         }
@@ -460,4 +475,62 @@ fn summarize_blast(traverser: &GraphTraverser<'_>, node: &Node, direct: usize) -
         "routes": routes,
         "topFiles": top_files,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use codegraph_core::types::Language;
+
+    fn sym(id: &str, kind: NodeKind) -> Node {
+        Node {
+            id: id.to_string(),
+            kind,
+            name: id.to_string(),
+            qualified_name: id.to_string(),
+            file_path: "src/Card.astro".to_string(),
+            language: Language::Astro,
+            start_line: 1,
+            end_line: 1,
+            start_column: 0,
+            end_column: 0,
+            docstring: None,
+            signature: None,
+            visibility: None,
+            is_exported: false,
+            is_async: false,
+            is_static: false,
+            is_abstract: false,
+            decorators: Vec::new(),
+            type_parameters: Vec::new(),
+            return_type: None,
+            updated_at: 0,
+        }
+    }
+
+    #[test]
+    fn a_member_is_listed_once_and_never_the_symbol_itself_or_a_file() {
+        let mut seen = HashSet::from(["component:card".to_string()]);
+        assert!(admit_member(
+            &mut seen,
+            &sym("constant:title", NodeKind::Constant)
+        ));
+        // The walk one level down meets it again.
+        assert!(!admit_member(
+            &mut seen,
+            &sym("constant:title", NodeKind::Constant)
+        ));
+        assert!(!admit_member(
+            &mut seen,
+            &sym("component:card", NodeKind::Component)
+        ));
+        assert!(!admit_member(
+            &mut seen,
+            &sym("file:src/Card.astro", NodeKind::File)
+        ));
+        assert!(admit_member(
+            &mut seen,
+            &sym("function:format", NodeKind::Function)
+        ));
+    }
 }
