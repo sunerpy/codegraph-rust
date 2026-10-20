@@ -264,7 +264,10 @@ of the codebase.
 When a tool response begins with:
 
 ```
-⚠️  N file(s) edited since the last index sync: path/a.rs, path/b.rs
+⚠️ Some files referenced below were edited since the last index sync — their codegraph entries may be stale:
+  - path/a.rs
+  - path/b.rs
+For accurate content of those specific files, Read them directly. The rest of this response is fresh.
 ```
 
 those specific files may be out of date. Read them directly with the Read tool
