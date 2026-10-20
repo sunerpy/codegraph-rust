@@ -560,3 +560,250 @@ fn still_lists_what_nothing_reaches_beside_merged_declarations() {
         assert!(listed.contains(&name.to_string()), "{name} in {listed:?}");
     }
 }
+
+/* ------------------------------------- a framework that calls by name -- */
+
+/// Upstream #2405's fixture. The Java beans sit in package `acme`, not
+/// upstream's `demo`: this port reads any `demo/` segment as non-production
+/// code, which would make them tests.
+fn framework_calls_by_name() -> Project {
+    let bean = |name: &str| {
+        format!(
+            "package acme;
+
+import org.springframework.beans.factory.InitializingBean;
+import org.springframework.stereotype.Component;
+
+@Component
+public class {name} implements InitializingBean {{
+  public void afterPropertiesSet() {{}}
+}}
+"
+        )
+    };
+    let first_bean = bean("FirstBean");
+    let second_bean = bean("SecondBean");
+    Project::indexed(&[
+        // Three components that write the interface out: together they are the
+        // index's own record of what Angular's `OnInit` carries. The third
+        // inherits `ngOnInit` rather than declaring it, and lacks the `refresh`
+        // the other two happen to share.
+        (
+            "src/app/first.component.ts",
+            "import { Component, OnInit } from '@angular/core';
+
+@Component({ selector: 'app-first', template: '' })
+export class FirstComponent implements OnInit {
+  ngOnInit(): void {}
+  refresh(): void {}
+}
+",
+        ),
+        (
+            "src/app/second.component.ts",
+            "import { AfterViewInit, Component, OnInit } from '@angular/core';
+
+@Component({ selector: 'app-second', template: '' })
+export class SecondComponent implements OnInit, AfterViewInit {
+  ngOnInit(): void {}
+  ngAfterViewInit(): void {}
+  reload(): void {}
+  refresh(): void {}
+}
+",
+        ),
+        (
+            "src/app/base-page.ts",
+            "import { Directive } from '@angular/core';
+
+@Directive()
+export abstract class BasePage {
+  ngOnInit(): void {
+    void 0;
+  }
+}
+",
+        ),
+        (
+            "src/app/third.component.ts",
+            "import { Component, OnInit } from '@angular/core';
+import { BasePage } from './base-page';
+
+@Component({ selector: 'app-third', template: '' })
+export class ThirdComponent extends BasePage implements OnInit {}
+",
+        ),
+        // Writes no `implements` clause. Angular calls `ngOnInit` all the same.
+        (
+            "src/app/demo.component.ts",
+            "import { Component, HostListener } from '@angular/core';
+
+@Component({ selector: 'app-demo', template: '' })
+export class DemoComponent {
+  ngOnInit(): void {
+    void 0;
+  }
+
+  @HostListener('window:keyup', ['$event'])
+  keyEvent(event: KeyboardEvent): void {
+    void event;
+  }
+
+  reload(): void {
+    void 0;
+  }
+
+  refresh(): void {
+    void 0;
+  }
+
+  unusedHelper(): number {
+    return 1;
+  }
+}
+",
+        ),
+        // No decorator, so no framework registers it: the name is no evidence.
+        (
+            "src/app/plain.ts",
+            "export class Plain {\n  ngOnInit(): void {\n    void 0;\n  }\n}\n",
+        ),
+        (
+            "src/api/cron.service.ts",
+            "import { Injectable } from '@nestjs/common';
+import { OnEvent } from '@nestjs/event-emitter';
+import { Cron } from '@nestjs/schedule';
+
+@Injectable()
+export class CronService {
+  @Cron('0 * * * *')
+  runEveryHour(): void {
+    void 0;
+  }
+
+  @OnEvent('portfolio.changed')
+  handlePortfolioChanged(): void {
+    void 0;
+  }
+
+  hasCurrencyPair(): boolean {
+    return false;
+  }
+}
+",
+        ),
+        (
+            "src/main.ts",
+            "import { FirstComponent } from './app/first.component';
+import { SecondComponent } from './app/second.component';
+import { ThirdComponent } from './app/third.component';
+import { DemoComponent } from './app/demo.component';
+import { Plain } from './app/plain';
+import { CronService } from './api/cron.service';
+
+export const declarations = [FirstComponent, SecondComponent, ThirdComponent, DemoComponent, Plain, CronService];
+",
+        ),
+        // Java checks the interface itself: Spring calls `afterPropertiesSet` on
+        // a bean that implements InitializingBean, never on one with the name.
+        ("src/main/java/acme/FirstBean.java", &first_bean),
+        ("src/main/java/acme/SecondBean.java", &second_bean),
+        (
+            "src/main/java/acme/LooseBean.java",
+            "package acme;
+
+import org.springframework.stereotype.Component;
+
+@Component
+public class LooseBean {
+  public void afterPropertiesSet() {}
+}
+",
+        ),
+        (
+            "src/main/java/acme/App.java",
+            "package acme;
+
+public class App {
+  public static void main(String[] args) {
+    new FirstBean();
+    new SecondBean();
+    new LooseBean();
+  }
+}
+",
+        ),
+    ])
+}
+
+fn listed(report: &DeadCodeReport, qualified_name: &str) -> bool {
+    report
+        .entries
+        .iter()
+        .any(|entry| entry.node.qualified_name == qualified_name)
+}
+
+#[test]
+fn does_not_list_a_method_whose_decorator_resolves_outside_the_index() {
+    let project = framework_calls_by_name();
+    for corroborate in [true, false] {
+        let report = report(&project, |q| {
+            if !corroborate {
+                q.read_source = None;
+            }
+        });
+        for name in [
+            "DemoComponent::keyEvent",
+            "CronService::runEveryHour",
+            "CronService::handlePortfolioChanged",
+        ] {
+            assert!(!listed(&report, name), "{name}: {:?}", names(&report));
+        }
+        assert!(report.excluded.decorated >= 3, "{:?}", report.excluded);
+    }
+}
+
+#[test]
+fn does_not_list_a_hook_its_class_fills_by_name_without_writing_the_interface() {
+    let project = framework_calls_by_name();
+    for corroborate in [true, false] {
+        let report = report(&project, |q| {
+            if !corroborate {
+                q.read_source = None;
+            }
+        });
+        assert!(!listed(&report, "DemoComponent::ngOnInit"));
+        // The base a component inherits the hook from is reached the same way.
+        assert!(!listed(&report, "BasePage::ngOnInit"));
+        assert_eq!(report.excluded.hooks, 2, "{:?}", report.excluded);
+    }
+}
+
+#[test]
+fn still_lists_what_nothing_reaches_in_a_class_a_framework_registers() {
+    let project = framework_calls_by_name();
+    let report = report(&project, |_| {});
+    // A decorator on the class is not evidence for each of its members.
+    assert!(listed(&report, "DemoComponent::unusedHelper"));
+    assert!(listed(&report, "CronService::hasCurrencyPair"));
+    // One implementer is not a contract: `reload` is only SecondComponent's.
+    assert!(listed(&report, "DemoComponent::reload"));
+    // Two implementers sharing a method is no contract while a third lacks it.
+    assert!(listed(&report, "DemoComponent::refresh"));
+    // Nothing registers an undecorated class.
+    assert!(listed(&report, "Plain::ngOnInit"));
+}
+
+#[test]
+fn infers_a_contract_only_where_the_interface_has_no_runtime_effect() {
+    let project = framework_calls_by_name();
+    // Java has no export marker in the index, so ask for the exported list,
+    // where every other rule still runs.
+    let report = report(&project, |q| q.include_exported = true);
+    assert!(
+        listed(&report, "acme::LooseBean::afterPropertiesSet"),
+        "{:?}",
+        names(&report)
+    );
+    assert!(!listed(&report, "DemoComponent::ngOnInit"));
+}

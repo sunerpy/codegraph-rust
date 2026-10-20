@@ -159,6 +159,18 @@ on the packages under it. A box's `label` writes such a chain of three or more
 folders `first/…/last` (`src/main/…/app/owner`); the `id`, the box's tooltip
 and the side panel keep the whole path, and every other label is the id.
 
+The Dead code list leaves off a symbol carrying a decorator, including one
+imported from outside the index (`@HostListener`, `@Cron`), which leaves only
+the resolver's unresolved `decorates` row. It also leaves off a TypeScript hook
+its framework calls by name, counted as `hooks`: a method on a decorated class
+that skips the `implements` clause (`ngOnInit` without `implements OnInit`),
+when the classes that do write an interface from outside the index out, more
+than half of them decorated, all have the method, declared or inherited, and at
+least two and more than half of them declare it. Which names are hooks comes
+from those classes, not from a list, so an unused helper on the same component
+stays listed. Java, C# and Kotlin check the interface itself, so the rule is
+TypeScript's only.
+
 ## Differences from upstream
 
 The wire shapes, limits, error codes and refusals follow upstream `v1.6.1`. Where
