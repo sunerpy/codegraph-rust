@@ -34,6 +34,12 @@ crates/codegraph-mcp/src/tools_list.json text eol=lf
 *.yml  text eol=lf
 *.yaml text eol=lf
 
+# --- Generated viewer bundle: `make ui` output, never hand-edited ---
+# `make ui-check` byte-compares it with a fresh build, so a whitespace fix would
+# break that check; minified output may end a line inside a string with a
+# space. Exempt it from whitespace errors (`git diff --check`).
+crates/codegraph-ui/viewer/** -whitespace
+
 # --- Binary artifacts: never let git touch these bytes ---
 # `-text` is explicit (not just `binary`) so the catch-all `* text=auto eol=lf`
 # can never leave a dangling `eol=lf` applied to a binary SQLite DB: `-text`
