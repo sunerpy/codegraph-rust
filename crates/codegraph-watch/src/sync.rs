@@ -5285,6 +5285,50 @@ pub(crate) mod tests {
         assert!(imports_double(&db), "{:#?}", edge_projection(&db));
     }
 
+    /// W5-06: a control file is compared by its whole text whatever its size:
+    /// a `tsconfig.json` past 64 MiB replaced with its size and modification
+    /// time kept moves the alias for a full sync and for a watcher's sync of
+    /// the path alike, as a fresh index of the new text has it.
+    #[test]
+    fn a_large_control_file_replaced_with_its_size_and_mtime_kept_is_compared() {
+        let padded = |target: &str| {
+            format!(
+                "{{\"compilerOptions\":{{\"baseUrl\":\".\",\"paths\":{{\"@lib/*\":[\"{target}\"]}}}}}}{}\n",
+                " ".repeat(64 * 1024 * 1024 + 1)
+            )
+        };
+        let (before, after) = (padded("src/xyz/*"), padded("src/lib/*"));
+        assert_eq!(before.len(), after.len());
+        let fresh = {
+            let files = [("tsconfig.json", after.as_str()), TS_MATH, TS_MAIN];
+            fresh_edges("control-inputs-large-fresh", &files)
+        };
+        for watcher in [false, true] {
+            let dir = TestDir::new(&format!("control-inputs-large-{watcher}"));
+            let db = default_db_path(dir.path()).unwrap();
+            let initial = [("tsconfig.json", before.as_str()), TS_MATH, TS_MAIN];
+            write_files(dir.path(), &initial);
+            sync_changed_paths(dir.path(), &db, initial.iter().map(|(path, _)| *path)).unwrap();
+            assert!(!imports_double(&db), "{:#?}", edge_projection(&db));
+            let config = dir.path().join("tsconfig.json");
+            let modified = fs::metadata(&config).unwrap().modified().unwrap();
+            fs::write(&config, &after).unwrap();
+            fs::File::options()
+                .write(true)
+                .open(&config)
+                .unwrap()
+                .set_modified(modified)
+                .unwrap();
+            if watcher {
+                sync_changed_paths(dir.path(), &db, ["tsconfig.json"]).unwrap();
+            } else {
+                sync_project_once(dir.path()).unwrap();
+            }
+            assert!(imports_double(&db), "watcher {watcher}");
+            assert_eq!(edge_projection(&db), fresh, "watcher {watcher}");
+        }
+    }
+
     /// W5-06: a directory coming into a workspace glob's listing moves the
     /// listing, and so does the listed folder coming whole, though no event
     /// names a control file in either (each is moved in whole): the members'

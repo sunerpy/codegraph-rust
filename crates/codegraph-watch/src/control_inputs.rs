@@ -46,9 +46,6 @@ pub const FRAMEWORKS_VERSION_KEY: &str = "frameworks_version";
 /// Value of [`FRAMEWORKS_VERSION_KEY`].
 pub const FRAMEWORKS_VERSION: &str = "1";
 
-/// A file larger than this is digested by its size and modification time.
-const READ_LIMIT: u64 = 64 * 1024 * 1024;
-
 /// A kind of control input, by the languages whose resolution reads it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ControlKind {
@@ -160,25 +157,16 @@ fn key_of(project_root: &Path, path: &Path) -> String {
     }
 }
 
-/// A file's digest: its text's sha256, or its size and modification time
-/// past [`READ_LIMIT`]; `None` when it is no readable regular file.
+/// A file's digest: its whole text's sha256, read whatever its size, as its
+/// readers read it whole; `None` when it is no readable regular file.
 fn file_digest(path: &Path) -> Option<String> {
     let metadata = std::fs::metadata(path).ok()?;
     if !metadata.is_file() {
         return None;
     }
-    if metadata.len() > READ_LIMIT {
-        let modified = metadata
-            .modified()
-            .ok()
-            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-            .map_or(0, |since| since.as_nanos());
-        return Some(format!("large:{}:{modified}", metadata.len()));
-    }
     let mut bytes = Vec::new();
     std::fs::File::open(path)
         .ok()?
-        .take(READ_LIMIT + 1)
         .read_to_end(&mut bytes)
         .ok()?;
     Some(hash_content(&String::from_utf8_lossy(&bytes)))
