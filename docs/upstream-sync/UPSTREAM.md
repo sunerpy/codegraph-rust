@@ -23,10 +23,15 @@
 - **Next discovery starts here:**
   `b635dd467f0578926a9c01a37b9d28d2b26689f1..origin/main`. Do not re-triage the
   audited range.
-- **Planned for codegraph-rs `v0.55.0`:** every row of the 2026-10-10 audit
-  except its `ALREADY-HAVE`, `N/A` and `OWNER-EXCLUDED` rows, in one pull
-  request; see the 2026-10-10 entry below. The tracked release stays `v1.6.1`
-  until that release ships and its downloaded binaries are verified.
+- **Planned for codegraph-rs `v0.55.0`:** the 2026-10-10 audit's rows under
+  waves W0 to W6 and W10 of its program. By the owner's decision of 2026-10-16
+  the rows under W7, W8 and W9 (the UI family F1–F12 with the synthesis stage
+  and the framework resolvers, VB.NET, `codegraph context`, #1617 and the 26
+  v1.5.0 performance strategies) move to a follow-up pull request; the audit
+  marks them `PLANNED (follow-up PR)`, and a row that lands only partly in
+  `v0.55.0` names both halves. See the 2026-10-16 entry below. The tracked
+  release stays `v1.6.1` until `v0.55.0` ships and its downloaded binaries are
+  verified.
 - **Upstream repository:** <https://github.com/colbymchenry/codegraph>.
 - **Shipped in codegraph-rs `v0.52.0`, 2026-10-01:**
   - #286, which makes a full `sync` keep what `index` keeps;
@@ -77,8 +82,11 @@
   edges and routers, the synthesis layer and its schema, cross-tier channels,
   server route naming, the explore Flow, the React Native bridge) remain
   deferred, scheduled as phases 2–4: F10/F11 first, then F1–F6 with Screens and
-  Steps, then F7–F9 and F12. The 2026-10-10 program plans all of them for
-  `v0.55.0`.
+  Steps, then F7–F9 and F12. The 2026-10-10 program planned all of them for
+  `v0.55.0`; on 2026-10-16 the owner moved them, with the rest of W7, to the
+  follow-up pull request. `v0.55.0` lands from them only `950686de`'s test-file
+  classifier and `b1f40c57`'s `e2e/` test path (one predicate with the
+  resolver's), and the route roots its routes list reads.
 
 The Rust product and upstream release versions are independent. This Current
 alignment block is the only place that states release parity; dated log entries
@@ -177,6 +185,30 @@ below remain immutable historical evidence.
 > that records colby parity — do not infer it from `Cargo.toml`.
 
 ## Sync log
+
+### 2026-10-16 — the codegraph-rs `v0.55.0` program SPLIT into two pull requests (OD-18)
+
+- **Decision:** asked about the program's progress after it had run more than
+  a week, the owner split it. `v0.55.0` ships waves W0 to W6 and W10 of the
+  2026-10-10 program; a follow-up pull request ships W7 (the UI family F1–F12:
+  framework navigation edges and routers, the synthesis stage, cross-tier
+  channels, server route naming, the explore Flow, Steps and Screens, the React
+  Native bridge, and the other framework resolvers), W8 (VB.NET) and W9
+  (`codegraph context`, #1617 and the 26 v1.5.0 performance strategies).
+- **Ledger:** the audit's rows under W7, W8 and W9 are `PLANNED (follow-up PR)`,
+  which until now marked only OD-19's schema check; a row that lands only
+  partly in `v0.55.0` is `LANDED` for that half and `PLANNED (follow-up PR)`
+  for the other. The audit's Corrections table records the split.
+- **Extraction version:** `v0.55.0` moves it once, 21 → 22. An index it builds
+  reads `Current` under any binary whose version is still 22, so the follow-up
+  pull request must move it to 23 in its own commit before its first
+  graph-changing one (updating `PREVIOUS_EXTRACTION_VERSION` in
+  `crates/codegraph-store/tests/index_state.rs` with it), or unchanged files
+  would never get the new frameworks, synthesis and VB.NET semantics. It also
+  adds an upgrade test from a real `v0.55.0` index, over `codegraph sync` and a
+  daemon's catch-up.
+- **Not changed:** the tracked release stays `v1.6.1`; the discovery boundary
+  stays `b635dd46`.
 
 ### 2026-10-12 — `V1_5` #1346's C++ part, and #1070 and #1100 as pre-parse passes, PORTED (W4-CPP-01)
 
