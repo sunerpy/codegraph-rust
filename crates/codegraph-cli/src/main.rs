@@ -46,9 +46,8 @@ mod viewer_gate;
 /// musl's allocator serializes threads, so the static Linux release builds got
 /// slower as threads were added: a full index of this repository took over two
 /// minutes at 32 threads, against 51 s at one. Through mimalloc it takes 8 s.
-/// mimalloc is built without transparent huge pages (`no_thp`): it advised
-/// them for its own memory, and each thread's heap then held whole 2 MiB pages
-/// (W10-06).
+/// mimalloc asks for transparent huge pages for its own memory; a full index
+/// turns them off while it runs ([`HugePagesOff`], W10-07).
 #[cfg(target_env = "musl")]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -5638,6 +5637,153 @@ impl Drop for BulkIndexPragmaGuard {
     }
 }
 
+/// Transparent huge pages off for this process while a full index runs (W10-07).
+///
+/// mimalloc asks for huge pages for its own memory, and a full index runs one
+/// heap per worker thread: each then holds whole 2 MiB pages, up to twice a
+/// small project's memory at 32 threads. A short command's small heap takes far
+/// fewer page faults with them, so only the index body turns them off. Pages
+/// already in place stay as they are, and the processes the index starts
+/// inherit the setting. The guard turns them back on only if it turned them
+/// off: a setting the process inherited, or one the kernel cannot read or
+/// change, is left as it was, so the work after the index (and any process
+/// started after it) gets the setting the command began with.
+#[cfg(all(target_os = "linux", any(test, target_env = "musl")))]
+struct HugePagesOff {
+    turned_off: bool,
+}
+
+#[cfg(all(target_os = "linux", any(test, target_env = "musl")))]
+impl HugePagesOff {
+    fn begin() -> Self {
+        let turned_off = thp_disabled() == Some(false) && set_thp_disabled(true);
+        Self { turned_off }
+    }
+}
+
+#[cfg(all(target_os = "linux", any(test, target_env = "musl")))]
+impl Drop for HugePagesOff {
+    fn drop(&mut self) {
+        if self.turned_off {
+            set_thp_disabled(false);
+        }
+    }
+}
+
+#[cfg(all(target_os = "linux", any(test, target_env = "musl")))]
+unsafe extern "C" {
+    fn prctl(option: std::ffi::c_int, ...) -> std::ffi::c_int;
+}
+
+#[cfg(all(target_os = "linux", any(test, target_env = "musl")))]
+const PR_SET_THP_DISABLE: std::ffi::c_int = 41;
+#[cfg(all(target_os = "linux", any(test, target_env = "musl")))]
+const PR_GET_THP_DISABLE: std::ffi::c_int = 42;
+
+/// Whether transparent huge pages are off for this process, or `None` when
+/// the kernel cannot say.
+#[cfg(all(target_os = "linux", any(test, target_env = "musl")))]
+fn thp_disabled() -> Option<bool> {
+    let zero: std::ffi::c_ulong = 0;
+    // SAFETY: PR_GET_THP_DISABLE requires its four arguments to be zero and
+    // returns the setting; no pointer is passed.
+    match unsafe { prctl(PR_GET_THP_DISABLE, zero, zero, zero, zero) } {
+        0 => Some(false),
+        1 => Some(true),
+        _ => None,
+    }
+}
+
+/// Turns transparent huge pages off or on for this process; whether the
+/// kernel accepted the change.
+#[cfg(all(target_os = "linux", any(test, target_env = "musl")))]
+fn set_thp_disabled(disabled: bool) -> bool {
+    let zero: std::ffi::c_ulong = 0;
+    // SAFETY: PR_SET_THP_DISABLE reads its second argument as a flag and
+    // requires the other three to be zero; no pointer is passed.
+    unsafe {
+        prctl(
+            PR_SET_THP_DISABLE,
+            std::ffi::c_ulong::from(disabled),
+            zero,
+            zero,
+            zero,
+        ) == 0
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod huge_pages_tests {
+    use super::{HugePagesOff, set_thp_disabled};
+
+    /// `THP_enabled` of `/proc/self/status`, which kernels before 5.0 omit.
+    fn thp_enabled() -> Option<String> {
+        let status = std::fs::read_to_string("/proc/self/status").ok()?;
+        status
+            .lines()
+            .find_map(|line| line.strip_prefix("THP_enabled:"))
+            .map(|value| value.trim().to_string())
+    }
+
+    /// Runs [`huge_pages_child`] in a child process with huge pages first
+    /// `initially` on or off, so no other test of this binary sees the setting
+    /// change or changes it underneath the check.
+    fn run_child(initially: &str) {
+        let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                "huge_pages_tests::huge_pages_child",
+                "--nocapture",
+            ])
+            .env("CODEGRAPH_TEST_HUGE_PAGES_CHILD", initially)
+            .output()
+            .expect("run the child test");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "child failed:\n{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            stdout.contains("1 passed"),
+            "the child test did not run:\n{stdout}"
+        );
+    }
+
+    /// The guard of [`super::index_project_inner`] turns huge pages off and
+    /// back on.
+    #[test]
+    fn full_index_turns_transparent_huge_pages_off() {
+        run_child("on");
+    }
+
+    /// A setting the process inherited stays off after the guard.
+    #[test]
+    fn full_index_keeps_inherited_huge_pages_off() {
+        run_child("off");
+    }
+
+    #[test]
+    fn huge_pages_child() {
+        let Some(initially) = std::env::var_os("CODEGRAPH_TEST_HUGE_PAGES_CHILD") else {
+            return;
+        };
+        if thp_enabled().is_none() {
+            println!("this kernel does not report THP_enabled");
+            return;
+        }
+        let inherited_off = initially == "off";
+        assert!(set_thp_disabled(inherited_off), "set the starting setting");
+        let before = if inherited_off { "0" } else { "1" };
+        assert_eq!(thp_enabled().as_deref(), Some(before), "before the guard");
+        {
+            let _off = HugePagesOff::begin();
+            assert_eq!(thp_enabled().as_deref(), Some("0"), "inside the guard");
+        }
+        assert_eq!(thp_enabled().as_deref(), Some(before), "after the guard");
+    }
+}
+
 fn index_project_inner(
     project: &Path,
     kind: codegraph_store::RebuildKind,
@@ -5646,6 +5792,8 @@ fn index_project_inner(
     diagnostics: &DiagnosticArgs,
     command: &'static str,
 ) -> Result<IndexSummary> {
+    #[cfg(all(target_os = "linux", target_env = "musl"))]
+    let _huge_pages_off = HugePagesOff::begin();
     let started = std::time::Instant::now();
     let paths = index_paths(project)?;
     let index_root = paths.current_root().to_path_buf();

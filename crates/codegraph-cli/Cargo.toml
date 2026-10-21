@@ -45,11 +45,11 @@ tracing-subscriber = { workspace = true }
 time = { workspace = true }
 
 # musl's allocator serializes threads; the static Linux release builds use
-# mimalloc instead. Other targets keep their system allocator. `no_thp`: mimalloc
-# does not ask for transparent huge pages, which held up to twice a small full
-# index's memory at 32 threads.
+# mimalloc instead. Other targets keep their system allocator. mimalloc asks for
+# transparent huge pages; a full index turns them off while it runs
+# (`HugePagesOff` in src/main.rs).
 [target.'cfg(target_env = "musl")'.dependencies]
-mimalloc = { version = "0.1.52", default-features = false, features = ["v2", "no_thp"] }
+mimalloc = { version = "0.1.52", default-features = false, features = ["v2"] }
 
 [dev-dependencies]
 rusqlite = { workspace = true }
