@@ -5718,9 +5718,11 @@ fn index_project_inner(
     // write-capable target. The index root and DB are created by the rebuild
     // layer, so nothing below reconstructs a path or reopens the namespace.
     //
-    // `synchronous=OFF` + a larger cache/mmap window speed up the from-scratch bulk
-    // index. Their restore is part of the guard's EXPLICIT FALLIBLE `finish`, not a
-    // trailing statement, because every `?` below would skip a trailing restore.
+    // `synchronous=OFF` + a larger page cache speed up the from-scratch bulk index,
+    // which does not memory-map the file (the cache holds its pages, and a map
+    // counted them twice). Their restore is part of the guard's EXPLICIT FALLIBLE
+    // `finish`, not a trailing statement, because every `?` below would skip a
+    // trailing restore.
     // If the body bails out early, the guard's Drop only attempts state-gated
     // pragma repair/compaction/close and publishes nothing: the namespace stays
     // `phase=building` and unreadable.

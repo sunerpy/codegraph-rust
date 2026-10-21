@@ -519,7 +519,8 @@ mmap_size = 268435456
 ```
 
 A rebuild validates its exclusive `IndexLease` between file-touching PRAGMAs.
-Bulk indexing temporarily uses `synchronous=OFF`, a larger cache/mmap window, and
+Bulk indexing temporarily uses `synchronous=OFF` and a larger page cache, turns
+memory mapping off (`mmap_size=0`, so database pages are not held twice), and
 normally disables WAL autocheckpoint; a fallible finalizer restores defaults,
 compacts, and publishes the completed namespace. Early failure leaves the
 building namespace unreadable rather than publishing a partial database.

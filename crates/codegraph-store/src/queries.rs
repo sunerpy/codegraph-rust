@@ -1823,8 +1823,8 @@ impl Store {
     }
 
     /// Tune THIS connection for a from-scratch bulk index: drop `synchronous` to
-    /// `OFF`, grow the page cache and mmap window, and (unless opted out) DEFER WAL
-    /// auto-checkpointing for the whole run (#1231). This trades crash durability
+    /// `OFF`, grow the page cache, stop memory-mapping the file, and (unless opted
+    /// out) DEFER WAL auto-checkpointing for the whole run (#1231). This trades crash durability
     /// for throughput during the one-shot full index, which is always safe because
     /// the full-index path starts from an empty DB (`index --force` removes the file
     /// first) and is re-runnable from scratch on failure.
@@ -1838,6 +1838,11 @@ impl Store {
     /// one `wal_checkpoint(TRUNCATE)`. Set `CODEGRAPH_NO_WAL_DEFER=1` to keep the
     /// default autocheckpoint interval.
     ///
+    /// No memory map (`mmap_size=0`): the page cache already holds the pages a
+    /// full index writes and reads back, so mapping the file as well counted the
+    /// database twice in peak RSS (once as cache, once as mapped file pages)
+    /// without making the index faster.
+    ///
     /// `synchronous`, `cache_size`, `mmap_size`, and `wal_autocheckpoint` are all
     /// durability/scheduling knobs only: none alters committed content, so golden
     /// byte-equivalence is preserved. `wal_autocheckpoint` is a per-connection
@@ -1849,8 +1854,7 @@ impl Store {
     pub fn set_bulk_index_pragmas(&self) -> rusqlite::Result<()> {
         self.conn.pragma_update(None, "synchronous", "OFF")?;
         self.conn.pragma_update(None, "cache_size", -262_144)?;
-        self.conn
-            .pragma_update(None, "mmap_size", 1_073_741_824_i64)?;
+        self.conn.pragma_update(None, "mmap_size", 0_i64)?;
         if !wal_defer_disabled() {
             self.conn.pragma_update(None, "wal_autocheckpoint", 0)?;
         }
