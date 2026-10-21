@@ -1180,18 +1180,24 @@ fn parse_js_colon_alias(name: &str) -> Option<(String, String)> {
 
 /// Strip JS line + block comments preserving strings (`stripJsComments`,
 /// `import-resolver.ts:935-972`).
+///
+/// Walks bytes: every character it acts on (the three quotes, `\`, `/`, `*`
+/// and `\n`) is ASCII, and no byte of a multi-byte UTF-8 character equals one,
+/// so each removed comment starts and ends on a character boundary and the
+/// result is the character-by-character scan's, without first copying the text
+/// into a `Vec<char>` (W10-08).
 fn strip_js_comments(content: &str) -> String {
-    let chars: Vec<char> = content.chars().collect();
-    let n = chars.len();
-    let mut out = String::with_capacity(content.len());
+    let bytes = content.as_bytes();
+    let n = bytes.len();
+    let mut out: Vec<u8> = Vec::with_capacity(n);
     let mut i = 0;
-    let mut str_ch: Option<char> = None;
+    let mut str_ch: Option<u8> = None;
     while i < n {
-        let ch = chars[i];
+        let ch = bytes[i];
         if let Some(quote) = str_ch {
             out.push(ch);
-            if ch == '\\' && i + 1 < n {
-                out.push(chars[i + 1]);
+            if ch == b'\\' && i + 1 < n {
+                out.push(bytes[i + 1]);
                 i += 2;
                 continue;
             }
@@ -1201,21 +1207,21 @@ fn strip_js_comments(content: &str) -> String {
             i += 1;
             continue;
         }
-        if ch == '"' || ch == '\'' || ch == '`' {
+        if ch == b'"' || ch == b'\'' || ch == b'`' {
             str_ch = Some(ch);
             out.push(ch);
             i += 1;
             continue;
         }
-        if ch == '/' && chars.get(i + 1).copied() == Some('/') {
-            while i < n && chars[i] != '\n' {
+        if ch == b'/' && bytes.get(i + 1) == Some(&b'/') {
+            while i < n && bytes[i] != b'\n' {
                 i += 1;
             }
             continue;
         }
-        if ch == '/' && chars.get(i + 1).copied() == Some('*') {
+        if ch == b'/' && bytes.get(i + 1) == Some(&b'*') {
             i += 2;
-            while i < n && !(chars[i] == '*' && chars.get(i + 1).copied() == Some('/')) {
+            while i < n && !(bytes[i] == b'*' && bytes.get(i + 1) == Some(&b'/')) {
                 i += 1;
             }
             i += 2;
@@ -1224,7 +1230,7 @@ fn strip_js_comments(content: &str) -> String {
         out.push(ch);
         i += 1;
     }
-    out
+    String::from_utf8(out).expect("a removed comment starts and ends at an ASCII byte")
 }
 
 /// Bindings a Rust file's `use` declarations introduce, as `(local_name, path)`.
@@ -4830,6 +4836,99 @@ const { x, y: z } = require('./other');
             m.iter()
                 .any(|x| x.local_name == "bar" && x.source == "foo/bar.hpp")
         );
+    }
+
+    /// The character-by-character scan `strip_js_comments` replaced (W10-08),
+    /// kept as the oracle for its byte scan.
+    fn strip_js_comments_by_chars(content: &str) -> String {
+        let chars: Vec<char> = content.chars().collect();
+        let n = chars.len();
+        let mut out = String::with_capacity(content.len());
+        let mut i = 0;
+        let mut str_ch: Option<char> = None;
+        while i < n {
+            let ch = chars[i];
+            if let Some(quote) = str_ch {
+                out.push(ch);
+                if ch == '\\' && i + 1 < n {
+                    out.push(chars[i + 1]);
+                    i += 2;
+                    continue;
+                }
+                if ch == quote {
+                    str_ch = None;
+                }
+                i += 1;
+                continue;
+            }
+            if ch == '"' || ch == '\'' || ch == '`' {
+                str_ch = Some(ch);
+                out.push(ch);
+                i += 1;
+                continue;
+            }
+            if ch == '/' && chars.get(i + 1).copied() == Some('/') {
+                while i < n && chars[i] != '\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            if ch == '/' && chars.get(i + 1).copied() == Some('*') {
+                i += 2;
+                while i < n && !(chars[i] == '*' && chars.get(i + 1).copied() == Some('/')) {
+                    i += 1;
+                }
+                i += 2;
+                continue;
+            }
+            out.push(ch);
+            i += 1;
+        }
+        out
+    }
+
+    #[test]
+    fn strip_js_comments_matches_the_character_scan() {
+        let cases = [
+            "const a = 'é'; // ünïcödé comment\nconst b = \"日本\"; /* 块注释 🦀 */ const c = `🦀${x}`;",
+            "const s = \"\\é\"; const t = '\\🦀'; const u = `\\日`;",
+            "\"unterminated é",
+            "/* unterminated 日本",
+            "x // no newline at the end é",
+            "'\\",
+            "a / b / c; const re = /é+/; d */ e",
+            "const u = 'a // b'; const v = \"c /* d */\"; const w = `e // f`;",
+            "/**/ /*/ x */ /* * / */ // \r\nnext\r\n",
+            "",
+        ];
+        for case in cases {
+            assert_eq!(
+                strip_js_comments(case),
+                strip_js_comments_by_chars(case),
+                "{case:?}"
+            );
+        }
+        let alphabet = [
+            'a', ' ', '/', '*', '\'', '"', '`', '\\', '\n', 'é', '日', '🦀',
+        ];
+        // Every text of at most four of these characters.
+        let mut texts = vec![String::new()];
+        let mut level = vec![String::new()];
+        for _ in 0..4 {
+            level = level
+                .iter()
+                .flat_map(|text| alphabet.iter().map(move |c| format!("{text}{c}")))
+                .collect();
+            texts.extend(level.iter().cloned());
+        }
+        assert_eq!(texts.len(), 1 + 12 + 144 + 1728 + 20736);
+        for text in &texts {
+            assert_eq!(
+                strip_js_comments(text),
+                strip_js_comments_by_chars(text),
+                "{text:?}"
+            );
+        }
     }
 
     #[test]
