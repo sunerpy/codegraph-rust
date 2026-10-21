@@ -141,6 +141,10 @@ impl<'tree> ValueRefs<'tree> {
                 stack.push(body);
             }
             let mut visited = 0;
+            // One cursor per scan, reset onto each node: `walk()` is a C
+            // allocation, and one per visited node was most of the parse
+            // stage's allocations (W10-05).
+            let mut cursor = reader.node.walk();
             while let Some(node) = stack.pop() {
                 if visited >= MAX_VALUE_REF_NODES {
                     break;
@@ -159,7 +163,6 @@ impl<'tree> ValueRefs<'tree> {
                         edges.push(value_ref_edge(&reader.id, target));
                     }
                 }
-                let mut cursor = node.walk();
                 stack.extend(node.named_children(&mut cursor));
             }
         }
@@ -184,6 +187,7 @@ impl<'tree> ValueRefs<'tree> {
         };
         let mut stack = vec![root];
         let mut visited = 0;
+        let mut cursor = root.walk();
         while let Some(node) = stack.pop() {
             if visited >= MAX_VALUE_REF_NODES {
                 break;
@@ -231,7 +235,6 @@ impl<'tree> ValueRefs<'tree> {
                 }
                 _ => {}
             }
-            let mut cursor = node.walk();
             stack.extend(node.named_children(&mut cursor));
         }
         for (name, count) in declared {
@@ -301,5 +304,162 @@ fn value_ref_edge(source: &str, target: &str) -> Edge {
         line: None,
         col: None,
         provenance: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::Command;
+
+    const CHILD: &str = "CODEGRAPH_TEST_VALUE_REF_ALLOCATIONS";
+
+    /// A tree-sitter allocator over Rust's that counts allocation calls.
+    mod counting {
+        use std::alloc::{Layout, alloc, alloc_zeroed, dealloc, realloc};
+        use std::ffi::c_void;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        pub static CALLS: AtomicUsize = AtomicUsize::new(0);
+        const HEADER: usize = 16;
+
+        fn layout(size: usize) -> Layout {
+            Layout::from_size_align(size + HEADER, 16).expect("allocation layout")
+        }
+
+        unsafe fn finish(base: *mut u8, size: usize) -> *mut c_void {
+            assert!(!base.is_null(), "tree-sitter allocation failed");
+            unsafe {
+                base.cast::<usize>().write(size);
+                base.add(HEADER).cast()
+            }
+        }
+
+        unsafe fn base_of(ptr: *mut c_void) -> (*mut u8, usize) {
+            let base = unsafe { ptr.cast::<u8>().sub(HEADER) };
+            (base, unsafe { base.cast::<usize>().read() })
+        }
+
+        pub unsafe extern "C" fn malloc(size: usize) -> *mut c_void {
+            CALLS.fetch_add(1, Ordering::Relaxed);
+            unsafe { finish(alloc(layout(size)), size) }
+        }
+
+        pub unsafe extern "C" fn calloc(count: usize, size: usize) -> *mut c_void {
+            CALLS.fetch_add(1, Ordering::Relaxed);
+            let total = count.checked_mul(size).expect("calloc size");
+            unsafe { finish(alloc_zeroed(layout(total)), total) }
+        }
+
+        pub unsafe extern "C" fn resize(ptr: *mut c_void, size: usize) -> *mut c_void {
+            if ptr.is_null() {
+                return unsafe { malloc(size) };
+            }
+            CALLS.fetch_add(1, Ordering::Relaxed);
+            unsafe {
+                let (base, old) = base_of(ptr);
+                finish(realloc(base, layout(old), size + HEADER), size)
+            }
+        }
+
+        pub unsafe extern "C" fn free(ptr: *mut c_void) {
+            if !ptr.is_null() {
+                unsafe {
+                    let (base, old) = base_of(ptr);
+                    dealloc(base, layout(old));
+                }
+            }
+        }
+    }
+
+    /// W10-05: a value-reference scan allocates one tree cursor per reader,
+    /// not one per syntax node it visits. Each cursor is a C allocation, and
+    /// the musl release build serializes those on one lock: a cursor per node
+    /// made redis's walk stage three times slower at 32 threads. Runs in a
+    /// child process, since the allocator must be installed before any other
+    /// tree-sitter call.
+    #[test]
+    fn value_ref_scan_allocates_a_cursor_per_reader_not_per_node() {
+        let output = Command::new(std::env::current_exe().expect("current test binary"))
+            .args([
+                "--exact",
+                "value_refs::tests::value_ref_scan_allocation_child",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .expect("run the allocation child");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("CASE_PASSED"),
+            "allocation child failed: stdout={stdout} stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn value_ref_scan_allocation_child() {
+        if std::env::var_os(CHILD).is_none() {
+            return;
+        }
+        // SAFETY: the child runs this test alone, before any tree-sitter call.
+        unsafe {
+            tree_sitter::set_allocator(Some(tree_sitter::Allocator {
+                malloc: counting::malloc,
+                calloc: counting::calloc,
+                realloc: counting::resize,
+                free: counting::free,
+            }));
+        }
+        const READERS: usize = 30;
+        let mut source = String::from("static const int LIMIT_VALUE = 3;\n");
+        for i in 0..READERS {
+            source.push_str(&format!(
+                "int f{i}(int a, int b) {{ return a + b * LIMIT_VALUE - (a / 2) + (b % 3) + a * b; }}\n"
+            ));
+        }
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_c::LANGUAGE.into())
+            .expect("C grammar");
+        let tree = parser.parse(&source, None).expect("parse");
+        let root = tree.root_node();
+        let mut refs = ValueRefs::default();
+        let file = "file:src/limits.c";
+        let mut cursor = root.walk();
+        for (i, item) in root.named_children(&mut cursor).enumerate() {
+            match item.kind() {
+                "declaration" => refs.capture(
+                    Language::C,
+                    NodeKind::Constant,
+                    "LIMIT_VALUE",
+                    "constant:limit",
+                    item,
+                    Some(file),
+                ),
+                "function_definition" => refs.capture(
+                    Language::C,
+                    NodeKind::Function,
+                    &format!("f{}", i - 1),
+                    &format!("function:f{}", i - 1),
+                    item,
+                    Some(file),
+                ),
+                other => panic!("unexpected top-level node {other}"),
+            }
+        }
+        drop(cursor);
+        let before = counting::CALLS.load(std::sync::atomic::Ordering::Relaxed);
+        let edges = refs.into_edges(Language::C, "src/limits.c", root, &source);
+        let used = counting::CALLS.load(std::sync::atomic::Ordering::Relaxed) - before;
+        assert_eq!(edges.len(), READERS, "every function reads LIMIT_VALUE");
+        // One cursor for the shadowing scan and one per reader (the constant
+        // reads nothing but is a reader too), with room for a second
+        // allocation each; a cursor per visited node made 1,935.
+        assert!(
+            used <= 2 * (READERS + 2),
+            "the scan made {used} tree-sitter allocations for {READERS} readers"
+        );
+        println!("CASE_PASSED");
     }
 }
