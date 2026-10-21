@@ -1,5 +1,74 @@
 # Changelog
 
+## [0.55.0](https://github.com/sunerpy/codegraph-rust/compare/v0.54.0...v0.55.0) (2026-10-21)
+
+
+### Features
+
+* **cli:** report files needing reindex and files with parse errors ([0796c8a](https://github.com/sunerpy/codegraph-rust/commit/0796c8a4010fbb5d7f8d157244498b6f4d8ee2b6))
+* **core:** detect minified scripts by content and keep their symbols file-local ([0796c8a](https://github.com/sunerpy/codegraph-rust/commit/0796c8a4010fbb5d7f8d157244498b6f4d8ee2b6))
+* **extract:** C and C++ preParse round 2, brace-derived scopes and types in declarations ([0796c8a](https://github.com/sunerpy/codegraph-rust/commit/0796c8a4010fbb5d7f8d157244498b6f4d8ee2b6))
+* **extract:** CFML container tags, cfinterface, cfscript-in-tag re-parse and cfquery ([0796c8a](https://github.com/sunerpy/codegraph-rust/commit/0796c8a4010fbb5d7f8d157244498b6f4d8ee2b6))
+* **extract:** CommonJS requires import their files ([0796c8a](https://github.com/sunerpy/codegraph-rust/commit/0796c8a4010fbb5d7f8d157244498b6f4d8ee2b6))
+* **extract:** emit instantiations for object creation and literal construction ([0796c8a](https://github.com/sunerpy/codegraph-rust/commit/0796c8a4010fbb5d7f8d157244498b6f4d8ee2b6))
+* **extract:** fold Vue, Svelte and Astro scripts into the component's file node ([0796c8a](https://github.com/sunerpy/codegraph-rust/commit/0796c8a4010fbb5d7f8d157244498b6f4d8ee2b6))
+* **extract:** Go type aliases, defined types and standalone doc comments ([0796c8a](https://github.com/sunerpy/codegraph-rust/commit/0796c8a4010fbb5d7f8d157244498b6f4d8ee2b6))
+* **extract:** Kotlin infix calls, Lombok members, Java enum bodies and C# accessor bodies ([0796c8a](https://github.com/sunerpy/codegraph-rust/commit/0796c8a4010fbb5d7f8d157244498b6f4d8ee2b6))
+* **extract:** parse [@flow](https://github.com/flow) files as TSX with Flow syntax blanked ([0796c8a](https://github.com/sunerpy/codegraph-rust/commit/0796c8a4010fbb5d7f8d157244498b6f4d8ee2b6))
+* **extract:** record class heritage for C#, Python, PHP, Objective-C, Go and Dart ([0796c8a](https://github.com/sunerpy/codegraph-rust/commit/0796c8a4010fbb5d7f8d157244498b6f4d8ee2b6))
+* **extract:** same-file value references and static member reads ([0796c8a](https://github.com/sunerpy/codegraph-rust/commit/0796c8a4010fbb5d7f8d157244498b6f4d8ee2b6))
+* **extract:** type-annotation references for Rust, Go, Java, Kotlin, Scala, C#, Swift, Dart and PHP ([0796c8a](https://github.com/sunerpy/codegraph-rust/commit/0796c8a4010fbb5d7f8d157244498b6f4d8ee2b6))
+* **resolve:** a call reaches the overload its arguments fit ([0796c8a](https://github.com/sunerpy/codegraph-rust/commit/0796c8a4010fbb5d7f8d157244498b6f4d8ee2b6))
+* **resolve:** C++ alias receivers, base classes by name lookup and macro-opened namespaces ([0796c8a](https://github.com/sunerpy/codegraph-rust/commit/0796c8a4010fbb5d7f8d157244498b6f4d8ee2b6))
+* **resolve:** Dart library visibility, import URIs, parts, getters, call chains and annotations ([0796c8a](https://github.com/sunerpy/codegraph-rust/commit/0796c8a4010fbb5d7f8d157244498b6f4d8ee2b6))
+* **resolve:** JavaScript namespace re-exports, default aliases and destructured call results ([0796c8a](https://github.com/sunerpy/codegraph-rust/commit/0796c8a4010fbb5d7f8d157244498b6f4d8ee2b6))
+* **resolve:** Python package re-exports, module members, pytest fixtures and Django managers ([0796c8a](https://github.com/sunerpy/codegraph-rust/commit/0796c8a4010fbb5d7f8d157244498b6f4d8ee2b6))
+* **resolve:** Swift extensions and conformance, Go receiver types, Rust variant paths ([0796c8a](https://github.com/sunerpy/codegraph-rust/commit/0796c8a4010fbb5d7f8d157244498b6f4d8ee2b6))
+* **ui:** Map collapses pass-through folders and opens on the whole repo ([0796c8a](https://github.com/sunerpy/codegraph-rust/commit/0796c8a4010fbb5d7f8d157244498b6f4d8ee2b6))
+
+
+### Bug Fixes
+
+* **daemon:** answer proxied initialize and tools/list as the direct server does ([0796c8a](https://github.com/sunerpy/codegraph-rust/commit/0796c8a4010fbb5d7f8d157244498b6f4d8ee2b6))
+* **daemon:** replace a daemon left by an older install ([0796c8a](https://github.com/sunerpy/codegraph-rust/commit/0796c8a4010fbb5d7f8d157244498b6f4d8ee2b6))
+* **dead-code:** unresolved decorators and lifecycle hooks count ([0796c8a](https://github.com/sunerpy/codegraph-rust/commit/0796c8a4010fbb5d7f8d157244498b6f4d8ee2b6))
+* **deps:** update quinn-proto to 0.11.19, rustls to 0.23.46 and self_update to 1.3.1 ([0796c8a](https://github.com/sunerpy/codegraph-rust/commit/0796c8a4010fbb5d7f8d157244498b6f4d8ee2b6))
+* **deps:** update rustls-webpki to 0.103.16 and webpki-roots to 1.0.10 ([0796c8a](https://github.com/sunerpy/codegraph-rust/commit/0796c8a4010fbb5d7f8d157244498b6f4d8ee2b6))
+* **extract:** Shopify JSON is Liquid only inside a theme; references stay in their theme ([0796c8a](https://github.com/sunerpy/codegraph-rust/commit/0796c8a4010fbb5d7f8d157244498b6f4d8ee2b6))
+* **extract:** stop indexing phantom macro functions ([0796c8a](https://github.com/sunerpy/codegraph-rust/commit/0796c8a4010fbb5d7f8d157244498b6f4d8ee2b6))
+* **extract:** store the sniffed language on the file row ([0796c8a](https://github.com/sunerpy/codegraph-rust/commit/0796c8a4010fbb5d7f8d157244498b6f4d8ee2b6))
+* **mcp:** bound the startup sub-project scan ([0796c8a](https://github.com/sunerpy/codegraph-rust/commit/0796c8a4010fbb5d7f8d157244498b6f4d8ee2b6))
+* **mcp:** serve MCP 2026-07-28 sessions at a too-broad root ([0796c8a](https://github.com/sunerpy/codegraph-rust/commit/0796c8a4010fbb5d7f8d157244498b6f4d8ee2b6))
+* **prompt-hook:** skip a prompt that is entirely an agent message ([0796c8a](https://github.com/sunerpy/codegraph-rust/commit/0796c8a4010fbb5d7f8d157244498b6f4d8ee2b6))
+* **rank:** judge non-production folders by the layout above src/ ([0796c8a](https://github.com/sunerpy/codegraph-rust/commit/0796c8a4010fbb5d7f8d157244498b6f4d8ee2b6))
+* **resolve:** a C# call on an outside type reaches the project's extension method for it ([0796c8a](https://github.com/sunerpy/codegraph-rust/commit/0796c8a4010fbb5d7f8d157244498b6f4d8ee2b6))
+* **resolve:** an imports reference binds the file it names, never its own import statement ([0796c8a](https://github.com/sunerpy/codegraph-rust/commit/0796c8a4010fbb5d7f8d157244498b6f4d8ee2b6))
+* **resolve:** language rules for JavaScript, Python, Rust, Go, C/C++, JVM, C#, Swift, Objective-C, PHP, Ruby, Lua, R, Dart, CFML, Solidity and Erlang ([0796c8a](https://github.com/sunerpy/codegraph-rust/commit/0796c8a4010fbb5d7f8d157244498b6f4d8ee2b6))
+* **resolve:** name matching stops for receivers no project type explains, test suites and out-of-scope bindings ([0796c8a](https://github.com/sunerpy/codegraph-rust/commit/0796c8a4010fbb5d7f8d157244498b6f4d8ee2b6))
+* **resolve:** never offer import statements as name-match candidates ([0796c8a](https://github.com/sunerpy/codegraph-rust/commit/0796c8a4010fbb5d7f8d157244498b6f4d8ee2b6))
+* **scan:** honor the repository's .git/info/exclude ([0796c8a](https://github.com/sunerpy/codegraph-rust/commit/0796c8a4010fbb5d7f8d157244498b6f4d8ee2b6))
+* **serve:** keep a cold-start MCP session attached to the daemon it starts ([0796c8a](https://github.com/sunerpy/codegraph-rust/commit/0796c8a4010fbb5d7f8d157244498b6f4d8ee2b6))
+* **sync:** JavaScript module surfaces and class supertypes converge with a full index ([0796c8a](https://github.com/sunerpy/codegraph-rust/commit/0796c8a4010fbb5d7f8d157244498b6f4d8ee2b6))
+* **sync:** re-resolve dependents when tsconfig paths, package.json, C# project files, Cargo or pubspec manifests change ([0796c8a](https://github.com/sunerpy/codegraph-rust/commit/0796c8a4010fbb5d7f8d157244498b6f4d8ee2b6))
+* **sync:** retry failed imports and qualified references when what they name appears ([0796c8a](https://github.com/sunerpy/codegraph-rust/commit/0796c8a4010fbb5d7f8d157244498b6f4d8ee2b6))
+* **ui:** directed Flow finds its ends by exact names and prefers named routes ([0796c8a](https://github.com/sunerpy/codegraph-rust/commit/0796c8a4010fbb5d7f8d157244498b6f4d8ee2b6))
+* **ui:** key viewer lists by id ([0796c8a](https://github.com/sunerpy/codegraph-rust/commit/0796c8a4010fbb5d7f8d157244498b6f4d8ee2b6))
+* **ui:** move past a permission-denied viewer port ([0796c8a](https://github.com/sunerpy/codegraph-rust/commit/0796c8a4010fbb5d7f8d157244498b6f4d8ee2b6))
+* **watch:** rescan the project when the watcher may have lost events ([0796c8a](https://github.com/sunerpy/codegraph-rust/commit/0796c8a4010fbb5d7f8d157244498b6f4d8ee2b6))
+* **windows:** hide the console window of every git call ([0796c8a](https://github.com/sunerpy/codegraph-rust/commit/0796c8a4010fbb5d7f8d157244498b6f4d8ee2b6))
+
+
+### Performance Improvements
+
+* **cli:** turn transparent huge pages off only for a full index ([0796c8a](https://github.com/sunerpy/codegraph-rust/commit/0796c8a4010fbb5d7f8d157244498b6f4d8ee2b6))
+* **extract:** reuse one tree cursor per value-reference scan ([0796c8a](https://github.com/sunerpy/codegraph-rust/commit/0796c8a4010fbb5d7f8d157244498b6f4d8ee2b6))
+* **resolve:** keep name resolution linear when a repository repeats a name many times ([0796c8a](https://github.com/sunerpy/codegraph-rust/commit/0796c8a4010fbb5d7f8d157244498b6f4d8ee2b6))
+* **resolve:** keep only handles in the snapshot's node lists ([0796c8a](https://github.com/sunerpy/codegraph-rust/commit/0796c8a4010fbb5d7f8d157244498b6f4d8ee2b6))
+* **resolve:** strip JavaScript comments without copying the text into characters ([0796c8a](https://github.com/sunerpy/codegraph-rust/commit/0796c8a4010fbb5d7f8d157244498b6f4d8ee2b6))
+* **store:** keep resolved references so sync re-resolves dependents without re-extracting them ([0796c8a](https://github.com/sunerpy/codegraph-rust/commit/0796c8a4010fbb5d7f8d157244498b6f4d8ee2b6))
+* **store:** stop memory-mapping the database during a full index ([0796c8a](https://github.com/sunerpy/codegraph-rust/commit/0796c8a4010fbb5d7f8d157244498b6f4d8ee2b6))
+* **sync:** extract the dependent files of a sync in parallel ([0796c8a](https://github.com/sunerpy/codegraph-rust/commit/0796c8a4010fbb5d7f8d157244498b6f4d8ee2b6))
+
 ## [0.54.0](https://github.com/sunerpy/codegraph-rust/compare/v0.53.3...v0.54.0) (2026-10-08)
 
 
