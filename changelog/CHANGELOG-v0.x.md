@@ -14,7 +14,7 @@
 * **extract:** fold Vue, Svelte and Astro scripts into the component's file node ([0796c8a](https://github.com/sunerpy/codegraph-rust/commit/0796c8a4010fbb5d7f8d157244498b6f4d8ee2b6))
 * **extract:** Go type aliases, defined types and standalone doc comments ([0796c8a](https://github.com/sunerpy/codegraph-rust/commit/0796c8a4010fbb5d7f8d157244498b6f4d8ee2b6))
 * **extract:** Kotlin infix calls, Lombok members, Java enum bodies and C# accessor bodies ([0796c8a](https://github.com/sunerpy/codegraph-rust/commit/0796c8a4010fbb5d7f8d157244498b6f4d8ee2b6))
-* **extract:** parse [@flow](https://github.com/flow) files as TSX with Flow syntax blanked ([0796c8a](https://github.com/sunerpy/codegraph-rust/commit/0796c8a4010fbb5d7f8d157244498b6f4d8ee2b6))
+* **extract:** parse Flow-marked files as TSX with Flow syntax blanked ([0796c8a](https://github.com/sunerpy/codegraph-rust/commit/0796c8a4010fbb5d7f8d157244498b6f4d8ee2b6))
 * **extract:** record class heritage for C#, Python, PHP, Objective-C, Go and Dart ([0796c8a](https://github.com/sunerpy/codegraph-rust/commit/0796c8a4010fbb5d7f8d157244498b6f4d8ee2b6))
 * **extract:** same-file value references and static member reads ([0796c8a](https://github.com/sunerpy/codegraph-rust/commit/0796c8a4010fbb5d7f8d157244498b6f4d8ee2b6))
 * **extract:** type-annotation references for Rust, Go, Java, Kotlin, Scala, C#, Swift, Dart and PHP ([0796c8a](https://github.com/sunerpy/codegraph-rust/commit/0796c8a4010fbb5d7f8d157244498b6f4d8ee2b6))
