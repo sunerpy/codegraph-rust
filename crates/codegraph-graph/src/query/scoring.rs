@@ -475,126 +475,34 @@ const NON_PRODUCTION_DIRS: &[&str] = &[
     "demos",
 ];
 
+/// A non-production folder in the project layout: only the part of the path
+/// above its first `/src/` counts, never the package path below it, so
+/// `core/data/src/main/kotlin/com/google/samples/apps/…` is a Google sample by
+/// name and production code by layout (upstream `950686de`).
 fn matches_non_production_dir(lower_path: &str) -> bool {
-    NON_PRODUCTION_DIRS.iter().any(|dir| {
-        lower_path.contains(&format!("/{dir}/")) || lower_path.starts_with(&format!("{dir}/"))
-    })
+    let scope = match lower_path.find("/src/") {
+        Some(at) => &lower_path[..=at],
+        None if lower_path.starts_with("src/") => "",
+        None => lower_path,
+    };
+    NON_PRODUCTION_DIRS
+        .iter()
+        .any(|dir| scope.contains(&format!("/{dir}/")) || scope.starts_with(&format!("{dir}/")))
 }
 
 /// Whether a path looks like test or other non-production code (examples,
-/// samples, fixtures, benchmarks, demos) — upstream `isTestFile`, the wide
-/// reading ranking uses.
+/// samples, fixtures, benchmarks, demos in the layout above `src/`) — upstream
+/// `isTestFile`, the wide reading ranking uses.
 pub fn is_test_file(file_path: &str) -> bool {
     is_test_path(file_path) || matches_non_production_dir(&file_path.to_lowercase())
 }
 
 /// Whether a path names a TEST suite — upstream `isTestPath`, the narrow half of
-/// [`is_test_file`]: the file-name and directory conventions test suites use,
-/// and nothing else (an example or a fixture is not a test).
+/// [`is_test_file`]: the file-name and directory conventions test suites and
+/// test-support modules use, and nothing else (an example or a fixture is not a
+/// test). The resolver's test-suite rule reads the same predicate.
 pub fn is_test_path(file_path: &str) -> bool {
-    let lower = file_path.to_lowercase();
-    let file_name = basename(file_path);
-    let lower_name = file_name.to_lowercase();
-
-    if lower_name.starts_with("test_")
-        || lower_name.starts_with("test.")
-        || matches_separator_test(&lower_name)
-        || matches_camel_test_suffix(&file_name)
-    {
-        return true;
-    }
-
-    if lower.contains("/tests/")
-        || lower.contains("/test/")
-        || lower.contains("/__tests__/")
-        || lower.contains("/spec/")
-        || lower.contains("/specs/")
-        || lower.contains("/testlib/")
-        || lower.contains("/testing/")
-        || lower.starts_with("test/")
-        || lower.starts_with("tests/")
-        || lower.starts_with("spec/")
-        || lower.starts_with("specs/")
-        || matches_camel_test_dir(file_path)
-    {
-        return true;
-    }
-
-    false
-}
-
-fn matches_separator_test(lower_name: &str) -> bool {
-    let chars: Vec<char> = lower_name.chars().collect();
-    let dot = match lower_name.rfind('.') {
-        Some(idx) => idx,
-        None => return false,
-    };
-    let ext: String = lower_name[dot + 1..].to_string();
-    if ext.is_empty()
-        || !ext
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
-    {
-        return false;
-    }
-    let stem = &lower_name[..dot];
-    let stem_chars: Vec<char> = stem.chars().collect();
-    for marker in ["test", "tests", "spec", "specs"] {
-        if let Some(pos) = stem.rfind(marker)
-            && pos + marker.len() == stem.len()
-            && pos > 0
-        {
-            let sep = stem_chars[pos - 1];
-            if sep == '.' || sep == '_' || sep == '-' {
-                return true;
-            }
-        }
-    }
-    let _ = chars;
-    false
-}
-
-fn matches_camel_test_suffix(file_name: &str) -> bool {
-    let dot = match file_name.rfind('.') {
-        Some(idx) => idx,
-        None => return false,
-    };
-    let ext = &file_name[dot + 1..];
-    if ext.is_empty() || !ext.chars().all(|c| c.is_ascii_alphanumeric()) {
-        return false;
-    }
-    let stem = &file_name[..dot];
-    for marker in ["TestCase", "Tests", "Tester", "Test", "Specs", "Spec"] {
-        if stem.ends_with(marker) {
-            return true;
-        }
-    }
-    false
-}
-
-fn matches_camel_test_dir(file_path: &str) -> bool {
-    let chars: Vec<char> = file_path.chars().collect();
-    let n = chars.len();
-    let mut i = 0usize;
-    while i < n {
-        let at_segment_start = i == 0 || chars[i - 1] == '/';
-        if at_segment_start {
-            let mut j = i;
-            while j < n && chars[j].is_ascii_alphanumeric() {
-                j += 1;
-            }
-            if j < n && chars[j] == '/' {
-                let segment: String = chars[i..j].iter().collect();
-                for marker in ["Tests", "Test", "Spec"] {
-                    if segment.ends_with(marker) {
-                        return true;
-                    }
-                }
-            }
-        }
-        i += 1;
-    }
-    false
+    codegraph_core::file_class::is_test_path(file_path)
 }
 
 pub fn name_match_bonus(node_name: &str, query: &str) -> f64 {
@@ -944,6 +852,10 @@ mod tests {
         assert!(is_test_file("FooTest.java"));
         assert!(is_test_file("FooSpec.scala"));
         assert!(is_test_file("MyTestCase.cs"));
+        // Google's C++ unittests (upstream #2434); a bare `unittest.go` is code.
+        assert!(is_test_path("src/stack_unittest.cc"));
+        assert!(is_test_path("src/stack_unittests.cc"));
+        assert!(!is_test_path("cmd/promtool/unittest.go"));
     }
 
     #[test]
@@ -954,6 +866,98 @@ mod tests {
         assert!(is_test_file("app/UnitTests/Thing.cs"));
         assert!(is_test_file("examples/demo.rs"));
         assert!(is_test_file("fixtures/data.json"));
+    }
+
+    /// Upstream `__tests__/is-test-file.test.ts` (origin/main), case for case.
+    #[test]
+    fn is_test_file_reads_paths_as_upstream_does() {
+        // Test-support modules and doubles by directory name (`950686de`).
+        for path in [
+            "core/data-test/src/main/kotlin/com/example/FakeUserDataRepository.kt",
+            "core/datastore-test/src/main/kotlin/com/example/InMemoryDataStore.kt",
+            "core/testing/src/main/kotlin/com/example/TestUserDataRepository.kt",
+            "pkg/testdata/fixture.go",
+            "src/__mocks__/api.ts",
+            "internal/testutil/helpers.go",
+        ] {
+            assert!(is_test_file(path), "{path}");
+        }
+        // Only the project layout above `src/` decides; the package path below
+        // it never does…
+        for path in [
+            "core/data/src/main/kotlin/com/google/samples/apps/nowinandroid/core/data/SyncUtilities.kt",
+            "feature/foryou/impl/src/main/kotlin/com/google/samples/apps/ForYouViewModel.kt",
+            "src/samples/demo.ts",
+        ] {
+            assert!(!is_test_file(path), "{path}");
+        }
+        // …while a real examples folder in the layout still counts.
+        for path in [
+            "examples/basic/src/index.ts",
+            "packages/x/examples/basic.ts",
+            "benchmarks/run.py",
+        ] {
+            assert!(is_test_file(path), "{path}");
+        }
+        // Kotlin test files and source sets; Swift test files; the older
+        // conventions.
+        for path in [
+            "okhttp/src/jvmTest/kotlin/okhttp3/CallTest.kt",
+            "okhttp/src/commonTest/kotlin/okhttp3/CompressionInterceptorTest.kt",
+            "app/src/androidTest/java/com/example/FooTest.kt",
+            "module/src/integrationTest/kotlin/BarSpec.kt",
+            "Tests/SessionTests.swift",
+            "Sources/FooTest.swift",
+            "foo/test_bar.py",
+            "pkg/bar_test.go",
+            "src/foo.test.ts",
+            "src/foo.spec.ts",
+            "com/example/FooTest.java",
+            "com/example/FooTestCase.java",
+            "project/__tests__/foo.ts",
+            "project/tests/foo.rb",
+        ] {
+            assert!(is_test_file(path), "{path}");
+        }
+        // Google's unittest-named files are suites in both readings.
+        for path in [
+            "src/google/protobuf/wire_format_unittest.cc",
+            "src/google/protobuf/wire_format_unittest.h",
+            "src/compiler/register-allocator-unittest.cpp",
+            "lib/parser.unittest.js",
+            "tools/run_all_unittests.cc",
+            "build/android/pylib/device_unittest.py",
+        ] {
+            assert!(is_test_path(path), "{path}");
+            assert!(is_test_file(path), "{path}");
+        }
+        // A file merely named unittest is not one.
+        assert!(!is_test_path("cmd/promtool/unittest.go"));
+        assert!(!is_test_path("Lib/unittest/case.py"));
+        assert!(!is_test_file("cmd/promtool/unittest.go"));
+        // Production files that merely contain a lowercase "test", and
+        // ordinary production source.
+        for path in [
+            "src/latest/loader.kt",
+            "lib/manifest.kt",
+            "okhttp/src/jvmMain/kotlin/okhttp3/internal/connection/RealCall.kt",
+            "src/contestEntry.ts",
+            "pkg/greatest.go",
+            "src/flask/app.py",
+            "src/vs/workbench/api/common/extensionHostMain.ts",
+            "okhttp/src/commonJvmAndroid/kotlin/okhttp3/OkHttpClient.kt",
+        ] {
+            assert!(!is_test_file(path), "{path}");
+        }
+    }
+
+    /// An `e2e/` tree is a test suite (upstream `b1f40c57`), as it is to the
+    /// resolver: both read [`codegraph_core::file_class::is_test_path`].
+    #[test]
+    fn an_e2e_tree_is_a_test_suite() {
+        assert!(is_test_path("e2e/helpers/login.ts"));
+        assert!(is_test_path("apps/web/e2e/fixtures.ts"));
+        assert!(!is_test_path("src/route2e2e.ts"));
     }
 
     #[test]

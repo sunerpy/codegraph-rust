@@ -603,20 +603,92 @@ impl Store {
         &self,
         ids: &[String],
     ) -> rusqlite::Result<HashSet<String>> {
+        Ok(self
+            .unresolved_reference_names_from(ids, &[EdgeKind::Extends, EdgeKind::Implements])?
+            .into_keys()
+            .collect())
+    }
+
+    /// `getUnresolvedReferenceNamesFrom`: the names each of `ids` holds an
+    /// unresolved reference of `kinds` to, sorted. A reference into code
+    /// outside the index leaves no edge, only this row: a decorator imported
+    /// from a framework (`@HostListener`, `@Cron`) or an interface named in an
+    /// `implements` clause. Pending rows count with failed ones. Ids with no
+    /// such row are absent. Chunked probe over `idx_unresolved_from_node`.
+    pub fn unresolved_reference_names_from(
+        &self,
+        ids: &[String],
+        kinds: &[EdgeKind],
+    ) -> rusqlite::Result<HashMap<String, Vec<String>>> {
         let ids = unique(ids);
-        let mut found = HashSet::new();
+        let mut found: HashMap<String, Vec<String>> = HashMap::new();
+        if ids.is_empty() || kinds.is_empty() {
+            return Ok(found);
+        }
+        let kind_strs: Vec<&'static str> = kinds.iter().map(|k| k.as_str()).collect();
         for chunk in ids.chunks(SQLITE_PARAM_CHUNK_SIZE) {
             let sql = format!(
-                "SELECT DISTINCT from_node_id FROM unresolved_refs
+                "SELECT DISTINCT from_node_id, reference_name FROM unresolved_refs
                   WHERE from_node_id IN ({})
-                    AND reference_kind IN ('extends', 'implements')",
-                placeholders(chunk.len())
+                    AND reference_kind IN ({})",
+                placeholders(chunk.len()),
+                placeholders(kind_strs.len())
             );
-            let values: Vec<&dyn ToSql> = chunk.iter().map(|id| id as &dyn ToSql).collect();
+            let mut values: Vec<&dyn ToSql> = chunk.iter().map(|id| id as &dyn ToSql).collect();
+            values.extend(kind_strs.iter().map(|k| k as &dyn ToSql));
             let mut stmt = self.connection().prepare(&sql)?;
-            let rows = stmt.query_map(values.as_slice(), |row| row.get::<_, String>(0))?;
+            let rows = stmt.query_map(values.as_slice(), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
             for row in rows {
-                found.insert(row?);
+                let (id, name) = row?;
+                found.entry(id).or_default().push(name);
+            }
+        }
+        for names in found.values_mut() {
+            names.sort();
+            names.dedup();
+        }
+        Ok(found)
+    }
+
+    /// `getUnresolvedReferenceSourcesNamed`: every node holding an unresolved
+    /// reference of `kinds` to each of `names`, the mirror of
+    /// [`Self::unresolved_reference_names_from`] keyed by the name. For
+    /// `implements`, every class that names an interface outside the index.
+    /// Names nothing refers to are absent. Chunked probe over
+    /// `idx_unresolved_name`.
+    pub fn unresolved_reference_sources_named(
+        &self,
+        names: &[String],
+        kinds: &[EdgeKind],
+    ) -> rusqlite::Result<HashMap<String, HashSet<String>>> {
+        let names: Vec<String> = unique(names)
+            .into_iter()
+            .filter(|name| !name.is_empty())
+            .collect();
+        let mut found: HashMap<String, HashSet<String>> = HashMap::new();
+        if names.is_empty() || kinds.is_empty() {
+            return Ok(found);
+        }
+        let kind_strs: Vec<&'static str> = kinds.iter().map(|k| k.as_str()).collect();
+        for chunk in names.chunks(SQLITE_PARAM_CHUNK_SIZE) {
+            let sql = format!(
+                "SELECT DISTINCT reference_name, from_node_id FROM unresolved_refs
+                  WHERE reference_name IN ({})
+                    AND reference_kind IN ({})",
+                placeholders(chunk.len()),
+                placeholders(kind_strs.len())
+            );
+            let mut values: Vec<&dyn ToSql> = chunk.iter().map(|name| name as &dyn ToSql).collect();
+            values.extend(kind_strs.iter().map(|k| k as &dyn ToSql));
+            let mut stmt = self.connection().prepare(&sql)?;
+            let rows = stmt.query_map(values.as_slice(), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            for row in rows {
+                let (name, id) = row?;
+                found.entry(name).or_default().insert(id);
             }
         }
         Ok(found)

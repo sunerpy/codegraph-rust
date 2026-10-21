@@ -29,6 +29,7 @@
 
 use crate::context::{DEFAULT_CACHE_LIMIT, order_candidates};
 use crate::import_resolver;
+use crate::package_manifests::{ManifestScope, read_manifest_scope};
 use crate::path_aliases::{AliasMap, load_project_aliases};
 use crate::pathutil;
 use crate::source_facts::SourceFacts;
@@ -178,6 +179,34 @@ struct SnapshotCaches {
     /// same candidates are probed from every importing file, and the tree does
     /// not change within a pass (upstream `fileExistsMemo`).
     fs_exists: BoundedFileMemo<bool>,
+    /// Each directory's package.json / Deno import-map scope (upstream
+    /// #2128 `manifestScopes`).
+    manifest_scopes: BoundedFileMemo<Arc<ManifestScope>>,
+    /// Each file's functions and methods by qualified name (W5-08).
+    function_scopes: BoundedFileMemo<Arc<crate::name_matcher::FileCallables>>,
+    /// Each file's methods by owner and name (W5-08).
+    file_methods: BoundedFileMemo<Arc<crate::name_matcher::FileMethods>>,
+    /// The name matcher's memos for the run (W5-08).
+    name_matcher_tables: OnceLock<Arc<crate::name_matcher::NameMatcherTables>>,
+    /// The Python write index for the run (upstream #2332).
+    python_write_index: OnceLock<Arc<crate::python_globals::PythonWriteIndex>>,
+    /// The C/C++ namespace tables for the run (upstream #2176).
+    cpp_namespace_tables: OnceLock<Arc<crate::cpp_namespaces::CppNamespaceTables>>,
+    /// The Kotlin tables for the run (upstream #2172).
+    kotlin_tables: OnceLock<Arc<crate::kotlin_scope::KotlinTables>>,
+    scala_tables: OnceLock<Arc<crate::scala_scope::ScalaTables>>,
+    csharp_tables: OnceLock<Arc<crate::csharp_types::CsharpTables>>,
+    member_tables: OnceLock<Arc<crate::member_types::MemberTables>>,
+    ruby_tables: OnceLock<Arc<crate::ruby_scope::RubyTables>>,
+    php_tables: OnceLock<Arc<crate::php_scope::PhpTables>>,
+    lua_tables: OnceLock<Arc<crate::lua_scope::LuaTables>>,
+    dart_tables: OnceLock<Arc<crate::dart_scope::DartTables>>,
+    dart_libraries: OnceLock<Arc<crate::dart_libraries::DartLibraries>>,
+    cfml_tables: OnceLock<Arc<crate::cfml_scope::CfmlTables>>,
+    swift_tables: OnceLock<Arc<crate::swift_type_visibility::SwiftTables>>,
+    objc_tables: OnceLock<Arc<crate::objc_scope::ObjcTables>>,
+    go_tables: OnceLock<Arc<crate::go_packages::GoTables>>,
+    solidity_tables: OnceLock<Arc<crate::solidity_scope::SolidityTables>>,
     #[cfg(test)]
     counters: SnapshotCacheCounters,
 }
@@ -193,6 +222,26 @@ impl SnapshotCaches {
             import_mappings: BoundedFileMemo::new(DEFAULT_CACHE_LIMIT),
             re_exports: BoundedFileMemo::new(DEFAULT_CACHE_LIMIT),
             fs_exists: BoundedFileMemo::new(crate::context::FILE_EXISTS_MEMO_LIMIT),
+            manifest_scopes: BoundedFileMemo::new(DEFAULT_CACHE_LIMIT),
+            function_scopes: BoundedFileMemo::new(DEFAULT_CACHE_LIMIT),
+            file_methods: BoundedFileMemo::new(DEFAULT_CACHE_LIMIT),
+            name_matcher_tables: OnceLock::new(),
+            python_write_index: OnceLock::new(),
+            cpp_namespace_tables: OnceLock::new(),
+            kotlin_tables: OnceLock::new(),
+            scala_tables: OnceLock::new(),
+            csharp_tables: OnceLock::new(),
+            member_tables: OnceLock::new(),
+            ruby_tables: OnceLock::new(),
+            php_tables: OnceLock::new(),
+            lua_tables: OnceLock::new(),
+            dart_tables: OnceLock::new(),
+            dart_libraries: OnceLock::new(),
+            cfml_tables: OnceLock::new(),
+            swift_tables: OnceLock::new(),
+            objc_tables: OnceLock::new(),
+            go_tables: OnceLock::new(),
+            solidity_tables: OnceLock::new(),
             #[cfg(test)]
             counters: SnapshotCacheCounters::default(),
         }
@@ -222,6 +271,7 @@ struct NodeSnapshot {
     workspace_packages: Option<WorkspacePackages>,
     go_module: Option<GoModule>,
     go_modules: Vec<GoModule>,
+    rust_crates: Arc<crate::rust_scope::RustCrates>,
 }
 
 /// A `Sync`, immutable [`ResolutionContext`] over a precomputed [`NodeSnapshot`]
@@ -289,7 +339,11 @@ impl SnapshotResolutionContext {
 
         // Per-file and per-kind lists copy the store's own query output verbatim
         // so the candidate order matches `nodes_by_file_path` (ORDER BY
-        // start_line) and `nodes_by_kind` (SQLite scan order) exactly.
+        // start_line) and `nodes_by_kind` (SQLite scan order) exactly. Each list
+        // is collected from a borrowing iterator: collected from the query's
+        // `Vec<Node>` by value, it reused that buffer in place and kept a
+        // node's worth of room for every 8-byte handle for the whole pass
+        // (17 MiB on this repository; W10-04).
         let mut file_paths: Vec<String> = by_id.values().map(|n| n.file_path.clone()).collect();
         file_paths.sort_unstable();
         file_paths.dedup();
@@ -299,7 +353,7 @@ impl SnapshotResolutionContext {
             let entries = store
                 .nodes_by_file_path(fp)
                 .unwrap_or_default()
-                .into_iter()
+                .iter()
                 .filter_map(|node| by_id.get(&node.id).cloned())
                 .collect();
             by_file_path.insert(fp.clone(), entries);
@@ -310,7 +364,7 @@ impl SnapshotResolutionContext {
             let entries = store
                 .nodes_by_kind(kind)
                 .unwrap_or_default()
-                .into_iter()
+                .iter()
                 .filter_map(|node| by_id.get(&node.id).cloned())
                 .collect();
             by_kind.insert(kind, entries);
@@ -353,6 +407,10 @@ impl SnapshotResolutionContext {
         let workspace_packages = load_workspace_packages(&project_root);
         let go_module = crate::context::load_go_module_pub(&project_root);
         let go_modules = crate::context::load_go_modules_pub(&project_root, &all_file_paths);
+        let rust_crates = Arc::new(crate::rust_scope::load_rust_crates(
+            &project_root,
+            &all_file_paths,
+        ));
 
         Ok(Self {
             snapshot: Arc::new(NodeSnapshot {
@@ -372,6 +430,7 @@ impl SnapshotResolutionContext {
                 workspace_packages,
                 go_module,
                 go_modules,
+                rust_crates,
             }),
             caches: Arc::new(SnapshotCaches::new()),
             max_file_size: codegraph_core::config::DEFAULT_MAX_FILE_SIZE,
@@ -510,6 +569,12 @@ impl ResolutionContext for SnapshotResolutionContext {
         })
     }
 
+    fn is_indexed_file(&self, file_path: &str) -> bool {
+        self.snapshot
+            .known_file_paths
+            .contains(&file_path.replace('\\', "/"))
+    }
+
     fn read_file(&self, file_path: &str) -> Option<String> {
         self.read_file_cached(file_path)
             .as_deref()
@@ -611,6 +676,17 @@ impl ResolutionContext for SnapshotResolutionContext {
         }
         let mut supertypes: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         for tn in &type_nodes {
+            // A Swift conformance to a type the project only extends
+            // (SwiftUI's `View`) resolves to nothing, an extension being no
+            // type, yet the members its extensions add are still the
+            // conformer's (upstream #2107).
+            if language == Language::Swift {
+                for name in crate::swift_type_visibility::extended_conformances(tn, self).iter() {
+                    if name != type_name {
+                        supertypes.insert(name.clone());
+                    }
+                }
+            }
             let Some(adjacency) = self.edges.get(&tn.id) else {
                 continue;
             };
@@ -655,12 +731,191 @@ impl ResolutionContext for SnapshotResolutionContext {
         self.snapshot.workspace_packages.clone()
     }
 
+    fn python_write_index(&self) -> Arc<crate::python_globals::PythonWriteIndex> {
+        Arc::clone(
+            self.caches
+                .python_write_index
+                .get_or_init(|| Arc::new(crate::python_globals::PythonWriteIndex::build(self))),
+        )
+    }
+
+    fn cpp_namespace_tables(&self) -> Arc<crate::cpp_namespaces::CppNamespaceTables> {
+        Arc::clone(
+            self.caches
+                .cpp_namespace_tables
+                .get_or_init(|| Arc::new(crate::cpp_namespaces::CppNamespaceTables::new())),
+        )
+    }
+
+    fn kotlin_tables(&self) -> Arc<crate::kotlin_scope::KotlinTables> {
+        Arc::clone(
+            self.caches
+                .kotlin_tables
+                .get_or_init(|| Arc::new(crate::kotlin_scope::KotlinTables::new())),
+        )
+    }
+
+    fn scala_tables(&self) -> Arc<crate::scala_scope::ScalaTables> {
+        Arc::clone(
+            self.caches
+                .scala_tables
+                .get_or_init(|| Arc::new(crate::scala_scope::ScalaTables::new())),
+        )
+    }
+
+    fn csharp_tables(&self) -> Arc<crate::csharp_types::CsharpTables> {
+        Arc::clone(
+            self.caches
+                .csharp_tables
+                .get_or_init(|| Arc::new(crate::csharp_types::CsharpTables::new())),
+        )
+    }
+
+    fn member_tables(&self) -> Arc<crate::member_types::MemberTables> {
+        Arc::clone(
+            self.caches
+                .member_tables
+                .get_or_init(|| Arc::new(crate::member_types::MemberTables::new())),
+        )
+    }
+
+    fn ruby_tables(&self) -> Arc<crate::ruby_scope::RubyTables> {
+        Arc::clone(
+            self.caches
+                .ruby_tables
+                .get_or_init(|| Arc::new(crate::ruby_scope::RubyTables::new())),
+        )
+    }
+
+    fn php_tables(&self) -> Arc<crate::php_scope::PhpTables> {
+        Arc::clone(
+            self.caches
+                .php_tables
+                .get_or_init(|| Arc::new(crate::php_scope::PhpTables::new())),
+        )
+    }
+
+    fn lua_tables(&self) -> Arc<crate::lua_scope::LuaTables> {
+        Arc::clone(
+            self.caches
+                .lua_tables
+                .get_or_init(|| Arc::new(crate::lua_scope::LuaTables::new())),
+        )
+    }
+
+    fn dart_tables(&self) -> Arc<crate::dart_scope::DartTables> {
+        Arc::clone(
+            self.caches
+                .dart_tables
+                .get_or_init(|| Arc::new(crate::dart_scope::DartTables::new())),
+        )
+    }
+
+    fn dart_libraries(&self) -> Arc<crate::dart_libraries::DartLibraries> {
+        Arc::clone(
+            self.caches
+                .dart_libraries
+                .get_or_init(|| Arc::new(crate::dart_libraries::DartLibraries::new())),
+        )
+    }
+
+    fn cfml_tables(&self) -> Arc<crate::cfml_scope::CfmlTables> {
+        Arc::clone(
+            self.caches
+                .cfml_tables
+                .get_or_init(|| Arc::new(crate::cfml_scope::CfmlTables::new())),
+        )
+    }
+
+    fn swift_tables(&self) -> Arc<crate::swift_type_visibility::SwiftTables> {
+        Arc::clone(
+            self.caches
+                .swift_tables
+                .get_or_init(|| Arc::new(crate::swift_type_visibility::SwiftTables::new())),
+        )
+    }
+
+    fn objc_tables(&self) -> Arc<crate::objc_scope::ObjcTables> {
+        Arc::clone(
+            self.caches
+                .objc_tables
+                .get_or_init(|| Arc::new(crate::objc_scope::ObjcTables::new())),
+        )
+    }
+
+    fn go_tables(&self) -> Arc<crate::go_packages::GoTables> {
+        Arc::clone(
+            self.caches
+                .go_tables
+                .get_or_init(|| Arc::new(crate::go_packages::GoTables::new())),
+        )
+    }
+
+    fn solidity_tables(&self) -> Arc<crate::solidity_scope::SolidityTables> {
+        Arc::clone(
+            self.caches
+                .solidity_tables
+                .get_or_init(|| Arc::new(crate::solidity_scope::SolidityTables::new())),
+        )
+    }
+
+    fn enclosing_function_lines(
+        &self,
+        file_path: &str,
+        qualified: &str,
+        start: i64,
+        end: i64,
+    ) -> Option<(i64, i64)> {
+        self.file_callables(file_path)
+            .first_enclosing(qualified, start, end)
+    }
+
+    fn file_callables(&self, file_path: &str) -> Arc<crate::name_matcher::FileCallables> {
+        self.caches.function_scopes.get_or_init(file_path, || {
+            Arc::new(crate::name_matcher::FileCallables::of(
+                &self.get_nodes_in_file_shared(file_path),
+            ))
+        })
+    }
+
+    fn file_methods(&self, file_path: &str) -> Arc<crate::name_matcher::FileMethods> {
+        self.caches.file_methods.get_or_init(file_path, || {
+            Arc::new(crate::name_matcher::FileMethods::of(
+                &self.get_nodes_in_file_shared(file_path),
+            ))
+        })
+    }
+
+    fn method_files(&self, name: &str) -> Option<Arc<std::collections::HashSet<String>>> {
+        Some(crate::name_matcher::method_files_of(name, self))
+    }
+
+    fn name_matcher_tables(&self) -> Arc<crate::name_matcher::NameMatcherTables> {
+        Arc::clone(
+            self.caches
+                .name_matcher_tables
+                .get_or_init(|| Arc::new(crate::name_matcher::NameMatcherTables::new())),
+        )
+    }
+
+    fn manifest_scope(&self, dir: &str) -> Arc<ManifestScope> {
+        // A directory's parent is another key, so the memo never re-enters
+        // the entry it is filling.
+        self.caches
+            .manifest_scopes
+            .get_or_init(dir, || Arc::new(read_manifest_scope(dir, self)))
+    }
+
     fn get_go_module(&self) -> Option<GoModule> {
         self.snapshot.go_module.clone()
     }
 
     fn get_go_modules(&self) -> Vec<GoModule> {
         self.snapshot.go_modules.clone()
+    }
+
+    fn get_rust_crates(&self) -> Arc<crate::rust_scope::RustCrates> {
+        Arc::clone(&self.snapshot.rust_crates)
     }
 
     fn get_re_exports(&self, file_path: &str, language: Language) -> Vec<ReExport> {
@@ -791,6 +1046,102 @@ mod tests {
         store
     }
 
+    /// W5-08: the snapshot context answers a declaration's enclosing
+    /// function from its per-file memo exactly as the qualified-name lookup
+    /// does, before and after the memo holds the file.
+    #[test]
+    fn snapshot_encloses_as_the_qualified_name_lookup_does() {
+        let root = temp_root("enclosing");
+        let mut store = Store::open(&root.join("index.db")).expect("open");
+        store.upsert_file(&file_record("a.ts", 5)).unwrap();
+        store.upsert_file(&file_record("b.ts", 1)).unwrap();
+        let scoped = |id: &str, kind, qualified: &str, file: &str, lines: (i64, i64), col| {
+            let name = qualified.rsplit("::").next().unwrap_or(qualified);
+            let mut n = node(id, name, kind, file, lines.0, col);
+            n.qualified_name = qualified.to_string();
+            n.end_line = lines.1;
+            n
+        };
+        store
+            .upsert_nodes(&[
+                scoped("f-a", NodeKind::Function, "f", "a.ts", (3, 20), 0),
+                scoped("f-b", NodeKind::Function, "f", "a.ts", (3, 20), 4),
+                scoped("f-outer", NodeKind::Function, "f", "a.ts", (2, 30), 0),
+                scoped("m", NodeKind::Method, "C::m", "a.ts", (5, 9), 2),
+                scoped("c", NodeKind::Class, "C", "a.ts", (4, 10), 0),
+                scoped("f-other", NodeKind::Function, "f", "b.ts", (1, 100), 0),
+            ])
+            .unwrap();
+        let ctx = SnapshotResolutionContext::from_store(&store, root.to_str().unwrap())
+            .expect("snapshot");
+        for _ in 0..2 {
+            for (file, qualified, start, end) in [
+                ("a.ts", "f", 6, 7),
+                ("a.ts", "f", 25, 26),
+                ("a.ts", "f", 31, 31),
+                ("a.ts", "C::m", 6, 6),
+                ("a.ts", "C", 6, 6),
+                ("b.ts", "f", 50, 50),
+                ("c.ts", "f", 1, 1),
+            ] {
+                assert_eq!(
+                    ctx.enclosing_function_lines(file, qualified, start, end),
+                    crate::name_matcher::enclosing_by_qualified_name(
+                        &ctx, file, qualified, start, end
+                    ),
+                    "{file} {qualified} {start}..={end}"
+                );
+            }
+        }
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// W10-04: the per-file and per-kind lists hold only their handles. Each
+    /// was collected from the store's `Vec<Node>` in place and kept that
+    /// buffer, a node's size of room per 8-byte handle, through the whole
+    /// resolution pass.
+    #[test]
+    fn snapshot_lists_keep_no_node_sized_buffers() {
+        let root = temp_root("list-room");
+        let mut store = Store::open(&root.join("index.db")).expect("open");
+        store.upsert_file(&file_record("a.ts", 40)).unwrap();
+        let nodes: Vec<Node> = (0..40_i64)
+            .map(|i| {
+                node(
+                    &format!("f{i}"),
+                    &format!("F{i}"),
+                    NodeKind::Function,
+                    "a.ts",
+                    i + 1,
+                    0,
+                )
+            })
+            .collect();
+        store.upsert_nodes(&nodes).unwrap();
+        let ctx = SnapshotResolutionContext::from_store(&store, root.to_str().unwrap())
+            .expect("snapshot");
+        let lists = ctx
+            .snapshot
+            .by_file_path
+            .values()
+            .chain(ctx.snapshot.by_kind.values());
+        let mut checked = 0;
+        for list in lists.filter(|list| !list.is_empty()) {
+            assert!(
+                list.capacity() <= 2 * list.len().max(4),
+                "a list of {} handles keeps room for {}",
+                list.len(),
+                list.capacity()
+            );
+            checked += 1;
+        }
+        assert!(
+            checked >= 2,
+            "the file's list and the function list were checked"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     #[test]
     fn from_store_builds_node_lookups() {
         let root = temp_root("build");
@@ -834,6 +1185,9 @@ mod tests {
         assert!(ctx.file_exists("a.ts"));
         assert!(ctx.file_exists("ondisk.ts"));
         assert!(!ctx.file_exists("nowhere.ts"));
+        // Only the index's own files are indexed; the disk fallback is not.
+        assert!(ctx.is_indexed_file("a.ts"));
+        assert!(!ctx.is_indexed_file("ondisk.ts"));
         assert!(
             !ctx.file_exists(&format!(
                 "../{}/secret.ts",

@@ -84,6 +84,20 @@ impl FrameworkResolver for VueResolver {
     }
 
     // Ports vueResolver.resolve (vue.ts:103-188).
+    /// A Vue app's macros, auto-imports and components are its scripts'
+    /// (upstream #2210): mealie's Python `QueryFilterBuilder(...)` is not the
+    /// `QueryFilterBuilder.vue` component.
+    fn resolve_languages(&self) -> Option<&[Language]> {
+        const LANGS: [Language; 5] = [
+            Language::Vue,
+            Language::JavaScript,
+            Language::TypeScript,
+            Language::Tsx,
+            Language::Jsx,
+        ];
+        Some(&LANGS)
+    }
+
     fn resolve(&self, reference: &RefView, context: &dyn ResolutionContext) -> Option<ResolvedRef> {
         let name = &reference.reference_name;
 
@@ -92,8 +106,12 @@ impl FrameworkResolver for VueResolver {
             return Some(self_resolved(reference, 1.0));
         }
 
-        // Pattern 2: Nuxt auto-imported composables (vue.ts:114-122).
-        if NUXT_AUTO_IMPORTS.contains(&name.as_str()) {
+        // Pattern 2: Nuxt auto-imported composables (vue.ts:114-122), unless
+        // the file declares its own function of that name, which shadows the
+        // auto-import: elk's lists page calls its own `clearError(true)`, not
+        // Nuxt's (upstream #2357).
+        if NUXT_AUTO_IMPORTS.contains(&name.as_str()) && !declares_own_function(reference, context)
+        {
             return Some(self_resolved(reference, 1.0));
         }
 
@@ -231,6 +249,21 @@ fn dep_present(pkg: &serde_json::Value, keys: &[&str]) -> bool {
 }
 
 /// A ref that resolves to its own source node (compiler macros / auto-imports).
+/// Does the reference's own file declare a function (or a const holding one)
+/// of the referenced name (upstream #2357 `declaresOwnFunction`)?
+fn declares_own_function(reference: &RefView, context: &dyn ResolutionContext) -> bool {
+    context
+        .get_nodes_in_file_shared(&reference.file_path)
+        .iter()
+        .any(|node| {
+            node.name == reference.reference_name
+                && matches!(
+                    node.kind,
+                    NodeKind::Function | NodeKind::Constant | NodeKind::Variable
+                )
+        })
+}
+
 fn self_resolved(reference: &RefView, confidence: f64) -> ResolvedRef {
     ResolvedRef {
         original: reference.clone(),

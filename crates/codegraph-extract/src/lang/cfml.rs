@@ -18,9 +18,13 @@
 //! script `component` (file-name rename + script-style `extends`) and the tag
 //! grammar's `cf_component_open_tag`/`cf_function_tag`.
 //!
-//! DEFERRED (recorded follow-ups, consistent with H1–H5): the
-//! `<cfscript>`-in-tag-body re-parse delegation, the `cfquery` SQL-body
-//! extraction (`LANGUAGE_CFQUERY`), and the CFML framework RESOLVER bridges.
+//! A tag file's `<cfscript>` bodies and `<cfquery>` SQL bodies are parsed a
+//! second time in place, with the crate's cfscript and cfquery grammars over
+//! the file's own bytes (upstream #2296, W4-CF-02; the walker's
+//! `delegate_cfml_script_tag` / `delegate_cfml_query_tag`).
+//!
+//! DEFERRED (recorded follow-up, consistent with H1–H5): the CFML framework
+//! RESOLVER bridges.
 
 use codegraph_core::types::Language;
 use tree_sitter::{Language as TsLanguage, Node};
@@ -279,6 +283,67 @@ pub(crate) fn cfml_tag_attr(tag: Node<'_>, name: &str, source: &str) -> Option<S
     None
 }
 
+/// A generic `cf_tag`'s start tag, where its name and attributes live
+/// (upstream `cfStartTag`).
+pub(crate) fn cfml_start_tag(tag: Node<'_>) -> Option<Node<'_>> {
+    tag.named_children(&mut tag.walk())
+        .find(|c| matches!(c.kind(), "cf_start_tag" | "cf_start_tag_with_selfclose"))
+}
+
+/// A generic `cf_tag`'s name, lowercased, without the `cf` prefix
+/// (`<cfLoop>` -> `loop`; upstream `cfTagName`).
+pub(crate) fn cfml_tag_name(tag: Node<'_>, source: &str) -> Option<String> {
+    let start = cfml_start_tag(tag)?;
+    let name = start
+        .named_children(&mut start.walk())
+        .find(|c| c.kind() == "cf_tag_name")?;
+    Some(node_text(name, source).to_ascii_lowercase())
+}
+
+/// The `attribute_value` node of a tag attribute (upstream
+/// `tagAttrValueNode`): `None` when the tag has no such attribute,
+/// `Some(None)` when its value is not plain text (empty, or a `#hash#`
+/// expression).
+pub(crate) fn cfml_tag_attr_value_node<'t>(
+    tag: Node<'t>,
+    name: &str,
+    source: &str,
+) -> Option<Option<Node<'t>>> {
+    let mut attrs = Vec::new();
+    for child in tag.named_children(&mut tag.walk()) {
+        match child.kind() {
+            "cf_attribute" => attrs.push(child),
+            "cf_tag_attributes" => attrs.extend(
+                child
+                    .named_children(&mut child.walk())
+                    .filter(|inner| inner.kind() == "cf_attribute"),
+            ),
+            _ => {}
+        }
+    }
+    for attr in attrs {
+        let Some(attr_name) = attr
+            .named_children(&mut attr.walk())
+            .find(|c| c.kind() == "cf_attribute_name")
+        else {
+            continue;
+        };
+        if !node_text(attr_name, source).eq_ignore_ascii_case(name) {
+            continue;
+        }
+        let value = attr
+            .named_children(&mut attr.walk())
+            .find(|c| matches!(c.kind(), "quoted_cf_attribute_value" | "cf_attribute_value"))
+            .and_then(|wrapper| {
+                wrapper
+                    .named_children(&mut wrapper.walk())
+                    .find(|c| c.kind() == "attribute_value")
+            });
+        return Some(value);
+    }
+    None
+}
+
 /// A script-style `component_attribute(identifier, string)` value by name
 /// (case-insensitive), for the cfscript grammar — used for script-style
 /// `extends="Base"`. Matches the `identifier` child and returns the `string`
@@ -304,6 +369,38 @@ pub(crate) fn cfml_string_attr_value(node: Node<'_>, name: &str, source: &str) -
                 return Some(value);
             }
         }
+    }
+    None
+}
+
+/// A script-style `component_attribute` by label (case-insensitive): the
+/// value's text with its quotes stripped, and the value node (upstream reads
+/// the first child that is not the `identifier` label).
+pub(crate) fn cfml_component_attr<'t>(
+    node: Node<'t>,
+    name: &str,
+    source: &str,
+) -> Option<(String, Node<'t>)> {
+    for attr in node.named_children(&mut node.walk()) {
+        if attr.kind() != "component_attribute" {
+            continue;
+        }
+        let children: Vec<Node<'t>> = attr.named_children(&mut attr.walk()).collect();
+        let label = children.iter().copied().find(|c| c.kind() == "identifier");
+        let value = children.iter().copied().find(|c| c.kind() != "identifier");
+        let (Some(label), Some(value)) = (label, value) else {
+            continue;
+        };
+        if !node_text(label, source).eq_ignore_ascii_case(name) {
+            continue;
+        }
+        let text = node_text(value, source);
+        let text = text.strip_prefix(['"', '\'']).unwrap_or(&text).to_string();
+        let text = text
+            .strip_suffix(['"', '\''])
+            .map(str::to_string)
+            .unwrap_or(text);
+        return Some((text, value));
     }
     None
 }

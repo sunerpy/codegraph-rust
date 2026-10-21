@@ -37,7 +37,7 @@ use codegraph_core::IndexPaths;
 use codegraph_core::generated_header::detect_generated_file;
 use codegraph_core::node_id::hash_content;
 use codegraph_core::types::{Edge, FileRecord, Node, UnresolvedRef};
-use codegraph_extract::detect_language_with;
+use codegraph_extract::detect_language_of;
 use codegraph_resolve::ReferenceResolver;
 use codegraph_store::StoreWriteAuthorization;
 
@@ -87,6 +87,24 @@ pub(crate) fn migrate_project(
     rebuild.set_bulk_index_pragmas()?;
 
     let mut pending_nodes: Vec<Node> = Vec::with_capacity(NODE_FLUSH_ROWS);
+    let mut surfaces = Vec::new();
+    let mut namespace_scans = Vec::new();
+    let mut head_rows = Vec::new();
+    let mut kotlin_rows = Vec::new();
+    let mut scala_rows = Vec::new();
+    let mut csharp_rows = Vec::new();
+    let mut member_rows = Vec::new();
+    let mut ruby_rows = Vec::new();
+    let mut cfml_rows = Vec::new();
+    let mut solidity_rows = Vec::new();
+    let mut swift_rows = Vec::new();
+    let mut objc_rows = Vec::new();
+    let mut go_rows = Vec::new();
+    let mut php_rows = Vec::new();
+    let mut class_head_rows = Vec::new();
+    let mut lua_rows = Vec::new();
+    let mut dart_rows = Vec::new();
+    let mut dart_library_rows = Vec::new();
     let mut edges: Vec<Edge> = Vec::new();
     let mut refs: Vec<UnresolvedRef> = Vec::new();
     let mut outcome = SyncOutcome {
@@ -111,7 +129,7 @@ pub(crate) fn migrate_project(
         let file = FileRecord {
             path: relative.clone(),
             content_hash: hash_content(&hash_input),
-            language: detect_language_with(relative, &options.extensions),
+            language: detect_language_of(relative, &source, &options.extensions),
             size: metadata.len() as i64,
             modified_at: modified_millis(&metadata),
             indexed_at: now_millis(),
@@ -125,6 +143,67 @@ pub(crate) fn migrate_project(
         };
 
         rebuild.store().upsert_file(&file)?;
+        if let Some(surface) = crate::module_surfaces::surface_of(relative, file.language, &source)
+        {
+            surfaces.push((relative.clone(), surface));
+        }
+        if let Some(scan) = crate::cpp_namespace_rows::scan_of(relative, file.language, &source) {
+            namespace_scans.push((relative.clone(), scan));
+        }
+        if let Some(row) = crate::java_heads::row_of(file.language, &source, &result.nodes) {
+            head_rows.push((relative.clone(), row));
+        }
+        if let Some(row) =
+            crate::kotlin_surfaces::row_of(relative, file.language, &source, &result.nodes)
+        {
+            kotlin_rows.push((relative.clone(), row));
+        }
+        if let Some(row) =
+            crate::scala_surfaces::row_of(relative, file.language, &source, &result.nodes)
+        {
+            scala_rows.push((relative.clone(), row));
+        }
+        if let Some(row) = crate::csharp_surfaces::row_of(file.language, &source, &result.nodes) {
+            csharp_rows.push((relative.clone(), row));
+        }
+        if let Some(row) = crate::member_surfaces::row_of(file.language, &source, &result.nodes) {
+            member_rows.push((relative.clone(), row));
+        }
+        if let Some(row) = crate::ruby_heads::row_of(file.language, &source, &result.nodes) {
+            ruby_rows.push((relative.clone(), row));
+        }
+        if let Some(row) =
+            crate::cfml_heads::row_of(relative, file.language, &source, &result.nodes)
+        {
+            cfml_rows.push((relative.clone(), row));
+        }
+        if let Some(row) = crate::solidity_heads::row_of(file.language, &source, &result.nodes) {
+            solidity_rows.push((relative.clone(), row));
+        }
+        if let Some(row) = crate::swift_heads::row_of(file.language, &source, &result.nodes) {
+            swift_rows.push((relative.clone(), row));
+        }
+        if let Some(row) = crate::objc_heads::row_of(file.language, &source, &result.nodes) {
+            objc_rows.push((relative.clone(), row));
+        }
+        if let Some(row) = crate::go_heads::row_of(file.language, &source, &result.nodes) {
+            go_rows.push((relative.clone(), row));
+        }
+        if let Some(row) = crate::php_heads::row_of(file.language, &source, &result.nodes) {
+            php_rows.push((relative.clone(), row));
+        }
+        if let Some(row) = crate::class_heads::row_of(file.language, &source, &result.nodes) {
+            class_head_rows.push((relative.clone(), row));
+        }
+        if let Some(row) = crate::lua_modules::row_of(file.language, &source, &result.nodes) {
+            lua_rows.push((relative.clone(), row));
+        }
+        if let Some(row) = crate::dart_heads::row_of(file.language, &source, &result.nodes) {
+            dart_rows.push((relative.clone(), row));
+        }
+        if let Some(row) = crate::dart_libraries::row_of(file.language, &source) {
+            dart_library_rows.push((relative.clone(), row));
+        }
         pending_nodes.append(&mut result.nodes);
         if pending_nodes.len() >= NODE_FLUSH_ROWS {
             rebuild.store_mut().upsert_nodes(&pending_nodes)?;
@@ -142,6 +221,71 @@ pub(crate) fn migrate_project(
         rebuild.store_mut().upsert_nodes(&pending_nodes)?;
     }
     drop(pending_nodes);
+    // Every file row is stored, as in the CLI full index at the same point.
+    crate::module_surfaces::write_index_rows(
+        rebuild.store(),
+        project_root,
+        options.max_file_size,
+        &surfaces,
+    )?;
+    drop(surfaces);
+    crate::cpp_namespace_rows::write_index_rows(rebuild.store(), &mut namespace_scans)?;
+    drop(namespace_scans);
+    crate::java_heads::write_index_rows(rebuild.store(), &mut head_rows)?;
+    drop(head_rows);
+    crate::kotlin_surfaces::write_index_rows(rebuild.store(), &mut kotlin_rows)?;
+    drop(kotlin_rows);
+    crate::scala_surfaces::write_index_rows(rebuild.store(), &mut scala_rows)?;
+    drop(scala_rows);
+    crate::csharp_surfaces::write_index_rows(rebuild.store(), &mut csharp_rows)?;
+    drop(csharp_rows);
+    crate::member_surfaces::write_index_rows(rebuild.store(), &mut member_rows)?;
+    drop(member_rows);
+    crate::ruby_heads::write_index_rows(rebuild.store(), &mut ruby_rows)?;
+    drop(ruby_rows);
+    crate::cfml_heads::write_index_rows(rebuild.store(), &mut cfml_rows)?;
+    drop(cfml_rows);
+    crate::solidity_heads::write_index_rows(rebuild.store(), &mut solidity_rows)?;
+    crate::shopify_themes::write_index_row(rebuild.store(), project_root)?;
+    drop(solidity_rows);
+    crate::swift_heads::write_index_rows(rebuild.store(), &mut swift_rows)?;
+    drop(swift_rows);
+    crate::objc_heads::write_index_rows(rebuild.store(), &mut objc_rows)?;
+    drop(objc_rows);
+    crate::go_heads::write_index_rows(rebuild.store(), &mut go_rows)?;
+    drop(go_rows);
+    crate::php_heads::write_index_rows(rebuild.store(), &mut php_rows)?;
+    drop(php_rows);
+    crate::class_heads::write_index_rows(rebuild.store(), &mut class_head_rows)?;
+    drop(class_head_rows);
+    crate::lua_modules::write_index_rows(rebuild.store(), &mut lua_rows)?;
+    drop(lua_rows);
+    crate::dart_heads::write_index_rows(rebuild.store(), &mut dart_rows)?;
+    drop(dart_rows);
+    crate::dart_libraries::write_index_rows(rebuild.store(), &mut dart_library_rows)?;
+    drop(dart_library_rows);
+    crate::dart_libraries::write_pubspec_rows(rebuild.store(), project_root)?;
+    crate::cpp_dependents::write_marker(rebuild.store())?;
+    crate::java_heads::write_marker(rebuild.store())?;
+    crate::kotlin_surfaces::write_marker(rebuild.store())?;
+    crate::scala_surfaces::write_marker(rebuild.store())?;
+    crate::csharp_surfaces::write_marker(rebuild.store())?;
+    crate::member_surfaces::write_marker(rebuild.store())?;
+    crate::ruby_heads::write_marker(rebuild.store())?;
+    crate::cfml_heads::write_marker(rebuild.store())?;
+    crate::solidity_heads::write_marker(rebuild.store())?;
+    crate::shopify_themes::write_marker(rebuild.store())?;
+    crate::swift_heads::write_marker(rebuild.store())?;
+    crate::objc_heads::write_marker(rebuild.store())?;
+    crate::go_heads::write_marker(rebuild.store())?;
+    crate::rust_receivers::write_marker(rebuild.store())?;
+    crate::php_heads::write_marker(rebuild.store())?;
+    crate::class_heads::write_marker(rebuild.store())?;
+    crate::case_folded::write_marker(rebuild.store())?;
+    crate::lua_modules::write_marker(rebuild.store())?;
+    crate::r_bindings::write_marker(rebuild.store())?;
+    crate::dart_heads::write_marker(rebuild.store())?;
+    crate::dart_libraries::write_marker(rebuild.store())?;
 
     // ALL nodes are persisted before ANY edge, because `insert_edges` drops edges
     // whose endpoints are absent. The WAL valve folds the log back during the
@@ -164,6 +308,13 @@ pub(crate) fn migrate_project(
         let context = resolver.store_context(rebuild.store());
         resolver.initialize(&context);
     }
+    // What resolution reads of the control files, and the frameworks it
+    // detected (W5-06), once every file row is stored.
+    crate::control_inputs::write_index_rows(
+        rebuild.store(),
+        project_root,
+        &resolver.framework_names(),
+    )?;
     if resolver.has_framework_resolvers() {
         let relative_files = rebuild
             .store()
@@ -180,6 +331,8 @@ pub(crate) fn migrate_project(
     }
     resolver.resolve_and_persist_batched(rebuild.store_mut(), RESOLVE_BATCH_ROWS)?;
     resolver.run_post_extract(rebuild.store_mut())?;
+    // Every reference is now in `unresolved_refs` or `resolved_refs` (W5-09e).
+    crate::resolved_refs::write_marker(rebuild.store(), options, &scope.framework)?;
     rebuild
         .store()
         .set_project_metadata(INDEXED_WITH_VERSION_KEY, env!("CARGO_PKG_VERSION"))?;
@@ -192,6 +345,9 @@ pub(crate) fn migrate_project(
             !scan.links.is_empty(),
         )?;
     }
+
+    // The rows the rebuild wrote, read before it closes (W5-09d).
+    outcome.changed_records = Some(crate::sync::changed_records(rebuild.store(), &candidates)?);
 
     // Explicit fallible finalization: pragma restore, checkpoint + compaction,
     // extraction stamp, stamp checkpoint, connection close, and only then the

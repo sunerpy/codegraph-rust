@@ -10,8 +10,41 @@
 
 use crate::pathutil;
 use serde_json::Value;
+use std::cell::RefCell;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+
+thread_local! {
+    /// While [`alias_config_inputs`] runs, every path the loader probes or
+    /// reads, in order.
+    static PROBES: RefCell<Option<Vec<PathBuf>>> = const { RefCell::new(None) };
+}
+
+fn note_probe(path: &Path) {
+    PROBES.with(|probes| {
+        if let Some(list) = probes.borrow_mut().as_mut() {
+            list.push(path.to_path_buf());
+        }
+    });
+}
+
+/// Every path [`load_project_aliases`] probes or reads for `project_root`,
+/// once each, in the order it first does: the three root configs and each
+/// `extends` candidate, a missing one included, wherever the loader looks
+/// (an absolute or `../` target, a `node_modules` above the project). What a
+/// sync compares to know when the aliases may have moved (W5-06).
+pub fn alias_config_inputs(project_root: &str) -> Vec<PathBuf> {
+    PROBES.with(|probes| *probes.borrow_mut() = Some(Vec::new()));
+    let _ = load_project_aliases(project_root);
+    let probed = PROBES
+        .with(|probes| probes.borrow_mut().take())
+        .unwrap_or_default();
+    let mut seen = HashSet::new();
+    probed
+        .into_iter()
+        .filter(|path| seen.insert(path.clone()))
+        .collect()
+}
 
 /// A single alias pattern from `compilerOptions.paths`
 /// (`AliasPattern`, `path-aliases.ts:31-45`).
@@ -56,7 +89,7 @@ const MAX_EXTENDS_DEPTH: usize = 32;
 ///
 /// Walks the source as a tiny state machine tracking string context so that a
 /// `//` inside a string value (e.g. a URL) is never truncated.
-fn strip_jsonc(src: &str) -> String {
+pub(crate) fn strip_jsonc(src: &str) -> String {
     let chars: Vec<char> = src.chars().collect();
     let n = chars.len();
     let mut out = String::with_capacity(src.len());
@@ -152,6 +185,7 @@ fn append_json_extension(path: &Path) -> PathBuf {
 }
 
 fn is_file(path: &Path) -> bool {
+    note_probe(path);
     std::fs::metadata(path).is_ok_and(|metadata| metadata.is_file())
 }
 
@@ -187,6 +221,7 @@ fn resolve_extends_target(spec: &str, from_dir: &Path) -> Option<PathBuf> {
 }
 
 fn read_tsconfig_like(path: &Path) -> Option<Value> {
+    note_probe(path);
     let text = std::fs::read_to_string(path).ok()?;
     let parsed = serde_json::from_str::<Value>(&strip_jsonc(&text)).ok()?;
     parsed.is_object().then_some(parsed)
@@ -401,6 +436,51 @@ mod tests {
         let path = path.as_ref();
         std::fs::create_dir_all(path.parent().expect("config parent")).unwrap();
         std::fs::write(path, serde_json::to_string_pretty(&value).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn alias_config_inputs_are_every_path_the_loader_probes() {
+        let root = temp_dir("inputs");
+        write_json(
+            root.join("tsconfig.json"),
+            serde_json::json!({ "extends": ["./configs/base.json", "@acme/tsconfig"] }),
+        );
+        // No config holds `paths`: all three root configs are probed, and
+        // each `extends` candidate, missing ones included, the package's in
+        // every `node_modules` up to the filesystem root.
+        let base = root.join("configs/base.json");
+        let mut expected = vec![
+            root.join("tsconfig.json"),
+            base.clone(),
+            append_json_extension(&base),
+            base.join("tsconfig.json"),
+        ];
+        for dir in root.ancestors() {
+            let package = dir.join("node_modules").join("@acme/tsconfig");
+            expected.extend([
+                package.clone(),
+                append_json_extension(&package),
+                package.join("tsconfig.json"),
+            ]);
+        }
+        expected.extend([root.join("jsconfig.json"), root.join("tsconfig.base.json")]);
+        assert_eq!(alias_config_inputs(&root.to_string_lossy()), expected);
+
+        // The first config with `paths` ends the search, and its existing
+        // `extends` target is read once.
+        write_json(
+            &base,
+            serde_json::json!({ "compilerOptions": { "paths": { "@lib/*": ["src/lib/*"] } } }),
+        );
+        write_json(
+            root.join("tsconfig.json"),
+            serde_json::json!({ "extends": "./configs/base.json" }),
+        );
+        assert_eq!(
+            alias_config_inputs(&root.to_string_lossy()),
+            [root.join("tsconfig.json"), base]
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

@@ -29,6 +29,9 @@ type SyncFn = Arc<dyn Fn(Vec<String>) -> Result<SyncOutcome> + Send + Sync>;
 /// or cannot be expressed as a path list (see [`RemovalHint`]).
 type FullSyncFn = Arc<dyn Fn() -> Result<SyncOutcome> + Send + Sync>;
 type NoticeCallback = Arc<dyn Fn(String) + Send + Sync>;
+/// The drift sentinel's check: `Some(detail)` when the disk holds changes the
+/// index never recorded, `None` when it is current or cannot be read right now.
+type DriftCheckFn = Arc<dyn Fn() -> Result<Option<String>> + Send + Sync>;
 
 /// The OS watcher, shared between [`ProjectWatcher`] (which owns its lifetime)
 /// and the event-loop thread (which registers a watch when a brand-new
@@ -88,6 +91,8 @@ impl RuntimeWatchScope {
 struct ControlChanges {
     config_toml: bool,
     codegraph_json: bool,
+    /// The root `.gitignore` or the repository's `.git/info/exclude`: the two
+    /// files [`RootGitignore`](codegraph_extract::RootGitignore) reads.
     root_gitignore: bool,
 }
 
@@ -102,6 +107,7 @@ struct ControlFiles {
     config_toml: String,
     codegraph_json: String,
     root_gitignore: String,
+    repository_exclude: &'static str,
 }
 
 impl ControlFiles {
@@ -110,6 +116,7 @@ impl ControlFiles {
             config_toml: relative_path(project_root, &paths.config_toml()),
             codegraph_json: relative_path(project_root, &paths.extension_config()),
             root_gitignore: ".gitignore".to_string(),
+            repository_exclude: codegraph_extract::engine::REPOSITORY_EXCLUDE,
         }
     }
 
@@ -120,7 +127,7 @@ impl ControlFiles {
         } else if relative == self.codegraph_json {
             changes.codegraph_json = true;
             true
-        } else if relative == self.root_gitignore {
+        } else if relative == self.root_gitignore || relative == self.repository_exclude {
             changes.root_gitignore = true;
             true
         } else {
@@ -318,7 +325,9 @@ fn watch_registration(backend: WatchBackend) -> WatchRegistration {
 /// The walk reuses the SAME [`WatchPolicy`] already built in
 /// [`ProjectWatcher::start`] (its `normalize_relative` + `should_watch_dir`), so
 /// the watch-registration set matches the extract-side ignore set exactly. When a
-/// directory is ignored, the walk does not descend into it at all.
+/// directory is ignored, the walk does not descend into it at all; an ignored
+/// `config/` or `layout/` is still watched itself, for a Shopify theme marker
+/// (W4-LIQ-01).
 ///
 /// Pure and deterministic: the result is sorted, always includes `root` itself,
 /// and `read_dir`/metadata errors on any subdir are tolerated (that subdir is
@@ -361,7 +370,15 @@ fn collect_watch_tree(root: &Path, policy: &WatchPolicy) -> (Vec<PathBuf>, bool)
             match policy.normalize_relative(&path) {
                 // PRUNE: do not descend into an ignored subtree at all. This is
                 // what keeps us out of node_modules/.venv/__pycache__/.git/etc.
-                Some(relative) if !policy.should_watch_dir(&relative) => continue,
+                // An ignored `config/` or `layout/` is still watched, not below
+                // it, for a Shopify theme marker, which counts wherever it is
+                // (W4-LIQ-01).
+                Some(relative) if !policy.should_watch_dir(&relative) => {
+                    if policy.watches_for_theme_markers(&relative) {
+                        dirs.push(path);
+                    }
+                    continue;
+                }
                 // A path that doesn't normalize (escape / root) is not pushed.
                 None => continue,
                 Some(_) => stack.push(path),
@@ -552,6 +569,21 @@ fn register_new_dirs_with(
     }
     for dir in collect_watch_dirs(new_dir, policy) {
         register(&dir, RecursiveMode::NonRecursive);
+    }
+}
+
+/// Register a NonRecursive watch for the newly-created directory `dir` alone,
+/// an ignored one watched for a Shopify theme marker (W4-LIQ-01), on
+/// per-directory backends; a no-op on the recursive ones.
+fn register_marker_dir(watcher: &SharedWatcher, dir: &Path) {
+    if watch_registration(platform_watch_backend()) == WatchRegistration::SingleRootRecursive {
+        return;
+    }
+    let Ok(mut guard) = watcher.lock() else {
+        return;
+    };
+    if let Some(watcher) = guard.as_mut() {
+        let _ = watcher.watch(dir, RecursiveMode::NonRecursive);
     }
 }
 
@@ -877,12 +909,57 @@ pub struct WatchOptions {
     /// How often a RECOVERING watcher retries its full reconcile. Defaults to
     /// [`LOCK_RECOVERY_INTERVAL`].
     pub lock_recovery_interval: Duration,
+    /// How often an idle watcher checks the index for changes its events never
+    /// reported (the drift sentinel). `None` turns it off. Defaults to
+    /// [`CODEGRAPH_WATCH_SENTINEL_MS`] on Windows, whose backend can lose events
+    /// without saying so, and `None` elsewhere.
+    pub drift_sentinel: Option<Duration>,
+    /// Override for the sentinel's check. Defaults to the delta `codegraph
+    /// status` reports; tests inject a script.
+    drift_check_fn: Option<DriftCheckFn>,
 }
 
 /// How often a watcher paused by lock contention retries its full reconcile,
 /// so a long-lived writer is not polled in a loop (upstream #1959's re-arm
 /// cooldown).
 pub const LOCK_RECOVERY_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Above this many pending paths a burst syncs the whole project instead of
+/// path by path (upstream #1397's `SCOPED_SYNC_MAX_PENDING`). A branch switch or
+/// mass rename is cheaper to diff once, and the full scan also repairs anything
+/// the burst's events failed to report.
+const SCOPED_SYNC_MAX_PENDING: usize = 500;
+
+/// Env var name: milliseconds between drift-sentinel checks of an idle watcher
+/// on Windows (default 60000); `0` turns the sentinel off. Other platforms run
+/// no sentinel, because their backends report lost events.
+pub const CODEGRAPH_WATCH_SENTINEL_MS: &str = "CODEGRAPH_WATCH_SENTINEL_MS";
+const DEFAULT_SENTINEL_MS: u64 = 60_000;
+const MIN_SENTINEL_MS: u64 = 1_000;
+const MAX_SENTINEL_MS: u64 = 3_600_000;
+
+/// How long one sentinel check waits for a shared index lease before skipping
+/// the round: a writer holding the index is already syncing it.
+const DRIFT_READ_BUDGET: Duration = Duration::from_millis(250);
+
+fn drift_sentinel_from_env() -> Option<Duration> {
+    if cfg!(windows) {
+        parse_sentinel_ms(std::env::var(CODEGRAPH_WATCH_SENTINEL_MS).ok().as_deref())
+    } else {
+        None
+    }
+}
+
+/// Unset, empty or malformed gives the default; `0` disables; anything else is
+/// clamped to [`MIN_SENTINEL_MS`, `MAX_SENTINEL_MS`].
+fn parse_sentinel_ms(raw: Option<&str>) -> Option<Duration> {
+    let millis = raw
+        .map(str::trim)
+        .filter(|raw| !raw.is_empty())
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_SENTINEL_MS);
+    (millis > 0).then(|| Duration::from_millis(millis.clamp(MIN_SENTINEL_MS, MAX_SENTINEL_MS)))
+}
 
 impl Default for WatchOptions {
     fn default() -> Self {
@@ -907,6 +984,8 @@ impl Default for WatchOptions {
             cancel: SyncCancellation::new(),
             lock_contention_budget: MAX_BACKOFF,
             lock_recovery_interval: LOCK_RECOVERY_INTERVAL,
+            drift_sentinel: drift_sentinel_from_env(),
+            drift_check_fn: None,
         }
     }
 }
@@ -951,6 +1030,8 @@ impl WatchOptions {
             on_scan();
             Ok(SyncOutcome::default())
         }));
+        // Index drift is the syncing watcher's to repair, not an observer's.
+        self.drift_sentinel = None;
         self
     }
 
@@ -1030,6 +1111,17 @@ impl ProjectWatcher {
         // events fail `WatchPolicy::normalize_relative` before classification.
         let project_root = index_paths.project().to_path_buf();
         let control_files = ControlFiles::new(&project_root, &index_paths);
+        // The control inputs the index records (W5-06): their events reach the
+        // sync though they are no source files. An index that cannot be read
+        // yet records none; the first sync refreshes the list.
+        let control_paths = codegraph_store::Store::open_for_read(
+            &index_paths,
+            Instant::now() + Duration::from_secs(2),
+            || false,
+        )
+        .ok()
+        .and_then(|store| crate::control_inputs::recorded_paths(&store).ok())
+        .unwrap_or_default();
         let runtime_scope = RuntimeWatchScope::from_options(&project_root, &options);
         let policy = runtime_scope.policy.clone();
         let db_path = match options.db_path.clone() {
@@ -1052,6 +1144,13 @@ impl ProjectWatcher {
             let project_root = project_root.clone();
             let cancel = cancel.clone();
             Arc::new(move || sync_project_once_cancellable(&project_root, &cancel))
+        });
+        let drift_sentinel = options.drift_sentinel;
+        let drift_check_fn = options.drift_check_fn.clone().unwrap_or_else(|| {
+            let project_root = project_root.clone();
+            let index_paths = Arc::clone(&index_paths);
+            let cancel = cancel.clone();
+            Arc::new(move || index_drift(&project_root, &index_paths, &cancel))
         });
         let (tx, rx) = mpsc::channel();
         let degraded = Arc::new(DegradedState::default());
@@ -1097,19 +1196,9 @@ impl ProjectWatcher {
             Arc::new(Mutex::new(None))
         } else {
             let callback_tx = tx.clone();
-            let mut watcher =
-                notify::recommended_watcher(move |event: notify::Result<Event>| match event {
-                    Ok(event) if !changes_content(&event.kind) => {}
-                    Ok(event) => {
-                        let _ = callback_tx.send(LoopMessage::Event(WatchEventBatch::from_event(
-                            &event.kind,
-                            event.paths,
-                        )));
-                    }
-                    Err(err) => {
-                        let _ = callback_tx.send(LoopMessage::WatchError(err));
-                    }
-                })?;
+            let mut watcher = notify::recommended_watcher(move |event: notify::Result<Event>| {
+                forward_notify(&callback_tx, event);
+            })?;
             // Windows ReadDirectoryChangesW and macOS FSEvents cover descendants
             // with one recursive root watch. Registering every directory separately
             // is both redundant and expensive on Windows (one 16 KiB buffer plus OS
@@ -1147,6 +1236,15 @@ impl ProjectWatcher {
                     index_paths.current_root().to_path_buf(),
                     RecursiveMode::NonRecursive,
                 ));
+            }
+            // `.git/` is never watched as source either, yet the repository's
+            // `.git/info/exclude` decides scan membership like the root
+            // `.gitignore` (upstream #1728), so its directory gets the same
+            // explicit control watch. A recursive root watch already reports it.
+            if watch_registration(backend) == WatchRegistration::PerDirNonRecursive
+                && let Some(info) = codegraph_extract::engine::repository_exclude_dir(&project_root)
+            {
+                targets.push((info, RecursiveMode::NonRecursive));
             }
             let mut watch_err: Option<notify::Error> = None;
             for (dir, mode) in &targets {
@@ -1218,6 +1316,9 @@ impl ProjectWatcher {
                 supplemental_cap_warned,
                 lock_contention_budget,
                 lock_recovery_interval,
+                drift_sentinel,
+                drift_check_fn,
+                control_paths,
             });
             loop_finished.store(true, Ordering::SeqCst);
         });
@@ -1298,6 +1399,13 @@ impl ProjectWatcher {
         ])));
     }
 
+    /// Feed one notify callback result exactly as the OS watcher would, so a
+    /// test can produce the `Rescan` and path-less shapes no runner emits on
+    /// demand.
+    pub fn ingest_notify_event_for_tests(&self, event: notify::Result<Event>) {
+        forward_notify(&self.tx, event);
+    }
+
     /// Feed a REMOVED-DIRECTORY event, the notify `Remove(RemoveKind::Folder)`
     /// shape, without needing a real OS watcher.
     pub fn ingest_removed_dir_for_tests(&self, relative: impl Into<PathBuf>) {
@@ -1372,6 +1480,10 @@ enum LoopMessage {
 struct WatchEventBatch {
     paths: Vec<PathBuf>,
     removal: RemovalHint,
+    /// The backend may have dropped events: it flagged the event `Rescan`
+    /// (inotify queue overflow, an FSEvents drop) or reported a change without
+    /// naming any path. Only a full sync can find what was lost.
+    rescan: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1387,6 +1499,7 @@ impl WatchEventBatch {
         Self {
             paths,
             removal: RemovalHint::None,
+            rescan: false,
         }
     }
 
@@ -1396,7 +1509,34 @@ impl WatchEventBatch {
             EventKind::Remove(RemoveKind::Any) => RemovalHint::Ambiguous,
             _ => RemovalHint::None,
         };
-        Self { paths, removal }
+        Self {
+            paths,
+            removal,
+            rescan: false,
+        }
+    }
+
+    /// The batch for one notify event that [`changes_content`] let through.
+    fn from_notify(event: Event) -> Self {
+        let rescan = event.need_rescan() || event.paths.is_empty();
+        Self {
+            rescan,
+            ..Self::from_event(&event.kind, event.paths)
+        }
+    }
+}
+
+/// Hand one notify callback result to the event loop: content changes as a
+/// batch, errors as errors, and opens/reads not at all.
+fn forward_notify(tx: &Sender<LoopMessage>, event: notify::Result<Event>) {
+    match event {
+        Ok(event) if !changes_content(&event.kind) => {}
+        Ok(event) => {
+            let _ = tx.send(LoopMessage::Event(WatchEventBatch::from_notify(event)));
+        }
+        Err(err) => {
+            let _ = tx.send(LoopMessage::WatchError(err));
+        }
     }
 }
 
@@ -1454,6 +1594,10 @@ struct EventLoopCtx {
     supplemental_cap_warned: bool,
     lock_contention_budget: Duration,
     lock_recovery_interval: Duration,
+    drift_sentinel: Option<Duration>,
+    drift_check_fn: DriftCheckFn,
+    /// The control inputs the index records (W5-06), refreshed by each sync.
+    control_paths: crate::control_inputs::RecordedInputs,
 }
 
 fn event_loop(ctx: EventLoopCtx) {
@@ -1476,6 +1620,9 @@ fn event_loop(ctx: EventLoopCtx) {
         mut supplemental_cap_warned,
         lock_contention_budget,
         lock_recovery_interval,
+        drift_sentinel,
+        drift_check_fn,
+        mut control_paths,
     } = ctx;
     let mut pending = BTreeMap::<String, PendingInfo>::new();
     let mut deadline = None::<Instant>;
@@ -1484,8 +1631,14 @@ fn event_loop(ctx: EventLoopCtx) {
     // per-path list (one full sync instead of N incremental ones) yet still
     // flushes exactly once, on the same debounce deadline.
     let mut full_sync_pending = false;
+    // When an idle watcher next asks the drift sentinel whether the disk holds
+    // changes its events never reported. Only consulted while nothing is
+    // pending; every sync pushes it a whole interval out.
+    let mut sentinel_due = drift_sentinel.map(|every| Instant::now() + every);
+    let mut drift_error_reported = false;
     loop {
-        let message = match deadline {
+        let wake = deadline.or(sentinel_due);
+        let message = match wake {
             Some(when) => match rx.recv_timeout(when.saturating_duration_since(Instant::now())) {
                 Ok(message) => Some(message),
                 Err(RecvTimeoutError::Timeout) => None,
@@ -1499,7 +1652,11 @@ fn event_loop(ctx: EventLoopCtx) {
 
         match message {
             Some(LoopMessage::Event(batch)) => {
-                let WatchEventBatch { paths, removal } = batch;
+                let WatchEventBatch {
+                    paths,
+                    removal,
+                    rescan,
+                } = batch;
                 let mut control_changes = ControlChanges::default();
                 let mut normalized = Vec::new();
                 // Set when this batch changes which links the index follows.
@@ -1594,6 +1751,24 @@ fn event_loop(ctx: EventLoopCtx) {
                                     first_seen_ms: now,
                                     last_seen_ms: now,
                                 });
+                        } else if runtime_scope.policy.watches_for_theme_markers(&relative) {
+                            // An ignored `config/` or `layout/` removed or moved
+                            // away takes its theme marker with it, though no
+                            // event may name the marker (W4-LIQ-01).
+                            let now = epoch_millis();
+                            for marker in
+                                codegraph_extract::embedded::shopify::shopify_markers_in_folder(
+                                    &relative,
+                                )
+                            {
+                                pending
+                                    .entry(marker)
+                                    .and_modify(|info| info.last_seen_ms = now)
+                                    .or_insert(PendingInfo {
+                                        first_seen_ms: now,
+                                        last_seen_ms: now,
+                                    });
+                            }
                         }
                         continue;
                     }
@@ -1602,6 +1777,34 @@ fn event_loop(ctx: EventLoopCtx) {
                     // `collect_watch_dirs`). Register it (and any non-ignored
                     // descendants created in the same burst, e.g. `mkdir -p`) so
                     // edits inside it are seen without a server restart.
+                    // A new ignored `config/` or `layout/` is watched for a theme
+                    // marker alone; a marker written before the watch counts as
+                    // seen (W4-LIQ-01).
+                    if path.is_dir()
+                        && !runtime_scope.policy.should_watch_dir(&relative)
+                        && runtime_scope.policy.watches_for_theme_markers(&relative)
+                        && !fs::symlink_metadata(&path)
+                            .is_ok_and(|meta| meta.file_type().is_symlink())
+                    {
+                        register_marker_dir(&watcher, &path);
+                        known_dirs.insert(relative.clone());
+                        let now = epoch_millis();
+                        for entry in fs::read_dir(&path).into_iter().flatten().flatten() {
+                            let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+                                continue;
+                            };
+                            let marker = format!("{relative}/{name}");
+                            if runtime_scope.policy.may_mark_a_theme(&marker) {
+                                pending
+                                    .entry(marker)
+                                    .and_modify(|info| info.last_seen_ms = now)
+                                    .or_insert(PendingInfo {
+                                        first_seen_ms: now,
+                                        last_seen_ms: now,
+                                    });
+                            }
+                        }
+                    }
                     if path.is_dir() && runtime_scope.policy.should_watch_dir(&relative) {
                         // A new link is the scan's to follow (above); a new real
                         // directory holding a link is a topology change too.
@@ -1631,9 +1834,18 @@ fn event_loop(ctx: EventLoopCtx) {
                             }
                         }
                     }
+                    // A Shopify theme marker need not be source, nor in scope,
+                    // yet its coming or going reclassifies the theme's JSON
+                    // templates: the sync it is handed to reads the theme
+                    // (W4-LIQ-01).
                     if runtime_scope.policy.should_handle_file(&relative)
                         || (runtime_scope.policy.allows_file_path(&relative)
                             && maybe_deleted_source(&relative))
+                        || runtime_scope.policy.may_mark_a_theme(&relative)
+                        // A control file or an input the index records is
+                        // no source either, yet resolution reads it (W5-06).
+                        || runtime_scope.policy.is_project_control_file(&relative)
+                        || control_paths.may_move(&relative, path.is_dir())
                     {
                         let now = epoch_millis();
                         // A file link aliasing this path is the same content
@@ -1685,6 +1897,18 @@ fn event_loop(ctx: EventLoopCtx) {
                     supplemental = next_supplemental;
                     full_sync_pending = true;
                 }
+                // The backend may have dropped events (upstream #2025's
+                // `filename == null`, an inotify overflow, an FSEvents drop):
+                // only a full scan finds what they would have reported.
+                if rescan && runtime_scope.enabled {
+                    full_sync_pending = true;
+                    begin_lost_event_recovery(
+                        &degraded,
+                        &mut deadline,
+                        runtime_scope.debounce,
+                        "the OS watcher reported dropped events or a change without a path",
+                    );
+                }
                 // While lock contention paused auto-sync, the recovery retry keeps
                 // its own cadence; a burst of edits must not poll the other writer.
                 if !pending.is_empty() && !degraded.is_recovering() {
@@ -1704,12 +1928,42 @@ fn event_loop(ctx: EventLoopCtx) {
             }
             #[cfg(test)]
             Some(LoopMessage::Flush(reply)) => {
-                if !pending.is_empty() {
+                if !pending.is_empty() || full_sync_pending {
                     deadline = Some(Instant::now());
                 }
                 let _ = reply.send(());
             }
             Some(LoopMessage::Stop) => break,
+            None if deadline.is_none() => {
+                // The drift sentinel's idle tick. A recovery already owes a full
+                // reconcile, and a disabled scope syncs nothing.
+                sentinel_due = drift_sentinel.map(|every| Instant::now() + every);
+                if degraded.is_recovering() || !runtime_scope.enabled {
+                    continue;
+                }
+                match drift_check_fn() {
+                    Ok(Some(detail)) => {
+                        // A backend that lost events may also have dropped its
+                        // watch without saying so (notify's Windows backend on an
+                        // unexpected error code): register the root again.
+                        rewatch_root(&watcher, &project_root, &on_sync_error);
+                        full_sync_pending = true;
+                        begin_lost_event_recovery(
+                            &degraded,
+                            &mut deadline,
+                            Duration::ZERO,
+                            &format!("the drift sentinel found {detail}"),
+                        );
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
+                        if !drift_error_reported && let Some(callback) = &on_sync_error {
+                            callback(format!("watch drift check failed: {err:#}"));
+                        }
+                        drift_error_reported = true;
+                    }
+                }
+            }
             None => {
                 // Taken for the attempt; a failed or paused sync puts it back.
                 let mut batch = Some(std::mem::take(&mut pending));
@@ -1718,7 +1972,19 @@ fn event_loop(ctx: EventLoopCtx) {
                     .map(|batch| batch.keys().cloned().collect::<Vec<_>>())
                     .unwrap_or_default();
                 deadline = None;
-                let full_sync = std::mem::take(&mut full_sync_pending);
+                sentinel_due = drift_sentinel.map(|every| Instant::now() + every);
+                // A burst past the ceiling is diffed whole: cheaper than path by
+                // path, and it also repairs whatever its events failed to report,
+                // so it reports RECOVERING like any other possible event loss
+                // until that full sync commits.
+                let burst = paths.len() > SCOPED_SYNC_MAX_PENDING;
+                if burst && !degraded.is_recovering() {
+                    degraded.mark_recovering(format!(
+                        "events may have been lost: {} paths changed at once",
+                        paths.len()
+                    ));
+                }
+                let full_sync = std::mem::take(&mut full_sync_pending) || burst;
                 let attempt = if full_sync {
                     run_full_sync_with_backoff(&full_sync_fn, lock_contention_budget)
                 } else {
@@ -1731,6 +1997,9 @@ fn event_loop(ctx: EventLoopCtx) {
                         // edits missed while another writer held the index are in.
                         if full_sync {
                             degraded.recover();
+                        }
+                        if let Some(paths) = &outcome.control_paths {
+                            control_paths.clone_from(paths);
                         }
                         // Preserve the event batch independently of actual DB
                         // mutations. Startup catch-up can win the writer lease and
@@ -1795,6 +2064,77 @@ fn event_loop(ctx: EventLoopCtx) {
 fn with_trigger_paths(mut outcome: SyncOutcome, trigger_paths: Vec<String>) -> SyncOutcome {
     outcome.trigger_paths = trigger_paths;
     outcome
+}
+
+/// Events may have been lost: report RECOVERING, naming `cause`, until the full
+/// sync the caller owes commits, and schedule that sync `delay` from now. A
+/// recovery already under way (lock contention) owes the same full reconcile,
+/// so it keeps its own reason and retry cadence.
+fn begin_lost_event_recovery(
+    degraded: &DegradedState,
+    deadline: &mut Option<Instant>,
+    delay: Duration,
+    cause: &str,
+) {
+    if degraded.is_recovering() {
+        return;
+    }
+    degraded.mark_recovering(format!("events may have been lost: {cause}"));
+    *deadline = Some(Instant::now() + delay);
+}
+
+/// Register the recursive root watch again. Only single-root backends need it:
+/// notify's Windows backend can drop that watch on an unexpected error code
+/// without reporting anything, while per-directory backends report failures.
+fn rewatch_root(
+    watcher: &SharedWatcher,
+    project_root: &Path,
+    on_sync_error: &Option<NoticeCallback>,
+) {
+    if watch_registration(platform_watch_backend()) != WatchRegistration::SingleRootRecursive {
+        return;
+    }
+    let Ok(mut guard) = watcher.lock() else {
+        return;
+    };
+    let Some(watcher) = guard.as_mut() else {
+        return;
+    };
+    let _ = watcher.unwatch(project_root);
+    if let Err(err) = watcher.watch(project_root, RecursiveMode::Recursive)
+        && let Some(callback) = on_sync_error
+    {
+        callback(format!(
+            "re-watching {} after drift failed: {err}",
+            project_root.display()
+        ));
+    }
+}
+
+/// The drift sentinel's default check: the same delta `codegraph status`
+/// reports (git's fast path when it can vouch for the tree, the full inventory
+/// otherwise). A writer holding the index is already syncing it, and an index
+/// that is not current is the catch-up's to rebuild, so both skip the round.
+fn index_drift(
+    project_root: &Path,
+    index_paths: &IndexPaths,
+    cancel: &SyncCancellation,
+) -> Result<Option<String>> {
+    let deadline = Instant::now() + DRIFT_READ_BUDGET;
+    let Ok(store) =
+        codegraph_store::Store::open_for_read(index_paths, deadline, || cancel.is_cancelled())
+    else {
+        return Ok(None);
+    };
+    let pending = crate::sync::pending_project_changes(project_root, &store)?;
+    Ok((!pending.is_empty()).then(|| {
+        format!(
+            "{} added, {} modified and {} removed path(s) the watcher never reported",
+            pending.added.len(),
+            pending.modified.len(),
+            pending.removed.len()
+        )
+    }))
 }
 
 /// Apply the EMFILE/ENFILE → degrade-once, ENOSPC → warn classification to a
@@ -2509,6 +2849,59 @@ mod tests {
         let readmitted = outcome_rx
             .recv_timeout(FULL_SYNC_WAIT)
             .expect("gitignore-readmission full sync");
+        assert_eq!(readmitted.files_reindexed, 1);
+        assert!(
+            codegraph_store::Store::open(&paths.current_db())
+                .unwrap()
+                .file_by_path("generated/drop.ts")
+                .unwrap()
+                .is_some()
+        );
+        watcher.stop();
+    }
+
+    /// The repository's `.git/info/exclude` decides scan membership like the
+    /// root `.gitignore` (upstream #1728), so an edit to it reloads the scope
+    /// and reconciles, although the rest of `.git/` is always ignored.
+    #[test]
+    fn repository_exclude_reload_reconciles_and_readmits_sources() {
+        let _env = crate::test_env::env_guard();
+        let dir = crate::sync::tests::TestDir::new("watch-exclude-reload");
+        fs::create_dir_all(dir.path().join(".git/info")).unwrap();
+        fs::create_dir_all(dir.path().join("generated")).unwrap();
+        fs::write(
+            dir.path().join("generated/drop.ts"),
+            "export function drop() { return 1; }\n",
+        )
+        .unwrap();
+        let paths = IndexPaths::resolve(dir.path(), None).unwrap();
+        let initial = crate::sync::sync_project_once(dir.path()).unwrap();
+        assert_eq!(initial.files_reindexed, 1);
+        let (outcome_tx, outcome_rx) = mpsc::channel();
+        let mut options = live_project_options(dir.path());
+        options.debounce = Duration::from_secs(30);
+        options.inert_for_tests = true;
+        options.on_sync_complete = Some(Arc::new(move |outcome| {
+            outcome_tx.send(outcome).unwrap();
+        }));
+        let watcher = ProjectWatcher::start(dir.path(), options).unwrap().unwrap();
+
+        fs::write(dir.path().join(".git/info/exclude"), "generated/\n").unwrap();
+        watcher.ingest_event_for_tests(".git/info/exclude");
+        watcher.ingest_event_for_tests("generated/drop.ts");
+        watcher.flush_for_tests();
+        let removed = outcome_rx
+            .recv_timeout(FULL_SYNC_WAIT)
+            .expect("exclude-removal full sync");
+        assert_eq!(removed.files_removed, 1);
+        assert_eq!(removed.trigger_paths, vec![".git/info/exclude".to_string()]);
+
+        fs::write(dir.path().join(".git/info/exclude"), "").unwrap();
+        watcher.ingest_event_for_tests(".git/info/exclude");
+        watcher.flush_for_tests();
+        let readmitted = outcome_rx
+            .recv_timeout(FULL_SYNC_WAIT)
+            .expect("exclude-readmission full sync");
         assert_eq!(readmitted.files_reindexed, 1);
         assert!(
             codegraph_store::Store::open(&paths.current_db())
@@ -3778,6 +4171,301 @@ mod tests {
         );
     }
 
+    /// W5-06: a control file a resolver reads is no source file, yet its
+    /// event reaches the sync: a JS, C#, Rust or Dart control file and a
+    /// Tauri marker by name; an input the index records (an `extends` target named
+    /// like no control file) by its path, and a directory coming into a
+    /// workspace glob's listing, as the watcher read them at start; and an
+    /// input the rows come to record, as a sync reports them. JSON no reader
+    /// reads, and a file in a listed folder, are not handed on.
+    #[test]
+    fn control_files_and_recorded_inputs_reach_the_sync_though_they_are_not_source() {
+        let _env = crate::test_env::env_guard();
+        let dir = crate::sync::tests::TestDir::new("watch-control-inputs");
+        let write = |relative: &str, text: &str| {
+            let path = dir.path().join(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, text).unwrap();
+        };
+        let initial = [
+            (
+                "package.json",
+                "{\"name\":\"root\",\"workspaces\":[\"packages/*\"]}\n",
+            ),
+            (
+                "tsconfig.json",
+                "{\"extends\":\"./configs/base-settings.json\"}\n",
+            ),
+            ("packages/core/package.json", "{\"name\":\"@acme/core\"}\n"),
+            ("src/main.ts", "export const one = 1;\n"),
+        ];
+        for (relative, text) in initial {
+            write(relative, text);
+        }
+        for folder in ["App", "configs", "notes", "shared", "src-tauri"] {
+            fs::create_dir_all(dir.path().join(folder)).unwrap();
+        }
+        let db = crate::sync::default_db_path(dir.path()).unwrap();
+        crate::sync::sync_changed_paths(dir.path(), &db, initial.iter().map(|(path, _)| *path))
+            .unwrap();
+
+        let synced = Arc::new(Mutex::new(Vec::<Vec<String>>::new()));
+        let recorder = Arc::clone(&synced);
+        let sync_fn: SyncFn = Arc::new(move |paths| {
+            let mut synced = recorder.lock().unwrap();
+            synced.push(paths.clone());
+            // Once the `extends` target is heard of, the rows a sync writes
+            // come to record another input, and only it.
+            let recorded = synced
+                .iter()
+                .flatten()
+                .any(|path| path == "configs/base-settings.json")
+                .then(|| crate::control_inputs::RecordedInputs {
+                    paths: ["shared/settings.cfg".to_string()].into(),
+                    member_listings: Default::default(),
+                });
+            Ok(SyncOutcome {
+                files_checked: paths.len(),
+                control_paths: recorded,
+                ..Default::default()
+            })
+        });
+        let watcher = ProjectWatcher::start(
+            dir.path(),
+            WatchOptions {
+                debounce: Duration::from_millis(50),
+                sync_fn: Some(sync_fn),
+                ..WatchOptions::default()
+            },
+        )
+        .unwrap()
+        .unwrap();
+        let reached = |path: &str| {
+            for _ in 0..40 {
+                std::thread::sleep(Duration::from_millis(50));
+                if synced
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|paths| paths.iter().any(|p| p == path))
+                {
+                    return true;
+                }
+            }
+            false
+        };
+
+        // Give the OS watch registration a moment.
+        std::thread::sleep(Duration::from_millis(150));
+        let mut missed = Vec::new();
+        for (relative, text) in [
+            (
+                "package.json",
+                "{\"name\":\"root\",\"workspaces\":[\"packages/*\",\"apps/*\"]}\n",
+            ),
+            (
+                "tsconfig.json",
+                "{\"extends\":\"./configs/base-settings.json\"}\n\n",
+            ),
+            ("App/App.csproj", "<Project Sdk=\"Microsoft.NET.Sdk\" />\n"),
+            ("Cargo.toml", "[package]\nname = \"app\"\n"),
+            ("src-tauri/tauri.conf.json", "{}\n"),
+            ("packages/core/pubspec.yaml", "name: core\n"),
+        ] {
+            write(relative, text);
+            if !reached(relative) {
+                missed.push(relative.to_string());
+            }
+        }
+        let staging = crate::sync::tests::TestDir::new("watch-control-inputs-staging");
+        fs::create_dir_all(staging.path().join("ui")).unwrap();
+        fs::write(
+            staging.path().join("ui/package.json"),
+            "{\"name\":\"@acme/ui\"}\n",
+        )
+        .unwrap();
+        fs::rename(staging.path().join("ui"), dir.path().join("packages/ui")).unwrap();
+        if !reached("packages/ui") {
+            missed.push("packages/ui".to_string());
+        }
+        write("configs/base-settings.json", "{}\n");
+        if !reached("configs/base-settings.json") {
+            missed.push("configs/base-settings.json".to_string());
+        }
+        write("shared/settings.cfg", "shared\n");
+        if !reached("shared/settings.cfg") {
+            missed.push("shared/settings.cfg".to_string());
+        }
+        // What no reader reads, then a source file the batch must reach
+        // after them.
+        write("notes/settings.json", "{}\n");
+        write("packages/readme.txt", "members\n");
+        write("src/fence.ts", "export const fence = 1;\n");
+        let fenced = reached("src/fence.ts");
+        watcher.stop();
+        let synced = synced.lock().unwrap().clone();
+        assert!(missed.is_empty(), "missed {missed:?}: {synced:?}");
+        assert!(fenced, "the fence should reach a sync: {synced:?}");
+        for unread in ["notes/settings.json", "packages/readme.txt"] {
+            assert!(
+                !synced.iter().any(|paths| paths.iter().any(|p| p == unread)),
+                "{unread} is not handed on: {synced:?}"
+            );
+        }
+    }
+
+    /// W4-LIQ-01: a Shopify theme marker is no source file here, yet its
+    /// coming reaches the sync, which reclassifies the theme's JSON
+    /// templates; other JSON beside it does not.
+    #[test]
+    fn a_shopify_theme_marker_reaches_the_sync_though_it_is_not_source() {
+        let _env = crate::test_env::env_guard();
+        let dir = crate::sync::tests::TestDir::new("watch-shopify-marker");
+        fs::create_dir_all(dir.path().join("config")).unwrap();
+        fs::create_dir_all(dir.path().join("templates")).unwrap();
+        fs::write(dir.path().join("templates/product.json"), "{}").unwrap();
+
+        let synced = Arc::new(Mutex::new(Vec::<Vec<String>>::new()));
+        let recorder = Arc::clone(&synced);
+        let sync_fn: SyncFn = Arc::new(move |paths| {
+            recorder.lock().unwrap().push(paths.clone());
+            Ok(SyncOutcome {
+                files_checked: paths.len(),
+                ..Default::default()
+            })
+        });
+        let watcher = ProjectWatcher::start(
+            dir.path(),
+            WatchOptions {
+                debounce: Duration::from_millis(50),
+                sync_fn: Some(sync_fn),
+                ..WatchOptions::default()
+            },
+        )
+        .unwrap()
+        .unwrap();
+
+        // Give the OS watch registration a moment, then write the theme's
+        // settings data (no marker) and its settings schema (a marker).
+        std::thread::sleep(Duration::from_millis(150));
+        fs::write(dir.path().join("config/settings_data.json"), "{}").unwrap();
+        fs::write(dir.path().join("config/settings_schema.json"), "[]").unwrap();
+
+        let mut seen = false;
+        for _ in 0..40 {
+            std::thread::sleep(Duration::from_millis(50));
+            if synced
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|paths| paths.iter().any(|p| p == "config/settings_schema.json"))
+            {
+                seen = true;
+                break;
+            }
+        }
+        watcher.stop();
+        let synced = synced.lock().unwrap().clone();
+        assert!(seen, "the marker should reach a sync: {synced:?}");
+        assert!(
+            !synced
+                .iter()
+                .any(|paths| paths.iter().any(|p| p == "config/settings_data.json")),
+            "JSON that marks no theme is not handed on: {synced:?}"
+        );
+    }
+
+    /// W4-LIQ-01: a Shopify theme marker counts though ignored, so an ignored
+    /// `config/` is still watched for one (itself, not below it, on
+    /// per-directory backends), whether it exists at start or comes later,
+    /// and its marker reaches the sync.
+    #[test]
+    fn an_ignored_shopify_marker_folder_is_watched_for_its_marker() {
+        let _env = crate::test_env::env_guard();
+        let dir = crate::sync::tests::TestDir::new("watch-shopify-ignored-marker");
+        fs::write(dir.path().join(".gitignore"), "config/\n").unwrap();
+        fs::create_dir_all(dir.path().join("config")).unwrap();
+        fs::create_dir_all(dir.path().join("templates")).unwrap();
+        fs::create_dir_all(dir.path().join("shop/templates")).unwrap();
+
+        let synced = Arc::new(Mutex::new(Vec::<Vec<String>>::new()));
+        let recorder = Arc::clone(&synced);
+        let sync_fn: SyncFn = Arc::new(move |paths| {
+            recorder.lock().unwrap().push(paths.clone());
+            Ok(SyncOutcome {
+                files_checked: paths.len(),
+                ..Default::default()
+            })
+        });
+        let watcher = ProjectWatcher::start(
+            dir.path(),
+            WatchOptions {
+                debounce: Duration::from_millis(50),
+                sync_fn: Some(sync_fn),
+                ..WatchOptions::default()
+            },
+        )
+        .unwrap()
+        .unwrap();
+        // Whether a batch after the first `since` names `path`.
+        let reached = |path: &str, since: usize| {
+            for _ in 0..40 {
+                std::thread::sleep(Duration::from_millis(50));
+                if synced
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .skip(since)
+                    .any(|paths| paths.iter().any(|p| p == path))
+                {
+                    return true;
+                }
+            }
+            false
+        };
+        let batches = || synced.lock().unwrap().len();
+
+        // Give the OS watch registration a moment, then mark the root theme.
+        std::thread::sleep(Duration::from_millis(150));
+        fs::write(dir.path().join("config/settings_schema.json"), "[]").unwrap();
+        let root_marker = reached("config/settings_schema.json", 0);
+        // An ignored `config/` made after start is watched too.
+        fs::create_dir_all(dir.path().join("shop/config")).unwrap();
+        std::thread::sleep(Duration::from_millis(150));
+        fs::write(dir.path().join("shop/config/settings_schema.json"), "[]").unwrap();
+        let folder_marker = reached("shop/config/settings_schema.json", 0);
+        // A marker folder moved away, or removed whole, takes its marker with
+        // it, though no event need name the marker.
+        let since = batches();
+        fs::rename(
+            dir.path().join("shop/config"),
+            dir.path().join("shop/config-old"),
+        )
+        .unwrap();
+        let moved_away = reached("shop/config/settings_schema.json", since);
+        let since = batches();
+        fs::remove_dir_all(dir.path().join("config")).unwrap();
+        let removed = reached("config/settings_schema.json", since);
+        watcher.stop();
+        let synced = synced.lock().unwrap().clone();
+        assert!(
+            root_marker,
+            "the root theme's marker should reach a sync: {synced:?}"
+        );
+        assert!(
+            folder_marker,
+            "the folder theme's marker should reach a sync: {synced:?}"
+        );
+        assert!(
+            moved_away,
+            "a marker moved away with its folder should reach a sync: {synced:?}"
+        );
+        assert!(
+            removed,
+            "a marker removed with its folder should reach a sync: {synced:?}"
+        );
+    }
+
     #[test]
     fn newly_created_source_dir_is_watched_after_start() {
         let _env = crate::test_env::env_guard();
@@ -4326,6 +5014,325 @@ mod tests {
         assert!(
             scheduled,
             "a file link whose target became a directory now reaches a tree the scan follows"
+        );
+    }
+
+    // ---- lost events (upstream #1397, #2025; sunerpy/codegraph-rust#269) ----
+
+    /// What an injected watcher's syncs did: every incremental batch, and one
+    /// channel message per full sync.
+    struct SyncLog {
+        incremental: Recorded,
+        full: mpsc::Receiver<()>,
+    }
+
+    /// An inert watcher whose syncs only record what they were asked to do. The
+    /// full sync runs `full_sync` first, so a test can fail or hold it.
+    fn logging_watcher(
+        root: &Path,
+        options: WatchOptions,
+        full_sync: impl Fn() -> Result<()> + Send + Sync + 'static,
+    ) -> (ProjectWatcher, SyncLog) {
+        let incremental: Recorded = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&incremental);
+        let sync_fn: SyncFn = Arc::new(move |paths| {
+            sink.lock().unwrap().push(paths);
+            Ok(SyncOutcome::default())
+        });
+        let (full_tx, full) = mpsc::channel();
+        let full_sync_fn: FullSyncFn = Arc::new(move || {
+            full_sync()?;
+            let _ = full_tx.send(());
+            Ok(SyncOutcome::default())
+        });
+        let watcher = ProjectWatcher::start(
+            root,
+            WatchOptions {
+                inert_for_tests: true,
+                sync_fn: Some(sync_fn),
+                full_sync_fn: Some(full_sync_fn),
+                drift_sentinel: None,
+                ..options
+            },
+        )
+        .unwrap()
+        .unwrap();
+        (watcher, SyncLog { incremental, full })
+    }
+
+    fn quiet_options() -> WatchOptions {
+        WatchOptions {
+            debounce: Duration::from_secs(30),
+            ..WatchOptions::default()
+        }
+    }
+
+    #[test]
+    fn rescan_flag_forces_full_sync() {
+        use notify::event::{Flag, ModifyKind};
+        let _env = crate::test_env::env_guard();
+        let dir = crate::sync::tests::TestDir::new("watch-rescan-flag");
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        let (watcher, log) = logging_watcher(dir.path(), quiet_options(), || Ok(()));
+
+        // inotify reports a queue overflow as a path-less `Other` event flagged
+        // Rescan; FSEvents flags a dropped stream the same way, with a path.
+        watcher
+            .ingest_notify_event_for_tests(Ok(Event::new(EventKind::Other).set_flag(Flag::Rescan)));
+        watcher.flush_for_tests();
+        log.full
+            .recv_timeout(Duration::from_secs(2))
+            .expect("an overflow schedules a full sync");
+        watcher.ingest_notify_event_for_tests(Ok(Event::new(EventKind::Modify(ModifyKind::Any))
+            .add_path(PathBuf::from("src/app.ts"))
+            .set_flag(Flag::Rescan)));
+        watcher.flush_for_tests();
+        log.full
+            .recv_timeout(Duration::from_secs(2))
+            .expect("a Rescan flag on a named path also schedules a full sync");
+        watcher.stop();
+
+        assert!(
+            log.incremental.lock().unwrap().is_empty(),
+            "a possible event loss never takes the path-scoped sync"
+        );
+    }
+
+    #[test]
+    fn empty_path_event_forces_full_sync() {
+        use notify::event::{CreateKind, ModifyKind};
+        let _env = crate::test_env::env_guard();
+        let dir = crate::sync::tests::TestDir::new("watch-empty-path");
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        let (watcher, log) = logging_watcher(dir.path(), quiet_options(), || Ok(()));
+
+        // An open or a read names no change and still never reaches the loop.
+        watcher.ingest_notify_event_for_tests(Ok(Event::new(EventKind::Access(AccessKind::Open(
+            AccessMode::Any,
+        )))));
+        watcher.flush_for_tests();
+        assert!(log.full.try_recv().is_err(), "an open schedules nothing");
+
+        // A change the backend could not attribute to any path (libuv's
+        // `filename == null`) can only be found by a full scan.
+        for kind in [
+            EventKind::Modify(ModifyKind::Any),
+            EventKind::Create(CreateKind::Any),
+        ] {
+            watcher.ingest_notify_event_for_tests(Ok(Event::new(kind)));
+            watcher.flush_for_tests();
+            log.full
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap_or_else(|_| panic!("a path-less {kind:?} schedules a full sync"));
+        }
+        watcher.stop();
+        assert!(log.incremental.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn burst_over_500_paths_forces_full_sync() {
+        let _env = crate::test_env::env_guard();
+        let dir = crate::sync::tests::TestDir::new("watch-burst-ceiling");
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        // The full sync is held until the test lets it commit, so the health
+        // while it runs is observable.
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let release_rx = Mutex::new(release_rx);
+        let full_started = Arc::new(AtomicUsize::new(0));
+        let started = Arc::clone(&full_started);
+        let (watcher, log) = logging_watcher(dir.path(), quiet_options(), move || {
+            started.fetch_add(1, AtomicOrdering::SeqCst);
+            release_rx
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(10))
+                .map_err(|_| anyhow::anyhow!("test never released the sync"))
+        });
+
+        // At the ceiling the burst is still synced path by path...
+        for n in 0..SCOPED_SYNC_MAX_PENDING {
+            watcher.ingest_event_for_tests(format!("src/f{n:04}.ts"));
+        }
+        watcher.flush_for_tests();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while log.incremental.lock().unwrap().is_empty() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        {
+            let batches = log.incremental.lock().unwrap();
+            assert_eq!(batches.len(), 1, "one scoped sync at the ceiling");
+            assert_eq!(batches[0].len(), SCOPED_SYNC_MAX_PENDING);
+        }
+        assert!(log.full.try_recv().is_err());
+
+        assert_eq!(watcher.health(), WatchHealth::Healthy);
+
+        // ...and one path more makes it one full sync instead, during which the
+        // watcher reports RECOVERING: such a burst may have lost events too.
+        for n in 0..=SCOPED_SYNC_MAX_PENDING {
+            watcher.ingest_event_for_tests(format!("src/g{n:04}.ts"));
+        }
+        watcher.flush_for_tests();
+        assert!(
+            wait_until(|| full_started.load(AtomicOrdering::SeqCst) == 1),
+            "a burst past the ceiling runs a full sync"
+        );
+        match watcher.health() {
+            WatchHealth::Recovering { reason } => assert!(
+                reason.contains("events may have been lost")
+                    && reason.contains(&format!("{} paths", SCOPED_SYNC_MAX_PENDING + 1)),
+                "the reason names the burst: {reason}"
+            ),
+            other => panic!("RECOVERING while the burst is reconciled, got {other:?}"),
+        }
+        release_tx.send(()).unwrap();
+        log.full
+            .recv_timeout(Duration::from_secs(2))
+            .expect("the full sync commits");
+        let healthy = wait_until(|| watcher.health() == WatchHealth::Healthy);
+        watcher.stop();
+        assert!(healthy, "the committed full sync ends the recovery");
+        assert_eq!(
+            log.incremental.lock().unwrap().len(),
+            1,
+            "the burst past the ceiling never takes the path-scoped sync"
+        );
+    }
+
+    #[test]
+    fn lost_events_report_recovering_until_committed() {
+        use notify::event::Flag;
+        let _env = crate::test_env::env_guard();
+        let dir = crate::sync::tests::TestDir::new("watch-lost-recovering");
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        // The first full sync fails; the retry is held until the test lets it
+        // commit, so the health in between is observable.
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempt_counter = Arc::clone(&attempts);
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let release_rx = Mutex::new(release_rx);
+        let (watcher, log) = logging_watcher(
+            dir.path(),
+            WatchOptions {
+                debounce: Duration::from_millis(20),
+                ..WatchOptions::default()
+            },
+            move || {
+                if attempt_counter.fetch_add(1, AtomicOrdering::SeqCst) == 0 {
+                    anyhow::bail!("disk unavailable");
+                }
+                release_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(10))
+                    .map_err(|_| anyhow::anyhow!("test never released the sync"))
+            },
+        );
+        assert_eq!(watcher.health(), WatchHealth::Healthy);
+
+        watcher
+            .ingest_notify_event_for_tests(Ok(Event::new(EventKind::Other).set_flag(Flag::Rescan)));
+        let recovering = wait_until(|| attempts.load(AtomicOrdering::SeqCst) >= 2);
+        assert!(recovering, "the failed full sync is retried");
+        match watcher.health() {
+            WatchHealth::Recovering { reason } => assert!(
+                reason.contains("events may have been lost"),
+                "the reason names the cause: {reason}"
+            ),
+            other => panic!("RECOVERING until a full sync commits, got {other:?}"),
+        }
+
+        release_tx.send(()).unwrap();
+        log.full
+            .recv_timeout(Duration::from_secs(2))
+            .expect("the retried full sync commits");
+        let healthy = wait_until(|| watcher.health() == WatchHealth::Healthy);
+        watcher.stop();
+        assert!(healthy, "a committed full sync ends the recovery");
+    }
+
+    #[test]
+    fn sentinel_drift_triggers_full_sync() {
+        let _env = crate::test_env::env_guard();
+        let dir = crate::sync::tests::TestDir::new("watch-sentinel-drift");
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        let checks = Arc::new(AtomicUsize::new(0));
+        let check_counter = Arc::clone(&checks);
+        let drift_check_fn: DriftCheckFn = Arc::new(move || {
+            // Only the second check finds drift: the first proves a clean check
+            // schedules nothing.
+            Ok((check_counter.fetch_add(1, AtomicOrdering::SeqCst) == 1)
+                .then(|| "1 added path the watcher never reported".to_string()))
+        });
+        let incremental: Recorded = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&incremental);
+        let (full_tx, full_rx) = mpsc::channel();
+        let full_checks = Arc::clone(&checks);
+        let watcher = ProjectWatcher::start(
+            dir.path(),
+            WatchOptions {
+                debounce: Duration::from_millis(20),
+                inert_for_tests: true,
+                sync_fn: Some(Arc::new(move |paths| {
+                    sink.lock().unwrap().push(paths);
+                    Ok(SyncOutcome::default())
+                })),
+                full_sync_fn: Some(Arc::new(move || {
+                    let _ = full_tx.send(full_checks.load(AtomicOrdering::SeqCst));
+                    Ok(SyncOutcome::default())
+                })),
+                drift_sentinel: Some(Duration::from_millis(30)),
+                drift_check_fn: Some(drift_check_fn),
+                ..WatchOptions::default()
+            },
+        )
+        .unwrap()
+        .unwrap();
+
+        let checks_before_sync = full_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("drift found by the sentinel schedules a full sync");
+        assert_eq!(
+            checks_before_sync, 2,
+            "the full sync follows the check that found drift, not the clean one"
+        );
+        let checked_again = wait_until(|| checks.load(AtomicOrdering::SeqCst) >= 4);
+        let healthy = watcher.health() == WatchHealth::Healthy;
+        watcher.stop();
+        assert!(checked_again, "the sentinel keeps checking while idle");
+        assert!(healthy, "the committed full sync ends the recovery");
+        assert!(full_rx.try_recv().is_err(), "clean checks schedule nothing");
+        assert!(incremental.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn sentinel_interval_parses_its_env_value() {
+        assert_eq!(parse_sentinel_ms(None), Some(Duration::from_secs(60)));
+        assert_eq!(parse_sentinel_ms(Some("")), Some(Duration::from_secs(60)));
+        assert_eq!(
+            parse_sentinel_ms(Some("soon")),
+            Some(Duration::from_secs(60))
+        );
+        assert_eq!(parse_sentinel_ms(Some("0")), None);
+        assert_eq!(parse_sentinel_ms(Some("5")), Some(Duration::from_secs(1)));
+        assert_eq!(
+            parse_sentinel_ms(Some("90000")),
+            Some(Duration::from_secs(90))
+        );
+        assert_eq!(
+            parse_sentinel_ms(Some("99999999")),
+            Some(Duration::from_secs(3_600))
+        );
+        assert_eq!(
+            WatchOptions::default().drift_sentinel.is_some(),
+            cfg!(windows),
+            "only Windows runs the sentinel by default"
+        );
+        assert_eq!(
+            WatchOptions::default()
+                .observe_only(|_| {}, || {})
+                .drift_sentinel,
+            None
         );
     }
 }

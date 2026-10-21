@@ -3,9 +3,10 @@
 //! `QueryBuilder.getRoutingManifest`.
 //!
 //! The rows come from `route` nodes the framework resolvers mint, joined to the
-//! handler their `references` / `calls` edge names. Fewer than three
-//! production routes is not a routed app: the answer is then `routed: false`
-//! rather than a map of two test fixtures.
+//! handler their `references` / `calls` edge names, one row per route (the
+//! viewer keys its lists by route id). Fewer than three production rows is not
+//! a routed app: the answer is then `routed: false` rather than a map of two
+//! test fixtures.
 
 use std::collections::{HashMap, HashSet};
 
@@ -16,7 +17,8 @@ use serde::Serialize;
 use serde_json::Value;
 
 use super::Ctx;
-use super::wire::to_posix_path;
+use super::route_roots::{RouteRoot, route_roots};
+use super::wire::{is_test_file, to_posix_path};
 use crate::respond::{ApiResult, Query};
 
 const HTTP_METHODS: &[&str] = &[
@@ -26,6 +28,9 @@ const HTTP_METHODS: &[&str] = &[
 
 /// The smallest window a caller may ask for — also the routed-app floor.
 const MIN_LIMIT: i64 = 3;
+
+/// Manifest rows fetched per route shown, so folding repeats still fills the page.
+const ROWS_PER_ROUTE: i64 = 4;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -41,6 +46,8 @@ pub struct WireRoute {
     pub route_file: String,
     pub route_line: i64,
     pub route_id: String,
+    /// The handler is written inline at the registration: the route stands in for it.
+    pub inline: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -155,10 +162,70 @@ fn routing_manifest(ctx: &Ctx<'_>, limit: i64) -> ApiResult<Option<Manifest>> {
     }))
 }
 
+/// The manifest's rows folded to one per route, in its order: the row naming
+/// the route's root (the handler a resolver bound, or the component a screen
+/// renders), else the route's first row. A route whose root is its own inline
+/// body is that route, labelled as an inline handler rather than as whichever
+/// call in the body sorted first, and is left out when it is written in a
+/// test, as the manifest leaves out test handlers.
+fn fold_rows(rows: Vec<RoutingRow>, roots: &HashMap<String, RouteRoot>) -> Vec<(RoutingRow, bool)> {
+    let mut order: Vec<String> = Vec::new();
+    let mut by_route: HashMap<String, Vec<RoutingRow>> = HashMap::new();
+    for row in rows {
+        by_route
+            .entry(row.route_id.clone())
+            .or_insert_with(|| {
+                order.push(row.route_id.clone());
+                Vec::new()
+            })
+            .push(row);
+    }
+    let mut out = Vec::with_capacity(order.len());
+    for route_id in order {
+        let mut list = by_route.remove(&route_id).unwrap_or_default();
+        if list.is_empty() {
+            continue;
+        }
+        let root = roots.get(&route_id);
+        if root.is_some_and(|root| root.inline) {
+            let first = list.swap_remove(0);
+            if is_test_file(&first.route_file) {
+                continue;
+            }
+            out.push((
+                RoutingRow {
+                    handler: "inline handler".to_string(),
+                    handler_kind: "route".to_string(),
+                    handler_file: first.route_file.clone(),
+                    handler_line: first.route_line,
+                    ..first
+                },
+                true,
+            ));
+            continue;
+        }
+        let named = root.and_then(|root| {
+            list.iter().position(|row| {
+                row.handler_file == root.node.file_path
+                    && row.handler_line == root.node.start_line
+                    && row.handler == root.node.name
+            })
+        });
+        out.push((list.swap_remove(named.unwrap_or(0)), false));
+    }
+    out
+}
+
 /// The route map with at most `limit` rows.
 pub fn build_routes(ctx: &Ctx<'_>, limit: i64) -> ApiResult<WireRoutes> {
-    // One row over the limit, purely to learn whether there were more.
-    let manifest = routing_manifest(ctx, limit + 1)?;
+    // The manifest is a row per (route, edge): a route bound to two symbols,
+    // or an inline handler whose every call reads as a "handler", repeats, and
+    // a repeated route id stops the viewer drawing the list (upstream #2264).
+    // A route has ONE answer to "what serves this", route_roots.rs's, so rows
+    // are over-fetched and folded onto it; the extra row says whether there
+    // were more.
+    let fetched = limit * ROWS_PER_ROUTE + 1;
+    let manifest = routing_manifest(ctx, fetched)?;
     let route_count = ctx.store.count_nodes_of_kind(NodeKind::Route)?;
     let Some(Manifest {
         rows: entries,
@@ -176,13 +243,20 @@ pub fn build_routes(ctx: &Ctx<'_>, limit: i64) -> ApiResult<WireRoutes> {
             entries: Vec::new(),
         });
     };
-    let truncated = entries.len() as i64 > limit;
-    let rows: Vec<RoutingRow> = entries.into_iter().take(limit as usize).collect();
+    let fetched_rows = entries.len() as i64;
+    let mut route_ids: Vec<String> = entries.iter().map(|row| row.route_id.clone()).collect();
+    route_ids.sort();
+    route_ids.dedup();
+    let routes: Vec<_> = ctx.store.nodes_by_ids(&route_ids)?.into_values().collect();
+    let roots = route_roots(ctx, &routes)?;
+    let folded = fold_rows(entries, &roots);
+    let truncated = folded.len() as i64 > limit || fetched_rows >= fetched;
+    let rows: Vec<(RoutingRow, bool)> = folded.into_iter().take(limit as usize).collect();
 
     // Every row's handler file in one batched query, so a project that
     // scatters handlers across hundreds of files still costs one query per
     // chunk, and no row past a cap is reported as "not in the index" (#1975).
-    let handler_files: Vec<String> = rows.iter().map(|r| r.handler_file.clone()).collect();
+    let handler_files: Vec<String> = rows.iter().map(|(r, _)| r.handler_file.clone()).collect();
     let mut by_file_line_name: HashMap<(String, i64, String), String> = HashMap::new();
     for node in ctx.store.nodes_in_files(&handler_files)? {
         // Keyed on what the manifest knows: file, line and name. Two symbols can
@@ -196,15 +270,20 @@ pub fn build_routes(ctx: &Ctx<'_>, limit: i64) -> ApiResult<WireRoutes> {
 
     let entries: Vec<WireRoute> = rows
         .into_iter()
-        .map(|row| {
+        .map(|(row, inline)| {
             let (method, path) = split_route_name(&row.url);
-            let handler_id = by_file_line_name
-                .get(&(
-                    row.handler_file.clone(),
-                    row.handler_line,
-                    row.handler.clone(),
-                ))
-                .cloned();
+            // An inline handler has no node of its own; the route stands in.
+            let handler_id = if inline {
+                Some(row.route_id.clone())
+            } else {
+                by_file_line_name
+                    .get(&(
+                        row.handler_file.clone(),
+                        row.handler_line,
+                        row.handler.clone(),
+                    ))
+                    .cloned()
+            };
             WireRoute {
                 method,
                 path,
@@ -217,6 +296,7 @@ pub fn build_routes(ctx: &Ctx<'_>, limit: i64) -> ApiResult<WireRoutes> {
                 handler_kind: row.handler_kind,
                 handler: row.handler,
                 url: row.url,
+                inline,
             }
         })
         .collect();
@@ -240,6 +320,110 @@ pub fn build(ctx: &Ctx<'_>, query: &Query) -> ApiResult<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codegraph_core::types::{Language, Node};
+
+    fn row(route: &str, line: i64, handler: &str, handler_line: i64) -> RoutingRow {
+        RoutingRow {
+            url: format!("GET /{route}"),
+            route_id: format!("route:{route}"),
+            route_file: "server/app.js".to_string(),
+            route_line: line,
+            handler: handler.to_string(),
+            handler_file: "server/app.js".to_string(),
+            handler_line,
+            handler_kind: "function".to_string(),
+        }
+    }
+
+    fn root(route: &RoutingRow, name: &str, line: i64, inline: bool) -> (String, RouteRoot) {
+        let node = Node {
+            id: format!("function:{name}"),
+            kind: if inline {
+                NodeKind::Route
+            } else {
+                NodeKind::Function
+            },
+            name: name.to_string(),
+            qualified_name: name.to_string(),
+            file_path: "server/app.js".to_string(),
+            language: Language::JavaScript,
+            start_line: line,
+            end_line: line,
+            start_column: 0,
+            end_column: 0,
+            docstring: None,
+            signature: None,
+            visibility: None,
+            is_exported: false,
+            is_async: false,
+            is_static: false,
+            is_abstract: false,
+            decorators: Vec::new(),
+            type_parameters: Vec::new(),
+            return_type: None,
+            updated_at: 0,
+        };
+        (route.route_id.clone(), RouteRoot { node, inline })
+    }
+
+    /// Upstream #2264: hono's `GET /stream/text` came back once per call in its
+    /// inline handler, and a repeated route id blanked Entry points.
+    #[test]
+    fn folds_the_manifest_to_one_row_per_route_in_its_order() {
+        let card = [
+            row("card", 11, "loadUser", 4),
+            row("card", 11, "audit", 5),
+            row("card", 11, "render", 6),
+        ];
+        let show = [
+            row("show", 18, "loadUser", 4),
+            row("show", 18, "showUser", 8),
+        ];
+        let list = row("list", 17, "listUsers", 7);
+        let roots: HashMap<String, RouteRoot> = [
+            root(&card[0], "card", 11, true),
+            root(&show[0], "showUser", 8, false),
+        ]
+        .into_iter()
+        .collect();
+        let rows: Vec<RoutingRow> = card
+            .iter()
+            .chain([&list])
+            .chain(show.iter())
+            .cloned()
+            .collect();
+        let folded = fold_rows(rows, &roots);
+        let seen: Vec<(&str, &str, &str, bool)> = folded
+            .iter()
+            .map(|(r, inline)| {
+                (
+                    r.route_id.as_str(),
+                    r.handler.as_str(),
+                    r.handler_kind.as_str(),
+                    *inline,
+                )
+            })
+            .collect();
+        assert_eq!(
+            seen,
+            [
+                ("route:card", "inline handler", "route", true),
+                ("route:list", "listUsers", "function", false),
+                ("route:show", "showUser", "function", false),
+            ]
+        );
+        // An inline handler is placed where the route is written.
+        assert_eq!(folded[0].0.handler_line, 11);
+    }
+
+    #[test]
+    fn an_inline_handler_written_in_a_test_is_left_out() {
+        let mut probe = row("probe", 3, "check", 9);
+        probe.route_file = "test/app.test.js".to_string();
+        let roots: HashMap<String, RouteRoot> =
+            [root(&probe, "probe", 3, true)].into_iter().collect();
+        assert!(fold_rows(vec![probe], &roots).is_empty());
+    }
 
     #[test]
     fn takes_the_verb_off_when_there_is_one() {

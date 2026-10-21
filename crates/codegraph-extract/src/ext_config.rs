@@ -18,7 +18,7 @@ use codegraph_core::IndexPaths;
 use codegraph_core::types::Language;
 use serde::Deserialize;
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 #[derive(Debug, Deserialize)]
@@ -35,6 +35,10 @@ struct CodegraphJson {
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ExtensionOverrides {
     map: BTreeMap<String, Language>,
+    /// The project root the scope's paths are relative to, which tells a
+    /// Shopify theme's JSON templates apart from other JSON (W4-LIQ-01,
+    /// upstream #2393); `None` where there is no project to look in.
+    project_root: Option<PathBuf>,
 }
 
 impl ExtensionOverrides {
@@ -59,7 +63,26 @@ impl ExtensionOverrides {
     /// logged, matching the opt-in contract.
     #[must_use]
     pub fn load_for_paths(paths: &IndexPaths) -> Arc<Self> {
-        Self::load_from_file(&paths.extension_config())
+        let loaded = Self::load_from_file(&paths.extension_config());
+        Arc::new(Self {
+            map: loaded.map.clone(),
+            project_root: Some(paths.project().to_path_buf()),
+        })
+    }
+
+    /// These overrides, read for paths relative to `project_root`.
+    #[must_use]
+    pub fn with_project_root(&self, project_root: &Path) -> Arc<Self> {
+        Arc::new(Self {
+            map: self.map.clone(),
+            project_root: Some(project_root.to_path_buf()),
+        })
+    }
+
+    /// The project root the scope's paths are relative to, if any.
+    #[must_use]
+    pub fn project_root(&self) -> Option<&Path> {
+        self.project_root.as_deref()
     }
 
     /// Load overrides from an explicit `codegraph.json` path. Exposed so a
@@ -107,7 +130,10 @@ impl ExtensionOverrides {
                 }
             }
         }
-        Self { map }
+        Self {
+            map,
+            project_root: None,
+        }
     }
 
     /// `true` when the project declared no usable override.

@@ -342,18 +342,19 @@ fn resolve_mini_edges(result: &ExtractionResult) -> Vec<Edge> {
         .iter()
         .map(|node| (node.name.as_str(), node))
         .collect::<HashMap<_, _>>();
-    let import_nodes = result
+    let files = result
         .nodes
         .iter()
-        .filter(|node| node.kind == NodeKind::Import)
-        .map(|node| (node.name.as_str(), node))
+        .filter(|node| node.kind == NodeKind::File)
+        .map(|node| (node.file_path.as_str(), node))
         .collect::<HashMap<_, _>>();
 
     for reference in &result.unresolved_references {
         let target = match reference.reference_kind {
-            EdgeKind::Imports => import_nodes
-                .get(reference.reference_name.as_str())
-                .copied()
+            // A module path names the file it resolves to, never the import
+            // statement it is written in (upstream #2392 and #2263); a named
+            // specifier names the symbol.
+            EdgeKind::Imports => module_file(reference, &files)
                 .or_else(|| by_name.get(reference.reference_name.as_str()).copied()),
             EdgeKind::Calls => {
                 let simple = reference
@@ -373,6 +374,32 @@ fn resolve_mini_edges(result: &ExtractionResult) -> Vec<Edge> {
         }
     }
     edges
+}
+
+/// The file a relative module path (`./math`) names from the importing file,
+/// by the TypeScript extensions the mini fixture uses.
+fn module_file<'a>(reference: &UnresolvedRef, files: &HashMap<&str, &'a Node>) -> Option<&'a Node> {
+    let name = reference.reference_name.as_str();
+    if !name.starts_with("./") && !name.starts_with("../") {
+        return None;
+    }
+    let mut parts: Vec<&str> = reference
+        .file_path
+        .rsplit_once('/')
+        .map_or_else(Vec::new, |(dir, _)| dir.split('/').collect());
+    for segment in name.split('/') {
+        match segment {
+            "." => {}
+            ".." => {
+                parts.pop()?;
+            }
+            _ => parts.push(segment),
+        }
+    }
+    let stem = parts.join("/");
+    [".ts", ".tsx", "/index.ts"]
+        .iter()
+        .find_map(|suffix| files.get(format!("{stem}{suffix}").as_str()).copied())
 }
 
 fn edge_from_ref(reference: &UnresolvedRef, target: &str) -> Edge {

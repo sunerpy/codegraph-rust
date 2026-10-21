@@ -1,11 +1,13 @@
-use codegraph_core::node_id::{NodeIdAllocator, generate_node_id, utf16_column};
+use codegraph_core::node_id::generate_node_id;
 use codegraph_core::types::{
     Edge, EdgeKind, ExtractionResult, Language, Node, NodeKind, UnresolvedRef,
 };
 use regex::Regex;
 use std::path::Path;
-use streaming_iterator::StreamingIterator;
-use tree_sitter::{Parser, Query, QueryCursor};
+
+use crate::embedded::shared::{
+    ScriptFold, contains_edge, empty_result, fold_script_result, sfc_file_node,
+};
 
 // Vue built-in components to skip
 fn is_vue_builtin(name: &str) -> bool {
@@ -40,7 +42,7 @@ fn kebab_to_pascal(name: &str) -> String {
 struct ScriptBlock {
     content: String,
     line_offset: i64, // 0-indexed original .vue line containing content byte 0
-    _is_setup: bool,
+    is_setup: bool,
     is_typescript: bool,
 }
 
@@ -51,8 +53,6 @@ pub struct VueExtractor<'a> {
     edges: Vec<Edge>,
     unresolved_references: Vec<UnresolvedRef>,
     errors: Vec<String>,
-    /// Same-line namesakes keep distinct ids across every script block (#1349).
-    node_ids: NodeIdAllocator,
 }
 
 impl<'a> VueExtractor<'a> {
@@ -64,15 +64,18 @@ impl<'a> VueExtractor<'a> {
             edges: Vec::new(),
             unresolved_references: Vec::new(),
             errors: Vec::new(),
-            node_ids: NodeIdAllocator::default(),
         }
     }
 
     pub fn extract(mut self) -> ExtractionResult {
         let start_time = std::time::Instant::now();
 
+        // The SFC's one file node holds the component (upstream #2268).
+        let file_node = sfc_file_node(self.file_path, self.source, Language::Vue);
         let component_node = self.create_component_node();
         let component_id = component_node.id.clone();
+        self.edges.push(contains_edge(&file_node.id, &component_id));
+        self.nodes.push(file_node);
         self.nodes.push(component_node);
 
         let script_blocks = self.extract_script_blocks();
@@ -82,6 +85,11 @@ impl<'a> VueExtractor<'a> {
         }
 
         self.extract_template_components(&component_id);
+
+        // Calls the template makes (`{{ useBar(link) }}`, `:to="localePath(x)"`,
+        // `@click="save(item)"`) are the component's, like the calls its
+        // `<script setup>` makes (upstream #2357).
+        self.extract_template_calls(&component_id);
 
         ExtractionResult {
             nodes: self.nodes,
@@ -155,7 +163,7 @@ impl<'a> VueExtractor<'a> {
             blocks.push(ScriptBlock {
                 content: content.to_string(),
                 line_offset: content_line_offset as i64,
-                _is_setup: is_setup,
+                is_setup,
                 is_typescript,
             });
         }
@@ -163,125 +171,208 @@ impl<'a> VueExtractor<'a> {
         blocks
     }
 
+    /// A script block is extracted by the TypeScript (or JavaScript)
+    /// extractor, as upstream's Vue extractor delegates it (G8), and folded
+    /// into the component at the block's file lines; `<script setup>` runs
+    /// per component instance.
     fn process_script_block(&mut self, block: &ScriptBlock, component_id: &str) {
-        let mut parser = Parser::new();
         let language = if block.is_typescript {
-            tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()
+            Language::TypeScript
         } else {
-            tree_sitter_javascript::LANGUAGE.into()
+            Language::JavaScript
         };
-        parser.set_language(&language).unwrap();
+        let mut delegated =
+            crate::engine::extract_source(self.file_path, &block.content, Some(language));
+        // An Options API component's functions (`methods`, `computed`,
+        // `watch`, lifecycle hooks) are object-literal members the script
+        // extractor leaves to the file: name each one, and hand it the calls
+        // written inside it (upstream #2140).
+        if !block.is_setup {
+            self.add_options_members(block, &mut delegated, component_id);
+        }
+        let mut merged = empty_result(0);
+        fold_script_result(
+            &mut merged,
+            delegated,
+            &ScriptFold {
+                file_path: self.file_path,
+                component_id,
+                line_offset: block.line_offset,
+                language: Language::Vue,
+                per_instance: block.is_setup,
+            },
+        );
+        self.nodes.append(&mut merged.nodes);
+        self.edges.append(&mut merged.edges);
+        self.unresolved_references
+            .append(&mut merged.unresolved_references);
+        self.errors.append(&mut merged.errors);
+    }
 
-        let tree = parser.parse(&block.content, None).unwrap();
-
-        // Simple query to find functions and imports for the prototype
-        let query_str = r#"
-            (function_declaration
-                name: (identifier) @func.name) @func
-            
-            (import_statement
-                source: (string) @import.source) @import
-        "#;
-
-        let query = Query::new(&language, query_str).unwrap();
-        let mut cursor = QueryCursor::new();
-        let mut matches = cursor.matches(&query, tree.root_node(), block.content.as_bytes());
-
-        while let Some(m) = matches.next() {
-            for capture in m.captures() {
-                let node = capture.node;
-                let capture_name = query.capture_names()[capture.index as usize];
-
-                if capture_name == "func" {
-                    let name_node = m
-                        .captures()
-                        .iter()
-                        .find(|c| query.capture_names()[c.index as usize] == "func.name")
-                        .unwrap()
-                        .node;
-                    let name = name_node
-                        .utf8_text(block.content.as_bytes())
-                        .unwrap()
-                        .to_string();
-
-                    let start_pos = node.start_position();
-                    let end_pos = node.end_position();
-
-                    let id = self.node_ids.generate(
+    /// Method nodes for an Options API component's members (see
+    /// [`crate::embedded::vue_options_api`]), and the references and edges
+    /// written inside each, which the script extractor attributed to the
+    /// file, re-attributed to it. Lines are block-relative here; the fold
+    /// offsets them with the rest.
+    fn add_options_members(
+        &self,
+        block: &ScriptBlock,
+        result: &mut ExtractionResult,
+        component_id: &str,
+    ) {
+        let members = crate::embedded::vue_options_api::vue_options_members(&block.content);
+        if members.is_empty() {
+            return;
+        }
+        let owner = self
+            .nodes
+            .iter()
+            .find(|node| node.id == component_id)
+            .map_or_else(|| "component".to_string(), |node| node.name.clone());
+        let content = block.content.as_str();
+        let line_at = |offset: usize| content[..offset].matches('\n').count() as i64 + 1;
+        let column_at = |offset: usize| {
+            content[..offset]
+                .rfind('\n')
+                .map_or(offset, |newline| offset - newline - 1) as i64
+        };
+        let created: Vec<Node> = members
+            .iter()
+            .map(|member| {
+                let start_line = line_at(member.start);
+                Node {
+                    id: generate_node_id(
                         self.file_path,
-                        NodeKind::Function,
-                        &name,
-                        start_pos.row as u32 + 1,
-                        utf16_column(&block.content, node.start_byte()),
-                    );
-                    let qualified_name = format!("{}::{}", self.file_path, name);
-
-                    self.nodes.push(Node {
-                        id: id.clone(),
-                        kind: NodeKind::Function,
-                        name,
-                        qualified_name,
-                        file_path: self.file_path.to_string(),
-                        language: Language::Vue,
-                        start_line: start_pos.row as i64 + block.line_offset + 1, // 1-indexed
-                        end_line: end_pos.row as i64 + block.line_offset + 1,
-                        start_column: start_pos.column as i64 + 1,
-                        end_column: end_pos.column as i64 + 1,
-                        docstring: None,
-                        signature: None,
-                        visibility: None,
-                        is_exported: false,
-                        is_async: false,
-                        is_static: false,
-                        is_abstract: false,
-                        decorators: vec![],
-                        type_parameters: vec![],
-                        return_type: None,
-                        updated_at: 0,
-                    });
-
-                    self.edges.push(Edge {
-                        id: None,
-                        source: component_id.to_string(),
-                        target: id,
-                        kind: EdgeKind::Contains,
-                        metadata: None,
-                        line: None,
-                        col: None,
-                        provenance: None,
-                    });
-                } else if capture_name == "import" {
-                    let source_node = m
-                        .captures()
-                        .iter()
-                        .find(|c| query.capture_names()[c.index as usize] == "import.source")
-                        .unwrap()
-                        .node;
-                    let source_text = source_node
-                        .utf8_text(block.content.as_bytes())
-                        .unwrap()
-                        .to_string();
-                    let clean_source = source_text
-                        .trim_matches(|c| c == '"' || c == '\'')
-                        .to_string();
-
-                    let start_pos = node.start_position();
-
-                    self.unresolved_references.push(UnresolvedRef {
-                        id: None,
-                        from_node_id: component_id.to_string(),
-                        reference_name: clean_source,
-                        reference_kind: EdgeKind::Imports,
-                        line: start_pos.row as i64 + block.line_offset + 1,
-                        col: start_pos.column as i64 + 1,
-                        candidates: None,
-                        file_path: self.file_path.to_string(),
-                        language: Language::Vue,
-                        is_function_ref: false,
-                        reference_subkind: None,
-                    });
+                        NodeKind::Method,
+                        &format!("{owner}.{}", member.name),
+                        u32::try_from(start_line + block.line_offset).unwrap_or(u32::MAX),
+                    ),
+                    kind: NodeKind::Method,
+                    name: member.name.clone(),
+                    qualified_name: format!("{owner}::{}", member.name),
+                    file_path: self.file_path.to_string(),
+                    language: Language::Vue,
+                    start_line,
+                    end_line: line_at(member.end),
+                    start_column: column_at(member.start),
+                    end_column: column_at(member.end),
+                    docstring: None,
+                    signature: None,
+                    visibility: None,
+                    is_exported: false,
+                    is_async: false,
+                    is_static: false,
+                    is_abstract: false,
+                    decorators: vec![],
+                    type_parameters: vec![],
+                    return_type: None,
+                    updated_at: 0,
+                }
+            })
+            .collect();
+        // The innermost member for a line: `computed: { x: { get() {…} } }`
+        // is one member.
+        let member_at = |line: i64| -> Option<&Node> {
+            let mut best: Option<&Node> = None;
+            for node in &created {
+                if node.start_line <= line
+                    && node.end_line >= line
+                    && best.is_none_or(|best| node.start_line >= best.start_line)
+                {
+                    best = Some(node);
                 }
             }
+            best
+        };
+        // What the script extractor attributed to the file.
+        let file_id = format!("file:{}", self.file_path);
+        for reference in &mut result.unresolved_references {
+            if reference.from_node_id != file_id {
+                continue;
+            }
+            if let Some(member) = member_at(reference.line) {
+                reference.from_node_id = member.id.clone();
+            }
+        }
+        for edge in &mut result.edges {
+            if edge.kind == EdgeKind::Contains || edge.source != file_id {
+                continue;
+            }
+            if let Some(member) = edge.line.and_then(member_at) {
+                edge.source = member.id.clone();
+            }
+        }
+        result.nodes.extend(created);
+    }
+
+    /// Calls written in the `<template>` (see
+    /// [`crate::embedded::vue_template_calls`]), each made by the component
+    /// at the line it is written on, the same `calls` reference a call in
+    /// `<script setup>` makes. A template calls an Options API component's
+    /// own methods by their bare name (`{{ price(item) }}`,
+    /// `@click="save(form)"`) where script code writes `this.save()`;
+    /// resolution binds a bare call to a component method only through
+    /// `this.`, so these are linked here, where the method is known to be this
+    /// component's.
+    fn extract_template_calls(&mut self, component_id: &str) {
+        let calls = crate::embedded::vue_template_calls::vue_template_calls(self.source);
+        if calls.is_empty() {
+            return;
+        }
+        let owner = self
+            .nodes
+            .iter()
+            .find(|node| node.id == component_id)
+            .map(|node| node.name.clone())
+            .unwrap_or_default();
+        let own_methods: std::collections::HashMap<String, String> = self
+            .nodes
+            .iter()
+            .filter(|node| {
+                node.kind == NodeKind::Method
+                    && node.qualified_name == format!("{owner}::{}", node.name)
+            })
+            .map(|node| (node.name.clone(), node.id.clone()))
+            .collect();
+        let line_starts: Vec<usize> = std::iter::once(0)
+            .chain(self.source.match_indices('\n').map(|(at, _)| at + 1))
+            .collect();
+        let mut line = 0usize;
+        for call in calls {
+            // Calls come in source order, so the line only moves forward.
+            while line + 1 < line_starts.len() && line_starts[line + 1] <= call.offset {
+                line += 1;
+            }
+            let column = (call.offset - line_starts[line]) as i64;
+            let own_method = (!call.name.contains('.'))
+                .then(|| own_methods.get(&call.name))
+                .flatten();
+            if let Some(method_id) = own_method {
+                self.edges.push(Edge {
+                    id: None,
+                    source: component_id.to_string(),
+                    target: method_id.clone(),
+                    kind: EdgeKind::Calls,
+                    metadata: None,
+                    line: Some(line as i64 + 1),
+                    col: Some(column),
+                    provenance: None,
+                });
+                continue;
+            }
+            self.unresolved_references.push(UnresolvedRef {
+                id: None,
+                from_node_id: component_id.to_string(),
+                reference_name: call.name,
+                reference_kind: EdgeKind::Calls,
+                line: line as i64 + 1,
+                col: column,
+                candidates: None,
+                file_path: self.file_path.to_string(),
+                language: Language::Vue,
+                is_function_ref: false,
+                reference_subkind: None,
+            });
         }
     }
 

@@ -1,15 +1,41 @@
+pub mod case_folded;
+pub mod cfml_heads;
+pub mod class_heads;
+pub mod control_inputs;
+pub mod cpp_dependents;
+pub mod cpp_namespace_rows;
+pub mod csharp_surfaces;
+mod dart_chains;
+pub mod dart_heads;
+pub mod dart_libraries;
 mod git;
 pub mod git_pending;
+pub mod go_heads;
+pub mod java_heads;
+pub mod kotlin_surfaces;
 mod link_state;
+pub mod lua_modules;
+pub mod member_surfaces;
 mod migrate;
+pub mod module_surfaces;
+pub mod objc_heads;
+pub mod php_heads;
 mod policy;
+pub mod r_bindings;
+pub mod resolved_refs;
+pub mod ruby_heads;
+pub mod rust_receivers;
+pub mod scala_surfaces;
+pub mod shopify_themes;
+pub mod solidity_heads;
+pub mod swift_heads;
 mod sync;
 mod watcher;
 mod worktree;
 
 pub use git::{
-    DEFAULT_SYNC_HOOKS, GitHookName, GitHookResult, install_git_sync_hooks, is_git_repo,
-    is_sync_hook_installed, remove_git_sync_hooks,
+    DEFAULT_SYNC_HOOKS, GitHookName, GitHookResult, hide_console_window, install_git_sync_hooks,
+    is_git_repo, is_sync_hook_installed, remove_git_sync_hooks,
 };
 #[cfg(feature = "test-hooks")]
 pub use git_pending::test_hooks as git_pending_hooks;
@@ -24,8 +50,8 @@ pub use sync::{
     sync_project_once_cancellable, sync_project_once_with_progress,
 };
 pub use watcher::{
-    LOCK_RECOVERY_INTERVAL, PendingFile, ProjectWatcher, WatchHealth, WatchOptions,
-    start_serve_watcher, watch_health, watch_options_for_project,
+    CODEGRAPH_WATCH_SENTINEL_MS, LOCK_RECOVERY_INTERVAL, PendingFile, ProjectWatcher, WatchHealth,
+    WatchOptions, start_serve_watcher, watch_health, watch_options_for_project,
 };
 #[cfg(feature = "test-hooks")]
 pub use watcher::{WatchHealthGuard, register_watch_health_for_tests};

@@ -1,0 +1,8 @@
+{
+  "name": "commonjs-fixture",
+  "private": true,
+  "main": "index.js",
+  "dependencies": {
+    "supertest": "6.3.0"
+  }
+}

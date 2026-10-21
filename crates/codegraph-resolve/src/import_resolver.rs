@@ -12,9 +12,7 @@ use crate::name_matcher::{
 };
 use crate::path_aliases::apply_aliases;
 use crate::pathutil;
-use crate::types::{
-    GoModule, ImportMapping, ReExport, RefView, ResolutionContext, ResolvedBy, ResolvedRef,
-};
+use crate::types::{ImportMapping, ReExport, RefView, ResolutionContext, ResolvedBy, ResolvedRef};
 use crate::workspace_packages::resolve_workspace_import;
 use codegraph_core::types::{Language, Node, NodeKind};
 use regex::Regex;
@@ -370,6 +368,20 @@ fn is_external_import(
     language: Language,
     context: &dyn ResolutionContext,
 ) -> bool {
+    is_external_import_with(import_path, language, context, true)
+}
+
+/// [`is_external_import`], where `alias_prefixes: false` skips the test that
+/// a JS specifier starting with a project path alias's prefix is local. Only a
+/// caller that asks [`resolve_import_path`] whether the alias maps the import
+/// to a file may skip it: a catch-all `"*"` alias has an empty prefix, which
+/// every package starts with (upstream #2437).
+fn is_external_import_with(
+    import_path: &str,
+    language: Language,
+    context: &dyn ResolutionContext,
+    alias_prefixes: bool,
+) -> bool {
     if import_path.starts_with('.') {
         return false;
     }
@@ -407,7 +419,7 @@ fn is_external_import(
             return true;
         }
         // Project-defined alias prefix → local (import-resolver.ts:149-154).
-        if let Some(aliases) = context.get_project_aliases() {
+        if let Some(aliases) = context.get_project_aliases().filter(|_| alias_prefixes) {
             for pat in &aliases.patterns {
                 if import_path.starts_with(&pat.prefix) {
                     return false;
@@ -446,12 +458,10 @@ fn is_external_import(
         if import_path.starts_with('.') {
             return false;
         }
-        for module in context.get_go_modules() {
-            if import_path == module.module_path
-                || import_path.starts_with(&format!("{}/", module.module_path))
-            {
-                return false;
-            }
+        // A package of one of the project's modules, whose go.mod may be
+        // below the root or beside other modules (upstream #2322).
+        if crate::go_packages::go_import_package_dir(import_path, None, context).is_some() {
+            return false;
         }
         if import_path.contains("/internal/") {
             return false;
@@ -502,6 +512,15 @@ fn resolve_relative_import(
 
     let base_path = pathutil::resolve(from_dir, import_path);
     let relative_path = pathutil::relative(project_root, &base_path);
+    // `require('..')` up to the project root is its `index.js` (upstream
+    // #2189): only the `/index…` candidates name a file there.
+    if relative_path.is_empty() || relative_path == "." {
+        return extension_resolution(language)
+            .iter()
+            .filter_map(|extension| extension.strip_prefix('/'))
+            .find(|candidate| context.file_exists(candidate))
+            .map(str::to_string);
+    }
     resolve_source_candidate(&relative_path, language, context)
 }
 
@@ -580,6 +599,68 @@ fn resolve_cpp_include_path(
     None
 }
 
+/// A JS/TS module specifier written as a path (upstream `isJsPathSpecifier`,
+/// #2263): relative (`./x`, `../x`, `.`, `..`), rooted, or an alias with a
+/// folder in it (`@/lib/x`, `~/x`, `$lib/x`), rather than an imported
+/// binding's name or a bare or scoped package (`react`, `@scope/pkg`).
+fn is_js_path_specifier(name: &str) -> bool {
+    if name.starts_with("./") || name.starts_with("../") || name == "." || name == ".." {
+        return true;
+    }
+    if !name.contains('/') || name.chars().any(char::is_whitespace) {
+        return false;
+    }
+    // `@scope/pkg`: exactly one `/`, after an `@`-prefixed segment.
+    let scoped_package = name.strip_prefix('@').is_some_and(|rest| {
+        let mut parts = rest.split('/');
+        let (Some(scope), Some(pkg), None) = (parts.next(), parts.next(), parts.next()) else {
+            return false;
+        };
+        let word = |part: &str| {
+            !part.is_empty()
+                && part
+                    .chars()
+                    .all(|c| c.is_alphanumeric() || matches!(c, '_' | '.' | '-'))
+        };
+        word(scope) && word(pkg)
+    });
+    !scoped_package
+}
+
+/// A JS/TS `imports` reference that names a module by path (upstream
+/// `isJsPathImportRef`, #2263). It names a FILE, not a symbol, so it skips the
+/// name-exists pre-filter.
+pub fn is_js_path_import_ref(reference: &RefView) -> bool {
+    reference.reference_kind == codegraph_core::types::EdgeKind::Imports
+        && matches!(
+            reference.language,
+            Language::JavaScript
+                | Language::Jsx
+                | Language::TypeScript
+                | Language::Tsx
+                | Language::ArkTs
+        )
+        && is_js_path_specifier(&reference.reference_name)
+}
+
+/// A Lua / Luau `require` (upstream `isLuaRequireRef`, #2392): it names a
+/// module file or a module from outside the project, never a symbol.
+pub fn is_lua_require_ref(reference: &RefView) -> bool {
+    matches!(reference.language, Language::Lua | Language::Luau)
+        && reference.reference_kind == codegraph_core::types::EdgeKind::Imports
+}
+
+/// A Dart `import`, `export` or `part` (upstream `isDartImportRef`, #2388):
+/// its name is the URI, which names one file or none — `dart:async`, a
+/// package from outside the project, a generated part nobody committed — and
+/// never a symbol: the name-matcher took the URI's last segment for a file
+/// name (`package:flutter/foundation.dart` went to riverpod's own
+/// foundation.dart) or bound it to the file's own `import` node.
+pub fn is_dart_import_ref(reference: &RefView) -> bool {
+    reference.language == Language::Dart
+        && reference.reference_kind == codegraph_core::types::EdgeKind::Imports
+}
+
 /// Is this reference a PHP include/require PATH (vs a namespace `use` symbol)?
 /// (`isPhpIncludePathRef`, `import-resolver.ts:541-547`).
 pub fn is_php_include_path_ref(reference: &RefView) -> bool {
@@ -614,18 +695,29 @@ fn resolve_php_include_path(
 fn js_import_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
+        // `import type { X }` / `import type * as ns` is TypeScript's type-only
+        // form, not a default import named `type` (upstream #2134); the
+        // optional `type` group takes it, and `import type from './x'`, which
+        // leaves nothing else, still binds `type` (see `extract_js_imports`).
+        // A binding is any JS identifier, `$` included (upstream #2378): `\w`
+        // stops at the `$` of `import $store from './store'`.
         Regex::new(
-            r#"import\s+(?:(\w+)\s*,?\s*)?(?:\{([^}]+)\})?\s*(?:(\*)\s+as\s+(\w+))?\s*from\s*['"]([^'"]+)['"]"#,
+            r#"import\s+(?:(type)\s+)?(?:([A-Za-z_$][0-9A-Za-z_$]*)\s*,?\s*)?(?:\{([^}]+)\})?\s*(?:(\*)\s+as\s+([A-Za-z_$][0-9A-Za-z_$]*))?\s*from\s*['"]([^'"]+)['"]"#,
         )
         .expect("valid JS import regex")
     })
 }
 
+/// A `require` binding: each declarator of a list too (`var express =
+/// require('../'), request = require('supertest')`), and a member of the
+/// module (`require('./utils').methods`, upstream #2189).
 fn js_require_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
-        Regex::new(r#"(?:const|let|var)\s+(?:(\w+)|\{([^}]+)\})\s*=\s*require\(['"]([^'"]+)['"]\)"#)
-            .expect("valid JS require regex")
+        Regex::new(
+            r#"(?:(?-u:\b)(?:const|let|var)\s+|,\s*)(?:([A-Za-z_$][0-9A-Za-z_$]*)|\{([^}]+)\})\s*=\s*require\(\s*['"]([^'"]+)['"]\s*\)(?:\s*\.\s*([A-Za-z_$][0-9A-Za-z_$]*))?"#,
+        )
+        .expect("valid JS require regex")
     })
 }
 
@@ -653,11 +745,25 @@ fn extract_js_imports(content: &str) -> Vec<ImportMapping> {
     let mut mappings = Vec::new();
 
     for caps in js_import_regex().captures_iter(content) {
-        let default_import = caps.get(1).map(|m| m.as_str());
-        let named_imports = caps.get(2).map(|m| m.as_str());
-        let star = caps.get(3).is_some();
-        let namespace_alias = caps.get(4).map(|m| m.as_str());
-        let source = caps.get(5).map(|m| m.as_str()).unwrap_or_default();
+        // A default binding is never followed by `{`: the `${` of a code
+        // generator's `` `import ${name} from '${src}'` `` is no binding
+        // (upstream #2378's `(?![\w${])`).
+        if caps
+            .get(2)
+            .is_some_and(|binding| content[binding.end()..].starts_with('{'))
+        {
+            continue;
+        }
+        let type_only = caps.get(1).is_some();
+        let named_imports = caps.get(3).map(|m| m.as_str());
+        let star = caps.get(4).is_some();
+        let namespace_alias = caps.get(5).map(|m| m.as_str());
+        let source = caps.get(6).map(|m| m.as_str()).unwrap_or_default();
+        // `import type from './x'`: the `type` group took the binding's name.
+        let default_import = caps
+            .get(2)
+            .map(|m| m.as_str())
+            .or((type_only && named_imports.is_none() && !star).then_some("type"));
 
         if let Some(default_import) = default_import {
             mappings.push(ImportMapping {
@@ -671,13 +777,16 @@ fn extract_js_imports(content: &str) -> Vec<ImportMapping> {
 
         if let Some(named) = named_imports {
             for raw in named.split(',') {
-                let name = raw.trim();
+                let name = strip_inline_type_modifier(raw.trim());
                 if let Some((orig, alias)) = parse_as_alias(name) {
+                    // `{ default as X }` is the default import spelled as a
+                    // named one (upstream #2412).
+                    let is_default = orig == "default";
                     mappings.push(ImportMapping {
                         local_name: alias,
                         exported_name: orig,
                         source: source.to_string(),
-                        is_default: false,
+                        is_default,
                         is_namespace: false,
                     });
                 } else if !name.is_empty() {
@@ -709,13 +818,16 @@ fn extract_js_imports(content: &str) -> Vec<ImportMapping> {
         let default_name = caps.get(1).map(|m| m.as_str());
         let destructured = caps.get(2).map(|m| m.as_str());
         let source = caps.get(3).map(|m| m.as_str()).unwrap_or_default();
+        let member = caps.get(4).map(|m| m.as_str());
 
         if let Some(default_name) = default_name {
+            // `require('./utils').setCharset` is the module's `setCharset`,
+            // not its default (upstream #2189).
             mappings.push(ImportMapping {
                 local_name: default_name.to_string(),
-                exported_name: "default".to_string(),
+                exported_name: member.unwrap_or("default").to_string(),
                 source: source.to_string(),
-                is_default: true,
+                is_default: member.is_none(),
                 is_namespace: false,
             });
         }
@@ -723,7 +835,7 @@ fn extract_js_imports(content: &str) -> Vec<ImportMapping> {
         if let Some(destructured) = destructured {
             for raw in destructured.split(',') {
                 let name = raw.trim();
-                if let Some((orig, alias)) = parse_colon_alias(name) {
+                if let Some((orig, alias)) = parse_js_colon_alias(name) {
                     mappings.push(ImportMapping {
                         local_name: alias,
                         exported_name: orig,
@@ -747,21 +859,31 @@ fn extract_js_imports(content: &str) -> Vec<ImportMapping> {
     mappings
 }
 
-/// `extractPythonImports` (`import-resolver.ts:717-765`).
+/// `extractPythonImports` (`import-resolver.ts:717-765`), over the code
+/// alone: a docstring's `from x import y` binds nothing, and a parenthesized
+/// list (`from x import (\n    A,\n    B,\n)`, upstream #2291) binds every
+/// name in it, whatever its comments hold.
 fn extract_python_imports(content: &str) -> Vec<ImportMapping> {
     static FROM_RE: OnceLock<Regex> = OnceLock::new();
     static IMP_RE: OnceLock<Regex> = OnceLock::new();
-    let from_re = FROM_RE
-        .get_or_init(|| Regex::new(r"from\s+([\w.]+)\s+import\s+([^#\n]+)").expect("py from"));
+    let from_re = FROM_RE.get_or_init(|| {
+        Regex::new(r"from\s+([\w.]+)\s+import\s+(\([^)]*\)|[^#\n]+)").expect("py from")
+    });
     let imp_re = IMP_RE.get_or_init(|| {
         Regex::new(r"(?m)^import\s+([\w.]+)(?:\s+as\s+(\w+))?").expect("py import")
     });
+    let content = crate::strip_comments::strip_comments_for_regex(
+        content,
+        crate::strip_comments::CommentLang::Python,
+    );
 
     let mut mappings = Vec::new();
 
-    for caps in from_re.captures_iter(content) {
+    for caps in from_re.captures_iter(&content) {
         let source = caps.get(1).map(|m| m.as_str()).unwrap_or_default();
-        let imports = caps.get(2).map(|m| m.as_str()).unwrap_or_default();
+        let imports = caps.get(2).map(|m| m.as_str()).unwrap_or_default().trim();
+        let imports = imports.strip_prefix('(').unwrap_or(imports);
+        let imports = imports.strip_suffix(')').unwrap_or(imports);
         for raw in imports.split(',') {
             let name = raw.trim();
             if let Some((orig, alias)) = parse_as_alias(name) {
@@ -784,7 +906,7 @@ fn extract_python_imports(content: &str) -> Vec<ImportMapping> {
         }
     }
 
-    for caps in imp_re.captures_iter(content) {
+    for caps in imp_re.captures_iter(&content) {
         let source = caps.get(1).map(|m| m.as_str()).unwrap_or_default();
         let alias = caps.get(2).map(|m| m.as_str());
         let local_name = alias
@@ -802,54 +924,129 @@ fn extract_python_imports(content: &str) -> Vec<ImportMapping> {
     mappings
 }
 
-/// `extractGoImports` (`import-resolver.ts:770-810`).
+/// `extractGoImports` (upstream #2410). An import is bound to the name
+/// written before its path, or else to the name of the package it imports,
+/// which the path alone doesn't settle: `k8s.io/api/core/v1` is package `v1`,
+/// while `go.yaml.in/yaml/v3` and `gopkg.in/yaml.v3` are `yaml` and
+/// `github.com/mattn/go-sqlite3` is `sqlite3`. So an unaliased import keeps its
+/// last path element and also takes the name goimports assumes for the path,
+/// unless another of the file's imports is bound to that name or a second one
+/// assumes it too. Only the import section is read, without its comments: a
+/// word in one is no name (`"fmt" // for printing` named the next import
+/// `printing`), and an import spelled in a comment or a later string is none.
 fn extract_go_imports(content: &str) -> Vec<ImportMapping> {
     static SINGLE_RE: OnceLock<Regex> = OnceLock::new();
     static BLOCK_RE: OnceLock<Regex> = OnceLock::new();
     static LINE_RE: OnceLock<Regex> = OnceLock::new();
     let single_re = SINGLE_RE.get_or_init(|| {
-        Regex::new(r#"import\s+(?:(\w+)\s+)?["']([^"']+)["']"#).expect("go single")
+        Regex::new(r#"\bimport\s+(?:([A-Za-z_]\w*)[ \t]*)?["']([^"']+)["']"#).expect("go single")
     });
     let block_re =
-        BLOCK_RE.get_or_init(|| Regex::new(r"(?s)import\s*\(\s*([^)]+)\s*\)").expect("go block"));
-    let line_re =
-        LINE_RE.get_or_init(|| Regex::new(r#"(?:(\w+)\s+)?["']([^"']+)["']"#).expect("go line"));
+        BLOCK_RE.get_or_init(|| Regex::new(r"\bimport\s*\(\s*([^)]+)\s*\)").expect("go block"));
+    let line_re = LINE_RE.get_or_init(|| {
+        Regex::new(r#"(?:([A-Za-z_]\w*|\.)[ \t]*)?["']([^"']+)["']"#).expect("go line")
+    });
+    let code = crate::strip_comments::strip_comments_for_regex(
+        &content[..go_imports_end(content)],
+        crate::strip_comments::CommentLang::Go,
+    );
 
-    let mut mappings = Vec::new();
-
-    for caps in single_re.captures_iter(content) {
-        let alias = caps.get(1).map(|m| m.as_str());
-        let source = caps.get(2).map(|m| m.as_str()).unwrap_or_default();
-        let package_name = source.rsplit('/').next().unwrap_or(source);
-        mappings.push(ImportMapping {
-            local_name: alias.unwrap_or(package_name).to_string(),
-            exported_name: "*".to_string(),
-            source: source.to_string(),
-            is_default: false,
-            is_namespace: true,
-        });
+    let mut specs: Vec<(Option<&str>, &str)> = Vec::new();
+    for caps in single_re.captures_iter(&code) {
+        let name = caps.get(1).map(|m| m.as_str());
+        specs.push((name, caps.get(2).map_or("", |m| m.as_str())));
     }
-
-    for caps in block_re.captures_iter(content) {
-        let block = caps.get(1).map(|m| m.as_str()).unwrap_or_default();
+    for caps in block_re.captures_iter(&code) {
+        let block = caps.get(1).map_or("", |m| m.as_str());
         for line_caps in line_re.captures_iter(block) {
-            let alias = line_caps.get(1).map(|m| m.as_str());
-            let source = line_caps.get(2).map(|m| m.as_str()).unwrap_or_default();
-            let package_name = source.rsplit('/').next().unwrap_or(source);
-            mappings.push(ImportMapping {
-                local_name: alias.unwrap_or(package_name).to_string(),
-                exported_name: "*".to_string(),
-                source: source.to_string(),
-                is_default: false,
-                is_namespace: true,
-            });
+            let name = line_caps.get(1).map(|m| m.as_str());
+            specs.push((name, line_caps.get(2).map_or("", |m| m.as_str())));
         }
     }
 
+    let mapping = |local_name: &str, source: &str| ImportMapping {
+        local_name: local_name.to_string(),
+        exported_name: "*".to_string(),
+        source: source.to_string(),
+        is_default: false,
+        is_namespace: true,
+    };
+    // A dot import (`. "pkg"`) binds no name of its own; it stays listed under
+    // its last path element.
+    let mut mappings: Vec<ImportMapping> = specs
+        .iter()
+        .map(|&(name, source)| match name {
+            Some(name) if name != "." => mapping(name, source),
+            _ => mapping(source.rsplit('/').next().unwrap_or(source), source),
+        })
+        .collect();
+    let bound: BTreeSet<String> = mappings.iter().map(|m| m.local_name.clone()).collect();
+    let mut assumed: Vec<(String, Vec<&str>)> = Vec::new();
+    for &(name, source) in &specs {
+        if name.is_some() {
+            continue;
+        }
+        let assumed_name = go_assumed_package_name(source);
+        if assumed_name.is_empty() || bound.contains(&assumed_name) {
+            continue;
+        }
+        match assumed.iter_mut().find(|(name, _)| *name == assumed_name) {
+            Some((_, sources)) => sources.push(source),
+            None => assumed.push((assumed_name, vec![source])),
+        }
+    }
+    // Two imports that assume one name can't both be that package.
+    for (local_name, sources) in &assumed {
+        if let [source] = sources.as_slice() {
+            mappings.push(mapping(local_name, source));
+        }
+    }
     mappings
 }
 
-/// `extractJavaImports` (`import-resolver.ts:826-853`).
+/// Where a Go file's imports end: at its first other top-level declaration, a
+/// line opening with `func`, `type`, `var` or `const` outside a block comment
+/// (upstream `goImportsEnd`).
+fn go_imports_end(content: &str) -> usize {
+    static DECL_RE: OnceLock<Regex> = OnceLock::new();
+    let decl_re = DECL_RE
+        .get_or_init(|| Regex::new(r"(?m)^(?:func|type|var|const)\b").expect("go declaration"));
+    decl_re
+        .find_iter(content)
+        .map(|found| found.start())
+        .find(|&at| {
+            let open = content[..at].rfind("/*");
+            let close = content[..at].rfind("*/");
+            open.is_none() || close.is_some_and(|close| open < Some(close))
+        })
+        .unwrap_or(content.len())
+}
+
+/// The package name goimports assumes for an import path
+/// (`ImportPathToAssumedName`, upstream `goAssumedPackageName`): its last
+/// element that isn't a major version (`go.yaml.in/yaml/v3` → `yaml`), without
+/// a `go-` prefix (`github.com/mattn/go-sqlite3` → `sqlite3`), cut where an
+/// identifier can't go on (`gopkg.in/yaml.v3` → `yaml`).
+fn go_assumed_package_name(import_path: &str) -> String {
+    let elements: Vec<&str> = import_path.split('/').collect();
+    let mut base = elements.last().copied().unwrap_or_default();
+    let is_major_version = |element: &str| {
+        element
+            .strip_prefix('v')
+            .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+    };
+    if elements.len() > 1 && is_major_version(base) {
+        base = elements[elements.len() - 2];
+    }
+    let base = base.strip_prefix("go-").unwrap_or(base);
+    base.chars()
+        .take_while(|c| c.is_alphabetic() || c.is_numeric() || *c == '_')
+        .collect()
+}
+
+/// `extractJavaImports` (`import-resolver.ts:826-853`): Java's `import
+/// [static] <fqn>[.*];`, and Kotlin's `import <fqn> [as Alias]` with no `;`
+/// (upstream #2196). A renaming import binds its alias to the imported name.
 fn extract_java_imports(content: &str) -> Vec<ImportMapping> {
     static BLOCK_RE: OnceLock<Regex> = OnceLock::new();
     static LINE_RE: OnceLock<Regex> = OnceLock::new();
@@ -857,7 +1054,8 @@ fn extract_java_imports(content: &str) -> Vec<ImportMapping> {
     let block_re = BLOCK_RE.get_or_init(|| Regex::new(r"(?s)/\*.*?\*/").expect("java block"));
     let line_re = LINE_RE.get_or_init(|| Regex::new(r"//[^\n]*").expect("java line"));
     let import_re = IMPORT_RE.get_or_init(|| {
-        Regex::new(r"(?m)^\s*import\s+(static\s+)?([\w.]+(?:\.\*)?)\s*;").expect("java import")
+        Regex::new(r"(?m)^\s*import\s+(static\s+)?([\w.]+(?:\.\*)?)(?:\s+as\s+(\w+))?\s*(?:;|$)")
+            .expect("java import")
     });
 
     let no_block = block_re.replace_all(content, "");
@@ -868,13 +1066,14 @@ fn extract_java_imports(content: &str) -> Vec<ImportMapping> {
         if fqn.ends_with(".*") {
             continue;
         }
-        let local_name = fqn.rsplit('.').next().unwrap_or(fqn);
+        let exported_name = fqn.rsplit('.').next().unwrap_or(fqn);
+        let local_name = caps.get(3).map_or(exported_name, |alias| alias.as_str());
         if local_name.is_empty() {
             continue;
         }
         mappings.push(ImportMapping {
             local_name: local_name.to_string(),
-            exported_name: local_name.to_string(),
+            exported_name: exported_name.to_string(),
             source: fqn.to_string(),
             is_default: false,
             is_namespace: false,
@@ -936,34 +1135,69 @@ fn extract_cpp_imports(content: &str) -> Vec<ImportMapping> {
     mappings
 }
 
+/// `{ util, type objectUtil }`: an inline `type` modifier is not part of the
+/// binding's name (upstream #2134, `^type\s+(?=\w)`).
+fn strip_inline_type_modifier(name: &str) -> &str {
+    let Some(rest) = name.strip_prefix("type") else {
+        return name;
+    };
+    if !rest.starts_with(char::is_whitespace) {
+        return name;
+    }
+    let rest = rest.trim_start();
+    if rest
+        .bytes()
+        .next()
+        .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_' || byte == b'$')
+    {
+        rest
+    } else {
+        name
+    }
+}
+
 fn parse_as_alias(name: &str) -> Option<(String, String)> {
     static RE: OnceLock<Regex> = OnceLock::new();
-    let re = RE.get_or_init(|| Regex::new(r"(\w+)\s+as\s+(\w+)").expect("as-alias"));
+    let re = RE.get_or_init(|| {
+        Regex::new(r"([A-Za-z_$][0-9A-Za-z_$]*)\s+as\s+([A-Za-z_$][0-9A-Za-z_$]*)")
+            .expect("as-alias")
+    });
     re.captures(name)
         .map(|c| (c[1].to_string(), c[2].to_string()))
 }
 
-fn parse_colon_alias(name: &str) -> Option<(String, String)> {
+/// `key: local` in a destructured `require` pattern, with JS identifiers
+/// (`$` included, upstream's `[A-Za-z_$][\w$]*`).
+fn parse_js_colon_alias(name: &str) -> Option<(String, String)> {
     static RE: OnceLock<Regex> = OnceLock::new();
-    let re = RE.get_or_init(|| Regex::new(r"(\w+)\s*:\s*(\w+)").expect("colon-alias"));
+    let re = RE.get_or_init(|| {
+        Regex::new(r"([A-Za-z_$][0-9A-Za-z_$]*)\s*:\s*([A-Za-z_$][0-9A-Za-z_$]*)")
+            .expect("js colon alias")
+    });
     re.captures(name)
         .map(|c| (c[1].to_string(), c[2].to_string()))
 }
 
 /// Strip JS line + block comments preserving strings (`stripJsComments`,
 /// `import-resolver.ts:935-972`).
+///
+/// Walks bytes: every character it acts on (the three quotes, `\`, `/`, `*`
+/// and `\n`) is ASCII, and no byte of a multi-byte UTF-8 character equals one,
+/// so each removed comment starts and ends on a character boundary and the
+/// result is the character-by-character scan's, without first copying the text
+/// into a `Vec<char>` (W10-08).
 fn strip_js_comments(content: &str) -> String {
-    let chars: Vec<char> = content.chars().collect();
-    let n = chars.len();
-    let mut out = String::with_capacity(content.len());
+    let bytes = content.as_bytes();
+    let n = bytes.len();
+    let mut out: Vec<u8> = Vec::with_capacity(n);
     let mut i = 0;
-    let mut str_ch: Option<char> = None;
+    let mut str_ch: Option<u8> = None;
     while i < n {
-        let ch = chars[i];
+        let ch = bytes[i];
         if let Some(quote) = str_ch {
             out.push(ch);
-            if ch == '\\' && i + 1 < n {
-                out.push(chars[i + 1]);
+            if ch == b'\\' && i + 1 < n {
+                out.push(bytes[i + 1]);
                 i += 2;
                 continue;
             }
@@ -973,21 +1207,21 @@ fn strip_js_comments(content: &str) -> String {
             i += 1;
             continue;
         }
-        if ch == '"' || ch == '\'' || ch == '`' {
+        if ch == b'"' || ch == b'\'' || ch == b'`' {
             str_ch = Some(ch);
             out.push(ch);
             i += 1;
             continue;
         }
-        if ch == '/' && chars.get(i + 1).copied() == Some('/') {
-            while i < n && chars[i] != '\n' {
+        if ch == b'/' && bytes.get(i + 1) == Some(&b'/') {
+            while i < n && bytes[i] != b'\n' {
                 i += 1;
             }
             continue;
         }
-        if ch == '/' && chars.get(i + 1).copied() == Some('*') {
+        if ch == b'/' && bytes.get(i + 1) == Some(&b'*') {
             i += 2;
-            while i < n && !(chars[i] == '*' && chars.get(i + 1).copied() == Some('/')) {
+            while i < n && !(bytes[i] == b'*' && bytes.get(i + 1) == Some(&b'/')) {
                 i += 1;
             }
             i += 2;
@@ -996,7 +1230,7 @@ fn strip_js_comments(content: &str) -> String {
         out.push(ch);
         i += 1;
     }
-    out
+    String::from_utf8(out).expect("a removed comment starts and ends at an ASCII byte")
 }
 
 /// Bindings a Rust file's `use` declarations introduce, as `(local_name, path)`.
@@ -1118,8 +1352,8 @@ fn split_top_level_commas(inner: &str) -> Vec<String> {
 /// ref, a `type_alias` for a supertype).
 ///
 /// Two oracles only, each one its language cannot be wrong about:
-/// - the JS specifier family, via the existing [`is_external_import`], which
-///   already understands tsconfig path aliases and workspace packages; and
+/// - the JS specifier family, via [`is_out_of_repo_js_import`], which
+///   understands tsconfig path aliases and workspace packages; and
 /// - Rust `use`, restricted to [`RUST_OUT_OF_REPO_ROOTS`], with the escape that a
 ///   path walking to a real file is local.
 ///
@@ -1144,7 +1378,14 @@ pub fn is_bound_to_out_of_repo_module(
             .get_import_mappings(&reference.file_path, reference.language)
             .into_iter()
             .filter(|m| m.local_name == head)
-            .any(|m| is_external_import(&m.source, reference.language, context));
+            .any(|m| {
+                is_out_of_repo_js_import(
+                    &m.source,
+                    &reference.file_path,
+                    reference.language,
+                    context,
+                )
+            });
     }
 
     if reference.language == Language::Rust {
@@ -1158,6 +1399,42 @@ pub fn is_bound_to_out_of_repo_module(
     }
 
     false
+}
+
+/// Does a JS-family import of `source` from `from_file` name a module outside
+/// the repository? A path alias makes it the project's only when it maps the
+/// import to a file the index holds (upstream #2437). Matching the alias's
+/// prefix is not enough: a catch-all `"*": ["./typings/*"]` matches every
+/// package. Nor is a path that exists on disk: an alias can land in
+/// `node_modules`, or on a directory.
+fn is_out_of_repo_js_import(
+    source: &str,
+    from_file: &str,
+    language: Language,
+    context: &dyn ResolutionContext,
+) -> bool {
+    is_external_import_with(source, language, context, false)
+        && !resolve_import_path(source, from_file, language, context)
+            .is_some_and(|resolved| context.is_indexed_file(&resolved))
+}
+
+/// Does a JS-family import of `source`, written in `from_file`, name a module
+/// outside the repository (upstream #2120 `isOutOfRepoImport`, #2128)? A
+/// package that is not a relative path, a path alias onto an indexed file or
+/// a workspace member, and that the file's package.json chain or Deno import
+/// map declares, or a Node built-in, a runtime scheme or a framework's
+/// virtual module ([`crate::package_manifests`]): an alias the resolver does
+/// not follow (`$lib/…`, `~/…`) and the repository's own package stay the
+/// project's. Every other language answers `false`.
+pub fn is_out_of_repo_import(
+    source: &str,
+    from_file: &str,
+    language: Language,
+    context: &dyn ResolutionContext,
+) -> bool {
+    is_js_specifier_language(language)
+        && is_out_of_repo_js_import(source, from_file, language, context)
+        && crate::package_manifests::is_declared_outside_package(source, from_file, context)
 }
 
 /// Does a Rust `use` path name a crate outside the repository?
@@ -1186,6 +1463,13 @@ fn rust_use_path_is_out_of_repo(
     true
 }
 
+/// A JavaScript identifier without escapes: an `ID_Start` letter, `$` or
+/// `_`, then `ID_Continue`, `$`, ZWNJ or ZWJ. Upstream's `[A-Za-z_$][\w$]*`
+/// (#2378, #2384) is its ASCII subset; the `\w+` the local alias forms read
+/// before took the Unicode letters but not `$`, so `export default items$;`
+/// bound nothing.
+const JS_IDENTIFIER: &str = r"[\p{ID_Start}_$][\p{ID_Continue}$\x{200C}\x{200D}]*";
+
 /// Extract JS/TS cross-file re-exports and explicit local export aliases
 /// (`extractReExports`, `import-resolver.ts:989-1042`).
 pub fn extract_re_exports(content: &str, language: Language) -> Vec<ReExport> {
@@ -1203,29 +1487,42 @@ pub fn extract_re_exports(content: &str, language: Language) -> Vec<ReExport> {
     static LOCAL_CONST_RE: OnceLock<Regex> = OnceLock::new();
     static LOCAL_NAMED_RE: OnceLock<Regex> = OnceLock::new();
     static LOCAL_DEFAULT_RE: OnceLock<Regex> = OnceLock::new();
+    // `export * from '…'`; `export * as ns from '…'` exports `ns` alone
+    // (upstream #2192).
     let wildcard_re = WILDCARD_RE.get_or_init(|| {
-        Regex::new(r#"export\s*\*(?:\s+as\s+\w+)?\s*from\s*['"]([^'"]+)['"]"#)
-            .expect("reexport wildcard")
+        Regex::new(
+            r#"export\s*\*(?:\s+as\s+([A-Za-z_$][0-9A-Za-z_$]*))?\s*from\s*['"]([^'"]+)['"]"#,
+        )
+        .expect("reexport wildcard")
     });
     let named_re = NAMED_RE.get_or_init(|| {
         Regex::new(r#"export\s*\{([^}]+)\}\s*from\s*['"]([^'"]+)['"]"#).expect("reexport named")
     });
     let local_const_re = LOCAL_CONST_RE.get_or_init(|| {
-        Regex::new(r"(?m)\bexport[ \t]+const[ \t]+(\w+)[ \t]*=[ \t]*(\w+)[ \t]*(?:;[ \t]*)?$")
-            .expect("local const export alias")
+        Regex::new(&format!(
+            r"(?m)\bexport[ \t]+const[ \t]+({JS_IDENTIFIER})[ \t]*=[ \t]*({JS_IDENTIFIER})[ \t]*(?:;[ \t]*)?$"
+        ))
+        .expect("local const export alias")
     });
     let local_named_re = LOCAL_NAMED_RE.get_or_init(|| {
         Regex::new(r"(?m)\bexport[ \t]*\{([^}]+)\}[ \t]*;?[ \t]*$")
             .expect("local named export alias")
     });
     let local_default_re = LOCAL_DEFAULT_RE.get_or_init(|| {
-        Regex::new(r"(?m)\bexport[ \t]+default[ \t]+(\w+)[ \t]*;?[ \t]*$")
-            .expect("local default export alias")
+        Regex::new(&format!(
+            r"(?m)\bexport[ \t]+default[ \t]+({JS_IDENTIFIER})[ \t]*;?[ \t]*$"
+        ))
+        .expect("local default export alias")
     });
 
     for caps in wildcard_re.captures_iter(&cleaned) {
-        out.push(ReExport::Wildcard {
-            source: caps[1].to_string(),
+        let source = caps[2].to_string();
+        out.push(match caps.get(1) {
+            Some(namespace) => ReExport::Namespace {
+                exported_name: namespace.as_str().to_string(),
+                source,
+            },
+            None => ReExport::Wildcard { source },
         });
     }
 
@@ -1284,11 +1581,60 @@ pub fn extract_re_exports(content: &str, language: Language) -> Vec<ReExport> {
         });
     }
 
+    // CommonJS (upstream #2189): `exports.setCharset = function setCharset(…)`,
+    // `module.exports.x = impl`, and `module.exports = { parse, format:
+    // formatDate }`.
+    static CJS_MEMBER_RE: OnceLock<Regex> = OnceLock::new();
+    static CJS_OBJECT_RE: OnceLock<Regex> = OnceLock::new();
+    static CJS_ENTRY_RE: OnceLock<Regex> = OnceLock::new();
+    let cjs_member_re = CJS_MEMBER_RE.get_or_init(|| {
+        Regex::new(
+            r"(?m)^[ \t]*(?:module\.)?exports\.([A-Za-z_$][0-9A-Za-z_$]*)\s*=\s*(?:(?:async\s+)?function\s*\*?\s*([A-Za-z_$][0-9A-Za-z_$]*)\s*\(|([A-Za-z_$][0-9A-Za-z_$]*)\s*;?[ \t]*$)",
+        )
+        .expect("commonjs member export")
+    });
+    let cjs_object_re = CJS_OBJECT_RE.get_or_init(|| {
+        Regex::new(r"(?m)^[ \t]*module\.exports\s*=\s*\{([^{}]*)\}")
+            .expect("commonjs object export")
+    });
+    let cjs_entry_re = CJS_ENTRY_RE.get_or_init(|| {
+        Regex::new(r"^\s*([A-Za-z_$][0-9A-Za-z_$]*)\s*(?::\s*([A-Za-z_$][0-9A-Za-z_$]*)\s*)?$")
+            .expect("commonjs object entry")
+    });
+    for caps in cjs_member_re.captures_iter(content) {
+        let local = caps.get(2).or_else(|| caps.get(3));
+        if let Some(local) = local {
+            out.push(ReExport::CommonJsAlias {
+                exported_name: caps[1].to_string(),
+                original_name: local.as_str().to_string(),
+            });
+        }
+    }
+    for caps in cjs_object_re.captures_iter(content) {
+        for raw in caps[1].split(',') {
+            if let Some(entry) = cjs_entry_re.captures(raw) {
+                let exported = entry[1].to_string();
+                let local = entry
+                    .get(2)
+                    .map_or_else(|| exported.clone(), |m| m.as_str().to_string());
+                out.push(ReExport::CommonJsAlias {
+                    exported_name: exported,
+                    original_name: local,
+                });
+            }
+        }
+    }
+
     out
 }
 
+/// A JS identifier: `[A-Za-z_$][0-9A-Za-z_$]*` (upstream #2378).
 fn is_word(s: &str) -> bool {
-    !s.is_empty() && s.chars().all(|c| c.is_alphanumeric() || c == '_')
+    let mut chars = s.chars();
+    chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_' || c == '$')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
 }
 
 /// Resolve a JVM (Java/Kotlin) FQN import via the qualifiedName index
@@ -1369,6 +1715,136 @@ fn drop_last_segment(path: &str) -> Vec<&str> {
     } else {
         segs[..segs.len() - 1].to_vec()
     }
+}
+
+/// The qualified name (`App\Fields::FirstName`) of the class a PHP class
+/// name written with a namespace in it (`Field\FirstName`, `\Ns\X`) names at
+/// `reference`, read as PHP reads it: a leading `\` makes it absolute;
+/// otherwise a first segment a `use` imports is replaced by what it imports,
+/// and any other name is relative to the namespace the reference is in.
+pub(crate) fn php_qualified_class_qn(
+    name: &str,
+    reference: &RefView,
+    context: &dyn ResolutionContext,
+) -> String {
+    let fqn = if let Some(rooted) = name.strip_prefix('\\') {
+        rooted.to_string()
+    } else {
+        let head = name.split('\\').next().unwrap_or(name);
+        match context
+            .get_import_mappings(&reference.file_path, reference.language)
+            .into_iter()
+            .find(|import| import.local_name == head)
+        {
+            Some(import) => format!(
+                "{}{}",
+                import.source.trim_start_matches('\\'),
+                &name[head.len()..]
+            ),
+            // `namespace App;` applies until the next namespace statement.
+            None => match context
+                .get_nodes_in_file_shared(&reference.file_path)
+                .into_iter()
+                .filter(|node| {
+                    node.kind == NodeKind::Namespace && node.start_line <= reference.line
+                })
+                .max_by(|a, b| {
+                    (a.start_line, a.start_column, &b.id).cmp(&(
+                        b.start_line,
+                        b.start_column,
+                        &a.id,
+                    ))
+                }) {
+                Some(namespace) => format!("{}\\{name}", namespace.qualified_name),
+                None => name.to_string(),
+            },
+        }
+    };
+    match fqn.rsplit_once('\\') {
+        Some((namespace, last)) => format!("{namespace}::{last}"),
+        None => fqn,
+    }
+}
+
+/// A PHP class written with a namespace in it (upstream
+/// `resolvePhpQualifiedClassRef`, #2256 / #2286). `use App\Fields as Field;`
+/// aliases a namespace, so `new Field\FirstName()`, `extends Field\Base` and
+/// `Field\FirstName::make()` all name `App\Fields\FirstName`. PHP reads a
+/// qualified name one way: a leading `\` makes it absolute; otherwise a first
+/// segment a `use` imports is replaced by what it imports, and any other name
+/// is relative to the current namespace. `None` when the ref is not a
+/// qualified class name (or names a method the class inherits); `Some(None)`
+/// when it is but no single project class has that name, so it lives outside
+/// the project and the name fallbacks must not guess. KEEP-RUST: a static
+/// call is recorded as written (`Field\FirstName.make`), the other class
+/// name refs by their last segment, whose written name is read back from the
+/// source ([`crate::php_scope::php_written_class_name`]).
+pub(crate) fn resolve_php_qualified_class_ref(
+    reference: &RefView,
+    context: &dyn ResolutionContext,
+) -> Option<Option<ResolvedRef>> {
+    if reference.language != Language::Php {
+        return None;
+    }
+    let (name, member) = if reference.reference_kind == codegraph_core::types::EdgeKind::Calls {
+        // A static call on the class: `Field\FirstName::make()` is written
+        // `Field\FirstName.make`.
+        static CALL: OnceLock<Regex> = OnceLock::new();
+        let call = CALL
+            .get_or_init(|| {
+                Regex::new(r"^(.*\\[^\\.:]+)(?:\.|::)([0-9A-Za-z_]+)$").expect("php qualified call")
+            })
+            .captures(&reference.reference_name)?;
+        (call[1].to_string(), Some(call[2].to_string()))
+    } else {
+        (
+            crate::php_scope::php_written_class_name(reference, context)?,
+            None,
+        )
+    };
+    if !name.contains('\\') {
+        return None;
+    }
+    let qualified_name = php_qualified_class_qn(&name, reference, context);
+    let classes: Vec<Arc<Node>> = context
+        .get_nodes_by_qualified_name_shared(&qualified_name)
+        .into_iter()
+        .filter(|node| node.language == Language::Php && is_static_member_container(node.kind))
+        .collect();
+    // A type mention can name something other than a class (a namespaced
+    // constant or function), so it keeps the ordinary strategies.
+    let [owner] = classes.as_slice() else {
+        return (reference.reference_kind != codegraph_core::types::EdgeKind::References)
+            .then_some(None);
+    };
+    let Some(member) = member else {
+        return Some(Some(ResolvedRef {
+            original: reference.clone(),
+            target_node_id: owner.id.clone(),
+            confidence: 0.95,
+            resolved_by: ResolvedBy::Import,
+        }));
+    };
+    let methods: Vec<Arc<Node>> = context
+        .get_nodes_by_qualified_name_shared(&format!("{}::{member}", owner.qualified_name))
+        .into_iter()
+        .filter(|node| {
+            node.language == Language::Php
+                && node.kind == NodeKind::Method
+                && node.file_path == owner.file_path
+        })
+        .collect();
+    // A method the class inherits is left to the strategies that walk
+    // supertypes.
+    let [method] = methods.as_slice() else {
+        return None;
+    };
+    Some(Some(ResolvedRef {
+        original: reference.clone(),
+        target_node_id: method.id.clone(),
+        confidence: 0.95,
+        resolved_by: ResolvedBy::Import,
+    }))
 }
 
 /// Resolve a PHP scoped call through the exact class namespace named by its
@@ -1472,6 +1948,53 @@ pub fn resolve_via_import(
     reference: &RefView,
     context: &dyn ResolutionContext,
 ) -> Option<ResolvedRef> {
+    // #2263 — a JS/TS module path (`import './polyfills'`, the module of
+    // `import x from '../lib/a'`) names a FILE, found the way the runtime finds
+    // it: extensions, `index` files, path aliases.
+    if is_js_path_import_ref(reference)
+        && let Some(file) = resolve_import_path(
+            &reference.reference_name,
+            &reference.file_path,
+            reference.language,
+            context,
+        )
+        && file != reference.file_path
+        && let Some(file_node) = context
+            .get_nodes_by_name_shared(pathutil::basename(&file))
+            .into_iter()
+            .find(|n| n.kind == NodeKind::File && n.file_path == file)
+    {
+        return Some(ResolvedRef {
+            original: reference.clone(),
+            target_node_id: file_node.id.clone(),
+            confidence: 0.9,
+            resolved_by: ResolvedBy::Import,
+        });
+    }
+    // A Dart `import` / `export` URI names a library file, and a `part` URI
+    // one of the library's own files: `package:app/x.dart` is app's
+    // lib/x.dart, any other path is from the file the directive is in
+    // (upstream #2388, #2391).
+    if is_dart_import_ref(reference) {
+        let file = crate::dart_libraries::dart_directive_file(
+            &reference.file_path,
+            &reference.reference_name,
+            context,
+        )?;
+        if file == reference.file_path {
+            return None;
+        }
+        let file_node = context
+            .get_nodes_in_file_shared(&file)
+            .into_iter()
+            .find(|n| n.kind == NodeKind::File)?;
+        return Some(ResolvedRef {
+            original: reference.clone(),
+            target_node_id: file_node.id.clone(),
+            confidence: 0.9,
+            resolved_by: ResolvedBy::Import,
+        });
+    }
     // C/C++ #include → file→file edge (import-resolver.ts:1132-1164).
     if matches!(reference.language, Language::C | Language::Cpp)
         && reference.reference_kind == codegraph_core::types::EdgeKind::Imports
@@ -1612,6 +2135,17 @@ pub fn resolve_via_import(
         }
     }
 
+    // Kotlin's `import app.model.Outer.Inner as Made`: `Made.create()` is the
+    // aliased class's member, found by its FQN; nothing else binds the alias
+    // (upstream #2196).
+    if reference.language == Language::Kotlin
+        && reference.reference_kind != codegraph_core::types::EdgeKind::Imports
+    {
+        if let Some(aliased) = resolve_jvm_alias(reference, &imports, context) {
+            return Some(aliased);
+        }
+    }
+
     // Generic: reference name matches an import (import-resolver.ts:1272-1306).
     for imp in &imports {
         if imp.local_name == reference.reference_name
@@ -1649,23 +2183,11 @@ pub fn resolve_via_import(
                     None
                 };
 
+                // Python symbols are never marked exported; a named import
+                // names the module's own top-level definition (#1820), or
+                // one it re-exports (#2247).
                 let python_symbol = |name: &str| {
-                    // Python symbols are never marked exported; a named import
-                    // names the module's own top-level definition (#1820).
-                    context
-                        .get_nodes_in_file_shared(&resolved_path)
-                        .into_iter()
-                        .find(|node| {
-                            node.name == name
-                                && !node.qualified_name.contains("::")
-                                && matches!(
-                                    node.kind,
-                                    NodeKind::Class
-                                        | NodeKind::Function
-                                        | NodeKind::Variable
-                                        | NodeKind::Constant
-                                )
-                        })
+                    python_module_symbol(&resolved_path, name, context)
                         .map(|node| node.as_ref().clone())
                 };
                 let wanted_python_name =
@@ -1865,6 +2387,49 @@ fn resolve_module_import_to_file(
 
 /// Resolve a Java/Kotlin reference whose receiver is an imported FQN's simple
 /// name (`resolveJavaImportedReference`, `import-resolver.ts:1671-1735`).
+/// `Alias` or `Alias.member` through a renaming Kotlin import, by the imported
+/// FQN (upstream #2196 `resolveJvmAlias`): the package is some prefix of the
+/// FQN, the rest the type path (`app.model::Outer::Inner`).
+fn resolve_jvm_alias(
+    reference: &RefView,
+    imports: &[ImportMapping],
+    context: &dyn ResolutionContext,
+) -> Option<ResolvedRef> {
+    let (root, member) = match reference.reference_name.split_once('.') {
+        Some((root, member)) => (root, Some(member)),
+        None => (reference.reference_name.as_str(), None),
+    };
+    let imp = imports.iter().find(|mapping| {
+        mapping.local_name == root && mapping.local_name != mapping.exported_name
+    })?;
+    let parts: Vec<&str> = imp.source.split('.').collect();
+    for cut in (1..parts.len()).rev() {
+        let qualified = format!("{}::{}", parts[..cut].join("."), parts[cut..].join("::"));
+        let Some(target) = context
+            .get_nodes_by_qualified_name_shared(&qualified)
+            .into_iter()
+            .next()
+        else {
+            continue;
+        };
+        let target_node = match member {
+            None => target,
+            Some(member) if member.contains('.') => return None,
+            Some(member) => context
+                .get_nodes_by_qualified_name_shared(&format!("{}::{member}", target.qualified_name))
+                .into_iter()
+                .next()?,
+        };
+        return Some(ResolvedRef {
+            original: reference.clone(),
+            target_node_id: target_node.id.clone(),
+            confidence: 0.9,
+            resolved_by: ResolvedBy::Import,
+        });
+    }
+    None
+}
+
 fn resolve_java_imported_reference(
     reference: &RefView,
     imports: &[ImportMapping],
@@ -1935,6 +2500,162 @@ fn resolve_java_imported_reference(
         }
     }
     None
+}
+
+/// What `module.exports = …` (also `exports = module.exports = …`) default
+/// exports (upstream #2189 `commonJsDefaultExport`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CommonJsDefault {
+    /// The module it forwards: `module.exports = require('./lib/express')`.
+    Forward(String),
+    /// The name it binds: `createApplication`, `function name(`, `class Name`.
+    Binding(String),
+}
+
+fn commonjs_default_export(
+    file_path: &str,
+    context: &dyn ResolutionContext,
+) -> Option<CommonJsDefault> {
+    if !is_js_family_file(file_path) {
+        return None;
+    }
+    commonjs_default_of(&context.read_file_shared(file_path)?)
+}
+
+/// [`commonjs_default_export`] read from a JS-family file's text.
+pub(crate) fn commonjs_default_of(source: &str) -> Option<CommonJsDefault> {
+    static COMMONJS_DEFAULT_EXPORT: OnceLock<Regex> = OnceLock::new();
+    if !source.contains("module.exports") {
+        return None;
+    }
+    let pattern = COMMONJS_DEFAULT_EXPORT.get_or_init(|| {
+        Regex::new(
+            r#"(?m)^[ \t]*(?:exports\s*=\s*)?module\.exports\s*=\s*(?:exports\s*=\s*)?(?:require\(\s*['"]([^'"]+)['"]\s*\)\s*;?[ \t]*$|(?:async\s+)?function\s*\*?\s*([A-Za-z_$][0-9A-Za-z_$]*)\s*\(|class\s+([A-Za-z_$][0-9A-Za-z_$]*)|([A-Za-z_$][0-9A-Za-z_$]*)\s*;?[ \t]*$)"#,
+        )
+        .expect("commonjs default export")
+    });
+    let captures = pattern.captures(source)?;
+    if let Some(forward) = captures.get(1) {
+        return Some(CommonJsDefault::Forward(forward.as_str().to_string()));
+    }
+    captures
+        .get(2)
+        .or_else(|| captures.get(3))
+        .or_else(|| captures.get(4))
+        .map(|name| CommonJsDefault::Binding(name.as_str().to_string()))
+}
+
+/// `[cm]?[jt]sx?`: a JS-family file (upstream `JS_FAMILY_FILE`).
+pub(crate) fn is_js_family_file(file_path: &str) -> bool {
+    let Some((_, extension)) = file_path.rsplit_once('.') else {
+        return false;
+    };
+    let extension = extension.strip_prefix(['c', 'm']).unwrap_or(extension);
+    matches!(extension, "js" | "jsx" | "ts" | "tsx")
+}
+
+/// Languages with ES import semantics (upstream `ESM_IMPORT_LANGUAGES`).
+fn is_esm_import_language(language: Language) -> bool {
+    matches!(
+        language,
+        Language::TypeScript
+            | Language::Tsx
+            | Language::JavaScript
+            | Language::Jsx
+            | Language::ArkTs
+            | Language::Svelte
+            | Language::Vue
+            | Language::Astro
+    )
+}
+
+/// The node a CommonJS export alias (`exports.x = impl`) names for
+/// `exported_name`: the file's first node of that local name (upstream
+/// `exportedByName`'s clause aliases).
+fn commonjs_alias_target(
+    exported_name: &str,
+    re_exports: &[ReExport],
+    nodes_in_file: &[Arc<Node>],
+) -> Option<Node> {
+    let local = re_exports.iter().find_map(|rex| match rex {
+        ReExport::CommonJsAlias {
+            exported_name: exported,
+            original_name,
+        } if exported == exported_name => Some(original_name.as_str()),
+        _ => None,
+    })?;
+    nodes_in_file
+        .iter()
+        .find(|n| n.name == local && n.kind != NodeKind::File)
+        .map(|n| n.as_ref().clone())
+}
+
+/// Whether a JS-family file's text holds an `export default` statement
+/// (upstream #2433 `ESM_DEFAULT_EXPORT_RE`).
+pub(crate) fn has_esm_default_statement(source: &str) -> bool {
+    static ESM_DEFAULT_EXPORT: OnceLock<Regex> = OnceLock::new();
+    source.contains("default")
+        && ESM_DEFAULT_EXPORT
+            .get_or_init(|| {
+                Regex::new(r"(?m)^[ \t]*export\s+default(?-u:\b)").expect("export default")
+            })
+            .is_match(source)
+}
+
+/// The declaration an ES module default-exports, when it has an ESM default
+/// export at all (upstream #2433 `hasEsmDefaultExport` / `esmDefaultExport`):
+/// the component a single-file component file is, else what an `export
+/// default NAME` statement names, else the first exported function or class
+/// of a file with an `export default` statement. A CommonJS module has none,
+/// though its `exports.x = function` declarations are exported.
+fn esm_default_export(
+    file_path: &str,
+    nodes_in_file: &[Arc<Node>],
+    re_exports: &[ReExport],
+    context: &dyn ResolutionContext,
+) -> Option<Node> {
+    if let Some(component) = nodes_in_file
+        .iter()
+        .find(|n| n.is_exported && n.kind == NodeKind::Component)
+    {
+        return Some(component.as_ref().clone());
+    }
+    if !is_js_family_file(file_path) {
+        return None;
+    }
+    if !has_esm_default_statement(&context.read_file_shared(file_path)?) {
+        return None;
+    }
+    let bound = re_exports.iter().find_map(|rex| match rex {
+        ReExport::LocalAlias {
+            exported_name,
+            original_name,
+        } if exported_name == "default" => Some(original_name.as_str()),
+        _ => None,
+    });
+    bound
+        .and_then(|name| {
+            nodes_in_file
+                .iter()
+                .filter(|n| {
+                    n.name == name
+                        && matches!(
+                            n.kind,
+                            NodeKind::Function
+                                | NodeKind::Class
+                                | NodeKind::Component
+                                | NodeKind::Constant
+                                | NodeKind::Variable
+                        )
+                })
+                .min_by_key(|n| (n.start_line, n.start_column))
+        })
+        .or_else(|| {
+            nodes_in_file
+                .iter()
+                .find(|n| n.is_exported && matches!(n.kind, NodeKind::Function | NodeKind::Class))
+        })
+        .map(|n| n.as_ref().clone())
 }
 
 /// Recursive depth cap for re-export chains (`REEXPORT_MAX_DEPTH`,
@@ -2046,6 +2767,42 @@ fn find_exported_symbol(
         {
             return Some(direct.as_ref().clone());
         }
+        // CommonJS: `module.exports = createApplication`, or `=
+        // require('./lib/express')` (upstream #2189).
+        match commonjs_default_export(file_path, context) {
+            Some(CommonJsDefault::Forward(source)) => {
+                if let Some(next) = resolve_import_path(&source, file_path, language, context) {
+                    return find_exported_symbol(
+                        &next,
+                        want,
+                        language,
+                        context,
+                        visited,
+                        depth + 1,
+                    );
+                }
+            }
+            Some(CommonJsDefault::Binding(name)) => {
+                if let Some(bound) = nodes_in_file
+                    .iter()
+                    .filter(|n| {
+                        n.name == name
+                            && matches!(
+                                n.kind,
+                                NodeKind::Function
+                                    | NodeKind::Class
+                                    | NodeKind::Component
+                                    | NodeKind::Constant
+                                    | NodeKind::Variable
+                            )
+                    })
+                    .min_by_key(|n| (n.start_line, n.start_column))
+                {
+                    return Some(bound.as_ref().clone());
+                }
+            }
+            None => {}
+        }
     } else if want.is_namespace {
         if let Some(member) = &want.member_name {
             if let Some(direct) = nodes_in_file
@@ -2054,12 +2811,32 @@ fn find_exported_symbol(
             {
                 return Some(direct.as_ref().clone());
             }
+            if let Some(aliased) = commonjs_alias_target(member, &re_exports, &nodes_in_file) {
+                return Some(aliased);
+            }
         }
     } else if let Some(direct) = nodes_in_file
         .iter()
         .find(|n| n.name == want.exported_name && n.is_exported)
     {
         return Some(direct.as_ref().clone());
+    } else if let Some(aliased) =
+        commonjs_alias_target(&want.exported_name, &re_exports, &nodes_in_file)
+    {
+        return Some(aliased);
+    } else if depth == 0
+        && want.exported_name == "default"
+        && is_esm_import_language(language)
+        && let Some(esm_default) =
+            esm_default_export(file_path, &nodes_in_file, &re_exports, context)
+    {
+        // `require('./x').default` and `const { default: X } = require('./x')`
+        // read the `default` property of module.exports. A CommonJS module
+        // sets it by name (`exports.default = fn`, found just above); a module
+        // written as an ES module sets it to its default export, which is no
+        // named export (upstream #2433). Only in the module asked for:
+        // `export * from` never forwards a default.
+        return Some(esm_default);
     }
 
     // Cross-file re-export hits (import-resolver.ts:1855-1893).
@@ -2067,8 +2844,14 @@ fn find_exported_symbol(
         return None;
     }
 
+    // For `ns.member` through `import * as ns`, the member is the name wanted
+    // (upstream #2192).
     let target_name = if want.is_default {
         "default"
+    } else if want.is_namespace
+        && let Some(member) = want.member_name.as_deref()
+    {
+        member
     } else {
         &want.exported_name
     };
@@ -2100,8 +2883,40 @@ fn find_exported_symbol(
                     }
                 }
             }
-            ReExport::Wildcard { .. } | ReExport::LocalAlias { .. } => {}
+            ReExport::Wildcard { .. }
+            | ReExport::Namespace { .. }
+            | ReExport::LocalAlias { .. }
+            | ReExport::CommonJsAlias { .. } => {}
         }
+    }
+
+    // `z.core.util.fn` through `export * as core from './core'`: the member
+    // continues in that module (upstream #2192).
+    if want.is_namespace
+        && let Some(member) = want.member_name.as_deref()
+        && let Some((head, rest)) = member.split_once('.')
+        && let Some(source) = re_exports.iter().find_map(|rex| match rex {
+            ReExport::Namespace {
+                exported_name,
+                source,
+            } if exported_name == head => Some(source),
+            _ => None,
+        })
+    {
+        let next = resolve_import_path(source, file_path, language, context)?;
+        return find_exported_symbol(
+            &next,
+            &Want {
+                is_default: want.is_default,
+                is_namespace: want.is_namespace,
+                exported_name: rest.split('.').next().unwrap_or(rest).to_string(),
+                member_name: Some(rest.to_string()),
+            },
+            language,
+            context,
+            visited,
+            depth + 1,
+        );
     }
 
     for rex in &re_exports {
@@ -2115,7 +2930,10 @@ fn find_exported_symbol(
                     }
                 }
             }
-            ReExport::Named { .. } | ReExport::LocalAlias { .. } => {}
+            ReExport::Named { .. }
+            | ReExport::Namespace { .. }
+            | ReExport::LocalAlias { .. }
+            | ReExport::CommonJsAlias { .. } => {}
         }
     }
 
@@ -2164,10 +2982,16 @@ fn resolve_imported_instance_member(
     let decl_slice = lines[start..end].join("\n");
 
     let escaped = regex_escape(&value.name);
-    for pattern in local_receiver_type_patterns(value.language, &escaped) {
-        let Some(captured) = pattern.captures(&decl_slice).and_then(|c| c.get(1)) else {
+    for (pattern, check) in local_receiver_type_patterns(value.language, &escaped) {
+        let Some(captures) = pattern.captures(&decl_slice) else {
             continue;
         };
+        let (Some(whole), Some(captured)) = (captures.get(0), captures.get(1)) else {
+            continue;
+        };
+        if !check.passes(&decl_slice, whole, captured) {
+            continue;
+        }
         let Some(type_name) = normalize_inferred_type_name(captured.as_str()) else {
             continue;
         };
@@ -2241,84 +3065,69 @@ fn resolve_static_member(
     Some(candidates.swap_remove(0).as_ref().clone())
 }
 
-/// The module whose `module_path` covers `import_path`, longest match first.
-fn owning_go_module<'m>(import_path: &str, modules: &'m [GoModule]) -> Option<&'m GoModule> {
-    modules
-        .iter()
-        .filter(|m| {
-            import_path == m.module_path || import_path.starts_with(&format!("{}/", m.module_path))
-        })
-        .max_by_key(|m| m.module_path.len())
-}
-
-/// The project-relative directory an in-project Go import resolves to: the
-/// owning module's own directory, plus the import's path below `module_path`.
-fn go_package_dir(import_path: &str, module: &GoModule) -> String {
-    let below = import_path
-        .strip_prefix(&module.module_path)
-        .unwrap_or_default()
-        .trim_start_matches('/');
-    match (module.dir.as_str(), below) {
-        ("", rest) => rest.to_string(),
-        (dir, "") => dir.to_string(),
-        (dir, rest) => format!("{dir}/{rest}"),
-    }
-}
-
 /// Go cross-package call `pkga.FuncX` → the exported member in the package
 /// directory the import maps to. Ports `resolveGoCrossPackageReference`
-/// (import-resolver.ts, issue #388).
+/// (import-resolver.ts, issue #388), with #2322's package directories: a
+/// bare name the source writes through a package (`store.Manager` in a field
+/// or a signature, which the index keeps as `Manager`) is that package's
+/// too, and a link inside a longer chain (`s.db.Get`, kept as `db.Get`) is
+/// no package's.
 fn resolve_go_cross_package_reference(
     reference: &RefView,
     imports: &[ImportMapping],
     context: &dyn ResolutionContext,
 ) -> Option<ResolvedRef> {
-    let modules = context.get_go_modules();
-    if modules.is_empty() {
+    let Some(dot_idx) = reference.reference_name.find('.') else {
+        let import = crate::go_packages::go_ref_qualifier(reference, context)?;
+        return find_go_package_member(&reference.reference_name, &import, reference, context);
+    };
+    if dot_idx == 0 || crate::go_packages::is_go_chain_link(reference, context) {
         return None;
     }
-    let dot_idx = reference.reference_name.find('.')?;
-    if dot_idx == 0 {
-        return None;
-    }
+    // A parameter or local named like the import holds the call there:
+    // `store := newStore()`, then `store.Get(k)` is no call into package
+    // store (upstream #2448).
+    crate::go_packages::go_ref_qualifier(reference, context)?;
     let receiver = &reference.reference_name[..dot_idx];
     let member = &reference.reference_name[dot_idx + 1..];
     if member.is_empty() {
         return None;
     }
+    imports
+        .iter()
+        .filter(|import| import.local_name == receiver)
+        .find_map(|import| find_go_package_member(member, import, reference, context))
+}
 
-    for imp in imports {
-        if imp.local_name != receiver {
-            continue;
-        }
-        // Only in-project imports map to a known directory. With several modules
-        // the LONGEST matching module path wins, so a module nested inside
-        // another's path resolves to its own directory rather than its parent's.
-        let Some(module) = owning_go_module(&imp.source, &modules) else {
-            continue;
-        };
-        let pkg_dir = go_package_dir(&imp.source, module);
-
-        for node in context.get_nodes_by_name_shared(member) {
-            if node.language != Language::Go || !node.is_exported {
-                continue;
-            }
-            let fp = node.file_path.replace('\\', "/");
-            let file_dir = match fp.rfind('/') {
-                Some(i) => &fp[..i],
-                None => "",
-            };
-            if file_dir == pkg_dir {
-                return Some(ResolvedRef {
-                    original: reference.clone(),
-                    target_node_id: node.id.clone(),
-                    confidence: 0.9,
-                    resolved_by: ResolvedBy::Import,
-                });
-            }
-        }
-    }
-    None
+/// The exported `member` of the project package `import` names, in the
+/// package's own directory (`pkga.FuncX` never lands on a `FuncX` of
+/// `pkga/subpkg/`; upstream `findGoPackageMember`). `None` when the import
+/// is no project package.
+fn find_go_package_member(
+    member: &str,
+    import: &ImportMapping,
+    reference: &RefView,
+    context: &dyn ResolutionContext,
+) -> Option<ResolvedRef> {
+    let pkg_dir = crate::go_packages::go_import_package_dir(
+        &import.source,
+        Some(&reference.file_path),
+        context,
+    )?;
+    context
+        .get_nodes_by_name_shared(member)
+        .into_iter()
+        .find(|node| {
+            node.language == Language::Go
+                && node.is_exported
+                && crate::go_packages::package_dir_of(&node.file_path) == pkg_dir
+        })
+        .map(|node| ResolvedRef {
+            original: reference.clone(),
+            target_node_id: node.id.clone(),
+            confidence: 0.9,
+            resolved_by: ResolvedBy::Import,
+        })
 }
 
 #[derive(Default)]
@@ -2417,28 +3226,20 @@ fn lookup_python_module_member(
         };
     }
 
-    let mut targets = context
-        .get_nodes_in_file_shared(resolved_path)
-        .into_iter()
-        .filter(|n| {
-            n.name == member
-                && matches!(
-                    n.kind,
-                    NodeKind::Function | NodeKind::Class | NodeKind::Variable | NodeKind::Constant
-                )
-        });
-    let Some(target) = targets.next() else {
+    // The module's own top-level definition, which must be unique, or one
+    // it re-exports (a package's `__init__.py`, upstream #2248).
+    let own = python_top_level_symbols(resolved_path, member, context);
+    let target = match own.as_slice() {
+        [target] => Some(Arc::clone(target)),
+        [] => python_module_symbol(resolved_path, member, context),
+        _ => None,
+    };
+    let Some(target) = target else {
         return PythonModuleMemberLookup {
             claimed: true,
             resolved: None,
         };
     };
-    if targets.next().is_some() {
-        return PythonModuleMemberLookup {
-            claimed: true,
-            resolved: None,
-        };
-    }
 
     PythonModuleMemberLookup {
         claimed: true,
@@ -2579,6 +3380,221 @@ fn resolve_python_absolute_module(
         confidence: 0.9,
         resolved_by: ResolvedBy::Import,
     })
+}
+
+/// How many modules deep a Python re-export walk goes (upstream #2247).
+const PYTHON_REEXPORT_DEPTH: usize = 3;
+
+/// The top-level classes, functions and values named `name` in the Python
+/// module `file`, in source order.
+fn python_top_level_symbols(
+    file: &str,
+    name: &str,
+    context: &dyn ResolutionContext,
+) -> Vec<Arc<Node>> {
+    let mut symbols: Vec<Arc<Node>> = context
+        .get_nodes_in_file_shared(file)
+        .into_iter()
+        .filter(|node| {
+            node.name == name
+                && !node.qualified_name.contains("::")
+                && matches!(
+                    node.kind,
+                    NodeKind::Class | NodeKind::Function | NodeKind::Variable | NodeKind::Constant
+                )
+        })
+        .collect();
+    symbols.sort_by(|a, b| {
+        (a.start_line, a.start_column, &a.id).cmp(&(b.start_line, b.start_column, &b.id))
+    });
+    symbols
+}
+
+/// The definition the Python module `file` offers as `name` (upstream #2247
+/// `pythonModuleSymbol`): its own top-level class, function or value, else
+/// the one it re-exports by name (`from .tokens import Token`) or through a
+/// star import (`from .users import *`), three modules deep.
+///
+/// Where upstream takes the first hit, this fails closed: two imports
+/// rebinding the name (`try: from .fast import Parser` / `except
+/// ImportError: from .slow import Parser`), or star-imported modules
+/// offering different definitions, leave it unresolved. Each `(module, name,
+/// depth)` answer is memoised for the pass; the walk is a function of the
+/// files alone, so the order in which references ask cannot change it.
+pub(crate) fn python_module_symbol(
+    file: &str,
+    name: &str,
+    context: &dyn ResolutionContext,
+) -> Option<Arc<Node>> {
+    python_module_symbol_at(file, name, context, 0)
+}
+
+fn python_module_symbol_at(
+    file: &str,
+    name: &str,
+    context: &dyn ResolutionContext,
+    depth: usize,
+) -> Option<Arc<Node>> {
+    let compute = || python_module_symbol_uncached(file, name, context, depth);
+    let id = match context.source_facts(file) {
+        Some(facts) => facts.python_module_symbol(name, depth, compute),
+        None => compute(),
+    }?;
+    context.get_node_by_id_shared(&id)
+}
+
+fn python_module_symbol_uncached(
+    file: &str,
+    name: &str,
+    context: &dyn ResolutionContext,
+    depth: usize,
+) -> Option<String> {
+    if let Some(own) = python_top_level_symbols(file, name, context).first() {
+        return Some(own.id.clone());
+    }
+    if depth >= PYTHON_REEXPORT_DEPTH {
+        return None;
+    }
+    let follow = |source: &str, exported: &str| {
+        let target = python_import_target(source, file, context)?;
+        python_module_symbol_at(&target, exported, context, depth + 1)
+    };
+    let named: Vec<ImportMapping> = context
+        .get_import_mappings(file, Language::Python)
+        .into_iter()
+        .filter(|imp| !imp.is_namespace && imp.local_name == name)
+        .collect();
+    match named.as_slice() {
+        [] => {}
+        [imp] => {
+            if let Some(node) = follow(&imp.source, &imp.exported_name) {
+                return Some(node.id.clone());
+            }
+        }
+        _ => return None,
+    }
+    // A star import is not among the import mappings: read it here.
+    let mut found: Option<Arc<Node>> = None;
+    for source in python_star_imports(file, context) {
+        let Some(node) = follow(&source, name) else {
+            continue;
+        };
+        if found.as_ref().is_some_and(|seen| seen.id != node.id) {
+            return None;
+        }
+        found = Some(node);
+    }
+    found.map(|node| node.id.clone())
+}
+
+/// The file a Python import of `source` in `file` names, other than `file`.
+fn python_import_target(
+    source: &str,
+    file: &str,
+    context: &dyn ResolutionContext,
+) -> Option<String> {
+    resolve_import_path(source, file, Language::Python, context)
+        .or_else(|| find_python_module_file(source, context, file))
+        .filter(|target| target != file)
+}
+
+/// The modules Python `code` star-imports (`from .users import *`), in
+/// source order.
+fn python_star_modules(code: &str) -> Vec<String> {
+    static STAR: OnceLock<Regex> = OnceLock::new();
+    let star = STAR.get_or_init(|| {
+        Regex::new(r"(?m)^\s*from\s+([\w.]+)\s+import\s+\*").expect("python star import")
+    });
+    star.captures_iter(code)
+        .filter_map(|captures| captures.get(1))
+        .map(|module| module.as_str().to_string())
+        .collect()
+}
+
+/// The modules `file` star-imports, read from its code (comments and
+/// docstrings blanked).
+fn python_star_imports(file: &str, context: &dyn ResolutionContext) -> Vec<String> {
+    context
+        .source_facts(file)
+        .map(|facts| python_star_modules(facts.python_comment_free().0))
+        .unwrap_or_default()
+}
+
+/// The names a Python import statement of `file` can re-export to the files
+/// that import `file`, as [`python_module_symbol`] reads them: what a `from
+/// … import a, b as c` binds, and for `from m import *` every name module
+/// `m` offers, its own top-level definitions and what it re-exports in turn,
+/// as deep as the walk looks. Sync touches these when the statement comes or
+/// goes, since an importer's name then moves without any node of that name
+/// changing.
+pub fn python_reexported_names(
+    file: &str,
+    statement: &str,
+    context: &dyn ResolutionContext,
+) -> BTreeSet<String> {
+    let mut names: BTreeSet<String> = extract_import_mappings(statement, Language::Python)
+        .into_iter()
+        .filter(|mapping| !mapping.is_namespace)
+        .map(|mapping| mapping.local_name)
+        .collect();
+    let code = crate::strip_comments::strip_comments_for_regex(
+        statement,
+        crate::strip_comments::CommentLang::Python,
+    );
+    let mut seen = std::collections::HashMap::new();
+    for module in python_star_modules(&code) {
+        if let Some(target) = python_import_target(&module, file, context) {
+            python_offered_names(&target, 1, context, &mut names, &mut seen);
+        }
+    }
+    names
+}
+
+/// Every name the walk can find in the Python module `file` when it arrives
+/// there `depth` modules deep.
+fn python_offered_names(
+    file: &str,
+    depth: usize,
+    context: &dyn ResolutionContext,
+    names: &mut BTreeSet<String>,
+    seen: &mut std::collections::HashMap<String, usize>,
+) {
+    // A module already read at this depth or shallower offered all of this.
+    if seen.get(file).is_some_and(|&at| at <= depth) {
+        return;
+    }
+    seen.insert(file.to_string(), depth);
+    names.extend(
+        context
+            .get_nodes_in_file_shared(file)
+            .into_iter()
+            .filter(|node| {
+                !node.qualified_name.contains("::")
+                    && matches!(
+                        node.kind,
+                        NodeKind::Class
+                            | NodeKind::Function
+                            | NodeKind::Variable
+                            | NodeKind::Constant
+                    )
+            })
+            .map(|node| node.name.clone()),
+    );
+    if depth >= PYTHON_REEXPORT_DEPTH {
+        return;
+    }
+    names.extend(
+        context
+            .get_import_mappings(file, Language::Python)
+            .into_iter()
+            .filter(|mapping| !mapping.is_namespace)
+            .map(|mapping| mapping.local_name),
+    );
+    for module in python_star_imports(file, context) {
+        if let Some(target) = python_import_target(&module, file, context) {
+            python_offered_names(&target, depth + 1, context, names, seen);
+        }
+    }
 }
 
 /// Find a Python module file by its absolute dotted path (`a.b.c` →
@@ -2771,7 +3787,7 @@ fn resolve_rust_module_file(
 
 /// Lua / Luau `require("a.b.c")` dotted module path → module file. Ports
 /// `resolveLuaRequire`.
-fn resolve_lua_require(
+pub(crate) fn resolve_lua_require(
     reference: &RefView,
     context: &dyn ResolutionContext,
 ) -> Option<ResolvedRef> {
@@ -2790,16 +3806,14 @@ fn resolve_lua_require(
         format!("{base}/init.lua"),
         format!("{base}/init.luau"),
     ];
-    let files = context.get_all_files_shared();
     let shared = |a: &str, b: &str| -> usize {
         a.bytes().zip(b.bytes()).take_while(|(x, y)| x == y).count()
     };
     for suffix in &suffixes {
-        let mut matches: Vec<String> = files
-            .iter()
-            .filter(|f| *f == suffix || f.ends_with(&format!("/{suffix}")))
-            .cloned()
-            .collect();
+        // The files the suffix names, read once per pass (W5-09).
+        let mut matches: Vec<String> = crate::lua_scope::lua_require_matches(suffix, context)
+            .as_ref()
+            .clone();
         if matches.is_empty() {
             continue;
         }
@@ -2828,7 +3842,7 @@ fn resolve_lua_require(
 mod tests {
     use super::*;
     use crate::path_aliases::{AliasMap, AliasPattern};
-    use crate::types::{ImportMapping, ReExport, RefView, ResolutionContext};
+    use crate::types::{GoModule, ImportMapping, ReExport, RefView, ResolutionContext};
     use crate::workspace_packages::WorkspacePackages;
     use codegraph_core::types::{EdgeKind, Language, Node, NodeKind};
     use std::collections::{BTreeMap, BTreeSet};
@@ -2848,6 +3862,8 @@ mod tests {
         workspace_packages: Option<WorkspacePackages>,
         go_module: Option<GoModule>,
         cpp_include_dirs: Vec<String>,
+        /// Files on disk that the index does not hold (a `node_modules` file).
+        disk_only_files: BTreeSet<String>,
     }
 
     impl ResolutionContext for TestContext {
@@ -2880,7 +3896,7 @@ mod tests {
                 .collect()
         }
         fn file_exists(&self, file_path: &str) -> bool {
-            self.existing_files.contains(file_path)
+            self.existing_files.contains(file_path) || self.disk_only_files.contains(file_path)
         }
         fn read_file(&self, file_path: &str) -> Option<String> {
             self.file_contents.get(file_path).cloned()
@@ -3197,6 +4213,95 @@ mod tests {
         }
     }
 
+    fn alias(prefix: &str, has_wildcard: bool, replacement: &str) -> AliasPattern {
+        AliasPattern {
+            prefix: prefix.to_string(),
+            suffix: String::new(),
+            has_wildcard,
+            replacements: vec![replacement.to_string()],
+        }
+    }
+
+    /// Upstream #2437: a catch-all `"*"` alias has an empty prefix, which every
+    /// package specifier starts with, so matching it proves nothing. A binding
+    /// is local only when an alias maps it to an indexed file.
+    #[test]
+    fn catch_all_alias_never_makes_a_package_binding_local() {
+        let mut ctx = TestContext {
+            project_root: "/proj".to_string(),
+            project_aliases: Some(AliasMap {
+                base_url: "/proj".to_string(),
+                // In the loader's specificity order: longest prefix first.
+                patterns: vec![
+                    alias("@lib/", true, "lib/*"),
+                    alias("", true, "./typings/*"),
+                ],
+            }),
+            ..Default::default()
+        };
+        ctx.existing_files.insert("lib/thing.ts".to_string());
+        ctx.import_mappings.insert(
+            "src/App.tsx".to_string(),
+            vec![
+                mapping("Typography", "Typography", "@mui/material"),
+                mapping("Thing", "Thing", "@lib/thing"),
+            ],
+        );
+        let package = reference(
+            "Typography",
+            EdgeKind::Imports,
+            "src/App.tsx",
+            Language::Tsx,
+        );
+        assert!(
+            is_bound_to_out_of_repo_module(&package, &ctx),
+            "a catch-all alias must not make `@mui/material` local"
+        );
+        let aliased = reference("Thing", EdgeKind::Imports, "src/App.tsx", Language::Tsx);
+        assert!(
+            !is_bound_to_out_of_repo_module(&aliased, &ctx),
+            "an alias that maps the import to an indexed file keeps it local"
+        );
+        // Resolving an import still honors the catch-all's empty prefix.
+        assert!(!is_external_import("@mui/material", Language::Tsx, &ctx));
+    }
+
+    /// Upstream #2437: an alias that lands on a file outside the index, such as
+    /// one under `node_modules`, does not make the binding the project's.
+    #[test]
+    fn alias_onto_a_file_outside_the_index_is_out_of_repo() {
+        let mut ctx = TestContext {
+            project_root: "/proj".to_string(),
+            project_aliases: Some(AliasMap {
+                base_url: "/proj".to_string(),
+                patterns: vec![alias("lit/format", false, "./node_modules/lit/format.js")],
+            }),
+            ..Default::default()
+        };
+        ctx.disk_only_files
+            .insert("node_modules/lit/format.js".to_string());
+        ctx.import_mappings.insert(
+            "src/card.ts".to_string(),
+            vec![mapping("format", "format", "lit/format")],
+        );
+        let r = reference(
+            "format",
+            EdgeKind::Imports,
+            "src/card.ts",
+            Language::TypeScript,
+        );
+        assert!(
+            is_bound_to_out_of_repo_module(&r, &ctx),
+            "an alias into node_modules is out of the repository"
+        );
+
+        // The same alias onto a file the index holds is the project's.
+        ctx.disk_only_files.clear();
+        ctx.existing_files
+            .insert("node_modules/lit/format.js".to_string());
+        assert!(!is_bound_to_out_of_repo_module(&r, &ctx));
+    }
+
     #[test]
     fn extension_resolution_covers_all_language_arms() {
         assert!(extension_resolution(Language::TypeScript).contains(&".ts"));
@@ -3241,10 +4346,14 @@ mod tests {
     #[test]
     fn parse_colon_alias_extracts_orig_and_alias() {
         assert_eq!(
-            parse_colon_alias("foo: bar"),
+            parse_js_colon_alias("foo: bar"),
             Some(("foo".to_string(), "bar".to_string()))
         );
-        assert_eq!(parse_colon_alias("foo"), None);
+        assert_eq!(parse_js_colon_alias("foo"), None);
+        assert_eq!(
+            parse_js_colon_alias("$el: $root"),
+            Some(("$el".to_string(), "$root".to_string()))
+        );
     }
 
     #[test]
@@ -3276,6 +4385,224 @@ import * as ns from './baz';
             m.iter()
                 .any(|x| x.local_name == "ns" && x.exported_name == "*" && x.is_namespace)
         );
+    }
+
+    /// `local<exported` (` ns` for a namespace), the shape of upstream
+    /// #2134's `import-type-modifier.test.ts`.
+    fn js_bindings(source: &str) -> Vec<String> {
+        extract_import_mappings(source, Language::TypeScript)
+            .into_iter()
+            .map(|m| {
+                format!(
+                    "{}<{}{}",
+                    m.local_name,
+                    m.exported_name,
+                    if m.is_namespace { " ns" } else { "" }
+                )
+            })
+            .collect()
+    }
+
+    /// Upstream #2134: a type-only import binds its names, never `type`.
+    #[test]
+    fn a_type_only_import_binds_its_names_never_type() {
+        assert_eq!(
+            js_bindings("import type { enumUtil } from './helpers/enumUtil.js';\n"),
+            ["enumUtil<enumUtil"]
+        );
+        assert_eq!(js_bindings("import type * as z from './z';\n"), ["z<* ns"]);
+        assert_eq!(
+            js_bindings("import type Foo from './foo';\n"),
+            ["Foo<default"]
+        );
+    }
+
+    /// Upstream #2134: an inline `type` modifier is not part of the name, and
+    /// a default import that is named `type` is still one.
+    #[test]
+    fn an_inline_type_modifier_is_not_part_of_the_name() {
+        assert_eq!(
+            js_bindings("import { util, type objectUtil } from './helpers/util.js';\n"),
+            ["util<util", "objectUtil<objectUtil"]
+        );
+        assert_eq!(
+            js_bindings("import { type A as B } from './ab';\n"),
+            ["B<A"]
+        );
+        assert_eq!(
+            js_bindings("import type from './type';\n"),
+            ["type<default"]
+        );
+    }
+
+    fn mapping_strings(content: &str) -> Vec<String> {
+        extract_js_imports(content)
+            .into_iter()
+            .map(|m| {
+                format!(
+                    "{}<{}{}{}",
+                    m.local_name,
+                    m.exported_name,
+                    if m.is_default { " default" } else { "" },
+                    if m.is_namespace { " ns" } else { "" }
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn import_default_as_is_the_default_import() {
+        assert_eq!(
+            mapping_strings(
+                "import {\n  default as AppRoot,\n  ErrorBoundary as AppRootErrorBoundary,\n} from './routes/app/root';\n"
+            ),
+            [
+                "AppRoot<default default",
+                "AppRootErrorBoundary<ErrorBoundary"
+            ]
+        );
+        assert_eq!(
+            mapping_strings("import { default as Settings } from './settings';\n"),
+            ["Settings<default default"]
+        );
+        assert_eq!(
+            mapping_strings("import type { default as Config } from './config';\n"),
+            ["Config<default default"]
+        );
+        assert_eq!(
+            mapping_strings("import { type default as Config } from './config';\n"),
+            ["Config<default default"]
+        );
+        assert_eq!(
+            mapping_strings("import Main, { default as Again, helper } from './main';\n"),
+            [
+                "Main<default default",
+                "Again<default default",
+                "helper<helper"
+            ]
+        );
+        assert_eq!(
+            mapping_strings("import { defaults as d, defaultTheme as theme } from './theme';\n"),
+            ["d<defaults", "theme<defaultTheme"]
+        );
+    }
+
+    #[test]
+    fn dollar_identifiers_are_import_bindings() {
+        assert_eq!(
+            mapping_strings("import items$ from './store';\n"),
+            ["items$<default default"]
+        );
+        assert_eq!(
+            mapping_strings("import $ from './dom';\n"),
+            ["$<default default"]
+        );
+        assert_eq!(
+            mapping_strings("import * as ns$ from './ns';\n"),
+            ["ns$<* ns"]
+        );
+        assert_eq!(
+            mapping_strings("import { a as b$, default as items$ } from './x';\n"),
+            ["b$<a", "items$<default default"]
+        );
+        assert_eq!(
+            mapping_strings("import type $T from './t';\n"),
+            ["$T<default default"]
+        );
+        // A code generator's template literal is no import.
+        assert!(mapping_strings("const code = `import ${name} from '${src}'`;\n").is_empty());
+        assert_eq!(
+            extract_re_exports(
+                "export { a$ } from './a';\nexport { b as c$ } from './b';\n",
+                Language::TypeScript
+            )
+            .into_iter()
+            .filter_map(|rex| match rex {
+                ReExport::Named {
+                    exported_name,
+                    original_name,
+                    ..
+                } => {
+                    Some(format!("{exported_name}<{original_name}"))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>(),
+            ["a$<a$", "c$<b"]
+        );
+    }
+
+    #[test]
+    fn a_namespace_reexport_is_its_own_kind() {
+        let reexports = extract_re_exports(
+            "export * as core from './core';\nexport * from './schemas';\n",
+            Language::TypeScript,
+        );
+        assert!(reexports.iter().any(|rex| matches!(
+            rex,
+            ReExport::Namespace { exported_name, source } if exported_name == "core" && source == "./core"
+        )));
+        assert!(reexports.iter().any(|rex| matches!(
+            rex,
+            ReExport::Wildcard { source } if source == "./schemas"
+        )));
+        assert_eq!(reexports.len(), 2);
+    }
+
+    #[test]
+    fn extract_js_imports_reads_require_lists_and_members() {
+        let content = "var express = require('../')\n  , request = require('supertest');\nvar setCharset = require('./utils').setCharset;\nconst { default: Service, $el: el } = require('./service');\n";
+        let mappings = extract_js_imports(content);
+        let find = |local: &str| {
+            mappings
+                .iter()
+                .find(|m| m.local_name == local)
+                .unwrap_or_else(|| panic!("{local}: {mappings:?}"))
+        };
+        assert!(find("express").is_default && find("express").source == "../");
+        assert!(find("request").is_default && find("request").source == "supertest");
+        let member = find("setCharset");
+        assert!(!member.is_default);
+        assert_eq!(member.exported_name, "setCharset");
+        assert_eq!(find("Service").exported_name, "default");
+        assert_eq!(find("el").exported_name, "$el");
+    }
+
+    #[test]
+    fn extract_re_exports_reads_commonjs_export_aliases() {
+        let content = "exports.setCharset = function setCharset(type) { return type; };\nmodule.exports.alias = impl;\nexports.default = formatDate;\nmodule.exports = { parse, format: formatDate };\n";
+        let aliases: Vec<(String, String)> = extract_re_exports(content, Language::JavaScript)
+            .into_iter()
+            .filter_map(|rex| match rex {
+                ReExport::CommonJsAlias {
+                    exported_name,
+                    original_name,
+                } => Some((exported_name, original_name)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            aliases,
+            [
+                ("setCharset".to_string(), "setCharset".to_string()),
+                ("alias".to_string(), "impl".to_string()),
+                ("default".to_string(), "formatDate".to_string()),
+                ("parse".to_string(), "parse".to_string()),
+                ("format".to_string(), "formatDate".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn js_family_files_carry_js_or_ts_extensions() {
+        for file in [
+            "a.js", "a.cjs", "a.mjs", "a.jsx", "a.ts", "a.mts", "a.cts", "a.tsx",
+        ] {
+            assert!(is_js_family_file(file), "{file}");
+        }
+        for file in ["a.vue", "a.svelte", "a.json", "a", "a.py"] {
+            assert!(!is_js_family_file(file), "{file}");
+        }
     }
 
     #[test]
@@ -3322,6 +4649,119 @@ const { x, y: z } = require('./other');
         );
     }
 
+    /// Upstream #2291's case: a parenthesized from-import binds every name
+    /// it lists, a comment in it holds none, and a docstring imports nothing.
+    #[test]
+    fn extract_python_imports_reads_parenthesized_lists_over_code_only() {
+        let content = "\nfrom store.base import (\n    Base,\n    helper as h,  # a comment, with a comma and a call()\n)\n\"\"\"\nfrom docstring import NotAnImport\n\"\"\"\nfrom store.rows import (Row, Col)\n";
+        let mappings = extract_import_mappings(content, Language::Python);
+        let found: Vec<(&str, &str, &str)> = mappings
+            .iter()
+            .map(|m| {
+                (
+                    m.local_name.as_str(),
+                    m.exported_name.as_str(),
+                    m.source.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            found,
+            [
+                ("Base", "Base", "store.base"),
+                ("h", "helper", "store.base"),
+                ("Row", "Row", "store.rows"),
+                ("Col", "Col", "store.rows"),
+            ]
+        );
+    }
+
+    /// `name <- path` of every Go import mapping of `source`, sorted.
+    fn go_import_names(source: &str) -> Vec<String> {
+        let mut names: Vec<String> = extract_import_mappings(source, Language::Go)
+            .iter()
+            .map(|m| format!("{} <- {}", m.local_name, m.source))
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// Upstream #2410: an unaliased versioned or `go-` import is bound to its
+    /// package's name as well as its last element.
+    #[test]
+    fn a_go_import_takes_the_name_goimports_assumes() {
+        assert_eq!(
+            go_import_names(
+                "package p\nimport (\n\t\"go.yaml.in/yaml/v3\"\n\t\"github.com/mattn/go-sqlite3\"\n\t\"k8s.io/api/core/v1\"\n\t\"github.com/gin-gonic/gin\"\n\t\"gopkg.in/natefinch/lumberjack.v2\"\n)\n"
+            ),
+            [
+                "core <- k8s.io/api/core/v1",
+                "gin <- github.com/gin-gonic/gin",
+                "go-sqlite3 <- github.com/mattn/go-sqlite3",
+                "lumberjack <- gopkg.in/natefinch/lumberjack.v2",
+                "lumberjack.v2 <- gopkg.in/natefinch/lumberjack.v2",
+                "sqlite3 <- github.com/mattn/go-sqlite3",
+                "v1 <- k8s.io/api/core/v1",
+                "v3 <- go.yaml.in/yaml/v3",
+                "yaml <- go.yaml.in/yaml/v3",
+            ]
+        );
+        assert_eq!(
+            go_import_names("package p\n\nimport \"gopkg.in/yaml.v3\"\n"),
+            ["yaml <- gopkg.in/yaml.v3", "yaml.v3 <- gopkg.in/yaml.v3"]
+        );
+    }
+
+    /// Upstream #2410: no assumed name another import holds, or two assume.
+    #[test]
+    fn a_go_import_takes_no_assumed_name_another_holds_or_two_assume() {
+        assert_eq!(
+            go_import_names(
+                "package p\nimport (\n\t\"k8s.io/api/core/v1\"\n\t\"k8s.io/kubernetes/pkg/apis/core\"\n\tyaml \"sigs.k8s.io/yaml\"\n\t\"go.yaml.in/yaml/v3\"\n\t\"github.com/a/semver/v3\"\n\t\"github.com/b/go-semver\"\n)\n"
+            ),
+            [
+                "core <- k8s.io/kubernetes/pkg/apis/core",
+                "go-semver <- github.com/b/go-semver",
+                "v1 <- k8s.io/api/core/v1",
+                "v3 <- github.com/a/semver/v3",
+                "v3 <- go.yaml.in/yaml/v3",
+                "yaml <- sigs.k8s.io/yaml",
+            ]
+        );
+    }
+
+    /// Upstream #2410: a written name is kept, a dot import assumes none, and
+    /// a comment names nothing.
+    #[test]
+    fn a_go_import_keeps_a_written_name_and_reads_none_from_a_comment() {
+        assert_eq!(
+            go_import_names(
+                "package p\nimport (\n\t\"fmt\" // for printing\n\tmetav1 \"k8s.io/apimachinery/pkg/apis/meta/v1\"\n\t_ \"embed\"\n\t. \"github.com/onsi/ginkgo/v2\"\n\t// yaml decoding\n\t\"gopkg.in/yaml.v3\"\n\t/* the store */ \"example.com/app/store\"\n)\nfunc run() {}\n"
+            ),
+            [
+                "_ <- embed",
+                "fmt <- fmt",
+                "metav1 <- k8s.io/apimachinery/pkg/apis/meta/v1",
+                "store <- example.com/app/store",
+                "v2 <- github.com/onsi/ginkgo/v2",
+                "yaml <- gopkg.in/yaml.v3",
+                "yaml.v3 <- gopkg.in/yaml.v3",
+            ]
+        );
+    }
+
+    /// Upstream #2410: only the import declarations, wherever a comment or a
+    /// later string spells one.
+    #[test]
+    fn a_go_file_reads_only_its_import_declarations() {
+        assert_eq!(
+            go_import_names(
+                "/*\nPackage p is a code generator.\nfunc Example() {}\n*/\npackage p\n// import \"example.com/commented\"\nimport (\n\t\"text/template\" // (for the body below)\n\t\"strings\"\n)\nfunc run() string {\n\treturn strings.TrimSpace(`\nimport \"example.com/generated\"\n`)\n}\n"
+            ),
+            ["strings <- strings", "template <- text/template"]
+        );
+    }
+
     #[test]
     fn extract_go_imports_single_and_block_with_alias() {
         let single = r#"import "fmt""#;
@@ -3356,6 +4796,21 @@ const { x, y: z } = require('./other');
         );
     }
 
+    /// Upstream #2196: Kotlin imports carry no `;`, and `as` renames one.
+    #[test]
+    fn extract_kotlin_imports_without_semicolons_and_with_aliases() {
+        let content = "package app\n\nimport java.lang.reflect.Field\nimport app.model.Outer.Inner as Made // the builder\nimport okio.*\n/* import gone.Thing */\n";
+        let m = extract_import_mappings(content, Language::Kotlin);
+        assert!(m.iter().any(|x| x.local_name == "Field"
+            && x.exported_name == "Field"
+            && x.source == "java.lang.reflect.Field"));
+        assert!(m.iter().any(|x| x.local_name == "Made"
+            && x.exported_name == "Inner"
+            && x.source == "app.model.Outer.Inner"));
+        assert!(!m.iter().any(|x| x.source.ends_with(".*")));
+        assert!(!m.iter().any(|x| x.local_name == "Thing"));
+    }
+
     #[test]
     fn extract_php_imports_use_and_alias() {
         let content = "use App\\Models\\User;\nuse App\\Service as Svc;\n";
@@ -3381,6 +4836,99 @@ const { x, y: z } = require('./other');
             m.iter()
                 .any(|x| x.local_name == "bar" && x.source == "foo/bar.hpp")
         );
+    }
+
+    /// The character-by-character scan `strip_js_comments` replaced (W10-08),
+    /// kept as the oracle for its byte scan.
+    fn strip_js_comments_by_chars(content: &str) -> String {
+        let chars: Vec<char> = content.chars().collect();
+        let n = chars.len();
+        let mut out = String::with_capacity(content.len());
+        let mut i = 0;
+        let mut str_ch: Option<char> = None;
+        while i < n {
+            let ch = chars[i];
+            if let Some(quote) = str_ch {
+                out.push(ch);
+                if ch == '\\' && i + 1 < n {
+                    out.push(chars[i + 1]);
+                    i += 2;
+                    continue;
+                }
+                if ch == quote {
+                    str_ch = None;
+                }
+                i += 1;
+                continue;
+            }
+            if ch == '"' || ch == '\'' || ch == '`' {
+                str_ch = Some(ch);
+                out.push(ch);
+                i += 1;
+                continue;
+            }
+            if ch == '/' && chars.get(i + 1).copied() == Some('/') {
+                while i < n && chars[i] != '\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            if ch == '/' && chars.get(i + 1).copied() == Some('*') {
+                i += 2;
+                while i < n && !(chars[i] == '*' && chars.get(i + 1).copied() == Some('/')) {
+                    i += 1;
+                }
+                i += 2;
+                continue;
+            }
+            out.push(ch);
+            i += 1;
+        }
+        out
+    }
+
+    #[test]
+    fn strip_js_comments_matches_the_character_scan() {
+        let cases = [
+            "const a = 'é'; // ünïcödé comment\nconst b = \"日本\"; /* 块注释 🦀 */ const c = `🦀${x}`;",
+            "const s = \"\\é\"; const t = '\\🦀'; const u = `\\日`;",
+            "\"unterminated é",
+            "/* unterminated 日本",
+            "x // no newline at the end é",
+            "'\\",
+            "a / b / c; const re = /é+/; d */ e",
+            "const u = 'a // b'; const v = \"c /* d */\"; const w = `e // f`;",
+            "/**/ /*/ x */ /* * / */ // \r\nnext\r\n",
+            "",
+        ];
+        for case in cases {
+            assert_eq!(
+                strip_js_comments(case),
+                strip_js_comments_by_chars(case),
+                "{case:?}"
+            );
+        }
+        let alphabet = [
+            'a', ' ', '/', '*', '\'', '"', '`', '\\', '\n', 'é', '日', '🦀',
+        ];
+        // Every text of at most four of these characters.
+        let mut texts = vec![String::new()];
+        let mut level = vec![String::new()];
+        for _ in 0..4 {
+            level = level
+                .iter()
+                .flat_map(|text| alphabet.iter().map(move |c| format!("{text}{c}")))
+                .collect();
+            texts.extend(level.iter().cloned());
+        }
+        assert_eq!(texts.len(), 1 + 12 + 144 + 1728 + 20736);
+        for text in &texts {
+            assert_eq!(
+                strip_js_comments(text),
+                strip_js_comments_by_chars(text),
+                "{text:?}"
+            );
+        }
     }
 
     #[test]
@@ -3416,8 +4964,13 @@ export { } from './empty';
             out.iter()
                 .any(|r| matches!(r, ReExport::Wildcard { source } if source == "./all"))
         );
+        // `export * as ns` exports the namespace alone (upstream #2192).
+        assert!(out.iter().any(|r| matches!(
+            r,
+            ReExport::Namespace { exported_name, source } if exported_name == "ns" && source == "./ns"
+        )));
         assert!(
-            out.iter()
+            !out.iter()
                 .any(|r| matches!(r, ReExport::Wildcard { source } if source == "./ns"))
         );
         assert!(out.iter().any(|r| matches!(
@@ -3478,6 +5031,49 @@ export const memberAlias = namespace.target;
                 if ["mutableLetAlias", "mutableVarAlias", "callAlias", "memberAlias"]
                     .contains(&exported_name.as_str())
         )));
+    }
+
+    #[test]
+    fn extract_re_exports_reads_dollar_and_unicode_identifiers_in_local_aliases() {
+        let content = "const $fmt = () => 1;\nexport default $fmt;\nfunction make$() {}\nexport const $make = make$;\nexport const café = naïve;\n";
+        let out = extract_re_exports(content, Language::TypeScript);
+        let aliases: Vec<(&str, &str)> = out
+            .iter()
+            .filter_map(|r| match r {
+                ReExport::LocalAlias {
+                    exported_name,
+                    original_name,
+                } => Some((exported_name.as_str(), original_name.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            aliases,
+            [("$make", "make$"), ("café", "naïve"), ("default", "$fmt")]
+        );
+        let trailing = extract_re_exports(
+            "const items$ = {};\nexport default items$;\n",
+            Language::JavaScript,
+        );
+        assert_eq!(
+            trailing,
+            [ReExport::LocalAlias {
+                exported_name: "default".to_string(),
+                original_name: "items$".to_string(),
+            }]
+        );
+        // A default that is no identifier binds nothing new: `42` and a call.
+        let none = extract_re_exports(
+            "export default 42;\nexport default make$();\n",
+            Language::JavaScript,
+        );
+        assert!(
+            none.iter().all(|r| !matches!(
+                r,
+                ReExport::LocalAlias { original_name, .. } if original_name.starts_with("make")
+            )),
+            "{none:?}"
+        );
     }
 
     #[test]
@@ -4537,49 +6133,6 @@ export default defaultTarget;
         let r = reference("pkga.FuncX", EdgeKind::Calls, "main.go", Language::Go);
         let resolved = resolve_via_import(&r, &ctx).expect("resolves");
         assert_eq!(resolved.target_node_id, "function:FuncX");
-    }
-
-    fn go_mod(module_path: &str, dir: &str) -> crate::types::GoModule {
-        crate::types::GoModule {
-            module_path: module_path.to_string(),
-            dir: dir.to_string(),
-        }
-    }
-
-    #[test]
-    fn owning_go_module_prefers_the_longest_matching_module_path() {
-        let modules = vec![go_mod("ex/a", "a"), go_mod("ex/a/sub", "a/sub")];
-        assert_eq!(
-            owning_go_module("ex/a/sub/pkg", &modules).map(|m| m.dir.as_str()),
-            Some("a/sub"),
-            "the nested module must win over its prefix"
-        );
-        assert_eq!(
-            owning_go_module("ex/a/other", &modules).map(|m| m.dir.as_str()),
-            Some("a")
-        );
-        assert!(owning_go_module("github.com/x/y", &modules).is_none());
-    }
-
-    #[test]
-    fn owning_go_module_rejects_a_shared_path_prefix_that_is_not_a_segment() {
-        let modules = vec![go_mod("ex/a", "a")];
-        assert!(
-            owning_go_module("ex/abc", &modules).is_none(),
-            "`ex/abc` is a different module, not a package inside `ex/a`"
-        );
-    }
-
-    #[test]
-    fn go_package_dir_joins_module_dir_with_the_path_below_it() {
-        assert_eq!(go_package_dir("ex/a", &go_mod("ex/a", "a")), "a");
-        assert_eq!(go_package_dir("ex/a/pkg", &go_mod("ex/a", "a")), "a/pkg");
-        assert_eq!(go_package_dir("ex/m/pkg", &go_mod("ex/m", "")), "pkg");
-        assert_eq!(
-            go_package_dir("ex/m", &go_mod("ex/m", "")),
-            "",
-            "a root module's own package lives in the project root"
-        );
     }
 
     #[test]

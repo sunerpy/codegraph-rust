@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use codegraph_core::types::{
     Edge, EdgeKind, FileRecord, Language, Node, NodeKind, ReferenceSubkind, UnresolvedRef,
@@ -212,6 +212,41 @@ impl Store {
         )
     }
 
+    /// The functions and methods of `file_path`, by start line: the file's
+    /// rows of [`Self::nodes_by_file_path`] of those kinds (W5-08). The `+`
+    /// keeps the kind index out of the plan, so the file's own index walks
+    /// its rows, as it does for every node of the file.
+    pub fn callables_by_file_path(&self, file_path: &str) -> rusqlite::Result<Vec<Node>> {
+        query_nodes(
+            &self.conn,
+            "SELECT * FROM nodes WHERE file_path = ? AND +kind IN ('function', 'method') \
+             ORDER BY start_line",
+            [file_path],
+        )
+    }
+
+    /// The methods of `file_path` in the order [`Self::nodes_by_file_path`]
+    /// lists them: the same walk of the file's own index, the other rows
+    /// skipped (W5-08).
+    pub fn methods_by_file_path(&self, file_path: &str) -> rusqlite::Result<Vec<Node>> {
+        query_nodes(
+            &self.conn,
+            "SELECT * FROM nodes WHERE file_path = ? AND +kind = 'method' ORDER BY start_line",
+            [file_path],
+        )
+    }
+
+    /// Whether a function or method has the qualified name `qualified`
+    /// (W5-08): the qualified-name index's rows, none of them read.
+    pub fn has_callable_named(&self, qualified: &str) -> rusqlite::Result<bool> {
+        self.conn
+            .prepare_cached(
+                "SELECT EXISTS (SELECT 1 FROM nodes WHERE qualified_name = ?1 \
+                 AND +kind IN ('function', 'method'))",
+            )?
+            .query_row([qualified], |row| row.get(0))
+    }
+
     /// Count of nodes whose `file_path` matches, for the displayed file-level
     /// symbol total. Reads the live `nodes` table (which includes framework
     /// marker nodes added after the initial extractor), so it can exceed the
@@ -256,6 +291,25 @@ impl Store {
             &self.conn,
             "SELECT * FROM nodes WHERE qualified_name = ?",
             [qualified_name],
+        )
+    }
+
+    /// The nodes whose qualified name starts with `prefix` (`server::` for
+    /// the members of `server`), read as an index range so the
+    /// `qualified_name` index serves it.
+    pub fn nodes_with_qualified_prefix(&self, prefix: &str) -> rusqlite::Result<Vec<Node>> {
+        let mut upper = prefix.to_string();
+        match upper.pop() {
+            Some(last) => match char::from_u32(u32::from(last) + 1) {
+                Some(next) => upper.push(next),
+                None => return Ok(Vec::new()),
+            },
+            None => return Ok(Vec::new()),
+        }
+        query_nodes(
+            &self.conn,
+            "SELECT * FROM nodes WHERE qualified_name >= ?1 AND qualified_name < ?2 ORDER BY id",
+            [prefix, upper.as_str()],
         )
     }
 
@@ -809,6 +863,28 @@ impl Store {
         rows.collect()
     }
 
+    /// The paths of the files of `language`, in path order (W4-DART-03b: a
+    /// sync lane reading every Dart file's text needs no other column).
+    pub fn file_paths_of_language(&self, language: Language) -> rusqlite::Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT path FROM files WHERE language = ?1 ORDER BY path")?;
+        let rows = stmt.query_map([language.as_str()], |row| row.get(0))?;
+        rows.collect()
+    }
+
+    /// Files stored with no nodes or with recorded extraction errors: the only
+    /// rows that can be missing their symbols (upstream #2336's
+    /// `getFilesWithoutNodesOrWithErrors`). A healthy index has few, so this
+    /// stays cheap on a large one.
+    pub fn files_without_nodes_or_with_errors(&self) -> rusqlite::Result<Vec<FileRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT * FROM files WHERE node_count = 0 OR errors IS NOT NULL ORDER BY path",
+        )?;
+        let rows = stmt.query_map([], row_to_file)?;
+        rows.collect()
+    }
+
     /// Every node in the graph, ordered by id for a deterministic export.
     pub fn all_nodes(&self) -> rusqlite::Result<Vec<Node>> {
         query_nodes(&self.conn, "SELECT * FROM nodes ORDER BY id", [])
@@ -853,6 +929,15 @@ impl Store {
         rows.collect()
     }
 
+    /// Every unresolved reference of `kind`, in row order.
+    pub fn unresolved_refs_of_kind(&self, kind: EdgeKind) -> rusqlite::Result<Vec<UnresolvedRef>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT * FROM unresolved_refs WHERE reference_kind = ? ORDER BY id")?;
+        let rows = stmt.query_map([kind.as_str()], row_to_unresolved_ref)?;
+        rows.collect()
+    }
+
     /// Read one rowid-ordered batch of unresolved references with `id > after_id`.
     ///
     /// `id` is the rowid alias (`INTEGER PRIMARY KEY AUTOINCREMENT`), so
@@ -869,6 +954,29 @@ impl Store {
             .conn
             .prepare_cached("SELECT * FROM unresolved_refs WHERE id > ? ORDER BY id LIMIT ?")?;
         let rows = stmt.query_map(params![after_id, limit as i64], row_to_unresolved_ref)?;
+        rows.collect()
+    }
+
+    /// One rowid-ordered batch of the unresolved references with `id >
+    /// after_id` whose kind is one of `kinds` (`within`) or none of them.
+    pub fn unresolved_refs_batch_by_kinds(
+        &self,
+        after_id: i64,
+        limit: usize,
+        kinds: &[EdgeKind],
+        within: bool,
+    ) -> rusqlite::Result<Vec<UnresolvedRef>> {
+        let listed = kinds.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+        let sql = format!(
+            "SELECT * FROM unresolved_refs WHERE id > ? AND (reference_kind IN ({listed})) = ? \
+             ORDER BY id LIMIT ?"
+        );
+        let mut stmt = self.conn.prepare_cached(&sql)?;
+        let mut values: Vec<rusqlite::types::Value> = vec![after_id.into()];
+        values.extend(kinds.iter().map(|kind| kind.as_str().to_string().into()));
+        values.push(within.into());
+        values.push((limit as i64).into());
+        let rows = stmt.query_map(rusqlite::params_from_iter(values), row_to_unresolved_ref)?;
         rows.collect()
     }
 
@@ -893,18 +1001,82 @@ impl Store {
     /// Keying on the row id removes that whole class of loss, and with it the need
     /// for any `id <= max_id` batch guard: an id from batch N cannot name a row in
     /// batch N+1, so a per-batch caller is already precise.
+    ///
+    /// Each row moves whole into `resolved_refs`, keeping its id (schema 10,
+    /// W5-09e): with the rows still unresolved, they stay every reference of
+    /// the file's last extraction. The ids move a chunk at a time, one
+    /// statement each way (W5-09g); an id listed twice moves once, since its
+    /// first move deleted the row the second would select.
     pub fn delete_resolved_unresolved_refs(&mut self, row_ids: &[i64]) -> rusqlite::Result<()> {
         if row_ids.is_empty() {
             return Ok(());
         }
         let tx = self.conn.transaction()?;
-        {
-            let mut stmt = tx.prepare_cached("DELETE FROM unresolved_refs WHERE id = ?")?;
-            for row_id in row_ids {
-                stmt.execute(params![row_id])?;
-            }
+        for chunk in row_ids.chunks(SQLITE_PARAM_CHUNK_SIZE) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let params = chunk.iter().map(|id| id as &dyn ToSql).collect::<Vec<_>>();
+            tx.prepare_cached(&format!(
+                "INSERT OR IGNORE INTO resolved_refs ({UNRESOLVED_REF_COLUMNS}) \
+                 SELECT {UNRESOLVED_REF_COLUMNS} FROM unresolved_refs WHERE id IN ({placeholders})"
+            ))?
+            .execute(params.as_slice())?;
+            tx.prepare_cached(&format!(
+                "DELETE FROM unresolved_refs WHERE id IN ({placeholders})"
+            ))?
+            .execute(params.as_slice())?;
         }
         tx.commit()
+    }
+
+    /// [`Self::stored_refs_of_file`] at `sites` only: every stored reference
+    /// whose source and coordinate are one of them, by id and without it.
+    pub fn stored_refs_at_sites(
+        &self,
+        sites: &BTreeSet<ReferenceSite>,
+    ) -> rusqlite::Result<Vec<UnresolvedRef>> {
+        let mut stmt = self.conn.prepare_cached(&format!(
+            "SELECT {UNRESOLVED_REF_COLUMNS} FROM unresolved_refs \
+             WHERE from_node_id = ?1 AND line = ?2 AND col = ?3 \
+             UNION ALL SELECT {UNRESOLVED_REF_COLUMNS} FROM resolved_refs \
+             WHERE from_node_id = ?1 AND line = ?2 AND col = ?3"
+        ))?;
+        let mut out = Vec::new();
+        for site in sites {
+            for reference in stmt.query_map(
+                params![site.from_node_id, site.line, site.col],
+                row_to_unresolved_ref,
+            )? {
+                out.push(reference?);
+            }
+        }
+        out.sort_by_key(|reference| reference.id);
+        for reference in &mut out {
+            reference.id = None;
+        }
+        Ok(out)
+    }
+
+    /// Every reference of `file_path`'s last extraction, the rows resolution
+    /// moved into `resolved_refs` and the ones still in `unresolved_refs`, by
+    /// id and without it (W5-09e): what re-extracting the unchanged file would
+    /// give, as each site's multiset of references. Only valid while the
+    /// `resolved_refs_version` marker is.
+    pub fn stored_refs_of_file(&self, file_path: &str) -> rusqlite::Result<Vec<UnresolvedRef>> {
+        let mut stmt = self.conn.prepare_cached(&format!(
+            "SELECT {UNRESOLVED_REF_COLUMNS} FROM unresolved_refs WHERE file_path = ?1 \
+             UNION ALL SELECT {UNRESOLVED_REF_COLUMNS} FROM resolved_refs WHERE file_path = ?1 \
+             ORDER BY id"
+        ))?;
+        let rows = stmt.query_map([file_path], row_to_unresolved_ref)?;
+        rows.map(|row| {
+            row.map(|mut reference| {
+                reference.id = None;
+                reference
+            })
+        })
+        .collect()
     }
 
     /// Ports `getUnresolvedReferencesByFiles` from `upstream db/queries.ts:1663-1694`.
@@ -1037,6 +1209,567 @@ impl Store {
         Ok(out)
     }
 
+    /// The unresolved references of `language`, in id order: a lane whose
+    /// language writes tails the shared tail lookup cannot read (an
+    /// Objective-C keyword selector, `cache.storeImage:forKey:`) filters them
+    /// itself.
+    pub fn unresolved_refs_of_language(
+        &self,
+        language: Language,
+    ) -> rusqlite::Result<Vec<UnresolvedRef>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT * FROM unresolved_refs WHERE language = ?1 ORDER BY id")?;
+        let rows = stmt.query_map([language.as_str()], row_to_unresolved_ref)?;
+        rows.collect()
+    }
+
+    /// The files of `language` whose `extends` or `implements` references
+    /// name `name`, resolved (to a node of that name) or parked (W4-DART-02).
+    pub fn files_with_inheritance_refs_to(
+        &self,
+        language: Language,
+        name: &str,
+    ) -> rusqlite::Result<BTreeSet<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT s.file_path FROM edges e \
+             JOIN nodes s ON s.id = e.source JOIN nodes t ON t.id = e.target \
+             WHERE e.kind IN ('extends', 'implements') AND t.name = ?2 AND s.language = ?1 \
+             UNION SELECT file_path FROM unresolved_refs \
+             WHERE reference_kind IN ('extends', 'implements') AND reference_name = ?2 \
+             AND language = ?1",
+        )?;
+        stmt.query_map(params![language.as_str(), name], |row| row.get(0))?
+            .collect()
+    }
+
+    /// The names `file`'s `extends` and `implements` references write: the
+    /// target's name of a resolved one, the reference's own of a parked one
+    /// (W4-DART-02).
+    pub fn inheritance_ref_names_in_file(&self, file: &str) -> rusqlite::Result<BTreeSet<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT t.name FROM edges e \
+             JOIN nodes s ON s.id = e.source JOIN nodes t ON t.id = e.target \
+             WHERE e.kind IN ('extends', 'implements') AND s.file_path = ?1 \
+             UNION SELECT reference_name FROM unresolved_refs \
+             WHERE reference_kind IN ('extends', 'implements') AND file_path = ?1",
+        )?;
+        stmt.query_map(params![file], |row| row.get(0))?.collect()
+    }
+
+    /// The unresolved references of `language` written with a receiver,
+    /// `receiver.member`, whose member (the text after the last `.`) is one of
+    /// `members`, in id order and with no ceiling: a lane that knows which
+    /// members can have moved retries every call of them (W4-PHP-01). The
+    /// match runs in SQL, so the language's other references are never read.
+    pub fn unresolved_refs_of_language_by_members(
+        &self,
+        language: Language,
+        members: &[String],
+    ) -> rusqlite::Result<Vec<UnresolvedRef>> {
+        let mut unique: Vec<&str> = members
+            .iter()
+            .map(String::as_str)
+            .filter(|member| !member.is_empty() && !member.contains('.'))
+            .collect();
+        unique.sort_unstable();
+        unique.dedup();
+        let mut out: BTreeMap<i64, UnresolvedRef> = BTreeMap::new();
+        for chunk in unique.chunks(SQLITE_PARAM_CHUNK_SIZE - 1) {
+            let clauses = (0..chunk.len())
+                .map(|index| format!("reference_name GLOB ?{}", index + 2))
+                .collect::<Vec<_>>()
+                .join(" OR ");
+            let sql = format!(
+                "SELECT * FROM unresolved_refs WHERE language = ?1 AND ({clauses}) ORDER BY id"
+            );
+            // `*`, `?` and `[` are GLOB's own; a bracket makes each literal.
+            let patterns: Vec<String> = chunk
+                .iter()
+                .map(|member| {
+                    let mut escaped = String::from("*.");
+                    for c in member.chars() {
+                        match c {
+                            '*' => escaped.push_str("[*]"),
+                            '?' => escaped.push_str("[?]"),
+                            '[' => escaped.push_str("[[]"),
+                            _ => escaped.push(c),
+                        }
+                    }
+                    escaped
+                })
+                .collect();
+            let language = language.as_str();
+            let mut params: Vec<&dyn ToSql> = vec![&language];
+            params.extend(patterns.iter().map(|p| p as &dyn ToSql));
+            let mut stmt = self.conn.prepare(&sql)?;
+            for reference in stmt.query_map(params.as_slice(), row_to_unresolved_ref)? {
+                let reference = reference?;
+                if let Some(id) = reference.id {
+                    out.insert(id, reference);
+                }
+            }
+        }
+        Ok(out.into_values().collect())
+    }
+
+    /// The unresolved references written in `language` through one of
+    /// `receivers`, named `<receiver>.<…>` (`Provider.autoDispose`), in id
+    /// order: a sync retries those whose receiver's type came or went
+    /// (W4-DART-03), which the tail lookup never names.
+    pub fn unresolved_refs_of_language_through(
+        &self,
+        language: Language,
+        receivers: &[String],
+    ) -> rusqlite::Result<Vec<UnresolvedRef>> {
+        let mut unique: Vec<&str> = receivers
+            .iter()
+            .map(String::as_str)
+            .filter(|receiver| !receiver.is_empty())
+            .collect();
+        unique.sort_unstable();
+        unique.dedup();
+        let mut out: BTreeMap<i64, UnresolvedRef> = BTreeMap::new();
+        for chunk in unique.chunks(SQLITE_PARAM_CHUNK_SIZE - 1) {
+            let clauses = (0..chunk.len())
+                .map(|index| format!("reference_name GLOB ?{}", index + 2))
+                .collect::<Vec<_>>()
+                .join(" OR ");
+            let sql = format!(
+                "SELECT * FROM unresolved_refs WHERE language = ?1 AND ({clauses}) ORDER BY id"
+            );
+            // `*`, `?` and `[` are GLOB's own; a bracket makes each literal.
+            let patterns: Vec<String> = chunk
+                .iter()
+                .map(|receiver| {
+                    let mut escaped = String::new();
+                    for c in receiver.chars() {
+                        match c {
+                            '*' => escaped.push_str("[*]"),
+                            '?' => escaped.push_str("[?]"),
+                            '[' => escaped.push_str("[[]"),
+                            _ => escaped.push(c),
+                        }
+                    }
+                    escaped.push_str(".*");
+                    escaped
+                })
+                .collect();
+            let language = language.as_str();
+            let mut params: Vec<&dyn ToSql> = vec![&language];
+            params.extend(patterns.iter().map(|p| p as &dyn ToSql));
+            let mut stmt = self.conn.prepare(&sql)?;
+            for reference in stmt.query_map(params.as_slice(), row_to_unresolved_ref)? {
+                let reference = reference?;
+                if let Some(id) = reference.id {
+                    out.insert(id, reference);
+                }
+            }
+        }
+        Ok(out.into_values().collect())
+    }
+
+    /// The unresolved references written in one of `languages`, whose names
+    /// ignore case, named like one of `names` in any ASCII case (SQLite's
+    /// `lower`, as the case-insensitive node lookup folds), in id order: a
+    /// sync retries `\HELPER()` once a `helper` comes or goes (W4-PHP-02). No
+    /// index folds case, so those languages' rows are scanned.
+    pub fn unresolved_refs_by_folded_names(
+        &self,
+        languages: &[Language],
+        names: &[String],
+    ) -> rusqlite::Result<Vec<UnresolvedRef>> {
+        if languages.is_empty() || names.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut unique = names.to_vec();
+        unique.sort_unstable();
+        unique.dedup();
+        let languages: Vec<&str> = languages.iter().map(|language| language.as_str()).collect();
+        let language_slots = std::iter::repeat_n("?", languages.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut out: BTreeMap<i64, UnresolvedRef> = BTreeMap::new();
+        for chunk in unique.chunks(SQLITE_PARAM_CHUNK_SIZE - languages.len()) {
+            let name_slots = std::iter::repeat_n("lower(?)", chunk.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT * FROM unresolved_refs WHERE language IN ({language_slots}) \
+                 AND lower(reference_name) IN ({name_slots}) ORDER BY id"
+            );
+            let mut params: Vec<&dyn ToSql> = languages
+                .iter()
+                .map(|language| language as &dyn ToSql)
+                .collect();
+            params.extend(chunk.iter().map(|name| name as &dyn ToSql));
+            let mut stmt = self.conn.prepare(&sql)?;
+            for reference in stmt.query_map(params.as_slice(), row_to_unresolved_ref)? {
+                let reference = reference?;
+                if let Some(id) = reference.id {
+                    out.insert(id, reference);
+                }
+            }
+        }
+        Ok(out.into_values().collect())
+    }
+
+    /// Sites of the surviving non-`contains` edges whose source is written in
+    /// one of `languages` and whose target is named like one of `names` in
+    /// any ASCII case, in either file relation: a case-insensitive language's
+    /// fuzzy match keeps a target only while it is the one node of its name in
+    /// any case, so a namesake that comes, goes or changes in another case
+    /// moves it (W4-PHP-03).
+    pub fn reference_sites_of_edges_to_folded_targets(
+        &self,
+        languages: &[Language],
+        names: &[String],
+    ) -> rusqlite::Result<Vec<FileReferenceSite>> {
+        if languages.is_empty() || names.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut unique = names.to_vec();
+        unique.sort_unstable();
+        unique.dedup();
+        let languages: Vec<&str> = languages.iter().map(|language| language.as_str()).collect();
+        let language_slots = std::iter::repeat_n("?", languages.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut out = BTreeSet::new();
+        for chunk in unique.chunks(SQLITE_PARAM_CHUNK_SIZE - languages.len()) {
+            let name_slots = std::iter::repeat_n("lower(?)", chunk.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                r#"SELECT src.file_path, e.source, e.line, e.col
+                FROM edges e
+                JOIN nodes tgt ON tgt.id = e.target
+                JOIN nodes src ON src.id = e.source
+                WHERE lower(tgt.name) IN ({name_slots})
+                  AND src.language IN ({language_slots})
+                  AND e.kind != 'contains'
+                ORDER BY src.file_path, e.source, e.line, e.col"#
+            );
+            let mut params: Vec<&dyn ToSql> = chunk.iter().map(|name| name as &dyn ToSql).collect();
+            params.extend(languages.iter().map(|language| language as &dyn ToSql));
+            let mut stmt = self.conn.prepare(&sql)?;
+            let rows = stmt.query_map(params.as_slice(), row_to_file_reference_site)?;
+            for row in rows {
+                out.insert(row?);
+            }
+        }
+        Ok(out.into_iter().collect())
+    }
+
+    /// The unresolved PHP calls through a class written with a namespace
+    /// (`F\FirstName::make()`, recorded `F\FirstName.make`), in id order: a
+    /// sync retries those through a class whose name came or went, with no
+    /// ceiling (W4-PHP-02).
+    pub fn unresolved_php_calls_through_qualified_classes(
+        &self,
+    ) -> rusqlite::Result<Vec<UnresolvedRef>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT * FROM unresolved_refs WHERE language = 'php' AND reference_kind = 'calls' \
+             AND instr(reference_name, '\\') > 0 AND instr(reference_name, '.') > 0 ORDER BY id",
+        )?;
+        let rows = stmt.query_map([], row_to_unresolved_ref)?;
+        rows.collect()
+    }
+
+    /// The unresolved references written with a qualifier (`User.create`,
+    /// `objectType.IsEnum`) whose [`reference_name_tail`] is one of `names`,
+    /// the symbol names a sync's changed files touched (upstream #1240's
+    /// `name_tail` retry). The whole-name lookup,
+    /// [`Self::unresolved_refs_by_names`], never matches them. A tail more
+    /// than `per_key_ceiling` such references share is skipped, as
+    /// upstream's per-name ceiling skips names that common.
+    pub fn unresolved_refs_by_name_tails(
+        &self,
+        names: &[String],
+        per_key_ceiling: usize,
+    ) -> rusqlite::Result<Vec<UnresolvedRef>> {
+        if names.is_empty() {
+            return Ok(Vec::new());
+        }
+        let names: HashSet<&str> = names.iter().map(String::as_str).collect();
+        // Every dotted or colon reference's name and kind first, the rest of
+        // a row read only for the ones chosen (W5-08): the same rows, the
+        // same order.
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT id, reference_name, reference_kind FROM unresolved_refs \
+             WHERE instr(reference_name, '.') > 0 OR instr(reference_name, ':') > 0 ORDER BY id",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                let raw_kind = row.get::<_, String>(2)?;
+                let kind = if raw_kind == "function_ref" {
+                    EdgeKind::References
+                } else {
+                    parse_edge_kind(raw_kind)?
+                };
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, kind))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut buckets: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+        for (index, (_, name, kind)) in rows.iter().enumerate() {
+            let tail = reference_name_tail(name, *kind);
+            if tail != *name && names.contains(tail.as_str()) {
+                buckets.entry(tail).or_default().push(index);
+            }
+        }
+        let mut chosen = BTreeSet::new();
+        for indexes in buckets.values() {
+            if indexes.len() <= per_key_ceiling {
+                chosen.extend(indexes.iter().copied());
+            }
+        }
+        let mut by_id = self
+            .conn
+            .prepare_cached("SELECT * FROM unresolved_refs WHERE id = ?1")?;
+        chosen
+            .into_iter()
+            .map(|index| by_id.query_row([rows[index].0], row_to_unresolved_ref))
+            .collect()
+    }
+
+    /// The parked references a sync retries by the names its changed files
+    /// touched that the whole-name lookup ([`Self::unresolved_refs_by_names`])
+    /// never matches, found in one pass over the table (W5-08), each row once
+    /// in id order: a qualified reference by its tail, a tail more than
+    /// `tail_ceiling` share skipped ([`Self::unresolved_refs_by_name_tails`]);
+    /// a PHP call written `\helper()` by its name, and a name of
+    /// `folded_languages`, in any ASCII case
+    /// ([`Self::unresolved_refs_by_folded_names`]); and a PHP call through a
+    /// class written with a namespace whose class or member is one of the
+    /// names ([`Self::unresolved_php_calls_through_qualified_classes`]).
+    pub fn unresolved_refs_retried_by_names(
+        &self,
+        names: &[String],
+        tail_ceiling: usize,
+        folded_languages: &[Language],
+    ) -> rusqlite::Result<Vec<UnresolvedRef>> {
+        if names.is_empty() {
+            return Ok(Vec::new());
+        }
+        let exact: HashSet<&str> = names.iter().map(String::as_str).collect();
+        // SQLite's `lower` folds ASCII letters only, as `to_ascii_lowercase`.
+        let folded: HashSet<String> = names.iter().map(|name| name.to_ascii_lowercase()).collect();
+        let rooted: HashSet<String> = names
+            .iter()
+            .map(|name| format!("\\{name}").to_ascii_lowercase())
+            .collect();
+        let php = Language::Php.as_str();
+        let mut languages: Vec<&str> = folded_languages
+            .iter()
+            .map(|language| language.as_str())
+            .chain([php])
+            .collect();
+        languages.sort_unstable();
+        languages.dedup();
+        let folded_languages: HashSet<&str> = folded_languages
+            .iter()
+            .map(|language| language.as_str())
+            .collect();
+        let sql = format!(
+            "SELECT id, reference_name, reference_kind, language FROM unresolved_refs \
+             WHERE instr(reference_name, '.') > 0 OR instr(reference_name, ':') > 0 \
+             OR language IN ({}) ORDER BY id",
+            std::iter::repeat_n("?", languages.len())
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let mut tails: HashMap<String, Vec<i64>> = HashMap::new();
+        let mut chosen = BTreeSet::new();
+        {
+            let mut stmt = self.conn.prepare_cached(&sql)?;
+            let mut rows = stmt.query(rusqlite::params_from_iter(languages.iter()))?;
+            while let Some(row) = rows.next()? {
+                let id: i64 = row.get(0)?;
+                let name = text_column(row, 1)?;
+                let raw_kind = text_column(row, 2)?;
+                if name.contains(['.', ':']) {
+                    let tail = reference_name_tail_of(name, edge_kind_of(raw_kind)?);
+                    if tail != name && exact.contains(tail) {
+                        tails.entry(tail.to_string()).or_default().push(id);
+                    }
+                }
+                let language = text_column(row, 3)?;
+                let is_php = language == php;
+                let in_any_case = (is_php || folded_languages.contains(language)) && {
+                    let lowered = name.to_ascii_lowercase();
+                    (is_php && rooted.contains(&lowered))
+                        || (folded_languages.contains(language) && folded.contains(&lowered))
+                };
+                let through_class = is_php
+                    && raw_kind == "calls"
+                    && name.contains('\\')
+                    && name.rsplit_once('.').is_some_and(|(class, member)| {
+                        exact.contains(member)
+                            || class
+                                .rsplit('\\')
+                                .next()
+                                .is_some_and(|class| exact.contains(class))
+                    });
+                if in_any_case || through_class {
+                    chosen.insert(id);
+                }
+            }
+        }
+        for ids in tails.values() {
+            if ids.len() <= tail_ceiling {
+                chosen.extend(ids.iter().copied());
+            }
+        }
+        let mut by_id = self
+            .conn
+            .prepare_cached("SELECT * FROM unresolved_refs WHERE id = ?1")?;
+        chosen
+            .into_iter()
+            .map(|id| by_id.query_row([id], row_to_unresolved_ref))
+            .collect()
+    }
+
+    /// The unresolved references written through one of `receivers`
+    /// (`User.create`, `User::create`): a name that starts with the receiver
+    /// and then `.` or `::`, each found by a range over `idx_unresolved_name`,
+    /// however many there are (W5-07). Each row once, ordered by id.
+    pub fn unresolved_refs_by_receivers(
+        &self,
+        receivers: &[String],
+    ) -> rusqlite::Result<Vec<UnresolvedRef>> {
+        let mut out: BTreeMap<i64, UnresolvedRef> = BTreeMap::new();
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT * FROM unresolved_refs WHERE reference_name >= ?1 AND reference_name < ?2",
+        )?;
+        for receiver in receivers {
+            // The byte after each separator bounds the range: `.` is 0x2E and
+            // `/` 0x2F, `:` is 0x3A and `;` 0x3B.
+            for (low, high) in [
+                (format!("{receiver}."), format!("{receiver}/")),
+                (format!("{receiver}::"), format!("{receiver}:;")),
+            ] {
+                for reference in stmt.query_map(params![low, high], row_to_unresolved_ref)? {
+                    let reference = reference?;
+                    if let Some(id) = reference.id {
+                        out.entry(id).or_insert(reference);
+                    }
+                }
+            }
+        }
+        Ok(out.into_values().collect())
+    }
+
+    /// The parked imports a sync that adds files should retry (upstream
+    /// `getRetryableFailedImports`, #2392). An import names a file, a folder or
+    /// a namespace, which the symbol-name lookup cannot match, so it is found by
+    /// `path_keys` (each added file's [`import_path_keys`]) as its tail or its
+    /// whole name, and by `names` (the namespaces and modules the changed files
+    /// declare) as its whole name when its tail is something else. A
+    /// reference written as a path is looked up as an import is. A key more
+    /// than `per_key_ceiling` rows share is skipped, as the symbol lookup's
+    /// keys are.
+    pub fn retryable_failed_imports(
+        &self,
+        path_keys: &[String],
+        names: &[String],
+        per_key_ceiling: usize,
+    ) -> rusqlite::Result<Vec<UnresolvedRef>> {
+        if path_keys.is_empty() && names.is_empty() {
+            return Ok(Vec::new());
+        }
+        let path_keys: HashSet<&str> = path_keys.iter().map(String::as_str).collect();
+        let names: HashSet<&str> = names.iter().map(String::as_str).collect();
+        // Each candidate row's id, name and kind first, read without copying,
+        // the rest of a row only for the ones chosen (W5-09): the same rows in
+        // the same order.
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT id, reference_name, reference_kind FROM unresolved_refs \
+             WHERE reference_kind = 'imports' \
+             OR (reference_kind = 'references' AND instr(reference_name, '/') > 0) ORDER BY id",
+        )?;
+        // One bucket per (lookup, key), counted against the ceiling apiece.
+        let mut buckets: BTreeMap<(u8, String), Vec<i64>> = BTreeMap::new();
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let id: i64 = row.get(0)?;
+            let name = text_column(row, 1)?;
+            let tail = reference_name_tail_of(name, edge_kind_of(text_column(row, 2)?)?);
+            if path_keys.contains(tail) {
+                buckets.entry((0, tail.to_string())).or_default().push(id);
+            }
+            if path_keys.contains(name) {
+                buckets.entry((1, name.to_string())).or_default().push(id);
+            }
+            if names.contains(name) && tail != name {
+                buckets.entry((2, name.to_string())).or_default().push(id);
+            }
+        }
+        drop(rows);
+        let mut chosen = BTreeSet::new();
+        for ids in buckets.values() {
+            if ids.len() <= per_key_ceiling {
+                chosen.extend(ids.iter().copied());
+            }
+        }
+        let mut by_id = self
+            .conn
+            .prepare_cached("SELECT * FROM unresolved_refs WHERE id = ?1")?;
+        chosen
+            .into_iter()
+            .map(|id| by_id.query_row([id], row_to_unresolved_ref))
+            .collect()
+    }
+
+    /// The JavaScript-family files whose import of `file` holds a binding that
+    /// does not resolve into it (upstream #2450): another file X with an
+    /// `imports` edge into `file`'s file node, X's `import` node around that
+    /// edge's line, and within that node's lines either an unresolved
+    /// `imports` reference other than the statement's own path (`W` of
+    /// `import { Widget as W } from './widgets/Widget'` while the module
+    /// declares no `Widget`) or an `imports` edge from X that import
+    /// resolution did not make (`resolvedBy` other than `import`: `W` matched
+    /// by its name, to a namesake in the module or elsewhere). The statement's
+    /// edge to the file node itself is its path, not a binding. An edit that
+    /// gives the module what such a binding imports reaches it by no name, as
+    /// the binding is written under its own. Read it before `file`'s old
+    /// nodes go: the edges into them go with them. Sorted, each file once.
+    pub fn importers_with_unbound_bindings(&self, file: &str) -> rusqlite::Result<Vec<String>> {
+        // CROSS JOIN pins the order: from the file's node to the edges into
+        // it, never from every `imports` edge (`idx_edges_kind`).
+        let mut stmt = self.conn.prepare_cached(
+            r#"SELECT DISTINCT s.file_path
+            FROM nodes f
+            CROSS JOIN edges e ON e.target = f.id AND e.kind = 'imports'
+            CROSS JOIN nodes s ON s.id = e.source
+            CROSS JOIN nodes i ON i.file_path = s.file_path AND i.kind = 'import'
+                AND i.start_line <= e.line AND e.line <= i.end_line
+            WHERE f.file_path = ?1 AND f.kind = 'file' AND s.file_path <> ?1
+                AND i.language IN
+                    ('typescript', 'tsx', 'javascript', 'jsx', 'arkts', 'svelte', 'vue', 'astro')
+                AND (
+                    EXISTS (
+                        SELECT 1 FROM unresolved_refs u
+                        WHERE u.file_path = s.file_path AND u.reference_kind = 'imports'
+                            AND u.line BETWEEN i.start_line AND i.end_line
+                            AND u.reference_name <> i.name
+                    )
+                    OR EXISTS (
+                        SELECT 1 FROM nodes x
+                        CROSS JOIN edges b ON b.source = x.id AND b.kind = 'imports'
+                        WHERE x.file_path = s.file_path
+                            AND b.line BETWEEN i.start_line AND i.end_line
+                            AND b.target <> f.id
+                            AND (CASE WHEN json_valid(b.metadata)
+                                THEN json_extract(b.metadata, '$.resolvedBy') END)
+                                IS NOT 'import'
+                    )
+                )
+            ORDER BY 1"#,
+        )?;
+        let rows = stmt.query_map([file], |row| row.get::<_, String>(0))?;
+        rows.collect()
+    }
+
     /// Ports `getStats` count SQL from `upstream db/queries.ts:1746-1756`.
     pub fn counts(&self) -> rusqlite::Result<StoreCounts> {
         self.conn.query_row(
@@ -1090,8 +1823,8 @@ impl Store {
     }
 
     /// Tune THIS connection for a from-scratch bulk index: drop `synchronous` to
-    /// `OFF`, grow the page cache and mmap window, and (unless opted out) DEFER WAL
-    /// auto-checkpointing for the whole run (#1231). This trades crash durability
+    /// `OFF`, grow the page cache, stop memory-mapping the file, and (unless opted
+    /// out) DEFER WAL auto-checkpointing for the whole run (#1231). This trades crash durability
     /// for throughput during the one-shot full index, which is always safe because
     /// the full-index path starts from an empty DB (`index --force` removes the file
     /// first) and is re-runnable from scratch on failure.
@@ -1105,6 +1838,11 @@ impl Store {
     /// one `wal_checkpoint(TRUNCATE)`. Set `CODEGRAPH_NO_WAL_DEFER=1` to keep the
     /// default autocheckpoint interval.
     ///
+    /// No memory map (`mmap_size=0`): the page cache already holds the pages a
+    /// full index writes and reads back, so mapping the file as well counted the
+    /// database twice in peak RSS (once as cache, once as mapped file pages)
+    /// without making the index faster.
+    ///
     /// `synchronous`, `cache_size`, `mmap_size`, and `wal_autocheckpoint` are all
     /// durability/scheduling knobs only: none alters committed content, so golden
     /// byte-equivalence is preserved. `wal_autocheckpoint` is a per-connection
@@ -1116,8 +1854,7 @@ impl Store {
     pub fn set_bulk_index_pragmas(&self) -> rusqlite::Result<()> {
         self.conn.pragma_update(None, "synchronous", "OFF")?;
         self.conn.pragma_update(None, "cache_size", -262_144)?;
-        self.conn
-            .pragma_update(None, "mmap_size", 1_073_741_824_i64)?;
+        self.conn.pragma_update(None, "mmap_size", 0_i64)?;
         if !wal_defer_disabled() {
             self.conn.pragma_update(None, "wal_autocheckpoint", 0)?;
         }
@@ -1195,6 +1932,28 @@ impl Store {
     pub fn delete_project_metadata(&self, key: &str) -> rusqlite::Result<usize> {
         self.conn
             .execute("DELETE FROM project_metadata WHERE key = ?", [key])
+    }
+
+    /// Every `project_metadata` row whose key starts with `prefix`, by key.
+    pub fn project_metadata_with_prefix(
+        &self,
+        prefix: &str,
+    ) -> rusqlite::Result<Vec<(String, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT key, value FROM project_metadata WHERE substr(key, 1, ?2) = ?1 ORDER BY key",
+        )?;
+        let rows = stmt.query_map(params![prefix, prefix.chars().count() as i64], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?;
+        rows.collect()
+    }
+
+    /// Delete every `project_metadata` row whose key starts with `prefix`.
+    pub fn delete_project_metadata_with_prefix(&self, prefix: &str) -> rusqlite::Result<usize> {
+        self.conn.execute(
+            "DELETE FROM project_metadata WHERE substr(key, 1, ?2) = ?1",
+            params![prefix, prefix.chars().count() as i64],
+        )
     }
 
     /// `project_metadata` key for the incomplete-resolution MARKER (#1187).
@@ -1301,6 +2060,92 @@ impl Store {
         let mut out = BTreeSet::new();
         for row in rows {
             out.insert(row?);
+        }
+        Ok(out.into_iter().collect())
+    }
+
+    /// `(id, file_path, signature)` of every Python function and method, in
+    /// id order. Sync reads the parameters a pytest fixture can feed.
+    pub fn python_callable_signatures(&self) -> rusqlite::Result<Vec<(String, String, String)>> {
+        let mut stmt = self.conn.prepare(
+            r#"SELECT id, file_path, COALESCE(signature, '')
+            FROM nodes
+            WHERE language = 'python' AND kind IN ('function', 'method')
+            ORDER BY id"#,
+        )?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+        rows.collect()
+    }
+
+    /// The reference sites of everything `node_ids` reference: their
+    /// non-`contains` edges and their unresolved rows, sorted and
+    /// deduplicated.
+    pub fn reference_sites_from_nodes(
+        &self,
+        node_ids: &[String],
+    ) -> rusqlite::Result<Vec<FileReferenceSite>> {
+        let mut unique = node_ids.to_vec();
+        unique.sort_unstable();
+        unique.dedup();
+        let mut out = BTreeSet::new();
+        for chunk in unique.chunks(SQLITE_PARAM_CHUNK_SIZE) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let params = chunk.iter().map(|p| p as &dyn ToSql).collect::<Vec<_>>();
+            for sql in [
+                format!(
+                    r#"SELECT src.file_path, e.source, e.line, e.col
+                    FROM edges e
+                    JOIN nodes src ON src.id = e.source
+                    WHERE e.kind != 'contains' AND e.source IN ({placeholders})"#
+                ),
+                format!(
+                    r#"SELECT file_path, from_node_id, line, col
+                    FROM unresolved_refs
+                    WHERE from_node_id IN ({placeholders})"#
+                ),
+            ] {
+                let mut stmt = self.conn.prepare(&sql)?;
+                let rows = stmt.query_map(params.as_slice(), row_to_file_reference_site)?;
+                for row in rows {
+                    out.insert(row?);
+                }
+            }
+        }
+        Ok(out.into_iter().collect())
+    }
+
+    /// The source sites of the function-value `references` edges
+    /// (`{"fnRef": true}`) whose source lies in one of `file_paths`, sorted
+    /// and deduplicated. Sync refreshes the ones that read through a Python
+    /// module global whose writes changed.
+    pub fn function_ref_sites_in_files(
+        &self,
+        file_paths: &[String],
+    ) -> rusqlite::Result<Vec<FileReferenceSite>> {
+        let mut unique = file_paths.to_vec();
+        unique.sort_unstable();
+        unique.dedup();
+        let mut out = BTreeSet::new();
+        for chunk in unique.chunks(SQLITE_PARAM_CHUNK_SIZE) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                r#"SELECT src.file_path, e.source, e.line, e.col
+                FROM edges e
+                JOIN nodes src ON src.id = e.source
+                WHERE e.kind = 'references'
+                  AND json_extract(e.metadata, '$.fnRef') = 1
+                  AND src.file_path IN ({placeholders})"#
+            );
+            let params = chunk.iter().map(|p| p as &dyn ToSql).collect::<Vec<_>>();
+            let mut stmt = self.conn.prepare(&sql)?;
+            let rows = stmt.query_map(params.as_slice(), row_to_file_reference_site)?;
+            for row in rows {
+                out.insert(row?);
+            }
         }
         Ok(out.into_iter().collect())
     }
@@ -1436,22 +2281,25 @@ impl Store {
     }
 
     /// Delete every resolution-produced edge whose SOURCE node lives in
-    /// `file_path`. Every non-`contains` edge is produced by reference resolution
-    /// (it carries `metadata.resolvedBy`); `contains` edges come only from
-    /// extraction. Used only by incremental sync's correctness-first whole-file
-    /// fallback; normal unchanged dependents use
-    /// [`Self::delete_resolved_edges_at_sites`]. `contains` edges are left intact
-    /// because the file's nodes are not re-extracted.
+    /// `file_path`. Extraction produces only `contains` edges and same-file
+    /// value references (`references` with `{"valueRef": true}` and no
+    /// coordinates); every other edge comes from reference resolution. Used
+    /// only by incremental sync's correctness-first whole-file fallback;
+    /// normal unchanged dependents use [`Self::delete_resolved_edges_at_sites`].
+    /// Extraction edges are left intact because the file's nodes are not
+    /// re-extracted.
     pub fn delete_resolved_edges_from_file(&self, file_path: &str) -> rusqlite::Result<usize> {
         self.conn.execute(
-            r#"DELETE FROM edges
+            &format!(
+                r#"DELETE FROM edges
             WHERE id IN (
               SELECT e.id
               FROM edges e
               JOIN nodes src ON src.id = e.source
               WHERE src.file_path = ?1
-                AND e.kind != 'contains'
-            )"#,
+                AND {RESOLUTION_EDGE}
+            )"#
+            ),
             [file_path],
         )
     }
@@ -1500,24 +2348,37 @@ impl Store {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let removed = tx.execute(
-            r#"DELETE FROM edges
-            WHERE id IN (
-              SELECT e.id
-              FROM edges e
-              JOIN nodes src ON src.id = e.source
-              WHERE src.file_path = ?1
-                AND e.kind != 'contains'
-            )"#,
-            [file_path],
-        )?;
-        tx.execute(
-            "DELETE FROM unresolved_refs WHERE file_path = ?1",
-            [file_path],
-        )?;
-        insert_unresolved_refs_in_connection(&tx, refs)?;
+        let removed = replace_file_resolution_in(&tx, file_path, refs)?;
         tx.commit()?;
         Ok(removed)
+    }
+
+    /// Apply `replacements` in order in ONE `BEGIN IMMEDIATE` transaction:
+    /// the statements of [`Self::replace_resolution_state_from_file`] and
+    /// [`Self::replace_resolution_state_at_sites`], committed once for every
+    /// dependent of a sync instead of once per file (W5-09a). A failure keeps
+    /// every old answer, as each file's own transaction did for that file.
+    pub fn replace_resolution_states(
+        &mut self,
+        replacements: &[ResolutionReplacement],
+    ) -> rusqlite::Result<()> {
+        if replacements.is_empty() {
+            return Ok(());
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for replacement in replacements {
+            match replacement {
+                ResolutionReplacement::File { file_path, refs } => {
+                    replace_file_resolution_in(&tx, file_path, refs)?;
+                }
+                ResolutionReplacement::Sites { sites, refs } => {
+                    replace_site_resolution_in(&tx, sites, refs)?;
+                }
+            }
+        }
+        tx.commit()
     }
 
     /// Atomically replace the resolution state of selected source-site sibling
@@ -1531,34 +2392,13 @@ impl Store {
         sites: &[ReferenceSite],
         refs: &[UnresolvedRef],
     ) -> rusqlite::Result<usize> {
-        let unique = sites.iter().cloned().collect::<BTreeSet<_>>();
-        if unique.is_empty() {
+        if sites.is_empty() {
             return Ok(0);
         }
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let mut removed = 0;
-        {
-            let mut delete_edges = tx.prepare_cached(
-                r#"DELETE FROM edges
-                WHERE source = ?1 AND line = ?2 AND col = ?3
-                  AND kind != 'contains'"#,
-            )?;
-            let mut delete_refs = tx.prepare_cached(
-                r#"DELETE FROM unresolved_refs
-                WHERE from_node_id = ?1 AND line = ?2 AND col = ?3"#,
-            )?;
-            for site in unique {
-                removed += delete_edges.execute(params![
-                    site.from_node_id.as_str(),
-                    site.line,
-                    site.col
-                ])?;
-                delete_refs.execute(params![site.from_node_id.as_str(), site.line, site.col])?;
-            }
-        }
-        insert_unresolved_refs_in_connection(&tx, refs)?;
+        let removed = replace_site_resolution_in(&tx, sites, refs)?;
         tx.commit()?;
         Ok(removed)
     }
@@ -1603,6 +2443,30 @@ impl Store {
             }
         }
         Ok(out)
+    }
+
+    /// The `calls` edges whose source is a node of `file_path` that have a
+    /// site, with the name of the node each reaches (W4-DART-03b: a sync tells
+    /// the chain links among a file's calls by the member each names). The
+    /// `CROSS JOIN` keeps the file's nodes the outer loop: left to itself the
+    /// planner walks every `calls` edge of the project through the kind index.
+    pub fn call_sites_in_file(
+        &self,
+        file_path: &str,
+    ) -> rusqlite::Result<Vec<(String, i64, i64, String)>> {
+        let mut stmt = self.conn.prepare(
+            r#"SELECT e.source, e.line, e.col, tgt.name
+            FROM nodes src
+            CROSS JOIN edges e ON e.source = src.id
+            JOIN nodes tgt ON tgt.id = e.target
+            WHERE src.file_path = ?1 AND e.kind = 'calls'
+              AND e.line IS NOT NULL AND e.col IS NOT NULL
+            ORDER BY e.source, e.line, e.col, tgt.name"#,
+        )?;
+        let rows = stmt.query_map([file_path], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })?;
+        rows.collect()
     }
 
     /// Precise source-site counterpart of
@@ -1675,6 +2539,12 @@ impl Store {
     }
 }
 
+/// SQL predicate over edge alias `e`: an edge reference resolution produced.
+/// Extraction produces `contains` edges and same-file value references (a
+/// `references` edge with `{"valueRef": true}` and no coordinates), which a
+/// re-resolution of an unchanged file must keep.
+const RESOLUTION_EDGE: &str = "e.kind != 'contains' AND NOT (e.kind = 'references' AND e.line IS NULL AND CASE WHEN json_valid(e.metadata) THEN json_extract(e.metadata, '$.valueRef') END = 1)";
+
 fn row_to_file_reference_site(row: &Row<'_>) -> rusqlite::Result<FileReferenceSite> {
     let file_path = row.get(0)?;
     let from_node_id = row.get(1)?;
@@ -1695,9 +2565,93 @@ fn query_nodes<P>(conn: &Connection, sql: &str, params: P) -> rusqlite::Result<V
 where
     P: rusqlite::Params,
 {
-    let mut stmt = conn.prepare(sql)?;
-    let rows = stmt.query_map(params, row_to_node)?;
+    // A statement prepared once per connection, and each field's column
+    // found once per statement rather than by name on every row (W5-08):
+    // the same values [`row_to_node`] reads.
+    let mut stmt = conn.prepare_cached(sql)?;
+    let columns = NodeColumns::of(&stmt)?;
+    let rows = stmt.query_map(params, |row| columns.node(row))?;
     rows.collect()
+}
+
+/// The column each [`Node`] field is read from in one statement's rows.
+struct NodeColumns {
+    id: usize,
+    kind: usize,
+    name: usize,
+    qualified_name: usize,
+    file_path: usize,
+    language: usize,
+    start_line: usize,
+    end_line: usize,
+    start_column: usize,
+    end_column: usize,
+    docstring: usize,
+    signature: usize,
+    visibility: usize,
+    is_exported: usize,
+    is_async: usize,
+    is_static: usize,
+    is_abstract: usize,
+    decorators: usize,
+    type_parameters: usize,
+    return_type: usize,
+    updated_at: usize,
+}
+
+impl NodeColumns {
+    fn of(stmt: &rusqlite::Statement<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            id: stmt.column_index("id")?,
+            kind: stmt.column_index("kind")?,
+            name: stmt.column_index("name")?,
+            qualified_name: stmt.column_index("qualified_name")?,
+            file_path: stmt.column_index("file_path")?,
+            language: stmt.column_index("language")?,
+            start_line: stmt.column_index("start_line")?,
+            end_line: stmt.column_index("end_line")?,
+            start_column: stmt.column_index("start_column")?,
+            end_column: stmt.column_index("end_column")?,
+            docstring: stmt.column_index("docstring")?,
+            signature: stmt.column_index("signature")?,
+            visibility: stmt.column_index("visibility")?,
+            is_exported: stmt.column_index("is_exported")?,
+            is_async: stmt.column_index("is_async")?,
+            is_static: stmt.column_index("is_static")?,
+            is_abstract: stmt.column_index("is_abstract")?,
+            decorators: stmt.column_index("decorators")?,
+            type_parameters: stmt.column_index("type_parameters")?,
+            return_type: stmt.column_index("return_type")?,
+            updated_at: stmt.column_index("updated_at")?,
+        })
+    }
+
+    /// [`row_to_node`] of `row`, by the columns found.
+    fn node(&self, row: &Row<'_>) -> rusqlite::Result<Node> {
+        Ok(Node {
+            id: row.get(self.id)?,
+            kind: parse_node_kind(row.get::<_, String>(self.kind)?)?,
+            name: row.get(self.name)?,
+            qualified_name: row.get(self.qualified_name)?,
+            file_path: row.get(self.file_path)?,
+            language: parse_language(row.get::<_, String>(self.language)?)?,
+            start_line: row.get(self.start_line)?,
+            end_line: row.get(self.end_line)?,
+            start_column: row.get(self.start_column)?,
+            end_column: row.get(self.end_column)?,
+            docstring: row.get(self.docstring)?,
+            signature: row.get(self.signature)?,
+            visibility: row.get(self.visibility)?,
+            is_exported: row.get::<_, i64>(self.is_exported)? == 1,
+            is_async: row.get::<_, i64>(self.is_async)? == 1,
+            is_static: row.get::<_, i64>(self.is_static)? == 1,
+            is_abstract: row.get::<_, i64>(self.is_abstract)? == 1,
+            decorators: parse_json_array(row.get(self.decorators)?)?,
+            type_parameters: parse_json_array(row.get(self.type_parameters)?)?,
+            return_type: row.get(self.return_type)?,
+            updated_at: row.get(self.updated_at)?,
+        })
+    }
 }
 
 fn query_edges<P>(conn: &Connection, sql: &str, params: P) -> rusqlite::Result<Vec<Edge>>
@@ -1781,6 +2735,102 @@ fn millis_column(row: &Row<'_>, name: &str) -> rusqlite::Result<i64> {
         )),
     }
 }
+
+/// The tail a parked reference waits under (upstream `referenceNameTail`,
+/// #1240, #2392): the part a new symbol's plain name could match, after the
+/// last `.` or `:` (`util.greet` -> `greet`, `mod::fn/2` -> `fn`, an Erlang
+/// arity dropped). An import, or a reference written as a path, names a FILE,
+/// so its tail is the path's last segment cut at its first dot
+/// (`package:app/b.dart` -> `b`, `./foo` -> `foo`, `inc/db.php` -> `db`): the
+/// stem [`import_path_keys`] takes from a file that could satisfy it.
+pub fn reference_name_tail(reference_name: &str, reference_kind: EdgeKind) -> String {
+    reference_name_tail_of(reference_name, reference_kind).to_string()
+}
+
+/// [`reference_name_tail`] as the part of the name it is.
+fn reference_name_tail_of(reference_name: &str, reference_kind: EdgeKind) -> &str {
+    // A reference written as a path, but not an Erlang `fun mod:f/2` value.
+    let path_reference = reference_kind == EdgeKind::References
+        && reference_name.contains('/')
+        && strip_erlang_arity(reference_name) == reference_name;
+    if reference_kind == EdgeKind::Imports || path_reference {
+        let path = reference_name.trim_end_matches('/');
+        if let Some(slash) = path.rfind('/') {
+            let stem = file_name_stem(&path[slash + 1..]);
+            // `..` and `.` name a folder only through the importing file.
+            if !stem.chars().all(|c| c == '.') {
+                return stem;
+            }
+        }
+    }
+    let base = strip_erlang_arity(reference_name);
+    match base.rfind(['.', ':']) {
+        Some(idx) => &base[idx + 1..],
+        None => base,
+    }
+}
+
+/// `name` without a trailing `/<1-3 digits>` arity (`f/1` -> `f`).
+fn strip_erlang_arity(name: &str) -> &str {
+    match name.rsplit_once('/') {
+        Some((base, arity))
+            if !base.is_empty()
+                && (1..=3).contains(&arity.len())
+                && arity.chars().all(|c| c.is_ascii_digit()) =>
+        {
+            base
+        }
+        _ => name,
+    }
+}
+
+/// A file or folder name up to its first dot past the first character:
+/// `b.dart` -> `b`, `types.d.ts` -> `types`, `.eslintrc.js` -> `.eslintrc`.
+fn file_name_stem(name: &str) -> &str {
+    match name.get(1..).and_then(|rest| rest.find('.')) {
+        Some(dot) => &name[..dot + 1],
+        None => name,
+    }
+}
+
+/// What an import of the file at `file_path` can be written as (upstream
+/// `importPathKeys`, #2392): its name (`b.h`, a bare include) and stem (`b`,
+/// the tail of `a/b.h`, `./b`, `pkg.b`), and the same two for its folder,
+/// which an import names for its index file (`./ui` -> `ui/index.ts`, `pkg`
+/// -> `pkg/__init__.py`) or as a Go package.
+pub fn import_path_keys(file_path: &str) -> Vec<String> {
+    let parts: Vec<&str> = file_path.split('/').collect();
+    let mut keys: Vec<String> = Vec::new();
+    for name in &parts[parts.len().saturating_sub(2)..] {
+        for key in [*name, file_name_stem(name)] {
+            if !key.is_empty() && !keys.iter().any(|existing| existing == key) {
+                keys.push(key.to_string());
+            }
+        }
+    }
+    keys
+}
+
+/// A text column of `row`, borrowed rather than copied.
+fn text_column<'row>(row: &'row Row<'_>, index: usize) -> rusqlite::Result<&'row str> {
+    let value = row.get_ref(index)?;
+    value
+        .as_str()
+        .map_err(|_| rusqlite::Error::InvalidColumnType(index, String::new(), value.data_type()))
+}
+
+/// The edge kind a stored `reference_kind` reads as, a function reference's
+/// as `references` ([`row_to_unresolved_ref`]).
+fn edge_kind_of(raw_kind: &str) -> rusqlite::Result<EdgeKind> {
+    if raw_kind == "function_ref" {
+        return Ok(EdgeKind::References);
+    }
+    edge_kind_named(raw_kind).ok_or_else(|| enum_error(raw_kind.to_string(), "edge kind"))
+}
+
+/// The columns `unresolved_refs` and `resolved_refs` share, in table order.
+const UNRESOLVED_REF_COLUMNS: &str = "id, from_node_id, reference_name, reference_kind, line, col, \
+     candidates, file_path, language, reference_subkind";
 
 pub(crate) fn row_to_unresolved_ref(row: &Row<'_>) -> rusqlite::Result<UnresolvedRef> {
     let raw_kind = row.get::<_, String>("reference_kind")?;
@@ -1872,7 +2922,12 @@ fn parse_node_kind(value: String) -> rusqlite::Result<NodeKind> {
 }
 
 fn parse_edge_kind(value: String) -> rusqlite::Result<EdgeKind> {
-    let kind = match value.as_str() {
+    edge_kind_named(&value).ok_or_else(|| enum_error(value, "edge kind"))
+}
+
+/// The edge kind a stored name is, if any.
+fn edge_kind_named(value: &str) -> Option<EdgeKind> {
+    let kind = match value {
         "contains" => EdgeKind::Contains,
         "calls" => EdgeKind::Calls,
         "imports" => EdgeKind::Imports,
@@ -1885,9 +2940,9 @@ fn parse_edge_kind(value: String) -> rusqlite::Result<EdgeKind> {
         "instantiates" => EdgeKind::Instantiates,
         "overrides" => EdgeKind::Overrides,
         "decorates" => EdgeKind::Decorates,
-        _ => return Err(enum_error(value, "edge kind")),
+        _ => return None,
     };
-    Ok(kind)
+    Some(kind)
 }
 
 fn parse_reference_subkind(value: Option<String>) -> rusqlite::Result<Option<ReferenceSubkind>> {
@@ -2006,6 +3061,91 @@ fn existing_node_ids(
         }
     }
     Ok(out)
+}
+
+/// One dependent's resolution state to replace in
+/// [`Store::replace_resolution_states`].
+#[derive(Debug, Clone)]
+pub enum ResolutionReplacement {
+    /// Every resolution edge and stored reference of the file, by these
+    /// references ([`Store::replace_resolution_state_from_file`]).
+    File {
+        file_path: String,
+        refs: Vec<UnresolvedRef>,
+    },
+    /// The site groups, by these references
+    /// ([`Store::replace_resolution_state_at_sites`]).
+    Sites {
+        sites: Vec<ReferenceSite>,
+        refs: Vec<UnresolvedRef>,
+    },
+}
+
+/// The body of [`Store::replace_resolution_state_from_file`], in `tx`.
+fn replace_file_resolution_in(
+    tx: &Connection,
+    file_path: &str,
+    refs: &[UnresolvedRef],
+) -> rusqlite::Result<usize> {
+    let removed = tx.execute(
+        &format!(
+            r#"DELETE FROM edges
+            WHERE id IN (
+              SELECT e.id
+              FROM edges e
+              JOIN nodes src ON src.id = e.source
+              WHERE src.file_path = ?1
+                AND {RESOLUTION_EDGE}
+            )"#
+        ),
+        [file_path],
+    )?;
+    tx.execute(
+        "DELETE FROM unresolved_refs WHERE file_path = ?1",
+        [file_path],
+    )?;
+    tx.execute(
+        "DELETE FROM resolved_refs WHERE file_path = ?1",
+        [file_path],
+    )?;
+    insert_unresolved_refs_in_connection(tx, refs)?;
+    Ok(removed)
+}
+
+/// The body of [`Store::replace_resolution_state_at_sites`], in `tx`.
+fn replace_site_resolution_in(
+    tx: &Connection,
+    sites: &[ReferenceSite],
+    refs: &[UnresolvedRef],
+) -> rusqlite::Result<usize> {
+    let unique = sites.iter().cloned().collect::<BTreeSet<_>>();
+    if unique.is_empty() {
+        return Ok(0);
+    }
+    let mut removed = 0;
+    {
+        let mut delete_edges = tx.prepare_cached(
+            r#"DELETE FROM edges
+                WHERE source = ?1 AND line = ?2 AND col = ?3
+                  AND kind != 'contains'"#,
+        )?;
+        let mut delete_refs = tx.prepare_cached(
+            r#"DELETE FROM unresolved_refs
+                WHERE from_node_id = ?1 AND line = ?2 AND col = ?3"#,
+        )?;
+        let mut delete_resolved = tx.prepare_cached(
+            r#"DELETE FROM resolved_refs
+                WHERE from_node_id = ?1 AND line = ?2 AND col = ?3"#,
+        )?;
+        for site in unique {
+            removed +=
+                delete_edges.execute(params![site.from_node_id.as_str(), site.line, site.col])?;
+            delete_refs.execute(params![site.from_node_id.as_str(), site.line, site.col])?;
+            delete_resolved.execute(params![site.from_node_id.as_str(), site.line, site.col])?;
+        }
+    }
+    insert_unresolved_refs_in_connection(tx, refs)?;
+    Ok(removed)
 }
 
 /// Insert unresolved references through `conn`, which may be either the Store's
@@ -2127,6 +3267,49 @@ mod tests {
 
     fn store(test_name: &str) -> Store {
         Store::open(&temp_db_path(test_name)).expect("open temp store")
+    }
+
+    #[test]
+    fn project_metadata_prefix_reads_and_deletes_only_its_rows() {
+        let store = store("metadata-prefix");
+        for (key, value) in [
+            ("surface:src/b.ts", "2"),
+            ("surface:src/a.ts", "1"),
+            ("surfaces", "other"),
+            ("indexed_with_version", "0.1.0"),
+        ] {
+            store.set_project_metadata(key, value).unwrap();
+        }
+        assert_eq!(
+            store.project_metadata_with_prefix("surface:").unwrap(),
+            [
+                ("surface:src/a.ts".to_string(), "1".to_string()),
+                ("surface:src/b.ts".to_string(), "2".to_string()),
+            ]
+        );
+        assert_eq!(
+            store
+                .delete_project_metadata_with_prefix("surface:")
+                .unwrap(),
+            2
+        );
+        assert!(
+            store
+                .project_metadata_with_prefix("surface:")
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            store.get_project_metadata("surfaces").unwrap().as_deref(),
+            Some("other")
+        );
+        assert_eq!(
+            store
+                .get_project_metadata("indexed_with_version")
+                .unwrap()
+                .as_deref(),
+            Some("0.1.0")
+        );
     }
 
     fn node(id: &str, name: &str, file_path: &str) -> Node {
@@ -2511,6 +3694,29 @@ mod tests {
         assert_eq!(store.all_unresolved_refs().unwrap().len(), 1);
         let by_file = store.unresolved_refs_by_file_path("src/u.rs").unwrap();
         assert_eq!(by_file[0].reference_name, unresolved.reference_name);
+        let extends = UnresolvedRef {
+            reference_name: "Base".to_string(),
+            reference_kind: EdgeKind::Extends,
+            ..unresolved.clone()
+        };
+        store
+            .insert_unresolved_refs(std::slice::from_ref(&extends))
+            .unwrap();
+        let of_kind = store.unresolved_refs_of_kind(EdgeKind::Extends).unwrap();
+        assert_eq!(
+            of_kind
+                .iter()
+                .map(|reference| reference.reference_name.as_str())
+                .collect::<Vec<_>>(),
+            ["Base"]
+        );
+        assert_eq!(
+            store
+                .unresolved_refs_of_kind(EdgeKind::References)
+                .unwrap()
+                .len(),
+            1
+        );
 
         assert_eq!(store.get_project_metadata("root").unwrap(), None);
         store.set_project_metadata("root", "/tmp/project").unwrap();
@@ -3139,6 +4345,593 @@ mod tests {
     }
 
     #[test]
+    fn edge_sites_are_found_by_folded_target_names_in_both_file_relations() {
+        let mut store = store("folded-targets");
+        let php = |id: &str, name: &str, file: &str| {
+            let mut n = node(id, name, file);
+            n.language = Language::Php;
+            n
+        };
+        let mut js = node("function:js", "caller", "c.js");
+        js.language = Language::JavaScript;
+        store
+            .upsert_nodes(&[
+                php("function:render", "render", "view.php"),
+                php("function:FormatPrice", "FormatPrice", "helpers.php"),
+                php("function:local", "Local", "view.php"),
+                js.clone(),
+            ])
+            .unwrap();
+        let edge = |source: &str, target: &str, line: i64| Edge {
+            id: None,
+            source: source.to_string(),
+            target: target.to_string(),
+            kind: EdgeKind::Calls,
+            metadata: None,
+            line: Some(line),
+            col: Some(0),
+            provenance: None,
+        };
+        store
+            .insert_edges(&[
+                edge("function:render", "function:FormatPrice", 2),
+                edge("function:render", "function:local", 3),
+                edge("function:js", "function:FormatPrice", 4),
+            ])
+            .unwrap();
+        let sites = |names: &[&str]| -> Vec<(String, i64)> {
+            let names: Vec<String> = names.iter().map(|n| (*n).to_string()).collect();
+            store
+                .reference_sites_of_edges_to_folded_targets(&[Language::Php], &names)
+                .unwrap()
+                .into_iter()
+                .map(|s| (s.file_path, s.site.map_or(0, |site| site.line)))
+                .collect()
+        };
+        // Cross-file and same-file edges, from the languages asked for only.
+        assert_eq!(sites(&["formatPRICE"]), [("view.php".to_string(), 2)]);
+        assert_eq!(sites(&["LOCAL"]), [("view.php".to_string(), 3)]);
+        assert!(sites(&["price"]).is_empty());
+    }
+
+    #[test]
+    fn unresolved_refs_are_found_by_folded_names_and_qualified_php_classes() {
+        let mut store = store("folded-names");
+        store
+            .upsert_nodes(&[
+                node("function:src1", "src1", "a.php"),
+                node("function:src2", "src2", "b.js"),
+            ])
+            .unwrap();
+        let mk = |from: &str, name: &str, file: &str, lang: Language| UnresolvedRef {
+            id: None,
+            from_node_id: from.to_string(),
+            reference_name: name.to_string(),
+            reference_kind: EdgeKind::Calls,
+            line: 1,
+            col: 0,
+            candidates: None,
+            file_path: file.to_string(),
+            language: lang,
+            is_function_ref: false,
+            reference_subkind: None,
+        };
+        store
+            .insert_unresolved_refs(&[
+                mk("function:src1", "\\HELPER", "a.php", Language::Php),
+                mk("function:src1", "\\helper", "a.php", Language::Php),
+                mk("function:src1", "\\helperx", "a.php", Language::Php),
+                mk("function:src1", "F\\FirstName.make", "a.php", Language::Php),
+                mk("function:src1", "Plain.make", "a.php", Language::Php),
+                mk("function:src2", "\\HELPER", "b.js", Language::JavaScript),
+            ])
+            .unwrap();
+        let folded: Vec<String> = store
+            .unresolved_refs_by_folded_names(&[Language::Php], &["\\Helper".to_string()])
+            .unwrap()
+            .into_iter()
+            .map(|reference| reference.reference_name)
+            .collect();
+        // Any ASCII case of the whole name, and only the languages asked for.
+        assert_eq!(folded, ["\\HELPER", "\\helper"]);
+        assert!(
+            store
+                .unresolved_refs_by_folded_names(&[], &["\\helper".to_string()])
+                .unwrap()
+                .is_empty()
+        );
+        let qualified: Vec<String> = store
+            .unresolved_php_calls_through_qualified_classes()
+            .unwrap()
+            .into_iter()
+            .map(|reference| reference.reference_name)
+            .collect();
+        assert_eq!(qualified, ["F\\FirstName.make"]);
+    }
+
+    /// W5-09e: a reference resolution takes out of `unresolved_refs` moves
+    /// whole into `resolved_refs`, keeping its id, once even when listed
+    /// twice; with the rows still unresolved they are every reference of the
+    /// file, which the stored reads return by id and without it, per file or
+    /// per site.
+    #[test]
+    fn resolved_references_move_whole_and_read_back_as_extracted() {
+        let mut store = store("resolved-refs-move");
+        store
+            .upsert_nodes(&[
+                node("function:a", "a", "a.ts"),
+                node("function:b", "b", "b.ts"),
+            ])
+            .unwrap();
+        let mk = |from: &str, name: &str, line: i64, file: &str| UnresolvedRef {
+            id: None,
+            from_node_id: from.to_string(),
+            reference_name: name.to_string(),
+            reference_kind: EdgeKind::Calls,
+            line,
+            col: 2,
+            candidates: Some(vec!["x".to_string()]),
+            file_path: file.to_string(),
+            language: Language::TypeScript,
+            is_function_ref: false,
+            reference_subkind: None,
+        };
+        let written = vec![
+            mk("function:a", "one", 1, "a.ts"),
+            mk("function:a", "two", 2, "a.ts"),
+            mk("function:a", "two", 2, "a.ts"),
+            mk("function:a", "three", 3, "a.ts"),
+            mk("function:b", "other", 1, "b.ts"),
+        ];
+        store.insert_unresolved_refs(&written).unwrap();
+        let ids: Vec<i64> = store
+            .unresolved_refs_by_file_path("a.ts")
+            .unwrap()
+            .into_iter()
+            .map(|reference| reference.id.unwrap())
+            .collect();
+        // The first `two` and `three` resolve; `three` is listed twice.
+        store
+            .delete_resolved_unresolved_refs(&[ids[1], ids[3], ids[3]])
+            .unwrap();
+        let moved: Vec<(i64, String)> = store
+            .connection()
+            .prepare("SELECT id, reference_name FROM resolved_refs ORDER BY id")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            moved,
+            [(ids[1], "two".to_string()), (ids[3], "three".to_string())]
+        );
+        let back = store.stored_refs_of_file("a.ts").unwrap();
+        let expected: Vec<UnresolvedRef> = written[..4].to_vec();
+        assert_eq!(back, expected, "every reference, by id, without it");
+        let site = |from: &str, line: i64| ReferenceSite {
+            from_node_id: from.to_string(),
+            line,
+            col: 2,
+        };
+        let at_sites = store
+            .stored_refs_at_sites(&BTreeSet::from([site("function:a", 2)]))
+            .unwrap();
+        assert_eq!(at_sites, written[1..3].to_vec(), "the site's multiset");
+
+        // A site replacement and a whole-file replacement clear the stored
+        // references they replace; deleting a file's node cascades.
+        store
+            .replace_resolution_state_at_sites(&[site("function:a", 2)], &[])
+            .unwrap();
+        assert_eq!(
+            store.stored_refs_of_file("a.ts").unwrap(),
+            vec![written[0].clone(), written[3].clone()]
+        );
+        store
+            .replace_resolution_state_from_file("a.ts", &written[..1])
+            .unwrap();
+        assert_eq!(
+            store.stored_refs_of_file("a.ts").unwrap(),
+            written[..1].to_vec()
+        );
+        let b_ids: Vec<i64> = store
+            .unresolved_refs_by_file_path("b.ts")
+            .unwrap()
+            .into_iter()
+            .map(|reference| reference.id.unwrap())
+            .collect();
+        store.delete_resolved_unresolved_refs(&b_ids).unwrap();
+        store
+            .connection()
+            .execute("DELETE FROM nodes WHERE id = 'function:b'", [])
+            .unwrap();
+        assert!(store.stored_refs_of_file("b.ts").unwrap().is_empty());
+    }
+
+    /// W5-09a: the replacements of a sync's dependents applied in one
+    /// transaction leave what applying them one by one does, each of them
+    /// replacing what it covers: the stored references (resolved ones too)
+    /// and resolution edges at a site, and of a whole file.
+    #[test]
+    fn batched_resolution_replacements_match_one_by_one() {
+        let mk = |from: &str, name: &str, line: i64, file: &str| UnresolvedRef {
+            id: None,
+            from_node_id: from.to_string(),
+            reference_name: name.to_string(),
+            reference_kind: EdgeKind::Calls,
+            line,
+            col: 0,
+            candidates: None,
+            file_path: file.to_string(),
+            language: Language::TypeScript,
+            is_function_ref: false,
+            reference_subkind: None,
+        };
+        let build = |name: &str| {
+            let mut store = store(name);
+            store
+                .upsert_nodes(&[
+                    node("function:a", "a", "a.ts"),
+                    node("function:b", "b", "b.ts"),
+                    node("function:t", "t", "t.ts"),
+                ])
+                .unwrap();
+            store
+                .insert_unresolved_refs(&[
+                    mk("function:a", "x", 1, "a.ts"),
+                    mk("function:a", "t", 2, "a.ts"),
+                    mk("function:b", "t", 1, "b.ts"),
+                ])
+                .unwrap();
+            // `t` resolves at both sites: its edges are written and its rows
+            // move into `resolved_refs`.
+            let resolved: Vec<i64> = ["a.ts", "b.ts"]
+                .into_iter()
+                .flat_map(|file| store.unresolved_refs_by_file_path(file).unwrap())
+                .filter(|reference| reference.reference_name == "t")
+                .map(|reference| reference.id.unwrap())
+                .collect();
+            let call = |source: &str, line: i64| Edge {
+                line: Some(line),
+                col: Some(0),
+                ..edge(source, "function:t", EdgeKind::Calls)
+            };
+            store
+                .insert_edges(&[call("function:a", 2), call("function:b", 1)])
+                .unwrap();
+            store.delete_resolved_unresolved_refs(&resolved).unwrap();
+            store
+        };
+        let site = ReferenceSite {
+            from_node_id: "function:a".to_string(),
+            line: 2,
+            col: 0,
+        };
+        let a_now = vec![mk("function:a", "u", 2, "a.ts")];
+        let b_now = vec![mk("function:b", "v", 1, "b.ts")];
+        let mut one = build("replace-one-by-one");
+        one.replace_resolution_state_at_sites(std::slice::from_ref(&site), &a_now)
+            .unwrap();
+        one.replace_resolution_state_from_file("b.ts", &b_now)
+            .unwrap();
+        let mut batched = build("replace-batched");
+        batched
+            .replace_resolution_states(&[
+                ResolutionReplacement::Sites {
+                    sites: vec![site],
+                    refs: a_now.clone(),
+                },
+                ResolutionReplacement::File {
+                    file_path: "b.ts".to_string(),
+                    refs: b_now.clone(),
+                },
+            ])
+            .unwrap();
+        let state = |store: &Store| {
+            let edges: i64 = store
+                .connection()
+                .query_row("SELECT COUNT(*) FROM edges", [], |row| row.get(0))
+                .unwrap();
+            (
+                store.stored_refs_of_file("a.ts").unwrap(),
+                store.stored_refs_of_file("b.ts").unwrap(),
+                edges,
+            )
+        };
+        assert_eq!(state(&batched), state(&one));
+        assert_eq!(
+            state(&batched),
+            (
+                vec![mk("function:a", "x", 1, "a.ts"), a_now[0].clone()],
+                b_now,
+                0
+            ),
+            "each replacement replaced what it covers"
+        );
+    }
+
+    /// W5-09g: a move spanning several chunks, with ids repeated inside a
+    /// chunk and across chunks, leaves both tables as moving the rows one by
+    /// one does: each listed row moved once, whole and with its id, and every
+    /// other row still unresolved.
+    #[test]
+    fn a_move_across_chunks_moves_each_listed_row_once() {
+        let mut store = store("resolved-refs-chunks");
+        store
+            .upsert_nodes(&[node("function:a", "a", "a.ts")])
+            .unwrap();
+        let refs: Vec<UnresolvedRef> = (0..3_000)
+            .map(|i| UnresolvedRef {
+                id: None,
+                from_node_id: "function:a".to_string(),
+                reference_name: format!("r{i}"),
+                reference_kind: EdgeKind::Calls,
+                line: i + 1,
+                col: 0,
+                candidates: None,
+                file_path: "a.ts".to_string(),
+                language: Language::TypeScript,
+                is_function_ref: false,
+                reference_subkind: None,
+            })
+            .collect();
+        store.insert_unresolved_refs(&refs).unwrap();
+        let ids: Vec<i64> = store
+            .unresolved_refs_by_file_path("a.ts")
+            .unwrap()
+            .into_iter()
+            .map(|reference| reference.id.unwrap())
+            .collect();
+        // Every third row, in reverse, then a repeat of some of them: the
+        // repeats land in the same chunk and in later ones.
+        let mut listed: Vec<i64> = ids.iter().copied().step_by(3).rev().collect();
+        listed.extend(ids.iter().copied().step_by(9));
+        assert!(listed.len() > 2 * SQLITE_PARAM_CHUNK_SIZE);
+        store.delete_resolved_unresolved_refs(&listed).unwrap();
+
+        let id_list = |sql: &str| -> Vec<i64> {
+            store
+                .connection()
+                .prepare(sql)
+                .unwrap()
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        };
+        let moved: BTreeSet<i64> = ids.iter().copied().step_by(3).collect();
+        assert_eq!(
+            id_list("SELECT id FROM resolved_refs ORDER BY id"),
+            moved.iter().copied().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            id_list("SELECT id FROM unresolved_refs ORDER BY id"),
+            ids.iter()
+                .copied()
+                .filter(|id| !moved.contains(id))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            store.stored_refs_of_file("a.ts").unwrap(),
+            refs,
+            "every row, whole, by id"
+        );
+    }
+
+    #[test]
+    fn the_one_pass_retry_reads_what_the_four_lookups_read() {
+        let mut store = store("one-pass-retry");
+        store
+            .upsert_nodes(&[
+                node("function:php", "php", "a.php"),
+                node("function:pas", "pas", "b.pas"),
+                node("function:js", "js", "c.js"),
+            ])
+            .unwrap();
+        let mk = |from: &str, name: &str, kind: EdgeKind, lang: Language| UnresolvedRef {
+            id: None,
+            from_node_id: from.to_string(),
+            reference_name: name.to_string(),
+            reference_kind: kind,
+            line: 1,
+            col: 0,
+            candidates: None,
+            file_path: String::new(),
+            language: lang,
+            is_function_ref: false,
+            reference_subkind: None,
+        };
+        let php = |name: &str, kind| mk("function:php", name, kind, Language::Php);
+        let pas = |name: &str| mk("function:pas", name, EdgeKind::Calls, Language::Pascal);
+        let js = |name: &str, kind| mk("function:js", name, kind, Language::JavaScript);
+        let mut function_ref = js("util.helper", EdgeKind::References);
+        function_ref.is_function_ref = true;
+        store
+            .insert_unresolved_refs(&[
+                php("\\HELPER", EdgeKind::Calls),
+                php("\\helperx", EdgeKind::Calls),
+                php("Helper", EdgeKind::Calls),
+                php("F\\FirstName.make", EdgeKind::Calls),
+                php("F\\Other.helper", EdgeKind::Calls),
+                php("F\\Other.other", EdgeKind::Calls),
+                php("F\\FirstName.make", EdgeKind::References),
+                pas("HELPER"),
+                pas("Unit.Helper"),
+                js("\\HELPER", EdgeKind::Calls),
+                js("HELPER", EdgeKind::Calls),
+                js("a.helper", EdgeKind::Calls),
+                js("b.helper", EdgeKind::Calls),
+                js("c.helper", EdgeKind::Calls),
+                function_ref,
+                js("./lib/helper.js", EdgeKind::Imports),
+                js("mod:make/2", EdgeKind::Calls),
+                js("x.make", EdgeKind::Calls),
+                js("helper", EdgeKind::Calls),
+            ])
+            .unwrap();
+        let folded_languages = [Language::Php, Language::Pascal, Language::Cfml];
+        let ids = |refs: Vec<UnresolvedRef>| -> Vec<i64> {
+            refs.into_iter()
+                .map(|reference| reference.id.unwrap())
+                .collect()
+        };
+        let four = |names: &[String], ceiling: usize| -> Vec<i64> {
+            let rooted: Vec<String> = names.iter().map(|name| format!("\\{name}")).collect();
+            let wanted: HashSet<&str> = names.iter().map(String::as_str).collect();
+            let mut out = BTreeSet::new();
+            out.extend(ids(store
+                .unresolved_refs_by_name_tails(names, ceiling)
+                .unwrap()));
+            out.extend(ids(store
+                .unresolved_refs_by_folded_names(&[Language::Php], &rooted)
+                .unwrap()));
+            out.extend(ids(store
+                .unresolved_refs_by_folded_names(&folded_languages, names)
+                .unwrap()));
+            if !names.is_empty() {
+                out.extend(ids(store
+                    .unresolved_php_calls_through_qualified_classes()
+                    .unwrap()
+                    .into_iter()
+                    .filter(|reference| {
+                        reference
+                            .reference_name
+                            .rsplit_once('.')
+                            .is_some_and(|(class, member)| {
+                                wanted.contains(member)
+                                    || class
+                                        .rsplit('\\')
+                                        .next()
+                                        .is_some_and(|class| wanted.contains(class))
+                            })
+                    })
+                    .collect()));
+            }
+            out.into_iter().collect()
+        };
+        let one = |names: &[String], ceiling: usize| -> Vec<String> {
+            store
+                .unresolved_refs_retried_by_names(names, ceiling, &folded_languages)
+                .unwrap()
+                .into_iter()
+                .map(|reference| reference.reference_name)
+                .collect()
+        };
+        let names =
+            |list: &[&str]| -> Vec<String> { list.iter().map(|n| (*n).to_string()).collect() };
+        for list in [
+            &["helper"][..],
+            &["Helper"],
+            &["make"],
+            &["FirstName"],
+            &["helper", "make"],
+            &["Other"],
+            &["nothing"],
+            &[],
+        ] {
+            for ceiling in [1, 3, 500] {
+                let names = names(list);
+                let read = store
+                    .unresolved_refs_retried_by_names(&names, ceiling, &folded_languages)
+                    .unwrap();
+                assert_eq!(ids(read), four(&names, ceiling), "{list:?} at {ceiling}");
+            }
+        }
+        // Not vacuous: each lane reads its own rows.
+        assert_eq!(
+            one(&names(&["helper"]), 500),
+            [
+                "\\HELPER",
+                "Helper",
+                "F\\Other.helper",
+                "HELPER",
+                "a.helper",
+                "b.helper",
+                "c.helper",
+                "util.helper",
+                "./lib/helper.js",
+            ]
+        );
+        // Six qualified references share the tail `helper`: past a ceiling of
+        // three the tail lane reads none of them, the PHP class lane still
+        // its own. A tail matches in its own case only.
+        assert_eq!(
+            one(&names(&["helper"]), 3),
+            ["\\HELPER", "Helper", "F\\Other.helper", "HELPER"]
+        );
+        assert_eq!(
+            one(&names(&["Helper"]), 500),
+            ["\\HELPER", "Helper", "HELPER", "Unit.Helper"]
+        );
+        assert_eq!(
+            one(&names(&["make"]), 500),
+            [
+                "F\\FirstName.make",
+                "F\\FirstName.make",
+                "mod:make/2",
+                "x.make"
+            ]
+        );
+        assert_eq!(one(&names(&["FirstName"]), 500), ["F\\FirstName.make"]);
+    }
+
+    #[test]
+    fn unresolved_refs_of_a_language_are_found_by_their_member() {
+        let mut store = store("by-members");
+        store
+            .upsert_nodes(&[
+                node("function:src1", "src1", "a.php"),
+                node("function:src2", "src2", "b.rb"),
+            ])
+            .unwrap();
+        let mk = |from: &str, name: &str, file: &str, lang: Language| UnresolvedRef {
+            id: None,
+            from_node_id: from.to_string(),
+            reference_name: name.to_string(),
+            reference_kind: EdgeKind::Calls,
+            line: 1,
+            col: 0,
+            candidates: None,
+            file_path: file.to_string(),
+            language: lang,
+            is_function_ref: false,
+            reference_subkind: None,
+        };
+        store
+            .insert_unresolved_refs(&[
+                mk("function:src1", "page.save", "a.php", Language::Php),
+                mk("function:src1", "this.repo.save", "a.php", Language::Php),
+                mk("function:src1", "page.saveAll", "a.php", Language::Php),
+                mk("function:src1", "save", "a.php", Language::Php),
+                mk("function:src1", "x.a_b", "a.php", Language::Php),
+                mk("function:src1", "x.a*b", "a.php", Language::Php),
+                mk("function:src2", "page.save", "b.rb", Language::Ruby),
+            ])
+            .unwrap();
+        let names = |members: &[&str]| -> Vec<String> {
+            let members: Vec<String> = members.iter().map(|m| (*m).to_string()).collect();
+            store
+                .unresolved_refs_of_language_by_members(Language::Php, &members)
+                .unwrap()
+                .into_iter()
+                .map(|reference| reference.reference_name)
+                .collect()
+        };
+        // The member after the last `.`, whole: not a bare name, not a longer
+        // member, not another language's.
+        assert_eq!(names(&["save"]), ["page.save", "this.repo.save"]);
+        // GLOB's own characters match only themselves.
+        assert_eq!(names(&["a*b"]), ["x.a*b"]);
+        assert_eq!(
+            names(&["a_b", "save"]),
+            ["page.save", "this.repo.save", "x.a_b"]
+        );
+        assert!(names(&[]).is_empty());
+        assert!(names(&["repo.save"]).is_empty());
+    }
+
+    #[test]
     fn function_ref_flag_round_trips_through_unresolved_refs() {
         let mut store = store("fn-ref");
         store
@@ -3516,6 +5309,50 @@ mod tests {
         assert_eq!(removed, 1);
         assert_eq!(store.all_edges().unwrap().len(), 1);
         assert_eq!(store.all_edges().unwrap()[0].kind, EdgeKind::Contains);
+    }
+
+    #[test]
+    fn whole_file_fallbacks_keep_same_file_value_references() {
+        let mut store = store("value-refs-survive");
+        store
+            .upsert_nodes(&[
+                node("function:run", "run", "a.ts"),
+                node("constant:limit", "LIMIT_MAX", "a.ts"),
+                node("function:callee", "callee", "b.ts"),
+            ])
+            .unwrap();
+        let mut value_ref = edge("function:run", "constant:limit", EdgeKind::References);
+        value_ref.metadata = Some(serde_json::json!({ "valueRef": true }));
+        value_ref.line = None;
+        value_ref.col = None;
+        // A resolved `references` edge without the marker still goes.
+        let mut resolved_ref = edge("function:run", "function:callee", EdgeKind::References);
+        resolved_ref.line = Some(3);
+        resolved_ref.col = Some(4);
+        store
+            .insert_edges(&[
+                value_ref.clone(),
+                resolved_ref,
+                edge("function:run", "function:callee", EdgeKind::Calls),
+            ])
+            .unwrap();
+        assert_eq!(store.delete_resolved_edges_from_file("a.ts").unwrap(), 2);
+        let left = store.all_edges().unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].target, "constant:limit");
+
+        store
+            .insert_edges(&[edge("function:run", "function:callee", EdgeKind::Calls)])
+            .unwrap();
+        assert_eq!(
+            store
+                .replace_resolution_state_from_file("a.ts", &[])
+                .unwrap(),
+            1
+        );
+        let left = store.all_edges().unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].kind, EdgeKind::References);
     }
 
     #[test]

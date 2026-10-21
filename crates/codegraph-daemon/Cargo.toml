@@ -13,6 +13,12 @@ rust-version.workspace = true
 description = "Per-project single-instance daemon (pid + socket, ppid watchdog) for CodeGraph-rs."
 readme = "../../README.md"
 
+[features]
+# Test-only seams: let a test build's daemon claim another version in its hello
+# and leave control frames unanswered, so the replacement of an older daemon can
+# be driven end to end. Never enabled in a release build.
+test-hooks = []
+
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }

@@ -67,6 +67,7 @@ function route(over: Partial<WireEntryRoute> = {}): WireEntryRoute {
     routeFile: 'internal/transport/httpapi/router.go',
     routeLine: 9,
     routeId: 'route:router.go:9:POST:/v1/payroll/cycles/{cycleID}/run',
+    inline: false,
     ...over,
   };
 }
@@ -223,6 +224,14 @@ describe('an entry-point row', () => {
     expect(row.target).toBeNull();
     expect(row.flowFrom).toBeNull();
     expect(row.meta).toBe('RunCycle · not in the index');
+  });
+
+  it('opens an inline handler on its route but draws no Flow from it', () => {
+    const row = routeRow(
+      route({ handler: 'inline handler', handlerKind: 'route', handlerId: 'route:app.js:11', inline: true })
+    );
+    expect(row.target).toEqual({ type: 'symbol', id: 'route:app.js:11', name: 'inline handler', kind: 'route' });
+    expect(row.flowFrom).toBeNull();
   });
 
   it('offers a flow only from a row that names a callable symbol', () => {

@@ -75,12 +75,18 @@ impl LanguageSpec for CppSpec {
         {
             return Some(name);
         }
-        let qid = declarator_qualified_id(child_by_field(node, "declarator")?)?;
-        node_text(qid, source)
-            .rsplit("::")
-            .filter(|part| !part.is_empty())
-            .next()
-            .map(str::to_string)
+        child_by_field(node, "declarator")
+            .and_then(declarator_qualified_id)
+            .and_then(|qid| {
+                node_text(qid, source)
+                    .rsplit("::")
+                    .find(|part| !part.is_empty())
+                    .map(str::to_string)
+            })
+            .or_else(|| crate::lang::c::unnamed_type_variable_name(node, source))
+    }
+    fn declaration_wrapper<'tree>(&self, node: Node<'tree>) -> Option<Node<'tree>> {
+        crate::lang::c::defining_declaration(node)
     }
     fn get_receiver_type(&self, node: Node<'_>, source: &str) -> Option<String> {
         let qid = declarator_qualified_id(child_by_field(node, "declarator")?)?;
@@ -134,12 +140,17 @@ impl LanguageSpec for CppSpec {
         }
         None
     }
-    fn is_misparsed_function(&self, name: &str, _node: Node<'_>, _source: &str) -> bool {
+    fn is_misparsed_function(&self, name: &str, node: Node<'_>, _source: &str) -> bool {
         name.starts_with("namespace")
             || matches!(
                 name,
                 "switch" | "if" | "for" | "while" | "do" | "case" | "return"
             )
+            // `class MACRO Name : public Base { … }` misparses to a function
+            // definition named after the class or its base. The ALL-CAPS
+            // export-macro shapes are recovered as classes before this; this is
+            // the fallback for any misparse left (upstream #946).
+            || is_macro_misparsed_type_decl(node)
     }
     fn extract_import(&self, node: Node<'_>, source: &str) -> Option<ImportInfo> {
         include_import(node, source)
@@ -147,6 +158,28 @@ impl LanguageSpec for CppSpec {
     fn pre_parse(&self, source: &str, file_path: &str) -> String {
         pre_parse_cpp_source(source, file_path)
     }
+}
+
+/// tree-sitter's reading of a class or struct annotated with a macro it does
+/// not know (upstream #946 `isMacroMisparsedTypeDecl`): `class MACRO` is an
+/// elaborated type specifier, a *bodyless* `class_specifier` or
+/// `struct_specifier`, and the rest a function definition whose declarator is
+/// no function declarator. A real inline-defined return type (`struct P { int
+/// x; } makeP() { … }`) has a field list, and a real function returning an
+/// elaborated type (`class Foo f() { … }`) has a function declarator.
+fn is_macro_misparsed_type_decl(node: Node<'_>) -> bool {
+    let Some(type_node) = child_by_field(node, "type") else {
+        return false;
+    };
+    if !matches!(type_node.kind(), "class_specifier" | "struct_specifier")
+        || type_node
+            .named_children(&mut type_node.walk())
+            .any(|child| child.kind() == "field_declaration_list")
+    {
+        return false;
+    }
+    !child_by_field(node, "declarator")
+        .is_some_and(|declarator| declarator.kind() == "function_declarator")
 }
 
 /// A C++ pure-virtual declaration is a `field_declaration`, not a
@@ -422,26 +455,54 @@ fn find_descendant_of_kind<'tree>(node: Node<'tree>, kind: &str) -> Option<Node<
         .find_map(|child| find_descendant_of_kind(child, kind))
 }
 
-/// Offset-preserving C++ pre-parse: blank heavily-reflected Unreal-Engine markup
-/// (member-level `*_API` prefixes, line-leading no-semicolon annotation macros,
-/// mid-line `UMETA`/`UPARAM`/`UE_DEPRECATED`) so the enclosing class parses
-/// instead of collapsing into an ERROR node (#1158). Blanking replaces bytes with
-/// ASCII spaces — tree-sitter consumes byte offsets, and every blanked span lies
-/// on char boundaries, so byte length (and thus line/column) is preserved. Each
-/// pass is `contains`-gated, so macro-free C++ is returned byte-identical.
-fn pre_parse_cpp_source(source: &str, file_path: &str) -> String {
-    let bytes = blank_msvc_com_interface_keyword(blank_cpp_annotation_macro_calls(
-        blank_cpp_inline_annotation_macros(blank_cpp_api_prefix_macros(source.as_bytes().to_vec())),
+/// Offset-preserving C++ pre-parse, in upstream `preParseCppSource`'s order
+/// (`b635dd46`): access specifiers spelled as macros are rewritten and
+/// conditionals inside a declaration flattened (#2186); then the MSVC COM
+/// `interface` keyword, macros in class heads (#1070, #2449) and in front of
+/// return types (#1100), Unreal-Engine markup (member `*_API` prefixes,
+/// mid-line `UMETA`/`UPARAM`/`UE_DEPRECATED`, line-leading annotation calls,
+/// #1158), attribute macros around pointers, after parameter lists and
+/// declared names (#2449), the C leading attribute macro (only with a
+/// `#define` proving it, KEEP-RUST), macros opening a declaration (#2449) and
+/// lone macro lines (#1346); the Metal and CUDA dialects; and last, every
+/// directive line as the source wrote it (#1346). Blanking replaces bytes
+/// with ASCII spaces on char boundaries, so byte length (and thus every
+/// line/column) is preserved. Each pass is gated, so macro-free C++ is
+/// returned byte-identical.
+pub(crate) fn pre_parse_cpp_source(source: &str, file_path: &str) -> String {
+    // Every pass replaces whole ASCII spans, so the text stays UTF-8; were it
+    // ever not to, the source goes to the parser unchanged.
+    try_pre_parse_cpp_source(source, file_path).unwrap_or_else(|| source.to_string())
+}
+
+fn try_pre_parse_cpp_source(source: &str, file_path: &str) -> Option<String> {
+    use super::cpp_preparse as passes;
+    let source =
+        passes::flatten_mid_statement_conditionals(&passes::rewrite_cpp_access_macros(source));
+    let text = |bytes: Vec<u8>| String::from_utf8(bytes).ok();
+    let blanked = text(blank_msvc_com_interface_keyword(source.as_bytes().to_vec()))?;
+    let blanked = passes::blank_cpp_inline_macros(&passes::blank_cpp_export_macros(&blanked));
+    let blanked = text(blank_cpp_inline_annotation_macros(
+        blank_cpp_api_prefix_macros(blanked.into_bytes()),
+    ))?;
+    let blanked = passes::blank_cpp_declarator_attribute_macros(
+        &passes::blank_cpp_trailing_attribute_macros(&passes::blank_cpp_pointer_annotation_macros(
+            &blanked,
+        )),
+    );
+    let blanked = text(blank_cpp_annotation_macro_calls(blanked.into_bytes()))?;
+    let blanked = passes::blank_lone_macro_lines(&passes::blank_cpp_leading_attribute_macros(
+        &super::c::blank_c_leading_attr_macros(&blanked),
     ));
     let lower = file_path.to_ascii_lowercase();
     let bytes = if lower.ends_with(".metal") {
-        blank_metal_attributes(bytes)
-    } else if lower.ends_with(".cu") || lower.ends_with(".cuh") || looks_like_cuda_source(source) {
-        blank_cuda_constructs(bytes)
+        blank_metal_attributes(blanked.into_bytes())
+    } else if lower.ends_with(".cu") || lower.ends_with(".cuh") || looks_like_cuda_source(&source) {
+        blank_cuda_constructs(blanked.into_bytes())
     } else {
-        bytes
+        blanked.into_bytes()
     };
-    String::from_utf8(bytes).unwrap_or_else(|_| source.to_string())
+    Some(passes::restore_directive_lines(&source, &text(bytes)?))
 }
 
 /// Blank Metal Shading Language `[[attribute]]` annotations (`[[position]]`,
@@ -836,8 +897,28 @@ fn blank_msvc_com_interface_keyword(bytes: Vec<u8>) -> Vec<u8> {
 /// node's docstring, so a purely textual match corrupts extraction output even
 /// though it never mints a node.
 pub(crate) fn cpp_code_mask(src: &str) -> Vec<bool> {
+    cpp_code_classes(src)
+        .into_iter()
+        .map(|class| class == CODE)
+        .collect()
+}
+
+/// [`cpp_code_classes`]: ordinary code.
+pub(crate) const CODE: u8 = 0;
+/// [`cpp_code_classes`]: a line or block comment.
+pub(crate) const COMMENT: u8 = 1;
+/// [`cpp_code_classes`]: a string, char or raw string literal.
+pub(crate) const LITERAL: u8 = 2;
+/// [`cpp_code_classes`]: a logical preprocessor line.
+pub(crate) const DIRECTIVE: u8 = 3;
+
+/// The lexical class of every byte of `src` ([`CODE`], [`COMMENT`],
+/// [`LITERAL`], [`DIRECTIVE`]): the one scan [`cpp_code_mask`] reads, so the
+/// C++ pre-parse passes that need to tell a literal from a comment see the
+/// same boundaries as every other pass.
+pub(crate) fn cpp_code_classes(src: &str) -> Vec<u8> {
     let bytes = src.as_bytes();
-    let mut mask = vec![true; bytes.len()];
+    let mut classes = vec![CODE; bytes.len()];
     let mut i = 0usize;
     let mut at_line_start = true;
     while i < bytes.len() {
@@ -854,28 +935,28 @@ pub(crate) fn cpp_code_mask(src: &str) -> Vec<bool> {
             }
             at_line_start = false;
             if b == b'#' {
-                i = mask_preprocessor_line(bytes, &mut mask, i);
+                i = mask_preprocessor_line(bytes, &mut classes, i);
                 at_line_start = true;
                 continue;
             }
         }
         if b == b'/' && bytes.get(i + 1) == Some(&b'/') {
             while i < bytes.len() && bytes[i] != b'\n' {
-                mask[i] = false;
+                classes[i] = COMMENT;
                 i += 1;
             }
             continue;
         }
         if b == b'/' && bytes.get(i + 1) == Some(&b'*') {
-            mask[i] = false;
-            mask[i + 1] = false;
+            classes[i] = COMMENT;
+            classes[i + 1] = COMMENT;
             i += 2;
             while i < bytes.len() {
                 let closing = bytes[i] == b'*' && bytes.get(i + 1) == Some(&b'/');
-                mask[i] = false;
+                classes[i] = COMMENT;
                 i += 1;
                 if closing {
-                    mask[i] = false;
+                    classes[i] = COMMENT;
                     i += 1;
                     break;
                 }
@@ -885,28 +966,28 @@ pub(crate) fn cpp_code_mask(src: &str) -> Vec<bool> {
         // A raw string is recognised by the `R` immediately before the quote,
         // which also covers every encoding prefix (`LR"`, `u8R"`, `uR"`, `UR"`).
         if b == b'"' && i > 0 && bytes[i - 1] == b'R' {
-            i = mask_raw_string(bytes, &mut mask, i);
+            i = mask_raw_string(bytes, &mut classes, i);
             continue;
         }
         if b == b'"' || b == b'\'' {
-            i = mask_quoted_literal(bytes, &mut mask, i, b);
+            i = mask_quoted_literal(bytes, &mut classes, i, b);
             continue;
         }
         i += 1;
     }
-    mask
+    classes
 }
 
-/// Mask a whole LOGICAL preprocessor line starting at `start` (the `#`),
+/// Mark a whole LOGICAL preprocessor line starting at `start` (the `#`),
 /// following every backslash-newline continuation. Returns the index just past
 /// the logical line. The continuation matters: `#define D \` + a following
 /// `  interface IFoo` line is one directive, and its second physical line is
 /// not code.
-fn mask_preprocessor_line(bytes: &[u8], mask: &mut [bool], start: usize) -> usize {
+fn mask_preprocessor_line(bytes: &[u8], classes: &mut [u8], start: usize) -> usize {
     let mut i = start;
     loop {
         while i < bytes.len() && bytes[i] != b'\n' {
-            mask[i] = false;
+            classes[i] = DIRECTIVE;
             i += 1;
         }
         let mut back = i;
@@ -915,7 +996,7 @@ fn mask_preprocessor_line(bytes: &[u8], mask: &mut [bool], start: usize) -> usiz
         }
         let continued = back > start && bytes[back - 1] == b'\\';
         if i < bytes.len() {
-            mask[i] = false;
+            classes[i] = DIRECTIVE;
             i += 1;
         }
         if !continued || i >= bytes.len() {
@@ -924,10 +1005,10 @@ fn mask_preprocessor_line(bytes: &[u8], mask: &mut [bool], start: usize) -> usiz
     }
 }
 
-/// Mask `R"delim( … )delim"` from its opening quote. The delimiter is captured
+/// Mark `R"delim( … )delim"` from its opening quote. The delimiter is captured
 /// so a custom one (`R"xy( … )xy"`) closes on its own terminator instead of the
 /// first `)"`. A malformed opener falls back to ordinary string rules.
-fn mask_raw_string(bytes: &[u8], mask: &mut [bool], quote: usize) -> usize {
+fn mask_raw_string(bytes: &[u8], classes: &mut [u8], quote: usize) -> usize {
     let mut delim_end = quote + 1;
     while delim_end < bytes.len()
         && bytes[delim_end] != b'('
@@ -937,7 +1018,7 @@ fn mask_raw_string(bytes: &[u8], mask: &mut [bool], quote: usize) -> usize {
         delim_end += 1;
     }
     if delim_end >= bytes.len() || bytes[delim_end] != b'(' {
-        return mask_quoted_literal(bytes, mask, quote, b'"');
+        return mask_quoted_literal(bytes, classes, quote, b'"');
     }
     let mut closer = Vec::with_capacity(delim_end - quote + 1);
     closer.push(b')');
@@ -953,28 +1034,28 @@ fn mask_raw_string(bytes: &[u8], mask: &mut [bool], quote: usize) -> usize {
         }
         k += 1;
     };
-    for m in mask.iter_mut().take(end).skip(quote) {
-        *m = false;
+    for class in classes.iter_mut().take(end).skip(quote) {
+        *class = LITERAL;
     }
     end
 }
 
-/// Mask a `"…"` or `'…'` literal from its opening quote, honouring backslash
+/// Mark a `"…"` or `'…'` literal from its opening quote, honouring backslash
 /// escapes. An unterminated literal stops at the newline rather than swallowing
 /// the rest of the file.
-fn mask_quoted_literal(bytes: &[u8], mask: &mut [bool], start: usize, quote: u8) -> usize {
-    mask[start] = false;
+fn mask_quoted_literal(bytes: &[u8], classes: &mut [u8], start: usize, quote: u8) -> usize {
+    classes[start] = LITERAL;
     let mut i = start + 1;
     while i < bytes.len() {
         let c = bytes[i];
         if c == b'\n' {
             break;
         }
-        mask[i] = false;
+        classes[i] = LITERAL;
         i += 1;
         if c == b'\\' {
             if i < bytes.len() && bytes[i] != b'\n' {
-                mask[i] = false;
+                classes[i] = LITERAL;
                 i += 1;
             }
             continue;
@@ -1510,6 +1591,55 @@ mod tests {
     /// tree-sitter's error recovery happens to extract identically for that
     /// file's text (measured). The exclusion is still required: it stops the pass
     /// emitting invalid C++ from input that parses correctly today.
+    /// Upstream #2449's whole-pipeline offset check: every macro of a class
+    /// written around attribute macros goes, every line keeps its length,
+    /// CRLF included.
+    #[test]
+    fn pre_parse_keeps_every_offset_through_the_whole_pipeline() {
+        let src = "class PROTOBUF_EXPORT X final : public Y {\n  const D* PROTOBUF_NONNULL d() const ABSL_ATTRIBUTE_LIFETIME_BOUND;\n  int n_ GUARDED_BY(mu_);\n};\r\n";
+        let out = pre_parse_cpp_source(src, "x.h");
+        assert_eq!(out.len(), src.len());
+        let lengths = |text: &str| text.split('\n').map(str::len).collect::<Vec<_>>();
+        assert_eq!(lengths(&out), lengths(src));
+        for gone in ["PROTOBUF_", "ABSL_", "GUARDED_BY"] {
+            assert!(!out.contains(gone), "{out:?}");
+        }
+    }
+
+    /// The C leading attribute macro pass runs in C++ only with a `#define`
+    /// proving the token an attribute (KEEP-RUST): a typedef'd return type or
+    /// a keyword alias in capitals stays, and so does a macro call inside an
+    /// expression.
+    #[test]
+    fn pre_parse_leaves_unproved_capitals_and_expression_macros_alone() {
+        for src in [
+            "EFI_STATUS f(void) {\n  return 0;\n}\n",
+            "STATIC int x;\n",
+            "int v = MAX_OF(a, b) + LIMIT_VALUE;\n",
+            "if (CHECK_FLAG(x)) {\n  run();\n}\n",
+        ] {
+            assert_eq!(pre_parse_cpp_source(src, "x.cpp"), src, "{src:?}");
+        }
+        // With a `#define` proving it an attribute, the C pass blanks it.
+        let proved = "#define SEC_ATTR __attribute__((section(\".x\")))\nSEC_ATTR int helper(void) {\n  return 0;\n}\n";
+        let out = pre_parse_cpp_source(proved, "x.cpp");
+        assert!(out.starts_with("#define SEC_ATTR "), "{out:?}");
+        assert!(out.contains("\n         int helper(void)"), "{out:?}");
+    }
+
+    /// A directive keeps its text through every pass: a `#define` whose body
+    /// holds a macro shape the passes blank elsewhere is restored whole.
+    #[test]
+    fn pre_parse_restores_directive_lines() {
+        let src = "#define DECL(name) PROTOBUF_EXPORT void name()\nclass FOO_API Thing {};\n";
+        let out = pre_parse_cpp_source(src, "x.h");
+        assert!(
+            out.starts_with("#define DECL(name) PROTOBUF_EXPORT void name()\n"),
+            "{out:?}"
+        );
+        assert!(out.contains("class         Thing {};"), "{out:?}");
+    }
+
     #[test]
     fn cpp_code_mask_covers_comments_strings_and_preproc() {
         let must_not_fire: &[(&str, &str)] = &[

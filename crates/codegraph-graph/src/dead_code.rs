@@ -5,9 +5,15 @@
 //! edge from whatever holds it points at the symbol. `dead` is an inference on
 //! top of that fact, and every step of it is subtractive — a candidate leaves
 //! the list the moment there is any reason to believe something outside the
-//! graph reaches it: exported or declared in a header; in a test, generated or
-//! vendored file; abstract or declared on an interface; decorated; overriding
-//! an ancestor's member (or an ancestor we cannot read); named something the
+//! graph reaches it: exported (a TypeScript `declare module 'x'` or `declare
+//! global` body exports what it declares, which merges into a library's or
+//! the global scope's type, upstream #2418) or declared in a header; in a
+//! test, generated or
+//! vendored file; abstract or declared on an interface; decorated (a
+//! `decorates` edge, or a decorator from outside the index the resolver could
+//! not follow); overriding an ancestor's member (or an ancestor we cannot
+//! read); a TypeScript hook its framework calls by name on a decorated class
+//! that skips the `implements` clause; named something the
 //! language calls by itself; in an in-file test scope; in a component file
 //! whose markup can reference it invisibly; in a file nothing reaches; sharing
 //! a name the resolver failed to follow, or a name another referenced symbol
@@ -21,7 +27,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use codegraph_core::types::{EdgeKind, Node, NodeKind};
+use codegraph_core::types::{EdgeKind, Language, Node, NodeKind};
 use codegraph_store::Store;
 
 use crate::collation::locale_compare;
@@ -88,6 +94,20 @@ fn is_declaration_container_kind(kind: NodeKind) -> bool {
         kind,
         NodeKind::Interface | NodeKind::Trait | NodeKind::Protocol
     )
+}
+
+/// Languages whose `implements` clause is erased before the program runs, so
+/// a framework that calls an interface's member can only be finding it by
+/// name, the premise of [`by_name_hook_candidates`]. Java, C#, Kotlin and the
+/// rest check the interface itself: Spring never calls `afterPropertiesSet` on
+/// a bean that merely has a method of that name.
+const BY_NAME_DISPATCH_LANGUAGES: &[Language] = &[Language::TypeScript, Language::Tsx];
+
+/// A member a framework could call as a hook: a method or function in a
+/// [`BY_NAME_DISPATCH_LANGUAGES`] file.
+fn is_hook_shaped(node: &Node) -> bool {
+    matches!(node.kind, NodeKind::Method | NodeKind::Function)
+        && BY_NAME_DISPATCH_LANGUAGES.contains(&node.language)
 }
 
 /// Member kinds an override can be declared on.
@@ -181,6 +201,10 @@ pub struct DeadCodeExclusions {
     pub declarations: usize,
     pub decorated: usize,
     pub overriding: usize,
+    /// A hook its framework calls by name, on a class that skips the
+    /// interface: the class carries a decorator, and the name is one an
+    /// interface outside the index carries, going by the classes that write it.
+    pub hooks: usize,
     pub implicit: usize,
     pub vendored: usize,
     pub test_scope: usize,
@@ -195,7 +219,7 @@ pub struct DeadCodeExclusions {
 
 impl DeadCodeExclusions {
     /// Every rule with its wire name (upstream's camelCase key), in rule order.
-    pub fn entries(&self) -> [(&'static str, usize); 17] {
+    pub fn entries(&self) -> [(&'static str, usize); 18] {
         [
             ("tests", self.tests),
             ("generated", self.generated),
@@ -204,6 +228,7 @@ impl DeadCodeExclusions {
             ("declarations", self.declarations),
             ("decorated", self.decorated),
             ("overriding", self.overriding),
+            ("hooks", self.hooks),
             ("implicit", self.implicit),
             ("vendored", self.vendored),
             ("testScope", self.test_scope),
@@ -321,13 +346,7 @@ pub fn build_dead_code_report(
     }
 
     // ---- the rules that need the graph -------------------------------------
-    // A `decorates` edge runs FROM the decorated symbol to the decorator.
-    let surviving_ids: Vec<String> = surviving.iter().map(|n| n.id.clone()).collect();
-    let decorated: HashSet<String> = store
-        .outgoing_edges_from(&surviving_ids, &[EdgeKind::Decorates])?
-        .into_iter()
-        .map(|e| e.source)
-        .collect();
+    let decorated = carries_decorator(store, &surviving)?;
     let containers = containers_of(store, &surviving)?;
     let overriding = override_candidates(store, &surviving, &containers)?;
     // A file nothing reaches is an island: its symbols' zero fan-in describes
@@ -345,10 +364,18 @@ pub fn build_dead_code_report(
     let names: Vec<String> = surviving.iter().map(|n| n.name.clone()).collect();
     let unresolved = store.unresolved_names_among(&names)?;
     let ambiguous = store.ambiguous_referenced_names(&names)?;
+    // Asked only about the members no earlier rule in the loop below drops.
+    let undecided: Vec<&Node> = surviving
+        .iter()
+        .copied()
+        .filter(|node| !decorated.contains(&node.id) && !overriding.contains(&node.id))
+        .collect();
+    let unreferenced: Vec<&Node> = candidates.iter().map(|(node, _)| node).collect();
+    let hooks = by_name_hook_candidates(store, &undecided, &containers, &unreferenced)?;
 
     let mut kept: Vec<&Node> = Vec::new();
     for node in surviving {
-        if decorated.contains(&node.id) || !node.decorators.is_empty() {
+        if decorated.contains(&node.id) {
             excluded.decorated += 1;
         } else if containers
             .get(&node.id)
@@ -357,6 +384,8 @@ pub fn build_dead_code_report(
             excluded.declarations += 1;
         } else if overriding.contains(&node.id) {
             excluded.overriding += 1;
+        } else if hooks.contains(&node.id) {
+            excluded.hooks += 1;
         } else if unresolved.contains(&node.name) {
             excluded.unresolved_name += 1;
         } else if ambiguous.contains(&node.name) {
@@ -646,64 +675,12 @@ fn override_candidates(
         return Ok(dropped);
     }
 
-    // Level-by-level upward walk over EVERY container at once. `reach` maps an
-    // ancestor back to the containers it is an ancestor of.
-    let mut reach: HashMap<String, HashSet<String>> = HashMap::new();
-    let mut seen: HashMap<String, HashSet<String>> = container_ids
-        .iter()
-        .map(|id| (id.clone(), HashSet::from([id.clone()])))
-        .collect();
-    let mut frontier: Vec<(String, HashSet<String>)> = container_ids
-        .iter()
-        .map(|id| (id.clone(), HashSet::from([id.clone()])))
-        .collect();
-    let mut depth = 0;
-    while depth < MAX_OVERRIDE_ANCESTOR_DEPTH && !frontier.is_empty() {
-        let roots_of: HashMap<&str, &HashSet<String>> =
-            frontier.iter().map(|(id, r)| (id.as_str(), r)).collect();
-        let ids: Vec<String> = frontier.iter().map(|(id, _)| id.clone()).collect();
-        let mut edges =
-            store.outgoing_edges_from(&ids, &[EdgeKind::Extends, EdgeKind::Implements])?;
-        edges.sort_by(|a, b| {
-            a.source
-                .cmp(&b.source)
-                .then_with(|| a.target.cmp(&b.target))
-        });
-        let mut next: Vec<(String, HashSet<String>)> = Vec::new();
-        let mut next_at: HashMap<String, usize> = HashMap::new();
-        for edge in edges {
-            if edge.target == edge.source {
-                continue;
-            }
-            let Some(roots) = roots_of.get(edge.source.as_str()) else {
-                continue;
-            };
-            let visited = seen.entry(edge.target.clone()).or_default();
-            let known = reach.entry(edge.target.clone()).or_default();
-            let mut merged: HashSet<String> = HashSet::new();
-            for root in roots.iter() {
-                if visited.insert(root.clone()) {
-                    merged.insert(root.clone());
-                    known.insert(root.clone());
-                }
-            }
-            if known.is_empty() {
-                reach.remove(&edge.target);
-            }
-            if merged.is_empty() {
-                continue;
-            }
-            match next_at.get(&edge.target) {
-                Some(&at) => next[at].1.extend(merged),
-                None => {
-                    next_at.insert(edge.target.clone(), next.len());
-                    next.push((edge.target.clone(), merged));
-                }
-            }
-        }
-        frontier = next;
-        depth += 1;
-    }
+    // `reach` maps an ancestor back to the containers it is an ancestor of.
+    let reach = ancestors_of(
+        store,
+        &container_ids,
+        &[EdgeKind::Extends, EdgeKind::Implements],
+    )?;
 
     let mut opaque: HashSet<String> = HashSet::new();
     let mut probe: Vec<String> = container_ids.clone();
@@ -765,6 +742,311 @@ fn override_candidates(
                 .get(&container.id)
                 .is_some_and(|names| names.contains(&node.name))
         {
+            dropped.insert(node.id.clone());
+        }
+    }
+    Ok(dropped)
+}
+
+/// Every ancestor of `ids` along `kinds` edges, mapped back to the ids it is
+/// an ancestor of. A level-by-level upward walk over EVERY id at once, one
+/// query per level rather than one per id, up to
+/// [`MAX_OVERRIDE_ANCESTOR_DEPTH`].
+fn ancestors_of(
+    store: &Store,
+    ids: &[String],
+    kinds: &[EdgeKind],
+) -> rusqlite::Result<HashMap<String, HashSet<String>>> {
+    let mut reach: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut seen: HashMap<String, HashSet<String>> = ids
+        .iter()
+        .map(|id| (id.clone(), HashSet::from([id.clone()])))
+        .collect();
+    let mut frontier: Vec<(String, HashSet<String>)> = ids
+        .iter()
+        .map(|id| (id.clone(), HashSet::from([id.clone()])))
+        .collect();
+    let mut depth = 0;
+    while depth < MAX_OVERRIDE_ANCESTOR_DEPTH && !frontier.is_empty() {
+        let roots_of: HashMap<&str, &HashSet<String>> =
+            frontier.iter().map(|(id, r)| (id.as_str(), r)).collect();
+        let ids: Vec<String> = frontier.iter().map(|(id, _)| id.clone()).collect();
+        let mut edges = store.outgoing_edges_from(&ids, kinds)?;
+        edges.sort_by(|a, b| {
+            a.source
+                .cmp(&b.source)
+                .then_with(|| a.target.cmp(&b.target))
+        });
+        let mut next: Vec<(String, HashSet<String>)> = Vec::new();
+        let mut next_at: HashMap<String, usize> = HashMap::new();
+        for edge in edges {
+            if edge.target == edge.source {
+                continue;
+            }
+            let Some(roots) = roots_of.get(edge.source.as_str()) else {
+                continue;
+            };
+            let visited = seen.entry(edge.target.clone()).or_default();
+            let known = reach.entry(edge.target.clone()).or_default();
+            let mut merged: HashSet<String> = HashSet::new();
+            for root in roots.iter() {
+                if visited.insert(root.clone()) {
+                    merged.insert(root.clone());
+                    known.insert(root.clone());
+                }
+            }
+            if known.is_empty() {
+                reach.remove(&edge.target);
+            }
+            if merged.is_empty() {
+                continue;
+            }
+            match next_at.get(&edge.target) {
+                Some(&at) => next[at].1.extend(merged),
+                None => {
+                    next_at.insert(edge.target.clone(), next.len());
+                    next.push((edge.target.clone(), merged));
+                }
+            }
+        }
+        frontier = next;
+        depth += 1;
+    }
+    Ok(reach)
+}
+
+/// Which of `nodes` carry a decorator: their own outgoing `decorates` edge
+/// (it runs FROM the decorated symbol to the decorator), an unresolved
+/// `decorates` row (the only trace a decorator imported from outside the
+/// index, like `@HostListener` or `@Cron`, leaves; the same record the
+/// ancestor rule reads for a supertype it could not follow), or the
+/// `decorators` list a couple of languages record on the node itself.
+fn carries_decorator(store: &Store, nodes: &[&Node]) -> rusqlite::Result<HashSet<String>> {
+    let ids: Vec<String> = nodes.iter().map(|node| node.id.clone()).collect();
+    let mut found: HashSet<String> = store
+        .outgoing_edges_from(&ids, &[EdgeKind::Decorates])?
+        .into_iter()
+        .map(|edge| edge.source)
+        .collect();
+    found.extend(
+        store
+            .unresolved_reference_names_from(&ids, &[EdgeKind::Decorates])?
+            .into_keys(),
+    );
+    for node in nodes {
+        if !node.decorators.is_empty() {
+            found.insert(node.id.clone());
+        }
+    }
+    Ok(found)
+}
+
+fn sorted_unique<'a>(ids: impl IntoIterator<Item = &'a String>) -> Vec<String> {
+    let mut out: Vec<String> = ids.into_iter().cloned().collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Which members are hooks their framework calls by name: the ids to drop
+/// (upstream #2405).
+///
+/// Angular calls `ngOnInit` on every component it creates, and NestJS calls
+/// `onModuleInit` on every provider, whether or not the class writes
+/// `implements OnInit`: TypeScript erases the clause, so the framework can only
+/// be finding the method by its name. A class that writes the clause is
+/// already off the list, because its ancestor is outside the index
+/// ([`override_candidates`]). One that skips it is tied to the framework by
+/// nothing but the name.
+///
+/// Which names are hooks is not a table kept here; a table would go stale and
+/// hide real dead code behind a name coincidence. The index says it already:
+/// what `OnInit` carries is what the classes that DO write `implements OnInit`
+/// have. A method is dropped when all of this holds:
+///
+/// - **its class carries a decorator**, so a framework creates it
+///   (`@Component`, `@Injectable`). Nothing creates an undecorated class, so
+///   nothing calls its hooks, and the class's decorator says nothing about its
+///   other methods: an unused helper on a component stays on the list;
+/// - **an interface outside the index carries the name**. Every TypeScript
+///   class that writes the interface into an `implements` clause has a method
+///   of that name, declared or inherited from an ancestor that declares it; a
+///   class that inherits from outside the index may have it from there, so it
+///   is no evidence either way. At least two of them, and more than half,
+///   declare it themselves: one class's methods are that class, not a
+///   contract;
+/// - **more than half of those classes carry a decorator** as well: the
+///   interface is one framework-created classes fill, not a library type whose
+///   method happens to share the name.
+///
+/// A hook is never called from inside the index, so each declaration of it is
+/// among the `unreferenced` candidates already; a name some declaration of
+/// which is called is the ambiguous-name rule's anyway.
+fn by_name_hook_candidates(
+    store: &Store,
+    nodes: &[&Node],
+    containers: &HashMap<String, Node>,
+    unreferenced: &[&Node],
+) -> rusqlite::Result<HashSet<String>> {
+    let mut dropped = HashSet::new();
+    let in_class = |node: &Node| {
+        containers
+            .get(&node.id)
+            .is_some_and(|container| container.kind == NodeKind::Class)
+    };
+    let methods: Vec<&Node> = nodes
+        .iter()
+        .copied()
+        .filter(|node| is_hook_shaped(node) && in_class(node))
+        .collect();
+    if methods.is_empty() {
+        return Ok(dropped);
+    }
+    let mut classes: HashMap<&str, &Node> = HashMap::new();
+    for node in &methods {
+        if let Some(container) = containers.get(&node.id) {
+            classes.insert(container.id.as_str(), container);
+        }
+    }
+    let class_nodes: Vec<&Node> = classes.into_values().collect();
+    let registered = carries_decorator(store, &class_nodes)?;
+    let eligible: Vec<&Node> = methods
+        .into_iter()
+        .filter(|node| {
+            containers
+                .get(&node.id)
+                .is_some_and(|container| registered.contains(&container.id))
+        })
+        .collect();
+    if eligible.is_empty() {
+        return Ok(dropped);
+    }
+
+    // Every class declaring a method of each name.
+    let names: HashSet<&str> = eligible.iter().map(|node| node.name.as_str()).collect();
+    let declarations: Vec<&Node> = unreferenced
+        .iter()
+        .copied()
+        .filter(|node| names.contains(node.name.as_str()) && is_hook_shaped(node))
+        .collect();
+    let elsewhere: Vec<&Node> = declarations
+        .iter()
+        .copied()
+        .filter(|node| !containers.contains_key(&node.id))
+        .collect();
+    let declared_in = containers_of(store, &elsewhere)?;
+    let mut declaring: HashMap<&str, HashSet<String>> = HashMap::new();
+    for node in &declarations {
+        let container = containers
+            .get(&node.id)
+            .or_else(|| declared_in.get(&node.id));
+        if let Some(container) = container.filter(|c| c.kind == NodeKind::Class) {
+            declaring
+                .entry(node.name.as_str())
+                .or_default()
+                .insert(container.id.clone());
+        }
+    }
+
+    // The interfaces outside the index each of those classes writes out.
+    let declarers = sorted_unique(declaring.values().flatten());
+    let interfaces_of =
+        store.unresolved_reference_names_from(&declarers, &[EdgeKind::Implements])?;
+    let interfaces = sorted_unique(interfaces_of.values().flatten());
+    if interfaces.is_empty() {
+        return Ok(dropped);
+    }
+
+    // Every TypeScript class writing each of those interfaces out, kept where
+    // more than half of them are framework-created.
+    let writers = store.unresolved_reference_sources_named(&interfaces, &[EdgeKind::Implements])?;
+    let writer_ids = sorted_unique(writers.values().flatten());
+    let writer_nodes = store.nodes_by_ids(&writer_ids)?;
+    let typescript: Vec<&Node> = writer_nodes
+        .values()
+        .filter(|node| BY_NAME_DISPATCH_LANGUAGES.contains(&node.language))
+        .collect();
+    let typescript_ids: HashSet<&str> = typescript.iter().map(|node| node.id.as_str()).collect();
+    let registered_writers = carries_decorator(store, &typescript)?;
+    let mut implementers: HashMap<&str, Vec<String>> = HashMap::new();
+    for (name, ids) in &writers {
+        let own: Vec<String> = ids
+            .iter()
+            .filter(|id| typescript_ids.contains(id.as_str()))
+            .cloned()
+            .collect();
+        let registered_count = own
+            .iter()
+            .filter(|id| registered_writers.contains(*id))
+            .count();
+        if registered_count * 2 > own.len() {
+            implementers.insert(name.as_str(), own);
+        }
+    }
+    if implementers.is_empty() {
+        return Ok(dropped);
+    }
+
+    // What each implementer inherits from, and which inherit from outside the
+    // index somewhere up the chain.
+    let implementer_ids = sorted_unique(implementers.values().flatten());
+    let ancestors = ancestors_of(store, &implementer_ids, &[EdgeKind::Extends])?;
+    let mut inherits: HashMap<&str, Vec<&str>> = HashMap::new();
+    for (ancestor, roots) in &ancestors {
+        for root in roots {
+            inherits
+                .entry(root.as_str())
+                .or_default()
+                .push(ancestor.as_str());
+        }
+    }
+    let mut probe = implementer_ids.clone();
+    probe.extend(ancestors.keys().cloned());
+    let outside = store.unresolved_reference_names_from(&probe, &[EdgeKind::Extends])?;
+    let mut opaque: HashSet<&str> = implementer_ids
+        .iter()
+        .filter(|id| outside.contains_key(*id))
+        .map(String::as_str)
+        .collect();
+    for (ancestor, roots) in &ancestors {
+        if outside.contains_key(ancestor) {
+            opaque.extend(roots.iter().map(String::as_str));
+        }
+    }
+
+    let mut hook_names: HashSet<&str> = HashSet::new();
+    for name in &names {
+        let Some(declared) = declaring.get(name) else {
+            continue;
+        };
+        let has = |id: &str| {
+            declared.contains(id)
+                || opaque.contains(id)
+                || inherits
+                    .get(id)
+                    .is_some_and(|up| up.iter().any(|ancestor| declared.contains(*ancestor)))
+        };
+        let contracts: HashSet<&str> = declared
+            .iter()
+            .filter_map(|id| interfaces_of.get(id))
+            .flatten()
+            .map(String::as_str)
+            .collect();
+        let fills = contracts.iter().any(|contract| {
+            implementers.get(contract).is_some_and(|own| {
+                let declared_count = own.iter().filter(|id| declared.contains(*id)).count();
+                declared_count >= 2
+                    && declared_count * 2 > own.len()
+                    && own.iter().all(|id| has(id))
+            })
+        });
+        if fills {
+            hook_names.insert(name);
+        }
+    }
+
+    for node in eligible {
+        if hook_names.contains(node.name.as_str()) {
             dropped.insert(node.id.clone());
         }
     }

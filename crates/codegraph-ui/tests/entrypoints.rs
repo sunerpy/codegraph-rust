@@ -249,3 +249,116 @@ async fn counts_the_tests_exactly_and_the_derived_lists_as_a_floor() {
         );
     }
 }
+
+/// Upstream #2122: a docs site's bundle, not named `.min.js` (one-letter
+/// functions calling each other on one enormous line), is generated, and its
+/// functions are not the project's hubs.
+#[tokio::test]
+async fn lists_the_projects_own_hubs_not_a_vendored_bundles() {
+    let body: Vec<String> = (0..400)
+        .map(|i| format!("function f{i}(e){{return n(e,{i})+t(e)}}"))
+        .collect();
+    let bundle = format!(
+        "function n(e,r){{return e+r}};function t(e){{return n(e,1)}};{};\n",
+        body.join(";")
+    );
+    let project = Project::indexed(&[
+        (
+            "src/store.ts",
+            "export function insertNode(name: string): string {
+  return name.trim();
+}
+export function readNode(name: string): string {
+  return insertNode(name);
+}
+export function warm(): string {
+  return insertNode('a') + readNode('b');
+}
+",
+        ),
+        ("docs/assets/bundle.js", &bundle),
+    ]);
+    let payload = project.viewer().json("/api/entrypoints").await;
+    let names: Vec<&str> = payload["hubs"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|hub| hub["name"].as_str())
+        .collect();
+    assert!(names.contains(&"insertNode"), "{names:?}");
+    assert!(!names.contains(&"n"), "{names:?}");
+    assert!(!names.contains(&"t"), "{names:?}");
+}
+
+/// Upstream #2109(c): a SwiftUI view's top-level `#Preview { … }` is Xcode's
+/// canvas, so its constructions do not make the view a file that runs
+/// something; a file with a real top-level call beside a widget's preview
+/// keeps that one.
+#[tokio::test]
+async fn lists_no_swiftui_preview_as_a_file_that_runs_something() {
+    let project = Project::indexed(&[
+        (
+            "App/HomeView.swift",
+            "import SwiftUI
+struct HomeView: View {
+    var body: some View { Text(\"Home\") }
+}
+
+#Preview {
+    HomeView()
+}
+",
+        ),
+        (
+            "App/main.swift",
+            "import Foundation
+let server = Server()
+server.start()
+",
+        ),
+        (
+            "App/Server.swift",
+            "final class Server {
+    func start() {}
+}
+",
+        ),
+        (
+            "App/App.swift",
+            "import SwiftUI
+@main
+struct HomeApp: App {
+    var body: some Scene { WindowGroup { HomeView() } }
+}
+",
+        ),
+        (
+            "Widgets/Board.swift",
+            "import SwiftUI
+let shared = Server()
+shared.start()
+
+#Preview(as: .systemSmall) {
+    HomeView()
+} timeline: {
+    Server()
+}
+",
+        ),
+    ]);
+    let body = project.viewer().json("/api/entrypoints").await;
+    let files = files_of(&body["files"]);
+    assert!(files.contains(&"App/main.swift".to_string()), "{files:?}");
+    assert!(
+        !files.contains(&"App/HomeView.swift".to_string()),
+        "{files:?}"
+    );
+    let board = body["files"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["file"] == "Widgets/Board.swift")
+        .unwrap_or_else(|| panic!("{files:?}"))
+        .clone();
+    assert_eq!(board["calls"], 1, "{board}");
+}

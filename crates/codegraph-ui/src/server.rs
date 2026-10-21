@@ -317,30 +317,328 @@ pub async fn bind_ports(
     attempts: u16,
     fallback: bool,
 ) -> anyhow::Result<tokio::net::TcpListener> {
-    let mut last: Option<std::io::Error> = None;
-    for offset in 0..attempts.max(1) {
+    bind_ports_with(first, attempts, fallback, BindPlatform::CURRENT, |port| {
+        tokio::net::TcpListener::bind(SocketAddr::from((LOOPBACK_ADDRESS, port)))
+    })
+    .await
+}
+
+/// [`bind_ports`] through `bind`, its failures read as on `platform`. Only a
+/// failure the next port may not share moves on ([`should_try_next_port`]):
+/// a permission rule every port is under, or a bad address, would only be
+/// buried by twenty more tries.
+async fn bind_ports_with<F, Fut>(
+    first: u16,
+    attempts: u16,
+    fallback: bool,
+    platform: BindPlatform,
+    mut bind: F,
+) -> anyhow::Result<tokio::net::TcpListener>
+where
+    F: FnMut(u16) -> Fut,
+    Fut: std::future::Future<Output = std::io::Result<tokio::net::TcpListener>>,
+{
+    let attempts = if fallback { attempts.max(1) } else { 1 };
+    // Whether any port was refused rather than in use: the message says so.
+    let mut refused = false;
+    for offset in 0..attempts {
         let candidate = first.saturating_add(offset);
-        match tokio::net::TcpListener::bind(SocketAddr::from((LOOPBACK_ADDRESS, candidate))).await {
+        match bind(candidate).await {
             Ok(listener) => return Ok(listener),
-            Err(err) if fallback && err.kind() == std::io::ErrorKind::AddrInUse => {
-                last = Some(err);
-            }
             Err(err) => {
-                return Err(match err.kind() {
-                    std::io::ErrorKind::AddrInUse => anyhow::anyhow!(
-                        "Port {candidate} is already in use. Pick another with --port, or omit --port to let codegraph ui find a free one."
-                    ),
-                    std::io::ErrorKind::PermissionDenied => anyhow::anyhow!(
-                        "Not allowed to listen on port {candidate}. Ports below 1024 usually need elevated rights; pick another with --port."
-                    ),
-                    _ => anyhow::anyhow!("Could not listen on 127.0.0.1:{candidate}: {err}"),
-                });
+                refused |= err.kind() == std::io::ErrorKind::PermissionDenied;
+                if !(fallback && should_try_next_port(err.kind(), candidate, platform))
+                    || offset + 1 == attempts
+                {
+                    return Err(describe_bind_failure(
+                        &err, first, candidate, fallback, platform, refused,
+                    ));
+                }
             }
         }
     }
-    Err(anyhow::anyhow!(
-        "Ports {first}-{} are all in use. Pick a free one with --port.{}",
-        first.saturating_add(attempts.max(1) - 1),
-        last.map(|e| format!(" ({e})")).unwrap_or_default()
-    ))
+    unreachable!("the last attempt returns")
+}
+
+/// Whose rules a bind failure is read by: Windows refuses ports for reasons
+/// POSIX does not have, and has no privileged ports (upstream #2353).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BindPlatform {
+    Windows,
+    Posix,
+}
+
+impl BindPlatform {
+    const CURRENT: Self = if cfg!(windows) {
+        Self::Windows
+    } else {
+        Self::Posix
+    };
+}
+
+/// The command that lists the port ranges Windows reserves.
+const LIST_RESERVED_PORTS: &str = "`netsh int ipv4 show excludedportrange protocol=tcp`";
+
+/// Whether only an administrator may bind `port`: below 1024, on every
+/// platform but Windows, which has no such rule.
+fn is_privileged_port(port: u16, platform: BindPlatform) -> bool {
+    platform == BindPlatform::Posix && port > 0 && port < 1024
+}
+
+/// Whether a bind of `port` that failed with `kind` leaves the next port
+/// worth trying. A port in use does. So does one refused on Windows, where a
+/// port another program holds exclusively (`SO_EXCLUSIVEADDRUSE`) or one in
+/// a reserved range fails with a permission error rather than as in use;
+/// elsewhere a refused port below 1024 is the privileged-port rule, which the
+/// next port is under too, and from 1024 up something refusing that one port.
+fn should_try_next_port(kind: std::io::ErrorKind, port: u16, platform: BindPlatform) -> bool {
+    match kind {
+        std::io::ErrorKind::AddrInUse => true,
+        std::io::ErrorKind::PermissionDenied => !is_privileged_port(port, platform),
+        _ => false,
+    }
+}
+
+/// A bind failure of `port` as something a user can act on, and true where
+/// it is read. `refused` says whether a walk from `first` met a refused port
+/// rather than only ports in use; it only words a walk that ran out.
+fn describe_bind_failure(
+    err: &std::io::Error,
+    first: u16,
+    port: u16,
+    fallback: bool,
+    platform: BindPlatform,
+    refused: bool,
+) -> anyhow::Error {
+    let kind = err.kind();
+    let windows = platform == BindPlatform::Windows;
+    if fallback && should_try_next_port(kind, port, platform) {
+        let taken = if !refused && kind == std::io::ErrorKind::AddrInUse {
+            "in use".to_string()
+        } else if windows {
+            format!("in use or reserved ({LIST_RESERVED_PORTS} lists the reserved ranges)")
+        } else {
+            "in use or not allowed".to_string()
+        };
+        return anyhow::anyhow!(
+            "Ports {first}-{port} are all {taken}. Free one, or pick another with --port. ({err})"
+        );
+    }
+    match kind {
+        std::io::ErrorKind::AddrInUse => anyhow::anyhow!(
+            "Port {port} is already in use. Pick another with --port, or omit --port to let codegraph ui find a free one."
+        ),
+        std::io::ErrorKind::PermissionDenied if is_privileged_port(port, platform) => {
+            anyhow::anyhow!(
+                "Not allowed to listen on port {port}. Ports below 1024 usually need elevated rights; pick another with --port."
+            )
+        }
+        std::io::ErrorKind::PermissionDenied if windows => anyhow::anyhow!(
+            "Windows refused port {port}: another program holds it, or it is in a reserved range ({LIST_RESERVED_PORTS} lists them). Pick another with --port, or omit --port to let codegraph ui find a free one."
+        ),
+        std::io::ErrorKind::PermissionDenied => anyhow::anyhow!(
+            "Not allowed to listen on port {port}: the system refused permission. Pick another with --port, or omit --port to let codegraph ui find a free one."
+        ),
+        _ => anyhow::anyhow!("Could not listen on 127.0.0.1:{port}: {err}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Error, ErrorKind};
+
+    const PLATFORMS: [BindPlatform; 2] = [BindPlatform::Windows, BindPlatform::Posix];
+
+    /// A binder that fails the ports `failures` names with their kind and binds
+    /// any free loopback port for the rest, recording what it was asked.
+    fn binder(
+        failures: Vec<(u16, ErrorKind)>,
+        tried: std::sync::Arc<std::sync::Mutex<Vec<u16>>>,
+    ) -> impl FnMut(
+        u16,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = std::io::Result<tokio::net::TcpListener>>>,
+    > {
+        move |port| {
+            tried.lock().unwrap().push(port);
+            let failure = failures.iter().find(|(p, _)| *p == port).map(|(_, k)| *k);
+            Box::pin(async move {
+                match failure {
+                    Some(kind) => Err(Error::from(kind)),
+                    None => tokio::net::TcpListener::bind((LOOPBACK_ADDRESS, 0)).await,
+                }
+            })
+        }
+    }
+
+    /// #2353: a port in use and the next one refused (another program holds
+    /// it, or a reserved range) are both walked past, on every platform from
+    /// 1024 up.
+    #[tokio::test]
+    async fn a_walk_moves_past_a_port_in_use_and_one_refused() {
+        for platform in PLATFORMS {
+            let tried = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let failures = vec![
+                (4747, ErrorKind::AddrInUse),
+                (4748, ErrorKind::PermissionDenied),
+            ];
+            let listener =
+                bind_ports_with(4747, 20, true, platform, binder(failures, tried.clone()))
+                    .await
+                    .expect("the third port binds");
+            drop(listener);
+            assert_eq!(*tried.lock().unwrap(), [4747, 4748, 4749], "{platform:?}");
+        }
+    }
+
+    /// Below 1024 a refusal is POSIX's privileged-port rule, which every next
+    /// port is under too, so the walk stops with that message; Windows has no
+    /// such rule and walks on.
+    #[tokio::test]
+    async fn a_privileged_refusal_stops_the_walk_off_windows_only() {
+        let tried = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let err = bind_ports_with(
+            80,
+            20,
+            true,
+            BindPlatform::Posix,
+            binder(vec![(80, ErrorKind::PermissionDenied)], tried.clone()),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(*tried.lock().unwrap(), [80]);
+        assert!(err.to_string().contains("Ports below 1024"), "{err}");
+
+        let tried = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        bind_ports_with(
+            80,
+            20,
+            true,
+            BindPlatform::Windows,
+            binder(vec![(80, ErrorKind::PermissionDenied)], tried.clone()),
+        )
+        .await
+        .expect("Windows walks on");
+        assert_eq!(*tried.lock().unwrap(), [80, 81]);
+    }
+
+    /// A pinned port never moves, and its refusal says why where it is read.
+    #[tokio::test]
+    async fn a_pinned_refused_port_names_the_platforms_reason() {
+        for (platform, expected) in [
+            (BindPlatform::Windows, "Windows refused port 4747"),
+            (BindPlatform::Posix, "the system refused permission"),
+        ] {
+            let tried = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let err = bind_ports_with(
+                4747,
+                1,
+                false,
+                platform,
+                binder(vec![(4747, ErrorKind::PermissionDenied)], tried.clone()),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(*tried.lock().unwrap(), [4747]);
+            assert!(err.to_string().contains(expected), "{platform:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn the_next_port_is_tried_after_a_port_in_use_or_a_refusal_it_may_not_share() {
+        for platform in PLATFORMS {
+            assert!(should_try_next_port(ErrorKind::AddrInUse, 80, platform));
+            assert!(should_try_next_port(ErrorKind::AddrInUse, 4747, platform));
+            assert!(should_try_next_port(
+                ErrorKind::PermissionDenied,
+                4747,
+                platform
+            ));
+            assert!(!should_try_next_port(
+                ErrorKind::AddrNotAvailable,
+                4747,
+                platform
+            ));
+        }
+        assert!(should_try_next_port(
+            ErrorKind::PermissionDenied,
+            80,
+            BindPlatform::Windows
+        ));
+        assert!(!should_try_next_port(
+            ErrorKind::PermissionDenied,
+            80,
+            BindPlatform::Posix
+        ));
+        assert!(!should_try_next_port(
+            ErrorKind::PermissionDenied,
+            1023,
+            BindPlatform::Posix
+        ));
+        assert!(should_try_next_port(
+            ErrorKind::PermissionDenied,
+            1024,
+            BindPlatform::Posix
+        ));
+    }
+
+    #[test]
+    fn a_walk_that_ran_out_says_whether_a_port_was_refused() {
+        let in_use = Error::from(ErrorKind::AddrInUse);
+        let message = |platform, refused| {
+            describe_bind_failure(&in_use, 4747, 4766, true, platform, refused).to_string()
+        };
+        for platform in PLATFORMS {
+            assert!(message(platform, false).starts_with("Ports 4747-4766 are all in use."));
+        }
+        assert!(message(BindPlatform::Windows, true).contains("in use or reserved"));
+        assert!(
+            message(BindPlatform::Windows, true).contains("netsh int ipv4 show excludedportrange")
+        );
+        assert!(message(BindPlatform::Posix, true).contains("in use or not allowed"));
+        assert!(!message(BindPlatform::Posix, true).contains("netsh"));
+        let refused = Error::from(ErrorKind::PermissionDenied);
+        assert!(
+            describe_bind_failure(&refused, 4747, 4766, true, BindPlatform::Posix, true)
+                .to_string()
+                .contains("in use or not allowed")
+        );
+    }
+
+    #[test]
+    fn a_pinned_port_in_use_or_privileged_keeps_its_message() {
+        for platform in PLATFORMS {
+            let err = describe_bind_failure(
+                &Error::from(ErrorKind::AddrInUse),
+                4747,
+                4747,
+                false,
+                platform,
+                false,
+            );
+            assert!(
+                err.to_string().contains("Port 4747 is already in use"),
+                "{err}"
+            );
+        }
+        let err = describe_bind_failure(
+            &Error::from(ErrorKind::PermissionDenied),
+            80,
+            80,
+            false,
+            BindPlatform::Posix,
+            true,
+        );
+        assert!(err.to_string().contains("Ports below 1024"), "{err}");
+        let err = describe_bind_failure(
+            &Error::from(ErrorKind::PermissionDenied),
+            80,
+            80,
+            false,
+            BindPlatform::Windows,
+            true,
+        );
+        assert!(err.to_string().contains("Windows refused port 80"), "{err}");
+    }
 }

@@ -24,7 +24,13 @@ CODEGRAPH_UI=1 codegraph ui --read-only        # refuse every write, saved trail
 
 `[path]` walks up to the nearest directory with an index, like the lifecycle
 commands. Without `--port` the viewer takes 4747, or the next free one of the 20
-ports after it; an explicit `--port` never moves. `CODEGRAPH_BROWSER=<command>`
+ports after it. It walks past a port in use, and past one the system refuses
+where the next may be allowed: on Windows any refused port (another program
+holds it exclusively, or it is in a reserved range, which
+`netsh int ipv4 show excludedportrange protocol=tcp` lists), elsewhere one from
+1024 up; below 1024 off Windows the refusal is the privileged-port rule and the
+walk stops there. An explicit `--port` never moves, and its error names the
+platform's reason. `CODEGRAPH_BROWSER=<command>`
 picks the browser that opens, `CODEGRAPH_BROWSER=none` (or `0`, `false`, `off`)
 opens none. `Ctrl+C` or `SIGTERM` stops it: open streams end first, then the
 server drains.
@@ -120,6 +126,51 @@ All answers are JSON; failures are `{error, code, hint?}` with `bad-request`
 | `GET /api/events`                                             | the live channel above                                                                        |
 | `GET/POST /api/trails`, `DELETE /api/trails/<id>`             | saved trails, re-resolved; the one write                                                      |
 
+The entry points' hubs leave out symbols in test files and in generated files
+(the indexed flag or the path convention), so a vendored bundle's one-letter
+functions, depended on by the bundle alone, never top the list.
+
+The files that run something do not count the calls inside a Swift file's
+top-level `#Preview { … }` macros, trailing closures included: a preview is
+Xcode's canvas, so a view whose only top-level calls are previews leaves the
+list, and a file with other top-level calls is ranked on those.
+
+A directed Flow (`from` and `to`) looks its two ends up by the names as
+written, a symbol's own name: a two-letter method, a Ruby `valid?` or `save!` and
+an Objective-C selector such as `initWithFrame:` are found as any other name. A
+`symbols` Flow takes the symbol-shaped words of its query, and of two routes of
+one length to a symbol it keeps the one that ends on fewer unnamed symbols, then
+the one through more of the named ones, not the one the index lists first.
+
+The routes list, and the routes among the entry points, hold one row per
+route: the handler a resolver bound to it, else `inline handler` standing for a
+handler written at the registration, which opens on the route itself and offers
+no Flow. A symbol's members list each member once, never the symbol itself or a
+file.
+
+The Map, asked for no `root`, opens on the top directory holding a clear
+majority of the non-test symbols, files loose in the repository root counted in
+the whole. When that directory draws one box at every depth (Express's `lib/`,
+an R package's `R/`) and the whole repository draws more, it opens on the whole
+repository instead. A folder with exactly one subfolder and no file of its own,
+read from every indexed file with tests included, is not a level: a Maven or
+Gradle project's `src/main/java/com/acme/app/` counts as one, so the map opens
+on the packages under it. A box's `label` writes such a chain of three or more
+folders `first/…/last` (`src/main/…/app/owner`); the `id`, the box's tooltip
+and the side panel keep the whole path, and every other label is the id.
+
+The Dead code list leaves off a symbol carrying a decorator, including one
+imported from outside the index (`@HostListener`, `@Cron`), which leaves only
+the resolver's unresolved `decorates` row. It also leaves off a TypeScript hook
+its framework calls by name, counted as `hooks`: a method on a decorated class
+that skips the `implements` clause (`ngOnInit` without `implements OnInit`),
+when the classes that do write an interface from outside the index out, more
+than half of them decorated, all have the method, declared or inherited, and at
+least two and more than half of them declare it. Which names are hooks comes
+from those classes, not from a list, so an unused helper on the same component
+stays listed. Java, C# and Kotlin check the interface itself, so the rule is
+TypeScript's only.
+
 ## Differences from upstream
 
 The wire shapes, limits, error codes and refusals follow upstream `v1.6.1`. Where
@@ -142,6 +193,9 @@ the Rust graph holds different facts, the viewer shows what this index holds:
   specifier, and the File view lists it that way.
 - The bundle is embedded in the binary, so upstream's `CODEGRAPH_VIEWER_PATH`
   has no counterpart.
+- An exported Map writes each box's label, the text the canvas draws and sized
+  the box for. Upstream's export writes the id, cut to fit, so a Maven package
+  reads `src/main/java/com/ac…` in the image.
 
 ## Look and themes
 

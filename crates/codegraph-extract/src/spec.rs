@@ -88,6 +88,21 @@ pub trait LanguageSpec: Sync {
         None
     }
 
+    /// The node a declaration is wrapped in, whose preceding comment documents
+    /// it (upstream `getDeclarationWrapper`): a C/C++ type defined in a
+    /// declaration's type, `struct Foo { … } foo;`, is documented by the
+    /// comment above the declaration.
+    fn declaration_wrapper<'tree>(&self, _node: Node<'tree>) -> Option<Node<'tree>> {
+        None
+    }
+
+    /// Whether a docstring leaves out the comments that belong to the line
+    /// above it (upstream `docstringSkipsTrailingComments`): one written after
+    /// code on its line, and any that begins on the line such a comment ends.
+    fn docstring_skips_trailing_comments(&self) -> bool {
+        false
+    }
+
     fn classify_class_node(&self, _node: Node<'_>) -> NodeKind {
         NodeKind::Class
     }

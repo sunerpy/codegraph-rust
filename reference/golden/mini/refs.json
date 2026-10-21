@@ -1,1 +1,12 @@
-[]
+[
+  {
+    "candidates": null,
+    "col": 26,
+    "file_path": "src/math.ts",
+    "from_node_id": "method:f501ba98441869bd251c636e30d31e3d",
+    "language": "typescript",
+    "line": 9,
+    "reference_kind": "function_ref",
+    "reference_name": "this.value"
+  }
+]

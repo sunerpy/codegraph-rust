@@ -896,7 +896,9 @@ function mapNodeSvg(node: MapNodeLayout, selected: boolean, dimmed: boolean): st
         family: MONO_STACK,
         weight: 500,
       },
-      esc(truncate(module.id, room, MODULE_NAME_SIZE))
+      // The label the canvas box shows and was sized for, not the id: a
+      // Maven package's id is seven folders long, its label three.
+      esc(truncate(module.label || module.id, room, MODULE_NAME_SIZE))
     ),
     textEl(
       {

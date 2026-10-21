@@ -72,7 +72,9 @@ fn liquid_extracts_template_nodes_and_shopify_json_section_refs() {
         4,
     );
 
-    let json = extract_fixture("templates/product.json", None);
+    // A JSON template is Liquid inside a Shopify theme, which takes the
+    // project root to find (upstream #2393); here it is extracted as one.
+    let json = extract_fixture("templates/product.json", Some(Language::Liquid));
     assert_no_errors(&json);
     assert_ref(
         &json,
@@ -86,7 +88,7 @@ fn liquid_extracts_template_nodes_and_shopify_json_section_refs() {
         "sections/related-products.liquid",
         1,
     );
-    assert_eq!(detect_language("templates/product.json"), Language::Liquid);
+    assert_eq!(detect_language("templates/product.json"), Language::Unknown);
     println!("liquid original-line assertions passed");
 }
 
@@ -223,9 +225,15 @@ fn astro_extracts_frontmatter_scripts_and_template_refs_on_original_lines() {
     let result = extract_fixture("sample.astro", Some(Language::Astro));
     assert_no_errors(&result);
 
-    // Component node + delegated TS frontmatter/script symbols on their
-    // .astro lines (the upstream keeps the delegated file node; its line depends on
-    // node-id dedup ordering, so it is not asserted here).
+    // One file node holding the component (upstream #2268), and the
+    // delegated TS frontmatter/script symbols on their .astro lines.
+    let file_nodes: Vec<_> = result
+        .nodes
+        .iter()
+        .filter(|node| node.kind == NodeKind::File)
+        .map(|node| node.start_line)
+        .collect();
+    assert_eq!(file_nodes, [1], "one file node: {file_nodes:?}");
     assert_node(&result, NodeKind::Component, "sample", 1);
     assert_node(&result, NodeKind::Import, "./Layout.astro", 2);
     assert_node(&result, NodeKind::Import, "../utils/date", 3);

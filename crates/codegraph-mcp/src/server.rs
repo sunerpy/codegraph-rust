@@ -183,9 +183,21 @@ pub fn reopen_count() -> u64 {
     db_identity_change_count()
 }
 
+/// How [`McpServer::run_until_adoption`] ended.
 pub enum RunUntilAdoption<R> {
     Eof,
-    Adopted { project_root: PathBuf, reader: R },
+    Adopted {
+        project_root: PathBuf,
+        reader: R,
+    },
+    /// Before any `initialize`, a request opened MCP 2026-07-28's inline
+    /// lifecycle: `server/discover`, or a request that names its protocol
+    /// version in `_meta`. `first_line` is that request, unanswered;
+    /// [`McpServer::serve_inline`] serves it and the rest of the session.
+    Inline {
+        first_line: String,
+        reader: R,
+    },
 }
 
 /// Holds the default project path and per-path DB identities used to observe
@@ -198,6 +210,9 @@ pub struct McpServer {
     root_discovery: ServerRootDiscovery,
     no_roots: bool,
     project_services: Option<ProjectServiceBroker>,
+    /// The session has answered an `initialize`: it is in the initialize
+    /// lifecycle, and stays with this loop.
+    saw_initialize: bool,
 }
 
 impl McpServer {
@@ -228,7 +243,7 @@ impl McpServer {
             .or_else(|| use_cwd_for_discovery.then(|| cwd.clone()).flatten());
         let mut root_discovery = ServerRootDiscovery::new(search_from);
         let mut resolved_default = default_project;
-        if let Some(resolution) = root_discovery.initial_resolution() {
+        if let Some(resolution) = root_discovery.startup_resolution() {
             if let Some(root) = resolution.root {
                 if resolution.via_subproject_scan {
                     let relative = root
@@ -265,6 +280,7 @@ impl McpServer {
             root_discovery,
             no_roots: false,
             project_services,
+            saw_initialize: false,
         }
     }
 
@@ -285,6 +301,9 @@ impl McpServer {
             return None;
         }
         let resolution = self.root_discovery.retry_resolution()?;
+        if let Some(notice) = self.root_discovery.scan_notice(&resolution) {
+            eprintln!("{notice}");
+        }
         let root = resolution.root?;
         let relative = root
             .strip_prefix(&resolution.search_from)
@@ -305,6 +324,10 @@ impl McpServer {
     /// retained hand-rolled path: the broad-root→daemon handoff
     /// needs the raw reader back mid-session, which rmcp (owning its own read
     /// loop) cannot provide. All other serve paths go through the rmcp handler.
+    ///
+    /// The loop knows only the `initialize` lifecycle. A session that opens with
+    /// the inline one instead ends it with [`RunUntilAdoption::Inline`], so the
+    /// rmcp handler answers it as it answers a direct session.
     pub fn run_until_adoption<R: BufRead, W: Write>(
         &mut self,
         mut reader: R,
@@ -317,6 +340,12 @@ impl McpServer {
             }
             if line.trim().is_empty() {
                 continue;
+            }
+            if !self.saw_initialize && opens_inline_lifecycle(&line) {
+                return Ok(RunUntilAdoption::Inline {
+                    first_line: line,
+                    reader,
+                });
             }
             let handled = self.handle_line(&line);
             for response in handled.responses {
@@ -401,8 +430,15 @@ impl McpServer {
         let is_request = req.id.is_some();
         match req.method.as_str() {
             "initialize" if is_request => {
+                self.saw_initialize = true;
+                let reply = initialize_result_for(
+                    req.params
+                        .as_ref()
+                        .and_then(|params| params.get("protocolVersion"))
+                        .and_then(Value::as_str),
+                );
                 if self.no_roots {
-                    return Dispatch::Reply(initialize_result());
+                    return Dispatch::Reply(reply);
                 }
                 let cwd = self.cwd.clone();
                 let old_default = self.default_project.clone();
@@ -413,10 +449,7 @@ impl McpServer {
                 ) {
                     self.root_discovery.clear_candidates();
                     self.debug_roots_adopted(&adopted, old_default.as_deref());
-                    return Dispatch::ReplyWithAdoption {
-                        reply: initialize_result(),
-                        adopted,
-                    };
+                    return Dispatch::ReplyWithAdoption { reply, adopted };
                 }
                 if self.workspace_roots.should_request_roots(
                     self.default_project.as_ref(),
@@ -425,11 +458,11 @@ impl McpServer {
                 ) {
                     self.workspace_roots.mark_roots_list_requested();
                     Dispatch::ReplyAndRequest {
-                        reply: initialize_result(),
+                        reply,
                         request: roots_list_request(),
                     }
                 } else {
-                    Dispatch::Reply(initialize_result())
+                    Dispatch::Reply(reply)
                 }
             }
             "initialized" => Dispatch::Notification,
@@ -550,6 +583,7 @@ impl McpServer {
                     raw_project,
                     self.root_discovery.search_from(),
                     self.root_discovery.known_candidates(),
+                    self.root_discovery.scan_truncated(),
                 );
                 let result = if raw_project.is_some() {
                     ToolResult::error(message)
@@ -660,6 +694,30 @@ impl McpServer {
         self.observed_identities.clear();
     }
 
+    /// Serve a session [`Self::run_until_adoption`] ended with
+    /// [`RunUntilAdoption::Inline`]: `first_line`, then the rest of `reader`,
+    /// through the rmcp handler a direct session uses, until EOF. The handler
+    /// takes this server's default project, cwd, root discovery and
+    /// explicit-`projectPath` services, so nothing is resolved or started anew.
+    pub fn serve_inline<R, W>(self, first_line: String, reader: R, writer: W) -> anyhow::Result<()>
+    where
+        R: BufRead + Send + 'static,
+        W: Write + Send + 'static,
+    {
+        let handler = crate::rmcp_handler::CodeGraphHandler::from_hand_rolled(
+            self.default_project,
+            self.cwd,
+            self.no_roots,
+            self.root_discovery,
+            self.project_services,
+        );
+        let reader = std::io::BufReader::new(std::io::Read::chain(
+            std::io::Cursor::new(first_line.into_bytes()),
+            reader,
+        ));
+        crate::rmcp_session::serve_handler_blocking(handler, reader, writer)
+    }
+
     /// Test/diagnostic only: the currently adopted default project path.
     #[doc(hidden)]
     pub fn default_project(&self) -> Option<&std::path::Path> {
@@ -697,6 +755,23 @@ impl HandledLine {
     }
 }
 
+/// Whether `line` is a request that opens MCP 2026-07-28's inline lifecycle:
+/// `server/discover`, or any other request but `initialize` that names its
+/// protocol version in `_meta`.
+fn opens_inline_lifecycle(line: &str) -> bool {
+    let Ok(request) = serde_json::from_str::<Value>(line) else {
+        return false;
+    };
+    if request.get("id").is_none() {
+        return false;
+    }
+    match request.get("method").and_then(Value::as_str) {
+        Some("server/discover") => true,
+        Some("initialize") | None => false,
+        Some(_) => crate::rmcp_handler::request_declares_protocol_version(&request),
+    }
+}
+
 fn json_response(response: JsonRpcResponse) -> Value {
     match serde_json::to_value(response) {
         Ok(value) => value,
@@ -709,6 +784,18 @@ fn json_response(response: JsonRpcResponse) -> Value {
             },
         }),
     }
+}
+
+/// [`initialize_result`] with the `protocolVersion` an `initialize` asking for
+/// `requested` negotiates with the rmcp handler
+/// ([`crate::rmcp_handler::negotiated_initialize_version`]): the answer the
+/// daemon proxy gives a host on the direct server's behalf.
+pub fn initialize_result_for(requested: Option<&str>) -> Value {
+    let mut result = initialize_result();
+    result["protocolVersion"] = json!(crate::rmcp_handler::negotiated_initialize_version(
+        requested
+    ));
+    result
 }
 
 /// The `initialize` result (`session.ts:182-187`).
@@ -817,10 +904,15 @@ mod tests {
         let workspace = workspace("single-child");
         let child = indexed_child(&workspace, "service-a");
 
-        let server = McpServer::new_with_cwd(
+        let mut server = McpServer::new_with_cwd(
             Some(workspace.path().to_path_buf()),
             Some(workspace.path().to_path_buf()),
         );
+        // Construction, which precedes the `initialize` answer, walks upward
+        // only; the downward scan runs on the first retry, which `tools/list`
+        // and every tool call make.
+        assert_eq!(server.default_project(), Some(workspace.path()));
+        server.retry_default_project();
 
         assert_eq!(server.default_project(), Some(child.as_path()));
     }
@@ -830,10 +922,11 @@ mod tests {
         let workspace = workspace("ambiguous");
         let a = indexed_child(&workspace, "service-a");
         let b = indexed_child(&workspace, "service-b");
-        let server = McpServer::new_with_cwd(
+        let mut server = McpServer::new_with_cwd(
             Some(workspace.path().to_path_buf()),
             Some(workspace.path().to_path_buf()),
         );
+        server.retry_default_project();
 
         assert_eq!(server.default_project(), Some(workspace.path()));
         assert_eq!(
@@ -1360,6 +1453,236 @@ mod tests {
         assert_eq!(out.len(), 1, "adoption still replies once");
         assert_eq!(out[0]["id"], json!(19));
         assert_eq!(server.default_project(), Some(project.path()));
+    }
+
+    /// What each kind of `initialize` request is answered with, against what the
+    /// rmcp handler negotiates for it.
+    const NEGOTIATIONS: [(Option<&str>, &str); 5] = [
+        (Some("2025-06-18"), "2025-06-18"),
+        (Some("2024-11-05"), "2024-11-05"),
+        (Some("2026-07-28"), "2024-11-05"),
+        (Some("1999-01-01"), "2024-11-05"),
+        (None, "2024-11-05"),
+    ];
+
+    fn with_version(mut params: Value, asked: Option<&str>) -> Value {
+        if let Some(asked) = asked {
+            params["protocolVersion"] = json!(asked);
+        }
+        params
+    }
+
+    fn assert_negotiated(reply: &Value, asked: Option<&str>, negotiated: &str, branch: &str) {
+        assert_eq!(
+            reply["result"]["protocolVersion"],
+            json!(negotiated),
+            "{branch}, asking for {asked:?}"
+        );
+        assert_eq!(
+            reply["result"]["protocolVersion"],
+            json!(crate::rmcp_handler::negotiated_initialize_version(asked)),
+            "{branch}, asking for {asked:?}"
+        );
+    }
+
+    #[test]
+    fn initialize_negotiates_the_version_the_rmcp_handler_does_in_every_reply_branch() {
+        let project = indexed_project("init-negotiate");
+        let uri = format!("file://{}", project.path().display());
+        for (asked, negotiated) in NEGOTIATIONS {
+            // A plain reply.
+            let mut server = McpServer::new(None);
+            let out = run_initialize_capture(
+                &mut server,
+                with_version(json!({ "capabilities": {} }), asked),
+            );
+            assert_eq!(out.len(), 1, "{out:?}");
+            assert_negotiated(&out[0], asked, negotiated, "reply");
+
+            // A reply followed by a roots/list request.
+            let mut server = McpServer::new(None);
+            let out = run_initialize_capture(
+                &mut server,
+                with_version(
+                    json!({ "capabilities": { "roots": { "listChanged": true } } }),
+                    asked,
+                ),
+            );
+            assert_eq!(out[1]["method"], json!("roots/list"), "{out:?}");
+            assert_negotiated(&out[0], asked, negotiated, "reply and roots/list");
+
+            // A reply that adopts the indexed project the client names.
+            let mut server = McpServer::new(None);
+            let out =
+                run_initialize_capture(&mut server, with_version(json!({ "rootUri": uri }), asked));
+            assert_eq!(server.default_project(), Some(project.path()));
+            assert_negotiated(&out[0], asked, negotiated, "reply with adoption");
+        }
+    }
+
+    /// The `_meta` a 2026-07-28 request carries.
+    fn inline_meta() -> Value {
+        json!({
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientCapabilities": {},
+            "io.modelcontextprotocol/clientInfo": { "name": "inline-test", "version": "0" }
+        })
+    }
+
+    /// Run `lines` through `run_until_adoption`: what it wrote, and how it ended.
+    fn run_lines(
+        server: &mut McpServer,
+        lines: &[Value],
+    ) -> (Vec<Value>, RunUntilAdoption<Cursor<Vec<u8>>>) {
+        let input: String = lines.iter().map(|line| format!("{line}\n")).collect();
+        let mut out = Vec::new();
+        let outcome = server
+            .run_until_adoption(Cursor::new(input.into_bytes()), Cursor::new(&mut out))
+            .unwrap();
+        (parse_json_lines(&out), outcome)
+    }
+
+    #[test]
+    fn a_session_opening_with_the_inline_lifecycle_is_handed_over_unanswered() {
+        let discover = json!({
+            "jsonrpc": "2.0", "id": 1, "method": "server/discover",
+            "params": { "_meta": inline_meta() }
+        });
+        let list = json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/list",
+            "params": { "_meta": inline_meta() }
+        });
+        for opener in [&discover, &list] {
+            let mut server = McpServer::new(None);
+            let (written, outcome) = run_lines(&mut server, &[opener.clone(), list.clone()]);
+            assert!(written.is_empty(), "{opener}: wrote {written:?}");
+            let RunUntilAdoption::Inline {
+                first_line,
+                mut reader,
+            } = outcome
+            else {
+                panic!("{opener} opens the inline lifecycle");
+            };
+            assert_eq!(first_line, format!("{opener}\n"));
+            let mut remaining = String::new();
+            reader.read_to_string(&mut remaining).unwrap();
+            assert_eq!(remaining, format!("{list}\n"));
+        }
+    }
+
+    #[test]
+    fn the_initialize_lifecycle_stays_with_the_hand_rolled_loop() {
+        let initialize = json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": { "protocolVersion": "2025-06-18", "capabilities": {} }
+        });
+        let list_with_meta = json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/list",
+            "params": { "_meta": inline_meta() }
+        });
+        let mut server = McpServer::new(None);
+        let (written, outcome) = run_lines(&mut server, &[initialize, list_with_meta]);
+        assert!(matches!(outcome, RunUntilAdoption::Eof));
+        assert_eq!(written.len(), 2, "{written:?}");
+        assert!(written[1]["result"].get("resultType").is_none());
+
+        // A first request that names no version is the hand-rolled loop's too.
+        let plain_list = json!({ "jsonrpc": "2.0", "id": 3, "method": "tools/list" });
+        let mut server = McpServer::new(None);
+        let (written, outcome) = run_lines(&mut server, &[plain_list]);
+        assert!(matches!(outcome, RunUntilAdoption::Eof));
+        assert!(written[0]["result"]["tools"].is_array(), "{written:?}");
+    }
+
+    /// A writer the inline session's tokio runtime can own while the test reads it.
+    #[derive(Clone, Default)]
+    struct SharedBuf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl Write for SharedBuf {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn an_inline_session_keeps_the_explicit_project_service_broker() {
+        let project = indexed_project("inline-broker");
+        let starts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let broker = ProjectServiceBroker::new(std::sync::Arc::new({
+            let starts = std::sync::Arc::clone(&starts);
+            move |_: &Path| {
+                starts.fetch_add(1, Ordering::SeqCst);
+                Ok(std::sync::Arc::new(()) as crate::project_services::ProjectServiceHandle)
+            }
+        }));
+        let call = json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {
+                "_meta": inline_meta(),
+                "name": "codegraph_status",
+                "arguments": { "projectPath": project.path() }
+            }
+        });
+        // A pipe, so the session's input stays open until the reply is in. The
+        // session runs on its own thread: whichever loop answers, the reply
+        // lands in `out`, and a failed assertion drops the pipe's write end on
+        // unwind, which ends the session.
+        let (pipe_reader, mut pipe_writer) = std::io::pipe().unwrap();
+        writeln!(pipe_writer, "{call}").unwrap();
+        let out = SharedBuf::default();
+        let serving = std::thread::spawn({
+            let out = out.clone();
+            move || -> anyhow::Result<bool> {
+                let mut server = McpServer::new_with_project_services(None, Some(broker));
+                match server
+                    .run_until_adoption(std::io::BufReader::new(pipe_reader), out.clone())?
+                {
+                    RunUntilAdoption::Inline { first_line, reader } => {
+                        server.serve_inline(first_line, reader, out)?;
+                        Ok(true)
+                    }
+                    _ => Ok(false),
+                }
+            }
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let reply = loop {
+            let bytes = out.0.lock().unwrap().clone();
+            if let Some(reply) = parse_json_lines(&bytes)
+                .into_iter()
+                .find(|reply| reply["id"] == json!(1))
+            {
+                break reply;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no reply to the tools/call"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        assert_eq!(
+            reply["result"]["resultType"],
+            json!("complete"),
+            "the rmcp handler answers the call: {reply}"
+        );
+        assert_eq!(
+            starts.load(Ordering::SeqCst),
+            1,
+            "the explicit projectPath must reach the same broker"
+        );
+        drop(pipe_writer);
+        assert!(
+            serving.join().unwrap().unwrap(),
+            "the session was handed over"
+        );
     }
 
     #[test]

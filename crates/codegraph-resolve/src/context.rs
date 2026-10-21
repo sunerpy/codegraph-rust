@@ -7,6 +7,7 @@
 //! per-resolver LRU caches the upstream uses (`index.ts:217-250`). Resolution is sync.
 
 use crate::lru_cache::LruCache;
+use crate::package_manifests::{ManifestScope, read_manifest_scope};
 use crate::path_aliases::{AliasMap, load_project_aliases};
 use crate::source_facts::SourceFacts;
 use crate::types::{GoModule, ImportMapping, ReExport, ResolutionContext};
@@ -34,6 +35,9 @@ pub struct StoreResolutionContext<'a> {
     project_root: String,
     max_file_size: u64,
     caches: RefCell<Caches>,
+    /// The files whose class-head rows are not to be read, when the rows are
+    /// trusted at all ([`Self::with_recorded_class_heads`]).
+    recorded_heads_stale: Option<Arc<std::collections::HashSet<String>>>,
 }
 
 struct Caches {
@@ -45,17 +49,67 @@ struct Caches {
     name_cache: LruCache<String, Vec<Arc<Node>>>,
     lower_name_cache: LruCache<String, Vec<Arc<Node>>>,
     qualified_name_cache: LruCache<String, Vec<Arc<Node>>>,
+    /// Each file's functions and methods by qualified name (W5-08).
+    function_scopes_cache: LruCache<String, Arc<crate::name_matcher::FileCallables>>,
+    /// Each file's methods by owner and name (W5-08).
+    file_methods_cache: LruCache<String, Arc<crate::name_matcher::FileMethods>>,
+    /// Each file's class-head row, as read (W5-08).
+    head_rows: HashMap<String, Option<Arc<crate::class_heads::HeadsRow>>>,
+    /// The name matcher's memos for the pass (W5-08).
+    name_matcher_tables: Option<Arc<crate::name_matcher::NameMatcherTables>>,
     project_aliases: Option<Option<AliasMap>>,
     go_module: Option<Option<GoModule>>,
     go_modules: Option<Vec<GoModule>>,
+    rust_crates: Option<Arc<crate::rust_scope::RustCrates>>,
     workspace_packages: Option<Option<WorkspacePackages>>,
+    /// Each directory's package.json / Deno import-map scope for the pass.
+    manifest_scopes: HashMap<String, Arc<ManifestScope>>,
     all_files: Option<Arc<Vec<String>>>,
     files_by_basename: Option<HashMap<String, Arc<Vec<String>>>>,
     /// Existence answers for the pass: import resolution probes every extension
     /// of a specifier from every importing file, and neither the borrowed store
     /// nor the tree changes within a pass (upstream `fileExistsMemo`).
     file_exists: HashMap<String, bool>,
+    /// The Python write index for the pass (upstream #2332).
+    python_write_index: Option<Arc<crate::python_globals::PythonWriteIndex>>,
+    /// The C/C++ namespace tables for the pass (upstream #2176).
+    cpp_namespace_tables: Option<Arc<crate::cpp_namespaces::CppNamespaceTables>>,
+    /// The Kotlin tables for the pass (upstream #2172).
+    kotlin_tables: Option<Arc<crate::kotlin_scope::KotlinTables>>,
+    scala_tables: Option<Arc<crate::scala_scope::ScalaTables>>,
+    csharp_tables: Option<Arc<crate::csharp_types::CsharpTables>>,
+    member_tables: Option<Arc<crate::member_types::MemberTables>>,
+    ruby_tables: Option<Arc<crate::ruby_scope::RubyTables>>,
+    php_tables: Option<Arc<crate::php_scope::PhpTables>>,
+    lua_tables: Option<Arc<crate::lua_scope::LuaTables>>,
+    dart_tables: Option<Arc<crate::dart_scope::DartTables>>,
+    dart_libraries: Option<Arc<crate::dart_libraries::DartLibraries>>,
+    /// The last few compiled pattern sets, most recent last
+    /// ([`ResolutionContext::compiled_patterns`]).
+    patterns: std::collections::VecDeque<CompiledPatterns>,
+    /// The last few nodes read by id, most recent last.
+    nodes_by_id: std::collections::VecDeque<(String, Option<Arc<Node>>)>,
+    cfml_tables: Option<Arc<crate::cfml_scope::CfmlTables>>,
+    swift_tables: Option<Arc<crate::swift_type_visibility::SwiftTables>>,
+    objc_tables: Option<Arc<crate::objc_scope::ObjcTables>>,
+    go_tables: Option<Arc<crate::go_packages::GoTables>>,
+    solidity_tables: Option<Arc<crate::solidity_scope::SolidityTables>>,
 }
+
+/// A compiled pattern set by its key.
+type CompiledPatterns = (
+    String,
+    Arc<Vec<(regex::Regex, crate::name_matcher::PatternCheck)>>,
+);
+
+/// The most compiled pattern sets a store context keeps: a set takes a
+/// megabyte or more (CFML's eight about 3.3 MB), so a few, enough for the
+/// receivers one file's references write in turn.
+const PATTERN_MEMO_LIMIT: usize = 8;
+
+/// The most nodes a store context keeps by id: the gates one reference passes
+/// read its target's node in turn, each a query of its own otherwise.
+const NODE_BY_ID_MEMO_LIMIT: usize = 8;
 
 /// Bound on memoized existence answers; the memo restarts past it, as upstream.
 pub(crate) const FILE_EXISTS_MEMO_LIMIT: usize = 200_000;
@@ -74,13 +128,37 @@ impl Caches {
             name_cache: LruCache::new(limit),
             lower_name_cache: LruCache::new(limit),
             qualified_name_cache: LruCache::new(limit),
+            function_scopes_cache: LruCache::new(limit),
+            file_methods_cache: LruCache::new(limit),
+            head_rows: HashMap::new(),
+            name_matcher_tables: None,
             project_aliases: None,
             go_module: None,
             go_modules: None,
+            rust_crates: None,
             workspace_packages: None,
+            manifest_scopes: HashMap::new(),
             all_files: None,
             files_by_basename: None,
             file_exists: HashMap::new(),
+            python_write_index: None,
+            cpp_namespace_tables: None,
+            kotlin_tables: None,
+            scala_tables: None,
+            csharp_tables: None,
+            member_tables: None,
+            ruby_tables: None,
+            php_tables: None,
+            lua_tables: None,
+            dart_tables: None,
+            dart_libraries: None,
+            patterns: std::collections::VecDeque::new(),
+            nodes_by_id: std::collections::VecDeque::new(),
+            cfml_tables: None,
+            swift_tables: None,
+            objc_tables: None,
+            go_tables: None,
+            solidity_tables: None,
         }
     }
 }
@@ -93,6 +171,7 @@ impl<'a> StoreResolutionContext<'a> {
             project_root: project_root.into(),
             max_file_size: codegraph_core::config::DEFAULT_MAX_FILE_SIZE,
             caches: RefCell::new(Caches::new()),
+            recorded_heads_stale: None,
         }
     }
 
@@ -101,6 +180,19 @@ impl<'a> StoreResolutionContext<'a> {
     #[must_use]
     pub fn with_max_file_size(mut self, max_file_size: u64) -> Self {
         self.max_file_size = max_file_size;
+        self
+    }
+
+    /// Trust the store's class-head rows (`class_heads:<path>`) for every
+    /// file but `stale`, the files a sync changed since they were written
+    /// (W5-08): a declaration's own head is then read from its file's row,
+    /// when the row holds one answer for it, instead of the file.
+    #[must_use]
+    pub fn with_recorded_class_heads(
+        mut self,
+        stale: Option<Arc<std::collections::HashSet<String>>>,
+    ) -> Self {
+        self.recorded_heads_stale = stale;
         self
     }
 
@@ -119,6 +211,24 @@ impl<'a> StoreResolutionContext<'a> {
         c.all_files = None;
         c.files_by_basename = None;
         c.file_exists.clear();
+        c.python_write_index = None;
+        c.cpp_namespace_tables = None;
+        c.kotlin_tables = None;
+        c.scala_tables = None;
+        c.csharp_tables = None;
+        c.member_tables = None;
+        c.ruby_tables = None;
+        c.php_tables = None;
+        c.lua_tables = None;
+        c.dart_tables = None;
+        c.dart_libraries = None;
+        c.patterns.clear();
+        c.nodes_by_id.clear();
+        c.cfml_tables = None;
+        c.swift_tables = None;
+        c.objc_tables = None;
+        c.go_tables = None;
+        c.solidity_tables = None;
     }
 
     fn cached_all_files(&self) -> Arc<Vec<String>> {
@@ -175,7 +285,7 @@ impl ResolutionContext for StoreResolutionContext<'_> {
 
     fn get_nodes_in_file_shared(&self, file_path: &str) -> Vec<Arc<Node>> {
         let mut c = self.caches.borrow_mut();
-        if let Some(cached) = c.node_cache.get(&file_path.to_string()) {
+        if let Some(cached) = c.node_cache.get(file_path) {
             return cached;
         }
         let result: Vec<Arc<Node>> = self
@@ -198,7 +308,7 @@ impl ResolutionContext for StoreResolutionContext<'_> {
 
     fn get_nodes_by_name_shared(&self, name: &str) -> Vec<Arc<Node>> {
         let mut c = self.caches.borrow_mut();
-        if let Some(cached) = c.name_cache.get(&name.to_string()) {
+        if let Some(cached) = c.name_cache.get(name) {
             return cached;
         }
         let mut result = self.store.nodes_by_name(name).unwrap_or_default();
@@ -217,7 +327,7 @@ impl ResolutionContext for StoreResolutionContext<'_> {
 
     fn get_nodes_by_qualified_name_shared(&self, qualified_name: &str) -> Vec<Arc<Node>> {
         let mut c = self.caches.borrow_mut();
-        if let Some(cached) = c.qualified_name_cache.get(&qualified_name.to_string()) {
+        if let Some(cached) = c.qualified_name_cache.get(qualified_name) {
             return cached;
         }
         let mut result = self
@@ -273,6 +383,15 @@ impl ResolutionContext for StoreResolutionContext<'_> {
         exists
     }
 
+    fn is_indexed_file(&self, file_path: &str) -> bool {
+        let normalized = file_path.replace('\\', "/");
+        self.store
+            .file_by_path(&normalized)
+            .ok()
+            .flatten()
+            .is_some()
+    }
+
     fn read_file(&self, file_path: &str) -> Option<String> {
         self.read_file_shared(file_path)
             .map(|content| content.to_string())
@@ -281,7 +400,7 @@ impl ResolutionContext for StoreResolutionContext<'_> {
     fn read_file_shared(&self, file_path: &str) -> Option<Arc<str>> {
         let mut c = self.caches.borrow_mut();
         if c.file_cache.has(&file_path.to_string()) {
-            return c.file_cache.get(&file_path.to_string()).flatten();
+            return c.file_cache.get(file_path).flatten();
         }
         let full_path = Path::new(&self.project_root).join(file_path);
         let content: Option<Arc<str>> =
@@ -294,7 +413,7 @@ impl ResolutionContext for StoreResolutionContext<'_> {
         {
             let mut c = self.caches.borrow_mut();
             if c.source_facts_cache.has(&file_path.to_string()) {
-                return c.source_facts_cache.get(&file_path.to_string()).flatten();
+                return c.source_facts_cache.get(file_path).flatten();
             }
         }
         let facts = self
@@ -332,7 +451,7 @@ impl ResolutionContext for StoreResolutionContext<'_> {
 
     fn get_nodes_by_lower_name_shared(&self, lower_name: &str) -> Vec<Arc<Node>> {
         let mut c = self.caches.borrow_mut();
-        if let Some(cached) = c.lower_name_cache.get(&lower_name.to_string()) {
+        if let Some(cached) = c.lower_name_cache.get(lower_name) {
             return cached;
         }
         let mut result = self
@@ -347,7 +466,27 @@ impl ResolutionContext for StoreResolutionContext<'_> {
     }
 
     fn get_node_by_id(&self, id: &str) -> Option<Node> {
-        self.store.node_by_id(id).ok().flatten()
+        self.get_node_by_id_shared(id)
+            .map(|node| node.as_ref().clone())
+    }
+
+    fn get_node_by_id_shared(&self, id: &str) -> Option<Arc<Node>> {
+        if let Some((_, node)) = self
+            .caches
+            .borrow()
+            .nodes_by_id
+            .iter()
+            .find(|(key, _)| key == id)
+        {
+            return node.clone();
+        }
+        let node = self.store.node_by_id(id).ok().flatten().map(Arc::new);
+        let mut c = self.caches.borrow_mut();
+        if c.nodes_by_id.len() >= NODE_BY_ID_MEMO_LIMIT {
+            c.nodes_by_id.pop_front();
+        }
+        c.nodes_by_id.push_back((id.to_string(), node.clone()));
+        node
     }
 
     fn get_supertypes(&self, type_name: &str, language: Language) -> Vec<String> {
@@ -376,6 +515,17 @@ impl ResolutionContext for StoreResolutionContext<'_> {
         }
         let mut supertypes: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         for tn in &type_nodes {
+            // A Swift conformance to a type the project only extends
+            // (SwiftUI's `View`) resolves to nothing, an extension being no
+            // type, yet the members its extensions add are still the
+            // conformer's (upstream #2107).
+            if language == Language::Swift {
+                for name in crate::swift_type_visibility::extended_conformances(tn, self).iter() {
+                    if name != type_name {
+                        supertypes.insert(name.clone());
+                    }
+                }
+            }
             for edge_kind in [EdgeKind::Implements, EdgeKind::Extends] {
                 let edges = self
                     .store
@@ -395,7 +545,7 @@ impl ResolutionContext for StoreResolutionContext<'_> {
 
     fn get_import_mappings(&self, file_path: &str, language: Language) -> Vec<ImportMapping> {
         let mut c = self.caches.borrow_mut();
-        if let Some(cached) = c.import_mapping_cache.get(&file_path.to_string()) {
+        if let Some(cached) = c.import_mapping_cache.get(file_path) {
             return cached;
         }
         drop(c);
@@ -429,6 +579,305 @@ impl ResolutionContext for StoreResolutionContext<'_> {
         c.workspace_packages.clone().flatten()
     }
 
+    fn python_write_index(&self) -> Arc<crate::python_globals::PythonWriteIndex> {
+        if let Some(index) = self.caches.borrow().python_write_index.clone() {
+            return index;
+        }
+        let index = Arc::new(crate::python_globals::PythonWriteIndex::build(self));
+        self.caches.borrow_mut().python_write_index = Some(Arc::clone(&index));
+        index
+    }
+
+    fn cpp_namespace_tables(&self) -> Arc<crate::cpp_namespaces::CppNamespaceTables> {
+        Arc::clone(
+            self.caches
+                .borrow_mut()
+                .cpp_namespace_tables
+                .get_or_insert_with(|| Arc::new(crate::cpp_namespaces::CppNamespaceTables::new())),
+        )
+    }
+
+    fn kotlin_tables(&self) -> Arc<crate::kotlin_scope::KotlinTables> {
+        Arc::clone(
+            self.caches
+                .borrow_mut()
+                .kotlin_tables
+                .get_or_insert_with(|| Arc::new(crate::kotlin_scope::KotlinTables::new())),
+        )
+    }
+
+    fn scala_tables(&self) -> Arc<crate::scala_scope::ScalaTables> {
+        Arc::clone(
+            self.caches
+                .borrow_mut()
+                .scala_tables
+                .get_or_insert_with(|| Arc::new(crate::scala_scope::ScalaTables::new())),
+        )
+    }
+
+    fn csharp_tables(&self) -> Arc<crate::csharp_types::CsharpTables> {
+        Arc::clone(
+            self.caches
+                .borrow_mut()
+                .csharp_tables
+                .get_or_insert_with(|| Arc::new(crate::csharp_types::CsharpTables::new())),
+        )
+    }
+
+    fn member_tables(&self) -> Arc<crate::member_types::MemberTables> {
+        Arc::clone(
+            self.caches
+                .borrow_mut()
+                .member_tables
+                .get_or_insert_with(|| Arc::new(crate::member_types::MemberTables::new())),
+        )
+    }
+
+    fn ruby_tables(&self) -> Arc<crate::ruby_scope::RubyTables> {
+        Arc::clone(
+            self.caches
+                .borrow_mut()
+                .ruby_tables
+                .get_or_insert_with(|| Arc::new(crate::ruby_scope::RubyTables::new())),
+        )
+    }
+
+    fn php_tables(&self) -> Arc<crate::php_scope::PhpTables> {
+        Arc::clone(
+            self.caches
+                .borrow_mut()
+                .php_tables
+                .get_or_insert_with(|| Arc::new(crate::php_scope::PhpTables::new())),
+        )
+    }
+
+    fn lua_tables(&self) -> Arc<crate::lua_scope::LuaTables> {
+        Arc::clone(
+            self.caches
+                .borrow_mut()
+                .lua_tables
+                .get_or_insert_with(|| Arc::new(crate::lua_scope::LuaTables::new())),
+        )
+    }
+
+    fn dart_tables(&self) -> Arc<crate::dart_scope::DartTables> {
+        Arc::clone(
+            self.caches
+                .borrow_mut()
+                .dart_tables
+                .get_or_insert_with(|| Arc::new(crate::dart_scope::DartTables::new())),
+        )
+    }
+
+    fn dart_libraries(&self) -> Arc<crate::dart_libraries::DartLibraries> {
+        Arc::clone(
+            self.caches
+                .borrow_mut()
+                .dart_libraries
+                .get_or_insert_with(|| Arc::new(crate::dart_libraries::DartLibraries::new())),
+        )
+    }
+
+    fn compiled_patterns(
+        &self,
+        key: &str,
+        build: &dyn Fn() -> Vec<(regex::Regex, crate::name_matcher::PatternCheck)>,
+    ) -> Arc<Vec<(regex::Regex, crate::name_matcher::PatternCheck)>> {
+        {
+            let mut c = self.caches.borrow_mut();
+            if let Some(at) = c.patterns.iter().position(|(k, _)| k == key)
+                && let Some(entry) = c.patterns.remove(at)
+            {
+                let set = Arc::clone(&entry.1);
+                c.patterns.push_back(entry);
+                return set;
+            }
+        }
+        let set = Arc::new(build());
+        let mut c = self.caches.borrow_mut();
+        while c.patterns.len() >= PATTERN_MEMO_LIMIT {
+            c.patterns.pop_front();
+        }
+        c.patterns.push_back((key.to_string(), Arc::clone(&set)));
+        set
+    }
+
+    fn cfml_tables(&self) -> Arc<crate::cfml_scope::CfmlTables> {
+        Arc::clone(
+            self.caches
+                .borrow_mut()
+                .cfml_tables
+                .get_or_insert_with(|| Arc::new(crate::cfml_scope::CfmlTables::new())),
+        )
+    }
+
+    fn swift_tables(&self) -> Arc<crate::swift_type_visibility::SwiftTables> {
+        Arc::clone(
+            self.caches
+                .borrow_mut()
+                .swift_tables
+                .get_or_insert_with(|| Arc::new(crate::swift_type_visibility::SwiftTables::new())),
+        )
+    }
+
+    fn objc_tables(&self) -> Arc<crate::objc_scope::ObjcTables> {
+        Arc::clone(
+            self.caches
+                .borrow_mut()
+                .objc_tables
+                .get_or_insert_with(|| Arc::new(crate::objc_scope::ObjcTables::new())),
+        )
+    }
+
+    fn go_tables(&self) -> Arc<crate::go_packages::GoTables> {
+        Arc::clone(
+            self.caches
+                .borrow_mut()
+                .go_tables
+                .get_or_insert_with(|| Arc::new(crate::go_packages::GoTables::new())),
+        )
+    }
+
+    fn solidity_tables(&self) -> Arc<crate::solidity_scope::SolidityTables> {
+        Arc::clone(
+            self.caches
+                .borrow_mut()
+                .solidity_tables
+                .get_or_insert_with(|| Arc::new(crate::solidity_scope::SolidityTables::new())),
+        )
+    }
+
+    fn enclosing_function_lines(
+        &self,
+        file_path: &str,
+        qualified: &str,
+        start: i64,
+        end: i64,
+    ) -> Option<(i64, i64)> {
+        self.file_callables(file_path)
+            .first_enclosing(qualified, start, end)
+    }
+
+    fn file_callables(&self, file_path: &str) -> Arc<crate::name_matcher::FileCallables> {
+        let cached = self
+            .caches
+            .borrow_mut()
+            .function_scopes_cache
+            .get(file_path);
+        if let Some(callables) = cached {
+            return callables;
+        }
+        // Only the file's functions and methods, by start line: the rows the
+        // index keeps (W5-08).
+        let nodes: Vec<Arc<Node>> = self
+            .store
+            .callables_by_file_path(file_path)
+            .unwrap_or_default()
+            .into_iter()
+            .map(Arc::new)
+            .collect();
+        let callables = Arc::new(crate::name_matcher::FileCallables::of(&nodes));
+        self.caches
+            .borrow_mut()
+            .function_scopes_cache
+            .set(file_path.to_string(), Arc::clone(&callables));
+        callables
+    }
+
+    fn file_methods(&self, file_path: &str) -> Arc<crate::name_matcher::FileMethods> {
+        let cached = self.caches.borrow_mut().file_methods_cache.get(file_path);
+        if let Some(methods) = cached {
+            return methods;
+        }
+        // Only the file's methods, in the order its every node is listed
+        // (the same index walk): the rows the methods keep (W5-08).
+        let nodes: Vec<Arc<Node>> = self
+            .store
+            .methods_by_file_path(file_path)
+            .unwrap_or_default()
+            .into_iter()
+            .map(Arc::new)
+            .collect();
+        let methods = Arc::new(crate::name_matcher::FileMethods::of(&nodes));
+        self.caches
+            .borrow_mut()
+            .file_methods_cache
+            .set(file_path.to_string(), Arc::clone(&methods));
+        methods
+    }
+
+    fn recorded_heads(&self, class: &Node) -> Option<Vec<String>> {
+        let stale = self.recorded_heads_stale.as_ref()?;
+        if stale.contains(&class.file_path) {
+            return None;
+        }
+        let cached = self
+            .caches
+            .borrow()
+            .head_rows
+            .get(&class.file_path)
+            .cloned();
+        let row = match cached {
+            Some(row) => row,
+            None => {
+                let row = self
+                    .store
+                    .get_project_metadata(&crate::class_heads::row_key(&class.file_path))
+                    .ok()
+                    .flatten()
+                    .and_then(|value| crate::class_heads::HeadsRow::decode(&value))
+                    .map(Arc::new);
+                self.caches
+                    .borrow_mut()
+                    .head_rows
+                    .insert(class.file_path.clone(), row.clone());
+                row
+            }
+        }?;
+        // The declaration's entries: one answer, or none trusted (two
+        // declarations of the name whose heads differ are told apart only
+        // by reading the file).
+        let mut entries = row
+            .entries
+            .iter()
+            .filter(|entry| entry.language == class.language && entry.name == class.name);
+        let first = entries.next()?;
+        entries
+            .all(|entry| entry.heads == first.heads)
+            .then(|| first.heads.clone())
+    }
+
+    fn has_callable_named(&self, qualified: &str) -> bool {
+        self.store.has_callable_named(qualified).unwrap_or(true)
+    }
+
+    fn method_files(&self, name: &str) -> Option<Arc<std::collections::HashSet<String>>> {
+        Some(crate::name_matcher::method_files_of(name, self))
+    }
+
+    fn name_matcher_tables(&self) -> Arc<crate::name_matcher::NameMatcherTables> {
+        Arc::clone(
+            self.caches
+                .borrow_mut()
+                .name_matcher_tables
+                .get_or_insert_with(|| Arc::new(crate::name_matcher::NameMatcherTables::new())),
+        )
+    }
+
+    fn manifest_scope(&self, dir: &str) -> Arc<ManifestScope> {
+        if let Some(scope) = self.caches.borrow().manifest_scopes.get(dir) {
+            return Arc::clone(scope);
+        }
+        // Read without holding the cache: the parent's scope and the
+        // manifests' text come through this context too.
+        let scope = Arc::new(read_manifest_scope(dir, self));
+        self.caches
+            .borrow_mut()
+            .manifest_scopes
+            .insert(dir.to_string(), Arc::clone(&scope));
+        scope
+    }
+
     fn get_go_module(&self) -> Option<GoModule> {
         let mut c = self.caches.borrow_mut();
         if c.go_module.is_none() {
@@ -446,9 +895,21 @@ impl ResolutionContext for StoreResolutionContext<'_> {
         modules
     }
 
+    fn get_rust_crates(&self) -> Arc<crate::rust_scope::RustCrates> {
+        if let Some(cached) = self.caches.borrow().rust_crates.clone() {
+            return cached;
+        }
+        let crates = Arc::new(crate::rust_scope::load_rust_crates(
+            &self.project_root,
+            &self.get_all_files(),
+        ));
+        self.caches.borrow_mut().rust_crates = Some(Arc::clone(&crates));
+        crates
+    }
+
     fn get_re_exports(&self, file_path: &str, language: Language) -> Vec<ReExport> {
         let mut c = self.caches.borrow_mut();
-        if let Some(cached) = c.re_export_cache.get(&file_path.to_string()) {
+        if let Some(cached) = c.re_export_cache.get(file_path) {
             return cached;
         }
         drop(c);
@@ -831,6 +1292,94 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// W5-09b: the files a Lua `require` suffix names come from one scan of
+    /// the file list per pass, the same files in the same order as scanning
+    /// for each `require`, kept apart per suffix.
+    #[test]
+    fn lua_require_matches_are_the_scan_of_each_suffix() {
+        let root = temp_root("lua-require");
+        let store = open_store(&root);
+        for path in [
+            "a/b.lua",
+            "lib/a/b.lua",
+            "a/b/init.lua",
+            "xa/b.lua",
+            "b.lua",
+            "a/b.luau",
+        ] {
+            store.upsert_file(&file_record(path, 0)).unwrap();
+        }
+        let ctx = StoreResolutionContext::new(&store, root.to_str().unwrap());
+        let files = ctx.get_all_files();
+        let scan = |suffix: &str| -> Vec<String> {
+            files
+                .iter()
+                .filter(|file| file.as_str() == suffix || file.ends_with(&format!("/{suffix}")))
+                .cloned()
+                .collect()
+        };
+        for round in 0..2 {
+            for suffix in ["a/b.lua", "b.lua", "a/b/init.lua", "a/b.luau", "c.lua"] {
+                assert_eq!(
+                    *crate::lua_scope::lua_require_matches(suffix, &ctx),
+                    scan(suffix),
+                    "{suffix}, round {round}"
+                );
+            }
+        }
+        assert_eq!(scan("a/b.lua"), ["a/b.lua", "lib/a/b.lua"]);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// W5-08: the store context answers a declaration's enclosing function
+    /// from its per-file index exactly as the qualified-name lookup does,
+    /// before and after the index is cached.
+    #[test]
+    fn store_context_encloses_as_the_qualified_name_lookup_does() {
+        let root = temp_root("enclosing");
+        let mut store = open_store(&root);
+        store.upsert_file(&file_record("a.ts", 5)).unwrap();
+        store.upsert_file(&file_record("b.ts", 1)).unwrap();
+        let scoped = |id: &str, kind, qualified: &str, file: &str, lines: (i64, i64), col| {
+            let name = qualified.rsplit("::").next().unwrap_or(qualified);
+            let mut n = node(id, name, kind, file, lines.0, col);
+            n.qualified_name = qualified.to_string();
+            n.end_line = lines.1;
+            n
+        };
+        store
+            .upsert_nodes(&[
+                scoped("f-a", NodeKind::Function, "f", "a.ts", (3, 20), 0),
+                scoped("f-b", NodeKind::Function, "f", "a.ts", (3, 20), 4),
+                scoped("f-outer", NodeKind::Function, "f", "a.ts", (2, 30), 0),
+                scoped("m", NodeKind::Method, "C::m", "a.ts", (5, 9), 2),
+                scoped("c", NodeKind::Class, "C", "a.ts", (4, 10), 0),
+                scoped("f-other", NodeKind::Function, "f", "b.ts", (1, 100), 0),
+            ])
+            .unwrap();
+        let ctx = StoreResolutionContext::new(&store, root.to_str().unwrap());
+        for _ in 0..2 {
+            for (file, qualified, start, end) in [
+                ("a.ts", "f", 6, 7),
+                ("a.ts", "f", 25, 26),
+                ("a.ts", "f", 31, 31),
+                ("a.ts", "C::m", 6, 6),
+                ("a.ts", "C", 6, 6),
+                ("b.ts", "f", 50, 50),
+                ("c.ts", "f", 1, 1),
+            ] {
+                assert_eq!(
+                    ctx.enclosing_function_lines(file, qualified, start, end),
+                    crate::name_matcher::enclosing_by_qualified_name(
+                        &ctx, file, qualified, start, end
+                    ),
+                    "{file} {qualified} {start}..={end}"
+                );
+            }
+        }
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     #[test]
     fn store_context_file_exists_and_read_file() {
         let root = temp_root("files");
@@ -848,6 +1397,10 @@ mod tests {
         assert!(ctx.file_exists("known.ts"));
         assert!(ctx.file_exists("ondisk.ts"));
         assert!(!ctx.file_exists("nowhere.ts"));
+        // Only the index's own files are indexed; the disk fallback is not.
+        assert!(ctx.is_indexed_file("known.ts"));
+        assert!(!ctx.is_indexed_file("ondisk.ts"));
+        assert!(!ctx.is_indexed_file("nowhere.ts"));
         assert!(
             !ctx.file_exists(&format!(
                 "../{}/secret.ts",

@@ -93,6 +93,15 @@ pub trait FrameworkResolver: Sync {
         None
     }
 
+    /// The languages whose references `resolve()` sees, when they are not
+    /// [`Self::languages`] (upstream #2415 `resolveLanguages`): a framework's
+    /// conventions are its languages', so Strategy 1 asks only the resolvers
+    /// that read a reference's language. Defaults to [`Self::languages`]; a
+    /// resolver that declares neither stays universal.
+    fn resolve_languages(&self) -> Option<&[Language]> {
+        self.languages()
+    }
+
     /// Detect whether the project uses this `FrameworkResolver`'s target — called
     /// once at startup (`detect`, `types.ts:163`).
     fn detect(&self, context: &dyn ResolutionContext) -> bool;
@@ -125,6 +134,14 @@ pub trait FrameworkResolver: Sync {
         _context: &FrameworkExtractionContext,
     ) -> Option<FrameworkResolverExtractionResult> {
         None
+    }
+
+    /// Whether [`Self::extract`] of `file_path` reads files other than the one
+    /// it is handed, so its references can change while that file does not: a
+    /// sync re-extracts such a file rather than reusing its stored references
+    /// (W5-09e). Defaults to `false`.
+    fn extraction_reads_other_files(&self, _file_path: &str) -> bool {
+        false
     }
 
     /// Cross-file finalization pass run once after all extraction completes

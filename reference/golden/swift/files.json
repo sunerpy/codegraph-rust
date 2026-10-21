@@ -1,0 +1,20 @@
+[
+  {
+    "content_hash": "8aca53d13cf5661b2a82ebc5e49fdf2bbe902f3d14cb3a22d1ff25913a1aa304",
+    "errors": null,
+    "generated": 0,
+    "language": "swift",
+    "node_count": 5,
+    "path": "Sources/App/Client.swift",
+    "size": 387
+  },
+  {
+    "content_hash": "5ce53a75898b06189d4d1cb0bdf5c2f15d225d568b269f48c44cccae91f5d060",
+    "errors": null,
+    "generated": 0,
+    "language": "swift",
+    "node_count": 20,
+    "path": "Sources/App/Models.swift",
+    "size": 789
+  }
+]

@@ -735,3 +735,132 @@ async fn is_listed_on_the_api_index() {
     let params = entry["params"].as_array().unwrap();
     assert!(params.contains(&Value::from("from")) && params.contains(&Value::from("hop")));
 }
+
+/* ------------------------------ a directed Flow's ends are exact names -- */
+
+/// Upstream #2262: a directed Flow names its two ends as the viewer's links
+/// write them, a symbol's own name, which the free-text filter dropped: a
+/// two-letter name, a Ruby predicate and bang method, an Objective-C selector.
+fn exact_names_fixture() -> Project {
+    Project::indexed(&[
+        (
+            "src/check.ts",
+            "export function ok(): number {\n  return go();\n}\n\nexport function go(): number {\n  return 1;\n}\n",
+        ),
+        (
+            "app/models/order.rb",
+            "class Order\n  def save!\n    raise ArgumentError unless valid?\n  end\n\n  def valid?\n    true\n  end\nend\n",
+        ),
+        (
+            "src/Panel.m",
+            "@implementation Panel\n- (instancetype)initWithFrame:(CGRect)frame {\n  [self layoutPanel];\n  return self;\n}\n\n- (void)layoutPanel {\n}\n@end\n",
+        ),
+    ])
+}
+
+#[tokio::test]
+async fn a_directed_flow_reaches_names_the_free_text_filter_drops() {
+    let project = exact_names_fixture();
+    let viewer = project.viewer();
+    for (from, to) in [
+        ("ok", "go"),
+        ("save!", "valid?"),
+        ("initWithFrame:", "layoutPanel"),
+    ] {
+        let payload = flow(
+            &viewer,
+            &format!("?from={}&to={}", encode(from), encode(to)),
+            StatusCode::OK,
+        )
+        .await;
+        let flows = payload["flows"].as_array().unwrap();
+        assert!(!flows.is_empty(), "{from} -> {to}: {payload:#}");
+        assert_eq!(names(&flows[0]), [from, to], "{from} -> {to}");
+    }
+}
+
+/* ------------------ a named Flow goes through the symbols the query names -- */
+
+/// Upstream #2453: two routes of one length to a node were settled by the
+/// order the index lists callees in, so a Flow could pass a symbol nobody
+/// named while the named one called the next symbol just as directly.
+/// Upstream met it through an interface method's implementations, whose
+/// dispatch edges come with the synthesis stage (W7); any two routes of one
+/// length are settled the same way. Each case is asked naming one route and
+/// then the other, so it fails whichever is listed first.
+fn rival_routes_fixture() -> Project {
+    Project::indexed(&[
+        (
+            "src/store.ts",
+            "export function persist(): number {\n  return viaMemory() + viaDisk();\n}\n\nexport function viaMemory(): number {\n  return writeEntry();\n}\n\nexport function viaDisk(): number {\n  return writeEntry();\n}\n\nexport function writeEntry(): number {\n  return 1;\n}\n",
+        ),
+        (
+            "src/cache.ts",
+            "export function expire(): void {\n  toMemory();\n  toDisk();\n}\n\nexport function toMemory(): void {\n  dropFromMemory();\n}\n\nexport function toDisk(): void {\n  dropFromDisk();\n}\n\nexport function dropFromMemory(): void {}\n\nexport function dropFromDisk(): void {}\n",
+        ),
+    ])
+}
+
+/// The lead chain of a named Flow, each step as `qualifiedName@file`.
+fn lead_chain(project: &Project, query: &str) -> Vec<String> {
+    let paths = codegraph_core::IndexPaths::resolve(project.root(), None).unwrap();
+    let store = codegraph_store::Store::open_for_read(
+        &paths,
+        Instant::now() + Duration::from_secs(30),
+        || false,
+    )
+    .expect("read the index");
+    let flow = resolve_named_symbol_flow(&store, query, &NamedSymbolFlowOptions::default());
+    flow.chains
+        .first()
+        .map(|chain| {
+            chain
+                .steps
+                .iter()
+                .map(|s| format!("{}@{}", s.node.qualified_name, s.node.file_path))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[test]
+fn a_named_flow_takes_the_route_through_the_symbol_the_query_names() {
+    let project = rival_routes_fixture();
+    assert_eq!(
+        lead_chain(&project, "persist viaMemory writeEntry"),
+        [
+            "persist@src/store.ts",
+            "viaMemory@src/store.ts",
+            "writeEntry@src/store.ts",
+        ]
+    );
+    assert_eq!(
+        lead_chain(&project, "persist viaDisk writeEntry"),
+        [
+            "persist@src/store.ts",
+            "viaDisk@src/store.ts",
+            "writeEntry@src/store.ts",
+        ]
+    );
+}
+
+#[test]
+fn of_two_equally_deep_ends_the_one_reached_through_more_named_symbols() {
+    let project = rival_routes_fixture();
+    assert_eq!(
+        lead_chain(&project, "expire toMemory dropFromMemory dropFromDisk"),
+        [
+            "expire@src/cache.ts",
+            "toMemory@src/cache.ts",
+            "dropFromMemory@src/cache.ts",
+        ]
+    );
+    assert_eq!(
+        lead_chain(&project, "expire toDisk dropFromMemory dropFromDisk"),
+        [
+            "expire@src/cache.ts",
+            "toDisk@src/cache.ts",
+            "dropFromDisk@src/cache.ts",
+        ]
+    );
+}

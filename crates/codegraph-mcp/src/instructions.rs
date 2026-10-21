@@ -108,7 +108,7 @@ typically one to a few calls; a grep/read exploration is dozens.
 ## Limitations
 
 - If a tool reports the project isn't initialized, `.codegraph/` doesn't exist yet — offer to run `codegraph init .` to build the index.
-- Index lags file writes by ~1 second.
+- Index lags file writes by ~1 second. A burst of many changes (a branch switch, a mass rename) or a sign that the OS dropped file events makes the watcher re-scan the whole project on its own, and responses can start with "⚠️ CodeGraph auto-sync is RECOVERING" until that catch-up commits. Renames never need a rebuild: `codegraph sync` reconciles the whole project when no watcher is running.
 - Cross-file resolution is best-effort name matching; ambiguous calls may return multiple candidates.
 - Explore matches names and indexed code words lexically, not by meaning; an empty result reports word matches and may suggest indexed candidate names to retry with `codegraph_explore`.
 - No live correctness validation — that's still the TypeScript compiler / test suite / linter's job. Codegraph supplements those with structural context they don't have.

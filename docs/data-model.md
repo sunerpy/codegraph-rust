@@ -2,7 +2,7 @@
 
 This is the AS-BUILT storage contract owned by `codegraph-store`.
 
-- Current schema version: **8**
+- Current schema version: **10**
 - Base DDL: `crates/codegraph-store/src/schema.rs`
 - Ordered migrations: `crates/codegraph-store/src/migrations.rs`
 - Connection and lease policy: `crates/codegraph-store/src/connection.rs`
@@ -18,7 +18,11 @@ A new database is configured before its first page is written, then receives the
 complete base schema. The base DDL inserts schema row `1`; initialization also
 records the current version with description `Initial schema includes all
 migrations`. Existing databases run every missing migration in ascending order,
-each in its own transaction.
+each in its own transaction, when a write-capable connection opens a current
+index (a sync, a mutation, a stale-sidecar recovery), under its exclusive lease
+and before its first write; a full rebuild starts a new database at the current
+schema instead. A read-only open never migrates, and nothing it runs reads
+`resolved_refs`.
 
 Migrations that add a column first inspect `PRAGMA table_info`. This makes replay
 safe when a newer base schema already contains the column while still failing
@@ -34,6 +38,8 @@ loudly if the table itself is absent.
 |       6 | `unresolved_refs.reference_subkind` for structural/framework evidence        |
 |       7 | Deduplicate edges and add their unique semantic identity index               |
 |       8 | `files.generated` plus the partial generated-file index                      |
+|       9 | `synthesis_inputs` plus the partial synthesized-edge site index              |
+|      10 | `resolved_refs`, the references resolution took out of `unresolved_refs`     |
 
 Schema version and extraction version are independent. A DDL change needs a
 schema migration; a change in graph meaning may need an extraction-version move
@@ -84,6 +90,25 @@ documented compatibility ID are the exception, not a second general formula.
 | `line`, `col`      | INTEGER nullable                  | source location when known                     |
 | `provenance`       | TEXT nullable default NULL        | resolution/synthesis provenance                |
 
+A synthesized edge, one the resolver infers rather than reads from a call site
+(dynamic dispatch, callbacks, cross-tier channels), carries
+`provenance = 'heuristic'` and a `metadata` object with `synthesizedBy` (the pass
+that made it) and, when the wiring happens elsewhere, `registeredAt`
+(`path:line` of the registration). Consumers such as the type hierarchy and the
+named-symbol flow recognize synthesized edges by that provenance value.
+
+A value reference is a `references` edge the extractor emits from a symbol to a
+constant or variable of the same file that the symbol reads (upstream #895,
+#897), so `impact` on a shared value reaches its readers. It carries `metadata`
+`{"valueRef": true}` and no location. Only a constant or variable declared at
+file, class, module, struct or enum scope with a distinctive name (three or more
+characters, one of them an uppercase letter or `_`) is a target, and none whose
+name the file binds again in an inner scope. Generated files have none. The
+languages are TypeScript, JavaScript, TSX, ArkTS, Go, Python, PHP, Scala, Rust,
+Ruby, C, Pascal (whose targets are its `const`s only), Java, C#, Kotlin, Swift
+and Dart, and the scripts of Vue, Svelte and Astro components through the
+extractor they delegate to.
+
 An edge's semantic identity is:
 
 ```text
@@ -123,6 +148,30 @@ path classification where required.
 | `language`                         | TEXT not null default `unknown`   | source language (migration 2)                 |
 | `reference_subkind`                | TEXT nullable                     | structural/framework label (migration 6)      |
 
+### `resolved_refs`
+
+The columns of `unresolved_refs`, with `id` the row's id there (an INTEGER
+primary key, not autoincrement), `from_node_id` cascading with its node.
+
+Resolution moves each reference it takes out of `unresolved_refs` (the ones it
+resolves and the C++ internal-constructor references it accounts for) into this
+table, the whole row in the same transaction; an id listed twice moves once.
+Re-extracting a file deletes its rows from both tables, replacing a dependent's
+resolution state deletes them at the replaced sites or for the whole file, and
+a deleted source node cascades. So a file's rows in the two tables are every
+reference of its last extraction, the multiset at each site unchanged, which
+the `resolved_refs_version` marker below vouches for. Migration 10 creates the
+table empty and writes no marker.
+
+### `synthesis_inputs`
+
+| Column      | Type             | Contract                                                      |
+| ----------- | ---------------- | ------------------------------------------------------------- |
+| `file_path` | TEXT primary key | a file that fed a synthesis pass; cascades with `files(path)` |
+
+A sync reads it to tell whether a deleted or edited file changes synthesized
+edges, so it can recompute them without re-reading every file (migration 9).
+
 ### `project_metadata`
 
 | Column       | Type             | Contract           |
@@ -130,6 +179,285 @@ path classification where required.
 | `key`        | TEXT primary key | metadata name      |
 | `value`      | TEXT not null    | serialized value   |
 | `updated_at` | INTEGER not null | epoch milliseconds |
+
+Module-surface rows record what other files' resolution reads from a
+JavaScript-family module's own text, which no node records: its re-exports and
+export aliases, the CommonJS default, whether it has an `export default`
+statement, the names its export lists give, whether it is a sealed module, and a
+Vue or Svelte component's `<script>` blocks. `js_module_surface:<path>` holds the
+JSON `{"digest", "sources", "targets"}`: the sha256 of the canonical encoding of
+those facts, the specifiers the module forwards, and every project file they
+resolved to when the row was written, in each language an import following them
+can be written in (TypeScript, TSX, JavaScript, JSX, Vue, Svelte, Astro, ArkTS
+order extensions differently), sorted. A file whose surface is the default one
+(an ES module none of whose text another file reads) has no row.
+`js_module_surface_version` records the row format (2).
+
+A full index and a migration write every row and the marker once the file rows
+are stored, before resolution. A sync withdraws the marker before its first
+mutation and writes the rows it changed, then the marker, only after resolution
+is persisted. A sync that finds the marker missing, or another format,
+reconciles every JavaScript-family file before writing it. These rows are no
+canonical surface; the sync matrix checks that a sync leaves them as a fresh
+index writes them.
+
+Namespace rows record what a qualified C or C++ name reads from a file's own
+text: its namespace aliases (`namespace py = pybind11;`, in `.h`, `.hh`,
+`.hpp`, `.hxx`, `.inl`, `.c`, `.cc`, `.cpp`, `.cxx` files), the namespace
+macros a header defines (`.h`, `.hh`, `.hpp`, `.hxx`, `.h++`, `.inl`, `.ipp`,
+`.tcc`: openers with their body as written, single-parameter openers, closers
+with the scopes they close, identifier macro aliases), and, for a C or C++ file,
+the lines that use an opener or closer the project defines (line, macro, its
+argument). `cpp_namespace_surface:<path>` holds the JSON `{"facts": {"aliases",
+"macros"}, "usage"}`; a file with none of these has no row. A full index and a
+migration write them with the module-surface rows; a sync writes the rows it
+changed last, with the module-surface rows. When an alias or a macro is defined
+in several files, the first by path wins, and within a file its first
+definition.
+
+`cpp_type_surface_version` (2) records that no sync left a C or C++ reference
+unrefreshed whose resolution reads another file's text (a same-stem header's
+declarations, the aliases and class heads an alias lookup walks, the namespace
+aliases and macros a qualified name reads) and that the namespace rows are
+current. A full index and a migration write it with the module-surface marker;
+a sync withdraws it before its first mutation and writes it back last, after
+resolution is persisted, and a sync that finds it missing or at another version
+re-resolves every C and C++ file and rebuilds the namespace rows before writing
+it. Neither is a canonical surface.
+
+Head rows record what Java resolution reads of a Java file's type declarations:
+for each class, interface and enum, the names the scope walk of a bare call
+reads from the lines of its head and the names its ancestor walk reads, by the
+same readers. `java_type_heads:<path>` holds the JSON `{"entries": [{"name",
+"qualified_name", "supertypes", "ancestors"}]}`, the entries in the order of the
+declarations in the file (the walk reads same-named declarations in that order,
+across files by path); a declaration whose head names nothing has no entry, and
+a file with no entry has no row. A full index and a migration write them with
+the namespace rows; a sync writes the rows it changed last, with the other rows.
+`java_type_heads_version` (1) records that no sync left a Java reference
+unrefreshed whose resolution reads another file's heads or the project's
+packages, and that the head rows are current; it is written, withdrawn and
+checked as `cpp_type_surface_version` is, and a sync that finds it missing or at
+another version re-resolves every Java file and rebuilds the head rows. Neither
+is a canonical surface.
+
+Kotlin surface rows record what Kotlin resolution reads of a Kotlin file (`.kt`,
+`.kts`) by the readers it uses: `kotlin_surface:<path>` holds the JSON
+`{"heads", "function_types", "extensions", "lambdas", "aliases", "starts",
+"lambda_calls"}`: each class, struct, interface and enum head's name, qualified
+name and supertypes, the receivers its function types and extension functions
+name, each function's name and last parameter type as written, each typealias's
+name and right side (each list in file order), and, sorted, the names a
+hierarchy walk in the file can start from (type names, member owners, brace
+heads, a Gradle script's `Project` or `Settings`) and the calls its lambdas are
+passed to. A file with none of these has no row. They are written, withdrawn and
+checked like the head rows under `kotlin_surface_version` (1); a sync that finds
+it missing or at another version re-resolves every Kotlin file and rebuilds the
+rows. Neither is a canonical surface.
+
+Scala surface rows record what Scala resolution reads of a Scala file by the
+readers it uses: `scala_surface:<path>` holds the JSON `{"heads",
+"package_objects", "starts", "extension_functions", "block_locals",
+"object_package", "holder"}`: each type head's name and the supertypes that
+declaration names (in node order), each `package object X extends …`'s name and
+supertypes (in text order, `.scala` files only), sorted, the names the file's
+own walks start from (its type names, every type a `new … with …` names, the
+objects it imports whole, its package segments), the functions an `extension`
+line marks and the `val`s a block of a class body scopes (by node id and name),
+the package its package object opens and the last segment of its last package
+clause. A file with none of these has no row. They are written, withdrawn and
+checked like the head rows under `scala_surface_version` (1); a sync that finds
+it missing or at another version re-resolves every Scala file and rebuilds the
+rows. Neither is a canonical surface.
+
+C# surface rows record what C# resolution reads of a C# file by the readers it
+uses: `csharp_surface:<path>` holds the JSON `{"globals", "global_statics",
+"heads"}`: sorted, the namespaces its `global using`s import and the types its
+`global using static`s name, and each class, interface, struct and enum head's
+name, qualified name and the bases each of the two readers reads from it
+(`bases`, seven lines; `supers`, nine lines with `<…>` and `(…)` dropped; in
+node order; a head listing no base to either has no entry). A file with none of
+these has no row. They are written, withdrawn and checked like the head rows
+under `csharp_surface_version` (2); a sync that finds it missing or at another
+version re-resolves every C# file and rebuilds the rows. Neither is a canonical
+surface.
+
+Member surface rows record what a C#, Java, Kotlin or Swift call through a declared
+member, or a Dart member read, reads of a file's classes: `member_surface:<path>`
+holds the JSON `{"classes": [{"name", "qualified_name", "supers", "digest"}]}`,
+one entry per class, struct, interface and enum in node order, with the
+supertypes its head names and a digest of its member-level lines, its head (nine
+lines, cut at the first `{`) and the type parameters it declares. A Dart entry
+also holds `head`, the digest of its head and type parameters alone,
+`lines`, its member-level lines as `<depth>\t<text>`, so a sync can read the
+type a member had before and the members its ancestry declared, and
+`statements`, its member declarations as a chain's typing reads them
+(whitespace collapsed, a block shown as `{}`, an argument or parameter list as
+`()`, a function's arrow body as `=> ;`); a Dart file's row also holds `top`,
+its top-level declarations the same way, a type's body shown as `{}`. A file with no such declaration has no row. They are
+written, withdrawn and checked like the head rows under `member_surface_version`
+(4); a sync that finds it missing or at another version re-resolves every C#,
+Java, Kotlin, Swift and Dart file and rebuilds the rows.
+Neither is a canonical surface.
+
+Ruby head rows record what a bare Ruby call reads of a file's classes and
+modules: `ruby_heads:<path>` holds the JSON `{"entries": [{"qualified_name",
+"kind", "superclass", "mixins"}]}`, one entry per class and module in file
+order, with the superclass its first line writes (`::` kept when it roots the
+name) and every `include`, `extend` and `prepend` constant a line of its body
+writes, as written. A file with no class or module has no row. They are
+written, withdrawn and checked like the head rows under `ruby_heads_version`
+(1); a sync that finds it missing or at another version re-resolves every Ruby
+file and rebuilds the rows. Neither is a canonical surface.
+
+CFML component rows record what a bare call in a component reads of a `.cfc`
+file: `cfml_heads:<path>` holds the JSON `{"components", "extends"}`, the
+lowercased names of the classes the file declares and the `extends` path its
+text writes before its first function, as written. A `.cfc` file with neither
+has no row. They are written, withdrawn and checked like the head rows under
+`cfml_heads_version` (1); a sync that finds it missing or at another version
+re-resolves every CFML file and rebuilds the rows. Neither is a canonical
+surface.
+
+Solidity head rows record what a bare Solidity call reads of a file's type
+declarations: `solidity_heads:<path>` holds the JSON `{"types": [{"name",
+"supers"}]}`, one entry per contract, interface, library and struct, sorted,
+with the bases its `is` clause names as resolution reads them. A file with no
+type has no row. They are written, withdrawn and checked like the head rows
+under `solidity_heads_version` (1); a sync that finds it missing or at another
+version re-resolves every Solidity file and rebuilds the rows. Neither is a
+canonical surface.
+
+The Shopify theme row records which directories hold a Shopify theme whose
+files the index holds: `shopify_themes` holds the sorted JSON array of the theme
+roots the indexed Liquid files sit in (project-relative, `""` for the project
+root), read from the theme markers on disk. Every full index, migration and sync
+writes it, last, under the `shopify_themes_version` marker (1), withdrawn and
+restored like the head rows; a sync that finds the marker missing or at another
+version hands every indexed JSON template to its per-path pass, re-resolves
+every Liquid file and rebuilds the row. A sync records the roots it found moved
+under `shopify_themes_pending` before its per-path pass and deletes the key once
+it finishes; the next sync takes up any roots a stopped one left there. None of
+them is a canonical surface.
+
+Swift head rows record what Swift type resolution reads of a file's type
+declarations: `swift_heads:<path>` holds the JSON `{"entries":
+[{"qualified_name", "kind", "extension", "supertypes", "inherits", "written",
+"reducer"}]}`, one entry per class, struct, enum, protocol and type alias,
+sorted, with whether the declaration is an `extension`, the last segments of
+the supertypes its head names by the two readers resolution uses, the nested
+path an extension writes (`API::PackageController` for `extension
+API.PackageController`) and whether an enum is a TCA `@Reducer`. A file with no
+type declaration has no row. They are written, withdrawn and checked like the
+head rows under `swift_heads_version` (2); a sync that finds it
+missing or at another version re-resolves every Swift file and rebuilds the
+rows. Neither is a canonical surface.
+
+Objective-C head rows record what a message reached by name reads of a file's
+classes and properties: `objc_heads:<path>` holds the JSON `{"entries":
+[{"kind", "name", "written"}]}`, one entry per class (`@interface`,
+`@implementation` and category alike) and property, sorted, with the
+superclass a class's first line names after `@interface Name :` and the class
+a property's `@property` line declares it as, or `null`. A file with neither
+has no row. They are written, withdrawn and checked like the head rows under
+`objc_heads_version` (1); a sync that finds it missing or at another version
+re-resolves every Objective-C file and rebuilds the rows. Neither is a
+canonical surface.
+
+Go head rows record what a Go call reads of a file's type declarations:
+`go_heads:<path>` holds the JSON `{"entries": [{"name", "embeds", "mentions",
+"digest", "imports"}]}`, one entry per struct, interface and type alias (a defined type `type A B` or an
+alias `type A = B`), sorted, with the names of the types its declaration embeds, every name its
+declaration's text mentions, a 64-bit FNV-1a digest of that text (comments
+stripped), and the import path each package qualifier the declaration writes
+binds in its file (`dep=example.com/app/store1`). A file
+with no type declaration has no row. They are written, withdrawn and checked
+like the head rows under `go_heads_version` (1); a sync that finds it missing
+or at another version re-resolves every Go file and rebuilds the rows. Neither
+is a canonical surface.
+
+PHP head rows record what a PHP call reads of a file's types: `php_heads:<path>`
+holds the JSON `{"entries": [{"qualified_name", "kind", "supers"}]}`, one entry
+per class, trait, interface and enum, sorted, with the qualified names
+(`App\\Models::Entity`) its `extends` clause and its body's trait `use`s name,
+each read through the file's `namespace` and `use` imports. A file with no type
+has no row. They are written, withdrawn and checked like the head rows under
+`php_heads_version` (1); a sync that finds it missing or at another version
+re-resolves every PHP file and rebuilds the rows. Neither is a canonical
+surface.
+
+Dart head rows record what a bare Dart call reads of a file's types:
+`dart_heads:<path>` holds the JSON `{"entries": [{"name", "extension", "supers",
+"on"}]}`, one entry per class, mixin, enum and extension in source order, with
+whether it is an extension, the names its head extends, mixes in, implements or
+sits `on` (comments and type arguments dropped), and the type the first line of
+its name's first declaration puts an extension `on`, type arguments kept. A file
+with no type declaration has no row. They are written, withdrawn and checked
+like the head rows under `dart_heads_version` (1); a sync that finds it missing
+or at another version, or a row it cannot read, withdraws the marker before
+changing anything, re-resolves every Dart file and rebuilds the rows. Neither is
+a canonical surface.
+
+Dart library rows record what a Dart name or import reads of a file's
+directives: `dart_library:<path>` holds the JSON `{"library", "part_of_uri",
+"part_of_name", "parts", "imports", "exports"}`, each key only when the file has
+it: the `library` name, the URI or library name its `part of` gives, its `part`
+URIs, and each `import` and `export` in source order as `{"uris", "prefix",
+"show", "hide"}` (the URI and its conditional alternatives, the `as` prefix, and
+the names its combinators let through or hide, sorted). A file with no
+directive has no row. They are written, withdrawn and checked like the head
+rows under `dart_libraries_version` (1); a sync that finds it missing or at
+another version, or a row it cannot read, withdraws the marker before changing
+anything, re-resolves every Dart file and rebuilds the rows. Neither is a
+canonical surface.
+
+Lua module rows record what a Lua call in another file reads of a Lua file:
+`lua_module:<path>` holds the JSON `{"locals", "reads", "globals", "surface"}`:
+every `local` declaration in source order as `[name, kind, line]`, the modules
+its aliases `require` (read from each variable's initializer, as resolution
+reads it, and from every `local … = …` line), the last member of every dotted
+chain written after an `=` (each shorter chain's too, read in the code and with
+its comments removed), and a digest of its functions and its variables with
+their locality, both in source order, and of the first export of each name with
+the declaration of the local its right side starts from. Every Lua file has a
+row. They are written, withdrawn and checked like the head rows under
+`lua_modules_version` (1); a sync that finds it missing or at another version,
+or a row it cannot read, withdraws the marker before changing anything,
+re-resolves every Lua file and rebuilds the rows, even with nothing changed.
+Neither is a canonical surface.
+
+The case-folded lane stores no rows, only its marker:
+`case_folded_names_version` (1) is written by a full index, a migration and
+every sync whose resolution is persisted, and withdrawn with the others before
+a sync's first change. A sync that finds it missing or at another version
+re-resolves every PHP, Pascal and CFML file. It is not a canonical surface.
+
+The R base-binding lane stores no rows, only its marker:
+`r_base_bindings_version` (1) is written by a full index, a migration and every
+sync whose resolution is persisted, and withdrawn with the others before a
+sync's first change. A sync that finds it missing or at another version
+re-resolves every R file. It is not a canonical surface.
+
+The Rust receiver lane stores no rows, only its marker: `rust_receivers_version`
+(1) is written by a full index, a migration and every sync whose resolution is
+persisted, and withdrawn with the others before a sync's first change. A sync
+that finds it missing or at another version re-resolves every Rust file. It is
+not a canonical surface.
+
+`resolved_refs_version` vouches that every file's rows in `unresolved_refs` and
+`resolved_refs` are what extracting it again gives. Its value is `1:` and the
+sha256 of the inputs that decide what an unchanged file's extraction yields:
+the extension overrides, `max_file_size`, the Godot DSL configuration, the
+extraction version and the `frameworks_detected` row. Only a full index (`init`,
+`index`, the rebuild of an outdated index) writes it, once resolution and
+framework finalization are persisted. A sync reads it before its first change,
+withdraws it with the other markers at that change, and writes it back once the
+sync is persisted only when it held at the start and the digest is the same at
+the end; a sync never creates it. While it holds, a sync re-resolves an
+unchanged dependent from the stored rows instead of extracting it, except
+`project.godot`, whose extraction reads other files. A schema-9 index migrated
+to 10, a sync that failed partway and an index whose inputs moved keep
+extracting dependents until the next full index. It is not a canonical surface.
 
 ## FTS5
 
@@ -162,11 +490,14 @@ The base schema creates:
 
 - node indexes on kind, name, qualified name, file path, language,
   `(file_path, start_line)`, and `lower(name)`;
-- edge indexes on kind, `(source, kind)`, `(target, kind)`, provenance, and the
-  unique semantic identity tuple;
+- edge indexes on kind, `(source, kind)`, `(target, kind)`, provenance, the
+  unique semantic identity tuple, and the partial `idx_edges_synthesis_site`
+  over synthesized edges' `metadata.registeredAt` (only rows whose metadata
+  names `synthesizedBy`; `json_valid` guards keep malformed metadata out);
 - file indexes on language, modified time, and the partial `generated = 1` set;
 - unresolved-reference indexes on source node, name, file path, and
-  `(from_node_id, reference_name)`.
+  `(from_node_id, reference_name)`;
+- resolved-reference indexes on `(from_node_id, line, col)` and file path.
 
 The former `idx_edges_source` and `idx_edges_target` are intentionally absent:
 the composite indexes cover their left-prefix lookups and migration 4 removes
@@ -188,7 +519,8 @@ mmap_size = 268435456
 ```
 
 A rebuild validates its exclusive `IndexLease` between file-touching PRAGMAs.
-Bulk indexing temporarily uses `synchronous=OFF`, a larger cache/mmap window, and
+Bulk indexing temporarily uses `synchronous=OFF` and a larger page cache, turns
+memory mapping off (`mmap_size=0`, so database pages are not held twice), and
 normally disables WAL autocheckpoint; a fallible finalizer restores defaults,
 compacts, and publishes the completed namespace. Early failure leaves the
 building namespace unreadable rather than publishing a partial database.

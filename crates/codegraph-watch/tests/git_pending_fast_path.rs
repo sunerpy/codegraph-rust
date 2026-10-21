@@ -522,6 +522,24 @@ fn an_unknown_stamp_or_a_new_scope_declines() {
     repo.assert_declines("the root .gitignore changed");
 }
 
+/// `.git/info/exclude` decides scan membership (upstream #1728) but hides
+/// nothing from `git status` that is already tracked, so a record made before
+/// an edit to it proves nothing afterwards.
+#[test]
+fn a_changed_repository_exclude_declines() {
+    let _hooks = hooks_guard();
+    let Some(repo) = indexed("exclude-scope") else {
+        return;
+    };
+    fs::write(
+        repo.top.join(".git/info/exclude"),
+        ".codegraph/\nsrc/b.ts\n",
+    )
+    .unwrap();
+    let pending = repo.assert_declines("the repository exclude file changed");
+    assert_eq!(pending.removed, paths(&["src/b.ts"]));
+}
+
 #[test]
 fn nested_repositories_submodules_and_hidden_changes_decline() {
     let _hooks = hooks_guard();
@@ -1025,4 +1043,103 @@ fn an_ancestor_gitattributes_above_a_subdirectory_project_declines() {
         fs::remove_file(&attributes).unwrap();
     }
     assert!(repo.assert_fast("attributes removed again").is_empty());
+}
+
+/// W4-LIQ-01: a Shopify theme marker among git's candidates declines, since
+/// its coming or going makes the theme's unchanged JSON templates source or
+/// not, which git never reports; an edit of other JSON stays fast.
+#[test]
+fn a_shopify_theme_marker_declines() {
+    let _hooks = hooks_guard();
+    if !git_available() {
+        return;
+    }
+    let repo = Repo::new("shopify");
+    repo.write("sections/main.liquid", "<main></main>\n");
+    repo.write(
+        "templates/index.json",
+        "{\"sections\":{\"main\":{\"type\":\"main\"}},\"order\":[\"main\"]}",
+    );
+    repo.write("config/settings_data.json", "{}");
+    repo.commit("init");
+    repo.sync();
+    assert!(repo.assert_fast("no theme").is_empty());
+
+    repo.write("config/settings_data.json", "{\"current\":{}}");
+    assert!(repo.assert_fast("JSON that marks no theme").is_empty());
+
+    repo.write("config/settings_schema.json", "[]");
+    assert_eq!(
+        repo.assert_declines("an added settings schema").added,
+        paths(&["templates/index.json"])
+    );
+    // Once synced and committed, the marker is no candidate.
+    repo.commit("mark the theme");
+    repo.sync();
+    assert!(repo.assert_fast("the marker, committed").is_empty());
+
+    fs::remove_file(repo.root.join("config/settings_schema.json")).unwrap();
+    assert_eq!(
+        repo.assert_declines("a removed settings schema").removed,
+        paths(&["templates/index.json"])
+    );
+}
+
+/// W4-LIQ-01: a Shopify theme marker counts though git ignores it, so git
+/// hiding one (an ignored marker, or an ignored `config/` beside a theme's
+/// JSON folders) declines: `git status` never reports its coming or going,
+/// nor a recorded theme losing it. An ignored `config/` with no JSON folder
+/// beside it stays fast.
+#[test]
+fn a_git_ignored_shopify_theme_marker_declines() {
+    let _hooks = hooks_guard();
+    if !git_available() {
+        return;
+    }
+    let template = "{\"sections\":{\"main\":{\"type\":\"main\"}},\"order\":[\"main\"]}";
+    let repo = Repo::new("shopify-ignored");
+    repo.write(".gitignore", "settings_schema.json\napp/config/\n");
+    repo.write("sections/main.liquid", "<main></main>\n");
+    repo.write("templates/index.json", template);
+    // `app/` keeps a tracked file: git lists a wholly ignored directory as
+    // ignored itself, which declines already (the scan descends into it).
+    repo.write("app/config/local.yml", "a: 1\n");
+    repo.write("app/main.ts", "export const app = 1;\n");
+    repo.commit("init");
+    repo.sync();
+    assert!(
+        repo.assert_fast("an ignored config/ with no JSON beside it")
+            .is_empty()
+    );
+
+    repo.write("config/settings_schema.json", "[]");
+    assert_eq!(
+        repo.assert_declines("an ignored settings schema").added,
+        paths(&["templates/index.json"])
+    );
+    repo.sync();
+    assert!(
+        repo.assert_declines("the ignored marker, synced")
+            .is_empty()
+    );
+    // Gone, the ignored marker leaves nothing for git to list; the theme the
+    // index records has lost its marker.
+    fs::remove_file(repo.root.join("config/settings_schema.json")).unwrap();
+    assert_eq!(
+        repo.assert_declines("the ignored marker, removed").removed,
+        paths(&["templates/index.json"])
+    );
+
+    let dir = Repo::new("shopify-ignored-dir");
+    dir.write(".gitignore", "config/\n");
+    dir.write("sections/main.liquid", "<main></main>\n");
+    dir.write("templates/index.json", template);
+    dir.commit("init");
+    dir.sync();
+    dir.write("config/settings_schema.json", "[]");
+    assert_eq!(
+        dir.assert_declines("a settings schema in an ignored config/")
+            .added,
+        paths(&["templates/index.json"])
+    );
 }

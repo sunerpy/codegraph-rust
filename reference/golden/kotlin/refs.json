@@ -1,1 +1,42 @@
-[]
+[
+  {
+    "candidates": null,
+    "col": 15,
+    "file_path": "signatures.kt",
+    "from_node_id": "method:b8173e3daeeefd9fa0ae5b727e67a8aa",
+    "language": "kotlin",
+    "line": 11,
+    "reference_kind": "references",
+    "reference_name": "Map"
+  },
+  {
+    "candidates": null,
+    "col": 24,
+    "file_path": "signatures.kt",
+    "from_node_id": "function:2f46eb5b34c29e3d3d7af8f3a7af5859",
+    "language": "kotlin",
+    "line": 7,
+    "reference_kind": "references",
+    "reference_name": "T"
+  },
+  {
+    "candidates": null,
+    "col": 28,
+    "file_path": "signatures.kt",
+    "from_node_id": "function:2f46eb5b34c29e3d3d7af8f3a7af5859",
+    "language": "kotlin",
+    "line": 7,
+    "reference_kind": "references",
+    "reference_name": "T"
+  },
+  {
+    "candidates": null,
+    "col": 7,
+    "file_path": "signatures.kt",
+    "from_node_id": "method:b8173e3daeeefd9fa0ae5b727e67a8aa",
+    "language": "kotlin",
+    "line": 13,
+    "reference_kind": "references",
+    "reference_name": "Result"
+  }
+]

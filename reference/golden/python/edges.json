@@ -1,41 +1,5 @@
 [
   {
-    "col": 0,
-    "kind": "imports",
-    "line": 1,
-    "metadata": {
-      "confidence": 0.4,
-      "resolvedBy": "exact-match"
-    },
-    "provenance": null,
-    "source": "file:consumers.py",
-    "target": "import:3e3fb8b0ff507a934daf33d767cfbcbe"
-  },
-  {
-    "col": 0,
-    "kind": "imports",
-    "line": 1,
-    "metadata": {
-      "confidence": 0.9,
-      "resolvedBy": "exact-match"
-    },
-    "provenance": null,
-    "source": "file:aliases.py",
-    "target": "import:3f9465655dece192b5d6b6ed7e3c6708"
-  },
-  {
-    "col": 0,
-    "kind": "imports",
-    "line": 3,
-    "metadata": {
-      "confidence": 0.4,
-      "resolvedBy": "exact-match"
-    },
-    "provenance": null,
-    "source": "file:aliases.py",
-    "target": "import:4e455e43a58183fcc5cb69899b41d397"
-  },
-  {
     "col": 11,
     "kind": "calls",
     "line": 11,
@@ -173,18 +137,6 @@
     "provenance": null,
     "source": "file:aliases.py",
     "target": "class:099ebd3f5c7b1a6ac5522e9fbfb00912"
-  },
-  {
-    "col": 7,
-    "kind": "imports",
-    "line": 2,
-    "metadata": {
-      "confidence": 0.9,
-      "resolvedBy": "exact-match"
-    },
-    "provenance": null,
-    "source": "file:aliases.py",
-    "target": "import:ad79f4a5704382d64b2b28e1481e8334"
   },
   {
     "col": null,

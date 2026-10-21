@@ -515,11 +515,7 @@ impl ActiveFullRebuild {
                 .pragma_update(None, "cache_size", -262_144),
         )?;
         store.validate_state_write_authority()?;
-        pragma(
-            store
-                .connection()
-                .pragma_update(None, "mmap_size", 1_073_741_824_i64),
-        )?;
+        pragma(store.connection().pragma_update(None, "mmap_size", 0_i64))?;
         if !matches!(std::env::var(crate::CODEGRAPH_NO_WAL_DEFER), Ok(value) if value == "1") {
             store.validate_state_write_authority()?;
             pragma(
@@ -1384,6 +1380,36 @@ mod tests {
         assert!(
             !paths.current_db().exists(),
             "revalidation must happen immediately before SQLite creates the DB"
+        );
+    }
+
+    #[test]
+    fn rebuild_bulk_pragmas_turn_memory_mapping_off() {
+        let project = TempProject::new("bulk-mmap");
+        let paths = project.paths();
+        let rebuild = begin_full_rebuild(&paths, RebuildKind::ExplicitInit, deadline(), || false)
+            .expect("begin the rebuild")
+            .open_store()
+            .expect("open the rebuild target");
+        let mmap_size = |rebuild: &ActiveFullRebuild| -> i64 {
+            rebuild
+                .store()
+                .connection()
+                .query_row("PRAGMA mmap_size", [], |row| row.get(0))
+                .expect("read mmap_size")
+        };
+        assert_eq!(
+            mmap_size(&rebuild),
+            268_435_456,
+            "the target opens like any writer"
+        );
+        rebuild
+            .set_bulk_index_pragmas()
+            .expect("enable bulk pragmas");
+        assert_eq!(
+            mmap_size(&rebuild),
+            0,
+            "a full index reads its pages through the page cache, not a second mapping"
         );
     }
 

@@ -146,3 +146,60 @@ fn depth_abort_is_scoped_to_one_extraction() {
     assert!(normal.errors.is_empty(), "{:?}", normal.errors);
     assert!(normal.nodes.iter().any(|node| node.name == "add"));
 }
+
+/// A CFML component whose tag tree is shallow but whose `<cfscript>` body or
+/// `<cfquery>` `#…#` expression nests `depth` parentheses: the re-parsed
+/// snippet is what runs deep.
+fn cfml_snippet_source(shape: &str, depth: usize) -> String {
+    let nested = format!("{}1{}", "(".repeat(depth), ")".repeat(depth));
+    match shape {
+        "script" => format!(
+            "<cfcomponent>\n<cffunction name=\"before\"></cffunction>\n<cfscript>\nx = {nested};\n</cfscript>\n</cfcomponent>\n"
+        ),
+        "query" => format!(
+            "<cfcomponent>\n<cffunction name=\"before\">\n<cfquery name=\"q\">SELECT * FROM t WHERE id = #{nested}#</cfquery>\n</cffunction>\n</cfcomponent>\n"
+        ),
+        _ => unreachable!("cfml snippet shapes are script and query"),
+    }
+}
+
+fn extract_cfml_on_small_stack(
+    shape: &'static str,
+    depth: usize,
+) -> codegraph_core::types::ExtractionResult {
+    let source = cfml_snippet_source(shape, depth);
+    std::thread::Builder::new()
+        .name(format!("deep-nesting-cfml-{shape}"))
+        .stack_size(1024 * 1024)
+        .spawn(move || extract_source("Deep.cfc", &source, Some(Language::Cfml)))
+        .expect("spawn 1 MiB extraction thread")
+        .join()
+        .expect("deep extraction must return instead of overflowing")
+}
+
+#[test]
+fn a_deep_cfml_snippet_fails_its_file_without_partial_graph() {
+    for shape in ["script", "query"] {
+        let result = extract_cfml_on_small_stack(shape, DEEP);
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|error| error.contains(EXPECTED_ERROR)),
+            "{shape}: errors={:?}",
+            result.errors
+        );
+        assert!(result.nodes.is_empty(), "{shape}: partial nodes survived");
+        assert!(result.edges.is_empty(), "{shape}: partial edges survived");
+        assert!(
+            result.unresolved_references.is_empty(),
+            "{shape}: partial references survived"
+        );
+        let shallow = extract_cfml_on_small_stack(shape, 20);
+        assert!(shallow.errors.is_empty(), "{shape}: {:?}", shallow.errors);
+        assert!(
+            shallow.nodes.iter().any(|node| node.name == "before"),
+            "{shape}: the component's function disappeared"
+        );
+    }
+}

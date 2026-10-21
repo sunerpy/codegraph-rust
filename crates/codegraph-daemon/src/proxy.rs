@@ -4,12 +4,20 @@
 //! stdio<->socket bridge to the shared daemon. Unlike a raw byte pump, this is
 //! the LOCAL-HANDSHAKE proxy (colby `runLocalHandshakeProxy`):
 //!
-//!   * `initialize` and `tools/list` are answered LOCALLY from this build's
-//!     static constants the instant the host asks, so tool registration is
-//!     instant and the daemon cold-start race is avoided. The `initialize` is
-//!     ALSO forwarded to the daemon (to prime its engine), but the daemon's
-//!     reply to that id is SUPPRESSED — the host already got the local answer.
-//!   * `tools/list` is answered locally and NOT forwarded.
+//!   * `initialize` is answered LOCALLY the instant the host asks, so tool
+//!     registration is instant and the daemon cold-start race is avoided. The
+//!     answer is the direct server's: this build's static result, with the
+//!     `protocolVersion` rmcp would negotiate for the version asked for. The
+//!     `initialize` is ALSO forwarded to the daemon (to prime its engine), but
+//!     the daemon's reply to that id is SUPPRESSED — the host already got the
+//!     local answer.
+//!   * `tools/list` is answered locally and NOT forwarded, in the lifecycle
+//!     that answer belongs to: after an `initialize`, when the request names no
+//!     protocol version in its `_meta`. A 2026-07-28 session has no
+//!     `initialize`: it opens with `server/discover` and names its version on
+//!     every request, and a result there carries `resultType`. Such a
+//!     `tools/list` is forwarded, and the daemon's rmcp handler answers it as a
+//!     direct server would.
 //!   * Every OTHER JSON-RPC line is forwarded verbatim host<->daemon.
 //!
 //! The daemon's one-line versioned hello is consumed and DISCARDED here — it is
@@ -62,6 +70,60 @@ pub enum ProxyOutcome {
     /// The daemon hello did not match this build (version/protocol mismatch).
     /// The caller should transparently fall back to direct serving.
     VersionMismatch,
+}
+
+/// How a running daemon's build compares with this one, read from its hello.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DaemonPeer {
+    /// The same version and protocol: attach to it.
+    Same,
+    /// A plain `X.Y.Z` release older than this plain `X.Y.Z` build. A launcher
+    /// replaces it (upstream #2343).
+    OlderRelease { version: String },
+    /// Anything else: a newer release, a prerelease, an unknown version, or
+    /// another protocol at the same version. It is never stopped, so two
+    /// installs cannot take turns replacing each other's daemon.
+    Foreign { version: Option<String> },
+}
+
+/// Classify a daemon hello against this build; see [`DaemonPeer`].
+#[must_use]
+pub fn classify_daemon_hello(hello: &Value) -> DaemonPeer {
+    classify_against(hello, env!("CARGO_PKG_VERSION"))
+}
+
+fn classify_against(hello: &Value, ours: &str) -> DaemonPeer {
+    let version = hello.get("codegraph").and_then(Value::as_str);
+    let protocol = hello.get("protocol").and_then(Value::as_u64);
+    if version == Some(ours) && protocol == Some(EXPECTED_PROTOCOL) {
+        return DaemonPeer::Same;
+    }
+    match (
+        version,
+        version.and_then(plain_release),
+        plain_release(ours),
+    ) {
+        (Some(version), Some(peer), Some(ours)) if peer < ours => DaemonPeer::OlderRelease {
+            version: version.to_string(),
+        },
+        _ => DaemonPeer::Foreign {
+            version: version.map(str::to_string),
+        },
+    }
+}
+
+/// `X.Y.Z` with three all-digit parts and nothing else, or `None`: a
+/// prerelease or build suffix is never ordered against a release.
+fn plain_release(version: &str) -> Option<(u64, u64, u64)> {
+    let mut parts = version.split('.');
+    let mut next = || {
+        parts
+            .next()
+            .filter(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+            .and_then(|part| part.parse::<u64>().ok())
+    };
+    let release = (next()?, next()?, next()?);
+    parts.next().is_none().then_some(release)
 }
 
 /// Verify the daemon hello matches THIS build: `codegraph` version equals
@@ -348,9 +410,10 @@ fn half_close_write(write_fd: Option<WriteFd>) {
 #[cfg(not(unix))]
 fn half_close_write(_write_fd: Option<WriteFd>) {}
 
-/// host -> daemon: read host_in line-by-line; answer `initialize`+`tools/list`
-/// locally, forward everything else. On `initialize`, ALSO forward it to prime
-/// the daemon engine and record its id so the daemon reply is suppressed.
+/// host -> daemon: read host_in line-by-line; answer `initialize`, and an
+/// `initialize`-lifecycle `tools/list`, locally, and forward everything else.
+/// On `initialize`, ALSO forward it to prime the daemon engine and record its
+/// id so the daemon reply is suppressed.
 fn pump_host_to_daemon<R, S, W>(
     host_in: R,
     mut daemon_send: S,
@@ -364,6 +427,10 @@ where
     S: Write,
     W: Write,
 {
+    // Which lifecycle the host runs: an `initialize` handshake, or the
+    // 2026-07-28 one that opens with `server/discover` instead.
+    let mut initialized = false;
+    let mut discovered = false;
     for line in host_in.lines() {
         if shutdown.load(Ordering::SeqCst) {
             break;
@@ -383,19 +450,38 @@ where
             .and_then(Value::as_str);
         let id = parsed.as_ref().and_then(|v| v.get("id")).cloned();
 
+        // A `tools/list` this proxy answers itself: one in the `initialize`
+        // lifecycle. A request that names its protocol version in `_meta` is
+        // the per-request lifecycle's, whose results only rmcp shapes.
+        let local_tools_list = method == Some("tools/list")
+            && initialized
+            && !discovered
+            && !parsed
+                .as_ref()
+                .is_some_and(codegraph_mcp::request_declares_protocol_version);
+
         match method {
             Some("initialize") => {
+                initialized = true;
                 // Answer locally, then forward to prime the daemon and suppress
                 // its reply to this id.
                 if let Some(id) = id.clone() {
-                    write_host_line(host_out, &reply(&id, codegraph_mcp::initialize_result()))?;
+                    let requested = parsed
+                        .as_ref()
+                        .and_then(|request| request.get("params"))
+                        .and_then(|params| params.get("protocolVersion"))
+                        .and_then(Value::as_str);
+                    write_host_line(
+                        host_out,
+                        &reply(&id, codegraph_mcp::initialize_result_for(requested)),
+                    )?;
                     *suppressed_id
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(id);
                 }
                 forward_to_daemon(&mut daemon_send, &line)?;
             }
-            Some("tools/list") => {
+            Some("tools/list") if local_tools_list => {
                 // Answer locally; do NOT forward (the daemon would re-answer it).
                 //
                 // PRESERVE the static full-tool-surface answer
@@ -415,10 +501,14 @@ where
                 }
             }
             _ => {
-                // Everything else (tools/call, ping, notifications, ...) is
-                // forwarded verbatim to the daemon. Only a REQUEST (one carrying
-                // an `id`) is ever answered, so only that owes the host a reply;
-                // a notification has no id and is deliberately not recorded.
+                // Everything else (tools/call, ping, notifications, a 2026-07-28
+                // `server/discover` and `tools/list`, ...) is forwarded verbatim
+                // to the daemon. Only a REQUEST (one carrying an `id`) is ever
+                // answered, so only that owes the host a reply; a notification
+                // has no id and is deliberately not recorded.
+                if method == Some("server/discover") {
+                    discovered = true;
+                }
                 if let Some(id) = id {
                     ledger.record(id);
                 }
@@ -692,6 +782,65 @@ mod tests {
     }
 
     #[test]
+    fn only_an_older_plain_release_is_classified_for_replacement() {
+        let hello = |version: Option<&str>, protocol: u64| match version {
+            Some(version) => json!({ "codegraph": version, "protocol": protocol }),
+            None => json!({ "protocol": protocol }),
+        };
+        let ours = "0.55.0";
+        assert_eq!(
+            classify_against(&hello(Some(ours), EXPECTED_PROTOCOL), ours),
+            DaemonPeer::Same
+        );
+        for older in ["0.54.0", "0.54.12", "0.0.1"] {
+            assert_eq!(
+                classify_against(&hello(Some(older), EXPECTED_PROTOCOL), ours),
+                DaemonPeer::OlderRelease {
+                    version: older.to_string()
+                },
+                "{older}"
+            );
+        }
+        for foreign in [
+            "0.55.1",
+            "1.0.0",
+            "0.56.0-rc.1",
+            "0.54.0-rc.1",
+            "0.54",
+            "0.54.0.1",
+            "v0.54.0",
+            "0.54.x",
+            "",
+        ] {
+            assert_eq!(
+                classify_against(&hello(Some(foreign), EXPECTED_PROTOCOL), ours),
+                DaemonPeer::Foreign {
+                    version: Some(foreign.to_string())
+                },
+                "{foreign:?}"
+            );
+        }
+        assert_eq!(
+            classify_against(&hello(None, EXPECTED_PROTOCOL), ours),
+            DaemonPeer::Foreign { version: None }
+        );
+        // Another protocol at the same version is never replaced either.
+        assert_eq!(
+            classify_against(&hello(Some(ours), EXPECTED_PROTOCOL + 1), ours),
+            DaemonPeer::Foreign {
+                version: Some(ours.to_string())
+            }
+        );
+        // A prerelease build never replaces anything.
+        assert_eq!(
+            classify_against(&hello(Some("0.54.0"), EXPECTED_PROTOCOL), "0.55.0-dev"),
+            DaemonPeer::Foreign {
+                version: Some("0.54.0".to_string())
+            }
+        );
+    }
+
+    #[test]
     fn verify_daemon_hello_accepts_matching_build() {
         let hello = json!({
             "codegraph": env!("CARGO_PKG_VERSION"),
@@ -803,6 +952,140 @@ mod tests {
             ledger.wait_until_settled(Duration::from_millis(0)),
             "retiring the only owed id settles the ledger"
         );
+    }
+
+    /// Run the host->daemon pump over `requests` (one JSON value per line) and
+    /// return what reached the host, what reached the daemon, and the ledger.
+    fn pump(requests: &[Value]) -> (Vec<Value>, Vec<Value>, Arc<ReplyLedger>) {
+        let input: String = requests.iter().map(|r| format!("{r}\n")).collect();
+        let mut daemon_sink = Vec::<u8>::new();
+        let host_out = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let ledger = Arc::new(ReplyLedger::default());
+        pump_host_to_daemon(
+            std::io::Cursor::new(input.into_bytes()),
+            &mut daemon_sink,
+            &host_out,
+            &Arc::new(AtomicBool::new(false)),
+            &Arc::new(Mutex::new(None)),
+            &ledger,
+        )
+        .expect("pump runs to host_in EOF");
+        let lines = |bytes: Vec<u8>| -> Vec<Value> {
+            String::from_utf8(bytes)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect()
+        };
+        let to_host = lines(host_out.lock().unwrap().clone());
+        (to_host, lines(daemon_sink), ledger)
+    }
+
+    fn meta(version: &str) -> Value {
+        json!({
+            "io.modelcontextprotocol/protocolVersion": version,
+            "io.modelcontextprotocol/clientCapabilities": {},
+            "io.modelcontextprotocol/clientInfo": {"name": "test", "version": "0"}
+        })
+    }
+
+    fn initialize(id: i64, version: &str) -> Value {
+        json!({"jsonrpc": "2.0", "id": id, "method": "initialize", "params": {
+            "protocolVersion": version, "capabilities": {},
+            "clientInfo": {"name": "test", "version": "0"}}})
+    }
+
+    /// MCP 2026-07-28 has no `initialize`: the session opens with
+    /// `server/discover` and names its version in every request's `_meta`, and
+    /// only rmcp gives such a `tools/list` its `resultType`. Both are the
+    /// daemon's to answer, and both are owed.
+    #[test]
+    fn pump_host_to_daemon_forwards_a_2026_tools_list_and_owes_its_reply() {
+        let (to_host, to_daemon, ledger) = pump(&[
+            json!({"jsonrpc": "2.0", "id": 1, "method": "server/discover",
+                   "params": {"_meta": meta("2026-07-28")}}),
+            json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list",
+                   "params": {"_meta": meta("2026-07-28")}}),
+        ]);
+        assert!(to_host.is_empty(), "nothing answered locally: {to_host:?}");
+        let methods: Vec<&str> = to_daemon
+            .iter()
+            .map(|request| request["method"].as_str().unwrap())
+            .collect();
+        assert_eq!(methods, ["server/discover", "tools/list"]);
+        ledger.retire(&json!(1));
+        assert!(
+            !ledger.wait_until_settled(Duration::from_millis(0)),
+            "the forwarded tools/list still owes the host a reply"
+        );
+        ledger.retire(&json!(2));
+        assert!(ledger.wait_until_settled(Duration::from_millis(0)));
+    }
+
+    /// After an `initialize`, a `tools/list` with no protocol version in `_meta`
+    /// is still answered here; one that names a version is rmcp's to shape.
+    #[test]
+    fn pump_host_to_daemon_answers_only_an_initialize_lifecycle_tools_list_locally() {
+        let (to_host, to_daemon, _) = pump(&[
+            initialize(1, "2025-06-18"),
+            json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+            json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}),
+            json!({"jsonrpc": "2.0", "id": 3, "method": "tools/list",
+                   "params": {"_meta": meta("2025-06-18")}}),
+        ]);
+        let ids: Vec<&Value> = to_host.iter().map(|reply| &reply["id"]).collect();
+        assert_eq!(ids, [&json!(1), &json!(2)]);
+        assert_eq!(
+            to_host[1]["result"],
+            json!({"tools": codegraph_mcp::schemas::visible_tool_definitions()})
+        );
+        let forwarded: Vec<(&str, &Value)> = to_daemon
+            .iter()
+            .map(|request| (request["method"].as_str().unwrap(), &request["id"]))
+            .collect();
+        assert_eq!(
+            forwarded,
+            [
+                ("initialize", &json!(1)),
+                ("notifications/initialized", &Value::Null),
+                ("tools/list", &json!(3)),
+            ]
+        );
+    }
+
+    /// A session that opened with `server/discover` runs the per-request
+    /// lifecycle even if it also sent an `initialize`, so its `tools/list` is
+    /// the daemon's to answer, `_meta` or not.
+    #[test]
+    fn pump_host_to_daemon_forwards_a_tools_list_after_server_discover() {
+        let (to_host, to_daemon, _) = pump(&[
+            initialize(1, "2025-06-18"),
+            json!({"jsonrpc": "2.0", "id": 2, "method": "server/discover",
+                   "params": {"_meta": meta("2026-07-28")}}),
+            json!({"jsonrpc": "2.0", "id": 3, "method": "tools/list"}),
+        ]);
+        let ids: Vec<&Value> = to_host.iter().map(|reply| &reply["id"]).collect();
+        assert_eq!(ids, [&json!(1)], "only the initialize is answered here");
+        assert_eq!(to_daemon.last().unwrap()["method"], "tools/list");
+    }
+
+    /// The local `initialize` answer negotiates what the direct server does: a
+    /// version with an `initialize` handshake is echoed, 2026-07-28 (which has
+    /// none) and an unknown one get 2024-11-05.
+    #[test]
+    fn pump_host_to_daemon_answers_initialize_with_the_version_the_direct_server_negotiates() {
+        for (asked, answered) in [
+            ("2025-06-18", "2025-06-18"),
+            ("2025-11-25", "2025-11-25"),
+            ("2024-11-05", "2024-11-05"),
+            ("2026-07-28", "2024-11-05"),
+            ("1999-01-01", "2024-11-05"),
+        ] {
+            let (to_host, _, _) = pump(&[initialize(1, asked)]);
+            let mut expected = codegraph_mcp::initialize_result();
+            expected["protocolVersion"] = json!(answered);
+            assert_eq!(to_host[0]["result"], expected, "{asked}");
+        }
     }
 
     #[test]

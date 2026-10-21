@@ -29,6 +29,21 @@ fn set_bulk_index_pragmas_drops_synchronous_to_off() {
     assert_eq!(read_synchronous(&store), 0);
 }
 
+// A full index reads its pages through the enlarged page cache; mapping the file
+// as well held every page twice in peak RSS (W10-03). Ordinary connections keep
+// their 256 MiB window.
+#[test]
+fn set_bulk_index_pragmas_turns_memory_mapping_off() {
+    let dir = TestDir::new();
+    let db_path = dir.path().join("codegraph.db");
+
+    let store = Store::open(&db_path).unwrap();
+    assert_eq!(read_mmap_size(&store), 268_435_456);
+
+    store.set_bulk_index_pragmas().unwrap();
+    assert_eq!(read_mmap_size(&store), 0);
+}
+
 #[test]
 fn restore_default_pragmas_returns_to_normal_on_same_connection() {
     let dir = TestDir::new();
@@ -89,6 +104,13 @@ fn read_synchronous(store: &Store) -> i64 {
     store
         .connection()
         .query_row("PRAGMA synchronous", [], |row| row.get::<_, i64>(0))
+        .unwrap()
+}
+
+fn read_mmap_size(store: &Store) -> i64 {
+    store
+        .connection()
+        .query_row("PRAGMA mmap_size", [], |row| row.get::<_, i64>(0))
         .unwrap()
 }
 

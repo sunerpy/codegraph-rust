@@ -16,12 +16,12 @@
     "kind": "imports",
     "line": 1,
     "metadata": {
-      "confidence": 0.95,
-      "resolvedBy": "qualified-name"
+      "confidence": 0.9,
+      "resolvedBy": "import"
     },
     "provenance": null,
     "source": "file:src/app.ts",
-    "target": "import:4ec14e7f870d20bf811e565c9993468c"
+    "target": "file:src/math.ts"
   },
   {
     "col": 11,

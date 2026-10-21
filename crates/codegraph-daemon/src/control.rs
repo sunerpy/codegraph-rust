@@ -142,6 +142,9 @@ pub enum ShutdownOutcome {
     /// A live owner was recorded but never ACKed within the bounded budget. The
     /// caller MUST fail closed; the pid is reported, never signalled.
     Unresponsive { pid: u32, detail: String },
+    /// The daemon answering on the rendezvous is not the one the caller meant
+    /// to drain (its hello failed the caller's check), so no frame was sent.
+    Declined { pid: u32, detail: String },
 }
 
 /// Ask the daemon recorded for `project_root` to shut down, and wait a bounded
@@ -152,6 +155,19 @@ pub enum ShutdownOutcome {
 pub fn request_daemon_shutdown(
     project_root: &Path,
     project_identity: &str,
+) -> Result<ShutdownOutcome> {
+    request_daemon_shutdown_of(project_root, project_identity, |_| true)
+}
+
+/// [`request_daemon_shutdown`] of one particular daemon: the frame is sent
+/// only after the hello on that same connection passes `is_target`. A caller
+/// that chose to drain a daemon by its hello (an older release) passes the same
+/// test, so a daemon that took the project in the meantime (a newer release) is
+/// never asked; that ends in [`ShutdownOutcome::Declined`].
+pub fn request_daemon_shutdown_of(
+    project_root: &Path,
+    project_identity: &str,
+    is_target: impl Fn(&serde_json::Value) -> bool + Send + 'static,
 ) -> Result<ShutdownOutcome> {
     let pid_path = crate::paths::daemon_pid_path(project_root)?;
     let Some(info) = std::fs::read_to_string(&pid_path)
@@ -170,13 +186,24 @@ pub fn request_daemon_shutdown(
         info.socket_path.clone()
     };
 
-    match bounded_exchange_shutdown(socket_path, project_identity.to_string()) {
-        Ok(()) => Ok(ShutdownOutcome::Drained { pid: info.pid }),
+    match bounded_exchange_shutdown(socket_path, project_identity.to_string(), is_target) {
+        Ok(Exchange::Drained) => Ok(ShutdownOutcome::Drained { pid: info.pid }),
+        Ok(Exchange::Declined(detail)) => Ok(ShutdownOutcome::Declined {
+            pid: info.pid,
+            detail,
+        }),
         Err(detail) => Ok(ShutdownOutcome::Unresponsive {
             pid: info.pid,
             detail,
         }),
     }
+}
+
+/// How a shutdown exchange that reached a daemon ended.
+enum Exchange {
+    Drained,
+    /// The hello failed the caller's check; nothing was sent.
+    Declined(String),
 }
 
 /// Run the exchange on a worker thread and wait for it with a monotonic channel
@@ -186,11 +213,15 @@ pub fn request_daemon_shutdown(
 /// wedged Windows named pipe would otherwise block forever. Bounding the WAIT
 /// itself (not the socket) is finite on every supported platform; the abandoned
 /// worker owns only its own connection and never touches index bytes.
-fn bounded_exchange_shutdown(socket_path: PathBuf, project_identity: String) -> Result<(), String> {
+fn bounded_exchange_shutdown(
+    socket_path: PathBuf,
+    project_identity: String,
+    is_target: impl Fn(&serde_json::Value) -> bool + Send + 'static,
+) -> Result<Exchange, String> {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
-        let result =
-            exchange_shutdown(&socket_path, &project_identity).map_err(|e| format!("{e:#}"));
+        let result = exchange_shutdown(&socket_path, &project_identity, &is_target)
+            .map_err(|e| format!("{e:#}"));
         let _ = tx.send(result);
     });
     match rx.recv_timeout(SHUTDOWN_ACK_TIMEOUT + SHUTDOWN_WAIT_MARGIN) {
@@ -205,7 +236,11 @@ fn bounded_exchange_shutdown(socket_path: PathBuf, project_identity: String) -> 
     }
 }
 
-fn exchange_shutdown(socket_path: &Path, project_identity: &str) -> Result<()> {
+fn exchange_shutdown(
+    socket_path: &Path,
+    project_identity: &str,
+    is_target: &dyn Fn(&serde_json::Value) -> bool,
+) -> Result<Exchange> {
     let rendezvous = Rendezvous::from_socket_path(socket_path);
     let stream = connect(&rendezvous)
         .with_context(|| format!("connecting to daemon socket {}", socket_path.display()))?;
@@ -221,12 +256,21 @@ fn exchange_shutdown(socket_path: &Path, project_identity: &str) -> Result<()> {
     }
 
     // The daemon writes its versioned hello on accept; consume that line first so
-    // the ACK read below cannot mistake it for the reply.
+    // the ACK read below cannot mistake it for the reply. It also says which
+    // daemon this connection reached, which the caller may require.
     let mut reader = BufReader::new(&stream);
     let mut hello = String::new();
     reader
         .read_line(&mut hello)
         .context("reading the daemon hello before sending a control frame")?;
+    let announced =
+        serde_json::from_str::<serde_json::Value>(hello.trim()).unwrap_or(serde_json::Value::Null);
+    if !is_target(&announced) {
+        return Ok(Exchange::Declined(format!(
+            "the daemon on the rendezvous announced {}",
+            hello.trim()
+        )));
+    }
 
     let frame = ControlFrame::shutdown(project_identity);
     (&stream)
@@ -245,7 +289,7 @@ fn exchange_shutdown(socket_path: &Path, project_identity: &str) -> Result<()> {
         "daemon reported an incomplete drain (drained={})",
         ack.drained
     );
-    Ok(())
+    Ok(Exchange::Drained)
 }
 
 #[cfg(test)]

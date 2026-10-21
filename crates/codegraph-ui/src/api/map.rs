@@ -109,8 +109,108 @@ fn join_nonempty<'a>(parts: impl IntoIterator<Item = &'a str>) -> String {
         .join("/")
 }
 
+/// Directories a module boundary never falls on: exactly one subdirectory and
+/// no file of their own (upstream #2102). A Maven project keeps every line of
+/// Java under `src/main/java/org/springframework/samples/petclinic/`, and the
+/// first folders of that chain split nothing: cutting at any of them draws the
+/// whole program as one box, and no depth the reader can pick gets past them.
+/// Such a folder joins the level below it, so depth counts folders that fork.
+///
+/// Read from every indexed file, tests included, so a module's id does not
+/// change when the reader toggles tests. The repository root is never one.
+pub fn pass_through_dirs<'a>(paths: impl IntoIterator<Item = &'a str>) -> HashSet<String> {
+    let mut children: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut holds_files: HashSet<String> = HashSet::new();
+    for raw in paths {
+        let path = to_posix_path(raw);
+        let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
+        let mut dir = String::new();
+        for part in &parts[..parts.len().saturating_sub(1)] {
+            children
+                .entry(dir.clone())
+                .or_default()
+                .insert((*part).to_string());
+            dir = if dir.is_empty() {
+                (*part).to_string()
+            } else {
+                format!("{dir}/{part}")
+            };
+        }
+        holds_files.insert(dir);
+    }
+    children
+        .into_iter()
+        .filter(|(dir, kids)| !dir.is_empty() && kids.len() == 1 && !holds_files.contains(dir))
+        .map(|(dir, _)| dir)
+        .collect()
+}
+
+/// Where each level of a file's directory path ends, as indexes into `dirs`:
+/// a level is one folder plus every pass-through folder that follows it.
+fn level_ends(root: &str, dirs: &[&str], pass_through: Option<&HashSet<String>>) -> Vec<usize> {
+    let mut ends = Vec::new();
+    let mut i = 0;
+    while i < dirs.len() {
+        i += 1;
+        if let Some(through) = pass_through {
+            while i < dirs.len() && through.contains(&join_path(root, &dirs[..i])) {
+                i += 1;
+            }
+        }
+        ends.push(i);
+    }
+    ends
+}
+
+fn join_path(root: &str, segments: &[&str]) -> String {
+    join_nonempty(std::iter::once(root).chain(segments.iter().copied()))
+}
+
+/// The levels of `dirs` that `ends` closes, a chain of three or more folders
+/// written `first/…/last`.
+fn level_label(root: &str, dirs: &[&str], ends: &[usize]) -> String {
+    let mut out: Vec<String> = if root.is_empty() {
+        Vec::new()
+    } else {
+        vec![root.to_string()]
+    };
+    let mut from = 0;
+    for &end in ends {
+        let chain = &dirs[from..end];
+        out.push(if chain.len() >= 3 {
+            format!("{}/…/{}", chain[0], chain[chain.len() - 1])
+        } else {
+            chain.join("/")
+        });
+        from = end;
+    }
+    out.join("/")
+}
+
+/// Which module a file falls in, as [`module_id_for`] names it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModuleAt {
+    /// The directory path, the `(root files)` bucket, or a façade's own path.
+    pub id: String,
+    /// What the box says: the id, a folder chain nothing forks in written
+    /// `first/…/last`. Equal to `id` everywhere else.
+    pub label: String,
+    pub facade: bool,
+}
+
 /// Which module a file belongs to, or `None` when it is outside the root.
-pub fn module_id_for(file_path: &str, root: &str, depth: usize) -> Option<(String, bool)> {
+///
+/// `depth` levels under the root name the module, a level being a folder and
+/// the [`pass_through_dirs`] that follow it (without them, one level per
+/// folder; a depth below 1 reads as 1). A file with fewer levels than that is
+/// loose in the root: a façade keeps its own box, everything else joins the
+/// `(root files)` bucket.
+pub fn module_id_for(
+    file_path: &str,
+    root: &str,
+    depth: usize,
+    pass_through: Option<&HashSet<String>>,
+) -> Option<ModuleAt> {
     let path = to_posix_path(file_path);
     let rel = if root.is_empty() {
         path.as_str()
@@ -119,19 +219,35 @@ pub fn module_id_for(file_path: &str, root: &str, depth: usize) -> Option<(Strin
     };
     let parts: Vec<&str> = rel.split('/').filter(|p| !p.is_empty()).collect();
     let last = *parts.last()?;
-    if parts.len() <= depth {
+    let dirs = &parts[..parts.len() - 1];
+    let ends = level_ends(root, dirs, pass_through);
+    let depth = depth.max(1);
+    if ends.len() < depth {
         // A loose file. The directories it DOES have still qualify it, so
         // `src/a/b.ts` at depth 2 lands in `src/a/(root files)`.
+        let dir_label = level_label(root, dirs, &ends);
         if FACADE_STEMS.contains(&stem_of(last)) {
-            let id = join_nonempty(std::iter::once(root).chain(parts.iter().copied()));
-            return Some((id, true));
+            return Some(ModuleAt {
+                id: join_path(root, &parts),
+                label: if dir_label.is_empty() {
+                    last.to_string()
+                } else {
+                    format!("{dir_label}/{last}")
+                },
+                facade: true,
+            });
         }
-        let dir =
-            join_nonempty(std::iter::once(root).chain(parts[..parts.len() - 1].iter().copied()));
-        return Some((root_files_id(&dir), false));
+        return Some(ModuleAt {
+            id: root_files_id(&join_path(root, dirs)),
+            label: root_files_id(&dir_label),
+            facade: false,
+        });
     }
-    let id = join_nonempty(std::iter::once(root).chain(parts[..depth].iter().copied()));
-    Some((id, false))
+    Some(ModuleAt {
+        id: join_path(root, &dirs[..ends[depth - 1]]),
+        label: level_label(root, dirs, &ends[..depth]),
+        facade: false,
+    })
 }
 
 fn top_dir(path: &str) -> Option<&str> {
@@ -150,11 +266,14 @@ pub fn pick_default_root(files: &[MapFile]) -> String {
         if file.test {
             continue;
         }
+        // A file loose in the repository root is program too: git's hundreds
+        // of top-level `.c` files made `builtin/` look like the majority of
+        // the code (upstream #2270).
+        total += file.symbols;
         let Some(dir) = top_dir(&file.path) else {
             continue;
         };
         *by_dir.entry(dir).or_insert(0) += file.symbols;
-        total += file.symbols;
     }
     if total == 0 {
         return String::new();
@@ -186,7 +305,12 @@ pub fn pick_default_root(files: &[MapFile]) -> String {
 }
 
 /// The non-test modules a depth would draw, and how concentrated they are.
-fn tally_modules(files: &[MapFile], root: &str, depth: usize) -> (usize, f64, usize) {
+fn tally_modules(
+    files: &[MapFile],
+    root: &str,
+    depth: usize,
+    pass_through: Option<&HashSet<String>>,
+) -> (usize, f64, usize) {
     let mut by_module: HashMap<String, (i64, usize)> = HashMap::new();
     let mut order: Vec<String> = Vec::new();
     let mut total = 0;
@@ -194,11 +318,11 @@ fn tally_modules(files: &[MapFile], root: &str, depth: usize) -> (usize, f64, us
         if file.test {
             continue;
         }
-        let Some((id, _)) = module_id_for(&file.path, root, depth) else {
+        let Some(at) = module_id_for(&file.path, root, depth, pass_through) else {
             continue;
         };
-        let entry = by_module.entry(id.clone()).or_insert_with(|| {
-            order.push(id);
+        let entry = by_module.entry(at.id.clone()).or_insert_with(|| {
+            order.push(at.id);
             (0, 0)
         });
         entry.0 += file.symbols;
@@ -224,7 +348,11 @@ fn tally_modules(files: &[MapFile], root: &str, depth: usize) -> (usize, f64, us
 /// How many segments name a module, when the reader has not said: the
 /// shallowest depth that is neither dominated by one box worth opening nor too
 /// small to be a picture, stopping before a deeper one becomes a crowd.
-pub fn pick_default_depth(files: &[MapFile], root: &str) -> usize {
+pub fn pick_default_depth(
+    files: &[MapFile],
+    root: &str,
+    pass_through: Option<&HashSet<String>>,
+) -> usize {
     let mut deepest = DEFAULT_DEPTH;
     for file in files {
         if file.test {
@@ -239,14 +367,15 @@ pub fn pick_default_depth(files: &[MapFile], root: &str) -> usize {
                 None => continue,
             }
         };
-        let segments = rel.split('/').filter(|p| !p.is_empty()).count();
-        deepest = deepest.max(segments.saturating_sub(1));
+        let parts: Vec<&str> = rel.split('/').filter(|p| !p.is_empty()).collect();
+        let dirs = &parts[..parts.len().saturating_sub(1)];
+        deepest = deepest.max(level_ends(root, dirs, pass_through).len());
     }
     let mut fallback = DEFAULT_DEPTH;
     let mut fallback_count = 0;
     let mut depth = DEFAULT_DEPTH;
     while depth <= MAX_DEPTH.min(deepest) {
-        let (count, share, largest_files) = tally_modules(files, root, depth);
+        let (count, share, largest_files) = tally_modules(files, root, depth, pass_through);
         if count == 0 || count > MAX_MODULES {
             break;
         }
@@ -261,6 +390,30 @@ pub fn pick_default_depth(files: &[MapFile], root: &str) -> usize {
         depth += 1;
     }
     fallback
+}
+
+/// The root and depth the map opens on when the reader named neither.
+///
+/// A source directory whose files all sit in one folder (Express's `lib/`, an
+/// R package's `R/`, an Erlang app's `src/`) draws as one box at any depth,
+/// and a map whose subject is one box has said nothing. The repository around
+/// it is then the picture worth opening on, when it draws more than one box
+/// (upstream #2270).
+pub fn pick_default_view(
+    files: &[MapFile],
+    pass_through: Option<&HashSet<String>>,
+) -> (String, usize) {
+    let root = pick_default_root(files);
+    let depth = pick_default_depth(files, &root, pass_through);
+    if root.is_empty() || tally_modules(files, &root, depth, pass_through).0 > 1 {
+        return (root, depth);
+    }
+    let whole_depth = pick_default_depth(files, "", pass_through);
+    if tally_modules(files, "", whole_depth, pass_through).0 > 1 {
+        (String::new(), whole_depth)
+    } else {
+        (root, depth)
+    }
 }
 
 /// JavaScript `parseInt(raw, 10)`: optional leading whitespace and sign, then
@@ -394,9 +547,20 @@ pub fn build(ctx: &Ctx<'_>, query: &Query) -> ApiResult<Value> {
         })
         .collect();
 
-    let root = requested_root.unwrap_or_else(|| pick_default_root(&files));
-    // Root first, then depth against THAT root.
-    let depth = requested_depth.unwrap_or_else(|| pick_default_depth(&files, &root));
+    let pass_through = pass_through_dirs(files.iter().map(|file| file.path.as_str()));
+    // Root first, then depth against THAT root: how finely to cut depends on
+    // what is being cut. Nobody naming a root opens the default view.
+    let view = requested_root
+        .is_none()
+        .then(|| pick_default_view(&files, Some(&pass_through)));
+    let root = view
+        .as_ref()
+        .map(|(root, _)| root.clone())
+        .or(requested_root)
+        .unwrap_or_default();
+    let depth = requested_depth
+        .or(view.map(|(_, depth)| depth))
+        .unwrap_or_else(|| pick_default_depth(&files, &root, Some(&pass_through)));
     let counts = ctx.store.counts()?;
     let last_indexed_at = ctx.store.last_indexed_at()?;
     let key = [
@@ -414,25 +578,37 @@ pub fn build(ctx: &Ctx<'_>, query: &Query) -> ApiResult<Value> {
         return Ok(hit);
     }
 
-    let mut assigned: HashMap<&str, (String, bool)> = HashMap::new();
+    let mut assigned: HashMap<&str, ModuleAt> = HashMap::new();
+    let mut label_of: HashMap<String, String> = HashMap::new();
     for file in &files {
-        if let Some(at) = module_id_for(&file.path, &root, depth) {
+        if let Some(at) = module_id_for(&file.path, &root, depth, Some(&pass_through)) {
+            label_of.insert(at.id.clone(), at.label.clone());
             assigned.insert(file.path.as_str(), at);
         }
     }
-    let ids: HashSet<String> = assigned.values().map(|(id, _)| id.clone()).collect();
+    let ids: HashSet<String> = assigned.values().map(|at| at.id.clone()).collect();
     let renamed = collapse_lone_root_files(&ids);
+    for (from, to) in &renamed {
+        let label = label_of.get(from).cloned().unwrap_or_else(|| to.clone());
+        let label = label
+            .strip_suffix(&format!("/{ROOT_FILES}"))
+            .map_or_else(|| label.clone(), str::to_string);
+        label_of.insert(to.clone(), label);
+    }
 
     let mut modules: BTreeMap<String, ModuleEntry> = BTreeMap::new();
     let mut module_of_file: HashMap<String, String> = HashMap::new();
     for file in &files {
-        let Some((at_id, facade)) = assigned.get(file.path.as_str()) else {
+        let Some(at) = assigned.get(file.path.as_str()) else {
             continue;
         };
-        let id = renamed.get(at_id).cloned().unwrap_or_else(|| at_id.clone());
+        let id = renamed
+            .get(&at.id)
+            .cloned()
+            .unwrap_or_else(|| at.id.clone());
         module_of_file.insert(file.path.clone(), id.clone());
         let entry = modules.entry(id).or_insert_with(|| ModuleEntry {
-            facade: *facade,
+            facade: at.facade,
             ..ModuleEntry::default()
         });
         entry.files += 1;
@@ -468,11 +644,7 @@ pub fn build(ctx: &Ctx<'_>, query: &Query) -> ApiResult<Value> {
             shown.truncate(MAX_FILES_PER_MODULE);
             let mut languages: Vec<(String, usize)> = entry.languages.into_iter().collect();
             languages.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| locale_compare(&a.0, &b.0)));
-            let label = match id.rfind('/') {
-                Some(cut) if cut + 1 < id.len() => id[cut + 1..].to_string(),
-                Some(_) => id.clone(),
-                None => id.clone(),
-            };
+            let label = label_of.get(&id).cloned().unwrap_or_else(|| id.clone());
             WireMapModule {
                 label,
                 files: entry.files,
@@ -827,35 +999,192 @@ mod tests {
     }
 
     fn id(path: &str, root: &str, depth: usize) -> Option<(String, bool)> {
-        module_id_for(path, root, depth)
+        module_id_for(path, root, depth, None).map(|at| (at.id, at.facade))
+    }
+
+    /// The module without pass-through folders, label included.
+    fn at(path: &str, root: &str, depth: usize) -> Option<ModuleAt> {
+        module_id_for(path, root, depth, None)
+    }
+
+    fn box_of(id: &str, label: &str, facade: bool) -> Option<ModuleAt> {
+        Some(ModuleAt {
+            id: id.into(),
+            label: label.into(),
+            facade,
+        })
+    }
+
+    /// A Maven project's sources and tests, under folders nothing forks in.
+    const MAVEN: [&str; 7] = [
+        "src/main/java/org/springframework/samples/petclinic/PetClinicApplication.java",
+        "src/main/java/org/springframework/samples/petclinic/owner/Owner.java",
+        "src/main/java/org/springframework/samples/petclinic/owner/OwnerController.java",
+        "src/main/java/org/springframework/samples/petclinic/vet/Vet.java",
+        "src/main/java/org/springframework/samples/petclinic/visit/Visit.java",
+        "src/main/java/org/springframework/samples/petclinic/model/BaseEntity.java",
+        "src/test/java/org/springframework/samples/petclinic/owner/OwnerControllerTests.java",
+    ];
+
+    #[test]
+    fn finds_the_folders_with_one_subfolder_and_no_file_of_their_own() {
+        let mut through: Vec<String> = pass_through_dirs(MAVEN).into_iter().collect();
+        through.sort();
+        assert_eq!(
+            through,
+            [
+                "src/main",
+                "src/main/java",
+                "src/main/java/org",
+                "src/main/java/org/springframework",
+                "src/main/java/org/springframework/samples",
+                "src/test",
+                "src/test/java",
+                "src/test/java/org",
+                "src/test/java/org/springframework",
+                "src/test/java/org/springframework/samples",
+                "src/test/java/org/springframework/samples/petclinic",
+            ]
+        );
+        // A folder holding a file is a boundary even with one subfolder.
+        assert!(!pass_through_dirs(["a/b/c.ts", "a/x.ts"]).contains("a"));
+    }
+
+    #[test]
+    fn counts_depth_in_folders_that_fork_and_elides_the_chain_in_the_label() {
+        let through = pass_through_dirs(MAVEN);
+        let at = |path: &str, depth: usize| module_id_for(path, "src", depth, Some(&through));
+        assert_eq!(
+            at(MAVEN[1], 1),
+            Some(ModuleAt {
+                id: "src/main/java/org/springframework/samples/petclinic".into(),
+                label: "src/main/…/petclinic".into(),
+                facade: false,
+            })
+        );
+        assert_eq!(
+            at(MAVEN[1], 2),
+            Some(ModuleAt {
+                id: "src/main/java/org/springframework/samples/petclinic/owner".into(),
+                label: "src/main/…/petclinic/owner".into(),
+                facade: false,
+            })
+        );
+        // The application class sits loose in the package root.
+        assert_eq!(
+            at(MAVEN[0], 2),
+            Some(ModuleAt {
+                id: "src/main/java/org/springframework/samples/petclinic/(root files)".into(),
+                label: "src/main/…/petclinic/(root files)".into(),
+                facade: false,
+            })
+        );
+        // Without the set nothing changes: one level per folder, the label
+        // the id.
+        assert_eq!(
+            module_id_for(MAVEN[1], "src", 2, None),
+            Some(ModuleAt {
+                id: "src/main/java".into(),
+                label: "src/main/java".into(),
+                facade: false,
+            })
+        );
+    }
+
+    #[test]
+    fn opens_a_maven_project_on_its_packages_not_on_one_box() {
+        let files: Vec<MapFile> = MAVEN
+            .iter()
+            .map(|path| file(path, 10, path.contains("/test/")))
+            .collect();
+        let through = pass_through_dirs(MAVEN);
+        let depth = pick_default_depth(&files, "src", Some(&through));
+        assert_eq!(depth, 2);
+        let mut ids: Vec<String> = files
+            .iter()
+            .filter(|f| !f.test)
+            .map(|f| {
+                module_id_for(&f.path, "src", depth, Some(&through))
+                    .unwrap()
+                    .id
+            })
+            .collect();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(
+            ids,
+            [
+                "src/main/java/org/springframework/samples/petclinic/(root files)",
+                "src/main/java/org/springframework/samples/petclinic/model",
+                "src/main/java/org/springframework/samples/petclinic/owner",
+                "src/main/java/org/springframework/samples/petclinic/vet",
+                "src/main/java/org/springframework/samples/petclinic/visit",
+            ]
+        );
+    }
+
+    #[test]
+    fn counts_files_loose_in_the_repository_root_as_program() {
+        // git: hundreds of top-level `.c` files beside `builtin/`.
+        assert_eq!(
+            pick_default_root(&[
+                file("git.c", 60, false),
+                file("refs.c", 50, false),
+                file("builtin/add.c", 40, false),
+                file("builtin/commit.c", 30, false),
+            ]),
+            ""
+        );
+    }
+
+    #[test]
+    fn opens_on_the_repository_when_the_source_folder_is_one_flat_folder() {
+        // Express: everything under `lib/` sits in `lib/` itself.
+        let mut files: Vec<MapFile> = (0..30)
+            .map(|i| file(&format!("lib/f{i}.js"), 10, false))
+            .collect();
+        files.push(file("index.js", 1, false));
+        files.push(file("benchmarks/run.js", 3, false));
+        files.push(file("test/app.js", 50, true));
+        assert_eq!(pick_default_view(&files, None), (String::new(), 1));
+        // ...but a source folder that draws a picture of its own is kept.
+        let files = [
+            file("src/a/x.ts", 40, false),
+            file("src/b/y.ts", 40, false),
+            file("scripts/z.ts", 2, false),
+        ];
+        assert_eq!(pick_default_view(&files, None).0, "src");
     }
 
     #[test]
     fn names_a_module_after_the_first_depth_segments_under_the_root() {
         assert_eq!(
-            id("src/core/engine.ts", "src", 1),
-            Some(("src/core".into(), false))
+            at("src/core/engine.ts", "src", 1),
+            box_of("src/core", "src/core", false)
         );
         assert_eq!(
-            id("src/a/b/c.ts", "src", 2),
-            Some(("src/a/b".into(), false))
+            at("src/a/b/c.ts", "src", 2),
+            box_of("src/a/b", "src/a/b", false)
         );
-        assert_eq!(id("a/b/c.ts", "", 1), Some(("a".into(), false)));
+        assert_eq!(at("a/b/c.ts", "", 1), box_of("a", "a", false));
     }
 
     #[test]
     fn keeps_a_facade_as_its_own_box_and_buckets_the_other_loose_files() {
         assert_eq!(
-            id("src/index.ts", "src", 1),
-            Some(("src/index.ts".into(), true))
+            at("src/index.ts", "src", 1),
+            box_of("src/index.ts", "src/index.ts", true)
         );
         assert_eq!(id("src/lib.rs", "src", 1).map(|(_, f)| f), Some(true));
         assert_eq!(id("pkg/__init__.py", "pkg", 1).map(|(_, f)| f), Some(true));
         assert_eq!(
-            id("src/types.ts", "src", 1),
-            Some(("src/(root files)".into(), false))
+            at("src/types.ts", "src", 1),
+            box_of("src/(root files)", "src/(root files)", false)
         );
-        assert_eq!(id("types.ts", "", 1), Some(("(root files)".into(), false)));
+        assert_eq!(
+            at("types.ts", "", 1),
+            box_of("(root files)", "(root files)", false)
+        );
         assert_eq!(stem_of(".eslintrc"), ".eslintrc");
         assert_eq!(stem_of("index.test.ts"), "index");
     }
@@ -863,8 +1192,8 @@ mod tests {
     #[test]
     fn buckets_a_loose_file_into_the_directory_it_is_actually_in_not_the_top_one() {
         assert_eq!(
-            id("src/a/loose.ts", "src", 2),
-            Some(("src/a/(root files)".into(), false))
+            at("src/a/loose.ts", "src", 2),
+            box_of("src/a/(root files)", "src/a/(root files)", false)
         );
         assert_eq!(id("src/a/b.ts", "", 2), Some(("src/a".into(), false)));
     }
@@ -927,7 +1256,7 @@ mod tests {
         files.extend(spread("ios/CaptureView", 63, 28, false));
         files.extend(spread("ios/Camera", 3, 38, false));
         files.extend(spread(".github/workflows", 4, 0, false));
-        assert_eq!(pick_default_depth(&files, ""), 2);
+        assert_eq!(pick_default_depth(&files, "", None), 2);
     }
 
     #[test]
@@ -937,7 +1266,7 @@ mod tests {
         files.extend(spread("src/mcp", 7, 40, false));
         files.extend(spread("src/search", 5, 40, false));
         files.extend(spread("src/sync", 4, 40, false));
-        assert_eq!(pick_default_depth(&files, "src"), 1);
+        assert_eq!(pick_default_depth(&files, "src", None), 1);
     }
 
     #[test]
@@ -946,7 +1275,7 @@ mod tests {
         files.extend(spread("src/db", 2, 10, false));
         files.extend(spread("src/api", 2, 10, false));
         files.push(file("src/index.ts", 5, false));
-        assert_eq!(pick_default_depth(&files, "src"), 1);
+        assert_eq!(pick_default_depth(&files, "src", None), 1);
     }
 
     #[test]
@@ -956,21 +1285,21 @@ mod tests {
         files.extend(spread("frontend/src/hooks", 8, 10, false));
         files.extend(spread("frontend/src/api", 6, 10, false));
         files.extend(spread("backend/app", 5, 8, false));
-        assert_eq!(pick_default_depth(&files, ""), 3);
+        assert_eq!(pick_default_depth(&files, "", None), 3);
     }
 
     #[test]
     fn stops_before_a_deeper_grouping_becomes_a_crowd() {
         let mut files = spread("src/a", 30, 10, false);
         files.extend((0..70).map(|i| file(&format!("src/b/m{i}/f.ts"), 1, false)));
-        assert_eq!(pick_default_depth(&files, ""), 2);
+        assert_eq!(pick_default_depth(&files, "", None), 2);
     }
 
     #[test]
     fn does_not_chase_a_tree_that_has_no_more_levels_to_give() {
         let mut files = spread("src/a", 30, 10, false);
         files.extend(spread("src/b", 2, 1, false));
-        assert_eq!(pick_default_depth(&files, "src"), 1);
+        assert_eq!(pick_default_depth(&files, "src", None), 1);
     }
 
     #[test]
@@ -979,7 +1308,7 @@ mod tests {
         files.extend(spread("src/__tests__/a", 12, 10, true));
         files.extend(spread("src/__tests__/b", 12, 10, true));
         files.extend(spread("src/__tests__/c", 12, 10, true));
-        assert_eq!(pick_default_depth(&files, "src"), 1);
+        assert_eq!(pick_default_depth(&files, "src", None), 1);
     }
 
     #[test]

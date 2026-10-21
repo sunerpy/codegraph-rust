@@ -15,10 +15,12 @@
 //! signal to offer.
 //!
 //! `codegraph-graph`'s `query::scoring::is_test_file` deliberately stays
-//! separate. It answers a BROADER question for FTS relevance damping (it also
-//! treats `examples/`, `demos/`, `benchmarks/`, camelCase `FooTests/` dirs and
-//! `TestCase`-suffixed stems as non-production), so folding it in here would
-//! change search ranking rather than converge a duplicate.
+//! separate. It is upstream's wide `isTestFile`, the reading search ranking and
+//! the viewer use: [`is_test_path`] plus the `examples/`, `samples/`,
+//! `fixtures/`, `benchmarks/`, `demos/` and `integration/` folders of a
+//! project's layout above `src/`. Folding that into [`is_test_file`] would
+//! change what `affected` and the MCP engine call a test rather than converge
+//! a duplicate.
 
 /// Path segments that mark a test tree. Matched as whole `/`-delimited
 /// segments, so a repo-root `e2e/` counts and a `route2e2e.ts` filename
@@ -26,8 +28,9 @@
 const TEST_DIR_SEGMENTS: &[&str] = &["test", "tests", "__tests__", "spec", "e2e"];
 
 /// Filename markers that mark a test file. `_test.` is Go's convention
-/// (`math_test.go`); `.test.` / `.spec.` are the JS/TS ones.
-const TEST_FILE_MARKERS: &[&str] = &[".test.", ".spec.", "_test."];
+/// (`math_test.go`); `.test.` / `.spec.` are the JS/TS ones; `_unittest.` is
+/// Google's C++ one (`foo_unittest.cc`, upstream #2434).
+const TEST_FILE_MARKERS: &[&str] = &[".test.", ".spec.", "_test.", "_unittest."];
 
 /// Whether `path` names a test file, by directory segment or filename marker.
 ///
@@ -39,6 +42,171 @@ pub fn is_test_file(path: &str) -> bool {
         || TEST_DIR_SEGMENTS
             .iter()
             .any(|seg| contains_path_segment(path, seg))
+}
+
+/// Whether `path` names a test, the narrow reading of upstream's `isTestPath`
+/// the resolver's test-suite rule reads a reference's file with (upstream
+/// #2209): a test file by name (`test_foo.py`, `foo_test.go`, `foo.spec.ts`,
+/// `foo_unittest.cc`, `FooTest.kt`, `BarTests.swift`) or one under a test or
+/// test-support directory (`tests/`, `__tests__/`, `spec/`, `e2e/`,
+/// `testing/`, `jvmTest/`, `testdata/`, `fakes/`, `mocks/`, a `*-test`
+/// module).
+pub fn is_test_path(path: &str) -> bool {
+    let lower = path.to_lowercase();
+    let file_name = path.rsplit('/').next().unwrap_or(path);
+    let lower_name = file_name.to_lowercase();
+    if lower_name.starts_with("test_")
+        || lower_name.starts_with("test.")
+        || has_separated_suffix(
+            &lower_name,
+            &["test", "tests", "unittest", "unittests", "spec", "specs"],
+            &['.', '_', '-'],
+        )
+        || has_camel_suffix(
+            file_name,
+            &["Test", "Tests", "TestCase", "Tester", "Spec", "Specs"],
+            None,
+        )
+    {
+        return true;
+    }
+    const DIRS: [&str; 8] = [
+        "/tests/",
+        "/test/",
+        "/__tests__/",
+        "/spec/",
+        "/specs/",
+        "/testlib/",
+        "/testing/",
+        "/e2e/",
+    ];
+    const ROOTS: [&str; 5] = ["test/", "tests/", "spec/", "specs/", "e2e/"];
+    DIRS.iter().any(|dir| lower.contains(dir))
+        || ROOTS.iter().any(|root| lower.starts_with(root))
+        || directories(path).any(is_camel_test_directory)
+        || directories(&lower).any(is_test_support_directory)
+}
+
+/// Whether `path` is a test suite, as opposed to test-support code a project
+/// ships (`testing/`, `fakes/`, a `*-test` module), which its own code may use
+/// (upstream #2209 `isTestSuitePath`). `…Spec.java` alone is no test (halo's
+/// `IndexSpecs`, okhttp's `ConnectionSpec`), nor is `useTests.ts`, a hook.
+pub fn is_test_suite_path(path: &str) -> bool {
+    if !is_test_path(path) {
+        return false;
+    }
+    let lower = path.to_lowercase();
+    let file_name = path.rsplit('/').next().unwrap_or(path);
+    let name = lower.rsplit('/').next().unwrap_or(&lower);
+    if name.starts_with("test_")
+        || has_separated_suffix(
+            name,
+            &["test", "tests", "unittest", "unittests"],
+            &['.', '_', '-'],
+        )
+        || has_separated_suffix(name, &["spec", "specs"], &['.', '_'])
+        || has_camel_suffix(
+            file_name,
+            &["Test", "Tests", "TestCase"],
+            Some(&[
+                "java", "kt", "kts", "swift", "cs", "scala", "groovy", "m", "mm", "vb", "fs",
+            ]),
+        )
+        || name == "conftest.py"
+    {
+        return true;
+    }
+    directories(&lower).any(|dir| {
+        matches!(
+            dir,
+            "test" | "tests" | "__tests__" | "spec" | "specs" | "e2e"
+        )
+    }) || directories(path).any(is_camel_test_directory)
+}
+
+/// The directory segments of `path`: every `/`-delimited segment but the
+/// last.
+fn directories(path: &str) -> impl Iterator<Item = &str> {
+    let dirs = path.rsplit_once('/').map_or("", |(dirs, _)| dirs);
+    dirs.split('/').filter(|segment| !segment.is_empty())
+}
+
+/// `[sep](suffix)\.[a-z0-9]+$` over a lowercase file name: the stem before
+/// the last `.` ends in one of `suffixes`, right after one of `separators`,
+/// and the extension is lowercase alphanumeric.
+fn has_separated_suffix(lower_name: &str, suffixes: &[&str], separators: &[char]) -> bool {
+    let Some((stem, ext)) = lower_name.rsplit_once('.') else {
+        return false;
+    };
+    if ext.is_empty()
+        || !ext
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+    {
+        return false;
+    }
+    suffixes.iter().any(|suffix| {
+        stem.strip_suffix(suffix)
+            .and_then(|rest| rest.chars().next_back())
+            .is_some_and(|sep| separators.contains(&sep))
+    })
+}
+
+/// `(suffix)\.<ext>$` over a file name in its own case: the stem before the
+/// last `.` ends in one of `suffixes` (`FooTest`, `BarTests`), and the
+/// extension is alphanumeric, or one of `extensions` when given.
+fn has_camel_suffix(file_name: &str, suffixes: &[&str], extensions: Option<&[&str]>) -> bool {
+    let Some((stem, ext)) = file_name.rsplit_once('.') else {
+        return false;
+    };
+    let ext_ok = match extensions {
+        Some(allowed) => allowed.contains(&ext),
+        None => !ext.is_empty() && ext.bytes().all(|b| b.is_ascii_alphanumeric()),
+    };
+    ext_ok && suffixes.iter().any(|suffix| stem.ends_with(suffix))
+}
+
+/// `[A-Za-z0-9]*(Test|Tests|Spec)` as a whole directory: a Kotlin
+/// Multiplatform / Gradle / Xcode test source set (`jvmTest/`, `UnitTests/`).
+fn is_camel_test_directory(dir: &str) -> bool {
+    dir.bytes().all(|b| b.is_ascii_alphanumeric())
+        && ["Test", "Tests", "Spec"]
+            .iter()
+            .any(|suffix| dir.ends_with(suffix))
+}
+
+/// A test-support directory by its lowercase name: a `*-test` / `*_tests` /
+/// `*-testing` module, `testdata`, `testutil(s)`, `test-util(s)`, `fake(s)`,
+/// `mock(s)`, `__mocks__`, `stubs`.
+fn is_test_support_directory(dir: &str) -> bool {
+    if matches!(
+        dir,
+        "testdata"
+            | "testutil"
+            | "testutils"
+            | "test-util"
+            | "test_util"
+            | "test-utils"
+            | "test_utils"
+            | "fake"
+            | "fakes"
+            | "mock"
+            | "mocks"
+            | "__mocks__"
+            | "stubs"
+    ) {
+        return true;
+    }
+    ["test", "tests", "testing"].iter().any(|suffix| {
+        dir.strip_suffix(suffix)
+            .and_then(|rest| rest.strip_suffix(['-', '_']))
+            .is_some_and(|prefix| {
+                !prefix.is_empty()
+                    && prefix
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'.')
+            })
+    })
 }
 
 /// Whether `segment` appears in `path` as a complete `/`-delimited segment.
@@ -100,9 +268,12 @@ const GENERATED_SUFFIXES: &[&str] = &[
     "_grpc_pb.ts",
     "_grpc_pb.js",
     // Minified bundles vendored into a repo: single-letter symbols make
-    // name-based edges pure noise.
+    // name-based edges pure noise. Upstream's `[.-]min` also takes
+    // `underscore-min.js` (#2122).
     ".min.js",
     ".min.mjs",
+    "-min.js",
+    "-min.mjs",
     // Python — protobuf / gRPC
     "_pb2.py",
     "_pb2_grpc.py",
@@ -159,6 +330,60 @@ fn basename(path: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
+    /// Upstream #2209 / #2434: what `is_test_path` and `is_test_suite_path`
+    /// read as a test, and what they leave production or test support.
+    #[test]
+    fn test_paths_and_test_suites() {
+        for suite in [
+            "test/functional/entity/Record.ts",
+            "src/test/java/app/InterceptorTest.java",
+            "app/__tests__/a.ts",
+            "spec/models/user_spec.rb",
+            "e2e/login.ts",
+            "tools/test_foo.py",
+            "src/foo.test.ts",
+            "src/cpp/stack_unittest.cc",
+            "src/jvmTest/kotlin/A.kt",
+            "Sources/FooTests.swift",
+            "tests/conftest.py",
+        ] {
+            assert!(is_test_path(suite), "{suite}");
+            assert!(is_test_suite_path(suite), "{suite}");
+        }
+        for support in [
+            "src/testing/stub.ts",
+            "core/data-test/src/Fake.kt",
+            "internal/testdata/x.go",
+            "src/fakes/clock.ts",
+            "src/__mocks__/fs.ts",
+            "app/Specs/IndexSpecs.java",
+        ] {
+            assert!(is_test_path(support), "{support}");
+        }
+        for support in [
+            "src/testing/stub.ts",
+            "core/data-test/src/Fake.kt",
+            "internal/testdata/x.go",
+            "src/fakes/clock.ts",
+        ] {
+            assert!(!is_test_suite_path(support), "{support}");
+        }
+        for production in [
+            "src/columns.ts",
+            "src/latest.kt",
+            "src/manifest/x.kt",
+            "src/hooks/useTests.ts",
+            "src/okhttp/ConnectionSpec.java",
+            "cmd/promtool/unittest.go",
+        ] {
+            assert!(!is_test_suite_path(production), "{production}");
+        }
+        assert!(!is_test_path("src/columns.ts"));
+        // A `conftest.py` names a suite only where a test path already does.
+        assert!(!is_test_path("pkg/conftest.py"));
+        assert!(is_test_file("src/cpp/stack_unittest.cc"));
+    }
+
     use super::*;
 
     #[test]
@@ -230,6 +455,8 @@ mod tests {
             "svc_grpc_pb.js",
             "vendor/chart.min.js",
             "vendor/chart.min.mjs",
+            "vendor/underscore/underscore-min.js",
+            "vendor/underscore/underscore-min.mjs",
             "svc_pb2.py",
             "svc_pb2_grpc.py",
             "svc_pb2.pyi",
@@ -260,6 +487,7 @@ mod tests {
             "src/genesis.go",
             "src/pb.go",
             "src/table.js",
+            "src/admin.js",
             "docs/min.css",
             "src/grpc.cs",
             "src/outerclass.java",

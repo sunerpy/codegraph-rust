@@ -22,12 +22,13 @@ use codegraph_core::generated_header::detect_generated_file;
 use codegraph_core::logger::{LoggerConfig, init_logger};
 use codegraph_core::node_id::hash_content;
 use codegraph_core::types::{Edge, ExtractionResult, FileRecord, Language, Node, NodeKind};
-use codegraph_extract::{ExtractOptions, detect_language_with};
+use codegraph_extract::{ExtractOptions, detect_language_of};
 use codegraph_graph::graph::{GodotReach, GraphTraverser, group_definitions};
 use codegraph_graph::query::{SearchOptions, search_nodes};
 use codegraph_graph::{segment_match, segments};
 use codegraph_mcp::{McpServer, RunUntilAdoption};
 use codegraph_resolve::ReferenceResolver;
+use codegraph_resolve::module_surface::ModuleSurface;
 use codegraph_store::queries::SearchResult;
 use codegraph_store::{CorruptReason, ExtractionStatus, IndexLease, SlotOutcome, Store};
 use diagnostics::{DiagnosticArgs, DiagnosticRun, IndexTracker};
@@ -45,6 +46,8 @@ mod viewer_gate;
 /// musl's allocator serializes threads, so the static Linux release builds got
 /// slower as threads were added: a full index of this repository took over two
 /// minutes at 32 threads, against 51 s at one. Through mimalloc it takes 8 s.
+/// mimalloc asks for transparent huge pages for its own memory; a full index
+/// turns them off while it runs ([`HugePagesOff`], W10-07).
 #[cfg(target_env = "musl")]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -1193,6 +1196,15 @@ fn self_update_rate_limit_hint() -> &'static str {
     "if this is a GitHub API rate limit, authenticate with:\n  GITHUB_TOKEN=$(gh auth token) codegraph self-update"
 }
 
+/// The newest release's version in a `get_latest_release` listing (self_update
+/// 1.x returns the listing, newest first, where 0.x returned the release).
+fn newest_release_version(releases: &self_update::Releases) -> Result<String> {
+    releases
+        .latest()
+        .map(|release| release.version().to_string())
+        .context("the GitHub release listing holds no release")
+}
+
 fn cmd_self_update(check: bool, force: bool, tag: Option<String>) -> Result<()> {
     use self_update::cargo_crate_version;
 
@@ -1223,9 +1235,10 @@ fn cmd_self_update(check: bool, force: bool, tag: Option<String>) -> Result<()> 
                 self_update_rate_limit_hint()
             )
         })?;
+        let latest = newest_release_version(&latest)?;
         let current = cargo_crate_version!();
-        if self_update::version::bump_is_greater(current, &latest.version).unwrap_or(false) {
-            println!("codegraph {current} -> {} available", latest.version);
+        if self_update::version::bump_is_greater(current, &latest).unwrap_or(false) {
+            println!("codegraph {current} -> {latest} available");
             println!("run `codegraph self-update` to install it");
         } else {
             println!("codegraph {current} is up to date");
@@ -1253,17 +1266,18 @@ fn cmd_self_update(check: bool, force: bool, tag: Option<String>) -> Result<()> 
                     self_update_rate_limit_hint()
                 )
             })?;
+            let latest = newest_release_version(&latest)?;
             let current = cargo_crate_version!();
-            if should_skip_update(current, &latest.version, force, false) {
+            if should_skip_update(current, &latest, force, false) {
                 println!("codegraph {current} is already up to date");
                 return Ok(());
             }
-            latest_update_tag(&latest.version)
+            latest_update_tag(&latest)
         }
     };
 
     let mut builder = configure();
-    builder.target_version_tag(&target_tag);
+    builder.release_tag(target_tag.as_str());
     let updater = builder
         .build()
         .context("configuring the self-update backend")?;
@@ -1274,7 +1288,7 @@ fn cmd_self_update(check: bool, force: bool, tag: Option<String>) -> Result<()> 
             self_update_rate_limit_hint()
         )
     })?;
-    if status.updated() {
+    if status.is_updated() {
         println!("Updated codegraph to {}", status.version());
     } else {
         println!("codegraph {} is already up to date", status.version());
@@ -1328,6 +1342,24 @@ fn is_task_notification_wrapper(prompt: &str) -> bool {
     trimmed.starts_with("<task-notification>") && trimmed.ends_with("</task-notification>")
 }
 
+/// Claude Code hands a subagent's report back to the parent session as a
+/// `<agent-message from="…">…</agent-message>` prompt, which the hook receives
+/// too (#2184). Same rule as [`is_task_notification_wrapper`]: only a prompt
+/// that is entirely that envelope, its opening tag bare or followed by
+/// whitespace and attributes, is skipped (upstream v1.6.2 `isAgentMessage`).
+fn is_agent_message_wrapper(prompt: &str) -> bool {
+    let trimmed = prompt.trim_matches(char::is_whitespace);
+    let Some(rest) = trimmed.strip_prefix("<agent-message") else {
+        return false;
+    };
+    let Some(open_end) = rest.find('>') else {
+        return false;
+    };
+    let attributes = &rest[..open_end];
+    (attributes.is_empty() || attributes.starts_with(char::is_whitespace))
+        && rest[open_end + 1..].ends_with("</agent-message>")
+}
+
 /// `codegraph prompt-hook` — the Claude `UserPromptSubmit` hook entry point,
 /// now a confidence-tiered gate (upstream #1126 + #1136, telemetry EXCLUDED):
 ///
@@ -1368,7 +1400,9 @@ fn cmd_prompt_hook(path: Option<PathBuf>, query: Option<String>) -> Result<()> {
     if query.is_empty() {
         return Ok(());
     }
-    if is_task_notification_wrapper(query) {
+    // System-injected task notifications and subagent hand-backs are not
+    // user prompts (#1832, #2184).
+    if is_task_notification_wrapper(query) || is_agent_message_wrapper(query) {
         return Ok(());
     }
 
@@ -1668,6 +1702,9 @@ fn drain_project_daemon(project: &Path, project_identity: &str) -> Result<(), St
         Ok(codegraph_daemon::ShutdownOutcome::Unresponsive { pid, detail }) => Err(format!(
             "daemon {pid} did not acknowledge the shutdown control frame ({detail})"
         )),
+        Ok(codegraph_daemon::ShutdownOutcome::Declined { pid, detail }) => Err(format!(
+            "daemon {pid} was not asked to shut down ({detail})"
+        )),
         Err(error) => Err(format!("could not reach this project's daemon: {error:#}")),
     }
 }
@@ -1789,36 +1826,61 @@ fn cmd_sync(path: Option<PathBuf>, quiet: bool, diagnostics: DiagnosticArgs) -> 
     })?;
     finish_phase(&bar, "Synced files");
     diagnostic_run.relocate_to_index_root(paths.current_root());
-    if let Some(sink) = &diagnostic_sink
-        && let Ok(store) = open_store(&project)
-    {
-        for relative in &outcome.changed_paths {
-            let record = store.file_by_path(relative).ok().flatten();
+    let emit_file_complete =
+        |sink: &diagnostics::DiagnosticSink,
+         relative: &str,
+         record: Option<&codegraph_core::types::FileRecord>| {
             sink.emit(
                 "file_complete",
                 json!({
                     "file": relative,
                     "status": if record.is_some() { "reindexed" } else { "removed" },
-                    "language": record.as_ref().map(|file| file.language.to_string()),
-                    "sizeBytes": record.as_ref().map(|file| file.size),
-                    "nodes": record.as_ref().map(|file| file.node_count),
+                    "language": record.map(|file| file.language.to_string()),
+                    "sizeBytes": record.map(|file| file.size),
+                    "nodes": record.map(|file| file.node_count),
                     "edges": serde_json::Value::Null,
                     "references": serde_json::Value::Null,
-                    "errors": record.as_ref().map(|file| file.errors.len()),
+                    "errors": record.map(|file| file.errors.len()),
                 }),
             );
-        }
-    }
+        };
     let mut sync_warnings = Vec::new();
-    if let Ok(store) = open_store(&project) {
-        for relative in &outcome.changed_paths {
-            if let Some(record) = store.file_by_path(relative)? {
-                sync_warnings.extend(
-                    record
-                        .errors
-                        .into_iter()
-                        .filter(|error| codegraph_extract::is_extraction_warning(error)),
-                );
+    if let Some(records) = &outcome.changed_records {
+        // The rows the sync left, handed back by its writer: no second open
+        // of the index, which reads the whole database (W5-09d).
+        if let Some(sink) = &diagnostic_sink {
+            for (relative, record) in records {
+                emit_file_complete(sink, relative, record.as_ref());
+            }
+        }
+        for record in records.iter().filter_map(|(_, record)| record.as_ref()) {
+            sync_warnings.extend(
+                record
+                    .errors
+                    .iter()
+                    .filter(|error| codegraph_extract::is_extraction_warning(error))
+                    .cloned(),
+            );
+        }
+    } else {
+        if let Some(sink) = &diagnostic_sink
+            && let Ok(store) = open_store(&project)
+        {
+            for relative in &outcome.changed_paths {
+                let record = store.file_by_path(relative).ok().flatten();
+                emit_file_complete(sink, relative, record.as_ref());
+            }
+        }
+        if let Ok(store) = open_store(&project) {
+            for relative in &outcome.changed_paths {
+                if let Some(record) = store.file_by_path(relative)? {
+                    sync_warnings.extend(
+                        record
+                            .errors
+                            .into_iter()
+                            .filter(|error| codegraph_extract::is_extraction_warning(error)),
+                    );
+                }
             }
         }
     }
@@ -2128,6 +2190,9 @@ fn cmd_status(path: Option<PathBuf>, json_output: bool) -> Result<()> {
             .is_none_or(|v| v < codegraph_store::CURRENT_EXTRACTION_VERSION);
     let resolution_incomplete = store.is_resolution_incomplete()?;
     let pending = codegraph_watch::pending_project_changes(&project, &store)?;
+    // Files whose content is current but whose symbols are missing: the content
+    // hash behind "up to date" cannot see them (upstream #2336).
+    let health = FilesMissingSymbols::of(&store)?;
 
     if json_output {
         let mut index_obj = json!({
@@ -2135,6 +2200,8 @@ fn cmd_status(path: Option<PathBuf>, json_output: bool) -> Result<()> {
             "builtWithExtractionVersion": built_with_extraction_version,
             "currentExtractionVersion": codegraph_store::CURRENT_EXTRACTION_VERSION,
             "reindexRecommended": reindex_recommended,
+            "filesNeedingReindex": health.needs_reindex.len(),
+            "filesWithParseErrors": health.parse_errors.len(),
         });
         // #1187: surface the interrupted-index state ONLY when the marker is set,
         // so a healthy index's status JSON is byte-identical to a pre-#1187 build.
@@ -2223,6 +2290,13 @@ fn cmd_status(path: Option<PathBuf>, json_output: bool) -> Result<()> {
             }
         }
     }
+    let missing_symbols = health.warnings();
+    if !missing_symbols.is_empty() {
+        println!();
+        for line in &missing_symbols {
+            println!("⚠ {line}");
+        }
+    }
     if resolution_incomplete {
         println!(
             "\n⚠ Index is PARTIAL: a resolution pass was interrupted, so some call\n  edges are missing. Run `codegraph sync` to heal it.\n"
@@ -2232,10 +2306,85 @@ fn cmd_status(path: Option<PathBuf>, json_output: bool) -> Result<()> {
             "\nIndex has {} pending source change(s). Run `codegraph sync`.\n",
             pending.total()
         );
-    } else {
+    } else if missing_symbols.is_empty() {
         println!("\nIndex is up to date\n");
+    } else {
+        println!();
     }
     Ok(())
+}
+
+/// Indexed files whose content is current but whose symbols are missing,
+/// grouped by what to do about them (upstream #2336). Paths are sorted.
+struct FilesMissingSymbols {
+    needs_reindex: Vec<String>,
+    parse_errors: Vec<String>,
+}
+
+impl FilesMissingSymbols {
+    fn of(store: &Store) -> Result<Self> {
+        let mut health = Self {
+            needs_reindex: Vec::new(),
+            parse_errors: Vec::new(),
+        };
+        for file in store.files_without_nodes_or_with_errors()? {
+            match codegraph_extract::engine::missing_symbols(&file) {
+                Some(codegraph_extract::engine::MissingSymbols::NeedsReindex) => {
+                    health.needs_reindex.push(file.path);
+                }
+                Some(codegraph_extract::engine::MissingSymbols::ParseError) => {
+                    health.parse_errors.push(file.path);
+                }
+                None => {}
+            }
+        }
+        Ok(health)
+    }
+
+    /// One line per non-empty group: what is wrong, what to do, and up to
+    /// three of the files. A hash-based `sync` does not revisit a row whose
+    /// content is current, so a wiped row needs `codegraph index`.
+    fn warnings(&self) -> Vec<String> {
+        let sample = |paths: &[String]| {
+            let mut text = paths.iter().take(3).cloned().collect::<Vec<_>>().join(", ");
+            if paths.len() > 3 {
+                text.push_str(&format!(
+                    " (+{} more)",
+                    format_number(paths.len() as i64 - 3)
+                ));
+            }
+            text
+        };
+        let mut lines = Vec::new();
+        let reindex = self.needs_reindex.len();
+        if reindex > 0 {
+            lines.push(format!(
+                "{} {} symbols — run `codegraph index` to rebuild {}: {}",
+                format_number(reindex as i64),
+                if reindex == 1 {
+                    "file is missing its"
+                } else {
+                    "files are missing their"
+                },
+                if reindex == 1 { "it" } else { "them" },
+                sample(&self.needs_reindex)
+            ));
+        }
+        let unparsed = self.parse_errors.len();
+        if unparsed > 0 {
+            lines.push(format!(
+                "{} {} missing: {} — `codegraph files --json` shows the errors",
+                format_number(unparsed as i64),
+                if unparsed == 1 {
+                    "file could not be parsed, so its symbols are"
+                } else {
+                    "files could not be parsed, so their symbols are"
+                },
+                sample(&self.parse_errors)
+            ));
+        }
+        lines
+    }
 }
 
 fn print_wal_status(wal_size: u64, db_size: u64) {
@@ -3663,6 +3812,11 @@ fn serve_direct_no_services(
             project_root,
             reader,
         } => serve_adopted_project(reader, stdout, project_root, no_watch),
+        // MCP 2026-07-28: the rmcp handler answers the session, still with no
+        // daemon, watcher or catch-up for the broad root.
+        RunUntilAdoption::Inline { first_line, reader } => server
+            .serve_inline(first_line, reader, stdout)
+            .context("serving an MCP 2026-07-28 session at a too-broad root"),
     }
 }
 
@@ -3760,7 +3914,7 @@ fn start_daemon_for_adopted_root(project_root: &Path, no_watch: bool) -> Option<
                 socket_path = %socket_path.display(),
                 "adopted-root: spawned new daemon"
             );
-            socket_path.exists().then_some(socket_path)
+            codegraph_daemon::rendezvous_accepts(&socket_path).then_some(socket_path)
         }
         Err(err) => {
             tracing::warn!(error = %err, "adopted project daemon start failed");
@@ -3879,9 +4033,10 @@ pub enum ColdStartAction {
     /// A daemon is ALREADY running: attach to it via the real proxy (the proxy
     /// answers `initialize`/`tools/list` locally and forwards tool calls). Fast.
     ProxyToRunningDaemon,
-    /// COLD start (no live daemon): spawn the shared daemon FIRE-AND-FORGET for
-    /// the NEXT session's warm attach, but serve THIS session DIRECT immediately
-    /// so the MCP handshake is answered without waiting on daemon readiness.
+    /// COLD start (no live daemon): spawn the shared daemon FIRE-AND-FORGET, serve
+    /// THIS session DIRECT immediately so the MCP handshake is answered without
+    /// waiting on daemon readiness, and retain a passive lease on the daemon in
+    /// the background so it stays alive for this session.
     SpawnDaemonAndServeDirect,
 }
 
@@ -3903,6 +4058,8 @@ pub fn cold_start_action(daemon_running: bool) -> ColdStartAction {
 /// handshake without blocking on daemon socket readiness. This is the fix for
 /// the cold-start handshake race (opencode marking codegraph `failed` when the
 /// spawn→poll→proxy→heal prelude exceeded its MCP init timeout under load).
+/// A background keeper then retains a passive lease on that daemon, so it does
+/// not idle-exit while this session lives (upstream #2293).
 fn serve_spawn_or_proxy(
     project: Option<PathBuf>,
     project_root: &Path,
@@ -3916,8 +4073,24 @@ fn serve_spawn_or_proxy(
     match cold_start_action(daemon_already_running(project_root)) {
         ColdStartAction::ProxyToRunningDaemon => {
             tracing::debug!("serve_spawn_or_proxy: attaching to existing daemon (warm)");
-            if let Some(result) = proxy_to_running_daemon(project_root) {
-                return result;
+            match proxy_to_running_daemon(project_root) {
+                WarmAttach::Proxied(result) => return result,
+                WarmAttach::VersionMismatch => match replace_older_daemon(project_root) {
+                    DaemonReplacement::Drained => {
+                        return serve_after_replacement(
+                            project,
+                            project_root,
+                            no_watch,
+                            explicit_path,
+                        );
+                    }
+                    DaemonReplacement::Kept(reason) => {
+                        // stdout carries JSON-RPC only; MCP hosts log stderr, so a
+                        // session that quietly stopped syncing is visible there.
+                        eprintln!("[CodeGraph MCP] {READ_ONLY_SESSION_NOTICE}: {reason}.");
+                    }
+                },
+                WarmAttach::Unavailable => {}
             }
             // A failed transport attach does not grant a second watcher. Keep the
             // request path available as a read-only direct session while the live
@@ -3925,41 +4098,95 @@ fn serve_spawn_or_proxy(
             serve_direct_stdio(project, explicit_project_services(no_watch))
         }
         ColdStartAction::SpawnDaemonAndServeDirect => {
-            // Cold: kick off the shared daemon for FUTURE sessions, then serve
-            // this session direct immediately. The spawn is best-effort and
-            // idempotent — `start_or_attach` (via the daemon's pid lock) makes N
-            // concurrent cold sessions converge on at most one daemon, and a
-            // failed/lost race just means this session serves direct (which it
-            // does anyway). We deliberately do NOT poll or proxy here: that
-            // prelude is exactly what blew past opencode's handshake timeout.
-            if spawn_shared_daemon_best_effort(project_root, no_watch) {
-                // The detached daemon is the sole writer. This foreground process
-                // exists only to answer the first MCP handshake without waiting for
-                // socket readiness; starting another watcher/catch-up here recreated
-                // the exact dual-writer race #1740 guards against.
-                serve_direct_stdio(project, explicit_project_services(no_watch))
-            } else {
-                // If the child could not even be spawned, preserve the established
-                // in-process fallback. It takes writer.pid itself, so two fallback
-                // processes still cannot run competing watchers.
-                serve_direct(project, project_root, no_watch, explicit_path)
-            }
+            serve_cold_start(project, project_root, no_watch, explicit_path)
         }
     }
 }
 
-/// Attach to an ALREADY-running shared daemon via the real proxy. Returns
-/// `Some(Ok(()))` when the proxy bridged the session (caller must NOT also serve
-/// direct), or `None` when it could not attach (socket gone, version mismatch,
-/// or connect error) — the caller then falls back to direct serving. Unchanged
-/// proxy semantics: `run_proxy` answers `initialize`/`tools/list` locally and
+/// The stderr notice of a session that serves reads while another process owns
+/// the project's writer slot (upstream's `readOnlyFallback`).
+const READ_ONLY_SESSION_NOTICE: &str = "Serving reads in-process without auto-sync";
+
+/// Cold: kick off the shared daemon, then serve this session direct immediately.
+/// The spawn is best-effort and idempotent — `start_or_attach` (via the daemon's
+/// pid lock) makes N concurrent cold sessions converge on at most one daemon,
+/// and a failed/lost race just means this session serves direct (which it does
+/// anyway). We deliberately do NOT poll or proxy here: that prelude is exactly
+/// what blew past opencode's handshake timeout.
+fn serve_cold_start(
+    project: Option<PathBuf>,
+    project_root: &Path,
+    no_watch: bool,
+    explicit_path: bool,
+) -> Result<()> {
+    if spawn_shared_daemon_best_effort(project_root, no_watch) {
+        // The detached daemon is the sole writer. This foreground process exists
+        // only to answer the first MCP handshake without waiting for socket
+        // readiness; starting another watcher/catch-up here recreated the exact
+        // dual-writer race #1740 guards against.
+        //
+        // The daemon is also what keeps this session's index live, and a daemon
+        // with no client idle-exits. Once its socket is up, the keeper retains a
+        // passive lease for the life of the session and, if that lease is lost,
+        // starts or re-attaches a daemon with backoff (upstream #2293). It runs
+        // on its own thread, so the handshake below still never waits on the
+        // daemon.
+        let _lease_keeper =
+            codegraph_daemon::keep_session_attached(project_root.to_path_buf(), no_watch);
+        serve_direct_stdio(project, explicit_project_services(no_watch))
+    } else {
+        // If the child could not even be spawned, preserve the established
+        // in-process fallback. It takes writer.pid itself, so two fallback
+        // processes still cannot run competing watchers.
+        serve_direct(project, project_root, no_watch, explicit_path)
+    }
+}
+
+/// After an older install's daemon drained: start this install's daemon and
+/// proxy to it once its socket is up within the usual poll window; a slower
+/// start is served like a cold start, which attaches as soon as it can.
+fn serve_after_replacement(
+    project: Option<PathBuf>,
+    project_root: &Path,
+    no_watch: bool,
+    explicit_path: bool,
+) -> Result<()> {
+    if !spawn_shared_daemon_best_effort(project_root, no_watch) {
+        return serve_direct(project, project_root, no_watch, explicit_path);
+    }
+    poll_for_daemon_socket(project_root);
+    if let WarmAttach::Proxied(result) = proxy_to_running_daemon(project_root) {
+        return result;
+    }
+    let _lease_keeper =
+        codegraph_daemon::keep_session_attached(project_root.to_path_buf(), no_watch);
+    serve_direct_stdio(project, explicit_project_services(no_watch))
+}
+
+/// What attaching to a running daemon came to.
+enum WarmAttach {
+    /// The proxy bridged the session until one side closed.
+    Proxied(Result<()>),
+    /// The daemon is another build: its hello did not match this one.
+    VersionMismatch,
+    /// No usable socket, or the attach failed.
+    Unavailable,
+}
+
+/// Attach to an ALREADY-running shared daemon via the real proxy. On
+/// [`WarmAttach::Proxied`] the caller must NOT also serve direct; otherwise it
+/// may replace an older daemon or fall back to direct serving. Unchanged proxy
+/// semantics: `run_proxy` answers `initialize`/`tools/list` locally and
 /// forwards tool calls; its fd half-close / ppid-watchdog teardown is untouched.
-fn proxy_to_running_daemon(project_root: &Path) -> Option<Result<()>> {
-    let socket_path = codegraph_daemon::recorded_socket_path(project_root).ok()?;
-    if !socket_path.exists() {
+/// A mismatch is reported before `run_proxy` reads any client input.
+fn proxy_to_running_daemon(project_root: &Path) -> WarmAttach {
+    let Ok(socket_path) = codegraph_daemon::recorded_socket_path(project_root) else {
+        return WarmAttach::Unavailable;
+    };
+    if !codegraph_daemon::rendezvous_accepts(&socket_path) {
         tracing::debug!("proxy_to_running_daemon: daemon socket missing; falling back to direct");
         heal_stale_daemon_if_dead(project_root);
-        return None;
+        return WarmAttach::Unavailable;
     }
 
     let host_ppid = Some(codegraph_daemon::current_ppid());
@@ -3970,18 +4197,106 @@ fn proxy_to_running_daemon(project_root: &Path) -> Option<Result<()>> {
         BufReader::new(stdin.lock()),
         io::stdout(),
     ) {
-        Ok(codegraph_daemon::ProxyOutcome::Proxied) => Some(Ok(())),
+        Ok(codegraph_daemon::ProxyOutcome::Proxied) => WarmAttach::Proxied(Ok(())),
         Ok(codegraph_daemon::ProxyOutcome::VersionMismatch) => {
-            tracing::debug!(
-                "proxy_to_running_daemon: daemon version mismatch; falling back to direct"
-            );
-            None
+            tracing::debug!("proxy_to_running_daemon: daemon version mismatch");
+            WarmAttach::VersionMismatch
         }
         Err(err) => {
             tracing::debug!(error = %err, "proxy_to_running_daemon: proxy attach failed; falling back to direct");
             heal_stale_daemon_if_dead(project_root);
-            None
+            WarmAttach::Unavailable
         }
+    }
+}
+
+/// What a session did about a running daemon of another build.
+enum DaemonReplacement {
+    /// The daemon of an older release drained on request; the project's
+    /// rendezvous and writer slot are free for this install's daemon.
+    Drained,
+    /// The daemon keeps the project, for the reason given.
+    Kept(String),
+}
+
+/// Replace a running daemon only when it is an OLDER plain `X.Y.Z` release
+/// (upstream #2343): ask it to drain over its control channel, which is bound
+/// to this project's identity, so nothing is ever signalled by pid. A daemon of
+/// a newer release, a prerelease or an unknown version is never stopped, so two
+/// installs cannot take turns replacing each other's daemon, and one that does
+/// not acknowledge the drain keeps the project and its writer slot.
+fn replace_older_daemon(project_root: &Path) -> DaemonReplacement {
+    use codegraph_daemon::{DaemonPeer, ShutdownOutcome};
+
+    let hello = match codegraph_daemon::recorded_socket_path(project_root)
+        .and_then(|socket| codegraph_daemon::attach_to_daemon(&socket))
+    {
+        Ok(client) => client.hello,
+        Err(error) => {
+            return DaemonReplacement::Kept(format!(
+                "the project's daemon could not be reached ({error:#})"
+            ));
+        }
+    };
+    let version = match codegraph_daemon::classify_daemon_hello(&hello) {
+        DaemonPeer::OlderRelease { version } => version,
+        DaemonPeer::Same => {
+            return DaemonReplacement::Kept(
+                "the project's daemon is this build but did not accept the session".to_string(),
+            );
+        }
+        DaemonPeer::Foreign {
+            version: Some(version),
+        } => {
+            return DaemonReplacement::Kept(format!(
+                "the project's daemon runs codegraph {version}, which codegraph {VERSION} never \
+                 replaces"
+            ));
+        }
+        DaemonPeer::Foreign { version: None } => {
+            return DaemonReplacement::Kept(
+                "the project's daemon runs an unknown codegraph version, which is never replaced"
+                    .to_string(),
+            );
+        }
+    };
+    let identity = match index_paths(project_root) {
+        Ok(paths) => paths.project_identity().to_string(),
+        Err(error) => {
+            return DaemonReplacement::Kept(format!(
+                "the codegraph {version} daemon was left running: {error:#}"
+            ));
+        }
+    };
+    // The frame goes only to a daemon whose hello, on the shutdown connection
+    // itself, is the older release classified above: a daemon that took the
+    // project in between is never asked.
+    let classified = version.clone();
+    let is_classified = move |hello: &serde_json::Value| {
+        matches!(
+            codegraph_daemon::classify_daemon_hello(hello),
+            DaemonPeer::OlderRelease { version } if version == classified
+        )
+    };
+    match codegraph_daemon::request_daemon_shutdown_of(project_root, &identity, is_classified) {
+        Ok(ShutdownOutcome::Drained { pid }) => {
+            tracing::info!(
+                pid,
+                %version,
+                "replaced the daemon an older codegraph install left running"
+            );
+            DaemonReplacement::Drained
+        }
+        Ok(ShutdownOutcome::NoDaemon) => DaemonReplacement::Drained,
+        Ok(ShutdownOutcome::Unresponsive { pid, detail }) => DaemonReplacement::Kept(format!(
+            "the codegraph {version} daemon (pid {pid}) did not drain when asked ({detail})"
+        )),
+        Ok(ShutdownOutcome::Declined { pid, detail }) => DaemonReplacement::Kept(format!(
+            "the project's daemon (pid {pid}) is no longer the codegraph {version} one ({detail})"
+        )),
+        Err(error) => DaemonReplacement::Kept(format!(
+            "the codegraph {version} daemon could not be asked to drain ({error:#})"
+        )),
     }
 }
 
@@ -4039,7 +4354,8 @@ fn poll_for_daemon_socket(project_root: &Path) {
         // Re-read the lock each tick: the daemon rewrites the recorded socket to
         // its bind-fallback choice during startup, so the path can change while
         // we poll (D-Daemon-b).
-        if codegraph_daemon::recorded_socket_path(project_root).is_ok_and(|socket| socket.exists())
+        if codegraph_daemon::recorded_socket_path(project_root)
+            .is_ok_and(|socket| codegraph_daemon::rendezvous_accepts(&socket))
         {
             return;
         }
@@ -4264,7 +4580,7 @@ mod serve_mode_tests {
 mod prompt_hook_output_tests {
     use super::{
         CLAUDE_CODE_INLINE_HOOK_OUTPUT_LIMIT, PROMPT_HOOK_MAX_INJECT, cap_prompt_hook_injection,
-        is_task_notification_wrapper,
+        is_agent_message_wrapper, is_task_notification_wrapper,
     };
 
     #[test]
@@ -4283,6 +4599,33 @@ mod prompt_hook_output_tests {
         assert!(capped.is_char_boundary(capped.len()));
         assert!(capped.starts_with(&"界".repeat(PROMPT_HOOK_MAX_INJECT / 3)));
         assert!(capped.len() < CLAUDE_CODE_INLINE_HOOK_OUTPUT_LIMIT);
+    }
+
+    #[test]
+    fn agent_message_gate_takes_only_a_prompt_that_is_the_whole_envelope() {
+        assert!(is_agent_message_wrapper(
+            "<agent-message from=\"explorer\">Found Foo() in a.ts</agent-message>"
+        ));
+        assert!(is_agent_message_wrapper(
+            "\n <agent-message>report</agent-message>\n\n"
+        ));
+        assert!(is_agent_message_wrapper(
+            "<agent-message\n  from=\"a\"\n>multi\nline</agent-message>"
+        ));
+        assert!(is_agent_message_wrapper("<agent-message></agent-message>"));
+        assert!(!is_agent_message_wrapper(
+            "Please explain <agent-message> and what calls Foo()"
+        ));
+        assert!(!is_agent_message_wrapper(
+            "<agent-messages>report</agent-messages>"
+        ));
+        assert!(!is_agent_message_wrapper(
+            "<agent-message from=\"a\">report</agent-message>\nNow explain Foo()"
+        ));
+        assert!(!is_agent_message_wrapper(
+            "<agent-message from=\"a\">unterminated"
+        ));
+        assert!(!is_agent_message_wrapper("<agent-message from=\"a\""));
     }
 
     #[test]
@@ -5294,6 +5637,153 @@ impl Drop for BulkIndexPragmaGuard {
     }
 }
 
+/// Transparent huge pages off for this process while a full index runs (W10-07).
+///
+/// mimalloc asks for huge pages for its own memory, and a full index runs one
+/// heap per worker thread: each then holds whole 2 MiB pages, up to twice a
+/// small project's memory at 32 threads. A short command's small heap takes far
+/// fewer page faults with them, so only the index body turns them off. Pages
+/// already in place stay as they are, and the processes the index starts
+/// inherit the setting. The guard turns them back on only if it turned them
+/// off: a setting the process inherited, or one the kernel cannot read or
+/// change, is left as it was, so the work after the index (and any process
+/// started after it) gets the setting the command began with.
+#[cfg(all(target_os = "linux", any(test, target_env = "musl")))]
+struct HugePagesOff {
+    turned_off: bool,
+}
+
+#[cfg(all(target_os = "linux", any(test, target_env = "musl")))]
+impl HugePagesOff {
+    fn begin() -> Self {
+        let turned_off = thp_disabled() == Some(false) && set_thp_disabled(true);
+        Self { turned_off }
+    }
+}
+
+#[cfg(all(target_os = "linux", any(test, target_env = "musl")))]
+impl Drop for HugePagesOff {
+    fn drop(&mut self) {
+        if self.turned_off {
+            set_thp_disabled(false);
+        }
+    }
+}
+
+#[cfg(all(target_os = "linux", any(test, target_env = "musl")))]
+unsafe extern "C" {
+    fn prctl(option: std::ffi::c_int, ...) -> std::ffi::c_int;
+}
+
+#[cfg(all(target_os = "linux", any(test, target_env = "musl")))]
+const PR_SET_THP_DISABLE: std::ffi::c_int = 41;
+#[cfg(all(target_os = "linux", any(test, target_env = "musl")))]
+const PR_GET_THP_DISABLE: std::ffi::c_int = 42;
+
+/// Whether transparent huge pages are off for this process, or `None` when
+/// the kernel cannot say.
+#[cfg(all(target_os = "linux", any(test, target_env = "musl")))]
+fn thp_disabled() -> Option<bool> {
+    let zero: std::ffi::c_ulong = 0;
+    // SAFETY: PR_GET_THP_DISABLE requires its four arguments to be zero and
+    // returns the setting; no pointer is passed.
+    match unsafe { prctl(PR_GET_THP_DISABLE, zero, zero, zero, zero) } {
+        0 => Some(false),
+        1 => Some(true),
+        _ => None,
+    }
+}
+
+/// Turns transparent huge pages off or on for this process; whether the
+/// kernel accepted the change.
+#[cfg(all(target_os = "linux", any(test, target_env = "musl")))]
+fn set_thp_disabled(disabled: bool) -> bool {
+    let zero: std::ffi::c_ulong = 0;
+    // SAFETY: PR_SET_THP_DISABLE reads its second argument as a flag and
+    // requires the other three to be zero; no pointer is passed.
+    unsafe {
+        prctl(
+            PR_SET_THP_DISABLE,
+            std::ffi::c_ulong::from(disabled),
+            zero,
+            zero,
+            zero,
+        ) == 0
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod huge_pages_tests {
+    use super::{HugePagesOff, set_thp_disabled};
+
+    /// `THP_enabled` of `/proc/self/status`, which kernels before 5.0 omit.
+    fn thp_enabled() -> Option<String> {
+        let status = std::fs::read_to_string("/proc/self/status").ok()?;
+        status
+            .lines()
+            .find_map(|line| line.strip_prefix("THP_enabled:"))
+            .map(|value| value.trim().to_string())
+    }
+
+    /// Runs [`huge_pages_child`] in a child process with huge pages first
+    /// `initially` on or off, so no other test of this binary sees the setting
+    /// change or changes it underneath the check.
+    fn run_child(initially: &str) {
+        let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                "huge_pages_tests::huge_pages_child",
+                "--nocapture",
+            ])
+            .env("CODEGRAPH_TEST_HUGE_PAGES_CHILD", initially)
+            .output()
+            .expect("run the child test");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "child failed:\n{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            stdout.contains("1 passed"),
+            "the child test did not run:\n{stdout}"
+        );
+    }
+
+    /// The guard of [`super::index_project_inner`] turns huge pages off and
+    /// back on.
+    #[test]
+    fn full_index_turns_transparent_huge_pages_off() {
+        run_child("on");
+    }
+
+    /// A setting the process inherited stays off after the guard.
+    #[test]
+    fn full_index_keeps_inherited_huge_pages_off() {
+        run_child("off");
+    }
+
+    #[test]
+    fn huge_pages_child() {
+        let Some(initially) = std::env::var_os("CODEGRAPH_TEST_HUGE_PAGES_CHILD") else {
+            return;
+        };
+        if thp_enabled().is_none() {
+            println!("this kernel does not report THP_enabled");
+            return;
+        }
+        let inherited_off = initially == "off";
+        assert!(set_thp_disabled(inherited_off), "set the starting setting");
+        let before = if inherited_off { "0" } else { "1" };
+        assert_eq!(thp_enabled().as_deref(), Some(before), "before the guard");
+        {
+            let _off = HugePagesOff::begin();
+            assert_eq!(thp_enabled().as_deref(), Some("0"), "inside the guard");
+        }
+        assert_eq!(thp_enabled().as_deref(), Some(before), "after the guard");
+    }
+}
+
 fn index_project_inner(
     project: &Path,
     kind: codegraph_store::RebuildKind,
@@ -5302,6 +5792,8 @@ fn index_project_inner(
     diagnostics: &DiagnosticArgs,
     command: &'static str,
 ) -> Result<IndexSummary> {
+    #[cfg(all(target_os = "linux", target_env = "musl"))]
+    let _huge_pages_off = HugePagesOff::begin();
     let started = std::time::Instant::now();
     let paths = index_paths(project)?;
     let index_root = paths.current_root().to_path_buf();
@@ -5377,9 +5869,11 @@ fn index_project_inner(
     // write-capable target. The index root and DB are created by the rebuild
     // layer, so nothing below reconstructs a path or reopens the namespace.
     //
-    // `synchronous=OFF` + a larger cache/mmap window speed up the from-scratch bulk
-    // index. Their restore is part of the guard's EXPLICIT FALLIBLE `finish`, not a
-    // trailing statement, because every `?` below would skip a trailing restore.
+    // `synchronous=OFF` + a larger page cache speed up the from-scratch bulk index,
+    // which does not memory-map the file (the cache holds its pages, and a map
+    // counted them twice). Their restore is part of the guard's EXPLICIT FALLIBLE
+    // `finish`, not a trailing statement, because every `?` below would skip a
+    // trailing restore.
     // If the body bails out early, the guard's Drop only attempts state-gated
     // pragma repair/compaction/close and publishes nothing: the namespace stays
     // `phase=building` and unreadable.
@@ -5442,7 +5936,54 @@ fn index_project_inner(
     let parse_started = std::time::Instant::now();
 
     // `None` for an MPEG transport stream named `.ts`: video, not source (#1910).
-    type ParsePayload = Option<(String, FileRecord, ExtractionResult)>;
+    // A JavaScript-family module's surface rides along for the consumer to
+    // record once every file row is stored (W4a-F3), and so do what a C/C++
+    // file holds for its namespace row (W4-CPP-07) and a Java file's head row
+    // (W4-JVM-01).
+    type ParsePayload = Option<(
+        String,
+        FileRecord,
+        ExtractionResult,
+        Option<ModuleSurface>,
+        Option<codegraph_watch::cpp_namespace_rows::NamespaceScan>,
+        Option<codegraph_resolve::java_scope::HeadRow>,
+        Option<codegraph_resolve::kotlin_scope::KotlinSurface>,
+        Option<codegraph_resolve::scala_scope::ScalaSurface>,
+        Option<codegraph_resolve::csharp_types::CsharpSurface>,
+        Option<codegraph_resolve::member_types::MemberSurface>,
+        Option<codegraph_resolve::ruby_scope::HeadRow>,
+        Option<codegraph_resolve::cfml_scope::HeadRow>,
+        Option<codegraph_resolve::solidity_scope::HeadRow>,
+        Option<codegraph_resolve::swift_type_visibility::HeadRow>,
+        Option<codegraph_resolve::objc_scope::HeadRow>,
+        Option<codegraph_resolve::go_packages::HeadRow>,
+        Option<codegraph_resolve::php_scope::HeadRow>,
+        Option<codegraph_watch::class_heads::HeadsRow>,
+        Option<codegraph_resolve::lua_scope::LuaModuleRow>,
+        Option<codegraph_resolve::dart_scope::HeadRow>,
+        Option<codegraph_resolve::dart_libraries::LibraryRow>,
+    )>;
+    let mut surfaces: Vec<(String, ModuleSurface)> = Vec::new();
+    let mut namespace_scans: Vec<(String, codegraph_watch::cpp_namespace_rows::NamespaceScan)> =
+        Vec::new();
+    let mut head_rows: Vec<(String, codegraph_resolve::java_scope::HeadRow)> = Vec::new();
+    let mut kotlin_rows: Vec<(String, codegraph_resolve::kotlin_scope::KotlinSurface)> = Vec::new();
+    let mut scala_rows: Vec<(String, codegraph_resolve::scala_scope::ScalaSurface)> = Vec::new();
+    let mut csharp_rows: Vec<(String, codegraph_resolve::csharp_types::CsharpSurface)> = Vec::new();
+    let mut member_rows: Vec<(String, codegraph_resolve::member_types::MemberSurface)> = Vec::new();
+    let mut ruby_rows: Vec<(String, codegraph_resolve::ruby_scope::HeadRow)> = Vec::new();
+    let mut cfml_rows: Vec<(String, codegraph_resolve::cfml_scope::HeadRow)> = Vec::new();
+    let mut solidity_rows: Vec<(String, codegraph_resolve::solidity_scope::HeadRow)> = Vec::new();
+    let mut swift_rows: Vec<(String, codegraph_resolve::swift_type_visibility::HeadRow)> =
+        Vec::new();
+    let mut objc_rows: Vec<(String, codegraph_resolve::objc_scope::HeadRow)> = Vec::new();
+    let mut go_rows: Vec<(String, codegraph_resolve::go_packages::HeadRow)> = Vec::new();
+    let mut php_rows: Vec<(String, codegraph_resolve::php_scope::HeadRow)> = Vec::new();
+    let mut class_head_rows: Vec<(String, codegraph_watch::class_heads::HeadsRow)> = Vec::new();
+    let mut lua_rows: Vec<(String, codegraph_resolve::lua_scope::LuaModuleRow)> = Vec::new();
+    let mut dart_rows: Vec<(String, codegraph_resolve::dart_scope::HeadRow)> = Vec::new();
+    let mut dart_library_rows: Vec<(String, codegraph_resolve::dart_libraries::LibraryRow)> =
+        Vec::new();
     let schedule_tracker = tracker.clone();
     let parse_tracker = tracker.clone();
     let buffer_tracker = tracker.clone();
@@ -5473,7 +6014,7 @@ fn index_project_inner(
                 return Ok(None);
             };
             parse_tracker.stage(index, "prepare");
-            let language = detect_language_with(relative, &options.extensions);
+            let language = detect_language_of(relative, &source, &options.extensions);
             parse_tracker.file_info(index, metadata.len(), language);
 
             let result =
@@ -5496,11 +6037,86 @@ fn index_project_inner(
                 generated: detect_generated_file(relative, &hash_input),
             };
             parse_tracker.parsed(index, &result);
-            Ok(Some((relative.clone(), file, result)))
+            let surface = codegraph_watch::module_surfaces::surface_of(relative, language, &source);
+            let namespace_scan =
+                codegraph_watch::cpp_namespace_rows::scan_of(relative, language, &source);
+            let head_row = codegraph_watch::java_heads::row_of(language, &source, &result.nodes);
+            let kotlin_row = codegraph_watch::kotlin_surfaces::row_of(
+                relative,
+                language,
+                &source,
+                &result.nodes,
+            );
+            let scala_row =
+                codegraph_watch::scala_surfaces::row_of(relative, language, &source, &result.nodes);
+            let csharp_row =
+                codegraph_watch::csharp_surfaces::row_of(language, &source, &result.nodes);
+            let member_row =
+                codegraph_watch::member_surfaces::row_of(language, &source, &result.nodes);
+            let ruby_row = codegraph_watch::ruby_heads::row_of(language, &source, &result.nodes);
+            let cfml_row =
+                codegraph_watch::cfml_heads::row_of(relative, language, &source, &result.nodes);
+            let solidity_row =
+                codegraph_watch::solidity_heads::row_of(language, &source, &result.nodes);
+            let swift_row = codegraph_watch::swift_heads::row_of(language, &source, &result.nodes);
+            let objc_row = codegraph_watch::objc_heads::row_of(language, &source, &result.nodes);
+            let go_row = codegraph_watch::go_heads::row_of(language, &source, &result.nodes);
+            let php_row = codegraph_watch::php_heads::row_of(language, &source, &result.nodes);
+            let class_head_row =
+                codegraph_watch::class_heads::row_of(language, &source, &result.nodes);
+            let lua_row = codegraph_watch::lua_modules::row_of(language, &source, &result.nodes);
+            let dart_row = codegraph_watch::dart_heads::row_of(language, &source, &result.nodes);
+            let dart_library_row = codegraph_watch::dart_libraries::row_of(language, &source);
+            Ok(Some((
+                relative.clone(),
+                file,
+                result,
+                surface,
+                namespace_scan,
+                head_row,
+                kotlin_row,
+                scala_row,
+                csharp_row,
+                member_row,
+                ruby_row,
+                cfml_row,
+                solidity_row,
+                swift_row,
+                objc_row,
+                go_row,
+                php_row,
+                class_head_row,
+                lua_row,
+                dart_row,
+                dart_library_row,
+            )))
         },
         |buffered| buffer_tracker.buffered(buffered),
         |index, payload| {
-            let Some((_relative, file, mut result)) = payload else {
+            let Some((
+                relative,
+                file,
+                mut result,
+                surface,
+                namespace_scan,
+                head_row,
+                kotlin_row,
+                scala_row,
+                csharp_row,
+                member_row,
+                ruby_row,
+                cfml_row,
+                solidity_row,
+                swift_row,
+                objc_row,
+                go_row,
+                php_row,
+                class_head_row,
+                lua_row,
+                dart_row,
+                dart_library_row,
+            )) = payload
+            else {
                 files_not_source += 1;
                 persist_tracker.persisted(index);
                 return Ok(());
@@ -5539,6 +6155,60 @@ fn index_project_inner(
                 persist_tracker.failed(index, &error);
                 return Err(error);
             }
+            if let Some(scan) = namespace_scan {
+                namespace_scans.push((relative.clone(), scan));
+            }
+            if let Some(row) = head_row {
+                head_rows.push((relative.clone(), row));
+            }
+            if let Some(row) = kotlin_row {
+                kotlin_rows.push((relative.clone(), row));
+            }
+            if let Some(row) = scala_row {
+                scala_rows.push((relative.clone(), row));
+            }
+            if let Some(row) = csharp_row {
+                csharp_rows.push((relative.clone(), row));
+            }
+            if let Some(row) = member_row {
+                member_rows.push((relative.clone(), row));
+            }
+            if let Some(row) = ruby_row {
+                ruby_rows.push((relative.clone(), row));
+            }
+            if let Some(row) = cfml_row {
+                cfml_rows.push((relative.clone(), row));
+            }
+            if let Some(row) = solidity_row {
+                solidity_rows.push((relative.clone(), row));
+            }
+            if let Some(row) = swift_row {
+                swift_rows.push((relative.clone(), row));
+            }
+            if let Some(row) = objc_row {
+                objc_rows.push((relative.clone(), row));
+            }
+            if let Some(row) = go_row {
+                go_rows.push((relative.clone(), row));
+            }
+            if let Some(row) = php_row {
+                php_rows.push((relative.clone(), row));
+            }
+            if let Some(row) = class_head_row {
+                class_head_rows.push((relative.clone(), row));
+            }
+            if let Some(row) = lua_row {
+                lua_rows.push((relative.clone(), row));
+            }
+            if let Some(row) = dart_row {
+                dart_rows.push((relative.clone(), row));
+            }
+            if let Some(row) = dart_library_row {
+                dart_library_rows.push((relative.clone(), row));
+            }
+            if let Some(surface) = surface {
+                surfaces.push((relative, surface));
+            }
             persist_tracker.persisted(index);
             Ok(())
         },
@@ -5569,6 +6239,79 @@ fn index_project_inner(
         store.upsert_nodes(&pending_nodes)?;
     }
     drop(pending_nodes);
+    // Every file row is stored: the module-surface rows can resolve what
+    // their barrels forward (W4a-F3).
+    codegraph_watch::module_surfaces::write_index_rows(
+        &store,
+        project,
+        options.max_file_size,
+        &surfaces,
+    )?;
+    drop(surfaces);
+    codegraph_watch::cpp_namespace_rows::write_index_rows(&store, &mut namespace_scans)?;
+    drop(namespace_scans);
+    codegraph_watch::java_heads::write_index_rows(&store, &mut head_rows)?;
+    drop(head_rows);
+    codegraph_watch::kotlin_surfaces::write_index_rows(&store, &mut kotlin_rows)?;
+    drop(kotlin_rows);
+    codegraph_watch::scala_surfaces::write_index_rows(&store, &mut scala_rows)?;
+    drop(scala_rows);
+    codegraph_watch::csharp_surfaces::write_index_rows(&store, &mut csharp_rows)?;
+    drop(csharp_rows);
+    codegraph_watch::member_surfaces::write_index_rows(&store, &mut member_rows)?;
+    drop(member_rows);
+    codegraph_watch::ruby_heads::write_index_rows(&store, &mut ruby_rows)?;
+    drop(ruby_rows);
+    codegraph_watch::cfml_heads::write_index_rows(&store, &mut cfml_rows)?;
+    drop(cfml_rows);
+    codegraph_watch::solidity_heads::write_index_rows(&store, &mut solidity_rows)?;
+    codegraph_watch::shopify_themes::write_index_row(&store, project)?;
+    drop(solidity_rows);
+    codegraph_watch::swift_heads::write_index_rows(&store, &mut swift_rows)?;
+    drop(swift_rows);
+    codegraph_watch::objc_heads::write_index_rows(&store, &mut objc_rows)?;
+    drop(objc_rows);
+    codegraph_watch::go_heads::write_index_rows(&store, &mut go_rows)?;
+    drop(go_rows);
+    codegraph_watch::php_heads::write_index_rows(&store, &mut php_rows)?;
+    drop(php_rows);
+    codegraph_watch::class_heads::write_index_rows(&store, &mut class_head_rows)?;
+    drop(class_head_rows);
+    codegraph_watch::lua_modules::write_index_rows(&store, &mut lua_rows)?;
+    drop(lua_rows);
+    codegraph_watch::dart_heads::write_index_rows(&store, &mut dart_rows)?;
+    drop(dart_rows);
+    codegraph_watch::dart_libraries::write_index_rows(&store, &mut dart_library_rows)?;
+    drop(dart_library_rows);
+    codegraph_watch::dart_libraries::write_pubspec_rows(&store, project)?;
+    // A fresh index leaves no C/C++ (W4-CPP-04), Java (W4-JVM-01), Kotlin
+    // (W4-JVM-03), Scala (W4-SC-01), C# (W4-CS-01), member-walk (W4-CS-03)
+    // Ruby (W4-RB-01), CFML (W4-CF-01), Swift (W4-SW-01), Objective-C
+    // (W4-SW-04), Go (W4-GO-01), Rust receiver (W4-RS-03), PHP
+    // (W4-PHP-01), case-folded (W4-PHP-03), Lua (W4-LUA-01), R base-binding
+    // (W4-R-01), Dart head (W4-DART-01) or Dart library (W4-DART-02)
+    // dependent unrefreshed.
+    codegraph_watch::cpp_dependents::write_marker(&store)?;
+    codegraph_watch::java_heads::write_marker(&store)?;
+    codegraph_watch::kotlin_surfaces::write_marker(&store)?;
+    codegraph_watch::scala_surfaces::write_marker(&store)?;
+    codegraph_watch::csharp_surfaces::write_marker(&store)?;
+    codegraph_watch::member_surfaces::write_marker(&store)?;
+    codegraph_watch::ruby_heads::write_marker(&store)?;
+    codegraph_watch::cfml_heads::write_marker(&store)?;
+    codegraph_watch::solidity_heads::write_marker(&store)?;
+    codegraph_watch::shopify_themes::write_marker(&store)?;
+    codegraph_watch::swift_heads::write_marker(&store)?;
+    codegraph_watch::objc_heads::write_marker(&store)?;
+    codegraph_watch::go_heads::write_marker(&store)?;
+    codegraph_watch::rust_receivers::write_marker(&store)?;
+    codegraph_watch::php_heads::write_marker(&store)?;
+    codegraph_watch::class_heads::write_marker(&store)?;
+    codegraph_watch::case_folded::write_marker(&store)?;
+    codegraph_watch::lua_modules::write_marker(&store)?;
+    codegraph_watch::r_bindings::write_marker(&store)?;
+    codegraph_watch::dart_heads::write_marker(&store)?;
+    codegraph_watch::dart_libraries::write_marker(&store)?;
     finish_phase(&pb, "Persisted nodes");
     diagnostic_run.phase_end("node_write", node_write_started.elapsed(), json!({}));
 
@@ -5621,6 +6364,13 @@ fn index_project_inner(
         let context = resolver.store_context(&store);
         resolver.initialize(&context);
     }
+    // What resolution reads of the control files, and the frameworks it
+    // detected (W5-06), once every file row is stored.
+    codegraph_watch::control_inputs::write_index_rows(
+        &store,
+        project,
+        &resolver.framework_names(),
+    )?;
     if resolver.has_framework_resolvers() {
         let relative_files = store
             .all_files()?
@@ -5722,6 +6472,9 @@ fn index_project_inner(
         framework_finalize_started.elapsed(),
         json!({}),
     );
+    // Every reference is now in `unresolved_refs` or `resolved_refs`
+    // (W5-09e).
+    codegraph_watch::resolved_refs::write_marker(&store, &options, &framework_context)?;
     store.set_project_metadata("indexed_with_version", VERSION)?;
     codegraph_watch::record_followed_links(&store, &followed_links)?;
     if let Some(capture) = git_capture {
@@ -7222,6 +7975,9 @@ struct FileOutput<'a> {
     language: Language,
     node_count: i64,
     size: i64,
+    /// The errors extraction recorded for the file (upstream #2336); empty when
+    /// it parsed cleanly.
+    errors: &'a [String],
 }
 
 impl<'a> From<&'a FileRecord> for FileOutput<'a> {
@@ -7231,6 +7987,7 @@ impl<'a> From<&'a FileRecord> for FileOutput<'a> {
             language: file.language,
             node_count: file.node_count,
             size: file.size,
+            errors: &file.errors,
         }
     }
 }

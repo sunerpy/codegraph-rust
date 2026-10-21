@@ -193,7 +193,8 @@ jobs:
 
   # FSEvents is the one native-recursive watcher backend no other job runs:
   # Linux uses inotify and Windows ReadDirectoryChangesW. This job runs the
-  # symlink-following scan and watcher tests on macOS (#770).
+  # symlink-following scan and watcher tests on macOS (#770), and the burst
+  # that may drop or coalesce events (#1397).
   macos-watcher:
     name: macOS Watcher
     needs: workspace-version
@@ -228,6 +229,9 @@ jobs:
         run: |
           cargo test -p codegraph-extract --locked --test scan_symlinks
           cargo test -p codegraph-watch --locked symlink
+
+      - name: Run the event-loss convergence test
+        run: cargo test -p codegraph-watch --locked --test event_loss
 
   ui:
     name: UI

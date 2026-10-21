@@ -132,7 +132,7 @@ function boundary(over: Partial<WireFlowBoundary> = {}): WireFlowBoundary {
 function mod(id: string, over: Partial<WireMapModule> = {}): WireMapModule {
   return {
     id,
-    label: id.slice(id.lastIndexOf('/') + 1) || id,
+    label: over.label ?? id,
     files: over.files ?? 3,
     symbols: over.symbols ?? 30,
     languages: over.languages ?? [{ language: 'typescript', files: 3 }],
@@ -449,6 +449,17 @@ describe('mapSvg', () => {
     expect(svg).toContain('>1218 symbols · 54 files</text>');
     // Tests were filtered out of the layout, so they are not in the image.
     expect(svg).not.toContain('>__tests__</text>');
+  });
+
+  it('writes the label the canvas box shows, not the id it was too narrow for', () => {
+    const id = 'src/main/java/org/springframework/samples/petclinic/owner';
+    const elided = buildMapLayout(
+      { modules: [mod(id, { label: 'src/main/…/petclinic/owner' })], links: [] },
+      { includeTests: false }
+    );
+    const svg = mapSvg(elided);
+    expect(svg).toContain('>src/main/…/petclinic/owner</text>');
+    expect(svg).not.toContain('springframework');
   });
 
   it('exports the weight bar the canvas draws, scaled the same way', () => {

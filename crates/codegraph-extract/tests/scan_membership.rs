@@ -165,3 +165,60 @@ fn directories_missing_paths_and_symlinks() {
     fs::remove_dir_all(&root).ok();
     fs::remove_dir_all(&outside).ok();
 }
+
+/// The repository's own `.git/info/exclude` prunes the scan like a root
+/// `.gitignore` (upstream #1728). The root `.gitignore` is read after it, so its
+/// `!` lines re-include what the exclude file ignored, as in git.
+#[test]
+fn the_repositorys_info_exclude_prunes_the_scan() {
+    let root = sandbox("info-exclude");
+    fs::create_dir_all(root.join(".git/info")).unwrap();
+    fs::write(
+        root.join(".git/info/exclude"),
+        "# local excludes\nscratch/\n*.local.ts\nkept/\n",
+    )
+    .unwrap();
+    fs::write(root.join(".gitignore"), "!kept/\n").unwrap();
+    for file in [
+        "src/app.ts",
+        "src/debug.local.ts",
+        "scratch/try.ts",
+        "kept/again.ts",
+    ] {
+        touch(&root, file);
+    }
+
+    let options = ExtractOptions::default();
+    let scanned = scan_project(&root, &options).expect("scan");
+    assert_eq!(scanned, ["kept/again.ts", "src/app.ts"]);
+    for file in files_on_disk(&root) {
+        let membership = scan_membership(&root, &options, &file, false);
+        assert_eq!(
+            membership == Membership::Admitted,
+            scanned.contains(&file),
+            "{file}: membership {membership:?} agrees with the scan"
+        );
+    }
+    fs::remove_dir_all(&root).ok();
+}
+
+/// Only the project's own repository counts: a `.git` file (a linked worktree
+/// or submodule) points outside the project, and is never followed.
+#[test]
+fn a_git_file_pointing_elsewhere_contributes_no_excludes() {
+    let root = sandbox("info-exclude-gitfile");
+    let elsewhere = sandbox("info-exclude-elsewhere");
+    fs::create_dir_all(elsewhere.join("info")).unwrap();
+    fs::write(elsewhere.join("info/exclude"), "src/\n").unwrap();
+    fs::write(
+        root.join(".git"),
+        format!("gitdir: {}\n", elsewhere.display()),
+    )
+    .unwrap();
+    touch(&root, "src/app.ts");
+
+    let scanned = scan_project(&root, &ExtractOptions::default()).expect("scan");
+    assert_eq!(scanned, ["src/app.ts"]);
+    fs::remove_dir_all(&root).ok();
+    fs::remove_dir_all(&elsewhere).ok();
+}

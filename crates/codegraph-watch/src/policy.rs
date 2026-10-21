@@ -34,11 +34,12 @@ pub struct WatchPolicy {
     /// uses, never [`rule_matches`] — whose `*` form compares BASENAMES, so it
     /// could never match a `res/values*` prefix against `res/values/strings.xml`.
     ignore_paths: Vec<String>,
-    /// The root `.gitignore` — the NEGOTIABLE tail of the last-match-wins stream
-    /// (`ignore_paths` and `exclude` first, it last, mirroring the scan), so a
-    /// `!pattern` line here re-includes what an `ignore_paths`, `exclude`, or
-    /// earlier `.gitignore` line dropped. It is the scan's own git-rules
-    /// matcher, so the two read every `.gitignore` line identically.
+    /// The root `.gitignore`, with `.git/info/exclude` read ahead of it — the
+    /// NEGOTIABLE tail of the last-match-wins stream (`ignore_paths` and
+    /// `exclude` first, it last, mirroring the scan), so a `!pattern` line here
+    /// re-includes what an `ignore_paths`, `exclude`, or earlier line dropped.
+    /// It is the scan's own git-rules matcher, so the two read every line
+    /// identically.
     gitignore: RootGitignore,
     include: Vec<String>,
     exclude: Vec<String>,
@@ -134,6 +135,31 @@ impl WatchPolicy {
 
     pub fn allows_file_path(&self, relative: &str) -> bool {
         !self.is_always_ignored(relative) && !self.is_ignored(relative, false)
+    }
+
+    /// Whether `relative` is a Shopify theme marker a sync must hear of,
+    /// ignored or not (W4-LIQ-01): a marker counts wherever it is, since it
+    /// only tells a theme's JSON templates apart.
+    pub fn may_mark_a_theme(&self, relative: &str) -> bool {
+        !self.is_always_ignored(relative)
+            && codegraph_extract::embedded::shopify::is_shopify_theme_marker(relative)
+    }
+
+    /// Whether `relative` is a control file a resolver reads, or a Tauri
+    /// config marker, which a sync must hear of though it is no source file
+    /// (W5-06), ignored or not: the readers read it all the same.
+    pub fn is_project_control_file(&self, relative: &str) -> bool {
+        !self.is_always_ignored(relative) && crate::control_inputs::is_control_file(relative)
+    }
+
+    /// Whether the directory `relative`, which this policy does not watch, is
+    /// still watched (not below it) for a Shopify theme marker: a `config/` or
+    /// `layout/` directory, in any case (W4-LIQ-01).
+    pub fn watches_for_theme_markers(&self, relative: &str) -> bool {
+        !self.is_always_ignored(relative)
+            && codegraph_extract::embedded::shopify::is_shopify_marker_folder(
+                relative.rsplit('/').next().unwrap_or(relative),
+            )
     }
 
     pub fn should_watch_dir(&self, relative: &str) -> bool {

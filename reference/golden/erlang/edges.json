@@ -1,17 +1,5 @@
 [
   {
-    "col": 0,
-    "kind": "imports",
-    "line": 4,
-    "metadata": {
-      "confidence": 0.9,
-      "resolvedBy": "exact-match"
-    },
-    "provenance": null,
-    "source": "namespace:998d8cbb5759a2fdb05d10d3a9fc6bd9",
-    "target": "import:5b8fe7f4d9d9c305e6f7961f26c5eec9"
-  },
-  {
     "col": 10,
     "kind": "calls",
     "line": 5,

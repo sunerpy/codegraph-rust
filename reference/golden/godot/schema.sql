@@ -111,6 +111,26 @@ CREATE INDEX idx_unresolved_name ON unresolved_refs(reference_name);
 CREATE INDEX idx_unresolved_file_path ON unresolved_refs(file_path);
 CREATE INDEX idx_unresolved_from_name ON unresolved_refs(from_node_id, reference_name);
 CREATE INDEX idx_edges_provenance ON edges(provenance);
+CREATE INDEX idx_edges_synthesis_site ON edges(CASE WHEN json_valid(metadata) THEN json_extract(metadata, '$.registeredAt') END)
+WHERE CASE WHEN json_valid(metadata) THEN json_extract(metadata, '$.synthesizedBy') END IS NOT NULL;
+CREATE TABLE synthesis_inputs (
+file_path TEXT PRIMARY KEY REFERENCES files(path) ON DELETE CASCADE
+);
+CREATE TABLE resolved_refs (
+id INTEGER PRIMARY KEY,
+from_node_id TEXT NOT NULL,
+reference_name TEXT NOT NULL,
+reference_kind TEXT NOT NULL,
+line INTEGER NOT NULL,
+col INTEGER NOT NULL,
+candidates TEXT, -- JSON array
+file_path TEXT NOT NULL DEFAULT '',
+language TEXT NOT NULL DEFAULT 'unknown',
+reference_subkind TEXT,
+FOREIGN KEY (from_node_id) REFERENCES nodes(id) ON DELETE CASCADE
+);
+CREATE INDEX idx_resolved_refs_site ON resolved_refs(from_node_id, line, col);
+CREATE INDEX idx_resolved_refs_file_path ON resolved_refs(file_path);
 CREATE TABLE project_metadata (
 key TEXT PRIMARY KEY,
 value TEXT NOT NULL,

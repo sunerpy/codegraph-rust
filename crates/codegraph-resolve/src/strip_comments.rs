@@ -24,6 +24,8 @@ pub enum CommentLang {
     Swift,
     Go,
     Rust,
+    /// C and C++ (upstream's `c` / `cpp`).
+    Cpp,
 }
 
 /// Replace comments + string literals with spaces, preserving offsets.
@@ -38,7 +40,7 @@ pub fn strip_comments_for_regex(content: &str, lang: CommentLang) -> String {
         CommentLang::Go => strip_go(content),
         // allowSingleQuoteStrings only for JS/TS (strip-comments.ts:55).
         CommentLang::JavaScript | CommentLang::TypeScript => strip_c_style(content, true),
-        CommentLang::Java | CommentLang::CSharp | CommentLang::Swift => {
+        CommentLang::Java | CommentLang::CSharp | CommentLang::Swift | CommentLang::Cpp => {
             strip_c_style(content, false)
         }
     }
@@ -203,55 +205,65 @@ fn strip_ruby(src: &str) -> String {
     out.into_iter().collect()
 }
 
-/// `stripCStyle` (`strip-comments.ts:213-261`).
+/// `stripCStyle` (`strip-comments.ts:213-261`), read over bytes: every
+/// delimiter it looks for is ASCII, which no byte of a multi-byte character
+/// equals, so it decides what reading characters decides, and a blanked
+/// range becomes one space per character, its newlines kept. A character
+/// array of the text took four bytes a character twice over: a JS/TS
+/// function scan strips the function's code up to each reference in it, and
+/// typescript-large's `createTypeChecker` is three megabytes (W4d end).
 fn strip_c_style(src: &str, allow_single_quote_strings: bool) -> String {
-    let chars: Vec<char> = src.chars().collect();
-    let mut out = chars.clone();
-    let n = chars.len();
+    let bytes = src.as_bytes();
+    let n = bytes.len();
+    let mut out = String::with_capacity(n);
+    // Bytes of `src` before this one are in `out`.
+    let mut copied = 0;
     let mut i = 0;
     while i < n {
-        let c = chars[i];
-        let c2 = chars.get(i + 1).copied().unwrap_or('\0');
+        let c = bytes[i];
+        let c2 = bytes.get(i + 1).copied().unwrap_or(0);
 
         // Block comment.
-        if c == '/' && c2 == '*' {
+        if c == b'/' && c2 == b'*' {
             let start = i;
             i += 2;
-            while i < n && !(chars[i] == '*' && chars.get(i + 1).copied() == Some('/')) {
+            while i < n && !(bytes[i] == b'*' && bytes.get(i + 1) == Some(&b'/')) {
                 i += 1;
             }
             if i < n {
                 i += 2;
             }
-            blank_range(&mut out, &chars, start, i);
+            blank_into(&mut out, src, &mut copied, start, i);
             continue;
         }
 
         // Line comment.
-        if c == '/' && c2 == '/' {
+        if c == b'/' && c2 == b'/' {
             let start = i;
-            while i < n && chars[i] != '\n' {
+            while i < n && bytes[i] != b'\n' {
                 i += 1;
             }
-            blank_range(&mut out, &chars, start, i);
+            blank_into(&mut out, src, &mut copied, start, i);
             continue;
         }
 
         // String literals.
-        if c == '"' || (allow_single_quote_strings && c == '\'') || c == '`' {
+        if c == b'"' || (allow_single_quote_strings && c == b'\'') || c == b'`' {
             let quote = c;
             i += 1;
-            while i < n && chars[i] != quote {
-                if chars[i] == '\\' && i + 1 < n {
+            while i < n && bytes[i] != quote {
+                // The escaped character's first byte; any more are bytes no
+                // delimiter equals.
+                if bytes[i] == b'\\' && i + 1 < n {
                     i += 2;
                     continue;
                 }
-                if quote != '`' && chars[i] == '\n' {
+                if quote != b'`' && bytes[i] == b'\n' {
                     break;
                 }
                 i += 1;
             }
-            if i < n && chars[i] == quote {
+            if i < n && bytes[i] == quote {
                 i += 1;
             }
             continue;
@@ -259,7 +271,20 @@ fn strip_c_style(src: &str, allow_single_quote_strings: bool) -> String {
 
         i += 1;
     }
-    out.into_iter().collect()
+    out.push_str(&src[copied..]);
+    out
+}
+
+/// Copy `src[*copied..start]` to `out`, then `src[start..end]` with each
+/// character but a newline as a space ([`blank_range`] over a string).
+fn blank_into(out: &mut String, src: &str, copied: &mut usize, start: usize, end: usize) {
+    out.push_str(&src[*copied..start]);
+    out.extend(
+        src[start..end]
+            .chars()
+            .map(|c| if c == '\n' { '\n' } else { ' ' }),
+    );
+    *copied = end;
 }
 
 /// `stripPhp` (`strip-comments.ts:265-321`).
@@ -509,61 +534,68 @@ fn starts_with(chars: &[char], at: usize, needle: &str) -> bool {
 /// literal. Like that stripper it replaces character for character, so the
 /// composed view keeps every line's character offsets.
 pub fn blank_string_contents(text: &str) -> String {
-    let chars: Vec<char> = text.chars().collect();
-    let mut out = chars.clone();
-    let n = chars.len();
-    // Byte offset of each char, for the regex-start look-behind window.
-    let offsets: Vec<usize> = text.char_indices().map(|(offset, _)| offset).collect();
+    // Read over bytes, as [`strip_c_style`]: the delimiters are ASCII, and a
+    // blanked character is one space whatever its length. The character and
+    // offset arrays took sixteen bytes a character, and module facts blank
+    // whole files, typescript-large's three-megabyte checker among them.
+    let bytes = text.as_bytes();
+    let n = bytes.len();
+    let char_len = |at: usize| text[at..].chars().next().map_or(1, char::len_utf8);
+    let mut out = String::with_capacity(n);
+    // Bytes of `text` before this one are in `out`.
+    let mut copied = 0;
     let mut i = 0;
     while i < n {
-        let c = chars[i];
-        if c == '/' && regex_literal_may_start(&text[..offsets[i]]) {
+        let c = bytes[i];
+        if c == b'/' && regex_literal_may_start(&text[..i]) {
             let mut end = i + 1;
             let mut in_class = false;
-            while end < n && chars[end] != '\n' {
-                match chars[end] {
-                    '\\' => {
+            while end < n && bytes[end] != b'\n' {
+                match bytes[end] {
+                    b'\\' => {
                         end += 2;
                         continue;
                     }
-                    '[' => in_class = true,
-                    ']' => in_class = false,
-                    '/' if !in_class => break,
+                    b'[' => in_class = true,
+                    b']' => in_class = false,
+                    b'/' if !in_class => break,
                     _ => {}
                 }
                 end += 1;
             }
-            if end < n && chars[end] == '/' {
+            if end < n && bytes[end] == b'/' {
                 i = end + 1;
                 continue;
             }
         }
-        if c == '"' || c == '\'' || c == '`' {
+        if c == b'"' || c == b'\'' || c == b'`' {
             let quote = c;
             i += 1;
-            while i < n && chars[i] != quote {
-                if chars[i] == '\\' && i + 1 < n {
-                    out[i] = ' ';
-                    out[i + 1] = ' ';
-                    i += 2;
+            out.push_str(&text[copied..i]);
+            while i < n && bytes[i] != quote {
+                if bytes[i] == b'\\' && i + 1 < n {
+                    // The backslash and the character it escapes, a newline
+                    // included.
+                    out.push_str("  ");
+                    i += 1 + char_len(i + 1);
                     continue;
                 }
-                if quote != '`' && chars[i] == '\n' {
+                if quote != b'`' && bytes[i] == b'\n' {
                     break;
                 }
-                if chars[i] != '\n' {
-                    out[i] = ' ';
-                }
-                i += 1;
+                out.push(if bytes[i] == b'\n' { '\n' } else { ' ' });
+                i += char_len(i);
             }
-            if i < n && chars[i] == quote {
+            copied = i;
+            if i < n && bytes[i] == quote {
                 i += 1;
             }
             continue;
         }
         i += 1;
     }
-    out.into_iter().collect()
+    out.push_str(&text[copied..]);
+    out
 }
 
 /// Whether a `/` whose preceding text is `before` opens a regex literal:
@@ -612,6 +644,215 @@ fn regex_literal_may_start(before: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The character-array `blankStringContents` [`blank_string_contents`]
+    /// replaced, kept as its oracle.
+    fn blank_string_contents_chars(text: &str) -> String {
+        let chars: Vec<char> = text.chars().collect();
+        let mut out = chars.clone();
+        let n = chars.len();
+        // Byte offset of each char, for the regex-start look-behind window.
+        let offsets: Vec<usize> = text.char_indices().map(|(offset, _)| offset).collect();
+        let mut i = 0;
+        while i < n {
+            let c = chars[i];
+            if c == '/' && regex_literal_may_start(&text[..offsets[i]]) {
+                let mut end = i + 1;
+                let mut in_class = false;
+                while end < n && chars[end] != '\n' {
+                    match chars[end] {
+                        '\\' => {
+                            end += 2;
+                            continue;
+                        }
+                        '[' => in_class = true,
+                        ']' => in_class = false,
+                        '/' if !in_class => break,
+                        _ => {}
+                    }
+                    end += 1;
+                }
+                if end < n && chars[end] == '/' {
+                    i = end + 1;
+                    continue;
+                }
+            }
+            if c == '"' || c == '\'' || c == '`' {
+                let quote = c;
+                i += 1;
+                while i < n && chars[i] != quote {
+                    if chars[i] == '\\' && i + 1 < n {
+                        out[i] = ' ';
+                        out[i + 1] = ' ';
+                        i += 2;
+                        continue;
+                    }
+                    if quote != '`' && chars[i] == '\n' {
+                        break;
+                    }
+                    if chars[i] != '\n' {
+                        out[i] = ' ';
+                    }
+                    i += 1;
+                }
+                if i < n && chars[i] == quote {
+                    i += 1;
+                }
+                continue;
+            }
+            i += 1;
+        }
+        out.into_iter().collect()
+    }
+
+    /// The character-array `stripCStyle` [`strip_c_style`] replaced, kept as
+    /// its oracle.
+    fn strip_c_style_chars(src: &str, allow_single_quote_strings: bool) -> String {
+        let chars: Vec<char> = src.chars().collect();
+        let mut out = chars.clone();
+        let n = chars.len();
+        let mut i = 0;
+        while i < n {
+            let c = chars[i];
+            let c2 = chars.get(i + 1).copied().unwrap_or('\0');
+
+            // Block comment.
+            if c == '/' && c2 == '*' {
+                let start = i;
+                i += 2;
+                while i < n && !(chars[i] == '*' && chars.get(i + 1).copied() == Some('/')) {
+                    i += 1;
+                }
+                if i < n {
+                    i += 2;
+                }
+                blank_range(&mut out, &chars, start, i);
+                continue;
+            }
+
+            // Line comment.
+            if c == '/' && c2 == '/' {
+                let start = i;
+                while i < n && chars[i] != '\n' {
+                    i += 1;
+                }
+                blank_range(&mut out, &chars, start, i);
+                continue;
+            }
+
+            // String literals.
+            if c == '"' || (allow_single_quote_strings && c == '\'') || c == '`' {
+                let quote = c;
+                i += 1;
+                while i < n && chars[i] != quote {
+                    if chars[i] == '\\' && i + 1 < n {
+                        i += 2;
+                        continue;
+                    }
+                    if quote != '`' && chars[i] == '\n' {
+                        break;
+                    }
+                    i += 1;
+                }
+                if i < n && chars[i] == quote {
+                    i += 1;
+                }
+                continue;
+            }
+
+            i += 1;
+        }
+        out.into_iter().collect()
+    }
+
+    /// The byte stripper and string blanker write what the character ones
+    /// did: comments and strings around multi-byte characters, an escaped multi-byte
+    /// character, unterminated comments and strings, CRLF, and every file of
+    /// the extraction fixtures and of this crate's sources.
+    #[test]
+    fn c_style_bytes_strip_as_the_character_version_did() {
+        let samples = [
+            "",
+            "/",
+            "/*",
+            "//",
+            "a /* é ü */ b // ß\nc",
+            "x = \"é // not\"; // ü\ny = 'ç /* no */'; /* open é",
+            "s = \"\\é\"; t = '\\'; u = `\\`",
+            "`multi\nline é // kept`\n// gone ü",
+            "a\r\n// cr é\r\nb /* x\r\n y */ c",
+            "unterminated \"string é\nnext // c",
+            "tail \\",
+            "q = '\\é' // ü",
+            "😀 /* 😀 */ \"😀\" // 😀",
+        ];
+        let blank_samples = [
+            "x = 'é\\ü' + \"a\\\nb\" + `t\né ${y}`;",
+            "r = /[\"']é/g; s = 'q'; t = a / b / 'c';",
+            "return /é\\/'/.test(s) && 'ü'",
+            "'unterminated é\nnext 'x'",
+            "`open template é",
+            "s = '\\",
+            "😀 '😀' \"😀\\😀\" `😀`",
+        ];
+        for sample in samples.iter().chain(&blank_samples) {
+            for quotes in [true, false] {
+                assert_eq!(
+                    strip_c_style(sample, quotes),
+                    strip_c_style_chars(sample, quotes),
+                    "{sample:?}"
+                );
+            }
+            assert_eq!(
+                blank_string_contents(sample),
+                blank_string_contents_chars(sample),
+                "{sample:?}"
+            );
+        }
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut dirs = vec![
+            manifest.join("src"),
+            manifest.join("tests"),
+            manifest.join("../codegraph-extract/tests/fixtures"),
+            manifest.join("../codegraph-bench/fixtures"),
+        ];
+        let mut compared = 0;
+        while let Some(dir) = dirs.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    dirs.push(path);
+                } else if let Ok(text) = std::fs::read_to_string(&path) {
+                    for quotes in [true, false] {
+                        assert_eq!(
+                            strip_c_style(&text, quotes),
+                            strip_c_style_chars(&text, quotes),
+                            "{}",
+                            path.display()
+                        );
+                    }
+                    let code = strip_c_style(&text, true);
+                    assert_eq!(
+                        blank_string_contents(&code),
+                        blank_string_contents_chars(&code),
+                        "{}",
+                        path.display()
+                    );
+                    assert_eq!(
+                        blank_string_contents(&text),
+                        blank_string_contents_chars(&text),
+                        "{}",
+                        path.display()
+                    );
+                    compared += 1;
+                }
+            }
+        }
+        assert!(compared > 50, "{compared}");
+    }
 
     #[test]
     fn blank_string_contents_keeps_quotes_newlines_and_code() {

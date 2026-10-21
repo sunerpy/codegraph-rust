@@ -1,0 +1,65 @@
+[
+  {
+    "content_hash": "d3dc8e47baf5e3f2dda23bc858d877d511aa2e0ff77d983a63d74a0612b38e50",
+    "errors": null,
+    "generated": 0,
+    "language": "python",
+    "node_count": 3,
+    "path": "pkg/__init__.py",
+    "size": 45
+  },
+  {
+    "content_hash": "e6bc57ca12662ce13145dad8675549b6d4ecc9120f4726f375fb5b503c050722",
+    "errors": null,
+    "generated": 0,
+    "language": "python",
+    "node_count": 2,
+    "path": "pkg/models/__init__.py",
+    "size": 20
+  },
+  {
+    "content_hash": "33347b276e54b1a96af7e2629ef1d67d309f82609d0eaf4857bb3690a18bc292",
+    "errors": null,
+    "generated": 0,
+    "language": "python",
+    "node_count": 7,
+    "path": "pkg/models/base.py",
+    "size": 212
+  },
+  {
+    "content_hash": "999710570bc6984ba96822d1f0431579b3f97908edc98045c9f1c01e83294d26",
+    "errors": null,
+    "generated": 0,
+    "language": "python",
+    "node_count": 6,
+    "path": "pkg/models/user.py",
+    "size": 221
+  },
+  {
+    "content_hash": "c186e353bccd405b0fa16aff9aec2dd7a00584881161df23c5ab3bd39bcf4474",
+    "errors": null,
+    "generated": 0,
+    "language": "python",
+    "node_count": 4,
+    "path": "pkg/service.py",
+    "size": 156
+  },
+  {
+    "content_hash": "d1b907a7cc69e27e39eaf4572d4a095e52457638c158811bfc55c2672e382a5c",
+    "errors": null,
+    "generated": 0,
+    "language": "python",
+    "node_count": 4,
+    "path": "tests/conftest.py",
+    "size": 99
+  },
+  {
+    "content_hash": "bf9764d6424937ac9e8c9130ce357168614da638526a79b95ddd2e70c8e25c1a",
+    "errors": null,
+    "generated": 0,
+    "language": "python",
+    "node_count": 4,
+    "path": "tests/test_service.py",
+    "size": 129
+  }
+]

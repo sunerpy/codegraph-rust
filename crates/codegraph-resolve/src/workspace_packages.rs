@@ -9,8 +9,64 @@
 //! `*`/`**` globs, directory-based subpath resolution (`workspace-packages.ts:17-24`).
 
 use serde_json::Value;
-use std::collections::BTreeMap;
-use std::path::Path;
+use std::cell::RefCell;
+use std::collections::{BTreeMap, HashSet};
+use std::path::{Path, PathBuf};
+
+/// What [`load_workspace_packages`] read: a file, or a directory it listed
+/// for a glob's members (W5-06).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum WorkspaceInput {
+    File(PathBuf),
+    MemberListing(PathBuf),
+}
+
+thread_local! {
+    /// While [`workspace_inputs`] runs, every file the loader reads and every
+    /// directory it lists, in order.
+    static READS: RefCell<Option<Vec<WorkspaceInput>>> = const { RefCell::new(None) };
+}
+
+fn note_read(input: WorkspaceInput) {
+    READS.with(|reads| {
+        if let Some(list) = reads.borrow_mut().as_mut() {
+            list.push(input);
+        }
+    });
+}
+
+/// Every file [`load_workspace_packages`] reads for `project_root` and every
+/// directory it lists for a glob's members, once each, in the order it first
+/// does: the root `package.json` and `pnpm-workspace.yaml`, each member's
+/// `package.json`, a missing one included. What a sync compares to know when
+/// the workspace may have moved (W5-06).
+pub fn workspace_inputs(project_root: &str) -> Vec<WorkspaceInput> {
+    READS.with(|reads| *reads.borrow_mut() = Some(Vec::new()));
+    let _ = load_workspace_packages(project_root);
+    let read = READS
+        .with(|reads| reads.borrow_mut().take())
+        .unwrap_or_default();
+    let mut seen = HashSet::new();
+    read.into_iter()
+        .filter(|input| seen.insert(input.clone()))
+        .collect()
+}
+
+/// The member directory names a glob's base `dir` lists: its directories,
+/// but no dot directory and no `node_modules`, sorted.
+pub fn member_listing(dir: &Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = entries
+        .flatten()
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .map(|entry| entry.file_name().to_string_lossy().to_string())
+        .filter(|name| !name.starts_with('.') && name != "node_modules")
+        .collect();
+    names.sort();
+    names
+}
 
 /// Member package `name` → directory relative to project root (posix)
 /// (`WorkspacePackages`, `workspace-packages.ts:31-34`).
@@ -87,6 +143,9 @@ fn collapse_slashes(path: &str) -> String {
 fn read_workspace_globs(project_root: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
 
+    note_read(WorkspaceInput::File(
+        Path::new(project_root).join("package.json"),
+    ));
     if let Ok(text) = std::fs::read_to_string(Path::new(project_root).join("package.json")) {
         if let Ok(pkg) = serde_json::from_str::<Value>(&text) {
             match pkg.get("workspaces") {
@@ -103,6 +162,9 @@ fn read_workspace_globs(project_root: &str) -> Vec<String> {
         }
     }
 
+    note_read(WorkspaceInput::File(
+        Path::new(project_root).join("pnpm-workspace.yaml"),
+    ));
     if let Ok(yaml) = std::fs::read_to_string(Path::new(project_root).join("pnpm-workspace.yaml")) {
         out.extend(parse_pnpm_packages(&yaml));
     }
@@ -157,33 +219,25 @@ fn expand_workspace_glob(project_root: &str, pattern: &str) -> Vec<String> {
     } else {
         Path::new(project_root).join(&base)
     };
-    let Ok(entries) = std::fs::read_dir(&dir) else {
-        return Vec::new();
-    };
-    let mut out: Vec<String> = Vec::new();
-    for entry in entries.flatten() {
-        let Ok(ft) = entry.file_type() else { continue };
-        if !ft.is_dir() {
-            continue;
-        }
-        let name = entry.file_name().to_string_lossy().to_string();
-        if name.starts_with('.') || name == "node_modules" {
-            continue;
-        }
-        out.push(if base.is_empty() {
-            name
-        } else {
-            format!("{base}/{name}")
-        });
-    }
-    // Deterministic order: read_dir is FS-ordered; sort so `or_insert` first-wins is stable.
-    out.sort();
-    out
+    note_read(WorkspaceInput::MemberListing(dir.clone()));
+    // Deterministic order: read_dir is FS-ordered; `member_listing` sorts so
+    // `or_insert` first-wins is stable.
+    member_listing(&dir)
+        .into_iter()
+        .map(|name| {
+            if base.is_empty() {
+                name
+            } else {
+                format!("{base}/{name}")
+            }
+        })
+        .collect()
 }
 
 /// Read the `name` field from a member directory's package.json
 /// (`readPackageName`, `workspace-packages.ts:173-180`).
 fn read_package_name(dir_abs: &Path) -> Option<String> {
+    note_read(WorkspaceInput::File(dir_abs.join("package.json")));
     let text = std::fs::read_to_string(dir_abs.join("package.json")).ok()?;
     let pkg: Value = serde_json::from_str(&text).ok()?;
     pkg.get("name")
@@ -215,6 +269,42 @@ mod tests {
             format!("{{ \"name\": \"{name}\" }}"),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn workspace_inputs_are_every_file_read_and_folder_listed() {
+        let root = temp_dir("inputs");
+        std::fs::write(
+            root.join("package.json"),
+            "{ \"workspaces\": [\"packages/*\"] }",
+        )
+        .unwrap();
+        write_pkg(&root.join("packages/ui"), "@acme/ui");
+        std::fs::create_dir_all(root.join("packages/bare")).unwrap();
+        std::fs::create_dir_all(root.join("packages/node_modules")).unwrap();
+        std::fs::write(root.join("packages/README.md"), "members\n").unwrap();
+        assert_eq!(
+            workspace_inputs(&root.to_string_lossy()),
+            [
+                WorkspaceInput::File(root.join("package.json")),
+                WorkspaceInput::File(root.join("pnpm-workspace.yaml")),
+                WorkspaceInput::MemberListing(root.join("packages")),
+                WorkspaceInput::File(root.join("packages/bare/package.json")),
+                WorkspaceInput::File(root.join("packages/ui/package.json")),
+            ]
+        );
+        // The listing is the member folders: no file, no `node_modules`.
+        assert_eq!(member_listing(&root.join("packages")), ["bare", "ui"]);
+        // No workspace: only the two root files are read.
+        std::fs::write(root.join("package.json"), "{ \"name\": \"solo\" }").unwrap();
+        assert_eq!(
+            workspace_inputs(&root.to_string_lossy()),
+            [
+                WorkspaceInput::File(root.join("package.json")),
+                WorkspaceInput::File(root.join("pnpm-workspace.yaml")),
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

@@ -52,7 +52,7 @@
     "kind": "calls",
     "line": 10,
     "metadata": {
-      "confidence": 0.85,
+      "confidence": 0.95,
       "resolvedBy": "qualified-name"
     },
     "provenance": null,
@@ -125,7 +125,7 @@
     "line": 18,
     "metadata": {
       "confidence": 0.9,
-      "resolvedBy": "exact-match"
+      "resolvedBy": "qualified-name"
     },
     "provenance": null,
     "source": "struct:418731e230da99cc3237d0e7e35385f1",
@@ -148,7 +148,7 @@
     "kind": "extends",
     "line": 22,
     "metadata": {
-      "confidence": 0.95,
+      "confidence": 0.9,
       "resolvedBy": "qualified-name"
     },
     "provenance": null,
@@ -161,7 +161,7 @@
     "line": 3,
     "metadata": {
       "confidence": 0.9,
-      "resolvedBy": "exact-match"
+      "resolvedBy": "qualified-name"
     },
     "provenance": null,
     "source": "class:0c060877c79717f6f299b28b7a70963d",
@@ -173,7 +173,7 @@
     "line": 8,
     "metadata": {
       "confidence": 0.9,
-      "resolvedBy": "exact-match"
+      "resolvedBy": "qualified-name"
     },
     "provenance": null,
     "source": "class:76beb6e8a8a91371f90602d5b477891f",
@@ -197,7 +197,7 @@
     "line": 13,
     "metadata": {
       "confidence": 0.9,
-      "resolvedBy": "exact-match"
+      "resolvedBy": "qualified-name"
     },
     "provenance": null,
     "source": "class:1f9695d61900e851f6609231a60ccd9a",
@@ -226,6 +226,18 @@
     "provenance": null,
     "source": "function:22779c7ef8b93c5a53baefaca5b875ec",
     "target": "struct:860b4dfc2d8e87f389dbeb7e3370cac2"
+  },
+  {
+    "col": 22,
+    "kind": "references",
+    "line": 10,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "function:87a31607b9531ae0a01b03caf6c870aa",
+    "target": "class:2e7e24e7488b3868c5b2924a018549c9"
   },
   {
     "col": 25,
@@ -257,7 +269,7 @@
     "line": 12,
     "metadata": {
       "confidence": 0.9,
-      "resolvedBy": "exact-match"
+      "resolvedBy": "qualified-name"
     },
     "provenance": null,
     "source": "class:d764b8bdd68df1978991f1ac288b8731",
@@ -293,7 +305,7 @@
     "line": 5,
     "metadata": {
       "confidence": 0.9,
-      "resolvedBy": "exact-match"
+      "resolvedBy": "qualified-name"
     },
     "provenance": null,
     "source": "class:663f57ce46858cb3d9b9085a4dcead53",
@@ -328,7 +340,7 @@
     "kind": "extends",
     "line": 11,
     "metadata": {
-      "confidence": 0.95,
+      "confidence": 0.9,
       "resolvedBy": "qualified-name"
     },
     "provenance": null,
@@ -352,8 +364,8 @@
     "kind": "calls",
     "line": 8,
     "metadata": {
-      "confidence": 0.9,
-      "resolvedBy": "exact-match"
+      "confidence": 0.95,
+      "resolvedBy": "qualified-name"
     },
     "provenance": null,
     "source": "function:8118a321a3f16f7898de2768139b459d",
@@ -401,7 +413,7 @@
     "line": 13,
     "metadata": {
       "confidence": 0.9,
-      "resolvedBy": "exact-match"
+      "resolvedBy": "qualified-name"
     },
     "provenance": null,
     "source": "class:1f9695d61900e851f6609231a60ccd9a",
@@ -412,7 +424,7 @@
     "kind": "extends",
     "line": 8,
     "metadata": {
-      "confidence": 0.95,
+      "confidence": 0.9,
       "resolvedBy": "qualified-name"
     },
     "provenance": null,
@@ -1164,6 +1176,15 @@
     "metadata": null,
     "provenance": null,
     "source": "file:plain_header_negatives.h",
+    "target": "constant:8a73342dee366546d413dd2e9e4adb51"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:plain_header_negatives.h",
     "target": "function:7d67c5231553d5bd8cebacf0f8bdbf72"
   },
   {
@@ -1300,6 +1321,15 @@
     "provenance": null,
     "source": "file:union_agg.c",
     "target": "struct:9a7a504b38e595f1a2d8030cdd4ff5c2"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:union_agg.c",
+    "target": "union:19733cd97c5ad963368395301e1be80b"
   },
   {
     "col": null,

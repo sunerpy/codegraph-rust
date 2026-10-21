@@ -7,6 +7,8 @@
 
 pub mod control;
 pub mod http_registry;
+mod install;
+mod lease_keeper;
 mod lock;
 pub mod mcp_registry;
 mod paths;
@@ -28,7 +30,12 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 pub use control::{
     CONTROL_PROTOCOL, ControlAck, ControlFrame, ShutdownOutcome, parse_control_frame,
-    request_daemon_shutdown,
+    request_daemon_shutdown, request_daemon_shutdown_of,
+};
+pub use install::{CODEGRAPH_DAEMON_INSTALL_CHECK_MS, InstallIdentity, install_check_interval};
+pub use lease_keeper::{
+    CODEGRAPH_DAEMON_RETRY_MAX_MS, CODEGRAPH_DAEMON_RETRY_MS, DaemonRetryPolicy,
+    SessionLeaseKeeper, keep_session_attached,
 };
 pub use lock::{
     AcquireResult, DaemonLockInfo, clear_stale_daemon_lock, clear_stale_daemon_socket,
@@ -40,8 +47,11 @@ pub use process::{
     SupervisionState, current_ppid, is_process_alive, is_session_leader, supervision_lost_reason,
     terminate_pid,
 };
-pub use project_service::{ProjectDaemonLease, project_service_broker, retain_project_daemon};
-pub use proxy::{ProxyOutcome, run_proxy, verify_daemon_hello};
+pub use project_service::{
+    ProjectDaemonLease, attach_project_daemon_passive, project_service_broker,
+    retain_project_daemon, retain_project_daemon_passive,
+};
+pub use proxy::{DaemonPeer, ProxyOutcome, classify_daemon_hello, run_proxy, verify_daemon_hello};
 pub use session::{SessionRegistry, read_daemon_hello, run_session_recv};
 pub use spawn::{
     CODEGRAPH_HTTP_DETACH_INTERNAL, CODEGRAPH_SKIP_STARTUP_CATCHUP, spawn_detached_daemon,
@@ -195,6 +205,14 @@ pub struct DaemonOptions {
     /// acknowledges success, so the caller fails closed. Defaults to
     /// [`DRAIN_TIMEOUT`].
     pub drain_budget: Duration,
+    /// The install this daemon runs, recorded at start. Once the file there is
+    /// replaced or removed (an upgrade), the daemon drains and exits so the next
+    /// session starts one from the current install (upstream #2346). Defaults
+    /// to the running executable; `None` disables the check.
+    pub install: Option<InstallIdentity>,
+    /// How often [`Self::install`] is checked. Defaults to
+    /// [`install_check_interval`]; `None` disables the check.
+    pub install_check: Option<Duration>,
 }
 
 impl Default for DaemonOptions {
@@ -206,6 +224,8 @@ impl Default for DaemonOptions {
             run_mcp: true,
             watch: true,
             drain_budget: DRAIN_TIMEOUT,
+            install: InstallIdentity::current(),
+            install_check: install_check_interval(),
         }
     }
 }
@@ -360,6 +380,22 @@ pub fn run_foreground_gated(
         StartOrAttach::Attached(client) => {
             bail!("daemon already running at {}", client.socket_path.display())
         }
+    }
+}
+
+/// Whether a daemon could be listening at the recorded rendezvous
+/// `socket_path` now. On Unix that is its socket file existing. On Windows the
+/// record holds a bare pipe name with no file behind it, so only connecting
+/// can tell; the probe's connection is dropped at once and its session ends.
+pub fn rendezvous_accepts(socket_path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        socket_path.exists()
+    }
+    #[cfg(windows)]
+    {
+        !socket_path.as_os_str().is_empty()
+            && connect(&Rendezvous::from_socket_path(socket_path)).is_ok()
     }
 }
 
@@ -563,6 +599,7 @@ async fn run_accept_loop_async(
     let mut ticker = tokio::time::interval(Duration::from_millis(tick_ms));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut last_sweep = std::time::Instant::now();
+    let mut last_install_check = std::time::Instant::now();
 
     let stop_reason: Option<anyhow::Error> = loop {
         if shutdown.load(Ordering::SeqCst) {
@@ -629,6 +666,21 @@ async fn run_accept_loop_async(
                 if last_sweep.elapsed().as_millis() >= client_sweep_ms {
                     sweep_dead_clients(&registry);
                     last_sweep = std::time::Instant::now();
+                }
+                // A daemon keeps running the code it started with. Once its
+                // install is replaced or removed it steps aside, so the next
+                // session starts a daemon from the current install (#2346).
+                if let (Some(install), Some(every)) = (&options.install, options.install_check)
+                    && last_install_check.elapsed() >= every
+                {
+                    last_install_check = std::time::Instant::now();
+                    if install.changed() {
+                        info!(
+                            install = %install.path().display(),
+                            "daemon exiting: its install was upgraded or removed"
+                        );
+                        break None;
+                    }
                 }
                 let idle_ms = registry.millis_since_active();
                 if idle_ms > max_idle_ms {
@@ -1269,6 +1321,31 @@ mod tests {
         let (_listener, bound) =
             bind_with_fallback(&root, preferred.clone()).expect("preferred socket must bind");
         assert_eq!(bound, preferred, "the preferred candidate binds first");
+        #[cfg(unix)]
+        if let Some(stale) = Rendezvous::from_socket_path(&bound).cleanup_path() {
+            let _ = fs::remove_file(stale);
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_rendezvous_nobody_binds_accepts_nothing() {
+        let root = temp_root("accepts-dead");
+        assert!(!rendezvous_accepts(&socket_path_of(&root)));
+        assert!(!rendezvous_accepts(Path::new("")));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn a_bound_rendezvous_accepts() {
+        let root = temp_root("accepts-bound");
+        create_rendezvous_dir(&root);
+        let (_listener, bound) =
+            bind_with_fallback(&root, socket_path_of(&root)).expect("the preferred socket binds");
+        assert!(
+            rendezvous_accepts(&bound),
+            "a bound rendezvous is found, by file on Unix and by connecting on Windows"
+        );
         #[cfg(unix)]
         if let Some(stale) = Rendezvous::from_socket_path(&bound).cleanup_path() {
             let _ = fs::remove_file(stale);

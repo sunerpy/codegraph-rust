@@ -49,12 +49,15 @@ pub fn open_browser(url: &str) -> bool {
     else {
         return false;
     };
-    let spawned = Command::new(command)
+    let mut opener = Command::new(command);
+    opener
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn();
+        .stderr(Stdio::null());
+    // A Windows opener is `cmd /c start`, a console program.
+    codegraph_watch::hide_console_window(&mut opener);
+    let spawned = opener.spawn();
     match spawned {
         Ok(child) => {
             // Reap it off the caller's thread so it never lingers as a zombie.

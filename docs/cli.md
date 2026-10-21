@@ -71,8 +71,8 @@ by the same rules: what changed between the recorded commit and `HEAD`, plus wha
 inventory still answers whenever git might not see a change:
 
 - there is no record, the commit no longer exists, or the repository has no commit;
-- the scope changed: config, root `.gitignore`, extension overrides, index root,
-  or binary version;
+- the scope changed: config, root `.gitignore`, `.git/info/exclude`, extension
+  overrides, index root, or binary version;
 - the index was built through symlinks, or the repository has submodules;
 - an untracked nested repository or an `assume-unchanged` or `skip-worktree` entry
   is present;
@@ -84,6 +84,11 @@ inventory still answers whenever git might not see a change:
   case-insensitive or Unicode-precomposing name match (`core.ignorecase`, the
   macOS and Windows default; `core.precomposeunicode`). On those systems the full
   inventory answers;
+- a Shopify theme marker (`layout/theme.liquid`, `config/settings_schema.json`)
+  is among the candidates, git may hide one (it ignores a marker, or a
+  `config/` or `layout/` directory beside a `templates/` or `sections/` folder),
+  or a theme the index records has lost every marker: a marker's coming or
+  going makes the theme's unchanged JSON templates source or not;
 - git is missing or does not answer within 10 seconds.
 
 Git runs without optional locks, so `status` never rewrites `.git/index`.
@@ -472,6 +477,10 @@ the framework resolver after the initial extractor, so the stored
 read `0` while the graph actually holds those nodes. `files` recomputes the
 displayed count from the `nodes` table for display only — it never rewrites the
 stored `files.node_count` column, so the golden output is unaffected.
+
+`files --json` lists each file's `path`, `language`, `nodeCount`, `size` and
+`errors`: the errors extraction recorded for it, such as a parse that produced no
+symbols or a file over `max_file_size` (an empty array when it parsed cleanly).
 
 ---
 
@@ -945,6 +954,25 @@ Until the viewer leaves preview, `ui` and its alias `web` — also as `help ui` 
 from `--help`. The boundary, the live channel, the API and the differences from
 upstream are documented in [the viewer reference](ui.md).
 
+## `codegraph status` — files missing their symbols
+
+A content-hash comparison calls a file up to date even when its stored row holds
+none of its symbols, so `status` also reads the stored rows (upstream #2336).
+`status --json` reports two counts under `index`:
+
+- `filesNeedingReindex`: files stored with no nodes and no recorded reason.
+  Every parse stores at least the file node, so such a row was wiped; a
+  hash-based `sync` does not revisit it, and `codegraph index` rebuilds it.
+- `filesWithParseErrors`: files whose recorded parse failure left them without
+  symbols. They stay that way until the file or the parser changes;
+  `codegraph files --json` shows the errors.
+
+A file over `max_file_size` and a file-level-only language (YAML, Twig,
+properties, Godot scenes, resources and project files) are empty on purpose and
+are counted in neither. Human output names up to three files of each group in a
+warning, and says the index is up to date only when both groups are empty and no
+change is pending.
+
 ## `codegraph status` — WAL diagnostics
 
 `status` reports the SQLite write-ahead log only when a non-empty `-wal` sidecar
@@ -984,10 +1012,13 @@ Before choosing Direct/daemon mode, `serve --mcp` resolves one default root:
    workspace manifest or `.git`;
 3. adopt the child only when exactly one indexed project is found.
 
-The downward scan is deterministic and bounded: depth 4, at most 64 candidates,
+The downward scan is deterministic and bounded: depth 4, at most 64 candidates
+and 10,000 directory entries (plus a 500 ms backstop for slow filesystems),
 sorted directory traversal, no descent below an indexed child, and no
 `node_modules`, VCS metadata, build output, vendor, virtualenv, cache, or temp
-directories. It never runs from `$HOME` or a filesystem root. An adopted child
+directories. It never runs from `$HOME` or a filesystem root. A scan that stops
+at its entry budget or backstop adopts nothing and says so, because it cannot
+know the child it found is the only one. An adopted child
 enters the ordinary daemon/watcher/catch-up path, so the daemon socket and watch
 scope are keyed to the child rather than the unindexed workspace container.
 
@@ -1043,6 +1074,34 @@ spawn, the first foreground stdio process answers MCP directly but starts no
 watcher/catch-up of its own. If the child cannot be spawned, that foreground
 process falls back to direct writer mode and takes `writer.pid` itself.
 
+That cold-start session still depends on the daemon for live sync, so once the
+daemon's socket is up it retains a passive client connection to it for as long
+as the session runs. The daemon therefore never idle-exits under an open
+session. If the connection stops being live — the daemon crashed, was replaced,
+or the index was removed or re-created — the session waits
+`CODEGRAPH_DAEMON_RETRY_MS`, starts a daemon if none owns the project, and
+attaches again, doubling the wait after each miss up to
+`CODEGRAPH_DAEMON_RETRY_MAX_MS`. It never starts a daemon for a project whose
+index is gone, and `CODEGRAPH_DAEMON_RETRY_MS=0` turns the retries off.
+
+A daemon keeps running the code it started with, so after an upgrade the
+project's daemon can be an older build than the session that finds it. A
+session that meets a daemon of another version reads the version from the
+daemon's hello and replaces it only when it is an older plain `X.Y.Z` release:
+it asks the daemon to drain over its control channel, which is bound to this
+project's identity, so no process is ever signalled by pid, then starts a daemon
+from its own install and attaches to it. Sessions attached to the old daemon end
+when it drains, and their clients reconnect. A daemon of a newer release, a
+prerelease or an unknown version is never stopped, so two installs cannot take
+turns replacing each other's daemon. Neither is one that does not answer the
+drain request. In those cases the session serves reads without auto-sync and
+says so on stderr (`Serving reads in-process without auto-sync: …`); the daemon
+keeps the writer slot. Independently, every daemon checks its own executable
+every `CODEGRAPH_DAEMON_INSTALL_CHECK_MS` and drains and exits once the file is
+replaced or removed, so the next session starts one from the current install.
+A cold-start session whose own install changed stops starting daemons, keeps
+serving reads, and asks on stderr to be restarted.
+
 On filesystems that reject binding an `AF_UNIX` socket inside the project
 directory (ExFAT/FAT, some network mounts, WSL DrvFs), the daemon falls back
 through a deterministic candidate chain — first the project-dir
@@ -1088,7 +1147,13 @@ A `build` directory that is a Java, Kotlin or Scala package under a source root
 output, so it stays indexed and watched. The root `.gitignore` prunes the index
 and the watcher alike, with git's own rules: a slash-less rule applies at any
 depth, a leading or inner `/` anchors it to the project root, `*` and `**` glob,
-and `!` re-includes a path unless a directory above it is ignored.
+and `!` re-includes a path unless a directory above it is ignored. The
+repository's own `.git/info/exclude` prunes them the same way. git ranks a
+`.gitignore` above it, so a `.gitignore` rule wins a conflict with an exclude
+rule. It is read only from a real `.git` directory at the project root, never
+through a link: a linked worktree or submodule, whose `.git` is a file naming a
+git directory elsewhere, and a project below its repository's root read no
+exclude file, and the user-wide `core.excludesFile` is never read.
 
 Indexing follows symlinked files and directories, including targets outside
 the project, and indexes their files under the link's own path. A directory is
@@ -1110,13 +1175,35 @@ up by the next full `sync`.
 
 This keeps the total watch count well inside the OS inotify limit on large trees
 and makes daemon startup fast. A newly-created non-ignored directory is picked up
-automatically on its create event — no restart required.
+automatically on its create event — no restart required. One kind of ignored
+directory is still watched, itself and not below it: a `config/` or `layout/`
+directory, which may hold a Shopify theme marker (`config/settings_schema.json`,
+`layout/theme.liquid`). A marker counts though ignored, since it only tells a
+theme's JSON templates apart, and the watcher hands its events to the sync; a
+marker folder removed or moved away takes its marker with it.
 
-Three project-control files are recognized before ordinary include/exclude
-filtering: the selected index root's `config.toml` and `codegraph.json`, plus the
-project-root `.gitignore`. Editing one reloads the effective Config, extension
-overrides, and watch policy, atomically replaces the live scope, reconciles
-per-directory OS watches, and schedules one full project reconcile. That full
+A settled burst normally syncs exactly the paths its events named. Three cases
+make it run one full project reconcile instead, the same pass `codegraph sync`
+runs:
+
+- the burst named more than 500 paths, as a branch switch or a mass rename does;
+- the backend said events may have been dropped: inotify's queue overflowed,
+  FSEvents asked for a rescan, or an event arrived without naming any path;
+- on Windows, whose backend can lose events without saying so, an idle watcher
+  compares the index with the disk every `CODEGRAPH_WATCH_SENTINEL_MS` (60 s by
+  default; `0` turns this off) and found changes no event reported. It also
+  registers its root watch again.
+
+In each case the watcher reports RECOVERING, naming the cause, until that full
+reconcile commits; a reconcile that fails is retried like any other failed sync.
+
+Four project-control files are recognized before ordinary include/exclude
+filtering: the selected index root's `config.toml` and `codegraph.json`, the
+project-root `.gitignore`, and `.git/info/exclude`. Editing one reloads the
+effective Config, extension overrides, and watch policy, atomically replaces the
+live scope, reconciles per-directory OS watches, and schedules one full project
+reconcile. Per-directory backends watch `.git/info` for its exclude file when
+that directory exists as the watcher starts. That full
 reconcile dominates queued path events, while every later incremental sync
 re-checks the current scope, so an old event cannot re-add a newly excluded
 file. Invalid TOML keeps the last valid runtime scope and reports the error;
@@ -1146,25 +1233,41 @@ Three escape hatches:
 
 ### Environment variable reference
 
-| Variable                           | Default      | Clamp range         | Meaning                                                                                                                                                                                                                                                                                            |
-| ---------------------------------- | ------------ | ------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `CODEGRAPH_NO_DAEMON`              | —            | —                   | Force foreground Direct mode; one indexed-project writer only, enforced by `writer.pid`                                                                                                                                                                                                            |
-| `CODEGRAPH_DAEMON_IDLE_TIMEOUT_MS` | `300000`     | 1000–3600000        | Exit after this long with no connected clients                                                                                                                                                                                                                                                     |
-| `CODEGRAPH_DAEMON_MAX_IDLE_MS`     | `1800000`    | 1000–3600000        | Hard cap on total daemon lifetime when idle                                                                                                                                                                                                                                                        |
-| `CODEGRAPH_DAEMON_CLIENT_SWEEP_MS` | `30000`      | 50–600000           | How often the daemon sweeps for dead clients                                                                                                                                                                                                                                                       |
-| `CODEGRAPH_WATCH_DEBOUNCE_MS`      | `2000`       | 100–60000           | File-change debounce window before a re-index triggers                                                                                                                                                                                                                                             |
-| `CODEGRAPH_NO_WATCH`               | —            | —                   | Disable the live file watcher (equivalent to `serve --no-watch`)                                                                                                                                                                                                                                   |
-| `CODEGRAPH_FORCE_WATCH`            | —            | —                   | Override WSL2 `/mnt/` auto-disable; does not override `NO_WATCH`                                                                                                                                                                                                                                   |
-| `CODEGRAPH_NO_WAL_DEFER`           | —            | `1` enables opt-out | Keep SQLite's default WAL autocheckpoint interval during bulk indexing                                                                                                                                                                                                                             |
-| `CODEGRAPH_WAL_VALVE_MB`           | `256`        | >0; invalid→default | Shared MB threshold for the active WAL valve, resetting `journal_size_limit`, and `status` WAL warning                                                                                                                                                                                             |
-| `CODEGRAPH_MCP_REGISTRY_DIR`       | —            | —                   | Override the stdio MCP registry directory read by `mcp list`                                                                                                                                                                                                                                       |
-| `CODEGRAPH_UI`                     | —            | `1` enables         | Enable the browser viewer commands `ui` / `web` (preview); otherwise they are refused and hidden from `--help`                                                                                                                                                                                     |
-| `CODEGRAPH_BROWSER`                | —            | —                   | The program `codegraph ui` opens its URL with; `none`, `0`, `false`, `off` or empty open nothing                                                                                                                                                                                                   |
-| `CODEGRAPH_DIR`                    | `.codegraph` | —                   | Select one non-empty project-local directory name; absolute paths, separators, `.`, `..`, and aliases are rejected. Unset on a WSL Windows drive (`/mnt/<drive>/`), the default is `.codegraph-wsl` unless `.codegraph/codegraph.db` already exists, so WSL never shares Windows CodeGraph's index |
+| Variable                            | Default      | Clamp range                   | Meaning                                                                                                                                                                                                                                                                                            |
+| ----------------------------------- | ------------ | ----------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `CODEGRAPH_NO_DAEMON`               | —            | —                             | Force foreground Direct mode; one indexed-project writer only, enforced by `writer.pid`                                                                                                                                                                                                            |
+| `CODEGRAPH_DAEMON_IDLE_TIMEOUT_MS`  | `300000`     | 1000–3600000                  | Exit after this long with no connected clients                                                                                                                                                                                                                                                     |
+| `CODEGRAPH_DAEMON_MAX_IDLE_MS`      | `1800000`    | 1000–3600000                  | Hard cap on total daemon lifetime when idle                                                                                                                                                                                                                                                        |
+| `CODEGRAPH_DAEMON_CLIENT_SWEEP_MS`  | `30000`      | 50–600000                     | How often the daemon sweeps for dead clients                                                                                                                                                                                                                                                       |
+| `CODEGRAPH_DAEMON_RETRY_MS`         | `5000`       | ≥0; `0` disables              | How long a cold-start stdio session waits before starting or re-attaching the shared daemon after its connection was lost; doubles after each miss. Empty, malformed, or negative values use the default                                                                                           |
+| `CODEGRAPH_DAEMON_RETRY_MAX_MS`     | `300000`     | ≥ `CODEGRAPH_DAEMON_RETRY_MS` | Cap for that doubling wait                                                                                                                                                                                                                                                                         |
+| `CODEGRAPH_DAEMON_INSTALL_CHECK_MS` | `30000`      | ≥0; `0` disables              | How often a daemon checks whether its own executable was replaced or removed, and then drains and exits. Empty or malformed values use the default                                                                                                                                                 |
+| `CODEGRAPH_WATCH_DEBOUNCE_MS`       | `2000`       | 100–60000                     | File-change debounce window before a re-index triggers                                                                                                                                                                                                                                             |
+| `CODEGRAPH_WATCH_SENTINEL_MS`       | `60000`      | 0 or 1000–3600000             | Windows only: how often an idle watcher checks the index for changes no event reported; `0` disables. Empty or malformed values use the default                                                                                                                                                    |
+| `CODEGRAPH_NO_WATCH`                | —            | —                             | Disable the live file watcher (equivalent to `serve --no-watch`)                                                                                                                                                                                                                                   |
+| `CODEGRAPH_FORCE_WATCH`             | —            | —                             | Override WSL2 `/mnt/` auto-disable; does not override `NO_WATCH`                                                                                                                                                                                                                                   |
+| `CODEGRAPH_NO_WAL_DEFER`            | —            | `1` enables opt-out           | Keep SQLite's default WAL autocheckpoint interval during bulk indexing                                                                                                                                                                                                                             |
+| `CODEGRAPH_WAL_VALVE_MB`            | `256`        | >0; invalid→default           | Shared MB threshold for the active WAL valve, resetting `journal_size_limit`, and `status` WAL warning                                                                                                                                                                                             |
+| `CODEGRAPH_MCP_TOOL_TIMEOUT_SECS`   | `60`         | ≥0; `0` disables              | How long an MCP client waits for one tool call, in seconds; past it the call returns an `isError` result while its work finishes in the background. Empty or malformed values use the default                                                                                                      |
+| `CODEGRAPH_MCP_REGISTRY_DIR`        | —            | —                             | Override the stdio MCP registry directory read by `mcp list`                                                                                                                                                                                                                                       |
+| `CODEGRAPH_UI`                      | —            | `1` enables                   | Enable the browser viewer commands `ui` / `web` (preview); otherwise they are refused and hidden from `--help`                                                                                                                                                                                     |
+| `CODEGRAPH_BROWSER`                 | —            | —                             | The program `codegraph ui` opens its URL with; `none`, `0`, `false`, `off` or empty open nothing                                                                                                                                                                                                   |
+| `CODEGRAPH_DIR`                     | `.codegraph` | —                             | Select one non-empty project-local directory name; absolute paths, separators, `.`, `..`, and aliases are rejected. Unset on a WSL Windows drive (`/mnt/<drive>/`), the default is `.codegraph-wsl` unless `.codegraph/codegraph.db` already exists, so WSL never shares Windows CodeGraph's index |
 
 Timeout/debounce values outside their clamp range are silently clamped to the
 nearest bound. `CODEGRAPH_WAL_VALVE_MB` instead falls back to `256` when it is
 empty, non-numeric, zero, or too large to convert safely to bytes.
+
+### Color and progress output
+
+codegraph's own output has no color: every command prints plain text whether
+stdout is a terminal or a pipe, so `NO_COLOR`, `FORCE_COLOR` and `CI` change
+nothing in it. `init`, `index` and `sync` draw a progress bar only on a terminal
+stderr; piped, they print plain lines (`Scanning files…` on stderr, the summary
+on stdout) with no carriage-return rewrites. The help and error text clap prints
+is colored on a color terminal (not `TERM=dumb`) or under `CLICOLOR_FORCE`, and
+`NO_COLOR` turns that off too. Upstream's `--color` and `--no-color` are not
+flags here: passing either is an argument error.
 
 ### Custom extension mapping (`.codegraph/codegraph.json`)
 
@@ -1244,10 +1347,13 @@ codegraph sync /path/to/project          # ordinary changes or a supported upgra
 codegraph index --force /path/to/project # only when the CLI explicitly requires recovery
 ```
 
-Extraction versions 11 → 12 and 12 → 13 are supported `sync` upgrades: `status`
-reports the old index as outdated, and `sync` rebuilds it into the current
-namespace. Do not run `index --force` solely because the extraction version
-changed.
+An index built by an older extraction version is a supported `sync` upgrade:
+`status` reports it as outdated, and `sync` (or the catch-up a daemon or MCP
+session runs when it opens the project) rebuilds it from source into the current
+namespace, applying any pending schema migration on the way. The result equals a
+fresh `init`. Do not run `index --force` solely because the extraction version
+changed. An older binary refuses an index a newer extraction version wrote and
+leaves it untouched.
 
 If a supported grammar reports tree errors and extraction collapses to only the
 synthetic file node, `init`/`index`/`sync` still succeed but print and persist
@@ -1279,10 +1385,11 @@ a query as an argument or reads one from stdin, runs `codegraph_explore` against
 the nearest index, and prints structured context. HIGH-tier Explore text is
 capped at 9,000 UTF-8 bytes so the complete wrapper stays below Claude Code's
 10,000-byte inline hook-output limit; truncation never splits a multi-byte
-character. If the first non-whitespace content is `<task-notification>`, the
-host-generated message is skipped before index work. A user mentioning that tag
-later in a real prompt is not suppressed. If no index is found or no query is
-provided, the hook exits cleanly and silently.
+character. A prompt that is entirely a host envelope, past leading and trailing
+whitespace, is skipped before index work: a `<task-notification>` task completion
+or an `<agent-message …>` subagent hand-back. A real prompt that mentions either
+tag, or adds a question after the envelope, is not suppressed. If no index is
+found or no query is provided, the hook exits cleanly and silently.
 
 `codegraph install --prompt-hook` writes a `UserPromptSubmit` hook into Claude
 Code's config that calls `codegraph prompt-hook` before each prompt. This is
