@@ -339,7 +339,11 @@ impl SnapshotResolutionContext {
 
         // Per-file and per-kind lists copy the store's own query output verbatim
         // so the candidate order matches `nodes_by_file_path` (ORDER BY
-        // start_line) and `nodes_by_kind` (SQLite scan order) exactly.
+        // start_line) and `nodes_by_kind` (SQLite scan order) exactly. Each list
+        // is collected from a borrowing iterator: collected from the query's
+        // `Vec<Node>` by value, it reused that buffer in place and kept a
+        // node's worth of room for every 8-byte handle for the whole pass
+        // (17 MiB on this repository; W10-04).
         let mut file_paths: Vec<String> = by_id.values().map(|n| n.file_path.clone()).collect();
         file_paths.sort_unstable();
         file_paths.dedup();
@@ -349,7 +353,7 @@ impl SnapshotResolutionContext {
             let entries = store
                 .nodes_by_file_path(fp)
                 .unwrap_or_default()
-                .into_iter()
+                .iter()
                 .filter_map(|node| by_id.get(&node.id).cloned())
                 .collect();
             by_file_path.insert(fp.clone(), entries);
@@ -360,7 +364,7 @@ impl SnapshotResolutionContext {
             let entries = store
                 .nodes_by_kind(kind)
                 .unwrap_or_default()
-                .into_iter()
+                .iter()
                 .filter_map(|node| by_id.get(&node.id).cloned())
                 .collect();
             by_kind.insert(kind, entries);
@@ -1089,6 +1093,52 @@ mod tests {
                 );
             }
         }
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// W10-04: the per-file and per-kind lists hold only their handles. Each
+    /// was collected from the store's `Vec<Node>` in place and kept that
+    /// buffer, a node's size of room per 8-byte handle, through the whole
+    /// resolution pass.
+    #[test]
+    fn snapshot_lists_keep_no_node_sized_buffers() {
+        let root = temp_root("list-room");
+        let mut store = Store::open(&root.join("index.db")).expect("open");
+        store.upsert_file(&file_record("a.ts", 40)).unwrap();
+        let nodes: Vec<Node> = (0..40_i64)
+            .map(|i| {
+                node(
+                    &format!("f{i}"),
+                    &format!("F{i}"),
+                    NodeKind::Function,
+                    "a.ts",
+                    i + 1,
+                    0,
+                )
+            })
+            .collect();
+        store.upsert_nodes(&nodes).unwrap();
+        let ctx = SnapshotResolutionContext::from_store(&store, root.to_str().unwrap())
+            .expect("snapshot");
+        let lists = ctx
+            .snapshot
+            .by_file_path
+            .values()
+            .chain(ctx.snapshot.by_kind.values());
+        let mut checked = 0;
+        for list in lists.filter(|list| !list.is_empty()) {
+            assert!(
+                list.capacity() <= 2 * list.len().max(4),
+                "a list of {} handles keeps room for {}",
+                list.len(),
+                list.capacity()
+            );
+            checked += 1;
+        }
+        assert!(
+            checked >= 2,
+            "the file's list and the function list were checked"
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 
