@@ -46,6 +46,9 @@ mod viewer_gate;
 /// musl's allocator serializes threads, so the static Linux release builds got
 /// slower as threads were added: a full index of this repository took over two
 /// minutes at 32 threads, against 51 s at one. Through mimalloc it takes 8 s.
+/// mimalloc is built without transparent huge pages (`no_thp`): it advised
+/// them for its own memory, and each thread's heap then held whole 2 MiB pages
+/// (W10-06).
 #[cfg(target_env = "musl")]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
