@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.55.1](https://github.com/sunerpy/codegraph-rust/compare/v0.55.0...v0.55.1) (2026-10-22)
+
+
+### Bug Fixes
+
+* **daemon:** upgrade an outdated index before the daemon starts serving it ([#330](https://github.com/sunerpy/codegraph-rust/issues/330)) ([b6f0106](https://github.com/sunerpy/codegraph-rust/commit/b6f010665e8a9e6ef726a158882cf549099908a5))
+
 ## [0.55.0](https://github.com/sunerpy/codegraph-rust/compare/v0.54.0...v0.55.0) (2026-10-21)
 
 
