@@ -2102,3 +2102,105 @@ fn sync_refuses_uninitialized_namespace_without_mutation() {
     let after = namespace_snapshot(paths.current_root());
     assert_namespace_unchanged(&before, &after, "uninitialized");
 }
+
+/// An older version's `uninit --force` leaves the residue this version's leaves
+/// — an `uninitialized` slot, a tombstone, no database — except that the slot
+/// carries the older extraction version. It stays reserved for an explicit
+/// `init` all the same: `status` reports it uninitialized, a sync, a catch-up
+/// sync and `index --force` refuse it without touching a byte, a repeated
+/// `uninit --force` continues it at this version, and `init` brings the index
+/// back.
+#[test]
+fn an_older_versions_uninit_stays_reserved_for_an_explicit_init() {
+    let dir = TestDir::new("refuse-older-uninit");
+    let project = init_project("refuse-older-uninit", &dir);
+    let project_arg = project.to_str().unwrap();
+    let paths = IndexPaths::resolve(&project, None).expect("resolve v2 paths");
+    let uninit = cli(&["uninit", "--force", project_arg]);
+    assert!(uninit.ok, "setup: uninit failed: {}", uninit.stderr);
+    stage_state_slot(
+        &paths,
+        100,
+        CURRENT_STORAGE_PROTOCOL,
+        CURRENT_EXTRACTION_VERSION - 1,
+        "uninitialized",
+    );
+    assert!(
+        paths.tombstone().is_file(),
+        "setup: uninit leaves its tombstone"
+    );
+    assert!(
+        !paths.current_db().exists(),
+        "setup: uninit removes the database"
+    );
+    assert_eq!(
+        Store::extraction_status(&paths),
+        ExtractionStatus::Uninitialized,
+        "an older version's uninit is uninitialized, not outdated"
+    );
+
+    let status = cli(&["status", project_arg, "--json"]);
+    assert!(status.ok, "status failed: {}", status.stderr);
+    let json: serde_json::Value = serde_json::from_str(&status.stdout).expect("status JSON");
+    assert_eq!(
+        json["extractionStatus"], "uninitialized",
+        "{}",
+        status.stdout
+    );
+
+    let before = namespace_snapshot(paths.current_root());
+    for command in [
+        &["sync", project_arg][..],
+        &["index", "--force", project_arg][..],
+    ] {
+        let run = cli(command);
+        assert!(
+            !run.ok,
+            "`codegraph {}` must refuse an older uninit: stdout={}, stderr={}",
+            command[0], run.stdout, run.stderr
+        );
+        assert_namespace_unchanged(
+            &before,
+            &namespace_snapshot(paths.current_root()),
+            command[0],
+        );
+    }
+    codegraph_watch::sync_project_once(&project)
+        .expect_err("a catch-up sync must refuse an older uninit");
+    assert_namespace_unchanged(
+        &before,
+        &namespace_snapshot(paths.current_root()),
+        "catch-up",
+    );
+
+    let again = cli(&["uninit", "--force", project_arg]);
+    assert!(
+        again.ok,
+        "a repeated `uninit --force` must continue an older uninit: {}",
+        again.stderr
+    );
+    let classification = codegraph_store::index_state::classify(&paths);
+    assert_eq!(classification.status(), &ExtractionStatus::Uninitialized);
+    assert_eq!(
+        classification
+            .authoritative()
+            .map(|slot| slot.record.extraction_version),
+        Some(CURRENT_EXTRACTION_VERSION),
+        "the continued uninit republishes at this extraction version"
+    );
+    assert!(paths.tombstone().is_file(), "the tombstone stays");
+
+    let init = cli(&["init", project_arg]);
+    assert!(init.ok, "init failed: {}", init.stderr);
+    assert_eq!(Store::extraction_status(&paths), ExtractionStatus::Current);
+    assert!(
+        !paths.tombstone().exists(),
+        "an explicit init removes the tombstone"
+    );
+    let search = cli(&["search", "add", "-p", project_arg]);
+    assert!(
+        search.ok,
+        "the rebuilt index must answer: {}",
+        search.stderr
+    );
+}

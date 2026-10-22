@@ -179,10 +179,19 @@ fn index_state_current_protocol_maps_each_phase() {
 }
 
 #[test]
-fn index_state_extraction_version_maps_outdated_and_future_for_every_phase() {
+fn index_state_extraction_version_maps_outdated_and_future_by_phase() {
     let previous_extraction = CURRENT_EXTRACTION_VERSION - 1;
     let future_extraction = CURRENT_EXTRACTION_VERSION + 1;
     for phase in ["building", "current", "uninitialized"] {
+        // An older version's uninit leaves no index to upgrade: it is the
+        // residue this version's uninit leaves, reserved for an explicit init.
+        let older = |built| {
+            if phase == "uninitialized" {
+                ExtractionStatus::Uninitialized
+            } else {
+                ExtractionStatus::Outdated { built }
+            }
+        };
         let old = TempTree::new("outdated");
         write_wire(
             &old.slots()[0],
@@ -192,10 +201,7 @@ fn index_state_extraction_version_maps_outdated_and_future_for_every_phase() {
             phase,
             OWNER,
         );
-        assert_eq!(
-            classify_slots(&old.slots(), OWNER).status(),
-            &ExtractionStatus::Outdated { built: 1 }
-        );
+        assert_eq!(classify_slots(&old.slots(), OWNER).status(), &older(1));
 
         let previous = TempTree::new("previous-extraction");
         write_wire(
@@ -208,9 +214,7 @@ fn index_state_extraction_version_maps_outdated_and_future_for_every_phase() {
         );
         assert_eq!(
             classify_slots(&previous.slots(), OWNER).status(),
-            &ExtractionStatus::Outdated {
-                built: previous_extraction
-            }
+            &older(previous_extraction)
         );
 
         let future = TempTree::new("future-extraction");

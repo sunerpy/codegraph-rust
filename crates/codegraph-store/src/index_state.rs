@@ -94,8 +94,11 @@
 //! 6. Future storage protocol ⇒ [`ExtractionStatus::Future`]. Otherwise,
 //!    `extractionVersion` above [`CURRENT_EXTRACTION_VERSION`] ⇒
 //!    [`ExtractionStatus::Future`] for EVERY phase, `uninitialized` included.
-//!    Below ⇒ [`ExtractionStatus::Outdated`] preserving the built version. Equal
-//!    ⇒ [`ExtractionStatus::Current`], [`ExtractionStatus::Building`], or
+//!    Below ⇒ [`ExtractionStatus::Outdated`] preserving the built version, except
+//!    the `uninitialized` phase, which is [`ExtractionStatus::Uninitialized`]
+//!    whichever older version wrote it: an uninit leaves no index to upgrade, and
+//!    its residue stays reserved for an explicit `init`. Equal ⇒
+//!    [`ExtractionStatus::Current`], [`ExtractionStatus::Building`], or
 //!    [`ExtractionStatus::Uninitialized`] by phase.
 //!
 //! Callers must branch on the typed variants and on [`CorruptReason`]; the
@@ -482,7 +485,8 @@ pub enum ExtractionStatus {
         /// The extraction version the interrupted build was producing.
         built: u64,
     },
-    /// A `uninit --force` was in progress when the namespace last advanced.
+    /// A `uninit --force` was in progress when the namespace last advanced, at
+    /// this extraction version or an older one.
     Uninitialized,
     /// No state slot exists at all.
     Missing,
@@ -961,7 +965,15 @@ fn classify_raw(
         // recoverable interrupted uninit.
         ExtractionStatus::Future { built }
     } else if built < CURRENT_EXTRACTION_VERSION {
-        ExtractionStatus::Outdated { built }
+        // An older version's uninit leaves the residue this version's leaves:
+        // no index to upgrade, and only an explicit `init` may rebuild it.
+        // Reading it as Outdated would let a sync or reindex recreate the index
+        // under its tombstone.
+        if authoritative.record.phase == Some(StatePhase::Uninitialized) {
+            ExtractionStatus::Uninitialized
+        } else {
+            ExtractionStatus::Outdated { built }
+        }
     } else {
         match authoritative.record.phase {
             Some(StatePhase::Current) => ExtractionStatus::Current,

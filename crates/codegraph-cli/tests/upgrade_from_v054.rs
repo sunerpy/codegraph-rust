@@ -105,9 +105,10 @@ fn a_cold_mcp_session_upgrades_a_v0_54_index_through_its_daemon() {
 }
 
 /// A daemon never undoes an older `uninit --force`. That leaves an
-/// `uninitialized` slot at the older extraction version, which the state gate
-/// classifies as `outdated`, a tombstone, and no database; the daemon must
-/// leave all of it alone and refuse to start, as it did before.
+/// `uninitialized` slot at the older extraction version, a tombstone, and no
+/// database, which the state gate classifies as `uninitialized`, like this
+/// version's own uninit; the daemon must not try to upgrade it, must leave all
+/// of it alone, and must refuse to start.
 #[cfg(unix)]
 #[test]
 fn a_cold_mcp_session_leaves_an_older_uninit_alone() {
@@ -126,10 +127,8 @@ fn a_cold_mcp_session_leaves_an_older_uninit_alone() {
         V0_54_EXTRACTION_VERSION,
         "uninitialized",
     );
-    let outdated = ExtractionStatus::Outdated {
-        built: V0_54_EXTRACTION_VERSION,
-    };
-    assert_eq!(Store::extraction_status(&paths), outdated);
+    let uninitialized = ExtractionStatus::Uninitialized;
+    assert_eq!(Store::extraction_status(&paths), uninitialized);
     assert!(paths.tombstone().is_file(), "uninit leaves its tombstone");
     assert!(!paths.current_db().exists(), "uninit removes the database");
     let slots = state_slot_bytes(&paths);
@@ -146,7 +145,7 @@ fn a_cold_mcp_session_leaves_an_older_uninit_alone() {
         "the daemon recreated the database an uninit removed:\n{log}"
     );
     assert!(paths.tombstone().is_file(), "the tombstone must stay");
-    assert_eq!(Store::extraction_status(&paths), outdated);
+    assert_eq!(Store::extraction_status(&paths), uninitialized);
     assert_eq!(
         state_slot_bytes(&paths),
         slots,
@@ -157,8 +156,12 @@ fn a_cold_mcp_session_leaves_an_older_uninit_alone() {
         "no daemon may serve this index"
     );
     assert!(
-        log.contains("left the outdated index to the startup gate"),
-        "the daemon must say why it left the index alone:\n{log}"
+        log.contains("index state is uninitialized"),
+        "the daemon must refuse the uninit as uninitialized:\n{log}"
+    );
+    assert!(
+        !log.contains("upgrading an index an older codegraph built"),
+        "the daemon must not try to upgrade an uninit:\n{log}"
     );
     session.close();
 }
