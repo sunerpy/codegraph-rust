@@ -7,11 +7,13 @@
 
 ## Current alignment
 
-- **Tracked colby release:** `v1.6.1`. All portable in-scope behavior audited
-  through that release is closed: ported, already present, recorded N/A, or
-  deferred by the owner, as the 2026-10-01 CLOSEOUT entry below lists. The
-  official codegraph-rs `v0.51.0` binaries passed the release smoke recorded
-  there.
+- **Tracked colby release:** `v1.6.2`. All portable in-scope behavior audited
+  through that release, and through the `main` commits after it up to the last
+  discovery audit, is closed: ported, already present, recorded N/A or
+  KEEP-RUST, excluded by the owner, or moved by the owner to the follow-up pull
+  request, as the 2026-10-22 CLOSEOUT entry below lists. The official
+  codegraph-rs `v0.55.0` binaries passed the black-box acceptance in the
+  2026-10-22 release entry.
 - **Last discovery audit:** colby `main` at
   `b635dd467f0578926a9c01a37b9d28d2b26689f1` (2026-10-07), audited on
   2026-10-10 in [`V1_6_2_AUDIT_2026-10-10.md`](V1_6_2_AUDIT_2026-10-10.md): 268
@@ -23,15 +25,17 @@
 - **Next discovery starts here:**
   `b635dd467f0578926a9c01a37b9d28d2b26689f1..origin/main`. Do not re-triage the
   audited range.
-- **Planned for codegraph-rs `v0.55.0`:** the 2026-10-10 audit's rows under
-  waves W0 to W6 and W10 of its program. By the owner's decision of 2026-10-16
-  the rows under W7, W8 and W9 (the UI family F1–F12 with the synthesis stage
-  and the framework resolvers, VB.NET, `codegraph context`, #1617 and the 26
-  v1.5.0 performance strategies) move to a follow-up pull request; the audit
-  marks them `PLANNED (follow-up PR)`, and a row that lands only partly in
-  `v0.55.0` names both halves. See the 2026-10-16 entry below. The tracked
-  release stays `v1.6.1` until `v0.55.0` ships and its downloaded binaries are
-  verified.
+- **Shipped in codegraph-rs `v0.55.0`, 2026-10-22:** #322, the 2026-10-10
+  audit's rows under waves W0 to W6 and W10 of its program, with extraction
+  version 22. The audit's `LANDED` rows name the commits and #322. See the
+  2026-10-22 release and CLOSEOUT entries below.
+- **Planned for the follow-up pull request:** the rows under W7, W8 and W9
+  (the UI family F1–F12 with the synthesis stage and the framework resolvers,
+  VB.NET, `codegraph context`, #1617 and the 26 v1.5.0 performance
+  strategies), by the owner's decision of 2026-10-16. The audit marks them
+  `PLANNED (follow-up PR)`, and a row that landed only partly in `v0.55.0`
+  names both halves. That pull request moves the extraction version from 22 to
+  23. See the 2026-10-16 entry below.
 - **Upstream repository:** <https://github.com/colbymchenry/codegraph>.
 - **Shipped in codegraph-rs `v0.52.0`, 2026-10-01:**
   - #286, which makes a full `sync` keep what `index` keeps;
@@ -84,13 +88,39 @@
   deferred, scheduled as phases 2–4: F10/F11 first, then F1–F6 with Screens and
   Steps, then F7–F9 and F12. The 2026-10-10 program planned all of them for
   `v0.55.0`; on 2026-10-16 the owner moved them, with the rest of W7, to the
-  follow-up pull request. `v0.55.0` lands from them only `950686de`'s test-file
+  follow-up pull request. `v0.55.0` landed from them only `950686de`'s test-file
   classifier and `b1f40c57`'s `e2e/` test path (one predicate with the
   resolver's), and the route roots its routes list reads.
 
 The Rust product and upstream release versions are independent. This Current
 alignment block is the only place that states release parity; dated log entries
 below remain immutable historical evidence.
+
+> **1.6.1 → 1.6.2 sync: COMPLETE** (codegraph-rs `v0.54.0` → `v0.55.0`).
+> Every portable, in-scope behavior of the audited range — the `v1.6.2`
+> release and the 88 `main` commits after it, through `b635dd46` — landed in
+> #322, except the exceptions below, and the official `v0.55.0` binaries passed
+> the black-box acceptance in the 2026-10-22 release entry below. The explicit
+> exceptions are:
+>
+> - **COBOL is OWNER-EXCLUDED** (2026-10-10): the extraction (#1161), the CICS
+>   resolver, #2272 and #2358. crates.io's `tree-sitter-cobol` is a placeholder,
+>   and the grammar manifest forbids vendoring a grammar.
+> - **G16 and G17 are OWNER-EXCLUDED** (2026-10-12): two older C/C++
+>   extraction gaps found while porting #2446 and only recorded. A variable at
+>   namespace scope, and a struct or union defined inside a function body, get
+>   no node.
+> - **Refusing a schema newer than the binary (OD-19) is PLANNED (follow-up
+>   PR)**, with the design constraints the audit records.
+> - **The rows under W7, W8 and W9 are PLANNED (follow-up PR)** (2026-10-16):
+>   the UI family F1–F12 with the synthesis stage and the framework resolvers,
+>   VB.NET, `codegraph context`, #1617 and the 26 v1.5.0 performance
+>   strategies.
+> - **KEEP-RUST divergences** are recorded row by row in the audit. Three of
+>   them add behavior upstream does not have: property type references for
+>   Kotlin and PHP, C# extension methods reached from an outside receiver
+>   type, and C/C++ alias signatures.
+> - The `1.6.0 → 1.6.1` and older caveats below carry forward unchanged.
 
 > **1.6.0 → 1.6.1 sync: COMPLETE** (codegraph-rs `v0.50.3` → `v0.51.0`).
 > Every audited portable, in-scope behavior landed in six porting PRs (#275,
@@ -185,6 +215,159 @@ below remain immutable historical evidence.
 > that records colby parity — do not infer it from `Cargo.toml`.
 
 ## Sync log
+
+### 2026-10-22 — CLOSEOUT: `v1.6.1 → v1.6.2` sync COMPLETE in codegraph-rs `v0.55.0` (tracked parity advanced to `v1.6.2`)
+
+The 2026-10-10 audit covered `f4ddf508..b635dd46`: 268 commits, of which the
+first 180 make up `v1.6.2`. #322 landed every row the program kept for
+`v0.55.0`, waves W0 to W6 and W10, in 206 commits squashed into `0796c8a`.
+The audit's status column now reads `LANDED` with those commits and #322,
+`ALREADY-HAVE`, `KEEP-RUST`, `N/A`, `OWNER-EXCLUDED`, or `PLANNED (follow-up
+PR)`; no row is still `PLANNED` for this release.
+
+The tracked release moves to `v1.6.2`, the newest formal tag before
+`b635dd46`. Everything portable through it has landed, except the owner's
+exceptions in Current alignment, and the downloaded `v0.55.0` binaries are
+verified in the release entry below. The rows `PLANNED (follow-up PR)` get
+their own entry when that pull request lands. The next discovery starts at
+`b635dd467f0578926a9c01a37b9d28d2b26689f1..origin/main`.
+
+### 2026-10-22 — `v0.55.0` RELEASED: #322 shipped
+
+The implementation PR #322 merged as `0796c8a`, with the tree of its reviewed
+head `f5287d0` (`93c051b…`). The final kirocodex goal review failed on the
+previous head `d21291b` with two blocking items and passed on `f5287d0` with
+none. Main CI run
+[`39599579698`](https://github.com/sunerpy/codegraph-rust/actions/runs/39599579698)
+passed.
+
+Release-please PR [#325](https://github.com/sunerpy/codegraph-rust/pull/325)
+merged as `5f96a741504e656fd9f6bed138b288ab22a490a0`, with the tree of its head
+`67a9a9d`, `029198b…`.
+
+- The owner approved it as code owner. One Linux test failed in its CI run
+  [`39605156993`](https://github.com/sunerpy/codegraph-rust/actions/runs/39605156993)
+  (`plain_output`, a temporary directory two tests can share); the re-run of
+  the failed jobs passed, so attempt 2 is all green.
+- GitHub never delivered the push event of that merge. The commit has no
+  workflow run and no check suite, and the repository activity log has no
+  merge entry for it, though every earlier merge has one. Release Please runs
+  only on push, and the exact-SHA gate needs a CI push run on the release
+  commit, which `ci.yml` cannot produce later. The release stalled.
+- #327 merged as `b02b563`. A manual Release dispatch may now name the release
+  PR's own CI run; it is accepted only while the release commit has no CI push
+  run, and only for a run on the same tree, and a CI push run that appears
+  later must pass before publication. That merge's push was delivered: Release
+  Please created tag `v0.55.0` at `5f96a74` and the draft. Its run
+  [`39698159119`](https://github.com/sunerpy/codegraph-rust/actions/runs/39698159119)
+  was cancelled once the draft existed, because its exact-SHA gate could not
+  pass.
+
+Release workflow run
+[`39698634632`](https://github.com/sunerpy/codegraph-rust/actions/runs/39698634632),
+dispatched on `main` with `tag_name=v0.55.0` and `ci_run_id=39605156993`,
+passed all twelve jobs on its first attempt.
+
+- The CI gate accepted #325's run `39605156993` (attempt 2, head `67a9a9d`,
+  tree `029198b…`), since `5f96a74` has no CI push run; the publish-time check
+  found none either.
+- Every build job checked out tag `v0.55.0` and verified that it resolves to
+  `5f96a74`. The attestations name the dispatch run and its commit `b02b563`.
+- The release was published at 2026-10-22T00:34:16Z UTC.
+- The official `codegraph-0.55.0-x86_64-unknown-linux-musl.tar.gz` digest is
+  `c3503ff2f91c863b65d9d0c8c148eea047c92fd1553cfd0eb4be62e22c0357cc`.
+
+Black-box acceptance of the downloaded release, against the official `v0.54.0`:
+
+- **Artifacts.** `SHA256SUMS` and `gh attestation verify` passed for all six
+  archives. The binary reports `codegraph 0.55.0`, and its `.comment` section
+  names rustc 1.98.0.
+- **Upgrade.** On this repository's `14c4f93` tree, an index built by
+  `v0.54.0` (extraction version 21) is `outdated` to `v0.55.0`. One `sync`
+  makes it current at extraction version 22 with nothing pending, and its
+  `export` is byte-identical to a fresh `init` (20,241 nodes, 67,962 edges).
+  `v0.54.0` reports the `v0.55.0` index as `future`, refuses `sync` and
+  `search`, and leaves every file of the index byte-identical.
+- **Daemon.** A `v0.54.0` session and its daemon run on a `v0.54.0` index.
+  After `codegraph sync`, a `v0.55.0` session replaces that daemon ("replaced
+  the daemon an older codegraph install left running"), and a write reaches the
+  index. Without the `sync`, see the known issue below.
+- **Cold start.** With the idle timeout at 4 s, the daemon of a cold
+  `v0.55.0` session is still alive after 8 s, and an edit then reaches the
+  index. `v0.54.0`'s daemon idle-exits under the open session, and the edit
+  never arrives.
+- **Bulk rename.** With a live session, 600 files renamed at once leave
+  nothing pending after 4.9 s, and the index equals a fresh `init` of the
+  renamed tree.
+- **Graph.** 20 seeds from the program's inputs hold on `v0.55.0`; 14 of them
+  do not hold on `v0.54.0`. The 20 include a C# base list, a Vue
+  `<script setup>` call, a Svelte instance call, Go embedding, a TS value
+  reference, static member reads in Java and Rust, a Kotlin property type, an
+  import that binds its file, `it()` no longer binding a project property, a
+  `super` call that is not a self call, Python bases, overloads by arity, a
+  type parameter that stays in scope, and a sync that retries a failed TS
+  import or PHP `require`.
+- **Contract.** On the same tree, the `--json` output of `search`, `callers`,
+  `callees` and `impact` has the same fields and types as `v0.54.0`'s;
+  `export` adds `metadata.valueRef` on edges and changes nothing else.
+- **MCP.** A second `serve --mcp` session beside a running daemon, and one
+  launched in `$HOME`, both answer MCP 2026-07-28 `server/discover` and
+  `tools/list` with `resultType: "complete"`. A 2025-06-18 `initialize` gets
+  2025-06-18 back. `v0.54.0` answers `server/discover` with "Method not
+  found".
+- **Performance.** The published Linux binary exports the same graph as the
+  benchmarked `f5287d0` candidate. At 4 threads on this repository its wall
+  time and peak RSS are 11.41 s and 261 MiB, against 11.39 s and 271 MiB
+  (medians of 3 runs).
+
+**Known issue, older than this release.** In the default daemon mode, an
+index an older extraction version built is never upgraded on its own. The
+session defers to the daemon, and the daemon refuses to start on an
+`outdated` index, so MCP tool calls answer "state-gated Store open rejected
+index state outdated" until `codegraph sync` runs. `v0.54.0` does the same on a
+`v0.53.0` index. With `CODEGRAPH_NO_DAEMON=1`, the session upgrades the index
+itself. `v0.55.0` moves the extraction version from 21 to 22, so every
+`v0.54.0` index needs one `codegraph sync <project>`. The owner decided on
+2026-10-22 to fix this in a patch release.
+
+**Benchmark.** Baseline: the official `v0.54.0` musl binary. Candidate: the
+`f5287d0` musl build with the Release workflow's toolchain (zig 0.15.1,
+cargo-zigbuild 0.23.0, rustc 1.98.0). The cells are this repository's
+`14c4f93` archive and typescript-large at 32, 4 and 1 threads, and the nine
+other registry corpora at 32 and 4. Each binary ran `codegraph init` six times
+per cell, interleaved with the other, on a 32-core Linux host (Xeon 6975P-C,
+Ubuntu 24.04, kernel 7.0). The first run is dropped; the figures are the median
+and range of the other five. Every kept run exited 0 and produced the same
+canonical graph as its binary's other runs. All 24 cells are within the
+budget: peak RSS at most 1.15x, and wall at most 1.10x or rows per second at
+least 0.90x.
+
+| corpus | threads | canonical rows | wall | rows/s | peak RSS |
+| --- | ---: | --- | --- | ---: | --- |
+| repo-14c4f93 | 32 | 142,230 → 166,893 (1.173x) | 8.19 s (7.90–8.36) → 8.67 s (8.39–8.89), 1.058x | 1.109x | 554 MiB (550–557) → 440 MiB (438–448), 0.795x |
+| repo-14c4f93 | 4 | 142,230 → 166,893 (1.173x) | 12.89 s (12.79–12.99) → 11.39 s (11.38–11.44), 0.883x | 1.328x | 262 MiB (261–265) → 270 MiB (270–272), 1.032x |
+| repo-14c4f93 | 1 | 142,230 → 166,893 (1.173x) | 36.29 s (36.14–36.34) → 29.02 s (28.72–29.07), 0.800x | 1.467x | 228 MiB (226–231) → 241 MiB (240–241), 1.056x |
+| typescript-large | 32 | 236,805 → 243,505 (1.028x) | 17.62 s (17.30–17.73) → 15.27 s (14.96–15.77), 0.866x | 1.187x | 684 MiB (679–694) → 546 MiB (544–555), 0.797x |
+| typescript-large | 4 | 236,805 → 243,505 (1.028x) | 38.39 s (38.24–38.95) → 20.66 s (20.61–20.71), 0.538x | 1.911x | 392 MiB (386–394) → 336 MiB (336–338), 0.859x |
+| typescript-large | 1 | 236,805 → 243,505 (1.028x) | 120.07 s (119.56–120.57) → 47.77 s (47.61–47.86), 0.398x | 2.585x | 358 MiB (356–360) → 313 MiB (313–315), 0.876x |
+| fd-small | 32 | 2,470 → 3,003 (1.216x) | 0.21 s (0.21–0.21) → 0.21 s (0.21–0.21), 1.000x | 1.216x | 275 MiB (273–276) → 122 MiB (121–124), 0.443x |
+| fd-small | 4 | 2,470 → 3,003 (1.216x) | 0.21 s (0.21–0.21) → 0.21 s (0.21–0.21), 1.000x | 1.216x | 61 MiB (57–61) → 39 MiB (38–40), 0.644x |
+| tokio-medium | 32 | 35,448 → 44,937 (1.268x) | 2.02 s (2.00–2.02) → 2.02 s (2.02–2.07), 1.001x | 1.266x | 355 MiB (353–359) → 205 MiB (203–205), 0.577x |
+| tokio-medium | 4 | 35,448 → 44,937 (1.268x) | 2.37 s (2.32–2.37) → 2.22 s (2.22–2.22), 0.937x | 1.353x | 95 MiB (94–97) → 80 MiB (80–81), 0.847x |
+| express-medium | 32 | 11,846 → 12,046 (1.017x) | 0.97 s (0.97–1.02) → 0.62 s (0.57–0.62), 0.635x | 1.602x | 342 MiB (342–346) → 182 MiB (179–182), 0.532x |
+| express-medium | 4 | 11,846 → 12,046 (1.017x) | 2.87 s (2.87–2.87) → 0.52 s (0.51–0.52), 0.179x | 5.666x | 72 MiB (71–75) → 55 MiB (54–57), 0.769x |
+| leveldb-small | 32 | 17,260 → 17,479 (1.013x) | 0.97 s (0.97–1.02) → 0.97 s (0.97–0.97), 0.998x | 1.015x | 286 MiB (283–292) → 119 MiB (117–122), 0.416x |
+| leveldb-small | 4 | 17,260 → 17,479 (1.013x) | 1.27 s (1.22–1.27) → 1.02 s (1.02–1.02), 0.802x | 1.262x | 77 MiB (75–78) → 62 MiB (62–63), 0.806x |
+| gson-medium | 32 | 34,746 → 43,157 (1.242x) | 2.07 s (2.02–2.07) → 2.22 s (2.22–2.23), 1.074x | 1.157x | 371 MiB (369–373) → 248 MiB (242–249), 0.668x |
+| gson-medium | 4 | 34,746 → 43,157 (1.242x) | 4.12 s (4.07–4.12) → 4.12 s (4.07–4.17), 1.000x | 1.242x | 100 MiB (98–101) → 94 MiB (93–96), 0.932x |
+| newtonsoft-large | 32 | 81,453 → 109,589 (1.345x) | 7.49 s (7.34–7.54) → 8.14 s (7.94–8.14), 1.087x | 1.238x | 416 MiB (414–421) → 360 MiB (355–363), 0.865x |
+| newtonsoft-large | 4 | 81,453 → 109,589 (1.345x) | 14.79 s (14.74–14.84) → 12.84 s (12.79–12.94), 0.868x | 1.550x | 161 MiB (161–162) → 175 MiB (173–177), 1.086x |
+| alamofire-small | 32 | 7,043 → 10,295 (1.462x) | 0.52 s (0.52–0.52) → 0.72 s (0.72–0.72), 1.388x | 1.053x | 330 MiB (321–334) → 195 MiB (185–195), 0.590x |
+| alamofire-small | 4 | 7,043 → 10,295 (1.462x) | 0.62 s (0.62–0.62) → 0.82 s (0.82–0.82), 1.326x | 1.103x | 71 MiB (71–72) → 59 MiB (58–61), 0.833x |
+| redis-medium | 32 | 65,393 → 67,446 (1.031x) | 4.07 s (4.07–4.12) → 4.22 s (4.07–4.42), 1.037x | 0.995x | 270 MiB (262–276) → 198 MiB (197–203), 0.734x |
+| redis-medium | 4 | 65,393 → 67,446 (1.031x) | 3.07 s (3.02–3.07) → 3.22 s (3.17–3.27), 1.049x | 0.983x | 129 MiB (126–131) → 121 MiB (119–122), 0.936x |
+| kong-medium | 32 | 41,516 → 41,516 (1.000x) | 3.02 s (2.97–3.07) → 2.22 s (2.22–2.27), 0.735x | 1.360x | 402 MiB (391–407) → 241 MiB (236–243), 0.598x |
+| kong-medium | 4 | 41,516 → 41,516 (1.000x) | 5.53 s (5.48–5.58) → 2.67 s (2.62–2.67), 0.483x | 2.070x | 116 MiB (115–117) → 89 MiB (88–90), 0.765x |
 
 ### 2026-10-16 — the codegraph-rs `v0.55.0` program SPLIT into two pull requests (OD-18)
 
