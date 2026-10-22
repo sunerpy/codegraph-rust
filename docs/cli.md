@@ -1360,9 +1360,11 @@ equals a fresh `init`. An MCP session upgrades a complete older index as well:
 in the default daemon mode the project's daemon rebuilds it the same way before it
 starts serving, and with `CODEGRAPH_NO_DAEMON=1` the session's own catch-up does.
 Until the rebuild finishes, a tool call may wait for it, up to 30 seconds, or
-fail; a later call succeeds. The daemon leaves an older index alone when it is
-not complete (an interrupted build, an `uninit --force`, or a missing database)
-and refuses to start; run `codegraph status` for the recovery it needs. Do not run `index --force` solely because the extraction version
+fail; a later call succeeds once it is done. A rebuild that fails partway leaves
+the index `building`, as an interrupted `sync` does. The daemon also leaves an
+older index alone when it is not complete (an interrupted build, an
+`uninit --force`, or a missing database). In both cases it refuses to start; run
+`codegraph status` for the recovery it needs. Do not run `index --force` solely because the extraction version
 changed. An older binary refuses an index a newer extraction version wrote and
 leaves it untouched.
 
