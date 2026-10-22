@@ -41,8 +41,13 @@ F=$(fixture F_coverage); mutate "$F/codecov.yml" '        informational: true' '
 G=$(fixture G_source); mutate "$G/.github/workflows/release.yml" '        run: bash scripts/check-workspace-versions.sh' '        run: echo skipped'; run G_source "$G"; expect G_source nonzero 'first-Cargo version gate'
 H=$(fixture H_verify); mutate "$H/.github/workflows/release.yml" '    needs: [release-please, source-gate]' '    needs: release-please'; run H_verify "$H"; expect H_verify nonzero 'verify must need release-please and source-gate'
 I=$(fixture I_upload); mutate "$I/.github/workflows/release.yml" '    needs: [release-please, source-gate, verify-ci, verify, build-binaries]' '    needs: [release-please, source-gate, verify, build-binaries]'; run I_upload "$I"; expect I_upload nonzero 'upload-assets bypasses'
-J=$(fixture J_exact_ci); mutate "$J/.github/workflows/release.yml" 'select(.name == "CI Success")' 'select(.name == "CI Maybe")'; run J_exact_ci "$J"; expect J_exact_ci nonzero 'verify-ci does not require exact-SHA CI Success'
+J=$(fixture J_exact_ci); mutate "$J/.github/workflows/release.yml" 'select(.name == "CI Success")] | last // {}' 'select(.name == "CI Maybe")] | last // {}'; run J_exact_ci "$J"; expect J_exact_ci nonzero 'verify-ci does not require exact-SHA CI Success'
 K=$(fixture K_yaml); mutate "$K/.github/workflows/ci.yml" 'jobs:' 'jobs: [bad]\nignored:'; run K_yaml "$K"; expect K_yaml nonzero 'check-ci-gate: ERROR'
+L=$(fixture L_pr_ci_on_push); mutate "$L/.github/workflows/release.yml" "if: github.event_name == 'workflow_dispatch' && inputs.ci_run_id != ''" "if: inputs.ci_run_id != ''"; run L_pr_ci_on_push "$L"; expect L_pr_ci_on_push nonzero 'reads inputs.ci_run_id outside workflow_dispatch'
+M=$(fixture M_exact_skipped); mutate "$M/.github/workflows/release.yml" "if: steps.pr_ci.outputs.accepted != 'true'" "if: steps.pr_ci.outputs.accepted != 'false'"; run M_exact_skipped "$M"; expect M_exact_skipped nonzero 'exact-SHA wait step is skipped'
+N=$(fixture N_pr_read); mutate "$N/.github/workflows/release.yml" $'      # commits/<sha>/pulls in the dispatch-only PR-CI step.\n      pull-requests: read\n' ''; run N_pr_read "$N"; expect N_pr_read nonzero 'lacks pull-requests: read'
+O=$(fixture O_no_recheck); mutate "$O/.github/workflows/release.yml" "if: needs.verify-ci.outputs.pr_ci_accepted == 'true'" 'if: false'; run O_no_recheck "$O"; expect O_no_recheck nonzero 'does not re-check exact-SHA CI before publishing'
+P=$(fixture P_publish_needs); mutate "$P/.github/workflows/release.yml" '    needs: [release-please, verify-ci, upload-assets]' '    needs: [release-please, upload-assets]'; run P_publish_needs "$P"; expect P_publish_needs nonzero 'publish-release must need verify-ci'
 
 echo "ci-gate harness: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

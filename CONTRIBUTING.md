@@ -105,3 +105,14 @@ placeholder, tags, or published release assets manually. Release Please owns
 all four version surfaces. Maintainers publish only through
 the draft-until-verified workflow after exact-SHA CI, all platform archives,
 checksums, attestations, and archive smoke pass.
+
+GitHub can drop the push event of a release commit. Then no CI push run can
+appear for that commit, and the exact-SHA gate cannot pass. Once the next merge
+to `main` has let Release Please create the draft, dispatch the Release workflow
+on `main` with `tag_name` and `ci_run_id`, the ID of the release PR's own CI
+run. The workflow accepts that run only if it is a completed `pull_request` run
+of `ci.yml` in this repository with `CI Success` passed, its head is the head of
+the merged release PR, that head contains the release commit's parent, and both
+commits have the same tree. While the release commit has a CI push run, the
+exact-SHA gate decides, and a CI push run that appears after that run was
+accepted must pass before the publish job makes the release public.

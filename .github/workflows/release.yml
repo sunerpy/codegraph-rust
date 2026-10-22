@@ -14,6 +14,11 @@ on:
         description: "Existing draft release tag to rebuild, for example v1.2.3"
         required: true
         type: string
+      ci_run_id:
+        description: "Only when GitHub dropped the release commit's push event: the release PR's CI run on the same tree"
+        required: false
+        default: ""
+        type: string
 
 permissions:
   contents: read
@@ -122,6 +127,10 @@ jobs:
     permissions:
       actions: read
       contents: read
+      # commits/<sha>/pulls in the dispatch-only PR-CI step.
+      pull-requests: read
+    outputs:
+      pr_ci_accepted: ${{ steps.pr_ci.outputs.accepted }}
     steps:
       - name: Checkout release tag
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -141,7 +150,87 @@ jobs:
             exit 1
           fi
 
+      # GitHub can drop the push event of a merge (v0.55.0's release commit got
+      # no run at all), and ci.yml has no dispatch trigger, so no push run can
+      # appear for that commit afterwards. A manual rebuild may then name the
+      # release PR's own CI run; it is accepted only for an identical tree and
+      # only while the release commit has no push CI run.
+      - name: Accept the release PR's CI when the push run is missing
+        id: pr_ci
+        if: github.event_name == 'workflow_dispatch' && inputs.ci_run_id != ''
+        shell: bash
+        env:
+          CI_RUN_ID: ${{ inputs.ci_run_id }}
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_SHA: ${{ needs.release-please.outputs.release_sha }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          fail() {
+            echo "::error title=Release CI::$*"
+            exit 1
+          }
+          push_runs=$(gh api "repos/${REPO}/actions/runs?head_sha=${RELEASE_SHA}&event=push&branch=main&per_page=100" \
+            --jq '[.workflow_runs[] | select(.name == "CI")] | length') \
+            || fail "cannot list the push runs of ${RELEASE_SHA}"
+          [[ "$push_runs" =~ ^[0-9]+$ ]] || fail "unexpected push-run count '${push_runs}' for ${RELEASE_SHA}"
+          if [ "$push_runs" != 0 ]; then
+            echo "A push CI run exists for ${RELEASE_SHA}; the exact-SHA gate decides."
+            echo "accepted=false" >>"$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          [[ "$CI_RUN_ID" =~ ^[0-9]+$ ]] || fail "ci_run_id must be a run ID, got '${CI_RUN_ID}'"
+          run=$(gh api "repos/${REPO}/actions/runs/${CI_RUN_ID}") || fail "cannot read CI run ${CI_RUN_ID}"
+          field() { jq -r "$1" <<<"$run"; }
+          [ "$(field '.repository.full_name')" = "$REPO" ] || fail "run ${CI_RUN_ID} belongs to another repository"
+          [ "$(field '.head_repository.full_name')" = "$REPO" ] || fail "run ${CI_RUN_ID} tested a head outside ${REPO}"
+          [ "$(field '.name')" = CI ] || fail "run ${CI_RUN_ID} is not the CI workflow"
+          [ "$(field '.path')" = .github/workflows/ci.yml ] || fail "run ${CI_RUN_ID} is not .github/workflows/ci.yml"
+          [ "$(field '.event')" = pull_request ] || fail "run ${CI_RUN_ID} is not a pull_request run"
+          [ "$(field '.status')" = completed ] || fail "run ${CI_RUN_ID} has not completed"
+          head=$(field '.head_sha')
+          [[ "$head" =~ ^[0-9a-f]{40}$ ]] || fail "run ${CI_RUN_ID} has no head SHA"
+
+          gate=$(gh api "repos/${REPO}/actions/runs/${CI_RUN_ID}/jobs?per_page=100" \
+            --jq '[.jobs[] | select(.name == "CI Success")] | last | .conclusion // empty') \
+            || fail "cannot read the jobs of run ${CI_RUN_ID}"
+          [ "$gate" = success ] || fail "CI Success concluded ${gate:-<missing>} in run ${CI_RUN_ID}"
+
+          prs=$(gh api "repos/${REPO}/commits/${RELEASE_SHA}/pulls") \
+            || fail "cannot list the pull requests of ${RELEASE_SHA}"
+          mapfile -t numbers < <(jq -r '.[].number' <<<"$prs")
+          matched=()
+          for number in "${numbers[@]}"; do
+            pr=$(gh api "repos/${REPO}/pulls/${number}") || fail "cannot read pull request #${number}"
+            if [ "$(jq -r '.merged' <<<"$pr")" = true ] \
+              && [ "$(jq -r '.base.ref' <<<"$pr")" = main ] \
+              && [ "$(jq -r '.merge_commit_sha' <<<"$pr")" = "$RELEASE_SHA" ] \
+              && [ "$(jq -r '.head.sha' <<<"$pr")" = "$head" ]; then
+              matched+=("$number")
+            fi
+          done
+          [ "${#matched[@]}" -eq 1 ] \
+            || fail "${#matched[@]} merged pull requests into main have merge commit ${RELEASE_SHA} and head ${head}; exactly one is required"
+
+          release=$(gh api "repos/${REPO}/commits/${RELEASE_SHA}") || fail "cannot read ${RELEASE_SHA}"
+          [ "$(jq -r '.parents | length' <<<"$release")" = 1 ] || fail "${RELEASE_SHA} does not have exactly one parent"
+          parent=$(jq -r '.parents[0].sha' <<<"$release")
+          release_tree=$(jq -r '.commit.tree.sha' <<<"$release")
+          behind=$(gh api "repos/${REPO}/compare/${parent}...${head}" --jq '.behind_by') \
+            || fail "cannot compare ${parent}...${head}"
+          # A head that contains the merge's parent contains every earlier main,
+          # so the PR run tested the head's own tree.
+          [ "$behind" = 0 ] || fail "PR head ${head} is ${behind} commit(s) behind ${parent}"
+          head_tree=$(gh api "repos/${REPO}/commits/${head}" --jq '.commit.tree.sha') || fail "cannot read ${head}"
+          [ "$head_tree" = "$release_tree" ] \
+            || fail "tree ${head_tree} of ${head} differs from the release commit's tree ${release_tree}"
+
+          echo "::warning title=Release CI::no push CI run exists for ${RELEASE_SHA}; accepted CI run ${CI_RUN_ID} of PR #${matched[0]} (head ${head}, tree ${release_tree})"
+          echo "accepted=true" >>"$GITHUB_OUTPUT"
+
       - name: Wait for exact-SHA CI Success
+        if: steps.pr_ci.outputs.accepted != 'true'
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -526,12 +615,13 @@ jobs:
 
   publish-release:
     name: Publish Release
-    needs: [release-please, upload-assets]
+    needs: [release-please, verify-ci, upload-assets]
     if: needs.release-please.outputs.build_artifacts == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     environment: release
     permissions:
+      actions: read
       contents: write
     steps:
       - name: Checkout release tooling
@@ -545,6 +635,48 @@ jobs:
         with:
           name: checksums
           path: dist
+
+      # verify-ci accepted the release PR's CI because no push run existed then.
+      # A CI push run can still appear before publication (for example when
+      # GitHub replays the dropped push event); publish only if it passes too.
+      - name: Re-check exact-SHA CI after accepting the release PR's CI
+        id: exact_ci_recheck
+        if: needs.verify-ci.outputs.pr_ci_accepted == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ needs.release-please.outputs.release_sha }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          fail() {
+            echo "::error title=Release CI::$*"
+            exit 1
+          }
+          run_id=$(gh api "repos/${REPO}/actions/runs?head_sha=${HEAD_SHA}&event=push&branch=main&per_page=100" \
+            --jq '[.workflow_runs[] | select(.name == "CI")] | sort_by(.created_at) | last | .id // empty') \
+            || fail "cannot list the push runs of ${HEAD_SHA}"
+          if [ -z "$run_id" ]; then
+            echo "No CI push run exists for ${HEAD_SHA}; the accepted release PR CI stands."
+            exit 0
+          fi
+          # Stay inside the job's 10 minutes; re-run this job once a slower run finishes.
+          for _ in $(seq 1 30); do
+            job=$(gh api "repos/${REPO}/actions/runs/${run_id}/jobs?per_page=100" \
+              --jq '[.jobs[] | select(.name == "CI Success")] | last // {}') \
+              || fail "cannot read the jobs of push run ${run_id}"
+            status=$(jq -r '.status // empty' <<<"$job")
+            conclusion=$(jq -r '.conclusion // empty' <<<"$job")
+            if [ "$status" != completed ]; then
+              sleep 15
+              continue
+            fi
+            [ "$conclusion" = success ] \
+              || fail "CI Success concluded ${conclusion:-<missing>} in push run ${run_id} for ${HEAD_SHA}"
+            echo "CI Success passed in push run ${run_id} for ${HEAD_SHA}."
+            exit 0
+          done
+          fail "CI Success of push run ${run_id} has not completed; re-run this job after it finishes"
 
       - name: Verify remote assets and publish the draft
         shell: bash

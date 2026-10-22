@@ -52,9 +52,32 @@ def runs(job):
 if 'release-please' not in needset('source-gate'): fail('release-gate','source-gate must need release-please')
 if 'scripts/check-workspace-versions.sh' not in runs('source-gate'): fail('release-gate','source-gate does not run the first-Cargo version gate')
 if 'release-please' not in needset('verify-ci'): fail('release-gate','verify-ci must need release-please')
-verify_ci_body=runs('verify-ci')
-if 'select(.name == "CI Success")' not in verify_ci_body or 'conclusion' not in verify_ci_body or '= success' not in verify_ci_body:
-    fail('release-gate','verify-ci does not require exact-SHA CI Success')
+verify_ci_steps=[s for s in ((rel_jobs.get('verify-ci') or {}).get('steps') or []) if isinstance(s,dict)]
+exact_ci=[s for s in verify_ci_steps if 'inputs.ci_run_id' not in str(s) and 'event=push' in str(s.get('run',''))]
+if len(exact_ci)!=1: fail('release-gate',f'verify-ci needs one exact-SHA push-run wait step, found {len(exact_ci)}')
+else:
+    verify_ci_body=str(exact_ci[0].get('run',''))
+    if 'select(.name == "CI Success")' not in verify_ci_body or 'conclusion' not in verify_ci_body or '= success' not in verify_ci_body:
+        fail('release-gate','verify-ci does not require exact-SHA CI Success')
+    if str(exact_ci[0].get('if','')).strip() not in ('',"steps.pr_ci.outputs.accepted != 'true'"):
+        fail('release-gate',f"the exact-SHA wait step is skipped by {exact_ci[0].get('if')!r}")
+for step in verify_ci_steps:
+    if 'inputs.ci_run_id' in str(step) and "github.event_name == 'workflow_dispatch'" not in str(step.get('if','')):
+        fail('release-gate',f"verify-ci step {step.get('name')!r} reads inputs.ci_run_id outside workflow_dispatch")
+verify_ci_job=rel_jobs.get('verify-ci') or {}
+if (verify_ci_job.get('permissions') or {}).get('pull-requests')!='read': fail('release-gate','verify-ci lacks pull-requests: read for the PR-CI step')
+if str((verify_ci_job.get('outputs') or {}).get('pr_ci_accepted','')).replace(' ','')!='${{steps.pr_ci.outputs.accepted}}':
+    fail('release-gate','verify-ci does not expose pr_ci_accepted from the pr_ci step')
+if 'verify-ci' not in needset('publish-release'): fail('release-gate','publish-release must need verify-ci')
+publish_steps=[s for s in ((rel_jobs.get('publish-release') or {}).get('steps') or []) if isinstance(s,dict)]
+recheck=[i for i,s in enumerate(publish_steps) if str(s.get('if','')).strip()=="needs.verify-ci.outputs.pr_ci_accepted == 'true'"]
+publish=[i for i,s in enumerate(publish_steps) if '--publish' in str(s.get('run',''))]
+if len(recheck)!=1 or not publish or recheck[0]>publish[0]:
+    fail('release-gate','publish-release does not re-check exact-SHA CI before publishing after the PR-CI fallback')
+else:
+    recheck_body=str(publish_steps[recheck[0]].get('run',''))
+    if 'event=push' not in recheck_body or 'select(.name == "CI Success")' not in recheck_body or '= success' not in recheck_body:
+        fail('release-gate','the publish-time re-check does not require CI Success of the exact-SHA push run')
 if not {'release-please','source-gate'} <= needset('verify'): fail('release-gate','verify must need release-please and source-gate')
 if 'make check' not in runs('verify'): fail('release-gate','verify does not run the complete local gate')
 if not {'release-please','source-gate'} <= needset('build-binaries'): fail('release-gate','build-binaries bypasses source-gate')
