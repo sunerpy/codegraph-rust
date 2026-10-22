@@ -216,6 +216,100 @@ below remain immutable historical evidence.
 
 ## Sync log
 
+### 2026-10-22 — `v0.55.1` RELEASED: #330 shipped
+
+Release-please PR [#331](https://github.com/sunerpy/codegraph-rust/pull/331)
+merged as `44fd8af13bff241c0706e463d953192b9ee33198`, and tag `v0.55.1` was cut
+at that exact commit.
+
+- The merge has the tree of the PR's head `9f7536e`, `4bfbe91…`.
+- The owner re-ran the bot's CI run
+  [`39746633290`](https://github.com/sunerpy/codegraph-rust/actions/runs/39746633290)
+  (attempt 2, all green) and approved the PR as code owner.
+- The implementation PR #330 merged as `b6f0106`, with the tree of its reviewed
+  head `fd097d4`, `e60702f…`. The kirocodex review failed round 1 on the
+  earlier head `8bb6e0a` with one blocking item and passed round 2 on
+  `fd097d4` with none. An earlier attempt had ended without a verdict when the
+  reviewer's connection dropped. Main CI run
+  [`39746576444`](https://github.com/sunerpy/codegraph-rust/actions/runs/39746576444)
+  passed.
+
+Release workflow run
+[`39754559422`](https://github.com/sunerpy/codegraph-rust/actions/runs/39754559422)
+passed all twelve jobs on its first attempt.
+
+- Unlike `v0.55.0`'s, the push of the release commit was delivered, so the run
+  was triggered by that push.
+- Its CI gate took the exact-SHA branch over main CI run
+  [`39754559497`](https://github.com/sunerpy/codegraph-rust/actions/runs/39754559497),
+  whose required `CI Success` passed. The release-PR fallback and the
+  publish-time recheck were skipped.
+- The release was published at 2026-10-22T09:47:47Z UTC.
+- The official `codegraph-0.55.1-x86_64-unknown-linux-musl.tar.gz` digest is
+  `298e179a6dc0eb7972e330cf3cbc4a563c0862ca0c50f23402328a93d98d8fa4`.
+
+Black-box acceptance of the downloaded release:
+
+- **Artifacts.** The release is not a draft, and its assets are the six
+  archives and `SHA256SUMS`. `SHA256SUMS` and `gh attestation verify` passed
+  for all six archives, and every attestation names run `39754559422`. The
+  binary reports `codegraph 0.55.1`, and its `.comment` section names rustc
+  1.98.0.
+- **Cold start.** An index built by the official `v0.54.0` and one built by
+  `v0.53.0` each received a cold `v0.55.1` `serve --mcp` session. Its daemon
+  upgraded the index to `current` with no manual `sync`. A write then reached
+  the index, and the index exported byte-identical to a fresh `init` of the
+  same tree.
+- **Daemon replacement.** A `v0.55.1` session replaced a `v0.54.0` daemon that
+  served a `v0.54.0` index. The new daemon upgraded the index, with the same
+  results.
+- **Control.** The same scripts fail against `v0.55.0`. With it, the index stays
+  `outdated`, and no `v0.55.0` daemon comes up.
+
+This closes the known issue in the `v0.55.0` entry below.
+
+### 2026-10-22 — The daemon upgrades an index an older extraction version built
+
+Not an upstream port: a fix for the known issue the `v0.55.0` release entry
+records. In the default daemon mode, nothing upgraded an index an older
+extraction version built:
+
+- the cold `serve --mcp` session defers to its daemon;
+- the daemon's startup gate admits only a `current` index;
+- so tool calls answered "outdated" until a manual `codegraph sync`.
+
+#330 makes the daemon run `codegraph_watch::upgrade_outdated_index_once` before
+that gate.
+
+- **What it upgrades.** It rebuilds only a complete older index: an `outdated`
+  namespace whose authoritative slot records the `current` phase, no
+  uninitialized tombstone, and the database file. All three are checked under
+  the one exclusive lease the migration then reuses.
+- **Why the checks are needed.** The state gate classifies every phase an
+  older version wrote as `outdated`. Without the checks, a daemon would rebuild
+  the database an older `uninit --force` removed.
+- **What it leaves alone.** Anything else stays untouched for the unchanged
+  gate to refuse.
+- **When the upgrade fails.** A failed upgrade stops that daemon before the
+  gate. The rebuild's last step publishes `current`, and the publisher's
+  directory sync can still fail after that, so the gate alone could have served
+  an index whose upgrade had just failed. The kirocodex review's round-1 item
+  was exactly this.
+
+Still open, older than this release: `codegraph sync` migrates every
+`outdated` namespace, so it would also rebuild an older binary's
+`uninit --force` leftovers. This comes from reading the code path. It was not
+reproduced, and #330 does not change it.
+
+The same PR gives every `plain_output` test project its own temporary
+directory. Two tests that started within one clock tick shared one, and the
+first to finish deleted the other's project, as in #325's first CI attempt.
+
+On #330's head `8bb6e0a`, Windows Tests failed once in
+`catch_up_absorbs_offline_edit`: its first tool call took 4.88 s against a 2 s
+bound. That test forces direct mode, and it passed on the heads before and
+after.
+
 ### 2026-10-22 — CLOSEOUT: `v1.6.1 → v1.6.2` sync COMPLETE in codegraph-rs `v0.55.0` (tracked parity advanced to `v1.6.2`)
 
 The 2026-10-10 audit covered `f4ddf508..b635dd46`: 268 commits, of which the
