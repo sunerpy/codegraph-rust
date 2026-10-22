@@ -2222,6 +2222,10 @@ fn cmd_status(path: Option<PathBuf>, json_output: bool) -> Result<()> {
                 } else {
                     format!("codegraph index --force {}", project.display())
                 });
+            } else if matches!(&extraction_status, ExtractionStatus::Outdated { .. })
+                && uninit_tombstone_present(&resolved)
+            {
+                status["recoveryCommand"] = json!(format!("codegraph init {}", project.display()));
             } else if owner_mismatch_recoverable {
                 status["recoveryCommand"] = json!(format!("codegraph init {}", project.display()));
             } else if lockless_missing {
@@ -2274,6 +2278,13 @@ fn cmd_status(path: Option<PathBuf>, json_output: bool) -> Result<()> {
                 }
                 ExtractionStatus::Missing if lockless_missing => {
                     println!("{extraction_status_detail}");
+                }
+                ExtractionStatus::Outdated { .. } if uninit_tombstone_present(&resolved) => {
+                    println!("Index was built by an older extraction version.");
+                    println!(
+                        "Recovery: run `codegraph init {}` to rebuild it; it still carries an uninit tombstone, which only `init` removes.",
+                        project.display()
+                    );
                 }
                 ExtractionStatus::Outdated { .. } => {
                     println!("Index was built by an older extraction version.");

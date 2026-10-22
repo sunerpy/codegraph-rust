@@ -2363,8 +2363,8 @@ fn an_interrupted_init_after_an_uninit_is_rebuilt_only_by_init() {
 
 /// An index an older version built that still carries the tombstone, which an
 /// explicit `init` that published Current but could not remove it leaves, is
-/// not a `sync` upgrade either: the sync refuses it untouched, and `init`
-/// rebuilds it.
+/// not a `sync` upgrade either: `status` names `init` rather than `sync`, the
+/// sync refuses it untouched, and `init` rebuilds it.
 #[test]
 fn sync_refuses_an_older_index_under_the_tombstone() {
     let dir = TestDir::new("tombstone-outdated");
@@ -2379,6 +2379,25 @@ fn sync_refuses_an_older_index_under_the_tombstone() {
         "current",
     );
     fs::write(paths.tombstone(), b"uninitialized\n").expect("stage the tombstone");
+
+    let init_command = format!("codegraph init {}", project.display());
+    let status = cli(&["status", project_arg, "--json"]);
+    assert!(status.ok, "status failed: {}", status.stderr);
+    let json: serde_json::Value = serde_json::from_str(&status.stdout).expect("status JSON");
+    assert_eq!(json["extractionStatus"], "outdated", "{}", status.stdout);
+    assert_eq!(
+        json["recoveryCommand"],
+        init_command.as_str(),
+        "{}",
+        status.stdout
+    );
+    let human = cli(&["status", project_arg]);
+    assert!(human.ok, "status failed: {}", human.stderr);
+    assert!(
+        human.stdout.contains(&init_command) && !human.stdout.contains("codegraph sync"),
+        "status must recommend init, not sync: {}",
+        human.stdout
+    );
 
     let before = namespace_snapshot(paths.current_root());
     let run = cli(&["sync", project_arg]);
