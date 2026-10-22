@@ -1390,6 +1390,17 @@ tracked file that turns into one leaves the index. Bytes that are not valid
 UTF-8 are decoded with U+FFFD replacements, so a Latin-1 or binary source file
 is indexed like any other instead of failing the run.
 
+### After `uninit --force`
+
+`uninit --force` deletes the database and leaves `.codegraph/` holding its
+state slots, its lock and an `uninitialized` tombstone, so nothing rebuilds the
+index on its own: `status` reports `uninitialized`, and `sync`, `index --force`,
+an MCP session and the daemon refuse it. `codegraph init` rebuilds it and then
+removes the tombstone. Until that `init` finishes, every other rebuild refuses
+the index, even one an interrupted `init` left `building`, because only `init`
+removes the tombstone; `status` and the read errors name `codegraph init` as the
+recovery then.
+
 ### Index diagnostics
 
 `init`, `index`, and `sync` share `--debug` and `--debug-log <FILE>`.

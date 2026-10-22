@@ -15,7 +15,10 @@
 //!
 //! Only after every one of those steps succeeded may the rebuild atomically
 //! publish `phase=current`; it then removes a tombstone only for an explicit,
-//! successful `init`. Any earlier fault leaves the namespace `Building` (or
+//! successful `init`. Because nothing else removes it, every other rebuild (a
+//! reindex, the migration a sync escalates to) refuses a namespace holding the
+//! tombstone before step 3: it would publish Current under a tombstone, which no
+//! read accepts. Any earlier fault leaves the namespace `Building` (or
 //! `Missing`, before the first publication), fail-closed and unreadable. The
 //! handle's `Drop` is emergency best-effort only: it can never publish `Current`,
 //! because no publication call exists on that path.
@@ -39,7 +42,8 @@ use crate::{
 /// Which lifecycle command is performing the destructive rebuild.
 ///
 /// The distinction is narrow and load-bearing: only an explicit, fully
-/// successful `init` may remove an existing tombstone.
+/// successful `init` may remove an existing tombstone, so only an explicit
+/// `init` may rebuild while one exists.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RebuildKind {
     /// `codegraph init` — an explicit initialization/recovery rebuild.
@@ -171,6 +175,23 @@ pub enum RebuildError {
         /// Resolved current root.
         path: PathBuf,
     },
+    /// A rebuild other than an explicit init reached a namespace that still
+    /// holds the uninitialized tombstone, which only an explicit init removes.
+    #[error(
+        "index namespace {path} holds the uninitialized tombstone; only an explicit `init` may rebuild it"
+    )]
+    TombstoneRequiresExplicitInit {
+        /// Resolved current root.
+        path: PathBuf,
+    },
+    /// The tombstone path could not be inspected under the lease.
+    #[error("cannot inspect the uninitialized tombstone {path}: {source}")]
+    InspectTombstone {
+        /// Tombstone path.
+        path: PathBuf,
+        /// Operating-system error.
+        source: io::Error,
+    },
     /// The tombstone could not be removed after a successful explicit init.
     #[error("cannot remove the uninitialized tombstone {path}: {source}")]
     RemoveTombstone {
@@ -280,8 +301,27 @@ fn begin_full_rebuild_with(
             path: paths.current_root().to_path_buf(),
         });
     }
+    if kind != RebuildKind::ExplicitInit {
+        refuse_tombstoned_namespace(paths, &lease)?;
+    }
 
     begin_from_authorization(paths, lease, kind, authorization, fault)
+}
+
+/// Refuse a rebuild other than an explicit `init` while the uninit tombstone
+/// exists, in any form: only an explicit `init` removes it, so any other
+/// rebuild would publish Current under it, which no read accepts. Runs under
+/// the retained exclusive lease, before `phase=building` is published.
+fn refuse_tombstoned_namespace(paths: &IndexPaths, lease: &IndexLease) -> Result<(), RebuildError> {
+    lease.validate_exclusive(paths)?;
+    let path = paths.tombstone();
+    match std::fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Ok(_) => Err(RebuildError::TombstoneRequiresExplicitInit {
+            path: paths.current_root().to_path_buf(),
+        }),
+        Err(source) => Err(RebuildError::InspectTombstone { path, source }),
+    }
 }
 
 /// Normalize only the copied/moved-project shape: every PRESENT fixed slot must
@@ -387,7 +427,7 @@ fn resume_full_rebuild_with(
         }
     }
     let lease = authorization.clone_lease();
-    lease.validate_exclusive(paths)?;
+    refuse_tombstoned_namespace(paths, &lease)?;
     begin_from_authorization(paths, lease, RebuildKind::Reindex, authorization, fault)
 }
 
@@ -1649,6 +1689,62 @@ mod tests {
         assert!(!paths.tombstone().exists());
         Store::open_for_read(&paths, deadline(), || false)
             .expect("an explicit-init retry must recover Current+tombstone residue");
+    }
+
+    /// Only an explicit `init` may rebuild under the tombstone. An `init` that
+    /// follows an uninit and stops after publishing `building` leaves that
+    /// phase beside the tombstone. A reindex or the migration a sync escalates
+    /// to would publish Current under the tombstone, which no read accepts
+    /// until another `init`, so both refuse before publishing anything.
+    #[test]
+    fn only_an_explicit_init_rebuilds_under_the_tombstone() {
+        let project = TempProject::new("tombstone-building");
+        let paths = project.paths();
+        run_successful_rebuild(&paths, RebuildKind::ExplicitInit);
+        stage_interrupted_uninit(&paths);
+        let lease = IndexLease::acquire_exclusive_existing(&paths, deadline(), || false)
+            .expect("acquire exclusive to stage the interrupted init");
+        publish_index_state(&paths, &lease, StatePhase::Building)
+            .expect("the explicit init publishes building");
+        drop(lease);
+        assert!(matches!(
+            Store::extraction_status(&paths),
+            ExtractionStatus::Building { .. }
+        ));
+        let slots = paths.state_slots().map(|slot| std::fs::read(slot).ok());
+
+        let error = begin_full_rebuild(&paths, RebuildKind::Reindex, deadline(), || false)
+            .expect_err("a reindex must refuse a namespace under the tombstone");
+        assert!(
+            matches!(error, RebuildError::TombstoneRequiresExplicitInit { .. }),
+            "unexpected error: {error}"
+        );
+
+        let lease = IndexLease::acquire_exclusive_existing(&paths, deadline(), || false)
+            .expect("acquire exclusive for the sync gate");
+        let StoreWriteOpen::FullRebuildRequired(authorization) =
+            Store::open_for_write(&paths, lease, StoreWritePurpose::IncrementalSync)
+                .expect("the sync gate escalates an interrupted build")
+        else {
+            panic!("the sync gate must escalate an interrupted build");
+        };
+        let error = resume_full_rebuild(&paths, authorization)
+            .expect_err("a sync migration must refuse a namespace under the tombstone");
+        assert!(
+            matches!(error, RebuildError::TombstoneRequiresExplicitInit { .. }),
+            "unexpected error: {error}"
+        );
+
+        assert!(paths.tombstone().exists(), "the tombstone stays");
+        assert_eq!(
+            paths.state_slots().map(|slot| std::fs::read(slot).ok()),
+            slots,
+            "a refused rebuild publishes nothing"
+        );
+
+        run_successful_rebuild(&paths, RebuildKind::ExplicitInit);
+        assert_eq!(Store::extraction_status(&paths), ExtractionStatus::Current);
+        assert!(!paths.tombstone().exists());
     }
 
     #[test]

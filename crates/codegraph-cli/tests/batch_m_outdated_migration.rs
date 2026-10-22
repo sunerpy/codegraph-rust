@@ -2262,3 +2262,136 @@ fn uninit_removes_an_index_an_older_version_built() {
         );
     }
 }
+
+/// An `init` after an uninit that stops once it has published `building`
+/// leaves that phase beside the tombstone. Only another `init` may rebuild it:
+/// recovery guidance names `init`, and `index --force`, `sync` and a catch-up
+/// sync refuse without touching a byte. Before, each of them rebuilt the index
+/// under the tombstone, which every read then refused.
+#[test]
+fn an_interrupted_init_after_an_uninit_is_rebuilt_only_by_init() {
+    let dir = TestDir::new("tombstone-building");
+    let project = init_project("tombstone-building", &dir);
+    let project_arg = project.to_str().unwrap();
+    let paths = IndexPaths::resolve(&project, None).expect("resolve v2 paths");
+    let uninit = cli(&["uninit", "--force", project_arg]);
+    assert!(uninit.ok, "setup: uninit failed: {}", uninit.stderr);
+    stage_state_slot(
+        &paths,
+        100,
+        CURRENT_STORAGE_PROTOCOL,
+        CURRENT_EXTRACTION_VERSION,
+        "building",
+    );
+    assert!(matches!(
+        Store::extraction_status(&paths),
+        ExtractionStatus::Building { .. }
+    ));
+    assert!(paths.tombstone().is_file(), "setup: the tombstone remains");
+
+    let init_command = format!("codegraph init {}", project.display());
+    let status = cli(&["status", project_arg, "--json"]);
+    assert!(status.ok, "status failed: {}", status.stderr);
+    let json: serde_json::Value = serde_json::from_str(&status.stdout).expect("status JSON");
+    assert_eq!(json["extractionStatus"], "building", "{}", status.stdout);
+    assert_eq!(
+        json["recoveryCommand"],
+        init_command.as_str(),
+        "{}",
+        status.stdout
+    );
+    let human = cli(&["status", project_arg]);
+    assert!(human.ok, "status failed: {}", human.stderr);
+    assert!(
+        human.stdout.contains(&init_command) && !human.stdout.contains("index --force"),
+        "status must recommend init: {}",
+        human.stdout
+    );
+    let read = cli(&["search", "add", "-p", project_arg]);
+    assert!(!read.ok, "a read must stay blocked");
+    assert!(
+        read.stderr.contains(&init_command) && !read.stderr.contains("index --force"),
+        "the read error must recommend init: {}",
+        read.stderr
+    );
+
+    let before = namespace_snapshot(paths.current_root());
+    for command in [
+        &["index", "--force", project_arg][..],
+        &["sync", project_arg][..],
+    ] {
+        let run = cli(command);
+        assert!(
+            !run.ok,
+            "`codegraph {}` must refuse an index under the tombstone: stdout={}, stderr={}",
+            command[0], run.stdout, run.stderr
+        );
+        assert!(
+            run.stderr.contains("tombstone"),
+            "`codegraph {}` must say why: {}",
+            command[0],
+            run.stderr
+        );
+        assert_namespace_unchanged(
+            &before,
+            &namespace_snapshot(paths.current_root()),
+            command[0],
+        );
+    }
+    codegraph_watch::sync_project_once(&project)
+        .expect_err("a catch-up sync must refuse an index under the tombstone");
+    assert_namespace_unchanged(
+        &before,
+        &namespace_snapshot(paths.current_root()),
+        "catch-up",
+    );
+
+    let init = cli(&["init", project_arg]);
+    assert!(init.ok, "init failed: {}", init.stderr);
+    assert_eq!(Store::extraction_status(&paths), ExtractionStatus::Current);
+    assert!(
+        !paths.tombstone().exists(),
+        "an explicit init removes the tombstone"
+    );
+    let search = cli(&["search", "add", "-p", project_arg]);
+    assert!(
+        search.ok,
+        "the rebuilt index must answer: {}",
+        search.stderr
+    );
+}
+
+/// An index an older version built that still carries the tombstone, which an
+/// explicit `init` that published Current but could not remove it leaves, is
+/// not a `sync` upgrade either: the sync refuses it untouched, and `init`
+/// rebuilds it.
+#[test]
+fn sync_refuses_an_older_index_under_the_tombstone() {
+    let dir = TestDir::new("tombstone-outdated");
+    let project = init_project("tombstone-outdated", &dir);
+    let project_arg = project.to_str().unwrap();
+    let paths = IndexPaths::resolve(&project, None).expect("resolve v2 paths");
+    stage_state_slot(
+        &paths,
+        100,
+        CURRENT_STORAGE_PROTOCOL,
+        CURRENT_EXTRACTION_VERSION - 1,
+        "current",
+    );
+    fs::write(paths.tombstone(), b"uninitialized\n").expect("stage the tombstone");
+
+    let before = namespace_snapshot(paths.current_root());
+    let run = cli(&["sync", project_arg]);
+    assert!(
+        !run.ok && run.stderr.contains("tombstone"),
+        "sync must refuse an older index under the tombstone: stdout={}, stderr={}",
+        run.stdout,
+        run.stderr
+    );
+    assert_namespace_unchanged(&before, &namespace_snapshot(paths.current_root()), "sync");
+
+    let init = cli(&["init", project_arg]);
+    assert!(init.ok, "init failed: {}", init.stderr);
+    assert_eq!(Store::extraction_status(&paths), ExtractionStatus::Current);
+    assert!(!paths.tombstone().exists());
+}
