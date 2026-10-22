@@ -2395,3 +2395,62 @@ fn sync_refuses_an_older_index_under_the_tombstone() {
     assert_eq!(Store::extraction_status(&paths), ExtractionStatus::Current);
     assert!(!paths.tombstone().exists());
 }
+
+/// A Current index beside the tombstone, which an `init` that published
+/// Current but could not remove the tombstone leaves, is unreadable until
+/// another `init`. `status` reports it with that recovery instead of failing
+/// like a read, and the read error names it too.
+#[test]
+fn status_reports_a_current_index_under_the_tombstone() {
+    let dir = TestDir::new("tombstone-current");
+    let project = init_project("tombstone-current", &dir);
+    let project_arg = project.to_str().unwrap();
+    let paths = IndexPaths::resolve(&project, None).expect("resolve v2 paths");
+    fs::write(paths.tombstone(), b"uninitialized\n").expect("stage the tombstone");
+    assert_eq!(Store::extraction_status(&paths), ExtractionStatus::Current);
+
+    let init_command = format!("codegraph init {}", project.display());
+    let status = cli(&["status", project_arg, "--json"]);
+    assert!(
+        status.ok,
+        "status must report the tombstone, not fail: stdout={}, stderr={}",
+        status.stdout, status.stderr
+    );
+    let json: serde_json::Value = serde_json::from_str(&status.stdout).expect("status JSON");
+    assert_eq!(json["initialized"], false, "{}", status.stdout);
+    assert_eq!(json["extractionStatus"], "current", "{}", status.stdout);
+    assert!(
+        json["extractionStatusDetail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("tombstone")),
+        "{}",
+        status.stdout
+    );
+    assert_eq!(
+        json["recoveryCommand"],
+        init_command.as_str(),
+        "{}",
+        status.stdout
+    );
+    let human = cli(&["status", project_arg]);
+    assert!(human.ok, "status failed: {}", human.stderr);
+    assert!(
+        human.stdout.contains("blocked by the uninit tombstone")
+            && human.stdout.contains(&init_command),
+        "{}",
+        human.stdout
+    );
+    let read = cli(&["search", "add", "-p", project_arg]);
+    assert!(
+        !read.ok && read.stderr.contains("codegraph init"),
+        "the read error must name init: {}",
+        read.stderr
+    );
+
+    let init = cli(&["init", project_arg]);
+    assert!(init.ok, "init failed: {}", init.stderr);
+    assert!(!paths.tombstone().exists());
+    let status = cli(&["status", project_arg, "--json"]);
+    let json: serde_json::Value = serde_json::from_str(&status.stdout).expect("status JSON");
+    assert_eq!(json["initialized"], true, "{}", status.stdout);
+}

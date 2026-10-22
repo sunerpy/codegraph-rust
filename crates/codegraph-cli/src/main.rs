@@ -2105,6 +2105,53 @@ fn cmd_status(path: Option<PathBuf>, json_output: bool) -> Result<()> {
             }
             return Ok(());
         }
+        // Current beside the uninit tombstone (an `init` that published Current
+        // but could not remove it) is unreadable until another `init`; report
+        // that recovery instead of failing like a read.
+        Err(error @ codegraph_store::StoreError::CurrentTombstoned { .. }) => {
+            let recovery = format!("codegraph init {}", project.display());
+            if json_output {
+                let mut status = json!({
+                    "initialized": false,
+                    "version": VERSION,
+                    "projectPath": project,
+                    "indexPath": index_root,
+                    "lastIndexed": null,
+                    "dbPath": db,
+                    "dbExists": db_exists,
+                    "dbSizeBytes": db_size,
+                    "extractionStatus": "current",
+                    "extractionStatusDetail": error.to_string(),
+                    "recoveryCommand": recovery,
+                    "legacyIndexPresent": legacy_index_present,
+                    "legacyIndexPaths": legacy_index_paths,
+                    "daemonRunning": daemon_running,
+                    "daemonPidPath": daemon_pid_path,
+                    "daemonSocketPath": daemon_socket_path,
+                    "daemonLogPath": daemon_log_path,
+                });
+                if wal_size > 0 {
+                    status["walSizeBytes"] = json!(wal_size);
+                }
+                print_json(&status)?;
+            } else {
+                println!("\nCodeGraph Status\n");
+                println!("Project: {}\n", project.display());
+                println!("State:   current (blocked by the uninit tombstone)");
+                println!("Index Statistics:");
+                println!("  DB Size:   {:.2} MB", db_size as f64 / 1024.0 / 1024.0);
+                print_wal_status(wal_size, db_size);
+                println!("\n  DB Path:   {}", db.display());
+                println!(
+                    "  Daemon:    {}",
+                    if daemon_running { "running" } else { "stopped" }
+                );
+                println!(
+                    "\nRecovery: run `{recovery}` to rebuild the index; only `init` removes the uninit tombstone."
+                );
+            }
+            return Ok(());
+        }
         Err(error) => return Err(error.into()),
     };
     if status_open.rebuilding {

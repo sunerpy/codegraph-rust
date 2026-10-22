@@ -988,6 +988,12 @@ file/node/edge counts and `journalMode`. Human output identifies this as
 `current (blocked by SQLite sidecar)`. `status` never checkpoints, deletes, or
 otherwise heals the sidecar.
 
+A `Current` index beside the uninit tombstone, which an `init` that published
+`Current` but could not remove the tombstone leaves, is reported the same way,
+with `recoveryCommand` set to `codegraph init <project>`; human output shows
+`current (blocked by the uninit tombstone)` and that recovery. Reads refuse such
+an index until `init` rebuilds it.
+
 When the WAL is larger than both the database and the configured WAL limit,
 `status` warns that live CodeGraph processes must be stopped before running:
 
