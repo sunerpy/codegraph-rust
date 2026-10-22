@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.55.2](https://github.com/sunerpy/codegraph-rust/compare/v0.55.1...v0.55.2) (2026-10-22)
+
+
+### Bug Fixes
+
+* **cli:** status reports a current index under the uninit tombstone ([139fb0a](https://github.com/sunerpy/codegraph-rust/commit/139fb0a25453cf0ae7ecdd4b79029d5283d8b1b8))
+* **store:** an older version's uninit stays uninitialized ([139fb0a](https://github.com/sunerpy/codegraph-rust/commit/139fb0a25453cf0ae7ecdd4b79029d5283d8b1b8))
+* **store:** only an explicit init rebuilds under the uninit tombstone ([139fb0a](https://github.com/sunerpy/codegraph-rust/commit/139fb0a25453cf0ae7ecdd4b79029d5283d8b1b8))
+* **store:** uninit removes an index an older version built ([139fb0a](https://github.com/sunerpy/codegraph-rust/commit/139fb0a25453cf0ae7ecdd4b79029d5283d8b1b8))
+
 ## [0.55.1](https://github.com/sunerpy/codegraph-rust/compare/v0.55.0...v0.55.1) (2026-10-22)
 
 
