@@ -10,6 +10,7 @@
 
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 const ANSI: &[u8] = b"\x1b[";
 
@@ -27,18 +28,33 @@ struct Project {
     registry: PathBuf,
 }
 
+/// Next project directory suffix, unique within this test process.
+static NEXT_PROJECT: AtomicU64 = AtomicU64::new(0);
+
+/// A fresh directory name for one project. The clock alone repeats when two
+/// tests start within one tick, and the first test's `Drop` then deleted the
+/// other's project mid-run; the process-wide sequence keeps every name distinct.
+fn project_base(nanos: u128) -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "codegraph-plain-output-{}-{}-{nanos}",
+        std::process::id(),
+        NEXT_PROJECT.fetch_add(1, Ordering::Relaxed)
+    ))
+}
+
 impl Project {
     fn indexed() -> Self {
-        let base = std::env::temp_dir().join(format!(
-            "codegraph-plain-output-{}-{}",
-            std::process::id(),
+        let base = project_base(
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
-        ));
+                .as_nanos(),
+        );
+        // `create_dir` fails on an existing directory, so two projects can
+        // never share one.
+        std::fs::create_dir(&base).expect("create a fresh project directory");
         let root = base.join("project");
-        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir(&root).unwrap();
         std::fs::write(
             root.join("a.ts"),
             "export function alpha(): number { return beta(); }\n\
@@ -77,6 +93,11 @@ impl Drop for Project {
             let _ = std::fs::remove_dir_all(base);
         }
     }
+}
+
+#[test]
+fn projects_created_within_one_clock_tick_get_distinct_directories() {
+    assert_ne!(project_base(7), project_base(7));
 }
 
 fn has(haystack: &[u8], needle: &[u8]) -> bool {
