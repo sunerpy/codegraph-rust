@@ -217,7 +217,7 @@ def main() -> int:
     upstream = read("docs/upstream-sync/UPSTREAM.md")
     if "b635dd467f0578926a9c01a37b9d28d2b26689f1..origin/main" not in upstream:
         fail("upstream ledger does not carry the audited next-discovery boundary")
-    if "Tracked colby release:** `v1.6.1`" not in upstream:
+    if "Tracked colby release:** `v1.6.2`" not in upstream:
         fail("upstream ledger tracked release changed without a new formal tag")
 
     paths = markdown_files()
