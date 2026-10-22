@@ -1372,7 +1372,8 @@ interrupted `sync` does. The daemon also refuses to start on an older index that
 is not complete (an interrupted build or a missing database), and leaves it
 alone. Either way, run `codegraph status` for the state
 the index is in and the recovery it needs. Do not run `index --force` solely because the extraction version
-changed. An older binary refuses an index a newer extraction version wrote and
+changed. `uninit --force` removes an older index as it is, without upgrading it
+first. An older binary refuses an index a newer extraction version wrote and
 leaves it untouched.
 
 If a supported grammar reports tree errors and extraction collapses to only the

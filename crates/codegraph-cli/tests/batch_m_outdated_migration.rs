@@ -2204,3 +2204,61 @@ fn an_older_versions_uninit_stays_reserved_for_an_explicit_init() {
         search.stderr
     );
 }
+
+/// `uninit --force` removes an index an older version built without
+/// rebuilding it first: it publishes `uninitialized` at this extraction
+/// version, writes the tombstone and deletes the database, exactly as it does
+/// for an index this version built.
+#[test]
+fn uninit_removes_an_index_an_older_version_built() {
+    let dir = TestDir::new("uninit-outdated");
+    let project = init_project("uninit-outdated", &dir);
+    let project_arg = project.to_str().unwrap();
+    let paths = IndexPaths::resolve(&project, None).expect("resolve v2 paths");
+    stage_state_slot(
+        &paths,
+        100,
+        CURRENT_STORAGE_PROTOCOL,
+        CURRENT_EXTRACTION_VERSION - 1,
+        "current",
+    );
+    assert_eq!(
+        Store::extraction_status(&paths),
+        ExtractionStatus::Outdated {
+            built: CURRENT_EXTRACTION_VERSION - 1
+        },
+        "setup: the staged slot must classify Outdated"
+    );
+    assert!(
+        paths.current_db().is_file(),
+        "setup: the index has a database"
+    );
+
+    let uninit = cli(&["uninit", "--force", project_arg]);
+    assert!(
+        uninit.ok,
+        "uninit must remove an outdated index: stdout={}, stderr={}",
+        uninit.stdout, uninit.stderr
+    );
+    let classification = codegraph_store::index_state::classify(&paths);
+    assert_eq!(classification.status(), &ExtractionStatus::Uninitialized);
+    assert_eq!(
+        classification
+            .authoritative()
+            .map(|slot| slot.record.extraction_version),
+        Some(CURRENT_EXTRACTION_VERSION),
+        "uninit publishes at this extraction version"
+    );
+    assert!(paths.tombstone().is_file(), "uninit writes its tombstone");
+    for removed in [
+        paths.current_db(),
+        paths.current_root().join("codegraph.db-wal"),
+        paths.current_root().join("codegraph.db-shm"),
+    ] {
+        assert!(
+            !removed.exists(),
+            "uninit must remove {}",
+            removed.display()
+        );
+    }
+}

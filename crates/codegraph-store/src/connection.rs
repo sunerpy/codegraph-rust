@@ -589,6 +589,7 @@ impl Store {
                     ExtractionStatus::Current
                         | ExtractionStatus::Building { .. }
                         | ExtractionStatus::Uninitialized
+                        | ExtractionStatus::Outdated { .. }
                 ) =>
             {
                 if status == ExtractionStatus::Current {

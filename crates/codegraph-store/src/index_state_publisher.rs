@@ -442,7 +442,10 @@ fn validate_transition(
     let allowed = matches!(
         (current, requested),
         (ExtractionStatus::Missing, StatePhase::Building)
-            | (ExtractionStatus::Outdated { .. }, StatePhase::Building)
+            | (
+                ExtractionStatus::Outdated { .. },
+                StatePhase::Building | StatePhase::Uninitialized
+            )
             | (
                 ExtractionStatus::Uninitialized,
                 StatePhase::Building | StatePhase::Uninitialized
@@ -696,7 +699,10 @@ mod tests {
                 let expected = matches!(
                     (&current, requested),
                     (ExtractionStatus::Missing, StatePhase::Building)
-                        | (ExtractionStatus::Outdated { .. }, StatePhase::Building)
+                        | (
+                            ExtractionStatus::Outdated { .. },
+                            StatePhase::Building | StatePhase::Uninitialized
+                        )
                         | (
                             ExtractionStatus::Uninitialized,
                             StatePhase::Building | StatePhase::Uninitialized
@@ -730,6 +736,7 @@ mod tests {
     fn every_publication_checkpoint_preserves_old_authority_or_exposes_valid_successor() {
         let allowed = [
             (PriorStatus::Outdated, StatePhase::Building),
+            (PriorStatus::Outdated, StatePhase::Uninitialized),
             (PriorStatus::Uninitialized, StatePhase::Building),
             (PriorStatus::Uninitialized, StatePhase::Uninitialized),
             (PriorStatus::Current, StatePhase::Building),

@@ -155,12 +155,15 @@ fn uninit_index_with(
     drain: impl FnOnce() -> Result<(), String>,
     fault: &mut impl UninitFault,
 ) -> Result<UninitOutcome, UninitError> {
+    // An index an older version built is removed as it is: uninit reads no
+    // row of it, so it need not be rebuilt first.
     let visible = Store::extraction_status(paths);
     if !matches!(
         visible,
         ExtractionStatus::Current
             | ExtractionStatus::Building { .. }
             | ExtractionStatus::Uninitialized
+            | ExtractionStatus::Outdated { .. }
     ) {
         return Err(UninitError::StateRejected { status: visible });
     }
@@ -178,6 +181,7 @@ fn uninit_index_with(
             ExtractionStatus::Current
                 | ExtractionStatus::Building { .. }
                 | ExtractionStatus::Uninitialized
+                | ExtractionStatus::Outdated { .. }
         )
     {
         return Err(UninitError::StateRejected {
