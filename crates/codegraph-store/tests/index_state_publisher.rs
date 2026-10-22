@@ -341,7 +341,6 @@ fn invalid_lifecycle_transitions_are_byte_nonmutating() {
         (PriorStatus::Missing, StatePhase::Current),
         (PriorStatus::Missing, StatePhase::Uninitialized),
         (PriorStatus::Outdated, StatePhase::Current),
-        (PriorStatus::Outdated, StatePhase::Uninitialized),
         (PriorStatus::Uninitialized, StatePhase::Current),
         (PriorStatus::Current, StatePhase::Current),
     ];
@@ -365,6 +364,36 @@ fn invalid_lifecycle_transitions_are_byte_nonmutating() {
             },
         );
     }
+}
+
+/// `uninit --force` removes an index an older version built as it is, so an
+/// outdated namespace may publish `uninitialized` directly, at this extraction
+/// version, beside the older authority.
+#[test]
+fn an_outdated_namespace_may_be_uninitialized() {
+    let project = TempProject::new("outdated-uninit");
+    let paths = project.paths();
+    let lease = IndexLease::create_exclusive(&paths, deadline(), || false).unwrap();
+    stage_prior_status(&paths, &lease, PriorStatus::Outdated);
+    let older = std::fs::read(&paths.state_slots()[0]).unwrap();
+
+    publish_index_state(&paths, &lease, StatePhase::Uninitialized)
+        .expect("an outdated namespace may be uninitialized");
+
+    let classification = classify(&paths);
+    assert_eq!(classification.status(), &ExtractionStatus::Uninitialized);
+    let authority = classification.authoritative().expect("published authority");
+    assert_eq!(authority.index, 1);
+    assert_eq!(authority.record.sequence, 5);
+    assert_eq!(
+        authority.record.extraction_version,
+        CURRENT_EXTRACTION_VERSION
+    );
+    assert_eq!(
+        std::fs::read(&paths.state_slots()[0]).unwrap(),
+        older,
+        "the older authority stays as it was"
+    );
 }
 
 #[test]

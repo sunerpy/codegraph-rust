@@ -2105,6 +2105,53 @@ fn cmd_status(path: Option<PathBuf>, json_output: bool) -> Result<()> {
             }
             return Ok(());
         }
+        // Current beside the uninit tombstone (an `init` that published Current
+        // but could not remove it) is unreadable until another `init`; report
+        // that recovery instead of failing like a read.
+        Err(error @ codegraph_store::StoreError::CurrentTombstoned { .. }) => {
+            let recovery = format!("codegraph init {}", project.display());
+            if json_output {
+                let mut status = json!({
+                    "initialized": false,
+                    "version": VERSION,
+                    "projectPath": project,
+                    "indexPath": index_root,
+                    "lastIndexed": null,
+                    "dbPath": db,
+                    "dbExists": db_exists,
+                    "dbSizeBytes": db_size,
+                    "extractionStatus": "current",
+                    "extractionStatusDetail": error.to_string(),
+                    "recoveryCommand": recovery,
+                    "legacyIndexPresent": legacy_index_present,
+                    "legacyIndexPaths": legacy_index_paths,
+                    "daemonRunning": daemon_running,
+                    "daemonPidPath": daemon_pid_path,
+                    "daemonSocketPath": daemon_socket_path,
+                    "daemonLogPath": daemon_log_path,
+                });
+                if wal_size > 0 {
+                    status["walSizeBytes"] = json!(wal_size);
+                }
+                print_json(&status)?;
+            } else {
+                println!("\nCodeGraph Status\n");
+                println!("Project: {}\n", project.display());
+                println!("State:   current (blocked by the uninit tombstone)");
+                println!("Index Statistics:");
+                println!("  DB Size:   {:.2} MB", db_size as f64 / 1024.0 / 1024.0);
+                print_wal_status(wal_size, db_size);
+                println!("\n  DB Path:   {}", db.display());
+                println!(
+                    "  Daemon:    {}",
+                    if daemon_running { "running" } else { "stopped" }
+                );
+                println!(
+                    "\nRecovery: run `{recovery}` to rebuild the index; only `init` removes the uninit tombstone."
+                );
+            }
+            return Ok(());
+        }
         Err(error) => return Err(error.into()),
     };
     if status_open.rebuilding {
@@ -2170,9 +2217,15 @@ fn cmd_status(path: Option<PathBuf>, json_output: bool) -> Result<()> {
                 "daemonLogPath": daemon_log_path,
             });
             if matches!(&extraction_status, ExtractionStatus::Building { .. }) {
-                status["recoveryCommand"] =
-                    json!(format!("codegraph index --force {}", project.display()));
-            } else if owner_mismatch_recoverable {
+                status["recoveryCommand"] = json!(if uninit_tombstone_present(&resolved) {
+                    format!("codegraph init {}", project.display())
+                } else {
+                    format!("codegraph index --force {}", project.display())
+                });
+            } else if owner_mismatch_recoverable
+                || (matches!(&extraction_status, ExtractionStatus::Outdated { .. })
+                    && uninit_tombstone_present(&resolved))
+            {
                 status["recoveryCommand"] = json!(format!("codegraph init {}", project.display()));
             } else if lockless_missing {
                 status["recoveryCommand"] =
@@ -2197,11 +2250,18 @@ fn cmd_status(path: Option<PathBuf>, json_output: bool) -> Result<()> {
             match &extraction_status {
                 ExtractionStatus::Building { .. } => {
                     println!("Index is not readable while the build is incomplete.");
-                    println!(
-                        "Recovery: run `codegraph index --force {}` to rebuild the interrupted index; `codegraph init {}` is also supported.",
-                        project.display(),
-                        project.display()
-                    );
+                    if uninit_tombstone_present(&resolved) {
+                        println!(
+                            "Recovery: run `codegraph init {}` to rebuild the interrupted index; it still carries an uninit tombstone, which only `init` removes.",
+                            project.display()
+                        );
+                    } else {
+                        println!(
+                            "Recovery: run `codegraph index --force {}` to rebuild the interrupted index; `codegraph init {}` is also supported.",
+                            project.display(),
+                            project.display()
+                        );
+                    }
                 }
                 ExtractionStatus::Corrupt { .. } if owner_mismatch_recoverable => {
                     println!(
@@ -2217,6 +2277,13 @@ fn cmd_status(path: Option<PathBuf>, json_output: bool) -> Result<()> {
                 }
                 ExtractionStatus::Missing if lockless_missing => {
                     println!("{extraction_status_detail}");
+                }
+                ExtractionStatus::Outdated { .. } if uninit_tombstone_present(&resolved) => {
+                    println!("Index was built by an older extraction version.");
+                    println!(
+                        "Recovery: run `codegraph init {}` to rebuild it; it still carries an uninit tombstone, which only `init` removes.",
+                        project.display()
+                    );
                 }
                 ExtractionStatus::Outdated { .. } => {
                     println!("Index was built by an older extraction version.");
@@ -4746,11 +4813,18 @@ fn cmd_unlock(path: Option<PathBuf>) -> Result<()> {
                     Store::extraction_status(&paths),
                     ExtractionStatus::Building { .. }
                 ) {
-                    println!(
-                        "Index state remains building; no rollback was performed. Run `codegraph index --force {}` to rebuild it (or `codegraph init {}`).",
-                        project.display(),
-                        project.display()
-                    );
+                    if uninit_tombstone_present(&paths) {
+                        println!(
+                            "Index state remains building; no rollback was performed. Run `codegraph init {}` to rebuild it.",
+                            project.display()
+                        );
+                    } else {
+                        println!(
+                            "Index state remains building; no rollback was performed. Run `codegraph index --force {}` to rebuild it (or `codegraph init {}`).",
+                            project.display(),
+                            project.display()
+                        );
+                    }
                 }
             }
             Err(codegraph_store::IndexLeaseError::TimedOut { .. }) => {
@@ -7475,6 +7549,17 @@ fn has_lifecycle_namespace(project: &Path) -> bool {
     Store::extraction_status(&paths) != codegraph_store::ExtractionStatus::Missing
 }
 
+/// Whether the uninit tombstone may be present, in any form. Only an explicit
+/// `init` rebuilds under it, so recovery guidance names `init` instead of
+/// `index --force` while it is there, and when its presence cannot be told:
+/// `init` recovers either way.
+fn uninit_tombstone_present(paths: &codegraph_core::IndexPaths) -> bool {
+    !matches!(
+        fs::symlink_metadata(paths.tombstone()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound
+    )
+}
+
 /// Resolve a readable project and report lifecycle-specific recovery without
 /// authorizing mutation. Only an all-present-slot OwnerMismatch or a Missing
 /// existing root with no permanent lock names explicit init; mixed or other
@@ -7491,6 +7576,11 @@ fn resolve_required_project(path: Option<PathBuf>) -> Result<PathBuf> {
             project.display(),
             paths.current_db().display(),
             paths.current_root().display(),
+            project.display()
+        ),
+        ExtractionStatus::Building { built: _ } if uninit_tombstone_present(&paths) => bail!(
+            "CodeGraph index build was interrupted in {}; reads remain blocked to avoid false empty results. Run `codegraph init {}` to rebuild it: the index still carries an uninit tombstone, which only `init` removes.",
+            project.display(),
             project.display()
         ),
         ExtractionStatus::Building { built: _ } => bail!(
@@ -7517,6 +7607,11 @@ fn resolve_required_project(path: Option<PathBuf>) -> Result<PathBuf> {
                 project.display()
             )
         }
+        ExtractionStatus::Outdated { built } if uninit_tombstone_present(&paths) => bail!(
+            "CodeGraph index in {} is outdated (built with extraction version {built}) and still carries an uninit tombstone; run `codegraph init {}` to rebuild it",
+            project.display(),
+            project.display()
+        ),
         ExtractionStatus::Outdated { built } => bail!(
             "CodeGraph index in {} is outdated (built with extraction version {built}); run `codegraph index --force {}` to rebuild it",
             project.display(),

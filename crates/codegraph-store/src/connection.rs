@@ -202,7 +202,9 @@ pub enum StoreError {
         status: ExtractionStatus,
         path: PathBuf,
     },
-    #[error("Current index state is blocked by the uninitialized tombstone at {path}")]
+    #[error(
+        "Current index state is blocked by the uninitialized tombstone at {path}; run `codegraph init` to rebuild the index"
+    )]
     CurrentTombstoned { path: PathBuf },
     #[error("Current index state has no SQLite database at {path}")]
     CurrentDatabaseMissing { path: PathBuf },
@@ -589,6 +591,7 @@ impl Store {
                     ExtractionStatus::Current
                         | ExtractionStatus::Building { .. }
                         | ExtractionStatus::Uninitialized
+                        | ExtractionStatus::Outdated { .. }
                 ) =>
             {
                 if status == ExtractionStatus::Current {

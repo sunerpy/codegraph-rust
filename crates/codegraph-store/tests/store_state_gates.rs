@@ -861,7 +861,7 @@ fn write_purpose_matrix_is_typed_and_rejected_pairs_are_nonmutating() {
         (
             FixtureStatus::Outdated,
             StoreWritePurpose::UninitContinuation,
-            "reject",
+            "uninit",
         ),
         (
             FixtureStatus::Uninitialized,

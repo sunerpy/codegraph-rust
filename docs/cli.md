@@ -988,6 +988,12 @@ file/node/edge counts and `journalMode`. Human output identifies this as
 `current (blocked by SQLite sidecar)`. `status` never checkpoints, deletes, or
 otherwise heals the sidecar.
 
+A `Current` index beside the uninit tombstone, which an `init` that published
+`Current` but could not remove the tombstone leaves, is reported the same way,
+with `recoveryCommand` set to `codegraph init <project>`; human output shows
+`current (blocked by the uninit tombstone)` and that recovery. Reads refuse such
+an index until `init` rebuilds it.
+
 When the WAL is larger than both the database and the configured WAL limit,
 `status` warns that live CodeGraph processes must be stopped before running:
 
@@ -1356,7 +1362,12 @@ codegraph index --force /path/to/project # only when the CLI explicitly requires
 An index built by an older extraction version is a supported `sync` upgrade:
 `status` reports it as outdated, and `sync` rebuilds it from source into the
 current namespace, applying any pending schema migration on the way. The result
-equals a fresh `init`. An MCP session upgrades a complete older index as well:
+equals a fresh `init`. What an older version's `uninit --force` left is not an
+index to upgrade: `status` reports it as uninitialized, as it does after this
+version's own `uninit --force`, and `sync`, `index --force` and the daemon leave
+it alone. Only `codegraph init` brings the index back, and `uninit --force` can
+finish one that was interrupted. An MCP session upgrades a complete older index
+as well:
 in the default daemon mode the project's daemon rebuilds it the same way before it
 starts serving, and with `CODEGRAPH_NO_DAEMON=1` the session's own catch-up does.
 Until the rebuild finishes, a tool call may wait for it, up to 30 seconds, or
@@ -1364,10 +1375,11 @@ fail; a later call succeeds once it is done. If the rebuild fails, the daemon
 does not start. A failure before the rebuild begins replacing the index leaves
 the older index as it was; a later one can leave it `building`, as an
 interrupted `sync` does. The daemon also refuses to start on an older index that
-is not complete (an interrupted build, an `uninit --force`, or a missing
-database), and leaves it alone. Either way, run `codegraph status` for the state
+is not complete (an interrupted build or a missing database), and leaves it
+alone. Either way, run `codegraph status` for the state
 the index is in and the recovery it needs. Do not run `index --force` solely because the extraction version
-changed. An older binary refuses an index a newer extraction version wrote and
+changed. `uninit --force` removes an older index as it is, without upgrading it
+first. An older binary refuses an index a newer extraction version wrote and
 leaves it untouched.
 
 If a supported grammar reports tree errors and extraction collapses to only the
@@ -1383,6 +1395,17 @@ stream is video rather than TypeScript: it is neither indexed nor counted, and a
 tracked file that turns into one leaves the index. Bytes that are not valid
 UTF-8 are decoded with U+FFFD replacements, so a Latin-1 or binary source file
 is indexed like any other instead of failing the run.
+
+### After `uninit --force`
+
+`uninit --force` deletes the database and leaves `.codegraph/` holding its
+state slots, its lock and an `uninitialized` tombstone, so nothing rebuilds the
+index on its own: `status` reports `uninitialized`, and `sync`, `index --force`,
+an MCP session and the daemon refuse it. `codegraph init` rebuilds it and then
+removes the tombstone. Until that `init` finishes, every other rebuild refuses
+the index, even one an interrupted `init` left `building`, because only `init`
+removes the tombstone; `status` and the read errors name `codegraph init` as the
+recovery then.
 
 ### Index diagnostics
 

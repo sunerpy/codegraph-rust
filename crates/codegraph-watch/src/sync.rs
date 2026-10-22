@@ -373,9 +373,10 @@ pub enum OutdatedUpgrade {
 /// Rebuild a complete index an older extraction version built, and nothing
 /// else: the upgrade a daemon runs before its startup gate.
 ///
-/// The state gate classifies an older version's every phase as `Outdated`, and
-/// `codegraph sync` migrates all of them. An automatic upgrade must not undo an
-/// older `uninit --force` or recreate a database someone removed, so this takes
+/// The state gate classifies an older version's `building` and `current`
+/// phases as `Outdated` (its `uninitialized` one is `Uninitialized`), and
+/// `codegraph sync` migrates both. An automatic upgrade must not undo an older
+/// `uninit --force` or recreate a database someone removed, so this takes
 /// ONE exclusive lease, reclassifies under it, and requires an `Outdated`
 /// status whose authoritative slot records the `current` phase, no
 /// uninitialized tombstone, and the database file. Only then does it run the
