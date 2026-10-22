@@ -1086,9 +1086,9 @@ index is gone, and `CODEGRAPH_DAEMON_RETRY_MS=0` turns the retries off.
 
 A daemon serves only a current index. Before it publishes its socket it upgrades
 a complete index an older extraction version built, as
-[Extraction-version upgrades](#extraction-version-upgrades) describes, and it
-refuses to start on any other index that is not current, logging the reason to
-`.codegraph/daemon.log`.
+[Extraction-version upgrades](#extraction-version-upgrades) describes. It
+refuses to start when that upgrade fails or the index is otherwise not current,
+logging the reason to `.codegraph/daemon.log`.
 
 A daemon keeps running the code it started with, so after an upgrade the
 project's daemon can be an older build than the session that finds it. A
@@ -1360,11 +1360,13 @@ equals a fresh `init`. An MCP session upgrades a complete older index as well:
 in the default daemon mode the project's daemon rebuilds it the same way before it
 starts serving, and with `CODEGRAPH_NO_DAEMON=1` the session's own catch-up does.
 Until the rebuild finishes, a tool call may wait for it, up to 30 seconds, or
-fail; a later call succeeds once it is done. A rebuild that fails partway leaves
-the index `building`, as an interrupted `sync` does. The daemon also leaves an
-older index alone when it is not complete (an interrupted build, an
-`uninit --force`, or a missing database). In both cases it refuses to start; run
-`codegraph status` for the recovery it needs. Do not run `index --force` solely because the extraction version
+fail; a later call succeeds once it is done. If the rebuild fails, the daemon
+does not start. A failure before the rebuild begins replacing the index leaves
+the older index as it was; a later one can leave it `building`, as an
+interrupted `sync` does. The daemon also refuses to start on an older index that
+is not complete (an interrupted build, an `uninit --force`, or a missing
+database), and leaves it alone. Either way, run `codegraph status` for the state
+the index is in and the recovery it needs. Do not run `index --force` solely because the extraction version
 changed. An older binary refuses an index a newer extraction version wrote and
 leaves it untouched.
 

@@ -1697,23 +1697,25 @@ fn authorize_daemon_startup(project_root: &Path) -> Result<codegraph_daemon::Sta
 /// daemon, so every tool call would answer "outdated" until a manual
 /// `codegraph sync`. The upgrade rebuilds only a complete older index, checked
 /// under its own exclusive lease, so an older `uninit --force` or a removed
-/// database is never undone. Anything else, and a failed upgrade, is left to
-/// the gate, which refuses it with its own recovery guidance: this never widens
-/// what a daemon may serve.
+/// database is never undone. Anything else is left to the gate, which refuses
+/// it with its own recovery guidance, so this never widens what a daemon may
+/// serve. A failed upgrade is a failed migration and stops the daemon before
+/// the gate: whatever the rebuild left, even a namespace published `Current`
+/// before a later step failed, is not served by this daemon.
 ///
 /// It runs before the daemon claims `daemon.pid`, so a session's lease keeper
 /// may start another daemon during a long upgrade. That one waits for the
-/// exclusive lease and then finds the index current, or gives up and is
-/// refused by the gate; the pid lock still lets only one daemon publish.
-fn upgrade_outdated_index_for_daemon(project_root: &Path) {
+/// exclusive lease and then finds the index current, or gives up and stops;
+/// the pid lock still lets only one daemon publish.
+fn upgrade_outdated_index_for_daemon(project_root: &Path) -> Result<()> {
     let Ok(paths) = index_paths(project_root) else {
         // The gate reports the same resolution failure.
-        return;
+        return Ok(());
     };
     // Lock-free first look, so a daemon for any other state never queues for
     // the exclusive lease; the upgrade classifies again under it.
     let ExtractionStatus::Outdated { built } = Store::extraction_status(&paths) else {
-        return;
+        return Ok(());
     };
     tracing::info!(
         project = %project_root.display(),
@@ -1732,12 +1734,17 @@ fn upgrade_outdated_index_for_daemon(project_root: &Path) {
             %reason,
             "left the outdated index to the startup gate"
         ),
-        Err(error) => tracing::warn!(
-            error = %format!("{error:#}"),
-            project = %project_root.display(),
-            "could not upgrade the outdated index; the startup gate decides"
-        ),
+        Err(error) => {
+            return Err(error.context(format!(
+                "refusing to start a daemon for {}: could not upgrade its outdated index. This \
+                 daemon did not publish a pid or socket. Run `codegraph status \"{}\"` for \
+                 recovery guidance",
+                project_root.display(),
+                project_root.display()
+            )));
+        }
     }
+    Ok(())
 }
 
 /// Ask this project's daemon (if any) to stop accepting, cancel its watcher lease
@@ -2781,7 +2788,9 @@ fn cmd_serve(
                 // publication, so a concurrent `uninit --force` cannot interleave.
                 // An index an older extraction version built is upgraded first:
                 // the gate admits only `Current`, and nothing else upgrades it.
-                upgrade_outdated_index_for_daemon(&project_root);
+                // A failed upgrade stops this daemon before the gate.
+                upgrade_outdated_index_for_daemon(&project_root)
+                    .context("running as detached MCP daemon")?;
                 let gate = |root: &Path| authorize_daemon_startup(root);
                 return codegraph_daemon::run_foreground_gated(
                     &project_root,

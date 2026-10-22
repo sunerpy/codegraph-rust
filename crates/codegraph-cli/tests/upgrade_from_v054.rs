@@ -135,7 +135,12 @@ fn a_cold_mcp_session_leaves_an_older_uninit_alone() {
     let slots = state_slot_bytes(&paths);
 
     let session = cold::Session::start(&project, dir.path());
-    let log = cold::wait_for_daemon_log(&paths, "refusing to start a daemon", &session);
+    let log = cold::wait_for_daemon_log(
+        &paths,
+        "refusing to start a daemon for",
+        "state-gated Store open rejected",
+        &session,
+    );
     assert!(
         !paths.current_db().exists(),
         "the daemon recreated the database an uninit removed:\n{log}"
@@ -158,8 +163,9 @@ fn a_cold_mcp_session_leaves_an_older_uninit_alone() {
     session.close();
 }
 
-/// A failed upgrade changes nothing, and the startup gate still refuses the
-/// index with its own guidance. Here the project config cannot be parsed.
+/// A failed upgrade is a failed migration: the daemon stops before its startup
+/// gate, and nothing changes. Here the project config cannot be parsed, so the
+/// upgrade fails before it takes the index lease.
 #[cfg(unix)]
 #[test]
 fn a_daemon_whose_upgrade_fails_still_refuses_the_outdated_index() {
@@ -171,7 +177,12 @@ fn a_daemon_whose_upgrade_fails_still_refuses_the_outdated_index() {
     let slots = state_slot_bytes(&paths);
 
     let session = cold::Session::start(&project, dir.path());
-    let log = cold::wait_for_daemon_log(&paths, "refusing to start a daemon", &session);
+    let log = cold::wait_for_daemon_log(
+        &paths,
+        "refusing to start a daemon for",
+        "could not upgrade its outdated index",
+        &session,
+    );
     assert_eq!(
         Store::extraction_status(&paths),
         ExtractionStatus::Outdated {
@@ -193,8 +204,8 @@ fn a_daemon_whose_upgrade_fails_still_refuses_the_outdated_index() {
         "no daemon may serve this index"
     );
     assert!(
-        log.contains("could not upgrade the outdated index"),
-        "the daemon must log the failed upgrade:\n{log}"
+        !log.contains("state-gated Store open"),
+        "a failed upgrade must stop the daemon before its startup gate:\n{log}"
     );
     session.close();
 }
@@ -435,21 +446,27 @@ mod cold {
             .is_some_and(|info| info.pid > 0 && codegraph_daemon::is_process_alive(info.pid))
     }
 
-    /// Wait until the project's `daemon.log` contains `needle`; returns the log.
+    /// Wait until one line of the project's `daemon.log` contains both `first`
+    /// and `then`, in that order; returns the whole log.
     pub fn wait_for_daemon_log(
         paths: &codegraph_core::IndexPaths,
-        needle: &str,
+        first: &str,
+        then: &str,
         session: &Session,
     ) -> String {
         let deadline = Instant::now() + REFUSED_WITHIN;
         loop {
             let log = fs::read_to_string(paths.daemon_log()).unwrap_or_default();
-            if log.contains(needle) {
+            let shown = log.lines().any(|line| {
+                line.find(first)
+                    .is_some_and(|at| line[at + first.len()..].contains(then))
+            });
+            if shown {
                 return log;
             }
             assert!(
                 Instant::now() < deadline,
-                "daemon.log did not show {needle:?} within {REFUSED_WITHIN:?}:\n{log}\nsession stderr:\n{}",
+                "daemon.log did not show {first:?} … {then:?} within {REFUSED_WITHIN:?}:\n{log}\nsession stderr:\n{}",
                 session.stderr()
             );
             std::thread::sleep(Duration::from_millis(50));
