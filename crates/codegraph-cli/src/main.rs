@@ -2222,11 +2222,10 @@ fn cmd_status(path: Option<PathBuf>, json_output: bool) -> Result<()> {
                 } else {
                     format!("codegraph index --force {}", project.display())
                 });
-            } else if matches!(&extraction_status, ExtractionStatus::Outdated { .. })
-                && uninit_tombstone_present(&resolved)
+            } else if owner_mismatch_recoverable
+                || (matches!(&extraction_status, ExtractionStatus::Outdated { .. })
+                    && uninit_tombstone_present(&resolved))
             {
-                status["recoveryCommand"] = json!(format!("codegraph init {}", project.display()));
-            } else if owner_mismatch_recoverable {
                 status["recoveryCommand"] = json!(format!("codegraph init {}", project.display()));
             } else if lockless_missing {
                 status["recoveryCommand"] =
