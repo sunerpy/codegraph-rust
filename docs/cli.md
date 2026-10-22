@@ -1084,6 +1084,12 @@ attaches again, doubling the wait after each miss up to
 `CODEGRAPH_DAEMON_RETRY_MAX_MS`. It never starts a daemon for a project whose
 index is gone, and `CODEGRAPH_DAEMON_RETRY_MS=0` turns the retries off.
 
+A daemon serves only a current index. Before it publishes its socket it upgrades
+a complete index an older extraction version built, as
+[Extraction-version upgrades](#extraction-version-upgrades) describes. It
+refuses to start when that upgrade fails or the index is otherwise not current,
+logging the reason to `.codegraph/daemon.log`.
+
 A daemon keeps running the code it started with, so after an upgrade the
 project's daemon can be an older build than the session that finds it. A
 session that meets a daemon of another version reads the version from the
@@ -1348,10 +1354,19 @@ codegraph index --force /path/to/project # only when the CLI explicitly requires
 ```
 
 An index built by an older extraction version is a supported `sync` upgrade:
-`status` reports it as outdated, and `sync` (or the catch-up a daemon or MCP
-session runs when it opens the project) rebuilds it from source into the current
-namespace, applying any pending schema migration on the way. The result equals a
-fresh `init`. Do not run `index --force` solely because the extraction version
+`status` reports it as outdated, and `sync` rebuilds it from source into the
+current namespace, applying any pending schema migration on the way. The result
+equals a fresh `init`. An MCP session upgrades a complete older index as well:
+in the default daemon mode the project's daemon rebuilds it the same way before it
+starts serving, and with `CODEGRAPH_NO_DAEMON=1` the session's own catch-up does.
+Until the rebuild finishes, a tool call may wait for it, up to 30 seconds, or
+fail; a later call succeeds once it is done. If the rebuild fails, the daemon
+does not start. A failure before the rebuild begins replacing the index leaves
+the older index as it was; a later one can leave it `building`, as an
+interrupted `sync` does. The daemon also refuses to start on an older index that
+is not complete (an interrupted build, an `uninit --force`, or a missing
+database), and leaves it alone. Either way, run `codegraph status` for the state
+the index is in and the recovery it needs. Do not run `index --force` solely because the extraction version
 changed. An older binary refuses an index a newer extraction version wrote and
 leaves it untouched.
 

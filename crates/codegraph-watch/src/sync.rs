@@ -20,7 +20,9 @@ use codegraph_resolve::ReferenceResolver;
 use codegraph_resolve::framework::FrameworkExtractionContext;
 use codegraph_resolve::frameworks::godot_dsl_config::GodotDslConfig;
 use codegraph_store::queries::{FileReferenceSite, ReferenceSite, ResolutionReplacement};
-use codegraph_store::{IndexLease, Store, StoreWriteOpen, StoreWritePurpose};
+use codegraph_store::{
+    ExtractionStatus, IndexLease, StatePhase, Store, StoreWriteOpen, StoreWritePurpose, classify,
+};
 use rayon::prelude::*;
 
 use crate::git_pending::{GitIndexCapture, PendingSource};
@@ -355,6 +357,94 @@ fn sync_project_once_with_scope(
             started,
             &mut on_progress,
         ),
+    }
+}
+
+/// What [`upgrade_outdated_index_once`] found under its exclusive lease.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OutdatedUpgrade {
+    /// A complete index an older extraction version built, rebuilt from source
+    /// into the current namespace.
+    Upgraded(SyncOutcome),
+    /// Any other namespace, left untouched; the text says why.
+    Skipped(String),
+}
+
+/// Rebuild a complete index an older extraction version built, and nothing
+/// else: the upgrade a daemon runs before its startup gate.
+///
+/// The state gate classifies an older version's every phase as `Outdated`, and
+/// `codegraph sync` migrates all of them. An automatic upgrade must not undo an
+/// older `uninit --force` or recreate a database someone removed, so this takes
+/// ONE exclusive lease, reclassifies under it, and requires an `Outdated`
+/// status whose authoritative slot records the `current` phase, no
+/// uninitialized tombstone, and the database file. Only then does it run the
+/// migration `sync` runs, under the same lease, so no writer can change the
+/// namespace between the check and the rebuild.
+pub fn upgrade_outdated_index_once(project_root: impl AsRef<Path>) -> Result<OutdatedUpgrade> {
+    let project_root = project_root.as_ref();
+    let paths = index_paths(project_root)?;
+    let scope = ProjectScope::load(project_root, &paths)?;
+    let started = Instant::now();
+    let lease = IndexLease::acquire_exclusive_existing(
+        &paths,
+        Instant::now() + SYNC_LEASE_TIMEOUT,
+        || false,
+    )?;
+    if let Some(reason) = not_a_complete_outdated_index(&paths)? {
+        return Ok(OutdatedUpgrade::Skipped(reason));
+    }
+    match Store::open_for_write(&paths, lease, StoreWritePurpose::IncrementalSync)? {
+        StoreWriteOpen::FullRebuildRequired(authorization) => crate::migrate::migrate_project(
+            project_root,
+            &paths,
+            authorization,
+            &scope,
+            started,
+            |_, _| {},
+        )
+        .map(OutdatedUpgrade::Upgraded),
+        // The check above held this lease, so the gate classifies the same
+        // `Outdated` namespace; any other answer is refused, not written.
+        _ => bail!(
+            "the index state gate did not authorize upgrading {}",
+            paths.current_root().display()
+        ),
+    }
+}
+
+/// Why the namespace is not a complete index an older extraction version
+/// built, or `None` when it is.
+fn not_a_complete_outdated_index(paths: &IndexPaths) -> Result<Option<String>> {
+    let classification = classify(paths);
+    if !matches!(classification.status(), ExtractionStatus::Outdated { .. }) {
+        return Ok(Some(format!("index state is {}", classification.status())));
+    }
+    let record = classification.authoritative().map(|slot| &slot.record);
+    if record.and_then(|record| record.phase) != Some(StatePhase::Current) {
+        return Ok(Some(format!(
+            "the outdated index records phase {}, not {}",
+            record.map_or("unknown", |record| record.phase_raw.as_str()),
+            StatePhase::Current.as_wire()
+        )));
+    }
+    match fs::symlink_metadata(paths.tombstone()) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Ok(_) => return Ok(Some("its uninitialized tombstone is present".to_string())),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("inspecting {}", paths.tombstone().display()));
+        }
+    }
+    match fs::symlink_metadata(paths.current_db()) {
+        Ok(metadata) if metadata.file_type().is_file() => Ok(None),
+        Ok(_) => Ok(Some("its database is not a regular file".to_string())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(Some("its database is missing".to_string()))
+        }
+        Err(error) => {
+            Err(error).with_context(|| format!("inspecting {}", paths.current_db().display()))
+        }
     }
 }
 

@@ -45,9 +45,10 @@ pub use policy::{
     CODEGRAPH_NO_WATCH, TooBroadRoot, WatchPolicy, too_broad_root_reason, watch_disabled_reason,
 };
 pub use sync::{
-    PendingChanges, SyncCancellation, SyncOutcome, pending_full_inventory, pending_project_changes,
-    pending_project_changes_detailed, sync_changed_paths, sync_project_once,
-    sync_project_once_cancellable, sync_project_once_with_progress,
+    OutdatedUpgrade, PendingChanges, SyncCancellation, SyncOutcome, pending_full_inventory,
+    pending_project_changes, pending_project_changes_detailed, sync_changed_paths,
+    sync_project_once, sync_project_once_cancellable, sync_project_once_with_progress,
+    upgrade_outdated_index_once,
 };
 pub use watcher::{
     CODEGRAPH_WATCH_SENTINEL_MS, LOCK_RECOVERY_INTERVAL, PendingFile, ProjectWatcher, WatchHealth,

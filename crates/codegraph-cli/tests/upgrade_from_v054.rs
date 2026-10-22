@@ -4,11 +4,12 @@
 //! released v0.54.0 binary (extraction version 21) wrote for the mini corpus.
 //! Each test plants it in a fresh project namespace, stages the state slot that
 //! release publishes (`phase=current`, extraction version 21), and upgrades it
-//! through one of the two paths a user hits: `codegraph sync` from the shell, and
-//! the catch-up sync a daemon or MCP session runs when it first opens the
-//! project. Both must classify the namespace as outdated, rebuild it from source
-//! exactly once, and leave an index at the current schema whose canonical graph
-//! equals a fresh `init` of the same tree.
+//! through the paths a user hits: `codegraph sync` from the shell, the catch-up
+//! sync a daemon or MCP session runs when it first opens the project, and a cold
+//! `serve --mcp` session in the default daemon mode, whose daemon must upgrade
+//! the index before it starts serving. Each must classify the namespace as
+//! outdated, rebuild it from source, and leave an index at the current schema
+//! whose canonical graph equals a fresh `init` of the same tree.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -61,6 +62,442 @@ fn catch_up_sync_upgrades_a_v0_54_index_to_the_current_schema_and_extraction() {
     codegraph_watch::sync_project_once(&project).expect("catch-up sync over a v0.54.0 index");
 
     assert_upgraded_like_a_fresh_init(&project, "catch-up");
+}
+
+/// The default daemon mode: a cold `serve --mcp` session answers direct and
+/// spawns the project's daemon, which used to refuse an `outdated` index at its
+/// startup gate, so nothing ever upgraded it and every tool call failed until a
+/// manual `codegraph sync`. The daemon must upgrade the index first, then serve
+/// it and keep it live.
+#[cfg(unix)]
+#[test]
+fn a_cold_mcp_session_upgrades_a_v0_54_index_through_its_daemon() {
+    let dir = TestDir::new("daemon");
+    let project = plant_v0_54_index(&dir);
+    let paths = index_paths(&project);
+    let mut session = cold::Session::start(&project, dir.path());
+
+    let deadline = std::time::Instant::now() + cold::UPGRADED_WITHIN;
+    while Store::extraction_status(&paths) != ExtractionStatus::Current {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the v0.54.0 index was still {:?} {:?} after the cold session started;\n\
+             daemon.log:\n{}\nsession stderr:\n{}",
+            Store::extraction_status(&paths),
+            cold::UPGRADED_WITHIN,
+            fs::read_to_string(paths.daemon_log()).unwrap_or_default(),
+            session.stderr()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    cold::wait_for_daemon(&project, &session);
+    assert_upgraded_like_a_fresh_init(&project, "daemon");
+
+    let marker = "upgradedDaemonSessionMarker";
+    fs::write(
+        project.join("src/upgraded.ts"),
+        format!("export function {marker}(): number {{\n  return 1;\n}}\n"),
+    )
+    .unwrap();
+    session.wait_for_symbol(marker, "src/upgraded.ts");
+    session.close();
+    cold::shutdown_daemon(&project);
+}
+
+/// A daemon never undoes an older `uninit --force`. That leaves an
+/// `uninitialized` slot at the older extraction version, which the state gate
+/// classifies as `outdated`, a tombstone, and no database; the daemon must
+/// leave all of it alone and refuse to start, as it did before.
+#[cfg(unix)]
+#[test]
+fn a_cold_mcp_session_leaves_an_older_uninit_alone() {
+    let dir = TestDir::new("daemon-uninit");
+    let project = dir.path().join("project");
+    copy_tree(&mini_fixture(), &project);
+    let init = cli(&["init", path_str(&project)]);
+    assert!(init.ok, "init failed: {}", init.stderr);
+    let uninit = cli(&["uninit", "--force", path_str(&project)]);
+    assert!(uninit.ok, "uninit failed: {}", uninit.stderr);
+    let paths = index_paths(&project);
+    stage_state_slot(
+        &paths,
+        3,
+        CURRENT_STORAGE_PROTOCOL,
+        V0_54_EXTRACTION_VERSION,
+        "uninitialized",
+    );
+    let outdated = ExtractionStatus::Outdated {
+        built: V0_54_EXTRACTION_VERSION,
+    };
+    assert_eq!(Store::extraction_status(&paths), outdated);
+    assert!(paths.tombstone().is_file(), "uninit leaves its tombstone");
+    assert!(!paths.current_db().exists(), "uninit removes the database");
+    let slots = state_slot_bytes(&paths);
+
+    let session = cold::Session::start(&project, dir.path());
+    let log = cold::wait_for_daemon_log(
+        &paths,
+        "refusing to start a daemon for",
+        "state-gated Store open rejected",
+        &session,
+    );
+    assert!(
+        !paths.current_db().exists(),
+        "the daemon recreated the database an uninit removed:\n{log}"
+    );
+    assert!(paths.tombstone().is_file(), "the tombstone must stay");
+    assert_eq!(Store::extraction_status(&paths), outdated);
+    assert_eq!(
+        state_slot_bytes(&paths),
+        slots,
+        "the state slots must not move"
+    );
+    assert!(
+        !cold::daemon_live(&project),
+        "no daemon may serve this index"
+    );
+    assert!(
+        log.contains("left the outdated index to the startup gate"),
+        "the daemon must say why it left the index alone:\n{log}"
+    );
+    session.close();
+}
+
+/// A failed upgrade is a failed migration: the daemon stops before its startup
+/// gate, and nothing changes. Here the project config cannot be parsed, so the
+/// upgrade fails before it takes the index lease.
+#[cfg(unix)]
+#[test]
+fn a_daemon_whose_upgrade_fails_still_refuses_the_outdated_index() {
+    let dir = TestDir::new("daemon-failed-upgrade");
+    let project = plant_v0_54_index(&dir);
+    let paths = index_paths(&project);
+    fs::write(paths.config_toml(), "[indexing\n").unwrap();
+    let database = fs::read(paths.current_db()).unwrap();
+    let slots = state_slot_bytes(&paths);
+
+    let session = cold::Session::start(&project, dir.path());
+    let log = cold::wait_for_daemon_log(
+        &paths,
+        "refusing to start a daemon for",
+        "could not upgrade its outdated index",
+        &session,
+    );
+    assert_eq!(
+        Store::extraction_status(&paths),
+        ExtractionStatus::Outdated {
+            built: V0_54_EXTRACTION_VERSION
+        }
+    );
+    assert_eq!(
+        fs::read(paths.current_db()).unwrap(),
+        database,
+        "a failed upgrade must leave the database as it was"
+    );
+    assert_eq!(
+        state_slot_bytes(&paths),
+        slots,
+        "the state slots must not move"
+    );
+    assert!(
+        !cold::daemon_live(&project),
+        "no daemon may serve this index"
+    );
+    assert!(
+        !log.contains("state-gated Store open"),
+        "a failed upgrade must stop the daemon before its startup gate:\n{log}"
+    );
+    session.close();
+}
+
+/// The upgrade a daemon runs rebuilds only a complete older index. Each
+/// namespace below is one `codegraph sync` would still migrate.
+#[test]
+fn the_daemon_upgrade_skips_an_interrupted_older_build() {
+    let dir = TestDir::new("skip-building");
+    let project = plant_v0_54_index(&dir);
+    stage_state_slot(
+        &index_paths(&project),
+        3,
+        CURRENT_STORAGE_PROTOCOL,
+        V0_54_EXTRACTION_VERSION,
+        "building",
+    );
+    assert_upgrade_skipped_untouched(&project, "records phase building");
+}
+
+#[test]
+fn the_daemon_upgrade_skips_an_older_index_with_a_tombstone() {
+    let dir = TestDir::new("skip-tombstone");
+    let project = plant_v0_54_index(&dir);
+    fs::write(index_paths(&project).tombstone(), b"uninitialized\n").unwrap();
+    assert_upgrade_skipped_untouched(&project, "tombstone is present");
+}
+
+#[test]
+fn the_daemon_upgrade_skips_an_older_index_without_its_database() {
+    let dir = TestDir::new("skip-missing-db");
+    let project = plant_v0_54_index(&dir);
+    fs::remove_file(index_paths(&project).current_db()).unwrap();
+    assert_upgrade_skipped_untouched(&project, "database is missing");
+}
+
+fn assert_upgrade_skipped_untouched(project: &Path, reason: &str) {
+    let paths = index_paths(project);
+    let status = Store::extraction_status(&paths);
+    assert!(
+        matches!(status, ExtractionStatus::Outdated { .. }),
+        "each case starts outdated: {status:?}"
+    );
+    let database = fs::read(paths.current_db()).ok();
+    let tombstone = fs::read(paths.tombstone()).ok();
+    let slots = state_slot_bytes(&paths);
+    match codegraph_watch::upgrade_outdated_index_once(project).expect("daemon upgrade entry") {
+        codegraph_watch::OutdatedUpgrade::Skipped(text) => {
+            assert!(text.contains(reason), "skipped for another reason: {text}");
+        }
+        other => panic!("expected a skip ({reason}), got {other:?}"),
+    }
+    assert_eq!(Store::extraction_status(&paths), status);
+    assert_eq!(fs::read(paths.current_db()).ok(), database);
+    assert_eq!(fs::read(paths.tombstone()).ok(), tombstone);
+    assert_eq!(state_slot_bytes(&paths), slots);
+}
+
+/// Both state slots, byte for byte (`None` for an absent slot).
+fn state_slot_bytes(paths: &IndexPaths) -> [Option<Vec<u8>>; 2] {
+    paths.state_slots().map(|slot| fs::read(slot).ok())
+}
+
+/// A cold `serve --mcp --path <project>` over line-delimited JSON-RPC, the
+/// harness of `cold_start_live_sync.rs` reduced to what the upgrade case needs.
+#[cfg(unix)]
+mod cold {
+    use std::fs;
+    use std::io::{BufRead, BufReader, Write};
+    use std::path::{Path, PathBuf};
+    use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    use serde_json::{Value, json};
+
+    /// Upper bound for the daemon to upgrade the mini corpus and publish.
+    pub const UPGRADED_WITHIN: Duration = Duration::from_secs(60);
+    /// Upper bound for an edit to reach `codegraph_search` once it serves.
+    const EDIT_VISIBLE_WITHIN: Duration = Duration::from_secs(10);
+
+    pub struct Session {
+        child: Child,
+        stdin: Option<ChildStdin>,
+        stdout: BufReader<ChildStdout>,
+        stderr_log: PathBuf,
+        next_id: i64,
+    }
+
+    impl Session {
+        pub fn start(project: &Path, scratch: &Path) -> Self {
+            let stderr_log = scratch.join("serve.stderr.log");
+            let mut child = Command::new(env!("CARGO_BIN_EXE_codegraph"))
+                .args(["serve", "--mcp", "--path"])
+                .arg(project)
+                .env_remove("CODEGRAPH_NO_DAEMON")
+                .env_remove("CODEGRAPH_NO_WATCH")
+                .env_remove("CODEGRAPH_DIR")
+                .env("CODEGRAPH_MCP_REGISTRY_DIR", scratch.join("mcp-registry"))
+                .env("CODEGRAPH_DAEMON_IDLE_TIMEOUT_MS", "1000")
+                .env("CODEGRAPH_DAEMON_RETRY_MS", "200")
+                .env("CODEGRAPH_DAEMON_RETRY_MAX_MS", "1000")
+                .env("CODEGRAPH_WATCH_DEBOUNCE_MS", "100")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(fs::File::create(&stderr_log).expect("create serve stderr log"))
+                .spawn()
+                .expect("spawn cold serve --mcp");
+            let stdin = child.stdin.take().expect("serve stdin");
+            let stdout = BufReader::new(child.stdout.take().expect("serve stdout"));
+            let mut session = Self {
+                child,
+                stdin: Some(stdin),
+                stdout,
+                stderr_log,
+                next_id: 1,
+            };
+            let id = session.next_id();
+            session.write(json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {},
+                    "clientInfo": { "name": "upgrade-from-v054", "version": "0" }
+                }
+            }));
+            let response = session.read_id(id);
+            assert_eq!(
+                response["result"]["serverInfo"]["name"], "codegraph",
+                "{response}"
+            );
+            session.write(json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }));
+            session
+        }
+
+        fn next_id(&mut self) -> i64 {
+            let id = self.next_id;
+            self.next_id += 1;
+            id
+        }
+
+        fn write(&mut self, value: Value) {
+            let stdin = self.stdin.as_mut().expect("serve stdin stays open");
+            writeln!(stdin, "{value}").unwrap();
+            stdin.flush().unwrap();
+        }
+
+        fn read_id(&mut self, want: i64) -> Value {
+            loop {
+                let mut line = String::new();
+                let read = self.stdout.read_line(&mut line).expect("read serve stdout");
+                assert!(
+                    read > 0,
+                    "serve closed stdout before response {want}; stderr:\n{}",
+                    self.stderr()
+                );
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                let value: Value = serde_json::from_str(trimmed).unwrap_or_else(|error| {
+                    panic!("non-JSON line on serve stdout ({error}): {trimmed:?}")
+                });
+                if value.get("id").and_then(Value::as_i64) == Some(want) {
+                    return value;
+                }
+            }
+        }
+
+        fn search(&mut self, query: &str) -> String {
+            let id = self.next_id();
+            self.write(json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "tools/call",
+                "params": { "name": "codegraph_search", "arguments": { "query": query } }
+            }));
+            let response = self.read_id(id);
+            response["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap_or("")
+                .to_string()
+        }
+
+        pub fn wait_for_symbol(&mut self, symbol: &str, file: &str) {
+            let deadline = Instant::now() + EDIT_VISIBLE_WITHIN;
+            loop {
+                let text = self.search(symbol);
+                if text.contains(symbol) && text.contains(file) {
+                    return;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "`{symbol}` was not searchable within {EDIT_VISIBLE_WITHIN:?}; last result:\n{text}\nstderr:\n{}",
+                    self.stderr()
+                );
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+
+        pub fn stderr(&self) -> String {
+            fs::read_to_string(&self.stderr_log).unwrap_or_default()
+        }
+
+        pub fn close(mut self) {
+            drop(self.stdin.take());
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while Instant::now() < deadline {
+                if self.child.try_wait().unwrap().is_some() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            panic!("cold serve did not exit after stdin EOF");
+        }
+    }
+
+    impl Drop for Session {
+        fn drop(&mut self) {
+            drop(self.stdin.take());
+            if self.child.try_wait().ok().flatten().is_none() {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+            }
+        }
+    }
+
+    /// Upper bound for a refusing daemon to write its log lines.
+    const REFUSED_WITHIN: Duration = Duration::from_secs(30);
+
+    /// Whether a live daemon owns `project`.
+    pub fn daemon_live(project: &Path) -> bool {
+        codegraph_daemon::daemon_pid_path(project)
+            .ok()
+            .and_then(|path| fs::read_to_string(path).ok())
+            .and_then(|raw| codegraph_daemon::decode_lock_info(&raw))
+            .is_some_and(|info| info.pid > 0 && codegraph_daemon::is_process_alive(info.pid))
+    }
+
+    /// Wait until one line of the project's `daemon.log` contains both `first`
+    /// and `then`, in that order; returns the whole log.
+    pub fn wait_for_daemon_log(
+        paths: &codegraph_core::IndexPaths,
+        first: &str,
+        then: &str,
+        session: &Session,
+    ) -> String {
+        let deadline = Instant::now() + REFUSED_WITHIN;
+        loop {
+            let log = fs::read_to_string(paths.daemon_log()).unwrap_or_default();
+            let shown = log.lines().any(|line| {
+                line.find(first)
+                    .is_some_and(|at| line[at + first.len()..].contains(then))
+            });
+            if shown {
+                return log;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "daemon.log did not show {first:?} … {then:?} within {REFUSED_WITHIN:?}:\n{log}\nsession stderr:\n{}",
+                session.stderr()
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// Wait until a live daemon owns `project`: it publishes only after the
+    /// upgrade and its startup gate.
+    pub fn wait_for_daemon(project: &Path, session: &Session) {
+        let deadline = Instant::now() + UPGRADED_WITHIN;
+        loop {
+            if daemon_live(project) {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "no live daemon within {UPGRADED_WITHIN:?}; stderr:\n{}",
+                session.stderr()
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    pub fn shutdown_daemon(project: &Path) {
+        let paths = codegraph_core::IndexPaths::resolve(project, None).unwrap();
+        match codegraph_daemon::request_daemon_shutdown(project, paths.project_identity()) {
+            Ok(codegraph_daemon::ShutdownOutcome::NoDaemon)
+            | Ok(codegraph_daemon::ShutdownOutcome::Drained { .. }) => {}
+            other => panic!("failed to stop the daemon: {other:?}"),
+        }
+    }
 }
 
 /// Copy the mini corpus into `dir`, create a namespace with the current binary,
