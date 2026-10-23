@@ -2157,7 +2157,10 @@ fn cmd_status(path: Option<PathBuf>, json_output: bool) -> Result<()> {
         // failing like a read.
         Err(
             error @ codegraph_store::StoreError::FutureSchema {
-                found, supported, ..
+                found,
+                supported,
+                discard_with_uninit,
+                ..
             },
         ) => {
             if json_output {
@@ -2198,11 +2201,17 @@ fn cmd_status(path: Option<PathBuf>, json_output: bool) -> Result<()> {
                     "  Daemon:    {}",
                     if daemon_running { "running" } else { "stopped" }
                 );
-                println!(
-                    "\nRecovery: a newer CodeGraph wrote this index. Upgrade CodeGraph, or run `codegraph uninit --force {}` and then `codegraph init {}` to discard and rebuild it.",
-                    project.display(),
-                    project.display()
-                );
+                if discard_with_uninit {
+                    println!(
+                        "\nRecovery: a newer CodeGraph wrote this index. Upgrade CodeGraph, or run `codegraph uninit --force {}` and then `codegraph init {}` to discard and rebuild it.",
+                        project.display(),
+                        project.display()
+                    );
+                } else {
+                    println!(
+                        "\nRecovery: a newer CodeGraph wrote this index. Upgrade CodeGraph to use it."
+                    );
+                }
             }
             return Ok(());
         }

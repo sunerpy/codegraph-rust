@@ -223,6 +223,49 @@ fn a_tombstoned_index_a_newer_codegraph_wrote_is_discarded_by_uninit() {
     assert!(!paths.tombstone().exists(), "init removed the tombstone");
 }
 
+/// Where `uninit --force` would fail (a tombstoned newer-schema index whose
+/// extraction stamp is missing), `status` reports the newer schema without
+/// offering it, in JSON and in its human output.
+#[test]
+fn status_offers_no_uninit_where_uninit_would_fail() {
+    let dir = TestDir::new("future-schema-no-discard");
+    let project = indexed_project(&dir);
+    let paths = index_paths(&project);
+    {
+        let conn = rusqlite::Connection::open(paths.current_db()).unwrap();
+        conn.execute(
+            "DELETE FROM project_metadata WHERE key = 'indexed_with_extraction_version'",
+            [],
+        )
+        .unwrap();
+    }
+    record_newer_schema(&paths);
+    fs::write(paths.tombstone(), b"remove failed").unwrap();
+    let before = index_bytes(&paths);
+
+    let status = cli(&["status", path_str(&project), "--json"]);
+    assert!(status.ok, "status failed: {}", status.stderr);
+    let json: Value = serde_json::from_str(&status.stdout).expect("status JSON");
+    let detail = json["extractionStatusDetail"].as_str().unwrap_or("");
+    assert!(
+        detail.contains(&format!("schema {NEWER}")) && !detail.contains("uninit"),
+        "{detail}"
+    );
+    let human = cli(&["status", path_str(&project)]);
+    assert!(human.ok, "status failed: {}", human.stderr);
+    assert!(
+        human.stdout.contains(&format!("schema {NEWER} is newer"))
+            && !human.stdout.contains("uninit"),
+        "{}",
+        human.stdout
+    );
+    assert!(
+        !cli(&["uninit", "--force", path_str(&project)]).ok,
+        "uninit refuses the missing stamp"
+    );
+    assert_unchanged(&paths, &before, "status and uninit");
+}
+
 #[test]
 fn sync_leaves_a_newer_schema_in_the_log_untouched() {
     let dir = TestDir::new("future-schema-log-sync");
