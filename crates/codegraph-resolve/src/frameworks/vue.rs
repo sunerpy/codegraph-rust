@@ -1,5 +1,7 @@
-//! Vue / Nuxt [`FrameworkResolver`] — ports
-//! `upstream resolution/frameworks/vue.ts`.
+//! Vue / Nuxt [`FrameworkResolver`]s — ports
+//! `upstream resolution/frameworks/vue.ts`: [`VueResolver`] reads Vue
+//! component references, compiler macros and Nuxt auto-imports;
+//! [`NuxtResolver`] reads Nuxt's file-based routes.
 
 use std::sync::OnceLock;
 
@@ -7,6 +9,7 @@ use codegraph_core::types::{EdgeKind, Language, NodeKind};
 use regex::Regex;
 
 use super::framework_node;
+use super::page_component::{page_component_ref, resolve_page_component};
 use crate::framework::FrameworkResolver;
 use crate::types::{
     FrameworkResolverExtractionResult, RefView, ResolutionContext, ResolvedBy, ResolvedRef,
@@ -149,8 +152,37 @@ impl FrameworkResolver for VueResolver {
 
         None
     }
+}
 
-    // Ports vueResolver.extract (vue.ts:190-264).
+/// Nuxt's file-based routes: `pages/` screens, `server/api/` endpoints and
+/// `middleware/` (`nuxtResolver`, upstream #2130). Its own resolver,
+/// detected only in a Nuxt app: a plain Vue app keeps its views in a
+/// `pages/` folder just as often (halo's console does), and those are
+/// components a router config names, not addresses.
+pub struct NuxtResolver;
+
+impl FrameworkResolver for NuxtResolver {
+    fn name(&self) -> &str {
+        "nuxt"
+    }
+
+    fn app_dependencies(&self) -> Option<&'static [&'static str]> {
+        Some(&NUXT_APP_DEPENDENCIES)
+    }
+
+    fn detect(&self, context: &dyn ResolutionContext) -> bool {
+        super::package_deps::depends_on(context, &NUXT_APP_DEPENDENCIES)
+            || context
+                .get_all_files_shared()
+                .iter()
+                .any(|file| nuxt_config_regex().is_match(file))
+    }
+
+    /// A page route names the component its file is (upstream #2267).
+    fn resolve(&self, reference: &RefView, context: &dyn ResolutionContext) -> Option<ResolvedRef> {
+        resolve_page_component(reference, context)
+    }
+
     fn extract(
         &self,
         file_path: &str,
@@ -158,35 +190,44 @@ impl FrameworkResolver for VueResolver {
         _context: &crate::framework::FrameworkExtractionContext,
     ) -> Option<FrameworkResolverExtractionResult> {
         let mut nodes = Vec::new();
-        let normalized = file_path.replace('\\', "/");
+        let mut references = Vec::new();
+        // Forward slashes, and a leading `/` so an app at the repository
+        // root (`pages/index.vue`) is found by the same `/pages/` search as
+        // a nested one.
+        let normalized = format!("/{}", file_path.replace('\\', "/"));
 
-        // Nuxt page routes (pages/ directory) (vue.ts:197-216).
-        if let Some(pages_index) = normalized.find("/pages/") {
-            if normalized.ends_with(".vue") {
-                let after_start = pages_index + "/pages/".len();
-                if let Some(route_path) = file_path_to_nuxt_route(&normalized, after_start) {
-                    nodes.push(framework_node(
-                        format!("route:{file_path}:{route_path}:1"),
-                        NodeKind::Route,
-                        route_path.clone(),
-                        format!("{file_path}::route:{route_path}"),
-                        file_path.to_string(),
-                        1,
-                        1,
-                        0,
-                        0,
-                        Language::Vue,
-                        false,
-                    ));
-                }
-            }
+        // Nuxt page routes (pages/ directory).
+        if let Some(pages_index) = normalized.find("/pages/")
+            && normalized.ends_with(".vue")
+            && let Some(route_path) =
+                file_path_to_nuxt_route(&normalized, pages_index + "/pages/".len())
+        {
+            let route = framework_node(
+                format!("route:{file_path}:{route_path}:1"),
+                NodeKind::Route,
+                route_path.clone(),
+                format!("{file_path}::route:{route_path}"),
+                file_path.to_string(),
+                1,
+                1,
+                0,
+                0,
+                Language::Vue,
+                false,
+            );
+            references.push(page_component_ref(&route, ".vue", Language::Vue));
+            nodes.push(route);
         }
 
-        // Nuxt API routes (server/api/ directory) (vue.ts:218-240).
+        // Nuxt API routes (server/api/ directory).
         if let Some(api_index) = normalized.find("/server/api/") {
             let after_api = &normalized[api_index + "/server/api/".len()..];
-            let route_name = strip_trailing_index(&strip_extension(after_api));
-            let api_route = format!("/api/{route_name}");
+            let route_name = nuxt_params(&strip_trailing_index(&strip_extension(after_api)));
+            let api_route = if route_name.is_empty() {
+                "/api".to_string()
+            } else {
+                format!("/api/{route_name}")
+            };
             let lang = if normalized.ends_with(".vue") {
                 Language::Vue
             } else {
@@ -207,7 +248,7 @@ impl FrameworkResolver for VueResolver {
             ));
         }
 
-        // Nuxt middleware (middleware/ directory) (vue.ts:242-261).
+        // Nuxt middleware (middleware/ directory).
         if let Some(mw_index) = normalized.find("/middleware/") {
             let after_mw = &normalized[mw_index + "/middleware/".len()..];
             let mw_name = strip_extension(after_mw);
@@ -231,12 +272,12 @@ impl FrameworkResolver for VueResolver {
             ));
         }
 
-        Some(FrameworkResolverExtractionResult {
-            nodes,
-            references: Vec::new(),
-        })
+        Some(FrameworkResolverExtractionResult { nodes, references })
     }
 }
+
+/// The packages a Nuxt app declares (`appDependencies`).
+const NUXT_APP_DEPENDENCIES: [&str; 3] = ["nuxt", "nuxt3", "@nuxt/kit"];
 
 /// `{ ...dependencies, ...devDependencies }` membership test (vue.ts:89-90).
 fn dep_present(pkg: &serde_json::Value, keys: &[&str]) -> bool {
@@ -350,17 +391,18 @@ fn resolve_component(
     }
 }
 
-/// `filePathToNuxtRoute` (vue.ts:313-331).
+/// `filePathToNuxtRoute`: a top-level `pages/index.vue` is `/` (upstream
+/// #2130).
 fn file_path_to_nuxt_route(normalized: &str, after_pages_start: usize) -> Option<String> {
     let after_pages = &normalized[after_pages_start..];
     // Remove .vue extension.
     let without_ext = after_pages.strip_suffix(".vue").unwrap_or(after_pages);
-    // Remove /index suffix.
-    let without_index = without_ext.strip_suffix("/index").unwrap_or(without_ext);
+    // Remove an `index` segment at the end (index.vue -> parent route).
+    let without_index = strip_trailing_index(without_ext);
 
     // [...slug] -> *slug, [[optional]] -> :optional?, [param] -> :param.
     let step1 = catch_all_regex()
-        .replace_all(without_index, "*$1")
+        .replace_all(&without_index, "*$1")
         .into_owned();
     let step2 = optional_regex().replace_all(&step1, ":$1?").into_owned();
     let step3 = param_regex().replace_all(&step2, ":$1").into_owned();
@@ -381,9 +423,24 @@ fn strip_extension(s: &str) -> String {
         .into_owned()
 }
 
-/// `replace(/\/index$/, '')`.
+/// `replace(/(?:^|\/)index$/, '')`: an `index` segment at the end.
 fn strip_trailing_index(s: &str) -> String {
+    if s == "index" {
+        return String::new();
+    }
     s.strip_suffix("/index").unwrap_or(s).to_string()
+}
+
+/// A server route's params, as a page's are: `[...slug]` -> `*slug`, `[id]`
+/// -> `:id` (upstream #2130).
+fn nuxt_params(s: &str) -> String {
+    let catch_all = catch_all_regex().replace_all(s, "*$1");
+    param_regex().replace_all(&catch_all, ":$1").into_owned()
+}
+
+fn nuxt_config_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"(?:^|/)nuxt\.config\.(?:[cm]?[jt]s)$").expect("nuxt config"))
 }
 
 fn dir_of(file: &str) -> String {
@@ -708,7 +765,7 @@ mod tests {
 
     #[test]
     fn extract_nuxt_catch_all_route() {
-        let result = VueResolver
+        let result = NuxtResolver
             .extract("app/pages/[...slug].vue", "", &test_extraction_context())
             .expect("extract");
         let route = result
@@ -721,7 +778,7 @@ mod tests {
 
     #[test]
     fn extract_nuxt_optional_param_route() {
-        let result = VueResolver
+        let result = NuxtResolver
             .extract("app/pages/[[maybe]].vue", "", &test_extraction_context())
             .expect("extract");
         let route = result
@@ -735,7 +792,7 @@ mod tests {
     #[test]
     fn extract_nuxt_nested_index_route_strips_index() {
         // `pages/users/index.vue` -> after_pages "users/index" -> strip /index -> "/users".
-        let result = VueResolver
+        let result = NuxtResolver
             .extract("app/pages/users/index.vue", "", &test_extraction_context())
             .expect("extract");
         let route = result
@@ -748,9 +805,9 @@ mod tests {
 
     #[test]
     fn extract_api_route_strips_index_and_ext() {
-        // The matcher keys on a leading-slash "/server/api/", so the file needs a
-        // parent segment (app/server/api/...).
-        let result = VueResolver
+        // An app in a subdirectory; extract_server_api_params_and_root_index
+        // covers one at the repository root.
+        let result = NuxtResolver
             .extract(
                 "app/server/api/users/index.ts",
                 "",
@@ -768,8 +825,7 @@ mod tests {
 
     #[test]
     fn extract_middleware_node() {
-        // Leading-slash "/middleware/" match requires a parent segment.
-        let result = VueResolver
+        let result = NuxtResolver
             .extract("app/middleware/auth.ts", "", &test_extraction_context())
             .expect("extract");
         let mw = result
@@ -783,7 +839,7 @@ mod tests {
 
     #[test]
     fn extract_non_route_file_yields_no_nodes() {
-        let result = VueResolver
+        let result = NuxtResolver
             .extract("src/plain.ts", "", &test_extraction_context())
             .expect("extract");
         assert!(result.nodes.is_empty());
@@ -792,7 +848,7 @@ mod tests {
     #[test]
     fn extract_backslash_paths_normalized() {
         // Windows-style separators normalize so /pages/ still matches.
-        let result = VueResolver
+        let result = NuxtResolver
             .extract("app\\pages\\about.vue", "", &test_extraction_context())
             .expect("extract");
         let route = result
@@ -884,7 +940,7 @@ mod tests {
     fn extract_pages_dot_vue_api_and_middleware_use_vue_language() {
         // A `.vue` file under server/api and under middleware exercises the
         // Language::Vue arm of both extract branches.
-        let api = VueResolver
+        let api = NuxtResolver
             .extract("app/server/api/ping.vue", "", &test_extraction_context())
             .expect("extract");
         let api_route = api
@@ -895,7 +951,7 @@ mod tests {
         assert_eq!(api_route.name, "/api/ping");
         assert_eq!(api_route.language, Language::Vue);
 
-        let mw = VueResolver
+        let mw = NuxtResolver
             .extract("app/middleware/guard.vue", "", &test_extraction_context())
             .expect("extract");
         let mw_node = mw
@@ -908,18 +964,124 @@ mod tests {
     }
 
     #[test]
-    fn extract_root_pages_index_is_root_route() {
-        // `pages/index.vue` → after_pages "index"; strip_suffix("/index") does
-        // not match (no leading segment), so the route is "/index".
-        let result = VueResolver
-            .extract("app/pages/index.vue", "", &test_extraction_context())
-            .expect("extract");
-        let route = result
-            .nodes
-            .iter()
-            .find(|n| n.kind == NodeKind::Route)
-            .expect("route");
-        assert_eq!(route.name, "/index");
+    fn extract_top_level_pages_index_is_the_root_route() {
+        // `pages/index.vue` is `/`, nested or at the repository root
+        // (upstream #2130), and the route references its own component.
+        for path in ["app/pages/index.vue", "pages/index.vue"] {
+            let result = NuxtResolver
+                .extract(path, "", &test_extraction_context())
+                .expect("extract");
+            let route = result
+                .nodes
+                .iter()
+                .find(|n| n.kind == NodeKind::Route)
+                .expect("route");
+            assert_eq!(route.name, "/", "{path}");
+            assert_eq!(route.id, format!("route:{path}:/:1"));
+            let [reference] = result.references.as_slice() else {
+                panic!("one reference: {:?}", result.references);
+            };
+            assert_eq!(reference.from_node_id, route.id);
+            assert_eq!(reference.reference_name, "index");
+            assert_eq!(reference.reference_kind, EdgeKind::Calls);
+            assert_eq!(reference.language, Language::Vue);
+        }
+    }
+
+    #[test]
+    fn extract_server_api_params_and_root_index() {
+        // `[id]` -> `:id`, `[...slug]` -> `*slug`, as a page's params are;
+        // `server/api/index.ts` is `/api` (upstream #2130).
+        for (path, name) in [
+            ("server/api/users/[id].ts", "/api/users/:id"),
+            ("server/api/files/[...path].ts", "/api/files/*path"),
+            ("server/api/index.ts", "/api"),
+        ] {
+            let result = NuxtResolver
+                .extract(path, "", &test_extraction_context())
+                .expect("extract");
+            let route = result
+                .nodes
+                .iter()
+                .find(|n| n.kind == NodeKind::Route)
+                .expect("route");
+            assert_eq!(route.name, name, "{path}");
+            assert!(result.references.is_empty(), "{path}");
+        }
+    }
+
+    #[test]
+    fn vue_no_longer_extracts_nuxt_routes() {
+        // Nuxt's file routes are NuxtResolver's (upstream #2130).
+        assert!(
+            VueResolver
+                .extract("app/pages/about.vue", "", &test_extraction_context())
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn nuxt_is_detected_by_its_dependencies_or_its_config() {
+        let by_dep = Ctx::default().file("package.json", r#"{"dependencies":{"nuxt":"3"}}"#);
+        assert!(NuxtResolver.detect(&by_dep));
+        let by_config = Ctx::default().file("site/nuxt.config.ts", "export default {}");
+        assert!(NuxtResolver.detect(&by_config));
+        for name in ["nuxt.config.mjs", "nuxt.config.cts", "nuxt.config.js"] {
+            assert!(
+                NuxtResolver.detect(&Ctx::default().file(name, "")),
+                "{name}"
+            );
+        }
+        // A plain Vue app with a `pages/` folder is no Nuxt app.
+        let plain = Ctx::default()
+            .file(
+                "package.json",
+                r#"{"dependencies":{"vue":"3","vue-router":"4"}}"#,
+            )
+            .file("src/pages/List.vue", "<template/>")
+            .file("docs/nuxt.config.md", "");
+        assert!(!NuxtResolver.detect(&plain));
+        assert_eq!(NuxtResolver.name(), "nuxt");
+        assert_eq!(
+            NuxtResolver.app_dependencies(),
+            Some(&["nuxt", "nuxt3", "@nuxt/kit"][..])
+        );
+    }
+
+    #[test]
+    fn a_page_route_resolves_to_its_own_files_component() {
+        let own = mk_node(
+            "component:pages/index.vue",
+            NodeKind::Component,
+            "index",
+            "pages/index.vue",
+        );
+        let other = mk_node(
+            "component:components/index.vue",
+            NodeKind::Component,
+            "index",
+            "components/index.vue",
+        );
+        let ctx = Ctx::default().node(own.clone()).node(other);
+        let mut reference = a_ref("index", EdgeKind::Calls, "pages/index.vue");
+        reference.from_node_id = "route:pages/index.vue:/:1".to_string();
+        let resolved = NuxtResolver.resolve(&reference, &ctx).expect("resolves");
+        assert_eq!(resolved.target_node_id, own.id);
+        assert_eq!(resolved.confidence, 0.95);
+        assert_eq!(resolved.resolved_by, ResolvedBy::Framework);
+        // Not from a route of its own file, or not a call: not a page's.
+        let mut elsewhere = reference.clone();
+        elsewhere.from_node_id = "route:pages/other.vue:/other:1".to_string();
+        assert!(NuxtResolver.resolve(&elsewhere, &ctx).is_none());
+        let mut prefix_only = reference.clone();
+        prefix_only.from_node_id = "route:pages/index.vue.bak:/:1".to_string();
+        assert!(NuxtResolver.resolve(&prefix_only, &ctx).is_none());
+        let mut not_a_call = reference.clone();
+        not_a_call.reference_kind = EdgeKind::References;
+        assert!(NuxtResolver.resolve(&not_a_call, &ctx).is_none());
+        let mut from_a_function = reference;
+        from_a_function.from_node_id = "function:x".to_string();
+        assert!(NuxtResolver.resolve(&from_a_function, &ctx).is_none());
     }
 
     #[test]

@@ -10361,6 +10361,93 @@ pub fn typescript_nestjs_provider_beside_its_controller_appears() -> Case {
         )
 }
 
+/// W7-03: a `nuxt.config.ts` appears in a Vue app (upstream #2130): Nuxt is
+/// detected, and its `pages/` become routes served by their components.
+pub fn vue_nuxt_config_appears() -> Case {
+    Case::new(Change::ControlFile, &[Language::Vue, Language::TypeScript])
+        .file(
+            "package.json",
+            "{\"name\":\"shop\",\"dependencies\":{\"vue\":\"3\"}}\n",
+        )
+        .file("pages/admin.vue", "<template><div>admin</div></template>\n")
+        .file("src/main.ts", "export const ready = true;\n")
+        .write("nuxt.config.ts", "export default {};\n")
+        .edge_after(
+            "route pages/admin.vue::route:/admin",
+            "calls",
+            "component pages/admin.vue::admin",
+        )
+}
+
+/// W7-03: an app's manifest comes to declare Nuxt (upstream #2129 and
+/// #2130): the files of that app now make Nuxt routes, though no page
+/// changed, while the other app's `pages/` stay components.
+pub fn vue_nuxt_app_manifest_gains_nuxt() -> Case {
+    Case::new(Change::ControlFile, &[Language::Vue])
+        .file("package.json", "{\"name\":\"mono\",\"private\":true}\n")
+        .file(
+            "apps/site/package.json",
+            "{\"name\":\"site\",\"dependencies\":{\"nuxt\":\"3\"}}\n",
+        )
+        .file("apps/site/pages/about.vue", "<template><div/></template>\n")
+        .file(
+            "apps/admin/package.json",
+            "{\"name\":\"admin\",\"dependencies\":{\"vue\":\"3\"}}\n",
+        )
+        .file(
+            "apps/admin/pages/users.vue",
+            "<template><div/></template>\n",
+        )
+        .file(
+            "apps/blog/package.json",
+            "{\"name\":\"blog\",\"dependencies\":{\"vue\":\"3\"}}\n",
+        )
+        .file("apps/blog/pages/post.vue", "<template><div/></template>\n")
+        .write(
+            "apps/admin/package.json",
+            "{\"name\":\"admin\",\"dependencies\":{\"vue\":\"3\",\"nuxt\":\"3\"}}\n",
+        )
+        .edge_throughout(
+            "route apps/site/pages/about.vue::route:/about",
+            "calls",
+            "component apps/site/pages/about.vue::about",
+        )
+        .edge_after(
+            "route apps/admin/pages/users.vue::route:/users",
+            "calls",
+            "component apps/admin/pages/users.vue::users",
+        )
+}
+
+/// W7-03: a Nuxt page's template is edited (upstream #2267): its route
+/// still references its own component, not the same-named one elsewhere.
+pub fn vue_nuxt_page_body_edit() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Vue])
+        .file(
+            "package.json",
+            "{\"name\":\"shop\",\"dependencies\":{\"nuxt\":\"3\"}}\n",
+        )
+        .file("pages/index.vue", "<template><div>home</div></template>\n")
+        .file(
+            "components/index.vue",
+            "<template><div>not a page</div></template>\n",
+        )
+        .write(
+            "pages/index.vue",
+            "<template><section>welcome</section></template>\n",
+        )
+        .edge_throughout(
+            "route pages/index.vue::route:/",
+            "calls",
+            "component pages/index.vue::index",
+        )
+        .no_edge_after(
+            "route pages/index.vue::route:/",
+            "calls",
+            "component components/index.vue::index",
+        )
+}
+
 /// W5-06: a package the manifest comes to declare is outside the project,
 /// so the import of its binding no longer reaches a project class by name.
 pub fn typescript_declared_dependency_makes_a_bare_import_external() -> Case {

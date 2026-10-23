@@ -143,7 +143,8 @@ one length to a symbol it keeps the one that ends on fewer unnamed symbols, then
 the one through more of the named ones, not the one the index lists first.
 
 The routes list, and the routes among the entry points, hold one row per
-route: the handler a resolver bound to it, else `inline handler` standing for a
+route: the handler a resolver bound to it (a screen's component, such as a Nuxt
+page's own, counts, upstream #2267), else `inline handler` standing for a
 handler written at the registration, which opens on the route itself and offers
 no Flow. A symbol's members list each member once, never the symbol itself or a
 file.
@@ -184,8 +185,8 @@ the Rust graph holds different facts, the viewer shows what this index holds:
 - Branch conditions on call sites (`when`) are absent from every edge for the
   same reason.
 - Routes come from the framework resolvers this port has — React Router and
-  Next.js pages, Vue Router, NestJS controllers. Express and Go HTTP routers are
-  not among them, so those projects are not routed apps here.
+  Next.js pages, Nuxt pages, NestJS controllers. Express, Go HTTP and Vue Router
+  routers are not among them, so those projects are not routed apps here.
 - The Rust index has no synthesized dynamic-dispatch edges, so a flow never
   shows a dashed `via …` hop from synthesis, and a Go interface's implicit
   implementations are not part of its type hierarchy.

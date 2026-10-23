@@ -4,7 +4,7 @@
 > `codegraph_core::node_id::generate_node_id`; tree-sitter file nodes use the
 > literal `file:{file_path}`; content hashes use `hash_content`. Framework
 > resolvers are active extensions, not an empty seam: the registry currently
-> contains NestJS, React, Vue, Godot, and Tauri candidates, each gated by project
+> contains NestJS, React, Vue, Godot, Tauri, and Nuxt candidates, each gated by project
 > detection. Framework nodes with an explicitly documented compatibility ID are
 > validated by their own corpora and do not change the ordinary symbol-ID formula.
 
@@ -249,6 +249,7 @@ The golden changes of the v0.56.0 follow-up program, in commit order.
 | `feat(resolve): framework edges name their resolver`                                               | godot, routers     | `edges.json`, `colby.db`               | an edge a framework resolver made names it in `metadata.framework` (upstream #2159): godot's four autoload calls name `godot`, and routers' one Vue-resolved call (the Next.js `Dashboard`'s `useRouter()`, read as a Nuxt auto-import of its own) names `vue`; no edge, node or reference comes or goes                                                                                                          | `scripts/regen-goldens.sh --write godot routers`     |
 | `fix(react): hooks and contexts prefer own-file declarations and imports; typed styled components` | routers, synthesis | `nodes.json`, `edges.json`, `colby.db` | the React resolver reads `.tsx`/`.jsx` files, and only for routes (upstream #841): routers gains the Next.js page routes of its `.tsx` pages (`/`, `/dashboard`, `/legacy`) and the data router's `/` route in `main.tsx`, with its `references` edge to `Layout`; synthesis loses the regex `hook:` node that duplicated the tree-sitter `useCartStore` constant. No other node, edge or reference comes or goes | `scripts/regen-goldens.sh --write routers synthesis` |
 | `fix(nestjs): conventions stay in their feature; global prefix and versioning`                     | servers            | `nodes.json`, `colby.db`               | a NestJS route is named by the path a request takes to it, with its app's global prefix and URI version (upstream #2117): the fixture's `setGlobalPrefix('api')` and `defaultVersion: '1'` rename `GET /users/:id` to `GET /api/v1/users/:id`; the route keeps its id and qualified name, and no other node, edge or reference comes or goes                                                                      | `scripts/regen-goldens.sh --write servers`           |
+| `fix(vue): Nuxt routes only in Nuxt apps; a page route references its component`                   | routers            | `nodes.json`, `edges.json`, `colby.db` | Nuxt's file routes are a `nuxt` resolver's, read only in a Nuxt app (upstream #2130): the Nuxt app's top-level `pages/index.vue` is `/` (its route id moves from `/index`), and each page route `calls` its own file's component (#2267), the fixture's two pages two new `framework` edges; no other node, edge or reference comes or goes                                                                       | `scripts/regen-goldens.sh --write routers`           |
 
 The canonicalizer strips inherently unstable timestamp columns
 (`nodes.updated_at`, `files.modified_at`, `files.indexed_at`), parses JSON text

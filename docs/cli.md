@@ -1472,6 +1472,6 @@ golden byte-stable output.
   constraint, guardrail-enforced; LLM combination happens in the orchestration
   layer).
 - No semantic search; search is FTS5 + deterministic scoring only.
-- Concrete `FrameworkResolver`s exist for NestJS, React, Vue, Godot, and Tauri;
+- Concrete `FrameworkResolver`s exist for NestJS, React, Vue, Nuxt, Godot, and Tauri;
   other framework resolution remains explicitly deferred.
 - No languages beyond the fixed `LANGUAGES` set.

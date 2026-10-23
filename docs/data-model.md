@@ -110,7 +110,7 @@ that made it) and, when the wiring happens elsewhere, `registeredAt`
 named-symbol flow recognize synthesized edges by that provenance value.
 
 An edge a framework resolver made (`resolvedBy: "framework"`) names that
-resolver in `metadata.framework` (`react`, `vue`, `nestjs`, `godot`, `tauri`),
+resolver in `metadata.framework` (`react`, `vue`, `nuxt`, `nestjs`, `godot`, `tauri`),
 as a synthesized edge names its pass. When one reference reaches several
 targets, only the edge to the first carries it; the others carry the metadata
 the resolver gave each.

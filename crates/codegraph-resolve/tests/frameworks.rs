@@ -1,4 +1,4 @@
-//! Regression tests for the React / Vue / NestJS [`FrameworkResolver`]s.
+//! Regression tests for the React / Vue / Nuxt / NestJS [`FrameworkResolver`]s.
 //!
 //! Each test drives a resolver through an in-memory [`ResolutionContext`] and
 //! asserts the produced [`ResolvedRef`] / extraction shape against the upstream
@@ -790,18 +790,26 @@ fn vue_resolves_pascalcase_component_call() {
 }
 
 #[test]
-fn vue_extract_emits_nuxt_page_route() {
-    // the upstream extract keys on `/pages/` (with leading slash), so the route file
-    // must sit under a parent dir (vue.ts:198).
-    let result = vue::VueResolver
-        .extract("app/pages/users/[id].vue", "", &no_project_config())
-        .expect("extract result");
-    let route = result
-        .nodes
-        .iter()
-        .find(|n| n.kind == NodeKind::Route)
-        .expect("route node");
-    assert_eq!(route.name, "/users/:id");
+fn nuxt_extract_emits_page_route() {
+    // Nuxt's page routes are the Nuxt resolver's, nested or at the
+    // repository root (upstream #2130); the Vue resolver extracts none.
+    for path in ["app/pages/users/[id].vue", "pages/users/[id].vue"] {
+        let result = vue::NuxtResolver
+            .extract(path, "", &no_project_config())
+            .expect("extract result");
+        let route = result
+            .nodes
+            .iter()
+            .find(|n| n.kind == NodeKind::Route)
+            .expect("route node");
+        assert_eq!(route.name, "/users/:id", "{path}");
+        assert!(
+            vue::VueResolver
+                .extract(path, "", &no_project_config())
+                .is_none(),
+            "{path}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

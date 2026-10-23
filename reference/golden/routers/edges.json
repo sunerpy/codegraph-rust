@@ -1,6 +1,32 @@
 [
   {
     "col": 0,
+    "kind": "calls",
+    "line": 1,
+    "metadata": {
+      "confidence": 0.95,
+      "framework": "nuxt",
+      "resolvedBy": "framework"
+    },
+    "provenance": null,
+    "source": "route:apps/nuxt/pages/index.vue:/:1",
+    "target": "component:ba1b120ba0c0a0e3733130855a8a1c17"
+  },
+  {
+    "col": 0,
+    "kind": "calls",
+    "line": 1,
+    "metadata": {
+      "confidence": 0.95,
+      "framework": "nuxt",
+      "resolvedBy": "framework"
+    },
+    "provenance": null,
+    "source": "route:apps/nuxt/pages/users/[id].vue:/users/:id:1",
+    "target": "component:eacd25434ecfb1c883a35441dd7dd4a0"
+  },
+  {
+    "col": 0,
     "kind": "imports",
     "line": 2,
     "metadata": {

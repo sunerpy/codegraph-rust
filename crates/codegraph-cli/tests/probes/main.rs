@@ -19256,4 +19256,121 @@ mod frameworks {
             "class AuthGuard @src/guards/auth.guard.ts",
         );
     }
+
+    /// Upstream #2130: Nuxt's file routes are read only in a Nuxt app, and a
+    /// Nuxt app at the repository root gets them: a top-level
+    /// `pages/index.vue` is `/`, not `/index`. A plain Vue app's `pages/`
+    /// folder holds components a router config names, not addresses.
+    #[test]
+    fn pr2130_nuxt_pages_are_routes_only_in_a_nuxt_app() {
+        let nuxt = Project::new()
+            .file(
+                "package.json",
+                "{\"name\":\"site\",\"dependencies\":{\"nuxt\":\"*\",\"vue\":\"*\"}}\n",
+            )
+            .file("pages/index.vue", "<template><div/></template>\n")
+            .file("pages/users/[id].vue", "<template><div/></template>\n")
+            .index();
+        assert_eq!(
+            route_names(nuxt.graph()),
+            ["/", "/users/:id"],
+            "{}",
+            nuxt.graph().report()
+        );
+        let plain = Project::new()
+            .file(
+                "ui/package.json",
+                "{\"name\":\"console\",\"dependencies\":{\"vue\":\"*\",\"vue-router\":\"*\"}}\n",
+            )
+            .file(
+                "ui/src/modules/contents/pages/SinglePageList.vue",
+                "<template><div/></template>\n",
+            )
+            .index();
+        assert!(
+            route_names(plain.graph()).is_empty(),
+            "{}",
+            plain.graph().report()
+        );
+    }
+
+    /// Upstream #2129 for Nuxt: in a monorepo, a Nuxt app's pages are routes
+    /// and a plain Vue app's `pages/` beside it are not, though the Nuxt app
+    /// makes the project a Nuxt one.
+    #[test]
+    fn pr2129_nuxt_routes_stay_in_the_app_that_declares_nuxt() {
+        let project = Project::new()
+            .file("package.json", "{\"name\":\"mono\",\"private\":true}\n")
+            .file(
+                "apps/site/package.json",
+                "{\"name\":\"site\",\"dependencies\":{\"nuxt\":\"3\"}}\n",
+            )
+            .file("apps/site/pages/about.vue", "<template><div/></template>\n")
+            .file(
+                "apps/admin/package.json",
+                "{\"name\":\"admin\",\"dependencies\":{\"vue\":\"3\"}}\n",
+            )
+            .file(
+                "apps/admin/src/pages/Users.vue",
+                "<template><div/></template>\n",
+            )
+            .index();
+        assert_eq!(
+            route_names(project.graph()),
+            ["/about"],
+            "{}",
+            project.graph().report()
+        );
+    }
+
+    /// Upstream #2267: a Nuxt page route is served by its own file's
+    /// component, never a same-named one: every `index.vue` is a component
+    /// named `index`.
+    #[test]
+    fn pr2267_a_nuxt_page_is_served_by_its_own_files_component() {
+        let project = Project::new()
+            .file(
+                "package.json",
+                "{\"name\":\"shop\",\"private\":true,\"dependencies\":{\"nuxt\":\"^3.0.0\"}}\n",
+            )
+            .file(
+                "pages/index.vue",
+                "<template><button @click=\"load\">Load</button></template>\n<script setup lang=\"ts\">\nfunction load() { return 1; }\n</script>\n",
+            )
+            .file("pages/admin.vue", "<template><div>admin</div></template>\n")
+            .file(
+                "pages/orders/index.vue",
+                "<template><div>orders</div></template>\n",
+            )
+            .file(
+                "components/index.vue",
+                "<template><div>not a page</div></template>\n",
+            )
+            .index();
+        let graph = project.graph();
+        for (route, file) in [
+            ("/", "pages/index.vue"),
+            ("/admin", "pages/admin.vue"),
+            ("/orders", "pages/orders/index.vue"),
+        ] {
+            let served: Vec<String> = graph
+                .edges
+                .iter()
+                .filter(|edge| {
+                    matches!(edge.kind.as_str(), "calls" | "references")
+                        && graph
+                            .node(&edge.source)
+                            .is_some_and(|node| node.kind == "route" && node.name == route)
+                })
+                .filter_map(|edge| graph.node(&edge.target))
+                .map(|node| format!("{} {}", node.kind, node.file_path))
+                .collect();
+            assert_eq!(
+                served,
+                [format!("component {file}")],
+                "{route}\n{}",
+                graph.report()
+            );
+        }
+    }
 }
