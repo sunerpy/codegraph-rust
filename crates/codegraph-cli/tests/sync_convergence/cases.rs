@@ -10262,6 +10262,105 @@ pub fn typescript_react_dependency_beside_an_added_script() -> Case {
         .edge_after("route src/routes.ts::route:/dash", "references", "function Dashboard")
 }
 
+const NEST_PACKAGE: &str = "{\"name\":\"api\",\"dependencies\":{\"@nestjs/core\":\"^11.0.0\",\"@nestjs/common\":\"^11.0.0\"}}\n";
+
+const NEST_USERS_CONTROLLER: &str = "import { Controller, Get } from '@nestjs/common';\n\n@Controller('users')\nexport class UsersController {\n  @Get(':id')\n  findOne() {\n    return 1;\n  }\n}\n";
+
+/// W7-02: the bootstrap comes to set a global prefix (upstream #2117): every
+/// route of its app is renamed though no controller file changed.
+pub fn typescript_nestjs_bootstrap_sets_a_global_prefix() -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript])
+        .file("package.json", NEST_PACKAGE)
+        .file(
+            "src/main.ts",
+            "import { NestFactory } from '@nestjs/core';\nimport { AppModule } from './app.module';\n\nasync function bootstrap() {\n  const app = await NestFactory.create(AppModule);\n  await app.listen(3000);\n}\nbootstrap();\n",
+        )
+        .file(
+            "src/app.module.ts",
+            "import { Module } from '@nestjs/common';\nimport { UsersController } from './users/users.controller';\n\n@Module({ controllers: [UsersController] })\nexport class AppModule {}\n",
+        )
+        .file("src/users/users.controller.ts", NEST_USERS_CONTROLLER)
+        .write(
+            "src/main.ts",
+            "import { NestFactory } from '@nestjs/core';\nimport { AppModule } from './app.module';\n\nasync function bootstrap() {\n  const app = await NestFactory.create(AppModule);\n  app.setGlobalPrefix('api');\n  app.enableVersioning({ defaultVersion: '1' });\n  await app.listen(3000);\n}\nbootstrap();\n",
+        )
+        .named_before("route", "GET /users/:id")
+        .named_after("route", "GET /api/v1/users/:id")
+        .edge_throughout(
+            "route src/users/users.controller.ts::GET:/users/:id",
+            "references",
+            "method UsersController::findOne",
+        )
+}
+
+/// W7-02: the bootstrap stops setting a global prefix: a route an earlier
+/// sync renamed gets its in-file name back, as a fresh index names it.
+pub fn typescript_nestjs_bootstrap_drops_its_global_prefix() -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript])
+        .file("package.json", NEST_PACKAGE)
+        .file(
+            "src/main.ts",
+            "import { NestFactory } from '@nestjs/core';\nimport { AppModule } from './app.module';\n\nasync function bootstrap() {\n  const app = await NestFactory.create(AppModule);\n  app.setGlobalPrefix('api');\n  app.enableVersioning({ defaultVersion: '1' });\n  await app.listen(3000);\n}\nbootstrap();\n",
+        )
+        .file(
+            "src/app.module.ts",
+            "import { Module } from '@nestjs/common';\nimport { UsersController } from './users/users.controller';\n\n@Module({ controllers: [UsersController] })\nexport class AppModule {}\n",
+        )
+        .file("src/users/users.controller.ts", NEST_USERS_CONTROLLER)
+        .write(
+            "src/main.ts",
+            "import { NestFactory } from '@nestjs/core';\nimport { AppModule } from './app.module';\n\nasync function bootstrap() {\n  const app = await NestFactory.create(AppModule);\n  await app.listen(3000);\n}\nbootstrap();\n",
+        )
+        .named_before("route", "GET /api/v1/users/:id")
+        .named_after("route", "GET /users/:id")
+}
+
+/// W7-02: a RouterModule registration goes away: the routes it prefixed get
+/// their in-file names back (the RouterModule pass renamed them; nothing
+/// renamed them back before).
+pub fn typescript_nestjs_router_module_registration_is_removed() -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript])
+        .file("package.json", NEST_PACKAGE)
+        .file(
+            "src/app.module.ts",
+            "import { Module } from '@nestjs/common';\nimport { RouterModule } from '@nestjs/core';\nimport { AdminModule } from './admin.module';\n\n@Module({ imports: [AdminModule, RouterModule.register([{ path: 'admin', module: AdminModule }])] })\nexport class AppModule {}\n",
+        )
+        .file(
+            "src/admin.module.ts",
+            "import { Module } from '@nestjs/common';\nimport { UsersController } from './users/users.controller';\n\n@Module({ controllers: [UsersController] })\nexport class AdminModule {}\n",
+        )
+        .file("src/users/users.controller.ts", NEST_USERS_CONTROLLER)
+        .write(
+            "src/app.module.ts",
+            "import { Module } from '@nestjs/common';\nimport { RouterModule } from '@nestjs/core';\nimport { AdminModule } from './admin.module';\n\n@Module({ imports: [AdminModule] })\nexport class AppModule {}\n",
+        )
+        .named_before("route", "GET /admin/users/:id")
+        .named_after("route", "GET /users/:id")
+}
+
+/// W7-02: the convention file beside a controller appears (upstream #2246):
+/// the provider it injects is that file's class, not another feature's.
+pub fn typescript_nestjs_provider_beside_its_controller_appears() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::TypeScript])
+        .file("package.json", NEST_PACKAGE)
+        .file("src/admin/users.service.ts", "export class UsersService {}\n")
+        .file(
+            "src/users/users.controller.ts",
+            "export class UsersController {\n  constructor(private readonly users: UsersService) {}\n}\n",
+        )
+        .write("src/users/users.service.ts", "export class UsersService {}\n")
+        .edge_after(
+            "method UsersController::constructor",
+            "references",
+            "class UsersService @src/users/users.service.ts",
+        )
+        .no_edge_after(
+            "method UsersController::constructor",
+            "references",
+            "class UsersService @src/admin/users.service.ts",
+        )
+}
+
 /// W5-06: a package the manifest comes to declare is outside the project,
 /// so the import of its binding no longer reaches a project class by name.
 pub fn typescript_declared_dependency_makes_a_bare_import_external() -> Case {

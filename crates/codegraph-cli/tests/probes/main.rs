@@ -19065,4 +19065,195 @@ mod frameworks {
             );
         }
     }
+
+    /// The route names a NestJS index holds, sorted.
+    fn route_names(graph: &super::support::Graph) -> Vec<String> {
+        let mut names: Vec<String> = graph
+            .nodes
+            .iter()
+            .filter(|node| node.kind == "route")
+            .map(|node| node.name.clone())
+            .collect();
+        names.sort();
+        names
+    }
+
+    const NEST_PACKAGE: &str =
+        "{\"dependencies\":{\"@nestjs/core\":\"^11.0.0\",\"@nestjs/common\":\"^11.0.0\"}}\n";
+
+    const NEST_MAIN: &str = "import { NestFactory } from '@nestjs/core';\nimport { VersioningType } from '@nestjs/common';\nimport { AppModule } from './app/app.module';\nasync function bootstrap() {\n  const app = await NestFactory.create(AppModule);\n  app.enableVersioning({ defaultVersion: '1', type: VersioningType.URI });\n  app.setGlobalPrefix('api', { exclude: ['sitemap.xml', 'health{/*wildcard}'] });\n  await app.listen(3333);\n}\nbootstrap();\n";
+
+    /// Upstream #2117: a NestJS route is named by the path a request takes to
+    /// it, the app's global prefix and URI version included: a route's own
+    /// `@Version`, else its controller's, else `defaultVersion`;
+    /// `VERSION_NEUTRAL` has none, an excluded path skips the prefix, a seed
+    /// script that creates the app without serving it does not displace the
+    /// bootstrap that configures it, and an app that sets nothing keeps its
+    /// routes as written.
+    #[test]
+    fn pr2117_routes_carry_the_global_prefix_and_uri_version() {
+        let project = Project::new()
+            .file("package.json", NEST_PACKAGE)
+            .file("apps/api/src/main.ts", NEST_MAIN)
+            .file(
+                "apps/api/src/database/run-seed.ts",
+                "import { NestFactory } from '@nestjs/core';\nconst runSeed = async () => {\n  const app = await NestFactory.create(SeedModule);\n  await app.close();\n};\nvoid runSeed();\n",
+            )
+            .file(
+                "apps/api/src/app/user.controller.ts",
+                "import { Controller, Get, Post, Version, VERSION_NEUTRAL } from '@nestjs/common';\n@Controller('user')\nexport class UserController {\n  @Get()\n  public getUser() {}\n\n  @Post()\n  @UseGuards(AuthGuard('jwt'))\n  @Version('2')\n  public createUser() {}\n\n  @Get('oidc/callback')\n  @Version(VERSION_NEUTRAL)\n  public callback() {}\n}\n",
+            )
+            .file(
+                "apps/api/src/app/sitemap.controller.ts",
+                "import { Controller, Get, Version, VERSION_NEUTRAL } from '@nestjs/common';\n@Controller()\n@Version(VERSION_NEUTRAL)\nexport class SitemapController {\n  @Get('sitemap.xml')\n  public sitemap() {}\n}\n",
+            )
+            .file(
+                "apps/api/src/app/health.controller.ts",
+                "import { Controller, Get } from '@nestjs/common';\n@Controller({ path: 'health', version: '3' })\nexport class HealthController {\n  @Get('db')\n  public db() {}\n}\n",
+            )
+            .file(
+                "apps/jobs/src/main.ts",
+                "import { NestFactory } from '@nestjs/core';\nNestFactory.create(JobsModule).then((app) => app.listen(3335));\n",
+            )
+            .file(
+                "apps/jobs/src/jobs.controller.ts",
+                "import { Controller, Get } from '@nestjs/common';\n@Controller('jobs')\nexport class JobsController {\n  @Get()\n  public list() {}\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        assert_eq!(
+            route_names(graph),
+            [
+                "GET /api/user/oidc/callback",
+                "GET /api/v1/user",
+                "GET /jobs",
+                "GET /sitemap.xml",
+                "GET /v3/health/db",
+                "POST /api/v2/user",
+            ],
+            "{}",
+            graph.report()
+        );
+        // The rename keeps the route's identity: its id and qualified name
+        // still read the path its file wrote.
+        graph.assert_edge(
+            "route apps/api/src/app/user.controller.ts::GET:/user",
+            "references",
+            "method UserController::getUser",
+            None,
+        );
+    }
+
+    /// Upstream #2117: a route's `@Version` is found past decorators with
+    /// object arguments, on the method or the class, and each app reads its
+    /// own bootstrap: a computed prefix is not guessed, and one app's `/api`
+    /// is never another's.
+    #[test]
+    fn pr2117_a_version_past_object_decorators_and_each_apps_bootstrap() {
+        let project = Project::new()
+            .file("package.json", NEST_PACKAGE)
+            .file("apps/api/src/main.ts", NEST_MAIN)
+            .file(
+                "apps/api/src/app/stats.controller.ts",
+                "import { Controller, Get, Version } from '@nestjs/common';\n@Controller('stats')\nexport class StatsController {\n  @Version('2')\n  @ApiResponse({ status: 200, description: 'The stats' })\n  @Get('daily')\n  public daily() {}\n\n  @Get('weekly')\n  public weekly() {}\n}\n",
+            )
+            .file(
+                "apps/api/src/app/reports.controller.ts",
+                "import { Controller, Get, Version } from '@nestjs/common';\n@Version('4')\n@ApiTags({ name: 'reports' })\n@Controller('reports')\nexport class ReportsController {\n  @Get()\n  public list() {}\n}\n",
+            )
+            .file(
+                "apps/admin/src/main.ts",
+                "import { NestFactory } from '@nestjs/core';\nasync function bootstrap() {\n  const app = await NestFactory.create(AdminModule);\n  app.setGlobalPrefix(config.get('app.prefix'));\n  app.enableVersioning({ defaultVersion: '1' });\n  await app.listen(3334);\n}\nbootstrap();\n",
+            )
+            .file(
+                "apps/admin/src/users.controller.ts",
+                "import { Controller, Get } from '@nestjs/common';\n@Controller('users')\nexport class UsersController {\n  @Get()\n  public list() {}\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        assert_eq!(
+            route_names(graph),
+            [
+                "GET /api/v1/stats/weekly",
+                "GET /api/v2/stats/daily",
+                "GET /api/v4/reports",
+                "GET /v1/users",
+            ],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream #2246: in a TS/JS module the provider convention (`*Service`,
+    /// `*Controller`, …) takes the file's own class or the convention file
+    /// beside it, never a same-named class elsewhere preferred for its file
+    /// name: Nest's own specs' `TransientService` is not an integration
+    /// app's. Anything farther is import resolution's or name matching's.
+    #[test]
+    fn pr2246_the_provider_convention_stays_in_the_references_feature() {
+        let project = Project::new()
+            .file(
+                "package.json",
+                "{\"name\":\"nest\",\"private\":true,\"dependencies\":{\"@nestjs/common\":\"^10.0.0\"}}\n",
+            )
+            .file(
+                "integration/injector/src/app.module.ts",
+                "import { Module } from '@nestjs/common';\n\n@Module({})\nexport class AppModule {}\n",
+            )
+            .file(
+                "integration/injector/src/scoped/transient.service.ts",
+                "export class TransientService {}\n",
+            )
+            .file(
+                "packages/core/test/scope/helpers.ts",
+                "export class TransientService {}\n",
+            )
+            .file(
+                "packages/core/test/scope/transient-scope.spec.ts",
+                "class Holder {\n  constructor(public transient: TransientService) {}\n}\n",
+            )
+            .file("src/admin/users.service.ts", "export class UsersService {}\n")
+            .file("src/users/users.service.ts", "export class UsersService {}\n")
+            .file(
+                "src/users/users.controller.ts",
+                "export class UsersController {\n  constructor(private readonly users: UsersService) {}\n}\n",
+            )
+            .file("src/guards/auth.guard.ts", "export class AuthGuard {}\n")
+            .file(
+                "src/auth/session.ts",
+                "export class AuthGuard {}\n\nexport class Session {\n  constructor(private readonly guard: AuthGuard) {}\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        graph.assert_no_edge(
+            "method Holder::constructor",
+            "references",
+            "class TransientService @integration/injector/src/scoped/transient.service.ts",
+        );
+        // The convention file beside the reference, not another feature's.
+        graph.assert_edge(
+            "method UsersController::constructor",
+            "references",
+            "class UsersService @src/users/users.service.ts",
+            Some("framework"),
+        );
+        graph.assert_no_edge(
+            "method UsersController::constructor",
+            "references",
+            "class UsersService @src/admin/users.service.ts",
+        );
+        // The file's own class, though another file is named by the
+        // convention.
+        graph.assert_edge(
+            "method Session::constructor",
+            "references",
+            "class AuthGuard @src/auth/session.ts",
+            Some("framework"),
+        );
+        graph.assert_no_edge(
+            "method Session::constructor",
+            "references",
+            "class AuthGuard @src/guards/auth.guard.ts",
+        );
+    }
 }

@@ -306,4 +306,8 @@ for them that colby's sync has no counterpart for, each with a version marker
 withdrawn before the sync's first write and restored once it has resolved
 ([Daemon and watch lifecycle](../architecture.md#daemon-and-watch-lifecycle)).
 The Shopify theme lane also covers a scoped sync: a theme marker added or
-removed converges there, where colby's needs a full sync.
+removed converges there, where colby's needs a full sync. NestJS route naming
+needs no lane: every sync renames the routes again, and one that nothing
+renames any more (its app's global prefix or version, or its module's
+`RouterModule` entry, went away) gets the name its file gives it back
+(`frameworks/nestjs.rs`), where colby's sync keeps the old name.

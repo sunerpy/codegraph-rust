@@ -121,6 +121,8 @@ pub struct Case {
     edges_after: Vec<EdgeSpec>,
     absent_after: Vec<EdgeSpec>,
     languages_after: Vec<(&'static str, &'static str)>,
+    names_before: Vec<(&'static str, &'static str)>,
+    names_after: Vec<(&'static str, &'static str)>,
 }
 
 impl Case {
@@ -136,6 +138,8 @@ impl Case {
             edges_after: Vec::new(),
             absent_after: Vec::new(),
             languages_after: Vec::new(),
+            names_before: Vec::new(),
+            names_after: Vec::new(),
         }
     }
 
@@ -206,6 +210,20 @@ impl Case {
     /// The language a fresh index of the final tree records for file `path`.
     pub fn file_language_after(mut self, path: &'static str, language: &'static str) -> Self {
         self.languages_after.push((path, language));
+        self
+    }
+
+    /// A node of `kind` named `name` the `before` index must hold: a change
+    /// that renames a node in place (a route's name) shows in no edge.
+    pub fn named_before(mut self, kind: &'static str, name: &'static str) -> Self {
+        self.names_before.push((kind, name));
+        self
+    }
+
+    /// A node of `kind` named `name` a fresh index of the final tree must
+    /// hold.
+    pub fn named_after(mut self, kind: &'static str, name: &'static str) -> Self {
+        self.names_after.push((kind, name));
         self
     }
 
@@ -304,6 +322,7 @@ fn run_case(name: &str, case: &Case) {
 
     let mut cli = case.index_before("cli");
     expect_edges(name, "before", cli.graph(), &case.edges_before);
+    expect_names(name, "before", cli.graph(), &case.names_before);
     let mut languages = indexed_languages(cli.graph());
     case.apply(&mut cli);
     cli.sync();
@@ -321,6 +340,7 @@ fn run_case(name: &str, case: &Case) {
         .index();
     expect_edges(name, "fresh", fresh.graph(), &case.edges_after);
     expect_no_edges(name, "fresh", fresh.graph(), &case.absent_after);
+    expect_names(name, "fresh", fresh.graph(), &case.names_after);
     for &(path, language) in &case.languages_after {
         let recorded = fresh
             .graph()
@@ -632,6 +652,18 @@ fn expect_edges(name: &str, label: &str, graph: &Graph, edges: &[EdgeSpec]) {
         assert!(
             !graph.edges_matching(source, kind, target).is_empty(),
             "[{name}] the {label} index lacks {source} -[{kind}]-> {target}, which this case \
+             exists to exercise\n{}",
+            graph.report()
+        );
+    }
+}
+
+#[track_caller]
+fn expect_names(name: &str, label: &str, graph: &Graph, names: &[(&str, &str)]) {
+    for &(kind, node_name) in names {
+        assert!(
+            !graph.nodes_named(kind, node_name).is_empty(),
+            "[{name}] the {label} index has no {kind} named `{node_name}`, which this case \
              exists to exercise\n{}",
             graph.report()
         );
@@ -1349,6 +1381,10 @@ matrix! {
     typescript_react_dependency_appears_in_an_app_package_json,
     typescript_react_dependency_appears_above_no_script,
     typescript_react_dependency_beside_an_added_script,
+    typescript_nestjs_bootstrap_sets_a_global_prefix,
+    typescript_nestjs_bootstrap_drops_its_global_prefix,
+    typescript_nestjs_router_module_registration_is_removed,
+    typescript_nestjs_provider_beside_its_controller_appears,
     typescript_declared_dependency_makes_a_bare_import_external,
     typescript_workspace_member_manifest_renames_its_package,
     typescript_workspace_member_manifest_is_deleted,

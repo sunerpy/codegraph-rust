@@ -228,7 +228,7 @@ to an indexed file, then those deeper above JavaScript-family code
 framework may name the packages its apps declare (upstream #2129); when some
 manifest declares one, its extractor runs only on files whose nearest
 `package.json` naming any such framework names it, so a router reads its own
-app in a monorepo. No registered framework names any yet. React extracts only routes, from `.tsx`/`.jsx` files too (components and hooks are the tree-sitter extractor's, upstream #841); it leaves a name the file imports to import resolution and reaches a hook or context by name only in the file that declares it (#2120, #2240). Godot also extracts project/scene/resource relationships; Tauri bridges
+app in a monorepo. No registered framework names any yet. React extracts only routes, from `.tsx`/`.jsx` files too (components and hooks are the tree-sitter extractor's, upstream #841); it leaves a name the file imports to import resolution and reaches a hook or context by name only in the file that declares it (#2120, #2240). NestJS takes a provider by its naming convention (`*Service`, `*Controller`, …) only from the reference's own file or the convention file beside it (#2246), and names each route by the path a request takes to it: its module's `RouterModule` prefix and its app's global prefix and URI version (#2117). The routes are renamed in place after extraction, keeping their ids, and a route nothing renames any more gets the name its file gives it back. Godot also extracts project/scene/resource relationships; Tauri bridges
 literal JS-family `invoke` calls to uniquely registered Rust commands. Ambiguous
 or dynamic targets remain unresolved rather than falling through to a global
 same-name guess.
