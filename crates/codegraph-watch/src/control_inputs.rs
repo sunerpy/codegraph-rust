@@ -391,9 +391,9 @@ impl ControlCheck {
 /// kind; otherwise a kind is re-read when a `requested` path is one of its
 /// recorded inputs, is a listed directory or one directly in a workspace
 /// glob's listing, or names one of its control files, or a `membership`
-/// change touches a file its readers start from. A `bootstrap` (the marker
-/// was missing when the sync began) re-reads every kind and counts each as
-/// moved.
+/// change touches a file its readers start from (for the JS kind, any file
+/// that comes or goes). A `bootstrap` (the marker was missing when the sync
+/// began) re-reads every kind and counts each as moved.
 pub(crate) fn check(
     store: &Store,
     project_root: &Path,
@@ -424,10 +424,15 @@ pub(crate) fn check(
                 || (kind == ControlKind::Js
                     && row.contains_key(&format!("dir:{}", parent_of(path))))
         }) || membership.iter().any(|(path, before, after)| {
-            before
-                .iter()
-                .chain(after)
-                .any(|language| kind.reads_from(path, *language))
+            // Framework detection reads the manifests one or two directories
+            // down from every indexed file, whatever its language (upstream
+            // #2395), so a file of any language that comes or goes may move
+            // the JS kind's inputs.
+            (kind == ControlKind::Js && (before.is_none() || after.is_none()))
+                || before
+                    .iter()
+                    .chain(after)
+                    .any(|language| kind.reads_from(path, *language))
         })
     };
     let mut out = ControlCheck::default();

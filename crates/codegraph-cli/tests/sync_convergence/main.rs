@@ -1346,6 +1346,7 @@ matrix! {
     typescript_react_dependency_leaves_package_json,
     typescript_react_dependency_appears_in_an_app_package_json,
     typescript_react_dependency_appears_above_no_script,
+    typescript_react_dependency_beside_an_added_script,
     typescript_declared_dependency_makes_a_bare_import_external,
     typescript_workspace_member_manifest_renames_its_package,
     typescript_workspace_member_manifest_is_deleted,

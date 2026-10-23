@@ -10191,6 +10191,31 @@ pub fn typescript_react_dependency_appears_above_no_script() -> Case {
         .edge_after("function page", "calls", "function src/hooks.ts::useCart")
 }
 
+/// Upstream #2395: a file of any language arriving one directory down brings
+/// the manifest beside it into detection: React declared in
+/// `frontend/package.json` is detected once `frontend/build.py` is indexed,
+/// and the sync records that manifest among the JS inputs, as a fresh index
+/// does.
+pub fn typescript_react_dependency_beside_an_added_script() -> Case {
+    Case::new(Change::ControlFile, &[Language::TypeScript])
+        .file("package.json", "{\"name\":\"web\",\"private\":true}\n")
+        .file(
+            "frontend/package.json",
+            "{\"name\":\"assets\",\"devDependencies\":{\"react\":\"18.2.0\"}}\n",
+        )
+        .file(
+            "src/hooks.ts",
+            "export function useCart(): number {\n  return 1;\n}\n",
+        )
+        .file(
+            "src/page.ts",
+            "export function page(): number {\n  return useCart();\n}\n",
+        )
+        .write("frontend/build.py", "def build():\n    return 1\n")
+        .edge_before("function page", "calls", "function useCart")
+        .edge_after("function page", "calls", "function src/hooks.ts::useCart")
+}
+
 /// W5-06: a package the manifest comes to declare is outside the project,
 /// so the import of its binding no longer reaches a project class by name.
 pub fn typescript_declared_dependency_makes_a_bare_import_external() -> Case {
