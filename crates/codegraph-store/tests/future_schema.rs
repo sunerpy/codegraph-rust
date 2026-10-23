@@ -112,6 +112,28 @@ fn record_newer_schema(db: &Path) {
     }
 }
 
+/// Replace `db`'s extraction stamp (`None` deletes it), checkpointed.
+fn set_stamp(db: &Path, stamp: Option<&str>) {
+    let conn = Connection::open(db).expect("open database fixture");
+    match stamp {
+        Some(value) => conn.execute(
+            "UPDATE project_metadata SET value = ?1 WHERE key = ?2",
+            [value, EXTRACTION_VERSION_KEY],
+        ),
+        None => conn.execute(
+            "DELETE FROM project_metadata WHERE key = ?1",
+            [EXTRACTION_VERSION_KEY],
+        ),
+    }
+    .expect("rewrite the stamp");
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .expect("checkpoint");
+    drop(conn);
+    for suffix in ["-wal", "-shm"] {
+        let _ = std::fs::remove_file(sidecar(db, suffix));
+    }
+}
+
 /// Record schema `NEWER` in `db`'s write-ahead log only, as a newer binary
 /// killed before its checkpoint leaves it: the main file still records this
 /// binary's schema.
@@ -431,6 +453,54 @@ fn a_tombstoned_newer_schema_index_is_refused_then_discarded_by_uninit() {
         Store::extraction_status(&paths),
         ExtractionStatus::Uninitialized
     );
+}
+
+/// `uninit --force` refuses a `Current` database whose extraction stamp is
+/// missing or not this binary's, so a refusal of such a newer-schema index,
+/// tombstoned or not, does not offer it.
+#[test]
+fn a_newer_schema_with_a_bad_stamp_never_offers_uninit() {
+    for (label, stamp) in [
+        ("missing", None),
+        ("malformed", Some("02")),
+        ("mismatched", Some("1")),
+    ] {
+        for tombstone in [false, true] {
+            let project = TempProject::new(&format!("bad-stamp-{label}-{tombstone}"));
+            let paths = stage_current(&project);
+            set_stamp(&paths.current_db(), stamp);
+            record_newer_schema(&paths.current_db());
+            if tombstone {
+                std::fs::write(paths.tombstone(), b"remove failed").expect("stage the tombstone");
+            }
+            let before = snapshot(&paths);
+            assert!(
+                uninit_index(&paths, deadline(), || false).is_err(),
+                "{label}/{tombstone}: uninit refuses a bad stamp"
+            );
+            assert_eq!(
+                snapshot(&paths),
+                before,
+                "{label}/{tombstone}: uninit changed it"
+            );
+
+            assert_rebuild_refused(
+                begin_full_rebuild(&paths, RebuildKind::ExplicitInit, deadline(), || false),
+                false,
+            );
+            if tombstone {
+                let Err(error) = Store::open_for_read(&paths, deadline(), || false) else {
+                    panic!("{label}: a read opened it");
+                };
+                assert_future_schema(&error, false);
+            }
+            assert_eq!(
+                snapshot(&paths),
+                before,
+                "{label}/{tombstone}: a refusal changed it"
+            );
+        }
+    }
 }
 
 #[test]

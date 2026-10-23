@@ -634,13 +634,7 @@ impl Store {
                     // then publishes Uninitialized before deleting those
                     // sidecars. Rejecting them here would make that required
                     // cleanup path unreachable.
-                    // OD-19: no schema check, so uninit stays the way to
-                    // discard a newer codegraph's index; it still reads the
-                    // extraction stamp row. A tombstone beside `Current` is an
-                    // init that published but could not remove it: uninit
-                    // discards that index too, and the tombstone stays.
-                    let (corroboration, source_conn) =
-                        corroborate_current_database_options(paths, false, true, true)?;
+                    let (corroboration, source_conn) = corroborate_current_for_uninit(paths)?;
                     drop(corroboration);
                     drop(source_conn);
                 }
@@ -938,7 +932,7 @@ fn corroborate_current_database_options(
                 path: db_path,
                 found,
                 supported: migrations::CURRENT_SCHEMA_VERSION,
-                discard_with_uninit: true,
+                discard_with_uninit: uninit_would_discard(paths, &ExtractionStatus::Current),
             });
         }
         return Err(StoreError::CurrentTombstoned {
@@ -977,6 +971,25 @@ fn corroborate_current_database_options(
         }
     }
     Ok((conn, source_conn))
+}
+
+/// The corroboration `uninit --force` runs on a `Current` namespace before its
+/// first change. OD-19: no schema check, so uninit stays the way to discard a
+/// newer codegraph's index; it still reads the extraction stamp row. A
+/// tombstone beside `Current` is an init that published but could not remove
+/// it: uninit discards that index too, and the tombstone stays.
+fn corroborate_current_for_uninit(paths: &IndexPaths) -> Result<(Connection, Connection)> {
+    corroborate_current_database_options(paths, false, true, true)
+}
+
+/// Whether `uninit --force` would discard the namespace in `status` now: a
+/// state it accepts, and for `Current` its own read-only corroboration
+/// (database present, main file readable, extraction stamp this binary's).
+/// A refusal offers uninit only when this holds; it creates and writes no
+/// file.
+pub(crate) fn uninit_would_discard(paths: &IndexPaths, status: &ExtractionStatus) -> bool {
+    crate::uninit::uninit_accepts(status)
+        && (*status != ExtractionStatus::Current || corroborate_current_for_uninit(paths).is_ok())
 }
 
 /// Refuse a database that records a schema newer than this binary's, read on

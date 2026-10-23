@@ -349,8 +349,9 @@ fn newer_schema_check(paths: &IndexPaths) -> Result<(), RebuildError> {
     match crate::schema_probe::probe_schema_version(&db) {
         Ok(ProbedSchema::Absent | ProbedSchema::NotSqlite) => Ok(()),
         Ok(ProbedSchema::Version(found)) if found > CURRENT_SCHEMA_VERSION => {
-            // `uninit --force` is offered only for the states it accepts.
-            let discard_with_uninit = crate::uninit::uninit_accepts(classify(paths).status());
+            // `uninit --force` is offered only where it would succeed.
+            let discard_with_uninit =
+                crate::connection::uninit_would_discard(paths, classify(paths).status());
             Err(RebuildError::Store(StoreError::FutureSchema {
                 path: db,
                 found,

@@ -1416,7 +1416,8 @@ refuse it, change nothing, and name both schema versions. `status` reports it as
 `current` with `initialized: false` and the versions in `extractionStatusDetail`.
 Upgrade CodeGraph to use it again. To discard it instead, run `codegraph uninit
 --force` and then `codegraph init`; the refusal offers that only where `uninit`
-accepts the index's state. The newer schema is reported before a leftover uninit
+would succeed: a state it accepts and, for a current index, a readable database
+with this binary's extraction stamp. The newer schema is reported before a leftover uninit
 tombstone, whose `init` recovery would refuse such an index.
 
 ### Index diagnostics
