@@ -1,4 +1,5 @@
 //! codegraph-graph crate
+pub mod branch_guards;
 pub mod centrality;
 pub mod collation;
 pub mod dead_code;
@@ -11,3 +12,4 @@ pub mod query;
 pub mod segment_match;
 pub mod segments;
 pub mod symbol_lookup;
+pub mod synthesized_hop;

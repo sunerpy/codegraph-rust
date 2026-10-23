@@ -121,14 +121,20 @@ text-formatting / relevance-ordering differences. Six of the eight shared tools 
 `codegraph_files` tree/flat/grouped) are byte-identical; the diffs below are
 confined to `codegraph_explore` and `codegraph_status`.
 
-- **`codegraph_explore` relevance ranking (RWR/flow/skeletonization) is not
-  ported; the size-adaptive output BUDGET is.** colby's `findRelevantContext`
-  (`reference/colby/src/context/index.ts`) ranks the subgraph with
-  Random-Walk-with-Restart / personalized PageRank, computes a FLOW spine among
-  named symbols (`buildFlowFromNamedSymbols`), and adaptively SKELETONIZES
-  off-spine polymorphic-sibling files to signatures (`adaptiveExplore`,
-  `tools.ts:2422-2623`). The Rust port reproduces the DETERMINISTIC structure —
-  header, blast radius, relationship map, dynamic boundaries, and per-file source
+- **`codegraph_explore` relevance ranking (RWR/skeletonization) is not
+  ported; the size-adaptive output BUDGET and the Flow section are.** colby's
+  `findRelevantContext` (`reference/colby/src/context/index.ts`) ranks the
+  subgraph with Random-Walk-with-Restart / personalized PageRank, computes a
+  FLOW spine among named symbols (`buildFlowFromNamedSymbols`), and adaptively
+  SKELETONIZES off-spine polymorphic-sibling files to signatures
+  (`adaptiveExplore`, `tools.ts:2422-2623`). The port opens the response with
+  the same Flow section (the chain, `dynamic:` hop tags, `(when …)` branch
+  conditions). The spine does not yet weight file ranking or body windows, the
+  "Dynamic-dispatch links among your symbols" section is not printed, and a
+  flow that does not connect gets no boundary or polymorphic-dispatch
+  announcement of its own; the port's boundary scan over the explore seeds
+  still runs. The Rust port reproduces the DETERMINISTIC structure — header,
+  blast radius, relationship map, dynamic boundaries, and per-file source
   grouped by file — by seeding roots from the FTS search results
   (`searchLimit: 8`) and pulling their callers/callees + `contains` children into
   the subgraph. It DOES now apply colby's `getExploreOutputBudget`

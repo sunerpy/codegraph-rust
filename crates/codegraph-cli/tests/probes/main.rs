@@ -19374,3 +19374,190 @@ mod frameworks {
         }
     }
 }
+
+mod explore_flow {
+    use super::support::{Project, codegraph};
+
+    const FLOW_HEADING: &str = "**Flow (call path among the symbols you queried)**";
+
+    /// What `codegraph explore` prints for `query`.
+    fn explore(root: &std::path::Path, query: &str) -> String {
+        let output = codegraph(root, ["explore", query, "-p", "."]);
+        String::from_utf8(output.stdout).expect("explore prints UTF-8")
+    }
+
+    /// The Flow section explore opens with: its heading through its last
+    /// numbered line; empty when there is none.
+    fn flow_section(text: &str) -> Vec<String> {
+        let Some(start) = text.find(FLOW_HEADING) else {
+            return Vec::new();
+        };
+        text[start..]
+            .lines()
+            .take_while(|line| !line.starts_with("> "))
+            .filter(|line| !line.is_empty())
+            .map(str::to_string)
+            .collect()
+    }
+
+    const BRANCHES_TS: &str = "export function helper() { return 1 }\nexport function other() { return 2 }\nexport function run(ready: boolean, busy: boolean) {\n  if (busy) return\n  if (ready) {\n    helper()\n  } else {\n    other()\n  }\n}\nexport function start() {\n  run(true, false)\n}\n";
+
+    /// Upstream #365: explore opens with the longest call chain among the
+    /// symbols the query names, one numbered line per symbol and one `↓`
+    /// line per hop, and says the bodies follow. Two named symbols one call
+    /// apart make no Flow: a chain needs three.
+    #[test]
+    fn pr365_explore_opens_with_the_call_path_among_the_named_symbols() {
+        let project = Project::new().file("src/app.ts", BRANCHES_TS).index();
+        let text = explore(project.root(), "start run helper");
+        assert!(text.starts_with(FLOW_HEADING), "{text}");
+        assert_eq!(
+            flow_section(&text),
+            [
+                FLOW_HEADING,
+                "1. start (src/app.ts:11)",
+                "   ↓ calls",
+                "2. run (src/app.ts:3)",
+                "   ↓ calls (when !busy && ready)",
+                "3. helper (src/app.ts:1)",
+            ],
+            "{text}"
+        );
+        assert!(
+            text.contains("\n\n> Full source for these symbols is below — the call flow among them, followed by their bodies.\n## Exploration: start run helper\n"),
+            "{text}"
+        );
+        let short = explore(project.root(), "start run");
+        assert!(flow_section(&short).is_empty(), "{short}");
+        assert!(short.starts_with("## Exploration: start run"), "{short}");
+    }
+
+    /// Upstream #1655: each hop of the Flow names the conditions its call
+    /// runs under, read from the caller's source as it is now: an earlier
+    /// early return negated, then the branch the call sits in. The other
+    /// arm of the same `if` reads negated.
+    #[test]
+    fn pr1655_a_flow_hop_says_when_its_call_runs() {
+        let project = Project::new().file("src/app.ts", BRANCHES_TS).index();
+        let text = explore(project.root(), "start run other");
+        assert_eq!(
+            flow_section(&text),
+            [
+                FLOW_HEADING,
+                "1. start (src/app.ts:11)",
+                "   ↓ calls",
+                "2. run (src/app.ts:3)",
+                "   ↓ calls (when !busy && !ready)",
+                "3. other (src/app.ts:2)",
+            ],
+            "{text}"
+        );
+    }
+
+    /// The condition is the CALLER's: read in the file the call is written
+    /// in, at the call's line, not in the callee's file.
+    #[test]
+    fn pr1655_the_condition_is_read_in_the_callers_file() {
+        let project = Project::new()
+            .file(
+                "src/lib.ts",
+                "export function helper(): number {\n  return 1;\n}\n",
+            )
+            .file(
+                "src/app.ts",
+                "import { helper } from './lib';\n\nexport function run(admin: boolean): number {\n  if (!admin) {\n    return 0;\n  }\n  return helper();\n}\n\nexport function start(): number {\n  return run(true);\n}\n",
+            )
+            .index();
+        let text = explore(project.root(), "start run helper");
+        assert_eq!(
+            flow_section(&text),
+            [
+                FLOW_HEADING,
+                "1. start (src/app.ts:10)",
+                "   ↓ calls",
+                "2. run (src/app.ts:3)",
+                "   ↓ calls (when admin)",
+                "3. helper (src/lib.ts:1)",
+            ],
+            "{text}"
+        );
+    }
+
+    /// A Python caller: `if not user: raise` before the call reads as `user`.
+    #[test]
+    fn pr1655_a_python_early_exit_guards_the_call_after_it() {
+        let project = Project::new()
+            .file(
+                "app.py",
+                "def helper():\n    return 1\n\n\ndef run(user):\n    if not user:\n        raise ValueError(\"no user\")\n    helper()\n\n\ndef start():\n    run(None)\n",
+            )
+            .index();
+        let text = explore(project.root(), "start run helper");
+        assert_eq!(
+            flow_section(&text),
+            [
+                FLOW_HEADING,
+                "1. start (app.py:11)",
+                "   ↓ calls",
+                "2. run (app.py:5)",
+                "   ↓ calls (when user)",
+                "3. helper (app.py:1)",
+            ],
+            "{text}"
+        );
+    }
+
+    /// A caller whose file changed since it was indexed may have moved its
+    /// lines: its hop shows no condition rather than one read at a stale
+    /// line, and the rest of the Flow stays.
+    #[test]
+    fn pr1655_a_changed_caller_file_gives_no_condition() {
+        let mut project = Project::new().file("src/app.ts", BRANCHES_TS).index();
+        let edited =
+            BRANCHES_TS.replace("  if (busy) return\n", "  if (busy) return\n  // checked\n");
+        project.write("src/app.ts", &edited);
+        let text = explore(project.root(), "start run helper");
+        assert_eq!(
+            flow_section(&text),
+            [
+                FLOW_HEADING,
+                "1. start (src/app.ts:11)",
+                "   ↓ calls",
+                "2. run (src/app.ts:3)",
+                "   ↓ calls",
+                "3. helper (src/app.ts:1)",
+            ],
+            "{text}"
+        );
+    }
+
+    /// Upstream #2453, explore half: two routes of one length to the next
+    /// named symbol, and the Flow takes the one through the symbol the query
+    /// names, whichever the index lists first. Upstream meets it through an
+    /// interface's implementations, whose dispatch edges come with the
+    /// synthesis stage (W7-14); direct calls settle the same way.
+    #[test]
+    fn pr2453_explore_flow_goes_through_the_symbol_the_query_names() {
+        let project = Project::new()
+            .file(
+                "src/store.ts",
+                "export function persist(): number {\n  return viaMemory() + viaDisk();\n}\n\nexport function viaMemory(): number {\n  return writeEntry();\n}\n\nexport function viaDisk(): number {\n  return writeEntry();\n}\n\nexport function writeEntry(): number {\n  return 1;\n}\n",
+            )
+            .index();
+        for (via, line) in [("viaMemory", 5), ("viaDisk", 9)] {
+            let text = explore(project.root(), &format!("persist {via} writeEntry"));
+            assert_eq!(
+                flow_section(&text),
+                [
+                    FLOW_HEADING.to_string(),
+                    "1. persist (src/store.ts:1)".to_string(),
+                    "   ↓ calls".to_string(),
+                    format!("2. {via} (src/store.ts:{line})"),
+                    "   ↓ calls".to_string(),
+                    "3. writeEntry (src/store.ts:13)".to_string(),
+                ],
+                "{text}"
+            );
+        }
+    }
+}
