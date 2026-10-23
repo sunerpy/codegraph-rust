@@ -18761,3 +18761,41 @@ mod pascal_includes {
         );
     }
 }
+
+/// What framework resolvers record on the edges they make (W7).
+mod frameworks {
+    use super::support::Project;
+
+    /// Upstream #2159: a link a framework or bridge resolver made names that
+    /// resolver in `metadata.framework`, as a synthesized channel names
+    /// itself with `synthesizedBy`: a Tauri `invoke('greet')` names `tauri`.
+    #[test]
+    fn pr2159_a_framework_resolved_edge_names_its_resolver() {
+        let project = Project::new()
+            .file("src-tauri/tauri.conf.json", "{}\n")
+            .file(
+                "src/main.ts",
+                "import { invoke } from '@tauri-apps/api/core';\n\nexport function run(): Promise<unknown> {\n  return invoke('greet');\n}\n",
+            )
+            .file(
+                "src-tauri/src/main.rs",
+                "#[tauri::command]\npub fn greet() -> String {\n    String::new()\n}\n\nfn main() {\n    greet();\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        let bridged = graph.edges_matching("file:src/main.ts", "calls", "function greet");
+        assert_eq!(bridged.len(), 1, "{}", graph.report());
+        assert_eq!(bridged[0].resolved_by(), Some("framework"));
+        assert_eq!(
+            bridged[0]
+                .metadata
+                .get("framework")
+                .and_then(|v| v.as_str()),
+            Some("tauri")
+        );
+        // A call no framework resolved names none.
+        let direct = graph.edges_matching("function main", "calls", "function greet");
+        assert_eq!(direct.len(), 1, "{}", graph.report());
+        assert_eq!(direct[0].metadata.get("framework"), None);
+    }
+}

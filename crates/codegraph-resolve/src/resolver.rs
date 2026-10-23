@@ -2439,8 +2439,12 @@ impl ReferenceResolver {
             .iter()
             .filter(|resolver| resolves_language(resolver.as_ref(), reference.language))
         {
+            // The resolver's name rides on the edges it makes (upstream
+            // #2159).
             if let Some(result) = self.gate_framework_resolver_extension_language(
-                resolver.resolve(reference, context),
+                resolver
+                    .resolve(reference, context)
+                    .map(|result| result.named_by(resolver.name())),
                 reference,
                 context,
             ) {
@@ -3795,11 +3799,12 @@ fn ref_view_to_unresolved(reference: &RefView) -> UnresolvedRef {
 }
 
 /// Build a resolved edge's `metadata` JSON: the target's own metadata from a
-/// framework resolution (`href`, …), then `confidence`+`resolvedBy`, plus
-/// `fnRef: true` for function-as-value edges (#756, index.ts:824-827) and
-/// `subkind` for Godot refs carrying a `reference_subkind`. The base shape (no
-/// `fnRef`, no `subkind`) stays byte-identical to the prior output, keeping
-/// existing resolved-edge goldens stable.
+/// framework resolution (`href`, the `framework` that made it, …), then
+/// `confidence`+`resolvedBy`, plus `fnRef: true` for function-as-value edges
+/// (#756, index.ts:824-827) and `subkind` for Godot refs carrying a
+/// `reference_subkind`. The base shape (no `fnRef`, no `subkind`) stays
+/// byte-identical to the prior output, keeping existing resolved-edge goldens
+/// stable.
 fn build_edge_metadata(
     reference: &ResolvedRef,
     extra: &serde_json::Map<String, serde_json::Value>,
@@ -4678,6 +4683,111 @@ mod tests {
         let batched = run_persist(true);
         assert_eq!(serial, batched);
         assert!(serial > 0, "expected at least one resolved edge");
+    }
+
+    /// A bridge that resolves `bridge.call` to two targets, the way a router
+    /// resolves a conditional navigation.
+    struct Bridge;
+    impl FrameworkResolver for Bridge {
+        fn name(&self) -> &str {
+            "bridge"
+        }
+        fn detect(&self, _c: &dyn ResolutionContext) -> bool {
+            true
+        }
+        fn claims_reference(&self, name: &str) -> bool {
+            name == "bridge.call"
+        }
+        fn resolve(&self, r: &RefView, _c: &dyn ResolutionContext) -> Option<ResolvedRef> {
+            (r.reference_name == "bridge.call").then(|| {
+                ResolvedRef::new(
+                    r.clone(),
+                    "function:native".to_string(),
+                    0.95,
+                    ResolvedBy::Framework,
+                )
+                .with_edge(crate::types::EdgeShape {
+                    also_targets: vec![crate::types::AlsoTarget {
+                        target_node_id: "function:fallback".to_string(),
+                        metadata: serde_json::Map::new(),
+                    }],
+                    ..Default::default()
+                })
+            })
+        }
+    }
+
+    /// Upstream #2159: the edge a framework resolver made to its target names
+    /// that resolver in `metadata.framework`, on the serial and the batched
+    /// path; an also-target's edge keeps its own metadata, and a resolution no
+    /// framework made names none.
+    #[test]
+    fn a_framework_resolved_edge_names_its_resolver() {
+        for batched in [false, true] {
+            let mut store = Store::open(&temp_db("framework-name")).expect("open");
+            let caller = mk_node("function:run", NodeKind::Function, "run", "app.ts");
+            let native = mk_node("function:native", NodeKind::Function, "native", "n.ts");
+            let fallback = mk_node("function:fallback", NodeKind::Function, "fallback", "f.ts");
+            let add = mk_node("function:add", NodeKind::Function, "add", "math.ts");
+            for file in ["app.ts", "n.ts", "f.ts", "math.ts"] {
+                store.upsert_file(&file_rec(file)).expect("file");
+            }
+            store
+                .upsert_nodes(&[caller.clone(), native, fallback, add])
+                .expect("nodes");
+            let reference = |name: &str, line: i64| UnresolvedRef {
+                id: None,
+                from_node_id: caller.id.clone(),
+                reference_name: name.to_string(),
+                reference_kind: EdgeKind::Calls,
+                line,
+                col: 0,
+                candidates: None,
+                file_path: "app.ts".to_string(),
+                language: Language::TypeScript,
+                is_function_ref: false,
+                reference_subkind: None,
+            };
+            store
+                .insert_unresolved_refs(&[reference("bridge.call", 1), reference("add", 2)])
+                .expect("refs");
+            let mut resolver = ReferenceResolver::new("/root");
+            resolver.framework_resolver_extensions = vec![Box::new(Bridge)];
+            if batched {
+                resolver
+                    .resolve_and_persist_batched(&mut store, 10)
+                    .expect("batched");
+            } else {
+                resolver.resolve_and_persist(&mut store).expect("serial");
+            }
+            let mut named: Vec<String> = store
+                .edges_by_source_kind(&caller.id, Some(EdgeKind::Calls))
+                .expect("edges")
+                .into_iter()
+                .map(|edge| {
+                    let metadata = edge.metadata.expect("metadata");
+                    format!(
+                        "{} {} {}",
+                        edge.target,
+                        metadata["resolvedBy"].as_str().unwrap_or("-"),
+                        metadata
+                            .get("framework")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("-"),
+                    )
+                })
+                .collect();
+            named.sort();
+            assert_eq!(
+                named,
+                [
+                    "function:add exact-match -",
+                    "function:fallback framework -",
+                    "function:native framework bridge",
+                ],
+                "batched: {batched}"
+            );
+        }
     }
 
     fn run_persist(batched: bool) -> usize {

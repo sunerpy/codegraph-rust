@@ -247,6 +247,20 @@ impl ResolvedRef {
         self.edge = Some(Box::new(edge));
         self
     }
+
+    /// This resolution as the framework resolver `framework` made it: the
+    /// edge to its target names that resolver in `metadata.framework`
+    /// (upstream #2159), so a bridge or router hop says how it got into the
+    /// graph, as a synthesized edge's `synthesizedBy` does. The edges to
+    /// [`EdgeShape::also_targets`] keep their own metadata, as upstream's do.
+    #[must_use]
+    pub fn named_by(mut self, framework: &str) -> Self {
+        self.edge
+            .get_or_insert_with(Box::default)
+            .metadata
+            .insert("framework".to_string(), serde_json::json!(framework));
+        self
+    }
 }
 
 /// The edges a framework resolution draws when they are not one plain edge

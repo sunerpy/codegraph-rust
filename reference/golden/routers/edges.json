@@ -117,6 +117,7 @@
     "line": 5,
     "metadata": {
       "confidence": 1.0,
+      "framework": "vue",
       "resolvedBy": "framework"
     },
     "provenance": null,
