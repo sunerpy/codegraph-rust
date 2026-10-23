@@ -12818,7 +12818,7 @@ mod go {
 }
 
 mod rust {
-    use super::support::{Graph, Project};
+    use super::support::{Graph, Project, assert_edge, assert_no_edge, assert_unresolved};
 
     /// `kind:qualifiedName` of every `calls` / `references` / `instantiates`
     /// target out of the functions named `name` (upstream's `targets`).
@@ -12850,6 +12850,33 @@ mod rust {
             .filter_map(|e| graph.node(&e.target))
             .map(|n| n.file_path.clone())
             .collect()
+    }
+
+    /// The member-path std gate deferred on 2026-10-03 needs no change: since
+    /// the #2169 port, a receiver whose declared type the project does not
+    /// declare (`PathBuf`, `&Path`, `std::path::PathBuf`) binds no project
+    /// method by name, so `index_root.join(..)` no longer reaches the project's
+    /// `LineIndex::join`; a project-typed receiver keeps its method.
+    #[test]
+    fn pr2169_a_std_typed_rust_receiver_binds_no_project_method_by_name() {
+        let project = Project::new()
+            .file("Cargo.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\n")
+            .file(
+                "src/lib.rs",
+                "use std::path::{Path, PathBuf};\n\npub struct LineIndex;\nimpl LineIndex {\n    pub fn join(&self, _x: &str) -> usize { 0 }\n}\n\npub struct EnvGuard;\nimpl EnvGuard {\n    pub fn set(&self) {}\n}\npub fn env_guard() -> EnvGuard { EnvGuard }\n\npub fn annotated(index_root: PathBuf) -> PathBuf {\n    index_root.join(\"x\")\n}\n\npub fn let_typed() -> PathBuf {\n    let base: PathBuf = PathBuf::from(\"a\");\n    base.join(\"b\")\n}\n\npub fn path_typed(p: &Path) -> PathBuf {\n    p.join(\"c\")\n}\n\npub fn std_path(q: std::path::PathBuf) -> PathBuf {\n    q.join(\"d\")\n}\n\npub fn project_typed() {\n    let mut env = env_guard();\n    env.set();\n}\n",
+            )
+            .index();
+
+        for (function, call) in [
+            ("annotated", "index_root.join"),
+            ("let_typed", "base.join"),
+            ("path_typed", "p.join"),
+            ("std_path", "q.join"),
+        ] {
+            assert_no_edge!(project, function => calls => "method LineIndex::join");
+            assert_unresolved!(project, function => calls => call);
+        }
+        assert_edge!(project, "project_typed" => calls => "method EnvGuard::set");
     }
 
     /// Upstream #2124: a bare Rust name reaches only what is in scope —
