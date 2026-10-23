@@ -16,7 +16,9 @@ mod upgrade_support;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use codegraph_store::{CURRENT_STORAGE_PROTOCOL, ExtractionStatus, Store};
+use codegraph_store::CURRENT_STORAGE_PROTOCOL;
+#[cfg(unix)]
+use codegraph_store::{ExtractionStatus, Store};
 use upgrade_support::*;
 
 /// Extraction version the v0.54.0 release published.
