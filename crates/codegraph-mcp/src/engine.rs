@@ -5797,21 +5797,91 @@ mod tests {
 
     static TEMP_SEQ: AtomicUsize = AtomicUsize::new(0);
 
-    fn test_engine() -> CodeGraphEngine {
+    /// An engine over an empty index in its own directory, which is removed
+    /// when the engine is dropped.
+    struct TestEngine {
+        engine: Option<CodeGraphEngine>,
+        root: PathBuf,
+    }
+
+    impl std::ops::Deref for TestEngine {
+        type Target = CodeGraphEngine;
+
+        fn deref(&self) -> &CodeGraphEngine {
+            self.engine.as_ref().expect("the engine lives until drop")
+        }
+    }
+
+    impl std::ops::DerefMut for TestEngine {
+        fn deref_mut(&mut self) -> &mut CodeGraphEngine {
+            self.engine.as_mut().expect("the engine lives until drop")
+        }
+    }
+
+    impl Drop for TestEngine {
+        fn drop(&mut self) {
+            // Close the index first: Windows cannot remove an open database.
+            drop(self.engine.take());
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn test_engine() -> TestEngine {
         let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
-        let base = std::env::temp_dir().join(format!("cg-mcp-engine-{}-{seq}", std::process::id()));
+        test_engine_at(
+            std::env::temp_dir().join(format!("cg-mcp-engine-{}-{seq}", std::process::id())),
+        )
+    }
+
+    /// The directory is keyed by pid and sequence number, so a dead process
+    /// whose pid came back may have left one with its own index there: remove
+    /// it first, or the test reads that run's index instead of an empty one.
+    fn test_engine_at(base: PathBuf) -> TestEngine {
+        match std::fs::remove_dir_all(&base) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!("remove the stale {}: {error}", base.display()),
+        }
         let db = base.join(".codegraph").join("codegraph.db");
         std::fs::create_dir_all(db.parent().unwrap()).unwrap();
         let store = Store::open(&db).unwrap();
-        CodeGraphEngine {
-            store,
-            project_root: base,
-            config: Arc::new(Config::default()),
-            deprioritize: Arc::new(DeprioritizeMatcher::default()),
-            source_probes: RefCell::new(HashMap::new()),
-            source_citations: RefCell::new(HashSet::new()),
-            answer_files: RefCell::new(BTreeSet::new()),
+        TestEngine {
+            engine: Some(CodeGraphEngine {
+                store,
+                project_root: base.clone(),
+                config: Arc::new(Config::default()),
+                deprioritize: Arc::new(DeprioritizeMatcher::default()),
+                source_probes: RefCell::new(HashMap::new()),
+                source_citations: RefCell::new(HashSet::new()),
+                answer_files: RefCell::new(BTreeSet::new()),
+            }),
+            root: base,
         }
+    }
+
+    #[test]
+    fn a_test_engine_never_reads_what_a_reused_directory_holds() {
+        let base = std::env::temp_dir().join(format!(
+            "cg-mcp-engine-stale-{}-{}",
+            std::process::id(),
+            TEMP_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let db = base.join(".codegraph").join("codegraph.db");
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        std::fs::write(&db, b"left by a dead process with the same pid").unwrap();
+        std::fs::write(base.join("stale.txt"), b"stale").unwrap();
+
+        let engine = test_engine_at(base.clone());
+        assert!(
+            !base.join("stale.txt").exists(),
+            "the stale directory stays"
+        );
+        assert!(
+            engine.store.all_files().unwrap().is_empty(),
+            "a test engine starts over an empty index"
+        );
+        drop(engine);
+        assert!(!base.exists(), "dropping the engine removes its directory");
     }
 
     fn node(name: &str, file: &str, start: i64, end: i64, kind: NodeKind) -> Node {
