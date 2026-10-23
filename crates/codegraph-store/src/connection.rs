@@ -925,6 +925,22 @@ fn corroborate_current_database_options(
 ) -> Result<(Connection, Connection)> {
     let db_path = paths.current_db();
     if !allow_tombstone && artifact_exists(&paths.tombstone())? {
+        // A database a newer codegraph wrote is reported as that before the
+        // tombstone, whose recovery (`init`) would refuse it (OD-19); uninit
+        // discards both. Read without touching a file, and only a version
+        // positively newer changes the answer.
+        if check_schema
+            && let Ok(crate::schema_probe::ProbedSchema::Version(found)) =
+                crate::schema_probe::probe_schema_version(&db_path)
+            && found > migrations::CURRENT_SCHEMA_VERSION
+        {
+            return Err(StoreError::FutureSchema {
+                path: db_path,
+                found,
+                supported: migrations::CURRENT_SCHEMA_VERSION,
+                discard_with_uninit: true,
+            });
+        }
         return Err(StoreError::CurrentTombstoned {
             path: paths.tombstone(),
         });

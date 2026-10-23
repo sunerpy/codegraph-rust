@@ -178,6 +178,33 @@ fn a_tombstoned_index_a_newer_codegraph_wrote_is_discarded_by_uninit() {
     fs::write(paths.tombstone(), b"remove failed").unwrap();
     let before = index_bytes(&paths);
 
+    // `status` reports the newer schema, not the tombstone's `init` recovery.
+    let status = cli(&["status", path_str(&project), "--json"]);
+    assert!(status.ok, "status failed: {}", status.stderr);
+    let json: Value = serde_json::from_str(&status.stdout).expect("status JSON");
+    assert_eq!(json["extractionStatus"], "current", "{}", status.stdout);
+    let detail = json["extractionStatusDetail"].as_str().unwrap_or("");
+    assert!(
+        detail.contains(&format!("schema {NEWER}")) && detail.contains("uninit --force"),
+        "{detail}"
+    );
+    assert_eq!(json["recoveryCommand"], Value::Null, "{}", status.stdout);
+    let human = cli(&["status", path_str(&project)]);
+    assert!(
+        human.stdout.contains(&format!("schema {NEWER} is newer"))
+            && human.stdout.contains("codegraph uninit --force")
+            && !human.stdout.contains("blocked by the uninit tombstone"),
+        "{}",
+        human.stdout
+    );
+    let search = cli(&["search", "add", "-p", path_str(&project)]);
+    assert!(
+        !search.ok && search.stderr.contains("newer CodeGraph"),
+        "{}",
+        search.stderr
+    );
+    assert_unchanged(&paths, &before, "status and search");
+
     let init = cli(&["init", path_str(&project)]);
     assert!(!init.ok, "init replaced a newer codegraph's index");
     assert!(

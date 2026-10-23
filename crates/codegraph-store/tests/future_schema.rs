@@ -409,6 +409,16 @@ fn a_tombstoned_newer_schema_index_is_refused_then_discarded_by_uninit() {
     std::fs::write(paths.tombstone(), b"remove failed").expect("stage the tombstone");
     let before = snapshot(&paths);
 
+    // The newer schema takes precedence over the tombstone, whose own
+    // recovery (`init`) would refuse it.
+    let Err(error) = Store::open_for_read(&paths, deadline(), || false) else {
+        panic!("a read opened a tombstoned newer codegraph's index");
+    };
+    assert_future_schema(&error, true);
+    let Err(error) = Store::open_for_status(&paths, deadline(), || false) else {
+        panic!("status opened a tombstoned newer codegraph's index");
+    };
+    assert_future_schema(&error, true);
     assert_rebuild_refused(
         begin_full_rebuild(&paths, RebuildKind::ExplicitInit, deadline(), || false),
         true,
