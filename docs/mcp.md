@@ -461,11 +461,15 @@ LLM a high-level structural summary of the entire codebase.
 
 ## Error Channels
 
-Two distinct error channels:
+Three error channels:
 
 - **Unknown tool name** — JSON-RPC error `-32602` (invalid params).
 - **Missing or invalid required argument** — tool result with
   `{content: ..., isError: true}` and `Error: <message>` body.
+- **A project whose index cannot be opened** — the same `isError` tool result,
+  `Failed to open project at <path>: <reason>`. An index a newer CodeGraph wrote
+  is one: the reason names both schema versions and nothing in the index changes
+  ([`cli.md`](cli.md#an-index-a-newer-codegraph-wrote)).
 
 ---
 

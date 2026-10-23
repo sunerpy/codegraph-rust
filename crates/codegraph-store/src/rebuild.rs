@@ -34,6 +34,8 @@ use crate::connection::{
     Store, StoreError, StoreWriteOpen, StoreWritePurpose, database_sidecar_path,
     first_existing_database_artifact,
 };
+use crate::migrations::CURRENT_SCHEMA_VERSION;
+use crate::schema_probe::ProbedSchema;
 use crate::{
     CorruptReason, IndexLease, IndexLeaseError, IndexLeaseValidationError, SlotOutcome, StatePhase,
     StatePublishError, classify, publish_index_state,
@@ -273,6 +275,9 @@ fn begin_full_rebuild_with(
     fault: &mut impl RebuildFault,
 ) -> Result<FullRebuild, RebuildError> {
     let lease = acquire_outer_exclusive(paths, deadline, cancelled)?;
+    // Before any byte changes, including an explicit init's removal of a
+    // copied project's state slots (OD-19).
+    refuse_newer_schema_database(paths, &lease)?;
     checkpoint(fault, RebuildCheckpoint::BeforeWriteAuthorization)?;
     if kind == RebuildKind::ExplicitInit {
         remove_owner_mismatched_state_slots(paths, &lease)?;
@@ -321,6 +326,43 @@ fn refuse_tombstoned_namespace(paths: &IndexPaths, lease: &IndexLease) -> Result
             path: paths.current_root().to_path_buf(),
         }),
         Err(source) => Err(RebuildError::InspectTombstone { path, source }),
+    }
+}
+
+/// Refuse to replace a database a newer codegraph wrote (OD-19), deciding from
+/// the version its next opener would read, its committed write-ahead log
+/// included, without creating or writing any file. Runs under the retained
+/// exclusive lease, before anything is removed or published.
+fn refuse_newer_schema_database(
+    paths: &IndexPaths,
+    lease: &IndexLease,
+) -> Result<(), RebuildError> {
+    lease.validate_exclusive(paths)?;
+    newer_schema_check(paths)
+}
+
+/// The check itself. A file that is not a SQLite database is no index any
+/// codegraph wrote, so a rebuild replaces it as before; a database whose version
+/// cannot be read is refused.
+fn newer_schema_check(paths: &IndexPaths) -> Result<(), RebuildError> {
+    let db = paths.current_db();
+    match crate::schema_probe::probe_schema_version(&db) {
+        Ok(ProbedSchema::Absent | ProbedSchema::NotSqlite) => Ok(()),
+        Ok(ProbedSchema::Version(found)) if found > CURRENT_SCHEMA_VERSION => {
+            // `uninit --force` is offered only for the states it accepts.
+            let discard_with_uninit = crate::uninit::uninit_accepts(classify(paths).status());
+            Err(RebuildError::Store(StoreError::FutureSchema {
+                path: db,
+                found,
+                supported: CURRENT_SCHEMA_VERSION,
+                discard_with_uninit,
+            }))
+        }
+        Ok(ProbedSchema::Version(_)) => Ok(()),
+        Err(source) => Err(RebuildError::Store(StoreError::ReadSchemaVersion {
+            path: db,
+            source,
+        })),
     }
 }
 
@@ -428,6 +470,7 @@ fn resume_full_rebuild_with(
     }
     let lease = authorization.clone_lease();
     refuse_tombstoned_namespace(paths, &lease)?;
+    refuse_newer_schema_database(paths, &lease)?;
     begin_from_authorization(paths, lease, RebuildKind::Reindex, authorization, fault)
 }
 
@@ -801,6 +844,9 @@ fn acquire_outer_exclusive(
         Err(IndexLeaseError::LockNotFound { .. })
             if Store::extraction_status(paths) == crate::ExtractionStatus::Missing =>
         {
+            // A newer codegraph's database stops the rebuild before the lock
+            // exists; the check is repeated under the lease (OD-19).
+            newer_schema_check(paths)?;
             let lease = IndexLease::create_exclusive_in_existing_root(paths, deadline, cancelled)?;
             let status = Store::extraction_status(paths);
             if status != crate::ExtractionStatus::Missing {

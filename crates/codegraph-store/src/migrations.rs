@@ -2,6 +2,17 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::schema::BASE_SCHEMA;
 
+/// Why [`ensure_schema_and_migrations`] stopped.
+#[derive(Debug, thiserror::Error)]
+pub enum MigrationError {
+    #[error(transparent)]
+    Sqlite(#[from] rusqlite::Error),
+    /// The database records a schema newer than [`CURRENT_SCHEMA_VERSION`]:
+    /// a newer codegraph wrote it. Nothing was changed.
+    #[error("the database records schema {found}; this binary supports schema {supported}")]
+    NewerSchema { found: i64, supported: i64 },
+}
+
 pub const CURRENT_SCHEMA_VERSION: i64 = 10;
 pub const FRESH_SCHEMA_DESCRIPTION: &str = "Initial schema includes all migrations";
 
@@ -143,8 +154,17 @@ struct Migration {
     adds_column: Option<(&'static str, &'static str)>,
 }
 
-pub fn ensure_schema_and_migrations(conn: &mut Connection) -> rusqlite::Result<()> {
-    if get_current_version(conn)? == 0 {
+pub fn ensure_schema_and_migrations(conn: &mut Connection) -> Result<(), MigrationError> {
+    // A newer codegraph's database is refused before anything below writes to
+    // it: no table, no migration, no ANALYZE (OD-19).
+    let current = get_current_version(conn)?;
+    if current > CURRENT_SCHEMA_VERSION {
+        return Err(MigrationError::NewerSchema {
+            found: current,
+            supported: CURRENT_SCHEMA_VERSION,
+        });
+    }
+    if current == 0 {
         initialize_fresh_schema(conn)?;
     }
 
@@ -312,6 +332,48 @@ mod tests {
 
         ensure_schema_and_migrations(&mut conn).unwrap();
         assert_eq!(get_current_version(&conn).unwrap(), CURRENT_SCHEMA_VERSION);
+    }
+
+    /// OD-19: a database a newer codegraph wrote is refused before anything is
+    /// written: no table, no migration, no ANALYZE, the file's bytes unchanged.
+    #[test]
+    fn a_newer_schema_is_refused_without_writing() {
+        struct Dir(std::path::PathBuf);
+        impl Drop for Dir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let dir =
+            Dir(std::env::temp_dir()
+                .join(format!("codegraph-migrations-newer-{}", std::process::id())));
+        let _ = std::fs::remove_dir_all(&dir.0);
+        std::fs::create_dir_all(&dir.0).unwrap();
+        let db = dir.0.join("newer.db");
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE schema_versions (version INTEGER PRIMARY KEY, applied_at INTEGER, description TEXT);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO schema_versions VALUES (?1, 0, 'newer')",
+            [CURRENT_SCHEMA_VERSION + 1],
+        )
+        .unwrap();
+        drop(conn);
+        let before = std::fs::read(&db).unwrap();
+
+        let mut conn = Connection::open(&db).unwrap();
+        match ensure_schema_and_migrations(&mut conn) {
+            Err(MigrationError::NewerSchema { found, supported }) => {
+                assert_eq!(found, CURRENT_SCHEMA_VERSION + 1);
+                assert_eq!(supported, CURRENT_SCHEMA_VERSION);
+            }
+            other => panic!("expected NewerSchema, got {other:?}"),
+        }
+        assert!(!has_sqlite_stat1(&conn).unwrap(), "no ANALYZE ran");
+        drop(conn);
+        assert_eq!(std::fs::read(&db).unwrap(), before, "the file changed");
     }
 
     #[test]

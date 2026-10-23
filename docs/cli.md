@@ -1407,6 +1407,16 @@ the index, even one an interrupted `init` left `building`, because only `init`
 removes the tombstone; `status` and the read errors name `codegraph init` as the
 recovery then.
 
+### An index a newer CodeGraph wrote
+
+A database recording a schema newer than this binary's is left alone: `search`
+and the other reads, `sync`, `init`, `index --force`, MCP tools and the daemon
+refuse it, change nothing, and name both schema versions. `status` reports it as
+`current` with `initialized: false` and the versions in `extractionStatusDetail`.
+Upgrade CodeGraph to use it again. To discard it instead, run `codegraph uninit
+--force` and then `codegraph init`; the refusal offers that only where `uninit`
+accepts the index's state.
+
 ### Index diagnostics
 
 `init`, `index`, and `sync` share `--debug` and `--debug-log <FILE>`.

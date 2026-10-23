@@ -45,6 +45,18 @@ Schema version and extraction version are independent. A DDL change needs a
 schema migration; a change in graph meaning may need an extraction-version move
 even when DDL is unchanged.
 
+A database whose `schema_versions` records a version above this binary's was
+written by a newer codegraph, and this binary neither reads, writes nor replaces
+it. Reads, `status`, a sync, an MCP session, a daemon, `init` and `index --force`
+refuse it before they change a byte. The check sees what the database's next
+opener would see, including a version that is only in an un-checkpointed
+write-ahead log: where a log may exist, the main file and the log's committed
+frames are read into memory and checked there, as SQLite's recovery would apply
+them, so no `-wal` or `-shm` is created or folded. A database whose version cannot
+be read is refused as well. A rebuild still replaces a file that is not a SQLite
+database at all. `uninit --force` skips the schema check and removes such an
+index from the states it accepts (current, building, outdated, uninitialized).
+
 ## Application tables
 
 ### `schema_versions`
