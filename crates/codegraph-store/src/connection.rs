@@ -634,11 +634,13 @@ impl Store {
                     // then publishes Uninitialized before deleting those
                     // sidecars. Rejecting them here would make that required
                     // cleanup path unreachable.
+                    // OD-19: no schema check, so uninit stays the way to
+                    // discard a newer codegraph's index; it still reads the
+                    // extraction stamp row. A tombstone beside `Current` is an
+                    // init that published but could not remove it: uninit
+                    // discards that index too, and the tombstone stays.
                     let (corroboration, source_conn) =
-                        // OD-19: no schema check, so uninit stays the way to
-                        // discard a newer codegraph's index. It still reads
-                        // the extraction stamp row.
-                        corroborate_current_database_options(paths, false, false, true)?;
+                        corroborate_current_database_options(paths, false, true, true)?;
                     drop(corroboration);
                     drop(source_conn);
                 }

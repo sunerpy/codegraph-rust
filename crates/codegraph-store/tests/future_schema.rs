@@ -398,6 +398,31 @@ fn a_damaged_database_in_a_missing_namespace_is_refused() {
     assert_eq!(snapshot(&paths), before);
 }
 
+/// A `Current` index beside the tombstone an `init` could not remove, with a
+/// newer schema: `init` refuses it unchanged and offers `uninit --force`, and
+/// that command then discards it.
+#[test]
+fn a_tombstoned_newer_schema_index_is_refused_then_discarded_by_uninit() {
+    let project = TempProject::new("current-tombstone");
+    let paths = stage_current(&project);
+    record_newer_schema(&paths.current_db());
+    std::fs::write(paths.tombstone(), b"remove failed").expect("stage the tombstone");
+    let before = snapshot(&paths);
+
+    assert_rebuild_refused(
+        begin_full_rebuild(&paths, RebuildKind::ExplicitInit, deadline(), || false),
+        true,
+    );
+    assert_eq!(snapshot(&paths), before, "the refusal changed the index");
+
+    uninit_index(&paths, deadline(), || false).expect("uninit --force discards it");
+    assert!(!paths.current_db().exists());
+    assert_eq!(
+        Store::extraction_status(&paths),
+        ExtractionStatus::Uninitialized
+    );
+}
+
 #[test]
 fn uninit_still_removes_a_newer_schema_index() {
     for phase in ["current", "building"] {

@@ -992,7 +992,8 @@ A `Current` index beside the uninit tombstone, which an `init` that published
 `Current` but could not remove the tombstone leaves, is reported the same way,
 with `recoveryCommand` set to `codegraph init <project>`; human output shows
 `current (blocked by the uninit tombstone)` and that recovery. Reads refuse such
-an index until `init` rebuilds it.
+an index until `init` rebuilds it; `uninit --force` discards it instead and keeps
+the tombstone.
 
 When the WAL is larger than both the database and the configured WAL limit,
 `status` warns that live CodeGraph processes must be stopped before running:

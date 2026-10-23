@@ -166,6 +166,36 @@ fn reads_sync_and_init_refuse_a_newer_schema_and_uninit_discards_it() {
     assert_eq!(Store::extraction_status(&paths), ExtractionStatus::Current);
 }
 
+/// The same index beside the tombstone a newer codegraph's `init` could not
+/// remove: `init` refuses it unchanged and names `uninit --force`, which
+/// discards it, and `init` then rebuilds it.
+#[test]
+fn a_tombstoned_index_a_newer_codegraph_wrote_is_discarded_by_uninit() {
+    let dir = TestDir::new("future-schema-tombstone");
+    let project = indexed_project(&dir);
+    let paths = index_paths(&project);
+    record_newer_schema(&paths);
+    fs::write(paths.tombstone(), b"remove failed").unwrap();
+    let before = index_bytes(&paths);
+
+    let init = cli(&["init", path_str(&project)]);
+    assert!(!init.ok, "init replaced a newer codegraph's index");
+    assert!(
+        init.stderr.contains("newer CodeGraph") && init.stderr.contains("uninit --force"),
+        "{}",
+        init.stderr
+    );
+    assert_unchanged(&paths, &before, "init");
+
+    let uninit = cli(&["uninit", "--force", path_str(&project)]);
+    assert!(uninit.ok, "uninit failed: {}", uninit.stderr);
+    assert!(!paths.current_db().exists());
+    let init = cli(&["init", path_str(&project)]);
+    assert!(init.ok, "init after uninit failed: {}", init.stderr);
+    assert_eq!(Store::extraction_status(&paths), ExtractionStatus::Current);
+    assert!(!paths.tombstone().exists(), "init removed the tombstone");
+}
+
 #[test]
 fn sync_leaves_a_newer_schema_in_the_log_untouched() {
     let dir = TestDir::new("future-schema-log-sync");
