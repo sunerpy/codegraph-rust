@@ -39,12 +39,14 @@ impl FrameworkResolver for NestjsResolver {
 
     // Ports nestjsResolver.detect (nestjs.ts:49-89).
     fn detect(&self, context: &dyn ResolutionContext) -> bool {
-        if let Some(package_json) = context.read_file("package.json") {
-            if let Ok(pkg) = serde_json::from_str::<serde_json::Value>(&package_json) {
-                if any_nestjs_dep(&pkg) {
-                    return true;
-                }
-            }
+        // Any `@nestjs/*` dependency in a package.json: the root's, or an
+        // app's (`apps/api/`, `server/`).
+        if context
+            .declared_dependencies()
+            .iter()
+            .any(|name| name.starts_with("@nestjs/"))
+        {
+            return true;
         }
 
         for file in context.get_all_files_shared().iter() {
@@ -88,12 +90,12 @@ impl FrameworkResolver for NestjsResolver {
                 Some(node) => (node, 0.85),
                 None => (&candidates[0], 0.7),
             };
-            return Some(ResolvedRef {
-                original: reference.clone(),
-                target_node_id: target.id.clone(),
+            return Some(ResolvedRef::new(
+                reference.clone(),
+                target.id.clone(),
                 confidence,
-                resolved_by: ResolvedBy::Framework,
-            });
+                ResolvedBy::Framework,
+            ));
         }
         None
     }
@@ -301,16 +303,6 @@ impl FrameworkResolver for NestjsResolver {
 // ---------------------------------------------------------------------------
 // Detection helpers
 // ---------------------------------------------------------------------------
-
-/// Any `@nestjs/*` key in dependencies/devDependencies (nestjs.ts:54-56).
-fn any_nestjs_dep(pkg: &serde_json::Value) -> bool {
-    let in_section = |section: &str| -> bool {
-        pkg.get(section)
-            .and_then(|d| d.as_object())
-            .is_some_and(|deps| deps.keys().any(|k| k.starts_with("@nestjs/")))
-    };
-    in_section("dependencies") || in_section("devDependencies")
-}
 
 // ---------------------------------------------------------------------------
 // Provider resolution conventions (nestjs.ts:273-283)

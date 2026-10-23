@@ -6569,7 +6569,7 @@ fn index_project_inner(
     codegraph_watch::control_inputs::write_index_rows(
         &store,
         project,
-        &resolver.framework_names(),
+        &resolver.framework_signature(),
     )?;
     if resolver.has_framework_resolvers() {
         let relative_files = store

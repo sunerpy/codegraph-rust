@@ -646,11 +646,13 @@ pub(crate) fn match_cpp_macro_namespaced(
             best = Some((node, score));
         }
     }
-    best.map(|(node, _)| ResolvedRef {
-        original: reference.clone(),
-        target_node_id: node.id.clone(),
-        confidence: 0.8,
-        resolved_by: ResolvedBy::QualifiedName,
+    best.map(|(node, _)| {
+        ResolvedRef::new(
+            reference.clone(),
+            node.id.clone(),
+            0.8,
+            ResolvedBy::QualifiedName,
+        )
     })
 }
 
@@ -681,16 +683,16 @@ pub(crate) fn match_cpp_global_name(
     let chosen = prefer_call_site_file(global, &reference.file_path)
         .into_iter()
         .next()?;
-    Some(ResolvedRef {
-        original: reference.clone(),
-        confidence: if count == 1 || chosen.file_path == reference.file_path {
+    Some(ResolvedRef::new(
+        reference.clone(),
+        chosen.id.clone(),
+        if count == 1 || chosen.file_path == reference.file_path {
             0.95
         } else {
             0.85
         },
-        target_node_id: chosen.id.clone(),
-        resolved_by: ResolvedBy::QualifiedName,
-    })
+        ResolvedBy::QualifiedName,
+    ))
 }
 
 /// Split `a, f(b, c), d<e, f>` at its top-level commas.

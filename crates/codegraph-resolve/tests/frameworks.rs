@@ -159,6 +159,39 @@ fn react_detects_via_tsx_file() {
     assert!(react::ReactResolver.detect(&ctx));
 }
 
+/// React in an app's manifest rather than the root's: proshop keeps `react`
+/// in `frontend/`, an ASP.NET solution its app in `src/Web/ClientApp/`
+/// (upstream #2395). Neither app has a `.jsx` or `.tsx` file.
+#[test]
+fn react_detects_via_an_app_package_json() {
+    for app in ["frontend/", "apps/web/", "src/Web/ClientApp/"] {
+        let ctx = MockContext::default()
+            .with_file("package.json", r#"{"name":"shop","private":true}"#)
+            .with_file(
+                &format!("{app}package.json"),
+                r#"{"peerDependencies":{"react":"18"}}"#,
+            )
+            .with_file(&format!("{app}src/index.js"), "export const x = 1;");
+        assert!(react::ReactResolver.detect(&ctx), "{app}");
+    }
+}
+
+/// A dependency's own manifest inside `node_modules` is not the project's.
+#[test]
+fn react_does_not_detect_a_manifest_inside_node_modules() {
+    let ctx = MockContext::default()
+        .with_file(
+            "tools/node_modules/react-ui/package.json",
+            r#"{"dependencies":{"react":"18"}}"#,
+        )
+        .with_file(
+            "tools/node_modules/react-ui/index.js",
+            "module.exports = 1;",
+        )
+        .with_file("tools/src/index.js", "export const x = 1;");
+    assert!(!react::ReactResolver.detect(&ctx));
+}
+
 #[test]
 fn react_does_not_detect_plain_ts_project() {
     let ctx = MockContext::default()
@@ -769,6 +802,23 @@ fn vue_extract_emits_nuxt_page_route() {
 fn nestjs_detects_via_package_json() {
     let ctx = MockContext::default()
         .with_file("package.json", r#"{"dependencies":{"@nestjs/core":"10"}}"#);
+    assert!(nestjs::NestjsResolver.detect(&ctx));
+}
+
+/// `@nestjs/*` in a workspace app's manifest, with no conventionally named
+/// controller or module file to fall back on.
+#[test]
+fn nestjs_detects_via_an_app_package_json() {
+    let ctx = MockContext::default()
+        .with_file(
+            "package.json",
+            r#"{"private":true,"workspaces":["apps/*"]}"#,
+        )
+        .with_file(
+            "apps/api/package.json",
+            r#"{"dependencies":{"@nestjs/core":"10"}}"#,
+        )
+        .with_file("apps/api/src/main.ts", "bootstrap();");
     assert!(nestjs::NestjsResolver.detect(&ctx));
 }
 

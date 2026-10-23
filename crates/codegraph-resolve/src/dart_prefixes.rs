@@ -41,11 +41,13 @@ pub(crate) fn match_dart_prefixed_call(
         return None;
     }
     let found = dart_prefixed_decls(prefix, name, &reference.file_path, context);
-    Some((found.len() == 1).then(|| ResolvedRef {
-        original: reference.clone(),
-        target_node_id: found[0].id.clone(),
-        confidence: 0.9,
-        resolved_by: ResolvedBy::Import,
+    Some((found.len() == 1).then(|| {
+        ResolvedRef::new(
+            reference.clone(),
+            found[0].id.clone(),
+            0.9,
+            ResolvedBy::Import,
+        )
     }))
 }
 

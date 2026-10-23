@@ -40,12 +40,10 @@ impl FrameworkResolver for ReactResolver {
 
     // Ports reactResolver.detect (react.ts:14-32).
     fn detect(&self, context: &dyn ResolutionContext) -> bool {
-        if let Some(package_json) = context.read_file("package.json") {
-            if let Ok(pkg) = serde_json::from_str::<serde_json::Value>(&package_json) {
-                if dep_present(&pkg, &["react", "next", "react-native"]) {
-                    return true;
-                }
-            }
+        // React in a package.json: the root's, or an app's (`frontend/`,
+        // `apps/web/`, `src/Web/ClientApp/`).
+        if super::package_deps::depends_on(context, &["react", "next", "react-native"]) {
+            return true;
         }
         context
             .get_all_files_shared()
@@ -266,16 +264,6 @@ impl FrameworkResolver for ReactResolver {
     }
 }
 
-/// `{ ...dependencies, ...devDependencies }` membership test (react.ts:20-21).
-fn dep_present(pkg: &serde_json::Value, keys: &[&str]) -> bool {
-    let in_section = |section: &str| -> bool {
-        pkg.get(section)
-            .and_then(|d| d.as_object())
-            .is_some_and(|deps| keys.iter().any(|k| deps.contains_key(*k)))
-    };
-    in_section("dependencies") || in_section("devDependencies")
-}
-
 /// Build a `references` ref linking a route node to its handler component
 /// (react.ts:188-196 / 229-237).
 fn route_reference(
@@ -300,12 +288,12 @@ fn route_reference(
 }
 
 fn framework_resolved(reference: &RefView, target_node_id: String, confidence: f64) -> ResolvedRef {
-    ResolvedRef {
-        original: reference.clone(),
+    ResolvedRef::new(
+        reference.clone(),
         target_node_id,
         confidence,
-        resolved_by: ResolvedBy::Framework,
-    }
+        ResolvedBy::Framework,
+    )
 }
 
 /// `isPascalCase` (react.ts:274-276).

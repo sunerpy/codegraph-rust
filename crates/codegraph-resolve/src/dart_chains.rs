@@ -1835,12 +1835,12 @@ fn match_link(
         }
     }
     let (target_node_id, resolved_by) = chosen.flatten()?;
-    Some(ResolvedRef {
-        original: reference.clone(),
+    Some(ResolvedRef::new(
+        reference.clone(),
         target_node_id,
-        confidence: 0.85,
+        0.85,
         resolved_by,
-    })
+    ))
 }
 
 /// Whether a constructor call written at `column` of 1-based `line` names

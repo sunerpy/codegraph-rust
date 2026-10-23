@@ -25,7 +25,7 @@
 
 use crate::frameworks::godot_dsl_config::GodotDslConfig;
 use crate::types::{FrameworkResolverExtractionResult, RefView, ResolutionContext, ResolvedRef};
-use codegraph_core::types::Language;
+use codegraph_core::types::{Language, Node, NodeKind};
 use std::sync::Arc;
 
 /// The per-project inputs a [`FrameworkResolver::extract`] pass may need beyond
@@ -102,6 +102,18 @@ pub trait FrameworkResolver: Sync {
         self.languages()
     }
 
+    /// Packages an app declares when it is built on this framework
+    /// (`appDependencies?`, upstream #2129). When some manifest in the project
+    /// declares one of them, [`Self::extract`] runs only on files of an app
+    /// whose `package.json` (the file's directory's or an enclosing one's)
+    /// declares one: in a monorepo with an Expo app beside a Next.js app, Expo
+    /// Router must not read the Next app's `app/layout.tsx` as a screen. When
+    /// no manifest declares any, detection found the framework by other
+    /// evidence and the extractor runs on every file.
+    fn app_dependencies(&self) -> Option<&'static [&'static str]> {
+        None
+    }
+
     /// Detect whether the project uses this `FrameworkResolver`'s target — called
     /// once at startup (`detect`, `types.ts:163`).
     fn detect(&self, context: &dyn ResolutionContext) -> bool;
@@ -154,6 +166,58 @@ pub trait FrameworkResolver: Sync {
     ) -> Option<Vec<codegraph_core::types::Node>> {
         None
     }
+
+    /// Nodes no single file's [`Self::extract`] can decide on
+    /// (`crossFileNodes?`, upstream #2400): a route table written in one file
+    /// is a table of routes only because another file hands it to the
+    /// router. It returns the COMPLETE set the framework wants now, so a pass
+    /// after [`Self::post_extract`] can insert the new ones with their
+    /// references, remove the ones no longer wanted, rename the ones whose
+    /// name changed and leave the rest, whose edges then survive. `None` when
+    /// the resolver makes no such nodes, as every registered resolver does so
+    /// far: neither an index nor a sync calls it yet.
+    fn cross_file_nodes(&self, _context: &dyn ResolutionContext) -> Option<CrossFileNodes> {
+        None
+    }
+
+    /// The navigation calls this resolver's [`Self::resolve`] binds to its
+    /// route nodes (`navigation?`, upstream #2425). A navigation call names
+    /// its route by path and its reference by the router's method, so a call
+    /// parked while its route was missing, or bound to the best route then,
+    /// is invisible to a sync's retry by name tail; this says which calls a
+    /// changed route may answer, so a sync can put them back. `None` when the
+    /// resolver binds no navigation, as every registered resolver does so
+    /// far: no sync calls it yet.
+    fn navigation(&self) -> Option<&dyn NavigationCalls> {
+        None
+    }
+}
+
+/// The nodes a [`FrameworkResolver::cross_file_nodes`] pass wants now
+/// (upstream `CrossFileNodes`).
+pub struct CrossFileNodes {
+    /// The nodes and the references that link them, as an extraction returns
+    /// them.
+    pub extraction: FrameworkResolverExtractionResult,
+    /// The kind every one of these nodes has.
+    pub kind: NodeKind,
+    /// True for a node this pass produces, and for no node extraction does.
+    pub owns: fn(&Node) -> bool,
+}
+
+/// The navigation calls a router binds to its routes — `navigate('/login')`,
+/// `router.push('/x')` — described so a sync can find the ones a changed
+/// route may answer (upstream `NavigationCalls`).
+pub trait NavigationCalls: Sync {
+    /// The name tails of the calls the resolver accepts as navigation (`push`
+    /// for `history.push`), which find them among the parked references; the
+    /// resolver then decides on the whole name.
+    fn tails(&self) -> &[&str];
+
+    /// The files whose navigation calls can name `route`: the path prefixes
+    /// of the apps whose table it is in (`""` for every file), or `None` when
+    /// it is not one of this router's routes.
+    fn scope(&self, route: &Node, context: &dyn ResolutionContext) -> Option<Vec<String>>;
 }
 
 #[cfg(test)]

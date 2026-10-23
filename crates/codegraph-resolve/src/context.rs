@@ -65,6 +65,8 @@ struct Caches {
     /// Each directory's package.json / Deno import-map scope for the pass.
     manifest_scopes: HashMap<String, Arc<ManifestScope>>,
     all_files: Option<Arc<Vec<String>>>,
+    /// The dependency names the project's manifests declare, for the pass.
+    declared_dependencies: Option<Arc<std::collections::BTreeSet<String>>>,
     files_by_basename: Option<HashMap<String, Arc<Vec<String>>>>,
     /// Existence answers for the pass: import resolution probes every extension
     /// of a specifier from every importing file, and neither the borrowed store
@@ -139,6 +141,7 @@ impl Caches {
             workspace_packages: None,
             manifest_scopes: HashMap::new(),
             all_files: None,
+            declared_dependencies: None,
             files_by_basename: None,
             file_exists: HashMap::new(),
             python_write_index: None,
@@ -436,6 +439,15 @@ impl ResolutionContext for StoreResolutionContext<'_> {
 
     fn get_all_files_shared(&self) -> Arc<Vec<String>> {
         self.cached_all_files()
+    }
+
+    fn declared_dependencies(&self) -> Arc<std::collections::BTreeSet<String>> {
+        if let Some(names) = self.caches.borrow().declared_dependencies.clone() {
+            return names;
+        }
+        let names = Arc::new(crate::frameworks::package_deps::declared_dependencies(self));
+        self.caches.borrow_mut().declared_dependencies = Some(names.clone());
+        names
     }
 
     fn get_files_by_basename_shared(&self, basename: &str) -> Arc<Vec<String>> {

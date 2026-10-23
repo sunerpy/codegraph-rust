@@ -88,6 +88,6 @@ pub use name_matcher::CASE_INSENSITIVE_LANGUAGES;
 pub use resolver::{ReferenceResolver, ResolutionObservation};
 pub use snapshot_context::{EdgeAdjacency, SnapshotResolutionContext, build_edge_adjacency};
 pub use types::{
-    FrameworkResolverExtractionResult, ImportMapping, ReExport, RefView, ResolutionContext,
-    ResolutionResult, ResolutionStats, ResolvedBy, ResolvedRef,
+    AlsoTarget, EdgeShape, FrameworkResolverExtractionResult, ImportMapping, ReExport, RefView,
+    ResolutionContext, ResolutionResult, ResolutionStats, ResolvedBy, ResolvedRef,
 };

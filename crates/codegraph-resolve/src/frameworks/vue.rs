@@ -265,21 +265,21 @@ fn declares_own_function(reference: &RefView, context: &dyn ResolutionContext) -
 }
 
 fn self_resolved(reference: &RefView, confidence: f64) -> ResolvedRef {
-    ResolvedRef {
-        original: reference.clone(),
-        target_node_id: reference.from_node_id.clone(),
+    ResolvedRef::new(
+        reference.clone(),
+        reference.from_node_id.clone(),
         confidence,
-        resolved_by: ResolvedBy::Framework,
-    }
+        ResolvedBy::Framework,
+    )
 }
 
 fn framework_resolved(reference: &RefView, target_node_id: String, confidence: f64) -> ResolvedRef {
-    ResolvedRef {
-        original: reference.clone(),
+    ResolvedRef::new(
+        reference.clone(),
         target_node_id,
         confidence,
-        resolved_by: ResolvedBy::Framework,
-    }
+        ResolvedBy::Framework,
+    )
 }
 
 /// Resolve an `@/` or `~/` alias path through the extension list to a node in

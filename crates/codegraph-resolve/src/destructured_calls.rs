@@ -274,12 +274,12 @@ fn destructured_call_target(
         .iter()
         .find(|n| n.kind == NodeKind::Function)
         .or_else(|| pool.first())?;
-    Some(ResolvedRef {
-        original: reference.clone(),
-        target_node_id: target.id.clone(),
-        confidence: 0.85,
-        resolved_by: ResolvedBy::InstanceMethod,
-    })
+    Some(ResolvedRef::new(
+        reference.clone(),
+        target.id.clone(),
+        0.85,
+        ResolvedBy::InstanceMethod,
+    ))
 }
 
 #[cfg(test)]

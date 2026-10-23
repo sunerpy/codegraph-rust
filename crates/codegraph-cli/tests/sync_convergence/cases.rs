@@ -10138,6 +10138,59 @@ pub fn typescript_react_dependency_leaves_package_json() -> Case {
         .edge_after("function page", "calls", "function useCart")
 }
 
+/// Upstream #2395: React coming into an app's manifest rather than the
+/// root's detects React as the root's does
+/// ([`typescript_react_dependency_appears_in_package_json`]).
+pub fn typescript_react_dependency_appears_in_an_app_package_json() -> Case {
+    Case::new(Change::ControlFile, &[Language::TypeScript])
+        .file("package.json", "{\"name\":\"mono\",\"private\":true}\n")
+        .file(
+            "apps/web/package.json",
+            "{\"name\":\"web\",\"dependencies\":{\"left-pad\":\"1.3.0\"}}\n",
+        )
+        .file(
+            "apps/web/src/hooks.ts",
+            "export function useCart(): number {\n  return 1;\n}\n",
+        )
+        .file(
+            "apps/web/src/page.ts",
+            "export function page(): number {\n  return useCart();\n}\n",
+        )
+        .write(
+            "apps/web/package.json",
+            "{\"name\":\"web\",\"dependencies\":{\"left-pad\":\"1.3.0\",\"react\":\"18.2.0\"}}\n",
+        )
+        .edge_before("function page", "calls", "function useCart")
+        .edge_after(
+            "function page",
+            "calls",
+            "function apps/web/src/hooks.ts::useCart",
+        )
+}
+
+/// Upstream #2395: detection reads a manifest one directory down whatever is
+/// indexed below it, so React declared in `frontend/package.json` beside
+/// only a Python build script detects React on the next sync too.
+pub fn typescript_react_dependency_appears_above_no_script() -> Case {
+    Case::new(Change::ControlFile, &[Language::TypeScript])
+        .file("package.json", "{\"name\":\"web\",\"private\":true}\n")
+        .file("frontend/build.py", "def build():\n    return 1\n")
+        .file(
+            "src/hooks.ts",
+            "export function useCart(): number {\n  return 1;\n}\n",
+        )
+        .file(
+            "src/page.ts",
+            "export function page(): number {\n  return useCart();\n}\n",
+        )
+        .write(
+            "frontend/package.json",
+            "{\"name\":\"assets\",\"devDependencies\":{\"react\":\"18.2.0\"}}\n",
+        )
+        .edge_before("function page", "calls", "function useCart")
+        .edge_after("function page", "calls", "function src/hooks.ts::useCart")
+}
+
 /// W5-06: a package the manifest comes to declare is outside the project,
 /// so the import of its binding no longer reaches a project class by name.
 pub fn typescript_declared_dependency_makes_a_bare_import_external() -> Case {

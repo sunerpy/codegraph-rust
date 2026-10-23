@@ -54,9 +54,10 @@ pub fn is_flow_callable(kind: NodeKind) -> bool {
     )
 }
 
-/// Edge kinds a flow may ride (`navigates` has no Rust edge kind yet).
+/// Edge kinds a flow may ride (`FLOW_EDGE_KINDS`): a call, and a
+/// navigation to the screen a route renders.
 fn is_flow_edge(kind: EdgeKind) -> bool {
-    kind == EdgeKind::Calls
+    matches!(kind, EdgeKind::Calls | EdgeKind::Navigates)
 }
 
 /// Non-callable kinds a SYNTHESIZED edge may end at (an RTK thunk is a constant).

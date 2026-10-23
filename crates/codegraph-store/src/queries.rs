@@ -2940,6 +2940,7 @@ fn edge_kind_named(value: &str) -> Option<EdgeKind> {
         "instantiates" => EdgeKind::Instantiates,
         "overrides" => EdgeKind::Overrides,
         "decorates" => EdgeKind::Decorates,
+        "navigates" => EdgeKind::Navigates,
         _ => return None,
     };
     Some(kind)
@@ -3884,6 +3885,31 @@ mod tests {
             col: None,
             provenance: None,
         }
+    }
+
+    /// Every edge kind, `navigates` included, reads back as the kind written:
+    /// the parser and `EdgeKind::ALL` stay in step.
+    #[test]
+    fn every_edge_kind_reads_back_as_written() {
+        let mut store = store("edge-kinds");
+        let a = node("function:a", "alpha", "src/a.rs");
+        let b = node("function:b", "beta", "src/b.rs");
+        store.upsert_nodes(&[a, b]).unwrap();
+        let written: Vec<Edge> = EdgeKind::ALL
+            .into_iter()
+            .map(|kind| edge("function:a", "function:b", kind))
+            .collect();
+        store.insert_edges(&written).unwrap();
+        let mut read: Vec<&'static str> = store
+            .all_edges()
+            .unwrap()
+            .into_iter()
+            .map(|edge| edge.kind.as_str())
+            .collect();
+        read.sort_unstable();
+        let mut expected = EdgeKind::ALL.map(EdgeKind::as_str).to_vec();
+        expected.sort_unstable();
+        assert_eq!(read, expected);
     }
 
     #[test]
