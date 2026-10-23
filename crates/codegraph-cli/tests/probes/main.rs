@@ -18798,4 +18798,271 @@ mod frameworks {
         assert_eq!(direct.len(), 1, "{}", graph.report());
         assert_eq!(direct[0].metadata.get("framework"), None);
     }
+
+    /// The kinds of every node named `name`, in order.
+    fn kinds_of(graph: &super::support::Graph, name: &str) -> Vec<String> {
+        let mut kinds: Vec<String> = graph
+            .nodes
+            .iter()
+            .filter(|node| node.name == name)
+            .map(|node| node.kind.clone())
+            .collect();
+        kinds.sort();
+        kinds
+    }
+
+    /// Upstream #841 and #2429: a const a wrapper declares as a component —
+    /// `forwardRef`, `memo`, `styled.x\`…\``, `styled(Base)\`…\``, typed or not
+    /// — is a `component` node, whose inline render function's calls are its
+    /// own; a lowercase memo, another template tag, a comparison and any
+    /// other initializer stay constants.
+    #[test]
+    fn pr0841_a_wrapper_declared_component_is_a_component() {
+        let project = Project::new()
+            .file("package.json", "{\"dependencies\":{\"react\":\"^18.0.0\"}}\n")
+            .file(
+                "ui.tsx",
+                "import * as React from 'react';\nimport styled from 'styled-components';\nexport const Button = React.forwardRef<HTMLButtonElement, {}>((props, ref) => <button ref={ref} {...props} />);\nexport const Bare = forwardRef((props, ref) => <span ref={ref} />);\nexport const Card = memo((props: { t: string }) => <div>{props.t}</div>);\nexport const Named = memo(function Named(props: { t: string }) { return <div>{props.t}</div>; });\nexport const Boxed = styled.div`color: red;`;\nexport const Wrapped = styled(Button)`padding: 4px;`;\nexport const Rewrapped = memo(Button);\n",
+            )
+            .file(
+                "typed.tsx",
+                "import styled from 'styled-components';\ntype WrapperProps = { active: boolean };\ntype Props = { align: 'start' | 'end' };\nconst Plain = styled.div`color: red;`;\nexport const Wrapper = styled.div<WrapperProps>`\n  color: ${(props) => (props.active ? 'red' : 'blue')};\n`;\nconst Background = styled.div<{ align: Props[\"align\"] }>`color: red;`;\nconst Content = styled(Plain)<WrapperProps>`padding: 4px;`;\nconst NudeButton = styled(Plain).attrs((props: Props) => ({ type: \"button\" }))<Props>`width: 24px;`;\nconst Either = styled.div<WrapperProps | Props>`color: red;`;\nconst Both = styled.span<WrapperProps & { open: boolean }>`color: red;`;\nconst Nested = styled.div<Partial<WrapperProps>>`color: red;`;\nconst Deeper = styled.div<Partial<Record<string, WrapperProps>>>`color: red;`;\n",
+            )
+            .file(
+                "tags.tsx",
+                "import styled, { css, keyframes } from 'styled-components';\ntype Props = { open: boolean };\nexport const Mixin = css<Props>`color: red;`;\nexport const Fade = keyframes<Props>`from { opacity: 0; }`;\nexport const Styledish = styledLike<Props>`color: red;`;\nexport const Compared = styled.length < LIMIT > 2;\nexport const Untagged = styled.div < Props > other;\nconst lowerCase = styled.div<Props>`color: red;`;\nconst cache = memo(expensiveFn);\nexport const Config = loadConfig();\nexport const Theme = { color: 'red' };\n",
+            )
+            .file(
+                "widget.tsx",
+                "import * as React from 'react';\nfunction useThing() { return 1; }\nexport const Widget = React.forwardRef((props, ref) => {\n  const v = useThing();\n  return <div ref={ref}>{v}</div>;\n});\n",
+            )
+            .index();
+        let graph = project.graph();
+        for name in [
+            "Button",
+            "Bare",
+            "Card",
+            "Named",
+            "Boxed",
+            "Wrapped",
+            "Rewrapped",
+            "Plain",
+            "Wrapper",
+            "Background",
+            "Content",
+            "NudeButton",
+            "Either",
+            "Both",
+            "Nested",
+            "Deeper",
+            "Widget",
+        ] {
+            assert_eq!(
+                kinds_of(graph, name),
+                ["component"],
+                "{name}\n{}",
+                graph.report()
+            );
+        }
+        for name in [
+            "Mixin",
+            "Fade",
+            "Styledish",
+            "Compared",
+            "Untagged",
+            "lowerCase",
+            "cache",
+            "Config",
+            "Theme",
+        ] {
+            assert_eq!(
+                kinds_of(graph, name),
+                ["constant"],
+                "{name}\n{}",
+                graph.report()
+            );
+        }
+        // The render function's call is the component's.
+        graph.assert_edge("component Widget", "calls", "function useThing", None);
+    }
+
+    /// Upstream #841: the React resolver reads `.tsx`/`.jsx` files for routes,
+    /// and only for routes: a `<Route>` there is a route node rendering its
+    /// element, and a hook is one tree-sitter `function` node, never a second
+    /// one from a regex.
+    #[test]
+    fn pr0841_routes_in_jsx_files_and_one_node_per_hook() {
+        let project = Project::new()
+            .file(
+                "package.json",
+                "{\"dependencies\":{\"react\":\"^18.0.0\",\"react-router-dom\":\"^6.0.0\"}}\n",
+            )
+            .file(
+                "src/App.tsx",
+                "import { Routes, Route } from 'react-router-dom';\nimport { Home } from './Home';\nexport function App() {\n  return (\n    <Routes>\n      <Route path=\"/home\" element={<Home />} />\n    </Routes>\n  );\n}\n",
+            )
+            .file("src/Home.tsx", "export function Home() {\n  return <h1 />;\n}\n")
+            .file("src/hooks/useAuth.ts", "export function useAuth() {\n  return null;\n}\n")
+            .file("src/Card.jsx", "export const Card = () => <div />;\n")
+            .index();
+        let graph = project.graph();
+        graph.assert_edge(
+            "route src/App.tsx::route:/home",
+            "references",
+            "function Home",
+            None,
+        );
+        assert_eq!(
+            kinds_of(graph, "useAuth"),
+            ["function"],
+            "{}",
+            graph.report()
+        );
+        assert_eq!(kinds_of(graph, "Card"), ["function"], "{}", graph.report());
+    }
+
+    /// Upstream #2120 (React half) and #2475: a component, hook or context the
+    /// file imports is the import's — a declared package's (`antd`'s
+    /// `<Button>`, `@tanstack/react-query`'s `useQuery`) renders no project
+    /// namesake, even through a bare call — and a hook nested inside another
+    /// function is never a target.
+    #[test]
+    fn pr2475_an_imported_tag_or_hook_is_the_imports() {
+        let project = Project::new()
+            .file(
+                "package.json",
+                "{\"name\":\"app\",\"dependencies\":{\"antd\":\"^5.0.0\",\"@mui/material\":\"^5.0.0\",\"react-router-dom\":\"^6.0.0\",\"@tanstack/react-query\":\"^5.0.0\",\"react\":\"^18.0.0\"}}\n",
+            )
+            .file(
+                "src/Page.tsx",
+                "import { Button } from 'antd';\nimport Typography from '@mui/material/Typography';\nimport { Link } from 'react-router-dom';\nexport function Page() {\n  return <div><Button /><Typography /><Link /></div>;\n}\n",
+            )
+            .file(
+                "src/styles.tsx",
+                "export function Button() { return null; }\nexport function Typography() { return null; }\nexport function Link() { return null; }\n",
+            )
+            .file(
+                "src/Calls.tsx",
+                "import { Button } from 'antd';\nexport function Calls() {\n  Button();\n  return null;\n}\n",
+            )
+            .file(
+                "src/factory.ts",
+                "export function createHooks() {\n  function useQuery() {\n    return 1;\n  }\n  return { useQuery };\n}\n",
+            )
+            .file(
+                "src/list.test.tsx",
+                "import { useQuery } from '@tanstack/react-query';\nexport function useList() {\n  return useQuery();\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        for (source, kind, name) in [
+            ("function Page", "references", "Button"),
+            ("function Page", "references", "Typography"),
+            ("function Page", "references", "Link"),
+            ("function Calls", "calls", "Button"),
+        ] {
+            graph.assert_no_edge(source, kind, &format!("function {name} @src/styles.tsx"));
+        }
+        graph.assert_no_edge(
+            "function useList",
+            "calls",
+            "function createHooks::useQuery",
+        );
+    }
+
+    /// Upstream #2240: in a JS/TS module another file's hook or context is
+    /// reached only through an import, never by name: trpc's adapter's
+    /// option `createContext?.(…)` is no example app's `createContext`, and
+    /// one app's `useUser()` no other app's hook. An optional call `f?.()` is
+    /// a bare call, so no class member is its target either.
+    #[test]
+    fn pr2240_hooks_and_contexts_by_name_are_the_files_own() {
+        let project = Project::new()
+            .file(
+                "package.json",
+                "{\"name\":\"trpc\",\"private\":true,\"dependencies\":{\"react\":\"^18.0.0\"}}\n",
+            )
+            .file(
+                "examples/next-app/src/server/context.ts",
+                "export async function createContext() {\n  return {};\n}\n",
+            )
+            .file(
+                "apps/nextjs-app/src/lib/auth.tsx",
+                "export function useUser() {\n  return null;\n}\n",
+            )
+            .file(
+                "packages/server/src/adapters/ws.ts",
+                "export function getHandler(opts: any) {\n  const { createContext } = opts;\n  return createContext?.({});\n}\n",
+            )
+            .file(
+                "apps/react-vite/src/lib/auth.tsx",
+                "const { useUser } = configureAuth({});\n\nexport function AuthLoader() {\n  const user = useUser();\n  return user;\n}\n",
+            )
+            .file(
+                "apps/react-vite/src/lib/session.tsx",
+                "function useSession() {\n  return null;\n}\n\nexport function SessionLoader() {\n  return useSession();\n}\n",
+            )
+            .file("src/box.ts", "export class Box {\n  refresh() {\n    return 1;\n  }\n}\n")
+            .file("src/tick.ts", "export function tick() {\n  refresh?.();\n}\n")
+            .index();
+        let graph = project.graph();
+        graph.assert_no_edge("function getHandler", "calls", "function createContext");
+        graph.assert_no_edge("function AuthLoader", "calls", "function useUser");
+        graph.assert_no_edge("function tick", "calls", "method Box::refresh");
+        // The file's own hook still resolves.
+        graph.assert_edge(
+            "function SessionLoader",
+            "calls",
+            "function useSession",
+            None,
+        );
+    }
+
+    /// Upstream #2420 (wrapper half): a PascalCase name a `.tsx` file
+    /// declares as a module-level value is that declaration wherever the
+    /// file uses it — the function it wraps (`observer(function X() {…})`,
+    /// `forwardRef(Inner) as …`, `observer(Inner)`), else the declaration —
+    /// never another app's same-named component. The lazy loader half is
+    /// W7-09's.
+    #[test]
+    fn pr2420_a_value_the_file_declares_is_what_its_jsx_renders() {
+        let project = Project::new()
+            .file("package.json", "{\"name\":\"app\",\"dependencies\":{\"react\":\"^18\",\"mobx-react\":\"^7\"}}\n")
+            .file(
+                "src/app/App.tsx",
+                "import { forwardRef } from 'react';\nimport { observer } from 'mobx-react';\nconst Panel = observer(function PanelInner() { return <div />; });\nfunction Inner() { return <span />; }\nconst Item = forwardRef(Inner) as any;\nconst Table = observer(TableInner);\nfunction TableInner() { return <table />; }\nconst Config = makeConfig();\nexport function App() {\n  return <div><Panel /><Item /><Table /><Config /></div>;\n}\n",
+            )
+            .file(
+                "src/other/Home.tsx",
+                "export function Panel() { return <div />; }\nexport function Item() { return <div />; }\nexport function Table() { return <div />; }\nexport function Config() { return <div />; }\n",
+            )
+            .index();
+        let graph = project.graph();
+        graph.assert_edge(
+            "function App",
+            "references",
+            "function Panel::PanelInner",
+            Some("framework"),
+        );
+        graph.assert_edge(
+            "function App",
+            "references",
+            "function Inner",
+            Some("framework"),
+        );
+        graph.assert_edge(
+            "function App",
+            "references",
+            "function TableInner",
+            Some("framework"),
+        );
+        graph.assert_edge("function App", "references", "constant Config", None);
+        for name in ["Panel", "Item", "Table", "Config"] {
+            graph.assert_no_edge(
+                "function App",
+                "references",
+                &format!("function {name} @src/other/Home.tsx"),
+            );
+        }
+    }
 }

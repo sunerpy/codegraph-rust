@@ -48,6 +48,18 @@
     "target": "file:apps/react-router/src/pages/Layout.tsx"
   },
   {
+    "col": 0,
+    "kind": "references",
+    "line": 7,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "route:apps/react-router/src/main.tsx:7:/",
+    "target": "function:c863eb857f02e69680c9e47dace356b9"
+  },
+  {
     "col": 13,
     "kind": "references",
     "line": 4,

@@ -1292,8 +1292,8 @@ fn is_ascii_word_char(ch: char) -> bool {
 /// v1.6.1). The extractor emits `this.m()` and `pkg.F().M()` under the bare
 /// member name, so the receiver is read back from the call site's own line:
 /// the text at the ref's column must start with the name, be followed by a
-/// call opener, and be preceded by nothing, an operator/opener, or one of
-/// [`BARE_CALL_KEYWORDS`].
+/// call opener (`(`, `<`, or an optional call's `?.(`), and be preceded by
+/// nothing, an operator/opener, or one of [`BARE_CALL_KEYWORDS`].
 ///
 /// Unlike upstream, the opener may sit on a following line: JavaScript's
 /// automatic semicolon insertion never splits `finish\n()`, so that is a real
@@ -1322,6 +1322,10 @@ fn is_receiver_less_call(reference: &RefView, context: &dyn ResolutionContext) -
     };
     let after =
         facts.source()[line_start + column + name.len()..].trim_start_matches(char::is_whitespace);
+    // An optional call's `?.(` opens a call too (upstream #2240).
+    let after = after
+        .strip_prefix("?.")
+        .map_or(after, |rest| rest.trim_start_matches(char::is_whitespace));
     if !after.starts_with('(') && !after.starts_with('<') {
         return false;
     }

@@ -17,6 +17,7 @@ pub(crate) mod godot_project;
 pub(crate) mod godot_resource;
 pub(crate) mod godot_scene;
 pub mod godot_script;
+pub(crate) mod js_scan;
 pub mod nestjs;
 pub mod package_deps;
 pub mod react;

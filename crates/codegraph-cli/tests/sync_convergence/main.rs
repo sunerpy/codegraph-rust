@@ -846,6 +846,8 @@ matrix! {
     javascript_global_namespace_member_renamed,
     javascript_object_literal_this_call_body_edit,
     tsx_tag_becomes_a_parameter_body_edit,
+    tsx_route_element_body_edit,
+    tsx_wrapper_value_body_edit,
     typescript_interface_moves_into_a_declare_module_body,
     vue_options_api_this_call_body_edit,
     vue_template_call_reaches_an_added_composable,

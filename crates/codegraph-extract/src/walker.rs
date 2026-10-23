@@ -4300,6 +4300,30 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
                     .collect::<String>();
                 format!("= {}{}", init, if init.len() >= 100 { "..." } else { "" })
             });
+            // A React component declared through a wrapper whose result is a
+            // component (`forwardRef`/`memo`/`styled`, upstream #841 and
+            // #2429). The initializer is a call or a tagged template, not a
+            // bare arrow, so the const would otherwise be a constant, which
+            // component resolution skips: `<Button/>` would bind another
+            // file's namesake or nothing. PascalCase-gated, so a memoized
+            // helper (`const cache = memo(fn)`) stays a constant.
+            if let Some(value) = value_node
+                && name.starts_with(|c: char| c.is_ascii_uppercase())
+                && let Some(render) = self.react_component_hoc(value)
+            {
+                self.extract_react_component(
+                    &name,
+                    child,
+                    render,
+                    NodeExtra {
+                        docstring: docstring.clone(),
+                        signature,
+                        is_exported,
+                        ..NodeExtra::default()
+                    },
+                );
+                continue;
+            }
             let declared_id = self
                 .create_node(
                     kind,
@@ -4379,6 +4403,102 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
                 }
             }
         }
+    }
+
+    /// Whether `value` declares a React component through a wrapper whose
+    /// result is one (upstream `reactComponentHoc`, #841): `forwardRef(…)`,
+    /// `memo(…)`, `React.forwardRef(…)`, `React.memo(…)`, and styled-components
+    /// or emotion's `styled.tag\`…\`` and `styled(Base)\`…\``, typed
+    /// (`styled.tag<Props>\`…\``, #2429) or not. `Some` holds the inline render
+    /// function, the first arrow or function expression among the wrapper's
+    /// arguments, when there is one (`memo(Imported)` and a styled template
+    /// have none); `None` for any other initializer.
+    fn react_component_hoc(&self, value: SyntaxNode<'tree>) -> Option<Option<SyntaxNode<'tree>>> {
+        if self.is_typed_styled_template(value) {
+            return Some(None);
+        }
+        if value.kind() != "call_expression" {
+            return None;
+        }
+        let callee = node_text(child_by_field(value, "function")?, self.source);
+        // tree-sitter reads a tagged template as a call whose callee is its
+        // tag: `styled.button` or `styled(Base)`, never `styledFoo`.
+        if starts_with_word(&callee, "styled") {
+            return Some(None);
+        }
+        if !matches!(
+            callee.as_str(),
+            "forwardRef" | "memo" | "React.forwardRef" | "React.memo"
+        ) {
+            return None;
+        }
+        let render = child_by_field(value, "arguments").and_then(|arguments| {
+            (0..arguments.named_child_count())
+                .filter_map(|i| arguments.named_child(i as u32))
+                .find(|argument| {
+                    matches!(argument.kind(), "arrow_function" | "function_expression")
+                })
+        });
+        Some(render)
+    }
+
+    /// A styled tag with type arguments, `styled.div<Props>\`…\`` or
+    /// `styled(Base)<Props>\`…\`` (upstream `isTypedStyledTemplate`, #2429).
+    /// tree-sitter's tagged-template call takes no type arguments, so one that
+    /// also reads as an expression turns the initializer into comparisons,
+    /// `(styled.div < Props) > \`…\``: the tag is the leftmost operand, against
+    /// a `<`, and the template the rightmost, against a `>` (`>>` when the type
+    /// argument ends in its own `<…>`). The operators in between are the type
+    /// argument's: `<A & B>` is `(styled.div < A) & (B > \`…\`)`.
+    fn is_typed_styled_template(&self, value: SyntaxNode<'tree>) -> bool {
+        if value.kind() != "binary_expression" {
+            return false;
+        }
+        let mut tag_parent = value;
+        let mut tag = child_by_field(value, "left");
+        while let Some(inner) = tag.filter(|node| node.kind() == "binary_expression") {
+            tag_parent = inner;
+            tag = child_by_field(inner, "left");
+        }
+        let mut template_parent = value;
+        let mut template = child_by_field(value, "right");
+        while let Some(inner) = template.filter(|node| node.kind() == "binary_expression") {
+            template_parent = inner;
+            template = child_by_field(inner, "right");
+        }
+        let (Some(tag), Some(template)) = (tag, template) else {
+            return false;
+        };
+        template.kind() == "template_string"
+            && child_by_field(tag_parent, "operator").is_some_and(|op| op.kind() == "<")
+            && child_by_field(template_parent, "operator")
+                .is_some_and(|op| !op.kind().is_empty() && op.kind().bytes().all(|b| b == b'>'))
+            && starts_with_word(&node_text(tag, self.source), "styled")
+    }
+
+    /// The `component` node of a wrapper-declared React component (see
+    /// [`Self::react_component_hoc`]), named by the declarator and spanning
+    /// it. An inline render function's body is walked with the component on
+    /// the stack, so its calls (hooks, helpers) are the component's, as a
+    /// plain `const Foo = () => …` component's are.
+    fn extract_react_component(
+        &mut self,
+        name: &str,
+        declarator: SyntaxNode<'tree>,
+        render: Option<SyntaxNode<'tree>>,
+        extra: NodeExtra,
+    ) {
+        let Some(component) = self.create_node(NodeKind::Component, name, declarator, extra) else {
+            return;
+        };
+        let Some(render) = render else {
+            return;
+        };
+        self.node_stack.push(component.id);
+        if let Some(body) = self.resolve_body(render) {
+            self.visit_function_body(body);
+        }
+        self.node_stack.pop();
     }
 
     /// A top-level binding exported by a LATER statement rather than at its
@@ -8396,6 +8516,17 @@ fn function_returned_object(function: SyntaxNode<'_>) -> Option<SyntaxNode<'_>> 
                 .into_iter()
                 .find_map(as_object)
         })
+}
+
+/// Whether `text` starts with the word `word`: what follows is no ASCII word
+/// character (a JavaScript `^word\b`).
+fn starts_with_word(text: &str, word: &str) -> bool {
+    text.strip_prefix(word).is_some_and(|rest| {
+        !rest
+            .bytes()
+            .next()
+            .is_some_and(|b| b.is_ascii_alphanumeric() || b == b'_')
+    })
 }
 
 /// Whether an object literal declares an inline function member — an action

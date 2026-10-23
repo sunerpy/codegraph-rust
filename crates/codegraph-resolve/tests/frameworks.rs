@@ -245,26 +245,35 @@ fn react_does_not_resolve_component_from_plain_ts_file() {
 }
 
 #[test]
-fn react_resolves_hook_preferring_hooks_dir() {
+fn react_resolves_only_the_files_own_hook() {
     let hook = node(
-        "hook:src/hooks/useAuth.ts:useAuth:1",
+        "function:src/hooks/useAuth.ts:useAuth:1",
         NodeKind::Function,
         "useAuth",
         "src/hooks/useAuth.ts",
         Language::TypeScript,
     );
     let ctx = MockContext::default().with_node(hook.clone());
+    // In a JS/TS module another file's hook comes through an import (the
+    // import resolver's), never by name: Page.tsx imports nothing here
+    // (upstream #2240).
     let reference = ref_view("useAuth", EdgeKind::Calls, "src/Page.tsx", Language::Tsx);
-    let resolved = react::ReactResolver
-        .resolve(&reference, &ctx)
-        .expect("resolves");
+    assert!(react::ReactResolver.resolve(&reference, &ctx).is_none());
+    // The file's own hook resolves.
+    let own = ref_view(
+        "useAuth",
+        EdgeKind::Calls,
+        "src/hooks/useAuth.ts",
+        Language::TypeScript,
+    );
+    let resolved = react::ReactResolver.resolve(&own, &ctx).expect("resolves");
     assert_eq!(resolved.target_node_id, hook.id);
     assert_eq!(resolved.confidence, 0.85);
     assert_eq!(resolved.resolved_by, ResolvedBy::Framework);
 }
 
 #[test]
-fn react_resolves_context() {
+fn react_resolves_only_the_files_own_context() {
     let ctx_node = node(
         "variable:src/context/AuthContext.tsx:AuthContext:1",
         NodeKind::Variable,
@@ -279,9 +288,14 @@ fn react_resolves_context() {
         "src/App.tsx",
         Language::Tsx,
     );
-    let resolved = react::ReactResolver
-        .resolve(&reference, &ctx)
-        .expect("resolves");
+    assert!(react::ReactResolver.resolve(&reference, &ctx).is_none());
+    let own = ref_view(
+        "AuthContext",
+        EdgeKind::References,
+        "src/context/AuthContext.tsx",
+        Language::Tsx,
+    );
+    let resolved = react::ReactResolver.resolve(&own, &ctx).expect("resolves");
     assert_eq!(resolved.target_node_id, ctx_node.id);
     assert_eq!(resolved.confidence, 0.8);
     assert_eq!(resolved.resolved_by, ResolvedBy::Framework);
@@ -305,18 +319,14 @@ fn react_extract_emits_nextjs_page_route() {
 }
 
 #[test]
-fn react_extract_component_and_route_reference() {
+fn react_extract_route_reference_and_no_component() {
     let content =
         "export function Home() { return <Layout/>; }\n<Route path=\"/home\" component={Home}/>";
     let result = react::ReactResolver
         .extract("src/Home.tsx", content, &no_project_config())
         .expect("extract result");
-    assert!(
-        result
-            .nodes
-            .iter()
-            .any(|n| n.kind == NodeKind::Component && n.name == "Home")
-    );
+    // The component is the tree-sitter extractor's `function` node (#841).
+    assert!(!result.nodes.iter().any(|n| n.kind == NodeKind::Component));
     let route = result
         .nodes
         .iter()

@@ -1,13 +1,14 @@
 //! React / Next.js [`FrameworkResolver`] — ports
 //! `upstream resolution/frameworks/react.ts`.
 
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
-use codegraph_core::types::{EdgeKind, Language, NodeKind};
+use codegraph_core::types::{EdgeKind, Language, Node, NodeKind};
 use regex::Regex;
 
-use super::{framework_node, js_language_for};
+use super::{framework_node, js_language_for, js_scan};
 use crate::framework::FrameworkResolver;
+use crate::strip_comments::{CommentLang, strip_comments_for_regex};
 use crate::types::{
     FrameworkResolverExtractionResult, RefView, ResolutionContext, ResolvedBy, ResolvedRef,
 };
@@ -20,18 +21,16 @@ impl FrameworkResolver for ReactResolver {
         "react"
     }
 
+    /// The languages React components, hooks and contexts are written and
+    /// used in. The JSX dialects are here so route extraction runs on the
+    /// `.tsx`/`.jsx` files a `<Route element={<X/>}>` lives in (upstream
+    /// #841), and `resolve` reads only a script's references, which its
+    /// `resolve_languages` default to (#2211): halo's Java `import
+    /// org.springframework…SecurityContext` is no React context.
     fn languages(&self) -> Option<&[Language]> {
-        // `languages: ['javascript', 'typescript']` (react.ts:12).
-        const LANGS: [Language; 2] = [Language::JavaScript, Language::TypeScript];
-        Some(&LANGS)
-    }
-
-    /// Components, hooks and contexts are a script's (upstream #2211): halo's
-    /// Java `import org.springframework…SecurityContext` is no React context.
-    fn resolve_languages(&self) -> Option<&[Language]> {
         const LANGS: [Language; 4] = [
-            Language::TypeScript,
             Language::JavaScript,
+            Language::TypeScript,
             Language::Tsx,
             Language::Jsx,
         ];
@@ -51,31 +50,65 @@ impl FrameworkResolver for ReactResolver {
             .any(|f| f.ends_with(".jsx") || f.ends_with(".tsx"))
     }
 
-    // Ports reactResolver.resolve (react.ts:34-86).
+    // Ports reactResolver.resolve (react.ts:44-131).
     fn resolve(&self, reference: &RefView, context: &dyn ResolutionContext) -> Option<ResolvedRef> {
         let name = &reference.reference_name;
-
-        // Pattern 1: PascalCase component refs, only from JSX-capable files
-        // (react.ts:43-57).
-        if matches!(reference.language, Language::Tsx | Language::Jsx)
+        // Pattern 1 reads a component USED in markup, which only parses in
+        // .tsx/.jsx. Without this gate every PascalCase TYPE in a plain .ts
+        // file went through component resolution: in a monorepo with
+        // same-named classes per package (#764, amplication), a GraphQL-types
+        // file's own `Account` type lost to an arbitrary `Account` class in
+        // another package.
+        let component = matches!(reference.language, Language::Tsx | Language::Jsx)
             && is_pascal_case(name)
-            && !is_built_in_type(name)
+            && !is_built_in_type(name);
+        let hook = name.starts_with("use") && name.len() > 3;
+        let provided = name.ends_with("Context") || name.ends_with("Provider");
+        if !(component || hook || provided) {
+            return None;
+        }
+
+        // A component, hook or context the file IMPORTS is the import's: the
+        // package's (`useQuery` from `@tanstack/react-query`, `<Button>` from
+        // a UI kit, upstream #2120 and #2475), or the module the import
+        // names, which import resolution finds. Framework resolution runs
+        // first, and a name lookup here bound trpc's tests' `useQuery` to a
+        // hook nested in one of trpc's own factories.
+        if context
+            .get_import_mappings(&reference.file_path, reference.language)
+            .iter()
+            .any(|mapping| mapping.local_name == *name)
         {
+            return None;
+        }
+
+        // Pattern 1: component references (PascalCase).
+        if component {
+            // A name the file declares itself as a value is that declaration,
+            // whatever refers to it (upstream #2420): the function the value
+            // wraps, or else the declaration, which name matching binds —
+            // never a same-named component in another app of the repository.
+            if let Some(own) = declared_component(name, &reference.file_path, context) {
+                return own
+                    .map(|component| framework_resolved(reference, component.id.clone(), 0.9));
+            }
             if let Some(target) = resolve_component(name, &reference.file_path, context) {
                 return Some(framework_resolved(reference, target, 0.8));
             }
         }
 
-        // Pattern 2: `use*` hooks (react.ts:59-70).
-        if name.starts_with("use") && name.len() > 3 {
-            if let Some(target) = resolve_hook(name, context) {
+        // Pattern 2: hook references (`use*`).
+        if hook {
+            if let Some(target) =
+                resolve_hook(name, &reference.file_path, context, reference.language)
+            {
                 return Some(framework_resolved(reference, target, 0.85));
             }
         }
 
-        // Pattern 3: `*Context` / `*Provider` (react.ts:72-83).
-        if name.ends_with("Context") || name.ends_with("Provider") {
-            if let Some(target) = resolve_context(name, context) {
+        // Pattern 3: context references (`*Context` / `*Provider`).
+        if provided {
+            if let Some(target) = resolve_context(name, reference, context) {
                 return Some(framework_resolved(reference, target, 0.8));
             }
         }
@@ -83,7 +116,7 @@ impl FrameworkResolver for ReactResolver {
         None
     }
 
-    // Ports reactResolver.extract (react.ts:88-268).
+    // Ports reactResolver.extract (react.ts:133-188).
     fn extract(
         &self,
         file_path: &str,
@@ -94,70 +127,13 @@ impl FrameworkResolver for ReactResolver {
         let mut references = Vec::new();
         let jsx_lang = js_language_for(file_path);
 
-        // Component definitions (react.ts:95-133).
-        for pattern in component_patterns() {
-            for m in pattern.captures_iter(content) {
-                let full = m.get(0).expect("group 0");
-                let Some(name) = m.get(1) else { continue };
-                let full_match = full.as_str();
-                let line = line_of(content, full.start());
-
-                let after_start = full.end();
-                let after = byte_window(content, after_start, 500);
-                let has_jsx = after.contains('<') && (after.contains("/>") || after.contains("</"));
-                if !has_jsx {
-                    continue;
-                }
-                let is_exported = full_match.contains("export");
-                // Component nodes are tsx/jsx (react.ts:127).
-                let lang = if file_path.ends_with(".tsx") {
-                    Language::Tsx
-                } else {
-                    Language::Jsx
-                };
-                nodes.push(framework_node(
-                    format!("component:{file_path}:{}:{line}", name.as_str()),
-                    NodeKind::Component,
-                    name.as_str().to_string(),
-                    format!("{file_path}::{}", name.as_str()),
-                    file_path.to_string(),
-                    line,
-                    line,
-                    0,
-                    full_match.len() as i64,
-                    lang,
-                    is_exported,
-                ));
-            }
-        }
-
-        // Custom hooks (react.ts:135-156).
-        for m in hook_pattern().captures_iter(content) {
-            let full = m.get(0).expect("group 0");
-            let Some(name) = m.get(1) else { continue };
-            let full_match = full.as_str();
-            let line = line_of(content, full.start());
-            let is_exported = full_match.contains("export");
-            // Hook nodes are typescript/javascript (react.ts:152).
-            let lang = if file_path.ends_with(".ts") || file_path.ends_with(".tsx") {
-                Language::TypeScript
-            } else {
-                Language::JavaScript
-            };
-            nodes.push(framework_node(
-                format!("hook:{file_path}:{}:{line}", name.as_str()),
-                NodeKind::Function,
-                name.as_str().to_string(),
-                format!("{file_path}::{}", name.as_str()),
-                file_path.to_string(),
-                line,
-                line,
-                0,
-                full_match.len() as i64,
-                lang,
-                is_exported,
-            ));
-        }
+        // Components and custom hooks are NOT extracted here (upstream #841).
+        // The tree-sitter extractor emits them across .ts/.tsx/.js/.jsx:
+        // function and arrow components as `function` nodes, components a
+        // wrapper declares (`forwardRef`/`memo`/`styled`) as `component`
+        // nodes, and `useX` hooks as `function` nodes. The regex this pass
+        // carried duplicated those nodes (a `useAuth` became two `function`
+        // nodes); it contributes only what tree-sitter can't: routes.
 
         // React Router <Route .../> (v5/v6) (react.ts:158-198).
         for tag in route_tag_regex().find_iter(content) {
@@ -390,34 +366,200 @@ fn resolve_component(
     }
 }
 
-/// `resolveHook` (react.ts:328-343).
-fn resolve_hook(name: &str, context: &dyn ResolutionContext) -> Option<String> {
+/// A value `file_path` declares itself under a component's name, and what it
+/// renders (upstream `declaredComponent`, #2420). JavaScript scoping makes
+/// the name, used anywhere in that file — `<RegisterPage />`, a route's
+/// `element: <RegisterPage />`, a type — this declaration, never another
+/// file's same-named component. `Some(component)` is the function the value
+/// wraps (`observer(function Login() {…})`), or `Some(None)` when there is
+/// none to find and the declaration is the binding, by name. `None` when the
+/// file declares no such value (a function or class component is found the
+/// usual way). A value's lazy loader is read in a later change.
+fn declared_component(
+    name: &str,
+    file_path: &str,
+    context: &dyn ResolutionContext,
+) -> Option<Option<Arc<Node>>> {
+    let declaration = declared_value(name, file_path, context)?;
+    Some(wrapped_component(&declaration, context))
+}
+
+/// The module-level `const`, `let` or `var` `file_path` declares as `name`
+/// (upstream `declaredValue`): a module-level declarator's qualified name is
+/// its bare name.
+fn declared_value(
+    name: &str,
+    file_path: &str,
+    context: &dyn ResolutionContext,
+) -> Option<Arc<Node>> {
+    context
+        .get_nodes_by_name_shared(name)
+        .into_iter()
+        .filter(|node| {
+            node.file_path == file_path
+                && matches!(node.kind, NodeKind::Constant | NodeKind::Variable)
+                && node.qualified_name == name
+        })
+        .min_by_key(|node| (node.start_line, node.start_column))
+}
+
+/// The component a value wraps, which is what it renders (upstream
+/// `wrappedComponent`): the function it holds (`const Application =
+/// observer(function Application() {…})`), or the component of its own file
+/// a wrapper call is handed (`const TableView = observer(TableViewInner)`,
+/// `forwardRef(Inner) as {…}`). An inner function counts when it has the
+/// value's name or ends where the value does — never a helper inside an
+/// arrow the graph has no node for (`withFallback('X', () => { const load =
+/// () => …; … })`).
+fn wrapped_component(value: &Node, context: &dyn ResolutionContext) -> Option<Arc<Node>> {
+    let nodes = context.get_nodes_in_file_shared(&value.file_path);
+    let inner: Vec<&Arc<Node>> = nodes
+        .iter()
+        .filter(|node| {
+            is_component_kind(node.kind)
+                && node
+                    .qualified_name
+                    .strip_prefix(value.qualified_name.as_str())
+                    .and_then(|rest| rest.strip_prefix("::"))
+                    == Some(node.name.as_str())
+                && node.start_line >= value.start_line
+                && node.end_line <= value.end_line
+        })
+        .collect();
+    if !inner.is_empty() {
+        let held = inner
+            .iter()
+            .find(|node| node.name == value.name)
+            .or_else(|| {
+                (inner.len() == 1 && inner[0].end_line == value.end_line).then(|| &inner[0])
+            });
+        return held.map(|node| Arc::clone(node));
+    }
+    let code = strip_comments_for_regex(&declaration_text(value, context), CommentLang::TypeScript);
+    let init = js_scan::initializer_at(&code, value.name.len())?;
+    let handed = js_scan::wrapped_name(&code[init..js_scan::statement_end(&code, init, false)])?;
+    if !is_pascal_case(handed) {
+        return None;
+    }
+    nodes
+        .iter()
+        .find(|node| {
+            node.name == handed && node.qualified_name == handed && is_component_kind(node.kind)
+        })
+        .cloned()
+}
+
+/// A declarator's own source text, `B = lazy(…)` in `const A = lazy(…), B =
+/// lazy(…)` (upstream `declarationText`): its lines, the last cut at its end
+/// column and the first from its start column. Columns are the byte columns
+/// the extractor stored; a file that no longer reads that way gives nothing.
+fn declaration_text(node: &Node, context: &dyn ResolutionContext) -> String {
+    let Some(facts) = context.source_facts(&node.file_path) else {
+        return String::new();
+    };
+    let (Ok(first), Ok(end)) = (
+        usize::try_from(node.start_line - 1),
+        usize::try_from(node.end_line),
+    ) else {
+        return String::new();
+    };
+    let end = end.min(facts.line_count());
+    if first >= end {
+        return String::new();
+    }
+    let mut lines: Vec<&str> = (first..end).map(|index| facts.line(index)).collect();
+    let last = lines.len() - 1;
+    if let Ok(cut @ 1..) = usize::try_from(node.end_column) {
+        let line = lines[last];
+        let Some(kept) = line.get(..cut.min(line.len())) else {
+            return String::new();
+        };
+        lines[last] = kept;
+    }
+    let from = usize::try_from(node.start_column).unwrap_or(0);
+    let Some(kept) = lines[0].get(from.min(lines[0].len())..) else {
+        return String::new();
+    };
+    lines[0] = kept;
+    lines.join("\n")
+}
+
+/// `isEsmLanguage` (react.ts:1312-1314): JS/TS and their JSX dialects,
+/// modules where a cross-file name needs an import.
+fn is_esm_script(language: Language) -> bool {
+    matches!(
+        language,
+        Language::TypeScript | Language::Tsx | Language::JavaScript | Language::Jsx
+    )
+}
+
+/// `resolveHook` (react.ts:1320-1346).
+fn resolve_hook(
+    name: &str,
+    from_file: &str,
+    context: &dyn ResolutionContext,
+    language: Language,
+) -> Option<String> {
     let candidates = context.get_nodes_by_name_shared(name);
-    if candidates.is_empty() {
+    let is_hook = |node: &Node| node.kind == NodeKind::Function && node.name.starts_with("use");
+    // A hook nested inside another function is only callable in there
+    // (upstream #2120).
+    let nested = |node: &Node| {
+        context
+            .get_nodes_in_file_shared(&node.file_path)
+            .iter()
+            .any(|outer| {
+                outer.id != node.id
+                    && matches!(outer.kind, NodeKind::Function | NodeKind::Method)
+                    && outer.start_line <= node.start_line
+                    && outer.end_line >= node.end_line
+                    && (outer.start_line < node.start_line || outer.end_line > node.end_line)
+            })
+    };
+    if let Some(own) = candidates
+        .iter()
+        .find(|node| node.file_path == from_file && is_hook(node) && !nested(node))
+    {
+        return Some(own.id.clone());
+    }
+    // A JS/TS module reaches another file's hook only by importing it — the
+    // import resolver's to follow (an imported name never gets here) —
+    // never by name alone (upstream #2240).
+    if is_esm_script(language) {
         return None;
     }
     let hooks: Vec<_> = candidates
-        .into_iter()
-        .filter(|n| n.kind == NodeKind::Function && n.name.starts_with("use"))
-        .collect();
-    if hooks.is_empty() {
-        return None;
-    }
-    const HOOK_DIRS: [&str; 4] = ["/hooks/", "/src/hooks/", "/lib/hooks/", "/utils/hooks/"];
-    if let Some(preferred) = hooks
         .iter()
-        .find(|n| HOOK_DIRS.iter().any(|d| n.file_path.contains(d)))
-    {
-        return Some(preferred.id.clone());
-    }
-    Some(hooks[0].id.clone())
+        .filter(|node| is_hook(node) && !nested(node))
+        .collect();
+    const HOOK_DIRS: [&str; 4] = ["/hooks/", "/src/hooks/", "/lib/hooks/", "/utils/hooks/"];
+    hooks
+        .iter()
+        .find(|node| HOOK_DIRS.iter().any(|dir| node.file_path.contains(dir)))
+        .or_else(|| hooks.first())
+        .map(|node| node.id.clone())
 }
 
-/// `resolveContext` (react.ts:348-368).
-fn resolve_context(name: &str, context: &dyn ResolutionContext) -> Option<String> {
+/// `resolveContext` (react.ts:1351-1377).
+fn resolve_context(
+    name: &str,
+    reference: &RefView,
+    context: &dyn ResolutionContext,
+) -> Option<String> {
+    // In a JS/TS module only the file's own context is in reach by name;
+    // another file's comes through an import (trpc's adapters'
+    // `createContext?.(…)` is an option, not an example app's
+    // `createContext`, upstream #2240).
+    if is_esm_script(reference.language) {
+        return context
+            .get_nodes_by_name_shared(name)
+            .iter()
+            .find(|node| node.file_path == reference.file_path)
+            .map(|node| node.id.clone());
+    }
     let candidates = context.get_nodes_by_name_shared(name);
     if candidates.is_empty() {
-        // Strip Context/Provider suffix fallback (react.ts:351-357).
+        // Without the Context/Provider suffix.
         let base_name = strip_context_suffix(name);
         if base_name != name {
             let base_candidates = context.get_nodes_by_name_shared(base_name);
@@ -697,37 +839,6 @@ fn opening_tag_end(text: &str) -> Option<usize> {
     None
 }
 
-fn component_patterns() -> &'static [Regex] {
-    static RE: OnceLock<Vec<Regex>> = OnceLock::new();
-    RE.get_or_init(|| {
-        vec![
-            // function components (react.ts:97).
-            Regex::new(r"(?:export\s+)?function\s+([A-Z][a-zA-Z0-9]*)\s*\(").expect("fn comp"),
-            // arrow function components (react.ts:99).
-            Regex::new(
-                r"(?:export\s+)?(?:const|let)\s+([A-Z][a-zA-Z0-9]*)\s*=\s*(?:\([^)]*\)|[a-zA-Z_][a-zA-Z0-9_]*)\s*=>",
-            )
-            .expect("arrow comp"),
-            // forwardRef components (react.ts:101).
-            Regex::new(
-                r"(?:export\s+)?(?:const|let)\s+([A-Z][a-zA-Z0-9]*)\s*=\s*(?:React\.)?forwardRef",
-            )
-            .expect("forwardRef comp"),
-            // memo components (react.ts:103).
-            Regex::new(r"(?:export\s+)?(?:const|let)\s+([A-Z][a-zA-Z0-9]*)\s*=\s*(?:React\.)?memo")
-                .expect("memo comp"),
-        ]
-    })
-}
-
-fn hook_pattern() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(r"(?:export\s+)?(?:function|const|let)\s+(use[A-Z][a-zA-Z0-9]*)\s*[=(]")
-            .expect("hook")
-    })
-}
-
 fn route_tag_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r"<Route\b").expect("route tag"))
@@ -843,6 +954,7 @@ mod tests {
     struct Ctx {
         files: HashMap<String, String>,
         nodes: Vec<Node>,
+        imports: HashMap<String, Vec<ImportMapping>>,
     }
 
     impl Ctx {
@@ -852,6 +964,20 @@ mod tests {
         }
         fn node(mut self, n: Node) -> Self {
             self.nodes.push(n);
+            self
+        }
+        /// `file` imports `local` from `source`.
+        fn import(mut self, file: &str, local: &str, source: &str) -> Self {
+            self.imports
+                .entry(file.to_string())
+                .or_default()
+                .push(ImportMapping {
+                    local_name: local.to_string(),
+                    exported_name: local.to_string(),
+                    source: source.to_string(),
+                    is_default: false,
+                    is_namespace: false,
+                });
             self
         }
     }
@@ -907,8 +1033,34 @@ mod tests {
         fn get_node_by_id(&self, id: &str) -> Option<Node> {
             self.nodes.iter().find(|n| n.id == id).cloned()
         }
-        fn get_import_mappings(&self, _f: &str, _l: Language) -> Vec<ImportMapping> {
-            Vec::new()
+        fn get_import_mappings(&self, file: &str, _l: Language) -> Vec<ImportMapping> {
+            self.imports.get(file).cloned().unwrap_or_default()
+        }
+    }
+
+    /// A node of `file` at `lines` (1-based, inclusive) and byte `columns`,
+    /// with its own qualified name.
+    fn placed(
+        kind: NodeKind,
+        qualified_name: &str,
+        file: &str,
+        lines: (i64, i64),
+        columns: (i64, i64),
+    ) -> Node {
+        let name = qualified_name.rsplit("::").next().unwrap_or(qualified_name);
+        Node {
+            qualified_name: qualified_name.to_string(),
+            start_line: lines.0,
+            end_line: lines.1,
+            start_column: columns.0,
+            end_column: columns.1,
+            ..mk_node(
+                &format!("{}:{file}:{qualified_name}:{}", kind.as_str(), lines.0),
+                kind,
+                name,
+                file,
+                Language::Tsx,
+            )
         }
     }
 
@@ -1026,8 +1178,9 @@ mod tests {
     // -- resolve: hook directory preference --------------------------------
 
     #[test]
-    fn resolve_hook_falls_back_to_first_when_no_hooks_dir() {
-        // No hooks/ directory, so the first candidate wins (react.ts:342).
+    fn resolve_hook_in_a_script_is_the_files_own() {
+        // In a JS/TS module another file's hook comes through an import (the
+        // import resolver's), never by name (upstream #2240).
         let hook = mk_node(
             "fn:src/util.ts:useThing:1",
             NodeKind::Function,
@@ -1036,21 +1189,86 @@ mod tests {
             Language::TypeScript,
         );
         let ctx = Ctx::default().node(hook.clone());
-        let reference = a_ref("useThing", EdgeKind::Calls, "src/Page.tsx", Language::Tsx);
-        let r = ReactResolver.resolve(&reference, &ctx).expect("resolves");
+        let elsewhere = a_ref("useThing", EdgeKind::Calls, "src/Page.tsx", Language::Tsx);
+        assert!(ReactResolver.resolve(&elsewhere, &ctx).is_none());
+        let own = a_ref(
+            "useThing",
+            EdgeKind::Calls,
+            "src/util.ts",
+            Language::TypeScript,
+        );
+        let r = ReactResolver.resolve(&own, &ctx).expect("resolves");
         assert_eq!(r.target_node_id, hook.id);
         assert_eq!(r.confidence, 0.85);
+    }
+
+    #[test]
+    fn resolve_hook_never_targets_a_nested_hook() {
+        // A hook declared inside another function is only callable in there
+        // (upstream #2120): trpc's `useQuery` inside one of its factories.
+        let factory = placed(
+            NodeKind::Function,
+            "createHooks",
+            "src/hooks.ts",
+            (1, 10),
+            (0, 1),
+        );
+        let nested = placed(
+            NodeKind::Function,
+            "createHooks::useQuery",
+            "src/hooks.ts",
+            (2, 4),
+            (2, 3),
+        );
+        let ctx = Ctx::default().node(factory).node(nested);
+        let reference = a_ref(
+            "useQuery",
+            EdgeKind::Calls,
+            "src/hooks.ts",
+            Language::TypeScript,
+        );
+        assert!(ReactResolver.resolve(&reference, &ctx).is_none());
+    }
+
+    #[test]
+    fn resolve_hook_outside_a_script_prefers_a_hooks_directory() {
+        // Only a non-script language reaches another file's hook by name: a
+        // hooks/ directory first, else the first candidate.
+        let far = mk_node(
+            "fn:src/util.ts:useThing:1",
+            NodeKind::Function,
+            "useThing",
+            "src/util.ts",
+            Language::TypeScript,
+        );
+        let near = mk_node(
+            "fn:src/hooks/useThing.ts:useThing:1",
+            NodeKind::Function,
+            "useThing",
+            "src/hooks/useThing.ts",
+            Language::TypeScript,
+        );
+        let ctx = Ctx::default().node(far.clone()).node(near.clone());
+        assert_eq!(
+            resolve_hook("useThing", "src/a.py", &ctx, Language::Python),
+            Some(near.id)
+        );
+        let ctx = Ctx::default().node(far.clone());
+        assert_eq!(
+            resolve_hook("useThing", "src/a.py", &ctx, Language::Python),
+            Some(far.id)
+        );
     }
 
     #[test]
     fn resolve_hook_none_when_not_a_use_function() {
         // Candidate exists but is not a `use*` function -> no hook resolution.
         let notf = mk_node(
-            "class:src/useThing.ts:useThing:1",
+            "class:src/Page.tsx:useThing:1",
             NodeKind::Class,
             "useThing",
-            "src/useThing.ts",
-            Language::TypeScript,
+            "src/Page.tsx",
+            Language::Tsx,
         );
         let ctx = Ctx::default().node(notf);
         let reference = a_ref("useThing", EdgeKind::Calls, "src/Page.tsx", Language::Tsx);
@@ -1066,9 +1284,50 @@ mod tests {
     }
 
     #[test]
+    fn resolve_context_in_a_script_is_the_files_own() {
+        // trpc's adapters' `createContext?.(…)` is an option, not an example
+        // app's `createContext` (upstream #2240).
+        let other = mk_node(
+            "var:src/context/AuthContext.tsx:AuthContext:1",
+            NodeKind::Variable,
+            "AuthContext",
+            "src/context/AuthContext.tsx",
+            Language::Tsx,
+        );
+        let own = mk_node(
+            "var:src/App.tsx:AuthContext:1",
+            NodeKind::Variable,
+            "AuthContext",
+            "src/App.tsx",
+            Language::Tsx,
+        );
+        let ctx = Ctx::default().node(other).node(own.clone());
+        let reference = a_ref(
+            "AuthContext",
+            EdgeKind::References,
+            "src/App.tsx",
+            Language::Tsx,
+        );
+        let r = ReactResolver.resolve(&reference, &ctx).expect("resolves");
+        assert_eq!(r.target_node_id, own.id);
+        let elsewhere = a_ref(
+            "AuthContext",
+            EdgeKind::References,
+            "src/Page.tsx",
+            Language::Tsx,
+        );
+        assert!(ReactResolver.resolve(&elsewhere, &ctx).is_none());
+    }
+
+    /// A reference outside JS/TS, which only [`resolve_context`] itself sees.
+    fn script_less_ref(name: &str) -> RefView {
+        a_ref(name, EdgeKind::References, "src/app.py", Language::Python)
+    }
+
+    #[test]
     fn resolve_context_strips_suffix_when_no_direct_match() {
         // No `AuthProvider` node, but a base `Auth` node exists -> suffix strip
-        // fallback resolves to it (react.ts:351-357).
+        // fallback resolves to it.
         let base = mk_node(
             "var:src/Auth.tsx:Auth:1",
             NodeKind::Variable,
@@ -1077,14 +1336,10 @@ mod tests {
             Language::Tsx,
         );
         let ctx = Ctx::default().node(base.clone());
-        let reference = a_ref(
-            "AuthProvider",
-            EdgeKind::References,
-            "src/App.tsx",
-            Language::Tsx,
+        assert_eq!(
+            resolve_context("AuthProvider", &script_less_ref("AuthProvider"), &ctx),
+            Some(base.id)
         );
-        let r = ReactResolver.resolve(&reference, &ctx).expect("resolves");
-        assert_eq!(r.target_node_id, base.id);
     }
 
     #[test]
@@ -1104,14 +1359,10 @@ mod tests {
             Language::Tsx,
         );
         let ctx = Ctx::default().node(far).node(near.clone());
-        let reference = a_ref(
-            "AuthContext",
-            EdgeKind::References,
-            "src/App.tsx",
-            Language::Tsx,
+        assert_eq!(
+            resolve_context("AuthContext", &script_less_ref("AuthContext"), &ctx),
+            Some(near.id)
         );
-        let r = ReactResolver.resolve(&reference, &ctx).expect("resolves");
-        assert_eq!(r.target_node_id, near.id);
     }
 
     #[test]
@@ -1124,6 +1375,180 @@ mod tests {
             Language::Tsx,
         );
         assert!(ReactResolver.resolve(&reference, &ctx).is_none());
+        assert_eq!(
+            resolve_context("MissingProvider", &script_less_ref("MissingProvider"), &ctx),
+            None
+        );
+    }
+
+    // -- resolve: the file's imports and its own values ---------------------
+
+    #[test]
+    fn an_imported_name_is_left_to_import_resolution() {
+        // antd's `<Button>` renders the package's, not the project's
+        // namesake (upstream #2120, #2475); the same for a hook or context.
+        let button = mk_node(
+            "component:src/components/Button.tsx:Button:1",
+            NodeKind::Component,
+            "Button",
+            "src/components/Button.tsx",
+            Language::Tsx,
+        );
+        let hook = mk_node(
+            "fn:src/Page.tsx:useQuery:1",
+            NodeKind::Function,
+            "useQuery",
+            "src/Page.tsx",
+            Language::Tsx,
+        );
+        let ctx = Ctx::default().node(button.clone()).node(hook.clone());
+        let tag = a_ref(
+            "Button",
+            EdgeKind::References,
+            "src/Page.tsx",
+            Language::Tsx,
+        );
+        let call = a_ref("useQuery", EdgeKind::Calls, "src/Page.tsx", Language::Tsx);
+        assert_eq!(
+            ReactResolver.resolve(&tag, &ctx).map(|r| r.target_node_id),
+            Some(button.id)
+        );
+        assert_eq!(
+            ReactResolver.resolve(&call, &ctx).map(|r| r.target_node_id),
+            Some(hook.id)
+        );
+        let ctx = ctx.import("src/Page.tsx", "Button", "antd").import(
+            "src/Page.tsx",
+            "useQuery",
+            "@tanstack/react-query",
+        );
+        assert!(ReactResolver.resolve(&tag, &ctx).is_none());
+        assert!(ReactResolver.resolve(&call, &ctx).is_none());
+    }
+
+    /// `src/App.tsx` for the declared-value cases, with each value's node.
+    fn app_with_values() -> Ctx {
+        let file = "src/App.tsx";
+        let source = "import { observer } from 'mobx-react';\n\
+                      const Panel = observer(function PanelInner() {\n\
+                      \x20 return <div />;\n\
+                      });\n\
+                      function Inner() { return <span />; }\n\
+                      const Item = forwardRef(Inner) as any; // a cast\n\
+                      const Home = lazy(() => import('./pages/Home'));\n";
+        let mut ctx = Ctx::default().file(file, source);
+        for (kind, name, lines, columns) in [
+            (NodeKind::Constant, "Panel", (2, 4), (6, 2)),
+            (NodeKind::Function, "Panel::PanelInner", (2, 4), (23, 1)),
+            (NodeKind::Function, "Inner", (5, 5), (0, 37)),
+            (NodeKind::Constant, "Item", (6, 6), (6, 37)),
+            (NodeKind::Constant, "Home", (7, 7), (6, 47)),
+        ] {
+            ctx = ctx.node(placed(kind, name, file, lines, columns));
+        }
+        // Another app's namesakes, in a component directory.
+        for name in ["Panel", "Item", "Home"] {
+            ctx = ctx.node(mk_node(
+                &format!("function:src/components/{name}.tsx:{name}:1"),
+                NodeKind::Function,
+                name,
+                &format!("src/components/{name}.tsx"),
+                Language::Tsx,
+            ));
+        }
+        ctx
+    }
+
+    #[test]
+    fn a_value_the_file_declares_renders_what_it_wraps() {
+        // Upstream #2420: the function a value holds, or the component of
+        // its own file a wrapper call is handed, past a type assertion.
+        let ctx = app_with_values();
+        for (name, target) in [
+            ("Panel", "function:src/App.tsx:Panel::PanelInner:2"),
+            ("Item", "function:src/App.tsx:Inner:5"),
+        ] {
+            let reference = a_ref(name, EdgeKind::References, "src/App.tsx", Language::Tsx);
+            let r = ReactResolver.resolve(&reference, &ctx).expect(name);
+            assert_eq!(r.target_node_id, target, "{name}");
+            assert_eq!(r.confidence, 0.9, "{name}");
+        }
+    }
+
+    #[test]
+    fn a_value_wrapping_no_component_is_its_own_declaration() {
+        // Nothing to render is found, so the declaration binds by name, never
+        // another app's same-named component; elsewhere that one still wins.
+        let ctx = app_with_values();
+        let own = a_ref("Home", EdgeKind::References, "src/App.tsx", Language::Tsx);
+        assert!(ReactResolver.resolve(&own, &ctx).is_none());
+        let elsewhere = a_ref("Home", EdgeKind::References, "src/Page.tsx", Language::Tsx);
+        assert_eq!(
+            ReactResolver
+                .resolve(&elsewhere, &ctx)
+                .map(|r| r.target_node_id),
+            Some("function:src/components/Home.tsx:Home:1".to_string())
+        );
+    }
+
+    #[test]
+    fn an_inner_function_counts_by_its_name_or_its_end() {
+        let file = "src/Page.tsx";
+        let value = placed(NodeKind::Constant, "Page", file, (1, 6), (6, 2));
+        // A helper inside an arrow the graph has no node for renders nothing.
+        let ctx = Ctx::default().node(value.clone()).node(placed(
+            NodeKind::Function,
+            "Page::load",
+            file,
+            (2, 2),
+            (8, 20),
+        ));
+        assert_eq!(wrapped_component(&value, &ctx), None);
+        // The value's namesake is what it holds, wherever it ends.
+        let ctx = ctx.node(placed(
+            NodeKind::Function,
+            "Page::Page",
+            file,
+            (3, 5),
+            (2, 3),
+        ));
+        assert_eq!(
+            wrapped_component(&value, &ctx).map(|node| node.id.clone()),
+            Some("function:src/Page.tsx:Page::Page:3".to_string())
+        );
+        // A lone inner function ending where the value does.
+        let ctx = Ctx::default().node(value.clone()).node(placed(
+            NodeKind::Function,
+            "Page::Render",
+            file,
+            (2, 6),
+            (8, 1),
+        ));
+        assert_eq!(
+            wrapped_component(&value, &ctx).map(|node| node.id.clone()),
+            Some("function:src/Page.tsx:Page::Render:2".to_string())
+        );
+    }
+
+    #[test]
+    fn a_declaration_reads_its_own_declarator() {
+        let ctx = app_with_values();
+        let item = placed(NodeKind::Constant, "Item", "src/App.tsx", (6, 6), (6, 37));
+        assert_eq!(
+            declaration_text(&item, &ctx),
+            "Item = forwardRef(Inner) as any"
+        );
+        let panel = placed(NodeKind::Constant, "Panel", "src/App.tsx", (2, 4), (6, 2));
+        assert_eq!(
+            declaration_text(&panel, &ctx),
+            "Panel = observer(function PanelInner() {\n  return <div />;\n})"
+        );
+        // A file that no longer reads that way gives nothing.
+        let stale = placed(NodeKind::Constant, "Item", "src/App.tsx", (60, 61), (6, 37));
+        assert_eq!(declaration_text(&stale, &ctx), "");
+        let ctx = Ctx::default().file("src/App.tsx", "const \u{e9}t\u{e9} = 1;\n");
+        let split = placed(NodeKind::Constant, "x", "src/App.tsx", (1, 1), (7, 20));
+        assert_eq!(declaration_text(&split, &ctx), "");
     }
 
     #[test]
@@ -1208,96 +1633,27 @@ mod tests {
         assert!(ReactResolver.resolve(&reference, &ctx).is_none());
     }
 
-    // -- extract: component variants + JSX gate -----------------------------
+    // -- extract: routes only -------------------------------------------------
 
     #[test]
-    fn extract_arrow_component_with_jsx() {
-        let content = "export const Card = () => { return <div/>; };";
-        let result = ReactResolver
-            .extract("src/Card.jsx", content, &test_extraction_context())
-            .expect("extract");
-        assert!(
-            result
-                .nodes
-                .iter()
-                .any(|n| n.kind == NodeKind::Component && n.name == "Card")
-        );
-    }
-
-    #[test]
-    fn extract_component_handles_utf8_at_lookahead_boundary() {
-        let mut content = String::from("function Card(");
-        content.push_str("<div/>");
-        content.push_str(&"a".repeat(493));
-        content.push('é');
-
-        let result = ReactResolver
-            .extract("src/Card.tsx", &content, &test_extraction_context())
-            .expect("extract");
-
-        assert!(
-            result
-                .nodes
-                .iter()
-                .any(|n| n.kind == NodeKind::Component && n.name == "Card")
-        );
-    }
-
-    #[test]
-    fn extract_component_without_jsx_is_skipped() {
-        // A PascalCase function that returns no JSX must NOT be a component node.
-        let content = "export function Helper() { return 42; }";
-        let result = ReactResolver
-            .extract("src/Helper.tsx", content, &test_extraction_context())
-            .expect("extract");
-        assert!(!result.nodes.iter().any(|n| n.kind == NodeKind::Component));
-    }
-
-    #[test]
-    fn extract_forward_ref_and_memo_components() {
-        let content =
-            "const Fancy = React.forwardRef(() => <div/>);\nconst Wrapped = memo(() => <span/>);";
-        let result = ReactResolver
-            .extract("src/W.tsx", content, &test_extraction_context())
-            .expect("extract");
-        let names: Vec<&str> = result
-            .nodes
-            .iter()
-            .filter(|n| n.kind == NodeKind::Component)
-            .map(|n| n.name.as_str())
-            .collect();
-        assert!(names.contains(&"Fancy"), "got {names:?}");
-        assert!(names.contains(&"Wrapped"), "got {names:?}");
-    }
-
-    #[test]
-    fn extract_custom_hook_node() {
-        let content = "export function useCounter() { return 0; }";
-        let result = ReactResolver
-            .extract("src/useCounter.ts", content, &test_extraction_context())
-            .expect("extract");
-        let hook = result
-            .nodes
-            .iter()
-            .find(|n| n.name == "useCounter")
-            .expect("hook node");
-        assert_eq!(hook.kind, NodeKind::Function);
-        assert_eq!(hook.language, Language::TypeScript);
-        assert!(hook.is_exported);
-    }
-
-    #[test]
-    fn extract_hook_js_language_for_plain_js() {
-        let content = "const useX = () => 1;";
-        let result = ReactResolver
-            .extract("src/useX.js", content, &test_extraction_context())
-            .expect("extract");
-        let hook = result
-            .nodes
-            .iter()
-            .find(|n| n.name == "useX")
-            .expect("hook");
-        assert_eq!(hook.language, Language::JavaScript);
+    fn extract_emits_no_component_or_hook_nodes() {
+        // The tree-sitter extractor owns components and hooks (upstream
+        // #841); a regex node here duplicated them.
+        let content = "export const Card = () => { return <div/>; };\n\
+                       export function Panel() { return <div/>; }\n\
+                       const Fancy = React.forwardRef(() => <div/>);\n\
+                       export function useCounter() { return 0; }\n";
+        for file in [
+            "src/Card.tsx",
+            "src/Card.jsx",
+            "src/useCounter.ts",
+            "src/useX.js",
+        ] {
+            let result = ReactResolver
+                .extract(file, content, &test_extraction_context())
+                .expect("extract");
+            assert!(result.nodes.is_empty(), "{file}: {:?}", result.nodes);
+        }
     }
 
     #[test]

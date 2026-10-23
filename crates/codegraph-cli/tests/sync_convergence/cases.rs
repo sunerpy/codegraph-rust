@@ -1072,6 +1072,50 @@ pub fn tsx_tag_becomes_a_parameter_body_edit() -> Case {
         .no_edge_after("function Widgets", "references", "function Widget @src/Widget.tsx")
 }
 
+/// Upstream #841: a `<Route>` in a `.tsx` file is a route, and an edit to
+/// the element it renders moves its edge, as a fresh index of the edit finds.
+pub fn tsx_route_element_body_edit() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Tsx])
+        .file(
+            "package.json",
+            "{\"dependencies\":{\"react\":\"^18.0.0\",\"react-router-dom\":\"^6.0.0\"}}\n",
+        )
+        .file("src/Home.tsx", "export function Home() {\n  return <h1 />;\n}\n")
+        .file("src/About.tsx", "export function About() {\n  return <h2 />;\n}\n")
+        .file(
+            "src/App.tsx",
+            "import { Routes, Route } from 'react-router-dom';\nimport { Home } from './Home';\nimport { About } from './About';\n\nexport function App() {\n  return (\n    <Routes>\n      <Route path=\"/page\" element={<Home />} />\n    </Routes>\n  );\n}\n",
+        )
+        .write(
+            "src/App.tsx",
+            "import { Routes, Route } from 'react-router-dom';\nimport { Home } from './Home';\nimport { About } from './About';\n\nexport function App() {\n  return (\n    <Routes>\n      <Route path=\"/page\" element={<About />} />\n    </Routes>\n  );\n}\n",
+        )
+        .edge_before("route src/App.tsx::route:/page", "references", "function Home")
+        .edge_after("route src/App.tsx::route:/page", "references", "function About")
+        .no_edge_after("route src/App.tsx::route:/page", "references", "function Home")
+}
+
+/// Upstream #2420: a component value a `.tsx` file declares renders the
+/// function it wraps, wherever the file uses it; an edit to what it wraps
+/// moves the tag's edge, never to another file's namesake.
+pub fn tsx_wrapper_value_body_edit() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Tsx])
+        .file("package.json", "{\"dependencies\":{\"react\":\"^18.0.0\"}}\n")
+        .file("src/other/Table.tsx", "export function Table() {\n  return <p />;\n}\n")
+        .file(
+            "src/App.tsx",
+            "import { observer } from 'mobx-react';\n\nfunction TableInner() {\n  return <table />;\n}\nfunction TableOuter() {\n  return <section />;\n}\nconst Table = observer(TableInner);\n\nexport function App() {\n  return <Table />;\n}\n",
+        )
+        .write(
+            "src/App.tsx",
+            "import { observer } from 'mobx-react';\n\nfunction TableInner() {\n  return <table />;\n}\nfunction TableOuter() {\n  return <section />;\n}\nconst Table = observer(TableOuter);\n\nexport function App() {\n  return <Table />;\n}\n",
+        )
+        .edge_before("function App", "references", "function TableInner")
+        .edge_after("function App", "references", "function TableOuter")
+        .no_edge_after("function App", "references", "function TableInner")
+        .no_edge_after("function App", "references", "function Table @src/other/Table.tsx")
+}
+
 /// Upstream #2418: an interface moved into a `declare module 'x'` body is
 /// exported, so another file's type reference reaches it by name, as a fresh
 /// index of the edit finds.
@@ -10003,8 +10047,10 @@ pub fn typescript_tsconfig_past_64_mib_replaced_with_its_size_and_mtime_kept() -
         .edge_after("file:src/main.ts", "imports", "function double")
 }
 
-/// Found by this matrix: only a fresh index detects React, mints the hook node
-/// and resolves the call through it.
+/// Found by this matrix: only a fresh index detected React. React coming into
+/// `package.json` makes the data router's table a route that renders its
+/// component (the React resolver's extraction runs only once React is
+/// detected).
 pub fn typescript_react_dependency_appears_in_package_json() -> Case {
     Case::new(Change::ControlFile, &[Language::TypeScript])
         .file(
@@ -10012,19 +10058,19 @@ pub fn typescript_react_dependency_appears_in_package_json() -> Case {
             "{\"name\":\"web\",\"dependencies\":{\"left-pad\":\"1.3.0\"}}\n",
         )
         .file(
-            "src/hooks.ts",
-            "export function useCart(): number {\n  return 1;\n}\n",
+            "src/dashboard.ts",
+            "export function Dashboard(): null {\n  return null;\n}\n",
         )
         .file(
-            "src/page.ts",
-            "export function page(): number {\n  return useCart();\n}\n",
+            "src/routes.ts",
+            "import { createBrowserRouter } from 'react-router-dom';\nimport { Dashboard } from './dashboard';\n\nexport const router = createBrowserRouter([{ path: '/dash', Component: Dashboard }]);\n",
         )
         .write(
             "package.json",
             "{\"name\":\"web\",\"dependencies\":{\"left-pad\":\"1.3.0\",\"react\":\"18.2.0\"}}\n",
         )
-        .edge_before("function page", "calls", "function useCart")
-        .edge_after("function page", "calls", "function src/hooks.ts::useCart")
+        .edge_before("file:src/routes.ts", "imports", "function Dashboard")
+        .edge_after("route src/routes.ts::route:/dash", "references", "function Dashboard")
 }
 
 /// W5-06: a `jsconfig.json` gaining `paths` makes the alias import resolve.
@@ -10114,8 +10160,8 @@ pub fn typescript_paths_retarget_moves_a_barrel_source() -> Case {
         .edge_after("function run", "calls", "function double @src/alt/math.ts")
 }
 
-/// W5-06: React leaving `package.json` takes the framework's hook node with
-/// it, and the call resolves by name again.
+/// W5-06: React leaving `package.json` takes the framework's route node with
+/// it; the import of the component stays.
 pub fn typescript_react_dependency_leaves_package_json() -> Case {
     Case::new(Change::ControlFile, &[Language::TypeScript])
         .file(
@@ -10123,19 +10169,19 @@ pub fn typescript_react_dependency_leaves_package_json() -> Case {
             "{\"name\":\"web\",\"dependencies\":{\"left-pad\":\"1.3.0\",\"react\":\"18.2.0\"}}\n",
         )
         .file(
-            "src/hooks.ts",
-            "export function useCart(): number {\n  return 1;\n}\n",
+            "src/dashboard.ts",
+            "export function Dashboard(): null {\n  return null;\n}\n",
         )
         .file(
-            "src/page.ts",
-            "export function page(): number {\n  return useCart();\n}\n",
+            "src/routes.ts",
+            "import { createBrowserRouter } from 'react-router-dom';\nimport { Dashboard } from './dashboard';\n\nexport const router = createBrowserRouter([{ path: '/dash', Component: Dashboard }]);\n",
         )
         .write(
             "package.json",
             "{\"name\":\"web\",\"dependencies\":{\"left-pad\":\"1.3.0\"}}\n",
         )
-        .edge_before("function page", "calls", "function src/hooks.ts::useCart")
-        .edge_after("function page", "calls", "function useCart")
+        .edge_before("route src/routes.ts::route:/dash", "references", "function Dashboard")
+        .edge_after("file:src/routes.ts", "imports", "function Dashboard")
 }
 
 /// Upstream #2395: React coming into an app's manifest rather than the
@@ -10149,22 +10195,22 @@ pub fn typescript_react_dependency_appears_in_an_app_package_json() -> Case {
             "{\"name\":\"web\",\"dependencies\":{\"left-pad\":\"1.3.0\"}}\n",
         )
         .file(
-            "apps/web/src/hooks.ts",
-            "export function useCart(): number {\n  return 1;\n}\n",
+            "apps/web/src/dashboard.ts",
+            "export function Dashboard(): null {\n  return null;\n}\n",
         )
         .file(
-            "apps/web/src/page.ts",
-            "export function page(): number {\n  return useCart();\n}\n",
+            "apps/web/src/routes.ts",
+            "import { createBrowserRouter } from 'react-router-dom';\nimport { Dashboard } from './dashboard';\n\nexport const router = createBrowserRouter([{ path: '/dash', Component: Dashboard }]);\n",
         )
         .write(
             "apps/web/package.json",
             "{\"name\":\"web\",\"dependencies\":{\"left-pad\":\"1.3.0\",\"react\":\"18.2.0\"}}\n",
         )
-        .edge_before("function page", "calls", "function useCart")
+        .edge_before("file:apps/web/src/routes.ts", "imports", "function Dashboard")
         .edge_after(
-            "function page",
-            "calls",
-            "function apps/web/src/hooks.ts::useCart",
+            "route apps/web/src/routes.ts::route:/dash",
+            "references",
+            "function Dashboard",
         )
 }
 
@@ -10176,19 +10222,19 @@ pub fn typescript_react_dependency_appears_above_no_script() -> Case {
         .file("package.json", "{\"name\":\"web\",\"private\":true}\n")
         .file("frontend/build.py", "def build():\n    return 1\n")
         .file(
-            "src/hooks.ts",
-            "export function useCart(): number {\n  return 1;\n}\n",
+            "src/dashboard.ts",
+            "export function Dashboard(): null {\n  return null;\n}\n",
         )
         .file(
-            "src/page.ts",
-            "export function page(): number {\n  return useCart();\n}\n",
+            "src/routes.ts",
+            "import { createBrowserRouter } from 'react-router-dom';\nimport { Dashboard } from './dashboard';\n\nexport const router = createBrowserRouter([{ path: '/dash', Component: Dashboard }]);\n",
         )
         .write(
             "frontend/package.json",
             "{\"name\":\"assets\",\"devDependencies\":{\"react\":\"18.2.0\"}}\n",
         )
-        .edge_before("function page", "calls", "function useCart")
-        .edge_after("function page", "calls", "function src/hooks.ts::useCart")
+        .edge_before("file:src/routes.ts", "imports", "function Dashboard")
+        .edge_after("route src/routes.ts::route:/dash", "references", "function Dashboard")
 }
 
 /// Upstream #2395: a file of any language arriving one directory down brings
@@ -10204,16 +10250,16 @@ pub fn typescript_react_dependency_beside_an_added_script() -> Case {
             "{\"name\":\"assets\",\"devDependencies\":{\"react\":\"18.2.0\"}}\n",
         )
         .file(
-            "src/hooks.ts",
-            "export function useCart(): number {\n  return 1;\n}\n",
+            "src/dashboard.ts",
+            "export function Dashboard(): null {\n  return null;\n}\n",
         )
         .file(
-            "src/page.ts",
-            "export function page(): number {\n  return useCart();\n}\n",
+            "src/routes.ts",
+            "import { createBrowserRouter } from 'react-router-dom';\nimport { Dashboard } from './dashboard';\n\nexport const router = createBrowserRouter([{ path: '/dash', Component: Dashboard }]);\n",
         )
         .write("frontend/build.py", "def build():\n    return 1\n")
-        .edge_before("function page", "calls", "function useCart")
-        .edge_after("function page", "calls", "function src/hooks.ts::useCart")
+        .edge_before("file:src/routes.ts", "imports", "function Dashboard")
+        .edge_after("route src/routes.ts::route:/dash", "references", "function Dashboard")
 }
 
 /// W5-06: a package the manifest comes to declare is outside the project,
