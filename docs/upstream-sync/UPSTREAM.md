@@ -8,22 +8,25 @@
 ## Current alignment
 
 - **Tracked colby release:** `v1.6.2`. All portable in-scope behavior audited
-  through that release, and through the `main` commits after it up to the last
-  discovery audit, is closed: ported, already present, recorded N/A or
-  KEEP-RUST, excluded by the owner, or moved by the owner to the follow-up pull
-  request, as the 2026-10-22 CLOSEOUT entry below lists. The official
-  codegraph-rs `v0.55.0` binaries passed the black-box acceptance in the
-  2026-10-22 release entry.
+  through that release, and through the `main` commits after it up to
+  `b635dd46`, is closed: ported, already present, recorded N/A or KEEP-RUST,
+  excluded by the owner, or moved by the owner to the follow-up pull request,
+  as the 2026-10-22 CLOSEOUT entry below lists. The official codegraph-rs
+  `v0.55.0` binaries passed the black-box acceptance in the 2026-10-22 release
+  entry. The `main` commits after `b635dd46` are audited but open, as the next
+  bullet says.
 - **Last discovery audit:** colby `main` at
-  `b635dd467f0578926a9c01a37b9d28d2b26689f1` (2026-10-07), audited on
-  2026-10-10 in [`V1_6_2_AUDIT_2026-10-10.md`](V1_6_2_AUDIT_2026-10-10.md): 268
-  commits from the previous boundary, none of them merges, the first 180 of
-  them the `v1.6.2` release (`6560052a6f856855d3f71eee838fd66ccfa4285d`).
-- **Previous discovery boundary:** the `v1.6.1` tag
-  `f4ddf508516332419ea3c95702810765936cf679` (the 2026-09-30 audit,
-  [`V1_6_1_AUDIT_2026-09-30.md`](V1_6_1_AUDIT_2026-09-30.md)).
+  `e8ddc4e2be02578d735c350df55f1769b7d6978a` (2026-10-22), audited on
+  2026-10-22 in
+  [`POST_V1_6_2_MAIN_2026-10-22.md`](POST_V1_6_2_MAIN_2026-10-22.md): 225
+  commits from the previous boundary, none of them merges and no new upstream
+  tag. Its `DEFER` rows go with the follow-up pull request; its `PORT` and
+  `PARTIAL` rows wait for a later program (OD-A1 in that file).
+- **Previous discovery boundary:** colby `main` at
+  `b635dd467f0578926a9c01a37b9d28d2b26689f1` (the 2026-10-10 audit,
+  [`V1_6_2_AUDIT_2026-10-10.md`](V1_6_2_AUDIT_2026-10-10.md)).
 - **Next discovery starts here:**
-  `b635dd467f0578926a9c01a37b9d28d2b26689f1..origin/main`. Do not re-triage the
+  `e8ddc4e2be02578d735c350df55f1769b7d6978a..origin/main`. Do not re-triage the
   audited range.
 - **Shipped in codegraph-rs `v0.55.0`, 2026-10-22:** #322, the 2026-10-10
   audit's rows under waves W0 to W6 and W10 of its program, with extraction
@@ -35,7 +38,8 @@
   strategies), by the owner's decision of 2026-10-16. The audit marks them
   `PLANNED (follow-up PR)`, and a row that landed only partly in `v0.55.0`
   names both halves. That pull request moves the extraction version from 22 to
-  23. See the 2026-10-16 entry below.
+  23, and it also takes the 21 `DEFER` rows of the 2026-10-22 audit. See the
+  2026-10-16 entry below.
 - **Upstream repository:** <https://github.com/colbymchenry/codegraph>.
 - **Shipped in codegraph-rs `v0.52.0`, 2026-10-01:**
   - #286, which makes a full `sync` keep what `index` keeps;
@@ -215,6 +219,106 @@ below remain immutable historical evidence.
 > that records colby parity — do not infer it from `Cargo.toml`.
 
 ## Sync log
+
+### 2026-10-22 — `b635dd46..e8ddc4e2` AUDITED; its `DEFER` rows join the follow-up pull request
+
+- **Range:** colby `main` of 2026-10-07 (`b635dd46`) to colby `main` of
+  2026-10-22 (`e8ddc4e2`): 225 commits, none of them merges, and no new
+  upstream tag. Classified against codegraph-rs `v0.55.1` (`4a7e158`,
+  extraction version 22, schema 10), with every probe run on the released
+  `0.55.1` binary. The row-by-row ledger is
+  [`POST_V1_6_2_MAIN_2026-10-22.md`](POST_V1_6_2_MAIN_2026-10-22.md).
+- **Findings:** 147 `PORT`, 36 `PARTIAL`, 21 `DEFER` (to the W7, W8 and W9
+  items of the follow-up pull request), 10 `ALREADY-HAVE`, 10 `N/A` and one
+  `KEEP-RUST`. Most of the range continues upstream's per-language precision
+  sweep: C++ receiver typing and overload choice, Go and Rust receiver typing,
+  JS/TS module and receiver resolution, and incremental-sync convergence. The
+  probes also found older Rust gaps that some rows build on: Go `const` and
+  `var` blocks, Pascal routine bodies and class heritage, Objective-C
+  file-scope variables, several JS/TS re-export shapes and TS interface
+  heritage.
+- **Verification:** both `ALREADY-HAVE` rows of the native-language pass
+  failed part of their upstream test's own fixture and are `PARTIAL` (#2769,
+  #2773); the audit file records the method.
+- **Owner decisions (2026-10-22):** the follow-up pull request (W7, W8, W9 and
+  OD-19, extraction version 23) also takes the 21 `DEFER` rows, which change
+  the code those items port; the 183 `PORT` and `PARTIAL` rows wait for a later
+  program with its own extraction-version move. The older gaps become G18 to
+  G25, each ported before the rows that need it. The C lone-macro `KEEP-RUST`
+  rule is reopened: C will follow upstream (#2709) when that row is ported. The
+  jsx-render pass of W7-14 builds on Rust's tree-based JSX references, not on
+  upstream's text scanner.
+- **Not changed:** the tracked release stays `v1.6.2`; the discovery boundary
+  moves to `e8ddc4e2`.
+
+### 2026-10-22 — `v0.55.2` RELEASED: #335 shipped
+
+Release-please PR [#336](https://github.com/sunerpy/codegraph-rust/pull/336)
+merged as `e62ccab464ea558f41e88077383b38689605bb14`, and tag `v0.55.2` was cut
+at that exact commit.
+
+- The merge has the tree of the PR's head `be301e4`, `1c057b4…`.
+- The owner re-ran the bot's CI run
+  [`39819839480`](https://github.com/sunerpy/codegraph-rust/actions/runs/39819839480)
+  (attempt 2, all green) and approved the PR as code owner.
+- The implementation PR #335 merged as `139fb0a`, with the tree of its reviewed
+  head `47f248b`, `e83f840…`. Main CI run
+  [`39819780373`](https://github.com/sunerpy/codegraph-rust/actions/runs/39819780373)
+  passed.
+
+Release workflow run
+[`39832317763`](https://github.com/sunerpy/codegraph-rust/actions/runs/39832317763)
+passed all twelve jobs on its first attempt.
+
+- The push of the release commit triggered it.
+- Its CI gate took the exact-SHA branch over main CI run
+  [`39832317746`](https://github.com/sunerpy/codegraph-rust/actions/runs/39832317746),
+  whose required `CI Success` passed.
+- The release was published at 2026-10-22T19:00:51Z UTC.
+- The official `codegraph-0.55.2-x86_64-unknown-linux-musl.tar.gz` digest is
+  `0b123f6010cf3a5831973ec9bb086f39c41536226b29a655a86d34ebc4118592`.
+
+Black-box acceptance of the downloaded release:
+
+- **Artifacts.** The release is not a draft, and its assets are the six
+  archives and `SHA256SUMS`. `SHA256SUMS` and `gh attestation verify` passed
+  for all six archives, and every attestation names run `39832317763`. The
+  binary reports `codegraph 0.55.2`, and its `.comment` section names rustc
+  1.98.0.
+- **Behavior.** One script makes 15 checks over the four defects: what the
+  official `v0.54.0` `uninit --force` left, an index `v0.54.0` built, an `init`
+  killed after it published `building` following an uninit (871 files), and a
+  current index beside the tombstone. All 15 pass with `v0.55.2`.
+- **Control.** The same script fails 10 of the 15 checks with `v0.55.1`; the
+  five it passes there (`init` recovery and blocked reads) already worked.
+
+### 2026-10-22 — The uninit tombstone keeps an index for an explicit `init` (#335)
+
+Not an upstream port: four lifecycle defects around the tombstone
+`uninit --force` writes. All were reproduced on the released `v0.55.1` binary,
+the first with what the released `v0.54.0` left.
+
+- **An older version's uninit read as `outdated`.** The state gate compared
+  extraction versions before phases, so `sync`, and the catch-up of a session
+  with `CODEGRAPH_NO_DAEMON=1`, rebuilt an index the user had removed, beside
+  its tombstone, after which `status` and every read failed. An older
+  `uninitialized` phase now classifies as `uninitialized`. This closes the open
+  item of the daemon-upgrade entry below.
+- **`uninit --force` refused an index an older version built**, so removing it
+  took a full `sync` first. It now removes it as it is.
+- **Rebuilds under the tombstone.** After an uninit, an `init` interrupted
+  after it published `building` left that phase beside the tombstone. The read
+  error recommended `index --force`, which rebuilt the whole index and left
+  `current` beside the tombstone, unreadable until another `init`. A reindex
+  and the migration a sync escalates to now refuse a namespace that holds the
+  tombstone, and `status` and the read errors name `codegraph init`.
+- **`status` failed on a current index beside the tombstone.** It now reports
+  a degraded diagnostic with `codegraph init` as the recovery.
+
+The kirocodex review (`--risk high`) failed round 1 with one blocking item:
+`status` still recommended `sync` for an `outdated` index under the tombstone.
+Round 2 passed on head `47f248b`, and #335 merged as `139fb0a` with that head's
+tree.
 
 ### 2026-10-22 — `v0.55.1` RELEASED: #330 shipped
 
