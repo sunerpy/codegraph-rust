@@ -414,7 +414,7 @@ self-equivalence.
 fixes from upstream #1823 and #1824. Its two-file corpus under
 `crates/codegraph-bench/fixtures/scala/` pins all of these as one contract:
 
-- the `tree-sitter-scala` 0.26.2 grammar accepts a class with multiple
+- the `tree-sitter-scala` 0.26.3 grammar accepts a class with multiple
   constructor parameter lists whose parent constructor also has multiple lists;
 - one `extends A(...) with B with C` clause emits three separate, bare-name
   `Extends` edges;

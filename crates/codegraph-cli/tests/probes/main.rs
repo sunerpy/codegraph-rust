@@ -10547,6 +10547,70 @@ mod swift {
             "{report}"
         );
     }
+
+    /// Upstream #2683: a call written after `try!` links what it calls. Calls
+    /// after `try?` and `try` are the control. Upstream's TortureTry.swift,
+    /// reduced to calls whose callees the project declares.
+    ///
+    /// Not yet on Windows: the held tree-sitter-swift 0.7.3 builds the `try!`
+    /// entry of its scanner's 64-bit mask as `1UL << 32`, which MSVC folds to
+    /// 0, so there `try! Message2(…)` parses as a call of `! Message2` and
+    /// `try! Settings.Defaults.load()` loses its receiver. 0.7.4 fixes it but
+    /// regenerates the grammar, which needs a walker change first
+    /// (docs/grammar-manifest.md); drop the `ignore` with that upgrade.
+    #[test]
+    #[cfg_attr(
+        windows,
+        ignore = "tree-sitter-swift 0.7.3 misparses `try!` on MSVC (upstream #2683)"
+    )]
+    fn pr2683_a_call_after_try_bang_links_what_it_calls() {
+        let project = Project::new()
+            .file(
+                "App/Models.swift",
+                "import Foundation\n\nstruct Message2 {\n    init(data: Data?) throws {}\n}\n\nfinal class Store {\n    init(path: String) throws {}\n}\n\nenum Settings {\n    enum Defaults {\n        static func load(from name: String) throws -> Settings.Defaults { .init() }\n    }\n}\n",
+            )
+            .file(
+                "App/Repository.swift",
+                "import Foundation\n\nfinal class Repository {\n    func load(data: Data?) throws -> Message2 {\n        let msg2 = try! Message2(data: data!)\n        let msg3 = try? Message2(data: data!)\n        let msg4 = try Message2(data: data!)\n        let store = try! Store(path: \"x\")\n        let settings = try! Settings.Defaults.load(from: \"defaults\")\n        try! validate(msg2)\n        _ = (msg3, msg4, store, settings)\n        return try! Message2(data: data!)\n    }\n\n    func validate(_ m: Message2) throws {}\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        let lines = |kind: &str, target: &str| -> Vec<i64> {
+            let mut lines: Vec<i64> = graph
+                .edges_matching("method Repository::load", kind, target)
+                .iter()
+                .filter_map(|edge| edge.line)
+                .collect();
+            lines.sort_unstable();
+            lines
+        };
+        let report = graph.report();
+        assert_eq!(
+            lines("instantiates", "struct Message2"),
+            [5, 6, 7, 12],
+            "{report}"
+        );
+        assert_eq!(lines("instantiates", "class Store"), [8], "{report}");
+        assert_eq!(
+            lines("calls", "method Settings::Defaults::load"),
+            [9],
+            "{report}"
+        );
+        assert_eq!(
+            lines("calls", "method Repository::validate"),
+            [10],
+            "{report}"
+        );
+        // The misparse left references named after the `!`.
+        assert!(
+            graph
+                .unresolved
+                .iter()
+                .all(|reference| !reference.reference_name.starts_with('!')),
+            "{}",
+            graph.unresolved_list()
+        );
+    }
 }
 
 mod objc {
