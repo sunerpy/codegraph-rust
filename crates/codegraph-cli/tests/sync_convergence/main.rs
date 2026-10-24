@@ -111,6 +111,9 @@ impl Op {
 
 type EdgeSpec = (&'static str, &'static str, &'static str);
 
+/// An edge and one string its metadata holds under a key.
+type MetadataSpec = (EdgeSpec, &'static str, &'static str);
+
 /// A `before` tree, one edit, and the edges that prove the case is live.
 pub struct Case {
     change: Change,
@@ -120,6 +123,7 @@ pub struct Case {
     edges_before: Vec<EdgeSpec>,
     edges_after: Vec<EdgeSpec>,
     absent_after: Vec<EdgeSpec>,
+    metadata_after: Vec<MetadataSpec>,
     languages_after: Vec<(&'static str, &'static str)>,
     names_before: Vec<(&'static str, &'static str)>,
     names_after: Vec<(&'static str, &'static str)>,
@@ -137,6 +141,7 @@ impl Case {
             edges_before: Vec::new(),
             edges_after: Vec::new(),
             absent_after: Vec::new(),
+            metadata_after: Vec::new(),
             languages_after: Vec::new(),
             names_before: Vec::new(),
             names_after: Vec::new(),
@@ -204,6 +209,19 @@ impl Case {
         target: &'static str,
     ) -> Self {
         self.absent_after.push((source, kind, target));
+        self
+    }
+
+    /// An edge a fresh index of the final tree must hold with `value` under
+    /// `key` in its metadata (a framework edge's `framework`): the
+    /// comparison with each sync reads the metadata too.
+    pub fn edge_metadata_after(
+        mut self,
+        edge: EdgeSpec,
+        key: &'static str,
+        value: &'static str,
+    ) -> Self {
+        self.metadata_after.push((edge, key, value));
         self
     }
 
@@ -340,6 +358,7 @@ fn run_case(name: &str, case: &Case) {
         .index();
     expect_edges(name, "fresh", fresh.graph(), &case.edges_after);
     expect_no_edges(name, "fresh", fresh.graph(), &case.absent_after);
+    expect_edge_metadata(name, "fresh", fresh.graph(), &case.metadata_after);
     expect_names(name, "fresh", fresh.graph(), &case.names_after);
     for &(path, language) in &case.languages_after {
         let recorded = fresh
@@ -671,6 +690,24 @@ fn expect_names(name: &str, label: &str, graph: &Graph, names: &[(&str, &str)]) 
 }
 
 #[track_caller]
+fn expect_edge_metadata(name: &str, label: &str, graph: &Graph, specs: &[MetadataSpec]) {
+    for &((source, kind, target), key, value) in specs {
+        assert!(
+            graph
+                .edges_matching(source, kind, target)
+                .iter()
+                .any(
+                    |edge| edge.metadata.get(key).and_then(serde_json::Value::as_str)
+                        == Some(value)
+                ),
+            "[{name}] the {label} index has no {source} -[{kind}]-> {target} with `{key}: \
+             {value:?}` in its metadata, which this case exists to exercise\n{}",
+            graph.report()
+        );
+    }
+}
+
+#[track_caller]
 fn expect_no_edges(name: &str, label: &str, graph: &Graph, edges: &[EdgeSpec]) {
     for &(source, kind, target) in edges {
         for selector in [source, target] {
@@ -880,6 +917,7 @@ matrix! {
     tsx_tag_becomes_a_parameter_body_edit,
     tsx_route_element_body_edit,
     tsx_wrapper_value_body_edit,
+    tsx_framework_edge_keeps_its_resolvers_name,
     typescript_interface_moves_into_a_declare_module_body,
     vue_options_api_this_call_body_edit,
     vue_template_call_reaches_an_added_composable,
@@ -1395,6 +1433,7 @@ matrix! {
     typescript_workspace_glob_gains_a_member,
     tauri_config_marker_appears,
     tauri_command_attribute_makes_an_invoke_call_its_edge,
+    tauri_command_body_edit_keeps_the_invoke_edges_resolver_name,
     typescript_package_version_bump_keeps_every_edge,
     liquid_json_template_joins_a_theme_once_its_settings_schema_appears,
     liquid_json_templates_leave_once_the_theme_layout_goes,

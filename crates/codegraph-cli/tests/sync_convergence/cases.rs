@@ -1116,6 +1116,28 @@ pub fn tsx_wrapper_value_body_edit() -> Case {
         .no_edge_after("function App", "references", "function Table @src/other/Table.tsx")
 }
 
+/// W7-04b (upstream #2159): the edge the React resolver makes names it in
+/// `metadata.framework`, and the file's re-extraction draws it again with the
+/// name, as a fresh index does.
+pub fn tsx_framework_edge_keeps_its_resolvers_name() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Tsx])
+        .file("package.json", "{\"dependencies\":{\"react\":\"^18.0.0\"}}\n")
+        .file(
+            "src/App.tsx",
+            "import { observer } from 'mobx-react';\n\nfunction TableInner() {\n  return <table />;\n}\nconst Table = observer(TableInner);\n\nexport function App() {\n  return <Table />;\n}\n",
+        )
+        .write(
+            "src/App.tsx",
+            "import { observer } from 'mobx-react';\n\nfunction TableInner() {\n  return <table className=\"wide\" />;\n}\nconst Table = observer(TableInner);\n\nexport function App() {\n  return <Table />;\n}\n",
+        )
+        .edge_after("function App", "references", "function TableInner")
+        .edge_metadata_after(
+            ("function App", "references", "function TableInner"),
+            "framework",
+            "react",
+        )
+}
+
 /// Upstream #2418: an interface moved into a `declare module 'x'` body is
 /// exported, so another file's type reference reaches it by name, as a fresh
 /// index of the edit finds.
@@ -10586,6 +10608,31 @@ pub fn tauri_command_attribute_makes_an_invoke_call_its_edge() -> Case {
             "#[tauri::command] pub fn greet() -> String {\n    String::new()\n}\n\nfn main() {}\n",
         )
         .edge_after("file:src/main.ts", "calls", "function greet")
+}
+
+/// W7-04b (upstream #2159): the invoke edge the Tauri resolver makes names it
+/// in `metadata.framework`; an edit to the command's body re-resolves the
+/// call at its site, and the edge keeps the name, as a fresh index has it.
+pub fn tauri_command_body_edit_keeps_the_invoke_edges_resolver_name() -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript, Language::Rust])
+        .file(
+            "src/main.ts",
+            "import { invoke } from '@tauri-apps/api/core';\n\nexport function run(): Promise<unknown> {\n  return invoke('greet');\n}\n",
+        )
+        .file(
+            "src-tauri/src/main.rs",
+            "#[tauri::command] pub fn greet() -> String {\n    String::new()\n}\n\nfn main() {}\n",
+        )
+        .write(
+            "src-tauri/src/main.rs",
+            "#[tauri::command] pub fn greet() -> String {\n    String::from(\"hi\")\n}\n\nfn main() {}\n",
+        )
+        .edge_throughout("file:src/main.ts", "calls", "function greet")
+        .edge_metadata_after(
+            ("file:src/main.ts", "calls", "function greet"),
+            "framework",
+            "tauri",
+        )
 }
 
 /// W5-06, fail closed: only the manifest's `version` changes; every JS file
