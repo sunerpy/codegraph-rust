@@ -1,11 +1,12 @@
 //! Concrete [`FrameworkResolver`] implementations + the detection registry.
 //!
-//! Ports the subset of `upstream resolution/frameworks/` that v1
-//! ships: React/Next.js ([`react`]), Vue and Nuxt ([`vue`]), and NestJS ([`nestjs`]).
-//! The other ~19 upstream resolvers remain deferred (see `KNOWN_DIFFS.md`).
+//! Ports the subset of `upstream resolution/frameworks/` that this port
+//! ships: React ([`react`]), Next.js ([`nextjs`]), Vue and Nuxt ([`vue`]),
+//! NestJS ([`nestjs`]), Godot ([`godot`]) and Tauri ([`tauri`]). The other
+//! upstream resolvers remain deferred (see `KNOWN_DIFFS.md`).
 //!
 //! [`detect_frameworks`] ports `frameworks/index.ts:detectFrameworks` restricted
-//! to the three ported resolvers; the orchestrator hands the detected list to
+//! to the ported resolvers; the orchestrator hands the detected list to
 //! [`crate::resolver::ReferenceResolver`] so they participate in
 //! [`crate::resolver::ReferenceResolver::resolve_one`] Strategy-1 exactly where
 //! the upstream runs them (`index.ts:695-701`).
@@ -19,9 +20,11 @@ pub(crate) mod godot_scene;
 pub mod godot_script;
 pub(crate) mod js_scan;
 pub mod nestjs;
+pub mod nextjs;
 pub mod package_deps;
 pub(crate) mod page_component;
 pub mod react;
+pub mod route_href;
 pub mod tauri;
 pub mod vue;
 
@@ -31,9 +34,10 @@ use codegraph_core::types::{Language, Node, NodeKind};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Detect which of the ported frameworks a project uses
-/// (`detectFrameworks`, `frameworks/index.ts:90-98`, restricted to react/vue/
-/// nestjs). The candidate order mirrors the upstream `FRAMEWORK_RESOLVERS`
-/// declaration order for the three ported entries (nestjs, react, vue).
+/// (`detectFrameworks`, `frameworks/index.ts:90-98`, restricted to the ported
+/// resolvers). The first three keep upstream's `FRAMEWORK_RESOLVERS` order
+/// (nestjs, react, vue); later ports are appended, so the first resolver to
+/// return `>= 0.9` for a reference that resolved before never changes.
 pub fn detect_frameworks(context: &dyn ResolutionContext) -> Vec<Box<dyn FrameworkResolver>> {
     let candidates: Vec<Box<dyn FrameworkResolver>> = vec![
         Box::new(nestjs::NestjsResolver),
@@ -50,6 +54,10 @@ pub fn detect_frameworks(context: &dyn ResolutionContext) -> Vec<Box<dyn Framewo
         // references to their pages' components, so its place here changes
         // no other reference's resolution.
         Box::new(vue::NuxtResolver),
+        // Next.js pages, route handlers and navigation (F3), split out of
+        // React. It claims only navigation calls that name one of its own
+        // pages, which no resolver above resolves.
+        Box::new(nextjs::NextjsResolver),
     ];
     candidates
         .into_iter()

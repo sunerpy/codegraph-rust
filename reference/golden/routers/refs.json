@@ -481,16 +481,6 @@
   },
   {
     "candidates": null,
-    "col": 32,
-    "file_path": "apps/next/app/dashboard/page.tsx",
-    "from_node_id": "function:6dccb0ce095800be34bbf630bb5e1b0b",
-    "language": "tsx",
-    "line": 6,
-    "reference_kind": "calls",
-    "reference_name": "router.push"
-  },
-  {
-    "candidates": null,
     "col": 34,
     "file_path": "apps/react-router/src/main.tsx",
     "from_node_id": "constant:12853c40af592d62e70d60d7fc689444",

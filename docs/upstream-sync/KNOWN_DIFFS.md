@@ -35,20 +35,21 @@ Tier-3 rules:
 The v1 Rust port of `reference/colby/src/resolution/` ships the two CORE
 deterministic strategies — import resolution (`import-resolver.ts`) and name
 matching (`name-matcher.ts`) — orchestrated by `ReferenceResolver`
-(`index.ts`), plus THREE concrete `FrameworkResolver` implementations behind the
+(`index.ts`), plus concrete `FrameworkResolver` implementations behind the
 `FrameworkResolver` trait EXTENSION POINT (`crates/codegraph-resolve/src/framework.rs`):
-React/Next.js, Vue/Nuxt, and NestJS (`crates/codegraph-resolve/src/frameworks/`),
-detected per-project by `detect_frameworks`. The remaining ~19 colby resolvers
-stay deferred. The following colby behaviors are intentionally NOT ported in v1:
+NestJS, React, Vue, Godot, Tauri, Nuxt and Next.js
+(`crates/codegraph-resolve/src/frameworks/`), detected per-project by
+`detect_frameworks`. The other colby resolvers stay deferred. The following
+colby behaviors are intentionally NOT ported in v1:
 
 - **The other framework-specific resolvers** — every concrete `FrameworkResolver`
-  in `reference/colby/src/resolution/frameworks/**` EXCEPT react/vue/nestjs:
+  in `reference/colby/src/resolution/frameworks/**` EXCEPT those above:
   Spring/Java, Drupal `routing.yml`, Express, Svelte, React Native / Expo / Fabric
   bridges, Swift↔ObjC bridging, the Go-module / Python / Ruby / C# / Play route
   extractors, and the Astro resolver
   (`frameworks/astro.ts`: `astro:*` module imports + the `Astro` global resolved
   as framework-provided, and `src/pages` file-based route-node mapping). These
-  are an additive heuristic layer; on a project where none of react/vue/nestjs is
+  are an additive heuristic layer; on a project where none of them is
   detected the orchestrator holds an empty resolver list, so behavior matches
   colby with zero frameworks detected. The Astro
   EXTRACTION half (frontmatter + `<script>` delegation, template `{call(...)}`
@@ -56,6 +57,9 @@ stay deferred. The following colby behaviors are intentionally NOT ported in v1:
   #768); only its framework-resolution half is deferred. Re-enable any of the
   deferred resolvers by adding it to `frameworks/` and the `detect_frameworks`
   registry — no orchestrator change required.
+- **Next.js link synthesis** — `next-router-synthesizer.ts`: a `<Link href>`
+  or internal `<a href>` is a JSX attribute, not a call, and draws no
+  `navigates` edge here; the Next.js resolver binds navigation calls only.
 - **Callback / observer edge synthesis** — `synthesizeCallbackEdges`
   (`reference/colby/src/resolution/callback-synthesizer.ts`, invoked at
   `index.ts:959-963`). Heuristic dynamic-dispatch edge synthesis; deferred behind
@@ -225,6 +229,14 @@ listed.
   spec at the repository root and prefers a bootstrap that configures the
   app, so all of nestjs/nest's integration apps took one spec's `/api`
   (`nestjs.rs`).
+- **A path two Next.js apps serve (W7-07).** When several Next pages serve
+  one path (two apps of a monorepo each with `/login`), a navigation call
+  goes to its own app's page: the app whose root is the longest one above
+  the calling file. Several such pages, or none, leave the call unresolved,
+  and no dynamic route stands in. colby keeps one page per path, the last in
+  node order; the store returns nodes in insertion order, which a sync
+  changes. A path one page serves binds as in colby, wherever the call is
+  (`nextjs.rs`).
 - **Dart named constructors (#2380).** A named constructor, indexed as a
   method, is reached only by a call written through its class (`Foo.value(2)`).
   A call through a value of that type (a typed parameter or local, a chain's

@@ -19414,6 +19414,331 @@ mod frameworks {
     }
 }
 
+mod nextjs {
+    use super::support::{Graph, Project};
+
+    const SITE_PACKAGE: &str = "{\"name\":\"site\",\"dependencies\":{\"next\":\"15\",\"react\":\"19\",\"@prisma/client\":\"5\"}}\n";
+
+    /// Upstream `__tests__/nextjs.test.ts`, end to end: a small App Router
+    /// site with a server action, a route handler and a middleware.
+    fn site() -> Project {
+        Project::new()
+            .file("package.json", SITE_PACKAGE)
+            .file(
+                "lib/db.ts",
+                "import { PrismaClient } from '@prisma/client'\nexport const prisma = new PrismaClient()\n",
+            )
+            .file(
+                "app/layout.tsx",
+                "export default function RootLayout({ children }) {\n  return children\n}\n",
+            )
+            .file(
+                "app/page.tsx",
+                "import Link from 'next/link'\nexport default function Home() {\n  return (\n    <main>\n      <Link href=\"/users\">Users</Link>\n      <a href=\"/login\">Log in</a>\n      <a href=\"https://example.com\">Elsewhere</a>\n    </main>\n  )\n}\n",
+            )
+            .file(
+                "app/login/page.tsx",
+                "export default function LoginPage() {\n  return null\n}\n",
+            )
+            .file(
+                "app/users/page.tsx",
+                "import { NewUserForm } from '../../components/new-user-form'\nimport { prisma } from '../../lib/db'\nexport default async function UsersPage() {\n  const users = await prisma.user.findMany()\n  return <NewUserForm count={users.length} />\n}\n",
+            )
+            .file(
+                "app/users/[id]/page.tsx",
+                "export default function UserPage({ params }) {\n  return <a href=\"/users\">Back</a>\n}\n",
+            )
+            .file(
+                "components/new-user-form.tsx",
+                "'use client'\nimport { useCallback, useState } from 'react'\nimport { useRouter } from 'next/navigation'\nimport { createUserAction } from '../app/actions'\nexport function NewUserForm({ count }) {\n  const [email, setEmail] = useState('')\n  const router = useRouter()\n  const handleSubmit = useCallback(async (e) => {\n    e.preventDefault()\n    const user = await createUserAction({ email })\n    if (user.ok) router.push(`/users/${user.id}`)\n  }, [email])\n  return <form onSubmit={handleSubmit}><input value={email} onChange={(e) => setEmail(e.target.value)} /></form>\n}\n",
+            )
+            .file(
+                "app/actions.ts",
+                "'use server'\nimport { redirect } from 'next/navigation'\nimport { prisma } from '../lib/db'\nexport async function createUserAction(data) {\n  const user = await prisma.user.create({ data })\n  if (!user.verified) redirect('/users')\n  return { ok: true, id: user.id }\n}\n",
+            )
+            .file(
+                "app/api/users/route.ts",
+                "import { NextResponse } from 'next/server'\nimport { prisma } from '../../../lib/db'\nexport async function GET() {\n  return NextResponse.json(await prisma.user.findMany())\n}\nexport async function POST(req) {\n  const data = await req.json()\n  const user = await prisma.user.create({ data })\n  return NextResponse.json(user, { status: 201 })\n}\n",
+            )
+            .file(
+                "middleware.ts",
+                "import { NextResponse } from 'next/server'\nexport function middleware(req) {\n  if (!req.cookies.get('session')) {\n    return NextResponse.redirect(new URL('/login', req.url))\n  }\n  return NextResponse.next()\n}\n",
+            )
+    }
+
+    /// Every route of the graph, sorted.
+    fn route_names(graph: &Graph) -> Vec<String> {
+        let mut names: Vec<String> = graph
+            .nodes
+            .iter()
+            .filter(|node| node.kind == "route")
+            .map(|node| node.name.clone())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// Upstream F3 (`nextjs.test.ts`, 9c6bc23b): a page is a route named by its path,
+    /// calling its default export; a route handler file is one endpoint per
+    /// exported method, each referencing its function; a layout is no route.
+    #[test]
+    fn f3_a_next_page_is_a_route_that_calls_its_component() {
+        let project = site().index();
+        let graph = project.graph();
+        assert_eq!(
+            route_names(graph),
+            [
+                "/",
+                "/login",
+                "/users",
+                "/users/:id",
+                "GET /api/users",
+                "POST /api/users"
+            ],
+            "{}",
+            graph.report()
+        );
+        graph.assert_edge(
+            "route app/page.tsx::route:/",
+            "calls",
+            "function Home @app/page.tsx",
+            None,
+        );
+        graph.assert_edge(
+            "route app/users/[id]/page.tsx::route:/users/:id",
+            "calls",
+            "function UserPage @app/users/[id]/page.tsx",
+            None,
+        );
+        graph.assert_edge(
+            "route app/api/users/route.ts::POST:/api/users",
+            "references",
+            "function POST @app/api/users/route.ts",
+            None,
+        );
+        graph.assert_edge(
+            "route app/api/users/route.ts::GET:/api/users",
+            "references",
+            "function GET @app/api/users/route.ts",
+            None,
+        );
+    }
+
+    /// Upstream F3: `router.push` with a template hole (in the `useCallback`
+    /// the extractor names `handleSubmit`) reaches the `[id]` page; `redirect()` in a server action and
+    /// `NextResponse.redirect(new URL(…))` in the middleware reach theirs,
+    /// each a `navigates` edge carrying the href and the verb.
+    #[test]
+    fn f3_a_navigation_call_navigates_to_the_page_its_href_names() {
+        let project = site().index();
+        let graph = project.graph();
+        let navigates = |from: &str, to: &str| {
+            let edges = graph.edges_matching(from, "navigates", to);
+            assert_eq!(edges.len(), 1, "{from} -> {to}\n{}", graph.report());
+            edges[0].metadata.clone()
+        };
+        let push = navigates(
+            "function NewUserForm::handleSubmit",
+            "route app/users/[id]/page.tsx::route:/users/:id",
+        );
+        assert_eq!(push["href"], "/users/${…}");
+        assert_eq!(push["navMethod"], "push");
+        assert_eq!(push["resolvedBy"], "framework");
+        assert_eq!(push["framework"], "nextjs");
+        let redirect = navigates(
+            "function createUserAction",
+            "route app/users/page.tsx::route:/users",
+        );
+        assert_eq!(redirect["href"], "/users");
+        assert_eq!(redirect["navMethod"], "redirect");
+        let guard = navigates(
+            "function middleware",
+            "route app/login/page.tsx::route:/login",
+        );
+        assert_eq!(guard["href"], "/login");
+        assert_eq!(guard["navMethod"], "response.redirect");
+    }
+
+    /// Upstream #2129 (`monorepo-app-frameworks.test.ts`), the Next.js
+    /// halves: Next reads only the app whose package.json names `next` (a
+    /// `src/pages/` file of the Expo app is no page), and its layouts,
+    /// components and handler files are no pages. The Expo halves come with
+    /// Expo Router (W7-08).
+    #[test]
+    fn pr2129_next_reads_only_the_app_that_declares_next() {
+        let project = Project::new()
+            .file(
+                "package.json",
+                "{\"name\":\"mono\",\"private\":true,\"workspaces\":[\"apps/*\"]}\n",
+            )
+            .file(
+                "apps/mobile/package.json",
+                "{\"name\":\"mobile\",\"dependencies\":{\"expo\":\"*\",\"expo-router\":\"*\",\"react\":\"*\"}}\n",
+            )
+            .file(
+                "apps/mobile/app/index.tsx",
+                "export default function Home() { return null; }\n",
+            )
+            .file(
+                "apps/mobile/app/user/[id].tsx",
+                "export default function User() { return null; }\n",
+            )
+            .file(
+                "apps/mobile/src/pages/settings.tsx",
+                "export default function Settings() { return null; }\n",
+            )
+            .file(
+                "apps/web/package.json",
+                "{\"name\":\"web\",\"dependencies\":{\"next\":\"*\",\"react\":\"*\"}}\n",
+            )
+            .file(
+                "apps/web/app/layout.tsx",
+                "export default function RootLayout({ children }: { children: unknown }) { return children; }\n",
+            )
+            .file(
+                "apps/web/app/page.tsx",
+                "export default function Page() { return null; }\n",
+            )
+            .file(
+                "apps/web/app/user/[id]/page.tsx",
+                "export default function UserPage() { return null; }\n",
+            )
+            .file(
+                "apps/web/app/_components/posts.tsx",
+                "export default function Posts() { return null; }\n",
+            )
+            .file(
+                "apps/web/app/api/auth/[...all]/route.ts",
+                "export async function GET() { return new Response('ok'); }\n",
+            )
+            .index();
+        let graph = project.graph();
+        let routes_in = |dir: &str| -> Vec<String> {
+            let mut names: Vec<String> = graph
+                .nodes
+                .iter()
+                .filter(|node| node.kind == "route" && node.file_path.starts_with(dir))
+                .map(|node| node.name.clone())
+                .collect();
+            names.sort();
+            names
+        };
+        assert_eq!(
+            routes_in("apps/web/"),
+            ["/", "/user/:id", "GET /api/auth/:all*"],
+            "{}",
+            graph.report()
+        );
+        // A `pages/` file of the app that does not declare Next is no page.
+        assert!(
+            routes_in("apps/mobile/src/").is_empty(),
+            "{}",
+            graph.report()
+        );
+
+        // The nearest manifest that names a router decides: a Next docs app
+        // under a root that names Expo.
+        let project = Project::new()
+            .file(
+                "package.json",
+                "{\"name\":\"true-sheet\",\"devDependencies\":{\"expo\":\"*\",\"expo-router\":\"*\",\"react\":\"*\"}}\n",
+            )
+            .file(
+                "docs/package.json",
+                "{\"name\":\"docs\",\"dependencies\":{\"next\":\"*\",\"react\":\"*\"}}\n",
+            )
+            .file(
+                "docs/app/layout.tsx",
+                "export default function RootLayout({ children }: { children: unknown }) { return children; }\n",
+            )
+            .file(
+                "docs/app/(docs)/[...slug]/page.tsx",
+                "export default function DocPage() { return null; }\n",
+            )
+            .file(
+                "example/app/_layout.tsx",
+                "export default function Layout() { return null; }\n",
+            )
+            .file(
+                "example/app/sheet.tsx",
+                "export default function Sheet() { return null; }\n",
+            )
+            .index();
+        let graph = project.graph();
+        let docs: Vec<&str> = graph
+            .nodes
+            .iter()
+            .filter(|node| node.kind == "route" && node.file_path.starts_with("docs/"))
+            .map(|node| node.name.as_str())
+            .collect();
+        assert_eq!(docs, ["/:slug*"], "{}", graph.report());
+        graph.assert_edge(
+            "route docs/app/(docs)/[...slug]/page.tsx::route:/:slug*",
+            "calls",
+            "function DocPage",
+            None,
+        );
+    }
+
+    /// W7-07 (KEEP-RUST): two Next apps of one monorepo both serve `/login`;
+    /// a call navigates to its own app's page. Upstream keeps one page per
+    /// path, the last in node order, which a sync can change.
+    #[test]
+    fn keep_rust_a_path_two_next_apps_serve_navigates_within_the_callers_app() {
+        let app =
+            |name: &str| format!("{{\"name\":\"{name}\",\"dependencies\":{{\"next\":\"15\"}}}}\n");
+        let project = Project::new()
+            .file("apps/admin/package.json", &app("admin"))
+            .file("apps/web/package.json", &app("web"))
+            .file(
+                "apps/admin/app/login/page.tsx",
+                "export default function AdminLogin() {\n  return null\n}\n",
+            )
+            .file(
+                "apps/web/app/login/page.tsx",
+                "export default function WebLogin() {\n  return null\n}\n",
+            )
+            .file(
+                "apps/admin/app/page.tsx",
+                "import { redirect } from 'next/navigation'\nexport default function AdminHome() {\n  redirect('/login')\n}\n",
+            )
+            .file(
+                "apps/web/app/page.tsx",
+                "import { redirect } from 'next/navigation'\nexport default function WebHome() {\n  redirect('/login')\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        for (from, to) in [
+            (
+                "function AdminHome",
+                "route apps/admin/app/login/page.tsx::route:/login",
+            ),
+            (
+                "function WebHome",
+                "route apps/web/app/login/page.tsx::route:/login",
+            ),
+        ] {
+            let edges = graph.edges_matching(from, "navigates", to);
+            assert_eq!(edges.len(), 1, "{from} -> {to}\n{}", graph.report());
+            assert_eq!(edges[0].metadata["navMethod"], "redirect");
+        }
+        assert_no_edge_any(
+            graph,
+            "function AdminHome",
+            "route apps/web/app/login/page.tsx::route:/login",
+        );
+        assert_no_edge_any(
+            graph,
+            "function WebHome",
+            "route apps/admin/app/login/page.tsx::route:/login",
+        );
+    }
+
+    fn assert_no_edge_any(graph: &Graph, from: &str, to: &str) {
+        graph.assert_no_edge(from, "navigates", to);
+    }
+}
+
 mod explore_flow {
     use super::support::{Project, codegraph};
 

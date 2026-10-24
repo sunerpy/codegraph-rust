@@ -207,6 +207,7 @@ struct SnapshotCaches {
     objc_tables: OnceLock<Arc<crate::objc_scope::ObjcTables>>,
     go_tables: OnceLock<Arc<crate::go_packages::GoTables>>,
     solidity_tables: OnceLock<Arc<crate::solidity_scope::SolidityTables>>,
+    route_tables: OnceLock<Arc<crate::frameworks::route_href::RouteTables>>,
     #[cfg(test)]
     counters: SnapshotCacheCounters,
 }
@@ -242,6 +243,7 @@ impl SnapshotCaches {
             objc_tables: OnceLock::new(),
             go_tables: OnceLock::new(),
             solidity_tables: OnceLock::new(),
+            route_tables: OnceLock::new(),
             #[cfg(test)]
             counters: SnapshotCacheCounters::default(),
         }
@@ -859,6 +861,10 @@ impl ResolutionContext for SnapshotResolutionContext {
         )
     }
 
+    fn route_tables(&self) -> Arc<crate::frameworks::route_href::RouteTables> {
+        Arc::clone(self.caches.route_tables.get_or_init(Default::default))
+    }
+
     fn enclosing_function_lines(
         &self,
         file_path: &str,
@@ -1044,6 +1050,16 @@ mod tests {
             }])
             .unwrap();
         store
+    }
+
+    /// W7-07: a snapshot's routers share one set of route tables.
+    #[test]
+    fn a_snapshot_keeps_one_set_of_route_tables() {
+        let root = temp_root("route-tables");
+        let store = Store::open(&root.join("index.db")).expect("open");
+        let ctx = SnapshotResolutionContext::from_store(&store, root.to_str().unwrap()).unwrap();
+        assert!(Arc::ptr_eq(&ctx.route_tables(), &ctx.route_tables()));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// W5-08: the snapshot context answers a declaration's enclosing

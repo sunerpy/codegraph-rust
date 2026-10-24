@@ -1,5 +1,6 @@
-//! React / Next.js [`FrameworkResolver`] — ports
-//! `upstream resolution/frameworks/react.ts`.
+//! React [`FrameworkResolver`] — ports
+//! `upstream resolution/frameworks/react.ts`. Next.js pages, route handlers
+//! and navigation are [`super::nextjs`]'s.
 
 use std::sync::{Arc, OnceLock};
 
@@ -13,7 +14,7 @@ use crate::types::{
     FrameworkResolverExtractionResult, RefView, ResolutionContext, ResolvedBy, ResolvedRef,
 };
 
-/// React / Next.js resolver (`reactResolver`, react.ts:10-269).
+/// React resolver (`reactResolver`, react.ts:10-269).
 pub struct ReactResolver;
 
 impl FrameworkResolver for ReactResolver {
@@ -205,36 +206,7 @@ impl FrameworkResolver for ReactResolver {
             }
         }
 
-        // Next.js pages/app routes (react.ts:241-265).
-        if file_path.contains("pages/") || file_path.contains("app/") {
-            if content.contains("export default") {
-                if let Some(route_path) = file_path_to_route(file_path) {
-                    let byte = content.find("export default").expect("contains check");
-                    let line_num = line_of(content, byte);
-                    // Route node language is tsx/typescript/javascript (react.ts:260).
-                    let lang = if file_path.ends_with(".tsx") {
-                        Language::Tsx
-                    } else if file_path.ends_with(".ts") {
-                        Language::TypeScript
-                    } else {
-                        Language::JavaScript
-                    };
-                    nodes.push(framework_node(
-                        format!("route:{file_path}:{route_path}:{line_num}"),
-                        NodeKind::Route,
-                        route_path.clone(),
-                        format!("{file_path}::route:{route_path}"),
-                        file_path.to_string(),
-                        line_num,
-                        line_num,
-                        0,
-                        0,
-                        lang,
-                        false,
-                    ));
-                }
-            }
-        }
+        // Next.js pages and route handlers are `super::nextjs`'s.
 
         Some(FrameworkResolverExtractionResult { nodes, references })
     }
@@ -597,51 +569,6 @@ fn strip_context_suffix(name: &str) -> &str {
     }
 }
 
-/// `filePathToRoute` (react.ts:373-417).
-fn file_path_to_route(file_path: &str) -> Option<String> {
-    let base = file_path.rsplit('/').next().unwrap_or(file_path);
-    if !page_ext_regex().is_match(base) {
-        return None;
-    }
-    if base.starts_with('_') || config_file_regex().is_match(base) {
-        return None;
-    }
-
-    if pages_segment_regex().is_match(file_path) {
-        // replace(/^.*pages\//, '/')
-        let after = pages_prefix_regex().replace(file_path, "/");
-        // replace(/\/index\.(tsx?|jsx?)$/, '')
-        let after = index_ext_regex().replace(&after, "");
-        // replace(/\.(tsx?|jsx?)$/, '')
-        let after = trailing_ext_regex().replace(&after, "");
-        // replace(/\[([^\]]+)\]/g, ':$1')
-        let route = param_regex().replace_all(&after, ":$1").into_owned();
-        return Some(if route.is_empty() {
-            "/".to_string()
-        } else {
-            route
-        });
-    }
-
-    if app_segment_regex().is_match(file_path) {
-        if !file_path.contains("page.") {
-            return None;
-        }
-        // replace(/^.*app\//, '/')
-        let after = app_prefix_regex().replace(file_path, "/");
-        // replace(/\/page\.(tsx?|jsx?)$/, '')
-        let after = page_ext_strip_regex().replace(&after, "");
-        let route = param_regex().replace_all(&after, ":$1").into_owned();
-        return Some(if route.is_empty() {
-            "/".to_string()
-        } else {
-            route
-        });
-    }
-
-    None
-}
-
 fn dir_of(file: &str) -> String {
     match file.rfind('/') {
         Some(idx) => file[..idx].to_string(),
@@ -886,56 +813,6 @@ fn obj_element_attr() -> &'static Regex {
 fn obj_component_attr() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r"\bComponent\s*:\s*([A-Z][A-Za-z0-9_]*)").expect("obj component"))
-}
-
-fn page_ext_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"\.(tsx?|jsx?)$").expect("page ext"))
-}
-
-fn config_file_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"\.config\.[a-z]+$").expect("config file"))
-}
-
-fn pages_segment_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"(?:^|/)pages/").expect("pages segment"))
-}
-
-fn pages_prefix_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"^.*pages/").expect("pages prefix"))
-}
-
-fn index_ext_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"/index\.(tsx?|jsx?)$").expect("index ext"))
-}
-
-fn trailing_ext_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"\.(tsx?|jsx?)$").expect("trailing ext"))
-}
-
-fn param_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"\[([^\]]+)\]").expect("param"))
-}
-
-fn app_segment_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"(?:^|/)app/").expect("app segment"))
-}
-
-fn app_prefix_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"^.*app/").expect("app prefix"))
-}
-
-fn page_ext_strip_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"/page\.(tsx?|jsx?)$").expect("page strip"))
 }
 
 #[cfg(test)]
@@ -1764,62 +1641,5 @@ mod tests {
             .extract("src/routes.tsx", content, &test_extraction_context())
             .expect("extract");
         assert!(!result.nodes.iter().any(|n| n.kind == NodeKind::Route));
-    }
-
-    #[test]
-    fn extract_nextjs_app_page_route() {
-        let content = "export default function Page() { return <div/>; }";
-        let result = ReactResolver
-            .extract("app/blog/page.tsx", content, &test_extraction_context())
-            .expect("extract");
-        let route = result
-            .nodes
-            .iter()
-            .find(|n| n.kind == NodeKind::Route)
-            .expect("route");
-        assert_eq!(route.name, "/blog");
-    }
-
-    #[test]
-    fn extract_nextjs_without_export_default_no_route() {
-        let content = "export function NotDefault() { return <div/>; }";
-        let result = ReactResolver
-            .extract("pages/x.tsx", content, &test_extraction_context())
-            .expect("extract");
-        assert!(!result.nodes.iter().any(|n| n.kind == NodeKind::Route));
-    }
-
-    // -- file_path_to_route pure branches -----------------------------------
-
-    #[test]
-    fn file_path_to_route_pages_index_and_param() {
-        assert_eq!(file_path_to_route("pages/index.tsx").as_deref(), Some("/"));
-        assert_eq!(
-            file_path_to_route("pages/users/[id].tsx").as_deref(),
-            Some("/users/:id")
-        );
-    }
-
-    #[test]
-    fn file_path_to_route_app_page_and_missing_page() {
-        assert_eq!(
-            file_path_to_route("app/settings/page.tsx").as_deref(),
-            Some("/settings")
-        );
-        // app/ path but not a page.* file -> None.
-        assert_eq!(file_path_to_route("app/settings/layout.tsx"), None);
-    }
-
-    #[test]
-    fn file_path_to_route_underscore_and_config_and_nonpage() {
-        assert_eq!(file_path_to_route("pages/_app.tsx"), None);
-        assert_eq!(file_path_to_route("pages/next.config.js"), None);
-        // Neither pages/ nor app/ segment.
-        assert_eq!(file_path_to_route("src/routes/home.tsx"), None);
-    }
-
-    #[test]
-    fn file_path_to_route_app_index_becomes_root() {
-        assert_eq!(file_path_to_route("app/page.tsx").as_deref(), Some("/"));
     }
 }

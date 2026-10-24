@@ -791,6 +791,13 @@ pub trait ResolutionContext {
     fn name_matcher_tables(&self) -> Arc<crate::name_matcher::NameMatcherTables> {
         Arc::new(crate::name_matcher::NameMatcherTables::new())
     }
+
+    /// The routers' route tables of one resolution pass (W7-07). Production
+    /// contexts keep them for the pass; this default builds a table each
+    /// time a router asks.
+    fn route_tables(&self) -> Arc<crate::frameworks::route_href::RouteTables> {
+        Arc::new(crate::frameworks::route_href::RouteTables::default())
+    }
 }
 
 /// Go module info parsed from `go.mod`.

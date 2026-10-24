@@ -6,10 +6,10 @@
 //!
 //! # Concrete implementations
 //!
-//! The upstream ships ~22 heuristic `FrameworkResolver` implementations. The v1 Rust
-//! port implements THREE of them — React/Next.js, Vue/Nuxt, and NestJS — in
+//! The upstream ships ~22 heuristic `FrameworkResolver` implementations. The Rust
+//! port implements NestJS, React, Vue, Godot, Tauri, Nuxt and Next.js in
 //! [`crate::frameworks`], detected per-project by
-//! [`crate::frameworks::detect_frameworks`]. The remaining ~19 (Spring/Java,
+//! [`crate::frameworks::detect_frameworks`]. The others (Spring/Java,
 //! React-Native, Go-module, Drupal, Laravel, Express, Svelte, Astro, Python,
 //! Ruby, C#, Swift, etc.) stay deferred (see `KNOWN_DIFFS.md`): they are an
 //! additive heuristic layer on top of the deterministic import + name-matching
@@ -79,8 +79,8 @@ impl FrameworkExtractionContext {
 ///
 /// Ports the upstream `FrameworkResolver` interface (`types.ts:157-197`). Every
 /// method maps 1:1 to an upstream field; `Option`-returning methods model the upstream
-/// `?:` optionals. Three implementations ship in v1 ([`crate::frameworks`]:
-/// React/Next.js, Vue/Nuxt, NestJS); the trait remains the seam through which
+/// `?:` optionals. The implementations live in [`crate::frameworks`]; the
+/// trait remains the seam through which
 /// the remaining upstream resolvers (Java/React-Native/Go-module/Swift-ObjC/…) can
 /// be added later.
 pub trait FrameworkResolver: Sync {
@@ -186,8 +186,8 @@ pub trait FrameworkResolver: Sync {
     /// parked while its route was missing, or bound to the best route then,
     /// is invisible to a sync's retry by name tail; this says which calls a
     /// changed route may answer, so a sync can put them back. `None` when the
-    /// resolver binds no navigation, as every registered resolver does so
-    /// far: no sync calls it yet.
+    /// resolver binds no navigation. Next.js answers it; no sync calls it
+    /// yet.
     fn navigation(&self) -> Option<&dyn NavigationCalls> {
         None
     }

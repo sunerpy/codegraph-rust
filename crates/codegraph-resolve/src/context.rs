@@ -96,6 +96,8 @@ struct Caches {
     objc_tables: Option<Arc<crate::objc_scope::ObjcTables>>,
     go_tables: Option<Arc<crate::go_packages::GoTables>>,
     solidity_tables: Option<Arc<crate::solidity_scope::SolidityTables>>,
+    /// The routers' route tables for the pass (W7-07).
+    route_tables: Option<Arc<crate::frameworks::route_href::RouteTables>>,
 }
 
 /// A compiled pattern set by its key.
@@ -162,6 +164,7 @@ impl Caches {
             objc_tables: None,
             go_tables: None,
             solidity_tables: None,
+            route_tables: None,
         }
     }
 }
@@ -759,6 +762,15 @@ impl ResolutionContext for StoreResolutionContext<'_> {
         )
     }
 
+    fn route_tables(&self) -> Arc<crate::frameworks::route_href::RouteTables> {
+        Arc::clone(
+            self.caches
+                .borrow_mut()
+                .route_tables
+                .get_or_insert_with(Default::default),
+        )
+    }
+
     fn enclosing_function_lines(
         &self,
         file_path: &str,
@@ -1107,6 +1119,22 @@ mod tests {
 
     fn open_store(root: &std::path::Path) -> Store {
         Store::open(&root.join("index.db")).expect("open store")
+    }
+
+    /// W7-07: a pass's routers share one set of route tables, so each
+    /// router reads the route nodes once per pass, not once per call.
+    #[test]
+    fn a_pass_keeps_one_set_of_route_tables() {
+        let root = temp_root("route-tables");
+        let store = open_store(&root);
+        let context = StoreResolutionContext::new(&store, root.to_string_lossy());
+        assert!(Arc::ptr_eq(
+            &context.route_tables(),
+            &context.route_tables()
+        ));
+        let other = StoreResolutionContext::new(&store, root.to_string_lossy());
+        assert!(!Arc::ptr_eq(&context.route_tables(), &other.route_tables()));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     fn node(id: &str, name: &str, kind: NodeKind, file: &str, line: i64, col: i64) -> Node {

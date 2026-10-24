@@ -10635,6 +10635,267 @@ pub fn tauri_command_body_edit_keeps_the_invoke_edges_resolver_name() -> Case {
         )
 }
 
+/// W7-07: a navigation call's file is edited to name another page
+/// (upstream F3): the `navigates` edge follows the href.
+pub fn typescript_next_navigation_call_names_another_page() -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript, Language::Tsx])
+        .file(
+            "package.json",
+            "{\"name\":\"site\",\"dependencies\":{\"next\":\"15\"}}\n",
+        )
+        .file(
+            "app/users/page.tsx",
+            "export default function UsersPage() {\n  return null\n}\n",
+        )
+        .file(
+            "app/login/page.tsx",
+            "export default function LoginPage() {\n  return null\n}\n",
+        )
+        .file(
+            "lib/nav.ts",
+            "import { redirect } from 'next/navigation'\nexport function leave() {\n  redirect('/users')\n}\n",
+        )
+        .write(
+            "lib/nav.ts",
+            "import { redirect } from 'next/navigation'\nexport function leave() {\n  redirect('/login')\n}\n",
+        )
+        .edge_before(
+            "function leave",
+            "navigates",
+            "route app/users/page.tsx::route:/users",
+        )
+        .edge_after(
+            "function leave",
+            "navigates",
+            "route app/login/page.tsx::route:/login",
+        )
+        .no_edge_after(
+            "function leave",
+            "navigates",
+            "route app/users/page.tsx::route:/users",
+        )
+        .edge_metadata_after(
+            (
+                "function leave",
+                "navigates",
+                "route app/login/page.tsx::route:/login",
+            ),
+            "href",
+            "/login",
+        )
+}
+
+/// W7-07: a page's body is edited (upstream F3): its route still calls its
+/// component, and the call in another file still navigates to it.
+pub fn tsx_next_page_body_edit_keeps_its_navigations() -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript, Language::Tsx])
+        .file(
+            "package.json",
+            "{\"name\":\"site\",\"dependencies\":{\"next\":\"15\"}}\n",
+        )
+        .file(
+            "app/users/[id]/page.tsx",
+            "export default function UserPage() {\n  return null\n}\n",
+        )
+        .file(
+            "components/form.ts",
+            "import { useRouter } from 'next/navigation'\nexport function submit(id: string) {\n  const router = useRouter()\n  router.push(`/users/${id}`)\n}\n",
+        )
+        .write(
+            "app/users/[id]/page.tsx",
+            "export default function UserPage() {\n  return <p>user</p>\n}\n",
+        )
+        .edge_throughout(
+            "route app/users/[id]/page.tsx::route:/users/:id",
+            "calls",
+            "function UserPage",
+        )
+        .edge_throughout(
+            "function submit",
+            "navigates",
+            "route app/users/[id]/page.tsx::route:/users/:id",
+        )
+}
+
+/// W7-07: the static page a call names is deleted (upstream F3): the call
+/// navigates to the dynamic route that now serves its path, as a fresh index
+/// does.
+pub fn tsx_next_static_page_delete_falls_back_to_the_dynamic_route() -> Case {
+    Case::new(
+        Change::DeleteImportedModule,
+        &[Language::TypeScript, Language::Tsx],
+    )
+    .file(
+        "package.json",
+        "{\"name\":\"site\",\"dependencies\":{\"next\":\"15\"}}\n",
+    )
+    .file(
+        "app/users/new/page.tsx",
+        "export default function NewUser() {\n  return null\n}\n",
+    )
+    .file(
+        "app/users/[id]/page.tsx",
+        "export default function UserPage() {\n  return null\n}\n",
+    )
+    .file(
+        "lib/nav.ts",
+        "import { redirect } from 'next/navigation'\nexport function create() {\n  redirect('/users/new')\n}\n",
+    )
+    .remove("app/users/new/page.tsx")
+    .edge_before(
+        "function create",
+        "navigates",
+        "route app/users/new/page.tsx::route:/users/new",
+    )
+    .edge_after(
+        "function create",
+        "navigates",
+        "route app/users/[id]/page.tsx::route:/users/:id",
+    )
+}
+
+/// W7-07: the manifest comes to declare Next (upstream F3): Next is
+/// detected, its pages become routes, and a call names one, though no source
+/// changed.
+pub fn typescript_next_dependency_appears_in_package_json() -> Case {
+    Case::new(Change::ControlFile, &[Language::TypeScript, Language::Tsx])
+        .file(
+            "package.json",
+            "{\"name\":\"site\",\"dependencies\":{\"react\":\"19\"}}\n",
+        )
+        .file(
+            "app/login/page.tsx",
+            "export default function LoginPage() {\n  return null\n}\n",
+        )
+        .file(
+            "lib/nav.ts",
+            "import { redirect } from 'next/navigation'\nexport function leave() {\n  redirect('/login')\n}\n",
+        )
+        .write(
+            "package.json",
+            "{\"name\":\"site\",\"dependencies\":{\"react\":\"19\",\"next\":\"15\"}}\n",
+        )
+        .edge_after(
+            "route app/login/page.tsx::route:/login",
+            "calls",
+            "function LoginPage",
+        )
+        .edge_after(
+            "function leave",
+            "navigates",
+            "route app/login/page.tsx::route:/login",
+        )
+}
+
+/// W7-07: a `next.config.mjs` appears beside the pages of an app that
+/// declares no Next dependency (upstream F3): Next is detected by its config.
+pub fn typescript_next_config_appears() -> Case {
+    Case::new(Change::ControlFile, &[Language::TypeScript, Language::Tsx])
+        .file(
+            "package.json",
+            "{\"name\":\"site\",\"dependencies\":{\"react\":\"19\"}}\n",
+        )
+        .file(
+            "pages/about.tsx",
+            "export default function About() {\n  return null\n}\n",
+        )
+        .file(
+            "lib/nav.ts",
+            "export function go(router: { push(path: string): void }) {\n  router.push('/about')\n}\n",
+        )
+        .write("next.config.mjs", "export default {}\n")
+        .edge_after(
+            "route pages/about.tsx::route:/about",
+            "calls",
+            "function About",
+        )
+        .edge_after(
+            "function go",
+            "navigates",
+            "route pages/about.tsx::route:/about",
+        )
+}
+
+/// W7-07: one app's manifest comes to declare Next while another app of the
+/// monorepo already does (upstream #2129): that app's pages become routes
+/// and its own call navigates to its own page; the other app is unchanged.
+pub fn typescript_next_app_manifest_gains_next() -> Case {
+    Case::new(Change::ControlFile, &[Language::TypeScript, Language::Tsx])
+        .file("package.json", "{\"name\":\"mono\",\"private\":true}\n")
+        .file(
+            "apps/web/package.json",
+            "{\"name\":\"web\",\"dependencies\":{\"next\":\"15\"}}\n",
+        )
+        .file(
+            "apps/web/app/login/page.tsx",
+            "export default function WebLogin() {\n  return null\n}\n",
+        )
+        .file(
+            "apps/admin/package.json",
+            "{\"name\":\"admin\",\"dependencies\":{\"react\":\"19\"}}\n",
+        )
+        .file(
+            "apps/admin/app/login/page.tsx",
+            "export default function AdminLogin() {\n  return null\n}\n",
+        )
+        .file(
+            "apps/admin/lib/nav.ts",
+            "import { redirect } from 'next/navigation'\nexport function leave() {\n  redirect('/login')\n}\n",
+        )
+        .write(
+            "apps/admin/package.json",
+            "{\"name\":\"admin\",\"dependencies\":{\"react\":\"19\",\"next\":\"15\"}}\n",
+        )
+        .edge_throughout(
+            "route apps/web/app/login/page.tsx::route:/login",
+            "calls",
+            "function WebLogin",
+        )
+        .edge_after(
+            "route apps/admin/app/login/page.tsx::route:/login",
+            "calls",
+            "function AdminLogin",
+        )
+        .edge_after(
+            "function leave",
+            "navigates",
+            "route apps/admin/app/login/page.tsx::route:/login",
+        )
+        .no_edge_after(
+            "function leave",
+            "navigates",
+            "route apps/web/app/login/page.tsx::route:/login",
+        )
+}
+
+/// W7-07: a route handler's body is edited (upstream F3): each exported
+/// method stays its own endpoint, referencing its function.
+pub fn typescript_next_route_handler_body_edit() -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript])
+        .file(
+            "package.json",
+            "{\"name\":\"site\",\"dependencies\":{\"next\":\"15\"}}\n",
+        )
+        .file(
+            "app/api/users/route.ts",
+            "export async function GET() {\n  return Response.json([])\n}\nexport async function POST(req: Request) {\n  return Response.json({})\n}\n",
+        )
+        .write(
+            "app/api/users/route.ts",
+            "export async function GET() {\n  return Response.json([1])\n}\nexport async function POST(req: Request) {\n  return Response.json({ ok: true })\n}\n",
+        )
+        .edge_throughout(
+            "route app/api/users/route.ts::GET:/api/users",
+            "references",
+            "function GET",
+        )
+        .edge_throughout(
+            "route app/api/users/route.ts::POST:/api/users",
+            "references",
+            "function POST",
+        )
+}
+
 /// W5-06, fail closed: only the manifest's `version` changes; every JS file
 /// re-resolves and every edge stays.
 pub fn typescript_package_version_bump_keeps_every_edge() -> Case {

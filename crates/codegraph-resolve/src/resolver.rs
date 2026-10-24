@@ -5756,8 +5756,8 @@ mod tests {
 
     #[test]
     fn extract_and_persist_frameworks_runs_when_detected() {
-        // With a react project detected, extract_and_persist_frameworks reads the
-        // relative file and persists any framework nodes/refs it emits.
+        // With a Next.js project detected, extract_and_persist_frameworks reads
+        // the relative file and persists any framework nodes/refs it emits.
         let dir = std::env::temp_dir().join(format!(
             "codegraph-fw-extract-{}-{}",
             std::process::id(),
@@ -5769,12 +5769,10 @@ mod tests {
         std::fs::create_dir_all(dir.join("pages")).expect("mkdir");
         std::fs::write(
             dir.join("package.json"),
-            r#"{"dependencies":{"react":"18"}}"#,
+            r#"{"dependencies":{"next":"14"}}"#,
         )
         .expect("pkg");
-        // The react resolver's languages() is [JavaScript, TypeScript]; a `.tsx`
-        // maps to Language::Tsx (not applicable), so use a `.ts` page whose Next.js
-        // route branch still fires on `export default`.
+        // A Next.js page: the Next resolver extracts its route.
         std::fs::write(
             dir.join("pages/about.ts"),
             "export default function About() { return 1; }",

@@ -180,13 +180,15 @@ the Rust graph holds different facts, the viewer shows what this index holds:
 - **Steps** (`/api/steps`) is not served yet: its effect and program builders and
   the branch conditions they use (UI families F1–F6 and F11) are a later port.
   The frontend is built without it, so the Steps view says it cannot draw steps.
-- **Screens** answers upstream's own "no screen navigation" result: the Rust
-  graph has no `navigates` edges until the navigation resolvers are ported.
-- Branch conditions on call sites (`when`) are absent from every edge for the
-  same reason.
-- Routes come from the framework resolvers this port has — React Router and
-  Next.js pages, Nuxt pages, NestJS controllers. Express, Go HTTP and Vue Router
-  routers are not among them, so those projects are not routed apps here.
+- **Screens** answers upstream's own "no screen navigation" result: its
+  builder is not ported, so the `navigates` edges the Next.js resolver draws
+  are not drawn as screens yet.
+- Branch conditions on call sites (`when`) are absent from every edge: the
+  builders that attach them are not ported either.
+- Routes come from the framework resolvers this port has — React Router
+  routes, Next.js pages and route handlers, Nuxt pages, NestJS controllers.
+  Express, Go HTTP and Vue Router routers are not among them, so those
+  projects are not routed apps here.
 - The Rust index has no synthesized dynamic-dispatch edges, so a flow never
   shows a dashed `via …` hop from synthesis, and a Go interface's implicit
   implementations are not part of its type hierarchy.

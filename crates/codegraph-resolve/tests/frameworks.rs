@@ -1,4 +1,4 @@
-//! Regression tests for the React / Vue / Nuxt / NestJS [`FrameworkResolver`]s.
+//! Regression tests for the React / Next.js / Vue / Nuxt / NestJS [`FrameworkResolver`]s.
 //!
 //! Each test drives a resolver through an in-memory [`ResolutionContext`] and
 //! asserts the produced [`ResolvedRef`] / extraction shape against the upstream
@@ -8,7 +8,7 @@ use std::collections::HashMap;
 
 use codegraph_core::types::{EdgeKind, Language, Node, NodeKind};
 use codegraph_resolve::framework::FrameworkResolver;
-use codegraph_resolve::frameworks::{detect_frameworks, godot, nestjs, react, vue};
+use codegraph_resolve::frameworks::{detect_frameworks, godot, nestjs, nextjs, react, vue};
 use codegraph_resolve::types::{ImportMapping, RefView, ResolutionContext, ResolvedBy};
 
 /// Extraction context for a resolver call that needs no project configuration.
@@ -302,8 +302,8 @@ fn react_resolves_only_the_files_own_context() {
 }
 
 #[test]
-fn react_extract_emits_nextjs_page_route() {
-    let result = react::ReactResolver
+fn nextjs_extract_emits_a_page_route_calling_its_default_export() {
+    let result = nextjs::NextjsResolver
         .extract(
             "pages/about.tsx",
             "export default function About() { return <div/>; }",
@@ -316,6 +316,21 @@ fn react_extract_emits_nextjs_page_route() {
         .find(|n| n.kind == NodeKind::Route)
         .expect("route node");
     assert_eq!(route.name, "/about");
+    assert!(
+        result
+            .references
+            .iter()
+            .any(|r| r.reference_name == "About" && r.reference_kind == EdgeKind::Calls)
+    );
+    // React no longer reads Next.js file routes.
+    let react = react::ReactResolver
+        .extract(
+            "pages/about.tsx",
+            "export default function About() { return <div/>; }",
+            &no_project_config(),
+        )
+        .expect("extract result");
+    assert!(!react.nodes.iter().any(|n| n.kind == NodeKind::Route));
 }
 
 #[test]
