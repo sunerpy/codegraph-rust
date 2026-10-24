@@ -216,6 +216,15 @@ listed.
 - **C# extension methods (W3-05c, owner 2026-10-11, OD-8).** A call on an
   outside type reaches the one project extension method in scope that takes it
   as `this`; colby resolves no extension method (`csharp_extensions.rs`).
+- **A test's NestJS bootstrap (W7-02b).** A `NestFactory.create` in a test
+  file (an e2e spec) with no `src/` segment above it belongs to the directory
+  above its test folder, else the one holding it, and within one app the
+  entry point's bootstrap decides over a test's: an e2e spec's
+  `setGlobalPrefix('api')` names neither another integration app's routes
+  nor the routes its app's own entry point serves. colby puts every such
+  spec at the repository root and prefers a bootstrap that configures the
+  app, so all of nestjs/nest's integration apps took one spec's `/api`
+  (`nestjs.rs`).
 - **Dart named constructors (#2380).** A named constructor, indexed as a
   method, is reached only by a call written through its class (`Foo.value(2)`).
   A call through a value of that type (a typed parameter or local, a chain's

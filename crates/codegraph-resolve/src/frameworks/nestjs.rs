@@ -183,8 +183,10 @@ impl FrameworkResolver for NestjsResolver {
             // Every app counts, even one that adds nothing: its routes must
             // not borrow another app's prefix.
             if nest_factory_create_regex().is_match(&safe) {
+                let test = codegraph_core::file_class::is_test_file(file_path);
                 bootstraps.push(NestBootstrap {
-                    root: app_root_of(file_path).to_string(),
+                    root: bootstrap_root(file_path, test),
+                    test,
                     config: read_bootstrap(&safe),
                 });
             }
@@ -530,28 +532,65 @@ impl NestAppConfig {
 
 struct NestBootstrap {
     root: String,
+    /// Whether a test (an e2e spec) creates this app, not its entry point.
+    test: bool,
     config: NestAppConfig,
 }
 
 /// The app a file belongs to (`appRootOf`): the directory above its first
 /// `src/` segment (`apps/api/`), else the repository (`""`).
 fn app_root_of(file_path: &str) -> &str {
+    src_root(file_path).unwrap_or("")
+}
+
+/// The directory above `file_path`'s first `src/` segment, when it has one.
+fn src_root(file_path: &str) -> Option<&str> {
     let mut at = 0;
     for segment in file_path.split('/') {
         let next = at + segment.len() + 1;
         if segment == "src" && next <= file_path.len() {
-            return &file_path[..at];
+            return Some(&file_path[..at]);
         }
         at = next;
     }
-    ""
+    None
+}
+
+/// The directories that make a file a test (`file_class::is_test_file`'s).
+const TEST_DIRECTORIES: [&str; 5] = ["test", "tests", "__tests__", "spec", "e2e"];
+
+/// The app the `NestFactory.create` in `file_path` serves. A test's (an e2e
+/// spec's) with no `src/` segment above it serves its own feature: the
+/// directory above its test folder (`integration/security/` for
+/// `integration/security/e2e/csrf.spec.ts`), else the directory holding it
+/// (KEEP-RUST). Upstream's `appRootOf` puts every such spec at the
+/// repository, where nestjs/nest's integration apps all took one spec's
+/// `setGlobalPrefix('api')`. Any other file's app is [`app_root_of`]'s.
+fn bootstrap_root(file_path: &str, test: bool) -> String {
+    if !test || src_root(file_path).is_some() {
+        return app_root_of(file_path).to_string();
+    }
+    let mut at = 0;
+    let mut segments = file_path.split('/').peekable();
+    while let Some(segment) = segments.next() {
+        if segments.peek().is_none() {
+            break;
+        }
+        if TEST_DIRECTORIES.contains(&segment) {
+            return file_path[..at].to_string();
+        }
+        at += segment.len() + 1;
+    }
+    file_path[..at].to_string()
 }
 
 /// The config of the app that holds `file_path` (`bootstrapFor`): the
 /// bootstrap with the longest root above it, else, for a file outside every
 /// app (an Nx `libs/` controller), the app when there is only one. A seed or
 /// migration script creates the same app without serving it, so the
-/// bootstrap that configures the app is the one that serves it.
+/// bootstrap that configures the app is the one that serves it. A test's
+/// bootstrap configures only an app no entry point creates (KEEP-RUST): an
+/// e2e spec's `setGlobalPrefix` is not what `src/main.ts` serves.
 fn bootstrap_for<'a>(
     bootstraps: &'a [NestBootstrap],
     file_path: &str,
@@ -574,9 +613,18 @@ fn bootstrap_for<'a>(
             &first.root
         }
     };
-    let mut here = bootstraps.iter().filter(|b| b.root == root);
-    let first = here.clone().next()?;
-    Some(&here.find(|b| b.config.adds()).unwrap_or(first).config)
+    let mut here: Vec<&NestBootstrap> = bootstraps.iter().filter(|b| b.root == root).collect();
+    if here.iter().any(|b| !b.test) {
+        here.retain(|b| !b.test);
+    }
+    let first = here.first()?;
+    Some(
+        &here
+            .iter()
+            .find(|b| b.config.adds())
+            .unwrap_or(first)
+            .config,
+    )
 }
 
 /// One version value (`versionValue`): `'2'`, `['1', '2']` (the first),
@@ -2650,7 +2698,15 @@ class F {}
     fn bootstrap(root: &str, safe: &str) -> NestBootstrap {
         NestBootstrap {
             root: root.to_string(),
+            test: false,
             config: read_bootstrap(safe),
+        }
+    }
+
+    fn test_bootstrap(root: &str, safe: &str) -> NestBootstrap {
+        NestBootstrap {
+            test: true,
+            ..bootstrap(root, safe)
         }
     }
 
@@ -2675,6 +2731,84 @@ class F {}
         assert_eq!(app_root_of("libs/shared/x.ts"), "");
         assert_eq!(app_root_of("apps/mysrc/main.ts"), "");
         assert_eq!(app_root_of("apps/src"), "");
+    }
+
+    /// W7-02b (KEEP-RUST): a test's bootstrap with no `src/` above it serves
+    /// the feature above its test folder; every other file's app is the one
+    /// above its `src/`, else the repository.
+    #[test]
+    fn a_tests_bootstrap_belongs_to_its_own_feature() {
+        for (file, test, root) in [
+            (
+                "integration/security/e2e/csrf-protection.spec.ts",
+                true,
+                "integration/security/",
+            ),
+            (
+                "integration/cookies/e2e/cookies.spec.ts",
+                true,
+                "integration/cookies/",
+            ),
+            ("test/app.e2e-spec.ts", true, ""),
+            ("apps/api/test/app.e2e-spec.ts", true, "apps/api/"),
+            (
+                "packages/core/test/scope/transient.spec.ts",
+                true,
+                "packages/core/",
+            ),
+            ("integration/hooks/main.spec.ts", true, "integration/hooks/"),
+            ("app.spec.ts", true, ""),
+            ("apps/api/src/app.e2e.spec.ts", true, "apps/api/"),
+            ("apps/api/src/test/app.e2e-spec.ts", true, "apps/api/"),
+            ("server/main.ts", false, ""),
+            ("apps/api/src/main.ts", false, "apps/api/"),
+        ] {
+            assert_eq!(bootstrap_root(file, test), root, "{file}");
+        }
+    }
+
+    /// W7-02b (KEEP-RUST): within an app, its entry point's bootstrap decides
+    /// over a test's; a test's configures an app nothing else creates.
+    #[test]
+    fn an_entry_points_bootstrap_decides_over_a_tests() {
+        let main = bootstrap("", "NestFactory.create(AppModule);");
+        let spec = test_bootstrap(
+            "",
+            "NestFactory.create(AppModule);\napp.setGlobalPrefix('api');",
+        );
+        assert_eq!(
+            bootstrap_for(&[spec, main], "src/users/users.controller.ts")
+                .map(|config| config.adds()),
+            Some(false)
+        );
+        let main = bootstrap(
+            "",
+            "NestFactory.create(AppModule);\napp.setGlobalPrefix('api');",
+        );
+        let spec = test_bootstrap("", "NestFactory.create(AppModule);");
+        assert_eq!(
+            bootstrap_for(&[spec, main], "src/users/users.controller.ts")
+                .map(|config| config.prefix.as_str()),
+            Some("api")
+        );
+        let security = test_bootstrap(
+            "integration/security/",
+            "NestFactory.create(AppModule);\napp.setGlobalPrefix('api');",
+        );
+        let cookies = test_bootstrap("integration/cookies/", "NestFactory.create(AppModule);");
+        let bootstraps = [security, cookies];
+        assert_eq!(
+            bootstrap_for(&bootstraps, "integration/security/src/app.controller.ts")
+                .map(|config| config.prefix.as_str()),
+            Some("api")
+        );
+        assert_eq!(
+            bootstrap_for(&bootstraps, "integration/cookies/src/app.controller.ts")
+                .map(|config| config.prefix.as_str()),
+            Some("")
+        );
+        // A feature no bootstrap creates, beside two apps: none of theirs.
+        assert!(bootstrap_for(&bootstraps, "integration/hello/src/hello.controller.ts").is_none());
     }
 
     #[test]

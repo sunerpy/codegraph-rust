@@ -19184,6 +19184,45 @@ mod frameworks {
         );
     }
 
+    /// W7-02b (KEEP-RUST): a test's `NestFactory.create` (an e2e spec) with no
+    /// `src/` above it serves the feature above its test folder. One
+    /// feature's spec setting `setGlobalPrefix('api')` names that feature's
+    /// routes and no other's, where upstream gives every integration app of
+    /// nestjs/nest that spec's `/api`.
+    #[test]
+    fn keep_rust_a_tests_nest_bootstrap_names_only_its_own_features_routes() {
+        let project = Project::new()
+            .file("package.json", NEST_PACKAGE)
+            .file(
+                "integration/security/e2e/csrf-protection.spec.ts",
+                "import { NestFactory } from '@nestjs/core';\nimport { AppModule } from '../src/app.module';\ndescribe('CSRF', () => {\n  it('protects', async () => {\n    const app = await NestFactory.create(AppModule);\n    app.setGlobalPrefix('api');\n    await app.init();\n  });\n});\n",
+            )
+            .file(
+                "integration/security/src/csrf.controller.ts",
+                "import { Controller, Get } from '@nestjs/common';\n@Controller('csrf')\nexport class CsrfController {\n  @Get()\n  public token() {}\n}\n",
+            )
+            .file(
+                "integration/cookies/e2e/cookies.spec.ts",
+                "import { NestFactory } from '@nestjs/core';\nimport { AppModule } from '../src/app.module';\ndescribe('Cookies', () => {\n  it('sets', async () => {\n    const app = await NestFactory.create(AppModule);\n    await app.init();\n  });\n});\n",
+            )
+            .file(
+                "integration/cookies/src/cookies.controller.ts",
+                "import { Controller, Get } from '@nestjs/common';\n@Controller('cookies')\nexport class CookiesController {\n  @Get('set')\n  public set() {}\n}\n",
+            )
+            .file(
+                "integration/hello/src/hello.controller.ts",
+                "import { Controller, Get } from '@nestjs/common';\n@Controller('hello')\nexport class HelloController {\n  @Get()\n  public hi() {}\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        assert_eq!(
+            route_names(graph),
+            ["GET /api/csrf", "GET /cookies/set", "GET /hello"],
+            "{}",
+            graph.report()
+        );
+    }
+
     /// Upstream #2246: in a TS/JS module the provider convention (`*Service`,
     /// `*Controller`, …) takes the file's own class or the convention file
     /// beside it, never a same-named class elsewhere preferred for its file

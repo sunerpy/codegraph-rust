@@ -1383,6 +1383,7 @@ matrix! {
     typescript_react_dependency_beside_an_added_script,
     typescript_nestjs_bootstrap_sets_a_global_prefix,
     typescript_nestjs_bootstrap_drops_its_global_prefix,
+    typescript_nestjs_e2e_spec_sets_a_global_prefix,
     typescript_nestjs_router_module_registration_is_removed,
     typescript_nestjs_provider_beside_its_controller_appears,
     vue_nuxt_config_appears,

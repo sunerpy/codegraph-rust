@@ -10315,6 +10315,37 @@ pub fn typescript_nestjs_bootstrap_drops_its_global_prefix() -> Case {
         .named_after("route", "GET /users/:id")
 }
 
+/// W7-02b (KEEP-RUST): one feature's e2e spec comes to set a global prefix:
+/// only that feature's routes are renamed; the feature beside it, whose own
+/// spec configures nothing, keeps its routes as written.
+pub fn typescript_nestjs_e2e_spec_sets_a_global_prefix() -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript])
+        .file("package.json", NEST_PACKAGE)
+        .file(
+            "integration/security/e2e/csrf.spec.ts",
+            "import { NestFactory } from '@nestjs/core';\nimport { AppModule } from '../src/app.module';\n\nit('protects', async () => {\n  const app = await NestFactory.create(AppModule);\n  await app.init();\n});\n",
+        )
+        .file(
+            "integration/security/src/csrf.controller.ts",
+            "import { Controller, Get } from '@nestjs/common';\n\n@Controller('csrf')\nexport class CsrfController {\n  @Get()\n  token() {\n    return 1;\n  }\n}\n",
+        )
+        .file(
+            "integration/cookies/e2e/cookies.spec.ts",
+            "import { NestFactory } from '@nestjs/core';\nimport { AppModule } from '../src/app.module';\n\nit('sets', async () => {\n  const app = await NestFactory.create(AppModule);\n  await app.init();\n});\n",
+        )
+        .file(
+            "integration/cookies/src/cookies.controller.ts",
+            "import { Controller, Get } from '@nestjs/common';\n\n@Controller('cookies')\nexport class CookiesController {\n  @Get('set')\n  set() {\n    return 1;\n  }\n}\n",
+        )
+        .write(
+            "integration/security/e2e/csrf.spec.ts",
+            "import { NestFactory } from '@nestjs/core';\nimport { AppModule } from '../src/app.module';\n\nit('protects', async () => {\n  const app = await NestFactory.create(AppModule);\n  app.setGlobalPrefix('api');\n  await app.init();\n});\n",
+        )
+        .named_before("route", "GET /csrf")
+        .named_after("route", "GET /api/csrf")
+        .named_after("route", "GET /cookies/set")
+}
+
 /// W7-02: a RouterModule registration goes away: the routes it prefixed get
 /// their in-file names back (the RouterModule pass renamed them; nothing
 /// renamed them back before).
