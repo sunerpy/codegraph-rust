@@ -16,8 +16,9 @@
 //! names a control file, is a folder coming into a workspace glob's listing,
 //! or changes which files the kind's readers start from) and compares: a kind
 //! that moved re-resolves every file of its languages whole; a framework that
-//! came or went re-extracts every file, since framework nodes are made at
-//! extraction. The rows are written last;
+//! came or went, or a manifest edit that moves which files a framework that
+//! runs only in its own apps extracts, re-extracts every file, since
+//! framework nodes are made at extraction. The rows are written last;
 //! `control_inputs_version` is withdrawn and restored with the other
 //! markers, and `frameworks_version` only by a sync that re-extracts for a
 //! framework change.
@@ -39,7 +40,9 @@ pub const VERSION_KEY: &str = "control_inputs_version";
 pub const VERSION: &str = "1";
 /// Metadata key prefix of a kind's row.
 pub const ROW_KEY_PREFIX: &str = "control_inputs:";
-/// Metadata key of the detected frameworks, sorted, as JSON.
+/// Metadata key of the detected frameworks, sorted, as JSON, then the digest
+/// of which files the frameworks that run only in their own apps extract
+/// ([`codegraph_resolve::ReferenceResolver::framework_signature`]).
 pub const FRAMEWORKS_KEY: &str = "frameworks_detected";
 /// Metadata key present when no sync left a framework change unextracted.
 pub const FRAMEWORKS_VERSION_KEY: &str = "frameworks_version";
@@ -214,6 +217,15 @@ pub fn digests_of(kind: ControlKind, project_root: &Path, files: &[FileRecord]) 
                 let digest = file_digest(&project_root.join(&relative));
                 out.insert(relative, digest);
             }
+            // The manifests framework detection reads (upstream #2395): the
+            // root's, the ones one or two directories down from any indexed
+            // file, and the ones deeper above JavaScript-family code.
+            let paths: Vec<String> = files.iter().map(|file| file.path.clone()).collect();
+            for relative in codegraph_resolve::frameworks::package_deps::manifest_candidates(&paths)
+            {
+                let digest = file_digest(&project_root.join(&relative));
+                out.insert(relative, digest);
+            }
         }
         ControlKind::Csharp => {
             let cs: Vec<String> = files
@@ -379,9 +391,9 @@ impl ControlCheck {
 /// kind; otherwise a kind is re-read when a `requested` path is one of its
 /// recorded inputs, is a listed directory or one directly in a workspace
 /// glob's listing, or names one of its control files, or a `membership`
-/// change touches a file its readers start from. A `bootstrap` (the marker
-/// was missing when the sync began) re-reads every kind and counts each as
-/// moved.
+/// change touches a file its readers start from (for the JS kind, any file
+/// that comes or goes). A `bootstrap` (the marker was missing when the sync
+/// began) re-reads every kind and counts each as moved.
 pub(crate) fn check(
     store: &Store,
     project_root: &Path,
@@ -412,10 +424,15 @@ pub(crate) fn check(
                 || (kind == ControlKind::Js
                     && row.contains_key(&format!("dir:{}", parent_of(path))))
         }) || membership.iter().any(|(path, before, after)| {
-            before
-                .iter()
-                .chain(after)
-                .any(|language| kind.reads_from(path, *language))
+            // Framework detection reads the manifests one or two directories
+            // down from every indexed file, whatever its language (upstream
+            // #2395), so a file of any language that comes or goes may move
+            // the JS kind's inputs.
+            (kind == ControlKind::Js && (before.is_none() || after.is_none()))
+                || before
+                    .iter()
+                    .chain(after)
+                    .any(|language| kind.reads_from(path, *language))
         })
     };
     let mut out = ControlCheck::default();

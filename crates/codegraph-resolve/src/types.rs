@@ -207,7 +207,7 @@ impl ResolvedBy {
 
 /// A resolved reference.
 ///
-/// Ports the upstream `ResolvedRef` interface (`types.ts:34-43`).
+/// Ports the upstream `ResolvedRef` interface (`types.ts:39-71`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedRef {
     /// Original unresolved reference.
@@ -218,6 +218,75 @@ pub struct ResolvedRef {
     pub confidence: f64,
     /// How it was resolved.
     pub resolved_by: ResolvedBy,
+    /// What a framework resolver adds to the edges this resolution draws;
+    /// `None` for a plain edge of the reference's own kind.
+    pub edge: Option<Box<EdgeShape>>,
+}
+
+impl ResolvedRef {
+    /// A resolution drawing one plain edge of the reference's own kind.
+    #[must_use]
+    pub fn new(
+        original: RefView,
+        target_node_id: String,
+        confidence: f64,
+        resolved_by: ResolvedBy,
+    ) -> Self {
+        Self {
+            original,
+            target_node_id,
+            confidence,
+            resolved_by,
+            edge: None,
+        }
+    }
+
+    /// This resolution drawing the edges `edge` describes.
+    #[must_use]
+    pub fn with_edge(mut self, edge: EdgeShape) -> Self {
+        self.edge = Some(Box::new(edge));
+        self
+    }
+
+    /// This resolution as the framework resolver `framework` made it: the
+    /// edge to its target names that resolver in `metadata.framework`
+    /// (upstream #2159), so a bridge or router hop says how it got into the
+    /// graph, as a synthesized edge's `synthesizedBy` does. The edges to
+    /// [`EdgeShape::also_targets`] keep their own metadata, as upstream's do.
+    #[must_use]
+    pub fn named_by(mut self, framework: &str) -> Self {
+        self.edge
+            .get_or_insert_with(Box::default)
+            .metadata
+            .insert("framework".to_string(), serde_json::json!(framework));
+        self
+    }
+}
+
+/// The edges a framework resolution draws when they are not one plain edge
+/// of the reference's own kind (upstream `ResolvedRef.edgeKind`, `metadata`
+/// and `alsoTargets`).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct EdgeShape {
+    /// The edges' kind when it is not the reference's own: a router turns a
+    /// `calls` reference into a `navigates` edge.
+    pub edge_kind: Option<EdgeKind>,
+    /// Metadata persisted on the edge to the resolution's target (`href`, …).
+    pub metadata: serde_json::Map<String, serde_json::Value>,
+    /// The other targets, when one reference names several: a navigation
+    /// whose destination is a conditional reaches every arm. Each is an edge
+    /// of its own with its own metadata, sharing the kind and confidence; the
+    /// reference still resolves once.
+    pub also_targets: Vec<AlsoTarget>,
+}
+
+/// One more target of a resolution ([`EdgeShape::also_targets`]).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct AlsoTarget {
+    /// ID of the target node.
+    pub target_node_id: String,
+    /// Metadata persisted on this target's edge.
+    pub metadata: serde_json::Map<String, serde_json::Value>,
 }
 
 /// Aggregate resolution statistics.
@@ -423,6 +492,12 @@ pub trait ResolutionContext {
         self.get_nodes_in_file_shared(file_path)
             .iter()
             .any(|node| node.is_exported)
+    }
+    /// The dependency names the project's `package.json` files declare
+    /// ([`crate::frameworks::package_deps::declared_dependencies`]). Contexts
+    /// that live for one pass compute it once; the default recomputes.
+    fn declared_dependencies(&self) -> Arc<std::collections::BTreeSet<String>> {
+        Arc::new(crate::frameworks::package_deps::declared_dependencies(self))
     }
     /// Get project root (`getProjectRoot`).
     fn get_project_root(&self) -> &str;
@@ -892,12 +967,12 @@ mod tests {
 
     #[test]
     fn resolved_ref_constructs() {
-        let rr = ResolvedRef {
-            original: sample_ref(),
-            target_node_id: "fn:2".to_string(),
-            confidence: 0.75,
-            resolved_by: ResolvedBy::ExactMatch,
-        };
+        let rr = ResolvedRef::new(
+            sample_ref(),
+            "fn:2".to_string(),
+            0.75,
+            ResolvedBy::ExactMatch,
+        );
         assert_eq!(rr.clone(), rr);
         assert!((rr.confidence - 0.75).abs() < f64::EPSILON);
         assert_eq!(rr.resolved_by, ResolvedBy::ExactMatch);

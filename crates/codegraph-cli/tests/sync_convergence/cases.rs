@@ -1072,6 +1072,72 @@ pub fn tsx_tag_becomes_a_parameter_body_edit() -> Case {
         .no_edge_after("function Widgets", "references", "function Widget @src/Widget.tsx")
 }
 
+/// Upstream #841: a `<Route>` in a `.tsx` file is a route, and an edit to
+/// the element it renders moves its edge, as a fresh index of the edit finds.
+pub fn tsx_route_element_body_edit() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Tsx])
+        .file(
+            "package.json",
+            "{\"dependencies\":{\"react\":\"^18.0.0\",\"react-router-dom\":\"^6.0.0\"}}\n",
+        )
+        .file("src/Home.tsx", "export function Home() {\n  return <h1 />;\n}\n")
+        .file("src/About.tsx", "export function About() {\n  return <h2 />;\n}\n")
+        .file(
+            "src/App.tsx",
+            "import { Routes, Route } from 'react-router-dom';\nimport { Home } from './Home';\nimport { About } from './About';\n\nexport function App() {\n  return (\n    <Routes>\n      <Route path=\"/page\" element={<Home />} />\n    </Routes>\n  );\n}\n",
+        )
+        .write(
+            "src/App.tsx",
+            "import { Routes, Route } from 'react-router-dom';\nimport { Home } from './Home';\nimport { About } from './About';\n\nexport function App() {\n  return (\n    <Routes>\n      <Route path=\"/page\" element={<About />} />\n    </Routes>\n  );\n}\n",
+        )
+        .edge_before("route src/App.tsx::route:/page", "references", "function Home")
+        .edge_after("route src/App.tsx::route:/page", "references", "function About")
+        .no_edge_after("route src/App.tsx::route:/page", "references", "function Home")
+}
+
+/// Upstream #2420: a component value a `.tsx` file declares renders the
+/// function it wraps, wherever the file uses it; an edit to what it wraps
+/// moves the tag's edge, never to another file's namesake.
+pub fn tsx_wrapper_value_body_edit() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Tsx])
+        .file("package.json", "{\"dependencies\":{\"react\":\"^18.0.0\"}}\n")
+        .file("src/other/Table.tsx", "export function Table() {\n  return <p />;\n}\n")
+        .file(
+            "src/App.tsx",
+            "import { observer } from 'mobx-react';\n\nfunction TableInner() {\n  return <table />;\n}\nfunction TableOuter() {\n  return <section />;\n}\nconst Table = observer(TableInner);\n\nexport function App() {\n  return <Table />;\n}\n",
+        )
+        .write(
+            "src/App.tsx",
+            "import { observer } from 'mobx-react';\n\nfunction TableInner() {\n  return <table />;\n}\nfunction TableOuter() {\n  return <section />;\n}\nconst Table = observer(TableOuter);\n\nexport function App() {\n  return <Table />;\n}\n",
+        )
+        .edge_before("function App", "references", "function TableInner")
+        .edge_after("function App", "references", "function TableOuter")
+        .no_edge_after("function App", "references", "function TableInner")
+        .no_edge_after("function App", "references", "function Table @src/other/Table.tsx")
+}
+
+/// W7-04b (upstream #2159): the edge the React resolver makes names it in
+/// `metadata.framework`, and the file's re-extraction draws it again with the
+/// name, as a fresh index does.
+pub fn tsx_framework_edge_keeps_its_resolvers_name() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Tsx])
+        .file("package.json", "{\"dependencies\":{\"react\":\"^18.0.0\"}}\n")
+        .file(
+            "src/App.tsx",
+            "import { observer } from 'mobx-react';\n\nfunction TableInner() {\n  return <table />;\n}\nconst Table = observer(TableInner);\n\nexport function App() {\n  return <Table />;\n}\n",
+        )
+        .write(
+            "src/App.tsx",
+            "import { observer } from 'mobx-react';\n\nfunction TableInner() {\n  return <table className=\"wide\" />;\n}\nconst Table = observer(TableInner);\n\nexport function App() {\n  return <Table />;\n}\n",
+        )
+        .edge_after("function App", "references", "function TableInner")
+        .edge_metadata_after(
+            ("function App", "references", "function TableInner"),
+            "framework",
+            "react",
+        )
+}
+
 /// Upstream #2418: an interface moved into a `declare module 'x'` body is
 /// exported, so another file's type reference reaches it by name, as a fresh
 /// index of the edit finds.
@@ -10003,8 +10069,10 @@ pub fn typescript_tsconfig_past_64_mib_replaced_with_its_size_and_mtime_kept() -
         .edge_after("file:src/main.ts", "imports", "function double")
 }
 
-/// Found by this matrix: only a fresh index detects React, mints the hook node
-/// and resolves the call through it.
+/// Found by this matrix: only a fresh index detected React. React coming into
+/// `package.json` makes the data router's table a route that renders its
+/// component (the React resolver's extraction runs only once React is
+/// detected).
 pub fn typescript_react_dependency_appears_in_package_json() -> Case {
     Case::new(Change::ControlFile, &[Language::TypeScript])
         .file(
@@ -10012,19 +10080,19 @@ pub fn typescript_react_dependency_appears_in_package_json() -> Case {
             "{\"name\":\"web\",\"dependencies\":{\"left-pad\":\"1.3.0\"}}\n",
         )
         .file(
-            "src/hooks.ts",
-            "export function useCart(): number {\n  return 1;\n}\n",
+            "src/dashboard.ts",
+            "export function Dashboard(): null {\n  return null;\n}\n",
         )
         .file(
-            "src/page.ts",
-            "export function page(): number {\n  return useCart();\n}\n",
+            "src/routes.ts",
+            "import { createBrowserRouter } from 'react-router-dom';\nimport { Dashboard } from './dashboard';\n\nexport const router = createBrowserRouter([{ path: '/dash', Component: Dashboard }]);\n",
         )
         .write(
             "package.json",
             "{\"name\":\"web\",\"dependencies\":{\"left-pad\":\"1.3.0\",\"react\":\"18.2.0\"}}\n",
         )
-        .edge_before("function page", "calls", "function useCart")
-        .edge_after("function page", "calls", "function src/hooks.ts::useCart")
+        .edge_before("file:src/routes.ts", "imports", "function Dashboard")
+        .edge_after("route src/routes.ts::route:/dash", "references", "function Dashboard")
 }
 
 /// W5-06: a `jsconfig.json` gaining `paths` makes the alias import resolve.
@@ -10114,8 +10182,8 @@ pub fn typescript_paths_retarget_moves_a_barrel_source() -> Case {
         .edge_after("function run", "calls", "function double @src/alt/math.ts")
 }
 
-/// W5-06: React leaving `package.json` takes the framework's hook node with
-/// it, and the call resolves by name again.
+/// W5-06: React leaving `package.json` takes the framework's route node with
+/// it; the import of the component stays.
 pub fn typescript_react_dependency_leaves_package_json() -> Case {
     Case::new(Change::ControlFile, &[Language::TypeScript])
         .file(
@@ -10123,19 +10191,314 @@ pub fn typescript_react_dependency_leaves_package_json() -> Case {
             "{\"name\":\"web\",\"dependencies\":{\"left-pad\":\"1.3.0\",\"react\":\"18.2.0\"}}\n",
         )
         .file(
-            "src/hooks.ts",
-            "export function useCart(): number {\n  return 1;\n}\n",
+            "src/dashboard.ts",
+            "export function Dashboard(): null {\n  return null;\n}\n",
         )
         .file(
-            "src/page.ts",
-            "export function page(): number {\n  return useCart();\n}\n",
+            "src/routes.ts",
+            "import { createBrowserRouter } from 'react-router-dom';\nimport { Dashboard } from './dashboard';\n\nexport const router = createBrowserRouter([{ path: '/dash', Component: Dashboard }]);\n",
         )
         .write(
             "package.json",
             "{\"name\":\"web\",\"dependencies\":{\"left-pad\":\"1.3.0\"}}\n",
         )
-        .edge_before("function page", "calls", "function src/hooks.ts::useCart")
-        .edge_after("function page", "calls", "function useCart")
+        .edge_before("route src/routes.ts::route:/dash", "references", "function Dashboard")
+        .edge_after("file:src/routes.ts", "imports", "function Dashboard")
+}
+
+/// Upstream #2395: React coming into an app's manifest rather than the
+/// root's detects React as the root's does
+/// ([`typescript_react_dependency_appears_in_package_json`]).
+pub fn typescript_react_dependency_appears_in_an_app_package_json() -> Case {
+    Case::new(Change::ControlFile, &[Language::TypeScript])
+        .file("package.json", "{\"name\":\"mono\",\"private\":true}\n")
+        .file(
+            "apps/web/package.json",
+            "{\"name\":\"web\",\"dependencies\":{\"left-pad\":\"1.3.0\"}}\n",
+        )
+        .file(
+            "apps/web/src/dashboard.ts",
+            "export function Dashboard(): null {\n  return null;\n}\n",
+        )
+        .file(
+            "apps/web/src/routes.ts",
+            "import { createBrowserRouter } from 'react-router-dom';\nimport { Dashboard } from './dashboard';\n\nexport const router = createBrowserRouter([{ path: '/dash', Component: Dashboard }]);\n",
+        )
+        .write(
+            "apps/web/package.json",
+            "{\"name\":\"web\",\"dependencies\":{\"left-pad\":\"1.3.0\",\"react\":\"18.2.0\"}}\n",
+        )
+        .edge_before("file:apps/web/src/routes.ts", "imports", "function Dashboard")
+        .edge_after(
+            "route apps/web/src/routes.ts::route:/dash",
+            "references",
+            "function Dashboard",
+        )
+}
+
+/// Upstream #2395: detection reads a manifest one directory down whatever is
+/// indexed below it, so React declared in `frontend/package.json` beside
+/// only a Python build script detects React on the next sync too.
+pub fn typescript_react_dependency_appears_above_no_script() -> Case {
+    Case::new(Change::ControlFile, &[Language::TypeScript])
+        .file("package.json", "{\"name\":\"web\",\"private\":true}\n")
+        .file("frontend/build.py", "def build():\n    return 1\n")
+        .file(
+            "src/dashboard.ts",
+            "export function Dashboard(): null {\n  return null;\n}\n",
+        )
+        .file(
+            "src/routes.ts",
+            "import { createBrowserRouter } from 'react-router-dom';\nimport { Dashboard } from './dashboard';\n\nexport const router = createBrowserRouter([{ path: '/dash', Component: Dashboard }]);\n",
+        )
+        .write(
+            "frontend/package.json",
+            "{\"name\":\"assets\",\"devDependencies\":{\"react\":\"18.2.0\"}}\n",
+        )
+        .edge_before("file:src/routes.ts", "imports", "function Dashboard")
+        .edge_after("route src/routes.ts::route:/dash", "references", "function Dashboard")
+}
+
+/// Upstream #2395: a file of any language arriving one directory down brings
+/// the manifest beside it into detection: React declared in
+/// `frontend/package.json` is detected once `frontend/build.py` is indexed,
+/// and the sync records that manifest among the JS inputs, as a fresh index
+/// does.
+pub fn typescript_react_dependency_beside_an_added_script() -> Case {
+    Case::new(Change::ControlFile, &[Language::TypeScript])
+        .file("package.json", "{\"name\":\"web\",\"private\":true}\n")
+        .file(
+            "frontend/package.json",
+            "{\"name\":\"assets\",\"devDependencies\":{\"react\":\"18.2.0\"}}\n",
+        )
+        .file(
+            "src/dashboard.ts",
+            "export function Dashboard(): null {\n  return null;\n}\n",
+        )
+        .file(
+            "src/routes.ts",
+            "import { createBrowserRouter } from 'react-router-dom';\nimport { Dashboard } from './dashboard';\n\nexport const router = createBrowserRouter([{ path: '/dash', Component: Dashboard }]);\n",
+        )
+        .write("frontend/build.py", "def build():\n    return 1\n")
+        .edge_before("file:src/routes.ts", "imports", "function Dashboard")
+        .edge_after("route src/routes.ts::route:/dash", "references", "function Dashboard")
+}
+
+const NEST_PACKAGE: &str = "{\"name\":\"api\",\"dependencies\":{\"@nestjs/core\":\"^11.0.0\",\"@nestjs/common\":\"^11.0.0\"}}\n";
+
+const NEST_USERS_CONTROLLER: &str = "import { Controller, Get } from '@nestjs/common';\n\n@Controller('users')\nexport class UsersController {\n  @Get(':id')\n  findOne() {\n    return 1;\n  }\n}\n";
+
+/// W7-02: the bootstrap comes to set a global prefix (upstream #2117): every
+/// route of its app is renamed though no controller file changed.
+pub fn typescript_nestjs_bootstrap_sets_a_global_prefix() -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript])
+        .file("package.json", NEST_PACKAGE)
+        .file(
+            "src/main.ts",
+            "import { NestFactory } from '@nestjs/core';\nimport { AppModule } from './app.module';\n\nasync function bootstrap() {\n  const app = await NestFactory.create(AppModule);\n  await app.listen(3000);\n}\nbootstrap();\n",
+        )
+        .file(
+            "src/app.module.ts",
+            "import { Module } from '@nestjs/common';\nimport { UsersController } from './users/users.controller';\n\n@Module({ controllers: [UsersController] })\nexport class AppModule {}\n",
+        )
+        .file("src/users/users.controller.ts", NEST_USERS_CONTROLLER)
+        .write(
+            "src/main.ts",
+            "import { NestFactory } from '@nestjs/core';\nimport { AppModule } from './app.module';\n\nasync function bootstrap() {\n  const app = await NestFactory.create(AppModule);\n  app.setGlobalPrefix('api');\n  app.enableVersioning({ defaultVersion: '1' });\n  await app.listen(3000);\n}\nbootstrap();\n",
+        )
+        .named_before("route", "GET /users/:id")
+        .named_after("route", "GET /api/v1/users/:id")
+        .edge_throughout(
+            "route src/users/users.controller.ts::GET:/users/:id",
+            "references",
+            "method UsersController::findOne",
+        )
+}
+
+/// W7-02: the bootstrap stops setting a global prefix: a route an earlier
+/// sync renamed gets its in-file name back, as a fresh index names it.
+pub fn typescript_nestjs_bootstrap_drops_its_global_prefix() -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript])
+        .file("package.json", NEST_PACKAGE)
+        .file(
+            "src/main.ts",
+            "import { NestFactory } from '@nestjs/core';\nimport { AppModule } from './app.module';\n\nasync function bootstrap() {\n  const app = await NestFactory.create(AppModule);\n  app.setGlobalPrefix('api');\n  app.enableVersioning({ defaultVersion: '1' });\n  await app.listen(3000);\n}\nbootstrap();\n",
+        )
+        .file(
+            "src/app.module.ts",
+            "import { Module } from '@nestjs/common';\nimport { UsersController } from './users/users.controller';\n\n@Module({ controllers: [UsersController] })\nexport class AppModule {}\n",
+        )
+        .file("src/users/users.controller.ts", NEST_USERS_CONTROLLER)
+        .write(
+            "src/main.ts",
+            "import { NestFactory } from '@nestjs/core';\nimport { AppModule } from './app.module';\n\nasync function bootstrap() {\n  const app = await NestFactory.create(AppModule);\n  await app.listen(3000);\n}\nbootstrap();\n",
+        )
+        .named_before("route", "GET /api/v1/users/:id")
+        .named_after("route", "GET /users/:id")
+}
+
+/// W7-02b (KEEP-RUST): one feature's e2e spec comes to set a global prefix:
+/// only that feature's routes are renamed; the feature beside it, whose own
+/// spec configures nothing, keeps its routes as written.
+pub fn typescript_nestjs_e2e_spec_sets_a_global_prefix() -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript])
+        .file("package.json", NEST_PACKAGE)
+        .file(
+            "integration/security/e2e/csrf.spec.ts",
+            "import { NestFactory } from '@nestjs/core';\nimport { AppModule } from '../src/app.module';\n\nit('protects', async () => {\n  const app = await NestFactory.create(AppModule);\n  await app.init();\n});\n",
+        )
+        .file(
+            "integration/security/src/csrf.controller.ts",
+            "import { Controller, Get } from '@nestjs/common';\n\n@Controller('csrf')\nexport class CsrfController {\n  @Get()\n  token() {\n    return 1;\n  }\n}\n",
+        )
+        .file(
+            "integration/cookies/e2e/cookies.spec.ts",
+            "import { NestFactory } from '@nestjs/core';\nimport { AppModule } from '../src/app.module';\n\nit('sets', async () => {\n  const app = await NestFactory.create(AppModule);\n  await app.init();\n});\n",
+        )
+        .file(
+            "integration/cookies/src/cookies.controller.ts",
+            "import { Controller, Get } from '@nestjs/common';\n\n@Controller('cookies')\nexport class CookiesController {\n  @Get('set')\n  set() {\n    return 1;\n  }\n}\n",
+        )
+        .write(
+            "integration/security/e2e/csrf.spec.ts",
+            "import { NestFactory } from '@nestjs/core';\nimport { AppModule } from '../src/app.module';\n\nit('protects', async () => {\n  const app = await NestFactory.create(AppModule);\n  app.setGlobalPrefix('api');\n  await app.init();\n});\n",
+        )
+        .named_before("route", "GET /csrf")
+        .named_after("route", "GET /api/csrf")
+        .named_after("route", "GET /cookies/set")
+}
+
+/// W7-02: a RouterModule registration goes away: the routes it prefixed get
+/// their in-file names back (the RouterModule pass renamed them; nothing
+/// renamed them back before).
+pub fn typescript_nestjs_router_module_registration_is_removed() -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript])
+        .file("package.json", NEST_PACKAGE)
+        .file(
+            "src/app.module.ts",
+            "import { Module } from '@nestjs/common';\nimport { RouterModule } from '@nestjs/core';\nimport { AdminModule } from './admin.module';\n\n@Module({ imports: [AdminModule, RouterModule.register([{ path: 'admin', module: AdminModule }])] })\nexport class AppModule {}\n",
+        )
+        .file(
+            "src/admin.module.ts",
+            "import { Module } from '@nestjs/common';\nimport { UsersController } from './users/users.controller';\n\n@Module({ controllers: [UsersController] })\nexport class AdminModule {}\n",
+        )
+        .file("src/users/users.controller.ts", NEST_USERS_CONTROLLER)
+        .write(
+            "src/app.module.ts",
+            "import { Module } from '@nestjs/common';\nimport { RouterModule } from '@nestjs/core';\nimport { AdminModule } from './admin.module';\n\n@Module({ imports: [AdminModule] })\nexport class AppModule {}\n",
+        )
+        .named_before("route", "GET /admin/users/:id")
+        .named_after("route", "GET /users/:id")
+}
+
+/// W7-02: the convention file beside a controller appears (upstream #2246):
+/// the provider it injects is that file's class, not another feature's.
+pub fn typescript_nestjs_provider_beside_its_controller_appears() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::TypeScript])
+        .file("package.json", NEST_PACKAGE)
+        .file("src/admin/users.service.ts", "export class UsersService {}\n")
+        .file(
+            "src/users/users.controller.ts",
+            "export class UsersController {\n  constructor(private readonly users: UsersService) {}\n}\n",
+        )
+        .write("src/users/users.service.ts", "export class UsersService {}\n")
+        .edge_after(
+            "method UsersController::constructor",
+            "references",
+            "class UsersService @src/users/users.service.ts",
+        )
+        .no_edge_after(
+            "method UsersController::constructor",
+            "references",
+            "class UsersService @src/admin/users.service.ts",
+        )
+}
+
+/// W7-03: a `nuxt.config.ts` appears in a Vue app (upstream #2130): Nuxt is
+/// detected, and its `pages/` become routes served by their components.
+pub fn vue_nuxt_config_appears() -> Case {
+    Case::new(Change::ControlFile, &[Language::Vue, Language::TypeScript])
+        .file(
+            "package.json",
+            "{\"name\":\"shop\",\"dependencies\":{\"vue\":\"3\"}}\n",
+        )
+        .file("pages/admin.vue", "<template><div>admin</div></template>\n")
+        .file("src/main.ts", "export const ready = true;\n")
+        .write("nuxt.config.ts", "export default {};\n")
+        .edge_after(
+            "route pages/admin.vue::route:/admin",
+            "calls",
+            "component pages/admin.vue::admin",
+        )
+}
+
+/// W7-03: an app's manifest comes to declare Nuxt (upstream #2129 and
+/// #2130): the files of that app now make Nuxt routes, though no page
+/// changed, while the other app's `pages/` stay components.
+pub fn vue_nuxt_app_manifest_gains_nuxt() -> Case {
+    Case::new(Change::ControlFile, &[Language::Vue])
+        .file("package.json", "{\"name\":\"mono\",\"private\":true}\n")
+        .file(
+            "apps/site/package.json",
+            "{\"name\":\"site\",\"dependencies\":{\"nuxt\":\"3\"}}\n",
+        )
+        .file("apps/site/pages/about.vue", "<template><div/></template>\n")
+        .file(
+            "apps/admin/package.json",
+            "{\"name\":\"admin\",\"dependencies\":{\"vue\":\"3\"}}\n",
+        )
+        .file(
+            "apps/admin/pages/users.vue",
+            "<template><div/></template>\n",
+        )
+        .file(
+            "apps/blog/package.json",
+            "{\"name\":\"blog\",\"dependencies\":{\"vue\":\"3\"}}\n",
+        )
+        .file("apps/blog/pages/post.vue", "<template><div/></template>\n")
+        .write(
+            "apps/admin/package.json",
+            "{\"name\":\"admin\",\"dependencies\":{\"vue\":\"3\",\"nuxt\":\"3\"}}\n",
+        )
+        .edge_throughout(
+            "route apps/site/pages/about.vue::route:/about",
+            "calls",
+            "component apps/site/pages/about.vue::about",
+        )
+        .edge_after(
+            "route apps/admin/pages/users.vue::route:/users",
+            "calls",
+            "component apps/admin/pages/users.vue::users",
+        )
+}
+
+/// W7-03: a Nuxt page's template is edited (upstream #2267): its route
+/// still references its own component, not the same-named one elsewhere.
+pub fn vue_nuxt_page_body_edit() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Vue])
+        .file(
+            "package.json",
+            "{\"name\":\"shop\",\"dependencies\":{\"nuxt\":\"3\"}}\n",
+        )
+        .file("pages/index.vue", "<template><div>home</div></template>\n")
+        .file(
+            "components/index.vue",
+            "<template><div>not a page</div></template>\n",
+        )
+        .write(
+            "pages/index.vue",
+            "<template><section>welcome</section></template>\n",
+        )
+        .edge_throughout(
+            "route pages/index.vue::route:/",
+            "calls",
+            "component pages/index.vue::index",
+        )
+        .no_edge_after(
+            "route pages/index.vue::route:/",
+            "calls",
+            "component components/index.vue::index",
+        )
 }
 
 /// W5-06: a package the manifest comes to declare is outside the project,
@@ -10245,6 +10608,31 @@ pub fn tauri_command_attribute_makes_an_invoke_call_its_edge() -> Case {
             "#[tauri::command] pub fn greet() -> String {\n    String::new()\n}\n\nfn main() {}\n",
         )
         .edge_after("file:src/main.ts", "calls", "function greet")
+}
+
+/// W7-04b (upstream #2159): the invoke edge the Tauri resolver makes names it
+/// in `metadata.framework`; an edit to the command's body re-resolves the
+/// call at its site, and the edge keeps the name, as a fresh index has it.
+pub fn tauri_command_body_edit_keeps_the_invoke_edges_resolver_name() -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript, Language::Rust])
+        .file(
+            "src/main.ts",
+            "import { invoke } from '@tauri-apps/api/core';\n\nexport function run(): Promise<unknown> {\n  return invoke('greet');\n}\n",
+        )
+        .file(
+            "src-tauri/src/main.rs",
+            "#[tauri::command] pub fn greet() -> String {\n    String::new()\n}\n\nfn main() {}\n",
+        )
+        .write(
+            "src-tauri/src/main.rs",
+            "#[tauri::command] pub fn greet() -> String {\n    String::from(\"hi\")\n}\n\nfn main() {}\n",
+        )
+        .edge_throughout("file:src/main.ts", "calls", "function greet")
+        .edge_metadata_after(
+            ("file:src/main.ts", "calls", "function greet"),
+            "framework",
+            "tauri",
+        )
 }
 
 /// W5-06, fail closed: only the manifest's `version` changes; every JS file

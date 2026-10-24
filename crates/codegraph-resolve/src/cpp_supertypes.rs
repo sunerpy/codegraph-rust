@@ -93,11 +93,13 @@ pub(crate) fn match_cpp_supertype(
     let visible =
         move |node: &Node| node.file_path == derived_file || !is_source_file(&node.file_path);
     let scopes = scopes_within(parent_scope(&derived.qualified_name));
-    let resolved = |target: Arc<Node>| ResolvedRef {
-        original: reference.clone(),
-        target_node_id: target.id.clone(),
-        confidence: 0.9,
-        resolved_by: ResolvedBy::QualifiedName,
+    let resolved = |target: Arc<Node>| {
+        ResolvedRef::new(
+            reference.clone(),
+            target.id.clone(),
+            0.9,
+            ResolvedBy::QualifiedName,
+        )
     };
     let look_up = |spelled: &str, scopes: &[String]| {
         class_node(
@@ -205,12 +207,12 @@ pub(crate) fn match_cpp_supertype(
         own
     };
     match sole.as_slice() {
-        [only] => Some(ResolvedRef {
-            original: reference.clone(),
-            target_node_id: only.id.clone(),
-            confidence: 0.7,
-            resolved_by: ResolvedBy::ExactMatch,
-        }),
+        [only] => Some(ResolvedRef::new(
+            reference.clone(),
+            only.id.clone(),
+            0.7,
+            ResolvedBy::ExactMatch,
+        )),
         _ => None,
     }
 }

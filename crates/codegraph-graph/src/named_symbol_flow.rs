@@ -13,8 +13,8 @@
 //! Overloads differ for the same reason: a bare ambiguous name in `Named` mode
 //! is kept only where the query also names its container; in `Directed` mode
 //! every candidate for both ends is tried and the pair that connects is the
-//! answer. Explore's own Flow section (family F10) is not wired to this yet;
-//! the viewer's `/api/flow` is its first caller.
+//! answer. Explore's Flow section (family F10) and the viewer's `/api/flow`
+//! both ride this search, so a name resolves to the same nodes in each.
 
 use std::collections::{HashMap, HashSet};
 
@@ -54,9 +54,10 @@ pub fn is_flow_callable(kind: NodeKind) -> bool {
     )
 }
 
-/// Edge kinds a flow may ride (`navigates` has no Rust edge kind yet).
+/// Edge kinds a flow may ride (`FLOW_EDGE_KINDS`): a call, and a
+/// navigation to the screen a route renders.
 fn is_flow_edge(kind: EdgeKind) -> bool {
-    kind == EdgeKind::Calls
+    matches!(kind, EdgeKind::Calls | EdgeKind::Navigates)
 }
 
 /// Non-callable kinds a SYNTHESIZED edge may end at (an RTK thunk is a constant).

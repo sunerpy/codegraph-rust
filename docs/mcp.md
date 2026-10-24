@@ -320,7 +320,7 @@ CODEGRAPH_MCP_TOOLS=explore,node,search,callers,impact,check codegraph serve --m
 
 | Tool                | Purpose                                                                                                                                 |
 | ------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
-| `codegraph_explore` | PRIMARY tool: blast radius + relationship map + dynamic-dispatch boundaries + source blocks (output is size-adaptive to project scale). |
+| `codegraph_explore` | PRIMARY tool: named-symbol call flow + blast radius + relationship map + dispatch boundaries + source blocks (output is size-adaptive). |
 | `codegraph_search`  | FTS5 + multi-signal scored symbol search.                                                                                               |
 | `codegraph_node`    | Node detail (symbol view) or file view (line-numbered source). A smarter `Read`.                                                        |
 | `codegraph_callers` | Callers of a symbol (along calls/references/imports edges).                                                                             |
@@ -350,6 +350,20 @@ an index or a change to user files, so the hint stays `true`.
 returns the symbols relevant to a query, their verbatim source grouped by file,
 plus the call/impact graph around them. Prefer it over individual `callers`/
 `callees` chains when surveying an unfamiliar area.
+
+When the query names two or more callables that a call chain of three or more
+connects, the response opens with a **Flow** section: the longest chain among
+them, one numbered line per symbol (`2. run (src/app.ts:3)`) and one `↓` line
+per hop. At most one unnamed symbol may bridge two named ones, and of two
+equally long routes the Flow takes the one through the symbols the query names;
+the search is the viewer's Flow search. A hop reads as its edge kind (`calls`,
+`navigates`), or, for a synthesized hop, as `dynamic: <mechanism> @<wiring
+site>`, and names the conditions its call runs under, read from the caller's
+current source: `↓ calls (when !busy && ready)` lists the branches around the
+call site up to the enclosing function, with the early exits before it negated.
+Conditions are read for JavaScript, TypeScript, Swift, Python, Java, Kotlin,
+C#, Go, C, C++ and Objective-C callers; a caller file that changed since it was
+indexed, or one above 256 KiB, gets none rather than one read at a stale line.
 
 Explicit source paths in the query are resolved before fuzzy search and pinned
 to the front of the result. Quoted/backticked paths, `./`, and Windows
@@ -416,7 +430,9 @@ through a helper it usually was not.
 example, `node.id` from CLI `codegraph search --json`), or a file path. `file`
 and `line` can pin an overloaded symbol to one definition. When given a file
 path without a symbol it returns the file's source with line numbers, which is a
-more accurate alternative to a plain `Read` tool call.
+more accurate alternative to a plain `Read` tool call. Its trail tags a
+synthesized hop with the Flow's wording: `exportReport (src/pdf-exporter.ts:5)
+[dynamic: interface → impl @src/pdf-exporter.ts:5]`.
 
 File mode also accepts pasted editor/GitHub locations: `src/app.ts:42`,
 `src/app.ts:42-80`, `src/app.ts#L42`, and `src/app.ts#L42-L80` (the final `L` is
@@ -461,11 +477,15 @@ LLM a high-level structural summary of the entire codebase.
 
 ## Error Channels
 
-Two distinct error channels:
+Three error channels:
 
 - **Unknown tool name** — JSON-RPC error `-32602` (invalid params).
 - **Missing or invalid required argument** — tool result with
   `{content: ..., isError: true}` and `Error: <message>` body.
+- **A project whose index cannot be opened** — the same `isError` tool result,
+  `Failed to open project at <path>: <reason>`. An index a newer CodeGraph wrote
+  is one: the reason names both schema versions and nothing in the index changes
+  ([`cli.md`](cli.md#an-index-a-newer-codegraph-wrote)).
 
 ---
 

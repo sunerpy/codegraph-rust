@@ -313,7 +313,7 @@ pub(crate) fn migrate_project(
     crate::control_inputs::write_index_rows(
         rebuild.store(),
         project_root,
-        &resolver.framework_names(),
+        &resolver.framework_signature(),
     )?;
     if resolver.has_framework_resolvers() {
         let relative_files = rebuild

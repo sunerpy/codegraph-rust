@@ -769,12 +769,12 @@ pub(crate) fn resolve_swift_type_path_call(
     let target = fit
         .into_iter()
         .min_by(|a, b| (&a.file_path, a.start_line).cmp(&(&b.file_path, b.start_line)))?;
-    Some(ResolvedRef {
-        original: reference.clone(),
-        target_node_id: target.id.clone(),
-        confidence: 0.9,
-        resolved_by: ResolvedBy::QualifiedName,
-    })
+    Some(ResolvedRef::new(
+        reference.clone(),
+        target.id.clone(),
+        0.9,
+        ResolvedBy::QualifiedName,
+    ))
 }
 
 /// Is this case declared in a `@Reducer enum`? (upstream `isReducerEnum`.)

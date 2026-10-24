@@ -863,12 +863,12 @@ pub(crate) fn match_scala_symbolic_type(
         types
     };
     Some(match chosen.as_slice() {
-        [only] => Some(ResolvedRef {
-            original: reference.clone(),
-            target_node_id: only.id.clone(),
-            confidence: 0.8,
-            resolved_by: ResolvedBy::ExactMatch,
-        }),
+        [only] => Some(ResolvedRef::new(
+            reference.clone(),
+            only.id.clone(),
+            0.8,
+            ResolvedBy::ExactMatch,
+        )),
         _ => None,
     })
 }

@@ -2960,7 +2960,7 @@
     "is_static": 0,
     "kind": "route",
     "language": "typescript",
-    "name": "GET /users/:id",
+    "name": "GET /api/v1/users/:id",
     "qualified_name": "nest/src/users/users.controller.ts::GET:/users/:id",
     "return_type": null,
     "signature": null,

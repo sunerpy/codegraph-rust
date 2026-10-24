@@ -920,12 +920,12 @@ pub(crate) fn resolve_go_method_in_package(
             return Some(None);
         }
         let ordered = crate::name_matcher::prefer_call_site_file(own, &reference.file_path);
-        return Some(Some(ResolvedRef {
-            original: reference.clone(),
-            target_node_id: ordered[0].id.clone(),
+        return Some(Some(ResolvedRef::new(
+            reference.clone(),
+            ordered[0].id.clone(),
             confidence,
             resolved_by,
-        }));
+        )));
     }
     let types = package_types(type_name, pkg_dir, context);
     if types.is_empty() {

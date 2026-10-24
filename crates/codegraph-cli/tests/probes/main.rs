@@ -10547,6 +10547,70 @@ mod swift {
             "{report}"
         );
     }
+
+    /// Upstream #2683: a call written after `try!` links what it calls. Calls
+    /// after `try?` and `try` are the control. Upstream's TortureTry.swift,
+    /// reduced to calls whose callees the project declares.
+    ///
+    /// Not yet on Windows: the held tree-sitter-swift 0.7.3 builds the `try!`
+    /// entry of its scanner's 64-bit mask as `1UL << 32`, which MSVC folds to
+    /// 0, so there `try! Message2(…)` parses as a call of `! Message2` and
+    /// `try! Settings.Defaults.load()` loses its receiver. 0.7.4 fixes it but
+    /// regenerates the grammar, which needs a walker change first
+    /// (docs/grammar-manifest.md); drop the `ignore` with that upgrade.
+    #[test]
+    #[cfg_attr(
+        windows,
+        ignore = "tree-sitter-swift 0.7.3 misparses `try!` on MSVC (upstream #2683)"
+    )]
+    fn pr2683_a_call_after_try_bang_links_what_it_calls() {
+        let project = Project::new()
+            .file(
+                "App/Models.swift",
+                "import Foundation\n\nstruct Message2 {\n    init(data: Data?) throws {}\n}\n\nfinal class Store {\n    init(path: String) throws {}\n}\n\nenum Settings {\n    enum Defaults {\n        static func load(from name: String) throws -> Settings.Defaults { .init() }\n    }\n}\n",
+            )
+            .file(
+                "App/Repository.swift",
+                "import Foundation\n\nfinal class Repository {\n    func load(data: Data?) throws -> Message2 {\n        let msg2 = try! Message2(data: data!)\n        let msg3 = try? Message2(data: data!)\n        let msg4 = try Message2(data: data!)\n        let store = try! Store(path: \"x\")\n        let settings = try! Settings.Defaults.load(from: \"defaults\")\n        try! validate(msg2)\n        _ = (msg3, msg4, store, settings)\n        return try! Message2(data: data!)\n    }\n\n    func validate(_ m: Message2) throws {}\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        let lines = |kind: &str, target: &str| -> Vec<i64> {
+            let mut lines: Vec<i64> = graph
+                .edges_matching("method Repository::load", kind, target)
+                .iter()
+                .filter_map(|edge| edge.line)
+                .collect();
+            lines.sort_unstable();
+            lines
+        };
+        let report = graph.report();
+        assert_eq!(
+            lines("instantiates", "struct Message2"),
+            [5, 6, 7, 12],
+            "{report}"
+        );
+        assert_eq!(lines("instantiates", "class Store"), [8], "{report}");
+        assert_eq!(
+            lines("calls", "method Settings::Defaults::load"),
+            [9],
+            "{report}"
+        );
+        assert_eq!(
+            lines("calls", "method Repository::validate"),
+            [10],
+            "{report}"
+        );
+        // The misparse left references named after the `!`.
+        assert!(
+            graph
+                .unresolved
+                .iter()
+                .all(|reference| !reference.reference_name.starts_with('!')),
+            "{}",
+            graph.unresolved_list()
+        );
+    }
 }
 
 mod objc {
@@ -12818,7 +12882,7 @@ mod go {
 }
 
 mod rust {
-    use super::support::{Graph, Project};
+    use super::support::{Graph, Project, assert_edge, assert_no_edge, assert_unresolved};
 
     /// `kind:qualifiedName` of every `calls` / `references` / `instantiates`
     /// target out of the functions named `name` (upstream's `targets`).
@@ -12850,6 +12914,33 @@ mod rust {
             .filter_map(|e| graph.node(&e.target))
             .map(|n| n.file_path.clone())
             .collect()
+    }
+
+    /// The member-path std gate deferred on 2026-10-03 needs no change: since
+    /// the #2169 port, a receiver whose declared type the project does not
+    /// declare (`PathBuf`, `&Path`, `std::path::PathBuf`) binds no project
+    /// method by name, so `index_root.join(..)` no longer reaches the project's
+    /// `LineIndex::join`; a project-typed receiver keeps its method.
+    #[test]
+    fn pr2169_a_std_typed_rust_receiver_binds_no_project_method_by_name() {
+        let project = Project::new()
+            .file("Cargo.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\n")
+            .file(
+                "src/lib.rs",
+                "use std::path::{Path, PathBuf};\n\npub struct LineIndex;\nimpl LineIndex {\n    pub fn join(&self, _x: &str) -> usize { 0 }\n}\n\npub struct EnvGuard;\nimpl EnvGuard {\n    pub fn set(&self) {}\n}\npub fn env_guard() -> EnvGuard { EnvGuard }\n\npub fn annotated(index_root: PathBuf) -> PathBuf {\n    index_root.join(\"x\")\n}\n\npub fn let_typed() -> PathBuf {\n    let base: PathBuf = PathBuf::from(\"a\");\n    base.join(\"b\")\n}\n\npub fn path_typed(p: &Path) -> PathBuf {\n    p.join(\"c\")\n}\n\npub fn std_path(q: std::path::PathBuf) -> PathBuf {\n    q.join(\"d\")\n}\n\npub fn project_typed() {\n    let mut env = env_guard();\n    env.set();\n}\n",
+            )
+            .index();
+
+        for (function, call) in [
+            ("annotated", "index_root.join"),
+            ("let_typed", "base.join"),
+            ("path_typed", "p.join"),
+            ("std_path", "q.join"),
+        ] {
+            assert_no_edge!(project, function => calls => "method LineIndex::join");
+            assert_unresolved!(project, function => calls => call);
+        }
+        assert_edge!(project, "project_typed" => calls => "method EnvGuard::set");
     }
 
     /// Upstream #2124: a bare Rust name reaches only what is in scope —
@@ -18668,5 +18759,844 @@ mod pascal_includes {
             "{}",
             graph.report()
         );
+    }
+}
+
+/// What framework resolvers record on the edges they make (W7).
+mod frameworks {
+    use super::support::Project;
+
+    /// Upstream #2159: a link a framework or bridge resolver made names that
+    /// resolver in `metadata.framework`, as a synthesized channel names
+    /// itself with `synthesizedBy`: a Tauri `invoke('greet')` names `tauri`.
+    #[test]
+    fn pr2159_a_framework_resolved_edge_names_its_resolver() {
+        let project = Project::new()
+            .file("src-tauri/tauri.conf.json", "{}\n")
+            .file(
+                "src/main.ts",
+                "import { invoke } from '@tauri-apps/api/core';\n\nexport function run(): Promise<unknown> {\n  return invoke('greet');\n}\n",
+            )
+            .file(
+                "src-tauri/src/main.rs",
+                "#[tauri::command]\npub fn greet() -> String {\n    String::new()\n}\n\nfn main() {\n    greet();\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        let bridged = graph.edges_matching("file:src/main.ts", "calls", "function greet");
+        assert_eq!(bridged.len(), 1, "{}", graph.report());
+        assert_eq!(bridged[0].resolved_by(), Some("framework"));
+        assert_eq!(
+            bridged[0]
+                .metadata
+                .get("framework")
+                .and_then(|v| v.as_str()),
+            Some("tauri")
+        );
+        // A call no framework resolved names none.
+        let direct = graph.edges_matching("function main", "calls", "function greet");
+        assert_eq!(direct.len(), 1, "{}", graph.report());
+        assert_eq!(direct[0].metadata.get("framework"), None);
+    }
+
+    /// The kinds of every node named `name`, in order.
+    fn kinds_of(graph: &super::support::Graph, name: &str) -> Vec<String> {
+        let mut kinds: Vec<String> = graph
+            .nodes
+            .iter()
+            .filter(|node| node.name == name)
+            .map(|node| node.kind.clone())
+            .collect();
+        kinds.sort();
+        kinds
+    }
+
+    /// Upstream #841 and #2429: a const a wrapper declares as a component —
+    /// `forwardRef`, `memo`, `styled.x\`…\``, `styled(Base)\`…\``, typed or not
+    /// — is a `component` node, whose inline render function's calls are its
+    /// own; a lowercase memo, another template tag, a comparison and any
+    /// other initializer stay constants.
+    #[test]
+    fn pr0841_a_wrapper_declared_component_is_a_component() {
+        let project = Project::new()
+            .file("package.json", "{\"dependencies\":{\"react\":\"^18.0.0\"}}\n")
+            .file(
+                "ui.tsx",
+                "import * as React from 'react';\nimport styled from 'styled-components';\nexport const Button = React.forwardRef<HTMLButtonElement, {}>((props, ref) => <button ref={ref} {...props} />);\nexport const Bare = forwardRef((props, ref) => <span ref={ref} />);\nexport const Card = memo((props: { t: string }) => <div>{props.t}</div>);\nexport const Named = memo(function Named(props: { t: string }) { return <div>{props.t}</div>; });\nexport const Boxed = styled.div`color: red;`;\nexport const Wrapped = styled(Button)`padding: 4px;`;\nexport const Rewrapped = memo(Button);\n",
+            )
+            .file(
+                "typed.tsx",
+                "import styled from 'styled-components';\ntype WrapperProps = { active: boolean };\ntype Props = { align: 'start' | 'end' };\nconst Plain = styled.div`color: red;`;\nexport const Wrapper = styled.div<WrapperProps>`\n  color: ${(props) => (props.active ? 'red' : 'blue')};\n`;\nconst Background = styled.div<{ align: Props[\"align\"] }>`color: red;`;\nconst Content = styled(Plain)<WrapperProps>`padding: 4px;`;\nconst NudeButton = styled(Plain).attrs((props: Props) => ({ type: \"button\" }))<Props>`width: 24px;`;\nconst Either = styled.div<WrapperProps | Props>`color: red;`;\nconst Both = styled.span<WrapperProps & { open: boolean }>`color: red;`;\nconst Nested = styled.div<Partial<WrapperProps>>`color: red;`;\nconst Deeper = styled.div<Partial<Record<string, WrapperProps>>>`color: red;`;\n",
+            )
+            .file(
+                "tags.tsx",
+                "import styled, { css, keyframes } from 'styled-components';\ntype Props = { open: boolean };\nexport const Mixin = css<Props>`color: red;`;\nexport const Fade = keyframes<Props>`from { opacity: 0; }`;\nexport const Styledish = styledLike<Props>`color: red;`;\nexport const Compared = styled.length < LIMIT > 2;\nexport const Untagged = styled.div < Props > other;\nconst lowerCase = styled.div<Props>`color: red;`;\nconst cache = memo(expensiveFn);\nexport const Config = loadConfig();\nexport const Theme = { color: 'red' };\n",
+            )
+            .file(
+                "widget.tsx",
+                "import * as React from 'react';\nfunction useThing() { return 1; }\nexport const Widget = React.forwardRef((props, ref) => {\n  const v = useThing();\n  return <div ref={ref}>{v}</div>;\n});\n",
+            )
+            .index();
+        let graph = project.graph();
+        for name in [
+            "Button",
+            "Bare",
+            "Card",
+            "Named",
+            "Boxed",
+            "Wrapped",
+            "Rewrapped",
+            "Plain",
+            "Wrapper",
+            "Background",
+            "Content",
+            "NudeButton",
+            "Either",
+            "Both",
+            "Nested",
+            "Deeper",
+            "Widget",
+        ] {
+            assert_eq!(
+                kinds_of(graph, name),
+                ["component"],
+                "{name}\n{}",
+                graph.report()
+            );
+        }
+        for name in [
+            "Mixin",
+            "Fade",
+            "Styledish",
+            "Compared",
+            "Untagged",
+            "lowerCase",
+            "cache",
+            "Config",
+            "Theme",
+        ] {
+            assert_eq!(
+                kinds_of(graph, name),
+                ["constant"],
+                "{name}\n{}",
+                graph.report()
+            );
+        }
+        // The render function's call is the component's.
+        graph.assert_edge("component Widget", "calls", "function useThing", None);
+    }
+
+    /// Upstream #841: the React resolver reads `.tsx`/`.jsx` files for routes,
+    /// and only for routes: a `<Route>` there is a route node rendering its
+    /// element, and a hook is one tree-sitter `function` node, never a second
+    /// one from a regex.
+    #[test]
+    fn pr0841_routes_in_jsx_files_and_one_node_per_hook() {
+        let project = Project::new()
+            .file(
+                "package.json",
+                "{\"dependencies\":{\"react\":\"^18.0.0\",\"react-router-dom\":\"^6.0.0\"}}\n",
+            )
+            .file(
+                "src/App.tsx",
+                "import { Routes, Route } from 'react-router-dom';\nimport { Home } from './Home';\nexport function App() {\n  return (\n    <Routes>\n      <Route path=\"/home\" element={<Home />} />\n    </Routes>\n  );\n}\n",
+            )
+            .file("src/Home.tsx", "export function Home() {\n  return <h1 />;\n}\n")
+            .file("src/hooks/useAuth.ts", "export function useAuth() {\n  return null;\n}\n")
+            .file("src/Card.jsx", "export const Card = () => <div />;\n")
+            .index();
+        let graph = project.graph();
+        graph.assert_edge(
+            "route src/App.tsx::route:/home",
+            "references",
+            "function Home",
+            None,
+        );
+        assert_eq!(
+            kinds_of(graph, "useAuth"),
+            ["function"],
+            "{}",
+            graph.report()
+        );
+        assert_eq!(kinds_of(graph, "Card"), ["function"], "{}", graph.report());
+    }
+
+    /// Upstream #2120 (React half) and #2475: a component, hook or context the
+    /// file imports is the import's — a declared package's (`antd`'s
+    /// `<Button>`, `@tanstack/react-query`'s `useQuery`) renders no project
+    /// namesake, even through a bare call — and a hook nested inside another
+    /// function is never a target.
+    #[test]
+    fn pr2475_an_imported_tag_or_hook_is_the_imports() {
+        let project = Project::new()
+            .file(
+                "package.json",
+                "{\"name\":\"app\",\"dependencies\":{\"antd\":\"^5.0.0\",\"@mui/material\":\"^5.0.0\",\"react-router-dom\":\"^6.0.0\",\"@tanstack/react-query\":\"^5.0.0\",\"react\":\"^18.0.0\"}}\n",
+            )
+            .file(
+                "src/Page.tsx",
+                "import { Button } from 'antd';\nimport Typography from '@mui/material/Typography';\nimport { Link } from 'react-router-dom';\nexport function Page() {\n  return <div><Button /><Typography /><Link /></div>;\n}\n",
+            )
+            .file(
+                "src/styles.tsx",
+                "export function Button() { return null; }\nexport function Typography() { return null; }\nexport function Link() { return null; }\n",
+            )
+            .file(
+                "src/Calls.tsx",
+                "import { Button } from 'antd';\nexport function Calls() {\n  Button();\n  return null;\n}\n",
+            )
+            .file(
+                "src/factory.ts",
+                "export function createHooks() {\n  function useQuery() {\n    return 1;\n  }\n  return { useQuery };\n}\n",
+            )
+            .file(
+                "src/list.test.tsx",
+                "import { useQuery } from '@tanstack/react-query';\nexport function useList() {\n  return useQuery();\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        for (source, kind, name) in [
+            ("function Page", "references", "Button"),
+            ("function Page", "references", "Typography"),
+            ("function Page", "references", "Link"),
+            ("function Calls", "calls", "Button"),
+        ] {
+            graph.assert_no_edge(source, kind, &format!("function {name} @src/styles.tsx"));
+        }
+        graph.assert_no_edge(
+            "function useList",
+            "calls",
+            "function createHooks::useQuery",
+        );
+    }
+
+    /// Upstream #2240: in a JS/TS module another file's hook or context is
+    /// reached only through an import, never by name: trpc's adapter's
+    /// option `createContext?.(…)` is no example app's `createContext`, and
+    /// one app's `useUser()` no other app's hook. An optional call `f?.()` is
+    /// a bare call, so no class member is its target either.
+    #[test]
+    fn pr2240_hooks_and_contexts_by_name_are_the_files_own() {
+        let project = Project::new()
+            .file(
+                "package.json",
+                "{\"name\":\"trpc\",\"private\":true,\"dependencies\":{\"react\":\"^18.0.0\"}}\n",
+            )
+            .file(
+                "examples/next-app/src/server/context.ts",
+                "export async function createContext() {\n  return {};\n}\n",
+            )
+            .file(
+                "apps/nextjs-app/src/lib/auth.tsx",
+                "export function useUser() {\n  return null;\n}\n",
+            )
+            .file(
+                "packages/server/src/adapters/ws.ts",
+                "export function getHandler(opts: any) {\n  const { createContext } = opts;\n  return createContext?.({});\n}\n",
+            )
+            .file(
+                "apps/react-vite/src/lib/auth.tsx",
+                "const { useUser } = configureAuth({});\n\nexport function AuthLoader() {\n  const user = useUser();\n  return user;\n}\n",
+            )
+            .file(
+                "apps/react-vite/src/lib/session.tsx",
+                "function useSession() {\n  return null;\n}\n\nexport function SessionLoader() {\n  return useSession();\n}\n",
+            )
+            .file("src/box.ts", "export class Box {\n  refresh() {\n    return 1;\n  }\n}\n")
+            .file("src/tick.ts", "export function tick() {\n  refresh?.();\n}\n")
+            .index();
+        let graph = project.graph();
+        graph.assert_no_edge("function getHandler", "calls", "function createContext");
+        graph.assert_no_edge("function AuthLoader", "calls", "function useUser");
+        graph.assert_no_edge("function tick", "calls", "method Box::refresh");
+        // The file's own hook still resolves.
+        graph.assert_edge(
+            "function SessionLoader",
+            "calls",
+            "function useSession",
+            None,
+        );
+    }
+
+    /// Upstream #2420 (wrapper half): a PascalCase name a `.tsx` file
+    /// declares as a module-level value is that declaration wherever the
+    /// file uses it — the function it wraps (`observer(function X() {…})`,
+    /// `forwardRef(Inner) as …`, `observer(Inner)`), else the declaration —
+    /// never another app's same-named component. The lazy loader half is
+    /// W7-09's.
+    #[test]
+    fn pr2420_a_value_the_file_declares_is_what_its_jsx_renders() {
+        let project = Project::new()
+            .file("package.json", "{\"name\":\"app\",\"dependencies\":{\"react\":\"^18\",\"mobx-react\":\"^7\"}}\n")
+            .file(
+                "src/app/App.tsx",
+                "import { forwardRef } from 'react';\nimport { observer } from 'mobx-react';\nconst Panel = observer(function PanelInner() { return <div />; });\nfunction Inner() { return <span />; }\nconst Item = forwardRef(Inner) as any;\nconst Table = observer(TableInner);\nfunction TableInner() { return <table />; }\nconst Config = makeConfig();\nexport function App() {\n  return <div><Panel /><Item /><Table /><Config /></div>;\n}\n",
+            )
+            .file(
+                "src/other/Home.tsx",
+                "export function Panel() { return <div />; }\nexport function Item() { return <div />; }\nexport function Table() { return <div />; }\nexport function Config() { return <div />; }\n",
+            )
+            .index();
+        let graph = project.graph();
+        graph.assert_edge(
+            "function App",
+            "references",
+            "function Panel::PanelInner",
+            Some("framework"),
+        );
+        graph.assert_edge(
+            "function App",
+            "references",
+            "function Inner",
+            Some("framework"),
+        );
+        graph.assert_edge(
+            "function App",
+            "references",
+            "function TableInner",
+            Some("framework"),
+        );
+        graph.assert_edge("function App", "references", "constant Config", None);
+        for name in ["Panel", "Item", "Table", "Config"] {
+            graph.assert_no_edge(
+                "function App",
+                "references",
+                &format!("function {name} @src/other/Home.tsx"),
+            );
+        }
+    }
+
+    /// The route names a NestJS index holds, sorted.
+    fn route_names(graph: &super::support::Graph) -> Vec<String> {
+        let mut names: Vec<String> = graph
+            .nodes
+            .iter()
+            .filter(|node| node.kind == "route")
+            .map(|node| node.name.clone())
+            .collect();
+        names.sort();
+        names
+    }
+
+    const NEST_PACKAGE: &str =
+        "{\"dependencies\":{\"@nestjs/core\":\"^11.0.0\",\"@nestjs/common\":\"^11.0.0\"}}\n";
+
+    const NEST_MAIN: &str = "import { NestFactory } from '@nestjs/core';\nimport { VersioningType } from '@nestjs/common';\nimport { AppModule } from './app/app.module';\nasync function bootstrap() {\n  const app = await NestFactory.create(AppModule);\n  app.enableVersioning({ defaultVersion: '1', type: VersioningType.URI });\n  app.setGlobalPrefix('api', { exclude: ['sitemap.xml', 'health{/*wildcard}'] });\n  await app.listen(3333);\n}\nbootstrap();\n";
+
+    /// Upstream #2117: a NestJS route is named by the path a request takes to
+    /// it, the app's global prefix and URI version included: a route's own
+    /// `@Version`, else its controller's, else `defaultVersion`;
+    /// `VERSION_NEUTRAL` has none, an excluded path skips the prefix, a seed
+    /// script that creates the app without serving it does not displace the
+    /// bootstrap that configures it, and an app that sets nothing keeps its
+    /// routes as written.
+    #[test]
+    fn pr2117_routes_carry_the_global_prefix_and_uri_version() {
+        let project = Project::new()
+            .file("package.json", NEST_PACKAGE)
+            .file("apps/api/src/main.ts", NEST_MAIN)
+            .file(
+                "apps/api/src/database/run-seed.ts",
+                "import { NestFactory } from '@nestjs/core';\nconst runSeed = async () => {\n  const app = await NestFactory.create(SeedModule);\n  await app.close();\n};\nvoid runSeed();\n",
+            )
+            .file(
+                "apps/api/src/app/user.controller.ts",
+                "import { Controller, Get, Post, Version, VERSION_NEUTRAL } from '@nestjs/common';\n@Controller('user')\nexport class UserController {\n  @Get()\n  public getUser() {}\n\n  @Post()\n  @UseGuards(AuthGuard('jwt'))\n  @Version('2')\n  public createUser() {}\n\n  @Get('oidc/callback')\n  @Version(VERSION_NEUTRAL)\n  public callback() {}\n}\n",
+            )
+            .file(
+                "apps/api/src/app/sitemap.controller.ts",
+                "import { Controller, Get, Version, VERSION_NEUTRAL } from '@nestjs/common';\n@Controller()\n@Version(VERSION_NEUTRAL)\nexport class SitemapController {\n  @Get('sitemap.xml')\n  public sitemap() {}\n}\n",
+            )
+            .file(
+                "apps/api/src/app/health.controller.ts",
+                "import { Controller, Get } from '@nestjs/common';\n@Controller({ path: 'health', version: '3' })\nexport class HealthController {\n  @Get('db')\n  public db() {}\n}\n",
+            )
+            .file(
+                "apps/jobs/src/main.ts",
+                "import { NestFactory } from '@nestjs/core';\nNestFactory.create(JobsModule).then((app) => app.listen(3335));\n",
+            )
+            .file(
+                "apps/jobs/src/jobs.controller.ts",
+                "import { Controller, Get } from '@nestjs/common';\n@Controller('jobs')\nexport class JobsController {\n  @Get()\n  public list() {}\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        assert_eq!(
+            route_names(graph),
+            [
+                "GET /api/user/oidc/callback",
+                "GET /api/v1/user",
+                "GET /jobs",
+                "GET /sitemap.xml",
+                "GET /v3/health/db",
+                "POST /api/v2/user",
+            ],
+            "{}",
+            graph.report()
+        );
+        // The rename keeps the route's identity: its id and qualified name
+        // still read the path its file wrote.
+        graph.assert_edge(
+            "route apps/api/src/app/user.controller.ts::GET:/user",
+            "references",
+            "method UserController::getUser",
+            None,
+        );
+    }
+
+    /// Upstream #2117: a route's `@Version` is found past decorators with
+    /// object arguments, on the method or the class, and each app reads its
+    /// own bootstrap: a computed prefix is not guessed, and one app's `/api`
+    /// is never another's.
+    #[test]
+    fn pr2117_a_version_past_object_decorators_and_each_apps_bootstrap() {
+        let project = Project::new()
+            .file("package.json", NEST_PACKAGE)
+            .file("apps/api/src/main.ts", NEST_MAIN)
+            .file(
+                "apps/api/src/app/stats.controller.ts",
+                "import { Controller, Get, Version } from '@nestjs/common';\n@Controller('stats')\nexport class StatsController {\n  @Version('2')\n  @ApiResponse({ status: 200, description: 'The stats' })\n  @Get('daily')\n  public daily() {}\n\n  @Get('weekly')\n  public weekly() {}\n}\n",
+            )
+            .file(
+                "apps/api/src/app/reports.controller.ts",
+                "import { Controller, Get, Version } from '@nestjs/common';\n@Version('4')\n@ApiTags({ name: 'reports' })\n@Controller('reports')\nexport class ReportsController {\n  @Get()\n  public list() {}\n}\n",
+            )
+            .file(
+                "apps/admin/src/main.ts",
+                "import { NestFactory } from '@nestjs/core';\nasync function bootstrap() {\n  const app = await NestFactory.create(AdminModule);\n  app.setGlobalPrefix(config.get('app.prefix'));\n  app.enableVersioning({ defaultVersion: '1' });\n  await app.listen(3334);\n}\nbootstrap();\n",
+            )
+            .file(
+                "apps/admin/src/users.controller.ts",
+                "import { Controller, Get } from '@nestjs/common';\n@Controller('users')\nexport class UsersController {\n  @Get()\n  public list() {}\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        assert_eq!(
+            route_names(graph),
+            [
+                "GET /api/v1/stats/weekly",
+                "GET /api/v2/stats/daily",
+                "GET /api/v4/reports",
+                "GET /v1/users",
+            ],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// W7-02b (KEEP-RUST): a test's `NestFactory.create` (an e2e spec) with no
+    /// `src/` above it serves the feature above its test folder. One
+    /// feature's spec setting `setGlobalPrefix('api')` names that feature's
+    /// routes and no other's, where upstream gives every integration app of
+    /// nestjs/nest that spec's `/api`.
+    #[test]
+    fn keep_rust_a_tests_nest_bootstrap_names_only_its_own_features_routes() {
+        let project = Project::new()
+            .file("package.json", NEST_PACKAGE)
+            .file(
+                "integration/security/e2e/csrf-protection.spec.ts",
+                "import { NestFactory } from '@nestjs/core';\nimport { AppModule } from '../src/app.module';\ndescribe('CSRF', () => {\n  it('protects', async () => {\n    const app = await NestFactory.create(AppModule);\n    app.setGlobalPrefix('api');\n    await app.init();\n  });\n});\n",
+            )
+            .file(
+                "integration/security/src/csrf.controller.ts",
+                "import { Controller, Get } from '@nestjs/common';\n@Controller('csrf')\nexport class CsrfController {\n  @Get()\n  public token() {}\n}\n",
+            )
+            .file(
+                "integration/cookies/e2e/cookies.spec.ts",
+                "import { NestFactory } from '@nestjs/core';\nimport { AppModule } from '../src/app.module';\ndescribe('Cookies', () => {\n  it('sets', async () => {\n    const app = await NestFactory.create(AppModule);\n    await app.init();\n  });\n});\n",
+            )
+            .file(
+                "integration/cookies/src/cookies.controller.ts",
+                "import { Controller, Get } from '@nestjs/common';\n@Controller('cookies')\nexport class CookiesController {\n  @Get('set')\n  public set() {}\n}\n",
+            )
+            .file(
+                "integration/hello/src/hello.controller.ts",
+                "import { Controller, Get } from '@nestjs/common';\n@Controller('hello')\nexport class HelloController {\n  @Get()\n  public hi() {}\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        assert_eq!(
+            route_names(graph),
+            ["GET /api/csrf", "GET /cookies/set", "GET /hello"],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream #2246: in a TS/JS module the provider convention (`*Service`,
+    /// `*Controller`, …) takes the file's own class or the convention file
+    /// beside it, never a same-named class elsewhere preferred for its file
+    /// name: Nest's own specs' `TransientService` is not an integration
+    /// app's. Anything farther is import resolution's or name matching's.
+    #[test]
+    fn pr2246_the_provider_convention_stays_in_the_references_feature() {
+        let project = Project::new()
+            .file(
+                "package.json",
+                "{\"name\":\"nest\",\"private\":true,\"dependencies\":{\"@nestjs/common\":\"^10.0.0\"}}\n",
+            )
+            .file(
+                "integration/injector/src/app.module.ts",
+                "import { Module } from '@nestjs/common';\n\n@Module({})\nexport class AppModule {}\n",
+            )
+            .file(
+                "integration/injector/src/scoped/transient.service.ts",
+                "export class TransientService {}\n",
+            )
+            .file(
+                "packages/core/test/scope/helpers.ts",
+                "export class TransientService {}\n",
+            )
+            .file(
+                "packages/core/test/scope/transient-scope.spec.ts",
+                "class Holder {\n  constructor(public transient: TransientService) {}\n}\n",
+            )
+            .file("src/admin/users.service.ts", "export class UsersService {}\n")
+            .file("src/users/users.service.ts", "export class UsersService {}\n")
+            .file(
+                "src/users/users.controller.ts",
+                "export class UsersController {\n  constructor(private readonly users: UsersService) {}\n}\n",
+            )
+            .file("src/guards/auth.guard.ts", "export class AuthGuard {}\n")
+            .file(
+                "src/auth/session.ts",
+                "export class AuthGuard {}\n\nexport class Session {\n  constructor(private readonly guard: AuthGuard) {}\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        graph.assert_no_edge(
+            "method Holder::constructor",
+            "references",
+            "class TransientService @integration/injector/src/scoped/transient.service.ts",
+        );
+        // The convention file beside the reference, not another feature's.
+        graph.assert_edge(
+            "method UsersController::constructor",
+            "references",
+            "class UsersService @src/users/users.service.ts",
+            Some("framework"),
+        );
+        graph.assert_no_edge(
+            "method UsersController::constructor",
+            "references",
+            "class UsersService @src/admin/users.service.ts",
+        );
+        // The file's own class, though another file is named by the
+        // convention.
+        graph.assert_edge(
+            "method Session::constructor",
+            "references",
+            "class AuthGuard @src/auth/session.ts",
+            Some("framework"),
+        );
+        graph.assert_no_edge(
+            "method Session::constructor",
+            "references",
+            "class AuthGuard @src/guards/auth.guard.ts",
+        );
+    }
+
+    /// Upstream #2130: Nuxt's file routes are read only in a Nuxt app, and a
+    /// Nuxt app at the repository root gets them: a top-level
+    /// `pages/index.vue` is `/`, not `/index`. A plain Vue app's `pages/`
+    /// folder holds components a router config names, not addresses.
+    #[test]
+    fn pr2130_nuxt_pages_are_routes_only_in_a_nuxt_app() {
+        let nuxt = Project::new()
+            .file(
+                "package.json",
+                "{\"name\":\"site\",\"dependencies\":{\"nuxt\":\"*\",\"vue\":\"*\"}}\n",
+            )
+            .file("pages/index.vue", "<template><div/></template>\n")
+            .file("pages/users/[id].vue", "<template><div/></template>\n")
+            .index();
+        assert_eq!(
+            route_names(nuxt.graph()),
+            ["/", "/users/:id"],
+            "{}",
+            nuxt.graph().report()
+        );
+        let plain = Project::new()
+            .file(
+                "ui/package.json",
+                "{\"name\":\"console\",\"dependencies\":{\"vue\":\"*\",\"vue-router\":\"*\"}}\n",
+            )
+            .file(
+                "ui/src/modules/contents/pages/SinglePageList.vue",
+                "<template><div/></template>\n",
+            )
+            .index();
+        assert!(
+            route_names(plain.graph()).is_empty(),
+            "{}",
+            plain.graph().report()
+        );
+    }
+
+    /// Upstream #2129 for Nuxt: in a monorepo, a Nuxt app's pages are routes
+    /// and a plain Vue app's `pages/` beside it are not, though the Nuxt app
+    /// makes the project a Nuxt one.
+    #[test]
+    fn pr2129_nuxt_routes_stay_in_the_app_that_declares_nuxt() {
+        let project = Project::new()
+            .file("package.json", "{\"name\":\"mono\",\"private\":true}\n")
+            .file(
+                "apps/site/package.json",
+                "{\"name\":\"site\",\"dependencies\":{\"nuxt\":\"3\"}}\n",
+            )
+            .file("apps/site/pages/about.vue", "<template><div/></template>\n")
+            .file(
+                "apps/admin/package.json",
+                "{\"name\":\"admin\",\"dependencies\":{\"vue\":\"3\"}}\n",
+            )
+            .file(
+                "apps/admin/src/pages/Users.vue",
+                "<template><div/></template>\n",
+            )
+            .index();
+        assert_eq!(
+            route_names(project.graph()),
+            ["/about"],
+            "{}",
+            project.graph().report()
+        );
+    }
+
+    /// Upstream #2267: a Nuxt page route is served by its own file's
+    /// component, never a same-named one: every `index.vue` is a component
+    /// named `index`.
+    #[test]
+    fn pr2267_a_nuxt_page_is_served_by_its_own_files_component() {
+        let project = Project::new()
+            .file(
+                "package.json",
+                "{\"name\":\"shop\",\"private\":true,\"dependencies\":{\"nuxt\":\"^3.0.0\"}}\n",
+            )
+            .file(
+                "pages/index.vue",
+                "<template><button @click=\"load\">Load</button></template>\n<script setup lang=\"ts\">\nfunction load() { return 1; }\n</script>\n",
+            )
+            .file("pages/admin.vue", "<template><div>admin</div></template>\n")
+            .file(
+                "pages/orders/index.vue",
+                "<template><div>orders</div></template>\n",
+            )
+            .file(
+                "components/index.vue",
+                "<template><div>not a page</div></template>\n",
+            )
+            .index();
+        let graph = project.graph();
+        for (route, file) in [
+            ("/", "pages/index.vue"),
+            ("/admin", "pages/admin.vue"),
+            ("/orders", "pages/orders/index.vue"),
+        ] {
+            let served: Vec<String> = graph
+                .edges
+                .iter()
+                .filter(|edge| {
+                    matches!(edge.kind.as_str(), "calls" | "references")
+                        && graph
+                            .node(&edge.source)
+                            .is_some_and(|node| node.kind == "route" && node.name == route)
+                })
+                .filter_map(|edge| graph.node(&edge.target))
+                .map(|node| format!("{} {}", node.kind, node.file_path))
+                .collect();
+            assert_eq!(
+                served,
+                [format!("component {file}")],
+                "{route}\n{}",
+                graph.report()
+            );
+        }
+    }
+}
+
+mod explore_flow {
+    use super::support::{Project, codegraph};
+
+    const FLOW_HEADING: &str = "**Flow (call path among the symbols you queried)**";
+
+    /// What `codegraph explore` prints for `query`.
+    fn explore(root: &std::path::Path, query: &str) -> String {
+        let output = codegraph(root, ["explore", query, "-p", "."]);
+        String::from_utf8(output.stdout).expect("explore prints UTF-8")
+    }
+
+    /// The Flow section explore opens with: its heading through its last
+    /// numbered line; empty when there is none.
+    fn flow_section(text: &str) -> Vec<String> {
+        let Some(start) = text.find(FLOW_HEADING) else {
+            return Vec::new();
+        };
+        text[start..]
+            .lines()
+            .take_while(|line| !line.starts_with("> "))
+            .filter(|line| !line.is_empty())
+            .map(str::to_string)
+            .collect()
+    }
+
+    const BRANCHES_TS: &str = "export function helper() { return 1 }\nexport function other() { return 2 }\nexport function run(ready: boolean, busy: boolean) {\n  if (busy) return\n  if (ready) {\n    helper()\n  } else {\n    other()\n  }\n}\nexport function start() {\n  run(true, false)\n}\n";
+
+    /// Upstream #365: explore opens with the longest call chain among the
+    /// symbols the query names, one numbered line per symbol and one `↓`
+    /// line per hop, and says the bodies follow. Two named symbols one call
+    /// apart make no Flow: a chain needs three.
+    #[test]
+    fn pr365_explore_opens_with_the_call_path_among_the_named_symbols() {
+        let project = Project::new().file("src/app.ts", BRANCHES_TS).index();
+        let text = explore(project.root(), "start run helper");
+        assert!(text.starts_with(FLOW_HEADING), "{text}");
+        assert_eq!(
+            flow_section(&text),
+            [
+                FLOW_HEADING,
+                "1. start (src/app.ts:11)",
+                "   ↓ calls",
+                "2. run (src/app.ts:3)",
+                "   ↓ calls (when !busy && ready)",
+                "3. helper (src/app.ts:1)",
+            ],
+            "{text}"
+        );
+        assert!(
+            text.contains("\n\n> Full source for these symbols is below — the call flow among them, followed by their bodies.\n## Exploration: start run helper\n"),
+            "{text}"
+        );
+        let short = explore(project.root(), "start run");
+        assert!(flow_section(&short).is_empty(), "{short}");
+        assert!(short.starts_with("## Exploration: start run"), "{short}");
+    }
+
+    /// Upstream #1655: each hop of the Flow names the conditions its call
+    /// runs under, read from the caller's source as it is now: an earlier
+    /// early return negated, then the branch the call sits in. The other
+    /// arm of the same `if` reads negated.
+    #[test]
+    fn pr1655_a_flow_hop_says_when_its_call_runs() {
+        let project = Project::new().file("src/app.ts", BRANCHES_TS).index();
+        let text = explore(project.root(), "start run other");
+        assert_eq!(
+            flow_section(&text),
+            [
+                FLOW_HEADING,
+                "1. start (src/app.ts:11)",
+                "   ↓ calls",
+                "2. run (src/app.ts:3)",
+                "   ↓ calls (when !busy && !ready)",
+                "3. other (src/app.ts:2)",
+            ],
+            "{text}"
+        );
+    }
+
+    /// The condition is the CALLER's: read in the file the call is written
+    /// in, at the call's line, not in the callee's file.
+    #[test]
+    fn pr1655_the_condition_is_read_in_the_callers_file() {
+        let project = Project::new()
+            .file(
+                "src/lib.ts",
+                "export function helper(): number {\n  return 1;\n}\n",
+            )
+            .file(
+                "src/app.ts",
+                "import { helper } from './lib';\n\nexport function run(admin: boolean): number {\n  if (!admin) {\n    return 0;\n  }\n  return helper();\n}\n\nexport function start(): number {\n  return run(true);\n}\n",
+            )
+            .index();
+        let text = explore(project.root(), "start run helper");
+        assert_eq!(
+            flow_section(&text),
+            [
+                FLOW_HEADING,
+                "1. start (src/app.ts:10)",
+                "   ↓ calls",
+                "2. run (src/app.ts:3)",
+                "   ↓ calls (when admin)",
+                "3. helper (src/lib.ts:1)",
+            ],
+            "{text}"
+        );
+    }
+
+    /// A Python caller: `if not user: raise` before the call reads as `user`.
+    #[test]
+    fn pr1655_a_python_early_exit_guards_the_call_after_it() {
+        let project = Project::new()
+            .file(
+                "app.py",
+                "def helper():\n    return 1\n\n\ndef run(user):\n    if not user:\n        raise ValueError(\"no user\")\n    helper()\n\n\ndef start():\n    run(None)\n",
+            )
+            .index();
+        let text = explore(project.root(), "start run helper");
+        assert_eq!(
+            flow_section(&text),
+            [
+                FLOW_HEADING,
+                "1. start (app.py:11)",
+                "   ↓ calls",
+                "2. run (app.py:5)",
+                "   ↓ calls (when user)",
+                "3. helper (app.py:1)",
+            ],
+            "{text}"
+        );
+    }
+
+    /// A caller whose file changed since it was indexed may have moved its
+    /// lines: its hop shows no condition rather than one read at a stale
+    /// line, and the rest of the Flow stays.
+    #[test]
+    fn pr1655_a_changed_caller_file_gives_no_condition() {
+        let mut project = Project::new().file("src/app.ts", BRANCHES_TS).index();
+        let edited =
+            BRANCHES_TS.replace("  if (busy) return\n", "  if (busy) return\n  // checked\n");
+        project.write("src/app.ts", &edited);
+        let text = explore(project.root(), "start run helper");
+        assert_eq!(
+            flow_section(&text),
+            [
+                FLOW_HEADING,
+                "1. start (src/app.ts:11)",
+                "   ↓ calls",
+                "2. run (src/app.ts:3)",
+                "   ↓ calls",
+                "3. helper (src/app.ts:1)",
+            ],
+            "{text}"
+        );
+    }
+
+    /// Upstream #2453, explore half: two routes of one length to the next
+    /// named symbol, and the Flow takes the one through the symbol the query
+    /// names, whichever the index lists first. Upstream meets it through an
+    /// interface's implementations, whose dispatch edges come with the
+    /// synthesis stage (W7-14); direct calls settle the same way.
+    #[test]
+    fn pr2453_explore_flow_goes_through_the_symbol_the_query_names() {
+        let project = Project::new()
+            .file(
+                "src/store.ts",
+                "export function persist(): number {\n  return viaMemory() + viaDisk();\n}\n\nexport function viaMemory(): number {\n  return writeEntry();\n}\n\nexport function viaDisk(): number {\n  return writeEntry();\n}\n\nexport function writeEntry(): number {\n  return 1;\n}\n",
+            )
+            .index();
+        for (via, line) in [("viaMemory", 5), ("viaDisk", 9)] {
+            let text = explore(project.root(), &format!("persist {via} writeEntry"));
+            assert_eq!(
+                flow_section(&text),
+                [
+                    FLOW_HEADING.to_string(),
+                    "1. persist (src/store.ts:1)".to_string(),
+                    "   ↓ calls".to_string(),
+                    format!("2. {via} (src/store.ts:{line})"),
+                    "   ↓ calls".to_string(),
+                    "3. writeEntry (src/store.ts:13)".to_string(),
+                ],
+                "{text}"
+            );
+        }
     }
 }

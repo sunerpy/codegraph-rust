@@ -1,7 +1,7 @@
 //! Concrete [`FrameworkResolver`] implementations + the detection registry.
 //!
 //! Ports the subset of `upstream resolution/frameworks/` that v1
-//! ships: React/Next.js ([`react`]), Vue/Nuxt ([`vue`]), and NestJS ([`nestjs`]).
+//! ships: React/Next.js ([`react`]), Vue and Nuxt ([`vue`]), and NestJS ([`nestjs`]).
 //! The other ~19 upstream resolvers remain deferred (see `KNOWN_DIFFS.md`).
 //!
 //! [`detect_frameworks`] ports `frameworks/index.ts:detectFrameworks` restricted
@@ -17,7 +17,10 @@ pub(crate) mod godot_project;
 pub(crate) mod godot_resource;
 pub(crate) mod godot_scene;
 pub mod godot_script;
+pub(crate) mod js_scan;
 pub mod nestjs;
+pub mod package_deps;
+pub(crate) mod page_component;
 pub mod react;
 pub mod tauri;
 pub mod vue;
@@ -42,6 +45,11 @@ pub fn detect_frameworks(context: &dyn ResolutionContext) -> Vec<Box<dyn Framewo
         // PRE-EXISTING reference must not change. A new candidate at the front
         // could pre-empt one of the four above.
         Box::new(tauri::TauriResolver::default()),
+        // Nuxt's file routes, in a Nuxt app only (upstream #2130). Upstream
+        // runs it right after Vue; it claims only its own routes' `calls`
+        // references to their pages' components, so its place here changes
+        // no other reference's resolution.
+        Box::new(vue::NuxtResolver),
     ];
     candidates
         .into_iter()

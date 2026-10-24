@@ -2152,6 +2152,69 @@ fn cmd_status(path: Option<PathBuf>, json_output: bool) -> Result<()> {
             }
             return Ok(());
         }
+        // A database a newer codegraph wrote (OD-19) is unreadable here, and
+        // nothing may write it; report which versions disagree instead of
+        // failing like a read.
+        Err(
+            error @ codegraph_store::StoreError::FutureSchema {
+                found,
+                supported,
+                discard_with_uninit,
+                ..
+            },
+        ) => {
+            if json_output {
+                let mut status = json!({
+                    "initialized": false,
+                    "version": VERSION,
+                    "projectPath": project,
+                    "indexPath": index_root,
+                    "lastIndexed": null,
+                    "dbPath": db,
+                    "dbExists": db_exists,
+                    "dbSizeBytes": db_size,
+                    "extractionStatus": "current",
+                    "extractionStatusDetail": error.to_string(),
+                    "recoveryCommand": null,
+                    "legacyIndexPresent": legacy_index_present,
+                    "legacyIndexPaths": legacy_index_paths,
+                    "daemonRunning": daemon_running,
+                    "daemonPidPath": daemon_pid_path,
+                    "daemonSocketPath": daemon_socket_path,
+                    "daemonLogPath": daemon_log_path,
+                });
+                if wal_size > 0 {
+                    status["walSizeBytes"] = json!(wal_size);
+                }
+                print_json(&status)?;
+            } else {
+                println!("\nCodeGraph Status\n");
+                println!("Project: {}\n", project.display());
+                println!(
+                    "State:   current (schema {found} is newer than this binary's {supported})"
+                );
+                println!("Index Statistics:");
+                println!("  DB Size:   {:.2} MB", db_size as f64 / 1024.0 / 1024.0);
+                print_wal_status(wal_size, db_size);
+                println!("\n  DB Path:   {}", db.display());
+                println!(
+                    "  Daemon:    {}",
+                    if daemon_running { "running" } else { "stopped" }
+                );
+                if discard_with_uninit {
+                    println!(
+                        "\nRecovery: a newer CodeGraph wrote this index. Upgrade CodeGraph, or run `codegraph uninit --force {}` and then `codegraph init {}` to discard and rebuild it.",
+                        project.display(),
+                        project.display()
+                    );
+                } else {
+                    println!(
+                        "\nRecovery: a newer CodeGraph wrote this index. Upgrade CodeGraph to use it."
+                    );
+                }
+            }
+            return Ok(());
+        }
         Err(error) => return Err(error.into()),
     };
     if status_open.rebuilding {
@@ -6506,7 +6569,7 @@ fn index_project_inner(
     codegraph_watch::control_inputs::write_index_rows(
         &store,
         project,
-        &resolver.framework_names(),
+        &resolver.framework_signature(),
     )?;
     if resolver.has_framework_resolvers() {
         let relative_files = store

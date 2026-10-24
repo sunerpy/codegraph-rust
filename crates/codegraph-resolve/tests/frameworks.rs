@@ -1,4 +1,4 @@
-//! Regression tests for the React / Vue / NestJS [`FrameworkResolver`]s.
+//! Regression tests for the React / Vue / Nuxt / NestJS [`FrameworkResolver`]s.
 //!
 //! Each test drives a resolver through an in-memory [`ResolutionContext`] and
 //! asserts the produced [`ResolvedRef`] / extraction shape against the upstream
@@ -159,6 +159,39 @@ fn react_detects_via_tsx_file() {
     assert!(react::ReactResolver.detect(&ctx));
 }
 
+/// React in an app's manifest rather than the root's: proshop keeps `react`
+/// in `frontend/`, an ASP.NET solution its app in `src/Web/ClientApp/`
+/// (upstream #2395). Neither app has a `.jsx` or `.tsx` file.
+#[test]
+fn react_detects_via_an_app_package_json() {
+    for app in ["frontend/", "apps/web/", "src/Web/ClientApp/"] {
+        let ctx = MockContext::default()
+            .with_file("package.json", r#"{"name":"shop","private":true}"#)
+            .with_file(
+                &format!("{app}package.json"),
+                r#"{"peerDependencies":{"react":"18"}}"#,
+            )
+            .with_file(&format!("{app}src/index.js"), "export const x = 1;");
+        assert!(react::ReactResolver.detect(&ctx), "{app}");
+    }
+}
+
+/// A dependency's own manifest inside `node_modules` is not the project's.
+#[test]
+fn react_does_not_detect_a_manifest_inside_node_modules() {
+    let ctx = MockContext::default()
+        .with_file(
+            "tools/node_modules/react-ui/package.json",
+            r#"{"dependencies":{"react":"18"}}"#,
+        )
+        .with_file(
+            "tools/node_modules/react-ui/index.js",
+            "module.exports = 1;",
+        )
+        .with_file("tools/src/index.js", "export const x = 1;");
+    assert!(!react::ReactResolver.detect(&ctx));
+}
+
 #[test]
 fn react_does_not_detect_plain_ts_project() {
     let ctx = MockContext::default()
@@ -212,26 +245,35 @@ fn react_does_not_resolve_component_from_plain_ts_file() {
 }
 
 #[test]
-fn react_resolves_hook_preferring_hooks_dir() {
+fn react_resolves_only_the_files_own_hook() {
     let hook = node(
-        "hook:src/hooks/useAuth.ts:useAuth:1",
+        "function:src/hooks/useAuth.ts:useAuth:1",
         NodeKind::Function,
         "useAuth",
         "src/hooks/useAuth.ts",
         Language::TypeScript,
     );
     let ctx = MockContext::default().with_node(hook.clone());
+    // In a JS/TS module another file's hook comes through an import (the
+    // import resolver's), never by name: Page.tsx imports nothing here
+    // (upstream #2240).
     let reference = ref_view("useAuth", EdgeKind::Calls, "src/Page.tsx", Language::Tsx);
-    let resolved = react::ReactResolver
-        .resolve(&reference, &ctx)
-        .expect("resolves");
+    assert!(react::ReactResolver.resolve(&reference, &ctx).is_none());
+    // The file's own hook resolves.
+    let own = ref_view(
+        "useAuth",
+        EdgeKind::Calls,
+        "src/hooks/useAuth.ts",
+        Language::TypeScript,
+    );
+    let resolved = react::ReactResolver.resolve(&own, &ctx).expect("resolves");
     assert_eq!(resolved.target_node_id, hook.id);
     assert_eq!(resolved.confidence, 0.85);
     assert_eq!(resolved.resolved_by, ResolvedBy::Framework);
 }
 
 #[test]
-fn react_resolves_context() {
+fn react_resolves_only_the_files_own_context() {
     let ctx_node = node(
         "variable:src/context/AuthContext.tsx:AuthContext:1",
         NodeKind::Variable,
@@ -246,9 +288,14 @@ fn react_resolves_context() {
         "src/App.tsx",
         Language::Tsx,
     );
-    let resolved = react::ReactResolver
-        .resolve(&reference, &ctx)
-        .expect("resolves");
+    assert!(react::ReactResolver.resolve(&reference, &ctx).is_none());
+    let own = ref_view(
+        "AuthContext",
+        EdgeKind::References,
+        "src/context/AuthContext.tsx",
+        Language::Tsx,
+    );
+    let resolved = react::ReactResolver.resolve(&own, &ctx).expect("resolves");
     assert_eq!(resolved.target_node_id, ctx_node.id);
     assert_eq!(resolved.confidence, 0.8);
     assert_eq!(resolved.resolved_by, ResolvedBy::Framework);
@@ -272,18 +319,14 @@ fn react_extract_emits_nextjs_page_route() {
 }
 
 #[test]
-fn react_extract_component_and_route_reference() {
+fn react_extract_route_reference_and_no_component() {
     let content =
         "export function Home() { return <Layout/>; }\n<Route path=\"/home\" component={Home}/>";
     let result = react::ReactResolver
         .extract("src/Home.tsx", content, &no_project_config())
         .expect("extract result");
-    assert!(
-        result
-            .nodes
-            .iter()
-            .any(|n| n.kind == NodeKind::Component && n.name == "Home")
-    );
+    // The component is the tree-sitter extractor's `function` node (#841).
+    assert!(!result.nodes.iter().any(|n| n.kind == NodeKind::Component));
     let route = result
         .nodes
         .iter()
@@ -747,18 +790,26 @@ fn vue_resolves_pascalcase_component_call() {
 }
 
 #[test]
-fn vue_extract_emits_nuxt_page_route() {
-    // the upstream extract keys on `/pages/` (with leading slash), so the route file
-    // must sit under a parent dir (vue.ts:198).
-    let result = vue::VueResolver
-        .extract("app/pages/users/[id].vue", "", &no_project_config())
-        .expect("extract result");
-    let route = result
-        .nodes
-        .iter()
-        .find(|n| n.kind == NodeKind::Route)
-        .expect("route node");
-    assert_eq!(route.name, "/users/:id");
+fn nuxt_extract_emits_page_route() {
+    // Nuxt's page routes are the Nuxt resolver's, nested or at the
+    // repository root (upstream #2130); the Vue resolver extracts none.
+    for path in ["app/pages/users/[id].vue", "pages/users/[id].vue"] {
+        let result = vue::NuxtResolver
+            .extract(path, "", &no_project_config())
+            .expect("extract result");
+        let route = result
+            .nodes
+            .iter()
+            .find(|n| n.kind == NodeKind::Route)
+            .expect("route node");
+        assert_eq!(route.name, "/users/:id", "{path}");
+        assert!(
+            vue::VueResolver
+                .extract(path, "", &no_project_config())
+                .is_none(),
+            "{path}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -769,6 +820,23 @@ fn vue_extract_emits_nuxt_page_route() {
 fn nestjs_detects_via_package_json() {
     let ctx = MockContext::default()
         .with_file("package.json", r#"{"dependencies":{"@nestjs/core":"10"}}"#);
+    assert!(nestjs::NestjsResolver.detect(&ctx));
+}
+
+/// `@nestjs/*` in a workspace app's manifest, with no conventionally named
+/// controller or module file to fall back on.
+#[test]
+fn nestjs_detects_via_an_app_package_json() {
+    let ctx = MockContext::default()
+        .with_file(
+            "package.json",
+            r#"{"private":true,"workspaces":["apps/*"]}"#,
+        )
+        .with_file(
+            "apps/api/package.json",
+            r#"{"dependencies":{"@nestjs/core":"10"}}"#,
+        )
+        .with_file("apps/api/src/main.ts", "bootstrap();");
     assert!(nestjs::NestjsResolver.detect(&ctx));
 }
 

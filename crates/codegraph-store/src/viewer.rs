@@ -415,7 +415,8 @@ impl Store {
     }
 
     /// `getRoutingManifest`'s SELECT: route → handler rows, routes in file and
-    /// line order, at most `limit`.
+    /// line order, at most `limit`. A screen in a Vue app is served by a
+    /// `component` (upstream #2267).
     pub fn routing_manifest_rows(&self, limit: i64) -> rusqlite::Result<Vec<RoutingRow>> {
         let mut stmt = self.connection().prepare(
             "SELECT r.name, r.id, r.file_path, r.start_line,
@@ -425,7 +426,7 @@ impl Store {
                JOIN nodes h ON e.target = h.id
               WHERE r.kind = 'route'
                 AND e.kind IN ('references', 'calls')
-                AND h.kind IN ('function', 'method', 'class', 'constant', 'variable')
+                AND h.kind IN ('function', 'method', 'class', 'constant', 'variable', 'component')
            ORDER BY r.file_path, r.start_line, r.id, h.id
               LIMIT ?",
         )?;

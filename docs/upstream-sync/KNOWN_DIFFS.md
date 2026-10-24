@@ -121,14 +121,20 @@ text-formatting / relevance-ordering differences. Six of the eight shared tools 
 `codegraph_files` tree/flat/grouped) are byte-identical; the diffs below are
 confined to `codegraph_explore` and `codegraph_status`.
 
-- **`codegraph_explore` relevance ranking (RWR/flow/skeletonization) is not
-  ported; the size-adaptive output BUDGET is.** colby's `findRelevantContext`
-  (`reference/colby/src/context/index.ts`) ranks the subgraph with
-  Random-Walk-with-Restart / personalized PageRank, computes a FLOW spine among
-  named symbols (`buildFlowFromNamedSymbols`), and adaptively SKELETONIZES
-  off-spine polymorphic-sibling files to signatures (`adaptiveExplore`,
-  `tools.ts:2422-2623`). The Rust port reproduces the DETERMINISTIC structure —
-  header, blast radius, relationship map, dynamic boundaries, and per-file source
+- **`codegraph_explore` relevance ranking (RWR/skeletonization) is not
+  ported; the size-adaptive output BUDGET and the Flow section are.** colby's
+  `findRelevantContext` (`reference/colby/src/context/index.ts`) ranks the
+  subgraph with Random-Walk-with-Restart / personalized PageRank, computes a
+  FLOW spine among named symbols (`buildFlowFromNamedSymbols`), and adaptively
+  SKELETONIZES off-spine polymorphic-sibling files to signatures
+  (`adaptiveExplore`, `tools.ts:2422-2623`). The port opens the response with
+  the same Flow section (the chain, `dynamic:` hop tags, `(when …)` branch
+  conditions). The spine does not yet weight file ranking or body windows, the
+  "Dynamic-dispatch links among your symbols" section is not printed, and a
+  flow that does not connect gets no boundary or polymorphic-dispatch
+  announcement of its own; the port's boundary scan over the explore seeds
+  still runs. The Rust port reproduces the DETERMINISTIC structure — header,
+  blast radius, relationship map, dynamic boundaries, and per-file source
   grouped by file — by seeding roots from the FTS search results
   (`searchLimit: 8`) and pulling their callers/callees + `contains` children into
   the subgraph. It DOES now apply colby's `getExploreOutputBudget`
@@ -210,6 +216,15 @@ listed.
 - **C# extension methods (W3-05c, owner 2026-10-11, OD-8).** A call on an
   outside type reaches the one project extension method in scope that takes it
   as `this`; colby resolves no extension method (`csharp_extensions.rs`).
+- **A test's NestJS bootstrap (W7-02b).** A `NestFactory.create` in a test
+  file (an e2e spec) with no `src/` segment above it belongs to the directory
+  above its test folder, else the one holding it, and within one app the
+  entry point's bootstrap decides over a test's: an e2e spec's
+  `setGlobalPrefix('api')` names neither another integration app's routes
+  nor the routes its app's own entry point serves. colby puts every such
+  spec at the repository root and prefers a bootstrap that configures the
+  app, so all of nestjs/nest's integration apps took one spec's `/api`
+  (`nestjs.rs`).
 - **Dart named constructors (#2380).** A named constructor, indexed as a
   method, is reached only by a call written through its class (`Foo.value(2)`).
   A call through a value of that type (a typed parameter or local, a chain's
@@ -306,4 +321,8 @@ for them that colby's sync has no counterpart for, each with a version marker
 withdrawn before the sync's first write and restored once it has resolved
 ([Daemon and watch lifecycle](../architecture.md#daemon-and-watch-lifecycle)).
 The Shopify theme lane also covers a scoped sync: a theme marker added or
-removed converges there, where colby's needs a full sync.
+removed converges there, where colby's needs a full sync. NestJS route naming
+needs no lane: every sync renames the routes again, and one that nothing
+renames any more (its app's global prefix or version, or its module's
+`RouterModule` entry, went away) gets the name its file gives it back
+(`frameworks/nestjs.rs`), where colby's sync keeps the old name.

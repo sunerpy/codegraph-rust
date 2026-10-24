@@ -863,7 +863,7 @@ fn sync_paths_with_store(
             let context = resolver.store_context(store);
             resolver.initialize(&context);
         }
-        frameworks = resolver.framework_names();
+        frameworks = resolver.framework_signature();
         frameworks_changed = crate::control_inputs::frameworks_changed(store, &frameworks)?;
     }
     if frameworks_changed {

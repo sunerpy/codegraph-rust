@@ -17,11 +17,14 @@ use codegraph_core::config::Config;
 use codegraph_core::deprioritize::DeprioritizeMatcher;
 use codegraph_core::file_class::{is_generated_file, is_test_file};
 use codegraph_core::node_id::hash_content;
-use codegraph_core::types::{EdgeKind, FileRecord, Node, NodeKind};
+use codegraph_core::types::{Edge, EdgeKind, FileRecord, Node, NodeKind};
+use codegraph_graph::branch_guards::{guard_label, guards_at, supports_branch_guards};
 use codegraph_graph::graph::{GodotReach, GraphTraverser, NodeEdge, group_definitions};
+use codegraph_graph::named_symbol_flow::{NamedSymbolFlowOptions, resolve_named_symbol_flow};
 use codegraph_graph::query::{SearchOptions, search_nodes};
 use codegraph_graph::segment_match::get_segment_matches;
 use codegraph_graph::segments::extract_segment_search_words;
+use codegraph_graph::synthesized_hop::describe_synthesized_hop;
 use codegraph_store::Store;
 use serde_json::Value;
 
@@ -983,11 +986,17 @@ impl CodeGraphEngine {
         if callees.is_empty() && callers.is_empty() {
             return Ok(String::new());
         }
+        // A synthesized hop carries its tag, so it never reads as a plain
+        // call (upstream `formatTrail`, #2428).
         let fmt = |e: &NodeEdge| -> String {
-            format!(
+            let base = format!(
                 "{} ({}:{})",
                 e.node.name, e.node.file_path, e.node.start_line
-            )
+            );
+            match synth_edge_note(&e.edge) {
+                Some(tag) => format!("{base} [{tag}]"),
+                None => base,
+            }
         };
         let mut lines = vec![
             String::new(),
@@ -1286,6 +1295,9 @@ impl CodeGraphEngine {
             )));
         }
 
+        // The Flow section opens the response (upstream prepends it to the
+        // header), so everything below spends against it too.
+        let flow_text = self.build_flow_section(&match_query);
         let file_count = subgraph.file_order.len();
 
         let mut lines = vec![
@@ -1384,7 +1396,7 @@ impl CodeGraphEngine {
         // incidental file that doesn't fit is DROPPED whole (never sliced
         // mid-method) and surfaced in the trailing "Additional relevant files"
         // list (`tools.ts:2483-2905`).
-        let mut total_chars: usize = lines.join("\n").len();
+        let mut total_chars: usize = flow_text.len() + lines.join("\n").len();
         let mut files_included = 0usize;
         let mut budget_dropped = false;
         let mut excluded_files: Vec<&String> = Vec::new();
@@ -1611,7 +1623,7 @@ impl CodeGraphEngine {
         // Final ABSOLUTE inline ceiling — cut at a `#### ` file-section boundary
         // so trailing whole sections drop rather than slicing a method body
         // (`tools.ts:2954-2975`).
-        let output = lines.join("\n");
+        let output = format!("{flow_text}{}", lines.join("\n"));
         let hard_ceiling = ((budget.max_output_chars as f64 * 1.5).round() as usize).min(25000);
         let trimmed_paths: Vec<&str> = trimmed_shown
             .iter()
@@ -1619,8 +1631,104 @@ impl CodeGraphEngine {
             .collect();
         let (output, kept_prefix_len) =
             cut_at_section_boundary(&output, hard_ceiling, &trimmed_paths);
-        self.mark_surviving_explore_citations(&lines, &rendered_sources, kept_prefix_len);
+        self.mark_surviving_explore_citations(
+            &lines,
+            &rendered_sources,
+            kept_prefix_len.saturating_sub(flow_text.len()),
+        );
         Ok(ToolResult::text(output))
+    }
+
+    /// The Flow section (upstream `buildFlowFromNamedSymbols`, `b635dd46`):
+    /// explore's query is usually a bag of symbol names that spans the flow
+    /// the agent is investigating, so the longest call chain AMONG those
+    /// symbols opens the response, one numbered line per symbol and one `↓`
+    /// line per hop. The search is `named_symbol_flow`'s, the one the
+    /// viewer's Flow rides. A synthesized hop names its mechanism and wiring
+    /// site; a hop whose call runs under conditions names them, read from
+    /// the caller's current source. Empty unless the query names two symbols
+    /// and a chain of three or more connects them.
+    ///
+    /// The rest of upstream's builder is not here: the dynamic-dispatch links
+    /// among the named symbols (W7-26), and the dynamic-boundary and
+    /// polymorphic-dispatch announcements for a flow that does not connect —
+    /// the port keeps its own boundary scan over the explore seeds. The
+    /// spine's weight in file ranking and windowing is W7-25's.
+    fn build_flow_section(&self, match_query: &str) -> String {
+        let flow =
+            resolve_named_symbol_flow(&self.store, match_query, &NamedSymbolFlowOptions::default());
+        if flow.tokens.len() < 2 || flow.named.len() < 2 {
+            return String::new();
+        }
+        let Some(best) = flow.chains.first().map(|chain| &chain.steps) else {
+            return String::new();
+        };
+        if best.len() < 3 {
+            return String::new();
+        }
+        let mut out = vec![
+            "**Flow (call path among the symbols you queried)**".to_string(),
+            String::new(),
+        ];
+        for (index, step) in best.iter().enumerate() {
+            if let Some(edge) = &step.edge {
+                let when = match index.checked_sub(1) {
+                    Some(previous) => self.when_label(&best[previous].node, edge),
+                    None => String::new(),
+                };
+                let label = synth_edge_note(edge).unwrap_or_else(|| edge.kind.as_str().to_string());
+                let when = if when.is_empty() {
+                    String::new()
+                } else {
+                    format!(" (when {when})")
+                };
+                out.push(format!("   ↓ {label}{when}"));
+            }
+            out.push(format!(
+                "{}. {} ({}:{})",
+                index + 1,
+                step.node.name,
+                step.node.file_path,
+                step.node.start_line
+            ));
+        }
+        out.push(String::new());
+        out.push(
+            "> Full source for these symbols is below — the call flow among them, followed by their bodies."
+                .to_string(),
+        );
+        out.push(String::new());
+        out.join("\n")
+    }
+
+    /// The conditions a flow hop's call site runs under (upstream
+    /// `whenLabel`), read from the caller's source now; empty when the call
+    /// is unconditional, its line is unknown, the language has no rules, or
+    /// the file changed since it was indexed — a moved line must not be read
+    /// for a condition.
+    fn when_label(&self, caller: &Node, edge: &Edge) -> String {
+        let Some(line) = edge.line.filter(|line| *line > 0) else {
+            return String::new();
+        };
+        if !supports_branch_guards(caller.language) {
+            return String::new();
+        }
+        let source = self.project_source(&caller.file_path);
+        if source.is_possibly_drifted() {
+            return String::new();
+        }
+        let Some(content) = source.content.as_deref() else {
+            return String::new();
+        };
+        let column = edge.col.and_then(|column| usize::try_from(column).ok());
+        let key = self.project_root.join(&caller.file_path);
+        guard_label(&guards_at(
+            &key.to_string_lossy(),
+            content,
+            caller.language,
+            line as usize,
+            column,
+        ))
     }
 
     /// Why an explore came back empty (upstream #1904). Explore matches names
@@ -5782,6 +5890,12 @@ fn cut_at_section_boundary(
     )
 }
 
+/// The tag a synthesized hop carries in explore's Flow and the node trail,
+/// `dynamic: <summary> @<wiring site>`; `None` for an ordinary static edge.
+fn synth_edge_note(edge: &Edge) -> Option<String> {
+    describe_synthesized_hop(edge).map(|hop| hop.tag())
+}
+
 fn require_string(args: &Value, field: &str) -> Result<String, String> {
     match args.get(field).and_then(Value::as_str) {
         Some(s) if !s.is_empty() => Ok(s.to_string()),
@@ -5797,21 +5911,91 @@ mod tests {
 
     static TEMP_SEQ: AtomicUsize = AtomicUsize::new(0);
 
-    fn test_engine() -> CodeGraphEngine {
+    /// An engine over an empty index in its own directory, which is removed
+    /// when the engine is dropped.
+    struct TestEngine {
+        engine: Option<CodeGraphEngine>,
+        root: PathBuf,
+    }
+
+    impl std::ops::Deref for TestEngine {
+        type Target = CodeGraphEngine;
+
+        fn deref(&self) -> &CodeGraphEngine {
+            self.engine.as_ref().expect("the engine lives until drop")
+        }
+    }
+
+    impl std::ops::DerefMut for TestEngine {
+        fn deref_mut(&mut self) -> &mut CodeGraphEngine {
+            self.engine.as_mut().expect("the engine lives until drop")
+        }
+    }
+
+    impl Drop for TestEngine {
+        fn drop(&mut self) {
+            // Close the index first: Windows cannot remove an open database.
+            drop(self.engine.take());
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn test_engine() -> TestEngine {
         let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
-        let base = std::env::temp_dir().join(format!("cg-mcp-engine-{}-{seq}", std::process::id()));
+        test_engine_at(
+            std::env::temp_dir().join(format!("cg-mcp-engine-{}-{seq}", std::process::id())),
+        )
+    }
+
+    /// The directory is keyed by pid and sequence number, so a dead process
+    /// whose pid came back may have left one with its own index there: remove
+    /// it first, or the test reads that run's index instead of an empty one.
+    fn test_engine_at(base: PathBuf) -> TestEngine {
+        match std::fs::remove_dir_all(&base) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!("remove the stale {}: {error}", base.display()),
+        }
         let db = base.join(".codegraph").join("codegraph.db");
         std::fs::create_dir_all(db.parent().unwrap()).unwrap();
         let store = Store::open(&db).unwrap();
-        CodeGraphEngine {
-            store,
-            project_root: base,
-            config: Arc::new(Config::default()),
-            deprioritize: Arc::new(DeprioritizeMatcher::default()),
-            source_probes: RefCell::new(HashMap::new()),
-            source_citations: RefCell::new(HashSet::new()),
-            answer_files: RefCell::new(BTreeSet::new()),
+        TestEngine {
+            engine: Some(CodeGraphEngine {
+                store,
+                project_root: base.clone(),
+                config: Arc::new(Config::default()),
+                deprioritize: Arc::new(DeprioritizeMatcher::default()),
+                source_probes: RefCell::new(HashMap::new()),
+                source_citations: RefCell::new(HashSet::new()),
+                answer_files: RefCell::new(BTreeSet::new()),
+            }),
+            root: base,
         }
+    }
+
+    #[test]
+    fn a_test_engine_never_reads_what_a_reused_directory_holds() {
+        let base = std::env::temp_dir().join(format!(
+            "cg-mcp-engine-stale-{}-{}",
+            std::process::id(),
+            TEMP_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let db = base.join(".codegraph").join("codegraph.db");
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        std::fs::write(&db, b"left by a dead process with the same pid").unwrap();
+        std::fs::write(base.join("stale.txt"), b"stale").unwrap();
+
+        let engine = test_engine_at(base.clone());
+        assert!(
+            !base.join("stale.txt").exists(),
+            "the stale directory stays"
+        );
+        assert!(
+            engine.store.all_files().unwrap().is_empty(),
+            "a test engine starts over an empty index"
+        );
+        drop(engine);
+        assert!(!base.exists(), "dropping the engine removes its directory");
     }
 
     fn node(name: &str, file: &str, start: i64, end: i64, kind: NodeKind) -> Node {
@@ -11703,6 +11887,111 @@ mod tests {
         assert!(
             !sub.rescued_files.contains("src/widget.ts"),
             "a type in the seed's own file is on-screen, not rescued"
+        );
+    }
+
+    /// Upstream #2428 (`synthesized-hop.ts`): a synthesized hop reads as the
+    /// dynamic dispatch it is, with its wiring site, in explore's Flow and in
+    /// the node trail — never as a bare `calls`. Upstream's fixture: an
+    /// interface method reaches its implementation by an `interface-impl`
+    /// edge.
+    #[test]
+    fn a_synthesized_hop_reads_as_dynamic_dispatch_in_the_flow_and_the_trail() {
+        use codegraph_core::types::EdgeKind;
+        let mut engine = test_engine();
+        let run_export = node_lang(
+            "runExport",
+            "runExport",
+            "src/run.ts",
+            3,
+            5,
+            NodeKind::Function,
+            Language::TypeScript,
+        );
+        let iface = node_lang(
+            "exportReport",
+            "Exporter::exportReport",
+            "src/exporter.ts",
+            2,
+            2,
+            NodeKind::Method,
+            Language::TypeScript,
+        );
+        let implementation = node_lang(
+            "exportReport",
+            "PdfExporter::exportReport",
+            "src/pdf-exporter.ts",
+            5,
+            7,
+            NodeKind::Method,
+            Language::TypeScript,
+        );
+        let render = node_lang(
+            "renderPdf",
+            "renderPdf",
+            "src/render.ts",
+            1,
+            3,
+            NodeKind::Function,
+            Language::TypeScript,
+        );
+        put_nodes(
+            &mut engine,
+            &[
+                run_export.clone(),
+                iface.clone(),
+                implementation.clone(),
+                render.clone(),
+            ],
+        );
+        let mut dispatch = mk_edge(&iface.id, &implementation.id, EdgeKind::Calls);
+        dispatch.provenance = Some("heuristic".to_string());
+        dispatch.metadata = Some(serde_json::json!({
+            "synthesizedBy": "interface-impl",
+            "registeredAt": "src/pdf-exporter.ts:5",
+        }));
+        put_edges(
+            &mut engine,
+            &[
+                mk_edge(&run_export.id, &iface.id, EdgeKind::Calls),
+                dispatch,
+                mk_edge(&implementation.id, &render.id, EdgeKind::Calls),
+            ],
+        );
+
+        let explored = text_of(&engine.execute(
+            "codegraph_explore",
+            &serde_json::json!({"query": "runExport exportReport renderPdf"}),
+        ));
+        assert!(
+            explored.starts_with(
+                "**Flow (call path among the symbols you queried)**\n\n\
+                 1. runExport (src/run.ts:3)\n   ↓ calls\n\
+                 2. exportReport (src/exporter.ts:2)\n   ↓ dynamic: interface → impl @src/pdf-exporter.ts:5\n\
+                 3. exportReport (src/pdf-exporter.ts:5)\n   ↓ calls\n\
+                 4. renderPdf (src/render.ts:1)\n"
+            ),
+            "{explored}"
+        );
+
+        let trail = text_of(&engine.execute(
+            "codegraph_node",
+            &serde_json::json!({"symbol": "exportReport", "file": "src/exporter.ts"}),
+        ));
+        assert!(
+            trail.contains(
+                "**Calls →** exportReport (src/pdf-exporter.ts:5) [dynamic: interface → impl @src/pdf-exporter.ts:5]"
+            ),
+            "{trail}"
+        );
+        let caller_trail = text_of(&engine.execute(
+            "codegraph_node",
+            &serde_json::json!({"symbol": "renderPdf"}),
+        ));
+        assert!(
+            caller_trail.contains("**Called by ←** exportReport (src/pdf-exporter.ts:5)\n")
+                || caller_trail.ends_with("**Called by ←** exportReport (src/pdf-exporter.ts:5)"),
+            "a static edge carries no tag: {caller_trail}"
         );
     }
 }

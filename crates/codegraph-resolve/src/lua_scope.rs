@@ -707,11 +707,8 @@ pub(crate) fn lua_alias_target(
         }
     };
     target.map(|target| {
-        target.map(|target_node_id| ResolvedRef {
-            original: reference.clone(),
-            target_node_id,
-            confidence: 0.9,
-            resolved_by: ResolvedBy::Import,
+        target.map(|target_node_id| {
+            ResolvedRef::new(reference.clone(), target_node_id, 0.9, ResolvedBy::Import)
         })
     })
 }

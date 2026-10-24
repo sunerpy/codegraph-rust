@@ -30,6 +30,7 @@ graph TD
     resolve --> extract
     resolve --> store
     graph --> core
+    graph --> extract
     graph --> store
     mcp --> core
     mcp --> graph
@@ -216,11 +217,19 @@ binding. A framework-resolved edge carries its own reachability proof and is not
 erased by ordinary source-language visibility (for example Tauri IPC to a
 private Rust command).
 
-The registered framework candidates are NestJS, React/Next.js, Vue/Nuxt, Godot,
-and Tauri, in a deliberate order. Each activates only when its detection guard
+The registered framework candidates are NestJS, React/Next.js, Vue, Godot,
+Tauri and Nuxt, in a deliberate order. Each activates only when its detection guard
 matches, and resolves only references written in its own languages (React
 and Vue their scripts', NestJS TypeScript and JavaScript, Tauri the JS-family
-`invoke` sites and Rust; Godot stays universal). Godot also extracts project/scene/resource relationships; Tauri bridges
+`invoke` sites and Rust; Godot stays universal). React and NestJS detect a
+dependency in any `package.json` detection reads (upstream #2395): the root's
+and up to 24 nested ones, first those one or two directories down on the path
+to an indexed file, then those deeper above JavaScript-family code
+(`src/Web/ClientApp/`), shallowest first, never one inside `node_modules`. A
+framework may name the packages its apps declare (upstream #2129); when some
+manifest declares one, its extractor runs only on files whose nearest
+`package.json` naming any such framework names it, so a router reads its own
+app in a monorepo. Only Nuxt names any: `nuxt`, `nuxt3` and `@nuxt/kit`. It is detected by one of them or a `nuxt.config.*` file (upstream #2130) and reads its file routes: a `pages/` file is a screen route (a top-level `pages/index.vue` is `/`) that `calls` its own file's component (#2267), never a same-named one; `server/api/` files are endpoints and `middleware/` files functions. Vue resolves component references, compiler macros and Nuxt's auto-imports and extracts nothing. React extracts only routes, from `.tsx`/`.jsx` files too (components and hooks are the tree-sitter extractor's, upstream #841); it leaves a name the file imports to import resolution and reaches a hook or context by name only in the file that declares it (#2120, #2240). NestJS takes a provider by its naming convention (`*Service`, `*Controller`, …) only from the reference's own file or the convention file beside it (#2246), and names each route by the path a request takes to it: its module's `RouterModule` prefix and its app's global prefix and URI version (#2117), where a test's `NestFactory.create` (an e2e spec) configures only its own feature's app and never one with an entry point of its own. The routes are renamed in place after extraction, keeping their ids, and a route nothing renames any more gets the name its file gives it back. Godot also extracts project/scene/resource relationships; Tauri bridges
 literal JS-family `invoke` calls to uniquely registered Rust commands. Ambiguous
 or dynamic targets remain unresolved rather than falling through to a global
 same-name guess.
@@ -234,7 +243,9 @@ ledger in [`upstream-sync/KNOWN_DIFFS.md`](upstream-sync/KNOWN_DIFFS.md).
 `codegraph-graph` operates on persisted nodes and edges. It owns callers,
 callees, impact, paths, hierarchies, cycle detection, FTS candidates, fallback
 matching, filters, and deterministic scoring. Generated/ambient/deprioritized
-paths can affect ranking without removing graph facts.
+paths can affect ranking without removing graph facts. It also reads the
+conditions a call site runs under from the caller's current source, with the
+extractor's grammars (`branch_guards`); nothing of that is stored in the index.
 
 The CLI and MCP share the same query engine for `search`, `explore`, and `node`,
 so source selection, staleness handling, and relationship rendering do not drift
@@ -594,19 +605,22 @@ that file's row rather than its source; the `class_heads_version` marker is
 withdrawn and restored with the others. Resolution also reads control files, which are no
 source files: the JS/TS path-alias configs along their `extends` chains, the
 workspace manifests and the folders a workspace glob lists, the `package.json`
-and Deno manifests above each JavaScript-family file, the C# project files
+and Deno manifests above each JavaScript-family file and the `package.json`
+files framework detection reads, the C# project files
 above each C# file, and the `Cargo.toml` files above each Rust file; and the
 frameworks it detects. Each reader reports what it read or probed in the same
 traversal, and every index and sync keeps a `control_inputs:` row per kind
 (`js`, `csharp`, `rust`) holding each input's digest by path (the sha256 of
 its text, or of a listed folder's names; `null` for a missing one; one outside
 the project by the absolute path its reader used), and a `frameworks_detected`
-row. A sync re-reads a kind's inputs (a CLI sync always; a watcher's when a
+row (the detected frameworks, sorted, and, when a framework runs only in its
+own apps, a digest of where it runs). A sync re-reads a kind's inputs (a CLI sync always; a watcher's when a
 path it was handed is a recorded input, a control file of the kind, or a folder
 coming into a workspace glob's listing, or when a file of the kind came, went
 or changed language), whole, with no size or time shortcut; a kind whose inputs
 moved re-resolves every file of its languages whole, and a framework that came
-or went re-extracts every file, since framework nodes are made at extraction.
+or went, or an app that moved onto or off a framework that runs only in its
+apps, re-extracts every file, since framework nodes are made at extraction.
 The `control_inputs_version` marker is withdrawn and restored with the others,
 and `frameworks_version` only by a sync re-extracting for a framework change.
 The watcher hands a control file's event to the sync, ignored or not, and an

@@ -1,6 +1,32 @@
 [
   {
     "col": 0,
+    "kind": "calls",
+    "line": 1,
+    "metadata": {
+      "confidence": 0.95,
+      "framework": "nuxt",
+      "resolvedBy": "framework"
+    },
+    "provenance": null,
+    "source": "route:apps/nuxt/pages/index.vue:/:1",
+    "target": "component:ba1b120ba0c0a0e3733130855a8a1c17"
+  },
+  {
+    "col": 0,
+    "kind": "calls",
+    "line": 1,
+    "metadata": {
+      "confidence": 0.95,
+      "framework": "nuxt",
+      "resolvedBy": "framework"
+    },
+    "provenance": null,
+    "source": "route:apps/nuxt/pages/users/[id].vue:/users/:id:1",
+    "target": "component:eacd25434ecfb1c883a35441dd7dd4a0"
+  },
+  {
+    "col": 0,
     "kind": "imports",
     "line": 2,
     "metadata": {
@@ -46,6 +72,18 @@
     "provenance": null,
     "source": "file:apps/react-router/src/main.tsx",
     "target": "file:apps/react-router/src/pages/Layout.tsx"
+  },
+  {
+    "col": 0,
+    "kind": "references",
+    "line": 7,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "route:apps/react-router/src/main.tsx:7:/",
+    "target": "function:c863eb857f02e69680c9e47dace356b9"
   },
   {
     "col": 13,
@@ -117,6 +155,7 @@
     "line": 5,
     "metadata": {
       "confidence": 1.0,
+      "framework": "vue",
       "resolvedBy": "framework"
     },
     "provenance": null,
