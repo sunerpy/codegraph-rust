@@ -37,7 +37,7 @@ deterministic strategies — import resolution (`import-resolver.ts`) and name
 matching (`name-matcher.ts`) — orchestrated by `ReferenceResolver`
 (`index.ts`), plus concrete `FrameworkResolver` implementations behind the
 `FrameworkResolver` trait EXTENSION POINT (`crates/codegraph-resolve/src/framework.rs`):
-NestJS, React, Vue, Godot, Tauri, Nuxt and Next.js
+NestJS, React, Vue, Godot, Tauri, Nuxt, Next.js and Expo Router
 (`crates/codegraph-resolve/src/frameworks/`), detected per-project by
 `detect_frameworks`. The other colby resolvers stay deferred. The following
 colby behaviors are intentionally NOT ported in v1:
@@ -57,9 +57,12 @@ colby behaviors are intentionally NOT ported in v1:
   #768); only its framework-resolution half is deferred. Re-enable any of the
   deferred resolvers by adding it to `frameworks/` and the `detect_frameworks`
   registry — no orchestrator change required.
-- **Next.js link synthesis** — `next-router-synthesizer.ts`: a `<Link href>`
-  or internal `<a href>` is a JSX attribute, not a call, and draws no
-  `navigates` edge here; the Next.js resolver binds navigation calls only.
+- **Router link synthesis** — `next-router-synthesizer.ts` (a Next.js
+  `<Link href>` or internal `<a href>`), Expo Router's `<Link href>`,
+  `<Redirect href>` and `Stack.Screen` names, and the screens a helper's
+  returned href names (`router.replace(await postLoginRoute())`): JSX
+  attributes and return values, not calls, so they draw no `navigates` edge
+  here; the routers bind navigation calls only.
 - **Callback / observer edge synthesis** — `synthesizeCallbackEdges`
   (`reference/colby/src/resolution/callback-synthesizer.ts`, invoked at
   `index.ts:959-963`). Heuristic dynamic-dispatch edge synthesis; deferred behind
@@ -237,6 +240,14 @@ listed.
   node order; the store returns nodes in insertion order, which a sync
   changes. A path one page serves binds as in colby, wherever the call is
   (`nextjs.rs`).
+- **Expo Router screens by app (W7-08).** A navigation call matches only the
+  screens of its own Expo app, the longest directory above an `app/` that
+  holds the calling file, exact and dynamic alike; a file under no Expo app
+  is not read, and a path two screens of that app serve (`app/index.tsx`
+  beside `app/(tabs)/index.tsx`) stays unresolved. colby keeps one table for
+  the project, reads every file and keeps the last screen of a path in node
+  order, so in a monorepo a React Router app's `navigate('/')` reached the
+  Expo app's `/` screen (`expo_router.rs`).
 - **Dart named constructors (#2380).** A named constructor, indexed as a
   method, is reached only by a call written through its class (`Foo.value(2)`).
   A call through a value of that type (a typed parameter or local, a chain's

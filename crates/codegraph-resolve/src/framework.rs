@@ -7,8 +7,8 @@
 //! # Concrete implementations
 //!
 //! The upstream ships ~22 heuristic `FrameworkResolver` implementations. The Rust
-//! port implements NestJS, React, Vue, Godot, Tauri, Nuxt and Next.js in
-//! [`crate::frameworks`], detected per-project by
+//! port implements NestJS, React, Vue, Godot, Tauri, Nuxt, Next.js and Expo
+//! Router in [`crate::frameworks`], detected per-project by
 //! [`crate::frameworks::detect_frameworks`]. The others (Spring/Java,
 //! React-Native, Go-module, Drupal, Laravel, Express, Svelte, Astro, Python,
 //! Ruby, C#, Swift, etc.) stay deferred (see `KNOWN_DIFFS.md`): they are an
@@ -186,8 +186,8 @@ pub trait FrameworkResolver: Sync {
     /// parked while its route was missing, or bound to the best route then,
     /// is invisible to a sync's retry by name tail; this says which calls a
     /// changed route may answer, so a sync can put them back. `None` when the
-    /// resolver binds no navigation. Next.js answers it; no sync calls it
-    /// yet.
+    /// resolver binds no navigation. Next.js and Expo Router answer it; no
+    /// sync calls it yet.
     fn navigation(&self) -> Option<&dyn NavigationCalls> {
         None
     }

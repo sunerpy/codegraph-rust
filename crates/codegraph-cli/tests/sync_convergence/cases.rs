@@ -10896,6 +10896,204 @@ pub fn typescript_next_route_handler_body_edit() -> Case {
         )
 }
 
+/// W7-08: a navigation call's file is edited to name another screen
+/// (upstream F2): the `navigates` edge follows the href.
+pub fn typescript_expo_navigation_call_names_another_screen() -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript, Language::Tsx])
+        .file("package.json", "{\"name\":\"app\",\"dependencies\":{\"expo-router\":\"4\"}}\n")
+        .file(
+            "app/settings.tsx",
+            "export default function Settings() {\n  return null\n}\n",
+        )
+        .file(
+            "app/profile.tsx",
+            "export default function Profile() {\n  return null\n}\n",
+        )
+        .file(
+            "lib/nav.ts",
+            "import { router } from 'expo-router'\nexport function open() {\n  router.push('/settings')\n}\n",
+        )
+        .write(
+            "lib/nav.ts",
+            "import { router } from 'expo-router'\nexport function open() {\n  router.push('/profile')\n}\n",
+        )
+        .edge_before(
+            "function open",
+            "navigates",
+            "route app/settings.tsx::route:/settings",
+        )
+        .edge_after(
+            "function open",
+            "navigates",
+            "route app/profile.tsx::route:/profile",
+        )
+        .no_edge_after(
+            "function open",
+            "navigates",
+            "route app/settings.tsx::route:/settings",
+        )
+        .edge_metadata_after(
+            (
+                "function open",
+                "navigates",
+                "route app/profile.tsx::route:/profile",
+            ),
+            "framework",
+            "expo-router",
+        )
+}
+
+/// W7-08: a screen's body is edited (upstream F2): its route still calls
+/// its component, and the call in another file still navigates to it.
+pub fn tsx_expo_screen_body_edit_keeps_its_navigations() -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript, Language::Tsx])
+        .file("package.json", "{\"name\":\"app\",\"dependencies\":{\"expo-router\":\"4\"}}\n")
+        .file(
+            "app/item/[id].tsx",
+            "export default function Item() {\n  return null\n}\n",
+        )
+        .file(
+            "lib/nav.ts",
+            "import { router } from 'expo-router'\nexport function openItem(id: string) {\n  router.push(`/item/${id}`)\n}\n",
+        )
+        .write(
+            "app/item/[id].tsx",
+            "export default function Item() {\n  return <p>item</p>\n}\n",
+        )
+        .edge_throughout(
+            "route app/item/[id].tsx::route:/item/[id]",
+            "calls",
+            "function Item",
+        )
+        .edge_throughout(
+            "function openItem",
+            "navigates",
+            "route app/item/[id].tsx::route:/item/[id]",
+        )
+}
+
+/// W7-08: the static screen a call names is deleted (upstream F2): the call
+/// navigates to the dynamic screen that now serves its path.
+pub fn tsx_expo_static_screen_delete_falls_back_to_the_dynamic_route() -> Case {
+    Case::new(
+        Change::DeleteImportedModule,
+        &[Language::TypeScript, Language::Tsx],
+    )
+    .file("package.json", "{\"name\":\"app\",\"dependencies\":{\"expo-router\":\"4\"}}\n")
+    .file(
+        "app/item/new.tsx",
+        "export default function NewItem() {\n  return null\n}\n",
+    )
+    .file(
+        "app/item/[id].tsx",
+        "export default function Item() {\n  return null\n}\n",
+    )
+    .file(
+        "lib/nav.ts",
+        "import { router } from 'expo-router'\nexport function create() {\n  router.push('/item/new')\n}\n",
+    )
+    .remove("app/item/new.tsx")
+    .edge_before(
+        "function create",
+        "navigates",
+        "route app/item/new.tsx::route:/item/new",
+    )
+    .edge_after(
+        "function create",
+        "navigates",
+        "route app/item/[id].tsx::route:/item/[id]",
+    )
+}
+
+/// W7-08: the manifest comes to declare Expo Router (upstream F2): its
+/// screens become routes and a call names one, though no source changed.
+pub fn typescript_expo_router_dependency_appears_in_package_json() -> Case {
+    Case::new(Change::ControlFile, &[Language::TypeScript, Language::Tsx])
+        .file(
+            "package.json",
+            "{\"name\":\"app\",\"dependencies\":{\"expo\":\"52\"}}\n",
+        )
+        .file(
+            "app/settings.tsx",
+            "export default function Settings() {\n  return null\n}\n",
+        )
+        .file(
+            "lib/nav.ts",
+            "import { router } from 'expo-router'\nexport function open() {\n  router.push('/settings')\n}\n",
+        )
+        .write(
+            "package.json",
+            "{\"name\":\"app\",\"dependencies\":{\"expo\":\"52\",\"expo-router\":\"4\"}}\n",
+        )
+        .edge_after(
+            "route app/settings.tsx::route:/settings",
+            "calls",
+            "function Settings",
+        )
+        .edge_after(
+            "function open",
+            "navigates",
+            "route app/settings.tsx::route:/settings",
+        )
+}
+
+/// W7-08: an `app.config.ts` appears beside an app's `_layout` in a project
+/// whose manifest names no router (upstream F2): Expo Router is detected by
+/// them.
+pub fn typescript_expo_config_appears_beside_a_layout() -> Case {
+    Case::new(Change::ControlFile, &[Language::TypeScript, Language::Tsx])
+        .file(
+            "package.json",
+            "{\"name\":\"app\",\"dependencies\":{\"react\":\"19\"}}\n",
+        )
+        .file(
+            "app/_layout.tsx",
+            "export default function Layout() {\n  return null\n}\n",
+        )
+        .file(
+            "app/settings.tsx",
+            "export default function Settings() {\n  return null\n}\n",
+        )
+        .file(
+            "lib/nav.ts",
+            "export function open(router: { push(path: string): void }) {\n  router.push('/settings')\n}\n",
+        )
+        .write("app.config.ts", "export default {}\n")
+        .edge_after(
+            "route app/settings.tsx::route:/settings",
+            "calls",
+            "function Settings",
+        )
+        .edge_after(
+            "function open",
+            "navigates",
+            "route app/settings.tsx::route:/settings",
+        )
+}
+
+/// W7-08: an Expo API route's body is edited (upstream #2135): each
+/// exported method stays its own endpoint, referencing its function.
+pub fn typescript_expo_api_route_body_edit() -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript])
+        .file(
+            "package.json",
+            "{\"name\":\"app\",\"dependencies\":{\"expo-router\":\"4\"}}\n",
+        )
+        .file(
+            "app/users+api.ts",
+            "export async function GET() {\n  return Response.json([])\n}\n",
+        )
+        .write(
+            "app/users+api.ts",
+            "export async function GET() {\n  return Response.json([1])\n}\n",
+        )
+        .edge_throughout(
+            "route app/users+api.ts::GET:/users",
+            "references",
+            "function GET",
+        )
+}
+
 /// W5-06, fail closed: only the manifest's `version` changes; every JS file
 /// re-resolves and every edge stays.
 pub fn typescript_package_version_bump_keeps_every_edge() -> Case {

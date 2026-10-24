@@ -551,16 +551,6 @@
   },
   {
     "candidates": null,
-    "col": 49,
-    "file_path": "apps/expo/app/index.tsx",
-    "from_node_id": "function:f635ab08203e0ff853aa7eaa5276ccc9",
-    "language": "tsx",
-    "line": 5,
-    "reference_kind": "calls",
-    "reference_name": "router.push"
-  },
-  {
-    "candidates": null,
     "col": 50,
     "file_path": "apps/vue/src/router/index.ts",
     "from_node_id": "constant:aae634828e679bd138fccffb08050d6b",

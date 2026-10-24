@@ -46,8 +46,33 @@
       "resolvedBy": "exact-match"
     },
     "provenance": null,
+    "source": "route:apps/expo/app/settings.tsx:/settings",
+    "target": "function:1f24522fd6944eca56c6841beba30994"
+  },
+  {
+    "col": 0,
+    "kind": "calls",
+    "line": 3,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
     "source": "route:apps/next/app/page.tsx:/",
     "target": "function:8694a47e777f8aafc5c96fe460badf43"
+  },
+  {
+    "col": 0,
+    "kind": "calls",
+    "line": 4,
+    "metadata": {
+      "confidence": 0.8,
+      "framework": "react",
+      "resolvedBy": "framework"
+    },
+    "provenance": null,
+    "source": "route:apps/expo/app/index.tsx:/",
+    "target": "function:f635ab08203e0ff853aa7eaa5276ccc9"
   },
   {
     "col": 0,
@@ -108,6 +133,18 @@
     "provenance": null,
     "source": "file:apps/react-router/src/main.tsx",
     "target": "file:apps/react-router/src/pages/Layout.tsx"
+  },
+  {
+    "col": 0,
+    "kind": "references",
+    "line": 1,
+    "metadata": {
+      "confidence": 0.7,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "route:apps/expo/app/api/hello+api.ts:1:GET:/api/hello",
+    "target": "function:4657a5913a769bdf2504b0a266d22d45"
   },
   {
     "col": 0,
@@ -262,6 +299,21 @@
     "provenance": null,
     "source": "file:apps/vue/src/router/index.ts",
     "target": "function:39add68cb5c4bab5e7011e7970b8700b"
+  },
+  {
+    "col": 49,
+    "kind": "navigates",
+    "line": 5,
+    "metadata": {
+      "confidence": 0.95,
+      "framework": "expo-router",
+      "href": "/settings",
+      "navMethod": "push",
+      "resolvedBy": "framework"
+    },
+    "provenance": null,
+    "source": "function:f635ab08203e0ff853aa7eaa5276ccc9",
+    "target": "route:apps/expo/app/settings.tsx:/settings"
   },
   {
     "col": 7,

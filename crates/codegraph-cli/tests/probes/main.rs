@@ -19739,6 +19739,328 @@ mod nextjs {
     }
 }
 
+mod expo_router {
+    use super::support::{Graph, Project};
+
+    /// Every route of the graph whose file is under `dir`, sorted.
+    fn routes_in(graph: &Graph, dir: &str) -> Vec<String> {
+        let mut names: Vec<String> = graph
+            .nodes
+            .iter()
+            .filter(|node| node.kind == "route" && node.file_path.starts_with(dir))
+            .map(|node| node.name.clone())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// Upstream F2 (`expo-router.test.ts`, end to end): every screen file is
+    /// a route that calls its component; a navigation call reaches the
+    /// screen its href names, with the href and the verb.
+    #[test]
+    fn f2_a_navigation_call_navigates_to_the_screen_its_href_names() {
+        let project = Project::new()
+            .file(
+                "package.json",
+                "{\"name\":\"app\",\"dependencies\":{\"expo\":\"52\",\"expo-router\":\"4\",\"react\":\"18\"}}\n",
+            )
+            .file(
+                "src/app/_layout.tsx",
+                "export default function Layout() { return null }\n",
+            )
+            .file(
+                "src/app/index.tsx",
+                "import { ItemCard } from '../components/item-card'\nexport default function Home() {\n  return <ItemCard item={{ id: '1' }} collected />\n}\n",
+            )
+            .file(
+                "src/app/object-detail.tsx",
+                "export default function ObjectDetail() {\n  return null\n}\n",
+            )
+            .file(
+                "src/app/item/[id].tsx",
+                "export default function Item() { return null }\n",
+            )
+            .file(
+                "src/app/welcome.tsx",
+                "export default function Welcome() { return null }\n",
+            )
+            .file(
+                "src/services/nav.ts",
+                "import { router } from 'expo-router'\nexport function openObjectDetail(item: { id: string }) {\n  router.navigate(\n    `/object-detail?detectionItem=${JSON.stringify(item)}` as any\n  )\n}\nexport function openItem(id: string) {\n  router.push({ pathname: '/item/[id]', params: { id } })\n}\n",
+            )
+            .file(
+                "src/components/item-card.tsx",
+                "import { openObjectDetail } from '../services/nav'\nexport function ItemCard(props: { item: { id: string }; collected: boolean }) {\n  const handlePress = () => {\n    if (props.collected) openObjectDetail(props.item)\n  }\n  return handlePress\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        assert_eq!(
+            routes_in(graph, ""),
+            ["/", "/item/[id]", "/object-detail", "/welcome"],
+            "{}",
+            graph.report()
+        );
+        graph.assert_edge(
+            "route src/app/object-detail.tsx::route:/object-detail",
+            "calls",
+            "function ObjectDetail",
+            None,
+        );
+        let navigates = |from: &str, to: &str| {
+            let edges = graph.edges_matching(from, "navigates", to);
+            assert_eq!(edges.len(), 1, "{from} -> {to}\n{}", graph.report());
+            edges[0].metadata.clone()
+        };
+        let detail = navigates(
+            "function openObjectDetail",
+            "route src/app/object-detail.tsx::route:/object-detail",
+        );
+        assert_eq!(detail["href"], "/object-detail?detectionItem=${…}");
+        assert_eq!(detail["navMethod"], "navigate");
+        assert_eq!(detail["resolvedBy"], "framework");
+        assert_eq!(detail["framework"], "expo-router");
+        navigates(
+            "function openItem",
+            "route src/app/item/[id].tsx::route:/item/[id]",
+        );
+    }
+
+    /// Upstream #2129 (`monorepo-app-frameworks.test.ts`), the Expo halves:
+    /// Expo Router reads the Expo app and never the Next app beside it, a
+    /// single Expo app at the repository root keeps its screens, and the
+    /// nearest manifest that names a router decides.
+    #[test]
+    fn pr2129_expo_router_reads_only_its_own_app() {
+        let project = Project::new()
+            .file(
+                "package.json",
+                "{\"name\":\"mono\",\"private\":true,\"workspaces\":[\"apps/*\"]}\n",
+            )
+            .file(
+                "apps/mobile/package.json",
+                "{\"name\":\"mobile\",\"dependencies\":{\"expo\":\"*\",\"expo-router\":\"*\",\"react\":\"*\"}}\n",
+            )
+            .file(
+                "apps/mobile/app/_layout.tsx",
+                "export default function Layout() { return null; }\n",
+            )
+            .file(
+                "apps/mobile/app/index.tsx",
+                "export default function Home() { return null; }\n",
+            )
+            .file(
+                "apps/mobile/app/user/[id].tsx",
+                "export default function User() { return null; }\n",
+            )
+            .file(
+                "apps/web/package.json",
+                "{\"name\":\"web\",\"dependencies\":{\"next\":\"*\",\"react\":\"*\"}}\n",
+            )
+            .file(
+                "apps/web/app/layout.tsx",
+                "export default function RootLayout({ children }: { children: unknown }) { return children; }\n",
+            )
+            .file(
+                "apps/web/app/page.tsx",
+                "export default function Page() { return null; }\n",
+            )
+            .file(
+                "apps/web/app/user/[id]/page.tsx",
+                "export default function UserPage() { return null; }\n",
+            )
+            .file(
+                "apps/web/app/_components/posts.tsx",
+                "export default function Posts() { return null; }\n",
+            )
+            .file(
+                "apps/web/app/api/auth/[...all]/route.ts",
+                "export async function GET() { return new Response('ok'); }\n",
+            )
+            .index();
+        let graph = project.graph();
+        assert_eq!(
+            routes_in(graph, "apps/mobile/"),
+            ["/", "/user/[id]"],
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            routes_in(graph, "apps/web/"),
+            ["/", "/user/:id", "GET /api/auth/:all*"],
+            "{}",
+            graph.report()
+        );
+
+        let project = Project::new()
+            .file(
+                "package.json",
+                "{\"name\":\"demo\",\"dependencies\":{\"expo\":\"*\",\"expo-router\":\"*\"}}\n",
+            )
+            .file(
+                "app/_layout.tsx",
+                "export default function Layout() { return null; }\n",
+            )
+            .file(
+                "app/settings.tsx",
+                "export default function Settings() { return null; }\n",
+            )
+            .index();
+        let graph = project.graph();
+        assert_eq!(
+            routes_in(graph, "app/"),
+            ["/settings"],
+            "{}",
+            graph.report()
+        );
+
+        let project = Project::new()
+            .file(
+                "package.json",
+                "{\"name\":\"true-sheet\",\"devDependencies\":{\"expo\":\"*\",\"expo-router\":\"*\",\"react\":\"*\"}}\n",
+            )
+            .file(
+                "docs/package.json",
+                "{\"name\":\"docs\",\"dependencies\":{\"next\":\"*\",\"react\":\"*\"}}\n",
+            )
+            .file(
+                "docs/app/layout.tsx",
+                "export default function RootLayout({ children }: { children: unknown }) { return children; }\n",
+            )
+            .file(
+                "docs/app/(docs)/[...slug]/page.tsx",
+                "export default function DocPage() { return null; }\n",
+            )
+            .file(
+                "example/app/_layout.tsx",
+                "export default function Layout() { return null; }\n",
+            )
+            .file(
+                "example/app/sheet.tsx",
+                "export default function Sheet() { return null; }\n",
+            )
+            .index();
+        let graph = project.graph();
+        assert_eq!(routes_in(graph, "docs/"), ["/:slug*"], "{}", graph.report());
+        assert_eq!(
+            routes_in(graph, "example/"),
+            ["/sheet"],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream #2135: an Expo API route is an endpoint per exported method,
+    /// referencing its handler, not a screen.
+    #[test]
+    fn pr2135_an_expo_api_route_is_an_endpoint_per_method() {
+        let project = Project::new()
+            .file(
+                "package.json",
+                "{\"name\":\"site\",\"dependencies\":{\"expo\":\"*\",\"expo-router\":\"*\"}}\n",
+            )
+            .file(
+                "app/index.tsx",
+                "export default function Home() { return null; }\n",
+            )
+            .file(
+                "app/blog/og-image/[post]+api.ts",
+                "export async function GET(request: Request) { return new Response('png'); }\nexport const POST = async () => new Response('ok');\n",
+            )
+            .index();
+        let graph = project.graph();
+        assert_eq!(
+            routes_in(graph, "app/"),
+            ["/", "GET /blog/og-image/:post", "POST /blog/og-image/:post"],
+            "{}",
+            graph.report()
+        );
+        graph.assert_edge(
+            "route app/blog/og-image/[post]+api.ts::GET:/blog/og-image/:post",
+            "references",
+            "function GET",
+            None,
+        );
+    }
+
+    /// W7-08 (KEEP-RUST): another app's `navigate('/')` in a monorepo never
+    /// reaches the Expo app's `/` screen; upstream reads every file.
+    #[test]
+    fn keep_rust_another_apps_navigation_never_reaches_an_expo_screen() {
+        let project = Project::new()
+            .file("package.json", "{\"name\":\"mono\",\"private\":true}\n")
+            .file(
+                "apps/expo/package.json",
+                "{\"name\":\"expo-app\",\"dependencies\":{\"expo-router\":\"3\"}}\n",
+            )
+            .file(
+                "apps/expo/app/index.tsx",
+                "export default function Index() { return null }\n",
+            )
+            .file(
+                "apps/expo/app/settings.tsx",
+                "import { router } from 'expo-router'\nexport default function Settings() {\n  router.replace('/')\n  return null\n}\n",
+            )
+            .file(
+                "apps/web/package.json",
+                "{\"name\":\"web\",\"dependencies\":{\"react-router-dom\":\"6\"}}\n",
+            )
+            .file(
+                "apps/web/src/main.tsx",
+                "import { useNavigate } from 'react-router-dom'\nexport function Nav() {\n  const navigate = useNavigate()\n  navigate('/')\n  return null\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        graph.assert_edge(
+            "function Settings",
+            "navigates",
+            "route apps/expo/app/index.tsx::route:/",
+            Some("framework"),
+        );
+        graph.assert_no_edge(
+            "function Nav",
+            "navigates",
+            "route apps/expo/app/index.tsx::route:/",
+        );
+    }
+
+    /// W7-08 (KEEP-RUST): `app/index.tsx` beside `app/(tabs)/index.tsx`
+    /// serve one path; a call to it is unresolved, while a path one screen
+    /// serves binds.
+    #[test]
+    fn keep_rust_a_path_two_screens_serve_stays_unresolved() {
+        let project = Project::new()
+            .file(
+                "package.json",
+                "{\"name\":\"app\",\"dependencies\":{\"expo-router\":\"4\"}}\n",
+            )
+            .file(
+                "app/index.tsx",
+                "export default function Start() { return null }\n",
+            )
+            .file(
+                "app/(tabs)/index.tsx",
+                "export default function Feed() { return null }\n",
+            )
+            .file(
+                "app/(tabs)/settings.tsx",
+                "export default function Settings() { return null }\n",
+            )
+            .file(
+                "lib/nav.ts",
+                "import { router } from 'expo-router'\nexport function home() {\n  router.push('/')\n}\nexport function settings() {\n  router.push('/settings')\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        graph.assert_edge(
+            "function settings",
+            "navigates",
+            "route app/(tabs)/settings.tsx::route:/settings",
+            Some("framework"),
+        );
+        graph.assert_unresolved("function home", "calls", "router.push");
+    }
+}
+
 mod explore_flow {
     use super::support::{Project, codegraph};
 

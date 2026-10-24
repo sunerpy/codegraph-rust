@@ -34,14 +34,14 @@
 //! (`(.)photo`) routes are not modelled; `layout` / `loading` / `error` /
 //! `template` files are not routes.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashSet};
 use std::sync::{Arc, OnceLock};
 
 use codegraph_core::types::{EdgeKind, Language, Node, NodeKind};
 use regex::Regex;
 
 use super::route_href::{
-    ExactRoute, HOLE, HrefLiteral, RouteEntry, decode_segment, first_argument_text, match_route,
+    ExactTable, HOLE, HrefLiteral, RouteEntry, decode_segment, first_argument_text, match_route,
     parse_href_expression, read_href_via_local, route_path,
 };
 use super::{framework_node, js_language_for};
@@ -215,8 +215,8 @@ fn table_page(node: &Node) -> Option<NextRouteFile> {
 /// This framework's pages, matched the Expo Router way (`NextTable`).
 #[derive(Debug, Default)]
 struct NextTable {
-    /// Page path → every page serving it, with its app's root.
-    exact: BTreeMap<String, Vec<(String, Arc<Node>)>>,
+    /// Every page by its path, with its app's root.
+    exact: ExactTable,
     /// The pages with a parameter or catch-all segment. Matching is
     /// order-independent: a tie is nothing.
     dynamic: Vec<RouteEntry>,
@@ -238,44 +238,11 @@ impl NextTable {
             }
             table
                 .exact
-                .entry(node.name.clone())
-                .or_default()
-                .push((file.root.clone(), node));
+                .insert(node.name.clone(), file.root.clone(), node);
             roots.insert(file.root);
         }
         table.roots = roots.into_iter().collect();
         table
-    }
-
-    /// The page at `path` for a call in `caller`. Upstream's table keeps the
-    /// last of several pages with one path in node order; the store's order
-    /// changes when a sync re-extracts a file, so the call's own app's page
-    /// is taken (the longest root above `caller`), and several or none of
-    /// them is nothing (KEEP-RUST).
-    fn exact_route(&self, path: &str, caller: &str) -> ExactRoute {
-        let Some(pages) = self.exact.get(path) else {
-            return ExactRoute::Absent;
-        };
-        if let [(_, page)] = pages.as_slice() {
-            return ExactRoute::Found(Arc::clone(page));
-        }
-        let Some(own) = pages
-            .iter()
-            .map(|(root, _)| root.as_str())
-            .filter(|root| caller.starts_with(root))
-            .max_by_key(|root| root.len())
-        else {
-            return ExactRoute::Ambiguous;
-        };
-        match pages
-            .iter()
-            .filter(|(root, _)| root == own)
-            .collect::<Vec<_>>()
-            .as_slice()
-        {
-            [(_, page)] => ExactRoute::Found(Arc::clone(page)),
-            _ => ExactRoute::Ambiguous,
-        }
     }
 }
 
@@ -329,7 +296,7 @@ fn destinations<'h>(
         let Some(segs) = href_segments(arm) else {
             continue;
         };
-        let exact = table.exact_route(&route_path(&segs), caller);
+        let exact = table.exact.route(&route_path(&segs), caller);
         // An arm naming no page drops out; the arms that do name one are
         // still places this navigation goes.
         let Some(target) = match_route(&segs, exact, &table.dynamic) else {
@@ -624,10 +591,8 @@ impl FrameworkResolver for NextjsResolver {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-
     use super::*;
-    use crate::types::ImportMapping;
+    use crate::frameworks::route_href::test_ctx::{RouteCtx, call_in};
 
     fn extract(file: &str, content: &str) -> FrameworkResolverExtractionResult {
         NextjsResolver
@@ -829,104 +794,23 @@ mod tests {
 
     // -- resolve: a navigation call → the page it names ---------------------
 
-    #[derive(Default)]
-    struct Ctx {
-        files: HashMap<String, String>,
-        nodes: Vec<Node>,
+    type Ctx = RouteCtx;
+
+    /// A page file and the route node Next's extraction makes for it.
+    trait Pages {
+        fn page(self, file: &str) -> Self;
     }
 
-    impl Ctx {
-        /// A page file and the route node Next's extraction makes for it.
-        fn page(mut self, file: &str) -> Self {
-            self.nodes.extend(extract(file, "").nodes);
-            self.files.insert(file.to_string(), String::new());
-            self
-        }
-        fn file(mut self, path: &str, content: &str) -> Self {
-            self.files.insert(path.to_string(), content.to_string());
-            self
-        }
-        fn route(&self, name: &str, file: &str) -> String {
-            self.nodes
-                .iter()
-                .find(|n| n.name == name && n.file_path == file)
-                .unwrap_or_else(|| panic!("no route {name} in {file}"))
-                .id
-                .clone()
-        }
-    }
-
-    impl ResolutionContext for Ctx {
-        fn get_nodes_in_file(&self, file_path: &str) -> Vec<Node> {
-            self.nodes
-                .iter()
-                .filter(|n| n.file_path == file_path)
-                .cloned()
-                .collect()
-        }
-        fn get_nodes_by_name(&self, name: &str) -> Vec<Node> {
-            self.nodes
-                .iter()
-                .filter(|n| n.name == name)
-                .cloned()
-                .collect()
-        }
-        fn get_nodes_by_qualified_name(&self, q: &str) -> Vec<Node> {
-            self.nodes
-                .iter()
-                .filter(|n| n.qualified_name == q)
-                .cloned()
-                .collect()
-        }
-        fn get_nodes_by_kind(&self, kind: NodeKind) -> Vec<Node> {
-            self.nodes
-                .iter()
-                .filter(|n| n.kind == kind)
-                .cloned()
-                .collect()
-        }
-        fn file_exists(&self, file_path: &str) -> bool {
-            self.files.contains_key(file_path)
-        }
-        fn read_file(&self, file_path: &str) -> Option<String> {
-            self.files.get(file_path).cloned()
-        }
-        fn get_project_root(&self) -> &str {
-            "/project"
-        }
-        fn get_all_files(&self) -> Vec<String> {
-            self.files.keys().cloned().collect()
-        }
-        fn get_nodes_by_lower_name(&self, lower: &str) -> Vec<Node> {
-            self.nodes
-                .iter()
-                .filter(|n| n.name.to_lowercase() == lower)
-                .cloned()
-                .collect()
-        }
-        fn get_node_by_id(&self, id: &str) -> Option<Node> {
-            self.nodes.iter().find(|n| n.id == id).cloned()
-        }
-        fn get_import_mappings(&self, _file: &str, _language: Language) -> Vec<ImportMapping> {
-            Vec::new()
+    impl Pages for RouteCtx {
+        fn page(self, file: &str) -> Self {
+            self.routes(file, extract(file, "").nodes)
         }
     }
 
     const NAV: &str = "components/nav.ts";
 
     fn call(name: &str, line: i64, column: i64) -> RefView {
-        RefView {
-            row_id: None,
-            from_node_id: "function:nav".to_string(),
-            reference_name: name.to_string(),
-            reference_kind: EdgeKind::Calls,
-            line,
-            column,
-            file_path: NAV.to_string(),
-            language: Language::TypeScript,
-            is_function_ref: false,
-            reference_subkind: None,
-        }
+        call_in(NAV, name, line, column)
     }
 
     fn site() -> Ctx {
@@ -1197,7 +1081,7 @@ mod tests {
                 "permanentRedirect"
             ]
         );
-        let page = ctx.nodes[0].clone();
+        let page = ctx.nodes()[0].clone();
         assert_eq!(
             navigation.scope(&page, &ctx),
             Some(vec!["apps/web/".to_string(), "docs/".to_string()])

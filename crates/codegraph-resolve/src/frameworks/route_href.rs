@@ -14,7 +14,7 @@
 //! multibyte character is never mistaken for one.
 
 use std::any::Any;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use codegraph_core::types::Node;
@@ -554,6 +554,57 @@ impl RouteEntry {
     }
 }
 
+/// A router's routes by the path each serves, with the root of the app each
+/// belongs to (`exact`). Several routes may serve one path: two apps of a
+/// monorepo each with `/login`, or `app/index.tsx` beside
+/// `app/(tabs)/index.tsx`. Upstream keeps the last in node order; the store
+/// lists nodes in insertion order, which a sync changes, so a call takes its
+/// own app's route (KEEP-RUST).
+#[derive(Debug, Default)]
+pub(crate) struct ExactTable {
+    by_path: BTreeMap<String, Vec<(String, Arc<Node>)>>,
+}
+
+impl ExactTable {
+    /// Register `node`, which serves `path` in the app at `root`.
+    pub(crate) fn insert(&mut self, path: String, root: String, node: Arc<Node>) {
+        self.by_path.entry(path).or_default().push((root, node));
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.by_path.is_empty()
+    }
+
+    /// The route at `path` for a call in `caller`: the one route serving it,
+    /// else the one of the call's own app (the longest root above `caller`);
+    /// several or none there is [`ExactRoute::Ambiguous`].
+    pub(crate) fn route(&self, path: &str, caller: &str) -> ExactRoute {
+        let Some(routes) = self.by_path.get(path) else {
+            return ExactRoute::Absent;
+        };
+        if let [(_, route)] = routes.as_slice() {
+            return ExactRoute::Found(Arc::clone(route));
+        }
+        let Some(own) = routes
+            .iter()
+            .map(|(root, _)| root.as_str())
+            .filter(|root| caller.starts_with(root))
+            .max_by_key(|root| root.len())
+        else {
+            return ExactRoute::Ambiguous;
+        };
+        match routes
+            .iter()
+            .filter(|(root, _)| root == own)
+            .collect::<Vec<_>>()
+            .as_slice()
+        {
+            [(_, route)] => ExactRoute::Found(Arc::clone(route)),
+            _ => ExactRoute::Ambiguous,
+        }
+    }
+}
+
 /// What a router's table holds at a path an href spells out exactly.
 pub(crate) enum ExactRoute {
     /// The route serving it.
@@ -662,6 +713,124 @@ impl RouteTables {
 impl std::fmt::Debug for RouteTables {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RouteTables").finish_non_exhaustive()
+    }
+}
+
+/// A resolution context over a few files and the route nodes a router's
+/// extraction made of them, for the routers' unit tests.
+#[cfg(test)]
+pub(crate) mod test_ctx {
+    use std::collections::HashMap;
+
+    use codegraph_core::types::{EdgeKind, Language, Node, NodeKind};
+
+    use crate::types::{ImportMapping, RefView, ResolutionContext};
+
+    #[derive(Default)]
+    pub(crate) struct RouteCtx {
+        files: HashMap<String, String>,
+        nodes: Vec<Node>,
+    }
+
+    impl RouteCtx {
+        /// A source file.
+        pub(crate) fn file(mut self, path: &str, content: &str) -> Self {
+            self.files.insert(path.to_string(), content.to_string());
+            self
+        }
+
+        /// A route file and the nodes its router extracted from it.
+        pub(crate) fn routes(mut self, file: &str, nodes: Vec<Node>) -> Self {
+            self.nodes.extend(nodes);
+            self.files.entry(file.to_string()).or_default();
+            self
+        }
+
+        /// The id of the route `name` in `file`.
+        pub(crate) fn route(&self, name: &str, file: &str) -> String {
+            self.nodes
+                .iter()
+                .find(|n| n.name == name && n.file_path == file)
+                .unwrap_or_else(|| panic!("no route {name} in {file}"))
+                .id
+                .clone()
+        }
+
+        pub(crate) fn nodes(&self) -> &[Node] {
+            &self.nodes
+        }
+    }
+
+    impl ResolutionContext for RouteCtx {
+        fn get_nodes_in_file(&self, file_path: &str) -> Vec<Node> {
+            self.nodes
+                .iter()
+                .filter(|n| n.file_path == file_path)
+                .cloned()
+                .collect()
+        }
+        fn get_nodes_by_name(&self, name: &str) -> Vec<Node> {
+            self.nodes
+                .iter()
+                .filter(|n| n.name == name)
+                .cloned()
+                .collect()
+        }
+        fn get_nodes_by_qualified_name(&self, q: &str) -> Vec<Node> {
+            self.nodes
+                .iter()
+                .filter(|n| n.qualified_name == q)
+                .cloned()
+                .collect()
+        }
+        fn get_nodes_by_kind(&self, kind: NodeKind) -> Vec<Node> {
+            self.nodes
+                .iter()
+                .filter(|n| n.kind == kind)
+                .cloned()
+                .collect()
+        }
+        fn file_exists(&self, file_path: &str) -> bool {
+            self.files.contains_key(file_path)
+        }
+        fn read_file(&self, file_path: &str) -> Option<String> {
+            self.files.get(file_path).cloned()
+        }
+        fn get_project_root(&self) -> &str {
+            "/project"
+        }
+        fn get_all_files(&self) -> Vec<String> {
+            self.files.keys().cloned().collect()
+        }
+        fn get_nodes_by_lower_name(&self, lower: &str) -> Vec<Node> {
+            self.nodes
+                .iter()
+                .filter(|n| n.name.to_lowercase() == lower)
+                .cloned()
+                .collect()
+        }
+        fn get_node_by_id(&self, id: &str) -> Option<Node> {
+            self.nodes.iter().find(|n| n.id == id).cloned()
+        }
+        fn get_import_mappings(&self, _file: &str, _language: Language) -> Vec<ImportMapping> {
+            Vec::new()
+        }
+    }
+
+    /// A `calls` reference named `name` at `line`:`column` of `file`.
+    pub(crate) fn call_in(file: &str, name: &str, line: i64, column: i64) -> RefView {
+        RefView {
+            row_id: None,
+            from_node_id: "function:nav".to_string(),
+            reference_name: name.to_string(),
+            reference_kind: EdgeKind::Calls,
+            line,
+            column,
+            file_path: file.to_string(),
+            language: Language::TypeScript,
+            is_function_ref: false,
+            reference_subkind: None,
+        }
     }
 }
 

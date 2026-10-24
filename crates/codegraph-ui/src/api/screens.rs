@@ -2,7 +2,8 @@
 //! Upstream `src/ui-server/api/screens.ts`.
 //!
 //! Screens are built from `navigates` edges into screen routes. The Next.js
-//! resolver draws them, but this builder is not ported yet, so every index
+//! and Expo Router resolvers draw them, but this builder is not ported yet, so
+//! every index
 //! takes upstream's own early return: no navigation, `routed: false`, and the
 //! Screens view says the graph holds no screen navigation instead of drawing
 //! an empty picture.

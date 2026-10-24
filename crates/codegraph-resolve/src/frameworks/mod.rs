@@ -1,9 +1,10 @@
 //! Concrete [`FrameworkResolver`] implementations + the detection registry.
 //!
 //! Ports the subset of `upstream resolution/frameworks/` that this port
-//! ships: React ([`react`]), Next.js ([`nextjs`]), Vue and Nuxt ([`vue`]),
-//! NestJS ([`nestjs`]), Godot ([`godot`]) and Tauri ([`tauri`]). The other
-//! upstream resolvers remain deferred (see `KNOWN_DIFFS.md`).
+//! ships: React ([`react`]), Next.js ([`nextjs`]), Expo Router
+//! ([`expo_router`]), Vue and Nuxt ([`vue`]), NestJS ([`nestjs`]), Godot
+//! ([`godot`]) and Tauri ([`tauri`]). The other upstream resolvers remain
+//! deferred (see `KNOWN_DIFFS.md`).
 //!
 //! [`detect_frameworks`] ports `frameworks/index.ts:detectFrameworks` restricted
 //! to the ported resolvers; the orchestrator hands the detected list to
@@ -11,6 +12,7 @@
 //! [`crate::resolver::ReferenceResolver::resolve_one`] Strategy-1 exactly where
 //! the upstream runs them (`index.ts:695-701`).
 
+pub mod expo_router;
 pub mod godot;
 pub(crate) mod godot_common;
 pub mod godot_dsl_config;
@@ -58,6 +60,10 @@ pub fn detect_frameworks(context: &dyn ResolutionContext) -> Vec<Box<dyn Framewo
         // React. It claims only navigation calls that name one of its own
         // pages, which no resolver above resolves.
         Box::new(nextjs::NextjsResolver),
+        // Expo Router screens and navigation (F2), after Next.js as upstream
+        // registers it. It claims navigation calls only where their href
+        // names one of its own screens.
+        Box::new(expo_router::ExpoRouterResolver),
     ];
     candidates
         .into_iter()

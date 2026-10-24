@@ -181,12 +181,13 @@ the Rust graph holds different facts, the viewer shows what this index holds:
   the branch conditions they use (UI families F1–F6 and F11) are a later port.
   The frontend is built without it, so the Steps view says it cannot draw steps.
 - **Screens** answers upstream's own "no screen navigation" result: its
-  builder is not ported, so the `navigates` edges the Next.js resolver draws
-  are not drawn as screens yet.
+  builder is not ported, so the `navigates` edges the Next.js and Expo Router
+  resolvers draw are not drawn as screens yet.
 - Branch conditions on call sites (`when`) are absent from every edge: the
   builders that attach them are not ported either.
 - Routes come from the framework resolvers this port has — React Router
-  routes, Next.js pages and route handlers, Nuxt pages, NestJS controllers.
+  routes, Next.js pages and route handlers, Expo Router screens and API
+  routes, Nuxt pages, NestJS controllers.
   Express, Go HTTP and Vue Router routers are not among them, so those
   projects are not routed apps here.
 - The Rust index has no synthesized dynamic-dispatch edges, so a flow never
