@@ -41,8 +41,8 @@ use codegraph_core::types::{EdgeKind, Language, Node, NodeKind};
 use regex::Regex;
 
 use super::route_href::{
-    ExactTable, HOLE, HrefLiteral, RouteEntry, decode_segment, first_argument_text, match_route,
-    parse_href_expression, read_href_via_local, route_path,
+    ExactTable, HrefLiteral, RouteEntry, destinations_for_href, first_argument_text,
+    parse_href_expression, read_href_via_local,
 };
 use super::{framework_node, js_language_for};
 use crate::framework::{FrameworkExtractionContext, FrameworkResolver, NavigationCalls};
@@ -251,62 +251,6 @@ fn next_route_table(context: &dyn ResolutionContext) -> Arc<NextTable> {
     context
         .route_tables()
         .get_or_build("nextjs", || NextTable::build(context))
-}
-
-/// `/users/${…}?tab=x` → `["users", "*"]`; an absolute URL keeps its path; a
-/// relative href is nothing (`hrefSegments`).
-fn href_segments(href: &HrefLiteral) -> Option<Vec<String>> {
-    static ABSOLUTE: OnceLock<Regex> = OnceLock::new();
-    let absolute = ABSOLUTE.get_or_init(|| {
-        Regex::new(r"(?i)^(?:[a-z][a-z0-9+.\-]*:)?//[^/]*(/.*)?$").expect("absolute href")
-    });
-    let path = match absolute.captures(&href.path) {
-        Some(url) => url.get(1).map_or("/", |path| path.as_str()),
-        None => href.path.as_str(),
-    };
-    if !path.starts_with('/') {
-        return None;
-    }
-    Some(
-        path.split('/')
-            .skip(1)
-            .filter(|seg| !seg.is_empty())
-            .map(|seg| {
-                if seg.contains(HOLE) {
-                    "*".to_string()
-                } else {
-                    decode_segment(seg)
-                }
-            })
-            .collect(),
-    )
-}
-
-/// Every page a destination names, one per arm of a conditional, each with
-/// the arm that named it (`destinationsForHref`): an edge says the path it
-/// took.
-fn destinations<'h>(
-    href: &'h HrefLiteral,
-    table: &NextTable,
-    caller: &str,
-) -> Vec<(Arc<Node>, &'h HrefLiteral)> {
-    let mut out = Vec::new();
-    let mut seen = HashSet::new();
-    for arm in href.arms() {
-        let Some(segs) = href_segments(arm) else {
-            continue;
-        };
-        let exact = table.exact.route(&route_path(&segs), caller);
-        // An arm naming no page drops out; the arms that do name one are
-        // still places this navigation goes.
-        let Some(target) = match_route(&segs, exact, &table.dynamic) else {
-            continue;
-        };
-        if seen.insert(target.id.clone()) {
-            out.push((target, arm));
-        }
-    }
-    out
 }
 
 /// `router.push` / `.replace` / `.prefetch`, `redirect` /
@@ -560,7 +504,9 @@ impl FrameworkResolver for NextjsResolver {
         // Every arm of a conditional destination is somewhere this call goes:
         // the first is this reference's resolution, the rest ride as
         // `also_targets`.
-        let mut targets = destinations(&href, &table, &reference.file_path).into_iter();
+        let mut targets =
+            destinations_for_href(&href, &table.exact, &table.dynamic, &reference.file_path)
+                .into_iter();
         let (target, arm) = targets.next()?;
         let metadata = |arm: &HrefLiteral| {
             let mut metadata = serde_json::Map::new();

@@ -8,6 +8,30 @@
 //! slice there is always on a character boundary. Upstream counts UTF-16
 //! code units; the bytes it compares are ASCII either way.
 
+/// JavaScript's `\s`: its white space and line terminators.
+pub(crate) fn is_js_space(c: char) -> bool {
+    matches!(
+        c,
+        '\t' | '\n' | '\u{0B}' | '\u{0C}' | '\r' | ' ' | '\u{A0}' | '\u{1680}' | '\u{2000}'
+            ..='\u{200A}'
+                | '\u{2028}'
+                | '\u{2029}'
+                | '\u{202F}'
+                | '\u{205F}'
+                | '\u{3000}'
+                | '\u{FEFF}'
+    )
+}
+
+/// JavaScript's `\s` as a regex class, for patterns ported from upstream: the
+/// `regex` crate's `\s` is Unicode's White_Space, which differs from it.
+pub(crate) const JS_SPACE: &str = r"[\t\n\x0B\x0C\r \x{A0}\x{1680}\x{2000}-\x{200A}\x{2028}\x{2029}\x{202F}\x{205F}\x{3000}\x{FEFF}]";
+
+/// `String.prototype.trim`.
+pub(crate) fn js_trim(s: &str) -> &str {
+    s.trim_matches(is_js_space)
+}
+
 /// The offset of the bracket, brace or paren closing the one at `open`, or
 /// `None` (upstream `matchBracket`).
 pub(crate) fn match_bracket(s: &str, open: usize) -> Option<usize> {

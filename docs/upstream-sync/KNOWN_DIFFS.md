@@ -37,7 +37,7 @@ deterministic strategies — import resolution (`import-resolver.ts`) and name
 matching (`name-matcher.ts`) — orchestrated by `ReferenceResolver`
 (`index.ts`), plus concrete `FrameworkResolver` implementations behind the
 `FrameworkResolver` trait EXTENSION POINT (`crates/codegraph-resolve/src/framework.rs`):
-NestJS, React, Vue, Godot, Tauri, Nuxt, Next.js and Expo Router
+NestJS, React, Vue, Godot, Tauri, Nuxt, React Router, Next.js and Expo Router
 (`crates/codegraph-resolve/src/frameworks/`), detected per-project by
 `detect_frameworks`. The other colby resolvers stay deferred. The following
 colby behaviors are intentionally NOT ported in v1:
@@ -58,7 +58,9 @@ colby behaviors are intentionally NOT ported in v1:
   deferred resolvers by adding it to `frameworks/` and the `detect_frameworks`
   registry — no orchestrator change required.
 - **Router link synthesis** — `next-router-synthesizer.ts` (a Next.js
-  `<Link href>` or internal `<a href>`), Expo Router's `<Link href>`,
+  `<Link href>` or internal `<a href>`), `react-router-synthesizer.ts`
+  (React Router's `<Link to>`, `<NavLink to>` and `<Navigate to>`), Expo
+  Router's `<Link href>`,
   `<Redirect href>` and `Stack.Screen` names, and the screens a helper's
   returned href names (`router.replace(await postLoginRoute())`): JSX
   attributes and return values, not calls, so they draw no `navigates` edge
@@ -248,6 +250,22 @@ listed.
   the project, reads every file and keeps the last screen of a path in node
   order, so in a monorepo a React Router app's `navigate('/')` reached the
   Expo app's `/` screen (`expo_router.rs`).
+- **A path two React Router routes of one app serve (W7-09b).** A
+  navigation call matches only the routes of its own app, as in colby, and a
+  path two routes of that app serve (written twice, or the bare path two
+  optional-parameter routes such as `/cart/:id?` and `/cart/:item?` shorten
+  to) stays unresolved, with no dynamic route standing in. colby's
+  `addRouteTo` keeps the first route of a path in node order, which a sync
+  changes (`react_router.rs`).
+- **A React Router route file nested past 256 levels (W7-09b).** The route
+  scanner's two recursive steps, a unit (a bracket group, a string or
+  template, a template hole, one character) and a JSX element, share a bound
+  of 256 levels. A file that goes deeper yields no routes, those read before
+  that point included: a parent route that was never closed would leave its
+  children's paths wrong. No file runs the call stack out; colby's scanner
+  recurses without a bound. The bracket, string and wrapped-call scanners in
+  `js_scan.rs` keep their stackless walks and have no bound
+  (`react_router.rs`).
 - **Dart named constructors (#2380).** A named constructor, indexed as a
   method, is reached only by a call written through its class (`Foo.value(2)`).
   A call through a value of that type (a typed parameter or local, a chain's

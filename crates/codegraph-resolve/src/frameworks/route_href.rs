@@ -1,7 +1,8 @@
 //! The destination a navigation call names, read off its source: the href
 //! readers `upstream resolution/frameworks/expo-router.ts` exports at
-//! `b635dd46`, which every file-based router's resolver reads its calls with
-//! (Next.js first here).
+//! `b635dd46`, which every router's resolver reads its calls with (Next.js
+//! and React Router here), and the matching `nextjs.ts` exports
+//! (`destinationsForHref`).
 //!
 //! `router.push('/users')` names its route by path, so extraction records a
 //! call that resolves to nothing. A router's `resolve` reads the call's
@@ -14,7 +15,7 @@
 //! multibyte character is never mistaken for one.
 
 use std::any::Any;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use codegraph_core::types::Node;
@@ -548,8 +549,16 @@ pub(crate) struct RouteEntry {
 }
 
 impl RouteEntry {
+    /// The route `node` at the path it is named by.
     pub(crate) fn new(node: Arc<Node>) -> Self {
         let segs = node.name.split('/').skip(1).map(str::to_string).collect();
+        Self { node, segs }
+    }
+
+    /// The route `node` at `path`, one of the paths it serves (React
+    /// Router's `/cart` for `/cart/:id?`).
+    pub(crate) fn at(node: Arc<Node>, path: &str) -> Self {
+        let segs = path.split('/').skip(1).map(str::to_string).collect();
         Self { node, segs }
     }
 }
@@ -651,6 +660,87 @@ pub(crate) fn match_route(
 /// The path an href's segments spell (`'/' + segs.join('/')`).
 pub(crate) fn route_path(segs: &[String]) -> String {
     format!("/{}", segs.join("/"))
+}
+
+/// `/users/${…}?tab=x` → `["users", "*"]`; an absolute URL keeps its path; a
+/// relative href is nothing (`hrefSegments`).
+pub(crate) fn href_segments(href: &HrefLiteral) -> Option<Vec<String>> {
+    static ABSOLUTE: OnceLock<Regex> = OnceLock::new();
+    let absolute = ABSOLUTE.get_or_init(|| {
+        Regex::new(r"(?i)^(?:[a-z][a-z0-9+.\-]*:)?//[^/]*(/.*)?$").expect("absolute href")
+    });
+    let path = match absolute.captures(&href.path) {
+        Some(url) => url.get(1).map_or("/", |path| path.as_str()),
+        None => href.path.as_str(),
+    };
+    if !path.starts_with('/') {
+        return None;
+    }
+    Some(
+        path.split('/')
+            .skip(1)
+            .filter(|seg| !seg.is_empty())
+            .map(|seg| {
+                if seg.contains(HOLE) {
+                    "*".to_string()
+                } else {
+                    decode_segment(seg)
+                }
+            })
+            .collect(),
+    )
+}
+
+/// Every route a destination names, one per arm of a conditional, each with
+/// the arm that named it (`destinationsForHref`): an edge says the path it
+/// took. `exact` and `dynamic` are a router's routes; `caller` is the file
+/// the navigation is written in.
+pub(crate) fn destinations_for_href<'h>(
+    href: &'h HrefLiteral,
+    exact: &ExactTable,
+    dynamic: &[RouteEntry],
+    caller: &str,
+) -> Vec<(Arc<Node>, &'h HrefLiteral)> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    for arm in href.arms() {
+        let Some(segs) = href_segments(arm) else {
+            continue;
+        };
+        let exact = exact.route(&route_path(&segs), caller);
+        // An arm naming no route drops out; the arms that do name one are
+        // still places this navigation goes.
+        let Some(target) = match_route(&segs, exact, dynamic) else {
+            continue;
+        };
+        if seen.insert(target.id.clone()) {
+            out.push((target, arm));
+        }
+    }
+    out
+}
+
+/// The app a route file belongs to: the directory above its first
+/// conventional source directory (`src`, `pages`, `app`, `routes`), else the
+/// file's own folder (`appRootFor`). `frontend/src/App.js` is `frontend/`'s,
+/// `src/App.tsx` the repository's.
+pub(crate) fn app_root_for(file_path: &str) -> String {
+    // `^((?:[^/]+\/)*?)(?:src|pages|app|routes)\/`: the first whole segment
+    // that is one of those, every segment before it non-empty.
+    let mut start = 0;
+    while let Some(slash) = file_path[start..].find('/') {
+        let segment = &file_path[start..start + slash];
+        if segment.is_empty() {
+            break;
+        }
+        if matches!(segment, "src" | "pages" | "app" | "routes") {
+            return file_path[..start].to_string();
+        }
+        start += slash + 1;
+    }
+    file_path
+        .rfind('/')
+        .map_or_else(String::new, |slash| file_path[..=slash].to_string())
 }
 
 /// `decodeURIComponent`, or the segment as written when that throws: a `%`

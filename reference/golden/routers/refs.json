@@ -451,16 +451,6 @@
   },
   {
     "candidates": null,
-    "col": 29,
-    "file_path": "apps/react-router/src/main.tsx",
-    "from_node_id": "function:bd2443bcbe09694a55210a349147c068",
-    "language": "tsx",
-    "line": 21,
-    "reference_kind": "calls",
-    "reference_name": "navigate"
-  },
-  {
-    "candidates": null,
     "col": 30,
     "file_path": "apps/angular/src/app/home/home.component.ts",
     "from_node_id": "method:d4726b2e34926c3875a341be13f597b0",

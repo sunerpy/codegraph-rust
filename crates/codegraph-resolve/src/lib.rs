@@ -10,9 +10,10 @@
 //! The heuristic `FrameworkResolver` layer is a small additive layer on top of
 //! the deterministic import + name-matching core. [`framework::FrameworkResolver`]
 //! is the documented EXTENSION POINT; the concrete implementations (NestJS,
-//! React, Vue, Godot, Tauri, Nuxt, Next.js, Expo Router: [`frameworks`]) are
-//! detected per-project by [`frameworks::detect_frameworks`]. The other
-//! upstream resolvers remain deferred (see `KNOWN_DIFFS.md`).
+//! React, Vue, Godot, Tauri, Nuxt, React Router, Next.js, Expo Router:
+//! [`frameworks`]) are detected per-project by
+//! [`frameworks::detect_frameworks`]. The other upstream resolvers remain
+//! deferred (see `KNOWN_DIFFS.md`).
 
 #![allow(clippy::collapsible_if, clippy::collapsible_else_if)]
 

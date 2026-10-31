@@ -161,14 +161,55 @@
   {
     "col": 0,
     "kind": "references",
-    "line": 7,
+    "line": 10,
+    "metadata": {
+      "confidence": 0.9,
+      "framework": "react",
+      "layout": true,
+      "resolvedBy": "framework"
+    },
+    "provenance": null,
+    "source": "route:apps/react-router/src/main.tsx:10:/",
+    "target": "function:c863eb857f02e69680c9e47dace356b9"
+  },
+  {
+    "col": 0,
+    "kind": "references",
+    "line": 10,
     "metadata": {
       "confidence": 0.9,
       "resolvedBy": "import"
     },
     "provenance": null,
-    "source": "route:apps/react-router/src/main.tsx:7:/",
+    "source": "route:apps/react-router/src/main.tsx:10:/",
+    "target": "function:39add68cb5c4bab5e7011e7970b8700b"
+  },
+  {
+    "col": 0,
+    "kind": "references",
+    "line": 11,
+    "metadata": {
+      "confidence": 0.9,
+      "framework": "react",
+      "layout": true,
+      "resolvedBy": "framework"
+    },
+    "provenance": null,
+    "source": "route:apps/react-router/src/main.tsx:11:/team",
     "target": "function:c863eb857f02e69680c9e47dace356b9"
+  },
+  {
+    "col": 0,
+    "kind": "references",
+    "line": 11,
+    "metadata": {
+      "confidence": 0.9,
+      "framework": "react",
+      "resolvedBy": "framework"
+    },
+    "provenance": null,
+    "source": "route:apps/react-router/src/main.tsx:11:/team",
+    "target": "function:5dd4a1bf99112612e8c2797164f02fcc"
   },
   {
     "col": 13,
@@ -246,6 +287,21 @@
     "provenance": null,
     "source": "function:6dccb0ce095800be34bbf630bb5e1b0b",
     "target": "function:6dccb0ce095800be34bbf630bb5e1b0b"
+  },
+  {
+    "col": 29,
+    "kind": "navigates",
+    "line": 21,
+    "metadata": {
+      "confidence": 0.95,
+      "framework": "react-router",
+      "href": "/",
+      "navMethod": "navigate",
+      "resolvedBy": "framework"
+    },
+    "provenance": null,
+    "source": "function:bd2443bcbe09694a55210a349147c068",
+    "target": "route:apps/react-router/src/main.tsx:10:/"
   },
   {
     "col": 31,

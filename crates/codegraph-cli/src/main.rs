@@ -6590,6 +6590,20 @@ fn index_project_inner(
         framework_started.elapsed(),
         json!({ "enabled": resolver.has_framework_resolvers() }),
     );
+    diagnostic_run.phase_start("framework_finalize");
+    let framework_finalize_started = std::time::Instant::now();
+    let pb = phase_spinner("Finalizing frameworks", quiet);
+    // Cross-file framework finalization (NestJS RouterModule prefixes, React
+    // Router routes named after a constant) BEFORE resolution, as upstream's
+    // index runs runPostExtract: a navigation call resolves against the
+    // route's final name.
+    resolver.run_post_extract(&mut store)?;
+    finish_phase(&pb, "Finalized frameworks");
+    diagnostic_run.phase_end(
+        "framework_finalize",
+        framework_finalize_started.elapsed(),
+        json!({}),
+    );
     // Finished from INSIDE the callback on the final chunk so the retained line
     // lands before the resolver's deferred passes (which resolve refs this bar
     // does not count). The trailing finish covers the no-chunk case where the
@@ -6659,18 +6673,6 @@ fn index_project_inner(
         "reference_resolution",
         resolution_started.elapsed(),
         json!({ "processed": resolve_bar.position(), "total": resolve_bar.length() }),
-    );
-    diagnostic_run.phase_start("framework_finalize");
-    let framework_finalize_started = std::time::Instant::now();
-    let pb = phase_spinner("Finalizing frameworks", quiet);
-    // Cross-file framework finalization (NestJS RouterModule prefixing) after
-    // resolution, mirroring the upstream index.ts:358 runPostExtract.
-    resolver.run_post_extract(&mut store)?;
-    finish_phase(&pb, "Finalized frameworks");
-    diagnostic_run.phase_end(
-        "framework_finalize",
-        framework_finalize_started.elapsed(),
-        json!({}),
     );
     // Every reference is now in `unresolved_refs` or `resolved_refs`
     // (W5-09e).

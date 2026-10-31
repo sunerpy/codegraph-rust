@@ -11209,6 +11209,295 @@ pub fn typescript_expo_api_route_body_edit() -> Case {
         )
 }
 
+/// The React Router app the W7-09b cases edit: two routes in `src/App.tsx`,
+/// their pages, and a navigation call in `src/nav.ts`.
+const REACT_ROUTER_PACKAGE: &str =
+    "{\"name\":\"web\",\"dependencies\":{\"react\":\"18\",\"react-router-dom\":\"6\"}}\n";
+const REACT_ROUTER_APP: &str = "import { Routes, Route } from 'react-router-dom'\nimport { Login } from './pages/Login'\nimport { SignIn } from './pages/SignIn'\nimport { Help } from './pages/Help'\nexport function App() {\n  return (\n    <Routes>\n      <Route path=\"/login\" element={<Login />} />\n      <Route path=\"/help\" element={<Help />} />\n    </Routes>\n  )\n}\n";
+const REACT_ROUTER_LOGIN: &str = "export function Login() {\n  return null\n}\n";
+const REACT_ROUTER_SIGN_IN: &str = "export function SignIn() {\n  return null\n}\n";
+const REACT_ROUTER_HELP: &str = "export function Help() {\n  return null\n}\n";
+const REACT_ROUTER_NAV: &str = "import { useNavigate } from 'react-router-dom'\nexport function goLogin() {\n  const navigate = useNavigate()\n  navigate('/login')\n}\n";
+
+/// The React Router app before an edit.
+fn react_router_app(change: Change) -> Case {
+    Case::new(change, &[Language::TypeScript, Language::Tsx])
+        .file("package.json", REACT_ROUTER_PACKAGE)
+        .file("src/App.tsx", REACT_ROUTER_APP)
+        .file("src/pages/Login.tsx", REACT_ROUTER_LOGIN)
+        .file("src/pages/SignIn.tsx", REACT_ROUTER_SIGN_IN)
+        .file("src/pages/Help.tsx", REACT_ROUTER_HELP)
+        .file("src/nav.ts", REACT_ROUTER_NAV)
+}
+
+/// W7-09b: the route file gives a route another element (upstream F4): the
+/// route renders the new page, and the navigation to it stays.
+pub fn tsx_react_router_route_renders_another_page() -> Case {
+    react_router_app(Change::BodyEdit)
+        .write(
+            "src/App.tsx",
+            "import { Routes, Route } from 'react-router-dom'\nimport { Login } from './pages/Login'\nimport { SignIn } from './pages/SignIn'\nimport { Help } from './pages/Help'\nexport function App() {\n  return (\n    <Routes>\n      <Route path=\"/login\" element={<SignIn />} />\n      <Route path=\"/help\" element={<Help />} />\n    </Routes>\n  )\n}\n",
+        )
+        .edge_before(
+            "route src/App.tsx::route:/login",
+            "references",
+            "function Login",
+        )
+        .edge_after(
+            "route src/App.tsx::route:/login",
+            "references",
+            "function SignIn",
+        )
+        .no_edge_after(
+            "route src/App.tsx::route:/login",
+            "references",
+            "function Login",
+        )
+        .edge_throughout(
+            "function goLogin",
+            "navigates",
+            "route src/App.tsx::route:/login",
+        )
+        .edge_metadata_after(
+            (
+                "function goLogin",
+                "navigates",
+                "route src/App.tsx::route:/login",
+            ),
+            "framework",
+            "react-router",
+        )
+}
+
+/// W7-09b: a route's page is edited (upstream F4): the route still renders
+/// it, and the navigation to the route stays.
+pub fn tsx_react_router_page_body_edit_keeps_its_route() -> Case {
+    react_router_app(Change::BodyEdit)
+        .write(
+            "src/pages/Login.tsx",
+            "export function Login() {\n  return <form />\n}\n",
+        )
+        .edge_throughout(
+            "route src/App.tsx::route:/login",
+            "references",
+            "function Login",
+        )
+        .edge_throughout(
+            "function goLogin",
+            "navigates",
+            "route src/App.tsx::route:/login",
+        )
+}
+
+/// W7-09b: a route's page is deleted (upstream F4): the route stays an
+/// address, rendering nothing, and the navigation to it stays.
+pub fn tsx_react_router_page_delete_leaves_its_route() -> Case {
+    react_router_app(Change::DeleteImportedModule)
+        .remove("src/pages/Login.tsx")
+        .edge_before(
+            "route src/App.tsx::route:/login",
+            "references",
+            "function Login",
+        )
+        .named_after("route", "/login")
+        .edge_throughout(
+            "function goLogin",
+            "navigates",
+            "route src/App.tsx::route:/login",
+        )
+}
+
+/// W7-09b: a navigation call is edited to name another route (upstream F4):
+/// the `navigates` edge follows the href.
+pub fn typescript_react_router_navigation_call_names_another_route() -> Case {
+    react_router_app(Change::BodyEdit)
+        .write(
+            "src/nav.ts",
+            "import { useNavigate } from 'react-router-dom'\nexport function goLogin() {\n  const navigate = useNavigate()\n  navigate('/help')\n}\n",
+        )
+        .edge_before(
+            "function goLogin",
+            "navigates",
+            "route src/App.tsx::route:/login",
+        )
+        .edge_after(
+            "function goLogin",
+            "navigates",
+            "route src/App.tsx::route:/help",
+        )
+        .no_edge_after(
+            "function goLogin",
+            "navigates",
+            "route src/App.tsx::route:/login",
+        )
+}
+
+/// W7-09b: `react-router-dom` appears in the manifest of a React app whose
+/// routes React already reads (upstream F4): React Router is detected, and
+/// the navigation call binds.
+pub fn typescript_react_router_dependency_appears_in_package_json() -> Case {
+    Case::new(Change::ControlFile, &[Language::TypeScript, Language::Tsx])
+        .file(
+            "package.json",
+            "{\"name\":\"web\",\"dependencies\":{\"react\":\"18\"}}\n",
+        )
+        .file("src/App.tsx", REACT_ROUTER_APP)
+        .file("src/pages/Login.tsx", REACT_ROUTER_LOGIN)
+        .file("src/pages/SignIn.tsx", REACT_ROUTER_SIGN_IN)
+        .file("src/pages/Help.tsx", REACT_ROUTER_HELP)
+        .file("src/nav.ts", REACT_ROUTER_NAV)
+        .write("package.json", REACT_ROUTER_PACKAGE)
+        .edge_throughout(
+            "route src/App.tsx::route:/login",
+            "references",
+            "function Login",
+        )
+        .edge_after(
+            "function goLogin",
+            "navigates",
+            "route src/App.tsx::route:/login",
+        )
+}
+
+/// W7-09b: the constant a route's path is built from changes (upstream
+/// #2165 and `postExtract`): the route, whose own file did not change, is
+/// renamed in place before anything resolves. (A navigation call in another
+/// file bound to the old name is retried by the sync navigation pass, W7-23.)
+pub fn typescript_react_router_route_constant_renames_the_route() -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript, Language::Tsx])
+        .file(
+            "package.json",
+            "{\"name\":\"web\",\"dependencies\":{\"react\":\"18\",\"react-router\":\"7\"}}\n",
+        )
+        .file(
+            "src/config/paths.ts",
+            "export const paths = {\n  app: { root: { path: '/app' }, team: { path: 'team' } },\n} as const\n",
+        )
+        .file(
+            "src/router.tsx",
+            "import { createBrowserRouter } from 'react-router'\nimport { paths } from './config/paths'\nimport { AppRoot } from './AppRoot'\nimport { Team } from './Team'\nexport const router = createBrowserRouter([\n  {\n    path: paths.app.root.path,\n    element: <AppRoot />,\n    children: [{ path: paths.app.team.path, element: <Team /> }],\n  },\n])\n",
+        )
+        .file(
+            "src/AppRoot.tsx",
+            "export function AppRoot() {\n  return null\n}\n",
+        )
+        .file("src/Team.tsx", "export function Team() {\n  return null\n}\n")
+        .write(
+            "src/config/paths.ts",
+            "export const paths = {\n  app: { root: { path: '/dashboard' }, team: { path: 'team' } },\n} as const\n",
+        )
+        .named_before("route", "/app")
+        .named_before("route", "/app/team")
+        .named_after("route", "/dashboard")
+        .named_after("route", "/dashboard/team")
+        .edge_throughout(
+            "route src/router.tsx::route:/{paths.app.root.path}",
+            "references",
+            "function AppRoot",
+        )
+}
+
+/// W7-09b: the page a lazy route's barrel imports appears (upstream
+/// `react-router-barrel-imports.test.ts`, sync): the parked `lazy-import:`
+/// reference waits under its path's last segment, which the new page's
+/// folder is, so the sync retries it. (A page appearing deeper under the
+/// barrel is #2560's, W7-23.)
+pub fn tsx_react_router_lazy_barrel_page_appears() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::TypeScript, Language::Tsx])
+        .file(
+            "package.json",
+            "{\"name\":\"shop\",\"private\":true,\"dependencies\":{\"react\":\"^18\",\"react-router\":\"^7\"}}\n",
+        )
+        .file(
+            "src/router.tsx",
+            "import { createBrowserRouter } from 'react-router';\n\nexport const router = createBrowserRouter([\n  { path: '/login', lazy: () => import('./auth/login') },\n]);\n",
+        )
+        .file(
+            "src/auth/login/index.ts",
+            "import Login from './Login';\n\nexport default Login;\n",
+        )
+        .write(
+            "src/auth/login/Login.tsx",
+            "export default function Login() {\n  return null;\n}\n",
+        )
+        .edge_after(
+            "route src/router.tsx::route:/login",
+            "references",
+            "function Login",
+        )
+}
+
+/// W7-09b: the page a lazy route's barrel imports moves its default export
+/// to another component, the old one staying (upstream
+/// `react-router-barrel-imports.test.ts`, sync): the route renders the new
+/// default.
+pub fn tsx_react_router_lazy_page_default_export_moves() -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript, Language::Tsx])
+        .file(
+            "package.json",
+            "{\"name\":\"shop\",\"private\":true,\"dependencies\":{\"react\":\"^18\",\"react-router\":\"^7\"}}\n",
+        )
+        .file(
+            "src/router.tsx",
+            "import { createBrowserRouter } from 'react-router';\n\nexport const router = createBrowserRouter([\n  { path: '/login', lazy: () => import('./auth/login') },\n]);\n",
+        )
+        .file(
+            "src/auth/login/index.ts",
+            "import Login from './Login';\n\nexport default Login;\n",
+        )
+        .file(
+            "src/auth/login/Login.tsx",
+            "export default function Login() {\n  return null;\n}\n",
+        )
+        .write(
+            "src/auth/login/Login.tsx",
+            "export function Login() {\n  return null;\n}\n\nexport default function SignIn() {\n  return null;\n}\n",
+        )
+        .edge_before(
+            "route src/router.tsx::route:/login",
+            "references",
+            "function Login",
+        )
+        .edge_after(
+            "route src/router.tsx::route:/login",
+            "references",
+            "function SignIn",
+        )
+}
+
+/// W7-09b: a lazily loaded route module's body is edited (upstream F4): the
+/// route still renders its default export, and still inside its layout.
+pub fn tsx_react_router_lazy_page_body_edit_keeps_its_route() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Tsx])
+        .file("package.json", REACT_ROUTER_PACKAGE)
+        .file(
+            "src/router.tsx",
+            "import { createBrowserRouter } from 'react-router-dom'\nimport { Layout } from './Layout'\nexport const router = createBrowserRouter([\n  {\n    path: '/',\n    element: <Layout />,\n    children: [{ path: 'team', lazy: () => import('./pages/Team') }],\n  },\n])\n",
+        )
+        .file(
+            "src/Layout.tsx",
+            "export function Layout() {\n  return null\n}\n",
+        )
+        .file(
+            "src/pages/Team.tsx",
+            "export default function Team() {\n  return null\n}\n",
+        )
+        .write(
+            "src/pages/Team.tsx",
+            "export default function Team() {\n  return <ul />\n}\n",
+        )
+        .edge_throughout(
+            "route src/router.tsx::route:/team",
+            "references",
+            "function Team",
+        )
+        .edge_throughout(
+            "route src/router.tsx::route:/team",
+            "references",
+            "function Layout",
+        )
+}
+
 /// W5-06, fail closed: only the manifest's `version` changes; every JS file
 /// re-resolves and every edge stays.
 pub fn typescript_package_version_bump_keeps_every_edge() -> Case {

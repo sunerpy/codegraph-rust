@@ -1469,6 +1469,11 @@ fn sync_paths_with_store(
                 &scope.options.extensions,
             )?;
         }
+        // Cross-file framework finalization on every sync, before anything is
+        // resolved, as a full index runs it (upstream's sync runs
+        // runPostExtract before its resolution too): a route a constant names
+        // is renamed before a navigation call resolves against it.
+        resolver.run_post_extract(store)?;
         let (scope_sites, fallback_files) = refresh_dependent_refs(
             project_root,
             store,
@@ -1508,8 +1513,6 @@ fn sync_paths_with_store(
             &scope_sites,
             &retry_names,
         )?;
-        // Cross-file framework finalization on every sync (upstream index.ts:464).
-        resolver.run_post_extract(store)?;
         // Last: the surface and namespace rows, then the markers the first
         // mutation withdrew.
         surfaces.write_rows(store)?;
@@ -1822,8 +1825,10 @@ fn sweep_orphaned_refs(
     // duplicate rows (`unresolved_refs` has no UNIQUE constraint), which
     // accumulate across interrupt→heal cycles and diverge from `index --force`.
     // Re-resolving the existing rows alone heals the interrupted pass byte-equal.
-    let result = resolver.resolve_and_persist_batched(store, ORPHAN_SWEEP_BATCH_ROWS)?;
+    // Cross-file framework finalization before resolution, as a full index
+    // runs it.
     resolver.run_post_extract(store)?;
+    let result = resolver.resolve_and_persist_batched(store, ORPHAN_SWEEP_BATCH_ROWS)?;
     Ok(result.stats)
 }
 

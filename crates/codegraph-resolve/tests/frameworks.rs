@@ -356,13 +356,13 @@ fn react_extract_route_reference_and_no_component() {
     );
 }
 
-/// Nested v6 shape from upstream #1348: the parent route has a `path` but renders
-/// `<Outlet/>`, and the pathless `index` child must stay skipped. The unbounded
-/// 400-byte window let the parent borrow the child's `element` and let the `index`
-/// route borrow its sibling's `path`, producing `/dashboard -> DashboardHome`,
-/// a duplicate `settings` node, and `settings -> DashboardHome`.
+/// Nested v6 shape from upstream #1348: the parent `<Route path="/dashboard">`
+/// renders nothing of its own (an `<Outlet/>`), its `index` child is the page at
+/// that address and claims it, and `settings` is nested under it. Each route
+/// reads only its own opening tag: the fixed 400-byte window this replaced let the
+/// parent borrow the child's `element` and the `index` route its sibling's `path`.
 #[test]
-fn react_route_window_stops_at_tag_end_not_at_sibling_routes() {
+fn react_route_index_child_claims_its_parents_address() {
     let content = concat!(
         "function DashboardHome() { return null; }\n",
         "function Settings() { return null; }\n",
@@ -389,8 +389,11 @@ fn react_route_window_stops_at_tag_end_not_at_sibling_routes() {
         .collect();
     assert_eq!(
         routes,
-        vec![("/dashboard".to_string(), 6), ("settings".to_string(), 8)],
-        "the pathless index route must not borrow its sibling's path"
+        vec![
+            ("/dashboard".to_string(), 7),
+            ("/dashboard/settings".to_string(), 8)
+        ],
+        "the index route is the page at its parent's address; settings nests under it"
     );
 
     let refs: Vec<(String, i64)> = result
@@ -400,15 +403,20 @@ fn react_route_window_stops_at_tag_end_not_at_sibling_routes() {
         .collect();
     assert_eq!(
         refs,
-        vec![("Settings".to_string(), 8)],
-        "only the settings route owns an element; the parent renders <Outlet/>"
+        vec![
+            ("DashboardHome".to_string(), 7),
+            ("Settings".to_string(), 8)
+        ],
+        "each route renders its own element; the parent renders <Outlet/>"
     );
 }
 
-/// An unterminated `<Route path=…` followed by a long run of `<` must not let the
-/// scan run to end-of-file, and must not reach the well-formed route far below it.
+/// An unterminated `<Route path=…` followed by a long run of `<`: the scanner reads
+/// the run as the tag's attributes, one character at a time, and the well-formed
+/// route below it as an element among them. The `/a` tag never closes, so it is no
+/// route (upstream's scanner), and `/b` keeps its own element.
 #[test]
-fn react_route_window_is_bounded_for_unterminated_tag_and_bare_angle_run() {
+fn react_route_unterminated_tag_is_no_route() {
     let mut content = String::from("function Comp() { return null; }\n<Route path=\"/a\"\n");
     content.push_str(&"<".repeat(200_000));
     content.push_str("\n<Route path=\"/b\" element={<Comp/>} />\n");
@@ -423,7 +431,7 @@ fn react_route_window_is_bounded_for_unterminated_tag_and_bare_angle_run() {
         .filter(|n| n.kind == NodeKind::Route)
         .map(|n| n.name.clone())
         .collect();
-    assert_eq!(routes, vec!["/a".to_string(), "/b".to_string()]);
+    assert_eq!(routes, vec!["/b".to_string()]);
 
     let refs: Vec<(String, i64)> = result
         .references
@@ -433,14 +441,13 @@ fn react_route_window_is_bounded_for_unterminated_tag_and_bare_angle_run() {
     assert_eq!(
         refs,
         vec![("Comp".to_string(), 4)],
-        "the unterminated /a tag must not reach the /b element 200KB later"
+        "the unterminated /a tag is no route, and /b renders its own element"
     );
 }
 
-/// Pins `ROUTE_OPENING_TAG_SCAN_LIMIT` from the outside: a 700-byte prettier-wrapped
-/// opening tag — wider than both the old 400-byte window and any tag measured while
-/// sizing the bound — still yields its `path` and its `element`, so the bound cannot
-/// be tightened to a value that truncates legitimate input.
+/// A 700-byte prettier-wrapped opening tag, wider than the fixed 400-byte window the
+/// scanner replaced, still yields its `path` and its `element`: a tag's attributes
+/// are read to its own `>`, however long.
 #[test]
 fn react_route_window_keeps_long_multiline_opening_tag_intact() {
     let filler: String = (0..12)
@@ -491,8 +498,9 @@ fn react_route_window_keeps_long_multiline_opening_tag_intact() {
 
 /// The data-router half of upstream #1348: a PARENT route object carries a `path`
 /// but no `element` of its own, and the first `element` the fixed 300-byte window
-/// met belonged to a CHILD inside `children: [...]`. The parent must produce NO
-/// borrowed edge, and each child exactly its own.
+/// this replaced met belonged to a CHILD inside `children: [...]`. The parent
+/// renders nothing; its `index` child is the page at its address, and `settings`
+/// nests under it, each with exactly its own element.
 #[test]
 fn react_data_router_parent_without_element_does_not_borrow_from_children() {
     let content = concat!(
@@ -518,8 +526,11 @@ fn react_data_router_parent_without_element_does_not_borrow_from_children() {
         .collect();
     assert_eq!(
         routes,
-        vec![("settings".to_string(), 6)],
-        "a parent route with no element of its own must emit no route->component pair"
+        vec![
+            ("/dashboard".to_string(), 5),
+            ("/dashboard/settings".to_string(), 6)
+        ],
+        "the index child is the page at /dashboard; the parent emits no route of its own"
     );
 
     let refs: Vec<(String, i64)> = result
@@ -529,8 +540,11 @@ fn react_data_router_parent_without_element_does_not_borrow_from_children() {
         .collect();
     assert_eq!(
         refs,
-        vec![("Settings".to_string(), 6)],
-        "/dashboard must not borrow DashboardHome from its pathless index child"
+        vec![
+            ("DashboardHome".to_string(), 5),
+            ("Settings".to_string(), 6)
+        ],
+        "each child renders its own element, and the parent borrows none"
     );
 }
 
@@ -579,9 +593,8 @@ fn react_data_router_child_without_element_does_not_borrow_from_parent() {
     );
 }
 
-/// A malformed object carrying two depth-0 `path:` keys — no `{` and no `}` separates
-/// them, so only the next-`path:` stop can keep the first from borrowing the second's
-/// element.
+/// A malformed object carrying two `path:` keys: as in a JavaScript object literal,
+/// the last one is the object's path, and the route is declared there.
 #[test]
 fn react_data_router_object_stops_at_next_path_key_when_unbraced() {
     let content = "createBrowserRouter([{ path: '/a', path: '/b', element: <B/> }]);\n";
@@ -650,11 +663,10 @@ fn react_data_router_object_survives_angle_brackets_and_stops_at_sibling() {
     );
 }
 
-/// A route object that legitimately runs well past the old 300-byte window — `loader`,
-/// `action`, `errorElement`, `hydrateFallbackElement`, a nested `handle={{…}}` and a
-/// `shouldRevalidate`, with its own `element` declared LAST — must still be seen whole.
-/// This pins the new bound from the outside: tightening it below the object length
-/// reddens this test.
+/// A route object that runs well past the fixed 300-byte window the scanner replaced
+/// — `loader`, `action`, `errorElement`, `hydrateFallbackElement`, a nested
+/// `handle={{…}}` and a `shouldRevalidate`, with its own `element` declared LAST —
+/// is read whole.
 #[test]
 fn react_data_router_keeps_long_route_object_intact() {
     let content = concat!(
@@ -711,8 +723,9 @@ fn react_data_router_keeps_long_route_object_intact() {
     );
 }
 
-/// An unterminated route object followed by a well-formed one 200KB later: the walk
-/// must neither run to end-of-file nor reach that far-away element.
+/// An unterminated route object with a well-formed one 200KB later inside it: the
+/// object never closes, so it is no route, and the well-formed one renders its own
+/// element.
 #[test]
 fn react_data_router_object_walk_is_bounded_for_unterminated_literal() {
     let mut content = String::from("createBrowserRouter([\n  { path: '/a',\n");

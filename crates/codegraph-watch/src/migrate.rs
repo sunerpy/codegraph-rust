@@ -329,8 +329,10 @@ pub(crate) fn migrate_project(
             &options.extensions,
         )?;
     }
-    resolver.resolve_and_persist_batched(rebuild.store_mut(), RESOLVE_BATCH_ROWS)?;
+    // Cross-file framework finalization before resolution, as a full index
+    // runs it.
     resolver.run_post_extract(rebuild.store_mut())?;
+    resolver.resolve_and_persist_batched(rebuild.store_mut(), RESOLVE_BATCH_ROWS)?;
     // Every reference is now in `unresolved_refs` or `resolved_refs` (W5-09e).
     crate::resolved_refs::write_marker(rebuild.store(), options, &scope.framework)?;
     rebuild

@@ -20115,6 +20115,724 @@ mod expo_router {
     }
 }
 
+mod react_router {
+    use super::support::{Graph, Project};
+
+    /// Every route's name, sorted.
+    fn routes(graph: &Graph) -> Vec<String> {
+        let mut names: Vec<String> = graph
+            .nodes
+            .iter()
+            .filter(|node| node.kind == "route")
+            .map(|node| node.name.clone())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// What each route renders (`->`) and renders inside (`~>`), as
+    /// `route -> name@file`, sorted (upstream's tests' `references` edges of
+    /// a route).
+    fn bindings(graph: &Graph) -> Vec<String> {
+        let mut out: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.kind == "references")
+            .filter_map(|edge| {
+                let route = graph
+                    .node(&edge.source)
+                    .filter(|node| node.kind == "route")?;
+                let target = graph.node(&edge.target)?;
+                let layout = edge.metadata.get("layout").and_then(|v| v.as_bool()) == Some(true);
+                Some(format!(
+                    "{} {} {}@{}",
+                    route.name,
+                    if layout { "~>" } else { "->" },
+                    target.name,
+                    target.file_path
+                ))
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// Every `navigates` edge, as `source -> route (verb href)`, sorted.
+    fn navigations(graph: &Graph) -> Vec<String> {
+        let mut out: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.kind == "navigates")
+            .map(|edge| {
+                let field = |key: &str| {
+                    edge.metadata
+                        .get(key)
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("?")
+                        .to_string()
+                };
+                format!(
+                    "{} -> {} ({} {}) {}",
+                    graph
+                        .node(&edge.source)
+                        .map_or("?", |node| node.name.as_str()),
+                    graph
+                        .node(&edge.target)
+                        .map_or("?", |node| node.name.as_str()),
+                    field("navMethod"),
+                    field("href"),
+                    field("framework"),
+                )
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    fn strings(items: &[&str]) -> Vec<String> {
+        items.iter().map(|item| (*item).to_string()).collect()
+    }
+
+    /// Upstream F4 (`react-router.test.ts`, "a routed app end to end"),
+    /// proshop's shape: a `frontend/` workspace whose routes are in
+    /// `src/App.js`. Every route is bound to its screen; `history.push` and
+    /// `.replace` with a literal, and v6's `navigate()` with a template hole
+    /// reaching the `:id?` route, navigate; a computed destination and an
+    /// array's `push` stay unresolved. (The `<Link to>` half is the link
+    /// pass's.)
+    #[test]
+    fn f4_a_routed_app_binds_its_routes_and_navigations() {
+        let project = Project::new()
+            .file("package.json", "{\"name\":\"shop\",\"private\":true}\n")
+            .file(
+                "frontend/package.json",
+                "{\"name\":\"frontend\",\"dependencies\":{\"react\":\"18\",\"react-router-dom\":\"5\"}}\n",
+            )
+            .file(
+                "frontend/src/App.js",
+                "import { BrowserRouter as Router, Route } from 'react-router-dom'\nimport LoginScreen from './screens/LoginScreen'\nimport ShippingScreen from './screens/ShippingScreen'\nimport PaymentScreen from './screens/PaymentScreen'\nimport PlaceOrderScreen from './screens/PlaceOrderScreen'\nimport ProductScreen from './screens/ProductScreen'\nimport CartScreen from './screens/CartScreen'\nconst App = () => (\n  <Router>\n    <Route path='/login' component={LoginScreen} />\n    <Route path='/shipping' component={ShippingScreen} />\n    <Route path='/payment' component={PaymentScreen} />\n    <Route path='/placeorder' component={PlaceOrderScreen} />\n    <Route path='/product/:id' component={ProductScreen} />\n    <Route path='/cart/:id?' component={CartScreen} />\n  </Router>\n)\nexport default App\n",
+            )
+            .file(
+                "frontend/src/screens/PaymentScreen.js",
+                "import React, { useState } from 'react'\nconst PaymentScreen = ({ history }) => {\n  const cart = useSelector((state) => state.cart)\n  if (!cart.shippingAddress.address) {\n    history.push('/shipping')\n  }\n  const submitHandler = (e) => {\n    e.preventDefault()\n    history.push('/placeorder')\n  }\n  return <form onSubmit={submitHandler} />\n}\nexport default PaymentScreen\n",
+            )
+            .file(
+                "frontend/src/screens/LoginScreen.js",
+                "import React, { useEffect } from 'react'\nconst LoginScreen = ({ location, history, userInfo }) => {\n  const redirect = location.search ? location.search.split('=')[1] : '/'\n  useEffect(() => {\n    if (userInfo) {\n      history.push(redirect)\n    }\n  }, [history, userInfo, redirect])\n  return null\n}\nexport default LoginScreen\n",
+            )
+            .file(
+                "frontend/src/screens/ShippingScreen.js",
+                "import React from 'react'\nconst ShippingScreen = ({ history }) => {\n  const submitHandler = () => {\n    history.replace('/payment')\n  }\n  return <form onSubmit={submitHandler} />\n}\nexport default ShippingScreen\n",
+            )
+            .file(
+                "frontend/src/screens/PlaceOrderScreen.js",
+                "import React from 'react'\nconst PlaceOrderScreen = () => <div>Order</div>\nexport default PlaceOrderScreen\n",
+            )
+            .file(
+                "frontend/src/screens/ProductScreen.js",
+                "import React from 'react'\nimport { useNavigate } from 'react-router-dom'\nconst ProductScreen = ({ match }) => {\n  const navigate = useNavigate()\n  const addToCart = () => {\n    navigate(`/cart/${match.params.id}`)\n  }\n  return <button onClick={addToCart}>Add</button>\n}\nexport default ProductScreen\n",
+            )
+            .file(
+                "frontend/src/screens/CartScreen.js",
+                "import React from 'react'\nconst CartScreen = () => <div>Cart</div>\nexport default CartScreen\n",
+            )
+            .file(
+                "frontend/src/utils/breadcrumbs.js",
+                "export const trail = () => {\n  const paths = []\n  paths.push('/placeorder')\n  return paths\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        let report = graph.report();
+        assert_eq!(
+            routes(graph),
+            [
+                "/cart/:id?",
+                "/login",
+                "/payment",
+                "/placeorder",
+                "/product/:id",
+                "/shipping"
+            ],
+            "{report}"
+        );
+        assert_eq!(
+            bindings(graph),
+            strings(&[
+                "/cart/:id? -> CartScreen@frontend/src/screens/CartScreen.js",
+                "/login -> LoginScreen@frontend/src/screens/LoginScreen.js",
+                "/payment -> PaymentScreen@frontend/src/screens/PaymentScreen.js",
+                "/placeorder -> PlaceOrderScreen@frontend/src/screens/PlaceOrderScreen.js",
+                "/product/:id -> ProductScreen@frontend/src/screens/ProductScreen.js",
+                "/shipping -> ShippingScreen@frontend/src/screens/ShippingScreen.js",
+            ]),
+            "{report}"
+        );
+        assert_eq!(
+            navigations(graph),
+            strings(&[
+                "PaymentScreen -> /shipping (push /shipping) react-router",
+                "addToCart -> /cart/:id? (navigate /cart/${…}) react-router",
+                "submitHandler -> /payment (replace /payment) react-router",
+                "submitHandler -> /placeorder (push /placeorder) react-router",
+            ]),
+            "{report}"
+        );
+        graph.assert_unresolved("function LoginScreen", "calls", "history.push");
+        graph.assert_unresolved("function trail", "calls", "paths.push");
+    }
+
+    /// Upstream "the shapes proshop is written in": a destination whose other
+    /// arm is computed still names where it goes.
+    #[test]
+    fn f4_a_local_destination_navigates_to_its_static_arm() {
+        let project = Project::new()
+            .file(
+                "package.json",
+                "{\"name\":\"shop\",\"dependencies\":{\"react\":\"18\",\"react-router-dom\":\"5\"}}\n",
+            )
+            .file(
+                "src/App.js",
+                "import { BrowserRouter as Router, Route } from 'react-router-dom'\nimport HomeScreen from './screens/HomeScreen'\nimport LoginScreen from './screens/LoginScreen'\nconst App = () => (\n  <Router>\n    <Route path='/' component={HomeScreen} exact />\n    <Route path='/login' component={LoginScreen} />\n  </Router>\n)\nexport default App\n",
+            )
+            .file(
+                "src/screens/HomeScreen.js",
+                "const HomeScreen = () => null\nexport default HomeScreen\n",
+            )
+            .file(
+                "src/screens/LoginScreen.js",
+                "import React, { useEffect } from 'react'\nconst LoginScreen = ({ location, history, userInfo }) => {\n  const redirect = location.search ? location.search.split('=')[1] : '/'\n  useEffect(() => {\n    if (userInfo) {\n      history.push(redirect)\n    }\n  }, [history, userInfo, redirect])\n  return null\n}\nexport default LoginScreen\n",
+            )
+            .index();
+        let graph = project.graph();
+        assert_eq!(
+            navigations(graph),
+            ["LoginScreen -> / (push /) react-router"],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream "route declaration boundaries (#1348)" through the whole
+    /// pipeline: each route's references bind the components its own file
+    /// declares, in a `.tsx` file and in a `.ts` data router.
+    #[test]
+    fn pr1348_a_route_binds_only_its_own_declaration() {
+        let project = Project::new()
+            .file("package.json", "{\"dependencies\":{\"react\":\"18\"}}\n")
+            .file(
+                "App.tsx",
+                "import { Routes, Route } from 'react-router-dom';\nfunction DashboardHome() { return null; }\nfunction Settings() { return null; }\nfunction Shell() { return null; }\nconst comparison = count<limit;\nconst fake = '<Route path=\"/fake\" element={<DashboardHome/>}/>';\nexport function App() {\n  return <Routes>\n    <Route path=\"/dashboard\">\n      <Route index element={<DashboardHome/>}/>\n      <Route path=\"settings\" element={<Settings/>}/>\n    </Route>\n    <Route path=\"/empty\"></Route>\n    <Route element={<Settings/>} path=\"/sibling\"/>\n    <Route element={<Shell title=\"a > b\"><Settings path=\"/nested\"/></Shell>} path=\"/long\"/>\n    <Route path=\"/no-element\" handle={{ element: <DashboardHome/> }}/>\n    <Route component={Settings} path=\"/legacy\"/>\n  </Routes>;\n}\n",
+            )
+            .file(
+                "data.ts",
+                "import { createBrowserRouter } from 'react-router-dom';\nfunction DataIndex() { return null; }\nfunction DataSettings() { return null; }\nconst routes = createBrowserRouter([\n  { path: '/data', children: [\n    { index: true, Component: DataIndex },\n    { Component: DataSettings, path: 'prefs' }\n  ] },\n  { path: '/metadata', handle: { Component: DataIndex } },\n  { path: '', Component: DataSettings }\n]);\n",
+            )
+            .index();
+        let graph = project.graph();
+        let report = graph.report();
+        assert_eq!(
+            routes(graph),
+            [
+                "/",
+                "/dashboard",
+                "/dashboard/settings",
+                "/data",
+                "/data/prefs",
+                "/empty",
+                "/legacy",
+                "/long",
+                "/no-element",
+                "/sibling"
+            ],
+            "{report}"
+        );
+        assert_eq!(
+            bindings(graph),
+            strings(&[
+                "/ -> DataSettings@data.ts",
+                "/dashboard -> DashboardHome@App.tsx",
+                "/dashboard/settings -> Settings@App.tsx",
+                "/data -> DataIndex@data.ts",
+                "/data/prefs -> DataSettings@data.ts",
+                "/legacy -> Settings@App.tsx",
+                "/long -> Shell@App.tsx",
+                "/sibling -> Settings@App.tsx",
+            ]),
+            "{report}"
+        );
+        // The language React gives its routes: tsx in a `.tsx` file, jsx in
+        // the `.ts` router.
+        for (name, language) in [("/dashboard", "tsx"), ("/data", "jsx")] {
+            let route = graph
+                .nodes
+                .iter()
+                .find(|node| node.kind == "route" && node.name == name)
+                .expect("route");
+            assert_eq!(route.language, language, "{name}");
+        }
+    }
+
+    /// Upstream `react-router-nested-lazy.test.ts` (bulletproof-react's
+    /// shape): a child path is relative to its parent's, `lazy: () =>
+    /// import('./routes/x')` renders the module's default export, a path read
+    /// from a constant through an app's own tsconfig alias names the route,
+    /// and a child renders inside its parent's component.
+    #[test]
+    fn pr2165_nested_lazy_routes_named_by_constants() {
+        let project = Project::new()
+            .file("package.json", "{\"name\":\"mono\",\"private\":true}\n")
+            .file(
+                "apps/web/package.json",
+                "{\"name\":\"web\",\"dependencies\":{\"react\":\"^18\",\"react-router\":\"^7\"}}\n",
+            )
+            .file(
+                "apps/web/tsconfig.json",
+                "{\"compilerOptions\":{\"baseUrl\":\".\",\"paths\":{\"@/*\":[\"./src/*\"]}}}\n",
+            )
+            .file(
+                "apps/web/src/config/paths.ts",
+                "export const paths = {\n  home: { path: '/', getHref: () => '/' },\n  app: {\n    root: { path: '/app', getHref: () => '/app' },\n    discussions: { path: 'discussions', getHref: () => '/app/discussions' },\n  },\n} as const;\n",
+            )
+            .file(
+                "apps/web/src/app/router.tsx",
+                "import { createBrowserRouter } from 'react-router';\nimport { paths } from '@/config/paths';\nimport { ProtectedRoute } from '@/lib/auth';\nimport AppRoot from './routes/app/root';\n\nexport const router = createBrowserRouter([\n  { path: paths.home.path, lazy: () => import('./routes/landing') },\n  {\n    path: paths.app.root.path,\n    element: (\n      <ProtectedRoute>\n        <AppRoot />\n      </ProtectedRoute>\n    ),\n    children: [\n      { path: paths.app.discussions.path, lazy: () => import('./routes/app/discussions') },\n      { path: 'settings', element: <Settings /> },\n    ],\n  },\n]);\n",
+            )
+            .file(
+                "apps/web/src/lib/auth.tsx",
+                "export function ProtectedRoute({ children }: { children: unknown }) { return children; }\n",
+            )
+            .file(
+                "apps/web/src/app/routes/landing.tsx",
+                "const LandingRoute = () => null;\nexport default LandingRoute;\n",
+            )
+            .file(
+                "apps/web/src/app/routes/app/root.tsx",
+                "export default function AppRoot() { return null; }\n",
+            )
+            .file(
+                "apps/web/src/app/routes/app/discussions.tsx",
+                "export default function DiscussionsRoute() { return null; }\n",
+            )
+            .index();
+        let graph = project.graph();
+        let report = graph.report();
+        assert_eq!(
+            routes(graph),
+            ["/", "/app", "/app/discussions", "/app/settings"],
+            "{report}"
+        );
+        assert_eq!(
+            bindings(graph),
+            strings(&[
+                "/ -> LandingRoute@apps/web/src/app/routes/landing.tsx",
+                "/app -> AppRoot@apps/web/src/app/routes/app/root.tsx",
+                "/app/discussions -> DiscussionsRoute@apps/web/src/app/routes/app/discussions.tsx",
+                "/app/discussions ~> AppRoot@apps/web/src/app/routes/app/root.tsx",
+                "/app/settings ~> AppRoot@apps/web/src/app/routes/app/root.tsx",
+            ]),
+            "{report}"
+        );
+        // The route keeps the id it was extracted with.
+        assert!(
+            graph
+                .nodes
+                .iter()
+                .any(|node| node.name == "/app/discussions"
+                    && node.id
+                        == "route:apps/web/src/app/router.tsx:16:/{paths.app.root.path}/{paths.app.discussions.path}"),
+            "{report}"
+        );
+    }
+
+    /// Upstream `react-router-config-href.test.ts`, the call's half (#2187):
+    /// `navigate(paths.auth.login.getHref(…))` reads the href the
+    /// route-config helper returns, dropping a query glued onto the path —
+    /// against a route the same constants name, named before any call
+    /// resolves.
+    #[test]
+    fn pr2187_a_navigation_reads_a_route_config_href() {
+        let project = Project::new()
+            .file(
+                "package.json",
+                "{\"name\":\"web\",\"dependencies\":{\"react\":\"^18\",\"react-router\":\"^7\"}}\n",
+            )
+            .file(
+                "tsconfig.json",
+                "{\"compilerOptions\":{\"baseUrl\":\".\",\"paths\":{\"@/*\":[\"./src/*\"]}}}\n",
+            )
+            .file(
+                "src/config/paths.ts",
+                "export const paths = {\n  auth: {\n    login: {\n      path: '/auth/login',\n      getHref: (redirectTo?: string | null | undefined) =>\n        `/auth/login${redirectTo ? `?redirectTo=${encodeURIComponent(redirectTo)}` : ''}`,\n    },\n  },\n  app: {\n    root: { path: '/app', getHref: () => '/app' },\n    discussion: {\n      path: 'discussions/:discussionId',\n      getHref: (id: string) => `/app/discussions/${id}`,\n    },\n  },\n} as const;\n",
+            )
+            .file(
+                "src/app/router.tsx",
+                "import { createBrowserRouter } from 'react-router';\nimport { paths } from '@/config/paths';\n\nexport const router = createBrowserRouter([\n  { path: paths.auth.login.path, lazy: () => import('./routes/auth/login') },\n  {\n    path: paths.app.root.path,\n    lazy: () => import('./routes/app/root'),\n    children: [\n      { path: paths.app.discussion.path, lazy: () => import('./routes/app/discussion') },\n    ],\n  },\n]);\n",
+            )
+            .file(
+                "src/app/routes/auth/login.tsx",
+                "export default function LoginRoute() { return null; }\n",
+            )
+            .file(
+                "src/app/routes/app/root.tsx",
+                "export default function AppRoot() { return null; }\n",
+            )
+            .file(
+                "src/app/routes/app/discussion.tsx",
+                "export default function DiscussionRoute() { return null; }\n",
+            )
+            .file(
+                "src/lib/auth.tsx",
+                "import { useNavigate } from 'react-router';\nimport { paths } from '@/config/paths';\n\nexport function Logout() {\n  const navigate = useNavigate();\n  return <button onClick={() => navigate(paths.auth.login.getHref(location.pathname))}>out</button>;\n}\nexport function Open({ id }: { id: string }) {\n  const navigate = useNavigate();\n  navigate(paths.app.discussion.getHref(id));\n  return null;\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        assert_eq!(
+            navigations(graph),
+            [
+                "Logout -> /auth/login (navigate /auth/login) react-router",
+                "Open -> /app/discussions/:discussionId (navigate /app/discussions/${…}) react-router",
+            ],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream `react-router-lazy-barrel.test.ts`, the index half but for
+    /// the `React.lazy` value (a later change): a lazily loaded module that
+    /// is a barrel renders what it forwards — `export *`, a barrel of
+    /// barrels, a named re-export, a forwarded default, an export clause, a
+    /// held binding, a memoized export's component — and nothing a barrel
+    /// does not forward.
+    #[test]
+    fn pr2400_a_lazy_route_module_renders_what_its_barrel_forwards() {
+        let project = Project::new()
+            .file(
+                "package.json",
+                "{\"name\":\"ui\",\"private\":true,\"dependencies\":{\"react\":\"^18\",\"react-router\":\"^7\"}}\n",
+            )
+            .file(
+                "tsconfig.json",
+                "{\"compilerOptions\":{\"baseUrl\":\".\",\"paths\":{\"@/*\":[\"./src/*\"]}}}\n",
+            )
+            .file(
+                "src/router.tsx",
+                "import { createBrowserRouter } from 'react-router';\n\nexport const router = createBrowserRouter([\n  {\n    path: '/builds/:id',\n    lazy: () => import('@/builds/build_page'),\n    children: [{ path: 'overview', lazy: () => import('@/builds/build_page/overview_tab') }],\n  },\n  { path: '/builders', lazy: () => import('@/builds/pages') },\n  { path: '/fleet', lazy: () => import('@/fleet/home_page') },\n  { path: '/login', lazy: () => import('@/auth/login_page') },\n  { path: '/graph', lazy: () => import('@/chronicle/graph_view') },\n  { path: '/media', lazy: () => import('@/media/media_page') },\n  { path: '/redirect', lazy: () => import('@/core/redirection_loader') },\n  { path: '/clash', lazy: () => import('@/clash') },\n  { path: '/loop', lazy: () => import('@/loop/a') },\n  { path: '/no-default', lazy: () => import('@/legacy') },\n]);\n",
+            )
+            .file("src/builds/build_page/index.ts", "export * from './build_page';\n")
+            .file(
+                "src/builds/build_page/build_page.tsx",
+                "export const BuildPage = () => null;\n\nexport function Component() {\n  return <BuildPage />;\n}\n",
+            )
+            .file(
+                "src/builds/build_page/overview_tab/index.ts",
+                "export * from './overview_tab';\n",
+            )
+            .file(
+                "src/builds/build_page/overview_tab/overview_tab.tsx",
+                "export function Component() {\n  return null;\n}\n",
+            )
+            .file("src/builds/pages/index.ts", "export * from './builder_list_page';\n")
+            .file(
+                "src/builds/pages/builder_list_page/index.ts",
+                "export * from './builder_list_page';\n",
+            )
+            .file(
+                "src/builds/pages/builder_list_page/builder_list_page.tsx",
+                "export function BuilderListPage() {\n  return null;\n}\n\nexport const Component = BuilderListPage;\n",
+            )
+            .file(
+                "src/fleet/home_page/index.ts",
+                "export { HomePage as Component } from './home_page';\n",
+            )
+            .file(
+                "src/fleet/home_page/home_page.tsx",
+                "export function HomePage() {\n  return null;\n}\n",
+            )
+            .file(
+                "src/auth/login_page/index.ts",
+                "export { default } from './login_page';\n",
+            )
+            .file(
+                "src/auth/login_page/login_page.tsx",
+                "export default function LoginPage() {\n  return null;\n}\n",
+            )
+            .file(
+                "src/chronicle/graph_view.tsx",
+                "function GraphView() {\n  return null;\n}\n\nexport { GraphView as Component };\n",
+            )
+            .file(
+                "src/media/media_page.tsx",
+                "import { memo } from 'react';\n\nfunction MediaPage() {\n  return null;\n}\n\nconst MemoizedMediaPage = memo(MediaPage);\n\nexport { MemoizedMediaPage as Component };\n",
+            )
+            .file(
+                "src/core/redirection_loader.ts",
+                "export function redirectionLoader() {\n  return null;\n}\n\nexport const loader = redirectionLoader;\n",
+            )
+            .file(
+                "src/clash/index.ts",
+                "export * from './first';\nexport * from './second';\n",
+            )
+            .file(
+                "src/clash/first.tsx",
+                "export function Component() {\n  return null;\n}\n",
+            )
+            .file(
+                "src/clash/second.tsx",
+                "export function Component() {\n  return null;\n}\n",
+            )
+            .file("src/loop/a.ts", "export * from './b';\n")
+            .file("src/loop/b.ts", "export * from './a';\n")
+            .file("src/legacy/index.ts", "export * from './legacy_page';\n")
+            .file(
+                "src/legacy/legacy_page.tsx",
+                "export default function LegacyPage() {\n  return null;\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        assert_eq!(
+            bindings(graph),
+            strings(&[
+                "/builders -> BuilderListPage@src/builds/pages/builder_list_page/builder_list_page.tsx",
+                "/builds/:id -> Component@src/builds/build_page/build_page.tsx",
+                "/builds/:id/overview -> Component@src/builds/build_page/overview_tab/overview_tab.tsx",
+                "/builds/:id/overview ~> Component@src/builds/build_page/build_page.tsx",
+                "/fleet -> HomePage@src/fleet/home_page/home_page.tsx",
+                "/graph -> GraphView@src/chronicle/graph_view.tsx",
+                "/login -> LoginPage@src/auth/login_page/login_page.tsx",
+                "/media -> MediaPage@src/media/media_page.tsx",
+            ]),
+            "{}",
+            graph.report()
+        );
+        for path in ["/redirect", "/clash", "/loop", "/no-default"] {
+            assert!(
+                graph
+                    .unresolved
+                    .iter()
+                    .any(|r| r.reference_name.starts_with("lazy-import:")
+                        && graph.node(&r.from_node_id).is_some_and(|n| n.name == path)),
+                "{path} links nothing\n{}",
+                graph.report()
+            );
+        }
+    }
+
+    /// Upstream `react-router-barrel-imports.test.ts`, the `lazy: () =>
+    /// import(…)` routes (the loaders that pick an export are a later
+    /// change): a default export that is an imported binding, an imported
+    /// page the module renames to `Component`, and no wrapper a default
+    /// export calls.
+    #[test]
+    fn pr2558_a_lazy_module_passes_on_a_page_it_imports() {
+        let project = Project::new()
+            .file(
+                "package.json",
+                "{\"name\":\"shop\",\"private\":true,\"dependencies\":{\"react\":\"^18\",\"react-router\":\"^7\"}}\n",
+            )
+            .file(
+                "tsconfig.json",
+                "{\"compilerOptions\":{\"baseUrl\":\".\",\"paths\":{\"@/*\":[\"./src/*\"]}}}\n",
+            )
+            .file(
+                "src/router.tsx",
+                "import { createBrowserRouter } from 'react-router';\n\nexport const router = createBrowserRouter([\n  { path: '/login', lazy: () => import('@/auth/login') },\n  { path: '/settings', lazy: () => import('@/settings') },\n  { path: '/account', lazy: () => import('@/account') },\n]);\n",
+            )
+            .file(
+                "src/auth/login/index.ts",
+                "import Login from './Login';\n\nexport default Login;\n",
+            )
+            .file(
+                "src/auth/login/Login.tsx",
+                "export default function Login() {\n  return null;\n}\n",
+            )
+            .file(
+                "src/settings/index.ts",
+                "import { SettingsPage } from './SettingsPage';\n\nexport { SettingsPage as Component };\n",
+            )
+            .file(
+                "src/settings/SettingsPage.tsx",
+                "export function SettingsPage() {\n  return null;\n}\n",
+            )
+            .file(
+                "src/account/index.ts",
+                "import withAuth from '@/hoc/withAuth';\nimport { AccountPage } from './AccountPage';\n\nexport default withAuth(AccountPage);\n",
+            )
+            .file(
+                "src/account/AccountPage.tsx",
+                "export function AccountPage() {\n  return null;\n}\n",
+            )
+            .file(
+                "src/hoc/withAuth.ts",
+                "export default function withAuth(Component: unknown) {\n  return Component;\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        assert_eq!(
+            bindings(graph),
+            strings(&[
+                "/login -> Login@src/auth/login/Login.tsx",
+                "/settings -> SettingsPage@src/settings/SettingsPage.tsx",
+            ]),
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream `react-router-outlet-routes.test.ts`, the scanner's half
+    /// (#2670): a route object that renders `<Outlet />` renders nothing of
+    /// its own and is no layout, yet stays an address a navigation reaches;
+    /// at its parent's address it only groups the routes inside it. No route
+    /// reference to `Outlet` is left behind.
+    #[test]
+    fn pr2670_an_outlet_route_renders_nothing_of_its_own() {
+        let page = |name: &'static str| -> String {
+            format!("export function Component() {{\n  return <div>{name}</div>;\n}}\n")
+        };
+        let region_list = page("RegionList");
+        let region_create = page("RegionCreate");
+        let product_list = page("ProductList");
+        let project = Project::new()
+            .file(
+                "package.json",
+                "{\"name\":\"admin\",\"dependencies\":{\"react\":\"^18\",\"react-router-dom\":\"^6\"}}\n",
+            )
+            .file(
+                "src/Shell.tsx",
+                "import { Outlet } from 'react-router-dom';\n\nexport function Shell() {\n  return <main><Outlet /></main>;\n}\n",
+            )
+            .file(
+                "src/router.tsx",
+                "import { createBrowserRouter, Outlet } from 'react-router-dom';\nimport { Shell } from './Shell';\n\nexport const router = createBrowserRouter([\n  {\n    element: <Shell />,\n    children: [\n      {\n        path: '/regions',\n        element: <Outlet />,\n        children: [\n          { path: '', lazy: () => import('./pages/region-list') },\n          { path: 'create', lazy: () => import('./pages/region-create') },\n        ],\n      },\n      {\n        path: '/products',\n        Component: Outlet,\n        children: [{ index: true, lazy: () => import('./pages/product-list') }],\n      },\n      { path: '/approvals', element: <Outlet /> },\n      { path: '/agents/:agentId', Component: Outlet },\n    ],\n  },\n]);\n",
+            )
+            .file(
+                "src/errors/router.tsx",
+                "import { createBrowserRouter, Outlet } from 'react-router-dom';\nimport { Layout, Project, RootErrorBoundary } from './routes';\n\nexport const router = createBrowserRouter([\n  {\n    path: '/',\n    element: <Layout />,\n    children: [\n      {\n        path: '',\n        element: <Outlet />,\n        errorElement: <RootErrorBoundary />,\n        children: [{ path: 'projects/:projectId', element: <Project /> }],\n      },\n    ],\n  },\n]);\n",
+            )
+            .file(
+                "src/errors/routes.tsx",
+                "import { Outlet } from 'react-router-dom';\n\nexport function Layout() {\n  return <div><Outlet /></div>;\n}\n\nexport function Project() {\n  return <div>Project</div>;\n}\n\nexport function RootErrorBoundary() {\n  return <div>Error</div>;\n}\n",
+            )
+            .file(
+                "src/Nav.tsx",
+                "import { useNavigate } from 'react-router-dom';\n\nexport function Nav() {\n  const navigate = useNavigate();\n  const openApprovals = () => navigate('/approvals');\n  const openAgent = (id: string) => navigate(`/agents/${id}`);\n  return <nav><button onClick={openApprovals} /><button onClick={() => openAgent('a')} /></nav>;\n}\n",
+            )
+            .file("src/pages/region-list.tsx", &region_list)
+            .file("src/pages/region-create.tsx", &region_create)
+            .file("src/pages/product-list.tsx", &product_list)
+            .index();
+        let graph = project.graph();
+        let report = graph.report();
+        assert_eq!(
+            routes(graph),
+            [
+                "/",
+                "/agents/:agentId",
+                "/approvals",
+                "/products",
+                "/projects/:projectId",
+                "/regions",
+                "/regions/create"
+            ],
+            "{report}"
+        );
+        assert_eq!(
+            bindings(graph),
+            strings(&[
+                "/ -> Layout@src/errors/routes.tsx",
+                "/agents/:agentId ~> Shell@src/Shell.tsx",
+                "/approvals ~> Shell@src/Shell.tsx",
+                "/products -> Component@src/pages/product-list.tsx",
+                "/products ~> Shell@src/Shell.tsx",
+                "/projects/:projectId -> Project@src/errors/routes.tsx",
+                "/projects/:projectId ~> Layout@src/errors/routes.tsx",
+                "/regions -> Component@src/pages/region-list.tsx",
+                "/regions ~> Shell@src/Shell.tsx",
+                "/regions/create -> Component@src/pages/region-create.tsx",
+                "/regions/create ~> Shell@src/Shell.tsx",
+            ]),
+            "{report}"
+        );
+        assert_eq!(
+            navigations(graph),
+            [
+                "openAgent -> /agents/:agentId (navigate /agents/${…}) react-router",
+                "openApprovals -> /approvals (navigate /approvals) react-router",
+            ],
+            "{report}"
+        );
+        assert!(
+            !graph
+                .unresolved
+                .iter()
+                .any(|r| r.from_node_id.starts_with("route:")
+                    && matches!(r.reference_name.as_str(), "Outlet" | "layout:Outlet")),
+            "{report}"
+        );
+    }
+
+    /// KEEP-RUST: upstream's `addRouteTo` keeps the first route at a path in
+    /// node order, which a sync changes; a path two routes of one app serve
+    /// stays unresolved instead, and each app of a monorepo answers its own
+    /// calls.
+    #[test]
+    fn keep_rust_a_path_two_routes_of_an_app_serve_stays_unresolved() {
+        let project = Project::new()
+            .file("package.json", "{\"name\":\"mono\",\"private\":true}\n")
+            .file(
+                "apps/web/package.json",
+                "{\"name\":\"web\",\"dependencies\":{\"react\":\"18\",\"react-router-dom\":\"6\"}}\n",
+            )
+            .file(
+                "apps/admin/package.json",
+                "{\"name\":\"admin\",\"dependencies\":{\"react\":\"18\",\"react-router-dom\":\"6\"}}\n",
+            )
+            .file(
+                "apps/web/src/App.tsx",
+                "import { Routes, Route } from 'react-router-dom';\nexport function App() {\n  return <Routes>\n    <Route path=\"/login\" element={<Login />} />\n    <Route path=\"/help\" element={<Help />} />\n  </Routes>;\n}\nfunction Login() { return null; }\nfunction Help() { return null; }\n",
+            )
+            .file(
+                "apps/web/src/Other.tsx",
+                "import { Routes, Route } from 'react-router-dom';\nexport function Other() {\n  return <Routes>\n    <Route path=\"/help\" element={<HelpAgain />} />\n  </Routes>;\n}\nfunction HelpAgain() { return null; }\n",
+            )
+            .file(
+                "apps/admin/src/App.tsx",
+                "import { Routes, Route } from 'react-router-dom';\nexport function AdminApp() {\n  return <Routes>\n    <Route path=\"/login\" element={<AdminLogin />} />\n  </Routes>;\n}\nfunction AdminLogin() { return null; }\n",
+            )
+            .file(
+                "apps/web/src/Nav.tsx",
+                "import { useNavigate } from 'react-router-dom';\nexport function webLogin() {\n  const navigate = useNavigate();\n  navigate('/login');\n}\nexport function webHelp() {\n  const navigate = useNavigate();\n  navigate('/help');\n}\n",
+            )
+            .file(
+                "apps/admin/src/Nav.tsx",
+                "import { useNavigate } from 'react-router-dom';\nexport function adminLogin() {\n  const navigate = useNavigate();\n  navigate('/login');\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        assert_eq!(
+            navigations(graph),
+            [
+                "adminLogin -> /login (navigate /login) react-router",
+                "webLogin -> /login (navigate /login) react-router",
+            ],
+            "{}",
+            graph.report()
+        );
+        graph.assert_edge(
+            "function webLogin",
+            "navigates",
+            "route apps/web/src/App.tsx::route:/login",
+            Some("framework"),
+        );
+        graph.assert_edge(
+            "function adminLogin",
+            "navigates",
+            "route apps/admin/src/App.tsx::route:/login",
+            Some("framework"),
+        );
+        graph.assert_unresolved("function webHelp", "calls", "navigate");
+    }
+}
+
 mod explore_flow {
     use super::support::{Project, codegraph};
 
