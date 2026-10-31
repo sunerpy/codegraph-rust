@@ -5,6 +5,7 @@
 //!
 //! Each reader reports what it read or probed in the same traversal that
 //! reads it ([`codegraph_resolve::path_aliases::alias_config_inputs`],
+//! [`codegraph_resolve::path_aliases::nearest_alias_inputs`],
 //! [`codegraph_resolve::workspace_packages::workspace_inputs`],
 //! [`codegraph_resolve::package_manifests::manifest_inputs`],
 //! [`codegraph_resolve::csharp_types::csharp_project_inputs`],
@@ -213,6 +214,11 @@ pub fn digests_of(kind: ControlKind, project_root: &Path, files: &[FileRecord]) 
                 .filter(|file| kind.reads_from(&file.path, file.language))
                 .map(|file| file.path.clone())
                 .collect();
+            // The configs nearer a file than the root's, which its imports
+            // try first (upstream #2165).
+            for path in codegraph_resolve::path_aliases::nearest_alias_inputs(&root, &js) {
+                out.insert(key_of(project_root, &path), file_digest(&path));
+            }
             for relative in codegraph_resolve::package_manifests::manifest_inputs(&js) {
                 let digest = file_digest(&project_root.join(&relative));
                 out.insert(relative, digest);

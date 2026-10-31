@@ -10153,6 +10153,121 @@ pub fn typescript_tsconfig_extends_target_appears() -> Case {
         .edge_after("file:src/main.ts", "imports", "function double")
 }
 
+/// The two `format` modules an app's `@/lib/format` import may name: the
+/// root's alias sends it to `shared/`, the app's own to its `src/`.
+fn app_alias_files(case: Case) -> Case {
+    case.file(
+        "tsconfig.json",
+        "{\"compilerOptions\":{\"baseUrl\":\".\",\"paths\":{\"@/*\":[\"./shared/*\"]}}}",
+    )
+    .file(
+        "shared/lib/format.ts",
+        "export function format(value: number): string {\n  return String(value);\n}\n",
+    )
+    .file(
+        "apps/web/src/lib/format.ts",
+        "export function format(value: number): string {\n  return value.toFixed(2);\n}\n",
+    )
+    .file(
+        "apps/web/src/main.ts",
+        "import { format } from '@/lib/format';\n\nexport function render(): string {\n  return format(1);\n}\n",
+    )
+}
+
+/// W7-09a (upstream #2165): an app's own tsconfig appearing with `paths`
+/// takes its imports from the root's alias to its own, as a fresh index
+/// reads the nearest config first.
+pub fn typescript_app_tsconfig_paths_appear() -> Case {
+    app_alias_files(Case::new(Change::ControlFile, &[Language::TypeScript]))
+        .edge_before(
+            "file:apps/web/src/main.ts",
+            "imports",
+            "function format @shared/lib/format.ts",
+        )
+        .write(
+            "apps/web/tsconfig.json",
+            "{\"compilerOptions\":{\"baseUrl\":\".\",\"paths\":{\"@/*\":[\"./src/*\"]}}}",
+        )
+        .edge_after(
+            "file:apps/web/src/main.ts",
+            "imports",
+            "function format @apps/web/src/lib/format.ts",
+        )
+}
+
+/// W7-09a: an app's tsconfig losing its `paths` gives its imports back to
+/// the root's alias.
+pub fn typescript_app_tsconfig_paths_retarget_to_the_root() -> Case {
+    app_alias_files(Case::new(Change::ControlFile, &[Language::TypeScript]))
+        .file(
+            "apps/web/tsconfig.json",
+            "{\"compilerOptions\":{\"baseUrl\":\".\",\"paths\":{\"@/*\":[\"./src/*\"]}}}",
+        )
+        .edge_before(
+            "file:apps/web/src/main.ts",
+            "imports",
+            "function format @apps/web/src/lib/format.ts",
+        )
+        .write(
+            "apps/web/tsconfig.json",
+            "{\"compilerOptions\":{\"strict\":true}}",
+        )
+        .edge_after(
+            "file:apps/web/src/main.ts",
+            "imports",
+            "function format @shared/lib/format.ts",
+        )
+}
+
+/// W7-09a: an app's tsconfig deleted, its imports fall back to the root's
+/// alias.
+pub fn typescript_app_tsconfig_is_deleted() -> Case {
+    app_alias_files(Case::new(Change::ControlFile, &[Language::TypeScript]))
+        .file(
+            "apps/web/tsconfig.json",
+            "{\"compilerOptions\":{\"baseUrl\":\".\",\"paths\":{\"@/*\":[\"./src/*\"]}}}",
+        )
+        .edge_before(
+            "file:apps/web/src/main.ts",
+            "imports",
+            "function format @apps/web/src/lib/format.ts",
+        )
+        .remove("apps/web/tsconfig.json")
+        .edge_after(
+            "file:apps/web/src/main.ts",
+            "imports",
+            "function format @shared/lib/format.ts",
+        )
+}
+
+/// W7-09a: an app's jsconfig appearing beside its sources gives it `~/*`,
+/// which no root config declares (LibreChat's `client/`). The namesake
+/// beside the importer is the one a bare-name match would pick.
+pub fn javascript_app_jsconfig_paths_appear() -> Case {
+    Case::new(Change::ControlFile, &[Language::JavaScript])
+        .file(
+            "client/src/lib/format.js",
+            "export function format(value) {\n  return String(value);\n}\n",
+        )
+        .file(
+            "client/src/format.js",
+            "export function format(value) {\n  return `${value}`;\n}\n",
+        )
+        .file(
+            "client/src/main.js",
+            "import { format } from '~/lib/format';\n\nexport function render() {\n  return format(1);\n}\n",
+        )
+        .write(
+            "client/jsconfig.json",
+            "{\"compilerOptions\":{\"paths\":{\"~/*\":[\"./src/*\"]}}}",
+        )
+        .edge_after(
+            "file:client/src/main.js",
+            "imports",
+            "function format @client/src/lib/format.js",
+        )
+}
+
 /// W5-06: `paths` pointed elsewhere moves what a barrel's alias source
 /// resolves to, and the import through the barrel follows.
 pub fn typescript_paths_retarget_moves_a_barrel_source() -> Case {

@@ -174,7 +174,10 @@ an enclosing one, declares the package (a `workspace:`, `file:` or `link:`
 dependency is the repository's own, and a Deno import map counts), or it is a
 Node built-in, `@std/…`, a runtime scheme (`node:`, `npm:`, `jsr:`) or a
 framework's virtual module (`$app/…`, `astro:…`); an alias the resolver does
-not follow (`$lib/…`, `~/…`) stays the project's. Calls in Vue, Svelte and
+not follow (`$lib/…`, `~/…`) stays the project's. A JS-family import's path
+alias comes from the `tsconfig.json` or `jsconfig.json` nearest the importing
+file below the root that declares `paths` (a monorepo app's own `@/*`, upstream
+#2165), then from the root's. Calls in Vue, Svelte and
 Astro components follow the JS/TS rules and, like ArkTS, see the JS
 built-ins, unless the file imports its own binding of the built-in's name.
 A result that lands on
@@ -603,7 +606,8 @@ it, however many there are; while it resolves, a sync whose rows were current
 as it started reads the heads of a file it neither rebuilds nor removes from
 that file's row rather than its source; the `class_heads_version` marker is
 withdrawn and restored with the others. Resolution also reads control files, which are no
-source files: the JS/TS path-alias configs along their `extends` chains, the
+source files: the JS/TS path-alias configs along their `extends` chains (the
+root's, and those in each directory above a JavaScript-family file), the
 workspace manifests and the folders a workspace glob lists, the `package.json`
 and Deno manifests above each JavaScript-family file and the `package.json`
 files framework detection reads, the C# project files

@@ -244,6 +244,60 @@ fn pr2437_alias_into_node_modules_keeps_the_import_external() {
     assert_unresolved!(project, "file:src/card.ts" => imports => "format");
 }
 
+/// Upstream #2165 (W7-09a): an import tries the tsconfig nearest its file
+/// before the root's, so each app of a monorepo resolves its own `@/*`, and
+/// an app declaring `~/*` only in its own config (LibreChat's `client/`)
+/// resolves it at all. A file outside every app keeps the root's alias.
+#[test]
+fn pr2165_each_app_resolves_its_own_tsconfig_alias() {
+    let format = "export function format(value: number): string {\n  return String(value);\n}\n";
+    let main = |spec: &str| {
+        format!(
+            "import {{ format }} from '{spec}';\n\nexport function render(): string {{\n  return format(1);\n}}\n"
+        )
+    };
+    let project = Project::new()
+        .file(
+            "tsconfig.json",
+            "{\n  \"compilerOptions\": {\n    \"baseUrl\": \".\",\n    \"paths\": { \"@/*\": [\"./shared/*\"] }\n  }\n}\n",
+        )
+        .file("shared/lib/format.ts", format)
+        .file(
+            "apps/web/tsconfig.json",
+            "{\n  \"compilerOptions\": {\n    \"baseUrl\": \".\",\n    \"paths\": { \"@/*\": [\"./src/*\"] }\n  }\n}\n",
+        )
+        .file("apps/web/src/lib/format.ts", format)
+        .file("apps/web/src/main.ts", &main("@/lib/format"))
+        .file(
+            "client/tsconfig.json",
+            "{\n  \"compilerOptions\": {\n    \"paths\": { \"~/*\": [\"./src/*\"] }\n  }\n}\n",
+        )
+        .file("client/src/lib/format.ts", format)
+        .file("client/src/main.ts", &main("~/lib/format"))
+        .file("tools/report.ts", &main("@/lib/format"))
+        .index();
+
+    assert_edge!(
+        project,
+        "file:apps/web/src/main.ts" => imports => "function format @apps/web/src/lib/format.ts",
+        resolved_by = "import",
+    );
+    assert_no_edge!(
+        project,
+        "file:apps/web/src/main.ts" => imports => "function format @shared/lib/format.ts"
+    );
+    assert_edge!(
+        project,
+        "file:client/src/main.ts" => imports => "function format @client/src/lib/format.ts",
+        resolved_by = "import",
+    );
+    assert_edge!(
+        project,
+        "file:tools/report.ts" => imports => "function format @shared/lib/format.ts",
+        resolved_by = "import",
+    );
+}
+
 /// W3: the cross-language resolution seams (plan section 3 "W3"). Every probe
 /// of this wave sits here, so `cargo test --test probes -- seams` runs them.
 mod seams {

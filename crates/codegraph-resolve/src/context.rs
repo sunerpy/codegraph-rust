@@ -8,7 +8,7 @@
 
 use crate::lru_cache::LruCache;
 use crate::package_manifests::{ManifestScope, read_manifest_scope};
-use crate::path_aliases::{AliasMap, load_project_aliases};
+use crate::path_aliases::{AliasMap, load_directory_aliases, load_project_aliases};
 use crate::source_facts::SourceFacts;
 use crate::types::{GoModule, ImportMapping, ReExport, ResolutionContext};
 use crate::workspace_packages::{WorkspacePackages, load_workspace_packages};
@@ -58,6 +58,8 @@ struct Caches {
     /// The name matcher's memos for the pass (W5-08).
     name_matcher_tables: Option<Arc<crate::name_matcher::NameMatcherTables>>,
     project_aliases: Option<Option<AliasMap>>,
+    /// Each directory's nearest aliases below the root (upstream #2165).
+    dir_aliases: HashMap<String, Option<AliasMap>>,
     go_module: Option<Option<GoModule>>,
     go_modules: Option<Vec<GoModule>>,
     rust_crates: Option<Arc<crate::rust_scope::RustCrates>>,
@@ -137,6 +139,7 @@ impl Caches {
             head_rows: HashMap::new(),
             name_matcher_tables: None,
             project_aliases: None,
+            dir_aliases: HashMap::new(),
             go_module: None,
             go_modules: None,
             rust_crates: None,
@@ -583,6 +586,30 @@ impl ResolutionContext for StoreResolutionContext<'_> {
             c.project_aliases = Some(loaded);
         }
         c.project_aliases.clone().flatten()
+    }
+
+    fn get_nearest_aliases(&self, from_file: &str) -> Option<AliasMap> {
+        let walk = crate::path_aliases::nearest_alias_walk(from_file);
+        let mut walked = Vec::new();
+        let mut found = None;
+        for dir in walk {
+            if let Some(hit) = self.caches.borrow().dir_aliases.get(dir) {
+                found = hit.clone();
+                break;
+            }
+            walked.push(dir);
+            if let Some(aliases) =
+                load_directory_aliases(&std::path::Path::new(&self.project_root).join(dir))
+            {
+                found = Some(aliases);
+                break;
+            }
+        }
+        let mut c = self.caches.borrow_mut();
+        for dir in walked {
+            c.dir_aliases.insert(dir.to_string(), found.clone());
+        }
+        found
     }
 
     fn get_workspace_packages(&self) -> Option<WorkspacePackages> {
@@ -1552,6 +1579,49 @@ mod tests {
         assert!(ctx.get_workspace_packages().is_some());
         assert!(ctx.get_go_module().is_some());
         assert!(ctx.get_go_module().is_some());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// W7-09a (upstream #2165): a file's nearest aliases are those of the
+    /// first directory up from it, below the root, whose own config declares
+    /// `paths`; a directory without one passes the lookup up, and a file
+    /// with none between it and the root has none.
+    #[test]
+    fn store_context_reads_the_nearest_configs_aliases() {
+        let root = temp_root("nearest-aliases");
+        std::fs::create_dir_all(root.join("apps/web/src/pages")).unwrap();
+        std::fs::create_dir_all(root.join("apps/docs")).unwrap();
+        std::fs::write(
+            root.join("tsconfig.json"),
+            r#"{ "compilerOptions": { "paths": { "@/*": ["src/*"] } } }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("apps/web/tsconfig.json"),
+            r#"{ "compilerOptions": { "paths": { "@/*": ["./src/*"] } } }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("apps/web/src/tsconfig.json"),
+            r#"{ "compilerOptions": { "strict": true } }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("apps/docs/tsconfig.json"),
+            r#"{ "compilerOptions": { "strict": true } }"#,
+        )
+        .unwrap();
+        let store = open_store(&root);
+        let ctx = StoreResolutionContext::new(&store, root.to_str().unwrap());
+        for _ in 0..2 {
+            let web = ctx
+                .get_nearest_aliases("apps/web/src/pages/a.tsx")
+                .expect("the web app's aliases");
+            assert!(web.base_url.ends_with("/apps/web"));
+        }
+        assert!(ctx.get_nearest_aliases("apps/docs/a.ts").is_none());
+        assert!(ctx.get_nearest_aliases("a.ts").is_none());
+        assert!(ctx.get_nearest_aliases("../a.ts").is_none());
         std::fs::remove_dir_all(&root).ok();
     }
 

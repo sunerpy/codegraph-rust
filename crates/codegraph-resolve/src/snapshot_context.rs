@@ -30,7 +30,7 @@
 use crate::context::{DEFAULT_CACHE_LIMIT, order_candidates};
 use crate::import_resolver;
 use crate::package_manifests::{ManifestScope, read_manifest_scope};
-use crate::path_aliases::{AliasMap, load_project_aliases};
+use crate::path_aliases::{AliasMap, load_directory_aliases, load_project_aliases};
 use crate::pathutil;
 use crate::source_facts::SourceFacts;
 use crate::types::{GoModule, ImportMapping, ReExport, ResolutionContext};
@@ -182,6 +182,8 @@ struct SnapshotCaches {
     /// Each directory's package.json / Deno import-map scope (upstream
     /// #2128 `manifestScopes`).
     manifest_scopes: BoundedFileMemo<Arc<ManifestScope>>,
+    /// Each directory's nearest aliases below the root (upstream #2165).
+    dir_aliases: BoundedFileMemo<Option<AliasMap>>,
     /// Each file's functions and methods by qualified name (W5-08).
     function_scopes: BoundedFileMemo<Arc<crate::name_matcher::FileCallables>>,
     /// Each file's methods by owner and name (W5-08).
@@ -224,6 +226,7 @@ impl SnapshotCaches {
             re_exports: BoundedFileMemo::new(DEFAULT_CACHE_LIMIT),
             fs_exists: BoundedFileMemo::new(crate::context::FILE_EXISTS_MEMO_LIMIT),
             manifest_scopes: BoundedFileMemo::new(DEFAULT_CACHE_LIMIT),
+            dir_aliases: BoundedFileMemo::new(DEFAULT_CACHE_LIMIT),
             function_scopes: BoundedFileMemo::new(DEFAULT_CACHE_LIMIT),
             file_methods: BoundedFileMemo::new(DEFAULT_CACHE_LIMIT),
             name_matcher_tables: OnceLock::new(),
@@ -296,6 +299,18 @@ pub struct SnapshotResolutionContext {
 }
 
 impl SnapshotResolutionContext {
+    /// The nearest aliases from the first of `dirs` (a walk from
+    /// [`crate::path_aliases::nearest_alias_walk`]) upward: that directory's
+    /// own, else the next one's. A directory's parent is another key, so the
+    /// memo never re-enters the entry it is filling.
+    fn nearest_aliases_from(&self, dirs: &[&str]) -> Option<AliasMap> {
+        let (dir, above) = dirs.split_first()?;
+        self.caches.dir_aliases.get_or_init(dir, || {
+            load_directory_aliases(&std::path::Path::new(&self.snapshot.project_root).join(dir))
+                .or_else(|| self.nearest_aliases_from(above))
+        })
+    }
+
     /// Build the WHOLE-RUN snapshot from the live `store` rooted at
     /// `project_root`, with an empty per-chunk edge map.
     ///
@@ -729,6 +744,10 @@ impl ResolutionContext for SnapshotResolutionContext {
         self.snapshot.project_aliases.clone()
     }
 
+    fn get_nearest_aliases(&self, from_file: &str) -> Option<AliasMap> {
+        self.nearest_aliases_from(&crate::path_aliases::nearest_alias_walk(from_file))
+    }
+
     fn get_workspace_packages(&self) -> Option<WorkspacePackages> {
         self.snapshot.workspace_packages.clone()
     }
@@ -1050,6 +1069,40 @@ mod tests {
             }])
             .unwrap();
         store
+    }
+
+    /// W7-09a (upstream #2165): the snapshot reads a file's nearest aliases
+    /// as the store context does, from the first directory up whose own
+    /// config declares `paths`, and none below the root's.
+    #[test]
+    fn a_snapshot_reads_the_nearest_configs_aliases() {
+        let root = temp_root("nearest-aliases");
+        std::fs::create_dir_all(root.join("apps/web/src/pages")).unwrap();
+        std::fs::write(
+            root.join("apps/web/tsconfig.json"),
+            r#"{ "compilerOptions": { "paths": { "@/*": ["./src/*"] } } }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("apps/web/src/tsconfig.json"),
+            r#"{ "compilerOptions": { "strict": true } }"#,
+        )
+        .unwrap();
+        let store = Store::open(&root.join("index.db")).expect("open");
+        let ctx = SnapshotResolutionContext::from_store(&store, root.to_str().unwrap()).unwrap();
+        for file in [
+            "apps/web/src/pages/a.tsx",
+            "apps/web/src/b.tsx",
+            "apps/web/c.ts",
+        ] {
+            let web = ctx
+                .get_nearest_aliases(file)
+                .expect("the web app's aliases");
+            assert!(web.base_url.ends_with("/apps/web"), "{file}");
+        }
+        assert!(ctx.get_nearest_aliases("apps/other/a.ts").is_none());
+        assert!(ctx.get_nearest_aliases("a.ts").is_none());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// W7-07: a snapshot's routers share one set of route tables.

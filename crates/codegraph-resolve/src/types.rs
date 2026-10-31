@@ -563,6 +563,15 @@ pub trait ResolutionContext {
         None
     }
 
+    /// The aliases of the tsconfig or jsconfig nearest `from_file` below the
+    /// project root that declares `paths` (upstream #2165
+    /// `getNearestAliases`): a monorepo app's own `@/*`. `None` when no
+    /// directory between the file's and the root has one. The store and
+    /// snapshot contexts keep each directory's answer for the pass.
+    fn get_nearest_aliases(&self, _from_file: &str) -> Option<crate::path_aliases::AliasMap> {
+        None
+    }
+
     /// Monorepo workspace member packages (`getWorkspacePackages?`). `None` for
     /// single-package repos (`types.ts:113-118`).
     fn get_workspace_packages(&self) -> Option<crate::workspace_packages::WorkspacePackages> {
