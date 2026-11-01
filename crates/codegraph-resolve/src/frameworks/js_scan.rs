@@ -136,6 +136,103 @@ pub(crate) fn top_level_items(text: &str) -> Vec<&str> {
     out
 }
 
+/// One field [`read_fields`] reads of an object literal: its key, its value's
+/// text, and where the key starts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ObjectField<'s> {
+    pub key: &'s str,
+    pub text: &'s str,
+    pub at: usize,
+}
+
+/// An object literal's own fields, in the order they are written, the first
+/// of a key kept (upstream `readFields`): `s[start]` opens the object and
+/// `end` closes it. A bracket group, string or template inside is stepped
+/// over, and a value runs to the next comma at the object's own depth. A
+/// shorthand, a method or a quoted key is no field.
+pub(crate) fn read_fields(s: &str, start: usize, end: usize) -> Vec<ObjectField<'_>> {
+    let bytes = s.as_bytes();
+    let mut out: Vec<ObjectField<'_>> = Vec::new();
+    let mut i = start + 1;
+    while i < end {
+        match bytes[i] {
+            b'"' | b'\'' | b'`' => {
+                let Some(close) = skip_string(s, i) else {
+                    return out;
+                };
+                i = close + 1;
+                continue;
+            }
+            b'{' | b'[' | b'(' => {
+                let Some(close) = match_bracket(s, i) else {
+                    return out;
+                };
+                i = close + 1;
+                continue;
+            }
+            _ => {}
+        }
+        let Some((key, value_at)) = field_key(s, i) else {
+            i += 1;
+            continue;
+        };
+        let mut j = value_at;
+        while j < end {
+            match bytes[j] {
+                b'"' | b'\'' | b'`' => {
+                    let Some(close) = skip_string(s, j) else {
+                        return out;
+                    };
+                    j = close + 1;
+                }
+                b'{' | b'[' | b'(' => {
+                    let Some(close) = match_bracket(s, j) else {
+                        return out;
+                    };
+                    j = close + 1;
+                }
+                b',' => break,
+                _ => j += 1,
+            }
+        }
+        if !out.iter().any(|field| field.key == key) {
+            out.push(ObjectField {
+                key,
+                text: &s[value_at..j],
+                at: i,
+            });
+        }
+        i = j + 1;
+    }
+    out
+}
+
+/// The field key written at `at` and where its value starts, past the `:`
+/// (upstream's `^([A-Za-z_$][\w$]*)\s*:` within 64 code units).
+fn field_key(s: &str, at: usize) -> Option<(&str, usize)> {
+    let bytes = s.as_bytes();
+    let limit = (at + 64).min(s.len());
+    if !bytes
+        .get(at)
+        .is_some_and(|&b| b.is_ascii_alphabetic() || b == b'_' || b == b'$')
+    {
+        return None;
+    }
+    let mut i = at + 1;
+    while i < limit && (bytes[i].is_ascii_alphanumeric() || matches!(bytes[i], b'_' | b'$')) {
+        i += 1;
+    }
+    let key = &s[at..i];
+    while i < limit {
+        let c = s[i..].chars().next()?;
+        if !is_js_space(c) {
+            break;
+        }
+        i += c.len_utf8();
+    }
+    (i < limit && bytes[i] == b':').then_some((key, i + 1))
+}
+
 /// Where a declarator's initializer starts in `body`, scanning from `at`
 /// past its `: Type` and `=`; `None` when it has none (upstream
 /// `initializerAt`).
@@ -412,5 +509,37 @@ mod tests {
         ] {
             assert_eq!(wrapped_name(expression), name, "{expression}");
         }
+    }
+
+    #[test]
+    fn an_object_literal_reads_its_own_keyed_fields_first_of_a_key_kept() {
+        let s = "{ to: '/a', search: { x: 1, to: 2 }, to: '/b', go() { return 1 }, short, 'q': 3, list: [1, 2], last: f(1, 2) }";
+        let fields = read_fields(s, 0, s.len() - 1);
+        assert_eq!(
+            fields
+                .iter()
+                .map(|field| (field.key, field.text.trim()))
+                .collect::<Vec<_>>(),
+            [
+                ("to", "'/a'"),
+                ("search", "{ x: 1, to: 2 }"),
+                ("list", "[1, 2]"),
+                ("last", "f(1, 2)"),
+            ]
+        );
+        assert!(
+            fields
+                .iter()
+                .all(|field| s[field.at..].starts_with(field.key))
+        );
+        // A string the object never closes ends the reading there.
+        let s = "{ a: 1, b: `x, c: 2 }";
+        assert_eq!(
+            read_fields(s, 0, s.len() - 1)
+                .iter()
+                .map(|field| field.key)
+                .collect::<Vec<_>>(),
+            ["a"]
+        );
     }
 }

@@ -11209,6 +11209,185 @@ pub fn typescript_expo_api_route_body_edit() -> Case {
         )
 }
 
+// ----- TanStack Router (W7-10) ----------------------------------------------
+
+/// The package of the W7-10 cases.
+const TANSTACK_PACKAGE: &str =
+    "{\"name\":\"app\",\"dependencies\":{\"react\":\"19\",\"@tanstack/react-router\":\"1\"}}\n";
+
+/// A file route at `/settings` rendering `Settings`.
+const TANSTACK_SETTINGS: &str = "import { createFileRoute } from '@tanstack/react-router'\nexport const Route = createFileRoute('/settings')({ component: Settings })\nfunction Settings() {\n  return null\n}\n";
+/// A file route at `/profile` rendering `Profile`.
+const TANSTACK_PROFILE: &str = "import { createFileRoute } from '@tanstack/react-router'\nexport const Route = createFileRoute('/profile')({ component: Profile })\nfunction Profile() {\n  return null\n}\n";
+/// A file route at `/posts/$postId` rendering `Post`.
+const TANSTACK_POST: &str = "import { createFileRoute } from '@tanstack/react-router'\nexport const Route = createFileRoute('/posts/$postId')({ component: Post })\nfunction Post() {\n  return null\n}\n";
+/// A file route at `/posts/new` rendering `NewPost`.
+const TANSTACK_NEW_POST: &str = "import { createFileRoute } from '@tanstack/react-router'\nexport const Route = createFileRoute('/posts/new')({ component: NewPost })\nfunction NewPost() {\n  return null\n}\n";
+
+/// W7-10 (upstream F5): a navigation call's file is edited to name another
+/// route: the `navigates` edge follows the pattern.
+pub fn typescript_tanstack_navigation_call_names_another_route() -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript, Language::Tsx])
+        .file("package.json", TANSTACK_PACKAGE)
+        .file("src/routes/settings.tsx", TANSTACK_SETTINGS)
+        .file("src/routes/profile.tsx", TANSTACK_PROFILE)
+        .file(
+            "src/lib/nav.ts",
+            "export function open(navigate) {\n  navigate({ to: '/settings' })\n}\n",
+        )
+        .write(
+            "src/lib/nav.ts",
+            "export function open(navigate) {\n  navigate({ to: '/profile' })\n}\n",
+        )
+        .edge_before(
+            "function open",
+            "navigates",
+            "route src/routes/settings.tsx::route:/settings",
+        )
+        .edge_after(
+            "function open",
+            "navigates",
+            "route src/routes/profile.tsx::route:/profile",
+        )
+        .no_edge_after(
+            "function open",
+            "navigates",
+            "route src/routes/settings.tsx::route:/settings",
+        )
+        .edge_metadata_after(
+            (
+                "function open",
+                "navigates",
+                "route src/routes/profile.tsx::route:/profile",
+            ),
+            "framework",
+            "tanstack-router",
+        )
+}
+
+/// W7-10 (upstream F5): a route's body is edited: it still calls its
+/// component, and the call in another file still navigates to it by its
+/// pattern.
+pub fn tsx_tanstack_route_body_edit_keeps_its_navigations() -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript, Language::Tsx])
+        .file("package.json", TANSTACK_PACKAGE)
+        .file(
+            "src/routes/posts.$postId.tsx",
+            TANSTACK_POST,
+        )
+        .file(
+            "src/lib/nav.ts",
+            "export function openPost(navigate, postId) {\n  navigate({ to: '/posts/$postId', params: { postId } })\n}\n",
+        )
+        .write(
+            "src/routes/posts.$postId.tsx",
+            "import { createFileRoute } from '@tanstack/react-router'\nexport const Route = createFileRoute('/posts/$postId')({ component: Post })\nfunction Post() {\n  return <article />\n}\n",
+        )
+        .edge_throughout(
+            "route src/routes/posts.$postId.tsx::route:/posts/:postId",
+            "calls",
+            "function Post",
+        )
+        .edge_throughout(
+            "function openPost",
+            "navigates",
+            "route src/routes/posts.$postId.tsx::route:/posts/:postId",
+        )
+}
+
+/// W7-10 (upstream F5): the static route a call names is deleted: the call
+/// navigates to the dynamic route that now serves its path.
+pub fn tsx_tanstack_static_route_delete_falls_back_to_the_dynamic_route() -> Case {
+    Case::new(
+        Change::DeleteImportedModule,
+        &[Language::TypeScript, Language::Tsx],
+    )
+    .file("package.json", TANSTACK_PACKAGE)
+    .file("src/routes/posts.new.tsx", TANSTACK_NEW_POST)
+    .file("src/routes/posts.$postId.tsx", TANSTACK_POST)
+    .file(
+        "src/lib/nav.ts",
+        "export function create(navigate) {\n  navigate({ to: '/posts/new' })\n}\n",
+    )
+    .remove("src/routes/posts.new.tsx")
+    .edge_before(
+        "function create",
+        "navigates",
+        "route src/routes/posts.new.tsx::route:/posts/new",
+    )
+    .edge_after(
+        "function create",
+        "navigates",
+        "route src/routes/posts.$postId.tsx::route:/posts/:postId",
+    )
+}
+
+/// W7-10 (upstream F5): the manifest comes to declare TanStack Router: its
+/// files' routes appear and a call names one, though no source changed.
+pub fn typescript_tanstack_router_dependency_appears_in_package_json() -> Case {
+    Case::new(Change::ControlFile, &[Language::TypeScript, Language::Tsx])
+        .file(
+            "package.json",
+            "{\"name\":\"app\",\"dependencies\":{\"react\":\"19\"}}\n",
+        )
+        .file("src/routes/settings.tsx", TANSTACK_SETTINGS)
+        .file(
+            "src/lib/nav.ts",
+            "export function open(navigate) {\n  navigate({ to: '/settings' })\n}\n",
+        )
+        .write("package.json", TANSTACK_PACKAGE)
+        .edge_after(
+            "route src/routes/settings.tsx::route:/settings",
+            "calls",
+            "function Settings",
+        )
+        .edge_after(
+            "function open",
+            "navigates",
+            "route src/routes/settings.tsx::route:/settings",
+        )
+}
+
+/// The code-based route tree the W7-10 reparenting case edits. It exports
+/// the tree: in a module that exports nothing, a route is no other file's to
+/// reach (KEEP-RUST, W7-10).
+const TANSTACK_CODE_TREE: &str = "import { createRootRoute, createRoute } from '@tanstack/react-router'\nconst rootRoute = createRootRoute({ component: Root })\nconst postsRoute = createRoute({\n  getParentRoute: () => rootRoute,\n  path: 'posts',\n  component: Posts,\n})\nconst postRoute = createRoute({\n  getParentRoute: () => postsRoute,\n  path: '$postId',\n  component: Post,\n})\nfunction Root() {\n  return null\n}\nfunction Posts() {\n  return null\n}\nfunction Post() {\n  return null\n}\nexport const routeTree = rootRoute.addChildren([postsRoute, postRoute])\n";
+
+/// The same tree with `postRoute` moved under the root.
+const TANSTACK_CODE_TREE_REPARENTED: &str = "import { createRootRoute, createRoute } from '@tanstack/react-router'\nconst rootRoute = createRootRoute({ component: Root })\nconst postsRoute = createRoute({\n  getParentRoute: () => rootRoute,\n  path: 'posts',\n  component: Posts,\n})\nconst postRoute = createRoute({\n  getParentRoute: () => rootRoute,\n  path: '$postId',\n  component: Post,\n})\nfunction Root() {\n  return null\n}\nfunction Posts() {\n  return null\n}\nfunction Post() {\n  return null\n}\nexport const routeTree = rootRoute.addChildren([postsRoute, postRoute])\n";
+
+/// W7-10 (upstream F5): a code route tree moves a route under another
+/// parent: its address changes, and the call that named the old address
+/// names no route, not even the moved one.
+pub fn tsx_tanstack_code_route_moves_under_another_parent() -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript, Language::Tsx])
+        .file("package.json", TANSTACK_PACKAGE)
+        .file("src/router.tsx", TANSTACK_CODE_TREE)
+        .file(
+            "src/lib/nav.ts",
+            "export function openPost(navigate, postId) {\n  navigate({ to: '/posts/$postId', params: { postId } })\n}\n",
+        )
+        .write(
+            "src/router.tsx",
+            TANSTACK_CODE_TREE_REPARENTED,
+        )
+        .edge_before(
+            "function openPost",
+            "navigates",
+            "route src/router.tsx::route:/posts/:postId",
+        )
+        .no_edge_after(
+            "function openPost",
+            "navigates",
+            "route src/router.tsx::route:/:postId",
+        )
+        .edge_after(
+            "route src/router.tsx::route:/:postId",
+            "calls",
+            "function Post",
+        )
+}
+
 /// The React Router app the W7-09b cases edit: two routes in `src/App.tsx`,
 /// their pages, and a navigation call in `src/nav.ts`.
 const REACT_ROUTER_PACKAGE: &str =

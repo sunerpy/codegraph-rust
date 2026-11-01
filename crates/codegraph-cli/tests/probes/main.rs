@@ -21714,6 +21714,145 @@ mod react_router {
     }
 }
 
+mod tanstack_router {
+    use super::support::{EdgeRow, Graph, Project};
+
+    /// The `navigates` edges out of the one function named `name`.
+    fn navigations<'g>(graph: &'g Graph, name: &str) -> Vec<&'g EdgeRow> {
+        let from = graph.nodes_named("function", name);
+        assert_eq!(from.len(), 1, "function {name}\n{}", graph.report());
+        graph
+            .edges
+            .iter()
+            .filter(|edge| edge.kind == "navigates" && edge.source == from[0].id)
+            .collect()
+    }
+
+    /// Upstream F5 (`tanstack-router.test.ts`, "a routed app end to end",
+    /// without its `<Link to>` and Screens halves, W7-18 and the viewer):
+    /// file-based routes named by their pattern, one per address, each
+    /// calling its component; `navigate({ to })` and `throw redirect({ to })`
+    /// reach the route the pattern names; a pattern nothing serves and a
+    /// search-only navigation stay unresolved.
+    #[test]
+    fn f5_a_tanstack_app_routes_and_navigates_by_pattern() {
+        let project = Project::new()
+            .file(
+                "package.json",
+                "{\"name\":\"app\",\"dependencies\":{\"react\":\"19\",\"@tanstack/react-router\":\"1\"}}\n",
+            )
+            .file(
+                "src/routes/index.tsx",
+                "import { createFileRoute, Link } from '@tanstack/react-router'\nexport const Route = createFileRoute('/')({ component: IndexComponent })\nfunction IndexComponent() {\n  return (\n    <div>\n      <Link\n        to=\"/posts/$postId\"\n        params={{ postId: 3 }}\n      >\n        A post\n      </Link>\n      <Link to=\"/login\">Sign in</Link>\n    </div>\n  )\n}\n",
+            )
+            .file(
+                "src/routes/posts.route.tsx",
+                "import { createFileRoute, Outlet } from '@tanstack/react-router'\nexport const Route = createFileRoute('/posts')({ component: PostsLayout })\nfunction PostsLayout() {\n  return <Outlet />\n}\n",
+            )
+            .file(
+                "src/routes/posts.index.tsx",
+                "import { createFileRoute } from '@tanstack/react-router'\nexport const Route = createFileRoute('/posts/')({ component: PostsIndexComponent })\nfunction PostsIndexComponent() {\n  return <div>Posts</div>\n}\n",
+            )
+            .file(
+                "src/routes/posts.$postId.tsx",
+                "import { createFileRoute } from '@tanstack/react-router'\nexport const Route = createFileRoute('/posts/$postId')({ component: PostComponent })\nfunction PostComponent() {\n  return <div>Post</div>\n}\n",
+            )
+            .file(
+                "src/routes/login.tsx",
+                "import { createFileRoute, useNavigate } from '@tanstack/react-router'\nexport const Route = createFileRoute('/login')({ component: LoginComponent })\nfunction LoginComponent() {\n  const navigate = useNavigate()\n  async function submit(creds) {\n    const ok = await signIn(creds)\n    if (ok) navigate({ to: '/dashboard' })\n  }\n  return <form onSubmit={submit} />\n}\n",
+            )
+            .file(
+                "src/routes/_auth.tsx",
+                "import { createFileRoute, redirect } from '@tanstack/react-router'\nexport const Route = createFileRoute('/_auth')({\n  beforeLoad: ({ context }) => {\n    if (context.auth.status === 'loggedOut') {\n      throw redirect({ to: '/login' })\n    }\n  },\n})\n",
+            )
+            .file(
+                "src/routes/_auth.dashboard.tsx",
+                "import { createFileRoute, Link } from '@tanstack/react-router'\nexport const Route = createFileRoute('/_auth/dashboard')({ component: DashboardComponent })\nfunction DashboardComponent() {\n  return <Link to=\"/posts\">All posts</Link>\n}\n",
+            )
+            .file(
+                "src/routes/settings.tsx",
+                "import { createFileRoute, useNavigate } from '@tanstack/react-router'\nexport const Route = createFileRoute('/settings')({ component: SettingsComponent })\nfunction SettingsComponent() {\n  const navigate = useNavigate()\n  function nowhere() {\n    navigate({ to: '/no-such-route' })\n  }\n  function filter() {\n    navigate({ search: (old) => ({ ...old, page: 2 }) })\n  }\n  return <button onClick={nowhere} />\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        let mut routes: Vec<&str> = graph
+            .nodes
+            .iter()
+            .filter(|node| node.kind == "route")
+            .map(|node| node.name.as_str())
+            .collect();
+        routes.sort_unstable();
+        assert_eq!(
+            routes,
+            [
+                "/",
+                "/dashboard",
+                "/login",
+                "/posts",
+                "/posts/:postId",
+                "/settings"
+            ],
+            "{}",
+            graph.report()
+        );
+        // `/posts` is the index page, not the `posts.route.tsx` layout beside
+        // it; `_auth.dashboard.tsx` is the page at `/dashboard`.
+        graph.assert_edge(
+            "route src/routes/posts.index.tsx::route:/posts",
+            "calls",
+            "function PostsIndexComponent",
+            None,
+        );
+        graph.assert_edge(
+            "route src/routes/_auth.dashboard.tsx::route:/dashboard",
+            "calls",
+            "function DashboardComponent",
+            None,
+        );
+        let submit = navigations(graph, "submit");
+        assert_eq!(submit.len(), 1, "{}", graph.report());
+        assert_eq!(
+            graph
+                .node(&submit[0].target)
+                .map(|node| node.qualified_name.as_str()),
+            Some("src/routes/_auth.dashboard.tsx::route:/dashboard")
+        );
+        assert_eq!(submit[0].metadata["href"], "/dashboard");
+        assert_eq!(submit[0].metadata["navMethod"], "navigate");
+        assert_eq!(submit[0].metadata["framework"], "tanstack-router");
+        // The guard's thrown redirect goes to the login page.
+        let redirects: Vec<&EdgeRow> = graph
+            .edges
+            .iter()
+            .filter(|edge| {
+                edge.kind == "navigates"
+                    && graph
+                        .node(&edge.source)
+                        .is_some_and(|node| node.file_path == "src/routes/_auth.tsx")
+            })
+            .collect();
+        assert_eq!(redirects.len(), 1, "{}", graph.report());
+        assert_eq!(
+            graph
+                .node(&redirects[0].target)
+                .map(|node| node.qualified_name.as_str()),
+            Some("src/routes/login.tsx::route:/login")
+        );
+        assert_eq!(redirects[0].metadata["href"], "/login");
+        assert_eq!(redirects[0].metadata["navMethod"], "redirect");
+        assert!(
+            navigations(graph, "nowhere").is_empty(),
+            "{}",
+            graph.report()
+        );
+        assert!(
+            navigations(graph, "filter").is_empty(),
+            "{}",
+            graph.report()
+        );
+    }
+}
+
 mod explore_flow {
     use super::support::{Project, codegraph};
 

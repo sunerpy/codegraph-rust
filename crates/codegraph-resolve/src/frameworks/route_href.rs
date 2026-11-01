@@ -176,7 +176,7 @@ fn string_end(s: &[u8], at: usize) -> usize {
 /// The string literal (`'…'`, `"…"` or a template) starting at `at`, every
 /// `${…}` replaced by [`HOLE`]; `None` when `at` starts no string
 /// (`readStringAt`).
-fn read_string_at(s: &str, at: usize) -> Option<String> {
+pub(crate) fn read_string_at(s: &str, at: usize) -> Option<String> {
     let bytes = s.as_bytes();
     let quote = *bytes.get(at)?;
     match quote {
@@ -262,7 +262,7 @@ fn index_at_depth0(s: &[u8], ch: u8, from: usize) -> Option<usize> {
 
 /// The href a literal names (`toHref`): its path is the text before any `?`
 /// or `#`; an empty literal or path is none.
-fn to_href(literal: Option<String>) -> Option<HrefLiteral> {
+pub(crate) fn to_href(literal: Option<String>) -> Option<HrefLiteral> {
     let literal = literal.filter(|literal| !literal.is_empty())?;
     let path = literal
         .find(['?', '#'])

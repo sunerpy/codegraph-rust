@@ -30,6 +30,7 @@ pub mod react;
 pub mod react_router;
 pub(crate) mod react_tables;
 pub mod route_href;
+pub mod tanstack_router;
 pub mod tauri;
 pub mod vue;
 
@@ -65,6 +66,10 @@ pub fn detect_frameworks(context: &dyn ResolutionContext) -> Vec<Box<dyn Framewo
         // only calls that name one of its own routes, which no resolver above
         // resolves.
         Box::new(react_router::ReactRouterResolver),
+        // TanStack Router's file and code routes and navigation (F5), after
+        // React Router and before Next.js, as upstream orders the routers. It
+        // claims only navigation calls that name one of its own routes.
+        Box::new(tanstack_router::TanstackRouterResolver),
         // Next.js pages, route handlers and navigation (F3), split out of
         // React. It claims only navigation calls that name one of its own
         // pages, which no resolver above resolves.

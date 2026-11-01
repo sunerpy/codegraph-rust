@@ -42,6 +42,32 @@
     "kind": "calls",
     "line": 3,
     "metadata": {
+      "confidence": 0.8,
+      "framework": "react",
+      "resolvedBy": "framework"
+    },
+    "provenance": null,
+    "source": "route:apps/tanstack/src/routes/index.tsx:3:/:tanstack",
+    "target": "function:9137efed7a4eda576ab983339ee0aebb"
+  },
+  {
+    "col": 0,
+    "kind": "calls",
+    "line": 3,
+    "metadata": {
+      "confidence": 0.8,
+      "framework": "react",
+      "resolvedBy": "framework"
+    },
+    "provenance": null,
+    "source": "route:apps/tanstack/src/routes/posts.tsx:3:/posts:tanstack",
+    "target": "function:5aeeebbe29a1bbdc7599b6af1126dab2"
+  },
+  {
+    "col": 0,
+    "kind": "calls",
+    "line": 3,
+    "metadata": {
       "confidence": 0.9,
       "resolvedBy": "exact-match"
     },

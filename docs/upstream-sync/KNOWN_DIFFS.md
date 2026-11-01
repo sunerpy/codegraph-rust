@@ -282,6 +282,23 @@ listed.
   (its route renders nothing of it, and a value it is the loader of renders
   none of its module), so no loader runs the call stack out; colby's readers
   recurse without a bound (`lazy_loader.rs`).
+- **A path two TanStack Router routes of one app serve (W7-10).** A
+  navigation call matches only the routes of its own app, as in colby, and
+  a path two routes of that app serve stays unresolved. colby's
+  `addRouteTo` keeps the first route of a path in node order, which a sync
+  changes (`tanstack_router.rs`).
+- **A framework resolution into a module that exports nothing (W7-10).**
+  Whichever strategy chose a result, a framework resolver's included, it is
+  dropped when its target sits in another file's ES module that has imports
+  but exports nothing (`gate_js_visibility`); colby holds only name matching to
+  such a module (`isVisibleAcrossFiles`). Letting framework results through
+  was measured on LibreChat and typescript-large: every edge it added ended
+  in a test file or a compiler-test baseline, React tags such as `<Wrapper>`
+  and `<Icon>` bound to another spec file's function and navigations bound
+  to a test fixture's route. The cost: a route of a router declared in such
+  a module, a `main.tsx` that builds `createBrowserRouter([...])` or a
+  TanStack code route tree and renders it, is reached by no navigation from
+  another file (`resolver.rs`).
 - **A tag imported from a module that exports no component under its name
   (W7-09e).** A JSX tag imported from a module of the project renders what
   the module exports under the name, as colby's (#2563); when the module
