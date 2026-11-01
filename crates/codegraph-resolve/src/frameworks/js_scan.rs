@@ -227,7 +227,7 @@ pub(crate) fn is_identifier(text: &str) -> bool {
 /// `observer`, `React.memo`, `forwardRef<Props>` — or `None` when `s`
 /// starts with no such callee (upstream's
 /// `^[A-Za-z_$][\w$]*(?:\s*\.\s*[A-Za-z_$][\w$]*)*\s*(?:<[^()]*>)?\s*(?=\()`).
-fn callee_end(s: &str) -> Option<usize> {
+pub(crate) fn callee_end(s: &str) -> Option<usize> {
     let bytes = s.as_bytes();
     let ident = |at: usize| -> Option<usize> {
         let first = *bytes.get(at)?;

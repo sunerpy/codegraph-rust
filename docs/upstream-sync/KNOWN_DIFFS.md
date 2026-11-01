@@ -266,6 +266,12 @@ listed.
   recurses without a bound. The bracket, string and wrapped-call scanners in
   `js_scan.rs` keep their stackless walks and have no bound
   (`react_router.rs`).
+- **A React lazy loader nested past 256 levels (W7-09c).** The loader
+  readers follow a loader's arrays, destructuring patterns, wrapper calls
+  and default objects 256 levels deep; a loader nested deeper links nothing
+  (its route renders nothing of it, and a value it is the loader of renders
+  none of its module), so no loader runs the call stack out; colby's readers
+  recurse without a bound (`lazy_loader.rs`).
 - **Dart named constructors (#2380).** A named constructor, indexed as a
   method, is reached only by a call written through its class (`Foo.value(2)`).
   A call through a value of that type (a typed parameter or local, a chain's

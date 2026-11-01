@@ -11465,6 +11465,103 @@ pub fn tsx_react_router_lazy_page_default_export_moves() -> Case {
         )
 }
 
+/// The package of the W7-09c cases: React Router 7.
+const REACT_ROUTER_7_PACKAGE: &str = "{\"name\":\"ui\",\"private\":true,\"dependencies\":{\"react\":\"^18\",\"react-router\":\"^7\"}}\n";
+
+/// The `/reports` route of the W7-09c cases, its loader picking
+/// `ReportList` from the `reports` barrel.
+const REPORTS_ROUTER_LIST: &str = "import { createBrowserRouter } from 'react-router';\n\nexport const router = createBrowserRouter([\n  {\n    path: '/reports',\n    lazy: async () => {\n      const { ReportList } = await import('./reports');\n      return { Component: ReportList };\n    },\n  },\n]);\n";
+
+/// The same route, its loader picking `ReportPage`.
+const REPORTS_ROUTER_PAGE: &str = "import { createBrowserRouter } from 'react-router';\n\nexport const router = createBrowserRouter([\n  {\n    path: '/reports',\n    lazy: async () => {\n      const { ReportPage } = await import('./reports');\n      return { Component: ReportPage };\n    },\n  },\n]);\n";
+
+/// W7-09c (upstream #2480): a route's loader is edited to pick another
+/// export of the module it loads: the route renders the new pick.
+pub fn tsx_react_router_loader_picks_another_export() -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript, Language::Tsx])
+        .file("package.json", REACT_ROUTER_7_PACKAGE)
+        .file("src/router.tsx", REPORTS_ROUTER_LIST)
+        .file(
+            "src/reports/index.ts",
+            "export * from './report_list';\nexport * from './report_page';\n",
+        )
+        .file(
+            "src/reports/report_list.tsx",
+            "export function ReportList() {\n  return null;\n}\n",
+        )
+        .file(
+            "src/reports/report_page.tsx",
+            "export function ReportPage() {\n  return null;\n}\n",
+        )
+        .write("src/router.tsx", REPORTS_ROUTER_PAGE)
+        .edge_before(
+            "route src/router.tsx::route:/reports",
+            "references",
+            "function ReportList",
+        )
+        .edge_after(
+            "route src/router.tsx::route:/reports",
+            "references",
+            "function ReportPage",
+        )
+}
+
+/// W7-09c (upstream `react-router-lazy-member.test.ts`, sync): the module a
+/// loader picks the default export of moves its default to another
+/// component, the old one staying: the route renders the new default.
+pub fn tsx_react_router_picked_default_export_moves() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Tsx])
+        .file("package.json", REACT_ROUTER_7_PACKAGE)
+        .file(
+            "src/router.tsx",
+            "import { createBrowserRouter } from 'react-router';\n\nexport const router = createBrowserRouter([\n  {\n    path: '/login',\n    lazy: async () => {\n      const { default: Component } = await import('./pages/login');\n      return { Component };\n    },\n  },\n]);\n",
+        )
+        .file(
+            "src/pages/login.tsx",
+            "export default function LoginPage() {\n  return null;\n}\n",
+        )
+        .write(
+            "src/pages/login.tsx",
+            "export function LoginPage() {\n  return null;\n}\n\nexport default function SignIn() {\n  return null;\n}\n",
+        )
+        .edge_before(
+            "route src/router.tsx::route:/login",
+            "references",
+            "function LoginPage",
+        )
+        .edge_after(
+            "route src/router.tsx::route:/login",
+            "references",
+            "function SignIn",
+        )
+}
+
+/// W7-09c (upstream `react-router-lazy-member.test.ts`, sync): the module a
+/// loader picks an export from appears, in a folder of its own. The parked
+/// `import:./reports#ReportList` waits under no key the new files carry;
+/// the sync retries it because a file in a new folder moves the JS control
+/// inputs (the manifests framework detection reads), which re-resolves every
+/// JavaScript-family file whole. The same module appearing beside the route
+/// file, and an edit that gives the module the export, stay W7-23's.
+pub fn tsx_react_router_picked_export_module_appears() -> Case {
+    Case::new(
+        Change::AddImportTarget,
+        &[Language::TypeScript, Language::Tsx],
+    )
+    .file("package.json", REACT_ROUTER_7_PACKAGE)
+    .file("src/router.tsx", REPORTS_ROUTER_LIST)
+    .write("src/reports/index.ts", "export * from './report_list';\n")
+    .write(
+        "src/reports/report_list.tsx",
+        "export function ReportList() {\n  return null;\n}\n",
+    )
+    .edge_after(
+        "route src/router.tsx::route:/reports",
+        "references",
+        "function ReportList",
+    )
+}
+
 /// W7-09b: a lazily loaded route module's body is edited (upstream F4): the
 /// route still renders its default export, and still inside its layout.
 pub fn tsx_react_router_lazy_page_body_edit_keeps_its_route() -> Case {

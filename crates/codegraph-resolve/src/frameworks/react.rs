@@ -10,6 +10,7 @@ use regex::Regex;
 
 use super::js_language_for;
 use super::js_scan::{self, JS_SPACE};
+use super::lazy_loader::{self, LoadedPage};
 use super::react_router::{self, LAYOUT_PREFIX, LAZY_ROUTE_PREFIX};
 use crate::alias_binding::{default_export_binding, extract_local_export_aliases};
 use crate::framework::FrameworkResolver;
@@ -58,10 +59,12 @@ impl FrameworkResolver for ReactResolver {
     }
 
     /// A data-router `lazy: () => import('./routes/x')` route names a module,
-    /// not a symbol; a route's `layout:MainLayout` names the component around
-    /// it.
+    /// not a symbol, and `import:./x#Page` the export its loader picks; a
+    /// route's `layout:MainLayout` names the component around it.
     fn claims_reference(&self, name: &str) -> bool {
-        name.starts_with(LAZY_ROUTE_PREFIX) || name.starts_with(LAYOUT_PREFIX)
+        name.starts_with(LAZY_ROUTE_PREFIX)
+            || name.starts_with(LAYOUT_PREFIX)
+            || lazy_loader::picked_export_name(name).is_some()
     }
 
     // Ports reactResolver.resolve (react.ts:44-131).
@@ -69,6 +72,15 @@ impl FrameworkResolver for ReactResolver {
         let name = &reference.reference_name;
         if let Some(spec) = name.strip_prefix(LAZY_ROUTE_PREFIX) {
             return lazy_route_component(spec, &reference.file_path, context)
+                .map(|target| framework_resolved(reference, target, 0.9));
+        }
+        // The export a lazy route's loader picks. Vue Router and Angular name
+        // a lazily loaded component the same way, and their routes' are
+        // theirs.
+        if let Some((spec, export)) = lazy_loader::picked_export_name(name) {
+            return is_react_route_ref(reference)
+                .then(|| picked_export(spec, export, &reference.file_path, context))
+                .flatten()
                 .map(|target| framework_resolved(reference, target, 0.9));
         }
         // The layout a route renders inside: what happens in it — its
@@ -122,7 +134,7 @@ impl FrameworkResolver for ReactResolver {
             if let Some(own) = declared_component(name, &reference.file_path, context) {
                 return own
                     .component
-                    .map(|component| framework_resolved(reference, component.id.clone(), 0.9));
+                    .map(|component| framework_resolved(reference, component, 0.9));
             }
             if let Some(target) = resolve_component(name, &reference.file_path, context) {
                 return Some(framework_resolved(reference, target, 0.8));
@@ -280,30 +292,61 @@ fn resolve_component(
 /// (`declaredComponent`'s answer).
 struct DeclaredComponent {
     declaration: Arc<Node>,
-    /// The function the value wraps, or `None` when there is none to find and
-    /// the declaration is the binding, by name.
-    component: Option<Arc<Node>>,
+    /// The id of the component of the module the value loads lazily, or of
+    /// the function it wraps; `None` when there is none to find and the
+    /// declaration is the binding, by name.
+    component: Option<String>,
 }
 
 /// A value `file_path` declares itself under a component's name, and what it
 /// renders (upstream `declaredComponent`, #2420). JavaScript scoping makes
 /// the name, used anywhere in that file — `<RegisterPage />`, a route's
 /// `element: <RegisterPage />`, a type — this declaration, never another
-/// file's same-named component. Its `component` is the function the value
-/// wraps (`observer(function Login() {…})`). `None` when the file declares
-/// no such value (a function or class component is found the usual way). A
-/// value's lazy loader is read in a later change.
+/// file's same-named component: mantis's vite app bound its `RegisterPage`,
+/// a `Loadable(lazy(() => import('pages/auth/Register')))`, to the page of
+/// that name in the repository's Next.js app. Its `component` is the
+/// component of the module a lazy value loads ([`value_loader`]), or the
+/// function the value wraps (`observer(function Login() {…})`). A loader
+/// nested past the readers' bound has none. `None` when the file declares no
+/// such value (a function or class component is found the usual way).
 fn declared_component(
     name: &str,
     file_path: &str,
     context: &dyn ResolutionContext,
 ) -> Option<DeclaredComponent> {
     let declaration = declared_value(name, file_path, context)?;
-    let component = wrapped_component(&declaration, context);
+    let component = match value_loader(&declaration, context) {
+        Ok(None) => wrapped_component(&declaration, context).map(|node| node.id.clone()),
+        Ok(Some(LoadedPage { spec, member })) => {
+            if member == "default" {
+                lazy_route_component(&spec, file_path, context)
+            } else {
+                picked_export(&spec, &member, file_path, context)
+            }
+        }
+        Err(lazy_loader::Exhausted) => None,
+    };
     Some(DeclaredComponent {
         declaration,
         component,
     })
+}
+
+/// The module a value `declaration` declares loads lazily, and the export
+/// its loader picks (upstream `valueLoader`): `Ok(None)` for a value that
+/// loads none.
+fn value_loader(
+    declaration: &Node,
+    context: &dyn ResolutionContext,
+) -> Result<Option<LoadedPage>, lazy_loader::Exhausted> {
+    let code = strip_comments_for_regex(
+        &declaration_text(declaration, context),
+        CommentLang::TypeScript,
+    );
+    match js_scan::initializer_at(&code, declaration.name.len()) {
+        Some(init) => lazy_loader::value_loader(&code[init..]),
+        None => Ok(None),
+    }
 }
 
 /// The module-level `const`, `let` or `var` `file_path` declares as `name`
@@ -449,6 +492,31 @@ fn lazy_route_component(
     let file = lazy_module_file(spec, from_file, context)?;
     exported_component(&file, "default", context, &[])
         .or_else(|| exported_component(&file, "Component", context, &[]))
+}
+
+/// The component a lazy route's loader picks from the module `spec` loads:
+/// the export named `name`, through barrels (`pickedExport`).
+fn picked_export(
+    spec: &str,
+    name: &str,
+    from_file: &str,
+    context: &dyn ResolutionContext,
+) -> Option<String> {
+    let file = lazy_module_file(spec, from_file, context)?;
+    exported_component(&file, name, context, &[])
+}
+
+/// True for a reference a React route makes (`isReactRouteRef`): from a
+/// `route:<file>:…` node, in tsx or jsx, the language React gives its routes
+/// even in a `.ts` routes file. Vue Router's and Angular's routes are never
+/// in either.
+fn is_react_route_ref(reference: &RefView) -> bool {
+    matches!(reference.language, Language::Tsx | Language::Jsx)
+        && reference
+            .from_node_id
+            .strip_prefix("route:")
+            .and_then(|rest| rest.strip_prefix(reference.file_path.as_str()))
+            .is_some_and(|rest| rest.starts_with(':'))
 }
 
 /// The component `file` exports as `name` (upstream `exportedComponent`):
@@ -653,7 +721,7 @@ fn default_exported_name(source: &str) -> Option<String> {
 /// The component a route's `layout:` reference names, found the way the
 /// route's own component is (upstream `layoutComponent`): through the route
 /// file's import of it, else declared in reach — or a lazily loaded layout
-/// module's component.
+/// module's component, or the export its loader picks.
 fn layout_component(
     spec: &str,
     reference: &RefView,
@@ -661,6 +729,11 @@ fn layout_component(
 ) -> Option<String> {
     if let Some(module) = spec.strip_prefix(LAZY_ROUTE_PREFIX) {
         return lazy_route_component(module, &reference.file_path, context);
+    }
+    if is_react_route_ref(reference)
+        && let Some((module, export)) = lazy_loader::picked_export_name(spec)
+    {
+        return picked_export(module, export, &reference.file_path, context);
     }
     let Some(mapping) = context
         .get_import_mappings(&reference.file_path, reference.language)
@@ -671,7 +744,7 @@ fn layout_component(
         // `layout:` reference, so the declaration binds here when there is
         // no component to find.
         if let Some(own) = declared_component(spec, &reference.file_path, context) {
-            return Some(own.component.unwrap_or(own.declaration).id.clone());
+            return Some(own.component.unwrap_or_else(|| own.declaration.id.clone()));
         }
         return resolve_component(spec, &reference.file_path, context);
     };
@@ -1023,6 +1096,83 @@ mod tests {
             is_function_ref: false,
             reference_subkind: None,
         }
+    }
+
+    /// The export a lazy route's loader picks, `import:./x#Page`, is React's
+    /// only from a React route: Vue Router and Angular name a lazily loaded
+    /// component the same way (upstream `isReactRouteRef`).
+    #[test]
+    fn a_picked_export_resolves_only_from_a_react_route() {
+        let login = placed(
+            NodeKind::Function,
+            "Login",
+            "src/views/Login.tsx",
+            (1, 3),
+            (0, 1),
+        );
+        let ctx = Ctx::default()
+            .file("src/router.tsx", "")
+            .file("src/router.ts", "")
+            .file(
+                "src/views/Login.tsx",
+                "export function Login() {\n  return null;\n}\n",
+            )
+            .node(login.clone());
+        let from = |file: &str, language: Language, node: &str| RefView {
+            from_node_id: node.to_string(),
+            ..a_ref(
+                "import:./views/Login#Login",
+                EdgeKind::References,
+                file,
+                language,
+            )
+        };
+        let route = from(
+            "src/router.tsx",
+            Language::Tsx,
+            "route:src/router.tsx:3:/login",
+        );
+        assert!(ReactResolver.claims_reference(&route.reference_name));
+        assert_eq!(
+            ReactResolver
+                .resolve(&route, &ctx)
+                .map(|r| r.target_node_id),
+            Some(login.id.clone())
+        );
+        for reference in [
+            from(
+                "src/router.ts",
+                Language::TypeScript,
+                "route:src/router.ts:3:/login",
+            ),
+            from(
+                "src/router.tsx",
+                Language::Tsx,
+                "function:src/router.tsx:Routes:1",
+            ),
+            from(
+                "src/router.tsx",
+                Language::Tsx,
+                "route:src/other.tsx:3:/login",
+            ),
+        ] {
+            assert!(
+                ReactResolver.resolve(&reference, &ctx).is_none(),
+                "{}",
+                reference.from_node_id
+            );
+        }
+        // A layout the loader picks, the same way.
+        let layout = RefView {
+            reference_name: "layout:import:./views/Login#Login".to_string(),
+            ..route.clone()
+        };
+        assert_eq!(
+            ReactResolver
+                .resolve(&layout, &ctx)
+                .map(|r| r.target_node_id),
+            Some(login.id)
+        );
     }
 
     // -- pure-helper units --------------------------------------------------

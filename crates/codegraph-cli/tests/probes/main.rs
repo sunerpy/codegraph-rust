@@ -19072,26 +19072,36 @@ mod frameworks {
         );
     }
 
-    /// Upstream #2420 (wrapper half): a PascalCase name a `.tsx` file
-    /// declares as a module-level value is that declaration wherever the
-    /// file uses it — the function it wraps (`observer(function X() {…})`,
-    /// `forwardRef(Inner) as …`, `observer(Inner)`), else the declaration —
-    /// never another app's same-named component. The lazy loader half is
-    /// W7-09's.
+    /// Upstream #2420: a PascalCase name a `.tsx` file declares as a
+    /// module-level value is that declaration wherever the file uses it —
+    /// the component of the module its lazy loader loads (#2480's readers),
+    /// the function it wraps (`observer(function X() {…})`, `forwardRef(Inner)
+    /// as …`, `observer(Inner)`), else the declaration — never another app's
+    /// same-named component.
     #[test]
     fn pr2420_a_value_the_file_declares_is_what_its_jsx_renders() {
         let project = Project::new()
             .file("package.json", "{\"name\":\"app\",\"dependencies\":{\"react\":\"^18\",\"mobx-react\":\"^7\"}}\n")
             .file(
                 "src/app/App.tsx",
-                "import { forwardRef } from 'react';\nimport { observer } from 'mobx-react';\nconst Panel = observer(function PanelInner() { return <div />; });\nfunction Inner() { return <span />; }\nconst Item = forwardRef(Inner) as any;\nconst Table = observer(TableInner);\nfunction TableInner() { return <table />; }\nconst Config = makeConfig();\nexport function App() {\n  return <div><Panel /><Item /><Table /><Config /></div>;\n}\n",
+                "import { forwardRef, lazy } from 'react';\nimport { observer } from 'mobx-react';\nconst Home = lazy(() => import('./pages/Home'));\nconst Panel = observer(function PanelInner() { return <div />; });\nfunction Inner() { return <span />; }\nconst Item = forwardRef(Inner) as any;\nconst Table = observer(TableInner);\nfunction TableInner() { return <table />; }\nconst Config = makeConfig();\nexport function App() {\n  return <div><Home /><Panel /><Item /><Table /><Config /></div>;\n}\n",
+            )
+            .file(
+                "src/app/pages/Home.tsx",
+                "export default function HomePage() { return <main />; }\n",
             )
             .file(
                 "src/other/Home.tsx",
-                "export function Panel() { return <div />; }\nexport function Item() { return <div />; }\nexport function Table() { return <div />; }\nexport function Config() { return <div />; }\n",
+                "export function Home() { return <div />; }\nexport function Panel() { return <div />; }\nexport function Item() { return <div />; }\nexport function Table() { return <div />; }\nexport function Config() { return <div />; }\n",
             )
             .index();
         let graph = project.graph();
+        graph.assert_edge(
+            "function App",
+            "references",
+            "function HomePage",
+            Some("framework"),
+        );
         graph.assert_edge(
             "function App",
             "references",
@@ -19111,12 +19121,173 @@ mod frameworks {
             Some("framework"),
         );
         graph.assert_edge("function App", "references", "constant Config", None);
-        for name in ["Panel", "Item", "Table", "Config"] {
+        for name in ["Home", "Panel", "Item", "Table", "Config"] {
             graph.assert_no_edge(
                 "function App",
                 "references",
                 &format!("function {name} @src/other/Home.tsx"),
             );
+        }
+    }
+
+    /// Upstream `jsx-child-disambiguation.test.ts`, "a value the file
+    /// declares itself", the lazy loaders (#2480): a tag naming a value whose
+    /// lazy wrapper loads a module renders that module's component, never
+    /// another app's same-named page — `Loadable(lazy(…))`, next/dynamic's
+    /// `(await import(…)).default` with options, a `.then` that picks a named
+    /// export, a module that forwards its default to the component it wraps,
+    /// the branch of a conditional that loads lazily — and the declaration
+    /// itself when the module is out of reach or the value wraps a function
+    /// that imports on its own. Here the tag's `references` edge (the
+    /// `jsx-render` edges are W7-14's).
+    #[test]
+    fn pr2480_a_lazy_value_renders_the_module_it_loads() {
+        let project = Project::new()
+            .file(
+                "package.json",
+                "{\"dependencies\":{\"react\":\"^18.0.0\"}}",
+            )
+            .file(
+                "next/src/app/(auth)/register/page.jsx",
+                "export default function RegisterPage() {\n  return <div />;\n}\n",
+            )
+            .file(
+                "next/src/app/(auth)/login/page.jsx",
+                "export default function LoginPage() {\n  return <div />;\n}\n",
+            )
+            .file(
+                "vite/src/pages/auth/Register.jsx",
+                "export default function Register() {\n  return <div />;\n}\n",
+            )
+            .file(
+                "vite/src/components/Loadable.jsx",
+                "export default function Loadable(Component) {\n  return (props) => <Component {...props} />;\n}\n",
+            )
+            .file(
+                "vite/src/layout/AuthShell.jsx",
+                "import { lazy } from 'react';\nimport Loadable from '../components/Loadable';\n\nconst RegisterPage = Loadable(lazy(() => import('../pages/auth/Register')));\n// An import only the app's own build resolves (`baseUrl`).\nconst LoginPage = Loadable(lazy(() => import('pages/auth/Login')));\n\nexport function AuthShell() {\n  return <main><RegisterPage />Sign in <LoginPage /></main>;\n}\n",
+            )
+            .file(
+                "dev-docs/src/theme/ReactLiveScope/index.js",
+                "const Excalidraw = React.forwardRef((props, ref) => <div ref={ref} />);\nexport default { Excalidraw };\n",
+            )
+            .file(
+                "examples/with-nextjs/src/excalidrawWrapper.tsx",
+                "const ExcalidrawWrapper = () => {\n  return <div />;\n};\nexport default ExcalidrawWrapper;\n",
+            )
+            .file(
+                "examples/with-nextjs/src/pages/excalidraw-in-pages.tsx",
+                "import dynamic from 'next/dynamic';\n\nconst Excalidraw = dynamic(\n  async () => (await import('../excalidrawWrapper')).default,\n  {\n    ssr: false,\n  },\n);\n\nexport default function Page() {\n  return <Excalidraw />;\n}\n",
+            )
+            .file(
+                "a-decoy/line-chart.tsx",
+                "export function LineChart() {\n  return <svg />;\n}\n",
+            )
+            .file(
+                "charts/line-chart.tsx",
+                "export function LineChart() {\n  return <svg />;\n}\n",
+            )
+            .file(
+                "charts/index.ts",
+                "export default function Fallback() {\n  return null;\n}\nexport * from './line-chart';\n",
+            )
+            .file(
+                "dashboard.tsx",
+                "import { lazy } from 'react';\nconst LineChart = lazy(() => import('./charts').then((m) => ({ default: m.LineChart })));\nexport function Dashboard() {\n  return <LineChart />;\n}\n",
+            )
+            .file(
+                "a-decoy/Login.tsx",
+                "export function Login() {\n  return <form />;\n}\n",
+            )
+            .file(
+                "app/scenes/Login/Login.tsx",
+                "import { observer } from 'mobx-react';\nfunction Login() {\n  return <form />;\n}\n\nexport default observer(Login);\n",
+            )
+            .file(
+                "app/scenes/Login/index.ts",
+                "import Login from \"./Login\";\n\nexport default Login;\n",
+            )
+            .file(
+                "app/scenes/Shared/index.tsx",
+                "import { lazy } from 'react';\nconst Login = lazy(() => import('../Login'));\nexport function SharedScene() {\n  return <Login />;\n}\n",
+            )
+            .file(
+                "a-decoy/AuthZDevModal.tsx",
+                "export function AuthZDevModal() {\n  return <div />;\n}\n",
+            )
+            .file(
+                "src/lib/devtools/AuthZDevModal.tsx",
+                "export function AuthZDevModal() {\n  return <dialog />;\n}\n",
+            )
+            .file(
+                "src/palette.tsx",
+                "import React from 'react';\n\nconst IS_DEV = process.env.NODE_ENV === 'development';\n\nconst AuthZDevModal = IS_DEV\n  ? React.lazy(() =>\n      import('./lib/devtools/AuthZDevModal').then((m) => ({\n        default: m.AuthZDevModal,\n      })),\n    )\n  : null;\n\nexport function Palette() {\n  return <div>{AuthZDevModal && <AuthZDevModal />}</div>;\n}\n",
+            )
+            .file(
+                "heavy.tsx",
+                "export default function Heavy() {\n  return <div />;\n}\n",
+            )
+            .file(
+                "form.tsx",
+                "import { withFallback } from './fallback';\n\nconst Dialog = withFallback('Dialog', (props) => {\n  const load = () => import('./heavy');\n  return <div onClick={load} />;\n});\n\nexport function Form() {\n  return <form><Dialog /></form>;\n}\n",
+            )
+            .file(
+                "fallback.tsx",
+                "export function withFallback(name, render) {\n  return render;\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        for (parent, component) in [
+            (
+                "function AuthShell",
+                "function Register @vite/src/pages/auth/Register.jsx",
+            ),
+            (
+                "function Page",
+                "function ExcalidrawWrapper @examples/with-nextjs/src/excalidrawWrapper.tsx",
+            ),
+            (
+                "function Dashboard",
+                "function LineChart @charts/line-chart.tsx",
+            ),
+            (
+                "function SharedScene",
+                "function Login @app/scenes/Login/Login.tsx",
+            ),
+            (
+                "function Palette",
+                "function AuthZDevModal @src/lib/devtools/AuthZDevModal.tsx",
+            ),
+        ] {
+            graph.assert_edge(parent, "references", component, Some("framework"));
+        }
+        graph.assert_edge(
+            "function AuthShell",
+            "references",
+            "constant LoginPage @vite/src/layout/AuthShell.jsx",
+            None,
+        );
+        graph.assert_edge(
+            "function Form",
+            "references",
+            "constant Dialog @form.tsx",
+            None,
+        );
+        for (parent, decoy) in [
+            ("function AuthShell", "function RegisterPage"),
+            ("function AuthShell", "function LoginPage"),
+            (
+                "function Dashboard",
+                "function LineChart @a-decoy/line-chart.tsx",
+            ),
+            ("function SharedScene", "function Login @a-decoy/Login.tsx"),
+            (
+                "function Palette",
+                "function AuthZDevModal @a-decoy/AuthZDevModal.tsx",
+            ),
+            ("function Form", "function Heavy"),
+        ] {
+            graph.assert_no_edge(parent, "references", decoy);
         }
     }
 
@@ -20497,11 +20668,11 @@ mod react_router {
         );
     }
 
-    /// Upstream `react-router-lazy-barrel.test.ts`, the index half but for
-    /// the `React.lazy` value (a later change): a lazily loaded module that
-    /// is a barrel renders what it forwards — `export *`, a barrel of
-    /// barrels, a named re-export, a forwarded default, an export clause, a
-    /// held binding, a memoized export's component — and nothing a barrel
+    /// Upstream `react-router-lazy-barrel.test.ts`, the index half: a lazily
+    /// loaded module that is a barrel renders what it forwards — `export *`,
+    /// a barrel of barrels, a named re-export, a forwarded default, an
+    /// export clause, a held binding, a memoized export's component, the
+    /// default a `React.lazy` value loads (#2480) — and nothing a barrel
     /// does not forward.
     #[test]
     fn pr2400_a_lazy_route_module_renders_what_its_barrel_forwards() {
@@ -20516,7 +20687,7 @@ mod react_router {
             )
             .file(
                 "src/router.tsx",
-                "import { createBrowserRouter } from 'react-router';\n\nexport const router = createBrowserRouter([\n  {\n    path: '/builds/:id',\n    lazy: () => import('@/builds/build_page'),\n    children: [{ path: 'overview', lazy: () => import('@/builds/build_page/overview_tab') }],\n  },\n  { path: '/builders', lazy: () => import('@/builds/pages') },\n  { path: '/fleet', lazy: () => import('@/fleet/home_page') },\n  { path: '/login', lazy: () => import('@/auth/login_page') },\n  { path: '/graph', lazy: () => import('@/chronicle/graph_view') },\n  { path: '/media', lazy: () => import('@/media/media_page') },\n  { path: '/redirect', lazy: () => import('@/core/redirection_loader') },\n  { path: '/clash', lazy: () => import('@/clash') },\n  { path: '/loop', lazy: () => import('@/loop/a') },\n  { path: '/no-default', lazy: () => import('@/legacy') },\n]);\n",
+                "import { lazy } from 'react';\nimport { createBrowserRouter } from 'react-router';\n\nconst Settings = lazy(() => import('@/settings'));\n\nexport const router = createBrowserRouter([\n  {\n    path: '/builds/:id',\n    lazy: () => import('@/builds/build_page'),\n    children: [{ path: 'overview', lazy: () => import('@/builds/build_page/overview_tab') }],\n  },\n  { path: '/builders', lazy: () => import('@/builds/pages') },\n  { path: '/fleet', lazy: () => import('@/fleet/home_page') },\n  { path: '/login', lazy: () => import('@/auth/login_page') },\n  { path: '/graph', lazy: () => import('@/chronicle/graph_view') },\n  { path: '/media', lazy: () => import('@/media/media_page') },\n  { path: '/settings', element: <Settings /> },\n  { path: '/redirect', lazy: () => import('@/core/redirection_loader') },\n  { path: '/clash', lazy: () => import('@/clash') },\n  { path: '/loop', lazy: () => import('@/loop/a') },\n  { path: '/no-default', lazy: () => import('@/legacy') },\n]);\n",
             )
             .file("src/builds/build_page/index.ts", "export * from './build_page';\n")
             .file(
@@ -20565,6 +20736,14 @@ mod react_router {
                 "import { memo } from 'react';\n\nfunction MediaPage() {\n  return null;\n}\n\nconst MemoizedMediaPage = memo(MediaPage);\n\nexport { MemoizedMediaPage as Component };\n",
             )
             .file(
+                "src/settings/index.ts",
+                "export { default } from './settings_page';\n",
+            )
+            .file(
+                "src/settings/settings_page.tsx",
+                "export default function SettingsPage() {\n  return null;\n}\n",
+            )
+            .file(
                 "src/core/redirection_loader.ts",
                 "export function redirectionLoader() {\n  return null;\n}\n\nexport const loader = redirectionLoader;\n",
             )
@@ -20600,6 +20779,7 @@ mod react_router {
                 "/graph -> GraphView@src/chronicle/graph_view.tsx",
                 "/login -> LoginPage@src/auth/login_page/login_page.tsx",
                 "/media -> MediaPage@src/media/media_page.tsx",
+                "/settings -> SettingsPage@src/settings/settings_page.tsx",
             ]),
             "{}",
             graph.report()
@@ -20617,17 +20797,19 @@ mod react_router {
         }
     }
 
-    /// Upstream `react-router-barrel-imports.test.ts`, the `lazy: () =>
-    /// import(…)` routes (the loaders that pick an export are a later
-    /// change): a default export that is an imported binding, an imported
-    /// page the module renames to `Component`, and no wrapper a default
-    /// export calls.
+    /// Upstream `react-router-barrel-imports.test.ts` (#2558, the async
+    /// loaders and the `React.lazy` value #2480): a lazily loaded module
+    /// that passes on a page it imports — an export clause of imports, an
+    /// import from another barrel, a default export that is an imported
+    /// binding, an imported page the module renames to `Component`, the
+    /// default a `React.lazy` value loads — and nothing for a namespace, a
+    /// package's component or a wrapper a default export calls.
     #[test]
     fn pr2558_a_lazy_module_passes_on_a_page_it_imports() {
         let project = Project::new()
             .file(
                 "package.json",
-                "{\"name\":\"shop\",\"private\":true,\"dependencies\":{\"react\":\"^18\",\"react-router\":\"^7\"}}\n",
+                "{\"name\":\"shop\",\"private\":true,\"dependencies\":{\"react\":\"^18\",\"react-router\":\"^7\",\"@mui/material\":\"^6\"}}\n",
             )
             .file(
                 "tsconfig.json",
@@ -20635,7 +20817,25 @@ mod react_router {
             )
             .file(
                 "src/router.tsx",
-                "import { createBrowserRouter } from 'react-router';\n\nexport const router = createBrowserRouter([\n  { path: '/login', lazy: () => import('@/auth/login') },\n  { path: '/settings', lazy: () => import('@/settings') },\n  { path: '/account', lazy: () => import('@/account') },\n]);\n",
+                "import { lazy } from 'react';\nimport { createBrowserRouter } from 'react-router';\n\nconst Help = lazy(() => import('@/help'));\n\nexport const router = createBrowserRouter([\n  {\n    path: '/',\n    lazy: async () => {\n      const { UserLayout } = await import('@/layout');\n      return { Component: UserLayout };\n    },\n    children: [\n      {\n        index: true,\n        lazy: async () => {\n          const { HomePage } = await import('@/pages');\n          return { Component: HomePage };\n        },\n      },\n      { path: 'login', lazy: () => import('@/auth/login') },\n      { path: 'settings', lazy: () => import('@/settings') },\n      { path: 'help', element: <Help /> },\n      {\n        path: 'tabs',\n        lazy: async () => {\n          const { Tabs } = await import('@/tabs');\n          return { Component: Tabs };\n        },\n      },\n      {\n        path: 'button',\n        lazy: async () => {\n          const { Button } = await import('@/ui');\n          return { Component: Button };\n        },\n      },\n      { path: 'account', lazy: () => import('@/account') },\n    ],\n  },\n  {\n    path: '/admin',\n    lazy: async () => {\n      const { AdminLayout } = await import('@/layout');\n      return { Component: AdminLayout };\n    },\n  },\n]);\n",
+            )
+            .file(
+                "src/layout/index.ts",
+                "import { AdminLayout } from './AdminLayout'\nimport { UserLayout } from './UserLayout'\n\nexport { AdminLayout, UserLayout }\n",
+            )
+            .file(
+                "src/layout/AdminLayout.tsx",
+                "export function AdminLayout() {\n  return null;\n}\n",
+            )
+            .file("src/layout/UserLayout.tsx", "export const UserLayout = () => null;\n")
+            .file(
+                "src/pages/index.ts",
+                "import { HomePage } from './home';\n\nexport { HomePage };\n",
+            )
+            .file("src/pages/home/index.ts", "export * from './HomePage';\n")
+            .file(
+                "src/pages/home/HomePage.tsx",
+                "export function HomePage() {\n  return null;\n}\n",
             )
             .file(
                 "src/auth/login/index.ts",
@@ -20654,6 +20854,23 @@ mod react_router {
                 "export function SettingsPage() {\n  return null;\n}\n",
             )
             .file(
+                "src/help/index.ts",
+                "import HelpPage from './HelpPage';\n\nexport { HelpPage as default };\n",
+            )
+            .file(
+                "src/help/HelpPage.tsx",
+                "export default function HelpPage() {\n  return null;\n}\n",
+            )
+            .file(
+                "src/tabs/index.ts",
+                "import * as Tabs from './tabs';\n\nexport { Tabs };\n",
+            )
+            .file("src/tabs/tabs.tsx", "export function First() {\n  return null;\n}\n")
+            .file(
+                "src/ui/index.ts",
+                "import { Button } from '@mui/material';\n\nexport { Button };\n",
+            )
+            .file(
                 "src/account/index.ts",
                 "import withAuth from '@/hoc/withAuth';\nimport { AccountPage } from './AccountPage';\n\nexport default withAuth(AccountPage);\n",
             )
@@ -20667,21 +20884,195 @@ mod react_router {
             )
             .index();
         let graph = project.graph();
+        // `/tabs`, `/button` and `/account` render nothing, only inside the
+        // layout `/`'s loader picks.
         assert_eq!(
             bindings(graph),
             strings(&[
+                "/ -> HomePage@src/pages/home/HomePage.tsx",
+                "/ ~> UserLayout@src/layout/UserLayout.tsx",
+                "/account ~> UserLayout@src/layout/UserLayout.tsx",
+                "/admin -> AdminLayout@src/layout/AdminLayout.tsx",
+                "/button ~> UserLayout@src/layout/UserLayout.tsx",
+                "/help -> HelpPage@src/help/HelpPage.tsx",
+                "/help ~> UserLayout@src/layout/UserLayout.tsx",
                 "/login -> Login@src/auth/login/Login.tsx",
+                "/login ~> UserLayout@src/layout/UserLayout.tsx",
                 "/settings -> SettingsPage@src/settings/SettingsPage.tsx",
+                "/settings ~> UserLayout@src/layout/UserLayout.tsx",
+                "/tabs ~> UserLayout@src/layout/UserLayout.tsx",
             ]),
             "{}",
             graph.report()
         );
     }
 
-    /// Upstream `react-router-outlet-routes.test.ts`, the scanner's half
-    /// (#2670): a route object that renders `<Outlet />` renders nothing of
-    /// its own and is no layout, yet stays an address a navigation reaches;
-    /// at its parent's address it only groups the routes inside it. No route
+    /// Upstream `react-router-lazy-member.test.ts` (#2480): a data-router
+    /// `lazy` loader that picks the export it renders (luci-go's milo/ui) —
+    /// through a barrel, `{ default: Component }`, a `.then` callback, an
+    /// `(await import(…)).X`, a module binding, a method, the import the
+    /// component comes from rather than the first one, React Router 7's
+    /// object of lazy properties, the page an `element` shows inside its
+    /// guard or past a guard of the route file, a component of the route's
+    /// own file, a `<Route lazy>` — and nothing a loader does not hand over:
+    /// a loader that returns only a `loader` makes no page, and a picked
+    /// export the module lacks is not its default nor its `Component`.
+    #[test]
+    fn pr2480_a_lazy_loader_renders_the_export_it_picks() {
+        let project = Project::new()
+            .file(
+                "package.json",
+                "{\"name\":\"ui\",\"private\":true,\"dependencies\":{\"react\":\"^18\",\"react-router\":\"^7\"}}\n",
+            )
+            .file(
+                "tsconfig.json",
+                "{\"compilerOptions\":{\"baseUrl\":\".\",\"paths\":{\"@/*\":[\"./src/*\"]}}}\n",
+            )
+            .file(
+                "src/router.tsx",
+                "import { createBrowserRouter, Route, createRoutesFromElements } from 'react-router';\nimport { AgeGate, PrivateRoute, RequireAuth } from './guards';\nimport { SettingsPage } from './pages/settings';\n\nexport const router = createBrowserRouter([\n  {\n    path: '/invocations/:id',\n    lazy: async () => {\n      const { InvocationPage } = await import('@/invocation_page');\n      return { Component: InvocationPage };\n    },\n    children: [\n      {\n        path: 'tests',\n        lazy: async () => {\n          const { TestTab } = await import(\n            '@/invocation_page/tabs'\n          );\n          return { Component: TestTab };\n        },\n      },\n      {\n        path: 'details',\n        lazy: async () => {\n          const { DetailsTab } = await import('@/invocation_page/tabs');\n          return { Component: DetailsTab };\n        },\n      },\n    ],\n  },\n  {\n    path: '/login',\n    lazy: async () => {\n      const { default: Component } = await import(/* webpackChunkName: \"login\" */ './pages/login');\n      return { Component };\n    },\n  },\n  { path: '/reports', lazy: () => import('./pages/reports').then((m) => ({ Component: m.ReportList })) },\n  { path: '/reports/:id', lazy: async () => ({ Component: (await import('./pages/reports')).ReportPage }) },\n  {\n    path: '/profile',\n    lazy: async () => {\n      const page = await import('./pages/profile');\n      return { Component: page.ProfilePage };\n    },\n  },\n  {\n    path: '/projects',\n    async lazy() {\n      const { ProjectsPage } = await import('./pages/projects');\n      return { Component: ProjectsPage };\n    },\n  },\n  {\n    path: '/team',\n    lazy: async () => {\n      const { teamLoader } = await import('./loaders/team');\n      const { TeamPage } = await import('./pages/team');\n      return { loader: teamLoader, Component: TeamPage };\n    },\n  },\n  {\n    path: '/shows/:id',\n    lazy: {\n      loader: async () => (await import('./shows/loader')).loader,\n      Component: async () => (await import('./shows/show')).Show,\n    },\n  },\n  {\n    path: '/admin',\n    lazy: async () => {\n      const { AdminPage } = await import('./pages/admin');\n      return {\n        element: (\n          <RequireAuth>\n            <AdminPage />\n          </RequireAuth>\n        ),\n      };\n    },\n  },\n  {\n    path: '/fireworks',\n    lazy: async () => {\n      const { default: FireworksPage } = await import('./pages/fireworks');\n      return { element: <AgeGate minAge={18}><FireworksPage /></AgeGate> };\n    },\n  },\n  {\n    path: '/favorites',\n    async lazy() {\n      let { Favorites } = await import('./pages/favorites');\n      return { Component: () => <PrivateRoute redirectTo=\"/\" component={<Favorites />} /> };\n    },\n  },\n  {\n    path: '/feed',\n    lazy: async () => {\n      const [{ Feed }] = await Promise.all([import('./pages/feed'), loadMessages()]);\n      return { Component: Feed };\n    },\n  },\n  {\n    path: '/settings',\n    lazy: async () => {\n      const { settingsLoader } = await import('./loaders/settings');\n      return { loader: settingsLoader, Component: SettingsPage };\n    },\n  },\n  {\n    path: '/logout',\n    lazy: async () => {\n      const { loader } = await import('./pages/logout');\n      return { loader };\n    },\n  },\n  {\n    path: '/missing',\n    lazy: async () => {\n      const { Missing } = await import('./pages/reports');\n      return { Component: Missing };\n    },\n  },\n  {\n    path: '/named-only',\n    lazy: async () => {\n      const { default: Component } = await import('./pages/named_only');\n      return { Component };\n    },\n  },\n]);\n\nexport const jsxRoutes = createRoutesFromElements(\n  <Route path=\"/help\" lazy={async () => { const { HelpPage } = await import('./pages/help'); return { Component: HelpPage }; }} />\n);\n\nasync function loadMessages() {\n  return {};\n}\n",
+            )
+            .file(
+                "src/guards.tsx",
+                "export function RequireAuth({ children }: { children: unknown }) {\n  return children;\n}\n\nexport function AgeGate({ children }: { children: unknown; minAge: number }) {\n  return children;\n}\n\nexport function PrivateRoute({ component }: { component: unknown; redirectTo: string }) {\n  return component;\n}\n",
+            )
+            .file(
+                "src/pages/fireworks.tsx",
+                "export default function FireworksPage() {\n  return null;\n}\n",
+            )
+            .file(
+                "src/pages/favorites.tsx",
+                "export function Favorites() {\n  return null;\n}\n",
+            )
+            .file(
+                "src/invocation_page/index.ts",
+                "export * from './invocation_page';\n",
+            )
+            .file(
+                "src/invocation_page/invocation_page.tsx",
+                "export function InvocationPage() {\n  return null;\n}\n",
+            )
+            .file(
+                "src/invocation_page/tabs/index.ts",
+                "export * from './test_tab';\nexport * from './details_tab';\n",
+            )
+            .file(
+                "src/invocation_page/tabs/test_tab.tsx",
+                "export function TestTab() {\n  return null;\n}\n",
+            )
+            .file(
+                "src/invocation_page/tabs/details_tab.tsx",
+                "export function DetailsTab() {\n  return null;\n}\n",
+            )
+            .file(
+                "src/pages/login.tsx",
+                "export default function LoginPage() {\n  return null;\n}\n",
+            )
+            .file(
+                "src/pages/reports.tsx",
+                "export function ReportList() {\n  return null;\n}\n\nexport function ReportPage() {\n  return null;\n}\n\nexport default function ReportsHome() {\n  return null;\n}\n",
+            )
+            .file(
+                "src/pages/profile.tsx",
+                "export function ProfilePage() {\n  return null;\n}\n\nexport default function ProfileCard() {\n  return null;\n}\n",
+            )
+            .file(
+                "src/pages/projects.tsx",
+                "export function ProjectsPage() {\n  return null;\n}\n",
+            )
+            .file(
+                "src/loaders/team.ts",
+                "export async function teamLoader() {\n  return null;\n}\n",
+            )
+            .file(
+                "src/pages/team.tsx",
+                "export function TeamPage() {\n  return null;\n}\n",
+            )
+            .file(
+                "src/shows/loader.ts",
+                "export async function loader() {\n  return null;\n}\n",
+            )
+            .file(
+                "src/shows/show.tsx",
+                "export function Show() {\n  return null;\n}\n",
+            )
+            .file(
+                "src/pages/admin.tsx",
+                "export function AdminPage() {\n  return null;\n}\n",
+            )
+            .file(
+                "src/pages/feed.tsx",
+                "export function Feed() {\n  return null;\n}\n",
+            )
+            .file(
+                "src/loaders/settings.ts",
+                "export async function settingsLoader() {\n  return null;\n}\n",
+            )
+            .file(
+                "src/pages/settings.tsx",
+                "export function SettingsPage() {\n  return null;\n}\n",
+            )
+            .file(
+                "src/pages/logout.tsx",
+                "export async function loader() {\n  return null;\n}\n\nexport default function LogoutPage() {\n  return null;\n}\n",
+            )
+            .file(
+                "src/pages/named_only.tsx",
+                "export function Component() {\n  return null;\n}\n",
+            )
+            .file(
+                "src/pages/help.tsx",
+                "export function HelpPage() {\n  return null;\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        let report = graph.report();
+        assert!(!routes(graph).contains(&"/logout".to_string()), "{report}");
+        assert_eq!(
+            bindings(graph),
+            strings(&[
+                "/admin -> AdminPage@src/pages/admin.tsx",
+                "/favorites -> Favorites@src/pages/favorites.tsx",
+                "/feed -> Feed@src/pages/feed.tsx",
+                "/fireworks -> FireworksPage@src/pages/fireworks.tsx",
+                "/help -> HelpPage@src/pages/help.tsx",
+                "/invocations/:id -> InvocationPage@src/invocation_page/invocation_page.tsx",
+                "/invocations/:id/details -> DetailsTab@src/invocation_page/tabs/details_tab.tsx",
+                "/invocations/:id/details ~> InvocationPage@src/invocation_page/invocation_page.tsx",
+                "/invocations/:id/tests -> TestTab@src/invocation_page/tabs/test_tab.tsx",
+                "/invocations/:id/tests ~> InvocationPage@src/invocation_page/invocation_page.tsx",
+                "/login -> LoginPage@src/pages/login.tsx",
+                "/profile -> ProfilePage@src/pages/profile.tsx",
+                "/projects -> ProjectsPage@src/pages/projects.tsx",
+                "/reports -> ReportList@src/pages/reports.tsx",
+                "/reports/:id -> ReportPage@src/pages/reports.tsx",
+                "/settings -> SettingsPage@src/pages/settings.tsx",
+                "/shows/:id -> Show@src/shows/show.tsx",
+                "/team -> TeamPage@src/pages/team.tsx",
+            ]),
+            "{report}"
+        );
+        for (path, reference) in [
+            ("/missing", "import:./pages/reports#Missing"),
+            ("/named-only", "import:./pages/named_only#default"),
+        ] {
+            assert!(
+                graph
+                    .unresolved
+                    .iter()
+                    .any(|r| r.reference_name == reference
+                        && graph.node(&r.from_node_id).is_some_and(|n| n.name == path)),
+                "{path} links nothing\n{report}"
+            );
+        }
+    }
+
+    /// Upstream `react-router-outlet-routes.test.ts` (#2670): a route object
+    /// that renders `<Outlet />` — as its `element`, its `Component`, or
+    /// what its `lazy` loader hands back (Medusa's `:id` routes, which import
+    /// their page module only for its `loader`) — renders nothing of its own
+    /// and is no layout, yet stays an address a navigation reaches; at its
+    /// parent's address it only groups the routes inside it. No route
     /// reference to `Outlet` is left behind.
     #[test]
     fn pr2670_an_outlet_route_renders_nothing_of_its_own() {
@@ -20691,6 +21082,11 @@ mod react_router {
         let region_list = page("RegionList");
         let region_create = page("RegionCreate");
         let product_list = page("ProductList");
+        let loader = "export async function loader() {\n  return null;\n}\n\n";
+        let product_detail = format!("{loader}{}", page("ProductDetail"));
+        let variant_detail = page("VariantDetail");
+        let order_list = format!("{loader}{}", page("OrderList"));
+        let order_create = page("OrderCreate");
         let project = Project::new()
             .file(
                 "package.json",
@@ -20702,7 +21098,7 @@ mod react_router {
             )
             .file(
                 "src/router.tsx",
-                "import { createBrowserRouter, Outlet } from 'react-router-dom';\nimport { Shell } from './Shell';\n\nexport const router = createBrowserRouter([\n  {\n    element: <Shell />,\n    children: [\n      {\n        path: '/regions',\n        element: <Outlet />,\n        children: [\n          { path: '', lazy: () => import('./pages/region-list') },\n          { path: 'create', lazy: () => import('./pages/region-create') },\n        ],\n      },\n      {\n        path: '/products',\n        Component: Outlet,\n        children: [{ index: true, lazy: () => import('./pages/product-list') }],\n      },\n      { path: '/approvals', element: <Outlet /> },\n      { path: '/agents/:agentId', Component: Outlet },\n    ],\n  },\n]);\n",
+                "import { createBrowserRouter, Outlet } from 'react-router-dom';\nimport { Shell } from './Shell';\n\nexport const router = createBrowserRouter([\n  {\n    element: <Shell />,\n    children: [\n      {\n        path: '/regions',\n        element: <Outlet />,\n        children: [\n          { path: '', lazy: () => import('./pages/region-list') },\n          { path: 'create', lazy: () => import('./pages/region-create') },\n        ],\n      },\n      {\n        path: '/products',\n        Component: Outlet,\n        children: [{ index: true, lazy: () => import('./pages/product-list') }],\n      },\n      {\n        path: '/products/:id',\n        lazy: async () => {\n          const { loader } = await import('./pages/product-detail');\n          return { Component: Outlet, loader };\n        },\n        children: [\n          { path: '', lazy: () => import('./pages/product-detail') },\n          { path: 'variants/:variant_id', lazy: () => import('./pages/variant-detail') },\n        ],\n      },\n      {\n        path: '/orders',\n        lazy: async () => {\n          const { loader } = await import('./pages/order-list');\n          return { element: <Outlet />, loader };\n        },\n        children: [\n          { index: true, lazy: () => import('./pages/order-list') },\n          { path: 'new', lazy: () => import('./pages/order-create') },\n        ],\n      },\n      { path: '/approvals', element: <Outlet /> },\n      { path: '/agents/:agentId', Component: Outlet },\n    ],\n  },\n]);\n",
             )
             .file(
                 "src/errors/router.tsx",
@@ -20719,6 +21115,10 @@ mod react_router {
             .file("src/pages/region-list.tsx", &region_list)
             .file("src/pages/region-create.tsx", &region_create)
             .file("src/pages/product-list.tsx", &product_list)
+            .file("src/pages/product-detail.tsx", &product_detail)
+            .file("src/pages/variant-detail.tsx", &variant_detail)
+            .file("src/pages/order-list.tsx", &order_list)
+            .file("src/pages/order-create.tsx", &order_create)
             .index();
         let graph = project.graph();
         let report = graph.report();
@@ -20728,7 +21128,11 @@ mod react_router {
                 "/",
                 "/agents/:agentId",
                 "/approvals",
+                "/orders",
+                "/orders/new",
                 "/products",
+                "/products/:id",
+                "/products/:id/variants/:variant_id",
                 "/projects/:projectId",
                 "/regions",
                 "/regions/create"
@@ -20741,8 +21145,18 @@ mod react_router {
                 "/ -> Layout@src/errors/routes.tsx",
                 "/agents/:agentId ~> Shell@src/Shell.tsx",
                 "/approvals ~> Shell@src/Shell.tsx",
+                "/orders -> Component@src/pages/order-list.tsx",
+                "/orders ~> Shell@src/Shell.tsx",
+                "/orders/new -> Component@src/pages/order-create.tsx",
+                "/orders/new ~> Shell@src/Shell.tsx",
                 "/products -> Component@src/pages/product-list.tsx",
                 "/products ~> Shell@src/Shell.tsx",
+                "/products/:id -> Component@src/pages/product-detail.tsx",
+                "/products/:id ~> Shell@src/Shell.tsx",
+                // Not inside product-detail: its route hands React Router
+                // `Component: Outlet`.
+                "/products/:id/variants/:variant_id -> Component@src/pages/variant-detail.tsx",
+                "/products/:id/variants/:variant_id ~> Shell@src/Shell.tsx",
                 "/projects/:projectId -> Project@src/errors/routes.tsx",
                 "/projects/:projectId ~> Layout@src/errors/routes.tsx",
                 "/regions -> Component@src/pages/region-list.tsx",

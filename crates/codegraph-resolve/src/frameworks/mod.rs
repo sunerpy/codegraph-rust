@@ -21,6 +21,7 @@ pub(crate) mod godot_resource;
 pub(crate) mod godot_scene;
 pub mod godot_script;
 pub(crate) mod js_scan;
+pub(crate) mod lazy_loader;
 pub mod nestjs;
 pub mod nextjs;
 pub mod package_deps;

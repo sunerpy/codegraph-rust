@@ -35,6 +35,7 @@ use serde::{Deserialize, Serialize};
 
 use super::framework_node;
 use super::js_scan::{JS_SPACE, is_js_space, js_trim, match_bracket, skip_string};
+use super::lazy_loader;
 use super::route_href::{
     ExactTable, RouteEntry, destinations_for_href, first_argument_text, parse_href_expression,
     read_href_via_local,
@@ -59,7 +60,7 @@ pub(crate) const LAYOUT_PREFIX: &str = "layout:";
 
 /// React Router's `<Outlet />`: what a route with no element of its own
 /// renders, the routes inside it (`OUTLET`).
-const OUTLET: &str = "Outlet";
+pub(crate) const OUTLET: &str = "Outlet";
 
 /// How many nested units and JSX elements the scanner follows (`unit` and
 /// `jsx` count against it together). Upstream recurses without a bound; this
@@ -865,20 +866,26 @@ fn prop_tags(text: &str) -> Vec<String> {
     out
 }
 
-/// The module a `lazy` loader's first `import(…)` names, as the route's
-/// reference names it: `lazy-import:./routes/x` (upstream's reading before
-/// #2480).
+/// What a route's `lazy` loader renders, as the route's reference names it
+/// ([`lazy_loader::lazy_route_reference`]), the page an `element` it hands
+/// back shows read as a route's `element` is.
 fn lazy_route_reference(loader: Option<&str>) -> Option<String> {
-    static FIRST_IMPORT: OnceLock<Regex> = OnceLock::new();
-    let import = FIRST_IMPORT
+    lazy_loader::lazy_route_reference(loader, &|jsx| component_name(Some(jsx), true))
+}
+
+/// A route object's loader written as a method at `entry`, `async lazy() {
+/// … }`: its `async ` prefix and where its parameter list opens
+/// (`^(async\s+)?lazy\s*\(` within 32 code units).
+fn lazy_method(source: &str, entry: usize) -> Option<(&str, usize)> {
+    static METHOD: OnceLock<Regex> = OnceLock::new();
+    let window = &source[entry..floor_boundary(source, entry + 32)];
+    let method = METHOD
         .get_or_init(|| {
-            Regex::new(&format!(
-                r#"(?-u:\b)import{JS_SPACE}*\({JS_SPACE}*["']([^"']+)["']{JS_SPACE}*\)"#
-            ))
-            .expect("first import")
+            Regex::new(&format!(r"^(async{JS_SPACE}+)?lazy{JS_SPACE}*\(")).expect("lazy method")
         })
-        .captures(loader?)?;
-    Some(format!("{LAZY_ROUTE_PREFIX}{}", import.get(1)?.as_str()))
+        .captures(window)?;
+    let asynchronous = method.get(1).map_or("", |prefix| prefix.as_str());
+    Some((asynchronous, entry + method.get(0)?.end() - 1))
 }
 
 /// A data-router property's value and where its key starts.
@@ -1136,6 +1143,7 @@ impl<'s> Scanner<'s> {
             } else {
                 // Skip a whole entry (spread, method, shorthand), but still
                 // visit nested units.
+                let entry = i;
                 loop {
                     i = self.trivia(i);
                     if i >= self.len()
@@ -1145,6 +1153,17 @@ impl<'s> Scanner<'s> {
                         break;
                     }
                     i = self.unit(i);
+                }
+                // `async lazy() { … }`: a route's loader written as a method.
+                if self.objects
+                    && ch == b'{'
+                    && let Some((asynchronous, paren)) = lazy_method(self.source, entry)
+                {
+                    let value = format!(
+                        "{asynchronous}function {}",
+                        js_trim(&self.source[paren..i.max(paren)])
+                    );
+                    fields.insert("lazy".to_string(), Field { value, at: entry });
                 }
             }
             if self.byte(i) == Some(b',') {
@@ -2385,10 +2404,10 @@ export const router = createBrowserRouter([
         assert!(scanned(&jsx(100_000), "App.tsx").0.is_empty());
     }
 
-    /// A `lazy` loader names the module its first `import(…)` loads, as
-    /// upstream read it before the loader readers (#2480).
+    /// A `lazy` loader names the module it hands back (#2480), and one the
+    /// loader readers cannot read the module its first `import(…)` loads.
     #[test]
-    fn a_lazy_loader_names_the_module_it_imports_first() {
+    fn a_lazy_loader_names_the_module_it_hands_back() {
         assert_eq!(
             lazy_route_reference(Some("() => import('./routes/landing')")).as_deref(),
             Some("lazy-import:./routes/landing")
@@ -2398,7 +2417,11 @@ export const router = createBrowserRouter([
                 "async () => { const { loader } = await import(\"./a\"); return import('./b'); }"
             ))
             .as_deref(),
-            Some("lazy-import:./a")
+            Some("lazy-import:./b")
+        );
+        assert_eq!(
+            lazy_route_reference(Some("() => helper(import('./c'))")).as_deref(),
+            Some("lazy-import:./c")
         );
         assert_eq!(lazy_route_reference(Some("lazyPage(load)")), None);
         assert_eq!(lazy_route_reference(None), None);
