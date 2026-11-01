@@ -1,10 +1,11 @@
 //! Concrete [`FrameworkResolver`] implementations + the detection registry.
 //!
 //! Ports the subset of `upstream resolution/frameworks/` that this port
-//! ships: React ([`react`]), React Router ([`react_router`]), Next.js
-//! ([`nextjs`]), Expo Router ([`expo_router`]), Vue and Nuxt ([`vue`]),
-//! NestJS ([`nestjs`]), Godot ([`godot`]) and Tauri ([`tauri`]). The other
-//! upstream resolvers remain deferred (see `KNOWN_DIFFS.md`).
+//! ships: React ([`react`]), React Router ([`react_router`]), TanStack Router
+//! ([`tanstack_router`]), Next.js ([`nextjs`]), Vue Router ([`vue_router`]),
+//! Expo Router ([`expo_router`]), Vue and Nuxt ([`vue`]), NestJS
+//! ([`nestjs`]), Godot ([`godot`]) and Tauri ([`tauri`]). The other upstream
+//! resolvers remain deferred (see `KNOWN_DIFFS.md`).
 //!
 //! [`detect_frameworks`] ports `frameworks/index.ts:detectFrameworks` restricted
 //! to the ported resolvers; the orchestrator hands the detected list to
@@ -33,6 +34,7 @@ pub mod route_href;
 pub mod tanstack_router;
 pub mod tauri;
 pub mod vue;
+pub mod vue_router;
 
 use crate::framework::FrameworkResolver;
 use crate::types::ResolutionContext;
@@ -74,6 +76,11 @@ pub fn detect_frameworks(context: &dyn ResolutionContext) -> Vec<Box<dyn Framewo
         // React. It claims only navigation calls that name one of its own
         // pages, which no resolver above resolves.
         Box::new(nextjs::NextjsResolver),
+        // Vue Router's config routes and navigation, by name or by path
+        // (F6), after Next.js and before Expo Router, as upstream orders the
+        // routers. It claims navigation calls only where they name one of
+        // its own routes or a Nuxt page, and its routes' own references.
+        Box::new(vue_router::VueRouterResolver),
         // Expo Router screens and navigation (F2), after Next.js as upstream
         // registers it. It claims navigation calls only where their href
         // names one of its own screens.

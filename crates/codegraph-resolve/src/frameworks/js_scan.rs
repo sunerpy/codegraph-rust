@@ -136,6 +136,34 @@ pub(crate) fn top_level_items(text: &str) -> Vec<&str> {
     out
 }
 
+/// Each `{…}` written directly in `s[from..to]`, as the offsets of its braces
+/// (upstream `topLevelObjects`). A string or template is stepped over; a
+/// bracket or paren is not, so an object inside one is listed too. A brace
+/// that never closes ends the list.
+pub(crate) fn top_level_objects(s: &str, from: usize, to: usize) -> Vec<(usize, usize)> {
+    let bytes = s.as_bytes();
+    let mut out = Vec::new();
+    let mut i = from;
+    while i < to.min(bytes.len()) {
+        match bytes[i] {
+            b'"' | b'\'' | b'`' => match skip_string(s, i) {
+                Some(end) => i = end,
+                None => return out,
+            },
+            b'{' => match match_bracket(s, i) {
+                Some(end) => {
+                    out.push((i, end));
+                    i = end;
+                }
+                None => return out,
+            },
+            _ => {}
+        }
+        i += 1;
+    }
+    out
+}
+
 /// One field [`read_fields`] reads of an object literal: its key, its value's
 /// text, and where the key starts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -309,6 +337,53 @@ pub(crate) fn statement_end(text: &str, from: usize, comma: bool) -> usize {
         i += 1;
     }
     text.len()
+}
+
+/// Whether byte `at` of `s` is at its top level (Rust-only): outside every
+/// bracket group, string and template, so a declaration starting there is
+/// nested in no function, class, object or block, an anonymous `export
+/// default function () {…}`'s included. `s` has its comments blanked; a
+/// group or string that never closes holds the rest of the text.
+pub(crate) fn at_top_level(s: &str, at: usize) -> bool {
+    let bytes = s.as_bytes();
+    if at > bytes.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < at {
+        let close = match bytes[i] {
+            b'"' | b'\'' | b'`' => skip_string(s, i),
+            b'{' | b'(' | b'[' => match_bracket(s, i),
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+        match close {
+            Some(close) if close < at => i = close + 1,
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// Whether the declaration starting at byte `at` of `s` is the one `export
+/// default` writes (Rust-only): the words before it are `export default`,
+/// as in `export default function X`, `export default async function X` and
+/// `export default abstract class X`, which start at their first keyword.
+/// `s` has its comments blanked.
+pub(crate) fn follows_export_default(s: &str, at: usize) -> bool {
+    let Some(before) = s.get(..at) else {
+        return false;
+    };
+    let Some(rest) = before.trim_end_matches(is_js_space).strip_suffix("default") else {
+        return false;
+    };
+    let gap = rest.trim_end_matches(is_js_space);
+    gap.len() < rest.len()
+        && gap.strip_suffix("export").is_some_and(|head| {
+            !head.ends_with(|c: char| c.is_ascii_alphanumeric() || matches!(c, '_' | '$' | '.'))
+        })
 }
 
 /// Whether `text` is one JavaScript identifier (ASCII form).
@@ -541,5 +616,75 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["a"]
         );
+    }
+
+    /// A position is at the top level outside every bracket group, string
+    /// and template; a group that never closes holds the rest.
+    #[test]
+    fn a_position_is_at_the_top_level_outside_every_group() {
+        let source = "export function Outer() {\n  function Hidden() {}\n}\nexport default function () { function Inner() {} }\nexport const Other = 1, View = () => 2\nconst s = '{', t = `${ { } }`, Last = 3\nopen(";
+        let at = |needle: &str| source.find(needle).expect("needle");
+        for top in ["Outer", "Other", "View", "Last", "export default"] {
+            assert!(at_top_level(source, at(top)), "{top}");
+        }
+        for nested in ["Hidden", "Inner"] {
+            assert!(!at_top_level(source, at(nested)), "{nested}");
+        }
+        // The opening bracket itself is at the top level, the rest of a
+        // group that never closes is not, and so is nothing past the end.
+        assert!(at_top_level(source, at("() => 2")));
+        assert!(!at_top_level(source, source.len()));
+        assert!(!at_top_level(source, source.len() + 1));
+        assert!(at_top_level("a", 1));
+    }
+
+    /// `export default` writes the declaration its words precede.
+    #[test]
+    fn export_default_writes_the_declaration_its_words_precede() {
+        for (source, keyword) in [
+            ("export default function X() {}", "function"),
+            ("export default async function X() {}", "async"),
+            ("export default abstract class X {}", "abstract"),
+            ("export  default\n  class X {}", "class"),
+            ("x;export default function X() {}", "function"),
+        ] {
+            assert!(
+                follows_export_default(source, source.find(keyword).expect("keyword")),
+                "{source}"
+            );
+        }
+        for (source, keyword) in [
+            ("export function X() {}", "function"),
+            ("export const X = () => 1", "X"),
+            ("default function X() {}", "function"),
+            ("exportdefault function X() {}", "function"),
+            ("reexport default function X() {}", "function"),
+            ("m.export default function X() {}", "function"),
+            ("function X() {}", "function"),
+        ] {
+            assert!(
+                !follows_export_default(source, source.find(keyword).expect("keyword")),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_objects_of_an_array_are_listed_with_their_braces() {
+        let s = "[tableRouter, { path: '/a', meta: { x: 1 } }, '{ not }', `${ {} }`, f({ path: '/b' }), { path: '*' }]";
+        let objects = top_level_objects(s, 1, s.len() - 1);
+        assert_eq!(
+            objects
+                .iter()
+                .map(|&(start, end)| &s[start..=end])
+                .collect::<Vec<_>>(),
+            [
+                "{ path: '/a', meta: { x: 1 } }",
+                "{ path: '/b' }",
+                "{ path: '*' }"
+            ]
+        );
+        // A brace that never closes ends the list.
+        assert_eq!(top_level_objects("[{ a: 1 }, { b: 2", 1, 17).len(), 1);
     }
 }

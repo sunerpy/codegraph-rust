@@ -182,14 +182,15 @@ the Rust graph holds different facts, the viewer shows what this index holds:
   The frontend is built without it, so the Steps view says it cannot draw steps.
 - **Screens** answers upstream's own "no screen navigation" result: its
   builder is not ported, so the `navigates` edges the React Router, TanStack
-  Router, Next.js and Expo Router resolvers draw are not drawn as screens yet.
+  Router, Next.js, Vue Router and Expo Router resolvers draw are not drawn as
+  screens yet.
 - Branch conditions on call sites (`when`) are absent from every edge: the
   builders that attach them are not ported either.
-- Routes come from the framework resolvers this port has — React Router
-  and TanStack Router routes, Next.js pages and route handlers, Expo Router
-  screens and API routes, Nuxt pages, NestJS controllers.
-  Express, Go HTTP and Vue Router routers are not among them, so those
-  projects are not routed apps here.
+- Routes come from the framework resolvers this port has — React Router,
+  TanStack Router and Vue Router routes, Next.js pages and route handlers,
+  Expo Router screens and API routes, Nuxt pages, NestJS controllers.
+  Express and Go HTTP routers are not among them, so those projects are not
+  routed apps here.
 - The Rust index has no synthesized dynamic-dispatch edges, so a flow never
   shows a dashed `via …` hop from synthesis, and a Go interface's implicit
   implementations are not part of its type hierarchy.

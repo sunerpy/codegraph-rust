@@ -11348,6 +11348,399 @@ pub fn typescript_tanstack_router_dependency_appears_in_package_json() -> Case {
         )
 }
 
+/// The manifest of a Vue Router app.
+const VUE_ROUTER_PACKAGE: &str =
+    "{\"name\":\"app\",\"dependencies\":{\"vue\":\"3\",\"vue-router\":\"4\"}}\n";
+/// A Vue Router table of lazy views, by name: `home` at `/`, `login`,
+/// `settings`, and `/posts/new` beside `/posts/:id`.
+const VUE_ROUTER_TABLE: &str = "import { createRouter, createWebHistory } from 'vue-router'\nexport default createRouter({\n  history: createWebHistory(),\n  routes: [\n    { name: 'home', path: '/', component: () => import('../views/Home.vue') },\n    { name: 'login', path: '/login', component: () => import('../views/Login.vue') },\n    { name: 'settings', path: '/settings', component: () => import('../views/Settings.vue') },\n    { name: 'new-post', path: '/posts/new', component: () => import('../views/NewPost.vue') },\n    { name: 'post', path: '/posts/:id', component: () => import('../views/Post.vue') },\n  ],\n})\n";
+/// [`VUE_ROUTER_TABLE`] with `login` renamed `sign-in` at the same path.
+const VUE_ROUTER_TABLE_RENAMED: &str = "import { createRouter, createWebHistory } from 'vue-router'\nexport default createRouter({\n  history: createWebHistory(),\n  routes: [\n    { name: 'home', path: '/', component: () => import('../views/Home.vue') },\n    { name: 'sign-in', path: '/login', component: () => import('../views/Login.vue') },\n    { name: 'settings', path: '/settings', component: () => import('../views/Settings.vue') },\n    { name: 'new-post', path: '/posts/new', component: () => import('../views/NewPost.vue') },\n    { name: 'post', path: '/posts/:id', component: () => import('../views/Post.vue') },\n  ],\n})\n";
+/// [`VUE_ROUTER_TABLE`] without its `/posts/new` route.
+const VUE_ROUTER_TABLE_WITHOUT_NEW_POST: &str = "import { createRouter, createWebHistory } from 'vue-router'\nexport default createRouter({\n  history: createWebHistory(),\n  routes: [\n    { name: 'home', path: '/', component: () => import('../views/Home.vue') },\n    { name: 'login', path: '/login', component: () => import('../views/Login.vue') },\n    { name: 'settings', path: '/settings', component: () => import('../views/Settings.vue') },\n    { name: 'post', path: '/posts/:id', component: () => import('../views/Post.vue') },\n  ],\n})\n";
+/// A `.vue` view rendering `name`.
+const VUE_VIEW: &str =
+    "<template><div>view</div></template>\n<script setup>\nconst view = 1\n</script>\n";
+
+/// A Vue Router app: its manifest, its table and the views it names.
+fn vue_router_app(case: Case) -> Case {
+    case.file("package.json", VUE_ROUTER_PACKAGE)
+        .file("src/router/index.js", VUE_ROUTER_TABLE)
+        .file("src/views/Home.vue", VUE_VIEW)
+        .file("src/views/Login.vue", VUE_VIEW)
+        .file("src/views/Settings.vue", VUE_VIEW)
+        .file("src/views/NewPost.vue", VUE_VIEW)
+        .file("src/views/Post.vue", VUE_VIEW)
+}
+
+/// W7-11 (upstream F6): a navigation call's file is edited to name another
+/// route by name: the `navigates` edge follows the name.
+pub fn javascript_vue_router_navigation_call_names_another_route() -> Case {
+    vue_router_app(Case::new(
+        Change::BodyEdit,
+        &[Language::JavaScript, Language::Vue],
+    ))
+    .file(
+        "src/lib/nav.js",
+        "export function open(router) {\n  router.push({ name: 'login' })\n}\n",
+    )
+    .write(
+        "src/lib/nav.js",
+        "export function open(router) {\n  router.push({ name: 'settings' })\n}\n",
+    )
+    .edge_before(
+        "function open",
+        "navigates",
+        "route src/router/index.js::route:/login",
+    )
+    .edge_after(
+        "function open",
+        "navigates",
+        "route src/router/index.js::route:/settings",
+    )
+    .no_edge_after(
+        "function open",
+        "navigates",
+        "route src/router/index.js::route:/login",
+    )
+    .edge_metadata_after(
+        (
+            "function open",
+            "navigates",
+            "route src/router/index.js::route:/settings",
+        ),
+        "framework",
+        "vue-router",
+    )
+}
+
+/// W7-11 (upstream F6): the table renames a route and keeps its path, so
+/// its node keeps its id: the call in another file that named the old name
+/// navigates nowhere.
+pub fn javascript_vue_router_route_rename_drops_its_named_navigation() -> Case {
+    vue_router_app(Case::new(
+        Change::BodyEdit,
+        &[Language::JavaScript, Language::Vue],
+    ))
+    .file(
+        "src/lib/nav.js",
+        "export function open(router) {\n  router.push({ name: 'login' })\n}\n",
+    )
+    .write("src/router/index.js", VUE_ROUTER_TABLE_RENAMED)
+    .edge_before(
+        "function open",
+        "navigates",
+        "route src/router/index.js::route:/login",
+    )
+    .no_edge_after(
+        "function open",
+        "navigates",
+        "route src/router/index.js::route:/login",
+    )
+    .edge_throughout(
+        "route src/router/index.js::route:/login",
+        "calls",
+        "component src/views/Login.vue::Login",
+    )
+}
+
+/// W7-11 (upstream F6): the static route a call names by path leaves the
+/// table: the call navigates to the dynamic route that now serves it.
+pub fn javascript_vue_router_static_route_delete_falls_back_to_the_dynamic_route() -> Case {
+    vue_router_app(Case::new(
+        Change::BodyEdit,
+        &[Language::JavaScript, Language::Vue],
+    ))
+    .file(
+        "src/lib/nav.js",
+        "export function create(router) {\n  router.push('/posts/new')\n}\n",
+    )
+    .write("src/router/index.js", VUE_ROUTER_TABLE_WITHOUT_NEW_POST)
+    .edge_before(
+        "function create",
+        "navigates",
+        "route src/router/index.js::route:/posts/new",
+    )
+    .edge_after(
+        "function create",
+        "navigates",
+        "route src/router/index.js::route:/posts/:id",
+    )
+}
+
+/// W7-11 (upstream F6): the manifest comes to declare Vue Router: the
+/// table's routes appear, bound to their views, and a call names one,
+/// though no source changed.
+pub fn javascript_vue_router_dependency_appears_in_package_json() -> Case {
+    Case::new(Change::ControlFile, &[Language::JavaScript, Language::Vue])
+        .file(
+            "package.json",
+            "{\"name\":\"app\",\"dependencies\":{\"vue\":\"3\"}}\n",
+        )
+        .file("src/router/index.js", VUE_ROUTER_TABLE)
+        .file("src/views/Settings.vue", VUE_VIEW)
+        .file(
+            "src/lib/nav.js",
+            "export function open(router) {\n  router.push({ name: 'settings' })\n}\n",
+        )
+        .write("package.json", VUE_ROUTER_PACKAGE)
+        .edge_after(
+            "route src/router/index.js::route:/settings",
+            "calls",
+            "component src/views/Settings.vue::Settings",
+        )
+        .edge_after(
+            "function open",
+            "navigates",
+            "route src/router/index.js::route:/settings",
+        )
+}
+
+/// W7-11 (upstream F6): the layout a child route renders inside is edited:
+/// the child still references it as its layout.
+pub fn javascript_vue_router_layout_body_edit_keeps_the_layout() -> Case {
+    Case::new(Change::BodyEdit, &[Language::JavaScript, Language::Vue])
+        .file("package.json", VUE_ROUTER_PACKAGE)
+        .file(
+            "src/router/index.js",
+            "import { createRouter } from 'vue-router'\nimport Layout from '../layout/index.vue'\nexport default createRouter({\n  routes: [\n    {\n      path: '/admin',\n      component: Layout,\n      redirect: '/admin/users',\n      children: [{ path: 'users', component: () => import('../views/Users.vue') }],\n    },\n  ],\n})\n",
+        )
+        .file("src/layout/index.vue", VUE_VIEW)
+        .file("src/views/Users.vue", VUE_VIEW)
+        .write(
+            "src/layout/index.vue",
+            "<template><main><router-view /></main></template>\n<script setup>\nconst frame = 1\n</script>\n",
+        )
+        .edge_throughout(
+            "route src/router/index.js::route:/admin/users",
+            "references",
+            "component src/layout/index.vue::index",
+        )
+        .edge_throughout(
+            "route src/router/index.js::route:/admin/users",
+            "calls",
+            "component src/views/Users.vue::Users",
+        )
+}
+
+/// W7-11 (upstream F6): a Nuxt app's `router.push` is edited to name another
+/// page: the `navigates` edge follows the path to the Nuxt page. (A bare
+/// `navigateTo` is the Vue resolver's Nuxt auto-import at `e8ddc4e2`, so it
+/// navigates nowhere; upstream #2826 changes that after the audited range.)
+pub fn typescript_nuxt_router_push_names_another_page() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Vue, Language::TypeScript])
+        .file(
+            "package.json",
+            "{\"name\":\"site\",\"dependencies\":{\"nuxt\":\"3\",\"vue\":\"3\"}}\n",
+        )
+        .file("pages/index.vue", VUE_VIEW)
+        .file("pages/about.vue", VUE_VIEW)
+        .file(
+            "composables/useGo.ts",
+            "export function go(router) {\n  return router.push('/about')\n}\n",
+        )
+        .write(
+            "composables/useGo.ts",
+            "export function go(router) {\n  return router.push('/')\n}\n",
+        )
+        .edge_before(
+            "function go",
+            "navigates",
+            "route pages/about.vue::route:/about",
+        )
+        .edge_after("function go", "navigates", "route pages/index.vue::route:/")
+        .no_edge_after(
+            "function go",
+            "navigates",
+            "route pages/about.vue::route:/about",
+        )
+}
+
+/// W7-11 (upstream F6): the view a lazy route names appears after the
+/// table: the route calls its component, as in a fresh index.
+pub fn javascript_vue_router_lazy_view_appears() -> Case {
+    Case::new(
+        Change::AddImportTarget,
+        &[Language::JavaScript, Language::Vue],
+    )
+    .file("package.json", VUE_ROUTER_PACKAGE)
+    .file("src/router/index.js", VUE_ROUTER_TABLE)
+    .write("src/views/Settings.vue", VUE_VIEW)
+    .edge_after(
+        "route src/router/index.js::route:/settings",
+        "calls",
+        "component src/views/Settings.vue::Settings",
+    )
+}
+
+/// W7-11: a lazy route's view module that is no SFC renders the function
+/// its `export default` names. The default moves to another function of
+/// the module, both kept: the route calls the new default, as in a fresh
+/// index, though the routes file is untouched.
+pub fn javascript_vue_router_lazy_module_default_export_moves() -> Case {
+    Case::new(Change::BodyEdit, &[Language::JavaScript])
+        .file("package.json", VUE_ROUTER_PACKAGE)
+        .file(
+            "src/router/index.js",
+            "import { createRouter } from 'vue-router'\nexport default createRouter({\n  routes: [{ path: '/home', component: () => import('../views/home.js') }],\n})\n",
+        )
+        .file(
+            "src/views/home.js",
+            "export function Banner() {\n  return null\n}\nexport default function HomeView() {\n  return null\n}\n",
+        )
+        .write(
+            "src/views/home.js",
+            "export default function Banner() {\n  return null\n}\nexport function HomeView() {\n  return null\n}\n",
+        )
+        .edge_before(
+            "route src/router/index.js::route:/home",
+            "calls",
+            "function HomeView",
+        )
+        .edge_after(
+            "route src/router/index.js::route:/home",
+            "calls",
+            "function Banner",
+        )
+        .no_edge_after(
+            "route src/router/index.js::route:/home",
+            "calls",
+            "function HomeView",
+        )
+}
+
+/// W7-11: the same move written as a separate `export default` statement:
+/// neither function changes, only the statement naming one.
+pub fn javascript_vue_router_lazy_module_default_statement_names_another() -> Case {
+    Case::new(Change::BodyEdit, &[Language::JavaScript])
+        .file("package.json", VUE_ROUTER_PACKAGE)
+        .file(
+            "src/router/index.js",
+            "import { createRouter } from 'vue-router'\nexport default createRouter({\n  routes: [{ path: '/home', component: () => import('../views/home.js') }],\n})\n",
+        )
+        .file(
+            "src/views/home.js",
+            "function Banner() {\n  return null\n}\nfunction HomeView() {\n  return null\n}\nexport default HomeView\n",
+        )
+        .write(
+            "src/views/home.js",
+            "function Banner() {\n  return null\n}\nfunction HomeView() {\n  return null\n}\nexport default Banner\n",
+        )
+        .edge_before("route src/router/index.js::route:/home", "calls", "function HomeView")
+        .edge_after("route src/router/index.js::route:/home", "calls", "function Banner")
+        .no_edge_after("route src/router/index.js::route:/home", "calls", "function HomeView")
+}
+
+/// The routes file the W7-11 import cases share: a route renders the
+/// layout its named import takes.
+const VUE_ROUTER_IMPORTED_LAYOUT: &str = "import { createRouter } from 'vue-router'\nimport { FrameLayout } from '../layouts'\nexport default createRouter({\n  routes: [{ path: '/frame', component: FrameLayout }],\n})\n";
+
+/// W7-11: the module a route's named import names appears after the routes
+/// file: the route calls the export, as in a fresh index.
+pub fn typescript_vue_router_imported_layout_appears() -> Case {
+    Case::new(
+        Change::AddImportTarget,
+        &[Language::TypeScript, Language::Vue],
+    )
+    .file("package.json", VUE_ROUTER_PACKAGE)
+    .file("src/router/index.ts", VUE_ROUTER_IMPORTED_LAYOUT)
+    .file("src/layouts/frame.vue", VUE_VIEW)
+    .write(
+        "src/layouts/index.ts",
+        "export const FrameLayout = () => import('./frame.vue')\n",
+    )
+    .edge_after(
+        "route src/router/index.ts::route:/frame",
+        "calls",
+        "function FrameLayout",
+    )
+}
+
+/// W7-11: the barrel a route's named import goes through re-exports
+/// another layout under the name: the route calls the new one, as in a
+/// fresh index, though the routes file is untouched.
+pub fn typescript_vue_router_barrel_reexports_another_layout() -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript, Language::Vue])
+        .file("package.json", VUE_ROUTER_PACKAGE)
+        .file("src/router/index.ts", VUE_ROUTER_IMPORTED_LAYOUT)
+        .file(
+            "src/layouts/index.ts",
+            "export { default as FrameLayout } from './frame.vue'\n",
+        )
+        .file("src/layouts/frame.vue", VUE_VIEW)
+        .file("src/layouts/wide.vue", VUE_VIEW)
+        .write(
+            "src/layouts/index.ts",
+            "export { default as FrameLayout } from './wide.vue'\n",
+        )
+        .edge_before(
+            "route src/router/index.ts::route:/frame",
+            "calls",
+            "component src/layouts/frame.vue::frame",
+        )
+        .edge_after(
+            "route src/router/index.ts::route:/frame",
+            "calls",
+            "component src/layouts/wide.vue::wide",
+        )
+        .no_edge_after(
+            "route src/router/index.ts::route:/frame",
+            "calls",
+            "component src/layouts/frame.vue::frame",
+        )
+}
+
+/// The layouts module of the W7-11 declarator cases: the layout is a
+/// statement's second declarator, unexported and exported.
+const VUE_ROUTER_SECOND_DECLARATOR: &str =
+    "const Other = 1, FrameLayout = () => import('./frame.vue')\n";
+const VUE_ROUTER_EXPORTED_SECOND_DECLARATOR: &str =
+    "export const Other = 1, FrameLayout = () => import('./frame.vue')\n";
+
+/// W7-11: the statement declaring a route's layout as its second declarator
+/// gains `export`: the route calls the layout, as in a fresh index, though
+/// the routes file is untouched.
+pub fn typescript_vue_router_second_declarator_gains_its_export() -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript, Language::Vue])
+        .file("package.json", VUE_ROUTER_PACKAGE)
+        .file("src/router/index.ts", VUE_ROUTER_IMPORTED_LAYOUT)
+        .file("src/layouts/index.ts", VUE_ROUTER_SECOND_DECLARATOR)
+        .file("src/layouts/frame.vue", VUE_VIEW)
+        .write(
+            "src/layouts/index.ts",
+            VUE_ROUTER_EXPORTED_SECOND_DECLARATOR,
+        )
+        .edge_after(
+            "route src/router/index.ts::route:/frame",
+            "calls",
+            "function FrameLayout",
+        )
+}
+
+/// W7-11: the statement declaring a route's layout as its second declarator
+/// loses `export`: the route calls nothing, as in a fresh index.
+pub fn typescript_vue_router_second_declarator_loses_its_export() -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript, Language::Vue])
+        .file("package.json", VUE_ROUTER_PACKAGE)
+        .file("src/router/index.ts", VUE_ROUTER_IMPORTED_LAYOUT)
+        .file(
+            "src/layouts/index.ts",
+            VUE_ROUTER_EXPORTED_SECOND_DECLARATOR,
+        )
+        .file("src/layouts/frame.vue", VUE_VIEW)
+        .write("src/layouts/index.ts", VUE_ROUTER_SECOND_DECLARATOR)
+        .edge_before(
+            "route src/router/index.ts::route:/frame",
+            "calls",
+            "function FrameLayout",
+        )
+        .no_edge_after(
+            "route src/router/index.ts::route:/frame",
+            "calls",
+            "function FrameLayout",
+        )
+}
+
 /// The code-based route tree the W7-10 reparenting case edits. It exports
 /// the tree: in a module that exports nothing, a route is no other file's to
 /// reach (KEEP-RUST, W7-10).

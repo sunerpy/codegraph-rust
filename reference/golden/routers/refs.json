@@ -682,16 +682,6 @@
   {
     "candidates": null,
     "col": 9,
-    "file_path": "apps/nuxt/pages/index.vue",
-    "from_node_id": "function:13bf526514dd2ebd32bee115b7bd0144",
-    "language": "vue",
-    "line": 4,
-    "reference_kind": "calls",
-    "reference_name": "navigateTo"
-  },
-  {
-    "candidates": null,
-    "col": 9,
     "file_path": "apps/react-router/src/main.tsx",
     "from_node_id": "file:apps/react-router/src/main.tsx",
     "language": "tsx",
@@ -748,16 +738,6 @@
     "line": 1,
     "reference_kind": "imports",
     "reference_name": "createRouter"
-  },
-  {
-    "candidates": null,
-    "col": 9,
-    "file_path": "apps/vue/src/router/index.ts",
-    "from_node_id": "function:66ba7a3a4954c0c8fda1292c5d336133",
-    "language": "typescript",
-    "line": 17,
-    "reference_kind": "calls",
-    "reference_name": "router.push"
   },
   {
     "candidates": null,

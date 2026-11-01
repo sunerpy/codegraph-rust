@@ -299,6 +299,52 @@ listed.
   a module, a `main.tsx` that builds `createBrowserRouter([...])` or a
   TanStack code route tree and renders it, is reached by no navigation from
   another file (`resolver.rs`).
+- **A name or a path two Vue Router routes of one app carry (W7-11).** A
+  navigation call matches only the routes of its own app, as in colby. Each
+  table entry is a route of its own, listed once where it is written, its
+  node named by its file, line and path, and a name or a path more than one
+  entry of the app carries stays unresolved, two entries that repeat each
+  other or share a line included. colby skips an entry whose path and name
+  an earlier entry of its file gave, keeps the first route of a name or a
+  path in node order, which a sync changes, and finds an entry's route by
+  its path, so where one file declares a path twice, each name of that path
+  goes to the file's last route of it. A `children` field is read only as
+  an array written in place: after `children: kids`, colby's
+  `indexOf('[')` reads the next array, a later entry's children, as that
+  entry's too (`vue_router.rs`).
+- **A Vue Router destination that is no whole literal (W7-11).** A
+  navigation's destination is read only when it is whole: a string, a
+  template whose holes fill whole segments, a conditional of them, or a
+  local initialized to one, and of an object destination only the object's
+  own `name` and `path`; a comment does not end the value (`'/' /* x */ +
+  next` goes on). colby reads the literal heading an expression, so
+  vue-element-admin's `replace({ path: '/redirect' + fullPath })` navigates
+  to the `/redirect` frame, a hole sharing a segment (`` `/p-${id}` ``) as
+  the segment, and the first `name:` or `path:` written anywhere in the
+  object, inside its `query` or `params` too. The other routers read
+  destinations as colby does (`route_href.rs`, `vue_router.rs`).
+- **The component a Vue Router route names (W7-11).** A route renders what
+  the router file's import of its identifier takes: a named import the
+  module's node exported under that name, at its declaration or through an
+  export list or the modules that re-export it (never a private declaration
+  of the name, nor one nested in another declaration, which the module's
+  text tells: the extractor marks a declaration inside an exported function
+  exported; nor what `export default` declares, nor a `.vue` file's own
+  export, whose template is no script), a default import the module's
+  default export; a lazy `() => import(…)` renders the module's default
+  export, a `.vue` file's own component. The
+  route's reference to an identifier is named `component:<name>`, which
+  only Vue Router answers: where the import names a module that is not
+  found, or one holding no such component, the route renders nothing, and
+  only a name no import reaches is looked up by name: a declaration of the
+  routes file (vue-vben-admin's `const AuthPageLayout = () => import(…)`
+  layout, which colby leaves unresolved), else a component. A relative
+  specifier is the file it names. colby writes the bare identifier and takes the module's first
+  component, else its first function whose name starts with a capital,
+  whatever the import names, and otherwise any component of the
+  identifier's name, which the Vue resolver and name matching bind too:
+  vue-vben-admin's `component: IFrameView`, imported from a layouts module
+  of three lazy constants, renders `BasicLayout` (`vue_router.rs`).
 - **A tag imported from a module that exports no component under its name
   (W7-09e).** A JSX tag imported from a module of the project renders what
   the module exports under the name, as colby's (#2563); when the module

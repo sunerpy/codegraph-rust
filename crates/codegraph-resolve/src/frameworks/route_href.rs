@@ -309,11 +309,76 @@ fn strip_cast(expr: &str) -> &str {
     cast.find(expr).map_or(expr, |m| &expr[..m.start()])
 }
 
+/// How much of an expression a destination literal must be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Literal {
+    /// A literal at the head of the expression is read even when the
+    /// expression goes on past it (`'/a/' + id` reads `/a/`), as upstream's
+    /// readers do.
+    Head,
+    /// A literal is read only when it is the whole expression, or the whole
+    /// arm of a conditional, and a template's holes fill whole segments:
+    /// `'/a/' + id` and `` `/a${rest}` `` are computed and read nothing.
+    Whole,
+}
+
+/// True when every hole of `href`'s path is a whole segment: `/a/${id}`,
+/// not `/a${rest}`, whose value may add segments of its own.
+fn holes_fill_segments(href: &HrefLiteral) -> bool {
+    href.path
+        .split('/')
+        .all(|seg| !seg.contains(HOLE) || seg.chars().all(|c| c == HOLE))
+}
+
+/// True when the string or template opened at `at` is a whole value: past
+/// it and any comments, no operator, member access or call continues the
+/// expression, only its end, a `;`, or the `,` `}` or `)` closing what holds
+/// it (`'/a' /* x */ + b` goes on). An unclosed comment is not known to end.
+fn literal_is_whole(s: &str, at: usize) -> bool {
+    let bytes = s.as_bytes();
+    if !matches!(bytes.get(at), Some(b'"' | b'\'' | b'`')) {
+        return false;
+    }
+    let end = string_end(bytes, at);
+    if end >= bytes.len() {
+        return false;
+    }
+    let mut rest = s[end + 1..].trim_start();
+    loop {
+        if let Some(line) = rest.strip_prefix("//") {
+            rest = line.find('\n').map_or("", |nl| line[nl + 1..].trim_start());
+        } else if let Some(block) = rest.strip_prefix("/*") {
+            let Some(close) = block.find("*/") else {
+                return false;
+            };
+            rest = block[close + 2..].trim_start();
+        } else {
+            break;
+        }
+    }
+    rest.is_empty() || rest.starts_with([';', ',', '}', ')'])
+}
+
+/// The string a whole string literal `value` spells, or `None` when
+/// `value` is no literal or an expression continues past it.
+pub(crate) fn whole_string(value: &str) -> Option<String> {
+    let value = value.trim();
+    literal_is_whole(value, 0)
+        .then(|| read_string_at(value, 0))
+        .flatten()
+}
+
 /// The href one argument expression names (`parseHrefExpression`): a
 /// string, a template, an `Href` object with a literal `pathname`, or a
 /// conditional whose arms are those. Each readable arm of a conditional is a
 /// destination; anything else is not static.
 pub(crate) fn parse_href_expression(expr: &str) -> Option<HrefLiteral> {
+    parse_href(expr, Literal::Head)
+}
+
+/// [`parse_href_expression`], with `literal` saying how much of the
+/// expression (or of each arm) a literal must be.
+pub(crate) fn parse_href(expr: &str, literal: Literal) -> Option<HrefLiteral> {
     let mut args = strip_cast(expr.trim());
     // `(a ? b : c)`: unwrap grouping parens.
     while args.starts_with('(') && match_paren(args.as_bytes(), 0) == Some(args.len() - 1) {
@@ -325,8 +390,8 @@ pub(crate) fn parse_href_expression(expr: &str) -> Option<HrefLiteral> {
     let bytes = args.as_bytes();
     if let Some(q) = index_at_depth0(bytes, b'?', 0).filter(|&q| q > 0) {
         if let Some(colon) = ternary_colon(bytes, q).filter(|&colon| colon > q) {
-            let yes = parse_href_expression(&args[q + 1..colon]);
-            let no = parse_href_expression(&args[colon + 1..]);
+            let yes = parse_href(&args[q + 1..colon], literal);
+            let no = parse_href(&args[colon + 1..], literal);
             let mut arms = yes
                 .iter()
                 .chain(no.iter())
@@ -342,9 +407,17 @@ pub(crate) fn parse_href_expression(expr: &str) -> Option<HrefLiteral> {
         let key = PATHNAME
             .get_or_init(|| Regex::new(r"\bpathname\s*:\s*").expect("pathname key"))
             .find(args)?;
-        return to_href(read_string_at(args, key.end()));
+        if literal == Literal::Whole && !literal_is_whole(args, key.end()) {
+            return None;
+        }
+        return to_href(read_string_at(args, key.end()))
+            .filter(|href| literal == Literal::Head || holes_fill_segments(href));
+    }
+    if literal == Literal::Whole && !literal_is_whole(args, 0) {
+        return None;
     }
     to_href(read_string_at(args, 0))
+        .filter(|href| literal == Literal::Head || holes_fill_segments(href))
 }
 
 /// The source text of the navigation call's first argument, or `None` when
@@ -452,6 +525,19 @@ pub(crate) fn read_href_via_local(
     method: &str,
     enclosing_start: i64,
 ) -> Option<HrefLiteral> {
+    read_href_via_local_with(lines, line, column, method, enclosing_start, Literal::Head)
+}
+
+/// [`read_href_via_local`], with `literal` saying how much of the
+/// initializer a literal must be.
+pub(crate) fn read_href_via_local_with(
+    lines: &[&str],
+    line: i64,
+    column: i64,
+    method: &str,
+    enclosing_start: i64,
+    literal: Literal,
+) -> Option<HrefLiteral> {
     static IDENTIFIER: OnceLock<Regex> = OnceLock::new();
     static CONTINUATION: OnceLock<Regex> = OnceLock::new();
     let arg = first_argument_text(lines, line, column, method)?;
@@ -493,7 +579,7 @@ pub(crate) fn read_href_via_local(
             init.push_str(next);
             j += 1;
         }
-        return parse_href_expression(&init);
+        return parse_href(&init, literal);
     }
     None
 }
@@ -814,12 +900,13 @@ pub(crate) mod test_ctx {
 
     use codegraph_core::types::{EdgeKind, Language, Node, NodeKind};
 
-    use crate::types::{ImportMapping, RefView, ResolutionContext};
+    use crate::types::{ImportMapping, ReExport, RefView, ResolutionContext};
 
     #[derive(Default)]
     pub(crate) struct RouteCtx {
         files: HashMap<String, String>,
         nodes: Vec<Node>,
+        imports: HashMap<String, Vec<ImportMapping>>,
     }
 
     impl RouteCtx {
@@ -833,6 +920,15 @@ pub(crate) mod test_ctx {
         pub(crate) fn routes(mut self, file: &str, nodes: Vec<Node>) -> Self {
             self.nodes.extend(nodes);
             self.files.entry(file.to_string()).or_default();
+            self
+        }
+
+        /// An import `file` declares.
+        pub(crate) fn import(mut self, file: &str, mapping: ImportMapping) -> Self {
+            self.imports
+                .entry(file.to_string())
+                .or_default()
+                .push(mapping);
             self
         }
 
@@ -902,8 +998,14 @@ pub(crate) mod test_ctx {
         fn get_node_by_id(&self, id: &str) -> Option<Node> {
             self.nodes.iter().find(|n| n.id == id).cloned()
         }
-        fn get_import_mappings(&self, _file: &str, _language: Language) -> Vec<ImportMapping> {
-            Vec::new()
+        fn get_import_mappings(&self, file: &str, _language: Language) -> Vec<ImportMapping> {
+            self.imports.get(file).cloned().unwrap_or_default()
+        }
+        fn get_re_exports(&self, file: &str, language: Language) -> Vec<ReExport> {
+            self.files
+                .get(file)
+                .map(|content| crate::import_resolver::extract_re_exports(content, language))
+                .unwrap_or_default()
         }
     }
 

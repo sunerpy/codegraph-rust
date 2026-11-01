@@ -21853,6 +21853,459 @@ mod tanstack_router {
     }
 }
 
+mod vue_router {
+    use super::support::{EdgeRow, Graph, Project};
+
+    /// The `navigates` edges out of the one function named `name`.
+    fn navigations<'g>(graph: &'g Graph, name: &str) -> Vec<&'g EdgeRow> {
+        let from = graph.nodes_named("function", name);
+        assert_eq!(from.len(), 1, "function {name}\n{}", graph.report());
+        graph
+            .edges
+            .iter()
+            .filter(|edge| edge.kind == "navigates" && edge.source == from[0].id)
+            .collect()
+    }
+
+    fn route_names(graph: &Graph) -> Vec<&str> {
+        let mut routes: Vec<&str> = graph
+            .nodes
+            .iter()
+            .filter(|node| node.kind == "route")
+            .map(|node| node.name.as_str())
+            .collect();
+        routes.sort_unstable();
+        routes
+    }
+
+    /// The files the `kind` edges out of the route named `name` reach.
+    fn targets_of<'g>(graph: &'g Graph, name: &str, kind: &str) -> Vec<&'g str> {
+        let route = graph
+            .nodes
+            .iter()
+            .find(|node| node.kind == "route" && node.name == name)
+            .unwrap_or_else(|| panic!("no route {name}\n{}", graph.report()));
+        graph
+            .edges
+            .iter()
+            .filter(|edge| edge.kind == kind && edge.source == route.id)
+            .filter_map(|edge| graph.node(&edge.target))
+            .map(|node| node.file_path.as_str())
+            .collect()
+    }
+
+    /// Upstream F6 (`vue-router.test.ts`, "a routed app end to end",
+    /// without its `<router-link>` and Screens halves, W7-18 and the
+    /// viewer): vue-realworld's table of lazy views, each route calling the
+    /// `.vue` component it names; `router.push({ name })` reaches the route
+    /// of that name and `router.push({ path })` the route at that path; a
+    /// destination nothing declares and an array's `push` stay unresolved.
+    #[test]
+    fn f6_a_vue_router_app_routes_and_navigates_by_name() {
+        let project = Project::new()
+            .file(
+                "package.json",
+                "{\"name\":\"conduit\",\"dependencies\":{\"vue\":\"3\",\"vue-router\":\"4\"}}\n",
+            )
+            .file(
+                "src/router/index.js",
+                "import { createRouter, createWebHistory } from \"vue-router\"\nconst router = createRouter({\n  history: createWebHistory(),\n  routes: [\n    { name: \"home\", path: \"/\", component: () => import(\"@/views/Home\") },\n    { name: \"login\", path: \"/login\", component: () => import(\"@/views/Login\") },\n    { name: \"register\", path: \"/register\", component: () => import(\"@/views/Register\") },\n    { name: \"settings\", path: \"/settings\", component: () => import(\"@/views/Settings\") },\n    { name: \"profile\", path: \"/profile/:username\", component: () => import(\"@/views/Profile\") }\n  ]\n})\nexport default router\n",
+            )
+            .file(
+                "src/views/Home.vue",
+                "<template>\n  <div><TheHeader /></div>\n</template>\n<script setup>\nimport { useRouter } from \"vue-router\"\nimport TheHeader from \"@/components/TheHeader.vue\"\nconst router = useRouter()\nfunction goTo(tag) {\n  router.push({ path: \"/\", query: { tag } })\n}\n</script>\n",
+            )
+            .file(
+                "src/views/Login.vue",
+                "<template>\n  <form @submit=\"submit\"><router-link :to=\"{ name: 'register' }\">Need an account?</router-link></form>\n</template>\n<script setup>\nimport { useRouter } from \"vue-router\"\nconst router = useRouter()\nfunction submit() {\n  login().then(() => router.push({ name: \"home\" }))\n}\n</script>\n",
+            )
+            .file(
+                "src/views/Register.vue",
+                "<template>\n  <router-link to=\"/login\">Have an account?</router-link>\n</template>\n<script setup>\nconst nothing = 1\n</script>\n",
+            )
+            .file(
+                "src/views/Settings.vue",
+                "<template>\n  <button @click=\"save\">Save</button>\n</template>\n<script setup>\nimport { useRouter } from \"vue-router\"\nconst router = useRouter()\nconst target = \"/nowhere\"\nfunction save(user) {\n  router.push({ name: \"profile\", params: { username: user.username } })\n}\nfunction bail() {\n  router.push(target)\n}\n</script>\n",
+            )
+            .file(
+                "src/views/Profile.vue",
+                "<template>\n  <div>Profile</div>\n</template>\n<script setup>\nconst x = 1\n</script>\n",
+            )
+            .file(
+                "src/components/TheHeader.vue",
+                "<template>\n  <nav>\n    <router-link :to=\"{ name: 'home' }\">Home</router-link>\n    <router-link to=\"/settings\">Settings</router-link>\n  </nav>\n</template>\n<script setup>\nconst y = 1\n</script>\n",
+            )
+            .file(
+                "src/utils/trail.js",
+                "export function trail() {\n  const paths = []\n  paths.push(\"/login\")\n  return paths\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        assert_eq!(
+            route_names(graph),
+            [
+                "/",
+                "/login",
+                "/profile/:username",
+                "/register",
+                "/settings"
+            ],
+            "{}",
+            graph.report()
+        );
+        // The binding is a `calls` edge to the `.vue` view's component.
+        graph.assert_edge(
+            "route src/router/index.js::route:/login",
+            "calls",
+            "component src/views/Login.vue::Login",
+            None,
+        );
+        let submit = navigations(graph, "submit");
+        assert_eq!(submit.len(), 1, "{}", graph.report());
+        assert_eq!(
+            graph
+                .node(&submit[0].target)
+                .map(|node| node.qualified_name.as_str()),
+            Some("src/router/index.js::route:/")
+        );
+        assert_eq!(submit[0].metadata["href"], "home");
+        assert_eq!(submit[0].metadata["navMethod"], "push");
+        assert_eq!(submit[0].metadata["by"], "name");
+        assert_eq!(submit[0].metadata["framework"], "vue-router");
+        let save = navigations(graph, "save");
+        assert_eq!(save.len(), 1, "{}", graph.report());
+        assert_eq!(
+            graph
+                .node(&save[0].target)
+                .map(|node| node.qualified_name.as_str()),
+            Some("src/router/index.js::route:/profile/:username")
+        );
+        assert_eq!(save[0].metadata["href"], "profile");
+        let go_to = navigations(graph, "goTo");
+        assert_eq!(go_to.len(), 1, "{}", graph.report());
+        assert_eq!(
+            graph
+                .node(&go_to[0].target)
+                .map(|node| node.qualified_name.as_str()),
+            Some("src/router/index.js::route:/")
+        );
+        assert_eq!(go_to[0].metadata["href"], "/");
+        assert!(go_to[0].metadata.get("by").is_none());
+        assert!(navigations(graph, "bail").is_empty(), "{}", graph.report());
+        assert!(navigations(graph, "trail").is_empty(), "{}", graph.report());
+    }
+
+    /// Upstream F6 (`vue-element-admin`): named tables, `new Router`, a
+    /// module file's table object, children joined onto their parents, and
+    /// parents that redirect into their children as frames, not pages. Each
+    /// lazy `index` view binds to its own file's component, a child's
+    /// parent component is the layout around it, and `this.$router.push({
+    /// name })` reaches the composed child. TagsView's `this.$router.replace({
+    /// path: '/redirect' + fullPath })` goes where `fullPath` says, so it
+    /// reaches no route, not the `/redirect` frame its literal head names.
+    #[test]
+    fn f6_an_admin_template_routes_its_tables() {
+        let view = |name: &str| {
+            format!(
+                "<template><div>{name}</div></template>\n<script>\nexport default {{ name: '{name}' }}\n</script>\n"
+            )
+        };
+        let project = Project::new()
+            .file(
+                "package.json",
+                "{\"name\":\"admin\",\"dependencies\":{\"vue\":\"^2.6.0\",\"vue-router\":\"^3.0.0\"}}\n",
+            )
+            .file(
+                "src/router/index.js",
+                "import Vue from 'vue'\nimport Router from 'vue-router'\nimport Layout from '@/layout'\nimport tableRouter from './modules/table'\nVue.use(Router)\n\nexport const constantRoutes = [\n  {\n    path: '/redirect',\n    component: Layout,\n    hidden: true,\n    children: [\n      {\n        path: '/redirect/:path(.*)',\n        component: () => import('@/views/redirect/index')\n      }\n    ]\n  },\n  { path: '/login', component: () => import('@/views/login/index'), hidden: true },\n  {\n    path: '/',\n    component: Layout,\n    redirect: '/dashboard',\n    children: [\n      { path: 'dashboard', component: () => import('@/views/dashboard/index'), name: 'Dashboard' }\n    ]\n  }\n]\n\nexport const asyncRoutes = [tableRouter, { path: '*', redirect: '/404', hidden: true }]\n\nconst createRouter = () => new Router({ routes: constantRoutes })\nexport default createRouter()\n",
+            )
+            .file(
+                "src/router/modules/table.js",
+                "import Layout from '@/layout'\n\nconst tableRouter = {\n  path: '/table',\n  component: Layout,\n  redirect: '/table/complex-table',\n  name: 'Table',\n  children: [\n    { path: 'complex-table', component: () => import('@/views/table/complex-table'), name: 'ComplexTable' }\n  ]\n}\nexport default tableRouter\n",
+            )
+            .file("src/layout/index.vue", &view("Layout"))
+            .file(
+                "src/views/login/index.vue",
+                "<template><button @click=\"go\">in</button></template>\n<script>\nexport default {\n  name: 'Login',\n  methods: {\n    go() { this.$router.push({ name: 'Dashboard' }) }\n  }\n}\n</script>\n",
+            )
+            .file("src/views/dashboard/index.vue", &view("Dashboard"))
+            .file("src/views/table/complex-table.vue", &view("ComplexTable"))
+            .file("src/views/redirect/index.vue", &view("Redirect"))
+            .file(
+                "src/layout/components/TagsView/index.vue",
+                "<template><div class=\"tags-view-container\"></div></template>\n<script>\nexport default {\n  name: 'TagsView',\n  methods: {\n    refreshSelectedTag(view) {\n      this.$store.dispatch('tagsView/delCachedView', view).then(() => {\n        const { fullPath } = view\n        this.$nextTick(() => {\n          this.$router.replace({\n            path: '/redirect' + fullPath\n          })\n        })\n      })\n    }\n  }\n}\n</script>\n",
+            )
+            .index();
+        let graph = project.graph();
+        assert_eq!(
+            route_names(graph),
+            [
+                "/dashboard",
+                "/login",
+                "/redirect",
+                "/redirect/:path(.*)",
+                "/table/complex-table"
+            ],
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            targets_of(graph, "/dashboard", "calls"),
+            ["src/views/dashboard/index.vue"],
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            targets_of(graph, "/login", "calls"),
+            ["src/views/login/index.vue"],
+            "{}",
+            graph.report()
+        );
+        let layouts: Vec<&EdgeRow> = graph
+            .edges
+            .iter()
+            .filter(|edge| {
+                edge.kind == "references"
+                    && graph.node(&edge.source).is_some_and(|node| {
+                        node.kind == "route" && node.name == "/table/complex-table"
+                    })
+            })
+            .collect();
+        assert_eq!(layouts.len(), 1, "{}", graph.report());
+        assert_eq!(
+            graph
+                .node(&layouts[0].target)
+                .map(|node| node.file_path.as_str()),
+            Some("src/layout/index.vue")
+        );
+        assert_eq!(layouts[0].metadata["layout"], true);
+        let navigations: Vec<&str> = graph
+            .edges
+            .iter()
+            .filter(|edge| {
+                edge.kind == "navigates"
+                    && graph
+                        .node(&edge.source)
+                        .is_some_and(|node| node.file_path == "src/views/login/index.vue")
+            })
+            .filter_map(|edge| graph.node(&edge.target))
+            .map(|node| node.name.as_str())
+            .collect();
+        assert_eq!(navigations, ["/dashboard"], "{}", graph.report());
+        assert!(
+            !graph.edges.iter().any(|edge| {
+                edge.kind == "navigates"
+                    && graph.node(&edge.source).is_some_and(|node| {
+                        node.file_path == "src/layout/components/TagsView/index.vue"
+                    })
+            }),
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// A route renders only what its import takes, through the real
+    /// pipeline: a default import's SFC, a named import through the barrel
+    /// that re-exports it, and a statement's second declarator, exported
+    /// there or through an export list. An import of a module nothing finds,
+    /// a module without the export, a module whose only declaration of the
+    /// name is nested in an exported function, named or anonymous, or is
+    /// what `export default` declares, and a lazy import nothing finds
+    /// render nothing, though the project has components of those names:
+    /// neither Vue Router, the Vue resolver nor name matching binds a
+    /// namesake.
+    #[test]
+    fn f6_a_route_renders_only_what_its_import_takes() {
+        let sfc = |name: &str| {
+            format!(
+                "<template><div>{name}</div></template>\n<script setup lang=\"ts\">\nconst title = '{name}'\n</script>\n"
+            )
+        };
+        let project = Project::new()
+            .file(
+                "package.json",
+                "{\"name\":\"admin\",\"dependencies\":{\"vue\":\"3\",\"vue-router\":\"4\"}}\n",
+            )
+            .file(
+                "src/router/index.ts",
+                "import { createRouter, createWebHistory } from 'vue-router'\nimport Home from '@/views/Home.vue'\nimport { FrameLayout } from '@/layouts'\nimport { Missing } from '#/missing-module'\nimport { Gone } from '@/layouts'\nimport { Nested } from '@/layouts/nested'\nimport { Anon } from '@/layouts/anon'\nimport { Second, Listed, Main } from '@/layouts/multi'\nexport default createRouter({\n  history: createWebHistory(),\n  routes: [\n    { path: '/', component: Home },\n    { path: '/frame', component: FrameLayout },\n    { path: '/missing', component: Missing },\n    { path: '/gone', component: Gone },\n    { path: '/nested', component: Nested },\n    { path: '/anon', component: Anon },\n    { path: '/second', component: Second },\n    { path: '/listed', component: Listed },\n    { path: '/main', component: Main },\n    { path: '/lost', component: () => import('@/views/nowhere/Lost.vue') },\n  ],\n})\n",
+            )
+            .file(
+                "src/layouts/index.ts",
+                "export { default as FrameLayout } from './frame.vue'\n",
+            )
+            .file("src/layouts/frame.vue", &sfc("frame"))
+            .file(
+                "src/layouts/nested.ts",
+                "export function Outer() {\n  function Nested() {\n    return null\n  }\n  return Nested\n}\n",
+            )
+            .file("src/views/Nested.vue", &sfc("Nested"))
+            .file(
+                "src/layouts/anon.ts",
+                "export default function () {\n  function Anon() {\n    return null\n  }\n  return Anon\n}\n",
+            )
+            .file("src/views/Anon.vue", &sfc("Anon"))
+            .file(
+                "src/layouts/multi.ts",
+                "export const Other = 1, Second = defineComponent({ name: 'Second' })\nconst First = 1,\n  Listed = () => null\nexport { Listed }\nexport default function Main() {\n  return null\n}\n",
+            )
+            .file("src/views/Second.vue", &sfc("Second"))
+            .file("src/views/Listed.vue", &sfc("Listed"))
+            .file("src/views/Main.vue", &sfc("Main"))
+            .file("src/views/Home.vue", &sfc("Home"))
+            .file("src/views/Missing.vue", &sfc("Missing"))
+            .file("src/views/Gone.vue", &sfc("Gone"))
+            .file("src/views/Lost.vue", &sfc("Lost"))
+            .index();
+        let graph = project.graph();
+        assert_eq!(
+            route_names(graph),
+            [
+                "/", "/anon", "/frame", "/gone", "/listed", "/lost", "/main", "/missing",
+                "/nested", "/second"
+            ],
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            targets_of(graph, "/", "calls"),
+            ["src/views/Home.vue"],
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            targets_of(graph, "/frame", "calls"),
+            ["src/layouts/frame.vue"],
+            "{}",
+            graph.report()
+        );
+        // Vue Router's own binding of each declarator.
+        for (route, name) in [("/second", "Second"), ("/listed", "Listed")] {
+            let node = graph
+                .nodes
+                .iter()
+                .find(|node| node.kind == "route" && node.name == route)
+                .expect("the route");
+            let renders: Vec<(&str, &str, Option<&str>, Option<&str>)> = graph
+                .edges
+                .iter()
+                .filter(|edge| edge.kind == "calls" && edge.source == node.id)
+                .filter_map(|edge| {
+                    graph.node(&edge.target).map(|target| {
+                        (
+                            target.file_path.as_str(),
+                            target.name.as_str(),
+                            edge.resolved_by(),
+                            edge.metadata.get("framework").and_then(|v| v.as_str()),
+                        )
+                    })
+                })
+                .collect();
+            assert_eq!(
+                renders,
+                [(
+                    "src/layouts/multi.ts",
+                    name,
+                    Some("framework"),
+                    Some("vue-router")
+                )],
+                "{route}\n{}",
+                graph.report()
+            );
+        }
+        for route in ["/missing", "/gone", "/nested", "/anon", "/main", "/lost"] {
+            let node = graph
+                .nodes
+                .iter()
+                .find(|node| node.kind == "route" && node.name == route)
+                .expect("the route");
+            assert!(
+                !graph.edges.iter().any(|edge| edge.source == node.id),
+                "{route}\n{}",
+                graph.report()
+            );
+        }
+    }
+
+    /// Upstream F6 (`vben`): a typed routes module, and a lazy view through
+    /// an alias the resolver cannot follow, found by the one file of the app
+    /// whose path ends as the specifier does. `component: IFrameView`, a
+    /// named import of the layouts module, renders that export, not the
+    /// module's first component-like function (`BasicLayout`).
+    #[test]
+    fn f6_a_typed_routes_module_reaches_its_view_through_an_alias() {
+        let project = Project::new()
+            .file("package.json", "{\"name\":\"mono\",\"private\":true}\n")
+            .file(
+                "apps/web/package.json",
+                "{\"name\":\"web\",\"imports\":{\"#/*\":\"./src/*\"},\"dependencies\":{\"vue\":\"*\",\"vue-router\":\"*\"}}\n",
+            )
+            .file(
+                "apps/web/src/router/routes/modules/dashboard.ts",
+                "import type { RouteRecordRaw } from 'vue-router';\n\nconst routes: RouteRecordRaw[] = [\n  {\n    name: 'Dashboard',\n    path: '/dashboard',\n    children: [\n      { name: 'Analytics', path: 'analytics', component: () => import('#/views/dashboard/analytics/index.vue') },\n    ],\n  },\n];\n\nexport default routes;\n",
+            )
+            .file(
+                "apps/web/src/views/dashboard/analytics/index.vue",
+                "<template><div>analytics</div></template>\n<script setup lang=\"ts\">\nconst title = 'Analytics';\n</script>\n",
+            )
+            .file(
+                "apps/web/src/layouts/index.ts",
+                "const BasicLayout = () => import('./basic.vue');\nconst AuthPageLayout = () => import('./auth.vue');\n\nconst IFrameView = () => import('@vben/layouts').then((m) => m.IFrameView);\n\nexport { AuthPageLayout, BasicLayout, IFrameView };\n",
+            )
+            .file(
+                "apps/web/src/router/routes/modules/vben.ts",
+                "import type { RouteRecordRaw } from 'vue-router';\n\nimport { IFrameView } from '#/layouts';\n\nconst routes: RouteRecordRaw[] = [\n  {\n    name: 'VbenProject',\n    path: '/vben-admin',\n    children: [\n      {\n        name: 'VbenDocument',\n        path: 'document',\n        component: IFrameView,\n        meta: { link: 'https://doc.vben.pro' },\n      },\n    ],\n  },\n];\n\nexport default routes;\n",
+            )
+            .index();
+        let graph = project.graph();
+        assert_eq!(
+            route_names(graph),
+            ["/dashboard/analytics", "/vben-admin/document"],
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            targets_of(graph, "/dashboard/analytics", "calls"),
+            ["apps/web/src/views/dashboard/analytics/index.vue"],
+            "{}",
+            graph.report()
+        );
+        let document = graph
+            .nodes
+            .iter()
+            .find(|node| node.kind == "route" && node.name == "/vben-admin/document")
+            .expect("the document route");
+        // Vue Router's own binding, not a later strategy's: import
+        // resolution reaches the same export, and must not be what holds it.
+        let renders: Vec<(&str, &str, Option<&str>, Option<&str>)> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.kind == "calls" && edge.source == document.id)
+            .filter_map(|edge| {
+                graph.node(&edge.target).map(|node| {
+                    (
+                        node.file_path.as_str(),
+                        node.name.as_str(),
+                        edge.resolved_by(),
+                        edge.metadata.get("framework").and_then(|v| v.as_str()),
+                    )
+                })
+            })
+            .collect();
+        assert_eq!(
+            renders,
+            [(
+                "apps/web/src/layouts/index.ts",
+                "IFrameView",
+                Some("framework"),
+                Some("vue-router")
+            )],
+            "{}",
+            graph.report()
+        );
+    }
+}
+
 mod explore_flow {
     use super::support::{Project, codegraph};
 
