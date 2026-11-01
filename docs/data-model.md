@@ -463,7 +463,9 @@ that finds it missing or at another version re-resolves every Rust file. It is
 not a canonical surface.
 
 `resolved_refs_version` vouches that every file's rows in `unresolved_refs` and
-`resolved_refs` are what extracting it again gives. Its value is `1:` and the
+`resolved_refs` are what extracting it again gives, with the references of the
+cross-file nodes in it (the routes of React Router tables, which no single
+file's extraction makes and a sync's re-extraction of the file merges in). Its value is `1:` and the
 sha256 of the inputs that decide what an unchanged file's extraction yields:
 the extension overrides, `max_file_size`, the Godot DSL configuration, the
 extraction version and the `frameworks_detected` row. Only a full index (`init`,

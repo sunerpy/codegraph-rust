@@ -170,12 +170,14 @@ pub trait FrameworkResolver: Sync {
     /// Nodes no single file's [`Self::extract`] can decide on
     /// (`crossFileNodes?`, upstream #2400): a route table written in one file
     /// is a table of routes only because another file hands it to the
-    /// router. It returns the COMPLETE set the framework wants now, so a pass
-    /// after [`Self::post_extract`] can insert the new ones with their
-    /// references, remove the ones no longer wanted, rename the ones whose
-    /// name changed and leave the rest, whose edges then survive. `None` when
-    /// the resolver makes no such nodes, as every registered resolver does so
-    /// far: neither an index nor a sync calls it yet.
+    /// router. It returns the COMPLETE set the framework wants now, so the
+    /// pass every index, migration, sync and orphan sweep runs after
+    /// [`Self::post_extract`]
+    /// ([`crate::resolver::ReferenceResolver::plan_cross_file_nodes`]) can
+    /// insert the new ones with their references, remove the ones no longer
+    /// wanted or wanted changed, and leave the rest, whose edges then
+    /// survive. `None` when the resolver makes no such nodes; React makes the
+    /// routes of route tables.
     fn cross_file_nodes(&self, _context: &dyn ResolutionContext) -> Option<CrossFileNodes> {
         None
     }

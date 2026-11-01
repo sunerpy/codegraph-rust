@@ -6594,10 +6594,12 @@ fn index_project_inner(
     let framework_finalize_started = std::time::Instant::now();
     let pb = phase_spinner("Finalizing frameworks", quiet);
     // Cross-file framework finalization (NestJS RouterModule prefixes, React
-    // Router routes named after a constant) BEFORE resolution, as upstream's
+    // Router routes named after a constant, then the routes of tables
+    // another file hands React Router) BEFORE resolution, as upstream's
     // index runs runPostExtract: a navigation call resolves against the
     // route's final name.
     resolver.run_post_extract(&mut store)?;
+    resolver.run_cross_file_nodes(&mut store)?;
     finish_phase(&pb, "Finalized frameworks");
     diagnostic_run.phase_end(
         "framework_finalize",

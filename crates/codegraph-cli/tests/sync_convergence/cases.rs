@@ -11595,6 +11595,326 @@ pub fn tsx_react_router_lazy_page_body_edit_keeps_its_route() -> Case {
         )
 }
 
+// ----- Route tables another file hands React Router (W7-09d) ----------
+
+/// The route table of the W7-09d cases (upstream `react-router.test.ts`, "a
+/// route table as the files around it change"): the index route and
+/// `/counter`.
+const APP_ROUTES_TABLE: &str = "import { Counter } from './Counter';\nimport { Home } from './Home';\nimport { FetchData } from './FetchData';\n\nconst AppRoutes = [\n  { index: true, element: <Home /> },\n  { path: '/counter', element: <Counter /> },\n];\n\nexport default AppRoutes;\n";
+
+/// The same table with `/fetch-data` in front.
+const APP_ROUTES_TABLE_WITH_FETCH: &str = "import { Counter } from './Counter';\nimport { Home } from './Home';\nimport { FetchData } from './FetchData';\n\nconst AppRoutes = [\n  { path: '/fetch-data', element: <FetchData /> },\n  { index: true, element: <Home /> },\n  { path: '/counter', element: <Counter /> },\n];\n\nexport default AppRoutes;\n";
+
+/// The file that maps the table into `<Route>`s.
+const APP_MAPS_THE_TABLE: &str = "import { Route, Routes } from 'react-router-dom';\nimport AppRoutes from './AppRoutes';\nimport { Counter } from './Counter';\n\nexport default function App() {\n  return (\n    <Routes>\n      {AppRoutes.map(({ element, ...rest }, index) => <Route key={index} {...rest} element={element} />)}\n    </Routes>\n  );\n}\n";
+
+/// The same file with a route of its own instead.
+const APP_WRITES_A_ROUTE: &str = "import { Route, Routes } from 'react-router-dom';\nimport AppRoutes from './AppRoutes';\nimport { Counter } from './Counter';\n\nexport default function App() {\n  return (\n    <Routes>\n      <Route path=\"/static\" element={<Counter />} />\n    </Routes>\n  );\n}\n";
+
+/// A navigation call to the table's index route.
+const NAV_MENU_HOME: &str = "import { useNavigate } from 'react-router-dom';\nexport function NavMenu() {\n  const navigate = useNavigate();\n  const goHome = () => navigate('/');\n  return <button onClick={goHome}>Home</button>;\n}\n";
+
+const COUNTER_PAGE: &str = "export function Counter() {\n  return <div>Counter</div>;\n}\n";
+const HOME_PAGE: &str = "export function Home() {\n  return <div>Home</div>;\n}\n";
+const FETCH_DATA_PAGE: &str = "export function FetchData() {\n  return <div>FetchData</div>;\n}\n";
+
+/// W7-09d (upstream #2400): an edit to a table another file hands the
+/// router moves its routes; the navigation that named one still does.
+pub fn jsx_react_router_table_edit_moves_its_routes() -> Case {
+    Case::new(Change::BodyEdit, &[Language::JavaScript, Language::Jsx])
+        .file("package.json", REACT_ROUTER_PACKAGE)
+        .file("src/AppRoutes.js", APP_ROUTES_TABLE)
+        .file("src/App.js", APP_MAPS_THE_TABLE)
+        .file("src/Home.js", HOME_PAGE)
+        .file("src/Counter.js", COUNTER_PAGE)
+        .file("src/FetchData.js", FETCH_DATA_PAGE)
+        .file("src/NavMenu.js", NAV_MENU_HOME)
+        .write("src/AppRoutes.js", APP_ROUTES_TABLE_WITH_FETCH)
+        .edge_after(
+            "route src/AppRoutes.js::route:/fetch-data",
+            "references",
+            "function FetchData",
+        )
+        .edge_throughout(
+            "function NavMenu::goHome",
+            "navigates",
+            "route src/AppRoutes.js::route:/",
+        )
+}
+
+/// W7-09d (upstream #2400): the file that handed the router a table writes
+/// a route of its own instead: the table's routes go, and the navigation
+/// that named one names nothing.
+pub fn jsx_react_router_consumer_stops_handing_its_table() -> Case {
+    Case::new(Change::BodyEdit, &[Language::JavaScript, Language::Jsx])
+        .file("package.json", REACT_ROUTER_PACKAGE)
+        .file("src/AppRoutes.js", APP_ROUTES_TABLE)
+        .file("src/App.js", APP_MAPS_THE_TABLE)
+        .file("src/Home.js", HOME_PAGE)
+        .file("src/Counter.js", COUNTER_PAGE)
+        .file("src/FetchData.js", FETCH_DATA_PAGE)
+        .file("src/NavMenu.js", NAV_MENU_HOME)
+        .write("src/App.js", APP_WRITES_A_ROUTE)
+        .edge_before(
+            "function NavMenu::goHome",
+            "navigates",
+            "route src/AppRoutes.js::route:/",
+        )
+        .edge_after(
+            "route src/App.js::route:/static",
+            "references",
+            "function Counter",
+        )
+}
+
+/// W7-09d (upstream #2400): a file starts handing the router a table. No
+/// navigation names its routes before they exist: a call parked then is
+/// W7-23's (#2425).
+pub fn jsx_react_router_consumer_starts_handing_a_table() -> Case {
+    Case::new(Change::BodyEdit, &[Language::JavaScript, Language::Jsx])
+        .file("package.json", REACT_ROUTER_PACKAGE)
+        .file("src/AppRoutes.js", APP_ROUTES_TABLE)
+        .file("src/App.js", APP_WRITES_A_ROUTE)
+        .file("src/Home.js", HOME_PAGE)
+        .file("src/Counter.js", COUNTER_PAGE)
+        .file("src/FetchData.js", FETCH_DATA_PAGE)
+        .write("src/App.js", APP_MAPS_THE_TABLE)
+        .edge_after(
+            "route src/AppRoutes.js::route:/counter",
+            "references",
+            "function Counter",
+        )
+        .edge_after(
+            "route src/AppRoutes.js::route:/",
+            "references",
+            "function Home",
+        )
+}
+
+/// W7-09d: the file that hands the router a table is deleted, the module
+/// that imported it with it: the table's routes go.
+pub fn jsx_react_router_table_consumer_deleted() -> Case {
+    Case::new(
+        Change::DeleteImportedModule,
+        &[Language::JavaScript, Language::Jsx],
+    )
+    .file("package.json", REACT_ROUTER_PACKAGE)
+    .file("src/AppRoutes.js", APP_ROUTES_TABLE)
+    .file("src/App.js", APP_MAPS_THE_TABLE)
+    .file(
+        "src/index.js",
+        "import App from './App';\n\nexport default App;\n",
+    )
+    .file("src/Home.js", HOME_PAGE)
+    .file("src/Counter.js", COUNTER_PAGE)
+    .file("src/FetchData.js", FETCH_DATA_PAGE)
+    .file("src/NavMenu.js", NAV_MENU_HOME)
+    .remove("src/App.js")
+    .edge_before(
+        "route src/AppRoutes.js::route:/counter",
+        "references",
+        "function Counter",
+    )
+    .edge_before(
+        "function NavMenu::goHome",
+        "navigates",
+        "route src/AppRoutes.js::route:/",
+    )
+}
+
+/// W7-09d: a page a table's route renders moves within its file: the route
+/// renders it where it is now.
+pub fn jsx_react_router_table_page_moves() -> Case {
+    Case::new(Change::BodyEdit, &[Language::JavaScript, Language::Jsx])
+        .file("package.json", REACT_ROUTER_PACKAGE)
+        .file("src/AppRoutes.js", APP_ROUTES_TABLE)
+        .file("src/App.js", APP_MAPS_THE_TABLE)
+        .file("src/Home.js", HOME_PAGE)
+        .file("src/Counter.js", COUNTER_PAGE)
+        .file("src/FetchData.js", FETCH_DATA_PAGE)
+        .write(
+            "src/Counter.js",
+            "\nexport function Counter() {\n  return <div>Counter</div>;\n}\n",
+        )
+        .edge_throughout(
+            "route src/AppRoutes.js::route:/counter",
+            "references",
+            "function Counter",
+        )
+}
+
+/// The routes of a W7-09d case that maps another file's table inside
+/// `<Route path="/admin">`.
+const ADMIN_MAPS_THE_TABLE: &str = "import { Routes, Route } from 'react-router-dom';\nimport AdminLayout from './layouts/admin';\nimport { adminRoutes } from './adminRoutes';\n\nexport default function Router() {\n  return (\n    <Routes>\n      <Route path=\"/admin\" element={<AdminLayout/>}>\n        {adminRoutes.map((route) => <Route key={route.path} {...route}/>)}\n      </Route>\n    </Routes>\n  );\n}\n";
+
+/// The same routes under `/manage`.
+const MANAGE_MAPS_THE_TABLE: &str = "import { Routes, Route } from 'react-router-dom';\nimport AdminLayout from './layouts/admin';\nimport { adminRoutes } from './adminRoutes';\n\nexport default function Router() {\n  return (\n    <Routes>\n      <Route path=\"/manage\" element={<AdminLayout/>}>\n        {adminRoutes.map((route) => <Route key={route.path} {...route}/>)}\n      </Route>\n    </Routes>\n  );\n}\n";
+
+/// W7-09d (upstream `react-router.test.ts`, "a table mapped inside <Route
+/// path>"): the file that mounts another file's table moves it to another
+/// path. The table's file is unchanged; its route is replaced under the new
+/// path, and the navigation to the old path names nothing.
+pub fn jsx_react_router_consumer_moves_another_files_table() -> Case {
+    Case::new(Change::BodyEdit, &[Language::JavaScript, Language::Jsx])
+        .file("package.json", REACT_ROUTER_PACKAGE)
+        .file("src/routes.js", ADMIN_MAPS_THE_TABLE)
+        .file(
+            "src/adminRoutes.js",
+            "import Reports from './pages/Reports';\n\nexport const adminRoutes = [{ path: 'reports', element: <Reports/> }];\n",
+        )
+        .file(
+            "src/layouts/admin.js",
+            "export default function AdminLayout() {\n  return <div />;\n}\n",
+        )
+        .file(
+            "src/pages/Reports.js",
+            "export default function Reports() {\n  return <div />;\n}\n",
+        )
+        .file(
+            "src/nav.js",
+            "import { useNavigate } from 'react-router-dom';\nexport function Menu() {\n  const navigate = useNavigate();\n  const open = () => navigate('/admin/reports');\n  return <button onClick={open} />;\n}\n",
+        )
+        .write("src/routes.js", MANAGE_MAPS_THE_TABLE)
+        .edge_before(
+            "function Menu::open",
+            "navigates",
+            "route src/adminRoutes.js::route:/admin/reports",
+        )
+        .edge_after(
+            "route src/adminRoutes.js::route:/manage/reports",
+            "references",
+            "function Reports",
+        )
+}
+
+/// A table mapped inside the `<Route>` of the file it is written in, which
+/// renders `DashboardLayout`.
+const DASHBOARD_TABLE_IN_LAYOUT: &str = "import { Routes, Route } from 'react-router-dom';\nimport DashboardLayout from './layouts/dashboard';\nimport OtherLayout from './layouts/other';\nimport DashboardApp from './pages/DashboardApp';\n\nconst DashboardRoutes = [\n  { path: 'app', element: <DashboardApp/> },\n];\n\nexport default function Router() {\n  return (\n    <Routes>\n      <Route path=\"/dashboard\" element={<DashboardLayout/>}>\n        {DashboardRoutes.map((route, index) => {\n          const { element, ...rest } = route;\n          return <Route key={index} {...rest} element={element}/>;\n        })}\n      </Route>\n    </Routes>\n  );\n}\n";
+
+/// The same file, the `<Route>` rendering `OtherLayout`.
+const DASHBOARD_TABLE_IN_OTHER_LAYOUT: &str = "import { Routes, Route } from 'react-router-dom';\nimport DashboardLayout from './layouts/dashboard';\nimport OtherLayout from './layouts/other';\nimport DashboardApp from './pages/DashboardApp';\n\nconst DashboardRoutes = [\n  { path: 'app', element: <DashboardApp/> },\n];\n\nexport default function Router() {\n  return (\n    <Routes>\n      <Route path=\"/dashboard\" element={<OtherLayout/>}>\n        {DashboardRoutes.map((route, index) => {\n          const { element, ...rest } = route;\n          return <Route key={index} {...rest} element={element}/>;\n        })}\n      </Route>\n    </Routes>\n  );\n}\n";
+
+/// W7-09d (upstream #2423): the layout around a table mapped in its own file
+/// changes: the table's route renders inside the new one only.
+pub fn jsx_react_router_layout_around_a_same_file_table_changes() -> Case {
+    Case::new(Change::BodyEdit, &[Language::JavaScript, Language::Jsx])
+        .file("package.json", REACT_ROUTER_PACKAGE)
+        .file("src/routes.js", DASHBOARD_TABLE_IN_LAYOUT)
+        .file(
+            "src/layouts/dashboard.js",
+            "export default function DashboardLayout() {\n  return <div />;\n}\n",
+        )
+        .file(
+            "src/layouts/other.js",
+            "export default function OtherLayout() {\n  return <div />;\n}\n",
+        )
+        .file(
+            "src/pages/DashboardApp.js",
+            "export default function DashboardApp() {\n  return <div />;\n}\n",
+        )
+        .write("src/routes.js", DASHBOARD_TABLE_IN_OTHER_LAYOUT)
+        .edge_before(
+            "route src/routes.js::route:/dashboard/app",
+            "references",
+            "function DashboardLayout",
+        )
+        .edge_after(
+            "route src/routes.js::route:/dashboard/app",
+            "references",
+            "function OtherLayout",
+        )
+        .no_edge_after(
+            "route src/routes.js::route:/dashboard/app",
+            "references",
+            "function DashboardLayout",
+        )
+}
+
+/// A table mapped inside a layout of its own file, and handed over again by
+/// an earlier file.
+const SELF_MAPPED_TABLE: &str = "import { Routes, Route } from 'react-router-dom';\nimport Layout from './Layout';\nimport Reports from './Reports';\n\nexport const tableRoutes = [{ path: 'reports', element: <Reports/> }];\n\nexport function Shell() {\n  return (\n    <Routes>\n      <Route path=\"/\" element={<Layout/>}>\n        {tableRoutes.map((route) => <Route key={route.path} {...route}/>)}\n      </Route>\n    </Routes>\n  );\n}\n";
+
+/// A file read before the table's own that hands it to `useRoutes`.
+const EARLIER_CONSUMER: &str = "import { useRoutes } from 'react-router-dom';\nimport { tableRoutes } from './table';\n\nexport default function App() {\n  return useRoutes(tableRoutes);\n}\n";
+
+/// The same file handing over nothing.
+const EARLIER_FILE_QUIET: &str = "import { useNavigate } from 'react-router-dom';\n\nexport default function App() {\n  return null;\n}\n";
+
+/// A navigation call to the `/reports` route of the earlier-consumer cases.
+const NAV_TO_REPORTS: &str = "import { useNavigate } from 'react-router-dom';\nexport function Menu() {\n  const navigate = useNavigate();\n  const open = () => navigate('/reports');\n  return <button onClick={open} />;\n}\n";
+
+/// W7-09d: of two files handing over one table at the same address, the
+/// first read gives its routes, here outside the layout the table's own file
+/// maps it inside. When it stops, the route keeps its id and name and gains
+/// that layout: a route whose references changed is replaced, where
+/// upstream's rename in place keeps the old ones, and the navigation into
+/// it finds it again.
+pub fn jsx_react_router_earlier_consumer_stops_handing_a_table() -> Case {
+    Case::new(Change::BodyEdit, &[Language::JavaScript, Language::Jsx])
+        .file("package.json", REACT_ROUTER_PACKAGE)
+        .file("src/nav.js", NAV_TO_REPORTS)
+        .file("src/a.js", EARLIER_CONSUMER)
+        .file("src/table.js", SELF_MAPPED_TABLE)
+        .file(
+            "src/Layout.js",
+            "export default function Layout() {\n  return null;\n}\n",
+        )
+        .file(
+            "src/Reports.js",
+            "export default function Reports() {\n  return null;\n}\n",
+        )
+        .write("src/a.js", EARLIER_FILE_QUIET)
+        .edge_throughout(
+            "route src/table.js::route:/reports",
+            "references",
+            "function Reports",
+        )
+        .edge_throughout(
+            "function Menu::open",
+            "navigates",
+            "route src/table.js::route:/reports",
+        )
+        .edge_after(
+            "route src/table.js::route:/reports",
+            "references",
+            "function Layout",
+        )
+}
+
+/// W7-09d: the reverse: an earlier file starts handing over the table, and
+/// the route renders outside the layout from then on.
+pub fn jsx_react_router_earlier_consumer_starts_handing_a_table() -> Case {
+    Case::new(Change::BodyEdit, &[Language::JavaScript, Language::Jsx])
+        .file("package.json", REACT_ROUTER_PACKAGE)
+        .file("src/nav.js", NAV_TO_REPORTS)
+        .file("src/a.js", EARLIER_FILE_QUIET)
+        .file("src/table.js", SELF_MAPPED_TABLE)
+        .file(
+            "src/Layout.js",
+            "export default function Layout() {\n  return null;\n}\n",
+        )
+        .file(
+            "src/Reports.js",
+            "export default function Reports() {\n  return null;\n}\n",
+        )
+        .write("src/a.js", EARLIER_CONSUMER)
+        .edge_before(
+            "route src/table.js::route:/reports",
+            "references",
+            "function Layout",
+        )
+        .edge_throughout(
+            "function Menu::open",
+            "navigates",
+            "route src/table.js::route:/reports",
+        )
+        .no_edge_after(
+            "route src/table.js::route:/reports",
+            "references",
+            "function Layout",
+        )
+}
+
 /// W5-06, fail closed: only the manifest's `version` changes; every JS file
 /// re-resolves and every edge stays.
 pub fn typescript_package_version_bump_keeps_every_edge() -> Case {

@@ -21,10 +21,12 @@
 //!    the routes of the calling file's app and returns a `navigates` edge
 //!    carrying the href. `<Link to>` is markup, not a call.
 //!
-//! The lazy loaders' own readers (an export a loader picks, React Router 7's
-//! lazy properties), the tables another file hands the router and the sync
-//! retries of navigation calls are later changes; a `lazy` loader here names
-//! the module its first `import(…)` loads, as upstream did before #2480.
+//! What a `lazy` loader renders is [`super::lazy_loader`]'s to read. The
+//! scanner also reads, with `uses`, where a file hands the router a table
+//! and, with `table`, one table literal under the path it is mounted at: the
+//! table pass of [`super::react_tables`] makes routes of the tables another
+//! file hands the router. The sync retries of navigation calls are a later
+//! change.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
@@ -34,7 +36,7 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 
 use super::framework_node;
-use super::js_scan::{JS_SPACE, is_js_space, js_trim, match_bracket, skip_string};
+use super::js_scan::{self, JS_SPACE, is_js_space, js_trim, match_bracket, skip_string};
 use super::lazy_loader;
 use super::route_href::{
     ExactTable, RouteEntry, destinations_for_href, first_argument_text, parse_href_expression,
@@ -134,7 +136,7 @@ pub(crate) struct RoutePart {
 }
 
 impl RoutePart {
-    fn lit(lit: &str) -> Self {
+    pub(crate) fn lit(lit: &str) -> Self {
         Self {
             lit: Some(lit.to_string()),
             expr: None,
@@ -149,7 +151,7 @@ impl RoutePart {
     }
 
     /// The part as the file shows it: the literal, or `{expr}`.
-    fn shown(&self) -> String {
+    pub(crate) fn shown(&self) -> String {
         match (&self.lit, &self.expr) {
             (Some(lit), _) => lit.clone(),
             (None, Some(expr)) => format!("{{{expr}}}"),
@@ -668,7 +670,7 @@ impl RouteScope {
 
 /// The calls that hand React Router its routes; every route object in a file
 /// that makes one is a route (`ROUTER_CALL`).
-fn router_call() -> &'static Regex {
+pub(crate) fn router_call() -> &'static Regex {
     static ROUTER_CALL: OnceLock<Regex> = OnceLock::new();
     ROUTER_CALL.get_or_init(|| {
         Regex::new(r"(?-u:\b)(?:createBrowserRouter|createHashRouter|createMemoryRouter|createRoutesFromElements|useRoutes)(?-u:\b)")
@@ -894,35 +896,132 @@ struct Field {
     at: usize,
 }
 
+/// A `<Route>` tag the scanner read: where it is, the props it spreads
+/// (`{...rest}`) and its `path` expression.
+#[derive(Debug, Clone)]
+struct RouteTag {
+    at: usize,
+    spreads: Vec<String>,
+    path: Option<String>,
+}
+
+/// An identifier written where React Router reads routes — `[MainRoutes,
+/// LoginRoutes]`, `...ApiAuthorizationRoutes`, `children: adminRoutes`,
+/// `useRoutes(routes(isLoggedIn))` — naming a table declared elsewhere
+/// (`TableName`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TableName {
+    pub name: String,
+    /// `routes(isLoggedIn)`: the table is what the function returns.
+    pub call: bool,
+    /// Where it is written; inside a table, the route objects around it are
+    /// its mount.
+    pub at: usize,
+}
+
+/// Where a place that hands React Router routes finds them: a table it
+/// names, or the literal written there (`useRoutes([…])`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TableAt {
+    Named(TableName),
+    Literal(usize),
+}
+
+/// A place a file hands routes to React Router (`TableUse`), with the routes
+/// around it, outermost first: the path parts the table is mounted under,
+/// and the layouts its routes render inside.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TableUse {
+    pub table: TableAt,
+    pub prefix: Vec<RoutePart>,
+    pub layouts: Vec<String>,
+}
+
+/// A table a table names as more of its routes, with the path parts and
+/// layouts it sits under (`RouteScan.names`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NamedTable {
+    pub name: TableName,
+    pub prefix: Vec<RoutePart>,
+    pub layouts: Vec<String>,
+}
+
+/// What a scan reads (`RouteScan`).
+#[derive(Debug, Default)]
+pub(crate) struct RouteScan {
+    pub routes: Vec<RouteDeclaration>,
+    /// The tables the scanned table names as more of its routes.
+    pub names: Vec<NamedTable>,
+    /// Where the file hands a table to the router.
+    pub uses: Vec<TableUse>,
+}
+
+/// The literal a table scan reads: where it opens, and the path parts and
+/// layouts its routes sit under (`scanRoutes`' `table` option).
+#[derive(Debug, Clone)]
+pub(crate) struct TableScan {
+    pub at: usize,
+    pub prefix: Vec<RoutePart>,
+    pub layouts: Vec<String>,
+}
+
+/// What [`scan_routes`] reads of a file (`scanRoutes`' options): with
+/// `objects`, every route object; with `table`, only the literal there;
+/// with `uses`, also the places the file hands a table to the router.
+#[derive(Debug, Default)]
+pub(crate) struct ScanOptions {
+    pub objects: bool,
+    pub uses: bool,
+    pub table: Option<TableScan>,
+}
+
+/// What a `(` hands React Router (`routerCall`): its argument, after
+/// `useRoutes` or `create*Router`, or each item of the array a `.map` is
+/// called on.
+enum RouterCall {
+    Argument,
+    Map(TableName),
+}
+
 /// The structural scanner over one file's text (`scanRoutes`): strings,
 /// comments, regex literals, JSX and balanced expressions are units.
 struct Scanner<'s> {
     source: &'s str,
     allow_jsx: bool,
-    /// Every route object in the file is read: it makes a router.
+    /// Every route object in the file is read: it makes a router, or the
+    /// scan reads a table.
     objects: bool,
+    /// The places the file hands a table to the router are read.
+    uses: bool,
     depth: usize,
     /// A unit lay past `MAX_SCAN_DEPTH`: the scan stopped there, so what it
     /// read is not the file's whole route tree.
     truncated: bool,
     scopes: Vec<RouteScope>,
-    /// How many `<Route>` tags have been read.
-    route_tags: usize,
+    /// The tables a route list names, in the order they are written.
+    names: Vec<TableName>,
+    /// Where the file hands routes to the router, and the `(` of the call.
+    sites: Vec<(TableAt, usize)>,
+    /// Every `<Route>` tag read.
+    route_tags: Vec<RouteTag>,
     /// Where the router itself is written (`createRoutesFromElements(…)`,
     /// `<BrowserRouter>…</BrowserRouter>`): its routes start at `/`.
     routers: Vec<(usize, usize)>,
 }
 
 impl<'s> Scanner<'s> {
-    fn new(source: &'s str, allow_jsx: bool, objects: bool) -> Self {
+    fn new(source: &'s str, allow_jsx: bool, objects: bool, uses: bool) -> Self {
         Self {
             source,
             allow_jsx,
             objects,
+            uses,
             depth: 0,
             truncated: false,
             scopes: Vec::new(),
-            route_tags: 0,
+            names: Vec::new(),
+            sites: Vec::new(),
+            route_tags: Vec::new(),
             routers: Vec::new(),
         }
     }
@@ -1059,8 +1158,117 @@ impl<'s> Scanner<'s> {
             })
     }
 
+    /// What the `(` at `at` hands React Router (`routerCall`), read only
+    /// with `uses`: the argument of `useRoutes` or `create*Router`, or the
+    /// items of the array a `.map` is called on, settled once the call's
+    /// units are read ([`Self::settle`]).
+    fn router_call_at(&self, at: usize) -> Option<RouterCall> {
+        if !self.uses
+            || !matches!(
+                self.token_before(at).as_bytes().last(),
+                Some(b's' | b'r' | b'p')
+            )
+        {
+            return None;
+        }
+        let start = floor_boundary(self.source, at.saturating_sub(64));
+        let before = self.source[start..at].trim_end_matches(is_js_space);
+        // `(?:^|[^\w$.])` before the name: the window's start, or no
+        // identifier or member access.
+        let bounded = |head: &str| {
+            head.as_bytes()
+                .last()
+                .is_none_or(|b| !(is_ident_byte(*b) || *b == b'.'))
+        };
+        let router = [
+            "useRoutes",
+            "createBrowserRouter",
+            "createHashRouter",
+            "createMemoryRouter",
+        ]
+        .iter()
+        .any(|name| before.strip_suffix(name).is_some_and(bounded));
+        if router {
+            return Some(RouterCall::Argument);
+        }
+        // `([A-Za-z_$][\w$]*)\s*\??\.\s*map\s*$`
+        let head = before.strip_suffix("map")?;
+        let head = head.trim_end_matches(is_js_space).strip_suffix('.')?;
+        let head = head.strip_suffix('?').unwrap_or(head);
+        let head = head.trim_end_matches(is_js_space);
+        let name_at = head.len() - head.bytes().rev().take_while(|b| is_ident_byte(*b)).count();
+        let name = &head[name_at..];
+        if !name.as_bytes().first().copied().is_some_and(is_ident_start)
+            || !bounded(&head[..name_at])
+        {
+            return None;
+        }
+        Some(RouterCall::Map(TableName {
+            name: name.to_string(),
+            call: false,
+            at: start + name_at,
+        }))
+    }
+
+    /// The call whose parentheses open at `open` and close at `close` hands
+    /// the router what `call` says (`settle`): a `.map` whose callback renders
+    /// a `<Route>` from each item's own fields, the literal written there, or
+    /// the table a name or a call names.
+    fn settle(&mut self, call: RouterCall, open: usize, close: usize) {
+        let arg = self.trivia(open + 1);
+        if arg >= close {
+            return;
+        }
+        match call {
+            RouterCall::Map(name) => {
+                let tags: Vec<&RouteTag> = self
+                    .route_tags
+                    .iter()
+                    .filter(|tag| tag.at > arg && tag.at < close)
+                    .collect();
+                if !tags.is_empty() && maps_route_fields(&self.source[arg..close], &tags) {
+                    self.sites.push((TableAt::Named(name), open));
+                }
+            }
+            RouterCall::Argument => {
+                if matches!(self.byte(arg), Some(b'[' | b'{')) {
+                    self.sites.push((TableAt::Literal(arg), open));
+                    return;
+                }
+                let Some(end) = identifier_end(self.source, arg).filter(|end| *end <= close) else {
+                    return;
+                };
+                let id = &self.source[arg..end];
+                if matches!(id, "createRoutesFromElements" | "createRoutesFromChildren") {
+                    return;
+                }
+                let next = self.trivia(end);
+                let call = if next == close || self.byte(next) == Some(b',') {
+                    false
+                } else if self.byte(next) == Some(b'(') {
+                    true
+                } else {
+                    return;
+                };
+                let name = TableName {
+                    name: id.to_string(),
+                    call,
+                    at: arg,
+                };
+                self.sites.push((TableAt::Named(name), open));
+            }
+        }
+    }
+
     /// One unit at `at` and past it (`unit`).
     fn unit(&mut self, at: usize) -> usize {
+        self.unit_in(at, false)
+    }
+
+    /// One unit at `at` and past it; in a `route_list` (a table, a route's
+    /// `children`), an array's entries that name more routes are tables
+    /// (`unit(at, routeList)`).
+    fn unit_in(&mut self, at: usize, route_list: bool) -> usize {
         if at >= self.len() {
             return self.len();
         }
@@ -1069,12 +1277,12 @@ impl<'s> Scanner<'s> {
             return self.len();
         }
         self.depth += 1;
-        let end = self.unit_inner(at);
+        let end = self.unit_inner(at, route_list);
         self.depth -= 1;
         end.min(self.len())
     }
 
-    fn unit_inner(&mut self, at: usize) -> usize {
+    fn unit_inner(&mut self, at: usize, route_list: bool) -> usize {
         let ch = self.source.as_bytes()[at];
         match ch {
             b'"' | b'\'' | b'`' => return self.string_end(at),
@@ -1108,6 +1316,11 @@ impl<'s> Scanner<'s> {
             b'(' => b')',
             _ => return self.next_char(at),
         };
+        let call = if ch == b'(' {
+            self.router_call_at(at)
+        } else {
+            None
+        };
         let router = ch == b'(' && self.routes_from_elements(at);
         let mut i = at + 1;
         let mut fields: HashMap<String, Field> = HashMap::new();
@@ -1125,6 +1338,9 @@ impl<'s> Scanner<'s> {
             if let Some((name, key_end)) = key {
                 let start = i;
                 let value_at = self.trivia(key_end);
+                // A route's children are more routes, written in place or
+                // named.
+                let children = self.objects && name == "children";
                 i = value_at;
                 let mut value_end = i;
                 loop {
@@ -1135,10 +1351,17 @@ impl<'s> Scanner<'s> {
                     {
                         break;
                     }
-                    i = self.unit(i);
+                    i = self.unit_in(i, children);
                     value_end = i;
                 }
                 let value = js_trim(&self.source[value_at..value_end.max(value_at)]).to_string();
+                if children && identifier_end(&value, 0) == Some(value.len()) {
+                    self.names.push(TableName {
+                        name: value.clone(),
+                        call: false,
+                        at: value_at,
+                    });
+                }
                 fields.insert(name.to_string(), Field { value, at: start });
             } else {
                 // Skip a whole entry (spread, method, shorthand), but still
@@ -1165,6 +1388,18 @@ impl<'s> Scanner<'s> {
                     );
                     fields.insert("lazy".to_string(), Field { value, at: entry });
                 }
+                if route_list
+                    && ch == b'['
+                    && let Some((name, call)) = named_entry(js_trim(&without_comments(
+                        &self.source[entry..i.max(entry)],
+                    )))
+                {
+                    self.names.push(TableName {
+                        name,
+                        call,
+                        at: entry,
+                    });
+                }
             }
             if self.byte(i) == Some(b',') {
                 i += 1;
@@ -1172,6 +1407,11 @@ impl<'s> Scanner<'s> {
         }
         if self.objects && ch == b'{' && self.byte(i) == Some(close) {
             self.route_object(&fields, at, i);
+        }
+        if let Some(call) = call
+            && i < self.len()
+        {
+            self.settle(call, at, i);
         }
         if router {
             self.routers.push((at, i));
@@ -1260,6 +1500,7 @@ impl<'s> Scanner<'s> {
         }
         let tag = &self.source[at + 1..i];
         let mut attrs: HashMap<&'s str, String> = HashMap::new();
+        let mut spreads = Vec::new();
         loop {
             i = self.trivia(i);
             if i >= self.len() || self.byte(i) == Some(b'>') || self.starts_with_at(i, "/>") {
@@ -1270,7 +1511,11 @@ impl<'s> Scanner<'s> {
                 .take_while(|b| is_word_byte(**b) || matches!(b, b':' | b'-'))
                 .count();
             if name_len == 0 {
+                let from = i;
                 i = self.unit(i);
+                if let Some(spread) = spread_attribute(&self.source[from..i.max(from)]) {
+                    spreads.push(spread.to_string());
+                }
                 continue;
             }
             let name = &self.source[i..i + name_len];
@@ -1309,7 +1554,11 @@ impl<'s> Scanner<'s> {
             // `path="team"`, or the same string in braces: `path={"team"}`.
             let path = literal(path_text.unwrap_or(""))
                 .or_else(|| literal(&expression("path").unwrap_or_default()));
-            self.route_tags += 1;
+            self.route_tags.push(RouteTag {
+                at,
+                spreads: std::mem::take(&mut spreads),
+                path: expression("path").map(|path| js_trim(&path).to_string()),
+            });
             let element =
                 component_name(expression("element").as_deref(), true).filter(|tag| tag != OUTLET);
             let component = component_name(expression("component").as_deref(), false)
@@ -1351,7 +1600,7 @@ impl<'s> Scanner<'s> {
                     // address names.
                     let page =
                         path.as_deref() == Some("") && (element.is_some() || route.lazy.is_some());
-                    addressless = Some((route, self.route_tags, page));
+                    addressless = Some((route, self.route_tags.len(), page));
                     None
                 }
             } else {
@@ -1408,7 +1657,7 @@ impl<'s> Scanner<'s> {
         }
         if let Some((mut route, tags, page)) = addressless {
             route.end = end;
-            if self.route_tags > tags {
+            if self.route_tags.len() > tags {
                 if route.renders() {
                     route.pathless = true;
                     self.scopes.push(route);
@@ -1421,24 +1670,53 @@ impl<'s> Scanner<'s> {
         end
     }
 
-    /// The routes the scopes declare, nesting composed (the end of
-    /// `scanRoutes`).
-    fn routes(&self) -> Vec<RouteDeclaration> {
+    /// The scopes around the extent `start..end`, outermost first.
+    fn around(&self, start: usize, end: usize) -> Vec<&RouteScope> {
+        let mut outer: Vec<&RouteScope> = self
+            .scopes
+            .iter()
+            .filter(|outer| outer.start < start && outer.end >= end)
+            .collect();
+        outer.sort_by_key(|outer| outer.start);
+        outer
+    }
+
+    /// Where a table named or handed over at `at` is mounted (`mount`): the
+    /// path parts of the routes around it, and the layouts among them.
+    fn mount(&self, at: usize) -> (Vec<RoutePart>, Vec<String>) {
+        let outer = self.around(at, at);
+        let parts = outer.iter().map(|c| c.part.clone()).collect();
+        let layouts = outer
+            .iter()
+            .filter(|c| c.renders() && !c.opaque)
+            .map(|c| {
+                c.component
+                    .clone()
+                    .or_else(|| c.lazy.clone())
+                    .expect("renders")
+            })
+            .collect();
+        (parts, layouts)
+    }
+
+    /// The routes the scopes declare, nesting composed under `prefix` and
+    /// inside the `inherited` layouts (the end of `scanRoutes`).
+    fn routes(&self, prefix: &[RoutePart], inherited: &[String]) -> Vec<RouteDeclaration> {
         let scopes = &self.scopes;
         let holds =
             |outer: &RouteScope, start: usize, end: usize| outer.start < start && outer.end >= end;
-        let around = |start: usize, end: usize| -> Vec<&RouteScope> {
-            let mut outer: Vec<&RouteScope> =
-                scopes.iter().filter(|o| holds(o, start, end)).collect();
-            outer.sort_by_key(|o| o.start);
-            outer
-        };
+        let around = |start: usize, end: usize| self.around(start, end);
         let parts_of: Vec<Vec<RoutePart>> = scopes
             .iter()
             .map(|scope| {
-                around(scope.start, scope.end)
-                    .into_iter()
-                    .map(|c| c.part.clone())
+                prefix
+                    .iter()
+                    .cloned()
+                    .chain(
+                        around(scope.start, scope.end)
+                            .into_iter()
+                            .map(|c| c.part.clone()),
+                    )
                     .chain(std::iter::once(scope.part.clone()))
                     .collect()
             })
@@ -1494,15 +1772,20 @@ impl<'s> Scanner<'s> {
             }
             // A route object renders inside the route objects around it; a
             // `<Route>`, inside the routes around it of either kind.
-            let layouts = around(scope.start, scope.end)
-                .into_iter()
-                .filter(|c| layout(c) && (scope.jsx || !c.jsx))
-                .map(|c| {
-                    c.component
-                        .clone()
-                        .or_else(|| c.lazy.clone())
-                        .expect("renders")
-                })
+            let layouts = inherited
+                .iter()
+                .cloned()
+                .chain(
+                    around(scope.start, scope.end)
+                        .into_iter()
+                        .filter(|c| layout(c) && (scope.jsx || !c.jsx))
+                        .map(|c| {
+                            c.component
+                                .clone()
+                                .or_else(|| c.lazy.clone())
+                                .expect("renders")
+                        }),
+                )
                 .collect();
             routes.push(RouteDeclaration {
                 path: path.clone(),
@@ -1541,6 +1824,281 @@ fn object_key(source: &str, i: usize) -> Option<(&str, usize)> {
     (bytes.get(colon) == Some(&b':')).then_some((key, colon + 1))
 }
 
+/// A JSX attribute that spreads one name, `{...rest}`, as that name
+/// (`^\{\s*\.\.\.\s*([A-Za-z_$][\w$]*)\s*\}$`).
+fn spread_attribute(text: &str) -> Option<&str> {
+    let inner = js_trim(text.strip_prefix('{')?.strip_suffix('}')?);
+    let inner = js_trim(inner.strip_prefix("...")?);
+    (identifier_end(inner, 0) == Some(inner.len())).then_some(inner)
+}
+
+/// A route list's entry that names more routes — `MainRoutes`,
+/// `...authRoutes`, `...routes(user)` — as the name and whether the entry
+/// calls it, its arguments one balanced group to the end (`NAMED_ENTRY`).
+fn named_entry(text: &str) -> Option<(String, bool)> {
+    let at = match text.strip_prefix("...") {
+        Some(_) => skip_js_space(text, 3),
+        None => 0,
+    };
+    let end = identifier_end(text, at)?;
+    let name = text[at..end].to_string();
+    let after = skip_js_space(text, end);
+    if after == text.len() {
+        return Some((name, false));
+    }
+    (text.as_bytes()[after] == b'(' && match_bracket(text, after) == Some(text.len() - 1))
+        .then_some((name, true))
+}
+
+/// `text` with its comments taken out, as upstream's
+/// `/\/\*[\s\S]*?\*\/|\/\/[^\n]*/g` does: an unclosed `/*` stays.
+fn without_comments(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut copied = 0;
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        if bytes[i] == b'/' && bytes[i + 1] == b'*' {
+            if let Some(end) = text[i + 2..].find("*/") {
+                out.push_str(&text[copied..i]);
+                i += 2 + end + 2;
+                copied = i;
+                continue;
+            }
+        } else if bytes[i] == b'/' && bytes[i + 1] == b'/' {
+            out.push_str(&text[copied..i]);
+            i = text[i..].find('\n').map_or(text.len(), |end| i + end);
+            copied = i;
+            continue;
+        }
+        i += 1;
+    }
+    out.push_str(&text[copied..]);
+    out
+}
+
+/// True when a `.map` callback renders a `<Route>` from the item's own
+/// route fields — `{...route}`, `{...rest}` destructured from it,
+/// `path={route.path}` or a `path` destructured from it — so the array it
+/// maps is a route table (`mapsRouteFields`). A `<Route path={item.layout +
+/// item.path}>` composes a path the table does not hold, and a callback that
+/// renders links or menu entries maps a menu.
+fn maps_route_fields(callback: &str, tags: &[&RouteTag]) -> bool {
+    let mut param: Option<&str> = None;
+    let mut rest: HashSet<String> = HashSet::new();
+    let mut paths: HashSet<String> = HashSet::new();
+    let mut bind = |pattern: &str| {
+        let inner = &pattern[1..pattern.len() - 1];
+        for entry in js_scan::top_level_items(inner) {
+            if entry.is_empty() {
+                continue;
+            }
+            // `...rest`
+            if let Some(spread) = entry.strip_prefix("...") {
+                let spread = skip_js_space(spread, 0);
+                let name = &entry[3 + spread..];
+                if identifier_end(name, 0) == Some(name.len()) {
+                    rest.insert(name.to_string());
+                }
+            }
+            // `path`, `path: p`, `path = '/'`, `path: p = '/'`
+            if let Some(after) = entry.strip_prefix("path") {
+                let mut i = skip_js_space(after, 0);
+                let mut local = "path";
+                if after.as_bytes().get(i) == Some(&b':') {
+                    let at = skip_js_space(after, i + 1);
+                    let Some(end) = identifier_end(after, at) else {
+                        continue;
+                    };
+                    local = &after[at..end];
+                    i = skip_js_space(after, end);
+                }
+                if i == after.len() || after.as_bytes()[i] == b'=' {
+                    paths.insert(local.to_string());
+                }
+            }
+        }
+    };
+    if let Some(at) = callback_parameters(callback) {
+        if callback.as_bytes().get(at) == Some(&b'{') {
+            let Some(close) = match_bracket(callback, at) else {
+                return false;
+            };
+            bind(&callback[at..=close]);
+        } else {
+            param = identifier_end(callback, at).map(|end| &callback[at..end]);
+        }
+    } else {
+        param = arrow_parameter(callback);
+    }
+    if let Some(param) = param {
+        // `const { element, ...rest } = route;` in the body.
+        for pattern in destructured_from(callback, param) {
+            bind(pattern);
+        }
+    }
+    // `^PARAM\s*\??\.\s*path$`
+    let own_path = |path: &str| {
+        param.is_some_and(|param| {
+            let Some(rest) = path.strip_prefix(param) else {
+                return false;
+            };
+            let rest = rest.trim_start_matches(is_js_space);
+            let rest = rest.strip_prefix('?').unwrap_or(rest);
+            rest.strip_prefix('.')
+                .is_some_and(|rest| rest.trim_start_matches(is_js_space) == "path")
+        })
+    };
+    tags.iter().any(|tag| {
+        tag.spreads
+            .iter()
+            .any(|spread| Some(spread.as_str()) == param || rest.contains(spread))
+            || tag
+                .path
+                .as_deref()
+                .is_some_and(|path| own_path(path) || paths.contains(path))
+    })
+}
+
+/// Where a callback's first parameter starts, past its list's `(`
+/// (`^(?:async\s+)?(?:function\b[^(]*)?\(\s*`), or `None` when the
+/// callback opens no parenthesized list.
+fn callback_parameters(callback: &str) -> Option<usize> {
+    let after_async = callback
+        .strip_prefix("async")
+        .map(|rest| skip_js_space(rest, 0))
+        .filter(|spaced| *spaced > 0)
+        .map(|spaced| "async".len() + spaced);
+    for start in after_async.into_iter().chain(std::iter::once(0)) {
+        let rest = &callback[start..];
+        // `function\b[^(]*`: the list is the first `(` past the keyword.
+        if let Some(after) = rest.strip_prefix("function")
+            && !after.as_bytes().first().copied().is_some_and(is_word_byte)
+            && let Some(paren) = after.find('(')
+        {
+            return Some(skip_js_space(
+                callback,
+                start + "function".len() + paren + 1,
+            ));
+        }
+        if rest.starts_with('(') {
+            return Some(skip_js_space(callback, start + 1));
+        }
+    }
+    None
+}
+
+/// An arrow function's bare parameter, `route => …`
+/// (`^(?:async\s+)?([A-Za-z_$][\w$]*)\s*=>`).
+fn arrow_parameter(callback: &str) -> Option<&str> {
+    let bare = |at: usize| {
+        let end = identifier_end(callback, at)?;
+        callback[skip_js_space(callback, end)..]
+            .starts_with("=>")
+            .then(|| &callback[at..end])
+    };
+    if let Some(rest) = callback.strip_prefix("async") {
+        let spaced = skip_js_space(rest, 0);
+        if spaced > 0
+            && let Some(name) = bare(5 + spaced)
+        {
+            return Some(name);
+        }
+    }
+    bare(0)
+}
+
+/// The object patterns `callback` destructures `param` into
+/// (`\b(?:const|let|var)\s*(\{[^{}]*\})\s*=\s*PARAM\s*[;\n]`, every
+/// match, each search starting where the last match ended).
+fn destructured_from<'c>(callback: &'c str, param: &str) -> Vec<&'c str> {
+    let bytes = callback.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        let at = i;
+        i += 1;
+        if at > 0 && is_word_byte(bytes[at - 1]) {
+            continue;
+        }
+        let Some(keyword) = ["const", "let", "var"]
+            .into_iter()
+            .find(|keyword| bytes[at..].starts_with(keyword.as_bytes()))
+        else {
+            continue;
+        };
+        let open = skip_js_space(callback, at + keyword.len());
+        if bytes.get(open) != Some(&b'{') {
+            continue;
+        }
+        let Some(close) = callback[open + 1..]
+            .find(['{', '}'])
+            .map(|len| open + 1 + len)
+            .filter(|close| bytes[*close] == b'}')
+        else {
+            continue;
+        };
+        let eq = skip_js_space(callback, close + 1);
+        if bytes.get(eq) != Some(&b'=') {
+            continue;
+        }
+        let value = skip_js_space(callback, eq + 1);
+        if !bytes[value..].starts_with(param.as_bytes()) {
+            continue;
+        }
+        let after = value + param.len();
+        let spaces = skip_js_space(callback, after);
+        // `\s*[;\n]`: a `;` past the white space, or else its last line
+        // break.
+        let end = if bytes.get(spaces) == Some(&b';') {
+            spaces + 1
+        } else if let Some(line) = callback[after..spaces].rfind('\n') {
+            after + line + 1
+        } else {
+            continue;
+        };
+        out.push(&callback[open..=close]);
+        i = end;
+    }
+    out
+}
+
+/// The references that bind a route (`routeReferences`): what it renders,
+/// and the layouts around it.
+pub(crate) fn route_references(
+    route: &RouteDeclaration,
+    from_node_id: &str,
+    file_path: &str,
+    line: i64,
+    language: Language,
+) -> Vec<RefView> {
+    let reference = |name: String| RefView {
+        row_id: None,
+        from_node_id: from_node_id.to_string(),
+        reference_name: name,
+        reference_kind: EdgeKind::References,
+        line,
+        column: 0,
+        file_path: file_path.to_string(),
+        language,
+        is_function_ref: false,
+        reference_subkind: None,
+    };
+    route
+        .component
+        .clone()
+        .or_else(|| route.lazy.clone())
+        .into_iter()
+        .chain(
+            route
+                .layouts
+                .iter()
+                .map(|layout| format!("{LAYOUT_PREFIX}{layout}")),
+        )
+        .map(reference)
+        .collect()
+}
+
 /// The routes a file's own text declares: its `<Route>` elements and, in a
 /// file that makes a router, its route objects (`scanRouteDeclarations`).
 pub(crate) fn scan_route_declarations(source: &str, allow_jsx: bool) -> Vec<RouteDeclaration> {
@@ -1553,33 +2111,87 @@ pub(crate) fn scan_route_declarations(source: &str, allow_jsx: bool) -> Vec<Rout
     {
         return Vec::new();
     }
-    let mut scanner = Scanner::new(source, allow_jsx, objects);
-    let mut at = 0;
-    loop {
-        at = scanner.trivia(at);
-        if at >= scanner.len() {
-            break;
+    let options = ScanOptions {
+        objects,
+        ..ScanOptions::default()
+    };
+    scan_routes(source, allow_jsx, &options).routes
+}
+
+/// The structural scan of a file (`scanRoutes`): the whole file, or with
+/// `options.table` only the literal there, its routes under the table's
+/// prefix and inside its layouts, and the tables it names in `names`; with
+/// `options.uses`, the places the file hands a table to the router too.
+pub(crate) fn scan_routes(source: &str, allow_jsx: bool, options: &ScanOptions) -> RouteScan {
+    let table = options.table.as_ref();
+    let mut scanner = Scanner::new(
+        source,
+        allow_jsx,
+        options.objects || table.is_some(),
+        options.uses,
+    );
+    if let Some(table) = table {
+        let at = scanner.trivia(table.at);
+        scanner.unit_in(at, true);
+    } else {
+        let mut at = 0;
+        loop {
+            at = scanner.trivia(at);
+            if at >= scanner.len() {
+                break;
+            }
+            at = scanner.unit(at);
         }
-        at = scanner.unit(at);
     }
-    // KEEP-RUST: a file nested past the bound yields no routes. A route read
-    // before the cut can sit in a parent that never closed, and composed
-    // without it its path is wrong (`b` under `/a` would be `/b`).
+    // KEEP-RUST: a file nested past the bound yields no routes, and names
+    // and hands over no table. A route read before the cut can sit in a
+    // parent that never closed, and composed without it its path is wrong
+    // (`b` under `/a` would be `/b`).
     if scanner.truncated {
-        return Vec::new();
+        return RouteScan::default();
     }
-    scanner.routes()
+    let prefix = table.map_or(&[][..], |table| table.prefix.as_slice());
+    let inherited = table.map_or(&[][..], |table| table.layouts.as_slice());
+    let names = scanner
+        .names
+        .iter()
+        .map(|name| {
+            let (parts, layouts) = scanner.mount(name.at);
+            NamedTable {
+                name: name.clone(),
+                prefix: prefix.iter().cloned().chain(parts).collect(),
+                layouts: inherited.iter().cloned().chain(layouts).collect(),
+            }
+        })
+        .collect();
+    let uses = scanner
+        .sites
+        .iter()
+        .map(|(table, at)| {
+            let (prefix, layouts) = scanner.mount(*at);
+            TableUse {
+                table: table.clone(),
+                prefix,
+                layouts,
+            }
+        })
+        .collect();
+    RouteScan {
+        routes: scanner.routes(prefix, inherited),
+        names,
+        uses,
+    }
 }
 
 /// Whether JSX parses in `file_path`: everything but `.ts`, `.mts` and
 /// `.cts` (`allowsJsx`).
-fn allows_jsx(file_path: &str) -> bool {
+pub(crate) fn allows_jsx(file_path: &str) -> bool {
     !(file_path.ends_with(".ts") || file_path.ends_with(".mts") || file_path.ends_with(".cts"))
 }
 
 /// The language React gives its routes: `tsx` in a `.tsx` file, `jsx`
 /// anywhere else, a `.ts` routes file included.
-fn route_language(file_path: &str) -> Language {
+pub(crate) fn route_language(file_path: &str) -> Language {
     if file_path.ends_with(".tsx") {
         Language::Tsx
     } else {
@@ -1616,26 +2228,9 @@ pub(crate) fn extract_routes(file_path: &str, content: &str) -> FrameworkResolve
                 serde_json::to_string(&route.parts).expect("route parts serialize")
             ));
         }
-        let reference = |name: String| RefView {
-            row_id: None,
-            from_node_id: node.id.clone(),
-            reference_name: name,
-            reference_kind: EdgeKind::References,
-            line,
-            column: 0,
-            file_path: file_path.to_string(),
-            language,
-            is_function_ref: false,
-            reference_subkind: None,
-        };
-        if let Some(target) = route.component.clone().or_else(|| route.lazy.clone()) {
-            result.references.push(reference(target));
-        }
-        for layout in &route.layouts {
-            result
-                .references
-                .push(reference(format!("{LAYOUT_PREFIX}{layout}")));
-        }
+        result.references.extend(route_references(
+            &route, &node.id, file_path, line, language,
+        ));
         result.nodes.push(node);
     }
     result
@@ -1693,11 +2288,13 @@ pub(crate) fn react_router_root(file_path: &str) -> String {
     super::route_href::app_root_for(file_path)
 }
 
-/// True for a route node React's extraction emitted, and no other
-/// framework's (`isReactRouterRoute`): its id is a verbatim reconstruction
-/// of its own fields. A server route carries its METHOD
-/// (`route:file:12:POST:/login`), a file-based page carries no line, and a
-/// path built from a constant keeps the id it was extracted with.
+/// True for a route node React's extraction or its table pass emitted, and
+/// no other framework's (`isReactRouterRoute`): its id is a verbatim
+/// reconstruction of its own fields. A server route carries its METHOD
+/// (`route:file:12:POST:/login`), a file-based page carries no line, a path
+/// built from a constant keeps the id it was extracted with, and a route
+/// from a table another file hands the router says so
+/// (`…:12:table:/login`).
 fn is_react_router_route(node: &Node) -> bool {
     let prefix = format!("route:{}:{}:", node.file_path, node.start_line);
     if !matches!(node.language, Language::Tsx | Language::Jsx) {
@@ -1706,6 +2303,9 @@ fn is_react_router_route(node: &Node) -> bool {
     let Some(rest) = node.id.strip_prefix(&prefix) else {
         return false;
     };
+    if super::react_tables::is_table_route(node) {
+        return true;
+    }
     rest == node.name
         || (!is_method_prefixed(rest)
             && node
@@ -2386,6 +2986,11 @@ export const router = createBrowserRouter([
         );
         assert!(scanned(&nested(MAX_SCAN_DEPTH - 3), "App.tsx").0.is_empty());
         assert!(scanned(&nested(100_000), "App.tsx").0.is_empty());
+        // Nor does a truncated file hand the router a table (W7-09d): the
+        // `useRoutes(routes)` before the cut goes with the rest.
+        let handed = |arrays: usize| format!("useRoutes(routes);\n{}", nested(arrays));
+        assert_eq!(uses(&handed(MAX_SCAN_DEPTH - 4)).len(), 2);
+        assert!(uses(&handed(MAX_SCAN_DEPTH - 3)).is_empty());
         let jsx = |depth: usize| {
             format!(
                 "<Route path=\"/before\" element={{<Before />}} />\n<BrowserRouter>{}<Route path=\"/x\" element={{<X />}} />{}</BrowserRouter>",
@@ -2425,6 +3030,286 @@ export const router = createBrowserRouter([
         );
         assert_eq!(lazy_route_reference(Some("lazyPage(load)")), None);
         assert_eq!(lazy_route_reference(None), None);
+    }
+
+    /// What a consumer's scan says it hands the router: each use's table
+    /// (`name()` for a call, `@offset` for a literal) and the path parts and
+    /// layouts around it.
+    fn uses(source: &str) -> Vec<String> {
+        let options = ScanOptions {
+            objects: router_call().is_match(source),
+            uses: true,
+            table: None,
+        };
+        scan_routes(source, true, &options)
+            .uses
+            .iter()
+            .map(|table_use| {
+                let table = match &table_use.table {
+                    TableAt::Named(name) if name.call => format!("{}()", name.name),
+                    TableAt::Named(name) => name.name.clone(),
+                    TableAt::Literal(at) => format!("@{at}"),
+                };
+                let prefix: Vec<String> = table_use.prefix.iter().map(RoutePart::shown).collect();
+                format!(
+                    "{table} [{}] [{}]",
+                    prefix.join(","),
+                    table_use.layouts.join(",")
+                )
+            })
+            .collect()
+    }
+
+    /// Upstream `react-router.test.ts` (#2400) and `react-router-call-tables`
+    /// (#2668): a `useRoutes` or `create*Router` argument is a table, named,
+    /// called or written in place, and so is the array a `.map` renders a
+    /// `<Route>` from each item's own fields of; a menu mapped into links, a
+    /// path composed from fields the table does not hold, and the JSX routes
+    /// `createRoutesFromElements` makes are not.
+    #[test]
+    fn a_file_hands_the_router_the_tables_it_uses() {
+        assert_eq!(uses("const element = useRoutes(routes);"), ["routes [] []"]);
+        assert_eq!(
+            uses("export default () => useRoutes(routes(isLoggedIn));"),
+            ["routes() [] []"]
+        );
+        assert_eq!(
+            uses("const router = createBrowserRouter(routes, { basename: '/app' });"),
+            ["routes [] []"]
+        );
+        let literal = "const router = createBrowserRouter([MainRoutes, LoginRoutes]);";
+        assert_eq!(
+            uses(literal),
+            [format!("@{} [] []", literal.find('[').unwrap())]
+        );
+        assert!(
+            uses("createBrowserRouter(createRoutesFromElements(<Route path='/' />));").is_empty()
+        );
+        assert!(uses("const x = notuseRoutes(routes); a.useRoutes(routes);").is_empty());
+
+        // `AppRoutes.map(…)` renders a `<Route>` from each item, inside the
+        // routes around it.
+        let mapped = "<Routes>\n  <Route path=\"/dashboard\" element={<DashboardLayout/>}>\n    {DashboardRoutes.map((route, index) => {\n      const {element, requireAuth, ...rest} = route;\n      return <Route key={index} {...rest} element={element}/>;\n    })}\n  </Route>\n  {adminRoutes?.map((route) => <Route key={route.path} {...route}/>)}\n  {items.map(({ path, ...rest }) => <Route path={path} element={<X/>} />)}\n  {pages.map((p) => <Route path={p.path} element={p.element} />)}\n</Routes>";
+        assert_eq!(
+            uses(mapped),
+            [
+                "DashboardRoutes [/dashboard] [DashboardLayout]",
+                "adminRoutes [] []",
+                "items [] []",
+                "pages [] []",
+            ]
+        );
+        // A menu rendered as links, and a path the table does not hold.
+        assert!(
+            uses("{menu.map((item) => <NavLink key={item.path} to={item.path}>{item.element}</NavLink>)}").is_empty()
+        );
+        assert!(
+            uses("<Routes>{dashboardRoutes.map((r) => <Route key={r.path} path={r.layout + r.path} element={r.element} />)}</Routes>")
+                .is_empty()
+        );
+        // Without `uses`, nothing is read of them.
+        let options = ScanOptions {
+            objects: true,
+            ..ScanOptions::default()
+        };
+        assert!(
+            scan_routes("useRoutes(routes);", true, &options)
+                .uses
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_callback_names_the_route_fields_it_renders() {
+        let tag = |spreads: &[&str], path: Option<&str>| RouteTag {
+            at: 0,
+            spreads: strings(spreads),
+            path: path.map(str::to_string),
+        };
+        let maps = |callback: &str, tag: &RouteTag| maps_route_fields(callback, &[tag]);
+        assert!(maps(
+            "(route) => <Route {...route} />",
+            &tag(&["route"], None)
+        ));
+        assert!(maps(
+            "route => <Route {...route} />",
+            &tag(&["route"], None)
+        ));
+        assert!(maps("async (route) => x", &tag(&["route"], None)));
+        assert!(maps(
+            "function (route) { return x; }",
+            &tag(&["route"], None)
+        ));
+        assert!(maps(
+            "({ element, ...rest }, index) => x",
+            &tag(&["rest"], None)
+        ));
+        assert!(maps(
+            "(route, index) => {\n  const { element, ...rest } = route;\n  return x;\n}",
+            &tag(&["rest"], None)
+        ));
+        assert!(maps("(route) => x", &tag(&[], Some("route.path"))));
+        assert!(maps("(route) => x", &tag(&[], Some("route ?. path"))));
+        assert!(maps("({ path: to }) => x", &tag(&[], Some("to"))));
+        assert!(maps("({ path = '/' }) => x", &tag(&[], Some("path"))));
+        assert!(!maps("(route) => x", &tag(&[], Some("route.pathname"))));
+        assert!(!maps("(r) => x", &tag(&[], Some("r.layout + r.path"))));
+        assert!(!maps("(route) => x", &tag(&["other"], None)));
+        // `const { … } = route` binds only `route`, and only when the
+        // statement ends there.
+        assert!(!maps(
+            "(route) => {\n  const { ...rest } = routes;\n  return x;\n}",
+            &tag(&["rest"], None)
+        ));
+        assert!(!maps(
+            "(route) => {\n  const { ...rest } = route.meta;\n  return x;\n}",
+            &tag(&["rest"], None)
+        ));
+    }
+
+    #[test]
+    fn a_route_list_entry_names_a_table_or_a_call() {
+        assert_eq!(
+            named_entry("MainRoutes"),
+            Some(("MainRoutes".to_string(), false))
+        );
+        assert_eq!(
+            named_entry("...authRoutes"),
+            Some(("authRoutes".to_string(), false))
+        );
+        assert_eq!(
+            named_entry("... routes(user)"),
+            Some(("routes".to_string(), true))
+        );
+        assert_eq!(
+            named_entry("routes (a, (b))"),
+            Some(("routes".to_string(), true))
+        );
+        assert_eq!(named_entry("routes(a) (b)"), None);
+        assert_eq!(named_entry("...settingsRoutes.flatMap((r) => r)"), None);
+        assert_eq!(named_entry("{ path: 'x' }"), None);
+        assert_eq!(without_comments("a /* b */ c // d\ne"), "a  c \ne");
+        assert_eq!(without_comments("a /* open"), "a /* open");
+        assert_eq!(spread_attribute("{ ... rest }"), Some("rest"));
+        assert_eq!(spread_attribute("{...rest.x}"), None);
+    }
+
+    /// A table's routes, as a table scan reads the literal at `at` under
+    /// `prefix` and inside `layouts`, and the tables it names with their
+    /// mounts.
+    fn table(
+        source: &str,
+        at: usize,
+        prefix: &[&str],
+        layouts: &[&str],
+    ) -> (Vec<String>, Vec<String>) {
+        let options = ScanOptions {
+            objects: true,
+            uses: false,
+            table: Some(TableScan {
+                at,
+                prefix: prefix.iter().map(|lit| RoutePart::lit(lit)).collect(),
+                layouts: strings(layouts),
+            }),
+        };
+        let scan = scan_routes(source, true, &options);
+        let mut bindings = Vec::new();
+        for route in &scan.routes {
+            if let Some(target) = route.component.as_ref().or(route.lazy.as_ref()) {
+                bindings.push(format!("{}->{target}", route.path));
+            }
+            for layout in &route.layouts {
+                bindings.push(format!("{}~>{layout}", route.path));
+            }
+        }
+        bindings.sort();
+        let names = scan
+            .names
+            .iter()
+            .map(|named| {
+                let prefix: Vec<String> = named.prefix.iter().map(RoutePart::shown).collect();
+                format!(
+                    "{}{} [{}] [{}]",
+                    named.name.name,
+                    if named.name.call { "()" } else { "" },
+                    prefix.join(","),
+                    named.layouts.join(",")
+                )
+            })
+            .collect();
+        (bindings, names)
+    }
+
+    /// Upstream `react-router.test.ts` (the ASP.NET Core React template,
+    /// codedthemes' route objects, a table mapped inside `<Route path>`): a
+    /// table scan reads only its literal, an index route at its top is the
+    /// address it is mounted at, its routes sit under the mount's path and
+    /// inside the layouts handed down, and the tables it names come back with
+    /// their own mounts.
+    #[test]
+    fn a_table_scan_reads_its_literal_under_its_mount() {
+        let source = "const ignored = [{ path: '/no', element: <No /> }];\n\
+                      const AppRoutes = [\n\
+                      \x20 { index: true, element: <Home /> },\n\
+                      \x20 { path: 'counter', element: <Counter /> },\n\
+                      \x20 { path: '/settings', element: <Shell />, children: [{ path: 'profile', element: <Profile /> }, ...more] },\n\
+                      \x20 { path: 'admin', children: adminRoutes },\n\
+                      \x20 ...ApiAuthorizationRoutes, // the auth pages\n\
+                      \x20 extraRoutes(user),\n\
+                      ];\n";
+        let at = source.find("[\n").unwrap();
+        let (bindings, names) = table(source, at, &[], &[]);
+        assert_eq!(
+            bindings,
+            strings(&[
+                "/->Home",
+                "/counter->Counter",
+                "/settings->Shell",
+                "/settings/profile->Profile",
+                "/settings/profile~>Shell",
+            ])
+        );
+        assert_eq!(
+            names,
+            strings(&[
+                "more [/settings] [Shell]",
+                "adminRoutes [admin] []",
+                "ApiAuthorizationRoutes [] []",
+                "extraRoutes() [] []",
+            ])
+        );
+        // Under a mount, with the layouts around it in the same file.
+        let (bindings, names) = table(source, at, &["/dashboard"], &["DashboardLayout"]);
+        assert_eq!(
+            bindings,
+            strings(&[
+                "/dashboard->Home",
+                "/dashboard/counter->Counter",
+                "/dashboard/counter~>DashboardLayout",
+                "/dashboard~>DashboardLayout",
+                "/settings->Shell",
+                "/settings/profile->Profile",
+                "/settings/profile~>DashboardLayout",
+                "/settings/profile~>Shell",
+                "/settings~>DashboardLayout",
+            ])
+        );
+        assert_eq!(
+            names[0],
+            "more [/dashboard,/settings] [DashboardLayout,Shell]"
+        );
+        // One route object handed over on its own.
+        let object = "const MainRoutes = {\n  path: '/',\n  element: <MainLayout />,\n  children: [{ path: '/', element: <Dashboard /> }, { path: 'sample', element: <Sample /> }],\n};\n";
+        let (bindings, _) = table(object, object.find('{').unwrap(), &[], &[]);
+        assert_eq!(
+            bindings,
+            strings(&[
+                "/->Dashboard",
+                "/sample->Sample",
+                "/sample~>MainLayout",
+                "/~>MainLayout"
+            ])
+        );
     }
 
     /// The nodes and references extraction gives a route, as upstream's

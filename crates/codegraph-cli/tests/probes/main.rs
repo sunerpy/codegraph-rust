@@ -21184,6 +21184,385 @@ mod react_router {
         );
     }
 
+    /// Upstream `react-router.test.ts` (#2400), the ASP.NET Core React template: the table `App.js` maps into `<Route {...rest}>`, and the table it spreads in turn, are routes; an index route at the table's top is `/`, a wrapper renders what it wraps, an entry rendering a call's result is no route, and a menu, a list nothing hands the router and a path the table does not hold are none. (The `<Link to>` navigations are the link pass's.)
+    #[test]
+    fn pr2400_a_table_another_file_maps_into_routes_is_read() {
+        let project = Project::new()
+            .file("src/Web/ClientApp/package.json", "{\"name\":\"web\",\"dependencies\":{\"react\":\"^18\",\"react-router-dom\":\"^6\"}}")
+            .file("src/Web/ClientApp/src/App.js", "import React, { Component } from 'react';\nimport { Route, Routes } from 'react-router-dom';\nimport AppRoutes from './AppRoutes';\nimport AuthorizeRoute from './components/api-authorization/AuthorizeRoute';\nimport { Layout } from './components/Layout';\n\nexport default class App extends Component {\n  static displayName = App.name;\n\n  render() {\n    return (\n      <Layout>\n        <Routes>\n          {AppRoutes.map((route, index) => {\n            const { element, requireAuth, ...rest } = route;\n            return <Route key={index} {...rest} element={requireAuth ? <AuthorizeRoute {...rest} element={element} /> : element} />;\n          })}\n        </Routes>\n      </Layout>\n    );\n  }\n}\n")
+            .file("src/Web/ClientApp/src/AppRoutes.js", "import ApiAuthorzationRoutes from './components/api-authorization/ApiAuthorizationRoutes';\nimport { Counter } from \"./components/Counter\";\nimport { FetchData } from \"./components/FetchData\";\nimport { Home } from \"./components/Home\";\nimport { ProtectedRoute } from \"./components/ProtectedRoute\";\nimport AdminWrapper from \"./components/AdminWrapper\";\nimport { Users } from \"./components/Users\";\n\nconst AppRoutes = [\n  {\n    index: true,\n    element: <Home />\n  },\n  {\n    path: '/counter',\n    element: <Counter />\n  },\n  {\n    path: '/fetch-data',\n    requireAuth: true,\n    element: <ProtectedRoute><FetchData /></ProtectedRoute>\n  },\n  {\n    path: 'admin/users',\n    element: <AdminWrapper><Users /></AdminWrapper>\n  },\n  ...ApiAuthorzationRoutes\n];\n\nexport default AppRoutes;\n")
+            .file("src/Web/ClientApp/src/breadcrumbs.js", "import { Crumb } from './icons';\nexport const crumbs = [{ path: '/history', element: <Crumb /> }];\n")
+            .file("src/Web/ClientApp/src/components/AdminWrapper.js", "export default function AdminWrapper({ children }) {\n  return children;\n}\n")
+            .file("src/Web/ClientApp/src/components/Counter.js", "export function Counter() {\n  return <div>Counter</div>;\n}\n")
+            .file("src/Web/ClientApp/src/components/FetchData.js", "export function FetchData() {\n  return <div>FetchData</div>;\n}\n")
+            .file("src/Web/ClientApp/src/components/Home.js", "export function Home() {\n  return <div>Home</div>;\n}\n")
+            .file("src/Web/ClientApp/src/components/Layout.js", "import { NavMenu } from './NavMenu';\nexport function Layout({ children }) {\n  return <div><NavMenu />{children}</div>;\n}\n")
+            .file("src/Web/ClientApp/src/components/NavMenu.js", "import { Link, NavLink, useNavigate } from 'react-router-dom';\nimport { menu } from '../menu';\n\nexport function NavMenu() {\n  const navigate = useNavigate();\n  const showProfile = () => {\n    navigate('/authentication/profile');\n  };\n  return (\n    <nav>\n      <Link to=\"/\">Home</Link>\n      <Link to=\"/counter\">Counter</Link>\n      <Link to=\"/fetch-data\">Fetch data</Link>\n      <button onClick={showProfile}>Profile</button>\n      {menu.map((item) => <NavLink key={item.path} to={item.path}>{item.element}</NavLink>)}\n    </nav>\n  );\n}\n")
+            .file("src/Web/ClientApp/src/components/ProtectedRoute.js", "export function ProtectedRoute({ children }) {\n  return children;\n}\n")
+            .file("src/Web/ClientApp/src/components/Users.js", "export function Users() {\n  return <div>Users</div>;\n}\n")
+            .file("src/Web/ClientApp/src/components/api-authorization/ApiAuthorizationConstants.js", "const prefix = '/authentication';\nexport const ApplicationPaths = {\n  Login: `${prefix}/login`,\n};\n")
+            .file("src/Web/ClientApp/src/components/api-authorization/ApiAuthorizationRoutes.js", "import { Profile } from './Profile';\nimport { Login } from './Login';\nimport { ApplicationPaths } from './ApiAuthorizationConstants';\n\nconst ApiAuthorizationRoutes = [\n  {\n    path: '/authentication/profile',\n    element: <Profile />\n  },\n  {\n    path: ApplicationPaths.Login,\n    element: loginAction('login')\n  }\n];\n\nfunction loginAction(name) {\n  return <Login action={name}></Login>;\n}\n\nexport default ApiAuthorizationRoutes;\n")
+            .file("src/Web/ClientApp/src/components/api-authorization/AuthorizeRoute.js", "export default function AuthorizeRoute({ element }) {\n  return element;\n}\n")
+            .file("src/Web/ClientApp/src/components/api-authorization/Login.js", "export function Login() {\n  return <div>Login</div>;\n}\n")
+            .file("src/Web/ClientApp/src/components/api-authorization/Profile.js", "export function Profile() {\n  return <div>Profile</div>;\n}\n")
+            .file("src/Web/ClientApp/src/dashboard.js", "import { Route, Routes } from 'react-router-dom';\nimport { Stats } from './icons';\nconst dashboardRoutes = [{ path: '/stats', layout: '/admin', element: <Stats /> }];\nexport function Dashboard() {\n  return <Routes>{dashboardRoutes.map((r) => <Route key={r.path} path={r.layout + r.path} element={r.element} />)}</Routes>;\n}\n")
+            .file("src/Web/ClientApp/src/icons.js", "export function HelpIcon() {\n  return <div>HelpIcon</div>;\n}\nexport function SettingsIcon() {\n  return <div>SettingsIcon</div>;\n}\nexport function Crumb() {\n  return <div>Crumb</div>;\n}\nexport function Stats() {\n  return <div>Stats</div>;\n}\n")
+            .file("src/Web/ClientApp/src/menu.js", "import { HelpIcon, SettingsIcon } from './icons';\nexport const menu = [\n  { path: '/help', element: <HelpIcon /> },\n  { path: '/settings', element: <SettingsIcon /> },\n];\n")
+            .index();
+        let graph = project.graph();
+        let report = graph.report();
+        assert_eq!(
+            routes(graph),
+            [
+                "/",
+                "/admin/users",
+                "/authentication/profile",
+                "/counter",
+                "/fetch-data"
+            ],
+            "{report}"
+        );
+        assert_eq!(
+            bindings(graph),
+            strings(&[
+                "/ -> Home@src/Web/ClientApp/src/components/Home.js",
+                "/admin/users -> Users@src/Web/ClientApp/src/components/Users.js",
+                "/authentication/profile -> Profile@src/Web/ClientApp/src/components/api-authorization/Profile.js",
+                "/counter -> Counter@src/Web/ClientApp/src/components/Counter.js",
+                "/fetch-data -> FetchData@src/Web/ClientApp/src/components/FetchData.js",
+            ]),
+            "{report}"
+        );
+        assert_eq!(
+            navigations(graph),
+            strings(&[
+                "showProfile -> /authentication/profile (navigate /authentication/profile) react-router",
+            ]),
+            "{report}"
+        );
+        // Each route stays at the line of its own object in the table.
+        let counter = graph
+            .nodes
+            .iter()
+            .find(|node| node.kind == "route" && node.name == "/counter")
+            .expect("the /counter route");
+        assert_eq!(
+            (counter.file_path.as_str(), counter.start_line),
+            ("src/Web/ClientApp/src/AppRoutes.js", 15),
+            "{report}"
+        );
+    }
+
+    /// Upstream `react-router.test.ts` (#2400): `useRoutes(routes(isLoggedIn))` hands over the table the imported function returns, nested paths composed, the index route the page at its layout's address. (`<Navigate to>` and `<Link to>` are the link pass's.)
+    #[test]
+    fn pr2400_a_table_a_function_returns_is_handed_to_use_routes() {
+        let project = Project::new()
+            .file("package.json", "{\"name\":\"kit\",\"dependencies\":{\"react\":\"^18\",\"react-router-dom\":\"^6\"}}")
+            .file("src/App.jsx", "import { useRoutes } from 'react-router-dom';\nimport routes from './routes';\n\nexport default function App({ isLoggedIn }) {\n  return useRoutes(routes(isLoggedIn));\n}\n")
+            .file("src/layouts/DashboardLayout.jsx", "import { Outlet } from 'react-router-dom';\nexport default function DashboardLayout() {\n  return <Outlet />;\n}\n")
+            .file("src/layouts/MainLayout.jsx", "import { Link, Outlet } from 'react-router-dom';\nexport default function MainLayout() {\n  return <div><Link to=\"/app/dashboard\">Dashboard</Link><Outlet /></div>;\n}\n")
+            .file("src/pages.jsx", "import { useNavigate } from 'react-router-dom';\nexport function Dashboard() { return <div>Dashboard</div>; }\nexport function Account() { return <div>Account</div>; }\nexport function Landing() { return <div>Landing</div>; }\nexport function Login() {\n  const navigate = useNavigate();\n  const onSubmit = () => navigate('/app/account');\n  return <form onSubmit={onSubmit} />;\n}\n")
+            .file("src/routes.jsx", "import { Navigate } from 'react-router-dom';\nimport DashboardLayout from './layouts/DashboardLayout';\nimport MainLayout from './layouts/MainLayout';\nimport { Account, Dashboard, Landing, Login } from './pages';\n\nconst routes = (isLoggedIn) => [\n  {\n    path: 'app',\n    element: isLoggedIn ? <DashboardLayout /> : <Navigate to=\"/login\" />,\n    children: [\n      { path: 'dashboard', element: <Dashboard /> },\n      { path: 'account', element: <Account /> },\n    ],\n  },\n  {\n    path: '/',\n    element: <MainLayout />,\n    children: [\n      { index: true, element: <Landing /> },\n      { path: 'login', element: <Login /> },\n    ],\n  },\n];\n\nexport default routes;\n")
+            .index();
+        let graph = project.graph();
+        let report = graph.report();
+        assert_eq!(
+            routes(graph),
+            ["/", "/app/account", "/app/dashboard", "/login"],
+            "{report}"
+        );
+        assert_eq!(
+            bindings(graph),
+            strings(&[
+                "/ -> Landing@src/pages.jsx",
+                "/ ~> MainLayout@src/layouts/MainLayout.jsx",
+                "/app/account -> Account@src/pages.jsx",
+                "/app/dashboard -> Dashboard@src/pages.jsx",
+                "/login -> Login@src/pages.jsx",
+                "/login ~> MainLayout@src/layouts/MainLayout.jsx",
+            ]),
+            "{report}"
+        );
+        assert_eq!(
+            navigations(graph),
+            strings(&["onSubmit -> /app/account (navigate /app/account) react-router",]),
+            "{report}"
+        );
+    }
+
+    /// Upstream `react-router.test.ts` (#2400), codedthemes' admin templates: `createBrowserRouter([MainRoutes, AuthenticationRoutes])` names route objects of their own files; a page the route file loads lazily is the module's, and one whose module is out of reach the declaration itself, never another app's page of its name.
+    #[test]
+    fn pr2400_route_objects_in_their_own_files_are_handed_to_the_router() {
+        let project = Project::new()
+            .file("next/package.json", "{\"name\":\"berry-next\",\"dependencies\":{\"next\":\"^15\",\"react\":\"^18\"}}")
+            .file("next/src/views/default.jsx", "export default function DashboardDefault() {\n  return <div />;\n}\n")
+            .file("next/src/views/sample-page.jsx", "export default function SamplePage() {\n  return <div />;\n}\n")
+            .file("package.json", "{\"name\":\"berry\",\"dependencies\":{\"react\":\"^18\",\"react-router-dom\":\"^7\"}}")
+            .file("src/layout/MainLayout.jsx", "export default function MainLayout() {\n  return <main />;\n}\n")
+            .file("src/layout/MinimalLayout.jsx", "export default function MinimalLayout() {\n  return <main />;\n}\n")
+            .file("src/routes/AuthenticationRoutes.jsx", "import MinimalLayout from '../layout/MinimalLayout';\nimport LoginPage from '../views/LoginPage';\n\nconst AuthenticationRoutes = {\n  path: '/',\n  element: <MinimalLayout />,\n  children: [\n    {\n      path: '/pages/login',\n      element: <LoginPage />\n    }\n  ]\n};\n\nexport default AuthenticationRoutes;\n")
+            .file("src/routes/MainRoutes.jsx", "import { lazy } from 'react';\nimport MainLayout from '../layout/MainLayout';\nimport Loadable from '../ui-component/Loadable';\n\nconst DashboardDefault = Loadable(lazy(() => import('../views/DashboardDefault')));\n// An import only the app's own build resolves (`baseUrl`).\nconst SamplePage = Loadable(lazy(() => import('views/sample-page')));\n\nconst MainRoutes = {\n  path: '/',\n  element: <MainLayout />,\n  children: [\n    {\n      path: '/',\n      element: <DashboardDefault />\n    },\n    {\n      path: 'dashboard',\n      children: [\n        {\n          path: 'default',\n          element: <DashboardDefault />\n        }\n      ]\n    },\n    {\n      path: '/sample-page',\n      element: <SamplePage />\n    }\n  ]\n};\n\nexport default MainRoutes;\n")
+            .file("src/routes/index.jsx", "import { createBrowserRouter } from 'react-router-dom';\n\n// routes\nimport AuthenticationRoutes from './AuthenticationRoutes';\nimport MainRoutes from './MainRoutes';\n\nconst router = createBrowserRouter([MainRoutes, AuthenticationRoutes], {\n  basename: import.meta.env.VITE_APP_BASE_NAME\n});\n\nexport default router;\n")
+            .file("src/ui-component/Loadable.jsx", "export default function Loadable(Component) {\n  return (props) => <Component {...props} />;\n}\n")
+            .file("src/views/DashboardDefault.jsx", "export default function DashboardDefault() {\n  return <div />;\n}\n")
+            .file("src/views/LoginPage.jsx", "export default function LoginPage() {\n  return <div />;\n}\n")
+            .index();
+        let graph = project.graph();
+        let report = graph.report();
+        assert_eq!(
+            routes(graph),
+            [
+                "/",
+                "/",
+                "/dashboard/default",
+                "/pages/login",
+                "/sample-page"
+            ],
+            "{report}"
+        );
+        assert_eq!(
+            bindings(graph),
+            strings(&[
+                "/ -> DashboardDefault@src/views/DashboardDefault.jsx",
+                "/ -> MinimalLayout@src/layout/MinimalLayout.jsx",
+                "/ ~> MainLayout@src/layout/MainLayout.jsx",
+                "/dashboard/default -> DashboardDefault@src/views/DashboardDefault.jsx",
+                "/dashboard/default ~> MainLayout@src/layout/MainLayout.jsx",
+                "/pages/login -> LoginPage@src/views/LoginPage.jsx",
+                "/pages/login ~> MinimalLayout@src/layout/MinimalLayout.jsx",
+                "/sample-page -> SamplePage@src/routes/MainRoutes.jsx",
+                "/sample-page ~> MainLayout@src/layout/MainLayout.jsx",
+            ]),
+            "{report}"
+        );
+        assert_eq!(navigations(graph), strings(&[]), "{report}");
+    }
+
+    /// Upstream `react-router.test.ts` (#2423), "a table mapped inside <Route path> in the same file": a table's relative paths compose onto the `<Route path>` it is mapped inside, and render inside its element when written in the same file; another file's table gets no layout edge.
+    #[test]
+    fn pr2423_a_table_mapped_inside_route_path_renders_inside_its_element() {
+        let project = Project::new()
+            .file("ClientApp/package.json", "{\"name\":\"client\",\"dependencies\":{\"react\":\"^18\",\"react-router-dom\":\"^6\"}}")
+            .file("ClientApp/src/adminRoutes.js", "import Reports from './pages/Reports';\n\nexport const adminRoutes = [{ path: 'reports', element: <Reports/> }];\n")
+            .file("ClientApp/src/layouts/admin.js", "export default function AdminLayout() {\n  return <div />;\n}\n")
+            .file("ClientApp/src/layouts/dashboard.js", "export default function DashboardLayout() {\n  return <div />;\n}\n")
+            .file("ClientApp/src/pages/DashboardApp.js", "export default function DashboardApp() {\n  return <div />;\n}\n")
+            .file("ClientApp/src/pages/LandingPage.js", "export default function LandingPage() {\n  return <div />;\n}\n")
+            .file("ClientApp/src/pages/Reports.js", "export default function Reports() {\n  return <div />;\n}\n")
+            .file("ClientApp/src/pages/TicketDetail.js", "export default function TicketDetail() {\n  return <div />;\n}\n")
+            .file("ClientApp/src/routes.js", "import { Routes, Route } from 'react-router-dom';\nimport AdminLayout from './layouts/admin';\nimport { adminRoutes } from './adminRoutes';\nimport DashboardLayout from './layouts/dashboard';\nimport DashboardApp from './pages/DashboardApp';\nimport LandingPage from './pages/LandingPage';\nimport TicketDetail from './pages/TicketDetail';\n\nconst DashboardRoutes = [\n    {\n        path: 'app',\n        requireAuth: true,\n        element: <DashboardApp/>\n    },\n    {\n        path: 'tickets/:id',\n        requireAuth: true,\n        element: <TicketDetail/>\n    }\n];\n\nexport default function Router() {\n    return (\n        <Routes>\n            <Route path=\"landing\" element={<LandingPage/>}/>\n            <Route path=\"/dashboard\" element={<DashboardLayout/>}>\n                {DashboardRoutes.map((route, index) => {\n                    const {element, requireAuth, ...rest} = route;\n                    return <Route key={index} {...rest} element={element}/>;\n                })}\n            </Route>\n            <Route path=\"/admin\" element={<AdminLayout/>}>\n                {adminRoutes.map((route) => <Route key={route.path} {...route}/>)}\n            </Route>\n        </Routes>\n    );\n}\n")
+            .index();
+        let graph = project.graph();
+        let report = graph.report();
+        assert_eq!(
+            routes(graph),
+            [
+                "/admin",
+                "/admin/reports",
+                "/dashboard",
+                "/dashboard/app",
+                "/dashboard/tickets/:id",
+                "/landing"
+            ],
+            "{report}"
+        );
+        assert_eq!(
+            bindings(graph),
+            strings(&[
+                "/admin -> AdminLayout@ClientApp/src/layouts/admin.js",
+                "/admin/reports -> Reports@ClientApp/src/pages/Reports.js",
+                "/dashboard -> DashboardLayout@ClientApp/src/layouts/dashboard.js",
+                "/dashboard/app -> DashboardApp@ClientApp/src/pages/DashboardApp.js",
+                "/dashboard/app ~> DashboardLayout@ClientApp/src/layouts/dashboard.js",
+                "/dashboard/tickets/:id -> TicketDetail@ClientApp/src/pages/TicketDetail.js",
+                "/dashboard/tickets/:id ~> DashboardLayout@ClientApp/src/layouts/dashboard.js",
+                "/landing -> LandingPage@ClientApp/src/pages/LandingPage.js",
+            ]),
+            "{report}"
+        );
+        assert_eq!(navigations(graph), strings(&[]), "{report}");
+    }
+
+    /// Upstream `react-router-call-tables.test.ts` (#2668), Medusa's admin dashboard: `const routes = getRouteMap({ … }); createBrowserRouter(routes)` in a class method hands over the table the imported function returns, each lazy route bound to the page its module hands React Router; the tables spread in from parameters stay unread.
+    #[test]
+    fn pr2668_a_table_a_function_returns_is_handed_over_through_a_local() {
+        let project = Project::new()
+            .file("admin/package.json", "{\"name\":\"dashboard\",\"dependencies\":{\"react\":\"^18\",\"react-router-dom\":\"^6\"}}")
+            .file("admin/src/components/main-layout.tsx", "import { Outlet } from 'react-router-dom';\n\nexport const MainLayout = () => {\n  return <Outlet />;\n};\n")
+            .file("admin/src/components/protected-route.tsx", "import { Outlet } from 'react-router-dom';\n\nexport const ProtectedRoute = () => {\n  return <Outlet />;\n};\n")
+            .file("admin/src/components/public-layout.tsx", "import { Outlet } from 'react-router-dom';\n\nexport const PublicLayout = () => {\n  return <Outlet />;\n};\n")
+            .file("admin/src/components/settings-layout.tsx", "import { Outlet } from 'react-router-dom';\n\nexport const SettingsLayout = () => {\n  return <Outlet />;\n};\n")
+            .file("admin/src/dashboard-app/dashboard-app.tsx", "import { createBrowserRouter, RouteObject, RouterProvider } from 'react-router-dom';\nimport { getRouteMap } from './routes/get-route.map';\n\nexport class DashboardApp {\n  private coreRoutes: RouteObject[];\n  private settingsRoutes: RouteObject[];\n\n  constructor({ plugins }: { plugins: { routes: RouteObject[] }[] }) {\n    this.coreRoutes = plugins.flatMap((p) => p.routes);\n    this.settingsRoutes = [];\n  }\n\n  render() {\n    const routes = getRouteMap({\n      settingsRoutes: this.settingsRoutes,\n      coreRoutes: this.coreRoutes,\n    });\n\n    const router = createBrowserRouter(routes, {\n      basename: '/app',\n    });\n\n    return <RouterProvider router={router} />;\n  }\n}\n")
+            .file("admin/src/dashboard-app/routes/get-route.map.tsx", "import { RouteObject } from 'react-router-dom';\nimport { ProtectedRoute } from '../../components/protected-route';\nimport { MainLayout } from '../../components/main-layout';\nimport { SettingsLayout } from '../../components/settings-layout';\nimport { PublicLayout } from '../../components/public-layout';\n\nexport function getRouteMap({\n  settingsRoutes,\n  coreRoutes,\n}: {\n  settingsRoutes: RouteObject[]\n  coreRoutes: RouteObject[]\n}) {\n  return [\n    {\n      element: <ProtectedRoute />,\n      children: [\n        {\n          element: <MainLayout />,\n          children: [\n            {\n              path: '/',\n              lazy: () => import('../../routes/home'),\n            },\n            {\n              path: '/products',\n              children: [\n                {\n                  path: '',\n                  lazy: () => import('../../routes/products/product-list'),\n                  children: [\n                    {\n                      path: 'create',\n                      lazy: () =>\n                        import('../../routes/products/product-create'),\n                    },\n                  ],\n                },\n              ],\n            },\n            ...coreRoutes,\n          ],\n        },\n        {\n          element: <SettingsLayout />,\n          children: [\n            {\n              path: '/settings',\n              lazy: () => import('../../routes/settings'),\n            },\n            ...settingsRoutes.flatMap((r) => r?.children || []),\n          ],\n        },\n      ],\n    },\n    {\n      element: <PublicLayout />,\n      children: [\n        {\n          path: '/login',\n          lazy: () => import('../../routes/login'),\n        },\n      ],\n    },\n  ];\n}\n")
+            .file("admin/src/routes/home/home.tsx", "export const Home = () => {\n  return <div>Home</div>;\n};\n")
+            .file("admin/src/routes/home/index.ts", "export { Home as Component } from './home';\n")
+            .file("admin/src/routes/login/index.ts", "export { Login as Component } from './login';\n")
+            .file("admin/src/routes/login/login.tsx", "export const Login = () => {\n  return <div>Login</div>;\n};\n")
+            .file("admin/src/routes/orders/index.ts", "export { Orders as Component } from './orders';\n")
+            .file("admin/src/routes/orders/orders.tsx", "export const Orders = () => {\n  return <div>Orders</div>;\n};\n")
+            .file("admin/src/routes/products/product-create/index.ts", "export { ProductCreate as Component } from './product-create';\n")
+            .file("admin/src/routes/products/product-create/product-create.tsx", "export const ProductCreate = () => {\n  return <div>ProductCreate</div>;\n};\n")
+            .file("admin/src/routes/products/product-list/index.ts", "export { ProductList as Component } from './product-list';\n")
+            .file("admin/src/routes/products/product-list/product-list.tsx", "export const ProductList = () => {\n  return <div>ProductList</div>;\n};\n")
+            .file("admin/src/routes/settings/index.ts", "export { Settings as Component } from './settings';\n")
+            .file("admin/src/routes/settings/settings.tsx", "export const Settings = () => {\n  return <div>Settings</div>;\n};\n")
+            .index();
+        let graph = project.graph();
+        let report = graph.report();
+        assert_eq!(
+            routes(graph),
+            ["/", "/login", "/products", "/products/create", "/settings"],
+            "{report}"
+        );
+        assert_eq!(
+            bindings(graph),
+            strings(&[
+                "/ -> Home@admin/src/routes/home/home.tsx",
+                "/ ~> MainLayout@admin/src/components/main-layout.tsx",
+                "/ ~> ProtectedRoute@admin/src/components/protected-route.tsx",
+                "/login -> Login@admin/src/routes/login/login.tsx",
+                "/login ~> PublicLayout@admin/src/components/public-layout.tsx",
+                "/products -> ProductList@admin/src/routes/products/product-list/product-list.tsx",
+                "/products ~> MainLayout@admin/src/components/main-layout.tsx",
+                "/products ~> ProtectedRoute@admin/src/components/protected-route.tsx",
+                "/products/create -> ProductCreate@admin/src/routes/products/product-create/product-create.tsx",
+                "/products/create ~> MainLayout@admin/src/components/main-layout.tsx",
+                "/products/create ~> ProductList@admin/src/routes/products/product-list/product-list.tsx",
+                "/products/create ~> ProtectedRoute@admin/src/components/protected-route.tsx",
+                "/settings -> Settings@admin/src/routes/settings/settings.tsx",
+                "/settings ~> ProtectedRoute@admin/src/components/protected-route.tsx",
+                "/settings ~> SettingsLayout@admin/src/components/settings-layout.tsx",
+            ]),
+            "{report}"
+        );
+        assert_eq!(navigations(graph), strings(&[]), "{report}");
+        let home = graph
+            .nodes
+            .iter()
+            .find(|node| node.kind == "route" && node.name == "/")
+            .expect("the / route");
+        assert_eq!(
+            (home.file_path.as_str(), home.start_line),
+            ("admin/src/dashboard-app/routes/get-route.map.tsx", 22),
+            "{report}"
+        );
+    }
+
+    /// Upstream `react-router-call-tables.test.ts` (#2668): the `routes` in the router's own scope, an imported table past a same-named local, a table an export holds as a call's result, an awaited call's, and the tables a router file names inside the one its function returns are read; a menu and a table computed from data are none.
+    #[test]
+    fn pr2668_the_other_ways_a_call_hands_the_router_its_table() {
+        let project = Project::new()
+            .file("package.json", "{\"name\":\"shapes\",\"dependencies\":{\"react\":\"^18\",\"react-router-dom\":\"^6\"}}")
+            .file("src/awaited/boot.jsx", "import { createBrowserRouter } from 'react-router-dom';\nimport { loadRoutes } from './load';\n\nexport async function boot() {\n  const routes = await loadRoutes();\n  return createBrowserRouter(routes);\n}\n")
+            .file("src/awaited/load.jsx", "import { Account } from '../pages';\n\nexport async function loadRoutes() {\n  return [{ path: '/me', element: <Account /> }];\n}\n")
+            .file("src/computed/App.jsx", "import { useRoutes } from 'react-router-dom';\nimport { pageList } from './pages';\n\nfunction buildRoutes(pages) {\n  return pages.map((p) => ({ path: p.path, element: p.element }));\n}\n\nexport default function App() {\n  const routes = buildRoutes(pageList);\n  return useRoutes(routes);\n}\n")
+            .file("src/computed/pages.jsx", "import { HelpIcon } from '../icons';\n\nexport const pageList = [{ path: '/computed', element: <HelpIcon /> }];\n")
+            .file("src/default/App.jsx", "import { useRoutes } from 'react-router-dom';\nimport routes from './routes';\n\nexport default function App() {\n  return useRoutes(routes);\n}\n")
+            .file("src/default/build.jsx", "import { Reports } from '../pages';\n\nexport function buildRoutes() {\n  return [{ path: '/reports', element: <Reports /> }];\n}\n")
+            .file("src/default/routes.js", "import { buildRoutes } from './build';\n\nexport default buildRoutes();\n")
+            .file("src/exported/App.jsx", "import { useRoutes } from 'react-router-dom';\nimport { routes } from './routes';\n\nexport default function App() {\n  return useRoutes(routes);\n}\n")
+            .file("src/exported/routes.jsx", "import { Dashboard } from '../pages';\nimport { getMenu } from '../menu';\n\nexport function menuSize() {\n  const routes = getMenu();\n  return routes.length;\n}\n\nconst makeRoutes = () => [{ path: '/dashboard', element: <Dashboard /> }];\n\nexport const routes = makeRoutes();\n")
+            .file("src/features/todo/routes.jsx", "import { TodoList } from '../../pages';\n\nexport const todoRoutes = [{ path: '/todos', element: <TodoList /> }];\n")
+            .file("src/icons.jsx", "export function HelpIcon() {\n  return <svg />;\n}\nexport function BillingIcon() {\n  return <svg />;\n}\n")
+            .file("src/local/main.jsx", "import { createBrowserRouter } from 'react-router-dom';\nimport { todoRoutes } from '../features/todo/routes';\nimport { Home } from '../pages';\n\nfunction buildRoutes() {\n  return [{ path: '/home', element: <Home /> }, ...todoRoutes];\n}\n\nconst routes = buildRoutes();\n\nexport const router = createBrowserRouter(routes);\n")
+            .file("src/menu.jsx", "import { BillingIcon, HelpIcon } from './icons';\n\nexport function getMenu() {\n  return [\n    { path: '/help', element: <HelpIcon /> },\n    { path: '/billing', element: <BillingIcon /> },\n  ];\n}\n")
+            .file("src/pages.jsx", "export function Home() {\n  return <div>Home</div>;\n}\nexport function Account() {\n  return <div>Account</div>;\n}\nexport function Dashboard() {\n  return <div>Dashboard</div>;\n}\nexport function Landing() {\n  return <div>Landing</div>;\n}\nexport function TodoList() {\n  return <div>TodoList</div>;\n}\nexport function Reports() {\n  return <div>Reports</div>;\n}\n")
+            .file("src/scoped/App.jsx", "import { Link, useRoutes } from 'react-router-dom';\nimport { getMenu } from '../menu';\nimport { getRoutes } from './routes';\n\nfunction Sidebar() {\n  const routes = getMenu();\n  return <nav>{routes.map((r) => <Link key={r.path} to={r.path}>{r.path}</Link>)}</nav>;\n}\n\nexport default function App({ user }) {\n  const routes = getRoutes(user);\n  const element = useRoutes(routes);\n  return <div><Sidebar />{element}</div>;\n}\n")
+            .file("src/scoped/routes.jsx", "import { Account, Home } from '../pages';\n\nexport const getRoutes = (user) => [\n  { path: '/', element: <Home /> },\n  { path: '/account', element: <Account /> },\n];\n")
+            .file("src/shadow/App.jsx", "import { useRoutes } from 'react-router-dom';\nimport routes from './routes';\nimport { getMenu } from '../menu';\n\nfunction Sidebar() {\n  const routes = getMenu();\n  return <ul>{routes.map((r) => <li key={r.path}>{r.path}</li>)}</ul>;\n}\n\nexport default function App() {\n  return useRoutes(routes);\n}\n")
+            .file("src/shadow/routes.jsx", "import { Landing } from '../pages';\n\nconst routes = [{ path: '/landing', element: <Landing /> }];\n\nexport default routes;\n")
+            .index();
+        let graph = project.graph();
+        let report = graph.report();
+        assert_eq!(
+            routes(graph),
+            [
+                "/",
+                "/account",
+                "/dashboard",
+                "/home",
+                "/landing",
+                "/me",
+                "/reports",
+                "/todos"
+            ],
+            "{report}"
+        );
+        assert_eq!(
+            bindings(graph),
+            strings(&[
+                "/ -> Home@src/pages.jsx",
+                "/account -> Account@src/pages.jsx",
+                "/dashboard -> Dashboard@src/pages.jsx",
+                "/home -> Home@src/pages.jsx",
+                "/landing -> Landing@src/pages.jsx",
+                "/me -> Account@src/pages.jsx",
+                "/reports -> Reports@src/pages.jsx",
+                "/todos -> TodoList@src/pages.jsx",
+            ]),
+            "{report}"
+        );
+        assert_eq!(navigations(graph), strings(&[]), "{report}");
+    }
+
+    /// Upstream `react-router-returned-tables.test.ts` (#2672): every `return` of the function's own is a table, past an early `return []` and a callback's, through `useMemo` and a function returning another's; a list a function written inside it returns is none.
+    #[test]
+    fn pr2672_every_table_a_route_building_function_returns() {
+        let project = Project::new()
+            .file("package.json", "{\"name\":\"apps\",\"dependencies\":{\"react\":\"^18\",\"react-router-dom\":\"^6\"}}")
+            .file("src/guarded/App.jsx", "import { useRoutes } from 'react-router-dom';\nimport { getRoutes } from './routes';\n\nexport default function App({ user }) {\n  return useRoutes(getRoutes(user));\n}\n")
+            .file("src/guarded/Me.jsx", "import { useRoutes } from 'react-router-dom';\nimport { meRoutes } from './routes';\n\nexport default function Me() {\n  return useRoutes(meRoutes());\n}\n")
+            .file("src/guarded/routes.jsx", "import { Account, Admin, Dashboard, Landing } from '../pages';\n\nexport function getRoutes(user) {\n  if (!user) return [];\n  if (user.isAdmin) {\n    return [{ path: '/admin', element: <Admin /> }];\n  }\n  return [\n    { path: '/dashboard', element: <Dashboard /> },\n    { path: '/account', element: <Account /> },\n  ];\n}\n\nexport const publicRoutes = (ready) => (ready ? [] : [{ path: '/welcome', element: <Landing /> }]);\n\n// Parameters with calls and arrows of their own in them.\nexport const meRoutes = (user = currentUser(), onLeave = () => null) => [{ path: '/me', element: <Account /> }];\n\nfunction currentUser() {\n  return null;\n}\n")
+            .file("src/memo/App.jsx", "import { useMemo } from 'react';\nimport { useRoutes } from 'react-router-dom';\nimport { getRoutes } from './routes';\n\nexport default function App({ user }) {\n  const routes = useMemo(() => getRoutes(user), [user]);\n  return useRoutes(routes);\n}\n")
+            .file("src/memo/Settings.jsx", "import { useMemo } from 'react';\nimport { useRoutes } from 'react-router-dom';\nimport settingsRoutes from './routes';\n\nexport default function SettingsApp() {\n  const routes = useMemo(settingsRoutes, []);\n  return useRoutes(routes);\n}\n")
+            .file("src/memo/routes.jsx", "import { Reports, Settings } from '../pages';\n\nexport const getRoutes = (user) => [{ path: '/reports', element: <Reports /> }];\n\nexport default function settingsRoutes() {\n  return [{ path: '/settings', element: <Settings /> }];\n}\n")
+            .file("src/nested/App.jsx", "import { useRoutes } from 'react-router-dom';\nimport { appRoutes } from './routes';\n\nexport default function App() {\n  return useRoutes(appRoutes());\n}\n")
+            .file("src/nested/Direct.jsx", "import { useRoutes } from 'react-router-dom';\nimport { buildRoutes } from './build';\n\nexport default function Direct() {\n  return useRoutes(buildRoutes());\n}\n")
+            .file("src/nested/build.jsx", "import { Faq, Help, Home } from '../pages';\n\nexport function buildRoutes() {\n  const note = <p>Don't panic</p>;\n  const menu = () => {\n    return [{ path: '/help', element: <Help /> }];\n  };\n  function faqRoutes() {\n    return [{ path: '/faq', element: <Faq /> }];\n  }\n  return [{ path: '/', element: <Home />, handle: { note, links: menu() }, loader() { return [faqRoutes()]; } }];\n}\n")
+            .file("src/nested/routes.jsx", "import { buildRoutes } from './build';\n\nexport function appRoutes() {\n  return buildRoutes();\n}\n")
+            .file("src/pages.jsx", "export function Home() {\n  return <div>Home</div>;\n}\nexport function Login() {\n  return <div>Login</div>;\n}\nexport function Orders() {\n  return <div>Orders</div>;\n}\nexport function OrderDetail() {\n  return <div>OrderDetail</div>;\n}\nexport function Admin() {\n  return <div>Admin</div>;\n}\nexport function Account() {\n  return <div>Account</div>;\n}\nexport function Reports() {\n  return <div>Reports</div>;\n}\nexport function Help() {\n  return <div>Help</div>;\n}\nexport function Faq() {\n  return <div>Faq</div>;\n}\nexport function Settings() {\n  return <div>Settings</div>;\n}\nexport function Dashboard() {\n  return <div>Dashboard</div>;\n}\nexport function Landing() {\n  return <div>Landing</div>;\n}\nexport function NotFound() {\n  return <div>NotFound</div>;\n}\n")
+            .file("src/permissions/App.jsx", "import { createBrowserRouter, RouterProvider } from 'react-router-dom';\nimport { generateRoutes } from './routes';\n\nexport default function App({ permissions }) {\n  const dynamicRoutes = generateRoutes(permissions);\n  const router = createBrowserRouter(dynamicRoutes);\n  return <RouterProvider router={router} />;\n}\n")
+            .file("src/permissions/routes.jsx", "import { Home, Login, NotFound, Orders, OrderDetail } from '../pages';\n\nexport const generateRoutes = (permissions) => {\n  const dynamicRoutes = [];\n  permissions.forEach((currentPerm) => {\n    if (!currentPerm.module) return [];\n    dynamicRoutes.push({ path: `/${currentPerm.module}`, element: <Orders /> });\n  });\n  return [\n    { path: '/login', element: <Login /> },\n    {\n      path: '/',\n      children: [{ path: '/', element: <Home /> }, { path: '/orders/:id', element: <OrderDetail /> }, ...dynamicRoutes],\n    },\n    { path: '*', element: <NotFound /> },\n  ];\n};\n")
+            .index();
+        let graph = project.graph();
+        let report = graph.report();
+        assert_eq!(
+            routes(graph),
+            [
+                "/",
+                "/",
+                "/*",
+                "/account",
+                "/admin",
+                "/dashboard",
+                "/login",
+                "/me",
+                "/orders/:id",
+                "/reports",
+                "/settings"
+            ],
+            "{report}"
+        );
+        assert_eq!(
+            bindings(graph),
+            strings(&[
+                "/ -> Home@src/pages.jsx",
+                "/ -> Home@src/pages.jsx",
+                "/* -> NotFound@src/pages.jsx",
+                "/account -> Account@src/pages.jsx",
+                "/admin -> Admin@src/pages.jsx",
+                "/dashboard -> Dashboard@src/pages.jsx",
+                "/login -> Login@src/pages.jsx",
+                "/me -> Account@src/pages.jsx",
+                "/orders/:id -> OrderDetail@src/pages.jsx",
+                "/reports -> Reports@src/pages.jsx",
+                "/settings -> Settings@src/pages.jsx",
+            ]),
+            "{report}"
+        );
+        assert_eq!(navigations(graph), strings(&[]), "{report}");
+    }
+
     /// KEEP-RUST: upstream's `addRouteTo` keeps the first route at a path in
     /// node order, which a sync changes; a path two routes of one app serve
     /// stays unresolved instead, and each app of a monorepo answers its own

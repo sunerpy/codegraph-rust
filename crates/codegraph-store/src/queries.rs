@@ -113,74 +113,7 @@ impl Store {
     pub fn upsert_nodes(&mut self, nodes: &[Node]) -> rusqlite::Result<()> {
         validate_nodes(nodes)?;
         let tx = self.conn.transaction()?;
-        {
-            let mut stmt = tx.prepare_cached(
-                r#"
-                INSERT INTO nodes (
-                  id, kind, name, qualified_name, file_path, language,
-                  start_line, end_line, start_column, end_column,
-                  docstring, signature, visibility,
-                  is_exported, is_async, is_static, is_abstract,
-                  decorators, type_parameters, return_type, updated_at
-                ) VALUES (
-                  @id, @kind, @name, @qualifiedName, @filePath, @language,
-                  @startLine, @endLine, @startColumn, @endColumn,
-                  @docstring, @signature, @visibility,
-                  @isExported, @isAsync, @isStatic, @isAbstract,
-                  @decorators, @typeParameters, @returnType, @updatedAt
-                )
-                ON CONFLICT(id) DO UPDATE SET
-                  kind = excluded.kind,
-                  name = excluded.name,
-                  qualified_name = excluded.qualified_name,
-                  file_path = excluded.file_path,
-                  language = excluded.language,
-                  start_line = excluded.start_line,
-                  end_line = excluded.end_line,
-                  start_column = excluded.start_column,
-                  end_column = excluded.end_column,
-                  docstring = excluded.docstring,
-                  signature = excluded.signature,
-                  visibility = excluded.visibility,
-                  is_exported = excluded.is_exported,
-                  is_async = excluded.is_async,
-                  is_static = excluded.is_static,
-                  is_abstract = excluded.is_abstract,
-                  decorators = excluded.decorators,
-                  type_parameters = excluded.type_parameters,
-                  return_type = excluded.return_type,
-                  updated_at = excluded.updated_at
-                "#,
-            )?;
-
-            for node in nodes {
-                let decorators = json_array_or_null(&node.decorators)?;
-                let type_parameters = json_array_or_null(&node.type_parameters)?;
-                stmt.execute(named_params! {
-                    "@id": node.id,
-                    "@kind": node.kind.as_str(),
-                    "@name": node.name,
-                    "@qualifiedName": node.qualified_name,
-                    "@filePath": node.file_path,
-                    "@language": node.language.as_str(),
-                    "@startLine": node.start_line,
-                    "@endLine": node.end_line,
-                    "@startColumn": node.start_column,
-                    "@endColumn": node.end_column,
-                    "@docstring": node.docstring,
-                    "@signature": node.signature,
-                    "@visibility": node.visibility,
-                    "@isExported": bool_to_i64(node.is_exported),
-                    "@isAsync": bool_to_i64(node.is_async),
-                    "@isStatic": bool_to_i64(node.is_static),
-                    "@isAbstract": bool_to_i64(node.is_abstract),
-                    "@decorators": decorators,
-                    "@typeParameters": type_parameters,
-                    "@returnType": node.return_type,
-                    "@updatedAt": node.updated_at,
-                })?;
-            }
-        }
+        upsert_nodes_in(&tx, nodes)?;
         tx.commit()
     }
 
@@ -1036,26 +969,7 @@ impl Store {
         &self,
         sites: &BTreeSet<ReferenceSite>,
     ) -> rusqlite::Result<Vec<UnresolvedRef>> {
-        let mut stmt = self.conn.prepare_cached(&format!(
-            "SELECT {UNRESOLVED_REF_COLUMNS} FROM unresolved_refs \
-             WHERE from_node_id = ?1 AND line = ?2 AND col = ?3 \
-             UNION ALL SELECT {UNRESOLVED_REF_COLUMNS} FROM resolved_refs \
-             WHERE from_node_id = ?1 AND line = ?2 AND col = ?3"
-        ))?;
-        let mut out = Vec::new();
-        for site in sites {
-            for reference in stmt.query_map(
-                params![site.from_node_id, site.line, site.col],
-                row_to_unresolved_ref,
-            )? {
-                out.push(reference?);
-            }
-        }
-        out.sort_by_key(|reference| reference.id);
-        for reference in &mut out {
-            reference.id = None;
-        }
-        Ok(out)
+        stored_refs_at_sites_in(&self.conn, sites)
     }
 
     /// Every reference of `file_path`'s last extraction, the rows resolution
@@ -1064,19 +978,7 @@ impl Store {
     /// give, as each site's multiset of references. Only valid while the
     /// `resolved_refs_version` marker is.
     pub fn stored_refs_of_file(&self, file_path: &str) -> rusqlite::Result<Vec<UnresolvedRef>> {
-        let mut stmt = self.conn.prepare_cached(&format!(
-            "SELECT {UNRESOLVED_REF_COLUMNS} FROM unresolved_refs WHERE file_path = ?1 \
-             UNION ALL SELECT {UNRESOLVED_REF_COLUMNS} FROM resolved_refs WHERE file_path = ?1 \
-             ORDER BY id"
-        ))?;
-        let rows = stmt.query_map([file_path], row_to_unresolved_ref)?;
-        rows.map(|row| {
-            row.map(|mut reference| {
-                reference.id = None;
-                reference
-            })
-        })
-        .collect()
+        stored_refs_of_file_in(&self.conn, file_path)
     }
 
     /// Ports `getUnresolvedReferencesByFiles` from `upstream db/queries.ts:1663-1694`.
@@ -2064,6 +1966,83 @@ impl Store {
         Ok(out.into_iter().collect())
     }
 
+    /// The reference sites of the edges into the nodes `ids` names, other
+    /// than `contains` edges, each with its source's file (W7-09d); a NULL
+    /// coordinate gives its file whole (`site: None`). Sorted and
+    /// deduplicated.
+    pub fn reference_sites_of_edges_to_targets(
+        &self,
+        ids: &[String],
+    ) -> rusqlite::Result<Vec<FileReferenceSite>> {
+        let mut unique = ids.to_vec();
+        unique.sort_unstable();
+        unique.dedup();
+        let mut out = BTreeSet::new();
+        for chunk in unique.chunks(SQLITE_PARAM_CHUNK_SIZE) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                r#"SELECT src.file_path, e.source, e.line, e.col
+                FROM edges e
+                JOIN nodes src ON src.id = e.source
+                WHERE e.target IN ({placeholders})
+                  AND e.kind != 'contains'
+                ORDER BY src.file_path, e.source, e.line, e.col"#
+            );
+            let params = chunk.iter().map(|id| id as &dyn ToSql).collect::<Vec<_>>();
+            let mut stmt = self.conn.prepare(&sql)?;
+            let rows = stmt.query_map(params.as_slice(), row_to_file_reference_site)?;
+            for row in rows {
+                out.insert(row?);
+            }
+        }
+        Ok(out.into_iter().collect())
+    }
+
+    /// Bring the nodes no single file's extraction makes in line with what
+    /// a framework's cross-file pass wants, in one transaction (W7-09d):
+    /// re-open the reference sites `reopen` names, each sibling group's
+    /// edges deleted and its stored references back in `unresolved_refs`
+    /// (a whole file for a `None` site), then delete the nodes `remove`
+    /// names, their edges and references going with them, and insert
+    /// `insert` with `refs` pending. A crash leaves the store as it was or
+    /// with every part applied.
+    pub fn replace_cross_file_nodes(
+        &mut self,
+        remove: &[String],
+        insert: &[Node],
+        refs: &[UnresolvedRef],
+        reopen: &[FileReferenceSite],
+    ) -> rusqlite::Result<()> {
+        validate_nodes(insert)?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for affected in reopen {
+            match &affected.site {
+                Some(site) => {
+                    let sites = BTreeSet::from([site.clone()]);
+                    let stored = stored_refs_at_sites_in(&tx, &sites)?;
+                    replace_site_resolution_in(&tx, std::slice::from_ref(site), &stored)?;
+                }
+                None => {
+                    let stored = stored_refs_of_file_in(&tx, &affected.file_path)?;
+                    replace_file_resolution_in(&tx, &affected.file_path, &stored)?;
+                }
+            }
+        }
+        {
+            let mut delete = tx.prepare_cached("DELETE FROM nodes WHERE id = ?")?;
+            for id in remove {
+                delete.execute([id])?;
+            }
+        }
+        upsert_nodes_in(&tx, insert)?;
+        insert_unresolved_refs_in_connection(&tx, refs)?;
+        tx.commit()
+    }
+
     /// `(id, file_path, signature)` of every Python function and method, in
     /// id order. Sync reads the parameters a pytest fixture can feed.
     pub fn python_callable_signatures(&self) -> rusqlite::Result<Vec<(String, String, String)>> {
@@ -3020,6 +2999,125 @@ fn parse_language(value: String) -> rusqlite::Result<Language> {
         _ => return Err(enum_error(value, "language")),
     };
     Ok(language)
+}
+
+/// The body of [`Store::stored_refs_at_sites`], in `conn`.
+fn stored_refs_at_sites_in(
+    conn: &Connection,
+    sites: &BTreeSet<ReferenceSite>,
+) -> rusqlite::Result<Vec<UnresolvedRef>> {
+    let mut stmt = conn.prepare_cached(&format!(
+        "SELECT {UNRESOLVED_REF_COLUMNS} FROM unresolved_refs \
+         WHERE from_node_id = ?1 AND line = ?2 AND col = ?3 \
+         UNION ALL SELECT {UNRESOLVED_REF_COLUMNS} FROM resolved_refs \
+         WHERE from_node_id = ?1 AND line = ?2 AND col = ?3"
+    ))?;
+    let mut out = Vec::new();
+    for site in sites {
+        for reference in stmt.query_map(
+            params![site.from_node_id, site.line, site.col],
+            row_to_unresolved_ref,
+        )? {
+            out.push(reference?);
+        }
+    }
+    out.sort_by_key(|reference| reference.id);
+    for reference in &mut out {
+        reference.id = None;
+    }
+    Ok(out)
+}
+
+/// The body of [`Store::stored_refs_of_file`], in `conn`.
+fn stored_refs_of_file_in(
+    conn: &Connection,
+    file_path: &str,
+) -> rusqlite::Result<Vec<UnresolvedRef>> {
+    let mut stmt = conn.prepare_cached(&format!(
+        "SELECT {UNRESOLVED_REF_COLUMNS} FROM unresolved_refs WHERE file_path = ?1 \
+         UNION ALL SELECT {UNRESOLVED_REF_COLUMNS} FROM resolved_refs WHERE file_path = ?1 \
+         ORDER BY id"
+    ))?;
+    let rows = stmt.query_map([file_path], row_to_unresolved_ref)?;
+    rows.map(|row| {
+        row.map(|mut reference| {
+            reference.id = None;
+            reference
+        })
+    })
+    .collect()
+}
+
+/// The body of [`Store::upsert_nodes`], in `conn`: the nodes' own transaction
+/// or a caller's.
+fn upsert_nodes_in(conn: &Connection, nodes: &[Node]) -> rusqlite::Result<()> {
+    let mut stmt = conn.prepare_cached(
+        r#"
+                INSERT INTO nodes (
+                  id, kind, name, qualified_name, file_path, language,
+                  start_line, end_line, start_column, end_column,
+                  docstring, signature, visibility,
+                  is_exported, is_async, is_static, is_abstract,
+                  decorators, type_parameters, return_type, updated_at
+                ) VALUES (
+                  @id, @kind, @name, @qualifiedName, @filePath, @language,
+                  @startLine, @endLine, @startColumn, @endColumn,
+                  @docstring, @signature, @visibility,
+                  @isExported, @isAsync, @isStatic, @isAbstract,
+                  @decorators, @typeParameters, @returnType, @updatedAt
+                )
+                ON CONFLICT(id) DO UPDATE SET
+                  kind = excluded.kind,
+                  name = excluded.name,
+                  qualified_name = excluded.qualified_name,
+                  file_path = excluded.file_path,
+                  language = excluded.language,
+                  start_line = excluded.start_line,
+                  end_line = excluded.end_line,
+                  start_column = excluded.start_column,
+                  end_column = excluded.end_column,
+                  docstring = excluded.docstring,
+                  signature = excluded.signature,
+                  visibility = excluded.visibility,
+                  is_exported = excluded.is_exported,
+                  is_async = excluded.is_async,
+                  is_static = excluded.is_static,
+                  is_abstract = excluded.is_abstract,
+                  decorators = excluded.decorators,
+                  type_parameters = excluded.type_parameters,
+                  return_type = excluded.return_type,
+                  updated_at = excluded.updated_at
+                "#,
+    )?;
+
+    for node in nodes {
+        let decorators = json_array_or_null(&node.decorators)?;
+        let type_parameters = json_array_or_null(&node.type_parameters)?;
+        stmt.execute(named_params! {
+            "@id": node.id,
+            "@kind": node.kind.as_str(),
+            "@name": node.name,
+            "@qualifiedName": node.qualified_name,
+            "@filePath": node.file_path,
+            "@language": node.language.as_str(),
+            "@startLine": node.start_line,
+            "@endLine": node.end_line,
+            "@startColumn": node.start_column,
+            "@endColumn": node.end_column,
+            "@docstring": node.docstring,
+            "@signature": node.signature,
+            "@visibility": node.visibility,
+            "@isExported": bool_to_i64(node.is_exported),
+            "@isAsync": bool_to_i64(node.is_async),
+            "@isStatic": bool_to_i64(node.is_static),
+            "@isAbstract": bool_to_i64(node.is_abstract),
+            "@decorators": decorators,
+            "@typeParameters": type_parameters,
+            "@returnType": node.return_type,
+            "@updatedAt": node.updated_at,
+        })?;
+    }
+    Ok(())
 }
 
 fn validate_nodes(nodes: &[Node]) -> rusqlite::Result<()> {
@@ -4368,6 +4466,124 @@ mod tests {
             .unwrap();
         assert_eq!(by_names.len(), 1);
         assert_eq!(by_names[0].reference_name, "Target");
+    }
+
+    /// W7-09d: the sites of the edges into chosen nodes, and the one
+    /// transaction that re-opens them, deletes the nodes and inserts their
+    /// replacements with pending references.
+    #[test]
+    fn cross_file_nodes_are_replaced_with_the_sites_into_them_reopened() {
+        let mut store = store("cross-file-nodes");
+        store
+            .upsert_nodes(&[
+                node("route:old", "/old", "routes.js"),
+                node("function:nav", "nav", "nav.js"),
+                node("function:other", "other", "nav.js"),
+            ])
+            .unwrap();
+        let edge = |source: &str, target: &str, line: Option<i64>| Edge {
+            id: None,
+            source: source.to_string(),
+            target: target.to_string(),
+            kind: EdgeKind::Calls,
+            metadata: None,
+            line,
+            col: line.map(|_| 4),
+            provenance: None,
+        };
+        store
+            .insert_edges(&[
+                edge("function:nav", "route:old", Some(2)),
+                // A sibling at the same site, which goes back with it.
+                edge("function:nav", "function:other", Some(2)),
+                edge("function:other", "route:old", None),
+            ])
+            .unwrap();
+        let reference = |from: &str, name: &str, file: &str, line: i64| UnresolvedRef {
+            id: None,
+            from_node_id: from.to_string(),
+            reference_name: name.to_string(),
+            reference_kind: EdgeKind::Calls,
+            line,
+            col: 4,
+            candidates: None,
+            file_path: file.to_string(),
+            language: Language::Rust,
+            is_function_ref: false,
+            reference_subkind: None,
+        };
+        store
+            .insert_unresolved_refs(&[reference("function:nav", "navigate", "nav.js", 2)])
+            .unwrap();
+        let row_ids: Vec<i64> = store
+            .all_unresolved_refs()
+            .unwrap()
+            .into_iter()
+            .filter_map(|reference| reference.id)
+            .collect();
+        store.delete_resolved_unresolved_refs(&row_ids).unwrap();
+        let sites = store
+            .reference_sites_of_edges_to_targets(&["route:old".to_string()])
+            .unwrap();
+        assert_eq!(
+            sites,
+            [
+                FileReferenceSite {
+                    file_path: "nav.js".to_string(),
+                    site: None,
+                },
+                FileReferenceSite {
+                    file_path: "nav.js".to_string(),
+                    site: Some(ReferenceSite {
+                        from_node_id: "function:nav".to_string(),
+                        line: 2,
+                        col: 4,
+                    }),
+                },
+            ]
+        );
+        assert!(
+            store
+                .reference_sites_of_edges_to_targets(&[])
+                .unwrap()
+                .is_empty()
+        );
+
+        let replacement = node("route:new", "/new", "routes.js");
+        store
+            .replace_cross_file_nodes(
+                &["route:old".to_string()],
+                std::slice::from_ref(&replacement),
+                &[reference("route:new", "Page", "routes.js", 1)],
+                &sites[1..],
+            )
+            .unwrap();
+        assert!(store.node_by_id("route:old").unwrap().is_none());
+        assert_eq!(store.node_by_id("route:new").unwrap(), Some(replacement));
+        // Every edge at the re-opened site went, and its reference is pending
+        // again; the new node's reference is pending too.
+        let edges: Vec<(String, String)> = store
+            .all_edges()
+            .unwrap()
+            .into_iter()
+            .map(|edge| (edge.source, edge.target))
+            .collect();
+        assert!(edges.is_empty(), "{edges:?}");
+        let mut pending: Vec<(String, String)> = store
+            .all_unresolved_refs()
+            .unwrap()
+            .into_iter()
+            .map(|reference| (reference.from_node_id, reference.reference_name))
+            .collect();
+        pending.sort();
+        assert_eq!(
+            pending,
+            [
+                ("function:nav".to_string(), "navigate".to_string()),
+                ("route:new".to_string(), "Page".to_string()),
+            ]
+        );
+        assert!(store.stored_refs_of_file("nav.js").unwrap().len() == 1);
     }
 
     #[test]

@@ -1474,7 +1474,23 @@ fn sync_paths_with_store(
         // runPostExtract before its resolution too): a route a constant names
         // is renamed before a navigation call resolves against it.
         resolver.run_post_extract(store)?;
-        let (scope_sites, fallback_files) = refresh_dependent_refs(
+        // Then the nodes no single file's extraction makes, the routes of
+        // the tables another file hands React Router (W7-09d): what the
+        // passes want now, compared with the store, the first change
+        // withdrawing the markers. The edges into a node that goes are
+        // re-read as an unchanged dependent's sites, and a node that comes
+        // has its references resolved below.
+        let cross_file = resolver.plan_cross_file_nodes(store)?;
+        if cross_file.changes_store() {
+            changed_names.begin_mutation(store)?;
+        }
+        let cross_file_applied = resolver.apply_cross_file_plan(store, &cross_file, false)?;
+        for affected in cross_file_applied.incoming {
+            if !reindexed.contains(&affected.file_path) {
+                merge_dependent_site(&mut dependent_sites, &mut dependent_fallbacks, affected);
+            }
+        }
+        let (mut scope_sites, fallback_files) = refresh_dependent_refs(
             project_root,
             store,
             scope,
@@ -1484,7 +1500,9 @@ fn sync_paths_with_store(
             &receiver_dependents,
             &reindexed,
             stored_refs_marker.is_some(),
+            &cross_file,
         )?;
+        scope_sites.extend(cross_file_applied.inserted_sites);
         let mut scope_files = reindexed.clone();
         scope_files.extend(fallback_files);
         #[cfg(test)]
@@ -1634,6 +1652,7 @@ fn refresh_dependent_refs(
     receiver_names: &BTreeMap<String, BTreeSet<String>>,
     already_reindexed: &HashSet<String>,
     stored_refs: bool,
+    cross_file: &codegraph_resolve::CrossFilePlan,
 ) -> Result<(BTreeSet<ReferenceSite>, HashSet<String>)> {
     let dependents = dependent_sites
         .keys()
@@ -1665,7 +1684,14 @@ fn refresh_dependent_refs(
             .collect::<Vec<_>>()
             .into_par_iter()
             .map(|relative| {
-                let refs = extract_dependent_refs(project_root, relative, scope, resolver);
+                let refs = extract_dependent_refs(project_root, relative, scope, resolver).map(
+                    |mut refs| {
+                        // The nodes no single file's extraction makes keep
+                        // their references (W7-09d).
+                        refs.extend(cross_file.refs_of_file(relative).iter().cloned());
+                        refs
+                    },
+                );
                 (relative.clone(), refs)
             })
             .collect();
@@ -1826,8 +1852,10 @@ fn sweep_orphaned_refs(
     // accumulate across interrupt→heal cycles and diverge from `index --force`.
     // Re-resolving the existing rows alone heals the interrupted pass byte-equal.
     // Cross-file framework finalization before resolution, as a full index
-    // runs it.
+    // runs it; a cross-file node that goes puts the references whose edges
+    // reached it back among the pending ones the batch resolves.
     resolver.run_post_extract(store)?;
+    resolver.run_cross_file_nodes(store)?;
     let result = resolver.resolve_and_persist_batched(store, ORPHAN_SWEEP_BATCH_ROWS)?;
     Ok(result.stats)
 }
@@ -7689,6 +7717,224 @@ pub(crate) mod tests {
         assert!(stored_refs_marker(&db).is_some(), "a full index writes it");
     }
 
+    const TABLE_PACKAGE: (&str, &str) = (
+        "package.json",
+        "{\"dependencies\":{\"react\":\"18\",\"react-router-dom\":\"6\"}}\n",
+    );
+    const TABLE_ADMIN: (&str, &str) = (
+        "src/adminRoutes.js",
+        "import Reports from './Reports';\n\nexport const adminRoutes = [{ path: 'reports', element: <Reports/> }];\n",
+    );
+    const TABLE_PAGE: (&str, &str) = (
+        "src/Reports.js",
+        "export default function Reports() {\n  return null;\n}\n",
+    );
+    const TABLE_LAYOUT: (&str, &str) = (
+        "src/Layout.js",
+        "export default function Layout() {\n  return null;\n}\n",
+    );
+    const MOUNTED_AT_ADMIN: (&str, &str) = (
+        "src/routes.js",
+        "import { Routes, Route } from 'react-router-dom';\nimport { adminRoutes } from './adminRoutes';\n\nexport default function Router() {\n  return <Routes><Route path=\"/admin\">{adminRoutes.map((route) => <Route key={route.path} {...route}/>)}</Route></Routes>;\n}\n",
+    );
+    const MOUNTED_AT_MANAGE: (&str, &str) = (
+        "src/routes.js",
+        "import { Routes, Route } from 'react-router-dom';\nimport { adminRoutes } from './adminRoutes';\n\nexport default function Router() {\n  return <Routes><Route path=\"/manage\">{adminRoutes.map((route) => <Route key={route.path} {...route}/>)}</Route></Routes>;\n}\n",
+    );
+    const SELF_MAPPED: (&str, &str) = (
+        "src/table.js",
+        "import { Routes, Route } from 'react-router-dom';\nimport Layout from './Layout';\nimport Reports from './Reports';\n\nexport const tableRoutes = [{ path: 'reports', element: <Reports/> }];\n\nexport function Shell() {\n  return <Routes><Route path=\"/\" element={<Layout/>}>{tableRoutes.map((route) => <Route key={route.path} {...route}/>)}</Route></Routes>;\n}\n",
+    );
+    const EARLIER_HANDS: (&str, &str) = (
+        "src/a.js",
+        "import { useRoutes } from 'react-router-dom';\nimport { tableRoutes } from './table';\n\nexport default function App() {\n  return useRoutes(tableRoutes);\n}\n",
+    );
+    const EARLIER_QUIET: (&str, &str) = (
+        "src/a.js",
+        "import { useNavigate } from 'react-router-dom';\n\nexport default function App() {\n  return null;\n}\n",
+    );
+    const NAV_TO_REPORTS: (&str, &str) = (
+        "src/nav.js",
+        "import { useNavigate } from 'react-router-dom';\nexport function Menu() {\n  const navigate = useNavigate();\n  const open = () => navigate('/reports');\n  return <button onClick={open} />;\n}\n",
+    );
+
+    /// The `references` edges out of the routes `/admin/reports`,
+    /// `/manage/reports` and `/reports` of `db`, the table routes of the
+    /// W7-09d tests.
+    fn table_route_edges(db: &Path) -> Vec<String> {
+        edge_projection(db)
+            .into_iter()
+            .filter(|edge| {
+                let (source, _) = edge.split_once(" -[references]-> ").unwrap_or_default();
+                source.ends_with("/reports")
+            })
+            .collect()
+    }
+
+    /// W7-09d: a sync that fails after the table pass replaced the route of a
+    /// table another file mounts leaves the new route's reference pending
+    /// and the marker away. The next sync, with nothing changed, re-reads
+    /// every JavaScript file from its extraction, which keeps the references
+    /// of the routes no single file's extraction makes, and resolves them as
+    /// a fresh index does.
+    #[test]
+    fn a_sync_failing_after_the_table_pass_heals_on_the_next() {
+        let initial = [TABLE_PACKAGE, TABLE_ADMIN, TABLE_PAGE, MOUNTED_AT_ADMIN];
+        let (dir, db) = fully_indexed("table-pass-fail", &initial);
+        assert_eq!(
+            table_route_edges(&db),
+            [
+                "src/adminRoutes.js:src/adminRoutes.js::route:/admin/reports -[references]-> src/Reports.js:Reports {\"confidence\":0.9,\"resolvedBy\":\"import\"}"
+            ]
+        );
+
+        write_files(dir.path(), &[MOUNTED_AT_MANAGE]);
+        FAIL_BEFORE_RESOLUTION.with(|fail| fail.set(true));
+        let failed = sync_changed_paths(dir.path(), &db, ["src/routes.js"]);
+        FAIL_BEFORE_RESOLUTION.with(|fail| fail.set(false));
+        assert!(failed.is_err(), "the injected failure must stop the sync");
+        assert_eq!(stored_refs_marker(&db), None);
+        assert!(
+            table_route_edges(&db).is_empty(),
+            "the route was replaced, its reference left pending"
+        );
+
+        sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
+        let fresh = fresh_edges(
+            "table-pass-fail-fresh",
+            &[TABLE_PACKAGE, TABLE_ADMIN, TABLE_PAGE, MOUNTED_AT_MANAGE],
+        );
+        assert_eq!(edge_projection(&db), fresh);
+        assert_eq!(table_route_edges(&db).len(), 1, "{fresh:#?}");
+    }
+
+    /// W7-09d: the orphan sweep runs the table pass before it resolves every
+    /// pending reference, as a full index does, and a route it replaces puts
+    /// the references whose edges reached it back among them: here the
+    /// earlier file stopped handing the table over before a sync heard of
+    /// it, so `/reports` keeps its id and gains its file's layout, and the
+    /// navigation into it binds again.
+    #[test]
+    fn the_orphan_sweep_reconciles_the_tables_and_rebinds_what_reached_them() {
+        let initial = [
+            TABLE_PACKAGE,
+            TABLE_PAGE,
+            TABLE_LAYOUT,
+            SELF_MAPPED,
+            EARLIER_HANDS,
+            NAV_TO_REPORTS,
+        ];
+        let (dir, db) = fully_indexed("table-pass-sweep", &initial);
+        let navigates = |db: &Path| {
+            edge_projection(db)
+                .into_iter()
+                .filter(|edge| edge.contains("-[navigates]->"))
+                .count()
+        };
+        assert_eq!(navigates(&db), 1);
+        assert_eq!(table_route_edges(&db).len(), 1, "no layout yet");
+
+        // The earlier file stops; no sync is told.
+        write_files(dir.path(), &[EARLIER_QUIET]);
+        Store::open(&db)
+            .unwrap()
+            .set_resolution_incomplete()
+            .unwrap();
+        sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
+        assert!(
+            !Store::open(&db)
+                .unwrap()
+                .is_resolution_incomplete()
+                .unwrap()
+        );
+        assert_eq!(table_route_edges(&db).len(), 2, "the layout came");
+        assert_eq!(navigates(&db), 1, "the navigation found the route again");
+
+        // The sync that hears of it changes nothing more.
+        sync_changed_paths(dir.path(), &db, ["src/a.js"]).unwrap();
+        let fresh = fresh_edges(
+            "table-pass-sweep-fresh",
+            &[
+                TABLE_PACKAGE,
+                TABLE_PAGE,
+                TABLE_LAYOUT,
+                SELF_MAPPED,
+                EARLIER_QUIET,
+                NAV_TO_REPORTS,
+            ],
+        );
+        assert_eq!(edge_projection(&db), fresh);
+    }
+
+    /// W7-09d: when the table pass makes a sync's first change — every file
+    /// unchanged, another lane rebuilding — it withdraws the markers first,
+    /// so a failure after it leaves the next sync to re-read every
+    /// JavaScript file, and the replaced route's pending reference resolves.
+    #[test]
+    fn the_table_pass_withdraws_the_markers_before_its_first_change() {
+        let initial = [TABLE_PACKAGE, TABLE_ADMIN, TABLE_PAGE, MOUNTED_AT_ADMIN];
+        let (dir, db) = fully_indexed("table-pass-first", &initial);
+        // An unchanged index whose Java lane rebuilds, and a mount that
+        // moved under no sync's notice.
+        crate::java_heads::withdraw_marker(&Store::open(&db).unwrap()).unwrap();
+        write_files(dir.path(), &[MOUNTED_AT_MANAGE]);
+        FAIL_BEFORE_RESOLUTION.with(|fail| fail.set(true));
+        let failed = sync_changed_paths(dir.path(), &db, Vec::<&str>::new());
+        FAIL_BEFORE_RESOLUTION.with(|fail| fail.set(false));
+        assert!(failed.is_err(), "the injected failure must stop the sync");
+        assert_eq!(surface_marker(&db), None, "the table pass withdrew it");
+
+        sync_changed_paths(dir.path(), &db, ["src/routes.js"]).unwrap();
+        let fresh = fresh_edges(
+            "table-pass-first-fresh",
+            &[TABLE_PACKAGE, TABLE_ADMIN, TABLE_PAGE, MOUNTED_AT_MANAGE],
+        );
+        assert_eq!(edge_projection(&db), fresh);
+        assert_eq!(table_route_edges(&db).len(), 1);
+    }
+
+    /// W7-09d: the routes the table pass made compare equal to the ones it
+    /// wants, their references with them, so a reconciled project plans no
+    /// change, and a sync that touches no table neither replaces a route nor
+    /// withdraws a marker. A sync's own reconciliation is one the next plan
+    /// keeps too.
+    #[test]
+    fn a_reconciled_project_plans_no_table_change() {
+        let initial = [
+            TABLE_PACKAGE,
+            TABLE_ADMIN,
+            TABLE_PAGE,
+            TABLE_LAYOUT,
+            SELF_MAPPED,
+            EARLIER_HANDS,
+            NAV_TO_REPORTS,
+            MOUNTED_AT_ADMIN,
+        ];
+        let (dir, db) = fully_indexed("table-pass-reconciled", &initial);
+        let plans_a_change = || {
+            let store = Store::open(&db).unwrap();
+            let paths = index_paths(dir.path()).unwrap();
+            let scope = ProjectScope::load(dir.path(), &paths).unwrap();
+            let mut resolver = ReferenceResolver::new(dir.path().to_string_lossy())
+                .with_max_file_size(scope.options.max_file_size);
+            {
+                let context = resolver.store_context(&store);
+                resolver.initialize(&context);
+            }
+            resolver
+                .plan_cross_file_nodes(&store)
+                .unwrap()
+                .changes_store()
+        };
+        assert_eq!(table_route_edges(&db).len(), 2, "/admin/reports, /reports");
+        assert!(!plans_a_change(), "the full index reconciled every table");
+
+        write_files(dir.path(), &[MOUNTED_AT_MANAGE]);
+        sync_changed_paths(dir.path(), &db, ["src/routes.js"]).unwrap();
+        assert!(!plans_a_change(), "the sync reconciled the moved mount");
+        assert_eq!(table_route_edges(&db).len(), 2, "/manage/reports, /reports");
+    }
+
     /// W5-09e: `project.godot`'s extraction maps `uid://` autoloads through
     /// every `.gd.uid` and `.tscn`, so it is extracted even under the
     /// marker. No resolution rule gives it an outgoing edge today, so no sync
@@ -7743,6 +7989,7 @@ pub(crate) mod tests {
             &BTreeMap::new(),
             &HashSet::new(),
             true,
+            &codegraph_resolve::CrossFilePlan::default(),
         )
         .unwrap();
         assert_eq!(

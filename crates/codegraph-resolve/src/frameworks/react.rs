@@ -12,8 +12,9 @@ use super::js_language_for;
 use super::js_scan::{self, JS_SPACE};
 use super::lazy_loader::{self, LoadedPage};
 use super::react_router::{self, LAYOUT_PREFIX, LAZY_ROUTE_PREFIX};
+use super::react_tables;
 use crate::alias_binding::{default_export_binding, extract_local_export_aliases};
-use crate::framework::FrameworkResolver;
+use crate::framework::{CrossFileNodes, FrameworkResolver};
 use crate::import_resolver::{resolve_import_path, resolve_via_import};
 use crate::strip_comments::{CommentLang, strip_comments_for_regex};
 use crate::types::{
@@ -182,6 +183,16 @@ impl FrameworkResolver for ReactResolver {
     /// `postExtract`).
     fn post_extract(&self, context: &dyn ResolutionContext) -> Option<Vec<Node>> {
         Some(react_router::rename_constant_routes(context))
+    }
+
+    /// The routes of tables another file hands the router (React's
+    /// `crossFileNodes`, [`react_tables::table_routes`]).
+    fn cross_file_nodes(&self, context: &dyn ResolutionContext) -> Option<CrossFileNodes> {
+        Some(CrossFileNodes {
+            extraction: react_tables::table_routes(context),
+            kind: NodeKind::Route,
+            owns: react_tables::is_table_route,
+        })
     }
 }
 

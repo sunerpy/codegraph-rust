@@ -30,7 +30,7 @@ use crate::types::{
 use codegraph_core::types::{Edge, EdgeKind, Language, Node, NodeKind, UnresolvedRef};
 use codegraph_extract::lang::{cpp_constructor_shape, parse_cpp_constructor_reference_name};
 use codegraph_store::Store;
-use codegraph_store::queries::ReferenceSite;
+use codegraph_store::queries::{FileReferenceSite, ReferenceSite};
 use rayon::prelude::*;
 use regex::Regex;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -396,6 +396,76 @@ pub enum ResolutionObservation {
         processed: u64,
         total: u64,
     },
+}
+
+/// What the detected resolvers' cross-file passes want changed in a store
+/// ([`ReferenceResolver::plan_cross_file_nodes`]).
+#[derive(Debug, Default)]
+pub struct CrossFilePlan {
+    /// The owned nodes no pass wants, or wants changed: deleted.
+    remove: Vec<String>,
+    /// The wanted nodes the store lacks, the removed ones put back included.
+    insert: Vec<Node>,
+    /// The references of `insert`, pending.
+    insert_refs: Vec<UnresolvedRef>,
+    /// Every wanted node's references, by the node's file.
+    refs_by_file: BTreeMap<String, Vec<UnresolvedRef>>,
+}
+
+impl CrossFilePlan {
+    /// Whether applying the plan changes the store.
+    pub fn changes_store(&self) -> bool {
+        !self.remove.is_empty() || !self.insert.is_empty()
+    }
+
+    /// The references of every node the passes want in `file_path`, removed
+    /// and put back or kept: what a re-extraction of the file merges in, as
+    /// no single file's extraction makes them.
+    pub fn refs_of_file(&self, file_path: &str) -> &[UnresolvedRef] {
+        self.refs_by_file
+            .get(file_path)
+            .map_or(&[][..], Vec::as_slice)
+    }
+}
+
+/// What [`ReferenceResolver::apply_cross_file_plan`] moved.
+#[derive(Debug, Default)]
+pub struct CrossFileApplied {
+    /// The reference sites of the edges into the removed nodes, with their
+    /// sources' files, read before the nodes went.
+    pub incoming: Vec<FileReferenceSite>,
+    /// The sites of the references the inserted nodes make.
+    pub inserted_sites: BTreeSet<ReferenceSite>,
+}
+
+/// Whether two nodes are the same but for when they were made.
+fn same_cross_file_node(old: &Node, new: &Node) -> bool {
+    let mut probe = new.clone();
+    probe.updated_at = old.updated_at;
+    probe == *old
+}
+
+/// Whether two lists hold the same references, as multisets, row ids and
+/// candidate lists aside.
+fn same_references(left: &[UnresolvedRef], right: &[UnresolvedRef]) -> bool {
+    let key = |reference: &UnresolvedRef| {
+        (
+            reference.from_node_id.clone(),
+            reference.reference_name.clone(),
+            reference.reference_kind.as_str(),
+            reference.line,
+            reference.col,
+            reference.file_path.clone(),
+            reference.language.as_str(),
+            reference.is_function_ref,
+            reference.reference_subkind.map(|subkind| subkind.as_str()),
+        )
+    };
+    let mut left: Vec<_> = left.iter().map(key).collect();
+    let mut right: Vec<_> = right.iter().map(key).collect();
+    left.sort_unstable();
+    right.sort_unstable();
+    left == right
 }
 
 /// Read-only aggregate from the detected framework resolvers' per-file extract
@@ -1570,6 +1640,148 @@ impl ReferenceResolver {
             store.upsert_nodes(&all_updates)?;
         }
         Ok(updated)
+    }
+
+    /// What the detected resolvers' cross-file passes
+    /// ([`crate::framework::FrameworkResolver::cross_file_nodes`]) want
+    /// changed in `store`, compared with the nodes each pass owns there
+    /// (upstream's `reconcileCrossFileNodes`, W7-09d). Reads the store only;
+    /// [`Self::apply_cross_file_plan`] makes the change. A node no pass
+    /// wants any more goes, and so does one wanted with another name,
+    /// qualified name or set of references, to come back as wanted: upstream
+    /// renames it in place and keeps its references, so a consumer's edit
+    /// could leave them stale where a fresh index has the new ones.
+    pub fn plan_cross_file_nodes(&self, store: &Store) -> anyhow::Result<CrossFilePlan> {
+        let mut passes = Vec::new();
+        {
+            let context = self.store_context(store);
+            for resolver in &self.framework_resolver_extensions {
+                if let Some(pass) = resolver.cross_file_nodes(&context) {
+                    passes.push(pass);
+                }
+            }
+        }
+        let mut plan = CrossFilePlan::default();
+        for pass in passes {
+            let owns = pass.owns;
+            let wanted: BTreeMap<String, Node> = pass
+                .extraction
+                .nodes
+                .into_iter()
+                .filter(owns)
+                .map(|node| (node.id.clone(), node))
+                .collect();
+            let mut wanted_refs: BTreeMap<String, Vec<UnresolvedRef>> = BTreeMap::new();
+            for reference in &pass.extraction.references {
+                if wanted.contains_key(&reference.from_node_id) {
+                    wanted_refs
+                        .entry(reference.from_node_id.clone())
+                        .or_default()
+                        .push(ref_view_to_unresolved(reference));
+                }
+            }
+            let existing: BTreeMap<String, Node> = store
+                .nodes_by_kind(pass.kind)?
+                .into_iter()
+                .filter(owns)
+                .map(|node| (node.id.clone(), node))
+                .collect();
+            let mut stored: BTreeMap<String, Vec<UnresolvedRef>> = BTreeMap::new();
+            let files: BTreeSet<&str> = existing
+                .values()
+                .map(|node| node.file_path.as_str())
+                .collect();
+            for file in files {
+                for reference in store.stored_refs_of_file(file)? {
+                    if existing.contains_key(&reference.from_node_id) {
+                        stored
+                            .entry(reference.from_node_id.clone())
+                            .or_default()
+                            .push(reference);
+                    }
+                }
+            }
+            let mut removed = std::collections::HashSet::new();
+            for (id, old) in &existing {
+                let kept = wanted.get(id).is_some_and(|new| {
+                    same_cross_file_node(old, new)
+                        && same_references(
+                            stored.get(id).map_or(&[][..], Vec::as_slice),
+                            wanted_refs.get(id).map_or(&[][..], Vec::as_slice),
+                        )
+                });
+                if !kept {
+                    removed.insert(id.clone());
+                    plan.remove.push(id.clone());
+                }
+            }
+            for (id, node) in wanted {
+                let refs = wanted_refs.remove(&id).unwrap_or_default();
+                plan.refs_by_file
+                    .entry(node.file_path.clone())
+                    .or_default()
+                    .extend(refs.iter().cloned());
+                if !existing.contains_key(&id) || removed.contains(&id) {
+                    plan.insert_refs.extend(refs);
+                    plan.insert.push(node);
+                }
+            }
+        }
+        Ok(plan)
+    }
+
+    /// Make `plan`'s change in `store`, in one transaction, and say what it
+    /// moved: the reference sites of the edges into the nodes it removed,
+    /// read before they went, and the sites of the references it inserted.
+    /// With `reopen_incoming`, those incoming sites are put back in
+    /// `unresolved_refs` in the same transaction, for a resolution of every
+    /// pending reference to rebind; a sync instead re-reads them as an
+    /// unchanged dependent's sites.
+    pub fn apply_cross_file_plan(
+        &self,
+        store: &mut Store,
+        plan: &CrossFilePlan,
+        reopen_incoming: bool,
+    ) -> anyhow::Result<CrossFileApplied> {
+        if !plan.changes_store() {
+            return Ok(CrossFileApplied::default());
+        }
+        let removed: std::collections::HashSet<&str> =
+            plan.remove.iter().map(String::as_str).collect();
+        let incoming: Vec<FileReferenceSite> = store
+            .reference_sites_of_edges_to_targets(&plan.remove)?
+            .into_iter()
+            .filter(|affected| {
+                affected
+                    .site
+                    .as_ref()
+                    .is_none_or(|site| !removed.contains(site.from_node_id.as_str()))
+            })
+            .collect();
+        let reopen: &[FileReferenceSite] = if reopen_incoming { &incoming } else { &[] };
+        store.replace_cross_file_nodes(&plan.remove, &plan.insert, &plan.insert_refs, reopen)?;
+        let inserted_sites = plan
+            .insert_refs
+            .iter()
+            .map(|reference| ReferenceSite {
+                from_node_id: reference.from_node_id.clone(),
+                line: reference.line,
+                col: reference.col,
+            })
+            .collect();
+        Ok(CrossFileApplied {
+            incoming,
+            inserted_sites,
+        })
+    }
+
+    /// [`Self::plan_cross_file_nodes`] and [`Self::apply_cross_file_plan`]
+    /// together, the incoming sites re-opened: what an index, a migration
+    /// and the orphan sweep run after [`Self::run_post_extract`], before a
+    /// resolution of every pending reference.
+    pub fn run_cross_file_nodes(&self, store: &mut Store) -> anyhow::Result<CrossFileApplied> {
+        let plan = self.plan_cross_file_nodes(store)?;
+        self.apply_cross_file_plan(store, &plan, true)
     }
 
     /// Run each detected resolver's per-file `extract` over `relative_files`,

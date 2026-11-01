@@ -261,11 +261,21 @@ listed.
   scanner's two recursive steps, a unit (a bracket group, a string or
   template, a template hole, one character) and a JSX element, share a bound
   of 256 levels. A file that goes deeper yields no routes, those read before
-  that point included: a parent route that was never closed would leave its
-  children's paths wrong. No file runs the call stack out; colby's scanner
+  that point included, and names and hands over no route table (W7-09d): a
+  parent route that was never closed would leave its children's paths wrong. No file runs the call stack out; colby's scanner
   recurses without a bound. The bracket, string and wrapped-call scanners in
   `js_scan.rs` keep their stackless walks and have no bound
   (`react_router.rs`).
+- **A route table whose routes' references changed (W7-09d).** The pass
+  that reconciles the routes of React Router tables after `post_extract`
+  replaces a route the tables still give when its name, qualified name or
+  references changed: it deletes the stored route, re-resolves the edges
+  that reached it and inserts the new one with its references. colby's
+  `reconcileCrossFileNodes` renames such a route in place and keeps its
+  references, so when a table's first reader changes, say an earlier file
+  stops handing over a table its own file maps inside `<Route
+  element={<Layout/>}>`, the route keeps rendering outside the layout until a
+  full index (`resolver.rs`, `react_tables.rs`).
 - **A React lazy loader nested past 256 levels (W7-09c).** The loader
   readers follow a loader's arrays, destructuring patterns, wrapper calls
   and default objects 256 levels deep; a loader nested deeper links nothing

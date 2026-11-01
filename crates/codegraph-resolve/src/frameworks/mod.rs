@@ -28,6 +28,7 @@ pub mod package_deps;
 pub(crate) mod page_component;
 pub mod react;
 pub mod react_router;
+pub(crate) mod react_tables;
 pub mod route_href;
 pub mod tauri;
 pub mod vue;
