@@ -22306,6 +22306,221 @@ mod vue_router {
     }
 }
 
+mod sveltekit {
+    use super::support::{EdgeRow, Graph, Project};
+
+    fn route_names(graph: &Graph) -> Vec<&str> {
+        let mut routes: Vec<&str> = graph
+            .nodes
+            .iter()
+            .filter(|node| node.kind == "route")
+            .map(|node| node.name.as_str())
+            .collect();
+        routes.sort_unstable();
+        routes
+    }
+
+    /// The `navigates` edges out of the one `kind` node named `name` in a
+    /// file whose path contains `file`.
+    fn navigations<'g>(graph: &'g Graph, kind: &str, name: &str, file: &str) -> Vec<&'g EdgeRow> {
+        let from: Vec<_> = graph
+            .nodes_named(kind, name)
+            .into_iter()
+            .filter(|node| node.file_path.contains(file))
+            .collect();
+        assert_eq!(from.len(), 1, "{kind} {name} in {file}\n{}", graph.report());
+        graph
+            .edges
+            .iter()
+            .filter(|edge| edge.kind == "navigates" && edge.source == from[0].id)
+            .collect()
+    }
+
+    /// Where an edge goes, the `href` and `navMethod` it records, and that
+    /// SvelteKit's resolver drew it.
+    fn landing<'g>(graph: &'g Graph, edge: &'g EdgeRow) -> (&'g str, &'g str, &'g str) {
+        assert_eq!(edge.resolved_by(), Some("framework"), "{}", graph.report());
+        assert_eq!(
+            edge.metadata.get("framework").and_then(|v| v.as_str()),
+            Some("sveltekit-router"),
+            "{}",
+            graph.report()
+        );
+        (
+            graph
+                .node(&edge.target)
+                .map_or("", |node| node.name.as_str()),
+            edge.metadata
+                .get("href")
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+            edge.metadata
+                .get("navMethod")
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+        )
+    }
+
+    /// Upstream F6 (`sveltekit-router.test.ts`, "a routed app end to end",
+    /// without its `<a href>` and Screens halves, W7-18 and the viewer): the
+    /// SvelteKit realworld app's shape. One route per `+page.svelte` (a
+    /// layout is no second screen at its address); `redirect` takes its path
+    /// after the status, `goto` with a template hole reaches the `[slug]`
+    /// page, and a path no page serves or a computed one stays unresolved.
+    #[test]
+    fn f6_a_sveltekit_app_routes_and_navigates() {
+        let page = |body: &str| format!("<script>\n  export let data\n</script>\n{body}\n");
+        let project = Project::new()
+            .file(
+                "package.json",
+                "{\"name\":\"conduit\",\"devDependencies\":{\"@sveltejs/kit\":\"2\",\"svelte\":\"5\"}}\n",
+            )
+            .file(
+                "src/routes/+layout.svelte",
+                &page("<nav>\n  <a href=\"/\">Home</a>\n  <a href=\"/login\">Sign in</a>\n</nav>\n<slot />"),
+            )
+            .file("src/routes/+page.svelte", &page("<h1>Conduit</h1>"))
+            .file("src/routes/login/+page.svelte", &page("<h1>Sign in</h1>"))
+            .file(
+                "src/routes/login/+page.server.js",
+                "import { redirect } from '@sveltejs/kit'\nexport function load({ locals }) {\n  if (locals.user) redirect(307, '/')\n}\nexport const actions = {\n  default: async ({ request, locals }) => {\n    const user = await signIn(request)\n    if (!user) return { errors: ['bad login'] }\n    redirect(307, '/')\n  }\n}\n",
+            )
+            .file("src/routes/register/+page.svelte", &page("<h1>Sign up</h1>"))
+            .file("src/routes/settings/+page.svelte", &page("<h1>Settings</h1>"))
+            .file(
+                "src/routes/settings/+page.server.js",
+                "import { redirect } from '@sveltejs/kit'\nexport function load({ locals }) {\n  if (!locals.user) redirect(302, '/login')\n}\n",
+            )
+            .file(
+                "src/routes/editor/+page.svelte",
+                "<script>\n  import { goto } from '$app/navigation'\n  async function publish() {\n    const article = await save()\n    goto(`/article/${article.slug}`)\n  }\n</script>\n<button on:click={publish}>Publish</button>\n",
+            )
+            .file("src/routes/article/[slug]/+page.svelte", &page("<h1>Article</h1>"))
+            .file("src/routes/profile/@[user]/+page.svelte", &page("<h1>Profile</h1>"))
+            .file("src/routes/profile/@[user]/+layout.svelte", &page("<slot />"))
+            .file(
+                "src/routes/nowhere/+page.server.js",
+                "import { redirect } from '@sveltejs/kit'\nexport function load({ url }) {\n  redirect(307, '/no-such-page')\n  redirect(307, url.searchParams.get(\"next\"))\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        assert_eq!(
+            route_names(graph),
+            [
+                "/",
+                "/article/:slug",
+                "/editor",
+                "/login",
+                "/profile/@:user",
+                "/register",
+                "/settings"
+            ],
+            "{}",
+            graph.report()
+        );
+        let guard = navigations(graph, "function", "load", "settings");
+        assert_eq!(guard.len(), 1, "{}", graph.report());
+        assert_eq!(landing(graph, guard[0]), ("/login", "/login", "redirect"));
+        let login = navigations(graph, "function", "load", "login");
+        assert_eq!(login.len(), 1, "{}", graph.report());
+        assert_eq!(landing(graph, login[0]), ("/", "/", "redirect"));
+        let publish = navigations(graph, "function", "publish", "editor");
+        assert_eq!(publish.len(), 1, "{}", graph.report());
+        assert_eq!(
+            landing(graph, publish[0]),
+            ("/article/:slug", "/article/${…}", "goto")
+        );
+        assert!(
+            navigations(graph, "function", "load", "nowhere").is_empty(),
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream #2131 (`sveltekit-route-names.test.ts`): a `(group)` folder
+    /// is no part of the URL and a parameter's matcher no part of its name,
+    /// so `goto('/blocks')` reaches the page under `(app)/(layout)/`. The
+    /// fixture's `<a href="/view/card">` is the link pass's (W7-18).
+    #[test]
+    fn p2131_sveltekit_route_names_drop_groups_and_matchers() {
+        let project = Project::new()
+            .file(
+                "package.json",
+                "{\"name\":\"site\",\"devDependencies\":{\"@sveltejs/kit\":\"*\",\"svelte\":\"*\"}}\n",
+            )
+            .file("src/routes/(app)/(layout)/blocks/+page.svelte", "<h1>Blocks</h1>\n")
+            .file(
+                "src/routes/(app)/(layout)/+page.svelte",
+                "<script>\n  import { goto } from '$app/navigation';\n</script>\n<button on:click={() => goto('/blocks')}>Blocks</button>\n<a href=\"/view/card\">Card</a>\n",
+            )
+            .file("src/routes/(view)/view/[view=view]/+page.svelte", "<p>view</p>\n")
+            .file("src/routes/docs/[...slug=doc]/+page.svelte", "<p>doc</p>\n")
+            .file(
+                "src/params/view.ts",
+                "export function match(p: string) { return p.length > 0; }\n",
+            )
+            .index();
+        let graph = project.graph();
+        assert_eq!(
+            route_names(graph),
+            ["/", "/blocks", "/docs/*slug", "/view/:view"],
+            "{}",
+            graph.report()
+        );
+        let home = navigations(graph, "component", "+page", "(app)/(layout)/+page.svelte");
+        let landings: Vec<_> = home.iter().map(|edge| landing(graph, edge)).collect();
+        assert_eq!(
+            landings,
+            [("/blocks", "/blocks", "goto")],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// `$lib` in a monorepo app is that app's `src/lib`: the hook's import
+    /// links `apps/web/src/lib/server/db.ts`, not the repository root's
+    /// `src/lib/server/db.ts`.
+    #[test]
+    fn a_sveltekit_lib_import_links_its_apps_file() {
+        let project = Project::new()
+            .file("package.json", "{\"name\":\"mono\",\"private\":true}\n")
+            .file(
+                "apps/web/package.json",
+                "{\"name\":\"web\",\"devDependencies\":{\"@sveltejs/kit\":\"2\",\"svelte\":\"5\"}}\n",
+            )
+            .file(
+                "apps/web/src/hooks.server.ts",
+                "import { db } from '$lib/server/db'\nexport async function handle({ event, resolve }) {\n  return resolve(event)\n}\n",
+            )
+            .file("apps/web/src/lib/server/db.ts", "export const db = {}\n")
+            .file("src/lib/server/db.ts", "export const db = {}\n")
+            .file("apps/web/src/routes/+page.svelte", "<h1>Home</h1>\n")
+            .index();
+        let graph = project.graph();
+        let hooks = graph
+            .nodes
+            .iter()
+            .find(|node| node.kind == "file" && node.file_path == "apps/web/src/hooks.server.ts")
+            .expect("the hooks file");
+        let imported: Vec<(&str, Option<&str>)> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.kind == "imports" && edge.source == hooks.id)
+            .filter_map(|edge| {
+                graph
+                    .node(&edge.target)
+                    .map(|node| (node.file_path.as_str(), edge.resolved_by()))
+            })
+            .collect();
+        assert_eq!(
+            imported,
+            [("apps/web/src/lib/server/db.ts", Some("framework"))],
+            "{}",
+            graph.report()
+        );
+    }
+}
+
 mod explore_flow {
     use super::support::{Project, codegraph};
 

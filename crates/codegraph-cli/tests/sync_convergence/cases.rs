@@ -11741,6 +11741,280 @@ pub fn typescript_vue_router_second_declarator_loses_its_export() -> Case {
         )
 }
 
+/// The manifest of a SvelteKit app.
+const SVELTEKIT_PACKAGE: &str =
+    "{\"name\":\"site\",\"devDependencies\":{\"@sveltejs/kit\":\"2\",\"svelte\":\"5\"}}\n";
+/// A SvelteKit page with nothing to navigate.
+const SVELTEKIT_PAGE: &str = "<h1>page</h1>\n";
+
+/// A SvelteKit app: `/`, `/login`, `/settings`, `/article/new` beside
+/// `/article/[slug]`, and `/about` in a `(marketing)` group.
+fn sveltekit_app(case: Case) -> Case {
+    case.file("package.json", SVELTEKIT_PACKAGE)
+        .file("src/routes/+page.svelte", SVELTEKIT_PAGE)
+        .file("src/routes/login/+page.svelte", SVELTEKIT_PAGE)
+        .file("src/routes/settings/+page.svelte", SVELTEKIT_PAGE)
+        .file("src/routes/article/new/+page.svelte", SVELTEKIT_PAGE)
+        .file("src/routes/article/[slug]/+page.svelte", SVELTEKIT_PAGE)
+        .file("src/routes/(marketing)/about/+page.svelte", SVELTEKIT_PAGE)
+}
+
+/// W7-12 (upstream F6): a `goto` is edited to name another page: the
+/// `navigates` edge follows it.
+pub fn javascript_sveltekit_goto_names_another_page() -> Case {
+    sveltekit_app(Case::new(
+        Change::BodyEdit,
+        &[Language::JavaScript, Language::Svelte],
+    ))
+    .file(
+        "src/lib/nav.js",
+        "import { goto } from '$app/navigation'\nexport function open() {\n  goto('/login')\n}\n",
+    )
+    .write(
+        "src/lib/nav.js",
+        "import { goto } from '$app/navigation'\nexport function open() {\n  goto('/settings')\n}\n",
+    )
+    .edge_before(
+        "function open",
+        "navigates",
+        "route src/routes/login/+page.svelte::route:/login",
+    )
+    .edge_after(
+        "function open",
+        "navigates",
+        "route src/routes/settings/+page.svelte::route:/settings",
+    )
+    .no_edge_after(
+        "function open",
+        "navigates",
+        "route src/routes/login/+page.svelte::route:/login",
+    )
+    .edge_metadata_after(
+        (
+            "function open",
+            "navigates",
+            "route src/routes/settings/+page.svelte::route:/settings",
+        ),
+        "framework",
+        "sveltekit-router",
+    )
+}
+
+/// W7-12 (upstream F6): a loader's `redirect` is edited to name another
+/// page, after the status as before.
+pub fn javascript_sveltekit_server_redirect_names_another_page() -> Case {
+    sveltekit_app(Case::new(
+        Change::BodyEdit,
+        &[Language::JavaScript, Language::Svelte],
+    ))
+    .file(
+        "src/routes/settings/+page.server.js",
+        "import { redirect } from '@sveltejs/kit'\nexport function load({ locals }) {\n  if (!locals.user) redirect(302, '/login')\n}\n",
+    )
+    .write(
+        "src/routes/settings/+page.server.js",
+        "import { redirect } from '@sveltejs/kit'\nexport function load({ locals }) {\n  if (!locals.user) redirect(302, '/')\n}\n",
+    )
+    .edge_before(
+        "function load",
+        "navigates",
+        "route src/routes/login/+page.svelte::route:/login",
+    )
+    .edge_after(
+        "function load",
+        "navigates",
+        "route src/routes/+page.svelte::route:/",
+    )
+    .no_edge_after(
+        "function load",
+        "navigates",
+        "route src/routes/login/+page.svelte::route:/login",
+    )
+}
+
+/// W7-12 (upstream F6): the static page a call names is deleted: the call
+/// navigates to the `[slug]` page that now serves its path.
+pub fn javascript_sveltekit_static_page_delete_falls_back_to_the_dynamic_page() -> Case {
+    sveltekit_app(Case::new(
+        Change::DeleteImportedModule,
+        &[Language::JavaScript, Language::Svelte],
+    ))
+    .file(
+        "src/lib/nav.js",
+        "export function create() {\n  goto('/article/new')\n}\n",
+    )
+    .remove("src/routes/article/new/+page.svelte")
+    .edge_before(
+        "function create",
+        "navigates",
+        "route src/routes/article/new/+page.svelte::route:/article/new",
+    )
+    .edge_after(
+        "function create",
+        "navigates",
+        "route src/routes/article/[slug]/+page.svelte::route:/article/:slug",
+    )
+}
+
+/// W7-12 (upstream #2131): a page moves to another `(group)` folder: its
+/// address stays, and the call that names it navigates to the moved page.
+pub fn javascript_sveltekit_group_folder_rename_keeps_the_address() -> Case {
+    sveltekit_app(Case::new(
+        Change::DeleteImportedModule,
+        &[Language::JavaScript, Language::Svelte],
+    ))
+    .file(
+        "src/lib/nav.js",
+        "export function about() {\n  goto('/about')\n}\n",
+    )
+    .rename(
+        "src/routes/(marketing)/about/+page.svelte",
+        "src/routes/(site)/about/+page.svelte",
+    )
+    .edge_before(
+        "function about",
+        "navigates",
+        "route src/routes/(marketing)/about/+page.svelte::route:/about",
+    )
+    .edge_after(
+        "function about",
+        "navigates",
+        "route src/routes/(site)/about/+page.svelte::route:/about",
+    )
+}
+
+/// W7-12 (upstream F6): the manifest comes to declare SvelteKit: the
+/// `goto` of a Svelte app names a page, though no source changed.
+pub fn javascript_sveltekit_dependency_appears_in_package_json() -> Case {
+    Case::new(
+        Change::ControlFile,
+        &[Language::JavaScript, Language::Svelte],
+    )
+    .file(
+        "package.json",
+        "{\"name\":\"site\",\"devDependencies\":{\"svelte\":\"5\"}}\n",
+    )
+    .file("src/routes/login/+page.svelte", SVELTEKIT_PAGE)
+    .file(
+        "src/lib/nav.js",
+        "export function open() {\n  goto('/login')\n}\n",
+    )
+    .write("package.json", SVELTEKIT_PACKAGE)
+    .edge_after(
+        "function open",
+        "navigates",
+        "route src/routes/login/+page.svelte::route:/login",
+    )
+}
+
+/// W7-12 (upstream #2425's shape): a page appears at the path a call in
+/// another file already names: the call navigates to it, as in a fresh
+/// index.
+pub fn javascript_sveltekit_page_appears_where_a_goto_points() -> Case {
+    sveltekit_app(Case::new(
+        Change::AddImportTarget,
+        &[Language::JavaScript, Language::Svelte],
+    ))
+    .file(
+        "src/lib/nav.js",
+        "export function open() {\n  goto('/pricing')\n}\n",
+    )
+    .write("src/routes/pricing/+page.svelte", SVELTEKIT_PAGE)
+    .edge_after(
+        "function open",
+        "navigates",
+        "route src/routes/pricing/+page.svelte::route:/pricing",
+    )
+}
+
+/// W7-12: a static page appears at the path a call reached through the
+/// `[slug]` page: the call navigates to the static page.
+pub fn javascript_sveltekit_static_page_appears_beside_the_dynamic_page() -> Case {
+    Case::new(
+        Change::AddImportTarget,
+        &[Language::JavaScript, Language::Svelte],
+    )
+    .file("package.json", SVELTEKIT_PACKAGE)
+    .file("src/routes/article/[slug]/+page.svelte", SVELTEKIT_PAGE)
+    .file(
+        "src/lib/nav.js",
+        "export function create() {\n  goto('/article/new')\n}\n",
+    )
+    .write("src/routes/article/new/+page.svelte", SVELTEKIT_PAGE)
+    .edge_before(
+        "function create",
+        "navigates",
+        "route src/routes/article/[slug]/+page.svelte::route:/article/:slug",
+    )
+    .edge_after(
+        "function create",
+        "navigates",
+        "route src/routes/article/new/+page.svelte::route:/article/new",
+    )
+    .no_edge_after(
+        "function create",
+        "navigates",
+        "route src/routes/article/[slug]/+page.svelte::route:/article/:slug",
+    )
+}
+
+/// W7-12: a second page that shortens to the path a call reached through
+/// an `[[optional]]` page appears in another group: two pages of the app
+/// serve that path now, so the call reaches neither, as in a fresh index
+/// that lists the pages in another order.
+pub fn javascript_sveltekit_second_optional_page_makes_the_short_path_ambiguous() -> Case {
+    Case::new(
+        Change::AddImportTarget,
+        &[Language::JavaScript, Language::Svelte],
+    )
+    .file("package.json", SVELTEKIT_PACKAGE)
+    .file(
+        "src/routes/(shop)/menu/[[lang]]/+page.svelte",
+        SVELTEKIT_PAGE,
+    )
+    .file(
+        "src/lib/nav.js",
+        "export function open() {\n  goto('/menu')\n}\n",
+    )
+    .write("src/routes/(app)/menu/[[tab]]/+page.svelte", SVELTEKIT_PAGE)
+    .edge_before(
+        "function open",
+        "navigates",
+        "route src/routes/(shop)/menu/[[lang]]/+page.svelte::route:/menu/:lang?",
+    )
+    .no_edge_after(
+        "function open",
+        "navigates",
+        "route src/routes/(shop)/menu/[[lang]]/+page.svelte::route:/menu/:lang?",
+    )
+    .no_edge_after(
+        "function open",
+        "navigates",
+        "route src/routes/(app)/menu/[[tab]]/+page.svelte::route:/menu/:tab?",
+    )
+}
+
+/// W7-12: the module a hook imports through `$lib` appears: the import
+/// links the file, as in a fresh index.
+pub fn typescript_sveltekit_lib_module_appears() -> Case {
+    Case::new(
+        Change::AddImportTarget,
+        &[Language::TypeScript, Language::Svelte],
+    )
+    .file("package.json", SVELTEKIT_PACKAGE)
+    .file("src/routes/+page.svelte", SVELTEKIT_PAGE)
+    .file(
+        "src/hooks.server.ts",
+        "import { db } from '$lib/server/db'\nexport async function handle({ event, resolve }) {\n  return resolve(event)\n}\n",
+    )
+    .write("src/lib/server/db.ts", "export const db = {}\n")
+    .edge_after(
+        "file src/hooks.server.ts",
+        "imports",
+        "file src/lib/server/db.ts",
+    )
+}
+
 /// The code-based route tree the W7-10 reparenting case edits. It exports
 /// the tree: in a module that exports nothing, a route is no other file's to
 /// reach (KEEP-RUST, W7-10).

@@ -301,16 +301,6 @@
   },
   {
     "candidates": null,
-    "col": 2,
-    "file_path": "apps/sveltekit/src/routes/+page.svelte",
-    "from_node_id": "file:apps/sveltekit/src/routes/+page.svelte",
-    "language": "svelte",
-    "line": 2,
-    "reference_kind": "imports",
-    "reference_name": "$app/navigation"
-  },
-  {
-    "candidates": null,
     "col": 21,
     "file_path": "apps/angular/src/app/app.routes.ts",
     "from_node_id": "constant:06ea8b9bbf6fb3d63e00be0a1c9eb74e",
@@ -518,26 +508,6 @@
     "line": 16,
     "reference_kind": "calls",
     "reference_name": "this.router.navigate"
-  },
-  {
-    "candidates": null,
-    "col": 4,
-    "file_path": "apps/sveltekit/src/routes/+page.svelte",
-    "from_node_id": "function:bb9fd543df3b3f09c016b7b41c8c8799",
-    "language": "svelte",
-    "line": 4,
-    "reference_kind": "calls",
-    "reference_name": "goto"
-  },
-  {
-    "candidates": null,
-    "col": 4,
-    "file_path": "apps/sveltekit/src/routes/blog/[slug=slug]/+page.ts",
-    "from_node_id": "function:5b78e25224f937e219793d3c6a611284",
-    "language": "typescript",
-    "line": 5,
-    "reference_kind": "calls",
-    "reference_name": "redirect"
   },
   {
     "candidates": null,

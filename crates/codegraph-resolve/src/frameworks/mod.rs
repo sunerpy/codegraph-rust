@@ -2,7 +2,8 @@
 //!
 //! Ports the subset of `upstream resolution/frameworks/` that this port
 //! ships: React ([`react`]), React Router ([`react_router`]), TanStack Router
-//! ([`tanstack_router`]), Next.js ([`nextjs`]), Vue Router ([`vue_router`]),
+//! ([`tanstack_router`]), Next.js ([`nextjs`]), Svelte and SvelteKit
+//! ([`svelte`], [`sveltekit_router`]), Vue Router ([`vue_router`]),
 //! Expo Router ([`expo_router`]), Vue and Nuxt ([`vue`]), NestJS
 //! ([`nestjs`]), Godot ([`godot`]) and Tauri ([`tauri`]). The other upstream
 //! resolvers remain deferred (see `KNOWN_DIFFS.md`).
@@ -31,6 +32,8 @@ pub mod react;
 pub mod react_router;
 pub(crate) mod react_tables;
 pub mod route_href;
+pub mod svelte;
+pub mod sveltekit_router;
 pub mod tanstack_router;
 pub mod tauri;
 pub mod vue;
@@ -76,6 +79,13 @@ pub fn detect_frameworks(context: &dyn ResolutionContext) -> Vec<Box<dyn Framewo
         // React. It claims only navigation calls that name one of its own
         // pages, which no resolver above resolves.
         Box::new(nextjs::NextjsResolver),
+        // Svelte's and SvelteKit's conventions and a SvelteKit page's route,
+        // then SvelteKit's navigation, after Next.js and before Vue Router as
+        // upstream orders them. Svelte reads `.svelte` files and the scripts
+        // of a Svelte app (runes, `$lib`); SvelteKit claims only `goto` and
+        // `redirect` calls that name one of its own pages.
+        Box::new(svelte::SvelteResolver),
+        Box::new(sveltekit_router::SvelteKitRouterResolver),
         // Vue Router's config routes and navigation, by name or by path
         // (F6), after Next.js and before Expo Router, as upstream orders the
         // routers. It claims navigation calls only where they name one of

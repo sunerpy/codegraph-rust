@@ -37,14 +37,15 @@ deterministic strategies — import resolution (`import-resolver.ts`) and name
 matching (`name-matcher.ts`) — orchestrated by `ReferenceResolver`
 (`index.ts`), plus concrete `FrameworkResolver` implementations behind the
 `FrameworkResolver` trait EXTENSION POINT (`crates/codegraph-resolve/src/framework.rs`):
-NestJS, React, Vue, Godot, Tauri, Nuxt, React Router, Next.js and Expo Router
+NestJS, React, Vue, Godot, Tauri, Nuxt, React Router, TanStack Router, Next.js,
+Svelte, SvelteKit, Vue Router and Expo Router
 (`crates/codegraph-resolve/src/frameworks/`), detected per-project by
 `detect_frameworks`. The other colby resolvers stay deferred. The following
 colby behaviors are intentionally NOT ported in v1:
 
 - **The other framework-specific resolvers** — every concrete `FrameworkResolver`
   in `reference/colby/src/resolution/frameworks/**` EXCEPT those above:
-  Spring/Java, Drupal `routing.yml`, Express, Svelte, React Native / Expo / Fabric
+  Spring/Java, Drupal `routing.yml`, Express, React Native / Expo / Fabric
   bridges, Swift↔ObjC bridging, the Go-module / Python / Ruby / C# / Play route
   extractors, and the Astro resolver
   (`frameworks/astro.ts`: `astro:*` module imports + the `Astro` global resolved
@@ -345,6 +346,44 @@ listed.
   identifier's name, which the Vue resolver and name matching bind too:
   vue-vben-admin's `component: IFrameView`, imported from a layouts module
   of three lazy constants, renders `BasicLayout` (`vue_router.rs`).
+- **A path two SvelteKit pages of one app serve (W7-12).** A navigation
+  call matches only the pages of its own app, as in colby, and a path two
+  pages of that app serve (`(a)/x/+page.svelte` beside `(b)/x/+page.svelte`,
+  or the path two `[[optional]]` pages shorten to) stays unresolved, with no
+  dynamic page standing in. colby's `addRouteTo` keeps the first page of a
+  path in node order, which a sync changes (`sveltekit_router.rs`).
+- **A SvelteKit destination that is no whole literal, or leaves the site
+  (W7-12).** `goto` and `redirect` read their destination whole, as Vue
+  Router does: a string, a template whose holes fill whole segments, a
+  conditional of them, or, for `goto`, a local initialized to one; and an
+  absolute or protocol-relative URL reaches nothing (an arm of a conditional
+  that is one drops out before the other arms are matched, so
+  `sso ? 'https://auth.example.com/login' : '/login'` still reaches
+  `/login`). colby reads the literal heading the expression and keeps an
+  absolute URL's path:
+  `redirect(303, '/article/' + slug)` is read as `/article/` and reaches an
+  `/article` page, a hole sharing a segment counts as the whole segment
+  (`` `/profile/@${name}` `` reaches `/profile/@:user`, as
+  `` `/create/preview-02${url.search}` `` reaches `/create/:item`), and
+  `redirect(303, 'https://auth.example.com/login')` reaches the app's own
+  `/login` (`sveltekit_router.rs`).
+- **SvelteKit's `$lib` in a monorepo (W7-12).** An import of `$lib/x` is
+  the file `src/lib/x` of the importing file's app, the directory above its
+  first `src`, `pages`, `app` or `routes` folder, and reaches that file's own
+  node, as every import edge does; colby reads `src/lib/` at the repository
+  root, which in a monorepo is no app's, and takes the first node
+  `getNodesInFile` returns for the file (`svelte.rs`).
+- **A Svelte store subscription (W7-12).** `$store` in a component binds the
+  one variable or constant named `store` its own file declares, and nothing
+  else; colby takes the first variable or constant of the name anywhere in
+  node order, so `$page` from `$app/stores` reached any project `page`
+  (`svelte.rs`).
+- **A capitalized call in a Svelte app (W7-12).** A component call binds the
+  one component of its name in the calling file's directory or below, else
+  the one of the project; several in the directory, or several in the
+  project and none there, is none. colby takes the first component under the
+  directory's path prefix, so `src/ui/List.svelte` reached a `Card` in
+  `src/ui-kit/` (`svelte.rs`).
 - **A tag imported from a module that exports no component under its name
   (W7-09e).** A JSX tag imported from a module of the project renders what
   the module exports under the name, as colby's (#2563); when the module

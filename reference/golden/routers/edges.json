@@ -368,6 +368,19 @@
     "target": "function:6dccb0ce095800be34bbf630bb5e1b0b"
   },
   {
+    "col": 2,
+    "kind": "imports",
+    "line": 2,
+    "metadata": {
+      "confidence": 1.0,
+      "framework": "svelte",
+      "resolvedBy": "framework"
+    },
+    "provenance": null,
+    "source": "file:apps/sveltekit/src/routes/+page.svelte",
+    "target": "file:apps/sveltekit/src/routes/+page.svelte"
+  },
+  {
     "col": 29,
     "kind": "navigates",
     "line": 21,
@@ -408,6 +421,36 @@
     "provenance": null,
     "source": "function:6dccb0ce095800be34bbf630bb5e1b0b",
     "target": "route:apps/next/app/page.tsx:/"
+  },
+  {
+    "col": 4,
+    "kind": "navigates",
+    "line": 4,
+    "metadata": {
+      "confidence": 0.95,
+      "framework": "sveltekit-router",
+      "href": "/about",
+      "navMethod": "goto",
+      "resolvedBy": "framework"
+    },
+    "provenance": null,
+    "source": "function:bb9fd543df3b3f09c016b7b41c8c8799",
+    "target": "route:apps/sveltekit/src/routes/(marketing)/about/+page.svelte:/about:1"
+  },
+  {
+    "col": 4,
+    "kind": "navigates",
+    "line": 5,
+    "metadata": {
+      "confidence": 0.95,
+      "framework": "sveltekit-router",
+      "href": "/",
+      "navMethod": "redirect",
+      "resolvedBy": "framework"
+    },
+    "provenance": null,
+    "source": "function:5b78e25224f937e219793d3c6a611284",
+    "target": "route:apps/sveltekit/src/routes/+page.svelte:/:1"
   },
   {
     "col": 42,
