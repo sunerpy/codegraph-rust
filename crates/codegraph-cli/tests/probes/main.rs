@@ -19291,6 +19291,94 @@ mod frameworks {
         }
     }
 
+    /// Upstream #2563 (`jsx-child-disambiguation`, `sync-jsx-import-forwarding`;
+    /// audit probe `p18-jsx-import-forwarding`): a tag imported from a module
+    /// of the project renders what that module exports under the name, never
+    /// a same-named component elsewhere: through outline's `Sidebar/index.ts`
+    /// that forwards `observer(AppSidebar)`, past outline's `const Avatar =
+    /// AvatarWithHoverCard`, mastodon's `memo(Blurhash)` exported as
+    /// `Blurhash`, and outline's `Button.tsx`, whose default export wraps
+    /// `Button` beside an exported `Inner`. Where import resolution reaches
+    /// the same node, it links the edge as before. Here the tags' `references`
+    /// edges (the `jsx-render` edges are W7-14's).
+    #[test]
+    fn pr2563_an_imported_tag_renders_what_its_module_exports() {
+        let project = Project::new()
+            .file("package.json", "{\"name\":\"app\",\"dependencies\":{\"react\":\"^18\",\"mobx-react\":\"^9\"}}\n")
+            .file("tsconfig.json", "{\"compilerOptions\":{\"baseUrl\":\".\",\"paths\":{\"~/*\":[\"./app/*\"]}}}\n")
+            .file("src/components/Sidebar/Aside.tsx", "export function Sidebar() {\n  return <aside />;\n}\n")
+            .file("src/components/Sidebar/App.tsx", "import { observer } from 'mobx-react';\n\nfunction AppSidebar() {\n  return <nav />;\n}\n\nexport default observer(AppSidebar);\n")
+            .file("src/components/Sidebar/index.ts", "import Sidebar from './App';\n\nexport default Sidebar;\n")
+            .file("src/scenes/Home.tsx", "import Sidebar from '../components/Sidebar';\n\nexport function Home() {\n  return <main><Sidebar /></main>;\n}\n")
+            .file("app/components/Avatar/Avatar.tsx", "import { observer } from 'mobx-react';\n\nfunction Avatar() {\n  return <img />;\n}\n\nexport default observer(Avatar);\n")
+            .file("app/components/Avatar/AvatarWithHoverCard.tsx", "import { observer } from 'mobx-react';\nimport Avatar from './Avatar';\n\nfunction AvatarWithHoverCard() {\n  return <div><Avatar /></div>;\n}\n\nexport default observer(AvatarWithHoverCard);\n")
+            .file("app/components/Avatar/index.ts", "import AvatarWithHoverCard from './AvatarWithHoverCard';\n\nconst Avatar = AvatarWithHoverCard;\n\nexport { Avatar };\n")
+            .file("app/components/CommentForm.tsx", "import { Avatar } from '~/components/Avatar';\n\nexport function CommentForm() {\n  return <form><Avatar /></form>;\n}\n")
+            .file("src/avatar/Fake.tsx", "export function Avatar() {\n  return <span />;\n}\n")
+            .file("app/javascript/mastodon/components/blurhash.tsx", "import { memo } from 'react';\n\nfunction Blurhash({ hash }: { hash: string }) {\n  return <canvas data-hash={hash} />;\n}\n\nconst MemoizedBlurhash = memo(Blurhash);\n\nexport { MemoizedBlurhash as Blurhash };\n")
+            .file("app/javascript/mastodon/components/media_item.tsx", "import { Blurhash } from './blurhash';\n\nexport function MediaItem() {\n  return <div><Blurhash hash=\"x\" /></div>;\n}\n")
+            .file("components/Button.tsx", "import React from 'react';\n\nexport const Inner = React.forwardRef<HTMLSpanElement, object>((props, ref) => <span ref={ref} {...props} />);\n\nfunction Button(props: object, ref: React.Ref<HTMLButtonElement>) {\n  return <button ref={ref}><Inner /></button>;\n}\n\nexport default React.forwardRef<HTMLButtonElement, object>(Button);\n")
+            .file("components/Plain.tsx", "export function Plain() {\n  return <hr />;\n}\n")
+            .file("components/Toolbar.tsx", "import ToolbarButton from './Button';\nimport { Plain } from './Plain';\n\nexport function Toolbar() {\n  return <div><ToolbarButton /><Plain /></div>;\n}\n")
+            .index();
+        let graph = project.graph();
+        graph.assert_edge(
+            "function Home",
+            "references",
+            "function AppSidebar",
+            Some("framework"),
+        );
+        graph.assert_no_edge(
+            "function Home",
+            "references",
+            "function Sidebar @src/components/Sidebar/Aside.tsx",
+        );
+        graph.assert_edge(
+            "function CommentForm",
+            "references",
+            "function AvatarWithHoverCard",
+            Some("framework"),
+        );
+        graph.assert_no_edge(
+            "function CommentForm",
+            "references",
+            "function Avatar @src/avatar/Fake.tsx",
+        );
+        graph.assert_edge(
+            "function AvatarWithHoverCard",
+            "references",
+            "function Avatar @app/components/Avatar/Avatar.tsx",
+            Some("framework"),
+        );
+        graph.assert_edge(
+            "function MediaItem",
+            "references",
+            "function Blurhash",
+            Some("framework"),
+        );
+        graph.assert_edge(
+            "function Toolbar",
+            "references",
+            "function Button @components/Button.tsx",
+            Some("framework"),
+        );
+        graph.assert_no_edge("function Toolbar", "references", "component Inner");
+        graph.assert_edge(
+            "function Toolbar",
+            "references",
+            "function Plain",
+            Some("import"),
+        );
+        // The import statement's own binding stays import resolution's.
+        graph.assert_edge(
+            "file:src/scenes/Home.tsx",
+            "imports",
+            "file:src/components/Sidebar/index.ts",
+            Some("import"),
+        );
+        graph.assert_no_edge("file:src/scenes/Home.tsx", "imports", "function AppSidebar");
+    }
+
     /// The route names a NestJS index holds, sorted.
     fn route_names(graph: &super::support::Graph) -> Vec<String> {
         let mut names: Vec<String> = graph

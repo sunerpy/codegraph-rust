@@ -3,9 +3,10 @@
 //! navigation are [`super::react_router`]'s; Next.js pages, route handlers and
 //! navigation are [`super::nextjs`]'s.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, OnceLock};
 
-use codegraph_core::types::{Language, Node, NodeKind};
+use codegraph_core::types::{EdgeKind, Language, Node, NodeKind};
 use regex::Regex;
 
 use super::js_language_for;
@@ -15,11 +16,11 @@ use super::react_router::{self, LAYOUT_PREFIX, LAZY_ROUTE_PREFIX};
 use super::react_tables;
 use crate::alias_binding::{default_export_binding, extract_local_export_aliases};
 use crate::framework::{CrossFileNodes, FrameworkResolver};
-use crate::import_resolver::{resolve_import_path, resolve_via_import};
+use crate::import_resolver::{extract_import_mappings, resolve_import_path, resolve_via_import};
 use crate::strip_comments::{CommentLang, strip_comments_for_regex};
 use crate::types::{
-    EdgeShape, FrameworkResolverExtractionResult, ReExport, RefView, ResolutionContext, ResolvedBy,
-    ResolvedRef,
+    EdgeShape, FrameworkResolverExtractionResult, ImportMapping, ReExport, RefView,
+    ResolutionContext, ResolvedBy, ResolvedRef,
 };
 
 /// React resolver (`reactResolver`, react.ts:10-269).
@@ -117,13 +118,19 @@ impl FrameworkResolver for ReactResolver {
         // a UI kit, upstream #2120 and #2475), or the module the import
         // names, which import resolution finds. Framework resolution runs
         // first, and a name lookup here bound trpc's tests' `useQuery` to a
-        // hook nested in one of trpc's own factories.
-        if context
+        // hook nested in one of trpc's own factories. A component tag
+        // imported from a module of the project renders what that module
+        // exports under the name (#2563), which the import's own answer may
+        // miss.
+        if let Some(mapping) = context
             .get_import_mappings(&reference.file_path, reference.language)
-            .iter()
-            .any(|mapping| mapping.local_name == *name)
+            .into_iter()
+            .find(|mapping| mapping.local_name == *name)
         {
-            return None;
+            return (component && reference.reference_kind == EdgeKind::References)
+                .then(|| imported_component(reference, &mapping, context))
+                .flatten()
+                .map(|target| framework_resolved(reference, target, 0.9));
         }
 
         // Pattern 1: component references (PascalCase).
@@ -441,9 +448,15 @@ fn handed_component(
 /// `AvatarWithHoverCard` of outline's `const Avatar = AvatarWithHoverCard`,
 /// past a type assertion (`= Page as FC`); `None` for any other initializer.
 fn held_binding(value: &Node, context: &dyn ResolutionContext) -> Option<String> {
-    static HELD: OnceLock<Regex> = OnceLock::new();
     let code = strip_comments_for_regex(&declaration_text(value, context), CommentLang::TypeScript);
     let init = js_scan::initializer_at(&code, value.name.len())?;
+    held_at(&code, init, &value.name)
+}
+
+/// The binding the initializer at `init` of `code` holds and nothing more,
+/// when it is not `name`'s own ([`held_binding`]).
+fn held_at(code: &str, init: usize, name: &str) -> Option<String> {
+    static HELD: OnceLock<Regex> = OnceLock::new();
     let held = HELD
         .get_or_init(|| {
             Regex::new(&format!(
@@ -451,9 +464,9 @@ fn held_binding(value: &Node, context: &dyn ResolutionContext) -> Option<String>
             ))
             .expect("held binding")
         })
-        .captures(&code[init..js_scan::statement_end(&code, init, false)])?;
+        .captures(&code[init..js_scan::statement_end(code, init, false)])?;
     let held = held.get(1)?.as_str();
-    (held != value.name).then(|| held.to_string())
+    (held != name).then(|| held.to_string())
 }
 
 /// The identifier pattern upstream writes `[A-Za-z_$][\w$]*`.
@@ -515,6 +528,38 @@ fn picked_export(
 ) -> Option<String> {
     let file = lazy_module_file(spec, from_file, context)?;
     exported_component(&file, name, context, &[])
+}
+
+/// The component a tag imported from a module of the project renders
+/// (upstream #2563, the static half): what that module exports under the
+/// imported name ([`exported_component`]), through an `index` that forwards
+/// it, past a wrapper around it (`export default observer(AppSidebar)`,
+/// `memo(Blurhash)`), or in a value that holds another module's component.
+/// `None` for a package or namespace import, for a module that exports no
+/// component under the name, and where import resolution reaches the same
+/// node: it links the edge then, as it always did.
+fn imported_component(
+    reference: &RefView,
+    mapping: &ImportMapping,
+    context: &dyn ResolutionContext,
+) -> Option<String> {
+    if mapping.is_namespace {
+        return None;
+    }
+    let module = resolve_import_path(
+        &mapping.source,
+        &reference.file_path,
+        reference.language,
+        context,
+    )?;
+    let exported = if mapping.is_default {
+        "default"
+    } else {
+        mapping.exported_name.as_str()
+    };
+    let target = exported_component(&module, exported, context, &[])?;
+    let imported = resolve_via_import(reference, context).map(|resolved| resolved.target_node_id);
+    (imported.as_deref() != Some(target.as_str())).then_some(target)
 }
 
 /// True for a reference a React route makes (`isReactRouteRef`): from a
@@ -727,6 +772,228 @@ fn default_exported_name(source: &str) -> Option<String> {
         return Some(named.as_str().to_string());
     }
     js_scan::wrapped_name(&rest[..js_scan::statement_end(rest, 0, false)]).map(str::to_string)
+}
+
+/// What [`exported_component`] reads of a module's own exports besides its
+/// re-exports, as lines of the module's surface (W7-09e), and the import
+/// specifiers those exports forward. For each name the module exports itself
+/// — `default`, a declaration, an export list's alias — it follows the
+/// binding the export names ([`own_export`]: `export default Sidebar`) through
+/// what each `const` declared under that name holds ([`declarators`],
+/// outline's `const Avatar = AvatarWithHoverCard`), as far as
+/// `exported_component` does. Each import it reaches gets a line: the binding,
+/// the import's specifier and the name it imports, whether the export names
+/// the binding itself or holds it (for the default export, as the bare
+/// binding or wrapped), and whether the file also declares the name; and
+/// each binding on the way gets a line of what its declarations hold. A tag
+/// imported from the module renders through these, so a sync that sees one
+/// move refreshes the module's importers, and the barrels that forward the
+/// module are found through the specifiers. An export that reaches no import
+/// ends at a declaration of the file, or at nothing, and needs no line: an
+/// edge to the file's own node goes with its nodes whenever the file changes.
+/// A `const` inside a function counts as well as the module's own, so the
+/// scan never misses the one `exported_component` follows.
+pub(crate) fn export_forwards(text: &str) -> (Vec<String>, Vec<String>) {
+    static DECLARED_EXPORT: OnceLock<Regex> = OnceLock::new();
+    static DECLARATION: OnceLock<Regex> = OnceLock::new();
+    let code = strip_comments_for_regex(text, CommentLang::TypeScript);
+    let declared_exports: BTreeSet<String> = DECLARED_EXPORT
+        .get_or_init(|| {
+            Regex::new(&format!(
+                r"(?-u:\b)export{JS_SPACE}+(?:async{JS_SPACE}+)?(?:const|let|var|function|class){JS_SPACE}+({IDENT})"
+            ))
+            .expect("exported declaration")
+        })
+        .captures_iter(&code)
+        .filter_map(|captures| captures.get(1))
+        .map(|name| name.as_str().to_string())
+        .collect();
+    let aliases = extract_local_export_aliases(&code);
+    // What `own_export` gives each name: the default export's binding, a
+    // declaration exported where it stands, or an export list's local.
+    let mut exported: BTreeMap<String, String> = BTreeMap::new();
+    if let Some(local) = default_exported_name(&code).or_else(|| {
+        aliases
+            .iter()
+            .find(|alias| alias.exported_name == "default")
+            .map(|alias| alias.local_name.clone())
+    }) {
+        exported.insert("default".to_string(), local);
+    }
+    for alias in &aliases {
+        if alias.exported_name != "default" && !declared_exports.contains(&alias.exported_name) {
+            exported
+                .entry(alias.exported_name.clone())
+                .or_insert_with(|| alias.local_name.clone());
+        }
+    }
+    for name in &declared_exports {
+        exported.insert(name.clone(), name.clone());
+    }
+    // What each `const` declared under a name holds, in the order they are
+    // written, and every name the file declares.
+    let declarations = declarators(&code);
+    let mut holds: BTreeMap<&str, Vec<Option<&str>>> = BTreeMap::new();
+    for declaration in declarations
+        .iter()
+        .filter(|declaration| declaration.constant)
+    {
+        holds
+            .entry(declaration.name)
+            .or_default()
+            .push(declaration.held.as_deref());
+    }
+    let mut declared: BTreeSet<&str> = DECLARATION
+        .get_or_init(|| {
+            Regex::new(&format!(
+                r"(?:^|[^A-Za-z0-9_$.])(?:(?:async{JS_SPACE}+)?function{JS_SPACE}*\*?{JS_SPACE}*|class{JS_SPACE}+)({IDENT})"
+            ))
+            .expect("declaration")
+        })
+        .captures_iter(&code)
+        .filter_map(|captures| captures.get(1))
+        .map(|name| name.as_str())
+        .collect();
+    declared.extend(declarations.iter().map(|declaration| declaration.name));
+    let imports = extract_import_mappings(text, Language::TypeScript);
+    let default_binding = default_export_binding(&code);
+    let mut lines: BTreeSet<String> = BTreeSet::new();
+    let mut sources: Vec<String> = Vec::new();
+    for (name, local) in &exported {
+        // The bindings the export can be: its own, then what each of those
+        // holds, a hop at a time.
+        let mut reached: Vec<&str> = vec![local.as_str()];
+        let mut level = 0..1;
+        for _ in 0..MAX_REEXPORT_HOPS {
+            let next = reached.len();
+            for index in level {
+                for &held in holds.get(reached[index]).into_iter().flatten().flatten() {
+                    if !reached.contains(&held) {
+                        reached.push(held);
+                    }
+                }
+            }
+            if reached.len() == next {
+                break;
+            }
+            level = next..reached.len();
+        }
+        let mut forwards = false;
+        for &binding in &reached {
+            let Some(mapping) = imports
+                .iter()
+                .find(|mapping| mapping.local_name == binding && !mapping.is_namespace)
+            else {
+                continue;
+            };
+            let imported = if mapping.is_default {
+                "default"
+            } else {
+                mapping.exported_name.as_str()
+            };
+            let how = if binding != local.as_str() {
+                "held"
+            } else if name != "default" {
+                "own"
+            } else if default_binding.as_deref() == Some(local.as_str()) {
+                "bare"
+            } else {
+                "wrapped"
+            };
+            let also = if declared.contains(binding) {
+                "\tdeclared"
+            } else {
+                ""
+            };
+            lines.insert(format!(
+                "forward\t{name}\t{binding}\t{}\t{imported}\t{how}{also}",
+                mapping.source
+            ));
+            if !sources.contains(&mapping.source) {
+                sources.push(mapping.source.clone());
+            }
+            forwards = true;
+        }
+        if forwards {
+            for binding in &reached {
+                if let Some(held) = holds.get(binding) {
+                    let held: Vec<&str> = held.iter().map(|held| held.unwrap_or("-")).collect();
+                    lines.insert(format!("holds\t{binding}\t{}", held.join("\t")));
+                }
+            }
+        }
+    }
+    (lines.into_iter().collect(), sources)
+}
+
+/// One declarator of a `const`, `let` or `var` statement, for
+/// [`export_forwards`]: its name, and for a `const` the binding its
+/// initializer holds and nothing more.
+struct Declarator<'a> {
+    name: &'a str,
+    constant: bool,
+    held: Option<String>,
+}
+
+/// Every declarator of every `const`, `let` and `var` statement in `code`, in
+/// the order they are written: each declarator of a statement on its own
+/// (`const unused = 1, Screen = Page`), and what a `const` one holds read as
+/// [`held_binding`] reads a declarator's own text, past any type annotation
+/// [`js_scan::initializer_at`] skips (`const Screen: (props: P) => Element =
+/// Page`). A pattern (`const { a } = b`) declares no name.
+fn declarators(code: &str) -> Vec<Declarator<'_>> {
+    static KEYWORD: OnceLock<Regex> = OnceLock::new();
+    static NAME: OnceLock<Regex> = OnceLock::new();
+    let keyword = KEYWORD.get_or_init(|| {
+        Regex::new(&format!(r"(?:^|[^A-Za-z0-9_$.])(const|let|var){JS_SPACE}+"))
+            .expect("declaration keyword")
+    });
+    let name = NAME.get_or_init(|| Regex::new(&format!("^{IDENT}")).expect("declarator name"));
+    let bytes = code.as_bytes();
+    let mut out = Vec::new();
+    for captures in keyword.captures_iter(code) {
+        let (Some(word), Some(whole)) = (captures.get(1), captures.get(0)) else {
+            continue;
+        };
+        let constant = word.as_str() == "const";
+        let mut at = whole.end();
+        loop {
+            at = code.len() - code[at..].trim_start_matches(js_scan::is_js_space).len();
+            let declared = if matches!(bytes.get(at), Some(b'{' | b'[')) {
+                let Some(close) = js_scan::match_bracket(code, at) else {
+                    break;
+                };
+                at = close + 1;
+                None
+            } else {
+                let Some(found) = name.find(&code[at..]) else {
+                    break;
+                };
+                at += found.end();
+                Some(found.as_str())
+            };
+            // The declarator ends where its statement does, or at the comma
+            // before the next one.
+            let end = js_scan::statement_end(code, at, true);
+            if let Some(declared) = declared {
+                let declarator = &code[..end];
+                let held = constant
+                    .then(|| js_scan::initializer_at(declarator, at))
+                    .flatten()
+                    .and_then(|init| held_at(declarator, init, declared));
+                out.push(Declarator {
+                    name: declared,
+                    constant,
+                    held,
+                });
+            }
+            if bytes.get(end) != Some(&b',') {
+                break;
+            }
+            at = end + 1;
+        }
+    }
+    out
 }
 
 /// The component a route's `layout:` reference names, found the way the
@@ -1764,6 +2031,101 @@ mod tests {
                 .extract(file, content, &test_extraction_context())
                 .expect("extract");
             assert!(result.nodes.is_empty(), "{content}: {:?}", result.nodes);
+        }
+    }
+
+    /// W7-09e: the lines a module's surface gets for its own exports that
+    /// lead to an import, and the specifiers they forward.
+    #[test]
+    fn an_export_that_leads_to_an_import_is_a_forward() {
+        assert_eq!(
+            export_forwards("import Sidebar from './App';\n\nexport default Sidebar;\n"),
+            (
+                vec!["forward\tdefault\tSidebar\t./App\tdefault\tbare".to_string()],
+                vec!["./App".to_string()]
+            )
+        );
+        assert_eq!(
+            export_forwards(
+                "import AvatarWithHoverCard from './AvatarWithHoverCard';\n\nconst Avatar = AvatarWithHoverCard;\n\nexport { Avatar };\n"
+            )
+            .0,
+            [
+                "forward\tAvatar\tAvatarWithHoverCard\t./AvatarWithHoverCard\tdefault\theld",
+                "holds\tAvatar\tAvatarWithHoverCard",
+            ]
+        );
+        assert_eq!(
+            export_forwards(
+                "import { Inner as Base } from './inner';\nexport const Button = Base;\n"
+            )
+            .0,
+            [
+                "forward\tButton\tBase\t./inner\tInner\theld",
+                "holds\tButton\tBase"
+            ]
+        );
+        assert_eq!(
+            export_forwards("import Page from './Page';\nexport default withAuth(Page);\n").0,
+            ["forward\tdefault\tPage\t./Page\tdefault\twrapped"]
+        );
+        // Every declarator of a statement, past any type annotation the
+        // resolver reads past.
+        for text in [
+            "import App from './App';\nconst unused = 1, Sidebar = App;\nexport default Sidebar;\n",
+            "import App from './App';\nconst unused = 1,\n  Sidebar = App;\nexport default Sidebar;\n",
+            "import App from './App';\nconst Sidebar: (props: object) => JSX.Element = App;\nexport default Sidebar;\n",
+            "import App from './App';\nconst Sidebar: { (props: object): JSX.Element; displayName?: string } = App;\nexport default Sidebar;\n",
+            "import App from './App';\nconst Sidebar = App as FC;\nexport default Sidebar;\n",
+        ] {
+            assert_eq!(
+                export_forwards(text),
+                (
+                    vec![
+                        "forward\tdefault\tApp\t./App\tdefault\theld".to_string(),
+                        "holds\tSidebar\tApp".to_string(),
+                    ],
+                    vec!["./App".to_string()]
+                ),
+                "{text:?}"
+            );
+        }
+        // A `const` inside a function counts too, so the module's own is
+        // never missed; and a name the file declares as well is marked.
+        assert_eq!(
+            export_forwards(
+                "import App from './App';\nimport Other from './Other';\nexport function pick() {\n  const Sidebar = Other;\n  return Sidebar;\n}\nconst Sidebar = App;\nexport default Sidebar;\n"
+            ),
+            (
+                vec![
+                    "forward\tdefault\tApp\t./App\tdefault\theld".to_string(),
+                    "forward\tdefault\tOther\t./Other\tdefault\theld".to_string(),
+                    "holds\tSidebar\tOther\tApp".to_string(),
+                ],
+                vec!["./Other".to_string(), "./App".to_string()]
+            )
+        );
+        assert_eq!(
+            export_forwards(
+                "import Sidebar from './App';\nfunction Sidebar() {}\nexport default Sidebar;\n"
+            )
+            .0,
+            ["forward\tdefault\tSidebar\t./App\tdefault\tbare\tdeclared"]
+        );
+        // An export that ends at a declaration of the file, at a namespace
+        // or at nothing has no line; so does a value whose annotation the
+        // resolver does not read past (`Record<string, …>` stops it at its
+        // comma).
+        for text in [
+            "function AppSidebar() {}\nexport default observer(AppSidebar);\n",
+            "function Blurhash() {}\nconst MemoizedBlurhash = memo(Blurhash);\nexport { MemoizedBlurhash as Blurhash };\n",
+            "import * as ui from './ui';\nexport default ui;\n",
+            "import { Page } from './Page';\nfunction Main() {}\nexport default Main;\n",
+            "export default makeConfig();\n",
+            "import App from './App';\nconst Sidebar: Record<string, unknown> = App;\nexport default Sidebar;\n",
+            "import App from './App';\nconst { Sidebar } = App;\nexport default Sidebar;\n",
+        ] {
+            assert_eq!(export_forwards(text), (vec![], vec![]), "{text:?}");
         }
     }
 }

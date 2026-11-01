@@ -11915,6 +11915,260 @@ pub fn jsx_react_router_earlier_consumer_starts_handing_a_table() -> Case {
         )
 }
 
+// ----- A JSX tag imported from the project renders what its module exports (W7-09e) --
+
+/// The package of the W7-09e cases.
+const MOBX_REACT_PACKAGE: &str =
+    "{\"name\":\"app\",\"dependencies\":{\"react\":\"^18\",\"mobx-react\":\"^9\"}}\n";
+
+/// outline's `Sidebar/App.tsx`: the default export wraps the component.
+const APP_SIDEBAR: &str = "import { observer } from 'mobx-react';\n\nfunction AppSidebar() {\n  return <nav />;\n}\n\nexport default observer(AppSidebar);\n";
+
+/// The same file wrapping another component.
+const APP_SIDEBAR_WRAPS_COMPACT: &str = "import { observer } from 'mobx-react';\n\nfunction AppSidebar() {\n  return <nav />;\n}\n\nfunction CompactSidebar() {\n  return <nav />;\n}\n\nexport default observer(CompactSidebar);\n";
+
+/// Another module with a wrapped default export.
+const SHARED_SIDEBAR: &str = "import { observer } from 'mobx-react';\n\nfunction SharedSidebar() {\n  return <nav />;\n}\n\nexport default observer(SharedSidebar);\n";
+
+/// A same-named component nothing imports.
+const ASIDE_SIDEBAR: &str = "export function Sidebar() {\n  return <aside />;\n}\n";
+
+/// outline's `Sidebar/index.ts`: it forwards `App`'s default export.
+const INDEX_FORWARDS_APP: &str = "import Sidebar from './App';\n\nexport default Sidebar;\n";
+
+/// The page that renders `<Sidebar>` through the index.
+const HOME_RENDERS_SIDEBAR: &str = "import Sidebar from '../components/Sidebar';\n\nexport function Home() {\n  return <main><Sidebar /></main>;\n}\n";
+
+/// W7-09e (upstream `sync-jsx-import-forwarding`, #2563): only the index
+/// changes which module it forwards; the page that renders the tag is
+/// untouched and draws it to the other module's component.
+pub fn tsx_jsx_tag_forwarding_index_re_points() -> Case {
+    Case::new(Change::ReexportEdit, &[Language::Tsx, Language::TypeScript])
+        .file("package.json", MOBX_REACT_PACKAGE)
+        .file("src/components/Sidebar/Aside.tsx", ASIDE_SIDEBAR)
+        .file("src/components/Sidebar/App.tsx", APP_SIDEBAR)
+        .file("src/components/Sidebar/Shared.tsx", SHARED_SIDEBAR)
+        .file("src/components/Sidebar/index.ts", INDEX_FORWARDS_APP)
+        .file("src/scenes/Home.tsx", HOME_RENDERS_SIDEBAR)
+        .write(
+            "src/components/Sidebar/index.ts",
+            "import Sidebar from './Shared';\n\nexport default Sidebar;\n",
+        )
+        .edge_before("function Home", "references", "function AppSidebar")
+        .edge_after("function Home", "references", "function SharedSidebar")
+        .no_edge_after("function Home", "references", "function AppSidebar")
+}
+
+/// W7-09e (upstream `sync-jsx-import-forwarding`): the index starts holding
+/// the other module's component in a value (outline's `const Avatar =
+/// AvatarWithHoverCard`).
+pub fn tsx_jsx_tag_index_value_holds_another_component() -> Case {
+    Case::new(Change::ReexportEdit, &[Language::Tsx, Language::TypeScript])
+        .file("package.json", MOBX_REACT_PACKAGE)
+        .file("src/components/Sidebar/Aside.tsx", ASIDE_SIDEBAR)
+        .file("src/components/Sidebar/App.tsx", APP_SIDEBAR)
+        .file("src/components/Sidebar/Shared.tsx", SHARED_SIDEBAR)
+        .file("src/components/Sidebar/index.ts", INDEX_FORWARDS_APP)
+        .file("src/scenes/Home.tsx", HOME_RENDERS_SIDEBAR)
+        .write(
+            "src/components/Sidebar/index.ts",
+            "import Shared from './Shared';\n\nconst Sidebar = Shared;\n\nexport default Sidebar;\n",
+        )
+        .edge_after("function Home", "references", "function SharedSidebar")
+        .no_edge_after("function Home", "references", "function AppSidebar")
+}
+
+/// W7-09e (upstream `sync-jsx-import-forwarding`): the module behind the
+/// index wraps another component in its default export.
+pub fn tsx_jsx_tag_module_behind_the_index_wraps_another() -> Case {
+    Case::new(Change::ReexportEdit, &[Language::Tsx, Language::TypeScript])
+        .file("package.json", MOBX_REACT_PACKAGE)
+        .file("src/components/Sidebar/Aside.tsx", ASIDE_SIDEBAR)
+        .file("src/components/Sidebar/App.tsx", APP_SIDEBAR)
+        .file("src/components/Sidebar/index.ts", INDEX_FORWARDS_APP)
+        .file("src/scenes/Home.tsx", HOME_RENDERS_SIDEBAR)
+        .write("src/components/Sidebar/App.tsx", APP_SIDEBAR_WRAPS_COMPACT)
+        .edge_after("function Home", "references", "function CompactSidebar")
+        .no_edge_after("function Home", "references", "function AppSidebar")
+}
+
+/// W7-09e: two modules forward the component, and the middle one changes
+/// which module it forwards; neither the page nor the index changes.
+pub fn tsx_jsx_tag_middle_module_re_points() -> Case {
+    Case::new(Change::ReexportEdit, &[Language::Tsx, Language::TypeScript])
+        .file("package.json", MOBX_REACT_PACKAGE)
+        .file("src/components/Sidebar/Aside.tsx", ASIDE_SIDEBAR)
+        .file("src/components/Sidebar/App.tsx", APP_SIDEBAR)
+        .file("src/components/Sidebar/Shared.tsx", SHARED_SIDEBAR)
+        .file("src/components/Sidebar/mid.ts", INDEX_FORWARDS_APP)
+        .file(
+            "src/components/Sidebar/index.ts",
+            "import Sidebar from './mid';\n\nexport default Sidebar;\n",
+        )
+        .file("src/scenes/Home.tsx", HOME_RENDERS_SIDEBAR)
+        .write(
+            "src/components/Sidebar/mid.ts",
+            "import Sidebar from './Shared';\n\nexport default Sidebar;\n",
+        )
+        .edge_before("function Home", "references", "function AppSidebar")
+        .edge_after("function Home", "references", "function SharedSidebar")
+}
+
+/// W7-09e: the index comes to declare the component its default export
+/// names, so the tag renders the index's own.
+pub fn tsx_jsx_tag_index_declares_its_export() -> Case {
+    Case::new(Change::ReexportEdit, &[Language::Tsx, Language::TypeScript])
+        .file("package.json", MOBX_REACT_PACKAGE)
+        .file("src/components/Sidebar/Aside.tsx", ASIDE_SIDEBAR)
+        .file("src/components/Sidebar/App.tsx", APP_SIDEBAR)
+        .file("src/components/Sidebar/index.ts", INDEX_FORWARDS_APP)
+        .file("src/scenes/Home.tsx", HOME_RENDERS_SIDEBAR)
+        .write(
+            "src/components/Sidebar/index.ts",
+            "import Forwarded from './App';\n\nfunction Sidebar() {\n  return null;\n}\n\nexport default Sidebar;\n",
+        )
+        .edge_before("function Home", "references", "function AppSidebar")
+        .no_edge_after("function Home", "references", "function AppSidebar")
+}
+
+/// W7-09e: the module the index forwards is deleted.
+pub fn tsx_jsx_tag_forwarded_module_deleted() -> Case {
+    Case::new(
+        Change::DeleteImportedModule,
+        &[Language::Tsx, Language::TypeScript],
+    )
+    .file("package.json", MOBX_REACT_PACKAGE)
+    .file("src/components/Sidebar/Aside.tsx", ASIDE_SIDEBAR)
+    .file("src/components/Sidebar/App.tsx", APP_SIDEBAR)
+    .file("src/components/Sidebar/mid.ts", INDEX_FORWARDS_APP)
+    .file(
+        "src/components/Sidebar/index.ts",
+        "import Sidebar from './mid';\n\nexport default Sidebar;\n",
+    )
+    .file("src/scenes/Home.tsx", HOME_RENDERS_SIDEBAR)
+    .remove("src/components/Sidebar/mid.ts")
+    .edge_before("function Home", "references", "function AppSidebar")
+    .no_edge_after("function Home", "references", "function AppSidebar")
+}
+
+/// W7-09e (upstream `jsx-child-disambiguation`, mastodon's `blurhash.tsx`):
+/// the component a memo wrapper hands over is renamed; the tag that imports
+/// the wrapper under the old name renders the renamed one.
+pub fn tsx_jsx_tag_memo_wrapped_component_renamed() -> Case {
+    Case::new(Change::RenameSymbol, &[Language::Tsx])
+        .file("package.json", MOBX_REACT_PACKAGE)
+        .file(
+            "app/components/blurhash.tsx",
+            "import { memo } from 'react';\n\nfunction Blurhash({ hash }: { hash: string }) {\n  return <canvas data-hash={hash} />;\n}\n\nconst MemoizedBlurhash = memo(Blurhash);\n\nexport { MemoizedBlurhash as Blurhash };\n",
+        )
+        .file(
+            "app/components/media_item.tsx",
+            "import { Blurhash } from './blurhash';\n\nexport function MediaItem() {\n  return <div><Blurhash hash=\"x\" /></div>;\n}\n",
+        )
+        .write(
+            "app/components/blurhash.tsx",
+            "import { memo } from 'react';\n\nfunction BlurhashCanvas({ hash }: { hash: string }) {\n  return <canvas data-hash={hash} />;\n}\n\nconst MemoizedBlurhash = memo(BlurhashCanvas);\n\nexport { MemoizedBlurhash as Blurhash };\n",
+        )
+        .edge_before("function MediaItem", "references", "function Blurhash")
+        .edge_after("function MediaItem", "references", "function BlurhashCanvas")
+}
+
+/// W7-09e: the value the index exports is a later declarator of its
+/// statement (`const unused = 1, Sidebar = App`), and only the index changes
+/// which module that value's import names.
+pub fn tsx_jsx_tag_index_later_declarator_re_points() -> Case {
+    Case::new(Change::ReexportEdit, &[Language::Tsx, Language::TypeScript])
+        .file("package.json", MOBX_REACT_PACKAGE)
+        .file("src/components/Sidebar/Aside.tsx", ASIDE_SIDEBAR)
+        .file("src/components/Sidebar/App.tsx", APP_SIDEBAR)
+        .file("src/components/Sidebar/Shared.tsx", SHARED_SIDEBAR)
+        .file(
+            "src/components/Sidebar/index.ts",
+            "import App from './App';\n\nconst unused = 1, Sidebar = App;\n\nexport default Sidebar;\n",
+        )
+        .file("src/scenes/Home.tsx", HOME_RENDERS_SIDEBAR)
+        .write(
+            "src/components/Sidebar/index.ts",
+            "import App from './Shared';\n\nconst unused = 1, Sidebar = App;\n\nexport default Sidebar;\n",
+        )
+        .edge_before("function Home", "references", "function AppSidebar")
+        .edge_after("function Home", "references", "function SharedSidebar")
+        .no_edge_after("function Home", "references", "function AppSidebar")
+}
+
+/// W7-09e: as [`tsx_jsx_tag_index_later_declarator_re_points`], through an
+/// export list and a named import. Import resolution binds no node to the
+/// page's `{ Sidebar }`, so the #2450 lane re-resolves the page whatever the
+/// surface says; the case holds the surface to it should that change.
+pub fn tsx_jsx_tag_index_listed_later_declarator_re_points() -> Case {
+    Case::new(Change::ReexportEdit, &[Language::Tsx, Language::TypeScript])
+        .file("package.json", MOBX_REACT_PACKAGE)
+        .file("src/components/Sidebar/Aside.tsx", ASIDE_SIDEBAR)
+        .file("src/components/Sidebar/App.tsx", APP_SIDEBAR)
+        .file("src/components/Sidebar/Shared.tsx", SHARED_SIDEBAR)
+        .file(
+            "src/components/Sidebar/index.ts",
+            "import App from './App';\n\nconst unused = 1, Sidebar = App;\n\nexport { Sidebar };\n",
+        )
+        .file(
+            "src/scenes/Home.tsx",
+            "import { Sidebar } from '../components/Sidebar';\n\nexport function Home() {\n  return <main><Sidebar /></main>;\n}\n",
+        )
+        .write(
+            "src/components/Sidebar/index.ts",
+            "import App from './Shared';\n\nconst unused = 1, Sidebar = App;\n\nexport { Sidebar };\n",
+        )
+        .edge_before("function Home", "references", "function AppSidebar")
+        .edge_after("function Home", "references", "function SharedSidebar")
+        .no_edge_after("function Home", "references", "function AppSidebar")
+}
+
+/// W7-09e: the value the index exports carries a function type, whose `=>`
+/// comes before the initializer's `=`, and only the index changes which
+/// module that value's import names.
+pub fn tsx_jsx_tag_index_annotated_value_re_points() -> Case {
+    Case::new(Change::ReexportEdit, &[Language::Tsx, Language::TypeScript])
+        .file("package.json", MOBX_REACT_PACKAGE)
+        .file("src/components/Sidebar/Aside.tsx", ASIDE_SIDEBAR)
+        .file("src/components/Sidebar/App.tsx", APP_SIDEBAR)
+        .file("src/components/Sidebar/Shared.tsx", SHARED_SIDEBAR)
+        .file(
+            "src/components/Sidebar/index.ts",
+            "import App from './App';\n\nconst Sidebar: (props: object) => JSX.Element = App;\n\nexport default Sidebar;\n",
+        )
+        .file("src/scenes/Home.tsx", HOME_RENDERS_SIDEBAR)
+        .write(
+            "src/components/Sidebar/index.ts",
+            "import App from './Shared';\n\nconst Sidebar: (props: object) => JSX.Element = App;\n\nexport default Sidebar;\n",
+        )
+        .edge_before("function Home", "references", "function AppSidebar")
+        .edge_after("function Home", "references", "function SharedSidebar")
+        .no_edge_after("function Home", "references", "function AppSidebar")
+}
+
+/// W7-09e: a function in the index declares a `const` of the exported
+/// value's name before the module's own, and only the index changes which
+/// module the module's own value's import names.
+pub fn tsx_jsx_tag_index_shadowed_value_re_points() -> Case {
+    Case::new(Change::ReexportEdit, &[Language::Tsx, Language::TypeScript])
+        .file("package.json", MOBX_REACT_PACKAGE)
+        .file("src/components/Sidebar/Aside.tsx", ASIDE_SIDEBAR)
+        .file("src/components/Sidebar/App.tsx", APP_SIDEBAR)
+        .file("src/components/Sidebar/Shared.tsx", SHARED_SIDEBAR)
+        .file(
+            "src/components/Sidebar/index.ts",
+            "import App from './App';\nimport Other from './Aside';\n\nexport function pick() {\n  const Sidebar = Other;\n  return Sidebar;\n}\n\nconst Sidebar = App;\n\nexport default Sidebar;\n",
+        )
+        .file("src/scenes/Home.tsx", HOME_RENDERS_SIDEBAR)
+        .write(
+            "src/components/Sidebar/index.ts",
+            "import App from './Shared';\nimport Other from './Aside';\n\nexport function pick() {\n  const Sidebar = Other;\n  return Sidebar;\n}\n\nconst Sidebar = App;\n\nexport default Sidebar;\n",
+        )
+        .edge_before("function Home", "references", "function AppSidebar")
+        .edge_after("function Home", "references", "function SharedSidebar")
+        .no_edge_after("function Home", "references", "function AppSidebar")
+}
+
 /// W5-06, fail closed: only the manifest's `version` changes; every JS file
 /// re-resolves and every edge stays.
 pub fn typescript_package_version_bump_keeps_every_edge() -> Case {

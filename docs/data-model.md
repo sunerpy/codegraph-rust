@@ -201,15 +201,19 @@ edges, so it can recompute them without re-reading every file (migration 9).
 Module-surface rows record what other files' resolution reads from a
 JavaScript-family module's own text, which no node records: its re-exports and
 export aliases, the CommonJS default, whether it has an `export default`
-statement, the names its export lists give, whether it is a sealed module, and a
-Vue or Svelte component's `<script>` blocks. `js_module_surface:<path>` holds the
-JSON `{"digest", "sources", "targets"}`: the sha256 of the canonical encoding of
-those facts, the specifiers the module forwards, and every project file they
+statement, each of its own exports that leads to an import (the binding it
+names, the constants that binding holds in turn, the import's specifier and
+imported name, as React reads them for a tag imported from the module), the
+names its export lists give, whether it is a sealed module, and a Vue or Svelte
+component's `<script>` blocks. `js_module_surface:<path>` holds the JSON
+`{"digest", "sources", "targets"}`: the sha256 of the canonical encoding of
+those facts, the specifiers the module forwards (its re-exports' and those
+imports'), and every project file they
 resolved to when the row was written, in each language an import following them
 can be written in (TypeScript, TSX, JavaScript, JSX, Vue, Svelte, Astro, ArkTS
 order extensions differently), sorted. A file whose surface is the default one
 (an ES module none of whose text another file reads) has no row.
-`js_module_surface_version` records the row format (2).
+`js_module_surface_version` records the row format (3).
 
 A full index and a migration write every row and the marker once the file rows
 are stored, before resolution. A sync withdraws the marker before its first

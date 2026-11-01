@@ -282,6 +282,13 @@ listed.
   (its route renders nothing of it, and a value it is the loader of renders
   none of its module), so no loader runs the call stack out; colby's readers
   recurse without a bound (`lazy_loader.rs`).
+- **A tag imported from a module that exports no component under its name
+  (W7-09e).** A JSX tag imported from a module of the project renders what
+  the module exports under the name, as colby's (#2563); when the module
+  exports no component there, the tag keeps the edge import resolution
+  gives it, where colby's `jsx-render` pass draws nothing for the tag. The
+  resolver chain has no way for one resolver to veto the next, and the
+  static `references` edge is import resolution's (`react.rs`).
 - **Dart named constructors (#2380).** A named constructor, indexed as a
   method, is reached only by a call written through its class (`Foo.value(2)`).
   A call through a value of that type (a typed parameter or local, a chain's

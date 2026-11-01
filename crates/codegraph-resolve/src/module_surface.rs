@@ -3,9 +3,12 @@
 //!
 //! Import resolution reads a module's re-exports and export aliases (as
 //! `get_re_exports` reads a barrel), its CommonJS default (`module.exports =
-//! …`) and whether it has an `export default` statement. Name matching reads
-//! the names its export lists give and whether it is a sealed module
-//! (upstream #2162), and a component's `<script>` blocks (upstream #2227).
+//! …`) and whether it has an `export default` statement; React reads the
+//! binding each of its own exports names and the import that binding is or
+//! holds (`import Sidebar from './App'; export default Sidebar`). Name
+//! matching reads the names its export lists give and whether it is a
+//! sealed module (upstream #2162), and a component's `<script>` blocks
+//! (upstream #2227).
 //! The text is gone once the file changes on disk, so an index keeps a digest
 //! of the surface per file in `project_metadata`, with the specifiers the
 //! module forwards and what they resolved to: a sync that sees the digest
@@ -30,8 +33,10 @@ pub const ROW_KEY_PREFIX: &str = "js_module_surface:";
 /// rows to trust.
 pub const VERSION_KEY: &str = "js_module_surface_version";
 /// The row format this build writes. 2: `targets` is the union over the
-/// JavaScript-family resolution languages (W4a-F4).
-pub const VERSION: &str = "2";
+/// JavaScript-family resolution languages (W4a-F4). 3: the digest covers the
+/// bindings a module's own exports name and the imports they forward, which
+/// are among the sources (W7-09e).
+pub const VERSION: &str = "3";
 
 /// The canonical encoding of the default surface: an ES module none of whose
 /// text another file's resolution reads. No row records it.
@@ -48,8 +53,8 @@ pub struct ModuleSurface {
     /// The sha256 of the canonical encoding of every fact.
     pub digest: String,
     /// The specifiers it forwards (`export * from`, `export * as … from`,
-    /// `export { … } from`, `module.exports = require(…)`), in order of first
-    /// appearance.
+    /// `export { … } from`, `module.exports = require(…)`, an import one of
+    /// its own exports names or holds), in order of first appearance.
     pub sources: Vec<String>,
 }
 
@@ -220,6 +225,15 @@ fn canonical_surface(file_path: &str, text: &str) -> (String, Vec<String>) {
         if import_resolver::has_esm_default_statement(text) {
             out.push_str("export-default\n");
         }
+        // What a tag imported from the module renders through (W7-09e).
+        let (forwards, forwarded) = crate::frameworks::react::export_forwards(text);
+        for line in forwards {
+            out.push_str(&line);
+            out.push('\n');
+        }
+        for source in forwarded {
+            forward(&source, &mut sources);
+        }
     }
     let facts = SourceFacts::new(Arc::from(text));
     match crate::name_matcher::read_module_exports(&facts) {
@@ -315,6 +329,58 @@ mod tests {
         assert_ne!(
             cjs("module.exports = parse;\n").map(|s| s.digest),
             cjs("module.exports = format;\n").map(|s| s.digest)
+        );
+    }
+
+    /// W7-09e: an import one of the module's own exports names or holds is
+    /// forwarded. Re-pointing it, holding another binding or wrapping it
+    /// moves the digest, and its specifier is among the sources; an import
+    /// the module only uses, and an export that ends at a declaration of the
+    /// file, add nothing.
+    #[test]
+    fn an_import_an_export_forwards_moves_the_digest() {
+        let surface = |text: &str| module_surface("src/index.ts", Language::TypeScript, Some(text));
+        let app = surface("import Sidebar from './App';\n\nexport default Sidebar;\n")
+            .expect("a forward");
+        let shared = surface("import Sidebar from './Shared';\n\nexport default Sidebar;\n")
+            .expect("a forward");
+        assert_eq!(app.sources, ["./App"]);
+        assert_eq!(shared.sources, ["./Shared"]);
+        assert_ne!(app.digest, shared.digest);
+        let held = surface(
+            "import Shared from './Shared';\n\nconst Sidebar = Shared;\n\nexport default Sidebar;\n",
+        )
+        .expect("a held forward");
+        assert_eq!(held.sources, ["./Shared"]);
+        assert_ne!(held.digest, shared.digest);
+        let later = |module: &str| {
+            surface(&format!(
+                "import App from '{module}';\n\nconst unused = 1, Sidebar = App;\n\nexport default Sidebar;\n"
+            ))
+            .expect("a later declarator's forward")
+        };
+        assert_eq!(later("./App").sources, ["./App"]);
+        assert_ne!(later("./App").digest, later("./Shared").digest);
+        let listed = surface(
+            "import AvatarWithHoverCard from './AvatarWithHoverCard';\n\nconst Avatar = AvatarWithHoverCard;\n\nexport { Avatar };\n",
+        )
+        .expect("a listed forward");
+        assert_eq!(listed.sources, ["./AvatarWithHoverCard"]);
+        assert_ne!(
+            surface("import Page from './Page';\nexport default withAuth(Page);\n")
+                .map(|s| s.digest),
+            surface("import Page from './Page';\nexport default Page;\n").map(|s| s.digest)
+        );
+        assert_eq!(
+            surface("import { x } from './x';\nexport function f() {\n  return x;\n}\n"),
+            None
+        );
+        assert_eq!(
+            surface(
+                "import { observer } from 'mobx-react';\nfunction AppSidebar() {}\nexport default observer(AppSidebar);\n"
+            )
+            .map(|s| s.sources),
+            Some(Vec::new())
         );
     }
 
