@@ -38,7 +38,7 @@ matching (`name-matcher.ts`) — orchestrated by `ReferenceResolver`
 (`index.ts`), plus concrete `FrameworkResolver` implementations behind the
 `FrameworkResolver` trait EXTENSION POINT (`crates/codegraph-resolve/src/framework.rs`):
 NestJS, React, Vue, Godot, Tauri, Nuxt, React Router, TanStack Router, Next.js,
-Svelte, SvelteKit, Vue Router and Expo Router
+Svelte, SvelteKit, Vue Router, Angular Router and Expo Router
 (`crates/codegraph-resolve/src/frameworks/`), detected per-project by
 `detect_frameworks`. The other colby resolvers stay deferred. The following
 colby behaviors are intentionally NOT ported in v1:
@@ -346,6 +346,22 @@ listed.
   identifier's name, which the Vue resolver and name matching bind too:
   vue-vben-admin's `component: IFrameView`, imported from a layouts module
   of three lazy constants, renders `BasicLayout` (`vue_router.rs`).
+- **Angular `children` and nested constants written elsewhere (W7-13).**
+  A route's `children` are read only from an array written in place, and a
+  path constant's nested object only from an object written in place; colby
+  takes the first `[` or `{` after the key, so `children: CHILDREN` read the
+  array of a later entry, and `path: paths.account.path` whose `account`
+  names another constant read the next field's object (`angular_router.rs`).
+- **A cycle of Angular mounts (W7-13).** A routes file in a cycle of
+  `loadChildren` mounts sits under the prefixes of its own chain up to the
+  first file that repeats; colby memoizes each file's prefix in the order it
+  renames the routes, so in a cycle a file's name depended on which route
+  was renamed first (`angular_router.rs`).
+- **An Angular path constant that aliases itself (W7-13).** A chain of local
+  aliases (`const { create } = internalRoutes.accounts;`) is followed at most
+  eight hops, and an alias that leads back to a chain being read reads
+  nothing; colby follows aliases without a bound, so `const a = a.b;`
+  recursed until the stack ran out (`angular_router.rs`).
 - **A path two SvelteKit pages of one app serve (W7-12).** A navigation
   call matches only the pages of its own app, as in colby, and a path two
   pages of that app serve (`(a)/x/+page.svelte` beside `(b)/x/+page.svelte`,

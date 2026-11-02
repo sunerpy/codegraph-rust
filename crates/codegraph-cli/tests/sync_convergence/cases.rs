@@ -12015,6 +12015,291 @@ pub fn typescript_sveltekit_lib_module_appears() -> Case {
     )
 }
 
+/// The manifest of an Angular app.
+const ANGULAR_PACKAGE: &str =
+    "{\"name\":\"app\",\"dependencies\":{\"@angular/core\":\"19\",\"@angular/router\":\"19\"}}\n";
+/// An Angular app's sign-in screen.
+const ANGULAR_AUTH: &str = "import { Component } from '@angular/core';\n@Component({ selector: 'app-auth', template: '' })\nexport class AuthComponent {}\n";
+/// An Angular app's profile screen.
+const ANGULAR_PROFILE: &str = "import { Component } from '@angular/core';\n@Component({ selector: 'app-profile', template: '' })\nexport class ProfileComponent {}\n";
+/// An Angular app's account screen.
+const ANGULAR_ACCOUNT: &str = "import { Component } from '@angular/core';\n@Component({ selector: 'app-account', template: '' })\nexport class AccountComponent {}\n";
+/// An Angular app's users screen.
+const ANGULAR_USERS: &str = "import { Component } from '@angular/core';\n@Component({ selector: 'app-users', template: '' })\nexport class UsersComponent {}\n";
+/// The app's routes: `/login`, and the profile routes mounted at `profile`.
+const ANGULAR_APP_ROUTES: &str = "import { Routes } from '@angular/router';\nimport { AuthComponent } from './auth.component';\nexport const routes: Routes = [\n  { path: 'login', component: AuthComponent },\n  { path: 'profile', loadChildren: () => import('./profile/profile.routes') },\n];\n";
+/// The profile routes file, which knows only its own `:username`.
+const ANGULAR_PROFILE_ROUTES: &str = "import { Routes } from '@angular/router';\nimport { ProfileComponent } from './profile.component';\nexport default [{ path: ':username', component: ProfileComponent }] satisfies Routes;\n";
+/// A routing module: `users`, in no NgModule yet.
+const ANGULAR_ADMIN_ROUTING: &str = "import { NgModule } from '@angular/core';\nimport { RouterModule, Routes } from '@angular/router';\nimport { UsersComponent } from './users.component';\nconst routes: Routes = [{ path: 'users', component: UsersComponent }];\n@NgModule({ imports: [RouterModule.forChild(routes)], exports: [RouterModule] })\nexport class AdminRoutingModule {}\n";
+/// An Nx shell that lazy-loads the `@ws/home` library at `home`.
+const ANGULAR_NX_SHELL: &str = "import { Route } from '@angular/router';\nexport const shellRoutes: Route[] = [\n  { path: 'home', loadChildren: async () => (await import('@ws/home')).HomeModule },\n];\n";
+/// An Nx library module whose `''` route renders its home.
+const ANGULAR_NX_HOME_MODULE: &str = "import { NgModule } from '@angular/core';\nimport { RouterModule } from '@angular/router';\nimport { HomeComponent } from './home.component';\n@NgModule({ imports: [RouterModule.forChild([{ path: '', component: HomeComponent }])] })\nexport class HomeModule {}\n";
+/// Another library module: `welcome`.
+const ANGULAR_NX_LANDING_MODULE: &str = "import { NgModule } from '@angular/core';\nimport { RouterModule } from '@angular/router';\nimport { LandingComponent } from './landing.component';\n@NgModule({ imports: [RouterModule.forChild([{ path: 'welcome', component: LandingComponent }])] })\nexport class LandingModule {}\n";
+/// The library components the modules render.
+const ANGULAR_NX_HOME: &str = "import { Component } from '@angular/core';\n@Component({ selector: 'ws-home', template: '' })\nexport class HomeComponent {}\n";
+const ANGULAR_NX_LANDING: &str = "import { Component } from '@angular/core';\n@Component({ selector: 'ws-landing', template: '' })\nexport class LandingComponent {}\n";
+
+/// An Angular app: the app routes, the profile routes they mount, and the
+/// screens both render.
+fn angular_app(case: Case) -> Case {
+    case.file("package.json", ANGULAR_PACKAGE)
+        .file("src/app/auth.component.ts", ANGULAR_AUTH)
+        .file("src/app/profile/profile.component.ts", ANGULAR_PROFILE)
+}
+
+/// An Nx workspace: the shell lazy-loads `@ws/home`, whose barrel names
+/// one of two library modules.
+fn angular_nx(case: Case) -> Case {
+    case.file("package.json", ANGULAR_PACKAGE)
+        .file(
+            "tsconfig.base.json",
+            "{\"compilerOptions\":{\"paths\":{\"@ws/home\":[\"libs/home/src/index.ts\"]}}}\n",
+        )
+        .file("libs/shell/src/lib/shell.routes.ts", ANGULAR_NX_SHELL)
+        .file("libs/home/src/lib/home.module.ts", ANGULAR_NX_HOME_MODULE)
+        .file("libs/home/src/lib/home.component.ts", ANGULAR_NX_HOME)
+        .file(
+            "libs/home/src/lib/landing.module.ts",
+            ANGULAR_NX_LANDING_MODULE,
+        )
+        .file("libs/home/src/lib/landing.component.ts", ANGULAR_NX_LANDING)
+}
+
+/// W7-13 (upstream #2113): the mount that lazy-loads a routes file is
+/// edited: the loaded file's routes take the new prefix, though the file is
+/// untouched.
+pub fn typescript_angular_mount_path_edit_moves_the_loaded_routes() -> Case {
+    angular_app(Case::new(Change::BodyEdit, &[Language::TypeScript]))
+        .file("src/app/app.routes.ts", ANGULAR_APP_ROUTES)
+        .file("src/app/profile/profile.routes.ts", ANGULAR_PROFILE_ROUTES)
+        .write(
+            "src/app/app.routes.ts",
+            "import { Routes } from '@angular/router';\nimport { AuthComponent } from './auth.component';\nexport const routes: Routes = [\n  { path: 'login', component: AuthComponent },\n  { path: 'user', loadChildren: () => import('./profile/profile.routes') },\n];\n",
+        )
+        .named_before("route", "/profile/:username")
+        .named_after("route", "/user/:username")
+        .edge_throughout(
+            "route src/app/profile/profile.routes.ts::route:/:username",
+            "references",
+            "class ProfileComponent",
+        )
+}
+
+/// W7-13 (upstream #2113): the constant a route's path is written with
+/// changes in another file: the route is renamed, though its routes file
+/// is untouched.
+pub fn typescript_angular_constant_path_edit_renames_the_route() -> Case {
+    angular_app(Case::new(Change::BodyEdit, &[Language::TypeScript]))
+        .file("src/app/account.component.ts", ANGULAR_ACCOUNT)
+        .file(
+            "src/app/routes.constants.ts",
+            "export const internalRoutes = {\n  account: { path: 'account' },\n};\n",
+        )
+        .file(
+            "src/app/app.routes.ts",
+            "import { Routes } from '@angular/router';\nimport { AccountComponent } from './account.component';\nimport { internalRoutes } from './routes.constants';\nexport const routes: Routes = [\n  { path: internalRoutes.account.path, component: AccountComponent },\n];\n",
+        )
+        .write(
+            "src/app/routes.constants.ts",
+            "export const internalRoutes = {\n  account: { path: 'my-account' },\n};\n",
+        )
+        .named_before("route", "/account")
+        .named_after("route", "/my-account")
+        .edge_throughout(
+            "route src/app/app.routes.ts::route:/{internalRoutes.account.path}",
+            "references",
+            "class AccountComponent",
+        )
+}
+
+/// W7-13 (upstream #2133): the barrel a constant is imported through comes
+/// to re-export it from another file: the route takes that file's value.
+pub fn typescript_angular_constant_barrel_reexports_another_file() -> Case {
+    angular_app(Case::new(Change::ReexportEdit, &[Language::TypeScript]))
+        .file("src/app/account.component.ts", ANGULAR_ACCOUNT)
+        .file(
+            "src/app/paths/en.ts",
+            "export const internalRoutes = { account: { path: 'account' } };\n",
+        )
+        .file(
+            "src/app/paths/de.ts",
+            "export const internalRoutes = { account: { path: 'konto' } };\n",
+        )
+        .file("src/app/paths/index.ts", "export * from './en';\n")
+        .file(
+            "src/app/app.routes.ts",
+            "import { Routes } from '@angular/router';\nimport { AccountComponent } from './account.component';\nimport { internalRoutes } from './paths';\nexport const routes: Routes = [\n  { path: internalRoutes.account.path, component: AccountComponent },\n];\n",
+        )
+        .write("src/app/paths/index.ts", "export * from './de';\n")
+        .named_before("route", "/account")
+        .named_after("route", "/konto")
+}
+
+/// W7-13 (upstream #2113): an NgModule a mount lazy-loads comes to import
+/// its routing module: the routing module's routes sit under the mount.
+pub fn typescript_angular_ng_module_imports_its_routing_module() -> Case {
+    angular_app(Case::new(Change::BodyEdit, &[Language::TypeScript]))
+        .file("src/app/admin/users.component.ts", ANGULAR_USERS)
+        .file("src/app/admin/admin-routing.module.ts", ANGULAR_ADMIN_ROUTING)
+        .file(
+            "src/app/admin/admin.module.ts",
+            "import { NgModule } from '@angular/core';\nimport { CommonModule } from '@angular/common';\n@NgModule({ imports: [CommonModule] })\nexport class AdminModule {}\n",
+        )
+        .file(
+            "src/app/app.routes.ts",
+            "import { Routes } from '@angular/router';\nexport const routes: Routes = [\n  { path: 'admin', loadChildren: () => import('./admin/admin.module').then((m) => m.AdminModule) },\n];\n",
+        )
+        .write(
+            "src/app/admin/admin.module.ts",
+            "import { NgModule } from '@angular/core';\nimport { CommonModule } from '@angular/common';\nimport { AdminRoutingModule } from './admin-routing.module';\n@NgModule({ imports: [CommonModule, AdminRoutingModule] })\nexport class AdminModule {}\n",
+        )
+        .named_before("route", "/users")
+        .named_after("route", "/admin/users")
+}
+
+/// W7-13 (upstream #2133): an Nx library's barrel comes to forward another
+/// module: that module's routes sit under the shell's mount, and the old
+/// one's no longer do.
+pub fn typescript_angular_nx_barrel_forwards_another_module() -> Case {
+    angular_nx(Case::new(Change::ReexportEdit, &[Language::TypeScript]))
+        .file(
+            "libs/home/src/index.ts",
+            "export * from './lib/home.module';\n",
+        )
+        .write(
+            "libs/home/src/index.ts",
+            "export * from './lib/landing.module';\n",
+        )
+        .named_before("route", "/home")
+        .named_before("route", "/welcome")
+        .named_after("route", "/")
+        .named_after("route", "/home/welcome")
+}
+
+/// W7-13 (upstream #2133): the path alias an Nx shell lazy-loads by comes
+/// to name another library: that library's routes sit under the mount.
+pub fn typescript_angular_nx_alias_retargets_the_mount() -> Case {
+    angular_nx(Case::new(Change::ControlFile, &[Language::TypeScript]))
+        .file(
+            "libs/home/src/index.ts",
+            "export * from './lib/home.module';\n",
+        )
+        .file(
+            "libs/landing/src/index.ts",
+            "export * from '../../home/src/lib/landing.module';\n",
+        )
+        .write(
+            "tsconfig.base.json",
+            "{\"compilerOptions\":{\"paths\":{\"@ws/home\":[\"libs/landing/src/index.ts\"]}}}\n",
+        )
+        .named_before("route", "/home")
+        .named_after("route", "/home/welcome")
+}
+
+/// W7-13 (upstream #2113): the component file a route lazy-loads moves its
+/// default export to another of its components: the route references that
+/// one, though the routes file is untouched.
+pub fn typescript_angular_lazy_component_default_export_moves() -> Case {
+    angular_app(Case::new(Change::BodyEdit, &[Language::TypeScript]))
+        .file(
+            "src/app/app.routes.ts",
+            "import { Routes } from '@angular/router';\nexport const routes: Routes = [\n  { path: 'home', loadComponent: () => import('./home/home.component') },\n];\n",
+        )
+        .file(
+            "src/app/home/home.component.ts",
+            "import { Component } from '@angular/core';\n@Component({ selector: 'app-home', template: '' })\nexport default class HomeComponent {}\n@Component({ selector: 'app-legacy', template: '' })\nexport class LegacyHomeComponent {}\n",
+        )
+        .write(
+            "src/app/home/home.component.ts",
+            "import { Component } from '@angular/core';\n@Component({ selector: 'app-home', template: '' })\nexport class HomeComponent {}\n@Component({ selector: 'app-legacy', template: '' })\nexport default class LegacyHomeComponent {}\n",
+        )
+        .edge_before(
+            "route src/app/app.routes.ts::route:/home",
+            "references",
+            "class HomeComponent",
+        )
+        .edge_after(
+            "route src/app/app.routes.ts::route:/home",
+            "references",
+            "class LegacyHomeComponent",
+        )
+        .no_edge_after(
+            "route src/app/app.routes.ts::route:/home",
+            "references",
+            "class HomeComponent",
+        )
+}
+
+/// W7-13 (upstream #2113): the component file a route lazy-loads appears:
+/// the route references its component, as in a fresh index.
+pub fn typescript_angular_lazy_component_appears() -> Case {
+    angular_app(Case::new(Change::AddImportTarget, &[Language::TypeScript]))
+        .file(
+            "src/app/app.routes.ts",
+            "import { Routes } from '@angular/router';\nexport const routes: Routes = [\n  { path: 'about', loadComponent: () => import('./about/about.component').then((m) => m.AboutComponent) },\n];\n",
+        )
+        .write(
+            "src/app/about/about.component.ts",
+            "import { Component } from '@angular/core';\n@Component({ selector: 'app-about', template: '' })\nexport class AboutComponent {}\n",
+        )
+        .edge_after(
+            "route src/app/app.routes.ts::route:/about",
+            "references",
+            "class AboutComponent",
+        )
+}
+
+/// W7-13 (upstream #2113): the routes file a mount lazy-loads appears: its
+/// routes sit under the mount, as in a fresh index.
+pub fn typescript_angular_mounted_routes_file_appears() -> Case {
+    angular_app(Case::new(Change::AddImportTarget, &[Language::TypeScript]))
+        .file("src/app/app.routes.ts", ANGULAR_APP_ROUTES)
+        .write("src/app/profile/profile.routes.ts", ANGULAR_PROFILE_ROUTES)
+        .named_after("route", "/profile/:username")
+        .edge_after(
+            "route src/app/profile/profile.routes.ts::route:/:username",
+            "references",
+            "class ProfileComponent",
+        )
+}
+
+/// W7-13: a file earlier in path order comes to mount the same routes file:
+/// a routes file mounted from two places sits under the first in path
+/// order, so the loaded routes move there, as in a fresh index.
+pub fn typescript_angular_earlier_file_mounts_the_routes_too() -> Case {
+    angular_app(Case::new(Change::AddCompetitor, &[Language::TypeScript]))
+        .file("src/app/app.routes.ts", ANGULAR_APP_ROUTES)
+        .file("src/app/profile/profile.routes.ts", ANGULAR_PROFILE_ROUTES)
+        .write(
+            "src/app/admin.routes.ts",
+            "import { Routes } from '@angular/router';\nexport const adminRoutes: Routes = [\n  { path: 'people', loadChildren: () => import('./profile/profile.routes') },\n];\n",
+        )
+        .named_before("route", "/profile/:username")
+        .named_after("route", "/people/:username")
+}
+
+/// W7-13 (upstream #2113): the manifest comes to declare Angular: the app's
+/// routes appear, though no source changed.
+pub fn typescript_angular_dependency_appears_in_package_json() -> Case {
+    Case::new(Change::ControlFile, &[Language::TypeScript])
+        .file("package.json", "{\"name\":\"app\"}\n")
+        .file("src/app/auth.component.ts", ANGULAR_AUTH)
+        .file("src/app/profile/profile.component.ts", ANGULAR_PROFILE)
+        .file("src/app/app.routes.ts", ANGULAR_APP_ROUTES)
+        .file("src/app/profile/profile.routes.ts", ANGULAR_PROFILE_ROUTES)
+        .write("package.json", ANGULAR_PACKAGE)
+        .named_after("route", "/login")
+        .named_after("route", "/profile/:username")
+        .edge_after(
+            "route src/app/app.routes.ts::route:/login",
+            "references",
+            "class AuthComponent",
+        )
+}
+
 /// The code-based route tree the W7-10 reparenting case edits. It exports
 /// the tree: in a module that exports nothing, a route is no other file's to
 /// reach (KEEP-RUST, W7-10).

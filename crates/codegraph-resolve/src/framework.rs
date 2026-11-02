@@ -8,8 +8,8 @@
 //!
 //! The upstream ships ~22 heuristic `FrameworkResolver` implementations. The Rust
 //! port implements NestJS, React, Vue, Godot, Tauri, Nuxt, React Router,
-//! TanStack Router, Next.js, Svelte, SvelteKit, Vue Router and Expo Router in
-//! [`crate::frameworks`], detected per-project by
+//! TanStack Router, Next.js, Svelte, SvelteKit, Vue Router, Angular Router and
+//! Expo Router in [`crate::frameworks`], detected per-project by
 //! [`crate::frameworks::detect_frameworks`]. The others (Spring/Java,
 //! React-Native, Go-module, Drupal, Laravel, Express, Astro, Python, Ruby, C#,
 //! Swift, etc.) stay deferred (see `KNOWN_DIFFS.md`): they are an

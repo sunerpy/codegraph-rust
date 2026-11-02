@@ -4,7 +4,8 @@
 //! ships: React ([`react`]), React Router ([`react_router`]), TanStack Router
 //! ([`tanstack_router`]), Next.js ([`nextjs`]), Svelte and SvelteKit
 //! ([`svelte`], [`sveltekit_router`]), Vue Router ([`vue_router`]),
-//! Expo Router ([`expo_router`]), Vue and Nuxt ([`vue`]), NestJS
+//! Angular Router ([`angular_router`]), Expo Router ([`expo_router`]), Vue
+//! and Nuxt ([`vue`]), NestJS
 //! ([`nestjs`]), Godot ([`godot`]) and Tauri ([`tauri`]). The other upstream
 //! resolvers remain deferred (see `KNOWN_DIFFS.md`).
 //!
@@ -14,6 +15,7 @@
 //! [`crate::resolver::ReferenceResolver::resolve_one`] Strategy-1 exactly where
 //! the upstream runs them (`index.ts:695-701`).
 
+pub mod angular_router;
 pub mod expo_router;
 pub mod godot;
 pub(crate) mod godot_common;
@@ -91,6 +93,10 @@ pub fn detect_frameworks(context: &dyn ResolutionContext) -> Vec<Box<dyn Framewo
         // routers. It claims navigation calls only where they name one of
         // its own routes or a Nuxt page, and its routes' own references.
         Box::new(vue_router::VueRouterResolver),
+        // Angular's `Routes` arrays and the components they render, after
+        // Vue Router and before Expo Router, as upstream orders the routers.
+        // It claims only its own routes' lazy and layout references.
+        Box::new(angular_router::AngularRouterResolver),
         // Expo Router screens and navigation (F2), after Next.js as upstream
         // registers it. It claims navigation calls only where their href
         // names one of its own screens.

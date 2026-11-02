@@ -187,9 +187,9 @@ the Rust graph holds different facts, the viewer shows what this index holds:
 - Branch conditions on call sites (`when`) are absent from every edge: the
   builders that attach them are not ported either.
 - Routes come from the framework resolvers this port has — React Router,
-  TanStack Router and Vue Router routes, Next.js pages and route handlers,
-  SvelteKit pages, Expo Router screens and API routes, Nuxt pages, NestJS
-  controllers.
+  TanStack Router, Vue Router and Angular Router routes, Next.js pages and
+  route handlers, SvelteKit pages, Expo Router screens and API routes, Nuxt
+  pages, NestJS controllers.
   Express and Go HTTP routers are not among them, so those projects are not
   routed apps here.
 - The Rust index has no synthesized dynamic-dispatch edges, so a flow never

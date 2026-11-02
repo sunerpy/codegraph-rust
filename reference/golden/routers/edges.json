@@ -291,6 +291,31 @@
     "target": "component:f03c817073321d2ca5841191b01278d1"
   },
   {
+    "col": 0,
+    "kind": "references",
+    "line": 5,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "route:apps/angular/src/app/app.routes.ts:5:/:angular",
+    "target": "class:49a64bdaf5b8db2e9dbf283b51dba375"
+  },
+  {
+    "col": 0,
+    "kind": "references",
+    "line": 6,
+    "metadata": {
+      "confidence": 0.95,
+      "framework": "angular-router",
+      "resolvedBy": "framework"
+    },
+    "provenance": null,
+    "source": "route:apps/angular/src/app/app.routes.ts:6:/lazy:angular",
+    "target": "class:49a64bdaf5b8db2e9dbf283b51dba375"
+  },
+  {
     "col": 13,
     "kind": "references",
     "line": 4,

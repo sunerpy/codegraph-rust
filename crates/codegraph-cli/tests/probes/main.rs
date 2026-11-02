@@ -22521,6 +22521,248 @@ mod sveltekit {
     }
 }
 
+mod angular {
+    use super::support::{Graph, Project};
+
+    /// Each route `name -> rendered, layout …`, sorted (upstream's
+    /// `names each screen by the path a user takes to it`), with the
+    /// resolver that bound each reference.
+    fn screens(graph: &Graph) -> Vec<String> {
+        let mut out: Vec<String> = graph
+            .nodes
+            .iter()
+            .filter(|node| node.kind == "route")
+            .map(|route| {
+                let mut bound: Vec<String> = graph
+                    .edges
+                    .iter()
+                    .filter(|edge| edge.kind == "references" && edge.source == route.id)
+                    .map(|edge| {
+                        let layout = edge
+                            .metadata
+                            .get("layout")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+                        let target = graph
+                            .node(&edge.target)
+                            .map_or("?", |node| node.name.as_str());
+                        format!("{}{target}", if layout { "layout " } else { "" })
+                    })
+                    .collect();
+                bound.sort();
+                format!("{} -> {}", route.name, bound.join(", "))
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// A component class written the way upstream's fixtures write one.
+    fn component(name: &str, selector: &str, template: &str, body: &str) -> String {
+        format!(
+            "import {{ Component }} from '@angular/core';\nimport {{ Router }} from '@angular/router';\n@Component({{ selector: '{selector}', template: `{template}` }})\nexport class {name} {{\n  constructor(private router: Router) {{}}\n{body}\n}}\n"
+        )
+    }
+
+    /// Upstream #2113 (`angular-router.test.ts`, "an Angular app, indexed",
+    /// its first assertion; the navigation, template and Screens halves are
+    /// W7-13b, W7-18 and the viewer's): each screen is named by the path a
+    /// user takes to it, through a mount, a constant, a `$localize` path
+    /// and an NgModule's routing module, and bound to its component and
+    /// the layouts around it. A layout with a `''` child is no screen of
+    /// its own.
+    #[test]
+    fn pr2113_an_angular_app_names_its_screens_by_their_paths() {
+        let home = component(
+            "HomeComponent",
+            "app-home",
+            "<p>Home</p>",
+            "  open(slug: string) { this.router.navigate(['/login']); }",
+        )
+        .replace("export class", "export default class");
+        let overview = component("OverviewComponent", "app-overview", "<p>Overview</p>", "")
+            .replace("export class", "export default class");
+        let project = Project::new()
+            .file(
+                "package.json",
+                "{\"dependencies\":{\"@angular/core\":\"^19.0.0\",\"@angular/router\":\"^19.0.0\"}}\n",
+            )
+            .file(
+                "src/app/routes.constants.ts",
+                "export const internalRoutes = {\n  account: { path: 'account', routerLink: ['/account'], subRoutes: { access: { path: 'access', routerLink: (id: string) => ['/account', 'access', id] } } },\n  about: { path: $localize`:kebab-case@@routes.about:about`, routerLink: ['/' + $localize`:kebab-case@@routes.about:about`] },\n};\n",
+            )
+            .file(
+                "src/app/app.routes.ts",
+                "import { Routes } from '@angular/router';\nimport { AuthComponent } from './auth/auth.component';\nimport { internalRoutes } from './routes.constants';\nconst { about } = internalRoutes;\nexport const routes: Routes = [\n  { path: 'home', loadComponent: () => import('./home/home.component') },\n  { path: 'login', component: AuthComponent },\n  { path: about.path, loadComponent: () => import('./about/about.component').then((m) => m.AboutComponent) },\n  { path: internalRoutes.account.path, loadChildren: () => import('./account/account.routes') },\n  { path: 'admin', loadChildren: () => import('./admin/admin.module').then((m) => m.AdminModule) },\n  { path: '**', redirectTo: 'home' },\n];\n",
+            )
+            .file(
+                "src/app/account/account.routes.ts",
+                "import { Routes } from '@angular/router';\nimport { AccountComponent } from './account.component';\nimport { AccessComponent } from './access.component';\nimport { internalRoutes } from '../routes.constants';\nexport default [\n  { path: '', component: AccountComponent, children: [\n      { path: '', loadComponent: () => import('./overview.component') },\n      { path: internalRoutes.account.subRoutes.access.path + '/:id', component: AccessComponent },\n  ] },\n] satisfies Routes;\n",
+            )
+            .file(
+                "src/app/admin/admin.module.ts",
+                "import { NgModule } from '@angular/core';\nimport { AdminRoutingModule } from './admin-routing.module';\n@NgModule({ imports: [AdminRoutingModule] })\nexport class AdminModule {}\n",
+            )
+            .file(
+                "src/app/admin/admin-routing.module.ts",
+                "import { NgModule } from '@angular/core';\nimport { RouterModule, Routes } from '@angular/router';\nimport { AdminUsersComponent } from './admin-users.component';\nconst routes: Routes = [{ path: '', redirectTo: 'users', pathMatch: 'full' }, { path: 'users', component: AdminUsersComponent }];\n@NgModule({ imports: [RouterModule.forChild(routes)], exports: [RouterModule] })\nexport class AdminRoutingModule {}\n",
+            )
+            .file("src/app/home/home.component.ts", &home)
+            .file(
+                "src/app/auth/auth.component.ts",
+                &component(
+                    "AuthComponent",
+                    "app-auth",
+                    "<a routerLink=\"/home\">Home</a>",
+                    "  done() { this.router.navigate(['/']); }",
+                ),
+            )
+            .file(
+                "src/app/about/about.component.ts",
+                &component("AboutComponent", "app-about", "<p>About</p>", ""),
+            )
+            .file(
+                "src/app/account/account.component.ts",
+                &component(
+                    "AccountComponent",
+                    "app-account",
+                    "<router-outlet></router-outlet>",
+                    "",
+                ),
+            )
+            .file("src/app/account/overview.component.ts", &overview)
+            .file(
+                "src/app/account/access.component.ts",
+                &component("AccessComponent", "app-access", "<p>Access</p>", ""),
+            )
+            .file(
+                "src/app/admin/admin-users.component.ts",
+                &component("AdminUsersComponent", "app-admin-users", "<p>Users</p>", ""),
+            )
+            .index();
+        let graph = project.graph();
+        assert_eq!(
+            screens(graph),
+            [
+                "/about -> AboutComponent",
+                "/account -> OverviewComponent, layout AccountComponent",
+                "/account/access/:id -> AccessComponent, layout AccountComponent",
+                "/admin/users -> AdminUsersComponent",
+                "/home -> HomeComponent",
+                "/login -> AuthComponent",
+            ],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream #2133 (angular-spotify): Nx libraries behind barrels,
+    /// `(await import(…)).M` and a class-static path constant name the
+    /// screens a shell lazy-loads. The `routerLink` navigation is W7-18's.
+    #[test]
+    fn pr2133_nx_libraries_mount_their_routes_through_barrels() {
+        let module = |name: &str, component: &str, file: &str| {
+            format!(
+                "import {{ NgModule }} from '@angular/core';\nimport {{ RouterModule }} from '@angular/router';\nimport {{ {component} }} from './{file}';\n@NgModule({{ imports: [RouterModule.forChild([{{ path: '', component: {component} }}])] }})\nexport class {name} {{}}\n"
+            )
+        };
+        let class = |name: &str, selector: &str| {
+            format!(
+                "import {{ Component }} from '@angular/core';\n@Component({{ selector: '{selector}', template: `<p></p>` }})\nexport class {name} {{}}\n"
+            )
+        };
+        let project = Project::new()
+            .file(
+                "package.json",
+                "{\"name\":\"ws\",\"dependencies\":{\"@angular/core\":\"*\",\"@angular/router\":\"*\"}}\n",
+            )
+            .file("nx.json", "{}\n")
+            .file(
+                "tsconfig.base.json",
+                "{\"compilerOptions\":{\"paths\":{\"@ws/home\":[\"libs/home/src/index.ts\"],\"@ws/lyrics\":[\"libs/lyrics/src/index.ts\"],\"@ws/utils\":[\"libs/utils/src/index.ts\"]}}}\n",
+            )
+            .file("libs/utils/src/index.ts", "export * from './lib/router-util';\n")
+            .file(
+                "libs/utils/src/lib/router-util.ts",
+                "export class RouterUtil {\n  static Configuration = { Lyrics: 'lyrics' };\n}\n",
+            )
+            .file(
+                "libs/shell/src/lib/shell.routes.ts",
+                "import { Route } from '@angular/router';\nimport { RouterUtil } from '@ws/utils';\n\nexport const shellRoutes: Route[] = [\n  { path: '', loadChildren: async () => (await import('@ws/home')).HomeModule },\n  { path: RouterUtil.Configuration.Lyrics, loadChildren: async () => (await import('@ws/lyrics')).LyricsModule },\n];\n",
+            )
+            .file("libs/home/src/index.ts", "export * from './lib/home.module';\n")
+            .file(
+                "libs/home/src/lib/home.module.ts",
+                &module("HomeModule", "HomeComponent", "home.component"),
+            )
+            .file(
+                "libs/home/src/lib/home.component.ts",
+                &class("HomeComponent", "as-home"),
+            )
+            .file("libs/lyrics/src/index.ts", "export * from './lib/lyrics.module';\n")
+            .file(
+                "libs/lyrics/src/lib/lyrics.module.ts",
+                &module("LyricsModule", "LyricsComponent", "lyrics.component"),
+            )
+            .file(
+                "libs/lyrics/src/lib/lyrics.component.ts",
+                &class("LyricsComponent", "as-lyrics"),
+            )
+            .index();
+        let graph = project.graph();
+        assert_eq!(
+            screens(graph),
+            ["/ -> HomeComponent", "/lyrics -> LyricsComponent"],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream #2133 (jira-clone): a template-literal path whose hole is a
+    /// class constant, under a mount whose file holds only the mount and a
+    /// redirect. The navigation half is W7-13b's.
+    #[test]
+    fn pr2133_a_template_literal_path_sits_under_its_mount() {
+        let class = |name: &str| {
+            format!(
+                "import {{ Component }} from '@angular/core';\n@Component({{ selector: 'j-x', template: '<div></div>' }})\nexport class {name} {{}}\n"
+            )
+        };
+        let project = Project::new()
+            .file(
+                "package.json",
+                "{\"name\":\"jira\",\"dependencies\":{\"@angular/core\":\"*\",\"@angular/router\":\"*\"}}\n",
+            )
+            .file("angular.json", "{}\n")
+            .file(
+                "src/app/app.routes.ts",
+                "import { Routes } from '@angular/router';\nexport const appRoutes: Routes = [\n  { path: 'project', loadChildren: () => import('./project/project.routes').then((m) => m.PROJECT_ROUTES) },\n  { path: '', redirectTo: 'project', pathMatch: 'full' },\n];\n",
+            )
+            .file(
+                "src/app/project/config/const.ts",
+                "export class ProjectConst {\n  static readonly IssueId = 'issueId';\n}\n",
+            )
+            .file(
+                "src/app/project/project.routes.ts",
+                "import { Routes } from '@angular/router';\nimport { ProjectComponent } from './project.component';\nimport { BoardComponent } from './board.component';\nimport { IssueComponent } from './issue.component';\nimport { ProjectConst } from './config/const';\nexport const PROJECT_ROUTES: Routes = [\n  {\n    path: '',\n    component: ProjectComponent,\n    children: [\n      { path: 'board', component: BoardComponent },\n      { path: `issue/:${ProjectConst.IssueId}`, component: IssueComponent },\n      { path: '', redirectTo: 'board', pathMatch: 'full' },\n    ],\n  },\n];\n",
+            )
+            .file("src/app/project/project.component.ts", &class("ProjectComponent"))
+            .file("src/app/project/board.component.ts", &class("BoardComponent"))
+            .file("src/app/project/issue.component.ts", &class("IssueComponent"))
+            .index();
+        let graph = project.graph();
+        assert_eq!(
+            screens(graph),
+            [
+                "/project/board -> BoardComponent, layout ProjectComponent",
+                "/project/issue/:issueId -> IssueComponent, layout ProjectComponent",
+            ],
+            "{}",
+            graph.report()
+        );
+    }
+}
+
 mod explore_flow {
     use super::support::{Project, codegraph};
 
