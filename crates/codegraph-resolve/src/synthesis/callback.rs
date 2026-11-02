@@ -13,6 +13,7 @@ use codegraph_store::queries::ReferenceSite;
 use regex::Regex;
 use serde_json::{Value, json};
 
+use super::MAX_CALLBACKS_PER_CHANNEL;
 use super::stage::{LineAt, View, enclosing_fn, slice_lines};
 
 /// A registrar's name: `onUpdate`, `subscribe`, `addListener`, ...
@@ -46,7 +47,6 @@ const OBSERVER_NAMES: &[&str] = &[
     "listen",
     "addCallback",
 ];
-const MAX_CALLBACKS_PER_CHANNEL: usize = 40;
 /// An event with more handlers or dispatchers than this is too generic to
 /// pair without receiver types.
 const EVENT_FANOUT_CAP: usize = 6;

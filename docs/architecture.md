@@ -256,10 +256,16 @@ upstream's registry order, merges their edges (the first pass to pair a source
 and a target keeps the pair), and replaces every synthesized edge in one
 transaction, an edge whose identity a base edge holds being ignored while its
 pair stays taken. The ported passes are the field observer
-(`callback`), the Swift and Kotlin closure collection (`closure-collection`)
-and the string-keyed emitter (`event-emitter`), each walking its candidates in
-upstream's order (nodes by file, line and id, edges by their other end, line
-and column). A full index and a migration run the stage after
+(`callback`), the Swift and Kotlin closure collection (`closure-collection`),
+the string-keyed emitter (`event-emitter`), and the structural ones: a React
+class component's or a Flutter `State`'s re-render (`react-render`,
+`flutter-build`), a C++ virtual override (`cpp-override`), a Kotlin
+Multiplatform declaration's `actual`s (`kotlin-expect-actual`), a Delphi
+form's unit (`pascal-form`) and a MyBatis mapper method's statement
+(`mybatis-java-xml`). Each walks its candidates in upstream's order (nodes by
+file, line and id, edges by their other end, line and column); the Flutter,
+C++, Kotlin and MyBatis passes run only when the index has files of their
+languages, as upstream's gates have them. A full index and a migration run the stage after
 resolution. A sync runs it last, after the orphan sweep, whenever it changed
 the index, bootstrapped a lane, swept, or found the `synthesis_version`
 marker missing, and writes the marker as its last write; the sync's site

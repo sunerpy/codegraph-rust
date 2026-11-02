@@ -5581,6 +5581,75 @@ class basic_json
         );
     }
 
+    /// Upstream #2407's override assertions (`cpp-base-class-lookup.test.ts`,
+    /// "what the hierarchy feeds"), drawn by the synthesis stage's
+    /// `cpp-override` pass (W7-14b): each base method links to the overrides
+    /// in the subclasses name lookup found, never to a namesake's, and
+    /// through an alias to the class it names.
+    #[test]
+    fn pr2407_a_base_method_links_to_the_overrides_of_its_subclasses() {
+        let project = base_lookup_project();
+        let graph = project.graph();
+        let overrides = |qualified: &str, file: &str| -> Vec<String> {
+            let id = &the_class(graph, qualified, file).id;
+            let mut out: Vec<String> = graph
+                .edges
+                .iter()
+                .filter(|edge| {
+                    &edge.source == id
+                        && edge.kind == "calls"
+                        && edge.metadata["synthesizedBy"] == "cpp-override"
+                })
+                .filter_map(|edge| graph.node(&edge.target))
+                .map(|target| target.qualified_name.clone())
+                .collect();
+            out.sort();
+            out
+        };
+        assert_eq!(
+            overrides("leveldb::Iterator::Next", "include/leveldb/iterator.h"),
+            ["leveldb::DBIter::Next"],
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            overrides("leveldb::SkipList::Iterator::Next", "db/skiplist.h"),
+            Vec::<String>::new(),
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            overrides(
+                "google::protobuf::Message::ByteSizeLong",
+                "src/google/protobuf/message.h"
+            ),
+            [
+                "google::protobuf::DynamicMessage::ByteSizeLong",
+                "google::protobuf::internal::ZeroFieldsBase::ByteSizeLong",
+            ],
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            overrides(
+                "google::protobuf::json_internal::ResolverPool::Message::ByteSizeLong",
+                "src/google/protobuf/json/internal/untyped_message.h"
+            ),
+            Vec::<String>::new(),
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            overrides(
+                "rocksdb::InternalIteratorBase::Next",
+                "table/internal_iterator.h"
+            ),
+            ["rocksdb::MergingIterator::Next"],
+            "{}",
+            graph.report()
+        );
+    }
+
     /// Upstream #2426's last case, which needs #2407's lookup: protobuf's
     /// `FieldDescriptor`, walked in brace scopes after an unknown attribute
     /// macro broke the tree, keeps its namespaces, and its base
@@ -23504,6 +23573,418 @@ mod synthesis {
             "method App::triggerRender",
             "callback",
             &[("via", "onUpdate")],
+        );
+    }
+
+    /// Upstream's react-render pass: in a class with a `render` method, each
+    /// sibling method calling `this.setState(…)` reaches `render`; one that
+    /// sets no state does not.
+    #[test]
+    fn w714b_a_react_state_update_reaches_render() {
+        let project = Project::new()
+            .file(
+                "src/counter.ts",
+                "export class Counter extends Component {\n  increment() {\n    this.setState({ count: 1 });\n  }\n  reset() {\n    return 0;\n  }\n  render() {\n    return null;\n  }\n  apply() {\n    setState({});\n  }\n}\n",
+            )
+            .index();
+        let graph = graph_of(&project);
+        let edge = assert_synthesized(
+            graph,
+            "method Counter::increment",
+            "method Counter::render",
+            "react-render",
+            &[("via", "setState"), ("registeredAt", "src/counter.ts:8")],
+        );
+        assert_eq!((edge.line, edge.col), (Some(2), None), "{edge:?}");
+        assert_not_synthesized(graph, "method Counter::reset", "method Counter::render");
+        assert_not_synthesized(graph, "method Counter::apply", "method Counter::render");
+
+        // A `render` that sets state is no edge to itself.
+        let project = Project::new()
+            .file(
+                "src/looping.ts",
+                "export class Looping extends Component {\n  render() {\n    this.setState({});\n    return null;\n  }\n}\n",
+            )
+            .index();
+        let graph = graph_of(&project);
+        assert_not_synthesized(graph, "method Looping::render", "method Looping::render");
+
+        // Upstream walks classes only: an interface's default methods are
+        // no component's, whatever they call.
+        let project = Project::new()
+            .file(
+                "src/app/Renderable.java",
+                "package app;\npublic interface Renderable {\n    default void render() {}\n    default void update() { this.setState(null); }\n}\n",
+            )
+            .index();
+        let graph = graph_of(&project);
+        for method in [
+            "method app::Renderable::render",
+            "method app::Renderable::update",
+        ] {
+            assert_eq!(graph.nodes_matching(method).len(), 1, "{}", graph.report());
+        }
+        assert_not_synthesized(
+            graph,
+            "method app::Renderable::update",
+            "method app::Renderable::render",
+        );
+    }
+
+    /// Upstream's flutter-build pass: in a Dart class, each sibling method
+    /// calling `setState(…)` reaches `build`; a `build` outside a `.dart`
+    /// file is no Flutter widget's, so nothing reaches it.
+    #[test]
+    fn w714b_a_flutter_state_update_reaches_build() {
+        let project = Project::new()
+            .file(
+                "lib/counter.dart",
+                "class CounterState extends State<Counter> {\n  int count = 0;\n  void increment() {\n    setState(() {\n      count++;\n    });\n  }\n  void log() {\n    print(count);\n  }\n  Widget build(BuildContext context) {\n    return Text('$count');\n  }\n}\n",
+            )
+            .file(
+                "src/builder.js",
+                "export class Builder {\n  step() {\n    setState(1);\n  }\n  build() {\n    return 1;\n  }\n}\n",
+            )
+            .index();
+        let graph = graph_of(&project);
+        assert_synthesized(
+            graph,
+            "method CounterState::increment",
+            "method CounterState::build",
+            "flutter-build",
+            &[("via", "setState"), ("registeredAt", "lib/counter.dart:11")],
+        );
+        assert_not_synthesized(
+            graph,
+            "method CounterState::log",
+            "method CounterState::build",
+        );
+        assert_not_synthesized(graph, "method Builder::step", "method Builder::build");
+    }
+
+    /// Upstream's kotlin-expect-actual pass: the `expect` declaration links
+    /// to each platform's `actual`, a class to an `actual typealias`; two
+    /// plain namesakes, neither `actual`, pair nothing.
+    #[test]
+    fn w714b_an_expect_declaration_reaches_each_actual() {
+        let project = Project::new()
+            .file(
+                "src/commonMain/kotlin/Platform.kt",
+                "package app\n\nexpect fun platformName(): String\n\nexpect class Clock {\n    fun now(): Long\n}\n\nfun helper(): Int = 1\n",
+            )
+            .file(
+                "src/jvmMain/kotlin/Platform.jvm.kt",
+                "package app\n\nactual fun platformName(): String = \"JVM\"\n\nactual typealias Clock = java.time.Clock\n\nfun helper(): Int = 2\n",
+            )
+            .file(
+                "src/iosMain/kotlin/Platform.ios.kt",
+                "package app\n\nactual fun platformName(): String = \"iOS\"\n",
+            )
+            .index();
+        let graph = graph_of(&project);
+        for (actual, line) in [
+            ("src/jvmMain/kotlin/Platform.jvm.kt", 3),
+            ("src/iosMain/kotlin/Platform.ios.kt", 3),
+        ] {
+            assert_synthesized(
+                graph,
+                "function app::platformName @src/commonMain/kotlin/Platform.kt",
+                &format!("function app::platformName @{actual}"),
+                "kotlin-expect-actual",
+                &[
+                    ("via", "platformName"),
+                    ("registeredAt", &format!("{actual}:{line}")),
+                ],
+            );
+        }
+        assert_synthesized(
+            graph,
+            "class app::Clock @src/commonMain/kotlin/Platform.kt",
+            "type_alias app::Clock @src/jvmMain/kotlin/Platform.jvm.kt",
+            "kotlin-expect-actual",
+            &[("via", "Clock")],
+        );
+        assert!(
+            graph
+                .edges
+                .iter()
+                .filter(|edge| edge.metadata.get("synthesizedBy").is_some())
+                .all(|edge| graph
+                    .node(&edge.target)
+                    .is_none_or(|target| target.name != "helper")),
+            "{}",
+            graph.report()
+        );
+        // One platform's `actual` is no declaration of another's.
+        for (from, to) in [(
+            "jvmMain/kotlin/Platform.jvm.kt",
+            "iosMain/kotlin/Platform.ios.kt",
+        )] {
+            for (a, b) in [(from, to), (to, from)] {
+                assert_not_synthesized(
+                    graph,
+                    &format!("function app::platformName @src/{a}"),
+                    &format!("function app::platformName @src/{b}"),
+                );
+            }
+        }
+
+        // An overload beside the `actual` is in its file, a class is no
+        // function's declaration, and a Java class is no Kotlin `actual`'s.
+        let project = Project::new()
+            .file(
+                "src/main/java/com/example/Foo.java",
+                "package com.example;\n\npublic class Foo {}\n",
+            )
+            .file(
+                "src/jvmMain/kotlin/com/example/Foo.kt",
+                "package com.example\n\nactual class Foo\n",
+            )
+            .file(
+                "src/commonMain/kotlin/Platform.kt",
+                "package app\n\nexpect fun platformName(): String\n\nclass Logger\n",
+            )
+            .file(
+                "src/jvmMain/kotlin/Platform.jvm.kt",
+                "package app\n\nactual fun platformName(): String = \"JVM\"\n\nfun platformName(prefix: String): String = prefix\n\nactual fun Logger(): Int = 1\n",
+            )
+            .index();
+        let graph = graph_of(&project);
+        let pairs: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.metadata["synthesizedBy"] == "kotlin-expect-actual")
+            .map(|edge| graph.describe_edge(edge))
+            .collect();
+        assert_eq!(pairs.len(), 1, "{pairs:#?}");
+        assert_synthesized(
+            graph,
+            "function app::platformName @src/commonMain/kotlin/Platform.kt",
+            "function app::platformName @src/jvmMain/kotlin/Platform.jvm.kt:3",
+            "kotlin-expect-actual",
+            &[],
+        );
+    }
+
+    /// Each re-render target, `actual` and override links at most forty
+    /// sources or targets (upstream `MAX_CALLBACKS_PER_CHANNEL`), in
+    /// upstream's order: a class's methods by their `contains` edges, an
+    /// `actual`'s declarations by file, line and id.
+    #[test]
+    fn w714b_each_structural_pass_links_at_most_forty() {
+        let mut counter = String::from("export class Counter extends Component {\n");
+        for at in 1..=41 {
+            counter.push_str(&format!(
+                "  set{at}() {{\n    this.setState({{ n: {at} }});\n  }}\n"
+            ));
+        }
+        counter.push_str("  render() {\n    return null;\n  }\n}\n");
+        let mut base = String::from("class Base {\n public:\n");
+        let mut derived =
+            String::from("#include \"base.h\"\nclass Derived : public Base {\n public:\n");
+        for at in 1..=41 {
+            base.push_str(&format!("  virtual void step{at}() {{}}\n"));
+            derived.push_str(&format!("  void step{at}() override {{}}\n"));
+        }
+        base.push_str("};\n");
+        derived.push_str("};\n");
+        let mut project = Project::new()
+            .file("src/counter.ts", &counter)
+            .file("src/base.h", &base)
+            .file("src/derived.h", &derived)
+            .file(
+                "src/jvmMain/kotlin/Name.jvm.kt",
+                "package app\n\nactual fun name(): String = \"JVM\"\n",
+            );
+        for at in 1..=41 {
+            project = project.file(
+                &format!("src/commonMain/kotlin/Name{at:02}.kt"),
+                "package app\n\nexpect fun name(): String\n",
+            );
+        }
+        let project = project.index();
+        let graph = graph_of(&project);
+        let count = |by: &str| {
+            graph
+                .edges
+                .iter()
+                .filter(|edge| edge.metadata["synthesizedBy"] == by)
+                .count()
+        };
+        assert_eq!(
+            [
+                count("react-render"),
+                count("cpp-override"),
+                count("kotlin-expect-actual")
+            ],
+            [40, 40, 40],
+            "{}",
+            graph.report()
+        );
+        // The forty-first declaration by file is the one left out.
+        assert_not_synthesized(
+            graph,
+            "function app::name @src/commonMain/kotlin/Name41.kt",
+            "function app::name @src/jvmMain/kotlin/Name.jvm.kt",
+        );
+    }
+
+    /// Upstream's override table is a `Map` by name: of a base's overloads
+    /// of one name, the last in its `contains` order (by target id) is the
+    /// one an override links from.
+    #[test]
+    fn w714b_an_override_links_from_the_last_overload_of_its_name() {
+        let project = Project::new()
+            .file(
+                "src/iterator.h",
+                "class Iterator {\n public:\n  virtual void Seek(int key) {}\n  virtual void Seek(const char* key) {}\n};\n",
+            )
+            .file(
+                "src/db_iter.h",
+                "#include \"iterator.h\"\nclass DBIter : public Iterator {\n public:\n  void Seek(int key) override {}\n};\n",
+            )
+            .index();
+        let graph = graph_of(&project);
+        let overloads = graph.nodes_matching("method Iterator::Seek");
+        assert_eq!(overloads.len(), 2, "{}", graph.report());
+        let last = overloads.iter().max_by_key(|node| &node.id).unwrap();
+        let edges: Vec<&EdgeRow> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.metadata["synthesizedBy"] == "cpp-override")
+            .collect();
+        assert_eq!(edges.len(), 1, "{}", graph.report());
+        assert_eq!(edges[0].source, last.id, "{}", graph.report());
+    }
+
+    /// Upstream's override pass walks classes only: a C++ `struct` that
+    /// derives from a base keeps its overrides unlinked, while a class
+    /// beside it is linked.
+    #[test]
+    fn w714b_a_struct_override_stays_unlinked() {
+        let project = Project::new()
+            .file(
+                "src/store.cpp",
+                "class Base {\npublic:\n    virtual int read(int key) = 0;\n};\nstruct Derived : public Base {\n    int read(int key) override { return key; }\n};\nclass Other : public Base {\npublic:\n    int read(int key) override { return key + 1; }\n};\n",
+            )
+            .index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            graph.nodes_matching("method Derived::read").len(),
+            1,
+            "{}",
+            graph.report()
+        );
+        assert_synthesized(
+            graph,
+            "method Base::read",
+            "method Other::read",
+            "cpp-override",
+            &[("via", "read"), ("registeredAt", "src/store.cpp:10")],
+        );
+        assert_not_synthesized(graph, "method Base::read", "method Derived::read");
+    }
+
+    /// Upstream's pascal-form pass: a Delphi unit references the form of its
+    /// name beside it; a form with no unit references nothing.
+    #[test]
+    fn w714b_a_delphi_unit_references_its_form() {
+        let project = Project::new()
+            .file(
+                "src/UFRMAbout.pas",
+                "unit UFRMAbout;\n\ninterface\n\nimplementation\n\n{$R *.dfm}\n\nend.\n",
+            )
+            .file(
+                "src/UFRMAbout.dfm",
+                "object FRMAbout: TFRMAbout\n  Caption = 'About'\nend\n",
+            )
+            .file(
+                "src/Orphan.dfm",
+                "object FRMOrphan: TFRMOrphan\n  Caption = 'Orphan'\nend\n",
+            )
+            .index();
+        let graph = graph_of(&project);
+        let edges: Vec<&EdgeRow> = graph
+            .edges_matching(
+                "file:src/UFRMAbout.pas",
+                "references",
+                "file:src/UFRMAbout.dfm",
+            )
+            .into_iter()
+            .filter(|edge| edge.metadata.get("synthesizedBy").is_some())
+            .collect();
+        assert_eq!(edges.len(), 1, "{}", graph.report());
+        assert_eq!(edges[0].metadata["synthesizedBy"], "pascal-form");
+        assert_eq!(edges[0].metadata["registeredAt"], "src/UFRMAbout.pas");
+        assert_eq!(
+            graph
+                .edges
+                .iter()
+                .filter(|edge| edge.metadata["synthesizedBy"] == "pascal-form")
+                .count(),
+            1,
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream's mybatis-java-xml pass: a mapper interface's method
+    /// reaches the statement of its namespace and id; with a second Java
+    /// class of the mapper's simple name, the pair is ambiguous and nothing
+    /// links.
+    #[test]
+    fn w714b_a_mapper_method_reaches_its_statement() {
+        const MAPPER: &str = "package com.example;\n\npublic interface UserMapper {\n    User findById(long id);\n}\n";
+        const XML: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE mapper PUBLIC \"-//mybatis.org//DTD Mapper 3.0//EN\" \"http://mybatis.org/dtd/mybatis-3-mapper.dtd\">\n<mapper namespace=\"com.example.UserMapper\">\n  <select id=\"findById\" resultType=\"User\">\n    SELECT * FROM users WHERE id = #{id}\n  </select>\n</mapper>\n";
+        let project = Project::new()
+            .file("src/main/java/com/example/UserMapper.java", MAPPER)
+            .file("src/main/resources/mapper/UserMapper.xml", XML)
+            .index();
+        let graph = graph_of(&project);
+        let linked: Vec<&EdgeRow> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.metadata["synthesizedBy"] == "mybatis-java-xml")
+            .collect();
+        assert_eq!(linked.len(), 1, "{}", graph.report());
+        let (source, target) = (
+            graph.node(&linked[0].source).unwrap(),
+            graph.node(&linked[0].target).unwrap(),
+        );
+        assert_eq!(
+            (
+                source.name.as_str(),
+                source.language.as_str(),
+                target.language.as_str()
+            ),
+            ("findById", "java", "xml"),
+            "{}",
+            graph.report()
+        );
+        assert_eq!(linked[0].metadata["via"], "UserMapper.findById");
+        assert_eq!(
+            linked[0].metadata["registeredAt"],
+            format!(
+                "src/main/resources/mapper/UserMapper.xml:{}",
+                target.start_line
+            )
+        );
+
+        let ambiguous = Project::new()
+            .file("src/main/java/com/example/UserMapper.java", MAPPER)
+            .file(
+                "src/main/java/com/other/UserMapper.java",
+                "package com.other;\n\npublic class UserMapper {\n    public User findById(long id) {\n        return null;\n    }\n}\n",
+            )
+            .file("src/main/resources/mapper/UserMapper.xml", XML)
+            .index();
+        assert!(
+            graph_of(&ambiguous)
+                .edges
+                .iter()
+                .all(|edge| edge.metadata["synthesizedBy"] != "mybatis-java-xml"),
+            "{}",
+            graph_of(&ambiguous).report()
         );
     }
 }

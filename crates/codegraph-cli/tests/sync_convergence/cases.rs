@@ -15991,3 +15991,116 @@ pub fn swift_closure_collection_keeps_its_field_after_an_edit() -> Case {
             "handlers",
         )
 }
+
+const SYNTH_COUNTER: &str = "export class Counter extends Component {\n  increment() {\n    this.setState({ count: 1 });\n  }\n  render() {\n    return null;\n  }\n}\n";
+const SYNTH_EXPECT: &str = "package app\n\nexpect fun platformName(): String\n";
+const SYNTH_MAPPER: &str =
+    "package com.example;\n\npublic interface UserMapper {\n    User findById(long id);\n}\n";
+const SYNTH_MAPPER_XML: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE mapper PUBLIC \"-//mybatis.org//DTD Mapper 3.0//EN\" \"http://mybatis.org/dtd/mybatis-3-mapper.dtd\">\n<mapper namespace=\"com.example.UserMapper\">\n  <select id=\"findById\" resultType=\"User\">\n    SELECT * FROM users WHERE id = #{id}\n  </select>\n</mapper>\n";
+
+/// W7-14b: a React class method stops setting state; its re-render edge to
+/// `render` goes.
+pub fn typescript_react_state_update_goes() -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript])
+        .file("src/counter.ts", SYNTH_COUNTER)
+        .write(
+            "src/counter.ts",
+            "export class Counter extends Component {\n  increment() {\n    return 1;\n  }\n  render() {\n    return null;\n  }\n}\n",
+        )
+        .edge_before("method Counter::increment", "calls", "method Counter::render")
+        .no_edge_after("method Counter::increment", "calls", "method Counter::render")
+}
+
+/// W7-14b: one platform's `actual` file goes; the `expect` declaration keeps
+/// its edge to the other platform's.
+pub fn kotlin_actual_file_deleted() -> Case {
+    Case::new(Change::DeleteImportedModule, &[Language::Kotlin])
+        .file("src/commonMain/kotlin/Platform.kt", SYNTH_EXPECT)
+        .file(
+            "src/jvmMain/kotlin/Platform.jvm.kt",
+            "package app\n\nactual fun platformName(): String = \"JVM\"\n",
+        )
+        .file(
+            "src/iosMain/kotlin/Platform.ios.kt",
+            "package app\n\nactual fun platformName(): String = \"iOS\"\n",
+        )
+        .remove("src/jvmMain/kotlin/Platform.jvm.kt")
+        .edge_before(
+            "function app::platformName @src/commonMain/kotlin/Platform.kt",
+            "calls",
+            "function app::platformName @src/jvmMain/kotlin/Platform.jvm.kt",
+        )
+        .edge_metadata_after(
+            (
+                "function app::platformName @src/commonMain/kotlin/Platform.kt",
+                "calls",
+                "function app::platformName @src/iosMain/kotlin/Platform.ios.kt",
+            ),
+            "synthesizedBy",
+            "kotlin-expect-actual",
+        )
+}
+
+/// W7-14b: a C++ subclass renames its override; the base method no longer
+/// reaches it.
+pub fn cpp_override_renamed() -> Case {
+    Case::new(Change::RenameSymbol, &[Language::Cpp])
+        .file(
+            "include/iterator.h",
+            "class Iterator {\n public:\n  virtual void Next() = 0;\n};\n",
+        )
+        .file(
+            "src/db_iter.cc",
+            "#include \"iterator.h\"\nclass DBIter : public Iterator {\n public:\n  void Next() override {}\n};\n",
+        )
+        .write(
+            "src/db_iter.cc",
+            "#include \"iterator.h\"\nclass DBIter : public Iterator {\n public:\n  void Advance() {}\n};\n",
+        )
+        .edge_before("method Iterator::Next", "calls", "method DBIter::Next")
+        .no_edge_after("method Iterator::Next", "calls", "method DBIter::Advance")
+}
+
+/// W7-14b: a Delphi unit's form appears beside it; the unit references it.
+pub fn pascal_form_appears() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Pascal])
+        .file(
+            "src/UFRMAbout.pas",
+            "unit UFRMAbout;\n\ninterface\n\nimplementation\n\n{$R *.dfm}\n\nend.\n",
+        )
+        .write(
+            "src/UFRMAbout.dfm",
+            "object FRMAbout: TFRMAbout\n  Caption = 'About'\nend\n",
+        )
+        .edge_metadata_after(
+            (
+                "file:src/UFRMAbout.pas",
+                "references",
+                "file:src/UFRMAbout.dfm",
+            ),
+            "synthesizedBy",
+            "pascal-form",
+        )
+}
+
+/// W7-14b: a second Java class of a mapper's simple name appears; the
+/// statement's mapper method is ambiguous and the edge goes.
+pub fn java_mybatis_mapper_gains_a_namesake() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Java, Language::Xml])
+        .file("src/main/java/com/example/UserMapper.java", SYNTH_MAPPER)
+        .file("src/main/resources/mapper/UserMapper.xml", SYNTH_MAPPER_XML)
+        .write(
+            "src/main/java/com/other/UserMapper.java",
+            "package com.other;\n\npublic class UserMapper {\n    public User findById(long id) {\n        return null;\n    }\n}\n",
+        )
+        .edge_before(
+            "method com.example::UserMapper::findById",
+            "calls",
+            "method com.example.UserMapper::findById",
+        )
+        .no_edge_after(
+            "method com.example::UserMapper::findById",
+            "calls",
+            "method com.example.UserMapper::findById",
+        )
+}

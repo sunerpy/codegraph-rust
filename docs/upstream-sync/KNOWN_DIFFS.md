@@ -67,13 +67,17 @@ colby behaviors are intentionally NOT ported in v1:
   attributes and return values, not calls, so they draw no `navigates` edge
   here; the routers bind navigation calls only.
 - **Dynamic-dispatch synthesis passes** — of `SYNTH_PASSES`
-  (`callback-synthesizer.ts`), the field, closure-collection and emitter
-  passes are ported (`crates/codegraph-resolve/src/synthesis/`); the others
-  and the Go prerequisites (`go-method-contains`, `go-implements`) draw no
-  edge here yet. The ported passes and the merge keep `b635dd46`'s view of
-  Jest/Vitest manual mocks: #2790's skip of a `__mocks__/` handler for
-  production code is a PORT row of the 2026-10-22 audit, left with the rest
-  of that row to the next round.
+  (`callback-synthesizer.ts`), the field, closure-collection, emitter,
+  render, Pascal form, Flutter, C++ override, Kotlin expect/actual and
+  MyBatis passes are ported (`crates/codegraph-resolve/src/synthesis/`); the
+  others and the Go prerequisites (`go-method-contains`, `go-implements`)
+  draw no edge here yet. The ported passes and the merge keep `b635dd46`'s
+  view of Jest/Vitest manual mocks: #2790's skip of a `__mocks__/` handler
+  for production code is a PORT row of the 2026-10-22 audit, left with the
+  rest of that row to the next round. The C++ override pass is `b635dd46`'s
+  too: #2609's skip of a member template's explicit specialization, which
+  shares the template's name, is a PORT row of the same audit, left with its
+  extraction half.
 - **Razor `@using` cascade resolution** — `resolveRazorUsing` / `getRazorUsings`
   (`index.ts:1116-1158`), tied to the Razor framework layer.
 

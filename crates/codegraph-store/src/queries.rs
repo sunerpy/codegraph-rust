@@ -231,6 +231,22 @@ impl Store {
         query_nodes(&self.conn, &sql, rusqlite::params_from_iter(values))
     }
 
+    /// The `language` nodes whose decorator list may hold `decorator`: its
+    /// JSON text contains the quoted name, a superset the caller narrows by
+    /// the exact list (upstream `iterateNodesByLanguageWithDecorator`, W7-14).
+    /// Unordered.
+    pub fn nodes_with_decorator(
+        &self,
+        language: Language,
+        decorator: &str,
+    ) -> rusqlite::Result<Vec<Node>> {
+        query_nodes(
+            &self.conn,
+            "SELECT * FROM nodes WHERE language = ?1 AND decorators LIKE '%' || ?2 || '%'",
+            rusqlite::params![language.as_str(), format!("\"{decorator}\"")],
+        )
+    }
+
     /// Whether a function or method has the qualified name `qualified`
     /// (W5-08): the qualified-name index's rows, none of them read.
     pub fn has_callable_named(&self, qualified: &str) -> rusqlite::Result<bool> {
@@ -850,6 +866,22 @@ impl Store {
             .conn
             .prepare("SELECT path FROM files WHERE language = ?1 ORDER BY path")?;
         let rows = stmt.query_map([language.as_str()], |row| row.get(0))?;
+        rows.collect()
+    }
+
+    /// Every file's path, in path order (upstream `getAllFilePaths`): the
+    /// synthesis stage's Delphi form pass needs no other column.
+    pub fn file_paths(&self) -> rusqlite::Result<Vec<String>> {
+        let mut stmt = self.conn.prepare("SELECT path FROM files ORDER BY path")?;
+        let rows = stmt.query_map([], |row| row.get(0))?;
+        rows.collect()
+    }
+
+    /// The distinct languages of the files (upstream
+    /// `getDistinctFileLanguages`), which gate the synthesis passes.
+    pub fn file_languages(&self) -> rusqlite::Result<Vec<Language>> {
+        let mut stmt = self.conn.prepare("SELECT DISTINCT language FROM files")?;
+        let rows = stmt.query_map([], |row| parse_language(row.get::<_, String>(0)?))?;
         rows.collect()
     }
 
@@ -4730,6 +4762,27 @@ mod tests {
         assert_eq!(store.file_by_path("src/a.rs").unwrap(), None);
         assert_eq!(store.node_count_by_file_path("src/a.rs").unwrap(), 0);
         assert_eq!(store.all_files().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn file_paths_and_languages_read_one_column_each() {
+        let store = store("files-paths-languages");
+        for (path, language) in [
+            ("src/b.py", Language::Python),
+            ("src/a.rs", Language::Rust),
+            ("src/c.rs", Language::Rust),
+        ] {
+            let mut rec = file(path);
+            rec.language = language;
+            store.upsert_file(&rec).unwrap();
+        }
+        assert_eq!(
+            store.file_paths().unwrap(),
+            ["src/a.rs", "src/b.py", "src/c.rs"]
+        );
+        let mut languages = store.file_languages().unwrap();
+        languages.sort_by_key(|language| language.as_str());
+        assert_eq!(languages, [Language::Python, Language::Rust]);
     }
 
     #[test]

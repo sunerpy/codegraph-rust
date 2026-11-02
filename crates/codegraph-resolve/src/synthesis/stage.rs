@@ -16,7 +16,7 @@ use codegraph_core::types::{Edge, EdgeKind, Language, Node, NodeKind, Unresolved
 use codegraph_store::Store;
 use codegraph_store::queries::ReferenceSite;
 
-use super::{callback, is_synthesized};
+use super::{callback, dispatch, is_synthesized};
 
 /// What one run of the stage did.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -33,12 +33,50 @@ pub struct StageStats {
 /// A pass: the edges it synthesizes over the view, in its own order.
 type Pass = fn(&View<'_>) -> Result<Vec<Edge>>;
 
+/// Whether a pass can find anything in a project of these file languages
+/// (upstream's `gate`): a pass it closes is provably empty, so it is
+/// skipped without changing the output.
+type Gate = fn(&HashSet<Language>) -> bool;
+
+fn always(_: &HashSet<Language>) -> bool {
+    true
+}
+
 /// The ported passes in upstream `SYNTH_PASSES` order, which is the merge
 /// order: the first pass to emit a `source>target` pair keeps it.
-const PASSES: &[(&str, Pass)] = &[
-    ("fieldEdges", callback::field_edges),
-    ("closureCollEdges", callback::closure_collection_edges),
-    ("emitterEdges", callback::event_emitter_edges),
+const PASSES: &[(&str, Gate, Pass)] = &[
+    ("fieldEdges", always, callback::field_edges),
+    (
+        "closureCollEdges",
+        always,
+        callback::closure_collection_edges,
+    ),
+    ("emitterEdges", always, callback::event_emitter_edges),
+    ("renderEdges", always, dispatch::react_render_edges),
+    ("pascalEdges", always, dispatch::pascal_form_edges),
+    (
+        "flutterEdges",
+        |languages| languages.contains(&Language::Dart),
+        dispatch::flutter_build_edges,
+    ),
+    (
+        "cppEdges",
+        |languages| languages.contains(&Language::Cpp),
+        dispatch::cpp_override_edges,
+    ),
+    (
+        "kotlinExpectActual",
+        |languages| languages.contains(&Language::Kotlin),
+        dispatch::kotlin_expect_actual_edges,
+    ),
+    (
+        "mybatisEdges",
+        |languages| {
+            (languages.contains(&Language::Java) || languages.contains(&Language::Kotlin))
+                && languages.contains(&Language::Xml)
+        },
+        dispatch::mybatis_edges,
+    ),
 ];
 
 /// Compute every synthesized edge over `store`'s base graph and replace the
@@ -57,9 +95,12 @@ pub fn run_stage(store: &mut Store, project_root: &Path, max_file_size: u64) -> 
 /// registry order, sorted.
 pub fn synthesize(store: &Store, project_root: &Path, max_file_size: u64) -> Result<Vec<Edge>> {
     let view = View::new(store, project_root, max_file_size);
+    let languages = view.file_languages()?;
     let mut passes = Vec::with_capacity(PASSES.len());
-    for (_, pass) in PASSES {
-        passes.push(pass(&view)?);
+    for (_, gate, pass) in PASSES {
+        if gate(&languages) {
+            passes.push(pass(&view)?);
+        }
     }
     Ok(merge(passes))
 }
@@ -93,7 +134,7 @@ fn edge_order(a: &Edge, b: &Edge) -> Ordering {
 
 /// The order upstream's node lookups return (`ORDER BY file_path,
 /// start_line, id`), which a pass's caps and first matches follow.
-fn node_order(a: &Node, b: &Node) -> Ordering {
+pub(super) fn node_order(a: &Node, b: &Node) -> Ordering {
     (&a.file_path, a.start_line, &a.id).cmp(&(&b.file_path, b.start_line, &b.id))
 }
 
@@ -171,8 +212,44 @@ impl<'a> View<'a> {
         Ok(edges)
     }
 
+    /// Every base edge of `kind`, and the overlay's.
+    pub(super) fn edges_of_kind(&self, kind: EdgeKind) -> Result<Vec<Edge>> {
+        let mut edges: Vec<Edge> = self
+            .store
+            .edges_by_kind(kind)?
+            .into_iter()
+            .filter(|edge| !is_synthesized(edge))
+            .collect();
+        edges.extend(
+            self.overlay
+                .iter()
+                .filter(|edge| edge.kind == kind)
+                .cloned(),
+        );
+        Ok(edges)
+    }
+
     pub(super) fn node(&self, id: &str) -> Result<Option<Node>> {
         Ok(self.store.node_by_id(id)?)
+    }
+
+    /// The nodes whose qualified name is `qualified`, in [`node_order`].
+    pub(super) fn nodes_qualified(&self, qualified: &str) -> Result<Vec<Node>> {
+        let mut nodes = self.store.nodes_by_qualified_name(qualified)?;
+        nodes.sort_by(node_order);
+        Ok(nodes)
+    }
+
+    /// The `language` nodes whose decorators may hold `decorator` (see
+    /// [`Store::nodes_with_decorator`]), in [`node_order`].
+    pub(super) fn nodes_with_decorator(
+        &self,
+        language: Language,
+        decorator: &str,
+    ) -> Result<Vec<Node>> {
+        let mut nodes = self.store.nodes_with_decorator(language, decorator)?;
+        nodes.sort_by(node_order);
+        Ok(nodes)
     }
 
     /// The nodes of `file`, by line and id (upstream `getNodesByFile`).
@@ -210,14 +287,15 @@ impl<'a> View<'a> {
         Ok(nodes)
     }
 
-    /// Every indexed file, by path.
+    /// The languages of the indexed files (upstream
+    /// `getDistinctFileLanguages`).
+    fn file_languages(&self) -> Result<HashSet<Language>> {
+        Ok(self.store.file_languages()?.into_iter().collect())
+    }
+
+    /// Every indexed file, by path (upstream `getAllFilePaths`).
     pub(super) fn files(&self) -> Result<Vec<String>> {
-        let mut files: Vec<String> = self
-            .store
-            .all_files()?
-            .into_iter()
-            .map(|file| file.path)
-            .collect();
+        let mut files = self.store.file_paths()?;
         files.sort();
         Ok(files)
     }

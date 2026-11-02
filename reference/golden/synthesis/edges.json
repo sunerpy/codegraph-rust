@@ -235,6 +235,32 @@
   {
     "col": null,
     "kind": "calls",
+    "line": 3,
+    "metadata": {
+      "registeredAt": "kotlin/jvm/src/Platform.kt:3",
+      "synthesizedBy": "kotlin-expect-actual",
+      "via": "platformName"
+    },
+    "provenance": "heuristic",
+    "source": "function:f72ae9f0f4692acfbc9fbbec49b8fe90",
+    "target": "function:8d2b7c79a380ef6a7161fb9ed9f100e6"
+  },
+  {
+    "col": null,
+    "kind": "calls",
+    "line": 4,
+    "metadata": {
+      "registeredAt": "mybatis/src/main/resources/mapper/UserMapper.xml:4",
+      "synthesizedBy": "mybatis-java-xml",
+      "via": "UserMapper.findName"
+    },
+    "provenance": "heuristic",
+    "source": "method:23b52db61e3c123c60850cc118b75515",
+    "target": "method:fc57b8ff353cc43701ceb2c71ac647fd"
+  },
+  {
+    "col": null,
+    "kind": "calls",
     "line": null,
     "metadata": {
       "event": "saved",
