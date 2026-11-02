@@ -7040,6 +7040,17 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
                             self.push_ref(class_id, &name, EdgeKind::Extends, target);
                         }
                     }
+                } else if let Some(types) = type_list(child) {
+                    // Java's `interface I extends A, B` wraps them in a
+                    // `type_list` (upstream `tree-sitter.ts`): one each.
+                    for target in types.named_children(&mut types.walk()) {
+                        self.push_ref(
+                            class_id,
+                            &node_text(target, self.source),
+                            EdgeKind::Extends,
+                            target,
+                        );
+                    }
                 } else if let Some(target) = child.named_child(0) {
                     self.push_ref(
                         class_id,
@@ -7050,7 +7061,9 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
                 }
             }
             if matches!(child.kind(), "implements_clause" | "super_interfaces") {
-                for iface in child.named_children(&mut child.walk()) {
+                // Java's `implements A, B` is a `type_list`, read type by type.
+                let list = type_list(child).unwrap_or(child);
+                for iface in list.named_children(&mut list.walk()) {
                     self.push_ref(
                         class_id,
                         &node_text(iface, self.source),
@@ -8223,6 +8236,14 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             self.push_ref(&from_id, component, EdgeKind::References, tag);
         }
     }
+}
+
+/// The `type_list` a heritage clause wraps its types in (tree-sitter-java's
+/// `super_interfaces` and `extends_interfaces`), when it has one.
+fn type_list(clause: SyntaxNode<'_>) -> Option<SyntaxNode<'_>> {
+    clause
+        .named_children(&mut clause.walk())
+        .find(|child| child.kind() == "type_list")
 }
 
 fn strip_erlang_arity(name: &str) -> &str {
@@ -10703,6 +10724,31 @@ class Widget extends Base implements Named {
         let (_, refs) = run("W.java", src, Language::Java);
         assert!(has_ref(&refs, EdgeKind::Extends, "Base"));
         assert!(has_ref(&refs, EdgeKind::Implements, "Named"));
+    }
+
+    /// tree-sitter-java wraps a class's interfaces and an interface's
+    /// parents in a `type_list`: each type is its own reference, at its own
+    /// place (upstream `tree-sitter.ts`), never the list as one name.
+    #[test]
+    fn java_heritage_lists_read_each_type() {
+        let src = "interface Repo {}\ninterface Store {}\nclass JpaRepo extends Base implements Repo, Store {}\ninterface Combined extends Repo, Store {}\nclass One implements Repo {}\n";
+        let (_, refs) = run("J.java", src, Language::Java);
+        let heritage: Vec<(EdgeKind, &str, i64, i64)> = refs
+            .iter()
+            .filter(|r| matches!(r.reference_kind, EdgeKind::Extends | EdgeKind::Implements))
+            .map(|r| (r.reference_kind, r.reference_name.as_str(), r.line, r.col))
+            .collect();
+        assert_eq!(
+            heritage,
+            [
+                (EdgeKind::Extends, "Base", 3, 22),
+                (EdgeKind::Implements, "Repo", 3, 38),
+                (EdgeKind::Implements, "Store", 3, 44),
+                (EdgeKind::Extends, "Repo", 4, 27),
+                (EdgeKind::Extends, "Store", 4, 33),
+                (EdgeKind::Implements, "Repo", 5, 21),
+            ]
+        );
     }
 
     #[test]

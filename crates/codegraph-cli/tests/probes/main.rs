@@ -7005,6 +7005,69 @@ class basic_json
 mod java {
     use super::support::{Graph, Project};
 
+    /// tree-sitter-java wraps several supertypes in a `type_list`: a class
+    /// implementing two interfaces and an interface extending two get an
+    /// edge to each (upstream reads the list type by type), and no
+    /// reference is named after the whole list.
+    #[test]
+    fn a_heritage_list_resolves_each_type() {
+        let project = Project::new()
+            .file(
+                "src/app/Repo.java",
+                "package app;\n\npublic interface Repo {\n    void save();\n}\n",
+            )
+            .file(
+                "src/app/Store.java",
+                "package app;\n\npublic interface Store {\n    void load();\n}\n",
+            )
+            .file(
+                "src/app/JpaRepo.java",
+                "package app;\n\npublic class JpaRepo implements Repo, Store {\n    public void save() { }\n    public void load() { }\n}\n",
+            )
+            .file(
+                "src/app/Combined.java",
+                "package app;\n\npublic interface Combined extends Repo, Store {\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        let supertypes = |source: &str, kind: &str| -> Vec<String> {
+            let mut out: Vec<String> = graph
+                .edges
+                .iter()
+                .filter(|edge| edge.kind == kind)
+                .filter(|edge| {
+                    graph
+                        .node(&edge.source)
+                        .is_some_and(|node| node.qualified_name == source)
+                })
+                .filter_map(|edge| graph.node(&edge.target))
+                .map(|node| node.qualified_name.clone())
+                .collect();
+            out.sort();
+            out
+        };
+        assert_eq!(
+            supertypes("app::JpaRepo", "implements"),
+            ["app::Repo", "app::Store"],
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            supertypes("app::Combined", "extends"),
+            ["app::Repo", "app::Store"],
+            "{}",
+            graph.report()
+        );
+        assert!(
+            graph
+                .unresolved
+                .iter()
+                .all(|reference| !reference.reference_name.contains(',')),
+            "{}",
+            graph.report()
+        );
+    }
+
     /// `qualified` of every method of `file`, sorted.
     fn methods_in(graph: &Graph, file: &str) -> Vec<String> {
         let mut out: Vec<String> = graph

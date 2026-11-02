@@ -989,6 +989,7 @@ matrix! {
     cpp_lowercase_macro_class_body_edit,
     c_auto_local_initializer_call_body_edit,
     java_subclass_gains_a_base_its_caller_reaches,
+    java_class_gains_a_second_interface,
     typescript_dollar_import_reaches_an_added_module,
     typescript_dollar_default_export_names_another_declaration,
     java_super_call_in_an_override_body_edit,

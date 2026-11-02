@@ -2797,6 +2797,31 @@ pub fn java_subclass_gains_a_base_its_caller_reaches() -> Case {
         .edge_after("method app::Use::go", "calls", "method app::Base::run")
 }
 
+/// A Java class gains a second interface: `implements Repo, Store` is a
+/// `type_list` read type by type, so both resolve, as on a fresh index.
+pub fn java_class_gains_a_second_interface() -> Case {
+    Case::new(Change::EditHeritage, &[Language::Java])
+        .file(
+            "src/app/Repo.java",
+            "package app;\n\npublic interface Repo {\n    void save();\n}\n",
+        )
+        .file(
+            "src/app/Store.java",
+            "package app;\n\npublic interface Store {\n    void load();\n}\n",
+        )
+        .file(
+            "src/app/JpaRepo.java",
+            "package app;\n\npublic class JpaRepo implements Repo {\n    public void save() { }\n    public void load() { }\n}\n",
+        )
+        .write(
+            "src/app/JpaRepo.java",
+            "package app;\n\npublic class JpaRepo implements Repo, Store {\n    public void save() { }\n    public void load() { }\n}\n",
+        )
+        .edge_before("class app::JpaRepo", "implements", "interface app::Repo")
+        .edge_after("class app::JpaRepo", "implements", "interface app::Repo")
+        .edge_after("class app::JpaRepo", "implements", "interface app::Store")
+}
+
 /// Upstream #2172: a bare Kotlin call reaches a member of what the class
 /// around it inherits, read from the declarations' heads by name, so a base
 /// changed in another file moves the call of an unchanged subclass, as on a
