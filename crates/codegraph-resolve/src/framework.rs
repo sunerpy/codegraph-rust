@@ -189,8 +189,9 @@ pub trait FrameworkResolver: Sync {
     /// parked while its route was missing, or bound to the best route then,
     /// is invisible to a sync's retry by name tail; this says which calls a
     /// changed route may answer, so a sync can put them back. `None` when the
-    /// resolver binds no navigation. Next.js and Expo Router answer it; no
-    /// sync calls it yet.
+    /// resolver binds no navigation. Every router resolver (Next.js, Expo
+    /// Router, React Router, TanStack Router, Vue Router, SvelteKit, Angular
+    /// Router) answers it; no sync calls it yet.
     fn navigation(&self) -> Option<&dyn NavigationCalls> {
         None
     }
