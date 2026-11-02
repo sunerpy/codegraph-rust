@@ -462,13 +462,12 @@ listed.
   `synthesis_inputs` table is never written, so #2565's and #2688's filter
   of its rows has nothing to filter (`synthesis/mod.rs`,
   `codegraph-watch/src/sync.rs`).
-- **The order a pass walks, and the handler a name means (W7-14).** Each
-  pass walks its candidates by file, line, column and id, and a cap
-  (`MAX_CALLBACKS_PER_CHANNEL`) cuts by that order; an emitter handler named
-  `h` is the one function or method `h` of the registering file, else the one
-  of the project, and nothing when either has several. colby walks SQL row
-  order, which a sync changes, and takes the first row of `getNodesByName`
-  (`synthesis/stage.rs`, `synthesis/callback.rs`).
+- **The handler a name means (W7-14).** An emitter handler named `h` is the
+  one function or method `h` of the registering file, else the one of the
+  project, and nothing when either has several: an ambiguous name stays
+  unresolved. colby takes the first of `getNodesByName`, the one of the file
+  first by path. The passes otherwise walk colby's orders (`synthesis/stage.rs`,
+  `synthesis/callback.rs`).
 - **A file that drifted since it was indexed (W7-14).** The stage reads a
   file only while its size and modification time, or its content hash, are
   the ones its file row records, the MCP engine's freshness probe; a drifted

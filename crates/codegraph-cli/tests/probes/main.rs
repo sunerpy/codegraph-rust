@@ -23108,6 +23108,47 @@ mod synthesis {
         );
     }
 
+    /// The forty registrations a channel links are its first forty incoming
+    /// calls in upstream's order, by caller id, line and column: with one
+    /// registration in each of forty-one callers, the callback of the caller
+    /// whose id sorts last stays unlinked.
+    #[test]
+    fn w714_field_observer_caps_by_caller_id() {
+        let mut app = String::from(
+            "import { Scene } from './scene';\nexport class App {\n  scene = new Scene();\n",
+        );
+        for at in 1..=41 {
+            app.push_str(&format!(
+                "  wire{at}() {{\n    this.scene.onUpdate(this.cb{at});\n  }}\n"
+            ));
+        }
+        for at in 1..=41 {
+            app.push_str(&format!("  cb{at}() {{\n    return {at};\n  }}\n"));
+        }
+        app.push_str("}\n");
+        let project = Project::new()
+            .file("src/scene.ts", SCENE)
+            .file("src/app.ts", &app)
+            .index();
+        let graph = graph_of(&project);
+        let caller = |at: usize| {
+            graph.nodes_named("method", &format!("wire{at}"))[0]
+                .id
+                .clone()
+        };
+        let last = (1..=41).max_by_key(|&at| caller(at)).unwrap();
+        assert_ne!(last, 41, "the id order must differ from the line order");
+        for at in 1..=41 {
+            let linked = !synthesized(
+                graph,
+                "method Scene::triggerUpdate",
+                &format!("method App::cb{at}"),
+            )
+            .is_empty();
+            assert_eq!(linked, at != last, "cb{at}:\n{}", graph.report());
+        }
+    }
+
     /// A channel pairs a registrar and a dispatcher of one file: a loop over
     /// a same-named field in another file is no dispatcher of it.
     #[test]
@@ -23383,7 +23424,8 @@ mod synthesis {
 
     /// KEEP-RUST: a handler name means the one function of that name in the
     /// registering file, else the one in the project; two of them, in
-    /// neither, mean nothing (upstream takes whichever row comes first).
+    /// neither, mean nothing (upstream takes the one of the first file by
+    /// path).
     #[test]
     fn w714_emitter_handler_name_must_be_unique() {
         let project = Project::new()

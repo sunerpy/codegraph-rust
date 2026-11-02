@@ -130,24 +130,18 @@ pub(super) fn field_edges(view: &View<'_>) -> Result<Vec<Edge>> {
             r"{}\s*\(\s*(this\.[A-Za-z0-9_]+|[A-Za-z0-9_]+)\s*[,)]",
             regex::escape(&registrar.name)
         ))?;
-        let mut registrations = Vec::new();
+        // The registrations in upstream's order: by caller id, line, column.
+        let mut added = 0;
         for call in view.edges_into(&registrar.id, EdgeKind::Calls)? {
+            if added >= MAX_CALLBACKS_PER_CHANNEL {
+                break;
+            }
             let Some(line) = call.line.filter(|&line| line > 0) else {
                 continue;
             };
             let Some(caller) = view.node(&call.source)? else {
                 continue;
             };
-            registrations.push((caller, line, call.col));
-        }
-        registrations.sort_by(|a, b| {
-            (&a.0.file_path, a.1, a.2, &a.0.id).cmp(&(&b.0.file_path, b.1, b.2, &b.0.id))
-        });
-        let mut added = 0;
-        for (caller, line, _) in registrations {
-            if added >= MAX_CALLBACKS_PER_CHANNEL {
-                break;
-            }
             let Some(text) = view.text(&caller.file_path) else {
                 continue;
             };
@@ -450,10 +444,11 @@ pub(super) fn event_emitter_edges(view: &View<'_>) -> Result<Vec<Edge>> {
     Ok(edges)
 }
 
-/// The function or method `name` means at a registration in `file`
-/// (KEEP-RUST: upstream takes the first of `getNodesByName` in row order):
-/// the one of that name in `file`, else the one in the project, nothing when
-/// either holds several.
+/// The function or method `name` means at a registration in `file`: the one
+/// of that name in `file`, else the one in the project, nothing when either
+/// holds several (KEEP-RUST: an ambiguous name stays unresolved, where
+/// upstream takes the first of `getNodesByName`, the one of the first file by
+/// path).
 fn unique_handler(view: &View<'_>, name: &str, file: &str) -> Result<Option<Node>> {
     let candidates: Vec<Node> = view
         .nodes_named(name)?

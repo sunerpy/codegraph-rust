@@ -15962,10 +15962,11 @@ pub fn javascript_emitter_handler_loses_a_competitor() -> Case {
         )
 }
 
-/// W7-14 (KEEP-RUST order): `complete` iterates both fields `feed` appends
-/// to, so the first field the pass walks names its edge. The pass walks
-/// callables by file, line and column; a sync rewrites the edited file's
-/// node rows after the others', and the edge keeps a fresh index's field.
+/// W7-14: `complete` iterates both fields `feed` appends to, so the first
+/// field the pass walks names its edge. The pass walks callables in
+/// upstream's order (the methods by file, line and id); a sync rewrites the
+/// edited file's node rows after the others', and the edge keeps a fresh
+/// index's field.
 pub fn swift_closure_collection_keeps_its_field_after_an_edit() -> Case {
     Case::new(Change::BodyEdit, &[Language::Swift])
         .file(

@@ -91,15 +91,24 @@ fn edge_order(a: &Edge, b: &Edge) -> Ordering {
     ))
 }
 
-/// The order a pass walks candidates in (KEEP-RUST): upstream walks SQL row
-/// order, which a sync changes, and its caps and first matches follow it.
-pub(super) fn node_order(a: &Node, b: &Node) -> Ordering {
-    (&a.file_path, a.start_line, a.start_column, &a.id).cmp(&(
-        &b.file_path,
-        b.start_line,
-        b.start_column,
-        &b.id,
-    ))
+/// The order upstream's node lookups return (`ORDER BY file_path,
+/// start_line, id`), which a pass's caps and first matches follow.
+fn node_order(a: &Node, b: &Node) -> Ordering {
+    (&a.file_path, a.start_line, &a.id).cmp(&(&b.file_path, b.start_line, &b.id))
+}
+
+/// Upstream's `methodAndFunctionNodes`: every method, then every function,
+/// each in [`node_order`].
+fn callable_order(a: &Node, b: &Node) -> Ordering {
+    let rank = |node: &Node| node.kind != NodeKind::Method;
+    rank(a).cmp(&rank(b)).then_with(|| node_order(a, b))
+}
+
+/// The order of upstream's edge lookups past the kind: by the other end,
+/// then line and column (`ORDER BY kind, source, line, col` into a node,
+/// `kind, target, line, col` out of one; `None` first, as SQLite's NULL).
+fn edge_end_order(end: impl Fn(&Edge) -> &str) -> impl Fn(&Edge, &Edge) -> Ordering {
+    move |a, b| (end(a), a.line, a.col).cmp(&(end(b), b.line, b.col))
 }
 
 /// What a pass reads: the base graph and the indexed files' text.
@@ -124,7 +133,8 @@ impl<'a> View<'a> {
         }
     }
 
-    /// The base edges of `kind` into `target`, and the overlay's.
+    /// The base edges of `kind` into `target`, and the overlay's, by source,
+    /// line and column.
     pub(super) fn edges_into(&self, target: &str, kind: EdgeKind) -> Result<Vec<Edge>> {
         let mut edges: Vec<Edge> = self
             .store
@@ -138,10 +148,12 @@ impl<'a> View<'a> {
                 .filter(|edge| edge.target == target && edge.kind == kind)
                 .cloned(),
         );
+        edges.sort_by(edge_end_order(|edge| &edge.source));
         Ok(edges)
     }
 
-    /// The base edges of `kind` out of `source`, and the overlay's.
+    /// The base edges of `kind` out of `source`, and the overlay's, by
+    /// target, line and column.
     pub(super) fn edges_from(&self, source: &str, kind: EdgeKind) -> Result<Vec<Edge>> {
         let mut edges: Vec<Edge> = self
             .store
@@ -155,6 +167,7 @@ impl<'a> View<'a> {
                 .filter(|edge| edge.source == source && edge.kind == kind)
                 .cloned(),
         );
+        edges.sort_by(edge_end_order(|edge| &edge.target));
         Ok(edges)
     }
 
@@ -162,12 +175,10 @@ impl<'a> View<'a> {
         Ok(self.store.node_by_id(id)?)
     }
 
-    /// The nodes of `file`, by line, column and id.
+    /// The nodes of `file`, by line and id (upstream `getNodesByFile`).
     pub(super) fn nodes_in_file(&self, file: &str) -> Result<Vec<Node>> {
         let mut nodes = self.store.nodes_by_file_path(file)?;
-        nodes.sort_by(|a, b| {
-            (a.start_line, a.start_column, &a.id).cmp(&(b.start_line, b.start_column, &b.id))
-        });
+        nodes.sort_by(|a, b| (a.start_line, &a.id).cmp(&(b.start_line, &b.id)));
         Ok(nodes)
     }
 
@@ -179,7 +190,7 @@ impl<'a> View<'a> {
     }
 
     /// The functions and methods a name pattern can match (see
-    /// [`Store::callables_named_like`]), in [`node_order`].
+    /// [`Store::callables_named_like`]): the methods, then the functions.
     pub(super) fn callables_named_like(
         &self,
         globs: &[&str],
@@ -187,14 +198,15 @@ impl<'a> View<'a> {
         names: &[&str],
     ) -> Result<Vec<Node>> {
         let mut nodes = self.store.callables_named_like(globs, likes, names)?;
-        nodes.sort_by(node_order);
+        nodes.sort_by(callable_order);
         Ok(nodes)
     }
 
-    /// The functions and methods written in `languages`, in [`node_order`].
+    /// The functions and methods written in `languages`: the methods, then
+    /// the functions.
     pub(super) fn callables_in_languages(&self, languages: &[Language]) -> Result<Vec<Node>> {
         let mut nodes = self.store.callables_in_languages(languages)?;
-        nodes.sort_by(node_order);
+        nodes.sort_by(callable_order);
         Ok(nodes)
     }
 
@@ -440,6 +452,71 @@ mod tests {
             base_end
         );
         assert!(view.edges_into("c", EdgeKind::Calls).unwrap().is_empty());
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The view returns upstream's orders: a file's nodes by line and id,
+    /// not column; callables method first, then by file, line and id; edges
+    /// by their other end, then line, whatever order the store keeps.
+    #[test]
+    fn the_view_walks_upstreams_order() {
+        let (mut store, dir) = temp_store("order");
+        let at = |id: &str, kind: NodeKind, file: &str, line: i64, column: i64| Node {
+            kind,
+            name: format!("on{}", id.to_uppercase()),
+            start_line: line,
+            end_line: line,
+            start_column: column,
+            ..function(id, file)
+        };
+        store
+            .upsert_nodes(&[
+                at("b", NodeKind::Function, "src/a.ts", 3, 0),
+                at("a", NodeKind::Function, "src/a.ts", 3, 9),
+                at("m", NodeKind::Method, "src/z.ts", 1, 0),
+                at("s1", NodeKind::Function, "src/c.ts", 1, 0),
+                at("s2", NodeKind::Function, "src/c.ts", 2, 0),
+            ])
+            .unwrap();
+        let call = |source: &str, target: &str, line: i64| Edge {
+            line: Some(line),
+            col: Some(0),
+            metadata: None,
+            provenance: None,
+            ..synthesized(source, target, "base")
+        };
+        store
+            .insert_edges(&[call("s2", "a", 1), call("s1", "b", 1), call("s1", "a", 9)])
+            .unwrap();
+        let view = View::new(&store, &dir, 1 << 20);
+        let ids =
+            |nodes: Vec<Node>| -> Vec<String> { nodes.into_iter().map(|node| node.id).collect() };
+        assert_eq!(ids(view.nodes_in_file("src/a.ts").unwrap()), ["a", "b"]);
+        assert_eq!(
+            ids(view.callables_named_like(&["on[A-Z]*"], &[], &[]).unwrap()),
+            ["m", "a", "b", "s1", "s2"]
+        );
+        let ends = |edges: Vec<Edge>| -> Vec<(String, String)> {
+            edges
+                .into_iter()
+                .map(|edge| (edge.source, edge.target))
+                .collect()
+        };
+        assert_eq!(
+            ends(view.edges_into("a", EdgeKind::Calls).unwrap()),
+            [
+                ("s1".to_string(), "a".to_string()),
+                ("s2".to_string(), "a".to_string())
+            ]
+        );
+        assert_eq!(
+            ends(view.edges_from("s1", EdgeKind::Calls).unwrap()),
+            [
+                ("s1".to_string(), "a".to_string()),
+                ("s1".to_string(), "b".to_string())
+            ]
+        );
         drop(store);
         std::fs::remove_dir_all(dir).unwrap();
     }

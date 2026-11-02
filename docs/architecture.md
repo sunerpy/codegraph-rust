@@ -257,8 +257,9 @@ and a target keeps the pair), and replaces every synthesized edge in one
 transaction, an edge whose identity a base edge holds being ignored while its
 pair stays taken. The ported passes are the field observer
 (`callback`), the Swift and Kotlin closure collection (`closure-collection`)
-and the string-keyed emitter (`event-emitter`), each walking its candidates by
-file, line, column and id. A full index and a migration run the stage after
+and the string-keyed emitter (`event-emitter`), each walking its candidates in
+upstream's order (nodes by file, line and id, edges by their other end, line
+and column). A full index and a migration run the stage after
 resolution. A sync runs it last, after the orphan sweep, whenever it changed
 the index, bootstrapped a lane, swept, or found the `synthesis_version`
 marker missing, and writes the marker as its last write; the sync's site
