@@ -3704,6 +3704,12 @@ export const router = createBrowserRouter([
             assert!(edge.also_targets.is_empty());
             assert_eq!(resolved.confidence, 0.95);
         }
+        // Only a call carries a destination: a reference of another kind at
+        // the same site navigates nowhere.
+        let mut reference = call_in(screen, "history.push", 2, 0);
+        reference.language = Language::Jsx;
+        reference.reference_kind = EdgeKind::References;
+        assert!(ReactRouterResolver.resolve(&reference, &ctx).is_none());
     }
 
     /// Upstream: a computed destination is left unresolved, a local's
@@ -3869,10 +3875,18 @@ export const router = createBrowserRouter([
         assert!(!is_destination(&route(file, 5, "settings")));
         assert!(is_destination(&renamed));
         assert!(!is_destination(&vue));
-        let ctx = RouteCtx::default().routes(file, vec![renamed.clone()]);
+        let frontend = route("frontend/src/App.js", 3, "/login");
+        let ctx = RouteCtx::default()
+            .routes(file, vec![renamed.clone()])
+            .routes("frontend/src/App.js", vec![frontend.clone()]);
         assert_eq!(
             ReactRouterNavigation.scope(&renamed, &ctx),
             Some(vec![String::new()])
+        );
+        // A route answers the calls of its own app.
+        assert_eq!(
+            ReactRouterNavigation.scope(&frontend, &ctx),
+            Some(vec!["frontend/".to_string()])
         );
         assert_eq!(ReactRouterNavigation.scope(&server, &ctx), None);
         assert_eq!(

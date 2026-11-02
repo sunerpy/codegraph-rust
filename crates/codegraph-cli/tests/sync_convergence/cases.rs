@@ -12606,6 +12606,41 @@ pub fn typescript_react_router_route_constant_renames_the_route() -> Case {
         )
 }
 
+/// W7-09b: the routes file whose route a constant names is edited, and a
+/// navigation in it names the route's path (upstream `postExtract` before
+/// resolution): the sync renames the re-extracted route before it resolves
+/// the call, as a full index does, so the call still navigates to it.
+pub fn tsx_react_router_routes_file_edit_names_its_route_before_resolving() -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript, Language::Tsx])
+        .file(
+            "package.json",
+            "{\"name\":\"web\",\"dependencies\":{\"react\":\"18\",\"react-router\":\"7\"}}\n",
+        )
+        .file(
+            "src/config/paths.ts",
+            "export const paths = {\n  app: { root: { path: '/app' } },\n} as const\n",
+        )
+        .file(
+            "src/router.tsx",
+            "import { createBrowserRouter, redirect } from 'react-router'\nimport { paths } from './config/paths'\nimport { AppRoot } from './AppRoot'\nexport const router = createBrowserRouter([\n  { path: paths.app.root.path, element: <AppRoot /> },\n])\nexport function goApp() {\n  return redirect('/app')\n}\n",
+        )
+        .file(
+            "src/AppRoot.tsx",
+            "export function AppRoot() {\n  return null\n}\n",
+        )
+        .write(
+            "src/router.tsx",
+            "import { createBrowserRouter, redirect } from 'react-router'\nimport { paths } from './config/paths'\nimport { AppRoot } from './AppRoot'\nexport const router = createBrowserRouter([\n  { path: paths.app.root.path, element: <AppRoot /> },\n])\nexport function goApp() {\n  console.log('leaving')\n  return redirect('/app')\n}\n",
+        )
+        .named_before("route", "/app")
+        .named_after("route", "/app")
+        .edge_throughout(
+            "function goApp",
+            "navigates",
+            "route src/router.tsx::route:/{paths.app.root.path}",
+        )
+}
+
 /// W7-09b: the page a lazy route's barrel imports appears (upstream
 /// `react-router-barrel-imports.test.ts`, sync): the parked `lazy-import:`
 /// reference waits under its path's last segment, which the new page's

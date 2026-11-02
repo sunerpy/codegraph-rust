@@ -2473,3 +2473,73 @@ fn status_reports_a_current_index_under_the_tombstone() {
     let json: serde_json::Value = serde_json::from_str(&status.stdout).expect("status JSON");
     assert_eq!(json["initialized"], true, "{}", status.stdout);
 }
+
+/// W7-09b: a migration names a route a constant spells before it resolves
+/// the navigation calls, as `index --force` does (upstream `postExtract`
+/// before resolution), so a call to the route's path navigates to it after
+/// the upgrade.
+#[test]
+fn outdated_migration_names_constant_routes_before_resolving_navigation() {
+    let dir = TestDir::new("outdated-react-router-constant-route");
+    let project = dir.path().join("web");
+    for (path, contents) in [
+        (
+            "package.json",
+            "{\"name\":\"web\",\"dependencies\":{\"react\":\"18\",\"react-router\":\"7\"}}\n",
+        ),
+        (
+            "src/config/paths.ts",
+            "export const paths = {\n  app: { root: { path: '/app' } },\n} as const\n",
+        ),
+        (
+            "src/router.tsx",
+            "import { createBrowserRouter, redirect } from 'react-router'\nimport { paths } from './config/paths'\nimport { AppRoot } from './AppRoot'\nexport const router = createBrowserRouter([\n  { path: paths.app.root.path, element: <AppRoot /> },\n])\nexport function goApp() {\n  return redirect('/app')\n}\n",
+        ),
+        (
+            "src/AppRoot.tsx",
+            "export function AppRoot() {\n  return null\n}\n",
+        ),
+    ] {
+        let full = project.join(path);
+        fs::create_dir_all(full.parent().unwrap()).expect("create the source directory");
+        fs::write(full, contents).expect("write a source file");
+    }
+    let run = cli(&["init", project.to_str().unwrap()]);
+    assert!(
+        run.ok,
+        "setup: `codegraph init` must succeed (stdout={}, stderr={})",
+        run.stdout, run.stderr
+    );
+    let paths = IndexPaths::resolve(&project, None).expect("resolve v2 paths");
+    stage_state_slot(
+        &paths,
+        100,
+        CURRENT_STORAGE_PROTOCOL,
+        CURRENT_EXTRACTION_VERSION - 1,
+        "current",
+    );
+    let run = cli(&["sync", project.to_str().unwrap()]);
+    assert!(
+        run.ok,
+        "sync must migrate an Outdated namespace: stdout={}, stderr={}",
+        run.stdout, run.stderr
+    );
+    let migrated = canonicalize_db(&paths.current_db()).expect("canonicalize migrated db");
+    assert!(
+        migrated
+            .edges
+            .iter()
+            .any(|edge| edge.get("kind").and_then(|kind| kind.as_str()) == Some("navigates")),
+        "the migrated index must hold the call's navigates edge: {:?}",
+        migrated.edges
+    );
+    let (_scratch, peer) = fresh_force_peer("outdated-react-router-constant-route", &project);
+    let rebuilt = canonicalize_db(
+        &IndexPaths::resolve(&peer, None)
+            .expect("resolve peer v2 paths")
+            .current_db(),
+    )
+    .expect("canonicalize peer db");
+    diff_canonical(&rebuilt, &migrated, None)
+        .expect("a forced migration must equal a fresh v2 `index --force`");
+}

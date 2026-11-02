@@ -1497,6 +1497,7 @@ matrix! {
     typescript_react_router_navigation_call_names_another_route,
     typescript_react_router_dependency_appears_in_package_json,
     typescript_react_router_route_constant_renames_the_route,
+    tsx_react_router_routes_file_edit_names_its_route_before_resolving,
     tsx_react_router_lazy_barrel_page_appears,
     tsx_react_router_lazy_page_default_export_moves,
     tsx_react_router_lazy_page_body_edit_keeps_its_route,
