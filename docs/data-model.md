@@ -107,7 +107,11 @@ A synthesized edge, one the resolver infers rather than reads from a call site
 `provenance = 'heuristic'` and a `metadata` object with `synthesizedBy` (the pass
 that made it) and, when the wiring happens elsewhere, `registeredAt`
 (`path:line` of the registration). Consumers such as the type hierarchy and the
-named-symbol flow recognize synthesized edges by that provenance value.
+named-symbol flow recognize synthesized edges by that provenance value. Only the
+synthesis stage writes them: it replaces every edge whose metadata names
+`synthesizedBy` in one transaction, and a sync's reference-site queries and
+deletions leave such edges alone, so the rest of the graph is what a fresh index
+resolves before any synthesized edge exists.
 
 An edge a framework resolver made (`resolvedBy: "framework"`) names that
 resolver in `metadata.framework` (`react`, `vue`, `nuxt`, `nestjs`, `godot`, `tauri`),
@@ -187,8 +191,9 @@ table empty and writes no marker.
 | ----------- | ---------------- | ------------------------------------------------------------- |
 | `file_path` | TEXT primary key | a file that fed a synthesis pass; cascades with `files(path)` |
 
-A sync reads it to tell whether a deleted or edited file changes synthesized
-edges, so it can recompute them without re-reading every file (migration 9).
+Migration 9 creates it for upstream's per-file recompute gate. This engine
+recomputes the synthesized edges whenever a sync changes the index, so it never
+writes the table, which stays empty.
 
 ### `project_metadata`
 
@@ -465,6 +470,14 @@ The Rust receiver lane stores no rows, only its marker: `rust_receivers_version`
 persisted, and withdrawn with the others before a sync's first change. A sync
 that finds it missing or at another version re-resolves every Rust file. It is
 not a canonical surface.
+
+`synthesis_version` (1) vouches that the synthesized edges are the synthesis
+stage's output over the current base graph. A full index and a migration write
+it after the stage. A sync withdraws it before its first change, before a lane
+bootstrap's first write and before the orphan sweep, and, when it changed the
+index, bootstrapped a lane, swept, or found the marker missing or at another
+version, recomputes the stage and writes the marker back as its last write. It
+is not a canonical surface.
 
 `resolved_refs_version` vouches that every file's rows in `unresolved_refs` and
 `resolved_refs` are what extracting it again gives, with the references of the

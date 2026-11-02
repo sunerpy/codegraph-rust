@@ -79,6 +79,7 @@ pub mod source_facts;
 pub mod strip_comments;
 mod swift_scope;
 pub mod swift_type_visibility;
+pub mod synthesis;
 mod type_parameters;
 pub mod types;
 pub mod workspace_packages;

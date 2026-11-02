@@ -234,6 +234,19 @@
   },
   {
     "col": null,
+    "kind": "calls",
+    "line": null,
+    "metadata": {
+      "event": "saved",
+      "registeredAt": "js/src/events.js:9",
+      "synthesizedBy": "event-emitter"
+    },
+    "provenance": "heuristic",
+    "source": "function:4c075e5c6998bde068ac64c5129298c1",
+    "target": "function:c87c29fe6a038cbf57b0af6a8597d7e0"
+  },
+  {
+    "col": null,
     "kind": "contains",
     "line": null,
     "metadata": null,

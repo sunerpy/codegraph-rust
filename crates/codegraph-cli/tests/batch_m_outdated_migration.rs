@@ -2543,3 +2543,75 @@ fn outdated_migration_names_constant_routes_before_resolving_navigation() {
     diff_canonical(&rebuilt, &migrated, None)
         .expect("a forced migration must equal a fresh v2 `index --force`");
 }
+
+/// W7-14: a migration synthesizes the dispatch edges no reference names, as
+/// `index --force` does, and leaves the synthesis marker a sync reads.
+#[test]
+fn outdated_migration_synthesizes_dispatch_edges() {
+    let dir = TestDir::new("outdated-synthesis");
+    let project = dir.path().join("app");
+    for (path, contents) in [
+        (
+            "src/scene.ts",
+            "type Callback = () => void;\nexport class Scene {\n  private callbacks = new Set<Callback>();\n  onUpdate(cb: Callback) {\n    this.callbacks.add(cb);\n  }\n  triggerUpdate() {\n    for (const cb of this.callbacks) cb();\n  }\n}\n",
+        ),
+        (
+            "src/app.ts",
+            "import { Scene } from './scene';\nexport class App {\n  scene = new Scene();\n  constructor() {\n    this.scene.onUpdate(this.triggerRender);\n  }\n  triggerRender() {\n    return 1;\n  }\n}\n",
+        ),
+    ] {
+        let full = project.join(path);
+        fs::create_dir_all(full.parent().unwrap()).expect("create the source directory");
+        fs::write(full, contents).expect("write a source file");
+    }
+    let run = cli(&["init", project.to_str().unwrap()]);
+    assert!(
+        run.ok,
+        "setup: `codegraph init` must succeed (stdout={}, stderr={})",
+        run.stdout, run.stderr
+    );
+    let paths = IndexPaths::resolve(&project, None).expect("resolve v2 paths");
+    stage_state_slot(
+        &paths,
+        100,
+        CURRENT_STORAGE_PROTOCOL,
+        CURRENT_EXTRACTION_VERSION - 1,
+        "current",
+    );
+    let run = cli(&["sync", project.to_str().unwrap()]);
+    assert!(
+        run.ok,
+        "sync must migrate an Outdated namespace: stdout={}, stderr={}",
+        run.stdout, run.stderr
+    );
+    let migrated = canonicalize_db(&paths.current_db()).expect("canonicalize migrated db");
+    assert!(
+        migrated.edges.iter().any(|edge| {
+            let edge = serde_json::to_string(edge).expect("serialize a canonical edge");
+            edge.contains("synthesizedBy") && edge.contains("callback")
+        }),
+        "the migrated index must hold the synthesized dispatch edge: {:?}",
+        migrated.edges
+    );
+    let marker = rusqlite::Connection::open_with_flags(
+        format!("file:{}?immutable=1", paths.current_db().display()),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+    )
+    .expect("open the migrated db")
+    .query_row(
+        "SELECT value FROM project_metadata WHERE key = 'synthesis_version'",
+        [],
+        |row| row.get::<_, String>(0),
+    )
+    .expect("the migration writes the synthesis marker");
+    assert_eq!(marker, "1");
+    let (_scratch, peer) = fresh_force_peer("outdated-synthesis", &project);
+    let rebuilt = canonicalize_db(
+        &IndexPaths::resolve(&peer, None)
+            .expect("resolve peer v2 paths")
+            .current_db(),
+    )
+    .expect("canonicalize peer db");
+    diff_canonical(&rebuilt, &migrated, None)
+        .expect("a forced migration must equal a fresh v2 `index --force`");
+}

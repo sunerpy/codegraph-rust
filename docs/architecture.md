@@ -91,6 +91,8 @@ graph LR
     store --> resolve[generic + framework resolution]
     resolve --> edges[resolved edges]
     edges --> store
+    edges --> synth[dispatch-edge synthesis]
+    synth --> store
     store --> query[graph traversal + search]
     query --> cli[CLI]
     query --> mcp[MCP]
@@ -240,6 +242,27 @@ same-name guess.
 The static/runtime boundaries for supported languages and Godot are documented in
 [`languages.md`](languages.md), [`godot.md`](godot.md), and the upstream-difference
 ledger in [`upstream-sync/KNOWN_DIFFS.md`](upstream-sync/KNOWN_DIFFS.md).
+
+### Synthesis
+
+After resolution, `codegraph_resolve::synthesis` adds the dispatch edges no
+reference names: a dispatcher reaching the callbacks registered elsewhere through
+a shared store (upstream `callback-synthesizer.ts`). The stage reads the base
+graph (every edge without `metadata.synthesizedBy`, the nodes and
+`resolved_refs`) and the indexed files whose size and modification time, or
+content hash, are still the ones their file rows record; a file that drifted
+since it was indexed reads as absent until its own sync. It runs its passes in
+upstream's registry order, merges their edges (the first pass to pair a source
+and a target keeps the pair), and replaces every synthesized edge in one
+transaction, an edge whose identity a base edge holds being ignored while its
+pair stays taken. The ported passes are the field observer
+(`callback`), the Swift and Kotlin closure collection (`closure-collection`)
+and the string-keyed emitter (`event-emitter`), each walking its candidates by
+file, line, column and id. A full index and a migration run the stage after
+resolution. A sync runs it last, after the orphan sweep, whenever it changed
+the index, bootstrapped a lane, swept, or found the `synthesis_version`
+marker missing, and writes the marker as its last write; the sync's site
+machinery never selects or deletes a synthesized edge.
 
 ## Query layer
 

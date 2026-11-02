@@ -66,10 +66,14 @@ colby behaviors are intentionally NOT ported in v1:
   returned href names (`router.replace(await postLoginRoute())`): JSX
   attributes and return values, not calls, so they draw no `navigates` edge
   here; the routers bind navigation calls only.
-- **Callback / observer edge synthesis** — `synthesizeCallbackEdges`
-  (`reference/colby/src/resolution/callback-synthesizer.ts`, invoked at
-  `index.ts:959-963`). Heuristic dynamic-dispatch edge synthesis; deferred behind
-  the same extension point.
+- **Dynamic-dispatch synthesis passes** — of `SYNTH_PASSES`
+  (`callback-synthesizer.ts`), the field, closure-collection and emitter
+  passes are ported (`crates/codegraph-resolve/src/synthesis/`); the others
+  and the Go prerequisites (`go-method-contains`, `go-implements`) draw no
+  edge here yet. The ported passes and the merge keep `b635dd46`'s view of
+  Jest/Vitest manual mocks: #2790's skip of a `__mocks__/` handler for
+  production code is a PORT row of the 2026-10-22 audit, left with the rest
+  of that row to the next round.
 - **Razor `@using` cascade resolution** — `resolveRazorUsing` / `getRazorUsings`
   (`index.ts:1116-1158`), tied to the Razor framework layer.
 
@@ -441,6 +445,36 @@ listed.
   scores by its words (`fooValue`), calls an instance or extension member of
   that name, or nothing, where colby's member lookup and receiver guesses take
   the constructor (`dart_members.rs`, `name_matcher.rs`).
+
+### Synthesis
+
+- **When a sync recomputes synthesis (W7-14).** A sync recomputes every
+  synthesized edge whenever it changes the index, bootstraps a lane or runs
+  the orphan sweep, and when the `synthesis_version` marker is missing.
+  colby decides by what changed (`src/index.ts:985-1082,1378-1409`): a
+  changed file that was a synthesis input, held a synthesized edge or
+  matches `hasSynthesisPattern`, a new renderable definition, a moved route,
+  workspace-package map or Python root set, or references an interrupted
+  resolution left pending. A handler a name picks depends on every candidate
+  of that name, and an unchanged file's base edges move when a sync
+  re-resolves them, which that gate does not see; its pattern holds for
+  nearly every code file anyway. The
+  `synthesis_inputs` table is never written, so #2565's and #2688's filter
+  of its rows has nothing to filter (`synthesis/mod.rs`,
+  `codegraph-watch/src/sync.rs`).
+- **The order a pass walks, and the handler a name means (W7-14).** Each
+  pass walks its candidates by file, line, column and id, and a cap
+  (`MAX_CALLBACKS_PER_CHANNEL`) cuts by that order; an emitter handler named
+  `h` is the one function or method `h` of the registering file, else the one
+  of the project, and nothing when either has several. colby walks SQL row
+  order, which a sync changes, and takes the first row of `getNodesByName`
+  (`synthesis/stage.rs`, `synthesis/callback.rs`).
+- **A file that drifted since it was indexed (W7-14).** The stage reads a
+  file only while its size and modification time, or its content hash, are
+  the ones its file row records, the MCP engine's freshness probe; a drifted
+  file reads as absent until its sync recomputes the stage, never sliced by
+  its old nodes' lines. colby reads the file as it is on disk
+  (`synthesis/stage.rs`).
 
 ### Extraction
 

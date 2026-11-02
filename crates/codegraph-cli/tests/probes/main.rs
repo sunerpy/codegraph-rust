@@ -23010,3 +23010,458 @@ mod explore_flow {
         }
     }
 }
+
+/// The synthesis stage's dispatch edges (W7-14): the field, closure and
+/// emitter passes over the base graph a full index resolved, merged in
+/// upstream's registry order.
+mod synthesis {
+    use super::support::{EdgeRow, Graph, Project, graph_of, project_metadata_with_prefix};
+    use serde_json::Value;
+
+    /// The synthesized `calls` edges from a node matching `source` to one
+    /// matching `target`.
+    #[track_caller]
+    fn synthesized<'g>(graph: &'g Graph, source: &str, target: &str) -> Vec<&'g EdgeRow> {
+        graph
+            .edges_matching(source, "calls", target)
+            .into_iter()
+            .filter(|edge| edge.metadata.get("synthesizedBy").is_some())
+            .collect()
+    }
+
+    /// The one synthesized edge from `source` to `target`, made by `by` and
+    /// carrying each of `fields` in its metadata.
+    #[track_caller]
+    fn assert_synthesized(
+        graph: &Graph,
+        source: &str,
+        target: &str,
+        by: &str,
+        fields: &[(&str, &str)],
+    ) -> EdgeRow {
+        let edges = synthesized(graph, source, target);
+        assert_eq!(
+            edges.len(),
+            1,
+            "one synthesized edge {source} -> {target}:\n{}",
+            graph.report()
+        );
+        let edge = edges[0].clone();
+        assert_eq!(edge.metadata["synthesizedBy"], by, "{edge:?}");
+        assert_eq!(edge.provenance.as_deref(), Some("heuristic"), "{edge:?}");
+        for (key, value) in fields {
+            assert_eq!(
+                edge.metadata[*key],
+                Value::from(*value),
+                "{key} of {edge:?}"
+            );
+        }
+        edge
+    }
+
+    #[track_caller]
+    fn assert_not_synthesized(graph: &Graph, source: &str, target: &str) {
+        let edges = synthesized(graph, source, target);
+        assert!(
+            edges.is_empty(),
+            "no synthesized edge {source} -> {target}:\n{}",
+            graph.report()
+        );
+    }
+
+    const SCENE: &str = "type Callback = () => void;\nexport class Scene {\n  private callbacks = new Set<Callback>();\n  onUpdate(cb: Callback) {\n    this.callbacks.add(cb);\n  }\n  triggerUpdate() {\n    for (const cb of this.callbacks) cb();\n  }\n}\n";
+
+    /// Upstream's field observer (excalidraw's `Scene`): the dispatcher that
+    /// loops over `this.callbacks` reaches the method a caller registered,
+    /// the value resolution bound at the registration's line, picked by its
+    /// name among the line's function values.
+    #[test]
+    fn w714_field_observer_reaches_the_registered_method() {
+        let project = Project::new()
+            .file("src/scene.ts", SCENE)
+            .file(
+                "src/app.ts",
+                "import { Scene } from './scene';\nexport class App {\n  scene = new Scene();\n  constructor() {\n    this.scene.onUpdate(this.triggerRender); this.log(this.triggerPaint);\n  }\n  log(value: unknown) {\n    return value;\n  }\n  triggerRender() {\n    return 1;\n  }\n  triggerPaint() {\n    return 2;\n  }\n}\n",
+            )
+            .index();
+        let graph = graph_of(&project);
+        assert_not_synthesized(
+            graph,
+            "method Scene::triggerUpdate",
+            "method App::triggerPaint",
+        );
+        let edge = assert_synthesized(
+            graph,
+            "method Scene::triggerUpdate",
+            "method App::triggerRender",
+            "callback",
+            &[
+                ("via", "onUpdate"),
+                ("field", "callbacks"),
+                ("registeredAt", "src/app.ts:5"),
+            ],
+        );
+        assert_eq!((edge.line, edge.col), (Some(7), None), "{edge:?}");
+        assert_eq!(
+            project_metadata_with_prefix(&project.db(), "synthesis_version"),
+            [("synthesis_version".to_string(), "1".to_string())]
+        );
+    }
+
+    /// A channel pairs a registrar and a dispatcher of one file: a loop over
+    /// a same-named field in another file is no dispatcher of it.
+    #[test]
+    fn w714_field_observer_pairs_within_one_file() {
+        let project = Project::new()
+            .file(
+                "src/scene.ts",
+                "type Callback = () => void;\nexport class Scene {\n  private callbacks = new Set<Callback>();\n  onUpdate(cb: Callback) {\n    this.callbacks.add(cb);\n  }\n}\n",
+            )
+            .file(
+                "src/loop.ts",
+                "export class Loop {\n  private callbacks = new Set<() => void>();\n  triggerUpdate() {\n    for (const cb of this.callbacks) cb();\n  }\n}\n",
+            )
+            .file(
+                "src/app.ts",
+                "import { Scene } from './scene';\nexport class App {\n  scene = new Scene();\n  constructor() {\n    this.scene.onUpdate(this.triggerRender);\n  }\n  triggerRender() {\n    return 1;\n  }\n}\n",
+            )
+            .index();
+        assert_not_synthesized(
+            graph_of(&project),
+            "method Loop::triggerUpdate",
+            "method App::triggerRender",
+        );
+    }
+
+    /// The callback is the value resolution bound at the registration: a
+    /// bare name from another file links through its import, and without
+    /// one nothing is bound and nothing links.
+    #[test]
+    fn w714_field_observer_needs_a_bound_value() {
+        let wiring = |app: &str| {
+            Project::new()
+                .file("src/scene.ts", SCENE)
+                .file(
+                    "src/render.ts",
+                    "export function render() {\n  return 1;\n}\n",
+                )
+                .file("src/app.ts", app)
+                .index()
+        };
+        let imported = wiring(
+            "import { Scene } from './scene';\nimport { render } from './render';\nexport function wire(scene: Scene) {\n  scene.onUpdate(render);\n}\n",
+        );
+        assert_synthesized(
+            graph_of(&imported),
+            "method Scene::triggerUpdate",
+            "function render",
+            "callback",
+            &[("registeredAt", "src/app.ts:4")],
+        );
+        let unbound = wiring(
+            "import { Scene } from './scene';\nexport function wire(scene: Scene) {\n  scene.onUpdate(render);\n}\n",
+        );
+        assert_not_synthesized(
+            graph_of(&unbound),
+            "method Scene::triggerUpdate",
+            "function render",
+        );
+    }
+
+    /// A channel links its first forty registrations, by file, line and
+    /// column (upstream `MAX_CALLBACKS_PER_CHANNEL`): the forty-first
+    /// callback stays unlinked.
+    #[test]
+    fn w714_field_observer_caps_a_channel_at_forty_callbacks() {
+        let mut app = String::from(
+            "import { Scene } from './scene';\nexport class App {\n  scene = new Scene();\n  constructor() {\n",
+        );
+        for at in 1..=41 {
+            app.push_str(&format!("    this.scene.onUpdate(this.cb{at});\n"));
+        }
+        app.push_str("  }\n");
+        for at in 1..=41 {
+            app.push_str(&format!("  cb{at}() {{\n    return {at};\n  }}\n"));
+        }
+        app.push_str("}\n");
+        let project = Project::new()
+            .file("src/scene.ts", SCENE)
+            .file("src/app.ts", &app)
+            .index();
+        let graph = graph_of(&project);
+        let linked: Vec<&EdgeRow> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.metadata["synthesizedBy"] == "callback")
+            .collect();
+        assert_eq!(linked.len(), 40, "{}", graph.report());
+        assert_synthesized(
+            graph,
+            "method Scene::triggerUpdate",
+            "method App::cb40",
+            "callback",
+            &[("registeredAt", "src/app.ts:44")],
+        );
+        assert_not_synthesized(graph, "method Scene::triggerUpdate", "method App::cb41");
+    }
+
+    /// Upstream's closure collection (Alamofire's `Request`,
+    /// `closure-collection-synthesizer.test.ts`): the base class's
+    /// dispatchers invoke each element of a property a subclass in another
+    /// file appends to, through `validators.write { $0.append(…) }` or a
+    /// direct `handlers.append(…)`; `names.forEach { print($0) }` invokes
+    /// no element, so `names` pairs nothing.
+    #[test]
+    fn w714_closure_collection_pairs_by_field_across_files() {
+        let project = Project::new()
+            .file(
+                "Request.swift",
+                "class Request {\n    var validators: [() -> Void] = []\n    var handlers: [() -> Void] = []\n    var names: [String] = []\n\n    func didCompleteTask() {\n        let validators = validators\n        validators.forEach { $0() }\n    }\n\n    func runHandlers() {\n        handlers.forEach { $0() }\n    }\n\n    func printNames() {\n        names.forEach { print($0) }\n    }\n}\n",
+            )
+            .file(
+                "DataRequest.swift",
+                "class DataRequest: Request {\n    func validate(_ validation: @escaping () -> Void) -> Self {\n        let validator: () -> Void = { validation() }\n        validators.write { $0.append(validator) }\n        return self\n    }\n\n    func onEvent(_ handler: @escaping () -> Void) {\n        handlers.append(handler)\n    }\n\n    func addName(_ n: String) {\n        names.append(n)\n    }\n}\n",
+            )
+            .index();
+        let graph = graph_of(&project);
+        assert_synthesized(
+            graph,
+            "method Request::didCompleteTask",
+            "method DataRequest::validate",
+            "closure-collection",
+            &[
+                ("field", "validators"),
+                ("registeredAt", "DataRequest.swift:4"),
+            ],
+        );
+        assert_synthesized(
+            graph,
+            "method Request::runHandlers",
+            "method DataRequest::onEvent",
+            "closure-collection",
+            &[
+                ("field", "handlers"),
+                ("registeredAt", "DataRequest.swift:9"),
+            ],
+        );
+        assert!(
+            graph
+                .edges
+                .iter()
+                .filter(|edge| edge.metadata.get("synthesizedBy").is_some())
+                .all(|edge| edge.metadata["field"] != "names"
+                    && graph
+                        .node(&edge.target)
+                        .is_none_or(|target| target.name != "addName")),
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream #1235: element invocation is Swift and Kotlin trailing-closure
+    /// syntax, so JavaScript with every textual trigger pairs nothing.
+    #[test]
+    fn pr1235_closure_collection_skips_other_languages() {
+        let project = Project::new()
+            .file(
+                "queue.js",
+                "class Queue {\n  constructor() { this.tasks = []; }\n  register(fn) { this.tasks.push(fn); }\n  drain() { this.tasks.forEach(function (t) { t(); }); }\n  weird() { const s = \"tasks.forEach { $0( } tasks.push(\"; return s; }\n}\nmodule.exports = Queue;\n",
+            )
+            .index();
+        let graph = graph_of(&project);
+        assert!(
+            graph
+                .edges
+                .iter()
+                .all(|edge| edge.metadata["synthesizedBy"] != "closure-collection"),
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// A field name more than eight registrars append to is too generic to
+    /// pair; eight still pair.
+    #[test]
+    fn w714_closure_collection_skips_a_generic_field() {
+        let hub = "class Hub {\n    var items: [() -> Void] = []\n    func run() {\n        items.forEach { $0() }\n    }\n}\n";
+        let adders = |count: usize| {
+            let mut project = Project::new().file("Sources/Hub.swift", hub);
+            for at in 0..count {
+                project = project.file(
+                    &format!("Sources/A{at}.swift"),
+                    &format!(
+                        "class A{at}: Hub {{\n    func add{at}(_ item: @escaping () -> Void) {{\n        items.append(item)\n    }}\n}}\n"
+                    ),
+                );
+            }
+            project.index()
+        };
+        let eight = adders(8);
+        let paired: Vec<_> = graph_of(&eight)
+            .edges
+            .iter()
+            .filter(|edge| edge.metadata["synthesizedBy"] == "closure-collection")
+            .collect();
+        assert_eq!(paired.len(), 8, "{}", graph_of(&eight).report());
+        let nine = adders(9);
+        assert!(
+            graph_of(&nine)
+                .edges
+                .iter()
+                .all(|edge| edge.metadata.get("synthesizedBy").is_none()),
+            "{}",
+            graph_of(&nine).report()
+        );
+    }
+
+    /// `$0.append(…)` and `$0.forEach { $0() }` name no property: the `0`
+    /// the receiver patterns capture is no field, so the write's own
+    /// receiver is the only one `feed` appends to and nothing pairs.
+    #[test]
+    fn w714_closure_collection_skips_a_positional_field() {
+        let project = Project::new()
+            .file(
+                "Sources/Pool.swift",
+                "class Pool {\n    var queues: [[() -> Void]] = []\n    func drainAll() {\n        queues.write { $0.forEach { $0() } }\n    }\n}\n",
+            )
+            .file(
+                "Sources/Feeder.swift",
+                "class Feeder {\n    func feed(_ job: @escaping () -> Void) {\n        jobs.write { $0.append(job) }\n    }\n}\n",
+            )
+            .index();
+        let graph = graph_of(&project);
+        assert!(
+            graph
+                .edges
+                .iter()
+                .all(|edge| edge.metadata.get("synthesizedBy").is_none()),
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream's emitter shapes: express's `use` emits `mount`, which
+    /// `init` handles with a named inline function; a bus's methods emit
+    /// what its `wire` registers.
+    #[test]
+    fn w714_emitter_reaches_the_handler_of_the_event() {
+        let project = Project::new()
+            .file(
+                "application.js",
+                "var app = exports = module.exports = {};\n\napp.use = function use(fn) {\n  fn.emit('mount', this);\n  return this;\n};\n\napp.init = function init() {\n  this.on('mount', function onmount(parent) {\n    this.parent = parent;\n  });\n};\n",
+            )
+            .file(
+                "bus.js",
+                "class Bus {\n  tick() { this.emit('refresh'); }\n  persist() { this.emit('save'); }\n  handleRefresh() { return 1; }\n  handleSave() { return 2; }\n  wire() {\n    this.on('refresh', this.handleRefresh);\n    this.on('save', this.handleSave);\n  }\n}\nmodule.exports = Bus;\n",
+            )
+            .index();
+        let graph = graph_of(&project);
+        let edge = assert_synthesized(
+            graph,
+            "function use",
+            "function init::onmount",
+            "event-emitter",
+            &[("event", "mount"), ("registeredAt", "application.js:9")],
+        );
+        assert_eq!((edge.line, edge.col), (None, None), "{edge:?}");
+        assert_synthesized(
+            graph,
+            "method Bus::tick",
+            "method Bus::handleRefresh",
+            "event-emitter",
+            &[("event", "refresh"), ("registeredAt", "bus.js:7")],
+        );
+        assert_synthesized(
+            graph,
+            "method Bus::persist",
+            "method Bus::handleSave",
+            "event-emitter",
+            &[("event", "save"), ("registeredAt", "bus.js:8")],
+        );
+        assert_not_synthesized(graph, "method Bus::tick", "method Bus::handleSave");
+    }
+
+    /// KEEP-RUST: a handler name means the one function of that name in the
+    /// registering file, else the one in the project; two of them, in
+    /// neither, mean nothing (upstream takes whichever row comes first).
+    #[test]
+    fn w714_emitter_handler_name_must_be_unique() {
+        let project = Project::new()
+            .file(
+                "src/app.js",
+                "export function save(bus) {\n  bus.emit('save');\n}\nexport function wire(bus) {\n  bus.on('save', handleSave);\n  bus.on('load', handleLoad);\n}\nexport function load(bus) {\n  bus.emit('load');\n}\n",
+            )
+            .file("src/a.js", "export function handleSave() {\n  return 1;\n}\nexport function handleLoad() {\n  return 3;\n}\n")
+            .file("src/b.js", "export function handleSave() {\n  return 2;\n}\n")
+            .index();
+        let graph = graph_of(&project);
+        assert_not_synthesized(graph, "function save", "function handleSave");
+        assert_synthesized(
+            graph,
+            "function load",
+            "function handleLoad",
+            "event-emitter",
+            &[("event", "load"), ("registeredAt", "src/app.js:6")],
+        );
+    }
+
+    /// An event with more than six handlers is too generic to pair; six
+    /// still pair.
+    #[test]
+    fn w714_emitter_skips_a_generic_event() {
+        let handlers = |count: usize| {
+            let mut app = String::from(
+                "export function fire(bus) {\n  bus.emit('change');\n}\nexport function wire(bus) {\n",
+            );
+            for at in 1..=count {
+                app.push_str(&format!("  bus.on('change', h{at});\n"));
+            }
+            app.push_str("}\n");
+            for at in 1..=count {
+                app.push_str(&format!("function h{at}() {{}}\n"));
+            }
+            Project::new().file("src/app.js", &app).index()
+        };
+        let six = handlers(6);
+        let paired: Vec<_> = graph_of(&six)
+            .edges
+            .iter()
+            .filter(|edge| edge.metadata["synthesizedBy"] == "event-emitter")
+            .collect();
+        assert_eq!(paired.len(), 6, "{}", graph_of(&six).report());
+        let seven = handlers(7);
+        assert!(
+            graph_of(&seven)
+                .edges
+                .iter()
+                .all(|edge| edge.metadata.get("synthesizedBy").is_none()),
+            "{}",
+            graph_of(&seven).report()
+        );
+    }
+
+    /// The passes merge in upstream's registry order: when the field and the
+    /// emitter pass both pair a dispatcher with a callback, the field edge
+    /// is the one kept.
+    #[test]
+    fn w714_the_earlier_pass_keeps_a_pair() {
+        let project = Project::new()
+            .file(
+                "src/scene.ts",
+                "type Callback = () => void;\nexport class Scene {\n  private callbacks = new Set<Callback>();\n  onUpdate(cb: Callback) {\n    this.callbacks.add(cb);\n  }\n  triggerUpdate() {\n    for (const cb of this.callbacks) cb();\n    this.emit('update');\n  }\n  emit(event: string) {\n    return event;\n  }\n}\n",
+            )
+            .file(
+                "src/app.ts",
+                "import { Scene } from './scene';\nexport class App {\n  scene = new Scene();\n  constructor() {\n    this.scene.onUpdate(this.triggerRender);\n    this.scene.on('update', this.triggerRender);\n  }\n  triggerRender() {\n    return 1;\n  }\n}\n",
+            )
+            .index();
+        let graph = graph_of(&project);
+        assert_synthesized(
+            graph,
+            "method Scene::triggerUpdate",
+            "method App::triggerRender",
+            "callback",
+            &[("via", "onUpdate")],
+        );
+    }
+}

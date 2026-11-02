@@ -10,6 +10,24 @@ use serde_json::Value;
 
 use crate::connection::Store;
 
+/// Whether the edge row `$alias` names is one the synthesis stage owns
+/// (`metadata.synthesizedBy`, W7-14), in the expression schema 9's
+/// `idx_edges_synthesis_site` is partial on. Every other edge is the base
+/// graph: a fresh index resolves before any synthesized edge exists, so a
+/// sync's site machinery neither selects nor deletes one, and only
+/// [`Store::replace_synthesized_edges`] and node deletion remove them.
+macro_rules! synthesized_edge {
+    ($alias:literal) => {
+        concat!(
+            "CASE WHEN json_valid(",
+            $alias,
+            "metadata) THEN json_extract(",
+            $alias,
+            "metadata, '$.synthesizedBy') END IS NOT NULL"
+        )
+    };
+}
+
 pub(crate) const SQLITE_PARAM_CHUNK_SIZE: usize = 500;
 
 /// Env var name (#1231): set to `1` to opt out of bulk-index WAL-checkpoint
@@ -167,6 +185,50 @@ impl Store {
             "SELECT * FROM nodes WHERE file_path = ? AND +kind = 'method' ORDER BY start_line",
             [file_path],
         )
+    }
+
+    /// The functions and methods whose name GLOBs one of `globs`, LIKEs one
+    /// of `likes` (case-insensitive in ASCII) or is one of `names`: the
+    /// superset of a synthesis pass's name pattern it narrows itself,
+    /// rather than every callable of the project (W7-14; upstream #610).
+    /// Unordered.
+    pub fn callables_named_like(
+        &self,
+        globs: &[&str],
+        likes: &[&str],
+        names: &[&str],
+    ) -> rusqlite::Result<Vec<Node>> {
+        let mut conditions = Vec::new();
+        conditions.extend(globs.iter().map(|_| "name GLOB ?".to_string()));
+        conditions.extend(likes.iter().map(|_| "name LIKE ?".to_string()));
+        if !names.is_empty() {
+            conditions.push(format!("name IN ({})", vec!["?"; names.len()].join(",")));
+        }
+        if conditions.is_empty() {
+            return Ok(Vec::new());
+        }
+        let sql = format!(
+            "SELECT * FROM nodes WHERE kind IN ('function', 'method') AND ({})",
+            conditions.join(" OR ")
+        );
+        let values = globs.iter().chain(likes).chain(names);
+        query_nodes(&self.conn, &sql, rusqlite::params_from_iter(values))
+    }
+
+    /// The functions and methods written in one of `languages` (W7-14).
+    /// Unordered.
+    pub fn callables_in_languages(&self, languages: &[Language]) -> rusqlite::Result<Vec<Node>> {
+        if languages.is_empty() {
+            return Ok(Vec::new());
+        }
+        let sql = format!(
+            "SELECT * FROM nodes WHERE kind IN ('function', 'method') AND language IN ({})",
+            std::iter::repeat_n("?", languages.len())
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let values = languages.iter().map(|language| language.as_str());
+        query_nodes(&self.conn, &sql, rusqlite::params_from_iter(values))
     }
 
     /// Whether a function or method has the qualified name `qualified`
@@ -636,11 +698,6 @@ impl Store {
         if edges.is_empty() {
             return Ok(());
         }
-        let endpoint_ids = edges
-            .iter()
-            .flat_map(|edge| [edge.source.as_str(), edge.target.as_str()])
-            .collect::<Vec<_>>();
-
         // Snapshot endpoint existence INSIDE a `BEGIN IMMEDIATE` transaction so the
         // FK filter and the inserts observe one write-locked, delete-free view.
         // Reading it before the transaction let a concurrent writer (daemon
@@ -651,38 +708,28 @@ impl Store {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let existing_node_ids = existing_node_ids(&tx, &endpoint_ids)?;
-        {
-            let mut stmt = tx.prepare_cached(
-                r#"
-                INSERT OR IGNORE INTO edges (source, target, kind, metadata, line, col, provenance)
-                VALUES (@source, @target, @kind, @metadata, @line, @col, @provenance)
-                "#,
-            )?;
-            for edge in edges {
-                if !existing_node_ids.contains(&edge.source)
-                    || !existing_node_ids.contains(&edge.target)
-                {
-                    continue;
-                }
-                let metadata = edge
-                    .metadata
-                    .as_ref()
-                    .map(serde_json::to_string)
-                    .transpose()
-                    .map_err(json_to_sql_error)?;
-                stmt.execute(named_params! {
-                    "@source": edge.source,
-                    "@target": edge.target,
-                    "@kind": edge.kind.as_str(),
-                    "@metadata": metadata,
-                    "@line": edge.line,
-                    "@col": edge.col,
-                    "@provenance": edge.provenance,
-                })?;
-            }
-        }
+        insert_edges_in(&tx, edges)?;
         tx.commit()
+    }
+
+    /// Replace every synthesized edge with `edges` in ONE `BEGIN IMMEDIATE`
+    /// transaction (W7-14, upstream `SynthesisStage.publish`): the old ones
+    /// go, then `edges` go in as [`Self::insert_edges`] inserts them, so an
+    /// edge whose identity a base edge holds is ignored by
+    /// `idx_edges_identity`. Returns how many rows went and how many came.
+    /// The synthesis marker is the caller's: a sync writes it only after its
+    /// last other write.
+    pub fn replace_synthesized_edges(
+        &mut self,
+        edges: &[Edge],
+    ) -> rusqlite::Result<(usize, usize)> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let removed = tx.execute(&format!("DELETE FROM edges WHERE {SYNTHESIZED}"), [])?;
+        let inserted = insert_edges_in(&tx, edges)?;
+        tx.commit()?;
+        Ok((removed, inserted))
     }
 
     /// Ports `getOutgoingEdges` from `upstream db/queries.ts:1310-1337`.
@@ -1350,6 +1397,7 @@ impl Store {
                 WHERE lower(tgt.name) IN ({name_slots})
                   AND src.language IN ({language_slots})
                   AND e.kind != 'contains'
+                  AND NOT ({SYNTHESIZED_E})
                 ORDER BY src.file_path, e.source, e.line, e.col"#
             );
             let mut params: Vec<&dyn ToSql> = chunk.iter().map(|name| name as &dyn ToSql).collect();
@@ -1948,16 +1996,17 @@ impl Store {
         &self,
         file_path: &str,
     ) -> rusqlite::Result<Vec<FileReferenceSite>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare(&format!(
             r#"SELECT src.file_path, e.source, e.line, e.col
             FROM edges e
             JOIN nodes tgt ON tgt.id = e.target
             JOIN nodes src ON src.id = e.source
             WHERE tgt.file_path = ?1
               AND e.kind != 'contains'
+              AND NOT ({SYNTHESIZED_E})
               AND src.file_path != ?1
             ORDER BY src.file_path, e.source, e.line, e.col"#,
-        )?;
+        ))?;
         let rows = stmt.query_map([file_path], row_to_file_reference_site)?;
         let mut out = BTreeSet::new();
         for row in rows {
@@ -1988,6 +2037,7 @@ impl Store {
                 JOIN nodes src ON src.id = e.source
                 WHERE e.target IN ({placeholders})
                   AND e.kind != 'contains'
+                  AND NOT ({SYNTHESIZED_E})
                 ORDER BY src.file_path, e.source, e.line, e.col"#
             );
             let params = chunk.iter().map(|id| id as &dyn ToSql).collect::<Vec<_>>();
@@ -2077,7 +2127,8 @@ impl Store {
                     r#"SELECT src.file_path, e.source, e.line, e.col
                     FROM edges e
                     JOIN nodes src ON src.id = e.source
-                    WHERE e.kind != 'contains' AND e.source IN ({placeholders})"#
+                    WHERE e.kind != 'contains' AND NOT ({SYNTHESIZED_E})
+                      AND e.source IN ({placeholders})"#
                 ),
                 format!(
                     r#"SELECT file_path, from_node_id, line, col
@@ -2298,11 +2349,11 @@ impl Store {
         let tx = self.conn.transaction()?;
         let mut removed = 0;
         {
-            let mut stmt = tx.prepare_cached(
+            let mut stmt = tx.prepare_cached(&format!(
                 r#"DELETE FROM edges
                 WHERE source = ?1 AND line = ?2 AND col = ?3
-                  AND kind != 'contains'"#,
-            )?;
+                  AND kind != 'contains' AND NOT ({SYNTHESIZED})"#
+            ))?;
             for site in unique {
                 removed += stmt.execute(params![site.from_node_id, site.line, site.col])?;
             }
@@ -2412,7 +2463,8 @@ impl Store {
                 JOIN nodes tgt ON tgt.id = e.target
                 JOIN nodes src ON src.id = e.source
                 WHERE tgt.name IN ({placeholders})
-                  AND e.kind != 'contains'"#
+                  AND e.kind != 'contains'
+                  AND NOT ({SYNTHESIZED_E})"#
             );
             let params = chunk.iter().map(|n| n as &dyn ToSql).collect::<Vec<_>>();
             let mut stmt = self.conn.prepare(&sql)?;
@@ -2433,15 +2485,16 @@ impl Store {
         &self,
         file_path: &str,
     ) -> rusqlite::Result<Vec<(String, i64, i64, String)>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare(&format!(
             r#"SELECT e.source, e.line, e.col, tgt.name
             FROM nodes src
             CROSS JOIN edges e ON e.source = src.id
             JOIN nodes tgt ON tgt.id = e.target
             WHERE src.file_path = ?1 AND e.kind = 'calls'
               AND e.line IS NOT NULL AND e.col IS NOT NULL
+              AND NOT ({SYNTHESIZED_E})
             ORDER BY e.source, e.line, e.col, tgt.name"#,
-        )?;
+        ))?;
         let rows = stmt.query_map([file_path], |row| {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
         })?;
@@ -2501,6 +2554,7 @@ impl Store {
                 JOIN nodes src ON src.id = e.source
                 WHERE tgt.name IN ({placeholders})
                   AND e.kind != 'contains'
+                  AND NOT ({SYNTHESIZED_E})
                   AND src.file_path {file_relation} tgt.file_path
                 ORDER BY src.file_path, e.source, e.line, e.col"#
             );
@@ -2522,7 +2576,16 @@ impl Store {
 /// Extraction produces `contains` edges and same-file value references (a
 /// `references` edge with `{"valueRef": true}` and no coordinates), which a
 /// re-resolution of an unchanged file must keep.
-const RESOLUTION_EDGE: &str = "e.kind != 'contains' AND NOT (e.kind = 'references' AND e.line IS NULL AND CASE WHEN json_valid(e.metadata) THEN json_extract(e.metadata, '$.valueRef') END = 1)";
+const RESOLUTION_EDGE: &str = concat!(
+    "e.kind != 'contains' AND NOT (e.kind = 'references' AND e.line IS NULL AND CASE WHEN json_valid(e.metadata) THEN json_extract(e.metadata, '$.valueRef') END = 1) AND NOT (",
+    synthesized_edge!("e."),
+    ")"
+);
+
+/// [`synthesized_edge`] for an unaliased `edges` row.
+const SYNTHESIZED: &str = synthesized_edge!("");
+/// [`synthesized_edge`] for an `edges` row aliased `e`.
+const SYNTHESIZED_E: &str = synthesized_edge!("e.");
 
 fn row_to_file_reference_site(row: &Row<'_>) -> rusqlite::Result<FileReferenceSite> {
     let file_path = row.get(0)?;
@@ -3136,6 +3199,47 @@ fn validate_nodes(nodes: &[Node]) -> rusqlite::Result<()> {
     Ok(())
 }
 
+/// The body of [`Store::insert_edges`] in `tx`: every edge of `edges` whose
+/// endpoints both exist, `INSERT OR IGNORE`d; how many rows went in.
+fn insert_edges_in(tx: &Connection, edges: &[Edge]) -> rusqlite::Result<usize> {
+    if edges.is_empty() {
+        return Ok(0);
+    }
+    let endpoint_ids = edges
+        .iter()
+        .flat_map(|edge| [edge.source.as_str(), edge.target.as_str()])
+        .collect::<Vec<_>>();
+    let existing_node_ids = existing_node_ids(tx, &endpoint_ids)?;
+    let mut stmt = tx.prepare_cached(
+        r#"
+        INSERT OR IGNORE INTO edges (source, target, kind, metadata, line, col, provenance)
+        VALUES (@source, @target, @kind, @metadata, @line, @col, @provenance)
+        "#,
+    )?;
+    let mut inserted = 0;
+    for edge in edges {
+        if !existing_node_ids.contains(&edge.source) || !existing_node_ids.contains(&edge.target) {
+            continue;
+        }
+        let metadata = edge
+            .metadata
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(json_to_sql_error)?;
+        inserted += stmt.execute(named_params! {
+            "@source": edge.source,
+            "@target": edge.target,
+            "@kind": edge.kind.as_str(),
+            "@metadata": metadata,
+            "@line": edge.line,
+            "@col": edge.col,
+            "@provenance": edge.provenance,
+        })?;
+    }
+    Ok(inserted)
+}
+
 fn existing_node_ids(
     conn: &Connection,
     ids: &[&str],
@@ -3223,11 +3327,11 @@ fn replace_site_resolution_in(
     }
     let mut removed = 0;
     {
-        let mut delete_edges = tx.prepare_cached(
+        let mut delete_edges = tx.prepare_cached(&format!(
             r#"DELETE FROM edges
                 WHERE source = ?1 AND line = ?2 AND col = ?3
-                  AND kind != 'contains'"#,
-        )?;
+                  AND kind != 'contains' AND NOT ({SYNTHESIZED})"#
+        ))?;
         let mut delete_refs = tx.prepare_cached(
             r#"DELETE FROM unresolved_refs
                 WHERE from_node_id = ?1 AND line = ?2 AND col = ?3"#,
@@ -3983,6 +4087,217 @@ mod tests {
             col: None,
             provenance: None,
         }
+    }
+
+    fn synthesized(source: &str, target: &str, line: Option<i64>, col: Option<i64>) -> Edge {
+        Edge {
+            metadata: Some(
+                serde_json::json!({"synthesizedBy": "callback", "registeredAt": "src/a.rs:1"}),
+            ),
+            line,
+            col,
+            provenance: Some("heuristic".to_string()),
+            ..edge(source, target, EdgeKind::Calls)
+        }
+    }
+
+    /// An edge as `(source, target, kind, line, col, synthesized)`.
+    type EdgeRow = (String, String, String, Option<i64>, Option<i64>, bool);
+
+    fn edge_rows(store: &Store) -> Vec<EdgeRow> {
+        let mut rows: Vec<_> = store
+            .all_edges()
+            .unwrap()
+            .into_iter()
+            .filter(|edge| edge.kind != EdgeKind::Contains)
+            .map(|edge| {
+                let synthesized = edge
+                    .metadata
+                    .as_ref()
+                    .is_some_and(|metadata| metadata.get("synthesizedBy").is_some());
+                (
+                    edge.source,
+                    edge.target,
+                    edge.kind.as_str().to_string(),
+                    edge.line,
+                    edge.col,
+                    synthesized,
+                )
+            })
+            .collect();
+        rows.sort();
+        rows
+    }
+
+    /// The replacement swaps the synthesized edges alone (W7-14): the base
+    /// edge stays, the old synthesized edge goes, and a new one whose
+    /// identity the base edge holds is ignored.
+    #[test]
+    fn replace_synthesized_edges_swaps_only_synthesized_edges() {
+        let mut store = store("replace-synthesized");
+        store
+            .upsert_nodes(&[
+                node("function:a", "alpha", "src/a.rs"),
+                node("function:b", "beta", "src/b.rs"),
+                node("function:c", "gamma", "src/c.rs"),
+            ])
+            .unwrap();
+        let base = Edge {
+            line: Some(3),
+            col: Some(4),
+            ..edge("function:a", "function:b", EdgeKind::Calls)
+        };
+        store
+            .insert_edges(&[base, synthesized("function:a", "function:c", None, None)])
+            .unwrap();
+        let (removed, inserted) = store
+            .replace_synthesized_edges(&[
+                synthesized("function:a", "function:b", Some(3), Some(4)),
+                synthesized("function:b", "function:c", Some(1), None),
+            ])
+            .unwrap();
+        assert_eq!((removed, inserted), (1, 1));
+        let calls = |source: &str, target: &str, line, col, synthesized| {
+            (
+                source.to_string(),
+                target.to_string(),
+                "calls".to_string(),
+                line,
+                col,
+                synthesized,
+            )
+        };
+        assert_eq!(
+            edge_rows(&store),
+            [
+                calls("function:a", "function:b", Some(3), Some(4), false),
+                calls("function:b", "function:c", Some(1), None, true),
+            ]
+        );
+        // The delete reads the partial index schema 9 made for these rows.
+        let plan: Vec<String> = store
+            .conn
+            .prepare(&format!(
+                "EXPLAIN QUERY PLAN DELETE FROM edges WHERE {SYNTHESIZED}"
+            ))
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert!(
+            plan.iter()
+                .any(|step| step.contains("idx_edges_synthesis_site")),
+            "{plan:?}"
+        );
+    }
+
+    /// A sync's site machinery never selects or deletes a synthesized edge
+    /// (W7-14): a fresh index resolves before any exists.
+    #[test]
+    fn synthesized_edges_are_outside_the_sync_site_machinery() {
+        let mut store = store("synthesized-sites");
+        store
+            .upsert_nodes(&[
+                node("function:x", "xray", "src/x.rs"),
+                node("function:y", "yankee", "src/y.rs"),
+                node("function:z", "zulu", "src/z.rs"),
+            ])
+            .unwrap();
+        let base = Edge {
+            line: Some(2),
+            col: Some(1),
+            ..edge("function:x", "function:y", EdgeKind::Calls)
+        };
+        store
+            .insert_edges(&[
+                base,
+                synthesized("function:x", "function:y", Some(7), Some(3)),
+                synthesized("function:z", "function:y", None, None),
+            ])
+            .unwrap();
+        let base_site = FileReferenceSite {
+            file_path: "src/x.rs".to_string(),
+            site: Some(ReferenceSite {
+                from_node_id: "function:x".to_string(),
+                line: 2,
+                col: 1,
+            }),
+        };
+        assert_eq!(
+            store.reference_sites_dependent_on_file("src/y.rs").unwrap(),
+            std::slice::from_ref(&base_site)
+        );
+        assert_eq!(
+            store
+                .reference_sites_of_edges_to_targets(&["function:y".to_string()])
+                .unwrap(),
+            std::slice::from_ref(&base_site)
+        );
+        assert_eq!(
+            store
+                .reference_sites_of_edges_to_named_targets(&["yankee".to_string()])
+                .unwrap(),
+            std::slice::from_ref(&base_site)
+        );
+        assert_eq!(
+            store
+                .reference_sites_of_edges_to_folded_targets(
+                    &[Language::Rust],
+                    &["YANKEE".to_string()]
+                )
+                .unwrap(),
+            std::slice::from_ref(&base_site)
+        );
+        assert_eq!(
+            store
+                .reference_sites_from_nodes(&["function:x".to_string(), "function:z".to_string()])
+                .unwrap(),
+            [base_site]
+        );
+        assert_eq!(
+            store
+                .source_files_of_edges_to_named_targets(&["yankee".to_string()])
+                .unwrap(),
+            ["src/x.rs".to_string()]
+        );
+        assert_eq!(
+            store.call_sites_in_file("src/x.rs").unwrap(),
+            [("function:x".to_string(), 2, 1, "yankee".to_string())]
+        );
+        let synthesized_site = ReferenceSite {
+            from_node_id: "function:x".to_string(),
+            line: 7,
+            col: 3,
+        };
+        assert_eq!(
+            store
+                .delete_resolved_edges_at_sites(std::slice::from_ref(&synthesized_site))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            store
+                .replace_resolution_state_at_sites(&[synthesized_site], &[])
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            store.delete_resolved_edges_from_file("src/z.rs").unwrap(),
+            0
+        );
+        assert_eq!(
+            store
+                .replace_resolution_state_from_file("src/z.rs", &[])
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            store.delete_resolved_edges_from_file("src/x.rs").unwrap(),
+            1
+        );
+        let left: Vec<_> = edge_rows(&store).into_iter().map(|row| row.5).collect();
+        assert_eq!(left, [true, true], "only the base edge went");
     }
 
     /// Every edge kind, `navigates` included, reads back as the kind written:

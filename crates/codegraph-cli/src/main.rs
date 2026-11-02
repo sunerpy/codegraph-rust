@@ -6676,6 +6676,18 @@ fn index_project_inner(
         resolution_started.elapsed(),
         json!({ "processed": resolve_bar.position(), "total": resolve_bar.length() }),
     );
+    // The dispatch edges no reference names, over the finished base graph
+    // (W7-14).
+    diagnostic_run.phase_start("synthesis");
+    let synthesis_started = std::time::Instant::now();
+    let synthesis =
+        codegraph_resolve::synthesis::run_stage(&mut store, project, options.max_file_size)?;
+    codegraph_resolve::synthesis::write_marker(&store)?;
+    diagnostic_run.phase_end(
+        "synthesis",
+        synthesis_started.elapsed(),
+        json!({ "edges": synthesis.inserted }),
+    );
     // Every reference is now in `unresolved_refs` or `resolved_refs`
     // (W5-09e).
     codegraph_watch::resolved_refs::write_marker(&store, &options, &framework_context)?;

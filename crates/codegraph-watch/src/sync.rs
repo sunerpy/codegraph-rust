@@ -846,6 +846,12 @@ fn sync_paths_with_store(
         || dart_library_bootstrap
         || shopify_bootstrap
         || !shopify.moved.is_empty();
+    // A bootstrap re-resolves dependents without `begin_mutation`: the
+    // synthesized edges go stale with them, so their marker goes first
+    // (W7-14).
+    if any_bootstrap {
+        codegraph_resolve::synthesis::withdraw_marker(store)?;
+    }
     // A sync with nothing to do detects no framework: the frameworks read
     // their control files (`package.json`, the Tauri markers), which are the
     // JS kind's inputs, and the sources a changed file brings.
@@ -1595,10 +1601,31 @@ fn sync_paths_with_store(
     // healthy index (marker absent) skips this entirely, so an ordinary sync is
     // byte-for-byte unchanged.
     if store.is_resolution_incomplete()? {
+        // The sweep writes base edges: the synthesized ones go stale first.
+        codegraph_resolve::synthesis::withdraw_marker(store)?;
         let stats = sweep_orphaned_refs(project_root, store, scope.options.max_file_size)?;
         outcome.pending_refs_processed = stats.total;
         outcome.pending_refs_resolved = stats.resolved;
         outcome.pending_refs_unresolved = stats.unresolved;
+    }
+
+    // The dispatch edges no reference names (W7-14), recomputed whole once
+    // the base graph is final. Every write to the base graph above comes
+    // after a withdrawal of the marker (`begin_mutation`, a lane bootstrap,
+    // the sweep), so a sync recomputes whenever it finds the marker away:
+    // after its own changes, or a sync that stopped before writing it back,
+    // which is this sync's last write.
+    if !codegraph_resolve::synthesis::marker_is_current(store)? {
+        #[cfg(test)]
+        if tests::FAIL_BEFORE_SYNTHESIS.with(std::cell::Cell::get) {
+            bail!("injected sync failure before synthesis");
+        }
+        codegraph_resolve::synthesis::run_stage(store, project_root, scope.options.max_file_size)?;
+        #[cfg(test)]
+        if tests::FAIL_BEFORE_SYNTHESIS_MARKER.with(std::cell::Cell::get) {
+            bail!("injected sync failure before the synthesis marker");
+        }
+        codegraph_resolve::synthesis::write_marker(store)?;
     }
 
     outcome.duration_ms = started.elapsed().as_millis();
@@ -2842,6 +2869,7 @@ impl ChangedNames {
             crate::dart_heads::withdraw_marker(store)?;
             crate::dart_libraries::withdraw_marker(store)?;
             crate::resolved_refs::withdraw_marker(store)?;
+            codegraph_resolve::synthesis::withdraw_marker(store)?;
             self.surface_dirty = true;
         }
         Ok(())
@@ -3071,6 +3099,14 @@ pub(crate) mod tests {
         /// Fail the next sync after its mutations, before resolution.
         pub(crate) static FAIL_BEFORE_RESOLUTION: std::cell::Cell<bool> =
             const { std::cell::Cell::new(false) };
+        /// Fail the next sync that recomputes synthesis once every other
+        /// write is done, before the stage.
+        pub(crate) static FAIL_BEFORE_SYNTHESIS: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
+        /// Fail the next sync that recomputes synthesis once the stage has
+        /// replaced the edges, before the marker goes back.
+        pub(crate) static FAIL_BEFORE_SYNTHESIS_MARKER: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
         /// Fail the next Lua row rebuild once the old rows are purged and
         /// one is written back.
         pub(crate) static FAIL_AFTER_LUA_ROW_PURGE: std::cell::Cell<bool> =
@@ -3214,6 +3250,268 @@ pub(crate) mod tests {
         let db = default_db_path(dir.path()).unwrap();
         sync_changed_paths(dir.path(), &db, files.iter().map(|(path, _)| *path)).unwrap();
         edge_projection(&db)
+    }
+
+    const SYNTH_SCENE: (&str, &str) = (
+        "src/scene.ts",
+        "type Callback = () => void;\nexport class Scene {\n  private callbacks = new Set<Callback>();\n  onUpdate(cb: Callback) {\n    this.callbacks.add(cb);\n  }\n  triggerUpdate() {\n    for (const cb of this.callbacks) cb();\n  }\n}\n",
+    );
+    const SYNTH_RENDER: (&str, &str) = (
+        "src/app.ts",
+        "import { Scene } from './scene';\nexport class App {\n  scene = new Scene();\n  constructor() {\n    this.scene.onUpdate(this.triggerRender);\n  }\n  triggerRender() {\n    return 1;\n  }\n  triggerPaint() {\n    return 2;\n  }\n}\n",
+    );
+    const SYNTH_PAINT: (&str, &str) = (
+        "src/app.ts",
+        "import { Scene } from './scene';\nexport class App {\n  scene = new Scene();\n  constructor() {\n    this.scene.onUpdate(this.triggerPaint);\n  }\n  triggerRender() {\n    return 1;\n  }\n  triggerPaint() {\n    return 2;\n  }\n}\n",
+    );
+
+    fn synthesis_marker(db: &Path) -> Option<String> {
+        Store::open(db)
+            .unwrap()
+            .get_project_metadata(codegraph_resolve::synthesis::VERSION_KEY)
+            .unwrap()
+    }
+
+    fn synthesized_edges(db: &Path) -> Vec<String> {
+        edge_projection(db)
+            .into_iter()
+            .filter(|edge| edge.contains("synthesizedBy"))
+            .collect()
+    }
+
+    /// Insert a synthesized edge no pass would make, between two nodes named
+    /// `source` and `target`: the stage's replacement must remove it.
+    fn plant_stale_synthesized_edge(db: &Path, source: &str, target: &str) {
+        let mut store = Store::open(db).unwrap();
+        let id = |name: &str| store.nodes_by_name(name).unwrap().pop().unwrap().id;
+        let edge = codegraph_core::types::Edge {
+            id: None,
+            source: id(source),
+            target: id(target),
+            kind: codegraph_core::types::EdgeKind::Calls,
+            metadata: Some(
+                serde_json::json!({"synthesizedBy": "callback", "registeredAt": "stale"}),
+            ),
+            line: None,
+            col: None,
+            provenance: Some("heuristic".to_string()),
+        };
+        store.insert_edges(&[edge]).unwrap();
+        assert!(
+            synthesized_edges(db)
+                .iter()
+                .any(|edge| edge.contains("stale"))
+        );
+    }
+
+    /// The stage follows an edit (W7-14): the registration moves to another
+    /// method, and the sync's synthesized edges are a fresh index's.
+    #[test]
+    fn a_sync_recomputes_the_synthesized_edges() {
+        let dir = TestDir::new("synthesis-edit");
+        let db = default_db_path(dir.path()).unwrap();
+        write_files(dir.path(), &[SYNTH_SCENE, SYNTH_RENDER]);
+        sync_changed_paths(dir.path(), &db, [SYNTH_SCENE.0, SYNTH_RENDER.0]).unwrap();
+        let before = synthesized_edges(&db);
+        assert!(
+            before.len() == 1 && before[0].contains("App::triggerRender"),
+            "{before:?}"
+        );
+        assert_eq!(
+            synthesis_marker(&db).as_deref(),
+            Some(codegraph_resolve::synthesis::VERSION)
+        );
+
+        write_files(dir.path(), &[SYNTH_PAINT]);
+        sync_changed_paths(dir.path(), &db, [SYNTH_PAINT.0]).unwrap();
+        let after = synthesized_edges(&db);
+        assert!(
+            after.len() == 1 && after[0].contains("App::triggerPaint"),
+            "{after:?}"
+        );
+        assert_eq!(
+            edge_projection(&db),
+            fresh_edges("synthesis-edit-fresh", &[SYNTH_SCENE, SYNTH_PAINT])
+        );
+    }
+
+    /// A sync that stops before the stage, or after the replacement and
+    /// before the marker, leaves the marker away (W7-14): the next sync, with
+    /// nothing changed, recomputes and writes it back.
+    #[test]
+    fn a_sync_stopped_before_its_synthesis_marker_leaves_the_next_to_recompute() {
+        for (label, hook) in [
+            ("stage", &FAIL_BEFORE_SYNTHESIS),
+            ("marker", &FAIL_BEFORE_SYNTHESIS_MARKER),
+        ] {
+            let dir = TestDir::new(&format!("synthesis-stop-{label}"));
+            let db = default_db_path(dir.path()).unwrap();
+            write_files(dir.path(), &[SYNTH_SCENE, SYNTH_RENDER]);
+            sync_changed_paths(dir.path(), &db, [SYNTH_SCENE.0, SYNTH_RENDER.0]).unwrap();
+
+            write_files(dir.path(), &[SYNTH_PAINT]);
+            hook.with(|fail| fail.set(true));
+            let failed = sync_changed_paths(dir.path(), &db, [SYNTH_PAINT.0]);
+            hook.with(|fail| fail.set(false));
+            assert!(
+                failed.is_err(),
+                "{label}: the injected failure must stop the sync"
+            );
+            assert_eq!(
+                synthesis_marker(&db),
+                None,
+                "{label}: the marker stays away"
+            );
+
+            sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
+            assert_eq!(
+                synthesis_marker(&db).as_deref(),
+                Some(codegraph_resolve::synthesis::VERSION),
+                "{label}"
+            );
+            assert_eq!(
+                edge_projection(&db),
+                fresh_edges(
+                    &format!("synthesis-stop-{label}-fresh"),
+                    &[SYNTH_SCENE, SYNTH_PAINT]
+                ),
+                "{label}"
+            );
+        }
+    }
+
+    /// A lane bootstrap re-resolves without `begin_mutation`, so it withdraws
+    /// the synthesis marker before its first write (W7-14): a sync that
+    /// stops after the lane markers went back leaves it away, and the next
+    /// sync replaces a stale synthesized edge.
+    #[test]
+    fn a_lane_bootstrap_withdraws_the_synthesis_marker() {
+        let dir = TestDir::new("synthesis-bootstrap");
+        let db = default_db_path(dir.path()).unwrap();
+        write_files(dir.path(), &[SYNTH_SCENE, SYNTH_RENDER]);
+        sync_changed_paths(dir.path(), &db, [SYNTH_SCENE.0, SYNTH_RENDER.0]).unwrap();
+        plant_stale_synthesized_edge(&db, "triggerPaint", "onUpdate");
+        Store::open(&db)
+            .unwrap()
+            .delete_project_metadata(codegraph_resolve::module_surface::VERSION_KEY)
+            .unwrap();
+
+        FAIL_BEFORE_SYNTHESIS.with(|fail| fail.set(true));
+        let failed = sync_changed_paths(dir.path(), &db, Vec::<&str>::new());
+        FAIL_BEFORE_SYNTHESIS.with(|fail| fail.set(false));
+        assert!(failed.is_err(), "the injected failure must stop the sync");
+        assert!(
+            surface_marker(&db).is_some(),
+            "the bootstrap's lane marker went back"
+        );
+        assert_eq!(synthesis_marker(&db), None);
+
+        sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
+        assert_eq!(
+            edge_projection(&db),
+            fresh_edges("synthesis-bootstrap-fresh", &[SYNTH_SCENE, SYNTH_RENDER])
+        );
+    }
+
+    /// The orphan sweep resolves new base edges on a sync with nothing
+    /// changed, so the stage recomputes after it (W7-14).
+    #[test]
+    fn the_orphan_sweep_recomputes_the_synthesized_edges() {
+        let dir = TestDir::new("synthesis-sweep");
+        let db = default_db_path(dir.path()).unwrap();
+        write_files(dir.path(), &[SYNTH_SCENE, SYNTH_RENDER]);
+        sync_changed_paths(dir.path(), &db, [SYNTH_SCENE.0, SYNTH_RENDER.0]).unwrap();
+        plant_stale_synthesized_edge(&db, "triggerPaint", "onUpdate");
+        Store::open(&db)
+            .unwrap()
+            .set_resolution_incomplete()
+            .unwrap();
+        assert_eq!(
+            synthesis_marker(&db).as_deref(),
+            Some(codegraph_resolve::synthesis::VERSION)
+        );
+
+        sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
+        assert!(
+            !Store::open(&db)
+                .unwrap()
+                .is_resolution_incomplete()
+                .unwrap()
+        );
+        assert_eq!(
+            edge_projection(&db),
+            fresh_edges("synthesis-sweep-fresh", &[SYNTH_SCENE, SYNTH_RENDER])
+        );
+    }
+
+    /// The orphan sweep withdraws the synthesis marker before its first
+    /// write (W7-14): a sync that stops after sweeping leaves it away, and
+    /// the next sync, with nothing to sweep, replaces a stale synthesized
+    /// edge.
+    #[test]
+    fn an_orphan_sweep_withdraws_the_synthesis_marker() {
+        let dir = TestDir::new("synthesis-sweep-stop");
+        let db = default_db_path(dir.path()).unwrap();
+        write_files(dir.path(), &[SYNTH_SCENE, SYNTH_RENDER]);
+        sync_changed_paths(dir.path(), &db, [SYNTH_SCENE.0, SYNTH_RENDER.0]).unwrap();
+        plant_stale_synthesized_edge(&db, "triggerPaint", "onUpdate");
+        Store::open(&db)
+            .unwrap()
+            .set_resolution_incomplete()
+            .unwrap();
+
+        FAIL_BEFORE_SYNTHESIS.with(|fail| fail.set(true));
+        let failed = sync_changed_paths(dir.path(), &db, Vec::<&str>::new());
+        FAIL_BEFORE_SYNTHESIS.with(|fail| fail.set(false));
+        assert!(failed.is_err(), "the injected failure must stop the sync");
+        assert!(
+            !Store::open(&db)
+                .unwrap()
+                .is_resolution_incomplete()
+                .unwrap()
+        );
+        assert_eq!(synthesis_marker(&db), None);
+
+        sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
+        assert_eq!(
+            edge_projection(&db),
+            fresh_edges("synthesis-sweep-stop-fresh", &[SYNTH_SCENE, SYNTH_RENDER])
+        );
+    }
+
+    /// A file that changed on disk since it was indexed feeds no pass until
+    /// its own sync (W7-14): its old nodes' lines would slice its new text.
+    /// Its lines need not have moved for that: the stage cannot tell, so a
+    /// drift that keeps every line where it was still hides the channel.
+    #[test]
+    fn a_drifted_file_feeds_no_synthesis_until_its_sync() {
+        const SCENE_DRIFTED: (&str, &str) = (
+            "src/scene.ts",
+            "type Callback = () => void;\nexport class Scene {\n  private callbacks = new Set<Callback>();\n  onUpdate(cb: Callback) {\n    this.callbacks.add(cb);\n  }\n  triggerUpdate() {\n    for (const callback of this.callbacks) callback();\n  }\n}\n",
+        );
+        const OTHER: (&str, &str) = ("src/other.ts", "export const other = 1;\n");
+        const OTHER_EDITED: (&str, &str) = ("src/other.ts", "export const other = 2;\n");
+        let dir = TestDir::new("synthesis-drift");
+        let db = default_db_path(dir.path()).unwrap();
+        write_files(dir.path(), &[SYNTH_SCENE, SYNTH_RENDER, OTHER]);
+        sync_changed_paths(dir.path(), &db, [SYNTH_SCENE.0, SYNTH_RENDER.0, OTHER.0]).unwrap();
+        assert_eq!(synthesized_edges(&db).len(), 1);
+
+        // The scene drifts; a sync of another file recomputes without it.
+        write_files(dir.path(), &[SCENE_DRIFTED, OTHER_EDITED]);
+        sync_changed_paths(dir.path(), &db, [OTHER_EDITED.0]).unwrap();
+        assert_eq!(synthesized_edges(&db), Vec::<String>::new());
+
+        // Its own sync brings the channel back, as a fresh index has it.
+        sync_changed_paths(dir.path(), &db, [SCENE_DRIFTED.0]).unwrap();
+        assert_eq!(synthesized_edges(&db).len(), 1);
+        assert_eq!(
+            edge_projection(&db),
+            fresh_edges(
+                "synthesis-drift-fresh",
+                &[SCENE_DRIFTED, SYNTH_RENDER, OTHER_EDITED]
+            )
+        );
     }
 
     /// A sync with no transaction around it can fail after its mutations

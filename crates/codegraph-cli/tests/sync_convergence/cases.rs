@@ -15803,3 +15803,190 @@ pub fn dart_chain_link_reaches_an_unnamed_extension_once_its_file_joins_the_libr
         .edge_after("function run", "calls", "method <anonymous>::area")
         .edge_after("function run", "calls", "method Item::save")
 }
+
+const SYNTH_SCENE: &str = "type Callback = () => void;\nexport class Scene {\n  private callbacks = new Set<Callback>();\n  onUpdate(cb: Callback) {\n    this.callbacks.add(cb);\n  }\n  triggerUpdate() {\n    for (const cb of this.callbacks) cb();\n  }\n}\n";
+const SYNTH_APP_RENDER: &str = "import { Scene } from './scene';\nexport class App {\n  scene = new Scene();\n  constructor() {\n    this.scene.onUpdate(this.triggerRender);\n  }\n  triggerRender() {\n    return 1;\n  }\n  triggerPaint() {\n    return 2;\n  }\n}\n";
+const SYNTH_APP_PAINT: &str = "import { Scene } from './scene';\nexport class App {\n  scene = new Scene();\n  constructor() {\n    this.scene.onUpdate(this.triggerPaint);\n  }\n  triggerRender() {\n    return 1;\n  }\n  triggerPaint() {\n    return 2;\n  }\n}\n";
+const SYNTH_BUS: &str = "export function save(bus) {\n  bus.emit('save');\n}\nexport function wire(bus) {\n  bus.on('save', handleSave);\n}\n";
+
+/// W7-14: a field registration moves to another method; the synthesized
+/// dispatch edge follows it.
+pub fn typescript_synthesis_registration_moves() -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript])
+        .file("src/scene.ts", SYNTH_SCENE)
+        .file("src/app.ts", SYNTH_APP_RENDER)
+        .write("src/app.ts", SYNTH_APP_PAINT)
+        .edge_before(
+            "method Scene::triggerUpdate",
+            "calls",
+            "method App::triggerRender",
+        )
+        .no_edge_after(
+            "method Scene::triggerUpdate",
+            "calls",
+            "method App::triggerRender",
+        )
+        .edge_metadata_after(
+            (
+                "method Scene::triggerUpdate",
+                "calls",
+                "method App::triggerPaint",
+            ),
+            "synthesizedBy",
+            "callback",
+        )
+}
+
+/// W7-14: the file holding a channel's registrar and dispatcher goes, and
+/// with it every edge the channel synthesized.
+pub fn typescript_synthesis_channel_file_deleted() -> Case {
+    Case::new(Change::DeleteImportedModule, &[Language::TypeScript])
+        .file("src/scene.ts", SYNTH_SCENE)
+        .file("src/app.ts", SYNTH_APP_RENDER)
+        .remove("src/scene.ts")
+        .edge_before(
+            "method Scene::triggerUpdate",
+            "calls",
+            "method App::triggerRender",
+        )
+}
+
+/// W7-14: an edit to a file no pass reads recomputes the stage to the same
+/// synthesized edges.
+pub fn typescript_synthesis_survives_an_unrelated_edit() -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript])
+        .file("src/scene.ts", SYNTH_SCENE)
+        .file("src/app.ts", SYNTH_APP_RENDER)
+        .file(
+            "src/util.ts",
+            "export function twice(n: number) {\n  return n * 2;\n}\n",
+        )
+        .write(
+            "src/util.ts",
+            "export function twice(n: number) {\n  return n + n;\n}\n",
+        )
+        .edge_throughout(
+            "method Scene::triggerUpdate",
+            "calls",
+            "method App::triggerRender",
+        )
+        .edge_metadata_after(
+            (
+                "method Scene::triggerUpdate",
+                "calls",
+                "method App::triggerRender",
+            ),
+            "synthesizedBy",
+            "callback",
+        )
+}
+
+/// W7-14: a definition of a synthesized edge's target's name appears in
+/// another file. The registration binds `this.triggerRender`, so the edge
+/// stays, and the sync's site machinery leaves it to the stage.
+pub fn typescript_synthesis_target_gains_a_namesake() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::TypeScript])
+        .file("src/scene.ts", SYNTH_SCENE)
+        .file("src/app.ts", SYNTH_APP_RENDER)
+        .write(
+            "src/other.ts",
+            "export function triggerRender() {\n  return 3;\n}\n",
+        )
+        .edge_throughout(
+            "method Scene::triggerUpdate",
+            "calls",
+            "method App::triggerRender",
+        )
+        .edge_metadata_after(
+            (
+                "method Scene::triggerUpdate",
+                "calls",
+                "method App::triggerRender",
+            ),
+            "synthesizedBy",
+            "callback",
+        )
+}
+
+/// W7-14: a second definition of an emitter handler's name appears in a
+/// file the registration does not name: the name means no one function
+/// any more (KEEP-RUST), so the edge goes, as a fresh index leaves it out.
+pub fn javascript_emitter_handler_gains_a_competitor() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::JavaScript])
+        .file("src/app.js", SYNTH_BUS)
+        .file(
+            "src/handlers.js",
+            "export function handleSave() {\n  return 1;\n}\n",
+        )
+        .write(
+            "src/other.js",
+            "export function handleSave() {\n  return 2;\n}\n",
+        )
+        .edge_before(
+            "function save",
+            "calls",
+            "function handleSave @src/handlers.js",
+        )
+        .no_edge_after(
+            "function save",
+            "calls",
+            "function handleSave @src/handlers.js",
+        )
+}
+
+/// W7-14: the competing definition is renamed, the handler's name means
+/// one function again, and the edge appears.
+pub fn javascript_emitter_handler_loses_a_competitor() -> Case {
+    Case::new(Change::RenameSymbol, &[Language::JavaScript])
+        .file("src/app.js", SYNTH_BUS)
+        .file(
+            "src/handlers.js",
+            "export function handleSave() {\n  return 1;\n}\n",
+        )
+        .file(
+            "src/other.js",
+            "export function handleSave() {\n  return 2;\n}\n",
+        )
+        .write(
+            "src/other.js",
+            "export function handleOther() {\n  return 2;\n}\n",
+        )
+        .edge_metadata_after(
+            (
+                "function save",
+                "calls",
+                "function handleSave @src/handlers.js",
+            ),
+            "synthesizedBy",
+            "event-emitter",
+        )
+}
+
+/// W7-14 (KEEP-RUST order): `complete` iterates both fields `feed` appends
+/// to, so the first field the pass walks names its edge. The pass walks
+/// callables by file, line and column; a sync rewrites the edited file's
+/// node rows after the others', and the edge keeps a fresh index's field.
+pub fn swift_closure_collection_keeps_its_field_after_an_edit() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Swift])
+        .file(
+            "Sources/A.swift",
+            "class Early {\n    var handlers: [() -> Void] = []\n\n    func runHandlers() {\n        handlers.forEach { $0() }\n    }\n}\n",
+        )
+        .file(
+            "Sources/B.swift",
+            "class Late {\n    var validators: [() -> Void] = []\n    var handlers: [() -> Void] = []\n\n    func complete() {\n        validators.forEach { $0() }\n        handlers.forEach { $0() }\n    }\n}\n",
+        )
+        .file(
+            "Sources/C.swift",
+            "class Feeder {\n    func feed(_ job: @escaping () -> Void) {\n        validators.append(job)\n        handlers.append(job)\n    }\n}\n",
+        )
+        .write(
+            "Sources/A.swift",
+            "class Early {\n    var handlers: [() -> Void] = []\n\n    func runHandlers() {\n        let count = handlers.count\n        handlers.forEach { $0() }\n    }\n}\n",
+        )
+        .edge_metadata_after(
+            ("method Late::complete", "calls", "method Feeder::feed"),
+            "field",
+            "handlers",
+        )
+}
