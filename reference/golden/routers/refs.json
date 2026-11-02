@@ -501,16 +501,6 @@
   },
   {
     "candidates": null,
-    "col": 4,
-    "file_path": "apps/angular/src/app/home/home.component.ts",
-    "from_node_id": "method:bbc2c93e3330c7a866ecaf686ba2f83b",
-    "language": "typescript",
-    "line": 16,
-    "reference_kind": "calls",
-    "reference_name": "this.router.navigate"
-  },
-  {
-    "candidates": null,
     "col": 50,
     "file_path": "apps/vue/src/router/index.ts",
     "from_node_id": "constant:aae634828e679bd138fccffb08050d6b",

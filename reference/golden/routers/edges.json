@@ -450,6 +450,21 @@
   {
     "col": 4,
     "kind": "navigates",
+    "line": 16,
+    "metadata": {
+      "confidence": 0.95,
+      "framework": "angular-router",
+      "href": "/lazy",
+      "navMethod": "navigate",
+      "resolvedBy": "framework"
+    },
+    "provenance": null,
+    "source": "method:bbc2c93e3330c7a866ecaf686ba2f83b",
+    "target": "route:apps/angular/src/app/app.routes.ts:6:/lazy:angular"
+  },
+  {
+    "col": 4,
+    "kind": "navigates",
     "line": 4,
     "metadata": {
       "confidence": 0.95,

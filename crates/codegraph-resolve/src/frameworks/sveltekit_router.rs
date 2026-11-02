@@ -61,7 +61,7 @@ fn is_optional_param(seg: &str) -> bool {
 
 /// Whether `path` names another site: a scheme (`https:`, `mailto:`) or a
 /// protocol-relative `//host`.
-fn leaves_the_site(path: &str) -> bool {
+pub(crate) fn leaves_the_site(path: &str) -> bool {
     path.starts_with("//")
         || path.split_once(':').is_some_and(|(scheme, _)| {
             !scheme.is_empty()

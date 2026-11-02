@@ -93,9 +93,11 @@ pub fn detect_frameworks(context: &dyn ResolutionContext) -> Vec<Box<dyn Framewo
         // routers. It claims navigation calls only where they name one of
         // its own routes or a Nuxt page, and its routes' own references.
         Box::new(vue_router::VueRouterResolver),
-        // Angular's `Routes` arrays and the components they render, after
-        // Vue Router and before Expo Router, as upstream orders the routers.
-        // It claims only its own routes' lazy and layout references.
+        // Angular's `Routes` arrays, the components they render and the
+        // router's navigation, after Vue Router and before Expo Router, as
+        // upstream orders the routers. It claims its own routes' lazy and
+        // layout references, and `router.navigate`-style calls only where
+        // they name one of its own routes.
         Box::new(angular_router::AngularRouterResolver),
         // Expo Router screens and navigation (F2), after Next.js as upstream
         // registers it. It claims navigation calls only where their href

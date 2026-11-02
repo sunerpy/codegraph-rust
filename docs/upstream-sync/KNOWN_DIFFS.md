@@ -362,6 +362,33 @@ listed.
   eight hops, and an alias that leads back to a chain being read reads
   nothing; colby follows aliases without a bound, so `const a = a.b;`
   recursed until the stack ran out (`angular_router.rs`).
+- **A path two Angular routes of one app serve, and Angular redirects
+  (W7-13).** A navigation call matches only the routes of its own app, as in
+  colby, and a path two routes of that app serve stays unresolved. A
+  redirect is followed through the routes and the other redirects at most
+  four hops, whatever order its files are read in: a path a route serves
+  keeps the route, a path whose redirects lead to two routes reaches neither,
+  and so does `/` when two root `**` redirects disagree. colby keeps the
+  first route of a path in node order (`addRouteTo`) and applies redirects
+  in node and file order for four passes, the first to claim a path keeping
+  it, so which redirect wins and how long a chain resolves depend on an
+  order a sync changes (`angular_router.rs`).
+- **An Angular destination (W7-13).** `'/editor/' + slug` is the literal
+  and one segment only when the literal ends with `/` and one operand
+  follows; a conditional or a template is read whole, as Vue Router reads
+  its destinations; a relative arm of a conditional, and an arm that leaves
+  the site (`//auth.example.com/login`), drop out before the arms are
+  matched; `.concat` adds a segment per argument, its arguments split at
+  the top level; and a route or a redirect whose path holds a constant the
+  cross-file pass could not read is in no table. colby adds
+  `/` and a hole to any literal head, so `'/redirect' + path` reached
+  `/redirect/:x` and `'/a/' + b + '/c'` reached `/a/:x`, reads the literal
+  heading a conditional or a template (a hole sharing a segment counts as
+  the segment), checks only the first arm of a conditional, matches an
+  absolute URL's path (`//auth.example.com/login` reached `/login`), splits
+  `.concat`'s arguments at every comma, and matches an unread constant's
+  placeholder as a literal segment, which any hole of a destination fits
+  and a destination written the same way names (`angular_router.rs`).
 - **A path two SvelteKit pages of one app serve (W7-12).** A navigation
   call matches only the pages of its own app, as in colby, and a path two
   pages of that app serve (`(a)/x/+page.svelte` beside `(b)/x/+page.svelte`,

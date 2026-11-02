@@ -1489,6 +1489,8 @@ matrix! {
     typescript_angular_mounted_routes_file_appears,
     typescript_angular_earlier_file_mounts_the_routes_too,
     typescript_angular_dependency_appears_in_package_json,
+    typescript_angular_navigation_call_names_another_route,
+    typescript_angular_redirect_chain_link_moves,
     tsx_react_router_route_renders_another_page,
     tsx_react_router_page_body_edit_keeps_its_route,
     tsx_react_router_page_delete_leaves_its_route,

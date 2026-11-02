@@ -1,7 +1,8 @@
 //! Angular Router (upstream `frameworks/angular-router.ts` at `e8ddc4e2`,
 //! which is `b635dd46` with `escapeRegExp` on the names its declaration
 //! patterns build): routes declared in `Routes` arrays, the components they
-//! render, and the path each sits at once its lazily loaded file is mounted.
+//! render, the path each sits at once its lazily loaded file is mounted, and
+//! the router's navigation calls.
 //!
 //! ```text
 //! export const routes: Routes = [
@@ -37,6 +38,14 @@
 //! this resolver answers). Each route also references the components of the
 //! layouts it renders inside (`layout:`).
 //!
+//! A navigation call (`this.router.navigate([...])`, `navigateByUrl`,
+//! `createUrlTree`, `parseUrl`) binds to the route of its own app its
+//! destination names, a `navigates` edge: a command array, a static string,
+//! a route constant or the calling class's property holding one, read
+//! through `.concat`. An app is an Angular workspace (`angular.json`,
+//! `nx.json`) or a conventional app root, and a redirect makes its path the
+//! route it leads to.
+//!
 //! KEEP-RUST:
 //! - `children` and a constant's nested object are read only where they are
 //!   written in place. Upstream takes the first `[` (or `{`) after the key,
@@ -47,6 +56,16 @@
 //!   up to the first file that repeats. Upstream memoizes the prefixes in the
 //!   order it asks for them, so in a cycle a file's name depended on which
 //!   route was renamed first.
+//! - The route table does not depend on node or file order: a path two
+//!   routes of an app serve stays unresolved, and a redirect is followed
+//!   through the others at most four hops, a path whose redirects lead to two
+//!   routes reaching neither. Upstream keeps the first route or redirect of a
+//!   path in node and file order.
+//! - A destination is read whole where upstream reads its literal head:
+//!   `'/editor/' + slug` only when the literal ends with `/` and one operand
+//!   follows, a conditional or template whole, a relative or off-site arm
+//!   (`//host/…`) dropped before matching; a route or redirect with an
+//!   unread constant is in no table.
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -60,13 +79,17 @@ use super::js_scan::{
     JS_SPACE, ObjectField, is_js_space, js_trim, match_bracket, read_fields, skip_string,
     top_level_objects,
 };
-use super::route_href::read_string_at;
-use crate::framework::{FrameworkExtractionContext, FrameworkResolver};
+use super::route_href::{
+    ExactTable, HOLE, HrefLiteral, Literal, RouteEntry, app_root_for, destinations_for_href,
+    first_argument_text, nth_argument_text, parse_href, read_string_at, to_href,
+};
+use super::sveltekit_router::leaves_the_site;
+use crate::framework::{FrameworkExtractionContext, FrameworkResolver, NavigationCalls};
 use crate::import_resolver::resolve_import_path;
 use crate::strip_comments::strip_js_comments_keeping_offsets;
 use crate::types::{
-    EdgeShape, FrameworkResolverExtractionResult, RefView, ResolutionContext, ResolvedBy,
-    ResolvedRef,
+    AlsoTarget, EdgeShape, FrameworkResolverExtractionResult, RefView, ResolutionContext,
+    ResolvedBy, ResolvedRef,
 };
 
 /// How deep `children` nest before the walk stops (upstream's `depth > 12`).
@@ -1203,6 +1226,9 @@ fn read_chain(safe: &str, open: usize, links: &[&str]) -> Option<String> {
 struct AngularMounts {
     /// The file that loads each loaded file, and the path it loads it at.
     loaded_by: BTreeMap<String, (String, String)>,
+    /// Every file that lazy-loads routes, whether or not it declares a
+    /// screen of its own (`mountFiles`).
+    mount_files: BTreeSet<String>,
 }
 
 impl AngularMounts {
@@ -1240,7 +1266,10 @@ impl AngularMounts {
                 }
             }
         }
-        Self { loaded_by }
+        Self {
+            loaded_by,
+            mount_files,
+        }
     }
 
     /// The path segments `file`'s routes sit under: its parent's prefix plus
@@ -1332,6 +1361,609 @@ fn route_files_loaded_by(
     out
 }
 
+// =============================================================================
+// Navigation
+// =============================================================================
+
+/// How many redirects a destination is followed through (upstream settles
+/// its aliases in four passes).
+const MAX_REDIRECT_HOPS: usize = 4;
+
+/// How deep a destination is followed through properties, constants and
+/// `.concat` (`destinationOf`'s `depth > 4`).
+const MAX_DESTINATION_DEPTH: usize = 4;
+
+/// The verbs of the router's navigation calls (`navigation.tails`).
+const NAV_TAILS: [&str; 4] = ["navigate", "navigateByUrl", "createUrlTree", "parseUrl"];
+
+/// `this.router.navigate`, `router.navigateByUrl`, `this._router.createUrlTree`,
+/// `router.parseUrl` (`NAV_CALL`).
+fn nav_call() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        regex(r"^(?:this\.)?_?[rR]outer\.(navigate|navigateByUrl|createUrlTree|parseUrl)$")
+    })
+}
+
+/// The verb a navigation call's name ends with, or `None` for any other name.
+fn nav_verb(name: &str) -> Option<&str> {
+    nav_call()
+        .captures(name)
+        .and_then(|caps| caps.get(1))
+        .map(|verb| verb.as_str())
+}
+
+/// `relativeTo` among a navigation's extras.
+fn relative_to() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| regex(r"(?-u:\b)relativeTo(?-u:\b)"))
+}
+
+/// `x.concat(…)`: the value and its arguments.
+fn concat_call() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| regex(&format!(r"(?s)^(.*?)\.concat{s}*\((.*)\)$", s = JS_SPACE)))
+}
+
+/// `update.routerLink(dataSource, symbol)`: a member chain, called.
+fn chain_call() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        regex(&format!(
+            r"(?s)^((?:this{s}*\.{s}*)?[A-Za-z_$][A-Za-z0-9_$]*(?:{s}*\.{s}*[A-Za-z_$][A-Za-z0-9_$]*)+){s}*\((.*)\)$",
+            s = JS_SPACE
+        ))
+    })
+}
+
+/// `this.routerLinkAbout`, `internalRoutes.zen.routerLink`, `link`.
+fn member_chain() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        regex(&format!(
+            r"^(?:this{s}*\.{s}*)?([A-Za-z_$][A-Za-z0-9_$]*(?:{s}*\.{s}*[A-Za-z_$][A-Za-z0-9_$]*)*)$",
+            s = JS_SPACE
+        ))
+    })
+}
+
+/// `return [` in an arrow function's body.
+fn returns_array() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| regex(&format!(r"(?-u:\b)return{s}*\[", s = JS_SPACE)))
+}
+
+/// The comma-separated items of `text`, strings and brackets stepped over;
+/// `None` when one never closes.
+fn top_level_items(text: &str) -> Option<Vec<&str>> {
+    let bytes = text.as_bytes();
+    let mut items = Vec::new();
+    let mut start = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' | b'\'' | b'`' => i = skip_string(text, i)?,
+            b'[' | b'{' | b'(' => i = match_bracket(text, i)?,
+            b',' => {
+                items.push(&text[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    items.push(&text[start..]);
+    Some(items)
+}
+
+/// The href, when it names at least one segment of its own
+/// (`namesSomewhere`): a path of holes alone (`` [`/${a}`, b, c] ``) would
+/// match any route of its length.
+fn names_somewhere(href: HrefLiteral) -> Option<HrefLiteral> {
+    let mut segs = href
+        .path
+        .split('/')
+        .filter(|seg| !seg.is_empty())
+        .peekable();
+    let names = segs.peek().is_none() || segs.any(|seg| !seg.contains(HOLE));
+    names.then_some(href)
+}
+
+/// The destination a command array names (`commandsHref`): `['/article',
+/// slug]` is `/article/${…}`, each static element's segments in turn, a hole
+/// for a computed one, nothing for a matrix-params object. Only an absolute
+/// array names a place: its first element a static string starting with
+/// `/`, or, for a call that names no `relativeTo` (`from_root`), any that
+/// does not start with `.`. In a template, `['../', id]` and `['edit']` are
+/// relative to wherever the component is.
+pub(crate) fn commands_href(text: &str, from_root: bool) -> Option<HrefLiteral> {
+    let arr = js_trim(text);
+    if !arr.starts_with('[') {
+        return None;
+    }
+    let close = match_bracket(arr, 0)?;
+    let elements = top_level_items(&arr[1..close])?;
+    let mut parts: Vec<String> = Vec::new();
+    for element in &elements {
+        let element = js_trim(element);
+        if element.is_empty() {
+            continue;
+        }
+        if let Some(literal) = static_string(element) {
+            parts.extend(segments_of(&literal));
+        } else if !element.starts_with('{') {
+            parts.push(HOLE.to_string());
+        }
+    }
+    let first = static_string(js_trim(elements.first().copied().unwrap_or("")))?;
+    if !(first.starts_with('/') || (from_root && !first.starts_with('.'))) {
+        return None;
+    }
+    let path = format!("/{}", parts.join("/"));
+    names_somewhere(HrefLiteral {
+        display: path.replace(HOLE, "${…}"),
+        path,
+        alternates: Vec::new(),
+    })
+}
+
+/// A class property's initializer, read from the class's own lines:
+/// `routerLinkAbout = publicRoutes.about.routerLink;` (`propertyInitializer`).
+fn property_initializer(owner: &Node, name: &str, content: &str) -> Option<String> {
+    let first = usize::try_from(owner.start_line - 1).ok()?;
+    let last = usize::try_from(owner.end_line).ok()?;
+    let body = content
+        .split('\n')
+        .skip(first)
+        .take(last.saturating_sub(first))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let decl = regex(&format!(
+        r"(?:^|{s}|[;{{])(?:(?:public|private|protected|readonly|static|override){s}+)*{name}{s}*(?::[^=;\n]+)?={s}*",
+        name = regex::escape(name),
+        s = JS_SPACE
+    ));
+    let start = decl.find(&body)?.end();
+    let bytes = body.as_bytes();
+    let mut i = start;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' | b'\'' | b'`' => i = skip_string(&body, i)?,
+            b'[' | b'{' | b'(' => i = match_bracket(&body, i)?,
+            b';' | b'\n' => break,
+            _ => {}
+        }
+        i += 1;
+    }
+    let value = js_trim(&body[start..i.min(bytes.len())]);
+    (!value.is_empty()).then(|| value.to_string())
+}
+
+/// The array an arrow function returns: `(id) => ['/x', id]` or `(id) => {
+/// return ['/x', id]; }` (`arrowReturn`).
+fn arrow_return(fun: &str) -> Option<&str> {
+    let arrow = fun.find("=>")?;
+    let rest = &fun[arrow + 2..];
+    let mut i = fun.len() - rest.trim_start_matches(is_js_space).len();
+    let bytes = fun.as_bytes();
+    if bytes.get(i) == Some(&b'(') {
+        i += 1;
+    }
+    match bytes.get(i) {
+        Some(b'[') => {
+            let end = match_bracket(fun, i).filter(|end| *end > i)?;
+            Some(&fun[i..=end])
+        }
+        Some(b'{') => {
+            let ret = returns_array().find(&fun[i..])?;
+            let open = i + ret.end() - 1;
+            let end = match_bracket(fun, open).filter(|end| *end > open)?;
+            Some(&fun[open..=end])
+        }
+        _ => None,
+    }
+}
+
+/// Where an Angular destination expression leads, the argument of
+/// `router.navigate(…)` (`angularDestination`):
+///
+/// - a command array, `['/article', slug]`;
+/// - a static string, `'/login'` or `'/' + $localize…`, and `'/editor/' +
+///   slug`;
+/// - a route constant, `internalRoutes.zen.routerLink`, or one that builds
+///   its commands, `access.routerLink('me')`;
+/// - a property of the class it is written in, `this.routerLinkAbout`,
+///   holding one of those;
+/// - any of those `.concat(id)`, one more segment per argument.
+///
+/// `owner` is the class the expression is written in, for its properties.
+fn angular_destination(
+    expr: &str,
+    file: &str,
+    owner: Option<&Node>,
+    constants: &ConstantReader<'_>,
+    depth: usize,
+    from_root: bool,
+) -> Option<HrefLiteral> {
+    destination_of(expr, file, owner, constants, depth, from_root).and_then(names_somewhere)
+}
+
+fn destination_of(
+    expr: &str,
+    file: &str,
+    owner: Option<&Node>,
+    constants: &ConstantReader<'_>,
+    depth: usize,
+    from_root: bool,
+) -> Option<HrefLiteral> {
+    let text = js_trim(expr);
+    if text.is_empty() || depth > MAX_DESTINATION_DEPTH {
+        return None;
+    }
+    if text.starts_with('[') {
+        return commands_href(text, from_root);
+    }
+    if let Some(literal) = static_string(text) {
+        return to_href(Some(literal));
+    }
+    // `'/editor/' + article.slug`: the literal, then a hole for the one
+    // segment its other operand fills. KEEP-RUST: only a literal ending
+    // with `/` and one operand after it; upstream adds `/` and a hole to any
+    // literal head, so `'/redirect' + path` reached `/redirect/:x`.
+    if text.starts_with(['\'', '"'])
+        && let [head, tail] = split_plus(text).as_slice()
+        && static_string(tail).is_none()
+        && let Some(head) = static_string(head)
+        && head.starts_with('/')
+        && head.ends_with('/')
+    {
+        return to_href(Some(format!("{head}{HOLE}")));
+    }
+    // `this.routerLinkAdminControlUsers.concat(userId)`: a segment more for
+    // each argument.
+    if let Some(concat) = concat_call().captures(text) {
+        let base = angular_destination(&concat[1], file, owner, constants, depth + 1, from_root);
+        let added = top_level_items(&concat[2]).map_or(0, |items| {
+            items
+                .iter()
+                .filter(|item| !js_trim(item).is_empty())
+                .count()
+        });
+        return match base {
+            Some(base) if added > 0 => {
+                let path = base.path.strip_suffix('/').unwrap_or(&base.path);
+                to_href(Some(format!("{path}{}", format!("/{HOLE}").repeat(added))))
+            }
+            base => base,
+        };
+    }
+    // `update.routerLink(dataSource, symbol)`: a route constant that builds
+    // its commands, its returned array read with the arguments as holes.
+    if let Some(call) = chain_call().captures(text) {
+        let chain = without_space(&call[1]);
+        let chain = chain.strip_prefix("this.").unwrap_or(&chain);
+        let fun = constants.constant_text(chain, file)?;
+        return commands_href(arrow_return(&fun)?, from_root);
+    }
+    let Some(chain) = member_chain().captures(text) else {
+        // KEEP-RUST: a conditional or template is read whole, as Vue Router
+        // and SvelteKit read theirs; upstream reads the literal heading it.
+        return parse_href(text, Literal::Whole);
+    };
+    let parts: Vec<String> = without_space(&chain[1])
+        .split('.')
+        .map(str::to_string)
+        .collect();
+    if let Some(owner) = owner
+        && (text.starts_with("this") || parts.len() == 1)
+        && let Some(content) = constants.context.read_file_shared(file)
+        && let Some(init) = property_initializer(owner, &parts[0], &content)
+    {
+        let expr = match parts.as_slice() {
+            [_] => init,
+            [_, rest @ ..] => format!("{init}.{}", rest.join(".")),
+            [] => return None,
+        };
+        return angular_destination(&expr, file, Some(owner), constants, depth + 1, from_root);
+    }
+    let constant = constants.constant_text(&parts.join("."), file)?;
+    angular_destination(&constant, file, owner, constants, depth + 1, from_root)
+}
+
+/// The arms of `href` a navigation can take: absolute, on this site, and
+/// naming a segment of their own. Every other arm drops out before the arms
+/// are matched, so a relative arm before an absolute one does not hide it,
+/// and `//auth.example.com/login` is not this app's `/login` (KEEP-RUST:
+/// upstream reads only the first arm's path, and an absolute URL's path).
+fn navigable_arms(href: &HrefLiteral) -> Option<HrefLiteral> {
+    let mut arms = href
+        .arms()
+        .filter(|arm| arm.path.starts_with('/') && !leaves_the_site(&arm.path))
+        .map(|arm| HrefLiteral {
+            path: arm.path.clone(),
+            display: arm.display.clone(),
+            alternates: Vec::new(),
+        })
+        .filter_map(names_somewhere);
+    let mut first = arms.next()?;
+    first.alternates = arms.collect();
+    Some(first)
+}
+
+/// The app a routes file belongs to (`angularAppRoot`): the nearest
+/// directory above it holding an `angular.json` or an Nx `nx.json`, so a
+/// workspace whose screens are split across `libs/*` is one app; else the
+/// conventional app root.
+fn angular_app_root(
+    file_path: &str,
+    context: &dyn ResolutionContext,
+    memo: &mut HashMap<String, Option<String>>,
+) -> String {
+    let dir = file_path.rfind('/').map_or("", |slash| &file_path[..slash]);
+    let found = match memo.get(dir) {
+        Some(found) => found.clone(),
+        None => {
+            let mut found = None;
+            let mut current = Some(dir);
+            while let Some(d) = current {
+                let at = if d.is_empty() {
+                    String::new()
+                } else {
+                    format!("{d}/")
+                };
+                if context.file_exists(&format!("{at}angular.json"))
+                    || context.file_exists(&format!("{at}nx.json"))
+                {
+                    found = Some(at);
+                    break;
+                }
+                current = (!d.is_empty()).then(|| d.rfind('/').map_or("", |slash| &d[..slash]));
+            }
+            memo.insert(dir.to_string(), found.clone());
+            found
+        }
+    };
+    found.unwrap_or_else(|| app_root_for(file_path))
+}
+
+/// True for a route a navigation can reach (`inAngularTable`): this
+/// resolver's, at an absolute path. KEEP-RUST: a route whose path still
+/// holds a constant the cross-file pass could not read (`/{paths.lost}`)
+/// is in no table; upstream matches the placeholder as a literal segment,
+/// which any hole of a destination fits.
+fn in_angular_table(node: &Node) -> bool {
+    is_angular_route(node) && node.name.starts_with('/') && !node.name.contains('{')
+}
+
+/// One Angular app's routes, by path (`RouteTable`).
+#[derive(Debug, Default)]
+struct AngularApp {
+    exact: ExactTable,
+    /// The routes with a parameter in their path.
+    dynamic: Vec<RouteEntry>,
+}
+
+/// Every Angular app's routes, by the directory the app lives in, with the
+/// paths its redirects serve (`angularRouteTable`).
+#[derive(Debug, Default)]
+struct AngularTable {
+    by_root: BTreeMap<String, AngularApp>,
+}
+
+/// The routes every path reaches through `aliases` (redirect `from` → the
+/// `to`s it sends the user to) in at most `hops` more redirects: the routes
+/// serving it, else those its redirects reach.
+fn reached(
+    served: &BTreeMap<String, Vec<Arc<Node>>>,
+    aliases: &BTreeMap<String, BTreeSet<String>>,
+    path: &str,
+    hops: usize,
+    out: &mut BTreeMap<String, Arc<Node>>,
+) {
+    if let Some(routes) = served.get(path) {
+        for route in routes {
+            out.insert(route.id.clone(), Arc::clone(route));
+        }
+        return;
+    }
+    if hops == 0 {
+        return;
+    }
+    for to in aliases.get(path).into_iter().flatten() {
+        reached(served, aliases, to, hops - 1, out);
+    }
+}
+
+impl AngularTable {
+    fn build(context: &dyn ResolutionContext) -> Self {
+        let mut memo = HashMap::new();
+        let routes: Vec<Arc<Node>> = context
+            .get_nodes_by_kind_shared(NodeKind::Route)
+            .into_iter()
+            .filter(|node| is_angular_route(node))
+            .collect();
+        // The apps, one per root holding an Angular route (one whose path
+        // holds an unread constant too, as upstream's `byRoot`), and each
+        // app's routes by the path they serve.
+        let mut apps: BTreeSet<String> = BTreeSet::new();
+        let mut served: BTreeMap<String, BTreeMap<String, Vec<Arc<Node>>>> = BTreeMap::new();
+        for route in routes.iter().filter(|route| route.name.starts_with('/')) {
+            let root = angular_app_root(&route.file_path, context, &mut memo);
+            if in_angular_table(route) {
+                served
+                    .entry(root.clone())
+                    .or_default()
+                    .entry(route.name.clone())
+                    .or_default()
+                    .push(Arc::clone(route));
+            }
+            apps.insert(root);
+        }
+        // Redirects: arriving at `/` is arriving wherever `redirectTo` sends
+        // the user, read from every routes file and every file that only
+        // mounts others, under the path the file is mounted at.
+        let route_files: BTreeSet<String> =
+            routes.iter().map(|route| route.file_path.clone()).collect();
+        let mounts = AngularMounts::read(context, &route_files);
+        let constants = ConstantReader::new(context);
+        let only_root = (apps.len() == 1)
+            .then(|| apps.iter().next().cloned())
+            .flatten();
+        let mut aliases: BTreeMap<String, BTreeMap<String, BTreeSet<String>>> = BTreeMap::new();
+        for file in route_files.iter().chain(mounts.mount_files.iter()) {
+            let Some(content) = context.read_file_shared(file) else {
+                continue;
+            };
+            if !content.contains("redirectTo") {
+                continue;
+            }
+            let own = angular_app_root(file, context, &mut memo);
+            let Some(root) = apps
+                .contains(&own)
+                .then_some(own)
+                .or_else(|| only_root.clone())
+            else {
+                continue;
+            };
+            let prefix = mounts.prefix_of(file, &constants);
+            for redirect in parse_angular_routes(&content).redirects {
+                let mut from = prefix.clone();
+                from.extend(constants.resolved_segments(&redirect.from, file));
+                let mut to = if redirect.absolute {
+                    Vec::new()
+                } else {
+                    prefix.clone()
+                };
+                to.extend(constants.resolved_segments(&redirect.to, file));
+                let (from, to) = (join_path(&from), join_path(&to));
+                // KEEP-RUST: a path that still holds a constant the
+                // cross-file pass could not read names no real address, so
+                // a redirect from or to one is skipped. Upstream keeps the
+                // placeholder, which a destination written the same way
+                // matches.
+                if from.contains('{') || to.contains('{') {
+                    continue;
+                }
+                aliases
+                    .entry(root.clone())
+                    .or_default()
+                    .entry(from)
+                    .or_default()
+                    .insert(to);
+            }
+        }
+        let mut table = Self::default();
+        let no_paths = BTreeMap::new();
+        for root in &apps {
+            let paths = served.get(root).unwrap_or(&no_paths);
+            let app = table.by_root.entry(root.clone()).or_default();
+            for (path, nodes) in paths {
+                for node in nodes {
+                    app.exact
+                        .insert(path.clone(), root.clone(), Arc::clone(node));
+                    if path.contains(':') {
+                        app.dynamic.push(RouteEntry::new(Arc::clone(node)));
+                    }
+                }
+            }
+            // KEEP-RUST: each redirect is followed through the routes and
+            // the other redirects at most four hops, whatever order they are
+            // read in; a path a route serves keeps it (as upstream's
+            // `!exact.has(from)`), and a path whose redirects reach two
+            // routes reaches neither. Upstream applies them in node and
+            // file order, the first to claim a path keeping it.
+            let empty = BTreeMap::new();
+            let app_aliases = aliases.get(root).unwrap_or(&empty);
+            let mut aliased: BTreeSet<&str> = BTreeSet::new();
+            for (from, tos) in app_aliases {
+                if paths.contains_key(from) {
+                    continue;
+                }
+                let mut targets = BTreeMap::new();
+                for to in tos {
+                    reached(paths, app_aliases, to, MAX_REDIRECT_HOPS - 1, &mut targets);
+                }
+                if !targets.is_empty() {
+                    aliased.insert(from.as_str());
+                }
+                for node in targets.into_values() {
+                    app.exact.insert(from.clone(), root.clone(), node);
+                }
+            }
+            // `/` that no route or redirect serves falls through to the
+            // app's root `**` redirect. Only `/`: letting the wildcard
+            // answer any path would draw every destination this reading
+            // could not name as a trip home.
+            if !paths.contains_key("/")
+                && !aliased.contains("/")
+                && let Some(tos) = app_aliases.get("/**")
+            {
+                let mut targets = BTreeMap::new();
+                for to in tos {
+                    reached(paths, app_aliases, to, MAX_REDIRECT_HOPS - 1, &mut targets);
+                }
+                for node in targets.into_values() {
+                    app.exact.insert("/".to_string(), root.clone(), node);
+                }
+            }
+        }
+        table
+    }
+
+    /// The routes a file navigates among (`angularRoutesFor`): its own app's
+    /// (the longest root above it), or, for a shared library outside any
+    /// app, the one app's when there is only one.
+    fn routes_for(&self, file_path: &str) -> Option<&AngularApp> {
+        let own = self
+            .by_root
+            .iter()
+            .filter(|(root, _)| file_path.starts_with(root.as_str()))
+            .max_by_key(|(root, _)| root.len())
+            .map(|(_, app)| app);
+        if let Some(own) = own
+            && !own.exact.is_empty()
+        {
+            return Some(own);
+        }
+        match self.by_root.values().collect::<Vec<_>>().as_slice() {
+            [only] => Some(only),
+            _ => None,
+        }
+    }
+}
+
+/// The pass's Angular table.
+fn angular_table(context: &dyn ResolutionContext) -> Arc<AngularTable> {
+    context
+        .route_tables()
+        .get_or_build("angular-router", || AngularTable::build(context))
+}
+
+/// The navigation calls Angular binds to its routes: a route answers the
+/// calls of its own app, or of the whole workspace when it is the only one.
+struct AngularNavigation;
+
+impl NavigationCalls for AngularNavigation {
+    fn tails(&self) -> &[&str] {
+        &NAV_TAILS
+    }
+
+    fn scope(&self, route: &Node, context: &dyn ResolutionContext) -> Option<Vec<String>> {
+        if !in_angular_table(route) {
+            return None;
+        }
+        Some(if angular_table(context).by_root.len() == 1 {
+            vec![String::new()]
+        } else {
+            vec![angular_app_root(
+                &route.file_path,
+                context,
+                &mut HashMap::new(),
+            )]
+        })
+    }
+}
+
 /// Angular Router's routes (`angularRouterResolver`).
 pub struct AngularRouterResolver;
 
@@ -1349,10 +1981,15 @@ impl FrameworkResolver for AngularRouterResolver {
     }
 
     fn claims_reference(&self, name: &str) -> bool {
-        lazy_reference(name).is_some()
+        nav_verb(name).is_some()
+            || lazy_reference(name).is_some()
             || name
                 .strip_prefix(LAYOUT_PREFIX)
                 .is_some_and(|layout| !layout.is_empty())
+    }
+
+    fn navigation(&self) -> Option<&dyn NavigationCalls> {
+        Some(&AngularNavigation)
     }
 
     fn extract(
@@ -1446,6 +2083,9 @@ impl FrameworkResolver for AngularRouterResolver {
     }
 
     fn resolve(&self, reference: &RefView, context: &dyn ResolutionContext) -> Option<ResolvedRef> {
+        if let Some(verb) = nav_verb(&reference.reference_name) {
+            return resolve_navigation(reference, verb, context);
+        }
         // Only a route this resolver emitted names its component this way.
         if !reference.from_node_id.ends_with(ROUTE_ID_SUFFIX) {
             return None;
@@ -1478,6 +2118,86 @@ impl FrameworkResolver for AngularRouterResolver {
             ResolvedBy::Framework,
         ))
     }
+}
+
+/// A navigation call's edge to the route its destination names in the
+/// caller's app (`resolve`'s navigation half).
+fn resolve_navigation(
+    reference: &RefView,
+    verb: &str,
+    context: &dyn ResolutionContext,
+) -> Option<ResolvedRef> {
+    // Only a call carries a destination.
+    if reference.reference_kind != EdgeKind::Calls {
+        return None;
+    }
+    let table = angular_table(context);
+    let app = table.routes_for(&reference.file_path)?;
+    if app.exact.is_empty() {
+        return None;
+    }
+    let content = context.read_file_shared(&reference.file_path)?;
+    let lines: Vec<&str> = content
+        .split('\n')
+        .map(|line| line.strip_suffix('\r').unwrap_or(line))
+        .collect();
+    let arg = first_argument_text(&lines, reference.line, reference.column, verb)?;
+    // `navigate(['..', id], { relativeTo: this.route })` goes somewhere
+    // relative to here.
+    if nth_argument_text(&lines, reference.line, reference.column, verb, 1)
+        .is_some_and(|extras| relative_to().is_match(&extras))
+    {
+        return None;
+    }
+    // The innermost class the call is written in, for its properties.
+    let owner = context
+        .get_nodes_in_file_shared(&reference.file_path)
+        .into_iter()
+        .filter(|node| {
+            node.kind == NodeKind::Class
+                && node.start_line <= reference.line
+                && node.end_line >= reference.line
+        })
+        .max_by_key(|node| node.start_line);
+    let constants = ConstantReader::new(context);
+    let href = angular_destination(
+        &arg,
+        &reference.file_path,
+        owner.as_deref(),
+        &constants,
+        0,
+        true,
+    )?;
+    let href = navigable_arms(&href)?;
+    // Every arm of a conditional destination is somewhere this call goes:
+    // the first is this reference's resolution, the rest ride along.
+    let mut targets =
+        destinations_for_href(&href, &app.exact, &app.dynamic, &reference.file_path).into_iter();
+    let (target, arm) = targets.next()?;
+    let metadata = |display: &str| {
+        let mut metadata = serde_json::Map::new();
+        metadata.insert("href".to_string(), serde_json::json!(display));
+        metadata.insert("navMethod".to_string(), serde_json::json!(verb));
+        metadata
+    };
+    Some(
+        ResolvedRef::new(
+            reference.clone(),
+            target.id.clone(),
+            0.95,
+            ResolvedBy::Framework,
+        )
+        .with_edge(EdgeShape {
+            edge_kind: Some(EdgeKind::Navigates),
+            metadata: metadata(&arm.display),
+            also_targets: targets
+                .map(|(node, arm)| AlsoTarget {
+                    target_node_id: node.id.clone(),
+                    metadata: metadata(&arm.display),
+                })
+                .collect(),
+        }),
+    )
 }
 
 #[cfg(test)]
@@ -2309,6 +3029,516 @@ mod tests {
         );
         let ctx = project(&[("src/loop.routes.ts", &looped)], &[]);
         assert_eq!(named(&ctx, "src/loop.routes.ts"), ["/{a.x}"]);
+    }
+
+    /// `files` indexed as a sync leaves them: each file's routes renamed
+    /// under its mount, and a class node per `(name, file, start, end)`.
+    fn indexed(files: &[(&str, &str)], classes: &[(&str, &str, i64, i64)]) -> RouteCtx {
+        let extracted = project(files, &[]);
+        let renamed = renames(&extracted);
+        let mut ctx = RouteCtx::default();
+        for (file, content) in files {
+            ctx = ctx.file(file, content);
+        }
+        for node in extracted.nodes() {
+            let mut node = node.clone();
+            if let Some(name) = renamed.get(&node.id) {
+                node.name = name.clone();
+            }
+            let file = node.file_path.clone();
+            ctx = ctx.routes(&file, vec![node]);
+        }
+        for (name, file, start, end) in classes {
+            let mut class = class_node(name, file, *start);
+            class.end_line = *end;
+            ctx = ctx.routes(file, vec![class]);
+        }
+        ctx
+    }
+
+    /// Where the navigation call `name` on `line` of `file` goes: each
+    /// target route's name with the `href` its edge carries.
+    fn navigation(
+        ctx: &dyn ResolutionContext,
+        file: &str,
+        name: &str,
+        line: i64,
+    ) -> Vec<(String, String)> {
+        let reference = crate::frameworks::route_href::test_ctx::call_in(file, name, line, 0);
+        let Some(resolved) = AngularRouterResolver.resolve(&reference, ctx) else {
+            return Vec::new();
+        };
+        let edge = resolved.edge.expect("a navigation edge");
+        assert_eq!(edge.edge_kind, Some(EdgeKind::Navigates));
+        assert_eq!(resolved.confidence, 0.95);
+        let verb = nav_verb(name).expect("a navigation call");
+        let mut out = Vec::new();
+        let mut push = |target: &str, metadata: &serde_json::Map<String, serde_json::Value>| {
+            assert_eq!(metadata.get("navMethod"), Some(&serde_json::json!(verb)));
+            let route = ctx
+                .get_node_by_id(target)
+                .map_or_else(|| target.to_string(), |node| node.name);
+            let href = metadata
+                .get("href")
+                .and_then(|href| href.as_str())
+                .unwrap_or_default()
+                .to_string();
+            out.push((route, href));
+        };
+        push(&resolved.target_node_id, &edge.metadata);
+        for also in &edge.also_targets {
+            push(&also.target_node_id, &also.metadata);
+        }
+        out
+    }
+
+    /// The route each call of `calls` (a line of `file`) reaches, or `-`.
+    fn reached_by(ctx: &dyn ResolutionContext, file: &str, calls: &[(i64, &str)]) -> Vec<String> {
+        calls
+            .iter()
+            .map(|(line, name)| {
+                let targets = navigation(ctx, file, name, *line);
+                if targets.is_empty() {
+                    "-".to_string()
+                } else {
+                    targets
+                        .iter()
+                        .map(|(route, _)| route.as_str())
+                        .collect::<Vec<_>>()
+                        .join(" | ")
+                }
+            })
+            .collect()
+    }
+
+    /// Upstream "Angular destinations": an absolute command array, holes for
+    /// what is computed, nothing for a relative or all-hole one; from the
+    /// root, a call's bare first segment counts too (#2133).
+    #[test]
+    fn a_command_array_names_a_place_only_when_it_is_absolute() {
+        let display =
+            |text: &str, from_root: bool| commands_href(text, from_root).map(|href| href.display);
+        assert_eq!(
+            display("['/article', article.slug]", false).as_deref(),
+            Some("/article/${…}")
+        );
+        assert_eq!(
+            display("['/profile', p.username, 'favorites']", false).as_deref(),
+            Some("/profile/${…}/favorites")
+        );
+        assert_eq!(display("['/']", false).as_deref(), Some("/"));
+        assert_eq!(
+            display("['/users', { tab: 'x' }, id]", false).as_deref(),
+            Some("/users/${…}")
+        );
+        assert_eq!(display("['../', id]", false), None);
+        assert_eq!(display("['edit']", false), None);
+        assert_eq!(display("[`/${a}`, b, c]", false), None);
+        assert_eq!(display("['/', id]", false), None);
+        assert_eq!(display("[]", true), None);
+        assert_eq!(
+            display("['project', 'issue', id]", true).as_deref(),
+            Some("/project/issue/${…}")
+        );
+        assert_eq!(display("['./edit']", true), None);
+        assert_eq!(display("['/a', 'b'", true), None);
+    }
+
+    /// A destination is read through a property of the calling class, a
+    /// route constant (or one that builds its commands), `.concat` and a
+    /// literal followed by one segment; a relative `relativeTo` call, a
+    /// computed template and a concatenation that continues a segment reach
+    /// nothing, and a relative arm of a conditional drops out first.
+    #[test]
+    fn a_destination_is_read_through_properties_constants_and_concat() {
+        let routes = routes_file(
+            "export const routes: Routes = [\n  { path: 'home', component: Home },\n  { path: 'home/zen', component: Zen },\n  { path: 'home/zen/:id', component: ZenItem },\n  { path: 'account/access/:id', component: Access },\n  { path: 'editor/:slug', component: Editor },\n  { path: 'article/:slug', component: Article },\n  { path: 'project/board', component: Board },\n  { path: 'redirect/:path', component: Redirect },\n  { path: ':page', component: Page },\n];",
+        );
+        let constants = "export const internalRoutes = {\n  zen: { routerLink: ['/home', 'zen'] },\n  access: { routerLink: (id: string) => ['/account', 'access', id] },\n};\n";
+        let page = [
+            "import { Router } from '@angular/router';",
+            "import { internalRoutes } from './routes.constants';",
+            "export class PageComponent {",
+            "  protected readonly routerLinkZen = internalRoutes.zen.routerLink;",
+            "  constructor(private router: Router) {}",
+            "  a() { this.router.navigate(this.routerLinkZen); }",
+            "  b() { this.router.navigate(internalRoutes.access.routerLink('me')); }",
+            "  c(id) { this.router.navigate(this.routerLinkZen.concat(id)); }",
+            "  d(slug) { this.router.navigateByUrl('/editor/' + slug); }",
+            "  e(path) { this.router.navigateByUrl('/redirect' + path); }",
+            "  f() { this.router.navigate(['project', 'board']); }",
+            "  g(id) { this.router.navigate(['..', id], { relativeTo: this.route }); }",
+            "  h() { this.router.navigate([], { queryParams: { page: 2 } }); }",
+            "  i(ok) { this.router.navigateByUrl(ok ? 'relative' : '/home'); }",
+            "  j(slug) { this.router.navigateByUrl(`/article/${slug}`); }",
+            "  k(slug) { this.router.navigateByUrl(`/article${slug}`); }",
+            "  l() { this.router.navigate(internalRoutes.zen.routerLink); }",
+            "  m() { this.router.navigate(['project', 'board'], { relativeTo: this.route }); }",
+            "  n(slug) { this.router.navigateByUrl(`/${slug}`); }",
+            "}",
+        ]
+        .join("\n");
+        let file = "src/app/page.component.ts";
+        let ctx = indexed(
+            &[
+                ("src/app/app.routes.ts", &routes),
+                ("src/app/routes.constants.ts", constants),
+                (file, &page),
+            ],
+            &[("PageComponent", file, 3, 20)],
+        );
+        assert_eq!(
+            reached_by(
+                &ctx,
+                file,
+                &[
+                    (6, "this.router.navigate"),
+                    (7, "this.router.navigate"),
+                    (8, "this.router.navigate"),
+                    (9, "this.router.navigateByUrl"),
+                    (10, "this.router.navigateByUrl"),
+                    (11, "this.router.navigate"),
+                    (12, "this.router.navigate"),
+                    (13, "this.router.navigate"),
+                    (14, "this.router.navigateByUrl"),
+                    (15, "this.router.navigateByUrl"),
+                    (16, "this.router.navigateByUrl"),
+                    (17, "this.router.navigate"),
+                    (18, "this.router.navigate"),
+                    (19, "this.router.navigateByUrl"),
+                ]
+            ),
+            [
+                "/home/zen",
+                "/account/access/:id",
+                "/home/zen/:id",
+                "/editor/:slug",
+                "-",
+                "/project/board",
+                "-",
+                "-",
+                "/home",
+                "/article/:slug",
+                "-",
+                "/home/zen",
+                "-",
+                "-",
+            ]
+        );
+        assert_eq!(
+            navigation(&ctx, file, "this.router.navigateByUrl", 15),
+            [("/article/:slug".to_string(), "/article/${…}".to_string())]
+        );
+        // Outside the class, a property is no destination.
+        let outside = indexed(
+            &[
+                ("src/app/app.routes.ts", &routes),
+                ("src/app/routes.constants.ts", constants),
+                (file, &page),
+            ],
+            &[],
+        );
+        assert!(navigation(&outside, file, "this.router.navigate", 6).is_empty());
+    }
+
+    /// Only a call of the router navigates, with its own verb.
+    #[test]
+    fn a_navigation_is_a_call_of_the_router() {
+        let routes =
+            routes_file("export const routes: Routes = [{ path: 'login', component: Login }];");
+        let nav = [
+            "export class NavComponent {",
+            "  a() { this._router.navigateByUrl('/login'); }",
+            "  b() { router.parseUrl('/login'); }",
+            "  c() { this.router.createUrlTree(['/login']); }",
+            "}",
+        ]
+        .join("\n");
+        let file = "src/app/nav.component.ts";
+        let ctx = indexed(&[("src/app/app.routes.ts", &routes), (file, &nav)], &[]);
+        assert_eq!(
+            reached_by(
+                &ctx,
+                file,
+                &[
+                    (2, "this._router.navigateByUrl"),
+                    (3, "router.parseUrl"),
+                    (4, "this.router.createUrlTree"),
+                ]
+            ),
+            ["/login", "/login", "/login"]
+        );
+        for name in [
+            "this.router.navigate",
+            "router.navigateByUrl",
+            "this._router.createUrlTree",
+            "Router.parseUrl",
+        ] {
+            assert!(AngularRouterResolver.claims_reference(name), "{name}");
+        }
+        for name in ["this.location.go", "this.myRouter.navigate", "navigate"] {
+            assert!(!AngularRouterResolver.claims_reference(name), "{name}");
+        }
+        let mut reference =
+            crate::frameworks::route_href::test_ctx::call_in(file, "router.parseUrl", 3, 0);
+        reference.reference_kind = EdgeKind::References;
+        assert!(AngularRouterResolver.resolve(&reference, &ctx).is_none());
+        assert_eq!(
+            AngularNavigation.tails(),
+            ["navigate", "navigateByUrl", "createUrlTree", "parseUrl"]
+        );
+    }
+
+    /// KEEP-RUST: whatever order the routes and files are listed in, a path
+    /// two routes of an app serve reaches neither; a redirect is followed
+    /// through other redirects at most four hops; a route serving a path
+    /// keeps it from a redirect; two redirects of one path to different
+    /// routes reach neither, to the same route reach it; and `/` that no
+    /// route or redirect serves takes the root `**` redirect's route, unless
+    /// two disagree.
+    #[test]
+    fn the_route_table_settles_whatever_the_order() {
+        let one = routes_file(
+            "export const routes: Routes = [\n  { path: 'dup', component: A },\n  { path: 'home', component: H },\n  { path: 'end', component: E },\n  { path: 'x1', component: X1 },\n  { path: 'x2', component: X2 },\n  { path: 'a', redirectTo: 'b' },\n  { path: 'b', redirectTo: 'c' },\n  { path: 'c', redirectTo: 'd' },\n  { path: 'd', redirectTo: 'end' },\n  { path: 'v', redirectTo: 'w' },\n  { path: 'w', redirectTo: 'x' },\n  { path: 'x', redirectTo: 'y' },\n  { path: 'y', redirectTo: 'z' },\n  { path: 'z', redirectTo: 'end' },\n  { path: 'go', redirectTo: 'x1' },\n  { path: 'same', redirectTo: 'x1' },\n  { path: '**', redirectTo: 'home' },\n];",
+        );
+        let two = routes_file(
+            "export const routes: Routes = [\n  { path: 'dup', component: B },\n  { path: 'home', redirectTo: 'x2' },\n  { path: 'go', redirectTo: 'x2' },\n  { path: 'same', redirectTo: '/x1' },\n];",
+        );
+        let nav = [
+            "export class NavComponent {",
+            "  a() { this.router.navigate(['/dup']); }",
+            "  b() { this.router.navigate(['/a']); }",
+            "  c() { this.router.navigate(['/v']); }",
+            "  d() { this.router.navigate(['/home']); }",
+            "  e() { this.router.navigate(['/go']); }",
+            "  f() { this.router.navigate(['/same']); }",
+            "  g() { this.router.navigate(['/']); }",
+            "}",
+        ]
+        .join("\n");
+        let calls: Vec<(i64, &str)> = (2..=8).map(|line| (line, "this.router.navigate")).collect();
+        let expected = ["-", "/end", "-", "/home", "-", "/x1", "/home"];
+        let file = "src/app/nav.component.ts";
+        let files = [
+            ("src/app/one.routes.ts", one.as_str()),
+            ("src/app/two.routes.ts", two.as_str()),
+            (file, nav.as_str()),
+        ];
+        let ctx = indexed(&files, &[]);
+        let routes: Vec<Node> = ctx.nodes().to_vec();
+        let forward: Vec<String> = files.iter().map(|(file, _)| file.to_string()).collect();
+        let backward: Vec<String> = forward.iter().rev().cloned().collect();
+        let mut reversed = routes.clone();
+        reversed.reverse();
+        for (order, routes) in [(forward.clone(), routes.clone()), (backward, reversed)] {
+            let listed = Listed {
+                ctx: &ctx,
+                order,
+                routes: routes
+                    .into_iter()
+                    .filter(|node| node.kind == NodeKind::Route)
+                    .collect(),
+            };
+            assert_eq!(reached_by(&listed, file, &calls), expected);
+        }
+        // Two root `**` redirects to different routes leave `/` unserved (a
+        // file's redirects are read where it declares a screen or a mount).
+        let three = routes_file(
+            "export const routes: Routes = [{ path: 'other', component: O }, { path: '**', redirectTo: 'end' }];",
+        );
+        let ctx = indexed(
+            &[
+                ("src/app/one.routes.ts", one.as_str()),
+                ("src/app/three.routes.ts", three.as_str()),
+                (file, nav.as_str()),
+            ],
+            &[],
+        );
+        assert_eq!(
+            reached_by(&ctx, file, &[(8, "this.router.navigate")]),
+            ["-"]
+        );
+    }
+
+    /// A redirect in a file that only mounts others sits under that file's
+    /// mount, and a mounted file's relative redirect under its own (#2133,
+    /// jira-clone); a route with a constant the pass could not read is in no
+    /// table (KEEP-RUST), so a hole does not reach it.
+    /// A destination that leaves the site (`//host/…`, a scheme) names no
+    /// route of this app, written alone or as either arm of a conditional
+    /// (KEEP-RUST: upstream matches an absolute URL's path).
+    #[test]
+    fn an_off_site_destination_names_nothing() {
+        let routes = routes_file(
+            "export const routes: Routes = [\n  { path: 'login', component: Login },\n  { path: 'home', component: Home },\n];",
+        );
+        let nav = [
+            "export class NavComponent {",
+            "  a() { this.router.navigateByUrl('//auth.example.com/login'); }",
+            "  b(c) { this.router.navigateByUrl(c ? '//auth.example.com/login' : '/home'); }",
+            "  d(c) { this.router.navigateByUrl(c ? '/home' : '//auth.example.com/login'); }",
+            "  e() { this.router.navigateByUrl('https://auth.example.com/login'); }",
+            "  f() { this.router.navigateByUrl('/login'); }",
+            "}",
+        ]
+        .join("\n");
+        let file = "src/app/nav.component.ts";
+        let ctx = indexed(&[("src/app/app.routes.ts", &routes), (file, &nav)], &[]);
+        assert_eq!(
+            reached_by(
+                &ctx,
+                file,
+                &[
+                    (2, "this.router.navigateByUrl"),
+                    (3, "this.router.navigateByUrl"),
+                    (4, "this.router.navigateByUrl"),
+                    (5, "this.router.navigateByUrl"),
+                    (6, "this.router.navigateByUrl"),
+                ]
+            ),
+            ["-", "/home", "/home", "-", "/login"]
+        );
+    }
+
+    #[test]
+    fn redirects_sit_under_their_mounts_and_unread_constants_name_nothing() {
+        let app = routes_file(
+            "export const routes: Routes = [\n  { path: 'project', loadChildren: () => import('./project/project.routes').then((m) => m.ROUTES) },\n  { path: '', redirectTo: 'project', pathMatch: 'full' },\n  { path: lost.path, redirectTo: '/project' },\n  { path: lost.where, loadChildren: () => import('./lost/lost.routes').then((m) => m.ROUTES) },\n];",
+        );
+        let lost_routes = routes_file(
+            "export const ROUTES: Routes = [\n  { path: 'screen', component: LostScreen },\n  { path: 'old', redirectTo: '/project/board' },\n];",
+        );
+        let project_routes = routes_file(
+            "export const ROUTES: Routes = [\n  { path: '', component: Shell, children: [\n      { path: 'board', component: Board },\n      { path: '', redirectTo: 'board', pathMatch: 'full' },\n  ] },\n  { path: 'users/' + lost.path, component: Lost },\n  { path: lost.path + '/:id', component: AlsoLost },\n];",
+        );
+        let nav = [
+            "export class NavComponent {",
+            "  a() { this.router.navigate(['/']); }",
+            "  b() { this.router.navigate(['/project']); }",
+            "  c(id) { this.router.navigate(['/project/users', id]); }",
+            "  d(a, b) { this.router.navigate(['/project', a, b]); }",
+            "  e() { this.router.navigateByUrl('/{lost.path}'); }",
+            "  f() { this.router.navigateByUrl('/{lost.where}/old'); }",
+            "}",
+        ]
+        .join("\n");
+        let file = "src/app/nav.component.ts";
+        let ctx = indexed(
+            &[
+                ("src/app/app.routes.ts", &app),
+                ("src/app/project/project.routes.ts", &project_routes),
+                ("src/app/lost/lost.routes.ts", &lost_routes),
+                (file, &nav),
+            ],
+            &[],
+        );
+        assert_eq!(
+            reached_by(
+                &ctx,
+                file,
+                &[
+                    (2, "this.router.navigate"),
+                    (3, "this.router.navigate"),
+                    (4, "this.router.navigate"),
+                    (5, "this.router.navigate"),
+                    (6, "this.router.navigateByUrl"),
+                    (7, "this.router.navigateByUrl"),
+                ]
+            ),
+            ["/project/board", "/project/board", "-", "-", "-", "-"]
+        );
+    }
+
+    /// An Angular workspace (the directory of an `angular.json` or an Nx
+    /// `nx.json`) is one app, so a library's call reaches the routes another
+    /// library declares; without one, a file under no app's root uses the
+    /// only app's routes, and none when there are two.
+    #[test]
+    fn an_angular_workspace_is_one_app() {
+        let x = routes_file("export const routes: Routes = [{ path: 'x', component: X }];");
+        let y = routes_file("export const routes: Routes = [{ path: 'y', component: Y }];");
+        let nav = "export function go(router) {\n  router.navigate(['/x']);\n}\n";
+        let call = [(2, "router.navigate")];
+        let files = vec![
+            ("apps/x/src/app/x.routes.ts", x.as_str()),
+            ("apps/y/src/app/y.routes.ts", y.as_str()),
+            ("libs/shared/src/nav.ts", nav),
+        ];
+        let two_apps = indexed(&files, &[]);
+        assert_eq!(
+            reached_by(&two_apps, "libs/shared/src/nav.ts", &call),
+            ["-"]
+        );
+        let mut with_nx = files.clone();
+        with_nx.push(("nx.json", "{}"));
+        let workspace = indexed(&with_nx, &[]);
+        assert_eq!(
+            reached_by(&workspace, "libs/shared/src/nav.ts", &call),
+            ["/x"]
+        );
+        let route = workspace
+            .nodes()
+            .iter()
+            .find(|node| node.name == "/x")
+            .expect("the /x route");
+        assert_eq!(
+            AngularNavigation.scope(route, &workspace),
+            Some(vec![String::new()])
+        );
+        assert_eq!(
+            AngularNavigation.scope(route, &two_apps),
+            Some(vec!["apps/x/".to_string()])
+        );
+        let mut one_workspace = files.clone();
+        one_workspace.push(("apps/x/angular.json", "{}"));
+        let one = indexed(&one_workspace, &[]);
+        assert_eq!(reached_by(&one, "libs/shared/src/nav.ts", &call), ["-"]);
+        let single = indexed(
+            &files[..1]
+                .iter()
+                .copied()
+                .chain([files[2]])
+                .collect::<Vec<_>>(),
+            &[],
+        );
+        assert_eq!(reached_by(&single, "libs/shared/src/nav.ts", &call), ["/x"]);
+        assert_eq!(
+            AngularNavigation.scope(&class_node("X", "x.ts", 1), &single),
+            None
+        );
+    }
+
+    /// An app whose routes all hold a constant the cross-file pass could not
+    /// read is still an app: neither its own calls nor a shared library's
+    /// fall back to the other app's routes, which answer only their app.
+    #[test]
+    fn an_app_of_unread_routes_is_still_an_app() {
+        let x = routes_file("export const routes: Routes = [{ path: 'x', component: X }];");
+        let y = routes_file("export const routes: Routes = [{ path: lost.path, component: Y }];");
+        let nav = "export function go(router) {\n  router.navigate(['/x']);\n}\n";
+        let call = [(2, "router.navigate")];
+        let ctx = indexed(
+            &[
+                ("apps/x/src/app/x.routes.ts", &x),
+                ("apps/y/src/app/y.routes.ts", &y),
+                ("apps/x/src/app/nav.ts", nav),
+                ("apps/y/src/app/nav.ts", nav),
+                ("libs/shared/src/nav.ts", nav),
+            ],
+            &[],
+        );
+        assert_eq!(reached_by(&ctx, "apps/x/src/app/nav.ts", &call), ["/x"]);
+        assert_eq!(reached_by(&ctx, "apps/y/src/app/nav.ts", &call), ["-"]);
+        assert_eq!(reached_by(&ctx, "libs/shared/src/nav.ts", &call), ["-"]);
+        let route = ctx
+            .nodes()
+            .iter()
+            .find(|node| node.name == "/x")
+            .expect("the /x route");
+        assert_eq!(
+            AngularNavigation.scope(route, &ctx),
+            Some(vec!["apps/x/".to_string()])
+        );
     }
 
     #[test]

@@ -12300,6 +12300,84 @@ pub fn typescript_angular_dependency_appears_in_package_json() -> Case {
         )
 }
 
+/// A component whose `go` navigates to `/login`.
+const ANGULAR_NAV_LOGIN: &str = "import { Router } from '@angular/router';\nexport class NavComponent {\n  constructor(private router: Router) {}\n  go() { this.router.navigate(['/login']); }\n}\n";
+/// Routes `/x1` and `/x2`, and `go` redirecting to `x1`.
+const ANGULAR_X_ROUTES: &str = "import { Routes } from '@angular/router';\nimport { AuthComponent } from './auth.component';\nimport { ProfileComponent } from './profile/profile.component';\nexport const routes: Routes = [\n  { path: 'x1', component: AuthComponent },\n  { path: 'x2', component: ProfileComponent },\n  { path: 'go', redirectTo: 'x1' },\n];\n";
+
+/// W7-13 (upstream #2113): a `navigate` is edited to name another route:
+/// the `navigates` edge follows it.
+pub fn typescript_angular_navigation_call_names_another_route() -> Case {
+    angular_app(Case::new(Change::BodyEdit, &[Language::TypeScript]))
+        .file("src/app/app.routes.ts", ANGULAR_APP_ROUTES)
+        .file("src/app/profile/profile.routes.ts", ANGULAR_PROFILE_ROUTES)
+        .file("src/app/nav.component.ts", ANGULAR_NAV_LOGIN)
+        .write(
+            "src/app/nav.component.ts",
+            "import { Router } from '@angular/router';\nexport class NavComponent {\n  constructor(private router: Router) {}\n  go(name) { this.router.navigate(['/profile', name]); }\n}\n",
+        )
+        .edge_before(
+            "method NavComponent::go",
+            "navigates",
+            "route src/app/app.routes.ts::route:/login",
+        )
+        .edge_after(
+            "method NavComponent::go",
+            "navigates",
+            "route src/app/profile/profile.routes.ts::route:/:username",
+        )
+        .no_edge_after(
+            "method NavComponent::go",
+            "navigates",
+            "route src/app/app.routes.ts::route:/login",
+        )
+        .edge_metadata_after(
+            (
+                "method NavComponent::go",
+                "navigates",
+                "route src/app/profile/profile.routes.ts::route:/:username",
+            ),
+            "framework",
+            "angular-router",
+        )
+}
+
+/// W7-13: the redirect a call's redirect leads through is edited in
+/// another file to send the user elsewhere: the call follows the chain to
+/// the new route, though neither its file nor the first redirect's
+/// changed.
+pub fn typescript_angular_redirect_chain_link_moves() -> Case {
+    angular_app(Case::new(Change::BodyEdit, &[Language::TypeScript]))
+        .file("src/app/x.routes.ts", ANGULAR_X_ROUTES)
+        .file(
+            "src/app/chain.routes.ts",
+            "import { Routes } from '@angular/router';\nimport { AuthComponent } from './auth.component';\nexport const chainRoutes: Routes = [\n  { path: 'chain', component: AuthComponent },\n  { path: 'start', redirectTo: 'go' },\n];\n",
+        )
+        .file(
+            "src/app/nav.component.ts",
+            "import { Router } from '@angular/router';\nexport class NavComponent {\n  constructor(private router: Router) {}\n  go() { this.router.navigate(['/start']); }\n}\n",
+        )
+        .write(
+            "src/app/x.routes.ts",
+            "import { Routes } from '@angular/router';\nimport { AuthComponent } from './auth.component';\nimport { ProfileComponent } from './profile/profile.component';\nexport const routes: Routes = [\n  { path: 'x1', component: AuthComponent },\n  { path: 'x2', component: ProfileComponent },\n  { path: 'go', redirectTo: 'x2' },\n];\n",
+        )
+        .edge_before(
+            "method NavComponent::go",
+            "navigates",
+            "route src/app/x.routes.ts::route:/x1",
+        )
+        .edge_after(
+            "method NavComponent::go",
+            "navigates",
+            "route src/app/x.routes.ts::route:/x2",
+        )
+        .no_edge_after(
+            "method NavComponent::go",
+            "navigates",
+            "route src/app/x.routes.ts::route:/x1",
+        )
+}
+
 /// The code-based route tree the W7-10 reparenting case edits. It exports
 /// the tree: in a module that exports nothing, a route is no other file's to
 /// reach (KEEP-RUST, W7-10).

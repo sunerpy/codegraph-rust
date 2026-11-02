@@ -22557,6 +22557,27 @@ mod angular {
         out
     }
 
+    /// Each `navigates` edge `caller -> route (navMethod)`, sorted
+    /// (upstream's `draws navigation from calls …`).
+    fn navigations(graph: &Graph) -> Vec<String> {
+        let mut out: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.kind == "navigates")
+            .map(|edge| {
+                let name = |id: &str| graph.node(id).map_or("?", |node| node.name.as_str());
+                let verb = edge
+                    .metadata
+                    .get("navMethod")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?");
+                format!("{} -> {} ({verb})", name(&edge.source), name(&edge.target))
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
     /// A component class written the way upstream's fixtures write one.
     fn component(name: &str, selector: &str, template: &str, body: &str) -> String {
         format!(
@@ -22565,21 +22586,33 @@ mod angular {
     }
 
     /// Upstream #2113 (`angular-router.test.ts`, "an Angular app, indexed",
-    /// its first assertion; the navigation, template and Screens halves are
-    /// W7-13b, W7-18 and the viewer's): each screen is named by the path a
-    /// user takes to it, through a mount, a constant, a `$localize` path
-    /// and an NgModule's routing module, and bound to its component and
-    /// the layouts around it. A layout with a `''` child is no screen of
-    /// its own.
+    /// its first two assertions, the calls of the second; the `routerLink`,
+    /// template and Screens halves are W7-18's and the viewer's): each
+    /// screen is named by the path a user takes to it, through a mount, a
+    /// constant, a `$localize` path and an NgModule's routing module, and
+    /// bound to its component and the layouts around it, and each
+    /// `navigate` reaches the screen its destination names, `['/']` through
+    /// the root `**` redirect and a route constant that builds its commands.
+    /// A layout with a `''` child is no screen of its own.
     #[test]
     fn pr2113_an_angular_app_names_its_screens_by_their_paths() {
         let home = component(
             "HomeComponent",
             "app-home",
             "<p>Home</p>",
-            "  open(slug: string) { this.router.navigate(['/login']); }",
+            "  open(slug: string) { this.router.navigate(['/login']); }\n  more() { this.router.navigate([], { queryParams: { page: 2 } }); }",
         )
         .replace("export class", "export default class");
+        let card = component(
+            "CardComponent",
+            "app-card",
+            "<button (click)=\"save()\">Save</button>",
+            "  name = '';\n  save() { this.router.navigate(internalRoutes.account.subRoutes.access.routerLink('me')); }",
+        )
+        .replace(
+            "import { Router } from '@angular/router';",
+            "import { Router } from '@angular/router';\nimport { internalRoutes } from '../routes.constants';",
+        );
         let overview = component("OverviewComponent", "app-overview", "<p>Overview</p>", "")
             .replace("export class", "export default class");
         let project = Project::new()
@@ -22608,6 +22641,7 @@ mod angular {
                 "import { NgModule } from '@angular/core';\nimport { RouterModule, Routes } from '@angular/router';\nimport { AdminUsersComponent } from './admin-users.component';\nconst routes: Routes = [{ path: '', redirectTo: 'users', pathMatch: 'full' }, { path: 'users', component: AdminUsersComponent }];\n@NgModule({ imports: [RouterModule.forChild(routes)], exports: [RouterModule] })\nexport class AdminRoutingModule {}\n",
             )
             .file("src/app/home/home.component.ts", &home)
+            .file("src/app/shared/card.component.ts", &card)
             .file(
                 "src/app/auth/auth.component.ts",
                 &component(
@@ -22650,6 +22684,16 @@ mod angular {
                 "/admin/users -> AdminUsersComponent",
                 "/home -> HomeComponent",
                 "/login -> AuthComponent",
+            ],
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            navigations(graph),
+            [
+                "done -> /home (navigate)",
+                "open -> /login (navigate)",
+                "save -> /account/access/:id (navigate)",
             ],
             "{}",
             graph.report()
@@ -22720,7 +22764,9 @@ mod angular {
 
     /// Upstream #2133 (jira-clone): a template-literal path whose hole is a
     /// class constant, under a mount whose file holds only the mount and a
-    /// redirect. The navigation half is W7-13b's.
+    /// redirect; `navigate(['project', 'issue', id])` starts from the root,
+    /// and `navigate(['/'])` follows the redirect in the file that only
+    /// mounts, then the mounted file's own.
     #[test]
     fn pr2133_a_template_literal_path_sits_under_its_mount() {
         let class = |name: &str| {
@@ -22747,8 +22793,14 @@ mod angular {
                 "import { Routes } from '@angular/router';\nimport { ProjectComponent } from './project.component';\nimport { BoardComponent } from './board.component';\nimport { IssueComponent } from './issue.component';\nimport { ProjectConst } from './config/const';\nexport const PROJECT_ROUTES: Routes = [\n  {\n    path: '',\n    component: ProjectComponent,\n    children: [\n      { path: 'board', component: BoardComponent },\n      { path: `issue/:${ProjectConst.IssueId}`, component: IssueComponent },\n      { path: '', redirectTo: 'board', pathMatch: 'full' },\n    ],\n  },\n];\n",
             )
             .file("src/app/project/project.component.ts", &class("ProjectComponent"))
-            .file("src/app/project/board.component.ts", &class("BoardComponent"))
-            .file("src/app/project/issue.component.ts", &class("IssueComponent"))
+            .file(
+                "src/app/project/board.component.ts",
+                "import { Component } from '@angular/core';\nimport { Router } from '@angular/router';\n@Component({ selector: 'j-board', template: '<div></div>' })\nexport class BoardComponent {\n  constructor(private _router: Router) {}\n  openIssuePage(issueId: string) {\n    this._router.navigate(['project', 'issue', issueId]);\n  }\n}\n",
+            )
+            .file(
+                "src/app/project/issue.component.ts",
+                "import { Component } from '@angular/core';\nimport { Router } from '@angular/router';\n@Component({ selector: 'j-issue', template: '<div></div>' })\nexport class IssueComponent {\n  constructor(private _router: Router) {}\n  backHome() {\n    this._router.navigate(['/']);\n  }\n}\n",
+            )
             .index();
         let graph = project.graph();
         assert_eq!(
@@ -22756,6 +22808,15 @@ mod angular {
             [
                 "/project/board -> BoardComponent, layout ProjectComponent",
                 "/project/issue/:issueId -> IssueComponent, layout ProjectComponent",
+            ],
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            navigations(graph),
+            [
+                "backHome -> /project/board (navigate)",
+                "openIssuePage -> /project/issue/:issueId (navigate)",
             ],
             "{}",
             graph.report()
