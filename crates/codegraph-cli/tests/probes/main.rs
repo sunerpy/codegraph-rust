@@ -23147,7 +23147,9 @@ mod explore_flow {
 /// emitter passes over the base graph a full index resolved, merged in
 /// upstream's registry order.
 mod synthesis {
-    use super::support::{EdgeRow, Graph, Project, graph_of, project_metadata_with_prefix};
+    use super::support::{
+        EdgeRow, Graph, NodeRow, Project, graph_of, project_metadata_with_prefix,
+    };
     use serde_json::Value;
 
     /// The synthesized `calls` edges from a node matching `source` to one
@@ -23236,7 +23238,7 @@ mod synthesis {
         assert_eq!((edge.line, edge.col), (Some(7), None), "{edge:?}");
         assert_eq!(
             project_metadata_with_prefix(&project.db(), "synthesis_version"),
-            [("synthesis_version".to_string(), "1".to_string())]
+            [("synthesis_version".to_string(), "2".to_string())]
         );
     }
 
@@ -24048,6 +24050,284 @@ mod synthesis {
                 .all(|edge| edge.metadata["synthesizedBy"] != "mybatis-java-xml"),
             "{}",
             graph_of(&ambiguous).report()
+        );
+    }
+
+    /// The `interface-impl` edges of `graph` as `source -> target` qualified
+    /// names, sorted.
+    fn interface_links(graph: &Graph) -> Vec<String> {
+        let mut links: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.metadata["synthesizedBy"] == "interface-impl")
+            .map(|edge| {
+                format!(
+                    "{} -> {}",
+                    graph.node(&edge.source).unwrap().qualified_name,
+                    graph.node(&edge.target).unwrap().qualified_name
+                )
+            })
+            .collect();
+        links.sort();
+        links
+    }
+
+    /// Upstream's interface pass: each method of an interface links to
+    /// every method of its implementation with that name, overloads
+    /// included (a call may resolve to any of them), as a `calls` edge from
+    /// the base method's line.
+    #[test]
+    fn w714c_an_interface_method_reaches_each_overload_of_its_implementation() {
+        let project = Project::new()
+            .file(
+                "src/app/Repo.java",
+                "package app;\n\ninterface Repo {\n    void save();\n    void save(int id);\n}\n\nclass JpaRepo implements Repo {\n    public void save() {}\n    public void save(int id) {}\n}\n",
+            )
+            .index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            interface_links(graph),
+            vec!["app::Repo::save -> app::JpaRepo::save"; 4],
+            "{}",
+            graph.report()
+        );
+        for edge in graph
+            .edges
+            .iter()
+            .filter(|edge| edge.metadata["synthesizedBy"] == "interface-impl")
+        {
+            let (source, target) = (
+                graph.node(&edge.source).unwrap(),
+                graph.node(&edge.target).unwrap(),
+            );
+            assert_eq!(edge.kind, "calls", "{edge:?}");
+            assert_eq!(
+                (edge.line, edge.col),
+                (Some(source.start_line), None),
+                "{edge:?}"
+            );
+            assert_eq!(edge.provenance.as_deref(), Some("heuristic"), "{edge:?}");
+            assert_eq!(edge.metadata["via"], "save", "{edge:?}");
+            assert_eq!(
+                edge.metadata["registeredAt"],
+                format!("{}:{}", target.file_path, target.start_line),
+                "{edge:?}"
+            );
+        }
+    }
+
+    /// Every language the pass reads links through its supertype edges: a
+    /// TypeScript class to its interface and to its base class, a Kotlin
+    /// class to its interface and to its abstract class, a C# class, a
+    /// Scala trait, a Rust trait an `impl` block implements, and an ArkTS
+    /// base class.
+    #[test]
+    fn w714c_each_language_links_through_its_supertypes() {
+        let project = Project::new()
+            .file(
+                "src/shape.ts",
+                "export interface Shape {\n  area(): number;\n}\nexport class Circle implements Shape {\n  area() {\n    return 1;\n  }\n}\nexport class Base {\n  draw() {\n    return 0;\n  }\n}\nexport class Derived extends Base {\n  draw() {\n    return 1;\n  }\n}\n",
+            )
+            .file(
+                "src/clock.kt",
+                "package app\n\ninterface Clock {\n    fun now(): Long\n}\n\nclass SystemClock : Clock {\n    override fun now(): Long = 1L\n}\n\nabstract class Task {\n    abstract fun run()\n}\n\nclass Job : Task() {\n    override fun run() {}\n}\n",
+            )
+            .file(
+                "src/Repo.cs",
+                "interface IRepo\n{\n    void Save();\n}\n\nclass Repo : IRepo\n{\n    public void Save() {}\n}\n",
+            )
+            .file(
+                "src/Animal.scala",
+                "trait Animal {\n  def speak(): String\n}\n\nclass Dog extends Animal {\n  def speak(): String = \"woof\"\n}\n",
+            )
+            .file(
+                "src/store.rs",
+                "trait Store {\n    fn get(&self);\n}\n\nstruct Mem;\n\nimpl Store for Mem {\n    fn get(&self) {}\n}\n",
+            )
+            .file(
+                "src/panel.ets",
+                "class Panel {\n  area(): number {\n    return 0\n  }\n}\nclass Card extends Panel {\n  area(): number {\n    return 1\n  }\n}\n",
+            )
+            .index();
+        let graph = graph_of(&project);
+        let mut expected = vec![
+            "Shape::area -> Circle::area",
+            "Base::draw -> Derived::draw",
+            "app::Clock::now -> app::SystemClock::now",
+            "app::Task::run -> app::Job::run",
+            "IRepo::Save -> Repo::Save",
+            "Animal::speak -> Dog::speak",
+            "Store::get -> Mem::get",
+            "Panel::area -> Card::area",
+        ];
+        expected.sort_unstable();
+        assert_eq!(interface_links(graph), expected, "{}", graph.report());
+    }
+
+    /// A Swift protocol's requirements are not methods: its extensions, the
+    /// Swift classes of its name, hold the default implementations a
+    /// conformer overrides (upstream's Alamofire `EventMonitor`), in
+    /// whatever file they are.
+    #[test]
+    fn w714c_a_swift_protocol_extension_reaches_its_conformers() {
+        let project = Project::new()
+            .file(
+                "Sources/EventMonitor.swift",
+                "protocol EventMonitor {\n    func request()\n}\n",
+            )
+            .file(
+                "Sources/EventMonitor+Defaults.swift",
+                "extension EventMonitor {\n    func request() {}\n}\n",
+            )
+            .file(
+                "Sources/Logger.swift",
+                "final class Logger: EventMonitor {\n    func request() {}\n}\n",
+            )
+            .index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            interface_links(graph),
+            ["EventMonitor::request -> Logger::request"],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Go has no inheritance: a struct's embedded interface dispatches to
+    /// the struct's own method of its name, an embedded struct is no
+    /// supertype to dispatch through, and a struct that satisfies an
+    /// interface only implicitly has no `implements` edge before the Go
+    /// prerequisites (W7-15).
+    #[test]
+    fn w714c_a_go_embedded_interface_reaches_the_structs_own_method() {
+        let project = Project::new()
+            .file("go.mod", "module example.com/app\n\ngo 1.22\n")
+            .file(
+                "engine.go",
+                "package app\n\ntype Reader interface {\n\tRead() int\n}\n\ntype RouterGroup struct{}\n\nfunc (g *RouterGroup) Handle() {}\n\ntype Engine struct {\n\tRouterGroup\n\tReader\n}\n\nfunc (e *Engine) Handle() {}\n\nfunc (e *Engine) Read() int { return 1 }\n\ntype File struct{}\n\nfunc (f *File) Read() int { return 2 }\n",
+            )
+            .index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            graph
+                .edges_matching("struct Engine", "extends", "struct RouterGroup")
+                .len(),
+            1,
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            interface_links(graph),
+            ["Reader::Read -> Engine::Read"],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// The languages outside upstream's set link nothing through the pass:
+    /// a `.tsx` class implementing an interface, a Python subclass and a
+    /// C++ one (whose overrides are the C++ pass's); neither does a class
+    /// without methods.
+    #[test]
+    fn w714c_other_languages_and_empty_classes_link_nothing() {
+        let project = Project::new()
+            .file(
+                "src/shape.ts",
+                "export interface Shape {\n  area(): number;\n}\nexport class Empty implements Shape {}\n",
+            )
+            .file(
+                "src/square.tsx",
+                "import { Shape } from './shape';\nexport class Square implements Shape {\n  area() {\n    return 2;\n  }\n}\n",
+            )
+            .file(
+                "src/animals.py",
+                "class Animal:\n    def speak(self):\n        return ''\n\n\nclass Dog(Animal):\n    def speak(self):\n        return 'woof'\n",
+            )
+            .file(
+                "src/store.cpp",
+                "class Base {\npublic:\n    virtual int read(int key) = 0;\n};\nclass Disk : public Base {\npublic:\n    int read(int key) override { return key; }\n};\n",
+            )
+            .index();
+        let graph = graph_of(&project);
+        for (source, kind, target) in [
+            ("class Square", "implements", "interface Shape"),
+            ("class Empty", "implements", "interface Shape"),
+            ("class Dog", "extends", "class Animal"),
+            ("class Disk", "extends", "class Base"),
+        ] {
+            assert_eq!(
+                graph.edges_matching(source, kind, target).len(),
+                1,
+                "{source} {kind} {target}:\n{}",
+                graph.report()
+            );
+        }
+        assert_eq!(
+            interface_links(graph),
+            Vec::<String>::new(),
+            "{}",
+            graph.report()
+        );
+        assert_synthesized(
+            graph,
+            "method Base::read",
+            "method Disk::read",
+            "cpp-override",
+            &[],
+        );
+    }
+
+    /// Each supertype edge links at most forty methods (upstream
+    /// `MAX_CALLBACKS_PER_CHANNEL`), in the base's `contains` order (by
+    /// target id), and two interfaces with a method of one name each link
+    /// it.
+    #[test]
+    fn w714c_a_supertype_links_at_most_forty_and_each_interface_its_own() {
+        let mut wide = String::from("export interface Wide {\n");
+        let mut implementation = String::from("export class Impl implements Wide {\n");
+        for at in 1..=41 {
+            wide.push_str(&format!("  m{at}(): void;\n"));
+            implementation.push_str(&format!("  m{at}() {{}}\n"));
+        }
+        wide.push_str("}\n");
+        implementation.push_str("}\n");
+        let project = Project::new()
+            .file("src/wide.ts", &format!("{wide}{implementation}"))
+            .file(
+                "src/two.ts",
+                "export interface A {\n  run(): void;\n}\nexport interface B {\n  run(): void;\n}\nexport class C implements A, B {\n  run() {}\n}\n",
+            )
+            .index();
+        let graph = graph_of(&project);
+        let base_methods: Vec<&NodeRow> = graph
+            .nodes
+            .iter()
+            .filter(|node| node.kind == "method" && node.qualified_name.starts_with("Wide::"))
+            .collect();
+        assert_eq!(base_methods.len(), 41, "{}", graph.report());
+        let linked: Vec<&EdgeRow> = graph
+            .edges
+            .iter()
+            .filter(|edge| {
+                edge.metadata["synthesizedBy"] == "interface-impl"
+                    && base_methods.iter().any(|node| node.id == edge.source)
+            })
+            .collect();
+        assert_eq!(linked.len(), 40, "{}", graph.report());
+        let last = base_methods.iter().max_by_key(|node| &node.id).unwrap();
+        assert!(
+            linked.iter().all(|edge| edge.source != last.id),
+            "the base method with the largest id is the one left out:\n{}",
+            graph.report()
+        );
+        assert_eq!(
+            interface_links(graph)
+                .into_iter()
+                .filter(|link| link.ends_with("-> C::run"))
+                .collect::<Vec<_>>(),
+            ["A::run -> C::run", "B::run -> C::run"],
+            "{}",
+            graph.report()
         );
     }
 }

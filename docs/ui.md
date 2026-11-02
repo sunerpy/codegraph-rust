@@ -193,11 +193,11 @@ the Rust graph holds different facts, the viewer shows what this index holds:
   Express and Go HTTP routers are not among them, so those projects are not
   routed apps here.
 - The Rust index synthesizes the field-observer, closure-collection,
-  event-emitter, React and Flutter re-render, C++ override, Kotlin
-  expect/actual, Delphi form and MyBatis mapper dispatch edges, so a flow
-  shows a dashed `via …` hop for those and for no other upstream synthesis
-  pass, and a Go interface's implicit implementations are not part of its
-  type hierarchy.
+  event-emitter, React and Flutter re-render, C++ override, interface
+  override, Kotlin expect/actual, Delphi form and MyBatis mapper dispatch
+  edges, so a flow shows a dashed `via …` hop for those and for no other
+  upstream synthesis pass, and a Go interface's implicit implementations are
+  not part of its type hierarchy.
 - An unresolved import is recorded by the binding it names, not by the module
   specifier, and the File view lists it that way.
 - The bundle is embedded in the binary, so upstream's `CODEGRAPH_VIEWER_PATH`

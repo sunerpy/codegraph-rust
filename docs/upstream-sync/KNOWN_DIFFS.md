@@ -68,16 +68,23 @@ colby behaviors are intentionally NOT ported in v1:
   here; the routers bind navigation calls only.
 - **Dynamic-dispatch synthesis passes** — of `SYNTH_PASSES`
   (`callback-synthesizer.ts`), the field, closure-collection, emitter,
-  render, Pascal form, Flutter, C++ override, Kotlin expect/actual and
-  MyBatis passes are ported (`crates/codegraph-resolve/src/synthesis/`); the
-  others and the Go prerequisites (`go-method-contains`, `go-implements`)
-  draw no edge here yet. The ported passes and the merge keep `b635dd46`'s
-  view of Jest/Vitest manual mocks: #2790's skip of a `__mocks__/` handler
-  for production code is a PORT row of the 2026-10-22 audit, left with the
-  rest of that row to the next round. The C++ override pass is `b635dd46`'s
-  too: #2609's skip of a member template's explicit specialization, which
-  shares the template's name, is a PORT row of the same audit, left with its
-  extraction half.
+  render, Pascal form, Flutter, C++ override, interface override, Kotlin
+  expect/actual and MyBatis passes are ported
+  (`crates/codegraph-resolve/src/synthesis/`); the others and the Go
+  prerequisites (`go-method-contains`, `go-implements`) draw no edge here
+  yet. The ported passes and the merge keep `b635dd46`'s view of Jest/Vitest
+  manual mocks: #2790's skip of a `__mocks__/` handler for production code
+  is a PORT row of the 2026-10-22 audit, left with the rest of that row to
+  the next round. The C++ override pass is `b635dd46`'s too: #2609's skip of
+  a member template's explicit specialization, which shares the template's
+  name, is a PORT row of the same audit, left with its extraction half. The
+  interface override pass keys a method by its name, as `b635dd46` does, and
+  has no Go promotion: #2746's package key for an unexported Go method and
+  the methods a Go struct gets from what it embeds come with the Go
+  prerequisites. A TypeScript abstract method and an ArkTS interface's method
+  signature are no nodes here (#2653, a PORT row of the same audit, and the
+  ArkTS spec's missing `method_signature`), so a call through either reaches
+  no implementation.
 - **Razor `@using` cascade resolution** — `resolveRazorUsing` / `getRazorUsings`
   (`index.ts:1116-1158`), tied to the Razor framework layer.
 
@@ -454,7 +461,8 @@ listed.
 
 - **When a sync recomputes synthesis (W7-14).** A sync recomputes every
   synthesized edge whenever it changes the index, bootstraps a lane or runs
-  the orphan sweep, and when the `synthesis_version` marker is missing.
+  the orphan sweep, and when the `synthesis_version` marker is missing or at
+  another version.
   colby decides by what changed (`src/index.ts:985-1082,1378-1409`): a
   changed file that was a synthesis input, held a synthesized edge or
   matches `hasSynthesisPattern`, a new renderable definition, a moved route,

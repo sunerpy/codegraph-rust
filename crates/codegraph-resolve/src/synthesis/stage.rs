@@ -16,7 +16,7 @@ use codegraph_core::types::{Edge, EdgeKind, Language, Node, NodeKind, Unresolved
 use codegraph_store::Store;
 use codegraph_store::queries::ReferenceSite;
 
-use super::{callback, dispatch, is_synthesized};
+use super::{callback, dispatch, iface, is_synthesized};
 
 /// What one run of the stage did.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -64,6 +64,7 @@ const PASSES: &[(&str, Gate, Pass)] = &[
         |languages| languages.contains(&Language::Cpp),
         dispatch::cpp_override_edges,
     ),
+    ("ifaceEdges", iface::gate, iface::interface_override_edges),
     (
         "kotlinExpectActual",
         |languages| languages.contains(&Language::Kotlin),

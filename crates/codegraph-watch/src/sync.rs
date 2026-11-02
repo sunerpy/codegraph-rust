@@ -3380,6 +3380,32 @@ pub(crate) mod tests {
         }
     }
 
+    /// A marker another version of the passes wrote is not current (W7-14c
+    /// moved it to "2"): a sync with nothing changed replaces that
+    /// version's synthesized edges and writes this version's marker.
+    #[test]
+    fn a_synthesis_marker_of_another_version_recomputes() {
+        let dir = TestDir::new("synthesis-version");
+        let db = default_db_path(dir.path()).unwrap();
+        write_files(dir.path(), &[SYNTH_SCENE, SYNTH_RENDER]);
+        sync_changed_paths(dir.path(), &db, [SYNTH_SCENE.0, SYNTH_RENDER.0]).unwrap();
+        plant_stale_synthesized_edge(&db, "triggerPaint", "onUpdate");
+        Store::open(&db)
+            .unwrap()
+            .set_project_metadata(codegraph_resolve::synthesis::VERSION_KEY, "1")
+            .unwrap();
+
+        sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
+        assert_eq!(
+            synthesis_marker(&db).as_deref(),
+            Some(codegraph_resolve::synthesis::VERSION)
+        );
+        assert_eq!(
+            edge_projection(&db),
+            fresh_edges("synthesis-version-fresh", &[SYNTH_SCENE, SYNTH_RENDER])
+        );
+    }
+
     /// A lane bootstrap re-resolves without `begin_mutation`, so it withdraws
     /// the synthesis marker before its first write (W7-14): a sync that
     /// stops after the lane markers went back leaves it away, and the next

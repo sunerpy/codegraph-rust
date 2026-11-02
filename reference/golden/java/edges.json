@@ -157,6 +157,19 @@
   },
   {
     "col": null,
+    "kind": "calls",
+    "line": 4,
+    "metadata": {
+      "registeredAt": "src/main/java/app/shapes/Square.java:10",
+      "synthesizedBy": "interface-impl",
+      "via": "area"
+    },
+    "provenance": "heuristic",
+    "source": "method:3d88b8f054e0e481bc153e9c822c4ac4",
+    "target": "method:cd87bdc9721fd2109c50bdd8ed3d5896"
+  },
+  {
+    "col": null,
     "kind": "contains",
     "line": null,
     "metadata": null,

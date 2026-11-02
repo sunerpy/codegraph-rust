@@ -471,7 +471,7 @@ persisted, and withdrawn with the others before a sync's first change. A sync
 that finds it missing or at another version re-resolves every Rust file. It is
 not a canonical surface.
 
-`synthesis_version` (1) vouches that the synthesized edges are the synthesis
+`synthesis_version` (2) vouches that the synthesized edges are the synthesis
 stage's output over the current base graph. A full index and a migration write
 it after the stage. A sync withdraws it before its first change, before a lane
 bootstrap's first write and before the orphan sweep, and, when it changed the

@@ -24,7 +24,13 @@ static FLUTTER_SET_STATE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?-u:\b)setState\s*\(").expect("flutter setState"));
 
 /// A synthesized edge of `kind` from `source` to `target` at `line`.
-fn synthesized(source: &Node, target: &Node, kind: EdgeKind, line: i64, metadata: Value) -> Edge {
+pub(super) fn synthesized(
+    source: &Node,
+    target: &Node,
+    kind: EdgeKind,
+    line: i64,
+    metadata: Value,
+) -> Edge {
     Edge {
         id: None,
         source: source.id.clone(),
@@ -38,12 +44,12 @@ fn synthesized(source: &Node, target: &Node, kind: EdgeKind, line: i64, metadata
 }
 
 /// `node`'s place, `path:line`, as `registeredAt` names it.
-fn place(node: &Node) -> String {
+pub(super) fn place(node: &Node) -> String {
     format!("{}:{}", node.file_path, node.start_line)
 }
 
 /// The methods `parent` contains, in its `contains` edges' order.
-fn methods_of(view: &View<'_>, parent: &str) -> Result<Vec<Node>> {
+pub(super) fn methods_of(view: &View<'_>, parent: &str) -> Result<Vec<Node>> {
     let mut methods = Vec::new();
     for edge in view.edges_from(parent, EdgeKind::Contains)? {
         if let Some(node) = view.node(&edge.target)?

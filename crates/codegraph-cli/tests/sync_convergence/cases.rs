@@ -16129,3 +16129,80 @@ pub fn java_mybatis_mapper_gains_a_namesake() -> Case {
             "method com.example.UserMapper::findById",
         )
 }
+
+/// W7-14c: a TypeScript class stops implementing an interface; the
+/// interface method no longer reaches its method.
+pub fn typescript_class_drops_its_interface() -> Case {
+    Case::new(Change::EditHeritage, &[Language::TypeScript])
+        .file("src/shape.ts", "export interface Shape {\n  area(): number;\n}\n")
+        .file(
+            "src/circle.ts",
+            "import { Shape } from './shape';\nexport class Circle implements Shape {\n  area() {\n    return 1;\n  }\n}\n",
+        )
+        .write(
+            "src/circle.ts",
+            "import { Shape } from './shape';\nexport class Circle {\n  area() {\n    return 1;\n  }\n}\n",
+        )
+        .edge_before("method Shape::area", "calls", "method Circle::area")
+        .no_edge_after("method Shape::area", "calls", "method Circle::area")
+}
+
+/// W7-14c: an extension in another file gives a Swift protocol a default
+/// implementation; it reaches the conformer's override.
+pub fn swift_protocol_extension_appears() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Swift])
+        .file(
+            "Sources/EventMonitor.swift",
+            "protocol EventMonitor {\n    func request()\n}\n",
+        )
+        .file(
+            "Sources/Logger.swift",
+            "final class Logger: EventMonitor {\n    func request() {}\n}\n",
+        )
+        .write(
+            "Sources/EventMonitor+Defaults.swift",
+            "extension EventMonitor {\n    func request() {}\n}\n",
+        )
+        .edge_metadata_after(
+            (
+                "method EventMonitor::request",
+                "calls",
+                "method Logger::request",
+            ),
+            "synthesizedBy",
+            "interface-impl",
+        )
+}
+
+/// W7-14c: one of a Java class's two interfaces loses its file; the other
+/// interface's method keeps its edge to the class's method.
+pub fn java_interface_file_deleted() -> Case {
+    Case::new(Change::DeleteImportedModule, &[Language::Java])
+        .file(
+            "src/main/java/app/Repo.java",
+            "package app;\n\npublic interface Repo {\n    void save();\n}\n",
+        )
+        .file(
+            "src/main/java/app/Store.java",
+            "package app;\n\npublic interface Store {\n    void save();\n}\n",
+        )
+        .file(
+            "src/main/java/app/JpaRepo.java",
+            "package app;\n\npublic class JpaRepo implements Repo, Store {\n    public void save() {}\n}\n",
+        )
+        .remove("src/main/java/app/Repo.java")
+        .edge_before(
+            "method app::Repo::save",
+            "calls",
+            "method app::JpaRepo::save",
+        )
+        .edge_metadata_after(
+            (
+                "method app::Store::save",
+                "calls",
+                "method app::JpaRepo::save",
+            ),
+            "synthesizedBy",
+            "interface-impl",
+        )
+}

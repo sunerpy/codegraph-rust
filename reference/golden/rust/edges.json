@@ -277,6 +277,123 @@
   },
   {
     "col": null,
+    "kind": "calls",
+    "line": 116,
+    "metadata": {
+      "registeredAt": "self_field.rs:132",
+      "synthesizedBy": "interface-impl",
+      "via": "go"
+    },
+    "provenance": "heuristic",
+    "source": "method:d2274655d99f1b81b0b65055cdfbff4d",
+    "target": "method:0f4640288266b6d082378f92d5216de4"
+  },
+  {
+    "col": null,
+    "kind": "calls",
+    "line": 2,
+    "metadata": {
+      "registeredAt": "impl_ownership.rs:10",
+      "synthesizedBy": "interface-impl",
+      "via": "read"
+    },
+    "provenance": "heuristic",
+    "source": "method:14ace879f6bdb346389a16d346396e71",
+    "target": "method:d2dfb67ceb37326f45f8cd1641fe3ba6"
+  },
+  {
+    "col": null,
+    "kind": "calls",
+    "line": 2,
+    "metadata": {
+      "registeredAt": "impl_ownership.rs:20",
+      "synthesizedBy": "interface-impl",
+      "via": "read"
+    },
+    "provenance": "heuristic",
+    "source": "method:14ace879f6bdb346389a16d346396e71",
+    "target": "method:f3650150f51148f5f0e04a68d36db125"
+  },
+  {
+    "col": null,
+    "kind": "calls",
+    "line": 2,
+    "metadata": {
+      "registeredAt": "impl_ownership.rs:42",
+      "synthesizedBy": "interface-impl",
+      "via": "read"
+    },
+    "provenance": "heuristic",
+    "source": "method:14ace879f6bdb346389a16d346396e71",
+    "target": "method:e76c21ca9b8d76ef5a6ab6d28f97ba87"
+  },
+  {
+    "col": null,
+    "kind": "calls",
+    "line": 2,
+    "metadata": {
+      "registeredAt": "impl_ownership.rs:54",
+      "synthesizedBy": "interface-impl",
+      "via": "read"
+    },
+    "provenance": "heuristic",
+    "source": "method:14ace879f6bdb346389a16d346396e71",
+    "target": "method:1454626a9fdbd00f224b04b8eca29272"
+  },
+  {
+    "col": null,
+    "kind": "calls",
+    "line": 2,
+    "metadata": {
+      "registeredAt": "lib.rs:14",
+      "synthesizedBy": "interface-impl",
+      "via": "greet"
+    },
+    "provenance": "heuristic",
+    "source": "method:28764bbfc23c2fe8ec24a7d1b72b1330",
+    "target": "method:7fc738eac7790ac49dfa4b6a7cd6b9a9"
+  },
+  {
+    "col": null,
+    "kind": "calls",
+    "line": 2,
+    "metadata": {
+      "registeredAt": "lib.rs:20",
+      "synthesizedBy": "interface-impl",
+      "via": "greet"
+    },
+    "provenance": "heuristic",
+    "source": "method:28764bbfc23c2fe8ec24a7d1b72b1330",
+    "target": "method:8cb04e8ca5d9379a7bdf1b71236238cf"
+  },
+  {
+    "col": null,
+    "kind": "calls",
+    "line": 2,
+    "metadata": {
+      "registeredAt": "lib.rs:26",
+      "synthesizedBy": "interface-impl",
+      "via": "greet"
+    },
+    "provenance": "heuristic",
+    "source": "method:28764bbfc23c2fe8ec24a7d1b72b1330",
+    "target": "method:15074a95e078da927a780dccd5ed2448"
+  },
+  {
+    "col": null,
+    "kind": "calls",
+    "line": 2,
+    "metadata": {
+      "registeredAt": "lib.rs:43",
+      "synthesizedBy": "interface-impl",
+      "via": "greet"
+    },
+    "provenance": "heuristic",
+    "source": "method:28764bbfc23c2fe8ec24a7d1b72b1330",
+    "target": "method:332692d36b049f0071041145d30d687c"
+  },
+  {
+    "col": null,
     "kind": "contains",
     "line": null,
     "metadata": null,
