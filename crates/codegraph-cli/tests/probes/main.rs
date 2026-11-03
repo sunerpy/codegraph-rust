@@ -27968,3 +27968,314 @@ mod go_dispatch_synthesis {
         }
     }
 }
+
+/// W7-15d0: every Go `var` and `const` spec is a node with its initializer
+/// walked under it (upstream #2680, #2682, #693 and the Go half of #2743).
+mod go_var_specs {
+    use super::support::{Graph, Project, graph_of};
+
+    /// `SOURCE` of upstream `go-var-groups.test.ts`.
+    const SHAPES_GO: &str = concat!(
+        "// Package shapes is documented.\n",
+        "package shapes\n",
+        "\n",
+        "import (\n",
+        "\t\"errors\"\n",
+        "\t\"fmt\"\n",
+        ")\n",
+        "\n",
+        "// Errors returned by the shapes package.\n",
+        "var (\n",
+        "\t// ErrNoSides is returned for a shape without sides.\n",
+        "\tErrNoSides = errors.New(\"no sides\")\n",
+        "\tErrTooMany = newError(\"too many sides\")\n",
+        ")\n",
+        "\n",
+        "var (\n",
+        "\tregistry = map[string]int{}\n",
+        "\t// DefaultName is documented inside its group.\n",
+        "\tDefaultName string\n",
+        ")\n",
+        "\n",
+        "// single is documented above its own declaration.\n",
+        "var single = 3\n",
+        "\n",
+        "func newError(msg string) error { return fmt.Errorf(\"shapes: %s\", msg) }\n",
+        "\n",
+        "func check(n int) error {\n",
+        "\tif n == 0 {\n",
+        "\t\treturn ErrNoSides\n",
+        "\t}\n",
+        "\treturn ErrTooMany\n",
+        "}\n",
+    );
+
+    /// The one node `selector` matches.
+    #[track_caller]
+    fn one<'g>(graph: &'g Graph, selector: &str) -> &'g super::support::NodeRow {
+        let found = graph.nodes_matching(selector);
+        assert_eq!(found.len(), 1, "{selector}: {found:?}\n{}", graph.report());
+        found[0]
+    }
+
+    /// Upstream `go-var-groups.test.ts`, LF and CRLF: each member of a
+    /// `var ( … )` group is a variable the file contains, with its own doc
+    /// or the group's; a call in a member's initializer is its own; a read
+    /// of a member in the same file references it.
+    #[test]
+    fn w715d0_every_member_of_a_var_group_is_a_variable() {
+        for crlf in [false, true] {
+            let source = if crlf {
+                SHAPES_GO.replace('\n', "\r\n")
+            } else {
+                SHAPES_GO.to_string()
+            };
+            let project = Project::new()
+                .file("go.mod", "module example.com/shapes\n\ngo 1.22\n")
+                .file("shapes/shapes.go", &source)
+                .index();
+            let graph = graph_of(&project);
+            let docs: Vec<(&str, Option<&str>)> = [
+                "ErrNoSides",
+                "ErrTooMany",
+                "registry",
+                "DefaultName",
+                "single",
+            ]
+            .into_iter()
+            .map(|name| {
+                let node = one(graph, &format!("variable {name}"));
+                (name, node.docstring.as_deref())
+            })
+            .collect();
+            assert_eq!(
+                docs,
+                [
+                    (
+                        "ErrNoSides",
+                        Some("ErrNoSides is returned for a shape without sides.")
+                    ),
+                    ("ErrTooMany", Some("Errors returned by the shapes package.")),
+                    ("registry", None),
+                    (
+                        "DefaultName",
+                        Some("DefaultName is documented inside its group.")
+                    ),
+                    (
+                        "single",
+                        Some("single is documented above its own declaration.")
+                    ),
+                ],
+                "crlf {crlf}"
+            );
+            for name in ["ErrNoSides", "ErrTooMany", "registry", "DefaultName"] {
+                assert_eq!(
+                    graph
+                        .edges_matching(
+                            "file:shapes/shapes.go",
+                            "contains",
+                            &format!("variable {name}")
+                        )
+                        .len(),
+                    1,
+                    "file contains {name}, crlf {crlf}\n{}",
+                    graph.report()
+                );
+            }
+            assert_eq!(
+                graph
+                    .edges_matching("variable ErrTooMany", "calls", "function newError")
+                    .len(),
+                1,
+                "ErrTooMany calls newError, crlf {crlf}\n{}",
+                graph.report()
+            );
+            for name in ["ErrNoSides", "ErrTooMany"] {
+                assert_eq!(
+                    graph
+                        .edges_matching("function check", "references", &format!("variable {name}"))
+                        .len(),
+                    1,
+                    "check references {name}, crlf {crlf}\n{}",
+                    graph.report()
+                );
+            }
+        }
+    }
+
+    /// Upstream `function-ref.test.ts` (INITIALIZER WALKS, Go): a function
+    /// in an initializer is referenced once, by the variable it declares.
+    #[test]
+    fn w715d0_a_function_in_an_initializer_is_referenced_once() {
+        let project = Project::new()
+            .file("go.mod", "module example.com/app\n\ngo 1.22\n")
+            .file(
+                "handlers.go",
+                "package main\n\nfunc goHome() {}\n\nvar handlers = map[string]func(){\"home\": goHome}",
+            )
+            .index();
+        let graph = graph_of(&project);
+        let sources: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|edge| {
+                edge.kind == "references"
+                    && edge.metadata["fnRef"] == true
+                    && graph
+                        .node(&edge.target)
+                        .is_some_and(|node| node.name == "goHome")
+            })
+            .map(|edge| graph.describe(&edge.source))
+            .collect();
+        assert_eq!(
+            sources,
+            ["variable handlers @handlers.go:5"],
+            "{}",
+            graph.report()
+        );
+    }
+
+    const SPECS_GO: &str = concat!(
+        "package main\n",
+        "\n",
+        "type Options struct {\n",
+        "\tName string\n",
+        "}\n",
+        "\n",
+        "const (\n",
+        "\tA = iota\n",
+        "\tB\n",
+        "\tC\n",
+        ")\n",
+        "\n",
+        "var p, q = 1, 2\n",
+        "\n",
+        "var x Options\n",
+        "\n",
+        "var long = Options{\n",
+        "\tName: \"long\",\n",
+        "}\n",
+    );
+
+    /// Each spec is one node named by its first identifier and spanning the
+    /// spec; its signature is its last child's text, as upstream reads it
+    /// (`var x Options` reads `= Options`).
+    #[test]
+    fn w715d0_each_spec_is_one_node_over_the_spec() {
+        let project = Project::new()
+            .file("go.mod", "module example.com/app\n\ngo 1.22\n")
+            .file("specs.go", SPECS_GO)
+            .index();
+        let graph = graph_of(&project);
+        let row = |selector: &str| {
+            let node = one(graph, selector);
+            (node.start_line, node.end_line, node.signature.clone())
+        };
+        assert_eq!(row("constant A"), (8, 8, Some("= iota".to_string())));
+        assert_eq!(row("constant B"), (9, 9, None));
+        assert_eq!(row("constant C"), (10, 10, None));
+        assert_eq!(row("variable p"), (13, 13, Some("= 1, 2".to_string())));
+        assert!(
+            graph.nodes_matching("variable q").is_empty(),
+            "{}",
+            graph.report()
+        );
+        assert_eq!(row("variable x"), (15, 15, Some("= Options".to_string())));
+        assert_eq!(
+            row("variable long"),
+            (17, 19, Some("= Options{\n\tName: \"long\",\n}".to_string()))
+        );
+    }
+
+    const INIT_GO: &str = concat!(
+        "package main\n",
+        "\n",
+        "type Command struct {\n",
+        "\tRunE func(args []string) error\n",
+        "}\n",
+        "\n",
+        "type Options struct {\n",
+        "\tF func() error\n",
+        "}\n",
+        "\n",
+        "func run(args []string) error { return nil }\n",
+        "func setup()                   {}\n",
+        "func h() error                 { return nil }\n",
+        "func newThing() *Options       { return &Options{} }\n",
+        "\n",
+        "var rootCmd = &Command{\n",
+        "\tRunE: func(args []string) error {\n",
+        "\t\tsetup()\n",
+        "\t\treturn run(args)\n",
+        "\t},\n",
+        "}\n",
+        "\n",
+        "var d = Options{F: h}\n",
+        "\n",
+        "var made = newThing()\n",
+        "\n",
+        "func body() {\n",
+        "\tvar local = newThing()\n",
+        "\tother := newThing()\n",
+        "\t_, _ = local, other\n",
+        "}\n",
+    );
+
+    /// A package-level initializer is walked under the variable it
+    /// declares: the calls in a cobra-shaped closure, a composite literal
+    /// and its function value, a call. A function body's `var` and `:=`
+    /// stay locals whose calls are the function's.
+    #[test]
+    fn w715d0_package_initializers_are_their_variables() {
+        let project = Project::new()
+            .file("go.mod", "module example.com/app\n\ngo 1.22\n")
+            .file("init.go", INIT_GO)
+            .index();
+        let graph = graph_of(&project);
+        for (source, kind, target) in [
+            ("variable rootCmd", "instantiates", "struct Command"),
+            ("variable rootCmd", "calls", "function setup"),
+            ("variable rootCmd", "calls", "function run"),
+            ("variable d", "instantiates", "struct Options"),
+            ("variable d", "references", "function h"),
+            ("variable made", "calls", "function newThing"),
+        ] {
+            assert_eq!(
+                graph.edges_matching(source, kind, target).len(),
+                1,
+                "{source} -[{kind}]-> {target}\n{}",
+                graph.report()
+            );
+        }
+        for target in ["function setup", "function run", "function h"] {
+            assert!(
+                graph
+                    .edges_matching("file:init.go", "calls", target)
+                    .is_empty()
+                    && graph
+                        .edges_matching("file:init.go", "references", target)
+                        .is_empty(),
+                "{target} is the variable's\n{}",
+                graph.report()
+            );
+        }
+        assert!(
+            graph.nodes_matching("variable local").is_empty(),
+            "{}",
+            graph.report()
+        );
+        assert!(
+            graph.nodes_matching("variable other").is_empty(),
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            graph
+                .edges_matching("function body", "calls", "function newThing")
+                .len(),
+            2,
+            "{}",
+            graph.report()
+        );
+    }
+}

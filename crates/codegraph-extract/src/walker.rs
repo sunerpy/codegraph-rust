@@ -873,10 +873,18 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
                 self.visit_node(defined);
             }
             self.maybe_cpp_construction(node);
-            self.extract_variable(node);
-            // A type walked above captured its own function values.
-            let walked = defined_type.map(|defined| defined.id());
-            self.scan_fn_ref_subtree(node, 0, walked.as_slice());
+            // A type walked above captured its own function values, and so
+            // did a Go initializer walked under the spec it declares.
+            let mut walked: Vec<usize> = defined_type
+                .map(|defined| defined.id())
+                .into_iter()
+                .collect();
+            if self.spec.language() == Language::Go {
+                walked.extend(self.extract_go_variable(node));
+            } else {
+                self.extract_variable(node);
+            }
+            self.scan_fn_ref_subtree(node, 0, &walked);
             skip_children = true;
         } else if self.spec.language() == Language::Swift
             && node_type == "protocol_property_declaration"
@@ -4198,10 +4206,6 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             self.extract_python_assignment(node);
             return;
         }
-        if self.spec.language() == Language::Go {
-            self.extract_go_variable(node);
-            return;
-        }
         if self.spec.language() == Language::Solidity {
             // #1170 — file-scope `constant_variable_declaration` (`uint256 constant
             // MAX = 100;`) carries a direct `name` field. Emit a Constant (const)
@@ -5215,36 +5219,95 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
         );
     }
 
-    fn extract_go_variable(&mut self, node: SyntaxNode<'tree>) {
+    /// A Go `var` or `const` declaration (upstream `extractVariable`'s Go
+    /// branch). Each spec, a `var ( … )` group's inside its `var_spec_list`
+    /// (#2682), is a node named by its first identifier and spanning the
+    /// spec, with its own doc comment or else the declaration's (#2680), and
+    /// the text of its last child, cut in UTF-16 units as upstream cuts it
+    /// ([`utf16_value_signature`]), as the signature. Its initializer is walked
+    /// under it, so what a package-level `var c = pkg.New()` or `var Cmd =
+    /// &Command{RunE: func(…) {…}}` calls, builds and passes is that
+    /// variable's (#693). A `:=` reaches here only through error recovery
+    /// and declares a variable per name, unwalked. Returns the initializers
+    /// walked under a node: they captured their own function values, so the
+    /// declaration's scan skips them, as the file would otherwise keep a
+    /// second reference to each function from the same spot (#2743).
+    fn extract_go_variable(&mut self, node: SyntaxNode<'tree>) -> Vec<usize> {
         let kind = if node.kind() == "const_declaration" {
             NodeKind::Constant
         } else {
             NodeKind::Variable
         };
-        for ident in descendants_of_kind(node, "identifier") {
-            let Some(parent) = ident.parent() else {
-                continue;
-            };
-            if !matches!(
-                parent.kind(),
-                "var_spec" | "const_spec" | "short_var_declaration"
-            ) {
-                continue;
+        let docstring = self.docstring_for(node);
+        let mut specs = Vec::new();
+        for child in node.named_children(&mut node.walk()) {
+            if child.kind() == "var_spec_list" {
+                specs.extend(child.named_children(&mut child.walk()));
+            } else {
+                specs.push(child);
             }
-            let created = self.create_node(
-                kind,
-                &node_text(ident, self.source),
-                ident,
-                NodeExtra::default(),
-            );
-            // The value reads what its whole spec (its initializer) names.
-            if let Some(created) = created
-                && crate::value_refs::has_value_refs(self.spec.language())
-            {
-                self.value_refs.scan_reader_from(&created.id, parent);
-            }
-            break;
         }
+        let mut walked = Vec::new();
+        for spec in specs {
+            if !matches!(spec.kind(), "var_spec" | "const_spec") {
+                continue;
+            }
+            let mut created = None;
+            if let Some(name) = spec
+                .named_child(0)
+                .filter(|name| name.kind() == "identifier")
+            {
+                let count = spec.named_child_count();
+                let last = (count > 1)
+                    .then(|| spec.named_child(count as u32 - 1))
+                    .flatten();
+                created = self.create_node(
+                    kind,
+                    &node_text(name, self.source),
+                    spec,
+                    NodeExtra {
+                        docstring: self.docstring_for(spec).or_else(|| docstring.clone()),
+                        signature: utf16_value_signature(last, self.source),
+                        ..NodeExtra::default()
+                    },
+                );
+            }
+            if let Some(value) = child_by_field(spec, "value") {
+                if let Some(created) = &created {
+                    self.node_stack.push(created.id.clone());
+                }
+                self.visit_function_body(value);
+                if created.is_some() {
+                    self.node_stack.pop();
+                    walked.push(value.id());
+                }
+            }
+        }
+        if node.kind() == "short_var_declaration"
+            && let Some(left) = child_by_field(node, "left")
+        {
+            let names: Vec<SyntaxNode<'tree>> = if left.kind() == "expression_list" {
+                left.named_children(&mut left.walk())
+                    .filter(|name| name.kind() == "identifier")
+                    .collect()
+            } else {
+                vec![left]
+            };
+            let signature = utf16_value_signature(child_by_field(node, "right"), self.source);
+            for name in names {
+                self.create_node(
+                    NodeKind::Variable,
+                    &node_text(name, self.source),
+                    node,
+                    NodeExtra {
+                        docstring: docstring.clone(),
+                        signature: signature.clone(),
+                        ..NodeExtra::default()
+                    },
+                );
+            }
+        }
+        walked
     }
 
     fn extract_lua_variable(&mut self, node: SyntaxNode<'tree>) {
@@ -8617,6 +8680,37 @@ fn value_signature(value: Option<SyntaxNode<'_>>, source: &str) -> Option<String
             .collect::<String>();
         format!("= {}{}", init, if init.len() >= 100 { "..." } else { "" })
     })
+}
+
+/// A Go spec's signature as upstream writes it, `= ${text.slice(0, 100)}`
+/// with `...` when the text's `length` is 100 or more, both in UTF-16 code
+/// units as JavaScript counts a string; none for an empty text. A pair the
+/// cut splits leaves upstream a lone high surrogate, which its SQLite
+/// binding stores as U+FFFD, so this writes U+FFFD. [`value_signature`]'s
+/// callers still count characters and bytes.
+fn utf16_value_signature(value: Option<SyntaxNode<'_>>, source: &str) -> Option<String> {
+    let text = node_text(value?, source);
+    if text.is_empty() {
+        return None;
+    }
+    let mut units = 0;
+    let mut init = String::new();
+    for c in text.chars() {
+        if units + c.len_utf16() > 100 {
+            if units < 100 {
+                init.push(char::REPLACEMENT_CHARACTER);
+            }
+            break;
+        }
+        units += c.len_utf16();
+        init.push(c);
+    }
+    let ellipsis = if text.encode_utf16().nth(99).is_some() {
+        "..."
+    } else {
+        ""
+    };
+    Some(format!("= {init}{ellipsis}"))
 }
 
 /// A Ruby assignment whose left side is a `constant` (`MAX = 3`).

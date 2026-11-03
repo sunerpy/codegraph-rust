@@ -16496,3 +16496,74 @@ pub fn go_gin_dispatch_call_removed() -> Case {
         .edge_before("method Context::Next", "calls", "function Logger")
         .no_edge_after("method Context::Next", "calls", "function Logger")
 }
+
+/// W7-15d0 (upstream #2682, #693): a member a `var ( … )` group gains is a
+/// variable of its own, and the call its initializer makes is its own.
+pub fn go_var_group_gains_a_member_whose_initializer_calls_another_file() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Go])
+        .file("go.mod", "module example.com/shapes\n\ngo 1.22\n")
+        .file(
+            "errors.go",
+            "package shapes\n\nfunc newError(msg string) error { return nil }\n",
+        )
+        .file(
+            "shapes.go",
+            "package shapes\n\nvar (\n\tErrNoSides = newError(\"no sides\")\n)\n",
+        )
+        .write(
+            "shapes.go",
+            "package shapes\n\nvar (\n\tErrNoSides = newError(\"no sides\")\n\tErrTooMany = newError(\"too many\")\n)\n",
+        )
+        .edge_before("variable ErrNoSides", "calls", "function newError")
+        .edge_after("variable ErrTooMany", "calls", "function newError")
+}
+
+/// W7-15d0 (upstream #693): a call in a package-level closure, a cobra
+/// `RunE`, is the variable's; it links once the function appears.
+pub fn go_package_closure_call_reaches_a_function_that_appears() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Go])
+        .file("go.mod", "module example.com/app\n\ngo 1.22\n")
+        .file(
+            "cmd.go",
+            "package app\n\ntype Command struct {\n\tRunE func(args []string) error\n}\n\nvar rootCmd = &Command{\n\tRunE: func(args []string) error {\n\t\treturn run(args)\n\t},\n}\n",
+        )
+        .write("run.go", "package app\n\nfunc run(args []string) error { return nil }\n")
+        .edge_after("variable rootCmd", "calls", "function run @run.go")
+}
+
+/// W7-15d0 (upstream #693): a package-level composite literal instantiates
+/// its struct from the variable; the struct's package file deleted, the
+/// qualified literal links nothing, not the importer's own namesake.
+pub fn go_package_literal_struct_file_deleted() -> Case {
+    Case::new(Change::DeleteImportedModule, &[Language::Go])
+        .file("go.mod", "module example.com/app\n\ngo 1.22\n")
+        .file(
+            "refresh/refresh.go",
+            "package refresh\n\ntype Options struct {\n\tName string\n}\n",
+        )
+        .file("app/options.go", "package app\n\ntype Options struct {\n\tName string\n}\n")
+        .file(
+            "app/config.go",
+            "package app\n\nimport \"example.com/app/refresh\"\n\nvar defaults = refresh.Options{Name: \"x\"}\n",
+        )
+        .edge_before("variable defaults", "instantiates", "struct Options @refresh/refresh.go")
+        .remove("refresh/refresh.go")
+        .no_edge_after("variable defaults", "instantiates", "struct Options @app/options.go")
+}
+
+/// W7-15d0 (upstream #2680): every member of a `const ( … )` group is a
+/// constant, so a function's read of a later member reaches it.
+pub fn go_const_group_member_read_by_a_function() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Go])
+        .file("go.mod", "module example.com/limits\n\ngo 1.22\n")
+        .file(
+            "limits.go",
+            "package limits\n\nconst (\n\tBaseLimit = 10\n\tWideLimit = 50\n)\n\nfunc scale() int { return BaseLimit * 2 }\n",
+        )
+        .write(
+            "limits.go",
+            "package limits\n\nconst (\n\tBaseLimit = 10\n\tWideLimit = 50\n)\n\nfunc scale() int { return WideLimit * 2 }\n",
+        )
+        .edge_before("function scale", "references", "constant BaseLimit")
+        .edge_after("function scale", "references", "constant WideLimit")
+}
