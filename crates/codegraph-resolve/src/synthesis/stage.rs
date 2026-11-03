@@ -16,7 +16,7 @@ use codegraph_core::types::{Edge, EdgeKind, Language, Node, NodeKind, Unresolved
 use codegraph_store::Store;
 use codegraph_store::queries::ReferenceSite;
 
-use super::{callback, dispatch, iface, is_synthesized, registry};
+use super::{callback, dispatch, iface, is_synthesized, jsx, registry};
 
 /// What one run of the stage did.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -53,6 +53,7 @@ const PASSES: &[(&str, Gate, Pass)] = &[
     ),
     ("emitterEdges", always, callback::event_emitter_edges),
     ("renderEdges", always, dispatch::react_render_edges),
+    ("jsxEdges", jsx::gate, jsx::jsx_render_edges),
     ("pascalEdges", always, dispatch::pascal_form_edges),
     (
         "flutterEdges",
@@ -293,6 +294,17 @@ impl<'a> View<'a> {
     /// `getDistinctFileLanguages`).
     fn file_languages(&self) -> Result<HashSet<Language>> {
         Ok(self.store.file_languages()?.into_iter().collect())
+    }
+
+    /// The indexed files of `languages`, by path.
+    pub(super) fn files_of_languages(&self, languages: &[Language]) -> Result<Vec<String>> {
+        let mut files = Vec::new();
+        for language in languages {
+            files.extend(self.store.file_paths_of_language(*language)?);
+        }
+        files.sort();
+        files.dedup();
+        Ok(files)
     }
 
     /// Every indexed file, by path (upstream `getAllFilePaths`).

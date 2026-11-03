@@ -259,7 +259,8 @@ pair stays taken. The ported passes are the field observer
 (`callback`), the Swift and Kotlin closure collection (`closure-collection`),
 the string-keyed emitter (`event-emitter`), and the structural ones: a React
 class component's or a Flutter `State`'s re-render (`react-render`,
-`flutter-build`), a C++ virtual override (`cpp-override`), a call through
+`flutter-build`), the components a function's JSX tags render
+(`jsx-render`), a C++ virtual override (`cpp-override`), a call through
 an interface or a base type reaching the same-named methods of the types that
 implement or extend it (`interface-impl`), a Kotlin Multiplatform
 declaration's `actual`s (`kotlin-expect-actual`), a Delphi form's unit

@@ -611,6 +611,30 @@
   },
   {
     "col": null,
+    "kind": "calls",
+    "line": 5,
+    "metadata": {
+      "synthesizedBy": "jsx-render",
+      "via": "Home"
+    },
+    "provenance": "heuristic",
+    "source": "constant:12853c40af592d62e70d60d7fc689444",
+    "target": "function:39add68cb5c4bab5e7011e7970b8700b"
+  },
+  {
+    "col": null,
+    "kind": "calls",
+    "line": 5,
+    "metadata": {
+      "synthesizedBy": "jsx-render",
+      "via": "Layout"
+    },
+    "provenance": "heuristic",
+    "source": "constant:12853c40af592d62e70d60d7fc689444",
+    "target": "function:c863eb857f02e69680c9e47dace356b9"
+  },
+  {
+    "col": null,
     "kind": "contains",
     "line": null,
     "metadata": null,

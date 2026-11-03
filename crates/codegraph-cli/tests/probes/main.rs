@@ -18528,7 +18528,10 @@ mod import_bindings {
     /// (upstream's `LINKS`, in this port's graph: it links neither Astro's
     /// `Shell` to the `BaseLayout` component nor Express's mount of
     /// `uploadRoutes` to its `router`, upstream's two other links).
-    const LINKS: [&str; 20] = [
+    const LINKS: [&str; 21] = [
+        // The test file's top-level `const page = <Component />` renders it
+        // (W7-14e's `jsx-render`), recomputed with the import's link.
+        "calls constant src/pages/groups_page.test.tsx -> function src/pages/groups_page.tsx::Component",
         "calls function src/call.ts -> function src/handler.ts::handle",
         "extends class src/admin.ts -> class src/base.ts::BaseUser",
         "imports file backend/server.js -> file backend/routes/uploadRoutes.js::uploadRoutes.js",
@@ -23238,7 +23241,7 @@ mod synthesis {
         assert_eq!((edge.line, edge.col), (Some(7), None), "{edge:?}");
         assert_eq!(
             project_metadata_with_prefix(&project.db(), "synthesis_version"),
-            [("synthesis_version".to_string(), "3".to_string())]
+            [("synthesis_version".to_string(), "4".to_string())]
         );
     }
 
@@ -24741,5 +24744,207 @@ mod synthesis {
             &[("via", "Cmd"), ("registeredAt", "src/mixed.ts:13")],
         );
         assert_eq!(edge.line, Some(10), "{edge:?}");
+    }
+
+    /// Every `jsx-render` edge as `source -> target` qualified names, sorted.
+    fn jsx_links(graph: &Graph) -> Vec<String> {
+        let name = |id: &str| {
+            graph
+                .nodes
+                .iter()
+                .find(|node| node.id == id)
+                .map_or_else(|| id.to_string(), |node| node.qualified_name.clone())
+        };
+        let mut links: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.metadata["synthesizedBy"] == "jsx-render")
+            .map(|edge| format!("{} -> {}", name(&edge.source), name(&edge.target)))
+            .collect();
+        links.sort();
+        links
+    }
+
+    const BUTTON: &str = "export function Button() {\n  return <button />;\n}\n";
+
+    /// A component renders the component its tag's static reference reaches,
+    /// `via` the tag and at the parent's first line; an outer function also
+    /// renders the tags of a function inside it.
+    #[test]
+    fn w714e_a_component_renders_its_tags_and_its_inner_functions() {
+        let project = Project::new()
+            .file("src/button.tsx", BUTTON)
+            .file(
+                "src/card.tsx",
+                "import { Button } from './button';\nfunction Row() {\n  return <span />;\n}\nexport function Card() {\n  const row = () => <Row />;\n  return (\n    <div>\n      <Button />\n      <Button />\n      {row()}\n    </div>\n  );\n}\n",
+            )
+            .index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            jsx_links(graph),
+            ["Card -> Button", "Card -> Row", "Card::row -> Row"],
+            "{}",
+            graph.report()
+        );
+        let edge = assert_synthesized(graph, "Card", "Button", "jsx-render", &[("via", "Button")]);
+        assert_eq!(edge.line, Some(5), "{edge:?}");
+        assert_eq!(edge.col, None, "{edge:?}");
+    }
+
+    /// Outside every function a tag renders from the top-level value or the
+    /// file the syntax tree gives it to; a class component renders from its
+    /// `render` method.
+    #[test]
+    fn w714e_values_files_and_class_components_render() {
+        let project = Project::new()
+            .file("src/button.tsx", BUTTON)
+            .file(
+                "src/main.tsx",
+                "import { Button } from './button';\nconst ICONS = { a: <Button /> };\nexport class Page extends React.Component {\n  render() {\n    return <Button />;\n  }\n}\nexport function App() {\n  return <Page />;\n}\ncreateRoot(el).render(<App />);\n",
+            )
+            .index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            jsx_links(graph),
+            [
+                "App -> Page",
+                "ICONS -> Button",
+                "Page::render -> Button",
+                "src/main.tsx -> App",
+            ],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// What renders nothing: an intrinsic or member tag, a type argument, a
+    /// tag with a space after `<`, a tag of a declared package (#2475), a
+    /// component rendering itself, a tag whose reference reaches a method, and
+    /// any tag of a `.ts` or `.js` file.
+    #[test]
+    fn w714e_what_renders_nothing() {
+        let project = Project::new()
+            .file("src/button.tsx", BUTTON)
+            .file(
+                "package.json",
+                "{\n  \"name\": \"app\",\n  \"dependencies\": { \"antd\": \"5.0.0\" }\n}\n",
+            )
+            .file(
+                "src/tags.tsx",
+                "import * as UI from './button';\nexport function Box() {\n  const items: Array<Box> = [];\n  const one = useState<Box>(null);\n  return <div><UI.Button /></div>;\n}\nexport function Tree() {\n  return <Tree />;\n}\n",
+            )
+            .file(
+                "src/pkg.tsx",
+                "import { Button } from 'antd';\nexport function Shop() {\n  return <Button />;\n}\n",
+            )
+            .file(
+                "src/helpers.tsx",
+                "export class Helpers {\n  Helper() {\n    return 1;\n  }\n}\nexport function Uses() {\n  return <Helper />;\n}\n",
+            )
+            .file("src/plain.js", "import { Button } from './button';\nexport function Plain() {\n  return <Button />;\n}\n")
+            .file("src/plain.ts", "import { Button } from './button';\nexport class Box {}\nexport function Typed(raw: unknown) {\n  const v = <Box>raw;\n  return [Button, v];\n}\nexport const LIMIT_MAX = 3;\nexport function Check(count: number) {\n  return count <LIMIT_MAX ;\n}\n")
+            .index();
+        let graph = graph_of(&project);
+        assert_eq!(jsx_links(graph), Vec::<String>::new(), "{}", graph.report());
+    }
+
+    /// A parent links at most thirty children, the first tags it holds.
+    #[test]
+    fn w714e_a_parent_links_at_most_thirty() {
+        let mut source = String::new();
+        let mut tags = String::new();
+        for at in 1..=31 {
+            source.push_str(&format!(
+                "export function C{at:02}() {{\n  return <span />;\n}}\n"
+            ));
+            tags.push_str(&format!("      <C{at:02} />\n"));
+        }
+        source.push_str(&format!(
+            "export function All() {{\n  return (\n    <div>\n{tags}    </div>\n  );\n}}\n"
+        ));
+        let project = Project::new().file("src/all.tsx", &source).index();
+        let graph = graph_of(&project);
+        let links = jsx_links(graph);
+        assert_eq!(links.len(), 30, "{}", graph.report());
+        assert!(!links.contains(&"All -> C31".to_string()), "{links:?}");
+    }
+
+    /// `via` is the tag, not the child's name; a name a parent renders twice
+    /// reads its first tag; a pair already linked does not count toward the
+    /// thirty; a tag a class's lines hold renders from no value or file.
+    #[test]
+    fn w714e_via_names_pairs_and_class_lines() {
+        let mut comps = String::new();
+        let mut names = vec!["C01".to_string(), "C01 as Again".to_string()];
+        let mut tags = String::from("      <C01 />\n      <Again />\n");
+        for at in 1..=30 {
+            comps.push_str(&format!(
+                "export function C{at:02}() {{\n  return <span />;\n}}\n"
+            ));
+            if at > 1 {
+                names.push(format!("C{at:02}"));
+                tags.push_str(&format!("      <C{at:02} />\n"));
+            }
+        }
+        let project = Project::new()
+            .file("src/button.tsx", BUTTON)
+            .file("src/comps.tsx", &comps)
+            .file(
+                "src/all.tsx",
+                &format!(
+                    "import {{ {} }} from './comps';\nexport function All() {{\n  return (\n    <div>\n{tags}    </div>\n  );\n}}\n",
+                    names.join(", ")
+                ),
+            )
+            .file(
+                "src/alias.tsx",
+                "import { Button as Btn } from './button';\nexport function Aliased() {\n  return <Btn />;\n}\n",
+            )
+            .file(
+                "src/twice.tsx",
+                "import { Button } from './button';\nexport function Outer() {\n  function Inner() {\n    function Button() {\n      return <i />;\n    }\n    return <Button />;\n  }\n  return (\n    <div>\n      <Button />\n      <Inner />\n    </div>\n  );\n}\n",
+            )
+            .file(
+                "src/deco.tsx",
+                "import { Button } from './button';\n@decorate(<Button />)\nexport class Deco {}\n",
+            )
+            .file(
+                "src/holder.tsx",
+                "import { Button } from './button';\nexport class Holder {\n  static icon = <Button />;\n}\n",
+            )
+            .file("src/widget.py", "class Widget:\n    pass\n")
+            .file("src/cross.tsx", "export function Cross() {\n  return <Widget />;\n}\n")
+            .index();
+        let graph = graph_of(&project);
+        let links = jsx_links(graph);
+        let all: Vec<&String> = links
+            .iter()
+            .filter(|link| link.starts_with("All -> "))
+            .collect();
+        assert_eq!(all.len(), 30, "{}", graph.report());
+        assert!(links.contains(&"All -> C30".to_string()), "{links:?}");
+        assert_synthesized(graph, "Aliased", "Button", "jsx-render", &[("via", "Btn")]);
+        let outer: Vec<&String> = links
+            .iter()
+            .filter(|link| link.starts_with("Outer -> "))
+            .collect();
+        assert_eq!(
+            outer,
+            ["Outer -> Button", "Outer -> Outer::Inner"],
+            "{}",
+            graph.report()
+        );
+        // A decorator's argument is module-level code: the file renders it.
+        // A class field's tag belongs to the class, which renders nothing.
+        assert!(
+            links.contains(&"src/deco.tsx -> Button".to_string()),
+            "{links:?}"
+        );
+        assert!(
+            links.iter().all(|link| !link.starts_with("src/holder.tsx")
+                && !link.contains("Holder")
+                && !link.contains("Widget")),
+            "{links:?}"
+        );
     }
 }

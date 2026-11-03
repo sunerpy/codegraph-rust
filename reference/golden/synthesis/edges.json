@@ -261,6 +261,18 @@
   {
     "col": null,
     "kind": "calls",
+    "line": 7,
+    "metadata": {
+      "synthesizedBy": "jsx-render",
+      "via": "Label"
+    },
+    "provenance": "heuristic",
+    "source": "function:33d9d8364fb2a1c7aabe3039389f7a9c",
+    "target": "function:706e19e00afd3aaea61071890ff2d2ba"
+  },
+  {
+    "col": null,
+    "kind": "calls",
     "line": null,
     "metadata": {
       "event": "saved",

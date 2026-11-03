@@ -16262,3 +16262,55 @@ pub fn typescript_registry_dispatch_removed() -> Case {
         .edge_before("function route", "calls", "function saveDoc")
         .no_edge_after("function route", "calls", "function saveDoc")
 }
+
+const JSX_APP: &str =
+    "import { Card } from './card';\nexport function App() {\n  return <Card />;\n}\n";
+const JSX_CARD: &str = "export function Card() {\n  return <div />;\n}\n";
+
+/// W7-14e (#2452's JSX half): the component a tag imports appears in a new
+/// file; the unchanged parent renders it.
+pub fn tsx_rendered_component_appears() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Tsx])
+        .file("src/app.tsx", JSX_APP)
+        .write("src/card.tsx", JSX_CARD)
+        .edge_metadata_after(
+            ("function App", "calls", "function Card"),
+            "synthesizedBy",
+            "jsx-render",
+        )
+}
+
+/// W7-14e: one rendered component's file is deleted; the parent keeps
+/// rendering the other.
+pub fn tsx_rendered_component_file_deleted() -> Case {
+    Case::new(Change::DeleteImportedModule, &[Language::Tsx])
+        .file(
+            "src/app.tsx",
+            "import { Card } from './card';\nimport { Badge } from './badge';\nexport function App() {\n  return (\n    <div>\n      <Card />\n      <Badge />\n    </div>\n  );\n}\n",
+        )
+        .file("src/card.tsx", JSX_CARD)
+        .file(
+            "src/badge.tsx",
+            "export function Badge() {\n  return <span />;\n}\n",
+        )
+        .remove("src/card.tsx")
+        .edge_before("function App", "calls", "function Card")
+        .edge_metadata_after(
+            ("function App", "calls", "function Badge"),
+            "synthesizedBy",
+            "jsx-render",
+        )
+}
+
+/// W7-14e: the tag is edited out of the parent; its edge goes with it.
+pub fn tsx_tag_removed() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Tsx])
+        .file("src/app.tsx", JSX_APP)
+        .file("src/card.tsx", JSX_CARD)
+        .write(
+            "src/app.tsx",
+            "import { Card } from './card';\nexport function App() {\n  return null;\n}\n",
+        )
+        .edge_before("function App", "calls", "function Card")
+        .no_edge_after("function App", "calls", "function Card")
+}

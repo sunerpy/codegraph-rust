@@ -68,7 +68,7 @@ colby behaviors are intentionally NOT ported in v1:
   here; the routers bind navigation calls only.
 - **Dynamic-dispatch synthesis passes** — of `SYNTH_PASSES`
   (`callback-synthesizer.ts`), the field, closure-collection, emitter,
-  render, Pascal form, Flutter, C++ override, interface override, Kotlin
+  render, JSX, Pascal form, Flutter, C++ override, interface override, Kotlin
   expect/actual, MyBatis and object-registry passes are ported
   (`crates/codegraph-resolve/src/synthesis/`); the others and the Go
   prerequisites (`go-method-contains`, `go-implements`) draw no edge here
@@ -486,6 +486,19 @@ listed.
   file, else the one of the project, else nothing, without falling to the
   next kind. colby takes that kind's first node of `getNodesByName`
   (`synthesis/registry.rs`).
+- **JSX render (W7-14e, OD-A4).** A tag renders what its static
+  `references` edge reaches, a component, function, class or value, never
+  a method. colby scans a file's text for `<Name` and finds the child by
+  name (`jsxChild`, `declaredComponent` and its local-binding and export
+  lookups). The tags are the ones the syntax tree gives in tsx and jsx
+  files, so JSX in a `.js` file renders nothing here, and a type argument
+  (`Array<Box>`, `useState<Box>()`) is no tag, where colby's pattern reads
+  one. A tag outside every function renders from the value or the file
+  the syntax tree gives it to; colby decides by line, and a line a value
+  shares with another statement renders from no one (#2587). A wrapper
+  (`styled(Button)`, `memo(Button)`) does not render what it wraps, colby's
+  `wrapped` edges: the base graph has no edge from the wrapper to it
+  (`synthesis/jsx.rs`).
 - **A file that drifted since it was indexed (W7-14).** The stage reads a
   file only while its size and modification time, or its content hash, are
   the ones its file row records, the MCP engine's freshness probe; a drifted
