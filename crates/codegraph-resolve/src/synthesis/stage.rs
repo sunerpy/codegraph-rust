@@ -17,7 +17,7 @@ use codegraph_store::Store;
 use codegraph_store::queries::ReferenceSite;
 use rayon::prelude::*;
 
-use super::{callback, dispatch, go, iface, is_synthesized, jsx, registry};
+use super::{callback, dispatch, go, go_dispatch, iface, is_synthesized, jsx, registry};
 
 /// What one run of the stage did.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -81,6 +81,7 @@ const PASSES: &[(&str, Gate, Pass)] = &[
         |languages| languages.contains(&Language::Kotlin),
         dispatch::kotlin_expect_actual_edges,
     ),
+    ("goGrpcEdges", go::gate, go_dispatch::grpc_stub_impl_edges),
     (
         "mybatisEdges",
         |languages| {
@@ -88,6 +89,11 @@ const PASSES: &[(&str, Gate, Pass)] = &[
                 && languages.contains(&Language::Xml)
         },
         dispatch::mybatis_edges,
+    ),
+    (
+        "ginEdges",
+        go::gate,
+        go_dispatch::gin_middleware_chain_edges,
     ),
     ("registryEdges", always, registry::object_registry_edges),
 ];

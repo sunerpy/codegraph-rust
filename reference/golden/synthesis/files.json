@@ -18,6 +18,42 @@
     "size": 719
   },
   {
+    "content_hash": "f0b71fcb8e1e37601d10d7b7509adcee0eb524c1d687018a6beeb4429ce8cccd",
+    "errors": null,
+    "generated": 0,
+    "language": "go",
+    "node_count": 4,
+    "path": "go/gin/app.go",
+    "size": 176
+  },
+  {
+    "content_hash": "14a5e9b1d00bf5a2ffd207a250dfa9a8165adfd33b37701834a40b18f298b1ed",
+    "errors": null,
+    "generated": 0,
+    "language": "go",
+    "node_count": 8,
+    "path": "go/gin/gin.go",
+    "size": 501
+  },
+  {
+    "content_hash": "de178203bd8f72e872be69a17dd7c722361e26754a6c6104e3d867bd97a7e94b",
+    "errors": null,
+    "generated": 1,
+    "language": "go",
+    "node_count": 5,
+    "path": "go/rpc/greeter_grpc.pb.go",
+    "size": 352
+  },
+  {
+    "content_hash": "15e21a289c10ca784c470d738c3180e3b770b54e31f0584dc63f9f91202d2c9b",
+    "errors": null,
+    "generated": 0,
+    "language": "go",
+    "node_count": 3,
+    "path": "go/rpc/server.go",
+    "size": 153
+  },
+  {
     "content_hash": "65acc0aa30be3ed776601d151d4c8def2842810c9f434c8b1d218c5cd3079b53",
     "errors": null,
     "generated": 0,

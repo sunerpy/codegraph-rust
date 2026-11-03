@@ -276,14 +276,20 @@ an interface or a base type reaching the same-named methods of the types that
 implement or extend it, a Go interface's unexported method only those of its
 package, and the method a Go struct's embedding promotes into it
 (`interface-impl`, with `promotedInto`), a Kotlin Multiplatform
-declaration's `actual`s (`kotlin-expect-actual`), a Delphi form's unit
-(`pascal-form`), a MyBatis mapper method's statement (`mybatis-java-xml`) and
-each handler an object-literal registry maps, reached from a function that
-calls the registry with a runtime key (`object-registry`).
+declaration's `actual`s (`kotlin-expect-actual`), a generated gRPC server
+stub's methods reaching the same-named methods of each hand-written Go struct
+declaring all of them (`go-grpc-stub-impl`), a Delphi form's unit
+(`pascal-form`), a MyBatis mapper method's statement (`mybatis-java-xml`),
+gin's handler-chain dispatcher (a Go method calling into a `handlers` slice
+by index) reaching each named handler a `Use`, `GET` or other registration
+passes, a shared name only when the registration's file or the project holds
+one Go function or method of it (`gin-middleware-chain`), and each handler an
+object-literal registry maps, reached from a function that calls the
+registry with a runtime key (`object-registry`).
 Each walks its candidates in upstream's order (nodes by file, line and id,
 edges by their other end, line and column); the Flutter, C++, interface,
-Kotlin and MyBatis passes run only when the index has files of their
-languages, as upstream's gates have them. A full index and a migration run
+Kotlin, gRPC, MyBatis and gin passes run only when the index has files of
+their languages, as upstream's gates have them. A full index and a migration run
 the stage after resolution. A sync runs it last, after the orphan sweep,
 whenever it changed the index, bootstrapped a lane, swept, or found the
 `synthesis_version` marker missing or at another version, and writes the

@@ -101,6 +101,26 @@
   },
   {
     "candidates": null,
+    "col": 14,
+    "file_path": "go/gin/gin.go",
+    "from_node_id": "method:5c7f5fa1be3ed8bd0afaea1987ab236b",
+    "language": "go",
+    "line": 25,
+    "reference_kind": "calls",
+    "reference_name": "append"
+  },
+  {
+    "candidates": null,
+    "col": 15,
+    "file_path": "go/gin/gin.go",
+    "from_node_id": "method:5d4971ea91e2095eee5c31d0ff7d5543",
+    "language": "go",
+    "line": 14,
+    "reference_kind": "calls",
+    "reference_name": "len"
+  },
+  {
+    "candidates": null,
     "col": 18,
     "file_path": "dispatch/src/Events.java",
     "from_node_id": "field:b4afa2847b5e18c9e5084ec2c917ca28",
@@ -138,6 +158,26 @@
     "line": 12,
     "reference_kind": "calls",
     "reference_name": "bus.emit"
+  },
+  {
+    "candidates": null,
+    "col": 21,
+    "file_path": "go/gin/gin.go",
+    "from_node_id": "method:5d4971ea91e2095eee5c31d0ff7d5543",
+    "language": "go",
+    "line": 14,
+    "reference_kind": "function_ref",
+    "reference_name": "c.handlers"
+  },
+  {
+    "candidates": null,
+    "col": 23,
+    "file_path": "go/gin/gin.go",
+    "from_node_id": "method:5c7f5fa1be3ed8bd0afaea1987ab236b",
+    "language": "go",
+    "line": 25,
+    "reference_kind": "function_ref",
+    "reference_name": "e.Handlers"
   },
   {
     "candidates": null,

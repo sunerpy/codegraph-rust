@@ -23241,7 +23241,7 @@ mod synthesis {
         assert_eq!((edge.line, edge.col), (Some(7), None), "{edge:?}");
         assert_eq!(
             project_metadata_with_prefix(&project.db(), "synthesis_version"),
-            [("synthesis_version".to_string(), "5".to_string())]
+            [("synthesis_version".to_string(), "6".to_string())]
         );
     }
 
@@ -27430,5 +27430,541 @@ mod go_synthesis {
             }
         }
         assert_eq!(implementers(graph, "interface Coded"), ["e.statusErr"]);
+    }
+}
+
+/// W7-15c: the Go dispatch passes, a generated gRPC server stub's methods to
+/// the hand-written server's (`go-grpc-stub-impl`) and gin's handler-chain
+/// dispatcher to the named handlers its registrations pass
+/// (`gin-middleware-chain`).
+mod go_dispatch_synthesis {
+    use std::fmt::Write as _;
+
+    use super::support::{EdgeRow, Graph, Project, graph_of};
+
+    /// The `calls` edges the pass `by` made.
+    fn synthesized_by<'g>(graph: &'g Graph, by: &'g str) -> impl Iterator<Item = &'g EdgeRow> {
+        graph
+            .edges
+            .iter()
+            .filter(move |edge| edge.kind == "calls" && edge.metadata["synthesizedBy"] == by)
+    }
+
+    /// Every `calls` edge the pass `by` made, as `source -> target via
+    /// <via> @<registeredAt> line <line>` over qualified names, sorted; each
+    /// is heuristic and has no column.
+    #[track_caller]
+    fn links(graph: &Graph, by: &str) -> Vec<String> {
+        let name = |id: &str| {
+            graph
+                .node(id)
+                .map_or_else(|| "?".to_string(), |node| node.qualified_name.clone())
+        };
+        let mut links: Vec<String> = synthesized_by(graph, by)
+            .map(|edge| {
+                assert_eq!(edge.provenance.as_deref(), Some("heuristic"), "{edge:?}");
+                assert_eq!(edge.col, None, "{edge:?}");
+                format!(
+                    "{} -> {} via {} @{} line {}",
+                    name(&edge.source),
+                    name(&edge.target),
+                    edge.metadata["via"].as_str().unwrap_or("?"),
+                    edge.metadata["registeredAt"].as_str().unwrap_or("?"),
+                    edge.line
+                        .map_or_else(|| "?".to_string(), |line| line.to_string()),
+                )
+            })
+            .collect();
+        links.sort();
+        links
+    }
+
+    /// The 1-based line of `text` holding `needle`.
+    #[track_caller]
+    fn line_of(text: &str, needle: &str) -> usize {
+        text.split('\n')
+            .position(|line| line.contains(needle))
+            .unwrap_or_else(|| panic!("no line holds {needle:?}"))
+            + 1
+    }
+
+    const GO_MOD: &str = "module ginapp\n\ngo 1.21\n";
+
+    /// `gin.go` of upstream's `gin-middleware-chain.test.ts`: the chain
+    /// dispatcher and the registration surface.
+    const GIN_GO: &str = concat!(
+        "package gin\n",
+        "\n",
+        "type HandlerFunc func(*Context)\n",
+        "type HandlersChain []HandlerFunc\n",
+        "\n",
+        "type Context struct {\n",
+        "\thandlers HandlersChain\n",
+        "\tindex    int8\n",
+        "}\n",
+        "\n",
+        "func (c *Context) Next() {\n",
+        "\tc.index++\n",
+        "\tfor c.index < int8(len(c.handlers)) {\n",
+        "\t\tc.handlers[c.index](c)\n",
+        "\t\tc.index++\n",
+        "\t}\n",
+        "}\n",
+        "\n",
+        "type Engine struct {\n",
+        "\tHandlers HandlersChain\n",
+        "}\n",
+        "\n",
+        "func (e *Engine) Use(middleware ...HandlerFunc) {\n",
+        "\te.Handlers = append(e.Handlers, middleware...)\n",
+        "}\n",
+        "\n",
+        "func (e *Engine) GET(path string, handlers ...HandlerFunc) {}\n",
+    );
+
+    /// `app.go` of the same test: named middleware, a named route handler
+    /// and an inline closure.
+    const GIN_APP_GO: &str = concat!(
+        "package gin\n",
+        "\n",
+        "func Logger(c *Context)   {}\n",
+        "func Recovery(c *Context) {}\n",
+        "func getUser(c *Context)  {}\n",
+        "\n",
+        "func setup() {\n",
+        "\te := &Engine{}\n",
+        "\te.Use(Logger, Recovery)\n",
+        "\te.GET(\"/users\", getUser)\n",
+        "\te.GET(\"/inline\", func(c *Context) {})\n",
+        "}\n",
+    );
+
+    /// Upstream `gin-middleware-chain.test.ts`: `Context.Next` links to the
+    /// three named handlers registered through `Use` and `GET`, each with
+    /// its registration site; the inline closure is anonymous.
+    #[test]
+    fn w715c_gin_links_next_to_the_named_handlers() {
+        let project = Project::new()
+            .file("go.mod", GO_MOD)
+            .file("gin.go", GIN_GO)
+            .file("app.go", GIN_APP_GO)
+            .index();
+        let graph = graph_of(&project);
+        let next = line_of(GIN_GO, "func (c *Context) Next()");
+        let uses = line_of(GIN_APP_GO, "e.Use(Logger, Recovery)");
+        let get = line_of(GIN_APP_GO, "e.GET(\"/users\", getUser)");
+        assert_eq!(
+            links(graph, "gin-middleware-chain"),
+            [
+                format!("Context::Next -> Logger via Logger @app.go:{uses} line {next}"),
+                format!("Context::Next -> Recovery via Recovery @app.go:{uses} line {next}"),
+                format!("Context::Next -> getUser via getUser @app.go:{get} line {next}"),
+            ],
+            "{}",
+            graph.report()
+        );
+        assert!(
+            graph
+                .edges_matching("method Context::Next", "calls", "method Context::Next")
+                .is_empty()
+        );
+    }
+
+    /// Without a method calling into a `handlers` slice by index, the
+    /// registrations link nothing: a gin user's repository holds them alone.
+    #[test]
+    fn w715c_gin_needs_a_dispatcher() {
+        let indexed_only = GIN_GO.replace(
+            "\t\tc.handlers[c.index](c)\n",
+            "\t\t_ = c.handlers[c.index]\n",
+        );
+        let project = Project::new()
+            .file("go.mod", GO_MOD)
+            .file("gin.go", &indexed_only)
+            .file("app.go", GIN_APP_GO)
+            .index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            links(graph, "gin-middleware-chain"),
+            Vec::<String>::new(),
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// `r1.go`: registrations of each shape the pass reads.
+    const GIN_SHAPES_GO: &str = concat!(
+        "package gin\n",
+        "\n",
+        "func Logger() HandlerFunc { return nil }\n",
+        "func Auth(c *Context)     {}\n",
+        "func Hidden(c *Context)   {}\n",
+        "func Blocked(c *Context)  {}\n",
+        "func Quoted(c *Context)   {}\n",
+        "func Handled(c *Context)  {}\n",
+        "\n",
+        "func routes(e *Engine, c *Context) {\n",
+        "\t// e.Use(Hidden)\n",
+        "\t/* e.GET(\"/blocked\", Blocked) */\n",
+        "\te.Use(gin.Logger(), Auth)\n",
+        "\te.GET(\"Quoted\", func(c *Context) { Quoted(c) })\n",
+        "\te.Handle(\"GET\", \"/handled\", Handled)\n",
+        "\te.Use(c.Next)\n",
+        "}\n",
+    );
+
+    /// `r3.go`: a registration spaced from its parenthesis, in a file
+    /// holding no unspaced one, which upstream's prefilter skips.
+    const GIN_SPACED_GO: &str = concat!(
+        "package gin\n",
+        "\n",
+        "func Spaced(c *Context) {}\n",
+        "\n",
+        "func spaced(e *Engine) {\n",
+        "\te.Use (Spaced)\n",
+        "}\n",
+    );
+
+    /// `r2.go`: a later file registering `Auth` again.
+    const GIN_AGAIN_GO: &str = concat!(
+        "package gin\n",
+        "\n",
+        "func more(e *Engine) {\n",
+        "\te.GET(\"/again\", Auth)\n",
+        "}\n",
+    );
+
+    /// A registration in a comment counts for nothing, a string or a
+    /// function literal names no handler, `gin.Logger()` names `Logger`,
+    /// `Handle` registers too, the dispatcher registered as a handler links
+    /// to nothing, a name keeps its first registration site in path order,
+    /// and a file is read only when it holds `.Use(` or a verb call written
+    /// without a space.
+    #[test]
+    fn w715c_gin_reads_named_handlers_outside_comments() {
+        let project = Project::new()
+            .file("go.mod", GO_MOD)
+            .file("gin.go", GIN_GO)
+            .file("r1.go", GIN_SHAPES_GO)
+            .file("r2.go", GIN_AGAIN_GO)
+            .file("r3.go", GIN_SPACED_GO)
+            .index();
+        let graph = graph_of(&project);
+        let next = line_of(GIN_GO, "func (c *Context) Next()");
+        let uses = line_of(GIN_SHAPES_GO, "e.Use(gin.Logger(), Auth)");
+        let handle = line_of(GIN_SHAPES_GO, "e.Handle(");
+        assert_eq!(
+            links(graph, "gin-middleware-chain"),
+            [
+                format!("Context::Next -> Auth via Auth @r1.go:{uses} line {next}"),
+                format!("Context::Next -> Handled via Handled @r1.go:{handle} line {next}"),
+                format!("Context::Next -> Logger via Logger @r1.go:{uses} line {next}"),
+            ],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// A dispatcher links the first forty handlers the registrations name,
+    /// in their order; each dispatcher has its own forty.
+    #[test]
+    fn w715c_gin_links_at_most_forty_handlers_a_dispatcher() {
+        let mut handlers = String::from("package gin\n\n");
+        let mut names = Vec::new();
+        for at in 0..41 {
+            writeln!(handlers, "func H{at}(c *Context) {{}}").unwrap();
+            names.push(format!("H{at}"));
+        }
+        writeln!(
+            handlers,
+            "\nfunc wire(e *Engine) {{\n\te.Use({})\n}}",
+            names.join(", ")
+        )
+        .unwrap();
+        writeln!(
+            handlers,
+            "\ntype Router struct {{\n\thandlers HandlersChain\n}}\n\nfunc (r *Router) run() {{\n\tr.handlers[0](nil)\n}}"
+        )
+        .unwrap();
+        let project = Project::new()
+            .file("go.mod", GO_MOD)
+            .file("gin.go", GIN_GO)
+            .file("handlers.go", &handlers)
+            .index();
+        let graph = graph_of(&project);
+        for dispatcher in ["Context::Next", "Router::run"] {
+            let mut targets: Vec<String> = links(graph, "gin-middleware-chain")
+                .into_iter()
+                .filter_map(|link| {
+                    let rest = link.strip_prefix(&format!("{dispatcher} -> "))?;
+                    Some(rest.split(' ').next().unwrap_or_default().to_string())
+                })
+                .collect();
+            targets.sort();
+            let mut expected: Vec<String> = names[..40].to_vec();
+            expected.sort();
+            assert_eq!(targets, expected, "{dispatcher}:\n{}", graph.report());
+        }
+    }
+
+    /// Handlers that share a name link only when the registration's file
+    /// holds exactly one of them, or the project holds exactly one (as the
+    /// emitter pass picks its handler; upstream links an arbitrary one).
+    /// The candidates are Go functions and methods: a Go type or another
+    /// language's function of the name counts for nothing, and neither does a
+    /// registration outside a `.go` file.
+    #[test]
+    fn w715c_gin_links_a_shared_handler_name_only_when_unique() {
+        let project = Project::new()
+            .file("go.mod", GO_MOD)
+            .file("gin.go", GIN_GO)
+            .file("mw/a/auth.go", "package a\n\nfunc Auth(c *Context)  {}\nfunc Trace(c *Context) {}\n")
+            .file("mw/b/auth.go", "package b\n\nfunc Auth(c *Context)    {}\nfunc Recover(c *Context) {}\n")
+            .file("mw/c/types.go", "package c\n\ntype Recover struct{}\n")
+            .file("web/auth.js", "export function Recover() {}\napp.GET('/x', Shadow);\n")
+            .file(
+                "app/routes.go",
+                "package app\n\nfunc Trace(c *Context)  {}\nfunc Shadow(c *Context) {}\n\nfunc routes(e *Engine) {\n\te.Use(Auth, Trace, Recover)\n}\n",
+            )
+            .index();
+        let graph = graph_of(&project);
+        let next = line_of(GIN_GO, "func (c *Context) Next()");
+        let mut targets: Vec<String> = synthesized_by(graph, "gin-middleware-chain")
+            .map(|edge| graph.describe(&edge.target))
+            .collect();
+        targets.sort();
+        assert_eq!(
+            targets,
+            [
+                "function Recover @mw/b/auth.go:4",
+                "function Trace @app/routes.go:3",
+            ],
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            links(graph, "gin-middleware-chain"),
+            [
+                format!("Context::Next -> Recover via Recover @app/routes.go:7 line {next}"),
+                format!("Context::Next -> Trace via Trace @app/routes.go:7 line {next}"),
+            ]
+        );
+    }
+
+    /// `svc/greeter_grpc.pb.go`: protoc-gen-go-grpc's server stub, with
+    /// gRPC's embedding markers, and the generated client.
+    const GREETER_GRPC_GO: &str = concat!(
+        "package svc\n",
+        "\n",
+        "type UnimplementedGreeterServer struct{}\n",
+        "\n",
+        "func (UnimplementedGreeterServer) SayHello(ctx Context, in *HelloRequest) (*HelloReply, error) {\n",
+        "\treturn nil, nil\n",
+        "}\n",
+        "func (UnimplementedGreeterServer) SayBye(ctx Context, in *HelloRequest) (*HelloReply, error) {\n",
+        "\treturn nil, nil\n",
+        "}\n",
+        "func (UnimplementedGreeterServer) mustEmbedUnimplementedGreeterServer() {}\n",
+        "func (UnimplementedGreeterServer) testEmbeddedByValue()                 {}\n",
+        "\n",
+        "type greeterClient struct{}\n",
+        "\n",
+        "func (c *greeterClient) SayHello(ctx Context, in *HelloRequest) (*HelloReply, error) {\n",
+        "\treturn nil, nil\n",
+        "}\n",
+        "func (c *greeterClient) SayBye(ctx Context, in *HelloRequest) (*HelloReply, error) {\n",
+        "\treturn nil, nil\n",
+        "}\n",
+    );
+
+    /// `svc/server.go`: the hand-written server, one of its methods.
+    const GREETER_SERVER_GO: &str = concat!(
+        "package svc\n",
+        "\n",
+        "type Context interface{}\n",
+        "type HelloRequest struct{}\n",
+        "type HelloReply struct{}\n",
+        "\n",
+        "type server struct {\n",
+        "\tUnimplementedGreeterServer\n",
+        "}\n",
+        "\n",
+        "func (s *server) SayHello(ctx Context, in *HelloRequest) (*HelloReply, error) {\n",
+        "\treturn &HelloReply{}, nil\n",
+        "}\n",
+    );
+
+    /// `svc/bye.go`: the server's other method, in a file of its own.
+    const GREETER_BYE_GO: &str = concat!(
+        "package svc\n",
+        "\n",
+        "func (s *server) SayBye(ctx Context, in *HelloRequest) (*HelloReply, error) {\n",
+        "\treturn &HelloReply{}, nil\n",
+        "}\n",
+    );
+
+    /// `svc/fake.go`: a test double declaring every RPC and more.
+    const GREETER_FAKE_GO: &str = concat!(
+        "package svc\n",
+        "\n",
+        "type fakeServer struct{}\n",
+        "\n",
+        "func (fakeServer) SayHello(ctx Context, in *HelloRequest) (*HelloReply, error) { return nil, nil }\n",
+        "func (fakeServer) SayBye(ctx Context, in *HelloRequest) (*HelloReply, error)   { return nil, nil }\n",
+        "func (fakeServer) Reset()                                                      {}\n",
+    );
+
+    /// `svc/mock_greeter.go`: mockgen's default output name, a generated
+    /// file (KEEP-RUST: by its file name in any directory; upstream's
+    /// `/^mock_[^/]+\.go$/` matches the root's alone).
+    const GREETER_MOCK_GO: &str = concat!(
+        "package svc\n",
+        "\n",
+        "type MockGreeterServer struct{}\n",
+        "\n",
+        "func (MockGreeterServer) SayHello(ctx Context, in *HelloRequest) (*HelloReply, error) { return nil, nil }\n",
+        "func (MockGreeterServer) SayBye(ctx Context, in *HelloRequest) (*HelloReply, error)   { return nil, nil }\n",
+    );
+
+    /// Each RPC of a generated stub links to the same-named method of every
+    /// hand-written struct declaring all the RPCs, a method of another file
+    /// included; a struct of a generated file is no server, and gRPC's
+    /// embedding markers are no RPCs.
+    #[test]
+    fn w715c_grpc_stub_links_to_hand_written_servers() {
+        let project = Project::new()
+            .file("go.mod", "module rpcapp\n\ngo 1.21\n")
+            .file("svc/greeter_grpc.pb.go", GREETER_GRPC_GO)
+            .file("svc/server.go", GREETER_SERVER_GO)
+            .file("svc/bye.go", GREETER_BYE_GO)
+            .file("svc/fake.go", GREETER_FAKE_GO)
+            .file("svc/mock_greeter.go", GREETER_MOCK_GO)
+            .index();
+        let graph = graph_of(&project);
+        let hello = line_of(GREETER_GRPC_GO, "UnimplementedGreeterServer) SayHello");
+        let bye = line_of(GREETER_GRPC_GO, "UnimplementedGreeterServer) SayBye");
+        let fake_hello = line_of(GREETER_FAKE_GO, "SayHello");
+        let fake_bye = line_of(GREETER_FAKE_GO, "SayBye");
+        let server_hello = line_of(GREETER_SERVER_GO, "SayHello");
+        let server_bye = line_of(GREETER_BYE_GO, "SayBye");
+        assert_eq!(
+            links(graph, "go-grpc-stub-impl"),
+            [
+                format!(
+                    "UnimplementedGreeterServer::SayBye -> fakeServer::SayBye via SayBye @svc/fake.go:{fake_bye} line {bye}"
+                ),
+                format!(
+                    "UnimplementedGreeterServer::SayBye -> server::SayBye via SayBye @svc/bye.go:{server_bye} line {bye}"
+                ),
+                format!(
+                    "UnimplementedGreeterServer::SayHello -> fakeServer::SayHello via SayHello @svc/fake.go:{fake_hello} line {hello}"
+                ),
+                format!(
+                    "UnimplementedGreeterServer::SayHello -> server::SayHello via SayHello @svc/server.go:{server_hello} line {hello}"
+                ),
+            ],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// No edge without a generated stub with an RPC and a struct declaring
+    /// every one: a hand-written `Unimplemented*Server`, a server missing an
+    /// RPC and a stub of markers alone link nothing.
+    #[test]
+    fn w715c_grpc_needs_a_generated_stub_and_every_rpc() {
+        let project = Project::new()
+            .file("go.mod", "module rpcapp\n\ngo 1.21\n")
+            .file(
+                "svc/ping_grpc.pb.go",
+                concat!(
+                    "package svc\n",
+                    "\n",
+                    "type UnimplementedPingServer struct{}\n",
+                    "\n",
+                    "func (UnimplementedPingServer) Ping() {}\n",
+                    "func (UnimplementedPingServer) Pong() {}\n",
+                    "\n",
+                    "type UnimplementedNoopServer struct{}\n",
+                    "\n",
+                    "func (UnimplementedNoopServer) mustEmbedUnimplementedNoopServer() {}\n",
+                    "func (UnimplementedNoopServer) testEmbeddedByValue()              {}\n",
+                ),
+            )
+            .file(
+                "svc/ping.go",
+                concat!(
+                    "package svc\n",
+                    "\n",
+                    "type pinger struct{}\n",
+                    "\n",
+                    "func (pinger) Ping() {}\n",
+                    "\n",
+                    "type fullPinger struct{}\n",
+                    "\n",
+                    "func (fullPinger) Ping() {}\n",
+                    "func (fullPinger) Pong() {}\n",
+                    "\n",
+                    "type noop struct{}\n",
+                    "\n",
+                    "func (noop) mustEmbedUnimplementedNoopServer() {}\n",
+                    "func (noop) testEmbeddedByValue()              {}\n",
+                ),
+            )
+            .file(
+                "svc/echo.go",
+                concat!(
+                    "package svc\n",
+                    "\n",
+                    "type UnimplementedEchoServer struct{}\n",
+                    "\n",
+                    "func (UnimplementedEchoServer) Echo() {}\n",
+                    "\n",
+                    "type echoer struct{}\n",
+                    "\n",
+                    "func (echoer) Echo() {}\n",
+                ),
+            )
+            .index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            links(graph, "go-grpc-stub-impl"),
+            [
+                "UnimplementedPingServer::Ping -> fullPinger::Ping via Ping @svc/ping.go:9 line 5",
+                "UnimplementedPingServer::Pong -> fullPinger::Pong via Pong @svc/ping.go:10 line 6",
+            ],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// A stub and a server link at most forty RPCs; each server has its own
+    /// forty.
+    #[test]
+    fn w715c_grpc_links_at_most_forty_rpcs_a_server() {
+        let mut stub = String::from("package svc\n\ntype UnimplementedBigServer struct{}\n\n");
+        let mut big = String::from("package svc\n\ntype big struct{}\ntype big2 struct{}\n\n");
+        for at in 0..41 {
+            writeln!(stub, "func (UnimplementedBigServer) M{at}() {{}}").unwrap();
+            writeln!(big, "func (big) M{at}()  {{}}\nfunc (big2) M{at}() {{}}").unwrap();
+        }
+        let project = Project::new()
+            .file("go.mod", "module rpcapp\n\ngo 1.21\n")
+            .file("svc/big_grpc.pb.go", &stub)
+            .file("svc/big.go", &big)
+            .index();
+        let graph = graph_of(&project);
+        for server in ["big", "big2"] {
+            let count = synthesized_by(graph, "go-grpc-stub-impl")
+                .filter(|edge| {
+                    graph.node(&edge.target).is_some_and(|node| {
+                        node.qualified_name
+                            .strip_suffix(&format!("::{}", node.name))
+                            == Some(server)
+                    })
+                })
+                .count();
+            assert_eq!(count, 40, "{server}:\n{}", graph.report());
+        }
     }
 }

@@ -16413,3 +16413,86 @@ pub fn go_interface_embeds_another_std_type() -> Case {
         .edge_before("struct file", "implements", "interface SyncWriter")
         .no_edge_after("struct file", "implements", "interface SyncWriter")
 }
+
+const GO_GREETER_STUB: &str = "package svc\n\ntype UnimplementedGreeterServer struct{}\n\nfunc (UnimplementedGreeterServer) SayHello() error { return nil }\nfunc (UnimplementedGreeterServer) SayBye() error   { return nil }\nfunc (UnimplementedGreeterServer) mustEmbedUnimplementedGreeterServer() {}\n";
+
+/// W7-15c: the hand-written server gains the RPC it lacked, in a file of its
+/// own; the generated stub's methods now link to its (`go-grpc-stub-impl`).
+pub fn go_grpc_server_gains_its_missing_rpc() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Go])
+        .file("go.mod", "module example.com/app\n\ngo 1.22\n")
+        .file("svc/greeter_grpc.pb.go", GO_GREETER_STUB)
+        .file(
+            "svc/server.go",
+            "package svc\n\ntype server struct{}\n\nfunc (s *server) SayHello() error { return nil }\n",
+        )
+        .write(
+            "svc/bye.go",
+            "package svc\n\nfunc (s *server) SayBye() error { return nil }\n",
+        )
+        .edge_metadata_after(
+            (
+                "method UnimplementedGreeterServer::SayHello",
+                "calls",
+                "method server::SayHello",
+            ),
+            "synthesizedBy",
+            "go-grpc-stub-impl",
+        )
+        .edge_metadata_after(
+            (
+                "method UnimplementedGreeterServer::SayBye",
+                "calls",
+                "method server::SayBye",
+            ),
+            "synthesizedBy",
+            "go-grpc-stub-impl",
+        )
+}
+
+const GO_GIN_CONTEXT: &str = "package gin\n\ntype HandlerFunc func(*Context)\n\ntype Context struct {\n\thandlers []HandlerFunc\n\tindex    int\n}\n\nfunc (c *Context) Next() {\n\tfor c.index < len(c.handlers) {\n\t\tc.handlers[c.index](c)\n\t\tc.index++\n\t}\n}\n\ntype Engine struct{}\n\nfunc (e *Engine) Use(h ...HandlerFunc)          {}\nfunc (e *Engine) GET(p string, h ...HandlerFunc) {}\n";
+
+/// W7-15c: a route registration moves from one function body to another
+/// file's; the chain dispatcher's edge to the handler names the new site.
+pub fn go_gin_registration_moves_to_another_file() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Go])
+        .file("go.mod", "module example.com/app\n\ngo 1.22\n")
+        .file("gin.go", GO_GIN_CONTEXT)
+        .file(
+            "app.go",
+            "package gin\n\nfunc getUser(c *Context) {}\n\nfunc setup(e *Engine) {\n\te.GET(\"/users\", getUser)\n}\n",
+        )
+        .file("routes.go", "package gin\n\nfunc routes(e *Engine) {\n}\n")
+        .write(
+            "app.go",
+            "package gin\n\nfunc getUser(c *Context) {}\n\nfunc setup(e *Engine) {\n}\n",
+        )
+        .write(
+            "routes.go",
+            "package gin\n\nfunc routes(e *Engine) {\n\te.GET(\"/users\", getUser)\n}\n",
+        )
+        .edge_before("method Context::Next", "calls", "function getUser")
+        .edge_metadata_after(
+            ("method Context::Next", "calls", "function getUser"),
+            "registeredAt",
+            "routes.go:4",
+        )
+}
+
+/// W7-15c: the dispatcher stops calling into its handler slice; it links
+/// to no registered handler.
+pub fn go_gin_dispatch_call_removed() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Go])
+        .file("go.mod", "module example.com/app\n\ngo 1.22\n")
+        .file("gin.go", GO_GIN_CONTEXT)
+        .file(
+            "app.go",
+            "package gin\n\nfunc Logger(c *Context) {}\n\nfunc setup(e *Engine) {\n\te.Use(Logger)\n}\n",
+        )
+        .write(
+            "gin.go",
+            "package gin\n\ntype HandlerFunc func(*Context)\n\ntype Context struct {\n\thandlers []HandlerFunc\n\tindex    int\n}\n\nfunc (c *Context) Next() {\n\tfor c.index < len(c.handlers) {\n\t\t_ = c.handlers[c.index]\n\t\tc.index++\n\t}\n}\n\ntype Engine struct{}\n\nfunc (e *Engine) Use(h ...HandlerFunc)          {}\nfunc (e *Engine) GET(p string, h ...HandlerFunc) {}\n",
+        )
+        .edge_before("method Context::Next", "calls", "function Logger")
+        .no_edge_after("method Context::Next", "calls", "function Logger")
+}

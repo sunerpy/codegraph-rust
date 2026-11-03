@@ -2,6 +2,18 @@
   {
     "col": 1,
     "kind": "calls",
+    "line": 10,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "instance-method"
+    },
+    "provenance": null,
+    "source": "function:cc7dbb6ca5c71b7c859e0bb6405280d9",
+    "target": "method:40b38a9e4a5866e2832ab6804169ac35"
+  },
+  {
+    "col": 1,
+    "kind": "calls",
     "line": 28,
     "metadata": {
       "confidence": 0.9,
@@ -10,6 +22,30 @@
     "provenance": null,
     "source": "function:31958cc8a7c1c6134f84b5da2195fa02",
     "target": "method:7c53230815733da97f5fffbad03321ed"
+  },
+  {
+    "col": 1,
+    "kind": "calls",
+    "line": 8,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "instance-method"
+    },
+    "provenance": null,
+    "source": "function:cc7dbb6ca5c71b7c859e0bb6405280d9",
+    "target": "method:5c7f5fa1be3ed8bd0afaea1987ab236b"
+  },
+  {
+    "col": 1,
+    "kind": "calls",
+    "line": 9,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "instance-method"
+    },
+    "provenance": null,
+    "source": "function:cc7dbb6ca5c71b7c859e0bb6405280d9",
+    "target": "method:40b38a9e4a5866e2832ab6804169ac35"
   },
   {
     "col": 1,
@@ -22,6 +58,18 @@
     "provenance": null,
     "source": "struct:606f2ccca37614d5812343568306d220",
     "target": "struct:a10a7dcc11300874eeecc89c491e4c1d"
+  },
+  {
+    "col": 1,
+    "kind": "extends",
+    "line": 4,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "struct:148eb440f9e5fe012adef2af99df4d3a",
+    "target": "struct:9f671cfe2e6e6b014ddbfcc761442e33"
   },
   {
     "col": 1,
@@ -110,6 +158,42 @@
     "target": "struct:606f2ccca37614d5812343568306d220"
   },
   {
+    "col": 14,
+    "kind": "references",
+    "line": 7,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "function:cc7dbb6ca5c71b7c859e0bb6405280d9",
+    "target": "struct:8aefb8f45fcaf50d0ec2790e5cf8a531"
+  },
+  {
+    "col": 15,
+    "kind": "references",
+    "line": 3,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "function:468467677f4fc016663179441a52ff32",
+    "target": "struct:f3bd083b128204a4a98cb72d3ad0e848"
+  },
+  {
+    "col": 16,
+    "kind": "references",
+    "line": 5,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "function:4476dfa12db7b214d4f0de9d7d95ba48",
+    "target": "struct:f3bd083b128204a4a98cb72d3ad0e848"
+  },
+  {
     "col": 16,
     "kind": "references",
     "line": 9,
@@ -123,6 +207,19 @@
     "target": "function:c87c29fe6a038cbf57b0af6a8597d7e0"
   },
   {
+    "col": 17,
+    "kind": "references",
+    "line": 9,
+    "metadata": {
+      "confidence": 0.95,
+      "fnRef": true,
+      "resolvedBy": "function-ref"
+    },
+    "provenance": null,
+    "source": "function:cc7dbb6ca5c71b7c859e0bb6405280d9",
+    "target": "function:4476dfa12db7b214d4f0de9d7d95ba48"
+  },
+  {
     "col": 19,
     "kind": "references",
     "line": 24,
@@ -134,6 +231,30 @@
     "provenance": null,
     "source": "file:js/src/events.js",
     "target": "function:4c075e5c6998bde068ac64c5129298c1"
+  },
+  {
+    "col": 21,
+    "kind": "references",
+    "line": 5,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "type_alias:e73237bbfed7e10ddc7970e008f40349",
+    "target": "type_alias:d37ff45960d1ced0ea7715b31b2064d3"
+  },
+  {
+    "col": 23,
+    "kind": "references",
+    "line": 3,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "type_alias:d37ff45960d1ced0ea7715b31b2064d3",
+    "target": "struct:f3bd083b128204a4a98cb72d3ad0e848"
   },
   {
     "col": 25,
@@ -173,6 +294,18 @@
     "target": "class:c684061b11657d620087d825c55d4e41"
   },
   {
+    "col": 35,
+    "kind": "references",
+    "line": 24,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "method:5c7f5fa1be3ed8bd0afaea1987ab236b",
+    "target": "type_alias:d37ff45960d1ced0ea7715b31b2064d3"
+  },
+  {
     "col": 36,
     "kind": "calls",
     "line": 5,
@@ -185,6 +318,18 @@
     "target": "function:f72ae9f0f4692acfbc9fbbec49b8fe90"
   },
   {
+    "col": 46,
+    "kind": "references",
+    "line": 28,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "method:40b38a9e4a5866e2832ab6804169ac35",
+    "target": "type_alias:d37ff45960d1ced0ea7715b31b2064d3"
+  },
+  {
     "col": 7,
     "kind": "references",
     "line": 11,
@@ -195,6 +340,19 @@
     "provenance": null,
     "source": "function:33d9d8364fb2a1c7aabe3039389f7a9c",
     "target": "function:706e19e00afd3aaea61071890ff2d2ba"
+  },
+  {
+    "col": 7,
+    "kind": "references",
+    "line": 8,
+    "metadata": {
+      "confidence": 0.95,
+      "fnRef": true,
+      "resolvedBy": "function-ref"
+    },
+    "provenance": null,
+    "source": "function:cc7dbb6ca5c71b7c859e0bb6405280d9",
+    "target": "function:468467677f4fc016663179441a52ff32"
   },
   {
     "col": 8,
@@ -235,6 +393,32 @@
   {
     "col": null,
     "kind": "calls",
+    "line": 13,
+    "metadata": {
+      "registeredAt": "go/gin/app.go:8",
+      "synthesizedBy": "gin-middleware-chain",
+      "via": "Logger"
+    },
+    "provenance": "heuristic",
+    "source": "method:5d4971ea91e2095eee5c31d0ff7d5543",
+    "target": "function:468467677f4fc016663179441a52ff32"
+  },
+  {
+    "col": null,
+    "kind": "calls",
+    "line": 13,
+    "metadata": {
+      "registeredAt": "go/gin/app.go:9",
+      "synthesizedBy": "gin-middleware-chain",
+      "via": "getUser"
+    },
+    "provenance": "heuristic",
+    "source": "method:5d4971ea91e2095eee5c31d0ff7d5543",
+    "target": "function:4476dfa12db7b214d4f0de9d7d95ba48"
+  },
+  {
+    "col": null,
+    "kind": "calls",
     "line": 3,
     "metadata": {
       "registeredAt": "kotlin/jvm/src/Platform.kt:3",
@@ -270,6 +454,19 @@
     "provenance": "heuristic",
     "source": "method:23b52db61e3c123c60850cc118b75515",
     "target": "method:fc57b8ff353cc43701ceb2c71ac647fd"
+  },
+  {
+    "col": null,
+    "kind": "calls",
+    "line": 7,
+    "metadata": {
+      "registeredAt": "go/rpc/server.go:7",
+      "synthesizedBy": "go-grpc-stub-impl",
+      "via": "SayHello"
+    },
+    "provenance": "heuristic",
+    "source": "method:fcda1874ab363728d7d5db4798f7f1f0",
+    "target": "method:756e65a74d626f5c813a2edd22c820ca"
   },
   {
     "col": null,
@@ -461,6 +658,150 @@
     "provenance": null,
     "source": "file:dispatch/src/Events.java",
     "target": "namespace:559ecd17038af11c9b6ef54ae38f2d50"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:go/gin/app.go",
+    "target": "function:4476dfa12db7b214d4f0de9d7d95ba48"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:go/gin/app.go",
+    "target": "function:468467677f4fc016663179441a52ff32"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:go/gin/app.go",
+    "target": "function:cc7dbb6ca5c71b7c859e0bb6405280d9"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:go/gin/gin.go",
+    "target": "method:40b38a9e4a5866e2832ab6804169ac35"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:go/gin/gin.go",
+    "target": "method:5c7f5fa1be3ed8bd0afaea1987ab236b"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:go/gin/gin.go",
+    "target": "method:5d4971ea91e2095eee5c31d0ff7d5543"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:go/gin/gin.go",
+    "target": "struct:8aefb8f45fcaf50d0ec2790e5cf8a531"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:go/gin/gin.go",
+    "target": "struct:f3bd083b128204a4a98cb72d3ad0e848"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:go/gin/gin.go",
+    "target": "type_alias:d37ff45960d1ced0ea7715b31b2064d3"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:go/gin/gin.go",
+    "target": "type_alias:e73237bbfed7e10ddc7970e008f40349"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:go/rpc/greeter_grpc.pb.go",
+    "target": "method:20c3260f99bc76a2653cd102cf1b5156"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:go/rpc/greeter_grpc.pb.go",
+    "target": "method:28f2e0c552c98869548fae206df35ecd"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:go/rpc/greeter_grpc.pb.go",
+    "target": "method:fcda1874ab363728d7d5db4798f7f1f0"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:go/rpc/greeter_grpc.pb.go",
+    "target": "struct:9f671cfe2e6e6b014ddbfcc761442e33"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:go/rpc/server.go",
+    "target": "method:756e65a74d626f5c813a2edd22c820ca"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:go/rpc/server.go",
+    "target": "struct:148eb440f9e5fe012adef2af99df4d3a"
   },
   {
     "col": null,
@@ -837,6 +1178,15 @@
     "line": null,
     "metadata": null,
     "provenance": null,
+    "source": "struct:148eb440f9e5fe012adef2af99df4d3a",
+    "target": "method:756e65a74d626f5c813a2edd22c820ca"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
     "source": "struct:606f2ccca37614d5812343568306d220",
     "target": "method:bfb08c5b3c3ad31c97eb0770241257a8"
   },
@@ -846,8 +1196,62 @@
     "line": null,
     "metadata": null,
     "provenance": null,
+    "source": "struct:8aefb8f45fcaf50d0ec2790e5cf8a531",
+    "target": "method:40b38a9e4a5866e2832ab6804169ac35"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "struct:8aefb8f45fcaf50d0ec2790e5cf8a531",
+    "target": "method:5c7f5fa1be3ed8bd0afaea1987ab236b"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "struct:9f671cfe2e6e6b014ddbfcc761442e33",
+    "target": "method:20c3260f99bc76a2653cd102cf1b5156"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "struct:9f671cfe2e6e6b014ddbfcc761442e33",
+    "target": "method:28f2e0c552c98869548fae206df35ecd"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "struct:9f671cfe2e6e6b014ddbfcc761442e33",
+    "target": "method:fcda1874ab363728d7d5db4798f7f1f0"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
     "source": "struct:a10a7dcc11300874eeecc89c491e4c1d",
     "target": "method:ee38e1a68c4a246da445c2ddffeeff4f"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "struct:f3bd083b128204a4a98cb72d3ad0e848",
+    "target": "method:5d4971ea91e2095eee5c31d0ff7d5543"
   },
   {
     "col": null,

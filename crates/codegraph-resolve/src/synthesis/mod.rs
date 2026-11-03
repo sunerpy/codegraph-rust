@@ -24,6 +24,7 @@
 mod callback;
 mod dispatch;
 mod go;
+mod go_dispatch;
 mod iface;
 mod jsx;
 mod registry;
@@ -43,7 +44,7 @@ use codegraph_store::Store;
 pub const VERSION_KEY: &str = "synthesis_version";
 
 /// The marker's value; a change to what the passes produce moves it.
-pub const VERSION: &str = "5";
+pub const VERSION: &str = "6";
 
 /// The edges one channel, class or declaration links at most (upstream
 /// `MAX_CALLBACKS_PER_CHANNEL`).

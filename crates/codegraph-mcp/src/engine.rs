@@ -9474,10 +9474,11 @@ mod tests {
         }
     }
 
-    /// Tier 1 item 3, shape detail: upstream anchors mockgen's DEFAULT output as
-    /// `/^mock_[^/]+\.go$/` — a BASENAME rule. A naive `starts_with` on the full
-    /// path would miss every nested occurrence, which is where mocks actually
-    /// live, so the final path segment is what must be tested.
+    /// Tier 1 item 3, shape detail: mockgen's DEFAULT output, `mock_<src>.go`,
+    /// is matched on the final path segment, so a nested occurrence, which is
+    /// where mocks actually live, matches too. Upstream's
+    /// `/^mock_[^/]+\.go$/` tests the whole path and matches a root
+    /// `mock_x.go` alone (KEEP-RUST, `KNOWN_DIFFS.md`).
     #[test]
     fn ext_is_generated_file_mock_prefix_is_basename_anchored() {
         assert!(
