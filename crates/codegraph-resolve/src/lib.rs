@@ -44,6 +44,7 @@ pub mod frameworks; // concrete react/vue/nestjs FrameworkResolvers
 mod go_calls;
 pub mod go_packages;
 mod go_scope;
+pub mod go_std_methods;
 pub mod import_resolver;
 pub mod java_scope;
 mod js_store;

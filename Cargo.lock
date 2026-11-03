@@ -483,12 +483,15 @@ dependencies = [
  "clap",
  "codegraph-core",
  "codegraph-extract",
+ "codegraph-resolve",
  "criterion",
  "libc",
+ "regex",
  "rusqlite",
  "serde",
  "serde_json",
  "sha2 0.11.1",
+ "tree-sitter",
 ]
 
 [[package]]
