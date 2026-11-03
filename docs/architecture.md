@@ -252,7 +252,9 @@ graph (every edge without `metadata.synthesizedBy`, the nodes,
 `resolved_refs`, and for Go the `extends` rows resolution left in
 `unresolved_refs`) and the indexed files whose size and modification time, or
 content hash, are still the ones their file rows record; a file that drifted
-since it was indexed reads as absent until its own sync. When the index has
+since it was indexed reads as absent until its own sync. It reads every indexed
+file once before its first step, the file rows in one query and the files in
+parallel. When the index has
 Go files it first runs upstream's two prerequisite steps, whose edges the
 passes read as base edges and the replacement writes beside the merged ones:
 a Go type's `contains` edge to each method of its package that extraction

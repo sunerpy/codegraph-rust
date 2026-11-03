@@ -12,9 +12,10 @@ use std::time::UNIX_EPOCH;
 use anyhow::Result;
 use codegraph_core::node_id::hash_content;
 use codegraph_core::source_file::{SourceText, read_source_file};
-use codegraph_core::types::{Edge, EdgeKind, Language, Node, NodeKind, UnresolvedRef};
+use codegraph_core::types::{Edge, EdgeKind, FileRecord, Language, Node, NodeKind, UnresolvedRef};
 use codegraph_store::Store;
 use codegraph_store::queries::ReferenceSite;
+use rayon::prelude::*;
 
 use super::{callback, dispatch, go, iface, is_synthesized, jsx, registry};
 
@@ -107,6 +108,7 @@ pub fn run_stage(store: &mut Store, project_root: &Path, max_file_size: u64) -> 
 /// step's, and each pass's merged in registry order, sorted.
 pub fn synthesize(store: &Store, project_root: &Path, max_file_size: u64) -> Result<Vec<Edge>> {
     let mut view = View::new(store, project_root, max_file_size);
+    view.read_texts()?;
     let languages = view.file_languages()?;
     let mut edges = Vec::new();
     for (_, gate, step) in PREREQUISITES {
@@ -427,22 +429,55 @@ impl<'a> View<'a> {
 
     fn read_fresh(&self, file: &str) -> Option<Arc<str>> {
         let stored = self.store.file_by_path(file).ok().flatten()?;
-        let (metadata, source) =
-            read_source_file(&self.project_root.join(file), file, self.max_file_size).ok()?;
-        let SourceText::Text(text) = source else {
-            return None;
-        };
-        let stat_matches = stored.size == metadata.len() as i64
-            && metadata
-                .modified()
-                .ok()
-                .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-                .is_some_and(|since| since.as_millis() as i64 == stored.modified_at);
-        if !stat_matches && stored.content_hash != hash_content(&text) {
-            return None;
-        }
-        Some(Arc::from(text))
+        fresh_text(&self.project_root, &stored, self.max_file_size)
     }
+
+    /// Every indexed file's [`Self::text`], read at once before the steps
+    /// and the passes (W7-15p): the file records in one query, the files in
+    /// parallel. The event-emitter pass reads every indexed file in each
+    /// stage, so this reads no file the passes would not; a path the files
+    /// table lacks is still read when asked for.
+    fn read_texts(&self) -> Result<()> {
+        let root = &self.project_root;
+        let max_file_size = self.max_file_size;
+        let texts: Vec<(String, Option<Arc<str>>)> = self
+            .store
+            .all_files()?
+            .into_par_iter()
+            .map(|stored| {
+                let text = fresh_text(root, &stored, max_file_size);
+                (stored.path, text)
+            })
+            .collect();
+        self.texts.borrow_mut().extend(texts);
+        Ok(())
+    }
+}
+
+/// The text of `stored`'s file while it is what the index holds (see
+/// [`View::text`]): read only when its size is in the bound, and kept when its
+/// size and modification time are the recorded ones or its content hashes to
+/// the recorded hash.
+fn fresh_text(project_root: &Path, stored: &FileRecord, max_file_size: u64) -> Option<Arc<str>> {
+    let (metadata, source) = read_source_file(
+        &project_root.join(&stored.path),
+        &stored.path,
+        max_file_size,
+    )
+    .ok()?;
+    let SourceText::Text(text) = source else {
+        return None;
+    };
+    let stat_matches = stored.size == metadata.len() as i64
+        && metadata
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+            .is_some_and(|since| since.as_millis() as i64 == stored.modified_at);
+    if !stat_matches && stored.content_hash != hash_content(&text) {
+        return None;
+    }
+    Some(Arc::from(text))
 }
 
 /// The prerequisite steps' edges, indexed by each end.
@@ -863,6 +898,90 @@ mod tests {
         let mut found: Vec<&str> = found.keys().map(String::as_str).collect();
         found.sort_unstable();
         assert_eq!(found, ["f", "m1", "m2", "t", "u"]);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The texts read at once before the steps and the passes are the ones
+    /// `text` reads one at a time (W7-15p): a file whose stat is the recorded
+    /// one, one whose stat differs but whose content hashes to the recorded
+    /// hash, one whose content changed, one over the size bound, an MPEG
+    /// transport stream named `.ts`, and files the table lacks.
+    #[test]
+    fn the_texts_read_at_once_are_the_ones_read_one_at_a_time() {
+        let (store, dir) = temp_store("texts");
+        let same = "export const same = 1;\n";
+        let touched = "export const touched = 2;\n";
+        let big = "x".repeat(5000);
+        let mut clip = vec![0_u8; 188 * 16];
+        for packet in clip.chunks_mut(188) {
+            packet[0] = 0x47;
+        }
+        for (name, bytes) in [
+            ("same.ts", same.as_bytes()),
+            ("touched.ts", touched.as_bytes()),
+            ("edited.ts", b"export const edited = 3;\n".as_slice()),
+            ("big.ts", big.as_bytes()),
+            ("clip.ts", clip.as_slice()),
+            ("unlisted.ts", b"export const unlisted = 4;\n".as_slice()),
+        ] {
+            std::fs::write(dir.join(name), bytes).unwrap();
+        }
+        let record = |path: &str, text: &str, stat_matches: bool| {
+            let metadata = std::fs::metadata(dir.join(path)).unwrap();
+            let modified = metadata
+                .modified()
+                .unwrap()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as i64;
+            FileRecord {
+                path: path.to_string(),
+                content_hash: hash_content(text),
+                language: Language::TypeScript,
+                size: metadata.len() as i64,
+                modified_at: if stat_matches {
+                    modified
+                } else {
+                    modified - 1000
+                },
+                indexed_at: 0,
+                node_count: 0,
+                errors: Vec::new(),
+                generated: false,
+            }
+        };
+        for file in [
+            record("same.ts", "", true),
+            record("touched.ts", touched, false),
+            record("edited.ts", "export const before = 0;\n", false),
+            record("big.ts", &big, true),
+            record("clip.ts", "", true),
+        ] {
+            store.upsert_file(&file).unwrap();
+        }
+        let at_once = View::new(&store, &dir, 4096);
+        at_once.read_texts().unwrap();
+        assert_eq!(at_once.texts.borrow().len(), 5);
+        let one_at_a_time = View::new(&store, &dir, 4096);
+        let read = |view: &View<'_>, name: &str| view.text(name).map(|text| text.to_string());
+        let names = [
+            "same.ts",
+            "touched.ts",
+            "edited.ts",
+            "big.ts",
+            "clip.ts",
+            "unlisted.ts",
+            "absent.ts",
+        ];
+        for name in names {
+            assert_eq!(read(&at_once, name), read(&one_at_a_time, name), "{name}");
+        }
+        assert_eq!(read(&at_once, "same.ts").as_deref(), Some(same));
+        assert_eq!(read(&at_once, "touched.ts").as_deref(), Some(touched));
+        for name in ["edited.ts", "big.ts", "clip.ts", "unlisted.ts", "absent.ts"] {
+            assert_eq!(read(&at_once, name), None, "{name}");
+        }
         drop(store);
         std::fs::remove_dir_all(dir).unwrap();
     }
