@@ -1,7 +1,7 @@
 //! What resolution reads of a project's control files, which are no source
 //! files (W5-06): the JS/TS path aliases, workspace and package manifests,
-//! the C# project files and the Cargo manifests, and which frameworks the
-//! project uses.
+//! the C# project files, the Cargo manifests and the Go module files
+//! (W7-15d1), and which frameworks the project uses.
 //!
 //! Each reader reports what it read or probed in the same traversal that
 //! reads it ([`codegraph_resolve::path_aliases::alias_config_inputs`],
@@ -9,7 +9,8 @@
 //! [`codegraph_resolve::workspace_packages::workspace_inputs`],
 //! [`codegraph_resolve::package_manifests::manifest_inputs`],
 //! [`codegraph_resolve::csharp_types::csharp_project_inputs`],
-//! [`codegraph_resolve::rust_scope::rust_manifest_inputs`]); every full index,
+//! [`codegraph_resolve::rust_scope::rust_manifest_inputs`],
+//! [`codegraph_resolve::context::go_module_inputs`]); every full index,
 //! migration and sync writes one row per kind holding a digest of each input
 //! (a file's text, a directory's listing, `null` for a missing one), and one
 //! row naming the detected frameworks. A sync re-reads a kind's inputs (the
@@ -56,16 +57,18 @@ pub enum ControlKind {
     Js,
     Csharp,
     Rust,
+    Go,
 }
 
 impl ControlKind {
-    pub const ALL: [Self; 3] = [Self::Js, Self::Csharp, Self::Rust];
+    pub const ALL: [Self; 4] = [Self::Js, Self::Csharp, Self::Rust, Self::Go];
 
     fn key(self) -> &'static str {
         match self {
             Self::Js => "js",
             Self::Csharp => "csharp",
             Self::Rust => "rust",
+            Self::Go => "go",
         }
     }
 
@@ -92,6 +95,7 @@ impl ControlKind {
                 lower.ends_with(".csproj") || lower.ends_with(".props")
             }
             Self::Rust => name == "Cargo.toml",
+            Self::Go => name == "go.mod",
         }
     }
 
@@ -102,6 +106,7 @@ impl ControlKind {
             Self::Js => has_module_surface(path, language),
             Self::Csharp => language == Language::CSharp,
             Self::Rust => path.ends_with(".rs"),
+            Self::Go => path.ends_with(".go"),
         }
     }
 }
@@ -257,6 +262,13 @@ pub fn digests_of(kind: ControlKind, project_root: &Path, files: &[FileRecord]) 
         ControlKind::Rust => {
             let paths: Vec<String> = files.iter().map(|file| file.path.clone()).collect();
             for relative in codegraph_resolve::rust_scope::rust_manifest_inputs(&paths) {
+                let digest = file_digest(&project_root.join(&relative));
+                out.insert(relative, digest);
+            }
+        }
+        ControlKind::Go => {
+            let paths: Vec<String> = files.iter().map(|file| file.path.clone()).collect();
+            for relative in codegraph_resolve::context::go_module_inputs(&paths) {
                 let digest = file_digest(&project_root.join(&relative));
                 out.insert(relative, digest);
             }
@@ -522,6 +534,10 @@ mod tests {
         assert!(is_control_file("src/App.CSPROJ"));
         assert!(is_control_file("Directory.Build.props"));
         assert!(is_control_file("crates/a/Cargo.toml"));
+        assert!(is_control_file("go.mod"));
+        assert!(is_control_file("services/api/go.mod"));
+        assert!(!is_control_file("go.sum"));
+        assert!(!is_control_file("main.go"));
         assert!(is_control_file("src-tauri/tauri.conf.json"));
         assert!(is_control_file("packages/kit/pubspec.yaml"));
         assert!(is_control_file("pubspec_overrides.yaml"));

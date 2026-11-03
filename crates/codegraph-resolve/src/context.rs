@@ -1099,33 +1099,51 @@ fn load_go_module_in(project_root: &str, dir: &str) -> Option<GoModule> {
 /// Ordered by `dir` and deduplicated, so the result does not depend on the file
 /// iteration order.
 fn load_go_modules(project_root: &str, files: &[String]) -> Vec<GoModule> {
-    let mut dirs: BTreeSet<String> = BTreeSet::new();
-    for file in files {
-        if !file.ends_with(".go") {
-            continue;
-        }
-        let normalized = file.replace('\\', "/");
-        let mut dir = pathutil::dirname(&normalized);
-        loop {
-            dirs.insert(dir.clone());
-            if dir.is_empty() {
-                break;
-            }
-            dir = pathutil::dirname(&dir);
-        }
-    }
-    // A Go-less project keeps the previous behaviour: probe the root only.
-    if dirs.is_empty() {
-        return load_go_module(project_root).into_iter().collect();
-    }
-
-    let mut modules: Vec<GoModule> = dirs
+    let mut modules: Vec<GoModule> = go_module_inputs(files)
         .iter()
-        .filter_map(|dir| load_go_module_in(project_root, dir))
+        .filter_map(|relative| {
+            let dir = relative
+                .strip_suffix("go.mod")
+                .map_or("", |dir| dir.trim_end_matches('/'));
+            load_go_module_in(project_root, dir)
+        })
         .collect();
     modules.sort_by(|a, b| a.dir.cmp(&b.dir).then(a.module_path.cmp(&b.module_path)));
     modules.dedup_by(|a, b| a.dir == b.dir);
     modules
+}
+
+/// The project-relative `go.mod` paths [`load_go_modules`] reads for `files`:
+/// the root's (all a Go-less project reads), and one in every directory at or
+/// above an indexed `.go` file, a missing one included, sorted (W5-06 compares
+/// them). A file path that could leave the project root lexically (rooted,
+/// UNC, a Windows drive's, or `..` above the root) is skipped, by the rule
+/// `pathutil::lexical_path_within_root` applies, and the others are read
+/// normalized, so no probe leaves the root and the walk up ends.
+pub fn go_module_inputs(files: &[String]) -> Vec<String> {
+    let mut dirs: BTreeSet<String> = BTreeSet::from([String::new()]);
+    for file in files {
+        if !file.ends_with(".go") {
+            continue;
+        }
+        let Some(file) = pathutil::lexical_relative(file) else {
+            continue;
+        };
+        let mut dir = pathutil::dirname(&file);
+        while !dir.is_empty() {
+            dirs.insert(dir.clone());
+            dir = pathutil::dirname(&dir);
+        }
+    }
+    dirs.into_iter()
+        .map(|dir| {
+            if dir.is_empty() {
+                "go.mod".to_string()
+            } else {
+                format!("{dir}/go.mod")
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -1303,6 +1321,41 @@ mod tests {
         assert_eq!(modules[0].dir, "");
         assert_eq!(modules[0].module_path, "ex/m");
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// W7-15d1: what `load_go_modules` reads, and the Go control kind
+    /// compares: the root's `go.mod`, and one in every directory at or above
+    /// an indexed `.go` file, by directory, its path normalized; no other
+    /// file, and no path that could leave the project: rooted, UNC, a
+    /// Windows drive's, absolute or drive-relative, or `..` above the root.
+    #[test]
+    fn go_module_inputs_are_the_root_and_every_directory_above_a_go_file() {
+        assert_eq!(go_module_inputs(&[]), ["go.mod"]);
+        assert_eq!(
+            go_module_inputs(&[
+                "svc/api/handler.go".to_string(),
+                "svc\\cli\\main.go".to_string(),
+                "web/app.ts".to_string(),
+                "a/../b/z.go".to_string(),
+                "/abs/x.go".to_string(),
+                "\\rooted\\x.go".to_string(),
+                "\\\\server\\share\\x.go".to_string(),
+                "C:\\outside\\x.go".to_string(),
+                "C:/outside/x.go".to_string(),
+                "C:outside\\x.go".to_string(),
+                "./C:/outside/x.go".to_string(),
+                "a\\..\\C:\\outside\\x.go".to_string(),
+                "../out/y.go".to_string(),
+                "a/../../out/y.go".to_string(),
+            ]),
+            [
+                "go.mod",
+                "b/go.mod",
+                "svc/go.mod",
+                "svc/api/go.mod",
+                "svc/cli/go.mod"
+            ]
+        );
     }
 
     #[test]

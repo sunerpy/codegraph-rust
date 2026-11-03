@@ -58,8 +58,8 @@ pub enum Change {
     AddCompetitor,
     /// A project control file changes: one resolution reads (`package.json`,
     /// `tsconfig.json`, `jsconfig.json` or a config it extends, a workspace
-    /// member's manifest, a `.csproj` or `.props`, a `Cargo.toml`, a Tauri
-    /// config), the root `.gitignore`, `.git/info/exclude`, the index root's
+    /// member's manifest, a `.csproj` or `.props`, a `Cargo.toml`, a `go.mod`,
+    /// a Tauri config), the root `.gitignore`, `.git/info/exclude`, the index root's
     /// `config.toml` or `codegraph.json`, or a Shopify theme marker
     /// (`layout/theme.liquid`, `config/settings_schema.json`).
     ControlFile,
@@ -1532,6 +1532,10 @@ matrix! {
     go_package_closure_call_reaches_a_function_that_appears,
     go_package_literal_struct_file_deleted,
     go_const_group_member_read_by_a_function,
+    go_module_path_renamed_unlinks_a_cross_package_call,
+    go_nested_module_file_appears_and_links_its_importer,
+    go_nested_module_file_deleted_unlinks_its_importer,
+    go_root_module_file_deleted_unlinks_a_cross_package_call,
     tsx_react_router_lazy_barrel_page_appears,
     tsx_react_router_lazy_page_default_export_moves,
     tsx_react_router_lazy_page_body_edit_keeps_its_route,

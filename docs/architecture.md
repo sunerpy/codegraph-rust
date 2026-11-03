@@ -667,10 +667,11 @@ root's, and those in each directory above a JavaScript-family file), the
 workspace manifests and the folders a workspace glob lists, the `package.json`
 and Deno manifests above each JavaScript-family file and the `package.json`
 files framework detection reads, the C# project files
-above each C# file, and the `Cargo.toml` files above each Rust file; and the
-frameworks it detects. Each reader reports what it read or probed in the same
+above each C# file, the `Cargo.toml` files above each Rust file, and the
+`go.mod` files at the root and above each Go file; and the frameworks it
+detects. Each reader reports what it read or probed in the same
 traversal, and every index and sync keeps a `control_inputs:` row per kind
-(`js`, `csharp`, `rust`) holding each input's digest by path (the sha256 of
+(`js`, `csharp`, `rust`, `go`) holding each input's digest by path (the sha256 of
 its text, or of a listed folder's names; `null` for a missing one; one outside
 the project by the absolute path its reader used), and a `frameworks_detected`
 row (the detected frameworks, sorted, and, when a framework runs only in its

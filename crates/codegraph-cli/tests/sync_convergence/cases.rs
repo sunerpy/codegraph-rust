@@ -16567,3 +16567,58 @@ pub fn go_const_group_member_read_by_a_function() -> Case {
         .edge_before("function scale", "references", "constant BaseLimit")
         .edge_after("function scale", "references", "constant WideLimit")
 }
+
+const GO_SHOP_MAIN: &str =
+    "package main\n\nimport \"example.com/shop/util\"\n\nfunc main() { util.Go() }\n";
+const GO_UTIL_MAIN: &str =
+    "package main\n\nimport \"example.com/util\"\n\nfunc main() { util.Go() }\n";
+const GO_UTIL: &str = "package util\n\nfunc Go() {}\n";
+
+/// W7-15d1: `go.mod` is a control file. Its module path renamed, the
+/// import it named is outside the project, and the call through it links
+/// nothing, though no `.go` file changed.
+pub fn go_module_path_renamed_unlinks_a_cross_package_call() -> Case {
+    Case::new(Change::ControlFile, &[Language::Go])
+        .file("go.mod", "module example.com/shop\n\ngo 1.22\n")
+        .file("main.go", GO_SHOP_MAIN)
+        .file("util/util.go", GO_UTIL)
+        .edge_before("function main", "calls", "function Go @util/util.go")
+        .write("go.mod", "module example.com/store\n\ngo 1.22\n")
+        .no_edge_after("function main", "calls", "function Go @util/util.go")
+}
+
+/// W7-15d1: a nested module's `go.mod` appearing makes its directory the
+/// package an unchanged import names.
+pub fn go_nested_module_file_appears_and_links_its_importer() -> Case {
+    Case::new(Change::ControlFile, &[Language::Go])
+        .file("go.mod", "module example.com/shop\n\ngo 1.22\n")
+        .file("main.go", GO_UTIL_MAIN)
+        .file("util/util.go", GO_UTIL)
+        .write("util/go.mod", "module example.com/util\n\ngo 1.22\n")
+        .edge_after("function main", "calls", "function Go @util/util.go")
+}
+
+/// W7-15d1: the nested module's `go.mod` deleted, the import names no
+/// project package again.
+pub fn go_nested_module_file_deleted_unlinks_its_importer() -> Case {
+    Case::new(Change::ControlFile, &[Language::Go])
+        .file("go.mod", "module example.com/shop\n\ngo 1.22\n")
+        .file("util/go.mod", "module example.com/util\n\ngo 1.22\n")
+        .file("main.go", GO_UTIL_MAIN)
+        .file("util/util.go", GO_UTIL)
+        .edge_before("function main", "calls", "function Go @util/util.go")
+        .remove("util/go.mod")
+        .no_edge_after("function main", "calls", "function Go @util/util.go")
+}
+
+/// W7-15d1: the root `go.mod` deleted, the project has no module, so the
+/// import is outside it.
+pub fn go_root_module_file_deleted_unlinks_a_cross_package_call() -> Case {
+    Case::new(Change::ControlFile, &[Language::Go])
+        .file("go.mod", "module example.com/shop\n\ngo 1.22\n")
+        .file("main.go", GO_SHOP_MAIN)
+        .file("util/util.go", GO_UTIL)
+        .edge_before("function main", "calls", "function Go @util/util.go")
+        .remove("go.mod")
+        .no_edge_after("function main", "calls", "function Go @util/util.go")
+}

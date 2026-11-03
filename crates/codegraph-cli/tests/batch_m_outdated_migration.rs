@@ -1867,9 +1867,9 @@ fn outdated_migration_writes_the_class_head_rows_of_index_force() {
 }
 
 /// W5-06: a migration writes the control-input rows (what resolution read
-/// of the JS/TS configs and manifests, the C# project files and the Cargo
-/// manifests), the detected frameworks and both markers as `index --force`
-/// does.
+/// of the JS/TS configs and manifests, the C# project files, the Cargo
+/// manifests and, W7-15d1, the Go module files), the detected frameworks and
+/// both markers as `index --force` does.
 #[test]
 fn outdated_migration_writes_the_control_rows_of_index_force() {
     let dir = TestDir::new("outdated-control-inputs");
@@ -1901,6 +1901,8 @@ fn outdated_migration_writes_the_control_rows_of_index_force() {
             "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
         ),
         ("src/lib.rs", "pub fn one() -> u32 {\n    1\n}\n"),
+        ("svc/go.mod", "module example.com/svc\n\ngo 1.22\n"),
+        ("svc/main.go", "package main\n\nfunc main() {}\n"),
     ] {
         let full = project.join(path);
         fs::create_dir_all(full.parent().unwrap()).expect("create the source directory");
@@ -1947,6 +1949,7 @@ fn outdated_migration_writes_the_control_rows_of_index_force() {
             .collect::<Vec<_>>(),
         [
             "control_inputs:csharp",
+            "control_inputs:go",
             "control_inputs:js",
             "control_inputs:rust",
             "control_inputs_version",
@@ -1957,10 +1960,11 @@ fn outdated_migration_writes_the_control_rows_of_index_force() {
     );
     for (row, input) in [
         (0, "\"App/App.csproj\""),
-        (1, "\"tsconfig.json\""),
-        (1, "\"package.json\""),
-        (2, "\"Cargo.toml\""),
-        (4, "\"react\""),
+        (1, "\"svc/go.mod\""),
+        (2, "\"tsconfig.json\""),
+        (2, "\"package.json\""),
+        (3, "\"Cargo.toml\""),
+        (5, "\"react\""),
     ] {
         assert!(
             migrated[row].1.contains(input),
