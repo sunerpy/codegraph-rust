@@ -61,6 +61,36 @@ pub(super) fn methods_of(view: &View<'_>, parent: &str) -> Result<Vec<Node>> {
     Ok(methods)
 }
 
+/// [`methods_of`] of each of `parents`, by parent, every one of them
+/// present: the same methods in the same order, with one query a chunk for
+/// the edges and one for their targets. Edges that tie on target, line and
+/// column name the same method, so their order cannot change the list.
+pub(super) fn methods_of_each(
+    view: &View<'_>,
+    parents: &[String],
+) -> Result<HashMap<String, Vec<Node>>> {
+    let edges = view.edges_from_each(parents, EdgeKind::Contains)?;
+    let targets: Vec<String> = edges
+        .values()
+        .flatten()
+        .map(|edge| edge.target.clone())
+        .collect();
+    let nodes = view.nodes(&targets)?;
+    let mut methods = HashMap::new();
+    for parent in parents {
+        let found: Vec<Node> = edges
+            .get(parent)
+            .into_iter()
+            .flatten()
+            .filter_map(|edge| nodes.get(&edge.target))
+            .filter(|node| node.kind == NodeKind::Method)
+            .cloned()
+            .collect();
+        methods.insert(parent.clone(), found);
+    }
+    Ok(methods)
+}
+
 /// The classes among `ids`, in upstream's class order ([`node_order`]):
 /// those of upstream's walk over every class (`iterateNodesByKind`) that
 /// `ids` names, without reading the others.

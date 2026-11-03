@@ -250,6 +250,19 @@
     "kind": "calls",
     "line": 4,
     "metadata": {
+      "registeredAt": "go/store/store.go:14",
+      "synthesizedBy": "interface-impl",
+      "via": "Get"
+    },
+    "provenance": "heuristic",
+    "source": "method:596ab963c1e8091bdb7dada52f4dfeff",
+    "target": "method:ee38e1a68c4a246da445c2ddffeeff4f"
+  },
+  {
+    "col": null,
+    "kind": "calls",
+    "line": 4,
+    "metadata": {
       "registeredAt": "mybatis/src/main/resources/mapper/UserMapper.xml:4",
       "synthesizedBy": "mybatis-java-xml",
       "via": "UserMapper.findName"
@@ -269,6 +282,19 @@
     "provenance": "heuristic",
     "source": "function:33d9d8364fb2a1c7aabe3039389f7a9c",
     "target": "function:706e19e00afd3aaea61071890ff2d2ba"
+  },
+  {
+    "col": null,
+    "kind": "calls",
+    "line": 9,
+    "metadata": {
+      "registeredAt": "go/store/store.go:21",
+      "synthesizedBy": "interface-impl",
+      "via": "Set"
+    },
+    "provenance": "heuristic",
+    "source": "method:7c53230815733da97f5fffbad03321ed",
+    "target": "method:bfb08c5b3c3ad31c97eb0770241257a8"
   },
   {
     "col": null,
@@ -822,5 +848,44 @@
     "provenance": null,
     "source": "struct:a10a7dcc11300874eeecc89c491e4c1d",
     "target": "method:ee38e1a68c4a246da445c2ddffeeff4f"
+  },
+  {
+    "col": null,
+    "kind": "implements",
+    "line": 12,
+    "metadata": {
+      "registeredAt": "go/store/store.go:12",
+      "synthesizedBy": "go-implements",
+      "via": "Getter"
+    },
+    "provenance": "heuristic",
+    "source": "struct:a10a7dcc11300874eeecc89c491e4c1d",
+    "target": "interface:ff5c816f7e8b8bcf3e978f4fa19dc63a"
+  },
+  {
+    "col": null,
+    "kind": "implements",
+    "line": 16,
+    "metadata": {
+      "registeredAt": "go/store/store.go:16",
+      "synthesizedBy": "go-implements",
+      "via": "Getter"
+    },
+    "provenance": "heuristic",
+    "source": "struct:606f2ccca37614d5812343568306d220",
+    "target": "interface:ff5c816f7e8b8bcf3e978f4fa19dc63a"
+  },
+  {
+    "col": null,
+    "kind": "implements",
+    "line": 16,
+    "metadata": {
+      "registeredAt": "go/store/store.go:16",
+      "synthesizedBy": "go-implements",
+      "via": "Store"
+    },
+    "provenance": "heuristic",
+    "source": "struct:606f2ccca37614d5812343568306d220",
+    "target": "interface:8ce05b9afd075953348b7d6bf74a9556"
   }
 ]

@@ -16314,3 +16314,102 @@ pub fn tsx_tag_removed() -> Case {
         .edge_before("function App", "calls", "function Card")
         .no_edge_after("function App", "calls", "function Card")
 }
+
+const GO_SAVER: &str =
+    "package svc\n\ntype Store struct{}\n\ntype Saver interface {\n\tSave(key string) error\n}\n";
+const GO_SAVE: &str = "package svc\n\nfunc (s *Store) Save(key string) error { return nil }\n";
+
+/// W7-15b: a file of the package declares a method of a type in an
+/// unchanged file; the type owns it (`go-method-contains`) and satisfies
+/// the interface asking for it (`go-implements`).
+pub fn go_method_in_an_added_file_gains_its_owner() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Go])
+        .file("go.mod", "module example.com/app\n\ngo 1.22\n")
+        .file("svc/types.go", GO_SAVER)
+        .write("svc/methods.go", GO_SAVE)
+        .edge_metadata_after(
+            ("struct Store", "contains", "method Store::Save"),
+            "synthesizedBy",
+            "go-method-contains",
+        )
+        .edge_metadata_after(
+            ("struct Store", "implements", "interface Saver"),
+            "synthesizedBy",
+            "go-implements",
+        )
+}
+
+/// W7-15b: the interface's method is renamed; the struct declaring the old
+/// name no longer satisfies it.
+pub fn go_interface_method_renamed_off_its_implementer() -> Case {
+    Case::new(Change::RenameSymbol, &[Language::Go])
+        .file("go.mod", "module example.com/app\n\ngo 1.22\n")
+        .file("svc/types.go", GO_SAVER)
+        .file("svc/methods.go", GO_SAVE)
+        .write(
+            "svc/types.go",
+            "package svc\n\ntype Store struct{}\n\ntype Saver interface {\n\tKeep(key string) error\n}\n",
+        )
+        .edge_before("struct Store", "implements", "interface Saver")
+        .no_edge_after("struct Store", "implements", "interface Saver")
+}
+
+const GO_BASE: &str =
+    "package base\n\ntype Base struct{}\n\nfunc (Base) Close() error { return nil }\n";
+const GO_NAMED_CLOSER: &str =
+    "package api\n\ntype NamedCloser interface {\n\tClose() error\n\tName() string\n}\n";
+const GO_WRAPPER: &str = "package wrap\n\nimport \"example.com/app/base\"\n\ntype Wrapper struct{ base.Base }\n\nfunc (Wrapper) Name() string { return \"\" }\n";
+
+/// W7-15b: the struct stops embedding the type its `Close` came from; it no
+/// longer satisfies the interface.
+pub fn go_embedding_removed_drops_the_interface() -> Case {
+    Case::new(Change::EditHeritage, &[Language::Go])
+        .file("go.mod", "module example.com/app\n\ngo 1.22\n")
+        .file("api/api.go", GO_NAMED_CLOSER)
+        .file("base/base.go", GO_BASE)
+        .file("wrap/wrap.go", GO_WRAPPER)
+        .write(
+            "wrap/wrap.go",
+            "package wrap\n\ntype Wrapper struct{}\n\nfunc (Wrapper) Name() string { return \"\" }\n",
+        )
+        .edge_before("struct Wrapper", "implements", "interface NamedCloser")
+        .no_edge_after("struct Wrapper", "implements", "interface NamedCloser")
+}
+
+/// W7-15b (upstream's sync case): only the embedded type changes, in a file
+/// neither the struct's nor the interface's.
+pub fn go_embedded_type_renames_its_method() -> Case {
+    Case::new(Change::RenameSymbol, &[Language::Go])
+        .file("go.mod", "module example.com/app\n\ngo 1.22\n")
+        .file("api/api.go", GO_NAMED_CLOSER)
+        .file("base/base.go", GO_BASE)
+        .file("wrap/wrap.go", GO_WRAPPER)
+        .write(
+            "base/base.go",
+            "package base\n\ntype Base struct{}\n\nfunc (Base) Shutdown() error { return nil }\n",
+        )
+        .edge_before("struct Wrapper", "implements", "interface NamedCloser")
+        .no_edge_after("struct Wrapper", "implements", "interface NamedCloser")
+}
+
+/// W7-15b (upstream's sync case): the interface embeds another
+/// standard-library type, read back from resolution's failed `extends` row;
+/// an `io.Reader` has to `Read`, which the struct can't.
+pub fn go_interface_embeds_another_std_type() -> Case {
+    Case::new(Change::EditHeritage, &[Language::Go])
+        .file("go.mod", "module example.com/app\n\ngo 1.22\n")
+        .file(
+            "api/api.go",
+            "package api\n\nimport stdio \"io\"\n\ntype SyncWriter interface {\n\tstdio.Writer\n\tSync() error\n}\n",
+        )
+        .file(
+            "log/file.go",
+            "package log\n\ntype file struct{}\n\nfunc (f *file) Write(p []byte) (int, error) { return len(p), nil }\nfunc (f *file) Sync() error { return nil }\n",
+        )
+        .write(
+            "api/api.go",
+            "package api\n\nimport stdio \"io\"\n\ntype SyncWriter interface {\n\tstdio.Reader\n\tSync() error\n}\n",
+        )
+        .edge_before("struct file", "implements", "interface SyncWriter")
+        .no_edge_after("struct file", "implements", "interface SyncWriter")
+}

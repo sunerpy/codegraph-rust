@@ -196,8 +196,8 @@ the Rust graph holds different facts, the viewer shows what this index holds:
   event-emitter, React and Flutter re-render, JSX render, C++ override, interface
   override, Kotlin expect/actual, Delphi form, MyBatis mapper and object
   registry dispatch edges, so a flow shows a dashed `via …` hop for those and for no other
-  upstream synthesis pass, and a Go interface's implicit implementations are
-  not part of its type hierarchy.
+  upstream synthesis pass. A Go interface's implicit implementations are in
+  its type hierarchy, marked synthesized (`go-implements`).
 - An unresolved import is recorded by the binding it names, not by the module
   specifier, and the File view lists it that way.
 - The bundle is embedded in the binary, so upstream's `CODEGRAPH_VIEWER_PATH`

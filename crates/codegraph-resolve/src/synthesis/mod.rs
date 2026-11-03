@@ -9,15 +9,21 @@
 //! pass, merges their edges in registry order and replaces every synthesized
 //! edge with the result in one transaction. A synthesized edge has
 //! `provenance: "heuristic"` and `metadata.synthesizedBy` naming its pass,
-//! with `registeredAt` where the channel was wired up.
+//! with `registeredAt` where the channel was wired up; a Go type's
+//! `contains` edge to a method of another file (`go-method-contains`) has
+//! no provenance, as a parsed one has.
 //!
 //! The stage reads only the base graph (every edge without `synthesizedBy`,
-//! the nodes, `resolved_refs`) and the indexed files' text, so a sync that
-//! changes none of them keeps its edges. `codegraph-watch` recomputes them
-//! whole after any sync that changes the index, under [`VERSION_KEY`].
+//! the nodes, `resolved_refs`, and for Go the `extends` rows resolution
+//! left in `unresolved_refs`) and the indexed files' text, so a sync that
+//! changes none of them keeps its edges. Its Go prerequisite steps add
+//! edges the passes read as base edges first (W7-15b). `codegraph-watch`
+//! recomputes them whole after any sync that changes the index, under
+//! [`VERSION_KEY`].
 
 mod callback;
 mod dispatch;
+mod go;
 mod iface;
 mod jsx;
 mod registry;
@@ -37,7 +43,7 @@ use codegraph_store::Store;
 pub const VERSION_KEY: &str = "synthesis_version";
 
 /// The marker's value; a change to what the passes produce moves it.
-pub const VERSION: &str = "4";
+pub const VERSION: &str = "5";
 
 /// The edges one channel, class or declaration links at most (upstream
 /// `MAX_CALLBACKS_PER_CHANNEL`).

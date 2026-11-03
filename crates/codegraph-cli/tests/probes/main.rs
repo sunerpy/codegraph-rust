@@ -23241,7 +23241,7 @@ mod synthesis {
         assert_eq!((edge.line, edge.col), (Some(7), None), "{edge:?}");
         assert_eq!(
             project_metadata_with_prefix(&project.db(), "synthesis_version"),
-            [("synthesis_version".to_string(), "4".to_string())]
+            [("synthesis_version".to_string(), "5".to_string())]
         );
     }
 
@@ -24197,10 +24197,9 @@ mod synthesis {
     }
 
     /// Go has no inheritance: a struct's embedded interface dispatches to
-    /// the struct's own method of its name, an embedded struct is no
-    /// supertype to dispatch through, and a struct that satisfies an
-    /// interface only implicitly has no `implements` edge before the Go
-    /// prerequisites (W7-15).
+    /// the struct's own method of its name, and an embedded struct is no
+    /// supertype to dispatch through. `File`, which only declares `Read`,
+    /// reaches it through the edge `go-implements` makes (W7-15b).
     #[test]
     fn w714c_a_go_embedded_interface_reaches_the_structs_own_method() {
         let project = Project::new()
@@ -24221,7 +24220,7 @@ mod synthesis {
         );
         assert_eq!(
             interface_links(graph),
-            ["Reader::Read -> Engine::Read"],
+            ["Reader::Read -> Engine::Read", "Reader::Read -> File::Read"],
             "{}",
             graph.report()
         );
@@ -24946,5 +24945,2490 @@ mod synthesis {
                 && !link.contains("Widget")),
             "{links:?}"
         );
+    }
+}
+
+/// W7-15b: the Go prerequisite steps (`go-method-contains`, `go-implements`)
+/// and the Go half of the interface dispatch pass, with upstream's
+/// `__tests__/go-implements-*.test.ts` at `e8ddc4e2` ported case for case.
+mod go_synthesis {
+    use super::support::{EdgeRow, Graph, Indexed, NodeRow, Project, graph_of};
+
+    /// A node's Go package (its directory) and name, `pkg.Name` (upstream
+    /// `pkg`).
+    #[track_caller]
+    fn pkg(graph: &Graph, id: &str) -> String {
+        let node = graph.node(id).unwrap_or_else(|| panic!("no node {id}"));
+        let dir = node.file_path.rsplit_once('/').map_or(".", |(dir, _)| dir);
+        format!("{dir}.{}", node.name)
+    }
+
+    /// The edges of `kind` the synthesis step `by` made.
+    fn synthesized_by<'g>(
+        graph: &'g Graph,
+        kind: &'g str,
+        by: &'g str,
+    ) -> impl Iterator<Item = &'g EdgeRow> {
+        graph
+            .edges
+            .iter()
+            .filter(move |edge| edge.kind == kind && edge.metadata["synthesizedBy"] == by)
+    }
+
+    /// Every `go-implements` edge as `pkg.Type -> pkg.Interface`, sorted.
+    fn go_implements(graph: &Graph) -> Vec<String> {
+        let mut links: Vec<String> = synthesized_by(graph, "implements", "go-implements")
+            .map(|edge| {
+                format!(
+                    "{} -> {}",
+                    pkg(graph, &edge.source),
+                    pkg(graph, &edge.target)
+                )
+            })
+            .collect();
+        links.sort();
+        links
+    }
+
+    /// The one node `selector` matches.
+    #[track_caller]
+    fn one<'g>(graph: &'g Graph, selector: &str) -> &'g NodeRow {
+        let found = graph.nodes_matching(selector);
+        assert_eq!(found.len(), 1, "one {selector}:\n{}", graph.report());
+        found[0]
+    }
+
+    /// Where the interface dispatch pass bridges a call through `method` of
+    /// the interface `iface` to: the targets' qualified names, sorted
+    /// (upstream `dispatchTargets`).
+    #[track_caller]
+    fn dispatch_targets(graph: &Graph, iface: &str, method: &str) -> Vec<String> {
+        let iface = one(graph, iface);
+        let method = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.kind == "contains" && edge.source == iface.id)
+            .filter_map(|edge| graph.node(&edge.target))
+            .find(|node| node.name == method)
+            .unwrap_or_else(|| panic!("{} has no method {method}", iface.name));
+        let mut targets: Vec<String> = synthesized_by(graph, "calls", "interface-impl")
+            .filter(|edge| edge.source == method.id)
+            .map(|edge| {
+                graph
+                    .node(&edge.target)
+                    .map_or_else(|| "?".to_string(), |node| node.qualified_name.clone())
+            })
+            .collect();
+        targets.sort();
+        targets
+    }
+
+    // Upstream `go-implements-defined-types`: any defined type can declare
+    // methods, and plenty of real implementers are no structs (prometheus's
+    // `staticDiscoverer`, gin's `formSource`, etcd's `Int64Comparable`).
+
+    /// `go.mod`.
+    const DT_GO_MOD: &str = concat!("module example.com/app\n", "\n", "go 1.22\n",);
+
+    /// `discovery/discovery.go`.
+    const DT_DISCOVERY_DISCOVERY_GO: &str = concat!(
+        "package discovery\n",
+        "\n",
+        "import \"context\"\n",
+        "\n",
+        "type Group struct{ Source string }\n",
+        "\n",
+        "type Discoverer interface {\n",
+        "\tRun(ctx context.Context, up chan<- []*Group)\n",
+        "}\n",
+        "\n",
+        "type Config interface {\n",
+        "\tName() string\n",
+        "\tNewDiscoverer() (Discoverer, error)\n",
+        "}\n",
+        "\n",
+        "// A list of groups that is a Config, and hands out a Discoverer over itself.\n",
+        "type StaticConfig []*Group\n",
+        "\n",
+        "func (StaticConfig) Name() string { return \"static\" }\n",
+        "\n",
+        "func (c StaticConfig) NewDiscoverer() (Discoverer, error) { return staticDiscoverer(c), nil }\n",
+        "\n",
+        "type staticDiscoverer []*Group\n",
+        "\n",
+        "func (c staticDiscoverer) Run(ctx context.Context, up chan<- []*Group) {\n",
+        "\tselect {\n",
+        "\tcase <-ctx.Done():\n",
+        "\tcase up <- c:\n",
+        "\t}\n",
+        "}\n",
+        "\n",
+        "// A true alias: the same type as staticDiscoverer, not a second one.\n",
+        "type StaticDiscoverer = staticDiscoverer\n",
+        "\n",
+        "// A name but no NewDiscoverer: no Config.\n",
+        "type namedGroups []*Group\n",
+        "\n",
+        "func (namedGroups) Name() string { return \"named\" }\n",
+    );
+
+    /// `binding/form_mapping.go`.
+    const DT_BINDING_FORM_MAPPING_GO: &str = concat!(
+        "package binding\n",
+        "\n",
+        "type setOptions struct{ isDefaultExists bool }\n",
+        "\n",
+        "type setter interface {\n",
+        "\tTrySet(key string, opt setOptions) (bool, error)\n",
+        "}\n",
+        "\n",
+        "type formSource map[string][]string\n",
+        "\n",
+        "func (form formSource) TrySet(key string, opt setOptions) (bool, error) { return false, nil }\n",
+        "\n",
+        "// No method at all.\n",
+        "type keys []string\n",
+    );
+
+    /// `binding/multipart_form_mapping.go`.
+    const DT_BINDING_MULTIPART_FORM_MAPPING_GO: &str = concat!(
+        "package binding\n",
+        "\n",
+        "import \"net/http\"\n",
+        "\n",
+        "type multipartRequest http.Request\n",
+    );
+
+    /// `binding/multipart_set.go`.
+    const DT_BINDING_MULTIPART_SET_GO: &str = concat!(
+        "package binding\n",
+        "\n",
+        "func (r *multipartRequest) TrySet(key string, opt setOptions) (bool, error) { return false, nil }\n",
+    );
+
+    /// `adt/interval_tree.go`.
+    const DT_ADT_INTERVAL_TREE_GO: &str = concat!(
+        "package adt\n",
+        "\n",
+        "type Comparable interface {\n",
+        "\tCompare(c Comparable) int\n",
+        "}\n",
+        "\n",
+        "type StringComparable string\n",
+        "\n",
+        "func (s StringComparable) Compare(c Comparable) int { return 0 }\n",
+        "\n",
+        "type Int64Comparable int64\n",
+        "\n",
+        "func (v Int64Comparable) Compare(c Comparable) int { return 0 }\n",
+    );
+
+    /// `web/handler.go`.
+    const DT_WEB_HANDLER_GO: &str = concat!(
+        "package web\n",
+        "\n",
+        "type Request struct{}\n",
+        "\n",
+        "type ResponseWriter interface {\n",
+        "\tWrite(b []byte) (int, error)\n",
+        "}\n",
+        "\n",
+        "type Handler interface {\n",
+        "\tServeHTTP(w ResponseWriter, r *Request)\n",
+        "}\n",
+        "\n",
+        "type HandlerFunc func(ResponseWriter, *Request)\n",
+        "\n",
+        "func (f HandlerFunc) ServeHTTP(w ResponseWriter, r *Request) { f(w, r) }\n",
+        "\n",
+        "type Lener interface {\n",
+        "\tLen() int\n",
+        "}\n",
+        "\n",
+        "type Set[T comparable] map[T]struct{}\n",
+        "\n",
+        "func (s Set[T]) Len() int { return len(s) }\n",
+        "\n",
+        "// An interface type by another name: never an implementer itself.\n",
+        "type Serving Handler\n",
+    );
+
+    /// `ring/a.go`.
+    const DT_RING_A_GO: &str = concat!(
+        "package ring\n",
+        "\n",
+        "type Ticker interface{ Tick() }\n",
+        "\n",
+        "type alarm int\n",
+        "\n",
+        "func (alarm) Tick() {}\n",
+    );
+
+    const RING_STRUCTS: usize = 40;
+
+    /// `ring/b.go`: more structs declaring `Tick` than the cap.
+    fn ring_b_go() -> String {
+        let mut parts = vec!["package ring".to_string(), String::new()];
+        parts.extend((0..RING_STRUCTS).map(|index| {
+            let name = format!("tick{index:02}");
+            format!("type {name} struct{{}}\n\nfunc ({name}) Tick() {{}}\n")
+        }));
+        parts.join("\n")
+    }
+
+    fn defined_types() -> Indexed {
+        Project::new()
+            .file("go.mod", DT_GO_MOD)
+            .file("discovery/discovery.go", DT_DISCOVERY_DISCOVERY_GO)
+            .file("binding/form_mapping.go", DT_BINDING_FORM_MAPPING_GO)
+            .file(
+                "binding/multipart_form_mapping.go",
+                DT_BINDING_MULTIPART_FORM_MAPPING_GO,
+            )
+            .file("binding/multipart_set.go", DT_BINDING_MULTIPART_SET_GO)
+            .file("adt/interval_tree.go", DT_ADT_INTERVAL_TREE_GO)
+            .file("web/handler.go", DT_WEB_HANDLER_GO)
+            .file("ring/a.go", DT_RING_A_GO)
+            .file("ring/b.go", &ring_b_go())
+            .index()
+    }
+
+    /// Upstream: every defined type whose methods cover an interface is
+    /// linked, and a call through the interface is bridged to its method; a
+    /// true alias and an interface by another name implement nothing; an
+    /// interface takes at most 40 implementers, defined types in file order
+    /// with the declaring structs.
+    #[test]
+    fn w715b_defined_types_implement_the_interfaces_they_cover() {
+        let project = defined_types();
+        let graph = graph_of(&project);
+        let links: Vec<String> = go_implements(graph)
+            .into_iter()
+            .filter(|link| !link.starts_with("ring."))
+            .collect();
+        assert_eq!(
+            links,
+            [
+                "adt.Int64Comparable -> adt.Comparable",
+                "adt.StringComparable -> adt.Comparable",
+                "binding.formSource -> binding.setter",
+                "binding.multipartRequest -> binding.setter",
+                "discovery.StaticConfig -> discovery.Config",
+                "discovery.staticDiscoverer -> discovery.Discoverer",
+                "web.HandlerFunc -> web.Handler",
+                "web.Set -> web.Lener",
+            ],
+            "{}",
+            graph.report()
+        );
+
+        assert_eq!(
+            dispatch_targets(graph, "interface Discoverer", "Run"),
+            ["staticDiscoverer::Run"]
+        );
+        assert_eq!(
+            dispatch_targets(graph, "interface Config", "NewDiscoverer"),
+            ["StaticConfig::NewDiscoverer"]
+        );
+        assert_eq!(
+            dispatch_targets(graph, "interface setter", "TrySet"),
+            ["formSource::TrySet", "multipartRequest::TrySet"]
+        );
+        assert_eq!(
+            dispatch_targets(graph, "interface Comparable", "Compare"),
+            ["Int64Comparable::Compare", "StringComparable::Compare"]
+        );
+        assert_eq!(
+            dispatch_targets(graph, "interface Handler", "ServeHTTP"),
+            ["HandlerFunc::ServeHTTP"]
+        );
+
+        for name in ["StaticDiscoverer", "Serving"] {
+            let implements: Vec<String> = graph
+                .edges
+                .iter()
+                .filter(|edge| {
+                    edge.kind == "implements"
+                        && graph.node(&edge.source).is_some_and(|node| {
+                            node.name == name && node.language == "go" && node.kind != "import"
+                        })
+                })
+                .map(|edge| graph.describe_edge(edge))
+                .collect();
+            assert!(implements.is_empty(), "{name}: {implements:?}");
+        }
+        assert_eq!(
+            links
+                .iter()
+                .filter(|link| link.contains("staticDiscoverer"))
+                .count(),
+            1,
+            "{links:?}"
+        );
+
+        let ticker = one(graph, "interface Ticker");
+        let linked: Vec<&str> = synthesized_by(graph, "implements", "go-implements")
+            .filter(|edge| edge.target == ticker.id)
+            .map(|edge| graph.node(&edge.source).unwrap().name.as_str())
+            .collect();
+        assert_eq!(linked.len(), 40, "{linked:?}");
+        assert!(linked.contains(&"alarm"), "{linked:?}");
+        assert!(!linked.contains(&"tick39"), "{linked:?}");
+        assert!(
+            dispatch_targets(graph, "interface Ticker", "Tick")
+                .contains(&"alarm::Tick".to_string())
+        );
+    }
+
+    /// Upstream: a sync that edits a defined type's method re-derives what
+    /// it satisfies.
+    #[test]
+    fn w715b_a_sync_that_edits_a_defined_types_method_rederives_it() {
+        let int64 = "package adt\n\ntype Int64Comparable int64\n\nfunc (v Int64Comparable) Compare(c Comparable) int { return 0 }\n";
+        let mut project = Project::new()
+            .file("go.mod", DT_GO_MOD)
+            .file(
+                "adt/comparable.go",
+                "package adt\n\ntype Comparable interface {\n\tCompare(c Comparable) int\n}\n",
+            )
+            .file("adt/int64.go", int64)
+            .index();
+        let linked = |graph: &Graph| -> Vec<String> {
+            synthesized_by(graph, "implements", "go-implements")
+                .map(|edge| {
+                    format!(
+                        "{} -> {}",
+                        graph.node(&edge.source).unwrap().name,
+                        graph.node(&edge.target).unwrap().name
+                    )
+                })
+                .collect()
+        };
+        assert_eq!(linked(project.graph()), ["Int64Comparable -> Comparable"]);
+        project.write("adt/int64.go", &int64.replacen("Compare(", "Cmp(", 1));
+        assert_eq!(linked(project.sync()), Vec::<String>::new());
+        project.write("adt/int64.go", int64);
+        assert_eq!(linked(project.sync()), ["Int64Comparable -> Comparable"]);
+    }
+
+    /// The type hierarchy of `node` (`build_type_hierarchy`, the port of
+    /// upstream `buildTypeHierarchy`), read through the project's index.
+    #[track_caller]
+    fn hierarchy(
+        project: &Indexed,
+        node: &NodeRow,
+    ) -> Option<codegraph_graph::hierarchy::TypeHierarchy> {
+        let paths = codegraph_core::IndexPaths::resolve(project.root(), None).unwrap();
+        let store = codegraph_store::Store::open_for_read(
+            &paths,
+            std::time::Instant::now() + std::time::Duration::from_secs(30),
+            || false,
+        )
+        .expect("read the index");
+        let focus = store.node_by_id(&node.id).unwrap().expect("the node");
+        codegraph_graph::hierarchy::build_type_hierarchy(&store, &focus)
+    }
+
+    /// `relation pkg.Type` for each entry, marked when synthesized, sorted.
+    fn hierarchy_lines(
+        entries: &[codegraph_graph::hierarchy::HierarchyEntry],
+        mark: bool,
+    ) -> Vec<String> {
+        let mut lines: Vec<String> = entries
+            .iter()
+            .map(|entry| {
+                let dir = entry
+                    .node
+                    .file_path
+                    .rsplit_once('/')
+                    .map_or(".", |(dir, _)| dir);
+                format!(
+                    "{} {dir}.{}{}",
+                    entry.relation.as_str(),
+                    entry.node.name,
+                    if mark && entry.synthesized {
+                        " (synthesized)"
+                    } else {
+                        ""
+                    }
+                )
+            })
+            .collect();
+        lines.sort();
+        lines
+    }
+
+    /// Upstream: the defined types show in the type hierarchy, both ways.
+    #[test]
+    fn w715b_defined_types_show_in_the_type_hierarchy() {
+        let project = defined_types();
+        let graph = graph_of(&project);
+        let below = hierarchy(
+            &project,
+            one(graph, "interface Comparable @adt/interval_tree.go"),
+        )
+        .expect("a hierarchy");
+        assert_eq!(
+            hierarchy_lines(&below.descendants, true),
+            [
+                "implements adt.Int64Comparable (synthesized)",
+                "implements adt.StringComparable (synthesized)",
+            ]
+        );
+        let above =
+            hierarchy(&project, one(graph, "type_alias staticDiscoverer")).expect("a hierarchy");
+        assert_eq!(
+            hierarchy_lines(&above.ancestors, false),
+            ["implements discovery.Discoverer"]
+        );
+    }
+
+    // Upstream `go-implements-embedding`: both method sets include what
+    // embedding brings in (etcd's `AuthReadTx`, prometheus's `blockQuerier`).
+
+    /// `go.mod`.
+    const EM_GO_MOD: &str = concat!("module example.com/app\n", "\n", "go 1.22\n",);
+
+    /// `storage/storage.go`.
+    const EM_STORAGE_STORAGE_GO: &str = concat!(
+        "package storage\n",
+        "\n",
+        "type LabelQuerier interface {\n",
+        "\tLabelValues(name string) []string\n",
+        "\tLabelNames() []string\n",
+        "\tClose() error\n",
+        "}\n",
+        "\n",
+        "type Querier interface {\n",
+        "\tLabelQuerier\n",
+        "\tSelect(sorted bool) int\n",
+        "}\n",
+        "\n",
+        "// No method of its own.\n",
+        "type ChunkQuerier interface {\n",
+        "\tLabelQuerier\n",
+        "}\n",
+        "\n",
+        "// Promotes its methods into every struct that embeds it.\n",
+        "type BaseQuerier struct{}\n",
+        "\n",
+        "func (b *BaseQuerier) LabelValues(name string) []string { return nil }\n",
+        "func (b *BaseQuerier) LabelNames() []string            { return nil }\n",
+        "func (b *BaseQuerier) Close() error                    { return nil }\n",
+        "\n",
+        "type Appender interface {\n",
+        "\tAppend(ref uint64, v float64) (uint64, error)\n",
+        "\tCommit() error\n",
+        "\tRollback() error\n",
+        "}\n",
+        "\n",
+        "type Committer interface {\n",
+        "\tCommit() error\n",
+        "\tRollback() error\n",
+        "}\n",
+    );
+
+    /// `tsdb/querier.go`.
+    const EM_TSDB_QUERIER_GO: &str = concat!(
+        "package tsdb\n",
+        "\n",
+        "import \"example.com/app/storage\"\n",
+        "\n",
+        "// A storage.Querier through BaseQuerier's promoted methods and its own Select.\n",
+        "type blockQuerier struct {\n",
+        "\t*storage.BaseQuerier\n",
+        "\tmint, maxt int64\n",
+        "}\n",
+        "\n",
+        "func (q *blockQuerier) Select(sorted bool) int { return 0 }\n",
+        "\n",
+        "// Select and nothing else: no Querier.\n",
+        "type exemplarQuerier struct{}\n",
+        "\n",
+        "func (e *exemplarQuerier) Select(sorted bool) int { return 0 }\n",
+        "\n",
+        "// Embeds the interface it wraps, so it already declares that it is one.\n",
+        "type limitAppender struct {\n",
+        "\tstorage.Appender\n",
+        "\tlimit int\n",
+        "}\n",
+        "\n",
+        "func (a *limitAppender) Append(ref uint64, v float64) (uint64, error) {\n",
+        "\treturn a.Appender.Append(ref, v)\n",
+        "}\n",
+    );
+
+    /// `auth/store.go`.
+    const EM_AUTH_STORE_GO: &str = concat!(
+        "package auth\n",
+        "\n",
+        "type UnsafeAuthReader interface {\n",
+        "\tUnsafeReadAuthEnabled() bool\n",
+        "\tUnsafeGetUser(name string) string\n",
+        "}\n",
+        "\n",
+        "type AuthReadTx interface {\n",
+        "\tRLock()\n",
+        "\tRUnlock()\n",
+        "\tUnsafeAuthReader\n",
+        "}\n",
+        "\n",
+        "// A lock: no auth reader.\n",
+        "type RWMutex struct{}\n",
+        "\n",
+        "func (m *RWMutex) Lock()    {}\n",
+        "func (m *RWMutex) Unlock()  {}\n",
+        "func (m *RWMutex) RLock()   {}\n",
+        "func (m *RWMutex) RUnlock() {}\n",
+        "\n",
+        "type authReadTx struct{}\n",
+        "\n",
+        "func (t *authReadTx) RLock()                           {}\n",
+        "func (t *authReadTx) RUnlock()                         {}\n",
+        "func (t *authReadTx) UnsafeReadAuthEnabled() bool      { return false }\n",
+        "func (t *authReadTx) UnsafeGetUser(name string) string { return name }\n",
+    );
+
+    /// `gin/gin.go`.
+    const EM_GIN_GIN_GO: &str = concat!(
+        "package gin\n",
+        "\n",
+        "type HandlerFunc func()\n",
+        "\n",
+        "type HandlersChain []HandlerFunc\n",
+        "\n",
+        "func (c HandlersChain) Last() HandlerFunc { return nil }\n",
+        "\n",
+        "type IRoutes interface {\n",
+        "\tUse(...HandlerFunc) IRoutes\n",
+        "\tGET(string, ...HandlerFunc) IRoutes\n",
+        "}\n",
+        "\n",
+        "type IRouter interface {\n",
+        "\tIRoutes\n",
+        "\tGroup(string, ...HandlerFunc) *RouterGroup\n",
+        "}\n",
+        "\n",
+        "type RouterGroup struct{ Handlers HandlersChain }\n",
+        "\n",
+        "func (g *RouterGroup) Use(...HandlerFunc) IRoutes                { return g }\n",
+        "func (g *RouterGroup) GET(string, ...HandlerFunc) IRoutes        { return g }\n",
+        "func (g *RouterGroup) Group(string, ...HandlerFunc) *RouterGroup { return g }\n",
+        "\n",
+        "type Engine struct {\n",
+        "\tRouterGroup\n",
+        "\ttrees []string\n",
+        "}\n",
+        "\n",
+        "func (e *Engine) Use(middleware ...HandlerFunc) IRoutes {\n",
+        "\te.RouterGroup.Use(middleware...)\n",
+        "\treturn e\n",
+        "}\n",
+        "\n",
+        "type Chain interface {\n",
+        "\tLast() HandlerFunc\n",
+        "\tReset()\n",
+        "}\n",
+        "\n",
+        "// Last is promoted from the defined type it embeds.\n",
+        "type routeInfo struct {\n",
+        "\tHandlersChain\n",
+        "\tpath string\n",
+        "}\n",
+        "\n",
+        "func (r *routeInfo) Reset() {}\n",
+    );
+
+    /// `cycles/cycles.go`.
+    const EM_CYCLES_CYCLES_GO: &str = concat!(
+        "package cycles\n",
+        "\n",
+        "type Walker interface{ Walk() }\n",
+        "\n",
+        "// A struct may embed a pointer to itself.\n",
+        "type Node struct {\n",
+        "\t*Node\n",
+        "\tnext *Node\n",
+        "}\n",
+        "\n",
+        "func (n *Node) Walk() {}\n",
+        "\n",
+        "type Peer interface {\n",
+        "\tSend()\n",
+        "\tReply()\n",
+        "}\n",
+        "\n",
+        "// Each embeds the other through a pointer, so each has both methods.\n",
+        "type Client struct{ *Server }\n",
+        "\n",
+        "type Server struct{ *Client }\n",
+        "\n",
+        "func (c *Client) Send()  {}\n",
+        "func (s *Server) Reply() {}\n",
+        "\n",
+        "// Not valid Go, but a graph can hold it: each embeds the other.\n",
+        "type Left interface {\n",
+        "\tRight\n",
+        "\tL()\n",
+        "}\n",
+        "\n",
+        "type Right interface {\n",
+        "\tLeft\n",
+        "\tR()\n",
+        "}\n",
+        "\n",
+        "type both struct{}\n",
+        "\n",
+        "func (both) L() {}\n",
+        "func (both) R() {}\n",
+    );
+
+    /// `empty/empty.go`.
+    const EM_EMPTY_EMPTY_GO: &str = concat!(
+        "package empty\n",
+        "\n",
+        "import (\n",
+        "\t\"io\"\n",
+        "\n",
+        "\t\"go.uber.org/zap/zapcore\"\n",
+        ")\n",
+        "\n",
+        "type Any interface{}\n",
+        "\n",
+        "// Embeds only a type nothing here names the methods of: nothing to match.\n",
+        "type Core interface{ zapcore.Core }\n",
+        "\n",
+        "// What io.Closer asks for: a Close.\n",
+        "type Closer interface{ io.Closer }\n",
+    );
+
+    /// `fleet/heart.go`.
+    const EM_FLEET_HEART_GO: &str = concat!(
+        "package fleet\n",
+        "\n",
+        "type heart struct{}\n",
+        "\n",
+        "func (heart) Beat() {}\n",
+    );
+
+    const FLEET_UNITS: usize = 45;
+
+    /// `fleet/fleet.go`: more implementers than the cap, every unit through
+    /// the base they all embed.
+    fn fleet_go() -> String {
+        let mut lines: Vec<String> = [
+            "package fleet",
+            "",
+            "type Beater interface{ Beat() }",
+            "",
+            "type Base struct{}",
+            "",
+            "func (Base) Beat() {}",
+            "",
+        ]
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+        lines.extend((0..FLEET_UNITS).map(|index| format!("type unit{index:02} struct{{ Base }}")));
+        lines.push(String::new());
+        lines.join("\n")
+    }
+
+    fn embedding() -> Indexed {
+        Project::new()
+            .file("go.mod", EM_GO_MOD)
+            .file("storage/storage.go", EM_STORAGE_STORAGE_GO)
+            .file("tsdb/querier.go", EM_TSDB_QUERIER_GO)
+            .file("auth/store.go", EM_AUTH_STORE_GO)
+            .file("gin/gin.go", EM_GIN_GIN_GO)
+            .file("cycles/cycles.go", EM_CYCLES_CYCLES_GO)
+            .file("empty/empty.go", EM_EMPTY_EMPTY_GO)
+            .file("fleet/fleet.go", &fleet_go())
+            .file("fleet/heart.go", EM_FLEET_HEART_GO)
+            .index()
+    }
+
+    /// The `go-implements` edges out of Go structs (upstream's
+    /// `goImplements` of this test), as `pkg.Struct -> pkg.Interface`.
+    fn struct_implements(graph: &Graph) -> Vec<String> {
+        let mut links: Vec<String> = synthesized_by(graph, "implements", "go-implements")
+            .filter(|edge| {
+                graph
+                    .node(&edge.source)
+                    .is_some_and(|node| node.kind == "struct")
+            })
+            .map(|edge| {
+                format!(
+                    "{} -> {}",
+                    pkg(graph, &edge.source),
+                    pkg(graph, &edge.target)
+                )
+            })
+            .filter(|link| !link.starts_with("fleet."))
+            .collect();
+        links.sort();
+        links
+    }
+
+    /// Upstream: exactly the structs whose method set, embeddings included,
+    /// covers an interface are linked; an embedded interface's methods are
+    /// asked for too; a struct embedding the interface keeps its declared
+    /// edge; a call through the interface reaches an override on the
+    /// embedding struct; an interface with no known method takes nothing;
+    /// the cap keeps the types declaring the interface's methods.
+    #[test]
+    fn w715b_embedded_methods_count_on_both_sides() {
+        let project = embedding();
+        let graph = graph_of(&project);
+        assert_eq!(
+            struct_implements(graph),
+            [
+                "auth.authReadTx -> auth.AuthReadTx",
+                "auth.authReadTx -> auth.UnsafeAuthReader",
+                "cycles.Client -> cycles.Peer",
+                "cycles.Node -> cycles.Walker",
+                "cycles.Server -> cycles.Peer",
+                "cycles.both -> cycles.Left",
+                "cycles.both -> cycles.Right",
+                "gin.Engine -> gin.IRouter",
+                "gin.Engine -> gin.IRoutes",
+                "gin.RouterGroup -> gin.IRouter",
+                "gin.RouterGroup -> gin.IRoutes",
+                "gin.routeInfo -> gin.Chain",
+                "storage.BaseQuerier -> empty.Closer",
+                "storage.BaseQuerier -> storage.ChunkQuerier",
+                "storage.BaseQuerier -> storage.LabelQuerier",
+                "tsdb.blockQuerier -> empty.Closer",
+                "tsdb.blockQuerier -> storage.ChunkQuerier",
+                "tsdb.blockQuerier -> storage.LabelQuerier",
+                "tsdb.blockQuerier -> storage.Querier",
+                "tsdb.limitAppender -> storage.Committer",
+            ],
+            "{}",
+            graph.report()
+        );
+
+        for (selector, expected) in [
+            ("interface AuthReadTx", "implements auth.authReadTx"),
+            ("interface Querier", "implements tsdb.blockQuerier"),
+        ] {
+            let below = hierarchy(&project, one(graph, selector)).expect("a hierarchy");
+            assert_eq!(hierarchy_lines(&below.descendants, false), [expected]);
+        }
+
+        let limit = one(graph, "struct limitAppender");
+        let mut declared: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|edge| {
+                edge.source == limit.id && (edge.kind == "implements" || edge.kind == "extends")
+            })
+            .map(|edge| {
+                format!(
+                    "{} {}{}",
+                    edge.kind,
+                    pkg(graph, &edge.target),
+                    if edge.provenance.as_deref() == Some("heuristic") {
+                        " (synthesized)"
+                    } else {
+                        ""
+                    }
+                )
+            })
+            .collect();
+        declared.sort();
+        assert_eq!(
+            declared,
+            [
+                "implements storage.Appender",
+                "implements storage.Committer (synthesized)",
+            ],
+            "{}",
+            graph.report()
+        );
+
+        // RouterGroup was linked before. Engine satisfies IRoutes only with
+        // the GET that RouterGroup promotes into it.
+        assert_eq!(
+            dispatch_targets(graph, "interface IRoutes", "Use"),
+            ["Engine::Use", "RouterGroup::Use"]
+        );
+
+        for selector in ["interface Any", "interface Core"] {
+            let target = one(graph, selector);
+            assert_eq!(
+                synthesized_by(graph, "implements", "go-implements")
+                    .filter(|edge| edge.target == target.id)
+                    .count(),
+                0,
+                "{selector}"
+            );
+        }
+
+        // Base, heart and 45 units satisfy Beater. heart is declared after
+        // the units, but a call through Beater reaches its Beat, not theirs.
+        let beater = one(graph, "interface Beater");
+        let linked: Vec<&str> = synthesized_by(graph, "implements", "go-implements")
+            .filter(|edge| edge.target == beater.id)
+            .map(|edge| graph.node(&edge.source).unwrap().name.as_str())
+            .collect();
+        assert_eq!(linked.len(), 40, "{linked:?}");
+        assert!(
+            linked.contains(&"Base") && linked.contains(&"heart"),
+            "{linked:?}"
+        );
+        assert_eq!(
+            linked
+                .iter()
+                .filter(|name| name.starts_with("unit"))
+                .count(),
+            38,
+            "{linked:?}"
+        );
+        assert_eq!(
+            dispatch_targets(graph, "interface Beater", "Beat"),
+            ["Base::Beat", "heart::Beat"]
+        );
+    }
+
+    /// Upstream: a sync that edits only the embedded type re-derives what
+    /// the struct embedding it satisfies.
+    #[test]
+    fn w715b_a_sync_that_edits_only_the_embedded_type_rederives_it() {
+        let base =
+            "package base\n\ntype Base struct{}\n\nfunc (Base) Close() error { return nil }\n";
+        let mut project = Project::new()
+            .file("go.mod", EM_GO_MOD)
+            .file(
+                "api/api.go",
+                "package api\n\ntype NamedCloser interface {\n\tClose() error\n\tName() string\n}\n",
+            )
+            .file("base/base.go", base)
+            .file(
+                "wrap/wrap.go",
+                "package wrap\n\nimport \"example.com/app/base\"\n\ntype Wrapper struct{ base.Base }\n\nfunc (Wrapper) Name() string { return \"\" }\n",
+            )
+            .index();
+        let linked = |graph: &Graph| -> Vec<String> {
+            synthesized_by(graph, "implements", "go-implements")
+                .filter(|edge| {
+                    graph
+                        .node(&edge.source)
+                        .is_some_and(|node| node.kind == "struct")
+                })
+                .map(|edge| {
+                    format!(
+                        "{} -> {}",
+                        graph.node(&edge.source).unwrap().name,
+                        graph.node(&edge.target).unwrap().name
+                    )
+                })
+                .collect()
+        };
+        // Close comes from Base, in a file neither Wrapper's nor the
+        // interface's.
+        assert_eq!(linked(project.graph()), ["Wrapper -> NamedCloser"]);
+        project.write("base/base.go", &base.replacen("Close()", "Shutdown()", 1));
+        assert_eq!(linked(project.sync()), Vec::<String>::new());
+        project.write("base/base.go", base);
+        assert_eq!(linked(project.sync()), ["Wrapper -> NamedCloser"]);
+    }
+
+    // Upstream `go-implements-unexported` (#2746): an unexported method name
+    // belongs to the package declaring it, so only that package's methods
+    // satisfy an interface asking for it.
+
+    /// `go.mod`.
+    const UX_GO_MOD: &str = concat!("module example.com/app\n", "\n", "go 1.22\n",);
+
+    /// `discovery/refresh/refresh.go`.
+    const UX_DISCOVERY_REFRESH_REFRESH_GO: &str = concat!(
+        "package refresh\n",
+        "\n",
+        "type Discovery struct {\n",
+        "\trefreshf func() ([]string, error)\n",
+        "}\n",
+        "\n",
+        "func (d *Discovery) Run() {}\n",
+        "\n",
+        "func (d *Discovery) refresh() ([]string, error) { return d.refreshf() }\n",
+    );
+
+    /// `discovery/hetzner/hetzner.go`.
+    const UX_DISCOVERY_HETZNER_HETZNER_GO: &str = concat!(
+        "package hetzner\n",
+        "\n",
+        "import \"example.com/app/discovery/refresh\"\n",
+        "\n",
+        "type refresher interface {\n",
+        "\trefresh() ([]string, error)\n",
+        "}\n",
+        "\n",
+        "// A refresh of its own, declared in package hetzner: a refresher.\n",
+        "type hcloudDiscovery struct {\n",
+        "\t*refresh.Discovery\n",
+        "}\n",
+        "\n",
+        "func (d *hcloudDiscovery) refresh() ([]string, error) { return nil, nil }\n",
+        "\n",
+        "// A defined type of the package is one too.\n",
+        "type robotTargets []string\n",
+        "\n",
+        "func (r robotTargets) refresh() ([]string, error) { return r, nil }\n",
+        "\n",
+        "// Its only refresh is the one package refresh declares on the Discovery it\n",
+        "// embeds: no refresher, for all that it sits in this package.\n",
+        "type Discovery struct {\n",
+        "\t*refresh.Discovery\n",
+        "}\n",
+    );
+
+    /// `discovery/aws/ec2.go`.
+    const UX_DISCOVERY_AWS_EC2_GO: &str = concat!(
+        "package aws\n",
+        "\n",
+        "import \"example.com/app/discovery/refresh\"\n",
+        "\n",
+        "// A refresh of its own, but package aws's: no hetzner refresher.\n",
+        "type EC2Discovery struct {\n",
+        "\t*refresh.Discovery\n",
+        "}\n",
+        "\n",
+        "func (d *EC2Discovery) refresh() ([]string, error) { return nil, nil }\n",
+        "\n",
+        "// Nor is a defined type of package aws.\n",
+        "type staticTargets []string\n",
+        "\n",
+        "func (s staticTargets) refresh() ([]string, error) { return s, nil }\n",
+    );
+
+    /// `api/pb/rpc_grpc.pb.go`.
+    const UX_API_PB_RPC_GRPC_PB_GO: &str = concat!(
+        "package pb\n",
+        "\n",
+        "type KVServer interface {\n",
+        "\tRange(key string) (string, error)\n",
+        "\tPut(key string) (string, error)\n",
+        "\tmustEmbedUnimplementedKVServer()\n",
+        "}\n",
+        "\n",
+        "type UnimplementedKVServer struct{}\n",
+        "\n",
+        "func (UnimplementedKVServer) Range(key string) (string, error) { return \"\", nil }\n",
+        "func (UnimplementedKVServer) Put(key string) (string, error)   { return \"\", nil }\n",
+        "func (UnimplementedKVServer) mustEmbedUnimplementedKVServer()  {}\n",
+        "\n",
+        "type UnsafeKVServer interface {\n",
+        "\tmustEmbedUnimplementedKVServer()\n",
+        "}\n",
+    );
+
+    /// `server/v3rpc/key.go`.
+    const UX_SERVER_V3RPC_KEY_GO: &str = concat!(
+        "package v3rpc\n",
+        "\n",
+        "import pb \"example.com/app/api/pb\"\n",
+        "\n",
+        "// etcd's kvServer: the stub interface brings pb's mustEmbedUnimplementedKVServer.\n",
+        "type kvServer struct {\n",
+        "\tpb.UnsafeKVServer\n",
+        "}\n",
+        "\n",
+        "func (s *kvServer) Range(key string) (string, error) { return \"\", nil }\n",
+        "func (s *kvServer) Put(key string) (string, error)   { return \"\", nil }\n",
+        "\n",
+        "// The stub struct brings it, and Put.\n",
+        "type kvProxy struct {\n",
+        "\tpb.UnimplementedKVServer\n",
+        "}\n",
+        "\n",
+        "func (p *kvProxy) Range(key string) (string, error) { return \"\", nil }\n",
+        "\n",
+        "// Its mustEmbedUnimplementedKVServer is package v3rpc's: no KVServer.\n",
+        "type fakeKV struct{}\n",
+        "\n",
+        "func (fakeKV) Range(key string) (string, error) { return \"\", nil }\n",
+        "func (fakeKV) Put(key string) (string, error)   { return \"\", nil }\n",
+        "func (fakeKV) mustEmbedUnimplementedKVServer()  {}\n",
+    );
+
+    /// `server/v3rpc/closable.go`.
+    const UX_SERVER_V3RPC_CLOSABLE_GO: &str = concat!(
+        "package v3rpc\n",
+        "\n",
+        "import pb \"example.com/app/api/pb\"\n",
+        "\n",
+        "type closableKV interface {\n",
+        "\tpb.KVServer\n",
+        "\tClose() error\n",
+        "}\n",
+        "\n",
+        "func (s *kvServer) Close() error { return nil }\n",
+        "\n",
+        "func (fakeKV) Close() error { return nil }\n",
+    );
+
+    /// `lease/lease.go`.
+    const UX_LEASE_LEASE_GO: &str = concat!(
+        "package lease\n",
+        "\n",
+        "type checkpointer interface {\n",
+        "\tcheckpoint() error\n",
+        "\tExpired() bool\n",
+        "}\n",
+        "\n",
+        "// A checkpoint and no Expired: neither is a checkpointer itself.\n",
+        "type Lessor struct{}\n",
+        "\n",
+        "func (l *Lessor) checkpoint() error { return nil }\n",
+        "\n",
+        "type Store struct{}\n",
+        "\n",
+        "func (s *Store) checkpoint() error { return nil }\n",
+    );
+
+    /// `lease/proxy/proxy.go`.
+    const UX_LEASE_PROXY_PROXY_GO: &str = concat!(
+        "package proxy\n",
+        "\n",
+        "import \"example.com/app/lease\"\n",
+        "\n",
+        "// Its own checkpoint is package proxy's. A call through a checkpointer runs\n",
+        "// the one the Lessor it embeds declares in package lease.\n",
+        "type leaseProxy struct {\n",
+        "\t*lease.Lessor\n",
+        "}\n",
+        "\n",
+        "func (p *leaseProxy) checkpoint() error { return nil }\n",
+        "func (p *leaseProxy) Expired() bool     { return false }\n",
+        "\n",
+        "// local's checkpoint, one level down, is package proxy's too. It hides\n",
+        "// nothing: Store's, two levels down, is the checkpointer's.\n",
+        "type local struct{}\n",
+        "\n",
+        "func (local) checkpoint() error { return nil }\n",
+        "\n",
+        "type wrapped struct{ *lease.Store }\n",
+        "\n",
+        "type layered struct {\n",
+        "\tlocal\n",
+        "\twrapped\n",
+        "}\n",
+        "\n",
+        "func (layered) Expired() bool { return false }\n",
+    );
+
+    /// `a/early.go`.
+    const UX_A_EARLY_GO: &str = concat!(
+        "package a\n",
+        "\n",
+        "import \"example.com/app/pool\"\n",
+        "\n",
+        "type early struct{ pool.Base }\n",
+        "\n",
+        "func (early) ping() {}\n",
+    );
+
+    /// Base and 39 units: exactly the cap.
+    const POOL_UNITS: usize = 39;
+
+    fn pool_go() -> String {
+        let mut lines: Vec<String> = [
+            "package pool",
+            "",
+            "type pinger interface{ ping() }",
+            "",
+            "type Base struct{}",
+            "",
+            "func (Base) ping() {}",
+            "",
+        ]
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+        lines.extend((0..POOL_UNITS).map(|index| {
+            let unit = format!("unit{index:02}");
+            format!("type {unit} struct{{}}\n\nfunc ({unit}) ping() {{}}\n")
+        }));
+        lines.join("\n")
+    }
+
+    fn unexported() -> Indexed {
+        Project::new()
+            .file("go.mod", UX_GO_MOD)
+            .file(
+                "discovery/refresh/refresh.go",
+                UX_DISCOVERY_REFRESH_REFRESH_GO,
+            )
+            .file(
+                "discovery/hetzner/hetzner.go",
+                UX_DISCOVERY_HETZNER_HETZNER_GO,
+            )
+            .file("discovery/aws/ec2.go", UX_DISCOVERY_AWS_EC2_GO)
+            .file("api/pb/rpc_grpc.pb.go", UX_API_PB_RPC_GRPC_PB_GO)
+            .file("server/v3rpc/key.go", UX_SERVER_V3RPC_KEY_GO)
+            .file("server/v3rpc/closable.go", UX_SERVER_V3RPC_CLOSABLE_GO)
+            .file("lease/lease.go", UX_LEASE_LEASE_GO)
+            .file("lease/proxy/proxy.go", UX_LEASE_PROXY_PROXY_GO)
+            .file("a/early.go", UX_A_EARLY_GO)
+            .file("pool/pool.go", &pool_go())
+            .index()
+    }
+
+    /// `file:line` of the first line of `contents` containing `text`.
+    #[track_caller]
+    fn at(file: &str, contents: &str, text: &str) -> String {
+        let line = contents
+            .split('\n')
+            .position(|line| line.contains(text))
+            .unwrap_or_else(|| panic!("{text:?} in {file}"));
+        format!("{file}:{}", line + 1)
+    }
+
+    /// The `go-implements` edges into `iface`, as `pkg.Type`, sorted.
+    fn implementers(graph: &Graph, iface: &str) -> Vec<String> {
+        let iface = one(graph, iface);
+        let mut types: Vec<String> = synthesized_by(graph, "implements", "go-implements")
+            .filter(|edge| edge.target == iface.id)
+            .map(|edge| pkg(graph, &edge.source))
+            .collect();
+        types.sort();
+        types
+    }
+
+    /// Where a call through `method` of `iface` dispatches, as
+    /// `Target::m`, or `Target::m <- promotedInto @registeredAt` (upstream
+    /// `dispatch`).
+    #[track_caller]
+    fn dispatch(graph: &Graph, iface: &str, method: &str) -> Vec<String> {
+        let iface = one(graph, iface);
+        let method = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.kind == "contains" && edge.source == iface.id)
+            .filter_map(|edge| graph.node(&edge.target))
+            .find(|node| node.name == method)
+            .unwrap_or_else(|| panic!("{}.{method}", iface.name));
+        let mut targets: Vec<String> = synthesized_by(graph, "calls", "interface-impl")
+            .filter(|edge| edge.source == method.id)
+            .map(|edge| {
+                let target = graph
+                    .node(&edge.target)
+                    .map_or("?", |node| node.qualified_name.as_str());
+                match edge
+                    .metadata
+                    .get("promotedInto")
+                    .and_then(|into| into.as_str())
+                {
+                    Some(into) => format!(
+                        "{target} <- {into} @{}",
+                        edge.metadata["registeredAt"].as_str().unwrap_or("?")
+                    ),
+                    None => target.to_string(),
+                }
+            })
+            .collect();
+        targets.sort();
+        targets
+    }
+
+    /// Upstream: no type of another package satisfies an interface by a
+    /// namesake of its unexported method; a gRPC server satisfies one
+    /// through the stub it embeds from the interface's package; an embedded
+    /// interface's method is asked for in that interface's package; a call
+    /// dispatches to the method of the interface's own package, promoted when
+    /// the struct does not declare it; the cap fills with the types
+    /// declaring the method in its package first.
+    #[test]
+    fn w715b_an_unexported_method_is_satisfied_only_from_its_package() {
+        let project = unexported();
+        let graph = graph_of(&project);
+        // Not aws's EC2Discovery or staticTargets, nor refresh.Discovery,
+        // nor hetzner's Discovery, whose refresh is package refresh's.
+        let refresher = "interface refresher @discovery/hetzner/hetzner.go";
+        assert_eq!(
+            implementers(graph, refresher),
+            [
+                "discovery/hetzner.hcloudDiscovery",
+                "discovery/hetzner.robotTargets",
+            ],
+            "{}",
+            graph.report()
+        );
+        let below = hierarchy(&project, one(graph, refresher)).expect("a hierarchy");
+        let mut types: Vec<String> = below
+            .descendants
+            .iter()
+            .map(|entry| {
+                let dir = entry
+                    .node
+                    .file_path
+                    .rsplit_once('/')
+                    .map_or(".", |(dir, _)| dir);
+                format!("{dir}.{}", entry.node.name)
+            })
+            .collect();
+        types.sort();
+        assert_eq!(
+            types,
+            [
+                "discovery/hetzner.hcloudDiscovery",
+                "discovery/hetzner.robotTargets",
+            ]
+        );
+
+        // kvServer embeds the UnsafeKVServer interface, kvProxy the
+        // UnimplementedKVServer struct. fakeKV declares the method itself, in
+        // package v3rpc.
+        assert_eq!(
+            implementers(graph, "interface KVServer"),
+            [
+                "api/pb.UnimplementedKVServer",
+                "server/v3rpc.kvProxy",
+                "server/v3rpc.kvServer",
+            ]
+        );
+        // kvServer declares that one by embedding it.
+        assert_eq!(
+            implementers(graph, "interface UnsafeKVServer"),
+            ["api/pb.UnimplementedKVServer", "server/v3rpc.kvProxy"]
+        );
+        assert_eq!(
+            implementers(graph, "interface closableKV"),
+            ["server/v3rpc.kvServer"]
+        );
+
+        let checkpointer = "interface checkpointer";
+        assert_eq!(
+            implementers(graph, checkpointer),
+            ["lease/proxy.layered", "lease/proxy.leaseProxy"]
+        );
+        // Not leaseProxy's own checkpoint, nor local's at the shallower
+        // depth.
+        let proxy = "lease/proxy/proxy.go";
+        assert_eq!(
+            dispatch(graph, checkpointer, "checkpoint"),
+            [
+                format!(
+                    "Lessor::checkpoint <- leaseProxy @{}",
+                    at(proxy, UX_LEASE_PROXY_PROXY_GO, "\t*lease.Lessor")
+                ),
+                format!(
+                    "Store::checkpoint <- layered @{}",
+                    at(proxy, UX_LEASE_PROXY_PROXY_GO, "\twrapped")
+                ),
+            ],
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            dispatch(graph, checkpointer, "Expired"),
+            ["layered::Expired", "leaseProxy::Expired"]
+        );
+        // A gRPC server's own mustEmbedUnimplementedKVServer is no override.
+        assert_eq!(
+            dispatch(
+                graph,
+                "interface KVServer",
+                "mustEmbedUnimplementedKVServer"
+            ),
+            ["UnimplementedKVServer::mustEmbedUnimplementedKVServer"]
+        );
+
+        let mut pool: Vec<String> = vec!["pool.Base".to_string()];
+        pool.extend((0..POOL_UNITS).map(|index| format!("pool.unit{index:02}")));
+        pool.sort();
+        assert_eq!(implementers(graph, "interface pinger"), pool);
+    }
+
+    // Upstream `go-implements-stdlib` (#2402, #2759): the methods of the
+    // standard-library types projects embed are known, with their counts,
+    // and an embedded `error` is recorded as the embedding it is.
+
+    /// `go.mod`.
+    const SL_GO_MOD: &str = concat!("module example.com/app\n", "\n", "go 1.22\n",);
+
+    /// `promql/promql.go`.
+    const SL_PROMQL_PROMQL_GO: &str = concat!(
+        "package promql\n",
+        "\n",
+        "import (\n",
+        "\t\"context\"\n",
+        "\t\"io\"\n",
+        "\t\"log/slog\"\n",
+        "\t\"os\"\n",
+        "\t\"testing\"\n",
+        ")\n",
+        "\n",
+        "// All of testing.TB, which only an embedding can have, and Run.\n",
+        "type TBRun interface {\n",
+        "\ttesting.TB\n",
+        "\tRun(string, func(*testing.T)) bool\n",
+        "}\n",
+        "\n",
+        "// A Run, and nothing of testing.TB.\n",
+        "type Discovery struct{}\n",
+        "\n",
+        "func (d *Discovery) Run(name string, f func(*testing.T)) bool { return false }\n",
+        "\n",
+        "// testing.TB through *testing.T, and a Run of its own.\n",
+        "type tRunner struct{ *testing.T }\n",
+        "\n",
+        "func (r tRunner) Run(name string, f func(*testing.T)) bool { return r.T.Run(name, f) }\n",
+        "\n",
+        "// discovery/file's test helper: all of TBRun through *testing.T, Run included.\n",
+        "type testRunner struct {\n",
+        "\t*testing.T\n",
+        "\tdir string\n",
+        "}\n",
+        "\n",
+        "type syncWriter interface {\n",
+        "\tio.Writer\n",
+        "\tSync() error\n",
+        "}\n",
+        "\n",
+        "// Sync, and no Write.\n",
+        "type scrapePool struct{}\n",
+        "\n",
+        "func (sp *scrapePool) Sync() error { return nil }\n",
+        "\n",
+        "type queryLogFile struct{}\n",
+        "\n",
+        "func (f *queryLogFile) Write(p []byte) (int, error) { return len(p), nil }\n",
+        "func (f *queryLogFile) Sync() error                 { return nil }\n",
+        "\n",
+        "// Its Write takes a record and returns only an error: no io.Writer's.\n",
+        "type walLog struct{}\n",
+        "\n",
+        "func (w *walLog) Write(rec *Record) error { return nil }\n",
+        "func (w *walLog) Sync() error             { return nil }\n",
+        "\n",
+        "type SegmentFile interface {\n",
+        "\tStat() (os.FileInfo, error)\n",
+        "\tSync() error\n",
+        "\tio.Writer\n",
+        "\tio.Reader\n",
+        "\tio.Closer\n",
+        "}\n",
+        "\n",
+        "// Write through the SegmentFile it embeds, which has it from io.Writer.\n",
+        "type Segment struct {\n",
+        "\tSegmentFile\n",
+        "\tdir string\n",
+        "}\n",
+        "\n",
+        "// No method of its own: what slog.Handler and io.Closer ask for.\n",
+        "type QueryLogger interface {\n",
+        "\tslog.Handler\n",
+        "\tio.Closer\n",
+        "}\n",
+        "\n",
+        "type JSONFileLogger struct{}\n",
+        "\n",
+        "func (l *JSONFileLogger) Enabled(ctx context.Context, level slog.Level) bool { return true }\n",
+        "func (l *JSONFileLogger) Handle(ctx context.Context, r slog.Record) error  { return nil }\n",
+        "func (l *JSONFileLogger) WithAttrs(attrs []slog.Attr) slog.Handler          { return l }\n",
+        "func (l *JSONFileLogger) WithGroup(name string) slog.Handler                { return l }\n",
+        "func (l *JSONFileLogger) Close() error                                      { return nil }\n",
+    );
+
+    /// `fileutil/fileutil.go`.
+    const SL_FILEUTIL_FILEUTIL_GO: &str = concat!(
+        "package fileutil\n",
+        "\n",
+        "import (\n",
+        "\t\"bufio\"\n",
+        "\t\"context\"\n",
+        "\t\"io\"\n",
+        "\t\"io/fs\"\n",
+        "\t\"os\"\n",
+        "\t\"sync\"\n",
+        ")\n",
+        "\n",
+        "type FileReader interface {\n",
+        "\tio.Reader\n",
+        "\tFileInfo() (fs.FileInfo, error)\n",
+        "}\n",
+        "\n",
+        "// Read is promoted from *os.File.\n",
+        "type fileReader struct{ *os.File }\n",
+        "\n",
+        "func (fr *fileReader) FileInfo() (fs.FileInfo, error) { return fr.Stat() }\n",
+        "\n",
+        "// Read is promoted from *bufio.Reader.\n",
+        "type FileBufReader struct {\n",
+        "\t*bufio.Reader\n",
+        "\tfi fs.FileInfo\n",
+        "}\n",
+        "\n",
+        "func (fb *FileBufReader) FileInfo() (fs.FileInfo, error) { return fb.fi, nil }\n",
+        "\n",
+        "// FileInfo, and nothing to Read with.\n",
+        "type fileStat struct{}\n",
+        "\n",
+        "func (s *fileStat) FileInfo() (fs.FileInfo, error) { return nil, nil }\n",
+        "\n",
+        "// v3lockpb's client: Lock and Unlock are gRPC calls.\n",
+        "type LockClient interface {\n",
+        "\tLock(ctx context.Context, name string) error\n",
+        "\tUnlock(ctx context.Context, key string) error\n",
+        "}\n",
+        "\n",
+        "// hugo's: what a mutex has.\n",
+        "type Locker interface {\n",
+        "\tLock()\n",
+        "\tUnlock()\n",
+        "}\n",
+        "\n",
+        "// A mutex's Lock and Unlock: a Locker's, not a LockClient's.\n",
+        "type waitRecorder struct {\n",
+        "\tsync.Mutex\n",
+        "\tactions []string\n",
+        "}\n",
+        "\n",
+        "type lockProxy struct{}\n",
+        "\n",
+        "func (p *lockProxy) Lock(ctx context.Context, name string) error  { return nil }\n",
+        "func (p *lockProxy) Unlock(ctx context.Context, key string) error { return nil }\n",
+    );
+
+    /// `gin/response_writer.go`.
+    const SL_GIN_RESPONSE_WRITER_GO: &str = concat!(
+        "package gin\n",
+        "\n",
+        "import (\n",
+        "\t\"bufio\"\n",
+        "\t\"net\"\n",
+        "\t\"net/http\"\n",
+        ")\n",
+        "\n",
+        "type ResponseWriter interface {\n",
+        "\thttp.ResponseWriter\n",
+        "\thttp.Hijacker\n",
+        "\thttp.Flusher\n",
+        "\thttp.CloseNotifier\n",
+        "\tStatus() int\n",
+        "\tSize() int\n",
+        "\tWriteString(string) (int, error)\n",
+        "\tWritten() bool\n",
+        "\tWriteHeaderNow()\n",
+        "\tPusher() http.Pusher\n",
+        "}\n",
+        "\n",
+        "// Header is promoted from the http.ResponseWriter it wraps.\n",
+        "type responseWriter struct {\n",
+        "\thttp.ResponseWriter\n",
+        "\tsize   int\n",
+        "\tstatus int\n",
+        "}\n",
+        "\n",
+        "func (w *responseWriter) WriteHeader(code int)                          {}\n",
+        "func (w *responseWriter) WriteHeaderNow()                               {}\n",
+        "func (w *responseWriter) Write(data []byte) (int, error)                { return len(data), nil }\n",
+        "func (w *responseWriter) WriteString(s string) (int, error)             { return len(s), nil }\n",
+        "func (w *responseWriter) Status() int                                   { return w.status }\n",
+        "func (w *responseWriter) Size() int                                     { return w.size }\n",
+        "func (w *responseWriter) Written() bool                                 { return w.size >= 0 }\n",
+        "func (w *responseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error)  { return nil, nil, nil }\n",
+        "func (w *responseWriter) CloseNotify() <-chan bool                      { return nil }\n",
+        "func (w *responseWriter) Flush()                                        {}\n",
+        "func (w *responseWriter) Pusher() http.Pusher                           { return nil }\n",
+        "\n",
+        "// The methods ResponseWriter declares, none that http asks for.\n",
+        "type sizeTracker struct{ size, status int }\n",
+        "\n",
+        "func (t *sizeTracker) Status() int                       { return t.status }\n",
+        "func (t *sizeTracker) Size() int                         { return t.size }\n",
+        "func (t *sizeTracker) WriteString(s string) (int, error) { return len(s), nil }\n",
+        "func (t *sizeTracker) Written() bool                     { return t.size >= 0 }\n",
+        "func (t *sizeTracker) WriteHeaderNow()                   {}\n",
+        "func (t *sizeTracker) Pusher() http.Pusher               { return nil }\n",
+    );
+
+    /// `errs/errs.go`.
+    const SL_ERRS_ERRS_GO: &str = concat!(
+        "package errs\n",
+        "\n",
+        "type coded interface {\n",
+        "\terror\n",
+        "\tCode() int\n",
+        "}\n",
+        "\n",
+        "// Error is promoted from the error it wraps.\n",
+        "type statusErr struct {\n",
+        "\terror\n",
+        "\tcode int\n",
+        "}\n",
+        "\n",
+        "func (e statusErr) Code() int { return e.code }\n",
+        "\n",
+        "// A Code, and no Error.\n",
+        "type counter struct{ n int }\n",
+        "\n",
+        "func (c *counter) Code() int { return c.n }\n",
+    );
+
+    /// `diag/diag.go`.
+    const SL_DIAG_DIAG_GO: &str = concat!(
+        "package diag\n",
+        "\n",
+        "import (\n",
+        "\t\"github.com/libdns/libdns\"\n",
+        "\tplog \"github.com/prometheus/common/log\"\n",
+        "\t\"go.uber.org/zap\"\n",
+        "\t\"go.uber.org/zap/zapcore\"\n",
+        "\t\"google.golang.org/grpc\"\n",
+        ")\n",
+        "\n",
+        "// kapacitor's scraper.Diagnostic: Log, and a Logger.\n",
+        "type Diagnostic interface {\n",
+        "\tplog.Logger\n",
+        "\tLog(keyvals ...interface{}) error\n",
+        "}\n",
+        "\n",
+        "type ScraperHandler struct{}\n",
+        "\n",
+        "func (h *ScraperHandler) Debug(args ...interface{})          {}\n",
+        "func (h *ScraperHandler) Log(keyvals ...interface{}) error { return nil }\n",
+        "\n",
+        "type AlertNode struct{}\n",
+        "\n",
+        "func (n *AlertNode) Log(keyvals ...interface{}) error { return nil }\n",
+        "\n",
+        "// caddy's: nothing else has a FlushTo.\n",
+        "type LogBufferCoreInterface interface {\n",
+        "\tzapcore.Core\n",
+        "\tFlushTo(*zap.Logger)\n",
+        "}\n",
+        "\n",
+        "type LogBufferCore struct{}\n",
+        "\n",
+        "func (c *LogBufferCore) FlushTo(l *zap.Logger) {}\n",
+        "\n",
+        "type ClientStream interface {\n",
+        "\tgrpc.ClientStream\n",
+        "\tSend(m any) error\n",
+        "\tRecv(m any) error\n",
+        "}\n",
+        "\n",
+        "// Has the gRPC stream's methods by embedding it.\n",
+        "type wrappedStream struct{ grpc.ClientStream }\n",
+        "\n",
+        "func (s *wrappedStream) Send(m any) error { return nil }\n",
+        "func (s *wrappedStream) Recv(m any) error { return nil }\n",
+        "\n",
+        "// Sends and receives, as a server stream.\n",
+        "type serverStream struct{}\n",
+        "\n",
+        "func (s *serverStream) Send(m any) error { return nil }\n",
+        "func (s *serverStream) Recv(m any) error { return nil }\n",
+        "\n",
+        "// Nothing it asks for has a name here.\n",
+        "type DNSProvider interface {\n",
+        "\tlibdns.RecordGetter\n",
+        "\tlibdns.RecordSetter\n",
+        "}\n",
+    );
+
+    /// `testing/fake.go`: a project struct declaring every method
+    /// `testing.TB` has, at its counts, its unexported `private` included,
+    /// and a TBRun's `Run`; in a package whose directory is itself named
+    /// `testing`, its `private` is still not testing's.
+    fn fake_testing_tb() -> String {
+        let mut lines: Vec<String> = ["package testing", "", "type fakeTB struct{}", ""]
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        let mut methods =
+            codegraph_resolve::go_std_methods::go_std_methods(Some("testing"), "TB").unwrap();
+        methods.push(("Run", "2/1"));
+        for (name, arity) in methods {
+            let (params, results) = arity.split_once('/').unwrap();
+            let params: usize = params.parse().unwrap();
+            let results: usize = results.parse().unwrap();
+            let list: Vec<String> = (0..params).map(|index| format!("a{index} int")).collect();
+            let result = match results {
+                0 => String::new(),
+                1 => " int".to_string(),
+                _ => format!(" ({})", vec!["int"; results].join(", ")),
+            };
+            lines.push(format!(
+                "func (f *fakeTB) {name}({}){result} {{ panic(0) }}",
+                list.join(", ")
+            ));
+        }
+        format!("{}\n", lines.join("\n"))
+    }
+
+    fn stdlib() -> Indexed {
+        Project::new()
+            .file("go.mod", SL_GO_MOD)
+            .file("promql/promql.go", SL_PROMQL_PROMQL_GO)
+            .file("fileutil/fileutil.go", SL_FILEUTIL_FILEUTIL_GO)
+            .file("gin/response_writer.go", SL_GIN_RESPONSE_WRITER_GO)
+            .file("errs/errs.go", SL_ERRS_ERRS_GO)
+            .file("diag/diag.go", SL_DIAG_DIAG_GO)
+            .file("testing/fake.go", &fake_testing_tb())
+            .index()
+    }
+
+    /// Upstream: exactly the structs with every method, embedded ones
+    /// included, are linked; `testing.TB` and `io.Writer` ask for every
+    /// method, testing's own `private` and io's counts included; an embedded
+    /// `error` is recorded and stays outside the graph; a method a
+    /// standard-library embedding brings holds to its counts; an interface
+    /// embedding an undescribed type links to the same embedding, or to its
+    /// one candidate.
+    #[test]
+    fn w715b_standard_library_embeddings_bring_their_methods() {
+        let project = stdlib();
+        let graph = graph_of(&project);
+        assert_eq!(
+            struct_implements(graph),
+            [
+                "diag.LogBufferCore -> diag.LogBufferCoreInterface",
+                "diag.wrappedStream -> diag.ClientStream",
+                "errs.statusErr -> errs.coded",
+                "fileutil.FileBufReader -> fileutil.FileReader",
+                "fileutil.fileReader -> fileutil.FileReader",
+                // An *os.File is what prometheus's SegmentFile and syncWriter
+                // describe.
+                "fileutil.fileReader -> promql.SegmentFile",
+                "fileutil.fileReader -> promql.syncWriter",
+                "fileutil.lockProxy -> fileutil.LockClient",
+                "fileutil.waitRecorder -> fileutil.Locker",
+                "gin.responseWriter -> gin.ResponseWriter",
+                "promql.JSONFileLogger -> promql.QueryLogger",
+                "promql.Segment -> promql.syncWriter",
+                "promql.queryLogFile -> promql.syncWriter",
+                "promql.tRunner -> promql.TBRun",
+                "promql.testRunner -> promql.TBRun",
+            ],
+            "{}",
+            graph.report()
+        );
+
+        // Not the discoverer with a Run, nor fakeTB, whose private is its
+        // own package's.
+        let below = hierarchy(&project, one(graph, "interface TBRun")).expect("a hierarchy");
+        assert_eq!(
+            hierarchy_lines(&below.descendants, false),
+            ["implements promql.tRunner", "implements promql.testRunner"]
+        );
+        // Not walLog, whose Write takes a record and returns only an error.
+        let below = hierarchy(&project, one(graph, "interface syncWriter")).expect("a hierarchy");
+        assert_eq!(
+            hierarchy_lines(&below.descendants, false),
+            [
+                "implements fileutil.fileReader",
+                "implements promql.Segment",
+                "implements promql.queryLogFile",
+            ]
+        );
+        // A call through TBRun reaches tRunner's Run, not the discoverer's;
+        // testRunner's is testing's, outside the graph.
+        assert_eq!(
+            dispatch_targets(graph, "interface TBRun", "Run"),
+            ["tRunner::Run"]
+        );
+
+        for selector in ["struct statusErr", "interface coded"] {
+            let node = one(graph, selector);
+            let embedded: Vec<&str> = graph
+                .unresolved
+                .iter()
+                .filter(|reference| {
+                    reference.from_node_id == node.id && reference.reference_kind == "extends"
+                })
+                .map(|reference| reference.reference_name.as_str())
+                .collect();
+            assert_eq!(embedded, ["error"], "{selector}");
+            let declared: Vec<String> = graph
+                .edges
+                .iter()
+                .filter(|edge| {
+                    edge.source == node.id
+                        && (edge.kind == "extends" || edge.kind == "implements")
+                        && edge.provenance.as_deref() != Some("heuristic")
+                })
+                .map(|edge| graph.describe_edge(edge))
+                .collect();
+            assert!(declared.is_empty(), "{selector}: {declared:?}");
+        }
+
+        // waitRecorder's Lock and Unlock are sync.Mutex's: they take
+        // nothing.
+        assert_eq!(
+            implementers(graph, "interface Locker"),
+            ["fileutil.waitRecorder"]
+        );
+        assert_eq!(
+            implementers(graph, "interface LockClient"),
+            ["fileutil.lockProxy"]
+        );
+        // responseWriter's Header is http.ResponseWriter's, which
+        // ResponseWriter asks for.
+        assert_eq!(
+            implementers(graph, "interface ResponseWriter"),
+            ["gin.responseWriter"]
+        );
+
+        // Two structs have a Log: neither is known to be a plog.Logger.
+        assert_eq!(
+            implementers(graph, "interface Diagnostic"),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            implementers(graph, "interface LogBufferCoreInterface"),
+            ["diag.LogBufferCore"]
+        );
+        assert_eq!(
+            implementers(graph, "interface ClientStream"),
+            ["diag.wrappedStream"]
+        );
+        assert_eq!(
+            implementers(graph, "interface DNSProvider"),
+            Vec::<String>::new()
+        );
+    }
+
+    /// Upstream: a sync that changes what an interface embeds re-reads the
+    /// standard-library type it names.
+    #[test]
+    fn w715b_a_sync_that_changes_an_embedded_std_type_rereads_it() {
+        let api = "package api\n\nimport stdio \"io\"\n\ntype SyncWriter interface {\n\tstdio.Writer\n\tSync() error\n}\n";
+        let mut project = Project::new()
+            .file("go.mod", SL_GO_MOD)
+            .file("api/api.go", api)
+            .file(
+                "log/file.go",
+                "package log\n\ntype file struct{}\n\nfunc (f *file) Write(p []byte) (int, error) { return len(p), nil }\nfunc (f *file) Sync() error { return nil }\n",
+            )
+            .index();
+        let linked = |graph: &Graph| -> Vec<String> {
+            synthesized_by(graph, "implements", "go-implements")
+                .map(|edge| {
+                    format!(
+                        "{} -> {}",
+                        graph.node(&edge.source).unwrap().name,
+                        graph.node(&edge.target).unwrap().name
+                    )
+                })
+                .collect()
+        };
+        assert_eq!(linked(project.graph()), ["file -> SyncWriter"]);
+        // An io.Reader has to Read, which file can't.
+        project.write(
+            "api/api.go",
+            &api.replacen("stdio.Writer", "stdio.Reader", 1),
+        );
+        assert_eq!(linked(project.sync()), Vec::<String>::new());
+        project.write("api/api.go", api);
+        assert_eq!(linked(project.sync()), ["file -> SyncWriter"]);
+    }
+
+    // Upstream `go-implements-arity` (#2430, #2447): each wanted method also
+    // needs a declaration with its parameter and result counts, and a gRPC
+    // client interface takes its service's server arities too.
+
+    /// `go.mod`.
+    const AR_GO_MOD: &str = concat!("module example.com/app\n", "\n", "go 1.22\n",);
+
+    /// `rafthttp/http.go`.
+    const AR_RAFTHTTP_HTTP_GO: &str = concat!(
+        "package rafthttp\n",
+        "\n",
+        "import \"context\"\n",
+        "\n",
+        "type Peer interface{ attach() }\n",
+        "\n",
+        "type peerGetter interface {\n",
+        "\tGet(id uint64) Peer\n",
+        "}\n",
+        "\n",
+        "type Transport struct{}\n",
+        "\n",
+        "func (t *Transport) Get(id uint64) Peer { return nil }\n",
+        "\n",
+        "type Cache struct{}\n",
+        "\n",
+        "func (c *Cache) Get(ctx context.Context, key string, opts ...string) (string, error) {\n",
+        "\treturn \"\", nil\n",
+        "}\n",
+    );
+
+    /// `testutil/closer.go`.
+    const AR_TESTUTIL_CLOSER_GO: &str = concat!(
+        "package testutil\n",
+        "\n",
+        "type Closer interface {\n",
+        "\tClose()\n",
+        "}\n",
+        "\n",
+        "type tmpDir struct{}\n",
+        "\n",
+        "func (d *tmpDir) Close() {}\n",
+        "\n",
+        "type Block struct{}\n",
+        "\n",
+        "func (b *Block) Close() error { return nil }\n",
+        "\n",
+        "// Close is promoted from Block, still returning an error.\n",
+        "type wrapsBlock struct{ Block }\n",
+    );
+
+    /// `storage/storage.go`.
+    const AR_STORAGE_STORAGE_GO: &str = concat!(
+        "package storage\n",
+        "\n",
+        "type Appender interface {\n",
+        "\tAppend(\n",
+        "\t\tref uint64, // the series, or 0 (new)\n",
+        "\t\tv float64, /* sample, value */\n",
+        "\t) (uint64, error)\n",
+        "}\n",
+        "\n",
+        "type memAppender struct{}\n",
+        "\n",
+        "func (a *memAppender) Append(ref uint64, v float64) (uint64, error) { return ref, nil }\n",
+        "\n",
+        "type Putter interface {\n",
+        "\tPut(key, value []byte) error\n",
+        "}\n",
+        "\n",
+        "type boltStore struct{}\n",
+        "\n",
+        "func (s *boltStore) Put(k []byte, v []byte) error { return nil }\n",
+        "\n",
+        "type Conn struct{}\n",
+        "\n",
+        "type Dialer interface {\n",
+        "\tDial() (*Conn, error)\n",
+        "}\n",
+        "\n",
+        "type bridgeDialer struct{}\n",
+        "\n",
+        "func (b *bridgeDialer) Dial() (*Conn, error) { return nil, nil }\n",
+        "\n",
+        "type rwTimeoutDialer struct{}\n",
+        "\n",
+        "func (d *rwTimeoutDialer) Dial(network, address string) (*Conn, error) { return nil, nil }\n",
+    );
+
+    /// `generic/visit.go`.
+    const AR_GENERIC_VISIT_GO: &str = concat!(
+        "package generic\n",
+        "\n",
+        "type Pair[K comparable, V any] struct {\n",
+        "\tKey K\n",
+        "\tVal V\n",
+        "}\n",
+        "\n",
+        "type Visitor interface {\n",
+        "\tVisit(fn func(key, value string) error, p Pair[string, int]) (n int, err error)\n",
+        "}\n",
+        "\n",
+        "type walker struct{}\n",
+        "\n",
+        "func (w *walker) Visit(f func(k, v string) error, p Pair[string, int]) (int, error) { return 0, nil }\n",
+        "\n",
+        "type lister struct{}\n",
+        "\n",
+        "func (l *lister) Visit(f func(Pair[string, int]) bool) bool { return false }\n",
+        "\n",
+        "type Tagger interface {\n",
+        "\tTag(v struct {\n",
+        "\t\tA, B int `json:\"a,omitempty\" yaml:\"(b)\"`\n",
+        "\t}) string\n",
+        "}\n",
+        "\n",
+        "type tagger struct{}\n",
+        "\n",
+        "func (t tagger) Tag(v struct {\n",
+        "\tA, B int `json:\"a,omitempty\" yaml:\"(b)\"`\n",
+        "}) string {\n",
+        "\treturn \"\"\n",
+        "}\n",
+    );
+
+    /// `api/kv_grpc.pb.go`.
+    const AR_API_KV_GRPC_PB_GO: &str = concat!(
+        "// Code generated by protoc-gen-go-grpc. DO NOT EDIT.\n",
+        "\n",
+        "package api\n",
+        "\n",
+        "import (\n",
+        "\t\"context\"\n",
+        "\n",
+        "\t\"google.golang.org/grpc\"\n",
+        ")\n",
+        "\n",
+        "type RangeRequest struct{}\n",
+        "type RangeResponse struct{}\n",
+        "type ListRequest struct{}\n",
+        "type KV_ListClient struct{}\n",
+        "type KV_ListServer struct{}\n",
+        "type KV_WatchClient struct{}\n",
+        "type KV_WatchServer struct{}\n",
+        "\n",
+        "type KVClient interface {\n",
+        "\tRange(ctx context.Context, in *RangeRequest, opts ...grpc.CallOption) (*RangeResponse, error)\n",
+        "\tList(ctx context.Context, in *ListRequest, opts ...grpc.CallOption) (KV_ListClient, error)\n",
+        "\tWatch(ctx context.Context, opts ...grpc.CallOption) (KV_WatchClient, error)\n",
+        "}\n",
+        "\n",
+        "type kVClient struct {\n",
+        "\tcc grpc.ClientConnInterface\n",
+        "}\n",
+        "\n",
+        "func (c *kVClient) Range(ctx context.Context, in *RangeRequest, opts ...grpc.CallOption) (*RangeResponse, error) {\n",
+        "\treturn nil, nil\n",
+        "}\n",
+        "\n",
+        "func (c *kVClient) List(ctx context.Context, in *ListRequest, opts ...grpc.CallOption) (KV_ListClient, error) {\n",
+        "\treturn KV_ListClient{}, nil\n",
+        "}\n",
+        "\n",
+        "func (c *kVClient) Watch(ctx context.Context, opts ...grpc.CallOption) (KV_WatchClient, error) {\n",
+        "\treturn KV_WatchClient{}, nil\n",
+        "}\n",
+        "\n",
+        "type KVServer interface {\n",
+        "\tRange(context.Context, *RangeRequest) (*RangeResponse, error)\n",
+        "\tList(*ListRequest, KV_ListServer) error\n",
+        "\tWatch(KV_WatchServer) error\n",
+        "}\n",
+        "\n",
+        "type UnimplementedKVServer struct{}\n",
+        "\n",
+        "func (UnimplementedKVServer) Range(context.Context, *RangeRequest) (*RangeResponse, error) {\n",
+        "\treturn nil, nil\n",
+        "}\n",
+        "func (UnimplementedKVServer) List(*ListRequest, KV_ListServer) error { return nil }\n",
+        "func (UnimplementedKVServer) Watch(KV_WatchServer) error             { return nil }\n",
+    );
+
+    /// `server/kv.go`.
+    const AR_SERVER_KV_GO: &str = concat!(
+        "package server\n",
+        "\n",
+        "import (\n",
+        "\t\"context\"\n",
+        "\n",
+        "\t\"example.com/app/api\"\n",
+        "\t\"google.golang.org/grpc\"\n",
+        ")\n",
+        "\n",
+        "// Serves the KV service: a unary, a server-streaming and a bidi RPC.\n",
+        "type kvServer struct{}\n",
+        "\n",
+        "func (s *kvServer) Range(ctx context.Context, r *api.RangeRequest) (*api.RangeResponse, error) {\n",
+        "\treturn nil, nil\n",
+        "}\n",
+        "func (s *kvServer) List(r *api.ListRequest, stream api.KV_ListServer) error { return nil }\n",
+        "func (s *kvServer) Watch(stream api.KV_WatchServer) error                   { return nil }\n",
+        "\n",
+        "// What the server ranges through. The generated client has a Range too, with\n",
+        "// call options: it is no RaftKV.\n",
+        "type RaftKV interface {\n",
+        "\tRange(ctx context.Context, r *api.RangeRequest) (*api.RangeResponse, error)\n",
+        "}\n",
+        "\n",
+        "// An interface that mixes a client call with a method of its own is no\n",
+        "// gRPC client: what it asks for is what it takes.\n",
+        "type closingRanger interface {\n",
+        "\tRange(ctx context.Context, in *api.RangeRequest, opts ...grpc.CallOption) (*api.RangeResponse, error)\n",
+        "\tClose() error\n",
+        "}\n",
+        "\n",
+        "type rangeCloser struct{}\n",
+        "\n",
+        "func (c *rangeCloser) Range(ctx context.Context, r *api.RangeRequest) (*api.RangeResponse, error) {\n",
+        "\treturn nil, nil\n",
+        "}\n",
+        "func (c *rangeCloser) Close() error { return nil }\n",
+    );
+
+    /// `client/kv.go`.
+    const AR_CLIENT_KV_GO: &str = concat!(
+        "package client\n",
+        "\n",
+        "import (\n",
+        "\t\"context\"\n",
+        "\n",
+        "\t\"example.com/app/api\"\n",
+        ")\n",
+        "\n",
+        "type kv struct{ remote api.KVClient }\n",
+        "\n",
+        "func (k *kv) Range(key string) string          { return key }\n",
+        "func (k *kv) List(prefix string) []string      { return nil }\n",
+        "func (k *kv) Watch(key string) <-chan string   { return nil }\n",
+        "\n",
+        "func (k *kv) Get(ctx context.Context, key string) {\n",
+        "\tk.remote.Range(ctx, &api.RangeRequest{})\n",
+        "}\n",
+    );
+
+    /// `xds/transport.go`.
+    const AR_XDS_TRANSPORT_GO: &str = concat!(
+        "package xds\n",
+        "\n",
+        "type Transport struct{}\n",
+        "\n",
+        "type TransportBuilder interface {\n",
+        "\tBuild(serverURI string) (*Transport, error)\n",
+        "}\n",
+        "\n",
+        "type grpcTransportBuilder struct{}\n",
+        "\n",
+        "func (b *grpcTransportBuilder) Build(serverURI string) (*Transport, error) { return nil, nil }\n",
+    );
+
+    const BALANCERS: usize = 45;
+
+    /// `balancer/builders.go`: more builders with a `Build` of their own
+    /// than the cap, sorted before the one real implementer.
+    fn builders_go() -> String {
+        let mut lines: Vec<String> = [
+            "package balancer",
+            "",
+            "type ClientConn struct{}",
+            "type BuildOptions struct{}",
+            "type Balancer struct{}",
+            "",
+        ]
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+        lines.extend((0..BALANCERS).map(|index| {
+            let name = format!("builder{index:02}");
+            format!(
+                "type {name} struct{{}}\n\nfunc ({name}) Build(cc ClientConn, opts BuildOptions) Balancer {{ return Balancer{{}} }}\n"
+            )
+        }));
+        lines.join("\n")
+    }
+
+    fn arity() -> Indexed {
+        Project::new()
+            .file("go.mod", AR_GO_MOD)
+            .file("rafthttp/http.go", AR_RAFTHTTP_HTTP_GO)
+            .file("testutil/closer.go", AR_TESTUTIL_CLOSER_GO)
+            .file("storage/storage.go", AR_STORAGE_STORAGE_GO)
+            .file("generic/visit.go", AR_GENERIC_VISIT_GO)
+            .file("api/kv_grpc.pb.go", AR_API_KV_GRPC_PB_GO)
+            .file("server/kv.go", AR_SERVER_KV_GO)
+            .file("client/kv.go", AR_CLIENT_KV_GO)
+            .file("balancer/builders.go", &builders_go())
+            .file("xds/transport.go", AR_XDS_TRANSPORT_GO)
+            .index()
+    }
+
+    /// Upstream: only the structs whose methods take and return as many
+    /// values are linked, a call through an interface dispatches only to
+    /// methods Go could reach, and a struct failing the counts stays out of
+    /// the cap; a gRPC client interface reaches the servers of its service,
+    /// unary and streaming RPCs alike, but not a wrapper of other shapes,
+    /// and only an interface whose every method is a client call takes
+    /// server arities.
+    #[test]
+    fn w715b_implicit_satisfaction_checks_the_counts() {
+        let project = arity();
+        let graph = graph_of(&project);
+        assert_eq!(
+            struct_implements(graph),
+            [
+                "api.UnimplementedKVServer -> api.KVClient",
+                "api.UnimplementedKVServer -> api.KVServer",
+                "api.UnimplementedKVServer -> server.RaftKV",
+                "api.kVClient -> api.KVClient",
+                "generic.tagger -> generic.Tagger",
+                "generic.walker -> generic.Visitor",
+                "rafthttp.Transport -> rafthttp.peerGetter",
+                "server.kvServer -> api.KVClient",
+                "server.kvServer -> api.KVServer",
+                "server.kvServer -> server.RaftKV",
+                "server.rangeCloser -> server.RaftKV",
+                "storage.boltStore -> storage.Putter",
+                "storage.bridgeDialer -> storage.Dialer",
+                "storage.memAppender -> storage.Appender",
+                "testutil.tmpDir -> testutil.Closer",
+                "xds.grpcTransportBuilder -> xds.TransportBuilder",
+            ],
+            "{}",
+            graph.report()
+        );
+
+        assert_eq!(
+            dispatch_targets(graph, "interface peerGetter", "Get"),
+            ["Transport::Get"]
+        );
+        assert_eq!(
+            dispatch_targets(graph, "interface Closer", "Close"),
+            ["tmpDir::Close"]
+        );
+        // The generated client ranges with call options; RaftKV doesn't
+        // take them.
+        assert_eq!(
+            dispatch_targets(graph, "interface RaftKV", "Range"),
+            [
+                "UnimplementedKVServer::Range",
+                "kvServer::Range",
+                "rangeCloser::Range",
+            ]
+        );
+        assert_eq!(
+            implementers(graph, "interface TransportBuilder"),
+            ["xds.grpcTransportBuilder"]
+        );
+
+        for rpc in ["Range", "List", "Watch"] {
+            assert_eq!(
+                dispatch_targets(graph, "interface KVClient", rpc),
+                [
+                    format!("UnimplementedKVServer::{rpc}"),
+                    format!("kVClient::{rpc}"),
+                    format!("kvServer::{rpc}"),
+                ],
+                "{rpc}"
+            );
+        }
+        let client = one(graph, "interface KVClient");
+        let mut into: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.kind == "implements" && edge.target == client.id)
+            .map(|edge| pkg(graph, &edge.source))
+            .collect();
+        into.sort();
+        assert_eq!(
+            into,
+            [
+                "api.UnimplementedKVServer",
+                "api.kVClient",
+                "server.kvServer"
+            ]
+        );
+
+        for (selector, outgoing) in [
+            ("struct kv @client/kv.go", true),
+            ("interface closingRanger", false),
+        ] {
+            let node = one(graph, selector);
+            let linked: Vec<String> = graph
+                .edges
+                .iter()
+                .filter(|edge| {
+                    edge.kind == "implements"
+                        && if outgoing {
+                            edge.source == node.id
+                        } else {
+                            edge.target == node.id
+                        }
+                })
+                .map(|edge| graph.describe_edge(edge))
+                .collect();
+            assert!(linked.is_empty(), "{selector}: {linked:?}");
+        }
+    }
+
+    // Beyond upstream's tests: the owner lookup, the embedding qualifiers,
+    // promotion and the embedded `error` against Rust's own graph.
+
+    const OWN_TYPES_GO: &str = concat!(
+        "package svc\n",
+        "\n",
+        "import \"io\"\n",
+        "\n",
+        "type Store struct {\n",
+        "\tBase\n",
+        "}\n",
+        "\n",
+        "type Base struct{}\n",
+        "\n",
+        "func (b *Base) ping() {}\n",
+        "\n",
+        "type Saver interface {\n",
+        "\tSave(key string) error\n",
+        "\tio.Closer\n",
+        "}\n",
+        "\n",
+        "type HandlerFunc func(int)\n",
+        "\n",
+        "func (f HandlerFunc) Serve(n int) { f(n) }\n",
+        "\n",
+        "// A pipe closes through the io.Closer it embeds, outside the graph.\n",
+        "type Pipe struct {\n",
+        "\tio.Closer\n",
+        "}\n",
+        "\n",
+        "type Shutter interface {\n",
+        "\tClose() error\n",
+        "}\n",
+    );
+
+    const OWN_METHODS_GO: &str = concat!(
+        "package svc\n",
+        "\n",
+        "func (s *Store) Save(key string) error { return nil }\n",
+        "\n",
+        "func (s Store) Close() error { return nil }\n",
+    );
+
+    /// A method declared in another file of its package, and any method of
+    /// a defined type, gets its type as owner (`go-method-contains`, no
+    /// provenance); a namesake type of another package does not own it, and
+    /// a method extraction already attached keeps only its parsed edge. The
+    /// dispatch pass reads the new edges: a call through `Saver` reaches
+    /// `Store`'s `Save`. A struct with `io.Closer`'s `Close` satisfies an
+    /// interface asking for it, and a call through the interface reaches no
+    /// method of the graph for it.
+    #[test]
+    fn w715b_a_method_elsewhere_in_its_package_gets_its_owner() {
+        let project = Project::new()
+            .file("go.mod", "module example.com/app\n\ngo 1.22\n")
+            .file("svc/types.go", OWN_TYPES_GO)
+            .file("svc/methods.go", OWN_METHODS_GO)
+            .file("other/types.go", "package other\n\ntype Store struct{}\n")
+            .index();
+        let graph = graph_of(&project);
+        for (owner, method) in [
+            ("struct Store @svc/types.go", "method Store::Save"),
+            ("struct Store @svc/types.go", "method Store::Close"),
+            ("type_alias HandlerFunc", "method HandlerFunc::Serve"),
+        ] {
+            let edges = graph.edges_matching(owner, "contains", method);
+            assert_eq!(edges.len(), 1, "{owner} -> {method}:\n{}", graph.report());
+            assert_eq!(edges[0].metadata["synthesizedBy"], "go-method-contains");
+            assert_eq!(edges[0].provenance, None);
+            assert_eq!(edges[0].line, Some(one(graph, method).start_line));
+            assert!(
+                graph
+                    .edges_matching("struct Store @other/types.go", "contains", method)
+                    .is_empty()
+            );
+        }
+        let ping = graph.edges_matching("struct Base", "contains", "method Base::ping");
+        assert_eq!(ping.len(), 1, "{}", graph.report());
+        assert!(ping[0].metadata.get("synthesizedBy").is_none(), "{ping:?}");
+
+        assert_eq!(
+            dispatch_targets(graph, "interface Saver", "Save"),
+            ["Store::Save"]
+        );
+        assert_eq!(implementers(graph, "interface Saver"), ["svc.Store"]);
+        assert_eq!(
+            implementers(graph, "interface Shutter"),
+            ["svc.Pipe", "svc.Store"]
+        );
+        assert_eq!(
+            dispatch_targets(graph, "interface Shutter", "Close"),
+            ["Store::Close"]
+        );
+    }
+
+    /// A type written through a package name the file does not import is
+    /// no standard-library type: it brings no methods.
+    #[test]
+    fn w715b_a_written_qualifier_without_its_import_is_opaque() {
+        let project = Project::new()
+            .file("go.mod", "module example.com/app\n\ngo 1.22\n")
+            .file(
+                "w/a.go",
+                "package w\n\nimport \"io\"\n\ntype Writer2 interface {\n\tWrite(p []byte) (int, error)\n}\n\ntype W2 struct {\n\tio.Writer\n}\n",
+            )
+            .file("w/b.go", "package w\n\ntype W struct {\n\tio.Writer\n}\n")
+            .index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            implementers(graph, "interface Writer2"),
+            ["w.W2"],
+            "{}",
+            graph.report()
+        );
+    }
+
+    const PROMOTION_GO: &str = concat!(
+        "package p\n",
+        "\n",
+        "type Runner interface {\n",
+        "\tRun()\n",
+        "\tStop()\n",
+        "}\n",
+        "\n",
+        "type A struct{}\n",
+        "\n",
+        "func (A) Run() {}\n",
+        "\n",
+        "type B struct{}\n",
+        "\n",
+        "func (B) Run() {}\n",
+        "\n",
+        "// One path to one struct providing Run: the promoted method runs.\n",
+        "type One struct {\n",
+        "\tA\n",
+        "}\n",
+        "\n",
+        "func (One) Stop() {}\n",
+        "\n",
+        "// Two embeddings at one depth provide Run: Go selects neither.\n",
+        "type Two struct {\n",
+        "\tA\n",
+        "\tB\n",
+        "}\n",
+        "\n",
+        "func (Two) Stop() {}\n",
+        "\n",
+        "type RunnerOnly interface {\n",
+        "\tRun()\n",
+        "}\n",
+        "\n",
+        "type Holder struct {\n",
+        "\tRunnerOnly\n",
+        "}\n",
+        "\n",
+        "// Run comes through an interface its embedded struct embeds: a call\n",
+        "// through it dispatches again.\n",
+        "type Deep struct {\n",
+        "\tHolder\n",
+        "}\n",
+        "\n",
+        "func (Deep) Stop() {}\n",
+        "\n",
+        "type Pinger interface {\n",
+        "\tPing()\n",
+        "\tPong()\n",
+        "}\n",
+        "\n",
+        "type P struct{}\n",
+        "\n",
+        "func (P) Ping() {}\n",
+        "\n",
+        "type Q struct{}\n",
+        "\n",
+        "func (Q) Pong() {}\n",
+        "\n",
+        "// No method of its own: both of Pinger's are promoted.\n",
+        "type R struct {\n",
+        "\tP\n",
+        "\tQ\n",
+        "}\n",
+        "\n",
+        "type Walker interface {\n",
+        "\tWalk()\n",
+        "\tHalt()\n",
+        "}\n",
+        "\n",
+        "type C struct{}\n",
+        "\n",
+        "func (C) Walk() {}\n",
+        "\n",
+        "type D struct{}\n",
+        "\n",
+        "func (D) Walk() {}\n",
+        "\n",
+        "// Two embeddings at one depth provide Walk and neither type is linked\n",
+        "// otherwise: Go selects neither.\n",
+        "type Pair struct {\n",
+        "\tC\n",
+        "\tD\n",
+        "}\n",
+        "\n",
+        "func (Pair) Halt() {}\n",
+    );
+
+    /// A struct satisfying an interface with a promoted method runs the
+    /// embedded struct's method (`promotedInto`, wired at the embedding);
+    /// two paths at one depth, or an interface providing it, promote
+    /// nothing.
+    #[test]
+    fn w715b_a_promotion_needs_one_path_to_a_struct() {
+        let project = Project::new()
+            .file("go.mod", "module example.com/app\n\ngo 1.22\n")
+            .file("p/p.go", PROMOTION_GO)
+            .index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            implementers(graph, "interface Runner"),
+            ["p.Deep", "p.One", "p.Two"],
+            "{}",
+            graph.report()
+        );
+        let embedding = PROMOTION_GO
+            .split('\n')
+            .position(|line| line == "type One struct {")
+            .unwrap()
+            + 2;
+        assert_eq!(
+            dispatch(graph, "interface Runner", "Run"),
+            [format!("A::Run <- One @p/p.go:{embedding}")],
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            dispatch(graph, "interface Runner", "Stop"),
+            ["Deep::Stop", "One::Stop", "Two::Stop"]
+        );
+        // Neither of two providers at one depth is promoted, where no other
+        // edge holds the pair.
+        assert_eq!(implementers(graph, "interface Walker"), ["p.Pair"]);
+        assert_eq!(
+            dispatch(graph, "interface Walker", "Walk"),
+            Vec::<String>::new()
+        );
+        assert_eq!(dispatch(graph, "interface Walker", "Halt"), ["Pair::Halt"]);
+        // A struct declaring no method satisfies an interface with promoted
+        // methods alone.
+        assert_eq!(implementers(graph, "interface Pinger"), ["p.R"]);
+        let line = |text: &str| {
+            PROMOTION_GO
+                .split('\n')
+                .position(|line| line == text)
+                .unwrap()
+                + 1
+        };
+        let r = line("type R struct {");
+        assert_eq!(
+            dispatch(graph, "interface Pinger", "Ping"),
+            [format!("P::Ping <- R @p/p.go:{}", r + 1)]
+        );
+        assert_eq!(
+            dispatch(graph, "interface Pinger", "Pong"),
+            [format!("Q::Pong <- R @p/p.go:{}", r + 2)]
+        );
+    }
+
+    /// An embedded `error` is recorded and stays unresolved, though another
+    /// language declares a function of that name; it brings `Error`.
+    #[test]
+    fn w715b_an_embedded_error_stays_unresolved() {
+        let project = Project::new()
+            .file("go.mod", "module example.com/app\n\ngo 1.22\n")
+            .file(
+                "e/e.go",
+                "package e\n\ntype Coded interface {\n\terror\n\tCode() int\n}\n\ntype statusErr struct {\n\terror\n}\n\nfunc (statusErr) Code() int { return 0 }\n",
+            )
+            .file("web/log.js", "export function error() {}\n")
+            .index();
+        let graph = graph_of(&project);
+        for selector in ["struct statusErr", "interface Coded"] {
+            assert_eq!(
+                graph
+                    .unresolved_matching(selector, "extends", "error")
+                    .len(),
+                1,
+                "{selector}:\n{}",
+                graph.report()
+            );
+            for kind in ["extends", "implements"] {
+                assert!(
+                    graph
+                        .edges_matching(selector, kind, "function error")
+                        .is_empty()
+                );
+            }
+        }
+        assert_eq!(implementers(graph, "interface Coded"), ["e.statusErr"]);
     }
 }

@@ -231,6 +231,33 @@ impl Store {
         query_nodes(&self.conn, &sql, rusqlite::params_from_iter(values))
     }
 
+    /// The nodes of `kinds` written in `languages` (the filter of upstream
+    /// `iterateNodesByKindIn`, W7-15). Unordered.
+    pub fn nodes_of_kinds_in_languages(
+        &self,
+        kinds: &[NodeKind],
+        languages: &[Language],
+    ) -> rusqlite::Result<Vec<Node>> {
+        if kinds.is_empty() || languages.is_empty() {
+            return Ok(Vec::new());
+        }
+        let slots = |count: usize| {
+            std::iter::repeat_n("?", count)
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        let sql = format!(
+            "SELECT * FROM nodes WHERE kind IN ({}) AND language IN ({})",
+            slots(kinds.len()),
+            slots(languages.len())
+        );
+        let values = kinds
+            .iter()
+            .map(|kind| kind.as_str())
+            .chain(languages.iter().map(|language| language.as_str()));
+        query_nodes(&self.conn, &sql, rusqlite::params_from_iter(values))
+    }
+
     /// The `language` nodes whose decorator list may hold `decorator`: its
     /// JSON text contains the quoted name, a superset the caller narrows by
     /// the exact list (upstream `iterateNodesByLanguageWithDecorator`, W7-14).
@@ -799,6 +826,53 @@ impl Store {
                 params![target_id],
             ),
         }
+    }
+
+    /// The edges of `kind` into any of `targets`: what
+    /// [`Self::edges_by_target_kind`] returns for each, read with one query
+    /// a chunk of [`SQLITE_PARAM_CHUNK_SIZE`] distinct targets (W7-15b). The
+    /// rows into one target keep that query's order, as both read
+    /// `idx_edges_target_kind`; the targets come in no particular order.
+    pub fn edges_by_targets_kind(
+        &self,
+        targets: &[String],
+        kind: EdgeKind,
+    ) -> rusqlite::Result<Vec<Edge>> {
+        self.edges_by_ends_kind("target", targets, kind)
+    }
+
+    /// The edges of `kind` out of any of `sources`, as
+    /// [`Self::edges_by_targets_kind`] reads into its targets
+    /// (`idx_edges_source_kind`).
+    pub fn edges_by_sources_kind(
+        &self,
+        sources: &[String],
+        kind: EdgeKind,
+    ) -> rusqlite::Result<Vec<Edge>> {
+        self.edges_by_ends_kind("source", sources, kind)
+    }
+
+    fn edges_by_ends_kind(
+        &self,
+        end: &str,
+        ids: &[String],
+        kind: EdgeKind,
+    ) -> rusqlite::Result<Vec<Edge>> {
+        let mut unique: Vec<&str> = ids.iter().map(String::as_str).collect();
+        unique.sort_unstable();
+        unique.dedup();
+        let kind = kind.as_str();
+        let mut edges = Vec::new();
+        for chunk in unique.chunks(SQLITE_PARAM_CHUNK_SIZE) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!("SELECT * FROM edges WHERE {end} IN ({placeholders}) AND kind = ?");
+            let mut params = chunk.iter().map(|id| id as &dyn ToSql).collect::<Vec<_>>();
+            params.push(&kind);
+            edges.extend(query_edges(&self.conn, &sql, params.as_slice())?);
+        }
+        Ok(edges)
     }
 
     /// Ports `upsertFile` from `upstream db/queries.ts:1426-1455`.

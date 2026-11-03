@@ -107,7 +107,10 @@ A synthesized edge, one the resolver infers rather than reads from a call site
 `provenance = 'heuristic'` and a `metadata` object with `synthesizedBy` (the pass
 that made it) and, when the wiring happens elsewhere, `registeredAt`
 (`path:line` of the registration). Consumers such as the type hierarchy and the
-named-symbol flow recognize synthesized edges by that provenance value. Only the
+named-symbol flow recognize synthesized edges by that provenance value. The
+one exception is `go-method-contains`: its `contains` edge from a Go type to a
+method of its package declared outside the type's file has no provenance, as
+a parsed `contains` edge has, and only its `synthesizedBy` marks it. Only the
 synthesis stage writes them: it replaces every edge whose metadata names
 `synthesizedBy` in one transaction, and a sync's reference-site queries and
 deletions leave such edges alone, so the rest of the graph is what a fresh index
@@ -471,7 +474,7 @@ persisted, and withdrawn with the others before a sync's first change. A sync
 that finds it missing or at another version re-resolves every Rust file. It is
 not a canonical surface.
 
-`synthesis_version` (4) vouches that the synthesized edges are the synthesis
+`synthesis_version` (5) vouches that the synthesized edges are the synthesis
 stage's output over the current base graph. A full index and a migration write
 it after the stage. A sync withdraws it before its first change, before a lane
 bootstrap's first write and before the orphan sweep, and, when it changed the

@@ -8943,7 +8943,8 @@ fn has_type_annotation_refs(language: Language) -> bool {
 
 /// The name node of the type a Go embedding names (upstream
 /// `goEmbeddedTypeName`): `Base`, `pkg.Base` by `Base`, `Base[T]` by `Base`;
-/// a predeclared type is none.
+/// a predeclared type is none but `error`, an interface with a method that
+/// an embedding brings in like any type's from outside the index (#2759).
 fn go_embedded_type_name<'tree>(
     ty: Option<SyntaxNode<'tree>>,
     source: &str,
@@ -8957,8 +8958,11 @@ fn go_embedded_type_name<'tree>(
     if ty.kind() == "qualified_type" {
         return child_by_field(ty, "name");
     }
-    (ty.kind() == "type_identifier" && !is_go_predeclared_type(&node_text(ty, source)))
-        .then_some(ty)
+    if ty.kind() != "type_identifier" {
+        return None;
+    }
+    let name = node_text(ty, source);
+    (name == "error" || !is_go_predeclared_type(&name)).then_some(ty)
 }
 
 /// Whether code comes before `node` on the line it starts on.

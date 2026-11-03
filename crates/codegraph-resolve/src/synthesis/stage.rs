@@ -16,7 +16,7 @@ use codegraph_core::types::{Edge, EdgeKind, Language, Node, NodeKind, Unresolved
 use codegraph_store::Store;
 use codegraph_store::queries::ReferenceSite;
 
-use super::{callback, dispatch, iface, is_synthesized, jsx, registry};
+use super::{callback, dispatch, go, iface, is_synthesized, jsx, registry};
 
 /// What one run of the stage did.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -41,6 +41,15 @@ type Gate = fn(&HashSet<Language>) -> bool;
 fn always(_: &HashSet<Language>) -> bool {
     true
 }
+
+/// Upstream's prerequisite steps (CS:5265-5295), in their order: each
+/// step's edges join the view before the next step and the passes run, so
+/// all of them read those edges as base edges, and they are written beside
+/// the merged edges, never merged with them (upstream inserts them first).
+const PREREQUISITES: &[(&str, Gate, Pass)] = &[
+    ("goMethodContains", go::gate, go::method_contains_edges),
+    ("goImplements", go::gate, go::implements_edges),
+];
 
 /// The ported passes in upstream `SYNTH_PASSES` order, which is the merge
 /// order: the first pass to emit a `source>target` pair keeps it.
@@ -94,18 +103,36 @@ pub fn run_stage(store: &mut Store, project_root: &Path, max_file_size: u64) -> 
     })
 }
 
-/// Every synthesized edge over `store`'s base graph: each pass's, merged in
-/// registry order, sorted.
+/// Every synthesized edge over `store`'s base graph: each prerequisite
+/// step's, and each pass's merged in registry order, sorted.
 pub fn synthesize(store: &Store, project_root: &Path, max_file_size: u64) -> Result<Vec<Edge>> {
-    let view = View::new(store, project_root, max_file_size);
+    let mut view = View::new(store, project_root, max_file_size);
     let languages = view.file_languages()?;
+    let mut edges = Vec::new();
+    for (_, gate, step) in PREREQUISITES {
+        if gate(&languages) {
+            let made = step(&view)?;
+            view.overlay.extend(made.iter().cloned());
+            edges.extend(made);
+        }
+    }
     let mut passes = Vec::with_capacity(PASSES.len());
     for (_, gate, pass) in PASSES {
         if gate(&languages) {
             passes.push(pass(&view)?);
         }
     }
-    Ok(merge(passes))
+    Ok(combine(edges, passes))
+}
+
+/// The stage's output: the prerequisite steps' edges as they are (upstream
+/// inserts them before the passes run) beside the passes' merged ones,
+/// sorted.
+fn combine(prerequisites: Vec<Edge>, passes: Vec<Vec<Edge>>) -> Vec<Edge> {
+    let mut edges = prerequisites;
+    edges.extend(merge(passes));
+    edges.sort_by(edge_order);
+    edges
 }
 
 /// Upstream's merge: each edge takes its `source>target` key, and a later
@@ -160,9 +187,9 @@ pub(super) struct View<'a> {
     store: &'a Store,
     project_root: PathBuf,
     max_file_size: u64,
-    /// Edges the stage's prerequisite passes make visible to the later ones
-    /// (W7-15's Go `contains` and `implements`); none yet.
-    overlay: Vec<Edge>,
+    /// The edges of the stage's [`PREREQUISITES`], which the later steps
+    /// and the passes read beside the base graph's.
+    overlay: Overlay,
     texts: RefCell<HashMap<String, Option<Arc<str>>>>,
 }
 
@@ -172,7 +199,7 @@ impl<'a> View<'a> {
             store,
             project_root: project_root.to_path_buf(),
             max_file_size,
-            overlay: Vec::new(),
+            overlay: Overlay::default(),
             texts: RefCell::new(HashMap::new()),
         }
     }
@@ -186,12 +213,7 @@ impl<'a> View<'a> {
             .into_iter()
             .filter(|edge| !is_synthesized(edge))
             .collect();
-        edges.extend(
-            self.overlay
-                .iter()
-                .filter(|edge| edge.target == target && edge.kind == kind)
-                .cloned(),
-        );
+        edges.extend(self.overlay.reaching(target, kind).cloned());
         edges.sort_by(edge_end_order(|edge| &edge.source));
         Ok(edges)
     }
@@ -205,14 +227,61 @@ impl<'a> View<'a> {
             .into_iter()
             .filter(|edge| !is_synthesized(edge))
             .collect();
-        edges.extend(
-            self.overlay
-                .iter()
-                .filter(|edge| edge.source == source && edge.kind == kind)
-                .cloned(),
-        );
+        edges.extend(self.overlay.out_of(source, kind).cloned());
         edges.sort_by(edge_end_order(|edge| &edge.target));
         Ok(edges)
+    }
+
+    /// [`Self::edges_into`] of each of `targets`, by target: the same edges
+    /// in the same order, read with one query a chunk of targets rather
+    /// than one a target (W7-15b's cost revision). A target without edges
+    /// has no entry.
+    pub(super) fn edges_into_each(
+        &self,
+        targets: &[String],
+        kind: EdgeKind,
+    ) -> Result<HashMap<String, Vec<Edge>>> {
+        let mut by_end: HashMap<String, Vec<Edge>> = HashMap::new();
+        for edge in self.store.edges_by_targets_kind(targets, kind)? {
+            if !is_synthesized(&edge) {
+                by_end.entry(edge.target.clone()).or_default().push(edge);
+            }
+        }
+        for target in targets.iter().collect::<HashSet<_>>() {
+            let overlay: Vec<Edge> = self.overlay.reaching(target, kind).cloned().collect();
+            if !overlay.is_empty() {
+                by_end.entry(target.clone()).or_default().extend(overlay);
+            }
+        }
+        for edges in by_end.values_mut() {
+            edges.sort_by(edge_end_order(|edge| &edge.source));
+        }
+        Ok(by_end)
+    }
+
+    /// [`Self::edges_from`] of each of `sources`, by source, read as
+    /// [`Self::edges_into_each`] reads into its targets.
+    pub(super) fn edges_from_each(
+        &self,
+        sources: &[String],
+        kind: EdgeKind,
+    ) -> Result<HashMap<String, Vec<Edge>>> {
+        let mut by_end: HashMap<String, Vec<Edge>> = HashMap::new();
+        for edge in self.store.edges_by_sources_kind(sources, kind)? {
+            if !is_synthesized(&edge) {
+                by_end.entry(edge.source.clone()).or_default().push(edge);
+            }
+        }
+        for source in sources.iter().collect::<HashSet<_>>() {
+            let overlay: Vec<Edge> = self.overlay.out_of(source, kind).cloned().collect();
+            if !overlay.is_empty() {
+                by_end.entry(source.clone()).or_default().extend(overlay);
+            }
+        }
+        for edges in by_end.values_mut() {
+            edges.sort_by(edge_end_order(|edge| &edge.target));
+        }
+        Ok(by_end)
     }
 
     /// Every base edge of `kind`, and the overlay's.
@@ -223,17 +292,17 @@ impl<'a> View<'a> {
             .into_iter()
             .filter(|edge| !is_synthesized(edge))
             .collect();
-        edges.extend(
-            self.overlay
-                .iter()
-                .filter(|edge| edge.kind == kind)
-                .cloned(),
-        );
+        edges.extend(self.overlay.of_kind(kind).cloned());
         Ok(edges)
     }
 
     pub(super) fn node(&self, id: &str) -> Result<Option<Node>> {
         Ok(self.store.node_by_id(id)?)
+    }
+
+    /// The nodes of `ids` that exist, by id, read with one query a chunk.
+    pub(super) fn nodes(&self, ids: &[String]) -> Result<HashMap<String, Node>> {
+        Ok(self.store.nodes_by_ids(ids)?)
     }
 
     /// The nodes whose qualified name is `qualified`, in [`node_order`].
@@ -259,6 +328,18 @@ impl<'a> View<'a> {
     pub(super) fn nodes_in_file(&self, file: &str) -> Result<Vec<Node>> {
         let mut nodes = self.store.nodes_by_file_path(file)?;
         nodes.sort_by(|a, b| (a.start_line, &a.id).cmp(&(b.start_line, &b.id)));
+        Ok(nodes)
+    }
+
+    /// The nodes of `kinds` written in `languages`, in [`node_order`]
+    /// (upstream `iterateNodesByKindIn`).
+    pub(super) fn nodes_of_kinds_in(
+        &self,
+        kinds: &[NodeKind],
+        languages: &[Language],
+    ) -> Result<Vec<Node>> {
+        let mut nodes = self.store.nodes_of_kinds_in_languages(kinds, languages)?;
+        nodes.sort_by(node_order);
         Ok(nodes)
     }
 
@@ -314,6 +395,12 @@ impl<'a> View<'a> {
         Ok(files)
     }
 
+    /// Every unresolved reference of `kind`, in row order: what resolution
+    /// left of it.
+    pub(super) fn unresolved_refs_of_kind(&self, kind: EdgeKind) -> Result<Vec<UnresolvedRef>> {
+        Ok(self.store.unresolved_refs_of_kind(kind)?)
+    }
+
     /// The stored references (`unresolved_refs` and `resolved_refs`) at
     /// `site`.
     pub(super) fn refs_at(&self, site: ReferenceSite) -> Result<Vec<UnresolvedRef>> {
@@ -355,6 +442,49 @@ impl<'a> View<'a> {
             return None;
         }
         Some(Arc::from(text))
+    }
+}
+
+/// The prerequisite steps' edges, indexed by each end.
+#[derive(Default)]
+struct Overlay {
+    edges: Vec<Edge>,
+    by_source: HashMap<String, Vec<usize>>,
+    by_target: HashMap<String, Vec<usize>>,
+}
+
+impl Overlay {
+    fn extend(&mut self, edges: impl IntoIterator<Item = Edge>) {
+        for edge in edges {
+            let at = self.edges.len();
+            self.by_source
+                .entry(edge.source.clone())
+                .or_default()
+                .push(at);
+            self.by_target
+                .entry(edge.target.clone())
+                .or_default()
+                .push(at);
+            self.edges.push(edge);
+        }
+    }
+
+    fn at<'o>(&'o self, slots: Option<&'o Vec<usize>>) -> impl Iterator<Item = &'o Edge> {
+        slots.into_iter().flatten().map(|&at| &self.edges[at])
+    }
+
+    fn out_of(&self, source: &str, kind: EdgeKind) -> impl Iterator<Item = &Edge> {
+        self.at(self.by_source.get(source))
+            .filter(move |edge| edge.kind == kind)
+    }
+
+    fn reaching(&self, target: &str, kind: EdgeKind) -> impl Iterator<Item = &Edge> {
+        self.at(self.by_target.get(target))
+            .filter(move |edge| edge.kind == kind)
+    }
+
+    fn of_kind(&self, kind: EdgeKind) -> impl Iterator<Item = &Edge> {
+        self.edges.iter().filter(move |edge| edge.kind == kind)
     }
 }
 
@@ -500,6 +630,32 @@ mod tests {
         );
     }
 
+    /// A prerequisite step's edge takes no `source>target` key: a pass's
+    /// edge between the same two nodes is kept beside it.
+    #[test]
+    fn combine_keeps_prerequisite_edges_out_of_the_merge() {
+        let contains = Edge {
+            kind: EdgeKind::Contains,
+            provenance: None,
+            ..synthesized("a", "b", "go-method-contains")
+        };
+        let combined = combine(
+            vec![contains],
+            vec![vec![synthesized("a", "b", "callback")]],
+        );
+        let rows: Vec<(&str, &str, &str)> = combined
+            .iter()
+            .map(|edge| {
+                (
+                    edge.source.as_str(),
+                    edge.target.as_str(),
+                    edge.kind.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(rows, [("a", "b", "calls"), ("a", "b", "contains")]);
+    }
+
     /// A pass reads the base graph: the stored synthesized edges of the last
     /// stage are outside the view, as a fresh index has none before it.
     #[test]
@@ -609,6 +765,104 @@ mod tests {
                 ("s1".to_string(), "b".to_string())
             ]
         );
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The batched reads give each end what its own read gives: base edges
+    /// and the overlay's, without the stored synthesized ones, in the same
+    /// order; ids asked twice, ends without edges and more ends than one
+    /// chunk holds included. Each parent's methods are `methods_of`'s.
+    #[test]
+    fn the_batched_reads_are_the_single_ones() {
+        let (mut store, dir) = temp_store("batched");
+        let at = |id: &str, kind: NodeKind| Node {
+            kind,
+            ..function(id, "src/a.ts")
+        };
+        store
+            .upsert_nodes(&[
+                at("t", NodeKind::Class),
+                at("u", NodeKind::Class),
+                at("m1", NodeKind::Method),
+                at("m2", NodeKind::Method),
+                at("f", NodeKind::Function),
+            ])
+            .unwrap();
+        let contains = |source: &str, target: &str, line: Option<i64>| Edge {
+            kind: EdgeKind::Contains,
+            line,
+            metadata: None,
+            provenance: None,
+            ..synthesized(source, target, "base")
+        };
+        store
+            .insert_edges(&[
+                contains("t", "m2", Some(4)),
+                contains("t", "f", Some(2)),
+                contains("t", "m1", Some(9)),
+                contains("u", "m1", None),
+                Edge {
+                    kind: EdgeKind::Contains,
+                    ..synthesized("u", "m2", "go-method-contains")
+                },
+            ])
+            .unwrap();
+        let mut view = View::new(&store, &dir, 1 << 20);
+        view.overlay
+            .extend([contains("u", "m2", Some(1)), contains("t", "m1", Some(1))]);
+        let mut ids: Vec<String> = (0..1100).map(|n| format!("absent{n}")).collect();
+        ids.extend(["t", "u", "m1", "m2", "f", "t", "m1"].map(String::from));
+        let ends = |edges: &[Edge]| -> Vec<(String, String, Option<i64>)> {
+            edges
+                .iter()
+                .map(|edge| (edge.source.clone(), edge.target.clone(), edge.line))
+                .collect()
+        };
+        let into = view.edges_into_each(&ids, EdgeKind::Contains).unwrap();
+        let from = view.edges_from_each(&ids, EdgeKind::Contains).unwrap();
+        let methods = super::super::dispatch::methods_of_each(&view, &ids).unwrap();
+        for id in &ids {
+            let single = view.edges_into(id, EdgeKind::Contains).unwrap();
+            assert_eq!(
+                ends(into.get(id).map_or(&[][..], Vec::as_slice)),
+                ends(&single),
+                "into {id}"
+            );
+            let single = view.edges_from(id, EdgeKind::Contains).unwrap();
+            assert_eq!(
+                ends(from.get(id).map_or(&[][..], Vec::as_slice)),
+                ends(&single),
+                "from {id}"
+            );
+            let single: Vec<String> = super::super::dispatch::methods_of(&view, id)
+                .unwrap()
+                .into_iter()
+                .map(|node| node.id)
+                .collect();
+            let batched: Vec<String> = methods[id].iter().map(|node| node.id.clone()).collect();
+            assert_eq!(batched, single, "methods of {id}");
+        }
+        assert_eq!(
+            ends(&from["t"]),
+            [
+                ("t".to_string(), "f".to_string(), Some(2)),
+                ("t".to_string(), "m1".to_string(), Some(1)),
+                ("t".to_string(), "m1".to_string(), Some(9)),
+                ("t".to_string(), "m2".to_string(), Some(4)),
+            ]
+        );
+        assert_eq!(
+            methods["t"]
+                .iter()
+                .map(|node| node.id.as_str())
+                .collect::<Vec<_>>(),
+            ["m1", "m1", "m2"]
+        );
+        let found = view.nodes(&ids).unwrap();
+        let mut found: Vec<&str> = found.keys().map(String::as_str).collect();
+        found.sort_unstable();
+        assert_eq!(found, ["f", "m1", "m2", "t", "u"]);
         drop(store);
         std::fs::remove_dir_all(dir).unwrap();
     }

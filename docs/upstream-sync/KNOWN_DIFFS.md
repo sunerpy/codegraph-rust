@@ -69,19 +69,16 @@ colby behaviors are intentionally NOT ported in v1:
 - **Dynamic-dispatch synthesis passes** — of `SYNTH_PASSES`
   (`callback-synthesizer.ts`), the field, closure-collection, emitter,
   render, JSX, Pascal form, Flutter, C++ override, interface override, Kotlin
-  expect/actual, MyBatis and object-registry passes are ported
-  (`crates/codegraph-resolve/src/synthesis/`); the others and the Go
-  prerequisites (`go-method-contains`, `go-implements`) draw no edge here
+  expect/actual, MyBatis and object-registry passes and the Go prerequisites
+  (`go-method-contains`, `go-implements`) are ported
+  (`crates/codegraph-resolve/src/synthesis/`); the others draw no edge here
   yet. The ported passes and the merge keep `b635dd46`'s view of Jest/Vitest
   manual mocks: #2790's skip of a `__mocks__/` handler for production code
   is a PORT row of the 2026-10-22 audit, left with the rest of that row to
   the next round. The C++ override pass is `b635dd46`'s too: #2609's skip of
   a member template's explicit specialization, which shares the template's
-  name, is a PORT row of the same audit, left with its extraction half. The
-  interface override pass keys a method by its name, as `b635dd46` does, and
-  has no Go promotion: #2746's package key for an unexported Go method and
-  the methods a Go struct gets from what it embeds come with the Go
-  prerequisites. A TypeScript abstract method and an ArkTS interface's method
+  name, is a PORT row of the same audit, left with its extraction half. A
+  TypeScript abstract method and an ArkTS interface's method
   signature are no nodes here (#2653, a PORT row of the same audit, and the
   ArkTS spec's missing `method_signature`), so a call through either reaches
   no implementation.
@@ -504,7 +501,11 @@ listed.
   the ones its file row records, the MCP engine's freshness probe; a drifted
   file reads as absent until its sync recomputes the stage, never sliced by
   its old nodes' lines. colby reads the file as it is on disk
-  (`synthesis/stage.rs`).
+  (`synthesis/stage.rs`). The Go steps read from that text the package an
+  embedding of a type outside the index is written through, so an
+  embedding in a drifted file brings no method and matches no other
+  type's; colby reads it through its resolution context
+  (`synthesis/go.rs`, W7-15b).
 
 ### Extraction
 

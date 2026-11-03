@@ -310,6 +310,48 @@ mod tests {
         go_signature_arity(Some(signature))
     }
 
+    /// Upstream's `goSignatureArity` table (`go-implements-arity.test.ts`
+    /// at `e8ddc4e2`), case for case.
+    #[test]
+    fn arity_reads_upstreams_table() {
+        for (signature, expected) in [
+            ("()", "0/0"),
+            ("() error", "0/1"),
+            ("(s string) (int)", "1/1"),
+            ("(a, b int) (n int, err error)", "2/2"),
+            (
+                "(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[WatchRequest, WatchResponse], error)",
+                "2/2",
+            ),
+            (
+                "(fn func(a, b int) (int, error), m map[string][]int)",
+                "2/0",
+            ),
+            ("(p Pair[K, V]) func() (int, error)", "1/1"),
+            (
+                "(\n\tref uint64, // the series, or 0 (new)\n\tv float64, /* sample, value */\n) (uint64, error)",
+                "2/2",
+            ),
+            (
+                "(v struct {\n\tA, B int `json:\"a,omitempty\" yaml:\"(b)\"`\n}) string",
+                "1/1",
+            ),
+            ("(r rune) bool", "1/1"),
+        ] {
+            assert_eq!(arity(signature).as_deref(), Some(expected), "{signature:?}");
+        }
+        for signature in [
+            "",
+            "(a int",
+            "[T any](x T)",
+            "(a int) (b int",
+            "(a int) (b int) c",
+        ] {
+            assert_eq!(arity(signature), None, "{signature:?}");
+        }
+        assert_eq!(go_signature_arity(None), None);
+    }
+
     #[test]
     fn arity_counts_parameters_and_results() {
         assert_eq!(

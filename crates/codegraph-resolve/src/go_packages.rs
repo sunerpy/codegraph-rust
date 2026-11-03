@@ -20,6 +20,7 @@ use std::sync::{Arc, Mutex};
 
 use codegraph_core::types::{EdgeKind, Language, Node, NodeKind};
 
+use crate::source_facts::SourceFacts;
 use crate::types::{GoModule, ImportMapping, RefView, ResolutionContext, ResolvedBy, ResolvedRef};
 
 /// The memos of one resolution pass.
@@ -285,14 +286,25 @@ fn first_qualifier_of<'l>(line: &'l str, name: &str) -> Option<&'l str> {
 /// the name — read from its line, since the index keeps only the name
 /// (upstream `goRefQualification`'s `written`, #2397, #2448).
 fn go_written_qualifier(reference: &RefView, context: &dyn ResolutionContext) -> Option<String> {
+    go_qualified_name(reference)?;
+    let facts = context.source_facts(&reference.file_path)?;
+    go_written_qualifier_in(reference, &facts)
+}
+
+/// The name a Go reference's qualifier is read before: its last segment,
+/// for a reference that can have one.
+fn go_qualified_name(reference: &RefView) -> Option<&str> {
     if reference.language != Language::Go || reference.reference_kind == EdgeKind::Imports {
         return None;
     }
     let name = reference.reference_name.rsplit('.').next()?;
-    if !is_identifier(name) {
-        return None;
-    }
-    let facts = context.source_facts(&reference.file_path)?;
+    is_identifier(name).then_some(name)
+}
+
+/// [`go_written_qualifier`] over `facts`, the text of the reference's file
+/// as the caller read it (the synthesis stage reads only fresh text, W7-15).
+pub(crate) fn go_written_qualifier_in(reference: &RefView, facts: &SourceFacts) -> Option<String> {
+    let name = go_qualified_name(reference)?;
     let index = usize::try_from(reference.line.checked_sub(1)?)
         .ok()
         .filter(|&index| index < facts.line_count())?;

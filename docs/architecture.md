@@ -248,10 +248,19 @@ ledger in [`upstream-sync/KNOWN_DIFFS.md`](upstream-sync/KNOWN_DIFFS.md).
 After resolution, `codegraph_resolve::synthesis` adds the dispatch edges no
 reference names: a dispatcher reaching the callbacks registered elsewhere through
 a shared store (upstream `callback-synthesizer.ts`). The stage reads the base
-graph (every edge without `metadata.synthesizedBy`, the nodes and
-`resolved_refs`) and the indexed files whose size and modification time, or
+graph (every edge without `metadata.synthesizedBy`, the nodes,
+`resolved_refs`, and for Go the `extends` rows resolution left in
+`unresolved_refs`) and the indexed files whose size and modification time, or
 content hash, are still the ones their file rows record; a file that drifted
-since it was indexed reads as absent until its own sync. It runs its passes in
+since it was indexed reads as absent until its own sync. When the index has
+Go files it first runs upstream's two prerequisite steps, whose edges the
+passes read as base edges and the replacement writes beside the merged ones:
+a Go type's `contains` edge to each method of its package that extraction
+left with its file alone (`go-method-contains`, no provenance, as a parsed
+`contains` edge has), and a Go struct's or defined type's `implements` edge to
+each interface its method set covers, embeddings and the methods of embedded
+standard-library types included, at the interface's parameter and result
+counts (`go-implements`). It runs its passes in
 upstream's registry order, merges their edges (the first pass to pair a source
 and a target keeps the pair), and replaces every synthesized edge in one
 transaction, an edge whose identity a base edge holds being ignored while its
@@ -262,7 +271,9 @@ class component's or a Flutter `State`'s re-render (`react-render`,
 `flutter-build`), the components a function's JSX tags render
 (`jsx-render`), a C++ virtual override (`cpp-override`), a call through
 an interface or a base type reaching the same-named methods of the types that
-implement or extend it (`interface-impl`), a Kotlin Multiplatform
+implement or extend it, a Go interface's unexported method only those of its
+package, and the method a Go struct's embedding promotes into it
+(`interface-impl`, with `promotedInto`), a Kotlin Multiplatform
 declaration's `actual`s (`kotlin-expect-actual`), a Delphi form's unit
 (`pascal-form`), a MyBatis mapper method's statement (`mybatis-java-xml`) and
 each handler an object-literal registry maps, reached from a function that
