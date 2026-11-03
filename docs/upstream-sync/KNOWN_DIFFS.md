@@ -69,7 +69,7 @@ colby behaviors are intentionally NOT ported in v1:
 - **Dynamic-dispatch synthesis passes** — of `SYNTH_PASSES`
   (`callback-synthesizer.ts`), the field, closure-collection, emitter,
   render, Pascal form, Flutter, C++ override, interface override, Kotlin
-  expect/actual and MyBatis passes are ported
+  expect/actual, MyBatis and object-registry passes are ported
   (`crates/codegraph-resolve/src/synthesis/`); the others and the Go
   prerequisites (`go-method-contains`, `go-implements`) draw no edge here
   yet. The ported passes and the merge keep `b635dd46`'s view of Jest/Vitest
@@ -480,6 +480,12 @@ listed.
   unresolved. colby takes the first of `getNodesByName`, the one of the file
   first by path. The passes otherwise walk colby's orders (`synthesis/stage.rs`,
   `synthesis/callback.rs`).
+- **The handler a registry maps (W7-14d).** An object-registry handler named
+  `h` follows the same rule within the first kind that has a node `h`
+  (function, else class or struct, else method): the one of the registry's
+  file, else the one of the project, else nothing, without falling to the
+  next kind. colby takes that kind's first node of `getNodesByName`
+  (`synthesis/registry.rs`).
 - **A file that drifted since it was indexed (W7-14).** The stage reads a
   file only while its size and modification time, or its content hash, are
   the ones its file row records, the MCP engine's freshness probe; a drifted

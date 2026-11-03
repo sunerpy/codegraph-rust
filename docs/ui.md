@@ -194,8 +194,8 @@ the Rust graph holds different facts, the viewer shows what this index holds:
   routed apps here.
 - The Rust index synthesizes the field-observer, closure-collection,
   event-emitter, React and Flutter re-render, C++ override, interface
-  override, Kotlin expect/actual, Delphi form and MyBatis mapper dispatch
-  edges, so a flow shows a dashed `via …` hop for those and for no other
+  override, Kotlin expect/actual, Delphi form, MyBatis mapper and object
+  registry dispatch edges, so a flow shows a dashed `via …` hop for those and for no other
   upstream synthesis pass, and a Go interface's implicit implementations are
   not part of its type hierarchy.
 - An unresolved import is recorded by the binding it names, not by the module

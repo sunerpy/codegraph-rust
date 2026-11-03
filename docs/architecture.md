@@ -263,7 +263,9 @@ class component's or a Flutter `State`'s re-render (`react-render`,
 an interface or a base type reaching the same-named methods of the types that
 implement or extend it (`interface-impl`), a Kotlin Multiplatform
 declaration's `actual`s (`kotlin-expect-actual`), a Delphi form's unit
-(`pascal-form`) and a MyBatis mapper method's statement (`mybatis-java-xml`).
+(`pascal-form`), a MyBatis mapper method's statement (`mybatis-java-xml`) and
+each handler an object-literal registry maps, reached from a function that
+calls the registry with a runtime key (`object-registry`).
 Each walks its candidates in upstream's order (nodes by file, line and id,
 edges by their other end, line and column); the Flutter, C++, interface,
 Kotlin and MyBatis passes run only when the index has files of their

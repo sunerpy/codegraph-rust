@@ -23238,7 +23238,7 @@ mod synthesis {
         assert_eq!((edge.line, edge.col), (Some(7), None), "{edge:?}");
         assert_eq!(
             project_metadata_with_prefix(&project.db(), "synthesis_version"),
-            [("synthesis_version".to_string(), "2".to_string())]
+            [("synthesis_version".to_string(), "3".to_string())]
         );
     }
 
@@ -24329,5 +24329,417 @@ mod synthesis {
             "{}",
             graph.report()
         );
+    }
+
+    /// Every `object-registry` edge as `source -> target` qualified names,
+    /// sorted.
+    fn registry_links(graph: &Graph) -> Vec<String> {
+        let name = |id: &str| {
+            graph
+                .nodes
+                .iter()
+                .find(|node| node.id == id)
+                .map_or_else(|| id.to_string(), |node| node.qualified_name.clone())
+        };
+        let mut links: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.metadata["synthesizedBy"] == "object-registry")
+            .map(|edge| format!("{} -> {}", name(&edge.source), name(&edge.target)))
+            .collect();
+        links.sort();
+        links
+    }
+
+    const HANDLERS: &str = "export function saveDoc(x: string) { return x; }\nexport function loadDoc(x: string) { return x; }\n";
+
+    /// Upstream's `object-registry-synthesizer.test.ts`: a class field's
+    /// registry dispatched as `new this.commands[command]().execute()`
+    /// reaches each command's `execute`; a look-alike object only read as
+    /// `table.add` links nothing.
+    #[test]
+    fn w714d_a_command_registry_reaches_each_execute() {
+        let project = Project::new()
+            .file(
+                "src/commands.ts",
+                "export class AddCommand { execute() { return 'add'; } }\nexport class RemoveCommand { execute() { return 'remove'; } }\nexport class MoveCommand { execute() { return 'move'; } }\n",
+            )
+            .file(
+                "src/manager.ts",
+                "import { AddCommand, RemoveCommand, MoveCommand } from './commands';\nconst Cmd = { ADD: 'add', REMOVE: 'remove', MOVE: 'move' };\nclass CommandManager {\n  commands = {\n    [Cmd.ADD]: AddCommand,\n    [Cmd.REMOVE]: RemoveCommand,\n    [Cmd.MOVE]: MoveCommand,\n  };\n  executeCommand(command: string) {\n    return new this.commands[command]().execute();\n  }\n}\n",
+            )
+            .file(
+                "src/static.ts",
+                "import { AddCommand, RemoveCommand } from './commands';\nconst table = { add: AddCommand, remove: RemoveCommand };\nexport function direct() { return new table.add().execute(); }\n",
+            )
+            .index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            registry_links(graph),
+            [
+                "CommandManager::executeCommand -> AddCommand::execute",
+                "CommandManager::executeCommand -> MoveCommand::execute",
+                "CommandManager::executeCommand -> RemoveCommand::execute",
+            ],
+            "{}",
+            graph.report()
+        );
+        let edge = assert_synthesized(
+            graph,
+            "CommandManager::executeCommand",
+            "AddCommand::execute",
+            "object-registry",
+            &[("via", "AddCommand"), ("registeredAt", "src/manager.ts:4")],
+        );
+        assert_eq!(edge.line, Some(10), "{edge:?}");
+    }
+
+    /// A registry of functions: each one the dispatch can call, `via` its
+    /// name and `registeredAt` the registry's line.
+    #[test]
+    fn w714d_a_function_registry_links_each_function() {
+        let project = Project::new()
+            .file(
+                "src/route.ts",
+                &format!("{HANDLERS}const handlers = {{ save: saveDoc, load: loadDoc }};\nexport function route(action: string, x: string) {{\n  return handlers[action](x);\n}}\n"),
+            )
+            .index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            registry_links(graph),
+            ["route -> loadDoc", "route -> saveDoc"],
+            "{}",
+            graph.report()
+        );
+        let edge = assert_synthesized(
+            graph,
+            "route",
+            "saveDoc",
+            "object-registry",
+            &[("via", "saveDoc"), ("registeredAt", "src/route.ts:3")],
+        );
+        assert_eq!(edge.line, Some(5), "{edge:?}");
+    }
+
+    /// The entry method a dispatch chains wins over the class's first entry
+    /// method, and a constructor's `this.routes = {…}` registers too.
+    #[test]
+    fn w714d_the_chained_entry_wins_and_a_constructor_registers() {
+        let project = Project::new()
+            .file(
+                "src/chain.ts",
+                "export class Alpha { execute() {} run() {} }\nexport class Beta { execute() {} run() {} }\nconst reg = { a: Alpha, b: Beta };\nexport function go(k: string) {\n  reg[k].run();\n}\n",
+            )
+            .file(
+                "src/router.ts",
+                "export class Save { handle() {} }\nexport class Load { handle() {} }\nexport class Router {\n  constructor() {\n    this.routes = { save: Save, load: Load };\n  }\n  send(name: string) {\n    return new this.routes[name]().handle();\n  }\n}\n",
+            )
+            .index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            registry_links(graph),
+            [
+                "Router::send -> Load::handle",
+                "Router::send -> Save::handle",
+                "go -> Alpha::run",
+                "go -> Beta::run",
+            ],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// What registers or dispatches nothing: fewer than two names, a value
+    /// shorter than three characters, a quoted key, a registry or dispatch
+    /// in a comment, a dispatch outside any function.
+    #[test]
+    fn w714d_what_registers_or_dispatches_nothing() {
+        let project = Project::new()
+            .file(
+                "src/small.ts",
+                &format!("{HANDLERS}export function ab() {{}}\nconst one = {{ a: saveDoc }};\nconst tiny = {{ a: ab, b: loadDoc }};\nexport function useOne(k: string) {{ one[k](); }}\nexport function useTiny(k: string) {{ tiny[k](); }}\n"),
+            )
+            .file(
+                "src/quoted.ts",
+                &format!("{HANDLERS}const reg = {{ save: saveDoc, load: loadDoc }};\nexport function f() {{ reg['save'](); }}\nexport function pick(list: string[], i: number) {{ return list[i]; }}\n"),
+            )
+            .file(
+                "src/commented.ts",
+                &format!("{HANDLERS}// const ghost = {{ save: saveDoc, load: loadDoc }};\nconst real = {{ save: saveDoc, load: loadDoc }};\nexport function g(k: string) {{\n  /* ghost[k](); */\n  // real[k]();\n  return k;\n}}\n"),
+            )
+            .file(
+                "src/top.ts",
+                &format!("{HANDLERS}const reg = {{ save: saveDoc, load: loadDoc }};\nconst key = 'save';\nreg[key]('x');\n"),
+            )
+            .index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            registry_links(graph),
+            Vec::<String>::new(),
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// A dispatch site links at most forty handlers, the registry's first.
+    #[test]
+    fn w714d_a_dispatch_links_at_most_forty() {
+        let mut source = String::new();
+        let mut entries = Vec::new();
+        for at in 1..=41 {
+            source.push_str(&format!("export function h{at:02}() {{}}\n"));
+            entries.push(format!("k{at}: h{at:02}"));
+        }
+        source.push_str(&format!(
+            "const reg = {{ {} }};\nexport function go(k: string) {{\n  reg[k]();\n}}\n",
+            entries.join(", ")
+        ));
+        let project = Project::new().file("src/wide.ts", &source).index();
+        let graph = graph_of(&project);
+        let links = registry_links(graph);
+        assert_eq!(links.len(), 40, "{}", graph.report());
+        assert!(!links.contains(&"go -> h41".to_string()), "{links:?}");
+
+        let mut source = String::new();
+        let mut forty = Vec::new();
+        for at in 1..=41 {
+            source.push_str(&format!("export function h{at:02}() {{}}\n"));
+            forty.push(format!("k{at}: h{at:02}"));
+        }
+        let all = forty.join(", ");
+        forty.pop();
+        source.push_str(&format!(
+            "const first = {{ {} }};\nconst second = {{ {all} }};\nexport function go(k: string) {{\n  first[k]();\n  second[k]();\n}}\n",
+            forty.join(", ")
+        ));
+        let project = Project::new().file("src/twice.ts", &source).index();
+        let graph = graph_of(&project);
+        let links = registry_links(graph);
+        assert_eq!(links.len(), 41, "{}", graph.report());
+        assert!(links.contains(&"go -> h41".to_string()), "{links:?}");
+    }
+
+    /// KEEP-RUST: a handler name two files define links only when the
+    /// registry's own file defines it once; a name the project defines
+    /// once links wherever it is.
+    #[test]
+    fn w714d_an_ambiguous_handler_links_only_in_its_registrys_file() {
+        let registry = "const reg = { save: saveDoc, load: loadDoc };\nexport function go(k: string) {\n  reg[k]('x');\n}\n";
+        let project = Project::new()
+            .file(
+                "src/a.ts",
+                "export function saveDoc(x: string) { return x; }\n",
+            )
+            .file(
+                "src/b.ts",
+                "export function saveDoc(x: string) { return x; }\n",
+            )
+            .file(
+                "src/c.ts",
+                "export function loadDoc(x: string) { return x; }\n",
+            )
+            .file("src/reg.ts", registry)
+            .index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            registry_links(graph),
+            ["go -> loadDoc"],
+            "{}",
+            graph.report()
+        );
+
+        let project = Project::new()
+            .file(
+                "src/a.ts",
+                "export function saveDoc(x: string) { return x; }\n",
+            )
+            .file(
+                "src/c.ts",
+                "export function loadDoc(x: string) { return x; }\n",
+            )
+            .file(
+                "src/reg.ts",
+                &format!("export function saveDoc(x: string) {{ return x; }}\n{registry}"),
+            )
+            .index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            registry_links(graph),
+            ["go -> loadDoc", "go -> saveDoc"],
+            "{}",
+            graph.report()
+        );
+        assert_synthesized(graph, "go", "saveDoc @src/reg.ts", "object-registry", &[]);
+    }
+
+    /// `.mjs` and `.cjs` files are read; a `.vue` file is not.
+    #[test]
+    fn w714d_module_scripts_are_read_and_vue_files_are_not() {
+        let script = "export function saveDoc(x) { return x; }\nexport function loadDoc(x) { return x; }\nconst reg = { save: saveDoc, load: loadDoc };\nexport function go(k) {\n  return reg[k]('x');\n}\n";
+        let project = Project::new()
+            .file("src/a.mjs", script)
+            .file("src/b.cjs", script)
+            .file("src/c.vue", &format!("<script>\n{script}</script>\n"))
+            .index();
+        let graph = graph_of(&project);
+        let mut files: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.metadata["synthesizedBy"] == "object-registry")
+            .filter_map(|edge| graph.nodes.iter().find(|node| node.id == edge.source))
+            .map(|node| node.file_path.clone())
+            .collect();
+        files.sort();
+        assert_eq!(
+            files,
+            ["src/a.mjs", "src/a.mjs", "src/b.cjs", "src/b.cjs"],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// JavaScript's whitespace, not Unicode's: U+FEFF separates where a
+    /// space would, U+0085 does not.
+    #[test]
+    fn w714d_whitespace_is_javascripts() {
+        let open = "export function openDoc(x: string) { return x; }\n";
+        let project = Project::new()
+            .file(
+                "src/feff.ts",
+                &format!("{HANDLERS}const\u{FEFF}reg = {{ save:\u{FEFF}saveDoc, load\u{FEFF}: loadDoc }};\nexport function go(k: string) {{\n  return reg[\u{FEFF}k\u{FEFF}]('x');\n}}\n"),
+            )
+            .file(
+                "src/assign.ts",
+                &format!("{HANDLERS}const reg =\u{85}{{ save: saveDoc, load: loadDoc }};\nexport function viaAssign(k: string) {{\n  return reg[k]('x');\n}}\n"),
+            )
+            .file(
+                "src/dispatch.ts",
+                &format!("{HANDLERS}const reg = {{ save: saveDoc, load: loadDoc }};\nexport function viaDispatch(k: string) {{\n  return reg[\u{85}k]('x');\n}}\n"),
+            )
+            .file(
+                "src/entry.ts",
+                &format!("{HANDLERS}{open}const reg = {{ save:\u{85}saveDoc, load: loadDoc, open: openDoc }};\nexport function viaEntry(k: string) {{\n  return reg[k]('x');\n}}\n"),
+            )
+            .index();
+        let graph = graph_of(&project);
+        let links: Vec<String> = registry_links(graph);
+        assert!(
+            links.contains(&"go -> saveDoc".to_string()),
+            "{}",
+            graph.report()
+        );
+        assert!(
+            links.contains(&"go -> loadDoc".to_string()),
+            "{}",
+            graph.report()
+        );
+        assert!(
+            links
+                .iter()
+                .all(|link| !link.starts_with("viaAssign") && !link.starts_with("viaDispatch")),
+            "{links:?}"
+        );
+        let entry: Vec<&String> = links
+            .iter()
+            .filter(|link| link.starts_with("viaEntry"))
+            .collect();
+        assert_eq!(entry.len(), 2, "{links:?}");
+        assert!(
+            entry.iter().all(|link| !link.ends_with("saveDoc")),
+            "{links:?}"
+        );
+    }
+
+    /// The chained method is read from 160 UTF-16 units after the dispatch:
+    /// a method name ending on the 160th unit is read, one unit later it is
+    /// cut short and the class's first entry method is taken.
+    #[test]
+    fn w714d_the_chain_window_counts_utf16_units() {
+        // One method a line: methods sharing a line take the node id order.
+        let classes = "export class Alpha {\n  execute() {}\n  run() {}\n}\nexport class Beta {\n  execute() {}\n  run() {}\n}\nconst reg = { a: Alpha, b: Beta };\n";
+        // `reg[k]("` is 8 units and `").run` 6; each `😀` is two.
+        let dispatch = |pad: &str| {
+            format!("{classes}export function go(k: string) {{\n  reg[k](\"{pad}\").run();\n}}\n")
+        };
+        let fits = "😀".repeat(73);
+        let cut = format!("{fits}x");
+        for (pad, method) in [(fits.as_str(), "run"), (cut.as_str(), "execute")] {
+            let project = Project::new().file("src/chain.ts", &dispatch(pad)).index();
+            let graph = graph_of(&project);
+            assert_eq!(
+                registry_links(graph),
+                [
+                    format!("go -> Alpha::{method}"),
+                    format!("go -> Beta::{method}")
+                ],
+                "{}",
+                graph.report()
+            );
+        }
+    }
+
+    /// A file averaging more than 200 UTF-16 units a line is a minified
+    /// bundle and is skipped; exactly 200 is read.
+    #[test]
+    fn w714d_a_minified_file_is_skipped() {
+        let code = format!(
+            "{HANDLERS}const reg = {{ save: saveDoc, load: loadDoc }};\nexport function go(k: string) {{ return reg[k]('x'); }}\n"
+        );
+        let lines = code.matches('\n').count() + 1;
+        let units = code.encode_utf16().count();
+        // A trailing comment line of `😀`s (two units each) brings the
+        // average to exactly 200.
+        let mut fill = 200 * (lines + 1) - units - 4;
+        let mut pad = String::new();
+        if fill % 2 == 1 {
+            pad.push('x');
+            fill -= 1;
+        }
+        pad.push_str(&"😀".repeat(fill / 2));
+        let exact = format!("{code}// {pad}\n");
+        assert_eq!(
+            exact.encode_utf16().count(),
+            200 * (exact.matches('\n').count() + 1)
+        );
+        let over = format!("{code}// {pad}x\n");
+        for (content, linked) in [(exact, true), (over, false)] {
+            let project = Project::new().file("src/bundle.ts", &content).index();
+            let graph = graph_of(&project);
+            assert_eq!(
+                !registry_links(graph).is_empty(),
+                linked,
+                "{}",
+                graph.report()
+            );
+        }
+    }
+
+    /// A handler that is the dispatcher links nothing; a chained method
+    /// that is not an entry name does not choose the method; a class with
+    /// no entry method is entered at its constructor; two dispatches of one
+    /// pair link once.
+    #[test]
+    fn w714d_self_plain_chains_constructors_and_one_edge_a_pair() {
+        let project = Project::new()
+            .file(
+                "src/mixed.ts",
+                "export class Plain {\n  constructor() {}\n  render() {}\n}\nexport class Cmd {\n  execute() {}\n  render() {}\n}\nexport function goAll(k: string) {\n  reg[k].render();\n  reg[k].render();\n}\nconst reg = { plain: Plain, cmd: Cmd, self: goAll };\n",
+            )
+            .index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            registry_links(graph),
+            ["goAll -> Cmd::execute", "goAll -> Plain::constructor"],
+            "{}",
+            graph.report()
+        );
+        let edge = assert_synthesized(
+            graph,
+            "goAll",
+            "Cmd::execute",
+            "object-registry",
+            &[("via", "Cmd"), ("registeredAt", "src/mixed.ts:13")],
+        );
+        assert_eq!(edge.line, Some(10), "{edge:?}");
     }
 }

@@ -16206,3 +16206,59 @@ pub fn java_interface_file_deleted() -> Case {
             "interface-impl",
         )
 }
+
+const REGISTRY_SAVE: &str = "export function saveDoc(x: string) { return x; }\n";
+const REGISTRY_LOAD: &str = "export function loadDoc(x: string) { return x; }\n";
+const REGISTRY_ROUTE: &str = "import { saveDoc } from './save';\nimport { loadDoc } from './load';\nconst handlers = { save: saveDoc, load: loadDoc };\nexport function route(action: string, x: string) {\n  return handlers[action](x);\n}\n";
+
+/// W7-14d: an object registry gains a handler defined in another file; the
+/// dispatching function reaches it.
+pub fn typescript_registry_gains_a_handler() -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript])
+        .file("src/save.ts", REGISTRY_SAVE)
+        .file("src/load.ts", REGISTRY_LOAD)
+        .file(
+            "src/open.ts",
+            "export function openDoc(x: string) { return x; }\n",
+        )
+        .file("src/route.ts", REGISTRY_ROUTE)
+        .write(
+            "src/route.ts",
+            "import { saveDoc } from './save';\nimport { loadDoc } from './load';\nimport { openDoc } from './open';\nconst handlers = { save: saveDoc, load: loadDoc, open: openDoc };\nexport function route(action: string, x: string) {\n  return handlers[action](x);\n}\n",
+        )
+        .edge_metadata_after(
+            ("function route", "calls", "function openDoc"),
+            "synthesizedBy",
+            "object-registry",
+        )
+}
+
+/// W7-14d: a registered handler's file is deleted; the dispatch keeps its
+/// edge to the other handler only.
+pub fn typescript_registry_handler_file_deleted() -> Case {
+    Case::new(Change::DeleteImportedModule, &[Language::TypeScript])
+        .file("src/save.ts", REGISTRY_SAVE)
+        .file("src/load.ts", REGISTRY_LOAD)
+        .file("src/route.ts", REGISTRY_ROUTE)
+        .remove("src/load.ts")
+        .edge_before("function route", "calls", "function loadDoc")
+        .edge_metadata_after(
+            ("function route", "calls", "function saveDoc"),
+            "synthesizedBy",
+            "object-registry",
+        )
+}
+
+/// W7-14d: the dispatch is edited away; the registry's edges go with it.
+pub fn typescript_registry_dispatch_removed() -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript])
+        .file("src/save.ts", REGISTRY_SAVE)
+        .file("src/load.ts", REGISTRY_LOAD)
+        .file("src/route.ts", REGISTRY_ROUTE)
+        .write(
+            "src/route.ts",
+            "import { saveDoc } from './save';\nimport { loadDoc } from './load';\nconst handlers = { save: saveDoc, load: loadDoc };\nexport function route(action: string, x: string) {\n  return x;\n}\n",
+        )
+        .edge_before("function route", "calls", "function saveDoc")
+        .no_edge_after("function route", "calls", "function saveDoc")
+}

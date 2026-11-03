@@ -16,7 +16,7 @@ use codegraph_core::types::{Edge, EdgeKind, Language, Node, NodeKind, Unresolved
 use codegraph_store::Store;
 use codegraph_store::queries::ReferenceSite;
 
-use super::{callback, dispatch, iface, is_synthesized};
+use super::{callback, dispatch, iface, is_synthesized, registry};
 
 /// What one run of the stage did.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -78,6 +78,7 @@ const PASSES: &[(&str, Gate, Pass)] = &[
         },
         dispatch::mybatis_edges,
     ),
+    ("registryEdges", always, registry::object_registry_edges),
 ];
 
 /// Compute every synthesized edge over `store`'s base graph and replace the

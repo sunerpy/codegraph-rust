@@ -19,6 +19,7 @@
 mod callback;
 mod dispatch;
 mod iface;
+mod registry;
 mod stage;
 
 pub use stage::{StageStats, run_stage, synthesize};
@@ -35,7 +36,7 @@ use codegraph_store::Store;
 pub const VERSION_KEY: &str = "synthesis_version";
 
 /// The marker's value; a change to what the passes produce moves it.
-pub const VERSION: &str = "2";
+pub const VERSION: &str = "3";
 
 /// The edges one channel, class or declaration links at most (upstream
 /// `MAX_CALLBACKS_PER_CHANNEL`).
