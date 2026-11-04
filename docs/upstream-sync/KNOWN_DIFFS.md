@@ -487,6 +487,19 @@ listed.
   file, else the one of the project, else nothing, without falling to the
   next kind. colby takes that kind's first node of `getNodesByName`
   (`synthesis/registry.rs`).
+- **The thunk a dispatch names (W7-16d, OD-B14).** A redux-thunk constant's
+  `dispatch(name(…))` reaches the one candidate of the first kind that has
+  one: a thunk declaration, else a constant, else a function or method of the
+  dispatching file, else one of the project. Several of that kind reach
+  nothing, without falling to the next kind or choosing the dispatching
+  file's. colby takes that kind's first node of `getNodesByName`
+  (`synthesis/framework.rs`).
+- **The worker a qualified name means (W7-16d, OD-B14).** A Sidekiq enqueue
+  through `A::Worker` reaches the `perform` of the one class of that qualified
+  name that is a worker, and nothing when several are, even when their
+  `perform` is one method (two declarations of the class on one line); it then
+  does not fall back to the last segment. colby takes the first such class
+  (`synthesis/framework.rs`).
 - **JSX render (W7-14e, OD-A4).** A tag renders what its static
   `references` edge reaches, a component, function, class or value, never
   a method. colby scans a file's text for `<Name` and finds the child by

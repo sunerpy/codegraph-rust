@@ -123,7 +123,9 @@ pub struct Case {
     edges_before: Vec<EdgeSpec>,
     edges_after: Vec<EdgeSpec>,
     absent_after: Vec<EdgeSpec>,
+    metadata_before: Vec<MetadataSpec>,
     metadata_after: Vec<MetadataSpec>,
+    absent_metadata_after: Vec<MetadataSpec>,
     languages_after: Vec<(&'static str, &'static str)>,
     names_before: Vec<(&'static str, &'static str)>,
     names_after: Vec<(&'static str, &'static str)>,
@@ -141,7 +143,9 @@ impl Case {
             edges_before: Vec::new(),
             edges_after: Vec::new(),
             absent_after: Vec::new(),
+            metadata_before: Vec::new(),
             metadata_after: Vec::new(),
+            absent_metadata_after: Vec::new(),
             languages_after: Vec::new(),
             names_before: Vec::new(),
             names_after: Vec::new(),
@@ -209,6 +213,32 @@ impl Case {
         target: &'static str,
     ) -> Self {
         self.absent_after.push((source, kind, target));
+        self
+    }
+
+    /// An edge the `before` index must hold with `value` under `key` in its
+    /// metadata: a synthesized edge, beside a base edge between the same
+    /// nodes.
+    pub fn edge_metadata_before(
+        mut self,
+        edge: EdgeSpec,
+        key: &'static str,
+        value: &'static str,
+    ) -> Self {
+        self.metadata_before.push((edge, key, value));
+        self
+    }
+
+    /// No edge between nodes a fresh index of the final tree holds may have
+    /// `value` under `key` in its metadata: a synthesized edge gone, though a
+    /// base edge between the same nodes stays.
+    pub fn no_edge_metadata_after(
+        mut self,
+        edge: EdgeSpec,
+        key: &'static str,
+        value: &'static str,
+    ) -> Self {
+        self.absent_metadata_after.push((edge, key, value));
         self
     }
 
@@ -340,6 +370,7 @@ fn run_case(name: &str, case: &Case) {
 
     let mut cli = case.index_before("cli");
     expect_edges(name, "before", cli.graph(), &case.edges_before);
+    expect_edge_metadata(name, "before", cli.graph(), &case.metadata_before);
     expect_names(name, "before", cli.graph(), &case.names_before);
     let mut languages = indexed_languages(cli.graph());
     case.apply(&mut cli);
@@ -359,6 +390,7 @@ fn run_case(name: &str, case: &Case) {
     expect_edges(name, "fresh", fresh.graph(), &case.edges_after);
     expect_no_edges(name, "fresh", fresh.graph(), &case.absent_after);
     expect_edge_metadata(name, "fresh", fresh.graph(), &case.metadata_after);
+    expect_no_edge_metadata(name, "fresh", fresh.graph(), &case.absent_metadata_after);
     expect_names(name, "fresh", fresh.graph(), &case.names_after);
     for &(path, language) in &case.languages_after {
         let recorded = fresh
@@ -704,6 +736,32 @@ fn expect_edge_metadata(name: &str, label: &str, graph: &Graph, specs: &[Metadat
                 ),
             "[{name}] the {label} index has no {source} -[{kind}]-> {target} with `{key}: \
              {value:?}` in its metadata, which this case exists to exercise\n{}",
+            graph.report()
+        );
+    }
+}
+
+#[track_caller]
+fn expect_no_edge_metadata(name: &str, label: &str, graph: &Graph, specs: &[MetadataSpec]) {
+    for &((source, kind, target), key, value) in specs {
+        for selector in [source, target] {
+            assert!(
+                !graph.nodes_matching(selector).is_empty(),
+                "[{name}] the {label} index has no `{selector}`, so the absence of \
+                 {source} -[{kind}]-> {target} with `{key}: {value:?}` would hold vacuously\n{}",
+                graph.report()
+            );
+        }
+        assert!(
+            !graph
+                .edges_matching(source, kind, target)
+                .iter()
+                .any(
+                    |edge| edge.metadata.get(key).and_then(serde_json::Value::as_str)
+                        == Some(value)
+                ),
+            "[{name}] the {label} index holds {source} -[{kind}]-> {target} with `{key}: \
+             {value:?}` in its metadata, which this case exists to rule out\n{}",
             graph.report()
         );
     }
@@ -1531,10 +1589,12 @@ matrix! {
     go_gin_registration_moves_to_another_file,
     go_gin_dispatch_call_removed,
     ts_thunk_starts_dispatching_another_thunk,
+    ts_thunk_dispatch_target_gains_a_namesake_thunk,
     python_celery_task_loses_its_decorator,
     java_spring_listener_hears_another_event,
     csharp_mediatr_handler_takes_another_request,
     ruby_sidekiq_worker_drops_its_mixin,
+    ruby_sidekiq_qualified_worker_is_reopened_with_a_perform,
     php_laravel_listen_map_gains_a_listener,
     c_fnptr_table_gains_an_entry,
     c_fnptr_header_typedef_becomes_data,

@@ -224,7 +224,10 @@ pub(super) fn redux_thunk_edges(view: &View<'_>) -> Result<Vec<Edge>> {
                 continue;
             }
             // A thunk or an action creator, never a helper that only shares
-            // the name: a thunk, then any constant, then one in the same file.
+            // the name: the first tier holding a candidate decides, a thunk,
+            // then any constant, then one in the same file, then any, and
+            // only its one candidate links; several leave the dispatch
+            // unlinked (KEEP-RUST, OD-B14: upstream takes the tier's first).
             let candidates: Vec<Node> = view
                 .nodes_named(name)?
                 .into_iter()
@@ -235,25 +238,29 @@ pub(super) fn redux_thunk_edges(view: &View<'_>) -> Result<Vec<Edge>> {
                     )
                 })
                 .collect();
-            let target = candidates
-                .iter()
-                .find(|node| {
-                    node.signature
-                        .as_deref()
-                        .is_some_and(|signature| THUNK_DECL.is_match(signature))
-                })
-                .or_else(|| {
-                    candidates
-                        .iter()
-                        .find(|node| node.kind == NodeKind::Constant)
-                })
-                .or_else(|| {
-                    candidates
-                        .iter()
-                        .find(|node| node.file_path == thunk.file_path)
-                })
-                .or_else(|| candidates.first());
-            let Some(target) = target else {
+            let tier = [
+                candidates
+                    .iter()
+                    .filter(|node| {
+                        node.signature
+                            .as_deref()
+                            .is_some_and(|signature| THUNK_DECL.is_match(signature))
+                    })
+                    .collect::<Vec<_>>(),
+                candidates
+                    .iter()
+                    .filter(|node| node.kind == NodeKind::Constant)
+                    .collect(),
+                candidates
+                    .iter()
+                    .filter(|node| node.file_path == thunk.file_path)
+                    .collect(),
+                candidates.iter().collect(),
+            ]
+            .into_iter()
+            .find(|tier| !tier.is_empty())
+            .unwrap_or_default();
+            let [target] = tier.as_slice() else {
                 continue;
             };
             if target.id == thunk.id || !seen.insert((thunk.id.clone(), target.id.clone())) {
@@ -758,20 +765,29 @@ pub(super) fn sidekiq_dispatch_edges(view: &View<'_>) -> Result<Vec<Edge>> {
 }
 
 /// The `perform` of the worker `reference` names: by exact qualified name
-/// first when it is qualified, then by its last segment when exactly one
-/// worker has it, so same-named workers of other modules stay apart.
+/// first when it is qualified, then by its last segment, each when exactly
+/// one worker class has it, so same-named workers of other modules stay
+/// apart. Several classes of the qualified name leave it unlinked, even when
+/// their `perform` is one node (KEEP-RUST, OD-B14: upstream takes the
+/// first).
 fn sidekiq_perform(
     view: &View<'_>,
     reference: &str,
     performs: &mut HashMap<String, Option<Node>>,
 ) -> Result<Option<Node>> {
     if reference.contains("::") {
+        let mut qualified = Vec::new();
         for class in view.nodes_qualified(reference)? {
             if class.kind == NodeKind::Class
                 && let Some(perform) = perform_of(view, &class, performs)?
             {
-                return Ok(Some(perform));
+                qualified.push(perform);
             }
+        }
+        match qualified.len() {
+            0 => {}
+            1 => return Ok(qualified.pop()),
+            _ => return Ok(None),
         }
     }
     let last = reference.rsplit("::").next().unwrap_or(reference);

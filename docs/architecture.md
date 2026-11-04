@@ -290,8 +290,10 @@ gin's handler-chain dispatcher (a Go method calling into a `handlers` slice
 by index) reaching each named handler a `Use`, `GET` or other registration
 passes, a shared name only when the registration's file or the project holds
 one Go function or method of it (`gin-middleware-chain`), a redux-thunk
-constant reaching each thunk or action creator its body dispatches
-(`redux-thunk`), each handler an object-literal registry maps, reached from
+constant reaching each thunk or action creator its body dispatches, a name
+only when the first kind holding it (a thunk, a constant, a callable of the
+same file, any callable) holds one node of it (`redux-thunk`), each handler
+an object-literal registry maps, reached from
 a function that calls the registry with a runtime key (`object-registry`),
 the function around a Celery `.delay` or `.apply_async` reaching the
 decorated task (`celery-dispatch`), a Spring `publishEvent(new X(…))`
@@ -299,7 +301,9 @@ reaching every `@EventListener`, `@TransactionalEventListener` or
 `ApplicationListener` method of `X` (`spring-event`), a MediatR `Send` or
 `Publish` reaching the `Handle` of each handler of the sent type
 (`mediatr-dispatch`), a Sidekiq `perform_async`, `perform_in` or
-`perform_at` reaching the worker's `perform` (`sidekiq-dispatch`), a Laravel
+`perform_at` reaching the worker's `perform`, a name only when one worker
+class has it, by its qualified name, else by its last segment
+(`sidekiq-dispatch`), a Laravel
 `event(new X(…))` reaching each listener's `handle` for `X`, typed or
 registered in a `$listen` map (`laravel-event`), a C or C++ call through a
 struct's function-pointer field reaching each function a table, a designated

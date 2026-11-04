@@ -16777,6 +16777,41 @@ pub fn ts_thunk_starts_dispatching_another_thunk() -> Case {
         )
 }
 
+/// W7-16d: a second thunk of the dispatched name appears in another file;
+/// the name has no one target, so the dispatch reaches neither (OD-B14).
+/// The call `inner()` the dispatch makes also resolves as a base edge, which
+/// stays, so the case reads the synthesized edge's metadata.
+pub fn ts_thunk_dispatch_target_gains_a_namesake_thunk() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::TypeScript])
+        .file(
+            "a.ts",
+            "import { createAsyncThunk } from '@reduxjs/toolkit';\n\nexport const inner = createAsyncThunk('a/inner', async () => 1);\n",
+        )
+        .file(
+            "c.ts",
+            "import { createAsyncThunk } from '@reduxjs/toolkit';\n\nexport const outer = createAsyncThunk('c/outer', async (_: void, { dispatch }) => {\n  await dispatch(inner());\n});\n",
+        )
+        .write(
+            "b.ts",
+            "import { createAsyncThunk } from '@reduxjs/toolkit';\n\nexport const inner = createAsyncThunk('b/inner', async () => 1);\n",
+        )
+        .edge_metadata_before(
+            ("constant outer", "calls", "constant inner @a.ts"),
+            "synthesizedBy",
+            "redux-thunk",
+        )
+        .no_edge_metadata_after(
+            ("constant outer", "calls", "constant inner @a.ts"),
+            "synthesizedBy",
+            "redux-thunk",
+        )
+        .no_edge_metadata_after(
+            ("constant outer", "calls", "constant inner @b.ts"),
+            "synthesizedBy",
+            "redux-thunk",
+        )
+}
+
 /// W7-16a: a Celery task loses its decorator, in its own file; the
 /// dispatching function of another file reaches it no more.
 pub fn python_celery_task_loses_its_decorator() -> Case {
@@ -16871,6 +16906,40 @@ pub fn ruby_sidekiq_worker_drops_its_mixin() -> Case {
             "method Service::run",
             "calls",
             "method CleanupWorker::perform",
+        )
+}
+
+/// W7-16d: another file writes `class Comments::NotifyWorker` with the
+/// mixin and a `perform`; the qualified name has no one worker, so the
+/// enqueue reaches neither (OD-B14).
+pub fn ruby_sidekiq_qualified_worker_is_reopened_with_a_perform() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Ruby])
+        .file(
+            "app/workers/comments/notify_worker.rb",
+            "module Comments\n  class NotifyWorker\n    include Sidekiq::Job\n    def perform(id)\n    end\n  end\nend\n",
+        )
+        .file(
+            "app/services/notifier.rb",
+            "class Notifier\n  def run\n    Comments::NotifyWorker.perform_async(1)\n  end\nend\n",
+        )
+        .write(
+            "app/workers/legacy/notify_worker.rb",
+            "class Comments::NotifyWorker\n  include Sidekiq::Job\n  def perform(id)\n  end\nend\n",
+        )
+        .edge_before(
+            "method Notifier::run",
+            "calls",
+            "method Comments::NotifyWorker::perform @app/workers/comments/notify_worker.rb",
+        )
+        .no_edge_after(
+            "method Notifier::run",
+            "calls",
+            "method Comments::NotifyWorker::perform @app/workers/comments/notify_worker.rb",
+        )
+        .no_edge_after(
+            "method Notifier::run",
+            "calls",
+            "method Comments::NotifyWorker::perform @app/workers/legacy/notify_worker.rb",
         )
 }
 

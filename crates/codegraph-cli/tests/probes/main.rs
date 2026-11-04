@@ -23241,7 +23241,7 @@ mod synthesis {
         assert_eq!((edge.line, edge.col), (Some(7), None), "{edge:?}");
         assert_eq!(
             project_metadata_with_prefix(&project.db(), "synthesis_version"),
-            [("synthesis_version".to_string(), "10".to_string())]
+            [("synthesis_version".to_string(), "11".to_string())]
         );
     }
 
@@ -30883,6 +30883,219 @@ mod framework_dispatch {
             .next()
             .expect("an edge");
         assert_eq!(edge.metadata["registeredAt"], "a.go:3");
+    }
+
+    /// A thunk constant of `label` named `name`, in a file of its own.
+    fn thunk_named(name: &str, label: &str) -> String {
+        format!(
+            "import {{ createAsyncThunk }} from '@reduxjs/toolkit';\n\nexport const {name} = createAsyncThunk('{label}/{name}', async () => 1);\n"
+        )
+    }
+
+    /// The thunk `outer`, which dispatches `next()`.
+    fn outer_dispatching(next: &str) -> String {
+        format!(
+            "import {{ createAsyncThunk }} from '@reduxjs/toolkit';\n\nexport const outer = createAsyncThunk('c/outer', async (_: void, {{ dispatch }}) => {{\n  await dispatch({next}());\n}});\n"
+        )
+    }
+
+    /// `outer`'s one dispatch line in [`outer_dispatching`].
+    const OUTER_DISPATCH_LINE: usize = 4;
+
+    /// KEEP-RUST (OD-B14): a dispatched name two thunks share reaches
+    /// neither, even when the dispatching thunk's own file holds one of them;
+    /// upstream takes the first thunk of the name. One thunk of the name is
+    /// reached.
+    #[test]
+    fn w716d_a_name_two_thunks_share_reaches_neither() {
+        let project = Project::new()
+            .file("package.json", THUNK_PACKAGE_JSON)
+            .file("a.ts", &thunk_named("inner", "a"))
+            .file("b.ts", &thunk_named("inner", "b"))
+            .file("c.ts", &outer_dispatching("inner"))
+            .index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            links(graph, "redux-thunk"),
+            Vec::<String>::new(),
+            "{}",
+            graph.report()
+        );
+
+        let own = format!(
+            "{}\nexport const inner = createAsyncThunk('c/inner', async () => 1);\n",
+            outer_dispatching("inner")
+        );
+        let project = Project::new()
+            .file("package.json", THUNK_PACKAGE_JSON)
+            .file("a.ts", &thunk_named("inner", "a"))
+            .file("c.ts", &own)
+            .index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            links(graph, "redux-thunk"),
+            Vec::<String>::new(),
+            "{}",
+            graph.report()
+        );
+
+        let project = Project::new()
+            .file("package.json", THUNK_PACKAGE_JSON)
+            .file("a.ts", &thunk_named("inner", "a"))
+            .file("c.ts", &outer_dispatching("inner"))
+            .index();
+        let graph = graph_of(&project);
+        let line = OUTER_DISPATCH_LINE;
+        assert_eq!(
+            links(graph, "redux-thunk"),
+            [format!("outer -> inner via inner @c.ts:{line} line {line}")],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// KEEP-RUST (OD-B14): with no thunk of the name, two action-creator
+    /// constants of it reach neither, and with no constant either, two
+    /// functions of it in other files reach neither. One of each is reached.
+    #[test]
+    fn w716d_a_name_two_constants_or_two_functions_share_reaches_neither() {
+        let creator = |label: &str| {
+            format!(
+                "import {{ createAction }} from '@reduxjs/toolkit';\n\nexport const reset = createAction('{label}/reset');\n"
+            )
+        };
+        let function = |value: u8| format!("export function load() {{\n  return {value};\n}}\n");
+        let line = OUTER_DISPATCH_LINE;
+        for (files, next, linked) in [
+            (
+                vec![("a.ts", creator("a")), ("b.ts", creator("b"))],
+                "reset",
+                false,
+            ),
+            (vec![("a.ts", creator("a"))], "reset", true),
+            (
+                vec![("a.ts", function(1)), ("b.ts", function(2))],
+                "load",
+                false,
+            ),
+            (vec![("a.ts", function(1))], "load", true),
+        ] {
+            let project = files
+                .iter()
+                .fold(
+                    Project::new().file("package.json", THUNK_PACKAGE_JSON),
+                    |project, (path, text)| project.file(path, text),
+                )
+                .file("c.ts", &outer_dispatching(next))
+                .index();
+            let graph = graph_of(&project);
+            let expected = if linked {
+                vec![format!(
+                    "outer -> {next} via {next} @c.ts:{line} line {line}"
+                )]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(links(graph, "redux-thunk"), expected, "{}", graph.report());
+        }
+    }
+
+    /// The enqueue of `Comments::NotifyWorker` from `Notifier#run`.
+    const NOTIFIER_RB: &str = concat!(
+        "class Notifier\n",
+        "  def run\n",
+        "    Comments::NotifyWorker.perform_async(1)\n",
+        "  end\n",
+        "end\n",
+    );
+
+    /// KEEP-RUST (OD-B14): a qualified name two worker classes carry, one in
+    /// a reopened `module Comments` and one written `class
+    /// Comments::NotifyWorker`, each with the mixin and a `perform`, reaches
+    /// neither, nor falls back to the one class whose own name is the last
+    /// segment; upstream takes the first class. Without the second's mixin
+    /// the first is the one worker.
+    #[test]
+    fn w716d_a_qualified_name_two_workers_carry_reaches_neither() {
+        let compact = |mixin: &str| {
+            format!("class Comments::NotifyWorker\n{mixin}  def perform(id)\n  end\nend\n")
+        };
+        let project = Project::new()
+            .file(
+                "app/workers/comments/notify_worker.rb",
+                COMMENTS_NOTIFY_WORKER_RB,
+            )
+            .file(
+                "app/workers/legacy/notify_worker.rb",
+                &compact("  include Sidekiq::Job\n"),
+            )
+            .file("app/services/notifier.rb", NOTIFIER_RB)
+            .index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            links(graph, "sidekiq-dispatch"),
+            Vec::<String>::new(),
+            "{}",
+            graph.report()
+        );
+
+        let project = Project::new()
+            .file(
+                "app/workers/comments/notify_worker.rb",
+                COMMENTS_NOTIFY_WORKER_RB,
+            )
+            .file("app/workers/legacy/notify_worker.rb", &compact(""))
+            .file("app/services/notifier.rb", NOTIFIER_RB)
+            .index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            links(graph, "sidekiq-dispatch"),
+            [
+                "Notifier::run -> Comments::NotifyWorker::perform via Comments::NotifyWorker @app/services/notifier.rb:3 line 3"
+            ],
+            "{}",
+            graph.report()
+        );
+        let edge = synthesized_by(graph, "sidekiq-dispatch")
+            .next()
+            .expect("the edge");
+        assert_eq!(
+            graph.node(&edge.target).map(|node| node.file_path.as_str()),
+            Some("app/workers/comments/notify_worker.rb")
+        );
+    }
+
+    /// KEEP-RUST (OD-B14): two classes of one qualified name on one line are
+    /// two candidates, though the line's first `perform` is the only method
+    /// either reaches: the enqueue reaches neither.
+    #[test]
+    fn w716d_two_classes_of_a_qualified_name_on_one_line_reach_neither() {
+        let workers = concat!(
+            "module Comments\n",
+            "  class NotifyWorker; include Sidekiq::Job; def perform(id); end; end; class NotifyWorker; end\n",
+            "end\n",
+        );
+        let project = Project::new()
+            .file("app/workers/notify_worker.rb", workers)
+            .file("app/services/notifier.rb", NOTIFIER_RB)
+            .index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            graph
+                .nodes_named("class", "NotifyWorker")
+                .iter()
+                .filter(|node| node.qualified_name == "Comments::NotifyWorker")
+                .count(),
+            2,
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            links(graph, "sidekiq-dispatch"),
+            Vec::<String>::new(),
+            "{}",
+            graph.report()
+        );
     }
 }
 
