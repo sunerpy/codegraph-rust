@@ -50,7 +50,7 @@ tracing-appender = "0.2"
 time = { version = "0.3", features = ["macros", "local-offset", "formatting"] }
 
 # Database
-rusqlite = { version = "0.40", features = ["bundled"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
 
 # Tree-sitter
 tree-sitter = "0.27"
