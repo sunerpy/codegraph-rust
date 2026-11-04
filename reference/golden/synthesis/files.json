@@ -1,5 +1,32 @@
 [
   {
+    "content_hash": "fb4260cb8e55d292dfb58d44c8e41939337a58a09b8b5882c5f2dea25dc2ef5b",
+    "errors": null,
+    "generated": 0,
+    "language": "c",
+    "node_count": 6,
+    "path": "c/src/cmds.c",
+    "size": 271
+  },
+  {
+    "content_hash": "869f0977c7c8b36635d0e07685819517e06be975d42c4b1d56a2e80db1c209a8",
+    "errors": null,
+    "generated": 0,
+    "language": "c",
+    "node_count": 5,
+    "path": "c/src/cmds.h",
+    "size": 228
+  },
+  {
+    "content_hash": "a95fca3b752814dcf20603c7b2ec8936c7b5cd9663eb5770d93f40d87e1a052a",
+    "errors": null,
+    "generated": 0,
+    "language": "c",
+    "node_count": 6,
+    "path": "c/src/opcodes.c",
+    "size": 227
+  },
+  {
     "content_hash": "f054fd34d46d866d45aa963a0ee4c60ad255b44917cf21bfda2c320a920640fc",
     "errors": null,
     "generated": 0,
@@ -7,6 +34,15 @@
     "node_count": 6,
     "path": "c/src/ops.c",
     "size": 356
+  },
+  {
+    "content_hash": "b60bb4a70eb51c4e7fa2243f8931ed94d5b7d65b42480c6033ec94015dea79b5",
+    "errors": null,
+    "generated": 0,
+    "language": "cpp",
+    "node_count": 4,
+    "path": "cpp/src/launch.cpp",
+    "size": 193
   },
   {
     "content_hash": "6276c75f506728add71231a8b35ce692c007cba7306d1fce6a6af125a23aba39",

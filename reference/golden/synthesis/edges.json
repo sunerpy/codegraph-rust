@@ -1,5 +1,17 @@
 [
   {
+    "col": 0,
+    "kind": "imports",
+    "line": 1,
+    "metadata": {
+      "confidence": 0.92,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "file:c/src/cmds.c",
+    "target": "file:c/src/cmds.h"
+  },
+  {
     "col": 1,
     "kind": "calls",
     "line": 10,
@@ -282,6 +294,19 @@
     "target": "function:4c075e5c6998bde068ac64c5129298c1"
   },
   {
+    "col": 19,
+    "kind": "references",
+    "line": 7,
+    "metadata": {
+      "confidence": 0.95,
+      "fnRef": true,
+      "resolvedBy": "function-ref"
+    },
+    "provenance": null,
+    "source": "function:e6061b8b5dc1610b1c7761d496fd5b45",
+    "target": "function:a5f83ffcc7055c497b12a0b869658beb"
+  },
+  {
     "col": 20,
     "kind": "instantiates",
     "line": 30,
@@ -292,6 +317,32 @@
     "provenance": null,
     "source": "variable:b80207b06464950564d6b58fc4da7505",
     "target": "struct:9913848e6f980d5dd318f7e9c0c30431"
+  },
+  {
+    "col": 20,
+    "kind": "references",
+    "line": 7,
+    "metadata": {
+      "confidence": 0.95,
+      "fnRef": true,
+      "resolvedBy": "function-ref"
+    },
+    "provenance": null,
+    "source": "file:c/src/cmds.c",
+    "target": "function:ef2fe5fe1827dd3384df8b30d229bf79"
+  },
+  {
+    "col": 20,
+    "kind": "references",
+    "line": 8,
+    "metadata": {
+      "confidence": 0.95,
+      "fnRef": true,
+      "resolvedBy": "function-ref"
+    },
+    "provenance": null,
+    "source": "file:c/src/cmds.c",
+    "target": "function:a4cfdf5270df3432e9a24f869d02677c"
   },
   {
     "col": 21,
@@ -403,6 +454,19 @@
     "target": "class:c684061b11657d620087d825c55d4e41"
   },
   {
+    "col": 32,
+    "kind": "references",
+    "line": 6,
+    "metadata": {
+      "confidence": 0.95,
+      "fnRef": true,
+      "resolvedBy": "function-ref"
+    },
+    "provenance": null,
+    "source": "file:c/src/opcodes.c",
+    "target": "function:357980b5e0f33c1fcfcc15eacd524e51"
+  },
+  {
     "col": 33,
     "kind": "references",
     "line": 18,
@@ -452,6 +516,30 @@
   },
   {
     "col": 4,
+    "kind": "calls",
+    "line": 11,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "function:e6061b8b5dc1610b1c7761d496fd5b45",
+    "target": "function:1bdb95f0e8e57426106a05527118274b"
+  },
+  {
+    "col": 4,
+    "kind": "calls",
+    "line": 11,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "function:e6061b8b5dc1610b1c7761d496fd5b45",
+    "target": "function:a5f83ffcc7055c497b12a0b869658beb"
+  },
+  {
+    "col": 4,
     "kind": "references",
     "line": 3,
     "metadata": {
@@ -461,6 +549,19 @@
     "provenance": null,
     "source": "method:6c6925fe488048baffe7829bf858bf9d",
     "target": "class:0d1fdbdc20d3c1524720e79b000ddd1d"
+  },
+  {
+    "col": 40,
+    "kind": "references",
+    "line": 6,
+    "metadata": {
+      "confidence": 0.95,
+      "fnRef": true,
+      "resolvedBy": "function-ref"
+    },
+    "provenance": null,
+    "source": "file:c/src/opcodes.c",
+    "target": "function:eff093131b6d98290eb5f46c78e0a77e"
   },
   {
     "col": 46,
@@ -636,6 +737,32 @@
   {
     "col": null,
     "kind": "calls",
+    "line": 12,
+    "metadata": {
+      "registeredAt": "c/src/cmds.c:12",
+      "synthesizedBy": "fn-pointer-dispatch",
+      "via": "command.proc"
+    },
+    "provenance": "heuristic",
+    "source": "function:85b0f98b0b8a039781766fb128145442",
+    "target": "function:a4cfdf5270df3432e9a24f869d02677c"
+  },
+  {
+    "col": null,
+    "kind": "calls",
+    "line": 12,
+    "metadata": {
+      "registeredAt": "c/src/cmds.c:12",
+      "synthesizedBy": "fn-pointer-dispatch",
+      "via": "command.proc"
+    },
+    "provenance": "heuristic",
+    "source": "function:85b0f98b0b8a039781766fb128145442",
+    "target": "function:ef2fe5fe1827dd3384df8b30d229bf79"
+  },
+  {
+    "col": null,
+    "kind": "calls",
     "line": 13,
     "metadata": {
       "registeredAt": "go/gin/app.go:8",
@@ -671,6 +798,32 @@
     "provenance": "heuristic",
     "source": "method:4fa1cc0f5c6e16964aa519b8ffa473d9",
     "target": "method:d5658cf785502385e0d2dc65e6908262"
+  },
+  {
+    "col": null,
+    "kind": "calls",
+    "line": 15,
+    "metadata": {
+      "registeredAt": "c/src/ops.c:15",
+      "synthesizedBy": "fn-pointer-dispatch",
+      "via": "file_ops.open"
+    },
+    "provenance": "heuristic",
+    "source": "function:0114da5ed06cbe96441f72b8ce3bd9cc",
+    "target": "function:7b4ec42e248fdcfb93af97fcbdfe474e"
+  },
+  {
+    "col": null,
+    "kind": "calls",
+    "line": 16,
+    "metadata": {
+      "registeredAt": "c/src/ops.c:16",
+      "synthesizedBy": "fn-pointer-dispatch",
+      "via": "file_ops.close"
+    },
+    "provenance": "heuristic",
+    "source": "function:0114da5ed06cbe96441f72b8ce3bd9cc",
+    "target": "function:f4cd691a149da8dd44acd2922aa4d033"
   },
   {
     "col": null,
@@ -815,6 +968,32 @@
     "provenance": "heuristic",
     "source": "constant:df0d8b2254e4ba3660d72179cef212c8",
     "target": "constant:d3bb0e99a96c57777bb522356d235e1b"
+  },
+  {
+    "col": null,
+    "kind": "calls",
+    "line": 9,
+    "metadata": {
+      "registeredAt": "c/src/opcodes.c:9",
+      "synthesizedBy": "fn-pointer-dispatch",
+      "via": "opcodes[]"
+    },
+    "provenance": "heuristic",
+    "source": "function:6b00a787e36fbcd4b8de094c9e5ff4c9",
+    "target": "function:357980b5e0f33c1fcfcc15eacd524e51"
+  },
+  {
+    "col": null,
+    "kind": "calls",
+    "line": 9,
+    "metadata": {
+      "registeredAt": "c/src/opcodes.c:9",
+      "synthesizedBy": "fn-pointer-dispatch",
+      "via": "opcodes[]"
+    },
+    "provenance": "heuristic",
+    "source": "function:6b00a787e36fbcd4b8de094c9e5ff4c9",
+    "target": "function:eff093131b6d98290eb5f46c78e0a77e"
   },
   {
     "col": null,
@@ -1001,6 +1180,132 @@
     "line": null,
     "metadata": null,
     "provenance": null,
+    "source": "file:c/src/cmds.c",
+    "target": "function:85b0f98b0b8a039781766fb128145442"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:c/src/cmds.c",
+    "target": "function:a4cfdf5270df3432e9a24f869d02677c"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:c/src/cmds.c",
+    "target": "function:ef2fe5fe1827dd3384df8b30d229bf79"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:c/src/cmds.c",
+    "target": "import:1f2d245f153a271dc8b62738ea33b8d7"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:c/src/cmds.c",
+    "target": "variable:7c1f611c9d2b88651a95011c81320cbf"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:c/src/cmds.h",
+    "target": "constant:eaed02455481186f010576f515ab396a"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:c/src/cmds.h",
+    "target": "struct:53838bd4662ade3a6103283d4ee89a34"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:c/src/cmds.h",
+    "target": "struct:fa7fd783ce83c075353f2b4b19a17aca"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:c/src/cmds.h",
+    "target": "type_alias:566761cf3436dd1fb1113e31c680a6b6"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:c/src/opcodes.c",
+    "target": "function:357980b5e0f33c1fcfcc15eacd524e51"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:c/src/opcodes.c",
+    "target": "function:6b00a787e36fbcd4b8de094c9e5ff4c9"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:c/src/opcodes.c",
+    "target": "function:eff093131b6d98290eb5f46c78e0a77e"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:c/src/opcodes.c",
+    "target": "type_alias:41ca227eb2581dd070c25393bcba71c8"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:c/src/opcodes.c",
+    "target": "variable:4f5b2593777bd59ac0dd39dc52fc51b9"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
     "source": "file:c/src/ops.c",
     "target": "constant:aae425cc8a4fc80e95c4c11ab3247f2a"
   },
@@ -1048,6 +1353,33 @@
     "provenance": null,
     "source": "file:c3ae45271150319268fd53021c1a1a9b",
     "target": "method:fc57b8ff353cc43701ceb2c71ac647fd"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:cpp/src/launch.cpp",
+    "target": "function:1bdb95f0e8e57426106a05527118274b"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:cpp/src/launch.cpp",
+    "target": "function:a5f83ffcc7055c497b12a0b869658beb"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:cpp/src/launch.cpp",
+    "target": "function:e6061b8b5dc1610b1c7761d496fd5b45"
   },
   {
     "col": null,

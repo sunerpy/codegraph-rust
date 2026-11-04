@@ -295,7 +295,13 @@ reaching every `@EventListener`, `@TransactionalEventListener` or
 (`mediatr-dispatch`), a Sidekiq `perform_async`, `perform_in` or
 `perform_at` reaching the worker's `perform` (`sidekiq-dispatch`), a Laravel
 `event(new X(…))` reaching each listener's `handle` for `X`, typed or
-registered in a `$listen` map (`laravel-event`), and a Go call through a
+registered in a `$listen` map (`laravel-event`), a C or C++ call through a
+struct's function-pointer field reaching each function a table, a designated
+initializer or a field-to-field assignment registers in that field of that
+struct definition, the struct a name means read in the dispatching file's
+translation unit and an ambiguous one left unlinked, and a call through a
+bare array of function pointers reaching each function the array lists
+(`fn-pointer-dispatch`, with `via` and `registeredAt`), and a Go call through a
 struct field holding a function, reaching each function or method value a
 composite literal or an assignment puts in the field or in the func field it
 is copied from, the receiver typed by its scope at most one field or one
@@ -303,8 +309,8 @@ embedding away (`go-func-field`, with `field`, `via` and `registeredAt`).
 Each walks its candidates in upstream's order (nodes by file, line and id,
 edges by their other end, line and column); the Flutter, C++, interface,
 Kotlin, gRPC, MyBatis, gin, redux-thunk, Celery, Spring, MediatR, Sidekiq,
-Laravel and Go func-field passes run only when the index has files of their
-languages, as upstream's gates have them. A full index and a migration run
+Laravel, C function-pointer and Go func-field passes run only when the index
+has files of their languages, as upstream's gates have them. A full index and a migration run
 the stage after resolution. A sync runs it last, after the orphan sweep,
 whenever it changed the index, bootstrapped a lane, swept, or found the
 `synthesis_version` marker missing or at another version, and writes the

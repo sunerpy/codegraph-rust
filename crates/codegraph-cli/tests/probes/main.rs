@@ -23241,7 +23241,7 @@ mod synthesis {
         assert_eq!((edge.line, edge.col), (Some(7), None), "{edge:?}");
         assert_eq!(
             project_metadata_with_prefix(&project.db(), "synthesis_version"),
-            [("synthesis_version".to_string(), "8".to_string())]
+            [("synthesis_version".to_string(), "9".to_string())]
         );
     }
 
@@ -30883,5 +30883,1512 @@ mod framework_dispatch {
             .next()
             .expect("an edge");
         assert_eq!(edge.metadata["registeredAt"], "a.go:3");
+    }
+}
+
+/// W7-17a: upstream's `c-fnptr-synthesizer.test.ts` (`e8ddc4e2`), the
+/// sources as written there, and the cases the Rust port adds.
+mod c_fnptr {
+    use super::support::{Graph, Project, graph_of};
+
+    /// Every `fn-pointer-dispatch` edge, as `source -> target via <via>
+    /// @<registeredAt> line <line>` over node names, sorted; each is a
+    /// heuristic `calls` edge without a column.
+    #[track_caller]
+    fn links(graph: &Graph) -> Vec<String> {
+        let name = |id: &str| {
+            graph
+                .node(id)
+                .map_or_else(|| "?".to_string(), |node| node.name.clone())
+        };
+        let mut links: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.metadata["synthesizedBy"] == "fn-pointer-dispatch")
+            .map(|edge| {
+                assert_eq!(edge.kind, "calls", "{edge:?}");
+                assert_eq!(edge.provenance.as_deref(), Some("heuristic"), "{edge:?}");
+                assert_eq!(edge.col, None, "{edge:?}");
+                format!(
+                    "{} -> {} via {} @{} line {}",
+                    name(&edge.source),
+                    name(&edge.target),
+                    edge.metadata["via"].as_str().unwrap_or("?"),
+                    edge.metadata["registeredAt"].as_str().unwrap_or("?"),
+                    edge.line
+                        .map_or_else(|| "?".to_string(), |line| line.to_string()),
+                )
+            })
+            .collect();
+        links.sort();
+        links
+    }
+
+    /// The 1-based line of `text` holding `needle`.
+    #[track_caller]
+    fn line_of(text: &str, needle: &str) -> usize {
+        text.split('\n')
+            .position(|line| line.contains(needle))
+            .unwrap_or_else(|| panic!("no line holds {needle:?}"))
+            + 1
+    }
+
+    /// `source -> target via <via> @<file>:<line> line <line>`.
+    fn link(source: &str, target: &str, via: &str, file: &str, line: usize) -> String {
+        format!("{source} -> {target} via {via} @{file}:{line} line {line}")
+    }
+
+    /// `cmd.c` of upstream's case 01 (bridges-a-name-fn-command-table-dispatched-through-p-fn-the-).
+    const C01_CMD_C: &str = concat!(
+        "\n",
+        "struct cmd { const char *name; int (*fn)(int argc); };\n",
+        "static int cmd_add(int argc) { return argc + 1; }\n",
+        "static int cmd_rm(int argc) { return argc - 1; }\n",
+        "static int cmd_noop(int argc) { return argc; }   /* defined, NOT in the table */\n",
+        "\n",
+        "static struct cmd commands[] = {\n",
+        "    { \"add\", cmd_add },\n",
+        "    { \"rm\",  cmd_rm  },\n",
+        "};\n",
+        "\n",
+        "int run_builtin(struct cmd *p, int argc) {\n",
+        "    return p->fn(argc);\n",
+        "}\n",
+    );
+
+    /// `ops.c` of upstream's case 02 (bridges-designated-init-handler-fn-and-by-value-c-fn-dispatc).
+    const C02_OPS_C: &str = concat!(
+        "\n",
+        "struct ops { int (*handler)(void); int size; };\n",
+        "static int on_open(void) { return 1; }\n",
+        "static struct ops the_ops = { .handler = on_open, .size = 4 };\n",
+        "\n",
+        "int dispatch(struct ops o) { return o.handler(); }\n",
+    );
+
+    /// `union-ops.c` of upstream's case 03 (bridges-function-pointer-fields-declared-in-a-union).
+    const C03_UNION_OPS_C: &str = concat!(
+        "\n",
+        "union ops { int (*handler)(void); };\n",
+        "static int on_open(void) { return 1; }\n",
+        "static union ops the_ops = { .handler = on_open };\n",
+        "\n",
+        "int dispatch(union ops o) { return o.handler(); }\n",
+    );
+
+    /// `inline-union.c` of upstream's case 04 (bridges-an-inline-union-table-whose-entries-are-macro-built).
+    const C04_INLINE_UNION_C: &str = concat!(
+        "\n",
+        "#define SLOT(fn) { fn }\n",
+        "static int on_open(void) { return 1; }\n",
+        "static union inline_ops { int (*handler)(void); } ops[] = { SLOT(on_open) };\n",
+        "\n",
+        "int dispatch(union inline_ops o) { return o.handler(); }\n",
+    );
+
+    /// `alias-union.c` of upstream's case 05 (bridges-a-union-table-declared-through-an-object-macro-type-).
+    const C05_ALIAS_UNION_C: &str = concat!(
+        "\n",
+        "#define OPS_TYPE union ops\n",
+        "#define SLOT(fn) { fn }\n",
+        "union ops { int (*handler)(void); };\n",
+        "static int on_open(void) { return 1; }\n",
+        "static OPS_TYPE ops[] = { SLOT(on_open) };\n",
+        "\n",
+        "int dispatch(union ops o) { return o.handler(); }\n",
+    );
+
+    /// `hook.c` of upstream's case 06 (bridges-the-typedef-field-field-field-double-hop-the-hook-de).
+    const C06_HOOK_C: &str = concat!(
+        "\n",
+        "typedef void (*hook_func)(void);\n",
+        "struct hooks { hook_func func; };\n",
+        "struct entry { const char *name; hook_func fn; };\n",
+        "\n",
+        "static void hk_set(void) {}\n",
+        "static void hk_get(void) {}\n",
+        "\n",
+        "static const struct entry registry[] = {\n",
+        "    { \"set\", hk_set },\n",
+        "    { \"get\", hk_get },\n",
+        "};\n",
+        "\n",
+        "void call(struct hooks *h, const struct entry *found) {\n",
+        "    h->func = found->fn;   /* generic slot reassigned from the registry */\n",
+        "    h->func();             /* dispatch through hooks.func */\n",
+        "}\n",
+    );
+
+    /// `vtable.c` of upstream's case 07 (keys-by-struct-field-distinct-fn-pointer-fields-do-not-cross).
+    const C07_VTABLE_C: &str = concat!(
+        "\n",
+        "struct io { int (*read)(void); int (*write)(int); };\n",
+        "static int do_read(void) { return 0; }\n",
+        "static int do_write(int x) { return x; }\n",
+        "static struct io io = { .read = do_read, .write = do_write };\n",
+        "\n",
+        "int only_reads(struct io *p) { return p->read(); }\n",
+    );
+
+    /// `data.c` of upstream's case 08 (does-not-bridge-a-plain-data-field-and-no-ops-on-a-struct-wi).
+    const C08_DATA_C: &str = concat!(
+        "\n",
+        "struct box { int count; int (*fn)(void); };\n",
+        "static int helper(void) { return 0; }\n",
+        "static struct box b = { .count = 3, .fn = helper };\n",
+        "\n",
+        "/* reads a data field and never dispatches the fn pointer */\n",
+        "int total(struct box *x) { return x->count + 1; }\n",
+    );
+
+    /// `app.js` of upstream's case 09 (is-a-no-op-on-a-project-with-no-c-c-clean-control).
+    const C09_APP_JS: &str = concat!(
+        "\n",
+        "const handlers = { add: (x) => x + 1, rm: (x) => x - 1 };\n",
+        "function run(name, x) { return handlers[name](x); }\n",
+    );
+
+    /// `reg.c` of upstream's case 10 (bridges-a-macro-built-table-with-a-typedef-field-type-alias-).
+    const C10_REG_C: &str = concat!(
+        "\n",
+        "#include \"reg.h\"\n",
+        "#define ENTRY(nm, handler) nm, handler       /* function-like macro wrapping the handler */\n",
+        "#define CMD_T command                        /* object-like macro: the struct-type alias */\n",
+        "static void getCmd(int x) {}\n",
+        "static void setCmd(int x) {}\n",
+        "static void unusedCmd(int x) {}              /* defined, NOT in the table */\n",
+        "static struct CMD_T table[] = {\n",
+        "    { ENTRY(\"get\", getCmd) },\n",
+        "    { ENTRY(\"set\", setCmd) },\n",
+        "};\n",
+        "void run(struct context *ctx, int x) { ctx->cmd->proc(x); }  /* context.cmd → command → proc */\n",
+    );
+
+    /// `reg.h` of upstream's case 10 (bridges-a-macro-built-table-with-a-typedef-field-type-alias-).
+    const C10_REG_H: &str = concat!(
+        "\n",
+        "typedef void cmdProc(int x);                 /* function-TYPE typedef, not (*name) */\n",
+        "struct command { const char *name; cmdProc *proc; };\n",
+        "struct context { int id; struct command *cmd, *last; };  /* multi-declarator field */\n",
+    );
+
+    /// `fn.c` of upstream's case 12 (expands-a-header-defined-macro-that-produces-a-brace-wrapped).
+    const C12_FN_C: &str = concat!(
+        "\n",
+        "#include \"fn.h\"\n",
+        "static void absImpl(int *ctx) {}\n",
+        "static void lenImpl(int *ctx) {}\n",
+        "static struct FuncDef builtins[] = {\n",
+        "    MKFUNC(abs, absImpl),\n",
+        "    MKFUNC(len, lenImpl),\n",
+        "};\n",
+        "void invoke(struct FuncDef *p, int *x) { p->xFunc(x); }\n",
+    );
+
+    /// `fn.h` of upstream's case 12 (expands-a-header-defined-macro-that-produces-a-brace-wrapped).
+    const C12_FN_H: &str = concat!(
+        "\n",
+        "typedef void sqlFn(int *ctx);\n",
+        "struct FuncDef { int nArg; sqlFn *xFunc; const char *zName; };\n",
+        "#define MKFUNC(name, impl) { 1, impl, #name }\n",
+    );
+
+    /// `cmds.h` of upstream's case 13 (bridges-an-ifdef-guarded-inline-struct-table-dispatched-by-a).
+    const C13_CMDS_H: &str = concat!(
+        "\n",
+        "#ifdef DECLARE_TABLE\n",
+        "# define CMD(id, name, fn) { name, fn }\n",
+        "typedef void (*cmd_fn)(int arg);\n",
+        "static struct cmd_entry { const char *cmd_name; cmd_fn handler; } cmd_table[] =\n",
+        "#else\n",
+        "# define CMD(id, name, fn)  id\n",
+        "enum cmd_id\n",
+        "#endif\n",
+        "{\n",
+        "CMD(C_a, \"a\", do_a),\n",
+        "CMD(C_b, \"b\", do_b),\n",
+        "};\n",
+    );
+
+    /// `main.c` of upstream's case 13 (bridges-an-ifdef-guarded-inline-struct-table-dispatched-by-a).
+    const C13_MAIN_C: &str = concat!(
+        "\n",
+        "#define DECLARE_TABLE\n",
+        "#include \"cmds.h\"\n",
+        "static void do_a(int arg) {}\n",
+        "static void do_b(int arg) {}\n",
+        "static void unused(int arg) {}     /* defined, NOT in the table */\n",
+        "void run(int idx, int x) { (cmd_table[idx].handler)(x); }\n",
+    );
+
+    /// `cpu.c` of upstream's case 14 (bridges-a-bare-array-of-function-pointers-dispatched-by-subs).
+    const C14_CPU_C: &str = concat!(
+        "\n",
+        "typedef void op_t(int *vm, unsigned char opcode);\n",
+        "static void nop(int *vm, unsigned char opcode) {}\n",
+        "static void inc(int *vm, unsigned char opcode) {}\n",
+        "static void unreg(int *vm, unsigned char opcode) {}   /* defined, NOT in the table */\n",
+        "static op_t *opcodes[256] = { nop, inc };\n",
+        "void cpu_run(int *vm) {\n",
+        "    unsigned char opcode = 0;\n",
+        "    opcodes[opcode](vm, opcode);\n",
+        "}\n",
+    );
+
+    /// `rc.c` of upstream's case 15 (bridges-a-designated-cast-wrapped-array-with-a-calling-conve).
+    const C15_RC_C: &str = concat!(
+        "\n",
+        "#define FASTCALL\n",
+        "typedef void (FASTCALL *dtor_t)(int *p);\n",
+        "static void empty_dtor(int *p) {}\n",
+        "static void str_dtor(int *p) {}\n",
+        "static void arr_dtor(int *p) {}\n",
+        "static int type_of(int *p) { return 0; }\n",
+        "static const dtor_t rc_dtor[] = {\n",
+        "    [0] = (dtor_t)empty_dtor,\n",
+        "    [1] = (dtor_t)str_dtor,\n",
+        "    [2] = (dtor_t)arr_dtor,\n",
+        "};\n",
+        "void rc_free(int *p) { rc_dtor[type_of(p)](p); }\n",
+    );
+
+    /// `a.c` of upstream's case 16 (resolves-same-named-file-local-arrays-to-their-own-file-no-c).
+    const C16_A_C: &str = concat!(
+        "\n",
+        "typedef void af_t(int *m);\n",
+        "static void a_one(int *m) {}\n",
+        "static void a_two(int *m) {}\n",
+        "static af_t *table[8] = { a_one, a_two };\n",
+        "void a_run(int *m, int i) { table[i](m); }\n",
+    );
+
+    /// `b.c` of upstream's case 16 (resolves-same-named-file-local-arrays-to-their-own-file-no-c).
+    const C16_B_C: &str = concat!(
+        "\n",
+        "typedef void bf_t(int *m);\n",
+        "static void b_one(int *m) {}\n",
+        "static void b_two(int *m) {}\n",
+        "static bf_t *table[8] = { b_one, b_two };\n",
+        "void b_run(int *m, int i) { table[i](m); }\n",
+    );
+
+    /// `pkg.c` of upstream's case 17 (does-not-bridge-a-fn-pointer-array-that-is-registered-not-di).
+    const C17_PKG_C: &str = concat!(
+        "\n",
+        "typedef int searcher_t(int *L);\n",
+        "static int s_preload(int *L) { return 0; }\n",
+        "static int s_lua(int *L) { return 0; }\n",
+        "static searcher_t *searchers[] = { s_preload, s_lua, 0 };\n",
+        "extern void register_one(int *L, searcher_t *s);\n",
+        "void setup(int *L) {\n",
+        "    for (int i = 0; searchers[i]; i++) register_one(L, searchers[i]);\n",
+        "}\n",
+    );
+
+    /// Upstream's git shape: a `{name, fn}` command table dispatched through
+    /// `p->fn()`; a function not in the table is no target.
+    #[test]
+    fn w717a_a_command_table_reaches_its_functions() {
+        let project = Project::new().file("cmd.c", C01_CMD_C).index();
+        let graph = graph_of(&project);
+        let line = line_of(C01_CMD_C, "return p->fn(argc);");
+        assert_eq!(
+            links(graph),
+            [
+                link("run_builtin", "cmd_add", "cmd.fn", "cmd.c", line),
+                link("run_builtin", "cmd_rm", "cmd.fn", "cmd.c", line),
+            ],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream: a designated `.handler = fn` initializer and a dispatch
+    /// through a struct passed by value.
+    #[test]
+    fn w717a_a_designated_initializer_reaches_a_by_value_dispatch() {
+        let project = Project::new().file("ops.c", C02_OPS_C).index();
+        let graph = graph_of(&project);
+        let line = line_of(C02_OPS_C, "return o.handler();");
+        assert_eq!(
+            links(graph),
+            [link("dispatch", "on_open", "ops.handler", "ops.c", line)],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream: function-pointer fields declared in a union.
+    #[test]
+    fn w717a_a_union_field_is_a_function_pointer_too() {
+        let project = Project::new().file("union-ops.c", C03_UNION_OPS_C).index();
+        let graph = graph_of(&project);
+        let line = line_of(C03_UNION_OPS_C, "return o.handler();");
+        assert_eq!(
+            links(graph),
+            [link(
+                "dispatch",
+                "on_open",
+                "ops.handler",
+                "union-ops.c",
+                line
+            )],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream: an inline union table whose entries a macro builds.
+    #[test]
+    fn w717a_an_inline_union_table_of_macro_built_entries() {
+        let project = Project::new()
+            .file("inline-union.c", C04_INLINE_UNION_C)
+            .index();
+        let graph = graph_of(&project);
+        let line = line_of(C04_INLINE_UNION_C, "return o.handler();");
+        assert_eq!(
+            links(graph),
+            [link(
+                "dispatch",
+                "on_open",
+                "inline_ops.handler",
+                "inline-union.c",
+                line
+            )],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream: a union table whose type an object macro names.
+    #[test]
+    fn w717a_a_union_table_through_an_object_macro_alias() {
+        let project = Project::new()
+            .file("alias-union.c", C05_ALIAS_UNION_C)
+            .index();
+        let graph = graph_of(&project);
+        let line = line_of(C05_ALIAS_UNION_C, "return o.handler();");
+        assert_eq!(
+            links(graph),
+            [link(
+                "dispatch",
+                "on_open",
+                "ops.handler",
+                "alias-union.c",
+                line
+            )],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream's hook_demo.c shape: a typedef'd field, and a generic slot
+    /// reassigned from a registry field (`h->func = found->fn`).
+    #[test]
+    fn w717a_a_slot_inherits_the_registry_field_it_is_assigned_from() {
+        let project = Project::new().file("hook.c", C06_HOOK_C).index();
+        let graph = graph_of(&project);
+        let line = line_of(C06_HOOK_C, "h->func();");
+        assert_eq!(
+            links(graph),
+            [
+                link("call", "hk_get", "hooks.func", "hook.c", line),
+                link("call", "hk_set", "hooks.func", "hook.c", line),
+            ],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream: two fields of one struct keep their own functions.
+    #[test]
+    fn w717a_distinct_fields_do_not_cross_bleed() {
+        let project = Project::new().file("vtable.c", C07_VTABLE_C).index();
+        let graph = graph_of(&project);
+        let line = line_of(C07_VTABLE_C, "return p->read();");
+        assert_eq!(
+            links(graph),
+            [link("only_reads", "do_read", "io.read", "vtable.c", line)],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream: reading a data field is no dispatch.
+    #[test]
+    fn w717a_a_data_field_is_never_bridged() {
+        let project = Project::new().file("data.c", C08_DATA_C).index();
+        let graph = graph_of(&project);
+        assert!(links(graph).is_empty(), "{}", graph.report());
+    }
+
+    /// Upstream: a project without C or C++.
+    #[test]
+    fn w717a_a_project_without_c_links_nothing() {
+        let project = Project::new().file("app.js", C09_APP_JS).index();
+        let graph = graph_of(&project);
+        assert!(links(graph).is_empty(), "{}", graph.report());
+    }
+
+    /// Upstream's redis shape: a function-type typedef field, a table built
+    /// by a function-like macro and typed by an object-macro alias, and a
+    /// chained receiver through a field of a multi-declarator line.
+    #[test]
+    fn w717a_a_macro_built_table_reaches_a_chained_dispatch() {
+        let project = Project::new()
+            .file("reg.h", C10_REG_H)
+            .file("reg.c", C10_REG_C)
+            .index();
+        let graph = graph_of(&project);
+        let line = line_of(C10_REG_C, "ctx->cmd->proc(x);");
+        assert_eq!(
+            links(graph),
+            [
+                link("run", "getCmd", "command.proc", "reg.c", line),
+                link("run", "setCmd", "command.proc", "reg.c", line),
+            ],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream's sqlite shape: a header's macro expands to a whole
+    /// brace-wrapped element.
+    #[test]
+    fn w717a_a_header_macro_builds_a_braced_element() {
+        let project = Project::new()
+            .file("fn.h", C12_FN_H)
+            .file("fn.c", C12_FN_C)
+            .index();
+        let graph = graph_of(&project);
+        let line = line_of(C12_FN_C, "p->xFunc(x);");
+        assert_eq!(
+            links(graph),
+            [
+                link("invoke", "absImpl", "FuncDef.xFunc", "fn.c", line),
+                link("invoke", "lenImpl", "FuncDef.xFunc", "fn.c", line),
+            ],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream's vim shape: an `#ifdef`-guarded inline struct table in a
+    /// header the `.c` includes after defining the switch, dispatched by a
+    /// subscript of the file-scope table.
+    #[test]
+    fn w717a_an_ifdef_guarded_inline_table_reaches_a_subscript_dispatch() {
+        let project = Project::new()
+            .file("cmds.h", C13_CMDS_H)
+            .file("main.c", C13_MAIN_C)
+            .index();
+        let graph = graph_of(&project);
+        let line = line_of(C13_MAIN_C, "(cmd_table[idx].handler)(x);");
+        assert_eq!(
+            links(graph),
+            [
+                link("run", "do_a", "cmd_entry.handler", "main.c", line),
+                link("run", "do_b", "cmd_entry.handler", "main.c", line),
+            ],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream's opcode-table shape: a bare array of function-type
+    /// pointers dispatched by a subscript.
+    #[test]
+    fn w717a_a_bare_array_reaches_a_subscript_call() {
+        let project = Project::new().file("cpu.c", C14_CPU_C).index();
+        let graph = graph_of(&project);
+        let line = line_of(C14_CPU_C, "opcodes[opcode](vm, opcode);");
+        assert_eq!(
+            links(graph),
+            [
+                link("cpu_run", "inc", "opcodes[]", "cpu.c", line),
+                link("cpu_run", "nop", "opcodes[]", "cpu.c", line),
+            ],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream's Zend dtor shape: a calling-convention typedef, designated
+    /// and cast entries, and a subscript that is itself a call.
+    #[test]
+    fn w717a_designated_cast_entries_of_a_calling_convention_typedef() {
+        let project = Project::new().file("rc.c", C15_RC_C).index();
+        let graph = graph_of(&project);
+        let line = line_of(C15_RC_C, "rc_dtor[type_of(p)](p);");
+        assert_eq!(
+            links(graph),
+            [
+                link("rc_free", "arr_dtor", "rc_dtor[]", "rc.c", line),
+                link("rc_free", "empty_dtor", "rc_dtor[]", "rc.c", line),
+                link("rc_free", "str_dtor", "rc_dtor[]", "rc.c", line),
+            ],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream: two files' same-named static arrays each reach their own.
+    #[test]
+    fn w717a_same_named_file_arrays_stay_in_their_files() {
+        let project = Project::new()
+            .file("a.c", C16_A_C)
+            .file("b.c", C16_B_C)
+            .index();
+        let graph = graph_of(&project);
+        let a = line_of(C16_A_C, "table[i](m);");
+        let b = line_of(C16_B_C, "table[i](m);");
+        assert_eq!(
+            links(graph),
+            [
+                link("a_run", "a_one", "table[]", "a.c", a),
+                link("a_run", "a_two", "table[]", "a.c", a),
+                link("b_run", "b_one", "table[]", "b.c", b),
+                link("b_run", "b_two", "table[]", "b.c", b),
+            ],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream's lua searchers control: an array handed out element by
+    /// element, never called through a subscript.
+    #[test]
+    fn w717a_an_array_never_called_through_links_nothing() {
+        let project = Project::new().file("pkg.c", C17_PKG_C).index();
+        let graph = graph_of(&project);
+        assert!(links(graph).is_empty(), "{}", graph.report());
+    }
+
+    /// Every `fn-pointer-dispatch` edge as `source (file) -> target (file)`,
+    /// sorted: for targets that share a name.
+    #[track_caller]
+    fn link_files(graph: &Graph) -> Vec<String> {
+        let describe = |id: &str| {
+            graph.node(id).map_or_else(
+                || "?".to_string(),
+                |node| format!("{} ({})", node.name, node.file_path),
+            )
+        };
+        let mut links: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.metadata["synthesizedBy"] == "fn-pointer-dispatch")
+            .map(|edge| format!("{} -> {}", describe(&edge.source), describe(&edge.target)))
+            .collect();
+        links.sort();
+        links
+    }
+
+    /// An anonymous member and each declarator of a multi-declarator line
+    /// take a position.
+    #[test]
+    fn w717a_anonymous_members_and_declarators_take_positions() {
+        const CMD_C: &str = concat!(
+            "struct cmd { int a, b; union { int x; long y; }; int (*fn)(int); };\n",
+            "static int f1(int v) { return v; }\n",
+            "static struct cmd table[] = { { 1, 2, { 3 }, f1 } };\n",
+            "int go(struct cmd *p) { return p->fn(0); }\n",
+        );
+        let project = Project::new().file("cmd.c", CMD_C).index();
+        let graph = graph_of(&project);
+        let line = line_of(CMD_C, "return p->fn(0);");
+        assert_eq!(
+            links(graph),
+            [link("go", "f1", "cmd.fn", "cmd.c", line)],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// The second declarator of `struct command *cmd, *last;` has the
+    /// shared type, so a chain walks through it; a second owner of `proc`
+    /// keeps the unique-owner fallback out of the way.
+    #[test]
+    fn w717a_a_chain_walks_a_later_declarator_of_a_shared_type() {
+        const REG_H: &str = concat!(
+            "typedef void cmdProc(int x);\n",
+            "struct command { const char *name; cmdProc *proc; };\n",
+            "struct other { cmdProc *proc; };\n",
+            "struct context { int id; struct command *cmd, *last; };\n",
+        );
+        const REG_C: &str = concat!(
+            "#include \"reg.h\"\n",
+            "static void getCmd(int x) {}\n",
+            "static void setCmd(int x) {}\n",
+            "static void otherCmd(int x) {}\n",
+            "static struct command table[] = { { \"get\", getCmd }, { \"set\", setCmd } };\n",
+            "static struct other others[] = { { otherCmd } };\n",
+            "void run(struct context *ctx, int x) { ctx->last->proc(x); }\n",
+        );
+        let project = Project::new()
+            .file("reg.h", REG_H)
+            .file("reg.c", REG_C)
+            .index();
+        let graph = graph_of(&project);
+        let line = line_of(REG_C, "ctx->last->proc(x);");
+        assert_eq!(
+            links(graph),
+            [
+                link("run", "getCmd", "command.proc", "reg.c", line),
+                link("run", "setCmd", "command.proc", "reg.c", line),
+            ],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// KEEP-RUST: two `struct ctx` definitions, each in its own directory's
+    /// `ctx.h`, are read in the translation unit that includes it; a file
+    /// that includes both reads neither (upstream takes the first).
+    #[test]
+    fn w717a_a_chain_reads_the_struct_its_translation_unit_defines() {
+        const A_CTX_H: &str = concat!(
+            "struct aops { void (*run)(void); };\n",
+            "struct ctx { int n; struct aops *h; };\n",
+        );
+        const B_CTX_H: &str = concat!(
+            "struct bops { void (*run)(void); };\n",
+            "struct ctx { struct bops *h; int n; };\n",
+        );
+        const A_C: &str = concat!(
+            "#include \"ctx.h\"\n",
+            "static void a_run(void) {}\n",
+            "static struct aops a_tab = { a_run };\n",
+            "void a_go(struct ctx *c) { c->h->run(); }\n",
+        );
+        const B_C: &str = concat!(
+            "#include \"ctx.h\"\n",
+            "static void b_run(void) {}\n",
+            "static struct bops b_tab = { b_run };\n",
+            "void b_go(struct ctx *c) { c->h->run(); }\n",
+        );
+        const BOTH_C: &str = concat!(
+            "#include \"a/ctx.h\"\n",
+            "#include \"b/ctx.h\"\n",
+            "void both_go(struct ctx *c) { c->h->run(); }\n",
+        );
+        let project = Project::new()
+            .file("a/ctx.h", A_CTX_H)
+            .file("b/ctx.h", B_CTX_H)
+            .file("a/a.c", A_C)
+            .file("b/b.c", B_C)
+            .file("both.c", BOTH_C)
+            .index();
+        let graph = graph_of(&project);
+        let a = line_of(A_C, "c->h->run();");
+        let b = line_of(B_C, "c->h->run();");
+        assert_eq!(
+            links(graph),
+            [
+                link("a_go", "a_run", "aops.run", "a/a.c", a),
+                link("b_go", "b_run", "bops.run", "b/b.c", b),
+            ],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// `a.c` and `b.c` with their own `struct ops`, of the field lists
+    /// `a_fields` and `b_fields`, and tables of the rows `a_row` and `b_row`.
+    fn own_ops(a_fields: &str, a_row: &str, b_fields: &str, b_row: &str) -> (String, String) {
+        (
+            format!(
+                "struct ops {{ {a_fields} }};\nstatic void a_run(void) {{}}\nstatic struct ops a_tab[] = {{ {a_row} }};\nvoid a_go(struct ops *p) {{ p->run(); }}\n"
+            ),
+            format!(
+                "struct ops {{ {b_fields} }};\nstatic void b_run(void) {{}}\nstatic struct ops b_tab[] = {{ {b_row} }};\nvoid b_go(struct ops *p) {{ p->run(); }}\n"
+            ),
+        )
+    }
+
+    /// KEEP-RUST: two files defining `struct ops` with their fields in a
+    /// different order each reach only their own table (upstream keys both
+    /// by the name, the last layout winning).
+    #[test]
+    fn w717a_two_definitions_of_one_name_keep_their_tables() {
+        let (a, b) = own_ops(
+            "int n; void (*run)(void);",
+            "{ 1, a_run }",
+            "void (*run)(void); int n;",
+            "{ b_run, 1 }",
+        );
+        let project = Project::new().file("a.c", &a).file("b.c", &b).index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            links(graph),
+            [
+                link("a_go", "a_run", "ops.run", "a.c", 4),
+                link("b_go", "b_run", "ops.run", "b.c", 4),
+            ],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// KEEP-RUST: two definitions with the same name and the same fields
+    /// are still two layouts, so neither file's dispatch reaches the other's
+    /// table (gate prestart round 2).
+    #[test]
+    fn w717a_two_identical_definitions_keep_their_tables() {
+        let (a, b) = own_ops(
+            "void (*run)(void);",
+            "{ a_run }",
+            "void (*run)(void);",
+            "{ b_run }",
+        );
+        let project = Project::new().file("a.c", &a).file("b.c", &b).index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            links(graph),
+            [
+                link("a_go", "a_run", "ops.run", "a.c", 4),
+                link("b_go", "b_run", "ops.run", "b.c", 4),
+            ],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// One definition in a shared header is one layout: the tables of both
+    /// files register into it, and a dispatch through a pointer of that type
+    /// in either file reaches both (the vtable a driver registers and the
+    /// core dispatches).
+    #[test]
+    fn w717a_a_shared_definition_is_one_channel() {
+        const OPS_H: &str = "struct ops { void (*run)(void); };\n";
+        const A_C: &str = concat!(
+            "#include \"ops.h\"\n",
+            "static void a_run(void) {}\n",
+            "static struct ops a_tab[] = { { a_run } };\n",
+            "void a_go(struct ops *p) { p->run(); }\n",
+        );
+        const B_C: &str = concat!(
+            "#include \"ops.h\"\n",
+            "static void b_run(void) {}\n",
+            "static struct ops b_tab[] = { { b_run } };\n",
+            "void b_go(struct ops *p) { p->run(); }\n",
+        );
+        let project = Project::new()
+            .file("ops.h", OPS_H)
+            .file("a.c", A_C)
+            .file("b.c", B_C)
+            .index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            links(graph),
+            [
+                link("a_go", "a_run", "ops.run", "a.c", 4),
+                link("a_go", "b_run", "ops.run", "a.c", 4),
+                link("b_go", "a_run", "ops.run", "b.c", 4),
+                link("b_go", "b_run", "ops.run", "b.c", 4),
+            ],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// A receiver whose type no declaration in the function gives falls
+    /// back to the one struct that owns the field; with two owners it links
+    /// nothing.
+    #[test]
+    fn w717a_an_untyped_receiver_needs_a_unique_owner() {
+        const ONE_C: &str = concat!(
+            "struct ops { void (*run)(void); };\n",
+            "static void r1(void) {}\n",
+            "static struct ops t1 = { r1 };\n",
+            "extern struct ops *g;\n",
+            "void go(void) { g->run(); }\n",
+        );
+        let project = Project::new().file("one.c", ONE_C).index();
+        let graph = graph_of(&project);
+        let line = line_of(ONE_C, "g->run();");
+        assert_eq!(
+            links(graph),
+            [link("go", "r1", "ops.run", "one.c", line)],
+            "{}",
+            graph.report()
+        );
+        let two = format!(
+            "{ONE_C}struct ops2 {{ void (*run)(void); }};\nstatic void r2(void) {{}}\nstatic struct ops2 t2 = {{ r2 }};\n"
+        );
+        let project = Project::new().file("one.c", &two).index();
+        let graph = graph_of(&project);
+        assert!(links(graph).is_empty(), "{}", graph.report());
+    }
+
+    /// Two files' tables each name their own static `handler`: each entry
+    /// is its file's.
+    #[test]
+    fn w717a_each_table_names_its_files_function() {
+        const OPS_H: &str = "struct ops { void (*run)(void); };\n";
+        const A_C: &str = concat!(
+            "#include \"ops.h\"\n",
+            "static void handler(void) {}\n",
+            "static struct ops a_tab = { handler };\n",
+        );
+        const B_C: &str = concat!(
+            "#include \"ops.h\"\n",
+            "static void handler(void) {}\n",
+            "static struct ops b_tab = { handler };\n",
+        );
+        const D_C: &str = concat!(
+            "#include \"ops.h\"\n",
+            "void go(struct ops *p) { p->run(); }\n",
+        );
+        let project = Project::new()
+            .file("ops.h", OPS_H)
+            .file("a.c", A_C)
+            .file("b.c", B_C)
+            .file("d.c", D_C)
+            .index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            link_files(graph),
+            ["go (d.c) -> handler (a.c)", "go (d.c) -> handler (b.c)"],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// KEEP-RUST: two overloads of one name in the table's C++ file leave
+    /// the entry unregistered (upstream takes the first).
+    #[test]
+    fn w717a_an_overloaded_entry_is_not_registered() {
+        const OPS_CPP: &str = concat!(
+            "struct ops { void (*run)(int); };\n",
+            "static void cb(int x) {}\n",
+            "static void cb(double x) {}\n",
+            "static ops tab = { cb };\n",
+            "void go(ops *p) { p->run(1); }\n",
+        );
+        let project = Project::new().file("ops.cpp", OPS_CPP).index();
+        let graph = graph_of(&project);
+        assert!(links(graph).is_empty(), "{}", graph.report());
+    }
+
+    /// KEEP-RUST: an entry the table's file does not define, named by two
+    /// other files' functions, is not registered (upstream takes the first).
+    #[test]
+    fn w717a_an_entry_two_other_files_define_is_not_registered() {
+        const T_C: &str = concat!(
+            "struct ops { void (*run)(void); };\n",
+            "static struct ops tab = { handler };\n",
+            "void go(struct ops *p) { p->run(); }\n",
+        );
+        let project = Project::new()
+            .file("t.c", T_C)
+            .file("x.c", "void handler(void) {}\n")
+            .file("y.c", "void handler(void) {}\n")
+            .index();
+        let graph = graph_of(&project);
+        assert!(links(graph).is_empty(), "{}", graph.report());
+        let project = Project::new()
+            .file("t.c", T_C)
+            .file("x.c", "void handler(void) {}\n")
+            .index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            link_files(graph),
+            ["go (t.c) -> handler (x.c)"],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// KEEP-RUST: a header's table entry, read as its includer reads it,
+    /// names the includer's one function of that name even when another
+    /// file defines it too.
+    #[test]
+    fn w717a_a_header_entry_names_its_includers_function() {
+        const CMDS_H: &str = concat!(
+            "struct ops { void (*run)(void); };\n",
+            "#ifdef WANT_TABLE\n",
+            "static struct ops tab = { handler };\n",
+            "#endif\n",
+        );
+        const MAIN_C: &str = concat!(
+            "#define WANT_TABLE\n",
+            "#include \"cmds.h\"\n",
+            "static void handler(void) {}\n",
+            "void go(struct ops *p) { p->run(); }\n",
+        );
+        let project = Project::new()
+            .file("cmds.h", CMDS_H)
+            .file("main.c", MAIN_C)
+            .file("other.c", "void handler(void) {}\n")
+            .index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            link_files(graph),
+            ["go (main.c) -> handler (main.c)"],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// KEEP-RUST: one table name in two files of different structs is read
+    /// in the dispatching file's translation unit; a file that sees neither
+    /// links nothing.
+    #[test]
+    fn w717a_a_table_name_reads_its_translation_units_table() {
+        const A_C: &str = concat!(
+            "struct aops { void (*run)(void); };\n",
+            "static void a1(void) {}\n",
+            "static struct aops table[] = { { a1 } };\n",
+            "void a_go(int i) { table[i].run(); }\n",
+        );
+        const B_C: &str = concat!(
+            "struct bops { void (*run)(void); };\n",
+            "static void b1(void) {}\n",
+            "static struct bops table[] = { { b1 } };\n",
+            "void b_go(int i) { table[i].run(); }\n",
+        );
+        const C_C: &str = "void c_go(int i) { table[i].run(); }\n";
+        let project = Project::new()
+            .file("a.c", A_C)
+            .file("b.c", B_C)
+            .file("c.c", C_C)
+            .index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            links(graph),
+            [
+                link("a_go", "a1", "aops.run", "a.c", 4),
+                link("b_go", "b1", "bops.run", "b.c", 4),
+            ],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// A header read with its includer's names: `#ifndef` and `#else` arms
+    /// follow them, and an `#if` it cannot evaluate keeps its arm.
+    #[test]
+    fn w717a_conditionals_follow_the_includers_names() {
+        const CMDS_H: &str = concat!(
+            "struct ops { void (*run)(void); };\n",
+            "#ifndef USE_A\n",
+            "static struct ops t1 = { not_a };\n",
+            "#else\n",
+            "static struct ops t1 = { yes_a };\n",
+            "#endif\n",
+            "#if X > 1\n",
+            "static struct ops t2 = { unknown_expr };\n",
+            "#endif\n",
+        );
+        const MAIN_C: &str = concat!(
+            "#define USE_A\n",
+            "#include \"cmds.h\"\n",
+            "static void not_a(void) {}\n",
+            "static void yes_a(void) {}\n",
+            "static void unknown_expr(void) {}\n",
+            "void go(struct ops *p) { p->run(); }\n",
+        );
+        // A second definition of each name keeps the header's own unit
+        // from registering them.
+        const OTHER_C: &str = concat!(
+            "void not_a(void) {}\n",
+            "void yes_a(void) {}\n",
+            "void unknown_expr(void) {}\n",
+        );
+        let project = Project::new()
+            .file("cmds.h", CMDS_H)
+            .file("main.c", MAIN_C)
+            .file("other.c", OTHER_C)
+            .index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            link_files(graph),
+            [
+                "go (main.c) -> unknown_expr (main.c)",
+                "go (main.c) -> yes_a (main.c)",
+            ],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// A header without an `#if` is not read again with its includer's
+    /// macros: the includer's `MK` never expands the header's table.
+    #[test]
+    fn w717a_a_header_without_conditionals_is_read_once() {
+        const TBL_H: &str = concat!(
+            "struct ops { void (*run)(void); };\n",
+            "static struct ops t = { MK(fn_a) };\n",
+        );
+        const MAIN_C: &str = concat!(
+            "#define MK(f) f\n",
+            "#include \"tbl.h\"\n",
+            "static void fn_a(void) {}\n",
+            "void go(struct ops *p) { p->run(); }\n",
+        );
+        let project = Project::new()
+            .file("tbl.h", TBL_H)
+            .file("main.c", MAIN_C)
+            .index();
+        let graph = graph_of(&project);
+        assert!(links(graph).is_empty(), "{}", graph.report());
+    }
+
+    /// Two includers of one header, one defining `USE_A`, each read its
+    /// own arm: `a.c`'s table entry is its `yes_a`, `b.c`'s is its `not_a`.
+    /// Both register into the header's one `struct ops`, so each dispatch
+    /// reaches both.
+    #[test]
+    fn w717a_each_includer_reads_the_header_by_its_own_names() {
+        const CMDS_H: &str = concat!(
+            "struct ops { void (*run)(void); };\n",
+            "#ifndef USE_A\n",
+            "static struct ops t1 = { not_a };\n",
+            "#else\n",
+            "static struct ops t1 = { yes_a };\n",
+            "#endif\n",
+        );
+        let includer = |define: &str, go: &str| {
+            format!(
+                "#define {define}\n#include \"cmds.h\"\nstatic void yes_a(void) {{}}\nstatic void not_a(void) {{}}\nvoid {go}(struct ops *p) {{ p->run(); }}\n"
+            )
+        };
+        let project = Project::new()
+            .file("cmds.h", CMDS_H)
+            .file("a.c", &includer("USE_A", "go_a"))
+            .file("b.c", &includer("OTHER", "go_b"))
+            .index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            link_files(graph),
+            [
+                "go_a (a.c) -> not_a (b.c)",
+                "go_a (a.c) -> yes_a (a.c)",
+                "go_b (b.c) -> not_a (b.c)",
+                "go_b (b.c) -> yes_a (a.c)",
+            ],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// A header read with its includer's names expands with its own macro
+    /// before the includer's of the same name.
+    #[test]
+    fn w717a_a_headers_own_macro_wins_in_its_includers_reading() {
+        const TBL_H: &str = concat!(
+            "struct ops { void (*run)(void); };\n",
+            "#define MK(f) { f }\n",
+            "#ifdef ON\n",
+            "static struct ops t[] = { MK(right) };\n",
+            "#endif\n",
+        );
+        const MAIN_C: &str = concat!(
+            "#define ON\n",
+            "#define MK(f) { wrong }\n",
+            "#include \"tbl.h\"\n",
+            "void right(void) {}\n",
+            "void wrong(void) {}\n",
+            "void go(struct ops *p) { p->run(); }\n",
+        );
+        let project = Project::new()
+            .file("tbl.h", TBL_H)
+            .file("main.c", MAIN_C)
+            .index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            link_files(graph),
+            ["go (main.c) -> right (main.c)"],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// A file's own macro wins over an included one of the same name.
+    #[test]
+    fn w717a_a_files_own_macro_wins_over_an_included_one() {
+        const MK_H: &str = "#define MK(f) { wrong }\n";
+        const MAIN_C: &str = concat!(
+            "#include \"mk.h\"\n",
+            "#define MK(f) { f }\n",
+            "struct ops { void (*run)(void); };\n",
+            "void right(void) {}\n",
+            "void wrong(void) {}\n",
+            "static struct ops t[] = { MK(right) };\n",
+            "void go(struct ops *p) { p->run(); }\n",
+        );
+        let project = Project::new()
+            .file("mk.h", MK_H)
+            .file("main.c", MAIN_C)
+            .index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            link_files(graph),
+            ["go (main.c) -> right (main.c)"],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Field-to-field propagation runs three rounds: a chain of four
+    /// assignments, written so each round moves one hop, reaches `s4` and
+    /// not `s5`.
+    #[test]
+    fn w717a_propagation_stops_after_three_rounds() {
+        let mut source = String::new();
+        for n in 1..=5 {
+            source.push_str(&format!("struct s{n} {{ void (*f)(void); }};\n"));
+        }
+        source.push_str("static void h(void) {}\n");
+        source.push_str("static struct s1 base = { h };\n");
+        source.push_str(
+            "void wire(struct s1 *a, struct s2 *b, struct s3 *c, struct s4 *d, struct s5 *e) {\n",
+        );
+        source.push_str(
+            "    e->f = d->f;\n    d->f = c->f;\n    c->f = b->f;\n    b->f = a->f;\n}\n",
+        );
+        for n in 2..=5 {
+            source.push_str(&format!("void use{n}(struct s{n} *p) {{ p->f(); }}\n"));
+        }
+        let project = Project::new().file("hops.c", &source).index();
+        let graph = graph_of(&project);
+        let line = |n: usize| line_of(&source, &format!("void use{n}("));
+        assert_eq!(
+            links(graph),
+            [
+                link("use2", "h", "s2.f", "hops.c", line(2)),
+                link("use3", "h", "s3.f", "hops.c", line(3)),
+                link("use4", "h", "s4.f", "hops.c", line(4)),
+            ],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// One dispatching function links at most 300 functions.
+    #[test]
+    fn w717a_a_dispatch_links_at_most_300_functions() {
+        let mut source = String::from("struct ops { void (*run)(void); };\n");
+        for n in 0..301 {
+            source.push_str(&format!("static void h{n:03}(void) {{}}\n"));
+        }
+        source.push_str("static struct ops tab[] = {");
+        for n in 0..301 {
+            source.push_str(&format!(" {{ h{n:03} }},"));
+        }
+        source.push_str(" };\nvoid go(struct ops *p) { p->run(); }\n");
+        let project = Project::new().file("many.c", &source).index();
+        let graph = graph_of(&project);
+        let links = links(graph);
+        assert_eq!(links.len(), 300, "{}", graph.report());
+        assert!(
+            !links.iter().any(|link| link.contains(" -> h300 ")),
+            "the last registered function is the one left out: {links:?}"
+        );
+    }
+
+    /// Past the 4096 names one prefilter pattern spells out, every text is
+    /// read: through a struct of 4097 function-pointer fields and one of
+    /// 4097 bare arrays, the dispatches still reach their functions.
+    #[test]
+    fn w717a_past_the_name_bound_every_body_is_read() {
+        let mut source = String::from("typedef void handler(void);\nstruct many {");
+        for n in 0..4097 {
+            source.push_str(&format!(" void (*f{n})(void);"));
+        }
+        source.push_str(" };\nstatic void hit(void) {}\n");
+        for n in 0..4097 {
+            source.push_str(&format!("static handler *a{n}[] = {{ hit }};\n"));
+        }
+        source.push_str("static struct many table = { .f4000 = hit };\n");
+        source.push_str("void call(struct many *m) { m->f4000(); }\n");
+        source.push_str("void step(int i) { a4000[i](); }\n");
+        let project = Project::new().file("big.c", &source).index();
+        let graph = graph_of(&project);
+        let call = line_of(&source, "void call(");
+        let step = line_of(&source, "void step(");
+        assert_eq!(
+            links(graph),
+            [
+                link("call", "hit", "many.f4000", "big.c", call),
+                link("step", "hit", "a4000[]", "big.c", step),
+            ],
+            "{}",
+            graph.report()
+        );
+    }
+
+    const PLAIN_OPS: &str = concat!(
+        "struct ops { void (*run)(void); };\n",
+        "static void r(void) {}\n",
+        "static struct ops t = { r };\n",
+        "void go(struct ops *p) { p->run(); }\n",
+    );
+
+    /// `.cu` is C++ to the index but not a path the pass reads; the same
+    /// text in a `.cpp` file links.
+    #[test]
+    fn w717a_a_cuda_file_is_not_read() {
+        let project = Project::new().file("k.cu", PLAIN_OPS).index();
+        let graph = graph_of(&project);
+        assert!(links(graph).is_empty(), "{}", graph.report());
+        let project = Project::new().file("k.cpp", PLAIN_OPS).index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            links(graph),
+            [link("go", "r", "ops.run", "k.cpp", 4)],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// A dispatch inside a comment is no dispatch.
+    #[test]
+    fn w717a_a_commented_dispatch_links_nothing() {
+        let source = PLAIN_OPS.replace("{ p->run(); }", "{ /* p->run(); */ }");
+        let project = Project::new().file("c.c", &source).index();
+        let graph = graph_of(&project);
+        assert!(links(graph).is_empty(), "{}", graph.report());
+    }
+
+    /// A bare array's value expands at most six macro calls.
+    #[test]
+    fn w717a_a_bare_array_expands_at_most_six_macros() {
+        let mut source = String::from("#define W(f) f\ntypedef void op_t(void);\n");
+        for n in 1..=7 {
+            source.push_str(&format!("static void f{n}(void) {{}}\n"));
+        }
+        source.push_str(
+            "static op_t *ops[] = { W(f1), W(f2), W(f3), W(f4), W(f5), W(f6), W(f7) };\n",
+        );
+        source.push_str("void run(int i) { ops[i](); }\n");
+        let project = Project::new().file("ops.c", &source).index();
+        let graph = graph_of(&project);
+        let line = line_of(&source, "void run(");
+        let expected: Vec<String> = (1..=6)
+            .map(|n| link("run", &format!("f{n}"), "ops[]", "ops.c", line))
+            .collect();
+        assert_eq!(links(graph), expected, "{}", graph.report());
+    }
+
+    /// Table items are split at commas without regard to strings, so
+    /// `{ "a,b", f }` puts `f` in the third position: no field there.
+    #[test]
+    fn w717a_a_comma_in_a_string_shifts_the_positions() {
+        const CMD_C: &str = concat!(
+            "struct cmd { const char *name; int (*fn)(int); };\n",
+            "static int f(int x) { return x; }\n",
+            "static struct cmd t[] = { { \"a,b\", f } };\n",
+            "int go(struct cmd *p) { return p->fn(1); }\n",
+        );
+        let project = Project::new().file("cmd.c", CMD_C).index();
+        let graph = graph_of(&project);
+        assert!(links(graph).is_empty(), "{}", graph.report());
+    }
+
+    /// A bare array whose name only one table has is reached from another
+    /// file.
+    #[test]
+    fn w717a_a_unique_bare_array_is_reached_across_files() {
+        const A_C: &str = concat!(
+            "typedef void op_t(void);\n",
+            "static void o1(void) {}\n",
+            "op_t *ops[] = { o1 };\n",
+        );
+        const B_C: &str = "void run(int i) { ops[i](); }\n";
+        let project = Project::new().file("a.c", A_C).file("b.c", B_C).index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            links(graph),
+            [link("run", "o1", "ops[]", "b.c", 1)],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// A designated data item does not advance the positions: in
+    /// `{ .n = 1, 2, f }` the `2` is position 0 and `f` position 1.
+    #[test]
+    fn w717a_a_designated_data_item_keeps_the_position() {
+        const CMD_C: &str = concat!(
+            "struct cmd { int n; int (*fn)(int); };\n",
+            "static int f(int x) { return x; }\n",
+            "static struct cmd t = { .n = 1, 2, f };\n",
+            "int go(struct cmd *p) { return p->fn(1); }\n",
+        );
+        let project = Project::new().file("cmd.c", CMD_C).index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            links(graph),
+            [link("go", "f", "cmd.fn", "cmd.c", 4)],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// An initializer's type is read through at most five object-macro
+    /// aliases.
+    #[test]
+    fn w717a_a_type_alias_chain_of_five_hops() {
+        let source = |aliases: usize| {
+            let mut source = String::new();
+            for n in 1..aliases {
+                source.push_str(&format!("#define T{n} T{}\n", n + 1));
+            }
+            source.push_str(&format!("#define T{aliases} ops\n"));
+            source.push_str(PLAIN_OPS.replace("struct ops t", "struct T1 t").as_str());
+            source
+        };
+        let five = source(5);
+        let project = Project::new().file("alias.c", &five).index();
+        let graph = graph_of(&project);
+        let line = line_of(&five, "void go(");
+        assert_eq!(
+            links(graph),
+            [link("go", "r", "ops.run", "alias.c", line)],
+            "{}",
+            graph.report()
+        );
+        let six = source(6);
+        let project = Project::new().file("alias.c", &six).index();
+        let graph = graph_of(&project);
+        assert!(links(graph).is_empty(), "{}", graph.report());
+    }
+
+    /// A dispatching function in its own table links the table's other
+    /// functions, never itself.
+    #[test]
+    fn w717a_a_dispatch_never_links_itself() {
+        const OPS_C: &str = concat!(
+            "struct ops { void (*run)(struct ops *p); };\n",
+            "void go(struct ops *p) { p->run(p); }\n",
+            "static void other(struct ops *p) {}\n",
+            "static struct ops t[] = { { go }, { other } };\n",
+        );
+        let project = Project::new().file("ops.c", OPS_C).index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            links(graph),
+            [link("go", "other", "ops.run", "ops.c", 2)],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// The pass runs only in a project with C or C++: a `.hh` file mapped to
+    /// JavaScript whose string holds a C table is read only once a `.c`
+    /// file is indexed too.
+    #[test]
+    fn w717a_the_pass_needs_a_c_or_cpp_file() {
+        const MAPPING: &str = "{ \"extensions\": { \".hh\": \"javascript\" } }\n";
+        const X_HH: &str = concat!(
+            "const table = \"struct cmd { int (*fn)(int); } tab[] = { f };\";\n",
+            "function f(x) { return x; }\n",
+            "function run(p) { return p.fn(1); }\n",
+        );
+        let project = Project::new()
+            .file(".codegraph/codegraph.json", MAPPING)
+            .file("x.hh", X_HH)
+            .index();
+        let graph = graph_of(&project);
+        assert!(links(graph).is_empty(), "{}", graph.report());
+        let project = Project::new()
+            .file(".codegraph/codegraph.json", MAPPING)
+            .file("x.hh", X_HH)
+            .file("main.c", "int main(void) { return 0; }\n")
+            .index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            links(graph),
+            [link("run", "f", "cmd.fn", "x.hh", 3)],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// KEEP-RUST: a shared header's struct picks `run` or `stop` by the
+    /// includer's `A`, so those fields' positions are no file's: each
+    /// positional table registers only `first`, declared before the
+    /// `#ifdef`, and b.c's `stop` entry is never taken for `run`. A
+    /// designated `.stop = b_stop` is position-free (gate prestart round 3;
+    /// upstream reads the positions as written).
+    #[test]
+    fn w717a_positions_after_a_conditional_field_are_not_read() {
+        const OPS_H: &str = concat!(
+            "struct ops {\n",
+            "    void (*first)(void);\n",
+            "#ifdef A\n",
+            "    void (*run)(void);\n",
+            "#else\n",
+            "    void (*stop)(void);\n",
+            "#endif\n",
+            "};\n",
+        );
+        const A_C: &str = concat!(
+            "#define A\n",
+            "#include \"ops.h\"\n",
+            "static void a_first(void) {}\n",
+            "static void a_run(void) {}\n",
+            "static struct ops a_tab = { a_first, a_run };\n",
+            "void a_go(struct ops *p) { p->run(); }\n",
+        );
+        const B_C: &str = concat!(
+            "#include \"ops.h\"\n",
+            "static void b_first(void) {}\n",
+            "static void b_stop(void) {}\n",
+            "static struct ops b_tab = { b_first, b_stop };\n",
+            "static struct ops b_named = { .stop = b_stop };\n",
+            "void b_go(struct ops *p) { p->stop(); p->first(); }\n",
+        );
+        let project = Project::new()
+            .file("ops.h", OPS_H)
+            .file("a.c", A_C)
+            .file("b.c", B_C)
+            .index();
+        let graph = graph_of(&project);
+        let line = line_of(B_C, "void b_go(");
+        assert_eq!(
+            links(graph),
+            [
+                link("b_go", "a_first", "ops.first", "b.c", line),
+                link("b_go", "b_first", "ops.first", "b.c", line),
+                link("b_go", "b_stop", "ops.stop", "b.c", line),
+            ],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// KEEP-RUST: a field the struct declares in both arms of a conditional,
+    /// with two types, has no one type to walk; with two owners of `run`
+    /// the dispatch links nothing (upstream walks the first).
+    #[test]
+    fn w717a_a_chain_never_walks_a_field_declared_twice() {
+        const CTX_H: &str = concat!(
+            "struct aops { void (*run)(void); };\n",
+            "struct bops { void (*run)(void); };\n",
+            "struct ctx {\n",
+            "#ifdef A\n",
+            "    struct aops *h;\n",
+            "#else\n",
+            "    struct bops *h;\n",
+            "#endif\n",
+            "};\n",
+        );
+        const MAIN_C: &str = concat!(
+            "#include \"ctx.h\"\n",
+            "static void a_run(void) {}\n",
+            "static void b_run(void) {}\n",
+            "static struct aops at = { a_run };\n",
+            "static struct bops bt = { b_run };\n",
+            "void go(struct ctx *c) { c->h->run(); }\n",
+        );
+        let project = Project::new()
+            .file("ctx.h", CTX_H)
+            .file("main.c", MAIN_C)
+            .index();
+        let graph = graph_of(&project);
+        assert!(links(graph).is_empty(), "{}", graph.report());
     }
 }

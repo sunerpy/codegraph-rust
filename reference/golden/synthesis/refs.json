@@ -442,6 +442,26 @@
   {
     "candidates": null,
     "col": 4,
+    "file_path": "c/src/cmds.c",
+    "from_node_id": "function:85b0f98b0b8a039781766fb128145442",
+    "language": "c",
+    "line": 12,
+    "reference_kind": "calls",
+    "reference_name": "cmd.proc"
+  },
+  {
+    "candidates": null,
+    "col": 4,
+    "file_path": "c/src/opcodes.c",
+    "from_node_id": "function:6b00a787e36fbcd4b8de094c9e5ff4c9",
+    "language": "c",
+    "line": 9,
+    "reference_kind": "calls",
+    "reference_name": "opcodes[op]"
+  },
+  {
+    "candidates": null,
+    "col": 4,
     "file_path": "dispatch/app/services/signup.rb",
     "from_node_id": "method:6c6925fe488048baffe7829bf858bf9d",
     "language": "ruby",

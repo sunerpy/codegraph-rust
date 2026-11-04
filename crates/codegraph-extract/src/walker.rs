@@ -545,6 +545,11 @@ pub struct TreeSitterWalker<'a, 'tree> {
     /// recovery can close a scope at the wrong `}`, and with no brace scopes
     /// to correct it the walked class would land in the wrong one.
     walk_declared_types: bool,
+    /// C++ local function pointers (upstream `cppLocalFnPtrs`, #1172): per
+    /// enclosing symbol, the functions each local was bound to by
+    /// `auto kernel = &f<…>;` or a branch's `kernel = &g<…>;`, in the order
+    /// first bound, so a call or launch through the local names them.
+    cpp_local_fn_ptrs: HashMap<String, HashMap<String, Vec<String>>>,
 }
 
 /// The parts of a store initializer that its walk must not treat as the
@@ -592,6 +597,7 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             cpp_class_scope_ids: HashSet::new(),
             walk_declared_types: false,
             raw_source: source,
+            cpp_local_fn_ptrs: HashMap::new(),
         }
     }
 
@@ -6292,8 +6298,99 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             callee_name = converted;
         }
         callee_name = self.maybe_strip_cpp_template_call(callee_name);
+        // #1172: a C++ call or launch through a local the enclosing symbol
+        // bound from `&fn` calls every function it was bound to, not the
+        // local.
+        if self.spec.language() == Language::Cpp
+            && is_plain_identifier(&callee_name)
+            && let Some(targets) = self
+                .cpp_local_fn_ptrs
+                .get(&caller_id)
+                .and_then(|locals| locals.get(&callee_name))
+                .filter(|targets| !targets.is_empty())
+                .cloned()
+        {
+            for target in targets {
+                self.push_ref(&caller_id, &target, EdgeKind::Calls, position);
+            }
+            return;
+        }
         if !callee_name.is_empty() {
             self.push_ref(&caller_id, &callee_name, EdgeKind::Calls, position);
+        }
+    }
+
+    /// The C++ local function-pointer bindings `node` makes (#1172): each
+    /// `init_declarator` of a `declaration` that declares an identifier,
+    /// and an `assignment_expression` to an identifier. A body is walked in
+    /// source order and C++ declares a local before its use, so a binding
+    /// is recorded before the call through it.
+    fn record_cpp_fn_ptr_bindings(&mut self, node: SyntaxNode<'tree>) {
+        match node.kind() {
+            "declaration" => {
+                for i in 0..node.named_child_count() {
+                    let Some(child) = node.named_child(i as u32) else {
+                        continue;
+                    };
+                    if child.kind() != "init_declarator" {
+                        continue;
+                    }
+                    let Some(declarator) = child_by_field(child, "declarator") else {
+                        continue;
+                    };
+                    if declarator.kind() == "identifier" {
+                        let local = node_text(declarator, self.source);
+                        self.record_cpp_fn_ptr_binding(&local, child_by_field(child, "value"));
+                    }
+                }
+            }
+            "assignment_expression" => {
+                if let Some(left) = child_by_field(node, "left")
+                    && left.kind() == "identifier"
+                {
+                    let local = node_text(left, self.source);
+                    self.record_cpp_fn_ptr_binding(&local, child_by_field(node, "right"));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// `local = &fn`, `&fn<…>` or `&ns::fn<…>` for the enclosing symbol
+    /// (upstream `recordCppFnPtrBinding`): only the address-of shape, since
+    /// `auto x = y;` copies any value; the template arguments are stripped.
+    fn record_cpp_fn_ptr_binding(&mut self, local: &str, value: Option<SyntaxNode<'tree>>) {
+        let Some(value) = value else {
+            return;
+        };
+        if value.kind() != "pointer_expression" || value.child(0).map(|op| op.kind()) != Some("&") {
+            return;
+        }
+        let Some(argument) = child_by_field(value, "argument").or_else(|| value.named_child(0))
+        else {
+            return;
+        };
+        if !matches!(
+            argument.kind(),
+            "identifier" | "template_function" | "qualified_identifier"
+        ) {
+            return;
+        }
+        let Some(caller_id) = self.node_stack.last().cloned() else {
+            return;
+        };
+        let target = strip_cpp_template_args(&node_text(argument, self.source));
+        if target.is_empty() || target == local {
+            return;
+        }
+        let targets = self
+            .cpp_local_fn_ptrs
+            .entry(caller_id)
+            .or_default()
+            .entry(local.to_string())
+            .or_default();
+        if !targets.contains(&target) {
+            targets.push(target);
         }
     }
 
@@ -6804,6 +6901,11 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             if let Some(caller_id) = self.node_stack.last().cloned() {
                 self.push_ref(&caller_id, &callee_name, EdgeKind::Calls, node);
             }
+        }
+
+        // #1172: a C++ body's `auto kernel = &fn<…>;` and `kernel = &g;`.
+        if self.spec.language() == Language::Cpp && !self.node_stack.is_empty() {
+            self.record_cpp_fn_ptr_bindings(node);
         }
 
         // G4 — a static-member or enum-value read: `Enum.value`,
@@ -9288,6 +9390,16 @@ fn is_builtin_type(name: &str) -> bool {
             | "true"
             | "false"
     )
+}
+
+/// Whether `name` is one identifier, `[A-Za-z_][A-Za-z0-9_]*` (upstream's
+/// `/^[A-Za-z_]\w*$/`).
+fn is_plain_identifier(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    bytes
+        .next()
+        .is_some_and(|first| first.is_ascii_alphabetic() || first == b'_')
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
 }
 
 pub(crate) fn strip_cpp_template_args(name: &str) -> String {

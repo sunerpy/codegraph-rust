@@ -192,6 +192,21 @@ impl Store {
         )
     }
 
+    /// The structs, unions, functions and methods of `file_path`, by start
+    /// line: the file's rows of [`Self::nodes_by_file_path`] of those kinds,
+    /// read as [`Self::callables_by_file_path`] reads its own (W7-17a).
+    pub fn layouts_and_callables_by_file_path(
+        &self,
+        file_path: &str,
+    ) -> rusqlite::Result<Vec<Node>> {
+        query_nodes(
+            &self.conn,
+            "SELECT * FROM nodes WHERE file_path = ? \
+             AND +kind IN ('struct', 'union', 'function', 'method') ORDER BY start_line",
+            [file_path],
+        )
+    }
+
     /// The methods of `file_path` in the order [`Self::nodes_by_file_path`]
     /// lists them: the same walk of the file's own index, the other rows
     /// skipped (W5-08).
@@ -3799,6 +3814,51 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn a_files_layouts_and_callables_are_its_rows_of_those_kinds() {
+        let mut store = store("layouts-and-callables");
+        store.upsert_file(&file("src/ops.c")).unwrap();
+        store.upsert_file(&file("src/other.c")).unwrap();
+        let mut nodes = Vec::new();
+        for (index, kind) in [
+            NodeKind::Function,
+            NodeKind::Struct,
+            NodeKind::Variable,
+            NodeKind::Union,
+            NodeKind::Method,
+            NodeKind::Field,
+            NodeKind::Import,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut row = node(&format!("{}:{index}", kind.as_str()), "n", "src/ops.c");
+            row.kind = kind;
+            // Later kinds start earlier: the rows come back by line.
+            row.start_line = 20 - index as i64;
+            nodes.push(row);
+        }
+        nodes.push(node("function:other", "n", "src/other.c"));
+        store.upsert_nodes(&nodes).unwrap();
+        let read = store
+            .layouts_and_callables_by_file_path("src/ops.c")
+            .unwrap();
+        let mut expected: Vec<Node> = store
+            .nodes_by_file_path("src/ops.c")
+            .unwrap()
+            .into_iter()
+            .filter(|row| {
+                matches!(
+                    row.kind,
+                    NodeKind::Struct | NodeKind::Union | NodeKind::Function | NodeKind::Method
+                )
+            })
+            .collect();
+        expected.sort_by_key(|row| row.start_line);
+        assert_eq!(read, expected);
+        assert_eq!(read.len(), 4);
     }
 
     #[test]

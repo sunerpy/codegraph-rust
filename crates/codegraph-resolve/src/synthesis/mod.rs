@@ -21,6 +21,7 @@
 //! recomputes them whole after any sync that changes the index, under
 //! [`VERSION_KEY`].
 
+mod c_fnptr;
 mod callback;
 mod dispatch;
 mod framework;
@@ -46,7 +47,7 @@ use codegraph_store::Store;
 pub const VERSION_KEY: &str = "synthesis_version";
 
 /// The marker's value; a change to what the passes produce moves it.
-pub const VERSION: &str = "8";
+pub const VERSION: &str = "9";
 
 /// The edges one channel, class or declaration links at most (upstream
 /// `MAX_CALLBACKS_PER_CHANNEL`).

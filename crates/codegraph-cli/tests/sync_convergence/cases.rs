@@ -16904,3 +16904,219 @@ pub fn php_laravel_listen_map_gains_a_listener() -> Case {
             "laravel-event",
         )
 }
+
+/// W7-17a: a C table gains an entry; the dispatch in another file, unchanged,
+/// reaches it.
+pub fn c_fnptr_table_gains_an_entry() -> Case {
+    Case::new(Change::BodyEdit, &[Language::C])
+        .file("ops.h", "struct ops { void (*run)(void); };\n")
+        .file(
+            "tab.c",
+            "#include \"ops.h\"\nvoid one(void) {}\nvoid two(void) {}\nstatic struct ops table[] = { { one } };\n",
+        )
+        .file(
+            "go.c",
+            "#include \"ops.h\"\nvoid go(struct ops *p) { p->run(); }\n",
+        )
+        .write(
+            "tab.c",
+            "#include \"ops.h\"\nvoid one(void) {}\nvoid two(void) {}\nstatic struct ops table[] = { { one }, { two } };\n",
+        )
+        .edge_before("function go", "calls", "function one")
+        .edge_after("function go", "calls", "function two")
+        .edge_metadata_after(("function go", "calls", "function two"), "via", "ops.run")
+}
+
+/// W7-17a: a header's function-pointer typedef becomes a data typedef; the
+/// field it types is no function pointer, so the dispatch reaches nothing.
+pub fn c_fnptr_header_typedef_becomes_data() -> Case {
+    Case::new(Change::BodyEdit, &[Language::C])
+        .file(
+            "ops.h",
+            "typedef void (*handler_t)(void);\nstruct ops { handler_t run; };\n",
+        )
+        .file(
+            "tab.c",
+            "#include \"ops.h\"\nvoid one(void) {}\nstatic struct ops table[] = { { one } };\n",
+        )
+        .file(
+            "go.c",
+            "#include \"ops.h\"\nvoid go(struct ops *p) { p->run(); }\n",
+        )
+        .write(
+            "ops.h",
+            "typedef int handler_t;\nstruct ops { handler_t run; };\n",
+        )
+        .edge_before("function go", "calls", "function one")
+        .no_edge_after("function go", "calls", "function one")
+}
+
+/// W7-17a: the macro that builds a table, defined in an included header,
+/// swaps its arguments; the function lands in the name's position.
+pub fn c_fnptr_header_table_macro_changes_its_expansion() -> Case {
+    Case::new(Change::BodyEdit, &[Language::C])
+        .file(
+            "cmd.h",
+            "struct cmd { const char *name; void (*fn)(void); };\n#define ENTRY(name, fn) { name, fn }\n",
+        )
+        .file(
+            "cmd.c",
+            "#include \"cmd.h\"\nvoid one(void) {}\nstatic struct cmd table[] = { ENTRY(\"one\", one) };\nvoid go(struct cmd *p) { p->fn(); }\n",
+        )
+        .write(
+            "cmd.h",
+            "struct cmd { const char *name; void (*fn)(void); };\n#define ENTRY(name, fn) { fn, name }\n",
+        )
+        .edge_before("function go", "calls", "function one")
+        .no_edge_after("function go", "calls", "function one")
+}
+
+/// W7-17a: a dispatch reads another field of the struct.
+pub fn c_fnptr_dispatch_reads_another_field() -> Case {
+    Case::new(Change::BodyEdit, &[Language::C])
+        .file(
+            "ops.c",
+            "struct ops { void (*run)(void); void (*stop)(void); };\nvoid one(void) {}\nvoid two(void) {}\nstatic struct ops table = { one, two };\n",
+        )
+        .file("go.c", "void go(struct ops *p) { p->run(); }\n")
+        .write("go.c", "void go(struct ops *p) { p->stop(); }\n")
+        .edge_before("function go", "calls", "function one")
+        .edge_after("function go", "calls", "function two")
+        .no_edge_after("function go", "calls", "function one")
+}
+
+/// W7-17a (#1172): a C++ local function pointer is bound to another
+/// function; the call through it follows.
+pub fn cpp_local_fn_ptr_binds_another_function() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Cpp])
+        .file(
+            "launch.cpp",
+            "void f() {}\nvoid g() {}\nvoid run() { auto k = &f; k(); }\n",
+        )
+        .write(
+            "launch.cpp",
+            "void f() {}\nvoid g() {}\nvoid run() { auto k = &g; k(); }\n",
+        )
+        .edge_before("function run", "calls", "function f")
+        .edge_after("function run", "calls", "function g")
+        .no_edge_after("function run", "calls", "function f")
+}
+
+/// W7-17a: of two files defining `struct ops` with their fields in a
+/// different order, one is renamed past the other; each dispatch still
+/// reaches only its own table.
+pub fn c_fnptr_struct_definitions_change_their_order() -> Case {
+    Case::new(Change::RenameSymbol, &[Language::C])
+        .file(
+            "a.c",
+            "struct ops { int n; void (*run)(void); };\nvoid a_run(void) {}\nstatic struct ops a_tab[] = { { 1, a_run } };\nvoid a_go(struct ops *p) { p->run(); }\n",
+        )
+        .file(
+            "b.c",
+            "struct ops { void (*run)(void); int n; };\nvoid b_run(void) {}\nstatic struct ops b_tab[] = { { b_run, 1 } };\nvoid b_go(struct ops *p) { p->run(); }\n",
+        )
+        .rename("a.c", "z.c")
+        .edge_before("function a_go", "calls", "function a_run")
+        .edge_before("function b_go", "calls", "function b_run")
+        .edge_after("function a_go", "calls", "function a_run")
+        .edge_after("function b_go", "calls", "function b_run")
+        .no_edge_after("function a_go", "calls", "function b_run")
+        .no_edge_after("function b_go", "calls", "function a_run")
+}
+
+/// W7-17a: a table entry named by one function elsewhere gains a namesake
+/// in another file and is registered no more.
+pub fn c_fnptr_entry_gains_a_namesake() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::C])
+        .file(
+            "t.c",
+            "struct ops { void (*run)(void); };\nstatic struct ops tab = { handler };\nvoid go(struct ops *p) { p->run(); }\n",
+        )
+        .file("x.c", "void handler(void) {}\n")
+        .write("y.c", "void handler(void) {}\n")
+        .edge_before("function go", "calls", "function handler")
+        .no_edge_after("function go", "calls", "function handler")
+}
+
+/// W7-17a: two files define the same `struct ops`, each with its table;
+/// one table gains an entry, and the other file's dispatch does not reach
+/// it.
+pub fn c_fnptr_identical_struct_table_gains_an_entry() -> Case {
+    Case::new(Change::BodyEdit, &[Language::C])
+        .file(
+            "a.c",
+            "struct ops { void (*run)(void); };\nvoid a_run(void) {}\nstatic struct ops a_tab[] = { { a_run } };\nvoid a_go(struct ops *p) { p->run(); }\n",
+        )
+        .file(
+            "b.c",
+            "struct ops { void (*run)(void); };\nvoid b_run(void) {}\nvoid b_two(void) {}\nstatic struct ops b_tab[] = { { b_run } };\nvoid b_go(struct ops *p) { p->run(); }\n",
+        )
+        .write(
+            "b.c",
+            "struct ops { void (*run)(void); };\nvoid b_run(void) {}\nvoid b_two(void) {}\nstatic struct ops b_tab[] = { { b_run }, { b_two } };\nvoid b_go(struct ops *p) { p->run(); }\n",
+        )
+        .edge_before("function a_go", "calls", "function a_run")
+        .edge_after("function b_go", "calls", "function b_two")
+        .no_edge_after("function a_go", "calls", "function b_two")
+}
+
+/// W7-17a: two files share a header's `struct ops`, so each dispatch
+/// reaches both tables; one file takes its own copy of the definition, and
+/// each reaches only its own.
+pub fn c_fnptr_shared_definition_splits() -> Case {
+    Case::new(Change::BodyEdit, &[Language::C])
+        .file("ops.h", "struct ops { void (*run)(void); };\n")
+        .file(
+            "a.c",
+            "#include \"ops.h\"\nvoid a_run(void) {}\nstatic struct ops a_tab[] = { { a_run } };\nvoid a_go(struct ops *p) { p->run(); }\n",
+        )
+        .file(
+            "b.c",
+            "#include \"ops.h\"\nvoid b_run(void) {}\nstatic struct ops b_tab[] = { { b_run } };\nvoid b_go(struct ops *p) { p->run(); }\n",
+        )
+        .write(
+            "b.c",
+            "struct ops { void (*run)(void); };\nvoid b_run(void) {}\nstatic struct ops b_tab[] = { { b_run } };\nvoid b_go(struct ops *p) { p->run(); }\n",
+        )
+        .edge_before("function a_go", "calls", "function b_run")
+        .edge_after("function a_go", "calls", "function a_run")
+        .edge_after("function b_go", "calls", "function b_run")
+        .no_edge_after("function a_go", "calls", "function b_run")
+        .no_edge_after("function b_go", "calls", "function a_run")
+}
+
+/// W7-17a: a header's struct gains an `#ifdef` field before its function
+/// pointer; the positional entry is registered no more, the designated one
+/// still is.
+pub fn c_fnptr_header_struct_gains_a_conditional_field() -> Case {
+    Case::new(Change::BodyEdit, &[Language::C])
+        .file("ops.h", "struct ops {\n    void (*run)(void);\n};\n")
+        .file(
+            "tab.c",
+            "#include \"ops.h\"\nvoid one(void) {}\nvoid two(void) {}\nstatic struct ops pos = { one };\nstatic struct ops named = { .run = two };\nvoid go(struct ops *p) { p->run(); }\n",
+        )
+        .write(
+            "ops.h",
+            "struct ops {\n#ifdef EXTRA\n    int extra;\n#endif\n    void (*run)(void);\n};\n",
+        )
+        .edge_before("function go", "calls", "function one")
+        .edge_after("function go", "calls", "function two")
+        .no_edge_after("function go", "calls", "function one")
+}
+
+/// W7-17a: the reverse: the `#ifdef` field goes, and the positional entry
+/// is registered again.
+pub fn c_fnptr_header_struct_drops_its_conditional_field() -> Case {
+    Case::new(Change::BodyEdit, &[Language::C])
+        .file(
+            "ops.h",
+            "struct ops {\n#ifdef EXTRA\n    int extra;\n#endif\n    void (*run)(void);\n};\n",
+        )
+        .file(
+            "tab.c",
+            "#include \"ops.h\"\nvoid one(void) {}\nvoid two(void) {}\nstatic struct ops pos = { one };\nstatic struct ops named = { .run = two };\nvoid go(struct ops *p) { p->run(); }\n",
+        )
+        .write("ops.h", "struct ops {\n    void (*run)(void);\n};\n")
+        .edge_before("function go", "calls", "function two")
+        .edge_after("function go", "calls", "function one")
+}

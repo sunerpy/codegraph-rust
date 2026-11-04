@@ -18,8 +18,8 @@ use codegraph_store::queries::ReferenceSite;
 use rayon::prelude::*;
 
 use super::{
-    callback, dispatch, framework, go, go_dispatch, go_func_field, iface, is_synthesized, jsx,
-    registry,
+    c_fnptr, callback, dispatch, framework, go, go_dispatch, go_func_field, iface, is_synthesized,
+    jsx, registry,
 };
 
 /// What one run of the stage did.
@@ -124,6 +124,11 @@ const PASSES: &[(&str, Gate, Pass)] = &[
         "laravelEdges",
         |languages| languages.contains(&Language::Php),
         framework::laravel_event_edges,
+    ),
+    (
+        "cFnPtrEdges",
+        |languages| languages.contains(&Language::C) || languages.contains(&Language::Cpp),
+        c_fnptr::c_fn_pointer_dispatch_edges,
     ),
     (
         "goFuncFieldEdges",
@@ -385,6 +390,14 @@ impl<'a> View<'a> {
     /// The nodes of `file`, by line and id (upstream `getNodesByFile`).
     pub(super) fn nodes_in_file(&self, file: &str) -> Result<Vec<Node>> {
         let mut nodes = self.store.nodes_by_file_path(file)?;
+        nodes.sort_by(|a, b| (a.start_line, &a.id).cmp(&(b.start_line, &b.id)));
+        Ok(nodes)
+    }
+
+    /// The structs, unions, functions and methods of [`Self::nodes_in_file`],
+    /// in the same order, read without the others (W7-17a).
+    pub(super) fn layouts_and_callables_in_file(&self, file: &str) -> Result<Vec<Node>> {
+        let mut nodes = self.store.layouts_and_callables_by_file_path(file)?;
         nodes.sort_by(|a, b| (a.start_line, &a.id).cmp(&(b.start_line, &b.id)));
         Ok(nodes)
     }

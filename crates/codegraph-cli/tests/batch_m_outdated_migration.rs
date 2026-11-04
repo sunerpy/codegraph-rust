@@ -2608,7 +2608,7 @@ fn outdated_migration_synthesizes_dispatch_edges() {
         |row| row.get::<_, String>(0),
     )
     .expect("the migration writes the synthesis marker");
-    assert_eq!(marker, "8");
+    assert_eq!(marker, "9");
     let (_scratch, peer) = fresh_force_peer("outdated-synthesis", &project);
     let rebuilt = canonicalize_db(
         &IndexPaths::resolve(&peer, None)
