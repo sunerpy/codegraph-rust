@@ -274,6 +274,21 @@ impl Store {
         query_nodes(&self.conn, &sql, rusqlite::params_from_iter(values))
     }
 
+    /// The nodes of `kind` whose signature holds `text` (W7-16a): a superset
+    /// the caller narrows by its own pattern. A node without a signature
+    /// holds nothing. Unordered.
+    pub fn nodes_of_kind_whose_signature_holds(
+        &self,
+        kind: NodeKind,
+        text: &str,
+    ) -> rusqlite::Result<Vec<Node>> {
+        query_nodes(
+            &self.conn,
+            "SELECT * FROM nodes WHERE kind = ?1 AND instr(signature, ?2) > 0",
+            rusqlite::params![kind.as_str(), text],
+        )
+    }
+
     /// The `language` nodes whose decorator list may hold `decorator`: its
     /// JSON text contains the quoted name, a superset the caller narrows by
     /// the exact list (upstream `iterateNodesByLanguageWithDecorator`, W7-14).
@@ -3749,6 +3764,40 @@ mod tests {
                 "gen/f0000.go".to_string(),
                 format!("gen/f{:04}.go", total - 1),
             ])
+        );
+    }
+
+    #[test]
+    fn a_kinds_nodes_are_read_by_what_their_signature_holds() {
+        let mut store = store("signature-holds");
+        store.upsert_file(&file("src/thunks.ts")).unwrap();
+        let mut thunk = node("constant:thunk", "fetchUser", "src/thunks.ts");
+        thunk.kind = NodeKind::Constant;
+        thunk.signature = Some("= createAsyncThunk('user/fetch', async () => {".to_string());
+        let mut lower = node("constant:lower", "other", "src/thunks.ts");
+        lower.kind = NodeKind::Constant;
+        lower.signature = Some("= createasyncthunk()".to_string());
+        let mut unsigned = node("constant:unsigned", "bare", "src/thunks.ts");
+        unsigned.kind = NodeKind::Constant;
+        unsigned.signature = None;
+        let mut function = node("function:thunk", "makeThunk", "src/thunks.ts");
+        function.signature = Some("(Thunk t)".to_string());
+        store
+            .upsert_nodes(&[thunk.clone(), lower, unsigned, function])
+            .unwrap();
+        // Of the constants, the one whose signature holds the text, case
+        // and all; a function's signature is another kind's.
+        assert_eq!(
+            store
+                .nodes_of_kind_whose_signature_holds(NodeKind::Constant, "Thunk")
+                .unwrap(),
+            vec![thunk]
+        );
+        assert!(
+            store
+                .nodes_of_kind_whose_signature_holds(NodeKind::Constant, "missing")
+                .unwrap()
+                .is_empty()
         );
     }
 

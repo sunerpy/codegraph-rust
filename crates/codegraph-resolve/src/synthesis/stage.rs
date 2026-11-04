@@ -18,7 +18,8 @@ use codegraph_store::queries::ReferenceSite;
 use rayon::prelude::*;
 
 use super::{
-    callback, dispatch, go, go_dispatch, go_func_field, iface, is_synthesized, jsx, registry,
+    callback, dispatch, framework, go, go_dispatch, go_func_field, iface, is_synthesized, jsx,
+    registry,
 };
 
 /// What one run of the stage did.
@@ -97,7 +98,33 @@ const PASSES: &[(&str, Gate, Pass)] = &[
         go::gate,
         go_dispatch::gin_middleware_chain_edges,
     ),
+    ("thunkEdges", jsx::gate, framework::redux_thunk_edges),
     ("registryEdges", always, registry::object_registry_edges),
+    (
+        "celeryEdges",
+        |languages| languages.contains(&Language::Python),
+        framework::celery_dispatch_edges,
+    ),
+    (
+        "springEdges",
+        |languages| languages.contains(&Language::Java),
+        framework::spring_event_edges,
+    ),
+    (
+        "mediatrEdges",
+        |languages| languages.contains(&Language::CSharp),
+        framework::mediatr_dispatch_edges,
+    ),
+    (
+        "sidekiqEdges",
+        |languages| languages.contains(&Language::Ruby),
+        framework::sidekiq_dispatch_edges,
+    ),
+    (
+        "laravelEdges",
+        |languages| languages.contains(&Language::Php),
+        framework::laravel_event_edges,
+    ),
     (
         "goFuncFieldEdges",
         go::gate,
@@ -380,6 +407,18 @@ impl<'a> View<'a> {
         languages: &[Language],
     ) -> Result<Vec<Node>> {
         let mut nodes = self.store.nodes_of_kinds_in_languages(kinds, languages)?;
+        nodes.sort_by(node_order);
+        Ok(nodes)
+    }
+
+    /// The nodes of `kind` whose signature holds `text` (see
+    /// [`Store::nodes_of_kind_whose_signature_holds`]), in [`node_order`].
+    pub(super) fn nodes_of_kind_whose_signature_holds(
+        &self,
+        kind: NodeKind,
+        text: &str,
+    ) -> Result<Vec<Node>> {
+        let mut nodes = self.store.nodes_of_kind_whose_signature_holds(kind, text)?;
         nodes.sort_by(node_order);
         Ok(nodes)
     }

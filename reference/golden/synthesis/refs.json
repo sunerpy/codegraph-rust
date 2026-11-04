@@ -2,6 +2,26 @@
   {
     "candidates": null,
     "col": 0,
+    "file_path": "dispatch/app/Http/Registration.php",
+    "from_node_id": "namespace:1c67f66116a8ffa3279c4c8b70c1755e",
+    "language": "php",
+    "line": 4,
+    "reference_kind": "imports",
+    "reference_name": "App\\Events\\Registered"
+  },
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "dispatch/app/Listeners/SendWelcome.php",
+    "from_node_id": "namespace:6585f42f6df9f861416b2309c22c1b73",
+    "language": "php",
+    "line": 4,
+    "reference_kind": "imports",
+    "reference_name": "App\\Events\\Registered"
+  },
+  {
+    "candidates": null,
+    "col": 0,
     "file_path": "dispatch/src/Events.java",
     "from_node_id": "namespace:559ecd17038af11c9b6ef54ae38f2d50",
     "language": "java",
@@ -62,6 +82,16 @@
   {
     "candidates": null,
     "col": 0,
+    "file_path": "js/src/thunks.ts",
+    "from_node_id": "file:js/src/thunks.ts",
+    "language": "typescript",
+    "line": 1,
+    "reference_kind": "imports",
+    "reference_name": "@reduxjs/toolkit"
+  },
+  {
+    "candidates": null,
+    "col": 0,
     "file_path": "python/tasks.py",
     "from_node_id": "file:python/tasks.py",
     "language": "python",
@@ -101,6 +131,16 @@
   },
   {
     "candidates": null,
+    "col": 11,
+    "file_path": "dispatch/src/Orders.cs",
+    "from_node_id": "method:9c1b4e873ff43e93f8713698beeaf7e4",
+    "language": "csharp",
+    "line": 7,
+    "reference_kind": "references",
+    "reference_name": "Task"
+  },
+  {
+    "candidates": null,
     "col": 12,
     "file_path": "js/src/events.js",
     "from_node_id": "constant:f1553fed82b8f496223f2d2115aa5853",
@@ -122,6 +162,26 @@
   {
     "candidates": null,
     "col": 14,
+    "file_path": "dispatch/app/Http/Registration.php",
+    "from_node_id": "method:b8634218ad53bdcf252458f8e5eda333",
+    "language": "php",
+    "line": 10,
+    "reference_kind": "instantiates",
+    "reference_name": "Registered"
+  },
+  {
+    "candidates": null,
+    "col": 14,
+    "file_path": "dispatch/src/Orders.cs",
+    "from_node_id": "method:f31208ee05c865bc35c0f706a96c3a30",
+    "language": "csharp",
+    "line": 16,
+    "reference_kind": "calls",
+    "reference_name": "_mediator.Send"
+  },
+  {
+    "candidates": null,
+    "col": 14,
     "file_path": "go/gin/gin.go",
     "from_node_id": "method:5c7f5fa1be3ed8bd0afaea1987ab236b",
     "language": "go",
@@ -138,6 +198,16 @@
     "line": 14,
     "reference_kind": "calls",
     "reference_name": "len"
+  },
+  {
+    "candidates": null,
+    "col": 17,
+    "file_path": "dispatch/src/Orders.cs",
+    "from_node_id": "method:f31208ee05c865bc35c0f706a96c3a30",
+    "language": "csharp",
+    "line": 14,
+    "reference_kind": "references",
+    "reference_name": "Task"
   },
   {
     "candidates": null,
@@ -172,12 +242,32 @@
   {
     "candidates": null,
     "col": 2,
+    "file_path": "dispatch/app/workers/welcome_worker.rb",
+    "from_node_id": "class:0d1fdbdc20d3c1524720e79b000ddd1d",
+    "language": "ruby",
+    "line": 2,
+    "reference_kind": "implements",
+    "reference_name": "Sidekiq::Worker"
+  },
+  {
+    "candidates": null,
+    "col": 2,
     "file_path": "js/src/events.js",
     "from_node_id": "function:4c075e5c6998bde068ac64c5129298c1",
     "language": "javascript",
     "line": 12,
     "reference_kind": "calls",
     "reference_name": "bus.emit"
+  },
+  {
+    "candidates": null,
+    "col": 21,
+    "file_path": "dispatch/src/Orders.cs",
+    "from_node_id": "field:672c0f4b6dcddc33a260d0393990a992",
+    "language": "csharp",
+    "line": 12,
+    "reference_kind": "references",
+    "reference_name": "ISender"
   },
   {
     "candidates": null,
@@ -198,6 +288,16 @@
     "line": 25,
     "reference_kind": "function_ref",
     "reference_name": "e.Handlers"
+  },
+  {
+    "candidates": null,
+    "col": 24,
+    "file_path": "js/src/thunks.ts",
+    "from_node_id": "constant:df0d8b2254e4ba3660d72179cef212c8",
+    "language": "typescript",
+    "line": 7,
+    "reference_kind": "calls",
+    "reference_name": "createAsyncThunk"
   },
   {
     "candidates": null,
@@ -231,6 +331,26 @@
   },
   {
     "candidates": null,
+    "col": 26,
+    "file_path": "dispatch/src/Orders.cs",
+    "from_node_id": "class:253c64dd05f41b78ebb7a68e8aa02b46",
+    "language": "csharp",
+    "line": 3,
+    "reference_kind": "extends",
+    "reference_name": "IRequest"
+  },
+  {
+    "candidates": null,
+    "col": 27,
+    "file_path": "dispatch/app/Listeners/SendWelcome.php",
+    "from_node_id": "method:100387fd10458a252c1e7e679e93b7e1",
+    "language": "php",
+    "line": 8,
+    "reference_kind": "references",
+    "reference_name": "Registered"
+  },
+  {
+    "candidates": null,
     "col": 27,
     "file_path": "js/src/Counter.tsx",
     "from_node_id": "function:33d9d8364fb2a1c7aabe3039389f7a9c",
@@ -248,6 +368,16 @@
     "line": 1,
     "reference_kind": "imports",
     "reference_name": "createSlice"
+  },
+  {
+    "candidates": null,
+    "col": 27,
+    "file_path": "js/src/thunks.ts",
+    "from_node_id": "constant:d3bb0e99a96c57777bb522356d235e1b",
+    "language": "typescript",
+    "line": 3,
+    "reference_kind": "calls",
+    "reference_name": "createAsyncThunk"
   },
   {
     "candidates": null,
@@ -281,6 +411,26 @@
   },
   {
     "candidates": null,
+    "col": 32,
+    "file_path": "dispatch/app/services/signup.rb",
+    "from_node_id": "method:6c6925fe488048baffe7829bf858bf9d",
+    "language": "ruby",
+    "line": 3,
+    "reference_kind": "calls",
+    "reference_name": "user.id"
+  },
+  {
+    "candidates": null,
+    "col": 33,
+    "file_path": "dispatch/src/Orders.cs",
+    "from_node_id": "class:cc920e0108a83e95c6495f849c2f97f2",
+    "language": "csharp",
+    "line": 5,
+    "reference_kind": "extends",
+    "reference_name": "IRequestHandler"
+  },
+  {
+    "candidates": null,
     "col": 34,
     "file_path": "go/refresh/refresh.go",
     "from_node_id": "function:f8f21c17f8656f84fc213474805a9ec3",
@@ -288,6 +438,26 @@
     "line": 19,
     "reference_kind": "function_ref",
     "reference_name": "opts.RefreshF"
+  },
+  {
+    "candidates": null,
+    "col": 4,
+    "file_path": "dispatch/app/services/signup.rb",
+    "from_node_id": "method:6c6925fe488048baffe7829bf858bf9d",
+    "language": "ruby",
+    "line": 3,
+    "reference_kind": "calls",
+    "reference_name": "WelcomeWorker.perform_async"
+  },
+  {
+    "candidates": null,
+    "col": 4,
+    "file_path": "dispatch/app/workers/welcome_worker.rb",
+    "from_node_id": "method:62519ff44634c1c284163dc322ad4878",
+    "language": "ruby",
+    "line": 5,
+    "reference_kind": "calls",
+    "reference_name": "user_id"
   },
   {
     "candidates": null,
@@ -331,6 +501,16 @@
   },
   {
     "candidates": null,
+    "col": 48,
+    "file_path": "dispatch/src/Orders.cs",
+    "from_node_id": "method:9c1b4e873ff43e93f8713698beeaf7e4",
+    "language": "csharp",
+    "line": 7,
+    "reference_kind": "references",
+    "reference_name": "CancellationToken"
+  },
+  {
+    "candidates": null,
     "col": 6,
     "file_path": "js/src/store.ts",
     "from_node_id": "constant:9eff9be391067cb6961cb0e9edd413b4",
@@ -348,6 +528,26 @@
     "line": 3,
     "reference_kind": "imports",
     "reference_name": "context"
+  },
+  {
+    "candidates": null,
+    "col": 73,
+    "file_path": "dispatch/src/Orders.cs",
+    "from_node_id": "method:9c1b4e873ff43e93f8713698beeaf7e4",
+    "language": "csharp",
+    "line": 7,
+    "reference_kind": "calls",
+    "reference_name": "Task.FromResult"
+  },
+  {
+    "candidates": null,
+    "col": 8,
+    "file_path": "dispatch/app/Http/Registration.php",
+    "from_node_id": "method:b8634218ad53bdcf252458f8e5eda333",
+    "language": "php",
+    "line": 10,
+    "reference_kind": "calls",
+    "reference_name": "event"
   },
   {
     "candidates": null,
@@ -408,5 +608,15 @@
     "line": 2,
     "reference_kind": "imports",
     "reference_name": "defineStore"
+  },
+  {
+    "candidates": null,
+    "col": 9,
+    "file_path": "js/src/thunks.ts",
+    "from_node_id": "file:js/src/thunks.ts",
+    "language": "typescript",
+    "line": 1,
+    "reference_kind": "imports",
+    "reference_name": "createAsyncThunk"
   }
 ]

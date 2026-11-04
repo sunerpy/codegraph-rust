@@ -23241,7 +23241,7 @@ mod synthesis {
         assert_eq!((edge.line, edge.col), (Some(7), None), "{edge:?}");
         assert_eq!(
             project_metadata_with_prefix(&project.db(), "synthesis_version"),
-            [("synthesis_version".to_string(), "7".to_string())]
+            [("synthesis_version".to_string(), "8".to_string())]
         );
     }
 
@@ -29415,5 +29415,1473 @@ mod go_func_field {
             "{}",
             graph.report()
         );
+    }
+}
+
+/// W7-16a: the framework dispatch passes, upstream's six tests with their
+/// sources as written, and the cases Rust adds.
+mod framework_dispatch {
+    use super::support::{EdgeRow, Graph, Project, graph_of};
+
+    /// The `calls` edges the pass `by` made.
+    fn synthesized_by<'g>(graph: &'g Graph, by: &'g str) -> impl Iterator<Item = &'g EdgeRow> {
+        graph
+            .edges
+            .iter()
+            .filter(move |edge| edge.kind == "calls" && edge.metadata["synthesizedBy"] == by)
+    }
+
+    /// Every `calls` edge the pass `by` made, as `source -> target via
+    /// <via> @<registeredAt> line <line>` over qualified names, sorted; each
+    /// is heuristic and has no column.
+    #[track_caller]
+    fn links(graph: &Graph, by: &str) -> Vec<String> {
+        let name = |id: &str| {
+            graph
+                .node(id)
+                .map_or_else(|| "?".to_string(), |node| node.qualified_name.clone())
+        };
+        let mut links: Vec<String> = synthesized_by(graph, by)
+            .map(|edge| {
+                assert_eq!(edge.provenance.as_deref(), Some("heuristic"), "{edge:?}");
+                assert_eq!(edge.col, None, "{edge:?}");
+                format!(
+                    "{} -> {} via {} @{} line {}",
+                    name(&edge.source),
+                    name(&edge.target),
+                    edge.metadata["via"].as_str().unwrap_or("?"),
+                    edge.metadata["registeredAt"].as_str().unwrap_or("?"),
+                    edge.line
+                        .map_or_else(|| "?".to_string(), |line| line.to_string()),
+                )
+            })
+            .collect();
+        links.sort();
+        links
+    }
+
+    /// The 1-based line of `text` holding `needle`.
+    #[track_caller]
+    fn line_of(text: &str, needle: &str) -> usize {
+        text.split('\n')
+            .position(|line| line.contains(needle))
+            .unwrap_or_else(|| panic!("no line holds {needle:?}"))
+            + 1
+    }
+
+    /// `thunks.ts` of upstream's `redux-thunk-synthesizer.test.ts` (line 31).
+    const THUNKS_TS: &str = concat!(
+        "import { createAsyncThunk } from '@reduxjs/toolkit';\n",
+        "\n",
+        "export const deepThunk = createAsyncThunk('app/deep', async (n: number) => {\n",
+        "  return n * 2;\n",
+        "});\n",
+        "\n",
+        "export const innerThunk = createAsyncThunk('app/inner', async (n: number, { dispatch }) => {\n",
+        "  return dispatch(deepThunk(n));\n",
+        "});\n",
+        "\n",
+        "export const outerThunk = createAsyncThunk('app/outer', async (n: number, { dispatch }) => {\n",
+        "  await dispatch(innerThunk(n));\n",
+        "});\n",
+        "\n",
+        "// Non-thunk constant that only MENTIONS dispatch in a string — must be skipped.\n",
+        "export const notAThunk = 'dispatch(innerThunk())';\n",
+    );
+
+    /// `service.ts` of upstream's `redux-thunk-synthesizer.test.ts` (line 93).
+    const SERVICE_TS: &str = "export function leaveCall(id: string) { return id; }\n";
+
+    /// `thunks.ts` of upstream's `redux-thunk-synthesizer.test.ts` (line 95).
+    const LEAVE_THUNKS_TS: &str = concat!(
+        "import { createAsyncThunk } from '@reduxjs/toolkit';\n",
+        "\n",
+        "export const leaveCall = createAsyncThunk('call/leave', async () => {\n",
+        "  return 1;\n",
+        "});\n",
+        "\n",
+        "export const logout = createAsyncThunk('user/logout', async (_: void, { dispatch }) => {\n",
+        "  dispatch(leaveCall());\n",
+        "});\n",
+    );
+
+    /// `tasks.py` of upstream's `celery-dispatch-synthesizer.test.ts` (line 27).
+    const TASKS_PY: &str = concat!(
+        "from celery import shared_task\n",
+        "from myapp.celery import app\n",
+        "\n",
+        "\n",
+        "@shared_task\n",
+        "def send_email(to):\n",
+        "    return to\n",
+        "\n",
+        "\n",
+        "@app.task(bind=True, max_retries=3)\n",
+        "def crunch(self, n):\n",
+        "    return n * 2\n",
+    );
+
+    /// `services/tickets.py` of upstream's `celery-dispatch-synthesizer.test.ts` (line 44).
+    const TICKETS_PY: &str = concat!(
+        "from celery import shared_task\n",
+        "\n",
+        "\n",
+        "@shared_task\n",
+        "def invalidate_cache():\n",
+        "    return None\n",
+    );
+
+    /// `utils.py` of upstream's `celery-dispatch-synthesizer.test.ts` (line 55).
+    const UTILS_PY: &str = concat!("def process_data(x):\n", "    return x\n",);
+
+    /// `views.py` of upstream's `celery-dispatch-synthesizer.test.ts` (line 62).
+    const VIEWS_PY: &str = concat!(
+        "from tasks import send_email, crunch\n",
+        "from services import tickets\n",
+        "from utils import process_data\n",
+        "from celery import group\n",
+        "\n",
+        "\n",
+        "def handle_request(req):\n",
+        "    send_email.delay(req.addr)                 # → send_email task (cross-file)\n",
+        "    crunch.apply_async(args=[5])               # → crunch task (@app.task dialect)\n",
+        "    tickets.invalidate_cache.apply_async()     # module-qualified → invalidate_cache\n",
+        "    process_data.delay(req.x)                  # NOT a task → no edge\n",
+        "    group([send_email.s(a) for a in req.addrs]).delay()  # canvas → no edge\n",
+    );
+
+    /// `app.py` of upstream's `celery-dispatch-synthesizer.test.ts` (line 108).
+    const CELERY_FREE_PY: &str = concat!(
+        "def schedule(job):\n",
+        "    job.delay()          # a .delay() that has nothing to do with Celery\n",
+        "    return job\n",
+        "\n",
+        "\n",
+        "def run():\n",
+        "    schedule(make_job())\n",
+    );
+
+    /// `shop/OrderEvents.java` of upstream's `spring-event-synthesizer.test.ts` (line 32).
+    const ORDER_EVENTS_JAVA: &str = concat!(
+        "package shop;\n",
+        "class OrderShippedEvent { }\n",
+        "class OrderCancelledEvent { }\n",
+        "class UnheardEvent { }\n",
+    );
+
+    /// `shop/OrderService.java` of upstream's `spring-event-synthesizer.test.ts` (line 38).
+    const ORDER_SERVICE_JAVA: &str = concat!(
+        "package shop;\n",
+        "import org.springframework.context.ApplicationEventPublisher;\n",
+        "class OrderService {\n",
+        "    private ApplicationEventPublisher publisher;\n",
+        "    void ship() {\n",
+        "        publisher.publishEvent(new OrderShippedEvent());\n",
+        "        publisher.publishEvent(new UnheardEvent());\n",
+        "    }\n",
+        "    void cancel() {\n",
+        "        publisher.publishEvent(new OrderCancelledEvent());\n",
+        "    }\n",
+        "}\n",
+    );
+
+    /// `shop/ShippingListener.java` of upstream's `spring-event-synthesizer.test.ts` (line 52).
+    const SHIPPING_LISTENER_JAVA: &str = concat!(
+        "package shop;\n",
+        "import org.springframework.context.event.EventListener;\n",
+        "class ShippingListener {\n",
+        "    @EventListener\n",
+        "    public void onShipped(OrderShippedEvent event) { }\n",
+        "\n",
+        "    public void helper(OrderShippedEvent event) { }\n",
+        "}\n",
+    );
+
+    /// `shop/AuditListener.java` of upstream's `spring-event-synthesizer.test.ts` (line 62).
+    const AUDIT_LISTENER_JAVA: &str = concat!(
+        "package shop;\n",
+        "import org.springframework.context.event.EventListener;\n",
+        "class AuditListener {\n",
+        "    @EventListener(OrderShippedEvent.class)\n",
+        "    public void audit(OrderShippedEvent event) { }\n",
+        "}\n",
+    );
+
+    /// `shop/TxListener.java` of upstream's `spring-event-synthesizer.test.ts` (line 70).
+    const TX_LISTENER_JAVA: &str = concat!(
+        "package shop;\n",
+        "import org.springframework.transaction.event.TransactionalEventListener;\n",
+        "class TxListener {\n",
+        "    @TransactionalEventListener\n",
+        "    public void afterShipped(OrderShippedEvent event) { }\n",
+        "}\n",
+    );
+
+    /// `shop/LegacyListener.java` of upstream's `spring-event-synthesizer.test.ts` (line 78).
+    const LEGACY_LISTENER_JAVA: &str = concat!(
+        "package shop;\n",
+        "import org.springframework.context.ApplicationListener;\n",
+        "class LegacyListener implements ApplicationListener<OrderCancelledEvent> {\n",
+        "    @Override\n",
+        "    public void onApplicationEvent(OrderCancelledEvent event) { }\n",
+        "}\n",
+    );
+
+    /// `shop/PlainService.java` of upstream's `spring-event-synthesizer.test.ts` (line 114).
+    const PLAIN_SERVICE_JAVA: &str = concat!(
+        "package shop;\n",
+        "import org.springframework.stereotype.Service;\n",
+        "@Service\n",
+        "class PlainService {\n",
+        "    private final Repo repo;\n",
+        "    PlainService(Repo repo) { this.repo = repo; }\n",
+        "    String find(String id) { return repo.get(id); }\n",
+        "}\n",
+    );
+
+    /// `Requests.cs` of upstream's `mediatr-dispatch-synthesizer.test.ts` (line 31).
+    const REQUESTS_CS: &str = concat!(
+        "namespace Shop;\n",
+        "using MediatR;\n",
+        "public record GetThingsQuery : IRequest<ThingsVm>;\n",
+        "public record CreateThingCommand(string Name) : IRequest<int>;\n",
+        "public record DeleteThingCommand(int Id) : IRequest;\n",
+        "public record ThingDeletedNotification(int Id) : INotification;\n",
+        "public class UnhandledCommand : IRequest<int> { }\n",
+    );
+
+    /// `Handlers.cs` of upstream's `mediatr-dispatch-synthesizer.test.ts` (line 39).
+    const HANDLERS_CS: &str = concat!(
+        "namespace Shop;\n",
+        "using MediatR;\n",
+        "using System.Threading;\n",
+        "using System.Threading.Tasks;\n",
+        "public class GetThingsQueryHandler : IRequestHandler<GetThingsQuery, ThingsVm> {\n",
+        "    public Task<ThingsVm> Handle(GetThingsQuery request, CancellationToken ct) => Task.FromResult(new ThingsVm());\n",
+        "}\n",
+        "public class CreateThingCommandHandler : IRequestHandler<CreateThingCommand, int> {\n",
+        "    public Task<int> Handle(CreateThingCommand request, CancellationToken ct) => Task.FromResult(1);\n",
+        "}\n",
+        "public class DeleteThingCommandHandler : IRequestHandler<DeleteThingCommand> {\n",
+        "    public Task Handle(DeleteThingCommand request, CancellationToken ct) => Task.CompletedTask;\n",
+        "}\n",
+        "public class ThingDeletedNotificationHandler : INotificationHandler<ThingDeletedNotification> {\n",
+        "    public Task Handle(ThingDeletedNotification notification, CancellationToken ct) => Task.CompletedTask;\n",
+        "}\n",
+    );
+
+    /// `ThingsController.cs` of upstream's `mediatr-dispatch-synthesizer.test.ts` (line 56).
+    const THINGS_CONTROLLER_CS: &str = concat!(
+        "namespace Shop;\n",
+        "using MediatR;\n",
+        "using System.Threading.Tasks;\n",
+        "public class ThingsController {\n",
+        "    private readonly ISender _mediator;\n",
+        "    public ThingsController(ISender mediator) { _mediator = mediator; }\n",
+        "\n",
+        "    public async Task GetThings() {\n",
+        "        var vm = await _mediator.Send(new GetThingsQuery());\n",
+        "    }\n",
+        "    public async Task Create(CreateThingCommand command) {\n",
+        "        var id = await _mediator.Send(command);\n",
+        "    }\n",
+        "    public async Task Delete(int id) {\n",
+        "        var command = new DeleteThingCommand(id);\n",
+        "        await _mediator.Send(command);\n",
+        "    }\n",
+        "    public async Task Notify(int id) {\n",
+        "        await _mediator.Publish(new ThingDeletedNotification(id));\n",
+        "    }\n",
+        "    public async Task Bogus() {\n",
+        "        await _mediator.Send(new UnhandledCommand());\n",
+        "    }\n",
+        "    public void ViaMessagingCenter() {\n",
+        "        MessagingCenter.Send(this, \"evt\", new CreateThingCommand(\"x\"));\n",
+        "    }\n",
+        "}\n",
+    );
+
+    /// `Service.cs` of upstream's `mediatr-dispatch-synthesizer.test.ts` (line 112).
+    const MEDIATR_FREE_CS: &str = concat!(
+        "namespace Shop;\n",
+        "public class Service {\n",
+        "    private readonly IRepo _repo;\n",
+        "    public Service(IRepo repo) { _repo = repo; }\n",
+        "    public string Find(string id) => _repo.Get(id);\n",
+        "}\n",
+    );
+
+    /// `app/workers/destroy_user_worker.rb` of upstream's `sidekiq-dispatch-synthesizer.test.ts` (line 30).
+    const DESTROY_USER_WORKER_RB: &str = concat!(
+        "class DestroyUserWorker\n",
+        "  include Sidekiq::Worker\n",
+        "  def perform(user_id)\n",
+        "    User.find(user_id).destroy!\n",
+        "  end\n",
+        "end\n",
+    );
+
+    /// `app/workers/send_email_worker.rb` of upstream's `sidekiq-dispatch-synthesizer.test.ts` (line 38).
+    const SEND_EMAIL_WORKER_RB: &str = concat!(
+        "class SendEmailWorker\n",
+        "  include Sidekiq::Job\n",
+        "  def perform(addr)\n",
+        "  end\n",
+        "end\n",
+    );
+
+    /// `app/workers/comments/notify_worker.rb` of upstream's `sidekiq-dispatch-synthesizer.test.ts` (line 45).
+    const COMMENTS_NOTIFY_WORKER_RB: &str = concat!(
+        "module Comments\n",
+        "  class NotifyWorker\n",
+        "    include Sidekiq::Job\n",
+        "    def perform(id)\n",
+        "    end\n",
+        "  end\n",
+        "end\n",
+    );
+
+    /// `app/workers/articles/notify_worker.rb` of upstream's `sidekiq-dispatch-synthesizer.test.ts` (line 53).
+    const ARTICLES_NOTIFY_WORKER_RB: &str = concat!(
+        "module Articles\n",
+        "  class NotifyWorker\n",
+        "    include Sidekiq::Job\n",
+        "    def perform(id)\n",
+        "    end\n",
+        "  end\n",
+        "end\n",
+    );
+
+    /// `app/services/report.rb` of upstream's `sidekiq-dispatch-synthesizer.test.ts` (line 62).
+    const REPORT_RB: &str = concat!("class Report\n", "  def perform(x)\n", "  end\n", "end\n",);
+
+    /// `app/jobs/cleanup_job.rb` of upstream's `sidekiq-dispatch-synthesizer.test.ts` (line 68).
+    const CLEANUP_JOB_RB: &str = concat!(
+        "class CleanupJob < ApplicationJob\n",
+        "  def perform\n",
+        "  end\n",
+        "end\n",
+    );
+
+    /// `app/services/user_service.rb` of upstream's `sidekiq-dispatch-synthesizer.test.ts` (line 73).
+    const USER_SERVICE_RB: &str = concat!(
+        "class UserService\n",
+        "  def deactivate(user)\n",
+        "    DestroyUserWorker.perform_async(user.id)\n",
+        "    SendEmailWorker.perform_in(5, user.email)\n",
+        "    Comments::NotifyWorker.perform_async(1)\n",
+        "    Articles::NotifyWorker.perform_async(2)\n",
+        "    Report.perform_async(3)\n",
+        "    CleanupJob.perform_later\n",
+        "  end\n",
+        "end\n",
+    );
+
+    /// `lib/calc.rb` of upstream's `sidekiq-dispatch-synthesizer.test.ts` (line 113).
+    const SIDEKIQ_FREE_RB: &str = concat!(
+        "class Calc\n",
+        "  def add(a, b)\n",
+        "    a + b\n",
+        "  end\n",
+        "end\n",
+    );
+
+    /// `app/Listeners/LoveTrack.php` of upstream's `laravel-event-synthesizer.test.ts` (line 41).
+    const LOVE_TRACK_PHP: &str = concat!(
+        "<?php\n",
+        "namespace App\\Listeners;\n",
+        "use App\\Events\\SongLiked;\n",
+        "class LoveTrack {\n",
+        "    public function handle(SongLiked $event): void {}\n",
+        "}\n",
+    );
+
+    /// `app/Listeners/PruneLibrary.php` of upstream's `laravel-event-synthesizer.test.ts` (line 49).
+    const PRUNE_LIBRARY_PHP: &str = concat!(
+        "<?php\n",
+        "namespace App\\Listeners;\n",
+        "class PruneLibrary {\n",
+        "    public function handle(): void {}\n",
+        "}\n",
+    );
+
+    /// `app/Listeners/WriteScanLog.php` of upstream's `laravel-event-synthesizer.test.ts` (line 56).
+    const WRITE_SCAN_LOG_PHP: &str = concat!(
+        "<?php\n",
+        "namespace App\\Listeners;\n",
+        "use App\\Events\\ScanDone;\n",
+        "class WriteScanLog {\n",
+        "    public function handle(ScanDone $event): void {}\n",
+        "}\n",
+    );
+
+    /// `app/Listeners/DeleteStale.php` of upstream's `laravel-event-synthesizer.test.ts` (line 63).
+    const DELETE_STALE_PHP: &str = concat!(
+        "<?php\n",
+        "namespace App\\Listeners;\n",
+        "use App\\Events\\ScanDone;\n",
+        "class DeleteStale {\n",
+        "    public function handle(ScanDone $event): void {}\n",
+        "}\n",
+    );
+
+    /// `app/Listeners/SendsTestNotification.php` of upstream's `laravel-event-synthesizer.test.ts` (line 71).
+    const SENDS_TEST_NOTIFICATION_PHP: &str = concat!(
+        "<?php\n",
+        "namespace App\\Listeners;\n",
+        "use App\\Events\\OwnerTest;\n",
+        "use App\\Events\\UserTest;\n",
+        "class SendsTestNotification {\n",
+        "    public function handle(OwnerTest|UserTest $event): void {}\n",
+        "}\n",
+    );
+
+    /// `app/Jobs/ProcessAudio.php` of upstream's `laravel-event-synthesizer.test.ts` (line 80).
+    const PROCESS_AUDIO_PHP: &str = concat!(
+        "<?php\n",
+        "namespace App\\Jobs;\n",
+        "use App\\Services\\AudioService;\n",
+        "class ProcessAudio implements ShouldQueue {\n",
+        "    public function handle(AudioService $svc): void {}\n",
+        "}\n",
+    );
+
+    /// `app/Providers/EventServiceProvider.php` of upstream's `laravel-event-synthesizer.test.ts` (line 88).
+    const EVENT_SERVICE_PROVIDER_PHP: &str = concat!(
+        "<?php\n",
+        "namespace App\\Providers;\n",
+        "use App\\Events\\LibraryChanged;\n",
+        "use App\\Listeners\\PruneLibrary;\n",
+        "class EventServiceProvider {\n",
+        "    protected $listen = [\n",
+        "        LibraryChanged::class => [\n",
+        "            PruneLibrary::class,\n",
+        "        ],\n",
+        "    ];\n",
+        "}\n",
+    );
+
+    /// `app/Services/SongService.php` of upstream's `laravel-event-synthesizer.test.ts` (line 100).
+    const SONG_SERVICE_PHP: &str = concat!(
+        "<?php\n",
+        "namespace App\\Services;\n",
+        "use App\\Events\\SongLiked;\n",
+        "use App\\Events\\LibraryChanged;\n",
+        "use App\\Events\\ScanDone;\n",
+        "use App\\Events\\OwnerTest;\n",
+        "use App\\Events\\UserTest;\n",
+        "use App\\Jobs\\ProcessAudio;\n",
+        "class SongService {\n",
+        "    public function like(int $id): void { event(new SongLiked($id)); }\n",
+        "    public function deleteSongs(): void { event(new LibraryChanged()); }\n",
+        "    public function scan(): void { event(new ScanDone()); }\n",
+        "    public function ownerTest(): void { event(new OwnerTest()); }\n",
+        "    public function userTest(): void { event(new UserTest()); }\n",
+        "    public function process(): void {\n",
+        "        ProcessAudio::dispatch();\n",
+        "        dispatch(new ProcessAudio());\n",
+        "    }\n",
+        "}\n",
+    );
+
+    /// `src/Client.php` of upstream's `laravel-event-synthesizer.test.ts` (line 154).
+    const EVENT_FREE_PHP: &str = concat!(
+        "<?php\n",
+        "namespace Acme;\n",
+        "class Client {\n",
+        "    public function send(string $url): string { return $url; }\n",
+        "}\n",
+    );
+
+    /// The `package.json` the thunk tests write (`JSON.stringify`).
+    const THUNK_PACKAGE_JSON: &str = r#"{"name":"app","dependencies":{"@reduxjs/toolkit":"^2"}}"#;
+
+    /// The five event classes upstream's Laravel test writes in a loop.
+    fn laravel_event(name: &str, body: &str) -> String {
+        format!("<?php\nnamespace App\\Events;\nclass {name} {{\n  {body}\n}}\n")
+    }
+
+    /// Upstream `redux-thunk-synthesizer.test.ts`, first case: each thunk
+    /// constant links to the thunk its body dispatches, so `outer → inner →
+    /// deep` connects; the constant that only mentions `dispatch` in a
+    /// string is no source.
+    #[test]
+    fn w716a_thunks_link_the_thunks_they_dispatch() {
+        let project = Project::new()
+            .file("package.json", THUNK_PACKAGE_JSON)
+            .file("thunks.ts", THUNKS_TS)
+            .index();
+        let graph = graph_of(&project);
+        let inner = line_of(THUNKS_TS, "return dispatch(deepThunk(n));");
+        let outer = line_of(THUNKS_TS, "await dispatch(innerThunk(n));");
+        assert_eq!(
+            links(graph, "redux-thunk"),
+            [
+                format!("innerThunk -> deepThunk via deepThunk @thunks.ts:{inner} line {inner}"),
+                format!("outerThunk -> innerThunk via innerThunk @thunks.ts:{outer} line {outer}"),
+            ],
+            "{}",
+            graph.report()
+        );
+        for edge in synthesized_by(graph, "redux-thunk") {
+            assert_eq!(
+                graph.node(&edge.source).map(|node| node.kind.as_str()),
+                Some("constant")
+            );
+        }
+    }
+
+    /// Upstream's second case: `dispatch(leaveCall())` reaches the
+    /// `createAsyncThunk` constant, not the service function of that name
+    /// another file declares.
+    #[test]
+    fn w716a_a_dispatch_reaches_the_thunk_not_a_namesake_function() {
+        let project = Project::new()
+            .file("package.json", THUNK_PACKAGE_JSON)
+            .file("service.ts", SERVICE_TS)
+            .file("thunks.ts", LEAVE_THUNKS_TS)
+            .index();
+        let graph = graph_of(&project);
+        let line = line_of(LEAVE_THUNKS_TS, "dispatch(leaveCall());");
+        assert_eq!(
+            links(graph, "redux-thunk"),
+            [format!(
+                "logout -> leaveCall via leaveCall @thunks.ts:{line} line {line}"
+            )],
+            "{}",
+            graph.report()
+        );
+        let edge = synthesized_by(graph, "redux-thunk")
+            .next()
+            .expect("the edge");
+        let target = graph.node(&edge.target).expect("the target");
+        assert_eq!(
+            (target.kind.as_str(), target.file_path.as_str()),
+            ("constant", "thunks.ts")
+        );
+    }
+
+    /// A thunk that dispatches itself links nothing to itself, and a
+    /// dispatch in a comment is not read.
+    #[test]
+    fn w716a_a_thunk_links_neither_itself_nor_a_commented_dispatch() {
+        let source = concat!(
+            "import { createAsyncThunk } from '@reduxjs/toolkit';\n",
+            "\n",
+            "export const retry = createAsyncThunk('job/retry', async (_: void, { dispatch }) => {\n",
+            "  // dispatch(cancel());\n",
+            "  /* dispatch(cancel()); */\n",
+            "  dispatch(retry());\n",
+            "});\n",
+            "\n",
+            "export const cancel = createAsyncThunk('job/cancel', async () => 1);\n",
+        );
+        // A namesake thunk in a file listed first: the dispatch of the
+        // thunk's own name is skipped, not linked to it.
+        let namesake = "export const retry = createAsyncThunk('other/retry', async () => 1);\n";
+        let project = Project::new()
+            .file("package.json", THUNK_PACKAGE_JSON)
+            .file("a/retry.ts", namesake)
+            .file("jobs.ts", source)
+            .index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            links(graph, "redux-thunk"),
+            Vec::<String>::new(),
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream `celery-dispatch-synthesizer.test.ts`, first case: the
+    /// function around each `.delay(…)` or `.apply_async(…)` reaches the
+    /// task of either decorator dialect, a module-qualified dispatch
+    /// included; a plain function and a canvas reach nothing.
+    #[test]
+    fn w716a_celery_links_dispatches_to_decorated_tasks() {
+        let project = Project::new()
+            .file("tasks.py", TASKS_PY)
+            .file("services/tickets.py", TICKETS_PY)
+            .file("utils.py", UTILS_PY)
+            .file("views.py", VIEWS_PY)
+            .index();
+        let graph = graph_of(&project);
+        let send = line_of(VIEWS_PY, "send_email.delay(req.addr)");
+        let crunch = line_of(VIEWS_PY, "crunch.apply_async(args=[5])");
+        let cache = line_of(VIEWS_PY, "tickets.invalidate_cache.apply_async()");
+        assert_eq!(
+            links(graph, "celery-dispatch"),
+            [
+                format!("handle_request -> crunch via crunch @views.py:{crunch} line {crunch}"),
+                format!(
+                    "handle_request -> invalidate_cache via invalidate_cache @views.py:{cache} line {cache}"
+                ),
+                format!("handle_request -> send_email via send_email @views.py:{send} line {send}"),
+            ],
+            "{}",
+            graph.report()
+        );
+        let targets: Vec<&str> = synthesized_by(graph, "celery-dispatch")
+            .map(|edge| graph.node(&edge.target).expect("target").file_path.as_str())
+            .collect();
+        assert!(targets.contains(&"services/tickets.py"), "{targets:?}");
+    }
+
+    /// Upstream's second case: a `.delay()` with nothing to do with Celery
+    /// links nothing.
+    #[test]
+    fn w716a_celery_needs_a_task() {
+        let project = Project::new().file("app.py", CELERY_FREE_PY).index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            links(graph, "celery-dispatch"),
+            Vec::<String>::new(),
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Tasks of one name in two modules: the dispatching file's is the one,
+    /// and a third file's dispatch, with no task of its own, reaches none.
+    #[test]
+    fn w716a_celery_picks_the_dispatching_files_task_of_a_shared_name() {
+        let task = |body: &str| {
+            format!(
+                "from celery import shared_task\n\n@shared_task\ndef run():\n    return {body}\n\n\ndef go():\n    run.delay()\n"
+            )
+        };
+        let project = Project::new()
+            .file("a.py", &task("1"))
+            .file("b.py", &task("2"))
+            .file(
+                "c.py",
+                "from a import run\n\n\ndef elsewhere():\n    run.delay()\n",
+            )
+            .index();
+        let graph = graph_of(&project);
+        let file = |id: &str| graph.node(id).expect("node").file_path.clone();
+        let mut pairs: Vec<String> = synthesized_by(graph, "celery-dispatch")
+            .map(|edge| {
+                format!(
+                    "{} -> {} @{}",
+                    file(&edge.source),
+                    file(&edge.target),
+                    edge.metadata["registeredAt"].as_str().unwrap_or("?")
+                )
+            })
+            .collect();
+        pairs.sort();
+        assert_eq!(
+            pairs,
+            ["a.py -> a.py @a.py:9", "b.py -> b.py @b.py:9"],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// A task's decorator is read upward from its own `def`, stopping at the
+    /// declaration before it and at most twelve lines up: a decorator above
+    /// the previous `def`, or thirteen lines up, makes no task.
+    #[test]
+    fn w716a_celery_reads_a_tasks_own_decorator() {
+        let mut tasks = String::from(concat!(
+            "from celery import shared_task\n",
+            "\n",
+            "@shared_task\n",
+            "def first():\n",
+            "    pass\n",
+            "def second():\n",
+            "    pass\n",
+            "\n",
+            "@shared_task\n",
+        ));
+        for i in 0..12 {
+            tasks.push_str(&format!("# filler {i}\n"));
+        }
+        tasks.push_str(concat!(
+            "def far():\n",
+            "    pass\n",
+            "\n",
+            "\n",
+            "def go():\n",
+            "    first.delay()\n",
+            "    second.delay()\n",
+            "    far.delay()\n",
+        ));
+        let project = Project::new().file("tasks.py", &tasks).index();
+        let graph = graph_of(&project);
+        let line = line_of(&tasks, "    first.delay()");
+        assert_eq!(
+            links(graph, "celery-dispatch"),
+            [format!(
+                "go -> first via first @tasks.py:{line} line {line}"
+            )],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream `spring-event-synthesizer.test.ts`, first case: a published
+    /// event reaches every listener of its type, a parameter-typed,
+    /// annotation-typed or transactional `@EventListener` and an
+    /// `ApplicationListener`'s `onApplicationEvent`; an event nobody hears
+    /// and a method without the annotation are no part of it.
+    #[test]
+    fn w716a_spring_links_published_events_to_their_listeners() {
+        let project = Project::new()
+            .file("shop/OrderEvents.java", ORDER_EVENTS_JAVA)
+            .file("shop/OrderService.java", ORDER_SERVICE_JAVA)
+            .file("shop/ShippingListener.java", SHIPPING_LISTENER_JAVA)
+            .file("shop/AuditListener.java", AUDIT_LISTENER_JAVA)
+            .file("shop/TxListener.java", TX_LISTENER_JAVA)
+            .file("shop/LegacyListener.java", LEGACY_LISTENER_JAVA)
+            .index();
+        let graph = graph_of(&project);
+        let ship = line_of(ORDER_SERVICE_JAVA, "new OrderShippedEvent()");
+        let cancel = line_of(ORDER_SERVICE_JAVA, "new OrderCancelledEvent()");
+        let at = |line: usize| format!("@shop/OrderService.java:{line} line {line}");
+        assert_eq!(
+            links(graph, "spring-event"),
+            [
+                format!(
+                    "shop::OrderService::cancel -> shop::LegacyListener::onApplicationEvent via OrderCancelledEvent {}",
+                    at(cancel)
+                ),
+                format!(
+                    "shop::OrderService::ship -> shop::AuditListener::audit via OrderShippedEvent {}",
+                    at(ship)
+                ),
+                format!(
+                    "shop::OrderService::ship -> shop::ShippingListener::onShipped via OrderShippedEvent {}",
+                    at(ship)
+                ),
+                format!(
+                    "shop::OrderService::ship -> shop::TxListener::afterShipped via OrderShippedEvent {}",
+                    at(ship)
+                ),
+            ],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream's second case: a Spring service without an event bus links
+    /// nothing.
+    #[test]
+    fn w716a_spring_needs_an_event_bus() {
+        let project = Project::new()
+            .file("shop/PlainService.java", PLAIN_SERVICE_JAVA)
+            .index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            links(graph, "spring-event"),
+            Vec::<String>::new(),
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// A listener's annotations are the `@` lines it starts with: one after
+    /// a comment line is not read. `@EventListener(X.class)` on a method
+    /// without parameters listens for `X`, and a generic first parameter
+    /// (`Map<String, X>`) names no event.
+    #[test]
+    fn w716a_spring_reads_a_listeners_own_annotation_block() {
+        let listeners = concat!(
+            "package shop;\n",
+            "class Listeners {\n",
+            "    @Async\n",
+            "    // a note\n",
+            "    @EventListener\n",
+            "    public void later(OrderShippedEvent event) { }\n",
+            "\n",
+            "    @EventListener(OrderShippedEvent.class)\n",
+            "    public void onAny() { }\n",
+            "\n",
+            "    @EventListener\n",
+            "    public void onMap(Map<String, OrderShippedEvent> events) { }\n",
+            "}\n",
+        );
+        let project = Project::new()
+            .file("shop/OrderEvents.java", ORDER_EVENTS_JAVA)
+            .file("shop/OrderService.java", ORDER_SERVICE_JAVA)
+            .file("shop/Listeners.java", listeners)
+            .index();
+        let graph = graph_of(&project);
+        let ship = line_of(ORDER_SERVICE_JAVA, "new OrderShippedEvent()");
+        assert_eq!(
+            links(graph, "spring-event"),
+            [format!(
+                "shop::OrderService::ship -> shop::Listeners::onAny via OrderShippedEvent @shop/OrderService.java:{ship} line {ship}"
+            )],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream `mediatr-dispatch-synthesizer.test.ts`, first case: a
+    /// request sent inline, as a parameter or as a local, and a published
+    /// notification, each reach their handler's `Handle`; a request no
+    /// handler takes and `MessagingCenter.Send` reach nothing.
+    #[test]
+    fn w716a_mediatr_links_sends_to_their_handlers() {
+        let project = Project::new()
+            .file("Requests.cs", REQUESTS_CS)
+            .file("Handlers.cs", HANDLERS_CS)
+            .file("ThingsController.cs", THINGS_CONTROLLER_CS)
+            .index();
+        let graph = graph_of(&project);
+        let at = |needle: &str| {
+            let line = line_of(THINGS_CONTROLLER_CS, needle);
+            format!("@ThingsController.cs:{line} line {line}")
+        };
+        assert_eq!(
+            links(graph, "mediatr-dispatch"),
+            [
+                format!(
+                    "Shop::ThingsController::Create -> Shop::CreateThingCommandHandler::Handle via CreateThingCommand {}",
+                    at("var id = await _mediator.Send(command);")
+                ),
+                format!(
+                    "Shop::ThingsController::Delete -> Shop::DeleteThingCommandHandler::Handle via DeleteThingCommand {}",
+                    at("        await _mediator.Send(command);")
+                ),
+                format!(
+                    "Shop::ThingsController::GetThings -> Shop::GetThingsQueryHandler::Handle via GetThingsQuery {}",
+                    at("new GetThingsQuery()")
+                ),
+                format!(
+                    "Shop::ThingsController::Notify -> Shop::ThingDeletedNotificationHandler::Handle via ThingDeletedNotification {}",
+                    at("Publish(new ThingDeletedNotification(id))")
+                ),
+            ],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream's second case: a C# service without MediatR links nothing.
+    #[test]
+    fn w716a_mediatr_needs_a_handler() {
+        let project = Project::new().file("Service.cs", MEDIATR_FREE_CS).index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            links(graph, "mediatr-dispatch"),
+            Vec::<String>::new(),
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// An identifier assigned `new X` after its declaration sends `X`, a
+    /// receiver named `sender` is a mediator too, `Send(new lower(…))`
+    /// types nothing, and a receiver that is no mediator
+    /// (`_client.Send(new X())`) reaches nothing.
+    #[test]
+    fn w716a_mediatr_types_a_sent_identifier_by_its_last_assignment() {
+        let controller = concat!(
+            "namespace Shop;\n",
+            "public class Jobs {\n",
+            "    private readonly ISender sender;\n",
+            "    private readonly HttpClient _client;\n",
+            "    public async Task Rerun(int id) {\n",
+            "        DeleteThingCommand command;\n",
+            "        command = new CreateThingCommand(\"x\");\n",
+            "        await this.sender.Send(command);\n",
+            "    }\n",
+            "    public async Task Lower() {\n",
+            "        await this.sender.Send(new lower());\n",
+            "    }\n",
+            "    public async Task Wire() {\n",
+            "        await _client.Send(new CreateThingCommand(\"x\"));\n",
+            "    }\n",
+            "}\n",
+        );
+        let project = Project::new()
+            .file("Requests.cs", REQUESTS_CS)
+            .file("Handlers.cs", HANDLERS_CS)
+            .file("Jobs.cs", controller)
+            .index();
+        let graph = graph_of(&project);
+        let line = line_of(controller, "await this.sender.Send(command);");
+        assert_eq!(
+            links(graph, "mediatr-dispatch"),
+            [format!(
+                "Shop::Jobs::Rerun -> Shop::CreateThingCommandHandler::Handle via CreateThingCommand @Jobs.cs:{line} line {line}"
+            )],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// A handler's base list is read from the first four lines of its
+    /// class: a class whose own `Handle` sits beside an
+    /// `IRequestHandler<X>` only on its fifth line handles nothing.
+    #[test]
+    fn w716a_mediatr_reads_a_handlers_base_list_in_its_first_four_lines() {
+        let audit = concat!(
+            "namespace Shop;\n",
+            "public class AuditTrail\n",
+            "{\n",
+            "    public Task Handle(CreateThingCommand request, CancellationToken ct) => Task.CompletedTask;\n",
+            "\n",
+            "    // Not a handler: IRequestHandler<CreateThingCommand> is only named here.\n",
+            "}\n",
+        );
+        let project = Project::new()
+            .file("Requests.cs", REQUESTS_CS)
+            .file("Handlers.cs", HANDLERS_CS)
+            .file("AuditTrail.cs", audit)
+            .file("ThingsController.cs", THINGS_CONTROLLER_CS)
+            .index();
+        let graph = graph_of(&project);
+        let links = links(graph, "mediatr-dispatch");
+        assert!(
+            links.iter().any(|link| link.starts_with(
+                "Shop::ThingsController::Create -> Shop::CreateThingCommandHandler::Handle"
+            )),
+            "{links:#?}"
+        );
+        assert!(
+            !links.iter().any(|link| link.contains("AuditTrail")),
+            "{links:#?}"
+        );
+    }
+
+    /// Upstream `sidekiq-dispatch-synthesizer.test.ts`, first case: both
+    /// mixin aliases, `perform_async` and `perform_in`, and a qualified name
+    /// that keeps two `NotifyWorker`s apart; a class that only has a
+    /// `perform` and an ActiveJob reach nothing.
+    #[test]
+    fn w716a_sidekiq_links_enqueues_to_their_workers() {
+        let project = Project::new()
+            .file("app/workers/destroy_user_worker.rb", DESTROY_USER_WORKER_RB)
+            .file("app/workers/send_email_worker.rb", SEND_EMAIL_WORKER_RB)
+            .file(
+                "app/workers/comments/notify_worker.rb",
+                COMMENTS_NOTIFY_WORKER_RB,
+            )
+            .file(
+                "app/workers/articles/notify_worker.rb",
+                ARTICLES_NOTIFY_WORKER_RB,
+            )
+            .file("app/services/report.rb", REPORT_RB)
+            .file("app/jobs/cleanup_job.rb", CLEANUP_JOB_RB)
+            .file("app/services/user_service.rb", USER_SERVICE_RB)
+            .index();
+        let graph = graph_of(&project);
+        let at = |needle: &str| {
+            let line = line_of(USER_SERVICE_RB, needle);
+            format!("@app/services/user_service.rb:{line} line {line}")
+        };
+        assert_eq!(
+            links(graph, "sidekiq-dispatch"),
+            [
+                format!(
+                    "UserService::deactivate -> Articles::NotifyWorker::perform via Articles::NotifyWorker {}",
+                    at("Articles::NotifyWorker.perform_async(2)")
+                ),
+                format!(
+                    "UserService::deactivate -> Comments::NotifyWorker::perform via Comments::NotifyWorker {}",
+                    at("Comments::NotifyWorker.perform_async(1)")
+                ),
+                format!(
+                    "UserService::deactivate -> DestroyUserWorker::perform via DestroyUserWorker {}",
+                    at("DestroyUserWorker.perform_async(user.id)")
+                ),
+                format!(
+                    "UserService::deactivate -> SendEmailWorker::perform via SendEmailWorker {}",
+                    at("SendEmailWorker.perform_in(5, user.email)")
+                ),
+            ],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream's second case: Ruby without Sidekiq links nothing.
+    #[test]
+    fn w716a_sidekiq_needs_a_worker() {
+        let project = Project::new().file("lib/calc.rb", SIDEKIQ_FREE_RB).index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            links(graph, "sidekiq-dispatch"),
+            Vec::<String>::new(),
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// An unqualified name two workers share reaches neither. The mixin is
+    /// read from the class's text as upstream reads it, so a commented-out
+    /// `include Sidekiq::Worker` still makes a worker.
+    #[test]
+    fn w716a_sidekiq_needs_one_worker_of_an_unqualified_name() {
+        let caller = concat!(
+            "class Notifier\n",
+            "  def notify\n",
+            "    NotifyWorker.perform_async(1)\n",
+            "    QuietWorker.perform_async(2)\n",
+            "  end\n",
+            "end\n",
+        );
+        let quiet = concat!(
+            "class QuietWorker\n",
+            "  # include Sidekiq::Worker\n",
+            "  def perform(id)\n",
+            "  end\n",
+            "end\n",
+        );
+        let project = Project::new()
+            .file(
+                "app/workers/comments/notify_worker.rb",
+                COMMENTS_NOTIFY_WORKER_RB,
+            )
+            .file(
+                "app/workers/articles/notify_worker.rb",
+                ARTICLES_NOTIFY_WORKER_RB,
+            )
+            .file("app/workers/quiet_worker.rb", quiet)
+            .file("app/services/notifier.rb", caller)
+            .index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            links(graph, "sidekiq-dispatch"),
+            [
+                "Notifier::notify -> QuietWorker::perform via QuietWorker @app/services/notifier.rb:4 line 4"
+            ],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// The project of upstream's Laravel test.
+    fn laravel_project() -> Project {
+        let mut project = Project::new();
+        for (name, body) in [
+            (
+                "SongLiked",
+                "public int $id; public function __construct(int $id) { $this->id = $id; }",
+            ),
+            ("LibraryChanged", ""),
+            ("ScanDone", ""),
+            ("OwnerTest", ""),
+            ("UserTest", ""),
+        ] {
+            project = project.file(
+                &format!("app/Events/{name}.php"),
+                &laravel_event(name, body),
+            );
+        }
+        project
+            .file("app/Listeners/LoveTrack.php", LOVE_TRACK_PHP)
+            .file("app/Listeners/PruneLibrary.php", PRUNE_LIBRARY_PHP)
+            .file("app/Listeners/WriteScanLog.php", WRITE_SCAN_LOG_PHP)
+            .file("app/Listeners/DeleteStale.php", DELETE_STALE_PHP)
+            .file(
+                "app/Listeners/SendsTestNotification.php",
+                SENDS_TEST_NOTIFICATION_PHP,
+            )
+            .file("app/Jobs/ProcessAudio.php", PROCESS_AUDIO_PHP)
+    }
+
+    /// Upstream `laravel-event-synthesizer.test.ts`, first case: a typed
+    /// `handle`, the `$listen` map's untyped one, a union type and a fan-out
+    /// each reach their listeners; a queued job's dispatch reaches nothing.
+    #[test]
+    fn w716a_laravel_links_events_to_their_listeners() {
+        let project = laravel_project()
+            .file(
+                "app/Providers/EventServiceProvider.php",
+                EVENT_SERVICE_PROVIDER_PHP,
+            )
+            .file("app/Services/SongService.php", SONG_SERVICE_PHP)
+            .index();
+        let graph = graph_of(&project);
+        let at = |needle: &str| {
+            let line = line_of(SONG_SERVICE_PHP, needle);
+            format!("@app/Services/SongService.php:{line} line {line}")
+        };
+        let service = "App\\Services::SongService";
+        assert_eq!(
+            links(graph, "laravel-event"),
+            [
+                format!(
+                    "{service}::deleteSongs -> App\\Listeners::PruneLibrary::handle via LibraryChanged {}",
+                    at("event(new LibraryChanged())")
+                ),
+                format!(
+                    "{service}::like -> App\\Listeners::LoveTrack::handle via SongLiked {}",
+                    at("event(new SongLiked($id))")
+                ),
+                format!(
+                    "{service}::ownerTest -> App\\Listeners::SendsTestNotification::handle via OwnerTest {}",
+                    at("event(new OwnerTest())")
+                ),
+                format!(
+                    "{service}::scan -> App\\Listeners::DeleteStale::handle via ScanDone {}",
+                    at("event(new ScanDone())")
+                ),
+                format!(
+                    "{service}::scan -> App\\Listeners::WriteScanLog::handle via ScanDone {}",
+                    at("event(new ScanDone())")
+                ),
+                format!(
+                    "{service}::userTest -> App\\Listeners::SendsTestNotification::handle via UserTest {}",
+                    at("event(new UserTest())")
+                ),
+            ],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream's second case: PHP without Laravel events links nothing.
+    #[test]
+    fn w716a_laravel_needs_a_listener() {
+        let project = Project::new()
+            .file("src/Client.php", EVENT_FREE_PHP)
+            .index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            links(graph, "laravel-event"),
+            Vec::<String>::new(),
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// A `$listen` map in a block comment registers nothing, and a nullable
+    /// `handle(?SongLiked $event)` listens all the same.
+    #[test]
+    fn w716a_laravel_reads_the_listen_map_without_comments() {
+        let provider = concat!(
+            "<?php\n",
+            "namespace App\\Providers;\n",
+            "class EventServiceProvider {\n",
+            "    /* protected $listen = [\n",
+            "        LibraryChanged::class => [PruneLibrary::class],\n",
+            "    ]; */\n",
+            "}\n",
+        );
+        let nullable = concat!(
+            "<?php\n",
+            "namespace App\\Listeners;\n",
+            "class MaybeLove {\n",
+            "    public function handle(?SongLiked $event): void {}\n",
+            "}\n",
+        );
+        let project = laravel_project()
+            .file("app/Providers/EventServiceProvider.php", provider)
+            .file("app/Listeners/MaybeLove.php", nullable)
+            .file("app/Services/SongService.php", SONG_SERVICE_PHP)
+            .index();
+        let graph = graph_of(&project);
+        let links = links(graph, "laravel-event");
+        assert!(
+            links.iter().any(|link| link.starts_with(
+                "App\\Services::SongService::like -> App\\Listeners::MaybeLove::handle via SongLiked"
+            )),
+            "{links:#?}"
+        );
+        assert!(
+            !links.iter().any(|link| link.contains("PruneLibrary")),
+            "{links:#?}"
+        );
+    }
+
+    /// The `(source name, target name)` of every `calls` edge the pass `by`
+    /// made, sorted.
+    fn name_pairs(graph: &Graph, by: &str) -> Vec<(String, String)> {
+        let name = |id: &str| {
+            graph
+                .node(id)
+                .map_or_else(|| "?".to_string(), |node| node.name.clone())
+        };
+        let mut pairs: Vec<(String, String)> = synthesized_by(graph, by)
+            .map(|edge| (name(&edge.source), name(&edge.target)))
+            .collect();
+        pairs.sort();
+        pairs
+    }
+
+    /// The pairs `(source, prefix{i})` for each `i` of `range`, sorted.
+    fn pairs_to(
+        source: &str,
+        prefix: &str,
+        range: std::ops::Range<usize>,
+    ) -> Vec<(String, String)> {
+        let mut pairs: Vec<(String, String)> = range
+            .map(|i| (source.to_string(), format!("{prefix}{i}")))
+            .collect();
+        pairs.sort();
+        pairs
+    }
+
+    /// A thunk links at most 24 of the thunks it dispatches: the 25th
+    /// dispatch is not read.
+    #[test]
+    fn w716a_a_thunk_links_at_most_24_dispatches() {
+        let mut ts = String::from("import { createAsyncThunk } from '@reduxjs/toolkit';\n");
+        for i in 0..25 {
+            ts.push_str(&format!("export function f{i}() {{ return {i}; }}\n"));
+        }
+        ts.push_str(
+            "export const many = createAsyncThunk('many', async (_: void, { dispatch }) => {\n",
+        );
+        for i in 0..25 {
+            ts.push_str(&format!("  dispatch(f{i}());\n"));
+        }
+        ts.push_str("});\n");
+        let project = Project::new()
+            .file("package.json", THUNK_PACKAGE_JSON)
+            .file("many.ts", &ts)
+            .index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            name_pairs(graph, "redux-thunk"),
+            pairs_to("many", "f", 0..24),
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Celery links at most 80 dispatches a file: the 81st is not read.
+    #[test]
+    fn w716a_celery_links_at_most_80_dispatches_a_file() {
+        let mut py = String::from("from celery import shared_task\n");
+        for i in 0..81 {
+            py.push_str(&format!("\n@shared_task\ndef t{i}():\n    pass\n"));
+        }
+        py.push_str("\ndef go():\n");
+        for i in 0..81 {
+            py.push_str(&format!("    t{i}.delay()\n"));
+        }
+        let project = Project::new().file("tasks.py", &py).index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            name_pairs(graph, "celery-dispatch"),
+            pairs_to("go", "t", 0..80),
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Sidekiq links at most 80 enqueues a file: the 81st is not read.
+    #[test]
+    fn w716a_sidekiq_links_at_most_80_enqueues_a_file() {
+        let mut rb = String::new();
+        for i in 0..81 {
+            rb.push_str(&format!(
+                "class W{i}\n  include Sidekiq::Job\n  def perform\n  end\nend\n\n"
+            ));
+        }
+        let mut go = String::from("class Go\n  def go\n");
+        for i in 0..81 {
+            go.push_str(&format!("    W{i}.perform_async\n"));
+        }
+        go.push_str("  end\nend\n");
+        let project = Project::new()
+            .file("app/workers/workers.rb", &rb)
+            .file("app/services/go.rb", &go)
+            .index();
+        let graph = graph_of(&project);
+        let pairs = name_pairs(graph, "sidekiq-dispatch");
+        assert_eq!(pairs.len(), 80, "{pairs:?}");
+        assert!(
+            pairs
+                .iter()
+                .all(|(source, target)| source == "go" && target == "perform"),
+            "{pairs:?}"
+        );
+        let targets: std::collections::BTreeSet<String> = synthesized_by(graph, "sidekiq-dispatch")
+            .map(|edge| edge.metadata["via"].as_str().unwrap_or("?").to_string())
+            .collect();
+        let expected: std::collections::BTreeSet<String> =
+            (0..80).map(|i| format!("W{i}")).collect();
+        assert_eq!(targets, expected);
+    }
+
+    /// Spring checks its cap of 80 before each published event, not before
+    /// each edge: of 81 events the 80th, heard by two listeners, links both
+    /// (81 edges) and the 81st is not read.
+    #[test]
+    fn w716a_spring_checks_its_cap_before_each_published_event() {
+        let mut listeners = String::from(concat!(
+            "package app;\n",
+            "import org.springframework.context.event.EventListener;\n",
+            "public class Listeners {\n",
+        ));
+        for i in 0..81 {
+            listeners.push_str(&format!(
+                "    @EventListener\n    public void on{i}(E{i} e) {{}}\n"
+            ));
+            if i == 79 {
+                listeners.push_str("    @EventListener\n    public void again79(E79 e) {}\n");
+            }
+        }
+        listeners.push_str("}\n");
+        let mut publisher = String::from(concat!(
+            "package app;\n",
+            "public class Publisher {\n",
+            "    private ApplicationEventPublisher publisher;\n",
+            "    public void go() {\n",
+        ));
+        for i in 0..81 {
+            publisher.push_str(&format!("        publisher.publishEvent(new E{i}());\n"));
+        }
+        publisher.push_str("    }\n}\n");
+        let project = Project::new()
+            .file("src/Listeners.java", &listeners)
+            .file("src/Publisher.java", &publisher)
+            .index();
+        let graph = graph_of(&project);
+        let mut expected = pairs_to("go", "on", 0..80);
+        expected.push(("go".to_string(), "again79".to_string()));
+        expected.sort();
+        assert_eq!(
+            name_pairs(graph, "spring-event"),
+            expected,
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// MediatR checks its cap of 80 before each send, not before each edge:
+    /// of 81 sends the 80th, handled twice, links both and the 81st is not
+    /// read.
+    #[test]
+    fn w716a_mediatr_checks_its_cap_before_each_send() {
+        let mut handlers = String::from("using MediatR;\nnamespace App;\n");
+        for i in 0..81 {
+            handlers.push_str(&format!(
+                "public class H{i} : IRequestHandler<R{i}>\n{{\n    public Task Handle(R{i} request, CancellationToken token) => Task.CompletedTask;\n}}\n"
+            ));
+            if i == 79 {
+                handlers.push_str(
+                    "public class Again79 : IRequestHandler<R79>\n{\n    public Task Handle(R79 request, CancellationToken token) => Task.CompletedTask;\n}\n",
+                );
+            }
+        }
+        let mut controller = String::from(concat!(
+            "using MediatR;\n",
+            "namespace App;\n",
+            "public class Controller\n",
+            "{\n",
+            "    private readonly IMediator _mediator;\n",
+            "    public async Task Go()\n",
+            "    {\n",
+        ));
+        for i in 0..81 {
+            controller.push_str(&format!("        await _mediator.Send(new R{i}());\n"));
+        }
+        controller.push_str("    }\n}\n");
+        let project = Project::new()
+            .file("Handlers.cs", &handlers)
+            .file("Controller.cs", &controller)
+            .index();
+        let graph = graph_of(&project);
+        let mut expected: Vec<String> = (0..80).map(|i| format!("App::H{i}::Handle")).collect();
+        expected.push("App::Again79::Handle".to_string());
+        expected.sort();
+        let mut targets: Vec<String> = synthesized_by(graph, "mediatr-dispatch")
+            .map(|edge| {
+                graph
+                    .node(&edge.target)
+                    .expect("target")
+                    .qualified_name
+                    .clone()
+            })
+            .collect();
+        targets.sort();
+        assert_eq!(targets, expected, "{}", graph.report());
+        assert!(synthesized_by(graph, "mediatr-dispatch").all(|edge| {
+            graph
+                .node(&edge.source)
+                .is_some_and(|node| node.name == "Go")
+        }));
+    }
+
+    /// Laravel checks its cap of 200 before each dispatched event, not
+    /// before each edge: of 201 events the 200th, heard by two listeners,
+    /// links both and the 201st is not read.
+    #[test]
+    fn w716a_laravel_checks_its_cap_before_each_event() {
+        let mut listeners = String::from("<?php\nnamespace App\\Listeners;\n");
+        for i in 0..201 {
+            listeners.push_str(&format!(
+                "class L{i}\n{{\n    public function handle(E{i} $event)\n    {{\n    }}\n}}\n"
+            ));
+            if i == 199 {
+                listeners.push_str(
+                    "class Again199\n{\n    public function handle(E199 $event)\n    {\n    }\n}\n",
+                );
+            }
+        }
+        let mut dispatcher = String::from(concat!(
+            "<?php\n",
+            "namespace App\\Http;\n",
+            "class Go\n",
+            "{\n",
+            "    public function go()\n",
+            "    {\n",
+        ));
+        for i in 0..201 {
+            dispatcher.push_str(&format!("        event(new E{i}());\n"));
+        }
+        dispatcher.push_str("    }\n}\n");
+        let project = Project::new()
+            .file("app/Listeners/Listeners.php", &listeners)
+            .file("app/Http/Go.php", &dispatcher)
+            .index();
+        let graph = graph_of(&project);
+        let mut expected: Vec<String> = (0..200)
+            .map(|i| format!("App\\Listeners::L{i}::handle"))
+            .collect();
+        expected.push("App\\Listeners::Again199::handle".to_string());
+        expected.sort();
+        let mut targets: Vec<String> = synthesized_by(graph, "laravel-event")
+            .map(|edge| {
+                graph
+                    .node(&edge.target)
+                    .expect("target")
+                    .qualified_name
+                    .clone()
+            })
+            .collect();
+        targets.sort();
+        assert_eq!(targets, expected, "{}", graph.report());
+    }
+
+    /// The thunk pass runs only when the index has a JavaScript-family file;
+    /// then its sources are the matching constants of any language.
+    #[test]
+    fn w716a_thunks_need_a_javascript_family_file() {
+        const GO: &str = concat!(
+            "package p\n",
+            "\n",
+            "const outer = \"createAsyncThunk(dispatch(inner()))\"\n",
+            "\n",
+            "func inner() {}\n",
+        );
+        let go_only = Project::new().file("a.go", GO).index();
+        let graph = graph_of(&go_only);
+        let pairs = name_pairs(graph, "redux-thunk");
+        assert!(pairs.is_empty(), "{pairs:?}\n{}", graph.report());
+        let with_ts = Project::new()
+            .file("a.go", GO)
+            .file("x.ts", "export const unrelated = 1;\n")
+            .index();
+        let graph = graph_of(&with_ts);
+        assert_eq!(
+            name_pairs(graph, "redux-thunk"),
+            [("outer".to_string(), "inner".to_string())],
+            "{}",
+            graph.report()
+        );
+        let edge = synthesized_by(graph, "redux-thunk")
+            .next()
+            .expect("an edge");
+        assert_eq!(edge.metadata["registeredAt"], "a.go:3");
     }
 }

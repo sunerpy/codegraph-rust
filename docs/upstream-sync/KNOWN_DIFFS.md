@@ -69,8 +69,9 @@ colby behaviors are intentionally NOT ported in v1:
 - **Dynamic-dispatch synthesis passes** — of `SYNTH_PASSES`
   (`callback-synthesizer.ts`), the field, closure-collection, emitter,
   render, JSX, Pascal form, Flutter, C++ override, interface override, Kotlin
-  expect/actual, gRPC stub, MyBatis, gin middleware-chain, object-registry
-  and Go func-field passes and the Go prerequisites (`go-method-contains`, `go-implements`) are
+  expect/actual, gRPC stub, MyBatis, gin middleware-chain, redux-thunk,
+  object-registry, Celery, Spring event, MediatR, Sidekiq, Laravel event and
+  Go func-field passes and the Go prerequisites (`go-method-contains`, `go-implements`) are
   ported
   (`crates/codegraph-resolve/src/synthesis/`); the others draw no edge here
   yet. The ported passes and the merge keep `b635dd46`'s view of Jest/Vitest

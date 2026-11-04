@@ -9,6 +9,42 @@
     "size": 356
   },
   {
+    "content_hash": "6276c75f506728add71231a8b35ce692c007cba7306d1fce6a6af125a23aba39",
+    "errors": null,
+    "generated": 0,
+    "language": "php",
+    "node_count": 5,
+    "path": "dispatch/app/Http/Registration.php",
+    "size": 160
+  },
+  {
+    "content_hash": "84d2a742f27eabc64f7b9ad854b460d3c0f06f1a9b94fadb9eac52563967e549",
+    "errors": null,
+    "generated": 0,
+    "language": "php",
+    "node_count": 5,
+    "path": "dispatch/app/Listeners/SendWelcome.php",
+    "size": 146
+  },
+  {
+    "content_hash": "4037ceeb4aee716f3b61d14978b81e0196a69c52fe19fadeb2ed90b5a5c1e53d",
+    "errors": null,
+    "generated": 0,
+    "language": "ruby",
+    "node_count": 3,
+    "path": "dispatch/app/services/signup.rb",
+    "size": 81
+  },
+  {
+    "content_hash": "fbcfb8740b0e6b70c847d16c72584bb8b79b0df7078548d8596896982e0f65fc",
+    "errors": null,
+    "generated": 0,
+    "language": "ruby",
+    "node_count": 3,
+    "path": "dispatch/app/workers/welcome_worker.rb",
+    "size": 92
+  },
+  {
     "content_hash": "7c59ba2837e635bc674c2fea732925ccdce6ef3b35dd0a56ab7b4367611d29fe",
     "errors": null,
     "generated": 0,
@@ -16,6 +52,15 @@
     "node_count": 13,
     "path": "dispatch/src/Events.java",
     "size": 719
+  },
+  {
+    "content_hash": "17d368a48e7ae83709cf05122be5f55baa86f943c09c60ea63337857c96b9bdd",
+    "errors": null,
+    "generated": 0,
+    "language": "csharp",
+    "node_count": 8,
+    "path": "dispatch/src/Orders.cs",
+    "size": 390
   },
   {
     "content_hash": "7926b6cd815c27769fe82d90237080980f3ee1894af8851870dcad09a2a5e585",
@@ -106,6 +151,15 @@
     "node_count": 7,
     "path": "js/src/store.ts",
     "size": 600
+  },
+  {
+    "content_hash": "4b14a769015a917288c7fda05253bc44656b26200bf4170ca0d9a23a850cee1e",
+    "errors": null,
+    "generated": 0,
+    "language": "typescript",
+    "node_count": 4,
+    "path": "js/src/thunks.ts",
+    "size": 295
   },
   {
     "content_hash": "7de1ffd65c22a65d5053245a2372f52d21f1a234719bc8ae4bc2678f6bf8f94a",

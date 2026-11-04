@@ -16757,3 +16757,150 @@ pub fn go_func_field_module_renamed_unlinks_a_qualified_literal() -> Case {
             "method EC2Discovery::refresh",
         )
 }
+
+/// W7-16a: a redux-thunk constant's body starts dispatching another thunk;
+/// the constant links to it (`redux-thunk`).
+pub fn ts_thunk_starts_dispatching_another_thunk() -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript])
+        .file(
+            "thunks.ts",
+            "import { createAsyncThunk } from '@reduxjs/toolkit';\n\nexport const load = createAsyncThunk('a/load', async (_: void, { dispatch }) => {\n  return 1;\n});\n\nexport const save = createAsyncThunk('a/save', async () => 2);\n",
+        )
+        .write(
+            "thunks.ts",
+            "import { createAsyncThunk } from '@reduxjs/toolkit';\n\nexport const load = createAsyncThunk('a/load', async (_: void, { dispatch }) => {\n  dispatch(save());\n});\n\nexport const save = createAsyncThunk('a/save', async () => 2);\n",
+        )
+        .edge_metadata_after(
+            ("constant load", "calls", "constant save"),
+            "synthesizedBy",
+            "redux-thunk",
+        )
+}
+
+/// W7-16a: a Celery task loses its decorator, in its own file; the
+/// dispatching function of another file reaches it no more.
+pub fn python_celery_task_loses_its_decorator() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Python])
+        .file(
+            "tasks.py",
+            "from celery import shared_task\n\n@shared_task\ndef send(to):\n    return to\n",
+        )
+        .file(
+            "views.py",
+            "from tasks import send\n\n\ndef signup(to):\n    send.delay(to)\n",
+        )
+        .write(
+            "tasks.py",
+            "from celery import shared_task\n\n# not a task\ndef send(to):\n    return to\n",
+        )
+        .edge_before("function signup", "calls", "function send")
+        .no_edge_after("function signup", "calls", "function send")
+}
+
+/// W7-16a: a Spring listener's parameter becomes another event; the
+/// publisher of the first one, in another file, reaches it no more.
+pub fn java_spring_listener_hears_another_event() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Java])
+        .file("app/Events.java", "package app;\nclass Shipped { }\nclass Cancelled { }\n")
+        .file(
+            "app/Service.java",
+            "package app;\nclass Service {\n    void ship() {\n        publisher.publishEvent(new Shipped());\n    }\n}\n",
+        )
+        .file(
+            "app/Listener.java",
+            "package app;\nclass Listener {\n    @EventListener\n    public void on(Shipped event) { }\n}\n",
+        )
+        .write(
+            "app/Listener.java",
+            "package app;\nclass Listener {\n    @EventListener\n    public void on(Cancelled event) { }\n}\n",
+        )
+        .edge_before("method app::Service::ship", "calls", "method app::Listener::on")
+        .no_edge_after("method app::Service::ship", "calls", "method app::Listener::on")
+}
+
+/// W7-16a: a MediatR handler's base list takes another request; the sender
+/// of the first, in another file, reaches its `Handle` no more.
+pub fn csharp_mediatr_handler_takes_another_request() -> Case {
+    Case::new(Change::EditHeritage, &[Language::CSharp])
+        .file(
+            "Requests.cs",
+            "namespace Shop;\npublic class Ping : IRequest<int> { }\npublic class Pong : IRequest<int> { }\n",
+        )
+        .file(
+            "PingHandler.cs",
+            "namespace Shop;\npublic class PingHandler : IRequestHandler<Ping, int> {\n    public Task<int> Handle(Ping request, CancellationToken ct) => Task.FromResult(1);\n}\n",
+        )
+        .file(
+            "Controller.cs",
+            "namespace Shop;\npublic class Controller {\n    public async Task Run() {\n        await _mediator.Send(new Ping());\n    }\n}\n",
+        )
+        .write(
+            "PingHandler.cs",
+            "namespace Shop;\npublic class PingHandler : IRequestHandler<Pong, int> {\n    public Task<int> Handle(Pong request, CancellationToken ct) => Task.FromResult(1);\n}\n",
+        )
+        .edge_before("method Shop::Controller::Run", "calls", "method Shop::PingHandler::Handle")
+        .no_edge_after(
+            "method Shop::Controller::Run",
+            "calls",
+            "method Shop::PingHandler::Handle",
+        )
+}
+
+/// W7-16a: a Sidekiq worker drops the mixin, in its own file; the enqueue
+/// of another file reaches its `perform` no more.
+pub fn ruby_sidekiq_worker_drops_its_mixin() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Ruby])
+        .file(
+            "app/workers/cleanup_worker.rb",
+            "class CleanupWorker\n  include Sidekiq::Worker\n  def perform(id)\n  end\nend\n",
+        )
+        .file(
+            "app/services/service.rb",
+            "class Service\n  def run\n    CleanupWorker.perform_async(1)\n  end\nend\n",
+        )
+        .write(
+            "app/workers/cleanup_worker.rb",
+            "class CleanupWorker\n  include Helpers\n  def perform(id)\n  end\nend\n",
+        )
+        .edge_before(
+            "method Service::run",
+            "calls",
+            "method CleanupWorker::perform",
+        )
+        .no_edge_after(
+            "method Service::run",
+            "calls",
+            "method CleanupWorker::perform",
+        )
+}
+
+/// W7-16a: an event service provider's `$listen` map gains a listener, in a
+/// file of its own; the dispatcher of the event reaches its `handle`.
+pub fn php_laravel_listen_map_gains_a_listener() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Php])
+        .file(
+            "app/Providers/EventServiceProvider.php",
+            "<?php\nnamespace App\\Providers;\nclass EventServiceProvider {\n    protected $listen = [\n        Saved::class => [],\n    ];\n}\n",
+        )
+        .file(
+            "app/Listeners/Notify.php",
+            "<?php\nnamespace App\\Listeners;\nclass Notify {\n    public function handle($event) {}\n}\n",
+        )
+        .file(
+            "app/Services/Service.php",
+            "<?php\nnamespace App\\Services;\nclass Service {\n    public function save() { event(new Saved()); }\n}\n",
+        )
+        .write(
+            "app/Providers/EventServiceProvider.php",
+            "<?php\nnamespace App\\Providers;\nclass EventServiceProvider {\n    protected $listen = [\n        Saved::class => [Notify::class],\n    ];\n}\n",
+        )
+        .edge_metadata_after(
+            (
+                "method App\\Services::Service::save",
+                "calls",
+                "method App\\Listeners::Notify::handle",
+            ),
+            "synthesizedBy",
+            "laravel-event",
+        )
+}

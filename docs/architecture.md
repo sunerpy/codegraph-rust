@@ -283,17 +283,28 @@ declaring all of them (`go-grpc-stub-impl`), a Delphi form's unit
 gin's handler-chain dispatcher (a Go method calling into a `handlers` slice
 by index) reaching each named handler a `Use`, `GET` or other registration
 passes, a shared name only when the registration's file or the project holds
-one Go function or method of it (`gin-middleware-chain`), each handler an
-object-literal registry maps, reached from a function that calls the
-registry with a runtime key (`object-registry`), and a Go call through a
+one Go function or method of it (`gin-middleware-chain`), a redux-thunk
+constant reaching each thunk or action creator its body dispatches
+(`redux-thunk`), each handler an object-literal registry maps, reached from
+a function that calls the registry with a runtime key (`object-registry`),
+the function around a Celery `.delay` or `.apply_async` reaching the
+decorated task (`celery-dispatch`), a Spring `publishEvent(new X(…))`
+reaching every `@EventListener`, `@TransactionalEventListener` or
+`ApplicationListener` method of `X` (`spring-event`), a MediatR `Send` or
+`Publish` reaching the `Handle` of each handler of the sent type
+(`mediatr-dispatch`), a Sidekiq `perform_async`, `perform_in` or
+`perform_at` reaching the worker's `perform` (`sidekiq-dispatch`), a Laravel
+`event(new X(…))` reaching each listener's `handle` for `X`, typed or
+registered in a `$listen` map (`laravel-event`), and a Go call through a
 struct field holding a function, reaching each function or method value a
 composite literal or an assignment puts in the field or in the func field it
 is copied from, the receiver typed by its scope at most one field or one
 embedding away (`go-func-field`, with `field`, `via` and `registeredAt`).
 Each walks its candidates in upstream's order (nodes by file, line and id,
 edges by their other end, line and column); the Flutter, C++, interface,
-Kotlin, gRPC, MyBatis, gin and Go func-field passes run only when the index
-has files of their languages, as upstream's gates have them. A full index and a migration run
+Kotlin, gRPC, MyBatis, gin, redux-thunk, Celery, Spring, MediatR, Sidekiq,
+Laravel and Go func-field passes run only when the index has files of their
+languages, as upstream's gates have them. A full index and a migration run
 the stage after resolution. A sync runs it last, after the orphan sweep,
 whenever it changed the index, bootstrapped a lane, swept, or found the
 `synthesis_version` marker missing or at another version, and writes the

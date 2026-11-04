@@ -245,6 +245,18 @@
   },
   {
     "col": 17,
+    "kind": "calls",
+    "line": 8,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "constant:df0d8b2254e4ba3660d72179cef212c8",
+    "target": "constant:d3bb0e99a96c57777bb522356d235e1b"
+  },
+  {
+    "col": 17,
     "kind": "references",
     "line": 9,
     "metadata": {
@@ -343,6 +355,30 @@
     "target": "function:994db1e9cc732ccb7ea9e3a57730e984"
   },
   {
+    "col": 28,
+    "kind": "references",
+    "line": 7,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "method:9c1b4e873ff43e93f8713698beeaf7e4",
+    "target": "class:253c64dd05f41b78ebb7a68e8aa02b46"
+  },
+  {
+    "col": 29,
+    "kind": "instantiates",
+    "line": 16,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "method:f31208ee05c865bc35c0f706a96c3a30",
+    "target": "class:253c64dd05f41b78ebb7a68e8aa02b46"
+  },
+  {
     "col": 29,
     "kind": "references",
     "line": 18,
@@ -413,6 +449,18 @@
     "provenance": null,
     "source": "function:207fddb9f2ee9a4411fbcefb730ff29a",
     "target": "struct:9913848e6f980d5dd318f7e9c0c30431"
+  },
+  {
+    "col": 4,
+    "kind": "references",
+    "line": 3,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "method:6c6925fe488048baffe7829bf858bf9d",
+    "target": "class:0d1fdbdc20d3c1524720e79b000ddd1d"
   },
   {
     "col": 46,
@@ -537,6 +585,18 @@
     "target": "method:596ab963c1e8091bdb7dada52f4dfeff"
   },
   {
+    "col": 8,
+    "kind": "calls",
+    "line": 8,
+    "metadata": {
+      "confidence": 0.5,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "constant:df0d8b2254e4ba3660d72179cef212c8",
+    "target": "function:994db1e9cc732ccb7ea9e3a57730e984"
+  },
+  {
     "col": 9,
     "kind": "calls",
     "line": 5,
@@ -559,6 +619,19 @@
     "provenance": null,
     "source": "function:f8f21c17f8656f84fc213474805a9ec3",
     "target": "struct:306ad387530d1e49ad70e35ee0097658"
+  },
+  {
+    "col": null,
+    "kind": "calls",
+    "line": 10,
+    "metadata": {
+      "registeredAt": "dispatch/app/Http/Registration.php:10",
+      "synthesizedBy": "laravel-event",
+      "via": "Registered"
+    },
+    "provenance": "heuristic",
+    "source": "method:b8634218ad53bdcf252458f8e5eda333",
+    "target": "method:100387fd10458a252c1e7e679e93b7e1"
   },
   {
     "col": null,
@@ -589,6 +662,45 @@
   {
     "col": null,
     "kind": "calls",
+    "line": 14,
+    "metadata": {
+      "registeredAt": "dispatch/src/Events.java:14",
+      "synthesizedBy": "spring-event",
+      "via": "UserRegistered"
+    },
+    "provenance": "heuristic",
+    "source": "method:4fa1cc0f5c6e16964aa519b8ffa473d9",
+    "target": "method:d5658cf785502385e0d2dc65e6908262"
+  },
+  {
+    "col": null,
+    "kind": "calls",
+    "line": 16,
+    "metadata": {
+      "registeredAt": "dispatch/src/Orders.cs:16",
+      "synthesizedBy": "mediatr-dispatch",
+      "via": "PlaceOrder"
+    },
+    "provenance": "heuristic",
+    "source": "method:f31208ee05c865bc35c0f706a96c3a30",
+    "target": "method:9c1b4e873ff43e93f8713698beeaf7e4"
+  },
+  {
+    "col": null,
+    "kind": "calls",
+    "line": 16,
+    "metadata": {
+      "registeredAt": "python/tasks.py:16",
+      "synthesizedBy": "celery-dispatch",
+      "via": "send_email"
+    },
+    "provenance": "heuristic",
+    "source": "function:fa4a2925d6f31cdb05806f4225d4fc3b",
+    "target": "function:adfc8690e5268296a2775a57da14f3c8"
+  },
+  {
+    "col": null,
+    "kind": "calls",
     "line": 23,
     "metadata": {
       "field": "Discovery.refreshf",
@@ -613,6 +725,19 @@
     "provenance": "heuristic",
     "source": "method:0f7eaf3a1a022ad3a1c6e72c49bf6a12",
     "target": "function:63f50595e4b93b47584b5a76d0547a43"
+  },
+  {
+    "col": null,
+    "kind": "calls",
+    "line": 3,
+    "metadata": {
+      "registeredAt": "dispatch/app/services/signup.rb:3",
+      "synthesizedBy": "sidekiq-dispatch",
+      "via": "WelcomeWorker"
+    },
+    "provenance": "heuristic",
+    "source": "method:6c6925fe488048baffe7829bf858bf9d",
+    "target": "method:62519ff44634c1c284163dc322ad4878"
   },
   {
     "col": null,
@@ -681,6 +806,19 @@
   {
     "col": null,
     "kind": "calls",
+    "line": 8,
+    "metadata": {
+      "registeredAt": "js/src/thunks.ts:8",
+      "synthesizedBy": "redux-thunk",
+      "via": "refreshCart"
+    },
+    "provenance": "heuristic",
+    "source": "constant:df0d8b2254e4ba3660d72179cef212c8",
+    "target": "constant:d3bb0e99a96c57777bb522356d235e1b"
+  },
+  {
+    "col": null,
+    "kind": "calls",
     "line": 9,
     "metadata": {
       "registeredAt": "go/store/store.go:21",
@@ -703,6 +841,33 @@
     "provenance": "heuristic",
     "source": "function:4c075e5c6998bde068ac64c5129298c1",
     "target": "function:c87c29fe6a038cbf57b0af6a8597d7e0"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "class:0d1fdbdc20d3c1524720e79b000ddd1d",
+    "target": "method:62519ff44634c1c284163dc322ad4878"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "class:1f858fe058eb702b4d243e208cc63e95",
+    "target": "method:6c6925fe488048baffe7829bf858bf9d"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "class:28fcc5a01b5862dd52521c130ba45131",
+    "target": "method:100387fd10458a252c1e7e679e93b7e1"
   },
   {
     "col": null,
@@ -764,6 +929,33 @@
     "line": null,
     "metadata": null,
     "provenance": null,
+    "source": "class:6f07ceb9e8a6696aba1dac6683e2f9ef",
+    "target": "method:b8634218ad53bdcf252458f8e5eda333"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "class:b730006f9fe896abb4a37c3c52ad9e30",
+    "target": "field:672c0f4b6dcddc33a260d0393990a992"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "class:b730006f9fe896abb4a37c3c52ad9e30",
+    "target": "method:f31208ee05c865bc35c0f706a96c3a30"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
     "source": "class:c684061b11657d620087d825c55d4e41",
     "target": "field:dd8a304b7ce02c3ac5eaa3871305166d"
   },
@@ -775,6 +967,15 @@
     "provenance": null,
     "source": "class:c684061b11657d620087d825c55d4e41",
     "target": "method:283cd87999c876223d1aec731fa59353"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "class:cc920e0108a83e95c6495f849c2f97f2",
+    "target": "method:9c1b4e873ff43e93f8713698beeaf7e4"
   },
   {
     "col": null,
@@ -854,8 +1055,53 @@
     "line": null,
     "metadata": null,
     "provenance": null,
+    "source": "file:dispatch/app/Http/Registration.php",
+    "target": "namespace:1c67f66116a8ffa3279c4c8b70c1755e"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:dispatch/app/Listeners/SendWelcome.php",
+    "target": "namespace:6585f42f6df9f861416b2309c22c1b73"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:dispatch/app/services/signup.rb",
+    "target": "class:1f858fe058eb702b4d243e208cc63e95"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:dispatch/app/workers/welcome_worker.rb",
+    "target": "class:0d1fdbdc20d3c1524720e79b000ddd1d"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
     "source": "file:dispatch/src/Events.java",
     "target": "namespace:559ecd17038af11c9b6ef54ae38f2d50"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:dispatch/src/Orders.cs",
+    "target": "namespace:93fd4d307652df72ac2d893fcbd70206"
   },
   {
     "col": null,
@@ -1331,6 +1577,33 @@
     "line": null,
     "metadata": null,
     "provenance": null,
+    "source": "file:js/src/thunks.ts",
+    "target": "constant:d3bb0e99a96c57777bb522356d235e1b"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:js/src/thunks.ts",
+    "target": "constant:df0d8b2254e4ba3660d72179cef212c8"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:js/src/thunks.ts",
+    "target": "import:3b547a464666f5cee0d828e7046a57f8"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
     "source": "file:kotlin/common/src/Platform.kt",
     "target": "namespace:140986f76e32346c08a5cb4305f4d507"
   },
@@ -1457,6 +1730,24 @@
     "line": null,
     "metadata": null,
     "provenance": null,
+    "source": "namespace:1c67f66116a8ffa3279c4c8b70c1755e",
+    "target": "class:6f07ceb9e8a6696aba1dac6683e2f9ef"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "namespace:1c67f66116a8ffa3279c4c8b70c1755e",
+    "target": "import:7ab5d9ce7d42b0f28d558c3854bfbe3d"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
     "source": "namespace:4283d6bc4a5d31bf6ee3c408ba1f611d",
     "target": "interface:9c343d25063ae666c25dce60d19024fa"
   },
@@ -1486,6 +1777,51 @@
     "provenance": null,
     "source": "namespace:559ecd17038af11c9b6ef54ae38f2d50",
     "target": "import:f9eb62fdac83d1803f7d7cccb40684ac"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "namespace:6585f42f6df9f861416b2309c22c1b73",
+    "target": "class:28fcc5a01b5862dd52521c130ba45131"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "namespace:6585f42f6df9f861416b2309c22c1b73",
+    "target": "import:12828a991b213fc515a737e04bedc264"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "namespace:93fd4d307652df72ac2d893fcbd70206",
+    "target": "class:253c64dd05f41b78ebb7a68e8aa02b46"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "namespace:93fd4d307652df72ac2d893fcbd70206",
+    "target": "class:b730006f9fe896abb4a37c3c52ad9e30"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "namespace:93fd4d307652df72ac2d893fcbd70206",
+    "target": "class:cc920e0108a83e95c6495f849c2f97f2"
   },
   {
     "col": null,
@@ -1624,5 +1960,16 @@
     "provenance": "heuristic",
     "source": "struct:606f2ccca37614d5812343568306d220",
     "target": "interface:8ce05b9afd075953348b7d6bf74a9556"
+  },
+  {
+    "col": null,
+    "kind": "references",
+    "line": null,
+    "metadata": {
+      "valueRef": true
+    },
+    "provenance": null,
+    "source": "constant:df0d8b2254e4ba3660d72179cef212c8",
+    "target": "constant:d3bb0e99a96c57777bb522356d235e1b"
   }
 ]
