@@ -6680,8 +6680,7 @@ fn index_project_inner(
     // (W7-14).
     diagnostic_run.phase_start("synthesis");
     let synthesis_started = std::time::Instant::now();
-    let synthesis =
-        codegraph_resolve::synthesis::run_stage(&mut store, project, options.max_file_size)?;
+    let synthesis = codegraph_resolve::synthesis::run_stage(&mut store, project, &options)?;
     codegraph_resolve::synthesis::write_marker(&store)?;
     diagnostic_run.phase_end(
         "synthesis",

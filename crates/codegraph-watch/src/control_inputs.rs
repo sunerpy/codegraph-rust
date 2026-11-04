@@ -332,8 +332,9 @@ fn parent_of(path: &str) -> &str {
 }
 
 /// The recorded inputs an event can name, by project path, as the rows hold
-/// them once a sync is done (W5-06): the watcher hands their events to the
-/// next sync, though they are no source files.
+/// them once a sync is done (W5-06, and the synthesis stage's, W7-17b): the
+/// watcher hands their events to the next sync, though they are no source
+/// files.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct RecordedInputs {
     /// Every input inside the project, a listed directory by its own path.
@@ -372,6 +373,11 @@ pub fn recorded_paths(store: &Store) -> Result<RecordedInputs> {
             }
             out.paths.insert(path.to_string());
         }
+    }
+    // The files the synthesis stage last read beside the index, or found
+    // missing (W7-17b): a sync compares them.
+    if let Some(inputs) = codegraph_resolve::synthesis::recorded_inputs(store)? {
+        out.paths.extend(inputs.into_keys());
     }
     Ok(out)
 }
@@ -545,5 +551,35 @@ mod tests {
         assert!(!is_control_file("apps/tauri.conf.json"));
         assert!(!is_control_file("src/main.ts"));
         assert!(!is_control_file("cargo.toml"));
+    }
+
+    /// The files the synthesis stage last read beside the index, and the
+    /// candidates it found no file at, are inputs whose events the watcher
+    /// hands to a sync (W7-17b).
+    #[test]
+    fn the_synthesis_stage_inputs_are_recorded_inputs() {
+        let dir = std::env::temp_dir().join(format!(
+            "cg-control-inputs-synthesis-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Store::open(&dir.join("index.db")).unwrap();
+        assert_eq!(recorded_paths(&store).unwrap(), RecordedInputs::default());
+        store
+            .set_project_metadata(
+                codegraph_resolve::synthesis::INPUTS_KEY,
+                r#"{"missing.def":null,"src/ops.def":"0123"}"#,
+            )
+            .unwrap();
+        let recorded = recorded_paths(&store).unwrap();
+        assert!(recorded.may_move("src/ops.def", false));
+        assert!(recorded.may_move("missing.def", false));
+        assert!(!recorded.may_move("src/other.def", false));
+        drop(store);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

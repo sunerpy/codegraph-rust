@@ -13,10 +13,12 @@ use anyhow::Result;
 use codegraph_core::node_id::hash_content;
 use codegraph_core::source_file::{SourceText, read_source_file};
 use codegraph_core::types::{Edge, EdgeKind, FileRecord, Language, Node, NodeKind, UnresolvedRef};
+use codegraph_extract::ExtractOptions;
 use codegraph_store::Store;
 use codegraph_store::queries::ReferenceSite;
 use rayon::prelude::*;
 
+use super::inputs::{self, Inputs, UnindexedReader};
 use super::{
     c_fnptr, callback, dispatch, framework, go, go_dispatch, go_func_field, iface, is_synthesized,
     jsx, registry,
@@ -138,10 +140,19 @@ const PASSES: &[(&str, Gate, Pass)] = &[
 ];
 
 /// Compute every synthesized edge over `store`'s base graph and replace the
-/// stored ones with them in one transaction. The marker is the caller's.
-pub fn run_stage(store: &mut Store, project_root: &Path, max_file_size: u64) -> Result<StageStats> {
-    let edges = synthesize(store, project_root, max_file_size)?;
+/// stored ones with them in one transaction, reading the files the index
+/// does not hold within `options`' scan scope, and record what it read
+/// beside the index (W7-17b). The marker is the caller's.
+pub fn run_stage(
+    store: &mut Store,
+    project_root: &Path,
+    options: &ExtractOptions,
+) -> Result<StageStats> {
+    let mut view = View::new(store, project_root, options.max_file_size);
+    view.unindexed = Some(UnindexedReader::new(project_root, options));
+    let (edges, read) = synthesize_in(view)?;
     let (removed, inserted) = store.replace_synthesized_edges(&edges)?;
+    inputs::write(store, &read)?;
     Ok(StageStats {
         edges: edges.len(),
         removed,
@@ -150,9 +161,14 @@ pub fn run_stage(store: &mut Store, project_root: &Path, max_file_size: u64) -> 
 }
 
 /// Every synthesized edge over `store`'s base graph: each prerequisite
-/// step's, and each pass's merged in registry order, sorted.
+/// step's, and each pass's merged in registry order, sorted. It reads the
+/// indexed files only, never a file the index does not hold.
 pub fn synthesize(store: &Store, project_root: &Path, max_file_size: u64) -> Result<Vec<Edge>> {
-    let mut view = View::new(store, project_root, max_file_size);
+    Ok(synthesize_in(View::new(store, project_root, max_file_size))?.0)
+}
+
+/// The stage over `view`, with what it read beside the index.
+fn synthesize_in(mut view: View<'_>) -> Result<(Vec<Edge>, Inputs)> {
     view.read_texts()?;
     let languages = view.file_languages()?;
     let mut edges = Vec::new();
@@ -169,7 +185,11 @@ pub fn synthesize(store: &Store, project_root: &Path, max_file_size: u64) -> Res
             passes.push(pass(&view)?);
         }
     }
-    Ok(combine(edges, passes))
+    let read = view
+        .unindexed
+        .map(UnindexedReader::into_inputs)
+        .unwrap_or_default();
+    Ok((combine(edges, passes), read))
 }
 
 /// The stage's output: the prerequisite steps' edges as they are (upstream
@@ -241,6 +261,9 @@ pub(super) struct View<'a> {
     /// The indexed files the files table flags as generated, read with the
     /// texts.
     generated: RefCell<HashSet<String>>,
+    /// The reader of the files the index does not hold, when the stage may
+    /// read them ([`run_stage`]; never under [`synthesize`]).
+    unindexed: Option<UnindexedReader>,
 }
 
 impl<'a> View<'a> {
@@ -252,7 +275,21 @@ impl<'a> View<'a> {
             overlay: Overlay::default(),
             texts: RefCell::new(HashMap::new()),
             generated: RefCell::new(HashSet::new()),
+            unindexed: None,
         }
+    }
+
+    /// The text of `path`, a file the index does not hold, as
+    /// [`UnindexedReader::text`] reads and records it; `None` when the
+    /// stage reads no such file.
+    pub(super) fn unindexed_text(&self, path: &str) -> Option<Arc<str>> {
+        self.unindexed.as_ref()?.text(path)
+    }
+
+    /// The project-relative path an unindexed `path` is read under, `None`
+    /// for one leaving the root.
+    pub(super) fn unindexed_path(path: &str) -> Option<String> {
+        UnindexedReader::relative(path)
     }
 
     /// The project root the files are read from.

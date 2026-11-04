@@ -36,6 +36,15 @@
     "size": 356
   },
   {
+    "content_hash": "816026f3bde6271e535a4733918cc16fe08492689e0496ede75ab449e67ddf1f",
+    "errors": null,
+    "generated": 0,
+    "language": "c",
+    "node_count": 8,
+    "path": "c/src/optab.c",
+    "size": 280
+  },
+  {
     "content_hash": "b60bb4a70eb51c4e7fa2243f8931ed94d5b7d65b42480c6033ec94015dea79b5",
     "errors": null,
     "generated": 0,

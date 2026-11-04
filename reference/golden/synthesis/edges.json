@@ -854,6 +854,32 @@
   {
     "col": null,
     "kind": "calls",
+    "line": 17,
+    "metadata": {
+      "registeredAt": "c/src/optab.c:17",
+      "synthesizedBy": "fn-pointer-dispatch",
+      "via": "op.run"
+    },
+    "provenance": "heuristic",
+    "source": "function:f3a1159c5c767086f4bcece8b9165bbc",
+    "target": "function:354a28e189a1f209b6773bc3f6f3433a"
+  },
+  {
+    "col": null,
+    "kind": "calls",
+    "line": 17,
+    "metadata": {
+      "registeredAt": "c/src/optab.c:17",
+      "synthesizedBy": "fn-pointer-dispatch",
+      "via": "op.run"
+    },
+    "provenance": "heuristic",
+    "source": "function:f3a1159c5c767086f4bcece8b9165bbc",
+    "target": "function:7948220796ebe418edd8b9ae6f5d5d52"
+  },
+  {
+    "col": null,
+    "kind": "calls",
     "line": 23,
     "metadata": {
       "field": "Discovery.refreshf",
@@ -1344,6 +1370,69 @@
     "provenance": null,
     "source": "file:c/src/ops.c",
     "target": "struct:536769ec73061b30ecba0ab7c6d6aa59"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:c/src/optab.c",
+    "target": "constant:533f0d18756d6c7a3489a616467fa2f6"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:c/src/optab.c",
+    "target": "function:354a28e189a1f209b6773bc3f6f3433a"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:c/src/optab.c",
+    "target": "function:7948220796ebe418edd8b9ae6f5d5d52"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:c/src/optab.c",
+    "target": "function:f3a1159c5c767086f4bcece8b9165bbc"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:c/src/optab.c",
+    "target": "import:30a0806e98b066d1c8080547d8dbdf13"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:c/src/optab.c",
+    "target": "struct:c449ae68b73ca11c6d427107a7a3d879"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:c/src/optab.c",
+    "target": "type_alias:49f5494ee04ac0d609f17b50d7161a96"
   },
   {
     "col": null,

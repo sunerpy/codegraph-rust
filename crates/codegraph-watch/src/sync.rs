@@ -1609,18 +1609,29 @@ fn sync_paths_with_store(
         outcome.pending_refs_unresolved = stats.unresolved;
     }
 
+    // A file the last stage run read beside the index (W7-17b) that reads
+    // differently now, its text, its presence or its scan scope changed,
+    // makes the stage's edges stale as a base-graph write does. Every sync
+    // compares, a sync that changed nothing included.
+    if codegraph_resolve::synthesis::marker_is_current(store)?
+        && codegraph_resolve::synthesis::inputs_changed(store, project_root, &scope.options)?
+    {
+        codegraph_resolve::synthesis::withdraw_marker(store)?;
+    }
+
     // The dispatch edges no reference names (W7-14), recomputed whole once
     // the base graph is final. Every write to the base graph above comes
     // after a withdrawal of the marker (`begin_mutation`, a lane bootstrap,
-    // the sweep), so a sync recomputes whenever it finds the marker away:
-    // after its own changes, or a sync that stopped before writing it back,
-    // which is this sync's last write.
+    // the sweep, a changed input read beside the index), so a sync
+    // recomputes whenever it finds the marker away: after its own changes,
+    // or a sync that stopped before writing it back, which is this sync's
+    // last write.
     if !codegraph_resolve::synthesis::marker_is_current(store)? {
         #[cfg(test)]
         if tests::FAIL_BEFORE_SYNTHESIS.with(std::cell::Cell::get) {
             bail!("injected sync failure before synthesis");
         }
-        codegraph_resolve::synthesis::run_stage(store, project_root, scope.options.max_file_size)?;
+        codegraph_resolve::synthesis::run_stage(store, project_root, &scope.options)?;
         #[cfg(test)]
         if tests::FAIL_BEFORE_SYNTHESIS_MARKER.with(std::cell::Cell::get) {
             bail!("injected sync failure before the synthesis marker");

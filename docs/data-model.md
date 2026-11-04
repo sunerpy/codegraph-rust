@@ -196,7 +196,9 @@ table empty and writes no marker.
 
 Migration 9 creates it for upstream's per-file recompute gate. This engine
 recomputes the synthesized edges whenever a sync changes the index, so it never
-writes the table, which stays empty.
+writes the table, which stays empty. The files the stage reads that the index
+does not hold are recorded in `project_metadata` instead
+(`synthesis_unindexed_inputs`, below).
 
 ### `project_metadata`
 
@@ -474,13 +476,27 @@ persisted, and withdrawn with the others before a sync's first change. A sync
 that finds it missing or at another version re-resolves every Rust file. It is
 not a canonical surface.
 
-`synthesis_version` (9) vouches that the synthesized edges are the synthesis
-stage's output over the current base graph. A full index and a migration write
-it after the stage. A sync withdraws it before its first change, before a lane
-bootstrap's first write and before the orphan sweep, and, when it changed the
-index, bootstrapped a lane, swept, or found the marker missing or at another
-version, recomputes the stage and writes the marker back as its last write. It
-is not a canonical surface.
+`synthesis_version` (10) vouches that the synthesized edges are the synthesis
+stage's output over the current base graph and the files it read beside the
+index. A full index and a migration write it after the stage. A sync withdraws
+it before its first change, before a lane bootstrap's first write, before the
+orphan sweep, and when a file `synthesis_unindexed_inputs` records reads
+differently, and, when it changed the index, bootstrapped a lane, swept, or
+found the marker missing or at another version, recomputes the stage and writes
+the marker back as its last write. It is not a canonical surface.
+
+`synthesis_unindexed_inputs` records the files the stage read beside the index
+(W7-17b): a JSON object, sorted by path, from each project-relative path an
+indexed C or C++ file's `#include "…"` led the stage to that the index does not
+hold to the SHA-256 of the text it read there, or `null` where it read nothing:
+no file, a path the scan's ignore rules, `.gitignore` or configuration keep
+out, one through a symbolic link, or a file over `indexing.max_file_size`. A
+path that would leave the project root is never probed nor recorded. Every run
+of the stage rewrites the row, `{}` when it read nothing beside the index. Each
+sync that finds the marker current reads every recorded path again the same way
+first, and the watcher hands an event for a recorded path to the next sync. A
+row that does not parse counts as changed; an index without the row has an
+older marker and recomputes anyway. It is not a canonical surface.
 
 `resolved_refs_version` vouches that every file's rows in `unresolved_refs` and
 `resolved_refs` are what extracting it again gives, with the references of the

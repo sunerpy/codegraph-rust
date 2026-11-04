@@ -524,8 +524,8 @@ listed.
   definition and its field: each `struct` or `union` node is one, and two
   definitions with the same name and fields are two. A name means the one
   definition of that name in the project, else the one of the file's
-  translation unit (the file and the indexed files its `#include`s reach),
-  else nothing; the type of a file-scope table, the one owner a field name
+  translation unit (the file and the files its `#include`s reach), else
+  nothing; the type of a file-scope table, the one owner a field name
   falls back to, and a table entry follow the same rule, the entry's function
   being the one of its name in the table's file, else in the includer's, else
   in the project. colby keys by the name: `structLayout` keeps the last
@@ -543,18 +543,23 @@ listed.
   `.field = fn` still is, and a chain never walks a field the body declares
   twice. colby reads the positions as written and walks the first field of
   the name (`synthesis/c_fnptr.rs`).
-- **C function pointers: what is read (W7-17a).** An `#include` resolves to
-  an indexed file only; colby also probes the disk under the project root,
-  which reaches excluded and unindexed files such as `.def` tables (W7-17b
-  settles it). The macro patterns read `\r`, `\n` and `\r\n` as line ends,
-  not U+2028 or U+2029, which JavaScript's `m` flag reads too. Every file runs
-  through every stage, without colby's survival filters, which skip a file
-  only where the stage would find nothing, except in two cases: an
-  initializer's type that only an unindexed include aliases (colby's
-  `aliasNames` reads indexed files; unreachable until W7-17b), and a match
+- **C function pointers: what is read (W7-17a, W7-17b).** An `#include`
+  resolves to an indexed file, else, as colby's does, to a file on disk under
+  the project root, but only to one the scan's rules admit whatever its
+  extension (the default ignores, the root `.gitignore`, `.git/info/exclude`
+  and the configured include and exclude), reached through no symbolic link
+  and no larger than `indexing.max_file_size`; colby reads any file there,
+  excluded, ignored or linked. So a first candidate the configuration keeps
+  out is no file here, and the include resolves to the second. The macro
+  patterns read `\r`, `\n` and `\r\n` as line ends, not U+2028 or U+2029,
+  which JavaScript's `m` flag reads too. Every file runs through every stage,
+  without colby's survival filters, which skip a file only where the stage
+  would find nothing, except in two cases: an initializer whose type only a
+  non-indexed include aliases, which this pass registers and colby's filter
+  skips (its `aliasNames` are the indexed files' object macros), and a match
   that starts before a function and runs across a line end into its
   signature line, which shifts the matches inside its body
-  (`synthesis/c_fnptr.rs`).
+  (`synthesis/c_fnptr.rs`, `synthesis/inputs.rs`).
 - **A Go type followed through aliases (W7-15d).** The func-field pass
   follows a type through aliases and defined types at most three deep, from
   whichever name it starts. colby keeps one answer per type name and file

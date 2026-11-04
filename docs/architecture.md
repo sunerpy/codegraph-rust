@@ -254,7 +254,13 @@ graph (every edge without `metadata.synthesizedBy`, the nodes,
 content hash, are still the ones their file rows record; a file that drifted
 since it was indexed reads as absent until its own sync. It reads every indexed
 file once before its first step, the file rows in one query and the files in
-parallel. When the index has
+parallel. The C function-pointer pass also reads the files an `#include "…"`
+names that the index does not hold, such as a `.def` table: a file within the
+project root that the scan's rules admit whatever its extension (the default
+ignores, the root `.gitignore`, `.git/info/exclude` and the configured
+include and exclude), reached through no symbolic link and no larger than
+`indexing.max_file_size`. The stage records every such path it probed with
+its text's hash, or null, in `synthesis_unindexed_inputs`. When the index has
 Go files it first runs upstream's two prerequisite steps, whose edges the
 passes read as base edges and the replacement writes beside the merged ones:
 a Go type's `contains` edge to each method of its package that extraction
@@ -312,10 +318,13 @@ Kotlin, gRPC, MyBatis, gin, redux-thunk, Celery, Spring, MediatR, Sidekiq,
 Laravel, C function-pointer and Go func-field passes run only when the index
 has files of their languages, as upstream's gates have them. A full index and a migration run
 the stage after resolution. A sync runs it last, after the orphan sweep,
-whenever it changed the index, bootstrapped a lane, swept, or found the
-`synthesis_version` marker missing or at another version, and writes the
-marker as its last write; the sync's site machinery never selects or deletes
-a synthesized edge.
+whenever it changed the index, bootstrapped a lane, swept, found a recorded
+file the last run read beside the index reading differently (its text, its
+presence or its scan scope moved), or found the `synthesis_version` marker
+missing or at another version, and writes the marker as its last write; the
+sync's site machinery never selects or deletes a synthesized edge. The
+watcher hands an event for a recorded path to the next sync, as it does a
+control input's.
 
 ## Query layer
 

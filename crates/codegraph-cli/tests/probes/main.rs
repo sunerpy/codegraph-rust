@@ -23241,7 +23241,7 @@ mod synthesis {
         assert_eq!((edge.line, edge.col), (Some(7), None), "{edge:?}");
         assert_eq!(
             project_metadata_with_prefix(&project.db(), "synthesis_version"),
-            [("synthesis_version".to_string(), "9".to_string())]
+            [("synthesis_version".to_string(), "10".to_string())]
         );
     }
 
@@ -31072,6 +31072,34 @@ mod c_fnptr {
         "struct context { int id; struct command *cmd, *last; };  /* multi-declarator field */\n",
     );
 
+    /// `inc.h` of upstream's case 11 (reads-a-macro-built-table-from-a-non-indexed-included-file).
+    const C11_INC_H: &str = concat!(
+        "\n",
+        "typedef int opRun(void);\n",
+        "struct op { const char *name; opRun *run; };\n",
+    );
+
+    /// `inc.c` of upstream's case 11 (reads-a-macro-built-table-from-a-non-indexed-included-file).
+    const C11_INC_C: &str = concat!(
+        "\n",
+        "#include \"inc.h\"\n",
+        "#define MK(nm, fn) nm, fn\n",
+        "#define CMD_T op\n",
+        "static int a_impl(void){return 0;}\n",
+        "static int b_impl(void){return 0;}\n",
+        "#include \"ops.def\"\n",
+        "int go(struct op *o) { return o->run(); }\n",
+    );
+
+    /// `ops.def` of upstream's case 11 (reads-a-macro-built-table-from-a-non-indexed-included-file).
+    const C11_OPS_DEF: &str = concat!(
+        "\n",
+        "static struct CMD_T optable[] = {\n",
+        "  { MK(\"a\", a_impl) },\n",
+        "  { MK(\"b\", b_impl) },\n",
+        "};\n",
+    );
+
     /// `fn.c` of upstream's case 12 (expands-a-header-defined-macro-that-produces-a-brace-wrapped).
     const C12_FN_C: &str = concat!(
         "\n",
@@ -32390,5 +32418,261 @@ mod c_fnptr {
             .index();
         let graph = graph_of(&project);
         assert!(links(graph).is_empty(), "{}", graph.report());
+    }
+
+    /// Upstream: a macro-built table in a `#include`d `.def`, which the
+    /// scan does not index, registers its functions with the includer's
+    /// macros (W7-17b).
+    #[test]
+    fn w717b_a_table_in_a_non_indexed_include_is_read() {
+        let project = Project::new()
+            .file("inc.h", C11_INC_H)
+            .file("inc.c", C11_INC_C)
+            .file("ops.def", C11_OPS_DEF)
+            .index();
+        let graph = graph_of(&project);
+        assert!(
+            graph.files.iter().all(|file| file.path != "ops.def"),
+            "the .def is no indexed file\n{}",
+            graph.report()
+        );
+        assert_eq!(links(graph), c11_links("inc.c"), "{}", graph.report());
+    }
+
+    /// The two links of upstream's case 11 with its dispatch in `file`.
+    fn c11_links(file: &str) -> Vec<String> {
+        let line = line_of(C11_INC_C, "int go(");
+        vec![
+            link("go", "a_impl", "op.run", file, line),
+            link("go", "b_impl", "op.run", file, line),
+        ]
+    }
+
+    /// KEEP-RUST: a non-indexed include the configuration excludes is not
+    /// read (upstream reads any file on disk). So a first candidate it
+    /// excludes is no file, and the include resolves to the second: the
+    /// raw path from the root.
+    #[test]
+    fn w717b_an_excluded_include_is_not_read() {
+        let project = Project::new()
+            .file(
+                ".codegraph/config.toml",
+                "[app]\nname = \"probe\"\n\n[indexing]\nexclude = [\"ops.def\"]\n",
+            )
+            .file("inc.h", C11_INC_H)
+            .file("inc.c", C11_INC_C)
+            .file("ops.def", C11_OPS_DEF)
+            .index();
+        let graph = graph_of(&project);
+        assert!(links(graph).is_empty(), "{}", graph.report());
+
+        const OTHER_DEF: &str = "static struct CMD_T optable[] = {\n  { MK(\"c\", c_impl) },\n};\n";
+        let project = Project::new()
+            .file(
+                ".codegraph/config.toml",
+                "[app]\nname = \"probe\"\n\n[indexing]\nexclude = [\"src/ops.def\"]\n",
+            )
+            .file("src/inc.h", C11_INC_H)
+            .file(
+                "src/inc.c",
+                &C11_INC_C.replace(
+                    "#include \"ops.def\"",
+                    "static int c_impl(void){return 0;}\n#include \"ops.def\"",
+                ),
+            )
+            .file("src/ops.def", OTHER_DEF)
+            .file("ops.def", C11_OPS_DEF)
+            .index();
+        let graph = graph_of(&project);
+        let line = line_of(C11_INC_C, "int go(") + 1;
+        assert_eq!(
+            links(graph),
+            [
+                link("go", "a_impl", "op.run", "src/inc.c", line),
+                link("go", "b_impl", "op.run", "src/inc.c", line),
+            ],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// KEEP-RUST: a non-indexed include the root `.gitignore` ignores is not
+    /// read.
+    #[test]
+    fn w717b_a_gitignored_include_is_not_read() {
+        let project = Project::new()
+            .file(".gitignore", "*.def\n")
+            .file("inc.h", C11_INC_H)
+            .file("inc.c", C11_INC_C)
+            .file("ops.def", C11_OPS_DEF)
+            .index();
+        let graph = graph_of(&project);
+        assert!(links(graph).is_empty(), "{}", graph.report());
+    }
+
+    /// An include naming a file outside the project root is never probed,
+    /// nor recorded (#1631's lexical containment).
+    #[test]
+    fn w717b_an_include_outside_the_root_is_not_read() {
+        let project = Project::new()
+            .file("inc.h", C11_INC_H)
+            .file("inc.c", &C11_INC_C.replace("\"ops.def\"", "\"../ops.def\""));
+        let outside = project.root().parent().expect("the project's parent");
+        std::fs::write(outside.join("ops.def"), C11_OPS_DEF).expect("write ../ops.def");
+        let project = project.index();
+        let graph = graph_of(&project);
+        assert!(links(graph).is_empty(), "{}", graph.report());
+        assert_eq!(
+            inputs_row(&project),
+            serde_json::json!({}),
+            "an escaping candidate is not recorded"
+        );
+    }
+
+    /// KEEP-RUST: a non-indexed include reached through a symbolic link is
+    /// not read, as the scan reads no link it has not followed.
+    #[cfg(unix)]
+    #[test]
+    fn w717b_an_include_through_a_link_is_not_read() {
+        let project = Project::new()
+            .file("inc.h", C11_INC_H)
+            .file("inc.c", C11_INC_C)
+            .file("defs/ops.def", C11_OPS_DEF);
+        std::os::unix::fs::symlink("defs/ops.def", project.root().join("ops.def"))
+            .expect("link ops.def");
+        let project = project.index();
+        let graph = graph_of(&project);
+        assert!(links(graph).is_empty(), "{}", graph.report());
+        assert_eq!(inputs_row(&project), serde_json::json!({ "ops.def": null }));
+    }
+
+    /// A non-indexed include larger than `indexing.max_file_size` is not
+    /// read, as an indexed file that large is not.
+    #[test]
+    fn w717b_an_include_over_the_size_bound_is_not_read() {
+        let large = format!("{C11_OPS_DEF}/* {} */\n", "x".repeat(512));
+        assert!(C11_INC_C.len() < 400 && C11_INC_H.len() < 400 && large.len() > 400);
+        let config = "[app]\nname = \"probe\"\n\n[indexing]\nmax_file_size = 400\n";
+        let project = Project::new()
+            .file(".codegraph/config.toml", config)
+            .file("inc.h", C11_INC_H)
+            .file("inc.c", C11_INC_C)
+            .file("ops.def", &large)
+            .index();
+        let graph = graph_of(&project);
+        assert!(links(graph).is_empty(), "{}", graph.report());
+        let project = Project::new()
+            .file(".codegraph/config.toml", config)
+            .file("inc.h", C11_INC_H)
+            .file("inc.c", C11_INC_C)
+            .file("ops.def", C11_OPS_DEF)
+            .index();
+        let graph = graph_of(&project);
+        assert_eq!(links(graph), c11_links("inc.c"), "{}", graph.report());
+    }
+
+    /// A non-indexed include's own includes are read too: the table's macro
+    /// comes from the `.def` the `.def` includes. (The declaration before
+    /// the table is the statement boundary upstream's `INIT_RE` needs after
+    /// a directive line.)
+    #[test]
+    fn w717b_a_non_indexed_include_reads_its_includes() {
+        let project = Project::new()
+            .file("inc.h", C11_INC_H)
+            .file(
+                "inc.c",
+                &C11_INC_C.replace("#define MK(nm, fn) nm, fn\n", ""),
+            )
+            .file(
+                "ops.def",
+                &format!("#include \"mk.def\"\nstatic int count;\n{C11_OPS_DEF}"),
+            )
+            .file("mk.def", "#define MK(nm, fn) nm, fn\n")
+            .index();
+        let graph = graph_of(&project);
+        let line = line_of(C11_INC_C, "int go(") - 1;
+        assert_eq!(
+            links(graph),
+            [
+                link("go", "a_impl", "op.run", "inc.c", line),
+                link("go", "b_impl", "op.run", "inc.c", line),
+            ],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// KEEP-RUST: a table whose type only a non-indexed include aliases is
+    /// registered. colby's survival filter skips the includer's own unit:
+    /// its `aliasNames` are the indexed files' object macros.
+    #[test]
+    fn w717b_a_table_typed_by_a_non_indexed_alias_is_read() {
+        const INC_C: &str = concat!(
+            "#include \"inc.h\"\n",
+            "#include \"alias.def\"\n",
+            "static int a_impl(void){return 0;}\n",
+            "static struct CMD_T tab[] = { { \"a\", a_impl } };\n",
+            "int go(struct op *o) { return o->run(); }\n",
+        );
+        let project = Project::new()
+            .file("inc.h", C11_INC_H)
+            .file("alias.def", "#define CMD_T op\n")
+            .file("inc.c", INC_C)
+            .index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            links(graph),
+            [link(
+                "go",
+                "a_impl",
+                "op.run",
+                "inc.c",
+                line_of(INC_C, "int go(")
+            )],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// The index records each file the stage read beside it with its text's
+    /// hash, and each candidate it found no file at as null; an indexed
+    /// include is no such input.
+    #[test]
+    fn w717b_the_index_records_what_the_stage_read_beside_it() {
+        let project = Project::new()
+            .file("src/inc.h", C11_INC_H)
+            .file(
+                "src/inc.c",
+                &C11_INC_C.replace(
+                    "#include \"ops.def\"",
+                    "#include \"ops.def\"\n#include \"missing.def\"",
+                ),
+            )
+            .file("src/ops.def", C11_OPS_DEF)
+            .index();
+        let graph = graph_of(&project);
+        assert_eq!(links(graph).len(), 2, "{}", graph.report());
+        assert_eq!(
+            inputs_row(&project),
+            serde_json::json!({
+                "missing.def": null,
+                "src/missing.def": null,
+                "src/ops.def": codegraph_core::node_id::hash_content(C11_OPS_DEF),
+            })
+        );
+    }
+
+    /// The `synthesis_unindexed_inputs` row of `project`'s index.
+    #[track_caller]
+    fn inputs_row(project: &super::support::Indexed) -> serde_json::Value {
+        let rows = super::support::project_metadata_with_prefix(
+            &project.db(),
+            "synthesis_unindexed_inputs",
+        );
+        let [(key, value)] = rows.as_slice() else {
+            panic!("one synthesis_unindexed_inputs row: {rows:?}");
+        };
+        assert_eq!(key, "synthesis_unindexed_inputs");
+        serde_json::from_str(value).expect("the row is JSON")
     }
 }

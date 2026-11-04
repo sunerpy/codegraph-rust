@@ -2,6 +2,16 @@
   {
     "candidates": null,
     "col": 0,
+    "file_path": "c/src/optab.c",
+    "from_node_id": "file:c/src/optab.c",
+    "language": "c",
+    "line": 14,
+    "reference_kind": "imports",
+    "reference_name": "optab.def"
+  },
+  {
+    "candidates": null,
+    "col": 0,
     "file_path": "dispatch/app/Http/Registration.php",
     "from_node_id": "namespace:1c67f66116a8ffa3279c4c8b70c1755e",
     "language": "php",
@@ -128,6 +138,16 @@
     "line": 16,
     "reference_kind": "calls",
     "reference_name": "ops.close"
+  },
+  {
+    "candidates": null,
+    "col": 11,
+    "file_path": "c/src/optab.c",
+    "from_node_id": "function:f3a1159c5c767086f4bcece8b9165bbc",
+    "language": "c",
+    "line": 17,
+    "reference_kind": "calls",
+    "reference_name": "o.run"
   },
   {
     "candidates": null,

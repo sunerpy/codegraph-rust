@@ -1,0 +1,4 @@
+static struct CMD_T optable[] = {
+    { MK("a", optab_a) },
+    { MK("b", optab_b) },
+};

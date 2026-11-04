@@ -14,13 +14,16 @@
 //! pass fails closed (KEEP-RUST, hard invariant 6): a struct is its name and
 //! its fields, a type name means the only struct of that name in the
 //! project, else the only one the file's translation unit (the file and the
-//! indexed files its includes reach) defines, and a table entry names the
+//! files its includes reach) defines, and a table entry names the
 //! only function of that name in the table's file, else in its includer's,
 //! else in the project. Anything still ambiguous is not linked.
 //!
 //! Upstream's survival filters, caches and native sweep only save time and
 //! memory: every file runs through each stage here. An `#include` resolves
-//! only to an indexed file.
+//! to an indexed file, else to a file the stage reads beside the index
+//! (W7-17b): within the project root and the scan's ignore model, through
+//! no symbolic link and no larger than `indexing.max_file_size`, which
+//! upstream does not require (KEEP-RUST).
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
@@ -1003,9 +1006,14 @@ pub(super) fn c_fn_pointer_dispatch_edges(view: &View<'_>) -> Result<Vec<Edge>> 
 }
 
 impl Pass<'_, '_> {
-    /// `file`'s indexed text.
+    /// `file`'s text: an indexed file's as the index holds it, any other's
+    /// as the stage reads the files the index does not hold (W7-17b).
     fn raw(&self, file: &str) -> Option<Arc<str>> {
-        self.view.text(file)
+        if self.is_indexed(file) {
+            self.view.text(file)
+        } else {
+            self.view.unindexed_text(file)
+        }
     }
 
     /// `file`'s text with its comments blanked, once a pass (`src`); `None`
@@ -1022,17 +1030,27 @@ impl Pass<'_, '_> {
         text
     }
 
-    /// The indexed path `#include "inc"` in `includer` names
-    /// (`resolveInclude`): the includer's directory's first, then `inc`
-    /// itself.
+    /// The path `#include "inc"` in `includer` names (`resolveInclude`):
+    /// the includer's directory's first, then `inc` itself, each an indexed
+    /// file or else a file the stage reads beside the index (upstream's
+    /// `fileExists`: the known files, then the disk), by its project-relative
+    /// form (W7-17b).
     fn resolve_include(&self, includer: &str, inc: &str) -> Option<String> {
         let dir = posix_dirname(&includer.replace('\\', "/")).to_string();
         let candidate = posix_normalize(&format!("{dir}/{inc}"));
-        if self.is_indexed(&candidate) {
-            return Some(candidate);
-        }
-        if self.is_indexed(inc) {
-            return Some(inc.to_string());
+        for path in [candidate.as_str(), inc] {
+            if self.is_indexed(path) {
+                return Some(path.to_string());
+            }
+            let Some(relative) = View::unindexed_path(path) else {
+                continue;
+            };
+            if self.is_indexed(&relative) {
+                return Some(relative);
+            }
+            if self.view.unindexed_text(&relative).is_some() {
+                return Some(relative);
+            }
         }
         None
     }

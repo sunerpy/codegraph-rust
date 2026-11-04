@@ -438,7 +438,8 @@ fn run_case(name: &str, case: &Case) {
     // And the Shopify theme row and its marker (W4-LIQ-01).
     let shopify_rows = support::project_metadata_with_prefix(&fresh.db(), "shopify_themes");
     // And the class-head rows (W5-07), the control-input rows, the
-    // detected frameworks and the Dart pubspec rows (W5-06). An input
+    // detected frameworks and the Dart pubspec rows (W5-06), and what the
+    // synthesis stage read beside the index (W7-17b). An input
     // outside the project is keyed by
     // the absolute path its reader used, which differs between the trees, so
     // only project paths are compared.
@@ -447,6 +448,7 @@ fn run_case(name: &str, case: &Case) {
         "control_inputs",
         "frameworks_",
         "dart_pubspec",
+        "synthesis_unindexed_inputs",
     ] {
         let fresh_rows = comparable_rows(&fresh.db(), prefix);
         for (driver, project) in [("cli", &cli), ("watch", &watch)] {
@@ -1545,6 +1547,11 @@ matrix! {
     c_fnptr_shared_definition_splits,
     c_fnptr_header_struct_gains_a_conditional_field,
     c_fnptr_header_struct_drops_its_conditional_field,
+    c_fnptr_non_indexed_include_gains_an_entry,
+    c_fnptr_non_indexed_include_appears,
+    c_fnptr_non_indexed_include_deleted,
+    c_fnptr_non_indexed_include_becomes_gitignored,
+    c_fnptr_non_indexed_include_becomes_excluded,
     go_var_group_gains_a_member_whose_initializer_calls_another_file,
     go_package_closure_call_reaches_a_function_that_appears,
     go_package_literal_struct_file_deleted,

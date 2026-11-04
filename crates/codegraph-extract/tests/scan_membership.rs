@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::SystemTime;
 
 use codegraph_extract::ExtractOptions;
-use codegraph_extract::engine::{Membership, scan_membership, scan_project};
+use codegraph_extract::engine::{Membership, ScanScope, scan_membership, scan_project};
 
 fn sandbox(tag: &str) -> PathBuf {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -221,4 +221,76 @@ fn a_git_file_pointing_elsewhere_contributes_no_excludes() {
     assert_eq!(scanned, ["src/app.ts"]);
     fs::remove_dir_all(&root).ok();
     fs::remove_dir_all(&elsewhere).ok();
+}
+
+/// `ScanScope::admits_file` is `scan_membership`'s verdict on a file without
+/// its question whether the file is extractable source (W7-17b): a `.def`
+/// the walk reaches is admitted, one the ignore model, the configuration or
+/// the reserved index root keeps out is not, a path through a symbolic link
+/// is the full scan's to resolve, and a source file is judged alike.
+#[test]
+fn a_scan_scope_admits_a_file_of_any_extension_the_walk_reaches() {
+    let root = sandbox("scope");
+    fs::write(root.join(".gitignore"), "ignored.def\n").unwrap();
+    for file in [
+        "ops.def",
+        "src/app.ts",
+        "src/tab.def",
+        "ignored.def",
+        "excluded.def",
+        "node_modules/pkg/x.def",
+        ".codegraph/stray.def",
+    ] {
+        touch(&root, file);
+    }
+    let options = ExtractOptions {
+        exclude: vec!["excluded.def".to_string()],
+        ..ExtractOptions::default()
+    };
+    let scope = ScanScope::new(&root, &options);
+    for (file, expected) in [
+        ("ops.def", Membership::Admitted),
+        ("src/tab.def", Membership::Admitted),
+        ("src/app.ts", Membership::Admitted),
+        ("ignored.def", Membership::Rejected),
+        ("excluded.def", Membership::Rejected),
+        ("node_modules/pkg/x.def", Membership::Rejected),
+        (".codegraph/stray.def", Membership::Rejected),
+        ("missing.def", Membership::Rejected),
+        ("src", Membership::Rejected),
+        ("../ops.def", Membership::Rejected),
+    ] {
+        assert_eq!(scope.admits_file(file), expected, "{file}");
+    }
+    assert_eq!(
+        scan_membership(&root, &options, "ops.def", false),
+        Membership::Rejected,
+        "the scan indexes no .def"
+    );
+    for file in files_on_disk(&root) {
+        if file.ends_with(".ts") {
+            assert_eq!(
+                scope.admits_file(&file),
+                scan_membership(&root, &options, &file, false),
+                "{file}: a source file is judged as the scan judges it"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    let made = std::os::unix::fs::symlink(root.join("ops.def"), root.join("linked.def"));
+    #[cfg(windows)]
+    let made = std::os::windows::fs::symlink_file(root.join("ops.def"), root.join("linked.def"));
+    match made {
+        Ok(()) => assert_eq!(
+            ScanScope::new(&root, &options).admits_file("linked.def"),
+            Membership::Unknown,
+            "a path through a symlink is the full scan's to resolve"
+        ),
+        Err(error) if std::env::var_os("CI").is_some() => {
+            panic!("CI must be able to create symlinks: {error}")
+        }
+        Err(_) => {}
+    }
+    fs::remove_dir_all(&root).ok();
 }

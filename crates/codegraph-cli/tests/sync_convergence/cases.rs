@@ -17120,3 +17120,72 @@ pub fn c_fnptr_header_struct_drops_its_conditional_field() -> Case {
         .edge_before("function go", "calls", "function two")
         .edge_after("function go", "calls", "function one")
 }
+
+/// W7-17b: the C file that dispatches and includes a `.def`, which the scan
+/// does not index, and the struct it registers into.
+const FNPTR_DEF_OPS_H: &str = "struct ops { void (*run)(void); };\n";
+const FNPTR_DEF_GO_C: &str = "#include \"ops.h\"\nvoid one(void) {}\nvoid two(void) {}\n#include \"tab.def\"\nvoid go(struct ops *p) { p->run(); }\n";
+const FNPTR_DEF_TAB: &str = "static struct ops table[] = { { one } };\n";
+
+/// W7-17b: only the `.def` the unchanged includer reads changes, and its
+/// table gains an entry.
+pub fn c_fnptr_non_indexed_include_gains_an_entry() -> Case {
+    Case::new(Change::BodyEdit, &[Language::C])
+        .file("ops.h", FNPTR_DEF_OPS_H)
+        .file("go.c", FNPTR_DEF_GO_C)
+        .file("tab.def", FNPTR_DEF_TAB)
+        .write(
+            "tab.def",
+            "static struct ops table[] = { { one }, { two } };\n",
+        )
+        .edge_before("function go", "calls", "function one")
+        .edge_after("function go", "calls", "function two")
+        .edge_metadata_after(("function go", "calls", "function two"), "via", "ops.run")
+}
+
+/// W7-17b: the `.def` an include names appears, though no file the index
+/// holds changes.
+pub fn c_fnptr_non_indexed_include_appears() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::C])
+        .file("ops.h", FNPTR_DEF_OPS_H)
+        .file("go.c", FNPTR_DEF_GO_C)
+        .write("tab.def", FNPTR_DEF_TAB)
+        .edge_after("function go", "calls", "function one")
+}
+
+/// W7-17b: the `.def` is deleted.
+pub fn c_fnptr_non_indexed_include_deleted() -> Case {
+    Case::new(Change::DeleteImportedModule, &[Language::C])
+        .file("ops.h", FNPTR_DEF_OPS_H)
+        .file("go.c", FNPTR_DEF_GO_C)
+        .file("tab.def", FNPTR_DEF_TAB)
+        .remove("tab.def")
+        .edge_before("function go", "calls", "function one")
+        .no_edge_after("function go", "calls", "function one")
+}
+
+/// W7-17b: the root `.gitignore` comes to ignore the `.def`, which the
+/// stage then no longer reads.
+pub fn c_fnptr_non_indexed_include_becomes_gitignored() -> Case {
+    Case::new(Change::ControlFile, &[Language::C])
+        .file("ops.h", FNPTR_DEF_OPS_H)
+        .file("go.c", FNPTR_DEF_GO_C)
+        .file("tab.def", FNPTR_DEF_TAB)
+        .write(".gitignore", "*.def\n")
+        .edge_before("function go", "calls", "function one")
+        .no_edge_after("function go", "calls", "function one")
+}
+
+/// W7-17b: the configuration comes to exclude the `.def`.
+pub fn c_fnptr_non_indexed_include_becomes_excluded() -> Case {
+    Case::new(Change::ControlFile, &[Language::C])
+        .file("ops.h", FNPTR_DEF_OPS_H)
+        .file("go.c", FNPTR_DEF_GO_C)
+        .file("tab.def", FNPTR_DEF_TAB)
+        .write(
+            ".codegraph/config.toml",
+            "[app]\nname = \"matrix\"\n\n[indexing]\nexclude = [\"tab.def\"]\n",
+        )
+        .edge_before("function go", "calls", "function one")
+        .no_edge_after("function go", "calls", "function one")
+}
