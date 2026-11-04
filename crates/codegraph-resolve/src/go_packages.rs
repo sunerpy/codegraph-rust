@@ -181,12 +181,23 @@ pub fn go_import_package_dir(
     {
         return hit;
     }
-    let dir = owning_go_module(import_path, &modules, own)
-        .map(|module| package_dir_in(import_path, module));
+    let dir = go_module_package_dir(import_path, from_file, &modules);
     if let Ok(mut memo) = tables.package_dirs.lock() {
         memo.insert(key, dir.clone());
     }
     dir
+}
+
+/// [`go_import_package_dir`] over a module table, without a resolution
+/// context: the directory of the package `import_path` names in `modules`,
+/// `from_file`'s own module breaking a tie (`""` at the project root).
+pub(crate) fn go_module_package_dir(
+    import_path: &str,
+    from_file: Option<&str>,
+    modules: &[GoModule],
+) -> Option<String> {
+    let own = from_file.and_then(|file| nearest_module(&package_dir_of(file), modules));
+    owning_go_module(import_path, modules, own).map(|module| package_dir_in(import_path, module))
 }
 
 /// The project directory of the package `file_path` imports as `qualifier`

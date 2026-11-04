@@ -16622,3 +16622,138 @@ pub fn go_root_module_file_deleted_unlinks_a_cross_package_call() -> Case {
         .remove("go.mod")
         .no_edge_after("function main", "calls", "function Go @util/util.go")
 }
+
+/// `discovery/refresh/refresh.go` of upstream's `go-func-field-dispatch.test.ts`:
+/// `Discovery.refresh` calls through `refreshf`, which `NewDiscovery` copies
+/// from `Options.RefreshF`.
+const GO_REFRESH: &str = "package refresh\n\nimport \"context\"\n\ntype Group struct{ Source string }\n\ntype Options struct {\n\tMech     string\n\tInterval int\n\tRefreshF func(ctx context.Context) ([]*Group, error)\n}\n\ntype Discovery struct {\n\tinterval int\n\trefreshf func(ctx context.Context) ([]*Group, error)\n}\n\nfunc NewDiscovery(opts Options) *Discovery {\n\treturn &Discovery{\n\t\tinterval: opts.Interval,\n\t\trefreshf: opts.RefreshF,\n\t}\n}\n\nfunc (d *Discovery) Run(ctx context.Context) {\n\td.refresh(ctx)\n}\n\nfunc (d *Discovery) refresh(ctx context.Context) ([]*Group, error) {\n\ttgs, err := d.refreshf(ctx)\n\treturn tgs, err\n}\n";
+
+/// The gce provider of upstream's sync case, before it wires its function.
+const GO_GCE_UNWIRED: &str = "package gce\n\nimport (\n\t\"context\"\n\n\t\"example.com/app/discovery/refresh\"\n)\n\nfunc refreshInstances(ctx context.Context) ([]*refresh.Group, error) { return nil, nil }\n\nfunc NewDiscovery() *refresh.Discovery {\n\treturn refresh.NewDiscovery(refresh.Options{Mech: \"gce\"})\n}\n";
+
+/// The same provider wiring `refreshInstances` in through `Options`.
+const GO_GCE_WIRED: &str = "package gce\n\nimport (\n\t\"context\"\n\n\t\"example.com/app/discovery/refresh\"\n)\n\nfunc refreshInstances(ctx context.Context) ([]*refresh.Group, error) { return nil, nil }\n\nfunc NewDiscovery() *refresh.Discovery {\n\treturn refresh.NewDiscovery(refresh.Options{Mech: \"gce\", RefreshF: refreshInstances})\n}\n";
+
+const GO_APP_MOD: &str = "module example.com/app\n\ngo 1.22\n";
+
+/// W7-15d (upstream `go-func-field-dispatch.test.ts`'s sync case): a file
+/// that only wires puts its function in the field, and the call through the
+/// copied field links to it.
+pub fn go_func_field_wiring_appears_in_a_file_that_only_wires() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Go])
+        .file("go.mod", GO_APP_MOD)
+        .file("discovery/refresh/refresh.go", GO_REFRESH)
+        .file("discovery/gce/gce.go", GO_GCE_UNWIRED)
+        .write("discovery/gce/gce.go", GO_GCE_WIRED)
+        .edge_after(
+            "method Discovery::refresh",
+            "calls",
+            "function refreshInstances",
+        )
+}
+
+/// W7-15d (the same upstream case's second step): the wiring goes, and so
+/// does the link.
+pub fn go_func_field_wiring_removed() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Go])
+        .file("go.mod", GO_APP_MOD)
+        .file("discovery/refresh/refresh.go", GO_REFRESH)
+        .file("discovery/gce/gce.go", GO_GCE_WIRED)
+        .edge_before(
+            "method Discovery::refresh",
+            "calls",
+            "function refreshInstances",
+        )
+        .write("discovery/gce/gce.go", GO_GCE_UNWIRED)
+        .no_edge_after(
+            "method Discovery::refresh",
+            "calls",
+            "function refreshInstances",
+        )
+}
+
+/// W7-15d: the field stops holding a function, so a call through it is
+/// no call through a func field.
+pub fn go_func_field_type_stops_being_a_func() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Go])
+        .file("go.mod", GO_APP_MOD)
+        .file(
+            "jobs/jobs.go",
+            "package jobs\n\ntype Job struct {\n\tfn func() error\n}\n\nfunc (j *Job) Run() error { return j.fn() }\n",
+        )
+        .file(
+            "jobs/wire.go",
+            "package jobs\n\nfunc cleanup() error { return nil }\n\nfunc NewJob() *Job { return &Job{fn: cleanup} }\n",
+        )
+        .edge_before("method Job::Run", "calls", "function cleanup")
+        .write(
+            "jobs/jobs.go",
+            "package jobs\n\ntype Job struct {\n\tfn int\n}\n\nfunc (j *Job) Run() error { return j.fn() }\n",
+        )
+        .no_edge_after("method Job::Run", "calls", "function cleanup")
+}
+
+/// `discovery/aws/ec2.go` wiring its `refresh` method in.
+const GO_EC2_REFRESH: &str = "package aws\n\nimport (\n\t\"context\"\n\n\t\"example.com/app/discovery/refresh\"\n)\n\ntype EC2Discovery struct {\n\t*refresh.Discovery\n}\n\nfunc NewEC2Discovery() *EC2Discovery {\n\td := &EC2Discovery{}\n\td.Discovery = refresh.NewDiscovery(refresh.Options{RefreshF: d.refresh})\n\treturn d\n}\n\nfunc (d *EC2Discovery) refresh(ctx context.Context) ([]*refresh.Group, error) { return nil, nil }\n\nfunc (d *EC2Discovery) list(ctx context.Context) ([]*refresh.Group, error)    { return nil, nil }\n";
+
+/// The same provider wiring its `list` method instead.
+const GO_EC2_LIST: &str = "package aws\n\nimport (\n\t\"context\"\n\n\t\"example.com/app/discovery/refresh\"\n)\n\ntype EC2Discovery struct {\n\t*refresh.Discovery\n}\n\nfunc NewEC2Discovery() *EC2Discovery {\n\td := &EC2Discovery{}\n\td.Discovery = refresh.NewDiscovery(refresh.Options{RefreshF: d.list})\n\treturn d\n}\n\nfunc (d *EC2Discovery) refresh(ctx context.Context) ([]*refresh.Group, error) { return nil, nil }\n\nfunc (d *EC2Discovery) list(ctx context.Context) ([]*refresh.Group, error)    { return nil, nil }\n";
+
+/// W7-15d: the value another file copies into the field changes, and the
+/// call through the copy follows it.
+pub fn go_func_field_copied_value_changes_in_another_file() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Go])
+        .file("go.mod", GO_APP_MOD)
+        .file("discovery/refresh/refresh.go", GO_REFRESH)
+        .file("discovery/aws/ec2.go", GO_EC2_REFRESH)
+        .edge_before(
+            "method Discovery::refresh",
+            "calls",
+            "method EC2Discovery::refresh",
+        )
+        .write("discovery/aws/ec2.go", GO_EC2_LIST)
+        .edge_after(
+            "method Discovery::refresh",
+            "calls",
+            "method EC2Discovery::list",
+        )
+        .no_edge_after(
+            "method Discovery::refresh",
+            "calls",
+            "method EC2Discovery::refresh",
+        )
+}
+
+/// W7-15d (after W7-15d0): a package-level variable's literal wires the
+/// field from a file that appears.
+pub fn go_func_field_package_level_wiring_appears() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Go])
+        .file("go.mod", GO_APP_MOD)
+        .file("discovery/refresh/refresh.go", GO_REFRESH)
+        .write(
+            "discovery/static/static.go",
+            "package static\n\nimport (\n\t\"context\"\n\n\t\"example.com/app/discovery/refresh\"\n)\n\nfunc list(ctx context.Context) ([]*refresh.Group, error) { return nil, nil }\n\nvar defaults = refresh.Options{Mech: \"static\", RefreshF: list}\n",
+        )
+        .edge_after("method Discovery::refresh", "calls", "function list")
+}
+
+/// W7-15d (after W7-15d1): the root `go.mod` renames the module, so the
+/// import a qualified literal is written through names no project package
+/// and the literal wires nothing.
+pub fn go_func_field_module_renamed_unlinks_a_qualified_literal() -> Case {
+    Case::new(Change::ControlFile, &[Language::Go])
+        .file("go.mod", GO_APP_MOD)
+        .file("discovery/refresh/refresh.go", GO_REFRESH)
+        .file("discovery/aws/ec2.go", GO_EC2_REFRESH)
+        .edge_before(
+            "method Discovery::refresh",
+            "calls",
+            "method EC2Discovery::refresh",
+        )
+        .write("go.mod", "module example.com/other\n\ngo 1.22\n")
+        .no_edge_after(
+            "method Discovery::refresh",
+            "calls",
+            "method EC2Discovery::refresh",
+        )
+}

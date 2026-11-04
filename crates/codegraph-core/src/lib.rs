@@ -1,5 +1,6 @@
 //! codegraph-core crate
 
+pub mod collation;
 pub mod config;
 pub mod deprioritize;
 pub mod errors;

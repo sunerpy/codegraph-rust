@@ -76,7 +76,25 @@ impl GoScopeIndex {
     /// Read `source` (upstream `readGoScopes(blankGoCode(…))`).
     pub(crate) fn read(source: &str) -> Self {
         let joined = source.lines().collect::<Vec<_>>().join("\n");
-        read_go_scopes(blank_go_code(&joined))
+        Self::from_blanked(blank_go_code(&joined))
+    }
+
+    /// Read `code`, the source's lines joined with `\n` and blanked by
+    /// [`blank_go_code`], as [`Self::read`] makes it.
+    pub(crate) fn from_blanked(code: String) -> Self {
+        read_go_scopes(code)
+    }
+
+    /// Whether `self` and `other` read the same code into the same blocks
+    /// and declarations; the scopes are worked out from those on demand.
+    #[cfg(test)]
+    pub(crate) fn same_as(&self, other: &Self) -> bool {
+        self.code == other.code
+            && self.line_starts == other.line_starts
+            && self.events == other.events
+            && self.open == other.open
+            && self.close == other.close
+            && self.decls == other.decls
     }
 
     /// The parameter or local `name` is at line `line` (1-based), column
@@ -96,6 +114,14 @@ impl GoScopeIndex {
             .filter(|(from, to, _)| at > *from && at < *to)
             .max_by_key(|(from, _, _)| *from)
             .map(|(_, _, decl)| decl.clone())
+    }
+
+    /// Where `decl` declares its name: the 1-based line and the column in
+    /// that line (upstream `goLocalDeclarationAt`'s `line` and `column`).
+    pub(crate) fn position(&self, decl: &GoDecl) -> (i64, i64) {
+        // The first line starts at 0, so every offset has a line.
+        let line = self.line_starts.partition_point(|&start| start <= decl.at);
+        (line as i64, (decl.at - self.line_starts[line - 1]) as i64)
     }
 
     fn scopes_of(&self, name: &str) -> Arc<Vec<Scope>> {
@@ -720,7 +746,7 @@ fn param_names(code: &str, from: usize, to: usize) -> Vec<(&str, usize, String)>
 /// Go source with its comments and the contents of its strings and runes
 /// blanked: offsets and newlines stay, so a match still maps to its line and
 /// column (upstream `blankGoCode`).
-fn blank_go_code(src: &str) -> String {
+pub(crate) fn blank_go_code(src: &str) -> String {
     let bytes = src.as_bytes();
     let mut out = bytes.to_vec();
     let blank = |out: &mut Vec<u8>, from: usize, to: usize| {

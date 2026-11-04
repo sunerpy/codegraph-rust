@@ -23241,7 +23241,7 @@ mod synthesis {
         assert_eq!((edge.line, edge.col), (Some(7), None), "{edge:?}");
         assert_eq!(
             project_metadata_with_prefix(&project.db(), "synthesis_version"),
-            [("synthesis_version".to_string(), "6".to_string())]
+            [("synthesis_version".to_string(), "7".to_string())]
         );
     }
 
@@ -28274,6 +28274,1144 @@ mod go_var_specs {
                 .edges_matching("function body", "calls", "function newThing")
                 .len(),
             2,
+            "{}",
+            graph.report()
+        );
+    }
+}
+
+mod go_func_field {
+    use super::support::{Graph, Project, codegraph, graph_of};
+
+    /// `go.mod` of upstream's `go-func-field-dispatch.test.ts`.
+    const GO_MOD: &str = concat!("module example.com/app\n", "\n", "go 1.22\n",);
+
+    /// `discovery/refresh/refresh.go` of upstream's `go-func-field-dispatch.test.ts`.
+    const DISCOVERY_REFRESH_REFRESH_GO: &str = concat!(
+        "package refresh\n",
+        "\n",
+        "import \"context\"\n",
+        "\n",
+        "type Group struct{ Source string }\n",
+        "\n",
+        "// Options are the options for a refreshing discovery.\n",
+        "type Options struct {\n",
+        "\tMech     string\n",
+        "\tInterval int\n",
+        "\tRefreshF func(ctx context.Context) ([]*Group, error)\n",
+        "}\n",
+        "\n",
+        "// Discovery runs a refresh function on an interval.\n",
+        "type Discovery struct {\n",
+        "\tinterval int\n",
+        "\trefreshf func(ctx context.Context) ([]*Group, error)\n",
+        "}\n",
+        "\n",
+        "func NewDiscovery(opts Options) *Discovery {\n",
+        "\treturn &Discovery{\n",
+        "\t\tinterval: opts.Interval,\n",
+        "\t\trefreshf: opts.RefreshF,\n",
+        "\t}\n",
+        "}\n",
+        "\n",
+        "func (d *Discovery) Run(ctx context.Context) {\n",
+        "\td.refresh(ctx)\n",
+        "}\n",
+        "\n",
+        "func (d *Discovery) refresh(ctx context.Context) ([]*Group, error) {\n",
+        "\ttgs, err := d.refreshf(ctx)\n",
+        "\treturn tgs, err\n",
+        "}\n",
+    );
+
+    /// `discovery/aws/ec2.go` of upstream's `go-func-field-dispatch.test.ts`.
+    const DISCOVERY_AWS_EC2_GO: &str = concat!(
+        "package aws\n",
+        "\n",
+        "import (\n",
+        "\t\"context\"\n",
+        "\n",
+        "\t\"example.com/app/discovery/refresh\"\n",
+        ")\n",
+        "\n",
+        "type EC2Discovery struct {\n",
+        "\t*refresh.Discovery\n",
+        "\tregion string\n",
+        "}\n",
+        "\n",
+        "func NewEC2Discovery(region string) *EC2Discovery {\n",
+        "\td := &EC2Discovery{region: region}\n",
+        "\td.Discovery = refresh.NewDiscovery(refresh.Options{\n",
+        "\t\tMech:     \"ec2\",\n",
+        "\t\tRefreshF: d.refresh,\n",
+        "\t})\n",
+        "\treturn d\n",
+        "}\n",
+        "\n",
+        "func (d *EC2Discovery) refresh(ctx context.Context) ([]*refresh.Group, error) {\n",
+        "\treturn []*refresh.Group{{Source: d.region}}, nil\n",
+        "}\n",
+    );
+
+    /// `discovery/hetzner/hetzner.go` of upstream's `go-func-field-dispatch.test.ts`.
+    const DISCOVERY_HETZNER_HETZNER_GO: &str = concat!(
+        "package hetzner\n",
+        "\n",
+        "import (\n",
+        "\t\"context\"\n",
+        "\n",
+        "\t\"example.com/app/discovery/refresh\"\n",
+        ")\n",
+        "\n",
+        "type refresher interface {\n",
+        "\trefresh(ctx context.Context) ([]*refresh.Group, error)\n",
+        "}\n",
+        "\n",
+        "type robotDiscovery struct{ endpoint string }\n",
+        "\n",
+        "func (d *robotDiscovery) refresh(ctx context.Context) ([]*refresh.Group, error) {\n",
+        "\treturn nil, nil\n",
+        "}\n",
+        "\n",
+        "type Discovery struct {\n",
+        "\t*refresh.Discovery\n",
+        "}\n",
+        "\n",
+        "func newRefresher(endpoint string) (refresher, error) {\n",
+        "\treturn &robotDiscovery{endpoint: endpoint}, nil\n",
+        "}\n",
+        "\n",
+        "func NewDiscovery(endpoint string) (*Discovery, error) {\n",
+        "\tr, err := newRefresher(endpoint)\n",
+        "\tif err != nil {\n",
+        "\t\treturn nil, err\n",
+        "\t}\n",
+        "\treturn &Discovery{\n",
+        "\t\tDiscovery: refresh.NewDiscovery(refresh.Options{\n",
+        "\t\t\tMech:     \"hetzner\",\n",
+        "\t\t\tRefreshF: r.refresh,\n",
+        "\t\t}),\n",
+        "\t}, nil\n",
+        "}\n",
+    );
+
+    /// `jobs/jobs.go` of upstream's `go-func-field-dispatch.test.ts`.
+    const JOBS_JOBS_GO: &str = concat!(
+        "package jobs\n",
+        "\n",
+        "type Job struct {\n",
+        "\tname string\n",
+        "\tfn   func() error\n",
+        "}\n",
+        "\n",
+        "func cleanup() error { return nil }\n",
+        "\n",
+        "func NewCleanupJob() *Job {\n",
+        "\treturn &Job{name: \"cleanup\", fn: cleanup}\n",
+        "}\n",
+        "\n",
+        "// What a parameter holds, or a function literal, is no function the project declares.\n",
+        "func NewJob(name string, fn func() error) *Job {\n",
+        "\treturn &Job{name: name, fn: fn}\n",
+        "}\n",
+        "\n",
+        "func NewInlineJob() *Job {\n",
+        "\treturn &Job{name: \"inline\", fn: func() error { return nil }}\n",
+        "}\n",
+        "\n",
+        "func (j *Job) Run() error {\n",
+        "\treturn j.fn()\n",
+        "}\n",
+    );
+
+    /// `hooks/hooks.go` of upstream's `go-func-field-dispatch.test.ts`.
+    const HOOKS_HOOKS_GO: &str = concat!(
+        "package hooks\n",
+        "\n",
+        "type Hook struct {\n",
+        "\tfn func() error\n",
+        "}\n",
+        "\n",
+        "func notify() error { return nil }\n",
+        "\n",
+        "func NewHook() *Hook {\n",
+        "\th := &Hook{}\n",
+        "\th.fn = notify\n",
+        "\treturn h\n",
+        "}\n",
+        "\n",
+        "func (h *Hook) Fire() error {\n",
+        "\treturn h.fn()\n",
+        "}\n",
+    );
+
+    /// `printer/printer.go` of upstream's `go-func-field-dispatch.test.ts`.
+    const PRINTER_PRINTER_GO: &str = concat!(
+        "package printer\n",
+        "\n",
+        "type printerRPC struct {\n",
+        "\tprefix string\n",
+        "\tp      func(v any)\n",
+        "}\n",
+        "\n",
+        "func printJSON(v any) {}\n",
+        "\n",
+        "func NewJSONPrinter() *printerRPC {\n",
+        "\treturn &printerRPC{\"json\", printJSON}\n",
+        "}\n",
+        "\n",
+        "func (p *printerRPC) Put(v any) { p.p(v) }\n",
+    );
+
+    /// `client/client.go` of upstream's `go-func-field-dispatch.test.ts`.
+    const CLIENT_CLIENT_GO: &str = concat!(
+        "package client\n",
+        "\n",
+        "type Client struct {\n",
+        "\tHook func()\n",
+        "}\n",
+        "\n",
+        "func defaultHook() {}\n",
+        "\n",
+        "func (c *Client) Do() { c.Hook() }\n",
+    );
+
+    /// `client/wire.go` of upstream's `go-func-field-dispatch.test.ts`.
+    const CLIENT_WIRE_GO: &str = concat!(
+        "package client\n",
+        "\n",
+        "func New() *Client {\n",
+        "\treturn &Client{Hook: defaultHook}\n",
+        "}\n",
+    );
+
+    /// `client/a_test.go` of upstream's `go-func-field-dispatch.test.ts`.
+    const CLIENT_A_TEST_GO: &str = concat!(
+        "package client\n",
+        "\n",
+        "import \"testing\"\n",
+        "\n",
+        "func newTestClient() *Client {\n",
+        "\treturn &Client{Hook: defaultHook}\n",
+        "}\n",
+        "\n",
+        "func TestDo(t *testing.T) {\n",
+        "\tc := newTestClient()\n",
+        "\tc.Hook()\n",
+        "}\n",
+    );
+
+    /// `other/other_test.go` of upstream's `go-func-field-dispatch.test.ts`.
+    const OTHER_OTHER_TEST_GO: &str = concat!(
+        "package other\n",
+        "\n",
+        "import (\n",
+        "\t\"testing\"\n",
+        "\n",
+        "\t\"example.com/app/client\"\n",
+        ")\n",
+        "\n",
+        "func otherHook() {}\n",
+        "\n",
+        "func TestOther(t *testing.T) {\n",
+        "\tc := client.New()\n",
+        "\tc.Hook = otherHook\n",
+        "\tc.Do()\n",
+        "}\n",
+    );
+
+    /// `server/server.go` of upstream's `go-func-field-dispatch.test.ts`.
+    const SERVER_SERVER_GO: &str = concat!(
+        "package server\n",
+        "\n",
+        "type HandlerFunc func(path string) error\n",
+        "\n",
+        "type Server struct {\n",
+        "\thandler HandlerFunc\n",
+        "}\n",
+        "\n",
+        "func (s *Server) serveStatic(path string) error { return nil }\n",
+        "\n",
+        "func New() *Server {\n",
+        "\ts := &Server{}\n",
+        "\ts.handler = HandlerFunc(s.serveStatic)\n",
+        "\treturn s\n",
+        "}\n",
+        "\n",
+        "func (s *Server) Handle(path string) error {\n",
+        "\treturn s.handler(path)\n",
+        "}\n",
+    );
+
+    const FILES: &[(&str, &str)] = &[
+        ("go.mod", GO_MOD),
+        ("discovery/refresh/refresh.go", DISCOVERY_REFRESH_REFRESH_GO),
+        ("discovery/aws/ec2.go", DISCOVERY_AWS_EC2_GO),
+        ("discovery/hetzner/hetzner.go", DISCOVERY_HETZNER_HETZNER_GO),
+        ("jobs/jobs.go", JOBS_JOBS_GO),
+        ("hooks/hooks.go", HOOKS_HOOKS_GO),
+        ("printer/printer.go", PRINTER_PRINTER_GO),
+        ("client/client.go", CLIENT_CLIENT_GO),
+        ("client/wire.go", CLIENT_WIRE_GO),
+        ("client/a_test.go", CLIENT_A_TEST_GO),
+        ("other/other_test.go", OTHER_OTHER_TEST_GO),
+        ("server/server.go", SERVER_SERVER_GO),
+    ];
+
+    /// The 1-based line of `text` holding `needle`.
+    #[track_caller]
+    fn line_of(text: &str, needle: &str) -> usize {
+        text.split('\n')
+            .position(|line| line.contains(needle))
+            .unwrap_or_else(|| panic!("no line holds {needle:?}"))
+            + 1
+    }
+
+    /// `file:line` of the line of fixture `file` holding `needle` (upstream
+    /// `siteOf`).
+    #[track_caller]
+    fn site_of(files: &[(&str, &str)], file: &str, needle: &str) -> String {
+        let (_, text) = files
+            .iter()
+            .find(|(path, _)| *path == file)
+            .unwrap_or_else(|| panic!("no fixture {file}"));
+        format!("{file}:{}", line_of(text, needle))
+    }
+
+    /// A project of `files`, indexed.
+    fn project_of(files: &[(&str, &str)]) -> super::support::Indexed {
+        files
+            .iter()
+            .fold(Project::new(), |project, (path, text)| {
+                project.file(path, text)
+            })
+            .index()
+    }
+
+    /// The id of the one function or method `qualified` in `file` (upstream
+    /// `fn`).
+    #[track_caller]
+    fn callable(graph: &Graph, qualified: &str, file: &str) -> String {
+        let found: Vec<_> = graph
+            .nodes
+            .iter()
+            .filter(|node| {
+                node.file_path == file
+                    && node.qualified_name == qualified
+                    && matches!(node.kind.as_str(), "function" | "method")
+            })
+            .collect();
+        assert_eq!(found.len(), 1, "{qualified} in {file}: {found:#?}");
+        found[0].id.clone()
+    }
+
+    /// The go-func-field edges out of `from`, as `target (file) @registeredAt
+    /// [field via]`, sorted (upstream `funcFieldCalls`); each is heuristic,
+    /// has no column, and sits on a line.
+    #[track_caller]
+    fn func_field_calls(graph: &Graph, from: &str) -> Vec<String> {
+        let mut calls: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|edge| {
+                edge.source == from
+                    && edge.kind == "calls"
+                    && edge.metadata["synthesizedBy"] == "go-func-field"
+            })
+            .map(|edge| {
+                assert_eq!(edge.provenance.as_deref(), Some("heuristic"), "{edge:?}");
+                assert_eq!(edge.col, None, "{edge:?}");
+                assert!(edge.line.is_some(), "{edge:?}");
+                let target = graph.node(&edge.target).expect("the target node");
+                let via = edge.metadata["via"]
+                    .as_str()
+                    .map(|via| format!(" via {via}"))
+                    .unwrap_or_default();
+                format!(
+                    "{} ({}) @{} [{}{via}]",
+                    target.qualified_name,
+                    target.file_path,
+                    edge.metadata["registeredAt"].as_str().unwrap_or("?"),
+                    edge.metadata["field"].as_str().unwrap_or("?"),
+                )
+            })
+            .collect();
+        calls.sort();
+        calls
+    }
+
+    /// Upstream: Prometheus' `Discovery.refresh` links to each provider's
+    /// method through the `Options` field it is copied from, EC2's method
+    /// value and hetzner's interface method (`r refresher`, a call's
+    /// result), each on the line of the call through the field.
+    #[test]
+    fn w715d_prometheus_refresh_reaches_each_provider_through_options() {
+        let project = project_of(FILES);
+        let graph = graph_of(&project);
+        let refresh = callable(graph, "Discovery::refresh", "discovery/refresh/refresh.go");
+        assert_eq!(
+            func_field_calls(graph, &refresh),
+            [
+                format!(
+                    "EC2Discovery::refresh (discovery/aws/ec2.go) @{} [Discovery.refreshf via Options.RefreshF]",
+                    site_of(FILES, "discovery/aws/ec2.go", "RefreshF: d.refresh")
+                ),
+                format!(
+                    "refresher::refresh (discovery/hetzner/hetzner.go) @{} [Discovery.refreshf via Options.RefreshF]",
+                    site_of(FILES, "discovery/hetzner/hetzner.go", "RefreshF: r.refresh")
+                ),
+            ],
+            "{}",
+            graph.report()
+        );
+        let call = line_of(DISCOVERY_REFRESH_REFRESH_GO, "d.refreshf(ctx)") as i64;
+        assert!(
+            graph
+                .edges
+                .iter()
+                .filter(|edge| edge.source == refresh
+                    && edge.metadata["synthesizedBy"] == "go-func-field")
+                .all(|edge| edge.line == Some(call)),
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream: a field name two unrelated structs share stays apart.
+    #[test]
+    fn w715d_a_field_name_two_structs_share_stays_apart() {
+        let project = project_of(FILES);
+        let graph = graph_of(&project);
+        assert_eq!(
+            func_field_calls(graph, &callable(graph, "Job::Run", "jobs/jobs.go")),
+            [format!(
+                "cleanup (jobs/jobs.go) @{} [Job.fn]",
+                site_of(FILES, "jobs/jobs.go", "fn: cleanup")
+            )],
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            func_field_calls(graph, &callable(graph, "Hook::Fire", "hooks/hooks.go")),
+            [format!(
+                "notify (hooks/hooks.go) @{} [Hook.fn]",
+                site_of(FILES, "hooks/hooks.go", "h.fn = notify")
+            )],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream: a positional literal, and a conversion to a func type.
+    #[test]
+    fn w715d_a_positional_literal_and_a_func_type_conversion() {
+        let project = project_of(FILES);
+        let graph = graph_of(&project);
+        assert_eq!(
+            func_field_calls(
+                graph,
+                &callable(graph, "printerRPC::Put", "printer/printer.go")
+            ),
+            [format!(
+                "printJSON (printer/printer.go) @{} [printerRPC.p]",
+                site_of(FILES, "printer/printer.go", "\"json\", printJSON")
+            )],
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            func_field_calls(
+                graph,
+                &callable(graph, "Server::Handle", "server/server.go")
+            ),
+            [format!(
+                "Server::serveStatic (server/server.go) @{} [Server.handler]",
+                site_of(FILES, "server/server.go", "HandlerFunc(s.serveStatic)")
+            )],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream: a function's production wiring is the one cited, and one
+    /// package's test wiring stays out of another package's tests.
+    #[test]
+    fn w715d_production_wiring_first_and_test_wiring_in_its_package() {
+        let project = project_of(FILES);
+        let graph = graph_of(&project);
+        let wired = format!(
+            "defaultHook (client/client.go) @{} [Client.Hook]",
+            site_of(FILES, "client/wire.go", "Hook: defaultHook")
+        );
+        assert_eq!(
+            func_field_calls(graph, &callable(graph, "Client::Do", "client/client.go")),
+            [
+                wired.clone(),
+                format!(
+                    "otherHook (other/other_test.go) @{} [Client.Hook]",
+                    site_of(FILES, "other/other_test.go", "c.Hook = otherHook")
+                ),
+            ],
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            func_field_calls(graph, &callable(graph, "TestDo", "client/a_test.go")),
+            [wired],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream: a function that only wires a field gains no edge.
+    #[test]
+    fn w715d_a_function_that_only_wires_gains_no_edge() {
+        let project = project_of(FILES);
+        let graph = graph_of(&project);
+        for (name, file) in [
+            ("NewDiscovery", "discovery/refresh/refresh.go"),
+            ("NewEC2Discovery", "discovery/aws/ec2.go"),
+            ("NewCleanupJob", "jobs/jobs.go"),
+            ("NewHook", "hooks/hooks.go"),
+        ] {
+            assert_eq!(
+                func_field_calls(graph, &callable(graph, name, file)),
+                Vec::<String>::new(),
+                "{name}: {}",
+                graph.report()
+            );
+        }
+    }
+
+    /// Upstream: `codegraph explore` follows the flow from `Run` to the
+    /// provider, the hop naming the field and its wiring site.
+    #[test]
+    fn w715d_explore_flow_crosses_the_func_field() {
+        let project = project_of(FILES);
+        let output = codegraph(
+            project.root(),
+            ["explore", "Discovery.Run EC2Discovery.refresh", "-p", "."],
+        );
+        let text = String::from_utf8(output.stdout).expect("explore prints UTF-8");
+        let flow = &text[..text.find("**Exploration").unwrap_or(text.len())];
+        assert!(flow.contains("**Flow"), "{text}");
+        assert!(
+            flow.contains(&format!(
+                "↓ dynamic: func field `Discovery.refreshf` (set from `Options.RefreshF`) @{}",
+                site_of(FILES, "discovery/aws/ec2.go", "RefreshF: d.refresh")
+            )),
+            "{text}"
+        );
+        assert!(flow.contains("refresh (discovery/aws/ec2.go:"), "{text}");
+    }
+
+    /// A project of the module `example.com/app` and `files`, indexed.
+    fn app_of(files: &[(&str, &str)]) -> super::support::Indexed {
+        project_of(&[&[("go.mod", GO_MOD)], files].concat())
+    }
+
+    /// The go-func-field edges out of the one function or method
+    /// `qualified` in `file`.
+    #[track_caller]
+    fn calls_of(graph: &Graph, qualified: &str, file: &str) -> Vec<String> {
+        func_field_calls(graph, &callable(graph, qualified, file))
+    }
+
+    const NEST_GO: &str = concat!(
+        "package nest\n",
+        "\n",
+        "type Inner struct {\n",
+        "\tF func()\n",
+        "}\n",
+        "\n",
+        "type Mid struct {\n",
+        "\tinner Inner\n",
+        "}\n",
+        "\n",
+        "type Outer struct {\n",
+        "\tmid Mid\n",
+        "}\n",
+        "\n",
+        "func work() {}\n",
+        "\n",
+        "func NewInner() *Inner { return &Inner{F: work} }\n",
+        "\n",
+        "func (m *Mid) Two() { m.inner.F() }\n",
+        "\n",
+        "func (o *Outer) Three(mid *Mid) { o.mid.inner.F() }\n",
+    );
+
+    /// A receiver one field away reaches the field (`m.inner.F()`); one two
+    /// fields away (`o.mid.inner.F()`) is no dispatch, as upstream's
+    /// selector holds at most two names and never starts after a dot, even
+    /// where `mid.inner` alone would be typed (`Three`'s parameter `mid`).
+    #[test]
+    fn w715d_a_receiver_two_fields_away_is_no_dispatch() {
+        let project = app_of(&[("nest/nest.go", NEST_GO)]);
+        let graph = graph_of(&project);
+        assert_eq!(
+            calls_of(graph, "Mid::Two", "nest/nest.go"),
+            [format!(
+                "work (nest/nest.go) @nest/nest.go:{} [Inner.F]",
+                line_of(NEST_GO, "Inner{F: work}")
+            )],
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            calls_of(graph, "Outer::Three", "nest/nest.go"),
+            Vec::<String>::new(),
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// `h.fn == notify` compares; it puts nothing in the field.
+    #[test]
+    fn w715d_a_comparison_is_no_assignment() {
+        let hooks = concat!(
+            "package hooks\n",
+            "\n",
+            "type Hook struct {\n",
+            "\tfn func() error\n",
+            "}\n",
+            "\n",
+            "func notify() error { return nil }\n",
+            "\n",
+            "func (h *Hook) Same() bool { return h.fn == notify }\n",
+            "\n",
+            "func (h *Hook) Fire() error { return h.fn() }\n",
+        );
+        let project = app_of(&[("hooks/hooks.go", hooks)]);
+        let graph = graph_of(&project);
+        assert_eq!(
+            calls_of(graph, "Hook::Fire", "hooks/hooks.go"),
+            Vec::<String>::new(),
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// A generated file is not read: neither the wiring a `.pb.go` file
+    /// holds nor the dispatch in a file only its generated-code banner marks
+    /// (the files table's flag).
+    #[test]
+    fn w715d_generated_files_are_not_read() {
+        let hooks = concat!(
+            "package hooks\n",
+            "\n",
+            "type Hook struct {\n",
+            "\tfn func() error\n",
+            "}\n",
+            "\n",
+            "func ping() error { return nil }\n",
+            "\n",
+            "func NewHook() *Hook { return &Hook{fn: ping} }\n",
+            "\n",
+            "func (h *Hook) Fire() error { return h.fn() }\n",
+        );
+        let wire = concat!(
+            "package hooks\n",
+            "\n",
+            "func notify() error { return nil }\n",
+            "\n",
+            "func wired() *Hook { return &Hook{fn: notify} }\n",
+        );
+        let banner = concat!(
+            "// Code generated by mockgen. DO NOT EDIT.\n",
+            "\n",
+            "package hooks\n",
+            "\n",
+            "func (h *Hook) FireAgain() error { return h.fn() }\n",
+        );
+        let project = app_of(&[
+            ("hooks/hooks.go", hooks),
+            ("hooks/wire.pb.go", wire),
+            ("hooks/fire_extra.go", banner),
+        ]);
+        let graph = graph_of(&project);
+        assert_eq!(
+            calls_of(graph, "Hook::Fire", "hooks/hooks.go"),
+            [format!(
+                "ping (hooks/hooks.go) @hooks/hooks.go:{} [Hook.fn]",
+                line_of(hooks, "Hook{fn: ping}")
+            )],
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            calls_of(graph, "Hook::FireAgain", "hooks/fire_extra.go"),
+            Vec::<String>::new(),
+            "{}",
+            graph.report()
+        );
+    }
+
+    const PROMOTED_GO: &str = concat!(
+        "package jobs\n",
+        "\n",
+        "type Base struct {\n",
+        "\trun func()\n",
+        "}\n",
+        "\n",
+        "type Job struct {\n",
+        "\tBase\n",
+        "\tname string\n",
+        "}\n",
+        "\n",
+        "type A struct {\n",
+        "\tstep func()\n",
+        "}\n",
+        "\n",
+        "type B struct {\n",
+        "\tstep func()\n",
+        "}\n",
+        "\n",
+        "type Both struct {\n",
+        "\tA\n",
+        "\tB\n",
+        "}\n",
+        "\n",
+        "func work() {}\n",
+        "\n",
+        "func other() {}\n",
+        "\n",
+        "func NewJob() *Job {\n",
+        "\tj := &Job{}\n",
+        "\tj.run = work\n",
+        "\treturn j\n",
+        "}\n",
+        "\n",
+        "func NewA() A { return A{step: work} }\n",
+        "\n",
+        "func NewB() B { return B{step: other} }\n",
+        "\n",
+        "func (j *Job) Do() { j.run() }\n",
+        "\n",
+        "func (a *A) Go() { a.step() }\n",
+        "\n",
+        "func (x *Both) Do() { x.step() }\n",
+        "\n",
+        "type Shadowed struct {\n",
+        "\tBase\n",
+        "}\n",
+        "\n",
+        "func (s *Shadowed) run() {}\n",
+        "\n",
+        "func (s *Shadowed) Do() { s.run() }\n",
+        "\n",
+        "type Hidden struct {\n",
+        "\tBase\n",
+        "\trun int\n",
+        "}\n",
+        "\n",
+        "func (h *Hidden) Do() { h.run() }\n",
+    );
+
+    /// A func field one embedding down is the embedding struct's, for the
+    /// call and the assignment alike; one two embeddings both hold links
+    /// nothing, as Go calls the selector ambiguous, and neither does one a
+    /// method or a field of the struct's own name hides.
+    #[test]
+    fn w715d_a_func_field_promotes_from_one_embedding() {
+        let project = app_of(&[("jobs/jobs.go", PROMOTED_GO)]);
+        let graph = graph_of(&project);
+        assert_eq!(
+            calls_of(graph, "Job::Do", "jobs/jobs.go"),
+            [format!(
+                "work (jobs/jobs.go) @jobs/jobs.go:{} [Base.run]",
+                line_of(PROMOTED_GO, "j.run = work")
+            )],
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            calls_of(graph, "A::Go", "jobs/jobs.go"),
+            [format!(
+                "work (jobs/jobs.go) @jobs/jobs.go:{} [A.step]",
+                line_of(PROMOTED_GO, "A{step: work}")
+            )],
+            "{}",
+            graph.report()
+        );
+        for name in ["Both::Do", "Shadowed::Do", "Hidden::Do"] {
+            assert_eq!(
+                calls_of(graph, name, "jobs/jobs.go"),
+                Vec::<String>::new(),
+                "{name}: {}",
+                graph.report()
+            );
+        }
+    }
+
+    /// A function put in a field at lines 9 and 10 cites line 9: sites
+    /// compare as numbers, `jobs.go:9` before `jobs.go:10`.
+    #[test]
+    fn w715d_a_function_wired_twice_cites_its_first_site() {
+        let jobs = concat!(
+            "package jobs\n",
+            "\n",
+            "type Job struct {\n",
+            "\tfn func() error\n",
+            "}\n",
+            "\n",
+            "func cleanup() error { return nil }\n",
+            "\n",
+            "func A() *Job { return &Job{fn: cleanup} }\n",
+            "func B() *Job { return &Job{fn: cleanup} }\n",
+            "\n",
+            "func (j *Job) Run() error { return j.fn() }\n",
+        );
+        assert_eq!(line_of(jobs, "func A()"), 9);
+        let project = app_of(&[("jobs/jobs.go", jobs)]);
+        let graph = graph_of(&project);
+        assert_eq!(
+            calls_of(graph, "Job::Run", "jobs/jobs.go"),
+            ["cleanup (jobs/jobs.go) @jobs/jobs.go:9 [Job.fn]"],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// A channel links at most forty functions, its first forty sites: of
+    /// forty-one, the one wired last is left out.
+    #[test]
+    fn w715d_a_channel_links_at_most_forty_functions() {
+        let mut jobs = String::from("package jobs\n\ntype Job struct {\n\tfn func()\n}\n\n");
+        for i in 0..41 {
+            jobs.push_str(&format!("func h{i:02}() {{}}\n"));
+        }
+        jobs.push('\n');
+        for i in 0..41 {
+            jobs.push_str(&format!(
+                "func w{i:02}() *Job {{ return &Job{{fn: h{i:02}}} }}\n"
+            ));
+        }
+        jobs.push_str("\nfunc (j *Job) Run() { j.fn() }\n");
+        let project = app_of(&[("jobs/jobs.go", &jobs)]);
+        let graph = graph_of(&project);
+        let calls = calls_of(graph, "Job::Run", "jobs/jobs.go");
+        let expected: Vec<String> = (0..40)
+            .map(|i| {
+                format!(
+                    "h{i:02} (jobs/jobs.go) @jobs/jobs.go:{} [Job.fn]",
+                    line_of(&jobs, &format!("fn: h{i:02}}}"))
+                )
+            })
+            .collect();
+        assert_eq!(calls, expected, "{}", graph.report());
+    }
+
+    /// Two functions put in fields on one line each take the function
+    /// value referenced where it is written.
+    #[test]
+    fn w715d_two_values_on_one_line_take_their_own_references() {
+        let jobs = concat!(
+            "package jobs\n",
+            "\n",
+            "type Job struct {\n",
+            "\tfn func() error\n",
+            "}\n",
+            "\n",
+            "func cleanup() error { return nil }\n",
+            "\n",
+            "func other() error { return nil }\n",
+            "\n",
+            "func Both() (*Job, *Job) { return &Job{fn: cleanup}, &Job{fn: other} }\n",
+            "\n",
+            "func (j *Job) Run() error { return j.fn() }\n",
+        );
+        let project = app_of(&[("jobs/jobs.go", jobs)]);
+        let graph = graph_of(&project);
+        let site = line_of(jobs, "func Both()");
+        assert_eq!(
+            calls_of(graph, "Job::Run", "jobs/jobs.go"),
+            [
+                format!("cleanup (jobs/jobs.go) @jobs/jobs.go:{site} [Job.fn]"),
+                format!("other (jobs/jobs.go) @jobs/jobs.go:{site} [Job.fn]"),
+            ],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// A comment between the dot and the field (`h./* fire */fn()`) hides
+    /// the call from the raw-text prefilter of a file that declares no type,
+    /// so that file is read only when another call there names a func field;
+    /// a file declaring a type is prefiltered on its text without comments
+    /// (upstream's two texts).
+    #[test]
+    fn w715d_a_comment_inside_a_selector_hides_the_call_from_the_raw_prefilter() {
+        let hooks = concat!(
+            "package hooks\n",
+            "\n",
+            "type Hook struct {\n",
+            "\tfn func() error\n",
+            "}\n",
+            "\n",
+            "func notify() error { return nil }\n",
+            "\n",
+            "func NewHook() *Hook { return &Hook{fn: notify} }\n",
+        );
+        let alone = "package hooks\n\nfunc (h *Hook) FireA() error { return h./* fire */fn() }\n";
+        let beside = "package hooks\n\nfunc (h *Hook) FireB() error { return h./* fire */fn() }\n\nfunc (h *Hook) FireC() error { return h.fn() }\n";
+        let declaring = "package hooks\n\ntype marker struct{}\n\nfunc (h *Hook) FireD() error { return h./* fire */fn() }\n";
+        let project = app_of(&[
+            ("hooks/hooks.go", hooks),
+            ("hooks/a.go", alone),
+            ("hooks/b.go", beside),
+            ("hooks/c.go", declaring),
+        ]);
+        let graph = graph_of(&project);
+        let wired = format!(
+            "notify (hooks/hooks.go) @hooks/hooks.go:{} [Hook.fn]",
+            line_of(hooks, "Hook{fn: notify}")
+        );
+        assert_eq!(
+            calls_of(graph, "Hook::FireA", "hooks/a.go"),
+            Vec::<String>::new(),
+            "{}",
+            graph.report()
+        );
+        for (name, file) in [
+            ("Hook::FireB", "hooks/b.go"),
+            ("Hook::FireC", "hooks/b.go"),
+            ("Hook::FireD", "hooks/c.go"),
+        ] {
+            assert_eq!(
+                calls_of(graph, name, file),
+                std::slice::from_ref(&wired),
+                "{name}: {}",
+                graph.report()
+            );
+        }
+    }
+
+    const PACKAGE_REFRESH_GO: &str = concat!(
+        "package app\n",
+        "\n",
+        "type Options struct {\n",
+        "\tRefreshF func() error\n",
+        "}\n",
+        "\n",
+        "type Discovery struct {\n",
+        "\trefreshf func() error\n",
+        "}\n",
+        "\n",
+        "func New(opts Options) *Discovery { return &Discovery{refreshf: opts.RefreshF} }\n",
+        "\n",
+        "func (d *Discovery) refresh() error { return d.refreshf() }\n",
+        "\n",
+        "type EC2 struct{}\n",
+        "\n",
+        "func (e *EC2) refresh() error { return nil }\n",
+        "\n",
+        "func (e *EC2) list() error { return nil }\n",
+        "\n",
+        "func handler() error { return nil }\n",
+        "\n",
+        "var defaults = Options{RefreshF: handler}\n",
+        "\n",
+        "var ec2 = &EC2{}\n",
+        "\n",
+        "var listed = Options{RefreshF: ec2.list}\n",
+        "\n",
+        "func wire() *Discovery {\n",
+        "\te := &EC2{}\n",
+        "\treturn New(Options{RefreshF: e.refresh})\n",
+        "}\n",
+    );
+
+    /// A package-level literal (W7-15d0's variables) wires its func field.
+    /// Outside a function upstream reads no scope (GFF:705): a value is what
+    /// its variable's function-value reference reaches, else a function of
+    /// the package. `ec2.list` stays unresolved, since no rule types a
+    /// package-level receiver before #2667 (next round), so `listed` wires
+    /// nothing, while a function's local `e` is read from its scope.
+    #[test]
+    fn w715d_a_package_level_literal_wires_its_field() {
+        let project = app_of(&[("app/app.go", PACKAGE_REFRESH_GO)]);
+        let graph = graph_of(&project);
+        let wired = |target: &str, needle: &str| {
+            format!(
+                "{target} (app/app.go) @app/app.go:{} [Discovery.refreshf via Options.RefreshF]",
+                line_of(PACKAGE_REFRESH_GO, needle)
+            )
+        };
+        assert_eq!(
+            calls_of(graph, "Discovery::refresh", "app/app.go"),
+            [
+                wired("EC2::refresh", "RefreshF: e.refresh"),
+                wired("handler", "RefreshF: handler"),
+            ],
+            "{}",
+            graph.report()
+        );
+        graph.assert_unresolved("variable listed", "function_ref", "ec2.list");
+    }
+
+    const LOCALS_GO: &str = concat!(
+        "package pick\n",
+        "\n",
+        "type Hook struct {\n",
+        "\tfn func()\n",
+        "}\n",
+        "\n",
+        "func ping() {}\n",
+        "\n",
+        "func pong() {}\n",
+        "\n",
+        "func pang() {}\n",
+        "\n",
+        "func peng() {}\n",
+        "\n",
+        "func pair() (bool, *Hook) { return true, &Hook{} }\n",
+        "\n",
+        "func second() {\n",
+        "\tok, h := pair()\n",
+        "\t_ = ok\n",
+        "\th.fn = ping\n",
+        "}\n",
+        "\n",
+        "func both() {\n",
+        "\tn, k := 1, &Hook{}\n",
+        "\t_ = n\n",
+        "\tk.fn = pong\n",
+        "}\n",
+        "\n",
+        "func created() {\n",
+        "\tc := new(Hook)\n",
+        "\tc.fn = pang\n",
+        "}\n",
+        "\n",
+        "func asserted(v any) {\n",
+        "\ta := v.(*Hook)\n",
+        "\ta.fn = peng\n",
+        "}\n",
+        "\n",
+        "func (h *Hook) Fire() {\n",
+        "\th.fn = h.Fire\n",
+        "\th.fn()\n",
+        "}\n",
+        "\n",
+        "func pung() {}\n",
+        "\n",
+        "func param(pung func()) *Hook { return &Hook{fn: pung} }\n",
+        "\n",
+        "type EC2 struct{}\n",
+        "\n",
+        "func newEC2() *EC2 { return &EC2{} }\n",
+        "\n",
+        "func (e *EC2) refresh() {}\n",
+        "\n",
+        "func method() {\n",
+        "\te := newEC2()\n",
+        "\th := &Hook{fn: e.refresh}\n",
+        "\t_ = h\n",
+        "}\n",
+    );
+
+    /// A local is typed by what its declaration gives it: the result of a
+    /// call at its place (`ok, h := pair()`), the value at its place
+    /// (`n, k := 1, &Hook{}`), `new(T)`, a type assertion, a call's result
+    /// whose method is the value (`e := newEC2()`, `e.refresh`). A bare
+    /// name a parameter holds (`pung`) is no package function. A function
+    /// put in a field it calls through links nowhere: no edge from a
+    /// function to itself.
+    #[test]
+    fn w715d_a_local_is_typed_by_its_value() {
+        let project = app_of(&[("pick/pick.go", LOCALS_GO)]);
+        let graph = graph_of(&project);
+        let wired = |target: &str| {
+            format!(
+                "{target} (pick/pick.go) @pick/pick.go:{} [Hook.fn]",
+                line_of(LOCALS_GO, &format!(".fn = {target}"))
+            )
+        };
+        assert_eq!(
+            calls_of(graph, "Hook::Fire", "pick/pick.go"),
+            [
+                format!(
+                    "EC2::refresh (pick/pick.go) @pick/pick.go:{} [Hook.fn]",
+                    line_of(LOCALS_GO, "fn: e.refresh")
+                ),
+                wired("pang"),
+                wired("peng"),
+                wired("ping"),
+                wired("pong"),
+            ],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// A literal wires the struct its type names in its own package: a bare
+    /// `Options{…}` written in a package without an `Options` of its own
+    /// (which the resolver may still link by name) wires nothing.
+    #[test]
+    fn w715d_a_literal_names_its_struct_s_package() {
+        let options = concat!(
+            "package opts\n",
+            "\n",
+            "type Options struct {\n",
+            "\tRefreshF func()\n",
+            "}\n",
+            "\n",
+            "func (o *Options) Run() { o.RefreshF() }\n",
+        );
+        let user = concat!(
+            "package user\n",
+            "\n",
+            "func list() {}\n",
+            "\n",
+            "func wire() { _ = Options{RefreshF: list} }\n",
+        );
+        let project = app_of(&[("opts/opts.go", options), ("user/user.go", user)]);
+        let graph = graph_of(&project);
+        graph.assert_edge(
+            "function wire @user/user.go",
+            "instantiates",
+            "struct Options @opts/opts.go",
+            Some("exact-match"),
+        );
+        assert_eq!(
+            calls_of(graph, "Options::Run", "opts/opts.go"),
+            Vec::<String>::new(),
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// The project root's package is `.`, as upstream names it: a literal
+    /// written through the root package's import wires its field.
+    #[test]
+    fn w715d_the_root_package_is_dot() {
+        let root = concat!(
+            "package app\n",
+            "\n",
+            "type Options struct {\n",
+            "\tRefreshF func()\n",
+            "}\n",
+            "\n",
+            "func (o *Options) Run() { o.RefreshF() }\n",
+        );
+        let sub = concat!(
+            "package sub\n",
+            "\n",
+            "import \"example.com/app\"\n",
+            "\n",
+            "func list() {}\n",
+            "\n",
+            "func wire() { _ = app.Options{RefreshF: list} }\n",
+        );
+        let project = app_of(&[("app.go", root), ("sub/sub.go", sub)]);
+        let graph = graph_of(&project);
+        assert_eq!(
+            calls_of(graph, "Options::Run", "app.go"),
+            [format!(
+                "list (sub/sub.go) @sub/sub.go:{} [Options.RefreshF]",
+                line_of(sub, "RefreshF: list")
+            )],
             "{}",
             graph.report()
         );

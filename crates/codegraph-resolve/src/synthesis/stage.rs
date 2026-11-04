@@ -17,7 +17,9 @@ use codegraph_store::Store;
 use codegraph_store::queries::ReferenceSite;
 use rayon::prelude::*;
 
-use super::{callback, dispatch, go, go_dispatch, iface, is_synthesized, jsx, registry};
+use super::{
+    callback, dispatch, go, go_dispatch, go_func_field, iface, is_synthesized, jsx, registry,
+};
 
 /// What one run of the stage did.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -96,6 +98,11 @@ const PASSES: &[(&str, Gate, Pass)] = &[
         go_dispatch::gin_middleware_chain_edges,
     ),
     ("registryEdges", always, registry::object_registry_edges),
+    (
+        "goFuncFieldEdges",
+        go::gate,
+        go_func_field::func_field_edges,
+    ),
 ];
 
 /// Compute every synthesized edge over `store`'s base graph and replace the
@@ -199,6 +206,9 @@ pub(super) struct View<'a> {
     /// and the passes read beside the base graph's.
     overlay: Overlay,
     texts: RefCell<HashMap<String, Option<Arc<str>>>>,
+    /// The indexed files the files table flags as generated, read with the
+    /// texts.
+    generated: RefCell<HashSet<String>>,
 }
 
 impl<'a> View<'a> {
@@ -209,7 +219,20 @@ impl<'a> View<'a> {
             max_file_size,
             overlay: Overlay::default(),
             texts: RefCell::new(HashMap::new()),
+            generated: RefCell::new(HashSet::new()),
         }
+    }
+
+    /// The project root the files are read from.
+    pub(super) fn project_root(&self) -> &Path {
+        &self.project_root
+    }
+
+    /// Whether the files table flags `file` as generated (upstream
+    /// `generatedPredicateFor`'s stored half; its path half is
+    /// [`codegraph_core::file_class::is_generated_file`]).
+    pub(super) fn is_flagged_generated(&self, file: &str) -> bool {
+        self.generated.borrow().contains(file)
     }
 
     /// The base edges of `kind` into `target`, and the overlay's, by source,
@@ -339,6 +362,16 @@ impl<'a> View<'a> {
         Ok(nodes)
     }
 
+    /// The nodes of [`Self::nodes_in_file`] that [`enclosing_fn`] can
+    /// return, in the same order, read without the others (W7-15d's cost
+    /// revision): `enclosing_fn` over them gives what it gives over every
+    /// node of the file.
+    pub(super) fn callables_in_file(&self, file: &str) -> Result<Vec<Node>> {
+        let mut nodes = self.store.enclosing_candidates_by_file_path(file)?;
+        nodes.sort_by(|a, b| (a.start_line, &a.id).cmp(&(b.start_line, &b.id)));
+        Ok(nodes)
+    }
+
     /// The nodes of `kinds` written in `languages`, in [`node_order`]
     /// (upstream `iterateNodesByKindIn`).
     pub(super) fn nodes_of_kinds_in(
@@ -440,15 +473,21 @@ impl<'a> View<'a> {
 
     /// Every indexed file's [`Self::text`], read at once before the steps
     /// and the passes (W7-15p): the file records in one query, the files in
-    /// parallel. The event-emitter pass reads every indexed file in each
-    /// stage, so this reads no file the passes would not; a path the files
-    /// table lacks is still read when asked for.
+    /// parallel, and the records' generated flags kept. The event-emitter
+    /// pass reads every indexed file in each stage, so this reads no file the
+    /// passes would not; a path the files table lacks is still read when
+    /// asked for.
     fn read_texts(&self) -> Result<()> {
         let root = &self.project_root;
         let max_file_size = self.max_file_size;
-        let texts: Vec<(String, Option<Arc<str>>)> = self
-            .store
-            .all_files()?
+        let files = self.store.all_files()?;
+        self.generated.borrow_mut().extend(
+            files
+                .iter()
+                .filter(|stored| stored.generated)
+                .map(|stored| stored.path.clone()),
+        );
+        let texts: Vec<(String, Option<Arc<str>>)> = files
             .into_par_iter()
             .map(|stored| {
                 let text = fresh_text(root, &stored, max_file_size);
@@ -741,6 +780,54 @@ mod tests {
             base_end
         );
         assert!(view.edges_into("c", EdgeKind::Calls).unwrap().is_empty());
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A file's callables read on their own are its nodes of the kinds
+    /// `enclosing_fn` takes, in the order of all its nodes (W7-15d's cost
+    /// revision).
+    #[test]
+    fn a_files_callables_are_its_enclosing_candidates_in_node_order() {
+        let (mut store, dir) = temp_store("callables");
+        let node = |id: &str, kind: NodeKind, line: i64| Node {
+            kind,
+            start_line: line,
+            end_line: line + 1,
+            ..function(id, "src/a.go")
+        };
+        store
+            .upsert_nodes(&[
+                node("m", NodeKind::Method, 3),
+                node("s", NodeKind::Struct, 1),
+                node("f", NodeKind::Function, 3),
+                node("c", NodeKind::Component, 2),
+                node("v", NodeKind::Variable, 2),
+                node("g", NodeKind::Function, 1),
+                function("other", "src/b.go"),
+            ])
+            .unwrap();
+        let view = View::new(&store, &dir, 1 << 20);
+        let expected: Vec<String> = view
+            .nodes_in_file("src/a.go")
+            .unwrap()
+            .into_iter()
+            .filter(|node| {
+                matches!(
+                    node.kind,
+                    NodeKind::Function | NodeKind::Method | NodeKind::Component
+                )
+            })
+            .map(|node| node.id)
+            .collect();
+        let read: Vec<String> = view
+            .callables_in_file("src/a.go")
+            .unwrap()
+            .into_iter()
+            .map(|node| node.id)
+            .collect();
+        assert_eq!(read, expected);
+        assert_eq!(expected, ["g", "c", "f", "m"]);
         drop(store);
         std::fs::remove_dir_all(dir).unwrap();
     }

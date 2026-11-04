@@ -143,6 +143,18 @@ pub fn describe_synthesized_hop(edge: &Edge) -> Option<SynthesizedHop> {
         ),
         "fn-pointer-dispatch" => hop(format!("fn-pointer {}", plain("via")), String::new()),
         "goframe-route" => hop(format!("GoFrame route {}", plain("route")), String::new()),
+        // Go: a call through a struct field holding a function, `d.refreshf(ctx)`;
+        // `via` is the field it was copied from, which the wiring site writes.
+        "go-func-field" => hop(
+            format!(
+                "func field {}{}",
+                quoted("field", "a func field"),
+                field("via")
+                    .map(|via| format!(" (set from `{}`)", js_string(via)))
+                    .unwrap_or_default()
+            ),
+            String::new(),
+        ),
         // redux-thunk, cpp-override, gin-middleware-chain, flutter-build, …
         other => hop(other.replace('-', " "), String::new()),
     })
@@ -318,6 +330,18 @@ mod tests {
             (
                 json!({"synthesizedBy": "goframe-route", "route": "/user"}),
                 "GoFrame route /user",
+            ),
+            (
+                json!({"synthesizedBy": "go-func-field", "field": "Discovery.refreshf", "via": "Options.RefreshF"}),
+                "func field `Discovery.refreshf` (set from `Options.RefreshF`)",
+            ),
+            (
+                json!({"synthesizedBy": "go-func-field", "field": "Job.run"}),
+                "func field `Job.run`",
+            ),
+            (
+                json!({"synthesizedBy": "go-func-field"}),
+                "func field a func field",
             ),
         ] {
             let hop = describe_synthesized_hop(&edge(metadata.clone())).expect("a hop");

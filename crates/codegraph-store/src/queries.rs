@@ -176,6 +176,22 @@ impl Store {
         )
     }
 
+    /// The functions, methods and components of `file_path`, by start line:
+    /// the file's rows of [`Self::nodes_by_file_path`] a synthesis pass can
+    /// take as a call's enclosing function (W7-15d), read as
+    /// [`Self::callables_by_file_path`] reads its own.
+    pub fn enclosing_candidates_by_file_path(
+        &self,
+        file_path: &str,
+    ) -> rusqlite::Result<Vec<Node>> {
+        query_nodes(
+            &self.conn,
+            "SELECT * FROM nodes WHERE file_path = ? \
+             AND +kind IN ('function', 'method', 'component') ORDER BY start_line",
+            [file_path],
+        )
+    }
+
     /// The methods of `file_path` in the order [`Self::nodes_by_file_path`]
     /// lists them: the same walk of the file's own index, the other rows
     /// skipped (W5-08).
