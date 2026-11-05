@@ -17052,6 +17052,167 @@ pub fn ts_rtk_endpoint_key_is_renamed() -> Case {
         .edge_after("function api::listPosts", "calls", "function fetchPosts")
 }
 
+/// W7-16b: the RTK api file gains a function named like an endpoint; the
+/// hook's endpoint has no one function of its name in the file, so the hook
+/// reaches neither (hard invariant 6).
+pub fn ts_rtk_api_gains_a_namesake_of_an_endpoint() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::TypeScript])
+        .file(
+            "api.ts",
+            "import { createApi } from '@reduxjs/toolkit/query/react';\nexport const api = createApi({\n  endpoints: (build) => ({ getPosts: build.query({ query: () => '/posts' }) }),\n});\nexport const { useGetPostsQuery } = api;\n",
+        )
+        .write(
+            "api.ts",
+            "import { createApi } from '@reduxjs/toolkit/query/react';\nexport const api = createApi({\n  endpoints: (build) => ({ getPosts: build.query({ query: () => '/posts' }) }),\n});\nexport const { useGetPostsQuery } = api;\nexport function getPosts() { return []; }\n",
+        )
+        .edge_metadata_before(
+            ("function useGetPostsQuery", "calls", "function api::getPosts"),
+            "synthesizedBy",
+            "rtk-query",
+        )
+        .no_edge_metadata_after(
+            ("function useGetPostsQuery", "calls", "function api::getPosts"),
+            "synthesizedBy",
+            "rtk-query",
+        )
+        .no_edge_metadata_after(
+            ("function useGetPostsQuery", "calls", "function getPosts"),
+            "synthesizedBy",
+            "rtk-query",
+        )
+}
+
+/// W7-16b: another file defines the Pinia factory a consumer binds; the
+/// name is no one store's, so the consumer's call reaches neither action.
+pub fn ts_pinia_factory_gains_a_namesake_in_another_file() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::TypeScript])
+        .file(
+            "cart.ts",
+            "import { defineStore } from 'pinia';\nexport const useCartStore = defineStore('cart', {\n  actions: { add(item: string) { this.items.push(item); } },\n});\n",
+        )
+        .file(
+            "checkout.ts",
+            "import { useCartStore } from './cart';\nexport function checkout() {\n  const cart = useCartStore();\n  cart.add('x');\n}\n",
+        )
+        .write(
+            "legacy/cart.ts",
+            "import { defineStore } from 'pinia';\nexport const useCartStore = defineStore('legacy-cart', {\n  actions: { add(item: string) { this.items.push(item); } },\n});\n",
+        )
+        .edge_metadata_before(
+            ("function checkout", "calls", "function useCartStore::add @cart.ts"),
+            "synthesizedBy",
+            "pinia-store",
+        )
+        .no_edge_metadata_after(
+            ("function checkout", "calls", "function useCartStore::add @cart.ts"),
+            "synthesizedBy",
+            "pinia-store",
+        )
+        .no_edge_metadata_after(
+            (
+                "function checkout",
+                "calls",
+                "function useCartStore::add @legacy/cart.ts",
+            ),
+            "synthesizedBy",
+            "pinia-store",
+        )
+}
+
+/// W7-16b: a Pinia options store gains the action an unchanged consumer
+/// already calls; the call reaches it.
+pub fn ts_pinia_store_gains_the_action_its_consumer_calls() -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript])
+        .file(
+            "cart.ts",
+            "import { defineStore } from 'pinia';\nexport const useCartStore = defineStore('cart', {\n  actions: { add(item: string) { this.items.push(item); } },\n});\n",
+        )
+        .file(
+            "checkout.ts",
+            "import { useCartStore } from './cart';\nexport function checkout() {\n  const cart = useCartStore();\n  cart.add('x');\n  cart.clear();\n}\n",
+        )
+        .write(
+            "cart.ts",
+            "import { defineStore } from 'pinia';\nexport const useCartStore = defineStore('cart', {\n  actions: {\n    add(item: string) { this.items.push(item); },\n    clear() { this.items = []; },\n  },\n});\n",
+        )
+        .edge_metadata_before(
+            ("function checkout", "calls", "function useCartStore::add"),
+            "synthesizedBy",
+            "pinia-store",
+        )
+        .edge_metadata_after(
+            ("function checkout", "calls", "function useCartStore::clear"),
+            "synthesizedBy",
+            "pinia-store",
+        )
+}
+
+/// W7-16b: a second store file of a Vuex namespace gains the action a
+/// namespaced dispatch names; the namespace has no one candidate, so the
+/// dispatch reaches neither (hard invariant 6).
+pub fn js_vuex_namespace_gains_a_second_store_file_of_the_action() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::JavaScript])
+        .file(
+            "store/modules/user.js",
+            "export default {\n  namespaced: true,\n  actions: { login() { return 1; } },\n};\n",
+        )
+        .file(
+            "app.js",
+            "export function bootstrap(store) {\n  store.dispatch('user/login');\n}\n",
+        )
+        .write(
+            "store/user/actions.js",
+            "export default {\n  namespaced: true,\n  actions: { login() { return 2; } },\n};\n",
+        )
+        .edge_metadata_before(
+            (
+                "function bootstrap",
+                "calls",
+                "function login @store/modules/user.js",
+            ),
+            "synthesizedBy",
+            "vuex-dispatch",
+        )
+        .no_edge_metadata_after(
+            (
+                "function bootstrap",
+                "calls",
+                "function login @store/modules/user.js",
+            ),
+            "synthesizedBy",
+            "vuex-dispatch",
+        )
+        .no_edge_metadata_after(
+            (
+                "function bootstrap",
+                "calls",
+                "function login @store/user/actions.js",
+            ),
+            "synthesizedBy",
+            "vuex-dispatch",
+        )
+}
+
+/// W7-16b: a Vuex module gains the mutation its action already commits; the
+/// commit reaches it.
+pub fn js_vuex_module_gains_the_mutation_its_action_commits() -> Case {
+    Case::new(Change::BodyEdit, &[Language::JavaScript])
+        .file(
+            "store/user.js",
+            "export default {\n  namespaced: true,\n  actions: { save({ commit }) { commit('SAVED'); } },\n};\n",
+        )
+        .write(
+            "store/user.js",
+            "export default {\n  namespaced: true,\n  mutations: { SAVED(state) { state.saved = true; } },\n  actions: { save({ commit }) { commit('SAVED'); } },\n};\n",
+        )
+        .named_before("function", "save")
+        .edge_metadata_after(
+            ("function save", "calls", "function SAVED"),
+            "synthesizedBy",
+            "vuex-dispatch",
+        )
+}
+
 /// W7-17a: a C table gains an entry; the dispatch in another file, unchanged,
 /// reaches it.
 pub fn c_fnptr_table_gains_an_entry() -> Case {

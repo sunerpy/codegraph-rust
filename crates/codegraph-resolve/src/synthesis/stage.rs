@@ -102,6 +102,17 @@ const PASSES: &[(&str, Gate, Pass)] = &[
     ),
     ("thunkEdges", jsx::gate, framework::redux_thunk_edges),
     ("registryEdges", always, registry::object_registry_edges),
+    ("rtkEdges", jsx::gate, framework::rtk_query_edges),
+    (
+        "piniaEdges",
+        framework::store_gate,
+        framework::pinia_store_edges,
+    ),
+    (
+        "vuexEdges",
+        framework::store_gate,
+        framework::vuex_dispatch_edges,
+    ),
     (
         "celeryEdges",
         |languages| languages.contains(&Language::Python),

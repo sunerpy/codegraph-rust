@@ -295,6 +295,17 @@ only when the first kind holding it (a thunk, a constant, a callable of the
 same file, any callable) holds one node of it (`redux-thunk`), each handler
 an object-literal registry maps, reached from
 a function that calls the registry with a runtime key (`object-registry`),
+a hook RTK Query generates reaching its endpoint, the one function of the
+hook's file its name names (`useLazyGetPostsQuery` names `getPosts`;
+`rtk-query`), a Pinia action called on the store a file binds
+(`const cart = useCartStore(); cart.add(…)`) reached from the function around
+the call, a name only when one file defines the factory, the file binds the
+variable to one store and the store's file holds one function of it
+(`pinia-store`), a Vuex `dispatch` or `commit` of a string key reaching the
+action or mutation its last segment names in a file that reads like a store,
+the one whose path has the key's namespace as a segment or, for a root key,
+the one of the dispatching file, else the project's only one
+(`vuex-dispatch`),
 the function around a Celery `.delay` or `.apply_async` reaching the
 decorated task (`celery-dispatch`), a Spring `publishEvent(new X(…))`
 reaching every `@EventListener`, `@TransactionalEventListener` or
@@ -318,7 +329,8 @@ is copied from, the receiver typed by its scope at most one field or one
 embedding away (`go-func-field`, with `field`, `via` and `registeredAt`).
 Each walks its candidates in upstream's order (nodes by file, line and id,
 edges by their other end, line and column); the Flutter, C++, interface,
-Kotlin, gRPC, MyBatis, gin, redux-thunk, Celery, Spring, MediatR, Sidekiq,
+Kotlin, gRPC, MyBatis, gin, redux-thunk, RTK Query, Pinia, Vuex, Celery,
+Spring, MediatR, Sidekiq,
 Laravel, C function-pointer and Go func-field passes run only when the index
 has files of their languages, as upstream's gates have them. A full index and a migration run
 the stage after resolution. A sync runs it last, after the orphan sweep,

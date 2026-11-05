@@ -70,9 +70,9 @@ colby behaviors are intentionally NOT ported in v1:
   (`callback-synthesizer.ts`), the field, closure-collection, emitter,
   render, JSX, Pascal form, Flutter, C++ override, interface override, Kotlin
   expect/actual, gRPC stub, MyBatis, gin middleware-chain, redux-thunk,
-  object-registry, Celery, Spring event, MediatR, Sidekiq, Laravel event, C
-  function-pointer and Go func-field passes and the Go prerequisites
-  (`go-method-contains`, `go-implements`) are ported
+  object-registry, RTK Query, Pinia, Vuex, Celery, Spring event, MediatR,
+  Sidekiq, Laravel event, C function-pointer and Go func-field passes and the
+  Go prerequisites (`go-method-contains`, `go-implements`) are ported
   (`crates/codegraph-resolve/src/synthesis/`); the others draw no edge here
   yet. The ported passes and the merge keep `b635dd46`'s view of Jest/Vitest
   manual mocks: #2790's skip of a `__mocks__/` handler for production code
@@ -500,6 +500,16 @@ listed.
   `perform` is one method (two declarations of the class on one line); it then
   does not fall back to the last segment. colby takes the first such class
   (`synthesis/framework.rs`).
+- **The store a dispatch names (W7-16b, hard invariant 6).** A generated RTK
+  Query hook reaches the one function of its endpoint's name in its own file.
+  A Pinia factory name more than one file defines is no store, a variable a
+  file binds to more than one store binds none, a call reaches the one
+  function of the method's name in the store's file, and a call outside every
+  function comes from the file's one component. A Vuex key reaches the one
+  candidate of its first tier (the store files whose path has the key's
+  namespace as a segment, or for a root key the dispatching file), else the
+  project's one candidate. Several of any of them reach nothing. colby takes
+  the first, and the last factory and binding (`synthesis/framework.rs`).
 - **JSX render (W7-14e, OD-A4).** A tag renders what its static
   `references` edge reaches, a component, function, class or value, never
   a method. colby scans a file's text for `<Name` and finds the child by

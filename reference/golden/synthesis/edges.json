@@ -946,6 +946,19 @@
   {
     "col": null,
     "kind": "calls",
+    "line": 14,
+    "metadata": {
+      "registeredAt": "js/src/store/modules/user.js:14",
+      "synthesizedBy": "vuex-dispatch",
+      "via": "SET_TOKEN"
+    },
+    "provenance": "heuristic",
+    "source": "function:e7c89e2fb443031382d116eb825c639f",
+    "target": "function:54332c2d8a0c44986c64d17390e07738"
+  },
+  {
+    "col": null,
+    "kind": "calls",
     "line": 15,
     "metadata": {
       "registeredAt": "c/src/ops.c:15",
@@ -1020,6 +1033,58 @@
     "provenance": "heuristic",
     "source": "function:f3a1159c5c767086f4bcece8b9165bbc",
     "target": "function:7948220796ebe418edd8b9ae6f5d5d52"
+  },
+  {
+    "col": null,
+    "kind": "calls",
+    "line": 2,
+    "metadata": {
+      "registeredAt": "js/src/app.js:2",
+      "synthesizedBy": "vuex-dispatch",
+      "via": "user/login"
+    },
+    "provenance": "heuristic",
+    "source": "function:2ff86be01a8b2c59d9961725b7675be9",
+    "target": "function:e7c89e2fb443031382d116eb825c639f"
+  },
+  {
+    "col": null,
+    "kind": "calls",
+    "line": 20,
+    "metadata": {
+      "registeredAt": "js/src/api.ts:20",
+      "synthesizedBy": "rtk-query",
+      "via": "addPost"
+    },
+    "provenance": "heuristic",
+    "source": "function:036b0502ddb804f6794d873d0c332e74",
+    "target": "function:40cdf68dfc7af0f1379f48b2ac1d8b44"
+  },
+  {
+    "col": null,
+    "kind": "calls",
+    "line": 20,
+    "metadata": {
+      "registeredAt": "js/src/api.ts:20",
+      "synthesizedBy": "rtk-query",
+      "via": "getPosts"
+    },
+    "provenance": "heuristic",
+    "source": "function:0424ca8ac1d7c0c481f0c9469690619b",
+    "target": "function:e219891c407a78630358752328d9ba15"
+  },
+  {
+    "col": null,
+    "kind": "calls",
+    "line": 20,
+    "metadata": {
+      "registeredAt": "js/src/api.ts:20",
+      "synthesizedBy": "rtk-query",
+      "via": "getPosts"
+    },
+    "provenance": "heuristic",
+    "source": "function:31711a2231d2854a388399d9247eaeea",
+    "target": "function:e219891c407a78630358752328d9ba15"
   },
   {
     "col": null,
@@ -1100,6 +1165,19 @@
     "provenance": "heuristic",
     "source": "method:23b52db61e3c123c60850cc118b75515",
     "target": "method:fc57b8ff353cc43701ceb2c71ac647fd"
+  },
+  {
+    "col": null,
+    "kind": "calls",
+    "line": 5,
+    "metadata": {
+      "registeredAt": "js/src/cartConsumer.ts:5",
+      "synthesizedBy": "pinia-store",
+      "via": "add"
+    },
+    "provenance": "heuristic",
+    "source": "function:ee3462990b2a34224b04f244a72ee6fc",
+    "target": "function:825165de277a437e25c783384e00019e"
   },
   {
     "col": null,

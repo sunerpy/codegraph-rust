@@ -23241,7 +23241,7 @@ mod synthesis {
         assert_eq!((edge.line, edge.col), (Some(7), None), "{edge:?}");
         assert_eq!(
             project_metadata_with_prefix(&project.db(), "synthesis_version"),
-            [("synthesis_version".to_string(), "11".to_string())]
+            [("synthesis_version".to_string(), "12".to_string())]
         );
     }
 
@@ -29424,7 +29424,10 @@ mod framework_dispatch {
     use super::support::{EdgeRow, Graph, Project, graph_of};
 
     /// The `calls` edges the pass `by` made.
-    fn synthesized_by<'g>(graph: &'g Graph, by: &'g str) -> impl Iterator<Item = &'g EdgeRow> {
+    pub(super) fn synthesized_by<'g>(
+        graph: &'g Graph,
+        by: &'g str,
+    ) -> impl Iterator<Item = &'g EdgeRow> {
         graph
             .edges
             .iter()
@@ -29435,7 +29438,7 @@ mod framework_dispatch {
     /// <via> @<registeredAt> line <line>` over qualified names, sorted; each
     /// is heuristic and has no column.
     #[track_caller]
-    fn links(graph: &Graph, by: &str) -> Vec<String> {
+    pub(super) fn links(graph: &Graph, by: &str) -> Vec<String> {
         let name = |id: &str| {
             graph
                 .node(id)
@@ -32894,6 +32897,7 @@ mod c_fnptr {
 /// of `rtk-query-synthesizer.test.ts` (`e8ddc4e2`), the sources as written
 /// there, and the cases the Rust port adds.
 mod vue_stores {
+    use super::framework_dispatch::links;
     use super::support::{Graph, Project, graph_of};
 
     /// The signature upstream's `extractRtkHookBindings` gives a hook.
@@ -33251,6 +33255,773 @@ export default {
         );
         assert!(
             graph.nodes_named("function", "SET").is_empty(),
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream `rtk-query-synthesizer.test.ts`, first case: each generated
+    /// hook, the lazy one too, reaches its endpoint in its own file.
+    #[test]
+    fn w716b_rtk_hooks_reach_their_endpoints() {
+        let project = rtk_project().index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            links(graph, "rtk-query"),
+            [
+                "useCheckConnectionMutation -> dashApi::checkConnection via checkConnection @dashApi.ts:21 line 21",
+                "useGetDashboardsQuery -> dashApi::getDashboards via getDashboards @dashApi.ts:21 line 21",
+                "useGetFiatRampsQuery -> fiatRampApi::getFiatRamps via getFiatRamps @fiatRampApi.ts:20 line 20",
+                "useLazyGetFiatRampsQuery -> fiatRampApi::getFiatRamps via getFiatRamps @fiatRampApi.ts:20 line 20",
+                "usePlaceOrderMutation -> fiatRampApi::placeOrder via placeOrder @fiatRampApi.ts:20 line 20",
+            ],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream `rtk-query-synthesizer.test.ts`, second case: a hand-written
+    /// `use*Query` beside a same-file `getThing` reaches nothing.
+    #[test]
+    fn w716b_a_hand_written_query_hook_reaches_nothing() {
+        let project = Project::new()
+            .file(
+                "useGetThingQuery.ts",
+                "export function getThing() { return 42; }
+export const useGetThingQuery = () => {
+  return getThing();
+};
+",
+            )
+            .file(
+                "Thing.tsx",
+                "import { useGetThingQuery } from './useGetThingQuery';
+export function Thing() {
+  return useGetThingQuery();
+}
+",
+            )
+            .index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            links(graph, "rtk-query"),
+            Vec::<String>::new(),
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// The endpoint a hook reaches is the one function of its name in the
+    /// hook's file: two apis of one file with a `getPosts` each leave
+    /// `useGetPostsQuery` unlinked (upstream takes the first), one links.
+    #[test]
+    fn w716b_a_hook_with_two_endpoints_of_its_name_in_its_file_reaches_neither() {
+        let api = |second: &str| {
+            format!(
+                "import {{ createApi }} from '@reduxjs/toolkit/query/react';
+export const api = createApi({{
+  endpoints: (build) => ({{ getPosts: build.query({{ query: () => '/posts' }}) }}),
+}});
+{second}export const {{ useGetPostsQuery }} = api;
+"
+            )
+        };
+        let second = "export const admin = createApi({
+  endpoints: (build) => ({ getPosts: build.query({ query: () => '/admin/posts' }) }),
+});
+";
+        let project = Project::new().file("api.ts", &api(second)).index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            graph.nodes_named("function", "getPosts").len(),
+            2,
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            links(graph, "rtk-query"),
+            Vec::<String>::new(),
+            "{}",
+            graph.report()
+        );
+        let project = Project::new().file("api.ts", &api("")).index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            links(graph, "rtk-query"),
+            ["useGetPostsQuery -> api::getPosts via getPosts @api.ts:5 line 5"],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// A hook destructured from an api of another file reaches no endpoint:
+    /// RTK writes the hooks beside their api, as upstream requires.
+    #[test]
+    fn w716b_a_hook_reaches_no_endpoint_of_another_file() {
+        let project = Project::new()
+            .file(
+                "api.ts",
+                "import { createApi } from '@reduxjs/toolkit/query/react';
+export const api = createApi({
+  endpoints: (build) => ({ getPosts: build.query({ query: () => '/posts' }) }),
+});
+",
+            )
+            .file(
+                "hooks.ts",
+                "import { api } from './api';
+export const { useGetPostsQuery } = api;
+",
+            )
+            .index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            graph.nodes_named("function", "useGetPostsQuery").len(),
+            1,
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            links(graph, "rtk-query"),
+            Vec::<String>::new(),
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream `pinia-store-synthesizer.test.ts`, first case: a consumer's
+    /// calls on the stores it binds reach the actions of an options store and
+    /// a setup store; `$patch`, Pinia's own, reaches nothing.
+    #[test]
+    fn w716b_pinia_actions_are_reached_from_their_caller() {
+        let project = Project::new()
+            .file(
+                "authStore.ts",
+                "import { defineStore } from 'pinia';
+export const useAuthStore = defineStore({
+  id: 'auth',
+  state: () => ({ token: '' }),
+  actions: {
+    async getMenu() { return loadMenu(); },
+    setToken(t: string) { this.token = t; },
+  },
+});
+",
+            )
+            .file(
+                "chatStore.ts",
+                "import { defineStore } from 'pinia';
+export const useChatStore = defineStore('chat', () => {
+  const getList = async () => { return fetchList(); };
+  return { getList };
+});
+",
+            )
+            .file(
+                "init.ts",
+                "import { useAuthStore } from './authStore';
+import { useChatStore } from './chatStore';
+export function init() {
+  const authStore = useAuthStore();
+  const chatStore = useChatStore();
+  authStore.getMenu();
+  authStore.setToken('x');
+  authStore.$patch({});        // Pinia built-in — must not bridge
+  chatStore.getList();
+}
+",
+            )
+            .index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            links(graph, "pinia-store"),
+            [
+                "init -> useAuthStore::getMenu via getMenu @init.ts:6 line 6",
+                "init -> useAuthStore::setToken via setToken @init.ts:7 line 7",
+                "init -> useChatStore::getList via getList @init.ts:9 line 9",
+            ],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream `pinia-store-synthesizer.test.ts`, second case: without a
+    /// `defineStore` factory nothing is a store.
+    #[test]
+    fn w716b_without_a_define_store_factory_nothing_is_a_store() {
+        let project = Project::new()
+            .file(
+                "thing.ts",
+                "function useThing() { return { run() { return 1; } }; }
+export function go() {
+  const thing = useThing();
+  thing.run();
+}
+",
+            )
+            .index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            links(graph, "pinia-store"),
+            Vec::<String>::new(),
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// `cart.ts`, a Pinia options store with `add` and `clear`, for the
+    /// Pinia probes below.
+    const CART_STORE: &str = "import { defineStore } from 'pinia';
+export const useCartStore = defineStore('cart', {
+  actions: {
+    add(item: string) { this.items.push(item); },
+    clear() { this.items = []; },
+  },
+});
+";
+
+    /// A factory name, a binding or an action several stores share binds
+    /// nothing (upstream's later factory or binding wins, its first action
+    /// is the target): each half is the same project with one more store.
+    #[test]
+    fn w716b_a_factory_a_binding_or_an_action_two_stores_share_binds_nothing() {
+        let consumer = "import { useCartStore } from './cart';
+export function checkout() {
+  const cart = useCartStore();
+  cart.add('x');
+}
+";
+        // A function of the action's name outside the store's file is no
+        // candidate.
+        let one = Project::new()
+            .file("cart.ts", CART_STORE)
+            .file(
+                "utils.ts",
+                "export function add(a: number, b: number) { return a + b; }\n",
+            )
+            .file("checkout.ts", consumer)
+            .index();
+        assert_eq!(
+            links(graph_of(&one), "pinia-store"),
+            ["checkout -> useCartStore::add via add @checkout.ts:4 line 4"],
+            "{}",
+            graph_of(&one).report()
+        );
+        // The factory name defined in a second file.
+        let two_factories = Project::new()
+            .file("cart.ts", CART_STORE)
+            .file("legacy/cart.ts", CART_STORE)
+            .file("checkout.ts", consumer)
+            .index();
+        assert_eq!(
+            links(graph_of(&two_factories), "pinia-store"),
+            Vec::<String>::new(),
+            "{}",
+            graph_of(&two_factories).report()
+        );
+        // One variable bound to two stores in one file.
+        let two_bindings = Project::new()
+            .file("cart.ts", CART_STORE)
+            .file(
+                "wish.ts",
+                "import { defineStore } from 'pinia';
+export const useWishStore = defineStore('wish', {
+  actions: { add(item: string) { this.items.push(item); } },
+});
+",
+            )
+            .file(
+                "checkout.ts",
+                "import { useCartStore } from './cart';
+import { useWishStore } from './wish';
+export function checkout() {
+  const cart = useCartStore();
+  cart.add('x');
+}
+export function wish() {
+  const cart = useWishStore();
+  cart.add('y');
+}
+",
+            )
+            .index();
+        assert_eq!(
+            links(graph_of(&two_bindings), "pinia-store"),
+            Vec::<String>::new(),
+            "{}",
+            graph_of(&two_bindings).report()
+        );
+        // Two functions of the action's name in the store's file.
+        let two_actions = Project::new()
+            .file(
+                "cart.ts",
+                &format!("{CART_STORE}export function add(item: string) {{ return item; }}\n"),
+            )
+            .file("checkout.ts", consumer)
+            .index();
+        assert_eq!(
+            graph_of(&two_actions).nodes_named("function", "add").len(),
+            2,
+            "{}",
+            graph_of(&two_actions).report()
+        );
+        assert_eq!(
+            links(graph_of(&two_actions), "pinia-store"),
+            Vec::<String>::new(),
+            "{}",
+            graph_of(&two_actions).report()
+        );
+    }
+
+    /// A call outside every function comes from the file's one component,
+    /// and from none when the file has two (upstream takes the first).
+    #[test]
+    fn w716b_a_call_outside_every_function_comes_from_the_one_component() {
+        let view = |components: &str| {
+            format!(
+                "import {{ memo }} from 'react';
+import {{ useCartStore }} from './cart';
+const cart = useCartStore();
+cart.add('x');
+{components}"
+            )
+        };
+        let one = Project::new()
+            .file("cart.ts", CART_STORE)
+            .file(
+                "View.tsx",
+                &view("export const View = memo(() => <div />);\n"),
+            )
+            .index();
+        assert_eq!(
+            graph_of(&one).nodes_matching("component View").len(),
+            1,
+            "{}",
+            graph_of(&one).report()
+        );
+        assert_eq!(
+            links(graph_of(&one), "pinia-store"),
+            ["View -> useCartStore::add via add @View.tsx:4 line 4"],
+            "{}",
+            graph_of(&one).report()
+        );
+        let two = Project::new()
+            .file("cart.ts", CART_STORE)
+            .file(
+                "View.tsx",
+                &view(
+                    "export const View = memo(() => <div />);
+export const Other = memo(() => <span />);
+",
+                ),
+            )
+            .index();
+        assert_eq!(
+            links(graph_of(&two), "pinia-store"),
+            Vec::<String>::new(),
+            "{}",
+            graph_of(&two).report()
+        );
+    }
+
+    /// The consumer is read without its comments, a factory's file with
+    /// them, as upstream reads both: `// cart.clear()` reaches nothing, and
+    /// a factory written only in a comment is a factory.
+    #[test]
+    fn w716b_pinia_reads_a_consumer_without_its_comments_and_a_factory_with_them() {
+        let project = Project::new()
+            .file("cart.ts", CART_STORE)
+            .file(
+                "legacy.ts",
+                "// export const useLegacyStore = defineStore('legacy', {…})
+export function reset() { return 0; }
+",
+            )
+            .file(
+                "checkout.ts",
+                "import { useCartStore } from './cart';
+import { useLegacyStore } from './legacy';
+export function checkout() {
+  const cart = useCartStore();
+  // cart.clear();
+  const legacy = useLegacyStore();
+  legacy.reset();
+}
+",
+            )
+            .index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            links(graph, "pinia-store"),
+            ["checkout -> reset via reset @checkout.ts:7 line 7"],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// One consumer file links at most 80 Pinia calls (`PINIA_FANOUT_CAP`):
+    /// 81 different actions called in a row give 80 edges, the last call
+    /// none.
+    #[test]
+    fn w716b_a_file_links_at_most_80_pinia_calls() {
+        let actions: String = (0..81)
+            .map(|i| format!("    a{i}() {{ return {i}; }},\n"))
+            .collect();
+        let calls: String = (0..81).map(|i| format!("  s.a{i}();\n")).collect();
+        let project = Project::new()
+            .file(
+                "store.ts",
+                &format!(
+                    "import {{ defineStore }} from 'pinia';
+export const useBigStore = defineStore('big', {{
+  actions: {{
+{actions}  }},
+}});
+"
+                ),
+            )
+            .file(
+                "use.ts",
+                &format!(
+                    "import {{ useBigStore }} from './store';
+export function run() {{
+  const s = useBigStore();
+{calls}}}
+"
+                ),
+            )
+            .index();
+        let graph = graph_of(&project);
+        let linked = links(graph, "pinia-store");
+        assert_eq!(linked.len(), 80, "{}", graph.report());
+        assert!(
+            !linked.iter().any(|link| link.contains("via a80 ")),
+            "{linked:#?}"
+        );
+    }
+
+    /// Upstream `vuex-dispatch-synthesizer.test.ts`: a namespaced dispatch
+    /// reaches the module's action, not the api's namesake, a local commit
+    /// the module's mutation, and a non-string dispatch nothing.
+    #[test]
+    fn w716b_vuex_dispatch_and_commit_reach_the_store_handlers() {
+        let project = Project::new()
+            .file(
+                "store/modules/user.js",
+                "import { login as apiLogin } from '../../api/user';
+export default {
+  namespaced: true,
+  state: { token: '' },
+  mutations: {
+    SET_TOKEN(state, t) { state.token = t; },
+  },
+  actions: {
+    login({ commit }, info) {
+      apiLogin(info);
+      commit('SET_TOKEN', info.token);   // root/local key → SET_TOKEN in THIS module
+    },
+  },
+};
+",
+            )
+            .file(
+                "api/user.js",
+                "export function login(info) { return info; }\n",
+            )
+            .file(
+                "app.js",
+                "import store from './store';
+export function bootstrap() {
+  store.dispatch('user/login', { token: 'x' });
+}
+",
+            )
+            .file(
+                "reduxy.js",
+                "export function reduxy(dispatch) {
+  dispatch(someAction());
+}
+",
+            )
+            .index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            links(graph, "vuex-dispatch"),
+            [
+                "bootstrap -> login via user/login @app.js:3 line 3",
+                "login -> SET_TOKEN via SET_TOKEN @store/modules/user.js:11 line 11",
+            ],
+            "{}",
+            graph.report()
+        );
+        let login = graph.edges_matching(
+            "function bootstrap",
+            "calls",
+            "function login @store/modules/user.js",
+        );
+        assert_eq!(login.len(), 1, "{}", graph.report());
+    }
+
+    /// A Vuex module of `name: { … }` collections, `name` an action, for the
+    /// Vuex probes below.
+    fn vuex_module(action: &str) -> String {
+        format!(
+            "export default {{
+  namespaced: true,
+  actions: {{ {action}() {{ return 1; }} }},
+}};
+"
+        )
+    }
+
+    /// A namespaced key reaches the one candidate whose path has the
+    /// namespace as a segment: two such files reach neither (upstream takes
+    /// the first), an empty tier the project's one candidate, and a segment
+    /// is bounded by separators or a stem's dot.
+    #[test]
+    fn w716b_a_namespaced_key_reaches_the_one_store_file_of_its_namespace() {
+        let dispatcher = "export function go(store) {
+  store.dispatch('user/login');
+}
+";
+        let one = Project::new()
+            .file("store/modules/user.js", &vuex_module("login"))
+            .file("store/superuser/actions.js", &vuex_module("login"))
+            .file("app.js", dispatcher)
+            .index();
+        assert_eq!(
+            links(graph_of(&one), "vuex-dispatch"),
+            ["go -> login via user/login @app.js:2 line 2"],
+            "{}",
+            graph_of(&one).report()
+        );
+        let login = graph_of(&one).edges_matching(
+            "function go",
+            "calls",
+            "function login @store/modules/user.js",
+        );
+        assert_eq!(login.len(), 1, "{}", graph_of(&one).report());
+        // Two files of the namespace.
+        let two = Project::new()
+            .file("store/modules/user.js", &vuex_module("login"))
+            .file("store/user/actions.js", &vuex_module("login"))
+            .file("app.js", dispatcher)
+            .index();
+        assert_eq!(
+            links(graph_of(&two), "vuex-dispatch"),
+            Vec::<String>::new(),
+            "{}",
+            graph_of(&two).report()
+        );
+        // No file of the namespace: the one candidate.
+        let lone = Project::new()
+            .file("store/modules/account.js", &vuex_module("login"))
+            .file("app.js", dispatcher)
+            .index();
+        assert_eq!(
+            links(graph_of(&lone), "vuex-dispatch"),
+            ["go -> login via user/login @app.js:2 line 2"],
+            "{}",
+            graph_of(&lone).report()
+        );
+        // A top-level `user.js` has no leading separator, so no `user`
+        // segment: beside another candidate, neither is reached.
+        let root = Project::new()
+            .file("user.js", &vuex_module("login"))
+            .file("store/superuser/actions.js", &vuex_module("login"))
+            .file("app.js", dispatcher)
+            .index();
+        assert_eq!(
+            links(graph_of(&root), "vuex-dispatch"),
+            Vec::<String>::new(),
+            "{}",
+            graph_of(&root).report()
+        );
+    }
+
+    /// A root key reaches the dispatching file's one candidate: an action and
+    /// a mutation of one name in the module leave `commit('save')` unlinked
+    /// (upstream takes the first).
+    #[test]
+    fn w716b_a_root_key_with_two_candidates_in_its_file_reaches_neither() {
+        let module = |mutation: &str| {
+            format!(
+                "export default {{
+  namespaced: true,
+  mutations: {{ {mutation}(state) {{ state.v = 1; }} }},
+  actions: {{ save({{ commit }}) {{ commit('{mutation}'); }} }},
+}};
+"
+            )
+        };
+        let two = Project::new()
+            .file("store/user.js", &module("save"))
+            .index();
+        assert_eq!(
+            links(graph_of(&two), "vuex-dispatch"),
+            Vec::<String>::new(),
+            "{}",
+            graph_of(&two).report()
+        );
+        let one = Project::new()
+            .file("store/user.js", &module("SAVE"))
+            .index();
+        assert_eq!(
+            links(graph_of(&one), "vuex-dispatch"),
+            ["save -> SAVE via SAVE @store/user.js:4 line 4"],
+            "{}",
+            graph_of(&one).report()
+        );
+    }
+
+    /// `this.$store.dispatch` is a dispatch, and one written in a
+    /// component's script outside any function comes from the component.
+    #[test]
+    fn w716b_a_components_dispatch_comes_from_the_component() {
+        let project = Project::new()
+            .file("store/modules/user.js", &vuex_module("login"))
+            .file(
+                "src/Login.vue",
+                "<template><button /></template>
+<script setup>
+import { useStore } from 'vuex';
+const store = useStore();
+store.dispatch('user/login');
+</script>
+",
+            )
+            .file(
+                "src/legacy.js",
+                "export class Page {
+  go() { this.$store.dispatch('user/login'); }
+}
+",
+            )
+            .index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            links(graph, "vuex-dispatch"),
+            [
+                "Page::go -> login via user/login @src/legacy.js:2 line 2",
+                "src/Login.vue::Login -> login via user/login @src/Login.vue:5 line 5",
+            ],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// One file links at most 120 Vuex dispatches and commits
+    /// (`VUEX_FANOUT_CAP`): 121 different mutations committed in a row give
+    /// 120 edges, the last commit none.
+    #[test]
+    fn w716b_a_file_links_at_most_120_vuex_dispatches() {
+        let mutations: String = (0..121)
+            .map(|i| format!("    m{i}(state) {{ state.v = {i}; }},\n"))
+            .collect();
+        let commits: String = (0..121)
+            .map(|i| format!("  store.commit('m{i}');\n"))
+            .collect();
+        let project = Project::new()
+            .file(
+                "store/index.js",
+                &format!(
+                    "export default {{
+  namespaced: true,
+  mutations: {{
+{mutations}  }},
+}};
+"
+                ),
+            )
+            .file(
+                "app.js",
+                &format!("export function run(store) {{\n{commits}}}\n"),
+            )
+            .index();
+        let graph = graph_of(&project);
+        let linked = links(graph, "vuex-dispatch");
+        assert_eq!(linked.len(), 120, "{}", graph.report());
+        assert!(
+            !linked.iter().any(|link| link.contains("via m120 ")),
+            "{linked:#?}"
+        );
+    }
+
+    /// A project of `.vue` files only passes the Pinia and Vuex gates, as
+    /// upstream's (`has('vue', ...JS_FAMILY)`), and not the RTK Query one
+    /// (`has(...JS_FAMILY)`): its generated hooks are nodes and reach no
+    /// endpoint.
+    #[test]
+    fn w716b_a_vue_only_project_passes_the_pinia_and_vuex_gates_not_rtks() {
+        let project = Project::new()
+            .file(
+                "src/CartStore.vue",
+                "<template><div /></template>
+<script>
+import { defineStore } from 'pinia';
+export const useCartStore = defineStore('cart', {
+  actions: { add(item) { this.items.push(item); } },
+});
+export default {
+  namespaced: true,
+  mutations: { SET(state) { state.v = 1; } },
+};
+</script>
+",
+            )
+            .file(
+                "src/Checkout.vue",
+                "<template><button /></template>
+<script setup>
+import { useCartStore } from './CartStore.vue';
+const cart = useCartStore();
+cart.add('x');
+store.commit('SET');
+</script>
+",
+            )
+            .file(
+                "src/Api.vue",
+                "<template><div /></template>
+<script>
+import { createApi } from '@reduxjs/toolkit/query/react';
+export const api = createApi({
+  endpoints: (build) => ({ getPosts: build.query({ query: () => '/posts' }) }),
+});
+export const { useGetPostsQuery } = api;
+export default {};
+</script>
+",
+            )
+            .index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            links(graph, "pinia-store"),
+            ["src/Checkout.vue::Checkout -> useCartStore::add via add @src/Checkout.vue:5 line 5"],
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            links(graph, "vuex-dispatch"),
+            ["src/Checkout.vue::Checkout -> SET via SET @src/Checkout.vue:6 line 6"],
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            graph.nodes_named("function", "useGetPostsQuery").len(),
+            1,
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            graph.nodes_named("function", "getPosts").len(),
+            1,
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            links(graph, "rtk-query"),
+            Vec::<String>::new(),
             "{}",
             graph.report()
         );

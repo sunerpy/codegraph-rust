@@ -9126,7 +9126,8 @@ fn push_vue_store_collections<'t>(
 /// `VUE_STORE_FILE_SIGNAL` (`defineStore`, `createStore`, `Vuex`,
 /// `mutations`, `actions`, `getters`, `namespaced`), each a whole word as
 /// JavaScript's `\b` bounds it: a run of ASCII letters, digits and `_`.
-fn reads_like_vue_store(source: &str) -> bool {
+/// The Vuex pass reads a store file by the same words (`isStoreFile`).
+pub fn reads_like_vue_store(source: &str) -> bool {
     const SIGNALS: [&str; 7] = [
         "defineStore",
         "createStore",

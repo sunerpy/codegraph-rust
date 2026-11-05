@@ -4,6 +4,12 @@
 //!
 //! - a redux-thunk constant to each thunk its body dispatches,
 //!   `dispatch(next(…))` (`redux-thunk`);
+//! - a hook RTK Query generates to its endpoint, `useGetPostsQuery` to
+//!   `getPosts` (`rtk-query`);
+//! - a Pinia store's action called on the store a file binds,
+//!   `const cart = useCartStore(); cart.add(…)` (`pinia-store`);
+//! - a Vuex `dispatch('user/login')` or `commit('SET_TOKEN')` to the store's
+//!   action or mutation (`vuex-dispatch`);
 //! - a Celery `task.delay(…)` or `task.apply_async(…)` to the decorated task
 //!   (`celery-dispatch`);
 //! - Spring's `publishEvent(new X(…))` to every listener method of `X`
@@ -23,6 +29,7 @@ use std::sync::LazyLock;
 
 use anyhow::Result;
 use codegraph_core::types::{Edge, EdgeKind, Language, Node, NodeKind};
+use codegraph_extract::walker::{RTK_GENERATED_HOOK_SIGNATURE, reads_like_vue_store};
 use regex::Regex;
 use serde_json::json;
 
@@ -45,6 +52,12 @@ const CELERY_DECORATOR_LOOKBACK: i64 = 12;
 /// The lines from a class's first that hold its base list
 /// (`MEDIATR_HANDLER_DECL_LOOKAHEAD`).
 const MEDIATR_HANDLER_DECL_LOOKAHEAD: usize = 4;
+/// The edges one file's Pinia action calls link at most
+/// (`PINIA_FANOUT_CAP`).
+const PINIA_FANOUT_CAP: usize = 80;
+/// The edges one file's Vuex dispatches and commits link at most
+/// (`VUEX_FANOUT_CAP`).
+const VUEX_FANOUT_CAP: usize = 120;
 
 /// An upstream pattern with JavaScript's `\s` ([`JS_SPACE`]) for the
 /// `regex` crate's Unicode one. Every pattern here spells `\w` as
@@ -180,6 +193,41 @@ static LARAVEL_HANDLE: LazyLock<Regex> = LazyLock::new(|| {
         "laravel handle",
     )
 });
+/// The files the Pinia and Vuex passes read (`PINIA_CONSUMER_EXT`).
+static STORE_PASS_FILE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\.(?:ts|tsx|js|jsx|mjs|cjs|vue)$").expect("store pass file"));
+/// The endpoint part of a generated hook's name, `useGetXQuery` or
+/// `useLazyGetXMutation` (`RTK_HOOK_DERIVE_RE`).
+static RTK_HOOK_DERIVE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^use([A-Z][A-Za-z0-9]*?)(?:Query|Mutation)$").expect("rtk hook derive")
+});
+/// A Pinia store factory, `const useXStore = defineStore(`
+/// (`PINIA_FACTORY_RE`).
+static PINIA_FACTORY: LazyLock<Regex> = LazyLock::new(|| {
+    js_regex(
+        r"(?-u:\b)(?:export\s+)?const\s+([A-Za-z0-9_]+)\s*=\s*defineStore\s*\(",
+        "pinia factory",
+    )
+});
+/// A store bound to a variable, `const store = useXStore(`
+/// (`PINIA_BIND_RE`).
+static PINIA_BIND: LazyLock<Regex> = LazyLock::new(|| {
+    js_regex(
+        r"(?-u:\b)const\s+([A-Za-z0-9_]+)\s*=\s*(?:await\s+)?([A-Za-z0-9_]+)\s*\(",
+        "pinia bind",
+    )
+});
+/// A method called on a variable, `store.load(` (`PINIA_CALL_RE`).
+static PINIA_CALL: LazyLock<Regex> =
+    LazyLock::new(|| js_regex(r"([A-Za-z0-9_]+)\s*\.\s*([A-Za-z0-9_]+)\s*\(", "pinia call"));
+/// A Vuex dispatch or commit by a string key, `dispatch('user/login'`
+/// (`VUEX_DISPATCH_RE`).
+static VUEX_DISPATCH: LazyLock<Regex> = LazyLock::new(|| {
+    js_regex(
+        r#"(?-u:\b)(?:dispatch|commit)\s*\(\s*['"]([A-Za-z][A-Za-z0-9_/]*)['"]"#,
+        "vuex dispatch",
+    )
+});
 
 /// The redux-thunk pass (`reduxThunkEdges`): a thunk constant
 /// (`createAsyncThunk(…)` or a `createThunk(…)` wrapper, its async body an
@@ -282,6 +330,340 @@ pub(super) fn redux_thunk_edges(view: &View<'_>) -> Result<Vec<Edge>> {
         }
     }
     Ok(edges)
+}
+
+/// The Pinia and Vuex passes' gate: a Vue file or one of the JavaScript
+/// family (upstream `has('vue', ...JS_FAMILY)`).
+pub(super) fn store_gate(languages: &HashSet<Language>) -> bool {
+    languages.contains(&Language::Vue) || super::jsx::gate(languages)
+}
+
+/// The RTK Query pass (`rtkQueryEdges`): a hook RTK generates, a function
+/// node extraction marks with [`RTK_GENERATED_HOOK_SIGNATURE`], links to
+/// its endpoint, the function its name derives (`useLazyGetPostsQuery` →
+/// `getPosts`) in the hook's file.
+pub(super) fn rtk_query_edges(view: &View<'_>) -> Result<Vec<Edge>> {
+    let mut edges = Vec::new();
+    let mut seen: HashSet<(String, String)> = HashSet::new();
+    for hook in
+        view.nodes_of_kind_whose_signature_holds(NodeKind::Function, RTK_GENERATED_HOOK_SIGNATURE)?
+    {
+        if hook.signature.as_deref() != Some(RTK_GENERATED_HOOK_SIGNATURE) {
+            continue;
+        }
+        let Some(endpoint) = rtk_endpoint_name(&hook.name) else {
+            continue;
+        };
+        // RTK writes an api's hooks beside it: the endpoint is the one
+        // function of the name in the hook's file, and several leave the
+        // hook unlinked (KEEP-RUST, hard invariant 6: upstream takes the
+        // first).
+        let candidates: Vec<Node> = view
+            .nodes_named(&endpoint)?
+            .into_iter()
+            .filter(|node| node.kind == NodeKind::Function && node.file_path == hook.file_path)
+            .collect();
+        let [target] = candidates.as_slice() else {
+            continue;
+        };
+        if target.id == hook.id || !seen.insert((hook.id.clone(), target.id.clone())) {
+            continue;
+        }
+        let line = hook.start_line;
+        edges.push(synthesized(
+            &hook,
+            target,
+            EdgeKind::Calls,
+            line,
+            json!({
+                "synthesizedBy": "rtk-query",
+                "via": endpoint,
+                "registeredAt": format!("{}:{line}", hook.file_path),
+            }),
+        ));
+    }
+    Ok(edges)
+}
+
+/// The endpoint a generated hook's name derives (`rtkEndpointNameFromHook`):
+/// without `use`, the `Query` or `Mutation` suffix and a `Lazy` prefix, its
+/// first letter lowered (`useLazyGetRecordsQuery` → `getRecords`).
+fn rtk_endpoint_name(hook: &str) -> Option<String> {
+    let captures = RTK_HOOK_DERIVE.captures(hook)?;
+    let middle = captures.get(1)?.as_str();
+    let middle = middle.strip_prefix("Lazy").unwrap_or(middle);
+    let first = middle.chars().next()?;
+    Some(format!(
+        "{}{}",
+        first.to_ascii_lowercase(),
+        &middle[first.len_utf8()..]
+    ))
+}
+
+/// The comment syntax a Pinia or Vuex file is stripped with: JavaScript's
+/// for `.js`, `.jsx`, `.mjs` and `.cjs`, TypeScript's for the others.
+fn store_pass_comments(file: &str) -> CommentLang {
+    if [".js", ".jsx", ".mjs", ".cjs"]
+        .iter()
+        .any(|suffix| file.ends_with(suffix))
+    {
+        CommentLang::JavaScript
+    } else {
+        CommentLang::TypeScript
+    }
+}
+
+/// Record that `key` names `value`; a key that named another value names
+/// nothing from then on.
+fn name_once(names: &mut HashMap<String, Option<String>>, key: &str, value: &str) {
+    match names.get(key) {
+        None => {
+            names.insert(key.to_string(), Some(value.to_string()));
+        }
+        Some(Some(named)) if named == value => {}
+        Some(_) => {
+            names.insert(key.to_string(), None);
+        }
+    }
+}
+
+/// The keys of `names` that name one value.
+fn named_once(names: HashMap<String, Option<String>>) -> HashMap<String, String> {
+    names
+        .into_iter()
+        .filter_map(|(key, value)| Some((key, value?)))
+        .collect()
+}
+
+/// What a Pinia or Vuex dispatch outside every function's lines comes from:
+/// the file's one component (a `.vue` file's top-level setup), or nothing
+/// when it has several (KEEP-RUST, hard invariant 6: upstream takes the
+/// first).
+fn only_component(nodes: &[Node]) -> Option<&Node> {
+    let mut components = nodes.iter().filter(|node| node.kind == NodeKind::Component);
+    let first = components.next()?;
+    components.next().is_none().then_some(first)
+}
+
+/// The Pinia pass (`piniaStoreEdges`): an action called on the store a file
+/// binds (`const cart = useCartStore(); cart.add(…)`) links from the
+/// function around the call to the action, the one function of the name in
+/// the store's file, at most [`PINIA_FANOUT_CAP`] a file. A factory name
+/// defined in several files, and a variable bound to several stores in one
+/// file, bind nothing (KEEP-RUST, hard invariant 6: upstream's later one
+/// wins).
+pub(super) fn pinia_store_edges(view: &View<'_>) -> Result<Vec<Edge>> {
+    let files: Vec<String> = view
+        .files()?
+        .into_iter()
+        .filter(|file| STORE_PASS_FILE.is_match(file))
+        .collect();
+    // Each factory's file, read in the text as written, comments too, as
+    // upstream reads it.
+    let mut factories: HashMap<String, Option<String>> = HashMap::new();
+    for file in &files {
+        let Some(content) = view.text(file) else {
+            continue;
+        };
+        if !content.contains("defineStore") {
+            continue;
+        }
+        for captures in PINIA_FACTORY.captures_iter(&content) {
+            name_once(&mut factories, &captures[1], file);
+        }
+    }
+    let factories = named_once(factories);
+    if factories.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut edges = Vec::new();
+    let mut seen: HashSet<(String, String)> = HashSet::new();
+    for file in &files {
+        let Some(content) = view.text(file) else {
+            continue;
+        };
+        if !content.contains("Store") {
+            continue;
+        }
+        let safe = strip_comments_for_regex(&content, store_pass_comments(file));
+        let mut bound: HashMap<String, Option<String>> = HashMap::new();
+        for captures in PINIA_BIND.captures_iter(&safe) {
+            if let Some(store_file) = factories.get(&captures[2]) {
+                name_once(&mut bound, &captures[1], store_file);
+            }
+        }
+        let bound = named_once(bound);
+        if bound.is_empty() {
+            continue;
+        }
+        let nodes = view.callables_in_file(file)?;
+        let fallback = only_component(&nodes);
+        let lines = LineAt::new(&safe, 1);
+        let mut added = 0;
+        for captures in PINIA_CALL.captures_iter(&safe) {
+            if added >= PINIA_FANOUT_CAP {
+                break;
+            }
+            let Some(store_file) = bound.get(&captures[1]) else {
+                continue;
+            };
+            let method = &captures[2];
+            let line = lines.line(captures.get(0).expect("match").start());
+            let Some(dispatcher) = enclosing_fn(&nodes, line).or(fallback) else {
+                continue;
+            };
+            // The store's action, the one function of the name in its file
+            // (KEEP-RUST, hard invariant 6: upstream takes the first).
+            let candidates: Vec<Node> = view
+                .nodes_named(method)?
+                .into_iter()
+                .filter(|node| node.kind == NodeKind::Function && node.file_path == *store_file)
+                .collect();
+            let [target] = candidates.as_slice() else {
+                continue;
+            };
+            if target.id == dispatcher.id
+                || !seen.insert((dispatcher.id.clone(), target.id.clone()))
+            {
+                continue;
+            }
+            edges.push(synthesized(
+                dispatcher,
+                target,
+                EdgeKind::Calls,
+                line,
+                json!({
+                    "synthesizedBy": "pinia-store",
+                    "via": method,
+                    "registeredAt": format!("{file}:{line}"),
+                }),
+            ));
+            added += 1;
+        }
+    }
+    Ok(edges)
+}
+
+/// The Vuex pass (`vuexDispatchEdges`): a `dispatch('user/login')` or
+/// `commit('SET_TOKEN')` links from the function around it to the action or
+/// mutation the key names, a function named by its last segment in a file
+/// that reads like a store, at most [`VUEX_FANOUT_CAP`] a file.
+pub(super) fn vuex_dispatch_edges(view: &View<'_>) -> Result<Vec<Edge>> {
+    let mut store_files: HashMap<String, bool> = HashMap::new();
+    let mut edges = Vec::new();
+    let mut seen: HashSet<(String, String)> = HashSet::new();
+    for file in view.files()? {
+        if !STORE_PASS_FILE.is_match(&file) {
+            continue;
+        }
+        let Some(content) = view.text(&file) else {
+            continue;
+        };
+        if !content.contains("dispatch(") && !content.contains("commit(") {
+            continue;
+        }
+        let safe = strip_comments_for_regex(&content, store_pass_comments(&file));
+        let nodes = view.callables_in_file(&file)?;
+        let fallback = only_component(&nodes);
+        let lines = LineAt::new(&safe, 1);
+        let mut added = 0;
+        for captures in VUEX_DISPATCH.captures_iter(&safe) {
+            if added >= VUEX_FANOUT_CAP {
+                break;
+            }
+            let key = &captures[1];
+            let line = lines.line(captures.get(0).expect("match").start());
+            let Some(dispatcher) = enclosing_fn(&nodes, line).or(fallback) else {
+                continue;
+            };
+            let Some(target) = vuex_target(view, key, &file, &mut store_files)? else {
+                continue;
+            };
+            if target.id == dispatcher.id
+                || !seen.insert((dispatcher.id.clone(), target.id.clone()))
+            {
+                continue;
+            }
+            edges.push(synthesized(
+                dispatcher,
+                &target,
+                EdgeKind::Calls,
+                line,
+                json!({
+                    "synthesizedBy": "vuex-dispatch",
+                    "via": key,
+                    "registeredAt": format!("{file}:{line}"),
+                }),
+            ));
+            added += 1;
+        }
+    }
+    Ok(edges)
+}
+
+/// The store function a Vuex key names (`resolve` in `vuexDispatchEdges`):
+/// of the functions its last segment names in files that read like a store,
+/// the first tier is a namespaced key's whose path has the namespace (the
+/// segment before the name) as a segment, and a root key's in the
+/// dispatching file. The tier's one candidate is the target; an empty tier
+/// leaves the one candidate overall; any other count none (KEEP-RUST, hard
+/// invariant 6: upstream takes the tier's first).
+fn vuex_target(
+    view: &View<'_>,
+    key: &str,
+    dispatching_file: &str,
+    store_files: &mut HashMap<String, bool>,
+) -> Result<Option<Node>> {
+    let segments: Vec<&str> = key.split('/').collect();
+    let name = segments[segments.len() - 1];
+    let candidates: Vec<Node> = view
+        .nodes_named(name)?
+        .into_iter()
+        .filter(|node| {
+            node.kind == NodeKind::Function && is_store_file(view, &node.file_path, store_files)
+        })
+        .collect();
+    let tier: Vec<&Node> = if segments.len() > 1 {
+        let namespace = segments[segments.len() - 2];
+        candidates
+            .iter()
+            .filter(|candidate| path_has_segment(&candidate.file_path, namespace))
+            .collect()
+    } else {
+        candidates
+            .iter()
+            .filter(|candidate| candidate.file_path == dispatching_file)
+            .collect()
+    };
+    Ok(match (tier.as_slice(), candidates.as_slice()) {
+        ([target], _) => Some((*target).clone()),
+        ([], [target]) => Some(target.clone()),
+        _ => None,
+    })
+}
+
+/// Whether `file`'s text, as written, holds two different store words
+/// (`isStoreFile`, the words extraction reads), decided once a file.
+fn is_store_file(view: &View<'_>, file: &str, store_files: &mut HashMap<String, bool>) -> bool {
+    if let Some(&store) = store_files.get(file) {
+        return store;
+    }
+    let store = view
+        .text(file)
+        .is_some_and(|text| reads_like_vue_store(&text));
+    store_files.insert(file.to_string(), store);
+    store
+}
+
+/// Whether `path` has `segment` as a directory or a file stem
+/// (`pathHasSegment`, `[\\/]segment[\\/.]`): `store/modules/user.js` has
+/// `user`, a top-level `user.js` none.
+fn path_has_segment(path: &str, segment: &str) -> bool {
+    path.match_indices(['/', '\\']).any(|(at, _)| {
+        path[at + 1..]
+            .strip_prefix(segment)
+            .is_some_and(|after| after.starts_with(['/', '\\', '.']))
+    })
 }
 
 /// The indexed files of `language` whose path ends in `suffix`: what
