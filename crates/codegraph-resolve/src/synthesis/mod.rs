@@ -30,6 +30,7 @@ mod framework;
 mod go;
 mod go_dispatch;
 mod go_func_field;
+mod goframe;
 mod iface;
 mod inputs;
 mod jsx;
@@ -51,7 +52,7 @@ use codegraph_store::Store;
 pub const VERSION_KEY: &str = "synthesis_version";
 
 /// The marker's value; a change to what the passes produce moves it.
-pub const VERSION: &str = "12";
+pub const VERSION: &str = "13";
 
 /// The edges one channel, class or declaration links at most (upstream
 /// `MAX_CALLBACKS_PER_CHANNEL`).

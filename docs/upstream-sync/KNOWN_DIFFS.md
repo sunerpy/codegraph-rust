@@ -38,7 +38,7 @@ matching (`name-matcher.ts`) — orchestrated by `ReferenceResolver`
 (`index.ts`), plus concrete `FrameworkResolver` implementations behind the
 `FrameworkResolver` trait EXTENSION POINT (`crates/codegraph-resolve/src/framework.rs`):
 NestJS, React, Vue, Godot, Tauri, Nuxt, React Router, TanStack Router, Next.js,
-Svelte, SvelteKit, Vue Router, Angular Router and Expo Router
+Svelte, SvelteKit, Vue Router, Angular Router, Expo Router and GoFrame
 (`crates/codegraph-resolve/src/frameworks/`), detected per-project by
 `detect_frameworks`. The other colby resolvers stay deferred. The following
 colby behaviors are intentionally NOT ported in v1:
@@ -71,8 +71,9 @@ colby behaviors are intentionally NOT ported in v1:
   render, JSX, Pascal form, Flutter, C++ override, interface override, Kotlin
   expect/actual, gRPC stub, MyBatis, gin middleware-chain, redux-thunk,
   object-registry, RTK Query, Pinia, Vuex, Celery, Spring event, MediatR,
-  Sidekiq, Laravel event, C function-pointer and Go func-field passes and the
-  Go prerequisites (`go-method-contains`, `go-implements`) are ported
+  Sidekiq, Laravel event, C function-pointer, GoFrame route and Go func-field
+  passes and the Go prerequisites (`go-method-contains`, `go-implements`) are
+  ported
   (`crates/codegraph-resolve/src/synthesis/`); the others draw no edge here
   yet. The ported passes and the merge keep `b635dd46`'s view of Jest/Vitest
   manual mocks: #2790's skip of a `__mocks__/` handler for production code
@@ -212,11 +213,11 @@ of [`equivalence.md`](../equivalence.md) and the module docs. Each one leaves
 a guess unresolved, gives the same graph whatever order the files were indexed
 in, reads the source as it is written where colby misreads it, follows a
 grammar or extractor shape that is not colby's, or, by the owner's decision,
-records what colby does not. None is a Tier-3 rule: the goldens pin this
-port's own output, these differences included. A difference of mechanism
-alone, which gives colby's result (one scan in place of a regex compiled per
-name, a per-pass memo, a pattern rewritten for Rust's regex engine), is not
-listed.
+records what colby does not or skips what colby reads. None is a Tier-3
+rule: the goldens pin this port's own output, these differences included. A
+difference of mechanism alone, which gives colby's result (one scan in place
+of a regex compiled per name, a per-pass memo, a pattern rewritten for Rust's
+regex engine), is not listed.
 
 ### Resolution
 
@@ -510,6 +511,14 @@ listed.
   namespace as a segment, or for a root key the dispatching file), else the
   project's one candidate. Several of any of them reach nothing. colby takes
   the first, and the last factory and binding (`synthesis/framework.rs`).
+- **The handler a GoFrame route's bare type reaches (W7-16c, OD-B16).** A
+  route whose package-qualified request type no method takes falls back to
+  the methods taking the bare type, leaving out one whose qualified parameter
+  is another route's request type: with `cash` and `order` both declaring a
+  `ListReq` route and only `order` handling one, `GET /cash/list` reaches
+  nothing. A same-package (`*ListReq`) or aliased (`*sys.DeptSearchReq`)
+  parameter still links. colby keeps every method of the bare type
+  (`synthesis/goframe.rs`).
 - **JSX render (W7-14e, OD-A4).** A tag renders what its static
   `references` edge reaches, a component, function, class or value, never
   a method. colby scans a file's text for `<Name` and finds the child by
@@ -635,6 +644,19 @@ listed.
   too. colby names any key by its text without quotes, so a computed
   `[types.SET]` member is a node named `[types.SET]`, qualifies by the file
   and skips a `function*` value (`walker.rs`).
+
+### Scan scope
+
+- **`addons` skipped by default (Godot; W7-16c, OD-B17).** The default
+  `indexing.ignore_dirs` adds `addons`, a Godot project's vendored editor
+  plugins, to colby's default directories (with `.godot`, the engine's
+  regenerated cache). Like every entry it is a directory name skipped at any
+  depth in any project, so first-party code under a directory of that name is
+  not indexed either: a GoFrame app's addon modules (`addons/<name>/`, which
+  the GoFrame pass's addon tier tells apart) and a core directory such as
+  hotgo's `api/admin/addons/`. colby indexes them. A project re-includes them
+  with a custom `ignore_dirs` list in `.codegraph/config.toml`
+  ([`godot.md`](../godot.md); `codegraph-core/src/config.rs`).
 
 ### Path order, not index order
 

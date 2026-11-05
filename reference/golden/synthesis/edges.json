@@ -662,6 +662,18 @@
   {
     "col": 46,
     "kind": "references",
+    "line": 22,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "function:ebfb48c8ba96cdb9d284ef6c34051704",
+    "target": "struct:17c7fbba1d0dbe2ba6dd032b313bfdac"
+  },
+  {
+    "col": 46,
+    "kind": "references",
     "line": 28,
     "metadata": {
       "confidence": 0.9,
@@ -733,6 +745,30 @@
     "target": "function:63f50595e4b93b47584b5a76d0547a43"
   },
   {
+    "col": 65,
+    "kind": "references",
+    "line": 17,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "method:57e5548b07bd432b5a197cfcc65a95d0",
+    "target": "struct:02286c619b4f64d8dd704e056fd8bc40"
+  },
+  {
+    "col": 66,
+    "kind": "references",
+    "line": 13,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "method:5566e0357aacb1c461a8c91af9815823",
+    "target": "struct:952d30a6a9b16b4c74783e552d13b727"
+  },
+  {
     "col": 7,
     "kind": "instantiates",
     "line": 15,
@@ -768,6 +804,18 @@
     "provenance": null,
     "source": "function:cc7dbb6ca5c71b7c859e0bb6405280d9",
     "target": "function:468467677f4fc016663179441a52ff32"
+  },
+  {
+    "col": 8,
+    "kind": "calls",
+    "line": 14,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "method:5566e0357aacb1c461a8c91af9815823",
+    "target": "function:ebfb48c8ba96cdb9d284ef6c34051704"
   },
   {
     "col": 8,
@@ -866,6 +914,30 @@
     "target": "struct:306ad387530d1e49ad70e35ee0097658"
   },
   {
+    "col": 90,
+    "kind": "references",
+    "line": 17,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "method:57e5548b07bd432b5a197cfcc65a95d0",
+    "target": "struct:1a2d8f3e6665453637b3803581ff55f2"
+  },
+  {
+    "col": 94,
+    "kind": "references",
+    "line": 13,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "method:5566e0357aacb1c461a8c91af9815823",
+    "target": "struct:17c7fbba1d0dbe2ba6dd032b313bfdac"
+  },
+  {
     "col": null,
     "kind": "calls",
     "line": 10,
@@ -942,6 +1014,20 @@
     "provenance": "heuristic",
     "source": "method:4fa1cc0f5c6e16964aa519b8ffa473d9",
     "target": "method:d5658cf785502385e0d2dc65e6908262"
+  },
+  {
+    "col": null,
+    "kind": "calls",
+    "line": 14,
+    "metadata": {
+      "registeredAt": "goframe/internal/controller/dept.go:17",
+      "requestType": "DeptAddReq",
+      "route": "POST /dept/add",
+      "synthesizedBy": "goframe-route"
+    },
+    "provenance": "heuristic",
+    "source": "route:goframe/api/system/dept.go:14:POST:/dept/add",
+    "target": "method:57e5548b07bd432b5a197cfcc65a95d0"
   },
   {
     "col": null,
@@ -1165,6 +1251,20 @@
     "provenance": "heuristic",
     "source": "method:23b52db61e3c123c60850cc118b75515",
     "target": "method:fc57b8ff353cc43701ceb2c71ac647fd"
+  },
+  {
+    "col": null,
+    "kind": "calls",
+    "line": 5,
+    "metadata": {
+      "registeredAt": "goframe/internal/controller/dept.go:13",
+      "requestType": "DeptSearchReq",
+      "route": "GET /dept/list",
+      "synthesizedBy": "goframe-route"
+    },
+    "provenance": "heuristic",
+    "source": "route:goframe/api/system/dept.go:5:GET:/dept/list",
+    "target": "method:5566e0357aacb1c461a8c91af9815823"
   },
   {
     "col": null,
@@ -2121,6 +2221,123 @@
     "line": null,
     "metadata": null,
     "provenance": null,
+    "source": "file:goframe/api/system/dept.go",
+    "target": "import:a825de79879b0c315bf50d3ffafc6bce"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:goframe/api/system/dept.go",
+    "target": "struct:02286c619b4f64d8dd704e056fd8bc40"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:goframe/api/system/dept.go",
+    "target": "struct:17c7fbba1d0dbe2ba6dd032b313bfdac"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:goframe/api/system/dept.go",
+    "target": "struct:1a2d8f3e6665453637b3803581ff55f2"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:goframe/api/system/dept.go",
+    "target": "struct:7cc1f317a4a96eee1223d1e5c1f500e2"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:goframe/api/system/dept.go",
+    "target": "struct:952d30a6a9b16b4c74783e552d13b727"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:goframe/api/system/dept.go",
+    "target": "struct:e28b7286a62192370b20f9c40432eb21"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:goframe/internal/controller/dept.go",
+    "target": "function:ebfb48c8ba96cdb9d284ef6c34051704"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:goframe/internal/controller/dept.go",
+    "target": "import:589470a8d09558a1118b45b9e9b112c3"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:goframe/internal/controller/dept.go",
+    "target": "import:a3cc53134ef0b6dacbb265f8564eede0"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:goframe/internal/controller/dept.go",
+    "target": "method:5566e0357aacb1c461a8c91af9815823"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:goframe/internal/controller/dept.go",
+    "target": "method:57e5548b07bd432b5a197cfcc65a95d0"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:goframe/internal/controller/dept.go",
+    "target": "struct:ec0b84de8d8db938b67c2f0c42fee15e"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
     "source": "file:js/src/Counter.tsx",
     "target": "function:33d9d8364fb2a1c7aabe3039389f7a9c"
   },
@@ -2717,6 +2934,24 @@
     "provenance": null,
     "source": "struct:cb43451f72c3398711cf7535251bec35",
     "target": "method:37e8ccd92b95136db15c0ea00ae4e40e"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "struct:ec0b84de8d8db938b67c2f0c42fee15e",
+    "target": "method:5566e0357aacb1c461a8c91af9815823"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "struct:ec0b84de8d8db938b67c2f0c42fee15e",
+    "target": "method:57e5548b07bd432b5a197cfcc65a95d0"
   },
   {
     "col": null,

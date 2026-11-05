@@ -171,6 +171,24 @@
     "size": 429
   },
   {
+    "content_hash": "61cf2d04fa1f42ce9675f17781816d608ea5b2893db4cba9e5eca3d686f6ed9a",
+    "errors": null,
+    "generated": 0,
+    "language": "go",
+    "node_count": 8,
+    "path": "goframe/api/system/dept.go",
+    "size": 519
+  },
+  {
+    "content_hash": "c2e17099965c2e7474df8719775761573a25ae7f97449ed40c01bf85adbcabb1",
+    "errors": null,
+    "generated": 0,
+    "language": "go",
+    "node_count": 7,
+    "path": "goframe/internal/controller/dept.go",
+    "size": 675
+  },
+  {
     "content_hash": "897c54c90596cfad23707ddd5c2515c56b227e0ce5d4d1b16bc37f1d7e159352",
     "errors": null,
     "generated": 0,

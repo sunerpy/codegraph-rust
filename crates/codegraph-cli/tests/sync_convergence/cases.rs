@@ -17497,3 +17497,95 @@ pub fn c_fnptr_non_indexed_include_becomes_excluded() -> Case {
         .edge_before("function go", "calls", "function one")
         .no_edge_after("function go", "calls", "function one")
 }
+
+/// W7-16c: the root `go.mod` of a GoFrame app.
+const GOFRAME_GO_MOD: &str = "module example.com/app\n\nrequire github.com/gogf/gf/v2 v2.7.0\n";
+
+/// W7-16c: two `g.Meta` request types of a GoFrame api.
+const GOFRAME_DEPT_API: &str = "package system\n\nimport \"github.com/gogf/gf/v2/frame/g\"\n\ntype DeptSearchReq struct {\n\tg.Meta `path:\"/dept/list\" method:\"get\"`\n}\ntype DeptSearchRes struct{}\n\ntype DeptAddReq struct {\n\tg.Meta `path:\"/dept/add\" method:\"post\"`\n}\ntype DeptAddRes struct{}\n";
+
+/// W7-16c: [`GOFRAME_DEPT_API`] with `POST /dept/add` moved to `/dept/create`.
+const GOFRAME_DEPT_API_CREATE: &str = "package system\n\nimport \"github.com/gogf/gf/v2/frame/g\"\n\ntype DeptSearchReq struct {\n\tg.Meta `path:\"/dept/list\" method:\"get\"`\n}\ntype DeptSearchRes struct{}\n\ntype DeptAddReq struct {\n\tg.Meta `path:\"/dept/create\" method:\"post\"`\n}\ntype DeptAddRes struct{}\n";
+
+/// W7-16c: the controller serving [`GOFRAME_DEPT_API`]'s routes.
+const GOFRAME_DEPT_CONTROLLER: &str = "package controller\n\nimport (\n\t\"context\"\n\n\t\"example.com/app/api/system\"\n)\n\ntype ctl struct{}\n\nfunc (c *ctl) List(ctx context.Context, req *system.DeptSearchReq) (res *system.DeptSearchRes, err error) {\n\treturn\n}\n\nfunc (c *ctl) Add(ctx context.Context, req *system.DeptAddReq) (res *system.DeptAddRes, err error) {\n\treturn\n}\n";
+
+/// W7-16c: a controller of `Add` only.
+const GOFRAME_ADD_CONTROLLER: &str = "package controller\n\nimport (\n\t\"context\"\n\n\t\"example.com/app/api/system\"\n)\n\ntype ctl struct{}\n\nfunc (c *ctl) Add(ctx context.Context, req *system.DeptAddReq) (res *system.DeptAddRes, err error) {\n\treturn\n}\n";
+
+/// W7-16c: [`GOFRAME_ADD_CONTROLLER`] with `Add` taking the search request.
+const GOFRAME_ADD_TAKES_SEARCH: &str = "package controller\n\nimport (\n\t\"context\"\n\n\t\"example.com/app/api/system\"\n)\n\ntype ctl struct{}\n\nfunc (c *ctl) Add(ctx context.Context, req *system.DeptSearchReq) (res *system.DeptAddRes, err error) {\n\treturn\n}\n";
+
+/// W7-16c: `POST /dept/add`'s route by its request type.
+const GOFRAME_ADD_ROUTE: &str = "route api/system/dept.go::goframe-route:system.DeptAddReq";
+/// W7-16c: `GET /dept/list`'s route by its request type.
+const GOFRAME_SEARCH_ROUTE: &str = "route api/system/dept.go::goframe-route:system.DeptSearchReq";
+
+/// W7-16c: the root `go.mod` comes to require GoFrame: the request types
+/// become routes, joined to their controller methods.
+pub fn go_goframe_go_mod_comes_to_require_goframe() -> Case {
+    Case::new(Change::ControlFile, &[Language::Go])
+        .file("go.mod", "module example.com/app\n\ngo 1.22\n")
+        .file("api/system/dept.go", GOFRAME_DEPT_API)
+        .file("internal/controller/dept.go", GOFRAME_DEPT_CONTROLLER)
+        .write("go.mod", GOFRAME_GO_MOD)
+        .named_after("route", "POST /dept/add")
+        .edge_after(GOFRAME_ADD_ROUTE, "calls", "method ctl::Add")
+        .edge_after(GOFRAME_SEARCH_ROUTE, "calls", "method ctl::List")
+}
+
+/// W7-16c: the handler comes to take another request type; its route
+/// follows the parameter.
+pub fn go_goframe_handler_takes_another_request_type() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Go])
+        .file("go.mod", GOFRAME_GO_MOD)
+        .file("api/system/dept.go", GOFRAME_DEPT_API)
+        .file("internal/controller/dept.go", GOFRAME_ADD_CONTROLLER)
+        .write("internal/controller/dept.go", GOFRAME_ADD_TAKES_SEARCH)
+        .edge_before(GOFRAME_ADD_ROUTE, "calls", "method ctl::Add")
+        .no_edge_after(GOFRAME_ADD_ROUTE, "calls", "method ctl::Add")
+        .edge_after(GOFRAME_SEARCH_ROUTE, "calls", "method ctl::Add")
+}
+
+/// W7-16c: a `g.Meta` tag's path changes: the route is renamed, with a new
+/// id, and its edge follows.
+pub fn go_goframe_route_path_is_changed() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Go])
+        .file("go.mod", GOFRAME_GO_MOD)
+        .file("api/system/dept.go", GOFRAME_DEPT_API)
+        .file("internal/controller/dept.go", GOFRAME_DEPT_CONTROLLER)
+        .write("api/system/dept.go", GOFRAME_DEPT_API_CREATE)
+        .named_before("route", "POST /dept/add")
+        .named_after("route", "POST /dept/create")
+        .edge_before(GOFRAME_ADD_ROUTE, "calls", "method ctl::Add")
+        .edge_after(GOFRAME_ADD_ROUTE, "calls", "method ctl::Add")
+}
+
+/// W7-16c: another controller directory gains a method taking the same
+/// request type, in the same addon root: the route has two handlers and
+/// links neither.
+pub fn go_goframe_another_controller_takes_the_request_type() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Go])
+        .file("go.mod", GOFRAME_GO_MOD)
+        .file("api/system/dept.go", GOFRAME_DEPT_API)
+        .file("internal/controller/dept.go", GOFRAME_DEPT_CONTROLLER)
+        .write(
+            "internal/controller/v2/dept.go",
+            "package v2\n\nimport (\n\t\"context\"\n\n\t\"example.com/app/api/system\"\n)\n\ntype ctl2 struct{}\n\nfunc (c *ctl2) Add(ctx context.Context, req *system.DeptAddReq) (res *system.DeptAddRes, err error) {\n\treturn\n}\n",
+        )
+        .edge_before(GOFRAME_ADD_ROUTE, "calls", "method ctl::Add")
+        .no_edge_after(GOFRAME_ADD_ROUTE, "calls", "method ctl::Add")
+        .edge_after(GOFRAME_SEARCH_ROUTE, "calls", "method ctl::List")
+}
+
+/// W7-16c: the controller file is deleted: its routes stay, unlinked.
+pub fn go_goframe_controller_file_is_deleted() -> Case {
+    Case::new(Change::DeleteImportedModule, &[Language::Go])
+        .file("go.mod", GOFRAME_GO_MOD)
+        .file("api/system/dept.go", GOFRAME_DEPT_API)
+        .file("internal/controller/dept.go", GOFRAME_DEPT_CONTROLLER)
+        .remove("internal/controller/dept.go")
+        .edge_before(GOFRAME_ADD_ROUTE, "calls", "method ctl::Add")
+        .named_after("route", "POST /dept/add")
+        .named_after("route", "GET /dept/list")
+}

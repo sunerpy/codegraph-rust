@@ -6,8 +6,9 @@
 //! ([`svelte`], [`sveltekit_router`]), Vue Router ([`vue_router`]),
 //! Angular Router ([`angular_router`]), Expo Router ([`expo_router`]), Vue
 //! and Nuxt ([`vue`]), NestJS
-//! ([`nestjs`]), Godot ([`godot`]) and Tauri ([`tauri`]). The other upstream
-//! resolvers remain deferred (see `KNOWN_DIFFS.md`).
+//! ([`nestjs`]), Godot ([`godot`]), Tauri ([`tauri`]) and GoFrame
+//! ([`goframe`]). The other upstream resolvers remain deferred (see
+//! `KNOWN_DIFFS.md`).
 //!
 //! [`detect_frameworks`] ports `frameworks/index.ts:detectFrameworks` restricted
 //! to the ported resolvers; the orchestrator hands the detected list to
@@ -24,6 +25,7 @@ pub(crate) mod godot_project;
 pub(crate) mod godot_resource;
 pub(crate) mod godot_scene;
 pub mod godot_script;
+pub mod goframe;
 pub(crate) mod js_scan;
 pub(crate) mod lazy_loader;
 pub mod nestjs;
@@ -103,6 +105,10 @@ pub fn detect_frameworks(context: &dyn ResolutionContext) -> Vec<Box<dyn Framewo
         // registers it. It claims navigation calls only where their href
         // names one of its own screens.
         Box::new(expo_router::ExpoRouterResolver),
+        // GoFrame's `g.Meta` routes (#747), upstream's after its Go
+        // resolver. It resolves no reference, so its place here changes
+        // no resolution; the synthesis stage joins its routes.
+        Box::new(goframe::GoFrameResolver),
     ];
     candidates
         .into_iter()

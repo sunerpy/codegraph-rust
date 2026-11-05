@@ -20,8 +20,8 @@ use rayon::prelude::*;
 
 use super::inputs::{self, Inputs, UnindexedReader};
 use super::{
-    c_fnptr, callback, dispatch, framework, go, go_dispatch, go_func_field, iface, is_synthesized,
-    jsx, registry,
+    c_fnptr, callback, dispatch, framework, go, go_dispatch, go_func_field, goframe, iface,
+    is_synthesized, jsx, registry,
 };
 
 /// What one run of the stage did.
@@ -143,6 +143,7 @@ const PASSES: &[(&str, Gate, Pass)] = &[
         |languages| languages.contains(&Language::C) || languages.contains(&Language::Cpp),
         c_fnptr::c_fn_pointer_dispatch_edges,
     ),
+    ("goframeEdges", go::gate, goframe::route_edges),
     (
         "goFuncFieldEdges",
         go::gate,

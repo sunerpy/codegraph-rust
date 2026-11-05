@@ -141,6 +141,26 @@
   },
   {
     "candidates": null,
+    "col": 1,
+    "file_path": "goframe/internal/controller/dept.go",
+    "from_node_id": "file:goframe/internal/controller/dept.go",
+    "language": "go",
+    "line": 4,
+    "reference_kind": "imports",
+    "reference_name": "context"
+  },
+  {
+    "candidates": null,
+    "col": 1,
+    "file_path": "goframe/internal/controller/dept.go",
+    "from_node_id": "file:goframe/internal/controller/dept.go",
+    "language": "go",
+    "line": 6,
+    "reference_kind": "imports",
+    "reference_name": "example.com/synthesis/goframe/api/system"
+  },
+  {
+    "candidates": null,
     "col": 11,
     "file_path": "c/src/ops.c",
     "from_node_id": "function:0114da5ed06cbe96441f72b8ce3bd9cc",
@@ -382,6 +402,16 @@
   {
     "candidates": null,
     "col": 24,
+    "file_path": "goframe/internal/controller/dept.go",
+    "from_node_id": "function:ebfb48c8ba96cdb9d284ef6c34051704",
+    "language": "go",
+    "line": 22,
+    "reference_kind": "references",
+    "reference_name": "Context"
+  },
+  {
+    "candidates": null,
+    "col": 24,
     "file_path": "js/src/api.ts",
     "from_node_id": "constant:ad1764c93db526d07dff60c7290e2f9f",
     "language": "typescript",
@@ -511,6 +541,46 @@
   },
   {
     "candidates": null,
+    "col": 3,
+    "file_path": "goframe/api/system/dept.go",
+    "from_node_id": "struct:02286c619b4f64d8dd704e056fd8bc40",
+    "language": "go",
+    "line": 15,
+    "reference_kind": "extends",
+    "reference_name": "Meta"
+  },
+  {
+    "candidates": null,
+    "col": 3,
+    "file_path": "goframe/api/system/dept.go",
+    "from_node_id": "struct:17c7fbba1d0dbe2ba6dd032b313bfdac",
+    "language": "go",
+    "line": 10,
+    "reference_kind": "extends",
+    "reference_name": "Meta"
+  },
+  {
+    "candidates": null,
+    "col": 3,
+    "file_path": "goframe/api/system/dept.go",
+    "from_node_id": "struct:952d30a6a9b16b4c74783e552d13b727",
+    "language": "go",
+    "line": 6,
+    "reference_kind": "extends",
+    "reference_name": "Meta"
+  },
+  {
+    "candidates": null,
+    "col": 3,
+    "file_path": "goframe/api/system/dept.go",
+    "from_node_id": "struct:e28b7286a62192370b20f9c40432eb21",
+    "language": "go",
+    "line": 22,
+    "reference_kind": "extends",
+    "reference_name": "Meta"
+  },
+  {
+    "candidates": null,
     "col": 32,
     "file_path": "dispatch/app/services/signup.rb",
     "from_node_id": "method:6c6925fe488048baffe7829bf858bf9d",
@@ -621,6 +691,26 @@
   },
   {
     "candidates": null,
+    "col": 44,
+    "file_path": "goframe/internal/controller/dept.go",
+    "from_node_id": "method:57e5548b07bd432b5a197cfcc65a95d0",
+    "language": "go",
+    "line": 17,
+    "reference_kind": "references",
+    "reference_name": "Context"
+  },
+  {
+    "candidates": null,
+    "col": 45,
+    "file_path": "goframe/internal/controller/dept.go",
+    "from_node_id": "method:5566e0357aacb1c461a8c91af9815823",
+    "language": "go",
+    "line": 13,
+    "reference_kind": "references",
+    "reference_name": "Context"
+  },
+  {
+    "candidates": null,
     "col": 48,
     "file_path": "dispatch/src/Orders.cs",
     "from_node_id": "method:9c1b4e873ff43e93f8713698beeaf7e4",
@@ -658,6 +748,16 @@
     "line": 3,
     "reference_kind": "imports",
     "reference_name": "context"
+  },
+  {
+    "candidates": null,
+    "col": 7,
+    "file_path": "goframe/api/system/dept.go",
+    "from_node_id": "file:goframe/api/system/dept.go",
+    "language": "go",
+    "line": 3,
+    "reference_kind": "imports",
+    "reference_name": "github.com/gogf/gf/v2/frame/g"
   },
   {
     "candidates": null,

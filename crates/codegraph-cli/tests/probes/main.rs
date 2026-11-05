@@ -23241,7 +23241,7 @@ mod synthesis {
         assert_eq!((edge.line, edge.col), (Some(7), None), "{edge:?}");
         assert_eq!(
             project_metadata_with_prefix(&project.db(), "synthesis_version"),
-            [("synthesis_version".to_string(), "12".to_string())]
+            [("synthesis_version".to_string(), "13".to_string())]
         );
     }
 
@@ -34024,6 +34024,486 @@ export default {};
             Vec::<String>::new(),
             "{}",
             graph.report()
+        );
+    }
+}
+
+/// W7-16c: GoFrame's `g.Meta` routes and the pass that joins each to the
+/// controller method serving it, upstream `goframe.test.ts` with its sources
+/// as written, and the cases Rust adds.
+mod goframe {
+    use super::framework_dispatch::synthesized_by;
+    use super::support::{Graph, Project, graph_of};
+
+    /// The `go.mod` of upstream's fixtures.
+    const GO_MOD: &str = "module example.com/app\n\nrequire github.com/gogf/gf/v2 v2.7.0\n";
+
+    /// `api/system/dept.go` of upstream's first test.
+    const DEPT_API: &str = r#"package system
+
+import "github.com/gogf/gf/v2/frame/g"
+
+type DeptSearchReq struct {
+	g.Meta   `path:"/dept/list" tags:"Dept" method:"get" summary:"list"`
+	DeptName string
+}
+type DeptSearchRes struct {
+	g.Meta `mime:"application/json"`
+	List   []string
+}
+
+type DeptAddReq struct {
+	g.Meta `path:"/dept/add" method:"post"`
+	Name   string
+}
+type DeptAddRes struct{}
+
+// A declared route whose handler does not exist in this codebase.
+type OrphanReq struct {
+	g.Meta `path:"/orphan" method:"get"`
+}
+type OrphanRes struct{}
+"#;
+
+    /// `internal/controller/dept.go` of upstream's first test.
+    const DEPT_CONTROLLER: &str = r#"package controller
+
+import (
+	"context"
+
+	"example.com/app/api/system"
+)
+
+type sysDeptController struct{}
+
+// NB: method name (List) differs from the request type (DeptSearchReq) — the join
+// must be by signature, not name.
+func (c *sysDeptController) List(ctx context.Context, req *system.DeptSearchReq) (res *system.DeptSearchRes, err error) {
+	return helper(ctx)
+}
+
+func (c *sysDeptController) Add(ctx context.Context, req *system.DeptAddReq) (res *system.DeptAddRes, err error) {
+	return
+}
+
+// Returns the response type but takes no request type — must NOT be linked.
+func helper(ctx context.Context) (res *system.DeptSearchRes, err error) {
+	return
+}
+"#;
+
+    /// The route nodes as `name @file:line`, sorted.
+    fn routes(graph: &Graph) -> Vec<String> {
+        let mut routes: Vec<String> = graph
+            .nodes
+            .iter()
+            .filter(|node| node.kind == "route")
+            .map(|node| format!("{} @{}:{}", node.name, node.file_path, node.start_line))
+            .collect();
+        routes.sort();
+        routes
+    }
+
+    /// Every `goframe-route` edge as `route -> handler (file) requestType
+    /// <type> @<registeredAt> line <line>`, sorted; each is heuristic, from
+    /// a route to a method, with no column.
+    #[track_caller]
+    fn links(graph: &Graph) -> Vec<String> {
+        let mut links: Vec<String> = synthesized_by(graph, "goframe-route")
+            .map(|edge| {
+                assert_eq!(edge.provenance.as_deref(), Some("heuristic"), "{edge:?}");
+                assert_eq!(edge.col, None, "{edge:?}");
+                let route = graph.node(&edge.source).expect("the route");
+                let handler = graph.node(&edge.target).expect("the handler");
+                assert_eq!(route.kind, "route", "{edge:?}");
+                assert_eq!(handler.kind, "method", "{edge:?}");
+                assert_eq!(edge.metadata["route"], route.name.as_str(), "{edge:?}");
+                format!(
+                    "{} -> {} ({}) requestType {} @{} line {}",
+                    route.name,
+                    handler.qualified_name,
+                    handler.file_path,
+                    edge.metadata["requestType"].as_str().unwrap_or("?"),
+                    edge.metadata["registeredAt"].as_str().unwrap_or("?"),
+                    edge.line
+                        .map_or_else(|| "?".to_string(), |line| line.to_string()),
+                )
+            })
+            .collect();
+        links.sort();
+        links
+    }
+
+    /// Upstream `goframe.test.ts`: each `g.Meta` route joins its controller
+    /// method by the request type in its signature, the method's name aside;
+    /// a `mime`-only response makes no route, the orphan stays unlinked and
+    /// the response type links nothing.
+    #[test]
+    fn w716c_each_g_meta_route_joins_its_controller_method_by_the_request_type() {
+        let project = Project::new()
+            .file("go.mod", GO_MOD)
+            .file("api/system/dept.go", DEPT_API)
+            .file("internal/controller/dept.go", DEPT_CONTROLLER)
+            .index();
+        let graph = graph_of(&project);
+        let mut names: Vec<&str> = graph
+            .nodes
+            .iter()
+            .filter(|node| node.kind == "route")
+            .map(|node| node.name.as_str())
+            .collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            ["GET /dept/list", "GET /orphan", "POST /dept/add"],
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            links(graph),
+            [
+                "GET /dept/list -> sysDeptController::List (internal/controller/dept.go) requestType DeptSearchReq @internal/controller/dept.go:13 line 5",
+                "POST /dept/add -> sysDeptController::Add (internal/controller/dept.go) requestType DeptAddReq @internal/controller/dept.go:17 line 14",
+            ],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream `goframe.test.ts`: two modules both define `ListReq`; the
+    /// package qualifier in each handler's signature tells them apart.
+    #[test]
+    fn w716c_the_package_qualifier_tells_identical_request_types_apart() {
+        let mut project = Project::new().file("go.mod", GO_MOD);
+        for module in ["cash", "order"] {
+            project = project
+                .file(
+                    &format!("api/{module}/{module}.go"),
+                    &format!(
+                        "package {module}\n\nimport \"github.com/gogf/gf/v2/frame/g\"\n\ntype ListReq struct {{\n\tg.Meta `path:\"/{module}/list\" method:\"get\"`\n}}\ntype ListRes struct{{}}\n"
+                    ),
+                )
+                .file(
+                    &format!("internal/controller/{module}/{module}.go"),
+                    &format!(
+                        "package {module}\n\nimport (\n\t\"context\"\n\n\t\"example.com/app/api/{module}\"\n)\n\ntype c{module} struct{{}}\n\nfunc (c *c{module}) List(ctx context.Context, req *{module}.ListReq) (res *{module}.ListRes, err error) {{\n\treturn\n}}\n"
+                    ),
+                );
+        }
+        let project = project.index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            links(graph),
+            [
+                "GET /cash/list -> ccash::List (internal/controller/cash/cash.go) requestType ListReq @internal/controller/cash/cash.go:11 line 5",
+                "GET /order/list -> corder::List (internal/controller/order/order.go) requestType ListReq @internal/controller/order/order.go:11 line 5",
+            ],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Detection reads the root `go.mod` only, as upstream: no `go.mod`, one
+    /// that requires no GoFrame, or GoFrame named only in `server/go.mod`
+    /// gives no route; GoFrame v1's `github.com/gogf/gf` is GoFrame too.
+    #[test]
+    fn w716c_only_a_root_go_mod_naming_gogf_detects_goframe() {
+        let undetected = [
+            Project::new().file("api/system/dept.go", DEPT_API),
+            Project::new()
+                .file("go.mod", "module example.com/app\n\ngo 1.22\n")
+                .file("api/system/dept.go", DEPT_API),
+            Project::new()
+                .file("server/go.mod", GO_MOD)
+                .file("server/api/system/dept.go", DEPT_API),
+        ];
+        for project in undetected {
+            let project = project.index();
+            let graph = graph_of(&project);
+            assert_eq!(routes(graph), Vec::<String>::new(), "{}", graph.report());
+        }
+        let v1 = Project::new()
+            .file(
+                "go.mod",
+                "module example.com/app\n\nrequire github.com/gogf/gf v1.16.9\n",
+            )
+            .file("api/system/dept.go", DEPT_API)
+            .index();
+        assert_eq!(
+            routes(graph_of(&v1)),
+            [
+                "GET /dept/list @api/system/dept.go:5",
+                "GET /orphan @api/system/dept.go:21",
+                "POST /dept/add @api/system/dept.go:14",
+            ],
+            "{}",
+            graph_of(&v1).report()
+        );
+    }
+
+    /// A route is a request type whose first field is a tagged `g.Meta`
+    /// with a `path:`, outside comments: no `method:` serves `ANY`, a method
+    /// is upper-cased, and the type's package qualifies its name.
+    #[test]
+    fn w716c_a_route_is_a_request_type_whose_first_field_is_a_tagged_g_meta() {
+        let api = r#"package x
+
+import "github.com/gogf/gf/v2/frame/g"
+
+// type CommentedReq struct {
+// 	g.Meta `path:"/commented" method:"get"`
+// }
+
+/* type BlockReq struct { g.Meta `path:"/block"` } */
+
+type AnyReq struct {
+	g.Meta `path:"/any"`
+}
+
+type PostReq struct {
+	g.Meta `path:"/post" method:"post"`
+}
+
+type PostRes struct {
+	g.Meta `mime:"application/json"`
+}
+
+type LateReq struct {
+	Name   string
+	g.Meta `path:"/late"`
+}
+
+type lowerReq struct {
+	g.Meta `path:"/lower"`
+}
+"#;
+        let project = Project::new()
+            .file("go.mod", GO_MOD)
+            .file("api/x/x.go", api)
+            .index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            routes(graph),
+            ["ANY /any @api/x/x.go:11", "POST /post @api/x/x.go:15"],
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            graph
+                .nodes_matching("route api/x/x.go::goframe-route:x.PostReq")
+                .len(),
+            1,
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// The bare type is the fallback: a same-package handler (`*DeptSearchReq`)
+    /// and an aliased import (`*sys.DeptAddReq`) are reached through it.
+    #[test]
+    fn w716c_a_same_package_or_aliased_handler_is_reached_through_the_bare_type() {
+        let project = Project::new()
+            .file("go.mod", GO_MOD)
+            .file("api/system/dept.go", DEPT_API)
+            .file(
+                "api/system/search.go",
+                "package system\n\nimport \"context\"\n\ntype Ctl struct{}\n\nfunc (c *Ctl) Search(ctx context.Context, req *DeptSearchReq) (res *DeptSearchRes, err error) {\n\treturn\n}\n",
+            )
+            .file(
+                "internal/controller/dept.go",
+                "package controller\n\nimport (\n\t\"context\"\n\n\tsys \"example.com/app/api/system\"\n)\n\ntype ctl struct{}\n\nfunc (c *ctl) Add(ctx context.Context, req *sys.DeptAddReq) (res *sys.DeptAddRes, err error) {\n\treturn\n}\n",
+            )
+            .index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            links(graph),
+            [
+                "GET /dept/list -> Ctl::Search (api/system/search.go) requestType DeptSearchReq @api/system/search.go:7 line 5",
+                "POST /dept/add -> ctl::Add (internal/controller/dept.go) requestType DeptAddReq @internal/controller/dept.go:11 line 14",
+            ],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// A handler takes its request type by pointer, and is a method: a value
+    /// parameter is no join, and a function taking the type beside the
+    /// method is no second candidate.
+    #[test]
+    fn w716c_a_value_parameter_or_a_function_is_no_handler() {
+        let project = Project::new()
+            .file("go.mod", GO_MOD)
+            .file("api/system/dept.go", DEPT_API)
+            .file(
+                "internal/controller/dept.go",
+                "package controller\n\nimport (\n\t\"context\"\n\n\t\"example.com/app/api/system\"\n)\n\ntype ctl struct{}\n\nfunc (c *ctl) List(ctx context.Context, req *system.DeptSearchReq) (res *system.DeptSearchRes, err error) {\n\treturn\n}\n\nfunc validate(req *system.DeptSearchReq) error {\n\treturn nil\n}\n\nfunc (c *ctl) Add(ctx context.Context, req system.DeptAddReq) (res *system.DeptAddRes, err error) {\n\treturn\n}\n",
+            )
+            .index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            links(graph),
+            [
+                "GET /dept/list -> ctl::List (internal/controller/dept.go) requestType DeptSearchReq @internal/controller/dept.go:11 line 5"
+            ],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Several methods take the request type: a controller directory's wins
+    /// over a logic one's; among controller ones, the route's own addon
+    /// root's (core for core, the addon's for the addon; `addons/` is
+    /// re-included, as Godot's default skips it); two left link nothing.
+    #[test]
+    fn w716c_controller_directories_then_the_routes_addon_pick_the_handler() {
+        let add = |receiver: &str| {
+            format!(
+                "package dept\n\nimport (\n\t\"context\"\n\n\t\"example.com/app/api/system\"\n)\n\ntype {receiver} struct{{}}\n\nfunc (c *{receiver}) Add(ctx context.Context, req *system.DeptAddReq) (res *system.DeptAddRes, err error) {{\n\treturn\n}}\n"
+            )
+        };
+        let tiers = Project::new()
+            .file("go.mod", GO_MOD)
+            .file("api/system/dept.go", DEPT_API)
+            .file("internal/logic/dept.go", &add("sDept"))
+            .file("internal/controller/dept.go", &add("cDept"))
+            .index();
+        assert_eq!(
+            links(graph_of(&tiers)),
+            [
+                "POST /dept/add -> cDept::Add (internal/controller/dept.go) requestType DeptAddReq @internal/controller/dept.go:11 line 14"
+            ],
+            "{}",
+            graph_of(&tiers).report()
+        );
+        let config = "package config\n\nimport \"github.com/gogf/gf/v2/frame/g\"\n\ntype GetReq struct {\n\tg.Meta `path:\"/config/get\" method:\"get\"`\n}\ntype GetRes struct{}\n";
+        let get = |import: &str| {
+            format!(
+                "package admin\n\nimport (\n\t\"context\"\n\n\t\"{import}\"\n)\n\ntype cConfig struct{{}}\n\nfunc (c *cConfig) Get(ctx context.Context, req *config.GetReq) (res *config.GetRes, err error) {{\n\treturn\n}}\n"
+            )
+        };
+        let addons = Project::new()
+            .file(
+                ".codegraph/config.toml",
+                "[app]\nname = \"probe\"\n\n[indexing]\nignore_dirs = [\".godot\"]\n",
+            )
+            .file("go.mod", GO_MOD)
+            .file("api/admin/config/config.go", config)
+            .file("addons/hgexample/api/admin/config/config.go", config)
+            .file(
+                "internal/controller/admin/config.go",
+                &get("example.com/app/api/admin/config"),
+            )
+            .file(
+                "addons/hgexample/controller/admin/config.go",
+                &get("example.com/app/addons/hgexample/api/admin/config"),
+            )
+            .index();
+        assert_eq!(
+            links(graph_of(&addons)),
+            [
+                "GET /config/get -> cConfig::Get (addons/hgexample/controller/admin/config.go) requestType GetReq @addons/hgexample/controller/admin/config.go:11 line 5",
+                "GET /config/get -> cConfig::Get (internal/controller/admin/config.go) requestType GetReq @internal/controller/admin/config.go:11 line 5",
+            ],
+            "{}",
+            graph_of(&addons).report()
+        );
+        let core_route = graph_of(&addons).edges_matching(
+            "route api/admin/config/config.go::goframe-route:config.GetReq",
+            "calls",
+            "method cConfig::Get @internal/controller/admin/config.go",
+        );
+        assert_eq!(core_route.len(), 1, "{}", graph_of(&addons).report());
+        let two = Project::new()
+            .file("go.mod", GO_MOD)
+            .file("api/system/dept.go", DEPT_API)
+            .file("internal/controller/dept.go", &add("cDept"))
+            .file("internal/controller/v2/dept.go", &add("cDeptV2"))
+            .index();
+        assert_eq!(
+            links(graph_of(&two)),
+            Vec::<String>::new(),
+            "{}",
+            graph_of(&two).report()
+        );
+    }
+
+    /// OD-B16 (KEEP-RUST): the bare fallback leaves out a handler whose
+    /// qualified parameter is another route's request type. With `cash` and
+    /// `order` both declaring a `ListReq` route and only `order` handling
+    /// one, `GET /cash/list` reaches nothing (upstream reaches `order`'s);
+    /// without `order`'s route the handler is no other route's and the
+    /// fallback reaches it, as upstream's does.
+    #[test]
+    fn w716c_the_bare_fallback_leaves_out_a_handler_another_route_owns() {
+        let api = |module: &str, routed: bool| {
+            if routed {
+                format!(
+                    "package {module}\n\nimport \"github.com/gogf/gf/v2/frame/g\"\n\ntype ListReq struct {{\n\tg.Meta `path:\"/{module}/list\" method:\"get\"`\n}}\ntype ListRes struct{{}}\n"
+                )
+            } else {
+                format!(
+                    "package {module}\n\ntype ListReq struct {{\n\tPage int\n}}\ntype ListRes struct{{}}\n"
+                )
+            }
+        };
+        let handler = "package order\n\nimport (\n\t\"context\"\n\n\t\"example.com/app/api/order\"\n)\n\ntype corder struct{}\n\nfunc (c *corder) List(ctx context.Context, req *order.ListReq) (res *order.ListRes, err error) {\n\treturn\n}\n";
+        let owned = Project::new()
+            .file("go.mod", GO_MOD)
+            .file("api/cash/cash.go", &api("cash", true))
+            .file("api/order/order.go", &api("order", true))
+            .file("internal/controller/order/order.go", handler)
+            .index();
+        assert_eq!(
+            links(graph_of(&owned)),
+            [
+                "GET /order/list -> corder::List (internal/controller/order/order.go) requestType ListReq @internal/controller/order/order.go:11 line 5"
+            ],
+            "{}",
+            graph_of(&owned).report()
+        );
+        let unrouted = Project::new()
+            .file("go.mod", GO_MOD)
+            .file("api/cash/cash.go", &api("cash", true))
+            .file("api/order/order.go", &api("order", false))
+            .file("internal/controller/order/order.go", handler)
+            .index();
+        assert_eq!(
+            links(graph_of(&unrouted)),
+            [
+                "GET /cash/list -> corder::List (internal/controller/order/order.go) requestType ListReq @internal/controller/order/order.go:11 line 5"
+            ],
+            "{}",
+            graph_of(&unrouted).report()
+        );
+    }
+
+    /// The pass links at most 2000 routes (upstream `FANOUT_CAP`): 2001
+    /// routes each with its handler give 2000 edges, the last route none.
+    #[test]
+    fn w716c_the_pass_links_at_most_2000_routes() {
+        let mut api = String::from("package a\n\nimport \"github.com/gogf/gf/v2/frame/g\"\n\n");
+        let mut controller = String::from(
+            "package controller\n\nimport (\n\t\"context\"\n\n\t\"example.com/app/api/a\"\n)\n\ntype C struct{}\n\n",
+        );
+        for i in 0..2001 {
+            api.push_str(&format!(
+                "type R{i}Req struct {{\n\tg.Meta `path:\"/r{i}\"`\n}}\n"
+            ));
+            controller.push_str(&format!(
+                "func (c *C) H{i}(ctx context.Context, req *a.R{i}Req) (err error) {{\n\treturn\n}}\n"
+            ));
+        }
+        let project = Project::new()
+            .file("go.mod", GO_MOD)
+            .file("api/a/a.go", &api)
+            .file("internal/controller/c.go", &controller)
+            .index();
+        let graph = graph_of(&project);
+        let linked = links(graph);
+        assert_eq!(linked.len(), 2000, "{}", graph.report());
+        assert!(
+            !linked.iter().any(|link| link.starts_with("ANY /r2000 ")),
+            "{linked:#?}"
         );
     }
 }
