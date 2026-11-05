@@ -32889,3 +32889,370 @@ mod c_fnptr {
         serde_json::from_str(value).expect("the row is JSON")
     }
 }
+
+/// W7-16b: upstream's `vue-store-extraction.test.ts` and the extraction half
+/// of `rtk-query-synthesizer.test.ts` (`e8ddc4e2`), the sources as written
+/// there, and the cases the Rust port adds.
+mod vue_stores {
+    use super::support::{Graph, Project, graph_of};
+
+    /// The signature upstream's `extractRtkHookBindings` gives a hook.
+    const RTK_HOOK_SIGNATURE: &str = "= RTK Query generated hook";
+
+    /// How many function nodes are named `name`.
+    fn functions_named(graph: &Graph, name: &str) -> usize {
+        graph.nodes_named("function", name).len()
+    }
+
+    /// Upstream `vue-store-extraction.test.ts`, first case: a Vuex module's
+    /// `const mutations`/`const actions`, a Pinia options store's `actions`
+    /// and `getters`, and a Pinia setup store's local functions are function
+    /// nodes, and an action owns the calls written in it.
+    #[test]
+    fn w716b_store_members_are_function_nodes() {
+        let project = Project::new()
+            .file(
+                "userModule.js",
+                "import { persistToken } from './auth-utils';
+const state = { token: '' };
+const mutations = {
+  SET_TOKEN: (state, token) => { state.token = token; },
+};
+const actions = {
+  login({ commit }, info) {
+    persistToken(info.token);
+  },
+  async logout({ commit }) {
+    commit('SET_TOKEN', '');
+  },
+};
+export default { namespaced: true, state, mutations, actions };
+",
+            )
+            .file(
+                "auth-utils.js",
+                "export function persistToken(token) { return token; }
+",
+            )
+            .file(
+                "authStore.ts",
+                "import { defineStore } from 'pinia';
+export const useAuthStore = defineStore({
+  id: 'auth',
+  state: () => ({ name: '' }),
+  getters: {
+    upperName: state => state.name.toUpperCase(),
+  },
+  actions: {
+    async fetchMenu() { return loadMenu(); },
+    setName(n: string) { this.name = n; },
+  },
+});
+",
+            )
+            .file(
+                "chatStore.ts",
+                "import { defineStore } from 'pinia';
+export const useChatStore = defineStore('chat', () => {
+  const list = reactive([]);
+  const getList = async () => { return fetchList(); };
+  function pushItem(x) { list.push(x); }
+  return { list, getList, pushItem };
+});
+",
+            )
+            .index();
+        let graph = graph_of(&project);
+        for name in [
+            "login",
+            "logout",
+            "SET_TOKEN",
+            "fetchMenu",
+            "setName",
+            "upperName",
+            "getList",
+            "pushItem",
+        ] {
+            assert!(
+                functions_named(graph, name) > 0,
+                "{name}\n{}",
+                graph.report()
+            );
+        }
+        let login_calls: Vec<&str> = graph
+            .edges
+            .iter()
+            .filter(|edge| {
+                edge.kind == "calls"
+                    && graph
+                        .node(&edge.source)
+                        .is_some_and(|node| node.name == "login")
+            })
+            .filter_map(|edge| graph.node(&edge.target).map(|node| node.name.as_str()))
+            .collect();
+        assert!(login_calls.contains(&"persistToken"), "{}", graph.report());
+    }
+
+    /// Upstream `vue-store-extraction.test.ts`, second case: a `const
+    /// actions = {…}` in a file that is no store is an owned literal like any
+    /// other (`actions::doThing`), and nothing reads `actions[key]()` as a
+    /// call to one of its members.
+    #[test]
+    fn w716b_a_const_actions_outside_a_store_is_an_owned_literal() {
+        let project = Project::new()
+            .file(
+                "commands.js",
+                "const actions = {
+  doThing() { return 1; },
+  doOther() { return 2; },
+};
+export function run(key) { return actions[key](); }
+",
+            )
+            .index();
+        let graph = graph_of(&project);
+        let mut members: Vec<(&str, &str)> = graph
+            .nodes
+            .iter()
+            .filter(|node| node.name == "doThing" || node.name == "doOther")
+            .map(|node| (node.kind.as_str(), node.qualified_name.as_str()))
+            .collect();
+        members.sort();
+        assert_eq!(
+            members,
+            [
+                ("function", "actions::doOther"),
+                ("function", "actions::doThing")
+            ],
+            "{}",
+            graph.report()
+        );
+        let run = graph.nodes_matching("function run");
+        assert_eq!(run.len(), 1, "{}", graph.report());
+        assert!(
+            !graph
+                .edges
+                .iter()
+                .any(|edge| edge.kind == "calls" && edge.source == run[0].id),
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// The sources of upstream `rtk-query-synthesizer.test.ts`'s first case.
+    pub(super) fn rtk_project() -> Project {
+        Project::new()
+            .file(
+                "fiatRampApi.ts",
+                "import { createApi, fetchBaseQuery } from '@reduxjs/toolkit/query/react';
+import { fetchRamps } from './ramps';
+
+export const fiatRampApi = createApi({
+  reducerPath: 'fiatRampApi',
+  baseQuery: fetchBaseQuery({ baseUrl: '/' }),
+  endpoints: build => ({
+    getFiatRamps: build.query({
+      queryFn: async () => {
+        const data = await fetchRamps();
+        return { data };
+      },
+    }),
+    placeOrder: build.mutation({
+      query: body => ({ url: 'order', method: 'POST', body }),
+    }),
+  }),
+});
+
+export const { useGetFiatRampsQuery, usePlaceOrderMutation, useLazyGetFiatRampsQuery } = fiatRampApi;
+",
+            )
+            .file(
+                "dashApi.ts",
+                "import { createApi, fetchBaseQuery } from '@reduxjs/toolkit/query/react';
+import { makeCheckFn } from './factory';
+
+export const dashApi = createApi({
+  reducerPath: 'dash',
+  baseQuery: fetchBaseQuery({ baseUrl: '/' }),
+  endpoints(builder) {
+    return {
+      getDashboards: builder.query({
+        query() {
+          return '/dashboards';
+        },
+      }),
+      checkConnection: builder.mutation({
+        queryFn: makeCheckFn('/check'),
+      }),
+    };
+  },
+});
+
+export const { useGetDashboardsQuery, useCheckConnectionMutation } = dashApi;
+",
+            )
+            .file(
+                "Views.tsx",
+                "import { useGetFiatRampsQuery, useLazyGetFiatRampsQuery } from './fiatRampApi';
+import { useGetDashboardsQuery } from './dashApi';
+
+export function FiatForm() {
+  const { data } = useGetFiatRampsQuery();
+  return data;
+}
+export function DashList() {
+  const { data } = useGetDashboardsQuery();
+  return data;
+}
+export function LazyForm() {
+  const [load] = useLazyGetFiatRampsQuery();
+  return load;
+}
+",
+            )
+    }
+
+    /// Upstream `rtk-query-synthesizer.test.ts`, first case, the extraction
+    /// half: each endpoint is a function node named by its key, in the arrow,
+    /// method and factory forms; each generated hook a function node with the
+    /// sentinel signature; and a component reaches the hook it calls.
+    #[test]
+    fn w716b_rtk_endpoints_and_generated_hooks_are_function_nodes() {
+        let project = rtk_project().index();
+        let graph = graph_of(&project);
+        for name in [
+            "getFiatRamps",
+            "placeOrder",
+            "getDashboards",
+            "checkConnection",
+        ] {
+            assert_eq!(
+                functions_named(graph, name),
+                1,
+                "{name}\n{}",
+                graph.report()
+            );
+        }
+        let mut hooks: Vec<&str> = graph
+            .nodes
+            .iter()
+            .filter(|node| node.signature.as_deref() == Some(RTK_HOOK_SIGNATURE))
+            .map(|node| node.name.as_str())
+            .collect();
+        hooks.sort();
+        assert_eq!(
+            hooks,
+            [
+                "useCheckConnectionMutation",
+                "useGetDashboardsQuery",
+                "useGetFiatRampsQuery",
+                "useLazyGetFiatRampsQuery",
+                "usePlaceOrderMutation",
+            ],
+            "{}",
+            graph.report()
+        );
+        assert!(
+            !graph
+                .edges_matching(
+                    "function FiatForm",
+                    "calls",
+                    "function useGetFiatRampsQuery"
+                )
+                .is_empty(),
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream `rtk-query-synthesizer.test.ts`, second case, the extraction
+    /// half: a hand-written `use*Query` hook keeps its body and carries no
+    /// sentinel.
+    #[test]
+    fn w716b_a_hand_written_query_hook_is_no_generated_hook() {
+        let project = Project::new()
+            .file(
+                "useGetThingQuery.ts",
+                "export function getThing() { return 42; }
+export const useGetThingQuery = () => {
+  return getThing();
+};
+",
+            )
+            .file(
+                "Thing.tsx",
+                "import { useGetThingQuery } from './useGetThingQuery';
+export function Thing() {
+  return useGetThingQuery();
+}
+",
+            )
+            .index();
+        let graph = graph_of(&project);
+        assert!(
+            !graph
+                .nodes
+                .iter()
+                .any(|node| node.signature.as_deref() == Some(RTK_HOOK_SIGNATURE)),
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// A component's script block is read as a script of its own: a Pinia
+    /// store or a Vuex module written there has its members, and whether it
+    /// reads like a store is decided by the block's text, not the template's.
+    #[test]
+    fn w716b_a_components_script_holds_its_store() {
+        let project = Project::new()
+            .file(
+                "src/CartStore.vue",
+                "<template><div /></template>
+<script lang=\"ts\">
+import { defineStore } from 'pinia';
+export const useCart = defineStore('cart', {
+  actions: { add(item: string) { this.items.push(item); } },
+});
+export default {};
+</script>
+",
+            )
+            .file(
+                "src/UserModule.vue",
+                "<template><div /></template>
+<script>
+export default {
+  namespaced: true,
+  actions: { load() { return fetchUser(); } },
+};
+</script>
+",
+            )
+            .file(
+                "src/Plain.vue",
+                "<template><div>actions and getters</div></template>
+<script>
+export default {
+  mutations: { SET(state) { state.v = 1; } },
+};
+</script>
+",
+            )
+            .index();
+        let graph = graph_of(&project);
+        let add = graph.nodes_matching("function useCart::add");
+        assert_eq!(add.len(), 1, "{}", graph.report());
+        assert_eq!(add[0].file_path, "src/CartStore.vue");
+        assert_eq!(
+            graph.nodes_matching("function load").len(),
+            1,
+            "{}",
+            graph.report()
+        );
+        assert!(
+            graph.nodes_named("function", "SET").is_empty(),
+            "{}",
+            graph.report()
+        );
+    }
+}

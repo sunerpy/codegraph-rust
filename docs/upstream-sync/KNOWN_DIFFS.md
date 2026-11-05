@@ -610,6 +610,21 @@ listed.
   `make`); local-scope offsets are bytes, colby's UTF-16 code units
   (`dart_chains.rs`, `dart_prefixes.rs`, `dart_local_scope.rs`,
   `dart_scope.rs`).
+- **Store and RTK initializers (W7-16b).** A Vue store's or an RTK Query
+  api's initializer is walked as its declaration's, skipping only what became
+  a node: the store call, its wrappers, `state` and an endpoint's other
+  options keep their calls, as a Zustand store's do (#693, #1862). A Vuex
+  module's `export default {…}` is walked as before around its collections'
+  members. colby walks none of the initializer once it finds a collection or
+  an endpoint, and none of the statement once the file reads like a store
+  (`walker.rs`).
+- **Store and RTK member names (W7-16b).** A collection member or an
+  endpoint is named only by a static key (an identifier, or a string of
+  `[A-Za-z0-9_$]` without its quotes) and qualified under its declaration
+  (`useAuthStore::login`, `api::getPosts`); a `function*` value is a member
+  too. colby names any key by its text without quotes, so a computed
+  `[types.SET]` member is a node named `[types.SET]`, qualifies by the file
+  and skips a `function*` value (`walker.rs`).
 
 ### Path order, not index order
 

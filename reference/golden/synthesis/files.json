@@ -180,6 +180,42 @@
     "size": 296
   },
   {
+    "content_hash": "7aea459a5abc36ed54f322b623f0c3feca5be086acf79ad9b64c14e581d3b043",
+    "errors": null,
+    "generated": 0,
+    "language": "tsx",
+    "node_count": 3,
+    "path": "js/src/Posts.tsx",
+    "size": 204
+  },
+  {
+    "content_hash": "c8876b9b581188d4aa8b6cade6355520a8a24382cf1fbd31163c69f11285e4b1",
+    "errors": null,
+    "generated": 0,
+    "language": "typescript",
+    "node_count": 9,
+    "path": "js/src/api.ts",
+    "size": 550
+  },
+  {
+    "content_hash": "db75fc116a5836c4fd952bc4bc59798a224a77a182fde429ef612bc71628632e",
+    "errors": null,
+    "generated": 0,
+    "language": "javascript",
+    "node_count": 2,
+    "path": "js/src/app.js",
+    "size": 80
+  },
+  {
+    "content_hash": "70ce61774555bb92a7cefe2bf151dda12e136e8fee41f75467ee9376b4e1dd1e",
+    "errors": null,
+    "generated": 0,
+    "language": "typescript",
+    "node_count": 3,
+    "path": "js/src/cartConsumer.ts",
+    "size": 134
+  },
+  {
     "content_hash": "77603a7146b36ed50ba8da6e5d7f505ecf8672794f32a7320c176a064cda5385",
     "errors": null,
     "generated": 0,
@@ -193,9 +229,27 @@
     "errors": null,
     "generated": 0,
     "language": "typescript",
-    "node_count": 7,
+    "node_count": 8,
     "path": "js/src/store.ts",
     "size": 600
+  },
+  {
+    "content_hash": "6f7d029ff0ca0a8f28758186a3db3ebc04ca2f0759749b193360822b7d7a7149",
+    "errors": null,
+    "generated": 0,
+    "language": "javascript",
+    "node_count": 2,
+    "path": "js/src/store/auth.js",
+    "size": 56
+  },
+  {
+    "content_hash": "6aa3f2eb68592d32e9dd6e364640ec55baede7ad77771c0f6fdbce9d330ba7da",
+    "errors": null,
+    "generated": 0,
+    "language": "javascript",
+    "node_count": 4,
+    "path": "js/src/store/modules/user.js",
+    "size": 314
   },
   {
     "content_hash": "4b14a769015a917288c7fda05253bc44656b26200bf4170ca0d9a23a850cee1e",

@@ -62,6 +62,16 @@
   {
     "candidates": null,
     "col": 0,
+    "file_path": "js/src/api.ts",
+    "from_node_id": "file:js/src/api.ts",
+    "language": "typescript",
+    "line": 1,
+    "reference_kind": "imports",
+    "reference_name": "@reduxjs/toolkit/query/react"
+  },
+  {
+    "candidates": null,
+    "col": 0,
     "file_path": "js/src/events.js",
     "from_node_id": "file:js/src/events.js",
     "language": "javascript",
@@ -181,6 +191,26 @@
   },
   {
     "candidates": null,
+    "col": 13,
+    "file_path": "js/src/api.ts",
+    "from_node_id": "constant:ad1764c93db526d07dff60c7290e2f9f",
+    "language": "typescript",
+    "line": 14,
+    "reference_kind": "calls",
+    "reference_name": "build.mutation"
+  },
+  {
+    "candidates": null,
+    "col": 13,
+    "file_path": "js/src/api.ts",
+    "from_node_id": "constant:ad1764c93db526d07dff60c7290e2f9f",
+    "language": "typescript",
+    "line": 9,
+    "reference_kind": "calls",
+    "reference_name": "fetchBaseQuery"
+  },
+  {
+    "candidates": null,
     "col": 14,
     "file_path": "dispatch/app/Http/Registration.php",
     "from_node_id": "method:b8634218ad53bdcf252458f8e5eda333",
@@ -208,6 +238,16 @@
     "line": 25,
     "reference_kind": "calls",
     "reference_name": "append"
+  },
+  {
+    "candidates": null,
+    "col": 14,
+    "file_path": "js/src/api.ts",
+    "from_node_id": "constant:ad1764c93db526d07dff60c7290e2f9f",
+    "language": "typescript",
+    "line": 11,
+    "reference_kind": "calls",
+    "reference_name": "build.query"
   },
   {
     "candidates": null,
@@ -272,12 +312,42 @@
   {
     "candidates": null,
     "col": 2,
+    "file_path": "js/src/app.js",
+    "from_node_id": "function:2ff86be01a8b2c59d9961725b7675be9",
+    "language": "javascript",
+    "line": 2,
+    "reference_kind": "calls",
+    "reference_name": "store.dispatch"
+  },
+  {
+    "candidates": null,
+    "col": 2,
+    "file_path": "js/src/cartConsumer.ts",
+    "from_node_id": "function:ee3462990b2a34224b04f244a72ee6fc",
+    "language": "typescript",
+    "line": 5,
+    "reference_kind": "calls",
+    "reference_name": "cart.add"
+  },
+  {
+    "candidates": null,
+    "col": 2,
     "file_path": "js/src/events.js",
     "from_node_id": "function:4c075e5c6998bde068ac64c5129298c1",
     "language": "javascript",
     "line": 12,
     "reference_kind": "calls",
     "reference_name": "bus.emit"
+  },
+  {
+    "candidates": null,
+    "col": 20,
+    "file_path": "js/src/api.ts",
+    "from_node_id": "file:js/src/api.ts",
+    "language": "typescript",
+    "line": 1,
+    "reference_kind": "imports",
+    "reference_name": "fetchBaseQuery"
   },
   {
     "candidates": null,
@@ -308,6 +378,16 @@
     "line": 25,
     "reference_kind": "function_ref",
     "reference_name": "e.Handlers"
+  },
+  {
+    "candidates": null,
+    "col": 24,
+    "file_path": "js/src/api.ts",
+    "from_node_id": "constant:ad1764c93db526d07dff60c7290e2f9f",
+    "language": "typescript",
+    "line": 7,
+    "reference_kind": "calls",
+    "reference_name": "createApi"
   },
   {
     "candidates": null,
@@ -553,11 +633,21 @@
     "candidates": null,
     "col": 6,
     "file_path": "js/src/store.ts",
-    "from_node_id": "constant:9eff9be391067cb6961cb0e9edd413b4",
+    "from_node_id": "function:825165de277a437e25c783384e00019e",
     "language": "typescript",
     "line": 26,
     "reference_kind": "calls",
     "reference_name": "this.items.push"
+  },
+  {
+    "candidates": null,
+    "col": 6,
+    "file_path": "js/src/store/modules/user.js",
+    "from_node_id": "function:e7c89e2fb443031382d116eb825c639f",
+    "language": "javascript",
+    "line": 14,
+    "reference_kind": "calls",
+    "reference_name": "commit"
   },
   {
     "candidates": null,
@@ -618,6 +708,16 @@
     "line": 1,
     "reference_kind": "imports",
     "reference_name": "useState"
+  },
+  {
+    "candidates": null,
+    "col": 9,
+    "file_path": "js/src/api.ts",
+    "from_node_id": "file:js/src/api.ts",
+    "language": "typescript",
+    "line": 1,
+    "reference_kind": "imports",
+    "reference_name": "createApi"
   },
   {
     "candidates": null,

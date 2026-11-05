@@ -16974,6 +16974,84 @@ pub fn php_laravel_listen_map_gains_a_listener() -> Case {
         )
 }
 
+/// W7-16b: a Pinia options store's `actions` gains a member, which calls a
+/// function of another file; the member is a node of its own that owns the
+/// call, and an unchanged file's call of its name reaches it.
+pub fn ts_pinia_options_store_gains_an_action() -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript])
+        .file(
+            "lib.ts",
+            "export function track(item: string) { return item; }\nexport function clearAll() { return []; }\n",
+        )
+        .file("other.ts", "export function wipe() { return reset(); }\n")
+        .file(
+            "store.ts",
+            "import { defineStore } from 'pinia';\nimport { track } from './lib';\nexport const useCartStore = defineStore('cart', {\n  actions: {\n    add(item: string) { track(item); },\n  },\n});\n",
+        )
+        .write(
+            "store.ts",
+            "import { defineStore } from 'pinia';\nimport { track, clearAll } from './lib';\nexport const useCartStore = defineStore('cart', {\n  actions: {\n    add(item: string) { track(item); },\n    reset() { clearAll(); },\n  },\n});\n",
+        )
+        .edge_before("function useCartStore::add", "calls", "function track")
+        .edge_after("function useCartStore::reset", "calls", "function clearAll")
+        .edge_after("function wipe", "calls", "function useCartStore::reset")
+}
+
+/// W7-16b: the api file's destructuring gains the RTK Query hook an
+/// unchanged component already imports and calls; the call reaches the hook.
+pub fn ts_rtk_api_gains_a_hook_binding() -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript, Language::Tsx])
+        .file(
+            "api.ts",
+            "import { createApi } from '@reduxjs/toolkit/query/react';\nexport const api = createApi({\n  endpoints: (build) => ({\n    getPosts: build.query({ query: () => '/posts' }),\n    getUser: build.query({ query: () => '/user' }),\n  }),\n});\nexport const { useGetPostsQuery } = api;\n",
+        )
+        .file(
+            "Profile.tsx",
+            "import { useGetUserQuery } from './api';\nexport function Profile() {\n  return useGetUserQuery();\n}\n",
+        )
+        .write(
+            "api.ts",
+            "import { createApi } from '@reduxjs/toolkit/query/react';\nexport const api = createApi({\n  endpoints: (build) => ({\n    getPosts: build.query({ query: () => '/posts' }),\n    getUser: build.query({ query: () => '/user' }),\n  }),\n});\nexport const { useGetPostsQuery, useGetUserQuery } = api;\n",
+        )
+        .named_before("function", "useGetPostsQuery")
+        .edge_after("function Profile", "calls", "function useGetUserQuery @api.ts")
+}
+
+/// W7-16b: a module's default export gains a second store word, so the file
+/// reads like a Vuex store; its `actions` member becomes a node that owns the
+/// call the file made before.
+pub fn js_vuex_module_becomes_a_store_file() -> Case {
+    Case::new(Change::BodyEdit, &[Language::JavaScript])
+        .file("api.js", "export function apiLogin(info) { return info; }\n")
+        .file(
+            "store/user.js",
+            "import { apiLogin } from '../api';\nexport default {\n  actions: {\n    login(context, info) { apiLogin(info); },\n  },\n};\n",
+        )
+        .write(
+            "store/user.js",
+            "import { apiLogin } from '../api';\nexport default {\n  namespaced: true,\n  actions: {\n    login(context, info) { apiLogin(info); },\n  },\n};\n",
+        )
+        .edge_before("file:store/user.js", "calls", "function apiLogin")
+        .edge_after("function login @store/user.js", "calls", "function apiLogin")
+}
+
+/// W7-16b: an RTK Query endpoint's key is renamed; the endpoint node follows
+/// with the call its handler makes.
+pub fn ts_rtk_endpoint_key_is_renamed() -> Case {
+    Case::new(Change::RenameSymbol, &[Language::TypeScript])
+        .file("fetchers.ts", "export function fetchPosts() { return []; }\n")
+        .file(
+            "api.ts",
+            "import { createApi } from '@reduxjs/toolkit/query/react';\nimport { fetchPosts } from './fetchers';\nexport const api = createApi({\n  endpoints: (build) => ({\n    getPosts: build.query({ queryFn: () => fetchPosts() }),\n  }),\n});\n",
+        )
+        .write(
+            "api.ts",
+            "import { createApi } from '@reduxjs/toolkit/query/react';\nimport { fetchPosts } from './fetchers';\nexport const api = createApi({\n  endpoints: (build) => ({\n    listPosts: build.query({ queryFn: () => fetchPosts() }),\n  }),\n});\n",
+        )
+        .edge_before("function api::getPosts", "calls", "function fetchPosts")
+        .edge_after("function api::listPosts", "calls", "function fetchPosts")
+}
+
 /// W7-17a: a C table gains an entry; the dispatch in another file, unchanged,
 /// reaches it.
 pub fn c_fnptr_table_gains_an_entry() -> Case {
