@@ -1,7 +1,7 @@
 //! Where a Swift reference to a type may land (upstream #2107,
 //! `swift-type-visibility.ts` in the shape at `b635dd46`: its non-dispatch
-//! half; the protocol-extension dispatch is W7-18's and the type-path calls
-//! W4-SW-02's).
+//! half; the protocol-extension dispatch is the interface-override pass's,
+//! `synthesis/iface.rs` (W7-14c), and the type-path calls W4-SW-02's).
 //!
 //! Two shapes bound type references to the wrong node:
 //!

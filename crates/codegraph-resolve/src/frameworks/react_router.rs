@@ -19,7 +19,8 @@
 //!    `navigate(\`/cart/${id}\`)`, `router.navigate(…)`, `redirect('/login')`:
 //!    [`ReactRouterResolver::resolve`] reads the argument, matches it against
 //!    the routes of the calling file's app and returns a `navigates` edge
-//!    carrying the href. `<Link to>` is markup, not a call.
+//!    carrying the href. `<Link to>` is markup, not a call: the link pass
+//!    reads it through [`react_router_link_routes`] (`synthesis/links.rs`).
 //!
 //! What a `lazy` loader renders is [`super::lazy_loader`]'s to read. The
 //! scanner also reads, with `uses`, where a file hands the router a table
@@ -39,8 +40,8 @@ use super::framework_node;
 use super::js_scan::{self, JS_SPACE, is_js_space, js_trim, match_bracket, skip_string};
 use super::lazy_loader;
 use super::route_href::{
-    ExactTable, RouteEntry, destinations_for_href, first_argument_text, parse_href_expression,
-    read_href_via_local,
+    ExactTable, HrefLiteral, LinkRoutes, RouteEntry, destinations_for_href, first_argument_text,
+    parse_href_expression, read_href_via_local,
 };
 use crate::framework::{FrameworkResolver, NavigationCalls};
 use crate::import_resolver::resolve_import_path;
@@ -2415,6 +2416,31 @@ fn react_router_table(context: &dyn ResolutionContext) -> Arc<ReactRouterTable> 
     context
         .route_tables()
         .get_or_build("react-router", || ReactRouterTable::build(context))
+}
+
+impl LinkRoutes for ReactRouterTable {
+    fn is_empty(&self) -> bool {
+        self.by_root.is_empty()
+    }
+
+    fn serves(&self, file: &str) -> bool {
+        self.app_of(file).is_some_and(|app| !app.exact.is_empty())
+    }
+
+    fn destinations<'h>(
+        &self,
+        file: &str,
+        href: &'h HrefLiteral,
+    ) -> Vec<(Arc<Node>, &'h HrefLiteral)> {
+        self.app_of(file).map_or_else(Vec::new, |app| {
+            destinations_for_href(href, &app.exact, &app.dynamic, file)
+        })
+    }
+}
+
+/// The React Router routes a `<Link to>` reaches, in its own app (W7-18a).
+pub(crate) fn react_router_link_routes(context: &dyn ResolutionContext) -> Arc<dyn LinkRoutes> {
+    react_router_table(context)
 }
 
 // =============================================================================

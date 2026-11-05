@@ -20007,6 +20007,95 @@ mod nextjs {
         assert_eq!(guard["navMethod"], "response.redirect");
     }
 
+    /// The `navigates` edges out of the one node `source` selects, each as
+    /// its target's name and its metadata, by target.
+    fn navigations_of(graph: &Graph, source: &str) -> Vec<(String, serde_json::Value)> {
+        let from = graph.nodes_matching(source);
+        assert_eq!(from.len(), 1, "{source}\n{}", graph.report());
+        let mut out: Vec<(String, serde_json::Value)> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.kind == "navigates" && edge.source == from[0].id)
+            .map(|edge| {
+                (
+                    graph
+                        .node(&edge.target)
+                        .map_or_else(String::new, |node| node.name.clone()),
+                    edge.metadata.clone(),
+                )
+            })
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    /// Upstream `nextjs.test.ts` ("a <Link href> and an internal <a href>
+    /// navigate from the component that renders them; an external one does
+    /// not", W7-18a): `Home`'s `<Link href="/users">` and `<a href="/login">`
+    /// draw one heuristic `navigates` edge each from `Home` to the page, with
+    /// the href, `navMethod` `link` or `a` and where the link is written; the
+    /// external `<a href>` draws none, and `UserPage`'s `<a href="/users">`
+    /// reaches `/users`.
+    #[test]
+    fn w718a_a_link_and_an_internal_anchor_navigate_from_their_component() {
+        let project = site().index();
+        let graph = project.graph();
+        let home = navigations_of(graph, "function Home");
+        let routes: Vec<&str> = home.iter().map(|(route, _)| route.as_str()).collect();
+        assert_eq!(routes, ["/login", "/users"], "{}", graph.report());
+        assert_eq!(
+            home[1].1,
+            serde_json::json!({
+                "synthesizedBy": "next-link",
+                "href": "/users",
+                "navMethod": "link",
+                "registeredAt": "app/page.tsx:5",
+            }),
+            "{}",
+            graph.report()
+        );
+        assert_eq!(home[0].1["navMethod"], "a");
+        assert_eq!(home[0].1["href"], "/login");
+        let users = graph.edges_matching(
+            "function Home",
+            "navigates",
+            "route app/users/page.tsx::route:/users",
+        );
+        assert_eq!(users.len(), 1, "{}", graph.report());
+        assert_eq!(users[0].provenance.as_deref(), Some("heuristic"));
+        let user_page: Vec<String> = navigations_of(graph, "function UserPage")
+            .into_iter()
+            .map(|(route, _)| route)
+            .collect();
+        assert_eq!(user_page, ["/users"], "{}", graph.report());
+    }
+
+    /// W7-18a (KEEP-RUST, OD-B10): a link names a page only with a
+    /// destination starting with `/`, a `<Link href>` as an `<a href>`.
+    /// Upstream skips an external `<a href>` only, and its table reads an
+    /// absolute URL's path, so a `<Link href="https://…/">` reached the
+    /// site's own `/`.
+    #[test]
+    fn keep_rust_w718a_an_external_link_href_reaches_no_page() {
+        let project = Project::new()
+            .file("package.json", SITE_PACKAGE)
+            .file(
+                "app/page.tsx",
+                "import Link from 'next/link'\nexport default function Home() {\n  return (\n    <main>\n      <Link href=\"https://codedthemes.com/\">Theme</Link>\n      <Link href=\"mailto:team@example.com\">Mail</Link>\n      <a href=\"https://example.com/about\">Elsewhere</a>\n      <Link href=\"/about\">About</Link>\n    </main>\n  )\n}\n",
+            )
+            .file(
+                "app/about/page.tsx",
+                "export default function About() {\n  return null\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        let home: Vec<String> = navigations_of(graph, "function Home")
+            .into_iter()
+            .map(|(route, _)| route)
+            .collect();
+        assert_eq!(home, ["/about"], "{}", graph.report());
+    }
+
     /// Upstream #2129 (`monorepo-app-frameworks.test.ts`), the Next.js
     /// halves: Next reads only the app whose package.json names `next` (a
     /// `src/pages/` file of the Expo app is no page), and its layouts,
@@ -20204,7 +20293,12 @@ mod expo_router {
 
     /// Upstream F2 (`expo-router.test.ts`, end to end): every screen file is
     /// a route that calls its component; a navigation call reaches the
-    /// screen its href names, with the href and the verb.
+    /// screen its href names, with the href and the verb. The synthesis
+    /// pass (W7-18a): `router.replace(await resolvePostLoginRoute())` makes
+    /// the helper's return literals its screens, one edge from the helper to
+    /// each with the push site and the literal's own column; the literals of
+    /// its return type are not read, and `apiPath`, which no navigation
+    /// consumes, is never read.
     #[test]
     fn f2_a_navigation_call_navigates_to_the_screen_its_href_names() {
         let project = Project::new()
@@ -20240,6 +20334,14 @@ mod expo_router {
                 "src/components/item-card.tsx",
                 "import { openObjectDetail } from '../services/nav'\nexport function ItemCard(props: { item: { id: string }; collected: boolean }) {\n  const handlePress = () => {\n    if (props.collected) openObjectDetail(props.item)\n  }\n  return handlePress\n}\n",
             )
+            .file(
+                "src/services/post-login.ts",
+                "export const resolvePostLoginRoute = async (): Promise<\n  '/welcome/' | '/'\n> => {\n  return (await seen()) ? '/' : '/welcome/'\n}\nasync function seen() { return true }\nexport function apiPath() { return '/api/users' }\n",
+            )
+            .file(
+                "src/services/login.ts",
+                "import { router } from 'expo-router'\nimport { resolvePostLoginRoute, apiPath } from './post-login'\nexport async function finishLogin() {\n  router.replace(await resolvePostLoginRoute())\n}\nexport function fetchUsers() { return fetch(apiPath()) }\n",
+            )
             .index();
         let graph = project.graph();
         assert_eq!(
@@ -20271,6 +20373,46 @@ mod expo_router {
             "function openItem",
             "route src/app/item/[id].tsx::route:/item/[id]",
         );
+        let returned = |name: &str| -> Vec<(String, &super::support::EdgeRow)> {
+            let from = graph.nodes_named("function", name);
+            assert_eq!(from.len(), 1, "function {name}\n{}", graph.report());
+            let mut edges: Vec<(String, &super::support::EdgeRow)> = graph
+                .edges
+                .iter()
+                .filter(|edge| edge.kind == "navigates" && edge.source == from[0].id)
+                .map(|edge| {
+                    (
+                        graph
+                            .node(&edge.target)
+                            .map_or_else(String::new, |node| node.name.clone()),
+                        edge,
+                    )
+                })
+                .collect();
+            edges.sort_by(|a, b| a.0.cmp(&b.0));
+            edges
+        };
+        let helper = returned("resolvePostLoginRoute");
+        let screens: Vec<&str> = helper.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(screens, ["/", "/welcome"], "{}", graph.report());
+        for (_, edge) in &helper {
+            assert_eq!(edge.provenance.as_deref(), Some("heuristic"));
+            assert_eq!(edge.metadata["synthesizedBy"], "expo-router-return");
+            assert_eq!(edge.metadata["registeredAt"], "src/services/login.ts:4");
+            assert_eq!(edge.metadata["navMethod"], "replace");
+        }
+        assert_eq!(helper[0].1.metadata["href"], "/");
+        assert_eq!(helper[1].1.metadata["href"], "/welcome/");
+        // The two arms share line 4; each edge keeps its literal's column.
+        assert_eq!((helper[0].1.line, helper[0].1.col), (Some(4), Some(26)));
+        assert_eq!((helper[1].1.line, helper[1].1.col), (Some(4), Some(32)));
+        graph.assert_edge(
+            "function finishLogin",
+            "calls",
+            "function resolvePostLoginRoute",
+            None,
+        );
+        assert!(returned("apiPath").is_empty(), "{}", graph.report());
     }
 
     /// Upstream #2129 (`monorepo-app-frameworks.test.ts`), the Expo halves:
@@ -20701,6 +20843,327 @@ mod react_router {
         assert_eq!(
             navigations(graph),
             ["LoginScreen -> / (push /) react-router"],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// The `navigates` edges [`navigations`] lists out of the nodes named
+    /// `name`.
+    fn navigations_from(graph: &Graph, name: &str) -> Vec<String> {
+        let prefix = format!("{name} -> ");
+        navigations(graph)
+            .into_iter()
+            .filter(|line| line.starts_with(&prefix))
+            .collect()
+    }
+
+    /// Upstream F4 (`react-router.test.ts`, "a routed app end to end"), the
+    /// link half (W7-18a): `LoginScreen`'s `<Link to>`, and `CheckoutSteps`'
+    /// `<LinkContainer to>` and `<NavLink to>`, navigate from the component
+    /// that renders them, `/cart` reaching `/cart/:id?`; the external `<a
+    /// href>` draws none, the computed `history.push(redirect)` stays
+    /// unresolved, and an array's `push` is never claimed.
+    #[test]
+    fn w718a_link_navlink_and_link_container_navigate_from_their_component() {
+        let project = Project::new()
+            .file("package.json", "{\"name\":\"shop\",\"private\":true}\n")
+            .file(
+                "frontend/package.json",
+                "{\"name\":\"frontend\",\"dependencies\":{\"react\":\"18\",\"react-router-dom\":\"5\",\"react-router-bootstrap\":\"0.26\"}}\n",
+            )
+            .file(
+                "frontend/src/App.js",
+                "import { BrowserRouter as Router, Route } from 'react-router-dom'\nimport LoginScreen from './screens/LoginScreen'\nimport ShippingScreen from './screens/ShippingScreen'\nimport PaymentScreen from './screens/PaymentScreen'\nimport PlaceOrderScreen from './screens/PlaceOrderScreen'\nimport ProductScreen from './screens/ProductScreen'\nimport CartScreen from './screens/CartScreen'\nconst App = () => (\n  <Router>\n    <Route path='/login' component={LoginScreen} />\n    <Route path='/shipping' component={ShippingScreen} />\n    <Route path='/payment' component={PaymentScreen} />\n    <Route path='/placeorder' component={PlaceOrderScreen} />\n    <Route path='/product/:id' component={ProductScreen} />\n    <Route path='/cart/:id?' component={CartScreen} />\n  </Router>\n)\nexport default App\n",
+            )
+            .file(
+                "frontend/src/screens/PaymentScreen.js",
+                "import React, { useState } from 'react'\nimport { useDispatch, useSelector } from 'react-redux'\nimport CheckoutSteps from '../components/CheckoutSteps'\nimport { savePaymentMethod } from '../actions/cartActions'\nconst PaymentScreen = ({ history }) => {\n  const cart = useSelector((state) => state.cart)\n  const { shippingAddress } = cart\n  if (!shippingAddress.address) {\n    history.push('/shipping')\n  }\n  const [paymentMethod, setPaymentMethod] = useState('PayPal')\n  const dispatch = useDispatch()\n  const submitHandler = (e) => {\n    e.preventDefault()\n    dispatch(savePaymentMethod(paymentMethod))\n    history.push('/placeorder')\n  }\n  return <form onSubmit={submitHandler}><CheckoutSteps step1 step2 step3 /></form>\n}\nexport default PaymentScreen\n",
+            )
+            .file(
+                "frontend/src/screens/LoginScreen.js",
+                "import React, { useEffect } from 'react'\nimport { Link } from 'react-router-dom'\nconst LoginScreen = ({ location, history, userInfo }) => {\n  const redirect = location.search ? location.search.split('=')[1] : '/'\n  useEffect(() => {\n    if (userInfo) {\n      history.push(redirect)\n    }\n  }, [history, userInfo, redirect])\n  return <Link to='/shipping'>Continue</Link>\n}\nexport default LoginScreen\n",
+            )
+            .file(
+                "frontend/src/screens/ShippingScreen.js",
+                "import React from 'react'\nconst ShippingScreen = ({ history }) => {\n  const submitHandler = () => {\n    history.replace('/payment')\n  }\n  return <form onSubmit={submitHandler} />\n}\nexport default ShippingScreen\n",
+            )
+            .file(
+                "frontend/src/screens/PlaceOrderScreen.js",
+                "import React from 'react'\nconst PlaceOrderScreen = () => <div>Order</div>\nexport default PlaceOrderScreen\n",
+            )
+            .file(
+                "frontend/src/screens/ProductScreen.js",
+                "import React from 'react'\nimport { useNavigate } from 'react-router-dom'\nconst ProductScreen = ({ match }) => {\n  const navigate = useNavigate()\n  const addToCart = () => {\n    navigate(`/cart/${match.params.id}`)\n  }\n  return <button onClick={addToCart}>Add</button>\n}\nexport default ProductScreen\n",
+            )
+            .file(
+                "frontend/src/screens/CartScreen.js",
+                "import React from 'react'\nconst CartScreen = () => <div>Cart</div>\nexport default CartScreen\n",
+            )
+            .file(
+                "frontend/src/components/CheckoutSteps.js",
+                "import React from 'react'\nimport { NavLink } from 'react-router-dom'\nimport { LinkContainer } from 'react-router-bootstrap'\nconst CheckoutSteps = ({ step1, step2 }) => (\n  <nav>\n    <LinkContainer to='/cart'><span>Cart</span></LinkContainer>\n    {step1 ? <LinkContainer to='/login'><span>Sign In</span></LinkContainer> : null}\n    {step2 ? <NavLink to='/placeorder'>Place Order</NavLink> : null}\n    <a href='https://example.com'>Elsewhere</a>\n  </nav>\n)\nexport default CheckoutSteps\n",
+            )
+            .file(
+                "frontend/src/actions/cartActions.js",
+                "export const savePaymentMethod = (data) => (dispatch) => {\n  dispatch({ type: 'CART_SAVE_PAYMENT_METHOD', payload: data })\n  localStorage.setItem('paymentMethod', JSON.stringify(data))\n}\n",
+            )
+            .file(
+                "frontend/src/utils/breadcrumbs.js",
+                "export const trail = () => {\n  const paths = []\n  paths.push('/placeorder')\n  return paths\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        let report = graph.report();
+        assert_eq!(
+            navigations_from(graph, "LoginScreen"),
+            ["LoginScreen -> /shipping (link /shipping) ?"],
+            "{report}"
+        );
+        let link = graph.edges_matching(
+            "function LoginScreen",
+            "navigates",
+            "route frontend/src/App.js::route:/shipping",
+        );
+        assert_eq!(link.len(), 1, "{report}");
+        assert_eq!(link[0].provenance.as_deref(), Some("heuristic"));
+        assert_eq!(link[0].metadata["synthesizedBy"], "react-router-link");
+        assert_eq!(
+            navigations_from(graph, "CheckoutSteps"),
+            [
+                "CheckoutSteps -> /cart/:id? (link /cart) ?",
+                "CheckoutSteps -> /login (link /login) ?",
+                "CheckoutSteps -> /placeorder (link /placeorder) ?",
+            ],
+            "{report}"
+        );
+        graph.assert_unresolved("function LoginScreen", "calls", "history.push");
+        assert!(navigations_from(graph, "trail").is_empty(), "{report}");
+    }
+
+    /// Upstream "the shapes proshop is written in", the link half (W7-18a):
+    /// a `to={cond ? … : …}` is read with a navigation call's reader, both
+    /// arms naming `/register` and the edge keeping the arm as written; the
+    /// three-way choice draws all three routes, each edge with the arm it
+    /// took; a template hole reaches the `:id` route. `history.push(redirect)`
+    /// reaches `/` through the resolver, its literal arm.
+    #[test]
+    fn w718a_a_link_destination_written_as_a_choice_draws_each_arm() {
+        let project = Project::new()
+            .file(
+                "package.json",
+                "{\"name\":\"shop\",\"dependencies\":{\"react\":\"18\",\"react-router-dom\":\"5\"}}\n",
+            )
+            .file(
+                "src/App.js",
+                "import { BrowserRouter as Router, Route } from 'react-router-dom'\nimport HomeScreen from './screens/HomeScreen'\nimport LoginScreen from './screens/LoginScreen'\nimport RegisterScreen from './screens/RegisterScreen'\nimport ProductScreen from './screens/ProductScreen'\nconst App = () => (\n  <Router>\n    <Route path='/search/:keyword' component={HomeScreen} exact />\n    <Route path='/page/:pageNumber' component={HomeScreen} exact />\n    <Route path='/' component={HomeScreen} exact />\n    <Route path='/login' component={LoginScreen} />\n    <Route path='/register' component={RegisterScreen} />\n    <Route path='/product/:id' component={ProductScreen} />\n  </Router>\n)\nexport default App\n",
+            )
+            .file(
+                "src/screens/HomeScreen.js",
+                "import React from 'react'\nimport { Link } from 'react-router-dom'\nconst HomeScreen = ({ match }) => {\n  const keyword = match.params.keyword\n  return <Link to={`/product/${keyword}`}>A product</Link>\n}\nexport default HomeScreen\n",
+            )
+            .file(
+                "src/screens/LoginScreen.js",
+                "import React, { useEffect } from 'react'\nimport { Link } from 'react-router-dom'\nconst LoginScreen = ({ location, history, userInfo }) => {\n  const redirect = location.search ? location.search.split('=')[1] : '/'\n  useEffect(() => {\n    if (userInfo) {\n      history.push(redirect)\n    }\n  }, [history, userInfo, redirect])\n  return (\n    <Link to={redirect ? `/register?redirect=${redirect}` : '/register'}>Register</Link>\n  )\n}\nexport default LoginScreen\n",
+            )
+            .file(
+                "src/screens/RegisterScreen.js",
+                "import React from 'react'\nconst RegisterScreen = () => <div>Register</div>\nexport default RegisterScreen\n",
+            )
+            .file(
+                "src/components/Paginate.js",
+                "import React from 'react'\nimport { Link } from 'react-router-dom'\nconst Paginate = ({ isAdmin, keyword, x }) => (\n  <Link\n    to={\n      !isAdmin\n        ? keyword\n          ? `/search/${keyword}`\n          : `/page/${x}`\n        : '/register'\n    }\n  >\n    {x}\n  </Link>\n)\nexport default Paginate\n",
+            )
+            .file(
+                "src/screens/ProductScreen.js",
+                "import React from 'react'\nconst ProductScreen = () => <div>Product</div>\nexport default ProductScreen\n",
+            )
+            .index();
+        let graph = project.graph();
+        assert_eq!(
+            navigations(graph),
+            strings(&[
+                "HomeScreen -> /product/:id (link /product/${…}) ?",
+                "LoginScreen -> / (push /) react-router",
+                "LoginScreen -> /register (link /register?redirect=${…}) ?",
+                "Paginate -> /page/:pageNumber (link /page/${…}) ?",
+                "Paginate -> /register (link /register) ?",
+                "Paginate -> /search/:keyword (link /search/${…}) ?",
+            ]),
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream "v5 redirects and styled link wrappers" (#2132, W7-18a): a
+    /// `styled(Link)` default export imported under another name, and a
+    /// `styled(NavLink)` declared in the file, are links; v5's `<Redirect
+    /// to>` in a guard navigates with `navMethod` `redirect`.
+    #[test]
+    fn w718a_pr2132_v5_redirects_and_styled_link_wrappers_navigate() {
+        let project = Project::new()
+            .file(
+                "package.json",
+                "{\"name\":\"app\",\"dependencies\":{\"react\":\"*\",\"react-router-dom\":\"^5.0.0\",\"styled-components\":\"*\"}}\n",
+            )
+            .file(
+                "app/components/Header/HeaderLink.js",
+                "import { Link } from 'react-router-dom';\nimport styled from 'styled-components';\n\nexport default styled(Link)`\n  color: #41addd;\n`;\n",
+            )
+            .file(
+                "app/components/Header/index.js",
+                "import React from 'react';\nimport HeaderLink from './HeaderLink';\n\nexport default function Header() {\n  return (\n    <nav>\n      <HeaderLink to=\"/\">Home</HeaderLink>\n      <HeaderLink to=\"/features\">Features</HeaderLink>\n    </nav>\n  );\n}\n",
+            )
+            .file(
+                "app/components/Nav.js",
+                "import React from 'react';\nimport { NavLink } from 'react-router-dom';\nimport styled from 'styled-components';\n\nconst MenuLink = styled(NavLink)`\n  padding: 4px;\n`;\n\nexport default function Nav() {\n  return <MenuLink to=\"/features\">Features</MenuLink>;\n}\n",
+            )
+            .file(
+                "app/router/PrivateRoute.js",
+                "import React from 'react';\nimport { Route, Redirect } from 'react-router-dom';\n\nexport default function PrivateRoute({ component: Component, ...rest }) {\n  return <Route {...rest} render={(props) => (rest.isAuthenticated ? <Component {...props} /> : <Redirect to=\"/\" />)} />;\n}\n",
+            )
+            .file(
+                "app/containers/App.js",
+                "import React from 'react';\nimport { Switch, Route } from 'react-router-dom';\nimport HomePage from './HomePage';\nimport FeaturePage from './FeaturePage';\n\nexport default function App() {\n  return (\n    <Switch>\n      <Route exact path=\"/\" component={HomePage} />\n      <Route path=\"/features\" component={FeaturePage} />\n    </Switch>\n  );\n}\n",
+            )
+            .file(
+                "app/containers/HomePage.js",
+                "import React from 'react';\nexport default function HomePage() { return <h1>Home</h1>; }\n",
+            )
+            .file(
+                "app/containers/FeaturePage.js",
+                "import React from 'react';\nexport default function FeaturePage() { return <h1>Features</h1>; }\n",
+            )
+            .index();
+        let graph = project.graph();
+        assert_eq!(
+            navigations(graph),
+            strings(&[
+                "Header -> / (link /) ?",
+                "Header -> /features (link /features) ?",
+                "Nav -> /features (link /features) ?",
+                "PrivateRoute -> / (redirect /) ?",
+            ]),
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream `react-router-config-href.test.ts`, the link's half (#2187,
+    /// W7-18a): `<Link to={paths.app.discussion.getHref(d.id)}>` reads the
+    /// href the route-config helper returns, past an arrow attribute before
+    /// `to`, its whole-segment `${id}` a parameter. The constants come
+    /// through the project's `@/*` alias.
+    #[test]
+    fn w718a_pr2187_a_link_reads_a_route_config_href() {
+        let project = Project::new()
+            .file(
+                "package.json",
+                "{\"name\":\"web\",\"dependencies\":{\"react\":\"^18\",\"react-router\":\"^7\"}}\n",
+            )
+            .file(
+                "tsconfig.json",
+                "{\"compilerOptions\":{\"baseUrl\":\".\",\"paths\":{\"@/*\":[\"./src/*\"]}}}\n",
+            )
+            .file(
+                "src/config/paths.ts",
+                "export const paths = {\n  auth: {\n    login: {\n      path: '/auth/login',\n      getHref: (redirectTo?: string | null | undefined) =>\n        `/auth/login${redirectTo ? `?redirectTo=${encodeURIComponent(redirectTo)}` : ''}`,\n    },\n  },\n  app: {\n    root: { path: '/app', getHref: () => '/app' },\n    discussions: { path: 'discussions', getHref: () => '/app/discussions' },\n    discussion: {\n      path: 'discussions/:discussionId',\n      getHref: (id: string) => `/app/discussions/${id}`,\n    },\n  },\n} as const;\n",
+            )
+            .file(
+                "src/app/router.tsx",
+                "import { createBrowserRouter } from 'react-router';\nimport { paths } from '@/config/paths';\n\nexport const router = createBrowserRouter([\n  { path: paths.auth.login.path, lazy: () => import('./routes/auth/login') },\n  {\n    path: paths.app.root.path,\n    lazy: () => import('./routes/app/root'),\n    children: [\n      { path: paths.app.discussions.path, lazy: () => import('./routes/app/discussions') },\n      { path: paths.app.discussion.path, lazy: () => import('./routes/app/discussion') },\n    ],\n  },\n]);\n",
+            )
+            .file(
+                "src/app/routes/auth/login.tsx",
+                "export default function LoginRoute() { return null; }\n",
+            )
+            .file(
+                "src/app/routes/app/root.tsx",
+                "export default function AppRoot() { return null; }\n",
+            )
+            .file(
+                "src/app/routes/app/discussions.tsx",
+                "export default function DiscussionsRoute() { return null; }\n",
+            )
+            .file(
+                "src/app/routes/app/discussion.tsx",
+                "export default function DiscussionRoute() { return null; }\n",
+            )
+            .file(
+                "src/features/discussions/discussions-list.tsx",
+                "import { Link } from 'react-router';\nimport { paths } from '@/config/paths';\n\nexport function DiscussionsList({ items, prefetch }: { items: { id: string }[]; prefetch: (id: string) => void }) {\n  return items.map((d) => (\n    <Link onMouseEnter={() => prefetch(d.id)} to={paths.app.discussion.getHref(d.id)}>\n      open\n    </Link>\n  ));\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        assert_eq!(
+            navigations_from(graph, "DiscussionsList"),
+            ["DiscussionsList -> /app/discussions/:discussionId (link /app/discussions/${…}) ?"],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// W7-18a, the link pass's import resolution through the store's
+    /// configuration loaders: a route-config object imported through a
+    /// `tsconfig.json` alias the fallback prefixes do not cover; a nearer
+    /// app's `tsconfig.json` mapping the same alias elsewhere decides for
+    /// the app's files; and a workspace package's `styled(Link)`, imported
+    /// by the package's name, is a link.
+    #[test]
+    fn w718a_a_link_reads_aliases_and_workspace_packages_as_resolution_does() {
+        let project = Project::new()
+            .file(
+                "package.json",
+                "{\"name\":\"mono\",\"private\":true,\"workspaces\":[\"packages/*\",\"apps/*\"],\"dependencies\":{\"react\":\"^18\",\"react-router-dom\":\"^6\",\"styled-components\":\"*\"}}\n",
+            )
+            .file(
+                "tsconfig.json",
+                "{\"compilerOptions\":{\"baseUrl\":\".\",\"paths\":{\"@config/*\":[\"./shared/config/*\"]}}}\n",
+            )
+            .file(
+                "shared/config/paths.ts",
+                "export const paths = {\n  home: { getHref: () => '/decoy' },\n} as const;\n",
+            )
+            .file(
+                "packages/ui/package.json",
+                "{\"name\":\"@acme/ui\",\"dependencies\":{\"react-router-dom\":\"^6\"}}\n",
+            )
+            .file(
+                "packages/ui/index.tsx",
+                "import { Link } from 'react-router-dom';\nimport styled from 'styled-components';\n\nexport const AppLink = styled(Link)`\n  color: red;\n`;\n",
+            )
+            .file(
+                "apps/web/package.json",
+                "{\"name\":\"web\",\"dependencies\":{\"react\":\"^18\",\"react-router-dom\":\"^6\",\"@acme/ui\":\"*\"}}\n",
+            )
+            .file(
+                "apps/web/tsconfig.json",
+                "{\"compilerOptions\":{\"baseUrl\":\".\",\"paths\":{\"@config/*\":[\"./src/config/*\"]}}}\n",
+            )
+            .file(
+                "apps/web/src/config/paths.ts",
+                "export const paths = {\n  home: { getHref: () => '/real' },\n  about: { getHref: () => '/about' },\n} as const;\n",
+            )
+            .file(
+                "apps/web/src/App.tsx",
+                "import { Routes, Route } from 'react-router-dom';\nimport { Real, Decoy, About } from './pages';\nexport function App() {\n  return (\n    <Routes>\n      <Route path=\"/real\" element={<Real />} />\n      <Route path=\"/decoy\" element={<Decoy />} />\n      <Route path=\"/about\" element={<About />} />\n    </Routes>\n  );\n}\n",
+            )
+            .file(
+                "apps/web/src/pages.tsx",
+                "export function Real() { return null; }\nexport function Decoy() { return null; }\nexport function About() { return null; }\n",
+            )
+            .file(
+                "apps/web/src/Nav.tsx",
+                "import { Link } from 'react-router-dom';\nimport { AppLink } from '@acme/ui';\nimport { paths } from '@config/paths';\nexport function Nav() {\n  return (\n    <nav>\n      <Link to={paths.home.getHref()}>Home</Link>\n      <AppLink to=\"/about\">About</AppLink>\n    </nav>\n  );\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        assert_eq!(
+            navigations_from(graph, "Nav"),
+            [
+                "Nav -> /about (link /about) ?",
+                "Nav -> /real (link /real) ?",
+            ],
             "{}",
             graph.report()
         );
@@ -21459,6 +21922,9 @@ mod react_router {
         assert_eq!(
             navigations(graph),
             strings(&[
+                "NavMenu -> / (link /) ?",
+                "NavMenu -> /counter (link /counter) ?",
+                "NavMenu -> /fetch-data (link /fetch-data) ?",
                 "showProfile -> /authentication/profile (navigate /authentication/profile) react-router",
             ]),
             "{report}"
@@ -21476,7 +21942,7 @@ mod react_router {
         );
     }
 
-    /// Upstream `react-router.test.ts` (#2400): `useRoutes(routes(isLoggedIn))` hands over the table the imported function returns, nested paths composed, the index route the page at its layout's address. (`<Navigate to>` and `<Link to>` are the link pass's.)
+    /// Upstream `react-router.test.ts` (#2400): `useRoutes(routes(isLoggedIn))` hands over the table the imported function returns, nested paths composed, the index route the page at its layout's address; the layout's `<Link to>` and the table's own `<Navigate to>` guard navigate too (the link pass).
     #[test]
     fn pr2400_a_table_a_function_returns_is_handed_to_use_routes() {
         let project = Project::new()
@@ -21508,7 +21974,11 @@ mod react_router {
         );
         assert_eq!(
             navigations(graph),
-            strings(&["onSubmit -> /app/account (navigate /app/account) react-router",]),
+            strings(&[
+                "MainLayout -> /app/dashboard (link /app/dashboard) ?",
+                "onSubmit -> /app/account (navigate /app/account) react-router",
+                "routes -> /login (navigate /login) ?",
+            ]),
             "{report}"
         );
     }
@@ -21864,11 +22334,12 @@ mod tanstack_router {
     }
 
     /// Upstream F5 (`tanstack-router.test.ts`, "a routed app end to end",
-    /// without its `<Link to>` and Screens halves, W7-18 and the viewer):
-    /// file-based routes named by their pattern, one per address, each
-    /// calling its component; `navigate({ to })` and `throw redirect({ to })`
-    /// reach the route the pattern names; a pattern nothing serves and a
-    /// search-only navigation stay unresolved.
+    /// without its Screens half, the viewer's): file-based routes named by
+    /// their pattern, one per address, each calling its component;
+    /// `navigate({ to })` and `throw redirect({ to })` reach the route the
+    /// pattern names; a pattern nothing serves and a search-only navigation
+    /// stay unresolved. The link pass (W7-18a): a `<Link to>` names the
+    /// route PATTERN, its params beside it.
     #[test]
     fn f5_a_tanstack_app_routes_and_navigates_by_pattern() {
         let project = Project::new()
@@ -21985,6 +22456,38 @@ mod tanstack_router {
             "{}",
             graph.report()
         );
+        let hrefs = |name: &str| -> Vec<String> {
+            let mut hrefs: Vec<String> = navigations(graph, name)
+                .into_iter()
+                .map(|edge| edge.metadata["href"].as_str().unwrap_or("").to_string())
+                .collect();
+            hrefs.sort();
+            hrefs
+        };
+        assert_eq!(
+            hrefs("IndexComponent"),
+            ["/login", "/posts/:postId"],
+            "{}",
+            graph.report()
+        );
+        let link = navigations(graph, "IndexComponent")
+            .into_iter()
+            .find(|edge| {
+                graph
+                    .node(&edge.target)
+                    .is_some_and(|node| node.name == "/posts/:postId")
+            })
+            .expect("the link to the post");
+        assert_eq!(link.provenance.as_deref(), Some("heuristic"));
+        assert_eq!(link.metadata["synthesizedBy"], "tanstack-link");
+        assert_eq!(link.metadata["href"], "/posts/:postId");
+        assert_eq!(link.metadata["navMethod"], "link");
+        assert_eq!(
+            hrefs("DashboardComponent"),
+            ["/posts"],
+            "{}",
+            graph.report()
+        );
     }
 }
 
@@ -22030,11 +22533,13 @@ mod vue_router {
     }
 
     /// Upstream F6 (`vue-router.test.ts`, "a routed app end to end",
-    /// without its `<router-link>` and Screens halves, W7-18 and the
-    /// viewer): vue-realworld's table of lazy views, each route calling the
-    /// `.vue` component it names; `router.push({ name })` reaches the route
-    /// of that name and `router.push({ path })` the route at that path; a
-    /// destination nothing declares and an array's `push` stay unresolved.
+    /// without its Screens half, the viewer's): vue-realworld's table of
+    /// lazy views, each route calling the `.vue` component it names;
+    /// `router.push({ name })` reaches the route of that name and
+    /// `router.push({ path })` the route at that path; a destination nothing
+    /// declares and an array's `push` stay unresolved. The link pass
+    /// (W7-18a): a `<router-link>` navigates from the component that
+    /// renders it, by name or by path, and an external `<a href>` does not.
     #[test]
     fn f6_a_vue_router_app_routes_and_navigates_by_name() {
         let project = Project::new()
@@ -22068,7 +22573,7 @@ mod vue_router {
             )
             .file(
                 "src/components/TheHeader.vue",
-                "<template>\n  <nav>\n    <router-link :to=\"{ name: 'home' }\">Home</router-link>\n    <router-link to=\"/settings\">Settings</router-link>\n  </nav>\n</template>\n<script setup>\nconst y = 1\n</script>\n",
+                "<template>\n  <nav>\n    <router-link :to=\"{ name: 'home' }\">Home</router-link>\n    <router-link to=\"/settings\">Settings</router-link>\n    <a href=\"https://example.com\">Elsewhere</a>\n  </nav>\n</template>\n<script setup>\nconst y = 1\n</script>\n",
             )
             .file(
                 "src/utils/trail.js",
@@ -22128,6 +22633,139 @@ mod vue_router {
         assert!(go_to[0].metadata.get("by").is_none());
         assert!(navigations(graph, "bail").is_empty(), "{}", graph.report());
         assert!(navigations(graph, "trail").is_empty(), "{}", graph.report());
+        let links = |name: &str| -> Vec<&EdgeRow> {
+            let from = graph.nodes_named("component", name);
+            assert_eq!(from.len(), 1, "component {name}\n{}", graph.report());
+            graph
+                .edges
+                .iter()
+                .filter(|edge| edge.kind == "navigates" && edge.source == from[0].id)
+                .collect()
+        };
+        let hrefs = |name: &str| -> Vec<String> {
+            let mut hrefs: Vec<String> = links(name)
+                .into_iter()
+                .map(|edge| edge.metadata["href"].as_str().unwrap_or("").to_string())
+                .collect();
+            hrefs.sort();
+            hrefs
+        };
+        assert_eq!(
+            hrefs("TheHeader"),
+            ["/settings", "home"],
+            "{}",
+            graph.report()
+        );
+        let header = links("TheHeader");
+        let home = header
+            .iter()
+            .find(|edge| edge.metadata["href"] == "home")
+            .expect("the named link");
+        assert_eq!(
+            graph
+                .node(&home.target)
+                .map(|node| node.qualified_name.as_str()),
+            Some("src/router/index.js::route:/")
+        );
+        assert_eq!(home.provenance.as_deref(), Some("heuristic"));
+        assert_eq!(home.metadata["synthesizedBy"], "vue-router-link");
+        assert_eq!(home.metadata["navMethod"], "link");
+        assert_eq!(home.metadata["by"], "name");
+        let settings = header
+            .iter()
+            .find(|edge| edge.metadata["href"] == "/settings")
+            .expect("the link by path");
+        assert_eq!(
+            graph
+                .node(&settings.target)
+                .map(|node| node.qualified_name.as_str()),
+            Some("src/router/index.js::route:/settings")
+        );
+        assert!(settings.metadata.get("by").is_none());
+        assert_eq!(hrefs("Register"), ["/login"], "{}", graph.report());
+    }
+
+    /// W7-18a (KEEP-RUST, as W7-11's `router.push({ name })`): a
+    /// `<router-link :to="{ name }">` whose name two routes of the app carry
+    /// names nothing, and the route of a name one route carries is reached.
+    /// Upstream keeps one route of a name, by node order.
+    #[test]
+    fn keep_rust_w718a_a_link_by_a_name_two_routes_carry_reaches_nothing() {
+        let view = |name: &str| {
+            format!(
+                "<template>\n  <div>{name}</div>\n</template>\n<script setup>\nconst x = 1\n</script>\n"
+            )
+        };
+        let project = Project::new()
+            .file(
+                "package.json",
+                "{\"name\":\"app\",\"dependencies\":{\"vue\":\"3\",\"vue-router\":\"4\"}}\n",
+            )
+            .file(
+                "src/router/index.js",
+                "import { createRouter, createWebHistory } from \"vue-router\"\nconst router = createRouter({\n  history: createWebHistory(),\n  routes: [\n    { name: \"dup\", path: \"/a\", component: () => import(\"@/views/A\") },\n    { name: \"dup\", path: \"/b\", component: () => import(\"@/views/B\") },\n    { name: \"only\", path: \"/c\", component: () => import(\"@/views/C\") }\n  ]\n})\nexport default router\n",
+            )
+            .file("src/views/A.vue", &view("A"))
+            .file("src/views/B.vue", &view("B"))
+            .file("src/views/C.vue", &view("C"))
+            .file(
+                "src/components/Menu.vue",
+                "<template>\n  <nav>\n    <router-link :to=\"{ name: 'dup' }\">Dup</router-link>\n    <router-link :to=\"{ name: 'only' }\">Only</router-link>\n  </nav>\n</template>\n<script setup>\nconst y = 1\n</script>\n",
+            )
+            .index();
+        let graph = project.graph();
+        let menu = graph.nodes_named("component", "Menu");
+        assert_eq!(menu.len(), 1, "{}", graph.report());
+        let targets: Vec<&str> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.kind == "navigates" && edge.source == menu[0].id)
+            .filter_map(|edge| graph.node(&edge.target))
+            .map(|node| node.name.as_str())
+            .collect();
+        assert_eq!(targets, ["/c"], "{}", graph.report());
+    }
+
+    /// W7-18a (upstream `vueRouterLinkEdges`): a bound `:to` holding a
+    /// `{ path }` object or a string names its route by path, and a `to`
+    /// written as an absolute URL leaves the site, though the app has the
+    /// route the URL's path names.
+    #[test]
+    fn w718a_a_bound_to_reads_a_path_object_or_a_string_never_a_url() {
+        let view = |name: &str| {
+            format!(
+                "<template>\n  <div>{name}</div>\n</template>\n<script setup>\nconst x = 1\n</script>\n"
+            )
+        };
+        let project = Project::new()
+            .file(
+                "package.json",
+                "{\"name\":\"app\",\"dependencies\":{\"vue\":\"3\",\"vue-router\":\"4\"}}\n",
+            )
+            .file(
+                "src/router/index.js",
+                "import { createRouter, createWebHistory } from \"vue-router\"\nconst router = createRouter({\n  history: createWebHistory(),\n  routes: [\n    { path: \"/a\", component: () => import(\"@/views/A\") },\n    { path: \"/b\", component: () => import(\"@/views/B\") },\n    { path: \"/c\", component: () => import(\"@/views/C\") }\n  ]\n})\nexport default router\n",
+            )
+            .file("src/views/A.vue", &view("A"))
+            .file("src/views/B.vue", &view("B"))
+            .file("src/views/C.vue", &view("C"))
+            .file(
+                "src/components/Menu.vue",
+                "<template>\n  <nav>\n    <router-link :to=\"{ path: '/a' }\">A</router-link>\n    <router-link :to=\"'/b'\">B</router-link>\n    <router-link to=\"https://example.com/c\">C</router-link>\n  </nav>\n</template>\n<script setup>\nconst y = 1\n</script>\n",
+            )
+            .index();
+        let graph = project.graph();
+        let menu = graph.nodes_named("component", "Menu");
+        assert_eq!(menu.len(), 1, "{}", graph.report());
+        let mut targets: Vec<&str> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.kind == "navigates" && edge.source == menu[0].id)
+            .filter_map(|edge| graph.node(&edge.target))
+            .map(|node| node.name.as_str())
+            .collect();
+        targets.sort_unstable();
+        assert_eq!(targets, ["/a", "/b"], "{}", graph.report());
     }
 
     /// Upstream F6 (`vue-element-admin`): named tables, `new Router`, a
@@ -22497,11 +23135,13 @@ mod sveltekit {
     }
 
     /// Upstream F6 (`sveltekit-router.test.ts`, "a routed app end to end",
-    /// without its `<a href>` and Screens halves, W7-18 and the viewer): the
-    /// SvelteKit realworld app's shape. One route per `+page.svelte` (a
-    /// layout is no second screen at its address); `redirect` takes its path
-    /// after the status, `goto` with a template hole reaches the `[slug]`
-    /// page, and a path no page serves or a computed one stays unresolved.
+    /// without its Screens half, the viewer's): the SvelteKit realworld
+    /// app's shape. One route per `+page.svelte` (a layout is no second
+    /// screen at its address); `redirect` takes its path after the status,
+    /// `goto` with a template hole reaches the `[slug]` page, and a path no
+    /// page serves or a computed one stays unresolved. The link pass
+    /// (W7-18a): an internal `<a href>` navigates from the component that
+    /// renders it, a `{expr}` in it a hole, and an external one does not.
     #[test]
     fn f6_a_sveltekit_app_routes_and_navigates() {
         let page = |body: &str| format!("<script>\n  export let data\n</script>\n{body}\n");
@@ -22512,15 +23152,24 @@ mod sveltekit {
             )
             .file(
                 "src/routes/+layout.svelte",
-                &page("<nav>\n  <a href=\"/\">Home</a>\n  <a href=\"/login\">Sign in</a>\n</nav>\n<slot />"),
+                &page("<nav>\n  <a href=\"/\">Home</a>\n  <a href=\"/login\">Sign in</a>\n  <a href=\"/settings\">Settings</a>\n  <a href=\"https://example.com\">Elsewhere</a>\n</nav>\n<slot />"),
             )
-            .file("src/routes/+page.svelte", &page("<h1>Conduit</h1>"))
-            .file("src/routes/login/+page.svelte", &page("<h1>Sign in</h1>"))
+            .file(
+                "src/routes/+page.svelte",
+                &page("<h1>Conduit</h1>\n<a href=\"/register\">Sign up</a>"),
+            )
+            .file(
+                "src/routes/login/+page.svelte",
+                "<script>\n  export let form\n</script>\n<a href=\"/register\">Need an account?</a>\n",
+            )
             .file(
                 "src/routes/login/+page.server.js",
                 "import { redirect } from '@sveltejs/kit'\nexport function load({ locals }) {\n  if (locals.user) redirect(307, '/')\n}\nexport const actions = {\n  default: async ({ request, locals }) => {\n    const user = await signIn(request)\n    if (!user) return { errors: ['bad login'] }\n    redirect(307, '/')\n  }\n}\n",
             )
-            .file("src/routes/register/+page.svelte", &page("<h1>Sign up</h1>"))
+            .file(
+                "src/routes/register/+page.svelte",
+                "<script>\n  export let form\n</script>\n<a href=\"/login\">Have an account?</a>\n",
+            )
             .file("src/routes/settings/+page.svelte", &page("<h1>Settings</h1>"))
             .file(
                 "src/routes/settings/+page.server.js",
@@ -22530,7 +23179,10 @@ mod sveltekit {
                 "src/routes/editor/+page.svelte",
                 "<script>\n  import { goto } from '$app/navigation'\n  async function publish() {\n    const article = await save()\n    goto(`/article/${article.slug}`)\n  }\n</script>\n<button on:click={publish}>Publish</button>\n",
             )
-            .file("src/routes/article/[slug]/+page.svelte", &page("<h1>Article</h1>"))
+            .file(
+                "src/routes/article/[slug]/+page.svelte",
+                &page("<a href=\"/editor\">Edit</a>\n<a href=\"/profile/@{data.author}\">Author</a>"),
+            )
             .file("src/routes/profile/@[user]/+page.svelte", &page("<h1>Profile</h1>"))
             .file("src/routes/profile/@[user]/+layout.svelte", &page("<slot />"))
             .file(
@@ -22570,12 +23222,108 @@ mod sveltekit {
             "{}",
             graph.report()
         );
+        let hrefs = |edges: &[&EdgeRow]| -> Vec<String> {
+            let mut hrefs: Vec<String> = edges
+                .iter()
+                .map(|edge| edge.metadata["href"].as_str().unwrap_or("").to_string())
+                .collect();
+            hrefs.sort();
+            hrefs
+        };
+        let article = navigations(graph, "component", "+page", "article/[slug]");
+        assert_eq!(
+            hrefs(&article),
+            ["/editor", "/profile/@${…}"],
+            "{}",
+            graph.report()
+        );
+        let edit = article
+            .iter()
+            .find(|edge| edge.metadata["href"] == "/editor")
+            .expect("the edit link");
+        assert_eq!(edit.provenance.as_deref(), Some("heuristic"));
+        assert_eq!(edit.metadata["synthesizedBy"], "sveltekit-link");
+        assert_eq!(edit.metadata["navMethod"], "a");
+        assert!(
+            article.iter().any(|edge| graph
+                .node(&edge.target)
+                .is_some_and(|node| node.name == "/profile/@:user")),
+            "{}",
+            graph.report()
+        );
+        let layout = navigations(graph, "component", "+layout", "routes/+layout");
+        assert_eq!(
+            hrefs(&layout),
+            ["/", "/login", "/settings"],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// W7-18a: an `<a href>` names a page only by a destination starting
+    /// with `/`. An absolute URL and a `mailto:` leave the site, even where
+    /// the app has the page the URL's path names; `href={…}` holding a
+    /// string or a template names its page, a template's hole a parameter.
+    #[test]
+    fn w718a_an_anchor_reads_an_expression_and_never_an_external_href() {
+        let project = Project::new()
+            .file(
+                "package.json",
+                "{\"name\":\"site\",\"devDependencies\":{\"@sveltejs/kit\":\"2\",\"svelte\":\"5\"}}\n",
+            )
+            .file("src/routes/+page.svelte", "<h1>Home</h1>\n")
+            .file("src/routes/about/+page.svelte", "<h1>About</h1>\n")
+            .file("src/routes/posts/[slug]/+page.svelte", "<h1>Post</h1>\n")
+            .file(
+                "src/lib/Footer.svelte",
+                "<footer>\n  <a href=\"https://example.com/\">Out</a>\n  <a href=\"mailto:team@example.com\">Mail</a>\n</footer>\n",
+            )
+            .file(
+                "src/lib/Menu.svelte",
+                "<script>\n  export let slug\n</script>\n<nav>\n  <a href={'/about'}>About</a>\n  <a href={`/posts/${slug}`}>Post</a>\n</nav>\n",
+            )
+            .index();
+        let graph = project.graph();
+        let mut links: Vec<(String, String, String)> = graph
+            .edges
+            .iter()
+            .filter(|edge| {
+                edge.kind == "navigates" && edge.metadata["synthesizedBy"] == "sveltekit-link"
+            })
+            .map(|edge| {
+                let name = |id: &str| graph.node(id).map_or("", |node| node.name.as_str());
+                (
+                    name(&edge.source).to_string(),
+                    name(&edge.target).to_string(),
+                    edge.metadata["href"].as_str().unwrap_or("").to_string(),
+                )
+            })
+            .collect();
+        links.sort();
+        assert_eq!(
+            links,
+            [
+                (
+                    "Menu".to_string(),
+                    "/about".to_string(),
+                    "/about".to_string()
+                ),
+                (
+                    "Menu".to_string(),
+                    "/posts/:slug".to_string(),
+                    "/posts/${\u{2026}}".to_string()
+                ),
+            ],
+            "{}",
+            graph.report()
+        );
     }
 
     /// Upstream #2131 (`sveltekit-route-names.test.ts`): a `(group)` folder
     /// is no part of the URL and a parameter's matcher no part of its name,
-    /// so `goto('/blocks')` reaches the page under `(app)/(layout)/`. The
-    /// fixture's `<a href="/view/card">` is the link pass's (W7-18).
+    /// so `goto('/blocks')` reaches the page under `(app)/(layout)/`, and
+    /// the link pass's `<a href="/view/card">` the page whose parameter has a
+    /// matcher.
     #[test]
     fn p2131_sveltekit_route_names_drop_groups_and_matchers() {
         let project = Project::new()
@@ -22603,13 +23351,30 @@ mod sveltekit {
             graph.report()
         );
         let home = navigations(graph, "component", "+page", "(app)/(layout)/+page.svelte");
-        let landings: Vec<_> = home.iter().map(|edge| landing(graph, edge)).collect();
+        let mut targets: Vec<(&str, Option<&str>)> = home
+            .iter()
+            .map(|edge| {
+                (
+                    graph
+                        .node(&edge.target)
+                        .map_or("", |node| node.name.as_str()),
+                    edge.metadata.get("synthesizedBy").and_then(|v| v.as_str()),
+                )
+            })
+            .collect();
+        targets.sort_unstable();
         assert_eq!(
-            landings,
-            [("/blocks", "/blocks", "goto")],
+            targets,
+            [("/blocks", None), ("/view/:view", Some("sveltekit-link"))],
             "{}",
             graph.report()
         );
+        let goto: Vec<_> = home
+            .iter()
+            .filter(|edge| edge.metadata.get("synthesizedBy").is_none())
+            .map(|edge| landing(graph, edge))
+            .collect();
+        assert_eq!(goto, [("/blocks", "/blocks", "goto")], "{}", graph.report());
     }
 
     /// `$lib` in a monorepo app is that app's `src/lib`: the hook's import
@@ -23241,8 +24006,147 @@ mod synthesis {
         assert_eq!((edge.line, edge.col), (Some(7), None), "{edge:?}");
         assert_eq!(
             project_metadata_with_prefix(&project.db(), "synthesis_version"),
-            [("synthesis_version".to_string(), "13".to_string())]
+            [("synthesis_version".to_string(), "14".to_string())]
         );
+    }
+
+    /// W7-18a (upstream `isTestPath` in the five link synthesizers and in
+    /// React's wrapper scan): no link pass reads a test file. Each router's
+    /// app writes the same link in a component and in a test file, and only
+    /// the component's draws a `navigates` edge; a `styled(Link)` wrapper a
+    /// test file declares wraps nothing, so the component writing it draws
+    /// none either.
+    #[test]
+    fn w718a_no_link_pass_reads_a_test_file() {
+        let next_nav = |name: &str| {
+            format!(
+                "import Link from 'next/link';\n\nexport function {name}() {{\n  return <Link href=\"/users\">Users</Link>;\n}}\n"
+            )
+        };
+        let react_nav = |name: &str| {
+            format!(
+                "import {{ Link }} from 'react-router-dom';\n\nexport function {name}() {{\n  return <Link to=\"/team\">Team</Link>;\n}}\n"
+            )
+        };
+        let vue_home = "<template><RouterLink to=\"/about\">About</RouterLink></template>\n<script setup lang=\"ts\">\nimport { RouterLink } from 'vue-router';\n</script>\n";
+        let project = Project::new()
+            .file(
+                "package.json",
+                "{\"name\":\"links\",\"private\":true,\"workspaces\":[\"apps/*\"]}\n",
+            )
+            .file(
+                "apps/next/package.json",
+                "{\"name\":\"next-app\",\"private\":true,\"dependencies\":{\"next\":\"14.1.0\",\"react\":\"18.2.0\"}}\n",
+            )
+            .file(
+                "apps/next/app/page.tsx",
+                "export default function Page() {\n  return null;\n}\n",
+            )
+            .file(
+                "apps/next/app/users/page.tsx",
+                "export default function Users() {\n  return null;\n}\n",
+            )
+            .file("apps/next/components/Nav.tsx", &next_nav("NextNav"))
+            .file(
+                "apps/next/components/__tests__/Nav.test.tsx",
+                &next_nav("NextNavTest"),
+            )
+            .file(
+                "apps/react/package.json",
+                "{\"name\":\"react-app\",\"private\":true,\"dependencies\":{\"react\":\"18.2.0\",\"react-router-dom\":\"6.22.0\"}}\n",
+            )
+            .file(
+                "apps/react/src/main.tsx",
+                "import { createBrowserRouter, Link } from 'react-router-dom';\nimport { Team } from './Team';\n\nexport const router = createBrowserRouter([\n  { path: '/team', element: <Team /> },\n]);\n\nexport function ReactNav() {\n  return <Link to=\"/team\">Team</Link>;\n}\n",
+            )
+            .file(
+                "apps/react/src/Team.tsx",
+                "export function Team() {\n  return null;\n}\n",
+            )
+            .file("apps/react/src/__tests__/Nav.test.tsx", &react_nav("ReactNavTest"))
+            .file(
+                "apps/react/src/__tests__/links.test.tsx",
+                "import { Link } from 'react-router-dom';\nimport styled from 'styled-components';\n\nexport const TestLink = styled(Link)`color: red;`;\n",
+            )
+            .file(
+                "apps/react/src/Uses.tsx",
+                "import { TestLink } from './__tests__/links.test';\n\nexport function UsesTestLink() {\n  return <TestLink to=\"/team\">Team</TestLink>;\n}\n",
+            )
+            .file(
+                "apps/tanstack/package.json",
+                "{\"name\":\"tanstack-app\",\"private\":true,\"dependencies\":{\"@tanstack/react-router\":\"1.15.0\",\"react\":\"18.2.0\"}}\n",
+            )
+            .file(
+                "apps/tanstack/src/routes/posts.tsx",
+                "import { createFileRoute } from '@tanstack/react-router';\n\nexport const Route = createFileRoute('/posts')({\n  component: Posts,\n});\n\nfunction Posts() {\n  return null;\n}\n",
+            )
+            .file(
+                "apps/tanstack/src/routes/index.tsx",
+                "import { createFileRoute, Link } from '@tanstack/react-router';\n\nexport const Route = createFileRoute('/')({\n  component: TanstackIndex,\n});\n\nfunction TanstackIndex() {\n  return <Link to=\"/posts\">Posts</Link>;\n}\n",
+            )
+            .file(
+                "apps/tanstack/src/__tests__/index.test.tsx",
+                "import { Link } from '@tanstack/react-router';\n\nexport function TanstackIndexTest() {\n  return <Link to=\"/posts\">Posts</Link>;\n}\n",
+            )
+            .file(
+                "apps/vue/package.json",
+                "{\"name\":\"vue-app\",\"private\":true,\"dependencies\":{\"vue\":\"3.4.0\",\"vue-router\":\"4.2.0\"}}\n",
+            )
+            .file(
+                "apps/vue/src/router/index.ts",
+                "import { createRouter, createWebHistory } from 'vue-router';\nimport Home from '../views/Home.vue';\n\nexport default createRouter({\n  history: createWebHistory(),\n  routes: [\n    { path: '/', component: Home },\n    { path: '/about', component: () => import('../views/About.vue') },\n  ],\n});\n",
+            )
+            .file("apps/vue/src/views/Home.vue", vue_home)
+            .file(
+                "apps/vue/src/views/About.vue",
+                "<template><div>About</div></template>\n",
+            )
+            .file("apps/vue/src/views/__tests__/HomeTest.vue", vue_home)
+            .file(
+                "apps/sveltekit/package.json",
+                "{\"name\":\"sveltekit-app\",\"private\":true,\"devDependencies\":{\"@sveltejs/kit\":\"2.5.0\",\"svelte\":\"4.2.0\"}}\n",
+            )
+            .file(
+                "apps/sveltekit/src/routes/+page.svelte",
+                "<a href=\"/about\">About</a>\n",
+            )
+            .file(
+                "apps/sveltekit/src/routes/about/+page.svelte",
+                "<h1>About</h1>\n",
+            )
+            .file(
+                "apps/sveltekit/src/lib/__tests__/Nav.svelte",
+                "<a href=\"/about\">About</a>\n",
+            )
+            .index();
+        let graph = project.graph();
+        let mut links: Vec<(String, String)> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.kind == "navigates")
+            .filter_map(|edge| {
+                let by = edge.metadata["synthesizedBy"].as_str()?;
+                let at = edge.metadata["registeredAt"].as_str()?;
+                by.ends_with("-link").then(|| {
+                    (
+                        by.to_string(),
+                        at.rsplit_once(':').map_or(at, |(file, _)| file).to_string(),
+                    )
+                })
+            })
+            .collect();
+        links.sort();
+        let expected: Vec<(String, String)> = [
+            ("next-link", "apps/next/components/Nav.tsx"),
+            ("react-router-link", "apps/react/src/main.tsx"),
+            ("sveltekit-link", "apps/sveltekit/src/routes/+page.svelte"),
+            ("tanstack-link", "apps/tanstack/src/routes/index.tsx"),
+            ("vue-router-link", "apps/vue/src/views/Home.vue"),
+        ]
+        .iter()
+        .map(|(by, file)| (by.to_string(), file.to_string()))
+        .collect();
+        assert_eq!(links, expected, "{}", graph.report());
     }
 
     /// The forty registrations a channel links are its first forty incoming

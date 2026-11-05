@@ -35,7 +35,8 @@
 //! serves, a path two routes of the call's app serve (KEEP-RUST), and a
 //! code-based route whose parent is declared in another file (the chain is
 //! composed within a file, where a route tree is written). `<Link to>` is
-//! JSX, not a call (W7-18).
+//! JSX, not a call: the link pass reads it through [`tanstack_link_routes`]
+//! (`synthesis/links.rs`).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
@@ -45,8 +46,8 @@ use regex::Regex;
 
 use super::js_scan::{self, JS_SPACE, ObjectField};
 use super::route_href::{
-    ExactTable, HrefLiteral, RouteEntry, app_root_for, destinations_for_href, first_argument_text,
-    parse_href_expression, read_href_via_local, read_string_at, to_href,
+    ExactTable, HrefLiteral, LinkRoutes, RouteEntry, app_root_for, destinations_for_href,
+    first_argument_text, parse_href_expression, read_href_via_local, read_string_at, to_href,
 };
 use super::{framework_node, js_language_for};
 use crate::framework::{FrameworkExtractionContext, FrameworkResolver, NavigationCalls};
@@ -467,6 +468,31 @@ fn tanstack_table(context: &dyn ResolutionContext) -> Arc<TanstackTable> {
     context
         .route_tables()
         .get_or_build("tanstack-router", || TanstackTable::build(context))
+}
+
+impl LinkRoutes for TanstackTable {
+    fn is_empty(&self) -> bool {
+        self.by_root.is_empty()
+    }
+
+    fn serves(&self, file: &str) -> bool {
+        self.app_of(file).is_some_and(|app| !app.exact.is_empty())
+    }
+
+    fn destinations<'h>(
+        &self,
+        file: &str,
+        href: &'h HrefLiteral,
+    ) -> Vec<(Arc<Node>, &'h HrefLiteral)> {
+        self.app_of(file).map_or_else(Vec::new, |app| {
+            destinations_for_href(href, &app.exact, &app.dynamic, file)
+        })
+    }
+}
+
+/// The TanStack routes a `<Link to>` pattern reaches, in its own app (W7-18a).
+pub(crate) fn tanstack_link_routes(context: &dyn ResolutionContext) -> Arc<dyn LinkRoutes> {
+    tanstack_table(context)
 }
 
 // =============================================================================

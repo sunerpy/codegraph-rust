@@ -332,8 +332,8 @@ pub(super) fn redux_thunk_edges(view: &View<'_>) -> Result<Vec<Edge>> {
     Ok(edges)
 }
 
-/// The Pinia and Vuex passes' gate: a Vue file or one of the JavaScript
-/// family (upstream `has('vue', ...JS_FAMILY)`).
+/// The Pinia, Vuex and Vue Router link passes' gate: a Vue file or one of
+/// the JavaScript family (upstream `has('vue', ...JS_FAMILY)`).
 pub(super) fn store_gate(languages: &HashSet<Language>) -> bool {
     languages.contains(&Language::Vue) || super::jsx::gate(languages)
 }

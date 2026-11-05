@@ -58,24 +58,29 @@ colby behaviors are intentionally NOT ported in v1:
   #768); only its framework-resolution half is deferred. Re-enable any of the
   deferred resolvers by adding it to `frameworks/` and the `detect_frameworks`
   registry — no orchestrator change required.
-- **Router link synthesis** — `next-router-synthesizer.ts` (a Next.js
-  `<Link href>` or internal `<a href>`), `react-router-synthesizer.ts`
-  (React Router's `<Link to>`, `<NavLink to>` and `<Navigate to>`), Expo
-  Router's `<Link href>`,
-  `<Redirect href>` and `Stack.Screen` names, and the screens a helper's
-  returned href names (`router.replace(await postLoginRoute())`): JSX
-  attributes and return values, not calls, so they draw no `navigates` edge
-  here; the routers bind navigation calls only.
 - **Dynamic-dispatch synthesis passes** — of `SYNTH_PASSES`
   (`callback-synthesizer.ts`), the field, closure-collection, emitter,
   render, JSX, Pascal form, Flutter, C++ override, interface override, Kotlin
   expect/actual, gRPC stub, MyBatis, gin middleware-chain, redux-thunk,
   object-registry, RTK Query, Pinia, Vuex, Celery, Spring event, MediatR,
   Sidekiq, Laravel event, C function-pointer, GoFrame route and Go func-field
-  passes and the Go prerequisites (`go-method-contains`, `go-implements`) are
-  ported
+  passes, the Expo Router return pass and the Next.js, React Router, TanStack
+  Router, Vue Router and SvelteKit link passes, and the Go prerequisites
+  (`go-method-contains`, `go-implements`) are ported
   (`crates/codegraph-resolve/src/synthesis/`); the others draw no edge here
-  yet. The ported passes and the merge keep `b635dd46`'s view of Jest/Vitest
+  yet, the Vue template, SvelteKit page and loader, and Angular template
+  passes among them. colby reads no Expo Router `<Link href>`, `<Redirect
+  href>` or `Stack.Screen` name either (`frameworks/expo-router.ts`, "Not
+  covered yet"). The link passes keep `b635dd46`'s view of their inputs:
+  #2769's escaping of a wrapper's name in the React Router prefilter, and
+  #2484's `unittests/` and `*_unittest(s)/` test directories, are PORT rows
+  of the 2026-10-22 audit, left to the next round. Two colby readings are
+  ported as they behave: a Next.js `href={{ pathname }}` names nothing, as
+  colby's sticky key, started at an offset of the whole source in a slice
+  that starts there, never matches; and an Expo helper is the one function
+  of its name in the navigation's file, else the project's, colby's step
+  between them reading an import mapping's `resolvedPath`, which nothing
+  sets. The ported passes and the merge keep `b635dd46`'s view of Jest/Vitest
   manual mocks: #2790's skip of a `__mocks__/` handler for production code
   is a PORT row of the 2026-10-22 audit, left with the rest of that row to
   the next round. The C++ override pass is `b635dd46`'s too: #2609's skip of
@@ -519,6 +524,20 @@ regex engine), is not listed.
   nothing. A same-package (`*ListReq`) or aliased (`*sys.DeptSearchReq`)
   parameter still links. colby keeps every method of the bare type
   (`synthesis/goframe.rs`).
+- **Navigation links (W7-18a, OD-B10).** A Next.js `<Link href>` names a
+  page only by a destination starting with `/`, as an internal `<a href>`
+  and every other router's link do; colby skips an external `<a href>`
+  only, and its table reads an absolute URL's path, so a `<Link
+  href="https://…/">` (mantis's MUI links) reaches the site's own `/`. An
+  Expo helper's literals name the screens of the navigation's own Expo app,
+  a navigation under no Expo app reads none, and the eight-screen cap and
+  the memo are per helper and app, as a navigation call matches (W7-08);
+  colby reads the helper against one table for the project. The files are
+  read in path order, so the navigation that first reaches a helper's
+  screen, whose `registeredAt` and `navMethod` the edge carries, is the same
+  on every index; colby walks `getAllFiles()` in index order. A path or a
+  name two routes of a link's app carry names nothing, as for the routers'
+  navigation calls (`synthesis/links.rs`).
 - **JSX render (W7-14e, OD-A4).** A tag renders what its static
   `references` edge reaches, a component, function, class or value, never
   a method. colby scans a file's text for `<Name` and finds the child by

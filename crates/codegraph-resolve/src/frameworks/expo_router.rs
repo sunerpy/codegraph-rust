@@ -28,8 +28,10 @@
 //! an `app/` that holds the calling file), and a file under no Expo app is
 //! not read, so in a monorepo another app's `navigate('/')` never reaches an
 //! Expo screen (KEEP-RUST; upstream keeps one table and reads every file).
+//! A destination a helper returns (`router.push(await helper())`) is read
+//! by the synthesis pass through [`expo_screens`] (`synthesis/links.rs`).
 //! `<Link href>`, `<Redirect href>` and `Stack.Screen` names are JSX, not
-//! calls.
+//! calls, and upstream does not read them either.
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, OnceLock};
@@ -255,6 +257,41 @@ fn expo_route_table(context: &dyn ResolutionContext) -> Arc<ExpoTable> {
     context
         .route_tables()
         .get_or_build("expo-router", || ExpoTable::build(context))
+}
+
+/// The Expo screens a navigation helper's return literals name (W7-18a's
+/// `expoRouterReturnEdges`), matched in the app of the navigation that
+/// consumes the helper, as every Expo navigation is here (KEEP-RUST).
+pub(crate) struct ExpoScreens(Arc<ExpoTable>);
+
+impl ExpoScreens {
+    /// Whether the project has no Expo screen.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.by_root.is_empty()
+    }
+
+    /// The root of the Expo app `file` belongs to, if any.
+    pub(crate) fn app_root(&self, file: &str) -> Option<&str> {
+        self.0
+            .by_root
+            .keys()
+            .filter(|root| file.starts_with(root.as_str()))
+            .max_by_key(|root| root.len())
+            .map(String::as_str)
+    }
+
+    /// The one screen of the app at `root` that `segs` name, for a
+    /// navigation written in `caller` (`matchRoute`).
+    pub(crate) fn screen(&self, root: &str, caller: &str, segs: &[String]) -> Option<Arc<Node>> {
+        let app = self.0.by_root.get(root)?;
+        let exact = app.exact.route(&route_path(segs), caller);
+        match_route(segs, exact, &app.dynamic)
+    }
+}
+
+/// The Expo screens of this pass (W7-18a).
+pub(crate) fn expo_screens(context: &dyn ResolutionContext) -> ExpoScreens {
+    ExpoScreens(expo_route_table(context))
 }
 
 /// An href path in the form screen names use: no trailing `/`, no `(group)`

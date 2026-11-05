@@ -17589,3 +17589,374 @@ pub fn go_goframe_controller_file_is_deleted() -> Case {
         .named_after("route", "POST /dept/add")
         .named_after("route", "GET /dept/list")
 }
+
+// W7-18a: the link passes. Each link is written in a file the edit leaves
+// alone; what it reaches changes in another file or a control file.
+
+const LINKS_NEXT_PACKAGE: &str = "{\"name\":\"site\",\"dependencies\":{\"next\":\"15\"}}\n";
+const LINKS_NEXT_HOME_LINKS_ABOUT: &str = "import Link from 'next/link'\nexport default function Home() {\n  return <Link href=\"/about\">About</Link>\n}\n";
+const LINKS_NEXT_ABOUT_PAGE: &str = "export default function About() {\n  return null\n}\n";
+
+/// W7-18a: the page a `<Link href>` names appears in another file: the
+/// link pass draws the edge.
+pub fn tsx_next_link_target_page_appears() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Tsx])
+        .file("package.json", LINKS_NEXT_PACKAGE)
+        .file("app/page.tsx", LINKS_NEXT_HOME_LINKS_ABOUT)
+        .write("app/about/page.tsx", LINKS_NEXT_ABOUT_PAGE)
+        .edge_after(
+            "function Home",
+            "navigates",
+            "route app/about/page.tsx::route:/about",
+        )
+        .edge_metadata_after(
+            (
+                "function Home",
+                "navigates",
+                "route app/about/page.tsx::route:/about",
+            ),
+            "synthesizedBy",
+            "next-link",
+        )
+}
+
+/// W7-18a: the page a `<Link href>` names is deleted: the link reaches the
+/// dynamic page that now serves its path.
+pub fn tsx_next_link_target_page_deleted() -> Case {
+    Case::new(Change::DeleteImportedModule, &[Language::Tsx])
+        .file("package.json", LINKS_NEXT_PACKAGE)
+        .file("app/page.tsx", LINKS_NEXT_HOME_LINKS_ABOUT)
+        .file("app/about/page.tsx", LINKS_NEXT_ABOUT_PAGE)
+        .file(
+            "app/[slug]/page.tsx",
+            "export default function Doc() {\n  return null\n}\n",
+        )
+        .remove("app/about/page.tsx")
+        .edge_before(
+            "function Home",
+            "navigates",
+            "route app/about/page.tsx::route:/about",
+        )
+        .edge_after(
+            "function Home",
+            "navigates",
+            "route app/[slug]/page.tsx::route:/:slug",
+        )
+}
+
+const LINKS_REACT_ROUTER_PACKAGE: &str = "{\"name\":\"app\",\"dependencies\":{\"react\":\"18\",\"react-router-dom\":\"6\",\"styled-components\":\"*\"}}\n";
+
+/// W7-18a: the route file is edited to serve the path a `<Link to>` in
+/// another file names.
+pub fn tsx_react_router_route_file_edit_serves_a_links_path() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Tsx])
+        .file("package.json", LINKS_REACT_ROUTER_PACKAGE)
+        .file(
+            "src/App.tsx",
+            "import { Routes, Route } from 'react-router-dom'\nexport function App() {\n  return (\n    <Routes>\n      <Route path=\"/old\" element={<Page />} />\n    </Routes>\n  )\n}\nfunction Page() {\n  return null\n}\n",
+        )
+        .file(
+            "src/Nav.tsx",
+            "import { Link } from 'react-router-dom'\nexport function Nav() {\n  return <Link to=\"/new\">New</Link>\n}\n",
+        )
+        .write(
+            "src/App.tsx",
+            "import { Routes, Route } from 'react-router-dom'\nexport function App() {\n  return (\n    <Routes>\n      <Route path=\"/new\" element={<Page />} />\n    </Routes>\n  )\n}\nfunction Page() {\n  return null\n}\n",
+        )
+        .named_before("route", "/old")
+        .edge_after(
+            "function Nav",
+            "navigates",
+            "route src/App.tsx::route:/new",
+        )
+}
+
+const LINKS_VUE_PACKAGE: &str =
+    "{\"name\":\"app\",\"dependencies\":{\"vue\":\"3\",\"vue-router\":\"4\"}}\n";
+const LINKS_VUE_VIEW: &str =
+    "<template>\n  <div>view</div>\n</template>\n<script setup>\nconst x = 1\n</script>\n";
+
+/// W7-18a: a route in the router config is renamed to the name a
+/// `<router-link :to="{ name }">` in another file names.
+pub fn vue_router_route_is_renamed_to_a_links_name() -> Case {
+    Case::new(Change::RenameSymbol, &[Language::Vue, Language::JavaScript])
+        .file("package.json", LINKS_VUE_PACKAGE)
+        .file(
+            "src/router/index.js",
+            "import { createRouter, createWebHistory } from \"vue-router\"\nconst router = createRouter({\n  history: createWebHistory(),\n  routes: [\n    { name: \"home\", path: \"/\", component: () => import(\"@/views/Home\") },\n    { name: \"about\", path: \"/about\", component: () => import(\"@/views/About\") }\n  ]\n})\nexport default router\n",
+        )
+        .file("src/views/Home.vue", LINKS_VUE_VIEW)
+        .file("src/views/About.vue", LINKS_VUE_VIEW)
+        .file(
+            "src/components/Menu.vue",
+            "<template>\n  <nav>\n    <router-link :to=\"{ name: 'start' }\">Start</router-link>\n  </nav>\n</template>\n<script setup>\nconst y = 1\n</script>\n",
+        )
+        .write(
+            "src/router/index.js",
+            "import { createRouter, createWebHistory } from \"vue-router\"\nconst router = createRouter({\n  history: createWebHistory(),\n  routes: [\n    { name: \"start\", path: \"/\", component: () => import(\"@/views/Home\") },\n    { name: \"about\", path: \"/about\", component: () => import(\"@/views/About\") }\n  ]\n})\nexport default router\n",
+        )
+        .edge_after(
+            "component src/components/Menu.vue::Menu",
+            "navigates",
+            "route src/router/index.js::route:/",
+        )
+        .edge_metadata_after(
+            (
+                "component src/components/Menu.vue::Menu",
+                "navigates",
+                "route src/router/index.js::route:/",
+            ),
+            "by",
+            "name",
+        )
+}
+
+/// W7-18a: the page an `<a href>` in the layout names appears.
+pub fn svelte_sveltekit_link_target_page_appears() -> Case {
+    sveltekit_app(Case::new(Change::AddImportTarget, &[Language::Svelte]))
+        .file(
+            "src/routes/+layout.svelte",
+            "<nav>\n  <a href=\"/faq\">FAQ</a>\n</nav>\n<slot />\n",
+        )
+        .write("src/routes/faq/+page.svelte", SVELTEKIT_PAGE)
+        .edge_after(
+            "component src/routes/+layout.svelte::+layout",
+            "navigates",
+            "route src/routes/faq/+page.svelte::route:/faq",
+        )
+        .edge_metadata_after(
+            (
+                "component src/routes/+layout.svelte::+layout",
+                "navigates",
+                "route src/routes/faq/+page.svelte::route:/faq",
+            ),
+            "synthesizedBy",
+            "sveltekit-link",
+        )
+}
+
+/// W7-18a: the route file of the pattern a TanStack `<Link to>` names
+/// appears.
+pub fn tsx_tanstack_link_route_file_appears() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Tsx])
+        .file(
+            "package.json",
+            "{\"name\":\"app\",\"dependencies\":{\"react\":\"19\",\"@tanstack/react-router\":\"1\"}}\n",
+        )
+        .file(
+            "src/routes/index.tsx",
+            "import { createFileRoute, Link } from '@tanstack/react-router'\nexport const Route = createFileRoute('/')({ component: IndexComponent })\nfunction IndexComponent() {\n  return <Link to=\"/about\">About</Link>\n}\n",
+        )
+        .write(
+            "src/routes/about.tsx",
+            "import { createFileRoute } from '@tanstack/react-router'\nexport const Route = createFileRoute('/about')({ component: AboutComponent })\nfunction AboutComponent() {\n  return null\n}\n",
+        )
+        .edge_after(
+            "function IndexComponent",
+            "navigates",
+            "route src/routes/about.tsx::route:/about",
+        )
+}
+
+const LINKS_REACT_ROUTER_FEATURES_APP: &str = "import { Routes, Route } from 'react-router-dom'\nexport function App() {\n  return (\n    <Routes>\n      <Route path=\"/features\" element={<Features />} />\n    </Routes>\n  )\n}\nfunction Features() {\n  return null\n}\n";
+
+/// W7-18a: `HeaderLink.tsx`'s default export stops being a styled link;
+/// the `<HeaderLink to>` in `Header.tsx`, unchanged, no longer navigates.
+pub fn tsx_header_link_default_export_stops_wrapping_a_link() -> Case {
+    Case::new(Change::ReexportEdit, &[Language::Tsx])
+        .file("package.json", LINKS_REACT_ROUTER_PACKAGE)
+        .file("src/App.tsx", LINKS_REACT_ROUTER_FEATURES_APP)
+        .file(
+            "src/HeaderLink.tsx",
+            "import { Link } from 'react-router-dom'\nimport styled from 'styled-components'\nexport default styled(Link)`\n  color: red;\n`\n",
+        )
+        .file(
+            "src/Header.tsx",
+            "import HeaderLink from './HeaderLink'\nexport function Header() {\n  return <HeaderLink to=\"/features\">Features</HeaderLink>\n}\n",
+        )
+        .write(
+            "src/HeaderLink.tsx",
+            "import { Link } from 'react-router-dom'\nimport styled from 'styled-components'\nimport { Button } from './Button'\nexport default styled(Button)`\n  color: red;\n`\n",
+        )
+        .edge_before(
+            "function Header",
+            "navigates",
+            "route src/App.tsx::route:/features",
+        )
+        .no_edge_after(
+            "function Header",
+            "navigates",
+            "route src/App.tsx::route:/features",
+        )
+}
+
+const LINKS_REACT_ROUTER_AB_APP: &str = "import { Routes, Route } from 'react-router-dom'\nexport function App() {\n  return (\n    <Routes>\n      <Route path=\"/a\" element={<Page />} />\n      <Route path=\"/b\" element={<Page />} />\n    </Routes>\n  )\n}\nfunction Page() {\n  return null\n}\n";
+const LINKS_ROUTE_CONFIG_A: &str =
+    "export const paths = {\n  home: { getHref: () => '/a' },\n} as const;\n";
+const LINKS_ROUTE_CONFIG_B: &str =
+    "export const paths = {\n  home: { getHref: () => '/b' },\n} as const;\n";
+
+/// W7-18a: the route-config helper a `<Link to={paths.home.getHref()}>`
+/// calls comes to return another path (#2187's link half).
+pub fn tsx_route_config_get_href_returns_another_path() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Tsx, Language::TypeScript])
+        .file("package.json", LINKS_REACT_ROUTER_PACKAGE)
+        .file(
+            "tsconfig.json",
+            "{\"compilerOptions\":{\"baseUrl\":\".\",\"paths\":{\"@/*\":[\"./src/*\"]}}}\n",
+        )
+        .file("src/App.tsx", LINKS_REACT_ROUTER_AB_APP)
+        .file("src/config/paths.ts", LINKS_ROUTE_CONFIG_A)
+        .file(
+            "src/Nav.tsx",
+            "import { Link } from 'react-router-dom'\nimport { paths } from '@/config/paths'\nexport function Nav() {\n  return <Link to={paths.home.getHref()}>Home</Link>\n}\n",
+        )
+        .write("src/config/paths.ts", LINKS_ROUTE_CONFIG_B)
+        .edge_before("function Nav", "navigates", "route src/App.tsx::route:/a")
+        .edge_after("function Nav", "navigates", "route src/App.tsx::route:/b")
+        .no_edge_after("function Nav", "navigates", "route src/App.tsx::route:/a")
+}
+
+/// W7-18a: `tsconfig.json`'s alias comes to point at another directory;
+/// the link that imports the route config through it, unchanged, reads the
+/// other config.
+pub fn tsx_tsconfig_alias_of_a_links_route_config_points_elsewhere() -> Case {
+    Case::new(Change::ControlFile, &[Language::Tsx, Language::TypeScript])
+        .file("package.json", LINKS_REACT_ROUTER_PACKAGE)
+        .file(
+            "tsconfig.json",
+            "{\"compilerOptions\":{\"baseUrl\":\".\",\"paths\":{\"@config/*\":[\"./src/config/*\"]}}}\n",
+        )
+        .file("src/App.tsx", LINKS_REACT_ROUTER_AB_APP)
+        .file("src/config/paths.ts", LINKS_ROUTE_CONFIG_A)
+        .file("src/alt/paths.ts", LINKS_ROUTE_CONFIG_B)
+        .file(
+            "src/Nav.tsx",
+            "import { Link } from 'react-router-dom'\nimport { paths } from '@config/paths'\nexport function Nav() {\n  return <Link to={paths.home.getHref()}>Home</Link>\n}\n",
+        )
+        .write(
+            "tsconfig.json",
+            "{\"compilerOptions\":{\"baseUrl\":\".\",\"paths\":{\"@config/*\":[\"./src/alt/*\"]}}}\n",
+        )
+        .edge_before("function Nav", "navigates", "route src/App.tsx::route:/a")
+        .edge_after("function Nav", "navigates", "route src/App.tsx::route:/b")
+        .no_edge_after("function Nav", "navigates", "route src/App.tsx::route:/a")
+}
+
+/// W7-18a: a workspace package's styled link comes to wrap another
+/// component; the app's `<AppLink to>`, unchanged, no longer navigates.
+pub fn tsx_workspace_package_wrapper_wraps_another_component() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Tsx])
+        .file(
+            "package.json",
+            "{\"name\":\"mono\",\"private\":true,\"workspaces\":[\"packages/*\"],\"dependencies\":{\"react\":\"18\",\"react-router-dom\":\"6\",\"styled-components\":\"*\"}}\n",
+        )
+        .file(
+            "packages/ui/package.json",
+            "{\"name\":\"@acme/ui\",\"dependencies\":{\"react-router-dom\":\"6\"}}\n",
+        )
+        .file(
+            "packages/ui/index.tsx",
+            "import { Link } from 'react-router-dom'\nimport styled from 'styled-components'\nexport const AppLink = styled(Link)`\n  color: red;\n`\n",
+        )
+        .file("src/App.tsx", LINKS_REACT_ROUTER_FEATURES_APP)
+        .file(
+            "src/Nav.tsx",
+            "import { AppLink } from '@acme/ui'\nexport function Nav() {\n  return <AppLink to=\"/features\">Features</AppLink>\n}\n",
+        )
+        .write(
+            "packages/ui/index.tsx",
+            "import { Link } from 'react-router-dom'\nimport styled from 'styled-components'\nimport { Button } from './Button'\nexport const AppLink = styled(Button)`\n  color: red;\n`\n",
+        )
+        .edge_before(
+            "function Nav",
+            "navigates",
+            "route src/App.tsx::route:/features",
+        )
+        .no_edge_after(
+            "function Nav",
+            "navigates",
+            "route src/App.tsx::route:/features",
+        )
+}
+
+/// An Expo app with a `/welcome` and a `/home` screen.
+fn expo_app(case: Case) -> Case {
+    case.file(
+        "package.json",
+        "{\"name\":\"app\",\"dependencies\":{\"expo\":\"52\",\"expo-router\":\"4\",\"react\":\"18\"}}\n",
+    )
+    .file(
+        "src/app/_layout.tsx",
+        "export default function Layout() { return null }\n",
+    )
+    .file(
+        "src/app/welcome.tsx",
+        "export default function Welcome() { return null }\n",
+    )
+    .file(
+        "src/app/home.tsx",
+        "export default function Home() { return null }\n",
+    )
+}
+
+const LINKS_EXPO_PICK_WELCOME: &str = "export function pick() {\n  return '/welcome'\n}\n";
+const LINKS_EXPO_FINISH_WITH_PICK: &str = "import { router } from 'expo-router'\nimport { pick } from './route'\nexport function finish() {\n  router.replace(pick())\n}\n";
+
+/// W7-18a: the helper a push consumes comes to return another screen.
+pub fn typescript_expo_helper_returns_another_screen() -> Case {
+    expo_app(Case::new(
+        Change::BodyEdit,
+        &[Language::TypeScript, Language::Tsx],
+    ))
+    .file("src/services/route.ts", LINKS_EXPO_PICK_WELCOME)
+    .file("src/services/login.ts", LINKS_EXPO_FINISH_WITH_PICK)
+    .write(
+        "src/services/route.ts",
+        "export function pick() {\n  return '/home'\n}\n",
+    )
+    .edge_before(
+        "function pick",
+        "navigates",
+        "route src/app/welcome.tsx::route:/welcome",
+    )
+    .edge_after(
+        "function pick",
+        "navigates",
+        "route src/app/home.tsx::route:/home",
+    )
+    .no_edge_after(
+        "function pick",
+        "navigates",
+        "route src/app/welcome.tsx::route:/welcome",
+    )
+}
+
+/// W7-18a: another file comes to push the helper's return value: the
+/// helper, unchanged, navigates to its screen.
+pub fn typescript_expo_push_comes_to_consume_a_helper() -> Case {
+    expo_app(Case::new(
+        Change::BodyEdit,
+        &[Language::TypeScript, Language::Tsx],
+    ))
+    .file("src/services/route.ts", LINKS_EXPO_PICK_WELCOME)
+    .file(
+        "src/services/login.ts",
+        "import { router } from 'expo-router'\nimport { pick } from './route'\nexport function finish() {\n  router.replace('/home')\n}\n",
+    )
+    .write("src/services/login.ts", LINKS_EXPO_FINISH_WITH_PICK)
+    .edge_after(
+        "function pick",
+        "navigates",
+        "route src/app/welcome.tsx::route:/welcome",
+    )
+    .edge_metadata_after(
+        (
+            "function pick",
+            "navigates",
+            "route src/app/welcome.tsx::route:/welcome",
+        ),
+        "registeredAt",
+        "src/services/login.ts:4",
+    )
+}

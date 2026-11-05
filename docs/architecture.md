@@ -332,11 +332,41 @@ struct field holding a function, reaching each function or method value a
 composite literal or an assignment puts in the field or in the func field it
 is copied from, the receiver typed by its scope at most one field or one
 embedding away (`go-func-field`, with `field`, `via` and `registeredAt`).
+The link passes read navigation the routers' resolvers never see, because
+it is markup or a helper's return value rather than a call: a navigation
+fed by a helper's call (`router.push(await pick())`) reaches each Expo
+screen of the navigation's own app that a string literal in the helper's
+body names, the helper the one function of its name in the navigation's
+file, else the project's, and at most eight screens a helper and app
+(`expo-router-return`, the edge from the helper with the literal's line
+and column); a Next.js `<Link href>`, `<NextLink href>` or internal
+`<a href>` (`next-link`), a React Router `<Link to>`, `<NavLink to>`,
+`<Navigate to>`, v5 `<Redirect to>`, react-router-bootstrap's
+`<LinkContainer to>` or a `styled(Link)` or `styled(NavLink)` wrapper a
+file importing React Router declares, used where it is declared or
+imported (`react-router-link`, a `to={…}` read as a navigation call's
+argument is, else as a route-config helper's href), a TanStack `<Link to>`
+or `<Navigate to>` read as a route pattern (`tanstack-link`), a Vue
+`<router-link>`, `<RouterLink>` or `<NuxtLink>` by path or, bound to
+`{ name }`, by name (`vue-router-link`, `by: name`), and a SvelteKit
+internal `<a href>`, a `{expr}` in it a hole (`sveltekit-link`), each a
+`navigates` edge from the function or component the link is written in to
+the route its destination names in the link's app, with `href`, `navMethod`
+and `registeredAt`, at most 24 a component, a pair already drawn not
+counted again. Only a destination starting with `/` is read: a computed,
+relative or external destination, one no route serves, a path or name two
+routes of the app carry and a link in a test file draw nothing. The link
+passes read the routers' own route tables, and resolve the imports a
+route-config object or a link wrapper comes through, through a view
+context: the texts of indexed files the stage reads, no edge, and the
+store's node, file and configuration lookups for the rest, whose
+`tsconfig.json`, `jsconfig.json`, workspace and `package.json` files are
+JavaScript's control inputs, so a change to one recomputes the stage.
 Each walks its candidates in upstream's order (nodes by file, line and id,
 edges by their other end, line and column); the Flutter, C++, interface,
 Kotlin, gRPC, MyBatis, gin, redux-thunk, RTK Query, Pinia, Vuex, Celery,
 Spring, MediatR, Sidekiq,
-Laravel, C function-pointer, GoFrame and Go func-field passes run only when the index
+Laravel, C function-pointer, GoFrame, Go func-field and link passes run only when the index
 has files of their languages, as upstream's gates have them. A full index and a migration run
 the stage after resolution. A sync runs it last, after the orphan sweep,
 whenever it changed the index, bootstrapped a lane, swept, found a recorded

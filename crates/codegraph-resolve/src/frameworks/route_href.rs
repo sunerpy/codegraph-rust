@@ -156,7 +156,7 @@ fn skip_template(s: &[u8], open: usize) -> usize {
 
 /// Index of the quote closing the string literal opening at `at`, or the end
 /// of `s` (`stringEnd`).
-fn string_end(s: &[u8], at: usize) -> usize {
+pub(crate) fn string_end(s: &[u8], at: usize) -> usize {
     let quote = s[at];
     if quote == b'`' {
         return skip_template(s, at);
@@ -804,6 +804,29 @@ pub(crate) fn destinations_for_href<'h>(
         }
     }
     out
+}
+
+/// What a router's link pass reads of its route table (W7-18a): whether the
+/// project has any of its routes, whether a file's app has some, and where an
+/// href written in a file goes. The tables stay private to their routers.
+pub(crate) trait LinkRoutes: Send + Sync {
+    /// Whether the table holds no route (upstream's early `return []`).
+    fn is_empty(&self) -> bool;
+    /// Whether a link written in `file` can reach a route: its app's routes
+    /// are not empty (upstream `routesForFile` and `exact.size`).
+    fn serves(&self, file: &str) -> bool;
+    /// Every route `href`, written in `file`, names, one per arm
+    /// ([`destinations_for_href`] over `file`'s app).
+    fn destinations<'h>(
+        &self,
+        file: &str,
+        href: &'h HrefLiteral,
+    ) -> Vec<(Arc<Node>, &'h HrefLiteral)>;
+    /// The one route of `file`'s app named `name` (Vue's `{ name }`): none
+    /// for a name two routes carry, and none for the other routers.
+    fn named(&self, _file: &str, _name: &str) -> Option<Arc<Node>> {
+        None
+    }
 }
 
 /// The app a route file belongs to: the directory above its first

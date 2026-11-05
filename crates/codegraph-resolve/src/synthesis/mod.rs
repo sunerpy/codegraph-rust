@@ -15,16 +15,20 @@
 //!
 //! The stage reads only the base graph (every edge without `synthesizedBy`,
 //! the nodes, `resolved_refs`, and for Go the `extends` rows resolution
-//! left in `unresolved_refs`), the indexed files' text, and the files the
-//! C function-pointer pass `#include`s that the index does not hold, which
-//! it records under [`INPUTS_KEY`] (W7-17b), so a sync that changes none of
-//! them keeps its edges. Its Go prerequisite steps add edges the passes read
+//! left in `unresolved_refs`), the indexed files' text, the files the C
+//! function-pointer pass `#include`s that the index does not hold, which it
+//! records under [`INPUTS_KEY`] (W7-17b), and, for the link passes' import
+//! resolution, the JavaScript configuration resolution reads (`tsconfig.json`
+//! and `jsconfig.json` aliases, workspace packages, `package.json`
+//! manifests), JavaScript's control inputs (W7-18a), so a sync that changes
+//! none of them keeps its edges. Its Go prerequisite steps add edges the passes read
 //! as base edges first (W7-15b). `codegraph-watch` recomputes them whole
 //! after any sync that changes the index or finds a recorded file reading
 //! differently, under [`VERSION_KEY`].
 
 mod c_fnptr;
 mod callback;
+mod context;
 mod dispatch;
 mod framework;
 mod go;
@@ -34,6 +38,7 @@ mod goframe;
 mod iface;
 mod inputs;
 mod jsx;
+mod links;
 mod registry;
 mod stage;
 
@@ -52,7 +57,7 @@ use codegraph_store::Store;
 pub const VERSION_KEY: &str = "synthesis_version";
 
 /// The marker's value; a change to what the passes produce moves it.
-pub const VERSION: &str = "13";
+pub const VERSION: &str = "14";
 
 /// The edges one channel, class or declaration links at most (upstream
 /// `MAX_CALLBACKS_PER_CHANNEL`).

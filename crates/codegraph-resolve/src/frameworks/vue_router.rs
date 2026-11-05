@@ -38,7 +38,8 @@
 //! destination's own field. A route's name is not stored on its
 //! node, so the table re-reads the config files its own routes came from with
 //! the same parser `extract` used. A Nuxt page (`vue.rs`) is in the table
-//! too, by path. `<router-link to>` is markup, not a call (W7-18).
+//! too, by path. `<router-link to>` is markup, not a call: the link pass
+//! reads it through [`vue_link_routes`] (`synthesis/links.rs`).
 //!
 //! Left unresolved rather than guessed: a computed destination, a name or
 //! path nothing declares, a name or path two routes of the call's app carry,
@@ -53,8 +54,9 @@ use regex::Regex;
 use super::framework_node;
 use super::js_scan::{self, JS_SPACE, ObjectField};
 use super::route_href::{
-    ExactTable, HOLE, HrefLiteral, Literal, RouteEntry, app_root_for, destinations_for_href,
-    first_argument_text, parse_href, read_href_via_local_with, read_string_at, whole_string,
+    ExactTable, HOLE, HrefLiteral, LinkRoutes, Literal, RouteEntry, app_root_for,
+    destinations_for_href, first_argument_text, parse_href, read_href_via_local_with,
+    read_string_at, whole_string,
 };
 use crate::framework::{FrameworkExtractionContext, FrameworkResolver, NavigationCalls};
 use crate::import_resolver::resolve_import_path;
@@ -527,6 +529,38 @@ fn vue_route_table(context: &dyn ResolutionContext) -> Arc<VueRouteTable> {
         .get_or_build("vue-router", || VueRouteTable::build(context))
 }
 
+impl LinkRoutes for VueRouteTable {
+    fn is_empty(&self) -> bool {
+        self.by_root.is_empty()
+    }
+
+    fn serves(&self, file: &str) -> bool {
+        self.app_of(file).is_some_and(|app| !app.exact.is_empty())
+    }
+
+    fn destinations<'h>(
+        &self,
+        file: &str,
+        href: &'h HrefLiteral,
+    ) -> Vec<(Arc<Node>, &'h HrefLiteral)> {
+        self.app_of(file).map_or_else(Vec::new, |app| {
+            destinations_for_href(href, &app.exact, &app.dynamic, file)
+        })
+    }
+
+    fn named(&self, file: &str, name: &str) -> Option<Arc<Node>> {
+        match self.app_of(file)?.by_name.get(name)?.as_slice() {
+            [only] => Some(Arc::clone(only)),
+            _ => None,
+        }
+    }
+}
+
+/// The Vue routes a `<router-link to>` reaches, by path or by name, in its own app (W7-18a).
+pub(crate) fn vue_link_routes(context: &dyn ResolutionContext) -> Arc<dyn LinkRoutes> {
+    vue_route_table(context)
+}
+
 // =============================================================================
 // Navigation calls
 // =============================================================================
@@ -575,7 +609,7 @@ pub fn route_name_in_expression(expr: &str) -> Option<String> {
 /// (`parseVuePathObject`). The object's own `path`, read as a whole
 /// destination: a literal, a template or a conditional of them, never the
 /// head of a concatenation.
-fn parse_vue_path_object(expr: &str) -> Option<HrefLiteral> {
+pub(crate) fn parse_vue_path_object(expr: &str) -> Option<HrefLiteral> {
     parse_href(own_field(expr, "path")?, Literal::Whole)
 }
 

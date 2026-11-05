@@ -18,11 +18,14 @@ use codegraph_store::Store;
 use codegraph_store::queries::ReferenceSite;
 use rayon::prelude::*;
 
+use super::context::ViewContext;
 use super::inputs::{self, Inputs, UnindexedReader};
 use super::{
     c_fnptr, callback, dispatch, framework, go, go_dispatch, go_func_field, goframe, iface,
-    is_synthesized, jsx, registry,
+    is_synthesized, jsx, links, registry,
 };
+use crate::context::StoreResolutionContext;
+use crate::frameworks::route_href::RouteTables;
 
 /// What one run of the stage did.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -148,6 +151,28 @@ const PASSES: &[(&str, Gate, Pass)] = &[
         "goFuncFieldEdges",
         go::gate,
         go_func_field::func_field_edges,
+    ),
+    (
+        "expoRouterReturnEdges",
+        jsx::gate,
+        links::expo_router_return_edges,
+    ),
+    ("nextLinkEdges", jsx::gate, links::next_link_edges),
+    (
+        "reactRouterLinkEdges",
+        jsx::gate,
+        links::react_router_link_edges,
+    ),
+    ("tanstackLinkEdges", jsx::gate, links::tanstack_link_edges),
+    (
+        "vueRouterLinkEdges",
+        framework::store_gate,
+        links::vue_router_link_edges,
+    ),
+    (
+        "svelteKitLinkEdges",
+        |languages| languages.contains(&Language::Svelte),
+        links::sveltekit_link_edges,
     ),
 ];
 
@@ -276,10 +301,13 @@ pub(super) struct View<'a> {
     /// The reader of the files the index does not hold, when the stage may
     /// read them ([`run_stage`]; never under [`synthesize`]).
     unindexed: Option<UnindexedReader>,
+    /// The routers' route tables of this stage run, each built the first
+    /// time a pass asks for it through a [`ViewContext`] (W7-18a).
+    route_tables: Arc<RouteTables>,
 }
 
 impl<'a> View<'a> {
-    fn new(store: &'a Store, project_root: &Path, max_file_size: u64) -> Self {
+    pub(super) fn new(store: &'a Store, project_root: &Path, max_file_size: u64) -> Self {
         Self {
             store,
             project_root: project_root.to_path_buf(),
@@ -288,7 +316,25 @@ impl<'a> View<'a> {
             texts: RefCell::new(HashMap::new()),
             generated: RefCell::new(HashSet::new()),
             unindexed: None,
+            route_tables: Arc::default(),
         }
+    }
+
+    /// The view as the [`crate::types::ResolutionContext`] a router's table,
+    /// its href readers and import resolution read through (see
+    /// [`ViewContext`]).
+    pub(super) fn context(&self) -> ViewContext<'_, 'a> {
+        let store = StoreResolutionContext::new(
+            self.store,
+            self.project_root.to_string_lossy().into_owned(),
+        )
+        .with_max_file_size(self.max_file_size);
+        ViewContext::new(self, store)
+    }
+
+    /// The route tables of this stage run ([`ViewContext`]'s).
+    pub(super) fn route_tables(&self) -> Arc<RouteTables> {
+        Arc::clone(&self.route_tables)
     }
 
     /// The text of `path`, a file the index does not hold, as

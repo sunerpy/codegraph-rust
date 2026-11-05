@@ -26,7 +26,7 @@
 //!    the source ([`super::route_href`]), matches it against this framework's
 //!    own route table and returns a `navigates` edge carrying the href. A
 //!    `<Link href>` is a JSX attribute, not a call: the link synthesis reads
-//!    it (W7-18).
+//!    it through [`next_link_routes`] (`synthesis/links.rs`).
 //!
 //! Precision rests on the string resolving to a real page: a computed href, a
 //! path no page serves, a relative href, or a conditional none of whose arms
@@ -41,7 +41,7 @@ use codegraph_core::types::{EdgeKind, Language, Node, NodeKind};
 use regex::Regex;
 
 use super::route_href::{
-    ExactTable, HrefLiteral, RouteEntry, destinations_for_href, first_argument_text,
+    ExactTable, HrefLiteral, LinkRoutes, RouteEntry, destinations_for_href, first_argument_text,
     parse_href_expression, read_href_via_local,
 };
 use super::{framework_node, js_language_for};
@@ -251,6 +251,33 @@ fn next_route_table(context: &dyn ResolutionContext) -> Arc<NextTable> {
     context
         .route_tables()
         .get_or_build("nextjs", || NextTable::build(context))
+}
+
+/// One table for every Next app: a link is read from under any app's root
+/// and reaches any page, its own app's first (`nextLinkEdges`).
+impl LinkRoutes for NextTable {
+    fn is_empty(&self) -> bool {
+        self.exact.is_empty()
+    }
+
+    fn serves(&self, file: &str) -> bool {
+        self.roots
+            .iter()
+            .any(|root| file.starts_with(root.as_str()))
+    }
+
+    fn destinations<'h>(
+        &self,
+        file: &str,
+        href: &'h HrefLiteral,
+    ) -> Vec<(Arc<Node>, &'h HrefLiteral)> {
+        destinations_for_href(href, &self.exact, &self.dynamic, file)
+    }
+}
+
+/// The Next pages a `<Link href>` reaches (W7-18a).
+pub(crate) fn next_link_routes(context: &dyn ResolutionContext) -> Arc<dyn LinkRoutes> {
+    next_route_table(context)
 }
 
 /// `router.push` / `.replace` / `.prefetch`, `redirect` /

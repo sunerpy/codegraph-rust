@@ -1154,5 +1154,75 @@
     "provenance": null,
     "source": "file:apps/vue/src/views/Home.vue",
     "target": "component:1a7b7031523fe7654fa37131da535be3"
+  },
+  {
+    "col": null,
+    "kind": "navigates",
+    "line": 1,
+    "metadata": {
+      "href": "/about",
+      "navMethod": "link",
+      "registeredAt": "apps/vue/src/views/Home.vue:1",
+      "synthesizedBy": "vue-router-link"
+    },
+    "provenance": "heuristic",
+    "source": "component:1a7b7031523fe7654fa37131da535be3",
+    "target": "route:apps/vue/src/router/index.ts:9:/about:vue"
+  },
+  {
+    "col": null,
+    "kind": "navigates",
+    "line": 1,
+    "metadata": {
+      "href": "/users/1",
+      "navMethod": "link",
+      "registeredAt": "apps/nuxt/pages/index.vue:1",
+      "synthesizedBy": "vue-router-link"
+    },
+    "provenance": "heuristic",
+    "source": "component:ba1b120ba0c0a0e3733130855a8a1c17",
+    "target": "route:apps/nuxt/pages/users/[id].vue:/users/:id:1"
+  },
+  {
+    "col": null,
+    "kind": "navigates",
+    "line": 20,
+    "metadata": {
+      "href": "/team",
+      "navMethod": "link",
+      "registeredAt": "apps/react-router/src/main.tsx:20",
+      "synthesizedBy": "react-router-link"
+    },
+    "provenance": "heuristic",
+    "source": "function:bd2443bcbe09694a55210a349147c068",
+    "target": "route:apps/react-router/src/main.tsx:11:/team"
+  },
+  {
+    "col": null,
+    "kind": "navigates",
+    "line": 4,
+    "metadata": {
+      "href": "/dashboard",
+      "navMethod": "link",
+      "registeredAt": "apps/next/app/page.tsx:4",
+      "synthesizedBy": "next-link"
+    },
+    "provenance": "heuristic",
+    "source": "function:8694a47e777f8aafc5c96fe460badf43",
+    "target": "route:apps/next/app/dashboard/page.tsx:/dashboard"
+  },
+  {
+    "col": null,
+    "kind": "navigates",
+    "line": 8,
+    "metadata": {
+      "href": "/posts",
+      "navMethod": "link",
+      "registeredAt": "apps/tanstack/src/routes/index.tsx:8",
+      "synthesizedBy": "tanstack-link"
+    },
+    "provenance": "heuristic",
+    "source": "function:9137efed7a4eda576ab983339ee0aebb",
+    "target": "route:apps/tanstack/src/routes/posts.tsx:3:/posts:tanstack"
   }
 ]

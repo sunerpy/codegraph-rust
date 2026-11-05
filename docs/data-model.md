@@ -116,6 +116,18 @@ synthesis stage writes them: it replaces every edge whose metadata names
 deletions leave such edges alone, so the rest of the graph is what a fresh index
 resolves before any synthesized edge exists.
 
+A link pass's `navigates` edge (W7-18a: `next-link`, `react-router-link`,
+`tanstack-link`, `vue-router-link`, `sveltekit-link`, `expo-router-return`)
+carries `href`, the destination as the arm that named the route writes it (a
+template's hole `${…}`), `navMethod` (`link`, `a`, `navigate` or `redirect`,
+and for `expo-router-return` the navigation call's own method: `push`,
+`replace`, `navigate` or `dismissTo`) and `registeredAt`, the `path:line` of
+the link or, for `expo-router-return`, of the navigation call. A Vue link to
+a route by its name carries `by: "name"`, the name as its `href`. Its `line`
+is the link's; an `expo-router-return` edge goes from the helper and its
+`line` and `col` are the literal's in the helper's body, `col` in UTF-16 code
+units, while the other link edges have no column.
+
 An edge a framework resolver made (`resolvedBy: "framework"`) names that
 resolver in `metadata.framework` (`react`, `vue`, `nuxt`, `nestjs`, `godot`, `tauri`),
 as a synthesized edge names its pass. When one reference reaches several
@@ -476,7 +488,7 @@ persisted, and withdrawn with the others before a sync's first change. A sync
 that finds it missing or at another version re-resolves every Rust file. It is
 not a canonical surface.
 
-`synthesis_version` (13) vouches that the synthesized edges are the synthesis
+`synthesis_version` (14) vouches that the synthesized edges are the synthesis
 stage's output over the current base graph and the files it read beside the
 index. A full index and a migration write it after the stage. A sync withdraws
 it before its first change, before a lane bootstrap's first write, before the

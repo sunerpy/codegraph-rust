@@ -18,7 +18,8 @@
 //! reads the literal heading the expression, so the call above is read as
 //! `/article/` and reaches an `/article` page, and a hole sharing a segment
 //! (`` `/profile/@${name}` ``) counts as the segment. `<a href>` is markup,
-//! which the link pass reads (W7-18).
+//! which the link pass reads through [`sveltekit_link_routes`]
+//! (`synthesis/links.rs`).
 //!
 //! Only a `+page.svelte` is a screen. A computed destination, a path no page
 //! serves, a path two pages of one app serve (`(a)/x` and `(b)/x`), and an
@@ -30,7 +31,7 @@ use std::sync::Arc;
 use codegraph_core::types::{EdgeKind, Language, Node, NodeKind};
 
 use super::route_href::{
-    ExactTable, HrefLiteral, Literal, RouteEntry, app_root_for, destinations_for_href,
+    ExactTable, HrefLiteral, LinkRoutes, Literal, RouteEntry, app_root_for, destinations_for_href,
     nth_argument_text, parse_href, read_href_via_local_with,
 };
 use crate::framework::{FrameworkResolver, NavigationCalls};
@@ -185,6 +186,31 @@ fn sveltekit_table(context: &dyn ResolutionContext) -> Arc<SvelteKitTable> {
     context
         .route_tables()
         .get_or_build("sveltekit-router", || SvelteKitTable::build(context))
+}
+
+impl LinkRoutes for SvelteKitTable {
+    fn is_empty(&self) -> bool {
+        self.by_root.is_empty()
+    }
+
+    fn serves(&self, file: &str) -> bool {
+        self.app_of(file).is_some_and(|app| !app.exact.is_empty())
+    }
+
+    fn destinations<'h>(
+        &self,
+        file: &str,
+        href: &'h HrefLiteral,
+    ) -> Vec<(Arc<Node>, &'h HrefLiteral)> {
+        self.app_of(file).map_or_else(Vec::new, |app| {
+            destinations_for_href(href, &app.exact, &app.dynamic, file)
+        })
+    }
+}
+
+/// The SvelteKit pages an internal `<a href>` reaches, in its own app (W7-18a).
+pub(crate) fn sveltekit_link_routes(context: &dyn ResolutionContext) -> Arc<dyn LinkRoutes> {
+    sveltekit_table(context)
 }
 
 /// SvelteKit's navigation resolver (`svelteKitRouterResolver`).
