@@ -80,8 +80,9 @@ use super::js_scan::{
     top_level_objects,
 };
 use super::route_href::{
-    ExactTable, HOLE, HrefLiteral, Literal, RouteEntry, app_root_for, destinations_for_href,
-    first_argument_text, nth_argument_text, parse_href, read_string_at, to_href,
+    ExactTable, HOLE, HrefLiteral, LinkRoutes, Literal, RouteEntry, app_root_for,
+    destinations_for_href, first_argument_text, nth_argument_text, parse_href, read_string_at,
+    to_href,
 };
 use super::sveltekit_router::leaves_the_site;
 use crate::framework::{FrameworkExtractionContext, FrameworkResolver, NavigationCalls};
@@ -1937,6 +1938,82 @@ fn angular_table(context: &dyn ResolutionContext) -> Arc<AngularTable> {
     context
         .route_tables()
         .get_or_build("angular-router", || AngularTable::build(context))
+}
+
+impl LinkRoutes for AngularTable {
+    fn is_empty(&self) -> bool {
+        self.by_root.values().all(|app| app.exact.is_empty())
+    }
+
+    fn serves(&self, file: &str) -> bool {
+        self.routes_for(file)
+            .is_some_and(|app| !app.exact.is_empty())
+    }
+
+    fn destinations<'h>(
+        &self,
+        file: &str,
+        href: &'h HrefLiteral,
+    ) -> Vec<(Arc<Node>, &'h HrefLiteral)> {
+        match self.routes_for(file) {
+            Some(app) if !app.exact.is_empty() => {
+                destinations_for_href(href, &app.exact, &app.dynamic, file)
+            }
+            _ => Vec::new(),
+        }
+    }
+}
+
+/// The Angular routes a component's `routerLink` reaches, in its own app as
+/// a navigation call's are (`angularRoutesFor`; W7-18d).
+pub(crate) fn angular_link_routes(context: &dyn ResolutionContext) -> Arc<dyn LinkRoutes> {
+    angular_table(context)
+}
+
+/// The destinations a component's `[routerLink]` bindings and `routerLink:`
+/// fields name (W7-18d), read as a navigation call's argument is
+/// ([`angular_destination`], the constants each file is read for kept for
+/// the pass), but not from the root (upstream's default): a template's
+/// `['edit']` is relative to the component. KEEP-RUST, as a call's: only
+/// [`navigable_arms`] are matched.
+pub(crate) struct LinkDestinations<'c> {
+    constants: ConstantReader<'c>,
+}
+
+impl<'c> LinkDestinations<'c> {
+    pub(crate) fn new(context: &'c dyn ResolutionContext) -> Self {
+        Self {
+            constants: ConstantReader::new(context),
+        }
+    }
+
+    /// Where `expr`, written in `file` within the class `owner`, leads.
+    pub(crate) fn of(&self, expr: &str, file: &str, owner: &Node) -> Option<HrefLiteral> {
+        let href = angular_destination(expr, file, Some(owner), &self.constants, 0, false)?;
+        navigable_arms(&href)
+    }
+}
+
+/// Where a plain `routerLink="…"` leads (`plainHref`): its text, each
+/// interpolation a hole, when it starts with `/`: `/profile/{{ name }}` is
+/// `/profile/${…}`. KEEP-RUST, as a call's: only [`navigable_arms`] are
+/// matched, so `//host/x` is no link of this app.
+pub(crate) fn plain_link_destination(value: &str) -> Option<HrefLiteral> {
+    let mut with_holes = String::new();
+    let mut rest = js_trim(value);
+    while let Some(open) = rest.find("{{") {
+        let Some(close) = rest[open + 2..].find("}}") else {
+            break;
+        };
+        with_holes.push_str(&rest[..open]);
+        with_holes.push(HOLE);
+        rest = &rest[open + 2 + close + 2..];
+    }
+    with_holes.push_str(rest);
+    if !with_holes.starts_with('/') {
+        return None;
+    }
+    navigable_arms(&names_somewhere(to_href(Some(with_holes))?)?)
 }
 
 /// The navigation calls Angular binds to its routes: a route answers the

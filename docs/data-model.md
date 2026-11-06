@@ -143,6 +143,19 @@ renders, with `via`, the tag as written (`el-button`, `MediaCard`), and a
 (`click`), and, for a member a composable returns, `via`, the composable's
 name.
 
+The Angular template pass's edges (W7-18d) go from a component's class with
+no column, at the tag's line in an inline template and at the class's for a
+template file, and carry `registeredAt`, the `path:line` the template, or
+for a `routerLink:` field the class, writes it at: an `angular-template`
+`calls` edge to a child component, with `via`, the tag; an `angular-event`
+`calls` edge to a method, with `via`, the event (`(click)`), and `trigger`,
+`{"kind": "prop", "name": "(click)", "of": "button"}` with the element the
+binding is written on; an `angular-binding` `calls` or `references` edge to
+a member, with `via`, the binding as written (`[name]`, `{{ }}`, `*ngIf`,
+`@if`, `@let`) and `fnRef: true` for a function handed over; and an
+`angular-router-link` `navigates` edge to a route, with `href`, `navMethod`
+`routerLink` and, for a template's link, `template: true`.
+
 An edge a framework resolver made (`resolvedBy: "framework"`) names that
 resolver in `metadata.framework` (`react`, `vue`, `nuxt`, `nestjs`, `godot`, `tauri`),
 as a synthesized edge names its pass. When one reference reaches several
@@ -503,7 +516,7 @@ persisted, and withdrawn with the others before a sync's first change. A sync
 that finds it missing or at another version re-resolves every Rust file. It is
 not a canonical surface.
 
-`synthesis_version` (16) vouches that the synthesized edges are the synthesis
+`synthesis_version` (17) vouches that the synthesized edges are the synthesis
 stage's output over the current base graph and the files it read beside the
 index. A full index and a migration write it after the stage. A sync withdraws
 it before its first change, before a lane bootstrap's first write, before the
@@ -513,9 +526,9 @@ found the marker missing or at another version, recomputes the stage and writes
 the marker back as its last write. It is not a canonical surface.
 
 `synthesis_unindexed_inputs` records the files the stage read beside the index
-(W7-17b): a JSON object, sorted by path, from each project-relative path an
-indexed C or C++ file's `#include "…"` led the stage to that the index does not
-hold to the SHA-256 of the text it read there, or `null` where it read nothing:
+(W7-17b): a JSON object, sorted by path, from each project-relative path the
+index does not hold that an indexed C or C++ file's `#include "…"` or an
+Angular component's `templateUrl` (W7-18d) led the stage to, to the SHA-256 of the text it read there, or `null` where it read nothing:
 no file, a path the scan's ignore rules, `.gitignore` or configuration keep
 out, one through a symbolic link, or a file over `indexing.max_file_size`. A
 path that would leave the project root is never probed nor recorded. Every run

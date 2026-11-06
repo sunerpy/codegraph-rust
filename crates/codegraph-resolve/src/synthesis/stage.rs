@@ -21,8 +21,8 @@ use rayon::prelude::*;
 use super::context::ViewContext;
 use super::inputs::{self, Inputs, UnindexedReader};
 use super::{
-    c_fnptr, callback, dispatch, framework, go, go_dispatch, go_func_field, goframe, iface,
-    is_synthesized, jsx, links, registry, sveltekit, vue,
+    angular, c_fnptr, callback, dispatch, framework, go, go_dispatch, go_func_field, goframe,
+    iface, is_synthesized, jsx, links, registry, sveltekit, vue,
 };
 use crate::context::StoreResolutionContext;
 use crate::frameworks::route_href::RouteTables;
@@ -179,6 +179,11 @@ const PASSES: &[(&str, Gate, Pass)] = &[
         "vueRouterLinkEdges",
         framework::store_gate,
         links::vue_router_link_edges,
+    ),
+    (
+        "angularTemplateEdges",
+        angular::gate,
+        angular::template_edges,
     ),
     (
         "svelteKitPageEdges",
