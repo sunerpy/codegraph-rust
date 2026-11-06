@@ -362,11 +362,18 @@ context: the texts of indexed files the stage reads, no edge, and the
 store's node, file and configuration lookups for the rest, whose
 `tsconfig.json`, `jsconfig.json`, workspace and `package.json` files are
 JavaScript's control inputs, so a change to one recomputes the stage.
+Two SvelteKit passes join the halves of a route the file system pairs: a
+`+page.svelte` or `+layout.svelte` component calls each function and method
+of the loaders beside it (`+page.server.ts`, `.server.js`, `.ts` or `.js`
+with its prefix), and their `load` and `actions` of any kind
+(`sveltekit-load`, with `via` and `registeredAt`), and each SvelteKit page
+route calls the component of its own file (`sveltekit-page`, with
+`registeredAt`); both read only paths and nodes.
 Each walks its candidates in upstream's order (nodes by file, line and id,
 edges by their other end, line and column); the Flutter, C++, interface,
 Kotlin, gRPC, MyBatis, gin, redux-thunk, RTK Query, Pinia, Vuex, Celery,
 Spring, MediatR, Sidekiq,
-Laravel, C function-pointer, GoFrame, Go func-field and link passes run only when the index
+Laravel, C function-pointer, GoFrame, Go func-field, link and SvelteKit passes run only when the index
 has files of their languages, as upstream's gates have them. A full index and a migration run
 the stage after resolution. A sync runs it last, after the orphan sweep,
 whenever it changed the index, bootstrapped a lane, swept, found a recorded

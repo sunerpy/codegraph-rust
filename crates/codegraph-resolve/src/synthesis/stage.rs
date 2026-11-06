@@ -22,7 +22,7 @@ use super::context::ViewContext;
 use super::inputs::{self, Inputs, UnindexedReader};
 use super::{
     c_fnptr, callback, dispatch, framework, go, go_dispatch, go_func_field, goframe, iface,
-    is_synthesized, jsx, links, registry,
+    is_synthesized, jsx, links, registry, sveltekit,
 };
 use crate::context::StoreResolutionContext;
 use crate::frameworks::route_href::RouteTables;
@@ -72,6 +72,11 @@ const PASSES: &[(&str, Gate, Pass)] = &[
     ("emitterEdges", always, callback::event_emitter_edges),
     ("renderEdges", always, dispatch::react_render_edges),
     ("jsxEdges", jsx::gate, jsx::jsx_render_edges),
+    (
+        "svelteKitEdges",
+        |languages| languages.contains(&Language::Svelte),
+        sveltekit::load_edges,
+    ),
     ("pascalEdges", always, dispatch::pascal_form_edges),
     (
         "flutterEdges",
@@ -168,6 +173,11 @@ const PASSES: &[(&str, Gate, Pass)] = &[
         "vueRouterLinkEdges",
         framework::store_gate,
         links::vue_router_link_edges,
+    ),
+    (
+        "svelteKitPageEdges",
+        |languages| languages.contains(&Language::Svelte),
+        sveltekit::page_component_edges,
     ),
     (
         "svelteKitLinkEdges",

@@ -128,6 +128,13 @@ is the link's; an `expo-router-return` edge goes from the helper and its
 `line` and `col` are the literal's in the helper's body, `col` in UTF-16 code
 units, while the other link edges have no column.
 
+The SvelteKit passes' `calls` edges (W7-18b) have no column. A
+`sveltekit-load` edge goes from a `+page` or `+layout` component to a hook of
+its loader at the component's `line`, with `via`, the hook's name, and
+`registeredAt`, the hook's `path:line`; a `sveltekit-page` edge goes from a
+page route to its own file's component at the component's `line`, with
+`registeredAt`, the file's path.
+
 An edge a framework resolver made (`resolvedBy: "framework"`) names that
 resolver in `metadata.framework` (`react`, `vue`, `nuxt`, `nestjs`, `godot`, `tauri`),
 as a synthesized edge names its pass. When one reference reaches several
@@ -488,7 +495,7 @@ persisted, and withdrawn with the others before a sync's first change. A sync
 that finds it missing or at another version re-resolves every Rust file. It is
 not a canonical surface.
 
-`synthesis_version` (14) vouches that the synthesized edges are the synthesis
+`synthesis_version` (15) vouches that the synthesized edges are the synthesis
 stage's output over the current base graph and the files it read beside the
 index. A full index and a migration write it after the stage. A sync withdraws
 it before its first change, before a lane bootstrap's first write, before the

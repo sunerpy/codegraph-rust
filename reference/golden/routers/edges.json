@@ -612,6 +612,30 @@
   {
     "col": null,
     "kind": "calls",
+    "line": 1,
+    "metadata": {
+      "registeredAt": "apps/sveltekit/src/routes/(marketing)/about/+page.svelte",
+      "synthesizedBy": "sveltekit-page"
+    },
+    "provenance": "heuristic",
+    "source": "route:apps/sveltekit/src/routes/(marketing)/about/+page.svelte:/about:1",
+    "target": "component:1a0676b95db66966c593cf6c182747c4"
+  },
+  {
+    "col": null,
+    "kind": "calls",
+    "line": 1,
+    "metadata": {
+      "registeredAt": "apps/sveltekit/src/routes/+page.svelte",
+      "synthesizedBy": "sveltekit-page"
+    },
+    "provenance": "heuristic",
+    "source": "route:apps/sveltekit/src/routes/+page.svelte:/:1",
+    "target": "component:5f34c45ff72fb84793e041a2fb224d56"
+  },
+  {
+    "col": null,
+    "kind": "calls",
     "line": 5,
     "metadata": {
       "synthesizedBy": "jsx-render",

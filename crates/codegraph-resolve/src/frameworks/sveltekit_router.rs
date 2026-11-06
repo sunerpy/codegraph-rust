@@ -19,7 +19,8 @@
 //! `/article/` and reaches an `/article` page, and a hole sharing a segment
 //! (`` `/profile/@${name}` ``) counts as the segment. `<a href>` is markup,
 //! which the link pass reads through [`sveltekit_link_routes`]
-//! (`synthesis/links.rs`).
+//! (`synthesis/links.rs`); the page pass joins each page to its file's
+//! component through [`sveltekit_pages`] (`synthesis/sveltekit.rs`).
 //!
 //! Only a `+page.svelte` is a screen. A computed destination, a path no page
 //! serves, a path two pages of one app serve (`(a)/x` and `(b)/x`), and an
@@ -124,6 +125,8 @@ impl AppPages {
 #[derive(Debug, Default)]
 struct SvelteKitTable {
     by_root: BTreeMap<String, AppPages>,
+    /// Every page the table holds, each once, by file, line and id.
+    pages: Vec<Arc<Node>>,
 }
 
 impl SvelteKitTable {
@@ -144,6 +147,7 @@ impl SvelteKitTable {
                 .or_default()
                 .add(&node.name, &root, &node);
             served.insert((root.clone(), node.name.clone()));
+            table.pages.push(Arc::clone(&node));
             // `[[optional]]` is `:x?`: the page serves its path with and
             // without it.
             let mut segs: Vec<&str> = node.name.split('/').skip(1).collect();
@@ -167,6 +171,9 @@ impl SvelteKitTable {
                 app.add(&path, &root, &node);
             }
         }
+        table.pages.sort_by(|a, b| {
+            (&a.file_path, a.start_line, &a.id).cmp(&(&b.file_path, b.start_line, &b.id))
+        });
         table
     }
 
@@ -211,6 +218,14 @@ impl LinkRoutes for SvelteKitTable {
 /// The SvelteKit pages an internal `<a href>` reaches, in its own app (W7-18a).
 pub(crate) fn sveltekit_link_routes(context: &dyn ResolutionContext) -> Arc<dyn LinkRoutes> {
     sveltekit_table(context)
+}
+
+/// Every page the SvelteKit table holds, each once, by file, line and id
+/// (W7-18b): the routes the page pass joins to their components. A page
+/// another page of its app serves the path of is one too (upstream walks
+/// each app's paths, which hold the first page in node order).
+pub(crate) fn sveltekit_pages(context: &dyn ResolutionContext) -> Vec<Arc<Node>> {
+    sveltekit_table(context).pages.clone()
 }
 
 /// SvelteKit's navigation resolver (`svelteKitRouterResolver`).

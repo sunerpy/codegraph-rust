@@ -17735,6 +17735,93 @@ pub fn svelte_sveltekit_link_target_page_appears() -> Case {
         )
 }
 
+const SVELTEKIT_LOADER: &str =
+    "export function load({ locals }) {\n  return { user: locals.user }\n}\n";
+
+/// W7-18b: a server loader appears beside a page, which is unchanged: the
+/// page calls its `load`.
+pub fn svelte_sveltekit_page_server_appears() -> Case {
+    sveltekit_app(Case::new(
+        Change::AddImportTarget,
+        &[Language::Svelte, Language::TypeScript],
+    ))
+    .write("src/routes/settings/+page.server.ts", SVELTEKIT_LOADER)
+    .edge_after(
+        "component src/routes/settings/+page.svelte::+page",
+        "calls",
+        "function load",
+    )
+    .edge_metadata_after(
+        (
+            "component src/routes/settings/+page.svelte::+page",
+            "calls",
+            "function load",
+        ),
+        "synthesizedBy",
+        "sveltekit-load",
+    )
+}
+
+/// W7-18b: a page's server loader is deleted and its universal loader
+/// kept: the page, unchanged, calls only the universal `load`.
+pub fn svelte_sveltekit_page_server_deleted() -> Case {
+    sveltekit_app(Case::new(
+        Change::DeleteImportedModule,
+        &[Language::Svelte, Language::TypeScript],
+    ))
+    .file(
+        "src/routes/settings/+page.server.ts",
+        "export const actions = {\n  save: async ({ request }) => {\n    return { saved: true }\n  }\n}\n",
+    )
+    .file("src/routes/settings/+page.ts", SVELTEKIT_LOADER)
+    .remove("src/routes/settings/+page.server.ts")
+    .edge_before(
+        "component src/routes/settings/+page.svelte::+page",
+        "calls",
+        "constant actions",
+    )
+    .edge_before(
+        "component src/routes/settings/+page.svelte::+page",
+        "calls",
+        "function actions::save",
+    )
+    .edge_after(
+        "component src/routes/settings/+page.svelte::+page",
+        "calls",
+        "function load",
+    )
+}
+
+/// W7-18b: a page appears beside a loader no page used: its route calls
+/// its component, and the component the loader's `load`.
+pub fn svelte_sveltekit_page_appears_beside_its_loader() -> Case {
+    sveltekit_app(Case::new(
+        Change::AddImportTarget,
+        &[Language::Svelte, Language::TypeScript],
+    ))
+    .file("src/routes/faq/+page.ts", SVELTEKIT_LOADER)
+    .write("src/routes/faq/+page.svelte", SVELTEKIT_PAGE)
+    .edge_after(
+        "route src/routes/faq/+page.svelte::route:/faq",
+        "calls",
+        "component src/routes/faq/+page.svelte::+page",
+    )
+    .edge_metadata_after(
+        (
+            "route src/routes/faq/+page.svelte::route:/faq",
+            "calls",
+            "component src/routes/faq/+page.svelte::+page",
+        ),
+        "synthesizedBy",
+        "sveltekit-page",
+    )
+    .edge_after(
+        "component src/routes/faq/+page.svelte::+page",
+        "calls",
+        "function load",
+    )
+}
+
 /// W7-18a: the route file of the pattern a TanStack `<Link to>` names
 /// appears.
 pub fn tsx_tanstack_link_route_file_appears() -> Case {
