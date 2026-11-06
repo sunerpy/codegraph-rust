@@ -23093,6 +23093,31 @@ mod sveltekit {
         routes
     }
 
+    /// The edges the pass naming itself `by` drew, as `source file, source
+    /// name -> target name via … at registeredAt, line`, sorted (W7-18b).
+    fn synthesized(graph: &Graph, by: &str) -> Vec<String> {
+        let mut edges: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.metadata["synthesizedBy"] == by)
+            .map(|edge| {
+                let source = graph.node(&edge.source).expect("the source");
+                let target = graph.node(&edge.target).expect("the target");
+                format!(
+                    "{} {} -> {} via {} at {}, line {}",
+                    source.file_path,
+                    source.name,
+                    target.name,
+                    edge.metadata["via"].as_str().unwrap_or("-"),
+                    edge.metadata["registeredAt"].as_str().unwrap_or("?"),
+                    edge.line.unwrap_or(0)
+                )
+            })
+            .collect();
+        edges.sort();
+        edges
+    }
+
     /// The `navigates` edges out of the one `kind` node named `name` in a
     /// file whose path contains `file`.
     fn navigations<'g>(graph: &'g Graph, kind: &str, name: &str, file: &str) -> Vec<&'g EdgeRow> {
@@ -23142,6 +23167,10 @@ mod sveltekit {
     /// page serves or a computed one stays unresolved. The link pass
     /// (W7-18a): an internal `<a href>` navigates from the component that
     /// renders it, a `{expr}` in it a hole, and an external one does not.
+    /// The page and loader passes (W7-18b): each route calls its own file's
+    /// component, and a page calls its loader's `load`, `actions` and the
+    /// form action inside them, so the guard in `/settings`' loader belongs
+    /// to its page; a loader with no page beside it joins nothing.
     #[test]
     fn f6_a_sveltekit_app_routes_and_navigates() {
         let page = |body: &str| format!("<script>\n  export let data\n</script>\n{body}\n");
@@ -23255,6 +23284,43 @@ mod sveltekit {
         assert_eq!(
             hrefs(&layout),
             ["/", "/login", "/settings"],
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            synthesized(graph, "sveltekit-load"),
+            [
+                "src/routes/login/+page.svelte +page -> actions via actions at src/routes/login/+page.server.js:5, line 1",
+                "src/routes/login/+page.svelte +page -> default via default at src/routes/login/+page.server.js:6, line 1",
+                "src/routes/login/+page.svelte +page -> load via load at src/routes/login/+page.server.js:2, line 1",
+                "src/routes/settings/+page.svelte +page -> load via load at src/routes/settings/+page.server.js:2, line 1",
+            ],
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            synthesized(graph, "sveltekit-page"),
+            [
+                "src/routes/+page.svelte / -> +page via - at src/routes/+page.svelte, line 1",
+                "src/routes/article/[slug]/+page.svelte /article/:slug -> +page via - at src/routes/article/[slug]/+page.svelte, line 1",
+                "src/routes/editor/+page.svelte /editor -> +page via - at src/routes/editor/+page.svelte, line 1",
+                "src/routes/login/+page.svelte /login -> +page via - at src/routes/login/+page.svelte, line 1",
+                "src/routes/profile/@[user]/+page.svelte /profile/@:user -> +page via - at src/routes/profile/@[user]/+page.svelte, line 1",
+                "src/routes/register/+page.svelte /register -> +page via - at src/routes/register/+page.svelte, line 1",
+                "src/routes/settings/+page.svelte /settings -> +page via - at src/routes/settings/+page.svelte, line 1",
+            ],
+            "{}",
+            graph.report()
+        );
+        assert!(
+            graph
+                .edges
+                .iter()
+                .filter(|edge| edge.metadata["synthesizedBy"] == "sveltekit-load"
+                    || edge.metadata["synthesizedBy"] == "sveltekit-page")
+                .all(|edge| edge.kind == "calls"
+                    && edge.provenance.as_deref() == Some("heuristic")
+                    && edge.col.is_none()),
             "{}",
             graph.report()
         );
@@ -24006,7 +24072,7 @@ mod synthesis {
         assert_eq!((edge.line, edge.col), (Some(7), None), "{edge:?}");
         assert_eq!(
             project_metadata_with_prefix(&project.db(), "synthesis_version"),
-            [("synthesis_version".to_string(), "14".to_string())]
+            [("synthesis_version".to_string(), "15".to_string())]
         );
     }
 

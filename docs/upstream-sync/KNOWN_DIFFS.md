@@ -64,11 +64,11 @@ colby behaviors are intentionally NOT ported in v1:
   expect/actual, gRPC stub, MyBatis, gin middleware-chain, redux-thunk,
   object-registry, RTK Query, Pinia, Vuex, Celery, Spring event, MediatR,
   Sidekiq, Laravel event, C function-pointer, GoFrame route and Go func-field
-  passes, the Expo Router return pass and the Next.js, React Router, TanStack
-  Router, Vue Router and SvelteKit link passes, and the Go prerequisites
-  (`go-method-contains`, `go-implements`) are ported
-  (`crates/codegraph-resolve/src/synthesis/`); the others draw no edge here
-  yet, the Vue template, SvelteKit page and loader, and Angular template
+  passes, the SvelteKit loader and page passes, the Expo Router return pass
+  and the Next.js, React Router, TanStack Router, Vue Router and SvelteKit
+  link passes, and the Go prerequisites (`go-method-contains`,
+  `go-implements`) are ported (`crates/codegraph-resolve/src/synthesis/`);
+  the others draw no edge here yet, the Vue template and Angular template
   passes among them. colby reads no Expo Router `<Link href>`, `<Redirect
   href>` or `Stack.Screen` name either (`frameworks/expo-router.ts`, "Not
   covered yet"). The link passes keep `b635dd46`'s view of their inputs:
@@ -538,6 +538,13 @@ regex engine), is not listed.
   on every index; colby walks `getAllFiles()` in index order. A path or a
   name two routes of a link's app carry names nothing, as for the routers'
   navigation calls (`synthesis/links.rs`).
+- **A SvelteKit route's page (W7-18b).** Every page the SvelteKit table
+  holds calls its own file's component, a page whose path another page of
+  its app serves too (route groups `(a)/x` and `(b)/x`, which SvelteKit
+  rejects as a conflict). colby walks each app's paths, each holding the
+  first page in node order, so only that page is joined. A page or layout
+  file joins nothing, its route or its loader, unless it holds exactly one
+  component; colby takes the first (`synthesis/sveltekit.rs`).
 - **JSX render (W7-14e, OD-A4).** A tag renders what its static
   `references` edge reaches, a component, function, class or value, never
   a method. colby scans a file's text for `<Name` and finds the child by
