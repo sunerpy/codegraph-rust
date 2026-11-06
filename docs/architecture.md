@@ -270,10 +270,18 @@ each interface its method set covers, embeddings and the methods of embedded
 standard-library types included, at the interface's parameter and result
 counts (`go-implements`). It runs its passes in
 upstream's registry order, merges their edges (the first pass to pair a source
-and a target keeps the pair), and replaces every synthesized edge in one
+and a target keeps the pair), and replaces the synthesized edges in one
 transaction, an edge whose identity a base edge holds being ignored while its
-pair stays taken. The ported passes are the field observer
-(`callback`), the Swift and Kotlin closure collection (`closure-collection`),
+pair stays taken. It writes only the difference: an edge it makes again
+unchanged keeps its row and id, the stored ones it no longer makes, or makes
+differently, go, and the new ones come, so the rows are the ones deleting
+every synthesized edge and inserting the new ones would leave, and an
+unchanged stage writes nothing. A query that lists a node's edges of one kind
+by row id can then list a kept synthesized edge before a base edge the same
+sync rewrote, as it already lists the base edges a sync rewrote after the
+ones it kept; a fresh index's stage writes into an empty set. The ported
+passes are the field observer (`callback`), the Swift and Kotlin closure
+collection (`closure-collection`),
 the string-keyed emitter (`event-emitter`), and the structural ones: a React
 class component's or a Flutter `State`'s re-render (`react-render`,
 `flutter-build`), the components a function's JSX tags render

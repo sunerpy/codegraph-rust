@@ -32,10 +32,11 @@ use crate::frameworks::route_href::RouteTables;
 pub struct StageStats {
     /// The merged edges the passes produced.
     pub edges: usize,
-    /// The synthesized edges the replacement removed.
+    /// The stored synthesized edges the replacement removed: each one the
+    /// stage did not make again unchanged (W7-18c0).
     pub removed: usize,
-    /// The edges it inserted: the merged ones a base edge's identity did not
-    /// already hold.
+    /// The edges it inserted: the merged ones whose identity no base edge
+    /// holds and that no stored synthesized edge already equals.
     pub inserted: usize,
 }
 

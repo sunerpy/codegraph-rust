@@ -538,6 +538,18 @@ regex engine), is not listed.
   on every index; colby walks `getAllFiles()` in index order. A path or a
   name two routes of a link's app carry names nothing, as for the routers'
   navigation calls (`synthesis/links.rs`).
+- **How the stage writes its edges (W7-18c0).** The stage keeps the row
+  of each synthesized edge it makes again unchanged, deletes the stored
+  ones it no longer makes or makes differently, and inserts the new ones,
+  in one transaction; the rows it leaves are the ones deleting every
+  synthesized edge and inserting the new list would leave. colby's
+  `publish` deletes every synthesized edge and inserts every new one
+  (`src/db/synthesis-stage.ts:52-89`). Where a query lists a node's edges
+  of one kind by row id, a kept synthesized edge can come before a base
+  edge the same sync rewrote, as base edges a sync rewrote already come
+  after the ones it kept; a fresh index writes the stage's edges after
+  every base edge, as colby does (`replace_synthesized_edges` in
+  `codegraph-store`).
 - **A SvelteKit route's page (W7-18b).** Every page the SvelteKit table
   holds calls its own file's component, a page whose path another page of
   its app serves too (route groups `(a)/x` and `(b)/x`, which SvelteKit

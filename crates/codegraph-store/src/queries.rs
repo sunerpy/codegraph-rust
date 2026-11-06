@@ -802,12 +802,17 @@ impl Store {
     }
 
     /// Replace every synthesized edge with `edges` in ONE `BEGIN IMMEDIATE`
-    /// transaction (W7-14, upstream `SynthesisStage.publish`): the old ones
-    /// go, then `edges` go in as [`Self::insert_edges`] inserts them, so an
-    /// edge whose identity a base edge holds is ignored by
-    /// `idx_edges_identity`. Returns how many rows went and how many came.
-    /// The synthesis marker is the caller's: a sync writes it only after its
-    /// last other write.
+    /// transaction (W7-14, upstream `SynthesisStage.publish`), leaving the
+    /// rows that deleting the old ones and inserting `edges` as
+    /// [`Self::insert_edges`] inserts them would leave: an edge whose
+    /// identity (`idx_edges_identity`) a base edge holds is ignored, and of
+    /// two with one identity the first goes in. It writes only the
+    /// difference (W7-18c0): a stored synthesized row equal to the edge of
+    /// its identity keeps its row and id, the other stored ones go first, and
+    /// the rest of `edges` comes after them, so an unchanged stage rewrites
+    /// nothing. Returns how many rows went and how many came. The synthesis
+    /// marker is the caller's: a sync writes it only after its last other
+    /// write.
     pub fn replace_synthesized_edges(
         &mut self,
         edges: &[Edge],
@@ -815,10 +820,68 @@ impl Store {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let removed = tx.execute(&format!("DELETE FROM edges WHERE {SYNTHESIZED}"), [])?;
-        let inserted = insert_edges_in(&tx, edges)?;
+        // The edge of each identity `INSERT OR IGNORE` writes: the first.
+        let mut wanted: Vec<(&Edge, Option<String>)> = Vec::with_capacity(edges.len());
+        let mut of_identity: HashMap<EdgeIdentity<'_>, usize> = HashMap::new();
+        for edge in edges {
+            let identity = EdgeIdentity::of_edge(edge);
+            if of_identity.contains_key(&identity) {
+                continue;
+            }
+            let metadata = edge
+                .metadata
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()
+                .map_err(json_to_sql_error)?;
+            of_identity.insert(identity, wanted.len());
+            wanted.push((edge, metadata));
+        }
+        let mut kept = vec![false; wanted.len()];
+        let mut stale = Vec::new();
+        {
+            let mut stmt = tx.prepare(&format!(
+                "SELECT id, source, target, kind, metadata, line, col, provenance \
+                 FROM edges WHERE {SYNTHESIZED}"
+            ))?;
+            let mut rows = stmt.query([])?;
+            while let Some(row) = rows.next()? {
+                let stored = StoredEdge {
+                    id: row.get(0)?,
+                    source: row.get(1)?,
+                    target: row.get(2)?,
+                    kind: row.get(3)?,
+                    metadata: row.get(4)?,
+                    line: row.get(5)?,
+                    col: row.get(6)?,
+                    provenance: row.get(7)?,
+                };
+                match of_identity.get(&stored.identity()) {
+                    Some(&at) if stored.writes(wanted[at].0, wanted[at].1.as_deref()) => {
+                        kept[at] = true;
+                    }
+                    _ => stale.push(stored.id),
+                }
+            }
+        }
+        for chunk in stale.chunks(SQLITE_PARAM_CHUNK_SIZE) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            tx.execute(
+                &format!("DELETE FROM edges WHERE id IN ({placeholders})"),
+                rusqlite::params_from_iter(chunk),
+            )?;
+        }
+        let rest: Vec<&Edge> = wanted
+            .iter()
+            .zip(&kept)
+            .filter(|(_, kept)| !**kept)
+            .map(|((edge, _), _)| *edge)
+            .collect();
+        let inserted = insert_edge_refs_in(&tx, &rest)?;
         tx.commit()?;
-        Ok((removed, inserted))
+        Ok((stale.len(), inserted))
     }
 
     /// Ports `getOutgoingEdges` from `upstream db/queries.ts:1310-1337`.
@@ -3354,6 +3417,11 @@ fn validate_nodes(nodes: &[Node]) -> rusqlite::Result<()> {
 /// The body of [`Store::insert_edges`] in `tx`: every edge of `edges` whose
 /// endpoints both exist, `INSERT OR IGNORE`d; how many rows went in.
 fn insert_edges_in(tx: &Connection, edges: &[Edge]) -> rusqlite::Result<usize> {
+    insert_edge_refs_in(tx, &edges.iter().collect::<Vec<_>>())
+}
+
+/// [`insert_edges_in`] over borrowed edges.
+fn insert_edge_refs_in(tx: &Connection, edges: &[&Edge]) -> rusqlite::Result<usize> {
     if edges.is_empty() {
         return Ok(0);
     }
@@ -3369,7 +3437,7 @@ fn insert_edges_in(tx: &Connection, edges: &[Edge]) -> rusqlite::Result<usize> {
         "#,
     )?;
     let mut inserted = 0;
-    for edge in edges {
+    for &edge in edges {
         if !existing_node_ids.contains(&edge.source) || !existing_node_ids.contains(&edge.target) {
             continue;
         }
@@ -3390,6 +3458,65 @@ fn insert_edges_in(tx: &Connection, edges: &[Edge]) -> rusqlite::Result<usize> {
         })?;
     }
     Ok(inserted)
+}
+
+/// An edge's identity, as `idx_edges_identity` keys it: `(source, target,
+/// kind, IFNULL(line, -1), IFNULL(col, -1))`.
+#[derive(PartialEq, Eq, Hash)]
+struct EdgeIdentity<'e> {
+    source: &'e str,
+    target: &'e str,
+    kind: &'e str,
+    line: i64,
+    col: i64,
+}
+
+impl<'e> EdgeIdentity<'e> {
+    fn of_edge(edge: &'e Edge) -> Self {
+        EdgeIdentity {
+            source: &edge.source,
+            target: &edge.target,
+            kind: edge.kind.as_str(),
+            line: edge.line.unwrap_or(-1),
+            col: edge.col.unwrap_or(-1),
+        }
+    }
+}
+
+/// A stored synthesized edge row, its metadata as the stored text.
+struct StoredEdge {
+    id: i64,
+    source: String,
+    target: String,
+    kind: String,
+    metadata: Option<String>,
+    line: Option<i64>,
+    col: Option<i64>,
+    provenance: Option<String>,
+}
+
+impl StoredEdge {
+    fn identity(&self) -> EdgeIdentity<'_> {
+        EdgeIdentity {
+            source: &self.source,
+            target: &self.target,
+            kind: &self.kind,
+            line: self.line.unwrap_or(-1),
+            col: self.col.unwrap_or(-1),
+        }
+    }
+
+    /// Whether inserting `edge`, its metadata serialized as `metadata`,
+    /// would write this row's every column but the id.
+    fn writes(&self, edge: &Edge, metadata: Option<&str>) -> bool {
+        self.source == edge.source
+            && self.target == edge.target
+            && self.kind == edge.kind.as_str()
+            && self.line == edge.line
+            && self.col == edge.col
+            && self.provenance == edge.provenance
+            && self.metadata.as_deref() == metadata
+    }
 }
 
 fn existing_node_ids(
@@ -4421,6 +4548,361 @@ mod tests {
                 .any(|step| step.contains("idx_edges_synthesis_site")),
             "{plan:?}"
         );
+    }
+
+    /// The replacement as W7-14 wrote it, the reference the difference write
+    /// must match row for row: every synthesized edge deleted, `edges`
+    /// inserted as `insert_edges` inserts them.
+    fn rewrite_synthesized_edges(store: &mut Store, edges: &[Edge]) {
+        let tx = store
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        tx.execute(&format!("DELETE FROM edges WHERE {SYNTHESIZED}"), [])
+            .unwrap();
+        insert_edges_in(&tx, edges).unwrap();
+        tx.commit().unwrap();
+    }
+
+    /// An edge row's every column but the id.
+    type EdgeContent = (
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<i64>,
+        Option<i64>,
+        Option<String>,
+    );
+
+    fn edge_contents(store: &Store) -> Vec<EdgeContent> {
+        store
+            .conn
+            .prepare(
+                "SELECT source, target, kind, metadata, line, col, provenance FROM edges \
+                 ORDER BY source, target, kind, metadata, line, col, provenance",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
+    /// Each edge row's id by `(source, target, line, col)`.
+    fn edge_ids(store: &Store) -> BTreeMap<(String, String, Option<i64>, Option<i64>), i64> {
+        store
+            .conn
+            .prepare("SELECT source, target, line, col, id FROM edges")
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    (row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?),
+                    row.get(4)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
+    fn registered_at(edge: Edge, at: &str) -> Edge {
+        Edge {
+            metadata: Some(serde_json::json!({"synthesizedBy": "callback", "registeredAt": at})),
+            ..edge
+        }
+    }
+
+    /// The difference write (W7-18c0): an unchanged synthesized edge keeps
+    /// its row and id; one whose metadata, provenance, line or column
+    /// changed is replaced; one the stage no longer makes goes; a new one
+    /// comes; and the rows are the full rewrite's.
+    #[test]
+    fn replace_synthesized_edges_keeps_the_rows_of_unchanged_edges() {
+        let nodes = [
+            node("function:a", "alpha", "src/a.rs"),
+            node("function:b", "beta", "src/b.rs"),
+            node("function:c", "gamma", "src/c.rs"),
+            node("function:d", "delta", "src/d.rs"),
+        ];
+        let base = Edge {
+            line: Some(3),
+            col: Some(4),
+            ..edge("function:a", "function:b", EdgeKind::Calls)
+        };
+        let before = [
+            synthesized("function:a", "function:c", Some(1), None),
+            synthesized("function:b", "function:c", Some(2), None),
+            synthesized("function:c", "function:d", None, None),
+            synthesized("function:a", "function:d", Some(5), Some(6)),
+            synthesized("function:b", "function:d", Some(1), Some(1)),
+        ];
+        let after = [
+            synthesized("function:a", "function:c", Some(1), None),
+            registered_at(
+                synthesized("function:b", "function:c", Some(2), None),
+                "src/b.rs:9",
+            ),
+            Edge {
+                provenance: None,
+                ..synthesized("function:c", "function:d", None, None)
+            },
+            synthesized("function:a", "function:d", Some(5), Some(7)),
+            synthesized("function:d", "function:a", Some(1), None),
+        ];
+        let mut reference = store("replace-difference-reference");
+        let mut store = store("replace-difference");
+        for target in [&mut store, &mut reference] {
+            target.upsert_nodes(&nodes).unwrap();
+            target.insert_edges(std::slice::from_ref(&base)).unwrap();
+        }
+        store.replace_synthesized_edges(&before).unwrap();
+        rewrite_synthesized_edges(&mut reference, &before);
+        let ids = edge_ids(&store);
+        let counts = store.replace_synthesized_edges(&after).unwrap();
+        rewrite_synthesized_edges(&mut reference, &after);
+        assert_eq!(counts, (4, 4));
+        assert_eq!(edge_contents(&store), edge_contents(&reference));
+        let now = edge_ids(&store);
+        let key = |source: &str, target: &str, line, col| {
+            (source.to_string(), target.to_string(), line, col)
+        };
+        // The base edge and the unchanged synthesized edge keep their rows.
+        for kept in [
+            key("function:a", "function:b", Some(3), Some(4)),
+            key("function:a", "function:c", Some(1), None),
+        ] {
+            assert_eq!(now[&kept], ids[&kept], "{kept:?}");
+        }
+        // The changed ones are new rows.
+        for changed in [
+            key("function:b", "function:c", Some(2), None),
+            key("function:c", "function:d", None, None),
+        ] {
+            assert!(now[&changed] > ids[&changed], "{changed:?}");
+        }
+        assert!(!now.contains_key(&key("function:b", "function:d", Some(1), Some(1))));
+        // Unchanged, the stage writes nothing.
+        assert_eq!(store.replace_synthesized_edges(&after).unwrap(), (0, 0));
+        assert_eq!(edge_ids(&store), now);
+    }
+
+    /// Of two edges with one identity the first is written, as `INSERT OR
+    /// IGNORE` writes it, even when the stored row is the second; an edge
+    /// whose identity a base edge holds is ignored and the base row stays;
+    /// an edge with an endpoint missing is skipped.
+    #[test]
+    fn replace_synthesized_edges_writes_what_insert_or_ignore_writes() {
+        let mut store = store("replace-first-of-identity");
+        store
+            .upsert_nodes(&[
+                node("function:a", "alpha", "src/a.rs"),
+                node("function:b", "beta", "src/b.rs"),
+                node("function:c", "gamma", "src/c.rs"),
+            ])
+            .unwrap();
+        let base = Edge {
+            line: Some(3),
+            col: Some(4),
+            ..edge("function:a", "function:b", EdgeKind::Calls)
+        };
+        store.insert_edges(&[base]).unwrap();
+        let first = registered_at(
+            synthesized("function:b", "function:c", Some(1), None),
+            "src/b.rs:1",
+        );
+        let second = registered_at(
+            synthesized("function:b", "function:c", Some(1), None),
+            "src/b.rs:2",
+        );
+        store
+            .replace_synthesized_edges(std::slice::from_ref(&second))
+            .unwrap();
+        let base_id = edge_ids(&store)[&(
+            "function:a".to_string(),
+            "function:b".to_string(),
+            Some(3),
+            Some(4),
+        )];
+        let counts = store
+            .replace_synthesized_edges(&[
+                first.clone(),
+                second,
+                synthesized("function:a", "function:b", Some(3), Some(4)),
+                synthesized("function:a", "function:missing", Some(1), None),
+            ])
+            .unwrap();
+        assert_eq!(counts, (1, 1));
+        let rows = edge_contents(&store);
+        let metadata = |at: &str| {
+            Some(
+                serde_json::to_string(
+                    &serde_json::json!({"synthesizedBy": "callback", "registeredAt": at}),
+                )
+                .unwrap(),
+            )
+        };
+        assert_eq!(
+            rows,
+            [
+                (
+                    "function:a".to_string(),
+                    "function:b".to_string(),
+                    "calls".to_string(),
+                    None,
+                    Some(3),
+                    Some(4),
+                    None,
+                ),
+                (
+                    "function:b".to_string(),
+                    "function:c".to_string(),
+                    "calls".to_string(),
+                    metadata("src/b.rs:1"),
+                    Some(1),
+                    None,
+                    Some("heuristic".to_string()),
+                ),
+            ]
+        );
+        assert_eq!(
+            edge_ids(&store)[&(
+                "function:a".to_string(),
+                "function:b".to_string(),
+                Some(3),
+                Some(4),
+            )],
+            base_id
+        );
+    }
+
+    /// The difference write leaves the rows the full rewrite leaves, over
+    /// generated histories: base edges, then stage runs, each keeping,
+    /// changing (metadata, provenance, line or column), dropping and
+    /// reordering the last run's edges and adding new ones, whose lists
+    /// repeat identities, collide with base edges and name missing nodes.
+    #[test]
+    fn replace_synthesized_edges_matches_the_full_rewrite() {
+        let mut seed: u64 = 0x5eed_7a18_c000_0001;
+        let mut next = move |bound: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % bound
+        };
+        let ids = ["function:a", "function:b", "function:c", "function:d"];
+        let nodes: Vec<Node> = ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| node(id, &format!("n{i}"), &format!("src/n{i}.rs")))
+            .collect();
+        let pick = |next: &mut dyn FnMut(u64) -> u64, synthesized_edge: bool| {
+            let end = |next: &mut dyn FnMut(u64) -> u64| {
+                // One in nine names a node the store does not hold.
+                if next(9) == 0 {
+                    "function:missing"
+                } else {
+                    ids[next(ids.len() as u64) as usize]
+                }
+            };
+            let source = end(next);
+            let target = end(next);
+            let line = [None, Some(1), Some(-1)][next(3) as usize];
+            let col = [None, Some(0), Some(-1)][next(3) as usize];
+            let base = Edge {
+                line,
+                col,
+                ..edge(source, target, EdgeKind::Calls)
+            };
+            if !synthesized_edge {
+                return base;
+            }
+            Edge {
+                metadata: Some(serde_json::json!({
+                    "synthesizedBy": "callback",
+                    "registeredAt": format!("src/x.rs:{}", next(2)),
+                })),
+                provenance: [Some("heuristic".to_string()), None][next(2) as usize].clone(),
+                ..base
+            }
+        };
+        let synthesized_rows = |store: &Store| -> usize {
+            store
+                .conn
+                .query_row(
+                    &format!("SELECT count(*) FROM edges WHERE {SYNTHESIZED}"),
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap() as usize
+        };
+        let mut kept = 0;
+        for case in 0..120 {
+            let mut reference = store(&format!("replace-generated-{case}-reference"));
+            let mut store = store(&format!("replace-generated-{case}"));
+            let bases: Vec<Edge> = (0..next(4)).map(|_| pick(&mut next, false)).collect();
+            let mut runs: Vec<Vec<Edge>> =
+                vec![(0..next(8)).map(|_| pick(&mut next, true)).collect()];
+            for _ in 0..3 {
+                let mut run = Vec::new();
+                for edge in runs.last().unwrap() {
+                    match next(7) {
+                        0 => {}
+                        1 => run.push(registered_at(edge.clone(), "src/x.rs:9")),
+                        2 => run.push(Edge {
+                            provenance: None,
+                            ..edge.clone()
+                        }),
+                        3 => run.push(Edge {
+                            col: edge.col.map_or(Some(-1), |_| None),
+                            ..edge.clone()
+                        }),
+                        4 => run.push(Edge {
+                            line: edge.line.map_or(Some(-1), |_| None),
+                            ..edge.clone()
+                        }),
+                        _ => run.push(edge.clone()),
+                    }
+                }
+                for _ in 0..next(3) {
+                    let at = next(run.len() as u64 + 1) as usize;
+                    run.insert(at, pick(&mut next, true));
+                }
+                if run.len() > 1 && next(2) == 0 {
+                    let at = next(run.len() as u64) as usize;
+                    let moved = run.remove(at);
+                    run.push(moved);
+                }
+                runs.push(run);
+            }
+            for target in [&mut store, &mut reference] {
+                target.upsert_nodes(&nodes).unwrap();
+                target.insert_edges(&bases).unwrap();
+            }
+            for run in &runs {
+                let stored = synthesized_rows(&store);
+                let (removed, _) = store.replace_synthesized_edges(run).unwrap();
+                kept += stored - removed;
+                rewrite_synthesized_edges(&mut reference, run);
+                assert_eq!(
+                    edge_contents(&store),
+                    edge_contents(&reference),
+                    "case {case}"
+                );
+            }
+        }
+        // The histories keep rows, not only rewrite them.
+        assert!(kept > 100, "{kept} rows kept");
     }
 
     /// A sync's site machinery never selects or deletes a synthesized edge

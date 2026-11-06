@@ -111,8 +111,9 @@ named-symbol flow recognize synthesized edges by that provenance value. The
 one exception is `go-method-contains`: its `contains` edge from a Go type to a
 method of its package declared outside the type's file has no provenance, as
 a parsed `contains` edge has, and only its `synthesizedBy` marks it. Only the
-synthesis stage writes them: it replaces every edge whose metadata names
-`synthesizedBy` in one transaction, and a sync's reference-site queries and
+synthesis stage writes them: it replaces the edges whose metadata names
+`synthesizedBy` in one transaction, keeping the row and id of each one it
+makes again unchanged, and a sync's reference-site queries and
 deletions leave such edges alone, so the rest of the graph is what a fresh index
 resolves before any synthesized edge exists.
 
