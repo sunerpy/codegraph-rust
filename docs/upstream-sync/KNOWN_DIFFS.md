@@ -64,14 +64,14 @@ colby behaviors are intentionally NOT ported in v1:
   expect/actual, gRPC stub, MyBatis, gin middleware-chain, redux-thunk,
   object-registry, RTK Query, Pinia, Vuex, Celery, Spring event, MediatR,
   Sidekiq, Laravel event, C function-pointer, GoFrame route and Go func-field
-  passes, the Vue template pass, the SvelteKit loader and page passes, the
-  Expo Router return pass and the Next.js, React Router, TanStack Router, Vue
-  Router and SvelteKit link passes, and the Go prerequisites
+  passes, the Vue and Angular template passes, the SvelteKit loader and page
+  passes, the Expo Router return pass and the Next.js, React Router, TanStack
+  Router, Vue Router and SvelteKit link passes, and the Go prerequisites
   (`go-method-contains`, `go-implements`) are ported
   (`crates/codegraph-resolve/src/synthesis/`); the others draw no edge here
-  yet, the Angular template pass among them. colby reads no Expo Router `<Link href>`, `<Redirect
-  href>` or `Stack.Screen` name either (`frameworks/expo-router.ts`, "Not
-  covered yet"). The link passes keep `b635dd46`'s view of their inputs:
+  yet. colby reads no Expo Router `<Link href>`, `<Redirect href>` or
+  `Stack.Screen` name either (`frameworks/expo-router.ts`, "Not covered
+  yet"). The link passes keep `b635dd46`'s view of their inputs:
   #2769's escaping of a wrapper's name in the React Router prefilter, and
   #2484's `unittests/` and `*_unittest(s)/` test directories, are PORT rows
   of the 2026-10-22 audit, left to the next round. Two colby readings are
@@ -558,6 +558,20 @@ regex engine), is not listed.
   of its key in the composable's file. colby takes the first in node order
   at each step. A file joins nothing unless it holds exactly one component
   (`synthesis/vue.rs`).
+- **Angular templates (W7-18d, OD-B18).** A `templateUrl` template the
+  index holds is read as the index holds it, so one changed since it was
+  indexed reads as absent until its own sync; any other is read only where
+  the scan's rules admit it whatever its extension, through no symbolic
+  link, no larger than `indexing.max_file_size` and never outside the
+  project root, and is recorded, so that a sync that finds it reading
+  differently recomputes the stage. colby reads any file at the path. An
+  inline `template:` is read only when its value is a string or template
+  literal; colby takes the value's first character for the quote and reads
+  from there to that character's next occurrence, so `template: tag + '…' +
+  tag` reads `ag + '…' + `. A link's destination is read as a navigation
+  call's is (W7-13): a relative arm, or one that leaves the site, drops out
+  before the arms are matched, where colby checks only the first arm
+  (`synthesis/angular.rs`).
 - **A SvelteKit route's page (W7-18b).** Every page the SvelteKit table
   holds calls its own file's component, a page whose path another page of
   its app serves too (route groups `(a)/x` and `(b)/x`, which SvelteKit
