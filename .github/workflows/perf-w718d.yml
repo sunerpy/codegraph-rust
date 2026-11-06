@@ -1,0 +1,118 @@
+name: Perf W7-18d r3
+
+# A throwaway measurement (owner 2026-11-05, OD-B19): the W7-18d r3 one-file sync under
+# the frozen method on the corpora the local machine could not measure, one
+# runner per corpus, which no other session loads. It lives only on
+# perf/w718d-* branches and is never merged.
+on:
+  push:
+    branches: ["perf/w718d-*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: perf-w718d
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CARGO_TERM_COLOR: never
+  CODEGRAPH_NO_DAEMON: "1"
+  CODEGRAPH_NO_WATCH: "1"
+  PRE: fec4fbb04bbdfee20584254592ba414687d77862
+  BASE: 7bb0ec392f373ddb21876bc865008002bde9ee60
+  CAND: 6df893e32b28af2c7e6b9b1f0666c9732eef58cd
+
+jobs:
+  measure:
+    name: ${{ matrix.corpus }}, frozen method
+    strategy:
+      fail-fast: false
+      matrix:
+        corpus: [ghostfolio, typescript-large]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 355
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master 2026-09-12
+        with:
+          toolchain: 1.98.0
+          components: rustfmt,clippy,llvm-tools-preview
+
+      - name: Tools, disk and runner
+        run: |
+          set -euo pipefail
+          sudo apt-get update -q
+          sudo apt-get install -y -q sqlite3 zstd rsync
+          root=/mnt/perf
+          if ! sudo mkdir -p "$root" || [ "$(df --output=avail -BG /mnt | tail -1 | tr -dc 0-9)" -lt 40 ]; then
+            root=$RUNNER_TEMP/perf
+          fi
+          sudo mkdir -p "$root" && sudo chown "$USER" "$root"
+          echo "PERF_ROOT=$root" >> "$GITHUB_ENV"
+          mkdir -p "$root/evidence"
+          { echo "root $root"; uname -a; nproc; lscpu | sed -n '1,16p'; free -h; df -h / /mnt /dev/shm "$root"; cat /proc/loadavg; } \
+            | tee "$root/evidence/runner.txt"
+          test "$(df --output=avail -BG "$root" | tail -1 | tr -dc 0-9)" -ge 30
+
+      - name: Build the three fast builds
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD~1)" = "$CAND"
+          test "$(git rev-parse HEAD~2)" = "$BASE"
+          git merge-base --is-ancestor "$PRE" "$BASE"
+          bash .github/perf-w718d/build.sh "$PERF_ROOT/dir" "$PERF_ROOT/target" "$PRE" "$BASE" "$CAND" \
+            2>&1 | tee "$PERF_ROOT/evidence/build.log" | grep -E '^(bin-|[0-9a-f]{64} )|Finished|error'
+          rm -rf "$PERF_ROOT/target"
+          git worktree remove --force "$PERF_ROOT/dir/trees/bin-before"
+          git worktree remove --force "$PERF_ROOT/dir/trees/bin-18c-fast"
+          git worktree remove --force "$PERF_ROOT/dir/trees/bin-18d-fast"
+          df -h "$PERF_ROOT"
+
+      - name: The fast builds differ as W7-18d says
+        run: |
+          set -euo pipefail
+          bash .github/perf-w718d/sanity.sh "$PERF_ROOT/dir" | tee "$PERF_ROOT/evidence/sanity.txt"
+          grep -qx "18c: marker 16, edges " "$PERF_ROOT/evidence/sanity.txt"
+          grep -qx "18d: marker 17, edges angular-event XComponent -> go;" "$PERF_ROOT/evidence/sanity.txt"
+
+      - name: Fetch the corpus
+        env:
+          CORPUS: ${{ matrix.corpus }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$PERF_ROOT/corpora"
+          spec=$(bash .github/perf-w718d/fetch-corpus.sh "$CORPUS" "$PERF_ROOT/corpora")
+          printf '%s\n' "$spec" > "$PERF_ROOT/spec.txt"
+          cat "$PERF_ROOT/spec.txt"
+
+      - name: Measure (frozen method)
+        run: |
+          set -euo pipefail
+          bash .github/perf-w718d/quiet-then-perf.sh "$PERF_ROOT/dir" "$PERF_ROOT/evidence" \
+            "$PERF_ROOT" "$(cat "$PERF_ROOT/spec.txt")"
+
+      - name: Per-round fresh-index check
+        run: |
+          set -euo pipefail
+          bash .github/perf-w718d/per-round.sh "$PERF_ROOT/dir" "$PERF_ROOT/evidence/per-round" \
+            "$PERF_ROOT/evidence/times.txt" "$PERF_ROOT/evidence/hashes.txt" w718d "$(cat "$PERF_ROOT/spec.txt")"
+
+      - name: Keep the evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: perf-w718d-${{ matrix.corpus }}
+          path: ${{ env.PERF_ROOT }}/evidence
+          if-no-files-found: error
+          retention-days: 30
