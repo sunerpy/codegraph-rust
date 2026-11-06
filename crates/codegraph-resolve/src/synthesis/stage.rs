@@ -21,8 +21,8 @@ use rayon::prelude::*;
 use super::context::ViewContext;
 use super::inputs::{self, Inputs, UnindexedReader};
 use super::{
-    c_fnptr, callback, dispatch, framework, go, go_dispatch, go_func_field, goframe, iface,
-    is_synthesized, jsx, links, registry, sveltekit, vue,
+    angular, c_fnptr, callback, dispatch, framework, go, go_dispatch, go_func_field, goframe,
+    iface, is_synthesized, jsx, links, registry, sveltekit, vue,
 };
 use crate::context::StoreResolutionContext;
 use crate::frameworks::route_href::RouteTables;
@@ -179,6 +179,11 @@ const PASSES: &[(&str, Gate, Pass)] = &[
         "vueRouterLinkEdges",
         framework::store_gate,
         links::vue_router_link_edges,
+    ),
+    (
+        "angularTemplateEdges",
+        angular::gate,
+        angular::template_edges,
     ),
     (
         "svelteKitPageEdges",
@@ -503,6 +508,26 @@ impl<'a> View<'a> {
         let mut nodes = self.store.nodes_by_file_path(file)?;
         nodes.sort_by(|a, b| (a.start_line, &a.id).cmp(&(b.start_line, &b.id)));
         Ok(nodes)
+    }
+
+    /// The classes, methods and properties of each of `files`, by file, in
+    /// [`Self::nodes_in_file`]'s order, read with one query for them all
+    /// (W7-18d's cost revision); a file without any has no entry.
+    pub(super) fn classes_and_members_in_files(
+        &self,
+        files: &[String],
+    ) -> Result<HashMap<String, Vec<Node>>> {
+        let mut by_file: HashMap<String, Vec<Node>> = HashMap::new();
+        for node in self.store.classes_and_members_by_file_paths(files)? {
+            by_file
+                .entry(node.file_path.clone())
+                .or_default()
+                .push(node);
+        }
+        for nodes in by_file.values_mut() {
+            nodes.sort_by(|a, b| (a.start_line, &a.id).cmp(&(b.start_line, &b.id)));
+        }
+        Ok(by_file)
     }
 
     /// The structs, unions, functions and methods of [`Self::nodes_in_file`],
@@ -998,6 +1023,56 @@ mod tests {
             .collect();
         assert_eq!(read, expected);
         assert_eq!(expected, ["g", "c", "f", "m"]);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The classes, methods and properties of many files read at once
+    /// (W7-18d's cost revision) are each file's nodes of those kinds in
+    /// [`View::nodes_in_file`]'s order, by line and then id; a file without
+    /// any, or not indexed, has no entry.
+    #[test]
+    fn many_files_classes_and_members_come_in_each_files_node_order() {
+        let (mut store, dir) = temp_store("classes-and-members");
+        let node = |id: &str, kind: NodeKind, file: &str, line: i64| Node {
+            kind,
+            start_line: line,
+            end_line: line + 1,
+            ..function(&format!("{file}:{id}"), file)
+        };
+        let mut nodes = Vec::new();
+        for file in ["src/a.ts", "src/b.ts"] {
+            nodes.extend([
+                node("m2", NodeKind::Method, file, 3),
+                node("p", NodeKind::Property, file, 2),
+                node("f", NodeKind::Function, file, 2),
+                node("k", NodeKind::Class, file, 1),
+                node("m1", NodeKind::Method, file, 3),
+                node("i", NodeKind::Import, file, 1),
+            ]);
+        }
+        nodes.push(node("f", NodeKind::Function, "src/c.ts", 1));
+        store.upsert_nodes(&nodes).unwrap();
+        let view = View::new(&store, &dir, 1 << 20);
+        let files = ["src/a.ts", "src/b.ts", "src/c.ts", "src/absent.ts"].map(str::to_string);
+        let read = view.classes_and_members_in_files(&files).unwrap();
+        for file in ["src/a.ts", "src/b.ts"] {
+            let expected: Vec<Node> = view
+                .nodes_in_file(file)
+                .unwrap()
+                .into_iter()
+                .filter(|node| {
+                    matches!(
+                        node.kind,
+                        NodeKind::Class | NodeKind::Method | NodeKind::Property
+                    )
+                })
+                .collect();
+            let ids: Vec<String> = expected.iter().map(|node| node.id.clone()).collect();
+            assert_eq!(ids, ["k", "p", "m1", "m2"].map(|id| format!("{file}:{id}")));
+            assert_eq!(read.get(file), Some(&expected), "{file}");
+        }
+        assert_eq!(read.len(), 2);
         drop(store);
         std::fs::remove_dir_all(dir).unwrap();
     }

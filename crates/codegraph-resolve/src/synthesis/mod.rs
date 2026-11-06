@@ -26,6 +26,7 @@
 //! after any sync that changes the index or finds a recorded file reading
 //! differently, under [`VERSION_KEY`].
 
+mod angular;
 mod c_fnptr;
 mod callback;
 mod context;
@@ -59,7 +60,7 @@ use codegraph_store::Store;
 pub const VERSION_KEY: &str = "synthesis_version";
 
 /// The marker's value; a change to what the passes produce moves it.
-pub const VERSION: &str = "16";
+pub const VERSION: &str = "17";
 
 /// The edges one channel, class or declaration links at most (upstream
 /// `MAX_CALLBACKS_PER_CHANNEL`).

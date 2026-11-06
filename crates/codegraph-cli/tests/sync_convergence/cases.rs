@@ -17498,6 +17498,91 @@ pub fn c_fnptr_non_indexed_include_becomes_excluded() -> Case {
         .no_edge_after("function go", "calls", "function one")
 }
 
+/// W7-18d: a component whose `templateUrl` names a template the scan does
+/// not index, and the two handlers its class declares.
+const ANGULAR_X_COMPONENT: &str = "import { Component } from '@angular/core';\n@Component({ selector: 'app-x', templateUrl: './x.component.html' })\nexport class XComponent {\n  one(): void {}\n  two(): void {}\n}\n";
+
+/// W7-18d: [`ANGULAR_X_COMPONENT`] with its `templateUrl` naming another
+/// template.
+const ANGULAR_X_COMPONENT_OTHER: &str = "import { Component } from '@angular/core';\n@Component({ selector: 'app-x', templateUrl: './other.component.html' })\nexport class XComponent {\n  one(): void {}\n  two(): void {}\n}\n";
+
+/// W7-18d: a template whose button runs `one`.
+const ANGULAR_TEMPLATE_ONE: &str = "<button (click)=\"one()\">One</button>\n";
+
+/// W7-18d: a template whose button runs `two`.
+const ANGULAR_TEMPLATE_TWO: &str = "<button (click)=\"two()\">Two</button>\n";
+
+/// W7-18d: only the template the stage read beside the index changes, the
+/// component is unchanged: its button comes to run the other handler.
+pub fn typescript_angular_template_file_runs_another_handler() -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript])
+        .file("package.json", ANGULAR_PACKAGE)
+        .file("src/app/x/x.component.ts", ANGULAR_X_COMPONENT)
+        .file("src/app/x/x.component.html", ANGULAR_TEMPLATE_ONE)
+        .write("src/app/x/x.component.html", ANGULAR_TEMPLATE_TWO)
+        .edge_before("class XComponent", "calls", "method XComponent::one")
+        .no_edge_after("class XComponent", "calls", "method XComponent::one")
+        .edge_after("class XComponent", "calls", "method XComponent::two")
+        .edge_metadata_after(
+            ("class XComponent", "calls", "method XComponent::two"),
+            "synthesizedBy",
+            "angular-event",
+        )
+}
+
+/// W7-18d: the template a `templateUrl` names appears, though no file the
+/// index holds changes.
+pub fn typescript_angular_template_file_appears() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::TypeScript])
+        .file("package.json", ANGULAR_PACKAGE)
+        .file("src/app/x/x.component.ts", ANGULAR_X_COMPONENT)
+        .write("src/app/x/x.component.html", ANGULAR_TEMPLATE_ONE)
+        .edge_after("class XComponent", "calls", "method XComponent::one")
+}
+
+/// W7-18d: the template is deleted.
+pub fn typescript_angular_template_file_deleted() -> Case {
+    Case::new(Change::DeleteImportedModule, &[Language::TypeScript])
+        .file("package.json", ANGULAR_PACKAGE)
+        .file("src/app/x/x.component.ts", ANGULAR_X_COMPONENT)
+        .file("src/app/x/x.component.html", ANGULAR_TEMPLATE_ONE)
+        .remove("src/app/x/x.component.html")
+        .edge_before("class XComponent", "calls", "method XComponent::one")
+        .no_edge_after("class XComponent", "calls", "method XComponent::one")
+}
+
+/// W7-18d: the component's `templateUrl` comes to name another template,
+/// both unchanged.
+pub fn typescript_angular_template_url_names_another_template() -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript])
+        .file("package.json", ANGULAR_PACKAGE)
+        .file("src/app/x/x.component.ts", ANGULAR_X_COMPONENT)
+        .file("src/app/x/x.component.html", ANGULAR_TEMPLATE_ONE)
+        .file("src/app/x/other.component.html", ANGULAR_TEMPLATE_TWO)
+        .write("src/app/x/x.component.ts", ANGULAR_X_COMPONENT_OTHER)
+        .edge_before("class XComponent", "calls", "method XComponent::one")
+        .no_edge_after("class XComponent", "calls", "method XComponent::one")
+        .edge_after("class XComponent", "calls", "method XComponent::two")
+}
+
+/// W7-18d: `codegraph.json` maps `.html` to JavaScript, so the template is
+/// an indexed file, read as the index holds it; it changes, the component
+/// is unchanged.
+pub fn typescript_angular_indexed_template_runs_another_handler() -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript])
+        .file(
+            ".codegraph/codegraph.json",
+            "{\"extensions\":{\".html\":\"javascript\"}}\n",
+        )
+        .file("package.json", ANGULAR_PACKAGE)
+        .file("src/app/x/x.component.ts", ANGULAR_X_COMPONENT)
+        .file("src/app/x/x.component.html", ANGULAR_TEMPLATE_ONE)
+        .write("src/app/x/x.component.html", ANGULAR_TEMPLATE_TWO)
+        .edge_before("class XComponent", "calls", "method XComponent::one")
+        .no_edge_after("class XComponent", "calls", "method XComponent::one")
+        .edge_after("class XComponent", "calls", "method XComponent::two")
+}
+
 /// W7-16c: the root `go.mod` of a GoFrame app.
 const GOFRAME_GO_MOD: &str = "module example.com/app\n\nrequire github.com/gogf/gf/v2 v2.7.0\n";
 
