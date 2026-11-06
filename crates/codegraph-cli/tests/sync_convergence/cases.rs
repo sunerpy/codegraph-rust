@@ -18047,3 +18047,91 @@ pub fn typescript_expo_push_comes_to_consume_a_helper() -> Case {
         "src/services/login.ts:4",
     )
 }
+
+/// W7-18c: the member a template's handler destructures from a composable
+/// is renamed in the composable's file; the component, unchanged, binds
+/// nothing there any more.
+pub fn vue_composable_member_is_renamed() -> Case {
+    Case::new(
+        Change::RenameSymbol,
+        &[Language::Vue, Language::TypeScript],
+    )
+    .file(
+        "composables/useSidebar.ts",
+        "export function useSidebar() {\n  function close() {\n    return false;\n  }\n  return { close };\n}\n",
+    )
+    .file(
+        "components/AppSidebar.vue",
+        "<template>\n  <button @click=\"closeSidebar\">x</button>\n</template>\n\n<script setup lang=\"ts\">\nimport { useSidebar } from '../composables/useSidebar';\nconst { close: closeSidebar } = useSidebar();\n</script>\n",
+    )
+    .write(
+        "composables/useSidebar.ts",
+        "export function useSidebar() {\n  function shut() {\n    return false;\n  }\n  return { close: shut };\n}\n",
+    )
+    .edge_before(
+        "component components/AppSidebar.vue::AppSidebar",
+        "calls",
+        "function useSidebar::close",
+    )
+}
+
+/// W7-18c: the component a template's kebab-case tag names appears in
+/// another file; the template, unchanged, renders it.
+pub fn vue_kebab_component_appears_elsewhere() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Vue])
+        .file(
+            "components/AppHeader.vue",
+            "<template>\n  <header><el-button>go</el-button></header>\n</template>\n",
+        )
+        .write(
+            "components/ElButton.vue",
+            "<template>\n  <button><slot /></button>\n</template>\n",
+        )
+        .edge_after(
+            "component components/AppHeader.vue::AppHeader",
+            "calls",
+            "component components/ElButton.vue::ElButton",
+        )
+        .edge_metadata_after(
+            (
+                "component components/AppHeader.vue::AppHeader",
+                "calls",
+                "component components/ElButton.vue::ElButton",
+            ),
+            "synthesizedBy",
+            "jsx-render",
+        )
+}
+
+/// W7-18c: `package.json` comes to declare the package a template's tag is
+/// imported from; the tag renders that package's component, no longer the
+/// project's namesake.
+pub fn vue_package_json_declares_an_imported_tags_package() -> Case {
+    Case::new(
+        Change::ControlFile,
+        &[Language::Vue],
+    )
+    .file("package.json", "{\"dependencies\":{\"vue\":\"^3.4.0\"}}\n")
+    .file(
+        "src/components/ui/Card.vue",
+        "<template>\n  <div><slot /></div>\n</template>\n",
+    )
+    .file(
+        "src/views/Dashboard.vue",
+        "<script setup lang=\"ts\">\nimport { Card } from 'ant-design-vue';\n</script>\n\n<template>\n  <Card title=\"Usage\">x</Card>\n</template>\n",
+    )
+    .write(
+        "package.json",
+        "{\"dependencies\":{\"vue\":\"^3.4.0\",\"ant-design-vue\":\"^4.0.0\"}}\n",
+    )
+    .edge_before(
+        "component src/views/Dashboard.vue::Dashboard",
+        "calls",
+        "component src/components/ui/Card.vue::Card",
+    )
+    .no_edge_after(
+        "component src/views/Dashboard.vue::Dashboard",
+        "calls",
+        "component src/components/ui/Card.vue::Card",
+    )
+}

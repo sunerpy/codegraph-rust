@@ -2853,6 +2853,14 @@ mod js {
             "{:?}",
             component_calls("components/Dialog.vue")
         );
+        // `@click="close"` is still the handler it names (W7-18c's template
+        // pass, at the component's line).
+        assert!(
+            component_calls("components/Dialog.vue")
+                .contains(&"close@components/Dialog.vue:1".to_string()),
+            "{:?}",
+            component_calls("components/Dialog.vue")
+        );
     }
 
     /// Upstream #2177 (`48498021`), its JavaScript part: fetch's Response,
@@ -24072,7 +24080,7 @@ mod synthesis {
         assert_eq!((edge.line, edge.col), (Some(7), None), "{edge:?}");
         assert_eq!(
             project_metadata_with_prefix(&project.db(), "synthesis_version"),
-            [("synthesis_version".to_string(), "15".to_string())]
+            [("synthesis_version".to_string(), "16".to_string())]
         );
     }
 
@@ -35474,6 +35482,147 @@ type lowerReq struct {
         assert!(
             !linked.iter().any(|link| link.starts_with("ANY /r2000 ")),
             "{linked:#?}"
+        );
+    }
+}
+
+mod vue_templates {
+    use super::support::{Graph, Project, graph_of};
+
+    /// The edges the Vue template pass draws as `by): source -> target
+    /// file:line {metadata}`, sorted, the metadata without `synthesizedBy`.
+    fn drawn(graph: &Graph, by: &str) -> Vec<String> {
+        let mut edges: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.metadata["synthesizedBy"] == by)
+            .map(|edge| {
+                let source = graph.node(&edge.source).expect("the source");
+                let target = graph.node(&edge.target).expect("the target");
+                let mut metadata = edge.metadata.clone();
+                metadata
+                    .as_object_mut()
+                    .expect("an object")
+                    .remove("synthesizedBy");
+                format!(
+                    "{} -> {} {}:{} {metadata}",
+                    source.name, target.name, target.file_path, target.start_line
+                )
+            })
+            .collect();
+        edges.sort();
+        edges
+    }
+
+    /// Upstream `jsx-package-imports.test.ts` "binds nothing in a Vue
+    /// template for a tag or a composable imported from a package" (#2475's
+    /// Vue half, W7-18c): ant-design-vue's `<Card>` and `<Button>` render
+    /// the package's components, not the project's of those names, and the
+    /// handler is what the package's composable returns, not the project's
+    /// composable of the same name.
+    #[test]
+    fn w718c_a_tag_or_a_composable_a_package_answers_binds_nothing() {
+        let project = Project::new()
+            .file(
+                "package.json",
+                "{\"dependencies\":{\"vue\":\"^3.4.0\",\"ant-design-vue\":\"^4.0.0\",\"@vueuse/core\":\"^10.0.0\"}}",
+            )
+            .file(
+                "src/components/ui/card/Card.vue",
+                "<script setup lang=\"ts\">\ndefineProps<{ title?: string }>();\n</script>\n\n<template>\n  <div class=\"card\"><slot /></div>\n</template>\n",
+            )
+            .file(
+                "src/components/ui/button/Button.vue",
+                "<script setup lang=\"ts\">\ndefineProps<{ variant?: string }>();\n</script>\n\n<template>\n  <button><slot /></button>\n</template>\n",
+            )
+            .file(
+                "src/components/AppHeader.vue",
+                "<script setup lang=\"ts\">\nconst title = \"App\";\n</script>\n\n<template>\n  <header>{{ title }}</header>\n</template>\n",
+            )
+            .file(
+                "src/composables/useFullscreen.ts",
+                "export function useFullscreen() {\n  function toggle() {\n    return document.fullscreenElement;\n  }\n  return { toggle };\n}\n",
+            )
+            .file(
+                "src/views/Dashboard.vue",
+                "<script setup lang=\"ts\">\nimport { Button, Card } from 'ant-design-vue';\nimport { useFullscreen } from '@vueuse/core';\nimport AppHeader from '../components/AppHeader.vue';\n\nconst { toggle: toggleFullscreen } = useFullscreen();\n</script>\n\n<template>\n  <AppHeader />\n  <Card title=\"Usage\">\n    <Button @click=\"toggleFullscreen\">Full screen</Button>\n  </Card>\n</template>\n",
+            )
+            .index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            drawn(graph, "jsx-render"),
+            ["Dashboard -> AppHeader src/components/AppHeader.vue:1 {\"via\":\"AppHeader\"}"],
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            drawn(graph, "vue-handler"),
+            Vec::<String>::new(),
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// A template's tags and handlers (W7-18c, upstream `vueTemplateEdges`):
+    /// a kebab-case tag renders its PascalCase component, a tag no node is
+    /// named renders the component Nuxt auto-imports under that name, a
+    /// built-in renders nothing; a bare handler is the function it names, a
+    /// handler the script destructures from a composable is that member of
+    /// the composable's file, an expression's leading name only through its
+    /// composable, every edge at the component's line.
+    #[test]
+    fn w718c_a_template_renders_its_tags_and_binds_its_handlers() {
+        let project = Project::new()
+            .file("package.json", "{\"name\":\"shop\",\"dependencies\":{\"nuxt\":\"^4.0.0\"}}")
+            .file(
+                "components/ElButton.vue",
+                "<template>\n  <button><slot /></button>\n</template>\n",
+            )
+            .file(
+                "components/media/Card.vue",
+                "<template>\n  <div><slot /></div>\n</template>\n",
+            )
+            .file(
+                "composables/useSidebar.ts",
+                "export function useSidebar() {\n  let open = true;\n  function close() {\n    open = false;\n  }\n  function toggle() {\n    open = !open;\n  }\n  return { close, toggle };\n}\n",
+            )
+            .file(
+                "components/AppSidebar.vue",
+                "<template>\n  <aside>\n    <el-button @click=\"closeSidebar\">x</el-button>\n    <MediaCard />\n    <NuxtLink to=\"/\">home</NuxtLink>\n    <button @click=\"toggle(1)\">t</button>\n    <button @click=\"refresh\">r</button>\n    <button @click=\"refresh(true)\">again</button>\n  </aside>\n</template>\n\n<script setup lang=\"ts\">\nconst { close: closeSidebar, toggle } = useSidebar();\nfunction refresh(force?: boolean) {\n  return force;\n}\n</script>\n",
+            )
+            .index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            drawn(graph, "jsx-render"),
+            [
+                "AppSidebar -> Card components/media/Card.vue:1 {\"via\":\"MediaCard\"}",
+                "AppSidebar -> ElButton components/ElButton.vue:1 {\"via\":\"el-button\"}",
+            ],
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            drawn(graph, "vue-handler"),
+            [
+                "AppSidebar -> close composables/useSidebar.ts:3 {\"event\":\"click\",\"via\":\"useSidebar\"}",
+                "AppSidebar -> refresh components/AppSidebar.vue:14 {\"event\":\"click\"}",
+                "AppSidebar -> toggle composables/useSidebar.ts:6 {\"event\":\"click\",\"via\":\"useSidebar\"}",
+            ],
+            "{}",
+            graph.report()
+        );
+        assert!(
+            graph
+                .edges
+                .iter()
+                .filter(|edge| edge.metadata["synthesizedBy"] == "jsx-render"
+                    || edge.metadata["synthesizedBy"] == "vue-handler")
+                .all(|edge| edge.kind == "calls"
+                    && edge.line == Some(1)
+                    && edge.col.is_none()
+                    && edge.provenance.as_deref() == Some("heuristic")),
+            "{}",
+            graph.report()
         );
     }
 }

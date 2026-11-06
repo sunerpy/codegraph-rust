@@ -136,6 +136,13 @@ its loader at the component's `line`, with `via`, the hook's name, and
 page route to its own file's component at the component's `line`, with
 `registeredAt`, the file's path.
 
+The Vue template pass's `calls` edges (W7-18c) go from a `.vue` file's
+component, at its `line`, with no column: a `jsx-render` edge to what a tag
+renders, with `via`, the tag as written (`el-button`, `MediaCard`), and a
+`vue-handler` edge to a handler, with `event`, the event it is bound to
+(`click`), and, for a member a composable returns, `via`, the composable's
+name.
+
 An edge a framework resolver made (`resolvedBy: "framework"`) names that
 resolver in `metadata.framework` (`react`, `vue`, `nuxt`, `nestjs`, `godot`, `tauri`),
 as a synthesized edge names its pass. When one reference reaches several
@@ -496,7 +503,7 @@ persisted, and withdrawn with the others before a sync's first change. A sync
 that finds it missing or at another version re-resolves every Rust file. It is
 not a canonical surface.
 
-`synthesis_version` (15) vouches that the synthesized edges are the synthesis
+`synthesis_version` (16) vouches that the synthesized edges are the synthesis
 stage's output over the current base graph and the files it read beside the
 index. A full index and a migration write it after the stage. A sync withdraws
 it before its first change, before a lane bootstrap's first write, before the

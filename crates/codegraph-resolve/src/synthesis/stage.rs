@@ -22,7 +22,7 @@ use super::context::ViewContext;
 use super::inputs::{self, Inputs, UnindexedReader};
 use super::{
     c_fnptr, callback, dispatch, framework, go, go_dispatch, go_func_field, goframe, iface,
-    is_synthesized, jsx, links, registry, sveltekit,
+    is_synthesized, jsx, links, registry, sveltekit, vue,
 };
 use crate::context::StoreResolutionContext;
 use crate::frameworks::route_href::RouteTables;
@@ -73,6 +73,11 @@ const PASSES: &[(&str, Gate, Pass)] = &[
     ("emitterEdges", always, callback::event_emitter_edges),
     ("renderEdges", always, dispatch::react_render_edges),
     ("jsxEdges", jsx::gate, jsx::jsx_render_edges),
+    (
+        "vueEdges",
+        |languages| languages.contains(&Language::Vue),
+        vue::template_edges,
+    ),
     (
         "svelteKitEdges",
         |languages| languages.contains(&Language::Svelte),
@@ -538,6 +543,13 @@ impl<'a> View<'a> {
         text: &str,
     ) -> Result<Vec<Node>> {
         let mut nodes = self.store.nodes_of_kind_whose_signature_holds(kind, text)?;
+        nodes.sort_by(node_order);
+        Ok(nodes)
+    }
+
+    /// The nodes of `kind`, in [`node_order`] (upstream `getNodesByKind`).
+    pub(super) fn nodes_of_kind(&self, kind: NodeKind) -> Result<Vec<Node>> {
+        let mut nodes = self.store.nodes_by_kind(kind)?;
         nodes.sort_by(node_order);
         Ok(nodes)
     }

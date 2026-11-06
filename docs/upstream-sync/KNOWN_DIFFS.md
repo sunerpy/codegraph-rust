@@ -64,12 +64,12 @@ colby behaviors are intentionally NOT ported in v1:
   expect/actual, gRPC stub, MyBatis, gin middleware-chain, redux-thunk,
   object-registry, RTK Query, Pinia, Vuex, Celery, Spring event, MediatR,
   Sidekiq, Laravel event, C function-pointer, GoFrame route and Go func-field
-  passes, the SvelteKit loader and page passes, the Expo Router return pass
-  and the Next.js, React Router, TanStack Router, Vue Router and SvelteKit
-  link passes, and the Go prerequisites (`go-method-contains`,
-  `go-implements`) are ported (`crates/codegraph-resolve/src/synthesis/`);
-  the others draw no edge here yet, the Vue template and Angular template
-  passes among them. colby reads no Expo Router `<Link href>`, `<Redirect
+  passes, the Vue template pass, the SvelteKit loader and page passes, the
+  Expo Router return pass and the Next.js, React Router, TanStack Router, Vue
+  Router and SvelteKit link passes, and the Go prerequisites
+  (`go-method-contains`, `go-implements`) are ported
+  (`crates/codegraph-resolve/src/synthesis/`); the others draw no edge here
+  yet, the Angular template pass among them. colby reads no Expo Router `<Link href>`, `<Redirect
   href>` or `Stack.Screen` name either (`frameworks/expo-router.ts`, "Not
   covered yet"). The link passes keep `b635dd46`'s view of their inputs:
   #2769's escaping of a wrapper's name in the React Router prefilter, and
@@ -550,6 +550,14 @@ regex engine), is not listed.
   after the ones it kept; a fresh index writes the stage's edges after
   every base edge, as colby does (`replace_synthesized_edges` in
   `codegraph-store`).
+- **A Vue template's names (W7-18c).** A tag or a handler is the one node
+  of its name and kinds in the template's file, else the one of the project,
+  and nothing when either has several; a tag no node is named renders the
+  component Nuxt auto-imports under it only when one component has that
+  Nuxt name, and a handler destructured from a composable is the one member
+  of its key in the composable's file. colby takes the first in node order
+  at each step. A file joins nothing unless it holds exactly one component
+  (`synthesis/vue.rs`).
 - **A SvelteKit route's page (W7-18b).** Every page the SvelteKit table
   holds calls its own file's component, a page whose path another page of
   its app serves too (route groups `(a)/x` and `(b)/x`, which SvelteKit

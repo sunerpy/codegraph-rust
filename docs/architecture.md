@@ -377,11 +377,23 @@ with its prefix), and their `load` and `actions` of any kind
 (`sveltekit-load`, with `via` and `registeredAt`), and each SvelteKit page
 route calls the component of its own file (`sveltekit-page`, with
 `registeredAt`); both read only paths and nodes.
+A Vue pass reads each `.vue` file's root template: a kebab-case tag
+(`<el-button>`, as `ElButton`) or a PascalCase one renders the component,
+function or class of that name, a component nested in a `components/`
+directory also under the name Nuxt auto-imports it by
+(`components/media/Card.vue` as `<MediaCard>`; `jsx-render`, with `via`, the
+tag as written); a bare `@event` or `v-on:event` handler calls the method or
+function it names, and a handler the script destructures from a composable
+(`const { close: closeSidebar } = useSidebar()`) that member of the
+composable's file (`vue-handler`, with `event` and, for a composable's member,
+`via`), at most 30 a component. A name is the one node of the file, else of
+the project; a name several nodes answer, and a name the file imports from a
+package a `package.json` declares, render and call nothing.
 Each walks its candidates in upstream's order (nodes by file, line and id,
 edges by their other end, line and column); the Flutter, C++, interface,
 Kotlin, gRPC, MyBatis, gin, redux-thunk, RTK Query, Pinia, Vuex, Celery,
 Spring, MediatR, Sidekiq,
-Laravel, C function-pointer, GoFrame, Go func-field, link and SvelteKit passes run only when the index
+Laravel, C function-pointer, GoFrame, Go func-field, link, Vue and SvelteKit passes run only when the index
 has files of their languages, as upstream's gates have them. A full index and a migration run
 the stage after resolution. A sync runs it last, after the orphan sweep,
 whenever it changed the index, bootstrapped a lane, swept, found a recorded

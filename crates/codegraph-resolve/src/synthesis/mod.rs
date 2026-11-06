@@ -42,6 +42,7 @@ mod links;
 mod registry;
 mod stage;
 mod sveltekit;
+mod vue;
 
 pub use inputs::{INPUTS_KEY, Inputs, inputs_changed, recorded as recorded_inputs};
 pub use stage::{StageStats, run_stage, synthesize};
@@ -58,7 +59,7 @@ use codegraph_store::Store;
 pub const VERSION_KEY: &str = "synthesis_version";
 
 /// The marker's value; a change to what the passes produce moves it.
-pub const VERSION: &str = "15";
+pub const VERSION: &str = "16";
 
 /// The edges one channel, class or declaration links at most (upstream
 /// `MAX_CALLBACKS_PER_CHANNEL`).

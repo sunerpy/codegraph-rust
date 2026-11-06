@@ -158,6 +158,42 @@
   },
   {
     "col": null,
+    "kind": "calls",
+    "line": 1,
+    "metadata": {
+      "event": "click",
+      "synthesizedBy": "vue-handler"
+    },
+    "provenance": "heuristic",
+    "source": "component:bf4932bbbd9ae2d8b66cf6b90d96d83a",
+    "target": "function:9bdc9cd1f3fedac8bed880a1d4210b7a"
+  },
+  {
+    "col": null,
+    "kind": "calls",
+    "line": 1,
+    "metadata": {
+      "event": "click",
+      "synthesizedBy": "vue-handler"
+    },
+    "provenance": "heuristic",
+    "source": "component:f4f2c5bd83c7e2d2bd25b6aeca79a228",
+    "target": "method:7566b37e2869af6376067732e7d9dea8"
+  },
+  {
+    "col": null,
+    "kind": "calls",
+    "line": 1,
+    "metadata": {
+      "synthesizedBy": "jsx-render",
+      "via": "Counter"
+    },
+    "provenance": "heuristic",
+    "source": "component:bf4932bbbd9ae2d8b66cf6b90d96d83a",
+    "target": "component:f4f2c5bd83c7e2d2bd25b6aeca79a228"
+  },
+  {
+    "col": null,
     "kind": "contains",
     "line": null,
     "metadata": null,
