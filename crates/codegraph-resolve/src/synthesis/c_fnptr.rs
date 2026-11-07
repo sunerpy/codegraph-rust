@@ -2710,6 +2710,7 @@ mod tests {
             }
         }
         assert_eq!(dispatch_links(&store, &dir), expected);
+        drop(store);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -2731,12 +2732,14 @@ mod tests {
         nodes.extend(functions.iter().cloned());
         let store = hand_indexed(&dir, &[("ops.c", OPS_C)], &nodes);
         assert_eq!(dispatch_links(&store, &dir), ["go -> f"]);
+        drop(store);
         std::fs::remove_dir_all(&dir).unwrap();
 
         let dir = temp_dir("two-nodes");
         nodes.push(c_node("s2", NodeKind::Struct, "ops", "ops.c", 1));
         let store = hand_indexed(&dir, &[("ops.c", OPS_C)], &nodes);
         assert!(dispatch_links(&store, &dir).is_empty());
+        drop(store);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
