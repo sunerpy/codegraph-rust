@@ -11,7 +11,7 @@
 use crate::pathutil;
 use serde_json::Value;
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 
 thread_local! {
@@ -36,6 +36,68 @@ fn note_probe(path: &Path) {
 pub fn alias_config_inputs(project_root: &str) -> Vec<PathBuf> {
     PROBES.with(|probes| *probes.borrow_mut() = Some(Vec::new()));
     let _ = load_project_aliases(project_root);
+    let probed = PROBES
+        .with(|probes| probes.borrow_mut().take())
+        .unwrap_or_default();
+    let mut seen = HashSet::new();
+    probed
+        .into_iter()
+        .filter(|path| seen.insert(path.clone()))
+        .collect()
+}
+
+/// The directories the nearest-config lookup visits for `from_file`, a
+/// project path, nearest first (upstream #2165 `getNearestAliases`): the
+/// file's directory and each one above it, the project root excluded. Empty
+/// for a file at the root, and for a path that is absolute or has a `..`
+/// segment, which could leave the project.
+pub fn nearest_alias_walk(from_file: &str) -> Vec<&str> {
+    let leaves = from_file.starts_with('/')
+        || from_file.as_bytes().get(1) == Some(&b':')
+        || from_file.split('/').any(|segment| segment == "..");
+    let mut dirs = Vec::new();
+    if leaves {
+        return dirs;
+    }
+    let mut dir = from_file.rsplit_once('/').map_or("", |(dir, _)| dir);
+    while !dir.is_empty() && dir != "." {
+        dirs.push(dir);
+        dir = dir.rsplit_once('/').map_or("", |(parent, _)| parent);
+    }
+    dirs
+}
+
+/// The aliases `dir`, a directory below the project root, gives the files in
+/// and under it (upstream #2165): read the way the root's are, when the
+/// directory has a `tsconfig.json` or `jsconfig.json` and its configs
+/// declare `paths`. A directory with only a `tsconfig.base.json` has none.
+pub fn load_directory_aliases(dir: &Path) -> Option<AliasMap> {
+    if !["tsconfig.json", "jsconfig.json"]
+        .iter()
+        .any(|name| is_file(&dir.join(name)))
+    {
+        return None;
+    }
+    load_project_aliases(&dir.to_string_lossy())
+}
+
+/// Every path the nearest-config lookup probes or reads for the files
+/// `files` (project paths) of the project at `project_root`, once each, in
+/// the order it first does: in each directory a file's walk visits
+/// ([`nearest_alias_walk`]), the configs it looks for, a missing one
+/// included, and what [`load_project_aliases`] reads there when the
+/// directory has one. A directory above the one a file's lookup stops at is
+/// listed too. What a sync compares to know when an app's aliases may have
+/// moved (W5-06).
+pub fn nearest_alias_inputs(project_root: &str, files: &[String]) -> Vec<PathBuf> {
+    let dirs: BTreeSet<&str> = files
+        .iter()
+        .flat_map(|file| nearest_alias_walk(file))
+        .collect();
+    PROBES.with(|probes| *probes.borrow_mut() = Some(Vec::new()));
+    for dir in dirs {
+        let _ = load_directory_aliases(&Path::new(project_root).join(dir));
+    }
     let probed = PROBES
         .with(|probes| probes.borrow_mut().take())
         .unwrap_or_default();
@@ -480,6 +542,89 @@ mod tests {
             alias_config_inputs(&root.to_string_lossy()),
             [root.join("tsconfig.json"), base]
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// W7-09a (upstream #2165): the nearest-config walk visits the file's
+    /// directory and each one above it, the root excluded, and none for a
+    /// path that could leave the project.
+    #[test]
+    fn the_nearest_config_walk_stops_below_the_root() {
+        assert_eq!(
+            nearest_alias_walk("apps/web/src/pages/a.tsx"),
+            ["apps/web/src/pages", "apps/web/src", "apps/web", "apps"]
+        );
+        assert_eq!(nearest_alias_walk("src/a.ts"), ["src"]);
+        assert!(nearest_alias_walk("a.ts").is_empty());
+        assert!(nearest_alias_walk("../outside/a.ts").is_empty());
+        assert!(nearest_alias_walk("apps/../a.ts").is_empty());
+        assert!(nearest_alias_walk("/abs/a.ts").is_empty());
+    }
+
+    /// W7-09a: a directory's aliases need its own `tsconfig.json` or
+    /// `jsconfig.json` declaring `paths`; a `tsconfig.base.json` alone, as
+    /// upstream reads it, gives none.
+    #[test]
+    fn a_directory_without_its_own_config_gives_no_aliases() {
+        let root = temp_dir("dir-aliases");
+        write_json(
+            root.join("web/tsconfig.json"),
+            serde_json::json!({ "compilerOptions": { "paths": { "@/*": ["./src/*"] } } }),
+        );
+        write_json(
+            root.join("base/tsconfig.base.json"),
+            serde_json::json!({ "compilerOptions": { "paths": { "@/*": ["./src/*"] } } }),
+        );
+        write_json(
+            root.join("plain/tsconfig.json"),
+            serde_json::json!({ "compilerOptions": { "strict": true } }),
+        );
+        write_json(
+            root.join("js/jsconfig.json"),
+            serde_json::json!({ "compilerOptions": { "paths": { "~/*": ["./*"] } } }),
+        );
+        let web = load_directory_aliases(&root.join("web")).expect("web aliases");
+        assert!(web.base_url.ends_with("/web"));
+        assert_eq!(web.patterns[0].prefix, "@/");
+        assert!(load_directory_aliases(&root.join("base")).is_none());
+        assert!(load_directory_aliases(&root.join("plain")).is_none());
+        assert_eq!(
+            load_directory_aliases(&root.join("js"))
+                .expect("js aliases")
+                .patterns[0]
+                .prefix,
+            "~/"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// W7-09a: the nearest lookup's inputs are what it probes in each
+    /// directory a file's walk visits, missing configs included, and what
+    /// it reads where a directory has one.
+    #[test]
+    fn nearest_alias_inputs_are_every_path_the_walk_probes() {
+        let root = temp_dir("nearest-inputs");
+        write_json(
+            root.join("apps/web/tsconfig.json"),
+            serde_json::json!({ "extends": "../../tsconfig.base.json" }),
+        );
+        let files = vec!["apps/web/src/a.ts".to_string(), "lib/b.ts".to_string()];
+        let inputs = nearest_alias_inputs(&root.to_string_lossy(), &files);
+        let expected = [
+            root.join("apps/tsconfig.json"),
+            root.join("apps/jsconfig.json"),
+            root.join("apps/web/tsconfig.json"),
+            root.join("apps/web/../../tsconfig.base.json"),
+            append_json_extension(&root.join("apps/web/../../tsconfig.base.json")),
+            root.join("apps/web/../../tsconfig.base.json/tsconfig.json"),
+            root.join("apps/web/jsconfig.json"),
+            root.join("apps/web/tsconfig.base.json"),
+            root.join("apps/web/src/tsconfig.json"),
+            root.join("apps/web/src/jsconfig.json"),
+            root.join("lib/tsconfig.json"),
+            root.join("lib/jsconfig.json"),
+        ];
+        assert_eq!(inputs, expected);
         let _ = std::fs::remove_dir_all(&root);
     }
 

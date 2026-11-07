@@ -61,12 +61,12 @@ pub(crate) fn match_store_accessor_chain(
     let [only] = callables.as_slice() else {
         return None;
     };
-    Some(ResolvedRef {
-        original: reference.clone(),
-        target_node_id: only.id.clone(),
-        confidence: 0.6,
-        resolved_by: ResolvedBy::ExactMatch,
-    })
+    Some(ResolvedRef::new(
+        reference.clone(),
+        only.id.clone(),
+        0.6,
+        ResolvedBy::ExactMatch,
+    ))
 }
 
 /// A bare JS/TS call bound to a store action by a destructuring of

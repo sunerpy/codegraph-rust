@@ -139,10 +139,12 @@ fn php_extends_and_implements_are_supertypes() {
 /// interface's embedded interface are `extends` refs, named where they are
 /// written: `*Head` (the `*` is its own token), `sync.Mutex` by `Mutex`, and
 /// `Box[int]` by `Box`. A named field, a method, a type set (`~int |
-/// float64`) and a predeclared type are not embeddings.
+/// float64`) and a predeclared type are not embeddings, but `error` is: an
+/// interface with a method, which an embedding brings in like any type's
+/// from outside the index (#2759).
 #[test]
 fn go_embedded_types_are_supertypes() {
-    let source = "package db\n\ntype DB struct {\n\t*Head\n\tQueryable\n\tsync.Mutex\n\tBox[int]\n\tname string\n\terror\n}\n\ntype IRouter interface {\n\tIRoutes\n\tio.Reader\n\tGroup(p string) *RouterGroup\n\t~int | float64\n}\n";
+    let source = "package db\n\ntype DB struct {\n\t*Head\n\tQueryable\n\tsync.Mutex\n\tBox[int]\n\tname string\n\terror\n\tany\n}\n\ntype IRouter interface {\n\tIRoutes\n\tio.Reader\n\tGroup(p string) *RouterGroup\n\t~int | float64\n}\n";
     assert_eq!(
         supertypes("db/db.go", source, Language::Go),
         vec![
@@ -150,6 +152,7 @@ fn go_embedded_types_are_supertypes() {
             extends("DB", "Head"),
             extends("DB", "Mutex"),
             extends("DB", "Queryable"),
+            extends("DB", "error"),
             extends("IRouter", "IRoutes"),
             extends("IRouter", "Reader"),
         ]

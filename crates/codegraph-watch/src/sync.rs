@@ -846,6 +846,12 @@ fn sync_paths_with_store(
         || dart_library_bootstrap
         || shopify_bootstrap
         || !shopify.moved.is_empty();
+    // A bootstrap re-resolves dependents without `begin_mutation`: the
+    // synthesized edges go stale with them, so their marker goes first
+    // (W7-14).
+    if any_bootstrap {
+        codegraph_resolve::synthesis::withdraw_marker(store)?;
+    }
     // A sync with nothing to do detects no framework: the frameworks read
     // their control files (`package.json`, the Tauri markers), which are the
     // JS kind's inputs, and the sources a changed file brings.
@@ -863,7 +869,7 @@ fn sync_paths_with_store(
             let context = resolver.store_context(store);
             resolver.initialize(&context);
         }
-        frameworks = resolver.framework_names();
+        frameworks = resolver.framework_signature();
         frameworks_changed = crate::control_inputs::frameworks_changed(store, &frameworks)?;
     }
     if frameworks_changed {
@@ -1469,7 +1475,28 @@ fn sync_paths_with_store(
                 &scope.options.extensions,
             )?;
         }
-        let (scope_sites, fallback_files) = refresh_dependent_refs(
+        // Cross-file framework finalization on every sync, before anything is
+        // resolved, as a full index runs it (upstream's sync runs
+        // runPostExtract before its resolution too): a route a constant names
+        // is renamed before a navigation call resolves against it.
+        resolver.run_post_extract(store)?;
+        // Then the nodes no single file's extraction makes, the routes of
+        // the tables another file hands React Router (W7-09d): what the
+        // passes want now, compared with the store, the first change
+        // withdrawing the markers. The edges into a node that goes are
+        // re-read as an unchanged dependent's sites, and a node that comes
+        // has its references resolved below.
+        let cross_file = resolver.plan_cross_file_nodes(store)?;
+        if cross_file.changes_store() {
+            changed_names.begin_mutation(store)?;
+        }
+        let cross_file_applied = resolver.apply_cross_file_plan(store, &cross_file, false)?;
+        for affected in cross_file_applied.incoming {
+            if !reindexed.contains(&affected.file_path) {
+                merge_dependent_site(&mut dependent_sites, &mut dependent_fallbacks, affected);
+            }
+        }
+        let (mut scope_sites, fallback_files) = refresh_dependent_refs(
             project_root,
             store,
             scope,
@@ -1479,7 +1506,9 @@ fn sync_paths_with_store(
             &receiver_dependents,
             &reindexed,
             stored_refs_marker.is_some(),
+            &cross_file,
         )?;
+        scope_sites.extend(cross_file_applied.inserted_sites);
         let mut scope_files = reindexed.clone();
         scope_files.extend(fallback_files);
         #[cfg(test)]
@@ -1508,8 +1537,6 @@ fn sync_paths_with_store(
             &scope_sites,
             &retry_names,
         )?;
-        // Cross-file framework finalization on every sync (upstream index.ts:464).
-        resolver.run_post_extract(store)?;
         // Last: the surface and namespace rows, then the markers the first
         // mutation withdrew.
         surfaces.write_rows(store)?;
@@ -1574,10 +1601,42 @@ fn sync_paths_with_store(
     // healthy index (marker absent) skips this entirely, so an ordinary sync is
     // byte-for-byte unchanged.
     if store.is_resolution_incomplete()? {
+        // The sweep writes base edges: the synthesized ones go stale first.
+        codegraph_resolve::synthesis::withdraw_marker(store)?;
         let stats = sweep_orphaned_refs(project_root, store, scope.options.max_file_size)?;
         outcome.pending_refs_processed = stats.total;
         outcome.pending_refs_resolved = stats.resolved;
         outcome.pending_refs_unresolved = stats.unresolved;
+    }
+
+    // A file the last stage run read beside the index (W7-17b) that reads
+    // differently now, its text, its presence or its scan scope changed,
+    // makes the stage's edges stale as a base-graph write does. Every sync
+    // compares, a sync that changed nothing included.
+    if codegraph_resolve::synthesis::marker_is_current(store)?
+        && codegraph_resolve::synthesis::inputs_changed(store, project_root, &scope.options)?
+    {
+        codegraph_resolve::synthesis::withdraw_marker(store)?;
+    }
+
+    // The dispatch edges no reference names (W7-14), recomputed whole once
+    // the base graph is final. Every write to the base graph above comes
+    // after a withdrawal of the marker (`begin_mutation`, a lane bootstrap,
+    // the sweep, a changed input read beside the index), so a sync
+    // recomputes whenever it finds the marker away: after its own changes,
+    // or a sync that stopped before writing it back, which is this sync's
+    // last write.
+    if !codegraph_resolve::synthesis::marker_is_current(store)? {
+        #[cfg(test)]
+        if tests::FAIL_BEFORE_SYNTHESIS.with(std::cell::Cell::get) {
+            bail!("injected sync failure before synthesis");
+        }
+        codegraph_resolve::synthesis::run_stage(store, project_root, &scope.options)?;
+        #[cfg(test)]
+        if tests::FAIL_BEFORE_SYNTHESIS_MARKER.with(std::cell::Cell::get) {
+            bail!("injected sync failure before the synthesis marker");
+        }
+        codegraph_resolve::synthesis::write_marker(store)?;
     }
 
     outcome.duration_ms = started.elapsed().as_millis();
@@ -1631,6 +1690,7 @@ fn refresh_dependent_refs(
     receiver_names: &BTreeMap<String, BTreeSet<String>>,
     already_reindexed: &HashSet<String>,
     stored_refs: bool,
+    cross_file: &codegraph_resolve::CrossFilePlan,
 ) -> Result<(BTreeSet<ReferenceSite>, HashSet<String>)> {
     let dependents = dependent_sites
         .keys()
@@ -1662,7 +1722,14 @@ fn refresh_dependent_refs(
             .collect::<Vec<_>>()
             .into_par_iter()
             .map(|relative| {
-                let refs = extract_dependent_refs(project_root, relative, scope, resolver);
+                let refs = extract_dependent_refs(project_root, relative, scope, resolver).map(
+                    |mut refs| {
+                        // The nodes no single file's extraction makes keep
+                        // their references (W7-09d).
+                        refs.extend(cross_file.refs_of_file(relative).iter().cloned());
+                        refs
+                    },
+                );
                 (relative.clone(), refs)
             })
             .collect();
@@ -1822,8 +1889,12 @@ fn sweep_orphaned_refs(
     // duplicate rows (`unresolved_refs` has no UNIQUE constraint), which
     // accumulate across interrupt→heal cycles and diverge from `index --force`.
     // Re-resolving the existing rows alone heals the interrupted pass byte-equal.
-    let result = resolver.resolve_and_persist_batched(store, ORPHAN_SWEEP_BATCH_ROWS)?;
+    // Cross-file framework finalization before resolution, as a full index
+    // runs it; a cross-file node that goes puts the references whose edges
+    // reached it back among the pending ones the batch resolves.
     resolver.run_post_extract(store)?;
+    resolver.run_cross_file_nodes(store)?;
+    let result = resolver.resolve_and_persist_batched(store, ORPHAN_SWEEP_BATCH_ROWS)?;
     Ok(result.stats)
 }
 
@@ -2809,6 +2880,7 @@ impl ChangedNames {
             crate::dart_heads::withdraw_marker(store)?;
             crate::dart_libraries::withdraw_marker(store)?;
             crate::resolved_refs::withdraw_marker(store)?;
+            codegraph_resolve::synthesis::withdraw_marker(store)?;
             self.surface_dirty = true;
         }
         Ok(())
@@ -3038,6 +3110,14 @@ pub(crate) mod tests {
         /// Fail the next sync after its mutations, before resolution.
         pub(crate) static FAIL_BEFORE_RESOLUTION: std::cell::Cell<bool> =
             const { std::cell::Cell::new(false) };
+        /// Fail the next sync that recomputes synthesis once every other
+        /// write is done, before the stage.
+        pub(crate) static FAIL_BEFORE_SYNTHESIS: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
+        /// Fail the next sync that recomputes synthesis once the stage has
+        /// replaced the edges, before the marker goes back.
+        pub(crate) static FAIL_BEFORE_SYNTHESIS_MARKER: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
         /// Fail the next Lua row rebuild once the old rows are purged and
         /// one is written back.
         pub(crate) static FAIL_AFTER_LUA_ROW_PURGE: std::cell::Cell<bool> =
@@ -3181,6 +3261,294 @@ pub(crate) mod tests {
         let db = default_db_path(dir.path()).unwrap();
         sync_changed_paths(dir.path(), &db, files.iter().map(|(path, _)| *path)).unwrap();
         edge_projection(&db)
+    }
+
+    const SYNTH_SCENE: (&str, &str) = (
+        "src/scene.ts",
+        "type Callback = () => void;\nexport class Scene {\n  private callbacks = new Set<Callback>();\n  onUpdate(cb: Callback) {\n    this.callbacks.add(cb);\n  }\n  triggerUpdate() {\n    for (const cb of this.callbacks) cb();\n  }\n}\n",
+    );
+    const SYNTH_RENDER: (&str, &str) = (
+        "src/app.ts",
+        "import { Scene } from './scene';\nexport class App {\n  scene = new Scene();\n  constructor() {\n    this.scene.onUpdate(this.triggerRender);\n  }\n  triggerRender() {\n    return 1;\n  }\n  triggerPaint() {\n    return 2;\n  }\n}\n",
+    );
+    const SYNTH_PAINT: (&str, &str) = (
+        "src/app.ts",
+        "import { Scene } from './scene';\nexport class App {\n  scene = new Scene();\n  constructor() {\n    this.scene.onUpdate(this.triggerPaint);\n  }\n  triggerRender() {\n    return 1;\n  }\n  triggerPaint() {\n    return 2;\n  }\n}\n",
+    );
+
+    fn synthesis_marker(db: &Path) -> Option<String> {
+        Store::open(db)
+            .unwrap()
+            .get_project_metadata(codegraph_resolve::synthesis::VERSION_KEY)
+            .unwrap()
+    }
+
+    fn synthesized_edges(db: &Path) -> Vec<String> {
+        edge_projection(db)
+            .into_iter()
+            .filter(|edge| edge.contains("synthesizedBy"))
+            .collect()
+    }
+
+    /// Insert a synthesized edge no pass would make, between two nodes named
+    /// `source` and `target`: the stage's replacement must remove it.
+    fn plant_stale_synthesized_edge(db: &Path, source: &str, target: &str) {
+        let mut store = Store::open(db).unwrap();
+        let id = |name: &str| store.nodes_by_name(name).unwrap().pop().unwrap().id;
+        let edge = codegraph_core::types::Edge {
+            id: None,
+            source: id(source),
+            target: id(target),
+            kind: codegraph_core::types::EdgeKind::Calls,
+            metadata: Some(
+                serde_json::json!({"synthesizedBy": "callback", "registeredAt": "stale"}),
+            ),
+            line: None,
+            col: None,
+            provenance: Some("heuristic".to_string()),
+        };
+        store.insert_edges(&[edge]).unwrap();
+        assert!(
+            synthesized_edges(db)
+                .iter()
+                .any(|edge| edge.contains("stale"))
+        );
+    }
+
+    /// The stage follows an edit (W7-14): the registration moves to another
+    /// method, and the sync's synthesized edges are a fresh index's.
+    #[test]
+    fn a_sync_recomputes_the_synthesized_edges() {
+        let dir = TestDir::new("synthesis-edit");
+        let db = default_db_path(dir.path()).unwrap();
+        write_files(dir.path(), &[SYNTH_SCENE, SYNTH_RENDER]);
+        sync_changed_paths(dir.path(), &db, [SYNTH_SCENE.0, SYNTH_RENDER.0]).unwrap();
+        let before = synthesized_edges(&db);
+        assert!(
+            before.len() == 1 && before[0].contains("App::triggerRender"),
+            "{before:?}"
+        );
+        assert_eq!(
+            synthesis_marker(&db).as_deref(),
+            Some(codegraph_resolve::synthesis::VERSION)
+        );
+
+        write_files(dir.path(), &[SYNTH_PAINT]);
+        sync_changed_paths(dir.path(), &db, [SYNTH_PAINT.0]).unwrap();
+        let after = synthesized_edges(&db);
+        assert!(
+            after.len() == 1 && after[0].contains("App::triggerPaint"),
+            "{after:?}"
+        );
+        assert_eq!(
+            edge_projection(&db),
+            fresh_edges("synthesis-edit-fresh", &[SYNTH_SCENE, SYNTH_PAINT])
+        );
+    }
+
+    /// A sync that stops before the stage, or after the replacement and
+    /// before the marker, leaves the marker away (W7-14): the next sync, with
+    /// nothing changed, recomputes and writes it back.
+    #[test]
+    fn a_sync_stopped_before_its_synthesis_marker_leaves_the_next_to_recompute() {
+        for (label, hook) in [
+            ("stage", &FAIL_BEFORE_SYNTHESIS),
+            ("marker", &FAIL_BEFORE_SYNTHESIS_MARKER),
+        ] {
+            let dir = TestDir::new(&format!("synthesis-stop-{label}"));
+            let db = default_db_path(dir.path()).unwrap();
+            write_files(dir.path(), &[SYNTH_SCENE, SYNTH_RENDER]);
+            sync_changed_paths(dir.path(), &db, [SYNTH_SCENE.0, SYNTH_RENDER.0]).unwrap();
+
+            write_files(dir.path(), &[SYNTH_PAINT]);
+            hook.with(|fail| fail.set(true));
+            let failed = sync_changed_paths(dir.path(), &db, [SYNTH_PAINT.0]);
+            hook.with(|fail| fail.set(false));
+            assert!(
+                failed.is_err(),
+                "{label}: the injected failure must stop the sync"
+            );
+            assert_eq!(
+                synthesis_marker(&db),
+                None,
+                "{label}: the marker stays away"
+            );
+
+            sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
+            assert_eq!(
+                synthesis_marker(&db).as_deref(),
+                Some(codegraph_resolve::synthesis::VERSION),
+                "{label}"
+            );
+            assert_eq!(
+                edge_projection(&db),
+                fresh_edges(
+                    &format!("synthesis-stop-{label}-fresh"),
+                    &[SYNTH_SCENE, SYNTH_PAINT]
+                ),
+                "{label}"
+            );
+        }
+    }
+
+    /// A marker another version of the passes wrote is not current (W7-14c
+    /// moved it to "2"): a sync with nothing changed replaces that
+    /// version's synthesized edges and writes this version's marker.
+    #[test]
+    fn a_synthesis_marker_of_another_version_recomputes() {
+        let dir = TestDir::new("synthesis-version");
+        let db = default_db_path(dir.path()).unwrap();
+        write_files(dir.path(), &[SYNTH_SCENE, SYNTH_RENDER]);
+        sync_changed_paths(dir.path(), &db, [SYNTH_SCENE.0, SYNTH_RENDER.0]).unwrap();
+        plant_stale_synthesized_edge(&db, "triggerPaint", "onUpdate");
+        Store::open(&db)
+            .unwrap()
+            .set_project_metadata(codegraph_resolve::synthesis::VERSION_KEY, "1")
+            .unwrap();
+
+        sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
+        assert_eq!(
+            synthesis_marker(&db).as_deref(),
+            Some(codegraph_resolve::synthesis::VERSION)
+        );
+        assert_eq!(
+            edge_projection(&db),
+            fresh_edges("synthesis-version-fresh", &[SYNTH_SCENE, SYNTH_RENDER])
+        );
+    }
+
+    /// A lane bootstrap re-resolves without `begin_mutation`, so it withdraws
+    /// the synthesis marker before its first write (W7-14): a sync that
+    /// stops after the lane markers went back leaves it away, and the next
+    /// sync replaces a stale synthesized edge.
+    #[test]
+    fn a_lane_bootstrap_withdraws_the_synthesis_marker() {
+        let dir = TestDir::new("synthesis-bootstrap");
+        let db = default_db_path(dir.path()).unwrap();
+        write_files(dir.path(), &[SYNTH_SCENE, SYNTH_RENDER]);
+        sync_changed_paths(dir.path(), &db, [SYNTH_SCENE.0, SYNTH_RENDER.0]).unwrap();
+        plant_stale_synthesized_edge(&db, "triggerPaint", "onUpdate");
+        Store::open(&db)
+            .unwrap()
+            .delete_project_metadata(codegraph_resolve::module_surface::VERSION_KEY)
+            .unwrap();
+
+        FAIL_BEFORE_SYNTHESIS.with(|fail| fail.set(true));
+        let failed = sync_changed_paths(dir.path(), &db, Vec::<&str>::new());
+        FAIL_BEFORE_SYNTHESIS.with(|fail| fail.set(false));
+        assert!(failed.is_err(), "the injected failure must stop the sync");
+        assert!(
+            surface_marker(&db).is_some(),
+            "the bootstrap's lane marker went back"
+        );
+        assert_eq!(synthesis_marker(&db), None);
+
+        sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
+        assert_eq!(
+            edge_projection(&db),
+            fresh_edges("synthesis-bootstrap-fresh", &[SYNTH_SCENE, SYNTH_RENDER])
+        );
+    }
+
+    /// The orphan sweep resolves new base edges on a sync with nothing
+    /// changed, so the stage recomputes after it (W7-14).
+    #[test]
+    fn the_orphan_sweep_recomputes_the_synthesized_edges() {
+        let dir = TestDir::new("synthesis-sweep");
+        let db = default_db_path(dir.path()).unwrap();
+        write_files(dir.path(), &[SYNTH_SCENE, SYNTH_RENDER]);
+        sync_changed_paths(dir.path(), &db, [SYNTH_SCENE.0, SYNTH_RENDER.0]).unwrap();
+        plant_stale_synthesized_edge(&db, "triggerPaint", "onUpdate");
+        Store::open(&db)
+            .unwrap()
+            .set_resolution_incomplete()
+            .unwrap();
+        assert_eq!(
+            synthesis_marker(&db).as_deref(),
+            Some(codegraph_resolve::synthesis::VERSION)
+        );
+
+        sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
+        assert!(
+            !Store::open(&db)
+                .unwrap()
+                .is_resolution_incomplete()
+                .unwrap()
+        );
+        assert_eq!(
+            edge_projection(&db),
+            fresh_edges("synthesis-sweep-fresh", &[SYNTH_SCENE, SYNTH_RENDER])
+        );
+    }
+
+    /// The orphan sweep withdraws the synthesis marker before its first
+    /// write (W7-14): a sync that stops after sweeping leaves it away, and
+    /// the next sync, with nothing to sweep, replaces a stale synthesized
+    /// edge.
+    #[test]
+    fn an_orphan_sweep_withdraws_the_synthesis_marker() {
+        let dir = TestDir::new("synthesis-sweep-stop");
+        let db = default_db_path(dir.path()).unwrap();
+        write_files(dir.path(), &[SYNTH_SCENE, SYNTH_RENDER]);
+        sync_changed_paths(dir.path(), &db, [SYNTH_SCENE.0, SYNTH_RENDER.0]).unwrap();
+        plant_stale_synthesized_edge(&db, "triggerPaint", "onUpdate");
+        Store::open(&db)
+            .unwrap()
+            .set_resolution_incomplete()
+            .unwrap();
+
+        FAIL_BEFORE_SYNTHESIS.with(|fail| fail.set(true));
+        let failed = sync_changed_paths(dir.path(), &db, Vec::<&str>::new());
+        FAIL_BEFORE_SYNTHESIS.with(|fail| fail.set(false));
+        assert!(failed.is_err(), "the injected failure must stop the sync");
+        assert!(
+            !Store::open(&db)
+                .unwrap()
+                .is_resolution_incomplete()
+                .unwrap()
+        );
+        assert_eq!(synthesis_marker(&db), None);
+
+        sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
+        assert_eq!(
+            edge_projection(&db),
+            fresh_edges("synthesis-sweep-stop-fresh", &[SYNTH_SCENE, SYNTH_RENDER])
+        );
+    }
+
+    /// A file that changed on disk since it was indexed feeds no pass until
+    /// its own sync (W7-14): its old nodes' lines would slice its new text.
+    /// Its lines need not have moved for that: the stage cannot tell, so a
+    /// drift that keeps every line where it was still hides the channel.
+    #[test]
+    fn a_drifted_file_feeds_no_synthesis_until_its_sync() {
+        const SCENE_DRIFTED: (&str, &str) = (
+            "src/scene.ts",
+            "type Callback = () => void;\nexport class Scene {\n  private callbacks = new Set<Callback>();\n  onUpdate(cb: Callback) {\n    this.callbacks.add(cb);\n  }\n  triggerUpdate() {\n    for (const callback of this.callbacks) callback();\n  }\n}\n",
+        );
+        const OTHER: (&str, &str) = ("src/other.ts", "export const other = 1;\n");
+        const OTHER_EDITED: (&str, &str) = ("src/other.ts", "export const other = 2;\n");
+        let dir = TestDir::new("synthesis-drift");
+        let db = default_db_path(dir.path()).unwrap();
+        write_files(dir.path(), &[SYNTH_SCENE, SYNTH_RENDER, OTHER]);
+        sync_changed_paths(dir.path(), &db, [SYNTH_SCENE.0, SYNTH_RENDER.0, OTHER.0]).unwrap();
+        assert_eq!(synthesized_edges(&db).len(), 1);
+
+        // The scene drifts; a sync of another file recomputes without it.
+        write_files(dir.path(), &[SCENE_DRIFTED, OTHER_EDITED]);
+        sync_changed_paths(dir.path(), &db, [OTHER_EDITED.0]).unwrap();
+        assert_eq!(synthesized_edges(&db), Vec::<String>::new());
+
+        // Its own sync brings the channel back, as a fresh index has it.
+        sync_changed_paths(dir.path(), &db, [SCENE_DRIFTED.0]).unwrap();
+        assert_eq!(synthesized_edges(&db).len(), 1);
+        assert_eq!(
+            edge_projection(&db),
+            fresh_edges(
+                "synthesis-drift-fresh",
+                &[SCENE_DRIFTED, SYNTH_RENDER, OTHER_EDITED]
+            )
+        );
     }
 
     /// A sync with no transaction around it can fail after its mutations
@@ -7684,6 +8052,224 @@ pub(crate) mod tests {
         assert!(stored_refs_marker(&db).is_some(), "a full index writes it");
     }
 
+    const TABLE_PACKAGE: (&str, &str) = (
+        "package.json",
+        "{\"dependencies\":{\"react\":\"18\",\"react-router-dom\":\"6\"}}\n",
+    );
+    const TABLE_ADMIN: (&str, &str) = (
+        "src/adminRoutes.js",
+        "import Reports from './Reports';\n\nexport const adminRoutes = [{ path: 'reports', element: <Reports/> }];\n",
+    );
+    const TABLE_PAGE: (&str, &str) = (
+        "src/Reports.js",
+        "export default function Reports() {\n  return null;\n}\n",
+    );
+    const TABLE_LAYOUT: (&str, &str) = (
+        "src/Layout.js",
+        "export default function Layout() {\n  return null;\n}\n",
+    );
+    const MOUNTED_AT_ADMIN: (&str, &str) = (
+        "src/routes.js",
+        "import { Routes, Route } from 'react-router-dom';\nimport { adminRoutes } from './adminRoutes';\n\nexport default function Router() {\n  return <Routes><Route path=\"/admin\">{adminRoutes.map((route) => <Route key={route.path} {...route}/>)}</Route></Routes>;\n}\n",
+    );
+    const MOUNTED_AT_MANAGE: (&str, &str) = (
+        "src/routes.js",
+        "import { Routes, Route } from 'react-router-dom';\nimport { adminRoutes } from './adminRoutes';\n\nexport default function Router() {\n  return <Routes><Route path=\"/manage\">{adminRoutes.map((route) => <Route key={route.path} {...route}/>)}</Route></Routes>;\n}\n",
+    );
+    const SELF_MAPPED: (&str, &str) = (
+        "src/table.js",
+        "import { Routes, Route } from 'react-router-dom';\nimport Layout from './Layout';\nimport Reports from './Reports';\n\nexport const tableRoutes = [{ path: 'reports', element: <Reports/> }];\n\nexport function Shell() {\n  return <Routes><Route path=\"/\" element={<Layout/>}>{tableRoutes.map((route) => <Route key={route.path} {...route}/>)}</Route></Routes>;\n}\n",
+    );
+    const EARLIER_HANDS: (&str, &str) = (
+        "src/a.js",
+        "import { useRoutes } from 'react-router-dom';\nimport { tableRoutes } from './table';\n\nexport default function App() {\n  return useRoutes(tableRoutes);\n}\n",
+    );
+    const EARLIER_QUIET: (&str, &str) = (
+        "src/a.js",
+        "import { useNavigate } from 'react-router-dom';\n\nexport default function App() {\n  return null;\n}\n",
+    );
+    const NAV_TO_REPORTS: (&str, &str) = (
+        "src/nav.js",
+        "import { useNavigate } from 'react-router-dom';\nexport function Menu() {\n  const navigate = useNavigate();\n  const open = () => navigate('/reports');\n  return <button onClick={open} />;\n}\n",
+    );
+
+    /// The `references` edges out of the routes `/admin/reports`,
+    /// `/manage/reports` and `/reports` of `db`, the table routes of the
+    /// W7-09d tests.
+    fn table_route_edges(db: &Path) -> Vec<String> {
+        edge_projection(db)
+            .into_iter()
+            .filter(|edge| {
+                let (source, _) = edge.split_once(" -[references]-> ").unwrap_or_default();
+                source.ends_with("/reports")
+            })
+            .collect()
+    }
+
+    /// W7-09d: a sync that fails after the table pass replaced the route of a
+    /// table another file mounts leaves the new route's reference pending
+    /// and the marker away. The next sync, with nothing changed, re-reads
+    /// every JavaScript file from its extraction, which keeps the references
+    /// of the routes no single file's extraction makes, and resolves them as
+    /// a fresh index does.
+    #[test]
+    fn a_sync_failing_after_the_table_pass_heals_on_the_next() {
+        let initial = [TABLE_PACKAGE, TABLE_ADMIN, TABLE_PAGE, MOUNTED_AT_ADMIN];
+        let (dir, db) = fully_indexed("table-pass-fail", &initial);
+        assert_eq!(
+            table_route_edges(&db),
+            [
+                "src/adminRoutes.js:src/adminRoutes.js::route:/admin/reports -[references]-> src/Reports.js:Reports {\"confidence\":0.9,\"resolvedBy\":\"import\"}"
+            ]
+        );
+
+        write_files(dir.path(), &[MOUNTED_AT_MANAGE]);
+        FAIL_BEFORE_RESOLUTION.with(|fail| fail.set(true));
+        let failed = sync_changed_paths(dir.path(), &db, ["src/routes.js"]);
+        FAIL_BEFORE_RESOLUTION.with(|fail| fail.set(false));
+        assert!(failed.is_err(), "the injected failure must stop the sync");
+        assert_eq!(stored_refs_marker(&db), None);
+        assert!(
+            table_route_edges(&db).is_empty(),
+            "the route was replaced, its reference left pending"
+        );
+
+        sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
+        let fresh = fresh_edges(
+            "table-pass-fail-fresh",
+            &[TABLE_PACKAGE, TABLE_ADMIN, TABLE_PAGE, MOUNTED_AT_MANAGE],
+        );
+        assert_eq!(edge_projection(&db), fresh);
+        assert_eq!(table_route_edges(&db).len(), 1, "{fresh:#?}");
+    }
+
+    /// W7-09d: the orphan sweep runs the table pass before it resolves every
+    /// pending reference, as a full index does, and a route it replaces puts
+    /// the references whose edges reached it back among them: here the
+    /// earlier file stopped handing the table over before a sync heard of
+    /// it, so `/reports` keeps its id and gains its file's layout, and the
+    /// navigation into it binds again.
+    #[test]
+    fn the_orphan_sweep_reconciles_the_tables_and_rebinds_what_reached_them() {
+        let initial = [
+            TABLE_PACKAGE,
+            TABLE_PAGE,
+            TABLE_LAYOUT,
+            SELF_MAPPED,
+            EARLIER_HANDS,
+            NAV_TO_REPORTS,
+        ];
+        let (dir, db) = fully_indexed("table-pass-sweep", &initial);
+        let navigates = |db: &Path| {
+            edge_projection(db)
+                .into_iter()
+                .filter(|edge| edge.contains("-[navigates]->"))
+                .count()
+        };
+        assert_eq!(navigates(&db), 1);
+        assert_eq!(table_route_edges(&db).len(), 1, "no layout yet");
+
+        // The earlier file stops; no sync is told.
+        write_files(dir.path(), &[EARLIER_QUIET]);
+        Store::open(&db)
+            .unwrap()
+            .set_resolution_incomplete()
+            .unwrap();
+        sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
+        assert!(
+            !Store::open(&db)
+                .unwrap()
+                .is_resolution_incomplete()
+                .unwrap()
+        );
+        assert_eq!(table_route_edges(&db).len(), 2, "the layout came");
+        assert_eq!(navigates(&db), 1, "the navigation found the route again");
+
+        // The sync that hears of it changes nothing more.
+        sync_changed_paths(dir.path(), &db, ["src/a.js"]).unwrap();
+        let fresh = fresh_edges(
+            "table-pass-sweep-fresh",
+            &[
+                TABLE_PACKAGE,
+                TABLE_PAGE,
+                TABLE_LAYOUT,
+                SELF_MAPPED,
+                EARLIER_QUIET,
+                NAV_TO_REPORTS,
+            ],
+        );
+        assert_eq!(edge_projection(&db), fresh);
+    }
+
+    /// W7-09d: when the table pass makes a sync's first change — every file
+    /// unchanged, another lane rebuilding — it withdraws the markers first,
+    /// so a failure after it leaves the next sync to re-read every
+    /// JavaScript file, and the replaced route's pending reference resolves.
+    #[test]
+    fn the_table_pass_withdraws_the_markers_before_its_first_change() {
+        let initial = [TABLE_PACKAGE, TABLE_ADMIN, TABLE_PAGE, MOUNTED_AT_ADMIN];
+        let (dir, db) = fully_indexed("table-pass-first", &initial);
+        // An unchanged index whose Java lane rebuilds, and a mount that
+        // moved under no sync's notice.
+        crate::java_heads::withdraw_marker(&Store::open(&db).unwrap()).unwrap();
+        write_files(dir.path(), &[MOUNTED_AT_MANAGE]);
+        FAIL_BEFORE_RESOLUTION.with(|fail| fail.set(true));
+        let failed = sync_changed_paths(dir.path(), &db, Vec::<&str>::new());
+        FAIL_BEFORE_RESOLUTION.with(|fail| fail.set(false));
+        assert!(failed.is_err(), "the injected failure must stop the sync");
+        assert_eq!(surface_marker(&db), None, "the table pass withdrew it");
+
+        sync_changed_paths(dir.path(), &db, ["src/routes.js"]).unwrap();
+        let fresh = fresh_edges(
+            "table-pass-first-fresh",
+            &[TABLE_PACKAGE, TABLE_ADMIN, TABLE_PAGE, MOUNTED_AT_MANAGE],
+        );
+        assert_eq!(edge_projection(&db), fresh);
+        assert_eq!(table_route_edges(&db).len(), 1);
+    }
+
+    /// W7-09d: the routes the table pass made compare equal to the ones it
+    /// wants, their references with them, so a reconciled project plans no
+    /// change, and a sync that touches no table neither replaces a route nor
+    /// withdraws a marker. A sync's own reconciliation is one the next plan
+    /// keeps too.
+    #[test]
+    fn a_reconciled_project_plans_no_table_change() {
+        let initial = [
+            TABLE_PACKAGE,
+            TABLE_ADMIN,
+            TABLE_PAGE,
+            TABLE_LAYOUT,
+            SELF_MAPPED,
+            EARLIER_HANDS,
+            NAV_TO_REPORTS,
+            MOUNTED_AT_ADMIN,
+        ];
+        let (dir, db) = fully_indexed("table-pass-reconciled", &initial);
+        let plans_a_change = || {
+            let store = Store::open(&db).unwrap();
+            let paths = index_paths(dir.path()).unwrap();
+            let scope = ProjectScope::load(dir.path(), &paths).unwrap();
+            let mut resolver = ReferenceResolver::new(dir.path().to_string_lossy())
+                .with_max_file_size(scope.options.max_file_size);
+            {
+                let context = resolver.store_context(&store);
+                resolver.initialize(&context);
+            }
+            resolver
+                .plan_cross_file_nodes(&store)
+                .unwrap()
+                .changes_store()
+        };
+        assert_eq!(table_route_edges(&db).len(), 2, "/admin/reports, /reports");
+        assert!(!plans_a_change(), "the full index reconciled every table");
+
+        write_files(dir.path(), &[MOUNTED_AT_MANAGE]);
+        sync_changed_paths(dir.path(), &db, ["src/routes.js"]).unwrap();
+        assert!(!plans_a_change(), "the sync reconciled the moved mount");
+        assert_eq!(table_route_edges(&db).len(), 2, "/manage/reports, /reports");
+    }
+
     /// W5-09e: `project.godot`'s extraction maps `uid://` autoloads through
     /// every `.gd.uid` and `.tscn`, so it is extracted even under the
     /// marker. No resolution rule gives it an outgoing edge today, so no sync
@@ -7738,6 +8324,7 @@ pub(crate) mod tests {
             &BTreeMap::new(),
             &HashSet::new(),
             true,
+            &codegraph_resolve::CrossFilePlan::default(),
         )
         .unwrap();
         assert_eq!(

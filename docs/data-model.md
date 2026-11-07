@@ -45,6 +45,18 @@ Schema version and extraction version are independent. A DDL change needs a
 schema migration; a change in graph meaning may need an extraction-version move
 even when DDL is unchanged.
 
+A database whose `schema_versions` records a version above this binary's was
+written by a newer codegraph, and this binary neither reads, writes nor replaces
+it. Reads, `status`, a sync, an MCP session, a daemon, `init` and `index --force`
+refuse it before they change a byte. The check sees what the database's next
+opener would see, including a version that is only in an un-checkpointed
+write-ahead log: where a log may exist, the main file and the log's committed
+frames are read into memory and checked there, as SQLite's recovery would apply
+them, so no `-wal` or `-shm` is created or folded. A database whose version cannot
+be read is refused as well. A rebuild still replaces a file that is not a SQLite
+database at all. `uninit --force` skips the schema check and removes such an
+index from the states it accepts (current, building, outdated, uninitialized).
+
 ## Application tables
 
 ### `schema_versions`
@@ -95,7 +107,60 @@ A synthesized edge, one the resolver infers rather than reads from a call site
 `provenance = 'heuristic'` and a `metadata` object with `synthesizedBy` (the pass
 that made it) and, when the wiring happens elsewhere, `registeredAt`
 (`path:line` of the registration). Consumers such as the type hierarchy and the
-named-symbol flow recognize synthesized edges by that provenance value.
+named-symbol flow recognize synthesized edges by that provenance value. The
+one exception is `go-method-contains`: its `contains` edge from a Go type to a
+method of its package declared outside the type's file has no provenance, as
+a parsed `contains` edge has, and only its `synthesizedBy` marks it. Only the
+synthesis stage writes them: it replaces the edges whose metadata names
+`synthesizedBy` in one transaction, keeping the row and id of each one it
+makes again unchanged, and a sync's reference-site queries and
+deletions leave such edges alone, so the rest of the graph is what a fresh index
+resolves before any synthesized edge exists.
+
+A link pass's `navigates` edge (W7-18a: `next-link`, `react-router-link`,
+`tanstack-link`, `vue-router-link`, `sveltekit-link`, `expo-router-return`)
+carries `href`, the destination as the arm that named the route writes it (a
+template's hole `${…}`), `navMethod` (`link`, `a`, `navigate` or `redirect`,
+and for `expo-router-return` the navigation call's own method: `push`,
+`replace`, `navigate` or `dismissTo`) and `registeredAt`, the `path:line` of
+the link or, for `expo-router-return`, of the navigation call. A Vue link to
+a route by its name carries `by: "name"`, the name as its `href`. Its `line`
+is the link's; an `expo-router-return` edge goes from the helper and its
+`line` and `col` are the literal's in the helper's body, `col` in UTF-16 code
+units, while the other link edges have no column.
+
+The SvelteKit passes' `calls` edges (W7-18b) have no column. A
+`sveltekit-load` edge goes from a `+page` or `+layout` component to a hook of
+its loader at the component's `line`, with `via`, the hook's name, and
+`registeredAt`, the hook's `path:line`; a `sveltekit-page` edge goes from a
+page route to its own file's component at the component's `line`, with
+`registeredAt`, the file's path.
+
+The Vue template pass's `calls` edges (W7-18c) go from a `.vue` file's
+component, at its `line`, with no column: a `jsx-render` edge to what a tag
+renders, with `via`, the tag as written (`el-button`, `MediaCard`), and a
+`vue-handler` edge to a handler, with `event`, the event it is bound to
+(`click`), and, for a member a composable returns, `via`, the composable's
+name.
+
+The Angular template pass's edges (W7-18d) go from a component's class with
+no column, at the tag's line in an inline template and at the class's for a
+template file, and carry `registeredAt`, the `path:line` the template, or
+for a `routerLink:` field the class, writes it at: an `angular-template`
+`calls` edge to a child component, with `via`, the tag; an `angular-event`
+`calls` edge to a method, with `via`, the event (`(click)`), and `trigger`,
+`{"kind": "prop", "name": "(click)", "of": "button"}` with the element the
+binding is written on; an `angular-binding` `calls` or `references` edge to
+a member, with `via`, the binding as written (`[name]`, <span v-pre>`{{ }}`</span>, `*ngIf`,
+`@if`, `@let`) and `fnRef: true` for a function handed over; and an
+`angular-router-link` `navigates` edge to a route, with `href`, `navMethod`
+`routerLink` and, for a template's link, `template: true`.
+
+An edge a framework resolver made (`resolvedBy: "framework"`) names that
+resolver in `metadata.framework` (`react`, `vue`, `nuxt`, `nestjs`, `godot`, `tauri`),
+as a synthesized edge names its pass. When one reference reaches several
+targets, only the edge to the first carries it; the others carry the metadata
+the resolver gave each.
 
 A value reference is a `references` edge the extractor emits from a symbol to a
 constant or variable of the same file that the symbol reads (upstream #895,
@@ -169,8 +234,11 @@ table empty and writes no marker.
 | ----------- | ---------------- | ------------------------------------------------------------- |
 | `file_path` | TEXT primary key | a file that fed a synthesis pass; cascades with `files(path)` |
 
-A sync reads it to tell whether a deleted or edited file changes synthesized
-edges, so it can recompute them without re-reading every file (migration 9).
+Migration 9 creates it for upstream's per-file recompute gate. This engine
+recomputes the synthesized edges whenever a sync changes the index, so it never
+writes the table, which stays empty. The files the stage reads that the index
+does not hold are recorded in `project_metadata` instead
+(`synthesis_unindexed_inputs`, below).
 
 ### `project_metadata`
 
@@ -183,15 +251,19 @@ edges, so it can recompute them without re-reading every file (migration 9).
 Module-surface rows record what other files' resolution reads from a
 JavaScript-family module's own text, which no node records: its re-exports and
 export aliases, the CommonJS default, whether it has an `export default`
-statement, the names its export lists give, whether it is a sealed module, and a
-Vue or Svelte component's `<script>` blocks. `js_module_surface:<path>` holds the
-JSON `{"digest", "sources", "targets"}`: the sha256 of the canonical encoding of
-those facts, the specifiers the module forwards, and every project file they
+statement, each of its own exports that leads to an import (the binding it
+names, the constants that binding holds in turn, the import's specifier and
+imported name, as React reads them for a tag imported from the module), the
+names its export lists give, whether it is a sealed module, and a Vue or Svelte
+component's `<script>` blocks. `js_module_surface:<path>` holds the JSON
+`{"digest", "sources", "targets"}`: the sha256 of the canonical encoding of
+those facts, the specifiers the module forwards (its re-exports' and those
+imports'), and every project file they
 resolved to when the row was written, in each language an import following them
 can be written in (TypeScript, TSX, JavaScript, JSX, Vue, Svelte, Astro, ArkTS
 order extensions differently), sorted. A file whose surface is the default one
 (an ES module none of whose text another file reads) has no row.
-`js_module_surface_version` records the row format (2).
+`js_module_surface_version` records the row format (3).
 
 A full index and a migration write every row and the marker once the file rows
 are stored, before resolution. A sync withdraws the marker before its first
@@ -444,8 +516,32 @@ persisted, and withdrawn with the others before a sync's first change. A sync
 that finds it missing or at another version re-resolves every Rust file. It is
 not a canonical surface.
 
+`synthesis_version` (17) vouches that the synthesized edges are the synthesis
+stage's output over the current base graph and the files it read beside the
+index. A full index and a migration write it after the stage. A sync withdraws
+it before its first change, before a lane bootstrap's first write, before the
+orphan sweep, and when a file `synthesis_unindexed_inputs` records reads
+differently, and, when it changed the index, bootstrapped a lane, swept, or
+found the marker missing or at another version, recomputes the stage and writes
+the marker back as its last write. It is not a canonical surface.
+
+`synthesis_unindexed_inputs` records the files the stage read beside the index
+(W7-17b): a JSON object, sorted by path, from each project-relative path the
+index does not hold that an indexed C or C++ file's `#include "…"` or an
+Angular component's `templateUrl` (W7-18d) led the stage to, to the SHA-256 of the text it read there, or `null` where it read nothing:
+no file, a path the scan's ignore rules, `.gitignore` or configuration keep
+out, one through a symbolic link, or a file over `indexing.max_file_size`. A
+path that would leave the project root is never probed nor recorded. Every run
+of the stage rewrites the row, `{}` when it read nothing beside the index. Each
+sync that finds the marker current reads every recorded path again the same way
+first, and the watcher hands an event for a recorded path to the next sync. A
+row that does not parse counts as changed; an index without the row has an
+older marker and recomputes anyway. It is not a canonical surface.
+
 `resolved_refs_version` vouches that every file's rows in `unresolved_refs` and
-`resolved_refs` are what extracting it again gives. Its value is `1:` and the
+`resolved_refs` are what extracting it again gives, with the references of the
+cross-file nodes in it (the routes of React Router tables, which no single
+file's extraction makes and a sync's re-extraction of the file merges in). Its value is `1:` and the
 sha256 of the inputs that decide what an unchanged file's extraction yields:
 the extension overrides, `max_file_size`, the Godot DSL configuration, the
 extraction version and the `frameworks_detected` row. Only a full index (`init`,

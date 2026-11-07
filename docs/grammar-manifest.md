@@ -141,3 +141,15 @@ cargo test --locked -p codegraph-bench --test equivalence
 Review `cargo tree -p codegraph-extract` for duplicate/incompatible tree-sitter
 cores. Do not vendor a grammar or change a pin merely to match upstream's WASM
 packaging; the Rust crate ABI and actual fixtures decide compatibility.
+
+## Held grammar versions
+
+`tree-sitter-swift` is pinned exactly to 0.7.3. Its scanner builds the `try!`
+entry of a 64-bit mask as `1UL << 32`, which a compiler with 32-bit `long`
+(MSVC) folds to 0, so the Windows build reads `try! Foo()` as a call of `! Foo`
+(upstream #2683). 0.7.4 fixes that line but regenerates the grammar: a call
+after an infix or prefix operator (`a + b.c()`, `!a.b()`) comes out as another
+tree, which the walker does not yet recognize as a member call. Upgrade it
+together with that walker change; the probe
+`pr2683_a_call_after_try_bang_links_what_it_calls`, ignored on Windows until
+then, is the acceptance test.

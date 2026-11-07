@@ -178,12 +178,12 @@ impl FrameworkResolver for TauriResolver {
             return None;
         }
         let target = self.roster(context).get(wire)?.as_ref()?;
-        Some(ResolvedRef {
-            original: reference.clone(),
-            target_node_id: target.id.clone(),
-            confidence: 0.9,
-            resolved_by: ResolvedBy::Framework,
-        })
+        Some(ResolvedRef::new(
+            reference.clone(),
+            target.id.clone(),
+            0.9,
+            ResolvedBy::Framework,
+        ))
     }
 
     /// Opt the namespaced call-side references through the name-exists

@@ -202,3 +202,54 @@ async fn lists_each_route_once_and_says_its_handler_is_not_inline() {
     let first = &entry["routes"]["items"]["items"][0];
     assert_eq!(first["inline"], false, "{entry:#}");
 }
+
+/// Upstream #2267: a Nuxt page is listed with the component that serves it,
+/// its own file's.
+#[tokio::test]
+async fn lists_a_nuxt_page_with_the_component_that_serves_it() {
+    let project = Project::indexed(&[
+        (
+            "package.json",
+            r#"{ "name": "shop", "private": true, "dependencies": { "nuxt": "^3.0.0" } }"#,
+        ),
+        (
+            "pages/index.vue",
+            "<template><button @click=\"load\">Load</button></template>\n<script setup lang=\"ts\">\nfunction load() { return 1; }\n</script>\n",
+        ),
+        ("pages/admin.vue", "<template><div>admin</div></template>\n"),
+        (
+            "pages/orders/index.vue",
+            "<template><div>orders</div></template>\n",
+        ),
+        (
+            "components/index.vue",
+            "<template><div>not a page</div></template>\n",
+        ),
+    ]);
+    let body = project.viewer().json("/api/routes").await;
+    assert_eq!(body["routed"], true, "{body:#}");
+    let mut rows: Vec<String> = body["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| {
+            format!(
+                "{} {} {} {}",
+                e["url"].as_str().unwrap(),
+                e["handler"].as_str().unwrap(),
+                e["handlerKind"].as_str().unwrap(),
+                e["file"].as_str().unwrap()
+            )
+        })
+        .collect();
+    rows.sort();
+    assert_eq!(
+        rows,
+        [
+            "/ index component pages/index.vue",
+            "/admin admin component pages/admin.vue",
+            "/orders index component pages/orders/index.vue",
+        ],
+        "{body:#}"
+    );
+}

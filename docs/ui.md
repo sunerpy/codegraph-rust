@@ -143,7 +143,8 @@ one length to a symbol it keeps the one that ends on fewer unnamed symbols, then
 the one through more of the named ones, not the one the index lists first.
 
 The routes list, and the routes among the entry points, hold one row per
-route: the handler a resolver bound to it, else `inline handler` standing for a
+route: the handler a resolver bound to it (a screen's component, such as a Nuxt
+page's own, counts, upstream #2267), else `inline handler` standing for a
 handler written at the registration, which opens on the route itself and offers
 no Flow. A symbol's members list each member once, never the symbol itself or a
 file.
@@ -179,16 +180,24 @@ the Rust graph holds different facts, the viewer shows what this index holds:
 - **Steps** (`/api/steps`) is not served yet: its effect and program builders and
   the branch conditions they use (UI families F1–F6 and F11) are a later port.
   The frontend is built without it, so the Steps view says it cannot draw steps.
-- **Screens** answers upstream's own "no screen navigation" result: the Rust
-  graph has no `navigates` edges until the navigation resolvers are ported.
-- Branch conditions on call sites (`when`) are absent from every edge for the
-  same reason.
-- Routes come from the framework resolvers this port has — React Router and
-  Next.js pages, Vue Router, NestJS controllers. Express and Go HTTP routers are
-  not among them, so those projects are not routed apps here.
-- The Rust index has no synthesized dynamic-dispatch edges, so a flow never
-  shows a dashed `via …` hop from synthesis, and a Go interface's implicit
-  implementations are not part of its type hierarchy.
+- **Screens** answers upstream's own "no screen navigation" result: its
+  builder is not ported, so the `navigates` edges the React Router, TanStack
+  Router, Next.js, SvelteKit, Vue Router, Angular Router and Expo Router
+  resolvers draw are not drawn as screens yet.
+- Branch conditions on call sites (`when`) are absent from every edge: the
+  builders that attach them are not ported either.
+- Routes come from the framework resolvers this port has — React Router,
+  TanStack Router, Vue Router and Angular Router routes, Next.js pages and
+  route handlers, SvelteKit pages, Expo Router screens and API routes, Nuxt
+  pages, NestJS controllers.
+  Express and Go HTTP routers are not among them, so those projects are not
+  routed apps here.
+- The Rust index synthesizes the field-observer, closure-collection,
+  event-emitter, React and Flutter re-render, JSX render, C++ override, interface
+  override, Kotlin expect/actual, Delphi form, MyBatis mapper and object
+  registry dispatch edges, so a flow shows a dashed `via …` hop for those and for no other
+  upstream synthesis pass. A Go interface's implicit implementations are in
+  its type hierarchy, marked synthesized (`go-implements`).
 - An unresolved import is recorded by the binding it names, not by the module
   specifier, and the File view lists it that way.
 - The bundle is embedded in the binary, so upstream's `CODEGRAPH_VIEWER_PATH`

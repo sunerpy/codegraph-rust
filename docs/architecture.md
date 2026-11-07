@@ -30,6 +30,7 @@ graph TD
     resolve --> extract
     resolve --> store
     graph --> core
+    graph --> extract
     graph --> store
     mcp --> core
     mcp --> graph
@@ -90,6 +91,8 @@ graph LR
     store --> resolve[generic + framework resolution]
     resolve --> edges[resolved edges]
     edges --> store
+    edges --> synth[dispatch-edge synthesis]
+    synth --> store
     store --> query[graph traversal + search]
     query --> cli[CLI]
     query --> mcp[MCP]
@@ -173,7 +176,10 @@ an enclosing one, declares the package (a `workspace:`, `file:` or `link:`
 dependency is the repository's own, and a Deno import map counts), or it is a
 Node built-in, `@std/…`, a runtime scheme (`node:`, `npm:`, `jsr:`) or a
 framework's virtual module (`$app/…`, `astro:…`); an alias the resolver does
-not follow (`$lib/…`, `~/…`) stays the project's. Calls in Vue, Svelte and
+not follow (`$lib/…`, `~/…`) stays the project's. A JS-family import's path
+alias comes from the `tsconfig.json` or `jsconfig.json` nearest the importing
+file below the root that declares `paths` (a monorepo app's own `@/*`, upstream
+#2165), then from the root's. Calls in Vue, Svelte and
 Astro components follow the JS/TS rules and, like ArkTS, see the JS
 built-ins, unless the file imports its own binding of the built-in's name.
 A result that lands on
@@ -216,11 +222,19 @@ binding. A framework-resolved edge carries its own reachability proof and is not
 erased by ordinary source-language visibility (for example Tauri IPC to a
 private Rust command).
 
-The registered framework candidates are NestJS, React/Next.js, Vue/Nuxt, Godot,
-and Tauri, in a deliberate order. Each activates only when its detection guard
+The registered framework candidates are NestJS, React, Vue, Godot, Tauri,
+Nuxt, React Router, TanStack Router, Next.js, Svelte, SvelteKit, Vue Router, Angular Router, Expo Router and GoFrame, in a deliberate order. Each activates only when its detection guard
 matches, and resolves only references written in its own languages (React
 and Vue their scripts', NestJS TypeScript and JavaScript, Tauri the JS-family
-`invoke` sites and Rust; Godot stays universal). Godot also extracts project/scene/resource relationships; Tauri bridges
+`invoke` sites and Rust; Godot stays universal). React and NestJS detect a
+dependency in any `package.json` detection reads (upstream #2395): the root's
+and up to 24 nested ones, first those one or two directories down on the path
+to an indexed file, then those deeper above JavaScript-family code
+(`src/Web/ClientApp/`), shallowest first, never one inside `node_modules`. A
+framework may name the packages its apps declare (upstream #2129); when some
+manifest declares one, its extractor runs only on files whose nearest
+`package.json` naming any such framework names it, so a router reads its own
+app in a monorepo. Nuxt names `nuxt`, `nuxt3` and `@nuxt/kit`, Next.js `next`, Vue Router `vue-router`, `nuxt` and `nuxt3`, Expo Router `expo-router`. Nuxt is detected by one of them or a `nuxt.config.*` file (upstream #2130) and reads its file routes: a `pages/` file is a screen route (a top-level `pages/index.vue` is `/`) that `calls` its own file's component (#2267), never a same-named one; `server/api/` files are endpoints and `middleware/` files functions. Vue resolves component references, compiler macros and Nuxt's auto-imports and extracts nothing. Next.js is detected by its dependency or a `next.config.*` beside a route file and reads `app/` and `pages/` file routes (F3): a page is a route named by its path (a `(group)` dropped, `[slug]` as `:slug`, `[...all]` as `:all*`) that `calls` its default export; a `route.ts` handler is one `GET /path`-style endpoint per exported method, referencing it; a `pages/api/` file is `ANY /path`; layouts, parallel and intercepting routes are none. A Next navigation call (`router.push`, `replace`, `prefetch`, `redirect`, `permanentRedirect`, `NextResponse.redirect`) under a Next app whose href names a page becomes a `navigates` edge with the `href` and `navMethod`, one per arm of a conditional; a path two apps serve goes to the calling app's page. Expo Router is detected by its dependency or an `app/_layout` beside an `app.config.*` and reads the files under `app/` (or `src/app/`) as screens (F2): a screen is a route named by its path (a `(group)` dropped, `[id]` and `[...rest]` kept, `index` the directory's own path) that `calls` its default export; layouts, `_` and `+` files other than `+not-found` are none, and a `+api` file is one `GET /path`-style endpoint per exported method (#2135). A navigation call (`router.push`, `replace`, `navigate`, `dismissTo`, or a project wrapper named like `safePush`) becomes a `navigates` edge to the screen its href names, a relative href read from the calling screen's directory; the call matches only the screens of its own Expo app (the longest directory above an `app/` that holds it), so a file under no Expo app is not read, and a path two screens of that app serve stays unresolved. React extracts only React Router routes, from `.tsx`/`.jsx` files too (components and hooks are the tree-sitter extractor's, upstream #841): a JSX-capable file's `<Route>` elements and, in a file that makes a router (`createBrowserRouter`, `createRoutesFromElements`, `useRoutes`, …), its route objects, each a route named by its path with nesting composed (F4). An index route is the page at its parent's address, a route around others is the layout they render inside (a reference whose edge carries `layout: true`), a route that renders `<Outlet />` renders nothing of its own, a `lazy: () => import('./x')` route renders the module's default export or else its `Component` export, through barrels (#2400), a loader that picks an export (`const { Page } = await import('./x'); return { Component: Page }`, a `.then` callback, `(await import('./x')).Page`, an `async lazy()` method, React Router 7's object of lazy properties) renders that export (#2480), one that hands back `Outlet` renders nothing of its own, one that hands over only a `loader` makes no page, and a path built from a constant (`paths.app.root.path`) is named from the constant's object literal before anything resolves, keeping its id; the route's language is tsx in a `.tsx` file and jsx elsewhere. A table another file hands the router is read too (#2400, #2423, #2668, #2672): from each non-test file that imports React Router and hands a table to `useRoutes` or `create*Router`, or maps an array into `<Route>`s from each item's own fields (`AppRoutes.map(({ element, ...rest }) => <Route {...rest} … />)`), the table is found where it is declared, imported or re-exported, or as what a function a value calls returns (each `return` of its own, through `useMemo`), and its route objects and the tables they name (`...authRoutes`, `children: adminRoutes`) become routes under the path they are mounted at, inside the layouts around them when the table is written in the same file; a `{ path, element }` menu nothing hands the router is none. These routes (`route:<file>:<line>:table:<path>`) are cross-file nodes: after the constant naming, a pass compares the routes every table gives now with the ones stored, inserts the new ones with their references and replaces one whose name or references changed, the edges that reached a removed one re-resolved, before anything resolves, in an index, a migration, every sync and the orphan sweep. A PascalCase module-level value a file declares is, wherever that file uses it, the component of the module its lazy wrapper loads (`Loadable(lazy(() => import('./x')))`, `dynamic(…)`, either branch of a conditional), else the function it wraps, else the declaration itself (#2420). React leaves a name the file imports to import resolution, but for a component tag imported from a module of the project: it renders what that module exports under the name, through an `index` that forwards it, past a wrapper around it (`export default observer(AppSidebar)`, `memo(Blurhash)`) or a value holding another module's component (#2563), where import resolution's answer differs or is missing. React reaches a hook or context by name only in the file that declares it (#2120, #2240). React Router is detected by `react-router`, `react-router-dom` or `react-router-native`: a navigation call (`history.push`, `history.replace`, `navigate`, `router.navigate`, `redirect`) whose href names a route of its own app (the directory above the file's first `src`, `pages`, `app` or `routes` segment, else its own) becomes a `navigates` edge with the `href` and `navMethod`, a route-config helper's href (`paths.x.getHref(id)`) and a local's static initializer read too, one edge per arm of a conditional; a path two routes of that app serve stays unresolved. TanStack Router is detected by `@tanstack/react-router`, `@tanstack/solid-router`, `@tanstack/router`, `@tanstack/react-start` or `@tanstack/start` and reads each file's own routes (F5): `createFileRoute('/posts/$postId')` names its route by the pattern, `$id` written `:id`, a bare `$` a splat, `_layout` and `(group)` segments dropped and an index's trailing `/` its parent's address, and `createRoute({ path, getParentRoute })` composes its address through the parents its file declares; a pathless layout, a root route, a route whose index child renders its address, and a file route in a file that renders `<Outlet />` or is named `*.route.tsx` are no address of their own, one address of a file is one route with its index winning, and each route `calls` the component it names. A navigation call (`navigate({ to })`, `router.navigate`, `Route.navigate`, `throw redirect({ to })`) whose `to` pattern names a route of its own app becomes a `navigates` edge with the `href` and `navMethod`; a computed `to`, a search-only navigation and a path two routes of that app serve stay unresolved. Vue Router is detected by `vue-router`, `nuxt` or `nuxt3` and reads the routes tables (F6) of a file that builds a router (`createRouter`, `new Router`, a `create*History` call), imports `vue-router`, writes a `routes` array or sits in a `router/` or `routes/` directory: a `routes: [` field or a declaration named for routes (`constantRoutes`, `const routes: RouteRecordRaw[]`, `tableRouter`) holds route objects, each entry a route of its own named by its path, a child's joined onto its parent's (`children` read only from an array written in place), that `calls` the component it names and references each parent's component as a layout (`layout: true`); a parent that a child's path claims or that redirects is a frame, not a page, and a top-level path not starting with `/` is none (#2130). The component is what the router file's import of an identifier takes (a named import the module-level node exported under that name, at its declaration or through an export list or the modules that re-export it, a default import the module's default export), or the default export of the module a lazy `() => import(…)` names, a `.vue` file's own component; the module is found as the router file resolves the import or else, for an alias, as the one file of its app whose path ends as the specifier does. A route names an identifier through a reference only Vue Router answers (`component:<name>`): where the import names a module that is not found or holds no such component, the route renders nothing, and only an identifier no import reaches is looked up by name (a declaration of the routes file, else a component of that name). A navigation call (`router.push`, `router.replace`, `this.$router.push`, `$router.push`, `navigateTo`) reaches by name the route of its own app that the table names so (`{ name: 'login' }`, an edge with `by: name`), and otherwise by its path a config route or a Nuxt page of that app. The destination is read whole: a string, a template whose holes fill whole segments (`` `/posts/${id}` ``), a conditional of them or a local initialized to one, and of an object destination only its own `name` and `path`; a concatenation (`'/redirect' + fullPath`, a comment between the two or not) or a hole sharing a segment (`` `/redirect${fullPath}` ``) reaches nothing, and a name or path two entries of the app carry stays unresolved. A bare `navigateTo` is the Vue resolver's Nuxt auto-import first, as in colby at `e8ddc4e2`: it binds to its own caller and navigates nowhere. Svelte is detected by `svelte` or `@sveltejs/kit` in the root `package.json` or by any `.svelte` file and reads a SvelteKit page's route: a `+page.svelte` under a `routes/` directory is a route named by its directory below the first `/routes/`, a `(group)` folder and a parameter's `=matcher` dropped (#2131: `[slug]` is `:slug`, `[[lang]]` `:lang?`, `[...rest]` `*rest`); a layout, error page, endpoint or loader is none. It resolves a Svelte 5 rune to its own caller, `$store` in a component to the one variable or constant of that name its file declares, an import of `$lib/x` to the file `src/lib/x` of the importing file's app (as written, or with `.ts`, `.js`, `.svelte`, `/index.ts` or `/index.js`), an import of `$app/…` or `$env/…` to its own file, as colby does, and a capitalized call to the one component of that name in the calling file's directory or below, else to the one anywhere. SvelteKit is detected by `@sveltejs/kit` in any `package.json` detection reads: a `goto(path)` or `redirect(status, path)` whose destination names a page of its own app becomes a `navigates` edge with the `href` and `navMethod`, one per arm of a conditional; the destination is read whole, as Vue Router reads it (for `goto` also a local initialized to one), and a `[[optional]]` page also serves its path without the parameter unless a page serves that path. A rest page, a computed destination, an absolute URL and a path two pages of the app serve stay unresolved. Angular Router is detected by `@angular/router` or `@angular/core` and reads the routes arrays of each TypeScript file (no declaration file) that imports `@angular/router` (upstream #2113): an array typed `Routes` or `Route[]`, handed to `RouterModule.forRoot`, `RouterModule.forChild` or `provideRouter`, a file's `export default [`, or a `const` whose array says `as Routes` or `satisfies Routes` holds route objects, their fields in any order, each child's path joined onto its parent's (`children` read only from an array written in place). Each screen is a route (`route:<file>:<line>:<path>:angular`) that references the component it renders, a `component` class through import resolution or the `@Component` class a `loadComponent` import picks (the member `.then(m => m.X)` or `(await import(…)).X` takes, else the file's default-exported component, else its only one, else its default-exported class), and references the component of each layout around it in its own file (`layout: true`; the layouts around a mount are not carried into the file it loads). A route with `children` is a layout, a screen only where no child claims its address; a `redirectTo` entry, a `**` path, a custom `matcher` and a computed path are no screens, and of two entries of a file at one path the first is the route. A file's routes are named as if the file were mounted at `/` and renamed after extraction under the path that lazy-loads the file (#2133): a `loadChildren` import, followed through barrels (an Nx library's `src/index.ts`, up to four hops) and through the routing modules an NgModule imports, a file mounted from two places under the first mount in path order, as in colby, and each file of a cycle of mounts under its own chain up to the file that repeats. A constant path segment (`internalRoutes.account.path`, an enum member, a class's static field or the object it holds, a destructured or plain alias, a `$localize` default, a `+` of strings and constants, a template whose holes are constants) is read from its declaration, through the barrels that forward it, and a constant's nested object only where it is written in place. A navigation call (`router.navigate`, `navigateByUrl`, `createUrlTree` or `parseUrl`, on `this.router` or `this._router` too) whose destination names a route of its own app becomes a `navigates` edge with the `href` and `navMethod`: the app is the nearest directory above a routes file that holds an `angular.json` or an `nx.json`, else its conventional app root, and a file under no app's root uses the only app's routes. The destination is a command array (`['/article', slug]`: a hole for each computed element, a matrix-params object ignored, and for a call a bare first segment such as `['project', 'issue', id]` read from the root), a static string, `'/editor/' + slug`, a route constant (`internalRoutes.zen.routerLink`, or one whose arrow function builds the commands), a property of the calling class, or any of those `.concat(…)`, one segment per argument; a conditional or a template is read whole, a relative arm or one that leaves the site (`//auth.example.com/login`) drops out first, and a call with `relativeTo` reaches nothing. A redirect gives its path the route it leads to, followed through the other redirects at most four hops, and `/` that no route or redirect serves takes the route of the app's root `**` redirect; a path two routes serve, or whose redirects lead to two routes, stays unresolved, and a route or a redirect whose path holds a constant the cross-file pass could not read is in no table, though its app still counts among the apps. Its templates' `routerLink`s are the synthesis stage's Angular pass's. NestJS takes a provider by its naming convention (`*Service`, `*Controller`, …) only from the reference's own file or the convention file beside it (#2246), and names each route by the path a request takes to it: its module's `RouterModule` prefix and its app's global prefix and URI version (#2117), where a test's `NestFactory.create` (an e2e spec) configures only its own feature's app and never one with an entry point of its own. The routes are renamed in place after extraction, keeping their ids, and a route nothing renames any more gets the name its file gives it back. This finalization runs after framework extraction and before resolution, in an index and in every sync. GoFrame is detected by `github.com/gogf/gf` in the root `go.mod` and reads each Go file's request types (#747): a type whose first field is a `g.Meta` with a `path:` tag is a route named `METHOD /path` (`ANY` when the tag names no method), its request type qualified by the file's package kept for the synthesis stage, which joins the route to the method serving it; it resolves no reference, and an addon's routes under `addons/` are read only where a project re-includes that directory, which the default skips for Godot. Godot also extracts project/scene/resource relationships; Tauri bridges
 literal JS-family `invoke` calls to uniquely registered Rust commands. Ambiguous
 or dynamic targets remain unresolved rather than falling through to a global
 same-name guess.
@@ -229,12 +243,199 @@ The static/runtime boundaries for supported languages and Godot are documented i
 [`languages.md`](languages.md), [`godot.md`](godot.md), and the upstream-difference
 ledger in [`upstream-sync/KNOWN_DIFFS.md`](upstream-sync/KNOWN_DIFFS.md).
 
+### Synthesis
+
+After resolution, `codegraph_resolve::synthesis` adds the dispatch edges no
+reference names: a dispatcher reaching the callbacks registered elsewhere through
+a shared store (upstream `callback-synthesizer.ts`). The stage reads the base
+graph (every edge without `metadata.synthesizedBy`, the nodes,
+`resolved_refs`, and for Go the `extends` rows resolution left in
+`unresolved_refs`) and the indexed files whose size and modification time, or
+content hash, are still the ones their file rows record; a file that drifted
+since it was indexed reads as absent until its own sync. It reads every indexed
+file once before its first step, the file rows in one query and the files in
+parallel. The C function-pointer pass also reads the files an `#include "…"`
+names that the index does not hold, such as a `.def` table, and the Angular
+template pass a component's `templateUrl` template the index does not hold: a
+file within the project root that the scan's rules admit whatever its extension (the default
+ignores, the root `.gitignore`, `.git/info/exclude` and the configured
+include and exclude), reached through no symbolic link and no larger than
+`indexing.max_file_size`. The stage records every such path it probed with
+its text's hash, or null, in `synthesis_unindexed_inputs`. When the index has
+Go files it first runs upstream's two prerequisite steps, whose edges the
+passes read as base edges and the replacement writes beside the merged ones:
+a Go type's `contains` edge to each method of its package that extraction
+left with its file alone (`go-method-contains`, no provenance, as a parsed
+`contains` edge has), and a Go struct's or defined type's `implements` edge to
+each interface its method set covers, embeddings and the methods of embedded
+standard-library types included, at the interface's parameter and result
+counts (`go-implements`). It runs its passes in
+upstream's registry order, merges their edges (the first pass to pair a source
+and a target keeps the pair), and replaces the synthesized edges in one
+transaction, an edge whose identity a base edge holds being ignored while its
+pair stays taken. It writes only the difference: an edge it makes again
+unchanged keeps its row and id, the stored ones it no longer makes, or makes
+differently, go, and the new ones come, so the rows are the ones deleting
+every synthesized edge and inserting the new ones would leave, and an
+unchanged stage writes nothing. A query that lists a node's edges of one kind
+by row id can then list a kept synthesized edge before a base edge the same
+sync rewrote, as it already lists the base edges a sync rewrote after the
+ones it kept; a fresh index's stage writes into an empty set. The ported
+passes are the field observer (`callback`), the Swift and Kotlin closure
+collection (`closure-collection`),
+the string-keyed emitter (`event-emitter`), and the structural ones: a React
+class component's or a Flutter `State`'s re-render (`react-render`,
+`flutter-build`), the components a function's JSX tags render
+(`jsx-render`), a C++ virtual override (`cpp-override`), a call through
+an interface or a base type reaching the same-named methods of the types that
+implement or extend it, a Go interface's unexported method only those of its
+package, and the method a Go struct's embedding promotes into it
+(`interface-impl`, with `promotedInto`), a Kotlin Multiplatform
+declaration's `actual`s (`kotlin-expect-actual`), a generated gRPC server
+stub's methods reaching the same-named methods of each hand-written Go struct
+declaring all of them (`go-grpc-stub-impl`), a Delphi form's unit
+(`pascal-form`), a MyBatis mapper method's statement (`mybatis-java-xml`),
+gin's handler-chain dispatcher (a Go method calling into a `handlers` slice
+by index) reaching each named handler a `Use`, `GET` or other registration
+passes, a shared name only when the registration's file or the project holds
+one Go function or method of it (`gin-middleware-chain`), a redux-thunk
+constant reaching each thunk or action creator its body dispatches, a name
+only when the first kind holding it (a thunk, a constant, a callable of the
+same file, any callable) holds one node of it (`redux-thunk`), each handler
+an object-literal registry maps, reached from
+a function that calls the registry with a runtime key (`object-registry`),
+a hook RTK Query generates reaching its endpoint, the one function of the
+hook's file its name names (`useLazyGetPostsQuery` names `getPosts`;
+`rtk-query`), a Pinia action called on the store a file binds
+(`const cart = useCartStore(); cart.add(…)`) reached from the function around
+the call, a name only when one file defines the factory, the file binds the
+variable to one store and the store's file holds one function of it
+(`pinia-store`), a Vuex `dispatch` or `commit` of a string key reaching the
+action or mutation its last segment names in a file that reads like a store,
+the one whose path has the key's namespace as a segment or, for a root key,
+the one of the dispatching file, else the project's only one
+(`vuex-dispatch`),
+the function around a Celery `.delay` or `.apply_async` reaching the
+decorated task (`celery-dispatch`), a Spring `publishEvent(new X(…))`
+reaching every `@EventListener`, `@TransactionalEventListener` or
+`ApplicationListener` method of `X` (`spring-event`), a MediatR `Send` or
+`Publish` reaching the `Handle` of each handler of the sent type
+(`mediatr-dispatch`), a Sidekiq `perform_async`, `perform_in` or
+`perform_at` reaching the worker's `perform`, a name only when one worker
+class has it, by its qualified name, else by its last segment
+(`sidekiq-dispatch`), a Laravel
+`event(new X(…))` reaching each listener's `handle` for `X`, typed or
+registered in a `$listen` map (`laravel-event`), a C or C++ call through a
+struct's function-pointer field reaching each function a table, a designated
+initializer or a field-to-field assignment registers in that field of that
+struct definition, the struct a name means read in the dispatching file's
+translation unit and an ambiguous one left unlinked, and a call through a
+bare array of function pointers reaching each function the array lists
+(`fn-pointer-dispatch`, with `via` and `registeredAt`), a GoFrame route
+reaching the controller method that takes its request type by pointer, the
+package-qualified type first and the bare one for a same-package or aliased
+parameter that is no other route's, narrowed to the controller directories
+and then to the route's own addon, one handler or none (`goframe-route`, with
+`route`, `requestType` and `registeredAt`), and a Go call through a
+struct field holding a function, reaching each function or method value a
+composite literal or an assignment puts in the field or in the func field it
+is copied from, the receiver typed by its scope at most one field or one
+embedding away (`go-func-field`, with `field`, `via` and `registeredAt`).
+The link passes read navigation the routers' resolvers never see, because
+it is markup or a helper's return value rather than a call: a navigation
+fed by a helper's call (`router.push(await pick())`) reaches each Expo
+screen of the navigation's own app that a string literal in the helper's
+body names, the helper the one function of its name in the navigation's
+file, else the project's, and at most eight screens a helper and app
+(`expo-router-return`, the edge from the helper with the literal's line
+and column); a Next.js `<Link href>`, `<NextLink href>` or internal
+`<a href>` (`next-link`), a React Router `<Link to>`, `<NavLink to>`,
+`<Navigate to>`, v5 `<Redirect to>`, react-router-bootstrap's
+`<LinkContainer to>` or a `styled(Link)` or `styled(NavLink)` wrapper a
+file importing React Router declares, used where it is declared or
+imported (`react-router-link`, a `to={…}` read as a navigation call's
+argument is, else as a route-config helper's href), a TanStack `<Link to>`
+or `<Navigate to>` read as a route pattern (`tanstack-link`), a Vue
+`<router-link>`, `<RouterLink>` or `<NuxtLink>` by path or, bound to
+`{ name }`, by name (`vue-router-link`, `by: name`), and a SvelteKit
+internal `<a href>`, a `{expr}` in it a hole (`sveltekit-link`), each a
+`navigates` edge from the function or component the link is written in to
+the route its destination names in the link's app, with `href`, `navMethod`
+and `registeredAt`, at most 24 a component, a pair already drawn not
+counted again. Only a destination starting with `/` is read: a computed,
+relative or external destination, one no route serves, a path or name two
+routes of the app carry and a link in a test file draw nothing. The link
+passes read the routers' own route tables, and resolve the imports a
+route-config object or a link wrapper comes through, through a view
+context: the texts of indexed files the stage reads, no edge, and the
+store's node, file and configuration lookups for the rest, whose
+`tsconfig.json`, `jsconfig.json`, workspace and `package.json` files are
+JavaScript's control inputs, so a change to one recomputes the stage.
+Two SvelteKit passes join the halves of a route the file system pairs: a
+`+page.svelte` or `+layout.svelte` component calls each function and method
+of the loaders beside it (`+page.server.ts`, `.server.js`, `.ts` or `.js`
+with its prefix), and their `load` and `actions` of any kind
+(`sveltekit-load`, with `via` and `registeredAt`), and each SvelteKit page
+route calls the component of its own file (`sveltekit-page`, with
+`registeredAt`); both read only paths and nodes.
+A Vue pass reads each `.vue` file's root template: a kebab-case tag
+(`<el-button>`, as `ElButton`) or a PascalCase one renders the component,
+function or class of that name, a component nested in a `components/`
+directory also under the name Nuxt auto-imports it by
+(`components/media/Card.vue` as `<MediaCard>`; `jsx-render`, with `via`, the
+tag as written); a bare `@event` or `v-on:event` handler calls the method or
+function it names, and a handler the script destructures from a composable
+(`const { close: closeSidebar } = useSidebar()`) that member of the
+composable's file (`vue-handler`, with `event` and, for a composable's member,
+`via`), at most 30 a component. A name is the one node of the file, else of
+the project; a name several nodes answer, and a name the file imports from a
+package a `package.json` declares, render and call nothing.
+An Angular pass reads, in a project that depends on `@angular/core`, the
+template of each `@Component` class of an indexed `.ts`, `.cts` or `.mts`
+file that is no declaration or test file: its `templateUrl` file, from the
+component's directory, or its inline `template:` when that is a string or
+template literal. A template file the index holds is read as it holds it,
+any other as the C pass reads an include, recorded. From the class it draws
+a `calls` edge to each child component a tag renders, the one component of
+that element selector, else the one of the parent's app (`angular-template`,
+with `via`, the tag); a `calls` edge to each of the class's own methods an
+event binding's statement calls, the last declared of that name
+(`angular-event`, with `via`, the event, and `trigger`), at most 40 children
+and 40 handlers a template; an edge to each own member a property binding,
+interpolation, structural directive, control-flow block or `@let` reads at
+render, `calls` for a call or a getter and `references` for another method,
+`fnRef` for a function handed over (`angular-binding`, with `via`, the
+binding); and a `navigates` edge to each route of the component's app that
+a `routerLink:` field of the class or a `routerLink` of the template names,
+read as a navigation call's destination is and a plain link's <span v-pre>`{{ … }}`</span> a
+hole (`angular-router-link`, with `href` and `navMethod` `routerLink`), at
+most 24 a component, the fields first. A pair already drawn is not counted
+again. Each edge carries `registeredAt`, where in the template, or for a
+field in the class, it is written, and its line is the tag's in an inline
+template and the class's for a template file.
+Each walks its candidates in upstream's order (nodes by file, line and id,
+edges by their other end, line and column); the Flutter, C++, interface,
+Kotlin, gRPC, MyBatis, gin, redux-thunk, RTK Query, Pinia, Vuex, Celery,
+Spring, MediatR, Sidekiq,
+Laravel, C function-pointer, GoFrame, Go func-field, link, Vue, Angular and SvelteKit passes run only when the index
+has files of their languages, as upstream's gates have them. A full index and a migration run
+the stage after resolution. A sync runs it last, after the orphan sweep,
+whenever it changed the index, bootstrapped a lane, swept, found a recorded
+file the last run read beside the index reading differently (its text, its
+presence or its scan scope moved), or found the `synthesis_version` marker
+missing or at another version, and writes the marker as its last write; the
+sync's site machinery never selects or deletes a synthesized edge. The
+watcher hands an event for a recorded path to the next sync, as it does a
+control input's.
+
 ## Query layer
 
 `codegraph-graph` operates on persisted nodes and edges. It owns callers,
 callees, impact, paths, hierarchies, cycle detection, FTS candidates, fallback
 matching, filters, and deterministic scoring. Generated/ambient/deprioritized
-paths can affect ranking without removing graph facts.
+paths can affect ranking without removing graph facts. It also reads the
+conditions a call site runs under from the caller's current source, with the
+extractor's grammars (`branch_guards`); nothing of that is stored in the index.
 
 The CLI and MCP share the same query engine for `search`, `explore`, and `node`,
 so source selection, staleness handling, and relationship rendering do not drift
@@ -321,8 +522,9 @@ no node records; a changed `conftest.py`, or a module one pulls in, refreshes
 the functions under its reach that take a parameter named like one of its
 fixtures, since a fixture's return type types that parameter; a
 JavaScript-family file whose module surface moved (its re-exports, export
-aliases and lists, CommonJS default, sealed-ness or component scripts, kept as
-a digest per file in `project_metadata`), and every file that came or went,
+aliases and lists, CommonJS default, the imports its own exports forward,
+sealed-ness or component scripts, kept as a digest per file in
+`project_metadata`), and every file that came or went,
 sends the direct dependents of it and of the barrels that forward it (by the
 targets their rows recorded or what their sources resolve to now) down the
 whole-file lane and touches the names it declares, since no node records any
@@ -592,21 +794,26 @@ it, however many there are; while it resolves, a sync whose rows were current
 as it started reads the heads of a file it neither rebuilds nor removes from
 that file's row rather than its source; the `class_heads_version` marker is
 withdrawn and restored with the others. Resolution also reads control files, which are no
-source files: the JS/TS path-alias configs along their `extends` chains, the
+source files: the JS/TS path-alias configs along their `extends` chains (the
+root's, and those in each directory above a JavaScript-family file), the
 workspace manifests and the folders a workspace glob lists, the `package.json`
-and Deno manifests above each JavaScript-family file, the C# project files
-above each C# file, and the `Cargo.toml` files above each Rust file; and the
-frameworks it detects. Each reader reports what it read or probed in the same
+and Deno manifests above each JavaScript-family file and the `package.json`
+files framework detection reads, the C# project files
+above each C# file, the `Cargo.toml` files above each Rust file, and the
+`go.mod` files at the root and above each Go file; and the frameworks it
+detects. Each reader reports what it read or probed in the same
 traversal, and every index and sync keeps a `control_inputs:` row per kind
-(`js`, `csharp`, `rust`) holding each input's digest by path (the sha256 of
+(`js`, `csharp`, `rust`, `go`) holding each input's digest by path (the sha256 of
 its text, or of a listed folder's names; `null` for a missing one; one outside
 the project by the absolute path its reader used), and a `frameworks_detected`
-row. A sync re-reads a kind's inputs (a CLI sync always; a watcher's when a
+row (the detected frameworks, sorted, and, when a framework runs only in its
+own apps, a digest of where it runs). A sync re-reads a kind's inputs (a CLI sync always; a watcher's when a
 path it was handed is a recorded input, a control file of the kind, or a folder
 coming into a workspace glob's listing, or when a file of the kind came, went
 or changed language), whole, with no size or time shortcut; a kind whose inputs
 moved re-resolves every file of its languages whole, and a framework that came
-or went re-extracts every file, since framework nodes are made at extraction.
+or went, or an app that moved onto or off a framework that runs only in its
+apps, re-extracts every file, since framework nodes are made at extraction.
 The `control_inputs_version` marker is withdrawn and restored with the others,
 and `frameworks_version` only by a sync re-extracting for a framework change.
 The watcher hands a control file's event to the sync, ignored or not, and an

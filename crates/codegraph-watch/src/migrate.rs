@@ -313,7 +313,7 @@ pub(crate) fn migrate_project(
     crate::control_inputs::write_index_rows(
         rebuild.store(),
         project_root,
-        &resolver.framework_names(),
+        &resolver.framework_signature(),
     )?;
     if resolver.has_framework_resolvers() {
         let relative_files = rebuild
@@ -329,8 +329,15 @@ pub(crate) fn migrate_project(
             &options.extensions,
         )?;
     }
-    resolver.resolve_and_persist_batched(rebuild.store_mut(), RESOLVE_BATCH_ROWS)?;
+    // Cross-file framework finalization before resolution, as a full index
+    // runs it.
     resolver.run_post_extract(rebuild.store_mut())?;
+    resolver.run_cross_file_nodes(rebuild.store_mut())?;
+    resolver.resolve_and_persist_batched(rebuild.store_mut(), RESOLVE_BATCH_ROWS)?;
+    // The dispatch edges no reference names, as a full index adds them
+    // (W7-14).
+    codegraph_resolve::synthesis::run_stage(rebuild.store_mut(), project_root, options)?;
+    codegraph_resolve::synthesis::write_marker(rebuild.store())?;
     // Every reference is now in `unresolved_refs` or `resolved_refs` (W5-09e).
     crate::resolved_refs::write_marker(rebuild.store(), options, &scope.framework)?;
     rebuild

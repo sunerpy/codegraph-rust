@@ -82,10 +82,10 @@ fn run_pipeline(test_name: &str, root: &Path, relative_files: &[&str]) -> Store 
     resolver
         .extract_and_persist_frameworks(&mut store, &relative)
         .expect("framework extract");
+    resolver.run_post_extract(&mut store).expect("post extract");
     resolver
         .resolve_and_persist(&mut store)
         .expect("resolve and persist");
-    resolver.run_post_extract(&mut store).expect("post extract");
     store
 }
 

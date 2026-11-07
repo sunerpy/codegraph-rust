@@ -7,6 +7,7 @@ use codegraph_bench::ab::{
     AbConfig, AbCorpus, DEFAULT_RUN_TIMEOUT, run_ab, write_ab_markdown, write_ab_report,
 };
 use codegraph_bench::corpus::{corpora_root, fetch_all_in, list_statuses, list_statuses_in};
+use codegraph_bench::go_std_gen;
 use codegraph_bench::graph_diff::run_graph_diff;
 use codegraph_bench::markdown::{render_from_json, write_markdown};
 use codegraph_bench::oracle::golden::write_golden;
@@ -129,6 +130,37 @@ struct Args {
                 exit 0 when identical, 1 when different, 2 when an input cannot be loaded"
     )]
     graph_diff: Option<Vec<PathBuf>>,
+
+    #[arg(
+        long,
+        requires = "go_src",
+        help = "Regenerate the Go standard-library method table from a Go source tree \
+                (codegraph-resolve/src/go_std_methods.rs): print it, or with --check \
+                exit 1 when the committed rows differ, or with --write rewrite them"
+    )]
+    gen_go_std_methods: bool,
+
+    #[arg(
+        long,
+        value_name = "DIR",
+        help = "Go source tree (with src/io) for --gen-go-std-methods"
+    )]
+    go_src: Option<PathBuf>,
+
+    #[arg(
+        long,
+        requires = "gen_go_std_methods",
+        conflicts_with = "write",
+        help = "Compare the generated rows with the committed ones"
+    )]
+    check: bool,
+
+    #[arg(
+        long,
+        requires = "gen_go_std_methods",
+        help = "Write the generated rows into the table module"
+    )]
+    write: bool,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -141,6 +173,9 @@ fn main() -> ExitCode {
     let args = Args::parse();
     if let Some(paths) = &args.graph_diff {
         return graph_diff_exit(&paths[0], &paths[1]);
+    }
+    if args.gen_go_std_methods {
+        return go_std_methods_exit(&args);
     }
     match run(&args) {
         Ok(()) => ExitCode::SUCCESS,
@@ -161,6 +196,37 @@ fn graph_diff_exit(left: &Path, right: &Path) -> ExitCode {
         Err(error) => {
             eprintln!("Error: {error:?}");
             ExitCode::from(2)
+        }
+    }
+}
+
+/// `--gen-go-std-methods`: 0 when printed, written or matching; 1 when
+/// `--check` finds a difference or the table cannot be generated (a listed
+/// type missing, a signature that does not read), as upstream's generator
+/// fails; 2 when `--go-src` is not a Go source tree.
+fn go_std_methods_exit(args: &Args) -> ExitCode {
+    let mode = if args.check {
+        go_std_gen::Mode::Check
+    } else if args.write {
+        go_std_gen::Mode::Write
+    } else {
+        go_std_gen::Mode::Print
+    };
+    let go_src = args.go_src.as_deref().expect("clap requires --go-src");
+    if !go_src.join("src").join("io").is_dir() {
+        eprintln!(
+            "Error: {} is not a Go source tree (no src/io)",
+            go_src.display()
+        );
+        return ExitCode::from(2);
+    }
+    let mut stdout = std::io::stdout().lock();
+    match go_std_gen::run(go_src, &go_std_gen::table_path(), mode, &mut stdout) {
+        Ok(true) => ExitCode::SUCCESS,
+        Ok(false) => ExitCode::from(1),
+        Err(error) => {
+            eprintln!("Error: {error:?}");
+            ExitCode::from(1)
         }
     }
 }

@@ -5,6 +5,7 @@
     "line": 10,
     "metadata": {
       "confidence": 0.9,
+      "framework": "godot",
       "resolvedBy": "framework"
     },
     "provenance": null,
@@ -17,6 +18,7 @@
     "line": 10,
     "metadata": {
       "confidence": 0.9,
+      "framework": "godot",
       "resolvedBy": "framework"
     },
     "provenance": null,
@@ -53,6 +55,7 @@
     "line": 9,
     "metadata": {
       "confidence": 0.9,
+      "framework": "godot",
       "resolvedBy": "framework"
     },
     "provenance": null,
@@ -65,6 +68,7 @@
     "line": 9,
     "metadata": {
       "confidence": 0.9,
+      "framework": "godot",
       "resolvedBy": "framework"
     },
     "provenance": null,

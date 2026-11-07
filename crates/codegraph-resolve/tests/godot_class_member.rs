@@ -93,11 +93,11 @@ fn run_pipeline(test_name: &str, root: &Path, relative_files: &[&str]) -> (Store
         .extract_and_persist_frameworks(&mut store, &relative)
         .expect("framework extract");
     resolver
-        .resolve_and_persist(&mut store)
-        .expect("resolve and persist");
-    resolver
         .run_post_extract(&mut store)
         .expect("run post extract");
+    resolver
+        .resolve_and_persist(&mut store)
+        .expect("resolve and persist");
 
     let edges = all_resolved_edges(&store);
     (store, edges)

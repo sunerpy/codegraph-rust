@@ -1,5 +1,65 @@
 [
   {
+    "col": 0,
+    "kind": "imports",
+    "line": 1,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "file:js/src/Posts.tsx",
+    "target": "file:js/src/api.ts"
+  },
+  {
+    "col": 0,
+    "kind": "imports",
+    "line": 1,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "file:js/src/cartConsumer.ts",
+    "target": "file:js/src/store.ts"
+  },
+  {
+    "col": 0,
+    "kind": "imports",
+    "line": 1,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "file:js/src/store/modules/user.js",
+    "target": "file:js/src/store/auth.js"
+  },
+  {
+    "col": 0,
+    "kind": "imports",
+    "line": 1,
+    "metadata": {
+      "confidence": 0.92,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "file:c/src/cmds.c",
+    "target": "file:c/src/cmds.h"
+  },
+  {
+    "col": 1,
+    "kind": "calls",
+    "line": 10,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "instance-method"
+    },
+    "provenance": null,
+    "source": "function:cc7dbb6ca5c71b7c859e0bb6405280d9",
+    "target": "method:40b38a9e4a5866e2832ab6804169ac35"
+  },
+  {
     "col": 1,
     "kind": "calls",
     "line": 28,
@@ -10,6 +70,30 @@
     "provenance": null,
     "source": "function:31958cc8a7c1c6134f84b5da2195fa02",
     "target": "method:7c53230815733da97f5fffbad03321ed"
+  },
+  {
+    "col": 1,
+    "kind": "calls",
+    "line": 8,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "instance-method"
+    },
+    "provenance": null,
+    "source": "function:cc7dbb6ca5c71b7c859e0bb6405280d9",
+    "target": "method:5c7f5fa1be3ed8bd0afaea1987ab236b"
+  },
+  {
+    "col": 1,
+    "kind": "calls",
+    "line": 9,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "instance-method"
+    },
+    "provenance": null,
+    "source": "function:cc7dbb6ca5c71b7c859e0bb6405280d9",
+    "target": "method:40b38a9e4a5866e2832ab6804169ac35"
   },
   {
     "col": 1,
@@ -26,6 +110,18 @@
   {
     "col": 1,
     "kind": "extends",
+    "line": 4,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "struct:148eb440f9e5fe012adef2af99df4d3a",
+    "target": "struct:9f671cfe2e6e6b014ddbfcc761442e33"
+  },
+  {
+    "col": 1,
+    "kind": "extends",
     "line": 8,
     "metadata": {
       "confidence": 0.9,
@@ -34,6 +130,18 @@
     "provenance": null,
     "source": "interface:8ce05b9afd075953348b7d6bf74a9556",
     "target": "interface:ff5c816f7e8b8bcf3e978f4fa19dc63a"
+  },
+  {
+    "col": 10,
+    "kind": "extends",
+    "line": 10,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "struct:cb43451f72c3398711cf7535251bec35",
+    "target": "struct:306ad387530d1e49ad70e35ee0097658"
   },
   {
     "col": 11,
@@ -110,6 +218,79 @@
     "target": "struct:606f2ccca37614d5812343568306d220"
   },
   {
+    "col": 14,
+    "kind": "references",
+    "line": 18,
+    "metadata": {
+      "confidence": 0.9,
+      "fnRef": true,
+      "resolvedBy": "function-ref"
+    },
+    "provenance": null,
+    "source": "function:207fddb9f2ee9a4411fbcefb730ff29a",
+    "target": "method:37e8ccd92b95136db15c0ea00ae4e40e"
+  },
+  {
+    "col": 14,
+    "kind": "references",
+    "line": 7,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "function:cc7dbb6ca5c71b7c859e0bb6405280d9",
+    "target": "struct:8aefb8f45fcaf50d0ec2790e5cf8a531"
+  },
+  {
+    "col": 15,
+    "kind": "calls",
+    "line": 16,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "function:207fddb9f2ee9a4411fbcefb730ff29a",
+    "target": "function:f8f21c17f8656f84fc213474805a9ec3"
+  },
+  {
+    "col": 15,
+    "kind": "calls",
+    "line": 4,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "function:ee3462990b2a34224b04f244a72ee6fc",
+    "target": "constant:9eff9be391067cb6961cb0e9edd413b4"
+  },
+  {
+    "col": 15,
+    "kind": "references",
+    "line": 3,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "function:468467677f4fc016663179441a52ff32",
+    "target": "struct:f3bd083b128204a4a98cb72d3ad0e848"
+  },
+  {
+    "col": 16,
+    "kind": "references",
+    "line": 5,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "function:4476dfa12db7b214d4f0de9d7d95ba48",
+    "target": "struct:f3bd083b128204a4a98cb72d3ad0e848"
+  },
+  {
     "col": 16,
     "kind": "references",
     "line": 9,
@@ -121,6 +302,43 @@
     "provenance": null,
     "source": "file:js/src/events.js",
     "target": "function:c87c29fe6a038cbf57b0af6a8597d7e0"
+  },
+  {
+    "col": 17,
+    "kind": "calls",
+    "line": 8,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "constant:df0d8b2254e4ba3660d72179cef212c8",
+    "target": "constant:d3bb0e99a96c57777bb522356d235e1b"
+  },
+  {
+    "col": 17,
+    "kind": "references",
+    "line": 9,
+    "metadata": {
+      "confidence": 0.95,
+      "fnRef": true,
+      "resolvedBy": "function-ref"
+    },
+    "provenance": null,
+    "source": "function:cc7dbb6ca5c71b7c859e0bb6405280d9",
+    "target": "function:4476dfa12db7b214d4f0de9d7d95ba48"
+  },
+  {
+    "col": 19,
+    "kind": "calls",
+    "line": 4,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "function:effeabed0b5bcae8fabffeb12b808691",
+    "target": "function:31711a2231d2854a388399d9247eaeea"
   },
   {
     "col": 19,
@@ -136,6 +354,117 @@
     "target": "function:4c075e5c6998bde068ac64c5129298c1"
   },
   {
+    "col": 19,
+    "kind": "references",
+    "line": 7,
+    "metadata": {
+      "confidence": 0.95,
+      "fnRef": true,
+      "resolvedBy": "function-ref"
+    },
+    "provenance": null,
+    "source": "function:e6061b8b5dc1610b1c7761d496fd5b45",
+    "target": "function:a5f83ffcc7055c497b12a0b869658beb"
+  },
+  {
+    "col": 20,
+    "kind": "calls",
+    "line": 5,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "function:effeabed0b5bcae8fabffeb12b808691",
+    "target": "function:036b0502ddb804f6794d873d0c332e74"
+  },
+  {
+    "col": 20,
+    "kind": "instantiates",
+    "line": 30,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "variable:b80207b06464950564d6b58fc4da7505",
+    "target": "struct:9913848e6f980d5dd318f7e9c0c30431"
+  },
+  {
+    "col": 20,
+    "kind": "references",
+    "line": 7,
+    "metadata": {
+      "confidence": 0.95,
+      "fnRef": true,
+      "resolvedBy": "function-ref"
+    },
+    "provenance": null,
+    "source": "file:c/src/cmds.c",
+    "target": "function:ef2fe5fe1827dd3384df8b30d229bf79"
+  },
+  {
+    "col": 20,
+    "kind": "references",
+    "line": 8,
+    "metadata": {
+      "confidence": 0.95,
+      "fnRef": true,
+      "resolvedBy": "function-ref"
+    },
+    "provenance": null,
+    "source": "file:c/src/cmds.c",
+    "target": "function:a4cfdf5270df3432e9a24f869d02677c"
+  },
+  {
+    "col": 21,
+    "kind": "references",
+    "line": 5,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "type_alias:e73237bbfed7e10ddc7970e008f40349",
+    "target": "type_alias:d37ff45960d1ced0ea7715b31b2064d3"
+  },
+  {
+    "col": 23,
+    "kind": "references",
+    "line": 18,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "function:f8f21c17f8656f84fc213474805a9ec3",
+    "target": "struct:9913848e6f980d5dd318f7e9c0c30431"
+  },
+  {
+    "col": 23,
+    "kind": "references",
+    "line": 3,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "type_alias:d37ff45960d1ced0ea7715b31b2064d3",
+    "target": "struct:f3bd083b128204a4a98cb72d3ad0e848"
+  },
+  {
+    "col": 25,
+    "kind": "references",
+    "line": 14,
+    "metadata": {
+      "confidence": 0.7,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "function:207fddb9f2ee9a4411fbcefb730ff29a",
+    "target": "struct:cb43451f72c3398711cf7535251bec35"
+  },
+  {
     "col": 25,
     "kind": "references",
     "line": 24,
@@ -147,6 +476,42 @@
     "provenance": null,
     "source": "file:js/src/events.js",
     "target": "function:994db1e9cc732ccb7ea9e3a57730e984"
+  },
+  {
+    "col": 27,
+    "kind": "imports",
+    "line": 1,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "file:js/src/Posts.tsx",
+    "target": "function:036b0502ddb804f6794d873d0c332e74"
+  },
+  {
+    "col": 28,
+    "kind": "references",
+    "line": 7,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "method:9c1b4e873ff43e93f8713698beeaf7e4",
+    "target": "class:253c64dd05f41b78ebb7a68e8aa02b46"
+  },
+  {
+    "col": 29,
+    "kind": "instantiates",
+    "line": 16,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "method:f31208ee05c865bc35c0f706a96c3a30",
+    "target": "class:253c64dd05f41b78ebb7a68e8aa02b46"
   },
   {
     "col": 29,
@@ -173,6 +538,43 @@
     "target": "class:c684061b11657d620087d825c55d4e41"
   },
   {
+    "col": 32,
+    "kind": "references",
+    "line": 6,
+    "metadata": {
+      "confidence": 0.95,
+      "fnRef": true,
+      "resolvedBy": "function-ref"
+    },
+    "provenance": null,
+    "source": "file:c/src/opcodes.c",
+    "target": "function:357980b5e0f33c1fcfcc15eacd524e51"
+  },
+  {
+    "col": 33,
+    "kind": "references",
+    "line": 18,
+    "metadata": {
+      "confidence": 0.7,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "function:f8f21c17f8656f84fc213474805a9ec3",
+    "target": "struct:306ad387530d1e49ad70e35ee0097658"
+  },
+  {
+    "col": 35,
+    "kind": "references",
+    "line": 24,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "method:5c7f5fa1be3ed8bd0afaea1987ab236b",
+    "target": "type_alias:d37ff45960d1ced0ea7715b31b2064d3"
+  },
+  {
     "col": 36,
     "kind": "calls",
     "line": 5,
@@ -185,6 +587,200 @@
     "target": "function:f72ae9f0f4692acfbc9fbbec49b8fe90"
   },
   {
+    "col": 36,
+    "kind": "instantiates",
+    "line": 16,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "function:207fddb9f2ee9a4411fbcefb730ff29a",
+    "target": "struct:9913848e6f980d5dd318f7e9c0c30431"
+  },
+  {
+    "col": 4,
+    "kind": "calls",
+    "line": 11,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "function:e6061b8b5dc1610b1c7761d496fd5b45",
+    "target": "function:1bdb95f0e8e57426106a05527118274b"
+  },
+  {
+    "col": 4,
+    "kind": "calls",
+    "line": 11,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "function:e6061b8b5dc1610b1c7761d496fd5b45",
+    "target": "function:a5f83ffcc7055c497b12a0b869658beb"
+  },
+  {
+    "col": 4,
+    "kind": "references",
+    "line": 3,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "method:6c6925fe488048baffe7829bf858bf9d",
+    "target": "class:0d1fdbdc20d3c1524720e79b000ddd1d"
+  },
+  {
+    "col": 40,
+    "kind": "references",
+    "line": 6,
+    "metadata": {
+      "confidence": 0.95,
+      "fnRef": true,
+      "resolvedBy": "function-ref"
+    },
+    "provenance": null,
+    "source": "file:c/src/opcodes.c",
+    "target": "function:eff093131b6d98290eb5f46c78e0a77e"
+  },
+  {
+    "col": 42,
+    "kind": "calls",
+    "line": 12,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "function:e219891c407a78630358752328d9ba15",
+    "target": "function:5cd1964ab26fb1cdc9994e9cce300090"
+  },
+  {
+    "col": 46,
+    "kind": "references",
+    "line": 22,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "function:ebfb48c8ba96cdb9d284ef6c34051704",
+    "target": "struct:17c7fbba1d0dbe2ba6dd032b313bfdac"
+  },
+  {
+    "col": 46,
+    "kind": "references",
+    "line": 28,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "method:40b38a9e4a5866e2832ab6804169ac35",
+    "target": "type_alias:d37ff45960d1ced0ea7715b31b2064d3"
+  },
+  {
+    "col": 49,
+    "kind": "references",
+    "line": 27,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "function:63f50595e4b93b47584b5a76d0547a43",
+    "target": "struct:1c8d98fa3bc515c71e3b7706aac50e26"
+  },
+  {
+    "col": 53,
+    "kind": "references",
+    "line": 22,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "method:0f7eaf3a1a022ad3a1c6e72c49bf6a12",
+    "target": "struct:1c8d98fa3bc515c71e3b7706aac50e26"
+  },
+  {
+    "col": 6,
+    "kind": "calls",
+    "line": 13,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "function:e7c89e2fb443031382d116eb825c639f",
+    "target": "function:736682e4083882eccd0b52a8d6b6439e"
+  },
+  {
+    "col": 61,
+    "kind": "references",
+    "line": 23,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "method:37e8ccd92b95136db15c0ea00ae4e40e",
+    "target": "struct:1c8d98fa3bc515c71e3b7706aac50e26"
+  },
+  {
+    "col": 62,
+    "kind": "references",
+    "line": 30,
+    "metadata": {
+      "confidence": 0.95,
+      "fnRef": true,
+      "resolvedBy": "function-ref"
+    },
+    "provenance": null,
+    "source": "variable:b80207b06464950564d6b58fc4da7505",
+    "target": "function:63f50595e4b93b47584b5a76d0547a43"
+  },
+  {
+    "col": 65,
+    "kind": "references",
+    "line": 17,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "method:57e5548b07bd432b5a197cfcc65a95d0",
+    "target": "struct:02286c619b4f64d8dd704e056fd8bc40"
+  },
+  {
+    "col": 66,
+    "kind": "references",
+    "line": 13,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "method:5566e0357aacb1c461a8c91af9815823",
+    "target": "struct:952d30a6a9b16b4c74783e552d13b727"
+  },
+  {
+    "col": 7,
+    "kind": "instantiates",
+    "line": 15,
+    "metadata": {
+      "confidence": 0.7,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "function:207fddb9f2ee9a4411fbcefb730ff29a",
+    "target": "struct:cb43451f72c3398711cf7535251bec35"
+  },
+  {
     "col": 7,
     "kind": "references",
     "line": 11,
@@ -195,6 +791,31 @@
     "provenance": null,
     "source": "function:33d9d8364fb2a1c7aabe3039389f7a9c",
     "target": "function:706e19e00afd3aaea61071890ff2d2ba"
+  },
+  {
+    "col": 7,
+    "kind": "references",
+    "line": 8,
+    "metadata": {
+      "confidence": 0.95,
+      "fnRef": true,
+      "resolvedBy": "function-ref"
+    },
+    "provenance": null,
+    "source": "function:cc7dbb6ca5c71b7c859e0bb6405280d9",
+    "target": "function:468467677f4fc016663179441a52ff32"
+  },
+  {
+    "col": 8,
+    "kind": "calls",
+    "line": 14,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "method:5566e0357aacb1c461a8c91af9815823",
+    "target": "function:ebfb48c8ba96cdb9d284ef6c34051704"
   },
   {
     "col": 8,
@@ -221,6 +842,18 @@
     "target": "method:596ab963c1e8091bdb7dada52f4dfeff"
   },
   {
+    "col": 8,
+    "kind": "calls",
+    "line": 8,
+    "metadata": {
+      "confidence": 0.5,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "constant:df0d8b2254e4ba3660d72179cef212c8",
+    "target": "function:994db1e9cc732ccb7ea9e3a57730e984"
+  },
+  {
     "col": 9,
     "kind": "calls",
     "line": 5,
@@ -231,6 +864,537 @@
     "provenance": null,
     "source": "constant:4b684f1aedba2724eae145b1dea95daa",
     "target": "function:c096d2e7fee390bda5cc9ce64c900a40"
+  },
+  {
+    "col": 9,
+    "kind": "imports",
+    "line": 1,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "file:js/src/Posts.tsx",
+    "target": "function:31711a2231d2854a388399d9247eaeea"
+  },
+  {
+    "col": 9,
+    "kind": "imports",
+    "line": 1,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "file:js/src/cartConsumer.ts",
+    "target": "constant:9eff9be391067cb6961cb0e9edd413b4"
+  },
+  {
+    "col": 9,
+    "kind": "imports",
+    "line": 1,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "file:js/src/store/modules/user.js",
+    "target": "function:736682e4083882eccd0b52a8d6b6439e"
+  },
+  {
+    "col": 9,
+    "kind": "instantiates",
+    "line": 19,
+    "metadata": {
+      "confidence": 0.7,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "function:f8f21c17f8656f84fc213474805a9ec3",
+    "target": "struct:306ad387530d1e49ad70e35ee0097658"
+  },
+  {
+    "col": 90,
+    "kind": "references",
+    "line": 17,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "method:57e5548b07bd432b5a197cfcc65a95d0",
+    "target": "struct:1a2d8f3e6665453637b3803581ff55f2"
+  },
+  {
+    "col": 94,
+    "kind": "references",
+    "line": 13,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "method:5566e0357aacb1c461a8c91af9815823",
+    "target": "struct:17c7fbba1d0dbe2ba6dd032b313bfdac"
+  },
+  {
+    "col": null,
+    "kind": "calls",
+    "line": 10,
+    "metadata": {
+      "registeredAt": "dispatch/app/Http/Registration.php:10",
+      "synthesizedBy": "laravel-event",
+      "via": "Registered"
+    },
+    "provenance": "heuristic",
+    "source": "method:b8634218ad53bdcf252458f8e5eda333",
+    "target": "method:100387fd10458a252c1e7e679e93b7e1"
+  },
+  {
+    "col": null,
+    "kind": "calls",
+    "line": 12,
+    "metadata": {
+      "registeredAt": "c/src/cmds.c:12",
+      "synthesizedBy": "fn-pointer-dispatch",
+      "via": "command.proc"
+    },
+    "provenance": "heuristic",
+    "source": "function:85b0f98b0b8a039781766fb128145442",
+    "target": "function:a4cfdf5270df3432e9a24f869d02677c"
+  },
+  {
+    "col": null,
+    "kind": "calls",
+    "line": 12,
+    "metadata": {
+      "registeredAt": "c/src/cmds.c:12",
+      "synthesizedBy": "fn-pointer-dispatch",
+      "via": "command.proc"
+    },
+    "provenance": "heuristic",
+    "source": "function:85b0f98b0b8a039781766fb128145442",
+    "target": "function:ef2fe5fe1827dd3384df8b30d229bf79"
+  },
+  {
+    "col": null,
+    "kind": "calls",
+    "line": 13,
+    "metadata": {
+      "registeredAt": "go/gin/app.go:8",
+      "synthesizedBy": "gin-middleware-chain",
+      "via": "Logger"
+    },
+    "provenance": "heuristic",
+    "source": "method:5d4971ea91e2095eee5c31d0ff7d5543",
+    "target": "function:468467677f4fc016663179441a52ff32"
+  },
+  {
+    "col": null,
+    "kind": "calls",
+    "line": 13,
+    "metadata": {
+      "registeredAt": "go/gin/app.go:9",
+      "synthesizedBy": "gin-middleware-chain",
+      "via": "getUser"
+    },
+    "provenance": "heuristic",
+    "source": "method:5d4971ea91e2095eee5c31d0ff7d5543",
+    "target": "function:4476dfa12db7b214d4f0de9d7d95ba48"
+  },
+  {
+    "col": null,
+    "kind": "calls",
+    "line": 14,
+    "metadata": {
+      "registeredAt": "dispatch/src/Events.java:14",
+      "synthesizedBy": "spring-event",
+      "via": "UserRegistered"
+    },
+    "provenance": "heuristic",
+    "source": "method:4fa1cc0f5c6e16964aa519b8ffa473d9",
+    "target": "method:d5658cf785502385e0d2dc65e6908262"
+  },
+  {
+    "col": null,
+    "kind": "calls",
+    "line": 14,
+    "metadata": {
+      "registeredAt": "goframe/internal/controller/dept.go:17",
+      "requestType": "DeptAddReq",
+      "route": "POST /dept/add",
+      "synthesizedBy": "goframe-route"
+    },
+    "provenance": "heuristic",
+    "source": "route:goframe/api/system/dept.go:14:POST:/dept/add",
+    "target": "method:57e5548b07bd432b5a197cfcc65a95d0"
+  },
+  {
+    "col": null,
+    "kind": "calls",
+    "line": 14,
+    "metadata": {
+      "registeredAt": "js/src/store/modules/user.js:14",
+      "synthesizedBy": "vuex-dispatch",
+      "via": "SET_TOKEN"
+    },
+    "provenance": "heuristic",
+    "source": "function:e7c89e2fb443031382d116eb825c639f",
+    "target": "function:54332c2d8a0c44986c64d17390e07738"
+  },
+  {
+    "col": null,
+    "kind": "calls",
+    "line": 15,
+    "metadata": {
+      "registeredAt": "c/src/ops.c:15",
+      "synthesizedBy": "fn-pointer-dispatch",
+      "via": "file_ops.open"
+    },
+    "provenance": "heuristic",
+    "source": "function:0114da5ed06cbe96441f72b8ce3bd9cc",
+    "target": "function:7b4ec42e248fdcfb93af97fcbdfe474e"
+  },
+  {
+    "col": null,
+    "kind": "calls",
+    "line": 16,
+    "metadata": {
+      "registeredAt": "c/src/ops.c:16",
+      "synthesizedBy": "fn-pointer-dispatch",
+      "via": "file_ops.close"
+    },
+    "provenance": "heuristic",
+    "source": "function:0114da5ed06cbe96441f72b8ce3bd9cc",
+    "target": "function:f4cd691a149da8dd44acd2922aa4d033"
+  },
+  {
+    "col": null,
+    "kind": "calls",
+    "line": 16,
+    "metadata": {
+      "registeredAt": "dispatch/src/Orders.cs:16",
+      "synthesizedBy": "mediatr-dispatch",
+      "via": "PlaceOrder"
+    },
+    "provenance": "heuristic",
+    "source": "method:f31208ee05c865bc35c0f706a96c3a30",
+    "target": "method:9c1b4e873ff43e93f8713698beeaf7e4"
+  },
+  {
+    "col": null,
+    "kind": "calls",
+    "line": 16,
+    "metadata": {
+      "registeredAt": "python/tasks.py:16",
+      "synthesizedBy": "celery-dispatch",
+      "via": "send_email"
+    },
+    "provenance": "heuristic",
+    "source": "function:fa4a2925d6f31cdb05806f4225d4fc3b",
+    "target": "function:adfc8690e5268296a2775a57da14f3c8"
+  },
+  {
+    "col": null,
+    "kind": "calls",
+    "line": 17,
+    "metadata": {
+      "registeredAt": "c/src/optab.c:17",
+      "synthesizedBy": "fn-pointer-dispatch",
+      "via": "op.run"
+    },
+    "provenance": "heuristic",
+    "source": "function:f3a1159c5c767086f4bcece8b9165bbc",
+    "target": "function:354a28e189a1f209b6773bc3f6f3433a"
+  },
+  {
+    "col": null,
+    "kind": "calls",
+    "line": 17,
+    "metadata": {
+      "registeredAt": "c/src/optab.c:17",
+      "synthesizedBy": "fn-pointer-dispatch",
+      "via": "op.run"
+    },
+    "provenance": "heuristic",
+    "source": "function:f3a1159c5c767086f4bcece8b9165bbc",
+    "target": "function:7948220796ebe418edd8b9ae6f5d5d52"
+  },
+  {
+    "col": null,
+    "kind": "calls",
+    "line": 2,
+    "metadata": {
+      "registeredAt": "js/src/app.js:2",
+      "synthesizedBy": "vuex-dispatch",
+      "via": "user/login"
+    },
+    "provenance": "heuristic",
+    "source": "function:2ff86be01a8b2c59d9961725b7675be9",
+    "target": "function:e7c89e2fb443031382d116eb825c639f"
+  },
+  {
+    "col": null,
+    "kind": "calls",
+    "line": 20,
+    "metadata": {
+      "registeredAt": "js/src/api.ts:20",
+      "synthesizedBy": "rtk-query",
+      "via": "addPost"
+    },
+    "provenance": "heuristic",
+    "source": "function:036b0502ddb804f6794d873d0c332e74",
+    "target": "function:40cdf68dfc7af0f1379f48b2ac1d8b44"
+  },
+  {
+    "col": null,
+    "kind": "calls",
+    "line": 20,
+    "metadata": {
+      "registeredAt": "js/src/api.ts:20",
+      "synthesizedBy": "rtk-query",
+      "via": "getPosts"
+    },
+    "provenance": "heuristic",
+    "source": "function:0424ca8ac1d7c0c481f0c9469690619b",
+    "target": "function:e219891c407a78630358752328d9ba15"
+  },
+  {
+    "col": null,
+    "kind": "calls",
+    "line": 20,
+    "metadata": {
+      "registeredAt": "js/src/api.ts:20",
+      "synthesizedBy": "rtk-query",
+      "via": "getPosts"
+    },
+    "provenance": "heuristic",
+    "source": "function:31711a2231d2854a388399d9247eaeea",
+    "target": "function:e219891c407a78630358752328d9ba15"
+  },
+  {
+    "col": null,
+    "kind": "calls",
+    "line": 23,
+    "metadata": {
+      "field": "Discovery.refreshf",
+      "registeredAt": "go/ec2/ec2.go:18",
+      "synthesizedBy": "go-func-field",
+      "via": "Options.RefreshF"
+    },
+    "provenance": "heuristic",
+    "source": "method:0f7eaf3a1a022ad3a1c6e72c49bf6a12",
+    "target": "method:37e8ccd92b95136db15c0ea00ae4e40e"
+  },
+  {
+    "col": null,
+    "kind": "calls",
+    "line": 23,
+    "metadata": {
+      "field": "Discovery.refreshf",
+      "registeredAt": "go/ec2/ec2.go:30",
+      "synthesizedBy": "go-func-field",
+      "via": "Options.RefreshF"
+    },
+    "provenance": "heuristic",
+    "source": "method:0f7eaf3a1a022ad3a1c6e72c49bf6a12",
+    "target": "function:63f50595e4b93b47584b5a76d0547a43"
+  },
+  {
+    "col": null,
+    "kind": "calls",
+    "line": 3,
+    "metadata": {
+      "registeredAt": "dispatch/app/services/signup.rb:3",
+      "synthesizedBy": "sidekiq-dispatch",
+      "via": "WelcomeWorker"
+    },
+    "provenance": "heuristic",
+    "source": "method:6c6925fe488048baffe7829bf858bf9d",
+    "target": "method:62519ff44634c1c284163dc322ad4878"
+  },
+  {
+    "col": null,
+    "kind": "calls",
+    "line": 3,
+    "metadata": {
+      "registeredAt": "kotlin/jvm/src/Platform.kt:3",
+      "synthesizedBy": "kotlin-expect-actual",
+      "via": "platformName"
+    },
+    "provenance": "heuristic",
+    "source": "function:f72ae9f0f4692acfbc9fbbec49b8fe90",
+    "target": "function:8d2b7c79a380ef6a7161fb9ed9f100e6"
+  },
+  {
+    "col": null,
+    "kind": "calls",
+    "line": 4,
+    "metadata": {
+      "registeredAt": "go/store/store.go:14",
+      "synthesizedBy": "interface-impl",
+      "via": "Get"
+    },
+    "provenance": "heuristic",
+    "source": "method:596ab963c1e8091bdb7dada52f4dfeff",
+    "target": "method:ee38e1a68c4a246da445c2ddffeeff4f"
+  },
+  {
+    "col": null,
+    "kind": "calls",
+    "line": 4,
+    "metadata": {
+      "registeredAt": "mybatis/src/main/resources/mapper/UserMapper.xml:4",
+      "synthesizedBy": "mybatis-java-xml",
+      "via": "UserMapper.findName"
+    },
+    "provenance": "heuristic",
+    "source": "method:23b52db61e3c123c60850cc118b75515",
+    "target": "method:fc57b8ff353cc43701ceb2c71ac647fd"
+  },
+  {
+    "col": null,
+    "kind": "calls",
+    "line": 5,
+    "metadata": {
+      "registeredAt": "goframe/internal/controller/dept.go:13",
+      "requestType": "DeptSearchReq",
+      "route": "GET /dept/list",
+      "synthesizedBy": "goframe-route"
+    },
+    "provenance": "heuristic",
+    "source": "route:goframe/api/system/dept.go:5:GET:/dept/list",
+    "target": "method:5566e0357aacb1c461a8c91af9815823"
+  },
+  {
+    "col": null,
+    "kind": "calls",
+    "line": 5,
+    "metadata": {
+      "registeredAt": "js/src/cartConsumer.ts:5",
+      "synthesizedBy": "pinia-store",
+      "via": "add"
+    },
+    "provenance": "heuristic",
+    "source": "function:ee3462990b2a34224b04f244a72ee6fc",
+    "target": "function:825165de277a437e25c783384e00019e"
+  },
+  {
+    "col": null,
+    "kind": "calls",
+    "line": 7,
+    "metadata": {
+      "registeredAt": "go/rpc/server.go:7",
+      "synthesizedBy": "go-grpc-stub-impl",
+      "via": "SayHello"
+    },
+    "provenance": "heuristic",
+    "source": "method:fcda1874ab363728d7d5db4798f7f1f0",
+    "target": "method:756e65a74d626f5c813a2edd22c820ca"
+  },
+  {
+    "col": null,
+    "kind": "calls",
+    "line": 7,
+    "metadata": {
+      "synthesizedBy": "jsx-render",
+      "via": "Label"
+    },
+    "provenance": "heuristic",
+    "source": "function:33d9d8364fb2a1c7aabe3039389f7a9c",
+    "target": "function:706e19e00afd3aaea61071890ff2d2ba"
+  },
+  {
+    "col": null,
+    "kind": "calls",
+    "line": 8,
+    "metadata": {
+      "registeredAt": "js/src/thunks.ts:8",
+      "synthesizedBy": "redux-thunk",
+      "via": "refreshCart"
+    },
+    "provenance": "heuristic",
+    "source": "constant:df0d8b2254e4ba3660d72179cef212c8",
+    "target": "constant:d3bb0e99a96c57777bb522356d235e1b"
+  },
+  {
+    "col": null,
+    "kind": "calls",
+    "line": 9,
+    "metadata": {
+      "registeredAt": "c/src/opcodes.c:9",
+      "synthesizedBy": "fn-pointer-dispatch",
+      "via": "opcodes[]"
+    },
+    "provenance": "heuristic",
+    "source": "function:6b00a787e36fbcd4b8de094c9e5ff4c9",
+    "target": "function:357980b5e0f33c1fcfcc15eacd524e51"
+  },
+  {
+    "col": null,
+    "kind": "calls",
+    "line": 9,
+    "metadata": {
+      "registeredAt": "c/src/opcodes.c:9",
+      "synthesizedBy": "fn-pointer-dispatch",
+      "via": "opcodes[]"
+    },
+    "provenance": "heuristic",
+    "source": "function:6b00a787e36fbcd4b8de094c9e5ff4c9",
+    "target": "function:eff093131b6d98290eb5f46c78e0a77e"
+  },
+  {
+    "col": null,
+    "kind": "calls",
+    "line": 9,
+    "metadata": {
+      "registeredAt": "go/store/store.go:21",
+      "synthesizedBy": "interface-impl",
+      "via": "Set"
+    },
+    "provenance": "heuristic",
+    "source": "method:7c53230815733da97f5fffbad03321ed",
+    "target": "method:bfb08c5b3c3ad31c97eb0770241257a8"
+  },
+  {
+    "col": null,
+    "kind": "calls",
+    "line": null,
+    "metadata": {
+      "event": "saved",
+      "registeredAt": "js/src/events.js:9",
+      "synthesizedBy": "event-emitter"
+    },
+    "provenance": "heuristic",
+    "source": "function:4c075e5c6998bde068ac64c5129298c1",
+    "target": "function:c87c29fe6a038cbf57b0af6a8597d7e0"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "class:0d1fdbdc20d3c1524720e79b000ddd1d",
+    "target": "method:62519ff44634c1c284163dc322ad4878"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "class:1f858fe058eb702b4d243e208cc63e95",
+    "target": "method:6c6925fe488048baffe7829bf858bf9d"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "class:28fcc5a01b5862dd52521c130ba45131",
+    "target": "method:100387fd10458a252c1e7e679e93b7e1"
   },
   {
     "col": null,
@@ -292,6 +1456,33 @@
     "line": null,
     "metadata": null,
     "provenance": null,
+    "source": "class:6f07ceb9e8a6696aba1dac6683e2f9ef",
+    "target": "method:b8634218ad53bdcf252458f8e5eda333"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "class:b730006f9fe896abb4a37c3c52ad9e30",
+    "target": "field:672c0f4b6dcddc33a260d0393990a992"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "class:b730006f9fe896abb4a37c3c52ad9e30",
+    "target": "method:f31208ee05c865bc35c0f706a96c3a30"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
     "source": "class:c684061b11657d620087d825c55d4e41",
     "target": "field:dd8a304b7ce02c3ac5eaa3871305166d"
   },
@@ -310,6 +1501,15 @@
     "line": null,
     "metadata": null,
     "provenance": null,
+    "source": "class:cc920e0108a83e95c6495f849c2f97f2",
+    "target": "method:9c1b4e873ff43e93f8713698beeaf7e4"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
     "source": "constant:0127d4fd50b5703f5e0311fe68bd6ef5",
     "target": "function:a20b8d6e8a5756eacb55af7fdb0a2b00"
   },
@@ -321,6 +1521,159 @@
     "provenance": null,
     "source": "constant:0127d4fd50b5703f5e0311fe68bd6ef5",
     "target": "function:cc642be9bf0e2328fb2ca8897f70bd60"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "constant:9eff9be391067cb6961cb0e9edd413b4",
+    "target": "function:825165de277a437e25c783384e00019e"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "constant:ad1764c93db526d07dff60c7290e2f9f",
+    "target": "function:40cdf68dfc7af0f1379f48b2ac1d8b44"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "constant:ad1764c93db526d07dff60c7290e2f9f",
+    "target": "function:e219891c407a78630358752328d9ba15"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:c/src/cmds.c",
+    "target": "function:85b0f98b0b8a039781766fb128145442"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:c/src/cmds.c",
+    "target": "function:a4cfdf5270df3432e9a24f869d02677c"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:c/src/cmds.c",
+    "target": "function:ef2fe5fe1827dd3384df8b30d229bf79"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:c/src/cmds.c",
+    "target": "import:1f2d245f153a271dc8b62738ea33b8d7"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:c/src/cmds.c",
+    "target": "variable:7c1f611c9d2b88651a95011c81320cbf"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:c/src/cmds.h",
+    "target": "constant:eaed02455481186f010576f515ab396a"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:c/src/cmds.h",
+    "target": "struct:53838bd4662ade3a6103283d4ee89a34"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:c/src/cmds.h",
+    "target": "struct:fa7fd783ce83c075353f2b4b19a17aca"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:c/src/cmds.h",
+    "target": "type_alias:566761cf3436dd1fb1113e31c680a6b6"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:c/src/opcodes.c",
+    "target": "function:357980b5e0f33c1fcfcc15eacd524e51"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:c/src/opcodes.c",
+    "target": "function:6b00a787e36fbcd4b8de094c9e5ff4c9"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:c/src/opcodes.c",
+    "target": "function:eff093131b6d98290eb5f46c78e0a77e"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:c/src/opcodes.c",
+    "target": "type_alias:41ca227eb2581dd070c25393bcba71c8"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:c/src/opcodes.c",
+    "target": "variable:4f5b2593777bd59ac0dd39dc52fc51b9"
   },
   {
     "col": null,
@@ -373,6 +1726,69 @@
     "line": null,
     "metadata": null,
     "provenance": null,
+    "source": "file:c/src/optab.c",
+    "target": "constant:533f0d18756d6c7a3489a616467fa2f6"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:c/src/optab.c",
+    "target": "function:354a28e189a1f209b6773bc3f6f3433a"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:c/src/optab.c",
+    "target": "function:7948220796ebe418edd8b9ae6f5d5d52"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:c/src/optab.c",
+    "target": "function:f3a1159c5c767086f4bcece8b9165bbc"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:c/src/optab.c",
+    "target": "import:30a0806e98b066d1c8080547d8dbdf13"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:c/src/optab.c",
+    "target": "struct:c449ae68b73ca11c6d427107a7a3d879"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:c/src/optab.c",
+    "target": "type_alias:49f5494ee04ac0d609f17b50d7161a96"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
     "source": "file:c3ae45271150319268fd53021c1a1a9b",
     "target": "method:fc57b8ff353cc43701ceb2c71ac647fd"
   },
@@ -382,8 +1798,341 @@
     "line": null,
     "metadata": null,
     "provenance": null,
+    "source": "file:cpp/src/launch.cpp",
+    "target": "function:1bdb95f0e8e57426106a05527118274b"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:cpp/src/launch.cpp",
+    "target": "function:a5f83ffcc7055c497b12a0b869658beb"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:cpp/src/launch.cpp",
+    "target": "function:e6061b8b5dc1610b1c7761d496fd5b45"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:dispatch/app/Http/Registration.php",
+    "target": "namespace:1c67f66116a8ffa3279c4c8b70c1755e"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:dispatch/app/Listeners/SendWelcome.php",
+    "target": "namespace:6585f42f6df9f861416b2309c22c1b73"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:dispatch/app/services/signup.rb",
+    "target": "class:1f858fe058eb702b4d243e208cc63e95"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:dispatch/app/workers/welcome_worker.rb",
+    "target": "class:0d1fdbdc20d3c1524720e79b000ddd1d"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
     "source": "file:dispatch/src/Events.java",
     "target": "namespace:559ecd17038af11c9b6ef54ae38f2d50"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:dispatch/src/Orders.cs",
+    "target": "namespace:93fd4d307652df72ac2d893fcbd70206"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:go/ec2/ec2.go",
+    "target": "function:207fddb9f2ee9a4411fbcefb730ff29a"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:go/ec2/ec2.go",
+    "target": "function:63f50595e4b93b47584b5a76d0547a43"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:go/ec2/ec2.go",
+    "target": "import:50bf29c6f27b84eac01edd6da36ee045"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:go/ec2/ec2.go",
+    "target": "import:d30f480a2df0a315c3aba6407e5740ec"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:go/ec2/ec2.go",
+    "target": "method:37e8ccd92b95136db15c0ea00ae4e40e"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:go/ec2/ec2.go",
+    "target": "struct:cb43451f72c3398711cf7535251bec35"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:go/ec2/ec2.go",
+    "target": "variable:b80207b06464950564d6b58fc4da7505"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:go/gin/app.go",
+    "target": "function:4476dfa12db7b214d4f0de9d7d95ba48"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:go/gin/app.go",
+    "target": "function:468467677f4fc016663179441a52ff32"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:go/gin/app.go",
+    "target": "function:cc7dbb6ca5c71b7c859e0bb6405280d9"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:go/gin/gin.go",
+    "target": "method:40b38a9e4a5866e2832ab6804169ac35"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:go/gin/gin.go",
+    "target": "method:5c7f5fa1be3ed8bd0afaea1987ab236b"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:go/gin/gin.go",
+    "target": "method:5d4971ea91e2095eee5c31d0ff7d5543"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:go/gin/gin.go",
+    "target": "struct:8aefb8f45fcaf50d0ec2790e5cf8a531"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:go/gin/gin.go",
+    "target": "struct:f3bd083b128204a4a98cb72d3ad0e848"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:go/gin/gin.go",
+    "target": "type_alias:d37ff45960d1ced0ea7715b31b2064d3"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:go/gin/gin.go",
+    "target": "type_alias:e73237bbfed7e10ddc7970e008f40349"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:go/refresh/refresh.go",
+    "target": "function:f8f21c17f8656f84fc213474805a9ec3"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:go/refresh/refresh.go",
+    "target": "import:50d8b4293e4970b0fd7f5b2a5570c6f6"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:go/refresh/refresh.go",
+    "target": "method:0f7eaf3a1a022ad3a1c6e72c49bf6a12"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:go/refresh/refresh.go",
+    "target": "struct:1c8d98fa3bc515c71e3b7706aac50e26"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:go/refresh/refresh.go",
+    "target": "struct:306ad387530d1e49ad70e35ee0097658"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:go/refresh/refresh.go",
+    "target": "struct:9913848e6f980d5dd318f7e9c0c30431"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:go/rpc/greeter_grpc.pb.go",
+    "target": "method:20c3260f99bc76a2653cd102cf1b5156"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:go/rpc/greeter_grpc.pb.go",
+    "target": "method:28f2e0c552c98869548fae206df35ecd"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:go/rpc/greeter_grpc.pb.go",
+    "target": "method:fcda1874ab363728d7d5db4798f7f1f0"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:go/rpc/greeter_grpc.pb.go",
+    "target": "struct:9f671cfe2e6e6b014ddbfcc761442e33"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:go/rpc/server.go",
+    "target": "method:756e65a74d626f5c813a2edd22c820ca"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:go/rpc/server.go",
+    "target": "struct:148eb440f9e5fe012adef2af99df4d3a"
   },
   {
     "col": null,
@@ -472,6 +2221,123 @@
     "line": null,
     "metadata": null,
     "provenance": null,
+    "source": "file:goframe/api/system/dept.go",
+    "target": "import:a825de79879b0c315bf50d3ffafc6bce"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:goframe/api/system/dept.go",
+    "target": "struct:02286c619b4f64d8dd704e056fd8bc40"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:goframe/api/system/dept.go",
+    "target": "struct:17c7fbba1d0dbe2ba6dd032b313bfdac"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:goframe/api/system/dept.go",
+    "target": "struct:1a2d8f3e6665453637b3803581ff55f2"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:goframe/api/system/dept.go",
+    "target": "struct:7cc1f317a4a96eee1223d1e5c1f500e2"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:goframe/api/system/dept.go",
+    "target": "struct:952d30a6a9b16b4c74783e552d13b727"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:goframe/api/system/dept.go",
+    "target": "struct:e28b7286a62192370b20f9c40432eb21"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:goframe/internal/controller/dept.go",
+    "target": "function:ebfb48c8ba96cdb9d284ef6c34051704"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:goframe/internal/controller/dept.go",
+    "target": "import:589470a8d09558a1118b45b9e9b112c3"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:goframe/internal/controller/dept.go",
+    "target": "import:a3cc53134ef0b6dacbb265f8564eede0"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:goframe/internal/controller/dept.go",
+    "target": "method:5566e0357aacb1c461a8c91af9815823"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:goframe/internal/controller/dept.go",
+    "target": "method:57e5548b07bd432b5a197cfcc65a95d0"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:goframe/internal/controller/dept.go",
+    "target": "struct:ec0b84de8d8db938b67c2f0c42fee15e"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
     "source": "file:js/src/Counter.tsx",
     "target": "function:33d9d8364fb2a1c7aabe3039389f7a9c"
   },
@@ -492,6 +2358,105 @@
     "provenance": null,
     "source": "file:js/src/Counter.tsx",
     "target": "import:8b8c5dbb657017f07dc43d774bce422c"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:js/src/Posts.tsx",
+    "target": "function:effeabed0b5bcae8fabffeb12b808691"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:js/src/Posts.tsx",
+    "target": "import:d7700ed89e3116b48cb452f358d5e258"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:js/src/api.ts",
+    "target": "constant:ad1764c93db526d07dff60c7290e2f9f"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:js/src/api.ts",
+    "target": "function:036b0502ddb804f6794d873d0c332e74"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:js/src/api.ts",
+    "target": "function:0424ca8ac1d7c0c481f0c9469690619b"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:js/src/api.ts",
+    "target": "function:31711a2231d2854a388399d9247eaeea"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:js/src/api.ts",
+    "target": "function:5cd1964ab26fb1cdc9994e9cce300090"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:js/src/api.ts",
+    "target": "import:c96b94899f09fa92d35dfe0a2bdf60a9"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:js/src/app.js",
+    "target": "function:2ff86be01a8b2c59d9961725b7675be9"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:js/src/cartConsumer.ts",
+    "target": "function:ee3462990b2a34224b04f244a72ee6fc"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:js/src/cartConsumer.ts",
+    "target": "import:c8665dbed2a35a60a9fdbf914d328e27"
   },
   {
     "col": null,
@@ -591,6 +2556,69 @@
     "provenance": null,
     "source": "file:js/src/store.ts",
     "target": "import:e1807f468c634f8415bb5355c5171f48"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:js/src/store/auth.js",
+    "target": "function:736682e4083882eccd0b52a8d6b6439e"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:js/src/store/modules/user.js",
+    "target": "function:54332c2d8a0c44986c64d17390e07738"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:js/src/store/modules/user.js",
+    "target": "function:e7c89e2fb443031382d116eb825c639f"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:js/src/store/modules/user.js",
+    "target": "import:700c50cc4324f0cfe232af9d1b1da9d2"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:js/src/thunks.ts",
+    "target": "constant:d3bb0e99a96c57777bb522356d235e1b"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:js/src/thunks.ts",
+    "target": "constant:df0d8b2254e4ba3660d72179cef212c8"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:js/src/thunks.ts",
+    "target": "import:3b547a464666f5cee0d828e7046a57f8"
   },
   {
     "col": null,
@@ -724,6 +2752,24 @@
     "line": null,
     "metadata": null,
     "provenance": null,
+    "source": "namespace:1c67f66116a8ffa3279c4c8b70c1755e",
+    "target": "class:6f07ceb9e8a6696aba1dac6683e2f9ef"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "namespace:1c67f66116a8ffa3279c4c8b70c1755e",
+    "target": "import:7ab5d9ce7d42b0f28d558c3854bfbe3d"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
     "source": "namespace:4283d6bc4a5d31bf6ee3c408ba1f611d",
     "target": "interface:9c343d25063ae666c25dce60d19024fa"
   },
@@ -760,6 +2806,69 @@
     "line": null,
     "metadata": null,
     "provenance": null,
+    "source": "namespace:6585f42f6df9f861416b2309c22c1b73",
+    "target": "class:28fcc5a01b5862dd52521c130ba45131"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "namespace:6585f42f6df9f861416b2309c22c1b73",
+    "target": "import:12828a991b213fc515a737e04bedc264"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "namespace:93fd4d307652df72ac2d893fcbd70206",
+    "target": "class:253c64dd05f41b78ebb7a68e8aa02b46"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "namespace:93fd4d307652df72ac2d893fcbd70206",
+    "target": "class:b730006f9fe896abb4a37c3c52ad9e30"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "namespace:93fd4d307652df72ac2d893fcbd70206",
+    "target": "class:cc920e0108a83e95c6495f849c2f97f2"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "struct:148eb440f9e5fe012adef2af99df4d3a",
+    "target": "method:756e65a74d626f5c813a2edd22c820ca"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "struct:306ad387530d1e49ad70e35ee0097658",
+    "target": "method:0f7eaf3a1a022ad3a1c6e72c49bf6a12"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
     "source": "struct:606f2ccca37614d5812343568306d220",
     "target": "method:bfb08c5b3c3ad31c97eb0770241257a8"
   },
@@ -769,7 +2878,138 @@
     "line": null,
     "metadata": null,
     "provenance": null,
+    "source": "struct:8aefb8f45fcaf50d0ec2790e5cf8a531",
+    "target": "method:40b38a9e4a5866e2832ab6804169ac35"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "struct:8aefb8f45fcaf50d0ec2790e5cf8a531",
+    "target": "method:5c7f5fa1be3ed8bd0afaea1987ab236b"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "struct:9f671cfe2e6e6b014ddbfcc761442e33",
+    "target": "method:20c3260f99bc76a2653cd102cf1b5156"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "struct:9f671cfe2e6e6b014ddbfcc761442e33",
+    "target": "method:28f2e0c552c98869548fae206df35ecd"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "struct:9f671cfe2e6e6b014ddbfcc761442e33",
+    "target": "method:fcda1874ab363728d7d5db4798f7f1f0"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
     "source": "struct:a10a7dcc11300874eeecc89c491e4c1d",
     "target": "method:ee38e1a68c4a246da445c2ddffeeff4f"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "struct:cb43451f72c3398711cf7535251bec35",
+    "target": "method:37e8ccd92b95136db15c0ea00ae4e40e"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "struct:ec0b84de8d8db938b67c2f0c42fee15e",
+    "target": "method:5566e0357aacb1c461a8c91af9815823"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "struct:ec0b84de8d8db938b67c2f0c42fee15e",
+    "target": "method:57e5548b07bd432b5a197cfcc65a95d0"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "struct:f3bd083b128204a4a98cb72d3ad0e848",
+    "target": "method:5d4971ea91e2095eee5c31d0ff7d5543"
+  },
+  {
+    "col": null,
+    "kind": "implements",
+    "line": 12,
+    "metadata": {
+      "registeredAt": "go/store/store.go:12",
+      "synthesizedBy": "go-implements",
+      "via": "Getter"
+    },
+    "provenance": "heuristic",
+    "source": "struct:a10a7dcc11300874eeecc89c491e4c1d",
+    "target": "interface:ff5c816f7e8b8bcf3e978f4fa19dc63a"
+  },
+  {
+    "col": null,
+    "kind": "implements",
+    "line": 16,
+    "metadata": {
+      "registeredAt": "go/store/store.go:16",
+      "synthesizedBy": "go-implements",
+      "via": "Getter"
+    },
+    "provenance": "heuristic",
+    "source": "struct:606f2ccca37614d5812343568306d220",
+    "target": "interface:ff5c816f7e8b8bcf3e978f4fa19dc63a"
+  },
+  {
+    "col": null,
+    "kind": "implements",
+    "line": 16,
+    "metadata": {
+      "registeredAt": "go/store/store.go:16",
+      "synthesizedBy": "go-implements",
+      "via": "Store"
+    },
+    "provenance": "heuristic",
+    "source": "struct:606f2ccca37614d5812343568306d220",
+    "target": "interface:8ce05b9afd075953348b7d6bf74a9556"
+  },
+  {
+    "col": null,
+    "kind": "references",
+    "line": null,
+    "metadata": {
+      "valueRef": true
+    },
+    "provenance": null,
+    "source": "constant:df0d8b2254e4ba3660d72179cef212c8",
+    "target": "constant:d3bb0e99a96c57777bb522356d235e1b"
   }
 ]

@@ -168,7 +168,9 @@ pub fn resolve_import_path(
     }
 
     // Aliased/absolute imports (import-resolver.ts:64-66).
-    if let Some(aliased) = resolve_aliased_import(import_path, &project_root, language, context) {
+    if let Some(aliased) =
+        resolve_aliased_import(import_path, from_file, &project_root, language, context)
+    {
         return Some(aliased);
     }
 
@@ -528,15 +530,22 @@ fn resolve_relative_import(
 /// `import-resolver.ts:265-322`).
 fn resolve_aliased_import(
     import_path: &str,
+    from_file: &str,
     project_root: &str,
     language: Language,
     context: &dyn ResolutionContext,
 ) -> Option<String> {
     let try_with_ext = |base_path: &str| resolve_source_candidate(base_path, language, context);
 
-    // 1. Project tsconfig/jsconfig paths (import-resolver.ts:282-289).
-    if let Some(alias_map) = context.get_project_aliases() {
-        for candidate in apply_aliases(import_path, &alias_map, project_root) {
+    // 1. tsconfig/jsconfig paths: the config nearest the importing file (an
+    //    app of a monorepo keeps its own `@/*`, upstream #2165), then the
+    //    project root's.
+    let root_map = context.get_project_aliases();
+    let nearest = context
+        .get_nearest_aliases(from_file)
+        .filter(|nearest| root_map.as_ref() != Some(nearest));
+    for alias_map in nearest.iter().chain(root_map.iter()) {
+        for candidate in apply_aliases(import_path, alias_map, project_root) {
             if let Some(hit) = try_with_ext(&candidate) {
                 return Some(hit);
             }
@@ -1671,12 +1680,12 @@ pub fn resolve_jvm_import(
     } else {
         pick_closest_jvm_candidate(&candidates, &reference.file_path)
     };
-    Some(ResolvedRef {
-        original: reference.clone(),
-        target_node_id: best.id,
-        confidence: 0.95,
-        resolved_by: ResolvedBy::Import,
-    })
+    Some(ResolvedRef::new(
+        reference.clone(),
+        best.id,
+        0.95,
+        ResolvedBy::Import,
+    ))
 }
 
 /// `pickClosestJvmCandidate` (`import-resolver.ts:1096-1119`).
@@ -1818,12 +1827,12 @@ pub(crate) fn resolve_php_qualified_class_ref(
             .then_some(None);
     };
     let Some(member) = member else {
-        return Some(Some(ResolvedRef {
-            original: reference.clone(),
-            target_node_id: owner.id.clone(),
-            confidence: 0.95,
-            resolved_by: ResolvedBy::Import,
-        }));
+        return Some(Some(ResolvedRef::new(
+            reference.clone(),
+            owner.id.clone(),
+            0.95,
+            ResolvedBy::Import,
+        )));
     };
     let methods: Vec<Arc<Node>> = context
         .get_nodes_by_qualified_name_shared(&format!("{}::{member}", owner.qualified_name))
@@ -1839,12 +1848,12 @@ pub(crate) fn resolve_php_qualified_class_ref(
     let [method] = methods.as_slice() else {
         return None;
     };
-    Some(Some(ResolvedRef {
-        original: reference.clone(),
-        target_node_id: method.id.clone(),
-        confidence: 0.95,
-        resolved_by: ResolvedBy::Import,
-    }))
+    Some(Some(ResolvedRef::new(
+        reference.clone(),
+        method.id.clone(),
+        0.95,
+        ResolvedBy::Import,
+    )))
 }
 
 /// Resolve a PHP scoped call through the exact class namespace named by its
@@ -1927,12 +1936,12 @@ pub(crate) fn resolve_php_imported_static_call(
         return PhpImportedStaticCallResolution::Claimed(None);
     };
 
-    PhpImportedStaticCallResolution::Claimed(Some(ResolvedRef {
-        original: reference.clone(),
-        target_node_id: method.id.clone(),
-        confidence: 0.95,
-        resolved_by: ResolvedBy::Import,
-    }))
+    PhpImportedStaticCallResolution::Claimed(Some(ResolvedRef::new(
+        reference.clone(),
+        method.id.clone(),
+        0.95,
+        ResolvedBy::Import,
+    )))
 }
 
 /// Resolve a reference using import mappings (`resolveViaImport`,
@@ -1964,12 +1973,12 @@ pub fn resolve_via_import(
             .into_iter()
             .find(|n| n.kind == NodeKind::File && n.file_path == file)
     {
-        return Some(ResolvedRef {
-            original: reference.clone(),
-            target_node_id: file_node.id.clone(),
-            confidence: 0.9,
-            resolved_by: ResolvedBy::Import,
-        });
+        return Some(ResolvedRef::new(
+            reference.clone(),
+            file_node.id.clone(),
+            0.9,
+            ResolvedBy::Import,
+        ));
     }
     // A Dart `import` / `export` URI names a library file, and a `part` URI
     // one of the library's own files: `package:app/x.dart` is app's
@@ -1988,12 +1997,12 @@ pub fn resolve_via_import(
             .get_nodes_in_file_shared(&file)
             .into_iter()
             .find(|n| n.kind == NodeKind::File)?;
-        return Some(ResolvedRef {
-            original: reference.clone(),
-            target_node_id: file_node.id.clone(),
-            confidence: 0.9,
-            resolved_by: ResolvedBy::Import,
-        });
+        return Some(ResolvedRef::new(
+            reference.clone(),
+            file_node.id.clone(),
+            0.9,
+            ResolvedBy::Import,
+        ));
     }
     // C/C++ #include → file→file edge (import-resolver.ts:1132-1164).
     if matches!(reference.language, Language::C | Language::Cpp)
@@ -2011,12 +2020,12 @@ pub fn resolve_via_import(
             .into_iter()
             .find(|n| n.kind == NodeKind::File && n.file_path == sibling_path)
         {
-            return Some(ResolvedRef {
-                original: reference.clone(),
-                target_node_id: sibling.id.clone(),
-                confidence: 0.92,
-                resolved_by: ResolvedBy::Import,
-            });
+            return Some(ResolvedRef::new(
+                reference.clone(),
+                sibling.id.clone(),
+                0.92,
+                ResolvedBy::Import,
+            ));
         }
         let resolved_path = resolve_import_path(
             &reference.reference_name,
@@ -2030,12 +2039,12 @@ pub fn resolve_via_import(
             .into_iter()
             .find(|n| n.kind == NodeKind::File && n.file_path == resolved_path)
         {
-            return Some(ResolvedRef {
-                original: reference.clone(),
-                target_node_id: file_node.id.clone(),
-                confidence: 0.9,
-                resolved_by: ResolvedBy::Import,
-            });
+            return Some(ResolvedRef::new(
+                reference.clone(),
+                file_node.id.clone(),
+                0.9,
+                ResolvedBy::Import,
+            ));
         }
         return None;
     }
@@ -2051,12 +2060,12 @@ pub fn resolve_via_import(
                 .into_iter()
                 .find(|n| n.kind == NodeKind::File && n.file_path == resolved_path)
             {
-                return Some(ResolvedRef {
-                    original: reference.clone(),
-                    target_node_id: file_node.id.clone(),
-                    confidence: 0.9,
-                    resolved_by: ResolvedBy::Import,
-                });
+                return Some(ResolvedRef::new(
+                    reference.clone(),
+                    file_node.id.clone(),
+                    0.9,
+                    ResolvedBy::Import,
+                ));
             }
         }
         return None;
@@ -2292,12 +2301,12 @@ pub fn resolve_via_import(
                     } else {
                         target_node
                     };
-                    return Some(ResolvedRef {
-                        original: reference.clone(),
-                        target_node_id: resolved_target.id,
-                        confidence: 0.9,
-                        resolved_by: ResolvedBy::Import,
-                    });
+                    return Some(ResolvedRef::new(
+                        reference.clone(),
+                        resolved_target.id,
+                        0.9,
+                        ResolvedBy::Import,
+                    ));
                 }
             }
         }
@@ -2350,12 +2359,12 @@ fn resolve_module_import_to_file(
                     .into_iter()
                     .find(|n| n.kind == NodeKind::File)
                 {
-                    return Some(ResolvedRef {
-                        original: reference.clone(),
-                        target_node_id: file_node.id.clone(),
-                        confidence: 0.9,
-                        resolved_by: ResolvedBy::Import,
-                    });
+                    return Some(ResolvedRef::new(
+                        reference.clone(),
+                        file_node.id.clone(),
+                        0.9,
+                        ResolvedBy::Import,
+                    ));
                 }
             }
         }
@@ -2372,12 +2381,12 @@ fn resolve_module_import_to_file(
                     .into_iter()
                     .find(|n| n.kind == NodeKind::File)
                 {
-                    return Some(ResolvedRef {
-                        original: reference.clone(),
-                        target_node_id: file_node.id.clone(),
-                        confidence: 0.9,
-                        resolved_by: ResolvedBy::Import,
-                    });
+                    return Some(ResolvedRef::new(
+                        reference.clone(),
+                        file_node.id.clone(),
+                        0.9,
+                        ResolvedBy::Import,
+                    ));
                 }
             }
         }
@@ -2420,12 +2429,12 @@ fn resolve_jvm_alias(
                 .into_iter()
                 .next()?,
         };
-        return Some(ResolvedRef {
-            original: reference.clone(),
-            target_node_id: target_node.id.clone(),
-            confidence: 0.9,
-            resolved_by: ResolvedBy::Import,
-        });
+        return Some(ResolvedRef::new(
+            reference.clone(),
+            target_node.id.clone(),
+            0.9,
+            ResolvedBy::Import,
+        ));
     }
     None
 }
@@ -2467,12 +2476,12 @@ fn resolve_java_imported_reference(
             }
             let fp = node.file_path.replace('\\', "/");
             if fp.ends_with(&fqn_path) || fp.ends_with(&format!("/{fqn_path}")) {
-                return Some(ResolvedRef {
-                    original: reference.clone(),
-                    target_node_id: node.id.clone(),
-                    confidence: 0.9,
-                    resolved_by: ResolvedBy::Import,
-                });
+                return Some(ResolvedRef::new(
+                    reference.clone(),
+                    node.id.clone(),
+                    0.9,
+                    ResolvedBy::Import,
+                ));
             }
         }
 
@@ -2487,12 +2496,12 @@ fn resolve_java_imported_reference(
                         }
                         let fp = node.file_path.replace('\\', "/");
                         if fp.ends_with(&owner_path) || fp.ends_with(&format!("/{owner_path}")) {
-                            return Some(ResolvedRef {
-                                original: reference.clone(),
-                                target_node_id: node.id.clone(),
-                                confidence: 0.9,
-                                resolved_by: ResolvedBy::Import,
-                            });
+                            return Some(ResolvedRef::new(
+                                reference.clone(),
+                                node.id.clone(),
+                                0.9,
+                                ResolvedBy::Import,
+                            ));
                         }
                     }
                 }
@@ -3122,12 +3131,7 @@ fn find_go_package_member(
                 && node.is_exported
                 && crate::go_packages::package_dir_of(&node.file_path) == pkg_dir
         })
-        .map(|node| ResolvedRef {
-            original: reference.clone(),
-            target_node_id: node.id.clone(),
-            confidence: 0.9,
-            resolved_by: ResolvedBy::Import,
-        })
+        .map(|node| ResolvedRef::new(reference.clone(), node.id.clone(), 0.9, ResolvedBy::Import))
 }
 
 #[derive(Default)]
@@ -3243,12 +3247,12 @@ fn lookup_python_module_member(
 
     PythonModuleMemberLookup {
         claimed: true,
-        resolved: Some(ResolvedRef {
-            original: reference.clone(),
-            target_node_id: target.id.clone(),
-            confidence: 0.85,
-            resolved_by: ResolvedBy::Import,
-        }),
+        resolved: Some(ResolvedRef::new(
+            reference.clone(),
+            target.id.clone(),
+            0.85,
+            ResolvedBy::Import,
+        )),
     }
 }
 
@@ -3345,12 +3349,12 @@ fn resolve_python_from_import_member(
     if targets.len() != 1 {
         return None;
     }
-    Some(ResolvedRef {
-        original: reference.clone(),
-        target_node_id: targets[0].id.clone(),
-        confidence: 0.9,
-        resolved_by: ResolvedBy::Import,
-    })
+    Some(ResolvedRef::new(
+        reference.clone(),
+        targets[0].id.clone(),
+        0.9,
+        ResolvedBy::Import,
+    ))
 }
 
 /// Python absolute dotted module import `import a.b.c` → its file (the Django
@@ -3374,12 +3378,12 @@ fn resolve_python_absolute_module(
                 .find(|n| n.kind == NodeKind::File)
                 .map(|n| n.id.clone())
         })?;
-    Some(ResolvedRef {
-        original: reference.clone(),
-        target_node_id: hit_id,
-        confidence: 0.9,
-        resolved_by: ResolvedBy::Import,
-    })
+    Some(ResolvedRef::new(
+        reference.clone(),
+        hit_id,
+        0.9,
+        ResolvedBy::Import,
+    ))
 }
 
 /// How many modules deep a Python re-export walk goes (upstream #2247).
@@ -3673,12 +3677,12 @@ fn resolve_rust_path_reference(
                         | NodeKind::Interface
                 )
         })?;
-    Some(ResolvedRef {
-        original: reference.clone(),
-        target_node_id: target.id.clone(),
-        confidence: 0.9,
-        resolved_by: ResolvedBy::Import,
-    })
+    Some(ResolvedRef::new(
+        reference.clone(),
+        target.id.clone(),
+        0.9,
+        ResolvedBy::Import,
+    ))
 }
 
 /// The crate-root directory (holds `lib.rs`/`main.rs`), walking up from a file.
@@ -3827,12 +3831,12 @@ pub(crate) fn resolve_lua_require(
             .into_iter()
             .find(|n| n.kind == NodeKind::File)
         {
-            return Some(ResolvedRef {
-                original: reference.clone(),
-                target_node_id: file_node.id.clone(),
-                confidence: 0.9,
-                resolved_by: ResolvedBy::Import,
-            });
+            return Some(ResolvedRef::new(
+                reference.clone(),
+                file_node.id.clone(),
+                0.9,
+                ResolvedBy::Import,
+            ));
         }
     }
     None
@@ -3859,6 +3863,9 @@ mod tests {
         import_mappings: BTreeMap<String, Vec<ImportMapping>>,
         re_exports: BTreeMap<String, Vec<ReExport>>,
         project_aliases: Option<AliasMap>,
+        /// A directory's nearest aliases, by the directory: a file takes the
+        /// longest one its path is under.
+        nearest_aliases: BTreeMap<String, AliasMap>,
         workspace_packages: Option<WorkspacePackages>,
         go_module: Option<GoModule>,
         cpp_include_dirs: Vec<String>,
@@ -3925,6 +3932,13 @@ mod tests {
         }
         fn get_project_aliases(&self) -> Option<AliasMap> {
             self.project_aliases.clone()
+        }
+        fn get_nearest_aliases(&self, from_file: &str) -> Option<AliasMap> {
+            self.nearest_aliases
+                .iter()
+                .filter(|(dir, _)| from_file.starts_with(&format!("{dir}/")))
+                .max_by_key(|(dir, _)| dir.len())
+                .map(|(_, aliases)| aliases.clone())
         }
         fn get_workspace_packages(&self) -> Option<WorkspacePackages> {
             self.workspace_packages.clone()
@@ -5548,6 +5562,47 @@ export default defaultTarget;
         assert_eq!(
             resolve_import_path("@lib/thing", "src/a.ts", Language::TypeScript, &ctx),
             Some("lib/thing.ts".to_string())
+        );
+    }
+
+    /// W7-09a (upstream #2165): an import tries the aliases of the config
+    /// nearest its file first, so each app of a monorepo resolves its own
+    /// `@/*`; the root's answer the rest, and an alias the nearest config
+    /// does not map.
+    #[test]
+    fn an_import_tries_the_nearest_configs_aliases_first() {
+        let existing: BTreeSet<String> =
+            ["src/thing.ts", "apps/web/src/thing.ts", "src/only-root.ts"]
+                .into_iter()
+                .map(str::to_string)
+                .collect();
+        let map = |base: &str, replacement: &str| AliasMap {
+            base_url: base.to_string(),
+            patterns: vec![alias("@/", true, replacement)],
+        };
+        let ctx = TestContext {
+            project_root: "/proj".to_string(),
+            existing_files: existing,
+            project_aliases: Some(map("/proj", "src/*")),
+            nearest_aliases: [("apps/web".to_string(), map("/proj/apps/web", "src/*"))]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        };
+        let resolve =
+            |spec: &str, from: &str| resolve_import_path(spec, from, Language::TypeScript, &ctx);
+        assert_eq!(
+            resolve("@/thing", "apps/web/src/pages/a.ts"),
+            Some("apps/web/src/thing.ts".to_string())
+        );
+        assert_eq!(
+            resolve("@/thing", "lib/b.ts"),
+            Some("src/thing.ts".to_string())
+        );
+        // The nearest config maps `@/only-root` to no file: the root's does.
+        assert_eq!(
+            resolve("@/only-root", "apps/web/src/pages/a.ts"),
+            Some("src/only-root.ts".to_string())
         );
     }
 

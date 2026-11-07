@@ -161,10 +161,10 @@ fn resolve_project(files: &[(String, String)]) -> Project {
     resolver
         .extract_and_persist_frameworks(&mut store, &relative)
         .expect("framework extract");
+    resolver.run_post_extract(&mut store).expect("post extract");
     resolver
         .resolve_and_persist(&mut store)
         .expect("resolve fixture");
-    resolver.run_post_extract(&mut store).expect("post extract");
     Project {
         root,
         store: Some(store),

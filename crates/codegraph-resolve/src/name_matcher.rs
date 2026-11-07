@@ -70,12 +70,12 @@ pub fn match_by_file_path(
     if let Some(exact) = file_nodes.iter().find(|n| {
         n.qualified_name == reference.reference_name || n.file_path == reference.reference_name
     }) {
-        return Some(ResolvedRef {
-            original: reference.clone(),
-            target_node_id: exact.id.clone(),
-            confidence: 0.95,
-            resolved_by: ResolvedBy::FilePath,
-        });
+        return Some(ResolvedRef::new(
+            reference.clone(),
+            exact.id.clone(),
+            0.95,
+            ResolvedBy::FilePath,
+        ));
     }
 
     // Suffix match, picking the closest file node (name-matcher.ts:54-64).
@@ -89,22 +89,22 @@ pub fn match_by_file_path(
         .collect();
     if !suffix_matches.is_empty() {
         let chosen = pick_closest_file_node(&suffix_matches, reference);
-        return Some(ResolvedRef {
-            original: reference.clone(),
-            target_node_id: chosen.id.clone(),
-            confidence: 0.85,
-            resolved_by: ResolvedBy::FilePath,
-        });
+        return Some(ResolvedRef::new(
+            reference.clone(),
+            chosen.id.clone(),
+            0.85,
+            ResolvedBy::FilePath,
+        ));
     }
 
     // Single same-named file node, lower confidence (name-matcher.ts:67-74).
     if file_nodes.len() == 1 {
-        return Some(ResolvedRef {
-            original: reference.clone(),
-            target_node_id: file_nodes[0].id.clone(),
-            confidence: 0.7,
-            resolved_by: ResolvedBy::FilePath,
-        });
+        return Some(ResolvedRef::new(
+            reference.clone(),
+            file_nodes[0].id.clone(),
+            0.7,
+            ResolvedBy::FilePath,
+        ));
     }
 
     None
@@ -1292,8 +1292,8 @@ fn is_ascii_word_char(ch: char) -> bool {
 /// v1.6.1). The extractor emits `this.m()` and `pkg.F().M()` under the bare
 /// member name, so the receiver is read back from the call site's own line:
 /// the text at the ref's column must start with the name, be followed by a
-/// call opener, and be preceded by nothing, an operator/opener, or one of
-/// [`BARE_CALL_KEYWORDS`].
+/// call opener (`(`, `<`, or an optional call's `?.(`), and be preceded by
+/// nothing, an operator/opener, or one of [`BARE_CALL_KEYWORDS`].
 ///
 /// Unlike upstream, the opener may sit on a following line: JavaScript's
 /// automatic semicolon insertion never splits `finish\n()`, so that is a real
@@ -1322,6 +1322,10 @@ fn is_receiver_less_call(reference: &RefView, context: &dyn ResolutionContext) -
     };
     let after =
         facts.source()[line_start + column + name.len()..].trim_start_matches(char::is_whitespace);
+    // An optional call's `?.(` opens a call too (upstream #2240).
+    let after = after
+        .strip_prefix("?.")
+        .map_or(after, |rest| rest.trim_start_matches(char::is_whitespace));
     if !after.starts_with('(') && !after.starts_with('<') {
         return false;
     }
@@ -3250,12 +3254,12 @@ pub fn match_by_exact_name(
     // reference actually was, and only the CANDIDATES are narrowed.
     if reachable.len() == 1 {
         let is_cross_language = candidates[0].language != reference.language;
-        return Some(ResolvedRef {
-            original: reference.clone(),
-            target_node_id: candidates[0].id.clone(),
-            confidence: if is_cross_language { 0.5 } else { 0.9 },
-            resolved_by: ResolvedBy::ExactMatch,
-        });
+        return Some(ResolvedRef::new(
+            reference.clone(),
+            candidates[0].id.clone(),
+            if is_cross_language { 0.5 } else { 0.9 },
+            ResolvedBy::ExactMatch,
+        ));
     }
 
     // Multiple matches — narrow down (name-matcher.ts:194-206). Decline past the
@@ -3266,12 +3270,12 @@ pub fn match_by_exact_name(
     if let Some(best) = find_best_match(reference, &candidates) {
         let proximity = compute_path_proximity(&reference.file_path, &best.file_path);
         let confidence = if proximity >= 30.0 { 0.7 } else { 0.4 };
-        return Some(ResolvedRef {
-            original: reference.clone(),
-            target_node_id: best.id.clone(),
+        return Some(ResolvedRef::new(
+            reference.clone(),
+            best.id.clone(),
             confidence,
-            resolved_by: ResolvedBy::ExactMatch,
-        });
+            ResolvedBy::ExactMatch,
+        ));
     }
 
     None
@@ -3319,12 +3323,12 @@ pub fn match_by_qualified_name(
         };
     }
     if candidates.len() == 1 {
-        return Some(ResolvedRef {
-            original: reference.clone(),
-            target_node_id: candidates[0].id.clone(),
-            confidence: 0.95,
-            resolved_by: ResolvedBy::QualifiedName,
-        });
+        return Some(ResolvedRef::new(
+            reference.clone(),
+            candidates[0].id.clone(),
+            0.95,
+            ResolvedBy::QualifiedName,
+        ));
     }
 
     // Several symbols share this exact qualified name (an ODR clash / separate
@@ -3333,12 +3337,12 @@ pub fn match_by_qualified_name(
     if candidates.len() > 1 {
         let ordered = prefer_call_site_file(candidates, &reference.file_path);
         if ordered[0].file_path == reference.file_path {
-            return Some(ResolvedRef {
-                original: reference.clone(),
-                target_node_id: ordered[0].id.clone(),
-                confidence: 0.95,
-                resolved_by: ResolvedBy::QualifiedName,
-            });
+            return Some(ResolvedRef::new(
+                reference.clone(),
+                ordered[0].id.clone(),
+                0.95,
+                ResolvedBy::QualifiedName,
+            ));
         }
     }
 
@@ -3365,12 +3369,12 @@ pub fn match_by_qualified_name(
             })
             .collect();
         if arity_candidates.len() == 1 {
-            return Some(ResolvedRef {
-                original: reference.clone(),
-                target_node_id: arity_candidates[0].id.clone(),
-                confidence: 0.85,
-                resolved_by: ResolvedBy::QualifiedName,
-            });
+            return Some(ResolvedRef::new(
+                reference.clone(),
+                arity_candidates[0].id.clone(),
+                0.85,
+                ResolvedBy::QualifiedName,
+            ));
         }
         return None;
     }
@@ -3387,12 +3391,12 @@ pub fn match_by_qualified_name(
             .collect();
         if !partial.is_empty() {
             let ordered = prefer_call_site_file(partial, &reference.file_path);
-            return Some(ResolvedRef {
-                original: reference.clone(),
-                target_node_id: ordered[0].id.clone(),
-                confidence: 0.85,
-                resolved_by: ResolvedBy::QualifiedName,
-            });
+            return Some(ResolvedRef::new(
+                reference.clone(),
+                ordered[0].id.clone(),
+                0.85,
+                ResolvedBy::QualifiedName,
+            ));
         }
     }
 
@@ -3555,12 +3559,12 @@ pub(crate) fn resolve_object_literal_member(
         return None;
     }
 
-    Some(ResolvedRef {
-        original: reference.clone(),
-        target_node_id: first.id.clone(),
+    Some(ResolvedRef::new(
+        reference.clone(),
+        first.id.clone(),
         confidence,
         resolved_by,
-    })
+    ))
 }
 
 /// Resolve a method on a type, walking supertypes (`resolveMethodOnType`,
@@ -3642,12 +3646,12 @@ pub(crate) fn resolve_method_on_type(
                 context,
             )
         {
-            return Some(ResolvedRef {
-                original: reference.clone(),
-                target_node_id: member.id.clone(),
+            return Some(ResolvedRef::new(
+                reference.clone(),
+                member.id.clone(),
                 confidence,
                 resolved_by,
-            });
+            ));
         }
         return None;
     }
@@ -3664,12 +3668,12 @@ pub(crate) fn resolve_method_on_type(
                 let fp = m.file_path.replace('\\', "/");
                 fp.ends_with(&fqn_path) || fp.ends_with(&format!("/{fqn_path}"))
             }) {
-                return Some(ResolvedRef {
-                    original: reference.clone(),
-                    target_node_id: chosen.id.clone(),
+                return Some(ResolvedRef::new(
+                    reference.clone(),
+                    chosen.id.clone(),
                     confidence,
                     resolved_by,
-                });
+                ));
             }
         }
     }
@@ -3679,12 +3683,12 @@ pub(crate) fn resolve_method_on_type(
     // Runs AFTER the preferred_fqn block, so Java/Kotlin import disambiguation
     // (#314), whose target is intentionally in another file, is unaffected.
     let ordered = prefer_call_site_file(matches, &reference.file_path);
-    Some(ResolvedRef {
-        original: reference.clone(),
-        target_node_id: ordered[0].id.clone(),
+    Some(ResolvedRef::new(
+        reference.clone(),
+        ordered[0].id.clone(),
         confidence,
         resolved_by,
-    })
+    ))
 }
 
 /// Last `::`-separated segment of a C++ name (`cppLastSegment`,
@@ -5857,11 +5861,13 @@ pub fn match_method_call(
             } else {
                 None
             };
-            return target.map(|target| ResolvedRef {
-                original: reference.clone(),
-                target_node_id: target.id.clone(),
-                confidence: 0.95,
-                resolved_by: ResolvedBy::InstanceMethod,
+            return target.map(|target| {
+                ResolvedRef::new(
+                    reference.clone(),
+                    target.id.clone(),
+                    0.95,
+                    ResolvedBy::InstanceMethod,
+                )
             });
         }
     }
@@ -6042,12 +6048,12 @@ pub fn match_method_call(
                     reference,
                     context,
                 ) {
-                    crate::cfml_scope::TypedReceiverCall::Method(method) => Some(ResolvedRef {
-                        original: reference.clone(),
-                        target_node_id: method.id.clone(),
-                        confidence: 0.9,
-                        resolved_by: ResolvedBy::InstanceMethod,
-                    }),
+                    crate::cfml_scope::TypedReceiverCall::Method(method) => Some(ResolvedRef::new(
+                        reference.clone(),
+                        method.id.clone(),
+                        0.9,
+                        ResolvedBy::InstanceMethod,
+                    )),
                     // The receiver is one of the namesakes and nothing says
                     // which: a method picked by name below is a guess.
                     crate::cfml_scope::TypedReceiverCall::Ambiguous => return None,
@@ -6265,12 +6271,12 @@ pub fn match_method_call(
             if let Some(method_node) =
                 find_method_in_class(&class_node, &method_name, context, &|_| true)
             {
-                return Some(ResolvedRef {
-                    original: reference.clone(),
-                    target_node_id: method_node.id,
-                    confidence: 0.85,
-                    resolved_by: ResolvedBy::QualifiedName,
-                });
+                return Some(ResolvedRef::new(
+                    reference.clone(),
+                    method_node.id,
+                    0.85,
+                    ResolvedBy::QualifiedName,
+                ));
             }
         }
     }
@@ -6315,12 +6321,12 @@ pub fn match_method_call(
             inherited_class_method(&walk, &method_name, context)
         });
     if let Some(inherited) = inherited {
-        return Some(ResolvedRef {
-            original: reference.clone(),
-            target_node_id: inherited.id.clone(),
-            confidence: 0.8,
-            resolved_by: ResolvedBy::QualifiedName,
-        });
+        return Some(ResolvedRef::new(
+            reference.clone(),
+            inherited.id.clone(),
+            0.8,
+            ResolvedBy::QualifiedName,
+        ));
     }
 
     // Built-in method names need a validated receiver (#1987). Typed, imported,
@@ -6450,12 +6456,12 @@ pub fn match_method_call(
                         callable_on_a_value(method, reference, context)
                     })
                 {
-                    return Some(ResolvedRef {
-                        original: reference.clone(),
-                        target_node_id: method_node.id,
-                        confidence: 0.8,
-                        resolved_by: ResolvedBy::InstanceMethod,
-                    });
+                    return Some(ResolvedRef::new(
+                        reference.clone(),
+                        method_node.id,
+                        0.8,
+                        ResolvedBy::InstanceMethod,
+                    ));
                 }
             }
         }
@@ -6593,12 +6599,12 @@ pub fn match_method_call(
             && !crate::ruby_scope::is_self_receiver(&object_or_class)
             && !names_owner(&target_methods[0]))
     {
-        return Some(ResolvedRef {
-            original: reference.clone(),
-            target_node_id: target_methods[0].id.clone(),
-            confidence: 0.7,
-            resolved_by: ResolvedBy::InstanceMethod,
-        });
+        return Some(ResolvedRef::new(
+            reference.clone(),
+            target_methods[0].id.clone(),
+            0.7,
+            ResolvedBy::InstanceMethod,
+        ));
     }
 
     if target_methods.len() > 1 {
@@ -6654,12 +6660,12 @@ pub fn match_method_call(
         // (upstream #2221).
         if let Some(best) = best_match {
             if best_score >= 2 && best.id != reference.from_node_id {
-                return Some(ResolvedRef {
-                    original: reference.clone(),
-                    target_node_id: best.id.clone(),
-                    confidence: 0.65,
-                    resolved_by: ResolvedBy::InstanceMethod,
-                });
+                return Some(ResolvedRef::new(
+                    reference.clone(),
+                    best.id.clone(),
+                    0.65,
+                    ResolvedBy::InstanceMethod,
+                ));
             }
         }
     }
@@ -6824,12 +6830,12 @@ fn match_rust_self_call(
     let [target] = owned.as_slice() else {
         return None;
     };
-    Some(ResolvedRef {
-        original: reference.clone(),
-        target_node_id: target.id.clone(),
-        confidence: 0.9,
-        resolved_by: ResolvedBy::QualifiedName,
-    })
+    Some(ResolvedRef::new(
+        reference.clone(),
+        target.id.clone(),
+        0.9,
+        ResolvedBy::QualifiedName,
+    ))
 }
 
 /// Resolve `self.field.method()` through the field type declared on the
@@ -7596,12 +7602,12 @@ pub fn match_fuzzy(reference: &RefView, context: &dyn ResolutionContext) -> Opti
         return None;
     }
     let is_cross_language = candidate.language != reference.language;
-    Some(ResolvedRef {
-        original: reference.clone(),
-        target_node_id: candidate.id.clone(),
-        confidence: if is_cross_language { 0.3 } else { 0.5 },
-        resolved_by: ResolvedBy::Fuzzy,
-    })
+    Some(ResolvedRef::new(
+        reference.clone(),
+        candidate.id.clone(),
+        if is_cross_language { 0.3 } else { 0.5 },
+        ResolvedBy::Fuzzy,
+    ))
 }
 
 /// Resolve a `::`-scoped factory chain (`matchScopedCallChain`,
@@ -8063,12 +8069,12 @@ fn other_supertype_named(
     let [candidate] = pool.as_slice() else {
         return None;
     };
-    Some(ResolvedRef {
-        original: reference.clone(),
-        target_node_id: candidate.id.clone(),
-        confidence: 0.8,
-        resolved_by: ResolvedBy::QualifiedName,
-    })
+    Some(ResolvedRef::new(
+        reference.clone(),
+        candidate.id.clone(),
+        0.8,
+        ResolvedBy::QualifiedName,
+    ))
 }
 
 /// Reference kinds a bare JS/TS local can be: a call, a value (function refs
@@ -8562,12 +8568,12 @@ pub fn match_reference(
             .iter()
             .find(|candidate| candidate.file_path == reference.file_path)
         {
-            return Some(ResolvedRef {
-                original: reference.clone(),
-                target_node_id: same_file.id.clone(),
-                confidence: 0.95,
-                resolved_by: ResolvedBy::ExactMatch,
-            });
+            return Some(ResolvedRef::new(
+                reference.clone(),
+                same_file.id.clone(),
+                0.95,
+                ResolvedBy::ExactMatch,
+            ));
         }
         // Another module's function is called bare only through `-import(Mod,
         // [f/N])`, or from a `.hrl` a module includes (upstream #2178):
@@ -8582,11 +8588,13 @@ pub fn match_reference(
             return candidates
                 .iter()
                 .find(|candidate| candidate.qualified_name.starts_with(&prefix))
-                .map(|chosen| ResolvedRef {
-                    original: reference.clone(),
-                    target_node_id: chosen.id.clone(),
-                    confidence: 0.9,
-                    resolved_by: ResolvedBy::ExactMatch,
+                .map(|chosen| {
+                    ResolvedRef::new(
+                        reference.clone(),
+                        chosen.id.clone(),
+                        0.9,
+                        ResolvedBy::ExactMatch,
+                    )
                 });
         }
         let candidates: Vec<Arc<Node>> =
@@ -8601,21 +8609,21 @@ pub fn match_reference(
                     .collect()
             };
         if candidates.len() == 1 {
-            return Some(ResolvedRef {
-                original: reference.clone(),
-                target_node_id: candidates[0].id.clone(),
-                confidence: 0.8,
-                resolved_by: ResolvedBy::ExactMatch,
-            });
+            return Some(ResolvedRef::new(
+                reference.clone(),
+                candidates[0].id.clone(),
+                0.8,
+                ResolvedBy::ExactMatch,
+            ));
         }
         if let Some(best) = find_best_match(reference, &candidates) {
             let proximity = compute_path_proximity(&reference.file_path, &best.file_path);
-            return Some(ResolvedRef {
-                original: reference.clone(),
-                target_node_id: best.id.clone(),
-                confidence: if proximity >= 30.0 { 0.7 } else { 0.4 },
-                resolved_by: ResolvedBy::ExactMatch,
-            });
+            return Some(ResolvedRef::new(
+                reference.clone(),
+                best.id.clone(),
+                if proximity >= 30.0 { 0.7 } else { 0.4 },
+                ResolvedBy::ExactMatch,
+            ));
         }
         return None;
     }
@@ -8794,12 +8802,12 @@ pub fn match_function_ref(
             .iter()
             .copied()
             .reduce(|a, b| if a.start_line <= b.start_line { a } else { b })?;
-        return Some(ResolvedRef {
-            original: reference.clone(),
-            target_node_id: target.id.clone(),
-            confidence: 0.9,
-            resolved_by: ResolvedBy::FunctionRef,
-        });
+        return Some(ResolvedRef::new(
+            reference.clone(),
+            target.id.clone(),
+            0.9,
+            ResolvedBy::FunctionRef,
+        ));
     }
 
     let named: Vec<Arc<Node>> = context
@@ -8916,12 +8924,12 @@ pub fn match_function_ref(
             .iter()
             .copied()
             .reduce(|a, b| if a.start_line <= b.start_line { a } else { b })?;
-        return Some(ResolvedRef {
-            original: reference.clone(),
-            target_node_id: target.id.clone(),
-            confidence: if same_file.len() == 1 { 0.95 } else { 0.9 },
-            resolved_by: ResolvedBy::FunctionRef,
-        });
+        return Some(ResolvedRef::new(
+            reference.clone(),
+            target.id.clone(),
+            if same_file.len() == 1 { 0.95 } else { 0.9 },
+            ResolvedBy::FunctionRef,
+        ));
     }
 
     // Cross-file: only an unambiguous match resolves, or, in Python, the one
@@ -8936,12 +8944,12 @@ pub fn match_function_ref(
                     context,
                 )))
     {
-        return Some(ResolvedRef {
-            original: reference.clone(),
-            target_node_id: candidates[0].id.clone(),
-            confidence: 0.8,
-            resolved_by: ResolvedBy::FunctionRef,
-        });
+        return Some(ResolvedRef::new(
+            reference.clone(),
+            candidates[0].id.clone(),
+            0.8,
+            ResolvedBy::FunctionRef,
+        ));
     }
     None
 }
@@ -9191,12 +9199,12 @@ mod self_veto_tests {
             is_function_ref: false,
             reference_subkind: None,
         };
-        let result = ResolvedRef {
-            original: reference.clone(),
-            target_node_id: node.id.clone(),
-            confidence: 0.9,
-            resolved_by: ResolvedBy::ExactMatch,
-        };
+        let result = ResolvedRef::new(
+            reference.clone(),
+            node.id.clone(),
+            0.9,
+            ResolvedBy::ExactMatch,
+        );
         (reference, Some(result))
     }
 
@@ -9630,12 +9638,12 @@ mod tests {
         let rust_call = refv("map", EdgeKind::Calls, "src/lib.rs", Language::Rust, 1);
         let ctx = Ctx::default().node_by_id(ts_method.clone());
         let chosen = || {
-            Some(ResolvedRef {
-                original: rust_call.clone(),
-                target_node_id: ts_method.id.clone(),
-                confidence: 0.5,
-                resolved_by: ResolvedBy::ExactMatch,
-            })
+            Some(ResolvedRef::new(
+                rust_call.clone(),
+                ts_method.id.clone(),
+                0.5,
+                ResolvedBy::ExactMatch,
+            ))
         };
         assert!(
             gate_language_match(chosen(), &rust_call, &ctx).is_none(),
@@ -9659,12 +9667,12 @@ mod tests {
         let cgo = Ctx::default()
             .node_by_id(exported.clone())
             .file("go/lib.go", "package main\nimport \"C\"\n//export add\nfunc add(a, b C.int) C.int { return a + b }\n");
-        let via_cgo = Some(ResolvedRef {
-            original: c_call.clone(),
-            target_node_id: exported.id.clone(),
-            confidence: 0.5,
-            resolved_by: ResolvedBy::ExactMatch,
-        });
+        let via_cgo = Some(ResolvedRef::new(
+            c_call.clone(),
+            exported.id.clone(),
+            0.5,
+            ResolvedBy::ExactMatch,
+        ));
         assert!(
             gate_language_match(via_cgo, &c_call, &cgo).is_some(),
             "a cgo //export is a C ABI bridge"
@@ -16113,11 +16121,13 @@ mod tests {
             "src/util.rs",
             Language::Rust,
         );
-        let chosen = |reference: &RefView| ResolvedRef {
-            original: reference.clone(),
-            target_node_id: "function:helper".to_string(),
-            confidence: 0.9,
-            resolved_by: ResolvedBy::QualifiedName,
+        let chosen = |reference: &RefView| {
+            ResolvedRef::new(
+                reference.clone(),
+                "function:helper".to_string(),
+                0.9,
+                ResolvedBy::QualifiedName,
+            )
         };
         let gate = |source: &str, reference: &RefView| {
             let ctx = Ctx::default()

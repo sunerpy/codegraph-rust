@@ -2,9 +2,10 @@
 //!
 //! Drives the FULL resolver pipeline against a populated `Store` — index files
 //! (base extraction + `extract_and_persist_frameworks`), run
+//! `run_post_extract` (the nodes-only finalization that stamps the confirmed
+//! singleton→script binding, before resolution as an index runs it), then
 //! `resolve_and_persist` (the generic pass, where autoload-access edges are
-//! produced by `GodotResolver::resolve`), then `run_post_extract` (the
-//! nodes-only finalization that stamps the confirmed singleton→script binding).
+//! produced by `GodotResolver::resolve`).
 //!
 //! What is verified:
 //! - Autoload access (`BuffManager.apply()`) resolves to the autoload singleton
@@ -90,11 +91,11 @@ fn run_pipeline(test_name: &str, root: &Path, relative_files: &[&str]) -> (Store
         .extract_and_persist_frameworks(&mut store, &relative)
         .expect("framework extract");
     resolver
-        .resolve_and_persist(&mut store)
-        .expect("resolve and persist");
-    resolver
         .run_post_extract(&mut store)
         .expect("run post extract");
+    resolver
+        .resolve_and_persist(&mut store)
+        .expect("resolve and persist");
 
     let edges = all_resolved_edges(&store);
     (store, edges)

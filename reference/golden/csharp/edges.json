@@ -241,6 +241,19 @@
   },
   {
     "col": null,
+    "kind": "calls",
+    "line": 10,
+    "metadata": {
+      "registeredAt": "src/App/Store.cs:31",
+      "synthesizedBy": "interface-impl",
+      "via": "Save"
+    },
+    "provenance": "heuristic",
+    "source": "method:a3e7a98624a3129bd1d529e9bf45f5dc",
+    "target": "method:fb6e3b0761da57101db4a4ffde0342a4"
+  },
+  {
+    "col": null,
     "kind": "contains",
     "line": null,
     "metadata": null,

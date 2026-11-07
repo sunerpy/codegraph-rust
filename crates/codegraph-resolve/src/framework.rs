@@ -6,12 +6,13 @@
 //!
 //! # Concrete implementations
 //!
-//! The upstream ships ~22 heuristic `FrameworkResolver` implementations. The v1 Rust
-//! port implements THREE of them — React/Next.js, Vue/Nuxt, and NestJS — in
-//! [`crate::frameworks`], detected per-project by
-//! [`crate::frameworks::detect_frameworks`]. The remaining ~19 (Spring/Java,
-//! React-Native, Go-module, Drupal, Laravel, Express, Svelte, Astro, Python,
-//! Ruby, C#, Swift, etc.) stay deferred (see `KNOWN_DIFFS.md`): they are an
+//! The upstream ships ~22 heuristic `FrameworkResolver` implementations. The Rust
+//! port implements NestJS, React, Vue, Godot, Tauri, Nuxt, React Router,
+//! TanStack Router, Next.js, Svelte, SvelteKit, Vue Router, Angular Router and
+//! Expo Router in [`crate::frameworks`], detected per-project by
+//! [`crate::frameworks::detect_frameworks`]. The others (Spring/Java,
+//! React-Native, Go-module, Drupal, Laravel, Express, Astro, Python, Ruby, C#,
+//! Swift, etc.) stay deferred (see `KNOWN_DIFFS.md`): they are an
 //! additive heuristic layer on top of the deterministic import + name-matching
 //! core, and porting them is tracked as future work.
 //!
@@ -25,7 +26,7 @@
 
 use crate::frameworks::godot_dsl_config::GodotDslConfig;
 use crate::types::{FrameworkResolverExtractionResult, RefView, ResolutionContext, ResolvedRef};
-use codegraph_core::types::Language;
+use codegraph_core::types::{Language, Node, NodeKind};
 use std::sync::Arc;
 
 /// The per-project inputs a [`FrameworkResolver::extract`] pass may need beyond
@@ -79,8 +80,8 @@ impl FrameworkExtractionContext {
 ///
 /// Ports the upstream `FrameworkResolver` interface (`types.ts:157-197`). Every
 /// method maps 1:1 to an upstream field; `Option`-returning methods model the upstream
-/// `?:` optionals. Three implementations ship in v1 ([`crate::frameworks`]:
-/// React/Next.js, Vue/Nuxt, NestJS); the trait remains the seam through which
+/// `?:` optionals. The implementations live in [`crate::frameworks`]; the
+/// trait remains the seam through which
 /// the remaining upstream resolvers (Java/React-Native/Go-module/Swift-ObjC/…) can
 /// be added later.
 pub trait FrameworkResolver: Sync {
@@ -100,6 +101,18 @@ pub trait FrameworkResolver: Sync {
     /// resolver that declares neither stays universal.
     fn resolve_languages(&self) -> Option<&[Language]> {
         self.languages()
+    }
+
+    /// Packages an app declares when it is built on this framework
+    /// (`appDependencies?`, upstream #2129). When some manifest in the project
+    /// declares one of them, [`Self::extract`] runs only on files of an app
+    /// whose `package.json` (the file's directory's or an enclosing one's)
+    /// declares one: in a monorepo with an Expo app beside a Next.js app, Expo
+    /// Router must not read the Next app's `app/layout.tsx` as a screen. When
+    /// no manifest declares any, detection found the framework by other
+    /// evidence and the extractor runs on every file.
+    fn app_dependencies(&self) -> Option<&'static [&'static str]> {
+        None
     }
 
     /// Detect whether the project uses this `FrameworkResolver`'s target — called
@@ -154,6 +167,61 @@ pub trait FrameworkResolver: Sync {
     ) -> Option<Vec<codegraph_core::types::Node>> {
         None
     }
+
+    /// Nodes no single file's [`Self::extract`] can decide on
+    /// (`crossFileNodes?`, upstream #2400): a route table written in one file
+    /// is a table of routes only because another file hands it to the
+    /// router. It returns the COMPLETE set the framework wants now, so the
+    /// pass every index, migration, sync and orphan sweep runs after
+    /// [`Self::post_extract`]
+    /// ([`crate::resolver::ReferenceResolver::plan_cross_file_nodes`]) can
+    /// insert the new ones with their references, remove the ones no longer
+    /// wanted or wanted changed, and leave the rest, whose edges then
+    /// survive. `None` when the resolver makes no such nodes; React makes the
+    /// routes of route tables.
+    fn cross_file_nodes(&self, _context: &dyn ResolutionContext) -> Option<CrossFileNodes> {
+        None
+    }
+
+    /// The navigation calls this resolver's [`Self::resolve`] binds to its
+    /// route nodes (`navigation?`, upstream #2425). A navigation call names
+    /// its route by path and its reference by the router's method, so a call
+    /// parked while its route was missing, or bound to the best route then,
+    /// is invisible to a sync's retry by name tail; this says which calls a
+    /// changed route may answer, so a sync can put them back. `None` when the
+    /// resolver binds no navigation. Every router resolver (Next.js, Expo
+    /// Router, React Router, TanStack Router, Vue Router, SvelteKit, Angular
+    /// Router) answers it; no sync calls it yet.
+    fn navigation(&self) -> Option<&dyn NavigationCalls> {
+        None
+    }
+}
+
+/// The nodes a [`FrameworkResolver::cross_file_nodes`] pass wants now
+/// (upstream `CrossFileNodes`).
+pub struct CrossFileNodes {
+    /// The nodes and the references that link them, as an extraction returns
+    /// them.
+    pub extraction: FrameworkResolverExtractionResult,
+    /// The kind every one of these nodes has.
+    pub kind: NodeKind,
+    /// True for a node this pass produces, and for no node extraction does.
+    pub owns: fn(&Node) -> bool,
+}
+
+/// The navigation calls a router binds to its routes — `navigate('/login')`,
+/// `router.push('/x')` — described so a sync can find the ones a changed
+/// route may answer (upstream `NavigationCalls`).
+pub trait NavigationCalls: Sync {
+    /// The name tails of the calls the resolver accepts as navigation (`push`
+    /// for `history.push`), which find them among the parked references; the
+    /// resolver then decides on the whole name.
+    fn tails(&self) -> &[&str];
+
+    /// The files whose navigation calls can name `route`: the path prefixes
+    /// of the apps whose table it is in (`""` for every file), or `None` when
+    /// it is not one of this router's routes.
+    fn scope(&self, route: &Node, context: &dyn ResolutionContext) -> Option<Vec<String>>;
 }
 
 #[cfg(test)]

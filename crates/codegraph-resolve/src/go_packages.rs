@@ -20,6 +20,7 @@ use std::sync::{Arc, Mutex};
 
 use codegraph_core::types::{EdgeKind, Language, Node, NodeKind};
 
+use crate::source_facts::SourceFacts;
 use crate::types::{GoModule, ImportMapping, RefView, ResolutionContext, ResolvedBy, ResolvedRef};
 
 /// The memos of one resolution pass.
@@ -180,12 +181,23 @@ pub fn go_import_package_dir(
     {
         return hit;
     }
-    let dir = owning_go_module(import_path, &modules, own)
-        .map(|module| package_dir_in(import_path, module));
+    let dir = go_module_package_dir(import_path, from_file, &modules);
     if let Ok(mut memo) = tables.package_dirs.lock() {
         memo.insert(key, dir.clone());
     }
     dir
+}
+
+/// [`go_import_package_dir`] over a module table, without a resolution
+/// context: the directory of the package `import_path` names in `modules`,
+/// `from_file`'s own module breaking a tie (`""` at the project root).
+pub(crate) fn go_module_package_dir(
+    import_path: &str,
+    from_file: Option<&str>,
+    modules: &[GoModule],
+) -> Option<String> {
+    let own = from_file.and_then(|file| nearest_module(&package_dir_of(file), modules));
+    owning_go_module(import_path, modules, own).map(|module| package_dir_in(import_path, module))
 }
 
 /// The project directory of the package `file_path` imports as `qualifier`
@@ -285,14 +297,25 @@ fn first_qualifier_of<'l>(line: &'l str, name: &str) -> Option<&'l str> {
 /// the name — read from its line, since the index keeps only the name
 /// (upstream `goRefQualification`'s `written`, #2397, #2448).
 fn go_written_qualifier(reference: &RefView, context: &dyn ResolutionContext) -> Option<String> {
+    go_qualified_name(reference)?;
+    let facts = context.source_facts(&reference.file_path)?;
+    go_written_qualifier_in(reference, &facts)
+}
+
+/// The name a Go reference's qualifier is read before: its last segment,
+/// for a reference that can have one.
+fn go_qualified_name(reference: &RefView) -> Option<&str> {
     if reference.language != Language::Go || reference.reference_kind == EdgeKind::Imports {
         return None;
     }
     let name = reference.reference_name.rsplit('.').next()?;
-    if !is_identifier(name) {
-        return None;
-    }
-    let facts = context.source_facts(&reference.file_path)?;
+    is_identifier(name).then_some(name)
+}
+
+/// [`go_written_qualifier`] over `facts`, the text of the reference's file
+/// as the caller read it (the synthesis stage reads only fresh text, W7-15).
+pub(crate) fn go_written_qualifier_in(reference: &RefView, facts: &SourceFacts) -> Option<String> {
+    let name = go_qualified_name(reference)?;
     let index = usize::try_from(reference.line.checked_sub(1)?)
         .ok()
         .filter(|&index| index < facts.line_count())?;
@@ -920,12 +943,12 @@ pub(crate) fn resolve_go_method_in_package(
             return Some(None);
         }
         let ordered = crate::name_matcher::prefer_call_site_file(own, &reference.file_path);
-        return Some(Some(ResolvedRef {
-            original: reference.clone(),
-            target_node_id: ordered[0].id.clone(),
+        return Some(Some(ResolvedRef::new(
+            reference.clone(),
+            ordered[0].id.clone(),
             confidence,
             resolved_by,
-        }));
+        )));
     }
     let types = package_types(type_name, pkg_dir, context);
     if types.is_empty() {

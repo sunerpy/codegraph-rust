@@ -1,15 +1,23 @@
 //! Concrete [`FrameworkResolver`] implementations + the detection registry.
 //!
-//! Ports the subset of `upstream resolution/frameworks/` that v1
-//! ships: React/Next.js ([`react`]), Vue/Nuxt ([`vue`]), and NestJS ([`nestjs`]).
-//! The other ~19 upstream resolvers remain deferred (see `KNOWN_DIFFS.md`).
+//! Ports the subset of `upstream resolution/frameworks/` that this port
+//! ships: React ([`react`]), React Router ([`react_router`]), TanStack Router
+//! ([`tanstack_router`]), Next.js ([`nextjs`]), Svelte and SvelteKit
+//! ([`svelte`], [`sveltekit_router`]), Vue Router ([`vue_router`]),
+//! Angular Router ([`angular_router`]), Expo Router ([`expo_router`]), Vue
+//! and Nuxt ([`vue`]), NestJS
+//! ([`nestjs`]), Godot ([`godot`]), Tauri ([`tauri`]) and GoFrame
+//! ([`goframe`]). The other upstream resolvers remain deferred (see
+//! `KNOWN_DIFFS.md`).
 //!
 //! [`detect_frameworks`] ports `frameworks/index.ts:detectFrameworks` restricted
-//! to the three ported resolvers; the orchestrator hands the detected list to
+//! to the ported resolvers; the orchestrator hands the detected list to
 //! [`crate::resolver::ReferenceResolver`] so they participate in
 //! [`crate::resolver::ReferenceResolver::resolve_one`] Strategy-1 exactly where
 //! the upstream runs them (`index.ts:695-701`).
 
+pub mod angular_router;
+pub mod expo_router;
 pub mod godot;
 pub(crate) mod godot_common;
 pub mod godot_dsl_config;
@@ -17,10 +25,23 @@ pub(crate) mod godot_project;
 pub(crate) mod godot_resource;
 pub(crate) mod godot_scene;
 pub mod godot_script;
+pub mod goframe;
+pub(crate) mod js_scan;
+pub(crate) mod lazy_loader;
 pub mod nestjs;
+pub mod nextjs;
+pub mod package_deps;
+pub(crate) mod page_component;
 pub mod react;
+pub mod react_router;
+pub(crate) mod react_tables;
+pub mod route_href;
+pub mod svelte;
+pub mod sveltekit_router;
+pub mod tanstack_router;
 pub mod tauri;
 pub mod vue;
+pub mod vue_router;
 
 use crate::framework::FrameworkResolver;
 use crate::types::ResolutionContext;
@@ -28,9 +49,10 @@ use codegraph_core::types::{Language, Node, NodeKind};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Detect which of the ported frameworks a project uses
-/// (`detectFrameworks`, `frameworks/index.ts:90-98`, restricted to react/vue/
-/// nestjs). The candidate order mirrors the upstream `FRAMEWORK_RESOLVERS`
-/// declaration order for the three ported entries (nestjs, react, vue).
+/// (`detectFrameworks`, `frameworks/index.ts:90-98`, restricted to the ported
+/// resolvers). The first three keep upstream's `FRAMEWORK_RESOLVERS` order
+/// (nestjs, react, vue); later ports are appended, so the first resolver to
+/// return `>= 0.9` for a reference that resolved before never changes.
 pub fn detect_frameworks(context: &dyn ResolutionContext) -> Vec<Box<dyn FrameworkResolver>> {
     let candidates: Vec<Box<dyn FrameworkResolver>> = vec![
         Box::new(nestjs::NestjsResolver),
@@ -42,6 +64,51 @@ pub fn detect_frameworks(context: &dyn ResolutionContext) -> Vec<Box<dyn Framewo
         // PRE-EXISTING reference must not change. A new candidate at the front
         // could pre-empt one of the four above.
         Box::new(tauri::TauriResolver::default()),
+        // Nuxt's file routes, in a Nuxt app only (upstream #2130). Upstream
+        // runs it right after Vue; it claims only its own routes' `calls`
+        // references to their pages' components, so its place here changes
+        // no other reference's resolution.
+        Box::new(vue::NuxtResolver),
+        // React Router's navigation (F4), before Next.js as upstream's
+        // `FRAMEWORK_RESOLVERS` orders the routers: a navigation call is
+        // bound by the first router whose routes its href names. It claims
+        // only calls that name one of its own routes, which no resolver above
+        // resolves.
+        Box::new(react_router::ReactRouterResolver),
+        // TanStack Router's file and code routes and navigation (F5), after
+        // React Router and before Next.js, as upstream orders the routers. It
+        // claims only navigation calls that name one of its own routes.
+        Box::new(tanstack_router::TanstackRouterResolver),
+        // Next.js pages, route handlers and navigation (F3), split out of
+        // React. It claims only navigation calls that name one of its own
+        // pages, which no resolver above resolves.
+        Box::new(nextjs::NextjsResolver),
+        // Svelte's and SvelteKit's conventions and a SvelteKit page's route,
+        // then SvelteKit's navigation, after Next.js and before Vue Router as
+        // upstream orders them. Svelte reads `.svelte` files and the scripts
+        // of a Svelte app (runes, `$lib`); SvelteKit claims only `goto` and
+        // `redirect` calls that name one of its own pages.
+        Box::new(svelte::SvelteResolver),
+        Box::new(sveltekit_router::SvelteKitRouterResolver),
+        // Vue Router's config routes and navigation, by name or by path
+        // (F6), after Next.js and before Expo Router, as upstream orders the
+        // routers. It claims navigation calls only where they name one of
+        // its own routes or a Nuxt page, and its routes' own references.
+        Box::new(vue_router::VueRouterResolver),
+        // Angular's `Routes` arrays, the components they render and the
+        // router's navigation, after Vue Router and before Expo Router, as
+        // upstream orders the routers. It claims its own routes' lazy and
+        // layout references, and `router.navigate`-style calls only where
+        // they name one of its own routes.
+        Box::new(angular_router::AngularRouterResolver),
+        // Expo Router screens and navigation (F2), after Next.js as upstream
+        // registers it. It claims navigation calls only where their href
+        // names one of its own screens.
+        Box::new(expo_router::ExpoRouterResolver),
+        // GoFrame's `g.Meta` routes (#747), upstream's after its Go
+        // resolver. It resolves no reference, so its place here changes
+        // no resolution; the synthesis stage joins its routes.
+        Box::new(goframe::GoFrameResolver),
     ];
     candidates
         .into_iter()

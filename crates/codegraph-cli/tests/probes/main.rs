@@ -244,6 +244,60 @@ fn pr2437_alias_into_node_modules_keeps_the_import_external() {
     assert_unresolved!(project, "file:src/card.ts" => imports => "format");
 }
 
+/// Upstream #2165 (W7-09a): an import tries the tsconfig nearest its file
+/// before the root's, so each app of a monorepo resolves its own `@/*`, and
+/// an app declaring `~/*` only in its own config (LibreChat's `client/`)
+/// resolves it at all. A file outside every app keeps the root's alias.
+#[test]
+fn pr2165_each_app_resolves_its_own_tsconfig_alias() {
+    let format = "export function format(value: number): string {\n  return String(value);\n}\n";
+    let main = |spec: &str| {
+        format!(
+            "import {{ format }} from '{spec}';\n\nexport function render(): string {{\n  return format(1);\n}}\n"
+        )
+    };
+    let project = Project::new()
+        .file(
+            "tsconfig.json",
+            "{\n  \"compilerOptions\": {\n    \"baseUrl\": \".\",\n    \"paths\": { \"@/*\": [\"./shared/*\"] }\n  }\n}\n",
+        )
+        .file("shared/lib/format.ts", format)
+        .file(
+            "apps/web/tsconfig.json",
+            "{\n  \"compilerOptions\": {\n    \"baseUrl\": \".\",\n    \"paths\": { \"@/*\": [\"./src/*\"] }\n  }\n}\n",
+        )
+        .file("apps/web/src/lib/format.ts", format)
+        .file("apps/web/src/main.ts", &main("@/lib/format"))
+        .file(
+            "client/tsconfig.json",
+            "{\n  \"compilerOptions\": {\n    \"paths\": { \"~/*\": [\"./src/*\"] }\n  }\n}\n",
+        )
+        .file("client/src/lib/format.ts", format)
+        .file("client/src/main.ts", &main("~/lib/format"))
+        .file("tools/report.ts", &main("@/lib/format"))
+        .index();
+
+    assert_edge!(
+        project,
+        "file:apps/web/src/main.ts" => imports => "function format @apps/web/src/lib/format.ts",
+        resolved_by = "import",
+    );
+    assert_no_edge!(
+        project,
+        "file:apps/web/src/main.ts" => imports => "function format @shared/lib/format.ts"
+    );
+    assert_edge!(
+        project,
+        "file:client/src/main.ts" => imports => "function format @client/src/lib/format.ts",
+        resolved_by = "import",
+    );
+    assert_edge!(
+        project,
+        "file:tools/report.ts" => imports => "function format @shared/lib/format.ts",
+        resolved_by = "import",
+    );
+}
+
 /// W3: the cross-language resolution seams (plan section 3 "W3"). Every probe
 /// of this wave sits here, so `cargo test --test probes -- seams` runs them.
 mod seams {
@@ -2796,6 +2850,14 @@ mod js {
             component_calls("components/Dialog.vue")
                 .iter()
                 .all(|call| !call.starts_with("emit@lib/bus.ts")),
+            "{:?}",
+            component_calls("components/Dialog.vue")
+        );
+        // `@click="close"` is still the handler it names (W7-18c's template
+        // pass, at the component's line).
+        assert!(
+            component_calls("components/Dialog.vue")
+                .contains(&"close@components/Dialog.vue:1".to_string()),
             "{:?}",
             component_calls("components/Dialog.vue")
         );
@@ -5527,6 +5589,75 @@ class basic_json
         );
     }
 
+    /// Upstream #2407's override assertions (`cpp-base-class-lookup.test.ts`,
+    /// "what the hierarchy feeds"), drawn by the synthesis stage's
+    /// `cpp-override` pass (W7-14b): each base method links to the overrides
+    /// in the subclasses name lookup found, never to a namesake's, and
+    /// through an alias to the class it names.
+    #[test]
+    fn pr2407_a_base_method_links_to_the_overrides_of_its_subclasses() {
+        let project = base_lookup_project();
+        let graph = project.graph();
+        let overrides = |qualified: &str, file: &str| -> Vec<String> {
+            let id = &the_class(graph, qualified, file).id;
+            let mut out: Vec<String> = graph
+                .edges
+                .iter()
+                .filter(|edge| {
+                    &edge.source == id
+                        && edge.kind == "calls"
+                        && edge.metadata["synthesizedBy"] == "cpp-override"
+                })
+                .filter_map(|edge| graph.node(&edge.target))
+                .map(|target| target.qualified_name.clone())
+                .collect();
+            out.sort();
+            out
+        };
+        assert_eq!(
+            overrides("leveldb::Iterator::Next", "include/leveldb/iterator.h"),
+            ["leveldb::DBIter::Next"],
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            overrides("leveldb::SkipList::Iterator::Next", "db/skiplist.h"),
+            Vec::<String>::new(),
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            overrides(
+                "google::protobuf::Message::ByteSizeLong",
+                "src/google/protobuf/message.h"
+            ),
+            [
+                "google::protobuf::DynamicMessage::ByteSizeLong",
+                "google::protobuf::internal::ZeroFieldsBase::ByteSizeLong",
+            ],
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            overrides(
+                "google::protobuf::json_internal::ResolverPool::Message::ByteSizeLong",
+                "src/google/protobuf/json/internal/untyped_message.h"
+            ),
+            Vec::<String>::new(),
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            overrides(
+                "rocksdb::InternalIteratorBase::Next",
+                "table/internal_iterator.h"
+            ),
+            ["rocksdb::MergingIterator::Next"],
+            "{}",
+            graph.report()
+        );
+    }
+
     /// Upstream #2426's last case, which needs #2407's lookup: protobuf's
     /// `FieldDescriptor`, walked in brace scopes after an unknown attribute
     /// macro broke the tree, keeps its namespaces, and its base
@@ -6881,6 +7012,69 @@ class basic_json
 
 mod java {
     use super::support::{Graph, Project};
+
+    /// tree-sitter-java wraps several supertypes in a `type_list`: a class
+    /// implementing two interfaces and an interface extending two get an
+    /// edge to each (upstream reads the list type by type), and no
+    /// reference is named after the whole list.
+    #[test]
+    fn a_heritage_list_resolves_each_type() {
+        let project = Project::new()
+            .file(
+                "src/app/Repo.java",
+                "package app;\n\npublic interface Repo {\n    void save();\n}\n",
+            )
+            .file(
+                "src/app/Store.java",
+                "package app;\n\npublic interface Store {\n    void load();\n}\n",
+            )
+            .file(
+                "src/app/JpaRepo.java",
+                "package app;\n\npublic class JpaRepo implements Repo, Store {\n    public void save() { }\n    public void load() { }\n}\n",
+            )
+            .file(
+                "src/app/Combined.java",
+                "package app;\n\npublic interface Combined extends Repo, Store {\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        let supertypes = |source: &str, kind: &str| -> Vec<String> {
+            let mut out: Vec<String> = graph
+                .edges
+                .iter()
+                .filter(|edge| edge.kind == kind)
+                .filter(|edge| {
+                    graph
+                        .node(&edge.source)
+                        .is_some_and(|node| node.qualified_name == source)
+                })
+                .filter_map(|edge| graph.node(&edge.target))
+                .map(|node| node.qualified_name.clone())
+                .collect();
+            out.sort();
+            out
+        };
+        assert_eq!(
+            supertypes("app::JpaRepo", "implements"),
+            ["app::Repo", "app::Store"],
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            supertypes("app::Combined", "extends"),
+            ["app::Repo", "app::Store"],
+            "{}",
+            graph.report()
+        );
+        assert!(
+            graph
+                .unresolved
+                .iter()
+                .all(|reference| !reference.reference_name.contains(',')),
+            "{}",
+            graph.report()
+        );
+    }
 
     /// `qualified` of every method of `file`, sorted.
     fn methods_in(graph: &Graph, file: &str) -> Vec<String> {
@@ -10547,6 +10741,70 @@ mod swift {
             "{report}"
         );
     }
+
+    /// Upstream #2683: a call written after `try!` links what it calls. Calls
+    /// after `try?` and `try` are the control. Upstream's TortureTry.swift,
+    /// reduced to calls whose callees the project declares.
+    ///
+    /// Not yet on Windows: the held tree-sitter-swift 0.7.3 builds the `try!`
+    /// entry of its scanner's 64-bit mask as `1UL << 32`, which MSVC folds to
+    /// 0, so there `try! Message2(…)` parses as a call of `! Message2` and
+    /// `try! Settings.Defaults.load()` loses its receiver. 0.7.4 fixes it but
+    /// regenerates the grammar, which needs a walker change first
+    /// (docs/grammar-manifest.md); drop the `ignore` with that upgrade.
+    #[test]
+    #[cfg_attr(
+        windows,
+        ignore = "tree-sitter-swift 0.7.3 misparses `try!` on MSVC (upstream #2683)"
+    )]
+    fn pr2683_a_call_after_try_bang_links_what_it_calls() {
+        let project = Project::new()
+            .file(
+                "App/Models.swift",
+                "import Foundation\n\nstruct Message2 {\n    init(data: Data?) throws {}\n}\n\nfinal class Store {\n    init(path: String) throws {}\n}\n\nenum Settings {\n    enum Defaults {\n        static func load(from name: String) throws -> Settings.Defaults { .init() }\n    }\n}\n",
+            )
+            .file(
+                "App/Repository.swift",
+                "import Foundation\n\nfinal class Repository {\n    func load(data: Data?) throws -> Message2 {\n        let msg2 = try! Message2(data: data!)\n        let msg3 = try? Message2(data: data!)\n        let msg4 = try Message2(data: data!)\n        let store = try! Store(path: \"x\")\n        let settings = try! Settings.Defaults.load(from: \"defaults\")\n        try! validate(msg2)\n        _ = (msg3, msg4, store, settings)\n        return try! Message2(data: data!)\n    }\n\n    func validate(_ m: Message2) throws {}\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        let lines = |kind: &str, target: &str| -> Vec<i64> {
+            let mut lines: Vec<i64> = graph
+                .edges_matching("method Repository::load", kind, target)
+                .iter()
+                .filter_map(|edge| edge.line)
+                .collect();
+            lines.sort_unstable();
+            lines
+        };
+        let report = graph.report();
+        assert_eq!(
+            lines("instantiates", "struct Message2"),
+            [5, 6, 7, 12],
+            "{report}"
+        );
+        assert_eq!(lines("instantiates", "class Store"), [8], "{report}");
+        assert_eq!(
+            lines("calls", "method Settings::Defaults::load"),
+            [9],
+            "{report}"
+        );
+        assert_eq!(
+            lines("calls", "method Repository::validate"),
+            [10],
+            "{report}"
+        );
+        // The misparse left references named after the `!`.
+        assert!(
+            graph
+                .unresolved
+                .iter()
+                .all(|reference| !reference.reference_name.starts_with('!')),
+            "{}",
+            graph.unresolved_list()
+        );
+    }
 }
 
 mod objc {
@@ -12818,7 +13076,7 @@ mod go {
 }
 
 mod rust {
-    use super::support::{Graph, Project};
+    use super::support::{Graph, Project, assert_edge, assert_no_edge, assert_unresolved};
 
     /// `kind:qualifiedName` of every `calls` / `references` / `instantiates`
     /// target out of the functions named `name` (upstream's `targets`).
@@ -12850,6 +13108,33 @@ mod rust {
             .filter_map(|e| graph.node(&e.target))
             .map(|n| n.file_path.clone())
             .collect()
+    }
+
+    /// The member-path std gate deferred on 2026-10-03 needs no change: since
+    /// the #2169 port, a receiver whose declared type the project does not
+    /// declare (`PathBuf`, `&Path`, `std::path::PathBuf`) binds no project
+    /// method by name, so `index_root.join(..)` no longer reaches the project's
+    /// `LineIndex::join`; a project-typed receiver keeps its method.
+    #[test]
+    fn pr2169_a_std_typed_rust_receiver_binds_no_project_method_by_name() {
+        let project = Project::new()
+            .file("Cargo.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\n")
+            .file(
+                "src/lib.rs",
+                "use std::path::{Path, PathBuf};\n\npub struct LineIndex;\nimpl LineIndex {\n    pub fn join(&self, _x: &str) -> usize { 0 }\n}\n\npub struct EnvGuard;\nimpl EnvGuard {\n    pub fn set(&self) {}\n}\npub fn env_guard() -> EnvGuard { EnvGuard }\n\npub fn annotated(index_root: PathBuf) -> PathBuf {\n    index_root.join(\"x\")\n}\n\npub fn let_typed() -> PathBuf {\n    let base: PathBuf = PathBuf::from(\"a\");\n    base.join(\"b\")\n}\n\npub fn path_typed(p: &Path) -> PathBuf {\n    p.join(\"c\")\n}\n\npub fn std_path(q: std::path::PathBuf) -> PathBuf {\n    q.join(\"d\")\n}\n\npub fn project_typed() {\n    let mut env = env_guard();\n    env.set();\n}\n",
+            )
+            .index();
+
+        for (function, call) in [
+            ("annotated", "index_root.join"),
+            ("let_typed", "base.join"),
+            ("path_typed", "p.join"),
+            ("std_path", "q.join"),
+        ] {
+            assert_no_edge!(project, function => calls => "method LineIndex::join");
+            assert_unresolved!(project, function => calls => call);
+        }
+        assert_edge!(project, "project_typed" => calls => "method EnvGuard::set");
     }
 
     /// Upstream #2124: a bare Rust name reaches only what is in scope —
@@ -18251,7 +18536,10 @@ mod import_bindings {
     /// (upstream's `LINKS`, in this port's graph: it links neither Astro's
     /// `Shell` to the `BaseLayout` component nor Express's mount of
     /// `uploadRoutes` to its `router`, upstream's two other links).
-    const LINKS: [&str; 20] = [
+    const LINKS: [&str; 21] = [
+        // The test file's top-level `const page = <Component />` renders it
+        // (W7-14e's `jsx-render`), recomputed with the import's link.
+        "calls constant src/pages/groups_page.test.tsx -> function src/pages/groups_page.tsx::Component",
         "calls function src/call.ts -> function src/handler.ts::handle",
         "extends class src/admin.ts -> class src/base.ts::BaseUser",
         "imports file backend/server.js -> file backend/routes/uploadRoutes.js::uploadRoutes.js",
@@ -18665,6 +18953,17908 @@ mod pascal_includes {
         assert_eq!(
             language_of(graph, "page.inc"),
             Some("php"),
+            "{}",
+            graph.report()
+        );
+    }
+}
+
+/// What framework resolvers record on the edges they make (W7).
+mod frameworks {
+    use super::support::Project;
+
+    /// Upstream #2159: a link a framework or bridge resolver made names that
+    /// resolver in `metadata.framework`, as a synthesized channel names
+    /// itself with `synthesizedBy`: a Tauri `invoke('greet')` names `tauri`.
+    #[test]
+    fn pr2159_a_framework_resolved_edge_names_its_resolver() {
+        let project = Project::new()
+            .file("src-tauri/tauri.conf.json", "{}\n")
+            .file(
+                "src/main.ts",
+                "import { invoke } from '@tauri-apps/api/core';\n\nexport function run(): Promise<unknown> {\n  return invoke('greet');\n}\n",
+            )
+            .file(
+                "src-tauri/src/main.rs",
+                "#[tauri::command]\npub fn greet() -> String {\n    String::new()\n}\n\nfn main() {\n    greet();\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        let bridged = graph.edges_matching("file:src/main.ts", "calls", "function greet");
+        assert_eq!(bridged.len(), 1, "{}", graph.report());
+        assert_eq!(bridged[0].resolved_by(), Some("framework"));
+        assert_eq!(
+            bridged[0]
+                .metadata
+                .get("framework")
+                .and_then(|v| v.as_str()),
+            Some("tauri")
+        );
+        // A call no framework resolved names none.
+        let direct = graph.edges_matching("function main", "calls", "function greet");
+        assert_eq!(direct.len(), 1, "{}", graph.report());
+        assert_eq!(direct[0].metadata.get("framework"), None);
+    }
+
+    /// The kinds of every node named `name`, in order.
+    fn kinds_of(graph: &super::support::Graph, name: &str) -> Vec<String> {
+        let mut kinds: Vec<String> = graph
+            .nodes
+            .iter()
+            .filter(|node| node.name == name)
+            .map(|node| node.kind.clone())
+            .collect();
+        kinds.sort();
+        kinds
+    }
+
+    /// Upstream #841 and #2429: a const a wrapper declares as a component —
+    /// `forwardRef`, `memo`, `styled.x\`…\``, `styled(Base)\`…\``, typed or not
+    /// — is a `component` node, whose inline render function's calls are its
+    /// own; a lowercase memo, another template tag, a comparison and any
+    /// other initializer stay constants.
+    #[test]
+    fn pr0841_a_wrapper_declared_component_is_a_component() {
+        let project = Project::new()
+            .file("package.json", "{\"dependencies\":{\"react\":\"^18.0.0\"}}\n")
+            .file(
+                "ui.tsx",
+                "import * as React from 'react';\nimport styled from 'styled-components';\nexport const Button = React.forwardRef<HTMLButtonElement, {}>((props, ref) => <button ref={ref} {...props} />);\nexport const Bare = forwardRef((props, ref) => <span ref={ref} />);\nexport const Card = memo((props: { t: string }) => <div>{props.t}</div>);\nexport const Named = memo(function Named(props: { t: string }) { return <div>{props.t}</div>; });\nexport const Boxed = styled.div`color: red;`;\nexport const Wrapped = styled(Button)`padding: 4px;`;\nexport const Rewrapped = memo(Button);\n",
+            )
+            .file(
+                "typed.tsx",
+                "import styled from 'styled-components';\ntype WrapperProps = { active: boolean };\ntype Props = { align: 'start' | 'end' };\nconst Plain = styled.div`color: red;`;\nexport const Wrapper = styled.div<WrapperProps>`\n  color: ${(props) => (props.active ? 'red' : 'blue')};\n`;\nconst Background = styled.div<{ align: Props[\"align\"] }>`color: red;`;\nconst Content = styled(Plain)<WrapperProps>`padding: 4px;`;\nconst NudeButton = styled(Plain).attrs((props: Props) => ({ type: \"button\" }))<Props>`width: 24px;`;\nconst Either = styled.div<WrapperProps | Props>`color: red;`;\nconst Both = styled.span<WrapperProps & { open: boolean }>`color: red;`;\nconst Nested = styled.div<Partial<WrapperProps>>`color: red;`;\nconst Deeper = styled.div<Partial<Record<string, WrapperProps>>>`color: red;`;\n",
+            )
+            .file(
+                "tags.tsx",
+                "import styled, { css, keyframes } from 'styled-components';\ntype Props = { open: boolean };\nexport const Mixin = css<Props>`color: red;`;\nexport const Fade = keyframes<Props>`from { opacity: 0; }`;\nexport const Styledish = styledLike<Props>`color: red;`;\nexport const Compared = styled.length < LIMIT > 2;\nexport const Untagged = styled.div < Props > other;\nconst lowerCase = styled.div<Props>`color: red;`;\nconst cache = memo(expensiveFn);\nexport const Config = loadConfig();\nexport const Theme = { color: 'red' };\n",
+            )
+            .file(
+                "widget.tsx",
+                "import * as React from 'react';\nfunction useThing() { return 1; }\nexport const Widget = React.forwardRef((props, ref) => {\n  const v = useThing();\n  return <div ref={ref}>{v}</div>;\n});\n",
+            )
+            .index();
+        let graph = project.graph();
+        for name in [
+            "Button",
+            "Bare",
+            "Card",
+            "Named",
+            "Boxed",
+            "Wrapped",
+            "Rewrapped",
+            "Plain",
+            "Wrapper",
+            "Background",
+            "Content",
+            "NudeButton",
+            "Either",
+            "Both",
+            "Nested",
+            "Deeper",
+            "Widget",
+        ] {
+            assert_eq!(
+                kinds_of(graph, name),
+                ["component"],
+                "{name}\n{}",
+                graph.report()
+            );
+        }
+        for name in [
+            "Mixin",
+            "Fade",
+            "Styledish",
+            "Compared",
+            "Untagged",
+            "lowerCase",
+            "cache",
+            "Config",
+            "Theme",
+        ] {
+            assert_eq!(
+                kinds_of(graph, name),
+                ["constant"],
+                "{name}\n{}",
+                graph.report()
+            );
+        }
+        // The render function's call is the component's.
+        graph.assert_edge("component Widget", "calls", "function useThing", None);
+    }
+
+    /// Upstream #841: the React resolver reads `.tsx`/`.jsx` files for routes,
+    /// and only for routes: a `<Route>` there is a route node rendering its
+    /// element, and a hook is one tree-sitter `function` node, never a second
+    /// one from a regex.
+    #[test]
+    fn pr0841_routes_in_jsx_files_and_one_node_per_hook() {
+        let project = Project::new()
+            .file(
+                "package.json",
+                "{\"dependencies\":{\"react\":\"^18.0.0\",\"react-router-dom\":\"^6.0.0\"}}\n",
+            )
+            .file(
+                "src/App.tsx",
+                "import { Routes, Route } from 'react-router-dom';\nimport { Home } from './Home';\nexport function App() {\n  return (\n    <Routes>\n      <Route path=\"/home\" element={<Home />} />\n    </Routes>\n  );\n}\n",
+            )
+            .file("src/Home.tsx", "export function Home() {\n  return <h1 />;\n}\n")
+            .file("src/hooks/useAuth.ts", "export function useAuth() {\n  return null;\n}\n")
+            .file("src/Card.jsx", "export const Card = () => <div />;\n")
+            .index();
+        let graph = project.graph();
+        graph.assert_edge(
+            "route src/App.tsx::route:/home",
+            "references",
+            "function Home",
+            None,
+        );
+        assert_eq!(
+            kinds_of(graph, "useAuth"),
+            ["function"],
+            "{}",
+            graph.report()
+        );
+        assert_eq!(kinds_of(graph, "Card"), ["function"], "{}", graph.report());
+    }
+
+    /// Upstream #2120 (React half) and #2475: a component, hook or context the
+    /// file imports is the import's — a declared package's (`antd`'s
+    /// `<Button>`, `@tanstack/react-query`'s `useQuery`) renders no project
+    /// namesake, even through a bare call — and a hook nested inside another
+    /// function is never a target.
+    #[test]
+    fn pr2475_an_imported_tag_or_hook_is_the_imports() {
+        let project = Project::new()
+            .file(
+                "package.json",
+                "{\"name\":\"app\",\"dependencies\":{\"antd\":\"^5.0.0\",\"@mui/material\":\"^5.0.0\",\"react-router-dom\":\"^6.0.0\",\"@tanstack/react-query\":\"^5.0.0\",\"react\":\"^18.0.0\"}}\n",
+            )
+            .file(
+                "src/Page.tsx",
+                "import { Button } from 'antd';\nimport Typography from '@mui/material/Typography';\nimport { Link } from 'react-router-dom';\nexport function Page() {\n  return <div><Button /><Typography /><Link /></div>;\n}\n",
+            )
+            .file(
+                "src/styles.tsx",
+                "export function Button() { return null; }\nexport function Typography() { return null; }\nexport function Link() { return null; }\n",
+            )
+            .file(
+                "src/Calls.tsx",
+                "import { Button } from 'antd';\nexport function Calls() {\n  Button();\n  return null;\n}\n",
+            )
+            .file(
+                "src/factory.ts",
+                "export function createHooks() {\n  function useQuery() {\n    return 1;\n  }\n  return { useQuery };\n}\n",
+            )
+            .file(
+                "src/list.test.tsx",
+                "import { useQuery } from '@tanstack/react-query';\nexport function useList() {\n  return useQuery();\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        for (source, kind, name) in [
+            ("function Page", "references", "Button"),
+            ("function Page", "references", "Typography"),
+            ("function Page", "references", "Link"),
+            ("function Calls", "calls", "Button"),
+        ] {
+            graph.assert_no_edge(source, kind, &format!("function {name} @src/styles.tsx"));
+        }
+        graph.assert_no_edge(
+            "function useList",
+            "calls",
+            "function createHooks::useQuery",
+        );
+    }
+
+    /// Upstream #2240: in a JS/TS module another file's hook or context is
+    /// reached only through an import, never by name: trpc's adapter's
+    /// option `createContext?.(…)` is no example app's `createContext`, and
+    /// one app's `useUser()` no other app's hook. An optional call `f?.()` is
+    /// a bare call, so no class member is its target either.
+    #[test]
+    fn pr2240_hooks_and_contexts_by_name_are_the_files_own() {
+        let project = Project::new()
+            .file(
+                "package.json",
+                "{\"name\":\"trpc\",\"private\":true,\"dependencies\":{\"react\":\"^18.0.0\"}}\n",
+            )
+            .file(
+                "examples/next-app/src/server/context.ts",
+                "export async function createContext() {\n  return {};\n}\n",
+            )
+            .file(
+                "apps/nextjs-app/src/lib/auth.tsx",
+                "export function useUser() {\n  return null;\n}\n",
+            )
+            .file(
+                "packages/server/src/adapters/ws.ts",
+                "export function getHandler(opts: any) {\n  const { createContext } = opts;\n  return createContext?.({});\n}\n",
+            )
+            .file(
+                "apps/react-vite/src/lib/auth.tsx",
+                "const { useUser } = configureAuth({});\n\nexport function AuthLoader() {\n  const user = useUser();\n  return user;\n}\n",
+            )
+            .file(
+                "apps/react-vite/src/lib/session.tsx",
+                "function useSession() {\n  return null;\n}\n\nexport function SessionLoader() {\n  return useSession();\n}\n",
+            )
+            .file("src/box.ts", "export class Box {\n  refresh() {\n    return 1;\n  }\n}\n")
+            .file("src/tick.ts", "export function tick() {\n  refresh?.();\n}\n")
+            .index();
+        let graph = project.graph();
+        graph.assert_no_edge("function getHandler", "calls", "function createContext");
+        graph.assert_no_edge("function AuthLoader", "calls", "function useUser");
+        graph.assert_no_edge("function tick", "calls", "method Box::refresh");
+        // The file's own hook still resolves.
+        graph.assert_edge(
+            "function SessionLoader",
+            "calls",
+            "function useSession",
+            None,
+        );
+    }
+
+    /// Upstream #2420: a PascalCase name a `.tsx` file declares as a
+    /// module-level value is that declaration wherever the file uses it —
+    /// the component of the module its lazy loader loads (#2480's readers),
+    /// the function it wraps (`observer(function X() {…})`, `forwardRef(Inner)
+    /// as …`, `observer(Inner)`), else the declaration — never another app's
+    /// same-named component.
+    #[test]
+    fn pr2420_a_value_the_file_declares_is_what_its_jsx_renders() {
+        let project = Project::new()
+            .file("package.json", "{\"name\":\"app\",\"dependencies\":{\"react\":\"^18\",\"mobx-react\":\"^7\"}}\n")
+            .file(
+                "src/app/App.tsx",
+                "import { forwardRef, lazy } from 'react';\nimport { observer } from 'mobx-react';\nconst Home = lazy(() => import('./pages/Home'));\nconst Panel = observer(function PanelInner() { return <div />; });\nfunction Inner() { return <span />; }\nconst Item = forwardRef(Inner) as any;\nconst Table = observer(TableInner);\nfunction TableInner() { return <table />; }\nconst Config = makeConfig();\nexport function App() {\n  return <div><Home /><Panel /><Item /><Table /><Config /></div>;\n}\n",
+            )
+            .file(
+                "src/app/pages/Home.tsx",
+                "export default function HomePage() { return <main />; }\n",
+            )
+            .file(
+                "src/other/Home.tsx",
+                "export function Home() { return <div />; }\nexport function Panel() { return <div />; }\nexport function Item() { return <div />; }\nexport function Table() { return <div />; }\nexport function Config() { return <div />; }\n",
+            )
+            .index();
+        let graph = project.graph();
+        graph.assert_edge(
+            "function App",
+            "references",
+            "function HomePage",
+            Some("framework"),
+        );
+        graph.assert_edge(
+            "function App",
+            "references",
+            "function Panel::PanelInner",
+            Some("framework"),
+        );
+        graph.assert_edge(
+            "function App",
+            "references",
+            "function Inner",
+            Some("framework"),
+        );
+        graph.assert_edge(
+            "function App",
+            "references",
+            "function TableInner",
+            Some("framework"),
+        );
+        graph.assert_edge("function App", "references", "constant Config", None);
+        for name in ["Home", "Panel", "Item", "Table", "Config"] {
+            graph.assert_no_edge(
+                "function App",
+                "references",
+                &format!("function {name} @src/other/Home.tsx"),
+            );
+        }
+    }
+
+    /// Upstream `jsx-child-disambiguation.test.ts`, "a value the file
+    /// declares itself", the lazy loaders (#2480): a tag naming a value whose
+    /// lazy wrapper loads a module renders that module's component, never
+    /// another app's same-named page — `Loadable(lazy(…))`, next/dynamic's
+    /// `(await import(…)).default` with options, a `.then` that picks a named
+    /// export, a module that forwards its default to the component it wraps,
+    /// the branch of a conditional that loads lazily — and the declaration
+    /// itself when the module is out of reach or the value wraps a function
+    /// that imports on its own. Here the tag's `references` edge (the
+    /// `jsx-render` edges are W7-14's).
+    #[test]
+    fn pr2480_a_lazy_value_renders_the_module_it_loads() {
+        let project = Project::new()
+            .file(
+                "package.json",
+                "{\"dependencies\":{\"react\":\"^18.0.0\"}}",
+            )
+            .file(
+                "next/src/app/(auth)/register/page.jsx",
+                "export default function RegisterPage() {\n  return <div />;\n}\n",
+            )
+            .file(
+                "next/src/app/(auth)/login/page.jsx",
+                "export default function LoginPage() {\n  return <div />;\n}\n",
+            )
+            .file(
+                "vite/src/pages/auth/Register.jsx",
+                "export default function Register() {\n  return <div />;\n}\n",
+            )
+            .file(
+                "vite/src/components/Loadable.jsx",
+                "export default function Loadable(Component) {\n  return (props) => <Component {...props} />;\n}\n",
+            )
+            .file(
+                "vite/src/layout/AuthShell.jsx",
+                "import { lazy } from 'react';\nimport Loadable from '../components/Loadable';\n\nconst RegisterPage = Loadable(lazy(() => import('../pages/auth/Register')));\n// An import only the app's own build resolves (`baseUrl`).\nconst LoginPage = Loadable(lazy(() => import('pages/auth/Login')));\n\nexport function AuthShell() {\n  return <main><RegisterPage />Sign in <LoginPage /></main>;\n}\n",
+            )
+            .file(
+                "dev-docs/src/theme/ReactLiveScope/index.js",
+                "const Excalidraw = React.forwardRef((props, ref) => <div ref={ref} />);\nexport default { Excalidraw };\n",
+            )
+            .file(
+                "examples/with-nextjs/src/excalidrawWrapper.tsx",
+                "const ExcalidrawWrapper = () => {\n  return <div />;\n};\nexport default ExcalidrawWrapper;\n",
+            )
+            .file(
+                "examples/with-nextjs/src/pages/excalidraw-in-pages.tsx",
+                "import dynamic from 'next/dynamic';\n\nconst Excalidraw = dynamic(\n  async () => (await import('../excalidrawWrapper')).default,\n  {\n    ssr: false,\n  },\n);\n\nexport default function Page() {\n  return <Excalidraw />;\n}\n",
+            )
+            .file(
+                "a-decoy/line-chart.tsx",
+                "export function LineChart() {\n  return <svg />;\n}\n",
+            )
+            .file(
+                "charts/line-chart.tsx",
+                "export function LineChart() {\n  return <svg />;\n}\n",
+            )
+            .file(
+                "charts/index.ts",
+                "export default function Fallback() {\n  return null;\n}\nexport * from './line-chart';\n",
+            )
+            .file(
+                "dashboard.tsx",
+                "import { lazy } from 'react';\nconst LineChart = lazy(() => import('./charts').then((m) => ({ default: m.LineChart })));\nexport function Dashboard() {\n  return <LineChart />;\n}\n",
+            )
+            .file(
+                "a-decoy/Login.tsx",
+                "export function Login() {\n  return <form />;\n}\n",
+            )
+            .file(
+                "app/scenes/Login/Login.tsx",
+                "import { observer } from 'mobx-react';\nfunction Login() {\n  return <form />;\n}\n\nexport default observer(Login);\n",
+            )
+            .file(
+                "app/scenes/Login/index.ts",
+                "import Login from \"./Login\";\n\nexport default Login;\n",
+            )
+            .file(
+                "app/scenes/Shared/index.tsx",
+                "import { lazy } from 'react';\nconst Login = lazy(() => import('../Login'));\nexport function SharedScene() {\n  return <Login />;\n}\n",
+            )
+            .file(
+                "a-decoy/AuthZDevModal.tsx",
+                "export function AuthZDevModal() {\n  return <div />;\n}\n",
+            )
+            .file(
+                "src/lib/devtools/AuthZDevModal.tsx",
+                "export function AuthZDevModal() {\n  return <dialog />;\n}\n",
+            )
+            .file(
+                "src/palette.tsx",
+                "import React from 'react';\n\nconst IS_DEV = process.env.NODE_ENV === 'development';\n\nconst AuthZDevModal = IS_DEV\n  ? React.lazy(() =>\n      import('./lib/devtools/AuthZDevModal').then((m) => ({\n        default: m.AuthZDevModal,\n      })),\n    )\n  : null;\n\nexport function Palette() {\n  return <div>{AuthZDevModal && <AuthZDevModal />}</div>;\n}\n",
+            )
+            .file(
+                "heavy.tsx",
+                "export default function Heavy() {\n  return <div />;\n}\n",
+            )
+            .file(
+                "form.tsx",
+                "import { withFallback } from './fallback';\n\nconst Dialog = withFallback('Dialog', (props) => {\n  const load = () => import('./heavy');\n  return <div onClick={load} />;\n});\n\nexport function Form() {\n  return <form><Dialog /></form>;\n}\n",
+            )
+            .file(
+                "fallback.tsx",
+                "export function withFallback(name, render) {\n  return render;\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        for (parent, component) in [
+            (
+                "function AuthShell",
+                "function Register @vite/src/pages/auth/Register.jsx",
+            ),
+            (
+                "function Page",
+                "function ExcalidrawWrapper @examples/with-nextjs/src/excalidrawWrapper.tsx",
+            ),
+            (
+                "function Dashboard",
+                "function LineChart @charts/line-chart.tsx",
+            ),
+            (
+                "function SharedScene",
+                "function Login @app/scenes/Login/Login.tsx",
+            ),
+            (
+                "function Palette",
+                "function AuthZDevModal @src/lib/devtools/AuthZDevModal.tsx",
+            ),
+        ] {
+            graph.assert_edge(parent, "references", component, Some("framework"));
+        }
+        graph.assert_edge(
+            "function AuthShell",
+            "references",
+            "constant LoginPage @vite/src/layout/AuthShell.jsx",
+            None,
+        );
+        graph.assert_edge(
+            "function Form",
+            "references",
+            "constant Dialog @form.tsx",
+            None,
+        );
+        for (parent, decoy) in [
+            ("function AuthShell", "function RegisterPage"),
+            ("function AuthShell", "function LoginPage"),
+            (
+                "function Dashboard",
+                "function LineChart @a-decoy/line-chart.tsx",
+            ),
+            ("function SharedScene", "function Login @a-decoy/Login.tsx"),
+            (
+                "function Palette",
+                "function AuthZDevModal @a-decoy/AuthZDevModal.tsx",
+            ),
+            ("function Form", "function Heavy"),
+        ] {
+            graph.assert_no_edge(parent, "references", decoy);
+        }
+    }
+
+    /// Upstream #2563 (`jsx-child-disambiguation`, `sync-jsx-import-forwarding`;
+    /// audit probe `p18-jsx-import-forwarding`): a tag imported from a module
+    /// of the project renders what that module exports under the name, never
+    /// a same-named component elsewhere: through outline's `Sidebar/index.ts`
+    /// that forwards `observer(AppSidebar)`, past outline's `const Avatar =
+    /// AvatarWithHoverCard`, mastodon's `memo(Blurhash)` exported as
+    /// `Blurhash`, and outline's `Button.tsx`, whose default export wraps
+    /// `Button` beside an exported `Inner`. Where import resolution reaches
+    /// the same node, it links the edge as before. Here the tags' `references`
+    /// edges (the `jsx-render` edges are W7-14's).
+    #[test]
+    fn pr2563_an_imported_tag_renders_what_its_module_exports() {
+        let project = Project::new()
+            .file("package.json", "{\"name\":\"app\",\"dependencies\":{\"react\":\"^18\",\"mobx-react\":\"^9\"}}\n")
+            .file("tsconfig.json", "{\"compilerOptions\":{\"baseUrl\":\".\",\"paths\":{\"~/*\":[\"./app/*\"]}}}\n")
+            .file("src/components/Sidebar/Aside.tsx", "export function Sidebar() {\n  return <aside />;\n}\n")
+            .file("src/components/Sidebar/App.tsx", "import { observer } from 'mobx-react';\n\nfunction AppSidebar() {\n  return <nav />;\n}\n\nexport default observer(AppSidebar);\n")
+            .file("src/components/Sidebar/index.ts", "import Sidebar from './App';\n\nexport default Sidebar;\n")
+            .file("src/scenes/Home.tsx", "import Sidebar from '../components/Sidebar';\n\nexport function Home() {\n  return <main><Sidebar /></main>;\n}\n")
+            .file("app/components/Avatar/Avatar.tsx", "import { observer } from 'mobx-react';\n\nfunction Avatar() {\n  return <img />;\n}\n\nexport default observer(Avatar);\n")
+            .file("app/components/Avatar/AvatarWithHoverCard.tsx", "import { observer } from 'mobx-react';\nimport Avatar from './Avatar';\n\nfunction AvatarWithHoverCard() {\n  return <div><Avatar /></div>;\n}\n\nexport default observer(AvatarWithHoverCard);\n")
+            .file("app/components/Avatar/index.ts", "import AvatarWithHoverCard from './AvatarWithHoverCard';\n\nconst Avatar = AvatarWithHoverCard;\n\nexport { Avatar };\n")
+            .file("app/components/CommentForm.tsx", "import { Avatar } from '~/components/Avatar';\n\nexport function CommentForm() {\n  return <form><Avatar /></form>;\n}\n")
+            .file("src/avatar/Fake.tsx", "export function Avatar() {\n  return <span />;\n}\n")
+            .file("app/javascript/mastodon/components/blurhash.tsx", "import { memo } from 'react';\n\nfunction Blurhash({ hash }: { hash: string }) {\n  return <canvas data-hash={hash} />;\n}\n\nconst MemoizedBlurhash = memo(Blurhash);\n\nexport { MemoizedBlurhash as Blurhash };\n")
+            .file("app/javascript/mastodon/components/media_item.tsx", "import { Blurhash } from './blurhash';\n\nexport function MediaItem() {\n  return <div><Blurhash hash=\"x\" /></div>;\n}\n")
+            .file("components/Button.tsx", "import React from 'react';\n\nexport const Inner = React.forwardRef<HTMLSpanElement, object>((props, ref) => <span ref={ref} {...props} />);\n\nfunction Button(props: object, ref: React.Ref<HTMLButtonElement>) {\n  return <button ref={ref}><Inner /></button>;\n}\n\nexport default React.forwardRef<HTMLButtonElement, object>(Button);\n")
+            .file("components/Plain.tsx", "export function Plain() {\n  return <hr />;\n}\n")
+            .file("components/Toolbar.tsx", "import ToolbarButton from './Button';\nimport { Plain } from './Plain';\n\nexport function Toolbar() {\n  return <div><ToolbarButton /><Plain /></div>;\n}\n")
+            .index();
+        let graph = project.graph();
+        graph.assert_edge(
+            "function Home",
+            "references",
+            "function AppSidebar",
+            Some("framework"),
+        );
+        graph.assert_no_edge(
+            "function Home",
+            "references",
+            "function Sidebar @src/components/Sidebar/Aside.tsx",
+        );
+        graph.assert_edge(
+            "function CommentForm",
+            "references",
+            "function AvatarWithHoverCard",
+            Some("framework"),
+        );
+        graph.assert_no_edge(
+            "function CommentForm",
+            "references",
+            "function Avatar @src/avatar/Fake.tsx",
+        );
+        graph.assert_edge(
+            "function AvatarWithHoverCard",
+            "references",
+            "function Avatar @app/components/Avatar/Avatar.tsx",
+            Some("framework"),
+        );
+        graph.assert_edge(
+            "function MediaItem",
+            "references",
+            "function Blurhash",
+            Some("framework"),
+        );
+        graph.assert_edge(
+            "function Toolbar",
+            "references",
+            "function Button @components/Button.tsx",
+            Some("framework"),
+        );
+        graph.assert_no_edge("function Toolbar", "references", "component Inner");
+        graph.assert_edge(
+            "function Toolbar",
+            "references",
+            "function Plain",
+            Some("import"),
+        );
+        // The import statement's own binding stays import resolution's.
+        graph.assert_edge(
+            "file:src/scenes/Home.tsx",
+            "imports",
+            "file:src/components/Sidebar/index.ts",
+            Some("import"),
+        );
+        graph.assert_no_edge("file:src/scenes/Home.tsx", "imports", "function AppSidebar");
+    }
+
+    /// The route names a NestJS index holds, sorted.
+    fn route_names(graph: &super::support::Graph) -> Vec<String> {
+        let mut names: Vec<String> = graph
+            .nodes
+            .iter()
+            .filter(|node| node.kind == "route")
+            .map(|node| node.name.clone())
+            .collect();
+        names.sort();
+        names
+    }
+
+    const NEST_PACKAGE: &str =
+        "{\"dependencies\":{\"@nestjs/core\":\"^11.0.0\",\"@nestjs/common\":\"^11.0.0\"}}\n";
+
+    const NEST_MAIN: &str = "import { NestFactory } from '@nestjs/core';\nimport { VersioningType } from '@nestjs/common';\nimport { AppModule } from './app/app.module';\nasync function bootstrap() {\n  const app = await NestFactory.create(AppModule);\n  app.enableVersioning({ defaultVersion: '1', type: VersioningType.URI });\n  app.setGlobalPrefix('api', { exclude: ['sitemap.xml', 'health{/*wildcard}'] });\n  await app.listen(3333);\n}\nbootstrap();\n";
+
+    /// Upstream #2117: a NestJS route is named by the path a request takes to
+    /// it, the app's global prefix and URI version included: a route's own
+    /// `@Version`, else its controller's, else `defaultVersion`;
+    /// `VERSION_NEUTRAL` has none, an excluded path skips the prefix, a seed
+    /// script that creates the app without serving it does not displace the
+    /// bootstrap that configures it, and an app that sets nothing keeps its
+    /// routes as written.
+    #[test]
+    fn pr2117_routes_carry_the_global_prefix_and_uri_version() {
+        let project = Project::new()
+            .file("package.json", NEST_PACKAGE)
+            .file("apps/api/src/main.ts", NEST_MAIN)
+            .file(
+                "apps/api/src/database/run-seed.ts",
+                "import { NestFactory } from '@nestjs/core';\nconst runSeed = async () => {\n  const app = await NestFactory.create(SeedModule);\n  await app.close();\n};\nvoid runSeed();\n",
+            )
+            .file(
+                "apps/api/src/app/user.controller.ts",
+                "import { Controller, Get, Post, Version, VERSION_NEUTRAL } from '@nestjs/common';\n@Controller('user')\nexport class UserController {\n  @Get()\n  public getUser() {}\n\n  @Post()\n  @UseGuards(AuthGuard('jwt'))\n  @Version('2')\n  public createUser() {}\n\n  @Get('oidc/callback')\n  @Version(VERSION_NEUTRAL)\n  public callback() {}\n}\n",
+            )
+            .file(
+                "apps/api/src/app/sitemap.controller.ts",
+                "import { Controller, Get, Version, VERSION_NEUTRAL } from '@nestjs/common';\n@Controller()\n@Version(VERSION_NEUTRAL)\nexport class SitemapController {\n  @Get('sitemap.xml')\n  public sitemap() {}\n}\n",
+            )
+            .file(
+                "apps/api/src/app/health.controller.ts",
+                "import { Controller, Get } from '@nestjs/common';\n@Controller({ path: 'health', version: '3' })\nexport class HealthController {\n  @Get('db')\n  public db() {}\n}\n",
+            )
+            .file(
+                "apps/jobs/src/main.ts",
+                "import { NestFactory } from '@nestjs/core';\nNestFactory.create(JobsModule).then((app) => app.listen(3335));\n",
+            )
+            .file(
+                "apps/jobs/src/jobs.controller.ts",
+                "import { Controller, Get } from '@nestjs/common';\n@Controller('jobs')\nexport class JobsController {\n  @Get()\n  public list() {}\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        assert_eq!(
+            route_names(graph),
+            [
+                "GET /api/user/oidc/callback",
+                "GET /api/v1/user",
+                "GET /jobs",
+                "GET /sitemap.xml",
+                "GET /v3/health/db",
+                "POST /api/v2/user",
+            ],
+            "{}",
+            graph.report()
+        );
+        // The rename keeps the route's identity: its id and qualified name
+        // still read the path its file wrote.
+        graph.assert_edge(
+            "route apps/api/src/app/user.controller.ts::GET:/user",
+            "references",
+            "method UserController::getUser",
+            None,
+        );
+    }
+
+    /// Upstream #2117: a route's `@Version` is found past decorators with
+    /// object arguments, on the method or the class, and each app reads its
+    /// own bootstrap: a computed prefix is not guessed, and one app's `/api`
+    /// is never another's.
+    #[test]
+    fn pr2117_a_version_past_object_decorators_and_each_apps_bootstrap() {
+        let project = Project::new()
+            .file("package.json", NEST_PACKAGE)
+            .file("apps/api/src/main.ts", NEST_MAIN)
+            .file(
+                "apps/api/src/app/stats.controller.ts",
+                "import { Controller, Get, Version } from '@nestjs/common';\n@Controller('stats')\nexport class StatsController {\n  @Version('2')\n  @ApiResponse({ status: 200, description: 'The stats' })\n  @Get('daily')\n  public daily() {}\n\n  @Get('weekly')\n  public weekly() {}\n}\n",
+            )
+            .file(
+                "apps/api/src/app/reports.controller.ts",
+                "import { Controller, Get, Version } from '@nestjs/common';\n@Version('4')\n@ApiTags({ name: 'reports' })\n@Controller('reports')\nexport class ReportsController {\n  @Get()\n  public list() {}\n}\n",
+            )
+            .file(
+                "apps/admin/src/main.ts",
+                "import { NestFactory } from '@nestjs/core';\nasync function bootstrap() {\n  const app = await NestFactory.create(AdminModule);\n  app.setGlobalPrefix(config.get('app.prefix'));\n  app.enableVersioning({ defaultVersion: '1' });\n  await app.listen(3334);\n}\nbootstrap();\n",
+            )
+            .file(
+                "apps/admin/src/users.controller.ts",
+                "import { Controller, Get } from '@nestjs/common';\n@Controller('users')\nexport class UsersController {\n  @Get()\n  public list() {}\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        assert_eq!(
+            route_names(graph),
+            [
+                "GET /api/v1/stats/weekly",
+                "GET /api/v2/stats/daily",
+                "GET /api/v4/reports",
+                "GET /v1/users",
+            ],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// W7-02b (KEEP-RUST): a test's `NestFactory.create` (an e2e spec) with no
+    /// `src/` above it serves the feature above its test folder. One
+    /// feature's spec setting `setGlobalPrefix('api')` names that feature's
+    /// routes and no other's, where upstream gives every integration app of
+    /// nestjs/nest that spec's `/api`.
+    #[test]
+    fn keep_rust_a_tests_nest_bootstrap_names_only_its_own_features_routes() {
+        let project = Project::new()
+            .file("package.json", NEST_PACKAGE)
+            .file(
+                "integration/security/e2e/csrf-protection.spec.ts",
+                "import { NestFactory } from '@nestjs/core';\nimport { AppModule } from '../src/app.module';\ndescribe('CSRF', () => {\n  it('protects', async () => {\n    const app = await NestFactory.create(AppModule);\n    app.setGlobalPrefix('api');\n    await app.init();\n  });\n});\n",
+            )
+            .file(
+                "integration/security/src/csrf.controller.ts",
+                "import { Controller, Get } from '@nestjs/common';\n@Controller('csrf')\nexport class CsrfController {\n  @Get()\n  public token() {}\n}\n",
+            )
+            .file(
+                "integration/cookies/e2e/cookies.spec.ts",
+                "import { NestFactory } from '@nestjs/core';\nimport { AppModule } from '../src/app.module';\ndescribe('Cookies', () => {\n  it('sets', async () => {\n    const app = await NestFactory.create(AppModule);\n    await app.init();\n  });\n});\n",
+            )
+            .file(
+                "integration/cookies/src/cookies.controller.ts",
+                "import { Controller, Get } from '@nestjs/common';\n@Controller('cookies')\nexport class CookiesController {\n  @Get('set')\n  public set() {}\n}\n",
+            )
+            .file(
+                "integration/hello/src/hello.controller.ts",
+                "import { Controller, Get } from '@nestjs/common';\n@Controller('hello')\nexport class HelloController {\n  @Get()\n  public hi() {}\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        assert_eq!(
+            route_names(graph),
+            ["GET /api/csrf", "GET /cookies/set", "GET /hello"],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream #2246: in a TS/JS module the provider convention (`*Service`,
+    /// `*Controller`, …) takes the file's own class or the convention file
+    /// beside it, never a same-named class elsewhere preferred for its file
+    /// name: Nest's own specs' `TransientService` is not an integration
+    /// app's. Anything farther is import resolution's or name matching's.
+    #[test]
+    fn pr2246_the_provider_convention_stays_in_the_references_feature() {
+        let project = Project::new()
+            .file(
+                "package.json",
+                "{\"name\":\"nest\",\"private\":true,\"dependencies\":{\"@nestjs/common\":\"^10.0.0\"}}\n",
+            )
+            .file(
+                "integration/injector/src/app.module.ts",
+                "import { Module } from '@nestjs/common';\n\n@Module({})\nexport class AppModule {}\n",
+            )
+            .file(
+                "integration/injector/src/scoped/transient.service.ts",
+                "export class TransientService {}\n",
+            )
+            .file(
+                "packages/core/test/scope/helpers.ts",
+                "export class TransientService {}\n",
+            )
+            .file(
+                "packages/core/test/scope/transient-scope.spec.ts",
+                "class Holder {\n  constructor(public transient: TransientService) {}\n}\n",
+            )
+            .file("src/admin/users.service.ts", "export class UsersService {}\n")
+            .file("src/users/users.service.ts", "export class UsersService {}\n")
+            .file(
+                "src/users/users.controller.ts",
+                "export class UsersController {\n  constructor(private readonly users: UsersService) {}\n}\n",
+            )
+            .file("src/guards/auth.guard.ts", "export class AuthGuard {}\n")
+            .file(
+                "src/auth/session.ts",
+                "export class AuthGuard {}\n\nexport class Session {\n  constructor(private readonly guard: AuthGuard) {}\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        graph.assert_no_edge(
+            "method Holder::constructor",
+            "references",
+            "class TransientService @integration/injector/src/scoped/transient.service.ts",
+        );
+        // The convention file beside the reference, not another feature's.
+        graph.assert_edge(
+            "method UsersController::constructor",
+            "references",
+            "class UsersService @src/users/users.service.ts",
+            Some("framework"),
+        );
+        graph.assert_no_edge(
+            "method UsersController::constructor",
+            "references",
+            "class UsersService @src/admin/users.service.ts",
+        );
+        // The file's own class, though another file is named by the
+        // convention.
+        graph.assert_edge(
+            "method Session::constructor",
+            "references",
+            "class AuthGuard @src/auth/session.ts",
+            Some("framework"),
+        );
+        graph.assert_no_edge(
+            "method Session::constructor",
+            "references",
+            "class AuthGuard @src/guards/auth.guard.ts",
+        );
+    }
+
+    /// Upstream #2130: Nuxt's file routes are read only in a Nuxt app, and a
+    /// Nuxt app at the repository root gets them: a top-level
+    /// `pages/index.vue` is `/`, not `/index`. A plain Vue app's `pages/`
+    /// folder holds components a router config names, not addresses.
+    #[test]
+    fn pr2130_nuxt_pages_are_routes_only_in_a_nuxt_app() {
+        let nuxt = Project::new()
+            .file(
+                "package.json",
+                "{\"name\":\"site\",\"dependencies\":{\"nuxt\":\"*\",\"vue\":\"*\"}}\n",
+            )
+            .file("pages/index.vue", "<template><div/></template>\n")
+            .file("pages/users/[id].vue", "<template><div/></template>\n")
+            .index();
+        assert_eq!(
+            route_names(nuxt.graph()),
+            ["/", "/users/:id"],
+            "{}",
+            nuxt.graph().report()
+        );
+        let plain = Project::new()
+            .file(
+                "ui/package.json",
+                "{\"name\":\"console\",\"dependencies\":{\"vue\":\"*\",\"vue-router\":\"*\"}}\n",
+            )
+            .file(
+                "ui/src/modules/contents/pages/SinglePageList.vue",
+                "<template><div/></template>\n",
+            )
+            .index();
+        assert!(
+            route_names(plain.graph()).is_empty(),
+            "{}",
+            plain.graph().report()
+        );
+    }
+
+    /// Upstream #2129 for Nuxt: in a monorepo, a Nuxt app's pages are routes
+    /// and a plain Vue app's `pages/` beside it are not, though the Nuxt app
+    /// makes the project a Nuxt one.
+    #[test]
+    fn pr2129_nuxt_routes_stay_in_the_app_that_declares_nuxt() {
+        let project = Project::new()
+            .file("package.json", "{\"name\":\"mono\",\"private\":true}\n")
+            .file(
+                "apps/site/package.json",
+                "{\"name\":\"site\",\"dependencies\":{\"nuxt\":\"3\"}}\n",
+            )
+            .file("apps/site/pages/about.vue", "<template><div/></template>\n")
+            .file(
+                "apps/admin/package.json",
+                "{\"name\":\"admin\",\"dependencies\":{\"vue\":\"3\"}}\n",
+            )
+            .file(
+                "apps/admin/src/pages/Users.vue",
+                "<template><div/></template>\n",
+            )
+            .index();
+        assert_eq!(
+            route_names(project.graph()),
+            ["/about"],
+            "{}",
+            project.graph().report()
+        );
+    }
+
+    /// Upstream #2267: a Nuxt page route is served by its own file's
+    /// component, never a same-named one: every `index.vue` is a component
+    /// named `index`.
+    #[test]
+    fn pr2267_a_nuxt_page_is_served_by_its_own_files_component() {
+        let project = Project::new()
+            .file(
+                "package.json",
+                "{\"name\":\"shop\",\"private\":true,\"dependencies\":{\"nuxt\":\"^3.0.0\"}}\n",
+            )
+            .file(
+                "pages/index.vue",
+                "<template><button @click=\"load\">Load</button></template>\n<script setup lang=\"ts\">\nfunction load() { return 1; }\n</script>\n",
+            )
+            .file("pages/admin.vue", "<template><div>admin</div></template>\n")
+            .file(
+                "pages/orders/index.vue",
+                "<template><div>orders</div></template>\n",
+            )
+            .file(
+                "components/index.vue",
+                "<template><div>not a page</div></template>\n",
+            )
+            .index();
+        let graph = project.graph();
+        for (route, file) in [
+            ("/", "pages/index.vue"),
+            ("/admin", "pages/admin.vue"),
+            ("/orders", "pages/orders/index.vue"),
+        ] {
+            let served: Vec<String> = graph
+                .edges
+                .iter()
+                .filter(|edge| {
+                    matches!(edge.kind.as_str(), "calls" | "references")
+                        && graph
+                            .node(&edge.source)
+                            .is_some_and(|node| node.kind == "route" && node.name == route)
+                })
+                .filter_map(|edge| graph.node(&edge.target))
+                .map(|node| format!("{} {}", node.kind, node.file_path))
+                .collect();
+            assert_eq!(
+                served,
+                [format!("component {file}")],
+                "{route}\n{}",
+                graph.report()
+            );
+        }
+    }
+}
+
+mod nextjs {
+    use super::support::{Graph, Project};
+
+    const SITE_PACKAGE: &str = "{\"name\":\"site\",\"dependencies\":{\"next\":\"15\",\"react\":\"19\",\"@prisma/client\":\"5\"}}\n";
+
+    /// Upstream `__tests__/nextjs.test.ts`, end to end: a small App Router
+    /// site with a server action, a route handler and a middleware.
+    fn site() -> Project {
+        Project::new()
+            .file("package.json", SITE_PACKAGE)
+            .file(
+                "lib/db.ts",
+                "import { PrismaClient } from '@prisma/client'\nexport const prisma = new PrismaClient()\n",
+            )
+            .file(
+                "app/layout.tsx",
+                "export default function RootLayout({ children }) {\n  return children\n}\n",
+            )
+            .file(
+                "app/page.tsx",
+                "import Link from 'next/link'\nexport default function Home() {\n  return (\n    <main>\n      <Link href=\"/users\">Users</Link>\n      <a href=\"/login\">Log in</a>\n      <a href=\"https://example.com\">Elsewhere</a>\n    </main>\n  )\n}\n",
+            )
+            .file(
+                "app/login/page.tsx",
+                "export default function LoginPage() {\n  return null\n}\n",
+            )
+            .file(
+                "app/users/page.tsx",
+                "import { NewUserForm } from '../../components/new-user-form'\nimport { prisma } from '../../lib/db'\nexport default async function UsersPage() {\n  const users = await prisma.user.findMany()\n  return <NewUserForm count={users.length} />\n}\n",
+            )
+            .file(
+                "app/users/[id]/page.tsx",
+                "export default function UserPage({ params }) {\n  return <a href=\"/users\">Back</a>\n}\n",
+            )
+            .file(
+                "components/new-user-form.tsx",
+                "'use client'\nimport { useCallback, useState } from 'react'\nimport { useRouter } from 'next/navigation'\nimport { createUserAction } from '../app/actions'\nexport function NewUserForm({ count }) {\n  const [email, setEmail] = useState('')\n  const router = useRouter()\n  const handleSubmit = useCallback(async (e) => {\n    e.preventDefault()\n    const user = await createUserAction({ email })\n    if (user.ok) router.push(`/users/${user.id}`)\n  }, [email])\n  return <form onSubmit={handleSubmit}><input value={email} onChange={(e) => setEmail(e.target.value)} /></form>\n}\n",
+            )
+            .file(
+                "app/actions.ts",
+                "'use server'\nimport { redirect } from 'next/navigation'\nimport { prisma } from '../lib/db'\nexport async function createUserAction(data) {\n  const user = await prisma.user.create({ data })\n  if (!user.verified) redirect('/users')\n  return { ok: true, id: user.id }\n}\n",
+            )
+            .file(
+                "app/api/users/route.ts",
+                "import { NextResponse } from 'next/server'\nimport { prisma } from '../../../lib/db'\nexport async function GET() {\n  return NextResponse.json(await prisma.user.findMany())\n}\nexport async function POST(req) {\n  const data = await req.json()\n  const user = await prisma.user.create({ data })\n  return NextResponse.json(user, { status: 201 })\n}\n",
+            )
+            .file(
+                "middleware.ts",
+                "import { NextResponse } from 'next/server'\nexport function middleware(req) {\n  if (!req.cookies.get('session')) {\n    return NextResponse.redirect(new URL('/login', req.url))\n  }\n  return NextResponse.next()\n}\n",
+            )
+    }
+
+    /// Every route of the graph, sorted.
+    fn route_names(graph: &Graph) -> Vec<String> {
+        let mut names: Vec<String> = graph
+            .nodes
+            .iter()
+            .filter(|node| node.kind == "route")
+            .map(|node| node.name.clone())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// Upstream F3 (`nextjs.test.ts`, 9c6bc23b): a page is a route named by its path,
+    /// calling its default export; a route handler file is one endpoint per
+    /// exported method, each referencing its function; a layout is no route.
+    #[test]
+    fn f3_a_next_page_is_a_route_that_calls_its_component() {
+        let project = site().index();
+        let graph = project.graph();
+        assert_eq!(
+            route_names(graph),
+            [
+                "/",
+                "/login",
+                "/users",
+                "/users/:id",
+                "GET /api/users",
+                "POST /api/users"
+            ],
+            "{}",
+            graph.report()
+        );
+        graph.assert_edge(
+            "route app/page.tsx::route:/",
+            "calls",
+            "function Home @app/page.tsx",
+            None,
+        );
+        graph.assert_edge(
+            "route app/users/[id]/page.tsx::route:/users/:id",
+            "calls",
+            "function UserPage @app/users/[id]/page.tsx",
+            None,
+        );
+        graph.assert_edge(
+            "route app/api/users/route.ts::POST:/api/users",
+            "references",
+            "function POST @app/api/users/route.ts",
+            None,
+        );
+        graph.assert_edge(
+            "route app/api/users/route.ts::GET:/api/users",
+            "references",
+            "function GET @app/api/users/route.ts",
+            None,
+        );
+    }
+
+    /// Upstream F3: `router.push` with a template hole (in the `useCallback`
+    /// the extractor names `handleSubmit`) reaches the `[id]` page; `redirect()` in a server action and
+    /// `NextResponse.redirect(new URL(…))` in the middleware reach theirs,
+    /// each a `navigates` edge carrying the href and the verb.
+    #[test]
+    fn f3_a_navigation_call_navigates_to_the_page_its_href_names() {
+        let project = site().index();
+        let graph = project.graph();
+        let navigates = |from: &str, to: &str| {
+            let edges = graph.edges_matching(from, "navigates", to);
+            assert_eq!(edges.len(), 1, "{from} -> {to}\n{}", graph.report());
+            edges[0].metadata.clone()
+        };
+        let push = navigates(
+            "function NewUserForm::handleSubmit",
+            "route app/users/[id]/page.tsx::route:/users/:id",
+        );
+        assert_eq!(push["href"], "/users/${…}");
+        assert_eq!(push["navMethod"], "push");
+        assert_eq!(push["resolvedBy"], "framework");
+        assert_eq!(push["framework"], "nextjs");
+        let redirect = navigates(
+            "function createUserAction",
+            "route app/users/page.tsx::route:/users",
+        );
+        assert_eq!(redirect["href"], "/users");
+        assert_eq!(redirect["navMethod"], "redirect");
+        let guard = navigates(
+            "function middleware",
+            "route app/login/page.tsx::route:/login",
+        );
+        assert_eq!(guard["href"], "/login");
+        assert_eq!(guard["navMethod"], "response.redirect");
+    }
+
+    /// The `navigates` edges out of the one node `source` selects, each as
+    /// its target's name and its metadata, by target.
+    fn navigations_of(graph: &Graph, source: &str) -> Vec<(String, serde_json::Value)> {
+        let from = graph.nodes_matching(source);
+        assert_eq!(from.len(), 1, "{source}\n{}", graph.report());
+        let mut out: Vec<(String, serde_json::Value)> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.kind == "navigates" && edge.source == from[0].id)
+            .map(|edge| {
+                (
+                    graph
+                        .node(&edge.target)
+                        .map_or_else(String::new, |node| node.name.clone()),
+                    edge.metadata.clone(),
+                )
+            })
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    /// Upstream `nextjs.test.ts` ("a <Link href> and an internal <a href>
+    /// navigate from the component that renders them; an external one does
+    /// not", W7-18a): `Home`'s `<Link href="/users">` and `<a href="/login">`
+    /// draw one heuristic `navigates` edge each from `Home` to the page, with
+    /// the href, `navMethod` `link` or `a` and where the link is written; the
+    /// external `<a href>` draws none, and `UserPage`'s `<a href="/users">`
+    /// reaches `/users`.
+    #[test]
+    fn w718a_a_link_and_an_internal_anchor_navigate_from_their_component() {
+        let project = site().index();
+        let graph = project.graph();
+        let home = navigations_of(graph, "function Home");
+        let routes: Vec<&str> = home.iter().map(|(route, _)| route.as_str()).collect();
+        assert_eq!(routes, ["/login", "/users"], "{}", graph.report());
+        assert_eq!(
+            home[1].1,
+            serde_json::json!({
+                "synthesizedBy": "next-link",
+                "href": "/users",
+                "navMethod": "link",
+                "registeredAt": "app/page.tsx:5",
+            }),
+            "{}",
+            graph.report()
+        );
+        assert_eq!(home[0].1["navMethod"], "a");
+        assert_eq!(home[0].1["href"], "/login");
+        let users = graph.edges_matching(
+            "function Home",
+            "navigates",
+            "route app/users/page.tsx::route:/users",
+        );
+        assert_eq!(users.len(), 1, "{}", graph.report());
+        assert_eq!(users[0].provenance.as_deref(), Some("heuristic"));
+        let user_page: Vec<String> = navigations_of(graph, "function UserPage")
+            .into_iter()
+            .map(|(route, _)| route)
+            .collect();
+        assert_eq!(user_page, ["/users"], "{}", graph.report());
+    }
+
+    /// W7-18a (KEEP-RUST, OD-B10): a link names a page only with a
+    /// destination starting with `/`, a `<Link href>` as an `<a href>`.
+    /// Upstream skips an external `<a href>` only, and its table reads an
+    /// absolute URL's path, so a `<Link href="https://…/">` reached the
+    /// site's own `/`.
+    #[test]
+    fn keep_rust_w718a_an_external_link_href_reaches_no_page() {
+        let project = Project::new()
+            .file("package.json", SITE_PACKAGE)
+            .file(
+                "app/page.tsx",
+                "import Link from 'next/link'\nexport default function Home() {\n  return (\n    <main>\n      <Link href=\"https://codedthemes.com/\">Theme</Link>\n      <Link href=\"mailto:team@example.com\">Mail</Link>\n      <a href=\"https://example.com/about\">Elsewhere</a>\n      <Link href=\"/about\">About</Link>\n    </main>\n  )\n}\n",
+            )
+            .file(
+                "app/about/page.tsx",
+                "export default function About() {\n  return null\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        let home: Vec<String> = navigations_of(graph, "function Home")
+            .into_iter()
+            .map(|(route, _)| route)
+            .collect();
+        assert_eq!(home, ["/about"], "{}", graph.report());
+    }
+
+    /// Upstream #2129 (`monorepo-app-frameworks.test.ts`), the Next.js
+    /// halves: Next reads only the app whose package.json names `next` (a
+    /// `src/pages/` file of the Expo app is no page), and its layouts,
+    /// components and handler files are no pages. The Expo halves come with
+    /// Expo Router (W7-08).
+    #[test]
+    fn pr2129_next_reads_only_the_app_that_declares_next() {
+        let project = Project::new()
+            .file(
+                "package.json",
+                "{\"name\":\"mono\",\"private\":true,\"workspaces\":[\"apps/*\"]}\n",
+            )
+            .file(
+                "apps/mobile/package.json",
+                "{\"name\":\"mobile\",\"dependencies\":{\"expo\":\"*\",\"expo-router\":\"*\",\"react\":\"*\"}}\n",
+            )
+            .file(
+                "apps/mobile/app/index.tsx",
+                "export default function Home() { return null; }\n",
+            )
+            .file(
+                "apps/mobile/app/user/[id].tsx",
+                "export default function User() { return null; }\n",
+            )
+            .file(
+                "apps/mobile/src/pages/settings.tsx",
+                "export default function Settings() { return null; }\n",
+            )
+            .file(
+                "apps/web/package.json",
+                "{\"name\":\"web\",\"dependencies\":{\"next\":\"*\",\"react\":\"*\"}}\n",
+            )
+            .file(
+                "apps/web/app/layout.tsx",
+                "export default function RootLayout({ children }: { children: unknown }) { return children; }\n",
+            )
+            .file(
+                "apps/web/app/page.tsx",
+                "export default function Page() { return null; }\n",
+            )
+            .file(
+                "apps/web/app/user/[id]/page.tsx",
+                "export default function UserPage() { return null; }\n",
+            )
+            .file(
+                "apps/web/app/_components/posts.tsx",
+                "export default function Posts() { return null; }\n",
+            )
+            .file(
+                "apps/web/app/api/auth/[...all]/route.ts",
+                "export async function GET() { return new Response('ok'); }\n",
+            )
+            .index();
+        let graph = project.graph();
+        let routes_in = |dir: &str| -> Vec<String> {
+            let mut names: Vec<String> = graph
+                .nodes
+                .iter()
+                .filter(|node| node.kind == "route" && node.file_path.starts_with(dir))
+                .map(|node| node.name.clone())
+                .collect();
+            names.sort();
+            names
+        };
+        assert_eq!(
+            routes_in("apps/web/"),
+            ["/", "/user/:id", "GET /api/auth/:all*"],
+            "{}",
+            graph.report()
+        );
+        // A `pages/` file of the app that does not declare Next is no page.
+        assert!(
+            routes_in("apps/mobile/src/").is_empty(),
+            "{}",
+            graph.report()
+        );
+
+        // The nearest manifest that names a router decides: a Next docs app
+        // under a root that names Expo.
+        let project = Project::new()
+            .file(
+                "package.json",
+                "{\"name\":\"true-sheet\",\"devDependencies\":{\"expo\":\"*\",\"expo-router\":\"*\",\"react\":\"*\"}}\n",
+            )
+            .file(
+                "docs/package.json",
+                "{\"name\":\"docs\",\"dependencies\":{\"next\":\"*\",\"react\":\"*\"}}\n",
+            )
+            .file(
+                "docs/app/layout.tsx",
+                "export default function RootLayout({ children }: { children: unknown }) { return children; }\n",
+            )
+            .file(
+                "docs/app/(docs)/[...slug]/page.tsx",
+                "export default function DocPage() { return null; }\n",
+            )
+            .file(
+                "example/app/_layout.tsx",
+                "export default function Layout() { return null; }\n",
+            )
+            .file(
+                "example/app/sheet.tsx",
+                "export default function Sheet() { return null; }\n",
+            )
+            .index();
+        let graph = project.graph();
+        let docs: Vec<&str> = graph
+            .nodes
+            .iter()
+            .filter(|node| node.kind == "route" && node.file_path.starts_with("docs/"))
+            .map(|node| node.name.as_str())
+            .collect();
+        assert_eq!(docs, ["/:slug*"], "{}", graph.report());
+        graph.assert_edge(
+            "route docs/app/(docs)/[...slug]/page.tsx::route:/:slug*",
+            "calls",
+            "function DocPage",
+            None,
+        );
+    }
+
+    /// W7-07 (KEEP-RUST): two Next apps of one monorepo both serve `/login`;
+    /// a call navigates to its own app's page. Upstream keeps one page per
+    /// path, the last in node order, which a sync can change.
+    #[test]
+    fn keep_rust_a_path_two_next_apps_serve_navigates_within_the_callers_app() {
+        let app =
+            |name: &str| format!("{{\"name\":\"{name}\",\"dependencies\":{{\"next\":\"15\"}}}}\n");
+        let project = Project::new()
+            .file("apps/admin/package.json", &app("admin"))
+            .file("apps/web/package.json", &app("web"))
+            .file(
+                "apps/admin/app/login/page.tsx",
+                "export default function AdminLogin() {\n  return null\n}\n",
+            )
+            .file(
+                "apps/web/app/login/page.tsx",
+                "export default function WebLogin() {\n  return null\n}\n",
+            )
+            .file(
+                "apps/admin/app/page.tsx",
+                "import { redirect } from 'next/navigation'\nexport default function AdminHome() {\n  redirect('/login')\n}\n",
+            )
+            .file(
+                "apps/web/app/page.tsx",
+                "import { redirect } from 'next/navigation'\nexport default function WebHome() {\n  redirect('/login')\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        for (from, to) in [
+            (
+                "function AdminHome",
+                "route apps/admin/app/login/page.tsx::route:/login",
+            ),
+            (
+                "function WebHome",
+                "route apps/web/app/login/page.tsx::route:/login",
+            ),
+        ] {
+            let edges = graph.edges_matching(from, "navigates", to);
+            assert_eq!(edges.len(), 1, "{from} -> {to}\n{}", graph.report());
+            assert_eq!(edges[0].metadata["navMethod"], "redirect");
+        }
+        assert_no_edge_any(
+            graph,
+            "function AdminHome",
+            "route apps/web/app/login/page.tsx::route:/login",
+        );
+        assert_no_edge_any(
+            graph,
+            "function WebHome",
+            "route apps/admin/app/login/page.tsx::route:/login",
+        );
+    }
+
+    fn assert_no_edge_any(graph: &Graph, from: &str, to: &str) {
+        graph.assert_no_edge(from, "navigates", to);
+    }
+}
+
+mod expo_router {
+    use super::support::{Graph, Project};
+
+    /// Every route of the graph whose file is under `dir`, sorted.
+    fn routes_in(graph: &Graph, dir: &str) -> Vec<String> {
+        let mut names: Vec<String> = graph
+            .nodes
+            .iter()
+            .filter(|node| node.kind == "route" && node.file_path.starts_with(dir))
+            .map(|node| node.name.clone())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// Upstream F2 (`expo-router.test.ts`, end to end): every screen file is
+    /// a route that calls its component; a navigation call reaches the
+    /// screen its href names, with the href and the verb. The synthesis
+    /// pass (W7-18a): `router.replace(await resolvePostLoginRoute())` makes
+    /// the helper's return literals its screens, one edge from the helper to
+    /// each with the push site and the literal's own column; the literals of
+    /// its return type are not read, and `apiPath`, which no navigation
+    /// consumes, is never read.
+    #[test]
+    fn f2_a_navigation_call_navigates_to_the_screen_its_href_names() {
+        let project = Project::new()
+            .file(
+                "package.json",
+                "{\"name\":\"app\",\"dependencies\":{\"expo\":\"52\",\"expo-router\":\"4\",\"react\":\"18\"}}\n",
+            )
+            .file(
+                "src/app/_layout.tsx",
+                "export default function Layout() { return null }\n",
+            )
+            .file(
+                "src/app/index.tsx",
+                "import { ItemCard } from '../components/item-card'\nexport default function Home() {\n  return <ItemCard item={{ id: '1' }} collected />\n}\n",
+            )
+            .file(
+                "src/app/object-detail.tsx",
+                "export default function ObjectDetail() {\n  return null\n}\n",
+            )
+            .file(
+                "src/app/item/[id].tsx",
+                "export default function Item() { return null }\n",
+            )
+            .file(
+                "src/app/welcome.tsx",
+                "export default function Welcome() { return null }\n",
+            )
+            .file(
+                "src/services/nav.ts",
+                "import { router } from 'expo-router'\nexport function openObjectDetail(item: { id: string }) {\n  router.navigate(\n    `/object-detail?detectionItem=${JSON.stringify(item)}` as any\n  )\n}\nexport function openItem(id: string) {\n  router.push({ pathname: '/item/[id]', params: { id } })\n}\n",
+            )
+            .file(
+                "src/components/item-card.tsx",
+                "import { openObjectDetail } from '../services/nav'\nexport function ItemCard(props: { item: { id: string }; collected: boolean }) {\n  const handlePress = () => {\n    if (props.collected) openObjectDetail(props.item)\n  }\n  return handlePress\n}\n",
+            )
+            .file(
+                "src/services/post-login.ts",
+                "export const resolvePostLoginRoute = async (): Promise<\n  '/welcome/' | '/'\n> => {\n  return (await seen()) ? '/' : '/welcome/'\n}\nasync function seen() { return true }\nexport function apiPath() { return '/api/users' }\n",
+            )
+            .file(
+                "src/services/login.ts",
+                "import { router } from 'expo-router'\nimport { resolvePostLoginRoute, apiPath } from './post-login'\nexport async function finishLogin() {\n  router.replace(await resolvePostLoginRoute())\n}\nexport function fetchUsers() { return fetch(apiPath()) }\n",
+            )
+            .index();
+        let graph = project.graph();
+        assert_eq!(
+            routes_in(graph, ""),
+            ["/", "/item/[id]", "/object-detail", "/welcome"],
+            "{}",
+            graph.report()
+        );
+        graph.assert_edge(
+            "route src/app/object-detail.tsx::route:/object-detail",
+            "calls",
+            "function ObjectDetail",
+            None,
+        );
+        let navigates = |from: &str, to: &str| {
+            let edges = graph.edges_matching(from, "navigates", to);
+            assert_eq!(edges.len(), 1, "{from} -> {to}\n{}", graph.report());
+            edges[0].metadata.clone()
+        };
+        let detail = navigates(
+            "function openObjectDetail",
+            "route src/app/object-detail.tsx::route:/object-detail",
+        );
+        assert_eq!(detail["href"], "/object-detail?detectionItem=${…}");
+        assert_eq!(detail["navMethod"], "navigate");
+        assert_eq!(detail["resolvedBy"], "framework");
+        assert_eq!(detail["framework"], "expo-router");
+        navigates(
+            "function openItem",
+            "route src/app/item/[id].tsx::route:/item/[id]",
+        );
+        let returned = |name: &str| -> Vec<(String, &super::support::EdgeRow)> {
+            let from = graph.nodes_named("function", name);
+            assert_eq!(from.len(), 1, "function {name}\n{}", graph.report());
+            let mut edges: Vec<(String, &super::support::EdgeRow)> = graph
+                .edges
+                .iter()
+                .filter(|edge| edge.kind == "navigates" && edge.source == from[0].id)
+                .map(|edge| {
+                    (
+                        graph
+                            .node(&edge.target)
+                            .map_or_else(String::new, |node| node.name.clone()),
+                        edge,
+                    )
+                })
+                .collect();
+            edges.sort_by(|a, b| a.0.cmp(&b.0));
+            edges
+        };
+        let helper = returned("resolvePostLoginRoute");
+        let screens: Vec<&str> = helper.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(screens, ["/", "/welcome"], "{}", graph.report());
+        for (_, edge) in &helper {
+            assert_eq!(edge.provenance.as_deref(), Some("heuristic"));
+            assert_eq!(edge.metadata["synthesizedBy"], "expo-router-return");
+            assert_eq!(edge.metadata["registeredAt"], "src/services/login.ts:4");
+            assert_eq!(edge.metadata["navMethod"], "replace");
+        }
+        assert_eq!(helper[0].1.metadata["href"], "/");
+        assert_eq!(helper[1].1.metadata["href"], "/welcome/");
+        // The two arms share line 4; each edge keeps its literal's column.
+        assert_eq!((helper[0].1.line, helper[0].1.col), (Some(4), Some(26)));
+        assert_eq!((helper[1].1.line, helper[1].1.col), (Some(4), Some(32)));
+        graph.assert_edge(
+            "function finishLogin",
+            "calls",
+            "function resolvePostLoginRoute",
+            None,
+        );
+        assert!(returned("apiPath").is_empty(), "{}", graph.report());
+    }
+
+    /// Upstream #2129 (`monorepo-app-frameworks.test.ts`), the Expo halves:
+    /// Expo Router reads the Expo app and never the Next app beside it, a
+    /// single Expo app at the repository root keeps its screens, and the
+    /// nearest manifest that names a router decides.
+    #[test]
+    fn pr2129_expo_router_reads_only_its_own_app() {
+        let project = Project::new()
+            .file(
+                "package.json",
+                "{\"name\":\"mono\",\"private\":true,\"workspaces\":[\"apps/*\"]}\n",
+            )
+            .file(
+                "apps/mobile/package.json",
+                "{\"name\":\"mobile\",\"dependencies\":{\"expo\":\"*\",\"expo-router\":\"*\",\"react\":\"*\"}}\n",
+            )
+            .file(
+                "apps/mobile/app/_layout.tsx",
+                "export default function Layout() { return null; }\n",
+            )
+            .file(
+                "apps/mobile/app/index.tsx",
+                "export default function Home() { return null; }\n",
+            )
+            .file(
+                "apps/mobile/app/user/[id].tsx",
+                "export default function User() { return null; }\n",
+            )
+            .file(
+                "apps/web/package.json",
+                "{\"name\":\"web\",\"dependencies\":{\"next\":\"*\",\"react\":\"*\"}}\n",
+            )
+            .file(
+                "apps/web/app/layout.tsx",
+                "export default function RootLayout({ children }: { children: unknown }) { return children; }\n",
+            )
+            .file(
+                "apps/web/app/page.tsx",
+                "export default function Page() { return null; }\n",
+            )
+            .file(
+                "apps/web/app/user/[id]/page.tsx",
+                "export default function UserPage() { return null; }\n",
+            )
+            .file(
+                "apps/web/app/_components/posts.tsx",
+                "export default function Posts() { return null; }\n",
+            )
+            .file(
+                "apps/web/app/api/auth/[...all]/route.ts",
+                "export async function GET() { return new Response('ok'); }\n",
+            )
+            .index();
+        let graph = project.graph();
+        assert_eq!(
+            routes_in(graph, "apps/mobile/"),
+            ["/", "/user/[id]"],
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            routes_in(graph, "apps/web/"),
+            ["/", "/user/:id", "GET /api/auth/:all*"],
+            "{}",
+            graph.report()
+        );
+
+        let project = Project::new()
+            .file(
+                "package.json",
+                "{\"name\":\"demo\",\"dependencies\":{\"expo\":\"*\",\"expo-router\":\"*\"}}\n",
+            )
+            .file(
+                "app/_layout.tsx",
+                "export default function Layout() { return null; }\n",
+            )
+            .file(
+                "app/settings.tsx",
+                "export default function Settings() { return null; }\n",
+            )
+            .index();
+        let graph = project.graph();
+        assert_eq!(
+            routes_in(graph, "app/"),
+            ["/settings"],
+            "{}",
+            graph.report()
+        );
+
+        let project = Project::new()
+            .file(
+                "package.json",
+                "{\"name\":\"true-sheet\",\"devDependencies\":{\"expo\":\"*\",\"expo-router\":\"*\",\"react\":\"*\"}}\n",
+            )
+            .file(
+                "docs/package.json",
+                "{\"name\":\"docs\",\"dependencies\":{\"next\":\"*\",\"react\":\"*\"}}\n",
+            )
+            .file(
+                "docs/app/layout.tsx",
+                "export default function RootLayout({ children }: { children: unknown }) { return children; }\n",
+            )
+            .file(
+                "docs/app/(docs)/[...slug]/page.tsx",
+                "export default function DocPage() { return null; }\n",
+            )
+            .file(
+                "example/app/_layout.tsx",
+                "export default function Layout() { return null; }\n",
+            )
+            .file(
+                "example/app/sheet.tsx",
+                "export default function Sheet() { return null; }\n",
+            )
+            .index();
+        let graph = project.graph();
+        assert_eq!(routes_in(graph, "docs/"), ["/:slug*"], "{}", graph.report());
+        assert_eq!(
+            routes_in(graph, "example/"),
+            ["/sheet"],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream #2135: an Expo API route is an endpoint per exported method,
+    /// referencing its handler, not a screen.
+    #[test]
+    fn pr2135_an_expo_api_route_is_an_endpoint_per_method() {
+        let project = Project::new()
+            .file(
+                "package.json",
+                "{\"name\":\"site\",\"dependencies\":{\"expo\":\"*\",\"expo-router\":\"*\"}}\n",
+            )
+            .file(
+                "app/index.tsx",
+                "export default function Home() { return null; }\n",
+            )
+            .file(
+                "app/blog/og-image/[post]+api.ts",
+                "export async function GET(request: Request) { return new Response('png'); }\nexport const POST = async () => new Response('ok');\n",
+            )
+            .index();
+        let graph = project.graph();
+        assert_eq!(
+            routes_in(graph, "app/"),
+            ["/", "GET /blog/og-image/:post", "POST /blog/og-image/:post"],
+            "{}",
+            graph.report()
+        );
+        graph.assert_edge(
+            "route app/blog/og-image/[post]+api.ts::GET:/blog/og-image/:post",
+            "references",
+            "function GET",
+            None,
+        );
+    }
+
+    /// W7-08 (KEEP-RUST): another app's `navigate('/')` in a monorepo never
+    /// reaches the Expo app's `/` screen; upstream reads every file.
+    #[test]
+    fn keep_rust_another_apps_navigation_never_reaches_an_expo_screen() {
+        let project = Project::new()
+            .file("package.json", "{\"name\":\"mono\",\"private\":true}\n")
+            .file(
+                "apps/expo/package.json",
+                "{\"name\":\"expo-app\",\"dependencies\":{\"expo-router\":\"3\"}}\n",
+            )
+            .file(
+                "apps/expo/app/index.tsx",
+                "export default function Index() { return null }\n",
+            )
+            .file(
+                "apps/expo/app/settings.tsx",
+                "import { router } from 'expo-router'\nexport default function Settings() {\n  router.replace('/')\n  return null\n}\n",
+            )
+            .file(
+                "apps/web/package.json",
+                "{\"name\":\"web\",\"dependencies\":{\"react-router-dom\":\"6\"}}\n",
+            )
+            .file(
+                "apps/web/src/main.tsx",
+                "import { useNavigate } from 'react-router-dom'\nexport function Nav() {\n  const navigate = useNavigate()\n  navigate('/')\n  return null\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        graph.assert_edge(
+            "function Settings",
+            "navigates",
+            "route apps/expo/app/index.tsx::route:/",
+            Some("framework"),
+        );
+        graph.assert_no_edge(
+            "function Nav",
+            "navigates",
+            "route apps/expo/app/index.tsx::route:/",
+        );
+    }
+
+    /// W7-08 (KEEP-RUST): `app/index.tsx` beside `app/(tabs)/index.tsx`
+    /// serve one path; a call to it is unresolved, while a path one screen
+    /// serves binds.
+    #[test]
+    fn keep_rust_a_path_two_screens_serve_stays_unresolved() {
+        let project = Project::new()
+            .file(
+                "package.json",
+                "{\"name\":\"app\",\"dependencies\":{\"expo-router\":\"4\"}}\n",
+            )
+            .file(
+                "app/index.tsx",
+                "export default function Start() { return null }\n",
+            )
+            .file(
+                "app/(tabs)/index.tsx",
+                "export default function Feed() { return null }\n",
+            )
+            .file(
+                "app/(tabs)/settings.tsx",
+                "export default function Settings() { return null }\n",
+            )
+            .file(
+                "lib/nav.ts",
+                "import { router } from 'expo-router'\nexport function home() {\n  router.push('/')\n}\nexport function settings() {\n  router.push('/settings')\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        graph.assert_edge(
+            "function settings",
+            "navigates",
+            "route app/(tabs)/settings.tsx::route:/settings",
+            Some("framework"),
+        );
+        graph.assert_unresolved("function home", "calls", "router.push");
+    }
+}
+
+mod react_router {
+    use super::support::{Graph, Project};
+
+    /// Every route's name, sorted.
+    fn routes(graph: &Graph) -> Vec<String> {
+        let mut names: Vec<String> = graph
+            .nodes
+            .iter()
+            .filter(|node| node.kind == "route")
+            .map(|node| node.name.clone())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// What each route renders (`->`) and renders inside (`~>`), as
+    /// `route -> name@file`, sorted (upstream's tests' `references` edges of
+    /// a route).
+    fn bindings(graph: &Graph) -> Vec<String> {
+        let mut out: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.kind == "references")
+            .filter_map(|edge| {
+                let route = graph
+                    .node(&edge.source)
+                    .filter(|node| node.kind == "route")?;
+                let target = graph.node(&edge.target)?;
+                let layout = edge.metadata.get("layout").and_then(|v| v.as_bool()) == Some(true);
+                Some(format!(
+                    "{} {} {}@{}",
+                    route.name,
+                    if layout { "~>" } else { "->" },
+                    target.name,
+                    target.file_path
+                ))
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// Every `navigates` edge, as `source -> route (verb href)`, sorted.
+    fn navigations(graph: &Graph) -> Vec<String> {
+        let mut out: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.kind == "navigates")
+            .map(|edge| {
+                let field = |key: &str| {
+                    edge.metadata
+                        .get(key)
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("?")
+                        .to_string()
+                };
+                format!(
+                    "{} -> {} ({} {}) {}",
+                    graph
+                        .node(&edge.source)
+                        .map_or("?", |node| node.name.as_str()),
+                    graph
+                        .node(&edge.target)
+                        .map_or("?", |node| node.name.as_str()),
+                    field("navMethod"),
+                    field("href"),
+                    field("framework"),
+                )
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    fn strings(items: &[&str]) -> Vec<String> {
+        items.iter().map(|item| (*item).to_string()).collect()
+    }
+
+    /// Upstream F4 (`react-router.test.ts`, "a routed app end to end"),
+    /// proshop's shape: a `frontend/` workspace whose routes are in
+    /// `src/App.js`. Every route is bound to its screen; `history.push` and
+    /// `.replace` with a literal, and v6's `navigate()` with a template hole
+    /// reaching the `:id?` route, navigate; a computed destination and an
+    /// array's `push` stay unresolved. (The `<Link to>` half is the link
+    /// pass's.)
+    #[test]
+    fn f4_a_routed_app_binds_its_routes_and_navigations() {
+        let project = Project::new()
+            .file("package.json", "{\"name\":\"shop\",\"private\":true}\n")
+            .file(
+                "frontend/package.json",
+                "{\"name\":\"frontend\",\"dependencies\":{\"react\":\"18\",\"react-router-dom\":\"5\"}}\n",
+            )
+            .file(
+                "frontend/src/App.js",
+                "import { BrowserRouter as Router, Route } from 'react-router-dom'\nimport LoginScreen from './screens/LoginScreen'\nimport ShippingScreen from './screens/ShippingScreen'\nimport PaymentScreen from './screens/PaymentScreen'\nimport PlaceOrderScreen from './screens/PlaceOrderScreen'\nimport ProductScreen from './screens/ProductScreen'\nimport CartScreen from './screens/CartScreen'\nconst App = () => (\n  <Router>\n    <Route path='/login' component={LoginScreen} />\n    <Route path='/shipping' component={ShippingScreen} />\n    <Route path='/payment' component={PaymentScreen} />\n    <Route path='/placeorder' component={PlaceOrderScreen} />\n    <Route path='/product/:id' component={ProductScreen} />\n    <Route path='/cart/:id?' component={CartScreen} />\n  </Router>\n)\nexport default App\n",
+            )
+            .file(
+                "frontend/src/screens/PaymentScreen.js",
+                "import React, { useState } from 'react'\nconst PaymentScreen = ({ history }) => {\n  const cart = useSelector((state) => state.cart)\n  if (!cart.shippingAddress.address) {\n    history.push('/shipping')\n  }\n  const submitHandler = (e) => {\n    e.preventDefault()\n    history.push('/placeorder')\n  }\n  return <form onSubmit={submitHandler} />\n}\nexport default PaymentScreen\n",
+            )
+            .file(
+                "frontend/src/screens/LoginScreen.js",
+                "import React, { useEffect } from 'react'\nconst LoginScreen = ({ location, history, userInfo }) => {\n  const redirect = location.search ? location.search.split('=')[1] : '/'\n  useEffect(() => {\n    if (userInfo) {\n      history.push(redirect)\n    }\n  }, [history, userInfo, redirect])\n  return null\n}\nexport default LoginScreen\n",
+            )
+            .file(
+                "frontend/src/screens/ShippingScreen.js",
+                "import React from 'react'\nconst ShippingScreen = ({ history }) => {\n  const submitHandler = () => {\n    history.replace('/payment')\n  }\n  return <form onSubmit={submitHandler} />\n}\nexport default ShippingScreen\n",
+            )
+            .file(
+                "frontend/src/screens/PlaceOrderScreen.js",
+                "import React from 'react'\nconst PlaceOrderScreen = () => <div>Order</div>\nexport default PlaceOrderScreen\n",
+            )
+            .file(
+                "frontend/src/screens/ProductScreen.js",
+                "import React from 'react'\nimport { useNavigate } from 'react-router-dom'\nconst ProductScreen = ({ match }) => {\n  const navigate = useNavigate()\n  const addToCart = () => {\n    navigate(`/cart/${match.params.id}`)\n  }\n  return <button onClick={addToCart}>Add</button>\n}\nexport default ProductScreen\n",
+            )
+            .file(
+                "frontend/src/screens/CartScreen.js",
+                "import React from 'react'\nconst CartScreen = () => <div>Cart</div>\nexport default CartScreen\n",
+            )
+            .file(
+                "frontend/src/utils/breadcrumbs.js",
+                "export const trail = () => {\n  const paths = []\n  paths.push('/placeorder')\n  return paths\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        let report = graph.report();
+        assert_eq!(
+            routes(graph),
+            [
+                "/cart/:id?",
+                "/login",
+                "/payment",
+                "/placeorder",
+                "/product/:id",
+                "/shipping"
+            ],
+            "{report}"
+        );
+        assert_eq!(
+            bindings(graph),
+            strings(&[
+                "/cart/:id? -> CartScreen@frontend/src/screens/CartScreen.js",
+                "/login -> LoginScreen@frontend/src/screens/LoginScreen.js",
+                "/payment -> PaymentScreen@frontend/src/screens/PaymentScreen.js",
+                "/placeorder -> PlaceOrderScreen@frontend/src/screens/PlaceOrderScreen.js",
+                "/product/:id -> ProductScreen@frontend/src/screens/ProductScreen.js",
+                "/shipping -> ShippingScreen@frontend/src/screens/ShippingScreen.js",
+            ]),
+            "{report}"
+        );
+        assert_eq!(
+            navigations(graph),
+            strings(&[
+                "PaymentScreen -> /shipping (push /shipping) react-router",
+                "addToCart -> /cart/:id? (navigate /cart/${…}) react-router",
+                "submitHandler -> /payment (replace /payment) react-router",
+                "submitHandler -> /placeorder (push /placeorder) react-router",
+            ]),
+            "{report}"
+        );
+        graph.assert_unresolved("function LoginScreen", "calls", "history.push");
+        graph.assert_unresolved("function trail", "calls", "paths.push");
+    }
+
+    /// Upstream "the shapes proshop is written in": a destination whose other
+    /// arm is computed still names where it goes.
+    #[test]
+    fn f4_a_local_destination_navigates_to_its_static_arm() {
+        let project = Project::new()
+            .file(
+                "package.json",
+                "{\"name\":\"shop\",\"dependencies\":{\"react\":\"18\",\"react-router-dom\":\"5\"}}\n",
+            )
+            .file(
+                "src/App.js",
+                "import { BrowserRouter as Router, Route } from 'react-router-dom'\nimport HomeScreen from './screens/HomeScreen'\nimport LoginScreen from './screens/LoginScreen'\nconst App = () => (\n  <Router>\n    <Route path='/' component={HomeScreen} exact />\n    <Route path='/login' component={LoginScreen} />\n  </Router>\n)\nexport default App\n",
+            )
+            .file(
+                "src/screens/HomeScreen.js",
+                "const HomeScreen = () => null\nexport default HomeScreen\n",
+            )
+            .file(
+                "src/screens/LoginScreen.js",
+                "import React, { useEffect } from 'react'\nconst LoginScreen = ({ location, history, userInfo }) => {\n  const redirect = location.search ? location.search.split('=')[1] : '/'\n  useEffect(() => {\n    if (userInfo) {\n      history.push(redirect)\n    }\n  }, [history, userInfo, redirect])\n  return null\n}\nexport default LoginScreen\n",
+            )
+            .index();
+        let graph = project.graph();
+        assert_eq!(
+            navigations(graph),
+            ["LoginScreen -> / (push /) react-router"],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// The `navigates` edges [`navigations`] lists out of the nodes named
+    /// `name`.
+    fn navigations_from(graph: &Graph, name: &str) -> Vec<String> {
+        let prefix = format!("{name} -> ");
+        navigations(graph)
+            .into_iter()
+            .filter(|line| line.starts_with(&prefix))
+            .collect()
+    }
+
+    /// Upstream F4 (`react-router.test.ts`, "a routed app end to end"), the
+    /// link half (W7-18a): `LoginScreen`'s `<Link to>`, and `CheckoutSteps`'
+    /// `<LinkContainer to>` and `<NavLink to>`, navigate from the component
+    /// that renders them, `/cart` reaching `/cart/:id?`; the external `<a
+    /// href>` draws none, the computed `history.push(redirect)` stays
+    /// unresolved, and an array's `push` is never claimed.
+    #[test]
+    fn w718a_link_navlink_and_link_container_navigate_from_their_component() {
+        let project = Project::new()
+            .file("package.json", "{\"name\":\"shop\",\"private\":true}\n")
+            .file(
+                "frontend/package.json",
+                "{\"name\":\"frontend\",\"dependencies\":{\"react\":\"18\",\"react-router-dom\":\"5\",\"react-router-bootstrap\":\"0.26\"}}\n",
+            )
+            .file(
+                "frontend/src/App.js",
+                "import { BrowserRouter as Router, Route } from 'react-router-dom'\nimport LoginScreen from './screens/LoginScreen'\nimport ShippingScreen from './screens/ShippingScreen'\nimport PaymentScreen from './screens/PaymentScreen'\nimport PlaceOrderScreen from './screens/PlaceOrderScreen'\nimport ProductScreen from './screens/ProductScreen'\nimport CartScreen from './screens/CartScreen'\nconst App = () => (\n  <Router>\n    <Route path='/login' component={LoginScreen} />\n    <Route path='/shipping' component={ShippingScreen} />\n    <Route path='/payment' component={PaymentScreen} />\n    <Route path='/placeorder' component={PlaceOrderScreen} />\n    <Route path='/product/:id' component={ProductScreen} />\n    <Route path='/cart/:id?' component={CartScreen} />\n  </Router>\n)\nexport default App\n",
+            )
+            .file(
+                "frontend/src/screens/PaymentScreen.js",
+                "import React, { useState } from 'react'\nimport { useDispatch, useSelector } from 'react-redux'\nimport CheckoutSteps from '../components/CheckoutSteps'\nimport { savePaymentMethod } from '../actions/cartActions'\nconst PaymentScreen = ({ history }) => {\n  const cart = useSelector((state) => state.cart)\n  const { shippingAddress } = cart\n  if (!shippingAddress.address) {\n    history.push('/shipping')\n  }\n  const [paymentMethod, setPaymentMethod] = useState('PayPal')\n  const dispatch = useDispatch()\n  const submitHandler = (e) => {\n    e.preventDefault()\n    dispatch(savePaymentMethod(paymentMethod))\n    history.push('/placeorder')\n  }\n  return <form onSubmit={submitHandler}><CheckoutSteps step1 step2 step3 /></form>\n}\nexport default PaymentScreen\n",
+            )
+            .file(
+                "frontend/src/screens/LoginScreen.js",
+                "import React, { useEffect } from 'react'\nimport { Link } from 'react-router-dom'\nconst LoginScreen = ({ location, history, userInfo }) => {\n  const redirect = location.search ? location.search.split('=')[1] : '/'\n  useEffect(() => {\n    if (userInfo) {\n      history.push(redirect)\n    }\n  }, [history, userInfo, redirect])\n  return <Link to='/shipping'>Continue</Link>\n}\nexport default LoginScreen\n",
+            )
+            .file(
+                "frontend/src/screens/ShippingScreen.js",
+                "import React from 'react'\nconst ShippingScreen = ({ history }) => {\n  const submitHandler = () => {\n    history.replace('/payment')\n  }\n  return <form onSubmit={submitHandler} />\n}\nexport default ShippingScreen\n",
+            )
+            .file(
+                "frontend/src/screens/PlaceOrderScreen.js",
+                "import React from 'react'\nconst PlaceOrderScreen = () => <div>Order</div>\nexport default PlaceOrderScreen\n",
+            )
+            .file(
+                "frontend/src/screens/ProductScreen.js",
+                "import React from 'react'\nimport { useNavigate } from 'react-router-dom'\nconst ProductScreen = ({ match }) => {\n  const navigate = useNavigate()\n  const addToCart = () => {\n    navigate(`/cart/${match.params.id}`)\n  }\n  return <button onClick={addToCart}>Add</button>\n}\nexport default ProductScreen\n",
+            )
+            .file(
+                "frontend/src/screens/CartScreen.js",
+                "import React from 'react'\nconst CartScreen = () => <div>Cart</div>\nexport default CartScreen\n",
+            )
+            .file(
+                "frontend/src/components/CheckoutSteps.js",
+                "import React from 'react'\nimport { NavLink } from 'react-router-dom'\nimport { LinkContainer } from 'react-router-bootstrap'\nconst CheckoutSteps = ({ step1, step2 }) => (\n  <nav>\n    <LinkContainer to='/cart'><span>Cart</span></LinkContainer>\n    {step1 ? <LinkContainer to='/login'><span>Sign In</span></LinkContainer> : null}\n    {step2 ? <NavLink to='/placeorder'>Place Order</NavLink> : null}\n    <a href='https://example.com'>Elsewhere</a>\n  </nav>\n)\nexport default CheckoutSteps\n",
+            )
+            .file(
+                "frontend/src/actions/cartActions.js",
+                "export const savePaymentMethod = (data) => (dispatch) => {\n  dispatch({ type: 'CART_SAVE_PAYMENT_METHOD', payload: data })\n  localStorage.setItem('paymentMethod', JSON.stringify(data))\n}\n",
+            )
+            .file(
+                "frontend/src/utils/breadcrumbs.js",
+                "export const trail = () => {\n  const paths = []\n  paths.push('/placeorder')\n  return paths\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        let report = graph.report();
+        assert_eq!(
+            navigations_from(graph, "LoginScreen"),
+            ["LoginScreen -> /shipping (link /shipping) ?"],
+            "{report}"
+        );
+        let link = graph.edges_matching(
+            "function LoginScreen",
+            "navigates",
+            "route frontend/src/App.js::route:/shipping",
+        );
+        assert_eq!(link.len(), 1, "{report}");
+        assert_eq!(link[0].provenance.as_deref(), Some("heuristic"));
+        assert_eq!(link[0].metadata["synthesizedBy"], "react-router-link");
+        assert_eq!(
+            navigations_from(graph, "CheckoutSteps"),
+            [
+                "CheckoutSteps -> /cart/:id? (link /cart) ?",
+                "CheckoutSteps -> /login (link /login) ?",
+                "CheckoutSteps -> /placeorder (link /placeorder) ?",
+            ],
+            "{report}"
+        );
+        graph.assert_unresolved("function LoginScreen", "calls", "history.push");
+        assert!(navigations_from(graph, "trail").is_empty(), "{report}");
+    }
+
+    /// Upstream "the shapes proshop is written in", the link half (W7-18a):
+    /// a `to={cond ? … : …}` is read with a navigation call's reader, both
+    /// arms naming `/register` and the edge keeping the arm as written; the
+    /// three-way choice draws all three routes, each edge with the arm it
+    /// took; a template hole reaches the `:id` route. `history.push(redirect)`
+    /// reaches `/` through the resolver, its literal arm.
+    #[test]
+    fn w718a_a_link_destination_written_as_a_choice_draws_each_arm() {
+        let project = Project::new()
+            .file(
+                "package.json",
+                "{\"name\":\"shop\",\"dependencies\":{\"react\":\"18\",\"react-router-dom\":\"5\"}}\n",
+            )
+            .file(
+                "src/App.js",
+                "import { BrowserRouter as Router, Route } from 'react-router-dom'\nimport HomeScreen from './screens/HomeScreen'\nimport LoginScreen from './screens/LoginScreen'\nimport RegisterScreen from './screens/RegisterScreen'\nimport ProductScreen from './screens/ProductScreen'\nconst App = () => (\n  <Router>\n    <Route path='/search/:keyword' component={HomeScreen} exact />\n    <Route path='/page/:pageNumber' component={HomeScreen} exact />\n    <Route path='/' component={HomeScreen} exact />\n    <Route path='/login' component={LoginScreen} />\n    <Route path='/register' component={RegisterScreen} />\n    <Route path='/product/:id' component={ProductScreen} />\n  </Router>\n)\nexport default App\n",
+            )
+            .file(
+                "src/screens/HomeScreen.js",
+                "import React from 'react'\nimport { Link } from 'react-router-dom'\nconst HomeScreen = ({ match }) => {\n  const keyword = match.params.keyword\n  return <Link to={`/product/${keyword}`}>A product</Link>\n}\nexport default HomeScreen\n",
+            )
+            .file(
+                "src/screens/LoginScreen.js",
+                "import React, { useEffect } from 'react'\nimport { Link } from 'react-router-dom'\nconst LoginScreen = ({ location, history, userInfo }) => {\n  const redirect = location.search ? location.search.split('=')[1] : '/'\n  useEffect(() => {\n    if (userInfo) {\n      history.push(redirect)\n    }\n  }, [history, userInfo, redirect])\n  return (\n    <Link to={redirect ? `/register?redirect=${redirect}` : '/register'}>Register</Link>\n  )\n}\nexport default LoginScreen\n",
+            )
+            .file(
+                "src/screens/RegisterScreen.js",
+                "import React from 'react'\nconst RegisterScreen = () => <div>Register</div>\nexport default RegisterScreen\n",
+            )
+            .file(
+                "src/components/Paginate.js",
+                "import React from 'react'\nimport { Link } from 'react-router-dom'\nconst Paginate = ({ isAdmin, keyword, x }) => (\n  <Link\n    to={\n      !isAdmin\n        ? keyword\n          ? `/search/${keyword}`\n          : `/page/${x}`\n        : '/register'\n    }\n  >\n    {x}\n  </Link>\n)\nexport default Paginate\n",
+            )
+            .file(
+                "src/screens/ProductScreen.js",
+                "import React from 'react'\nconst ProductScreen = () => <div>Product</div>\nexport default ProductScreen\n",
+            )
+            .index();
+        let graph = project.graph();
+        assert_eq!(
+            navigations(graph),
+            strings(&[
+                "HomeScreen -> /product/:id (link /product/${…}) ?",
+                "LoginScreen -> / (push /) react-router",
+                "LoginScreen -> /register (link /register?redirect=${…}) ?",
+                "Paginate -> /page/:pageNumber (link /page/${…}) ?",
+                "Paginate -> /register (link /register) ?",
+                "Paginate -> /search/:keyword (link /search/${…}) ?",
+            ]),
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream "v5 redirects and styled link wrappers" (#2132, W7-18a): a
+    /// `styled(Link)` default export imported under another name, and a
+    /// `styled(NavLink)` declared in the file, are links; v5's `<Redirect
+    /// to>` in a guard navigates with `navMethod` `redirect`.
+    #[test]
+    fn w718a_pr2132_v5_redirects_and_styled_link_wrappers_navigate() {
+        let project = Project::new()
+            .file(
+                "package.json",
+                "{\"name\":\"app\",\"dependencies\":{\"react\":\"*\",\"react-router-dom\":\"^5.0.0\",\"styled-components\":\"*\"}}\n",
+            )
+            .file(
+                "app/components/Header/HeaderLink.js",
+                "import { Link } from 'react-router-dom';\nimport styled from 'styled-components';\n\nexport default styled(Link)`\n  color: #41addd;\n`;\n",
+            )
+            .file(
+                "app/components/Header/index.js",
+                "import React from 'react';\nimport HeaderLink from './HeaderLink';\n\nexport default function Header() {\n  return (\n    <nav>\n      <HeaderLink to=\"/\">Home</HeaderLink>\n      <HeaderLink to=\"/features\">Features</HeaderLink>\n    </nav>\n  );\n}\n",
+            )
+            .file(
+                "app/components/Nav.js",
+                "import React from 'react';\nimport { NavLink } from 'react-router-dom';\nimport styled from 'styled-components';\n\nconst MenuLink = styled(NavLink)`\n  padding: 4px;\n`;\n\nexport default function Nav() {\n  return <MenuLink to=\"/features\">Features</MenuLink>;\n}\n",
+            )
+            .file(
+                "app/router/PrivateRoute.js",
+                "import React from 'react';\nimport { Route, Redirect } from 'react-router-dom';\n\nexport default function PrivateRoute({ component: Component, ...rest }) {\n  return <Route {...rest} render={(props) => (rest.isAuthenticated ? <Component {...props} /> : <Redirect to=\"/\" />)} />;\n}\n",
+            )
+            .file(
+                "app/containers/App.js",
+                "import React from 'react';\nimport { Switch, Route } from 'react-router-dom';\nimport HomePage from './HomePage';\nimport FeaturePage from './FeaturePage';\n\nexport default function App() {\n  return (\n    <Switch>\n      <Route exact path=\"/\" component={HomePage} />\n      <Route path=\"/features\" component={FeaturePage} />\n    </Switch>\n  );\n}\n",
+            )
+            .file(
+                "app/containers/HomePage.js",
+                "import React from 'react';\nexport default function HomePage() { return <h1>Home</h1>; }\n",
+            )
+            .file(
+                "app/containers/FeaturePage.js",
+                "import React from 'react';\nexport default function FeaturePage() { return <h1>Features</h1>; }\n",
+            )
+            .index();
+        let graph = project.graph();
+        assert_eq!(
+            navigations(graph),
+            strings(&[
+                "Header -> / (link /) ?",
+                "Header -> /features (link /features) ?",
+                "Nav -> /features (link /features) ?",
+                "PrivateRoute -> / (redirect /) ?",
+            ]),
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream `react-router-config-href.test.ts`, the link's half (#2187,
+    /// W7-18a): `<Link to={paths.app.discussion.getHref(d.id)}>` reads the
+    /// href the route-config helper returns, past an arrow attribute before
+    /// `to`, its whole-segment `${id}` a parameter. The constants come
+    /// through the project's `@/*` alias.
+    #[test]
+    fn w718a_pr2187_a_link_reads_a_route_config_href() {
+        let project = Project::new()
+            .file(
+                "package.json",
+                "{\"name\":\"web\",\"dependencies\":{\"react\":\"^18\",\"react-router\":\"^7\"}}\n",
+            )
+            .file(
+                "tsconfig.json",
+                "{\"compilerOptions\":{\"baseUrl\":\".\",\"paths\":{\"@/*\":[\"./src/*\"]}}}\n",
+            )
+            .file(
+                "src/config/paths.ts",
+                "export const paths = {\n  auth: {\n    login: {\n      path: '/auth/login',\n      getHref: (redirectTo?: string | null | undefined) =>\n        `/auth/login${redirectTo ? `?redirectTo=${encodeURIComponent(redirectTo)}` : ''}`,\n    },\n  },\n  app: {\n    root: { path: '/app', getHref: () => '/app' },\n    discussions: { path: 'discussions', getHref: () => '/app/discussions' },\n    discussion: {\n      path: 'discussions/:discussionId',\n      getHref: (id: string) => `/app/discussions/${id}`,\n    },\n  },\n} as const;\n",
+            )
+            .file(
+                "src/app/router.tsx",
+                "import { createBrowserRouter } from 'react-router';\nimport { paths } from '@/config/paths';\n\nexport const router = createBrowserRouter([\n  { path: paths.auth.login.path, lazy: () => import('./routes/auth/login') },\n  {\n    path: paths.app.root.path,\n    lazy: () => import('./routes/app/root'),\n    children: [\n      { path: paths.app.discussions.path, lazy: () => import('./routes/app/discussions') },\n      { path: paths.app.discussion.path, lazy: () => import('./routes/app/discussion') },\n    ],\n  },\n]);\n",
+            )
+            .file(
+                "src/app/routes/auth/login.tsx",
+                "export default function LoginRoute() { return null; }\n",
+            )
+            .file(
+                "src/app/routes/app/root.tsx",
+                "export default function AppRoot() { return null; }\n",
+            )
+            .file(
+                "src/app/routes/app/discussions.tsx",
+                "export default function DiscussionsRoute() { return null; }\n",
+            )
+            .file(
+                "src/app/routes/app/discussion.tsx",
+                "export default function DiscussionRoute() { return null; }\n",
+            )
+            .file(
+                "src/features/discussions/discussions-list.tsx",
+                "import { Link } from 'react-router';\nimport { paths } from '@/config/paths';\n\nexport function DiscussionsList({ items, prefetch }: { items: { id: string }[]; prefetch: (id: string) => void }) {\n  return items.map((d) => (\n    <Link onMouseEnter={() => prefetch(d.id)} to={paths.app.discussion.getHref(d.id)}>\n      open\n    </Link>\n  ));\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        assert_eq!(
+            navigations_from(graph, "DiscussionsList"),
+            ["DiscussionsList -> /app/discussions/:discussionId (link /app/discussions/${…}) ?"],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// W7-18a, the link pass's import resolution through the store's
+    /// configuration loaders: a route-config object imported through a
+    /// `tsconfig.json` alias the fallback prefixes do not cover; a nearer
+    /// app's `tsconfig.json` mapping the same alias elsewhere decides for
+    /// the app's files; and a workspace package's `styled(Link)`, imported
+    /// by the package's name, is a link.
+    #[test]
+    fn w718a_a_link_reads_aliases_and_workspace_packages_as_resolution_does() {
+        let project = Project::new()
+            .file(
+                "package.json",
+                "{\"name\":\"mono\",\"private\":true,\"workspaces\":[\"packages/*\",\"apps/*\"],\"dependencies\":{\"react\":\"^18\",\"react-router-dom\":\"^6\",\"styled-components\":\"*\"}}\n",
+            )
+            .file(
+                "tsconfig.json",
+                "{\"compilerOptions\":{\"baseUrl\":\".\",\"paths\":{\"@config/*\":[\"./shared/config/*\"]}}}\n",
+            )
+            .file(
+                "shared/config/paths.ts",
+                "export const paths = {\n  home: { getHref: () => '/decoy' },\n} as const;\n",
+            )
+            .file(
+                "packages/ui/package.json",
+                "{\"name\":\"@acme/ui\",\"dependencies\":{\"react-router-dom\":\"^6\"}}\n",
+            )
+            .file(
+                "packages/ui/index.tsx",
+                "import { Link } from 'react-router-dom';\nimport styled from 'styled-components';\n\nexport const AppLink = styled(Link)`\n  color: red;\n`;\n",
+            )
+            .file(
+                "apps/web/package.json",
+                "{\"name\":\"web\",\"dependencies\":{\"react\":\"^18\",\"react-router-dom\":\"^6\",\"@acme/ui\":\"*\"}}\n",
+            )
+            .file(
+                "apps/web/tsconfig.json",
+                "{\"compilerOptions\":{\"baseUrl\":\".\",\"paths\":{\"@config/*\":[\"./src/config/*\"]}}}\n",
+            )
+            .file(
+                "apps/web/src/config/paths.ts",
+                "export const paths = {\n  home: { getHref: () => '/real' },\n  about: { getHref: () => '/about' },\n} as const;\n",
+            )
+            .file(
+                "apps/web/src/App.tsx",
+                "import { Routes, Route } from 'react-router-dom';\nimport { Real, Decoy, About } from './pages';\nexport function App() {\n  return (\n    <Routes>\n      <Route path=\"/real\" element={<Real />} />\n      <Route path=\"/decoy\" element={<Decoy />} />\n      <Route path=\"/about\" element={<About />} />\n    </Routes>\n  );\n}\n",
+            )
+            .file(
+                "apps/web/src/pages.tsx",
+                "export function Real() { return null; }\nexport function Decoy() { return null; }\nexport function About() { return null; }\n",
+            )
+            .file(
+                "apps/web/src/Nav.tsx",
+                "import { Link } from 'react-router-dom';\nimport { AppLink } from '@acme/ui';\nimport { paths } from '@config/paths';\nexport function Nav() {\n  return (\n    <nav>\n      <Link to={paths.home.getHref()}>Home</Link>\n      <AppLink to=\"/about\">About</AppLink>\n    </nav>\n  );\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        assert_eq!(
+            navigations_from(graph, "Nav"),
+            [
+                "Nav -> /about (link /about) ?",
+                "Nav -> /real (link /real) ?",
+            ],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream "route declaration boundaries (#1348)" through the whole
+    /// pipeline: each route's references bind the components its own file
+    /// declares, in a `.tsx` file and in a `.ts` data router.
+    #[test]
+    fn pr1348_a_route_binds_only_its_own_declaration() {
+        let project = Project::new()
+            .file("package.json", "{\"dependencies\":{\"react\":\"18\"}}\n")
+            .file(
+                "App.tsx",
+                "import { Routes, Route } from 'react-router-dom';\nfunction DashboardHome() { return null; }\nfunction Settings() { return null; }\nfunction Shell() { return null; }\nconst comparison = count<limit;\nconst fake = '<Route path=\"/fake\" element={<DashboardHome/>}/>';\nexport function App() {\n  return <Routes>\n    <Route path=\"/dashboard\">\n      <Route index element={<DashboardHome/>}/>\n      <Route path=\"settings\" element={<Settings/>}/>\n    </Route>\n    <Route path=\"/empty\"></Route>\n    <Route element={<Settings/>} path=\"/sibling\"/>\n    <Route element={<Shell title=\"a > b\"><Settings path=\"/nested\"/></Shell>} path=\"/long\"/>\n    <Route path=\"/no-element\" handle={{ element: <DashboardHome/> }}/>\n    <Route component={Settings} path=\"/legacy\"/>\n  </Routes>;\n}\n",
+            )
+            .file(
+                "data.ts",
+                "import { createBrowserRouter } from 'react-router-dom';\nfunction DataIndex() { return null; }\nfunction DataSettings() { return null; }\nconst routes = createBrowserRouter([\n  { path: '/data', children: [\n    { index: true, Component: DataIndex },\n    { Component: DataSettings, path: 'prefs' }\n  ] },\n  { path: '/metadata', handle: { Component: DataIndex } },\n  { path: '', Component: DataSettings }\n]);\n",
+            )
+            .index();
+        let graph = project.graph();
+        let report = graph.report();
+        assert_eq!(
+            routes(graph),
+            [
+                "/",
+                "/dashboard",
+                "/dashboard/settings",
+                "/data",
+                "/data/prefs",
+                "/empty",
+                "/legacy",
+                "/long",
+                "/no-element",
+                "/sibling"
+            ],
+            "{report}"
+        );
+        assert_eq!(
+            bindings(graph),
+            strings(&[
+                "/ -> DataSettings@data.ts",
+                "/dashboard -> DashboardHome@App.tsx",
+                "/dashboard/settings -> Settings@App.tsx",
+                "/data -> DataIndex@data.ts",
+                "/data/prefs -> DataSettings@data.ts",
+                "/legacy -> Settings@App.tsx",
+                "/long -> Shell@App.tsx",
+                "/sibling -> Settings@App.tsx",
+            ]),
+            "{report}"
+        );
+        // The language React gives its routes: tsx in a `.tsx` file, jsx in
+        // the `.ts` router.
+        for (name, language) in [("/dashboard", "tsx"), ("/data", "jsx")] {
+            let route = graph
+                .nodes
+                .iter()
+                .find(|node| node.kind == "route" && node.name == name)
+                .expect("route");
+            assert_eq!(route.language, language, "{name}");
+        }
+    }
+
+    /// Upstream `react-router-nested-lazy.test.ts` (bulletproof-react's
+    /// shape): a child path is relative to its parent's, `lazy: () =>
+    /// import('./routes/x')` renders the module's default export, a path read
+    /// from a constant through an app's own tsconfig alias names the route,
+    /// and a child renders inside its parent's component.
+    #[test]
+    fn pr2165_nested_lazy_routes_named_by_constants() {
+        let project = Project::new()
+            .file("package.json", "{\"name\":\"mono\",\"private\":true}\n")
+            .file(
+                "apps/web/package.json",
+                "{\"name\":\"web\",\"dependencies\":{\"react\":\"^18\",\"react-router\":\"^7\"}}\n",
+            )
+            .file(
+                "apps/web/tsconfig.json",
+                "{\"compilerOptions\":{\"baseUrl\":\".\",\"paths\":{\"@/*\":[\"./src/*\"]}}}\n",
+            )
+            .file(
+                "apps/web/src/config/paths.ts",
+                "export const paths = {\n  home: { path: '/', getHref: () => '/' },\n  app: {\n    root: { path: '/app', getHref: () => '/app' },\n    discussions: { path: 'discussions', getHref: () => '/app/discussions' },\n  },\n} as const;\n",
+            )
+            .file(
+                "apps/web/src/app/router.tsx",
+                "import { createBrowserRouter } from 'react-router';\nimport { paths } from '@/config/paths';\nimport { ProtectedRoute } from '@/lib/auth';\nimport AppRoot from './routes/app/root';\n\nexport const router = createBrowserRouter([\n  { path: paths.home.path, lazy: () => import('./routes/landing') },\n  {\n    path: paths.app.root.path,\n    element: (\n      <ProtectedRoute>\n        <AppRoot />\n      </ProtectedRoute>\n    ),\n    children: [\n      { path: paths.app.discussions.path, lazy: () => import('./routes/app/discussions') },\n      { path: 'settings', element: <Settings /> },\n    ],\n  },\n]);\n",
+            )
+            .file(
+                "apps/web/src/lib/auth.tsx",
+                "export function ProtectedRoute({ children }: { children: unknown }) { return children; }\n",
+            )
+            .file(
+                "apps/web/src/app/routes/landing.tsx",
+                "const LandingRoute = () => null;\nexport default LandingRoute;\n",
+            )
+            .file(
+                "apps/web/src/app/routes/app/root.tsx",
+                "export default function AppRoot() { return null; }\n",
+            )
+            .file(
+                "apps/web/src/app/routes/app/discussions.tsx",
+                "export default function DiscussionsRoute() { return null; }\n",
+            )
+            .index();
+        let graph = project.graph();
+        let report = graph.report();
+        assert_eq!(
+            routes(graph),
+            ["/", "/app", "/app/discussions", "/app/settings"],
+            "{report}"
+        );
+        assert_eq!(
+            bindings(graph),
+            strings(&[
+                "/ -> LandingRoute@apps/web/src/app/routes/landing.tsx",
+                "/app -> AppRoot@apps/web/src/app/routes/app/root.tsx",
+                "/app/discussions -> DiscussionsRoute@apps/web/src/app/routes/app/discussions.tsx",
+                "/app/discussions ~> AppRoot@apps/web/src/app/routes/app/root.tsx",
+                "/app/settings ~> AppRoot@apps/web/src/app/routes/app/root.tsx",
+            ]),
+            "{report}"
+        );
+        // The route keeps the id it was extracted with.
+        assert!(
+            graph
+                .nodes
+                .iter()
+                .any(|node| node.name == "/app/discussions"
+                    && node.id
+                        == "route:apps/web/src/app/router.tsx:16:/{paths.app.root.path}/{paths.app.discussions.path}"),
+            "{report}"
+        );
+    }
+
+    /// Upstream `react-router-config-href.test.ts`, the call's half (#2187):
+    /// `navigate(paths.auth.login.getHref(…))` reads the href the
+    /// route-config helper returns, dropping a query glued onto the path —
+    /// against a route the same constants name, named before any call
+    /// resolves.
+    #[test]
+    fn pr2187_a_navigation_reads_a_route_config_href() {
+        let project = Project::new()
+            .file(
+                "package.json",
+                "{\"name\":\"web\",\"dependencies\":{\"react\":\"^18\",\"react-router\":\"^7\"}}\n",
+            )
+            .file(
+                "tsconfig.json",
+                "{\"compilerOptions\":{\"baseUrl\":\".\",\"paths\":{\"@/*\":[\"./src/*\"]}}}\n",
+            )
+            .file(
+                "src/config/paths.ts",
+                "export const paths = {\n  auth: {\n    login: {\n      path: '/auth/login',\n      getHref: (redirectTo?: string | null | undefined) =>\n        `/auth/login${redirectTo ? `?redirectTo=${encodeURIComponent(redirectTo)}` : ''}`,\n    },\n  },\n  app: {\n    root: { path: '/app', getHref: () => '/app' },\n    discussion: {\n      path: 'discussions/:discussionId',\n      getHref: (id: string) => `/app/discussions/${id}`,\n    },\n  },\n} as const;\n",
+            )
+            .file(
+                "src/app/router.tsx",
+                "import { createBrowserRouter } from 'react-router';\nimport { paths } from '@/config/paths';\n\nexport const router = createBrowserRouter([\n  { path: paths.auth.login.path, lazy: () => import('./routes/auth/login') },\n  {\n    path: paths.app.root.path,\n    lazy: () => import('./routes/app/root'),\n    children: [\n      { path: paths.app.discussion.path, lazy: () => import('./routes/app/discussion') },\n    ],\n  },\n]);\n",
+            )
+            .file(
+                "src/app/routes/auth/login.tsx",
+                "export default function LoginRoute() { return null; }\n",
+            )
+            .file(
+                "src/app/routes/app/root.tsx",
+                "export default function AppRoot() { return null; }\n",
+            )
+            .file(
+                "src/app/routes/app/discussion.tsx",
+                "export default function DiscussionRoute() { return null; }\n",
+            )
+            .file(
+                "src/lib/auth.tsx",
+                "import { useNavigate } from 'react-router';\nimport { paths } from '@/config/paths';\n\nexport function Logout() {\n  const navigate = useNavigate();\n  return <button onClick={() => navigate(paths.auth.login.getHref(location.pathname))}>out</button>;\n}\nexport function Open({ id }: { id: string }) {\n  const navigate = useNavigate();\n  navigate(paths.app.discussion.getHref(id));\n  return null;\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        assert_eq!(
+            navigations(graph),
+            [
+                "Logout -> /auth/login (navigate /auth/login) react-router",
+                "Open -> /app/discussions/:discussionId (navigate /app/discussions/${…}) react-router",
+            ],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream `react-router-lazy-barrel.test.ts`, the index half: a lazily
+    /// loaded module that is a barrel renders what it forwards — `export *`,
+    /// a barrel of barrels, a named re-export, a forwarded default, an
+    /// export clause, a held binding, a memoized export's component, the
+    /// default a `React.lazy` value loads (#2480) — and nothing a barrel
+    /// does not forward.
+    #[test]
+    fn pr2400_a_lazy_route_module_renders_what_its_barrel_forwards() {
+        let project = Project::new()
+            .file(
+                "package.json",
+                "{\"name\":\"ui\",\"private\":true,\"dependencies\":{\"react\":\"^18\",\"react-router\":\"^7\"}}\n",
+            )
+            .file(
+                "tsconfig.json",
+                "{\"compilerOptions\":{\"baseUrl\":\".\",\"paths\":{\"@/*\":[\"./src/*\"]}}}\n",
+            )
+            .file(
+                "src/router.tsx",
+                "import { lazy } from 'react';\nimport { createBrowserRouter } from 'react-router';\n\nconst Settings = lazy(() => import('@/settings'));\n\nexport const router = createBrowserRouter([\n  {\n    path: '/builds/:id',\n    lazy: () => import('@/builds/build_page'),\n    children: [{ path: 'overview', lazy: () => import('@/builds/build_page/overview_tab') }],\n  },\n  { path: '/builders', lazy: () => import('@/builds/pages') },\n  { path: '/fleet', lazy: () => import('@/fleet/home_page') },\n  { path: '/login', lazy: () => import('@/auth/login_page') },\n  { path: '/graph', lazy: () => import('@/chronicle/graph_view') },\n  { path: '/media', lazy: () => import('@/media/media_page') },\n  { path: '/settings', element: <Settings /> },\n  { path: '/redirect', lazy: () => import('@/core/redirection_loader') },\n  { path: '/clash', lazy: () => import('@/clash') },\n  { path: '/loop', lazy: () => import('@/loop/a') },\n  { path: '/no-default', lazy: () => import('@/legacy') },\n]);\n",
+            )
+            .file("src/builds/build_page/index.ts", "export * from './build_page';\n")
+            .file(
+                "src/builds/build_page/build_page.tsx",
+                "export const BuildPage = () => null;\n\nexport function Component() {\n  return <BuildPage />;\n}\n",
+            )
+            .file(
+                "src/builds/build_page/overview_tab/index.ts",
+                "export * from './overview_tab';\n",
+            )
+            .file(
+                "src/builds/build_page/overview_tab/overview_tab.tsx",
+                "export function Component() {\n  return null;\n}\n",
+            )
+            .file("src/builds/pages/index.ts", "export * from './builder_list_page';\n")
+            .file(
+                "src/builds/pages/builder_list_page/index.ts",
+                "export * from './builder_list_page';\n",
+            )
+            .file(
+                "src/builds/pages/builder_list_page/builder_list_page.tsx",
+                "export function BuilderListPage() {\n  return null;\n}\n\nexport const Component = BuilderListPage;\n",
+            )
+            .file(
+                "src/fleet/home_page/index.ts",
+                "export { HomePage as Component } from './home_page';\n",
+            )
+            .file(
+                "src/fleet/home_page/home_page.tsx",
+                "export function HomePage() {\n  return null;\n}\n",
+            )
+            .file(
+                "src/auth/login_page/index.ts",
+                "export { default } from './login_page';\n",
+            )
+            .file(
+                "src/auth/login_page/login_page.tsx",
+                "export default function LoginPage() {\n  return null;\n}\n",
+            )
+            .file(
+                "src/chronicle/graph_view.tsx",
+                "function GraphView() {\n  return null;\n}\n\nexport { GraphView as Component };\n",
+            )
+            .file(
+                "src/media/media_page.tsx",
+                "import { memo } from 'react';\n\nfunction MediaPage() {\n  return null;\n}\n\nconst MemoizedMediaPage = memo(MediaPage);\n\nexport { MemoizedMediaPage as Component };\n",
+            )
+            .file(
+                "src/settings/index.ts",
+                "export { default } from './settings_page';\n",
+            )
+            .file(
+                "src/settings/settings_page.tsx",
+                "export default function SettingsPage() {\n  return null;\n}\n",
+            )
+            .file(
+                "src/core/redirection_loader.ts",
+                "export function redirectionLoader() {\n  return null;\n}\n\nexport const loader = redirectionLoader;\n",
+            )
+            .file(
+                "src/clash/index.ts",
+                "export * from './first';\nexport * from './second';\n",
+            )
+            .file(
+                "src/clash/first.tsx",
+                "export function Component() {\n  return null;\n}\n",
+            )
+            .file(
+                "src/clash/second.tsx",
+                "export function Component() {\n  return null;\n}\n",
+            )
+            .file("src/loop/a.ts", "export * from './b';\n")
+            .file("src/loop/b.ts", "export * from './a';\n")
+            .file("src/legacy/index.ts", "export * from './legacy_page';\n")
+            .file(
+                "src/legacy/legacy_page.tsx",
+                "export default function LegacyPage() {\n  return null;\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        assert_eq!(
+            bindings(graph),
+            strings(&[
+                "/builders -> BuilderListPage@src/builds/pages/builder_list_page/builder_list_page.tsx",
+                "/builds/:id -> Component@src/builds/build_page/build_page.tsx",
+                "/builds/:id/overview -> Component@src/builds/build_page/overview_tab/overview_tab.tsx",
+                "/builds/:id/overview ~> Component@src/builds/build_page/build_page.tsx",
+                "/fleet -> HomePage@src/fleet/home_page/home_page.tsx",
+                "/graph -> GraphView@src/chronicle/graph_view.tsx",
+                "/login -> LoginPage@src/auth/login_page/login_page.tsx",
+                "/media -> MediaPage@src/media/media_page.tsx",
+                "/settings -> SettingsPage@src/settings/settings_page.tsx",
+            ]),
+            "{}",
+            graph.report()
+        );
+        for path in ["/redirect", "/clash", "/loop", "/no-default"] {
+            assert!(
+                graph
+                    .unresolved
+                    .iter()
+                    .any(|r| r.reference_name.starts_with("lazy-import:")
+                        && graph.node(&r.from_node_id).is_some_and(|n| n.name == path)),
+                "{path} links nothing\n{}",
+                graph.report()
+            );
+        }
+    }
+
+    /// Upstream `react-router-barrel-imports.test.ts` (#2558, the async
+    /// loaders and the `React.lazy` value #2480): a lazily loaded module
+    /// that passes on a page it imports — an export clause of imports, an
+    /// import from another barrel, a default export that is an imported
+    /// binding, an imported page the module renames to `Component`, the
+    /// default a `React.lazy` value loads — and nothing for a namespace, a
+    /// package's component or a wrapper a default export calls.
+    #[test]
+    fn pr2558_a_lazy_module_passes_on_a_page_it_imports() {
+        let project = Project::new()
+            .file(
+                "package.json",
+                "{\"name\":\"shop\",\"private\":true,\"dependencies\":{\"react\":\"^18\",\"react-router\":\"^7\",\"@mui/material\":\"^6\"}}\n",
+            )
+            .file(
+                "tsconfig.json",
+                "{\"compilerOptions\":{\"baseUrl\":\".\",\"paths\":{\"@/*\":[\"./src/*\"]}}}\n",
+            )
+            .file(
+                "src/router.tsx",
+                "import { lazy } from 'react';\nimport { createBrowserRouter } from 'react-router';\n\nconst Help = lazy(() => import('@/help'));\n\nexport const router = createBrowserRouter([\n  {\n    path: '/',\n    lazy: async () => {\n      const { UserLayout } = await import('@/layout');\n      return { Component: UserLayout };\n    },\n    children: [\n      {\n        index: true,\n        lazy: async () => {\n          const { HomePage } = await import('@/pages');\n          return { Component: HomePage };\n        },\n      },\n      { path: 'login', lazy: () => import('@/auth/login') },\n      { path: 'settings', lazy: () => import('@/settings') },\n      { path: 'help', element: <Help /> },\n      {\n        path: 'tabs',\n        lazy: async () => {\n          const { Tabs } = await import('@/tabs');\n          return { Component: Tabs };\n        },\n      },\n      {\n        path: 'button',\n        lazy: async () => {\n          const { Button } = await import('@/ui');\n          return { Component: Button };\n        },\n      },\n      { path: 'account', lazy: () => import('@/account') },\n    ],\n  },\n  {\n    path: '/admin',\n    lazy: async () => {\n      const { AdminLayout } = await import('@/layout');\n      return { Component: AdminLayout };\n    },\n  },\n]);\n",
+            )
+            .file(
+                "src/layout/index.ts",
+                "import { AdminLayout } from './AdminLayout'\nimport { UserLayout } from './UserLayout'\n\nexport { AdminLayout, UserLayout }\n",
+            )
+            .file(
+                "src/layout/AdminLayout.tsx",
+                "export function AdminLayout() {\n  return null;\n}\n",
+            )
+            .file("src/layout/UserLayout.tsx", "export const UserLayout = () => null;\n")
+            .file(
+                "src/pages/index.ts",
+                "import { HomePage } from './home';\n\nexport { HomePage };\n",
+            )
+            .file("src/pages/home/index.ts", "export * from './HomePage';\n")
+            .file(
+                "src/pages/home/HomePage.tsx",
+                "export function HomePage() {\n  return null;\n}\n",
+            )
+            .file(
+                "src/auth/login/index.ts",
+                "import Login from './Login';\n\nexport default Login;\n",
+            )
+            .file(
+                "src/auth/login/Login.tsx",
+                "export default function Login() {\n  return null;\n}\n",
+            )
+            .file(
+                "src/settings/index.ts",
+                "import { SettingsPage } from './SettingsPage';\n\nexport { SettingsPage as Component };\n",
+            )
+            .file(
+                "src/settings/SettingsPage.tsx",
+                "export function SettingsPage() {\n  return null;\n}\n",
+            )
+            .file(
+                "src/help/index.ts",
+                "import HelpPage from './HelpPage';\n\nexport { HelpPage as default };\n",
+            )
+            .file(
+                "src/help/HelpPage.tsx",
+                "export default function HelpPage() {\n  return null;\n}\n",
+            )
+            .file(
+                "src/tabs/index.ts",
+                "import * as Tabs from './tabs';\n\nexport { Tabs };\n",
+            )
+            .file("src/tabs/tabs.tsx", "export function First() {\n  return null;\n}\n")
+            .file(
+                "src/ui/index.ts",
+                "import { Button } from '@mui/material';\n\nexport { Button };\n",
+            )
+            .file(
+                "src/account/index.ts",
+                "import withAuth from '@/hoc/withAuth';\nimport { AccountPage } from './AccountPage';\n\nexport default withAuth(AccountPage);\n",
+            )
+            .file(
+                "src/account/AccountPage.tsx",
+                "export function AccountPage() {\n  return null;\n}\n",
+            )
+            .file(
+                "src/hoc/withAuth.ts",
+                "export default function withAuth(Component: unknown) {\n  return Component;\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        // `/tabs`, `/button` and `/account` render nothing, only inside the
+        // layout `/`'s loader picks.
+        assert_eq!(
+            bindings(graph),
+            strings(&[
+                "/ -> HomePage@src/pages/home/HomePage.tsx",
+                "/ ~> UserLayout@src/layout/UserLayout.tsx",
+                "/account ~> UserLayout@src/layout/UserLayout.tsx",
+                "/admin -> AdminLayout@src/layout/AdminLayout.tsx",
+                "/button ~> UserLayout@src/layout/UserLayout.tsx",
+                "/help -> HelpPage@src/help/HelpPage.tsx",
+                "/help ~> UserLayout@src/layout/UserLayout.tsx",
+                "/login -> Login@src/auth/login/Login.tsx",
+                "/login ~> UserLayout@src/layout/UserLayout.tsx",
+                "/settings -> SettingsPage@src/settings/SettingsPage.tsx",
+                "/settings ~> UserLayout@src/layout/UserLayout.tsx",
+                "/tabs ~> UserLayout@src/layout/UserLayout.tsx",
+            ]),
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream `react-router-lazy-member.test.ts` (#2480): a data-router
+    /// `lazy` loader that picks the export it renders (luci-go's milo/ui) —
+    /// through a barrel, `{ default: Component }`, a `.then` callback, an
+    /// `(await import(…)).X`, a module binding, a method, the import the
+    /// component comes from rather than the first one, React Router 7's
+    /// object of lazy properties, the page an `element` shows inside its
+    /// guard or past a guard of the route file, a component of the route's
+    /// own file, a `<Route lazy>` — and nothing a loader does not hand over:
+    /// a loader that returns only a `loader` makes no page, and a picked
+    /// export the module lacks is not its default nor its `Component`.
+    #[test]
+    fn pr2480_a_lazy_loader_renders_the_export_it_picks() {
+        let project = Project::new()
+            .file(
+                "package.json",
+                "{\"name\":\"ui\",\"private\":true,\"dependencies\":{\"react\":\"^18\",\"react-router\":\"^7\"}}\n",
+            )
+            .file(
+                "tsconfig.json",
+                "{\"compilerOptions\":{\"baseUrl\":\".\",\"paths\":{\"@/*\":[\"./src/*\"]}}}\n",
+            )
+            .file(
+                "src/router.tsx",
+                "import { createBrowserRouter, Route, createRoutesFromElements } from 'react-router';\nimport { AgeGate, PrivateRoute, RequireAuth } from './guards';\nimport { SettingsPage } from './pages/settings';\n\nexport const router = createBrowserRouter([\n  {\n    path: '/invocations/:id',\n    lazy: async () => {\n      const { InvocationPage } = await import('@/invocation_page');\n      return { Component: InvocationPage };\n    },\n    children: [\n      {\n        path: 'tests',\n        lazy: async () => {\n          const { TestTab } = await import(\n            '@/invocation_page/tabs'\n          );\n          return { Component: TestTab };\n        },\n      },\n      {\n        path: 'details',\n        lazy: async () => {\n          const { DetailsTab } = await import('@/invocation_page/tabs');\n          return { Component: DetailsTab };\n        },\n      },\n    ],\n  },\n  {\n    path: '/login',\n    lazy: async () => {\n      const { default: Component } = await import(/* webpackChunkName: \"login\" */ './pages/login');\n      return { Component };\n    },\n  },\n  { path: '/reports', lazy: () => import('./pages/reports').then((m) => ({ Component: m.ReportList })) },\n  { path: '/reports/:id', lazy: async () => ({ Component: (await import('./pages/reports')).ReportPage }) },\n  {\n    path: '/profile',\n    lazy: async () => {\n      const page = await import('./pages/profile');\n      return { Component: page.ProfilePage };\n    },\n  },\n  {\n    path: '/projects',\n    async lazy() {\n      const { ProjectsPage } = await import('./pages/projects');\n      return { Component: ProjectsPage };\n    },\n  },\n  {\n    path: '/team',\n    lazy: async () => {\n      const { teamLoader } = await import('./loaders/team');\n      const { TeamPage } = await import('./pages/team');\n      return { loader: teamLoader, Component: TeamPage };\n    },\n  },\n  {\n    path: '/shows/:id',\n    lazy: {\n      loader: async () => (await import('./shows/loader')).loader,\n      Component: async () => (await import('./shows/show')).Show,\n    },\n  },\n  {\n    path: '/admin',\n    lazy: async () => {\n      const { AdminPage } = await import('./pages/admin');\n      return {\n        element: (\n          <RequireAuth>\n            <AdminPage />\n          </RequireAuth>\n        ),\n      };\n    },\n  },\n  {\n    path: '/fireworks',\n    lazy: async () => {\n      const { default: FireworksPage } = await import('./pages/fireworks');\n      return { element: <AgeGate minAge={18}><FireworksPage /></AgeGate> };\n    },\n  },\n  {\n    path: '/favorites',\n    async lazy() {\n      let { Favorites } = await import('./pages/favorites');\n      return { Component: () => <PrivateRoute redirectTo=\"/\" component={<Favorites />} /> };\n    },\n  },\n  {\n    path: '/feed',\n    lazy: async () => {\n      const [{ Feed }] = await Promise.all([import('./pages/feed'), loadMessages()]);\n      return { Component: Feed };\n    },\n  },\n  {\n    path: '/settings',\n    lazy: async () => {\n      const { settingsLoader } = await import('./loaders/settings');\n      return { loader: settingsLoader, Component: SettingsPage };\n    },\n  },\n  {\n    path: '/logout',\n    lazy: async () => {\n      const { loader } = await import('./pages/logout');\n      return { loader };\n    },\n  },\n  {\n    path: '/missing',\n    lazy: async () => {\n      const { Missing } = await import('./pages/reports');\n      return { Component: Missing };\n    },\n  },\n  {\n    path: '/named-only',\n    lazy: async () => {\n      const { default: Component } = await import('./pages/named_only');\n      return { Component };\n    },\n  },\n]);\n\nexport const jsxRoutes = createRoutesFromElements(\n  <Route path=\"/help\" lazy={async () => { const { HelpPage } = await import('./pages/help'); return { Component: HelpPage }; }} />\n);\n\nasync function loadMessages() {\n  return {};\n}\n",
+            )
+            .file(
+                "src/guards.tsx",
+                "export function RequireAuth({ children }: { children: unknown }) {\n  return children;\n}\n\nexport function AgeGate({ children }: { children: unknown; minAge: number }) {\n  return children;\n}\n\nexport function PrivateRoute({ component }: { component: unknown; redirectTo: string }) {\n  return component;\n}\n",
+            )
+            .file(
+                "src/pages/fireworks.tsx",
+                "export default function FireworksPage() {\n  return null;\n}\n",
+            )
+            .file(
+                "src/pages/favorites.tsx",
+                "export function Favorites() {\n  return null;\n}\n",
+            )
+            .file(
+                "src/invocation_page/index.ts",
+                "export * from './invocation_page';\n",
+            )
+            .file(
+                "src/invocation_page/invocation_page.tsx",
+                "export function InvocationPage() {\n  return null;\n}\n",
+            )
+            .file(
+                "src/invocation_page/tabs/index.ts",
+                "export * from './test_tab';\nexport * from './details_tab';\n",
+            )
+            .file(
+                "src/invocation_page/tabs/test_tab.tsx",
+                "export function TestTab() {\n  return null;\n}\n",
+            )
+            .file(
+                "src/invocation_page/tabs/details_tab.tsx",
+                "export function DetailsTab() {\n  return null;\n}\n",
+            )
+            .file(
+                "src/pages/login.tsx",
+                "export default function LoginPage() {\n  return null;\n}\n",
+            )
+            .file(
+                "src/pages/reports.tsx",
+                "export function ReportList() {\n  return null;\n}\n\nexport function ReportPage() {\n  return null;\n}\n\nexport default function ReportsHome() {\n  return null;\n}\n",
+            )
+            .file(
+                "src/pages/profile.tsx",
+                "export function ProfilePage() {\n  return null;\n}\n\nexport default function ProfileCard() {\n  return null;\n}\n",
+            )
+            .file(
+                "src/pages/projects.tsx",
+                "export function ProjectsPage() {\n  return null;\n}\n",
+            )
+            .file(
+                "src/loaders/team.ts",
+                "export async function teamLoader() {\n  return null;\n}\n",
+            )
+            .file(
+                "src/pages/team.tsx",
+                "export function TeamPage() {\n  return null;\n}\n",
+            )
+            .file(
+                "src/shows/loader.ts",
+                "export async function loader() {\n  return null;\n}\n",
+            )
+            .file(
+                "src/shows/show.tsx",
+                "export function Show() {\n  return null;\n}\n",
+            )
+            .file(
+                "src/pages/admin.tsx",
+                "export function AdminPage() {\n  return null;\n}\n",
+            )
+            .file(
+                "src/pages/feed.tsx",
+                "export function Feed() {\n  return null;\n}\n",
+            )
+            .file(
+                "src/loaders/settings.ts",
+                "export async function settingsLoader() {\n  return null;\n}\n",
+            )
+            .file(
+                "src/pages/settings.tsx",
+                "export function SettingsPage() {\n  return null;\n}\n",
+            )
+            .file(
+                "src/pages/logout.tsx",
+                "export async function loader() {\n  return null;\n}\n\nexport default function LogoutPage() {\n  return null;\n}\n",
+            )
+            .file(
+                "src/pages/named_only.tsx",
+                "export function Component() {\n  return null;\n}\n",
+            )
+            .file(
+                "src/pages/help.tsx",
+                "export function HelpPage() {\n  return null;\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        let report = graph.report();
+        assert!(!routes(graph).contains(&"/logout".to_string()), "{report}");
+        assert_eq!(
+            bindings(graph),
+            strings(&[
+                "/admin -> AdminPage@src/pages/admin.tsx",
+                "/favorites -> Favorites@src/pages/favorites.tsx",
+                "/feed -> Feed@src/pages/feed.tsx",
+                "/fireworks -> FireworksPage@src/pages/fireworks.tsx",
+                "/help -> HelpPage@src/pages/help.tsx",
+                "/invocations/:id -> InvocationPage@src/invocation_page/invocation_page.tsx",
+                "/invocations/:id/details -> DetailsTab@src/invocation_page/tabs/details_tab.tsx",
+                "/invocations/:id/details ~> InvocationPage@src/invocation_page/invocation_page.tsx",
+                "/invocations/:id/tests -> TestTab@src/invocation_page/tabs/test_tab.tsx",
+                "/invocations/:id/tests ~> InvocationPage@src/invocation_page/invocation_page.tsx",
+                "/login -> LoginPage@src/pages/login.tsx",
+                "/profile -> ProfilePage@src/pages/profile.tsx",
+                "/projects -> ProjectsPage@src/pages/projects.tsx",
+                "/reports -> ReportList@src/pages/reports.tsx",
+                "/reports/:id -> ReportPage@src/pages/reports.tsx",
+                "/settings -> SettingsPage@src/pages/settings.tsx",
+                "/shows/:id -> Show@src/shows/show.tsx",
+                "/team -> TeamPage@src/pages/team.tsx",
+            ]),
+            "{report}"
+        );
+        for (path, reference) in [
+            ("/missing", "import:./pages/reports#Missing"),
+            ("/named-only", "import:./pages/named_only#default"),
+        ] {
+            assert!(
+                graph
+                    .unresolved
+                    .iter()
+                    .any(|r| r.reference_name == reference
+                        && graph.node(&r.from_node_id).is_some_and(|n| n.name == path)),
+                "{path} links nothing\n{report}"
+            );
+        }
+    }
+
+    /// Upstream `react-router-outlet-routes.test.ts` (#2670): a route object
+    /// that renders `<Outlet />` — as its `element`, its `Component`, or
+    /// what its `lazy` loader hands back (Medusa's `:id` routes, which import
+    /// their page module only for its `loader`) — renders nothing of its own
+    /// and is no layout, yet stays an address a navigation reaches; at its
+    /// parent's address it only groups the routes inside it. No route
+    /// reference to `Outlet` is left behind.
+    #[test]
+    fn pr2670_an_outlet_route_renders_nothing_of_its_own() {
+        let page = |name: &'static str| -> String {
+            format!("export function Component() {{\n  return <div>{name}</div>;\n}}\n")
+        };
+        let region_list = page("RegionList");
+        let region_create = page("RegionCreate");
+        let product_list = page("ProductList");
+        let loader = "export async function loader() {\n  return null;\n}\n\n";
+        let product_detail = format!("{loader}{}", page("ProductDetail"));
+        let variant_detail = page("VariantDetail");
+        let order_list = format!("{loader}{}", page("OrderList"));
+        let order_create = page("OrderCreate");
+        let project = Project::new()
+            .file(
+                "package.json",
+                "{\"name\":\"admin\",\"dependencies\":{\"react\":\"^18\",\"react-router-dom\":\"^6\"}}\n",
+            )
+            .file(
+                "src/Shell.tsx",
+                "import { Outlet } from 'react-router-dom';\n\nexport function Shell() {\n  return <main><Outlet /></main>;\n}\n",
+            )
+            .file(
+                "src/router.tsx",
+                "import { createBrowserRouter, Outlet } from 'react-router-dom';\nimport { Shell } from './Shell';\n\nexport const router = createBrowserRouter([\n  {\n    element: <Shell />,\n    children: [\n      {\n        path: '/regions',\n        element: <Outlet />,\n        children: [\n          { path: '', lazy: () => import('./pages/region-list') },\n          { path: 'create', lazy: () => import('./pages/region-create') },\n        ],\n      },\n      {\n        path: '/products',\n        Component: Outlet,\n        children: [{ index: true, lazy: () => import('./pages/product-list') }],\n      },\n      {\n        path: '/products/:id',\n        lazy: async () => {\n          const { loader } = await import('./pages/product-detail');\n          return { Component: Outlet, loader };\n        },\n        children: [\n          { path: '', lazy: () => import('./pages/product-detail') },\n          { path: 'variants/:variant_id', lazy: () => import('./pages/variant-detail') },\n        ],\n      },\n      {\n        path: '/orders',\n        lazy: async () => {\n          const { loader } = await import('./pages/order-list');\n          return { element: <Outlet />, loader };\n        },\n        children: [\n          { index: true, lazy: () => import('./pages/order-list') },\n          { path: 'new', lazy: () => import('./pages/order-create') },\n        ],\n      },\n      { path: '/approvals', element: <Outlet /> },\n      { path: '/agents/:agentId', Component: Outlet },\n    ],\n  },\n]);\n",
+            )
+            .file(
+                "src/errors/router.tsx",
+                "import { createBrowserRouter, Outlet } from 'react-router-dom';\nimport { Layout, Project, RootErrorBoundary } from './routes';\n\nexport const router = createBrowserRouter([\n  {\n    path: '/',\n    element: <Layout />,\n    children: [\n      {\n        path: '',\n        element: <Outlet />,\n        errorElement: <RootErrorBoundary />,\n        children: [{ path: 'projects/:projectId', element: <Project /> }],\n      },\n    ],\n  },\n]);\n",
+            )
+            .file(
+                "src/errors/routes.tsx",
+                "import { Outlet } from 'react-router-dom';\n\nexport function Layout() {\n  return <div><Outlet /></div>;\n}\n\nexport function Project() {\n  return <div>Project</div>;\n}\n\nexport function RootErrorBoundary() {\n  return <div>Error</div>;\n}\n",
+            )
+            .file(
+                "src/Nav.tsx",
+                "import { useNavigate } from 'react-router-dom';\n\nexport function Nav() {\n  const navigate = useNavigate();\n  const openApprovals = () => navigate('/approvals');\n  const openAgent = (id: string) => navigate(`/agents/${id}`);\n  return <nav><button onClick={openApprovals} /><button onClick={() => openAgent('a')} /></nav>;\n}\n",
+            )
+            .file("src/pages/region-list.tsx", &region_list)
+            .file("src/pages/region-create.tsx", &region_create)
+            .file("src/pages/product-list.tsx", &product_list)
+            .file("src/pages/product-detail.tsx", &product_detail)
+            .file("src/pages/variant-detail.tsx", &variant_detail)
+            .file("src/pages/order-list.tsx", &order_list)
+            .file("src/pages/order-create.tsx", &order_create)
+            .index();
+        let graph = project.graph();
+        let report = graph.report();
+        assert_eq!(
+            routes(graph),
+            [
+                "/",
+                "/agents/:agentId",
+                "/approvals",
+                "/orders",
+                "/orders/new",
+                "/products",
+                "/products/:id",
+                "/products/:id/variants/:variant_id",
+                "/projects/:projectId",
+                "/regions",
+                "/regions/create"
+            ],
+            "{report}"
+        );
+        assert_eq!(
+            bindings(graph),
+            strings(&[
+                "/ -> Layout@src/errors/routes.tsx",
+                "/agents/:agentId ~> Shell@src/Shell.tsx",
+                "/approvals ~> Shell@src/Shell.tsx",
+                "/orders -> Component@src/pages/order-list.tsx",
+                "/orders ~> Shell@src/Shell.tsx",
+                "/orders/new -> Component@src/pages/order-create.tsx",
+                "/orders/new ~> Shell@src/Shell.tsx",
+                "/products -> Component@src/pages/product-list.tsx",
+                "/products ~> Shell@src/Shell.tsx",
+                "/products/:id -> Component@src/pages/product-detail.tsx",
+                "/products/:id ~> Shell@src/Shell.tsx",
+                // Not inside product-detail: its route hands React Router
+                // `Component: Outlet`.
+                "/products/:id/variants/:variant_id -> Component@src/pages/variant-detail.tsx",
+                "/products/:id/variants/:variant_id ~> Shell@src/Shell.tsx",
+                "/projects/:projectId -> Project@src/errors/routes.tsx",
+                "/projects/:projectId ~> Layout@src/errors/routes.tsx",
+                "/regions -> Component@src/pages/region-list.tsx",
+                "/regions ~> Shell@src/Shell.tsx",
+                "/regions/create -> Component@src/pages/region-create.tsx",
+                "/regions/create ~> Shell@src/Shell.tsx",
+            ]),
+            "{report}"
+        );
+        assert_eq!(
+            navigations(graph),
+            [
+                "openAgent -> /agents/:agentId (navigate /agents/${…}) react-router",
+                "openApprovals -> /approvals (navigate /approvals) react-router",
+            ],
+            "{report}"
+        );
+        assert!(
+            !graph
+                .unresolved
+                .iter()
+                .any(|r| r.from_node_id.starts_with("route:")
+                    && matches!(r.reference_name.as_str(), "Outlet" | "layout:Outlet")),
+            "{report}"
+        );
+    }
+
+    /// Upstream `react-router.test.ts` (#2400), the ASP.NET Core React template: the table `App.js` maps into `<Route {...rest}>`, and the table it spreads in turn, are routes; an index route at the table's top is `/`, a wrapper renders what it wraps, an entry rendering a call's result is no route, and a menu, a list nothing hands the router and a path the table does not hold are none. (The `<Link to>` navigations are the link pass's.)
+    #[test]
+    fn pr2400_a_table_another_file_maps_into_routes_is_read() {
+        let project = Project::new()
+            .file("src/Web/ClientApp/package.json", "{\"name\":\"web\",\"dependencies\":{\"react\":\"^18\",\"react-router-dom\":\"^6\"}}")
+            .file("src/Web/ClientApp/src/App.js", "import React, { Component } from 'react';\nimport { Route, Routes } from 'react-router-dom';\nimport AppRoutes from './AppRoutes';\nimport AuthorizeRoute from './components/api-authorization/AuthorizeRoute';\nimport { Layout } from './components/Layout';\n\nexport default class App extends Component {\n  static displayName = App.name;\n\n  render() {\n    return (\n      <Layout>\n        <Routes>\n          {AppRoutes.map((route, index) => {\n            const { element, requireAuth, ...rest } = route;\n            return <Route key={index} {...rest} element={requireAuth ? <AuthorizeRoute {...rest} element={element} /> : element} />;\n          })}\n        </Routes>\n      </Layout>\n    );\n  }\n}\n")
+            .file("src/Web/ClientApp/src/AppRoutes.js", "import ApiAuthorzationRoutes from './components/api-authorization/ApiAuthorizationRoutes';\nimport { Counter } from \"./components/Counter\";\nimport { FetchData } from \"./components/FetchData\";\nimport { Home } from \"./components/Home\";\nimport { ProtectedRoute } from \"./components/ProtectedRoute\";\nimport AdminWrapper from \"./components/AdminWrapper\";\nimport { Users } from \"./components/Users\";\n\nconst AppRoutes = [\n  {\n    index: true,\n    element: <Home />\n  },\n  {\n    path: '/counter',\n    element: <Counter />\n  },\n  {\n    path: '/fetch-data',\n    requireAuth: true,\n    element: <ProtectedRoute><FetchData /></ProtectedRoute>\n  },\n  {\n    path: 'admin/users',\n    element: <AdminWrapper><Users /></AdminWrapper>\n  },\n  ...ApiAuthorzationRoutes\n];\n\nexport default AppRoutes;\n")
+            .file("src/Web/ClientApp/src/breadcrumbs.js", "import { Crumb } from './icons';\nexport const crumbs = [{ path: '/history', element: <Crumb /> }];\n")
+            .file("src/Web/ClientApp/src/components/AdminWrapper.js", "export default function AdminWrapper({ children }) {\n  return children;\n}\n")
+            .file("src/Web/ClientApp/src/components/Counter.js", "export function Counter() {\n  return <div>Counter</div>;\n}\n")
+            .file("src/Web/ClientApp/src/components/FetchData.js", "export function FetchData() {\n  return <div>FetchData</div>;\n}\n")
+            .file("src/Web/ClientApp/src/components/Home.js", "export function Home() {\n  return <div>Home</div>;\n}\n")
+            .file("src/Web/ClientApp/src/components/Layout.js", "import { NavMenu } from './NavMenu';\nexport function Layout({ children }) {\n  return <div><NavMenu />{children}</div>;\n}\n")
+            .file("src/Web/ClientApp/src/components/NavMenu.js", "import { Link, NavLink, useNavigate } from 'react-router-dom';\nimport { menu } from '../menu';\n\nexport function NavMenu() {\n  const navigate = useNavigate();\n  const showProfile = () => {\n    navigate('/authentication/profile');\n  };\n  return (\n    <nav>\n      <Link to=\"/\">Home</Link>\n      <Link to=\"/counter\">Counter</Link>\n      <Link to=\"/fetch-data\">Fetch data</Link>\n      <button onClick={showProfile}>Profile</button>\n      {menu.map((item) => <NavLink key={item.path} to={item.path}>{item.element}</NavLink>)}\n    </nav>\n  );\n}\n")
+            .file("src/Web/ClientApp/src/components/ProtectedRoute.js", "export function ProtectedRoute({ children }) {\n  return children;\n}\n")
+            .file("src/Web/ClientApp/src/components/Users.js", "export function Users() {\n  return <div>Users</div>;\n}\n")
+            .file("src/Web/ClientApp/src/components/api-authorization/ApiAuthorizationConstants.js", "const prefix = '/authentication';\nexport const ApplicationPaths = {\n  Login: `${prefix}/login`,\n};\n")
+            .file("src/Web/ClientApp/src/components/api-authorization/ApiAuthorizationRoutes.js", "import { Profile } from './Profile';\nimport { Login } from './Login';\nimport { ApplicationPaths } from './ApiAuthorizationConstants';\n\nconst ApiAuthorizationRoutes = [\n  {\n    path: '/authentication/profile',\n    element: <Profile />\n  },\n  {\n    path: ApplicationPaths.Login,\n    element: loginAction('login')\n  }\n];\n\nfunction loginAction(name) {\n  return <Login action={name}></Login>;\n}\n\nexport default ApiAuthorizationRoutes;\n")
+            .file("src/Web/ClientApp/src/components/api-authorization/AuthorizeRoute.js", "export default function AuthorizeRoute({ element }) {\n  return element;\n}\n")
+            .file("src/Web/ClientApp/src/components/api-authorization/Login.js", "export function Login() {\n  return <div>Login</div>;\n}\n")
+            .file("src/Web/ClientApp/src/components/api-authorization/Profile.js", "export function Profile() {\n  return <div>Profile</div>;\n}\n")
+            .file("src/Web/ClientApp/src/dashboard.js", "import { Route, Routes } from 'react-router-dom';\nimport { Stats } from './icons';\nconst dashboardRoutes = [{ path: '/stats', layout: '/admin', element: <Stats /> }];\nexport function Dashboard() {\n  return <Routes>{dashboardRoutes.map((r) => <Route key={r.path} path={r.layout + r.path} element={r.element} />)}</Routes>;\n}\n")
+            .file("src/Web/ClientApp/src/icons.js", "export function HelpIcon() {\n  return <div>HelpIcon</div>;\n}\nexport function SettingsIcon() {\n  return <div>SettingsIcon</div>;\n}\nexport function Crumb() {\n  return <div>Crumb</div>;\n}\nexport function Stats() {\n  return <div>Stats</div>;\n}\n")
+            .file("src/Web/ClientApp/src/menu.js", "import { HelpIcon, SettingsIcon } from './icons';\nexport const menu = [\n  { path: '/help', element: <HelpIcon /> },\n  { path: '/settings', element: <SettingsIcon /> },\n];\n")
+            .index();
+        let graph = project.graph();
+        let report = graph.report();
+        assert_eq!(
+            routes(graph),
+            [
+                "/",
+                "/admin/users",
+                "/authentication/profile",
+                "/counter",
+                "/fetch-data"
+            ],
+            "{report}"
+        );
+        assert_eq!(
+            bindings(graph),
+            strings(&[
+                "/ -> Home@src/Web/ClientApp/src/components/Home.js",
+                "/admin/users -> Users@src/Web/ClientApp/src/components/Users.js",
+                "/authentication/profile -> Profile@src/Web/ClientApp/src/components/api-authorization/Profile.js",
+                "/counter -> Counter@src/Web/ClientApp/src/components/Counter.js",
+                "/fetch-data -> FetchData@src/Web/ClientApp/src/components/FetchData.js",
+            ]),
+            "{report}"
+        );
+        assert_eq!(
+            navigations(graph),
+            strings(&[
+                "NavMenu -> / (link /) ?",
+                "NavMenu -> /counter (link /counter) ?",
+                "NavMenu -> /fetch-data (link /fetch-data) ?",
+                "showProfile -> /authentication/profile (navigate /authentication/profile) react-router",
+            ]),
+            "{report}"
+        );
+        // Each route stays at the line of its own object in the table.
+        let counter = graph
+            .nodes
+            .iter()
+            .find(|node| node.kind == "route" && node.name == "/counter")
+            .expect("the /counter route");
+        assert_eq!(
+            (counter.file_path.as_str(), counter.start_line),
+            ("src/Web/ClientApp/src/AppRoutes.js", 15),
+            "{report}"
+        );
+    }
+
+    /// Upstream `react-router.test.ts` (#2400): `useRoutes(routes(isLoggedIn))` hands over the table the imported function returns, nested paths composed, the index route the page at its layout's address; the layout's `<Link to>` and the table's own `<Navigate to>` guard navigate too (the link pass).
+    #[test]
+    fn pr2400_a_table_a_function_returns_is_handed_to_use_routes() {
+        let project = Project::new()
+            .file("package.json", "{\"name\":\"kit\",\"dependencies\":{\"react\":\"^18\",\"react-router-dom\":\"^6\"}}")
+            .file("src/App.jsx", "import { useRoutes } from 'react-router-dom';\nimport routes from './routes';\n\nexport default function App({ isLoggedIn }) {\n  return useRoutes(routes(isLoggedIn));\n}\n")
+            .file("src/layouts/DashboardLayout.jsx", "import { Outlet } from 'react-router-dom';\nexport default function DashboardLayout() {\n  return <Outlet />;\n}\n")
+            .file("src/layouts/MainLayout.jsx", "import { Link, Outlet } from 'react-router-dom';\nexport default function MainLayout() {\n  return <div><Link to=\"/app/dashboard\">Dashboard</Link><Outlet /></div>;\n}\n")
+            .file("src/pages.jsx", "import { useNavigate } from 'react-router-dom';\nexport function Dashboard() { return <div>Dashboard</div>; }\nexport function Account() { return <div>Account</div>; }\nexport function Landing() { return <div>Landing</div>; }\nexport function Login() {\n  const navigate = useNavigate();\n  const onSubmit = () => navigate('/app/account');\n  return <form onSubmit={onSubmit} />;\n}\n")
+            .file("src/routes.jsx", "import { Navigate } from 'react-router-dom';\nimport DashboardLayout from './layouts/DashboardLayout';\nimport MainLayout from './layouts/MainLayout';\nimport { Account, Dashboard, Landing, Login } from './pages';\n\nconst routes = (isLoggedIn) => [\n  {\n    path: 'app',\n    element: isLoggedIn ? <DashboardLayout /> : <Navigate to=\"/login\" />,\n    children: [\n      { path: 'dashboard', element: <Dashboard /> },\n      { path: 'account', element: <Account /> },\n    ],\n  },\n  {\n    path: '/',\n    element: <MainLayout />,\n    children: [\n      { index: true, element: <Landing /> },\n      { path: 'login', element: <Login /> },\n    ],\n  },\n];\n\nexport default routes;\n")
+            .index();
+        let graph = project.graph();
+        let report = graph.report();
+        assert_eq!(
+            routes(graph),
+            ["/", "/app/account", "/app/dashboard", "/login"],
+            "{report}"
+        );
+        assert_eq!(
+            bindings(graph),
+            strings(&[
+                "/ -> Landing@src/pages.jsx",
+                "/ ~> MainLayout@src/layouts/MainLayout.jsx",
+                "/app/account -> Account@src/pages.jsx",
+                "/app/dashboard -> Dashboard@src/pages.jsx",
+                "/login -> Login@src/pages.jsx",
+                "/login ~> MainLayout@src/layouts/MainLayout.jsx",
+            ]),
+            "{report}"
+        );
+        assert_eq!(
+            navigations(graph),
+            strings(&[
+                "MainLayout -> /app/dashboard (link /app/dashboard) ?",
+                "onSubmit -> /app/account (navigate /app/account) react-router",
+                "routes -> /login (navigate /login) ?",
+            ]),
+            "{report}"
+        );
+    }
+
+    /// Upstream `react-router.test.ts` (#2400), codedthemes' admin templates: `createBrowserRouter([MainRoutes, AuthenticationRoutes])` names route objects of their own files; a page the route file loads lazily is the module's, and one whose module is out of reach the declaration itself, never another app's page of its name.
+    #[test]
+    fn pr2400_route_objects_in_their_own_files_are_handed_to_the_router() {
+        let project = Project::new()
+            .file("next/package.json", "{\"name\":\"berry-next\",\"dependencies\":{\"next\":\"^15\",\"react\":\"^18\"}}")
+            .file("next/src/views/default.jsx", "export default function DashboardDefault() {\n  return <div />;\n}\n")
+            .file("next/src/views/sample-page.jsx", "export default function SamplePage() {\n  return <div />;\n}\n")
+            .file("package.json", "{\"name\":\"berry\",\"dependencies\":{\"react\":\"^18\",\"react-router-dom\":\"^7\"}}")
+            .file("src/layout/MainLayout.jsx", "export default function MainLayout() {\n  return <main />;\n}\n")
+            .file("src/layout/MinimalLayout.jsx", "export default function MinimalLayout() {\n  return <main />;\n}\n")
+            .file("src/routes/AuthenticationRoutes.jsx", "import MinimalLayout from '../layout/MinimalLayout';\nimport LoginPage from '../views/LoginPage';\n\nconst AuthenticationRoutes = {\n  path: '/',\n  element: <MinimalLayout />,\n  children: [\n    {\n      path: '/pages/login',\n      element: <LoginPage />\n    }\n  ]\n};\n\nexport default AuthenticationRoutes;\n")
+            .file("src/routes/MainRoutes.jsx", "import { lazy } from 'react';\nimport MainLayout from '../layout/MainLayout';\nimport Loadable from '../ui-component/Loadable';\n\nconst DashboardDefault = Loadable(lazy(() => import('../views/DashboardDefault')));\n// An import only the app's own build resolves (`baseUrl`).\nconst SamplePage = Loadable(lazy(() => import('views/sample-page')));\n\nconst MainRoutes = {\n  path: '/',\n  element: <MainLayout />,\n  children: [\n    {\n      path: '/',\n      element: <DashboardDefault />\n    },\n    {\n      path: 'dashboard',\n      children: [\n        {\n          path: 'default',\n          element: <DashboardDefault />\n        }\n      ]\n    },\n    {\n      path: '/sample-page',\n      element: <SamplePage />\n    }\n  ]\n};\n\nexport default MainRoutes;\n")
+            .file("src/routes/index.jsx", "import { createBrowserRouter } from 'react-router-dom';\n\n// routes\nimport AuthenticationRoutes from './AuthenticationRoutes';\nimport MainRoutes from './MainRoutes';\n\nconst router = createBrowserRouter([MainRoutes, AuthenticationRoutes], {\n  basename: import.meta.env.VITE_APP_BASE_NAME\n});\n\nexport default router;\n")
+            .file("src/ui-component/Loadable.jsx", "export default function Loadable(Component) {\n  return (props) => <Component {...props} />;\n}\n")
+            .file("src/views/DashboardDefault.jsx", "export default function DashboardDefault() {\n  return <div />;\n}\n")
+            .file("src/views/LoginPage.jsx", "export default function LoginPage() {\n  return <div />;\n}\n")
+            .index();
+        let graph = project.graph();
+        let report = graph.report();
+        assert_eq!(
+            routes(graph),
+            [
+                "/",
+                "/",
+                "/dashboard/default",
+                "/pages/login",
+                "/sample-page"
+            ],
+            "{report}"
+        );
+        assert_eq!(
+            bindings(graph),
+            strings(&[
+                "/ -> DashboardDefault@src/views/DashboardDefault.jsx",
+                "/ -> MinimalLayout@src/layout/MinimalLayout.jsx",
+                "/ ~> MainLayout@src/layout/MainLayout.jsx",
+                "/dashboard/default -> DashboardDefault@src/views/DashboardDefault.jsx",
+                "/dashboard/default ~> MainLayout@src/layout/MainLayout.jsx",
+                "/pages/login -> LoginPage@src/views/LoginPage.jsx",
+                "/pages/login ~> MinimalLayout@src/layout/MinimalLayout.jsx",
+                "/sample-page -> SamplePage@src/routes/MainRoutes.jsx",
+                "/sample-page ~> MainLayout@src/layout/MainLayout.jsx",
+            ]),
+            "{report}"
+        );
+        assert_eq!(navigations(graph), strings(&[]), "{report}");
+    }
+
+    /// Upstream `react-router.test.ts` (#2423), "a table mapped inside <Route path> in the same file": a table's relative paths compose onto the `<Route path>` it is mapped inside, and render inside its element when written in the same file; another file's table gets no layout edge.
+    #[test]
+    fn pr2423_a_table_mapped_inside_route_path_renders_inside_its_element() {
+        let project = Project::new()
+            .file("ClientApp/package.json", "{\"name\":\"client\",\"dependencies\":{\"react\":\"^18\",\"react-router-dom\":\"^6\"}}")
+            .file("ClientApp/src/adminRoutes.js", "import Reports from './pages/Reports';\n\nexport const adminRoutes = [{ path: 'reports', element: <Reports/> }];\n")
+            .file("ClientApp/src/layouts/admin.js", "export default function AdminLayout() {\n  return <div />;\n}\n")
+            .file("ClientApp/src/layouts/dashboard.js", "export default function DashboardLayout() {\n  return <div />;\n}\n")
+            .file("ClientApp/src/pages/DashboardApp.js", "export default function DashboardApp() {\n  return <div />;\n}\n")
+            .file("ClientApp/src/pages/LandingPage.js", "export default function LandingPage() {\n  return <div />;\n}\n")
+            .file("ClientApp/src/pages/Reports.js", "export default function Reports() {\n  return <div />;\n}\n")
+            .file("ClientApp/src/pages/TicketDetail.js", "export default function TicketDetail() {\n  return <div />;\n}\n")
+            .file("ClientApp/src/routes.js", "import { Routes, Route } from 'react-router-dom';\nimport AdminLayout from './layouts/admin';\nimport { adminRoutes } from './adminRoutes';\nimport DashboardLayout from './layouts/dashboard';\nimport DashboardApp from './pages/DashboardApp';\nimport LandingPage from './pages/LandingPage';\nimport TicketDetail from './pages/TicketDetail';\n\nconst DashboardRoutes = [\n    {\n        path: 'app',\n        requireAuth: true,\n        element: <DashboardApp/>\n    },\n    {\n        path: 'tickets/:id',\n        requireAuth: true,\n        element: <TicketDetail/>\n    }\n];\n\nexport default function Router() {\n    return (\n        <Routes>\n            <Route path=\"landing\" element={<LandingPage/>}/>\n            <Route path=\"/dashboard\" element={<DashboardLayout/>}>\n                {DashboardRoutes.map((route, index) => {\n                    const {element, requireAuth, ...rest} = route;\n                    return <Route key={index} {...rest} element={element}/>;\n                })}\n            </Route>\n            <Route path=\"/admin\" element={<AdminLayout/>}>\n                {adminRoutes.map((route) => <Route key={route.path} {...route}/>)}\n            </Route>\n        </Routes>\n    );\n}\n")
+            .index();
+        let graph = project.graph();
+        let report = graph.report();
+        assert_eq!(
+            routes(graph),
+            [
+                "/admin",
+                "/admin/reports",
+                "/dashboard",
+                "/dashboard/app",
+                "/dashboard/tickets/:id",
+                "/landing"
+            ],
+            "{report}"
+        );
+        assert_eq!(
+            bindings(graph),
+            strings(&[
+                "/admin -> AdminLayout@ClientApp/src/layouts/admin.js",
+                "/admin/reports -> Reports@ClientApp/src/pages/Reports.js",
+                "/dashboard -> DashboardLayout@ClientApp/src/layouts/dashboard.js",
+                "/dashboard/app -> DashboardApp@ClientApp/src/pages/DashboardApp.js",
+                "/dashboard/app ~> DashboardLayout@ClientApp/src/layouts/dashboard.js",
+                "/dashboard/tickets/:id -> TicketDetail@ClientApp/src/pages/TicketDetail.js",
+                "/dashboard/tickets/:id ~> DashboardLayout@ClientApp/src/layouts/dashboard.js",
+                "/landing -> LandingPage@ClientApp/src/pages/LandingPage.js",
+            ]),
+            "{report}"
+        );
+        assert_eq!(navigations(graph), strings(&[]), "{report}");
+    }
+
+    /// Upstream `react-router-call-tables.test.ts` (#2668), Medusa's admin dashboard: `const routes = getRouteMap({ … }); createBrowserRouter(routes)` in a class method hands over the table the imported function returns, each lazy route bound to the page its module hands React Router; the tables spread in from parameters stay unread.
+    #[test]
+    fn pr2668_a_table_a_function_returns_is_handed_over_through_a_local() {
+        let project = Project::new()
+            .file("admin/package.json", "{\"name\":\"dashboard\",\"dependencies\":{\"react\":\"^18\",\"react-router-dom\":\"^6\"}}")
+            .file("admin/src/components/main-layout.tsx", "import { Outlet } from 'react-router-dom';\n\nexport const MainLayout = () => {\n  return <Outlet />;\n};\n")
+            .file("admin/src/components/protected-route.tsx", "import { Outlet } from 'react-router-dom';\n\nexport const ProtectedRoute = () => {\n  return <Outlet />;\n};\n")
+            .file("admin/src/components/public-layout.tsx", "import { Outlet } from 'react-router-dom';\n\nexport const PublicLayout = () => {\n  return <Outlet />;\n};\n")
+            .file("admin/src/components/settings-layout.tsx", "import { Outlet } from 'react-router-dom';\n\nexport const SettingsLayout = () => {\n  return <Outlet />;\n};\n")
+            .file("admin/src/dashboard-app/dashboard-app.tsx", "import { createBrowserRouter, RouteObject, RouterProvider } from 'react-router-dom';\nimport { getRouteMap } from './routes/get-route.map';\n\nexport class DashboardApp {\n  private coreRoutes: RouteObject[];\n  private settingsRoutes: RouteObject[];\n\n  constructor({ plugins }: { plugins: { routes: RouteObject[] }[] }) {\n    this.coreRoutes = plugins.flatMap((p) => p.routes);\n    this.settingsRoutes = [];\n  }\n\n  render() {\n    const routes = getRouteMap({\n      settingsRoutes: this.settingsRoutes,\n      coreRoutes: this.coreRoutes,\n    });\n\n    const router = createBrowserRouter(routes, {\n      basename: '/app',\n    });\n\n    return <RouterProvider router={router} />;\n  }\n}\n")
+            .file("admin/src/dashboard-app/routes/get-route.map.tsx", "import { RouteObject } from 'react-router-dom';\nimport { ProtectedRoute } from '../../components/protected-route';\nimport { MainLayout } from '../../components/main-layout';\nimport { SettingsLayout } from '../../components/settings-layout';\nimport { PublicLayout } from '../../components/public-layout';\n\nexport function getRouteMap({\n  settingsRoutes,\n  coreRoutes,\n}: {\n  settingsRoutes: RouteObject[]\n  coreRoutes: RouteObject[]\n}) {\n  return [\n    {\n      element: <ProtectedRoute />,\n      children: [\n        {\n          element: <MainLayout />,\n          children: [\n            {\n              path: '/',\n              lazy: () => import('../../routes/home'),\n            },\n            {\n              path: '/products',\n              children: [\n                {\n                  path: '',\n                  lazy: () => import('../../routes/products/product-list'),\n                  children: [\n                    {\n                      path: 'create',\n                      lazy: () =>\n                        import('../../routes/products/product-create'),\n                    },\n                  ],\n                },\n              ],\n            },\n            ...coreRoutes,\n          ],\n        },\n        {\n          element: <SettingsLayout />,\n          children: [\n            {\n              path: '/settings',\n              lazy: () => import('../../routes/settings'),\n            },\n            ...settingsRoutes.flatMap((r) => r?.children || []),\n          ],\n        },\n      ],\n    },\n    {\n      element: <PublicLayout />,\n      children: [\n        {\n          path: '/login',\n          lazy: () => import('../../routes/login'),\n        },\n      ],\n    },\n  ];\n}\n")
+            .file("admin/src/routes/home/home.tsx", "export const Home = () => {\n  return <div>Home</div>;\n};\n")
+            .file("admin/src/routes/home/index.ts", "export { Home as Component } from './home';\n")
+            .file("admin/src/routes/login/index.ts", "export { Login as Component } from './login';\n")
+            .file("admin/src/routes/login/login.tsx", "export const Login = () => {\n  return <div>Login</div>;\n};\n")
+            .file("admin/src/routes/orders/index.ts", "export { Orders as Component } from './orders';\n")
+            .file("admin/src/routes/orders/orders.tsx", "export const Orders = () => {\n  return <div>Orders</div>;\n};\n")
+            .file("admin/src/routes/products/product-create/index.ts", "export { ProductCreate as Component } from './product-create';\n")
+            .file("admin/src/routes/products/product-create/product-create.tsx", "export const ProductCreate = () => {\n  return <div>ProductCreate</div>;\n};\n")
+            .file("admin/src/routes/products/product-list/index.ts", "export { ProductList as Component } from './product-list';\n")
+            .file("admin/src/routes/products/product-list/product-list.tsx", "export const ProductList = () => {\n  return <div>ProductList</div>;\n};\n")
+            .file("admin/src/routes/settings/index.ts", "export { Settings as Component } from './settings';\n")
+            .file("admin/src/routes/settings/settings.tsx", "export const Settings = () => {\n  return <div>Settings</div>;\n};\n")
+            .index();
+        let graph = project.graph();
+        let report = graph.report();
+        assert_eq!(
+            routes(graph),
+            ["/", "/login", "/products", "/products/create", "/settings"],
+            "{report}"
+        );
+        assert_eq!(
+            bindings(graph),
+            strings(&[
+                "/ -> Home@admin/src/routes/home/home.tsx",
+                "/ ~> MainLayout@admin/src/components/main-layout.tsx",
+                "/ ~> ProtectedRoute@admin/src/components/protected-route.tsx",
+                "/login -> Login@admin/src/routes/login/login.tsx",
+                "/login ~> PublicLayout@admin/src/components/public-layout.tsx",
+                "/products -> ProductList@admin/src/routes/products/product-list/product-list.tsx",
+                "/products ~> MainLayout@admin/src/components/main-layout.tsx",
+                "/products ~> ProtectedRoute@admin/src/components/protected-route.tsx",
+                "/products/create -> ProductCreate@admin/src/routes/products/product-create/product-create.tsx",
+                "/products/create ~> MainLayout@admin/src/components/main-layout.tsx",
+                "/products/create ~> ProductList@admin/src/routes/products/product-list/product-list.tsx",
+                "/products/create ~> ProtectedRoute@admin/src/components/protected-route.tsx",
+                "/settings -> Settings@admin/src/routes/settings/settings.tsx",
+                "/settings ~> ProtectedRoute@admin/src/components/protected-route.tsx",
+                "/settings ~> SettingsLayout@admin/src/components/settings-layout.tsx",
+            ]),
+            "{report}"
+        );
+        assert_eq!(navigations(graph), strings(&[]), "{report}");
+        let home = graph
+            .nodes
+            .iter()
+            .find(|node| node.kind == "route" && node.name == "/")
+            .expect("the / route");
+        assert_eq!(
+            (home.file_path.as_str(), home.start_line),
+            ("admin/src/dashboard-app/routes/get-route.map.tsx", 22),
+            "{report}"
+        );
+    }
+
+    /// Upstream `react-router-call-tables.test.ts` (#2668): the `routes` in the router's own scope, an imported table past a same-named local, a table an export holds as a call's result, an awaited call's, and the tables a router file names inside the one its function returns are read; a menu and a table computed from data are none.
+    #[test]
+    fn pr2668_the_other_ways_a_call_hands_the_router_its_table() {
+        let project = Project::new()
+            .file("package.json", "{\"name\":\"shapes\",\"dependencies\":{\"react\":\"^18\",\"react-router-dom\":\"^6\"}}")
+            .file("src/awaited/boot.jsx", "import { createBrowserRouter } from 'react-router-dom';\nimport { loadRoutes } from './load';\n\nexport async function boot() {\n  const routes = await loadRoutes();\n  return createBrowserRouter(routes);\n}\n")
+            .file("src/awaited/load.jsx", "import { Account } from '../pages';\n\nexport async function loadRoutes() {\n  return [{ path: '/me', element: <Account /> }];\n}\n")
+            .file("src/computed/App.jsx", "import { useRoutes } from 'react-router-dom';\nimport { pageList } from './pages';\n\nfunction buildRoutes(pages) {\n  return pages.map((p) => ({ path: p.path, element: p.element }));\n}\n\nexport default function App() {\n  const routes = buildRoutes(pageList);\n  return useRoutes(routes);\n}\n")
+            .file("src/computed/pages.jsx", "import { HelpIcon } from '../icons';\n\nexport const pageList = [{ path: '/computed', element: <HelpIcon /> }];\n")
+            .file("src/default/App.jsx", "import { useRoutes } from 'react-router-dom';\nimport routes from './routes';\n\nexport default function App() {\n  return useRoutes(routes);\n}\n")
+            .file("src/default/build.jsx", "import { Reports } from '../pages';\n\nexport function buildRoutes() {\n  return [{ path: '/reports', element: <Reports /> }];\n}\n")
+            .file("src/default/routes.js", "import { buildRoutes } from './build';\n\nexport default buildRoutes();\n")
+            .file("src/exported/App.jsx", "import { useRoutes } from 'react-router-dom';\nimport { routes } from './routes';\n\nexport default function App() {\n  return useRoutes(routes);\n}\n")
+            .file("src/exported/routes.jsx", "import { Dashboard } from '../pages';\nimport { getMenu } from '../menu';\n\nexport function menuSize() {\n  const routes = getMenu();\n  return routes.length;\n}\n\nconst makeRoutes = () => [{ path: '/dashboard', element: <Dashboard /> }];\n\nexport const routes = makeRoutes();\n")
+            .file("src/features/todo/routes.jsx", "import { TodoList } from '../../pages';\n\nexport const todoRoutes = [{ path: '/todos', element: <TodoList /> }];\n")
+            .file("src/icons.jsx", "export function HelpIcon() {\n  return <svg />;\n}\nexport function BillingIcon() {\n  return <svg />;\n}\n")
+            .file("src/local/main.jsx", "import { createBrowserRouter } from 'react-router-dom';\nimport { todoRoutes } from '../features/todo/routes';\nimport { Home } from '../pages';\n\nfunction buildRoutes() {\n  return [{ path: '/home', element: <Home /> }, ...todoRoutes];\n}\n\nconst routes = buildRoutes();\n\nexport const router = createBrowserRouter(routes);\n")
+            .file("src/menu.jsx", "import { BillingIcon, HelpIcon } from './icons';\n\nexport function getMenu() {\n  return [\n    { path: '/help', element: <HelpIcon /> },\n    { path: '/billing', element: <BillingIcon /> },\n  ];\n}\n")
+            .file("src/pages.jsx", "export function Home() {\n  return <div>Home</div>;\n}\nexport function Account() {\n  return <div>Account</div>;\n}\nexport function Dashboard() {\n  return <div>Dashboard</div>;\n}\nexport function Landing() {\n  return <div>Landing</div>;\n}\nexport function TodoList() {\n  return <div>TodoList</div>;\n}\nexport function Reports() {\n  return <div>Reports</div>;\n}\n")
+            .file("src/scoped/App.jsx", "import { Link, useRoutes } from 'react-router-dom';\nimport { getMenu } from '../menu';\nimport { getRoutes } from './routes';\n\nfunction Sidebar() {\n  const routes = getMenu();\n  return <nav>{routes.map((r) => <Link key={r.path} to={r.path}>{r.path}</Link>)}</nav>;\n}\n\nexport default function App({ user }) {\n  const routes = getRoutes(user);\n  const element = useRoutes(routes);\n  return <div><Sidebar />{element}</div>;\n}\n")
+            .file("src/scoped/routes.jsx", "import { Account, Home } from '../pages';\n\nexport const getRoutes = (user) => [\n  { path: '/', element: <Home /> },\n  { path: '/account', element: <Account /> },\n];\n")
+            .file("src/shadow/App.jsx", "import { useRoutes } from 'react-router-dom';\nimport routes from './routes';\nimport { getMenu } from '../menu';\n\nfunction Sidebar() {\n  const routes = getMenu();\n  return <ul>{routes.map((r) => <li key={r.path}>{r.path}</li>)}</ul>;\n}\n\nexport default function App() {\n  return useRoutes(routes);\n}\n")
+            .file("src/shadow/routes.jsx", "import { Landing } from '../pages';\n\nconst routes = [{ path: '/landing', element: <Landing /> }];\n\nexport default routes;\n")
+            .index();
+        let graph = project.graph();
+        let report = graph.report();
+        assert_eq!(
+            routes(graph),
+            [
+                "/",
+                "/account",
+                "/dashboard",
+                "/home",
+                "/landing",
+                "/me",
+                "/reports",
+                "/todos"
+            ],
+            "{report}"
+        );
+        assert_eq!(
+            bindings(graph),
+            strings(&[
+                "/ -> Home@src/pages.jsx",
+                "/account -> Account@src/pages.jsx",
+                "/dashboard -> Dashboard@src/pages.jsx",
+                "/home -> Home@src/pages.jsx",
+                "/landing -> Landing@src/pages.jsx",
+                "/me -> Account@src/pages.jsx",
+                "/reports -> Reports@src/pages.jsx",
+                "/todos -> TodoList@src/pages.jsx",
+            ]),
+            "{report}"
+        );
+        assert_eq!(navigations(graph), strings(&[]), "{report}");
+    }
+
+    /// Upstream `react-router-returned-tables.test.ts` (#2672): every `return` of the function's own is a table, past an early `return []` and a callback's, through `useMemo` and a function returning another's; a list a function written inside it returns is none.
+    #[test]
+    fn pr2672_every_table_a_route_building_function_returns() {
+        let project = Project::new()
+            .file("package.json", "{\"name\":\"apps\",\"dependencies\":{\"react\":\"^18\",\"react-router-dom\":\"^6\"}}")
+            .file("src/guarded/App.jsx", "import { useRoutes } from 'react-router-dom';\nimport { getRoutes } from './routes';\n\nexport default function App({ user }) {\n  return useRoutes(getRoutes(user));\n}\n")
+            .file("src/guarded/Me.jsx", "import { useRoutes } from 'react-router-dom';\nimport { meRoutes } from './routes';\n\nexport default function Me() {\n  return useRoutes(meRoutes());\n}\n")
+            .file("src/guarded/routes.jsx", "import { Account, Admin, Dashboard, Landing } from '../pages';\n\nexport function getRoutes(user) {\n  if (!user) return [];\n  if (user.isAdmin) {\n    return [{ path: '/admin', element: <Admin /> }];\n  }\n  return [\n    { path: '/dashboard', element: <Dashboard /> },\n    { path: '/account', element: <Account /> },\n  ];\n}\n\nexport const publicRoutes = (ready) => (ready ? [] : [{ path: '/welcome', element: <Landing /> }]);\n\n// Parameters with calls and arrows of their own in them.\nexport const meRoutes = (user = currentUser(), onLeave = () => null) => [{ path: '/me', element: <Account /> }];\n\nfunction currentUser() {\n  return null;\n}\n")
+            .file("src/memo/App.jsx", "import { useMemo } from 'react';\nimport { useRoutes } from 'react-router-dom';\nimport { getRoutes } from './routes';\n\nexport default function App({ user }) {\n  const routes = useMemo(() => getRoutes(user), [user]);\n  return useRoutes(routes);\n}\n")
+            .file("src/memo/Settings.jsx", "import { useMemo } from 'react';\nimport { useRoutes } from 'react-router-dom';\nimport settingsRoutes from './routes';\n\nexport default function SettingsApp() {\n  const routes = useMemo(settingsRoutes, []);\n  return useRoutes(routes);\n}\n")
+            .file("src/memo/routes.jsx", "import { Reports, Settings } from '../pages';\n\nexport const getRoutes = (user) => [{ path: '/reports', element: <Reports /> }];\n\nexport default function settingsRoutes() {\n  return [{ path: '/settings', element: <Settings /> }];\n}\n")
+            .file("src/nested/App.jsx", "import { useRoutes } from 'react-router-dom';\nimport { appRoutes } from './routes';\n\nexport default function App() {\n  return useRoutes(appRoutes());\n}\n")
+            .file("src/nested/Direct.jsx", "import { useRoutes } from 'react-router-dom';\nimport { buildRoutes } from './build';\n\nexport default function Direct() {\n  return useRoutes(buildRoutes());\n}\n")
+            .file("src/nested/build.jsx", "import { Faq, Help, Home } from '../pages';\n\nexport function buildRoutes() {\n  const note = <p>Don't panic</p>;\n  const menu = () => {\n    return [{ path: '/help', element: <Help /> }];\n  };\n  function faqRoutes() {\n    return [{ path: '/faq', element: <Faq /> }];\n  }\n  return [{ path: '/', element: <Home />, handle: { note, links: menu() }, loader() { return [faqRoutes()]; } }];\n}\n")
+            .file("src/nested/routes.jsx", "import { buildRoutes } from './build';\n\nexport function appRoutes() {\n  return buildRoutes();\n}\n")
+            .file("src/pages.jsx", "export function Home() {\n  return <div>Home</div>;\n}\nexport function Login() {\n  return <div>Login</div>;\n}\nexport function Orders() {\n  return <div>Orders</div>;\n}\nexport function OrderDetail() {\n  return <div>OrderDetail</div>;\n}\nexport function Admin() {\n  return <div>Admin</div>;\n}\nexport function Account() {\n  return <div>Account</div>;\n}\nexport function Reports() {\n  return <div>Reports</div>;\n}\nexport function Help() {\n  return <div>Help</div>;\n}\nexport function Faq() {\n  return <div>Faq</div>;\n}\nexport function Settings() {\n  return <div>Settings</div>;\n}\nexport function Dashboard() {\n  return <div>Dashboard</div>;\n}\nexport function Landing() {\n  return <div>Landing</div>;\n}\nexport function NotFound() {\n  return <div>NotFound</div>;\n}\n")
+            .file("src/permissions/App.jsx", "import { createBrowserRouter, RouterProvider } from 'react-router-dom';\nimport { generateRoutes } from './routes';\n\nexport default function App({ permissions }) {\n  const dynamicRoutes = generateRoutes(permissions);\n  const router = createBrowserRouter(dynamicRoutes);\n  return <RouterProvider router={router} />;\n}\n")
+            .file("src/permissions/routes.jsx", "import { Home, Login, NotFound, Orders, OrderDetail } from '../pages';\n\nexport const generateRoutes = (permissions) => {\n  const dynamicRoutes = [];\n  permissions.forEach((currentPerm) => {\n    if (!currentPerm.module) return [];\n    dynamicRoutes.push({ path: `/${currentPerm.module}`, element: <Orders /> });\n  });\n  return [\n    { path: '/login', element: <Login /> },\n    {\n      path: '/',\n      children: [{ path: '/', element: <Home /> }, { path: '/orders/:id', element: <OrderDetail /> }, ...dynamicRoutes],\n    },\n    { path: '*', element: <NotFound /> },\n  ];\n};\n")
+            .index();
+        let graph = project.graph();
+        let report = graph.report();
+        assert_eq!(
+            routes(graph),
+            [
+                "/",
+                "/",
+                "/*",
+                "/account",
+                "/admin",
+                "/dashboard",
+                "/login",
+                "/me",
+                "/orders/:id",
+                "/reports",
+                "/settings"
+            ],
+            "{report}"
+        );
+        assert_eq!(
+            bindings(graph),
+            strings(&[
+                "/ -> Home@src/pages.jsx",
+                "/ -> Home@src/pages.jsx",
+                "/* -> NotFound@src/pages.jsx",
+                "/account -> Account@src/pages.jsx",
+                "/admin -> Admin@src/pages.jsx",
+                "/dashboard -> Dashboard@src/pages.jsx",
+                "/login -> Login@src/pages.jsx",
+                "/me -> Account@src/pages.jsx",
+                "/orders/:id -> OrderDetail@src/pages.jsx",
+                "/reports -> Reports@src/pages.jsx",
+                "/settings -> Settings@src/pages.jsx",
+            ]),
+            "{report}"
+        );
+        assert_eq!(navigations(graph), strings(&[]), "{report}");
+    }
+
+    /// KEEP-RUST: upstream's `addRouteTo` keeps the first route at a path in
+    /// node order, which a sync changes; a path two routes of one app serve
+    /// stays unresolved instead, and each app of a monorepo answers its own
+    /// calls.
+    #[test]
+    fn keep_rust_a_path_two_routes_of_an_app_serve_stays_unresolved() {
+        let project = Project::new()
+            .file("package.json", "{\"name\":\"mono\",\"private\":true}\n")
+            .file(
+                "apps/web/package.json",
+                "{\"name\":\"web\",\"dependencies\":{\"react\":\"18\",\"react-router-dom\":\"6\"}}\n",
+            )
+            .file(
+                "apps/admin/package.json",
+                "{\"name\":\"admin\",\"dependencies\":{\"react\":\"18\",\"react-router-dom\":\"6\"}}\n",
+            )
+            .file(
+                "apps/web/src/App.tsx",
+                "import { Routes, Route } from 'react-router-dom';\nexport function App() {\n  return <Routes>\n    <Route path=\"/login\" element={<Login />} />\n    <Route path=\"/help\" element={<Help />} />\n  </Routes>;\n}\nfunction Login() { return null; }\nfunction Help() { return null; }\n",
+            )
+            .file(
+                "apps/web/src/Other.tsx",
+                "import { Routes, Route } from 'react-router-dom';\nexport function Other() {\n  return <Routes>\n    <Route path=\"/help\" element={<HelpAgain />} />\n  </Routes>;\n}\nfunction HelpAgain() { return null; }\n",
+            )
+            .file(
+                "apps/admin/src/App.tsx",
+                "import { Routes, Route } from 'react-router-dom';\nexport function AdminApp() {\n  return <Routes>\n    <Route path=\"/login\" element={<AdminLogin />} />\n  </Routes>;\n}\nfunction AdminLogin() { return null; }\n",
+            )
+            .file(
+                "apps/web/src/Nav.tsx",
+                "import { useNavigate } from 'react-router-dom';\nexport function webLogin() {\n  const navigate = useNavigate();\n  navigate('/login');\n}\nexport function webHelp() {\n  const navigate = useNavigate();\n  navigate('/help');\n}\n",
+            )
+            .file(
+                "apps/admin/src/Nav.tsx",
+                "import { useNavigate } from 'react-router-dom';\nexport function adminLogin() {\n  const navigate = useNavigate();\n  navigate('/login');\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        assert_eq!(
+            navigations(graph),
+            [
+                "adminLogin -> /login (navigate /login) react-router",
+                "webLogin -> /login (navigate /login) react-router",
+            ],
+            "{}",
+            graph.report()
+        );
+        graph.assert_edge(
+            "function webLogin",
+            "navigates",
+            "route apps/web/src/App.tsx::route:/login",
+            Some("framework"),
+        );
+        graph.assert_edge(
+            "function adminLogin",
+            "navigates",
+            "route apps/admin/src/App.tsx::route:/login",
+            Some("framework"),
+        );
+        graph.assert_unresolved("function webHelp", "calls", "navigate");
+    }
+}
+
+mod tanstack_router {
+    use super::support::{EdgeRow, Graph, Project};
+
+    /// The `navigates` edges out of the one function named `name`.
+    fn navigations<'g>(graph: &'g Graph, name: &str) -> Vec<&'g EdgeRow> {
+        let from = graph.nodes_named("function", name);
+        assert_eq!(from.len(), 1, "function {name}\n{}", graph.report());
+        graph
+            .edges
+            .iter()
+            .filter(|edge| edge.kind == "navigates" && edge.source == from[0].id)
+            .collect()
+    }
+
+    /// Upstream F5 (`tanstack-router.test.ts`, "a routed app end to end",
+    /// without its Screens half, the viewer's): file-based routes named by
+    /// their pattern, one per address, each calling its component;
+    /// `navigate({ to })` and `throw redirect({ to })` reach the route the
+    /// pattern names; a pattern nothing serves and a search-only navigation
+    /// stay unresolved. The link pass (W7-18a): a `<Link to>` names the
+    /// route PATTERN, its params beside it.
+    #[test]
+    fn f5_a_tanstack_app_routes_and_navigates_by_pattern() {
+        let project = Project::new()
+            .file(
+                "package.json",
+                "{\"name\":\"app\",\"dependencies\":{\"react\":\"19\",\"@tanstack/react-router\":\"1\"}}\n",
+            )
+            .file(
+                "src/routes/index.tsx",
+                "import { createFileRoute, Link } from '@tanstack/react-router'\nexport const Route = createFileRoute('/')({ component: IndexComponent })\nfunction IndexComponent() {\n  return (\n    <div>\n      <Link\n        to=\"/posts/$postId\"\n        params={{ postId: 3 }}\n      >\n        A post\n      </Link>\n      <Link to=\"/login\">Sign in</Link>\n    </div>\n  )\n}\n",
+            )
+            .file(
+                "src/routes/posts.route.tsx",
+                "import { createFileRoute, Outlet } from '@tanstack/react-router'\nexport const Route = createFileRoute('/posts')({ component: PostsLayout })\nfunction PostsLayout() {\n  return <Outlet />\n}\n",
+            )
+            .file(
+                "src/routes/posts.index.tsx",
+                "import { createFileRoute } from '@tanstack/react-router'\nexport const Route = createFileRoute('/posts/')({ component: PostsIndexComponent })\nfunction PostsIndexComponent() {\n  return <div>Posts</div>\n}\n",
+            )
+            .file(
+                "src/routes/posts.$postId.tsx",
+                "import { createFileRoute } from '@tanstack/react-router'\nexport const Route = createFileRoute('/posts/$postId')({ component: PostComponent })\nfunction PostComponent() {\n  return <div>Post</div>\n}\n",
+            )
+            .file(
+                "src/routes/login.tsx",
+                "import { createFileRoute, useNavigate } from '@tanstack/react-router'\nexport const Route = createFileRoute('/login')({ component: LoginComponent })\nfunction LoginComponent() {\n  const navigate = useNavigate()\n  async function submit(creds) {\n    const ok = await signIn(creds)\n    if (ok) navigate({ to: '/dashboard' })\n  }\n  return <form onSubmit={submit} />\n}\n",
+            )
+            .file(
+                "src/routes/_auth.tsx",
+                "import { createFileRoute, redirect } from '@tanstack/react-router'\nexport const Route = createFileRoute('/_auth')({\n  beforeLoad: ({ context }) => {\n    if (context.auth.status === 'loggedOut') {\n      throw redirect({ to: '/login' })\n    }\n  },\n})\n",
+            )
+            .file(
+                "src/routes/_auth.dashboard.tsx",
+                "import { createFileRoute, Link } from '@tanstack/react-router'\nexport const Route = createFileRoute('/_auth/dashboard')({ component: DashboardComponent })\nfunction DashboardComponent() {\n  return <Link to=\"/posts\">All posts</Link>\n}\n",
+            )
+            .file(
+                "src/routes/settings.tsx",
+                "import { createFileRoute, useNavigate } from '@tanstack/react-router'\nexport const Route = createFileRoute('/settings')({ component: SettingsComponent })\nfunction SettingsComponent() {\n  const navigate = useNavigate()\n  function nowhere() {\n    navigate({ to: '/no-such-route' })\n  }\n  function filter() {\n    navigate({ search: (old) => ({ ...old, page: 2 }) })\n  }\n  return <button onClick={nowhere} />\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        let mut routes: Vec<&str> = graph
+            .nodes
+            .iter()
+            .filter(|node| node.kind == "route")
+            .map(|node| node.name.as_str())
+            .collect();
+        routes.sort_unstable();
+        assert_eq!(
+            routes,
+            [
+                "/",
+                "/dashboard",
+                "/login",
+                "/posts",
+                "/posts/:postId",
+                "/settings"
+            ],
+            "{}",
+            graph.report()
+        );
+        // `/posts` is the index page, not the `posts.route.tsx` layout beside
+        // it; `_auth.dashboard.tsx` is the page at `/dashboard`.
+        graph.assert_edge(
+            "route src/routes/posts.index.tsx::route:/posts",
+            "calls",
+            "function PostsIndexComponent",
+            None,
+        );
+        graph.assert_edge(
+            "route src/routes/_auth.dashboard.tsx::route:/dashboard",
+            "calls",
+            "function DashboardComponent",
+            None,
+        );
+        let submit = navigations(graph, "submit");
+        assert_eq!(submit.len(), 1, "{}", graph.report());
+        assert_eq!(
+            graph
+                .node(&submit[0].target)
+                .map(|node| node.qualified_name.as_str()),
+            Some("src/routes/_auth.dashboard.tsx::route:/dashboard")
+        );
+        assert_eq!(submit[0].metadata["href"], "/dashboard");
+        assert_eq!(submit[0].metadata["navMethod"], "navigate");
+        assert_eq!(submit[0].metadata["framework"], "tanstack-router");
+        // The guard's thrown redirect goes to the login page.
+        let redirects: Vec<&EdgeRow> = graph
+            .edges
+            .iter()
+            .filter(|edge| {
+                edge.kind == "navigates"
+                    && graph
+                        .node(&edge.source)
+                        .is_some_and(|node| node.file_path == "src/routes/_auth.tsx")
+            })
+            .collect();
+        assert_eq!(redirects.len(), 1, "{}", graph.report());
+        assert_eq!(
+            graph
+                .node(&redirects[0].target)
+                .map(|node| node.qualified_name.as_str()),
+            Some("src/routes/login.tsx::route:/login")
+        );
+        assert_eq!(redirects[0].metadata["href"], "/login");
+        assert_eq!(redirects[0].metadata["navMethod"], "redirect");
+        assert!(
+            navigations(graph, "nowhere").is_empty(),
+            "{}",
+            graph.report()
+        );
+        assert!(
+            navigations(graph, "filter").is_empty(),
+            "{}",
+            graph.report()
+        );
+        let hrefs = |name: &str| -> Vec<String> {
+            let mut hrefs: Vec<String> = navigations(graph, name)
+                .into_iter()
+                .map(|edge| edge.metadata["href"].as_str().unwrap_or("").to_string())
+                .collect();
+            hrefs.sort();
+            hrefs
+        };
+        assert_eq!(
+            hrefs("IndexComponent"),
+            ["/login", "/posts/:postId"],
+            "{}",
+            graph.report()
+        );
+        let link = navigations(graph, "IndexComponent")
+            .into_iter()
+            .find(|edge| {
+                graph
+                    .node(&edge.target)
+                    .is_some_and(|node| node.name == "/posts/:postId")
+            })
+            .expect("the link to the post");
+        assert_eq!(link.provenance.as_deref(), Some("heuristic"));
+        assert_eq!(link.metadata["synthesizedBy"], "tanstack-link");
+        assert_eq!(link.metadata["href"], "/posts/:postId");
+        assert_eq!(link.metadata["navMethod"], "link");
+        assert_eq!(
+            hrefs("DashboardComponent"),
+            ["/posts"],
+            "{}",
+            graph.report()
+        );
+    }
+}
+
+mod vue_router {
+    use super::support::{EdgeRow, Graph, Project};
+
+    /// The `navigates` edges out of the one function named `name`.
+    fn navigations<'g>(graph: &'g Graph, name: &str) -> Vec<&'g EdgeRow> {
+        let from = graph.nodes_named("function", name);
+        assert_eq!(from.len(), 1, "function {name}\n{}", graph.report());
+        graph
+            .edges
+            .iter()
+            .filter(|edge| edge.kind == "navigates" && edge.source == from[0].id)
+            .collect()
+    }
+
+    fn route_names(graph: &Graph) -> Vec<&str> {
+        let mut routes: Vec<&str> = graph
+            .nodes
+            .iter()
+            .filter(|node| node.kind == "route")
+            .map(|node| node.name.as_str())
+            .collect();
+        routes.sort_unstable();
+        routes
+    }
+
+    /// The files the `kind` edges out of the route named `name` reach.
+    fn targets_of<'g>(graph: &'g Graph, name: &str, kind: &str) -> Vec<&'g str> {
+        let route = graph
+            .nodes
+            .iter()
+            .find(|node| node.kind == "route" && node.name == name)
+            .unwrap_or_else(|| panic!("no route {name}\n{}", graph.report()));
+        graph
+            .edges
+            .iter()
+            .filter(|edge| edge.kind == kind && edge.source == route.id)
+            .filter_map(|edge| graph.node(&edge.target))
+            .map(|node| node.file_path.as_str())
+            .collect()
+    }
+
+    /// Upstream F6 (`vue-router.test.ts`, "a routed app end to end",
+    /// without its Screens half, the viewer's): vue-realworld's table of
+    /// lazy views, each route calling the `.vue` component it names;
+    /// `router.push({ name })` reaches the route of that name and
+    /// `router.push({ path })` the route at that path; a destination nothing
+    /// declares and an array's `push` stay unresolved. The link pass
+    /// (W7-18a): a `<router-link>` navigates from the component that
+    /// renders it, by name or by path, and an external `<a href>` does not.
+    #[test]
+    fn f6_a_vue_router_app_routes_and_navigates_by_name() {
+        let project = Project::new()
+            .file(
+                "package.json",
+                "{\"name\":\"conduit\",\"dependencies\":{\"vue\":\"3\",\"vue-router\":\"4\"}}\n",
+            )
+            .file(
+                "src/router/index.js",
+                "import { createRouter, createWebHistory } from \"vue-router\"\nconst router = createRouter({\n  history: createWebHistory(),\n  routes: [\n    { name: \"home\", path: \"/\", component: () => import(\"@/views/Home\") },\n    { name: \"login\", path: \"/login\", component: () => import(\"@/views/Login\") },\n    { name: \"register\", path: \"/register\", component: () => import(\"@/views/Register\") },\n    { name: \"settings\", path: \"/settings\", component: () => import(\"@/views/Settings\") },\n    { name: \"profile\", path: \"/profile/:username\", component: () => import(\"@/views/Profile\") }\n  ]\n})\nexport default router\n",
+            )
+            .file(
+                "src/views/Home.vue",
+                "<template>\n  <div><TheHeader /></div>\n</template>\n<script setup>\nimport { useRouter } from \"vue-router\"\nimport TheHeader from \"@/components/TheHeader.vue\"\nconst router = useRouter()\nfunction goTo(tag) {\n  router.push({ path: \"/\", query: { tag } })\n}\n</script>\n",
+            )
+            .file(
+                "src/views/Login.vue",
+                "<template>\n  <form @submit=\"submit\"><router-link :to=\"{ name: 'register' }\">Need an account?</router-link></form>\n</template>\n<script setup>\nimport { useRouter } from \"vue-router\"\nconst router = useRouter()\nfunction submit() {\n  login().then(() => router.push({ name: \"home\" }))\n}\n</script>\n",
+            )
+            .file(
+                "src/views/Register.vue",
+                "<template>\n  <router-link to=\"/login\">Have an account?</router-link>\n</template>\n<script setup>\nconst nothing = 1\n</script>\n",
+            )
+            .file(
+                "src/views/Settings.vue",
+                "<template>\n  <button @click=\"save\">Save</button>\n</template>\n<script setup>\nimport { useRouter } from \"vue-router\"\nconst router = useRouter()\nconst target = \"/nowhere\"\nfunction save(user) {\n  router.push({ name: \"profile\", params: { username: user.username } })\n}\nfunction bail() {\n  router.push(target)\n}\n</script>\n",
+            )
+            .file(
+                "src/views/Profile.vue",
+                "<template>\n  <div>Profile</div>\n</template>\n<script setup>\nconst x = 1\n</script>\n",
+            )
+            .file(
+                "src/components/TheHeader.vue",
+                "<template>\n  <nav>\n    <router-link :to=\"{ name: 'home' }\">Home</router-link>\n    <router-link to=\"/settings\">Settings</router-link>\n    <a href=\"https://example.com\">Elsewhere</a>\n  </nav>\n</template>\n<script setup>\nconst y = 1\n</script>\n",
+            )
+            .file(
+                "src/utils/trail.js",
+                "export function trail() {\n  const paths = []\n  paths.push(\"/login\")\n  return paths\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        assert_eq!(
+            route_names(graph),
+            [
+                "/",
+                "/login",
+                "/profile/:username",
+                "/register",
+                "/settings"
+            ],
+            "{}",
+            graph.report()
+        );
+        // The binding is a `calls` edge to the `.vue` view's component.
+        graph.assert_edge(
+            "route src/router/index.js::route:/login",
+            "calls",
+            "component src/views/Login.vue::Login",
+            None,
+        );
+        let submit = navigations(graph, "submit");
+        assert_eq!(submit.len(), 1, "{}", graph.report());
+        assert_eq!(
+            graph
+                .node(&submit[0].target)
+                .map(|node| node.qualified_name.as_str()),
+            Some("src/router/index.js::route:/")
+        );
+        assert_eq!(submit[0].metadata["href"], "home");
+        assert_eq!(submit[0].metadata["navMethod"], "push");
+        assert_eq!(submit[0].metadata["by"], "name");
+        assert_eq!(submit[0].metadata["framework"], "vue-router");
+        let save = navigations(graph, "save");
+        assert_eq!(save.len(), 1, "{}", graph.report());
+        assert_eq!(
+            graph
+                .node(&save[0].target)
+                .map(|node| node.qualified_name.as_str()),
+            Some("src/router/index.js::route:/profile/:username")
+        );
+        assert_eq!(save[0].metadata["href"], "profile");
+        let go_to = navigations(graph, "goTo");
+        assert_eq!(go_to.len(), 1, "{}", graph.report());
+        assert_eq!(
+            graph
+                .node(&go_to[0].target)
+                .map(|node| node.qualified_name.as_str()),
+            Some("src/router/index.js::route:/")
+        );
+        assert_eq!(go_to[0].metadata["href"], "/");
+        assert!(go_to[0].metadata.get("by").is_none());
+        assert!(navigations(graph, "bail").is_empty(), "{}", graph.report());
+        assert!(navigations(graph, "trail").is_empty(), "{}", graph.report());
+        let links = |name: &str| -> Vec<&EdgeRow> {
+            let from = graph.nodes_named("component", name);
+            assert_eq!(from.len(), 1, "component {name}\n{}", graph.report());
+            graph
+                .edges
+                .iter()
+                .filter(|edge| edge.kind == "navigates" && edge.source == from[0].id)
+                .collect()
+        };
+        let hrefs = |name: &str| -> Vec<String> {
+            let mut hrefs: Vec<String> = links(name)
+                .into_iter()
+                .map(|edge| edge.metadata["href"].as_str().unwrap_or("").to_string())
+                .collect();
+            hrefs.sort();
+            hrefs
+        };
+        assert_eq!(
+            hrefs("TheHeader"),
+            ["/settings", "home"],
+            "{}",
+            graph.report()
+        );
+        let header = links("TheHeader");
+        let home = header
+            .iter()
+            .find(|edge| edge.metadata["href"] == "home")
+            .expect("the named link");
+        assert_eq!(
+            graph
+                .node(&home.target)
+                .map(|node| node.qualified_name.as_str()),
+            Some("src/router/index.js::route:/")
+        );
+        assert_eq!(home.provenance.as_deref(), Some("heuristic"));
+        assert_eq!(home.metadata["synthesizedBy"], "vue-router-link");
+        assert_eq!(home.metadata["navMethod"], "link");
+        assert_eq!(home.metadata["by"], "name");
+        let settings = header
+            .iter()
+            .find(|edge| edge.metadata["href"] == "/settings")
+            .expect("the link by path");
+        assert_eq!(
+            graph
+                .node(&settings.target)
+                .map(|node| node.qualified_name.as_str()),
+            Some("src/router/index.js::route:/settings")
+        );
+        assert!(settings.metadata.get("by").is_none());
+        assert_eq!(hrefs("Register"), ["/login"], "{}", graph.report());
+    }
+
+    /// W7-18a (KEEP-RUST, as W7-11's `router.push({ name })`): a
+    /// `<router-link :to="{ name }">` whose name two routes of the app carry
+    /// names nothing, and the route of a name one route carries is reached.
+    /// Upstream keeps one route of a name, by node order.
+    #[test]
+    fn keep_rust_w718a_a_link_by_a_name_two_routes_carry_reaches_nothing() {
+        let view = |name: &str| {
+            format!(
+                "<template>\n  <div>{name}</div>\n</template>\n<script setup>\nconst x = 1\n</script>\n"
+            )
+        };
+        let project = Project::new()
+            .file(
+                "package.json",
+                "{\"name\":\"app\",\"dependencies\":{\"vue\":\"3\",\"vue-router\":\"4\"}}\n",
+            )
+            .file(
+                "src/router/index.js",
+                "import { createRouter, createWebHistory } from \"vue-router\"\nconst router = createRouter({\n  history: createWebHistory(),\n  routes: [\n    { name: \"dup\", path: \"/a\", component: () => import(\"@/views/A\") },\n    { name: \"dup\", path: \"/b\", component: () => import(\"@/views/B\") },\n    { name: \"only\", path: \"/c\", component: () => import(\"@/views/C\") }\n  ]\n})\nexport default router\n",
+            )
+            .file("src/views/A.vue", &view("A"))
+            .file("src/views/B.vue", &view("B"))
+            .file("src/views/C.vue", &view("C"))
+            .file(
+                "src/components/Menu.vue",
+                "<template>\n  <nav>\n    <router-link :to=\"{ name: 'dup' }\">Dup</router-link>\n    <router-link :to=\"{ name: 'only' }\">Only</router-link>\n  </nav>\n</template>\n<script setup>\nconst y = 1\n</script>\n",
+            )
+            .index();
+        let graph = project.graph();
+        let menu = graph.nodes_named("component", "Menu");
+        assert_eq!(menu.len(), 1, "{}", graph.report());
+        let targets: Vec<&str> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.kind == "navigates" && edge.source == menu[0].id)
+            .filter_map(|edge| graph.node(&edge.target))
+            .map(|node| node.name.as_str())
+            .collect();
+        assert_eq!(targets, ["/c"], "{}", graph.report());
+    }
+
+    /// W7-18a (upstream `vueRouterLinkEdges`): a bound `:to` holding a
+    /// `{ path }` object or a string names its route by path, and a `to`
+    /// written as an absolute URL leaves the site, though the app has the
+    /// route the URL's path names.
+    #[test]
+    fn w718a_a_bound_to_reads_a_path_object_or_a_string_never_a_url() {
+        let view = |name: &str| {
+            format!(
+                "<template>\n  <div>{name}</div>\n</template>\n<script setup>\nconst x = 1\n</script>\n"
+            )
+        };
+        let project = Project::new()
+            .file(
+                "package.json",
+                "{\"name\":\"app\",\"dependencies\":{\"vue\":\"3\",\"vue-router\":\"4\"}}\n",
+            )
+            .file(
+                "src/router/index.js",
+                "import { createRouter, createWebHistory } from \"vue-router\"\nconst router = createRouter({\n  history: createWebHistory(),\n  routes: [\n    { path: \"/a\", component: () => import(\"@/views/A\") },\n    { path: \"/b\", component: () => import(\"@/views/B\") },\n    { path: \"/c\", component: () => import(\"@/views/C\") }\n  ]\n})\nexport default router\n",
+            )
+            .file("src/views/A.vue", &view("A"))
+            .file("src/views/B.vue", &view("B"))
+            .file("src/views/C.vue", &view("C"))
+            .file(
+                "src/components/Menu.vue",
+                "<template>\n  <nav>\n    <router-link :to=\"{ path: '/a' }\">A</router-link>\n    <router-link :to=\"'/b'\">B</router-link>\n    <router-link to=\"https://example.com/c\">C</router-link>\n  </nav>\n</template>\n<script setup>\nconst y = 1\n</script>\n",
+            )
+            .index();
+        let graph = project.graph();
+        let menu = graph.nodes_named("component", "Menu");
+        assert_eq!(menu.len(), 1, "{}", graph.report());
+        let mut targets: Vec<&str> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.kind == "navigates" && edge.source == menu[0].id)
+            .filter_map(|edge| graph.node(&edge.target))
+            .map(|node| node.name.as_str())
+            .collect();
+        targets.sort_unstable();
+        assert_eq!(targets, ["/a", "/b"], "{}", graph.report());
+    }
+
+    /// Upstream F6 (`vue-element-admin`): named tables, `new Router`, a
+    /// module file's table object, children joined onto their parents, and
+    /// parents that redirect into their children as frames, not pages. Each
+    /// lazy `index` view binds to its own file's component, a child's
+    /// parent component is the layout around it, and `this.$router.push({
+    /// name })` reaches the composed child. TagsView's `this.$router.replace({
+    /// path: '/redirect' + fullPath })` goes where `fullPath` says, so it
+    /// reaches no route, not the `/redirect` frame its literal head names.
+    #[test]
+    fn f6_an_admin_template_routes_its_tables() {
+        let view = |name: &str| {
+            format!(
+                "<template><div>{name}</div></template>\n<script>\nexport default {{ name: '{name}' }}\n</script>\n"
+            )
+        };
+        let project = Project::new()
+            .file(
+                "package.json",
+                "{\"name\":\"admin\",\"dependencies\":{\"vue\":\"^2.6.0\",\"vue-router\":\"^3.0.0\"}}\n",
+            )
+            .file(
+                "src/router/index.js",
+                "import Vue from 'vue'\nimport Router from 'vue-router'\nimport Layout from '@/layout'\nimport tableRouter from './modules/table'\nVue.use(Router)\n\nexport const constantRoutes = [\n  {\n    path: '/redirect',\n    component: Layout,\n    hidden: true,\n    children: [\n      {\n        path: '/redirect/:path(.*)',\n        component: () => import('@/views/redirect/index')\n      }\n    ]\n  },\n  { path: '/login', component: () => import('@/views/login/index'), hidden: true },\n  {\n    path: '/',\n    component: Layout,\n    redirect: '/dashboard',\n    children: [\n      { path: 'dashboard', component: () => import('@/views/dashboard/index'), name: 'Dashboard' }\n    ]\n  }\n]\n\nexport const asyncRoutes = [tableRouter, { path: '*', redirect: '/404', hidden: true }]\n\nconst createRouter = () => new Router({ routes: constantRoutes })\nexport default createRouter()\n",
+            )
+            .file(
+                "src/router/modules/table.js",
+                "import Layout from '@/layout'\n\nconst tableRouter = {\n  path: '/table',\n  component: Layout,\n  redirect: '/table/complex-table',\n  name: 'Table',\n  children: [\n    { path: 'complex-table', component: () => import('@/views/table/complex-table'), name: 'ComplexTable' }\n  ]\n}\nexport default tableRouter\n",
+            )
+            .file("src/layout/index.vue", &view("Layout"))
+            .file(
+                "src/views/login/index.vue",
+                "<template><button @click=\"go\">in</button></template>\n<script>\nexport default {\n  name: 'Login',\n  methods: {\n    go() { this.$router.push({ name: 'Dashboard' }) }\n  }\n}\n</script>\n",
+            )
+            .file("src/views/dashboard/index.vue", &view("Dashboard"))
+            .file("src/views/table/complex-table.vue", &view("ComplexTable"))
+            .file("src/views/redirect/index.vue", &view("Redirect"))
+            .file(
+                "src/layout/components/TagsView/index.vue",
+                "<template><div class=\"tags-view-container\"></div></template>\n<script>\nexport default {\n  name: 'TagsView',\n  methods: {\n    refreshSelectedTag(view) {\n      this.$store.dispatch('tagsView/delCachedView', view).then(() => {\n        const { fullPath } = view\n        this.$nextTick(() => {\n          this.$router.replace({\n            path: '/redirect' + fullPath\n          })\n        })\n      })\n    }\n  }\n}\n</script>\n",
+            )
+            .index();
+        let graph = project.graph();
+        assert_eq!(
+            route_names(graph),
+            [
+                "/dashboard",
+                "/login",
+                "/redirect",
+                "/redirect/:path(.*)",
+                "/table/complex-table"
+            ],
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            targets_of(graph, "/dashboard", "calls"),
+            ["src/views/dashboard/index.vue"],
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            targets_of(graph, "/login", "calls"),
+            ["src/views/login/index.vue"],
+            "{}",
+            graph.report()
+        );
+        let layouts: Vec<&EdgeRow> = graph
+            .edges
+            .iter()
+            .filter(|edge| {
+                edge.kind == "references"
+                    && graph.node(&edge.source).is_some_and(|node| {
+                        node.kind == "route" && node.name == "/table/complex-table"
+                    })
+            })
+            .collect();
+        assert_eq!(layouts.len(), 1, "{}", graph.report());
+        assert_eq!(
+            graph
+                .node(&layouts[0].target)
+                .map(|node| node.file_path.as_str()),
+            Some("src/layout/index.vue")
+        );
+        assert_eq!(layouts[0].metadata["layout"], true);
+        let navigations: Vec<&str> = graph
+            .edges
+            .iter()
+            .filter(|edge| {
+                edge.kind == "navigates"
+                    && graph
+                        .node(&edge.source)
+                        .is_some_and(|node| node.file_path == "src/views/login/index.vue")
+            })
+            .filter_map(|edge| graph.node(&edge.target))
+            .map(|node| node.name.as_str())
+            .collect();
+        assert_eq!(navigations, ["/dashboard"], "{}", graph.report());
+        assert!(
+            !graph.edges.iter().any(|edge| {
+                edge.kind == "navigates"
+                    && graph.node(&edge.source).is_some_and(|node| {
+                        node.file_path == "src/layout/components/TagsView/index.vue"
+                    })
+            }),
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// A route renders only what its import takes, through the real
+    /// pipeline: a default import's SFC, a named import through the barrel
+    /// that re-exports it, and a statement's second declarator, exported
+    /// there or through an export list. An import of a module nothing finds,
+    /// a module without the export, a module whose only declaration of the
+    /// name is nested in an exported function, named or anonymous, or is
+    /// what `export default` declares, and a lazy import nothing finds
+    /// render nothing, though the project has components of those names:
+    /// neither Vue Router, the Vue resolver nor name matching binds a
+    /// namesake.
+    #[test]
+    fn f6_a_route_renders_only_what_its_import_takes() {
+        let sfc = |name: &str| {
+            format!(
+                "<template><div>{name}</div></template>\n<script setup lang=\"ts\">\nconst title = '{name}'\n</script>\n"
+            )
+        };
+        let project = Project::new()
+            .file(
+                "package.json",
+                "{\"name\":\"admin\",\"dependencies\":{\"vue\":\"3\",\"vue-router\":\"4\"}}\n",
+            )
+            .file(
+                "src/router/index.ts",
+                "import { createRouter, createWebHistory } from 'vue-router'\nimport Home from '@/views/Home.vue'\nimport { FrameLayout } from '@/layouts'\nimport { Missing } from '#/missing-module'\nimport { Gone } from '@/layouts'\nimport { Nested } from '@/layouts/nested'\nimport { Anon } from '@/layouts/anon'\nimport { Second, Listed, Main } from '@/layouts/multi'\nexport default createRouter({\n  history: createWebHistory(),\n  routes: [\n    { path: '/', component: Home },\n    { path: '/frame', component: FrameLayout },\n    { path: '/missing', component: Missing },\n    { path: '/gone', component: Gone },\n    { path: '/nested', component: Nested },\n    { path: '/anon', component: Anon },\n    { path: '/second', component: Second },\n    { path: '/listed', component: Listed },\n    { path: '/main', component: Main },\n    { path: '/lost', component: () => import('@/views/nowhere/Lost.vue') },\n  ],\n})\n",
+            )
+            .file(
+                "src/layouts/index.ts",
+                "export { default as FrameLayout } from './frame.vue'\n",
+            )
+            .file("src/layouts/frame.vue", &sfc("frame"))
+            .file(
+                "src/layouts/nested.ts",
+                "export function Outer() {\n  function Nested() {\n    return null\n  }\n  return Nested\n}\n",
+            )
+            .file("src/views/Nested.vue", &sfc("Nested"))
+            .file(
+                "src/layouts/anon.ts",
+                "export default function () {\n  function Anon() {\n    return null\n  }\n  return Anon\n}\n",
+            )
+            .file("src/views/Anon.vue", &sfc("Anon"))
+            .file(
+                "src/layouts/multi.ts",
+                "export const Other = 1, Second = defineComponent({ name: 'Second' })\nconst First = 1,\n  Listed = () => null\nexport { Listed }\nexport default function Main() {\n  return null\n}\n",
+            )
+            .file("src/views/Second.vue", &sfc("Second"))
+            .file("src/views/Listed.vue", &sfc("Listed"))
+            .file("src/views/Main.vue", &sfc("Main"))
+            .file("src/views/Home.vue", &sfc("Home"))
+            .file("src/views/Missing.vue", &sfc("Missing"))
+            .file("src/views/Gone.vue", &sfc("Gone"))
+            .file("src/views/Lost.vue", &sfc("Lost"))
+            .index();
+        let graph = project.graph();
+        assert_eq!(
+            route_names(graph),
+            [
+                "/", "/anon", "/frame", "/gone", "/listed", "/lost", "/main", "/missing",
+                "/nested", "/second"
+            ],
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            targets_of(graph, "/", "calls"),
+            ["src/views/Home.vue"],
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            targets_of(graph, "/frame", "calls"),
+            ["src/layouts/frame.vue"],
+            "{}",
+            graph.report()
+        );
+        // Vue Router's own binding of each declarator.
+        for (route, name) in [("/second", "Second"), ("/listed", "Listed")] {
+            let node = graph
+                .nodes
+                .iter()
+                .find(|node| node.kind == "route" && node.name == route)
+                .expect("the route");
+            let renders: Vec<(&str, &str, Option<&str>, Option<&str>)> = graph
+                .edges
+                .iter()
+                .filter(|edge| edge.kind == "calls" && edge.source == node.id)
+                .filter_map(|edge| {
+                    graph.node(&edge.target).map(|target| {
+                        (
+                            target.file_path.as_str(),
+                            target.name.as_str(),
+                            edge.resolved_by(),
+                            edge.metadata.get("framework").and_then(|v| v.as_str()),
+                        )
+                    })
+                })
+                .collect();
+            assert_eq!(
+                renders,
+                [(
+                    "src/layouts/multi.ts",
+                    name,
+                    Some("framework"),
+                    Some("vue-router")
+                )],
+                "{route}\n{}",
+                graph.report()
+            );
+        }
+        for route in ["/missing", "/gone", "/nested", "/anon", "/main", "/lost"] {
+            let node = graph
+                .nodes
+                .iter()
+                .find(|node| node.kind == "route" && node.name == route)
+                .expect("the route");
+            assert!(
+                !graph.edges.iter().any(|edge| edge.source == node.id),
+                "{route}\n{}",
+                graph.report()
+            );
+        }
+    }
+
+    /// Upstream F6 (`vben`): a typed routes module, and a lazy view through
+    /// an alias the resolver cannot follow, found by the one file of the app
+    /// whose path ends as the specifier does. `component: IFrameView`, a
+    /// named import of the layouts module, renders that export, not the
+    /// module's first component-like function (`BasicLayout`).
+    #[test]
+    fn f6_a_typed_routes_module_reaches_its_view_through_an_alias() {
+        let project = Project::new()
+            .file("package.json", "{\"name\":\"mono\",\"private\":true}\n")
+            .file(
+                "apps/web/package.json",
+                "{\"name\":\"web\",\"imports\":{\"#/*\":\"./src/*\"},\"dependencies\":{\"vue\":\"*\",\"vue-router\":\"*\"}}\n",
+            )
+            .file(
+                "apps/web/src/router/routes/modules/dashboard.ts",
+                "import type { RouteRecordRaw } from 'vue-router';\n\nconst routes: RouteRecordRaw[] = [\n  {\n    name: 'Dashboard',\n    path: '/dashboard',\n    children: [\n      { name: 'Analytics', path: 'analytics', component: () => import('#/views/dashboard/analytics/index.vue') },\n    ],\n  },\n];\n\nexport default routes;\n",
+            )
+            .file(
+                "apps/web/src/views/dashboard/analytics/index.vue",
+                "<template><div>analytics</div></template>\n<script setup lang=\"ts\">\nconst title = 'Analytics';\n</script>\n",
+            )
+            .file(
+                "apps/web/src/layouts/index.ts",
+                "const BasicLayout = () => import('./basic.vue');\nconst AuthPageLayout = () => import('./auth.vue');\n\nconst IFrameView = () => import('@vben/layouts').then((m) => m.IFrameView);\n\nexport { AuthPageLayout, BasicLayout, IFrameView };\n",
+            )
+            .file(
+                "apps/web/src/router/routes/modules/vben.ts",
+                "import type { RouteRecordRaw } from 'vue-router';\n\nimport { IFrameView } from '#/layouts';\n\nconst routes: RouteRecordRaw[] = [\n  {\n    name: 'VbenProject',\n    path: '/vben-admin',\n    children: [\n      {\n        name: 'VbenDocument',\n        path: 'document',\n        component: IFrameView,\n        meta: { link: 'https://doc.vben.pro' },\n      },\n    ],\n  },\n];\n\nexport default routes;\n",
+            )
+            .index();
+        let graph = project.graph();
+        assert_eq!(
+            route_names(graph),
+            ["/dashboard/analytics", "/vben-admin/document"],
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            targets_of(graph, "/dashboard/analytics", "calls"),
+            ["apps/web/src/views/dashboard/analytics/index.vue"],
+            "{}",
+            graph.report()
+        );
+        let document = graph
+            .nodes
+            .iter()
+            .find(|node| node.kind == "route" && node.name == "/vben-admin/document")
+            .expect("the document route");
+        // Vue Router's own binding, not a later strategy's: import
+        // resolution reaches the same export, and must not be what holds it.
+        let renders: Vec<(&str, &str, Option<&str>, Option<&str>)> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.kind == "calls" && edge.source == document.id)
+            .filter_map(|edge| {
+                graph.node(&edge.target).map(|node| {
+                    (
+                        node.file_path.as_str(),
+                        node.name.as_str(),
+                        edge.resolved_by(),
+                        edge.metadata.get("framework").and_then(|v| v.as_str()),
+                    )
+                })
+            })
+            .collect();
+        assert_eq!(
+            renders,
+            [(
+                "apps/web/src/layouts/index.ts",
+                "IFrameView",
+                Some("framework"),
+                Some("vue-router")
+            )],
+            "{}",
+            graph.report()
+        );
+    }
+}
+
+mod sveltekit {
+    use super::support::{EdgeRow, Graph, Project};
+
+    fn route_names(graph: &Graph) -> Vec<&str> {
+        let mut routes: Vec<&str> = graph
+            .nodes
+            .iter()
+            .filter(|node| node.kind == "route")
+            .map(|node| node.name.as_str())
+            .collect();
+        routes.sort_unstable();
+        routes
+    }
+
+    /// The edges the pass naming itself `by` drew, as `source file, source
+    /// name -> target name via … at registeredAt, line`, sorted (W7-18b).
+    fn synthesized(graph: &Graph, by: &str) -> Vec<String> {
+        let mut edges: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.metadata["synthesizedBy"] == by)
+            .map(|edge| {
+                let source = graph.node(&edge.source).expect("the source");
+                let target = graph.node(&edge.target).expect("the target");
+                format!(
+                    "{} {} -> {} via {} at {}, line {}",
+                    source.file_path,
+                    source.name,
+                    target.name,
+                    edge.metadata["via"].as_str().unwrap_or("-"),
+                    edge.metadata["registeredAt"].as_str().unwrap_or("?"),
+                    edge.line.unwrap_or(0)
+                )
+            })
+            .collect();
+        edges.sort();
+        edges
+    }
+
+    /// The `navigates` edges out of the one `kind` node named `name` in a
+    /// file whose path contains `file`.
+    fn navigations<'g>(graph: &'g Graph, kind: &str, name: &str, file: &str) -> Vec<&'g EdgeRow> {
+        let from: Vec<_> = graph
+            .nodes_named(kind, name)
+            .into_iter()
+            .filter(|node| node.file_path.contains(file))
+            .collect();
+        assert_eq!(from.len(), 1, "{kind} {name} in {file}\n{}", graph.report());
+        graph
+            .edges
+            .iter()
+            .filter(|edge| edge.kind == "navigates" && edge.source == from[0].id)
+            .collect()
+    }
+
+    /// Where an edge goes, the `href` and `navMethod` it records, and that
+    /// SvelteKit's resolver drew it.
+    fn landing<'g>(graph: &'g Graph, edge: &'g EdgeRow) -> (&'g str, &'g str, &'g str) {
+        assert_eq!(edge.resolved_by(), Some("framework"), "{}", graph.report());
+        assert_eq!(
+            edge.metadata.get("framework").and_then(|v| v.as_str()),
+            Some("sveltekit-router"),
+            "{}",
+            graph.report()
+        );
+        (
+            graph
+                .node(&edge.target)
+                .map_or("", |node| node.name.as_str()),
+            edge.metadata
+                .get("href")
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+            edge.metadata
+                .get("navMethod")
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+        )
+    }
+
+    /// Upstream F6 (`sveltekit-router.test.ts`, "a routed app end to end",
+    /// without its Screens half, the viewer's): the SvelteKit realworld
+    /// app's shape. One route per `+page.svelte` (a layout is no second
+    /// screen at its address); `redirect` takes its path after the status,
+    /// `goto` with a template hole reaches the `[slug]` page, and a path no
+    /// page serves or a computed one stays unresolved. The link pass
+    /// (W7-18a): an internal `<a href>` navigates from the component that
+    /// renders it, a `{expr}` in it a hole, and an external one does not.
+    /// The page and loader passes (W7-18b): each route calls its own file's
+    /// component, and a page calls its loader's `load`, `actions` and the
+    /// form action inside them, so the guard in `/settings`' loader belongs
+    /// to its page; a loader with no page beside it joins nothing.
+    #[test]
+    fn f6_a_sveltekit_app_routes_and_navigates() {
+        let page = |body: &str| format!("<script>\n  export let data\n</script>\n{body}\n");
+        let project = Project::new()
+            .file(
+                "package.json",
+                "{\"name\":\"conduit\",\"devDependencies\":{\"@sveltejs/kit\":\"2\",\"svelte\":\"5\"}}\n",
+            )
+            .file(
+                "src/routes/+layout.svelte",
+                &page("<nav>\n  <a href=\"/\">Home</a>\n  <a href=\"/login\">Sign in</a>\n  <a href=\"/settings\">Settings</a>\n  <a href=\"https://example.com\">Elsewhere</a>\n</nav>\n<slot />"),
+            )
+            .file(
+                "src/routes/+page.svelte",
+                &page("<h1>Conduit</h1>\n<a href=\"/register\">Sign up</a>"),
+            )
+            .file(
+                "src/routes/login/+page.svelte",
+                "<script>\n  export let form\n</script>\n<a href=\"/register\">Need an account?</a>\n",
+            )
+            .file(
+                "src/routes/login/+page.server.js",
+                "import { redirect } from '@sveltejs/kit'\nexport function load({ locals }) {\n  if (locals.user) redirect(307, '/')\n}\nexport const actions = {\n  default: async ({ request, locals }) => {\n    const user = await signIn(request)\n    if (!user) return { errors: ['bad login'] }\n    redirect(307, '/')\n  }\n}\n",
+            )
+            .file(
+                "src/routes/register/+page.svelte",
+                "<script>\n  export let form\n</script>\n<a href=\"/login\">Have an account?</a>\n",
+            )
+            .file("src/routes/settings/+page.svelte", &page("<h1>Settings</h1>"))
+            .file(
+                "src/routes/settings/+page.server.js",
+                "import { redirect } from '@sveltejs/kit'\nexport function load({ locals }) {\n  if (!locals.user) redirect(302, '/login')\n}\n",
+            )
+            .file(
+                "src/routes/editor/+page.svelte",
+                "<script>\n  import { goto } from '$app/navigation'\n  async function publish() {\n    const article = await save()\n    goto(`/article/${article.slug}`)\n  }\n</script>\n<button on:click={publish}>Publish</button>\n",
+            )
+            .file(
+                "src/routes/article/[slug]/+page.svelte",
+                &page("<a href=\"/editor\">Edit</a>\n<a href=\"/profile/@{data.author}\">Author</a>"),
+            )
+            .file("src/routes/profile/@[user]/+page.svelte", &page("<h1>Profile</h1>"))
+            .file("src/routes/profile/@[user]/+layout.svelte", &page("<slot />"))
+            .file(
+                "src/routes/nowhere/+page.server.js",
+                "import { redirect } from '@sveltejs/kit'\nexport function load({ url }) {\n  redirect(307, '/no-such-page')\n  redirect(307, url.searchParams.get(\"next\"))\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        assert_eq!(
+            route_names(graph),
+            [
+                "/",
+                "/article/:slug",
+                "/editor",
+                "/login",
+                "/profile/@:user",
+                "/register",
+                "/settings"
+            ],
+            "{}",
+            graph.report()
+        );
+        let guard = navigations(graph, "function", "load", "settings");
+        assert_eq!(guard.len(), 1, "{}", graph.report());
+        assert_eq!(landing(graph, guard[0]), ("/login", "/login", "redirect"));
+        let login = navigations(graph, "function", "load", "login");
+        assert_eq!(login.len(), 1, "{}", graph.report());
+        assert_eq!(landing(graph, login[0]), ("/", "/", "redirect"));
+        let publish = navigations(graph, "function", "publish", "editor");
+        assert_eq!(publish.len(), 1, "{}", graph.report());
+        assert_eq!(
+            landing(graph, publish[0]),
+            ("/article/:slug", "/article/${…}", "goto")
+        );
+        assert!(
+            navigations(graph, "function", "load", "nowhere").is_empty(),
+            "{}",
+            graph.report()
+        );
+        let hrefs = |edges: &[&EdgeRow]| -> Vec<String> {
+            let mut hrefs: Vec<String> = edges
+                .iter()
+                .map(|edge| edge.metadata["href"].as_str().unwrap_or("").to_string())
+                .collect();
+            hrefs.sort();
+            hrefs
+        };
+        let article = navigations(graph, "component", "+page", "article/[slug]");
+        assert_eq!(
+            hrefs(&article),
+            ["/editor", "/profile/@${…}"],
+            "{}",
+            graph.report()
+        );
+        let edit = article
+            .iter()
+            .find(|edge| edge.metadata["href"] == "/editor")
+            .expect("the edit link");
+        assert_eq!(edit.provenance.as_deref(), Some("heuristic"));
+        assert_eq!(edit.metadata["synthesizedBy"], "sveltekit-link");
+        assert_eq!(edit.metadata["navMethod"], "a");
+        assert!(
+            article.iter().any(|edge| graph
+                .node(&edge.target)
+                .is_some_and(|node| node.name == "/profile/@:user")),
+            "{}",
+            graph.report()
+        );
+        let layout = navigations(graph, "component", "+layout", "routes/+layout");
+        assert_eq!(
+            hrefs(&layout),
+            ["/", "/login", "/settings"],
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            synthesized(graph, "sveltekit-load"),
+            [
+                "src/routes/login/+page.svelte +page -> actions via actions at src/routes/login/+page.server.js:5, line 1",
+                "src/routes/login/+page.svelte +page -> default via default at src/routes/login/+page.server.js:6, line 1",
+                "src/routes/login/+page.svelte +page -> load via load at src/routes/login/+page.server.js:2, line 1",
+                "src/routes/settings/+page.svelte +page -> load via load at src/routes/settings/+page.server.js:2, line 1",
+            ],
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            synthesized(graph, "sveltekit-page"),
+            [
+                "src/routes/+page.svelte / -> +page via - at src/routes/+page.svelte, line 1",
+                "src/routes/article/[slug]/+page.svelte /article/:slug -> +page via - at src/routes/article/[slug]/+page.svelte, line 1",
+                "src/routes/editor/+page.svelte /editor -> +page via - at src/routes/editor/+page.svelte, line 1",
+                "src/routes/login/+page.svelte /login -> +page via - at src/routes/login/+page.svelte, line 1",
+                "src/routes/profile/@[user]/+page.svelte /profile/@:user -> +page via - at src/routes/profile/@[user]/+page.svelte, line 1",
+                "src/routes/register/+page.svelte /register -> +page via - at src/routes/register/+page.svelte, line 1",
+                "src/routes/settings/+page.svelte /settings -> +page via - at src/routes/settings/+page.svelte, line 1",
+            ],
+            "{}",
+            graph.report()
+        );
+        assert!(
+            graph
+                .edges
+                .iter()
+                .filter(|edge| edge.metadata["synthesizedBy"] == "sveltekit-load"
+                    || edge.metadata["synthesizedBy"] == "sveltekit-page")
+                .all(|edge| edge.kind == "calls"
+                    && edge.provenance.as_deref() == Some("heuristic")
+                    && edge.col.is_none()),
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// W7-18a: an `<a href>` names a page only by a destination starting
+    /// with `/`. An absolute URL and a `mailto:` leave the site, even where
+    /// the app has the page the URL's path names; `href={…}` holding a
+    /// string or a template names its page, a template's hole a parameter.
+    #[test]
+    fn w718a_an_anchor_reads_an_expression_and_never_an_external_href() {
+        let project = Project::new()
+            .file(
+                "package.json",
+                "{\"name\":\"site\",\"devDependencies\":{\"@sveltejs/kit\":\"2\",\"svelte\":\"5\"}}\n",
+            )
+            .file("src/routes/+page.svelte", "<h1>Home</h1>\n")
+            .file("src/routes/about/+page.svelte", "<h1>About</h1>\n")
+            .file("src/routes/posts/[slug]/+page.svelte", "<h1>Post</h1>\n")
+            .file(
+                "src/lib/Footer.svelte",
+                "<footer>\n  <a href=\"https://example.com/\">Out</a>\n  <a href=\"mailto:team@example.com\">Mail</a>\n</footer>\n",
+            )
+            .file(
+                "src/lib/Menu.svelte",
+                "<script>\n  export let slug\n</script>\n<nav>\n  <a href={'/about'}>About</a>\n  <a href={`/posts/${slug}`}>Post</a>\n</nav>\n",
+            )
+            .index();
+        let graph = project.graph();
+        let mut links: Vec<(String, String, String)> = graph
+            .edges
+            .iter()
+            .filter(|edge| {
+                edge.kind == "navigates" && edge.metadata["synthesizedBy"] == "sveltekit-link"
+            })
+            .map(|edge| {
+                let name = |id: &str| graph.node(id).map_or("", |node| node.name.as_str());
+                (
+                    name(&edge.source).to_string(),
+                    name(&edge.target).to_string(),
+                    edge.metadata["href"].as_str().unwrap_or("").to_string(),
+                )
+            })
+            .collect();
+        links.sort();
+        assert_eq!(
+            links,
+            [
+                (
+                    "Menu".to_string(),
+                    "/about".to_string(),
+                    "/about".to_string()
+                ),
+                (
+                    "Menu".to_string(),
+                    "/posts/:slug".to_string(),
+                    "/posts/${\u{2026}}".to_string()
+                ),
+            ],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream #2131 (`sveltekit-route-names.test.ts`): a `(group)` folder
+    /// is no part of the URL and a parameter's matcher no part of its name,
+    /// so `goto('/blocks')` reaches the page under `(app)/(layout)/`, and
+    /// the link pass's `<a href="/view/card">` the page whose parameter has a
+    /// matcher.
+    #[test]
+    fn p2131_sveltekit_route_names_drop_groups_and_matchers() {
+        let project = Project::new()
+            .file(
+                "package.json",
+                "{\"name\":\"site\",\"devDependencies\":{\"@sveltejs/kit\":\"*\",\"svelte\":\"*\"}}\n",
+            )
+            .file("src/routes/(app)/(layout)/blocks/+page.svelte", "<h1>Blocks</h1>\n")
+            .file(
+                "src/routes/(app)/(layout)/+page.svelte",
+                "<script>\n  import { goto } from '$app/navigation';\n</script>\n<button on:click={() => goto('/blocks')}>Blocks</button>\n<a href=\"/view/card\">Card</a>\n",
+            )
+            .file("src/routes/(view)/view/[view=view]/+page.svelte", "<p>view</p>\n")
+            .file("src/routes/docs/[...slug=doc]/+page.svelte", "<p>doc</p>\n")
+            .file(
+                "src/params/view.ts",
+                "export function match(p: string) { return p.length > 0; }\n",
+            )
+            .index();
+        let graph = project.graph();
+        assert_eq!(
+            route_names(graph),
+            ["/", "/blocks", "/docs/*slug", "/view/:view"],
+            "{}",
+            graph.report()
+        );
+        let home = navigations(graph, "component", "+page", "(app)/(layout)/+page.svelte");
+        let mut targets: Vec<(&str, Option<&str>)> = home
+            .iter()
+            .map(|edge| {
+                (
+                    graph
+                        .node(&edge.target)
+                        .map_or("", |node| node.name.as_str()),
+                    edge.metadata.get("synthesizedBy").and_then(|v| v.as_str()),
+                )
+            })
+            .collect();
+        targets.sort_unstable();
+        assert_eq!(
+            targets,
+            [("/blocks", None), ("/view/:view", Some("sveltekit-link"))],
+            "{}",
+            graph.report()
+        );
+        let goto: Vec<_> = home
+            .iter()
+            .filter(|edge| edge.metadata.get("synthesizedBy").is_none())
+            .map(|edge| landing(graph, edge))
+            .collect();
+        assert_eq!(goto, [("/blocks", "/blocks", "goto")], "{}", graph.report());
+    }
+
+    /// `$lib` in a monorepo app is that app's `src/lib`: the hook's import
+    /// links `apps/web/src/lib/server/db.ts`, not the repository root's
+    /// `src/lib/server/db.ts`.
+    #[test]
+    fn a_sveltekit_lib_import_links_its_apps_file() {
+        let project = Project::new()
+            .file("package.json", "{\"name\":\"mono\",\"private\":true}\n")
+            .file(
+                "apps/web/package.json",
+                "{\"name\":\"web\",\"devDependencies\":{\"@sveltejs/kit\":\"2\",\"svelte\":\"5\"}}\n",
+            )
+            .file(
+                "apps/web/src/hooks.server.ts",
+                "import { db } from '$lib/server/db'\nexport async function handle({ event, resolve }) {\n  return resolve(event)\n}\n",
+            )
+            .file("apps/web/src/lib/server/db.ts", "export const db = {}\n")
+            .file("src/lib/server/db.ts", "export const db = {}\n")
+            .file("apps/web/src/routes/+page.svelte", "<h1>Home</h1>\n")
+            .index();
+        let graph = project.graph();
+        let hooks = graph
+            .nodes
+            .iter()
+            .find(|node| node.kind == "file" && node.file_path == "apps/web/src/hooks.server.ts")
+            .expect("the hooks file");
+        let imported: Vec<(&str, Option<&str>)> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.kind == "imports" && edge.source == hooks.id)
+            .filter_map(|edge| {
+                graph
+                    .node(&edge.target)
+                    .map(|node| (node.file_path.as_str(), edge.resolved_by()))
+            })
+            .collect();
+        assert_eq!(
+            imported,
+            [("apps/web/src/lib/server/db.ts", Some("framework"))],
+            "{}",
+            graph.report()
+        );
+    }
+}
+
+mod angular {
+    use super::support::{Graph, Project};
+
+    /// Each route `name -> rendered, layout …`, sorted (upstream's
+    /// `names each screen by the path a user takes to it`), with the
+    /// resolver that bound each reference.
+    fn screens(graph: &Graph) -> Vec<String> {
+        let mut out: Vec<String> = graph
+            .nodes
+            .iter()
+            .filter(|node| node.kind == "route")
+            .map(|route| {
+                let mut bound: Vec<String> = graph
+                    .edges
+                    .iter()
+                    .filter(|edge| edge.kind == "references" && edge.source == route.id)
+                    .map(|edge| {
+                        let layout = edge
+                            .metadata
+                            .get("layout")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+                        let target = graph
+                            .node(&edge.target)
+                            .map_or("?", |node| node.name.as_str());
+                        format!("{}{target}", if layout { "layout " } else { "" })
+                    })
+                    .collect();
+                bound.sort();
+                format!("{} -> {}", route.name, bound.join(", "))
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// Each `navigates` edge `caller -> route (navMethod)`, sorted
+    /// (upstream's `draws navigation from calls …`).
+    fn navigations(graph: &Graph) -> Vec<String> {
+        let mut out: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.kind == "navigates")
+            .map(|edge| {
+                let name = |id: &str| graph.node(id).map_or("?", |node| node.name.as_str());
+                let verb = edge
+                    .metadata
+                    .get("navMethod")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?");
+                format!("{} -> {} ({verb})", name(&edge.source), name(&edge.target))
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// A component class written the way upstream's fixtures write one.
+    fn component(name: &str, selector: &str, template: &str, body: &str) -> String {
+        format!(
+            "import {{ Component }} from '@angular/core';\nimport {{ Router }} from '@angular/router';\n@Component({{ selector: '{selector}', template: `{template}` }})\nexport class {name} {{\n  constructor(private router: Router) {{}}\n{body}\n}}\n"
+        )
+    }
+
+    /// Upstream #2113 (`angular-router.test.ts`, "an Angular app, indexed",
+    /// its first two assertions, the calls of the second; the template half
+    /// is W7-18d's `pr2113_a_template_navigates_renders_and_binds_its_events`,
+    /// the Screens half the viewer's): each screen is named by the path a
+    /// user takes to it, through a mount, a constant, a `$localize` path and
+    /// an NgModule's routing module, and bound to its component and the
+    /// layouts around it, and each `navigate` reaches the screen its
+    /// destination names, `['/']` through the root `**` redirect and a route
+    /// constant that builds its commands. A layout with a `''` child is no
+    /// screen of its own. Since W7-18d the `routerLink` the fixture's
+    /// `AuthComponent` template writes navigates too.
+    #[test]
+    fn pr2113_an_angular_app_names_its_screens_by_their_paths() {
+        let home = component(
+            "HomeComponent",
+            "app-home",
+            "<p>Home</p>",
+            "  open(slug: string) { this.router.navigate(['/login']); }\n  more() { this.router.navigate([], { queryParams: { page: 2 } }); }",
+        )
+        .replace("export class", "export default class");
+        let card = component(
+            "CardComponent",
+            "app-card",
+            "<button (click)=\"save()\">Save</button>",
+            "  name = '';\n  save() { this.router.navigate(internalRoutes.account.subRoutes.access.routerLink('me')); }",
+        )
+        .replace(
+            "import { Router } from '@angular/router';",
+            "import { Router } from '@angular/router';\nimport { internalRoutes } from '../routes.constants';",
+        );
+        let overview = component("OverviewComponent", "app-overview", "<p>Overview</p>", "")
+            .replace("export class", "export default class");
+        let project = Project::new()
+            .file(
+                "package.json",
+                "{\"dependencies\":{\"@angular/core\":\"^19.0.0\",\"@angular/router\":\"^19.0.0\"}}\n",
+            )
+            .file(
+                "src/app/routes.constants.ts",
+                "export const internalRoutes = {\n  account: { path: 'account', routerLink: ['/account'], subRoutes: { access: { path: 'access', routerLink: (id: string) => ['/account', 'access', id] } } },\n  about: { path: $localize`:kebab-case@@routes.about:about`, routerLink: ['/' + $localize`:kebab-case@@routes.about:about`] },\n};\n",
+            )
+            .file(
+                "src/app/app.routes.ts",
+                "import { Routes } from '@angular/router';\nimport { AuthComponent } from './auth/auth.component';\nimport { internalRoutes } from './routes.constants';\nconst { about } = internalRoutes;\nexport const routes: Routes = [\n  { path: 'home', loadComponent: () => import('./home/home.component') },\n  { path: 'login', component: AuthComponent },\n  { path: about.path, loadComponent: () => import('./about/about.component').then((m) => m.AboutComponent) },\n  { path: internalRoutes.account.path, loadChildren: () => import('./account/account.routes') },\n  { path: 'admin', loadChildren: () => import('./admin/admin.module').then((m) => m.AdminModule) },\n  { path: '**', redirectTo: 'home' },\n];\n",
+            )
+            .file(
+                "src/app/account/account.routes.ts",
+                "import { Routes } from '@angular/router';\nimport { AccountComponent } from './account.component';\nimport { AccessComponent } from './access.component';\nimport { internalRoutes } from '../routes.constants';\nexport default [\n  { path: '', component: AccountComponent, children: [\n      { path: '', loadComponent: () => import('./overview.component') },\n      { path: internalRoutes.account.subRoutes.access.path + '/:id', component: AccessComponent },\n  ] },\n] satisfies Routes;\n",
+            )
+            .file(
+                "src/app/admin/admin.module.ts",
+                "import { NgModule } from '@angular/core';\nimport { AdminRoutingModule } from './admin-routing.module';\n@NgModule({ imports: [AdminRoutingModule] })\nexport class AdminModule {}\n",
+            )
+            .file(
+                "src/app/admin/admin-routing.module.ts",
+                "import { NgModule } from '@angular/core';\nimport { RouterModule, Routes } from '@angular/router';\nimport { AdminUsersComponent } from './admin-users.component';\nconst routes: Routes = [{ path: '', redirectTo: 'users', pathMatch: 'full' }, { path: 'users', component: AdminUsersComponent }];\n@NgModule({ imports: [RouterModule.forChild(routes)], exports: [RouterModule] })\nexport class AdminRoutingModule {}\n",
+            )
+            .file("src/app/home/home.component.ts", &home)
+            .file("src/app/shared/card.component.ts", &card)
+            .file(
+                "src/app/auth/auth.component.ts",
+                &component(
+                    "AuthComponent",
+                    "app-auth",
+                    "<a routerLink=\"/home\">Home</a>",
+                    "  done() { this.router.navigate(['/']); }",
+                ),
+            )
+            .file(
+                "src/app/about/about.component.ts",
+                &component("AboutComponent", "app-about", "<p>About</p>", ""),
+            )
+            .file(
+                "src/app/account/account.component.ts",
+                &component(
+                    "AccountComponent",
+                    "app-account",
+                    "<router-outlet></router-outlet>",
+                    "",
+                ),
+            )
+            .file("src/app/account/overview.component.ts", &overview)
+            .file(
+                "src/app/account/access.component.ts",
+                &component("AccessComponent", "app-access", "<p>Access</p>", ""),
+            )
+            .file(
+                "src/app/admin/admin-users.component.ts",
+                &component("AdminUsersComponent", "app-admin-users", "<p>Users</p>", ""),
+            )
+            .index();
+        let graph = project.graph();
+        assert_eq!(
+            screens(graph),
+            [
+                "/about -> AboutComponent",
+                "/account -> OverviewComponent, layout AccountComponent",
+                "/account/access/:id -> AccessComponent, layout AccountComponent",
+                "/admin/users -> AdminUsersComponent",
+                "/home -> HomeComponent",
+                "/login -> AuthComponent",
+            ],
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            navigations(graph),
+            [
+                "AuthComponent -> /home (routerLink)",
+                "done -> /home (navigate)",
+                "open -> /login (navigate)",
+                "save -> /account/access/:id (navigate)",
+            ],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream #2133 (angular-spotify): Nx libraries behind barrels,
+    /// `(await import(…)).M` and a class-static path constant name the
+    /// screens a shell lazy-loads, and since W7-18d a template in one
+    /// library links to a screen another library declares.
+    #[test]
+    fn pr2133_nx_libraries_mount_their_routes_through_barrels() {
+        let module = |name: &str, component: &str, file: &str| {
+            format!(
+                "import {{ NgModule }} from '@angular/core';\nimport {{ RouterModule }} from '@angular/router';\nimport {{ {component} }} from './{file}';\n@NgModule({{ imports: [RouterModule.forChild([{{ path: '', component: {component} }}])] }})\nexport class {name} {{}}\n"
+            )
+        };
+        let class = |name: &str, selector: &str, template: &str| {
+            format!(
+                "import {{ Component }} from '@angular/core';\n@Component({{ selector: '{selector}', template: `{template}` }})\nexport class {name} {{}}\n"
+            )
+        };
+        let project = Project::new()
+            .file(
+                "package.json",
+                "{\"name\":\"ws\",\"dependencies\":{\"@angular/core\":\"*\",\"@angular/router\":\"*\"}}\n",
+            )
+            .file("nx.json", "{}\n")
+            .file(
+                "tsconfig.base.json",
+                "{\"compilerOptions\":{\"paths\":{\"@ws/home\":[\"libs/home/src/index.ts\"],\"@ws/lyrics\":[\"libs/lyrics/src/index.ts\"],\"@ws/utils\":[\"libs/utils/src/index.ts\"]}}}\n",
+            )
+            .file("libs/utils/src/index.ts", "export * from './lib/router-util';\n")
+            .file(
+                "libs/utils/src/lib/router-util.ts",
+                "export class RouterUtil {\n  static Configuration = { Lyrics: 'lyrics' };\n}\n",
+            )
+            .file(
+                "libs/shell/src/lib/shell.routes.ts",
+                "import { Route } from '@angular/router';\nimport { RouterUtil } from '@ws/utils';\n\nexport const shellRoutes: Route[] = [\n  { path: '', loadChildren: async () => (await import('@ws/home')).HomeModule },\n  { path: RouterUtil.Configuration.Lyrics, loadChildren: async () => (await import('@ws/lyrics')).LyricsModule },\n];\n",
+            )
+            .file("libs/home/src/index.ts", "export * from './lib/home.module';\n")
+            .file(
+                "libs/home/src/lib/home.module.ts",
+                &module("HomeModule", "HomeComponent", "home.component"),
+            )
+            .file(
+                "libs/home/src/lib/home.component.ts",
+                &class("HomeComponent", "as-home", "<a routerLink=\"/lyrics\">Lyrics</a>"),
+            )
+            .file("libs/lyrics/src/index.ts", "export * from './lib/lyrics.module';\n")
+            .file(
+                "libs/lyrics/src/lib/lyrics.module.ts",
+                &module("LyricsModule", "LyricsComponent", "lyrics.component"),
+            )
+            .file(
+                "libs/lyrics/src/lib/lyrics.component.ts",
+                &class("LyricsComponent", "as-lyrics", "<a routerLink=\"/\">Home</a>"),
+            )
+            .index();
+        let graph = project.graph();
+        assert_eq!(
+            screens(graph),
+            ["/ -> HomeComponent", "/lyrics -> LyricsComponent"],
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            navigations(graph),
+            [
+                "HomeComponent -> /lyrics (routerLink)",
+                "LyricsComponent -> / (routerLink)",
+            ],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream #2133 (jira-clone): a template-literal path whose hole is a
+    /// class constant, under a mount whose file holds only the mount and a
+    /// redirect; `navigate(['project', 'issue', id])` starts from the root,
+    /// and `navigate(['/'])` follows the redirect in the file that only
+    /// mounts, then the mounted file's own.
+    #[test]
+    fn pr2133_a_template_literal_path_sits_under_its_mount() {
+        let class = |name: &str| {
+            format!(
+                "import {{ Component }} from '@angular/core';\n@Component({{ selector: 'j-x', template: '<div></div>' }})\nexport class {name} {{}}\n"
+            )
+        };
+        let project = Project::new()
+            .file(
+                "package.json",
+                "{\"name\":\"jira\",\"dependencies\":{\"@angular/core\":\"*\",\"@angular/router\":\"*\"}}\n",
+            )
+            .file("angular.json", "{}\n")
+            .file(
+                "src/app/app.routes.ts",
+                "import { Routes } from '@angular/router';\nexport const appRoutes: Routes = [\n  { path: 'project', loadChildren: () => import('./project/project.routes').then((m) => m.PROJECT_ROUTES) },\n  { path: '', redirectTo: 'project', pathMatch: 'full' },\n];\n",
+            )
+            .file(
+                "src/app/project/config/const.ts",
+                "export class ProjectConst {\n  static readonly IssueId = 'issueId';\n}\n",
+            )
+            .file(
+                "src/app/project/project.routes.ts",
+                "import { Routes } from '@angular/router';\nimport { ProjectComponent } from './project.component';\nimport { BoardComponent } from './board.component';\nimport { IssueComponent } from './issue.component';\nimport { ProjectConst } from './config/const';\nexport const PROJECT_ROUTES: Routes = [\n  {\n    path: '',\n    component: ProjectComponent,\n    children: [\n      { path: 'board', component: BoardComponent },\n      { path: `issue/:${ProjectConst.IssueId}`, component: IssueComponent },\n      { path: '', redirectTo: 'board', pathMatch: 'full' },\n    ],\n  },\n];\n",
+            )
+            .file("src/app/project/project.component.ts", &class("ProjectComponent"))
+            .file(
+                "src/app/project/board.component.ts",
+                "import { Component } from '@angular/core';\nimport { Router } from '@angular/router';\n@Component({ selector: 'j-board', template: '<div></div>' })\nexport class BoardComponent {\n  constructor(private _router: Router) {}\n  openIssuePage(issueId: string) {\n    this._router.navigate(['project', 'issue', issueId]);\n  }\n}\n",
+            )
+            .file(
+                "src/app/project/issue.component.ts",
+                "import { Component } from '@angular/core';\nimport { Router } from '@angular/router';\n@Component({ selector: 'j-issue', template: '<div></div>' })\nexport class IssueComponent {\n  constructor(private _router: Router) {}\n  backHome() {\n    this._router.navigate(['/']);\n  }\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        assert_eq!(
+            screens(graph),
+            [
+                "/project/board -> BoardComponent, layout ProjectComponent",
+                "/project/issue/:issueId -> IssueComponent, layout ProjectComponent",
+            ],
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            navigations(graph),
+            [
+                "backHome -> /project/board (navigate)",
+                "openIssuePage -> /project/issue/:issueId (navigate)",
+            ],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// A component written as upstream's `angular-router.test.ts` writes
+    /// one: a `templateUrl` for a template starting with `./`, else an
+    /// inline `template`.
+    fn upstream_component(name: &str, selector: &str, template: &str, body: &str) -> String {
+        let template = if template.starts_with("./") {
+            format!("templateUrl: '{template}'")
+        } else {
+            format!("template: `{template}`")
+        };
+        format!(
+            "import {{ Component }} from '@angular/core';\nimport {{ Router }} from '@angular/router';\n@Component({{\n  selector: '{selector}',\n  {template},\n}})\nexport class {name} {{\n  constructor(private readonly router: Router) {{}}\n{body}\n}}\n"
+        )
+    }
+
+    /// The source with the routes constants imported after the router.
+    fn with_constants(source: &str) -> String {
+        source.replace(
+            "import { Router } from '@angular/router';",
+            "import { Router } from '@angular/router';\nimport { internalRoutes } from '../routes.constants';",
+        )
+    }
+
+    /// Upstream's "an Angular app, indexed" fixture (`angular-router.test.ts`,
+    /// #2113 and #2114), as written there.
+    fn upstream_app() -> super::support::Indexed {
+        let home = with_constants(
+            &upstream_component(
+                "HomeComponent",
+                "app-home",
+                "./home.component.html",
+                "  open(slug: string) { this.router.navigate(['/login']); }\n  more() { this.router.navigate([], { queryParams: { page: 2 } }); }",
+            )
+            .replace("export class", "export default class"),
+        )
+        .replace(
+            "  constructor(",
+            "  protected readonly routerLinkAbout = internalRoutes.about.routerLink;\n  constructor(",
+        );
+        let card = with_constants(&upstream_component(
+            "CardComponent",
+            "app-card",
+            "<button (click)=\"save()\">Save</button><input [(ngModel)]=\"name\" /><a (click)=\"closed.emit(true)\">x</a>",
+            "  name = '';\n  save() { this.router.navigate(internalRoutes.account.subRoutes.access.routerLink('me')); }",
+        ));
+        let account = with_constants(&upstream_component(
+            "AccountComponent",
+            "app-account",
+            "<a [routerLink]=\"['/login']\">Log out</a><app-tabs [tabs]=\"tabs\"></app-tabs><router-outlet></router-outlet>",
+            "  tabs = [{ label: 'Access', routerLink: internalRoutes.account.subRoutes.access.routerLink('me') }];",
+        ));
+        Project::new()
+            .file(
+                "package.json",
+                "{\"dependencies\":{\"@angular/core\":\"^19.0.0\",\"@angular/router\":\"^19.0.0\"}}",
+            )
+            .file(
+                "src/app/routes.constants.ts",
+                "export const internalRoutes = {\n  account: { path: 'account', routerLink: ['/account'], subRoutes: { access: { path: 'access', routerLink: (id: string) => ['/account', 'access', id] } } },\n  about: { path: $localize`:kebab-case@@routes.about:about`, routerLink: ['/' + $localize`:kebab-case@@routes.about:about`] },\n};\n",
+            )
+            .file(
+                "src/app/app.routes.ts",
+                "import { Routes } from '@angular/router';\nimport { AuthComponent } from './auth/auth.component';\nimport { internalRoutes } from './routes.constants';\nconst { about } = internalRoutes;\nexport const routes: Routes = [\n  { path: 'home', loadComponent: () => import('./home/home.component') },\n  { path: 'login', component: AuthComponent },\n  { path: about.path, loadComponent: () => import('./about/about.component').then((m) => m.AboutComponent) },\n  { path: internalRoutes.account.path, loadChildren: () => import('./account/account.routes') },\n  { path: 'admin', loadChildren: () => import('./admin/admin.module').then((m) => m.AdminModule) },\n  { path: '**', redirectTo: 'home' },\n];\n",
+            )
+            .file(
+                "src/app/account/account.routes.ts",
+                "import { Routes } from '@angular/router';\nimport { AccountComponent } from './account.component';\nimport { AccessComponent } from './access.component';\nimport { internalRoutes } from '../routes.constants';\nexport default [\n  { path: '', component: AccountComponent, children: [\n      { path: '', loadComponent: () => import('./overview.component') },\n      { path: internalRoutes.account.subRoutes.access.path + '/:id', component: AccessComponent },\n  ] },\n] satisfies Routes;\n",
+            )
+            .file(
+                "src/app/admin/admin.module.ts",
+                "import { NgModule } from '@angular/core';\nimport { AdminRoutingModule } from './admin-routing.module';\n@NgModule({ imports: [AdminRoutingModule] })\nexport class AdminModule {}\n",
+            )
+            .file(
+                "src/app/admin/admin-routing.module.ts",
+                "import { NgModule } from '@angular/core';\nimport { RouterModule, Routes } from '@angular/router';\nimport { AdminUsersComponent } from './admin-users.component';\nconst routes: Routes = [{ path: '', redirectTo: 'users', pathMatch: 'full' }, { path: 'users', component: AdminUsersComponent }];\n@NgModule({ imports: [RouterModule.forChild(routes)], exports: [RouterModule] })\nexport class AdminRoutingModule {}\n",
+            )
+            .file("src/app/home/home.component.ts", &home)
+            .file(
+                "src/app/home/home.component.html",
+                "<app-card></app-card>\n<a routerLink=\"/login\">Sign in</a>\n<a [routerLink]=\"routerLinkAbout\">About</a>\n<a [routerLink]=\"['/account', 'access', 7]\">Access</a>\n<a routerLink=\"relative\">Relative</a>\n",
+            )
+            .file("src/app/shared/card.component.ts", &card)
+            .file(
+                "src/app/auth/auth.component.ts",
+                &upstream_component(
+                    "AuthComponent",
+                    "app-auth",
+                    "<a routerLink=\"/home\">Home</a>",
+                    "  done() { this.router.navigate(['/']); }",
+                ),
+            )
+            .file(
+                "src/app/about/about.component.ts",
+                &upstream_component("AboutComponent", "app-about", "<p>About</p>", ""),
+            )
+            .file("src/app/account/account.component.ts", &account)
+            .file(
+                "src/app/account/overview.component.ts",
+                &upstream_component("OverviewComponent", "app-overview", "<p>Overview</p>", "")
+                    .replace("export class", "export default class"),
+            )
+            .file(
+                "src/app/account/access.component.ts",
+                &upstream_component("AccessComponent", "app-access", "<p>Access</p>", ""),
+            )
+            .file(
+                "src/app/admin/admin-users.component.ts",
+                &upstream_component("AdminUsersComponent", "app-admin-users", "<p>Users</p>", ""),
+            )
+            .index()
+    }
+
+    /// The `synthesizedBy` of `edge`.
+    fn synthesized_by(edge: &super::support::EdgeRow) -> &str {
+        edge.metadata
+            .get("synthesizedBy")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+    }
+
+    /// Upstream #2113 and #2114 (`angular-router.test.ts`, "an Angular app,
+    /// indexed", its second to fourth tests without the Steps half, which
+    /// is the viewer's): `routerLink` navigates from a template file, a
+    /// bound route constant, a class property holding one, a command array
+    /// and a class's tab field (a relative link draws nothing); a template
+    /// renders the child its element selector names; and an event binding
+    /// calls the component's own method, the binding as the trigger, where
+    /// a two-way binding and the component's own output call nothing. The
+    /// template file is no indexed file and is recorded beside the index.
+    #[test]
+    fn pr2113_a_template_navigates_renders_and_binds_its_events() {
+        let project = upstream_app();
+        let graph = project.graph();
+        assert_eq!(
+            navigations(graph),
+            [
+                "AccountComponent -> /account/access/:id (routerLink)",
+                "AccountComponent -> /login (routerLink)",
+                "AuthComponent -> /home (routerLink)",
+                "HomeComponent -> /about (routerLink)",
+                "HomeComponent -> /account/access/:id (routerLink)",
+                "HomeComponent -> /login (routerLink)",
+                "done -> /home (navigate)",
+                "open -> /login (navigate)",
+                "save -> /account/access/:id (navigate)",
+            ],
+            "{}",
+            graph.report()
+        );
+        let name = |id: &str| graph.node(id).map_or("?", |node| node.name.as_str());
+        let renders: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.kind == "calls" && synthesized_by(edge) == "angular-template")
+            .map(|edge| {
+                format!(
+                    "{} -> {} <{}>",
+                    name(&edge.source),
+                    name(&edge.target),
+                    edge.metadata["via"].as_str().unwrap_or("?")
+                )
+            })
+            .collect();
+        assert_eq!(
+            renders,
+            ["HomeComponent -> CardComponent <app-card>"],
+            "{}",
+            graph.report()
+        );
+        let events: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.kind == "calls" && synthesized_by(edge) == "angular-event")
+            .map(|edge| {
+                format!(
+                    "{} -> {} {}",
+                    name(&edge.source),
+                    name(&edge.target),
+                    edge.metadata["trigger"]
+                )
+            })
+            .collect();
+        assert_eq!(
+            events,
+            ["CardComponent -> save {\"kind\":\"prop\",\"name\":\"(click)\",\"of\":\"button\"}"],
+            "{}",
+            graph.report()
+        );
+        assert!(
+            graph
+                .files
+                .iter()
+                .all(|file| file.path != "src/app/home/home.component.html"),
+            "the template is no indexed file\n{}",
+            graph.report()
+        );
+        assert_eq!(
+            inputs_row(&project),
+            serde_json::json!({
+                "src/app/home/home.component.html": codegraph_core::node_id::hash_content(
+                    "<app-card></app-card>\n<a routerLink=\"/login\">Sign in</a>\n<a [routerLink]=\"routerLinkAbout\">About</a>\n<a [routerLink]=\"['/account', 'access', 7]\">Access</a>\n<a routerLink=\"relative\">Relative</a>\n"
+                ),
+            })
+        );
+    }
+
+    /// Upstream's "an Angular template's bindings, indexed" fixture
+    /// (`angular-router.test.ts`, #2398), as written there.
+    fn upstream_bindings() -> super::support::Indexed {
+        Project::new()
+            .file(
+                "package.json",
+                "{\"dependencies\":{\"@angular/core\":\"^19.0.0\",\"@angular/router\":\"^19.0.0\"}}",
+            )
+            .file(
+                "src/app/app.routes.ts",
+                "import { Routes } from '@angular/router';\nimport { TasksComponent } from './tasks/tasks.component';\nexport const routes: Routes = [{ path: 'tasks', component: TasksComponent }];\n",
+            )
+            .file(
+                "src/app/nav/nav.component.ts",
+                "import { Component, signal } from '@angular/core';\n@Component({\n  selector: 'app-nav',\n  template: `<nav>\n    <app-theme-toggle [class.open]=\"isOpen()\" />\n  </nav>`,\n})\nexport class NavComponent {\n  isOpen = signal(false);\n}\n",
+            )
+            .file(
+                "src/app/theme-toggle/theme-toggle.component.ts",
+                "import { Component, computed, signal } from '@angular/core';\n@Component({ selector: 'app-theme-toggle', templateUrl: './theme-toggle.component.html' })\nexport class ThemeToggleComponent {\n  private readonly theme = signal<'light' | 'dark'>('light');\n  icon = computed(() => (this.theme() === 'dark' ? 'moon' : 'sun'));\n  label = computed(() => (this.theme() === 'dark' ? 'Dark' : 'Light'));\n  cycle(): void {\n    this.theme.set(this.theme() === 'dark' ? 'light' : 'dark');\n  }\n  unused(): void {}\n}\n",
+            )
+            .file(
+                "src/app/theme-toggle/theme-toggle.component.html",
+                "<button (click)=\"cycle()\" [attr.aria-label]=\"label()\">\n  <lucide-icon [name]=\"icon()\"></lucide-icon>\n</button>\n",
+            )
+            .file(
+                "src/app/tasks/tasks.component.ts",
+                "import { Component, computed, signal } from '@angular/core';\n@Component({ selector: 'app-tasks', templateUrl: './tasks.component.html' })\nexport class TasksComponent {\n  lists = signal<{ id: number; title: string; items: { done: boolean }[] }[]>([]);\n  selectedListId = signal<number | null>(null);\n  selected = computed(() => this.lists().find((l) => l.id === this.selectedListId()));\n  editing = signal(false);\n  title = 'Tasks';\n  form = { reset() {} };\n  days = Array.from({ length: 3 }, (_, i) => i + 1);\n  row = computed(() => 0);\n  nameInput = (value: string) => value;\n\n  get canSave(): boolean {\n    return this.lists().length > 0;\n  }\n  remainingItems(list: { items: { done: boolean }[] }): number {\n    return list.items.filter((i) => !i.done).length;\n  }\n  trackById(index: number, list: { id: number }): number {\n    return list.id;\n  }\n  displayFn(list: { title: string }): string {\n    return list.title;\n  }\n  format(value: string): string {\n    return value;\n  }\n  reset(): void {}\n  set(): void {}\n  legacy(): string {\n    return '';\n  }\n  quoted(): string {\n    return '';\n  }\n  save(): void {}\n}\n",
+            )
+            .file(
+                "src/app/tasks/tasks.component.html",
+                "<!-- {{ legacy() }} -->\n<h1 [title]=\"title\">{{ 'quoted()' }}</h1>\n<input #nameInput [value]=\"nameInput.value\" (blur)=\"selected() && save()\" />\n@if (editing()) {\n  <span>editing</span>\n}\n<ul>\n  @for (list of lists(); track trackById($index, list)) {\n    <li [class.active]=\"list.id === selectedListId()\" (click)=\"selectedListId.set(list.id)\">\n      {{ list.title | format }} <small>{{ remainingItems(list) }}</small>\n    </li>\n  }\n</ul>\n@for (row of [selected()]; track row) {\n  <b>{{ row?.title }}</b>\n}\n@for (day of days; track day) {\n  <i>{{ day }}</i>\n}\n<mat-autocomplete [displayWith]=\"displayFn\"></mat-autocomplete>\n<button [disabled]=\"!canSave\" (click)=\"form.reset()\">Reset</button>\n",
+            )
+            .index()
+    }
+
+    /// `Source -> kind target [edge kind (fnRef)] via @ registeredAt` for
+    /// every template edge `by` draws, sorted (upstream's `templateEdges`).
+    fn template_edges(graph: &Graph, by: &str) -> Vec<String> {
+        let mut out: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|edge| synthesized_by(edge) == by)
+            .map(|edge| {
+                let source = graph.node(&edge.source).expect("the source");
+                let target = graph.node(&edge.target).expect("the target");
+                let fn_ref = edge
+                    .metadata
+                    .get("fnRef")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                format!(
+                    "{} -> {} {} [{}{}] {} @ {}",
+                    source.name,
+                    target.kind,
+                    target.name,
+                    edge.kind,
+                    if fn_ref { " fnRef" } else { "" },
+                    edge.metadata["via"].as_str().unwrap_or("?"),
+                    edge.metadata["registeredAt"].as_str().unwrap_or("?"),
+                )
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// Upstream #2398 (`angular-router.test.ts`, "an Angular template's
+    /// bindings, indexed", its first three tests; the Steps half is the
+    /// viewer's): each binding's own-member call, and a callable it only
+    /// reads, links the component to the member at the binding's line, an
+    /// inline template's on its own line of the class's file; a field read,
+    /// a pipe, another object's member, a comment, a string and a name the
+    /// template declares link nothing; an event binding keeps the member it
+    /// links; and the members a template uses leave the dead-code list.
+    #[test]
+    fn pr2398_a_template_binding_links_the_member_it_calls() {
+        let project = upstream_bindings();
+        let graph = project.graph();
+        assert_eq!(
+            template_edges(graph, "angular-binding"),
+            [
+                "NavComponent -> property isOpen [calls] [class.open] @ src/app/nav/nav.component.ts:5",
+                // A getter runs when it is read.
+                "TasksComponent -> method canSave [calls] [disabled] @ src/app/tasks/tasks.component.html:21",
+                // A field a call filled is read, not called.
+                "TasksComponent -> method days [references] @for @ src/app/tasks/tasks.component.html:17",
+                // A function handed to a child is a function reference.
+                "TasksComponent -> method displayFn [references fnRef] [displayWith] @ src/app/tasks/tasks.component.html:20",
+                "TasksComponent -> method remainingItems [calls] {{ }} @ src/app/tasks/tasks.component.html:10",
+                "TasksComponent -> method trackById [calls] @for @ src/app/tasks/tasks.component.html:8",
+                // A signal is a field, and calling it reads it.
+                "TasksComponent -> property editing [calls] @if @ src/app/tasks/tasks.component.html:4",
+                "TasksComponent -> property lists [calls] @for @ src/app/tasks/tasks.component.html:8",
+                "TasksComponent -> property selectedListId [calls] [class.active] @ src/app/tasks/tasks.component.html:9",
+                "ThemeToggleComponent -> method icon [calls] [name] @ src/app/theme-toggle/theme-toggle.component.html:2",
+                "ThemeToggleComponent -> method label [calls] [attr.aria-label] @ src/app/theme-toggle/theme-toggle.component.html:1",
+            ],
+            "{}",
+            graph.report()
+        );
+        // An inline template's edge sits on its own line of the class's
+        // file.
+        let nav = graph
+            .nodes
+            .iter()
+            .find(|node| node.kind == "class" && node.name == "NavComponent")
+            .expect("NavComponent");
+        let is_open = graph
+            .edges
+            .iter()
+            .find(|edge| {
+                edge.source == nav.id
+                    && edge.kind == "calls"
+                    && graph
+                        .node(&edge.target)
+                        .is_some_and(|node| node.name == "isOpen")
+            })
+            .expect("NavComponent calls isOpen");
+        assert_eq!(is_open.line, Some(5));
+
+        let tasks = graph
+            .nodes
+            .iter()
+            .find(|node| node.kind == "class" && node.name == "TasksComponent")
+            .expect("TasksComponent");
+        let linked: Vec<&str> = graph
+            .edges
+            .iter()
+            .filter(|edge| {
+                edge.source == tasks.id && matches!(edge.kind.as_str(), "calls" | "references")
+            })
+            .filter_map(|edge| graph.node(&edge.target).map(|node| node.name.as_str()))
+            .collect();
+        for name in [
+            "title",
+            "format",
+            "reset",
+            "set",
+            "legacy",
+            "quoted",
+            "row",
+            "nameInput",
+        ] {
+            assert!(
+                !linked.contains(&name),
+                "{name} is linked\n{}",
+                graph.report()
+            );
+        }
+        // A member the event bindings already link keeps that edge:
+        // `selected()` is both.
+        assert_eq!(
+            template_edges(graph, "angular-event"),
+            [
+                "TasksComponent -> method save [calls] (blur) @ src/app/tasks/tasks.component.html:3",
+                "TasksComponent -> method selected [calls] (blur) @ src/app/tasks/tasks.component.html:3",
+                "ThemeToggleComponent -> method cycle [calls] (click) @ src/app/theme-toggle/theme-toggle.component.html:1",
+            ],
+            "{}",
+            graph.report()
+        );
+
+        let paths = codegraph_core::IndexPaths::resolve(project.root(), None).unwrap();
+        let store = codegraph_store::Store::open_for_read(
+            &paths,
+            std::time::Instant::now() + std::time::Duration::from_secs(30),
+            || false,
+        )
+        .expect("read the index");
+        let report = codegraph_graph::dead_code::build_dead_code_report(
+            &store,
+            &codegraph_graph::dead_code::DeadCodeQuery {
+                limit: 100,
+                ..Default::default()
+            },
+        )
+        .expect("the dead-code report");
+        let listed: Vec<&str> = report
+            .entries
+            .iter()
+            .map(|entry| entry.node.name.as_str())
+            .collect();
+        assert!(listed.contains(&"unused"), "{listed:?}");
+        for name in ["icon", "label", "remainingItems", "canSave"] {
+            assert!(!listed.contains(&name), "{name} is listed: {listed:?}");
+        }
+    }
+
+    /// A component links at most twenty-four routes: the `routerLink:`
+    /// fields its class writes count first, then its template's; a
+    /// repeated destination is skipped before it counts, and the
+    /// twenty-fifth on is dropped (upstream `MAX_LINKS_PER_COMPONENT`),
+    /// among the fields as among the template's links.
+    #[test]
+    fn w718d_a_component_links_at_most_twenty_four_routes() {
+        let routes: String = (0..30)
+            .map(|i| format!("  {{ path: 'p{i}', component: PageComponent }},\n"))
+            .collect();
+        let mut template = String::from("<a routerLink=\"/p0\">0</a>");
+        for i in 0..29 {
+            template.push_str(&format!("<a routerLink=\"/p{i}\">{i}</a>"));
+        }
+        // A menu the class builds of twenty-six entries, the first repeated.
+        let entries: Vec<String> = [0]
+            .into_iter()
+            .chain(0..26)
+            .map(|i| format!("{{ routerLink: '/p{i}' }}"))
+            .collect();
+        let menu = format!("  items = [{}];", entries.join(", "));
+        let project = Project::new()
+            .file(
+                "package.json",
+                "{\"dependencies\":{\"@angular/core\":\"^19.0.0\",\"@angular/router\":\"^19.0.0\"}}\n",
+            )
+            .file(
+                "src/app/app.routes.ts",
+                &format!(
+                    "import {{ Routes }} from '@angular/router';\nimport {{ PageComponent }} from './page/page.component';\nexport const routes: Routes = [\n{routes}];\n"
+                ),
+            )
+            .file(
+                "src/app/page/page.component.ts",
+                &component("PageComponent", "app-page", "<p>Page</p>", ""),
+            )
+            .file(
+                "src/app/nav/nav.component.ts",
+                &component("NavComponent", "app-nav", &template, "  tabs = [{ label: 'Last', routerLink: '/p29' }];"),
+            )
+            .file("src/app/menu/menu.component.ts", &component("MenuComponent", "app-menu", "<p>Menu</p>", &menu))
+            .index();
+        let graph = project.graph();
+        let mut expected: Vec<String> = (0..23)
+            .chain([29])
+            .map(|i| format!("NavComponent -> /p{i} (routerLink)"))
+            .chain((0..24).map(|i| format!("MenuComponent -> /p{i} (routerLink)")))
+            .collect();
+        expected.sort();
+        assert_eq!(navigations(graph), expected, "{}", graph.report());
+    }
+
+    /// The edge a `routerLink:` field of a class draws is written on the
+    /// field's own line (W7-18d's cost revision reads it from the class
+    /// body's line table).
+    #[test]
+    fn w718d_a_fields_link_is_written_on_the_fields_line() {
+        let project = Project::new()
+            .file(
+                "package.json",
+                "{\"dependencies\":{\"@angular/core\":\"^19.0.0\",\"@angular/router\":\"^19.0.0\"}}\n",
+            )
+            .file(
+                "src/app/app.routes.ts",
+                "import { Routes } from '@angular/router';\nimport { PageComponent } from './page/page.component';\nexport const routes: Routes = [\n  { path: 'a', component: PageComponent },\n  { path: 'b', component: PageComponent },\n];\n",
+            )
+            .file(
+                "src/app/page/page.component.ts",
+                &component("PageComponent", "app-page", "<p>Page</p>", ""),
+            )
+            .file(
+                "src/app/nav/nav.component.ts",
+                &component(
+                    "NavComponent",
+                    "app-nav",
+                    "<p>Nav</p>",
+                    "  title = 'Nav';\n  tabs = [\n    { label: 'A', routerLink: '/a' },\n    { label: 'B', routerLink: '/b' },\n  ];",
+                ),
+            )
+            .index();
+        let graph = project.graph();
+        let mut lines: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.kind == "navigates")
+            .map(|edge| {
+                let target = graph
+                    .node(&edge.target)
+                    .map_or("?", |node| node.name.as_str());
+                format!("{target} line {}", edge.line.unwrap_or(0))
+            })
+            .collect();
+        lines.sort();
+        // The class's lines: the imports, the decorator, `export class` on
+        // line 4, the constructor, `title`, `tabs = [`, then the fields.
+        assert_eq!(lines, ["/a line 8", "/b line 9"], "{}", graph.report());
+    }
+
+    /// A component whose `templateUrl` template binds `go()` to a click.
+    const READ_COMPONENT: &str = "import { Component } from '@angular/core';\n@Component({ selector: 'app-x', templateUrl: './x.component.html' })\nexport class XComponent {\n  go(): void {}\n}\n";
+
+    /// Its template.
+    const READ_TEMPLATE: &str = "<button (click)=\"go()\">Go</button>\n";
+
+    /// The project around [`READ_COMPONENT`], its template at `template` if
+    /// any, with `extra` files.
+    fn read_project(template: Option<&str>, extra: &[(&str, &str)]) -> Project {
+        let mut project = Project::new()
+            .file(
+                "package.json",
+                "{\"dependencies\":{\"@angular/core\":\"^19.0.0\"}}",
+            )
+            .file("src/app/x/x.component.ts", READ_COMPONENT);
+        if let Some(path) = template {
+            project = project.file(path, READ_TEMPLATE);
+        }
+        for (path, contents) in extra {
+            project = project.file(path, contents);
+        }
+        project
+    }
+
+    /// The `angular-event` edges, `source -> target`.
+    fn event_edges(graph: &Graph) -> Vec<String> {
+        template_edges(graph, "angular-event")
+    }
+
+    /// OD-B18: a `templateUrl` template the index does not hold is read
+    /// beside it within the scan's scope and recorded with its hash; one the
+    /// configuration excludes, the root `.gitignore` ignores, one reached
+    /// through a symbolic link, or larger than `indexing.max_file_size` is
+    /// not read and recorded as null, one that is not there as null, and one
+    /// that would leave the project root is neither read nor recorded.
+    #[test]
+    fn w718d_a_template_file_is_read_beside_the_index_in_the_scan_scope() {
+        let edge = "XComponent -> method go [calls] (click) @ src/app/x/x.component.html:1";
+        let project = read_project(Some("src/app/x/x.component.html"), &[]).index();
+        assert_eq!(
+            event_edges(project.graph()),
+            [edge],
+            "{}",
+            project.graph().report()
+        );
+        assert_eq!(
+            inputs_row(&project),
+            serde_json::json!({
+                "src/app/x/x.component.html": codegraph_core::node_id::hash_content(READ_TEMPLATE),
+            })
+        );
+
+        let missing = read_project(None, &[]).index();
+        assert!(
+            event_edges(missing.graph()).is_empty(),
+            "{}",
+            missing.graph().report()
+        );
+        assert_eq!(
+            inputs_row(&missing),
+            serde_json::json!({ "src/app/x/x.component.html": null })
+        );
+
+        let excluded = read_project(
+            Some("src/app/x/x.component.html"),
+            &[(
+                ".codegraph/config.toml",
+                "[app]\nname = \"probe\"\n\n[indexing]\nexclude = [\"src/app/x/x.component.html\"]\n",
+            )],
+        )
+        .index();
+        assert!(
+            event_edges(excluded.graph()).is_empty(),
+            "{}",
+            excluded.graph().report()
+        );
+        assert_eq!(
+            inputs_row(&excluded),
+            serde_json::json!({ "src/app/x/x.component.html": null })
+        );
+
+        let ignored = read_project(
+            Some("src/app/x/x.component.html"),
+            &[(".gitignore", "*.html\n")],
+        )
+        .index();
+        assert!(
+            event_edges(ignored.graph()).is_empty(),
+            "{}",
+            ignored.graph().report()
+        );
+        assert_eq!(
+            inputs_row(&ignored),
+            serde_json::json!({ "src/app/x/x.component.html": null })
+        );
+
+        let large = format!("{READ_TEMPLATE}<!-- {} -->\n", "x".repeat(512));
+        assert!(READ_COMPONENT.len() < 400 && large.len() > 400);
+        let over = read_project(
+            None,
+            &[
+                (
+                    ".codegraph/config.toml",
+                    "[app]\nname = \"probe\"\n\n[indexing]\nmax_file_size = 400\n",
+                ),
+                ("src/app/x/x.component.html", &large),
+            ],
+        )
+        .index();
+        assert!(
+            event_edges(over.graph()).is_empty(),
+            "{}",
+            over.graph().report()
+        );
+        assert_eq!(
+            inputs_row(&over),
+            serde_json::json!({ "src/app/x/x.component.html": null })
+        );
+
+        let escaping = Project::new()
+            .file(
+                "package.json",
+                "{\"dependencies\":{\"@angular/core\":\"^19.0.0\"}}",
+            )
+            .file(
+                "x.component.ts",
+                &READ_COMPONENT.replace("./x.component.html", "../x.component.html"),
+            );
+        let outside = escaping.root().parent().expect("the project's parent");
+        std::fs::write(outside.join("x.component.html"), READ_TEMPLATE)
+            .expect("write ../x.component.html");
+        let escaping = escaping.index();
+        assert!(
+            event_edges(escaping.graph()).is_empty(),
+            "{}",
+            escaping.graph().report()
+        );
+        assert_eq!(
+            inputs_row(&escaping),
+            serde_json::json!({}),
+            "an escaping path is not recorded"
+        );
+    }
+
+    /// OD-B18: a template reached through a symbolic link is not read, as
+    /// the scan reads no link it has not followed.
+    #[cfg(unix)]
+    #[test]
+    fn w718d_a_template_through_a_link_is_not_read() {
+        let project = read_project(Some("templates/x.component.html"), &[]);
+        std::os::unix::fs::symlink(
+            "../../../templates/x.component.html",
+            project.root().join("src/app/x/x.component.html"),
+        )
+        .expect("link the template");
+        let project = project.index();
+        assert!(
+            event_edges(project.graph()).is_empty(),
+            "{}",
+            project.graph().report()
+        );
+        assert_eq!(
+            inputs_row(&project),
+            serde_json::json!({ "src/app/x/x.component.html": null })
+        );
+    }
+
+    /// OD-B18: a template `codegraph.json` maps to an indexed language is an
+    /// indexed file, read as the index holds it and not recorded beside it.
+    #[test]
+    fn w718d_a_template_the_index_holds_is_read_as_it_holds_it() {
+        let project = read_project(
+            Some("src/app/x/x.component.html"),
+            &[(
+                ".codegraph/codegraph.json",
+                "{\"extensions\":{\".html\":\"javascript\"}}\n",
+            )],
+        )
+        .index();
+        let graph = project.graph();
+        assert!(
+            graph
+                .files
+                .iter()
+                .any(|file| file.path == "src/app/x/x.component.html"),
+            "the template is an indexed file\n{}",
+            graph.report()
+        );
+        assert_eq!(
+            event_edges(graph),
+            ["XComponent -> method go [calls] (click) @ src/app/x/x.component.html:1"],
+            "{}",
+            graph.report()
+        );
+        assert_eq!(inputs_row(&project), serde_json::json!({}));
+    }
+
+    /// The `synthesis_unindexed_inputs` row of `project`'s index.
+    #[track_caller]
+    fn inputs_row(project: &super::support::Indexed) -> serde_json::Value {
+        let rows = super::support::project_metadata_with_prefix(
+            &project.db(),
+            "synthesis_unindexed_inputs",
+        );
+        let [(key, value)] = rows.as_slice() else {
+            panic!("one synthesis_unindexed_inputs row: {rows:?}");
+        };
+        assert_eq!(key, "synthesis_unindexed_inputs");
+        serde_json::from_str(value).expect("the row is JSON")
+    }
+}
+
+mod explore_flow {
+    use super::support::{Project, codegraph};
+
+    const FLOW_HEADING: &str = "**Flow (call path among the symbols you queried)**";
+
+    /// What `codegraph explore` prints for `query`.
+    fn explore(root: &std::path::Path, query: &str) -> String {
+        let output = codegraph(root, ["explore", query, "-p", "."]);
+        String::from_utf8(output.stdout).expect("explore prints UTF-8")
+    }
+
+    /// The Flow section explore opens with: its heading through its last
+    /// numbered line; empty when there is none.
+    fn flow_section(text: &str) -> Vec<String> {
+        let Some(start) = text.find(FLOW_HEADING) else {
+            return Vec::new();
+        };
+        text[start..]
+            .lines()
+            .take_while(|line| !line.starts_with("> "))
+            .filter(|line| !line.is_empty())
+            .map(str::to_string)
+            .collect()
+    }
+
+    const BRANCHES_TS: &str = "export function helper() { return 1 }\nexport function other() { return 2 }\nexport function run(ready: boolean, busy: boolean) {\n  if (busy) return\n  if (ready) {\n    helper()\n  } else {\n    other()\n  }\n}\nexport function start() {\n  run(true, false)\n}\n";
+
+    /// Upstream #365: explore opens with the longest call chain among the
+    /// symbols the query names, one numbered line per symbol and one `↓`
+    /// line per hop, and says the bodies follow. Two named symbols one call
+    /// apart make no Flow: a chain needs three.
+    #[test]
+    fn pr365_explore_opens_with_the_call_path_among_the_named_symbols() {
+        let project = Project::new().file("src/app.ts", BRANCHES_TS).index();
+        let text = explore(project.root(), "start run helper");
+        assert!(text.starts_with(FLOW_HEADING), "{text}");
+        assert_eq!(
+            flow_section(&text),
+            [
+                FLOW_HEADING,
+                "1. start (src/app.ts:11)",
+                "   ↓ calls",
+                "2. run (src/app.ts:3)",
+                "   ↓ calls (when !busy && ready)",
+                "3. helper (src/app.ts:1)",
+            ],
+            "{text}"
+        );
+        assert!(
+            text.contains("\n\n> Full source for these symbols is below — the call flow among them, followed by their bodies.\n## Exploration: start run helper\n"),
+            "{text}"
+        );
+        let short = explore(project.root(), "start run");
+        assert!(flow_section(&short).is_empty(), "{short}");
+        assert!(short.starts_with("## Exploration: start run"), "{short}");
+    }
+
+    /// Upstream #1655: each hop of the Flow names the conditions its call
+    /// runs under, read from the caller's source as it is now: an earlier
+    /// early return negated, then the branch the call sits in. The other
+    /// arm of the same `if` reads negated.
+    #[test]
+    fn pr1655_a_flow_hop_says_when_its_call_runs() {
+        let project = Project::new().file("src/app.ts", BRANCHES_TS).index();
+        let text = explore(project.root(), "start run other");
+        assert_eq!(
+            flow_section(&text),
+            [
+                FLOW_HEADING,
+                "1. start (src/app.ts:11)",
+                "   ↓ calls",
+                "2. run (src/app.ts:3)",
+                "   ↓ calls (when !busy && !ready)",
+                "3. other (src/app.ts:2)",
+            ],
+            "{text}"
+        );
+    }
+
+    /// The condition is the CALLER's: read in the file the call is written
+    /// in, at the call's line, not in the callee's file.
+    #[test]
+    fn pr1655_the_condition_is_read_in_the_callers_file() {
+        let project = Project::new()
+            .file(
+                "src/lib.ts",
+                "export function helper(): number {\n  return 1;\n}\n",
+            )
+            .file(
+                "src/app.ts",
+                "import { helper } from './lib';\n\nexport function run(admin: boolean): number {\n  if (!admin) {\n    return 0;\n  }\n  return helper();\n}\n\nexport function start(): number {\n  return run(true);\n}\n",
+            )
+            .index();
+        let text = explore(project.root(), "start run helper");
+        assert_eq!(
+            flow_section(&text),
+            [
+                FLOW_HEADING,
+                "1. start (src/app.ts:10)",
+                "   ↓ calls",
+                "2. run (src/app.ts:3)",
+                "   ↓ calls (when admin)",
+                "3. helper (src/lib.ts:1)",
+            ],
+            "{text}"
+        );
+    }
+
+    /// A Python caller: `if not user: raise` before the call reads as `user`.
+    #[test]
+    fn pr1655_a_python_early_exit_guards_the_call_after_it() {
+        let project = Project::new()
+            .file(
+                "app.py",
+                "def helper():\n    return 1\n\n\ndef run(user):\n    if not user:\n        raise ValueError(\"no user\")\n    helper()\n\n\ndef start():\n    run(None)\n",
+            )
+            .index();
+        let text = explore(project.root(), "start run helper");
+        assert_eq!(
+            flow_section(&text),
+            [
+                FLOW_HEADING,
+                "1. start (app.py:11)",
+                "   ↓ calls",
+                "2. run (app.py:5)",
+                "   ↓ calls (when user)",
+                "3. helper (app.py:1)",
+            ],
+            "{text}"
+        );
+    }
+
+    /// A caller whose file changed since it was indexed may have moved its
+    /// lines: its hop shows no condition rather than one read at a stale
+    /// line, and the rest of the Flow stays.
+    #[test]
+    fn pr1655_a_changed_caller_file_gives_no_condition() {
+        let mut project = Project::new().file("src/app.ts", BRANCHES_TS).index();
+        let edited =
+            BRANCHES_TS.replace("  if (busy) return\n", "  if (busy) return\n  // checked\n");
+        project.write("src/app.ts", &edited);
+        let text = explore(project.root(), "start run helper");
+        assert_eq!(
+            flow_section(&text),
+            [
+                FLOW_HEADING,
+                "1. start (src/app.ts:11)",
+                "   ↓ calls",
+                "2. run (src/app.ts:3)",
+                "   ↓ calls",
+                "3. helper (src/app.ts:1)",
+            ],
+            "{text}"
+        );
+    }
+
+    /// Upstream #2453, explore half: two routes of one length to the next
+    /// named symbol, and the Flow takes the one through the symbol the query
+    /// names, whichever the index lists first. Upstream meets it through an
+    /// interface's implementations, whose dispatch edges come with the
+    /// synthesis stage (W7-14); direct calls settle the same way.
+    #[test]
+    fn pr2453_explore_flow_goes_through_the_symbol_the_query_names() {
+        let project = Project::new()
+            .file(
+                "src/store.ts",
+                "export function persist(): number {\n  return viaMemory() + viaDisk();\n}\n\nexport function viaMemory(): number {\n  return writeEntry();\n}\n\nexport function viaDisk(): number {\n  return writeEntry();\n}\n\nexport function writeEntry(): number {\n  return 1;\n}\n",
+            )
+            .index();
+        for (via, line) in [("viaMemory", 5), ("viaDisk", 9)] {
+            let text = explore(project.root(), &format!("persist {via} writeEntry"));
+            assert_eq!(
+                flow_section(&text),
+                [
+                    FLOW_HEADING.to_string(),
+                    "1. persist (src/store.ts:1)".to_string(),
+                    "   ↓ calls".to_string(),
+                    format!("2. {via} (src/store.ts:{line})"),
+                    "   ↓ calls".to_string(),
+                    "3. writeEntry (src/store.ts:13)".to_string(),
+                ],
+                "{text}"
+            );
+        }
+    }
+}
+
+/// Explore's dynamic-dispatch links among the named symbols (W7-26):
+/// upstream's `explore-synth-link-endpoints`, `explore-synth-constant-
+/// endpoints` and #687 tests (`e8ddc4e2`), through `codegraph explore`.
+mod explore_synth_links {
+    use super::support::{Indexed, Project, codegraph, synthesized_targets_in_row_order};
+
+    const SECTION: &str = "**Dynamic-dispatch links among your symbols**";
+
+    /// What `codegraph explore` prints for `query`.
+    fn explore(root: &std::path::Path, query: &str) -> String {
+        let output = codegraph(root, ["explore", query, "-p", "."]);
+        String::from_utf8(output.stdout).expect("explore prints UTF-8")
+    }
+
+    /// The `- a → b   [...]` lines of the links section (upstream's
+    /// `linkLines`).
+    fn link_lines(text: &str) -> Vec<String> {
+        let Some(at) = text.find(SECTION) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for line in text[at + SECTION.len()..].lines() {
+            if line.starts_with("- ") {
+                out.push(line.to_string());
+            } else if !out.is_empty() {
+                break;
+            }
+        }
+        out
+    }
+
+    /// The Flow section, up to the links section (upstream's
+    /// `flowSection`).
+    fn flow_section(text: &str) -> &str {
+        let Some(at) = text.find("**Flow (call path") else {
+            return "";
+        };
+        match text[at..].find(SECTION) {
+            Some(end) => &text[at..at + end],
+            None => &text[at..],
+        }
+    }
+
+    /// The owner of a link's target: `Square` in `- Shape.area →
+    /// Square.area   [...]`.
+    fn target_owner(line: &str) -> &str {
+        let target = line.split(" → ").nth(1).expect("a link has an arrow");
+        target.split('.').next().expect("the target has an owner")
+    }
+
+    /// Upstream's `indexShapes`: `Shape.area` with one implementation per
+    /// name. `Circle.area` calls `scale`, so `report → Shape.area →
+    /// Circle.area → scale` is the longest chain among the query's symbols
+    /// and the Flow runs through Circle, never through the implementation
+    /// the query names. `doubles` go in `fakes/<name>.test.ts`.
+    fn shapes(implementations: &[&str], doubles: &[&str]) -> Project {
+        let mut project = Project::new()
+            .file("shape.ts", "export interface Shape {\n  area(): number;\n}\n")
+            .file(
+                "scale.ts",
+                "export function scale(n: number): number {\n  return n * 2;\n}\n",
+            )
+            .file(
+                "report.ts",
+                "import type { Shape } from './shape';\n\nexport function report(shape: Shape): number {\n  return shape.area();\n}\n",
+            )
+            .file(
+                "circle.ts",
+                "import type { Shape } from './shape';\nimport { scale } from './scale';\n\nexport class Circle implements Shape {\n  area(): number {\n    return scale(3);\n  }\n}\n",
+            );
+        for name in implementations {
+            project = project.file(
+                &format!("{}.ts", name.to_lowercase()),
+                &implementation(name, "./shape", 1),
+            );
+        }
+        for name in doubles {
+            project = project.file(
+                &format!("fakes/{}.test.ts", name.to_lowercase()),
+                &implementation(name, "../shape", 0),
+            );
+        }
+        project
+    }
+
+    fn implementation(name: &str, shape: &str, value: u8) -> String {
+        format!(
+            "import type {{ Shape }} from '{shape}';\n\nexport class {name} implements Shape {{\n  area(): number {{\n    return {value};\n  }}\n}}\n"
+        )
+    }
+
+    /// `Shape.area`'s implementations in the order its synthesized edges
+    /// come out of it (`kind, target, line, col`, upstream's
+    /// `getOutgoingEdges`).
+    fn implementations_in_edge_order(project: &Indexed) -> Vec<String> {
+        let graph = project.graph();
+        let shape = graph
+            .nodes
+            .iter()
+            .find(|n| n.qualified_name == "Shape::area")
+            .expect("the interface method");
+        graph
+            .edges
+            .iter()
+            .filter(|e| {
+                e.source == shape.id
+                    && e.provenance.as_deref() == Some("heuristic")
+                    && e.metadata["synthesizedBy"] == "interface-impl"
+            })
+            .map(|e| {
+                let target = graph.node(&e.target).expect("the implementation");
+                target
+                    .qualified_name
+                    .split("::")
+                    .next()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    /// Upstream #2748: an interface method's implementations are one link
+    /// each, the one the query names first, each end named by its owner;
+    /// the Flow's own hop is not repeated.
+    #[test]
+    fn pr2748_lists_the_named_implementation_first_and_every_other_off_the_flow() {
+        let project = shapes(&["Square", "Triangle"], &[]).index();
+        let mut order = implementations_in_edge_order(&project);
+        order.sort();
+        assert_eq!(order, ["Circle", "Square", "Triangle"]);
+        let text = explore(project.root(), "report Shape.area Square.area scale");
+        let flow = flow_section(&text);
+        assert!(flow.contains(". area (circle.ts:5)"), "{text}");
+        assert!(!flow.contains("square.ts"), "{text}");
+        assert_eq!(
+            link_lines(&text),
+            [
+                "- Shape.area → Square.area   [dynamic: interface → impl @square.ts:4]",
+                "- Shape.area → Triangle.area   [dynamic: interface → impl @triangle.ts:4]",
+            ],
+            "{text}"
+        );
+    }
+
+    /// Six lines at most, the first spent on the implementation the query
+    /// names even when the edge order lists it last; the rest go by the
+    /// edge order.
+    #[test]
+    fn pr2748_keeps_six_lines_and_spends_the_first_on_the_named_implementation() {
+        let others = [
+            "Square", "Triangle", "Pentagon", "Hexagon", "Heptagon", "Octagon", "Nonagon",
+            "Decagon",
+        ];
+        let project = shapes(&others, &[]).index();
+        let order: Vec<String> = implementations_in_edge_order(&project)
+            .into_iter()
+            .filter(|owner| owner != "Circle")
+            .collect();
+        let mut sorted = order.clone();
+        sorted.sort();
+        let mut expected = others.map(String::from).to_vec();
+        expected.sort();
+        assert_eq!(sorted, expected);
+        let last = order.last().unwrap();
+        let text = explore(
+            project.root(),
+            &format!("report Shape.area {last}.area scale"),
+        );
+        assert!(
+            flow_section(&text).contains(". area (circle.ts:5)"),
+            "{text}"
+        );
+        let links = link_lines(&text);
+        assert_eq!(links.len(), 6, "{text}");
+        assert_eq!(
+            links[0],
+            format!(
+                "- Shape.area → {last}.area   [dynamic: interface → impl @{}.ts:4]",
+                last.to_lowercase()
+            )
+        );
+        let rest: Vec<&str> = links[1..].iter().map(|line| target_owner(line)).collect();
+        assert_eq!(rest, order[..5], "{text}");
+    }
+
+    /// Links into test doubles (`fakes/*.test.ts`) through an end the
+    /// query did not name only get the lines the real implementations
+    /// leave.
+    #[test]
+    fn pr2748_lists_links_into_test_files_after_the_rest() {
+        let production = [
+            "Square", "Triangle", "Pentagon", "Hexagon", "Heptagon", "Octagon",
+        ];
+        let doubles = ["FakeA", "FakeB", "FakeC", "FakeD", "FakeE", "FakeF"];
+        let project = shapes(&production, &doubles).index();
+        let order: Vec<String> = implementations_in_edge_order(&project)
+            .into_iter()
+            .filter(|owner| owner != "Circle")
+            .collect();
+        assert!(
+            order[..6]
+                .iter()
+                .any(|owner| doubles.contains(&owner.as_str())),
+            "in the edge order a test double would take a line: {order:?}"
+        );
+        let text = explore(project.root(), "report Shape.area scale");
+        assert!(
+            flow_section(&text).contains(". area (circle.ts:5)"),
+            "{text}"
+        );
+        let links = link_lines(&text);
+        let mut owners: Vec<&str> = links.iter().map(|line| target_owner(line)).collect();
+        owners.sort();
+        let mut expected = production.to_vec();
+        expected.sort();
+        assert_eq!(owners, expected, "{text}");
+    }
+
+    /// prometheus's `Discovery.refresh` matches a `Discovery` in every
+    /// discovery package: the links of the interface the query picks out
+    /// come before the links among an ambiguous name's candidates.
+    #[test]
+    fn pr2748_puts_an_interface_the_query_picks_out_before_an_ambiguous_names_links() {
+        let mut project = Project::new()
+            .file(
+                "iface.ts",
+                "export interface Discovery {\n  refresh(): number;\n}\n",
+            )
+            .file(
+                "refresher.ts",
+                "export interface Refresher {\n  refresh(): number;\n}\n",
+            );
+        for i in 1..=5 {
+            project = project.file(
+                &format!("pkg{i}/discovery.ts"),
+                &format!(
+                    "import type {{ Discovery as Base }} from '../iface';\n\nexport class Discovery implements Base {{\n  refresh(): number {{\n    return {i};\n  }}\n}}\n"
+                ),
+            );
+        }
+        for name in ["Hcloud", "Robot"] {
+            project = project.file(
+                &format!("{}.ts", name.to_lowercase()),
+                &format!(
+                    "import type {{ Refresher }} from './refresher';\n\nexport class {name} implements Refresher {{\n  refresh(): number {{\n    return 0;\n  }}\n}}\n"
+                ),
+            );
+        }
+        let project = project.index();
+        let text = explore(
+            project.root(),
+            "Discovery.refresh Refresher.refresh Hcloud.refresh",
+        );
+        let links = link_lines(&text);
+        assert_eq!(links.len(), 6, "{text}");
+        assert_eq!(
+            links[0],
+            "- Refresher.refresh → Hcloud.refresh   [dynamic: interface → impl @hcloud.ts:4]"
+        );
+        assert_eq!(
+            links[1],
+            "- Refresher.refresh → Robot.refresh   [dynamic: interface → impl @robot.ts:4]"
+        );
+        for line in &links[2..] {
+            let site = line
+                .strip_prefix(
+                    "- Discovery.refresh → Discovery.refresh   [dynamic: interface → impl @pkg",
+                )
+                .unwrap_or_else(|| panic!("{line}"));
+            assert!(site.ends_with("/discovery.ts:4]"), "{line}");
+        }
+    }
+
+    /// Upstream #2751: the named symbols take turns, so one long fan-out
+    /// does not fill the list.
+    #[test]
+    fn pr2751_lets_the_named_symbols_take_turns() {
+        let mut project = Project::new();
+        for (interface, classes) in [
+            (
+                "Wide",
+                &[
+                    "WideA", "WideB", "WideC", "WideD", "WideE", "WideF", "WideG", "WideH",
+                ][..],
+            ),
+            ("Narrow", &["NarrowA", "NarrowB"][..]),
+        ] {
+            let module = interface.to_lowercase();
+            project = project.file(
+                &format!("{module}.ts"),
+                &format!("export interface {interface} {{\n  run(): number;\n}}\n"),
+            );
+            for name in classes {
+                project = project.file(
+                    &format!("{}.ts", name.to_lowercase()),
+                    &format!(
+                        "import type {{ {interface} }} from './{module}';\n\nexport class {name} implements {interface} {{\n  run(): number {{\n    return 1;\n  }}\n}}\n"
+                    ),
+                );
+            }
+        }
+        let project = project.index();
+        let text = explore(project.root(), "Wide.run Narrow.run");
+        let links = link_lines(&text);
+        let owners: Vec<&str> = links
+            .iter()
+            .map(|line| line[2..].split('.').next().unwrap())
+            .collect();
+        assert_eq!(
+            owners,
+            ["Wide", "Narrow", "Wide", "Narrow", "Wide", "Wide"],
+            "{text}"
+        );
+        let mut narrow: Vec<&str> = links
+            .iter()
+            .filter(|line| line.starts_with("- Narrow.run → "))
+            .map(|line| target_owner(line))
+            .collect();
+        narrow.sort();
+        assert_eq!(narrow, ["NarrowA", "NarrowB"]);
+    }
+
+    /// gin declares `Binding` once per build tag: two links that read the
+    /// same print once, and none that reads like the Flow's hop.
+    #[test]
+    fn pr2748_prints_a_line_once_and_never_one_that_reads_like_a_flow_hop() {
+        let iface = "package binding\n\ntype Binding interface {\n\tBind(req string) error\n}\n";
+        let project = Project::new()
+            .file("go.mod", "module example.com/binding\n\ngo 1.22\n")
+            .file("binding.go", &format!("//go:build !nomsgpack\n\n{iface}"))
+            .file(
+                "binding_nomsgpack.go",
+                &format!("//go:build nomsgpack\n\n{iface}"),
+            )
+            .file(
+                "form.go",
+                "package binding\n\ntype formBinding struct{}\n\nfunc (b formBinding) Bind(req string) error {\n\treturn mapForm(req)\n}\n\nfunc mapForm(req string) error {\n\treturn nil\n}\n",
+            )
+            .file(
+                "query.go",
+                "package binding\n\ntype queryBinding struct{}\n\nfunc (b queryBinding) Bind(req string) error {\n\treturn mapForm(req)\n}\n",
+            )
+            .index();
+        let declarations: Vec<_> = project
+            .graph()
+            .nodes
+            .iter()
+            .filter(|n| n.qualified_name == "Binding::Bind")
+            .collect();
+        assert_eq!(declarations.len(), 2);
+
+        let pair = explore(project.root(), "Binding.Bind formBinding.Bind");
+        assert_eq!(
+            link_lines(&pair),
+            [
+                "- Binding.Bind → formBinding.Bind   [dynamic: interface → impl @form.go:5]",
+                "- Binding.Bind → queryBinding.Bind   [dynamic: interface → impl @query.go:5]",
+            ],
+            "{pair}"
+        );
+
+        let text = explore(project.root(), "Binding.Bind formBinding.Bind mapForm");
+        let flow = flow_section(&text);
+        assert!(
+            flow.contains("1. Bind (binding.go:6)\n   ↓ dynamic: interface → impl @form.go:5\n2. Bind (form.go:5)\n")
+                || flow.contains("1. Bind (binding_nomsgpack.go:6)\n   ↓ dynamic: interface → impl @form.go:5\n2. Bind (form.go:5)\n"),
+            "{text}"
+        );
+        assert_eq!(
+            link_lines(&text),
+            ["- Binding.Bind → queryBinding.Bind   [dynamic: interface → impl @query.go:5]"],
+            "{text}"
+        );
+    }
+
+    /// An RTK thunk→thunk hop is `constant`→`constant`: no callable is
+    /// named, and the links are the only place it surfaces, as dynamic
+    /// dispatch with its wiring site.
+    #[test]
+    fn rtk_thunk_links_surface_between_two_constants() {
+        let project = Project::new()
+            .file(
+                "package.json",
+                r#"{"name":"app","dependencies":{"@reduxjs/toolkit":"^2"}}"#,
+            )
+            .file(
+                "thunks.ts",
+                "import { createAsyncThunk } from '@reduxjs/toolkit';\n\nexport const deepThunk = createAsyncThunk('app/deep', async (n: number) => n * 2);\n\nexport const innerThunk = createAsyncThunk('app/inner', async (n: number, { dispatch }) => {\n  return dispatch(deepThunk(n));\n});\n\nexport const outerThunk = createAsyncThunk('app/outer', async (n: number, { dispatch }) => {\n  await dispatch(innerThunk(n));\n});\n",
+            )
+            .index();
+        let outer = project
+            .graph()
+            .nodes
+            .iter()
+            .find(|n| n.name == "outerThunk")
+            .expect("outerThunk");
+        assert_eq!(outer.kind, "constant");
+        let text = explore(project.root(), "outerThunk innerThunk");
+        assert_eq!(
+            link_lines(&text),
+            [
+                "- outerThunk → innerThunk   [dynamic: redux thunk @thunks.ts:10]",
+                "- innerThunk → deepThunk   [dynamic: redux thunk @thunks.ts:6]",
+            ],
+            "{text}"
+        );
+        assert!(
+            text.contains("\n\n> Full source for these symbols is below.\n"),
+            "{text}"
+        );
+    }
+
+    /// Upstream #687, criterion 1: an emit→handler hop with a literal event
+    /// is a two-node chain, too short for the Flow; it is a link, and the
+    /// flow is connected, so there is no boundary to announce.
+    #[test]
+    fn pr687_a_direct_synthesized_emit_to_handler_hop_is_a_link() {
+        let project = Project::new()
+            .file(
+                "bus.ts",
+                "type Handler = (p: unknown) => void;\nexport class EventBus {\n  private listeners: Record<string, Handler[]> = {};\n  on(event: string, fn: Handler) { (this.listeners[event] ??= []).push(fn); }\n  emit(event: string, payload: unknown) { for (const fn of this.listeners[event] ?? []) fn(payload); }\n}\nexport const bus = new EventBus();",
+            )
+            .file(
+                "billing.ts",
+                "import { bus } from './bus';\nexport function settleInvoice(payload: unknown) { return payload; }\nbus.on('invoice.settled', settleInvoice);",
+            )
+            .file(
+                "checkout.ts",
+                "import { bus } from './bus';\nexport function completeCheckout(order: unknown) {\n  bus.emit('invoice.settled', order);\n}",
+            )
+            .index();
+        let text = explore(project.root(), "completeCheckout settleInvoice");
+        assert_eq!(
+            link_lines(&text),
+            [
+                "- completeCheckout → settleInvoice   [dynamic: event `invoice.settled` @billing.ts:3]"
+            ],
+            "{text}"
+        );
+        assert!(flow_section(&text).is_empty(), "{text}");
+        assert!(!text.contains("Dynamic boundaries"), "{text}");
+    }
+
+    /// A fully connected static flow has its Flow, no links and no boundary.
+    #[test]
+    fn pr687_a_connected_static_flow_has_no_links() {
+        let project = Project::new()
+            .file(
+                "pipeline.ts",
+                "export function stepOne() { return stepTwo(); }\nexport function stepTwo() { return stepThree(); }\nexport function stepThree() { return 3; }",
+            )
+            .index();
+        let text = explore(project.root(), "stepOne stepThree");
+        assert!(text.contains("**Flow"), "{text}");
+        assert!(!text.contains(SECTION), "{text}");
+        assert!(!text.contains("Dynamic boundaries"), "{text}");
+    }
+
+    /// The links' order is the graph's: after a sync rewrote one link's row
+    /// last, the six lines are the ones a fresh index of the same source
+    /// lists.
+    #[test]
+    fn w726_links_after_a_sync_read_as_a_fresh_index_reads_them() {
+        let others = [
+            "Square", "Triangle", "Pentagon", "Hexagon", "Heptagon", "Octagon", "Nonagon",
+            "Decagon",
+        ];
+        let mut synced = shapes(&others, &[]).index();
+        let moved = format!("\n{}", implementation("Nonagon", "./shape", 1));
+        synced.write("nonagon.ts", &moved);
+        synced.sync();
+        let fresh = shapes(&others, &[]).file("nonagon.ts", &moved).index();
+        assert_eq!(synced.graph().edges.len(), fresh.graph().edges.len());
+        let shape = |project: &Indexed| {
+            project
+                .graph()
+                .nodes
+                .iter()
+                .find(|n| n.qualified_name == "Shape::area")
+                .expect("the interface method")
+                .id
+                .clone()
+        };
+        assert_ne!(
+            synthesized_targets_in_row_order(&synced.db(), &shape(&synced)),
+            synthesized_targets_in_row_order(&fresh.db(), &shape(&fresh)),
+            "the sync left the rows in another order than a fresh index"
+        );
+        let query = "report Shape.area scale";
+        let links = link_lines(&explore(synced.root(), query));
+        assert_eq!(links.len(), 6);
+        assert_eq!(links, link_lines(&explore(fresh.root(), query)));
+    }
+
+    /// OD-B23: explore's hard filter drops a file upstream's `b635dd46`
+    /// patterns read as low-value (`specs/`), and keeps one they do not
+    /// (`lexicon.ts`, whose `icon` is no whole word), in a small project and
+    /// a query that does not mention tests.
+    #[test]
+    fn od_b23_the_hard_filter_reads_low_value_files_as_upstream_did() {
+        let body = |sep: &str| {
+            format!(
+                "export function tokenize(input: string): string[] {{\n  return input.split(\"{sep}\");\n}}\n"
+            )
+        };
+        let project = Project::new()
+            .file("src/a.ts", &body(" "))
+            .file("src/b.ts", &body(","))
+            .file("src/lexicon.ts", &body(";"))
+            .file("specs/a.ts", &body("|"))
+            .index();
+        let text = explore(project.root(), "tokenize");
+        assert!(text.contains("#### src/a.ts "), "{text}");
+        assert!(text.contains("#### src/b.ts "), "{text}");
+        assert!(text.contains("#### src/lexicon.ts "), "{text}");
+        assert!(!text.contains("specs/a.ts"), "{text}");
+    }
+}
+
+/// The synthesis stage's dispatch edges (W7-14): the field, closure and
+/// emitter passes over the base graph a full index resolved, merged in
+/// upstream's registry order.
+mod synthesis {
+    use super::support::{
+        EdgeRow, Graph, NodeRow, Project, graph_of, project_metadata_with_prefix,
+    };
+    use serde_json::Value;
+
+    /// The synthesized `calls` edges from a node matching `source` to one
+    /// matching `target`.
+    #[track_caller]
+    fn synthesized<'g>(graph: &'g Graph, source: &str, target: &str) -> Vec<&'g EdgeRow> {
+        graph
+            .edges_matching(source, "calls", target)
+            .into_iter()
+            .filter(|edge| edge.metadata.get("synthesizedBy").is_some())
+            .collect()
+    }
+
+    /// The one synthesized edge from `source` to `target`, made by `by` and
+    /// carrying each of `fields` in its metadata.
+    #[track_caller]
+    fn assert_synthesized(
+        graph: &Graph,
+        source: &str,
+        target: &str,
+        by: &str,
+        fields: &[(&str, &str)],
+    ) -> EdgeRow {
+        let edges = synthesized(graph, source, target);
+        assert_eq!(
+            edges.len(),
+            1,
+            "one synthesized edge {source} -> {target}:\n{}",
+            graph.report()
+        );
+        let edge = edges[0].clone();
+        assert_eq!(edge.metadata["synthesizedBy"], by, "{edge:?}");
+        assert_eq!(edge.provenance.as_deref(), Some("heuristic"), "{edge:?}");
+        for (key, value) in fields {
+            assert_eq!(
+                edge.metadata[*key],
+                Value::from(*value),
+                "{key} of {edge:?}"
+            );
+        }
+        edge
+    }
+
+    #[track_caller]
+    fn assert_not_synthesized(graph: &Graph, source: &str, target: &str) {
+        let edges = synthesized(graph, source, target);
+        assert!(
+            edges.is_empty(),
+            "no synthesized edge {source} -> {target}:\n{}",
+            graph.report()
+        );
+    }
+
+    const SCENE: &str = "type Callback = () => void;\nexport class Scene {\n  private callbacks = new Set<Callback>();\n  onUpdate(cb: Callback) {\n    this.callbacks.add(cb);\n  }\n  triggerUpdate() {\n    for (const cb of this.callbacks) cb();\n  }\n}\n";
+
+    /// Upstream's field observer (excalidraw's `Scene`): the dispatcher that
+    /// loops over `this.callbacks` reaches the method a caller registered,
+    /// the value resolution bound at the registration's line, picked by its
+    /// name among the line's function values.
+    #[test]
+    fn w714_field_observer_reaches_the_registered_method() {
+        let project = Project::new()
+            .file("src/scene.ts", SCENE)
+            .file(
+                "src/app.ts",
+                "import { Scene } from './scene';\nexport class App {\n  scene = new Scene();\n  constructor() {\n    this.scene.onUpdate(this.triggerRender); this.log(this.triggerPaint);\n  }\n  log(value: unknown) {\n    return value;\n  }\n  triggerRender() {\n    return 1;\n  }\n  triggerPaint() {\n    return 2;\n  }\n}\n",
+            )
+            .index();
+        let graph = graph_of(&project);
+        assert_not_synthesized(
+            graph,
+            "method Scene::triggerUpdate",
+            "method App::triggerPaint",
+        );
+        let edge = assert_synthesized(
+            graph,
+            "method Scene::triggerUpdate",
+            "method App::triggerRender",
+            "callback",
+            &[
+                ("via", "onUpdate"),
+                ("field", "callbacks"),
+                ("registeredAt", "src/app.ts:5"),
+            ],
+        );
+        assert_eq!((edge.line, edge.col), (Some(7), None), "{edge:?}");
+        assert_eq!(
+            project_metadata_with_prefix(&project.db(), "synthesis_version"),
+            [("synthesis_version".to_string(), "17".to_string())]
+        );
+    }
+
+    /// W7-18a (upstream `isTestPath` in the five link synthesizers and in
+    /// React's wrapper scan): no link pass reads a test file. Each router's
+    /// app writes the same link in a component and in a test file, and only
+    /// the component's draws a `navigates` edge; a `styled(Link)` wrapper a
+    /// test file declares wraps nothing, so the component writing it draws
+    /// none either.
+    #[test]
+    fn w718a_no_link_pass_reads_a_test_file() {
+        let next_nav = |name: &str| {
+            format!(
+                "import Link from 'next/link';\n\nexport function {name}() {{\n  return <Link href=\"/users\">Users</Link>;\n}}\n"
+            )
+        };
+        let react_nav = |name: &str| {
+            format!(
+                "import {{ Link }} from 'react-router-dom';\n\nexport function {name}() {{\n  return <Link to=\"/team\">Team</Link>;\n}}\n"
+            )
+        };
+        let vue_home = "<template><RouterLink to=\"/about\">About</RouterLink></template>\n<script setup lang=\"ts\">\nimport { RouterLink } from 'vue-router';\n</script>\n";
+        let project = Project::new()
+            .file(
+                "package.json",
+                "{\"name\":\"links\",\"private\":true,\"workspaces\":[\"apps/*\"]}\n",
+            )
+            .file(
+                "apps/next/package.json",
+                "{\"name\":\"next-app\",\"private\":true,\"dependencies\":{\"next\":\"14.1.0\",\"react\":\"18.2.0\"}}\n",
+            )
+            .file(
+                "apps/next/app/page.tsx",
+                "export default function Page() {\n  return null;\n}\n",
+            )
+            .file(
+                "apps/next/app/users/page.tsx",
+                "export default function Users() {\n  return null;\n}\n",
+            )
+            .file("apps/next/components/Nav.tsx", &next_nav("NextNav"))
+            .file(
+                "apps/next/components/__tests__/Nav.test.tsx",
+                &next_nav("NextNavTest"),
+            )
+            .file(
+                "apps/react/package.json",
+                "{\"name\":\"react-app\",\"private\":true,\"dependencies\":{\"react\":\"18.2.0\",\"react-router-dom\":\"6.22.0\"}}\n",
+            )
+            .file(
+                "apps/react/src/main.tsx",
+                "import { createBrowserRouter, Link } from 'react-router-dom';\nimport { Team } from './Team';\n\nexport const router = createBrowserRouter([\n  { path: '/team', element: <Team /> },\n]);\n\nexport function ReactNav() {\n  return <Link to=\"/team\">Team</Link>;\n}\n",
+            )
+            .file(
+                "apps/react/src/Team.tsx",
+                "export function Team() {\n  return null;\n}\n",
+            )
+            .file("apps/react/src/__tests__/Nav.test.tsx", &react_nav("ReactNavTest"))
+            .file(
+                "apps/react/src/__tests__/links.test.tsx",
+                "import { Link } from 'react-router-dom';\nimport styled from 'styled-components';\n\nexport const TestLink = styled(Link)`color: red;`;\n",
+            )
+            .file(
+                "apps/react/src/Uses.tsx",
+                "import { TestLink } from './__tests__/links.test';\n\nexport function UsesTestLink() {\n  return <TestLink to=\"/team\">Team</TestLink>;\n}\n",
+            )
+            .file(
+                "apps/tanstack/package.json",
+                "{\"name\":\"tanstack-app\",\"private\":true,\"dependencies\":{\"@tanstack/react-router\":\"1.15.0\",\"react\":\"18.2.0\"}}\n",
+            )
+            .file(
+                "apps/tanstack/src/routes/posts.tsx",
+                "import { createFileRoute } from '@tanstack/react-router';\n\nexport const Route = createFileRoute('/posts')({\n  component: Posts,\n});\n\nfunction Posts() {\n  return null;\n}\n",
+            )
+            .file(
+                "apps/tanstack/src/routes/index.tsx",
+                "import { createFileRoute, Link } from '@tanstack/react-router';\n\nexport const Route = createFileRoute('/')({\n  component: TanstackIndex,\n});\n\nfunction TanstackIndex() {\n  return <Link to=\"/posts\">Posts</Link>;\n}\n",
+            )
+            .file(
+                "apps/tanstack/src/__tests__/index.test.tsx",
+                "import { Link } from '@tanstack/react-router';\n\nexport function TanstackIndexTest() {\n  return <Link to=\"/posts\">Posts</Link>;\n}\n",
+            )
+            .file(
+                "apps/vue/package.json",
+                "{\"name\":\"vue-app\",\"private\":true,\"dependencies\":{\"vue\":\"3.4.0\",\"vue-router\":\"4.2.0\"}}\n",
+            )
+            .file(
+                "apps/vue/src/router/index.ts",
+                "import { createRouter, createWebHistory } from 'vue-router';\nimport Home from '../views/Home.vue';\n\nexport default createRouter({\n  history: createWebHistory(),\n  routes: [\n    { path: '/', component: Home },\n    { path: '/about', component: () => import('../views/About.vue') },\n  ],\n});\n",
+            )
+            .file("apps/vue/src/views/Home.vue", vue_home)
+            .file(
+                "apps/vue/src/views/About.vue",
+                "<template><div>About</div></template>\n",
+            )
+            .file("apps/vue/src/views/__tests__/HomeTest.vue", vue_home)
+            .file(
+                "apps/sveltekit/package.json",
+                "{\"name\":\"sveltekit-app\",\"private\":true,\"devDependencies\":{\"@sveltejs/kit\":\"2.5.0\",\"svelte\":\"4.2.0\"}}\n",
+            )
+            .file(
+                "apps/sveltekit/src/routes/+page.svelte",
+                "<a href=\"/about\">About</a>\n",
+            )
+            .file(
+                "apps/sveltekit/src/routes/about/+page.svelte",
+                "<h1>About</h1>\n",
+            )
+            .file(
+                "apps/sveltekit/src/lib/__tests__/Nav.svelte",
+                "<a href=\"/about\">About</a>\n",
+            )
+            .index();
+        let graph = project.graph();
+        let mut links: Vec<(String, String)> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.kind == "navigates")
+            .filter_map(|edge| {
+                let by = edge.metadata["synthesizedBy"].as_str()?;
+                let at = edge.metadata["registeredAt"].as_str()?;
+                by.ends_with("-link").then(|| {
+                    (
+                        by.to_string(),
+                        at.rsplit_once(':').map_or(at, |(file, _)| file).to_string(),
+                    )
+                })
+            })
+            .collect();
+        links.sort();
+        let expected: Vec<(String, String)> = [
+            ("next-link", "apps/next/components/Nav.tsx"),
+            ("react-router-link", "apps/react/src/main.tsx"),
+            ("sveltekit-link", "apps/sveltekit/src/routes/+page.svelte"),
+            ("tanstack-link", "apps/tanstack/src/routes/index.tsx"),
+            ("vue-router-link", "apps/vue/src/views/Home.vue"),
+        ]
+        .iter()
+        .map(|(by, file)| (by.to_string(), file.to_string()))
+        .collect();
+        assert_eq!(links, expected, "{}", graph.report());
+    }
+
+    /// The forty registrations a channel links are its first forty incoming
+    /// calls in upstream's order, by caller id, line and column: with one
+    /// registration in each of forty-one callers, the callback of the caller
+    /// whose id sorts last stays unlinked.
+    #[test]
+    fn w714_field_observer_caps_by_caller_id() {
+        let mut app = String::from(
+            "import { Scene } from './scene';\nexport class App {\n  scene = new Scene();\n",
+        );
+        for at in 1..=41 {
+            app.push_str(&format!(
+                "  wire{at}() {{\n    this.scene.onUpdate(this.cb{at});\n  }}\n"
+            ));
+        }
+        for at in 1..=41 {
+            app.push_str(&format!("  cb{at}() {{\n    return {at};\n  }}\n"));
+        }
+        app.push_str("}\n");
+        let project = Project::new()
+            .file("src/scene.ts", SCENE)
+            .file("src/app.ts", &app)
+            .index();
+        let graph = graph_of(&project);
+        let caller = |at: usize| {
+            graph.nodes_named("method", &format!("wire{at}"))[0]
+                .id
+                .clone()
+        };
+        let last = (1..=41).max_by_key(|&at| caller(at)).unwrap();
+        assert_ne!(last, 41, "the id order must differ from the line order");
+        for at in 1..=41 {
+            let linked = !synthesized(
+                graph,
+                "method Scene::triggerUpdate",
+                &format!("method App::cb{at}"),
+            )
+            .is_empty();
+            assert_eq!(linked, at != last, "cb{at}:\n{}", graph.report());
+        }
+    }
+
+    /// A channel pairs a registrar and a dispatcher of one file: a loop over
+    /// a same-named field in another file is no dispatcher of it.
+    #[test]
+    fn w714_field_observer_pairs_within_one_file() {
+        let project = Project::new()
+            .file(
+                "src/scene.ts",
+                "type Callback = () => void;\nexport class Scene {\n  private callbacks = new Set<Callback>();\n  onUpdate(cb: Callback) {\n    this.callbacks.add(cb);\n  }\n}\n",
+            )
+            .file(
+                "src/loop.ts",
+                "export class Loop {\n  private callbacks = new Set<() => void>();\n  triggerUpdate() {\n    for (const cb of this.callbacks) cb();\n  }\n}\n",
+            )
+            .file(
+                "src/app.ts",
+                "import { Scene } from './scene';\nexport class App {\n  scene = new Scene();\n  constructor() {\n    this.scene.onUpdate(this.triggerRender);\n  }\n  triggerRender() {\n    return 1;\n  }\n}\n",
+            )
+            .index();
+        assert_not_synthesized(
+            graph_of(&project),
+            "method Loop::triggerUpdate",
+            "method App::triggerRender",
+        );
+    }
+
+    /// The callback is the value resolution bound at the registration: a
+    /// bare name from another file links through its import, and without
+    /// one nothing is bound and nothing links.
+    #[test]
+    fn w714_field_observer_needs_a_bound_value() {
+        let wiring = |app: &str| {
+            Project::new()
+                .file("src/scene.ts", SCENE)
+                .file(
+                    "src/render.ts",
+                    "export function render() {\n  return 1;\n}\n",
+                )
+                .file("src/app.ts", app)
+                .index()
+        };
+        let imported = wiring(
+            "import { Scene } from './scene';\nimport { render } from './render';\nexport function wire(scene: Scene) {\n  scene.onUpdate(render);\n}\n",
+        );
+        assert_synthesized(
+            graph_of(&imported),
+            "method Scene::triggerUpdate",
+            "function render",
+            "callback",
+            &[("registeredAt", "src/app.ts:4")],
+        );
+        let unbound = wiring(
+            "import { Scene } from './scene';\nexport function wire(scene: Scene) {\n  scene.onUpdate(render);\n}\n",
+        );
+        assert_not_synthesized(
+            graph_of(&unbound),
+            "method Scene::triggerUpdate",
+            "function render",
+        );
+    }
+
+    /// A channel links its first forty registrations, by file, line and
+    /// column (upstream `MAX_CALLBACKS_PER_CHANNEL`): the forty-first
+    /// callback stays unlinked.
+    #[test]
+    fn w714_field_observer_caps_a_channel_at_forty_callbacks() {
+        let mut app = String::from(
+            "import { Scene } from './scene';\nexport class App {\n  scene = new Scene();\n  constructor() {\n",
+        );
+        for at in 1..=41 {
+            app.push_str(&format!("    this.scene.onUpdate(this.cb{at});\n"));
+        }
+        app.push_str("  }\n");
+        for at in 1..=41 {
+            app.push_str(&format!("  cb{at}() {{\n    return {at};\n  }}\n"));
+        }
+        app.push_str("}\n");
+        let project = Project::new()
+            .file("src/scene.ts", SCENE)
+            .file("src/app.ts", &app)
+            .index();
+        let graph = graph_of(&project);
+        let linked: Vec<&EdgeRow> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.metadata["synthesizedBy"] == "callback")
+            .collect();
+        assert_eq!(linked.len(), 40, "{}", graph.report());
+        assert_synthesized(
+            graph,
+            "method Scene::triggerUpdate",
+            "method App::cb40",
+            "callback",
+            &[("registeredAt", "src/app.ts:44")],
+        );
+        assert_not_synthesized(graph, "method Scene::triggerUpdate", "method App::cb41");
+    }
+
+    /// Upstream's closure collection (Alamofire's `Request`,
+    /// `closure-collection-synthesizer.test.ts`): the base class's
+    /// dispatchers invoke each element of a property a subclass in another
+    /// file appends to, through `validators.write { $0.append(…) }` or a
+    /// direct `handlers.append(…)`; `names.forEach { print($0) }` invokes
+    /// no element, so `names` pairs nothing.
+    #[test]
+    fn w714_closure_collection_pairs_by_field_across_files() {
+        let project = Project::new()
+            .file(
+                "Request.swift",
+                "class Request {\n    var validators: [() -> Void] = []\n    var handlers: [() -> Void] = []\n    var names: [String] = []\n\n    func didCompleteTask() {\n        let validators = validators\n        validators.forEach { $0() }\n    }\n\n    func runHandlers() {\n        handlers.forEach { $0() }\n    }\n\n    func printNames() {\n        names.forEach { print($0) }\n    }\n}\n",
+            )
+            .file(
+                "DataRequest.swift",
+                "class DataRequest: Request {\n    func validate(_ validation: @escaping () -> Void) -> Self {\n        let validator: () -> Void = { validation() }\n        validators.write { $0.append(validator) }\n        return self\n    }\n\n    func onEvent(_ handler: @escaping () -> Void) {\n        handlers.append(handler)\n    }\n\n    func addName(_ n: String) {\n        names.append(n)\n    }\n}\n",
+            )
+            .index();
+        let graph = graph_of(&project);
+        assert_synthesized(
+            graph,
+            "method Request::didCompleteTask",
+            "method DataRequest::validate",
+            "closure-collection",
+            &[
+                ("field", "validators"),
+                ("registeredAt", "DataRequest.swift:4"),
+            ],
+        );
+        assert_synthesized(
+            graph,
+            "method Request::runHandlers",
+            "method DataRequest::onEvent",
+            "closure-collection",
+            &[
+                ("field", "handlers"),
+                ("registeredAt", "DataRequest.swift:9"),
+            ],
+        );
+        assert!(
+            graph
+                .edges
+                .iter()
+                .filter(|edge| edge.metadata.get("synthesizedBy").is_some())
+                .all(|edge| edge.metadata["field"] != "names"
+                    && graph
+                        .node(&edge.target)
+                        .is_none_or(|target| target.name != "addName")),
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream #1235: element invocation is Swift and Kotlin trailing-closure
+    /// syntax, so JavaScript with every textual trigger pairs nothing.
+    #[test]
+    fn pr1235_closure_collection_skips_other_languages() {
+        let project = Project::new()
+            .file(
+                "queue.js",
+                "class Queue {\n  constructor() { this.tasks = []; }\n  register(fn) { this.tasks.push(fn); }\n  drain() { this.tasks.forEach(function (t) { t(); }); }\n  weird() { const s = \"tasks.forEach { $0( } tasks.push(\"; return s; }\n}\nmodule.exports = Queue;\n",
+            )
+            .index();
+        let graph = graph_of(&project);
+        assert!(
+            graph
+                .edges
+                .iter()
+                .all(|edge| edge.metadata["synthesizedBy"] != "closure-collection"),
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// A field name more than eight registrars append to is too generic to
+    /// pair; eight still pair.
+    #[test]
+    fn w714_closure_collection_skips_a_generic_field() {
+        let hub = "class Hub {\n    var items: [() -> Void] = []\n    func run() {\n        items.forEach { $0() }\n    }\n}\n";
+        let adders = |count: usize| {
+            let mut project = Project::new().file("Sources/Hub.swift", hub);
+            for at in 0..count {
+                project = project.file(
+                    &format!("Sources/A{at}.swift"),
+                    &format!(
+                        "class A{at}: Hub {{\n    func add{at}(_ item: @escaping () -> Void) {{\n        items.append(item)\n    }}\n}}\n"
+                    ),
+                );
+            }
+            project.index()
+        };
+        let eight = adders(8);
+        let paired: Vec<_> = graph_of(&eight)
+            .edges
+            .iter()
+            .filter(|edge| edge.metadata["synthesizedBy"] == "closure-collection")
+            .collect();
+        assert_eq!(paired.len(), 8, "{}", graph_of(&eight).report());
+        let nine = adders(9);
+        assert!(
+            graph_of(&nine)
+                .edges
+                .iter()
+                .all(|edge| edge.metadata.get("synthesizedBy").is_none()),
+            "{}",
+            graph_of(&nine).report()
+        );
+    }
+
+    /// `$0.append(…)` and `$0.forEach { $0() }` name no property: the `0`
+    /// the receiver patterns capture is no field, so the write's own
+    /// receiver is the only one `feed` appends to and nothing pairs.
+    #[test]
+    fn w714_closure_collection_skips_a_positional_field() {
+        let project = Project::new()
+            .file(
+                "Sources/Pool.swift",
+                "class Pool {\n    var queues: [[() -> Void]] = []\n    func drainAll() {\n        queues.write { $0.forEach { $0() } }\n    }\n}\n",
+            )
+            .file(
+                "Sources/Feeder.swift",
+                "class Feeder {\n    func feed(_ job: @escaping () -> Void) {\n        jobs.write { $0.append(job) }\n    }\n}\n",
+            )
+            .index();
+        let graph = graph_of(&project);
+        assert!(
+            graph
+                .edges
+                .iter()
+                .all(|edge| edge.metadata.get("synthesizedBy").is_none()),
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream's emitter shapes: express's `use` emits `mount`, which
+    /// `init` handles with a named inline function; a bus's methods emit
+    /// what its `wire` registers.
+    #[test]
+    fn w714_emitter_reaches_the_handler_of_the_event() {
+        let project = Project::new()
+            .file(
+                "application.js",
+                "var app = exports = module.exports = {};\n\napp.use = function use(fn) {\n  fn.emit('mount', this);\n  return this;\n};\n\napp.init = function init() {\n  this.on('mount', function onmount(parent) {\n    this.parent = parent;\n  });\n};\n",
+            )
+            .file(
+                "bus.js",
+                "class Bus {\n  tick() { this.emit('refresh'); }\n  persist() { this.emit('save'); }\n  handleRefresh() { return 1; }\n  handleSave() { return 2; }\n  wire() {\n    this.on('refresh', this.handleRefresh);\n    this.on('save', this.handleSave);\n  }\n}\nmodule.exports = Bus;\n",
+            )
+            .index();
+        let graph = graph_of(&project);
+        let edge = assert_synthesized(
+            graph,
+            "function use",
+            "function init::onmount",
+            "event-emitter",
+            &[("event", "mount"), ("registeredAt", "application.js:9")],
+        );
+        assert_eq!((edge.line, edge.col), (None, None), "{edge:?}");
+        assert_synthesized(
+            graph,
+            "method Bus::tick",
+            "method Bus::handleRefresh",
+            "event-emitter",
+            &[("event", "refresh"), ("registeredAt", "bus.js:7")],
+        );
+        assert_synthesized(
+            graph,
+            "method Bus::persist",
+            "method Bus::handleSave",
+            "event-emitter",
+            &[("event", "save"), ("registeredAt", "bus.js:8")],
+        );
+        assert_not_synthesized(graph, "method Bus::tick", "method Bus::handleSave");
+    }
+
+    /// KEEP-RUST: a handler name means the one function of that name in the
+    /// registering file, else the one in the project; two of them, in
+    /// neither, mean nothing (upstream takes the one of the first file by
+    /// path).
+    #[test]
+    fn w714_emitter_handler_name_must_be_unique() {
+        let project = Project::new()
+            .file(
+                "src/app.js",
+                "export function save(bus) {\n  bus.emit('save');\n}\nexport function wire(bus) {\n  bus.on('save', handleSave);\n  bus.on('load', handleLoad);\n}\nexport function load(bus) {\n  bus.emit('load');\n}\n",
+            )
+            .file("src/a.js", "export function handleSave() {\n  return 1;\n}\nexport function handleLoad() {\n  return 3;\n}\n")
+            .file("src/b.js", "export function handleSave() {\n  return 2;\n}\n")
+            .index();
+        let graph = graph_of(&project);
+        assert_not_synthesized(graph, "function save", "function handleSave");
+        assert_synthesized(
+            graph,
+            "function load",
+            "function handleLoad",
+            "event-emitter",
+            &[("event", "load"), ("registeredAt", "src/app.js:6")],
+        );
+    }
+
+    /// An event with more than six handlers is too generic to pair; six
+    /// still pair.
+    #[test]
+    fn w714_emitter_skips_a_generic_event() {
+        let handlers = |count: usize| {
+            let mut app = String::from(
+                "export function fire(bus) {\n  bus.emit('change');\n}\nexport function wire(bus) {\n",
+            );
+            for at in 1..=count {
+                app.push_str(&format!("  bus.on('change', h{at});\n"));
+            }
+            app.push_str("}\n");
+            for at in 1..=count {
+                app.push_str(&format!("function h{at}() {{}}\n"));
+            }
+            Project::new().file("src/app.js", &app).index()
+        };
+        let six = handlers(6);
+        let paired: Vec<_> = graph_of(&six)
+            .edges
+            .iter()
+            .filter(|edge| edge.metadata["synthesizedBy"] == "event-emitter")
+            .collect();
+        assert_eq!(paired.len(), 6, "{}", graph_of(&six).report());
+        let seven = handlers(7);
+        assert!(
+            graph_of(&seven)
+                .edges
+                .iter()
+                .all(|edge| edge.metadata.get("synthesizedBy").is_none()),
+            "{}",
+            graph_of(&seven).report()
+        );
+    }
+
+    /// The passes merge in upstream's registry order: when the field and the
+    /// emitter pass both pair a dispatcher with a callback, the field edge
+    /// is the one kept.
+    #[test]
+    fn w714_the_earlier_pass_keeps_a_pair() {
+        let project = Project::new()
+            .file(
+                "src/scene.ts",
+                "type Callback = () => void;\nexport class Scene {\n  private callbacks = new Set<Callback>();\n  onUpdate(cb: Callback) {\n    this.callbacks.add(cb);\n  }\n  triggerUpdate() {\n    for (const cb of this.callbacks) cb();\n    this.emit('update');\n  }\n  emit(event: string) {\n    return event;\n  }\n}\n",
+            )
+            .file(
+                "src/app.ts",
+                "import { Scene } from './scene';\nexport class App {\n  scene = new Scene();\n  constructor() {\n    this.scene.onUpdate(this.triggerRender);\n    this.scene.on('update', this.triggerRender);\n  }\n  triggerRender() {\n    return 1;\n  }\n}\n",
+            )
+            .index();
+        let graph = graph_of(&project);
+        assert_synthesized(
+            graph,
+            "method Scene::triggerUpdate",
+            "method App::triggerRender",
+            "callback",
+            &[("via", "onUpdate")],
+        );
+    }
+
+    /// Upstream's react-render pass: in a class with a `render` method, each
+    /// sibling method calling `this.setState(…)` reaches `render`; one that
+    /// sets no state does not.
+    #[test]
+    fn w714b_a_react_state_update_reaches_render() {
+        let project = Project::new()
+            .file(
+                "src/counter.ts",
+                "export class Counter extends Component {\n  increment() {\n    this.setState({ count: 1 });\n  }\n  reset() {\n    return 0;\n  }\n  render() {\n    return null;\n  }\n  apply() {\n    setState({});\n  }\n}\n",
+            )
+            .index();
+        let graph = graph_of(&project);
+        let edge = assert_synthesized(
+            graph,
+            "method Counter::increment",
+            "method Counter::render",
+            "react-render",
+            &[("via", "setState"), ("registeredAt", "src/counter.ts:8")],
+        );
+        assert_eq!((edge.line, edge.col), (Some(2), None), "{edge:?}");
+        assert_not_synthesized(graph, "method Counter::reset", "method Counter::render");
+        assert_not_synthesized(graph, "method Counter::apply", "method Counter::render");
+
+        // A `render` that sets state is no edge to itself.
+        let project = Project::new()
+            .file(
+                "src/looping.ts",
+                "export class Looping extends Component {\n  render() {\n    this.setState({});\n    return null;\n  }\n}\n",
+            )
+            .index();
+        let graph = graph_of(&project);
+        assert_not_synthesized(graph, "method Looping::render", "method Looping::render");
+
+        // Upstream walks classes only: an interface's default methods are
+        // no component's, whatever they call.
+        let project = Project::new()
+            .file(
+                "src/app/Renderable.java",
+                "package app;\npublic interface Renderable {\n    default void render() {}\n    default void update() { this.setState(null); }\n}\n",
+            )
+            .index();
+        let graph = graph_of(&project);
+        for method in [
+            "method app::Renderable::render",
+            "method app::Renderable::update",
+        ] {
+            assert_eq!(graph.nodes_matching(method).len(), 1, "{}", graph.report());
+        }
+        assert_not_synthesized(
+            graph,
+            "method app::Renderable::update",
+            "method app::Renderable::render",
+        );
+    }
+
+    /// Upstream's flutter-build pass: in a Dart class, each sibling method
+    /// calling `setState(…)` reaches `build`; a `build` outside a `.dart`
+    /// file is no Flutter widget's, so nothing reaches it.
+    #[test]
+    fn w714b_a_flutter_state_update_reaches_build() {
+        let project = Project::new()
+            .file(
+                "lib/counter.dart",
+                "class CounterState extends State<Counter> {\n  int count = 0;\n  void increment() {\n    setState(() {\n      count++;\n    });\n  }\n  void log() {\n    print(count);\n  }\n  Widget build(BuildContext context) {\n    return Text('$count');\n  }\n}\n",
+            )
+            .file(
+                "src/builder.js",
+                "export class Builder {\n  step() {\n    setState(1);\n  }\n  build() {\n    return 1;\n  }\n}\n",
+            )
+            .index();
+        let graph = graph_of(&project);
+        assert_synthesized(
+            graph,
+            "method CounterState::increment",
+            "method CounterState::build",
+            "flutter-build",
+            &[("via", "setState"), ("registeredAt", "lib/counter.dart:11")],
+        );
+        assert_not_synthesized(
+            graph,
+            "method CounterState::log",
+            "method CounterState::build",
+        );
+        assert_not_synthesized(graph, "method Builder::step", "method Builder::build");
+    }
+
+    /// Upstream's kotlin-expect-actual pass: the `expect` declaration links
+    /// to each platform's `actual`, a class to an `actual typealias`; two
+    /// plain namesakes, neither `actual`, pair nothing.
+    #[test]
+    fn w714b_an_expect_declaration_reaches_each_actual() {
+        let project = Project::new()
+            .file(
+                "src/commonMain/kotlin/Platform.kt",
+                "package app\n\nexpect fun platformName(): String\n\nexpect class Clock {\n    fun now(): Long\n}\n\nfun helper(): Int = 1\n",
+            )
+            .file(
+                "src/jvmMain/kotlin/Platform.jvm.kt",
+                "package app\n\nactual fun platformName(): String = \"JVM\"\n\nactual typealias Clock = java.time.Clock\n\nfun helper(): Int = 2\n",
+            )
+            .file(
+                "src/iosMain/kotlin/Platform.ios.kt",
+                "package app\n\nactual fun platformName(): String = \"iOS\"\n",
+            )
+            .index();
+        let graph = graph_of(&project);
+        for (actual, line) in [
+            ("src/jvmMain/kotlin/Platform.jvm.kt", 3),
+            ("src/iosMain/kotlin/Platform.ios.kt", 3),
+        ] {
+            assert_synthesized(
+                graph,
+                "function app::platformName @src/commonMain/kotlin/Platform.kt",
+                &format!("function app::platformName @{actual}"),
+                "kotlin-expect-actual",
+                &[
+                    ("via", "platformName"),
+                    ("registeredAt", &format!("{actual}:{line}")),
+                ],
+            );
+        }
+        assert_synthesized(
+            graph,
+            "class app::Clock @src/commonMain/kotlin/Platform.kt",
+            "type_alias app::Clock @src/jvmMain/kotlin/Platform.jvm.kt",
+            "kotlin-expect-actual",
+            &[("via", "Clock")],
+        );
+        assert!(
+            graph
+                .edges
+                .iter()
+                .filter(|edge| edge.metadata.get("synthesizedBy").is_some())
+                .all(|edge| graph
+                    .node(&edge.target)
+                    .is_none_or(|target| target.name != "helper")),
+            "{}",
+            graph.report()
+        );
+        // One platform's `actual` is no declaration of another's.
+        for (from, to) in [(
+            "jvmMain/kotlin/Platform.jvm.kt",
+            "iosMain/kotlin/Platform.ios.kt",
+        )] {
+            for (a, b) in [(from, to), (to, from)] {
+                assert_not_synthesized(
+                    graph,
+                    &format!("function app::platformName @src/{a}"),
+                    &format!("function app::platformName @src/{b}"),
+                );
+            }
+        }
+
+        // An overload beside the `actual` is in its file, a class is no
+        // function's declaration, and a Java class is no Kotlin `actual`'s.
+        let project = Project::new()
+            .file(
+                "src/main/java/com/example/Foo.java",
+                "package com.example;\n\npublic class Foo {}\n",
+            )
+            .file(
+                "src/jvmMain/kotlin/com/example/Foo.kt",
+                "package com.example\n\nactual class Foo\n",
+            )
+            .file(
+                "src/commonMain/kotlin/Platform.kt",
+                "package app\n\nexpect fun platformName(): String\n\nclass Logger\n",
+            )
+            .file(
+                "src/jvmMain/kotlin/Platform.jvm.kt",
+                "package app\n\nactual fun platformName(): String = \"JVM\"\n\nfun platformName(prefix: String): String = prefix\n\nactual fun Logger(): Int = 1\n",
+            )
+            .index();
+        let graph = graph_of(&project);
+        let pairs: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.metadata["synthesizedBy"] == "kotlin-expect-actual")
+            .map(|edge| graph.describe_edge(edge))
+            .collect();
+        assert_eq!(pairs.len(), 1, "{pairs:#?}");
+        assert_synthesized(
+            graph,
+            "function app::platformName @src/commonMain/kotlin/Platform.kt",
+            "function app::platformName @src/jvmMain/kotlin/Platform.jvm.kt:3",
+            "kotlin-expect-actual",
+            &[],
+        );
+    }
+
+    /// Each re-render target, `actual` and override links at most forty
+    /// sources or targets (upstream `MAX_CALLBACKS_PER_CHANNEL`), in
+    /// upstream's order: a class's methods by their `contains` edges, an
+    /// `actual`'s declarations by file, line and id.
+    #[test]
+    fn w714b_each_structural_pass_links_at_most_forty() {
+        let mut counter = String::from("export class Counter extends Component {\n");
+        for at in 1..=41 {
+            counter.push_str(&format!(
+                "  set{at}() {{\n    this.setState({{ n: {at} }});\n  }}\n"
+            ));
+        }
+        counter.push_str("  render() {\n    return null;\n  }\n}\n");
+        let mut base = String::from("class Base {\n public:\n");
+        let mut derived =
+            String::from("#include \"base.h\"\nclass Derived : public Base {\n public:\n");
+        for at in 1..=41 {
+            base.push_str(&format!("  virtual void step{at}() {{}}\n"));
+            derived.push_str(&format!("  void step{at}() override {{}}\n"));
+        }
+        base.push_str("};\n");
+        derived.push_str("};\n");
+        let mut project = Project::new()
+            .file("src/counter.ts", &counter)
+            .file("src/base.h", &base)
+            .file("src/derived.h", &derived)
+            .file(
+                "src/jvmMain/kotlin/Name.jvm.kt",
+                "package app\n\nactual fun name(): String = \"JVM\"\n",
+            );
+        for at in 1..=41 {
+            project = project.file(
+                &format!("src/commonMain/kotlin/Name{at:02}.kt"),
+                "package app\n\nexpect fun name(): String\n",
+            );
+        }
+        let project = project.index();
+        let graph = graph_of(&project);
+        let count = |by: &str| {
+            graph
+                .edges
+                .iter()
+                .filter(|edge| edge.metadata["synthesizedBy"] == by)
+                .count()
+        };
+        assert_eq!(
+            [
+                count("react-render"),
+                count("cpp-override"),
+                count("kotlin-expect-actual")
+            ],
+            [40, 40, 40],
+            "{}",
+            graph.report()
+        );
+        // The forty-first declaration by file is the one left out.
+        assert_not_synthesized(
+            graph,
+            "function app::name @src/commonMain/kotlin/Name41.kt",
+            "function app::name @src/jvmMain/kotlin/Name.jvm.kt",
+        );
+    }
+
+    /// Upstream's override table is a `Map` by name: of a base's overloads
+    /// of one name, the last in its `contains` order (by target id) is the
+    /// one an override links from.
+    #[test]
+    fn w714b_an_override_links_from_the_last_overload_of_its_name() {
+        let project = Project::new()
+            .file(
+                "src/iterator.h",
+                "class Iterator {\n public:\n  virtual void Seek(int key) {}\n  virtual void Seek(const char* key) {}\n};\n",
+            )
+            .file(
+                "src/db_iter.h",
+                "#include \"iterator.h\"\nclass DBIter : public Iterator {\n public:\n  void Seek(int key) override {}\n};\n",
+            )
+            .index();
+        let graph = graph_of(&project);
+        let overloads = graph.nodes_matching("method Iterator::Seek");
+        assert_eq!(overloads.len(), 2, "{}", graph.report());
+        let last = overloads.iter().max_by_key(|node| &node.id).unwrap();
+        let edges: Vec<&EdgeRow> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.metadata["synthesizedBy"] == "cpp-override")
+            .collect();
+        assert_eq!(edges.len(), 1, "{}", graph.report());
+        assert_eq!(edges[0].source, last.id, "{}", graph.report());
+    }
+
+    /// Upstream's override pass walks classes only: a C++ `struct` that
+    /// derives from a base keeps its overrides unlinked, while a class
+    /// beside it is linked.
+    #[test]
+    fn w714b_a_struct_override_stays_unlinked() {
+        let project = Project::new()
+            .file(
+                "src/store.cpp",
+                "class Base {\npublic:\n    virtual int read(int key) = 0;\n};\nstruct Derived : public Base {\n    int read(int key) override { return key; }\n};\nclass Other : public Base {\npublic:\n    int read(int key) override { return key + 1; }\n};\n",
+            )
+            .index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            graph.nodes_matching("method Derived::read").len(),
+            1,
+            "{}",
+            graph.report()
+        );
+        assert_synthesized(
+            graph,
+            "method Base::read",
+            "method Other::read",
+            "cpp-override",
+            &[("via", "read"), ("registeredAt", "src/store.cpp:10")],
+        );
+        assert_not_synthesized(graph, "method Base::read", "method Derived::read");
+    }
+
+    /// Upstream's pascal-form pass: a Delphi unit references the form of its
+    /// name beside it; a form with no unit references nothing.
+    #[test]
+    fn w714b_a_delphi_unit_references_its_form() {
+        let project = Project::new()
+            .file(
+                "src/UFRMAbout.pas",
+                "unit UFRMAbout;\n\ninterface\n\nimplementation\n\n{$R *.dfm}\n\nend.\n",
+            )
+            .file(
+                "src/UFRMAbout.dfm",
+                "object FRMAbout: TFRMAbout\n  Caption = 'About'\nend\n",
+            )
+            .file(
+                "src/Orphan.dfm",
+                "object FRMOrphan: TFRMOrphan\n  Caption = 'Orphan'\nend\n",
+            )
+            .index();
+        let graph = graph_of(&project);
+        let edges: Vec<&EdgeRow> = graph
+            .edges_matching(
+                "file:src/UFRMAbout.pas",
+                "references",
+                "file:src/UFRMAbout.dfm",
+            )
+            .into_iter()
+            .filter(|edge| edge.metadata.get("synthesizedBy").is_some())
+            .collect();
+        assert_eq!(edges.len(), 1, "{}", graph.report());
+        assert_eq!(edges[0].metadata["synthesizedBy"], "pascal-form");
+        assert_eq!(edges[0].metadata["registeredAt"], "src/UFRMAbout.pas");
+        assert_eq!(
+            graph
+                .edges
+                .iter()
+                .filter(|edge| edge.metadata["synthesizedBy"] == "pascal-form")
+                .count(),
+            1,
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream's mybatis-java-xml pass: a mapper interface's method
+    /// reaches the statement of its namespace and id; with a second Java
+    /// class of the mapper's simple name, the pair is ambiguous and nothing
+    /// links.
+    #[test]
+    fn w714b_a_mapper_method_reaches_its_statement() {
+        const MAPPER: &str = "package com.example;\n\npublic interface UserMapper {\n    User findById(long id);\n}\n";
+        const XML: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE mapper PUBLIC \"-//mybatis.org//DTD Mapper 3.0//EN\" \"http://mybatis.org/dtd/mybatis-3-mapper.dtd\">\n<mapper namespace=\"com.example.UserMapper\">\n  <select id=\"findById\" resultType=\"User\">\n    SELECT * FROM users WHERE id = #{id}\n  </select>\n</mapper>\n";
+        let project = Project::new()
+            .file("src/main/java/com/example/UserMapper.java", MAPPER)
+            .file("src/main/resources/mapper/UserMapper.xml", XML)
+            .index();
+        let graph = graph_of(&project);
+        let linked: Vec<&EdgeRow> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.metadata["synthesizedBy"] == "mybatis-java-xml")
+            .collect();
+        assert_eq!(linked.len(), 1, "{}", graph.report());
+        let (source, target) = (
+            graph.node(&linked[0].source).unwrap(),
+            graph.node(&linked[0].target).unwrap(),
+        );
+        assert_eq!(
+            (
+                source.name.as_str(),
+                source.language.as_str(),
+                target.language.as_str()
+            ),
+            ("findById", "java", "xml"),
+            "{}",
+            graph.report()
+        );
+        assert_eq!(linked[0].metadata["via"], "UserMapper.findById");
+        assert_eq!(
+            linked[0].metadata["registeredAt"],
+            format!(
+                "src/main/resources/mapper/UserMapper.xml:{}",
+                target.start_line
+            )
+        );
+
+        let ambiguous = Project::new()
+            .file("src/main/java/com/example/UserMapper.java", MAPPER)
+            .file(
+                "src/main/java/com/other/UserMapper.java",
+                "package com.other;\n\npublic class UserMapper {\n    public User findById(long id) {\n        return null;\n    }\n}\n",
+            )
+            .file("src/main/resources/mapper/UserMapper.xml", XML)
+            .index();
+        assert!(
+            graph_of(&ambiguous)
+                .edges
+                .iter()
+                .all(|edge| edge.metadata["synthesizedBy"] != "mybatis-java-xml"),
+            "{}",
+            graph_of(&ambiguous).report()
+        );
+    }
+
+    /// The `interface-impl` edges of `graph` as `source -> target` qualified
+    /// names, sorted.
+    fn interface_links(graph: &Graph) -> Vec<String> {
+        let mut links: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.metadata["synthesizedBy"] == "interface-impl")
+            .map(|edge| {
+                format!(
+                    "{} -> {}",
+                    graph.node(&edge.source).unwrap().qualified_name,
+                    graph.node(&edge.target).unwrap().qualified_name
+                )
+            })
+            .collect();
+        links.sort();
+        links
+    }
+
+    /// Upstream's interface pass: each method of an interface links to
+    /// every method of its implementation with that name, overloads
+    /// included (a call may resolve to any of them), as a `calls` edge from
+    /// the base method's line.
+    #[test]
+    fn w714c_an_interface_method_reaches_each_overload_of_its_implementation() {
+        let project = Project::new()
+            .file(
+                "src/app/Repo.java",
+                "package app;\n\ninterface Repo {\n    void save();\n    void save(int id);\n}\n\nclass JpaRepo implements Repo {\n    public void save() {}\n    public void save(int id) {}\n}\n",
+            )
+            .index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            interface_links(graph),
+            vec!["app::Repo::save -> app::JpaRepo::save"; 4],
+            "{}",
+            graph.report()
+        );
+        for edge in graph
+            .edges
+            .iter()
+            .filter(|edge| edge.metadata["synthesizedBy"] == "interface-impl")
+        {
+            let (source, target) = (
+                graph.node(&edge.source).unwrap(),
+                graph.node(&edge.target).unwrap(),
+            );
+            assert_eq!(edge.kind, "calls", "{edge:?}");
+            assert_eq!(
+                (edge.line, edge.col),
+                (Some(source.start_line), None),
+                "{edge:?}"
+            );
+            assert_eq!(edge.provenance.as_deref(), Some("heuristic"), "{edge:?}");
+            assert_eq!(edge.metadata["via"], "save", "{edge:?}");
+            assert_eq!(
+                edge.metadata["registeredAt"],
+                format!("{}:{}", target.file_path, target.start_line),
+                "{edge:?}"
+            );
+        }
+    }
+
+    /// Every language the pass reads links through its supertype edges: a
+    /// TypeScript class to its interface and to its base class, a Kotlin
+    /// class to its interface and to its abstract class, a C# class, a
+    /// Scala trait, a Rust trait an `impl` block implements, and an ArkTS
+    /// base class.
+    #[test]
+    fn w714c_each_language_links_through_its_supertypes() {
+        let project = Project::new()
+            .file(
+                "src/shape.ts",
+                "export interface Shape {\n  area(): number;\n}\nexport class Circle implements Shape {\n  area() {\n    return 1;\n  }\n}\nexport class Base {\n  draw() {\n    return 0;\n  }\n}\nexport class Derived extends Base {\n  draw() {\n    return 1;\n  }\n}\n",
+            )
+            .file(
+                "src/clock.kt",
+                "package app\n\ninterface Clock {\n    fun now(): Long\n}\n\nclass SystemClock : Clock {\n    override fun now(): Long = 1L\n}\n\nabstract class Task {\n    abstract fun run()\n}\n\nclass Job : Task() {\n    override fun run() {}\n}\n",
+            )
+            .file(
+                "src/Repo.cs",
+                "interface IRepo\n{\n    void Save();\n}\n\nclass Repo : IRepo\n{\n    public void Save() {}\n}\n",
+            )
+            .file(
+                "src/Animal.scala",
+                "trait Animal {\n  def speak(): String\n}\n\nclass Dog extends Animal {\n  def speak(): String = \"woof\"\n}\n",
+            )
+            .file(
+                "src/store.rs",
+                "trait Store {\n    fn get(&self);\n}\n\nstruct Mem;\n\nimpl Store for Mem {\n    fn get(&self) {}\n}\n",
+            )
+            .file(
+                "src/panel.ets",
+                "class Panel {\n  area(): number {\n    return 0\n  }\n}\nclass Card extends Panel {\n  area(): number {\n    return 1\n  }\n}\n",
+            )
+            .index();
+        let graph = graph_of(&project);
+        let mut expected = vec![
+            "Shape::area -> Circle::area",
+            "Base::draw -> Derived::draw",
+            "app::Clock::now -> app::SystemClock::now",
+            "app::Task::run -> app::Job::run",
+            "IRepo::Save -> Repo::Save",
+            "Animal::speak -> Dog::speak",
+            "Store::get -> Mem::get",
+            "Panel::area -> Card::area",
+        ];
+        expected.sort_unstable();
+        assert_eq!(interface_links(graph), expected, "{}", graph.report());
+    }
+
+    /// A Swift protocol's requirements are not methods: its extensions, the
+    /// Swift classes of its name, hold the default implementations a
+    /// conformer overrides (upstream's Alamofire `EventMonitor`), in
+    /// whatever file they are.
+    #[test]
+    fn w714c_a_swift_protocol_extension_reaches_its_conformers() {
+        let project = Project::new()
+            .file(
+                "Sources/EventMonitor.swift",
+                "protocol EventMonitor {\n    func request()\n}\n",
+            )
+            .file(
+                "Sources/EventMonitor+Defaults.swift",
+                "extension EventMonitor {\n    func request() {}\n}\n",
+            )
+            .file(
+                "Sources/Logger.swift",
+                "final class Logger: EventMonitor {\n    func request() {}\n}\n",
+            )
+            .index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            interface_links(graph),
+            ["EventMonitor::request -> Logger::request"],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Go has no inheritance: a struct's embedded interface dispatches to
+    /// the struct's own method of its name, and an embedded struct is no
+    /// supertype to dispatch through. `File`, which only declares `Read`,
+    /// reaches it through the edge `go-implements` makes (W7-15b).
+    #[test]
+    fn w714c_a_go_embedded_interface_reaches_the_structs_own_method() {
+        let project = Project::new()
+            .file("go.mod", "module example.com/app\n\ngo 1.22\n")
+            .file(
+                "engine.go",
+                "package app\n\ntype Reader interface {\n\tRead() int\n}\n\ntype RouterGroup struct{}\n\nfunc (g *RouterGroup) Handle() {}\n\ntype Engine struct {\n\tRouterGroup\n\tReader\n}\n\nfunc (e *Engine) Handle() {}\n\nfunc (e *Engine) Read() int { return 1 }\n\ntype File struct{}\n\nfunc (f *File) Read() int { return 2 }\n",
+            )
+            .index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            graph
+                .edges_matching("struct Engine", "extends", "struct RouterGroup")
+                .len(),
+            1,
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            interface_links(graph),
+            ["Reader::Read -> Engine::Read", "Reader::Read -> File::Read"],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// The languages outside upstream's set link nothing through the pass:
+    /// a `.tsx` class implementing an interface, a Python subclass and a
+    /// C++ one (whose overrides are the C++ pass's); neither does a class
+    /// without methods.
+    #[test]
+    fn w714c_other_languages_and_empty_classes_link_nothing() {
+        let project = Project::new()
+            .file(
+                "src/shape.ts",
+                "export interface Shape {\n  area(): number;\n}\nexport class Empty implements Shape {}\n",
+            )
+            .file(
+                "src/square.tsx",
+                "import { Shape } from './shape';\nexport class Square implements Shape {\n  area() {\n    return 2;\n  }\n}\n",
+            )
+            .file(
+                "src/animals.py",
+                "class Animal:\n    def speak(self):\n        return ''\n\n\nclass Dog(Animal):\n    def speak(self):\n        return 'woof'\n",
+            )
+            .file(
+                "src/store.cpp",
+                "class Base {\npublic:\n    virtual int read(int key) = 0;\n};\nclass Disk : public Base {\npublic:\n    int read(int key) override { return key; }\n};\n",
+            )
+            .index();
+        let graph = graph_of(&project);
+        for (source, kind, target) in [
+            ("class Square", "implements", "interface Shape"),
+            ("class Empty", "implements", "interface Shape"),
+            ("class Dog", "extends", "class Animal"),
+            ("class Disk", "extends", "class Base"),
+        ] {
+            assert_eq!(
+                graph.edges_matching(source, kind, target).len(),
+                1,
+                "{source} {kind} {target}:\n{}",
+                graph.report()
+            );
+        }
+        assert_eq!(
+            interface_links(graph),
+            Vec::<String>::new(),
+            "{}",
+            graph.report()
+        );
+        assert_synthesized(
+            graph,
+            "method Base::read",
+            "method Disk::read",
+            "cpp-override",
+            &[],
+        );
+    }
+
+    /// Each supertype edge links at most forty methods (upstream
+    /// `MAX_CALLBACKS_PER_CHANNEL`), in the base's `contains` order (by
+    /// target id), and two interfaces with a method of one name each link
+    /// it.
+    #[test]
+    fn w714c_a_supertype_links_at_most_forty_and_each_interface_its_own() {
+        let mut wide = String::from("export interface Wide {\n");
+        let mut implementation = String::from("export class Impl implements Wide {\n");
+        for at in 1..=41 {
+            wide.push_str(&format!("  m{at}(): void;\n"));
+            implementation.push_str(&format!("  m{at}() {{}}\n"));
+        }
+        wide.push_str("}\n");
+        implementation.push_str("}\n");
+        let project = Project::new()
+            .file("src/wide.ts", &format!("{wide}{implementation}"))
+            .file(
+                "src/two.ts",
+                "export interface A {\n  run(): void;\n}\nexport interface B {\n  run(): void;\n}\nexport class C implements A, B {\n  run() {}\n}\n",
+            )
+            .index();
+        let graph = graph_of(&project);
+        let base_methods: Vec<&NodeRow> = graph
+            .nodes
+            .iter()
+            .filter(|node| node.kind == "method" && node.qualified_name.starts_with("Wide::"))
+            .collect();
+        assert_eq!(base_methods.len(), 41, "{}", graph.report());
+        let linked: Vec<&EdgeRow> = graph
+            .edges
+            .iter()
+            .filter(|edge| {
+                edge.metadata["synthesizedBy"] == "interface-impl"
+                    && base_methods.iter().any(|node| node.id == edge.source)
+            })
+            .collect();
+        assert_eq!(linked.len(), 40, "{}", graph.report());
+        let last = base_methods.iter().max_by_key(|node| &node.id).unwrap();
+        assert!(
+            linked.iter().all(|edge| edge.source != last.id),
+            "the base method with the largest id is the one left out:\n{}",
+            graph.report()
+        );
+        assert_eq!(
+            interface_links(graph)
+                .into_iter()
+                .filter(|link| link.ends_with("-> C::run"))
+                .collect::<Vec<_>>(),
+            ["A::run -> C::run", "B::run -> C::run"],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Every `object-registry` edge as `source -> target` qualified names,
+    /// sorted.
+    fn registry_links(graph: &Graph) -> Vec<String> {
+        let name = |id: &str| {
+            graph
+                .nodes
+                .iter()
+                .find(|node| node.id == id)
+                .map_or_else(|| id.to_string(), |node| node.qualified_name.clone())
+        };
+        let mut links: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.metadata["synthesizedBy"] == "object-registry")
+            .map(|edge| format!("{} -> {}", name(&edge.source), name(&edge.target)))
+            .collect();
+        links.sort();
+        links
+    }
+
+    const HANDLERS: &str = "export function saveDoc(x: string) { return x; }\nexport function loadDoc(x: string) { return x; }\n";
+
+    /// Upstream's `object-registry-synthesizer.test.ts`: a class field's
+    /// registry dispatched as `new this.commands[command]().execute()`
+    /// reaches each command's `execute`; a look-alike object only read as
+    /// `table.add` links nothing.
+    #[test]
+    fn w714d_a_command_registry_reaches_each_execute() {
+        let project = Project::new()
+            .file(
+                "src/commands.ts",
+                "export class AddCommand { execute() { return 'add'; } }\nexport class RemoveCommand { execute() { return 'remove'; } }\nexport class MoveCommand { execute() { return 'move'; } }\n",
+            )
+            .file(
+                "src/manager.ts",
+                "import { AddCommand, RemoveCommand, MoveCommand } from './commands';\nconst Cmd = { ADD: 'add', REMOVE: 'remove', MOVE: 'move' };\nclass CommandManager {\n  commands = {\n    [Cmd.ADD]: AddCommand,\n    [Cmd.REMOVE]: RemoveCommand,\n    [Cmd.MOVE]: MoveCommand,\n  };\n  executeCommand(command: string) {\n    return new this.commands[command]().execute();\n  }\n}\n",
+            )
+            .file(
+                "src/static.ts",
+                "import { AddCommand, RemoveCommand } from './commands';\nconst table = { add: AddCommand, remove: RemoveCommand };\nexport function direct() { return new table.add().execute(); }\n",
+            )
+            .index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            registry_links(graph),
+            [
+                "CommandManager::executeCommand -> AddCommand::execute",
+                "CommandManager::executeCommand -> MoveCommand::execute",
+                "CommandManager::executeCommand -> RemoveCommand::execute",
+            ],
+            "{}",
+            graph.report()
+        );
+        let edge = assert_synthesized(
+            graph,
+            "CommandManager::executeCommand",
+            "AddCommand::execute",
+            "object-registry",
+            &[("via", "AddCommand"), ("registeredAt", "src/manager.ts:4")],
+        );
+        assert_eq!(edge.line, Some(10), "{edge:?}");
+    }
+
+    /// A registry of functions: each one the dispatch can call, `via` its
+    /// name and `registeredAt` the registry's line.
+    #[test]
+    fn w714d_a_function_registry_links_each_function() {
+        let project = Project::new()
+            .file(
+                "src/route.ts",
+                &format!("{HANDLERS}const handlers = {{ save: saveDoc, load: loadDoc }};\nexport function route(action: string, x: string) {{\n  return handlers[action](x);\n}}\n"),
+            )
+            .index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            registry_links(graph),
+            ["route -> loadDoc", "route -> saveDoc"],
+            "{}",
+            graph.report()
+        );
+        let edge = assert_synthesized(
+            graph,
+            "route",
+            "saveDoc",
+            "object-registry",
+            &[("via", "saveDoc"), ("registeredAt", "src/route.ts:3")],
+        );
+        assert_eq!(edge.line, Some(5), "{edge:?}");
+    }
+
+    /// The entry method a dispatch chains wins over the class's first entry
+    /// method, and a constructor's `this.routes = {…}` registers too.
+    #[test]
+    fn w714d_the_chained_entry_wins_and_a_constructor_registers() {
+        let project = Project::new()
+            .file(
+                "src/chain.ts",
+                "export class Alpha { execute() {} run() {} }\nexport class Beta { execute() {} run() {} }\nconst reg = { a: Alpha, b: Beta };\nexport function go(k: string) {\n  reg[k].run();\n}\n",
+            )
+            .file(
+                "src/router.ts",
+                "export class Save { handle() {} }\nexport class Load { handle() {} }\nexport class Router {\n  constructor() {\n    this.routes = { save: Save, load: Load };\n  }\n  send(name: string) {\n    return new this.routes[name]().handle();\n  }\n}\n",
+            )
+            .index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            registry_links(graph),
+            [
+                "Router::send -> Load::handle",
+                "Router::send -> Save::handle",
+                "go -> Alpha::run",
+                "go -> Beta::run",
+            ],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// What registers or dispatches nothing: fewer than two names, a value
+    /// shorter than three characters, a quoted key, a registry or dispatch
+    /// in a comment, a dispatch outside any function.
+    #[test]
+    fn w714d_what_registers_or_dispatches_nothing() {
+        let project = Project::new()
+            .file(
+                "src/small.ts",
+                &format!("{HANDLERS}export function ab() {{}}\nconst one = {{ a: saveDoc }};\nconst tiny = {{ a: ab, b: loadDoc }};\nexport function useOne(k: string) {{ one[k](); }}\nexport function useTiny(k: string) {{ tiny[k](); }}\n"),
+            )
+            .file(
+                "src/quoted.ts",
+                &format!("{HANDLERS}const reg = {{ save: saveDoc, load: loadDoc }};\nexport function f() {{ reg['save'](); }}\nexport function pick(list: string[], i: number) {{ return list[i]; }}\n"),
+            )
+            .file(
+                "src/commented.ts",
+                &format!("{HANDLERS}// const ghost = {{ save: saveDoc, load: loadDoc }};\nconst real = {{ save: saveDoc, load: loadDoc }};\nexport function g(k: string) {{\n  /* ghost[k](); */\n  // real[k]();\n  return k;\n}}\n"),
+            )
+            .file(
+                "src/top.ts",
+                &format!("{HANDLERS}const reg = {{ save: saveDoc, load: loadDoc }};\nconst key = 'save';\nreg[key]('x');\n"),
+            )
+            .index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            registry_links(graph),
+            Vec::<String>::new(),
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// A dispatch site links at most forty handlers, the registry's first.
+    #[test]
+    fn w714d_a_dispatch_links_at_most_forty() {
+        let mut source = String::new();
+        let mut entries = Vec::new();
+        for at in 1..=41 {
+            source.push_str(&format!("export function h{at:02}() {{}}\n"));
+            entries.push(format!("k{at}: h{at:02}"));
+        }
+        source.push_str(&format!(
+            "const reg = {{ {} }};\nexport function go(k: string) {{\n  reg[k]();\n}}\n",
+            entries.join(", ")
+        ));
+        let project = Project::new().file("src/wide.ts", &source).index();
+        let graph = graph_of(&project);
+        let links = registry_links(graph);
+        assert_eq!(links.len(), 40, "{}", graph.report());
+        assert!(!links.contains(&"go -> h41".to_string()), "{links:?}");
+
+        let mut source = String::new();
+        let mut forty = Vec::new();
+        for at in 1..=41 {
+            source.push_str(&format!("export function h{at:02}() {{}}\n"));
+            forty.push(format!("k{at}: h{at:02}"));
+        }
+        let all = forty.join(", ");
+        forty.pop();
+        source.push_str(&format!(
+            "const first = {{ {} }};\nconst second = {{ {all} }};\nexport function go(k: string) {{\n  first[k]();\n  second[k]();\n}}\n",
+            forty.join(", ")
+        ));
+        let project = Project::new().file("src/twice.ts", &source).index();
+        let graph = graph_of(&project);
+        let links = registry_links(graph);
+        assert_eq!(links.len(), 41, "{}", graph.report());
+        assert!(links.contains(&"go -> h41".to_string()), "{links:?}");
+    }
+
+    /// KEEP-RUST: a handler name two files define links only when the
+    /// registry's own file defines it once; a name the project defines
+    /// once links wherever it is.
+    #[test]
+    fn w714d_an_ambiguous_handler_links_only_in_its_registrys_file() {
+        let registry = "const reg = { save: saveDoc, load: loadDoc };\nexport function go(k: string) {\n  reg[k]('x');\n}\n";
+        let project = Project::new()
+            .file(
+                "src/a.ts",
+                "export function saveDoc(x: string) { return x; }\n",
+            )
+            .file(
+                "src/b.ts",
+                "export function saveDoc(x: string) { return x; }\n",
+            )
+            .file(
+                "src/c.ts",
+                "export function loadDoc(x: string) { return x; }\n",
+            )
+            .file("src/reg.ts", registry)
+            .index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            registry_links(graph),
+            ["go -> loadDoc"],
+            "{}",
+            graph.report()
+        );
+
+        let project = Project::new()
+            .file(
+                "src/a.ts",
+                "export function saveDoc(x: string) { return x; }\n",
+            )
+            .file(
+                "src/c.ts",
+                "export function loadDoc(x: string) { return x; }\n",
+            )
+            .file(
+                "src/reg.ts",
+                &format!("export function saveDoc(x: string) {{ return x; }}\n{registry}"),
+            )
+            .index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            registry_links(graph),
+            ["go -> loadDoc", "go -> saveDoc"],
+            "{}",
+            graph.report()
+        );
+        assert_synthesized(graph, "go", "saveDoc @src/reg.ts", "object-registry", &[]);
+    }
+
+    /// `.mjs` and `.cjs` files are read; a `.vue` file is not.
+    #[test]
+    fn w714d_module_scripts_are_read_and_vue_files_are_not() {
+        let script = "export function saveDoc(x) { return x; }\nexport function loadDoc(x) { return x; }\nconst reg = { save: saveDoc, load: loadDoc };\nexport function go(k) {\n  return reg[k]('x');\n}\n";
+        let project = Project::new()
+            .file("src/a.mjs", script)
+            .file("src/b.cjs", script)
+            .file("src/c.vue", &format!("<script>\n{script}</script>\n"))
+            .index();
+        let graph = graph_of(&project);
+        let mut files: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.metadata["synthesizedBy"] == "object-registry")
+            .filter_map(|edge| graph.nodes.iter().find(|node| node.id == edge.source))
+            .map(|node| node.file_path.clone())
+            .collect();
+        files.sort();
+        assert_eq!(
+            files,
+            ["src/a.mjs", "src/a.mjs", "src/b.cjs", "src/b.cjs"],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// JavaScript's whitespace, not Unicode's: U+FEFF separates where a
+    /// space would, U+0085 does not.
+    #[test]
+    fn w714d_whitespace_is_javascripts() {
+        let open = "export function openDoc(x: string) { return x; }\n";
+        let project = Project::new()
+            .file(
+                "src/feff.ts",
+                &format!("{HANDLERS}const\u{FEFF}reg = {{ save:\u{FEFF}saveDoc, load\u{FEFF}: loadDoc }};\nexport function go(k: string) {{\n  return reg[\u{FEFF}k\u{FEFF}]('x');\n}}\n"),
+            )
+            .file(
+                "src/assign.ts",
+                &format!("{HANDLERS}const reg =\u{85}{{ save: saveDoc, load: loadDoc }};\nexport function viaAssign(k: string) {{\n  return reg[k]('x');\n}}\n"),
+            )
+            .file(
+                "src/dispatch.ts",
+                &format!("{HANDLERS}const reg = {{ save: saveDoc, load: loadDoc }};\nexport function viaDispatch(k: string) {{\n  return reg[\u{85}k]('x');\n}}\n"),
+            )
+            .file(
+                "src/entry.ts",
+                &format!("{HANDLERS}{open}const reg = {{ save:\u{85}saveDoc, load: loadDoc, open: openDoc }};\nexport function viaEntry(k: string) {{\n  return reg[k]('x');\n}}\n"),
+            )
+            .index();
+        let graph = graph_of(&project);
+        let links: Vec<String> = registry_links(graph);
+        assert!(
+            links.contains(&"go -> saveDoc".to_string()),
+            "{}",
+            graph.report()
+        );
+        assert!(
+            links.contains(&"go -> loadDoc".to_string()),
+            "{}",
+            graph.report()
+        );
+        assert!(
+            links
+                .iter()
+                .all(|link| !link.starts_with("viaAssign") && !link.starts_with("viaDispatch")),
+            "{links:?}"
+        );
+        let entry: Vec<&String> = links
+            .iter()
+            .filter(|link| link.starts_with("viaEntry"))
+            .collect();
+        assert_eq!(entry.len(), 2, "{links:?}");
+        assert!(
+            entry.iter().all(|link| !link.ends_with("saveDoc")),
+            "{links:?}"
+        );
+    }
+
+    /// The chained method is read from 160 UTF-16 units after the dispatch:
+    /// a method name ending on the 160th unit is read, one unit later it is
+    /// cut short and the class's first entry method is taken.
+    #[test]
+    fn w714d_the_chain_window_counts_utf16_units() {
+        // One method a line: methods sharing a line take the node id order.
+        let classes = "export class Alpha {\n  execute() {}\n  run() {}\n}\nexport class Beta {\n  execute() {}\n  run() {}\n}\nconst reg = { a: Alpha, b: Beta };\n";
+        // `reg[k]("` is 8 units and `").run` 6; each `😀` is two.
+        let dispatch = |pad: &str| {
+            format!("{classes}export function go(k: string) {{\n  reg[k](\"{pad}\").run();\n}}\n")
+        };
+        let fits = "😀".repeat(73);
+        let cut = format!("{fits}x");
+        for (pad, method) in [(fits.as_str(), "run"), (cut.as_str(), "execute")] {
+            let project = Project::new().file("src/chain.ts", &dispatch(pad)).index();
+            let graph = graph_of(&project);
+            assert_eq!(
+                registry_links(graph),
+                [
+                    format!("go -> Alpha::{method}"),
+                    format!("go -> Beta::{method}")
+                ],
+                "{}",
+                graph.report()
+            );
+        }
+    }
+
+    /// A file averaging more than 200 UTF-16 units a line is a minified
+    /// bundle and is skipped; exactly 200 is read.
+    #[test]
+    fn w714d_a_minified_file_is_skipped() {
+        let code = format!(
+            "{HANDLERS}const reg = {{ save: saveDoc, load: loadDoc }};\nexport function go(k: string) {{ return reg[k]('x'); }}\n"
+        );
+        let lines = code.matches('\n').count() + 1;
+        let units = code.encode_utf16().count();
+        // A trailing comment line of `😀`s (two units each) brings the
+        // average to exactly 200.
+        let mut fill = 200 * (lines + 1) - units - 4;
+        let mut pad = String::new();
+        if fill % 2 == 1 {
+            pad.push('x');
+            fill -= 1;
+        }
+        pad.push_str(&"😀".repeat(fill / 2));
+        let exact = format!("{code}// {pad}\n");
+        assert_eq!(
+            exact.encode_utf16().count(),
+            200 * (exact.matches('\n').count() + 1)
+        );
+        let over = format!("{code}// {pad}x\n");
+        for (content, linked) in [(exact, true), (over, false)] {
+            let project = Project::new().file("src/bundle.ts", &content).index();
+            let graph = graph_of(&project);
+            assert_eq!(
+                !registry_links(graph).is_empty(),
+                linked,
+                "{}",
+                graph.report()
+            );
+        }
+    }
+
+    /// A handler that is the dispatcher links nothing; a chained method
+    /// that is not an entry name does not choose the method; a class with
+    /// no entry method is entered at its constructor; two dispatches of one
+    /// pair link once.
+    #[test]
+    fn w714d_self_plain_chains_constructors_and_one_edge_a_pair() {
+        let project = Project::new()
+            .file(
+                "src/mixed.ts",
+                "export class Plain {\n  constructor() {}\n  render() {}\n}\nexport class Cmd {\n  execute() {}\n  render() {}\n}\nexport function goAll(k: string) {\n  reg[k].render();\n  reg[k].render();\n}\nconst reg = { plain: Plain, cmd: Cmd, self: goAll };\n",
+            )
+            .index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            registry_links(graph),
+            ["goAll -> Cmd::execute", "goAll -> Plain::constructor"],
+            "{}",
+            graph.report()
+        );
+        let edge = assert_synthesized(
+            graph,
+            "goAll",
+            "Cmd::execute",
+            "object-registry",
+            &[("via", "Cmd"), ("registeredAt", "src/mixed.ts:13")],
+        );
+        assert_eq!(edge.line, Some(10), "{edge:?}");
+    }
+
+    /// Every `jsx-render` edge as `source -> target` qualified names, sorted.
+    fn jsx_links(graph: &Graph) -> Vec<String> {
+        let name = |id: &str| {
+            graph
+                .nodes
+                .iter()
+                .find(|node| node.id == id)
+                .map_or_else(|| id.to_string(), |node| node.qualified_name.clone())
+        };
+        let mut links: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.metadata["synthesizedBy"] == "jsx-render")
+            .map(|edge| format!("{} -> {}", name(&edge.source), name(&edge.target)))
+            .collect();
+        links.sort();
+        links
+    }
+
+    const BUTTON: &str = "export function Button() {\n  return <button />;\n}\n";
+
+    /// A component renders the component its tag's static reference reaches,
+    /// `via` the tag and at the parent's first line; an outer function also
+    /// renders the tags of a function inside it.
+    #[test]
+    fn w714e_a_component_renders_its_tags_and_its_inner_functions() {
+        let project = Project::new()
+            .file("src/button.tsx", BUTTON)
+            .file(
+                "src/card.tsx",
+                "import { Button } from './button';\nfunction Row() {\n  return <span />;\n}\nexport function Card() {\n  const row = () => <Row />;\n  return (\n    <div>\n      <Button />\n      <Button />\n      {row()}\n    </div>\n  );\n}\n",
+            )
+            .index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            jsx_links(graph),
+            ["Card -> Button", "Card -> Row", "Card::row -> Row"],
+            "{}",
+            graph.report()
+        );
+        let edge = assert_synthesized(graph, "Card", "Button", "jsx-render", &[("via", "Button")]);
+        assert_eq!(edge.line, Some(5), "{edge:?}");
+        assert_eq!(edge.col, None, "{edge:?}");
+    }
+
+    /// Outside every function a tag renders from the top-level value or the
+    /// file the syntax tree gives it to; a class component renders from its
+    /// `render` method.
+    #[test]
+    fn w714e_values_files_and_class_components_render() {
+        let project = Project::new()
+            .file("src/button.tsx", BUTTON)
+            .file(
+                "src/main.tsx",
+                "import { Button } from './button';\nconst ICONS = { a: <Button /> };\nexport class Page extends React.Component {\n  render() {\n    return <Button />;\n  }\n}\nexport function App() {\n  return <Page />;\n}\ncreateRoot(el).render(<App />);\n",
+            )
+            .index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            jsx_links(graph),
+            [
+                "App -> Page",
+                "ICONS -> Button",
+                "Page::render -> Button",
+                "src/main.tsx -> App",
+            ],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// What renders nothing: an intrinsic or member tag, a type argument, a
+    /// tag with a space after `<`, a tag of a declared package (#2475), a
+    /// component rendering itself, a tag whose reference reaches a method, and
+    /// any tag of a `.ts` or `.js` file.
+    #[test]
+    fn w714e_what_renders_nothing() {
+        let project = Project::new()
+            .file("src/button.tsx", BUTTON)
+            .file(
+                "package.json",
+                "{\n  \"name\": \"app\",\n  \"dependencies\": { \"antd\": \"5.0.0\" }\n}\n",
+            )
+            .file(
+                "src/tags.tsx",
+                "import * as UI from './button';\nexport function Box() {\n  const items: Array<Box> = [];\n  const one = useState<Box>(null);\n  return <div><UI.Button /></div>;\n}\nexport function Tree() {\n  return <Tree />;\n}\n",
+            )
+            .file(
+                "src/pkg.tsx",
+                "import { Button } from 'antd';\nexport function Shop() {\n  return <Button />;\n}\n",
+            )
+            .file(
+                "src/helpers.tsx",
+                "export class Helpers {\n  Helper() {\n    return 1;\n  }\n}\nexport function Uses() {\n  return <Helper />;\n}\n",
+            )
+            .file("src/plain.js", "import { Button } from './button';\nexport function Plain() {\n  return <Button />;\n}\n")
+            .file("src/plain.ts", "import { Button } from './button';\nexport class Box {}\nexport function Typed(raw: unknown) {\n  const v = <Box>raw;\n  return [Button, v];\n}\nexport const LIMIT_MAX = 3;\nexport function Check(count: number) {\n  return count <LIMIT_MAX ;\n}\n")
+            .index();
+        let graph = graph_of(&project);
+        assert_eq!(jsx_links(graph), Vec::<String>::new(), "{}", graph.report());
+    }
+
+    /// A parent links at most thirty children, the first tags it holds.
+    #[test]
+    fn w714e_a_parent_links_at_most_thirty() {
+        let mut source = String::new();
+        let mut tags = String::new();
+        for at in 1..=31 {
+            source.push_str(&format!(
+                "export function C{at:02}() {{\n  return <span />;\n}}\n"
+            ));
+            tags.push_str(&format!("      <C{at:02} />\n"));
+        }
+        source.push_str(&format!(
+            "export function All() {{\n  return (\n    <div>\n{tags}    </div>\n  );\n}}\n"
+        ));
+        let project = Project::new().file("src/all.tsx", &source).index();
+        let graph = graph_of(&project);
+        let links = jsx_links(graph);
+        assert_eq!(links.len(), 30, "{}", graph.report());
+        assert!(!links.contains(&"All -> C31".to_string()), "{links:?}");
+    }
+
+    /// `via` is the tag, not the child's name; a name a parent renders twice
+    /// reads its first tag; a pair already linked does not count toward the
+    /// thirty; a tag a class's lines hold renders from no value or file.
+    #[test]
+    fn w714e_via_names_pairs_and_class_lines() {
+        let mut comps = String::new();
+        let mut names = vec!["C01".to_string(), "C01 as Again".to_string()];
+        let mut tags = String::from("      <C01 />\n      <Again />\n");
+        for at in 1..=30 {
+            comps.push_str(&format!(
+                "export function C{at:02}() {{\n  return <span />;\n}}\n"
+            ));
+            if at > 1 {
+                names.push(format!("C{at:02}"));
+                tags.push_str(&format!("      <C{at:02} />\n"));
+            }
+        }
+        let project = Project::new()
+            .file("src/button.tsx", BUTTON)
+            .file("src/comps.tsx", &comps)
+            .file(
+                "src/all.tsx",
+                &format!(
+                    "import {{ {} }} from './comps';\nexport function All() {{\n  return (\n    <div>\n{tags}    </div>\n  );\n}}\n",
+                    names.join(", ")
+                ),
+            )
+            .file(
+                "src/alias.tsx",
+                "import { Button as Btn } from './button';\nexport function Aliased() {\n  return <Btn />;\n}\n",
+            )
+            .file(
+                "src/twice.tsx",
+                "import { Button } from './button';\nexport function Outer() {\n  function Inner() {\n    function Button() {\n      return <i />;\n    }\n    return <Button />;\n  }\n  return (\n    <div>\n      <Button />\n      <Inner />\n    </div>\n  );\n}\n",
+            )
+            .file(
+                "src/deco.tsx",
+                "import { Button } from './button';\n@decorate(<Button />)\nexport class Deco {}\n",
+            )
+            .file(
+                "src/holder.tsx",
+                "import { Button } from './button';\nexport class Holder {\n  static icon = <Button />;\n}\n",
+            )
+            .file("src/widget.py", "class Widget:\n    pass\n")
+            .file("src/cross.tsx", "export function Cross() {\n  return <Widget />;\n}\n")
+            .index();
+        let graph = graph_of(&project);
+        let links = jsx_links(graph);
+        let all: Vec<&String> = links
+            .iter()
+            .filter(|link| link.starts_with("All -> "))
+            .collect();
+        assert_eq!(all.len(), 30, "{}", graph.report());
+        assert!(links.contains(&"All -> C30".to_string()), "{links:?}");
+        assert_synthesized(graph, "Aliased", "Button", "jsx-render", &[("via", "Btn")]);
+        let outer: Vec<&String> = links
+            .iter()
+            .filter(|link| link.starts_with("Outer -> "))
+            .collect();
+        assert_eq!(
+            outer,
+            ["Outer -> Button", "Outer -> Outer::Inner"],
+            "{}",
+            graph.report()
+        );
+        // A decorator's argument is module-level code: the file renders it.
+        // A class field's tag belongs to the class, which renders nothing.
+        assert!(
+            links.contains(&"src/deco.tsx -> Button".to_string()),
+            "{links:?}"
+        );
+        assert!(
+            links.iter().all(|link| !link.starts_with("src/holder.tsx")
+                && !link.contains("Holder")
+                && !link.contains("Widget")),
+            "{links:?}"
+        );
+    }
+}
+
+/// W7-15b: the Go prerequisite steps (`go-method-contains`, `go-implements`)
+/// and the Go half of the interface dispatch pass, with upstream's
+/// `__tests__/go-implements-*.test.ts` at `e8ddc4e2` ported case for case.
+mod go_synthesis {
+    use super::support::{EdgeRow, Graph, Indexed, NodeRow, Project, graph_of};
+
+    /// A node's Go package (its directory) and name, `pkg.Name` (upstream
+    /// `pkg`).
+    #[track_caller]
+    fn pkg(graph: &Graph, id: &str) -> String {
+        let node = graph.node(id).unwrap_or_else(|| panic!("no node {id}"));
+        let dir = node.file_path.rsplit_once('/').map_or(".", |(dir, _)| dir);
+        format!("{dir}.{}", node.name)
+    }
+
+    /// The edges of `kind` the synthesis step `by` made.
+    fn synthesized_by<'g>(
+        graph: &'g Graph,
+        kind: &'g str,
+        by: &'g str,
+    ) -> impl Iterator<Item = &'g EdgeRow> {
+        graph
+            .edges
+            .iter()
+            .filter(move |edge| edge.kind == kind && edge.metadata["synthesizedBy"] == by)
+    }
+
+    /// Every `go-implements` edge as `pkg.Type -> pkg.Interface`, sorted.
+    fn go_implements(graph: &Graph) -> Vec<String> {
+        let mut links: Vec<String> = synthesized_by(graph, "implements", "go-implements")
+            .map(|edge| {
+                format!(
+                    "{} -> {}",
+                    pkg(graph, &edge.source),
+                    pkg(graph, &edge.target)
+                )
+            })
+            .collect();
+        links.sort();
+        links
+    }
+
+    /// The one node `selector` matches.
+    #[track_caller]
+    fn one<'g>(graph: &'g Graph, selector: &str) -> &'g NodeRow {
+        let found = graph.nodes_matching(selector);
+        assert_eq!(found.len(), 1, "one {selector}:\n{}", graph.report());
+        found[0]
+    }
+
+    /// Where the interface dispatch pass bridges a call through `method` of
+    /// the interface `iface` to: the targets' qualified names, sorted
+    /// (upstream `dispatchTargets`).
+    #[track_caller]
+    fn dispatch_targets(graph: &Graph, iface: &str, method: &str) -> Vec<String> {
+        let iface = one(graph, iface);
+        let method = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.kind == "contains" && edge.source == iface.id)
+            .filter_map(|edge| graph.node(&edge.target))
+            .find(|node| node.name == method)
+            .unwrap_or_else(|| panic!("{} has no method {method}", iface.name));
+        let mut targets: Vec<String> = synthesized_by(graph, "calls", "interface-impl")
+            .filter(|edge| edge.source == method.id)
+            .map(|edge| {
+                graph
+                    .node(&edge.target)
+                    .map_or_else(|| "?".to_string(), |node| node.qualified_name.clone())
+            })
+            .collect();
+        targets.sort();
+        targets
+    }
+
+    // Upstream `go-implements-defined-types`: any defined type can declare
+    // methods, and plenty of real implementers are no structs (prometheus's
+    // `staticDiscoverer`, gin's `formSource`, etcd's `Int64Comparable`).
+
+    /// `go.mod`.
+    const DT_GO_MOD: &str = concat!("module example.com/app\n", "\n", "go 1.22\n",);
+
+    /// `discovery/discovery.go`.
+    const DT_DISCOVERY_DISCOVERY_GO: &str = concat!(
+        "package discovery\n",
+        "\n",
+        "import \"context\"\n",
+        "\n",
+        "type Group struct{ Source string }\n",
+        "\n",
+        "type Discoverer interface {\n",
+        "\tRun(ctx context.Context, up chan<- []*Group)\n",
+        "}\n",
+        "\n",
+        "type Config interface {\n",
+        "\tName() string\n",
+        "\tNewDiscoverer() (Discoverer, error)\n",
+        "}\n",
+        "\n",
+        "// A list of groups that is a Config, and hands out a Discoverer over itself.\n",
+        "type StaticConfig []*Group\n",
+        "\n",
+        "func (StaticConfig) Name() string { return \"static\" }\n",
+        "\n",
+        "func (c StaticConfig) NewDiscoverer() (Discoverer, error) { return staticDiscoverer(c), nil }\n",
+        "\n",
+        "type staticDiscoverer []*Group\n",
+        "\n",
+        "func (c staticDiscoverer) Run(ctx context.Context, up chan<- []*Group) {\n",
+        "\tselect {\n",
+        "\tcase <-ctx.Done():\n",
+        "\tcase up <- c:\n",
+        "\t}\n",
+        "}\n",
+        "\n",
+        "// A true alias: the same type as staticDiscoverer, not a second one.\n",
+        "type StaticDiscoverer = staticDiscoverer\n",
+        "\n",
+        "// A name but no NewDiscoverer: no Config.\n",
+        "type namedGroups []*Group\n",
+        "\n",
+        "func (namedGroups) Name() string { return \"named\" }\n",
+    );
+
+    /// `binding/form_mapping.go`.
+    const DT_BINDING_FORM_MAPPING_GO: &str = concat!(
+        "package binding\n",
+        "\n",
+        "type setOptions struct{ isDefaultExists bool }\n",
+        "\n",
+        "type setter interface {\n",
+        "\tTrySet(key string, opt setOptions) (bool, error)\n",
+        "}\n",
+        "\n",
+        "type formSource map[string][]string\n",
+        "\n",
+        "func (form formSource) TrySet(key string, opt setOptions) (bool, error) { return false, nil }\n",
+        "\n",
+        "// No method at all.\n",
+        "type keys []string\n",
+    );
+
+    /// `binding/multipart_form_mapping.go`.
+    const DT_BINDING_MULTIPART_FORM_MAPPING_GO: &str = concat!(
+        "package binding\n",
+        "\n",
+        "import \"net/http\"\n",
+        "\n",
+        "type multipartRequest http.Request\n",
+    );
+
+    /// `binding/multipart_set.go`.
+    const DT_BINDING_MULTIPART_SET_GO: &str = concat!(
+        "package binding\n",
+        "\n",
+        "func (r *multipartRequest) TrySet(key string, opt setOptions) (bool, error) { return false, nil }\n",
+    );
+
+    /// `adt/interval_tree.go`.
+    const DT_ADT_INTERVAL_TREE_GO: &str = concat!(
+        "package adt\n",
+        "\n",
+        "type Comparable interface {\n",
+        "\tCompare(c Comparable) int\n",
+        "}\n",
+        "\n",
+        "type StringComparable string\n",
+        "\n",
+        "func (s StringComparable) Compare(c Comparable) int { return 0 }\n",
+        "\n",
+        "type Int64Comparable int64\n",
+        "\n",
+        "func (v Int64Comparable) Compare(c Comparable) int { return 0 }\n",
+    );
+
+    /// `web/handler.go`.
+    const DT_WEB_HANDLER_GO: &str = concat!(
+        "package web\n",
+        "\n",
+        "type Request struct{}\n",
+        "\n",
+        "type ResponseWriter interface {\n",
+        "\tWrite(b []byte) (int, error)\n",
+        "}\n",
+        "\n",
+        "type Handler interface {\n",
+        "\tServeHTTP(w ResponseWriter, r *Request)\n",
+        "}\n",
+        "\n",
+        "type HandlerFunc func(ResponseWriter, *Request)\n",
+        "\n",
+        "func (f HandlerFunc) ServeHTTP(w ResponseWriter, r *Request) { f(w, r) }\n",
+        "\n",
+        "type Lener interface {\n",
+        "\tLen() int\n",
+        "}\n",
+        "\n",
+        "type Set[T comparable] map[T]struct{}\n",
+        "\n",
+        "func (s Set[T]) Len() int { return len(s) }\n",
+        "\n",
+        "// An interface type by another name: never an implementer itself.\n",
+        "type Serving Handler\n",
+    );
+
+    /// `ring/a.go`.
+    const DT_RING_A_GO: &str = concat!(
+        "package ring\n",
+        "\n",
+        "type Ticker interface{ Tick() }\n",
+        "\n",
+        "type alarm int\n",
+        "\n",
+        "func (alarm) Tick() {}\n",
+    );
+
+    const RING_STRUCTS: usize = 40;
+
+    /// `ring/b.go`: more structs declaring `Tick` than the cap.
+    fn ring_b_go() -> String {
+        let mut parts = vec!["package ring".to_string(), String::new()];
+        parts.extend((0..RING_STRUCTS).map(|index| {
+            let name = format!("tick{index:02}");
+            format!("type {name} struct{{}}\n\nfunc ({name}) Tick() {{}}\n")
+        }));
+        parts.join("\n")
+    }
+
+    fn defined_types() -> Indexed {
+        Project::new()
+            .file("go.mod", DT_GO_MOD)
+            .file("discovery/discovery.go", DT_DISCOVERY_DISCOVERY_GO)
+            .file("binding/form_mapping.go", DT_BINDING_FORM_MAPPING_GO)
+            .file(
+                "binding/multipart_form_mapping.go",
+                DT_BINDING_MULTIPART_FORM_MAPPING_GO,
+            )
+            .file("binding/multipart_set.go", DT_BINDING_MULTIPART_SET_GO)
+            .file("adt/interval_tree.go", DT_ADT_INTERVAL_TREE_GO)
+            .file("web/handler.go", DT_WEB_HANDLER_GO)
+            .file("ring/a.go", DT_RING_A_GO)
+            .file("ring/b.go", &ring_b_go())
+            .index()
+    }
+
+    /// Upstream: every defined type whose methods cover an interface is
+    /// linked, and a call through the interface is bridged to its method; a
+    /// true alias and an interface by another name implement nothing; an
+    /// interface takes at most 40 implementers, defined types in file order
+    /// with the declaring structs.
+    #[test]
+    fn w715b_defined_types_implement_the_interfaces_they_cover() {
+        let project = defined_types();
+        let graph = graph_of(&project);
+        let links: Vec<String> = go_implements(graph)
+            .into_iter()
+            .filter(|link| !link.starts_with("ring."))
+            .collect();
+        assert_eq!(
+            links,
+            [
+                "adt.Int64Comparable -> adt.Comparable",
+                "adt.StringComparable -> adt.Comparable",
+                "binding.formSource -> binding.setter",
+                "binding.multipartRequest -> binding.setter",
+                "discovery.StaticConfig -> discovery.Config",
+                "discovery.staticDiscoverer -> discovery.Discoverer",
+                "web.HandlerFunc -> web.Handler",
+                "web.Set -> web.Lener",
+            ],
+            "{}",
+            graph.report()
+        );
+
+        assert_eq!(
+            dispatch_targets(graph, "interface Discoverer", "Run"),
+            ["staticDiscoverer::Run"]
+        );
+        assert_eq!(
+            dispatch_targets(graph, "interface Config", "NewDiscoverer"),
+            ["StaticConfig::NewDiscoverer"]
+        );
+        assert_eq!(
+            dispatch_targets(graph, "interface setter", "TrySet"),
+            ["formSource::TrySet", "multipartRequest::TrySet"]
+        );
+        assert_eq!(
+            dispatch_targets(graph, "interface Comparable", "Compare"),
+            ["Int64Comparable::Compare", "StringComparable::Compare"]
+        );
+        assert_eq!(
+            dispatch_targets(graph, "interface Handler", "ServeHTTP"),
+            ["HandlerFunc::ServeHTTP"]
+        );
+
+        for name in ["StaticDiscoverer", "Serving"] {
+            let implements: Vec<String> = graph
+                .edges
+                .iter()
+                .filter(|edge| {
+                    edge.kind == "implements"
+                        && graph.node(&edge.source).is_some_and(|node| {
+                            node.name == name && node.language == "go" && node.kind != "import"
+                        })
+                })
+                .map(|edge| graph.describe_edge(edge))
+                .collect();
+            assert!(implements.is_empty(), "{name}: {implements:?}");
+        }
+        assert_eq!(
+            links
+                .iter()
+                .filter(|link| link.contains("staticDiscoverer"))
+                .count(),
+            1,
+            "{links:?}"
+        );
+
+        let ticker = one(graph, "interface Ticker");
+        let linked: Vec<&str> = synthesized_by(graph, "implements", "go-implements")
+            .filter(|edge| edge.target == ticker.id)
+            .map(|edge| graph.node(&edge.source).unwrap().name.as_str())
+            .collect();
+        assert_eq!(linked.len(), 40, "{linked:?}");
+        assert!(linked.contains(&"alarm"), "{linked:?}");
+        assert!(!linked.contains(&"tick39"), "{linked:?}");
+        assert!(
+            dispatch_targets(graph, "interface Ticker", "Tick")
+                .contains(&"alarm::Tick".to_string())
+        );
+    }
+
+    /// Upstream: a sync that edits a defined type's method re-derives what
+    /// it satisfies.
+    #[test]
+    fn w715b_a_sync_that_edits_a_defined_types_method_rederives_it() {
+        let int64 = "package adt\n\ntype Int64Comparable int64\n\nfunc (v Int64Comparable) Compare(c Comparable) int { return 0 }\n";
+        let mut project = Project::new()
+            .file("go.mod", DT_GO_MOD)
+            .file(
+                "adt/comparable.go",
+                "package adt\n\ntype Comparable interface {\n\tCompare(c Comparable) int\n}\n",
+            )
+            .file("adt/int64.go", int64)
+            .index();
+        let linked = |graph: &Graph| -> Vec<String> {
+            synthesized_by(graph, "implements", "go-implements")
+                .map(|edge| {
+                    format!(
+                        "{} -> {}",
+                        graph.node(&edge.source).unwrap().name,
+                        graph.node(&edge.target).unwrap().name
+                    )
+                })
+                .collect()
+        };
+        assert_eq!(linked(project.graph()), ["Int64Comparable -> Comparable"]);
+        project.write("adt/int64.go", &int64.replacen("Compare(", "Cmp(", 1));
+        assert_eq!(linked(project.sync()), Vec::<String>::new());
+        project.write("adt/int64.go", int64);
+        assert_eq!(linked(project.sync()), ["Int64Comparable -> Comparable"]);
+    }
+
+    /// The type hierarchy of `node` (`build_type_hierarchy`, the port of
+    /// upstream `buildTypeHierarchy`), read through the project's index.
+    #[track_caller]
+    fn hierarchy(
+        project: &Indexed,
+        node: &NodeRow,
+    ) -> Option<codegraph_graph::hierarchy::TypeHierarchy> {
+        let paths = codegraph_core::IndexPaths::resolve(project.root(), None).unwrap();
+        let store = codegraph_store::Store::open_for_read(
+            &paths,
+            std::time::Instant::now() + std::time::Duration::from_secs(30),
+            || false,
+        )
+        .expect("read the index");
+        let focus = store.node_by_id(&node.id).unwrap().expect("the node");
+        codegraph_graph::hierarchy::build_type_hierarchy(&store, &focus)
+    }
+
+    /// `relation pkg.Type` for each entry, marked when synthesized, sorted.
+    fn hierarchy_lines(
+        entries: &[codegraph_graph::hierarchy::HierarchyEntry],
+        mark: bool,
+    ) -> Vec<String> {
+        let mut lines: Vec<String> = entries
+            .iter()
+            .map(|entry| {
+                let dir = entry
+                    .node
+                    .file_path
+                    .rsplit_once('/')
+                    .map_or(".", |(dir, _)| dir);
+                format!(
+                    "{} {dir}.{}{}",
+                    entry.relation.as_str(),
+                    entry.node.name,
+                    if mark && entry.synthesized {
+                        " (synthesized)"
+                    } else {
+                        ""
+                    }
+                )
+            })
+            .collect();
+        lines.sort();
+        lines
+    }
+
+    /// Upstream: the defined types show in the type hierarchy, both ways.
+    #[test]
+    fn w715b_defined_types_show_in_the_type_hierarchy() {
+        let project = defined_types();
+        let graph = graph_of(&project);
+        let below = hierarchy(
+            &project,
+            one(graph, "interface Comparable @adt/interval_tree.go"),
+        )
+        .expect("a hierarchy");
+        assert_eq!(
+            hierarchy_lines(&below.descendants, true),
+            [
+                "implements adt.Int64Comparable (synthesized)",
+                "implements adt.StringComparable (synthesized)",
+            ]
+        );
+        let above =
+            hierarchy(&project, one(graph, "type_alias staticDiscoverer")).expect("a hierarchy");
+        assert_eq!(
+            hierarchy_lines(&above.ancestors, false),
+            ["implements discovery.Discoverer"]
+        );
+    }
+
+    // Upstream `go-implements-embedding`: both method sets include what
+    // embedding brings in (etcd's `AuthReadTx`, prometheus's `blockQuerier`).
+
+    /// `go.mod`.
+    const EM_GO_MOD: &str = concat!("module example.com/app\n", "\n", "go 1.22\n",);
+
+    /// `storage/storage.go`.
+    const EM_STORAGE_STORAGE_GO: &str = concat!(
+        "package storage\n",
+        "\n",
+        "type LabelQuerier interface {\n",
+        "\tLabelValues(name string) []string\n",
+        "\tLabelNames() []string\n",
+        "\tClose() error\n",
+        "}\n",
+        "\n",
+        "type Querier interface {\n",
+        "\tLabelQuerier\n",
+        "\tSelect(sorted bool) int\n",
+        "}\n",
+        "\n",
+        "// No method of its own.\n",
+        "type ChunkQuerier interface {\n",
+        "\tLabelQuerier\n",
+        "}\n",
+        "\n",
+        "// Promotes its methods into every struct that embeds it.\n",
+        "type BaseQuerier struct{}\n",
+        "\n",
+        "func (b *BaseQuerier) LabelValues(name string) []string { return nil }\n",
+        "func (b *BaseQuerier) LabelNames() []string            { return nil }\n",
+        "func (b *BaseQuerier) Close() error                    { return nil }\n",
+        "\n",
+        "type Appender interface {\n",
+        "\tAppend(ref uint64, v float64) (uint64, error)\n",
+        "\tCommit() error\n",
+        "\tRollback() error\n",
+        "}\n",
+        "\n",
+        "type Committer interface {\n",
+        "\tCommit() error\n",
+        "\tRollback() error\n",
+        "}\n",
+    );
+
+    /// `tsdb/querier.go`.
+    const EM_TSDB_QUERIER_GO: &str = concat!(
+        "package tsdb\n",
+        "\n",
+        "import \"example.com/app/storage\"\n",
+        "\n",
+        "// A storage.Querier through BaseQuerier's promoted methods and its own Select.\n",
+        "type blockQuerier struct {\n",
+        "\t*storage.BaseQuerier\n",
+        "\tmint, maxt int64\n",
+        "}\n",
+        "\n",
+        "func (q *blockQuerier) Select(sorted bool) int { return 0 }\n",
+        "\n",
+        "// Select and nothing else: no Querier.\n",
+        "type exemplarQuerier struct{}\n",
+        "\n",
+        "func (e *exemplarQuerier) Select(sorted bool) int { return 0 }\n",
+        "\n",
+        "// Embeds the interface it wraps, so it already declares that it is one.\n",
+        "type limitAppender struct {\n",
+        "\tstorage.Appender\n",
+        "\tlimit int\n",
+        "}\n",
+        "\n",
+        "func (a *limitAppender) Append(ref uint64, v float64) (uint64, error) {\n",
+        "\treturn a.Appender.Append(ref, v)\n",
+        "}\n",
+    );
+
+    /// `auth/store.go`.
+    const EM_AUTH_STORE_GO: &str = concat!(
+        "package auth\n",
+        "\n",
+        "type UnsafeAuthReader interface {\n",
+        "\tUnsafeReadAuthEnabled() bool\n",
+        "\tUnsafeGetUser(name string) string\n",
+        "}\n",
+        "\n",
+        "type AuthReadTx interface {\n",
+        "\tRLock()\n",
+        "\tRUnlock()\n",
+        "\tUnsafeAuthReader\n",
+        "}\n",
+        "\n",
+        "// A lock: no auth reader.\n",
+        "type RWMutex struct{}\n",
+        "\n",
+        "func (m *RWMutex) Lock()    {}\n",
+        "func (m *RWMutex) Unlock()  {}\n",
+        "func (m *RWMutex) RLock()   {}\n",
+        "func (m *RWMutex) RUnlock() {}\n",
+        "\n",
+        "type authReadTx struct{}\n",
+        "\n",
+        "func (t *authReadTx) RLock()                           {}\n",
+        "func (t *authReadTx) RUnlock()                         {}\n",
+        "func (t *authReadTx) UnsafeReadAuthEnabled() bool      { return false }\n",
+        "func (t *authReadTx) UnsafeGetUser(name string) string { return name }\n",
+    );
+
+    /// `gin/gin.go`.
+    const EM_GIN_GIN_GO: &str = concat!(
+        "package gin\n",
+        "\n",
+        "type HandlerFunc func()\n",
+        "\n",
+        "type HandlersChain []HandlerFunc\n",
+        "\n",
+        "func (c HandlersChain) Last() HandlerFunc { return nil }\n",
+        "\n",
+        "type IRoutes interface {\n",
+        "\tUse(...HandlerFunc) IRoutes\n",
+        "\tGET(string, ...HandlerFunc) IRoutes\n",
+        "}\n",
+        "\n",
+        "type IRouter interface {\n",
+        "\tIRoutes\n",
+        "\tGroup(string, ...HandlerFunc) *RouterGroup\n",
+        "}\n",
+        "\n",
+        "type RouterGroup struct{ Handlers HandlersChain }\n",
+        "\n",
+        "func (g *RouterGroup) Use(...HandlerFunc) IRoutes                { return g }\n",
+        "func (g *RouterGroup) GET(string, ...HandlerFunc) IRoutes        { return g }\n",
+        "func (g *RouterGroup) Group(string, ...HandlerFunc) *RouterGroup { return g }\n",
+        "\n",
+        "type Engine struct {\n",
+        "\tRouterGroup\n",
+        "\ttrees []string\n",
+        "}\n",
+        "\n",
+        "func (e *Engine) Use(middleware ...HandlerFunc) IRoutes {\n",
+        "\te.RouterGroup.Use(middleware...)\n",
+        "\treturn e\n",
+        "}\n",
+        "\n",
+        "type Chain interface {\n",
+        "\tLast() HandlerFunc\n",
+        "\tReset()\n",
+        "}\n",
+        "\n",
+        "// Last is promoted from the defined type it embeds.\n",
+        "type routeInfo struct {\n",
+        "\tHandlersChain\n",
+        "\tpath string\n",
+        "}\n",
+        "\n",
+        "func (r *routeInfo) Reset() {}\n",
+    );
+
+    /// `cycles/cycles.go`.
+    const EM_CYCLES_CYCLES_GO: &str = concat!(
+        "package cycles\n",
+        "\n",
+        "type Walker interface{ Walk() }\n",
+        "\n",
+        "// A struct may embed a pointer to itself.\n",
+        "type Node struct {\n",
+        "\t*Node\n",
+        "\tnext *Node\n",
+        "}\n",
+        "\n",
+        "func (n *Node) Walk() {}\n",
+        "\n",
+        "type Peer interface {\n",
+        "\tSend()\n",
+        "\tReply()\n",
+        "}\n",
+        "\n",
+        "// Each embeds the other through a pointer, so each has both methods.\n",
+        "type Client struct{ *Server }\n",
+        "\n",
+        "type Server struct{ *Client }\n",
+        "\n",
+        "func (c *Client) Send()  {}\n",
+        "func (s *Server) Reply() {}\n",
+        "\n",
+        "// Not valid Go, but a graph can hold it: each embeds the other.\n",
+        "type Left interface {\n",
+        "\tRight\n",
+        "\tL()\n",
+        "}\n",
+        "\n",
+        "type Right interface {\n",
+        "\tLeft\n",
+        "\tR()\n",
+        "}\n",
+        "\n",
+        "type both struct{}\n",
+        "\n",
+        "func (both) L() {}\n",
+        "func (both) R() {}\n",
+    );
+
+    /// `empty/empty.go`.
+    const EM_EMPTY_EMPTY_GO: &str = concat!(
+        "package empty\n",
+        "\n",
+        "import (\n",
+        "\t\"io\"\n",
+        "\n",
+        "\t\"go.uber.org/zap/zapcore\"\n",
+        ")\n",
+        "\n",
+        "type Any interface{}\n",
+        "\n",
+        "// Embeds only a type nothing here names the methods of: nothing to match.\n",
+        "type Core interface{ zapcore.Core }\n",
+        "\n",
+        "// What io.Closer asks for: a Close.\n",
+        "type Closer interface{ io.Closer }\n",
+    );
+
+    /// `fleet/heart.go`.
+    const EM_FLEET_HEART_GO: &str = concat!(
+        "package fleet\n",
+        "\n",
+        "type heart struct{}\n",
+        "\n",
+        "func (heart) Beat() {}\n",
+    );
+
+    const FLEET_UNITS: usize = 45;
+
+    /// `fleet/fleet.go`: more implementers than the cap, every unit through
+    /// the base they all embed.
+    fn fleet_go() -> String {
+        let mut lines: Vec<String> = [
+            "package fleet",
+            "",
+            "type Beater interface{ Beat() }",
+            "",
+            "type Base struct{}",
+            "",
+            "func (Base) Beat() {}",
+            "",
+        ]
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+        lines.extend((0..FLEET_UNITS).map(|index| format!("type unit{index:02} struct{{ Base }}")));
+        lines.push(String::new());
+        lines.join("\n")
+    }
+
+    fn embedding() -> Indexed {
+        Project::new()
+            .file("go.mod", EM_GO_MOD)
+            .file("storage/storage.go", EM_STORAGE_STORAGE_GO)
+            .file("tsdb/querier.go", EM_TSDB_QUERIER_GO)
+            .file("auth/store.go", EM_AUTH_STORE_GO)
+            .file("gin/gin.go", EM_GIN_GIN_GO)
+            .file("cycles/cycles.go", EM_CYCLES_CYCLES_GO)
+            .file("empty/empty.go", EM_EMPTY_EMPTY_GO)
+            .file("fleet/fleet.go", &fleet_go())
+            .file("fleet/heart.go", EM_FLEET_HEART_GO)
+            .index()
+    }
+
+    /// The `go-implements` edges out of Go structs (upstream's
+    /// `goImplements` of this test), as `pkg.Struct -> pkg.Interface`.
+    fn struct_implements(graph: &Graph) -> Vec<String> {
+        let mut links: Vec<String> = synthesized_by(graph, "implements", "go-implements")
+            .filter(|edge| {
+                graph
+                    .node(&edge.source)
+                    .is_some_and(|node| node.kind == "struct")
+            })
+            .map(|edge| {
+                format!(
+                    "{} -> {}",
+                    pkg(graph, &edge.source),
+                    pkg(graph, &edge.target)
+                )
+            })
+            .filter(|link| !link.starts_with("fleet."))
+            .collect();
+        links.sort();
+        links
+    }
+
+    /// Upstream: exactly the structs whose method set, embeddings included,
+    /// covers an interface are linked; an embedded interface's methods are
+    /// asked for too; a struct embedding the interface keeps its declared
+    /// edge; a call through the interface reaches an override on the
+    /// embedding struct; an interface with no known method takes nothing;
+    /// the cap keeps the types declaring the interface's methods.
+    #[test]
+    fn w715b_embedded_methods_count_on_both_sides() {
+        let project = embedding();
+        let graph = graph_of(&project);
+        assert_eq!(
+            struct_implements(graph),
+            [
+                "auth.authReadTx -> auth.AuthReadTx",
+                "auth.authReadTx -> auth.UnsafeAuthReader",
+                "cycles.Client -> cycles.Peer",
+                "cycles.Node -> cycles.Walker",
+                "cycles.Server -> cycles.Peer",
+                "cycles.both -> cycles.Left",
+                "cycles.both -> cycles.Right",
+                "gin.Engine -> gin.IRouter",
+                "gin.Engine -> gin.IRoutes",
+                "gin.RouterGroup -> gin.IRouter",
+                "gin.RouterGroup -> gin.IRoutes",
+                "gin.routeInfo -> gin.Chain",
+                "storage.BaseQuerier -> empty.Closer",
+                "storage.BaseQuerier -> storage.ChunkQuerier",
+                "storage.BaseQuerier -> storage.LabelQuerier",
+                "tsdb.blockQuerier -> empty.Closer",
+                "tsdb.blockQuerier -> storage.ChunkQuerier",
+                "tsdb.blockQuerier -> storage.LabelQuerier",
+                "tsdb.blockQuerier -> storage.Querier",
+                "tsdb.limitAppender -> storage.Committer",
+            ],
+            "{}",
+            graph.report()
+        );
+
+        for (selector, expected) in [
+            ("interface AuthReadTx", "implements auth.authReadTx"),
+            ("interface Querier", "implements tsdb.blockQuerier"),
+        ] {
+            let below = hierarchy(&project, one(graph, selector)).expect("a hierarchy");
+            assert_eq!(hierarchy_lines(&below.descendants, false), [expected]);
+        }
+
+        let limit = one(graph, "struct limitAppender");
+        let mut declared: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|edge| {
+                edge.source == limit.id && (edge.kind == "implements" || edge.kind == "extends")
+            })
+            .map(|edge| {
+                format!(
+                    "{} {}{}",
+                    edge.kind,
+                    pkg(graph, &edge.target),
+                    if edge.provenance.as_deref() == Some("heuristic") {
+                        " (synthesized)"
+                    } else {
+                        ""
+                    }
+                )
+            })
+            .collect();
+        declared.sort();
+        assert_eq!(
+            declared,
+            [
+                "implements storage.Appender",
+                "implements storage.Committer (synthesized)",
+            ],
+            "{}",
+            graph.report()
+        );
+
+        // RouterGroup was linked before. Engine satisfies IRoutes only with
+        // the GET that RouterGroup promotes into it.
+        assert_eq!(
+            dispatch_targets(graph, "interface IRoutes", "Use"),
+            ["Engine::Use", "RouterGroup::Use"]
+        );
+
+        for selector in ["interface Any", "interface Core"] {
+            let target = one(graph, selector);
+            assert_eq!(
+                synthesized_by(graph, "implements", "go-implements")
+                    .filter(|edge| edge.target == target.id)
+                    .count(),
+                0,
+                "{selector}"
+            );
+        }
+
+        // Base, heart and 45 units satisfy Beater. heart is declared after
+        // the units, but a call through Beater reaches its Beat, not theirs.
+        let beater = one(graph, "interface Beater");
+        let linked: Vec<&str> = synthesized_by(graph, "implements", "go-implements")
+            .filter(|edge| edge.target == beater.id)
+            .map(|edge| graph.node(&edge.source).unwrap().name.as_str())
+            .collect();
+        assert_eq!(linked.len(), 40, "{linked:?}");
+        assert!(
+            linked.contains(&"Base") && linked.contains(&"heart"),
+            "{linked:?}"
+        );
+        assert_eq!(
+            linked
+                .iter()
+                .filter(|name| name.starts_with("unit"))
+                .count(),
+            38,
+            "{linked:?}"
+        );
+        assert_eq!(
+            dispatch_targets(graph, "interface Beater", "Beat"),
+            ["Base::Beat", "heart::Beat"]
+        );
+    }
+
+    /// Upstream: a sync that edits only the embedded type re-derives what
+    /// the struct embedding it satisfies.
+    #[test]
+    fn w715b_a_sync_that_edits_only_the_embedded_type_rederives_it() {
+        let base =
+            "package base\n\ntype Base struct{}\n\nfunc (Base) Close() error { return nil }\n";
+        let mut project = Project::new()
+            .file("go.mod", EM_GO_MOD)
+            .file(
+                "api/api.go",
+                "package api\n\ntype NamedCloser interface {\n\tClose() error\n\tName() string\n}\n",
+            )
+            .file("base/base.go", base)
+            .file(
+                "wrap/wrap.go",
+                "package wrap\n\nimport \"example.com/app/base\"\n\ntype Wrapper struct{ base.Base }\n\nfunc (Wrapper) Name() string { return \"\" }\n",
+            )
+            .index();
+        let linked = |graph: &Graph| -> Vec<String> {
+            synthesized_by(graph, "implements", "go-implements")
+                .filter(|edge| {
+                    graph
+                        .node(&edge.source)
+                        .is_some_and(|node| node.kind == "struct")
+                })
+                .map(|edge| {
+                    format!(
+                        "{} -> {}",
+                        graph.node(&edge.source).unwrap().name,
+                        graph.node(&edge.target).unwrap().name
+                    )
+                })
+                .collect()
+        };
+        // Close comes from Base, in a file neither Wrapper's nor the
+        // interface's.
+        assert_eq!(linked(project.graph()), ["Wrapper -> NamedCloser"]);
+        project.write("base/base.go", &base.replacen("Close()", "Shutdown()", 1));
+        assert_eq!(linked(project.sync()), Vec::<String>::new());
+        project.write("base/base.go", base);
+        assert_eq!(linked(project.sync()), ["Wrapper -> NamedCloser"]);
+    }
+
+    // Upstream `go-implements-unexported` (#2746): an unexported method name
+    // belongs to the package declaring it, so only that package's methods
+    // satisfy an interface asking for it.
+
+    /// `go.mod`.
+    const UX_GO_MOD: &str = concat!("module example.com/app\n", "\n", "go 1.22\n",);
+
+    /// `discovery/refresh/refresh.go`.
+    const UX_DISCOVERY_REFRESH_REFRESH_GO: &str = concat!(
+        "package refresh\n",
+        "\n",
+        "type Discovery struct {\n",
+        "\trefreshf func() ([]string, error)\n",
+        "}\n",
+        "\n",
+        "func (d *Discovery) Run() {}\n",
+        "\n",
+        "func (d *Discovery) refresh() ([]string, error) { return d.refreshf() }\n",
+    );
+
+    /// `discovery/hetzner/hetzner.go`.
+    const UX_DISCOVERY_HETZNER_HETZNER_GO: &str = concat!(
+        "package hetzner\n",
+        "\n",
+        "import \"example.com/app/discovery/refresh\"\n",
+        "\n",
+        "type refresher interface {\n",
+        "\trefresh() ([]string, error)\n",
+        "}\n",
+        "\n",
+        "// A refresh of its own, declared in package hetzner: a refresher.\n",
+        "type hcloudDiscovery struct {\n",
+        "\t*refresh.Discovery\n",
+        "}\n",
+        "\n",
+        "func (d *hcloudDiscovery) refresh() ([]string, error) { return nil, nil }\n",
+        "\n",
+        "// A defined type of the package is one too.\n",
+        "type robotTargets []string\n",
+        "\n",
+        "func (r robotTargets) refresh() ([]string, error) { return r, nil }\n",
+        "\n",
+        "// Its only refresh is the one package refresh declares on the Discovery it\n",
+        "// embeds: no refresher, for all that it sits in this package.\n",
+        "type Discovery struct {\n",
+        "\t*refresh.Discovery\n",
+        "}\n",
+    );
+
+    /// `discovery/aws/ec2.go`.
+    const UX_DISCOVERY_AWS_EC2_GO: &str = concat!(
+        "package aws\n",
+        "\n",
+        "import \"example.com/app/discovery/refresh\"\n",
+        "\n",
+        "// A refresh of its own, but package aws's: no hetzner refresher.\n",
+        "type EC2Discovery struct {\n",
+        "\t*refresh.Discovery\n",
+        "}\n",
+        "\n",
+        "func (d *EC2Discovery) refresh() ([]string, error) { return nil, nil }\n",
+        "\n",
+        "// Nor is a defined type of package aws.\n",
+        "type staticTargets []string\n",
+        "\n",
+        "func (s staticTargets) refresh() ([]string, error) { return s, nil }\n",
+    );
+
+    /// `api/pb/rpc_grpc.pb.go`.
+    const UX_API_PB_RPC_GRPC_PB_GO: &str = concat!(
+        "package pb\n",
+        "\n",
+        "type KVServer interface {\n",
+        "\tRange(key string) (string, error)\n",
+        "\tPut(key string) (string, error)\n",
+        "\tmustEmbedUnimplementedKVServer()\n",
+        "}\n",
+        "\n",
+        "type UnimplementedKVServer struct{}\n",
+        "\n",
+        "func (UnimplementedKVServer) Range(key string) (string, error) { return \"\", nil }\n",
+        "func (UnimplementedKVServer) Put(key string) (string, error)   { return \"\", nil }\n",
+        "func (UnimplementedKVServer) mustEmbedUnimplementedKVServer()  {}\n",
+        "\n",
+        "type UnsafeKVServer interface {\n",
+        "\tmustEmbedUnimplementedKVServer()\n",
+        "}\n",
+    );
+
+    /// `server/v3rpc/key.go`.
+    const UX_SERVER_V3RPC_KEY_GO: &str = concat!(
+        "package v3rpc\n",
+        "\n",
+        "import pb \"example.com/app/api/pb\"\n",
+        "\n",
+        "// etcd's kvServer: the stub interface brings pb's mustEmbedUnimplementedKVServer.\n",
+        "type kvServer struct {\n",
+        "\tpb.UnsafeKVServer\n",
+        "}\n",
+        "\n",
+        "func (s *kvServer) Range(key string) (string, error) { return \"\", nil }\n",
+        "func (s *kvServer) Put(key string) (string, error)   { return \"\", nil }\n",
+        "\n",
+        "// The stub struct brings it, and Put.\n",
+        "type kvProxy struct {\n",
+        "\tpb.UnimplementedKVServer\n",
+        "}\n",
+        "\n",
+        "func (p *kvProxy) Range(key string) (string, error) { return \"\", nil }\n",
+        "\n",
+        "// Its mustEmbedUnimplementedKVServer is package v3rpc's: no KVServer.\n",
+        "type fakeKV struct{}\n",
+        "\n",
+        "func (fakeKV) Range(key string) (string, error) { return \"\", nil }\n",
+        "func (fakeKV) Put(key string) (string, error)   { return \"\", nil }\n",
+        "func (fakeKV) mustEmbedUnimplementedKVServer()  {}\n",
+    );
+
+    /// `server/v3rpc/closable.go`.
+    const UX_SERVER_V3RPC_CLOSABLE_GO: &str = concat!(
+        "package v3rpc\n",
+        "\n",
+        "import pb \"example.com/app/api/pb\"\n",
+        "\n",
+        "type closableKV interface {\n",
+        "\tpb.KVServer\n",
+        "\tClose() error\n",
+        "}\n",
+        "\n",
+        "func (s *kvServer) Close() error { return nil }\n",
+        "\n",
+        "func (fakeKV) Close() error { return nil }\n",
+    );
+
+    /// `lease/lease.go`.
+    const UX_LEASE_LEASE_GO: &str = concat!(
+        "package lease\n",
+        "\n",
+        "type checkpointer interface {\n",
+        "\tcheckpoint() error\n",
+        "\tExpired() bool\n",
+        "}\n",
+        "\n",
+        "// A checkpoint and no Expired: neither is a checkpointer itself.\n",
+        "type Lessor struct{}\n",
+        "\n",
+        "func (l *Lessor) checkpoint() error { return nil }\n",
+        "\n",
+        "type Store struct{}\n",
+        "\n",
+        "func (s *Store) checkpoint() error { return nil }\n",
+    );
+
+    /// `lease/proxy/proxy.go`.
+    const UX_LEASE_PROXY_PROXY_GO: &str = concat!(
+        "package proxy\n",
+        "\n",
+        "import \"example.com/app/lease\"\n",
+        "\n",
+        "// Its own checkpoint is package proxy's. A call through a checkpointer runs\n",
+        "// the one the Lessor it embeds declares in package lease.\n",
+        "type leaseProxy struct {\n",
+        "\t*lease.Lessor\n",
+        "}\n",
+        "\n",
+        "func (p *leaseProxy) checkpoint() error { return nil }\n",
+        "func (p *leaseProxy) Expired() bool     { return false }\n",
+        "\n",
+        "// local's checkpoint, one level down, is package proxy's too. It hides\n",
+        "// nothing: Store's, two levels down, is the checkpointer's.\n",
+        "type local struct{}\n",
+        "\n",
+        "func (local) checkpoint() error { return nil }\n",
+        "\n",
+        "type wrapped struct{ *lease.Store }\n",
+        "\n",
+        "type layered struct {\n",
+        "\tlocal\n",
+        "\twrapped\n",
+        "}\n",
+        "\n",
+        "func (layered) Expired() bool { return false }\n",
+    );
+
+    /// `a/early.go`.
+    const UX_A_EARLY_GO: &str = concat!(
+        "package a\n",
+        "\n",
+        "import \"example.com/app/pool\"\n",
+        "\n",
+        "type early struct{ pool.Base }\n",
+        "\n",
+        "func (early) ping() {}\n",
+    );
+
+    /// Base and 39 units: exactly the cap.
+    const POOL_UNITS: usize = 39;
+
+    fn pool_go() -> String {
+        let mut lines: Vec<String> = [
+            "package pool",
+            "",
+            "type pinger interface{ ping() }",
+            "",
+            "type Base struct{}",
+            "",
+            "func (Base) ping() {}",
+            "",
+        ]
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+        lines.extend((0..POOL_UNITS).map(|index| {
+            let unit = format!("unit{index:02}");
+            format!("type {unit} struct{{}}\n\nfunc ({unit}) ping() {{}}\n")
+        }));
+        lines.join("\n")
+    }
+
+    fn unexported() -> Indexed {
+        Project::new()
+            .file("go.mod", UX_GO_MOD)
+            .file(
+                "discovery/refresh/refresh.go",
+                UX_DISCOVERY_REFRESH_REFRESH_GO,
+            )
+            .file(
+                "discovery/hetzner/hetzner.go",
+                UX_DISCOVERY_HETZNER_HETZNER_GO,
+            )
+            .file("discovery/aws/ec2.go", UX_DISCOVERY_AWS_EC2_GO)
+            .file("api/pb/rpc_grpc.pb.go", UX_API_PB_RPC_GRPC_PB_GO)
+            .file("server/v3rpc/key.go", UX_SERVER_V3RPC_KEY_GO)
+            .file("server/v3rpc/closable.go", UX_SERVER_V3RPC_CLOSABLE_GO)
+            .file("lease/lease.go", UX_LEASE_LEASE_GO)
+            .file("lease/proxy/proxy.go", UX_LEASE_PROXY_PROXY_GO)
+            .file("a/early.go", UX_A_EARLY_GO)
+            .file("pool/pool.go", &pool_go())
+            .index()
+    }
+
+    /// `file:line` of the first line of `contents` containing `text`.
+    #[track_caller]
+    fn at(file: &str, contents: &str, text: &str) -> String {
+        let line = contents
+            .split('\n')
+            .position(|line| line.contains(text))
+            .unwrap_or_else(|| panic!("{text:?} in {file}"));
+        format!("{file}:{}", line + 1)
+    }
+
+    /// The `go-implements` edges into `iface`, as `pkg.Type`, sorted.
+    fn implementers(graph: &Graph, iface: &str) -> Vec<String> {
+        let iface = one(graph, iface);
+        let mut types: Vec<String> = synthesized_by(graph, "implements", "go-implements")
+            .filter(|edge| edge.target == iface.id)
+            .map(|edge| pkg(graph, &edge.source))
+            .collect();
+        types.sort();
+        types
+    }
+
+    /// Where a call through `method` of `iface` dispatches, as
+    /// `Target::m`, or `Target::m <- promotedInto @registeredAt` (upstream
+    /// `dispatch`).
+    #[track_caller]
+    fn dispatch(graph: &Graph, iface: &str, method: &str) -> Vec<String> {
+        let iface = one(graph, iface);
+        let method = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.kind == "contains" && edge.source == iface.id)
+            .filter_map(|edge| graph.node(&edge.target))
+            .find(|node| node.name == method)
+            .unwrap_or_else(|| panic!("{}.{method}", iface.name));
+        let mut targets: Vec<String> = synthesized_by(graph, "calls", "interface-impl")
+            .filter(|edge| edge.source == method.id)
+            .map(|edge| {
+                let target = graph
+                    .node(&edge.target)
+                    .map_or("?", |node| node.qualified_name.as_str());
+                match edge
+                    .metadata
+                    .get("promotedInto")
+                    .and_then(|into| into.as_str())
+                {
+                    Some(into) => format!(
+                        "{target} <- {into} @{}",
+                        edge.metadata["registeredAt"].as_str().unwrap_or("?")
+                    ),
+                    None => target.to_string(),
+                }
+            })
+            .collect();
+        targets.sort();
+        targets
+    }
+
+    /// Upstream: no type of another package satisfies an interface by a
+    /// namesake of its unexported method; a gRPC server satisfies one
+    /// through the stub it embeds from the interface's package; an embedded
+    /// interface's method is asked for in that interface's package; a call
+    /// dispatches to the method of the interface's own package, promoted when
+    /// the struct does not declare it; the cap fills with the types
+    /// declaring the method in its package first.
+    #[test]
+    fn w715b_an_unexported_method_is_satisfied_only_from_its_package() {
+        let project = unexported();
+        let graph = graph_of(&project);
+        // Not aws's EC2Discovery or staticTargets, nor refresh.Discovery,
+        // nor hetzner's Discovery, whose refresh is package refresh's.
+        let refresher = "interface refresher @discovery/hetzner/hetzner.go";
+        assert_eq!(
+            implementers(graph, refresher),
+            [
+                "discovery/hetzner.hcloudDiscovery",
+                "discovery/hetzner.robotTargets",
+            ],
+            "{}",
+            graph.report()
+        );
+        let below = hierarchy(&project, one(graph, refresher)).expect("a hierarchy");
+        let mut types: Vec<String> = below
+            .descendants
+            .iter()
+            .map(|entry| {
+                let dir = entry
+                    .node
+                    .file_path
+                    .rsplit_once('/')
+                    .map_or(".", |(dir, _)| dir);
+                format!("{dir}.{}", entry.node.name)
+            })
+            .collect();
+        types.sort();
+        assert_eq!(
+            types,
+            [
+                "discovery/hetzner.hcloudDiscovery",
+                "discovery/hetzner.robotTargets",
+            ]
+        );
+
+        // kvServer embeds the UnsafeKVServer interface, kvProxy the
+        // UnimplementedKVServer struct. fakeKV declares the method itself, in
+        // package v3rpc.
+        assert_eq!(
+            implementers(graph, "interface KVServer"),
+            [
+                "api/pb.UnimplementedKVServer",
+                "server/v3rpc.kvProxy",
+                "server/v3rpc.kvServer",
+            ]
+        );
+        // kvServer declares that one by embedding it.
+        assert_eq!(
+            implementers(graph, "interface UnsafeKVServer"),
+            ["api/pb.UnimplementedKVServer", "server/v3rpc.kvProxy"]
+        );
+        assert_eq!(
+            implementers(graph, "interface closableKV"),
+            ["server/v3rpc.kvServer"]
+        );
+
+        let checkpointer = "interface checkpointer";
+        assert_eq!(
+            implementers(graph, checkpointer),
+            ["lease/proxy.layered", "lease/proxy.leaseProxy"]
+        );
+        // Not leaseProxy's own checkpoint, nor local's at the shallower
+        // depth.
+        let proxy = "lease/proxy/proxy.go";
+        assert_eq!(
+            dispatch(graph, checkpointer, "checkpoint"),
+            [
+                format!(
+                    "Lessor::checkpoint <- leaseProxy @{}",
+                    at(proxy, UX_LEASE_PROXY_PROXY_GO, "\t*lease.Lessor")
+                ),
+                format!(
+                    "Store::checkpoint <- layered @{}",
+                    at(proxy, UX_LEASE_PROXY_PROXY_GO, "\twrapped")
+                ),
+            ],
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            dispatch(graph, checkpointer, "Expired"),
+            ["layered::Expired", "leaseProxy::Expired"]
+        );
+        // A gRPC server's own mustEmbedUnimplementedKVServer is no override.
+        assert_eq!(
+            dispatch(
+                graph,
+                "interface KVServer",
+                "mustEmbedUnimplementedKVServer"
+            ),
+            ["UnimplementedKVServer::mustEmbedUnimplementedKVServer"]
+        );
+
+        let mut pool: Vec<String> = vec!["pool.Base".to_string()];
+        pool.extend((0..POOL_UNITS).map(|index| format!("pool.unit{index:02}")));
+        pool.sort();
+        assert_eq!(implementers(graph, "interface pinger"), pool);
+    }
+
+    // Upstream `go-implements-stdlib` (#2402, #2759): the methods of the
+    // standard-library types projects embed are known, with their counts,
+    // and an embedded `error` is recorded as the embedding it is.
+
+    /// `go.mod`.
+    const SL_GO_MOD: &str = concat!("module example.com/app\n", "\n", "go 1.22\n",);
+
+    /// `promql/promql.go`.
+    const SL_PROMQL_PROMQL_GO: &str = concat!(
+        "package promql\n",
+        "\n",
+        "import (\n",
+        "\t\"context\"\n",
+        "\t\"io\"\n",
+        "\t\"log/slog\"\n",
+        "\t\"os\"\n",
+        "\t\"testing\"\n",
+        ")\n",
+        "\n",
+        "// All of testing.TB, which only an embedding can have, and Run.\n",
+        "type TBRun interface {\n",
+        "\ttesting.TB\n",
+        "\tRun(string, func(*testing.T)) bool\n",
+        "}\n",
+        "\n",
+        "// A Run, and nothing of testing.TB.\n",
+        "type Discovery struct{}\n",
+        "\n",
+        "func (d *Discovery) Run(name string, f func(*testing.T)) bool { return false }\n",
+        "\n",
+        "// testing.TB through *testing.T, and a Run of its own.\n",
+        "type tRunner struct{ *testing.T }\n",
+        "\n",
+        "func (r tRunner) Run(name string, f func(*testing.T)) bool { return r.T.Run(name, f) }\n",
+        "\n",
+        "// discovery/file's test helper: all of TBRun through *testing.T, Run included.\n",
+        "type testRunner struct {\n",
+        "\t*testing.T\n",
+        "\tdir string\n",
+        "}\n",
+        "\n",
+        "type syncWriter interface {\n",
+        "\tio.Writer\n",
+        "\tSync() error\n",
+        "}\n",
+        "\n",
+        "// Sync, and no Write.\n",
+        "type scrapePool struct{}\n",
+        "\n",
+        "func (sp *scrapePool) Sync() error { return nil }\n",
+        "\n",
+        "type queryLogFile struct{}\n",
+        "\n",
+        "func (f *queryLogFile) Write(p []byte) (int, error) { return len(p), nil }\n",
+        "func (f *queryLogFile) Sync() error                 { return nil }\n",
+        "\n",
+        "// Its Write takes a record and returns only an error: no io.Writer's.\n",
+        "type walLog struct{}\n",
+        "\n",
+        "func (w *walLog) Write(rec *Record) error { return nil }\n",
+        "func (w *walLog) Sync() error             { return nil }\n",
+        "\n",
+        "type SegmentFile interface {\n",
+        "\tStat() (os.FileInfo, error)\n",
+        "\tSync() error\n",
+        "\tio.Writer\n",
+        "\tio.Reader\n",
+        "\tio.Closer\n",
+        "}\n",
+        "\n",
+        "// Write through the SegmentFile it embeds, which has it from io.Writer.\n",
+        "type Segment struct {\n",
+        "\tSegmentFile\n",
+        "\tdir string\n",
+        "}\n",
+        "\n",
+        "// No method of its own: what slog.Handler and io.Closer ask for.\n",
+        "type QueryLogger interface {\n",
+        "\tslog.Handler\n",
+        "\tio.Closer\n",
+        "}\n",
+        "\n",
+        "type JSONFileLogger struct{}\n",
+        "\n",
+        "func (l *JSONFileLogger) Enabled(ctx context.Context, level slog.Level) bool { return true }\n",
+        "func (l *JSONFileLogger) Handle(ctx context.Context, r slog.Record) error  { return nil }\n",
+        "func (l *JSONFileLogger) WithAttrs(attrs []slog.Attr) slog.Handler          { return l }\n",
+        "func (l *JSONFileLogger) WithGroup(name string) slog.Handler                { return l }\n",
+        "func (l *JSONFileLogger) Close() error                                      { return nil }\n",
+    );
+
+    /// `fileutil/fileutil.go`.
+    const SL_FILEUTIL_FILEUTIL_GO: &str = concat!(
+        "package fileutil\n",
+        "\n",
+        "import (\n",
+        "\t\"bufio\"\n",
+        "\t\"context\"\n",
+        "\t\"io\"\n",
+        "\t\"io/fs\"\n",
+        "\t\"os\"\n",
+        "\t\"sync\"\n",
+        ")\n",
+        "\n",
+        "type FileReader interface {\n",
+        "\tio.Reader\n",
+        "\tFileInfo() (fs.FileInfo, error)\n",
+        "}\n",
+        "\n",
+        "// Read is promoted from *os.File.\n",
+        "type fileReader struct{ *os.File }\n",
+        "\n",
+        "func (fr *fileReader) FileInfo() (fs.FileInfo, error) { return fr.Stat() }\n",
+        "\n",
+        "// Read is promoted from *bufio.Reader.\n",
+        "type FileBufReader struct {\n",
+        "\t*bufio.Reader\n",
+        "\tfi fs.FileInfo\n",
+        "}\n",
+        "\n",
+        "func (fb *FileBufReader) FileInfo() (fs.FileInfo, error) { return fb.fi, nil }\n",
+        "\n",
+        "// FileInfo, and nothing to Read with.\n",
+        "type fileStat struct{}\n",
+        "\n",
+        "func (s *fileStat) FileInfo() (fs.FileInfo, error) { return nil, nil }\n",
+        "\n",
+        "// v3lockpb's client: Lock and Unlock are gRPC calls.\n",
+        "type LockClient interface {\n",
+        "\tLock(ctx context.Context, name string) error\n",
+        "\tUnlock(ctx context.Context, key string) error\n",
+        "}\n",
+        "\n",
+        "// hugo's: what a mutex has.\n",
+        "type Locker interface {\n",
+        "\tLock()\n",
+        "\tUnlock()\n",
+        "}\n",
+        "\n",
+        "// A mutex's Lock and Unlock: a Locker's, not a LockClient's.\n",
+        "type waitRecorder struct {\n",
+        "\tsync.Mutex\n",
+        "\tactions []string\n",
+        "}\n",
+        "\n",
+        "type lockProxy struct{}\n",
+        "\n",
+        "func (p *lockProxy) Lock(ctx context.Context, name string) error  { return nil }\n",
+        "func (p *lockProxy) Unlock(ctx context.Context, key string) error { return nil }\n",
+    );
+
+    /// `gin/response_writer.go`.
+    const SL_GIN_RESPONSE_WRITER_GO: &str = concat!(
+        "package gin\n",
+        "\n",
+        "import (\n",
+        "\t\"bufio\"\n",
+        "\t\"net\"\n",
+        "\t\"net/http\"\n",
+        ")\n",
+        "\n",
+        "type ResponseWriter interface {\n",
+        "\thttp.ResponseWriter\n",
+        "\thttp.Hijacker\n",
+        "\thttp.Flusher\n",
+        "\thttp.CloseNotifier\n",
+        "\tStatus() int\n",
+        "\tSize() int\n",
+        "\tWriteString(string) (int, error)\n",
+        "\tWritten() bool\n",
+        "\tWriteHeaderNow()\n",
+        "\tPusher() http.Pusher\n",
+        "}\n",
+        "\n",
+        "// Header is promoted from the http.ResponseWriter it wraps.\n",
+        "type responseWriter struct {\n",
+        "\thttp.ResponseWriter\n",
+        "\tsize   int\n",
+        "\tstatus int\n",
+        "}\n",
+        "\n",
+        "func (w *responseWriter) WriteHeader(code int)                          {}\n",
+        "func (w *responseWriter) WriteHeaderNow()                               {}\n",
+        "func (w *responseWriter) Write(data []byte) (int, error)                { return len(data), nil }\n",
+        "func (w *responseWriter) WriteString(s string) (int, error)             { return len(s), nil }\n",
+        "func (w *responseWriter) Status() int                                   { return w.status }\n",
+        "func (w *responseWriter) Size() int                                     { return w.size }\n",
+        "func (w *responseWriter) Written() bool                                 { return w.size >= 0 }\n",
+        "func (w *responseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error)  { return nil, nil, nil }\n",
+        "func (w *responseWriter) CloseNotify() <-chan bool                      { return nil }\n",
+        "func (w *responseWriter) Flush()                                        {}\n",
+        "func (w *responseWriter) Pusher() http.Pusher                           { return nil }\n",
+        "\n",
+        "// The methods ResponseWriter declares, none that http asks for.\n",
+        "type sizeTracker struct{ size, status int }\n",
+        "\n",
+        "func (t *sizeTracker) Status() int                       { return t.status }\n",
+        "func (t *sizeTracker) Size() int                         { return t.size }\n",
+        "func (t *sizeTracker) WriteString(s string) (int, error) { return len(s), nil }\n",
+        "func (t *sizeTracker) Written() bool                     { return t.size >= 0 }\n",
+        "func (t *sizeTracker) WriteHeaderNow()                   {}\n",
+        "func (t *sizeTracker) Pusher() http.Pusher               { return nil }\n",
+    );
+
+    /// `errs/errs.go`.
+    const SL_ERRS_ERRS_GO: &str = concat!(
+        "package errs\n",
+        "\n",
+        "type coded interface {\n",
+        "\terror\n",
+        "\tCode() int\n",
+        "}\n",
+        "\n",
+        "// Error is promoted from the error it wraps.\n",
+        "type statusErr struct {\n",
+        "\terror\n",
+        "\tcode int\n",
+        "}\n",
+        "\n",
+        "func (e statusErr) Code() int { return e.code }\n",
+        "\n",
+        "// A Code, and no Error.\n",
+        "type counter struct{ n int }\n",
+        "\n",
+        "func (c *counter) Code() int { return c.n }\n",
+    );
+
+    /// `diag/diag.go`.
+    const SL_DIAG_DIAG_GO: &str = concat!(
+        "package diag\n",
+        "\n",
+        "import (\n",
+        "\t\"github.com/libdns/libdns\"\n",
+        "\tplog \"github.com/prometheus/common/log\"\n",
+        "\t\"go.uber.org/zap\"\n",
+        "\t\"go.uber.org/zap/zapcore\"\n",
+        "\t\"google.golang.org/grpc\"\n",
+        ")\n",
+        "\n",
+        "// kapacitor's scraper.Diagnostic: Log, and a Logger.\n",
+        "type Diagnostic interface {\n",
+        "\tplog.Logger\n",
+        "\tLog(keyvals ...interface{}) error\n",
+        "}\n",
+        "\n",
+        "type ScraperHandler struct{}\n",
+        "\n",
+        "func (h *ScraperHandler) Debug(args ...interface{})          {}\n",
+        "func (h *ScraperHandler) Log(keyvals ...interface{}) error { return nil }\n",
+        "\n",
+        "type AlertNode struct{}\n",
+        "\n",
+        "func (n *AlertNode) Log(keyvals ...interface{}) error { return nil }\n",
+        "\n",
+        "// caddy's: nothing else has a FlushTo.\n",
+        "type LogBufferCoreInterface interface {\n",
+        "\tzapcore.Core\n",
+        "\tFlushTo(*zap.Logger)\n",
+        "}\n",
+        "\n",
+        "type LogBufferCore struct{}\n",
+        "\n",
+        "func (c *LogBufferCore) FlushTo(l *zap.Logger) {}\n",
+        "\n",
+        "type ClientStream interface {\n",
+        "\tgrpc.ClientStream\n",
+        "\tSend(m any) error\n",
+        "\tRecv(m any) error\n",
+        "}\n",
+        "\n",
+        "// Has the gRPC stream's methods by embedding it.\n",
+        "type wrappedStream struct{ grpc.ClientStream }\n",
+        "\n",
+        "func (s *wrappedStream) Send(m any) error { return nil }\n",
+        "func (s *wrappedStream) Recv(m any) error { return nil }\n",
+        "\n",
+        "// Sends and receives, as a server stream.\n",
+        "type serverStream struct{}\n",
+        "\n",
+        "func (s *serverStream) Send(m any) error { return nil }\n",
+        "func (s *serverStream) Recv(m any) error { return nil }\n",
+        "\n",
+        "// Nothing it asks for has a name here.\n",
+        "type DNSProvider interface {\n",
+        "\tlibdns.RecordGetter\n",
+        "\tlibdns.RecordSetter\n",
+        "}\n",
+    );
+
+    /// `testing/fake.go`: a project struct declaring every method
+    /// `testing.TB` has, at its counts, its unexported `private` included,
+    /// and a TBRun's `Run`; in a package whose directory is itself named
+    /// `testing`, its `private` is still not testing's.
+    fn fake_testing_tb() -> String {
+        let mut lines: Vec<String> = ["package testing", "", "type fakeTB struct{}", ""]
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        let mut methods =
+            codegraph_resolve::go_std_methods::go_std_methods(Some("testing"), "TB").unwrap();
+        methods.push(("Run", "2/1"));
+        for (name, arity) in methods {
+            let (params, results) = arity.split_once('/').unwrap();
+            let params: usize = params.parse().unwrap();
+            let results: usize = results.parse().unwrap();
+            let list: Vec<String> = (0..params).map(|index| format!("a{index} int")).collect();
+            let result = match results {
+                0 => String::new(),
+                1 => " int".to_string(),
+                _ => format!(" ({})", vec!["int"; results].join(", ")),
+            };
+            lines.push(format!(
+                "func (f *fakeTB) {name}({}){result} {{ panic(0) }}",
+                list.join(", ")
+            ));
+        }
+        format!("{}\n", lines.join("\n"))
+    }
+
+    fn stdlib() -> Indexed {
+        Project::new()
+            .file("go.mod", SL_GO_MOD)
+            .file("promql/promql.go", SL_PROMQL_PROMQL_GO)
+            .file("fileutil/fileutil.go", SL_FILEUTIL_FILEUTIL_GO)
+            .file("gin/response_writer.go", SL_GIN_RESPONSE_WRITER_GO)
+            .file("errs/errs.go", SL_ERRS_ERRS_GO)
+            .file("diag/diag.go", SL_DIAG_DIAG_GO)
+            .file("testing/fake.go", &fake_testing_tb())
+            .index()
+    }
+
+    /// Upstream: exactly the structs with every method, embedded ones
+    /// included, are linked; `testing.TB` and `io.Writer` ask for every
+    /// method, testing's own `private` and io's counts included; an embedded
+    /// `error` is recorded and stays outside the graph; a method a
+    /// standard-library embedding brings holds to its counts; an interface
+    /// embedding an undescribed type links to the same embedding, or to its
+    /// one candidate.
+    #[test]
+    fn w715b_standard_library_embeddings_bring_their_methods() {
+        let project = stdlib();
+        let graph = graph_of(&project);
+        assert_eq!(
+            struct_implements(graph),
+            [
+                "diag.LogBufferCore -> diag.LogBufferCoreInterface",
+                "diag.wrappedStream -> diag.ClientStream",
+                "errs.statusErr -> errs.coded",
+                "fileutil.FileBufReader -> fileutil.FileReader",
+                "fileutil.fileReader -> fileutil.FileReader",
+                // An *os.File is what prometheus's SegmentFile and syncWriter
+                // describe.
+                "fileutil.fileReader -> promql.SegmentFile",
+                "fileutil.fileReader -> promql.syncWriter",
+                "fileutil.lockProxy -> fileutil.LockClient",
+                "fileutil.waitRecorder -> fileutil.Locker",
+                "gin.responseWriter -> gin.ResponseWriter",
+                "promql.JSONFileLogger -> promql.QueryLogger",
+                "promql.Segment -> promql.syncWriter",
+                "promql.queryLogFile -> promql.syncWriter",
+                "promql.tRunner -> promql.TBRun",
+                "promql.testRunner -> promql.TBRun",
+            ],
+            "{}",
+            graph.report()
+        );
+
+        // Not the discoverer with a Run, nor fakeTB, whose private is its
+        // own package's.
+        let below = hierarchy(&project, one(graph, "interface TBRun")).expect("a hierarchy");
+        assert_eq!(
+            hierarchy_lines(&below.descendants, false),
+            ["implements promql.tRunner", "implements promql.testRunner"]
+        );
+        // Not walLog, whose Write takes a record and returns only an error.
+        let below = hierarchy(&project, one(graph, "interface syncWriter")).expect("a hierarchy");
+        assert_eq!(
+            hierarchy_lines(&below.descendants, false),
+            [
+                "implements fileutil.fileReader",
+                "implements promql.Segment",
+                "implements promql.queryLogFile",
+            ]
+        );
+        // A call through TBRun reaches tRunner's Run, not the discoverer's;
+        // testRunner's is testing's, outside the graph.
+        assert_eq!(
+            dispatch_targets(graph, "interface TBRun", "Run"),
+            ["tRunner::Run"]
+        );
+
+        for selector in ["struct statusErr", "interface coded"] {
+            let node = one(graph, selector);
+            let embedded: Vec<&str> = graph
+                .unresolved
+                .iter()
+                .filter(|reference| {
+                    reference.from_node_id == node.id && reference.reference_kind == "extends"
+                })
+                .map(|reference| reference.reference_name.as_str())
+                .collect();
+            assert_eq!(embedded, ["error"], "{selector}");
+            let declared: Vec<String> = graph
+                .edges
+                .iter()
+                .filter(|edge| {
+                    edge.source == node.id
+                        && (edge.kind == "extends" || edge.kind == "implements")
+                        && edge.provenance.as_deref() != Some("heuristic")
+                })
+                .map(|edge| graph.describe_edge(edge))
+                .collect();
+            assert!(declared.is_empty(), "{selector}: {declared:?}");
+        }
+
+        // waitRecorder's Lock and Unlock are sync.Mutex's: they take
+        // nothing.
+        assert_eq!(
+            implementers(graph, "interface Locker"),
+            ["fileutil.waitRecorder"]
+        );
+        assert_eq!(
+            implementers(graph, "interface LockClient"),
+            ["fileutil.lockProxy"]
+        );
+        // responseWriter's Header is http.ResponseWriter's, which
+        // ResponseWriter asks for.
+        assert_eq!(
+            implementers(graph, "interface ResponseWriter"),
+            ["gin.responseWriter"]
+        );
+
+        // Two structs have a Log: neither is known to be a plog.Logger.
+        assert_eq!(
+            implementers(graph, "interface Diagnostic"),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            implementers(graph, "interface LogBufferCoreInterface"),
+            ["diag.LogBufferCore"]
+        );
+        assert_eq!(
+            implementers(graph, "interface ClientStream"),
+            ["diag.wrappedStream"]
+        );
+        assert_eq!(
+            implementers(graph, "interface DNSProvider"),
+            Vec::<String>::new()
+        );
+    }
+
+    /// Upstream: a sync that changes what an interface embeds re-reads the
+    /// standard-library type it names.
+    #[test]
+    fn w715b_a_sync_that_changes_an_embedded_std_type_rereads_it() {
+        let api = "package api\n\nimport stdio \"io\"\n\ntype SyncWriter interface {\n\tstdio.Writer\n\tSync() error\n}\n";
+        let mut project = Project::new()
+            .file("go.mod", SL_GO_MOD)
+            .file("api/api.go", api)
+            .file(
+                "log/file.go",
+                "package log\n\ntype file struct{}\n\nfunc (f *file) Write(p []byte) (int, error) { return len(p), nil }\nfunc (f *file) Sync() error { return nil }\n",
+            )
+            .index();
+        let linked = |graph: &Graph| -> Vec<String> {
+            synthesized_by(graph, "implements", "go-implements")
+                .map(|edge| {
+                    format!(
+                        "{} -> {}",
+                        graph.node(&edge.source).unwrap().name,
+                        graph.node(&edge.target).unwrap().name
+                    )
+                })
+                .collect()
+        };
+        assert_eq!(linked(project.graph()), ["file -> SyncWriter"]);
+        // An io.Reader has to Read, which file can't.
+        project.write(
+            "api/api.go",
+            &api.replacen("stdio.Writer", "stdio.Reader", 1),
+        );
+        assert_eq!(linked(project.sync()), Vec::<String>::new());
+        project.write("api/api.go", api);
+        assert_eq!(linked(project.sync()), ["file -> SyncWriter"]);
+    }
+
+    // Upstream `go-implements-arity` (#2430, #2447): each wanted method also
+    // needs a declaration with its parameter and result counts, and a gRPC
+    // client interface takes its service's server arities too.
+
+    /// `go.mod`.
+    const AR_GO_MOD: &str = concat!("module example.com/app\n", "\n", "go 1.22\n",);
+
+    /// `rafthttp/http.go`.
+    const AR_RAFTHTTP_HTTP_GO: &str = concat!(
+        "package rafthttp\n",
+        "\n",
+        "import \"context\"\n",
+        "\n",
+        "type Peer interface{ attach() }\n",
+        "\n",
+        "type peerGetter interface {\n",
+        "\tGet(id uint64) Peer\n",
+        "}\n",
+        "\n",
+        "type Transport struct{}\n",
+        "\n",
+        "func (t *Transport) Get(id uint64) Peer { return nil }\n",
+        "\n",
+        "type Cache struct{}\n",
+        "\n",
+        "func (c *Cache) Get(ctx context.Context, key string, opts ...string) (string, error) {\n",
+        "\treturn \"\", nil\n",
+        "}\n",
+    );
+
+    /// `testutil/closer.go`.
+    const AR_TESTUTIL_CLOSER_GO: &str = concat!(
+        "package testutil\n",
+        "\n",
+        "type Closer interface {\n",
+        "\tClose()\n",
+        "}\n",
+        "\n",
+        "type tmpDir struct{}\n",
+        "\n",
+        "func (d *tmpDir) Close() {}\n",
+        "\n",
+        "type Block struct{}\n",
+        "\n",
+        "func (b *Block) Close() error { return nil }\n",
+        "\n",
+        "// Close is promoted from Block, still returning an error.\n",
+        "type wrapsBlock struct{ Block }\n",
+    );
+
+    /// `storage/storage.go`.
+    const AR_STORAGE_STORAGE_GO: &str = concat!(
+        "package storage\n",
+        "\n",
+        "type Appender interface {\n",
+        "\tAppend(\n",
+        "\t\tref uint64, // the series, or 0 (new)\n",
+        "\t\tv float64, /* sample, value */\n",
+        "\t) (uint64, error)\n",
+        "}\n",
+        "\n",
+        "type memAppender struct{}\n",
+        "\n",
+        "func (a *memAppender) Append(ref uint64, v float64) (uint64, error) { return ref, nil }\n",
+        "\n",
+        "type Putter interface {\n",
+        "\tPut(key, value []byte) error\n",
+        "}\n",
+        "\n",
+        "type boltStore struct{}\n",
+        "\n",
+        "func (s *boltStore) Put(k []byte, v []byte) error { return nil }\n",
+        "\n",
+        "type Conn struct{}\n",
+        "\n",
+        "type Dialer interface {\n",
+        "\tDial() (*Conn, error)\n",
+        "}\n",
+        "\n",
+        "type bridgeDialer struct{}\n",
+        "\n",
+        "func (b *bridgeDialer) Dial() (*Conn, error) { return nil, nil }\n",
+        "\n",
+        "type rwTimeoutDialer struct{}\n",
+        "\n",
+        "func (d *rwTimeoutDialer) Dial(network, address string) (*Conn, error) { return nil, nil }\n",
+    );
+
+    /// `generic/visit.go`.
+    const AR_GENERIC_VISIT_GO: &str = concat!(
+        "package generic\n",
+        "\n",
+        "type Pair[K comparable, V any] struct {\n",
+        "\tKey K\n",
+        "\tVal V\n",
+        "}\n",
+        "\n",
+        "type Visitor interface {\n",
+        "\tVisit(fn func(key, value string) error, p Pair[string, int]) (n int, err error)\n",
+        "}\n",
+        "\n",
+        "type walker struct{}\n",
+        "\n",
+        "func (w *walker) Visit(f func(k, v string) error, p Pair[string, int]) (int, error) { return 0, nil }\n",
+        "\n",
+        "type lister struct{}\n",
+        "\n",
+        "func (l *lister) Visit(f func(Pair[string, int]) bool) bool { return false }\n",
+        "\n",
+        "type Tagger interface {\n",
+        "\tTag(v struct {\n",
+        "\t\tA, B int `json:\"a,omitempty\" yaml:\"(b)\"`\n",
+        "\t}) string\n",
+        "}\n",
+        "\n",
+        "type tagger struct{}\n",
+        "\n",
+        "func (t tagger) Tag(v struct {\n",
+        "\tA, B int `json:\"a,omitempty\" yaml:\"(b)\"`\n",
+        "}) string {\n",
+        "\treturn \"\"\n",
+        "}\n",
+    );
+
+    /// `api/kv_grpc.pb.go`.
+    const AR_API_KV_GRPC_PB_GO: &str = concat!(
+        "// Code generated by protoc-gen-go-grpc. DO NOT EDIT.\n",
+        "\n",
+        "package api\n",
+        "\n",
+        "import (\n",
+        "\t\"context\"\n",
+        "\n",
+        "\t\"google.golang.org/grpc\"\n",
+        ")\n",
+        "\n",
+        "type RangeRequest struct{}\n",
+        "type RangeResponse struct{}\n",
+        "type ListRequest struct{}\n",
+        "type KV_ListClient struct{}\n",
+        "type KV_ListServer struct{}\n",
+        "type KV_WatchClient struct{}\n",
+        "type KV_WatchServer struct{}\n",
+        "\n",
+        "type KVClient interface {\n",
+        "\tRange(ctx context.Context, in *RangeRequest, opts ...grpc.CallOption) (*RangeResponse, error)\n",
+        "\tList(ctx context.Context, in *ListRequest, opts ...grpc.CallOption) (KV_ListClient, error)\n",
+        "\tWatch(ctx context.Context, opts ...grpc.CallOption) (KV_WatchClient, error)\n",
+        "}\n",
+        "\n",
+        "type kVClient struct {\n",
+        "\tcc grpc.ClientConnInterface\n",
+        "}\n",
+        "\n",
+        "func (c *kVClient) Range(ctx context.Context, in *RangeRequest, opts ...grpc.CallOption) (*RangeResponse, error) {\n",
+        "\treturn nil, nil\n",
+        "}\n",
+        "\n",
+        "func (c *kVClient) List(ctx context.Context, in *ListRequest, opts ...grpc.CallOption) (KV_ListClient, error) {\n",
+        "\treturn KV_ListClient{}, nil\n",
+        "}\n",
+        "\n",
+        "func (c *kVClient) Watch(ctx context.Context, opts ...grpc.CallOption) (KV_WatchClient, error) {\n",
+        "\treturn KV_WatchClient{}, nil\n",
+        "}\n",
+        "\n",
+        "type KVServer interface {\n",
+        "\tRange(context.Context, *RangeRequest) (*RangeResponse, error)\n",
+        "\tList(*ListRequest, KV_ListServer) error\n",
+        "\tWatch(KV_WatchServer) error\n",
+        "}\n",
+        "\n",
+        "type UnimplementedKVServer struct{}\n",
+        "\n",
+        "func (UnimplementedKVServer) Range(context.Context, *RangeRequest) (*RangeResponse, error) {\n",
+        "\treturn nil, nil\n",
+        "}\n",
+        "func (UnimplementedKVServer) List(*ListRequest, KV_ListServer) error { return nil }\n",
+        "func (UnimplementedKVServer) Watch(KV_WatchServer) error             { return nil }\n",
+    );
+
+    /// `server/kv.go`.
+    const AR_SERVER_KV_GO: &str = concat!(
+        "package server\n",
+        "\n",
+        "import (\n",
+        "\t\"context\"\n",
+        "\n",
+        "\t\"example.com/app/api\"\n",
+        "\t\"google.golang.org/grpc\"\n",
+        ")\n",
+        "\n",
+        "// Serves the KV service: a unary, a server-streaming and a bidi RPC.\n",
+        "type kvServer struct{}\n",
+        "\n",
+        "func (s *kvServer) Range(ctx context.Context, r *api.RangeRequest) (*api.RangeResponse, error) {\n",
+        "\treturn nil, nil\n",
+        "}\n",
+        "func (s *kvServer) List(r *api.ListRequest, stream api.KV_ListServer) error { return nil }\n",
+        "func (s *kvServer) Watch(stream api.KV_WatchServer) error                   { return nil }\n",
+        "\n",
+        "// What the server ranges through. The generated client has a Range too, with\n",
+        "// call options: it is no RaftKV.\n",
+        "type RaftKV interface {\n",
+        "\tRange(ctx context.Context, r *api.RangeRequest) (*api.RangeResponse, error)\n",
+        "}\n",
+        "\n",
+        "// An interface that mixes a client call with a method of its own is no\n",
+        "// gRPC client: what it asks for is what it takes.\n",
+        "type closingRanger interface {\n",
+        "\tRange(ctx context.Context, in *api.RangeRequest, opts ...grpc.CallOption) (*api.RangeResponse, error)\n",
+        "\tClose() error\n",
+        "}\n",
+        "\n",
+        "type rangeCloser struct{}\n",
+        "\n",
+        "func (c *rangeCloser) Range(ctx context.Context, r *api.RangeRequest) (*api.RangeResponse, error) {\n",
+        "\treturn nil, nil\n",
+        "}\n",
+        "func (c *rangeCloser) Close() error { return nil }\n",
+    );
+
+    /// `client/kv.go`.
+    const AR_CLIENT_KV_GO: &str = concat!(
+        "package client\n",
+        "\n",
+        "import (\n",
+        "\t\"context\"\n",
+        "\n",
+        "\t\"example.com/app/api\"\n",
+        ")\n",
+        "\n",
+        "type kv struct{ remote api.KVClient }\n",
+        "\n",
+        "func (k *kv) Range(key string) string          { return key }\n",
+        "func (k *kv) List(prefix string) []string      { return nil }\n",
+        "func (k *kv) Watch(key string) <-chan string   { return nil }\n",
+        "\n",
+        "func (k *kv) Get(ctx context.Context, key string) {\n",
+        "\tk.remote.Range(ctx, &api.RangeRequest{})\n",
+        "}\n",
+    );
+
+    /// `xds/transport.go`.
+    const AR_XDS_TRANSPORT_GO: &str = concat!(
+        "package xds\n",
+        "\n",
+        "type Transport struct{}\n",
+        "\n",
+        "type TransportBuilder interface {\n",
+        "\tBuild(serverURI string) (*Transport, error)\n",
+        "}\n",
+        "\n",
+        "type grpcTransportBuilder struct{}\n",
+        "\n",
+        "func (b *grpcTransportBuilder) Build(serverURI string) (*Transport, error) { return nil, nil }\n",
+    );
+
+    const BALANCERS: usize = 45;
+
+    /// `balancer/builders.go`: more builders with a `Build` of their own
+    /// than the cap, sorted before the one real implementer.
+    fn builders_go() -> String {
+        let mut lines: Vec<String> = [
+            "package balancer",
+            "",
+            "type ClientConn struct{}",
+            "type BuildOptions struct{}",
+            "type Balancer struct{}",
+            "",
+        ]
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+        lines.extend((0..BALANCERS).map(|index| {
+            let name = format!("builder{index:02}");
+            format!(
+                "type {name} struct{{}}\n\nfunc ({name}) Build(cc ClientConn, opts BuildOptions) Balancer {{ return Balancer{{}} }}\n"
+            )
+        }));
+        lines.join("\n")
+    }
+
+    fn arity() -> Indexed {
+        Project::new()
+            .file("go.mod", AR_GO_MOD)
+            .file("rafthttp/http.go", AR_RAFTHTTP_HTTP_GO)
+            .file("testutil/closer.go", AR_TESTUTIL_CLOSER_GO)
+            .file("storage/storage.go", AR_STORAGE_STORAGE_GO)
+            .file("generic/visit.go", AR_GENERIC_VISIT_GO)
+            .file("api/kv_grpc.pb.go", AR_API_KV_GRPC_PB_GO)
+            .file("server/kv.go", AR_SERVER_KV_GO)
+            .file("client/kv.go", AR_CLIENT_KV_GO)
+            .file("balancer/builders.go", &builders_go())
+            .file("xds/transport.go", AR_XDS_TRANSPORT_GO)
+            .index()
+    }
+
+    /// Upstream: only the structs whose methods take and return as many
+    /// values are linked, a call through an interface dispatches only to
+    /// methods Go could reach, and a struct failing the counts stays out of
+    /// the cap; a gRPC client interface reaches the servers of its service,
+    /// unary and streaming RPCs alike, but not a wrapper of other shapes,
+    /// and only an interface whose every method is a client call takes
+    /// server arities.
+    #[test]
+    fn w715b_implicit_satisfaction_checks_the_counts() {
+        let project = arity();
+        let graph = graph_of(&project);
+        assert_eq!(
+            struct_implements(graph),
+            [
+                "api.UnimplementedKVServer -> api.KVClient",
+                "api.UnimplementedKVServer -> api.KVServer",
+                "api.UnimplementedKVServer -> server.RaftKV",
+                "api.kVClient -> api.KVClient",
+                "generic.tagger -> generic.Tagger",
+                "generic.walker -> generic.Visitor",
+                "rafthttp.Transport -> rafthttp.peerGetter",
+                "server.kvServer -> api.KVClient",
+                "server.kvServer -> api.KVServer",
+                "server.kvServer -> server.RaftKV",
+                "server.rangeCloser -> server.RaftKV",
+                "storage.boltStore -> storage.Putter",
+                "storage.bridgeDialer -> storage.Dialer",
+                "storage.memAppender -> storage.Appender",
+                "testutil.tmpDir -> testutil.Closer",
+                "xds.grpcTransportBuilder -> xds.TransportBuilder",
+            ],
+            "{}",
+            graph.report()
+        );
+
+        assert_eq!(
+            dispatch_targets(graph, "interface peerGetter", "Get"),
+            ["Transport::Get"]
+        );
+        assert_eq!(
+            dispatch_targets(graph, "interface Closer", "Close"),
+            ["tmpDir::Close"]
+        );
+        // The generated client ranges with call options; RaftKV doesn't
+        // take them.
+        assert_eq!(
+            dispatch_targets(graph, "interface RaftKV", "Range"),
+            [
+                "UnimplementedKVServer::Range",
+                "kvServer::Range",
+                "rangeCloser::Range",
+            ]
+        );
+        assert_eq!(
+            implementers(graph, "interface TransportBuilder"),
+            ["xds.grpcTransportBuilder"]
+        );
+
+        for rpc in ["Range", "List", "Watch"] {
+            assert_eq!(
+                dispatch_targets(graph, "interface KVClient", rpc),
+                [
+                    format!("UnimplementedKVServer::{rpc}"),
+                    format!("kVClient::{rpc}"),
+                    format!("kvServer::{rpc}"),
+                ],
+                "{rpc}"
+            );
+        }
+        let client = one(graph, "interface KVClient");
+        let mut into: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.kind == "implements" && edge.target == client.id)
+            .map(|edge| pkg(graph, &edge.source))
+            .collect();
+        into.sort();
+        assert_eq!(
+            into,
+            [
+                "api.UnimplementedKVServer",
+                "api.kVClient",
+                "server.kvServer"
+            ]
+        );
+
+        for (selector, outgoing) in [
+            ("struct kv @client/kv.go", true),
+            ("interface closingRanger", false),
+        ] {
+            let node = one(graph, selector);
+            let linked: Vec<String> = graph
+                .edges
+                .iter()
+                .filter(|edge| {
+                    edge.kind == "implements"
+                        && if outgoing {
+                            edge.source == node.id
+                        } else {
+                            edge.target == node.id
+                        }
+                })
+                .map(|edge| graph.describe_edge(edge))
+                .collect();
+            assert!(linked.is_empty(), "{selector}: {linked:?}");
+        }
+    }
+
+    // Beyond upstream's tests: the owner lookup, the embedding qualifiers,
+    // promotion and the embedded `error` against Rust's own graph.
+
+    const OWN_TYPES_GO: &str = concat!(
+        "package svc\n",
+        "\n",
+        "import \"io\"\n",
+        "\n",
+        "type Store struct {\n",
+        "\tBase\n",
+        "}\n",
+        "\n",
+        "type Base struct{}\n",
+        "\n",
+        "func (b *Base) ping() {}\n",
+        "\n",
+        "type Saver interface {\n",
+        "\tSave(key string) error\n",
+        "\tio.Closer\n",
+        "}\n",
+        "\n",
+        "type HandlerFunc func(int)\n",
+        "\n",
+        "func (f HandlerFunc) Serve(n int) { f(n) }\n",
+        "\n",
+        "// A pipe closes through the io.Closer it embeds, outside the graph.\n",
+        "type Pipe struct {\n",
+        "\tio.Closer\n",
+        "}\n",
+        "\n",
+        "type Shutter interface {\n",
+        "\tClose() error\n",
+        "}\n",
+    );
+
+    const OWN_METHODS_GO: &str = concat!(
+        "package svc\n",
+        "\n",
+        "func (s *Store) Save(key string) error { return nil }\n",
+        "\n",
+        "func (s Store) Close() error { return nil }\n",
+    );
+
+    /// A method declared in another file of its package, and any method of
+    /// a defined type, gets its type as owner (`go-method-contains`, no
+    /// provenance); a namesake type of another package does not own it, and
+    /// a method extraction already attached keeps only its parsed edge. The
+    /// dispatch pass reads the new edges: a call through `Saver` reaches
+    /// `Store`'s `Save`. A struct with `io.Closer`'s `Close` satisfies an
+    /// interface asking for it, and a call through the interface reaches no
+    /// method of the graph for it.
+    #[test]
+    fn w715b_a_method_elsewhere_in_its_package_gets_its_owner() {
+        let project = Project::new()
+            .file("go.mod", "module example.com/app\n\ngo 1.22\n")
+            .file("svc/types.go", OWN_TYPES_GO)
+            .file("svc/methods.go", OWN_METHODS_GO)
+            .file("other/types.go", "package other\n\ntype Store struct{}\n")
+            .index();
+        let graph = graph_of(&project);
+        for (owner, method) in [
+            ("struct Store @svc/types.go", "method Store::Save"),
+            ("struct Store @svc/types.go", "method Store::Close"),
+            ("type_alias HandlerFunc", "method HandlerFunc::Serve"),
+        ] {
+            let edges = graph.edges_matching(owner, "contains", method);
+            assert_eq!(edges.len(), 1, "{owner} -> {method}:\n{}", graph.report());
+            assert_eq!(edges[0].metadata["synthesizedBy"], "go-method-contains");
+            assert_eq!(edges[0].provenance, None);
+            assert_eq!(edges[0].line, Some(one(graph, method).start_line));
+            assert!(
+                graph
+                    .edges_matching("struct Store @other/types.go", "contains", method)
+                    .is_empty()
+            );
+        }
+        let ping = graph.edges_matching("struct Base", "contains", "method Base::ping");
+        assert_eq!(ping.len(), 1, "{}", graph.report());
+        assert!(ping[0].metadata.get("synthesizedBy").is_none(), "{ping:?}");
+
+        assert_eq!(
+            dispatch_targets(graph, "interface Saver", "Save"),
+            ["Store::Save"]
+        );
+        assert_eq!(implementers(graph, "interface Saver"), ["svc.Store"]);
+        assert_eq!(
+            implementers(graph, "interface Shutter"),
+            ["svc.Pipe", "svc.Store"]
+        );
+        assert_eq!(
+            dispatch_targets(graph, "interface Shutter", "Close"),
+            ["Store::Close"]
+        );
+    }
+
+    /// A type written through a package name the file does not import is
+    /// no standard-library type: it brings no methods.
+    #[test]
+    fn w715b_a_written_qualifier_without_its_import_is_opaque() {
+        let project = Project::new()
+            .file("go.mod", "module example.com/app\n\ngo 1.22\n")
+            .file(
+                "w/a.go",
+                "package w\n\nimport \"io\"\n\ntype Writer2 interface {\n\tWrite(p []byte) (int, error)\n}\n\ntype W2 struct {\n\tio.Writer\n}\n",
+            )
+            .file("w/b.go", "package w\n\ntype W struct {\n\tio.Writer\n}\n")
+            .index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            implementers(graph, "interface Writer2"),
+            ["w.W2"],
+            "{}",
+            graph.report()
+        );
+    }
+
+    const PROMOTION_GO: &str = concat!(
+        "package p\n",
+        "\n",
+        "type Runner interface {\n",
+        "\tRun()\n",
+        "\tStop()\n",
+        "}\n",
+        "\n",
+        "type A struct{}\n",
+        "\n",
+        "func (A) Run() {}\n",
+        "\n",
+        "type B struct{}\n",
+        "\n",
+        "func (B) Run() {}\n",
+        "\n",
+        "// One path to one struct providing Run: the promoted method runs.\n",
+        "type One struct {\n",
+        "\tA\n",
+        "}\n",
+        "\n",
+        "func (One) Stop() {}\n",
+        "\n",
+        "// Two embeddings at one depth provide Run: Go selects neither.\n",
+        "type Two struct {\n",
+        "\tA\n",
+        "\tB\n",
+        "}\n",
+        "\n",
+        "func (Two) Stop() {}\n",
+        "\n",
+        "type RunnerOnly interface {\n",
+        "\tRun()\n",
+        "}\n",
+        "\n",
+        "type Holder struct {\n",
+        "\tRunnerOnly\n",
+        "}\n",
+        "\n",
+        "// Run comes through an interface its embedded struct embeds: a call\n",
+        "// through it dispatches again.\n",
+        "type Deep struct {\n",
+        "\tHolder\n",
+        "}\n",
+        "\n",
+        "func (Deep) Stop() {}\n",
+        "\n",
+        "type Pinger interface {\n",
+        "\tPing()\n",
+        "\tPong()\n",
+        "}\n",
+        "\n",
+        "type P struct{}\n",
+        "\n",
+        "func (P) Ping() {}\n",
+        "\n",
+        "type Q struct{}\n",
+        "\n",
+        "func (Q) Pong() {}\n",
+        "\n",
+        "// No method of its own: both of Pinger's are promoted.\n",
+        "type R struct {\n",
+        "\tP\n",
+        "\tQ\n",
+        "}\n",
+        "\n",
+        "type Walker interface {\n",
+        "\tWalk()\n",
+        "\tHalt()\n",
+        "}\n",
+        "\n",
+        "type C struct{}\n",
+        "\n",
+        "func (C) Walk() {}\n",
+        "\n",
+        "type D struct{}\n",
+        "\n",
+        "func (D) Walk() {}\n",
+        "\n",
+        "// Two embeddings at one depth provide Walk and neither type is linked\n",
+        "// otherwise: Go selects neither.\n",
+        "type Pair struct {\n",
+        "\tC\n",
+        "\tD\n",
+        "}\n",
+        "\n",
+        "func (Pair) Halt() {}\n",
+    );
+
+    /// A struct satisfying an interface with a promoted method runs the
+    /// embedded struct's method (`promotedInto`, wired at the embedding);
+    /// two paths at one depth, or an interface providing it, promote
+    /// nothing.
+    #[test]
+    fn w715b_a_promotion_needs_one_path_to_a_struct() {
+        let project = Project::new()
+            .file("go.mod", "module example.com/app\n\ngo 1.22\n")
+            .file("p/p.go", PROMOTION_GO)
+            .index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            implementers(graph, "interface Runner"),
+            ["p.Deep", "p.One", "p.Two"],
+            "{}",
+            graph.report()
+        );
+        let embedding = PROMOTION_GO
+            .split('\n')
+            .position(|line| line == "type One struct {")
+            .unwrap()
+            + 2;
+        assert_eq!(
+            dispatch(graph, "interface Runner", "Run"),
+            [format!("A::Run <- One @p/p.go:{embedding}")],
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            dispatch(graph, "interface Runner", "Stop"),
+            ["Deep::Stop", "One::Stop", "Two::Stop"]
+        );
+        // Neither of two providers at one depth is promoted, where no other
+        // edge holds the pair.
+        assert_eq!(implementers(graph, "interface Walker"), ["p.Pair"]);
+        assert_eq!(
+            dispatch(graph, "interface Walker", "Walk"),
+            Vec::<String>::new()
+        );
+        assert_eq!(dispatch(graph, "interface Walker", "Halt"), ["Pair::Halt"]);
+        // A struct declaring no method satisfies an interface with promoted
+        // methods alone.
+        assert_eq!(implementers(graph, "interface Pinger"), ["p.R"]);
+        let line = |text: &str| {
+            PROMOTION_GO
+                .split('\n')
+                .position(|line| line == text)
+                .unwrap()
+                + 1
+        };
+        let r = line("type R struct {");
+        assert_eq!(
+            dispatch(graph, "interface Pinger", "Ping"),
+            [format!("P::Ping <- R @p/p.go:{}", r + 1)]
+        );
+        assert_eq!(
+            dispatch(graph, "interface Pinger", "Pong"),
+            [format!("Q::Pong <- R @p/p.go:{}", r + 2)]
+        );
+    }
+
+    /// An embedded `error` is recorded and stays unresolved, though another
+    /// language declares a function of that name; it brings `Error`.
+    #[test]
+    fn w715b_an_embedded_error_stays_unresolved() {
+        let project = Project::new()
+            .file("go.mod", "module example.com/app\n\ngo 1.22\n")
+            .file(
+                "e/e.go",
+                "package e\n\ntype Coded interface {\n\terror\n\tCode() int\n}\n\ntype statusErr struct {\n\terror\n}\n\nfunc (statusErr) Code() int { return 0 }\n",
+            )
+            .file("web/log.js", "export function error() {}\n")
+            .index();
+        let graph = graph_of(&project);
+        for selector in ["struct statusErr", "interface Coded"] {
+            assert_eq!(
+                graph
+                    .unresolved_matching(selector, "extends", "error")
+                    .len(),
+                1,
+                "{selector}:\n{}",
+                graph.report()
+            );
+            for kind in ["extends", "implements"] {
+                assert!(
+                    graph
+                        .edges_matching(selector, kind, "function error")
+                        .is_empty()
+                );
+            }
+        }
+        assert_eq!(implementers(graph, "interface Coded"), ["e.statusErr"]);
+    }
+}
+
+/// W7-15c: the Go dispatch passes, a generated gRPC server stub's methods to
+/// the hand-written server's (`go-grpc-stub-impl`) and gin's handler-chain
+/// dispatcher to the named handlers its registrations pass
+/// (`gin-middleware-chain`).
+mod go_dispatch_synthesis {
+    use std::fmt::Write as _;
+
+    use super::support::{EdgeRow, Graph, Project, graph_of};
+
+    /// The `calls` edges the pass `by` made.
+    fn synthesized_by<'g>(graph: &'g Graph, by: &'g str) -> impl Iterator<Item = &'g EdgeRow> {
+        graph
+            .edges
+            .iter()
+            .filter(move |edge| edge.kind == "calls" && edge.metadata["synthesizedBy"] == by)
+    }
+
+    /// Every `calls` edge the pass `by` made, as `source -> target via
+    /// <via> @<registeredAt> line <line>` over qualified names, sorted; each
+    /// is heuristic and has no column.
+    #[track_caller]
+    fn links(graph: &Graph, by: &str) -> Vec<String> {
+        let name = |id: &str| {
+            graph
+                .node(id)
+                .map_or_else(|| "?".to_string(), |node| node.qualified_name.clone())
+        };
+        let mut links: Vec<String> = synthesized_by(graph, by)
+            .map(|edge| {
+                assert_eq!(edge.provenance.as_deref(), Some("heuristic"), "{edge:?}");
+                assert_eq!(edge.col, None, "{edge:?}");
+                format!(
+                    "{} -> {} via {} @{} line {}",
+                    name(&edge.source),
+                    name(&edge.target),
+                    edge.metadata["via"].as_str().unwrap_or("?"),
+                    edge.metadata["registeredAt"].as_str().unwrap_or("?"),
+                    edge.line
+                        .map_or_else(|| "?".to_string(), |line| line.to_string()),
+                )
+            })
+            .collect();
+        links.sort();
+        links
+    }
+
+    /// The 1-based line of `text` holding `needle`.
+    #[track_caller]
+    fn line_of(text: &str, needle: &str) -> usize {
+        text.split('\n')
+            .position(|line| line.contains(needle))
+            .unwrap_or_else(|| panic!("no line holds {needle:?}"))
+            + 1
+    }
+
+    const GO_MOD: &str = "module ginapp\n\ngo 1.21\n";
+
+    /// `gin.go` of upstream's `gin-middleware-chain.test.ts`: the chain
+    /// dispatcher and the registration surface.
+    const GIN_GO: &str = concat!(
+        "package gin\n",
+        "\n",
+        "type HandlerFunc func(*Context)\n",
+        "type HandlersChain []HandlerFunc\n",
+        "\n",
+        "type Context struct {\n",
+        "\thandlers HandlersChain\n",
+        "\tindex    int8\n",
+        "}\n",
+        "\n",
+        "func (c *Context) Next() {\n",
+        "\tc.index++\n",
+        "\tfor c.index < int8(len(c.handlers)) {\n",
+        "\t\tc.handlers[c.index](c)\n",
+        "\t\tc.index++\n",
+        "\t}\n",
+        "}\n",
+        "\n",
+        "type Engine struct {\n",
+        "\tHandlers HandlersChain\n",
+        "}\n",
+        "\n",
+        "func (e *Engine) Use(middleware ...HandlerFunc) {\n",
+        "\te.Handlers = append(e.Handlers, middleware...)\n",
+        "}\n",
+        "\n",
+        "func (e *Engine) GET(path string, handlers ...HandlerFunc) {}\n",
+    );
+
+    /// `app.go` of the same test: named middleware, a named route handler
+    /// and an inline closure.
+    const GIN_APP_GO: &str = concat!(
+        "package gin\n",
+        "\n",
+        "func Logger(c *Context)   {}\n",
+        "func Recovery(c *Context) {}\n",
+        "func getUser(c *Context)  {}\n",
+        "\n",
+        "func setup() {\n",
+        "\te := &Engine{}\n",
+        "\te.Use(Logger, Recovery)\n",
+        "\te.GET(\"/users\", getUser)\n",
+        "\te.GET(\"/inline\", func(c *Context) {})\n",
+        "}\n",
+    );
+
+    /// Upstream `gin-middleware-chain.test.ts`: `Context.Next` links to the
+    /// three named handlers registered through `Use` and `GET`, each with
+    /// its registration site; the inline closure is anonymous.
+    #[test]
+    fn w715c_gin_links_next_to_the_named_handlers() {
+        let project = Project::new()
+            .file("go.mod", GO_MOD)
+            .file("gin.go", GIN_GO)
+            .file("app.go", GIN_APP_GO)
+            .index();
+        let graph = graph_of(&project);
+        let next = line_of(GIN_GO, "func (c *Context) Next()");
+        let uses = line_of(GIN_APP_GO, "e.Use(Logger, Recovery)");
+        let get = line_of(GIN_APP_GO, "e.GET(\"/users\", getUser)");
+        assert_eq!(
+            links(graph, "gin-middleware-chain"),
+            [
+                format!("Context::Next -> Logger via Logger @app.go:{uses} line {next}"),
+                format!("Context::Next -> Recovery via Recovery @app.go:{uses} line {next}"),
+                format!("Context::Next -> getUser via getUser @app.go:{get} line {next}"),
+            ],
+            "{}",
+            graph.report()
+        );
+        assert!(
+            graph
+                .edges_matching("method Context::Next", "calls", "method Context::Next")
+                .is_empty()
+        );
+    }
+
+    /// Without a method calling into a `handlers` slice by index, the
+    /// registrations link nothing: a gin user's repository holds them alone.
+    #[test]
+    fn w715c_gin_needs_a_dispatcher() {
+        let indexed_only = GIN_GO.replace(
+            "\t\tc.handlers[c.index](c)\n",
+            "\t\t_ = c.handlers[c.index]\n",
+        );
+        let project = Project::new()
+            .file("go.mod", GO_MOD)
+            .file("gin.go", &indexed_only)
+            .file("app.go", GIN_APP_GO)
+            .index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            links(graph, "gin-middleware-chain"),
+            Vec::<String>::new(),
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// `r1.go`: registrations of each shape the pass reads.
+    const GIN_SHAPES_GO: &str = concat!(
+        "package gin\n",
+        "\n",
+        "func Logger() HandlerFunc { return nil }\n",
+        "func Auth(c *Context)     {}\n",
+        "func Hidden(c *Context)   {}\n",
+        "func Blocked(c *Context)  {}\n",
+        "func Quoted(c *Context)   {}\n",
+        "func Handled(c *Context)  {}\n",
+        "\n",
+        "func routes(e *Engine, c *Context) {\n",
+        "\t// e.Use(Hidden)\n",
+        "\t/* e.GET(\"/blocked\", Blocked) */\n",
+        "\te.Use(gin.Logger(), Auth)\n",
+        "\te.GET(\"Quoted\", func(c *Context) { Quoted(c) })\n",
+        "\te.Handle(\"GET\", \"/handled\", Handled)\n",
+        "\te.Use(c.Next)\n",
+        "}\n",
+    );
+
+    /// `r3.go`: a registration spaced from its parenthesis, in a file
+    /// holding no unspaced one, which upstream's prefilter skips.
+    const GIN_SPACED_GO: &str = concat!(
+        "package gin\n",
+        "\n",
+        "func Spaced(c *Context) {}\n",
+        "\n",
+        "func spaced(e *Engine) {\n",
+        "\te.Use (Spaced)\n",
+        "}\n",
+    );
+
+    /// `r2.go`: a later file registering `Auth` again.
+    const GIN_AGAIN_GO: &str = concat!(
+        "package gin\n",
+        "\n",
+        "func more(e *Engine) {\n",
+        "\te.GET(\"/again\", Auth)\n",
+        "}\n",
+    );
+
+    /// A registration in a comment counts for nothing, a string or a
+    /// function literal names no handler, `gin.Logger()` names `Logger`,
+    /// `Handle` registers too, the dispatcher registered as a handler links
+    /// to nothing, a name keeps its first registration site in path order,
+    /// and a file is read only when it holds `.Use(` or a verb call written
+    /// without a space.
+    #[test]
+    fn w715c_gin_reads_named_handlers_outside_comments() {
+        let project = Project::new()
+            .file("go.mod", GO_MOD)
+            .file("gin.go", GIN_GO)
+            .file("r1.go", GIN_SHAPES_GO)
+            .file("r2.go", GIN_AGAIN_GO)
+            .file("r3.go", GIN_SPACED_GO)
+            .index();
+        let graph = graph_of(&project);
+        let next = line_of(GIN_GO, "func (c *Context) Next()");
+        let uses = line_of(GIN_SHAPES_GO, "e.Use(gin.Logger(), Auth)");
+        let handle = line_of(GIN_SHAPES_GO, "e.Handle(");
+        assert_eq!(
+            links(graph, "gin-middleware-chain"),
+            [
+                format!("Context::Next -> Auth via Auth @r1.go:{uses} line {next}"),
+                format!("Context::Next -> Handled via Handled @r1.go:{handle} line {next}"),
+                format!("Context::Next -> Logger via Logger @r1.go:{uses} line {next}"),
+            ],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// A dispatcher links the first forty handlers the registrations name,
+    /// in their order; each dispatcher has its own forty.
+    #[test]
+    fn w715c_gin_links_at_most_forty_handlers_a_dispatcher() {
+        let mut handlers = String::from("package gin\n\n");
+        let mut names = Vec::new();
+        for at in 0..41 {
+            writeln!(handlers, "func H{at}(c *Context) {{}}").unwrap();
+            names.push(format!("H{at}"));
+        }
+        writeln!(
+            handlers,
+            "\nfunc wire(e *Engine) {{\n\te.Use({})\n}}",
+            names.join(", ")
+        )
+        .unwrap();
+        writeln!(
+            handlers,
+            "\ntype Router struct {{\n\thandlers HandlersChain\n}}\n\nfunc (r *Router) run() {{\n\tr.handlers[0](nil)\n}}"
+        )
+        .unwrap();
+        let project = Project::new()
+            .file("go.mod", GO_MOD)
+            .file("gin.go", GIN_GO)
+            .file("handlers.go", &handlers)
+            .index();
+        let graph = graph_of(&project);
+        for dispatcher in ["Context::Next", "Router::run"] {
+            let mut targets: Vec<String> = links(graph, "gin-middleware-chain")
+                .into_iter()
+                .filter_map(|link| {
+                    let rest = link.strip_prefix(&format!("{dispatcher} -> "))?;
+                    Some(rest.split(' ').next().unwrap_or_default().to_string())
+                })
+                .collect();
+            targets.sort();
+            let mut expected: Vec<String> = names[..40].to_vec();
+            expected.sort();
+            assert_eq!(targets, expected, "{dispatcher}:\n{}", graph.report());
+        }
+    }
+
+    /// Handlers that share a name link only when the registration's file
+    /// holds exactly one of them, or the project holds exactly one (as the
+    /// emitter pass picks its handler; upstream links an arbitrary one).
+    /// The candidates are Go functions and methods: a Go type or another
+    /// language's function of the name counts for nothing, and neither does a
+    /// registration outside a `.go` file.
+    #[test]
+    fn w715c_gin_links_a_shared_handler_name_only_when_unique() {
+        let project = Project::new()
+            .file("go.mod", GO_MOD)
+            .file("gin.go", GIN_GO)
+            .file("mw/a/auth.go", "package a\n\nfunc Auth(c *Context)  {}\nfunc Trace(c *Context) {}\n")
+            .file("mw/b/auth.go", "package b\n\nfunc Auth(c *Context)    {}\nfunc Recover(c *Context) {}\n")
+            .file("mw/c/types.go", "package c\n\ntype Recover struct{}\n")
+            .file("web/auth.js", "export function Recover() {}\napp.GET('/x', Shadow);\n")
+            .file(
+                "app/routes.go",
+                "package app\n\nfunc Trace(c *Context)  {}\nfunc Shadow(c *Context) {}\n\nfunc routes(e *Engine) {\n\te.Use(Auth, Trace, Recover)\n}\n",
+            )
+            .index();
+        let graph = graph_of(&project);
+        let next = line_of(GIN_GO, "func (c *Context) Next()");
+        let mut targets: Vec<String> = synthesized_by(graph, "gin-middleware-chain")
+            .map(|edge| graph.describe(&edge.target))
+            .collect();
+        targets.sort();
+        assert_eq!(
+            targets,
+            [
+                "function Recover @mw/b/auth.go:4",
+                "function Trace @app/routes.go:3",
+            ],
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            links(graph, "gin-middleware-chain"),
+            [
+                format!("Context::Next -> Recover via Recover @app/routes.go:7 line {next}"),
+                format!("Context::Next -> Trace via Trace @app/routes.go:7 line {next}"),
+            ]
+        );
+    }
+
+    /// `svc/greeter_grpc.pb.go`: protoc-gen-go-grpc's server stub, with
+    /// gRPC's embedding markers, and the generated client.
+    const GREETER_GRPC_GO: &str = concat!(
+        "package svc\n",
+        "\n",
+        "type UnimplementedGreeterServer struct{}\n",
+        "\n",
+        "func (UnimplementedGreeterServer) SayHello(ctx Context, in *HelloRequest) (*HelloReply, error) {\n",
+        "\treturn nil, nil\n",
+        "}\n",
+        "func (UnimplementedGreeterServer) SayBye(ctx Context, in *HelloRequest) (*HelloReply, error) {\n",
+        "\treturn nil, nil\n",
+        "}\n",
+        "func (UnimplementedGreeterServer) mustEmbedUnimplementedGreeterServer() {}\n",
+        "func (UnimplementedGreeterServer) testEmbeddedByValue()                 {}\n",
+        "\n",
+        "type greeterClient struct{}\n",
+        "\n",
+        "func (c *greeterClient) SayHello(ctx Context, in *HelloRequest) (*HelloReply, error) {\n",
+        "\treturn nil, nil\n",
+        "}\n",
+        "func (c *greeterClient) SayBye(ctx Context, in *HelloRequest) (*HelloReply, error) {\n",
+        "\treturn nil, nil\n",
+        "}\n",
+    );
+
+    /// `svc/server.go`: the hand-written server, one of its methods.
+    const GREETER_SERVER_GO: &str = concat!(
+        "package svc\n",
+        "\n",
+        "type Context interface{}\n",
+        "type HelloRequest struct{}\n",
+        "type HelloReply struct{}\n",
+        "\n",
+        "type server struct {\n",
+        "\tUnimplementedGreeterServer\n",
+        "}\n",
+        "\n",
+        "func (s *server) SayHello(ctx Context, in *HelloRequest) (*HelloReply, error) {\n",
+        "\treturn &HelloReply{}, nil\n",
+        "}\n",
+    );
+
+    /// `svc/bye.go`: the server's other method, in a file of its own.
+    const GREETER_BYE_GO: &str = concat!(
+        "package svc\n",
+        "\n",
+        "func (s *server) SayBye(ctx Context, in *HelloRequest) (*HelloReply, error) {\n",
+        "\treturn &HelloReply{}, nil\n",
+        "}\n",
+    );
+
+    /// `svc/fake.go`: a test double declaring every RPC and more.
+    const GREETER_FAKE_GO: &str = concat!(
+        "package svc\n",
+        "\n",
+        "type fakeServer struct{}\n",
+        "\n",
+        "func (fakeServer) SayHello(ctx Context, in *HelloRequest) (*HelloReply, error) { return nil, nil }\n",
+        "func (fakeServer) SayBye(ctx Context, in *HelloRequest) (*HelloReply, error)   { return nil, nil }\n",
+        "func (fakeServer) Reset()                                                      {}\n",
+    );
+
+    /// `svc/mock_greeter.go`: mockgen's default output name, a generated
+    /// file (KEEP-RUST: by its file name in any directory; upstream's
+    /// `/^mock_[^/]+\.go$/` matches the root's alone).
+    const GREETER_MOCK_GO: &str = concat!(
+        "package svc\n",
+        "\n",
+        "type MockGreeterServer struct{}\n",
+        "\n",
+        "func (MockGreeterServer) SayHello(ctx Context, in *HelloRequest) (*HelloReply, error) { return nil, nil }\n",
+        "func (MockGreeterServer) SayBye(ctx Context, in *HelloRequest) (*HelloReply, error)   { return nil, nil }\n",
+    );
+
+    /// Each RPC of a generated stub links to the same-named method of every
+    /// hand-written struct declaring all the RPCs, a method of another file
+    /// included; a struct of a generated file is no server, and gRPC's
+    /// embedding markers are no RPCs.
+    #[test]
+    fn w715c_grpc_stub_links_to_hand_written_servers() {
+        let project = Project::new()
+            .file("go.mod", "module rpcapp\n\ngo 1.21\n")
+            .file("svc/greeter_grpc.pb.go", GREETER_GRPC_GO)
+            .file("svc/server.go", GREETER_SERVER_GO)
+            .file("svc/bye.go", GREETER_BYE_GO)
+            .file("svc/fake.go", GREETER_FAKE_GO)
+            .file("svc/mock_greeter.go", GREETER_MOCK_GO)
+            .index();
+        let graph = graph_of(&project);
+        let hello = line_of(GREETER_GRPC_GO, "UnimplementedGreeterServer) SayHello");
+        let bye = line_of(GREETER_GRPC_GO, "UnimplementedGreeterServer) SayBye");
+        let fake_hello = line_of(GREETER_FAKE_GO, "SayHello");
+        let fake_bye = line_of(GREETER_FAKE_GO, "SayBye");
+        let server_hello = line_of(GREETER_SERVER_GO, "SayHello");
+        let server_bye = line_of(GREETER_BYE_GO, "SayBye");
+        assert_eq!(
+            links(graph, "go-grpc-stub-impl"),
+            [
+                format!(
+                    "UnimplementedGreeterServer::SayBye -> fakeServer::SayBye via SayBye @svc/fake.go:{fake_bye} line {bye}"
+                ),
+                format!(
+                    "UnimplementedGreeterServer::SayBye -> server::SayBye via SayBye @svc/bye.go:{server_bye} line {bye}"
+                ),
+                format!(
+                    "UnimplementedGreeterServer::SayHello -> fakeServer::SayHello via SayHello @svc/fake.go:{fake_hello} line {hello}"
+                ),
+                format!(
+                    "UnimplementedGreeterServer::SayHello -> server::SayHello via SayHello @svc/server.go:{server_hello} line {hello}"
+                ),
+            ],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// No edge without a generated stub with an RPC and a struct declaring
+    /// every one: a hand-written `Unimplemented*Server`, a server missing an
+    /// RPC and a stub of markers alone link nothing.
+    #[test]
+    fn w715c_grpc_needs_a_generated_stub_and_every_rpc() {
+        let project = Project::new()
+            .file("go.mod", "module rpcapp\n\ngo 1.21\n")
+            .file(
+                "svc/ping_grpc.pb.go",
+                concat!(
+                    "package svc\n",
+                    "\n",
+                    "type UnimplementedPingServer struct{}\n",
+                    "\n",
+                    "func (UnimplementedPingServer) Ping() {}\n",
+                    "func (UnimplementedPingServer) Pong() {}\n",
+                    "\n",
+                    "type UnimplementedNoopServer struct{}\n",
+                    "\n",
+                    "func (UnimplementedNoopServer) mustEmbedUnimplementedNoopServer() {}\n",
+                    "func (UnimplementedNoopServer) testEmbeddedByValue()              {}\n",
+                ),
+            )
+            .file(
+                "svc/ping.go",
+                concat!(
+                    "package svc\n",
+                    "\n",
+                    "type pinger struct{}\n",
+                    "\n",
+                    "func (pinger) Ping() {}\n",
+                    "\n",
+                    "type fullPinger struct{}\n",
+                    "\n",
+                    "func (fullPinger) Ping() {}\n",
+                    "func (fullPinger) Pong() {}\n",
+                    "\n",
+                    "type noop struct{}\n",
+                    "\n",
+                    "func (noop) mustEmbedUnimplementedNoopServer() {}\n",
+                    "func (noop) testEmbeddedByValue()              {}\n",
+                ),
+            )
+            .file(
+                "svc/echo.go",
+                concat!(
+                    "package svc\n",
+                    "\n",
+                    "type UnimplementedEchoServer struct{}\n",
+                    "\n",
+                    "func (UnimplementedEchoServer) Echo() {}\n",
+                    "\n",
+                    "type echoer struct{}\n",
+                    "\n",
+                    "func (echoer) Echo() {}\n",
+                ),
+            )
+            .index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            links(graph, "go-grpc-stub-impl"),
+            [
+                "UnimplementedPingServer::Ping -> fullPinger::Ping via Ping @svc/ping.go:9 line 5",
+                "UnimplementedPingServer::Pong -> fullPinger::Pong via Pong @svc/ping.go:10 line 6",
+            ],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// A stub and a server link at most forty RPCs; each server has its own
+    /// forty.
+    #[test]
+    fn w715c_grpc_links_at_most_forty_rpcs_a_server() {
+        let mut stub = String::from("package svc\n\ntype UnimplementedBigServer struct{}\n\n");
+        let mut big = String::from("package svc\n\ntype big struct{}\ntype big2 struct{}\n\n");
+        for at in 0..41 {
+            writeln!(stub, "func (UnimplementedBigServer) M{at}() {{}}").unwrap();
+            writeln!(big, "func (big) M{at}()  {{}}\nfunc (big2) M{at}() {{}}").unwrap();
+        }
+        let project = Project::new()
+            .file("go.mod", "module rpcapp\n\ngo 1.21\n")
+            .file("svc/big_grpc.pb.go", &stub)
+            .file("svc/big.go", &big)
+            .index();
+        let graph = graph_of(&project);
+        for server in ["big", "big2"] {
+            let count = synthesized_by(graph, "go-grpc-stub-impl")
+                .filter(|edge| {
+                    graph.node(&edge.target).is_some_and(|node| {
+                        node.qualified_name
+                            .strip_suffix(&format!("::{}", node.name))
+                            == Some(server)
+                    })
+                })
+                .count();
+            assert_eq!(count, 40, "{server}:\n{}", graph.report());
+        }
+    }
+}
+
+/// W7-15d0: every Go `var` and `const` spec is a node with its initializer
+/// walked under it (upstream #2680, #2682, #693 and the Go half of #2743).
+mod go_var_specs {
+    use super::support::{Graph, Project, graph_of};
+
+    /// `SOURCE` of upstream `go-var-groups.test.ts`.
+    const SHAPES_GO: &str = concat!(
+        "// Package shapes is documented.\n",
+        "package shapes\n",
+        "\n",
+        "import (\n",
+        "\t\"errors\"\n",
+        "\t\"fmt\"\n",
+        ")\n",
+        "\n",
+        "// Errors returned by the shapes package.\n",
+        "var (\n",
+        "\t// ErrNoSides is returned for a shape without sides.\n",
+        "\tErrNoSides = errors.New(\"no sides\")\n",
+        "\tErrTooMany = newError(\"too many sides\")\n",
+        ")\n",
+        "\n",
+        "var (\n",
+        "\tregistry = map[string]int{}\n",
+        "\t// DefaultName is documented inside its group.\n",
+        "\tDefaultName string\n",
+        ")\n",
+        "\n",
+        "// single is documented above its own declaration.\n",
+        "var single = 3\n",
+        "\n",
+        "func newError(msg string) error { return fmt.Errorf(\"shapes: %s\", msg) }\n",
+        "\n",
+        "func check(n int) error {\n",
+        "\tif n == 0 {\n",
+        "\t\treturn ErrNoSides\n",
+        "\t}\n",
+        "\treturn ErrTooMany\n",
+        "}\n",
+    );
+
+    /// The one node `selector` matches.
+    #[track_caller]
+    fn one<'g>(graph: &'g Graph, selector: &str) -> &'g super::support::NodeRow {
+        let found = graph.nodes_matching(selector);
+        assert_eq!(found.len(), 1, "{selector}: {found:?}\n{}", graph.report());
+        found[0]
+    }
+
+    /// Upstream `go-var-groups.test.ts`, LF and CRLF: each member of a
+    /// `var ( … )` group is a variable the file contains, with its own doc
+    /// or the group's; a call in a member's initializer is its own; a read
+    /// of a member in the same file references it.
+    #[test]
+    fn w715d0_every_member_of_a_var_group_is_a_variable() {
+        for crlf in [false, true] {
+            let source = if crlf {
+                SHAPES_GO.replace('\n', "\r\n")
+            } else {
+                SHAPES_GO.to_string()
+            };
+            let project = Project::new()
+                .file("go.mod", "module example.com/shapes\n\ngo 1.22\n")
+                .file("shapes/shapes.go", &source)
+                .index();
+            let graph = graph_of(&project);
+            let docs: Vec<(&str, Option<&str>)> = [
+                "ErrNoSides",
+                "ErrTooMany",
+                "registry",
+                "DefaultName",
+                "single",
+            ]
+            .into_iter()
+            .map(|name| {
+                let node = one(graph, &format!("variable {name}"));
+                (name, node.docstring.as_deref())
+            })
+            .collect();
+            assert_eq!(
+                docs,
+                [
+                    (
+                        "ErrNoSides",
+                        Some("ErrNoSides is returned for a shape without sides.")
+                    ),
+                    ("ErrTooMany", Some("Errors returned by the shapes package.")),
+                    ("registry", None),
+                    (
+                        "DefaultName",
+                        Some("DefaultName is documented inside its group.")
+                    ),
+                    (
+                        "single",
+                        Some("single is documented above its own declaration.")
+                    ),
+                ],
+                "crlf {crlf}"
+            );
+            for name in ["ErrNoSides", "ErrTooMany", "registry", "DefaultName"] {
+                assert_eq!(
+                    graph
+                        .edges_matching(
+                            "file:shapes/shapes.go",
+                            "contains",
+                            &format!("variable {name}")
+                        )
+                        .len(),
+                    1,
+                    "file contains {name}, crlf {crlf}\n{}",
+                    graph.report()
+                );
+            }
+            assert_eq!(
+                graph
+                    .edges_matching("variable ErrTooMany", "calls", "function newError")
+                    .len(),
+                1,
+                "ErrTooMany calls newError, crlf {crlf}\n{}",
+                graph.report()
+            );
+            for name in ["ErrNoSides", "ErrTooMany"] {
+                assert_eq!(
+                    graph
+                        .edges_matching("function check", "references", &format!("variable {name}"))
+                        .len(),
+                    1,
+                    "check references {name}, crlf {crlf}\n{}",
+                    graph.report()
+                );
+            }
+        }
+    }
+
+    /// Upstream `function-ref.test.ts` (INITIALIZER WALKS, Go): a function
+    /// in an initializer is referenced once, by the variable it declares.
+    #[test]
+    fn w715d0_a_function_in_an_initializer_is_referenced_once() {
+        let project = Project::new()
+            .file("go.mod", "module example.com/app\n\ngo 1.22\n")
+            .file(
+                "handlers.go",
+                "package main\n\nfunc goHome() {}\n\nvar handlers = map[string]func(){\"home\": goHome}",
+            )
+            .index();
+        let graph = graph_of(&project);
+        let sources: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|edge| {
+                edge.kind == "references"
+                    && edge.metadata["fnRef"] == true
+                    && graph
+                        .node(&edge.target)
+                        .is_some_and(|node| node.name == "goHome")
+            })
+            .map(|edge| graph.describe(&edge.source))
+            .collect();
+        assert_eq!(
+            sources,
+            ["variable handlers @handlers.go:5"],
+            "{}",
+            graph.report()
+        );
+    }
+
+    const SPECS_GO: &str = concat!(
+        "package main\n",
+        "\n",
+        "type Options struct {\n",
+        "\tName string\n",
+        "}\n",
+        "\n",
+        "const (\n",
+        "\tA = iota\n",
+        "\tB\n",
+        "\tC\n",
+        ")\n",
+        "\n",
+        "var p, q = 1, 2\n",
+        "\n",
+        "var x Options\n",
+        "\n",
+        "var long = Options{\n",
+        "\tName: \"long\",\n",
+        "}\n",
+    );
+
+    /// Each spec is one node named by its first identifier and spanning the
+    /// spec; its signature is its last child's text, as upstream reads it
+    /// (`var x Options` reads `= Options`).
+    #[test]
+    fn w715d0_each_spec_is_one_node_over_the_spec() {
+        let project = Project::new()
+            .file("go.mod", "module example.com/app\n\ngo 1.22\n")
+            .file("specs.go", SPECS_GO)
+            .index();
+        let graph = graph_of(&project);
+        let row = |selector: &str| {
+            let node = one(graph, selector);
+            (node.start_line, node.end_line, node.signature.clone())
+        };
+        assert_eq!(row("constant A"), (8, 8, Some("= iota".to_string())));
+        assert_eq!(row("constant B"), (9, 9, None));
+        assert_eq!(row("constant C"), (10, 10, None));
+        assert_eq!(row("variable p"), (13, 13, Some("= 1, 2".to_string())));
+        assert!(
+            graph.nodes_matching("variable q").is_empty(),
+            "{}",
+            graph.report()
+        );
+        assert_eq!(row("variable x"), (15, 15, Some("= Options".to_string())));
+        assert_eq!(
+            row("variable long"),
+            (17, 19, Some("= Options{\n\tName: \"long\",\n}".to_string()))
+        );
+    }
+
+    const INIT_GO: &str = concat!(
+        "package main\n",
+        "\n",
+        "type Command struct {\n",
+        "\tRunE func(args []string) error\n",
+        "}\n",
+        "\n",
+        "type Options struct {\n",
+        "\tF func() error\n",
+        "}\n",
+        "\n",
+        "func run(args []string) error { return nil }\n",
+        "func setup()                   {}\n",
+        "func h() error                 { return nil }\n",
+        "func newThing() *Options       { return &Options{} }\n",
+        "\n",
+        "var rootCmd = &Command{\n",
+        "\tRunE: func(args []string) error {\n",
+        "\t\tsetup()\n",
+        "\t\treturn run(args)\n",
+        "\t},\n",
+        "}\n",
+        "\n",
+        "var d = Options{F: h}\n",
+        "\n",
+        "var made = newThing()\n",
+        "\n",
+        "func body() {\n",
+        "\tvar local = newThing()\n",
+        "\tother := newThing()\n",
+        "\t_, _ = local, other\n",
+        "}\n",
+    );
+
+    /// A package-level initializer is walked under the variable it
+    /// declares: the calls in a cobra-shaped closure, a composite literal
+    /// and its function value, a call. A function body's `var` and `:=`
+    /// stay locals whose calls are the function's.
+    #[test]
+    fn w715d0_package_initializers_are_their_variables() {
+        let project = Project::new()
+            .file("go.mod", "module example.com/app\n\ngo 1.22\n")
+            .file("init.go", INIT_GO)
+            .index();
+        let graph = graph_of(&project);
+        for (source, kind, target) in [
+            ("variable rootCmd", "instantiates", "struct Command"),
+            ("variable rootCmd", "calls", "function setup"),
+            ("variable rootCmd", "calls", "function run"),
+            ("variable d", "instantiates", "struct Options"),
+            ("variable d", "references", "function h"),
+            ("variable made", "calls", "function newThing"),
+        ] {
+            assert_eq!(
+                graph.edges_matching(source, kind, target).len(),
+                1,
+                "{source} -[{kind}]-> {target}\n{}",
+                graph.report()
+            );
+        }
+        for target in ["function setup", "function run", "function h"] {
+            assert!(
+                graph
+                    .edges_matching("file:init.go", "calls", target)
+                    .is_empty()
+                    && graph
+                        .edges_matching("file:init.go", "references", target)
+                        .is_empty(),
+                "{target} is the variable's\n{}",
+                graph.report()
+            );
+        }
+        assert!(
+            graph.nodes_matching("variable local").is_empty(),
+            "{}",
+            graph.report()
+        );
+        assert!(
+            graph.nodes_matching("variable other").is_empty(),
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            graph
+                .edges_matching("function body", "calls", "function newThing")
+                .len(),
+            2,
+            "{}",
+            graph.report()
+        );
+    }
+}
+
+mod go_func_field {
+    use super::support::{Graph, Project, codegraph, graph_of};
+
+    /// `go.mod` of upstream's `go-func-field-dispatch.test.ts`.
+    const GO_MOD: &str = concat!("module example.com/app\n", "\n", "go 1.22\n",);
+
+    /// `discovery/refresh/refresh.go` of upstream's `go-func-field-dispatch.test.ts`.
+    const DISCOVERY_REFRESH_REFRESH_GO: &str = concat!(
+        "package refresh\n",
+        "\n",
+        "import \"context\"\n",
+        "\n",
+        "type Group struct{ Source string }\n",
+        "\n",
+        "// Options are the options for a refreshing discovery.\n",
+        "type Options struct {\n",
+        "\tMech     string\n",
+        "\tInterval int\n",
+        "\tRefreshF func(ctx context.Context) ([]*Group, error)\n",
+        "}\n",
+        "\n",
+        "// Discovery runs a refresh function on an interval.\n",
+        "type Discovery struct {\n",
+        "\tinterval int\n",
+        "\trefreshf func(ctx context.Context) ([]*Group, error)\n",
+        "}\n",
+        "\n",
+        "func NewDiscovery(opts Options) *Discovery {\n",
+        "\treturn &Discovery{\n",
+        "\t\tinterval: opts.Interval,\n",
+        "\t\trefreshf: opts.RefreshF,\n",
+        "\t}\n",
+        "}\n",
+        "\n",
+        "func (d *Discovery) Run(ctx context.Context) {\n",
+        "\td.refresh(ctx)\n",
+        "}\n",
+        "\n",
+        "func (d *Discovery) refresh(ctx context.Context) ([]*Group, error) {\n",
+        "\ttgs, err := d.refreshf(ctx)\n",
+        "\treturn tgs, err\n",
+        "}\n",
+    );
+
+    /// `discovery/aws/ec2.go` of upstream's `go-func-field-dispatch.test.ts`.
+    const DISCOVERY_AWS_EC2_GO: &str = concat!(
+        "package aws\n",
+        "\n",
+        "import (\n",
+        "\t\"context\"\n",
+        "\n",
+        "\t\"example.com/app/discovery/refresh\"\n",
+        ")\n",
+        "\n",
+        "type EC2Discovery struct {\n",
+        "\t*refresh.Discovery\n",
+        "\tregion string\n",
+        "}\n",
+        "\n",
+        "func NewEC2Discovery(region string) *EC2Discovery {\n",
+        "\td := &EC2Discovery{region: region}\n",
+        "\td.Discovery = refresh.NewDiscovery(refresh.Options{\n",
+        "\t\tMech:     \"ec2\",\n",
+        "\t\tRefreshF: d.refresh,\n",
+        "\t})\n",
+        "\treturn d\n",
+        "}\n",
+        "\n",
+        "func (d *EC2Discovery) refresh(ctx context.Context) ([]*refresh.Group, error) {\n",
+        "\treturn []*refresh.Group{{Source: d.region}}, nil\n",
+        "}\n",
+    );
+
+    /// `discovery/hetzner/hetzner.go` of upstream's `go-func-field-dispatch.test.ts`.
+    const DISCOVERY_HETZNER_HETZNER_GO: &str = concat!(
+        "package hetzner\n",
+        "\n",
+        "import (\n",
+        "\t\"context\"\n",
+        "\n",
+        "\t\"example.com/app/discovery/refresh\"\n",
+        ")\n",
+        "\n",
+        "type refresher interface {\n",
+        "\trefresh(ctx context.Context) ([]*refresh.Group, error)\n",
+        "}\n",
+        "\n",
+        "type robotDiscovery struct{ endpoint string }\n",
+        "\n",
+        "func (d *robotDiscovery) refresh(ctx context.Context) ([]*refresh.Group, error) {\n",
+        "\treturn nil, nil\n",
+        "}\n",
+        "\n",
+        "type Discovery struct {\n",
+        "\t*refresh.Discovery\n",
+        "}\n",
+        "\n",
+        "func newRefresher(endpoint string) (refresher, error) {\n",
+        "\treturn &robotDiscovery{endpoint: endpoint}, nil\n",
+        "}\n",
+        "\n",
+        "func NewDiscovery(endpoint string) (*Discovery, error) {\n",
+        "\tr, err := newRefresher(endpoint)\n",
+        "\tif err != nil {\n",
+        "\t\treturn nil, err\n",
+        "\t}\n",
+        "\treturn &Discovery{\n",
+        "\t\tDiscovery: refresh.NewDiscovery(refresh.Options{\n",
+        "\t\t\tMech:     \"hetzner\",\n",
+        "\t\t\tRefreshF: r.refresh,\n",
+        "\t\t}),\n",
+        "\t}, nil\n",
+        "}\n",
+    );
+
+    /// `jobs/jobs.go` of upstream's `go-func-field-dispatch.test.ts`.
+    const JOBS_JOBS_GO: &str = concat!(
+        "package jobs\n",
+        "\n",
+        "type Job struct {\n",
+        "\tname string\n",
+        "\tfn   func() error\n",
+        "}\n",
+        "\n",
+        "func cleanup() error { return nil }\n",
+        "\n",
+        "func NewCleanupJob() *Job {\n",
+        "\treturn &Job{name: \"cleanup\", fn: cleanup}\n",
+        "}\n",
+        "\n",
+        "// What a parameter holds, or a function literal, is no function the project declares.\n",
+        "func NewJob(name string, fn func() error) *Job {\n",
+        "\treturn &Job{name: name, fn: fn}\n",
+        "}\n",
+        "\n",
+        "func NewInlineJob() *Job {\n",
+        "\treturn &Job{name: \"inline\", fn: func() error { return nil }}\n",
+        "}\n",
+        "\n",
+        "func (j *Job) Run() error {\n",
+        "\treturn j.fn()\n",
+        "}\n",
+    );
+
+    /// `hooks/hooks.go` of upstream's `go-func-field-dispatch.test.ts`.
+    const HOOKS_HOOKS_GO: &str = concat!(
+        "package hooks\n",
+        "\n",
+        "type Hook struct {\n",
+        "\tfn func() error\n",
+        "}\n",
+        "\n",
+        "func notify() error { return nil }\n",
+        "\n",
+        "func NewHook() *Hook {\n",
+        "\th := &Hook{}\n",
+        "\th.fn = notify\n",
+        "\treturn h\n",
+        "}\n",
+        "\n",
+        "func (h *Hook) Fire() error {\n",
+        "\treturn h.fn()\n",
+        "}\n",
+    );
+
+    /// `printer/printer.go` of upstream's `go-func-field-dispatch.test.ts`.
+    const PRINTER_PRINTER_GO: &str = concat!(
+        "package printer\n",
+        "\n",
+        "type printerRPC struct {\n",
+        "\tprefix string\n",
+        "\tp      func(v any)\n",
+        "}\n",
+        "\n",
+        "func printJSON(v any) {}\n",
+        "\n",
+        "func NewJSONPrinter() *printerRPC {\n",
+        "\treturn &printerRPC{\"json\", printJSON}\n",
+        "}\n",
+        "\n",
+        "func (p *printerRPC) Put(v any) { p.p(v) }\n",
+    );
+
+    /// `client/client.go` of upstream's `go-func-field-dispatch.test.ts`.
+    const CLIENT_CLIENT_GO: &str = concat!(
+        "package client\n",
+        "\n",
+        "type Client struct {\n",
+        "\tHook func()\n",
+        "}\n",
+        "\n",
+        "func defaultHook() {}\n",
+        "\n",
+        "func (c *Client) Do() { c.Hook() }\n",
+    );
+
+    /// `client/wire.go` of upstream's `go-func-field-dispatch.test.ts`.
+    const CLIENT_WIRE_GO: &str = concat!(
+        "package client\n",
+        "\n",
+        "func New() *Client {\n",
+        "\treturn &Client{Hook: defaultHook}\n",
+        "}\n",
+    );
+
+    /// `client/a_test.go` of upstream's `go-func-field-dispatch.test.ts`.
+    const CLIENT_A_TEST_GO: &str = concat!(
+        "package client\n",
+        "\n",
+        "import \"testing\"\n",
+        "\n",
+        "func newTestClient() *Client {\n",
+        "\treturn &Client{Hook: defaultHook}\n",
+        "}\n",
+        "\n",
+        "func TestDo(t *testing.T) {\n",
+        "\tc := newTestClient()\n",
+        "\tc.Hook()\n",
+        "}\n",
+    );
+
+    /// `other/other_test.go` of upstream's `go-func-field-dispatch.test.ts`.
+    const OTHER_OTHER_TEST_GO: &str = concat!(
+        "package other\n",
+        "\n",
+        "import (\n",
+        "\t\"testing\"\n",
+        "\n",
+        "\t\"example.com/app/client\"\n",
+        ")\n",
+        "\n",
+        "func otherHook() {}\n",
+        "\n",
+        "func TestOther(t *testing.T) {\n",
+        "\tc := client.New()\n",
+        "\tc.Hook = otherHook\n",
+        "\tc.Do()\n",
+        "}\n",
+    );
+
+    /// `server/server.go` of upstream's `go-func-field-dispatch.test.ts`.
+    const SERVER_SERVER_GO: &str = concat!(
+        "package server\n",
+        "\n",
+        "type HandlerFunc func(path string) error\n",
+        "\n",
+        "type Server struct {\n",
+        "\thandler HandlerFunc\n",
+        "}\n",
+        "\n",
+        "func (s *Server) serveStatic(path string) error { return nil }\n",
+        "\n",
+        "func New() *Server {\n",
+        "\ts := &Server{}\n",
+        "\ts.handler = HandlerFunc(s.serveStatic)\n",
+        "\treturn s\n",
+        "}\n",
+        "\n",
+        "func (s *Server) Handle(path string) error {\n",
+        "\treturn s.handler(path)\n",
+        "}\n",
+    );
+
+    const FILES: &[(&str, &str)] = &[
+        ("go.mod", GO_MOD),
+        ("discovery/refresh/refresh.go", DISCOVERY_REFRESH_REFRESH_GO),
+        ("discovery/aws/ec2.go", DISCOVERY_AWS_EC2_GO),
+        ("discovery/hetzner/hetzner.go", DISCOVERY_HETZNER_HETZNER_GO),
+        ("jobs/jobs.go", JOBS_JOBS_GO),
+        ("hooks/hooks.go", HOOKS_HOOKS_GO),
+        ("printer/printer.go", PRINTER_PRINTER_GO),
+        ("client/client.go", CLIENT_CLIENT_GO),
+        ("client/wire.go", CLIENT_WIRE_GO),
+        ("client/a_test.go", CLIENT_A_TEST_GO),
+        ("other/other_test.go", OTHER_OTHER_TEST_GO),
+        ("server/server.go", SERVER_SERVER_GO),
+    ];
+
+    /// The 1-based line of `text` holding `needle`.
+    #[track_caller]
+    fn line_of(text: &str, needle: &str) -> usize {
+        text.split('\n')
+            .position(|line| line.contains(needle))
+            .unwrap_or_else(|| panic!("no line holds {needle:?}"))
+            + 1
+    }
+
+    /// `file:line` of the line of fixture `file` holding `needle` (upstream
+    /// `siteOf`).
+    #[track_caller]
+    fn site_of(files: &[(&str, &str)], file: &str, needle: &str) -> String {
+        let (_, text) = files
+            .iter()
+            .find(|(path, _)| *path == file)
+            .unwrap_or_else(|| panic!("no fixture {file}"));
+        format!("{file}:{}", line_of(text, needle))
+    }
+
+    /// A project of `files`, indexed.
+    fn project_of(files: &[(&str, &str)]) -> super::support::Indexed {
+        files
+            .iter()
+            .fold(Project::new(), |project, (path, text)| {
+                project.file(path, text)
+            })
+            .index()
+    }
+
+    /// The id of the one function or method `qualified` in `file` (upstream
+    /// `fn`).
+    #[track_caller]
+    fn callable(graph: &Graph, qualified: &str, file: &str) -> String {
+        let found: Vec<_> = graph
+            .nodes
+            .iter()
+            .filter(|node| {
+                node.file_path == file
+                    && node.qualified_name == qualified
+                    && matches!(node.kind.as_str(), "function" | "method")
+            })
+            .collect();
+        assert_eq!(found.len(), 1, "{qualified} in {file}: {found:#?}");
+        found[0].id.clone()
+    }
+
+    /// The go-func-field edges out of `from`, as `target (file) @registeredAt
+    /// [field via]`, sorted (upstream `funcFieldCalls`); each is heuristic,
+    /// has no column, and sits on a line.
+    #[track_caller]
+    fn func_field_calls(graph: &Graph, from: &str) -> Vec<String> {
+        let mut calls: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|edge| {
+                edge.source == from
+                    && edge.kind == "calls"
+                    && edge.metadata["synthesizedBy"] == "go-func-field"
+            })
+            .map(|edge| {
+                assert_eq!(edge.provenance.as_deref(), Some("heuristic"), "{edge:?}");
+                assert_eq!(edge.col, None, "{edge:?}");
+                assert!(edge.line.is_some(), "{edge:?}");
+                let target = graph.node(&edge.target).expect("the target node");
+                let via = edge.metadata["via"]
+                    .as_str()
+                    .map(|via| format!(" via {via}"))
+                    .unwrap_or_default();
+                format!(
+                    "{} ({}) @{} [{}{via}]",
+                    target.qualified_name,
+                    target.file_path,
+                    edge.metadata["registeredAt"].as_str().unwrap_or("?"),
+                    edge.metadata["field"].as_str().unwrap_or("?"),
+                )
+            })
+            .collect();
+        calls.sort();
+        calls
+    }
+
+    /// Upstream: Prometheus' `Discovery.refresh` links to each provider's
+    /// method through the `Options` field it is copied from, EC2's method
+    /// value and hetzner's interface method (`r refresher`, a call's
+    /// result), each on the line of the call through the field.
+    #[test]
+    fn w715d_prometheus_refresh_reaches_each_provider_through_options() {
+        let project = project_of(FILES);
+        let graph = graph_of(&project);
+        let refresh = callable(graph, "Discovery::refresh", "discovery/refresh/refresh.go");
+        assert_eq!(
+            func_field_calls(graph, &refresh),
+            [
+                format!(
+                    "EC2Discovery::refresh (discovery/aws/ec2.go) @{} [Discovery.refreshf via Options.RefreshF]",
+                    site_of(FILES, "discovery/aws/ec2.go", "RefreshF: d.refresh")
+                ),
+                format!(
+                    "refresher::refresh (discovery/hetzner/hetzner.go) @{} [Discovery.refreshf via Options.RefreshF]",
+                    site_of(FILES, "discovery/hetzner/hetzner.go", "RefreshF: r.refresh")
+                ),
+            ],
+            "{}",
+            graph.report()
+        );
+        let call = line_of(DISCOVERY_REFRESH_REFRESH_GO, "d.refreshf(ctx)") as i64;
+        assert!(
+            graph
+                .edges
+                .iter()
+                .filter(|edge| edge.source == refresh
+                    && edge.metadata["synthesizedBy"] == "go-func-field")
+                .all(|edge| edge.line == Some(call)),
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream: a field name two unrelated structs share stays apart.
+    #[test]
+    fn w715d_a_field_name_two_structs_share_stays_apart() {
+        let project = project_of(FILES);
+        let graph = graph_of(&project);
+        assert_eq!(
+            func_field_calls(graph, &callable(graph, "Job::Run", "jobs/jobs.go")),
+            [format!(
+                "cleanup (jobs/jobs.go) @{} [Job.fn]",
+                site_of(FILES, "jobs/jobs.go", "fn: cleanup")
+            )],
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            func_field_calls(graph, &callable(graph, "Hook::Fire", "hooks/hooks.go")),
+            [format!(
+                "notify (hooks/hooks.go) @{} [Hook.fn]",
+                site_of(FILES, "hooks/hooks.go", "h.fn = notify")
+            )],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream: a positional literal, and a conversion to a func type.
+    #[test]
+    fn w715d_a_positional_literal_and_a_func_type_conversion() {
+        let project = project_of(FILES);
+        let graph = graph_of(&project);
+        assert_eq!(
+            func_field_calls(
+                graph,
+                &callable(graph, "printerRPC::Put", "printer/printer.go")
+            ),
+            [format!(
+                "printJSON (printer/printer.go) @{} [printerRPC.p]",
+                site_of(FILES, "printer/printer.go", "\"json\", printJSON")
+            )],
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            func_field_calls(
+                graph,
+                &callable(graph, "Server::Handle", "server/server.go")
+            ),
+            [format!(
+                "Server::serveStatic (server/server.go) @{} [Server.handler]",
+                site_of(FILES, "server/server.go", "HandlerFunc(s.serveStatic)")
+            )],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream: a function's production wiring is the one cited, and one
+    /// package's test wiring stays out of another package's tests.
+    #[test]
+    fn w715d_production_wiring_first_and_test_wiring_in_its_package() {
+        let project = project_of(FILES);
+        let graph = graph_of(&project);
+        let wired = format!(
+            "defaultHook (client/client.go) @{} [Client.Hook]",
+            site_of(FILES, "client/wire.go", "Hook: defaultHook")
+        );
+        assert_eq!(
+            func_field_calls(graph, &callable(graph, "Client::Do", "client/client.go")),
+            [
+                wired.clone(),
+                format!(
+                    "otherHook (other/other_test.go) @{} [Client.Hook]",
+                    site_of(FILES, "other/other_test.go", "c.Hook = otherHook")
+                ),
+            ],
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            func_field_calls(graph, &callable(graph, "TestDo", "client/a_test.go")),
+            [wired],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream: a function that only wires a field gains no edge.
+    #[test]
+    fn w715d_a_function_that_only_wires_gains_no_edge() {
+        let project = project_of(FILES);
+        let graph = graph_of(&project);
+        for (name, file) in [
+            ("NewDiscovery", "discovery/refresh/refresh.go"),
+            ("NewEC2Discovery", "discovery/aws/ec2.go"),
+            ("NewCleanupJob", "jobs/jobs.go"),
+            ("NewHook", "hooks/hooks.go"),
+        ] {
+            assert_eq!(
+                func_field_calls(graph, &callable(graph, name, file)),
+                Vec::<String>::new(),
+                "{name}: {}",
+                graph.report()
+            );
+        }
+    }
+
+    /// Upstream: `codegraph explore` follows the flow from `Run` to the
+    /// provider, the hop naming the field and its wiring site.
+    #[test]
+    fn w715d_explore_flow_crosses_the_func_field() {
+        let project = project_of(FILES);
+        let output = codegraph(
+            project.root(),
+            ["explore", "Discovery.Run EC2Discovery.refresh", "-p", "."],
+        );
+        let text = String::from_utf8(output.stdout).expect("explore prints UTF-8");
+        let flow = &text[..text.find("**Exploration").unwrap_or(text.len())];
+        assert!(flow.contains("**Flow"), "{text}");
+        assert!(
+            flow.contains(&format!(
+                "↓ dynamic: func field `Discovery.refreshf` (set from `Options.RefreshF`) @{}",
+                site_of(FILES, "discovery/aws/ec2.go", "RefreshF: d.refresh")
+            )),
+            "{text}"
+        );
+        assert!(flow.contains("refresh (discovery/aws/ec2.go:"), "{text}");
+    }
+
+    /// A project of the module `example.com/app` and `files`, indexed.
+    fn app_of(files: &[(&str, &str)]) -> super::support::Indexed {
+        project_of(&[&[("go.mod", GO_MOD)], files].concat())
+    }
+
+    /// The go-func-field edges out of the one function or method
+    /// `qualified` in `file`.
+    #[track_caller]
+    fn calls_of(graph: &Graph, qualified: &str, file: &str) -> Vec<String> {
+        func_field_calls(graph, &callable(graph, qualified, file))
+    }
+
+    const NEST_GO: &str = concat!(
+        "package nest\n",
+        "\n",
+        "type Inner struct {\n",
+        "\tF func()\n",
+        "}\n",
+        "\n",
+        "type Mid struct {\n",
+        "\tinner Inner\n",
+        "}\n",
+        "\n",
+        "type Outer struct {\n",
+        "\tmid Mid\n",
+        "}\n",
+        "\n",
+        "func work() {}\n",
+        "\n",
+        "func NewInner() *Inner { return &Inner{F: work} }\n",
+        "\n",
+        "func (m *Mid) Two() { m.inner.F() }\n",
+        "\n",
+        "func (o *Outer) Three(mid *Mid) { o.mid.inner.F() }\n",
+    );
+
+    /// A receiver one field away reaches the field (`m.inner.F()`); one two
+    /// fields away (`o.mid.inner.F()`) is no dispatch, as upstream's
+    /// selector holds at most two names and never starts after a dot, even
+    /// where `mid.inner` alone would be typed (`Three`'s parameter `mid`).
+    #[test]
+    fn w715d_a_receiver_two_fields_away_is_no_dispatch() {
+        let project = app_of(&[("nest/nest.go", NEST_GO)]);
+        let graph = graph_of(&project);
+        assert_eq!(
+            calls_of(graph, "Mid::Two", "nest/nest.go"),
+            [format!(
+                "work (nest/nest.go) @nest/nest.go:{} [Inner.F]",
+                line_of(NEST_GO, "Inner{F: work}")
+            )],
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            calls_of(graph, "Outer::Three", "nest/nest.go"),
+            Vec::<String>::new(),
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// `h.fn == notify` compares; it puts nothing in the field.
+    #[test]
+    fn w715d_a_comparison_is_no_assignment() {
+        let hooks = concat!(
+            "package hooks\n",
+            "\n",
+            "type Hook struct {\n",
+            "\tfn func() error\n",
+            "}\n",
+            "\n",
+            "func notify() error { return nil }\n",
+            "\n",
+            "func (h *Hook) Same() bool { return h.fn == notify }\n",
+            "\n",
+            "func (h *Hook) Fire() error { return h.fn() }\n",
+        );
+        let project = app_of(&[("hooks/hooks.go", hooks)]);
+        let graph = graph_of(&project);
+        assert_eq!(
+            calls_of(graph, "Hook::Fire", "hooks/hooks.go"),
+            Vec::<String>::new(),
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// A generated file is not read: neither the wiring a `.pb.go` file
+    /// holds nor the dispatch in a file only its generated-code banner marks
+    /// (the files table's flag).
+    #[test]
+    fn w715d_generated_files_are_not_read() {
+        let hooks = concat!(
+            "package hooks\n",
+            "\n",
+            "type Hook struct {\n",
+            "\tfn func() error\n",
+            "}\n",
+            "\n",
+            "func ping() error { return nil }\n",
+            "\n",
+            "func NewHook() *Hook { return &Hook{fn: ping} }\n",
+            "\n",
+            "func (h *Hook) Fire() error { return h.fn() }\n",
+        );
+        let wire = concat!(
+            "package hooks\n",
+            "\n",
+            "func notify() error { return nil }\n",
+            "\n",
+            "func wired() *Hook { return &Hook{fn: notify} }\n",
+        );
+        let banner = concat!(
+            "// Code generated by mockgen. DO NOT EDIT.\n",
+            "\n",
+            "package hooks\n",
+            "\n",
+            "func (h *Hook) FireAgain() error { return h.fn() }\n",
+        );
+        let project = app_of(&[
+            ("hooks/hooks.go", hooks),
+            ("hooks/wire.pb.go", wire),
+            ("hooks/fire_extra.go", banner),
+        ]);
+        let graph = graph_of(&project);
+        assert_eq!(
+            calls_of(graph, "Hook::Fire", "hooks/hooks.go"),
+            [format!(
+                "ping (hooks/hooks.go) @hooks/hooks.go:{} [Hook.fn]",
+                line_of(hooks, "Hook{fn: ping}")
+            )],
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            calls_of(graph, "Hook::FireAgain", "hooks/fire_extra.go"),
+            Vec::<String>::new(),
+            "{}",
+            graph.report()
+        );
+    }
+
+    const PROMOTED_GO: &str = concat!(
+        "package jobs\n",
+        "\n",
+        "type Base struct {\n",
+        "\trun func()\n",
+        "}\n",
+        "\n",
+        "type Job struct {\n",
+        "\tBase\n",
+        "\tname string\n",
+        "}\n",
+        "\n",
+        "type A struct {\n",
+        "\tstep func()\n",
+        "}\n",
+        "\n",
+        "type B struct {\n",
+        "\tstep func()\n",
+        "}\n",
+        "\n",
+        "type Both struct {\n",
+        "\tA\n",
+        "\tB\n",
+        "}\n",
+        "\n",
+        "func work() {}\n",
+        "\n",
+        "func other() {}\n",
+        "\n",
+        "func NewJob() *Job {\n",
+        "\tj := &Job{}\n",
+        "\tj.run = work\n",
+        "\treturn j\n",
+        "}\n",
+        "\n",
+        "func NewA() A { return A{step: work} }\n",
+        "\n",
+        "func NewB() B { return B{step: other} }\n",
+        "\n",
+        "func (j *Job) Do() { j.run() }\n",
+        "\n",
+        "func (a *A) Go() { a.step() }\n",
+        "\n",
+        "func (x *Both) Do() { x.step() }\n",
+        "\n",
+        "type Shadowed struct {\n",
+        "\tBase\n",
+        "}\n",
+        "\n",
+        "func (s *Shadowed) run() {}\n",
+        "\n",
+        "func (s *Shadowed) Do() { s.run() }\n",
+        "\n",
+        "type Hidden struct {\n",
+        "\tBase\n",
+        "\trun int\n",
+        "}\n",
+        "\n",
+        "func (h *Hidden) Do() { h.run() }\n",
+    );
+
+    /// A func field one embedding down is the embedding struct's, for the
+    /// call and the assignment alike; one two embeddings both hold links
+    /// nothing, as Go calls the selector ambiguous, and neither does one a
+    /// method or a field of the struct's own name hides.
+    #[test]
+    fn w715d_a_func_field_promotes_from_one_embedding() {
+        let project = app_of(&[("jobs/jobs.go", PROMOTED_GO)]);
+        let graph = graph_of(&project);
+        assert_eq!(
+            calls_of(graph, "Job::Do", "jobs/jobs.go"),
+            [format!(
+                "work (jobs/jobs.go) @jobs/jobs.go:{} [Base.run]",
+                line_of(PROMOTED_GO, "j.run = work")
+            )],
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            calls_of(graph, "A::Go", "jobs/jobs.go"),
+            [format!(
+                "work (jobs/jobs.go) @jobs/jobs.go:{} [A.step]",
+                line_of(PROMOTED_GO, "A{step: work}")
+            )],
+            "{}",
+            graph.report()
+        );
+        for name in ["Both::Do", "Shadowed::Do", "Hidden::Do"] {
+            assert_eq!(
+                calls_of(graph, name, "jobs/jobs.go"),
+                Vec::<String>::new(),
+                "{name}: {}",
+                graph.report()
+            );
+        }
+    }
+
+    /// A function put in a field at lines 9 and 10 cites line 9: sites
+    /// compare as numbers, `jobs.go:9` before `jobs.go:10`.
+    #[test]
+    fn w715d_a_function_wired_twice_cites_its_first_site() {
+        let jobs = concat!(
+            "package jobs\n",
+            "\n",
+            "type Job struct {\n",
+            "\tfn func() error\n",
+            "}\n",
+            "\n",
+            "func cleanup() error { return nil }\n",
+            "\n",
+            "func A() *Job { return &Job{fn: cleanup} }\n",
+            "func B() *Job { return &Job{fn: cleanup} }\n",
+            "\n",
+            "func (j *Job) Run() error { return j.fn() }\n",
+        );
+        assert_eq!(line_of(jobs, "func A()"), 9);
+        let project = app_of(&[("jobs/jobs.go", jobs)]);
+        let graph = graph_of(&project);
+        assert_eq!(
+            calls_of(graph, "Job::Run", "jobs/jobs.go"),
+            ["cleanup (jobs/jobs.go) @jobs/jobs.go:9 [Job.fn]"],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// A channel links at most forty functions, its first forty sites: of
+    /// forty-one, the one wired last is left out.
+    #[test]
+    fn w715d_a_channel_links_at_most_forty_functions() {
+        let mut jobs = String::from("package jobs\n\ntype Job struct {\n\tfn func()\n}\n\n");
+        for i in 0..41 {
+            jobs.push_str(&format!("func h{i:02}() {{}}\n"));
+        }
+        jobs.push('\n');
+        for i in 0..41 {
+            jobs.push_str(&format!(
+                "func w{i:02}() *Job {{ return &Job{{fn: h{i:02}}} }}\n"
+            ));
+        }
+        jobs.push_str("\nfunc (j *Job) Run() { j.fn() }\n");
+        let project = app_of(&[("jobs/jobs.go", &jobs)]);
+        let graph = graph_of(&project);
+        let calls = calls_of(graph, "Job::Run", "jobs/jobs.go");
+        let expected: Vec<String> = (0..40)
+            .map(|i| {
+                format!(
+                    "h{i:02} (jobs/jobs.go) @jobs/jobs.go:{} [Job.fn]",
+                    line_of(&jobs, &format!("fn: h{i:02}}}"))
+                )
+            })
+            .collect();
+        assert_eq!(calls, expected, "{}", graph.report());
+    }
+
+    /// Two functions put in fields on one line each take the function
+    /// value referenced where it is written.
+    #[test]
+    fn w715d_two_values_on_one_line_take_their_own_references() {
+        let jobs = concat!(
+            "package jobs\n",
+            "\n",
+            "type Job struct {\n",
+            "\tfn func() error\n",
+            "}\n",
+            "\n",
+            "func cleanup() error { return nil }\n",
+            "\n",
+            "func other() error { return nil }\n",
+            "\n",
+            "func Both() (*Job, *Job) { return &Job{fn: cleanup}, &Job{fn: other} }\n",
+            "\n",
+            "func (j *Job) Run() error { return j.fn() }\n",
+        );
+        let project = app_of(&[("jobs/jobs.go", jobs)]);
+        let graph = graph_of(&project);
+        let site = line_of(jobs, "func Both()");
+        assert_eq!(
+            calls_of(graph, "Job::Run", "jobs/jobs.go"),
+            [
+                format!("cleanup (jobs/jobs.go) @jobs/jobs.go:{site} [Job.fn]"),
+                format!("other (jobs/jobs.go) @jobs/jobs.go:{site} [Job.fn]"),
+            ],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// A comment between the dot and the field (`h./* fire */fn()`) hides
+    /// the call from the raw-text prefilter of a file that declares no type,
+    /// so that file is read only when another call there names a func field;
+    /// a file declaring a type is prefiltered on its text without comments
+    /// (upstream's two texts).
+    #[test]
+    fn w715d_a_comment_inside_a_selector_hides_the_call_from_the_raw_prefilter() {
+        let hooks = concat!(
+            "package hooks\n",
+            "\n",
+            "type Hook struct {\n",
+            "\tfn func() error\n",
+            "}\n",
+            "\n",
+            "func notify() error { return nil }\n",
+            "\n",
+            "func NewHook() *Hook { return &Hook{fn: notify} }\n",
+        );
+        let alone = "package hooks\n\nfunc (h *Hook) FireA() error { return h./* fire */fn() }\n";
+        let beside = "package hooks\n\nfunc (h *Hook) FireB() error { return h./* fire */fn() }\n\nfunc (h *Hook) FireC() error { return h.fn() }\n";
+        let declaring = "package hooks\n\ntype marker struct{}\n\nfunc (h *Hook) FireD() error { return h./* fire */fn() }\n";
+        let project = app_of(&[
+            ("hooks/hooks.go", hooks),
+            ("hooks/a.go", alone),
+            ("hooks/b.go", beside),
+            ("hooks/c.go", declaring),
+        ]);
+        let graph = graph_of(&project);
+        let wired = format!(
+            "notify (hooks/hooks.go) @hooks/hooks.go:{} [Hook.fn]",
+            line_of(hooks, "Hook{fn: notify}")
+        );
+        assert_eq!(
+            calls_of(graph, "Hook::FireA", "hooks/a.go"),
+            Vec::<String>::new(),
+            "{}",
+            graph.report()
+        );
+        for (name, file) in [
+            ("Hook::FireB", "hooks/b.go"),
+            ("Hook::FireC", "hooks/b.go"),
+            ("Hook::FireD", "hooks/c.go"),
+        ] {
+            assert_eq!(
+                calls_of(graph, name, file),
+                std::slice::from_ref(&wired),
+                "{name}: {}",
+                graph.report()
+            );
+        }
+    }
+
+    const PACKAGE_REFRESH_GO: &str = concat!(
+        "package app\n",
+        "\n",
+        "type Options struct {\n",
+        "\tRefreshF func() error\n",
+        "}\n",
+        "\n",
+        "type Discovery struct {\n",
+        "\trefreshf func() error\n",
+        "}\n",
+        "\n",
+        "func New(opts Options) *Discovery { return &Discovery{refreshf: opts.RefreshF} }\n",
+        "\n",
+        "func (d *Discovery) refresh() error { return d.refreshf() }\n",
+        "\n",
+        "type EC2 struct{}\n",
+        "\n",
+        "func (e *EC2) refresh() error { return nil }\n",
+        "\n",
+        "func (e *EC2) list() error { return nil }\n",
+        "\n",
+        "func handler() error { return nil }\n",
+        "\n",
+        "var defaults = Options{RefreshF: handler}\n",
+        "\n",
+        "var ec2 = &EC2{}\n",
+        "\n",
+        "var listed = Options{RefreshF: ec2.list}\n",
+        "\n",
+        "func wire() *Discovery {\n",
+        "\te := &EC2{}\n",
+        "\treturn New(Options{RefreshF: e.refresh})\n",
+        "}\n",
+    );
+
+    /// A package-level literal (W7-15d0's variables) wires its func field.
+    /// Outside a function upstream reads no scope (GFF:705): a value is what
+    /// its variable's function-value reference reaches, else a function of
+    /// the package. `ec2.list` stays unresolved, since no rule types a
+    /// package-level receiver before #2667 (next round), so `listed` wires
+    /// nothing, while a function's local `e` is read from its scope.
+    #[test]
+    fn w715d_a_package_level_literal_wires_its_field() {
+        let project = app_of(&[("app/app.go", PACKAGE_REFRESH_GO)]);
+        let graph = graph_of(&project);
+        let wired = |target: &str, needle: &str| {
+            format!(
+                "{target} (app/app.go) @app/app.go:{} [Discovery.refreshf via Options.RefreshF]",
+                line_of(PACKAGE_REFRESH_GO, needle)
+            )
+        };
+        assert_eq!(
+            calls_of(graph, "Discovery::refresh", "app/app.go"),
+            [
+                wired("EC2::refresh", "RefreshF: e.refresh"),
+                wired("handler", "RefreshF: handler"),
+            ],
+            "{}",
+            graph.report()
+        );
+        graph.assert_unresolved("variable listed", "function_ref", "ec2.list");
+    }
+
+    const LOCALS_GO: &str = concat!(
+        "package pick\n",
+        "\n",
+        "type Hook struct {\n",
+        "\tfn func()\n",
+        "}\n",
+        "\n",
+        "func ping() {}\n",
+        "\n",
+        "func pong() {}\n",
+        "\n",
+        "func pang() {}\n",
+        "\n",
+        "func peng() {}\n",
+        "\n",
+        "func pair() (bool, *Hook) { return true, &Hook{} }\n",
+        "\n",
+        "func second() {\n",
+        "\tok, h := pair()\n",
+        "\t_ = ok\n",
+        "\th.fn = ping\n",
+        "}\n",
+        "\n",
+        "func both() {\n",
+        "\tn, k := 1, &Hook{}\n",
+        "\t_ = n\n",
+        "\tk.fn = pong\n",
+        "}\n",
+        "\n",
+        "func created() {\n",
+        "\tc := new(Hook)\n",
+        "\tc.fn = pang\n",
+        "}\n",
+        "\n",
+        "func asserted(v any) {\n",
+        "\ta := v.(*Hook)\n",
+        "\ta.fn = peng\n",
+        "}\n",
+        "\n",
+        "func (h *Hook) Fire() {\n",
+        "\th.fn = h.Fire\n",
+        "\th.fn()\n",
+        "}\n",
+        "\n",
+        "func pung() {}\n",
+        "\n",
+        "func param(pung func()) *Hook { return &Hook{fn: pung} }\n",
+        "\n",
+        "type EC2 struct{}\n",
+        "\n",
+        "func newEC2() *EC2 { return &EC2{} }\n",
+        "\n",
+        "func (e *EC2) refresh() {}\n",
+        "\n",
+        "func method() {\n",
+        "\te := newEC2()\n",
+        "\th := &Hook{fn: e.refresh}\n",
+        "\t_ = h\n",
+        "}\n",
+    );
+
+    /// A local is typed by what its declaration gives it: the result of a
+    /// call at its place (`ok, h := pair()`), the value at its place
+    /// (`n, k := 1, &Hook{}`), `new(T)`, a type assertion, a call's result
+    /// whose method is the value (`e := newEC2()`, `e.refresh`). A bare
+    /// name a parameter holds (`pung`) is no package function. A function
+    /// put in a field it calls through links nowhere: no edge from a
+    /// function to itself.
+    #[test]
+    fn w715d_a_local_is_typed_by_its_value() {
+        let project = app_of(&[("pick/pick.go", LOCALS_GO)]);
+        let graph = graph_of(&project);
+        let wired = |target: &str| {
+            format!(
+                "{target} (pick/pick.go) @pick/pick.go:{} [Hook.fn]",
+                line_of(LOCALS_GO, &format!(".fn = {target}"))
+            )
+        };
+        assert_eq!(
+            calls_of(graph, "Hook::Fire", "pick/pick.go"),
+            [
+                format!(
+                    "EC2::refresh (pick/pick.go) @pick/pick.go:{} [Hook.fn]",
+                    line_of(LOCALS_GO, "fn: e.refresh")
+                ),
+                wired("pang"),
+                wired("peng"),
+                wired("ping"),
+                wired("pong"),
+            ],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// A literal wires the struct its type names in its own package: a bare
+    /// `Options{…}` written in a package without an `Options` of its own
+    /// (which the resolver may still link by name) wires nothing.
+    #[test]
+    fn w715d_a_literal_names_its_struct_s_package() {
+        let options = concat!(
+            "package opts\n",
+            "\n",
+            "type Options struct {\n",
+            "\tRefreshF func()\n",
+            "}\n",
+            "\n",
+            "func (o *Options) Run() { o.RefreshF() }\n",
+        );
+        let user = concat!(
+            "package user\n",
+            "\n",
+            "func list() {}\n",
+            "\n",
+            "func wire() { _ = Options{RefreshF: list} }\n",
+        );
+        let project = app_of(&[("opts/opts.go", options), ("user/user.go", user)]);
+        let graph = graph_of(&project);
+        graph.assert_edge(
+            "function wire @user/user.go",
+            "instantiates",
+            "struct Options @opts/opts.go",
+            Some("exact-match"),
+        );
+        assert_eq!(
+            calls_of(graph, "Options::Run", "opts/opts.go"),
+            Vec::<String>::new(),
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// The project root's package is `.`, as upstream names it: a literal
+    /// written through the root package's import wires its field.
+    #[test]
+    fn w715d_the_root_package_is_dot() {
+        let root = concat!(
+            "package app\n",
+            "\n",
+            "type Options struct {\n",
+            "\tRefreshF func()\n",
+            "}\n",
+            "\n",
+            "func (o *Options) Run() { o.RefreshF() }\n",
+        );
+        let sub = concat!(
+            "package sub\n",
+            "\n",
+            "import \"example.com/app\"\n",
+            "\n",
+            "func list() {}\n",
+            "\n",
+            "func wire() { _ = app.Options{RefreshF: list} }\n",
+        );
+        let project = app_of(&[("app.go", root), ("sub/sub.go", sub)]);
+        let graph = graph_of(&project);
+        assert_eq!(
+            calls_of(graph, "Options::Run", "app.go"),
+            [format!(
+                "list (sub/sub.go) @sub/sub.go:{} [Options.RefreshF]",
+                line_of(sub, "RefreshF: list")
+            )],
+            "{}",
+            graph.report()
+        );
+    }
+}
+
+/// W7-16a: the framework dispatch passes, upstream's six tests with their
+/// sources as written, and the cases Rust adds.
+mod framework_dispatch {
+    use super::support::{EdgeRow, Graph, Project, graph_of};
+
+    /// The `calls` edges the pass `by` made.
+    pub(super) fn synthesized_by<'g>(
+        graph: &'g Graph,
+        by: &'g str,
+    ) -> impl Iterator<Item = &'g EdgeRow> {
+        graph
+            .edges
+            .iter()
+            .filter(move |edge| edge.kind == "calls" && edge.metadata["synthesizedBy"] == by)
+    }
+
+    /// Every `calls` edge the pass `by` made, as `source -> target via
+    /// <via> @<registeredAt> line <line>` over qualified names, sorted; each
+    /// is heuristic and has no column.
+    #[track_caller]
+    pub(super) fn links(graph: &Graph, by: &str) -> Vec<String> {
+        let name = |id: &str| {
+            graph
+                .node(id)
+                .map_or_else(|| "?".to_string(), |node| node.qualified_name.clone())
+        };
+        let mut links: Vec<String> = synthesized_by(graph, by)
+            .map(|edge| {
+                assert_eq!(edge.provenance.as_deref(), Some("heuristic"), "{edge:?}");
+                assert_eq!(edge.col, None, "{edge:?}");
+                format!(
+                    "{} -> {} via {} @{} line {}",
+                    name(&edge.source),
+                    name(&edge.target),
+                    edge.metadata["via"].as_str().unwrap_or("?"),
+                    edge.metadata["registeredAt"].as_str().unwrap_or("?"),
+                    edge.line
+                        .map_or_else(|| "?".to_string(), |line| line.to_string()),
+                )
+            })
+            .collect();
+        links.sort();
+        links
+    }
+
+    /// The 1-based line of `text` holding `needle`.
+    #[track_caller]
+    fn line_of(text: &str, needle: &str) -> usize {
+        text.split('\n')
+            .position(|line| line.contains(needle))
+            .unwrap_or_else(|| panic!("no line holds {needle:?}"))
+            + 1
+    }
+
+    /// `thunks.ts` of upstream's `redux-thunk-synthesizer.test.ts` (line 31).
+    const THUNKS_TS: &str = concat!(
+        "import { createAsyncThunk } from '@reduxjs/toolkit';\n",
+        "\n",
+        "export const deepThunk = createAsyncThunk('app/deep', async (n: number) => {\n",
+        "  return n * 2;\n",
+        "});\n",
+        "\n",
+        "export const innerThunk = createAsyncThunk('app/inner', async (n: number, { dispatch }) => {\n",
+        "  return dispatch(deepThunk(n));\n",
+        "});\n",
+        "\n",
+        "export const outerThunk = createAsyncThunk('app/outer', async (n: number, { dispatch }) => {\n",
+        "  await dispatch(innerThunk(n));\n",
+        "});\n",
+        "\n",
+        "// Non-thunk constant that only MENTIONS dispatch in a string — must be skipped.\n",
+        "export const notAThunk = 'dispatch(innerThunk())';\n",
+    );
+
+    /// `service.ts` of upstream's `redux-thunk-synthesizer.test.ts` (line 93).
+    const SERVICE_TS: &str = "export function leaveCall(id: string) { return id; }\n";
+
+    /// `thunks.ts` of upstream's `redux-thunk-synthesizer.test.ts` (line 95).
+    const LEAVE_THUNKS_TS: &str = concat!(
+        "import { createAsyncThunk } from '@reduxjs/toolkit';\n",
+        "\n",
+        "export const leaveCall = createAsyncThunk('call/leave', async () => {\n",
+        "  return 1;\n",
+        "});\n",
+        "\n",
+        "export const logout = createAsyncThunk('user/logout', async (_: void, { dispatch }) => {\n",
+        "  dispatch(leaveCall());\n",
+        "});\n",
+    );
+
+    /// `tasks.py` of upstream's `celery-dispatch-synthesizer.test.ts` (line 27).
+    const TASKS_PY: &str = concat!(
+        "from celery import shared_task\n",
+        "from myapp.celery import app\n",
+        "\n",
+        "\n",
+        "@shared_task\n",
+        "def send_email(to):\n",
+        "    return to\n",
+        "\n",
+        "\n",
+        "@app.task(bind=True, max_retries=3)\n",
+        "def crunch(self, n):\n",
+        "    return n * 2\n",
+    );
+
+    /// `services/tickets.py` of upstream's `celery-dispatch-synthesizer.test.ts` (line 44).
+    const TICKETS_PY: &str = concat!(
+        "from celery import shared_task\n",
+        "\n",
+        "\n",
+        "@shared_task\n",
+        "def invalidate_cache():\n",
+        "    return None\n",
+    );
+
+    /// `utils.py` of upstream's `celery-dispatch-synthesizer.test.ts` (line 55).
+    const UTILS_PY: &str = concat!("def process_data(x):\n", "    return x\n",);
+
+    /// `views.py` of upstream's `celery-dispatch-synthesizer.test.ts` (line 62).
+    const VIEWS_PY: &str = concat!(
+        "from tasks import send_email, crunch\n",
+        "from services import tickets\n",
+        "from utils import process_data\n",
+        "from celery import group\n",
+        "\n",
+        "\n",
+        "def handle_request(req):\n",
+        "    send_email.delay(req.addr)                 # → send_email task (cross-file)\n",
+        "    crunch.apply_async(args=[5])               # → crunch task (@app.task dialect)\n",
+        "    tickets.invalidate_cache.apply_async()     # module-qualified → invalidate_cache\n",
+        "    process_data.delay(req.x)                  # NOT a task → no edge\n",
+        "    group([send_email.s(a) for a in req.addrs]).delay()  # canvas → no edge\n",
+    );
+
+    /// `app.py` of upstream's `celery-dispatch-synthesizer.test.ts` (line 108).
+    const CELERY_FREE_PY: &str = concat!(
+        "def schedule(job):\n",
+        "    job.delay()          # a .delay() that has nothing to do with Celery\n",
+        "    return job\n",
+        "\n",
+        "\n",
+        "def run():\n",
+        "    schedule(make_job())\n",
+    );
+
+    /// `shop/OrderEvents.java` of upstream's `spring-event-synthesizer.test.ts` (line 32).
+    const ORDER_EVENTS_JAVA: &str = concat!(
+        "package shop;\n",
+        "class OrderShippedEvent { }\n",
+        "class OrderCancelledEvent { }\n",
+        "class UnheardEvent { }\n",
+    );
+
+    /// `shop/OrderService.java` of upstream's `spring-event-synthesizer.test.ts` (line 38).
+    const ORDER_SERVICE_JAVA: &str = concat!(
+        "package shop;\n",
+        "import org.springframework.context.ApplicationEventPublisher;\n",
+        "class OrderService {\n",
+        "    private ApplicationEventPublisher publisher;\n",
+        "    void ship() {\n",
+        "        publisher.publishEvent(new OrderShippedEvent());\n",
+        "        publisher.publishEvent(new UnheardEvent());\n",
+        "    }\n",
+        "    void cancel() {\n",
+        "        publisher.publishEvent(new OrderCancelledEvent());\n",
+        "    }\n",
+        "}\n",
+    );
+
+    /// `shop/ShippingListener.java` of upstream's `spring-event-synthesizer.test.ts` (line 52).
+    const SHIPPING_LISTENER_JAVA: &str = concat!(
+        "package shop;\n",
+        "import org.springframework.context.event.EventListener;\n",
+        "class ShippingListener {\n",
+        "    @EventListener\n",
+        "    public void onShipped(OrderShippedEvent event) { }\n",
+        "\n",
+        "    public void helper(OrderShippedEvent event) { }\n",
+        "}\n",
+    );
+
+    /// `shop/AuditListener.java` of upstream's `spring-event-synthesizer.test.ts` (line 62).
+    const AUDIT_LISTENER_JAVA: &str = concat!(
+        "package shop;\n",
+        "import org.springframework.context.event.EventListener;\n",
+        "class AuditListener {\n",
+        "    @EventListener(OrderShippedEvent.class)\n",
+        "    public void audit(OrderShippedEvent event) { }\n",
+        "}\n",
+    );
+
+    /// `shop/TxListener.java` of upstream's `spring-event-synthesizer.test.ts` (line 70).
+    const TX_LISTENER_JAVA: &str = concat!(
+        "package shop;\n",
+        "import org.springframework.transaction.event.TransactionalEventListener;\n",
+        "class TxListener {\n",
+        "    @TransactionalEventListener\n",
+        "    public void afterShipped(OrderShippedEvent event) { }\n",
+        "}\n",
+    );
+
+    /// `shop/LegacyListener.java` of upstream's `spring-event-synthesizer.test.ts` (line 78).
+    const LEGACY_LISTENER_JAVA: &str = concat!(
+        "package shop;\n",
+        "import org.springframework.context.ApplicationListener;\n",
+        "class LegacyListener implements ApplicationListener<OrderCancelledEvent> {\n",
+        "    @Override\n",
+        "    public void onApplicationEvent(OrderCancelledEvent event) { }\n",
+        "}\n",
+    );
+
+    /// `shop/PlainService.java` of upstream's `spring-event-synthesizer.test.ts` (line 114).
+    const PLAIN_SERVICE_JAVA: &str = concat!(
+        "package shop;\n",
+        "import org.springframework.stereotype.Service;\n",
+        "@Service\n",
+        "class PlainService {\n",
+        "    private final Repo repo;\n",
+        "    PlainService(Repo repo) { this.repo = repo; }\n",
+        "    String find(String id) { return repo.get(id); }\n",
+        "}\n",
+    );
+
+    /// `Requests.cs` of upstream's `mediatr-dispatch-synthesizer.test.ts` (line 31).
+    const REQUESTS_CS: &str = concat!(
+        "namespace Shop;\n",
+        "using MediatR;\n",
+        "public record GetThingsQuery : IRequest<ThingsVm>;\n",
+        "public record CreateThingCommand(string Name) : IRequest<int>;\n",
+        "public record DeleteThingCommand(int Id) : IRequest;\n",
+        "public record ThingDeletedNotification(int Id) : INotification;\n",
+        "public class UnhandledCommand : IRequest<int> { }\n",
+    );
+
+    /// `Handlers.cs` of upstream's `mediatr-dispatch-synthesizer.test.ts` (line 39).
+    const HANDLERS_CS: &str = concat!(
+        "namespace Shop;\n",
+        "using MediatR;\n",
+        "using System.Threading;\n",
+        "using System.Threading.Tasks;\n",
+        "public class GetThingsQueryHandler : IRequestHandler<GetThingsQuery, ThingsVm> {\n",
+        "    public Task<ThingsVm> Handle(GetThingsQuery request, CancellationToken ct) => Task.FromResult(new ThingsVm());\n",
+        "}\n",
+        "public class CreateThingCommandHandler : IRequestHandler<CreateThingCommand, int> {\n",
+        "    public Task<int> Handle(CreateThingCommand request, CancellationToken ct) => Task.FromResult(1);\n",
+        "}\n",
+        "public class DeleteThingCommandHandler : IRequestHandler<DeleteThingCommand> {\n",
+        "    public Task Handle(DeleteThingCommand request, CancellationToken ct) => Task.CompletedTask;\n",
+        "}\n",
+        "public class ThingDeletedNotificationHandler : INotificationHandler<ThingDeletedNotification> {\n",
+        "    public Task Handle(ThingDeletedNotification notification, CancellationToken ct) => Task.CompletedTask;\n",
+        "}\n",
+    );
+
+    /// `ThingsController.cs` of upstream's `mediatr-dispatch-synthesizer.test.ts` (line 56).
+    const THINGS_CONTROLLER_CS: &str = concat!(
+        "namespace Shop;\n",
+        "using MediatR;\n",
+        "using System.Threading.Tasks;\n",
+        "public class ThingsController {\n",
+        "    private readonly ISender _mediator;\n",
+        "    public ThingsController(ISender mediator) { _mediator = mediator; }\n",
+        "\n",
+        "    public async Task GetThings() {\n",
+        "        var vm = await _mediator.Send(new GetThingsQuery());\n",
+        "    }\n",
+        "    public async Task Create(CreateThingCommand command) {\n",
+        "        var id = await _mediator.Send(command);\n",
+        "    }\n",
+        "    public async Task Delete(int id) {\n",
+        "        var command = new DeleteThingCommand(id);\n",
+        "        await _mediator.Send(command);\n",
+        "    }\n",
+        "    public async Task Notify(int id) {\n",
+        "        await _mediator.Publish(new ThingDeletedNotification(id));\n",
+        "    }\n",
+        "    public async Task Bogus() {\n",
+        "        await _mediator.Send(new UnhandledCommand());\n",
+        "    }\n",
+        "    public void ViaMessagingCenter() {\n",
+        "        MessagingCenter.Send(this, \"evt\", new CreateThingCommand(\"x\"));\n",
+        "    }\n",
+        "}\n",
+    );
+
+    /// `Service.cs` of upstream's `mediatr-dispatch-synthesizer.test.ts` (line 112).
+    const MEDIATR_FREE_CS: &str = concat!(
+        "namespace Shop;\n",
+        "public class Service {\n",
+        "    private readonly IRepo _repo;\n",
+        "    public Service(IRepo repo) { _repo = repo; }\n",
+        "    public string Find(string id) => _repo.Get(id);\n",
+        "}\n",
+    );
+
+    /// `app/workers/destroy_user_worker.rb` of upstream's `sidekiq-dispatch-synthesizer.test.ts` (line 30).
+    const DESTROY_USER_WORKER_RB: &str = concat!(
+        "class DestroyUserWorker\n",
+        "  include Sidekiq::Worker\n",
+        "  def perform(user_id)\n",
+        "    User.find(user_id).destroy!\n",
+        "  end\n",
+        "end\n",
+    );
+
+    /// `app/workers/send_email_worker.rb` of upstream's `sidekiq-dispatch-synthesizer.test.ts` (line 38).
+    const SEND_EMAIL_WORKER_RB: &str = concat!(
+        "class SendEmailWorker\n",
+        "  include Sidekiq::Job\n",
+        "  def perform(addr)\n",
+        "  end\n",
+        "end\n",
+    );
+
+    /// `app/workers/comments/notify_worker.rb` of upstream's `sidekiq-dispatch-synthesizer.test.ts` (line 45).
+    const COMMENTS_NOTIFY_WORKER_RB: &str = concat!(
+        "module Comments\n",
+        "  class NotifyWorker\n",
+        "    include Sidekiq::Job\n",
+        "    def perform(id)\n",
+        "    end\n",
+        "  end\n",
+        "end\n",
+    );
+
+    /// `app/workers/articles/notify_worker.rb` of upstream's `sidekiq-dispatch-synthesizer.test.ts` (line 53).
+    const ARTICLES_NOTIFY_WORKER_RB: &str = concat!(
+        "module Articles\n",
+        "  class NotifyWorker\n",
+        "    include Sidekiq::Job\n",
+        "    def perform(id)\n",
+        "    end\n",
+        "  end\n",
+        "end\n",
+    );
+
+    /// `app/services/report.rb` of upstream's `sidekiq-dispatch-synthesizer.test.ts` (line 62).
+    const REPORT_RB: &str = concat!("class Report\n", "  def perform(x)\n", "  end\n", "end\n",);
+
+    /// `app/jobs/cleanup_job.rb` of upstream's `sidekiq-dispatch-synthesizer.test.ts` (line 68).
+    const CLEANUP_JOB_RB: &str = concat!(
+        "class CleanupJob < ApplicationJob\n",
+        "  def perform\n",
+        "  end\n",
+        "end\n",
+    );
+
+    /// `app/services/user_service.rb` of upstream's `sidekiq-dispatch-synthesizer.test.ts` (line 73).
+    const USER_SERVICE_RB: &str = concat!(
+        "class UserService\n",
+        "  def deactivate(user)\n",
+        "    DestroyUserWorker.perform_async(user.id)\n",
+        "    SendEmailWorker.perform_in(5, user.email)\n",
+        "    Comments::NotifyWorker.perform_async(1)\n",
+        "    Articles::NotifyWorker.perform_async(2)\n",
+        "    Report.perform_async(3)\n",
+        "    CleanupJob.perform_later\n",
+        "  end\n",
+        "end\n",
+    );
+
+    /// `lib/calc.rb` of upstream's `sidekiq-dispatch-synthesizer.test.ts` (line 113).
+    const SIDEKIQ_FREE_RB: &str = concat!(
+        "class Calc\n",
+        "  def add(a, b)\n",
+        "    a + b\n",
+        "  end\n",
+        "end\n",
+    );
+
+    /// `app/Listeners/LoveTrack.php` of upstream's `laravel-event-synthesizer.test.ts` (line 41).
+    const LOVE_TRACK_PHP: &str = concat!(
+        "<?php\n",
+        "namespace App\\Listeners;\n",
+        "use App\\Events\\SongLiked;\n",
+        "class LoveTrack {\n",
+        "    public function handle(SongLiked $event): void {}\n",
+        "}\n",
+    );
+
+    /// `app/Listeners/PruneLibrary.php` of upstream's `laravel-event-synthesizer.test.ts` (line 49).
+    const PRUNE_LIBRARY_PHP: &str = concat!(
+        "<?php\n",
+        "namespace App\\Listeners;\n",
+        "class PruneLibrary {\n",
+        "    public function handle(): void {}\n",
+        "}\n",
+    );
+
+    /// `app/Listeners/WriteScanLog.php` of upstream's `laravel-event-synthesizer.test.ts` (line 56).
+    const WRITE_SCAN_LOG_PHP: &str = concat!(
+        "<?php\n",
+        "namespace App\\Listeners;\n",
+        "use App\\Events\\ScanDone;\n",
+        "class WriteScanLog {\n",
+        "    public function handle(ScanDone $event): void {}\n",
+        "}\n",
+    );
+
+    /// `app/Listeners/DeleteStale.php` of upstream's `laravel-event-synthesizer.test.ts` (line 63).
+    const DELETE_STALE_PHP: &str = concat!(
+        "<?php\n",
+        "namespace App\\Listeners;\n",
+        "use App\\Events\\ScanDone;\n",
+        "class DeleteStale {\n",
+        "    public function handle(ScanDone $event): void {}\n",
+        "}\n",
+    );
+
+    /// `app/Listeners/SendsTestNotification.php` of upstream's `laravel-event-synthesizer.test.ts` (line 71).
+    const SENDS_TEST_NOTIFICATION_PHP: &str = concat!(
+        "<?php\n",
+        "namespace App\\Listeners;\n",
+        "use App\\Events\\OwnerTest;\n",
+        "use App\\Events\\UserTest;\n",
+        "class SendsTestNotification {\n",
+        "    public function handle(OwnerTest|UserTest $event): void {}\n",
+        "}\n",
+    );
+
+    /// `app/Jobs/ProcessAudio.php` of upstream's `laravel-event-synthesizer.test.ts` (line 80).
+    const PROCESS_AUDIO_PHP: &str = concat!(
+        "<?php\n",
+        "namespace App\\Jobs;\n",
+        "use App\\Services\\AudioService;\n",
+        "class ProcessAudio implements ShouldQueue {\n",
+        "    public function handle(AudioService $svc): void {}\n",
+        "}\n",
+    );
+
+    /// `app/Providers/EventServiceProvider.php` of upstream's `laravel-event-synthesizer.test.ts` (line 88).
+    const EVENT_SERVICE_PROVIDER_PHP: &str = concat!(
+        "<?php\n",
+        "namespace App\\Providers;\n",
+        "use App\\Events\\LibraryChanged;\n",
+        "use App\\Listeners\\PruneLibrary;\n",
+        "class EventServiceProvider {\n",
+        "    protected $listen = [\n",
+        "        LibraryChanged::class => [\n",
+        "            PruneLibrary::class,\n",
+        "        ],\n",
+        "    ];\n",
+        "}\n",
+    );
+
+    /// `app/Services/SongService.php` of upstream's `laravel-event-synthesizer.test.ts` (line 100).
+    const SONG_SERVICE_PHP: &str = concat!(
+        "<?php\n",
+        "namespace App\\Services;\n",
+        "use App\\Events\\SongLiked;\n",
+        "use App\\Events\\LibraryChanged;\n",
+        "use App\\Events\\ScanDone;\n",
+        "use App\\Events\\OwnerTest;\n",
+        "use App\\Events\\UserTest;\n",
+        "use App\\Jobs\\ProcessAudio;\n",
+        "class SongService {\n",
+        "    public function like(int $id): void { event(new SongLiked($id)); }\n",
+        "    public function deleteSongs(): void { event(new LibraryChanged()); }\n",
+        "    public function scan(): void { event(new ScanDone()); }\n",
+        "    public function ownerTest(): void { event(new OwnerTest()); }\n",
+        "    public function userTest(): void { event(new UserTest()); }\n",
+        "    public function process(): void {\n",
+        "        ProcessAudio::dispatch();\n",
+        "        dispatch(new ProcessAudio());\n",
+        "    }\n",
+        "}\n",
+    );
+
+    /// `src/Client.php` of upstream's `laravel-event-synthesizer.test.ts` (line 154).
+    const EVENT_FREE_PHP: &str = concat!(
+        "<?php\n",
+        "namespace Acme;\n",
+        "class Client {\n",
+        "    public function send(string $url): string { return $url; }\n",
+        "}\n",
+    );
+
+    /// The `package.json` the thunk tests write (`JSON.stringify`).
+    const THUNK_PACKAGE_JSON: &str = r#"{"name":"app","dependencies":{"@reduxjs/toolkit":"^2"}}"#;
+
+    /// The five event classes upstream's Laravel test writes in a loop.
+    fn laravel_event(name: &str, body: &str) -> String {
+        format!("<?php\nnamespace App\\Events;\nclass {name} {{\n  {body}\n}}\n")
+    }
+
+    /// Upstream `redux-thunk-synthesizer.test.ts`, first case: each thunk
+    /// constant links to the thunk its body dispatches, so `outer → inner →
+    /// deep` connects; the constant that only mentions `dispatch` in a
+    /// string is no source.
+    #[test]
+    fn w716a_thunks_link_the_thunks_they_dispatch() {
+        let project = Project::new()
+            .file("package.json", THUNK_PACKAGE_JSON)
+            .file("thunks.ts", THUNKS_TS)
+            .index();
+        let graph = graph_of(&project);
+        let inner = line_of(THUNKS_TS, "return dispatch(deepThunk(n));");
+        let outer = line_of(THUNKS_TS, "await dispatch(innerThunk(n));");
+        assert_eq!(
+            links(graph, "redux-thunk"),
+            [
+                format!("innerThunk -> deepThunk via deepThunk @thunks.ts:{inner} line {inner}"),
+                format!("outerThunk -> innerThunk via innerThunk @thunks.ts:{outer} line {outer}"),
+            ],
+            "{}",
+            graph.report()
+        );
+        for edge in synthesized_by(graph, "redux-thunk") {
+            assert_eq!(
+                graph.node(&edge.source).map(|node| node.kind.as_str()),
+                Some("constant")
+            );
+        }
+    }
+
+    /// Upstream's second case: `dispatch(leaveCall())` reaches the
+    /// `createAsyncThunk` constant, not the service function of that name
+    /// another file declares.
+    #[test]
+    fn w716a_a_dispatch_reaches_the_thunk_not_a_namesake_function() {
+        let project = Project::new()
+            .file("package.json", THUNK_PACKAGE_JSON)
+            .file("service.ts", SERVICE_TS)
+            .file("thunks.ts", LEAVE_THUNKS_TS)
+            .index();
+        let graph = graph_of(&project);
+        let line = line_of(LEAVE_THUNKS_TS, "dispatch(leaveCall());");
+        assert_eq!(
+            links(graph, "redux-thunk"),
+            [format!(
+                "logout -> leaveCall via leaveCall @thunks.ts:{line} line {line}"
+            )],
+            "{}",
+            graph.report()
+        );
+        let edge = synthesized_by(graph, "redux-thunk")
+            .next()
+            .expect("the edge");
+        let target = graph.node(&edge.target).expect("the target");
+        assert_eq!(
+            (target.kind.as_str(), target.file_path.as_str()),
+            ("constant", "thunks.ts")
+        );
+    }
+
+    /// A thunk that dispatches itself links nothing to itself, and a
+    /// dispatch in a comment is not read.
+    #[test]
+    fn w716a_a_thunk_links_neither_itself_nor_a_commented_dispatch() {
+        let source = concat!(
+            "import { createAsyncThunk } from '@reduxjs/toolkit';\n",
+            "\n",
+            "export const retry = createAsyncThunk('job/retry', async (_: void, { dispatch }) => {\n",
+            "  // dispatch(cancel());\n",
+            "  /* dispatch(cancel()); */\n",
+            "  dispatch(retry());\n",
+            "});\n",
+            "\n",
+            "export const cancel = createAsyncThunk('job/cancel', async () => 1);\n",
+        );
+        // A namesake thunk in a file listed first: the dispatch of the
+        // thunk's own name is skipped, not linked to it.
+        let namesake = "export const retry = createAsyncThunk('other/retry', async () => 1);\n";
+        let project = Project::new()
+            .file("package.json", THUNK_PACKAGE_JSON)
+            .file("a/retry.ts", namesake)
+            .file("jobs.ts", source)
+            .index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            links(graph, "redux-thunk"),
+            Vec::<String>::new(),
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream `celery-dispatch-synthesizer.test.ts`, first case: the
+    /// function around each `.delay(…)` or `.apply_async(…)` reaches the
+    /// task of either decorator dialect, a module-qualified dispatch
+    /// included; a plain function and a canvas reach nothing.
+    #[test]
+    fn w716a_celery_links_dispatches_to_decorated_tasks() {
+        let project = Project::new()
+            .file("tasks.py", TASKS_PY)
+            .file("services/tickets.py", TICKETS_PY)
+            .file("utils.py", UTILS_PY)
+            .file("views.py", VIEWS_PY)
+            .index();
+        let graph = graph_of(&project);
+        let send = line_of(VIEWS_PY, "send_email.delay(req.addr)");
+        let crunch = line_of(VIEWS_PY, "crunch.apply_async(args=[5])");
+        let cache = line_of(VIEWS_PY, "tickets.invalidate_cache.apply_async()");
+        assert_eq!(
+            links(graph, "celery-dispatch"),
+            [
+                format!("handle_request -> crunch via crunch @views.py:{crunch} line {crunch}"),
+                format!(
+                    "handle_request -> invalidate_cache via invalidate_cache @views.py:{cache} line {cache}"
+                ),
+                format!("handle_request -> send_email via send_email @views.py:{send} line {send}"),
+            ],
+            "{}",
+            graph.report()
+        );
+        let targets: Vec<&str> = synthesized_by(graph, "celery-dispatch")
+            .map(|edge| graph.node(&edge.target).expect("target").file_path.as_str())
+            .collect();
+        assert!(targets.contains(&"services/tickets.py"), "{targets:?}");
+    }
+
+    /// Upstream's second case: a `.delay()` with nothing to do with Celery
+    /// links nothing.
+    #[test]
+    fn w716a_celery_needs_a_task() {
+        let project = Project::new().file("app.py", CELERY_FREE_PY).index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            links(graph, "celery-dispatch"),
+            Vec::<String>::new(),
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Tasks of one name in two modules: the dispatching file's is the one,
+    /// and a third file's dispatch, with no task of its own, reaches none.
+    #[test]
+    fn w716a_celery_picks_the_dispatching_files_task_of_a_shared_name() {
+        let task = |body: &str| {
+            format!(
+                "from celery import shared_task\n\n@shared_task\ndef run():\n    return {body}\n\n\ndef go():\n    run.delay()\n"
+            )
+        };
+        let project = Project::new()
+            .file("a.py", &task("1"))
+            .file("b.py", &task("2"))
+            .file(
+                "c.py",
+                "from a import run\n\n\ndef elsewhere():\n    run.delay()\n",
+            )
+            .index();
+        let graph = graph_of(&project);
+        let file = |id: &str| graph.node(id).expect("node").file_path.clone();
+        let mut pairs: Vec<String> = synthesized_by(graph, "celery-dispatch")
+            .map(|edge| {
+                format!(
+                    "{} -> {} @{}",
+                    file(&edge.source),
+                    file(&edge.target),
+                    edge.metadata["registeredAt"].as_str().unwrap_or("?")
+                )
+            })
+            .collect();
+        pairs.sort();
+        assert_eq!(
+            pairs,
+            ["a.py -> a.py @a.py:9", "b.py -> b.py @b.py:9"],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// A task's decorator is read upward from its own `def`, stopping at the
+    /// declaration before it and at most twelve lines up: a decorator above
+    /// the previous `def`, or thirteen lines up, makes no task.
+    #[test]
+    fn w716a_celery_reads_a_tasks_own_decorator() {
+        let mut tasks = String::from(concat!(
+            "from celery import shared_task\n",
+            "\n",
+            "@shared_task\n",
+            "def first():\n",
+            "    pass\n",
+            "def second():\n",
+            "    pass\n",
+            "\n",
+            "@shared_task\n",
+        ));
+        for i in 0..12 {
+            tasks.push_str(&format!("# filler {i}\n"));
+        }
+        tasks.push_str(concat!(
+            "def far():\n",
+            "    pass\n",
+            "\n",
+            "\n",
+            "def go():\n",
+            "    first.delay()\n",
+            "    second.delay()\n",
+            "    far.delay()\n",
+        ));
+        let project = Project::new().file("tasks.py", &tasks).index();
+        let graph = graph_of(&project);
+        let line = line_of(&tasks, "    first.delay()");
+        assert_eq!(
+            links(graph, "celery-dispatch"),
+            [format!(
+                "go -> first via first @tasks.py:{line} line {line}"
+            )],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream `spring-event-synthesizer.test.ts`, first case: a published
+    /// event reaches every listener of its type, a parameter-typed,
+    /// annotation-typed or transactional `@EventListener` and an
+    /// `ApplicationListener`'s `onApplicationEvent`; an event nobody hears
+    /// and a method without the annotation are no part of it.
+    #[test]
+    fn w716a_spring_links_published_events_to_their_listeners() {
+        let project = Project::new()
+            .file("shop/OrderEvents.java", ORDER_EVENTS_JAVA)
+            .file("shop/OrderService.java", ORDER_SERVICE_JAVA)
+            .file("shop/ShippingListener.java", SHIPPING_LISTENER_JAVA)
+            .file("shop/AuditListener.java", AUDIT_LISTENER_JAVA)
+            .file("shop/TxListener.java", TX_LISTENER_JAVA)
+            .file("shop/LegacyListener.java", LEGACY_LISTENER_JAVA)
+            .index();
+        let graph = graph_of(&project);
+        let ship = line_of(ORDER_SERVICE_JAVA, "new OrderShippedEvent()");
+        let cancel = line_of(ORDER_SERVICE_JAVA, "new OrderCancelledEvent()");
+        let at = |line: usize| format!("@shop/OrderService.java:{line} line {line}");
+        assert_eq!(
+            links(graph, "spring-event"),
+            [
+                format!(
+                    "shop::OrderService::cancel -> shop::LegacyListener::onApplicationEvent via OrderCancelledEvent {}",
+                    at(cancel)
+                ),
+                format!(
+                    "shop::OrderService::ship -> shop::AuditListener::audit via OrderShippedEvent {}",
+                    at(ship)
+                ),
+                format!(
+                    "shop::OrderService::ship -> shop::ShippingListener::onShipped via OrderShippedEvent {}",
+                    at(ship)
+                ),
+                format!(
+                    "shop::OrderService::ship -> shop::TxListener::afterShipped via OrderShippedEvent {}",
+                    at(ship)
+                ),
+            ],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream's second case: a Spring service without an event bus links
+    /// nothing.
+    #[test]
+    fn w716a_spring_needs_an_event_bus() {
+        let project = Project::new()
+            .file("shop/PlainService.java", PLAIN_SERVICE_JAVA)
+            .index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            links(graph, "spring-event"),
+            Vec::<String>::new(),
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// A listener's annotations are the `@` lines it starts with: one after
+    /// a comment line is not read. `@EventListener(X.class)` on a method
+    /// without parameters listens for `X`, and a generic first parameter
+    /// (`Map<String, X>`) names no event.
+    #[test]
+    fn w716a_spring_reads_a_listeners_own_annotation_block() {
+        let listeners = concat!(
+            "package shop;\n",
+            "class Listeners {\n",
+            "    @Async\n",
+            "    // a note\n",
+            "    @EventListener\n",
+            "    public void later(OrderShippedEvent event) { }\n",
+            "\n",
+            "    @EventListener(OrderShippedEvent.class)\n",
+            "    public void onAny() { }\n",
+            "\n",
+            "    @EventListener\n",
+            "    public void onMap(Map<String, OrderShippedEvent> events) { }\n",
+            "}\n",
+        );
+        let project = Project::new()
+            .file("shop/OrderEvents.java", ORDER_EVENTS_JAVA)
+            .file("shop/OrderService.java", ORDER_SERVICE_JAVA)
+            .file("shop/Listeners.java", listeners)
+            .index();
+        let graph = graph_of(&project);
+        let ship = line_of(ORDER_SERVICE_JAVA, "new OrderShippedEvent()");
+        assert_eq!(
+            links(graph, "spring-event"),
+            [format!(
+                "shop::OrderService::ship -> shop::Listeners::onAny via OrderShippedEvent @shop/OrderService.java:{ship} line {ship}"
+            )],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream `mediatr-dispatch-synthesizer.test.ts`, first case: a
+    /// request sent inline, as a parameter or as a local, and a published
+    /// notification, each reach their handler's `Handle`; a request no
+    /// handler takes and `MessagingCenter.Send` reach nothing.
+    #[test]
+    fn w716a_mediatr_links_sends_to_their_handlers() {
+        let project = Project::new()
+            .file("Requests.cs", REQUESTS_CS)
+            .file("Handlers.cs", HANDLERS_CS)
+            .file("ThingsController.cs", THINGS_CONTROLLER_CS)
+            .index();
+        let graph = graph_of(&project);
+        let at = |needle: &str| {
+            let line = line_of(THINGS_CONTROLLER_CS, needle);
+            format!("@ThingsController.cs:{line} line {line}")
+        };
+        assert_eq!(
+            links(graph, "mediatr-dispatch"),
+            [
+                format!(
+                    "Shop::ThingsController::Create -> Shop::CreateThingCommandHandler::Handle via CreateThingCommand {}",
+                    at("var id = await _mediator.Send(command);")
+                ),
+                format!(
+                    "Shop::ThingsController::Delete -> Shop::DeleteThingCommandHandler::Handle via DeleteThingCommand {}",
+                    at("        await _mediator.Send(command);")
+                ),
+                format!(
+                    "Shop::ThingsController::GetThings -> Shop::GetThingsQueryHandler::Handle via GetThingsQuery {}",
+                    at("new GetThingsQuery()")
+                ),
+                format!(
+                    "Shop::ThingsController::Notify -> Shop::ThingDeletedNotificationHandler::Handle via ThingDeletedNotification {}",
+                    at("Publish(new ThingDeletedNotification(id))")
+                ),
+            ],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream's second case: a C# service without MediatR links nothing.
+    #[test]
+    fn w716a_mediatr_needs_a_handler() {
+        let project = Project::new().file("Service.cs", MEDIATR_FREE_CS).index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            links(graph, "mediatr-dispatch"),
+            Vec::<String>::new(),
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// An identifier assigned `new X` after its declaration sends `X`, a
+    /// receiver named `sender` is a mediator too, `Send(new lower(…))`
+    /// types nothing, and a receiver that is no mediator
+    /// (`_client.Send(new X())`) reaches nothing.
+    #[test]
+    fn w716a_mediatr_types_a_sent_identifier_by_its_last_assignment() {
+        let controller = concat!(
+            "namespace Shop;\n",
+            "public class Jobs {\n",
+            "    private readonly ISender sender;\n",
+            "    private readonly HttpClient _client;\n",
+            "    public async Task Rerun(int id) {\n",
+            "        DeleteThingCommand command;\n",
+            "        command = new CreateThingCommand(\"x\");\n",
+            "        await this.sender.Send(command);\n",
+            "    }\n",
+            "    public async Task Lower() {\n",
+            "        await this.sender.Send(new lower());\n",
+            "    }\n",
+            "    public async Task Wire() {\n",
+            "        await _client.Send(new CreateThingCommand(\"x\"));\n",
+            "    }\n",
+            "}\n",
+        );
+        let project = Project::new()
+            .file("Requests.cs", REQUESTS_CS)
+            .file("Handlers.cs", HANDLERS_CS)
+            .file("Jobs.cs", controller)
+            .index();
+        let graph = graph_of(&project);
+        let line = line_of(controller, "await this.sender.Send(command);");
+        assert_eq!(
+            links(graph, "mediatr-dispatch"),
+            [format!(
+                "Shop::Jobs::Rerun -> Shop::CreateThingCommandHandler::Handle via CreateThingCommand @Jobs.cs:{line} line {line}"
+            )],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// A handler's base list is read from the first four lines of its
+    /// class: a class whose own `Handle` sits beside an
+    /// `IRequestHandler<X>` only on its fifth line handles nothing.
+    #[test]
+    fn w716a_mediatr_reads_a_handlers_base_list_in_its_first_four_lines() {
+        let audit = concat!(
+            "namespace Shop;\n",
+            "public class AuditTrail\n",
+            "{\n",
+            "    public Task Handle(CreateThingCommand request, CancellationToken ct) => Task.CompletedTask;\n",
+            "\n",
+            "    // Not a handler: IRequestHandler<CreateThingCommand> is only named here.\n",
+            "}\n",
+        );
+        let project = Project::new()
+            .file("Requests.cs", REQUESTS_CS)
+            .file("Handlers.cs", HANDLERS_CS)
+            .file("AuditTrail.cs", audit)
+            .file("ThingsController.cs", THINGS_CONTROLLER_CS)
+            .index();
+        let graph = graph_of(&project);
+        let links = links(graph, "mediatr-dispatch");
+        assert!(
+            links.iter().any(|link| link.starts_with(
+                "Shop::ThingsController::Create -> Shop::CreateThingCommandHandler::Handle"
+            )),
+            "{links:#?}"
+        );
+        assert!(
+            !links.iter().any(|link| link.contains("AuditTrail")),
+            "{links:#?}"
+        );
+    }
+
+    /// Upstream `sidekiq-dispatch-synthesizer.test.ts`, first case: both
+    /// mixin aliases, `perform_async` and `perform_in`, and a qualified name
+    /// that keeps two `NotifyWorker`s apart; a class that only has a
+    /// `perform` and an ActiveJob reach nothing.
+    #[test]
+    fn w716a_sidekiq_links_enqueues_to_their_workers() {
+        let project = Project::new()
+            .file("app/workers/destroy_user_worker.rb", DESTROY_USER_WORKER_RB)
+            .file("app/workers/send_email_worker.rb", SEND_EMAIL_WORKER_RB)
+            .file(
+                "app/workers/comments/notify_worker.rb",
+                COMMENTS_NOTIFY_WORKER_RB,
+            )
+            .file(
+                "app/workers/articles/notify_worker.rb",
+                ARTICLES_NOTIFY_WORKER_RB,
+            )
+            .file("app/services/report.rb", REPORT_RB)
+            .file("app/jobs/cleanup_job.rb", CLEANUP_JOB_RB)
+            .file("app/services/user_service.rb", USER_SERVICE_RB)
+            .index();
+        let graph = graph_of(&project);
+        let at = |needle: &str| {
+            let line = line_of(USER_SERVICE_RB, needle);
+            format!("@app/services/user_service.rb:{line} line {line}")
+        };
+        assert_eq!(
+            links(graph, "sidekiq-dispatch"),
+            [
+                format!(
+                    "UserService::deactivate -> Articles::NotifyWorker::perform via Articles::NotifyWorker {}",
+                    at("Articles::NotifyWorker.perform_async(2)")
+                ),
+                format!(
+                    "UserService::deactivate -> Comments::NotifyWorker::perform via Comments::NotifyWorker {}",
+                    at("Comments::NotifyWorker.perform_async(1)")
+                ),
+                format!(
+                    "UserService::deactivate -> DestroyUserWorker::perform via DestroyUserWorker {}",
+                    at("DestroyUserWorker.perform_async(user.id)")
+                ),
+                format!(
+                    "UserService::deactivate -> SendEmailWorker::perform via SendEmailWorker {}",
+                    at("SendEmailWorker.perform_in(5, user.email)")
+                ),
+            ],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream's second case: Ruby without Sidekiq links nothing.
+    #[test]
+    fn w716a_sidekiq_needs_a_worker() {
+        let project = Project::new().file("lib/calc.rb", SIDEKIQ_FREE_RB).index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            links(graph, "sidekiq-dispatch"),
+            Vec::<String>::new(),
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// An unqualified name two workers share reaches neither. The mixin is
+    /// read from the class's text as upstream reads it, so a commented-out
+    /// `include Sidekiq::Worker` still makes a worker.
+    #[test]
+    fn w716a_sidekiq_needs_one_worker_of_an_unqualified_name() {
+        let caller = concat!(
+            "class Notifier\n",
+            "  def notify\n",
+            "    NotifyWorker.perform_async(1)\n",
+            "    QuietWorker.perform_async(2)\n",
+            "  end\n",
+            "end\n",
+        );
+        let quiet = concat!(
+            "class QuietWorker\n",
+            "  # include Sidekiq::Worker\n",
+            "  def perform(id)\n",
+            "  end\n",
+            "end\n",
+        );
+        let project = Project::new()
+            .file(
+                "app/workers/comments/notify_worker.rb",
+                COMMENTS_NOTIFY_WORKER_RB,
+            )
+            .file(
+                "app/workers/articles/notify_worker.rb",
+                ARTICLES_NOTIFY_WORKER_RB,
+            )
+            .file("app/workers/quiet_worker.rb", quiet)
+            .file("app/services/notifier.rb", caller)
+            .index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            links(graph, "sidekiq-dispatch"),
+            [
+                "Notifier::notify -> QuietWorker::perform via QuietWorker @app/services/notifier.rb:4 line 4"
+            ],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// The project of upstream's Laravel test.
+    fn laravel_project() -> Project {
+        let mut project = Project::new();
+        for (name, body) in [
+            (
+                "SongLiked",
+                "public int $id; public function __construct(int $id) { $this->id = $id; }",
+            ),
+            ("LibraryChanged", ""),
+            ("ScanDone", ""),
+            ("OwnerTest", ""),
+            ("UserTest", ""),
+        ] {
+            project = project.file(
+                &format!("app/Events/{name}.php"),
+                &laravel_event(name, body),
+            );
+        }
+        project
+            .file("app/Listeners/LoveTrack.php", LOVE_TRACK_PHP)
+            .file("app/Listeners/PruneLibrary.php", PRUNE_LIBRARY_PHP)
+            .file("app/Listeners/WriteScanLog.php", WRITE_SCAN_LOG_PHP)
+            .file("app/Listeners/DeleteStale.php", DELETE_STALE_PHP)
+            .file(
+                "app/Listeners/SendsTestNotification.php",
+                SENDS_TEST_NOTIFICATION_PHP,
+            )
+            .file("app/Jobs/ProcessAudio.php", PROCESS_AUDIO_PHP)
+    }
+
+    /// Upstream `laravel-event-synthesizer.test.ts`, first case: a typed
+    /// `handle`, the `$listen` map's untyped one, a union type and a fan-out
+    /// each reach their listeners; a queued job's dispatch reaches nothing.
+    #[test]
+    fn w716a_laravel_links_events_to_their_listeners() {
+        let project = laravel_project()
+            .file(
+                "app/Providers/EventServiceProvider.php",
+                EVENT_SERVICE_PROVIDER_PHP,
+            )
+            .file("app/Services/SongService.php", SONG_SERVICE_PHP)
+            .index();
+        let graph = graph_of(&project);
+        let at = |needle: &str| {
+            let line = line_of(SONG_SERVICE_PHP, needle);
+            format!("@app/Services/SongService.php:{line} line {line}")
+        };
+        let service = "App\\Services::SongService";
+        assert_eq!(
+            links(graph, "laravel-event"),
+            [
+                format!(
+                    "{service}::deleteSongs -> App\\Listeners::PruneLibrary::handle via LibraryChanged {}",
+                    at("event(new LibraryChanged())")
+                ),
+                format!(
+                    "{service}::like -> App\\Listeners::LoveTrack::handle via SongLiked {}",
+                    at("event(new SongLiked($id))")
+                ),
+                format!(
+                    "{service}::ownerTest -> App\\Listeners::SendsTestNotification::handle via OwnerTest {}",
+                    at("event(new OwnerTest())")
+                ),
+                format!(
+                    "{service}::scan -> App\\Listeners::DeleteStale::handle via ScanDone {}",
+                    at("event(new ScanDone())")
+                ),
+                format!(
+                    "{service}::scan -> App\\Listeners::WriteScanLog::handle via ScanDone {}",
+                    at("event(new ScanDone())")
+                ),
+                format!(
+                    "{service}::userTest -> App\\Listeners::SendsTestNotification::handle via UserTest {}",
+                    at("event(new UserTest())")
+                ),
+            ],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream's second case: PHP without Laravel events links nothing.
+    #[test]
+    fn w716a_laravel_needs_a_listener() {
+        let project = Project::new()
+            .file("src/Client.php", EVENT_FREE_PHP)
+            .index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            links(graph, "laravel-event"),
+            Vec::<String>::new(),
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// A `$listen` map in a block comment registers nothing, and a nullable
+    /// `handle(?SongLiked $event)` listens all the same.
+    #[test]
+    fn w716a_laravel_reads_the_listen_map_without_comments() {
+        let provider = concat!(
+            "<?php\n",
+            "namespace App\\Providers;\n",
+            "class EventServiceProvider {\n",
+            "    /* protected $listen = [\n",
+            "        LibraryChanged::class => [PruneLibrary::class],\n",
+            "    ]; */\n",
+            "}\n",
+        );
+        let nullable = concat!(
+            "<?php\n",
+            "namespace App\\Listeners;\n",
+            "class MaybeLove {\n",
+            "    public function handle(?SongLiked $event): void {}\n",
+            "}\n",
+        );
+        let project = laravel_project()
+            .file("app/Providers/EventServiceProvider.php", provider)
+            .file("app/Listeners/MaybeLove.php", nullable)
+            .file("app/Services/SongService.php", SONG_SERVICE_PHP)
+            .index();
+        let graph = graph_of(&project);
+        let links = links(graph, "laravel-event");
+        assert!(
+            links.iter().any(|link| link.starts_with(
+                "App\\Services::SongService::like -> App\\Listeners::MaybeLove::handle via SongLiked"
+            )),
+            "{links:#?}"
+        );
+        assert!(
+            !links.iter().any(|link| link.contains("PruneLibrary")),
+            "{links:#?}"
+        );
+    }
+
+    /// The `(source name, target name)` of every `calls` edge the pass `by`
+    /// made, sorted.
+    fn name_pairs(graph: &Graph, by: &str) -> Vec<(String, String)> {
+        let name = |id: &str| {
+            graph
+                .node(id)
+                .map_or_else(|| "?".to_string(), |node| node.name.clone())
+        };
+        let mut pairs: Vec<(String, String)> = synthesized_by(graph, by)
+            .map(|edge| (name(&edge.source), name(&edge.target)))
+            .collect();
+        pairs.sort();
+        pairs
+    }
+
+    /// The pairs `(source, prefix{i})` for each `i` of `range`, sorted.
+    fn pairs_to(
+        source: &str,
+        prefix: &str,
+        range: std::ops::Range<usize>,
+    ) -> Vec<(String, String)> {
+        let mut pairs: Vec<(String, String)> = range
+            .map(|i| (source.to_string(), format!("{prefix}{i}")))
+            .collect();
+        pairs.sort();
+        pairs
+    }
+
+    /// A thunk links at most 24 of the thunks it dispatches: the 25th
+    /// dispatch is not read.
+    #[test]
+    fn w716a_a_thunk_links_at_most_24_dispatches() {
+        let mut ts = String::from("import { createAsyncThunk } from '@reduxjs/toolkit';\n");
+        for i in 0..25 {
+            ts.push_str(&format!("export function f{i}() {{ return {i}; }}\n"));
+        }
+        ts.push_str(
+            "export const many = createAsyncThunk('many', async (_: void, { dispatch }) => {\n",
+        );
+        for i in 0..25 {
+            ts.push_str(&format!("  dispatch(f{i}());\n"));
+        }
+        ts.push_str("});\n");
+        let project = Project::new()
+            .file("package.json", THUNK_PACKAGE_JSON)
+            .file("many.ts", &ts)
+            .index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            name_pairs(graph, "redux-thunk"),
+            pairs_to("many", "f", 0..24),
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Celery links at most 80 dispatches a file: the 81st is not read.
+    #[test]
+    fn w716a_celery_links_at_most_80_dispatches_a_file() {
+        let mut py = String::from("from celery import shared_task\n");
+        for i in 0..81 {
+            py.push_str(&format!("\n@shared_task\ndef t{i}():\n    pass\n"));
+        }
+        py.push_str("\ndef go():\n");
+        for i in 0..81 {
+            py.push_str(&format!("    t{i}.delay()\n"));
+        }
+        let project = Project::new().file("tasks.py", &py).index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            name_pairs(graph, "celery-dispatch"),
+            pairs_to("go", "t", 0..80),
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Sidekiq links at most 80 enqueues a file: the 81st is not read.
+    #[test]
+    fn w716a_sidekiq_links_at_most_80_enqueues_a_file() {
+        let mut rb = String::new();
+        for i in 0..81 {
+            rb.push_str(&format!(
+                "class W{i}\n  include Sidekiq::Job\n  def perform\n  end\nend\n\n"
+            ));
+        }
+        let mut go = String::from("class Go\n  def go\n");
+        for i in 0..81 {
+            go.push_str(&format!("    W{i}.perform_async\n"));
+        }
+        go.push_str("  end\nend\n");
+        let project = Project::new()
+            .file("app/workers/workers.rb", &rb)
+            .file("app/services/go.rb", &go)
+            .index();
+        let graph = graph_of(&project);
+        let pairs = name_pairs(graph, "sidekiq-dispatch");
+        assert_eq!(pairs.len(), 80, "{pairs:?}");
+        assert!(
+            pairs
+                .iter()
+                .all(|(source, target)| source == "go" && target == "perform"),
+            "{pairs:?}"
+        );
+        let targets: std::collections::BTreeSet<String> = synthesized_by(graph, "sidekiq-dispatch")
+            .map(|edge| edge.metadata["via"].as_str().unwrap_or("?").to_string())
+            .collect();
+        let expected: std::collections::BTreeSet<String> =
+            (0..80).map(|i| format!("W{i}")).collect();
+        assert_eq!(targets, expected);
+    }
+
+    /// Spring checks its cap of 80 before each published event, not before
+    /// each edge: of 81 events the 80th, heard by two listeners, links both
+    /// (81 edges) and the 81st is not read.
+    #[test]
+    fn w716a_spring_checks_its_cap_before_each_published_event() {
+        let mut listeners = String::from(concat!(
+            "package app;\n",
+            "import org.springframework.context.event.EventListener;\n",
+            "public class Listeners {\n",
+        ));
+        for i in 0..81 {
+            listeners.push_str(&format!(
+                "    @EventListener\n    public void on{i}(E{i} e) {{}}\n"
+            ));
+            if i == 79 {
+                listeners.push_str("    @EventListener\n    public void again79(E79 e) {}\n");
+            }
+        }
+        listeners.push_str("}\n");
+        let mut publisher = String::from(concat!(
+            "package app;\n",
+            "public class Publisher {\n",
+            "    private ApplicationEventPublisher publisher;\n",
+            "    public void go() {\n",
+        ));
+        for i in 0..81 {
+            publisher.push_str(&format!("        publisher.publishEvent(new E{i}());\n"));
+        }
+        publisher.push_str("    }\n}\n");
+        let project = Project::new()
+            .file("src/Listeners.java", &listeners)
+            .file("src/Publisher.java", &publisher)
+            .index();
+        let graph = graph_of(&project);
+        let mut expected = pairs_to("go", "on", 0..80);
+        expected.push(("go".to_string(), "again79".to_string()));
+        expected.sort();
+        assert_eq!(
+            name_pairs(graph, "spring-event"),
+            expected,
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// MediatR checks its cap of 80 before each send, not before each edge:
+    /// of 81 sends the 80th, handled twice, links both and the 81st is not
+    /// read.
+    #[test]
+    fn w716a_mediatr_checks_its_cap_before_each_send() {
+        let mut handlers = String::from("using MediatR;\nnamespace App;\n");
+        for i in 0..81 {
+            handlers.push_str(&format!(
+                "public class H{i} : IRequestHandler<R{i}>\n{{\n    public Task Handle(R{i} request, CancellationToken token) => Task.CompletedTask;\n}}\n"
+            ));
+            if i == 79 {
+                handlers.push_str(
+                    "public class Again79 : IRequestHandler<R79>\n{\n    public Task Handle(R79 request, CancellationToken token) => Task.CompletedTask;\n}\n",
+                );
+            }
+        }
+        let mut controller = String::from(concat!(
+            "using MediatR;\n",
+            "namespace App;\n",
+            "public class Controller\n",
+            "{\n",
+            "    private readonly IMediator _mediator;\n",
+            "    public async Task Go()\n",
+            "    {\n",
+        ));
+        for i in 0..81 {
+            controller.push_str(&format!("        await _mediator.Send(new R{i}());\n"));
+        }
+        controller.push_str("    }\n}\n");
+        let project = Project::new()
+            .file("Handlers.cs", &handlers)
+            .file("Controller.cs", &controller)
+            .index();
+        let graph = graph_of(&project);
+        let mut expected: Vec<String> = (0..80).map(|i| format!("App::H{i}::Handle")).collect();
+        expected.push("App::Again79::Handle".to_string());
+        expected.sort();
+        let mut targets: Vec<String> = synthesized_by(graph, "mediatr-dispatch")
+            .map(|edge| {
+                graph
+                    .node(&edge.target)
+                    .expect("target")
+                    .qualified_name
+                    .clone()
+            })
+            .collect();
+        targets.sort();
+        assert_eq!(targets, expected, "{}", graph.report());
+        assert!(synthesized_by(graph, "mediatr-dispatch").all(|edge| {
+            graph
+                .node(&edge.source)
+                .is_some_and(|node| node.name == "Go")
+        }));
+    }
+
+    /// Laravel checks its cap of 200 before each dispatched event, not
+    /// before each edge: of 201 events the 200th, heard by two listeners,
+    /// links both and the 201st is not read.
+    #[test]
+    fn w716a_laravel_checks_its_cap_before_each_event() {
+        let mut listeners = String::from("<?php\nnamespace App\\Listeners;\n");
+        for i in 0..201 {
+            listeners.push_str(&format!(
+                "class L{i}\n{{\n    public function handle(E{i} $event)\n    {{\n    }}\n}}\n"
+            ));
+            if i == 199 {
+                listeners.push_str(
+                    "class Again199\n{\n    public function handle(E199 $event)\n    {\n    }\n}\n",
+                );
+            }
+        }
+        let mut dispatcher = String::from(concat!(
+            "<?php\n",
+            "namespace App\\Http;\n",
+            "class Go\n",
+            "{\n",
+            "    public function go()\n",
+            "    {\n",
+        ));
+        for i in 0..201 {
+            dispatcher.push_str(&format!("        event(new E{i}());\n"));
+        }
+        dispatcher.push_str("    }\n}\n");
+        let project = Project::new()
+            .file("app/Listeners/Listeners.php", &listeners)
+            .file("app/Http/Go.php", &dispatcher)
+            .index();
+        let graph = graph_of(&project);
+        let mut expected: Vec<String> = (0..200)
+            .map(|i| format!("App\\Listeners::L{i}::handle"))
+            .collect();
+        expected.push("App\\Listeners::Again199::handle".to_string());
+        expected.sort();
+        let mut targets: Vec<String> = synthesized_by(graph, "laravel-event")
+            .map(|edge| {
+                graph
+                    .node(&edge.target)
+                    .expect("target")
+                    .qualified_name
+                    .clone()
+            })
+            .collect();
+        targets.sort();
+        assert_eq!(targets, expected, "{}", graph.report());
+    }
+
+    /// The thunk pass runs only when the index has a JavaScript-family file;
+    /// then its sources are the matching constants of any language.
+    #[test]
+    fn w716a_thunks_need_a_javascript_family_file() {
+        const GO: &str = concat!(
+            "package p\n",
+            "\n",
+            "const outer = \"createAsyncThunk(dispatch(inner()))\"\n",
+            "\n",
+            "func inner() {}\n",
+        );
+        let go_only = Project::new().file("a.go", GO).index();
+        let graph = graph_of(&go_only);
+        let pairs = name_pairs(graph, "redux-thunk");
+        assert!(pairs.is_empty(), "{pairs:?}\n{}", graph.report());
+        let with_ts = Project::new()
+            .file("a.go", GO)
+            .file("x.ts", "export const unrelated = 1;\n")
+            .index();
+        let graph = graph_of(&with_ts);
+        assert_eq!(
+            name_pairs(graph, "redux-thunk"),
+            [("outer".to_string(), "inner".to_string())],
+            "{}",
+            graph.report()
+        );
+        let edge = synthesized_by(graph, "redux-thunk")
+            .next()
+            .expect("an edge");
+        assert_eq!(edge.metadata["registeredAt"], "a.go:3");
+    }
+
+    /// A thunk constant of `label` named `name`, in a file of its own.
+    fn thunk_named(name: &str, label: &str) -> String {
+        format!(
+            "import {{ createAsyncThunk }} from '@reduxjs/toolkit';\n\nexport const {name} = createAsyncThunk('{label}/{name}', async () => 1);\n"
+        )
+    }
+
+    /// The thunk `outer`, which dispatches `next()`.
+    fn outer_dispatching(next: &str) -> String {
+        format!(
+            "import {{ createAsyncThunk }} from '@reduxjs/toolkit';\n\nexport const outer = createAsyncThunk('c/outer', async (_: void, {{ dispatch }}) => {{\n  await dispatch({next}());\n}});\n"
+        )
+    }
+
+    /// `outer`'s one dispatch line in [`outer_dispatching`].
+    const OUTER_DISPATCH_LINE: usize = 4;
+
+    /// KEEP-RUST (OD-B14): a dispatched name two thunks share reaches
+    /// neither, even when the dispatching thunk's own file holds one of them;
+    /// upstream takes the first thunk of the name. One thunk of the name is
+    /// reached.
+    #[test]
+    fn w716d_a_name_two_thunks_share_reaches_neither() {
+        let project = Project::new()
+            .file("package.json", THUNK_PACKAGE_JSON)
+            .file("a.ts", &thunk_named("inner", "a"))
+            .file("b.ts", &thunk_named("inner", "b"))
+            .file("c.ts", &outer_dispatching("inner"))
+            .index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            links(graph, "redux-thunk"),
+            Vec::<String>::new(),
+            "{}",
+            graph.report()
+        );
+
+        let own = format!(
+            "{}\nexport const inner = createAsyncThunk('c/inner', async () => 1);\n",
+            outer_dispatching("inner")
+        );
+        let project = Project::new()
+            .file("package.json", THUNK_PACKAGE_JSON)
+            .file("a.ts", &thunk_named("inner", "a"))
+            .file("c.ts", &own)
+            .index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            links(graph, "redux-thunk"),
+            Vec::<String>::new(),
+            "{}",
+            graph.report()
+        );
+
+        let project = Project::new()
+            .file("package.json", THUNK_PACKAGE_JSON)
+            .file("a.ts", &thunk_named("inner", "a"))
+            .file("c.ts", &outer_dispatching("inner"))
+            .index();
+        let graph = graph_of(&project);
+        let line = OUTER_DISPATCH_LINE;
+        assert_eq!(
+            links(graph, "redux-thunk"),
+            [format!("outer -> inner via inner @c.ts:{line} line {line}")],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// KEEP-RUST (OD-B14): with no thunk of the name, two action-creator
+    /// constants of it reach neither, and with no constant either, two
+    /// functions of it in other files reach neither. One of each is reached.
+    #[test]
+    fn w716d_a_name_two_constants_or_two_functions_share_reaches_neither() {
+        let creator = |label: &str| {
+            format!(
+                "import {{ createAction }} from '@reduxjs/toolkit';\n\nexport const reset = createAction('{label}/reset');\n"
+            )
+        };
+        let function = |value: u8| format!("export function load() {{\n  return {value};\n}}\n");
+        let line = OUTER_DISPATCH_LINE;
+        for (files, next, linked) in [
+            (
+                vec![("a.ts", creator("a")), ("b.ts", creator("b"))],
+                "reset",
+                false,
+            ),
+            (vec![("a.ts", creator("a"))], "reset", true),
+            (
+                vec![("a.ts", function(1)), ("b.ts", function(2))],
+                "load",
+                false,
+            ),
+            (vec![("a.ts", function(1))], "load", true),
+        ] {
+            let project = files
+                .iter()
+                .fold(
+                    Project::new().file("package.json", THUNK_PACKAGE_JSON),
+                    |project, (path, text)| project.file(path, text),
+                )
+                .file("c.ts", &outer_dispatching(next))
+                .index();
+            let graph = graph_of(&project);
+            let expected = if linked {
+                vec![format!(
+                    "outer -> {next} via {next} @c.ts:{line} line {line}"
+                )]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(links(graph, "redux-thunk"), expected, "{}", graph.report());
+        }
+    }
+
+    /// The enqueue of `Comments::NotifyWorker` from `Notifier#run`.
+    const NOTIFIER_RB: &str = concat!(
+        "class Notifier\n",
+        "  def run\n",
+        "    Comments::NotifyWorker.perform_async(1)\n",
+        "  end\n",
+        "end\n",
+    );
+
+    /// KEEP-RUST (OD-B14): a qualified name two worker classes carry, one in
+    /// a reopened `module Comments` and one written `class
+    /// Comments::NotifyWorker`, each with the mixin and a `perform`, reaches
+    /// neither, nor falls back to the one class whose own name is the last
+    /// segment; upstream takes the first class. Without the second's mixin
+    /// the first is the one worker.
+    #[test]
+    fn w716d_a_qualified_name_two_workers_carry_reaches_neither() {
+        let compact = |mixin: &str| {
+            format!("class Comments::NotifyWorker\n{mixin}  def perform(id)\n  end\nend\n")
+        };
+        let project = Project::new()
+            .file(
+                "app/workers/comments/notify_worker.rb",
+                COMMENTS_NOTIFY_WORKER_RB,
+            )
+            .file(
+                "app/workers/legacy/notify_worker.rb",
+                &compact("  include Sidekiq::Job\n"),
+            )
+            .file("app/services/notifier.rb", NOTIFIER_RB)
+            .index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            links(graph, "sidekiq-dispatch"),
+            Vec::<String>::new(),
+            "{}",
+            graph.report()
+        );
+
+        let project = Project::new()
+            .file(
+                "app/workers/comments/notify_worker.rb",
+                COMMENTS_NOTIFY_WORKER_RB,
+            )
+            .file("app/workers/legacy/notify_worker.rb", &compact(""))
+            .file("app/services/notifier.rb", NOTIFIER_RB)
+            .index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            links(graph, "sidekiq-dispatch"),
+            [
+                "Notifier::run -> Comments::NotifyWorker::perform via Comments::NotifyWorker @app/services/notifier.rb:3 line 3"
+            ],
+            "{}",
+            graph.report()
+        );
+        let edge = synthesized_by(graph, "sidekiq-dispatch")
+            .next()
+            .expect("the edge");
+        assert_eq!(
+            graph.node(&edge.target).map(|node| node.file_path.as_str()),
+            Some("app/workers/comments/notify_worker.rb")
+        );
+    }
+
+    /// KEEP-RUST (OD-B14): two classes of one qualified name on one line are
+    /// two candidates, though the line's first `perform` is the only method
+    /// either reaches: the enqueue reaches neither.
+    #[test]
+    fn w716d_two_classes_of_a_qualified_name_on_one_line_reach_neither() {
+        let workers = concat!(
+            "module Comments\n",
+            "  class NotifyWorker; include Sidekiq::Job; def perform(id); end; end; class NotifyWorker; end\n",
+            "end\n",
+        );
+        let project = Project::new()
+            .file("app/workers/notify_worker.rb", workers)
+            .file("app/services/notifier.rb", NOTIFIER_RB)
+            .index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            graph
+                .nodes_named("class", "NotifyWorker")
+                .iter()
+                .filter(|node| node.qualified_name == "Comments::NotifyWorker")
+                .count(),
+            2,
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            links(graph, "sidekiq-dispatch"),
+            Vec::<String>::new(),
+            "{}",
+            graph.report()
+        );
+    }
+}
+
+/// W7-17a: upstream's `c-fnptr-synthesizer.test.ts` (`e8ddc4e2`), the
+/// sources as written there, and the cases the Rust port adds.
+mod c_fnptr {
+    use super::support::{Graph, Project, graph_of};
+
+    /// Every `fn-pointer-dispatch` edge, as `source -> target via <via>
+    /// @<registeredAt> line <line>` over node names, sorted; each is a
+    /// heuristic `calls` edge without a column.
+    #[track_caller]
+    fn links(graph: &Graph) -> Vec<String> {
+        let name = |id: &str| {
+            graph
+                .node(id)
+                .map_or_else(|| "?".to_string(), |node| node.name.clone())
+        };
+        let mut links: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.metadata["synthesizedBy"] == "fn-pointer-dispatch")
+            .map(|edge| {
+                assert_eq!(edge.kind, "calls", "{edge:?}");
+                assert_eq!(edge.provenance.as_deref(), Some("heuristic"), "{edge:?}");
+                assert_eq!(edge.col, None, "{edge:?}");
+                format!(
+                    "{} -> {} via {} @{} line {}",
+                    name(&edge.source),
+                    name(&edge.target),
+                    edge.metadata["via"].as_str().unwrap_or("?"),
+                    edge.metadata["registeredAt"].as_str().unwrap_or("?"),
+                    edge.line
+                        .map_or_else(|| "?".to_string(), |line| line.to_string()),
+                )
+            })
+            .collect();
+        links.sort();
+        links
+    }
+
+    /// The 1-based line of `text` holding `needle`.
+    #[track_caller]
+    fn line_of(text: &str, needle: &str) -> usize {
+        text.split('\n')
+            .position(|line| line.contains(needle))
+            .unwrap_or_else(|| panic!("no line holds {needle:?}"))
+            + 1
+    }
+
+    /// `source -> target via <via> @<file>:<line> line <line>`.
+    fn link(source: &str, target: &str, via: &str, file: &str, line: usize) -> String {
+        format!("{source} -> {target} via {via} @{file}:{line} line {line}")
+    }
+
+    /// `cmd.c` of upstream's case 01 (bridges-a-name-fn-command-table-dispatched-through-p-fn-the-).
+    const C01_CMD_C: &str = concat!(
+        "\n",
+        "struct cmd { const char *name; int (*fn)(int argc); };\n",
+        "static int cmd_add(int argc) { return argc + 1; }\n",
+        "static int cmd_rm(int argc) { return argc - 1; }\n",
+        "static int cmd_noop(int argc) { return argc; }   /* defined, NOT in the table */\n",
+        "\n",
+        "static struct cmd commands[] = {\n",
+        "    { \"add\", cmd_add },\n",
+        "    { \"rm\",  cmd_rm  },\n",
+        "};\n",
+        "\n",
+        "int run_builtin(struct cmd *p, int argc) {\n",
+        "    return p->fn(argc);\n",
+        "}\n",
+    );
+
+    /// `ops.c` of upstream's case 02 (bridges-designated-init-handler-fn-and-by-value-c-fn-dispatc).
+    const C02_OPS_C: &str = concat!(
+        "\n",
+        "struct ops { int (*handler)(void); int size; };\n",
+        "static int on_open(void) { return 1; }\n",
+        "static struct ops the_ops = { .handler = on_open, .size = 4 };\n",
+        "\n",
+        "int dispatch(struct ops o) { return o.handler(); }\n",
+    );
+
+    /// `union-ops.c` of upstream's case 03 (bridges-function-pointer-fields-declared-in-a-union).
+    const C03_UNION_OPS_C: &str = concat!(
+        "\n",
+        "union ops { int (*handler)(void); };\n",
+        "static int on_open(void) { return 1; }\n",
+        "static union ops the_ops = { .handler = on_open };\n",
+        "\n",
+        "int dispatch(union ops o) { return o.handler(); }\n",
+    );
+
+    /// `inline-union.c` of upstream's case 04 (bridges-an-inline-union-table-whose-entries-are-macro-built).
+    const C04_INLINE_UNION_C: &str = concat!(
+        "\n",
+        "#define SLOT(fn) { fn }\n",
+        "static int on_open(void) { return 1; }\n",
+        "static union inline_ops { int (*handler)(void); } ops[] = { SLOT(on_open) };\n",
+        "\n",
+        "int dispatch(union inline_ops o) { return o.handler(); }\n",
+    );
+
+    /// `alias-union.c` of upstream's case 05 (bridges-a-union-table-declared-through-an-object-macro-type-).
+    const C05_ALIAS_UNION_C: &str = concat!(
+        "\n",
+        "#define OPS_TYPE union ops\n",
+        "#define SLOT(fn) { fn }\n",
+        "union ops { int (*handler)(void); };\n",
+        "static int on_open(void) { return 1; }\n",
+        "static OPS_TYPE ops[] = { SLOT(on_open) };\n",
+        "\n",
+        "int dispatch(union ops o) { return o.handler(); }\n",
+    );
+
+    /// `hook.c` of upstream's case 06 (bridges-the-typedef-field-field-field-double-hop-the-hook-de).
+    const C06_HOOK_C: &str = concat!(
+        "\n",
+        "typedef void (*hook_func)(void);\n",
+        "struct hooks { hook_func func; };\n",
+        "struct entry { const char *name; hook_func fn; };\n",
+        "\n",
+        "static void hk_set(void) {}\n",
+        "static void hk_get(void) {}\n",
+        "\n",
+        "static const struct entry registry[] = {\n",
+        "    { \"set\", hk_set },\n",
+        "    { \"get\", hk_get },\n",
+        "};\n",
+        "\n",
+        "void call(struct hooks *h, const struct entry *found) {\n",
+        "    h->func = found->fn;   /* generic slot reassigned from the registry */\n",
+        "    h->func();             /* dispatch through hooks.func */\n",
+        "}\n",
+    );
+
+    /// `vtable.c` of upstream's case 07 (keys-by-struct-field-distinct-fn-pointer-fields-do-not-cross).
+    const C07_VTABLE_C: &str = concat!(
+        "\n",
+        "struct io { int (*read)(void); int (*write)(int); };\n",
+        "static int do_read(void) { return 0; }\n",
+        "static int do_write(int x) { return x; }\n",
+        "static struct io io = { .read = do_read, .write = do_write };\n",
+        "\n",
+        "int only_reads(struct io *p) { return p->read(); }\n",
+    );
+
+    /// `data.c` of upstream's case 08 (does-not-bridge-a-plain-data-field-and-no-ops-on-a-struct-wi).
+    const C08_DATA_C: &str = concat!(
+        "\n",
+        "struct box { int count; int (*fn)(void); };\n",
+        "static int helper(void) { return 0; }\n",
+        "static struct box b = { .count = 3, .fn = helper };\n",
+        "\n",
+        "/* reads a data field and never dispatches the fn pointer */\n",
+        "int total(struct box *x) { return x->count + 1; }\n",
+    );
+
+    /// `app.js` of upstream's case 09 (is-a-no-op-on-a-project-with-no-c-c-clean-control).
+    const C09_APP_JS: &str = concat!(
+        "\n",
+        "const handlers = { add: (x) => x + 1, rm: (x) => x - 1 };\n",
+        "function run(name, x) { return handlers[name](x); }\n",
+    );
+
+    /// `reg.c` of upstream's case 10 (bridges-a-macro-built-table-with-a-typedef-field-type-alias-).
+    const C10_REG_C: &str = concat!(
+        "\n",
+        "#include \"reg.h\"\n",
+        "#define ENTRY(nm, handler) nm, handler       /* function-like macro wrapping the handler */\n",
+        "#define CMD_T command                        /* object-like macro: the struct-type alias */\n",
+        "static void getCmd(int x) {}\n",
+        "static void setCmd(int x) {}\n",
+        "static void unusedCmd(int x) {}              /* defined, NOT in the table */\n",
+        "static struct CMD_T table[] = {\n",
+        "    { ENTRY(\"get\", getCmd) },\n",
+        "    { ENTRY(\"set\", setCmd) },\n",
+        "};\n",
+        "void run(struct context *ctx, int x) { ctx->cmd->proc(x); }  /* context.cmd → command → proc */\n",
+    );
+
+    /// `reg.h` of upstream's case 10 (bridges-a-macro-built-table-with-a-typedef-field-type-alias-).
+    const C10_REG_H: &str = concat!(
+        "\n",
+        "typedef void cmdProc(int x);                 /* function-TYPE typedef, not (*name) */\n",
+        "struct command { const char *name; cmdProc *proc; };\n",
+        "struct context { int id; struct command *cmd, *last; };  /* multi-declarator field */\n",
+    );
+
+    /// `inc.h` of upstream's case 11 (reads-a-macro-built-table-from-a-non-indexed-included-file).
+    const C11_INC_H: &str = concat!(
+        "\n",
+        "typedef int opRun(void);\n",
+        "struct op { const char *name; opRun *run; };\n",
+    );
+
+    /// `inc.c` of upstream's case 11 (reads-a-macro-built-table-from-a-non-indexed-included-file).
+    const C11_INC_C: &str = concat!(
+        "\n",
+        "#include \"inc.h\"\n",
+        "#define MK(nm, fn) nm, fn\n",
+        "#define CMD_T op\n",
+        "static int a_impl(void){return 0;}\n",
+        "static int b_impl(void){return 0;}\n",
+        "#include \"ops.def\"\n",
+        "int go(struct op *o) { return o->run(); }\n",
+    );
+
+    /// `ops.def` of upstream's case 11 (reads-a-macro-built-table-from-a-non-indexed-included-file).
+    const C11_OPS_DEF: &str = concat!(
+        "\n",
+        "static struct CMD_T optable[] = {\n",
+        "  { MK(\"a\", a_impl) },\n",
+        "  { MK(\"b\", b_impl) },\n",
+        "};\n",
+    );
+
+    /// `fn.c` of upstream's case 12 (expands-a-header-defined-macro-that-produces-a-brace-wrapped).
+    const C12_FN_C: &str = concat!(
+        "\n",
+        "#include \"fn.h\"\n",
+        "static void absImpl(int *ctx) {}\n",
+        "static void lenImpl(int *ctx) {}\n",
+        "static struct FuncDef builtins[] = {\n",
+        "    MKFUNC(abs, absImpl),\n",
+        "    MKFUNC(len, lenImpl),\n",
+        "};\n",
+        "void invoke(struct FuncDef *p, int *x) { p->xFunc(x); }\n",
+    );
+
+    /// `fn.h` of upstream's case 12 (expands-a-header-defined-macro-that-produces-a-brace-wrapped).
+    const C12_FN_H: &str = concat!(
+        "\n",
+        "typedef void sqlFn(int *ctx);\n",
+        "struct FuncDef { int nArg; sqlFn *xFunc; const char *zName; };\n",
+        "#define MKFUNC(name, impl) { 1, impl, #name }\n",
+    );
+
+    /// `cmds.h` of upstream's case 13 (bridges-an-ifdef-guarded-inline-struct-table-dispatched-by-a).
+    const C13_CMDS_H: &str = concat!(
+        "\n",
+        "#ifdef DECLARE_TABLE\n",
+        "# define CMD(id, name, fn) { name, fn }\n",
+        "typedef void (*cmd_fn)(int arg);\n",
+        "static struct cmd_entry { const char *cmd_name; cmd_fn handler; } cmd_table[] =\n",
+        "#else\n",
+        "# define CMD(id, name, fn)  id\n",
+        "enum cmd_id\n",
+        "#endif\n",
+        "{\n",
+        "CMD(C_a, \"a\", do_a),\n",
+        "CMD(C_b, \"b\", do_b),\n",
+        "};\n",
+    );
+
+    /// `main.c` of upstream's case 13 (bridges-an-ifdef-guarded-inline-struct-table-dispatched-by-a).
+    const C13_MAIN_C: &str = concat!(
+        "\n",
+        "#define DECLARE_TABLE\n",
+        "#include \"cmds.h\"\n",
+        "static void do_a(int arg) {}\n",
+        "static void do_b(int arg) {}\n",
+        "static void unused(int arg) {}     /* defined, NOT in the table */\n",
+        "void run(int idx, int x) { (cmd_table[idx].handler)(x); }\n",
+    );
+
+    /// `cpu.c` of upstream's case 14 (bridges-a-bare-array-of-function-pointers-dispatched-by-subs).
+    const C14_CPU_C: &str = concat!(
+        "\n",
+        "typedef void op_t(int *vm, unsigned char opcode);\n",
+        "static void nop(int *vm, unsigned char opcode) {}\n",
+        "static void inc(int *vm, unsigned char opcode) {}\n",
+        "static void unreg(int *vm, unsigned char opcode) {}   /* defined, NOT in the table */\n",
+        "static op_t *opcodes[256] = { nop, inc };\n",
+        "void cpu_run(int *vm) {\n",
+        "    unsigned char opcode = 0;\n",
+        "    opcodes[opcode](vm, opcode);\n",
+        "}\n",
+    );
+
+    /// `rc.c` of upstream's case 15 (bridges-a-designated-cast-wrapped-array-with-a-calling-conve).
+    const C15_RC_C: &str = concat!(
+        "\n",
+        "#define FASTCALL\n",
+        "typedef void (FASTCALL *dtor_t)(int *p);\n",
+        "static void empty_dtor(int *p) {}\n",
+        "static void str_dtor(int *p) {}\n",
+        "static void arr_dtor(int *p) {}\n",
+        "static int type_of(int *p) { return 0; }\n",
+        "static const dtor_t rc_dtor[] = {\n",
+        "    [0] = (dtor_t)empty_dtor,\n",
+        "    [1] = (dtor_t)str_dtor,\n",
+        "    [2] = (dtor_t)arr_dtor,\n",
+        "};\n",
+        "void rc_free(int *p) { rc_dtor[type_of(p)](p); }\n",
+    );
+
+    /// `a.c` of upstream's case 16 (resolves-same-named-file-local-arrays-to-their-own-file-no-c).
+    const C16_A_C: &str = concat!(
+        "\n",
+        "typedef void af_t(int *m);\n",
+        "static void a_one(int *m) {}\n",
+        "static void a_two(int *m) {}\n",
+        "static af_t *table[8] = { a_one, a_two };\n",
+        "void a_run(int *m, int i) { table[i](m); }\n",
+    );
+
+    /// `b.c` of upstream's case 16 (resolves-same-named-file-local-arrays-to-their-own-file-no-c).
+    const C16_B_C: &str = concat!(
+        "\n",
+        "typedef void bf_t(int *m);\n",
+        "static void b_one(int *m) {}\n",
+        "static void b_two(int *m) {}\n",
+        "static bf_t *table[8] = { b_one, b_two };\n",
+        "void b_run(int *m, int i) { table[i](m); }\n",
+    );
+
+    /// `pkg.c` of upstream's case 17 (does-not-bridge-a-fn-pointer-array-that-is-registered-not-di).
+    const C17_PKG_C: &str = concat!(
+        "\n",
+        "typedef int searcher_t(int *L);\n",
+        "static int s_preload(int *L) { return 0; }\n",
+        "static int s_lua(int *L) { return 0; }\n",
+        "static searcher_t *searchers[] = { s_preload, s_lua, 0 };\n",
+        "extern void register_one(int *L, searcher_t *s);\n",
+        "void setup(int *L) {\n",
+        "    for (int i = 0; searchers[i]; i++) register_one(L, searchers[i]);\n",
+        "}\n",
+    );
+
+    /// Upstream's git shape: a `{name, fn}` command table dispatched through
+    /// `p->fn()`; a function not in the table is no target.
+    #[test]
+    fn w717a_a_command_table_reaches_its_functions() {
+        let project = Project::new().file("cmd.c", C01_CMD_C).index();
+        let graph = graph_of(&project);
+        let line = line_of(C01_CMD_C, "return p->fn(argc);");
+        assert_eq!(
+            links(graph),
+            [
+                link("run_builtin", "cmd_add", "cmd.fn", "cmd.c", line),
+                link("run_builtin", "cmd_rm", "cmd.fn", "cmd.c", line),
+            ],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream: a designated `.handler = fn` initializer and a dispatch
+    /// through a struct passed by value.
+    #[test]
+    fn w717a_a_designated_initializer_reaches_a_by_value_dispatch() {
+        let project = Project::new().file("ops.c", C02_OPS_C).index();
+        let graph = graph_of(&project);
+        let line = line_of(C02_OPS_C, "return o.handler();");
+        assert_eq!(
+            links(graph),
+            [link("dispatch", "on_open", "ops.handler", "ops.c", line)],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream: function-pointer fields declared in a union.
+    #[test]
+    fn w717a_a_union_field_is_a_function_pointer_too() {
+        let project = Project::new().file("union-ops.c", C03_UNION_OPS_C).index();
+        let graph = graph_of(&project);
+        let line = line_of(C03_UNION_OPS_C, "return o.handler();");
+        assert_eq!(
+            links(graph),
+            [link(
+                "dispatch",
+                "on_open",
+                "ops.handler",
+                "union-ops.c",
+                line
+            )],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream: an inline union table whose entries a macro builds.
+    #[test]
+    fn w717a_an_inline_union_table_of_macro_built_entries() {
+        let project = Project::new()
+            .file("inline-union.c", C04_INLINE_UNION_C)
+            .index();
+        let graph = graph_of(&project);
+        let line = line_of(C04_INLINE_UNION_C, "return o.handler();");
+        assert_eq!(
+            links(graph),
+            [link(
+                "dispatch",
+                "on_open",
+                "inline_ops.handler",
+                "inline-union.c",
+                line
+            )],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream: a union table whose type an object macro names.
+    #[test]
+    fn w717a_a_union_table_through_an_object_macro_alias() {
+        let project = Project::new()
+            .file("alias-union.c", C05_ALIAS_UNION_C)
+            .index();
+        let graph = graph_of(&project);
+        let line = line_of(C05_ALIAS_UNION_C, "return o.handler();");
+        assert_eq!(
+            links(graph),
+            [link(
+                "dispatch",
+                "on_open",
+                "ops.handler",
+                "alias-union.c",
+                line
+            )],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream's hook_demo.c shape: a typedef'd field, and a generic slot
+    /// reassigned from a registry field (`h->func = found->fn`).
+    #[test]
+    fn w717a_a_slot_inherits_the_registry_field_it_is_assigned_from() {
+        let project = Project::new().file("hook.c", C06_HOOK_C).index();
+        let graph = graph_of(&project);
+        let line = line_of(C06_HOOK_C, "h->func();");
+        assert_eq!(
+            links(graph),
+            [
+                link("call", "hk_get", "hooks.func", "hook.c", line),
+                link("call", "hk_set", "hooks.func", "hook.c", line),
+            ],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream: two fields of one struct keep their own functions.
+    #[test]
+    fn w717a_distinct_fields_do_not_cross_bleed() {
+        let project = Project::new().file("vtable.c", C07_VTABLE_C).index();
+        let graph = graph_of(&project);
+        let line = line_of(C07_VTABLE_C, "return p->read();");
+        assert_eq!(
+            links(graph),
+            [link("only_reads", "do_read", "io.read", "vtable.c", line)],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream: reading a data field is no dispatch.
+    #[test]
+    fn w717a_a_data_field_is_never_bridged() {
+        let project = Project::new().file("data.c", C08_DATA_C).index();
+        let graph = graph_of(&project);
+        assert!(links(graph).is_empty(), "{}", graph.report());
+    }
+
+    /// Upstream: a project without C or C++.
+    #[test]
+    fn w717a_a_project_without_c_links_nothing() {
+        let project = Project::new().file("app.js", C09_APP_JS).index();
+        let graph = graph_of(&project);
+        assert!(links(graph).is_empty(), "{}", graph.report());
+    }
+
+    /// Upstream's redis shape: a function-type typedef field, a table built
+    /// by a function-like macro and typed by an object-macro alias, and a
+    /// chained receiver through a field of a multi-declarator line.
+    #[test]
+    fn w717a_a_macro_built_table_reaches_a_chained_dispatch() {
+        let project = Project::new()
+            .file("reg.h", C10_REG_H)
+            .file("reg.c", C10_REG_C)
+            .index();
+        let graph = graph_of(&project);
+        let line = line_of(C10_REG_C, "ctx->cmd->proc(x);");
+        assert_eq!(
+            links(graph),
+            [
+                link("run", "getCmd", "command.proc", "reg.c", line),
+                link("run", "setCmd", "command.proc", "reg.c", line),
+            ],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream's sqlite shape: a header's macro expands to a whole
+    /// brace-wrapped element.
+    #[test]
+    fn w717a_a_header_macro_builds_a_braced_element() {
+        let project = Project::new()
+            .file("fn.h", C12_FN_H)
+            .file("fn.c", C12_FN_C)
+            .index();
+        let graph = graph_of(&project);
+        let line = line_of(C12_FN_C, "p->xFunc(x);");
+        assert_eq!(
+            links(graph),
+            [
+                link("invoke", "absImpl", "FuncDef.xFunc", "fn.c", line),
+                link("invoke", "lenImpl", "FuncDef.xFunc", "fn.c", line),
+            ],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream's vim shape: an `#ifdef`-guarded inline struct table in a
+    /// header the `.c` includes after defining the switch, dispatched by a
+    /// subscript of the file-scope table.
+    #[test]
+    fn w717a_an_ifdef_guarded_inline_table_reaches_a_subscript_dispatch() {
+        let project = Project::new()
+            .file("cmds.h", C13_CMDS_H)
+            .file("main.c", C13_MAIN_C)
+            .index();
+        let graph = graph_of(&project);
+        let line = line_of(C13_MAIN_C, "(cmd_table[idx].handler)(x);");
+        assert_eq!(
+            links(graph),
+            [
+                link("run", "do_a", "cmd_entry.handler", "main.c", line),
+                link("run", "do_b", "cmd_entry.handler", "main.c", line),
+            ],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream's opcode-table shape: a bare array of function-type
+    /// pointers dispatched by a subscript.
+    #[test]
+    fn w717a_a_bare_array_reaches_a_subscript_call() {
+        let project = Project::new().file("cpu.c", C14_CPU_C).index();
+        let graph = graph_of(&project);
+        let line = line_of(C14_CPU_C, "opcodes[opcode](vm, opcode);");
+        assert_eq!(
+            links(graph),
+            [
+                link("cpu_run", "inc", "opcodes[]", "cpu.c", line),
+                link("cpu_run", "nop", "opcodes[]", "cpu.c", line),
+            ],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream's Zend dtor shape: a calling-convention typedef, designated
+    /// and cast entries, and a subscript that is itself a call.
+    #[test]
+    fn w717a_designated_cast_entries_of_a_calling_convention_typedef() {
+        let project = Project::new().file("rc.c", C15_RC_C).index();
+        let graph = graph_of(&project);
+        let line = line_of(C15_RC_C, "rc_dtor[type_of(p)](p);");
+        assert_eq!(
+            links(graph),
+            [
+                link("rc_free", "arr_dtor", "rc_dtor[]", "rc.c", line),
+                link("rc_free", "empty_dtor", "rc_dtor[]", "rc.c", line),
+                link("rc_free", "str_dtor", "rc_dtor[]", "rc.c", line),
+            ],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream: two files' same-named static arrays each reach their own.
+    #[test]
+    fn w717a_same_named_file_arrays_stay_in_their_files() {
+        let project = Project::new()
+            .file("a.c", C16_A_C)
+            .file("b.c", C16_B_C)
+            .index();
+        let graph = graph_of(&project);
+        let a = line_of(C16_A_C, "table[i](m);");
+        let b = line_of(C16_B_C, "table[i](m);");
+        assert_eq!(
+            links(graph),
+            [
+                link("a_run", "a_one", "table[]", "a.c", a),
+                link("a_run", "a_two", "table[]", "a.c", a),
+                link("b_run", "b_one", "table[]", "b.c", b),
+                link("b_run", "b_two", "table[]", "b.c", b),
+            ],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream's lua searchers control: an array handed out element by
+    /// element, never called through a subscript.
+    #[test]
+    fn w717a_an_array_never_called_through_links_nothing() {
+        let project = Project::new().file("pkg.c", C17_PKG_C).index();
+        let graph = graph_of(&project);
+        assert!(links(graph).is_empty(), "{}", graph.report());
+    }
+
+    /// Every `fn-pointer-dispatch` edge as `source (file) -> target (file)`,
+    /// sorted: for targets that share a name.
+    #[track_caller]
+    fn link_files(graph: &Graph) -> Vec<String> {
+        let describe = |id: &str| {
+            graph.node(id).map_or_else(
+                || "?".to_string(),
+                |node| format!("{} ({})", node.name, node.file_path),
+            )
+        };
+        let mut links: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.metadata["synthesizedBy"] == "fn-pointer-dispatch")
+            .map(|edge| format!("{} -> {}", describe(&edge.source), describe(&edge.target)))
+            .collect();
+        links.sort();
+        links
+    }
+
+    /// An anonymous member and each declarator of a multi-declarator line
+    /// take a position.
+    #[test]
+    fn w717a_anonymous_members_and_declarators_take_positions() {
+        const CMD_C: &str = concat!(
+            "struct cmd { int a, b; union { int x; long y; }; int (*fn)(int); };\n",
+            "static int f1(int v) { return v; }\n",
+            "static struct cmd table[] = { { 1, 2, { 3 }, f1 } };\n",
+            "int go(struct cmd *p) { return p->fn(0); }\n",
+        );
+        let project = Project::new().file("cmd.c", CMD_C).index();
+        let graph = graph_of(&project);
+        let line = line_of(CMD_C, "return p->fn(0);");
+        assert_eq!(
+            links(graph),
+            [link("go", "f1", "cmd.fn", "cmd.c", line)],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// The second declarator of `struct command *cmd, *last;` has the
+    /// shared type, so a chain walks through it; a second owner of `proc`
+    /// keeps the unique-owner fallback out of the way.
+    #[test]
+    fn w717a_a_chain_walks_a_later_declarator_of_a_shared_type() {
+        const REG_H: &str = concat!(
+            "typedef void cmdProc(int x);\n",
+            "struct command { const char *name; cmdProc *proc; };\n",
+            "struct other { cmdProc *proc; };\n",
+            "struct context { int id; struct command *cmd, *last; };\n",
+        );
+        const REG_C: &str = concat!(
+            "#include \"reg.h\"\n",
+            "static void getCmd(int x) {}\n",
+            "static void setCmd(int x) {}\n",
+            "static void otherCmd(int x) {}\n",
+            "static struct command table[] = { { \"get\", getCmd }, { \"set\", setCmd } };\n",
+            "static struct other others[] = { { otherCmd } };\n",
+            "void run(struct context *ctx, int x) { ctx->last->proc(x); }\n",
+        );
+        let project = Project::new()
+            .file("reg.h", REG_H)
+            .file("reg.c", REG_C)
+            .index();
+        let graph = graph_of(&project);
+        let line = line_of(REG_C, "ctx->last->proc(x);");
+        assert_eq!(
+            links(graph),
+            [
+                link("run", "getCmd", "command.proc", "reg.c", line),
+                link("run", "setCmd", "command.proc", "reg.c", line),
+            ],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// KEEP-RUST: two `struct ctx` definitions, each in its own directory's
+    /// `ctx.h`, are read in the translation unit that includes it; a file
+    /// that includes both reads neither (upstream takes the first).
+    #[test]
+    fn w717a_a_chain_reads_the_struct_its_translation_unit_defines() {
+        const A_CTX_H: &str = concat!(
+            "struct aops { void (*run)(void); };\n",
+            "struct ctx { int n; struct aops *h; };\n",
+        );
+        const B_CTX_H: &str = concat!(
+            "struct bops { void (*run)(void); };\n",
+            "struct ctx { struct bops *h; int n; };\n",
+        );
+        const A_C: &str = concat!(
+            "#include \"ctx.h\"\n",
+            "static void a_run(void) {}\n",
+            "static struct aops a_tab = { a_run };\n",
+            "void a_go(struct ctx *c) { c->h->run(); }\n",
+        );
+        const B_C: &str = concat!(
+            "#include \"ctx.h\"\n",
+            "static void b_run(void) {}\n",
+            "static struct bops b_tab = { b_run };\n",
+            "void b_go(struct ctx *c) { c->h->run(); }\n",
+        );
+        const BOTH_C: &str = concat!(
+            "#include \"a/ctx.h\"\n",
+            "#include \"b/ctx.h\"\n",
+            "void both_go(struct ctx *c) { c->h->run(); }\n",
+        );
+        let project = Project::new()
+            .file("a/ctx.h", A_CTX_H)
+            .file("b/ctx.h", B_CTX_H)
+            .file("a/a.c", A_C)
+            .file("b/b.c", B_C)
+            .file("both.c", BOTH_C)
+            .index();
+        let graph = graph_of(&project);
+        let a = line_of(A_C, "c->h->run();");
+        let b = line_of(B_C, "c->h->run();");
+        assert_eq!(
+            links(graph),
+            [
+                link("a_go", "a_run", "aops.run", "a/a.c", a),
+                link("b_go", "b_run", "bops.run", "b/b.c", b),
+            ],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// `a.c` and `b.c` with their own `struct ops`, of the field lists
+    /// `a_fields` and `b_fields`, and tables of the rows `a_row` and `b_row`.
+    fn own_ops(a_fields: &str, a_row: &str, b_fields: &str, b_row: &str) -> (String, String) {
+        (
+            format!(
+                "struct ops {{ {a_fields} }};\nstatic void a_run(void) {{}}\nstatic struct ops a_tab[] = {{ {a_row} }};\nvoid a_go(struct ops *p) {{ p->run(); }}\n"
+            ),
+            format!(
+                "struct ops {{ {b_fields} }};\nstatic void b_run(void) {{}}\nstatic struct ops b_tab[] = {{ {b_row} }};\nvoid b_go(struct ops *p) {{ p->run(); }}\n"
+            ),
+        )
+    }
+
+    /// KEEP-RUST: two files defining `struct ops` with their fields in a
+    /// different order each reach only their own table (upstream keys both
+    /// by the name, the last layout winning).
+    #[test]
+    fn w717a_two_definitions_of_one_name_keep_their_tables() {
+        let (a, b) = own_ops(
+            "int n; void (*run)(void);",
+            "{ 1, a_run }",
+            "void (*run)(void); int n;",
+            "{ b_run, 1 }",
+        );
+        let project = Project::new().file("a.c", &a).file("b.c", &b).index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            links(graph),
+            [
+                link("a_go", "a_run", "ops.run", "a.c", 4),
+                link("b_go", "b_run", "ops.run", "b.c", 4),
+            ],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// KEEP-RUST: two definitions with the same name and the same fields
+    /// are still two layouts, so neither file's dispatch reaches the other's
+    /// table (gate prestart round 2).
+    #[test]
+    fn w717a_two_identical_definitions_keep_their_tables() {
+        let (a, b) = own_ops(
+            "void (*run)(void);",
+            "{ a_run }",
+            "void (*run)(void);",
+            "{ b_run }",
+        );
+        let project = Project::new().file("a.c", &a).file("b.c", &b).index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            links(graph),
+            [
+                link("a_go", "a_run", "ops.run", "a.c", 4),
+                link("b_go", "b_run", "ops.run", "b.c", 4),
+            ],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// One definition in a shared header is one layout: the tables of both
+    /// files register into it, and a dispatch through a pointer of that type
+    /// in either file reaches both (the vtable a driver registers and the
+    /// core dispatches).
+    #[test]
+    fn w717a_a_shared_definition_is_one_channel() {
+        const OPS_H: &str = "struct ops { void (*run)(void); };\n";
+        const A_C: &str = concat!(
+            "#include \"ops.h\"\n",
+            "static void a_run(void) {}\n",
+            "static struct ops a_tab[] = { { a_run } };\n",
+            "void a_go(struct ops *p) { p->run(); }\n",
+        );
+        const B_C: &str = concat!(
+            "#include \"ops.h\"\n",
+            "static void b_run(void) {}\n",
+            "static struct ops b_tab[] = { { b_run } };\n",
+            "void b_go(struct ops *p) { p->run(); }\n",
+        );
+        let project = Project::new()
+            .file("ops.h", OPS_H)
+            .file("a.c", A_C)
+            .file("b.c", B_C)
+            .index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            links(graph),
+            [
+                link("a_go", "a_run", "ops.run", "a.c", 4),
+                link("a_go", "b_run", "ops.run", "a.c", 4),
+                link("b_go", "a_run", "ops.run", "b.c", 4),
+                link("b_go", "b_run", "ops.run", "b.c", 4),
+            ],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// A receiver whose type no declaration in the function gives falls
+    /// back to the one struct that owns the field; with two owners it links
+    /// nothing.
+    #[test]
+    fn w717a_an_untyped_receiver_needs_a_unique_owner() {
+        const ONE_C: &str = concat!(
+            "struct ops { void (*run)(void); };\n",
+            "static void r1(void) {}\n",
+            "static struct ops t1 = { r1 };\n",
+            "extern struct ops *g;\n",
+            "void go(void) { g->run(); }\n",
+        );
+        let project = Project::new().file("one.c", ONE_C).index();
+        let graph = graph_of(&project);
+        let line = line_of(ONE_C, "g->run();");
+        assert_eq!(
+            links(graph),
+            [link("go", "r1", "ops.run", "one.c", line)],
+            "{}",
+            graph.report()
+        );
+        let two = format!(
+            "{ONE_C}struct ops2 {{ void (*run)(void); }};\nstatic void r2(void) {{}}\nstatic struct ops2 t2 = {{ r2 }};\n"
+        );
+        let project = Project::new().file("one.c", &two).index();
+        let graph = graph_of(&project);
+        assert!(links(graph).is_empty(), "{}", graph.report());
+    }
+
+    /// Two files' tables each name their own static `handler`: each entry
+    /// is its file's.
+    #[test]
+    fn w717a_each_table_names_its_files_function() {
+        const OPS_H: &str = "struct ops { void (*run)(void); };\n";
+        const A_C: &str = concat!(
+            "#include \"ops.h\"\n",
+            "static void handler(void) {}\n",
+            "static struct ops a_tab = { handler };\n",
+        );
+        const B_C: &str = concat!(
+            "#include \"ops.h\"\n",
+            "static void handler(void) {}\n",
+            "static struct ops b_tab = { handler };\n",
+        );
+        const D_C: &str = concat!(
+            "#include \"ops.h\"\n",
+            "void go(struct ops *p) { p->run(); }\n",
+        );
+        let project = Project::new()
+            .file("ops.h", OPS_H)
+            .file("a.c", A_C)
+            .file("b.c", B_C)
+            .file("d.c", D_C)
+            .index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            link_files(graph),
+            ["go (d.c) -> handler (a.c)", "go (d.c) -> handler (b.c)"],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// KEEP-RUST: two overloads of one name in the table's C++ file leave
+    /// the entry unregistered (upstream takes the first).
+    #[test]
+    fn w717a_an_overloaded_entry_is_not_registered() {
+        const OPS_CPP: &str = concat!(
+            "struct ops { void (*run)(int); };\n",
+            "static void cb(int x) {}\n",
+            "static void cb(double x) {}\n",
+            "static ops tab = { cb };\n",
+            "void go(ops *p) { p->run(1); }\n",
+        );
+        let project = Project::new().file("ops.cpp", OPS_CPP).index();
+        let graph = graph_of(&project);
+        assert!(links(graph).is_empty(), "{}", graph.report());
+    }
+
+    /// KEEP-RUST: an entry the table's file does not define, named by two
+    /// other files' functions, is not registered (upstream takes the first).
+    #[test]
+    fn w717a_an_entry_two_other_files_define_is_not_registered() {
+        const T_C: &str = concat!(
+            "struct ops { void (*run)(void); };\n",
+            "static struct ops tab = { handler };\n",
+            "void go(struct ops *p) { p->run(); }\n",
+        );
+        let project = Project::new()
+            .file("t.c", T_C)
+            .file("x.c", "void handler(void) {}\n")
+            .file("y.c", "void handler(void) {}\n")
+            .index();
+        let graph = graph_of(&project);
+        assert!(links(graph).is_empty(), "{}", graph.report());
+        let project = Project::new()
+            .file("t.c", T_C)
+            .file("x.c", "void handler(void) {}\n")
+            .index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            link_files(graph),
+            ["go (t.c) -> handler (x.c)"],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// KEEP-RUST: a header's table entry, read as its includer reads it,
+    /// names the includer's one function of that name even when another
+    /// file defines it too.
+    #[test]
+    fn w717a_a_header_entry_names_its_includers_function() {
+        const CMDS_H: &str = concat!(
+            "struct ops { void (*run)(void); };\n",
+            "#ifdef WANT_TABLE\n",
+            "static struct ops tab = { handler };\n",
+            "#endif\n",
+        );
+        const MAIN_C: &str = concat!(
+            "#define WANT_TABLE\n",
+            "#include \"cmds.h\"\n",
+            "static void handler(void) {}\n",
+            "void go(struct ops *p) { p->run(); }\n",
+        );
+        let project = Project::new()
+            .file("cmds.h", CMDS_H)
+            .file("main.c", MAIN_C)
+            .file("other.c", "void handler(void) {}\n")
+            .index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            link_files(graph),
+            ["go (main.c) -> handler (main.c)"],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// KEEP-RUST: one table name in two files of different structs is read
+    /// in the dispatching file's translation unit; a file that sees neither
+    /// links nothing.
+    #[test]
+    fn w717a_a_table_name_reads_its_translation_units_table() {
+        const A_C: &str = concat!(
+            "struct aops { void (*run)(void); };\n",
+            "static void a1(void) {}\n",
+            "static struct aops table[] = { { a1 } };\n",
+            "void a_go(int i) { table[i].run(); }\n",
+        );
+        const B_C: &str = concat!(
+            "struct bops { void (*run)(void); };\n",
+            "static void b1(void) {}\n",
+            "static struct bops table[] = { { b1 } };\n",
+            "void b_go(int i) { table[i].run(); }\n",
+        );
+        const C_C: &str = "void c_go(int i) { table[i].run(); }\n";
+        let project = Project::new()
+            .file("a.c", A_C)
+            .file("b.c", B_C)
+            .file("c.c", C_C)
+            .index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            links(graph),
+            [
+                link("a_go", "a1", "aops.run", "a.c", 4),
+                link("b_go", "b1", "bops.run", "b.c", 4),
+            ],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// A header read with its includer's names: `#ifndef` and `#else` arms
+    /// follow them, and an `#if` it cannot evaluate keeps its arm.
+    #[test]
+    fn w717a_conditionals_follow_the_includers_names() {
+        const CMDS_H: &str = concat!(
+            "struct ops { void (*run)(void); };\n",
+            "#ifndef USE_A\n",
+            "static struct ops t1 = { not_a };\n",
+            "#else\n",
+            "static struct ops t1 = { yes_a };\n",
+            "#endif\n",
+            "#if X > 1\n",
+            "static struct ops t2 = { unknown_expr };\n",
+            "#endif\n",
+        );
+        const MAIN_C: &str = concat!(
+            "#define USE_A\n",
+            "#include \"cmds.h\"\n",
+            "static void not_a(void) {}\n",
+            "static void yes_a(void) {}\n",
+            "static void unknown_expr(void) {}\n",
+            "void go(struct ops *p) { p->run(); }\n",
+        );
+        // A second definition of each name keeps the header's own unit
+        // from registering them.
+        const OTHER_C: &str = concat!(
+            "void not_a(void) {}\n",
+            "void yes_a(void) {}\n",
+            "void unknown_expr(void) {}\n",
+        );
+        let project = Project::new()
+            .file("cmds.h", CMDS_H)
+            .file("main.c", MAIN_C)
+            .file("other.c", OTHER_C)
+            .index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            link_files(graph),
+            [
+                "go (main.c) -> unknown_expr (main.c)",
+                "go (main.c) -> yes_a (main.c)",
+            ],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// A header without an `#if` is not read again with its includer's
+    /// macros: the includer's `MK` never expands the header's table.
+    #[test]
+    fn w717a_a_header_without_conditionals_is_read_once() {
+        const TBL_H: &str = concat!(
+            "struct ops { void (*run)(void); };\n",
+            "static struct ops t = { MK(fn_a) };\n",
+        );
+        const MAIN_C: &str = concat!(
+            "#define MK(f) f\n",
+            "#include \"tbl.h\"\n",
+            "static void fn_a(void) {}\n",
+            "void go(struct ops *p) { p->run(); }\n",
+        );
+        let project = Project::new()
+            .file("tbl.h", TBL_H)
+            .file("main.c", MAIN_C)
+            .index();
+        let graph = graph_of(&project);
+        assert!(links(graph).is_empty(), "{}", graph.report());
+    }
+
+    /// Two includers of one header, one defining `USE_A`, each read its
+    /// own arm: `a.c`'s table entry is its `yes_a`, `b.c`'s is its `not_a`.
+    /// Both register into the header's one `struct ops`, so each dispatch
+    /// reaches both.
+    #[test]
+    fn w717a_each_includer_reads_the_header_by_its_own_names() {
+        const CMDS_H: &str = concat!(
+            "struct ops { void (*run)(void); };\n",
+            "#ifndef USE_A\n",
+            "static struct ops t1 = { not_a };\n",
+            "#else\n",
+            "static struct ops t1 = { yes_a };\n",
+            "#endif\n",
+        );
+        let includer = |define: &str, go: &str| {
+            format!(
+                "#define {define}\n#include \"cmds.h\"\nstatic void yes_a(void) {{}}\nstatic void not_a(void) {{}}\nvoid {go}(struct ops *p) {{ p->run(); }}\n"
+            )
+        };
+        let project = Project::new()
+            .file("cmds.h", CMDS_H)
+            .file("a.c", &includer("USE_A", "go_a"))
+            .file("b.c", &includer("OTHER", "go_b"))
+            .index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            link_files(graph),
+            [
+                "go_a (a.c) -> not_a (b.c)",
+                "go_a (a.c) -> yes_a (a.c)",
+                "go_b (b.c) -> not_a (b.c)",
+                "go_b (b.c) -> yes_a (a.c)",
+            ],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// A header read with its includer's names expands with its own macro
+    /// before the includer's of the same name.
+    #[test]
+    fn w717a_a_headers_own_macro_wins_in_its_includers_reading() {
+        const TBL_H: &str = concat!(
+            "struct ops { void (*run)(void); };\n",
+            "#define MK(f) { f }\n",
+            "#ifdef ON\n",
+            "static struct ops t[] = { MK(right) };\n",
+            "#endif\n",
+        );
+        const MAIN_C: &str = concat!(
+            "#define ON\n",
+            "#define MK(f) { wrong }\n",
+            "#include \"tbl.h\"\n",
+            "void right(void) {}\n",
+            "void wrong(void) {}\n",
+            "void go(struct ops *p) { p->run(); }\n",
+        );
+        let project = Project::new()
+            .file("tbl.h", TBL_H)
+            .file("main.c", MAIN_C)
+            .index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            link_files(graph),
+            ["go (main.c) -> right (main.c)"],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// A file's own macro wins over an included one of the same name.
+    #[test]
+    fn w717a_a_files_own_macro_wins_over_an_included_one() {
+        const MK_H: &str = "#define MK(f) { wrong }\n";
+        const MAIN_C: &str = concat!(
+            "#include \"mk.h\"\n",
+            "#define MK(f) { f }\n",
+            "struct ops { void (*run)(void); };\n",
+            "void right(void) {}\n",
+            "void wrong(void) {}\n",
+            "static struct ops t[] = { MK(right) };\n",
+            "void go(struct ops *p) { p->run(); }\n",
+        );
+        let project = Project::new()
+            .file("mk.h", MK_H)
+            .file("main.c", MAIN_C)
+            .index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            link_files(graph),
+            ["go (main.c) -> right (main.c)"],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Field-to-field propagation runs three rounds: a chain of four
+    /// assignments, written so each round moves one hop, reaches `s4` and
+    /// not `s5`.
+    #[test]
+    fn w717a_propagation_stops_after_three_rounds() {
+        let mut source = String::new();
+        for n in 1..=5 {
+            source.push_str(&format!("struct s{n} {{ void (*f)(void); }};\n"));
+        }
+        source.push_str("static void h(void) {}\n");
+        source.push_str("static struct s1 base = { h };\n");
+        source.push_str(
+            "void wire(struct s1 *a, struct s2 *b, struct s3 *c, struct s4 *d, struct s5 *e) {\n",
+        );
+        source.push_str(
+            "    e->f = d->f;\n    d->f = c->f;\n    c->f = b->f;\n    b->f = a->f;\n}\n",
+        );
+        for n in 2..=5 {
+            source.push_str(&format!("void use{n}(struct s{n} *p) {{ p->f(); }}\n"));
+        }
+        let project = Project::new().file("hops.c", &source).index();
+        let graph = graph_of(&project);
+        let line = |n: usize| line_of(&source, &format!("void use{n}("));
+        assert_eq!(
+            links(graph),
+            [
+                link("use2", "h", "s2.f", "hops.c", line(2)),
+                link("use3", "h", "s3.f", "hops.c", line(3)),
+                link("use4", "h", "s4.f", "hops.c", line(4)),
+            ],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// One dispatching function links at most 300 functions.
+    #[test]
+    fn w717a_a_dispatch_links_at_most_300_functions() {
+        let mut source = String::from("struct ops { void (*run)(void); };\n");
+        for n in 0..301 {
+            source.push_str(&format!("static void h{n:03}(void) {{}}\n"));
+        }
+        source.push_str("static struct ops tab[] = {");
+        for n in 0..301 {
+            source.push_str(&format!(" {{ h{n:03} }},"));
+        }
+        source.push_str(" };\nvoid go(struct ops *p) { p->run(); }\n");
+        let project = Project::new().file("many.c", &source).index();
+        let graph = graph_of(&project);
+        let links = links(graph);
+        assert_eq!(links.len(), 300, "{}", graph.report());
+        assert!(
+            !links.iter().any(|link| link.contains(" -> h300 ")),
+            "the last registered function is the one left out: {links:?}"
+        );
+    }
+
+    /// Past the 4096 names one prefilter pattern spells out, every text is
+    /// read: through a struct of 4097 function-pointer fields and one of
+    /// 4097 bare arrays, the dispatches still reach their functions.
+    #[test]
+    fn w717a_past_the_name_bound_every_body_is_read() {
+        let mut source = String::from("typedef void handler(void);\nstruct many {");
+        for n in 0..4097 {
+            source.push_str(&format!(" void (*f{n})(void);"));
+        }
+        source.push_str(" };\nstatic void hit(void) {}\n");
+        for n in 0..4097 {
+            source.push_str(&format!("static handler *a{n}[] = {{ hit }};\n"));
+        }
+        source.push_str("static struct many table = { .f4000 = hit };\n");
+        source.push_str("void call(struct many *m) { m->f4000(); }\n");
+        source.push_str("void step(int i) { a4000[i](); }\n");
+        let project = Project::new().file("big.c", &source).index();
+        let graph = graph_of(&project);
+        let call = line_of(&source, "void call(");
+        let step = line_of(&source, "void step(");
+        assert_eq!(
+            links(graph),
+            [
+                link("call", "hit", "many.f4000", "big.c", call),
+                link("step", "hit", "a4000[]", "big.c", step),
+            ],
+            "{}",
+            graph.report()
+        );
+    }
+
+    const PLAIN_OPS: &str = concat!(
+        "struct ops { void (*run)(void); };\n",
+        "static void r(void) {}\n",
+        "static struct ops t = { r };\n",
+        "void go(struct ops *p) { p->run(); }\n",
+    );
+
+    /// `.cu` is C++ to the index but not a path the pass reads; the same
+    /// text in a `.cpp` file links.
+    #[test]
+    fn w717a_a_cuda_file_is_not_read() {
+        let project = Project::new().file("k.cu", PLAIN_OPS).index();
+        let graph = graph_of(&project);
+        assert!(links(graph).is_empty(), "{}", graph.report());
+        let project = Project::new().file("k.cpp", PLAIN_OPS).index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            links(graph),
+            [link("go", "r", "ops.run", "k.cpp", 4)],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// A dispatch inside a comment is no dispatch.
+    #[test]
+    fn w717a_a_commented_dispatch_links_nothing() {
+        let source = PLAIN_OPS.replace("{ p->run(); }", "{ /* p->run(); */ }");
+        let project = Project::new().file("c.c", &source).index();
+        let graph = graph_of(&project);
+        assert!(links(graph).is_empty(), "{}", graph.report());
+    }
+
+    /// A bare array's value expands at most six macro calls.
+    #[test]
+    fn w717a_a_bare_array_expands_at_most_six_macros() {
+        let mut source = String::from("#define W(f) f\ntypedef void op_t(void);\n");
+        for n in 1..=7 {
+            source.push_str(&format!("static void f{n}(void) {{}}\n"));
+        }
+        source.push_str(
+            "static op_t *ops[] = { W(f1), W(f2), W(f3), W(f4), W(f5), W(f6), W(f7) };\n",
+        );
+        source.push_str("void run(int i) { ops[i](); }\n");
+        let project = Project::new().file("ops.c", &source).index();
+        let graph = graph_of(&project);
+        let line = line_of(&source, "void run(");
+        let expected: Vec<String> = (1..=6)
+            .map(|n| link("run", &format!("f{n}"), "ops[]", "ops.c", line))
+            .collect();
+        assert_eq!(links(graph), expected, "{}", graph.report());
+    }
+
+    /// Table items are split at commas without regard to strings, so
+    /// `{ "a,b", f }` puts `f` in the third position: no field there.
+    #[test]
+    fn w717a_a_comma_in_a_string_shifts_the_positions() {
+        const CMD_C: &str = concat!(
+            "struct cmd { const char *name; int (*fn)(int); };\n",
+            "static int f(int x) { return x; }\n",
+            "static struct cmd t[] = { { \"a,b\", f } };\n",
+            "int go(struct cmd *p) { return p->fn(1); }\n",
+        );
+        let project = Project::new().file("cmd.c", CMD_C).index();
+        let graph = graph_of(&project);
+        assert!(links(graph).is_empty(), "{}", graph.report());
+    }
+
+    /// A bare array whose name only one table has is reached from another
+    /// file.
+    #[test]
+    fn w717a_a_unique_bare_array_is_reached_across_files() {
+        const A_C: &str = concat!(
+            "typedef void op_t(void);\n",
+            "static void o1(void) {}\n",
+            "op_t *ops[] = { o1 };\n",
+        );
+        const B_C: &str = "void run(int i) { ops[i](); }\n";
+        let project = Project::new().file("a.c", A_C).file("b.c", B_C).index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            links(graph),
+            [link("run", "o1", "ops[]", "b.c", 1)],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// A designated data item does not advance the positions: in
+    /// `{ .n = 1, 2, f }` the `2` is position 0 and `f` position 1.
+    #[test]
+    fn w717a_a_designated_data_item_keeps_the_position() {
+        const CMD_C: &str = concat!(
+            "struct cmd { int n; int (*fn)(int); };\n",
+            "static int f(int x) { return x; }\n",
+            "static struct cmd t = { .n = 1, 2, f };\n",
+            "int go(struct cmd *p) { return p->fn(1); }\n",
+        );
+        let project = Project::new().file("cmd.c", CMD_C).index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            links(graph),
+            [link("go", "f", "cmd.fn", "cmd.c", 4)],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// An initializer's type is read through at most five object-macro
+    /// aliases.
+    #[test]
+    fn w717a_a_type_alias_chain_of_five_hops() {
+        let source = |aliases: usize| {
+            let mut source = String::new();
+            for n in 1..aliases {
+                source.push_str(&format!("#define T{n} T{}\n", n + 1));
+            }
+            source.push_str(&format!("#define T{aliases} ops\n"));
+            source.push_str(PLAIN_OPS.replace("struct ops t", "struct T1 t").as_str());
+            source
+        };
+        let five = source(5);
+        let project = Project::new().file("alias.c", &five).index();
+        let graph = graph_of(&project);
+        let line = line_of(&five, "void go(");
+        assert_eq!(
+            links(graph),
+            [link("go", "r", "ops.run", "alias.c", line)],
+            "{}",
+            graph.report()
+        );
+        let six = source(6);
+        let project = Project::new().file("alias.c", &six).index();
+        let graph = graph_of(&project);
+        assert!(links(graph).is_empty(), "{}", graph.report());
+    }
+
+    /// A dispatching function in its own table links the table's other
+    /// functions, never itself.
+    #[test]
+    fn w717a_a_dispatch_never_links_itself() {
+        const OPS_C: &str = concat!(
+            "struct ops { void (*run)(struct ops *p); };\n",
+            "void go(struct ops *p) { p->run(p); }\n",
+            "static void other(struct ops *p) {}\n",
+            "static struct ops t[] = { { go }, { other } };\n",
+        );
+        let project = Project::new().file("ops.c", OPS_C).index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            links(graph),
+            [link("go", "other", "ops.run", "ops.c", 2)],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// The pass runs only in a project with C or C++: a `.hh` file mapped to
+    /// JavaScript whose string holds a C table is read only once a `.c`
+    /// file is indexed too.
+    #[test]
+    fn w717a_the_pass_needs_a_c_or_cpp_file() {
+        const MAPPING: &str = "{ \"extensions\": { \".hh\": \"javascript\" } }\n";
+        const X_HH: &str = concat!(
+            "const table = \"struct cmd { int (*fn)(int); } tab[] = { f };\";\n",
+            "function f(x) { return x; }\n",
+            "function run(p) { return p.fn(1); }\n",
+        );
+        let project = Project::new()
+            .file(".codegraph/codegraph.json", MAPPING)
+            .file("x.hh", X_HH)
+            .index();
+        let graph = graph_of(&project);
+        assert!(links(graph).is_empty(), "{}", graph.report());
+        let project = Project::new()
+            .file(".codegraph/codegraph.json", MAPPING)
+            .file("x.hh", X_HH)
+            .file("main.c", "int main(void) { return 0; }\n")
+            .index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            links(graph),
+            [link("run", "f", "cmd.fn", "x.hh", 3)],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// KEEP-RUST: a shared header's struct picks `run` or `stop` by the
+    /// includer's `A`, so those fields' positions are no file's: each
+    /// positional table registers only `first`, declared before the
+    /// `#ifdef`, and b.c's `stop` entry is never taken for `run`. A
+    /// designated `.stop = b_stop` is position-free (gate prestart round 3;
+    /// upstream reads the positions as written).
+    #[test]
+    fn w717a_positions_after_a_conditional_field_are_not_read() {
+        const OPS_H: &str = concat!(
+            "struct ops {\n",
+            "    void (*first)(void);\n",
+            "#ifdef A\n",
+            "    void (*run)(void);\n",
+            "#else\n",
+            "    void (*stop)(void);\n",
+            "#endif\n",
+            "};\n",
+        );
+        const A_C: &str = concat!(
+            "#define A\n",
+            "#include \"ops.h\"\n",
+            "static void a_first(void) {}\n",
+            "static void a_run(void) {}\n",
+            "static struct ops a_tab = { a_first, a_run };\n",
+            "void a_go(struct ops *p) { p->run(); }\n",
+        );
+        const B_C: &str = concat!(
+            "#include \"ops.h\"\n",
+            "static void b_first(void) {}\n",
+            "static void b_stop(void) {}\n",
+            "static struct ops b_tab = { b_first, b_stop };\n",
+            "static struct ops b_named = { .stop = b_stop };\n",
+            "void b_go(struct ops *p) { p->stop(); p->first(); }\n",
+        );
+        let project = Project::new()
+            .file("ops.h", OPS_H)
+            .file("a.c", A_C)
+            .file("b.c", B_C)
+            .index();
+        let graph = graph_of(&project);
+        let line = line_of(B_C, "void b_go(");
+        assert_eq!(
+            links(graph),
+            [
+                link("b_go", "a_first", "ops.first", "b.c", line),
+                link("b_go", "b_first", "ops.first", "b.c", line),
+                link("b_go", "b_stop", "ops.stop", "b.c", line),
+            ],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// KEEP-RUST: a field the struct declares in both arms of a conditional,
+    /// with two types, has no one type to walk; with two owners of `run`
+    /// the dispatch links nothing (upstream walks the first).
+    #[test]
+    fn w717a_a_chain_never_walks_a_field_declared_twice() {
+        const CTX_H: &str = concat!(
+            "struct aops { void (*run)(void); };\n",
+            "struct bops { void (*run)(void); };\n",
+            "struct ctx {\n",
+            "#ifdef A\n",
+            "    struct aops *h;\n",
+            "#else\n",
+            "    struct bops *h;\n",
+            "#endif\n",
+            "};\n",
+        );
+        const MAIN_C: &str = concat!(
+            "#include \"ctx.h\"\n",
+            "static void a_run(void) {}\n",
+            "static void b_run(void) {}\n",
+            "static struct aops at = { a_run };\n",
+            "static struct bops bt = { b_run };\n",
+            "void go(struct ctx *c) { c->h->run(); }\n",
+        );
+        let project = Project::new()
+            .file("ctx.h", CTX_H)
+            .file("main.c", MAIN_C)
+            .index();
+        let graph = graph_of(&project);
+        assert!(links(graph).is_empty(), "{}", graph.report());
+    }
+
+    /// Upstream: a macro-built table in a `#include`d `.def`, which the
+    /// scan does not index, registers its functions with the includer's
+    /// macros (W7-17b).
+    #[test]
+    fn w717b_a_table_in_a_non_indexed_include_is_read() {
+        let project = Project::new()
+            .file("inc.h", C11_INC_H)
+            .file("inc.c", C11_INC_C)
+            .file("ops.def", C11_OPS_DEF)
+            .index();
+        let graph = graph_of(&project);
+        assert!(
+            graph.files.iter().all(|file| file.path != "ops.def"),
+            "the .def is no indexed file\n{}",
+            graph.report()
+        );
+        assert_eq!(links(graph), c11_links("inc.c"), "{}", graph.report());
+    }
+
+    /// The two links of upstream's case 11 with its dispatch in `file`.
+    fn c11_links(file: &str) -> Vec<String> {
+        let line = line_of(C11_INC_C, "int go(");
+        vec![
+            link("go", "a_impl", "op.run", file, line),
+            link("go", "b_impl", "op.run", file, line),
+        ]
+    }
+
+    /// KEEP-RUST: a non-indexed include the configuration excludes is not
+    /// read (upstream reads any file on disk). So a first candidate it
+    /// excludes is no file, and the include resolves to the second: the
+    /// raw path from the root.
+    #[test]
+    fn w717b_an_excluded_include_is_not_read() {
+        let project = Project::new()
+            .file(
+                ".codegraph/config.toml",
+                "[app]\nname = \"probe\"\n\n[indexing]\nexclude = [\"ops.def\"]\n",
+            )
+            .file("inc.h", C11_INC_H)
+            .file("inc.c", C11_INC_C)
+            .file("ops.def", C11_OPS_DEF)
+            .index();
+        let graph = graph_of(&project);
+        assert!(links(graph).is_empty(), "{}", graph.report());
+
+        const OTHER_DEF: &str = "static struct CMD_T optable[] = {\n  { MK(\"c\", c_impl) },\n};\n";
+        let project = Project::new()
+            .file(
+                ".codegraph/config.toml",
+                "[app]\nname = \"probe\"\n\n[indexing]\nexclude = [\"src/ops.def\"]\n",
+            )
+            .file("src/inc.h", C11_INC_H)
+            .file(
+                "src/inc.c",
+                &C11_INC_C.replace(
+                    "#include \"ops.def\"",
+                    "static int c_impl(void){return 0;}\n#include \"ops.def\"",
+                ),
+            )
+            .file("src/ops.def", OTHER_DEF)
+            .file("ops.def", C11_OPS_DEF)
+            .index();
+        let graph = graph_of(&project);
+        let line = line_of(C11_INC_C, "int go(") + 1;
+        assert_eq!(
+            links(graph),
+            [
+                link("go", "a_impl", "op.run", "src/inc.c", line),
+                link("go", "b_impl", "op.run", "src/inc.c", line),
+            ],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// KEEP-RUST: a non-indexed include the root `.gitignore` ignores is not
+    /// read.
+    #[test]
+    fn w717b_a_gitignored_include_is_not_read() {
+        let project = Project::new()
+            .file(".gitignore", "*.def\n")
+            .file("inc.h", C11_INC_H)
+            .file("inc.c", C11_INC_C)
+            .file("ops.def", C11_OPS_DEF)
+            .index();
+        let graph = graph_of(&project);
+        assert!(links(graph).is_empty(), "{}", graph.report());
+    }
+
+    /// An include naming a file outside the project root is never probed,
+    /// nor recorded (#1631's lexical containment).
+    #[test]
+    fn w717b_an_include_outside_the_root_is_not_read() {
+        let project = Project::new()
+            .file("inc.h", C11_INC_H)
+            .file("inc.c", &C11_INC_C.replace("\"ops.def\"", "\"../ops.def\""));
+        let outside = project.root().parent().expect("the project's parent");
+        std::fs::write(outside.join("ops.def"), C11_OPS_DEF).expect("write ../ops.def");
+        let project = project.index();
+        let graph = graph_of(&project);
+        assert!(links(graph).is_empty(), "{}", graph.report());
+        assert_eq!(
+            inputs_row(&project),
+            serde_json::json!({}),
+            "an escaping candidate is not recorded"
+        );
+    }
+
+    /// KEEP-RUST: a non-indexed include reached through a symbolic link is
+    /// not read, as the scan reads no link it has not followed.
+    #[cfg(unix)]
+    #[test]
+    fn w717b_an_include_through_a_link_is_not_read() {
+        let project = Project::new()
+            .file("inc.h", C11_INC_H)
+            .file("inc.c", C11_INC_C)
+            .file("defs/ops.def", C11_OPS_DEF);
+        std::os::unix::fs::symlink("defs/ops.def", project.root().join("ops.def"))
+            .expect("link ops.def");
+        let project = project.index();
+        let graph = graph_of(&project);
+        assert!(links(graph).is_empty(), "{}", graph.report());
+        assert_eq!(inputs_row(&project), serde_json::json!({ "ops.def": null }));
+    }
+
+    /// A non-indexed include larger than `indexing.max_file_size` is not
+    /// read, as an indexed file that large is not.
+    #[test]
+    fn w717b_an_include_over_the_size_bound_is_not_read() {
+        let large = format!("{C11_OPS_DEF}/* {} */\n", "x".repeat(512));
+        assert!(C11_INC_C.len() < 400 && C11_INC_H.len() < 400 && large.len() > 400);
+        let config = "[app]\nname = \"probe\"\n\n[indexing]\nmax_file_size = 400\n";
+        let project = Project::new()
+            .file(".codegraph/config.toml", config)
+            .file("inc.h", C11_INC_H)
+            .file("inc.c", C11_INC_C)
+            .file("ops.def", &large)
+            .index();
+        let graph = graph_of(&project);
+        assert!(links(graph).is_empty(), "{}", graph.report());
+        let project = Project::new()
+            .file(".codegraph/config.toml", config)
+            .file("inc.h", C11_INC_H)
+            .file("inc.c", C11_INC_C)
+            .file("ops.def", C11_OPS_DEF)
+            .index();
+        let graph = graph_of(&project);
+        assert_eq!(links(graph), c11_links("inc.c"), "{}", graph.report());
+    }
+
+    /// A non-indexed include's own includes are read too: the table's macro
+    /// comes from the `.def` the `.def` includes. (The declaration before
+    /// the table is the statement boundary upstream's `INIT_RE` needs after
+    /// a directive line.)
+    #[test]
+    fn w717b_a_non_indexed_include_reads_its_includes() {
+        let project = Project::new()
+            .file("inc.h", C11_INC_H)
+            .file(
+                "inc.c",
+                &C11_INC_C.replace("#define MK(nm, fn) nm, fn\n", ""),
+            )
+            .file(
+                "ops.def",
+                &format!("#include \"mk.def\"\nstatic int count;\n{C11_OPS_DEF}"),
+            )
+            .file("mk.def", "#define MK(nm, fn) nm, fn\n")
+            .index();
+        let graph = graph_of(&project);
+        let line = line_of(C11_INC_C, "int go(") - 1;
+        assert_eq!(
+            links(graph),
+            [
+                link("go", "a_impl", "op.run", "inc.c", line),
+                link("go", "b_impl", "op.run", "inc.c", line),
+            ],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// KEEP-RUST: a table whose type only a non-indexed include aliases is
+    /// registered. colby's survival filter skips the includer's own unit:
+    /// its `aliasNames` are the indexed files' object macros.
+    #[test]
+    fn w717b_a_table_typed_by_a_non_indexed_alias_is_read() {
+        const INC_C: &str = concat!(
+            "#include \"inc.h\"\n",
+            "#include \"alias.def\"\n",
+            "static int a_impl(void){return 0;}\n",
+            "static struct CMD_T tab[] = { { \"a\", a_impl } };\n",
+            "int go(struct op *o) { return o->run(); }\n",
+        );
+        let project = Project::new()
+            .file("inc.h", C11_INC_H)
+            .file("alias.def", "#define CMD_T op\n")
+            .file("inc.c", INC_C)
+            .index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            links(graph),
+            [link(
+                "go",
+                "a_impl",
+                "op.run",
+                "inc.c",
+                line_of(INC_C, "int go(")
+            )],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// The index records each file the stage read beside it with its text's
+    /// hash, and each candidate it found no file at as null; an indexed
+    /// include is no such input.
+    #[test]
+    fn w717b_the_index_records_what_the_stage_read_beside_it() {
+        let project = Project::new()
+            .file("src/inc.h", C11_INC_H)
+            .file(
+                "src/inc.c",
+                &C11_INC_C.replace(
+                    "#include \"ops.def\"",
+                    "#include \"ops.def\"\n#include \"missing.def\"",
+                ),
+            )
+            .file("src/ops.def", C11_OPS_DEF)
+            .index();
+        let graph = graph_of(&project);
+        assert_eq!(links(graph).len(), 2, "{}", graph.report());
+        assert_eq!(
+            inputs_row(&project),
+            serde_json::json!({
+                "missing.def": null,
+                "src/missing.def": null,
+                "src/ops.def": codegraph_core::node_id::hash_content(C11_OPS_DEF),
+            })
+        );
+    }
+
+    /// The `synthesis_unindexed_inputs` row of `project`'s index.
+    #[track_caller]
+    fn inputs_row(project: &super::support::Indexed) -> serde_json::Value {
+        let rows = super::support::project_metadata_with_prefix(
+            &project.db(),
+            "synthesis_unindexed_inputs",
+        );
+        let [(key, value)] = rows.as_slice() else {
+            panic!("one synthesis_unindexed_inputs row: {rows:?}");
+        };
+        assert_eq!(key, "synthesis_unindexed_inputs");
+        serde_json::from_str(value).expect("the row is JSON")
+    }
+}
+
+/// W7-16b: upstream's `vue-store-extraction.test.ts` and the extraction half
+/// of `rtk-query-synthesizer.test.ts` (`e8ddc4e2`), the sources as written
+/// there, and the cases the Rust port adds.
+mod vue_stores {
+    use super::framework_dispatch::links;
+    use super::support::{Graph, Project, graph_of};
+
+    /// The signature upstream's `extractRtkHookBindings` gives a hook.
+    const RTK_HOOK_SIGNATURE: &str = "= RTK Query generated hook";
+
+    /// How many function nodes are named `name`.
+    fn functions_named(graph: &Graph, name: &str) -> usize {
+        graph.nodes_named("function", name).len()
+    }
+
+    /// Upstream `vue-store-extraction.test.ts`, first case: a Vuex module's
+    /// `const mutations`/`const actions`, a Pinia options store's `actions`
+    /// and `getters`, and a Pinia setup store's local functions are function
+    /// nodes, and an action owns the calls written in it.
+    #[test]
+    fn w716b_store_members_are_function_nodes() {
+        let project = Project::new()
+            .file(
+                "userModule.js",
+                "import { persistToken } from './auth-utils';
+const state = { token: '' };
+const mutations = {
+  SET_TOKEN: (state, token) => { state.token = token; },
+};
+const actions = {
+  login({ commit }, info) {
+    persistToken(info.token);
+  },
+  async logout({ commit }) {
+    commit('SET_TOKEN', '');
+  },
+};
+export default { namespaced: true, state, mutations, actions };
+",
+            )
+            .file(
+                "auth-utils.js",
+                "export function persistToken(token) { return token; }
+",
+            )
+            .file(
+                "authStore.ts",
+                "import { defineStore } from 'pinia';
+export const useAuthStore = defineStore({
+  id: 'auth',
+  state: () => ({ name: '' }),
+  getters: {
+    upperName: state => state.name.toUpperCase(),
+  },
+  actions: {
+    async fetchMenu() { return loadMenu(); },
+    setName(n: string) { this.name = n; },
+  },
+});
+",
+            )
+            .file(
+                "chatStore.ts",
+                "import { defineStore } from 'pinia';
+export const useChatStore = defineStore('chat', () => {
+  const list = reactive([]);
+  const getList = async () => { return fetchList(); };
+  function pushItem(x) { list.push(x); }
+  return { list, getList, pushItem };
+});
+",
+            )
+            .index();
+        let graph = graph_of(&project);
+        for name in [
+            "login",
+            "logout",
+            "SET_TOKEN",
+            "fetchMenu",
+            "setName",
+            "upperName",
+            "getList",
+            "pushItem",
+        ] {
+            assert!(
+                functions_named(graph, name) > 0,
+                "{name}\n{}",
+                graph.report()
+            );
+        }
+        let login_calls: Vec<&str> = graph
+            .edges
+            .iter()
+            .filter(|edge| {
+                edge.kind == "calls"
+                    && graph
+                        .node(&edge.source)
+                        .is_some_and(|node| node.name == "login")
+            })
+            .filter_map(|edge| graph.node(&edge.target).map(|node| node.name.as_str()))
+            .collect();
+        assert!(login_calls.contains(&"persistToken"), "{}", graph.report());
+    }
+
+    /// Upstream `vue-store-extraction.test.ts`, second case: a `const
+    /// actions = {…}` in a file that is no store is an owned literal like any
+    /// other (`actions::doThing`), and nothing reads `actions[key]()` as a
+    /// call to one of its members.
+    #[test]
+    fn w716b_a_const_actions_outside_a_store_is_an_owned_literal() {
+        let project = Project::new()
+            .file(
+                "commands.js",
+                "const actions = {
+  doThing() { return 1; },
+  doOther() { return 2; },
+};
+export function run(key) { return actions[key](); }
+",
+            )
+            .index();
+        let graph = graph_of(&project);
+        let mut members: Vec<(&str, &str)> = graph
+            .nodes
+            .iter()
+            .filter(|node| node.name == "doThing" || node.name == "doOther")
+            .map(|node| (node.kind.as_str(), node.qualified_name.as_str()))
+            .collect();
+        members.sort();
+        assert_eq!(
+            members,
+            [
+                ("function", "actions::doOther"),
+                ("function", "actions::doThing")
+            ],
+            "{}",
+            graph.report()
+        );
+        let run = graph.nodes_matching("function run");
+        assert_eq!(run.len(), 1, "{}", graph.report());
+        assert!(
+            !graph
+                .edges
+                .iter()
+                .any(|edge| edge.kind == "calls" && edge.source == run[0].id),
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// The sources of upstream `rtk-query-synthesizer.test.ts`'s first case.
+    pub(super) fn rtk_project() -> Project {
+        Project::new()
+            .file(
+                "fiatRampApi.ts",
+                "import { createApi, fetchBaseQuery } from '@reduxjs/toolkit/query/react';
+import { fetchRamps } from './ramps';
+
+export const fiatRampApi = createApi({
+  reducerPath: 'fiatRampApi',
+  baseQuery: fetchBaseQuery({ baseUrl: '/' }),
+  endpoints: build => ({
+    getFiatRamps: build.query({
+      queryFn: async () => {
+        const data = await fetchRamps();
+        return { data };
+      },
+    }),
+    placeOrder: build.mutation({
+      query: body => ({ url: 'order', method: 'POST', body }),
+    }),
+  }),
+});
+
+export const { useGetFiatRampsQuery, usePlaceOrderMutation, useLazyGetFiatRampsQuery } = fiatRampApi;
+",
+            )
+            .file(
+                "dashApi.ts",
+                "import { createApi, fetchBaseQuery } from '@reduxjs/toolkit/query/react';
+import { makeCheckFn } from './factory';
+
+export const dashApi = createApi({
+  reducerPath: 'dash',
+  baseQuery: fetchBaseQuery({ baseUrl: '/' }),
+  endpoints(builder) {
+    return {
+      getDashboards: builder.query({
+        query() {
+          return '/dashboards';
+        },
+      }),
+      checkConnection: builder.mutation({
+        queryFn: makeCheckFn('/check'),
+      }),
+    };
+  },
+});
+
+export const { useGetDashboardsQuery, useCheckConnectionMutation } = dashApi;
+",
+            )
+            .file(
+                "Views.tsx",
+                "import { useGetFiatRampsQuery, useLazyGetFiatRampsQuery } from './fiatRampApi';
+import { useGetDashboardsQuery } from './dashApi';
+
+export function FiatForm() {
+  const { data } = useGetFiatRampsQuery();
+  return data;
+}
+export function DashList() {
+  const { data } = useGetDashboardsQuery();
+  return data;
+}
+export function LazyForm() {
+  const [load] = useLazyGetFiatRampsQuery();
+  return load;
+}
+",
+            )
+    }
+
+    /// Upstream `rtk-query-synthesizer.test.ts`, first case, the extraction
+    /// half: each endpoint is a function node named by its key, in the arrow,
+    /// method and factory forms; each generated hook a function node with the
+    /// sentinel signature; and a component reaches the hook it calls.
+    #[test]
+    fn w716b_rtk_endpoints_and_generated_hooks_are_function_nodes() {
+        let project = rtk_project().index();
+        let graph = graph_of(&project);
+        for name in [
+            "getFiatRamps",
+            "placeOrder",
+            "getDashboards",
+            "checkConnection",
+        ] {
+            assert_eq!(
+                functions_named(graph, name),
+                1,
+                "{name}\n{}",
+                graph.report()
+            );
+        }
+        let mut hooks: Vec<&str> = graph
+            .nodes
+            .iter()
+            .filter(|node| node.signature.as_deref() == Some(RTK_HOOK_SIGNATURE))
+            .map(|node| node.name.as_str())
+            .collect();
+        hooks.sort();
+        assert_eq!(
+            hooks,
+            [
+                "useCheckConnectionMutation",
+                "useGetDashboardsQuery",
+                "useGetFiatRampsQuery",
+                "useLazyGetFiatRampsQuery",
+                "usePlaceOrderMutation",
+            ],
+            "{}",
+            graph.report()
+        );
+        assert!(
+            !graph
+                .edges_matching(
+                    "function FiatForm",
+                    "calls",
+                    "function useGetFiatRampsQuery"
+                )
+                .is_empty(),
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream `rtk-query-synthesizer.test.ts`, second case, the extraction
+    /// half: a hand-written `use*Query` hook keeps its body and carries no
+    /// sentinel.
+    #[test]
+    fn w716b_a_hand_written_query_hook_is_no_generated_hook() {
+        let project = Project::new()
+            .file(
+                "useGetThingQuery.ts",
+                "export function getThing() { return 42; }
+export const useGetThingQuery = () => {
+  return getThing();
+};
+",
+            )
+            .file(
+                "Thing.tsx",
+                "import { useGetThingQuery } from './useGetThingQuery';
+export function Thing() {
+  return useGetThingQuery();
+}
+",
+            )
+            .index();
+        let graph = graph_of(&project);
+        assert!(
+            !graph
+                .nodes
+                .iter()
+                .any(|node| node.signature.as_deref() == Some(RTK_HOOK_SIGNATURE)),
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// A component's script block is read as a script of its own: a Pinia
+    /// store or a Vuex module written there has its members, and whether it
+    /// reads like a store is decided by the block's text, not the template's.
+    #[test]
+    fn w716b_a_components_script_holds_its_store() {
+        let project = Project::new()
+            .file(
+                "src/CartStore.vue",
+                "<template><div /></template>
+<script lang=\"ts\">
+import { defineStore } from 'pinia';
+export const useCart = defineStore('cart', {
+  actions: { add(item: string) { this.items.push(item); } },
+});
+export default {};
+</script>
+",
+            )
+            .file(
+                "src/UserModule.vue",
+                "<template><div /></template>
+<script>
+export default {
+  namespaced: true,
+  actions: { load() { return fetchUser(); } },
+};
+</script>
+",
+            )
+            .file(
+                "src/Plain.vue",
+                "<template><div>actions and getters</div></template>
+<script>
+export default {
+  mutations: { SET(state) { state.v = 1; } },
+};
+</script>
+",
+            )
+            .index();
+        let graph = graph_of(&project);
+        let add = graph.nodes_matching("function useCart::add");
+        assert_eq!(add.len(), 1, "{}", graph.report());
+        assert_eq!(add[0].file_path, "src/CartStore.vue");
+        assert_eq!(
+            graph.nodes_matching("function load").len(),
+            1,
+            "{}",
+            graph.report()
+        );
+        assert!(
+            graph.nodes_named("function", "SET").is_empty(),
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream `rtk-query-synthesizer.test.ts`, first case: each generated
+    /// hook, the lazy one too, reaches its endpoint in its own file.
+    #[test]
+    fn w716b_rtk_hooks_reach_their_endpoints() {
+        let project = rtk_project().index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            links(graph, "rtk-query"),
+            [
+                "useCheckConnectionMutation -> dashApi::checkConnection via checkConnection @dashApi.ts:21 line 21",
+                "useGetDashboardsQuery -> dashApi::getDashboards via getDashboards @dashApi.ts:21 line 21",
+                "useGetFiatRampsQuery -> fiatRampApi::getFiatRamps via getFiatRamps @fiatRampApi.ts:20 line 20",
+                "useLazyGetFiatRampsQuery -> fiatRampApi::getFiatRamps via getFiatRamps @fiatRampApi.ts:20 line 20",
+                "usePlaceOrderMutation -> fiatRampApi::placeOrder via placeOrder @fiatRampApi.ts:20 line 20",
+            ],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream `rtk-query-synthesizer.test.ts`, second case: a hand-written
+    /// `use*Query` beside a same-file `getThing` reaches nothing.
+    #[test]
+    fn w716b_a_hand_written_query_hook_reaches_nothing() {
+        let project = Project::new()
+            .file(
+                "useGetThingQuery.ts",
+                "export function getThing() { return 42; }
+export const useGetThingQuery = () => {
+  return getThing();
+};
+",
+            )
+            .file(
+                "Thing.tsx",
+                "import { useGetThingQuery } from './useGetThingQuery';
+export function Thing() {
+  return useGetThingQuery();
+}
+",
+            )
+            .index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            links(graph, "rtk-query"),
+            Vec::<String>::new(),
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// The endpoint a hook reaches is the one function of its name in the
+    /// hook's file: two apis of one file with a `getPosts` each leave
+    /// `useGetPostsQuery` unlinked (upstream takes the first), one links.
+    #[test]
+    fn w716b_a_hook_with_two_endpoints_of_its_name_in_its_file_reaches_neither() {
+        let api = |second: &str| {
+            format!(
+                "import {{ createApi }} from '@reduxjs/toolkit/query/react';
+export const api = createApi({{
+  endpoints: (build) => ({{ getPosts: build.query({{ query: () => '/posts' }}) }}),
+}});
+{second}export const {{ useGetPostsQuery }} = api;
+"
+            )
+        };
+        let second = "export const admin = createApi({
+  endpoints: (build) => ({ getPosts: build.query({ query: () => '/admin/posts' }) }),
+});
+";
+        let project = Project::new().file("api.ts", &api(second)).index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            graph.nodes_named("function", "getPosts").len(),
+            2,
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            links(graph, "rtk-query"),
+            Vec::<String>::new(),
+            "{}",
+            graph.report()
+        );
+        let project = Project::new().file("api.ts", &api("")).index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            links(graph, "rtk-query"),
+            ["useGetPostsQuery -> api::getPosts via getPosts @api.ts:5 line 5"],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// A hook destructured from an api of another file reaches no endpoint:
+    /// RTK writes the hooks beside their api, as upstream requires.
+    #[test]
+    fn w716b_a_hook_reaches_no_endpoint_of_another_file() {
+        let project = Project::new()
+            .file(
+                "api.ts",
+                "import { createApi } from '@reduxjs/toolkit/query/react';
+export const api = createApi({
+  endpoints: (build) => ({ getPosts: build.query({ query: () => '/posts' }) }),
+});
+",
+            )
+            .file(
+                "hooks.ts",
+                "import { api } from './api';
+export const { useGetPostsQuery } = api;
+",
+            )
+            .index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            graph.nodes_named("function", "useGetPostsQuery").len(),
+            1,
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            links(graph, "rtk-query"),
+            Vec::<String>::new(),
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream `pinia-store-synthesizer.test.ts`, first case: a consumer's
+    /// calls on the stores it binds reach the actions of an options store and
+    /// a setup store; `$patch`, Pinia's own, reaches nothing.
+    #[test]
+    fn w716b_pinia_actions_are_reached_from_their_caller() {
+        let project = Project::new()
+            .file(
+                "authStore.ts",
+                "import { defineStore } from 'pinia';
+export const useAuthStore = defineStore({
+  id: 'auth',
+  state: () => ({ token: '' }),
+  actions: {
+    async getMenu() { return loadMenu(); },
+    setToken(t: string) { this.token = t; },
+  },
+});
+",
+            )
+            .file(
+                "chatStore.ts",
+                "import { defineStore } from 'pinia';
+export const useChatStore = defineStore('chat', () => {
+  const getList = async () => { return fetchList(); };
+  return { getList };
+});
+",
+            )
+            .file(
+                "init.ts",
+                "import { useAuthStore } from './authStore';
+import { useChatStore } from './chatStore';
+export function init() {
+  const authStore = useAuthStore();
+  const chatStore = useChatStore();
+  authStore.getMenu();
+  authStore.setToken('x');
+  authStore.$patch({});        // Pinia built-in — must not bridge
+  chatStore.getList();
+}
+",
+            )
+            .index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            links(graph, "pinia-store"),
+            [
+                "init -> useAuthStore::getMenu via getMenu @init.ts:6 line 6",
+                "init -> useAuthStore::setToken via setToken @init.ts:7 line 7",
+                "init -> useChatStore::getList via getList @init.ts:9 line 9",
+            ],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream `pinia-store-synthesizer.test.ts`, second case: without a
+    /// `defineStore` factory nothing is a store.
+    #[test]
+    fn w716b_without_a_define_store_factory_nothing_is_a_store() {
+        let project = Project::new()
+            .file(
+                "thing.ts",
+                "function useThing() { return { run() { return 1; } }; }
+export function go() {
+  const thing = useThing();
+  thing.run();
+}
+",
+            )
+            .index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            links(graph, "pinia-store"),
+            Vec::<String>::new(),
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// `cart.ts`, a Pinia options store with `add` and `clear`, for the
+    /// Pinia probes below.
+    const CART_STORE: &str = "import { defineStore } from 'pinia';
+export const useCartStore = defineStore('cart', {
+  actions: {
+    add(item: string) { this.items.push(item); },
+    clear() { this.items = []; },
+  },
+});
+";
+
+    /// A factory name, a binding or an action several stores share binds
+    /// nothing (upstream's later factory or binding wins, its first action
+    /// is the target): each half is the same project with one more store.
+    #[test]
+    fn w716b_a_factory_a_binding_or_an_action_two_stores_share_binds_nothing() {
+        let consumer = "import { useCartStore } from './cart';
+export function checkout() {
+  const cart = useCartStore();
+  cart.add('x');
+}
+";
+        // A function of the action's name outside the store's file is no
+        // candidate.
+        let one = Project::new()
+            .file("cart.ts", CART_STORE)
+            .file(
+                "utils.ts",
+                "export function add(a: number, b: number) { return a + b; }\n",
+            )
+            .file("checkout.ts", consumer)
+            .index();
+        assert_eq!(
+            links(graph_of(&one), "pinia-store"),
+            ["checkout -> useCartStore::add via add @checkout.ts:4 line 4"],
+            "{}",
+            graph_of(&one).report()
+        );
+        // The factory name defined in a second file.
+        let two_factories = Project::new()
+            .file("cart.ts", CART_STORE)
+            .file("legacy/cart.ts", CART_STORE)
+            .file("checkout.ts", consumer)
+            .index();
+        assert_eq!(
+            links(graph_of(&two_factories), "pinia-store"),
+            Vec::<String>::new(),
+            "{}",
+            graph_of(&two_factories).report()
+        );
+        // One variable bound to two stores in one file.
+        let two_bindings = Project::new()
+            .file("cart.ts", CART_STORE)
+            .file(
+                "wish.ts",
+                "import { defineStore } from 'pinia';
+export const useWishStore = defineStore('wish', {
+  actions: { add(item: string) { this.items.push(item); } },
+});
+",
+            )
+            .file(
+                "checkout.ts",
+                "import { useCartStore } from './cart';
+import { useWishStore } from './wish';
+export function checkout() {
+  const cart = useCartStore();
+  cart.add('x');
+}
+export function wish() {
+  const cart = useWishStore();
+  cart.add('y');
+}
+",
+            )
+            .index();
+        assert_eq!(
+            links(graph_of(&two_bindings), "pinia-store"),
+            Vec::<String>::new(),
+            "{}",
+            graph_of(&two_bindings).report()
+        );
+        // Two functions of the action's name in the store's file.
+        let two_actions = Project::new()
+            .file(
+                "cart.ts",
+                &format!("{CART_STORE}export function add(item: string) {{ return item; }}\n"),
+            )
+            .file("checkout.ts", consumer)
+            .index();
+        assert_eq!(
+            graph_of(&two_actions).nodes_named("function", "add").len(),
+            2,
+            "{}",
+            graph_of(&two_actions).report()
+        );
+        assert_eq!(
+            links(graph_of(&two_actions), "pinia-store"),
+            Vec::<String>::new(),
+            "{}",
+            graph_of(&two_actions).report()
+        );
+    }
+
+    /// A call outside every function comes from the file's one component,
+    /// and from none when the file has two (upstream takes the first).
+    #[test]
+    fn w716b_a_call_outside_every_function_comes_from_the_one_component() {
+        let view = |components: &str| {
+            format!(
+                "import {{ memo }} from 'react';
+import {{ useCartStore }} from './cart';
+const cart = useCartStore();
+cart.add('x');
+{components}"
+            )
+        };
+        let one = Project::new()
+            .file("cart.ts", CART_STORE)
+            .file(
+                "View.tsx",
+                &view("export const View = memo(() => <div />);\n"),
+            )
+            .index();
+        assert_eq!(
+            graph_of(&one).nodes_matching("component View").len(),
+            1,
+            "{}",
+            graph_of(&one).report()
+        );
+        assert_eq!(
+            links(graph_of(&one), "pinia-store"),
+            ["View -> useCartStore::add via add @View.tsx:4 line 4"],
+            "{}",
+            graph_of(&one).report()
+        );
+        let two = Project::new()
+            .file("cart.ts", CART_STORE)
+            .file(
+                "View.tsx",
+                &view(
+                    "export const View = memo(() => <div />);
+export const Other = memo(() => <span />);
+",
+                ),
+            )
+            .index();
+        assert_eq!(
+            links(graph_of(&two), "pinia-store"),
+            Vec::<String>::new(),
+            "{}",
+            graph_of(&two).report()
+        );
+    }
+
+    /// The consumer is read without its comments, a factory's file with
+    /// them, as upstream reads both: `// cart.clear()` reaches nothing, and
+    /// a factory written only in a comment is a factory.
+    #[test]
+    fn w716b_pinia_reads_a_consumer_without_its_comments_and_a_factory_with_them() {
+        let project = Project::new()
+            .file("cart.ts", CART_STORE)
+            .file(
+                "legacy.ts",
+                "// export const useLegacyStore = defineStore('legacy', {…})
+export function reset() { return 0; }
+",
+            )
+            .file(
+                "checkout.ts",
+                "import { useCartStore } from './cart';
+import { useLegacyStore } from './legacy';
+export function checkout() {
+  const cart = useCartStore();
+  // cart.clear();
+  const legacy = useLegacyStore();
+  legacy.reset();
+}
+",
+            )
+            .index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            links(graph, "pinia-store"),
+            ["checkout -> reset via reset @checkout.ts:7 line 7"],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// One consumer file links at most 80 Pinia calls (`PINIA_FANOUT_CAP`):
+    /// 81 different actions called in a row give 80 edges, the last call
+    /// none.
+    #[test]
+    fn w716b_a_file_links_at_most_80_pinia_calls() {
+        let actions: String = (0..81)
+            .map(|i| format!("    a{i}() {{ return {i}; }},\n"))
+            .collect();
+        let calls: String = (0..81).map(|i| format!("  s.a{i}();\n")).collect();
+        let project = Project::new()
+            .file(
+                "store.ts",
+                &format!(
+                    "import {{ defineStore }} from 'pinia';
+export const useBigStore = defineStore('big', {{
+  actions: {{
+{actions}  }},
+}});
+"
+                ),
+            )
+            .file(
+                "use.ts",
+                &format!(
+                    "import {{ useBigStore }} from './store';
+export function run() {{
+  const s = useBigStore();
+{calls}}}
+"
+                ),
+            )
+            .index();
+        let graph = graph_of(&project);
+        let linked = links(graph, "pinia-store");
+        assert_eq!(linked.len(), 80, "{}", graph.report());
+        assert!(
+            !linked.iter().any(|link| link.contains("via a80 ")),
+            "{linked:#?}"
+        );
+    }
+
+    /// Upstream `vuex-dispatch-synthesizer.test.ts`: a namespaced dispatch
+    /// reaches the module's action, not the api's namesake, a local commit
+    /// the module's mutation, and a non-string dispatch nothing.
+    #[test]
+    fn w716b_vuex_dispatch_and_commit_reach_the_store_handlers() {
+        let project = Project::new()
+            .file(
+                "store/modules/user.js",
+                "import { login as apiLogin } from '../../api/user';
+export default {
+  namespaced: true,
+  state: { token: '' },
+  mutations: {
+    SET_TOKEN(state, t) { state.token = t; },
+  },
+  actions: {
+    login({ commit }, info) {
+      apiLogin(info);
+      commit('SET_TOKEN', info.token);   // root/local key → SET_TOKEN in THIS module
+    },
+  },
+};
+",
+            )
+            .file(
+                "api/user.js",
+                "export function login(info) { return info; }\n",
+            )
+            .file(
+                "app.js",
+                "import store from './store';
+export function bootstrap() {
+  store.dispatch('user/login', { token: 'x' });
+}
+",
+            )
+            .file(
+                "reduxy.js",
+                "export function reduxy(dispatch) {
+  dispatch(someAction());
+}
+",
+            )
+            .index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            links(graph, "vuex-dispatch"),
+            [
+                "bootstrap -> login via user/login @app.js:3 line 3",
+                "login -> SET_TOKEN via SET_TOKEN @store/modules/user.js:11 line 11",
+            ],
+            "{}",
+            graph.report()
+        );
+        let login = graph.edges_matching(
+            "function bootstrap",
+            "calls",
+            "function login @store/modules/user.js",
+        );
+        assert_eq!(login.len(), 1, "{}", graph.report());
+    }
+
+    /// A Vuex module of `name: { … }` collections, `name` an action, for the
+    /// Vuex probes below.
+    fn vuex_module(action: &str) -> String {
+        format!(
+            "export default {{
+  namespaced: true,
+  actions: {{ {action}() {{ return 1; }} }},
+}};
+"
+        )
+    }
+
+    /// A namespaced key reaches the one candidate whose path has the
+    /// namespace as a segment: two such files reach neither (upstream takes
+    /// the first), an empty tier the project's one candidate, and a segment
+    /// is bounded by separators or a stem's dot.
+    #[test]
+    fn w716b_a_namespaced_key_reaches_the_one_store_file_of_its_namespace() {
+        let dispatcher = "export function go(store) {
+  store.dispatch('user/login');
+}
+";
+        let one = Project::new()
+            .file("store/modules/user.js", &vuex_module("login"))
+            .file("store/superuser/actions.js", &vuex_module("login"))
+            .file("app.js", dispatcher)
+            .index();
+        assert_eq!(
+            links(graph_of(&one), "vuex-dispatch"),
+            ["go -> login via user/login @app.js:2 line 2"],
+            "{}",
+            graph_of(&one).report()
+        );
+        let login = graph_of(&one).edges_matching(
+            "function go",
+            "calls",
+            "function login @store/modules/user.js",
+        );
+        assert_eq!(login.len(), 1, "{}", graph_of(&one).report());
+        // Two files of the namespace.
+        let two = Project::new()
+            .file("store/modules/user.js", &vuex_module("login"))
+            .file("store/user/actions.js", &vuex_module("login"))
+            .file("app.js", dispatcher)
+            .index();
+        assert_eq!(
+            links(graph_of(&two), "vuex-dispatch"),
+            Vec::<String>::new(),
+            "{}",
+            graph_of(&two).report()
+        );
+        // No file of the namespace: the one candidate.
+        let lone = Project::new()
+            .file("store/modules/account.js", &vuex_module("login"))
+            .file("app.js", dispatcher)
+            .index();
+        assert_eq!(
+            links(graph_of(&lone), "vuex-dispatch"),
+            ["go -> login via user/login @app.js:2 line 2"],
+            "{}",
+            graph_of(&lone).report()
+        );
+        // A top-level `user.js` has no leading separator, so no `user`
+        // segment: beside another candidate, neither is reached.
+        let root = Project::new()
+            .file("user.js", &vuex_module("login"))
+            .file("store/superuser/actions.js", &vuex_module("login"))
+            .file("app.js", dispatcher)
+            .index();
+        assert_eq!(
+            links(graph_of(&root), "vuex-dispatch"),
+            Vec::<String>::new(),
+            "{}",
+            graph_of(&root).report()
+        );
+    }
+
+    /// A root key reaches the dispatching file's one candidate: an action and
+    /// a mutation of one name in the module leave `commit('save')` unlinked
+    /// (upstream takes the first).
+    #[test]
+    fn w716b_a_root_key_with_two_candidates_in_its_file_reaches_neither() {
+        let module = |mutation: &str| {
+            format!(
+                "export default {{
+  namespaced: true,
+  mutations: {{ {mutation}(state) {{ state.v = 1; }} }},
+  actions: {{ save({{ commit }}) {{ commit('{mutation}'); }} }},
+}};
+"
+            )
+        };
+        let two = Project::new()
+            .file("store/user.js", &module("save"))
+            .index();
+        assert_eq!(
+            links(graph_of(&two), "vuex-dispatch"),
+            Vec::<String>::new(),
+            "{}",
+            graph_of(&two).report()
+        );
+        let one = Project::new()
+            .file("store/user.js", &module("SAVE"))
+            .index();
+        assert_eq!(
+            links(graph_of(&one), "vuex-dispatch"),
+            ["save -> SAVE via SAVE @store/user.js:4 line 4"],
+            "{}",
+            graph_of(&one).report()
+        );
+    }
+
+    /// `this.$store.dispatch` is a dispatch, and one written in a
+    /// component's script outside any function comes from the component.
+    #[test]
+    fn w716b_a_components_dispatch_comes_from_the_component() {
+        let project = Project::new()
+            .file("store/modules/user.js", &vuex_module("login"))
+            .file(
+                "src/Login.vue",
+                "<template><button /></template>
+<script setup>
+import { useStore } from 'vuex';
+const store = useStore();
+store.dispatch('user/login');
+</script>
+",
+            )
+            .file(
+                "src/legacy.js",
+                "export class Page {
+  go() { this.$store.dispatch('user/login'); }
+}
+",
+            )
+            .index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            links(graph, "vuex-dispatch"),
+            [
+                "Page::go -> login via user/login @src/legacy.js:2 line 2",
+                "src/Login.vue::Login -> login via user/login @src/Login.vue:5 line 5",
+            ],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// One file links at most 120 Vuex dispatches and commits
+    /// (`VUEX_FANOUT_CAP`): 121 different mutations committed in a row give
+    /// 120 edges, the last commit none.
+    #[test]
+    fn w716b_a_file_links_at_most_120_vuex_dispatches() {
+        let mutations: String = (0..121)
+            .map(|i| format!("    m{i}(state) {{ state.v = {i}; }},\n"))
+            .collect();
+        let commits: String = (0..121)
+            .map(|i| format!("  store.commit('m{i}');\n"))
+            .collect();
+        let project = Project::new()
+            .file(
+                "store/index.js",
+                &format!(
+                    "export default {{
+  namespaced: true,
+  mutations: {{
+{mutations}  }},
+}};
+"
+                ),
+            )
+            .file(
+                "app.js",
+                &format!("export function run(store) {{\n{commits}}}\n"),
+            )
+            .index();
+        let graph = graph_of(&project);
+        let linked = links(graph, "vuex-dispatch");
+        assert_eq!(linked.len(), 120, "{}", graph.report());
+        assert!(
+            !linked.iter().any(|link| link.contains("via m120 ")),
+            "{linked:#?}"
+        );
+    }
+
+    /// A project of `.vue` files only passes the Pinia and Vuex gates, as
+    /// upstream's (`has('vue', ...JS_FAMILY)`), and not the RTK Query one
+    /// (`has(...JS_FAMILY)`): its generated hooks are nodes and reach no
+    /// endpoint.
+    #[test]
+    fn w716b_a_vue_only_project_passes_the_pinia_and_vuex_gates_not_rtks() {
+        let project = Project::new()
+            .file(
+                "src/CartStore.vue",
+                "<template><div /></template>
+<script>
+import { defineStore } from 'pinia';
+export const useCartStore = defineStore('cart', {
+  actions: { add(item) { this.items.push(item); } },
+});
+export default {
+  namespaced: true,
+  mutations: { SET(state) { state.v = 1; } },
+};
+</script>
+",
+            )
+            .file(
+                "src/Checkout.vue",
+                "<template><button /></template>
+<script setup>
+import { useCartStore } from './CartStore.vue';
+const cart = useCartStore();
+cart.add('x');
+store.commit('SET');
+</script>
+",
+            )
+            .file(
+                "src/Api.vue",
+                "<template><div /></template>
+<script>
+import { createApi } from '@reduxjs/toolkit/query/react';
+export const api = createApi({
+  endpoints: (build) => ({ getPosts: build.query({ query: () => '/posts' }) }),
+});
+export const { useGetPostsQuery } = api;
+export default {};
+</script>
+",
+            )
+            .index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            links(graph, "pinia-store"),
+            ["src/Checkout.vue::Checkout -> useCartStore::add via add @src/Checkout.vue:5 line 5"],
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            links(graph, "vuex-dispatch"),
+            ["src/Checkout.vue::Checkout -> SET via SET @src/Checkout.vue:6 line 6"],
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            graph.nodes_named("function", "useGetPostsQuery").len(),
+            1,
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            graph.nodes_named("function", "getPosts").len(),
+            1,
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            links(graph, "rtk-query"),
+            Vec::<String>::new(),
+            "{}",
+            graph.report()
+        );
+    }
+}
+
+/// W7-16c: GoFrame's `g.Meta` routes and the pass that joins each to the
+/// controller method serving it, upstream `goframe.test.ts` with its sources
+/// as written, and the cases Rust adds.
+mod goframe {
+    use super::framework_dispatch::synthesized_by;
+    use super::support::{Graph, Project, graph_of};
+
+    /// The `go.mod` of upstream's fixtures.
+    const GO_MOD: &str = "module example.com/app\n\nrequire github.com/gogf/gf/v2 v2.7.0\n";
+
+    /// `api/system/dept.go` of upstream's first test.
+    const DEPT_API: &str = r#"package system
+
+import "github.com/gogf/gf/v2/frame/g"
+
+type DeptSearchReq struct {
+	g.Meta   `path:"/dept/list" tags:"Dept" method:"get" summary:"list"`
+	DeptName string
+}
+type DeptSearchRes struct {
+	g.Meta `mime:"application/json"`
+	List   []string
+}
+
+type DeptAddReq struct {
+	g.Meta `path:"/dept/add" method:"post"`
+	Name   string
+}
+type DeptAddRes struct{}
+
+// A declared route whose handler does not exist in this codebase.
+type OrphanReq struct {
+	g.Meta `path:"/orphan" method:"get"`
+}
+type OrphanRes struct{}
+"#;
+
+    /// `internal/controller/dept.go` of upstream's first test.
+    const DEPT_CONTROLLER: &str = r#"package controller
+
+import (
+	"context"
+
+	"example.com/app/api/system"
+)
+
+type sysDeptController struct{}
+
+// NB: method name (List) differs from the request type (DeptSearchReq) — the join
+// must be by signature, not name.
+func (c *sysDeptController) List(ctx context.Context, req *system.DeptSearchReq) (res *system.DeptSearchRes, err error) {
+	return helper(ctx)
+}
+
+func (c *sysDeptController) Add(ctx context.Context, req *system.DeptAddReq) (res *system.DeptAddRes, err error) {
+	return
+}
+
+// Returns the response type but takes no request type — must NOT be linked.
+func helper(ctx context.Context) (res *system.DeptSearchRes, err error) {
+	return
+}
+"#;
+
+    /// The route nodes as `name @file:line`, sorted.
+    fn routes(graph: &Graph) -> Vec<String> {
+        let mut routes: Vec<String> = graph
+            .nodes
+            .iter()
+            .filter(|node| node.kind == "route")
+            .map(|node| format!("{} @{}:{}", node.name, node.file_path, node.start_line))
+            .collect();
+        routes.sort();
+        routes
+    }
+
+    /// Every `goframe-route` edge as `route -> handler (file) requestType
+    /// <type> @<registeredAt> line <line>`, sorted; each is heuristic, from
+    /// a route to a method, with no column.
+    #[track_caller]
+    fn links(graph: &Graph) -> Vec<String> {
+        let mut links: Vec<String> = synthesized_by(graph, "goframe-route")
+            .map(|edge| {
+                assert_eq!(edge.provenance.as_deref(), Some("heuristic"), "{edge:?}");
+                assert_eq!(edge.col, None, "{edge:?}");
+                let route = graph.node(&edge.source).expect("the route");
+                let handler = graph.node(&edge.target).expect("the handler");
+                assert_eq!(route.kind, "route", "{edge:?}");
+                assert_eq!(handler.kind, "method", "{edge:?}");
+                assert_eq!(edge.metadata["route"], route.name.as_str(), "{edge:?}");
+                format!(
+                    "{} -> {} ({}) requestType {} @{} line {}",
+                    route.name,
+                    handler.qualified_name,
+                    handler.file_path,
+                    edge.metadata["requestType"].as_str().unwrap_or("?"),
+                    edge.metadata["registeredAt"].as_str().unwrap_or("?"),
+                    edge.line
+                        .map_or_else(|| "?".to_string(), |line| line.to_string()),
+                )
+            })
+            .collect();
+        links.sort();
+        links
+    }
+
+    /// Upstream `goframe.test.ts`: each `g.Meta` route joins its controller
+    /// method by the request type in its signature, the method's name aside;
+    /// a `mime`-only response makes no route, the orphan stays unlinked and
+    /// the response type links nothing.
+    #[test]
+    fn w716c_each_g_meta_route_joins_its_controller_method_by_the_request_type() {
+        let project = Project::new()
+            .file("go.mod", GO_MOD)
+            .file("api/system/dept.go", DEPT_API)
+            .file("internal/controller/dept.go", DEPT_CONTROLLER)
+            .index();
+        let graph = graph_of(&project);
+        let mut names: Vec<&str> = graph
+            .nodes
+            .iter()
+            .filter(|node| node.kind == "route")
+            .map(|node| node.name.as_str())
+            .collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            ["GET /dept/list", "GET /orphan", "POST /dept/add"],
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            links(graph),
+            [
+                "GET /dept/list -> sysDeptController::List (internal/controller/dept.go) requestType DeptSearchReq @internal/controller/dept.go:13 line 5",
+                "POST /dept/add -> sysDeptController::Add (internal/controller/dept.go) requestType DeptAddReq @internal/controller/dept.go:17 line 14",
+            ],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream `goframe.test.ts`: two modules both define `ListReq`; the
+    /// package qualifier in each handler's signature tells them apart.
+    #[test]
+    fn w716c_the_package_qualifier_tells_identical_request_types_apart() {
+        let mut project = Project::new().file("go.mod", GO_MOD);
+        for module in ["cash", "order"] {
+            project = project
+                .file(
+                    &format!("api/{module}/{module}.go"),
+                    &format!(
+                        "package {module}\n\nimport \"github.com/gogf/gf/v2/frame/g\"\n\ntype ListReq struct {{\n\tg.Meta `path:\"/{module}/list\" method:\"get\"`\n}}\ntype ListRes struct{{}}\n"
+                    ),
+                )
+                .file(
+                    &format!("internal/controller/{module}/{module}.go"),
+                    &format!(
+                        "package {module}\n\nimport (\n\t\"context\"\n\n\t\"example.com/app/api/{module}\"\n)\n\ntype c{module} struct{{}}\n\nfunc (c *c{module}) List(ctx context.Context, req *{module}.ListReq) (res *{module}.ListRes, err error) {{\n\treturn\n}}\n"
+                    ),
+                );
+        }
+        let project = project.index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            links(graph),
+            [
+                "GET /cash/list -> ccash::List (internal/controller/cash/cash.go) requestType ListReq @internal/controller/cash/cash.go:11 line 5",
+                "GET /order/list -> corder::List (internal/controller/order/order.go) requestType ListReq @internal/controller/order/order.go:11 line 5",
+            ],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Detection reads the root `go.mod` only, as upstream: no `go.mod`, one
+    /// that requires no GoFrame, or GoFrame named only in `server/go.mod`
+    /// gives no route; GoFrame v1's `github.com/gogf/gf` is GoFrame too.
+    #[test]
+    fn w716c_only_a_root_go_mod_naming_gogf_detects_goframe() {
+        let undetected = [
+            Project::new().file("api/system/dept.go", DEPT_API),
+            Project::new()
+                .file("go.mod", "module example.com/app\n\ngo 1.22\n")
+                .file("api/system/dept.go", DEPT_API),
+            Project::new()
+                .file("server/go.mod", GO_MOD)
+                .file("server/api/system/dept.go", DEPT_API),
+        ];
+        for project in undetected {
+            let project = project.index();
+            let graph = graph_of(&project);
+            assert_eq!(routes(graph), Vec::<String>::new(), "{}", graph.report());
+        }
+        let v1 = Project::new()
+            .file(
+                "go.mod",
+                "module example.com/app\n\nrequire github.com/gogf/gf v1.16.9\n",
+            )
+            .file("api/system/dept.go", DEPT_API)
+            .index();
+        assert_eq!(
+            routes(graph_of(&v1)),
+            [
+                "GET /dept/list @api/system/dept.go:5",
+                "GET /orphan @api/system/dept.go:21",
+                "POST /dept/add @api/system/dept.go:14",
+            ],
+            "{}",
+            graph_of(&v1).report()
+        );
+    }
+
+    /// A route is a request type whose first field is a tagged `g.Meta`
+    /// with a `path:`, outside comments: no `method:` serves `ANY`, a method
+    /// is upper-cased, and the type's package qualifies its name.
+    #[test]
+    fn w716c_a_route_is_a_request_type_whose_first_field_is_a_tagged_g_meta() {
+        let api = r#"package x
+
+import "github.com/gogf/gf/v2/frame/g"
+
+// type CommentedReq struct {
+// 	g.Meta `path:"/commented" method:"get"`
+// }
+
+/* type BlockReq struct { g.Meta `path:"/block"` } */
+
+type AnyReq struct {
+	g.Meta `path:"/any"`
+}
+
+type PostReq struct {
+	g.Meta `path:"/post" method:"post"`
+}
+
+type PostRes struct {
+	g.Meta `mime:"application/json"`
+}
+
+type LateReq struct {
+	Name   string
+	g.Meta `path:"/late"`
+}
+
+type lowerReq struct {
+	g.Meta `path:"/lower"`
+}
+"#;
+        let project = Project::new()
+            .file("go.mod", GO_MOD)
+            .file("api/x/x.go", api)
+            .index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            routes(graph),
+            ["ANY /any @api/x/x.go:11", "POST /post @api/x/x.go:15"],
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            graph
+                .nodes_matching("route api/x/x.go::goframe-route:x.PostReq")
+                .len(),
+            1,
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// The bare type is the fallback: a same-package handler (`*DeptSearchReq`)
+    /// and an aliased import (`*sys.DeptAddReq`) are reached through it.
+    #[test]
+    fn w716c_a_same_package_or_aliased_handler_is_reached_through_the_bare_type() {
+        let project = Project::new()
+            .file("go.mod", GO_MOD)
+            .file("api/system/dept.go", DEPT_API)
+            .file(
+                "api/system/search.go",
+                "package system\n\nimport \"context\"\n\ntype Ctl struct{}\n\nfunc (c *Ctl) Search(ctx context.Context, req *DeptSearchReq) (res *DeptSearchRes, err error) {\n\treturn\n}\n",
+            )
+            .file(
+                "internal/controller/dept.go",
+                "package controller\n\nimport (\n\t\"context\"\n\n\tsys \"example.com/app/api/system\"\n)\n\ntype ctl struct{}\n\nfunc (c *ctl) Add(ctx context.Context, req *sys.DeptAddReq) (res *sys.DeptAddRes, err error) {\n\treturn\n}\n",
+            )
+            .index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            links(graph),
+            [
+                "GET /dept/list -> Ctl::Search (api/system/search.go) requestType DeptSearchReq @api/system/search.go:7 line 5",
+                "POST /dept/add -> ctl::Add (internal/controller/dept.go) requestType DeptAddReq @internal/controller/dept.go:11 line 14",
+            ],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// A handler takes its request type by pointer, and is a method: a value
+    /// parameter is no join, and a function taking the type beside the
+    /// method is no second candidate.
+    #[test]
+    fn w716c_a_value_parameter_or_a_function_is_no_handler() {
+        let project = Project::new()
+            .file("go.mod", GO_MOD)
+            .file("api/system/dept.go", DEPT_API)
+            .file(
+                "internal/controller/dept.go",
+                "package controller\n\nimport (\n\t\"context\"\n\n\t\"example.com/app/api/system\"\n)\n\ntype ctl struct{}\n\nfunc (c *ctl) List(ctx context.Context, req *system.DeptSearchReq) (res *system.DeptSearchRes, err error) {\n\treturn\n}\n\nfunc validate(req *system.DeptSearchReq) error {\n\treturn nil\n}\n\nfunc (c *ctl) Add(ctx context.Context, req system.DeptAddReq) (res *system.DeptAddRes, err error) {\n\treturn\n}\n",
+            )
+            .index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            links(graph),
+            [
+                "GET /dept/list -> ctl::List (internal/controller/dept.go) requestType DeptSearchReq @internal/controller/dept.go:11 line 5"
+            ],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Several methods take the request type: a controller directory's wins
+    /// over a logic one's; among controller ones, the route's own addon
+    /// root's (core for core, the addon's for the addon; `addons/` is
+    /// re-included, as Godot's default skips it); two left link nothing.
+    #[test]
+    fn w716c_controller_directories_then_the_routes_addon_pick_the_handler() {
+        let add = |receiver: &str| {
+            format!(
+                "package dept\n\nimport (\n\t\"context\"\n\n\t\"example.com/app/api/system\"\n)\n\ntype {receiver} struct{{}}\n\nfunc (c *{receiver}) Add(ctx context.Context, req *system.DeptAddReq) (res *system.DeptAddRes, err error) {{\n\treturn\n}}\n"
+            )
+        };
+        let tiers = Project::new()
+            .file("go.mod", GO_MOD)
+            .file("api/system/dept.go", DEPT_API)
+            .file("internal/logic/dept.go", &add("sDept"))
+            .file("internal/controller/dept.go", &add("cDept"))
+            .index();
+        assert_eq!(
+            links(graph_of(&tiers)),
+            [
+                "POST /dept/add -> cDept::Add (internal/controller/dept.go) requestType DeptAddReq @internal/controller/dept.go:11 line 14"
+            ],
+            "{}",
+            graph_of(&tiers).report()
+        );
+        let config = "package config\n\nimport \"github.com/gogf/gf/v2/frame/g\"\n\ntype GetReq struct {\n\tg.Meta `path:\"/config/get\" method:\"get\"`\n}\ntype GetRes struct{}\n";
+        let get = |import: &str| {
+            format!(
+                "package admin\n\nimport (\n\t\"context\"\n\n\t\"{import}\"\n)\n\ntype cConfig struct{{}}\n\nfunc (c *cConfig) Get(ctx context.Context, req *config.GetReq) (res *config.GetRes, err error) {{\n\treturn\n}}\n"
+            )
+        };
+        let addons = Project::new()
+            .file(
+                ".codegraph/config.toml",
+                "[app]\nname = \"probe\"\n\n[indexing]\nignore_dirs = [\".godot\"]\n",
+            )
+            .file("go.mod", GO_MOD)
+            .file("api/admin/config/config.go", config)
+            .file("addons/hgexample/api/admin/config/config.go", config)
+            .file(
+                "internal/controller/admin/config.go",
+                &get("example.com/app/api/admin/config"),
+            )
+            .file(
+                "addons/hgexample/controller/admin/config.go",
+                &get("example.com/app/addons/hgexample/api/admin/config"),
+            )
+            .index();
+        assert_eq!(
+            links(graph_of(&addons)),
+            [
+                "GET /config/get -> cConfig::Get (addons/hgexample/controller/admin/config.go) requestType GetReq @addons/hgexample/controller/admin/config.go:11 line 5",
+                "GET /config/get -> cConfig::Get (internal/controller/admin/config.go) requestType GetReq @internal/controller/admin/config.go:11 line 5",
+            ],
+            "{}",
+            graph_of(&addons).report()
+        );
+        let core_route = graph_of(&addons).edges_matching(
+            "route api/admin/config/config.go::goframe-route:config.GetReq",
+            "calls",
+            "method cConfig::Get @internal/controller/admin/config.go",
+        );
+        assert_eq!(core_route.len(), 1, "{}", graph_of(&addons).report());
+        let two = Project::new()
+            .file("go.mod", GO_MOD)
+            .file("api/system/dept.go", DEPT_API)
+            .file("internal/controller/dept.go", &add("cDept"))
+            .file("internal/controller/v2/dept.go", &add("cDeptV2"))
+            .index();
+        assert_eq!(
+            links(graph_of(&two)),
+            Vec::<String>::new(),
+            "{}",
+            graph_of(&two).report()
+        );
+    }
+
+    /// OD-B16 (KEEP-RUST): the bare fallback leaves out a handler whose
+    /// qualified parameter is another route's request type. With `cash` and
+    /// `order` both declaring a `ListReq` route and only `order` handling
+    /// one, `GET /cash/list` reaches nothing (upstream reaches `order`'s);
+    /// without `order`'s route the handler is no other route's and the
+    /// fallback reaches it, as upstream's does.
+    #[test]
+    fn w716c_the_bare_fallback_leaves_out_a_handler_another_route_owns() {
+        let api = |module: &str, routed: bool| {
+            if routed {
+                format!(
+                    "package {module}\n\nimport \"github.com/gogf/gf/v2/frame/g\"\n\ntype ListReq struct {{\n\tg.Meta `path:\"/{module}/list\" method:\"get\"`\n}}\ntype ListRes struct{{}}\n"
+                )
+            } else {
+                format!(
+                    "package {module}\n\ntype ListReq struct {{\n\tPage int\n}}\ntype ListRes struct{{}}\n"
+                )
+            }
+        };
+        let handler = "package order\n\nimport (\n\t\"context\"\n\n\t\"example.com/app/api/order\"\n)\n\ntype corder struct{}\n\nfunc (c *corder) List(ctx context.Context, req *order.ListReq) (res *order.ListRes, err error) {\n\treturn\n}\n";
+        let owned = Project::new()
+            .file("go.mod", GO_MOD)
+            .file("api/cash/cash.go", &api("cash", true))
+            .file("api/order/order.go", &api("order", true))
+            .file("internal/controller/order/order.go", handler)
+            .index();
+        assert_eq!(
+            links(graph_of(&owned)),
+            [
+                "GET /order/list -> corder::List (internal/controller/order/order.go) requestType ListReq @internal/controller/order/order.go:11 line 5"
+            ],
+            "{}",
+            graph_of(&owned).report()
+        );
+        let unrouted = Project::new()
+            .file("go.mod", GO_MOD)
+            .file("api/cash/cash.go", &api("cash", true))
+            .file("api/order/order.go", &api("order", false))
+            .file("internal/controller/order/order.go", handler)
+            .index();
+        assert_eq!(
+            links(graph_of(&unrouted)),
+            [
+                "GET /cash/list -> corder::List (internal/controller/order/order.go) requestType ListReq @internal/controller/order/order.go:11 line 5"
+            ],
+            "{}",
+            graph_of(&unrouted).report()
+        );
+    }
+
+    /// The pass links at most 2000 routes (upstream `FANOUT_CAP`): 2001
+    /// routes each with its handler give 2000 edges, the last route none.
+    #[test]
+    fn w716c_the_pass_links_at_most_2000_routes() {
+        let mut api = String::from("package a\n\nimport \"github.com/gogf/gf/v2/frame/g\"\n\n");
+        let mut controller = String::from(
+            "package controller\n\nimport (\n\t\"context\"\n\n\t\"example.com/app/api/a\"\n)\n\ntype C struct{}\n\n",
+        );
+        for i in 0..2001 {
+            api.push_str(&format!(
+                "type R{i}Req struct {{\n\tg.Meta `path:\"/r{i}\"`\n}}\n"
+            ));
+            controller.push_str(&format!(
+                "func (c *C) H{i}(ctx context.Context, req *a.R{i}Req) (err error) {{\n\treturn\n}}\n"
+            ));
+        }
+        let project = Project::new()
+            .file("go.mod", GO_MOD)
+            .file("api/a/a.go", &api)
+            .file("internal/controller/c.go", &controller)
+            .index();
+        let graph = graph_of(&project);
+        let linked = links(graph);
+        assert_eq!(linked.len(), 2000, "{}", graph.report());
+        assert!(
+            !linked.iter().any(|link| link.starts_with("ANY /r2000 ")),
+            "{linked:#?}"
+        );
+    }
+}
+
+mod vue_templates {
+    use super::support::{Graph, Project, graph_of};
+
+    /// The edges the Vue template pass draws as `by): source -> target
+    /// file:line {metadata}`, sorted, the metadata without `synthesizedBy`.
+    fn drawn(graph: &Graph, by: &str) -> Vec<String> {
+        let mut edges: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.metadata["synthesizedBy"] == by)
+            .map(|edge| {
+                let source = graph.node(&edge.source).expect("the source");
+                let target = graph.node(&edge.target).expect("the target");
+                let mut metadata = edge.metadata.clone();
+                metadata
+                    .as_object_mut()
+                    .expect("an object")
+                    .remove("synthesizedBy");
+                format!(
+                    "{} -> {} {}:{} {metadata}",
+                    source.name, target.name, target.file_path, target.start_line
+                )
+            })
+            .collect();
+        edges.sort();
+        edges
+    }
+
+    /// Upstream `jsx-package-imports.test.ts` "binds nothing in a Vue
+    /// template for a tag or a composable imported from a package" (#2475's
+    /// Vue half, W7-18c): ant-design-vue's `<Card>` and `<Button>` render
+    /// the package's components, not the project's of those names, and the
+    /// handler is what the package's composable returns, not the project's
+    /// composable of the same name.
+    #[test]
+    fn w718c_a_tag_or_a_composable_a_package_answers_binds_nothing() {
+        let project = Project::new()
+            .file(
+                "package.json",
+                "{\"dependencies\":{\"vue\":\"^3.4.0\",\"ant-design-vue\":\"^4.0.0\",\"@vueuse/core\":\"^10.0.0\"}}",
+            )
+            .file(
+                "src/components/ui/card/Card.vue",
+                "<script setup lang=\"ts\">\ndefineProps<{ title?: string }>();\n</script>\n\n<template>\n  <div class=\"card\"><slot /></div>\n</template>\n",
+            )
+            .file(
+                "src/components/ui/button/Button.vue",
+                "<script setup lang=\"ts\">\ndefineProps<{ variant?: string }>();\n</script>\n\n<template>\n  <button><slot /></button>\n</template>\n",
+            )
+            .file(
+                "src/components/AppHeader.vue",
+                "<script setup lang=\"ts\">\nconst title = \"App\";\n</script>\n\n<template>\n  <header>{{ title }}</header>\n</template>\n",
+            )
+            .file(
+                "src/composables/useFullscreen.ts",
+                "export function useFullscreen() {\n  function toggle() {\n    return document.fullscreenElement;\n  }\n  return { toggle };\n}\n",
+            )
+            .file(
+                "src/views/Dashboard.vue",
+                "<script setup lang=\"ts\">\nimport { Button, Card } from 'ant-design-vue';\nimport { useFullscreen } from '@vueuse/core';\nimport AppHeader from '../components/AppHeader.vue';\n\nconst { toggle: toggleFullscreen } = useFullscreen();\n</script>\n\n<template>\n  <AppHeader />\n  <Card title=\"Usage\">\n    <Button @click=\"toggleFullscreen\">Full screen</Button>\n  </Card>\n</template>\n",
+            )
+            .index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            drawn(graph, "jsx-render"),
+            ["Dashboard -> AppHeader src/components/AppHeader.vue:1 {\"via\":\"AppHeader\"}"],
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            drawn(graph, "vue-handler"),
+            Vec::<String>::new(),
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// A template's tags and handlers (W7-18c, upstream `vueTemplateEdges`):
+    /// a kebab-case tag renders its PascalCase component, a tag no node is
+    /// named renders the component Nuxt auto-imports under that name, a
+    /// built-in renders nothing; a bare handler is the function it names, a
+    /// handler the script destructures from a composable is that member of
+    /// the composable's file, an expression's leading name only through its
+    /// composable, every edge at the component's line.
+    #[test]
+    fn w718c_a_template_renders_its_tags_and_binds_its_handlers() {
+        let project = Project::new()
+            .file("package.json", "{\"name\":\"shop\",\"dependencies\":{\"nuxt\":\"^4.0.0\"}}")
+            .file(
+                "components/ElButton.vue",
+                "<template>\n  <button><slot /></button>\n</template>\n",
+            )
+            .file(
+                "components/media/Card.vue",
+                "<template>\n  <div><slot /></div>\n</template>\n",
+            )
+            .file(
+                "composables/useSidebar.ts",
+                "export function useSidebar() {\n  let open = true;\n  function close() {\n    open = false;\n  }\n  function toggle() {\n    open = !open;\n  }\n  return { close, toggle };\n}\n",
+            )
+            .file(
+                "components/AppSidebar.vue",
+                "<template>\n  <aside>\n    <el-button @click=\"closeSidebar\">x</el-button>\n    <MediaCard />\n    <NuxtLink to=\"/\">home</NuxtLink>\n    <button @click=\"toggle(1)\">t</button>\n    <button @click=\"refresh\">r</button>\n    <button @click=\"refresh(true)\">again</button>\n  </aside>\n</template>\n\n<script setup lang=\"ts\">\nconst { close: closeSidebar, toggle } = useSidebar();\nfunction refresh(force?: boolean) {\n  return force;\n}\n</script>\n",
+            )
+            .index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            drawn(graph, "jsx-render"),
+            [
+                "AppSidebar -> Card components/media/Card.vue:1 {\"via\":\"MediaCard\"}",
+                "AppSidebar -> ElButton components/ElButton.vue:1 {\"via\":\"el-button\"}",
+            ],
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            drawn(graph, "vue-handler"),
+            [
+                "AppSidebar -> close composables/useSidebar.ts:3 {\"event\":\"click\",\"via\":\"useSidebar\"}",
+                "AppSidebar -> refresh components/AppSidebar.vue:14 {\"event\":\"click\"}",
+                "AppSidebar -> toggle composables/useSidebar.ts:6 {\"event\":\"click\",\"via\":\"useSidebar\"}",
+            ],
+            "{}",
+            graph.report()
+        );
+        assert!(
+            graph
+                .edges
+                .iter()
+                .filter(|edge| edge.metadata["synthesizedBy"] == "jsx-render"
+                    || edge.metadata["synthesizedBy"] == "vue-handler")
+                .all(|edge| edge.kind == "calls"
+                    && edge.line == Some(1)
+                    && edge.col.is_none()
+                    && edge.provenance.as_deref() == Some("heuristic")),
             "{}",
             graph.report()
         );

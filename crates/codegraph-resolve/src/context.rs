@@ -8,7 +8,7 @@
 
 use crate::lru_cache::LruCache;
 use crate::package_manifests::{ManifestScope, read_manifest_scope};
-use crate::path_aliases::{AliasMap, load_project_aliases};
+use crate::path_aliases::{AliasMap, load_directory_aliases, load_project_aliases};
 use crate::source_facts::SourceFacts;
 use crate::types::{GoModule, ImportMapping, ReExport, ResolutionContext};
 use crate::workspace_packages::{WorkspacePackages, load_workspace_packages};
@@ -58,6 +58,8 @@ struct Caches {
     /// The name matcher's memos for the pass (W5-08).
     name_matcher_tables: Option<Arc<crate::name_matcher::NameMatcherTables>>,
     project_aliases: Option<Option<AliasMap>>,
+    /// Each directory's nearest aliases below the root (upstream #2165).
+    dir_aliases: HashMap<String, Option<AliasMap>>,
     go_module: Option<Option<GoModule>>,
     go_modules: Option<Vec<GoModule>>,
     rust_crates: Option<Arc<crate::rust_scope::RustCrates>>,
@@ -65,6 +67,8 @@ struct Caches {
     /// Each directory's package.json / Deno import-map scope for the pass.
     manifest_scopes: HashMap<String, Arc<ManifestScope>>,
     all_files: Option<Arc<Vec<String>>>,
+    /// The dependency names the project's manifests declare, for the pass.
+    declared_dependencies: Option<Arc<std::collections::BTreeSet<String>>>,
     files_by_basename: Option<HashMap<String, Arc<Vec<String>>>>,
     /// Existence answers for the pass: import resolution probes every extension
     /// of a specifier from every importing file, and neither the borrowed store
@@ -94,6 +98,8 @@ struct Caches {
     objc_tables: Option<Arc<crate::objc_scope::ObjcTables>>,
     go_tables: Option<Arc<crate::go_packages::GoTables>>,
     solidity_tables: Option<Arc<crate::solidity_scope::SolidityTables>>,
+    /// The routers' route tables for the pass (W7-07).
+    route_tables: Option<Arc<crate::frameworks::route_href::RouteTables>>,
 }
 
 /// A compiled pattern set by its key.
@@ -133,12 +139,14 @@ impl Caches {
             head_rows: HashMap::new(),
             name_matcher_tables: None,
             project_aliases: None,
+            dir_aliases: HashMap::new(),
             go_module: None,
             go_modules: None,
             rust_crates: None,
             workspace_packages: None,
             manifest_scopes: HashMap::new(),
             all_files: None,
+            declared_dependencies: None,
             files_by_basename: None,
             file_exists: HashMap::new(),
             python_write_index: None,
@@ -159,6 +167,7 @@ impl Caches {
             objc_tables: None,
             go_tables: None,
             solidity_tables: None,
+            route_tables: None,
         }
     }
 }
@@ -438,6 +447,15 @@ impl ResolutionContext for StoreResolutionContext<'_> {
         self.cached_all_files()
     }
 
+    fn declared_dependencies(&self) -> Arc<std::collections::BTreeSet<String>> {
+        if let Some(names) = self.caches.borrow().declared_dependencies.clone() {
+            return names;
+        }
+        let names = Arc::new(crate::frameworks::package_deps::declared_dependencies(self));
+        self.caches.borrow_mut().declared_dependencies = Some(names.clone());
+        names
+    }
+
     fn get_files_by_basename_shared(&self, basename: &str) -> Arc<Vec<String>> {
         self.cached_files_by_basename(basename)
     }
@@ -568,6 +586,30 @@ impl ResolutionContext for StoreResolutionContext<'_> {
             c.project_aliases = Some(loaded);
         }
         c.project_aliases.clone().flatten()
+    }
+
+    fn get_nearest_aliases(&self, from_file: &str) -> Option<AliasMap> {
+        let walk = crate::path_aliases::nearest_alias_walk(from_file);
+        let mut walked = Vec::new();
+        let mut found = None;
+        for dir in walk {
+            if let Some(hit) = self.caches.borrow().dir_aliases.get(dir) {
+                found = hit.clone();
+                break;
+            }
+            walked.push(dir);
+            if let Some(aliases) =
+                load_directory_aliases(&std::path::Path::new(&self.project_root).join(dir))
+            {
+                found = Some(aliases);
+                break;
+            }
+        }
+        let mut c = self.caches.borrow_mut();
+        for dir in walked {
+            c.dir_aliases.insert(dir.to_string(), found.clone());
+        }
+        found
     }
 
     fn get_workspace_packages(&self) -> Option<WorkspacePackages> {
@@ -744,6 +786,15 @@ impl ResolutionContext for StoreResolutionContext<'_> {
                 .borrow_mut()
                 .solidity_tables
                 .get_or_insert_with(|| Arc::new(crate::solidity_scope::SolidityTables::new())),
+        )
+    }
+
+    fn route_tables(&self) -> Arc<crate::frameworks::route_href::RouteTables> {
+        Arc::clone(
+            self.caches
+                .borrow_mut()
+                .route_tables
+                .get_or_insert_with(Default::default),
         )
     }
 
@@ -1048,33 +1099,51 @@ fn load_go_module_in(project_root: &str, dir: &str) -> Option<GoModule> {
 /// Ordered by `dir` and deduplicated, so the result does not depend on the file
 /// iteration order.
 fn load_go_modules(project_root: &str, files: &[String]) -> Vec<GoModule> {
-    let mut dirs: BTreeSet<String> = BTreeSet::new();
-    for file in files {
-        if !file.ends_with(".go") {
-            continue;
-        }
-        let normalized = file.replace('\\', "/");
-        let mut dir = pathutil::dirname(&normalized);
-        loop {
-            dirs.insert(dir.clone());
-            if dir.is_empty() {
-                break;
-            }
-            dir = pathutil::dirname(&dir);
-        }
-    }
-    // A Go-less project keeps the previous behaviour: probe the root only.
-    if dirs.is_empty() {
-        return load_go_module(project_root).into_iter().collect();
-    }
-
-    let mut modules: Vec<GoModule> = dirs
+    let mut modules: Vec<GoModule> = go_module_inputs(files)
         .iter()
-        .filter_map(|dir| load_go_module_in(project_root, dir))
+        .filter_map(|relative| {
+            let dir = relative
+                .strip_suffix("go.mod")
+                .map_or("", |dir| dir.trim_end_matches('/'));
+            load_go_module_in(project_root, dir)
+        })
         .collect();
     modules.sort_by(|a, b| a.dir.cmp(&b.dir).then(a.module_path.cmp(&b.module_path)));
     modules.dedup_by(|a, b| a.dir == b.dir);
     modules
+}
+
+/// The project-relative `go.mod` paths [`load_go_modules`] reads for `files`:
+/// the root's (all a Go-less project reads), and one in every directory at or
+/// above an indexed `.go` file, a missing one included, sorted (W5-06 compares
+/// them). A file path that could leave the project root lexically (rooted,
+/// UNC, a Windows drive's, or `..` above the root) is skipped, by the rule
+/// `pathutil::lexical_path_within_root` applies, and the others are read
+/// normalized, so no probe leaves the root and the walk up ends.
+pub fn go_module_inputs(files: &[String]) -> Vec<String> {
+    let mut dirs: BTreeSet<String> = BTreeSet::from([String::new()]);
+    for file in files {
+        if !file.ends_with(".go") {
+            continue;
+        }
+        let Some(file) = pathutil::lexical_relative(file) else {
+            continue;
+        };
+        let mut dir = pathutil::dirname(&file);
+        while !dir.is_empty() {
+            dirs.insert(dir.clone());
+            dir = pathutil::dirname(&dir);
+        }
+    }
+    dirs.into_iter()
+        .map(|dir| {
+            if dir.is_empty() {
+                "go.mod".to_string()
+            } else {
+                format!("{dir}/go.mod")
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -1095,6 +1164,22 @@ mod tests {
 
     fn open_store(root: &std::path::Path) -> Store {
         Store::open(&root.join("index.db")).expect("open store")
+    }
+
+    /// W7-07: a pass's routers share one set of route tables, so each
+    /// router reads the route nodes once per pass, not once per call.
+    #[test]
+    fn a_pass_keeps_one_set_of_route_tables() {
+        let root = temp_root("route-tables");
+        let store = open_store(&root);
+        let context = StoreResolutionContext::new(&store, root.to_string_lossy());
+        assert!(Arc::ptr_eq(
+            &context.route_tables(),
+            &context.route_tables()
+        ));
+        let other = StoreResolutionContext::new(&store, root.to_string_lossy());
+        assert!(!Arc::ptr_eq(&context.route_tables(), &other.route_tables()));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     fn node(id: &str, name: &str, kind: NodeKind, file: &str, line: i64, col: i64) -> Node {
@@ -1236,6 +1321,41 @@ mod tests {
         assert_eq!(modules[0].dir, "");
         assert_eq!(modules[0].module_path, "ex/m");
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// W7-15d1: what `load_go_modules` reads, and the Go control kind
+    /// compares: the root's `go.mod`, and one in every directory at or above
+    /// an indexed `.go` file, by directory, its path normalized; no other
+    /// file, and no path that could leave the project: rooted, UNC, a
+    /// Windows drive's, absolute or drive-relative, or `..` above the root.
+    #[test]
+    fn go_module_inputs_are_the_root_and_every_directory_above_a_go_file() {
+        assert_eq!(go_module_inputs(&[]), ["go.mod"]);
+        assert_eq!(
+            go_module_inputs(&[
+                "svc/api/handler.go".to_string(),
+                "svc\\cli\\main.go".to_string(),
+                "web/app.ts".to_string(),
+                "a/../b/z.go".to_string(),
+                "/abs/x.go".to_string(),
+                "\\rooted\\x.go".to_string(),
+                "\\\\server\\share\\x.go".to_string(),
+                "C:\\outside\\x.go".to_string(),
+                "C:/outside/x.go".to_string(),
+                "C:outside\\x.go".to_string(),
+                "./C:/outside/x.go".to_string(),
+                "a\\..\\C:\\outside\\x.go".to_string(),
+                "../out/y.go".to_string(),
+                "a/../../out/y.go".to_string(),
+            ]),
+            [
+                "go.mod",
+                "b/go.mod",
+                "svc/go.mod",
+                "svc/api/go.mod",
+                "svc/cli/go.mod"
+            ]
+        );
     }
 
     #[test]
@@ -1512,6 +1632,49 @@ mod tests {
         assert!(ctx.get_workspace_packages().is_some());
         assert!(ctx.get_go_module().is_some());
         assert!(ctx.get_go_module().is_some());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// W7-09a (upstream #2165): a file's nearest aliases are those of the
+    /// first directory up from it, below the root, whose own config declares
+    /// `paths`; a directory without one passes the lookup up, and a file
+    /// with none between it and the root has none.
+    #[test]
+    fn store_context_reads_the_nearest_configs_aliases() {
+        let root = temp_root("nearest-aliases");
+        std::fs::create_dir_all(root.join("apps/web/src/pages")).unwrap();
+        std::fs::create_dir_all(root.join("apps/docs")).unwrap();
+        std::fs::write(
+            root.join("tsconfig.json"),
+            r#"{ "compilerOptions": { "paths": { "@/*": ["src/*"] } } }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("apps/web/tsconfig.json"),
+            r#"{ "compilerOptions": { "paths": { "@/*": ["./src/*"] } } }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("apps/web/src/tsconfig.json"),
+            r#"{ "compilerOptions": { "strict": true } }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("apps/docs/tsconfig.json"),
+            r#"{ "compilerOptions": { "strict": true } }"#,
+        )
+        .unwrap();
+        let store = open_store(&root);
+        let ctx = StoreResolutionContext::new(&store, root.to_str().unwrap());
+        for _ in 0..2 {
+            let web = ctx
+                .get_nearest_aliases("apps/web/src/pages/a.tsx")
+                .expect("the web app's aliases");
+            assert!(web.base_url.ends_with("/apps/web"));
+        }
+        assert!(ctx.get_nearest_aliases("apps/docs/a.ts").is_none());
+        assert!(ctx.get_nearest_aliases("a.ts").is_none());
+        assert!(ctx.get_nearest_aliases("../a.ts").is_none());
         std::fs::remove_dir_all(&root).ok();
     }
 

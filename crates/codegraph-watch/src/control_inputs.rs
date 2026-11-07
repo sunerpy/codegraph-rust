@@ -1,14 +1,16 @@
 //! What resolution reads of a project's control files, which are no source
 //! files (W5-06): the JS/TS path aliases, workspace and package manifests,
-//! the C# project files and the Cargo manifests, and which frameworks the
-//! project uses.
+//! the C# project files, the Cargo manifests and the Go module files
+//! (W7-15d1), and which frameworks the project uses.
 //!
 //! Each reader reports what it read or probed in the same traversal that
 //! reads it ([`codegraph_resolve::path_aliases::alias_config_inputs`],
+//! [`codegraph_resolve::path_aliases::nearest_alias_inputs`],
 //! [`codegraph_resolve::workspace_packages::workspace_inputs`],
 //! [`codegraph_resolve::package_manifests::manifest_inputs`],
 //! [`codegraph_resolve::csharp_types::csharp_project_inputs`],
-//! [`codegraph_resolve::rust_scope::rust_manifest_inputs`]); every full index,
+//! [`codegraph_resolve::rust_scope::rust_manifest_inputs`],
+//! [`codegraph_resolve::context::go_module_inputs`]); every full index,
 //! migration and sync writes one row per kind holding a digest of each input
 //! (a file's text, a directory's listing, `null` for a missing one), and one
 //! row naming the detected frameworks. A sync re-reads a kind's inputs (the
@@ -16,8 +18,9 @@
 //! names a control file, is a folder coming into a workspace glob's listing,
 //! or changes which files the kind's readers start from) and compares: a kind
 //! that moved re-resolves every file of its languages whole; a framework that
-//! came or went re-extracts every file, since framework nodes are made at
-//! extraction. The rows are written last;
+//! came or went, or a manifest edit that moves which files a framework that
+//! runs only in its own apps extracts, re-extracts every file, since
+//! framework nodes are made at extraction. The rows are written last;
 //! `control_inputs_version` is withdrawn and restored with the other
 //! markers, and `frameworks_version` only by a sync that re-extracts for a
 //! framework change.
@@ -39,7 +42,9 @@ pub const VERSION_KEY: &str = "control_inputs_version";
 pub const VERSION: &str = "1";
 /// Metadata key prefix of a kind's row.
 pub const ROW_KEY_PREFIX: &str = "control_inputs:";
-/// Metadata key of the detected frameworks, sorted, as JSON.
+/// Metadata key of the detected frameworks, sorted, as JSON, then the digest
+/// of which files the frameworks that run only in their own apps extract
+/// ([`codegraph_resolve::ReferenceResolver::framework_signature`]).
 pub const FRAMEWORKS_KEY: &str = "frameworks_detected";
 /// Metadata key present when no sync left a framework change unextracted.
 pub const FRAMEWORKS_VERSION_KEY: &str = "frameworks_version";
@@ -52,16 +57,18 @@ pub enum ControlKind {
     Js,
     Csharp,
     Rust,
+    Go,
 }
 
 impl ControlKind {
-    pub const ALL: [Self; 3] = [Self::Js, Self::Csharp, Self::Rust];
+    pub const ALL: [Self; 4] = [Self::Js, Self::Csharp, Self::Rust, Self::Go];
 
     fn key(self) -> &'static str {
         match self {
             Self::Js => "js",
             Self::Csharp => "csharp",
             Self::Rust => "rust",
+            Self::Go => "go",
         }
     }
 
@@ -88,6 +95,7 @@ impl ControlKind {
                 lower.ends_with(".csproj") || lower.ends_with(".props")
             }
             Self::Rust => name == "Cargo.toml",
+            Self::Go => name == "go.mod",
         }
     }
 
@@ -98,6 +106,7 @@ impl ControlKind {
             Self::Js => has_module_surface(path, language),
             Self::Csharp => language == Language::CSharp,
             Self::Rust => path.ends_with(".rs"),
+            Self::Go => path.ends_with(".go"),
         }
     }
 }
@@ -210,7 +219,21 @@ pub fn digests_of(kind: ControlKind, project_root: &Path, files: &[FileRecord]) 
                 .filter(|file| kind.reads_from(&file.path, file.language))
                 .map(|file| file.path.clone())
                 .collect();
+            // The configs nearer a file than the root's, which its imports
+            // try first (upstream #2165).
+            for path in codegraph_resolve::path_aliases::nearest_alias_inputs(&root, &js) {
+                out.insert(key_of(project_root, &path), file_digest(&path));
+            }
             for relative in codegraph_resolve::package_manifests::manifest_inputs(&js) {
+                let digest = file_digest(&project_root.join(&relative));
+                out.insert(relative, digest);
+            }
+            // The manifests framework detection reads (upstream #2395): the
+            // root's, the ones one or two directories down from any indexed
+            // file, and the ones deeper above JavaScript-family code.
+            let paths: Vec<String> = files.iter().map(|file| file.path.clone()).collect();
+            for relative in codegraph_resolve::frameworks::package_deps::manifest_candidates(&paths)
+            {
                 let digest = file_digest(&project_root.join(&relative));
                 out.insert(relative, digest);
             }
@@ -239,6 +262,13 @@ pub fn digests_of(kind: ControlKind, project_root: &Path, files: &[FileRecord]) 
         ControlKind::Rust => {
             let paths: Vec<String> = files.iter().map(|file| file.path.clone()).collect();
             for relative in codegraph_resolve::rust_scope::rust_manifest_inputs(&paths) {
+                let digest = file_digest(&project_root.join(&relative));
+                out.insert(relative, digest);
+            }
+        }
+        ControlKind::Go => {
+            let paths: Vec<String> = files.iter().map(|file| file.path.clone()).collect();
+            for relative in codegraph_resolve::context::go_module_inputs(&paths) {
                 let digest = file_digest(&project_root.join(&relative));
                 out.insert(relative, digest);
             }
@@ -302,8 +332,9 @@ fn parent_of(path: &str) -> &str {
 }
 
 /// The recorded inputs an event can name, by project path, as the rows hold
-/// them once a sync is done (W5-06): the watcher hands their events to the
-/// next sync, though they are no source files.
+/// them once a sync is done (W5-06, and the synthesis stage's, W7-17b): the
+/// watcher hands their events to the next sync, though they are no source
+/// files.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct RecordedInputs {
     /// Every input inside the project, a listed directory by its own path.
@@ -343,6 +374,11 @@ pub fn recorded_paths(store: &Store) -> Result<RecordedInputs> {
             out.paths.insert(path.to_string());
         }
     }
+    // The files the synthesis stage last read beside the index, or found
+    // missing (W7-17b): a sync compares them.
+    if let Some(inputs) = codegraph_resolve::synthesis::recorded_inputs(store)? {
+        out.paths.extend(inputs.into_keys());
+    }
     Ok(out)
 }
 
@@ -379,9 +415,9 @@ impl ControlCheck {
 /// kind; otherwise a kind is re-read when a `requested` path is one of its
 /// recorded inputs, is a listed directory or one directly in a workspace
 /// glob's listing, or names one of its control files, or a `membership`
-/// change touches a file its readers start from. A `bootstrap` (the marker
-/// was missing when the sync began) re-reads every kind and counts each as
-/// moved.
+/// change touches a file its readers start from (for the JS kind, any file
+/// that comes or goes). A `bootstrap` (the marker was missing when the sync
+/// began) re-reads every kind and counts each as moved.
 pub(crate) fn check(
     store: &Store,
     project_root: &Path,
@@ -412,10 +448,15 @@ pub(crate) fn check(
                 || (kind == ControlKind::Js
                     && row.contains_key(&format!("dir:{}", parent_of(path))))
         }) || membership.iter().any(|(path, before, after)| {
-            before
-                .iter()
-                .chain(after)
-                .any(|language| kind.reads_from(path, *language))
+            // Framework detection reads the manifests one or two directories
+            // down from every indexed file, whatever its language (upstream
+            // #2395), so a file of any language that comes or goes may move
+            // the JS kind's inputs.
+            (kind == ControlKind::Js && (before.is_none() || after.is_none()))
+                || before
+                    .iter()
+                    .chain(after)
+                    .any(|language| kind.reads_from(path, *language))
         })
     };
     let mut out = ControlCheck::default();
@@ -499,6 +540,10 @@ mod tests {
         assert!(is_control_file("src/App.CSPROJ"));
         assert!(is_control_file("Directory.Build.props"));
         assert!(is_control_file("crates/a/Cargo.toml"));
+        assert!(is_control_file("go.mod"));
+        assert!(is_control_file("services/api/go.mod"));
+        assert!(!is_control_file("go.sum"));
+        assert!(!is_control_file("main.go"));
         assert!(is_control_file("src-tauri/tauri.conf.json"));
         assert!(is_control_file("packages/kit/pubspec.yaml"));
         assert!(is_control_file("pubspec_overrides.yaml"));
@@ -506,5 +551,35 @@ mod tests {
         assert!(!is_control_file("apps/tauri.conf.json"));
         assert!(!is_control_file("src/main.ts"));
         assert!(!is_control_file("cargo.toml"));
+    }
+
+    /// The files the synthesis stage last read beside the index, and the
+    /// candidates it found no file at, are inputs whose events the watcher
+    /// hands to a sync (W7-17b).
+    #[test]
+    fn the_synthesis_stage_inputs_are_recorded_inputs() {
+        let dir = std::env::temp_dir().join(format!(
+            "cg-control-inputs-synthesis-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Store::open(&dir.join("index.db")).unwrap();
+        assert_eq!(recorded_paths(&store).unwrap(), RecordedInputs::default());
+        store
+            .set_project_metadata(
+                codegraph_resolve::synthesis::INPUTS_KEY,
+                r#"{"missing.def":null,"src/ops.def":"0123"}"#,
+            )
+            .unwrap();
+        let recorded = recorded_paths(&store).unwrap();
+        assert!(recorded.may_move("src/ops.def", false));
+        assert!(recorded.may_move("missing.def", false));
+        assert!(!recorded.may_move("src/other.def", false));
+        drop(store);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

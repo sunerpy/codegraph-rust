@@ -191,11 +191,11 @@ fn resolve_fixture(name: &str) -> Resolved {
         .extract_and_persist_frameworks(&mut store, &relative)
         .expect("framework extract");
     resolver
-        .resolve_and_persist(&mut store)
-        .expect("resolve and persist");
-    resolver
         .run_post_extract(&mut store)
         .expect("run post extract");
+    resolver
+        .resolve_and_persist(&mut store)
+        .expect("resolve and persist");
 
     let mut edges = Vec::new();
     for kind in NodeKind::ALL {

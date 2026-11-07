@@ -821,6 +821,110 @@ fn callers_keep_multiple_edge_kinds_between_same_pair() {
     assert_eq!(callers.len(), 2, "exactly two multi-kind caller edges");
 }
 
+/// A navigation (`navigate('/login')` resolved to the `/login` route, F1) is
+/// a caller/callee edge both ways, as upstream's traversal lists it.
+#[test]
+fn a_navigation_is_a_caller_and_callee_edge() {
+    let mut store = Store::open(&temp_db_path("navigates")).expect("open store");
+    let mut route = r2_node("route:login", "/login");
+    route.kind = NodeKind::Route;
+    store
+        .upsert_nodes(&[r2_node("function:logout", "logout"), route])
+        .expect("insert nodes");
+    store
+        .insert_edges(&[edge(
+            "function:logout",
+            "route:login",
+            EdgeKind::Navigates,
+            Some(3),
+            Some(4),
+        )])
+        .expect("insert edges");
+
+    let traverser = GraphTraverser::new(&store);
+    let callers = traverser.get_callers("route:login", 1).expect("callers");
+    assert_eq!(
+        callers
+            .iter()
+            .map(|c| (c.node.id.as_str(), c.edge.kind))
+            .collect::<Vec<_>>(),
+        [("function:logout", EdgeKind::Navigates)]
+    );
+    let callees = traverser
+        .get_callees("function:logout", 1)
+        .expect("callees");
+    assert_eq!(
+        callees
+            .iter()
+            .map(|c| (c.node.id.as_str(), c.edge.kind))
+            .collect::<Vec<_>>(),
+        [("route:login", EdgeKind::Navigates)]
+    );
+}
+
+/// A named flow rides a navigation as it rides a call (upstream
+/// `FLOW_EDGE_KINDS`), and a flow's boundary continues through one
+/// (`CONTINUATION_KINDS`).
+#[test]
+fn a_flow_and_its_boundary_ride_a_navigation() {
+    let mut store = Store::open(&temp_db_path("navigates-flow")).expect("open store");
+    let submit = r2_node("function:submit", "submitForm");
+    let open = r2_node("function:open", "openSettings");
+    let mut screen = r2_node("component:settings", "SettingsScreen");
+    screen.kind = NodeKind::Component;
+    store
+        .upsert_nodes(&[submit, open.clone(), screen])
+        .expect("insert nodes");
+    store
+        .insert_edges(&[
+            edge(
+                "function:submit",
+                "function:open",
+                EdgeKind::Calls,
+                Some(2),
+                Some(2),
+            ),
+            edge(
+                "function:open",
+                "component:settings",
+                EdgeKind::Navigates,
+                Some(5),
+                Some(2),
+            ),
+        ])
+        .expect("insert edges");
+
+    let flow = codegraph_graph::named_symbol_flow::resolve_named_symbol_flow(
+        &store,
+        "submitForm SettingsScreen",
+        &codegraph_graph::named_symbol_flow::NamedSymbolFlowOptions::default(),
+    );
+    let steps: Vec<&str> = flow
+        .chains
+        .first()
+        .map(|chain| chain.steps.iter().map(|s| s.node.id.as_str()).collect())
+        .unwrap_or_default();
+    assert_eq!(
+        steps,
+        ["function:submit", "function:open", "component:settings"]
+    );
+
+    let continuations = codegraph_graph::flow_boundary::continuations_from(
+        &store,
+        &open,
+        &std::collections::HashSet::new(),
+    )
+    .expect("continuations");
+    assert_eq!(
+        continuations
+            .resolved
+            .iter()
+            .map(|c| c.node.id.as_str())
+            .collect::<Vec<_>>(),
+        ["component:settings"]
+    );
+}
+
 /// #1087 (mirror) — callees must likewise keep multi-kind edges to the same pair.
 #[test]
 fn callees_keep_multiple_edge_kinds_between_same_pair() {

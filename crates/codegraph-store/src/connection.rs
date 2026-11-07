@@ -156,6 +156,22 @@ impl StoreStatusOpen {
     }
 }
 
+/// Why a database's schema version could not be read (OD-19).
+#[derive(Debug, thiserror::Error)]
+pub enum SchemaVersionReadError {
+    /// A file of the database (the main file or its write-ahead log) could
+    /// not be read.
+    #[error("failed to read {path}: {source}")]
+    Io {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    /// The database could not be queried.
+    #[error(transparent)]
+    Sqlite(#[from] rusqlite::Error),
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
     #[error("failed to create database directory {path}: {source}")]
@@ -181,6 +197,30 @@ pub enum StoreError {
         path: PathBuf,
         #[source]
         source: rusqlite::Error,
+    },
+    /// The database records a schema this binary does not know: a newer
+    /// codegraph wrote it (OD-19). Nothing was changed. `discard_with_uninit`
+    /// is whether `uninit --force` accepts the namespace's state, so the
+    /// message offers it only where it works.
+    #[error(
+        "index database {path} was written by a newer CodeGraph (schema {found}; this binary supports schema {supported}); upgrade CodeGraph before using it{}",
+        future_schema_discard_hint(*.discard_with_uninit)
+    )]
+    FutureSchema {
+        path: PathBuf,
+        found: i64,
+        supported: i64,
+        discard_with_uninit: bool,
+    },
+    /// The database's schema version could not be read, so it is not used or
+    /// replaced. Nothing was changed.
+    #[error(
+        "failed to read the schema version of {path}: {source}; nothing was changed (run `codegraph status` to inspect the index)"
+    )]
+    ReadSchemaVersion {
+        path: PathBuf,
+        #[source]
+        source: SchemaVersionReadError,
     },
     #[error(transparent)]
     Lease(#[from] IndexLeaseError),
@@ -313,12 +353,8 @@ impl Store {
             source,
         })?;
 
-        migrations::ensure_schema_and_migrations(&mut conn).map_err(|source| {
-            StoreError::Migrate {
-                path: db_path.to_path_buf(),
-                source,
-            }
-        })?;
+        migrations::ensure_schema_and_migrations(&mut conn)
+            .map_err(|error| migration_error(db_path, error, false))?;
 
         Ok(Self {
             conn,
@@ -502,6 +538,7 @@ impl Store {
                 // them for the same reason — and folds them away afterwards.
                 let (corroboration, source_conn) = corroborate_current_database_options(
                     paths,
+                    true,
                     false,
                     matches!(
                         purpose,
@@ -532,12 +569,8 @@ impl Store {
                 // behind (an extraction-version-22 index is schema 9 or later,
                 // so this is v10's DDL at most): migrate it under the same
                 // exclusive lease before the first write (W5-09e).
-                migrations::ensure_schema_and_migrations(&mut conn).map_err(|source| {
-                    StoreError::Migrate {
-                        path: db_path.clone(),
-                        source,
-                    }
-                })?;
+                migrations::ensure_schema_and_migrations(&mut conn)
+                    .map_err(|error| migration_error(&db_path, error, true))?;
                 Ok(StoreWriteOpen::Current(Box::new(Self {
                     conn,
                     _source_conn: None,
@@ -601,8 +634,7 @@ impl Store {
                     // then publishes Uninitialized before deleting those
                     // sidecars. Rejecting them here would make that required
                     // cleanup path unreachable.
-                    let (corroboration, source_conn) =
-                        corroborate_current_database_options(paths, false, true)?;
+                    let (corroboration, source_conn) = corroborate_current_for_uninit(paths)?;
                     drop(corroboration);
                     drop(source_conn);
                 }
@@ -651,12 +683,8 @@ impl Store {
         })?;
         configure_connection_for_rebuild(&conn, paths, lease, &db_path)?;
         lease.validate_exclusive(paths)?;
-        migrations::ensure_schema_and_migrations(&mut conn).map_err(|source| {
-            StoreError::Migrate {
-                path: db_path.clone(),
-                source,
-            }
-        })?;
+        migrations::ensure_schema_and_migrations(&mut conn)
+            .map_err(|error| migration_error(&db_path, error, false))?;
         Ok(Self {
             conn,
             _source_conn: None,
@@ -868,7 +896,7 @@ fn corroborate_current_database_with(
     paths: &IndexPaths,
     allow_tombstone: bool,
 ) -> Result<(Connection, Connection)> {
-    corroborate_current_database_options(paths, allow_tombstone, false)
+    corroborate_current_database_options(paths, true, allow_tombstone, false)
 }
 
 /// Corroborate a `Current` namespace from its main-database bytes.
@@ -885,11 +913,28 @@ fn corroborate_current_database_with(
 /// already-checkpointed main-file bytes, so the version gate is unchanged.
 fn corroborate_current_database_options(
     paths: &IndexPaths,
+    check_schema: bool,
     allow_tombstone: bool,
     allow_live_sidecar: bool,
 ) -> Result<(Connection, Connection)> {
     let db_path = paths.current_db();
     if !allow_tombstone && artifact_exists(&paths.tombstone())? {
+        // A database a newer codegraph wrote is reported as that before the
+        // tombstone, whose recovery (`init`) would refuse it (OD-19); uninit
+        // discards both. Read without touching a file, and only a version
+        // positively newer changes the answer.
+        if check_schema
+            && let Ok(crate::schema_probe::ProbedSchema::Version(found)) =
+                crate::schema_probe::probe_schema_version(&db_path)
+            && found > migrations::CURRENT_SCHEMA_VERSION
+        {
+            return Err(StoreError::FutureSchema {
+                path: db_path,
+                found,
+                supported: migrations::CURRENT_SCHEMA_VERSION,
+                discard_with_uninit: uninit_would_discard(paths, &ExtractionStatus::Current),
+            });
+        }
         return Err(StoreError::CurrentTombstoned {
             path: paths.tombstone(),
         });
@@ -913,7 +958,123 @@ fn corroborate_current_database_options(
             source,
         })?;
     validate_extraction_stamp(&db_path, stamp)?;
+    if check_schema {
+        if allow_live_sidecar {
+            // A writer's log may hold a newer schema the main image lacks. Read
+            // it as its next opener would, before any writable open touches
+            // the database (OD-19).
+            check_schema_version_with_log(&db_path)?;
+        } else {
+            // Sidecar-freedom was proved above, so the main image is the
+            // whole database.
+            check_schema_version(&db_path, &conn)?;
+        }
+    }
     Ok((conn, source_conn))
+}
+
+/// The corroboration `uninit --force` runs on a `Current` namespace before its
+/// first change. OD-19: no schema check, so uninit stays the way to discard a
+/// newer codegraph's index; it still reads the extraction stamp row. A
+/// tombstone beside `Current` is an init that published but could not remove
+/// it: uninit discards that index too, and the tombstone stays.
+fn corroborate_current_for_uninit(paths: &IndexPaths) -> Result<(Connection, Connection)> {
+    corroborate_current_database_options(paths, false, true, true)
+}
+
+/// Whether `uninit --force` would discard the namespace in `status` now: a
+/// state it accepts, and for `Current` its own read-only corroboration
+/// (database present, main file readable, extraction stamp this binary's).
+/// A refusal offers uninit only when this holds; it creates and writes no
+/// file.
+pub(crate) fn uninit_would_discard(paths: &IndexPaths, status: &ExtractionStatus) -> bool {
+    crate::uninit::uninit_accepts(status)
+        && (*status != ExtractionStatus::Current || corroborate_current_for_uninit(paths).is_ok())
+}
+
+/// Refuse a database that records a schema newer than this binary's, read on
+/// the connection that will be used (OD-19). An unreadable version fails
+/// closed.
+/// The recovery a [`StoreError::FutureSchema`] message offers besides
+/// upgrading.
+fn future_schema_discard_hint(discard_with_uninit: bool) -> &'static str {
+    if discard_with_uninit {
+        ", or discard it with `codegraph uninit --force` and rebuild it with `codegraph init`"
+    } else {
+        ""
+    }
+}
+
+fn check_schema_version(db_path: &Path, conn: &Connection) -> Result<()> {
+    let found =
+        migrations::get_current_version(conn).map_err(|source| StoreError::ReadSchemaVersion {
+            path: db_path.to_path_buf(),
+            source: source.into(),
+        })?;
+    if found > migrations::CURRENT_SCHEMA_VERSION {
+        return Err(StoreError::FutureSchema {
+            path: db_path.to_path_buf(),
+            found,
+            supported: migrations::CURRENT_SCHEMA_VERSION,
+            discard_with_uninit: true,
+        });
+    }
+    Ok(())
+}
+
+/// [`check_schema_version`] for a database whose write-ahead log may hold
+/// committed frames: the main file plus those frames, read into memory without
+/// creating or writing any file.
+fn check_schema_version_with_log(db_path: &Path) -> Result<()> {
+    match crate::schema_probe::probe_schema_version(db_path) {
+        Ok(crate::schema_probe::ProbedSchema::Version(found))
+            if found > migrations::CURRENT_SCHEMA_VERSION =>
+        {
+            Err(StoreError::FutureSchema {
+                path: db_path.to_path_buf(),
+                found,
+                supported: migrations::CURRENT_SCHEMA_VERSION,
+                discard_with_uninit: true,
+            })
+        }
+        Ok(crate::schema_probe::ProbedSchema::Version(_)) => Ok(()),
+        Ok(crate::schema_probe::ProbedSchema::Absent) => Err(StoreError::CurrentDatabaseMissing {
+            path: db_path.to_path_buf(),
+        }),
+        Ok(crate::schema_probe::ProbedSchema::NotSqlite) => Err(StoreError::ReadSchemaVersion {
+            path: db_path.to_path_buf(),
+            source: rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_NOTADB),
+                None,
+            )
+            .into(),
+        }),
+        Err(source) => Err(StoreError::ReadSchemaVersion {
+            path: db_path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+/// `discard_with_uninit` as [`StoreError::FutureSchema`] documents it: true
+/// where the caller opened a `Current` namespace.
+fn migration_error(
+    db_path: &Path,
+    error: migrations::MigrationError,
+    discard_with_uninit: bool,
+) -> StoreError {
+    match error {
+        migrations::MigrationError::Sqlite(source) => StoreError::Migrate {
+            path: db_path.to_path_buf(),
+            source,
+        },
+        migrations::MigrationError::NewerSchema { found, supported } => StoreError::FutureSchema {
+            path: db_path.to_path_buf(),
+            found,
+            supported,
+            discard_with_uninit,
+        },
+    }
 }
 
 fn open_read_only_without_sidecars(db_path: &Path) -> Result<(Connection, Connection)> {
@@ -954,12 +1115,17 @@ fn open_read_only_without_sidecars(db_path: &Path) -> Result<(Connection, Connec
 
 /// A `sqlite3_malloc64` buffer holding a database image, freed on drop until
 /// [`Self::into_raw`] hands it to SQLite.
-struct SqliteImage {
+pub(crate) struct SqliteImage {
     allocation: std::ptr::NonNull<u8>,
     len: usize,
 }
 
 impl SqliteImage {
+    /// A SQLite-owned copy of `bytes`, for an image assembled in memory.
+    pub(crate) fn copy_from(bytes: &[u8]) -> std::io::Result<Self> {
+        read_image_of_len(&mut &bytes[..], bytes.len())
+    }
+
     fn bytes(&self) -> &[u8] {
         // SAFETY: `allocation` is a live `len`-byte allocation this value owns.
         unsafe { std::slice::from_raw_parts(self.allocation.as_ptr(), self.len) }
@@ -1008,7 +1174,10 @@ fn read_image_of_len(file: &mut impl std::io::Read, len: usize) -> std::io::Resu
     Ok(image)
 }
 
-fn deserialize_read_only(conn: &mut Connection, image: SqliteImage) -> rusqlite::Result<()> {
+pub(crate) fn deserialize_read_only(
+    conn: &mut Connection,
+    image: SqliteImage,
+) -> rusqlite::Result<()> {
     if image.len == 0 {
         // An empty file fails as it did when its zero-byte copy could not be
         // allocated.

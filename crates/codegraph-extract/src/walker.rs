@@ -529,6 +529,9 @@ pub struct TreeSitterWalker<'a, 'tree> {
     /// Whether this file's named object literals own their function members;
     /// see [`Self::owns_object_literals`].
     owns_objects: Option<bool>,
+    /// Whether the source reads like a Vue store; see
+    /// [`Self::looks_like_vue_store_file`].
+    vue_store_file: Option<bool>,
     /// A C++ file whose tree has errors is walked in the scopes its braces
     /// open (see [`Self::visit_in_cpp_brace_scope`], upstream #2426): the
     /// scan of them, `None` for every other file, and the class-like nodes
@@ -545,7 +548,17 @@ pub struct TreeSitterWalker<'a, 'tree> {
     /// recovery can close a scope at the wrong `}`, and with no brace scopes
     /// to correct it the walked class would land in the wrong one.
     walk_declared_types: bool,
+    /// C++ local function pointers (upstream `cppLocalFnPtrs`, #1172): per
+    /// enclosing symbol, the functions each local was bound to by
+    /// `auto kernel = &f<…>;` or a branch's `kernel = &g<…>;`, in the order
+    /// first bound, so a call or launch through the local names them.
+    cpp_local_fn_ptrs: HashMap<String, HashMap<String, Vec<String>>>,
 }
+
+/// The signature of a function node minted for an RTK Query generated hook
+/// (upstream `extractRtkHookBindings`); the synthesis stage's RTK pass reads
+/// only nodes that carry it.
+pub const RTK_GENERATED_HOOK_SIGNATURE: &str = "= RTK Query generated hook";
 
 /// The parts of a store initializer that its walk must not treat as the
 /// store's own code.
@@ -553,7 +566,8 @@ struct StoreWalk {
     /// The factory closure whose body returns the action object. It is walked
     /// as the store's body, never bound as a function named after the store.
     factory: Option<usize>,
-    /// The action values that became function nodes of their own.
+    /// The values that became function nodes of their own: a store's
+    /// actions, its collections' members, RTK Query endpoints.
     actions: Vec<usize>,
 }
 
@@ -587,11 +601,13 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             store_walk: None,
             object_path_owners: HashMap::new(),
             owns_objects: None,
+            vue_store_file: None,
             cpp_brace_scopes: None,
             cpp_class_scopes: crate::lang::cpp_brace_scopes::NestedIntervals::default(),
             cpp_class_scope_ids: HashSet::new(),
             walk_declared_types: false,
             raw_source: source,
+            cpp_local_fn_ptrs: HashMap::new(),
         }
     }
 
@@ -671,6 +687,13 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
     fn visit_node(&mut self, node: SyntaxNode<'tree>) {
         let node = unwrap_transparent_walk_wrappers(self.spec.language(), node);
         if self.walk_aborted {
+            return;
+        }
+        if self
+            .store_walk
+            .as_ref()
+            .is_some_and(|walk| walk.actions.contains(&node.id()))
+        {
             return;
         }
         if self.walk_depth >= MAX_WALK_DEPTH {
@@ -784,6 +807,10 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             return;
         }
 
+        if node_type == "export_statement" && self.extract_store_module(node) {
+            return;
+        }
+
         if self.extract_c_function_macro(node) {
             return;
         }
@@ -873,10 +900,18 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
                 self.visit_node(defined);
             }
             self.maybe_cpp_construction(node);
-            self.extract_variable(node);
-            // A type walked above captured its own function values.
-            let walked = defined_type.map(|defined| defined.id());
-            self.scan_fn_ref_subtree(node, 0, walked.as_slice());
+            // A type walked above captured its own function values, and so
+            // did a Go initializer walked under the spec it declares.
+            let mut walked: Vec<usize> = defined_type
+                .map(|defined| defined.id())
+                .into_iter()
+                .collect();
+            if self.spec.language() == Language::Go {
+                walked.extend(self.extract_go_variable(node));
+            } else {
+                self.extract_variable(node);
+            }
+            self.scan_fn_ref_subtree(node, 0, &walked);
             skip_children = true;
         } else if self.spec.language() == Language::Swift
             && node_type == "protocol_property_declaration"
@@ -4198,10 +4233,6 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             self.extract_python_assignment(node);
             return;
         }
-        if self.spec.language() == Language::Go {
-            self.extract_go_variable(node);
-            return;
-        }
         if self.spec.language() == Language::Solidity {
             // #1170 — file-scope `constant_variable_declaration` (`uint256 constant
             // MAX = 100;`) carries a direct `name` field. Emit a Constant (const)
@@ -4273,6 +4304,15 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
                 continue;
             };
             if name_node.kind() == "object_pattern" || name_node.kind() == "array_pattern" {
+                // `export const { useGetPostsQuery } = api` destructures the
+                // hooks RTK Query generates off a `createApi` result: each
+                // binding that reads as one is a function of its own.
+                if name_node.kind() == "object_pattern"
+                    && child_by_field(child, "value")
+                        .is_some_and(|value| value.kind() == "identifier")
+                {
+                    self.extract_rtk_hook_bindings(name_node, is_exported);
+                }
                 // A pattern declares no symbol of its own, but its initializer
                 // (and any default value in the pattern) still runs: walk the
                 // declarator the way a function body walks it, with the
@@ -4300,6 +4340,30 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
                     .collect::<String>();
                 format!("= {}{}", init, if init.len() >= 100 { "..." } else { "" })
             });
+            // A React component declared through a wrapper whose result is a
+            // component (`forwardRef`/`memo`/`styled`, upstream #841 and
+            // #2429). The initializer is a call or a tagged template, not a
+            // bare arrow, so the const would otherwise be a constant, which
+            // component resolution skips: `<Button/>` would bind another
+            // file's namesake or nothing. PascalCase-gated, so a memoized
+            // helper (`const cache = memo(fn)`) stays a constant.
+            if let Some(value) = value_node
+                && name.starts_with(|c: char| c.is_ascii_uppercase())
+                && let Some(render) = self.react_component_hoc(value)
+            {
+                self.extract_react_component(
+                    &name,
+                    child,
+                    render,
+                    NodeExtra {
+                        docstring: docstring.clone(),
+                        signature,
+                        is_exported,
+                        ..NodeExtra::default()
+                    },
+                );
+                continue;
+            }
             let declared_id = self
                 .create_node(
                     kind,
@@ -4339,46 +4403,109 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
                     // shape: no walk of the whole literal, whose functions
                     // would count their calls for the constant as well.
                     self.extract_js_object_literal_members(value, owner_id);
-                } else if let (Some(owner_id), Some(actions)) = (
-                    declared_id.as_deref(),
-                    (value.kind() == "call_expression")
-                        .then(|| initializer_returned_object(value, 0))
-                        .flatten()
-                        .filter(|actions| object_has_inline_functions(*actions))
-                        .filter(|_| is_exported || self.is_exported_later(&name)),
-                ) {
-                    // An exported store — `create((set, get) => ({ reset: () =>
-                    // set({}) }))`, middleware wrappers included — owns the
-                    // inline actions of the object its initializer returns
-                    // (upstream #647/#1862).
-                    let actions_ids = self.extract_js_object_literal_members(actions, owner_id);
-                    // The rest of the initializer runs when the store is built:
-                    // the `create`/`persist` wrappers, their options, a block
-                    // factory's setup. Those calls stay the store's (#693), as
-                    // they were before the actions became nodes; upstream skips
-                    // the whole initializer here and drops them. Only the
-                    // extracted actions are skipped, so no action's calls are
-                    // counted for the store as well.
-                    let previous = self.store_walk.replace(StoreWalk {
-                        factory: nearest_function_ancestor(actions).map(|factory| factory.id()),
-                        actions: actions_ids,
-                    });
-                    self.node_stack.push(owner_id.to_string());
-                    self.visit_function_body(value);
-                    self.node_stack.pop();
-                    self.store_walk = previous;
+                } else if let Some(owner_id) = declared_id.as_deref() {
+                    self.walk_declared_initializer(value, owner_id, &name, is_exported);
                 } else {
-                    match declared_id {
-                        Some(id) => {
-                            self.node_stack.push(id);
-                            self.visit_function_body(value);
-                            self.node_stack.pop();
-                        }
-                        None => self.visit_function_body(value),
-                    }
+                    self.visit_function_body(value);
                 }
             }
         }
+    }
+
+    /// Whether `value` declares a React component through a wrapper whose
+    /// result is one (upstream `reactComponentHoc`, #841): `forwardRef(…)`,
+    /// `memo(…)`, `React.forwardRef(…)`, `React.memo(…)`, and styled-components
+    /// or emotion's `styled.tag\`…\`` and `styled(Base)\`…\``, typed
+    /// (`styled.tag<Props>\`…\``, #2429) or not. `Some` holds the inline render
+    /// function, the first arrow or function expression among the wrapper's
+    /// arguments, when there is one (`memo(Imported)` and a styled template
+    /// have none); `None` for any other initializer.
+    fn react_component_hoc(&self, value: SyntaxNode<'tree>) -> Option<Option<SyntaxNode<'tree>>> {
+        if self.is_typed_styled_template(value) {
+            return Some(None);
+        }
+        if value.kind() != "call_expression" {
+            return None;
+        }
+        let callee = node_text(child_by_field(value, "function")?, self.source);
+        // tree-sitter reads a tagged template as a call whose callee is its
+        // tag: `styled.button` or `styled(Base)`, never `styledFoo`.
+        if starts_with_word(&callee, "styled") {
+            return Some(None);
+        }
+        if !matches!(
+            callee.as_str(),
+            "forwardRef" | "memo" | "React.forwardRef" | "React.memo"
+        ) {
+            return None;
+        }
+        let render = child_by_field(value, "arguments").and_then(|arguments| {
+            (0..arguments.named_child_count())
+                .filter_map(|i| arguments.named_child(i as u32))
+                .find(|argument| {
+                    matches!(argument.kind(), "arrow_function" | "function_expression")
+                })
+        });
+        Some(render)
+    }
+
+    /// A styled tag with type arguments, `styled.div<Props>\`…\`` or
+    /// `styled(Base)<Props>\`…\`` (upstream `isTypedStyledTemplate`, #2429).
+    /// tree-sitter's tagged-template call takes no type arguments, so one that
+    /// also reads as an expression turns the initializer into comparisons,
+    /// `(styled.div < Props) > \`…\``: the tag is the leftmost operand, against
+    /// a `<`, and the template the rightmost, against a `>` (`>>` when the type
+    /// argument ends in its own `<…>`). The operators in between are the type
+    /// argument's: `<A & B>` is `(styled.div < A) & (B > \`…\`)`.
+    fn is_typed_styled_template(&self, value: SyntaxNode<'tree>) -> bool {
+        if value.kind() != "binary_expression" {
+            return false;
+        }
+        let mut tag_parent = value;
+        let mut tag = child_by_field(value, "left");
+        while let Some(inner) = tag.filter(|node| node.kind() == "binary_expression") {
+            tag_parent = inner;
+            tag = child_by_field(inner, "left");
+        }
+        let mut template_parent = value;
+        let mut template = child_by_field(value, "right");
+        while let Some(inner) = template.filter(|node| node.kind() == "binary_expression") {
+            template_parent = inner;
+            template = child_by_field(inner, "right");
+        }
+        let (Some(tag), Some(template)) = (tag, template) else {
+            return false;
+        };
+        template.kind() == "template_string"
+            && child_by_field(tag_parent, "operator").is_some_and(|op| op.kind() == "<")
+            && child_by_field(template_parent, "operator")
+                .is_some_and(|op| !op.kind().is_empty() && op.kind().bytes().all(|b| b == b'>'))
+            && starts_with_word(&node_text(tag, self.source), "styled")
+    }
+
+    /// The `component` node of a wrapper-declared React component (see
+    /// [`Self::react_component_hoc`]), named by the declarator and spanning
+    /// it. An inline render function's body is walked with the component on
+    /// the stack, so its calls (hooks, helpers) are the component's, as a
+    /// plain `const Foo = () => …` component's are.
+    fn extract_react_component(
+        &mut self,
+        name: &str,
+        declarator: SyntaxNode<'tree>,
+        render: Option<SyntaxNode<'tree>>,
+        extra: NodeExtra,
+    ) {
+        let Some(component) = self.create_node(NodeKind::Component, name, declarator, extra) else {
+            return;
+        };
+        let Some(render) = render else {
+            return;
+        };
+        self.node_stack.push(component.id);
+        if let Some(body) = self.resolve_body(render) {
+            self.visit_function_body(body);
+        }
+        self.node_stack.pop();
     }
 
     /// A top-level binding exported by a LATER statement rather than at its
@@ -4465,6 +4592,233 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
         }
         self.node_stack.pop();
         extracted
+    }
+
+    /// A declared constant's or variable's initializer: the store shapes whose
+    /// members become function nodes of their own, then one walk of the rest
+    /// under the declaration.
+    ///
+    /// The shapes, each extracted wherever it applies (upstream
+    /// `extractVariable`): an exported store's inline actions, the object its
+    /// initializer returns (`create((set, get) => ({ reset: () => set({}) }))`,
+    /// middleware wrappers included, #647/#1862); RTK Query's endpoints
+    /// (`createApi({ endpoints: (build) => ({ getPosts: build.query(…) }) })`);
+    /// a Vue store's `actions`, `mutations` and `getters` written in its call
+    /// (`defineStore({ actions: {…} })`, `createStore`, `new Vuex.Store`); and
+    /// in a store file a declaration named `actions`, `mutations` or `getters`
+    /// whose object none of the shapes before took. The members are qualified
+    /// under the declaration (`useAuthStore::login`).
+    ///
+    /// The rest of the initializer runs when the store is built: the `create`
+    /// or `defineStore` call, its wrappers, a store's `state` and options.
+    /// Those calls stay the declaration's (#693), as they were before the
+    /// members became nodes; upstream walks none of the initializer for these
+    /// shapes and drops them. What became a node is skipped, so no member's
+    /// calls are counted for the declaration as well.
+    fn walk_declared_initializer(
+        &mut self,
+        value: SyntaxNode<'tree>,
+        owner_id: &str,
+        name: &str,
+        is_exported: bool,
+    ) {
+        let mut extracted = Vec::new();
+        let mut factory = None;
+        let mut store_actions = false;
+        if value.kind() == "call_expression" {
+            if let Some(actions) = initializer_returned_object(value, 0)
+                .filter(|actions| object_has_inline_functions(*actions))
+                .filter(|_| is_exported || self.is_exported_later(name))
+            {
+                factory = nearest_function_ancestor(actions).map(|factory| factory.id());
+                extracted.extend(self.extract_js_object_literal_members(actions, owner_id));
+                store_actions = true;
+            }
+            if let Some(endpoints) = rtk_endpoints_object(value, self.source) {
+                extracted.extend(self.extract_rtk_endpoints(endpoints, owner_id));
+            }
+        }
+        if matches!(value.kind(), "call_expression" | "new_expression") {
+            for collection in vue_store_collection_objects(value, self.source) {
+                extracted.extend(self.extract_js_object_literal_members(collection, owner_id));
+            }
+        }
+        if !store_actions && is_vue_store_collection_name(name) && self.looks_like_vue_store_file()
+        {
+            let object = match value.kind() {
+                "object" | "object_expression" => Some(value),
+                "call_expression" => initializer_returned_object(value, 0),
+                _ => None,
+            };
+            if let Some(object) = object {
+                extracted.extend(self.extract_js_object_literal_members(object, owner_id));
+            }
+        }
+        let previous = (factory.is_some() || !extracted.is_empty()).then(|| {
+            self.store_walk.replace(StoreWalk {
+                factory,
+                actions: extracted,
+            })
+        });
+        self.node_stack.push(owner_id.to_string());
+        self.visit_function_body(value);
+        self.node_stack.pop();
+        if let Some(previous) = previous {
+            self.store_walk = previous;
+        }
+    }
+
+    /// RTK Query's endpoints (upstream `extractRtkEndpoints`): each
+    /// `getPosts: build.query({…})`, `build.mutation` or `build.infiniteQuery`
+    /// of the object `endpoints` returns is a function node named by its key,
+    /// under the api's declaration. One with a handler (`queryFn`, else
+    /// `query`, else its first function member) spans the handler; one with
+    /// none (`queryFn: makeQueryFn(url)`) spans the builder call, which is
+    /// walked under it, with the call's first 80 UTF-16 code units for its
+    /// signature. A key that names no static member (a computed `[key]`) makes
+    /// none. Returns the tree node ids that became the endpoints.
+    fn extract_rtk_endpoints(
+        &mut self,
+        endpoints: SyntaxNode<'tree>,
+        owner_id: &str,
+    ) -> Vec<usize> {
+        let mut extracted = Vec::new();
+        self.node_stack.push(owner_id.to_string());
+        for member in endpoints.named_children(&mut endpoints.walk()) {
+            if member.kind() != "pair" {
+                continue;
+            }
+            let (Some(key), Some(call)) = (
+                child_by_field(member, "key"),
+                child_by_field(member, "value"),
+            ) else {
+                continue;
+            };
+            if call.kind() != "call_expression" {
+                continue;
+            }
+            let Some(callee) = child_by_field(call, "function")
+                .filter(|callee| callee.kind() == "member_expression")
+            else {
+                continue;
+            };
+            let method = child_by_field(callee, "property").unwrap_or(callee);
+            if !matches!(
+                node_text(method, self.source).as_str(),
+                "query" | "mutation" | "infiniteQuery"
+            ) {
+                continue;
+            }
+            let Some(name) = js_object_member_name(key, self.source) else {
+                continue;
+            };
+            if let Some(handler) = rtk_endpoint_handler(call, self.source) {
+                self.extract_function(handler, Some(name));
+                extracted.push(handler.id());
+            } else if let Some(endpoint) = self.create_node(
+                NodeKind::Function,
+                &name,
+                call,
+                NodeExtra {
+                    signature: Some(utf16_prefix(&node_text(call, self.source), 80)),
+                    ..NodeExtra::default()
+                },
+            ) {
+                self.node_stack.push(endpoint.id);
+                self.visit_function_body(call);
+                self.node_stack.pop();
+                extracted.push(call.id());
+            }
+        }
+        self.node_stack.pop();
+        extracted
+    }
+
+    /// RTK Query's generated hooks (upstream `extractRtkHookBindings`): each
+    /// shorthand binding of `export const { useGetPostsQuery, … } = api` whose
+    /// name reads as one (`use`, a capital, and `Query` or `Mutation` at the
+    /// end) is a function node over the binding, exported with its
+    /// declaration, carrying [`RTK_GENERATED_HOOK_SIGNATURE`]. A renamed
+    /// (`usePrefetch: prefetch`) or defaulted binding is none.
+    fn extract_rtk_hook_bindings(&mut self, pattern: SyntaxNode<'tree>, is_exported: bool) {
+        for binding in pattern.named_children(&mut pattern.walk()) {
+            if binding.kind() != "shorthand_property_identifier_pattern" {
+                continue;
+            }
+            let name = node_text(binding, self.source);
+            if !is_rtk_hook_name(&name) {
+                continue;
+            }
+            self.create_node(
+                NodeKind::Function,
+                &name,
+                binding,
+                NodeExtra {
+                    signature: Some(RTK_GENERATED_HOOK_SIGNATURE.to_string()),
+                    is_exported,
+                    ..NodeExtra::default()
+                },
+            );
+        }
+    }
+
+    /// A Vuex module's default export in a store file (upstream
+    /// `extractStoreCollectionMethods`): `export default { namespaced: true,
+    /// mutations: {…}, actions: {…} }`. The members of its `actions`,
+    /// `mutations` and `getters` objects are function nodes of the file; the
+    /// rest of the statement is walked as before, skipping them (upstream
+    /// walks none of it). `false`, leaving the statement to the walk, when it
+    /// exports no object, the file does not read like a store, or the object
+    /// holds no such member.
+    fn extract_store_module(&mut self, statement: SyntaxNode<'tree>) -> bool {
+        if !matches!(
+            self.spec.language(),
+            Language::TypeScript | Language::Tsx | Language::JavaScript | Language::Jsx
+        ) {
+            return false;
+        }
+        let Some(object) = child_by_field(statement, "value")
+            .filter(|value| matches!(value.kind(), "object" | "object_expression"))
+        else {
+            return false;
+        };
+        if !self.looks_like_vue_store_file() {
+            return false;
+        }
+        let Some(owner_id) = self.node_stack.last().cloned() else {
+            return false;
+        };
+        let mut collections = Vec::new();
+        push_vue_store_collections(object, self.source, &mut collections);
+        let mut extracted = Vec::new();
+        for collection in collections {
+            extracted.extend(self.extract_js_object_literal_members(collection, &owner_id));
+        }
+        if extracted.is_empty() {
+            return false;
+        }
+        let previous = self.store_walk.replace(StoreWalk {
+            factory: None,
+            actions: extracted,
+        });
+        self.visit_named_children(statement);
+        self.store_walk = previous;
+        true
+    }
+
+    /// Whether the source reads like a Vue store (upstream
+    /// `looksLikeVueStoreFile`): at least two different words of
+    /// `defineStore`, `createStore`, `Vuex`, `mutations`, `actions`, `getters`
+    /// and `namespaced` occur in it as whole ASCII words, comments and strings
+    /// included. Computed once per walk; a component's script block is a walk
+    /// of its own.
+    fn looks_like_vue_store_file(&mut self) -> bool {
+        if let Some(store) = self.vue_store_file {
+            return store;
+        }
+        let store = reads_like_vue_store(self.source);
+        self.vue_store_file = Some(store);
+        store
     }
 
     /// Whether a named object literal in this file owns its function members
@@ -5095,36 +5449,95 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
         );
     }
 
-    fn extract_go_variable(&mut self, node: SyntaxNode<'tree>) {
+    /// A Go `var` or `const` declaration (upstream `extractVariable`'s Go
+    /// branch). Each spec, a `var ( … )` group's inside its `var_spec_list`
+    /// (#2682), is a node named by its first identifier and spanning the
+    /// spec, with its own doc comment or else the declaration's (#2680), and
+    /// the text of its last child, cut in UTF-16 units as upstream cuts it
+    /// ([`utf16_value_signature`]), as the signature. Its initializer is walked
+    /// under it, so what a package-level `var c = pkg.New()` or `var Cmd =
+    /// &Command{RunE: func(…) {…}}` calls, builds and passes is that
+    /// variable's (#693). A `:=` reaches here only through error recovery
+    /// and declares a variable per name, unwalked. Returns the initializers
+    /// walked under a node: they captured their own function values, so the
+    /// declaration's scan skips them, as the file would otherwise keep a
+    /// second reference to each function from the same spot (#2743).
+    fn extract_go_variable(&mut self, node: SyntaxNode<'tree>) -> Vec<usize> {
         let kind = if node.kind() == "const_declaration" {
             NodeKind::Constant
         } else {
             NodeKind::Variable
         };
-        for ident in descendants_of_kind(node, "identifier") {
-            let Some(parent) = ident.parent() else {
-                continue;
-            };
-            if !matches!(
-                parent.kind(),
-                "var_spec" | "const_spec" | "short_var_declaration"
-            ) {
-                continue;
+        let docstring = self.docstring_for(node);
+        let mut specs = Vec::new();
+        for child in node.named_children(&mut node.walk()) {
+            if child.kind() == "var_spec_list" {
+                specs.extend(child.named_children(&mut child.walk()));
+            } else {
+                specs.push(child);
             }
-            let created = self.create_node(
-                kind,
-                &node_text(ident, self.source),
-                ident,
-                NodeExtra::default(),
-            );
-            // The value reads what its whole spec (its initializer) names.
-            if let Some(created) = created
-                && crate::value_refs::has_value_refs(self.spec.language())
-            {
-                self.value_refs.scan_reader_from(&created.id, parent);
-            }
-            break;
         }
+        let mut walked = Vec::new();
+        for spec in specs {
+            if !matches!(spec.kind(), "var_spec" | "const_spec") {
+                continue;
+            }
+            let mut created = None;
+            if let Some(name) = spec
+                .named_child(0)
+                .filter(|name| name.kind() == "identifier")
+            {
+                let count = spec.named_child_count();
+                let last = (count > 1)
+                    .then(|| spec.named_child(count as u32 - 1))
+                    .flatten();
+                created = self.create_node(
+                    kind,
+                    &node_text(name, self.source),
+                    spec,
+                    NodeExtra {
+                        docstring: self.docstring_for(spec).or_else(|| docstring.clone()),
+                        signature: utf16_value_signature(last, self.source),
+                        ..NodeExtra::default()
+                    },
+                );
+            }
+            if let Some(value) = child_by_field(spec, "value") {
+                if let Some(created) = &created {
+                    self.node_stack.push(created.id.clone());
+                }
+                self.visit_function_body(value);
+                if created.is_some() {
+                    self.node_stack.pop();
+                    walked.push(value.id());
+                }
+            }
+        }
+        if node.kind() == "short_var_declaration"
+            && let Some(left) = child_by_field(node, "left")
+        {
+            let names: Vec<SyntaxNode<'tree>> = if left.kind() == "expression_list" {
+                left.named_children(&mut left.walk())
+                    .filter(|name| name.kind() == "identifier")
+                    .collect()
+            } else {
+                vec![left]
+            };
+            let signature = utf16_value_signature(child_by_field(node, "right"), self.source);
+            for name in names {
+                self.create_node(
+                    NodeKind::Variable,
+                    &node_text(name, self.source),
+                    node,
+                    NodeExtra {
+                        docstring: docstring.clone(),
+                        signature: signature.clone(),
+                        ..NodeExtra::default()
+                    },
+                );
+            }
+        }
+        walked
     }
 
     fn extract_lua_variable(&mut self, node: SyntaxNode<'tree>) {
@@ -6109,8 +6522,99 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             callee_name = converted;
         }
         callee_name = self.maybe_strip_cpp_template_call(callee_name);
+        // #1172: a C++ call or launch through a local the enclosing symbol
+        // bound from `&fn` calls every function it was bound to, not the
+        // local.
+        if self.spec.language() == Language::Cpp
+            && is_plain_identifier(&callee_name)
+            && let Some(targets) = self
+                .cpp_local_fn_ptrs
+                .get(&caller_id)
+                .and_then(|locals| locals.get(&callee_name))
+                .filter(|targets| !targets.is_empty())
+                .cloned()
+        {
+            for target in targets {
+                self.push_ref(&caller_id, &target, EdgeKind::Calls, position);
+            }
+            return;
+        }
         if !callee_name.is_empty() {
             self.push_ref(&caller_id, &callee_name, EdgeKind::Calls, position);
+        }
+    }
+
+    /// The C++ local function-pointer bindings `node` makes (#1172): each
+    /// `init_declarator` of a `declaration` that declares an identifier,
+    /// and an `assignment_expression` to an identifier. A body is walked in
+    /// source order and C++ declares a local before its use, so a binding
+    /// is recorded before the call through it.
+    fn record_cpp_fn_ptr_bindings(&mut self, node: SyntaxNode<'tree>) {
+        match node.kind() {
+            "declaration" => {
+                for i in 0..node.named_child_count() {
+                    let Some(child) = node.named_child(i as u32) else {
+                        continue;
+                    };
+                    if child.kind() != "init_declarator" {
+                        continue;
+                    }
+                    let Some(declarator) = child_by_field(child, "declarator") else {
+                        continue;
+                    };
+                    if declarator.kind() == "identifier" {
+                        let local = node_text(declarator, self.source);
+                        self.record_cpp_fn_ptr_binding(&local, child_by_field(child, "value"));
+                    }
+                }
+            }
+            "assignment_expression" => {
+                if let Some(left) = child_by_field(node, "left")
+                    && left.kind() == "identifier"
+                {
+                    let local = node_text(left, self.source);
+                    self.record_cpp_fn_ptr_binding(&local, child_by_field(node, "right"));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// `local = &fn`, `&fn<…>` or `&ns::fn<…>` for the enclosing symbol
+    /// (upstream `recordCppFnPtrBinding`): only the address-of shape, since
+    /// `auto x = y;` copies any value; the template arguments are stripped.
+    fn record_cpp_fn_ptr_binding(&mut self, local: &str, value: Option<SyntaxNode<'tree>>) {
+        let Some(value) = value else {
+            return;
+        };
+        if value.kind() != "pointer_expression" || value.child(0).map(|op| op.kind()) != Some("&") {
+            return;
+        }
+        let Some(argument) = child_by_field(value, "argument").or_else(|| value.named_child(0))
+        else {
+            return;
+        };
+        if !matches!(
+            argument.kind(),
+            "identifier" | "template_function" | "qualified_identifier"
+        ) {
+            return;
+        }
+        let Some(caller_id) = self.node_stack.last().cloned() else {
+            return;
+        };
+        let target = strip_cpp_template_args(&node_text(argument, self.source));
+        if target.is_empty() || target == local {
+            return;
+        }
+        let targets = self
+            .cpp_local_fn_ptrs
+            .entry(caller_id)
+            .or_default()
+            .entry(local.to_string())
+            .or_default();
+        if !targets.contains(&target) {
+            targets.push(target);
         }
     }
 
@@ -6623,6 +7127,11 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             }
         }
 
+        // #1172: a C++ body's `auto kernel = &fn<…>;` and `kernel = &g;`.
+        if self.spec.language() == Language::Cpp && !self.node_stack.is_empty() {
+            self.record_cpp_fn_ptr_bindings(node);
+        }
+
         // G4 — a static-member or enum-value read: `Enum.value`,
         // `Type.CONST`, `Foo::BAR`.
         self.extract_static_member_ref(node);
@@ -6920,6 +7429,17 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
                             self.push_ref(class_id, &name, EdgeKind::Extends, target);
                         }
                     }
+                } else if let Some(types) = type_list(child) {
+                    // Java's `interface I extends A, B` wraps them in a
+                    // `type_list` (upstream `tree-sitter.ts`): one each.
+                    for target in types.named_children(&mut types.walk()) {
+                        self.push_ref(
+                            class_id,
+                            &node_text(target, self.source),
+                            EdgeKind::Extends,
+                            target,
+                        );
+                    }
                 } else if let Some(target) = child.named_child(0) {
                     self.push_ref(
                         class_id,
@@ -6930,7 +7450,9 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
                 }
             }
             if matches!(child.kind(), "implements_clause" | "super_interfaces") {
-                for iface in child.named_children(&mut child.walk()) {
+                // Java's `implements A, B` is a `type_list`, read type by type.
+                let list = type_list(child).unwrap_or(child);
+                for iface in list.named_children(&mut list.walk()) {
                     self.push_ref(
                         class_id,
                         &node_text(iface, self.source),
@@ -8105,6 +8627,14 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
     }
 }
 
+/// The `type_list` a heritage clause wraps its types in (tree-sitter-java's
+/// `super_interfaces` and `extends_interfaces`), when it has one.
+fn type_list(clause: SyntaxNode<'_>) -> Option<SyntaxNode<'_>> {
+    clause
+        .named_children(&mut clause.walk())
+        .find(|child| child.kind() == "type_list")
+}
+
 fn strip_erlang_arity(name: &str) -> &str {
     let Some((base, tail)) = name.rsplit_once('/') else {
         return name;
@@ -8398,6 +8928,17 @@ fn function_returned_object(function: SyntaxNode<'_>) -> Option<SyntaxNode<'_>> 
         })
 }
 
+/// Whether `text` starts with the word `word`: what follows is no ASCII word
+/// character (a JavaScript `^word\b`).
+fn starts_with_word(text: &str, word: &str) -> bool {
+    text.strip_prefix(word).is_some_and(|rest| {
+        !rest
+            .bytes()
+            .next()
+            .is_some_and(|b| b.is_ascii_alphanumeric() || b == b'_')
+    })
+}
+
 /// Whether an object literal declares an inline function member — an action
 /// map, unlike a setup store's all-shorthand `return { foo, bar }`.
 fn object_has_inline_functions(object: SyntaxNode<'_>) -> bool {
@@ -8410,6 +8951,228 @@ fn object_has_inline_functions(object: SyntaxNode<'_>) -> bool {
             }),
             _ => false,
         })
+}
+
+/// A call's or construction's callee name: an identifier's text, else a
+/// member expression's property (`Vuex.Store` gives `Store`); empty for
+/// any other callee.
+fn callee_property_name(callee: SyntaxNode<'_>, source: &str) -> String {
+    match callee.kind() {
+        "identifier" => node_text(callee, source),
+        "member_expression" => {
+            node_text(child_by_field(callee, "property").unwrap_or(callee), source)
+        }
+        _ => String::new(),
+    }
+}
+
+/// The object of endpoint definitions of a `createApi({ endpoints: (build)
+/// => ({…}) })` or `api.injectEndpoints({ endpoints(build) { return {…} } })`
+/// call (upstream `findRtkEndpointsObject`): the first `endpoints` member of
+/// an object argument, a function or method whose returned object it is.
+/// `None` for any other call, and when that first `endpoints` returns none.
+fn rtk_endpoints_object<'t>(call: SyntaxNode<'t>, source: &str) -> Option<SyntaxNode<'t>> {
+    let callee = child_by_field(call, "function")?;
+    if !matches!(
+        callee_property_name(callee, source).as_str(),
+        "createApi" | "injectEndpoints"
+    ) {
+        return None;
+    }
+    let arguments = child_by_field(call, "arguments")?;
+    for argument in arguments.named_children(&mut arguments.walk()) {
+        if !matches!(argument.kind(), "object" | "object_expression") {
+            continue;
+        }
+        for member in argument.named_children(&mut argument.walk()) {
+            match member.kind() {
+                "pair" => {
+                    if !child_by_field(member, "key")
+                        .is_some_and(|key| node_text(key, source) == "endpoints")
+                    {
+                        continue;
+                    }
+                    if let Some(function) = child_by_field(member, "value").filter(|value| {
+                        matches!(value.kind(), "arrow_function" | "function_expression")
+                    }) {
+                        return function_returned_object(function);
+                    }
+                }
+                "method_definition"
+                    if child_by_field(member, "name")
+                        .is_some_and(|name| node_text(name, source) == "endpoints") =>
+                {
+                    return function_returned_object(member);
+                }
+                _ => {}
+            }
+        }
+    }
+    None
+}
+
+/// The handler of an RTK Query endpoint's builder call (upstream
+/// `rtkEndpointHandler`): in the first object argument that has a function
+/// member (`key: () => …`, `key: function () {…}` or `key() {…}`), the
+/// `queryFn`, else the `query`, else the first; the later of two members of
+/// one key. `None` when no object argument has a function member.
+fn rtk_endpoint_handler<'t>(call: SyntaxNode<'t>, source: &str) -> Option<SyntaxNode<'t>> {
+    let arguments = child_by_field(call, "arguments")?;
+    for argument in arguments.named_children(&mut arguments.walk()) {
+        if !matches!(argument.kind(), "object" | "object_expression") {
+            continue;
+        }
+        let (mut query_fn, mut query, mut first) = (None, None, None);
+        for member in argument.named_children(&mut argument.walk()) {
+            let (function, key) = match member.kind() {
+                "pair" => {
+                    let Some(value) = child_by_field(member, "value").filter(|value| {
+                        matches!(value.kind(), "arrow_function" | "function_expression")
+                    }) else {
+                        continue;
+                    };
+                    (value, child_by_field(member, "key"))
+                }
+                "method_definition" => (member, child_by_field(member, "name")),
+                _ => continue,
+            };
+            match key.map(|key| node_text(key, source)).as_deref() {
+                Some("queryFn") => query_fn = Some(function),
+                Some("query") => query = Some(function),
+                _ => {}
+            }
+            first.get_or_insert(function);
+        }
+        if let Some(handler) = query_fn.or(query).or(first) {
+            return Some(handler);
+        }
+    }
+    None
+}
+
+/// Whether `name` reads as an RTK Query generated hook (upstream
+/// `RTK_HOOK_NAME_RE`, `^use[A-Z][A-Za-z0-9]*(?:Query|Mutation)$`):
+/// `useGetPostsQuery`, `useLazyGetPostsQuery`, `useAddPostMutation`.
+pub fn is_rtk_hook_name(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix("use") else {
+        return false;
+    };
+    rest.starts_with(|c: char| c.is_ascii_uppercase())
+        && rest.bytes().all(|b| b.is_ascii_alphanumeric())
+        && ((rest.len() > "Query".len() && rest.ends_with("Query"))
+            || (rest.len() > "Mutation".len() && rest.ends_with("Mutation")))
+}
+
+/// The names of a Vue store's collections (upstream
+/// `VUE_STORE_COLLECTION_NAMES`).
+fn is_vue_store_collection_name(name: &str) -> bool {
+    matches!(name, "actions" | "mutations" | "getters")
+}
+
+/// The `actions`, `mutations` and `getters` objects written in a Vue store's
+/// call (upstream `findVueStoreCollectionObjects`): `defineStore({…})`,
+/// `defineStore('id', {…})`, `createStore({…})`, `new Vuex.Store({…})`,
+/// `new Store({…})`, from every object argument.
+fn vue_store_collection_objects<'t>(call: SyntaxNode<'t>, source: &str) -> Vec<SyntaxNode<'t>> {
+    let mut collections = Vec::new();
+    let Some(callee) =
+        child_by_field(call, "function").or_else(|| child_by_field(call, "constructor"))
+    else {
+        return collections;
+    };
+    if !matches!(
+        callee_property_name(callee, source).as_str(),
+        "defineStore" | "createStore" | "Store"
+    ) {
+        return collections;
+    }
+    let Some(arguments) = child_by_field(call, "arguments") else {
+        return collections;
+    };
+    for argument in arguments.named_children(&mut arguments.walk()) {
+        if matches!(argument.kind(), "object" | "object_expression") {
+            push_vue_store_collections(argument, source, &mut collections);
+        }
+    }
+    collections
+}
+
+/// The object values of a store config's `actions`, `mutations` and
+/// `getters` keys, written as such (a quoted `'actions'` is no key of them,
+/// as upstream compares the key's text).
+fn push_vue_store_collections<'t>(
+    config: SyntaxNode<'t>,
+    source: &str,
+    collections: &mut Vec<SyntaxNode<'t>>,
+) {
+    for member in config.named_children(&mut config.walk()) {
+        if member.kind() != "pair" {
+            continue;
+        }
+        if !child_by_field(member, "key")
+            .is_some_and(|key| is_vue_store_collection_name(&node_text(key, source)))
+        {
+            continue;
+        }
+        if let Some(value) = child_by_field(member, "value")
+            .filter(|value| matches!(value.kind(), "object" | "object_expression"))
+        {
+            collections.push(value);
+        }
+    }
+}
+
+/// Whether `source` holds at least two different words of upstream's
+/// `VUE_STORE_FILE_SIGNAL` (`defineStore`, `createStore`, `Vuex`,
+/// `mutations`, `actions`, `getters`, `namespaced`), each a whole word as
+/// JavaScript's `\b` bounds it: a run of ASCII letters, digits and `_`.
+/// The Vuex pass reads a store file by the same words (`isStoreFile`).
+pub fn reads_like_vue_store(source: &str) -> bool {
+    const SIGNALS: [&str; 7] = [
+        "defineStore",
+        "createStore",
+        "Vuex",
+        "mutations",
+        "actions",
+        "getters",
+        "namespaced",
+    ];
+    let mut seen = [false; SIGNALS.len()];
+    let mut seen_count = 0;
+    for word in source
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .filter(|word| !word.is_empty())
+    {
+        if let Some(index) = SIGNALS.iter().position(|signal| *signal == word)
+            && !seen[index]
+        {
+            seen[index] = true;
+            seen_count += 1;
+            if seen_count >= 2 {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// The first `limit` UTF-16 code units of `text`, as JavaScript's
+/// `slice(0, limit)` keeps them; a surrogate pair the cut splits leaves a
+/// lone high surrogate, which upstream's SQLite binding stores as U+FFFD.
+fn utf16_prefix(text: &str, limit: usize) -> String {
+    let mut units = 0;
+    let mut prefix = String::new();
+    for c in text.chars() {
+        if units + c.len_utf16() > limit {
+            if units < limit {
+                prefix.push(char::REPLACEMENT_CHARACTER);
+            }
+            break;
+        }
+        units += c.len_utf16();
+        prefix.push(c);
+    }
+    prefix
 }
 
 /// The call's callee name when it is a bare identifier or `pkg::fn` (yields
@@ -8465,6 +9228,37 @@ fn value_signature(value: Option<SyntaxNode<'_>>, source: &str) -> Option<String
             .collect::<String>();
         format!("= {}{}", init, if init.len() >= 100 { "..." } else { "" })
     })
+}
+
+/// A Go spec's signature as upstream writes it, `= ${text.slice(0, 100)}`
+/// with `...` when the text's `length` is 100 or more, both in UTF-16 code
+/// units as JavaScript counts a string; none for an empty text. A pair the
+/// cut splits leaves upstream a lone high surrogate, which its SQLite
+/// binding stores as U+FFFD, so this writes U+FFFD. [`value_signature`]'s
+/// callers still count characters and bytes.
+fn utf16_value_signature(value: Option<SyntaxNode<'_>>, source: &str) -> Option<String> {
+    let text = node_text(value?, source);
+    if text.is_empty() {
+        return None;
+    }
+    let mut units = 0;
+    let mut init = String::new();
+    for c in text.chars() {
+        if units + c.len_utf16() > 100 {
+            if units < 100 {
+                init.push(char::REPLACEMENT_CHARACTER);
+            }
+            break;
+        }
+        units += c.len_utf16();
+        init.push(c);
+    }
+    let ellipsis = if text.encode_utf16().nth(99).is_some() {
+        "..."
+    } else {
+        ""
+    };
+    Some(format!("= {init}{ellipsis}"))
 }
 
 /// A Ruby assignment whose left side is a `constant` (`MAX = 3`).
@@ -8791,7 +9585,8 @@ fn has_type_annotation_refs(language: Language) -> bool {
 
 /// The name node of the type a Go embedding names (upstream
 /// `goEmbeddedTypeName`): `Base`, `pkg.Base` by `Base`, `Base[T]` by `Base`;
-/// a predeclared type is none.
+/// a predeclared type is none but `error`, an interface with a method that
+/// an embedding brings in like any type's from outside the index (#2759).
 fn go_embedded_type_name<'tree>(
     ty: Option<SyntaxNode<'tree>>,
     source: &str,
@@ -8805,8 +9600,11 @@ fn go_embedded_type_name<'tree>(
     if ty.kind() == "qualified_type" {
         return child_by_field(ty, "name");
     }
-    (ty.kind() == "type_identifier" && !is_go_predeclared_type(&node_text(ty, source)))
-        .then_some(ty)
+    if ty.kind() != "type_identifier" {
+        return None;
+    }
+    let name = node_text(ty, source);
+    (name == "error" || !is_go_predeclared_type(&name)).then_some(ty)
 }
 
 /// Whether code comes before `node` on the line it starts on.
@@ -9038,6 +9836,16 @@ fn is_builtin_type(name: &str) -> bool {
             | "true"
             | "false"
     )
+}
+
+/// Whether `name` is one identifier, `[A-Za-z_][A-Za-z0-9_]*` (upstream's
+/// `/^[A-Za-z_]\w*$/`).
+fn is_plain_identifier(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    bytes
+        .next()
+        .is_some_and(|first| first.is_ascii_alphabetic() || first == b'_')
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
 }
 
 pub(crate) fn strip_cpp_template_args(name: &str) -> String {
@@ -10572,6 +11380,31 @@ class Widget extends Base implements Named {
         let (_, refs) = run("W.java", src, Language::Java);
         assert!(has_ref(&refs, EdgeKind::Extends, "Base"));
         assert!(has_ref(&refs, EdgeKind::Implements, "Named"));
+    }
+
+    /// tree-sitter-java wraps a class's interfaces and an interface's
+    /// parents in a `type_list`: each type is its own reference, at its own
+    /// place (upstream `tree-sitter.ts`), never the list as one name.
+    #[test]
+    fn java_heritage_lists_read_each_type() {
+        let src = "interface Repo {}\ninterface Store {}\nclass JpaRepo extends Base implements Repo, Store {}\ninterface Combined extends Repo, Store {}\nclass One implements Repo {}\n";
+        let (_, refs) = run("J.java", src, Language::Java);
+        let heritage: Vec<(EdgeKind, &str, i64, i64)> = refs
+            .iter()
+            .filter(|r| matches!(r.reference_kind, EdgeKind::Extends | EdgeKind::Implements))
+            .map(|r| (r.reference_kind, r.reference_name.as_str(), r.line, r.col))
+            .collect();
+        assert_eq!(
+            heritage,
+            [
+                (EdgeKind::Extends, "Base", 3, 22),
+                (EdgeKind::Implements, "Repo", 3, 38),
+                (EdgeKind::Implements, "Store", 3, 44),
+                (EdgeKind::Extends, "Repo", 4, 27),
+                (EdgeKind::Extends, "Store", 4, 33),
+                (EdgeKind::Implements, "Repo", 5, 21),
+            ]
+        );
     }
 
     #[test]

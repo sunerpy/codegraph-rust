@@ -213,6 +213,30 @@ fn strip_ruby(src: &str) -> String {
 /// function scan strips the function's code up to each reference in it, and
 /// typescript-large's `createTypeChecker` is three megabytes (W4d end).
 fn strip_c_style(src: &str, allow_single_quote_strings: bool) -> String {
+    strip_c_style_blanking(src, allow_single_quote_strings, Blanking::Characters)
+}
+
+/// [`strip_comments_for_regex`] for JavaScript and TypeScript with each
+/// comment BYTE but a newline a space (W7-09d): the result keeps every byte
+/// offset of `content`, so an offset found in it indexes `content` as well.
+/// The character-for-character blanking keeps character counts instead,
+/// which differ from byte offsets past a comment holding non-ASCII text.
+pub(crate) fn strip_js_comments_keeping_offsets(content: &str) -> String {
+    strip_c_style_blanking(content, true, Blanking::Bytes)
+}
+
+/// How a comment's text is blanked: one space per character, or per byte.
+#[derive(Clone, Copy)]
+enum Blanking {
+    Characters,
+    Bytes,
+}
+
+fn strip_c_style_blanking(
+    src: &str,
+    allow_single_quote_strings: bool,
+    blanking: Blanking,
+) -> String {
     let bytes = src.as_bytes();
     let n = bytes.len();
     let mut out = String::with_capacity(n);
@@ -233,7 +257,7 @@ fn strip_c_style(src: &str, allow_single_quote_strings: bool) -> String {
             if i < n {
                 i += 2;
             }
-            blank_into(&mut out, src, &mut copied, start, i);
+            blank_into(&mut out, src, &mut copied, start, i, blanking);
             continue;
         }
 
@@ -243,7 +267,7 @@ fn strip_c_style(src: &str, allow_single_quote_strings: bool) -> String {
             while i < n && bytes[i] != b'\n' {
                 i += 1;
             }
-            blank_into(&mut out, src, &mut copied, start, i);
+            blank_into(&mut out, src, &mut copied, start, i, blanking);
             continue;
         }
 
@@ -276,14 +300,29 @@ fn strip_c_style(src: &str, allow_single_quote_strings: bool) -> String {
 }
 
 /// Copy `src[*copied..start]` to `out`, then `src[start..end]` with each
-/// character but a newline as a space ([`blank_range`] over a string).
-fn blank_into(out: &mut String, src: &str, copied: &mut usize, start: usize, end: usize) {
+/// character (or byte) but a newline as a space ([`blank_range`] over a
+/// string).
+fn blank_into(
+    out: &mut String,
+    src: &str,
+    copied: &mut usize,
+    start: usize,
+    end: usize,
+    blanking: Blanking,
+) {
     out.push_str(&src[*copied..start]);
-    out.extend(
-        src[start..end]
-            .chars()
-            .map(|c| if c == '\n' { '\n' } else { ' ' }),
-    );
+    match blanking {
+        Blanking::Characters => out.extend(
+            src[start..end]
+                .chars()
+                .map(|c| if c == '\n' { '\n' } else { ' ' }),
+        ),
+        Blanking::Bytes => out.extend(
+            src[start..end]
+                .bytes()
+                .map(|b| if b == b'\n' { '\n' } else { ' ' }),
+        ),
+    }
     *copied = end;
 }
 
@@ -1043,6 +1082,22 @@ mod tests {
         let out = strip_comments_for_regex(input, CommentLang::JavaScript);
         assert_offsets_preserved(input, &out);
         assert!(!out.contains("c"));
+    }
+
+    /// W7-09d: blanked byte for byte, a comment holding non-ASCII text keeps
+    /// every byte offset after it, where blanking it character for character
+    /// keeps only the character count.
+    #[test]
+    fn js_comments_blanked_byte_for_byte_keep_byte_offsets() {
+        let input = "// the app’s routes — é\nconst a = '// no'; /* ü */ b;\n";
+        let out = strip_js_comments_keeping_offsets(input);
+        assert_eq!(out.len(), input.len());
+        assert_eq!(out.find("const"), input.find("const"));
+        assert_eq!(out.find(" b;"), input.find(" b;"));
+        let first_line = input.find('\n').unwrap();
+        assert_eq!(out[..first_line], " ".repeat(first_line));
+        assert!(out.contains("'// no'"));
+        assert!(!out.contains('ü'));
     }
 
     #[test]

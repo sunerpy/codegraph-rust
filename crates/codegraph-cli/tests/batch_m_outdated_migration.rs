@@ -14,6 +14,8 @@
 //! the index namespace, and an `uninitialized` namespace stays reserved for an
 //! explicit `init`.
 
+mod upgrade_support;
+
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -1867,9 +1869,9 @@ fn outdated_migration_writes_the_class_head_rows_of_index_force() {
 }
 
 /// W5-06: a migration writes the control-input rows (what resolution read
-/// of the JS/TS configs and manifests, the C# project files and the Cargo
-/// manifests), the detected frameworks and both markers as `index --force`
-/// does.
+/// of the JS/TS configs and manifests, the C# project files, the Cargo
+/// manifests and, W7-15d1, the Go module files), the detected frameworks and
+/// both markers as `index --force` does.
 #[test]
 fn outdated_migration_writes_the_control_rows_of_index_force() {
     let dir = TestDir::new("outdated-control-inputs");
@@ -1901,6 +1903,8 @@ fn outdated_migration_writes_the_control_rows_of_index_force() {
             "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
         ),
         ("src/lib.rs", "pub fn one() -> u32 {\n    1\n}\n"),
+        ("svc/go.mod", "module example.com/svc\n\ngo 1.22\n"),
+        ("svc/main.go", "package main\n\nfunc main() {}\n"),
     ] {
         let full = project.join(path);
         fs::create_dir_all(full.parent().unwrap()).expect("create the source directory");
@@ -1947,6 +1951,7 @@ fn outdated_migration_writes_the_control_rows_of_index_force() {
             .collect::<Vec<_>>(),
         [
             "control_inputs:csharp",
+            "control_inputs:go",
             "control_inputs:js",
             "control_inputs:rust",
             "control_inputs_version",
@@ -1957,10 +1962,11 @@ fn outdated_migration_writes_the_control_rows_of_index_force() {
     );
     for (row, input) in [
         (0, "\"App/App.csproj\""),
-        (1, "\"tsconfig.json\""),
-        (1, "\"package.json\""),
-        (2, "\"Cargo.toml\""),
-        (4, "\"react\""),
+        (1, "\"svc/go.mod\""),
+        (2, "\"tsconfig.json\""),
+        (2, "\"package.json\""),
+        (3, "\"Cargo.toml\""),
+        (5, "\"react\""),
     ] {
         assert!(
             migrated[row].1.contains(input),
@@ -2472,4 +2478,149 @@ fn status_reports_a_current_index_under_the_tombstone() {
     let status = cli(&["status", project_arg, "--json"]);
     let json: serde_json::Value = serde_json::from_str(&status.stdout).expect("status JSON");
     assert_eq!(json["initialized"], true, "{}", status.stdout);
+}
+
+/// W7-09b: a migration names a route a constant spells before it resolves
+/// the navigation calls, as `index --force` does (upstream `postExtract`
+/// before resolution), so a call to the route's path navigates to it after
+/// the upgrade.
+#[test]
+fn outdated_migration_names_constant_routes_before_resolving_navigation() {
+    let dir = TestDir::new("outdated-react-router-constant-route");
+    let project = dir.path().join("web");
+    for (path, contents) in [
+        (
+            "package.json",
+            "{\"name\":\"web\",\"dependencies\":{\"react\":\"18\",\"react-router\":\"7\"}}\n",
+        ),
+        (
+            "src/config/paths.ts",
+            "export const paths = {\n  app: { root: { path: '/app' } },\n} as const\n",
+        ),
+        (
+            "src/router.tsx",
+            "import { createBrowserRouter, redirect } from 'react-router'\nimport { paths } from './config/paths'\nimport { AppRoot } from './AppRoot'\nexport const router = createBrowserRouter([\n  { path: paths.app.root.path, element: <AppRoot /> },\n])\nexport function goApp() {\n  return redirect('/app')\n}\n",
+        ),
+        (
+            "src/AppRoot.tsx",
+            "export function AppRoot() {\n  return null\n}\n",
+        ),
+    ] {
+        let full = project.join(path);
+        fs::create_dir_all(full.parent().unwrap()).expect("create the source directory");
+        fs::write(full, contents).expect("write a source file");
+    }
+    let run = cli(&["init", project.to_str().unwrap()]);
+    assert!(
+        run.ok,
+        "setup: `codegraph init` must succeed (stdout={}, stderr={})",
+        run.stdout, run.stderr
+    );
+    let paths = IndexPaths::resolve(&project, None).expect("resolve v2 paths");
+    stage_state_slot(
+        &paths,
+        100,
+        CURRENT_STORAGE_PROTOCOL,
+        CURRENT_EXTRACTION_VERSION - 1,
+        "current",
+    );
+    let run = cli(&["sync", project.to_str().unwrap()]);
+    assert!(
+        run.ok,
+        "sync must migrate an Outdated namespace: stdout={}, stderr={}",
+        run.stdout, run.stderr
+    );
+    let migrated = canonicalize_db(&paths.current_db()).expect("canonicalize migrated db");
+    assert!(
+        migrated
+            .edges
+            .iter()
+            .any(|edge| edge.get("kind").and_then(|kind| kind.as_str()) == Some("navigates")),
+        "the migrated index must hold the call's navigates edge: {:?}",
+        migrated.edges
+    );
+    let (_scratch, peer) = fresh_force_peer("outdated-react-router-constant-route", &project);
+    let rebuilt = canonicalize_db(
+        &IndexPaths::resolve(&peer, None)
+            .expect("resolve peer v2 paths")
+            .current_db(),
+    )
+    .expect("canonicalize peer db");
+    diff_canonical(&rebuilt, &migrated, None)
+        .expect("a forced migration must equal a fresh v2 `index --force`");
+}
+
+/// W7-14: a migration synthesizes the dispatch edges no reference names, as
+/// `index --force` does, and leaves the synthesis marker a sync reads.
+#[test]
+fn outdated_migration_synthesizes_dispatch_edges() {
+    let dir = TestDir::new("outdated-synthesis");
+    let project = dir.path().join("app");
+    for (path, contents) in [
+        (
+            "src/scene.ts",
+            "type Callback = () => void;\nexport class Scene {\n  private callbacks = new Set<Callback>();\n  onUpdate(cb: Callback) {\n    this.callbacks.add(cb);\n  }\n  triggerUpdate() {\n    for (const cb of this.callbacks) cb();\n  }\n}\n",
+        ),
+        (
+            "src/app.ts",
+            "import { Scene } from './scene';\nexport class App {\n  scene = new Scene();\n  constructor() {\n    this.scene.onUpdate(this.triggerRender);\n  }\n  triggerRender() {\n    return 1;\n  }\n}\n",
+        ),
+    ] {
+        let full = project.join(path);
+        fs::create_dir_all(full.parent().unwrap()).expect("create the source directory");
+        fs::write(full, contents).expect("write a source file");
+    }
+    let run = cli(&["init", project.to_str().unwrap()]);
+    assert!(
+        run.ok,
+        "setup: `codegraph init` must succeed (stdout={}, stderr={})",
+        run.stdout, run.stderr
+    );
+    let paths = IndexPaths::resolve(&project, None).expect("resolve v2 paths");
+    stage_state_slot(
+        &paths,
+        100,
+        CURRENT_STORAGE_PROTOCOL,
+        CURRENT_EXTRACTION_VERSION - 1,
+        "current",
+    );
+    let run = cli(&["sync", project.to_str().unwrap()]);
+    assert!(
+        run.ok,
+        "sync must migrate an Outdated namespace: stdout={}, stderr={}",
+        run.stdout, run.stderr
+    );
+    let migrated = canonicalize_db(&paths.current_db()).expect("canonicalize migrated db");
+    assert!(
+        migrated.edges.iter().any(|edge| {
+            let edge = serde_json::to_string(edge).expect("serialize a canonical edge");
+            edge.contains("synthesizedBy") && edge.contains("callback")
+        }),
+        "the migrated index must hold the synthesized dispatch edge: {:?}",
+        migrated.edges
+    );
+    let marker = rusqlite::Connection::open_with_flags(
+        format!(
+            "{}?immutable=1",
+            upgrade_support::sqlite_file_uri(&paths.current_db())
+        ),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+    )
+    .expect("open the migrated db")
+    .query_row(
+        "SELECT value FROM project_metadata WHERE key = 'synthesis_version'",
+        [],
+        |row| row.get::<_, String>(0),
+    )
+    .expect("the migration writes the synthesis marker");
+    assert_eq!(marker, "17");
+    let (_scratch, peer) = fresh_force_peer("outdated-synthesis", &project);
+    let rebuilt = canonicalize_db(
+        &IndexPaths::resolve(&peer, None)
+            .expect("resolve peer v2 paths")
+            .current_db(),
+    )
+    .expect("canonicalize peer db");
+    diff_canonical(&rebuilt, &migrated, None)
+        .expect("a forced migration must equal a fresh v2 `index --force`");
 }

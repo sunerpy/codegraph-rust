@@ -819,6 +819,22 @@ pub fn project_metadata_with_prefix(db: &Path, prefix: &str) -> Vec<(String, Str
     .unwrap_or_else(|err| panic!("read project_metadata of {}: {err}", db.display()))
 }
 
+/// The targets of `source`'s synthesized edges in the order their rows were
+/// written, which a sync can leave different from a fresh index's.
+#[allow(dead_code)]
+#[track_caller]
+pub fn synthesized_targets_in_row_order(db: &Path, source: &str) -> Vec<String> {
+    let conn = open_immutable(db);
+    let mut stmt = conn
+        .prepare(
+            "SELECT target FROM edges WHERE source = ?1 AND provenance = 'heuristic' ORDER BY id",
+        )
+        .expect("prepare the synthesized-edge read");
+    stmt.query_map([source], |row| row.get(0))
+        .and_then(|rows| rows.collect::<rusqlite::Result<Vec<String>>>())
+        .unwrap_or_else(|err| panic!("read the synthesized edges of {}: {err}", db.display()))
+}
+
 /// Opens `db` read-only with `immutable=1`: no lock, no `-wal`/`-shm`.
 ///
 /// An immutable connection does not read a write-ahead log, so a non-empty one

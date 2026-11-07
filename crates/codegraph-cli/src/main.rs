@@ -2152,6 +2152,69 @@ fn cmd_status(path: Option<PathBuf>, json_output: bool) -> Result<()> {
             }
             return Ok(());
         }
+        // A database a newer codegraph wrote (OD-19) is unreadable here, and
+        // nothing may write it; report which versions disagree instead of
+        // failing like a read.
+        Err(
+            error @ codegraph_store::StoreError::FutureSchema {
+                found,
+                supported,
+                discard_with_uninit,
+                ..
+            },
+        ) => {
+            if json_output {
+                let mut status = json!({
+                    "initialized": false,
+                    "version": VERSION,
+                    "projectPath": project,
+                    "indexPath": index_root,
+                    "lastIndexed": null,
+                    "dbPath": db,
+                    "dbExists": db_exists,
+                    "dbSizeBytes": db_size,
+                    "extractionStatus": "current",
+                    "extractionStatusDetail": error.to_string(),
+                    "recoveryCommand": null,
+                    "legacyIndexPresent": legacy_index_present,
+                    "legacyIndexPaths": legacy_index_paths,
+                    "daemonRunning": daemon_running,
+                    "daemonPidPath": daemon_pid_path,
+                    "daemonSocketPath": daemon_socket_path,
+                    "daemonLogPath": daemon_log_path,
+                });
+                if wal_size > 0 {
+                    status["walSizeBytes"] = json!(wal_size);
+                }
+                print_json(&status)?;
+            } else {
+                println!("\nCodeGraph Status\n");
+                println!("Project: {}\n", project.display());
+                println!(
+                    "State:   current (schema {found} is newer than this binary's {supported})"
+                );
+                println!("Index Statistics:");
+                println!("  DB Size:   {:.2} MB", db_size as f64 / 1024.0 / 1024.0);
+                print_wal_status(wal_size, db_size);
+                println!("\n  DB Path:   {}", db.display());
+                println!(
+                    "  Daemon:    {}",
+                    if daemon_running { "running" } else { "stopped" }
+                );
+                if discard_with_uninit {
+                    println!(
+                        "\nRecovery: a newer CodeGraph wrote this index. Upgrade CodeGraph, or run `codegraph uninit --force {}` and then `codegraph init {}` to discard and rebuild it.",
+                        project.display(),
+                        project.display()
+                    );
+                } else {
+                    println!(
+                        "\nRecovery: a newer CodeGraph wrote this index. Upgrade CodeGraph to use it."
+                    );
+                }
+            }
+            return Ok(());
+        }
         Err(error) => return Err(error.into()),
     };
     if status_open.rebuilding {
@@ -6506,7 +6569,7 @@ fn index_project_inner(
     codegraph_watch::control_inputs::write_index_rows(
         &store,
         project,
-        &resolver.framework_names(),
+        &resolver.framework_signature(),
     )?;
     if resolver.has_framework_resolvers() {
         let relative_files = store
@@ -6526,6 +6589,22 @@ fn index_project_inner(
         "framework_extract",
         framework_started.elapsed(),
         json!({ "enabled": resolver.has_framework_resolvers() }),
+    );
+    diagnostic_run.phase_start("framework_finalize");
+    let framework_finalize_started = std::time::Instant::now();
+    let pb = phase_spinner("Finalizing frameworks", quiet);
+    // Cross-file framework finalization (NestJS RouterModule prefixes, React
+    // Router routes named after a constant, then the routes of tables
+    // another file hands React Router) BEFORE resolution, as upstream's
+    // index runs runPostExtract: a navigation call resolves against the
+    // route's final name.
+    resolver.run_post_extract(&mut store)?;
+    resolver.run_cross_file_nodes(&mut store)?;
+    finish_phase(&pb, "Finalized frameworks");
+    diagnostic_run.phase_end(
+        "framework_finalize",
+        framework_finalize_started.elapsed(),
+        json!({}),
     );
     // Finished from INSIDE the callback on the final chunk so the retained line
     // lands before the resolver's deferred passes (which resolve refs this bar
@@ -6597,17 +6676,16 @@ fn index_project_inner(
         resolution_started.elapsed(),
         json!({ "processed": resolve_bar.position(), "total": resolve_bar.length() }),
     );
-    diagnostic_run.phase_start("framework_finalize");
-    let framework_finalize_started = std::time::Instant::now();
-    let pb = phase_spinner("Finalizing frameworks", quiet);
-    // Cross-file framework finalization (NestJS RouterModule prefixing) after
-    // resolution, mirroring the upstream index.ts:358 runPostExtract.
-    resolver.run_post_extract(&mut store)?;
-    finish_phase(&pb, "Finalized frameworks");
+    // The dispatch edges no reference names, over the finished base graph
+    // (W7-14).
+    diagnostic_run.phase_start("synthesis");
+    let synthesis_started = std::time::Instant::now();
+    let synthesis = codegraph_resolve::synthesis::run_stage(&mut store, project, &options)?;
+    codegraph_resolve::synthesis::write_marker(&store)?;
     diagnostic_run.phase_end(
-        "framework_finalize",
-        framework_finalize_started.elapsed(),
-        json!({}),
+        "synthesis",
+        synthesis_started.elapsed(),
+        json!({ "edges": synthesis.inserted }),
     );
     // Every reference is now in `unresolved_refs` or `resolved_refs`
     // (W5-09e).

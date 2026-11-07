@@ -408,6 +408,7 @@ impl<'store> GraphTraverser<'store> {
                 EdgeKind::References,
                 EdgeKind::Imports,
                 EdgeKind::Instantiates,
+                EdgeKind::Navigates,
             ],
         )?;
         if incoming.is_empty() {
@@ -543,6 +544,7 @@ impl<'store> GraphTraverser<'store> {
                 EdgeKind::References,
                 EdgeKind::Imports,
                 EdgeKind::Instantiates,
+                EdgeKind::Navigates,
             ],
         )?;
         if outgoing.is_empty() {

@@ -30,7 +30,7 @@ use crate::types::{
 use codegraph_core::types::{Edge, EdgeKind, Language, Node, NodeKind, UnresolvedRef};
 use codegraph_extract::lang::{cpp_constructor_shape, parse_cpp_constructor_reference_name};
 use codegraph_store::Store;
-use codegraph_store::queries::ReferenceSite;
+use codegraph_store::queries::{FileReferenceSite, ReferenceSite};
 use rayon::prelude::*;
 use regex::Regex;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -396,6 +396,76 @@ pub enum ResolutionObservation {
         processed: u64,
         total: u64,
     },
+}
+
+/// What the detected resolvers' cross-file passes want changed in a store
+/// ([`ReferenceResolver::plan_cross_file_nodes`]).
+#[derive(Debug, Default)]
+pub struct CrossFilePlan {
+    /// The owned nodes no pass wants, or wants changed: deleted.
+    remove: Vec<String>,
+    /// The wanted nodes the store lacks, the removed ones put back included.
+    insert: Vec<Node>,
+    /// The references of `insert`, pending.
+    insert_refs: Vec<UnresolvedRef>,
+    /// Every wanted node's references, by the node's file.
+    refs_by_file: BTreeMap<String, Vec<UnresolvedRef>>,
+}
+
+impl CrossFilePlan {
+    /// Whether applying the plan changes the store.
+    pub fn changes_store(&self) -> bool {
+        !self.remove.is_empty() || !self.insert.is_empty()
+    }
+
+    /// The references of every node the passes want in `file_path`, removed
+    /// and put back or kept: what a re-extraction of the file merges in, as
+    /// no single file's extraction makes them.
+    pub fn refs_of_file(&self, file_path: &str) -> &[UnresolvedRef] {
+        self.refs_by_file
+            .get(file_path)
+            .map_or(&[][..], Vec::as_slice)
+    }
+}
+
+/// What [`ReferenceResolver::apply_cross_file_plan`] moved.
+#[derive(Debug, Default)]
+pub struct CrossFileApplied {
+    /// The reference sites of the edges into the removed nodes, with their
+    /// sources' files, read before the nodes went.
+    pub incoming: Vec<FileReferenceSite>,
+    /// The sites of the references the inserted nodes make.
+    pub inserted_sites: BTreeSet<ReferenceSite>,
+}
+
+/// Whether two nodes are the same but for when they were made.
+fn same_cross_file_node(old: &Node, new: &Node) -> bool {
+    let mut probe = new.clone();
+    probe.updated_at = old.updated_at;
+    probe == *old
+}
+
+/// Whether two lists hold the same references, as multisets, row ids and
+/// candidate lists aside.
+fn same_references(left: &[UnresolvedRef], right: &[UnresolvedRef]) -> bool {
+    let key = |reference: &UnresolvedRef| {
+        (
+            reference.from_node_id.clone(),
+            reference.reference_name.clone(),
+            reference.reference_kind.as_str(),
+            reference.line,
+            reference.col,
+            reference.file_path.clone(),
+            reference.language.as_str(),
+            reference.is_function_ref,
+            reference.reference_subkind.map(|subkind| subkind.as_str()),
+        )
+    };
+    let mut left: Vec<_> = left.iter().map(key).collect();
+    let mut right: Vec<_> = right.iter().map(key).collect();
+    left.sort_unstable();
+    right.sort_unstable();
+    left == right
 }
 
 /// Read-only aggregate from the detected framework resolvers' per-file extract
@@ -1396,6 +1466,14 @@ pub struct ReferenceResolver {
     /// Detected `FrameworkResolver` implementations (`frameworks` field,
     /// `index.ts:264`). Empty until [`Self::initialize`] detects react/vue/nestjs.
     framework_resolver_extensions: Vec<Box<dyn FrameworkResolver>>,
+    /// Which detected frameworks extract which files (upstream #2129
+    /// `frameworksForFile`), set by [`Self::initialize`]; a `Mutex` so its
+    /// manifest reads are memoized behind `&self`.
+    app_gating: std::sync::Mutex<crate::frameworks::package_deps::AppGating>,
+    /// [`crate::frameworks::package_deps::AppGating::digest`] over the
+    /// indexed files when [`Self::initialize`] ran; `None` when no detected
+    /// framework is gated.
+    framework_gating: Option<String>,
     /// Distinct symbol names known to the graph, for the fast pre-filter
     /// (`knownNames`, `index.ts:224`). Populated by `warm_caches`.
     known_names: Option<BTreeSet<String>>,
@@ -1441,6 +1519,8 @@ impl ReferenceResolver {
             max_file_size: codegraph_core::config::DEFAULT_MAX_FILE_SIZE,
             recorded_heads_stale: None,
             framework_resolver_extensions: Vec::new(),
+            app_gating: std::sync::Mutex::default(),
+            framework_gating: None,
             known_names: None,
             known_lower_names: std::sync::OnceLock::new(),
             macro_visibility: std::sync::Mutex::default(),
@@ -1483,7 +1563,32 @@ impl ReferenceResolver {
     /// `FrameworkResolver` list (`initialize`, `index.ts:263-266`). Must run
     /// before `resolve_all` so Strategy-1 dispatch sees the detected resolvers.
     pub fn initialize(&mut self, context: &dyn ResolutionContext) {
-        self.framework_resolver_extensions = crate::frameworks::detect_frameworks(context);
+        self.install_frameworks(crate::frameworks::detect_frameworks(context), context);
+    }
+
+    /// Run `frameworks`, which `context`'s project uses, and decide which of
+    /// their extractors run on which files.
+    fn install_frameworks(
+        &mut self,
+        frameworks: Vec<Box<dyn FrameworkResolver>>,
+        context: &dyn ResolutionContext,
+    ) {
+        self.framework_resolver_extensions = frameworks;
+        let mut gating = crate::frameworks::package_deps::AppGating::new(
+            self.framework_resolver_extensions
+                .iter()
+                .map(|resolver| (resolver.name(), resolver.app_dependencies())),
+            &context.declared_dependencies(),
+            self.max_file_size,
+        );
+        self.framework_gating = gating.digest(
+            context.get_all_files_shared().iter().map(String::as_str),
+            std::path::Path::new(&self.project_root),
+        );
+        *self
+            .app_gating
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = gating;
     }
 
     /// Has at least one `FrameworkResolver` been detected?
@@ -1502,6 +1607,18 @@ impl ReferenceResolver {
         names.sort();
         names.dedup();
         names
+    }
+
+    /// [`Self::framework_names`], then `gating:` and the digest of which
+    /// files the gated frameworks extract when any is gated: the frameworks
+    /// row a sync compares, so a manifest edit that moves an app's
+    /// frameworks re-extracts every file like a framework that came or went.
+    pub fn framework_signature(&self) -> Vec<String> {
+        let mut signature = self.framework_names();
+        if let Some(digest) = &self.framework_gating {
+            signature.push(format!("gating:{digest}"));
+        }
+        signature
     }
 
     /// Run each detected resolver's `post_extract` finalization and persist the
@@ -1523,6 +1640,148 @@ impl ReferenceResolver {
             store.upsert_nodes(&all_updates)?;
         }
         Ok(updated)
+    }
+
+    /// What the detected resolvers' cross-file passes
+    /// ([`crate::framework::FrameworkResolver::cross_file_nodes`]) want
+    /// changed in `store`, compared with the nodes each pass owns there
+    /// (upstream's `reconcileCrossFileNodes`, W7-09d). Reads the store only;
+    /// [`Self::apply_cross_file_plan`] makes the change. A node no pass
+    /// wants any more goes, and so does one wanted with another name,
+    /// qualified name or set of references, to come back as wanted: upstream
+    /// renames it in place and keeps its references, so a consumer's edit
+    /// could leave them stale where a fresh index has the new ones.
+    pub fn plan_cross_file_nodes(&self, store: &Store) -> anyhow::Result<CrossFilePlan> {
+        let mut passes = Vec::new();
+        {
+            let context = self.store_context(store);
+            for resolver in &self.framework_resolver_extensions {
+                if let Some(pass) = resolver.cross_file_nodes(&context) {
+                    passes.push(pass);
+                }
+            }
+        }
+        let mut plan = CrossFilePlan::default();
+        for pass in passes {
+            let owns = pass.owns;
+            let wanted: BTreeMap<String, Node> = pass
+                .extraction
+                .nodes
+                .into_iter()
+                .filter(owns)
+                .map(|node| (node.id.clone(), node))
+                .collect();
+            let mut wanted_refs: BTreeMap<String, Vec<UnresolvedRef>> = BTreeMap::new();
+            for reference in &pass.extraction.references {
+                if wanted.contains_key(&reference.from_node_id) {
+                    wanted_refs
+                        .entry(reference.from_node_id.clone())
+                        .or_default()
+                        .push(ref_view_to_unresolved(reference));
+                }
+            }
+            let existing: BTreeMap<String, Node> = store
+                .nodes_by_kind(pass.kind)?
+                .into_iter()
+                .filter(owns)
+                .map(|node| (node.id.clone(), node))
+                .collect();
+            let mut stored: BTreeMap<String, Vec<UnresolvedRef>> = BTreeMap::new();
+            let files: BTreeSet<&str> = existing
+                .values()
+                .map(|node| node.file_path.as_str())
+                .collect();
+            for file in files {
+                for reference in store.stored_refs_of_file(file)? {
+                    if existing.contains_key(&reference.from_node_id) {
+                        stored
+                            .entry(reference.from_node_id.clone())
+                            .or_default()
+                            .push(reference);
+                    }
+                }
+            }
+            let mut removed = std::collections::HashSet::new();
+            for (id, old) in &existing {
+                let kept = wanted.get(id).is_some_and(|new| {
+                    same_cross_file_node(old, new)
+                        && same_references(
+                            stored.get(id).map_or(&[][..], Vec::as_slice),
+                            wanted_refs.get(id).map_or(&[][..], Vec::as_slice),
+                        )
+                });
+                if !kept {
+                    removed.insert(id.clone());
+                    plan.remove.push(id.clone());
+                }
+            }
+            for (id, node) in wanted {
+                let refs = wanted_refs.remove(&id).unwrap_or_default();
+                plan.refs_by_file
+                    .entry(node.file_path.clone())
+                    .or_default()
+                    .extend(refs.iter().cloned());
+                if !existing.contains_key(&id) || removed.contains(&id) {
+                    plan.insert_refs.extend(refs);
+                    plan.insert.push(node);
+                }
+            }
+        }
+        Ok(plan)
+    }
+
+    /// Make `plan`'s change in `store`, in one transaction, and say what it
+    /// moved: the reference sites of the edges into the nodes it removed,
+    /// read before they went, and the sites of the references it inserted.
+    /// With `reopen_incoming`, those incoming sites are put back in
+    /// `unresolved_refs` in the same transaction, for a resolution of every
+    /// pending reference to rebind; a sync instead re-reads them as an
+    /// unchanged dependent's sites.
+    pub fn apply_cross_file_plan(
+        &self,
+        store: &mut Store,
+        plan: &CrossFilePlan,
+        reopen_incoming: bool,
+    ) -> anyhow::Result<CrossFileApplied> {
+        if !plan.changes_store() {
+            return Ok(CrossFileApplied::default());
+        }
+        let removed: std::collections::HashSet<&str> =
+            plan.remove.iter().map(String::as_str).collect();
+        let incoming: Vec<FileReferenceSite> = store
+            .reference_sites_of_edges_to_targets(&plan.remove)?
+            .into_iter()
+            .filter(|affected| {
+                affected
+                    .site
+                    .as_ref()
+                    .is_none_or(|site| !removed.contains(site.from_node_id.as_str()))
+            })
+            .collect();
+        let reopen: &[FileReferenceSite] = if reopen_incoming { &incoming } else { &[] };
+        store.replace_cross_file_nodes(&plan.remove, &plan.insert, &plan.insert_refs, reopen)?;
+        let inserted_sites = plan
+            .insert_refs
+            .iter()
+            .map(|reference| ReferenceSite {
+                from_node_id: reference.from_node_id.clone(),
+                line: reference.line,
+                col: reference.col,
+            })
+            .collect();
+        Ok(CrossFileApplied {
+            incoming,
+            inserted_sites,
+        })
+    }
+
+    /// [`Self::plan_cross_file_nodes`] and [`Self::apply_cross_file_plan`]
+    /// together, the incoming sites re-opened: what an index, a migration
+    /// and the orphan sweep run after [`Self::run_post_extract`], before a
+    /// resolution of every pending reference.
+    pub fn run_cross_file_nodes(&self, store: &mut Store) -> anyhow::Result<CrossFileApplied> {
+        let plan = self.plan_cross_file_nodes(store)?;
+        self.apply_cross_file_plan(store, &plan, true)
     }
 
     /// Run each detected resolver's per-file `extract` over `relative_files`,
@@ -1604,6 +1863,11 @@ impl ReferenceResolver {
         mut read_file: impl FnMut(&str) -> Option<String>,
     ) -> FrameworkExtractionCollection {
         let mut collection = FrameworkExtractionCollection::default();
+        let mut gating = self
+            .app_gating
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let project_root = std::path::Path::new(&self.project_root);
         for relative in relative_files {
             let detected = codegraph_extract::detect_language_with(relative, extensions);
             // A `.h` header may turn out C++ or Objective-C once read, so it
@@ -1628,7 +1892,11 @@ impl ReferenceResolver {
             let language =
                 codegraph_extract::detect_language_for_source(relative, &content, extensions);
             for resolver in &self.framework_resolver_extensions {
-                if !applies_to_language(resolver.as_ref(), language) {
+                // A framework that runs only in its own apps (#2129)
+                // extracts only the files of one of them.
+                if !applies_to_language(resolver.as_ref(), language)
+                    || !gating.applies(resolver.name(), relative, project_root)
+                {
                     continue;
                 }
                 if let Some(result) = resolver.extract(relative, &content, context) {
@@ -2383,8 +2651,12 @@ impl ReferenceResolver {
             .iter()
             .filter(|resolver| resolves_language(resolver.as_ref(), reference.language))
         {
+            // The resolver's name rides on the edges it makes (upstream
+            // #2159).
             if let Some(result) = self.gate_framework_resolver_extension_language(
-                resolver.resolve(reference, context),
+                resolver
+                    .resolve(reference, context)
+                    .map(|result| result.named_by(resolver.name())),
                 reference,
                 context,
             ) {
@@ -2712,12 +2984,12 @@ impl ReferenceResolver {
         let [target] = targets.as_slice() else {
             return None;
         };
-        Some(ResolvedRef {
-            original: reference.clone(),
-            target_node_id: target.id.clone(),
-            confidence: 0.98,
-            resolved_by: ResolvedBy::QualifiedName,
-        })
+        Some(ResolvedRef::new(
+            reference.clone(),
+            target.id.clone(),
+            0.98,
+            ResolvedBy::QualifiedName,
+        ))
     }
 
     /// Resolve a `this.<member>` function_ref against the enclosing class's own
@@ -2774,12 +3046,12 @@ impl ReferenceResolver {
             .reduce(|a, b| if a.start_line <= b.start_line { a } else { b });
         match target {
             Some(target) => (
-                Some(ResolvedRef {
-                    original: reference.clone(),
-                    target_node_id: target.id.clone(),
-                    confidence: 0.95,
-                    resolved_by: ResolvedBy::FunctionRef,
-                }),
+                Some(ResolvedRef::new(
+                    reference.clone(),
+                    target.id.clone(),
+                    0.95,
+                    ResolvedBy::FunctionRef,
+                )),
                 None,
             ),
             // Not on the class itself — possibly INHERITED. Retry in the
@@ -2834,12 +3106,12 @@ impl ReferenceResolver {
             };
 
             if let Some(target) = find_inherited_member(store, &class_name, member, reference) {
-                resolved.push(ResolvedRef {
-                    original: reference.clone(),
-                    target_node_id: target,
-                    confidence: 0.85,
-                    resolved_by: ResolvedBy::FunctionRef,
-                });
+                resolved.push(ResolvedRef::new(
+                    reference.clone(),
+                    target,
+                    0.85,
+                    ResolvedBy::FunctionRef,
+                ));
             }
         }
         drop(context);
@@ -2908,19 +3180,25 @@ impl ReferenceResolver {
         Ok(count)
     }
 
-    /// Create edges from resolved references (`createEdges`, `index.ts:751-790`).
+    /// Create edges from resolved references (`createEdges`, `index.ts:1546-1614`).
     pub fn create_edges(&self, resolved: &[ResolvedRef], store: &Store) -> Vec<Edge> {
         resolved
             .iter()
-            .map(|reference| {
-                let mut kind = reference.original.reference_kind;
-
-                // A Dart member read runs the getter it links (upstream #2338's
-                // `edgeKind: 'calls'`): `calls` is what callers, impact and
-                // flows follow.
-                if crate::dart_members::is_dart_member_read(&reference.original) {
-                    kind = EdgeKind::Calls;
-                }
+            .flat_map(|reference| {
+                let shape = reference.edge.as_deref();
+                let mut kind = match shape.and_then(|shape| shape.edge_kind) {
+                    // The kind a framework resolution gives its edges when it
+                    // is not the reference's own (`edgeKind`): a router's
+                    // `navigates`.
+                    Some(kind) => kind,
+                    // A Dart member read runs the getter it links (upstream
+                    // #2338's `edgeKind: 'calls'`): `calls` is what callers,
+                    // impact and flows follow.
+                    None if crate::dart_members::is_dart_member_read(&reference.original) => {
+                        EdgeKind::Calls
+                    }
+                    None => reference.original.reference_kind,
+                };
 
                 // Promote extends → implements (index.ts:756-764).
                 if kind == EdgeKind::Extends {
@@ -2952,16 +3230,35 @@ impl ReferenceResolver {
                     }
                 }
 
-                Edge {
-                    id: None,
-                    source: reference.original.from_node_id.clone(),
-                    target: reference.target_node_id.clone(),
-                    kind,
-                    metadata: Some(build_edge_metadata(reference)),
-                    line: Some(reference.original.line),
-                    col: Some(reference.original.column),
-                    provenance: None,
+                // One reference can name several targets — a navigation whose
+                // destination is a conditional reaches every arm. Each becomes
+                // its own edge, sharing this resolution's kind and confidence.
+                let empty = serde_json::Map::new();
+                let mut targets = vec![(
+                    reference.target_node_id.as_str(),
+                    shape.map_or(&empty, |shape| &shape.metadata),
+                )];
+                if let Some(shape) = shape {
+                    targets.extend(
+                        shape
+                            .also_targets
+                            .iter()
+                            .map(|also| (also.target_node_id.as_str(), &also.metadata)),
+                    );
                 }
+                targets
+                    .into_iter()
+                    .map(|(target, extra)| Edge {
+                        id: None,
+                        source: reference.original.from_node_id.clone(),
+                        target: target.to_string(),
+                        kind,
+                        metadata: Some(build_edge_metadata(reference, extra)),
+                        line: Some(reference.original.line),
+                        col: Some(reference.original.column),
+                        provenance: None,
+                    })
+                    .collect::<Vec<_>>()
             })
             .collect()
     }
@@ -3713,13 +4010,18 @@ fn ref_view_to_unresolved(reference: &RefView) -> UnresolvedRef {
     }
 }
 
-/// Build a resolved edge's `metadata` JSON: `confidence`+`resolvedBy`, plus
-/// `fnRef: true` for function-as-value edges (#756, index.ts:824-827) and
-/// `subkind` for Godot refs carrying a `reference_subkind`. The base shape (no
-/// `fnRef`, no `subkind`) stays byte-identical to the prior output, keeping
-/// existing resolved-edge goldens stable.
-fn build_edge_metadata(reference: &ResolvedRef) -> serde_json::Value {
-    let mut map = serde_json::Map::new();
+/// Build a resolved edge's `metadata` JSON: the target's own metadata from a
+/// framework resolution (`href`, the `framework` that made it, …), then
+/// `confidence`+`resolvedBy`, plus `fnRef: true` for function-as-value edges
+/// (#756, index.ts:824-827) and `subkind` for Godot refs carrying a
+/// `reference_subkind`. The base shape (no `fnRef`, no `subkind`) stays
+/// byte-identical to the prior output, keeping existing resolved-edge goldens
+/// stable.
+fn build_edge_metadata(
+    reference: &ResolvedRef,
+    extra: &serde_json::Map<String, serde_json::Value>,
+) -> serde_json::Value {
+    let mut map = extra.clone();
     map.insert(
         "confidence".to_string(),
         serde_json::json!(reference.confidence),
@@ -4088,12 +4390,12 @@ mod tests {
     #[test]
     fn build_edge_metadata_base_and_fn_ref() {
         let mut r = resolved_ref("t", 0.75);
-        let base = build_edge_metadata(&r);
+        let base = build_edge_metadata(&r, &serde_json::Map::new());
         assert_eq!(base["confidence"].as_f64(), Some(0.75));
         assert_eq!(base["resolvedBy"].as_str(), Some("import"));
         assert!(base.get("fnRef").is_none());
         r.original.is_function_ref = true;
-        let with_fn = build_edge_metadata(&r);
+        let with_fn = build_edge_metadata(&r, &serde_json::Map::new());
         assert_eq!(with_fn["fnRef"].as_bool(), Some(true));
     }
 
@@ -4101,7 +4403,7 @@ mod tests {
     fn build_edge_metadata_includes_subkind() {
         let mut r = resolved_ref("t", 0.9);
         r.original.reference_subkind = Some(codegraph_core::types::ReferenceSubkind::ScriptAttach);
-        let meta = build_edge_metadata(&r);
+        let meta = build_edge_metadata(&r, &serde_json::Map::new());
         assert_eq!(meta["subkind"].as_str(), Some("script_attach"));
     }
 
@@ -4374,8 +4676,8 @@ mod tests {
 
         let resolver = ReferenceResolver::new("/root");
 
-        let extends = ResolvedRef {
-            original: RefView {
+        let extends = ResolvedRef::new(
+            RefView {
                 row_id: None,
                 from_node_id: cls.id.clone(),
                 reference_name: "I".to_string(),
@@ -4387,12 +4689,12 @@ mod tests {
                 is_function_ref: false,
                 reference_subkind: None,
             },
-            target_node_id: iface.id.clone(),
-            confidence: 0.9,
-            resolved_by: ResolvedBy::Import,
-        };
-        let calls = ResolvedRef {
-            original: RefView {
+            iface.id.clone(),
+            0.9,
+            ResolvedBy::Import,
+        );
+        let calls = ResolvedRef::new(
+            RefView {
                 row_id: None,
                 from_node_id: caller.id.clone(),
                 reference_name: "D".to_string(),
@@ -4404,14 +4706,83 @@ mod tests {
                 is_function_ref: false,
                 reference_subkind: None,
             },
-            target_node_id: target_cls.id.clone(),
-            confidence: 0.9,
-            resolved_by: ResolvedBy::Import,
-        };
+            target_cls.id.clone(),
+            0.9,
+            ResolvedBy::Import,
+        );
         let edges = resolver.create_edges(&[extends, calls], &store);
         assert_eq!(edges.len(), 2);
         assert!(edges.iter().any(|e| e.kind == EdgeKind::Implements));
         assert!(edges.iter().any(|e| e.kind == EdgeKind::Instantiates));
+    }
+
+    /// A framework resolution's edge shape (upstream `edgeKind`, `metadata`,
+    /// `alsoTargets`): the edges take its kind, never promoted, one per
+    /// target, each with that target's metadata under the resolution's
+    /// `confidence` and `resolvedBy`.
+    #[test]
+    fn create_edges_draws_a_framework_edge_shape() {
+        let mut store = Store::open(&temp_db("edge-shape")).expect("open");
+        let caller = mk_node("function:go", NodeKind::Function, "go", "a.tsx");
+        // Class-kind targets: a plain `calls` edge to one would be promoted.
+        let login = mk_node("class:Login", NodeKind::Class, "Login", "login.tsx");
+        let search = mk_node("class:Search", NodeKind::Class, "Search", "search.tsx");
+        store
+            .upsert_nodes(&[caller.clone(), login.clone(), search.clone()])
+            .expect("upsert");
+        let resolver = ReferenceResolver::new("/root");
+        let href = |value: &str| {
+            let mut map = serde_json::Map::new();
+            map.insert("href".to_string(), serde_json::json!(value));
+            // A key the resolution's own metadata overrides.
+            map.insert("confidence".to_string(), serde_json::json!(0.1));
+            map
+        };
+        let mut original = mk_ref("router.push", EdgeKind::Calls, Language::Tsx);
+        original.from_node_id = caller.id.clone();
+        original.line = 7;
+        original.column = 4;
+        let navigation = ResolvedRef::new(original, login.id.clone(), 0.9, ResolvedBy::Framework)
+            .with_edge(crate::types::EdgeShape {
+                edge_kind: Some(EdgeKind::Navigates),
+                metadata: href("/login"),
+                also_targets: vec![crate::types::AlsoTarget {
+                    target_node_id: search.id.clone(),
+                    metadata: href("/search"),
+                }],
+            });
+
+        let edges = resolver.create_edges(&[navigation], &store);
+        let drawn: Vec<String> = edges
+            .iter()
+            .map(|edge| {
+                let metadata = edge.metadata.as_ref().expect("metadata");
+                format!(
+                    "{} {} {} {} {} {:?}:{:?}",
+                    edge.target,
+                    edge.kind.as_str(),
+                    metadata["href"].as_str().unwrap(),
+                    metadata["confidence"],
+                    metadata["resolvedBy"].as_str().unwrap(),
+                    edge.line,
+                    edge.col,
+                )
+            })
+            .collect();
+        assert_eq!(
+            drawn,
+            [
+                format!(
+                    "{} navigates /login 0.9 framework Some(7):Some(4)",
+                    login.id
+                ),
+                format!(
+                    "{} navigates /search 0.9 framework Some(7):Some(4)",
+                    search.id
+                ),
+            ]
+        );
+        assert!(edges.iter().all(|edge| edge.source == caller.id));
     }
 
     #[test]
@@ -4441,18 +4812,13 @@ mod tests {
             is_function_ref: false,
             reference_subkind: None,
         };
-        let to_member = ResolvedRef {
-            original: extends_ref.clone(),
-            target_node_id: member.id.clone(),
-            confidence: 0.9,
-            resolved_by: ResolvedBy::ExactMatch,
-        };
-        let to_iface = ResolvedRef {
-            original: extends_ref,
-            target_node_id: iface.id.clone(),
-            confidence: 0.9,
-            resolved_by: ResolvedBy::ExactMatch,
-        };
+        let to_member = ResolvedRef::new(
+            extends_ref.clone(),
+            member.id.clone(),
+            0.9,
+            ResolvedBy::ExactMatch,
+        );
+        let to_iface = ResolvedRef::new(extends_ref, iface.id.clone(), 0.9, ResolvedBy::ExactMatch);
 
         assert!(
             resolver
@@ -4529,6 +4895,111 @@ mod tests {
         let batched = run_persist(true);
         assert_eq!(serial, batched);
         assert!(serial > 0, "expected at least one resolved edge");
+    }
+
+    /// A bridge that resolves `bridge.call` to two targets, the way a router
+    /// resolves a conditional navigation.
+    struct Bridge;
+    impl FrameworkResolver for Bridge {
+        fn name(&self) -> &str {
+            "bridge"
+        }
+        fn detect(&self, _c: &dyn ResolutionContext) -> bool {
+            true
+        }
+        fn claims_reference(&self, name: &str) -> bool {
+            name == "bridge.call"
+        }
+        fn resolve(&self, r: &RefView, _c: &dyn ResolutionContext) -> Option<ResolvedRef> {
+            (r.reference_name == "bridge.call").then(|| {
+                ResolvedRef::new(
+                    r.clone(),
+                    "function:native".to_string(),
+                    0.95,
+                    ResolvedBy::Framework,
+                )
+                .with_edge(crate::types::EdgeShape {
+                    also_targets: vec![crate::types::AlsoTarget {
+                        target_node_id: "function:fallback".to_string(),
+                        metadata: serde_json::Map::new(),
+                    }],
+                    ..Default::default()
+                })
+            })
+        }
+    }
+
+    /// Upstream #2159: the edge a framework resolver made to its target names
+    /// that resolver in `metadata.framework`, on the serial and the batched
+    /// path; an also-target's edge keeps its own metadata, and a resolution no
+    /// framework made names none.
+    #[test]
+    fn a_framework_resolved_edge_names_its_resolver() {
+        for batched in [false, true] {
+            let mut store = Store::open(&temp_db("framework-name")).expect("open");
+            let caller = mk_node("function:run", NodeKind::Function, "run", "app.ts");
+            let native = mk_node("function:native", NodeKind::Function, "native", "n.ts");
+            let fallback = mk_node("function:fallback", NodeKind::Function, "fallback", "f.ts");
+            let add = mk_node("function:add", NodeKind::Function, "add", "math.ts");
+            for file in ["app.ts", "n.ts", "f.ts", "math.ts"] {
+                store.upsert_file(&file_rec(file)).expect("file");
+            }
+            store
+                .upsert_nodes(&[caller.clone(), native, fallback, add])
+                .expect("nodes");
+            let reference = |name: &str, line: i64| UnresolvedRef {
+                id: None,
+                from_node_id: caller.id.clone(),
+                reference_name: name.to_string(),
+                reference_kind: EdgeKind::Calls,
+                line,
+                col: 0,
+                candidates: None,
+                file_path: "app.ts".to_string(),
+                language: Language::TypeScript,
+                is_function_ref: false,
+                reference_subkind: None,
+            };
+            store
+                .insert_unresolved_refs(&[reference("bridge.call", 1), reference("add", 2)])
+                .expect("refs");
+            let mut resolver = ReferenceResolver::new("/root");
+            resolver.framework_resolver_extensions = vec![Box::new(Bridge)];
+            if batched {
+                resolver
+                    .resolve_and_persist_batched(&mut store, 10)
+                    .expect("batched");
+            } else {
+                resolver.resolve_and_persist(&mut store).expect("serial");
+            }
+            let mut named: Vec<String> = store
+                .edges_by_source_kind(&caller.id, Some(EdgeKind::Calls))
+                .expect("edges")
+                .into_iter()
+                .map(|edge| {
+                    let metadata = edge.metadata.expect("metadata");
+                    format!(
+                        "{} {} {}",
+                        edge.target,
+                        metadata["resolvedBy"].as_str().unwrap_or("-"),
+                        metadata
+                            .get("framework")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("-"),
+                    )
+                })
+                .collect();
+            named.sort();
+            assert_eq!(
+                named,
+                [
+                    "function:add exact-match -",
+                    "function:fallback framework -",
+                    "function:native framework bridge",
+                ],
+                "batched: {batched}"
+            );
+        }
     }
 
     fn run_persist(batched: bool) -> usize {
@@ -5121,12 +5592,12 @@ mod tests {
                 .is_none()
         );
         // References ref to a Python target from a TS source -> dropped (different family).
-        let candidate = ResolvedRef {
-            original: mk_ref("py", EdgeKind::References, Language::TypeScript),
-            target_node_id: py_node.id.clone(),
-            confidence: 0.8,
-            resolved_by: ResolvedBy::Import,
-        };
+        let candidate = ResolvedRef::new(
+            mk_ref("py", EdgeKind::References, Language::TypeScript),
+            py_node.id.clone(),
+            0.8,
+            ResolvedBy::Import,
+        );
         assert!(
             resolver
                 .gate_language(
@@ -5497,8 +5968,8 @@ mod tests {
 
     #[test]
     fn extract_and_persist_frameworks_runs_when_detected() {
-        // With a react project detected, extract_and_persist_frameworks reads the
-        // relative file and persists any framework nodes/refs it emits.
+        // With a Next.js project detected, extract_and_persist_frameworks reads
+        // the relative file and persists any framework nodes/refs it emits.
         let dir = std::env::temp_dir().join(format!(
             "codegraph-fw-extract-{}-{}",
             std::process::id(),
@@ -5510,12 +5981,10 @@ mod tests {
         std::fs::create_dir_all(dir.join("pages")).expect("mkdir");
         std::fs::write(
             dir.join("package.json"),
-            r#"{"dependencies":{"react":"18"}}"#,
+            r#"{"dependencies":{"next":"14"}}"#,
         )
         .expect("pkg");
-        // The react resolver's languages() is [JavaScript, TypeScript]; a `.tsx`
-        // maps to Language::Tsx (not applicable), so use a `.ts` page whose Next.js
-        // route branch still fires on `export default`.
+        // A Next.js page: the Next resolver extracts its route.
         std::fs::write(
             dir.join("pages/about.ts"),
             "export default function About() { return 1; }",
@@ -5842,6 +6311,270 @@ mod tests {
         }
     }
 
+    /// A file-based router that runs only in its own apps (upstream #2129):
+    /// one route node per file it extracts.
+    struct AppRouter;
+    impl FrameworkResolver for AppRouter {
+        fn name(&self) -> &str {
+            "app-router"
+        }
+        fn languages(&self) -> Option<&[Language]> {
+            const L: [Language; 1] = [Language::TypeScript];
+            Some(&L)
+        }
+        fn app_dependencies(&self) -> Option<&'static [&'static str]> {
+            Some(&["app-router"])
+        }
+        fn detect(&self, _c: &dyn ResolutionContext) -> bool {
+            true
+        }
+        fn resolve(&self, _r: &RefView, _c: &dyn ResolutionContext) -> Option<ResolvedRef> {
+            None
+        }
+        fn extract(
+            &self,
+            file_path: &str,
+            _content: &str,
+            _context: &crate::framework::FrameworkExtractionContext,
+        ) -> Option<crate::types::FrameworkResolverExtractionResult> {
+            let mut route = mk_node(
+                &format!("route:{file_path}"),
+                NodeKind::Route,
+                file_path,
+                file_path,
+            );
+            route.language = Language::TypeScript;
+            Some(crate::types::FrameworkResolverExtractionResult {
+                nodes: vec![route],
+                references: Vec::new(),
+            })
+        }
+    }
+
+    /// The same extractor, run on every file of its language.
+    struct EveryFileRouter;
+    impl FrameworkResolver for EveryFileRouter {
+        fn name(&self) -> &str {
+            "every-file"
+        }
+        fn languages(&self) -> Option<&[Language]> {
+            AppRouter.languages()
+        }
+        fn detect(&self, _c: &dyn ResolutionContext) -> bool {
+            true
+        }
+        fn resolve(&self, _r: &RefView, _c: &dyn ResolutionContext) -> Option<ResolvedRef> {
+            None
+        }
+        fn extract(
+            &self,
+            file_path: &str,
+            content: &str,
+            context: &crate::framework::FrameworkExtractionContext,
+        ) -> Option<crate::types::FrameworkResolverExtractionResult> {
+            let mut result = AppRouter.extract(file_path, content, context)?;
+            for node in &mut result.nodes {
+                node.id = format!("every:{file_path}");
+            }
+            Some(result)
+        }
+    }
+
+    /// A context over files on disk under `root`, all of them indexed.
+    struct DiskCtx {
+        root: std::path::PathBuf,
+        files: Vec<String>,
+    }
+    impl ResolutionContext for DiskCtx {
+        fn get_nodes_in_file(&self, _f: &str) -> Vec<Node> {
+            Vec::new()
+        }
+        fn get_nodes_by_name(&self, _n: &str) -> Vec<Node> {
+            Vec::new()
+        }
+        fn get_nodes_by_qualified_name(&self, _q: &str) -> Vec<Node> {
+            Vec::new()
+        }
+        fn get_nodes_by_kind(&self, _k: NodeKind) -> Vec<Node> {
+            Vec::new()
+        }
+        fn file_exists(&self, f: &str) -> bool {
+            self.root.join(f).is_file()
+        }
+        fn read_file(&self, f: &str) -> Option<String> {
+            std::fs::read_to_string(self.root.join(f)).ok()
+        }
+        fn get_project_root(&self) -> &str {
+            self.root.to_str().expect("utf-8 root")
+        }
+        fn get_all_files(&self) -> Vec<String> {
+            self.files.clone()
+        }
+        fn get_nodes_by_lower_name(&self, _n: &str) -> Vec<Node> {
+            Vec::new()
+        }
+        fn get_node_by_id(&self, _id: &str) -> Option<Node> {
+            None
+        }
+        fn get_import_mappings(&self, _f: &str, _l: Language) -> Vec<ImportMapping> {
+            Vec::new()
+        }
+    }
+
+    /// A temporary project tree, removed on drop.
+    struct TempTree(std::path::PathBuf);
+    impl TempTree {
+        fn new(slug: &str, files: &[(&str, &str)]) -> Self {
+            let root = temp_db(slug).with_extension("tree");
+            let _ = std::fs::remove_dir_all(&root);
+            let tree = Self(root);
+            for (path, content) in files {
+                tree.write(path, content);
+            }
+            tree
+        }
+        fn write(&self, path: &str, content: &str) {
+            let full = self.0.join(path);
+            std::fs::create_dir_all(full.parent().expect("parent")).expect("mkdir");
+            std::fs::write(full, content).expect("write");
+        }
+    }
+    impl Drop for TempTree {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Upstream #2129 through the extraction seam: a framework that names
+    /// its app dependencies extracts only the files of an app whose nearest
+    /// manifest declares one, an ungated framework every file, and the
+    /// frameworks signature moves when a manifest moves an app.
+    #[test]
+    fn a_gated_framework_extracts_only_the_files_of_its_apps() {
+        let tree = TempTree::new(
+            "app-gating",
+            &[
+                ("package.json", r#"{"name":"mono","private":true}"#),
+                (
+                    "apps/web/package.json",
+                    r#"{"dependencies":{"app-router":"*"}}"#,
+                ),
+                ("apps/web/app/page.ts", "export const page = 1;\n"),
+                (
+                    "apps/admin/package.json",
+                    r#"{"dependencies":{"left-pad":"*"}}"#,
+                ),
+                ("apps/admin/app/page.ts", "export const page = 2;\n"),
+            ],
+        );
+        let files = vec![
+            "apps/admin/app/page.ts".to_string(),
+            "apps/web/app/page.ts".to_string(),
+        ];
+        let context = DiskCtx {
+            root: tree.0.clone(),
+            files: files.clone(),
+        };
+        let root = tree.0.to_string_lossy().to_string();
+        let extract = |resolver: &ReferenceResolver| -> Vec<String> {
+            let mut ids: Vec<String> = resolver
+                .collect_framework_extraction_with(
+                    &files,
+                    &crate::framework::FrameworkExtractionContext::without_config(&root),
+                    &codegraph_extract::ext_config::ExtensionOverrides::default(),
+                )
+                .nodes
+                .into_iter()
+                .map(|node| node.id)
+                .collect();
+            ids.sort();
+            ids
+        };
+
+        let mut resolver = ReferenceResolver::new(&root);
+        resolver.install_frameworks(
+            vec![Box::new(AppRouter), Box::new(EveryFileRouter)],
+            &context,
+        );
+        assert_eq!(
+            extract(&resolver),
+            [
+                "every:apps/admin/app/page.ts",
+                "every:apps/web/app/page.ts",
+                "route:apps/web/app/page.ts",
+            ]
+        );
+        let signature = resolver.framework_signature();
+        assert_eq!(signature[..2], ["app-router", "every-file"]);
+        assert!(signature[2].starts_with("gating:"), "{signature:?}");
+
+        // The admin app moves onto the router: its file is extracted too, and
+        // the signature a sync compares moves with it.
+        tree.write(
+            "apps/admin/package.json",
+            r#"{"dependencies":{"app-router":"*"}}"#,
+        );
+        let mut moved = ReferenceResolver::new(&root);
+        moved.install_frameworks(
+            vec![Box::new(AppRouter), Box::new(EveryFileRouter)],
+            &context,
+        );
+        assert_eq!(
+            extract(&moved),
+            [
+                "every:apps/admin/app/page.ts",
+                "every:apps/web/app/page.ts",
+                "route:apps/admin/app/page.ts",
+                "route:apps/web/app/page.ts",
+            ]
+        );
+        assert_ne!(moved.framework_signature(), signature);
+
+        // A manifest edit that moves no app leaves the signature alone.
+        tree.write(
+            "apps/admin/package.json",
+            r#"{"dependencies":{"app-router":"^2"}}"#,
+        );
+        let mut again = ReferenceResolver::new(&root);
+        again.install_frameworks(
+            vec![Box::new(AppRouter), Box::new(EveryFileRouter)],
+            &context,
+        );
+        assert_eq!(again.framework_signature(), moved.framework_signature());
+    }
+
+    /// When no manifest names a gated framework's packages, detection found
+    /// it by other evidence: it extracts every file, and the signature is
+    /// the framework names alone, as before gating.
+    #[test]
+    fn an_undeclared_app_framework_extracts_every_file() {
+        let tree = TempTree::new(
+            "app-gating-undeclared",
+            &[
+                ("package.json", r#"{"name":"demo"}"#),
+                ("app/page.ts", "export const page = 1;\n"),
+            ],
+        );
+        let files = vec!["app/page.ts".to_string()];
+        let context = DiskCtx {
+            root: tree.0.clone(),
+            files: files.clone(),
+        };
+        let root = tree.0.to_string_lossy().to_string();
+        let mut resolver = ReferenceResolver::new(&root);
+        resolver.install_frameworks(vec![Box::new(AppRouter)], &context);
+        let nodes = resolver
+            .collect_framework_extraction_with(
+                &files,
+                &crate::framework::FrameworkExtractionContext::without_config(&root),
+                &codegraph_extract::ext_config::ExtensionOverrides::default(),
+            )
+            .nodes;
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(resolver.framework_signature(), ["app-router"]);
+        assert_eq!(resolver.framework_signature(), resolver.framework_names());
+    }
+
     struct MinimalCtx {
         files: HashMap<String, String>,
     }
@@ -5897,12 +6630,12 @@ mod tests {
     }
 
     fn resolved_ref(target: &str, confidence: f64) -> ResolvedRef {
-        ResolvedRef {
-            original: mk_ref("x", EdgeKind::Calls, Language::TypeScript),
-            target_node_id: target.to_string(),
+        ResolvedRef::new(
+            mk_ref("x", EdgeKind::Calls, Language::TypeScript),
+            target.to_string(),
             confidence,
-            resolved_by: ResolvedBy::Import,
-        }
+            ResolvedBy::Import,
+        )
     }
 
     fn mk_node(id: &str, kind: NodeKind, name: &str, file: &str) -> Node {
