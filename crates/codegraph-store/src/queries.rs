@@ -207,6 +207,41 @@ impl Store {
         )
     }
 
+    /// The classes, methods and properties of `file_paths`: each file's
+    /// rows of [`Self::nodes_by_file_path`] of those kinds, read a chunk of
+    /// [`SQLITE_PARAM_CHUNK_SIZE`] distinct paths at a time (W7-18d's cost
+    /// revision: the Angular pass reads its component files with this, not
+    /// with a query a file). The rows come in no promised order.
+    pub fn classes_and_members_by_file_paths(
+        &self,
+        file_paths: &[String],
+    ) -> rusqlite::Result<Vec<Node>> {
+        let mut out = Vec::new();
+        let mut unique = file_paths.to_vec();
+        unique.sort_unstable();
+        unique.dedup();
+        for chunk in unique.chunks(SQLITE_PARAM_CHUNK_SIZE) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT * FROM nodes WHERE file_path IN ({placeholders}) \
+                 AND +kind IN ('class', 'method', 'property')"
+            );
+            let params = chunk.iter().map(|p| p as &dyn ToSql).collect::<Vec<_>>();
+            let mut stmt = self.conn.prepare(&sql)?;
+            // Each field's column found once for the statement, as
+            // `query_nodes` does (W5-08): by name on every row, the read
+            // cost more than one query a file.
+            let columns = NodeColumns::of(&stmt)?;
+            let rows = stmt.query_map(params.as_slice(), |row| columns.node(row))?;
+            for node in rows {
+                out.push(node?);
+            }
+        }
+        Ok(out)
+    }
+
     /// The methods of `file_path` in the order [`Self::nodes_by_file_path`]
     /// lists them: the same walk of the file's own index, the other rows
     /// skipped (W5-08).
@@ -3986,6 +4021,62 @@ mod tests {
         expected.sort_by_key(|row| row.start_line);
         assert_eq!(read, expected);
         assert_eq!(read.len(), 4);
+    }
+
+    /// The classes, methods and properties of many files read at once
+    /// (W7-18d's cost revision) are each file's rows of those kinds, past a
+    /// chunk's worth of paths; a path asked twice is read once, a file not
+    /// asked is not read, and no path reads nothing.
+    #[test]
+    fn many_files_classes_and_members_are_their_rows_of_those_kinds() {
+        let mut store = store("classes-and-members");
+        let paths: Vec<String> = (0..SQLITE_PARAM_CHUNK_SIZE + 3)
+            .map(|at| format!("src/c{at:04}.ts"))
+            .collect();
+        let mut nodes = Vec::new();
+        for path in paths.iter().chain(["src/unasked.ts".to_string()].iter()) {
+            store.upsert_file(&file(path)).unwrap();
+            for (index, kind) in [
+                NodeKind::Class,
+                NodeKind::Method,
+                NodeKind::Property,
+                NodeKind::Function,
+                NodeKind::Field,
+                NodeKind::Import,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let mut row = node(&format!("{}:{path}:{index}", kind.as_str()), "n", path);
+                row.kind = kind;
+                row.start_line = 20 - index as i64;
+                nodes.push(row);
+            }
+        }
+        store.upsert_nodes(&nodes).unwrap();
+        let mut asked = paths.clone();
+        asked.push(paths[7].clone());
+        let mut read = store.classes_and_members_by_file_paths(&asked).unwrap();
+        let mut expected: Vec<Node> = paths
+            .iter()
+            .flat_map(|path| store.nodes_by_file_path(path).unwrap())
+            .filter(|row| {
+                matches!(
+                    row.kind,
+                    NodeKind::Class | NodeKind::Method | NodeKind::Property
+                )
+            })
+            .collect();
+        read.sort_by(|a, b| a.id.cmp(&b.id));
+        expected.sort_by(|a, b| a.id.cmp(&b.id));
+        assert_eq!(read, expected);
+        assert_eq!(read.len(), 3 * paths.len());
+        assert!(
+            store
+                .classes_and_members_by_file_paths(&[])
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

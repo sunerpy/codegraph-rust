@@ -23560,14 +23560,16 @@ mod angular {
     }
 
     /// Upstream #2113 (`angular-router.test.ts`, "an Angular app, indexed",
-    /// its first two assertions, the calls of the second; the `routerLink`,
-    /// template and Screens halves are W7-18's and the viewer's): each
-    /// screen is named by the path a user takes to it, through a mount, a
-    /// constant, a `$localize` path and an NgModule's routing module, and
-    /// bound to its component and the layouts around it, and each
-    /// `navigate` reaches the screen its destination names, `['/']` through
-    /// the root `**` redirect and a route constant that builds its commands.
-    /// A layout with a `''` child is no screen of its own.
+    /// its first two assertions, the calls of the second; the template half
+    /// is W7-18d's `pr2113_a_template_navigates_renders_and_binds_its_events`,
+    /// the Screens half the viewer's): each screen is named by the path a
+    /// user takes to it, through a mount, a constant, a `$localize` path and
+    /// an NgModule's routing module, and bound to its component and the
+    /// layouts around it, and each `navigate` reaches the screen its
+    /// destination names, `['/']` through the root `**` redirect and a route
+    /// constant that builds its commands. A layout with a `''` child is no
+    /// screen of its own. Since W7-18d the `routerLink` the fixture's
+    /// `AuthComponent` template writes navigates too.
     #[test]
     fn pr2113_an_angular_app_names_its_screens_by_their_paths() {
         let home = component(
@@ -23665,6 +23667,7 @@ mod angular {
         assert_eq!(
             navigations(graph),
             [
+                "AuthComponent -> /home (routerLink)",
                 "done -> /home (navigate)",
                 "open -> /login (navigate)",
                 "save -> /account/access/:id (navigate)",
@@ -23676,7 +23679,8 @@ mod angular {
 
     /// Upstream #2133 (angular-spotify): Nx libraries behind barrels,
     /// `(await import(…)).M` and a class-static path constant name the
-    /// screens a shell lazy-loads. The `routerLink` navigation is W7-18's.
+    /// screens a shell lazy-loads, and since W7-18d a template in one
+    /// library links to a screen another library declares.
     #[test]
     fn pr2133_nx_libraries_mount_their_routes_through_barrels() {
         let module = |name: &str, component: &str, file: &str| {
@@ -23684,9 +23688,9 @@ mod angular {
                 "import {{ NgModule }} from '@angular/core';\nimport {{ RouterModule }} from '@angular/router';\nimport {{ {component} }} from './{file}';\n@NgModule({{ imports: [RouterModule.forChild([{{ path: '', component: {component} }}])] }})\nexport class {name} {{}}\n"
             )
         };
-        let class = |name: &str, selector: &str| {
+        let class = |name: &str, selector: &str, template: &str| {
             format!(
-                "import {{ Component }} from '@angular/core';\n@Component({{ selector: '{selector}', template: `<p></p>` }})\nexport class {name} {{}}\n"
+                "import {{ Component }} from '@angular/core';\n@Component({{ selector: '{selector}', template: `{template}` }})\nexport class {name} {{}}\n"
             )
         };
         let project = Project::new()
@@ -23715,7 +23719,7 @@ mod angular {
             )
             .file(
                 "libs/home/src/lib/home.component.ts",
-                &class("HomeComponent", "as-home"),
+                &class("HomeComponent", "as-home", "<a routerLink=\"/lyrics\">Lyrics</a>"),
             )
             .file("libs/lyrics/src/index.ts", "export * from './lib/lyrics.module';\n")
             .file(
@@ -23724,13 +23728,22 @@ mod angular {
             )
             .file(
                 "libs/lyrics/src/lib/lyrics.component.ts",
-                &class("LyricsComponent", "as-lyrics"),
+                &class("LyricsComponent", "as-lyrics", "<a routerLink=\"/\">Home</a>"),
             )
             .index();
         let graph = project.graph();
         assert_eq!(
             screens(graph),
             ["/ -> HomeComponent", "/lyrics -> LyricsComponent"],
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            navigations(graph),
+            [
+                "HomeComponent -> /lyrics (routerLink)",
+                "LyricsComponent -> / (routerLink)",
+            ],
             "{}",
             graph.report()
         );
@@ -23795,6 +23808,708 @@ mod angular {
             "{}",
             graph.report()
         );
+    }
+
+    /// A component written as upstream's `angular-router.test.ts` writes
+    /// one: a `templateUrl` for a template starting with `./`, else an
+    /// inline `template`.
+    fn upstream_component(name: &str, selector: &str, template: &str, body: &str) -> String {
+        let template = if template.starts_with("./") {
+            format!("templateUrl: '{template}'")
+        } else {
+            format!("template: `{template}`")
+        };
+        format!(
+            "import {{ Component }} from '@angular/core';\nimport {{ Router }} from '@angular/router';\n@Component({{\n  selector: '{selector}',\n  {template},\n}})\nexport class {name} {{\n  constructor(private readonly router: Router) {{}}\n{body}\n}}\n"
+        )
+    }
+
+    /// The source with the routes constants imported after the router.
+    fn with_constants(source: &str) -> String {
+        source.replace(
+            "import { Router } from '@angular/router';",
+            "import { Router } from '@angular/router';\nimport { internalRoutes } from '../routes.constants';",
+        )
+    }
+
+    /// Upstream's "an Angular app, indexed" fixture (`angular-router.test.ts`,
+    /// #2113 and #2114), as written there.
+    fn upstream_app() -> super::support::Indexed {
+        let home = with_constants(
+            &upstream_component(
+                "HomeComponent",
+                "app-home",
+                "./home.component.html",
+                "  open(slug: string) { this.router.navigate(['/login']); }\n  more() { this.router.navigate([], { queryParams: { page: 2 } }); }",
+            )
+            .replace("export class", "export default class"),
+        )
+        .replace(
+            "  constructor(",
+            "  protected readonly routerLinkAbout = internalRoutes.about.routerLink;\n  constructor(",
+        );
+        let card = with_constants(&upstream_component(
+            "CardComponent",
+            "app-card",
+            "<button (click)=\"save()\">Save</button><input [(ngModel)]=\"name\" /><a (click)=\"closed.emit(true)\">x</a>",
+            "  name = '';\n  save() { this.router.navigate(internalRoutes.account.subRoutes.access.routerLink('me')); }",
+        ));
+        let account = with_constants(&upstream_component(
+            "AccountComponent",
+            "app-account",
+            "<a [routerLink]=\"['/login']\">Log out</a><app-tabs [tabs]=\"tabs\"></app-tabs><router-outlet></router-outlet>",
+            "  tabs = [{ label: 'Access', routerLink: internalRoutes.account.subRoutes.access.routerLink('me') }];",
+        ));
+        Project::new()
+            .file(
+                "package.json",
+                "{\"dependencies\":{\"@angular/core\":\"^19.0.0\",\"@angular/router\":\"^19.0.0\"}}",
+            )
+            .file(
+                "src/app/routes.constants.ts",
+                "export const internalRoutes = {\n  account: { path: 'account', routerLink: ['/account'], subRoutes: { access: { path: 'access', routerLink: (id: string) => ['/account', 'access', id] } } },\n  about: { path: $localize`:kebab-case@@routes.about:about`, routerLink: ['/' + $localize`:kebab-case@@routes.about:about`] },\n};\n",
+            )
+            .file(
+                "src/app/app.routes.ts",
+                "import { Routes } from '@angular/router';\nimport { AuthComponent } from './auth/auth.component';\nimport { internalRoutes } from './routes.constants';\nconst { about } = internalRoutes;\nexport const routes: Routes = [\n  { path: 'home', loadComponent: () => import('./home/home.component') },\n  { path: 'login', component: AuthComponent },\n  { path: about.path, loadComponent: () => import('./about/about.component').then((m) => m.AboutComponent) },\n  { path: internalRoutes.account.path, loadChildren: () => import('./account/account.routes') },\n  { path: 'admin', loadChildren: () => import('./admin/admin.module').then((m) => m.AdminModule) },\n  { path: '**', redirectTo: 'home' },\n];\n",
+            )
+            .file(
+                "src/app/account/account.routes.ts",
+                "import { Routes } from '@angular/router';\nimport { AccountComponent } from './account.component';\nimport { AccessComponent } from './access.component';\nimport { internalRoutes } from '../routes.constants';\nexport default [\n  { path: '', component: AccountComponent, children: [\n      { path: '', loadComponent: () => import('./overview.component') },\n      { path: internalRoutes.account.subRoutes.access.path + '/:id', component: AccessComponent },\n  ] },\n] satisfies Routes;\n",
+            )
+            .file(
+                "src/app/admin/admin.module.ts",
+                "import { NgModule } from '@angular/core';\nimport { AdminRoutingModule } from './admin-routing.module';\n@NgModule({ imports: [AdminRoutingModule] })\nexport class AdminModule {}\n",
+            )
+            .file(
+                "src/app/admin/admin-routing.module.ts",
+                "import { NgModule } from '@angular/core';\nimport { RouterModule, Routes } from '@angular/router';\nimport { AdminUsersComponent } from './admin-users.component';\nconst routes: Routes = [{ path: '', redirectTo: 'users', pathMatch: 'full' }, { path: 'users', component: AdminUsersComponent }];\n@NgModule({ imports: [RouterModule.forChild(routes)], exports: [RouterModule] })\nexport class AdminRoutingModule {}\n",
+            )
+            .file("src/app/home/home.component.ts", &home)
+            .file(
+                "src/app/home/home.component.html",
+                "<app-card></app-card>\n<a routerLink=\"/login\">Sign in</a>\n<a [routerLink]=\"routerLinkAbout\">About</a>\n<a [routerLink]=\"['/account', 'access', 7]\">Access</a>\n<a routerLink=\"relative\">Relative</a>\n",
+            )
+            .file("src/app/shared/card.component.ts", &card)
+            .file(
+                "src/app/auth/auth.component.ts",
+                &upstream_component(
+                    "AuthComponent",
+                    "app-auth",
+                    "<a routerLink=\"/home\">Home</a>",
+                    "  done() { this.router.navigate(['/']); }",
+                ),
+            )
+            .file(
+                "src/app/about/about.component.ts",
+                &upstream_component("AboutComponent", "app-about", "<p>About</p>", ""),
+            )
+            .file("src/app/account/account.component.ts", &account)
+            .file(
+                "src/app/account/overview.component.ts",
+                &upstream_component("OverviewComponent", "app-overview", "<p>Overview</p>", "")
+                    .replace("export class", "export default class"),
+            )
+            .file(
+                "src/app/account/access.component.ts",
+                &upstream_component("AccessComponent", "app-access", "<p>Access</p>", ""),
+            )
+            .file(
+                "src/app/admin/admin-users.component.ts",
+                &upstream_component("AdminUsersComponent", "app-admin-users", "<p>Users</p>", ""),
+            )
+            .index()
+    }
+
+    /// The `synthesizedBy` of `edge`.
+    fn synthesized_by(edge: &super::support::EdgeRow) -> &str {
+        edge.metadata
+            .get("synthesizedBy")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+    }
+
+    /// Upstream #2113 and #2114 (`angular-router.test.ts`, "an Angular app,
+    /// indexed", its second to fourth tests without the Steps half, which
+    /// is the viewer's): `routerLink` navigates from a template file, a
+    /// bound route constant, a class property holding one, a command array
+    /// and a class's tab field (a relative link draws nothing); a template
+    /// renders the child its element selector names; and an event binding
+    /// calls the component's own method, the binding as the trigger, where
+    /// a two-way binding and the component's own output call nothing. The
+    /// template file is no indexed file and is recorded beside the index.
+    #[test]
+    fn pr2113_a_template_navigates_renders_and_binds_its_events() {
+        let project = upstream_app();
+        let graph = project.graph();
+        assert_eq!(
+            navigations(graph),
+            [
+                "AccountComponent -> /account/access/:id (routerLink)",
+                "AccountComponent -> /login (routerLink)",
+                "AuthComponent -> /home (routerLink)",
+                "HomeComponent -> /about (routerLink)",
+                "HomeComponent -> /account/access/:id (routerLink)",
+                "HomeComponent -> /login (routerLink)",
+                "done -> /home (navigate)",
+                "open -> /login (navigate)",
+                "save -> /account/access/:id (navigate)",
+            ],
+            "{}",
+            graph.report()
+        );
+        let name = |id: &str| graph.node(id).map_or("?", |node| node.name.as_str());
+        let renders: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.kind == "calls" && synthesized_by(edge) == "angular-template")
+            .map(|edge| {
+                format!(
+                    "{} -> {} <{}>",
+                    name(&edge.source),
+                    name(&edge.target),
+                    edge.metadata["via"].as_str().unwrap_or("?")
+                )
+            })
+            .collect();
+        assert_eq!(
+            renders,
+            ["HomeComponent -> CardComponent <app-card>"],
+            "{}",
+            graph.report()
+        );
+        let events: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.kind == "calls" && synthesized_by(edge) == "angular-event")
+            .map(|edge| {
+                format!(
+                    "{} -> {} {}",
+                    name(&edge.source),
+                    name(&edge.target),
+                    edge.metadata["trigger"]
+                )
+            })
+            .collect();
+        assert_eq!(
+            events,
+            ["CardComponent -> save {\"kind\":\"prop\",\"name\":\"(click)\",\"of\":\"button\"}"],
+            "{}",
+            graph.report()
+        );
+        assert!(
+            graph
+                .files
+                .iter()
+                .all(|file| file.path != "src/app/home/home.component.html"),
+            "the template is no indexed file\n{}",
+            graph.report()
+        );
+        assert_eq!(
+            inputs_row(&project),
+            serde_json::json!({
+                "src/app/home/home.component.html": codegraph_core::node_id::hash_content(
+                    "<app-card></app-card>\n<a routerLink=\"/login\">Sign in</a>\n<a [routerLink]=\"routerLinkAbout\">About</a>\n<a [routerLink]=\"['/account', 'access', 7]\">Access</a>\n<a routerLink=\"relative\">Relative</a>\n"
+                ),
+            })
+        );
+    }
+
+    /// Upstream's "an Angular template's bindings, indexed" fixture
+    /// (`angular-router.test.ts`, #2398), as written there.
+    fn upstream_bindings() -> super::support::Indexed {
+        Project::new()
+            .file(
+                "package.json",
+                "{\"dependencies\":{\"@angular/core\":\"^19.0.0\",\"@angular/router\":\"^19.0.0\"}}",
+            )
+            .file(
+                "src/app/app.routes.ts",
+                "import { Routes } from '@angular/router';\nimport { TasksComponent } from './tasks/tasks.component';\nexport const routes: Routes = [{ path: 'tasks', component: TasksComponent }];\n",
+            )
+            .file(
+                "src/app/nav/nav.component.ts",
+                "import { Component, signal } from '@angular/core';\n@Component({\n  selector: 'app-nav',\n  template: `<nav>\n    <app-theme-toggle [class.open]=\"isOpen()\" />\n  </nav>`,\n})\nexport class NavComponent {\n  isOpen = signal(false);\n}\n",
+            )
+            .file(
+                "src/app/theme-toggle/theme-toggle.component.ts",
+                "import { Component, computed, signal } from '@angular/core';\n@Component({ selector: 'app-theme-toggle', templateUrl: './theme-toggle.component.html' })\nexport class ThemeToggleComponent {\n  private readonly theme = signal<'light' | 'dark'>('light');\n  icon = computed(() => (this.theme() === 'dark' ? 'moon' : 'sun'));\n  label = computed(() => (this.theme() === 'dark' ? 'Dark' : 'Light'));\n  cycle(): void {\n    this.theme.set(this.theme() === 'dark' ? 'light' : 'dark');\n  }\n  unused(): void {}\n}\n",
+            )
+            .file(
+                "src/app/theme-toggle/theme-toggle.component.html",
+                "<button (click)=\"cycle()\" [attr.aria-label]=\"label()\">\n  <lucide-icon [name]=\"icon()\"></lucide-icon>\n</button>\n",
+            )
+            .file(
+                "src/app/tasks/tasks.component.ts",
+                "import { Component, computed, signal } from '@angular/core';\n@Component({ selector: 'app-tasks', templateUrl: './tasks.component.html' })\nexport class TasksComponent {\n  lists = signal<{ id: number; title: string; items: { done: boolean }[] }[]>([]);\n  selectedListId = signal<number | null>(null);\n  selected = computed(() => this.lists().find((l) => l.id === this.selectedListId()));\n  editing = signal(false);\n  title = 'Tasks';\n  form = { reset() {} };\n  days = Array.from({ length: 3 }, (_, i) => i + 1);\n  row = computed(() => 0);\n  nameInput = (value: string) => value;\n\n  get canSave(): boolean {\n    return this.lists().length > 0;\n  }\n  remainingItems(list: { items: { done: boolean }[] }): number {\n    return list.items.filter((i) => !i.done).length;\n  }\n  trackById(index: number, list: { id: number }): number {\n    return list.id;\n  }\n  displayFn(list: { title: string }): string {\n    return list.title;\n  }\n  format(value: string): string {\n    return value;\n  }\n  reset(): void {}\n  set(): void {}\n  legacy(): string {\n    return '';\n  }\n  quoted(): string {\n    return '';\n  }\n  save(): void {}\n}\n",
+            )
+            .file(
+                "src/app/tasks/tasks.component.html",
+                "<!-- {{ legacy() }} -->\n<h1 [title]=\"title\">{{ 'quoted()' }}</h1>\n<input #nameInput [value]=\"nameInput.value\" (blur)=\"selected() && save()\" />\n@if (editing()) {\n  <span>editing</span>\n}\n<ul>\n  @for (list of lists(); track trackById($index, list)) {\n    <li [class.active]=\"list.id === selectedListId()\" (click)=\"selectedListId.set(list.id)\">\n      {{ list.title | format }} <small>{{ remainingItems(list) }}</small>\n    </li>\n  }\n</ul>\n@for (row of [selected()]; track row) {\n  <b>{{ row?.title }}</b>\n}\n@for (day of days; track day) {\n  <i>{{ day }}</i>\n}\n<mat-autocomplete [displayWith]=\"displayFn\"></mat-autocomplete>\n<button [disabled]=\"!canSave\" (click)=\"form.reset()\">Reset</button>\n",
+            )
+            .index()
+    }
+
+    /// `Source -> kind target [edge kind (fnRef)] via @ registeredAt` for
+    /// every template edge `by` draws, sorted (upstream's `templateEdges`).
+    fn template_edges(graph: &Graph, by: &str) -> Vec<String> {
+        let mut out: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|edge| synthesized_by(edge) == by)
+            .map(|edge| {
+                let source = graph.node(&edge.source).expect("the source");
+                let target = graph.node(&edge.target).expect("the target");
+                let fn_ref = edge
+                    .metadata
+                    .get("fnRef")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                format!(
+                    "{} -> {} {} [{}{}] {} @ {}",
+                    source.name,
+                    target.kind,
+                    target.name,
+                    edge.kind,
+                    if fn_ref { " fnRef" } else { "" },
+                    edge.metadata["via"].as_str().unwrap_or("?"),
+                    edge.metadata["registeredAt"].as_str().unwrap_or("?"),
+                )
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// Upstream #2398 (`angular-router.test.ts`, "an Angular template's
+    /// bindings, indexed", its first three tests; the Steps half is the
+    /// viewer's): each binding's own-member call, and a callable it only
+    /// reads, links the component to the member at the binding's line, an
+    /// inline template's on its own line of the class's file; a field read,
+    /// a pipe, another object's member, a comment, a string and a name the
+    /// template declares link nothing; an event binding keeps the member it
+    /// links; and the members a template uses leave the dead-code list.
+    #[test]
+    fn pr2398_a_template_binding_links_the_member_it_calls() {
+        let project = upstream_bindings();
+        let graph = project.graph();
+        assert_eq!(
+            template_edges(graph, "angular-binding"),
+            [
+                "NavComponent -> property isOpen [calls] [class.open] @ src/app/nav/nav.component.ts:5",
+                // A getter runs when it is read.
+                "TasksComponent -> method canSave [calls] [disabled] @ src/app/tasks/tasks.component.html:21",
+                // A field a call filled is read, not called.
+                "TasksComponent -> method days [references] @for @ src/app/tasks/tasks.component.html:17",
+                // A function handed to a child is a function reference.
+                "TasksComponent -> method displayFn [references fnRef] [displayWith] @ src/app/tasks/tasks.component.html:20",
+                "TasksComponent -> method remainingItems [calls] {{ }} @ src/app/tasks/tasks.component.html:10",
+                "TasksComponent -> method trackById [calls] @for @ src/app/tasks/tasks.component.html:8",
+                // A signal is a field, and calling it reads it.
+                "TasksComponent -> property editing [calls] @if @ src/app/tasks/tasks.component.html:4",
+                "TasksComponent -> property lists [calls] @for @ src/app/tasks/tasks.component.html:8",
+                "TasksComponent -> property selectedListId [calls] [class.active] @ src/app/tasks/tasks.component.html:9",
+                "ThemeToggleComponent -> method icon [calls] [name] @ src/app/theme-toggle/theme-toggle.component.html:2",
+                "ThemeToggleComponent -> method label [calls] [attr.aria-label] @ src/app/theme-toggle/theme-toggle.component.html:1",
+            ],
+            "{}",
+            graph.report()
+        );
+        // An inline template's edge sits on its own line of the class's
+        // file.
+        let nav = graph
+            .nodes
+            .iter()
+            .find(|node| node.kind == "class" && node.name == "NavComponent")
+            .expect("NavComponent");
+        let is_open = graph
+            .edges
+            .iter()
+            .find(|edge| {
+                edge.source == nav.id
+                    && edge.kind == "calls"
+                    && graph
+                        .node(&edge.target)
+                        .is_some_and(|node| node.name == "isOpen")
+            })
+            .expect("NavComponent calls isOpen");
+        assert_eq!(is_open.line, Some(5));
+
+        let tasks = graph
+            .nodes
+            .iter()
+            .find(|node| node.kind == "class" && node.name == "TasksComponent")
+            .expect("TasksComponent");
+        let linked: Vec<&str> = graph
+            .edges
+            .iter()
+            .filter(|edge| {
+                edge.source == tasks.id && matches!(edge.kind.as_str(), "calls" | "references")
+            })
+            .filter_map(|edge| graph.node(&edge.target).map(|node| node.name.as_str()))
+            .collect();
+        for name in [
+            "title",
+            "format",
+            "reset",
+            "set",
+            "legacy",
+            "quoted",
+            "row",
+            "nameInput",
+        ] {
+            assert!(
+                !linked.contains(&name),
+                "{name} is linked\n{}",
+                graph.report()
+            );
+        }
+        // A member the event bindings already link keeps that edge:
+        // `selected()` is both.
+        assert_eq!(
+            template_edges(graph, "angular-event"),
+            [
+                "TasksComponent -> method save [calls] (blur) @ src/app/tasks/tasks.component.html:3",
+                "TasksComponent -> method selected [calls] (blur) @ src/app/tasks/tasks.component.html:3",
+                "ThemeToggleComponent -> method cycle [calls] (click) @ src/app/theme-toggle/theme-toggle.component.html:1",
+            ],
+            "{}",
+            graph.report()
+        );
+
+        let paths = codegraph_core::IndexPaths::resolve(project.root(), None).unwrap();
+        let store = codegraph_store::Store::open_for_read(
+            &paths,
+            std::time::Instant::now() + std::time::Duration::from_secs(30),
+            || false,
+        )
+        .expect("read the index");
+        let report = codegraph_graph::dead_code::build_dead_code_report(
+            &store,
+            &codegraph_graph::dead_code::DeadCodeQuery {
+                limit: 100,
+                ..Default::default()
+            },
+        )
+        .expect("the dead-code report");
+        let listed: Vec<&str> = report
+            .entries
+            .iter()
+            .map(|entry| entry.node.name.as_str())
+            .collect();
+        assert!(listed.contains(&"unused"), "{listed:?}");
+        for name in ["icon", "label", "remainingItems", "canSave"] {
+            assert!(!listed.contains(&name), "{name} is listed: {listed:?}");
+        }
+    }
+
+    /// A component links at most twenty-four routes: the `routerLink:`
+    /// fields its class writes count first, then its template's; a
+    /// repeated destination is skipped before it counts, and the
+    /// twenty-fifth on is dropped (upstream `MAX_LINKS_PER_COMPONENT`),
+    /// among the fields as among the template's links.
+    #[test]
+    fn w718d_a_component_links_at_most_twenty_four_routes() {
+        let routes: String = (0..30)
+            .map(|i| format!("  {{ path: 'p{i}', component: PageComponent }},\n"))
+            .collect();
+        let mut template = String::from("<a routerLink=\"/p0\">0</a>");
+        for i in 0..29 {
+            template.push_str(&format!("<a routerLink=\"/p{i}\">{i}</a>"));
+        }
+        // A menu the class builds of twenty-six entries, the first repeated.
+        let entries: Vec<String> = [0]
+            .into_iter()
+            .chain(0..26)
+            .map(|i| format!("{{ routerLink: '/p{i}' }}"))
+            .collect();
+        let menu = format!("  items = [{}];", entries.join(", "));
+        let project = Project::new()
+            .file(
+                "package.json",
+                "{\"dependencies\":{\"@angular/core\":\"^19.0.0\",\"@angular/router\":\"^19.0.0\"}}\n",
+            )
+            .file(
+                "src/app/app.routes.ts",
+                &format!(
+                    "import {{ Routes }} from '@angular/router';\nimport {{ PageComponent }} from './page/page.component';\nexport const routes: Routes = [\n{routes}];\n"
+                ),
+            )
+            .file(
+                "src/app/page/page.component.ts",
+                &component("PageComponent", "app-page", "<p>Page</p>", ""),
+            )
+            .file(
+                "src/app/nav/nav.component.ts",
+                &component("NavComponent", "app-nav", &template, "  tabs = [{ label: 'Last', routerLink: '/p29' }];"),
+            )
+            .file("src/app/menu/menu.component.ts", &component("MenuComponent", "app-menu", "<p>Menu</p>", &menu))
+            .index();
+        let graph = project.graph();
+        let mut expected: Vec<String> = (0..23)
+            .chain([29])
+            .map(|i| format!("NavComponent -> /p{i} (routerLink)"))
+            .chain((0..24).map(|i| format!("MenuComponent -> /p{i} (routerLink)")))
+            .collect();
+        expected.sort();
+        assert_eq!(navigations(graph), expected, "{}", graph.report());
+    }
+
+    /// The edge a `routerLink:` field of a class draws is written on the
+    /// field's own line (W7-18d's cost revision reads it from the class
+    /// body's line table).
+    #[test]
+    fn w718d_a_fields_link_is_written_on_the_fields_line() {
+        let project = Project::new()
+            .file(
+                "package.json",
+                "{\"dependencies\":{\"@angular/core\":\"^19.0.0\",\"@angular/router\":\"^19.0.0\"}}\n",
+            )
+            .file(
+                "src/app/app.routes.ts",
+                "import { Routes } from '@angular/router';\nimport { PageComponent } from './page/page.component';\nexport const routes: Routes = [\n  { path: 'a', component: PageComponent },\n  { path: 'b', component: PageComponent },\n];\n",
+            )
+            .file(
+                "src/app/page/page.component.ts",
+                &component("PageComponent", "app-page", "<p>Page</p>", ""),
+            )
+            .file(
+                "src/app/nav/nav.component.ts",
+                &component(
+                    "NavComponent",
+                    "app-nav",
+                    "<p>Nav</p>",
+                    "  title = 'Nav';\n  tabs = [\n    { label: 'A', routerLink: '/a' },\n    { label: 'B', routerLink: '/b' },\n  ];",
+                ),
+            )
+            .index();
+        let graph = project.graph();
+        let mut lines: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.kind == "navigates")
+            .map(|edge| {
+                let target = graph
+                    .node(&edge.target)
+                    .map_or("?", |node| node.name.as_str());
+                format!("{target} line {}", edge.line.unwrap_or(0))
+            })
+            .collect();
+        lines.sort();
+        // The class's lines: the imports, the decorator, `export class` on
+        // line 4, the constructor, `title`, `tabs = [`, then the fields.
+        assert_eq!(lines, ["/a line 8", "/b line 9"], "{}", graph.report());
+    }
+
+    /// A component whose `templateUrl` template binds `go()` to a click.
+    const READ_COMPONENT: &str = "import { Component } from '@angular/core';\n@Component({ selector: 'app-x', templateUrl: './x.component.html' })\nexport class XComponent {\n  go(): void {}\n}\n";
+
+    /// Its template.
+    const READ_TEMPLATE: &str = "<button (click)=\"go()\">Go</button>\n";
+
+    /// The project around [`READ_COMPONENT`], its template at `template` if
+    /// any, with `extra` files.
+    fn read_project(template: Option<&str>, extra: &[(&str, &str)]) -> Project {
+        let mut project = Project::new()
+            .file(
+                "package.json",
+                "{\"dependencies\":{\"@angular/core\":\"^19.0.0\"}}",
+            )
+            .file("src/app/x/x.component.ts", READ_COMPONENT);
+        if let Some(path) = template {
+            project = project.file(path, READ_TEMPLATE);
+        }
+        for (path, contents) in extra {
+            project = project.file(path, contents);
+        }
+        project
+    }
+
+    /// The `angular-event` edges, `source -> target`.
+    fn event_edges(graph: &Graph) -> Vec<String> {
+        template_edges(graph, "angular-event")
+    }
+
+    /// OD-B18: a `templateUrl` template the index does not hold is read
+    /// beside it within the scan's scope and recorded with its hash; one the
+    /// configuration excludes, the root `.gitignore` ignores, one reached
+    /// through a symbolic link, or larger than `indexing.max_file_size` is
+    /// not read and recorded as null, one that is not there as null, and one
+    /// that would leave the project root is neither read nor recorded.
+    #[test]
+    fn w718d_a_template_file_is_read_beside_the_index_in_the_scan_scope() {
+        let edge = "XComponent -> method go [calls] (click) @ src/app/x/x.component.html:1";
+        let project = read_project(Some("src/app/x/x.component.html"), &[]).index();
+        assert_eq!(
+            event_edges(project.graph()),
+            [edge],
+            "{}",
+            project.graph().report()
+        );
+        assert_eq!(
+            inputs_row(&project),
+            serde_json::json!({
+                "src/app/x/x.component.html": codegraph_core::node_id::hash_content(READ_TEMPLATE),
+            })
+        );
+
+        let missing = read_project(None, &[]).index();
+        assert!(
+            event_edges(missing.graph()).is_empty(),
+            "{}",
+            missing.graph().report()
+        );
+        assert_eq!(
+            inputs_row(&missing),
+            serde_json::json!({ "src/app/x/x.component.html": null })
+        );
+
+        let excluded = read_project(
+            Some("src/app/x/x.component.html"),
+            &[(
+                ".codegraph/config.toml",
+                "[app]\nname = \"probe\"\n\n[indexing]\nexclude = [\"src/app/x/x.component.html\"]\n",
+            )],
+        )
+        .index();
+        assert!(
+            event_edges(excluded.graph()).is_empty(),
+            "{}",
+            excluded.graph().report()
+        );
+        assert_eq!(
+            inputs_row(&excluded),
+            serde_json::json!({ "src/app/x/x.component.html": null })
+        );
+
+        let ignored = read_project(
+            Some("src/app/x/x.component.html"),
+            &[(".gitignore", "*.html\n")],
+        )
+        .index();
+        assert!(
+            event_edges(ignored.graph()).is_empty(),
+            "{}",
+            ignored.graph().report()
+        );
+        assert_eq!(
+            inputs_row(&ignored),
+            serde_json::json!({ "src/app/x/x.component.html": null })
+        );
+
+        let large = format!("{READ_TEMPLATE}<!-- {} -->\n", "x".repeat(512));
+        assert!(READ_COMPONENT.len() < 400 && large.len() > 400);
+        let over = read_project(
+            None,
+            &[
+                (
+                    ".codegraph/config.toml",
+                    "[app]\nname = \"probe\"\n\n[indexing]\nmax_file_size = 400\n",
+                ),
+                ("src/app/x/x.component.html", &large),
+            ],
+        )
+        .index();
+        assert!(
+            event_edges(over.graph()).is_empty(),
+            "{}",
+            over.graph().report()
+        );
+        assert_eq!(
+            inputs_row(&over),
+            serde_json::json!({ "src/app/x/x.component.html": null })
+        );
+
+        let escaping = Project::new()
+            .file(
+                "package.json",
+                "{\"dependencies\":{\"@angular/core\":\"^19.0.0\"}}",
+            )
+            .file(
+                "x.component.ts",
+                &READ_COMPONENT.replace("./x.component.html", "../x.component.html"),
+            );
+        let outside = escaping.root().parent().expect("the project's parent");
+        std::fs::write(outside.join("x.component.html"), READ_TEMPLATE)
+            .expect("write ../x.component.html");
+        let escaping = escaping.index();
+        assert!(
+            event_edges(escaping.graph()).is_empty(),
+            "{}",
+            escaping.graph().report()
+        );
+        assert_eq!(
+            inputs_row(&escaping),
+            serde_json::json!({}),
+            "an escaping path is not recorded"
+        );
+    }
+
+    /// OD-B18: a template reached through a symbolic link is not read, as
+    /// the scan reads no link it has not followed.
+    #[cfg(unix)]
+    #[test]
+    fn w718d_a_template_through_a_link_is_not_read() {
+        let project = read_project(Some("templates/x.component.html"), &[]);
+        std::os::unix::fs::symlink(
+            "../../../templates/x.component.html",
+            project.root().join("src/app/x/x.component.html"),
+        )
+        .expect("link the template");
+        let project = project.index();
+        assert!(
+            event_edges(project.graph()).is_empty(),
+            "{}",
+            project.graph().report()
+        );
+        assert_eq!(
+            inputs_row(&project),
+            serde_json::json!({ "src/app/x/x.component.html": null })
+        );
+    }
+
+    /// OD-B18: a template `codegraph.json` maps to an indexed language is an
+    /// indexed file, read as the index holds it and not recorded beside it.
+    #[test]
+    fn w718d_a_template_the_index_holds_is_read_as_it_holds_it() {
+        let project = read_project(
+            Some("src/app/x/x.component.html"),
+            &[(
+                ".codegraph/codegraph.json",
+                "{\"extensions\":{\".html\":\"javascript\"}}\n",
+            )],
+        )
+        .index();
+        let graph = project.graph();
+        assert!(
+            graph
+                .files
+                .iter()
+                .any(|file| file.path == "src/app/x/x.component.html"),
+            "the template is an indexed file\n{}",
+            graph.report()
+        );
+        assert_eq!(
+            event_edges(graph),
+            ["XComponent -> method go [calls] (click) @ src/app/x/x.component.html:1"],
+            "{}",
+            graph.report()
+        );
+        assert_eq!(inputs_row(&project), serde_json::json!({}));
+    }
+
+    /// The `synthesis_unindexed_inputs` row of `project`'s index.
+    #[track_caller]
+    fn inputs_row(project: &super::support::Indexed) -> serde_json::Value {
+        let rows = super::support::project_metadata_with_prefix(
+            &project.db(),
+            "synthesis_unindexed_inputs",
+        );
+        let [(key, value)] = rows.as_slice() else {
+            panic!("one synthesis_unindexed_inputs row: {rows:?}");
+        };
+        assert_eq!(key, "synthesis_unindexed_inputs");
+        serde_json::from_str(value).expect("the row is JSON")
     }
 }
 
@@ -24080,7 +24795,7 @@ mod synthesis {
         assert_eq!((edge.line, edge.col), (Some(7), None), "{edge:?}");
         assert_eq!(
             project_metadata_with_prefix(&project.db(), "synthesis_version"),
-            [("synthesis_version".to_string(), "16".to_string())]
+            [("synthesis_version".to_string(), "17".to_string())]
         );
     }
 

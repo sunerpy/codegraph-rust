@@ -69,6 +69,7 @@
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::rc::Rc;
 use std::sync::{Arc, OnceLock};
 
 use codegraph_core::types::{EdgeKind, Language, Node, NodeKind};
@@ -80,8 +81,9 @@ use super::js_scan::{
     top_level_objects,
 };
 use super::route_href::{
-    ExactTable, HOLE, HrefLiteral, Literal, RouteEntry, app_root_for, destinations_for_href,
-    first_argument_text, nth_argument_text, parse_href, read_string_at, to_href,
+    ExactTable, HOLE, HrefLiteral, LinkRoutes, Literal, RouteEntry, app_root_for,
+    destinations_for_href, first_argument_text, nth_argument_text, parse_href, read_string_at,
+    to_href,
 };
 use super::sveltekit_router::leaves_the_site;
 use crate::framework::{FrameworkExtractionContext, FrameworkResolver, NavigationCalls};
@@ -984,11 +986,22 @@ fn lazy_reference(name: &str) -> Option<(&str, Option<&str>)> {
 // The cross-file pass: mounts and constant paths
 // =============================================================================
 
+/// What a [`ConstantReader`] keeps for each pair of strings.
+type PairMemo<V> = RefCell<HashMap<(String, String), V>>;
+
 /// What the cross-file pass reads while it names one pass's routes: the
 /// constants it looked up, by the file they were read from.
 struct ConstantReader<'c> {
     context: &'c dyn ResolutionContext,
-    memo: RefCell<HashMap<(String, String), Option<String>>>,
+    memo: PairMemo<Option<String>>,
+    /// The patterns the reads build from a name, by their text, each
+    /// compiled once in the reader's life (W7-18d's cost revision: compiled
+    /// at every read, they were most of the Angular pass's time).
+    patterns: RefCell<HashMap<String, Rc<Regex>>>,
+    /// Each (root, declaring file)'s declaring source, comments blanked.
+    declared: PairMemo<Option<Rc<str>>>,
+    /// Each (name, file)'s [`declaring_file`].
+    declaring: PairMemo<Option<String>>,
 }
 
 impl<'c> ConstantReader<'c> {
@@ -996,7 +1009,48 @@ impl<'c> ConstantReader<'c> {
         Self {
             context,
             memo: RefCell::new(HashMap::new()),
+            patterns: RefCell::new(HashMap::new()),
+            declared: RefCell::new(HashMap::new()),
+            declaring: RefCell::new(HashMap::new()),
         }
+    }
+
+    /// `source` compiled, once per reader.
+    fn pattern(&self, source: String) -> Rc<Regex> {
+        if let Some(found) = self.patterns.borrow().get(&source) {
+            return Rc::clone(found);
+        }
+        let compiled = Rc::new(regex(&source));
+        self.patterns
+            .borrow_mut()
+            .insert(source, Rc::clone(&compiled));
+        compiled
+    }
+
+    /// [`declaring_file`], once per (name, file).
+    fn declaring_file(&self, name: &str, from_file: &str) -> Option<String> {
+        let key = (name.to_string(), from_file.to_string());
+        if let Some(found) = self.declaring.borrow().get(&key) {
+            return found.clone();
+        }
+        let found = declaring_file(name, from_file, self.context);
+        self.declaring.borrow_mut().insert(key, found.clone());
+        found
+    }
+
+    /// The source declaring `root` as `file` leads to it
+    /// ([`Self::declaration_source`]), comments blanked, once per (root,
+    /// file).
+    fn declared_source(&self, root: &str, file: &str) -> Option<Rc<str>> {
+        let key = (root.to_string(), file.to_string());
+        if let Some(found) = self.declared.borrow().get(&key) {
+            return found.clone();
+        }
+        let found = self
+            .declaration_source(root, file, 0)
+            .map(|content| Rc::from(strip_js_comments_keeping_offsets(&content).as_str()));
+        self.declared.borrow_mut().insert(key, found.clone());
+        found
     }
 
     /// The source text a constant member chain names, read from the file its
@@ -1036,18 +1090,17 @@ impl<'c> ConstantReader<'c> {
         if root.is_empty() || chain.is_empty() {
             return None;
         }
-        let file = declaring_file(root, from_file, self.context)?;
-        let content = self.declaration_source(root, &file, 0)?;
-        let safe = strip_js_comments_keeping_offsets(&content);
+        let file = self.declaring_file(root, from_file)?;
+        let safe = self.declared_source(root, &file)?;
         let name = regex::escape(root);
-        let declared = regex(&format!(
+        let declared = self.pattern(format!(
             r"(?-u:\b)(?:const|let){s}+{name}{s}*(?::[^=]+)?={s}*\{{",
             s = JS_SPACE
         ));
         if let Some(decl) = declared.find(&safe) {
             return read_chain(&safe, decl.end() - 1, chain);
         }
-        let enumerated = regex(&format!(r"(?-u:\b)enum{s}+{name}{s}*\{{", s = JS_SPACE));
+        let enumerated = self.pattern(format!(r"(?-u:\b)enum{s}+{name}{s}*\{{", s = JS_SPACE));
         if let Some(decl) = enumerated.find(&safe) {
             // `enum Paths { Board = 'board' }`
             let [member] = chain else {
@@ -1056,14 +1109,14 @@ impl<'c> ConstantReader<'c> {
             let open = decl.end() - 1;
             let close = match_bracket(&safe, open).unwrap_or(open).max(open);
             let body = &safe[open..close];
-            let value = regex(&format!(
+            let value = self.pattern(format!(
                 r#"(?-u:\b){member}{s}*={s}*(['"`][^'"`]*['"`])"#,
                 member = regex::escape(member),
                 s = JS_SPACE
             ));
             return value.captures(body).map(|caps| caps[1].to_string());
         }
-        let class = regex(&format!(
+        let class = self.pattern(format!(
             r"(?-u:\b)class{s}+{name}(?-u:\b)[^{{]*\{{",
             s = JS_SPACE
         ));
@@ -1074,7 +1127,7 @@ impl<'c> ConstantReader<'c> {
         let close = match_bracket(&safe, open).filter(|close| *close > open)?;
         let body = &safe[open..close];
         let (first, rest) = chain.split_first()?;
-        let field = regex(&format!(
+        let field = self.pattern(format!(
             r"(?-u:\b)static{s}+(?:readonly{s}+)?{member}{s}*(?::[^=;]+)?={s}*",
             member = regex::escape(first),
             s = JS_SPACE
@@ -1104,7 +1157,7 @@ impl<'c> ConstantReader<'c> {
     fn declaration_source(&self, root: &str, file: &str, hops: usize) -> Option<Arc<str>> {
         let content = self.context.read_file_shared(file)?;
         let name = regex::escape(root);
-        let declares = regex(&format!(
+        let declares = self.pattern(format!(
             r"(?-u:\b)(?:const|let|class|enum){s}+{name}(?-u:\b)",
             s = JS_SPACE
         ));
@@ -1114,7 +1167,7 @@ impl<'c> ConstantReader<'c> {
         if hops >= MAX_DECLARATION_HOPS {
             return None;
         }
-        let names_root = regex(&format!(r"(?-u:\b){name}(?-u:\b)"));
+        let names_root = self.pattern(format!(r"(?-u:\b){name}(?-u:\b)"));
         for clause in re_export_clause().captures_iter(&content) {
             if &clause[1] != "*" && !names_root.is_match(&clause[1]) {
                 continue;
@@ -1160,7 +1213,7 @@ impl<'c> ConstantReader<'c> {
                 }
             }
         }
-        let simple = regex(&format!(
+        let simple = self.pattern(format!(
             r"(?-u:\b)(?:const|let){s}+{name}{s}*={s}*([A-Za-z_$][A-Za-z0-9_$]*(?:{s}*\.{s}*[A-Za-z_$][A-Za-z0-9_$]*)+){s}*;",
             name = regex::escape(root),
             s = JS_SPACE
@@ -1509,7 +1562,13 @@ pub(crate) fn commands_href(text: &str, from_root: bool) -> Option<HrefLiteral> 
 
 /// A class property's initializer, read from the class's own lines:
 /// `routerLinkAbout = publicRoutes.about.routerLink;` (`propertyInitializer`).
-fn property_initializer(owner: &Node, name: &str, content: &str) -> Option<String> {
+/// The pattern for `name` comes from `constants`, compiled once per reader.
+fn property_initializer(
+    owner: &Node,
+    name: &str,
+    content: &str,
+    constants: &ConstantReader<'_>,
+) -> Option<String> {
     let first = usize::try_from(owner.start_line - 1).ok()?;
     let last = usize::try_from(owner.end_line).ok()?;
     let body = content
@@ -1518,7 +1577,7 @@ fn property_initializer(owner: &Node, name: &str, content: &str) -> Option<Strin
         .take(last.saturating_sub(first))
         .collect::<Vec<_>>()
         .join("\n");
-    let decl = regex(&format!(
+    let decl = constants.pattern(format!(
         r"(?:^|{s}|[;{{])(?:(?:public|private|protected|readonly|static|override){s}+)*{name}{s}*(?::[^=;\n]+)?={s}*",
         name = regex::escape(name),
         s = JS_SPACE
@@ -1657,7 +1716,7 @@ fn destination_of(
     if let Some(owner) = owner
         && (text.starts_with("this") || parts.len() == 1)
         && let Some(content) = constants.context.read_file_shared(file)
-        && let Some(init) = property_initializer(owner, &parts[0], &content)
+        && let Some(init) = property_initializer(owner, &parts[0], &content, constants)
     {
         let expr = match parts.as_slice() {
             [_] => init,
@@ -1937,6 +1996,82 @@ fn angular_table(context: &dyn ResolutionContext) -> Arc<AngularTable> {
     context
         .route_tables()
         .get_or_build("angular-router", || AngularTable::build(context))
+}
+
+impl LinkRoutes for AngularTable {
+    fn is_empty(&self) -> bool {
+        self.by_root.values().all(|app| app.exact.is_empty())
+    }
+
+    fn serves(&self, file: &str) -> bool {
+        self.routes_for(file)
+            .is_some_and(|app| !app.exact.is_empty())
+    }
+
+    fn destinations<'h>(
+        &self,
+        file: &str,
+        href: &'h HrefLiteral,
+    ) -> Vec<(Arc<Node>, &'h HrefLiteral)> {
+        match self.routes_for(file) {
+            Some(app) if !app.exact.is_empty() => {
+                destinations_for_href(href, &app.exact, &app.dynamic, file)
+            }
+            _ => Vec::new(),
+        }
+    }
+}
+
+/// The Angular routes a component's `routerLink` reaches, in its own app as
+/// a navigation call's are (`angularRoutesFor`; W7-18d).
+pub(crate) fn angular_link_routes(context: &dyn ResolutionContext) -> Arc<dyn LinkRoutes> {
+    angular_table(context)
+}
+
+/// The destinations a component's `[routerLink]` bindings and `routerLink:`
+/// fields name (W7-18d), read as a navigation call's argument is
+/// ([`angular_destination`], the constants each file is read for kept for
+/// the pass), but not from the root (upstream's default): a template's
+/// `['edit']` is relative to the component. KEEP-RUST, as a call's: only
+/// [`navigable_arms`] are matched.
+pub(crate) struct LinkDestinations<'c> {
+    constants: ConstantReader<'c>,
+}
+
+impl<'c> LinkDestinations<'c> {
+    pub(crate) fn new(context: &'c dyn ResolutionContext) -> Self {
+        Self {
+            constants: ConstantReader::new(context),
+        }
+    }
+
+    /// Where `expr`, written in `file` within the class `owner`, leads.
+    pub(crate) fn of(&self, expr: &str, file: &str, owner: &Node) -> Option<HrefLiteral> {
+        let href = angular_destination(expr, file, Some(owner), &self.constants, 0, false)?;
+        navigable_arms(&href)
+    }
+}
+
+/// Where a plain `routerLink="…"` leads (`plainHref`): its text, each
+/// interpolation a hole, when it starts with `/`: `/profile/{{ name }}` is
+/// `/profile/${…}`. KEEP-RUST, as a call's: only [`navigable_arms`] are
+/// matched, so `//host/x` is no link of this app.
+pub(crate) fn plain_link_destination(value: &str) -> Option<HrefLiteral> {
+    let mut with_holes = String::new();
+    let mut rest = js_trim(value);
+    while let Some(open) = rest.find("{{") {
+        let Some(close) = rest[open + 2..].find("}}") else {
+            break;
+        };
+        with_holes.push_str(&rest[..open]);
+        with_holes.push(HOLE);
+        rest = &rest[open + 2 + close + 2..];
+    }
+    with_holes.push_str(rest);
+    if !with_holes.starts_with('/') {
+        return None;
+    }
+    navigable_arms(&names_somewhere(to_href(Some(with_holes))?)?)
 }
 
 /// The navigation calls Angular binds to its routes: a route answers the
@@ -3029,6 +3164,76 @@ mod tests {
         );
         let ctx = project(&[("src/loop.routes.ts", &looped)], &[]);
         assert_eq!(named(&ctx, "src/loop.routes.ts"), ["/{a.x}"]);
+    }
+
+    /// One reader reads constant after constant (W7-18d's cost revision
+    /// keeps its compiled patterns, declaring sources and declaring files
+    /// for its life): two members of one enum, a root two files each
+    /// declare, and a root two files import from different modules are each
+    /// read for themselves, in either order, as a fresh reader reads them.
+    #[test]
+    fn one_reader_reads_each_constant_for_itself() {
+        let ctx = RouteCtx::default()
+            .file(
+                "src/a/paths.ts",
+                "export enum Paths { Board = 'board', Lyrics = 'lyrics' }\nexport const shared = { home: { path: 'a-home' } };\n",
+            )
+            .file(
+                "src/b/paths.ts",
+                "export const shared = { home: { path: 'b-home' } };\n",
+            )
+            .file(
+                "src/a/app.routes.ts",
+                "import { Paths, shared } from './paths';\nconst local = { path: 'a-local' };\n",
+            )
+            .file(
+                "src/b/app.routes.ts",
+                "import { shared } from './paths';\nconst local = { path: 'b-local' };\n",
+            );
+        let reads = [
+            ("Paths.Board", "src/a/app.routes.ts", "board"),
+            ("Paths.Lyrics", "src/a/app.routes.ts", "lyrics"),
+            ("local.path", "src/a/app.routes.ts", "a-local"),
+            ("local.path", "src/b/app.routes.ts", "b-local"),
+            ("shared.home.path", "src/a/app.routes.ts", "a-home"),
+            ("shared.home.path", "src/b/app.routes.ts", "b-home"),
+        ];
+        for (expr, file, value) in reads {
+            let fresh = ConstantReader::new(&ctx).constant_value(expr, file);
+            assert_eq!(fresh.as_deref(), Some(value), "{expr} in {file}");
+        }
+        let forward: Vec<_> = reads.to_vec();
+        let backward: Vec<_> = reads.iter().rev().copied().collect();
+        for order in [forward, backward] {
+            let reader = ConstantReader::new(&ctx);
+            for (expr, file, value) in order {
+                assert_eq!(
+                    reader.constant_value(expr, file).as_deref(),
+                    Some(value),
+                    "{expr} in {file}"
+                );
+            }
+        }
+    }
+
+    /// Two properties of one class lead where their own initializers say,
+    /// read through one reader, again and in either spelling (W7-18d's cost
+    /// revision compiles the pattern for a property's name once per reader).
+    #[test]
+    fn each_property_of_a_class_leads_where_its_initializer_says() {
+        let file = "src/app/nav.component.ts";
+        let ctx = RouteCtx::default().file(
+            file,
+            "export class NavComponent {\n  routerLinkAbout = ['/about'];\n  public routerLinkHome = ['/home'];\n}\n",
+        );
+        let mut owner = class_node("NavComponent", file, 1);
+        owner.end_line = 4;
+        let destinations = LinkDestinations::new(&ctx);
+        let path = |expr: &str| destinations.of(expr, file, &owner).map(|href| href.path);
+        assert_eq!(path("routerLinkAbout").as_deref(), Some("/about"));
+        assert_eq!(path("this.routerLinkHome").as_deref(), Some("/home"));
+        assert_eq!(path("this.routerLinkAbout").as_deref(), Some("/about"));
+        assert_eq!(path("routerLinkHome").as_deref(), Some("/home"));
     }
 
     /// `files` indexed as a sync leaves them: each file's routes renamed

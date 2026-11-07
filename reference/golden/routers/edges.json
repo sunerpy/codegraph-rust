@@ -659,6 +659,37 @@
   },
   {
     "col": null,
+    "kind": "calls",
+    "line": 6,
+    "metadata": {
+      "registeredAt": "apps/angular/src/app/home/home.component.ts:6",
+      "synthesizedBy": "angular-binding",
+      "via": "{{ }}"
+    },
+    "provenance": "heuristic",
+    "source": "class:49a64bdaf5b8db2e9dbf283b51dba375",
+    "target": "method:c5210b38e25411979ea6f1cdf5a07a43"
+  },
+  {
+    "col": null,
+    "kind": "calls",
+    "line": 6,
+    "metadata": {
+      "registeredAt": "apps/angular/src/app/home/home.component.ts:6",
+      "synthesizedBy": "angular-event",
+      "trigger": {
+        "kind": "prop",
+        "name": "(click)",
+        "of": "button"
+      },
+      "via": "(click)"
+    },
+    "provenance": "heuristic",
+    "source": "class:49a64bdaf5b8db2e9dbf283b51dba375",
+    "target": "method:bbc2c93e3330c7a866ecaf686ba2f83b"
+  },
+  {
+    "col": null,
     "kind": "contains",
     "line": null,
     "metadata": null,
