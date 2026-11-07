@@ -477,6 +477,20 @@ pub trait ResolutionContext {
     fn read_file_shared(&self, file_path: &str) -> Option<Arc<str>> {
         self.read_file(file_path).map(Arc::from)
     }
+    /// The files among `files` whose source text contains `needle`, in
+    /// `files`' order: the ones [`Self::read_file_shared`] reads and
+    /// `str::contains` keeps. A context that reads files itself may read the
+    /// ones it has not cached in parallel.
+    fn files_containing(&self, files: &[String], needle: &str) -> Vec<String> {
+        files
+            .iter()
+            .filter(|file| {
+                self.read_file_shared(file)
+                    .is_some_and(|content| content.contains(needle))
+            })
+            .cloned()
+            .collect()
+    }
     /// Lazily derived facts about `file_path`'s source text, shared by the
     /// resolver's text-scanning gates. Contexts that live for one resolution
     /// pass cache one [`SourceFacts`] per file so every view — and every

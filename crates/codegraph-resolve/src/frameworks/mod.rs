@@ -1,12 +1,12 @@
 //! Concrete [`FrameworkResolver`] implementations + the detection registry.
 //!
 //! Ports the subset of `upstream resolution/frameworks/` that this port
-//! ships: React ([`react`]), React Router ([`react_router`]), TanStack Router
-//! ([`tanstack_router`]), Next.js ([`nextjs`]), Svelte and SvelteKit
-//! ([`svelte`], [`sveltekit_router`]), Vue Router ([`vue_router`]),
-//! Angular Router ([`angular_router`]), Expo Router ([`expo_router`]), Vue
-//! and Nuxt ([`vue`]), NestJS
-//! ([`nestjs`]), Godot ([`godot`]), Tauri ([`tauri`]) and GoFrame
+//! ships: Express ([`express`]), React ([`react`]), React Router
+//! ([`react_router`]), TanStack Router ([`tanstack_router`]), Next.js
+//! ([`nextjs`]), Svelte and SvelteKit ([`svelte`], [`sveltekit_router`]),
+//! Vue Router ([`vue_router`]), Angular Router ([`angular_router`]), Astro
+//! ([`astro`]), Expo Router ([`expo_router`]), Vue and Nuxt ([`vue`]),
+//! NestJS ([`nestjs`]), Godot ([`godot`]), Tauri ([`tauri`]) and GoFrame
 //! ([`goframe`]). The other upstream resolvers remain deferred (see
 //! `KNOWN_DIFFS.md`).
 //!
@@ -17,7 +17,9 @@
 //! the upstream runs them (`index.ts:695-701`).
 
 pub mod angular_router;
+pub mod astro;
 pub mod expo_router;
+pub mod express;
 pub mod godot;
 pub(crate) mod godot_common;
 pub mod godot_dsl_config;
@@ -50,19 +52,30 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Detect which of the ported frameworks a project uses
 /// (`detectFrameworks`, `frameworks/index.ts:90-98`, restricted to the ported
-/// resolvers). The first three keep upstream's `FRAMEWORK_RESOLVERS` order
-/// (nestjs, react, vue); later ports are appended, so the first resolver to
-/// return `>= 0.9` for a reference that resolved before never changes.
+/// resolvers).
+///
+/// Strategy 1 asks these in order: the first to return `>= 0.9` wins, and
+/// among lower answers the most confident, the earlier on a tie. Each port
+/// sits where upstream's `FRAMEWORK_RESOLVERS` puts it relative to its
+/// ported neighbours (Express before NestJS, Astro between Angular Router
+/// and Expo Router); the entries already here keep their places. A port
+/// placed ahead of others must not take a reference they resolved before:
+/// it answers below `0.9`, or only for references they do not claim.
 pub fn detect_frameworks(context: &dyn ResolutionContext) -> Vec<Box<dyn FrameworkResolver>> {
     let candidates: Vec<Box<dyn FrameworkResolver>> = vec![
+        // Express routes and mounts (#1957, #2200, #2243, #2244, #2261),
+        // first as upstream registers it. Its three name patterns answer
+        // `0.8` or `0.85`, never `>= 0.9`, and only with a declaration of the
+        // reference's own file: ahead of the others it decides a reference
+        // only on a confidence tie, as upstream's order does.
+        Box::new(express::ExpressResolver),
         Box::new(nestjs::NestjsResolver),
         Box::new(react::ReactResolver),
         Box::new(vue::VueResolver),
         Box::new(godot::GodotResolver),
-        // APPENDED LAST on purpose: Strategy 1 iterates this `Vec` in order
-        // (`resolver.rs:1103`), so the first resolver to return `>= 0.9` for any
-        // PRE-EXISTING reference must not change. A new candidate at the front
-        // could pre-empt one of the four above.
+        // Tauri is not upstream's. Strategy 1 must not hand it a reference
+        // one of the resolvers above resolved before it came, so it stays
+        // after them.
         Box::new(tauri::TauriResolver::default()),
         // Nuxt's file routes, in a Nuxt app only (upstream #2130). Upstream
         // runs it right after Vue; it claims only its own routes' `calls`
@@ -101,6 +114,13 @@ pub fn detect_frameworks(context: &dyn ResolutionContext) -> Vec<Box<dyn Framewo
         // layout references, and `router.navigate`-style calls only where
         // they name one of its own routes.
         Box::new(angular_router::AngularRouterResolver),
+        // Astro's file routes, its `Astro` global and `astro:*` modules, and
+        // components named in Astro markup (#2245, #2267), after Angular
+        // Router and before Expo Router as upstream orders them. Its `1.0`
+        // answers claim only names that are Astro's own (`Astro.props`,
+        // `astro:content`), and its page routes' `calls` land on their own
+        // file's component.
+        Box::new(astro::AstroResolver),
         // Expo Router screens and navigation (F2), after Next.js as upstream
         // registers it. It claims navigation calls only where their href
         // names one of its own screens.
@@ -133,6 +153,16 @@ pub(crate) fn js_language_for(file_path: &str) -> Language {
     } else {
         Language::JavaScript
     }
+}
+
+/// The one item `items` holds, or `None` when it holds none or several: a
+/// framework heuristic's tier resolves only through its sole candidate, and
+/// an ambiguous tier proposes nothing, leaving the reference to the other
+/// strategies.
+pub(crate) fn sole<T>(items: impl IntoIterator<Item = T>) -> Option<T> {
+    let mut items = items.into_iter();
+    let first = items.next()?;
+    items.next().is_none().then_some(first)
 }
 
 /// Current epoch millis for a framework node's `updatedAt` (`Date.now()`).

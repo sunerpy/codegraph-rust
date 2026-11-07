@@ -822,8 +822,28 @@
   {
     "candidates": null,
     "col": 2,
+    "file_path": "express/app.js",
+    "from_node_id": "route:express/app.js:12:GET:/health",
+    "language": "javascript",
+    "line": 13,
+    "reference_kind": "calls",
+    "reference_name": "res.json"
+  },
+  {
+    "candidates": null,
+    "col": 2,
     "file_path": "express/routes/users.js",
     "from_node_id": "file:express/routes/users.js",
+    "language": "javascript",
+    "line": 10,
+    "reference_kind": "calls",
+    "reference_name": "res.json"
+  },
+  {
+    "candidates": null,
+    "col": 2,
+    "file_path": "express/routes/users.js",
+    "from_node_id": "route:express/routes/users.js:9:GET:/users/:id",
     "language": "javascript",
     "line": 10,
     "reference_kind": "calls",
