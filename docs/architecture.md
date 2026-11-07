@@ -407,7 +407,7 @@ render, `calls` for a call or a getter and `references` for another method,
 `fnRef` for a function handed over (`angular-binding`, with `via`, the
 binding); and a `navigates` edge to each route of the component's app that
 a `routerLink:` field of the class or a `routerLink` of the template names,
-read as a navigation call's destination is and a plain link's `{{ … }}` a
+read as a navigation call's destination is and a plain link's <span v-pre>`{{ … }}`</span> a
 hole (`angular-router-link`, with `href` and `navMethod` `routerLink`), at
 most 24 a component, the fields first. A pair already drawn is not counted
 again. Each edge carries `registeredAt`, where in the template, or for a

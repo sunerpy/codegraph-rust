@@ -151,7 +151,7 @@ for a `routerLink:` field the class, writes it at: an `angular-template`
 `calls` edge to a method, with `via`, the event (`(click)`), and `trigger`,
 `{"kind": "prop", "name": "(click)", "of": "button"}` with the element the
 binding is written on; an `angular-binding` `calls` or `references` edge to
-a member, with `via`, the binding as written (`[name]`, `{{ }}`, `*ngIf`,
+a member, with `via`, the binding as written (`[name]`, <span v-pre>`{{ }}`</span>, `*ngIf`,
 `@if`, `@let`) and `fnRef: true` for a function handed over; and an
 `angular-router-link` `navigates` edge to a route, with `href`, `navMethod`
 `routerLink` and, for a template's link, `template: true`.
