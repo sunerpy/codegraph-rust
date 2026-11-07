@@ -24700,6 +24700,525 @@ mod explore_flow {
     }
 }
 
+/// Explore's dynamic-dispatch links among the named symbols (W7-26):
+/// upstream's `explore-synth-link-endpoints`, `explore-synth-constant-
+/// endpoints` and #687 tests (`e8ddc4e2`), through `codegraph explore`.
+mod explore_synth_links {
+    use super::support::{Indexed, Project, codegraph, synthesized_targets_in_row_order};
+
+    const SECTION: &str = "**Dynamic-dispatch links among your symbols**";
+
+    /// What `codegraph explore` prints for `query`.
+    fn explore(root: &std::path::Path, query: &str) -> String {
+        let output = codegraph(root, ["explore", query, "-p", "."]);
+        String::from_utf8(output.stdout).expect("explore prints UTF-8")
+    }
+
+    /// The `- a → b   [...]` lines of the links section (upstream's
+    /// `linkLines`).
+    fn link_lines(text: &str) -> Vec<String> {
+        let Some(at) = text.find(SECTION) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for line in text[at + SECTION.len()..].lines() {
+            if line.starts_with("- ") {
+                out.push(line.to_string());
+            } else if !out.is_empty() {
+                break;
+            }
+        }
+        out
+    }
+
+    /// The Flow section, up to the links section (upstream's
+    /// `flowSection`).
+    fn flow_section(text: &str) -> &str {
+        let Some(at) = text.find("**Flow (call path") else {
+            return "";
+        };
+        match text[at..].find(SECTION) {
+            Some(end) => &text[at..at + end],
+            None => &text[at..],
+        }
+    }
+
+    /// The owner of a link's target: `Square` in `- Shape.area →
+    /// Square.area   [...]`.
+    fn target_owner(line: &str) -> &str {
+        let target = line.split(" → ").nth(1).expect("a link has an arrow");
+        target.split('.').next().expect("the target has an owner")
+    }
+
+    /// Upstream's `indexShapes`: `Shape.area` with one implementation per
+    /// name. `Circle.area` calls `scale`, so `report → Shape.area →
+    /// Circle.area → scale` is the longest chain among the query's symbols
+    /// and the Flow runs through Circle, never through the implementation
+    /// the query names. `doubles` go in `fakes/<name>.test.ts`.
+    fn shapes(implementations: &[&str], doubles: &[&str]) -> Project {
+        let mut project = Project::new()
+            .file("shape.ts", "export interface Shape {\n  area(): number;\n}\n")
+            .file(
+                "scale.ts",
+                "export function scale(n: number): number {\n  return n * 2;\n}\n",
+            )
+            .file(
+                "report.ts",
+                "import type { Shape } from './shape';\n\nexport function report(shape: Shape): number {\n  return shape.area();\n}\n",
+            )
+            .file(
+                "circle.ts",
+                "import type { Shape } from './shape';\nimport { scale } from './scale';\n\nexport class Circle implements Shape {\n  area(): number {\n    return scale(3);\n  }\n}\n",
+            );
+        for name in implementations {
+            project = project.file(
+                &format!("{}.ts", name.to_lowercase()),
+                &implementation(name, "./shape", 1),
+            );
+        }
+        for name in doubles {
+            project = project.file(
+                &format!("fakes/{}.test.ts", name.to_lowercase()),
+                &implementation(name, "../shape", 0),
+            );
+        }
+        project
+    }
+
+    fn implementation(name: &str, shape: &str, value: u8) -> String {
+        format!(
+            "import type {{ Shape }} from '{shape}';\n\nexport class {name} implements Shape {{\n  area(): number {{\n    return {value};\n  }}\n}}\n"
+        )
+    }
+
+    /// `Shape.area`'s implementations in the order its synthesized edges
+    /// come out of it (`kind, target, line, col`, upstream's
+    /// `getOutgoingEdges`).
+    fn implementations_in_edge_order(project: &Indexed) -> Vec<String> {
+        let graph = project.graph();
+        let shape = graph
+            .nodes
+            .iter()
+            .find(|n| n.qualified_name == "Shape::area")
+            .expect("the interface method");
+        graph
+            .edges
+            .iter()
+            .filter(|e| {
+                e.source == shape.id
+                    && e.provenance.as_deref() == Some("heuristic")
+                    && e.metadata["synthesizedBy"] == "interface-impl"
+            })
+            .map(|e| {
+                let target = graph.node(&e.target).expect("the implementation");
+                target
+                    .qualified_name
+                    .split("::")
+                    .next()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    /// Upstream #2748: an interface method's implementations are one link
+    /// each, the one the query names first, each end named by its owner;
+    /// the Flow's own hop is not repeated.
+    #[test]
+    fn pr2748_lists_the_named_implementation_first_and_every_other_off_the_flow() {
+        let project = shapes(&["Square", "Triangle"], &[]).index();
+        let mut order = implementations_in_edge_order(&project);
+        order.sort();
+        assert_eq!(order, ["Circle", "Square", "Triangle"]);
+        let text = explore(project.root(), "report Shape.area Square.area scale");
+        let flow = flow_section(&text);
+        assert!(flow.contains(". area (circle.ts:5)"), "{text}");
+        assert!(!flow.contains("square.ts"), "{text}");
+        assert_eq!(
+            link_lines(&text),
+            [
+                "- Shape.area → Square.area   [dynamic: interface → impl @square.ts:4]",
+                "- Shape.area → Triangle.area   [dynamic: interface → impl @triangle.ts:4]",
+            ],
+            "{text}"
+        );
+    }
+
+    /// Six lines at most, the first spent on the implementation the query
+    /// names even when the edge order lists it last; the rest go by the
+    /// edge order.
+    #[test]
+    fn pr2748_keeps_six_lines_and_spends_the_first_on_the_named_implementation() {
+        let others = [
+            "Square", "Triangle", "Pentagon", "Hexagon", "Heptagon", "Octagon", "Nonagon",
+            "Decagon",
+        ];
+        let project = shapes(&others, &[]).index();
+        let order: Vec<String> = implementations_in_edge_order(&project)
+            .into_iter()
+            .filter(|owner| owner != "Circle")
+            .collect();
+        let mut sorted = order.clone();
+        sorted.sort();
+        let mut expected = others.map(String::from).to_vec();
+        expected.sort();
+        assert_eq!(sorted, expected);
+        let last = order.last().unwrap();
+        let text = explore(
+            project.root(),
+            &format!("report Shape.area {last}.area scale"),
+        );
+        assert!(
+            flow_section(&text).contains(". area (circle.ts:5)"),
+            "{text}"
+        );
+        let links = link_lines(&text);
+        assert_eq!(links.len(), 6, "{text}");
+        assert_eq!(
+            links[0],
+            format!(
+                "- Shape.area → {last}.area   [dynamic: interface → impl @{}.ts:4]",
+                last.to_lowercase()
+            )
+        );
+        let rest: Vec<&str> = links[1..].iter().map(|line| target_owner(line)).collect();
+        assert_eq!(rest, order[..5], "{text}");
+    }
+
+    /// Links into test doubles (`fakes/*.test.ts`) through an end the
+    /// query did not name only get the lines the real implementations
+    /// leave.
+    #[test]
+    fn pr2748_lists_links_into_test_files_after_the_rest() {
+        let production = [
+            "Square", "Triangle", "Pentagon", "Hexagon", "Heptagon", "Octagon",
+        ];
+        let doubles = ["FakeA", "FakeB", "FakeC", "FakeD", "FakeE", "FakeF"];
+        let project = shapes(&production, &doubles).index();
+        let order: Vec<String> = implementations_in_edge_order(&project)
+            .into_iter()
+            .filter(|owner| owner != "Circle")
+            .collect();
+        assert!(
+            order[..6]
+                .iter()
+                .any(|owner| doubles.contains(&owner.as_str())),
+            "in the edge order a test double would take a line: {order:?}"
+        );
+        let text = explore(project.root(), "report Shape.area scale");
+        assert!(
+            flow_section(&text).contains(". area (circle.ts:5)"),
+            "{text}"
+        );
+        let links = link_lines(&text);
+        let mut owners: Vec<&str> = links.iter().map(|line| target_owner(line)).collect();
+        owners.sort();
+        let mut expected = production.to_vec();
+        expected.sort();
+        assert_eq!(owners, expected, "{text}");
+    }
+
+    /// prometheus's `Discovery.refresh` matches a `Discovery` in every
+    /// discovery package: the links of the interface the query picks out
+    /// come before the links among an ambiguous name's candidates.
+    #[test]
+    fn pr2748_puts_an_interface_the_query_picks_out_before_an_ambiguous_names_links() {
+        let mut project = Project::new()
+            .file(
+                "iface.ts",
+                "export interface Discovery {\n  refresh(): number;\n}\n",
+            )
+            .file(
+                "refresher.ts",
+                "export interface Refresher {\n  refresh(): number;\n}\n",
+            );
+        for i in 1..=5 {
+            project = project.file(
+                &format!("pkg{i}/discovery.ts"),
+                &format!(
+                    "import type {{ Discovery as Base }} from '../iface';\n\nexport class Discovery implements Base {{\n  refresh(): number {{\n    return {i};\n  }}\n}}\n"
+                ),
+            );
+        }
+        for name in ["Hcloud", "Robot"] {
+            project = project.file(
+                &format!("{}.ts", name.to_lowercase()),
+                &format!(
+                    "import type {{ Refresher }} from './refresher';\n\nexport class {name} implements Refresher {{\n  refresh(): number {{\n    return 0;\n  }}\n}}\n"
+                ),
+            );
+        }
+        let project = project.index();
+        let text = explore(
+            project.root(),
+            "Discovery.refresh Refresher.refresh Hcloud.refresh",
+        );
+        let links = link_lines(&text);
+        assert_eq!(links.len(), 6, "{text}");
+        assert_eq!(
+            links[0],
+            "- Refresher.refresh → Hcloud.refresh   [dynamic: interface → impl @hcloud.ts:4]"
+        );
+        assert_eq!(
+            links[1],
+            "- Refresher.refresh → Robot.refresh   [dynamic: interface → impl @robot.ts:4]"
+        );
+        for line in &links[2..] {
+            let site = line
+                .strip_prefix(
+                    "- Discovery.refresh → Discovery.refresh   [dynamic: interface → impl @pkg",
+                )
+                .unwrap_or_else(|| panic!("{line}"));
+            assert!(site.ends_with("/discovery.ts:4]"), "{line}");
+        }
+    }
+
+    /// Upstream #2751: the named symbols take turns, so one long fan-out
+    /// does not fill the list.
+    #[test]
+    fn pr2751_lets_the_named_symbols_take_turns() {
+        let mut project = Project::new();
+        for (interface, classes) in [
+            (
+                "Wide",
+                &[
+                    "WideA", "WideB", "WideC", "WideD", "WideE", "WideF", "WideG", "WideH",
+                ][..],
+            ),
+            ("Narrow", &["NarrowA", "NarrowB"][..]),
+        ] {
+            let module = interface.to_lowercase();
+            project = project.file(
+                &format!("{module}.ts"),
+                &format!("export interface {interface} {{\n  run(): number;\n}}\n"),
+            );
+            for name in classes {
+                project = project.file(
+                    &format!("{}.ts", name.to_lowercase()),
+                    &format!(
+                        "import type {{ {interface} }} from './{module}';\n\nexport class {name} implements {interface} {{\n  run(): number {{\n    return 1;\n  }}\n}}\n"
+                    ),
+                );
+            }
+        }
+        let project = project.index();
+        let text = explore(project.root(), "Wide.run Narrow.run");
+        let links = link_lines(&text);
+        let owners: Vec<&str> = links
+            .iter()
+            .map(|line| line[2..].split('.').next().unwrap())
+            .collect();
+        assert_eq!(
+            owners,
+            ["Wide", "Narrow", "Wide", "Narrow", "Wide", "Wide"],
+            "{text}"
+        );
+        let mut narrow: Vec<&str> = links
+            .iter()
+            .filter(|line| line.starts_with("- Narrow.run → "))
+            .map(|line| target_owner(line))
+            .collect();
+        narrow.sort();
+        assert_eq!(narrow, ["NarrowA", "NarrowB"]);
+    }
+
+    /// gin declares `Binding` once per build tag: two links that read the
+    /// same print once, and none that reads like the Flow's hop.
+    #[test]
+    fn pr2748_prints_a_line_once_and_never_one_that_reads_like_a_flow_hop() {
+        let iface = "package binding\n\ntype Binding interface {\n\tBind(req string) error\n}\n";
+        let project = Project::new()
+            .file("go.mod", "module example.com/binding\n\ngo 1.22\n")
+            .file("binding.go", &format!("//go:build !nomsgpack\n\n{iface}"))
+            .file(
+                "binding_nomsgpack.go",
+                &format!("//go:build nomsgpack\n\n{iface}"),
+            )
+            .file(
+                "form.go",
+                "package binding\n\ntype formBinding struct{}\n\nfunc (b formBinding) Bind(req string) error {\n\treturn mapForm(req)\n}\n\nfunc mapForm(req string) error {\n\treturn nil\n}\n",
+            )
+            .file(
+                "query.go",
+                "package binding\n\ntype queryBinding struct{}\n\nfunc (b queryBinding) Bind(req string) error {\n\treturn mapForm(req)\n}\n",
+            )
+            .index();
+        let declarations: Vec<_> = project
+            .graph()
+            .nodes
+            .iter()
+            .filter(|n| n.qualified_name == "Binding::Bind")
+            .collect();
+        assert_eq!(declarations.len(), 2);
+
+        let pair = explore(project.root(), "Binding.Bind formBinding.Bind");
+        assert_eq!(
+            link_lines(&pair),
+            [
+                "- Binding.Bind → formBinding.Bind   [dynamic: interface → impl @form.go:5]",
+                "- Binding.Bind → queryBinding.Bind   [dynamic: interface → impl @query.go:5]",
+            ],
+            "{pair}"
+        );
+
+        let text = explore(project.root(), "Binding.Bind formBinding.Bind mapForm");
+        let flow = flow_section(&text);
+        assert!(
+            flow.contains("1. Bind (binding.go:6)\n   ↓ dynamic: interface → impl @form.go:5\n2. Bind (form.go:5)\n")
+                || flow.contains("1. Bind (binding_nomsgpack.go:6)\n   ↓ dynamic: interface → impl @form.go:5\n2. Bind (form.go:5)\n"),
+            "{text}"
+        );
+        assert_eq!(
+            link_lines(&text),
+            ["- Binding.Bind → queryBinding.Bind   [dynamic: interface → impl @query.go:5]"],
+            "{text}"
+        );
+    }
+
+    /// An RTK thunk→thunk hop is `constant`→`constant`: no callable is
+    /// named, and the links are the only place it surfaces, as dynamic
+    /// dispatch with its wiring site.
+    #[test]
+    fn rtk_thunk_links_surface_between_two_constants() {
+        let project = Project::new()
+            .file(
+                "package.json",
+                r#"{"name":"app","dependencies":{"@reduxjs/toolkit":"^2"}}"#,
+            )
+            .file(
+                "thunks.ts",
+                "import { createAsyncThunk } from '@reduxjs/toolkit';\n\nexport const deepThunk = createAsyncThunk('app/deep', async (n: number) => n * 2);\n\nexport const innerThunk = createAsyncThunk('app/inner', async (n: number, { dispatch }) => {\n  return dispatch(deepThunk(n));\n});\n\nexport const outerThunk = createAsyncThunk('app/outer', async (n: number, { dispatch }) => {\n  await dispatch(innerThunk(n));\n});\n",
+            )
+            .index();
+        let outer = project
+            .graph()
+            .nodes
+            .iter()
+            .find(|n| n.name == "outerThunk")
+            .expect("outerThunk");
+        assert_eq!(outer.kind, "constant");
+        let text = explore(project.root(), "outerThunk innerThunk");
+        assert_eq!(
+            link_lines(&text),
+            [
+                "- outerThunk → innerThunk   [dynamic: redux thunk @thunks.ts:10]",
+                "- innerThunk → deepThunk   [dynamic: redux thunk @thunks.ts:6]",
+            ],
+            "{text}"
+        );
+        assert!(
+            text.contains("\n\n> Full source for these symbols is below.\n"),
+            "{text}"
+        );
+    }
+
+    /// Upstream #687, criterion 1: an emit→handler hop with a literal event
+    /// is a two-node chain, too short for the Flow; it is a link, and the
+    /// flow is connected, so there is no boundary to announce.
+    #[test]
+    fn pr687_a_direct_synthesized_emit_to_handler_hop_is_a_link() {
+        let project = Project::new()
+            .file(
+                "bus.ts",
+                "type Handler = (p: unknown) => void;\nexport class EventBus {\n  private listeners: Record<string, Handler[]> = {};\n  on(event: string, fn: Handler) { (this.listeners[event] ??= []).push(fn); }\n  emit(event: string, payload: unknown) { for (const fn of this.listeners[event] ?? []) fn(payload); }\n}\nexport const bus = new EventBus();",
+            )
+            .file(
+                "billing.ts",
+                "import { bus } from './bus';\nexport function settleInvoice(payload: unknown) { return payload; }\nbus.on('invoice.settled', settleInvoice);",
+            )
+            .file(
+                "checkout.ts",
+                "import { bus } from './bus';\nexport function completeCheckout(order: unknown) {\n  bus.emit('invoice.settled', order);\n}",
+            )
+            .index();
+        let text = explore(project.root(), "completeCheckout settleInvoice");
+        assert_eq!(
+            link_lines(&text),
+            [
+                "- completeCheckout → settleInvoice   [dynamic: event `invoice.settled` @billing.ts:3]"
+            ],
+            "{text}"
+        );
+        assert!(flow_section(&text).is_empty(), "{text}");
+        assert!(!text.contains("Dynamic boundaries"), "{text}");
+    }
+
+    /// A fully connected static flow has its Flow, no links and no boundary.
+    #[test]
+    fn pr687_a_connected_static_flow_has_no_links() {
+        let project = Project::new()
+            .file(
+                "pipeline.ts",
+                "export function stepOne() { return stepTwo(); }\nexport function stepTwo() { return stepThree(); }\nexport function stepThree() { return 3; }",
+            )
+            .index();
+        let text = explore(project.root(), "stepOne stepThree");
+        assert!(text.contains("**Flow"), "{text}");
+        assert!(!text.contains(SECTION), "{text}");
+        assert!(!text.contains("Dynamic boundaries"), "{text}");
+    }
+
+    /// The links' order is the graph's: after a sync rewrote one link's row
+    /// last, the six lines are the ones a fresh index of the same source
+    /// lists.
+    #[test]
+    fn w726_links_after_a_sync_read_as_a_fresh_index_reads_them() {
+        let others = [
+            "Square", "Triangle", "Pentagon", "Hexagon", "Heptagon", "Octagon", "Nonagon",
+            "Decagon",
+        ];
+        let mut synced = shapes(&others, &[]).index();
+        let moved = format!("\n{}", implementation("Nonagon", "./shape", 1));
+        synced.write("nonagon.ts", &moved);
+        synced.sync();
+        let fresh = shapes(&others, &[]).file("nonagon.ts", &moved).index();
+        assert_eq!(synced.graph().edges.len(), fresh.graph().edges.len());
+        let shape = |project: &Indexed| {
+            project
+                .graph()
+                .nodes
+                .iter()
+                .find(|n| n.qualified_name == "Shape::area")
+                .expect("the interface method")
+                .id
+                .clone()
+        };
+        assert_ne!(
+            synthesized_targets_in_row_order(&synced.db(), &shape(&synced)),
+            synthesized_targets_in_row_order(&fresh.db(), &shape(&fresh)),
+            "the sync left the rows in another order than a fresh index"
+        );
+        let query = "report Shape.area scale";
+        let links = link_lines(&explore(synced.root(), query));
+        assert_eq!(links.len(), 6);
+        assert_eq!(links, link_lines(&explore(fresh.root(), query)));
+    }
+
+    /// OD-B23: explore's hard filter drops a file upstream's `b635dd46`
+    /// patterns read as low-value (`specs/`), and keeps one they do not
+    /// (`lexicon.ts`, whose `icon` is no whole word), in a small project and
+    /// a query that does not mention tests.
+    #[test]
+    fn od_b23_the_hard_filter_reads_low_value_files_as_upstream_did() {
+        let body = |sep: &str| {
+            format!(
+                "export function tokenize(input: string): string[] {{\n  return input.split(\"{sep}\");\n}}\n"
+            )
+        };
+        let project = Project::new()
+            .file("src/a.ts", &body(" "))
+            .file("src/b.ts", &body(","))
+            .file("src/lexicon.ts", &body(";"))
+            .file("specs/a.ts", &body("|"))
+            .index();
+        let text = explore(project.root(), "tokenize");
+        assert!(text.contains("#### src/a.ts "), "{text}");
+        assert!(text.contains("#### src/b.ts "), "{text}");
+        assert!(text.contains("#### src/lexicon.ts "), "{text}");
+        assert!(!text.contains("specs/a.ts"), "{text}");
+    }
+}
+
 /// The synthesis stage's dispatch edges (W7-14): the field, closure and
 /// emitter passes over the base graph a full index resolved, merged in
 /// upstream's registry order.

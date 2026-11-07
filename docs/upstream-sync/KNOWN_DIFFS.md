@@ -159,11 +159,15 @@ confined to `codegraph_explore` and `codegraph_status`.
   SKELETONIZES off-spine polymorphic-sibling files to signatures
   (`adaptiveExplore`, `tools.ts:2422-2623`). The port opens the response with
   the same Flow section (the chain, `dynamic:` hop tags, `(when …)` branch
-  conditions). The spine does not yet weight file ranking or body windows, the
-  "Dynamic-dispatch links among your symbols" section is not printed, and a
-  flow that does not connect gets no boundary or polymorphic-dispatch
-  announcement of its own; the port's boundary scan over the explore seeds
-  still runs. The Rust port reproduces the DETERMINISTIC structure — header,
+  conditions), followed by the "Dynamic-dispatch links among your symbols"
+  section as `e8ddc4e2` prints it (#2748, #2751). The spine does not yet weight
+  file ranking or body windows, and a flow that does not connect gets no
+  boundary or polymorphic-dispatch announcement of its own; the port's boundary
+  scan over the explore seeds still runs. The low-value files the links put
+  last and `excludeLowValueFiles` drops are `b635dd46`'s `isLowValue` patterns;
+  upstream has since moved both onto its engine-wide test predicate (#2557,
+  PARTIAL in the 2026-10-22 audit). The Rust port reproduces the DETERMINISTIC
+  structure — header,
   blast radius, relationship map, dynamic boundaries, and per-file source
   grouped by file — by seeding roots from the FTS search results
   (`searchLimit: 8`) and pulling their callers/callees + `contains` children into

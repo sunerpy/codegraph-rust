@@ -20,7 +20,9 @@ use codegraph_core::node_id::hash_content;
 use codegraph_core::types::{Edge, EdgeKind, FileRecord, Node, NodeKind};
 use codegraph_graph::branch_guards::{guard_label, guards_at, supports_branch_guards};
 use codegraph_graph::graph::{GodotReach, GraphTraverser, NodeEdge, group_definitions};
-use codegraph_graph::named_symbol_flow::{NamedSymbolFlowOptions, resolve_named_symbol_flow};
+use codegraph_graph::named_symbol_flow::{
+    FlowStep, NamedSymbolFlow, NamedSymbolFlowOptions, resolve_named_symbol_flow,
+};
 use codegraph_graph::query::{SearchOptions, search_nodes};
 use codegraph_graph::segment_match::get_segment_matches;
 use codegraph_graph::segments::extract_segment_search_words;
@@ -1639,66 +1641,253 @@ impl CodeGraphEngine {
         Ok(ToolResult::text(output))
     }
 
-    /// The Flow section (upstream `buildFlowFromNamedSymbols`, `b635dd46`):
+    /// The Flow section (upstream `buildFlowFromNamedSymbols`, `e8ddc4e2`):
     /// explore's query is usually a bag of symbol names that spans the flow
     /// the agent is investigating, so the longest call chain AMONG those
     /// symbols opens the response, one numbered line per symbol and one `↓`
     /// line per hop. The search is `named_symbol_flow`'s, the one the
     /// viewer's Flow rides. A synthesized hop names its mechanism and wiring
     /// site; a hop whose call runs under conditions names them, read from
-    /// the caller's current source. Empty unless the query names two symbols
-    /// and a chain of three or more connects them.
+    /// the caller's current source. The Flow needs two named callables and a
+    /// chain of three or more among them; the dynamic-dispatch links among
+    /// the named symbols ([`Self::synth_links`]) follow it, or stand alone
+    /// when there is none. Empty when the query names fewer than two
+    /// symbols, when neither part has a line to show, or when reading the
+    /// graph fails.
     ///
-    /// The rest of upstream's builder is not here: the dynamic-dispatch links
-    /// among the named symbols (W7-26), and the dynamic-boundary and
+    /// The rest of upstream's builder is not here: the dynamic-boundary and
     /// polymorphic-dispatch announcements for a flow that does not connect —
     /// the port keeps its own boundary scan over the explore seeds. The
     /// spine's weight in file ranking and windowing is W7-25's.
     fn build_flow_section(&self, match_query: &str) -> String {
         let flow =
             resolve_named_symbol_flow(&self.store, match_query, &NamedSymbolFlowOptions::default());
-        if flow.tokens.len() < 2 || flow.named.len() < 2 {
+        if flow.tokens.len() < 2 {
             return String::new();
         }
-        let Some(best) = flow.chains.first().map(|chain| &chain.steps) else {
-            return String::new();
-        };
-        if best.len() < 3 {
-            return String::new();
-        }
-        let mut out = vec![
-            "**Flow (call path among the symbols you queried)**".to_string(),
-            String::new(),
-        ];
-        for (index, step) in best.iter().enumerate() {
-            if let Some(edge) = &step.edge {
-                let when = match index.checked_sub(1) {
-                    Some(previous) => self.when_label(&best[previous].node, edge),
-                    None => String::new(),
-                };
-                let label = synth_edge_note(edge).unwrap_or_else(|| edge.kind.as_str().to_string());
-                let when = if when.is_empty() {
-                    String::new()
-                } else {
-                    format!(" (when {when})")
-                };
-                out.push(format!("   ↓ {label}{when}"));
+        self.flow_section_of(&flow).unwrap_or_default()
+    }
+
+    /// [`Self::build_flow_section`] for a resolved flow.
+    fn flow_section_of(&self, flow: &NamedSymbolFlow) -> anyhow::Result<String> {
+        if flow.named.len() < 2 {
+            // No Flow without two callables, but the named symbols can still
+            // have links: an RTK thunk's run between `constant`s.
+            let links = self.synth_links(flow, None)?;
+            if links.is_empty() {
+                return Ok(String::new());
             }
-            out.push(format!(
-                "{}. {} ({}:{})",
-                index + 1,
-                step.node.name,
-                step.node.file_path,
-                step.node.start_line
-            ));
+            let mut out = synth_links_block(links);
+            out.push("> Full source for these symbols is below.\n".to_string());
+            return Ok(out.join("\n"));
         }
-        out.push(String::new());
+        let best = flow
+            .chains
+            .first()
+            .map(|chain| chain.steps.as_slice())
+            .filter(|steps| steps.len() >= 3);
+        // A two-node chain renders nothing, so its synthesized hop is listed
+        // as a link (upstream #687).
+        let links = self.synth_links(flow, best)?;
+        if best.is_none() && links.is_empty() {
+            return Ok(String::new());
+        }
+        let mut out = Vec::new();
+        if let Some(best) = best {
+            out.push("**Flow (call path among the symbols you queried)**".to_string());
+            out.push(String::new());
+            for (index, step) in best.iter().enumerate() {
+                if let Some(edge) = &step.edge {
+                    let when = match index.checked_sub(1) {
+                        Some(previous) => self.when_label(&best[previous].node, edge),
+                        None => String::new(),
+                    };
+                    let label =
+                        synth_edge_note(edge).unwrap_or_else(|| edge.kind.as_str().to_string());
+                    let when = if when.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" (when {when})")
+                    };
+                    out.push(format!("   ↓ {label}{when}"));
+                }
+                out.push(format!(
+                    "{}. {} ({}:{})",
+                    index + 1,
+                    step.node.name,
+                    step.node.file_path,
+                    step.node.start_line
+                ));
+            }
+            out.push(String::new());
+        }
+        if !links.is_empty() {
+            out.extend(synth_links_block(links));
+        }
         out.push(
             "> Full source for these symbols is below — the call flow among them, followed by their bodies."
                 .to_string(),
         );
         out.push(String::new());
-        out.join("\n")
+        Ok(out.join("\n"))
+    }
+
+    /// The dynamic-dispatch links among the named symbols (upstream
+    /// `collectSynthLinks`, `e8ddc4e2`: #2748 and #2751): one line per
+    /// synthesized edge at a named callable or a named non-callable endpoint
+    /// (an RTK thunk), keyed by the edge's two ends whatever its kind, the
+    /// other end named or not. `chain` is the rendered Flow: an edge with
+    /// both ends on it is left out, and a line that reads like one of its
+    /// synthesized hops is not printed again; neither is a line printed
+    /// twice (gin declares `Binding` once per build tag, and both
+    /// declarations link to the same implementation).
+    ///
+    /// At most [`MAX_SYNTH_LINKS`] lines, so the order decides what is left
+    /// out. Links into a low-value file ([`is_low_value_file`]: tests,
+    /// specs, icons, translations) through an end the query did not name go
+    /// last: they are the files explore's hard filter drops. Before that,
+    /// links go by how pointedly the query named their ends: a symbol a
+    /// token picks out (at most three definitions) or a named non-callable
+    /// endpoint weighs 3, a candidate of an ambiguous token 1, anything else
+    /// 0, and a link the sum of its two. Links of one rank take turns by the
+    /// named symbol they hang from, so one symbol's long fan-out cannot fill
+    /// the list before another's first link; the edge order
+    /// ([`Self::edges_at_in_upstream_order`]) breaks the ties.
+    fn synth_links(
+        &self,
+        flow: &NamedSymbolFlow,
+        chain: Option<&[FlowStep]>,
+    ) -> anyhow::Result<Vec<String>> {
+        let chain = chain.unwrap_or_default();
+        let on_chain: HashSet<&str> = chain.iter().map(|step| step.node.id.as_str()).collect();
+        let weight = |id: &str| -> u8 {
+            if flow.unique_named_node_ids.contains(id) || flow.dyn_named.contains_key(id) {
+                3
+            } else if flow.named.contains_key(id) {
+                1
+            } else {
+                0
+            }
+        };
+        let mut links: Vec<SynthLink> = Vec::new();
+        let mut seen: HashSet<(String, String)> = HashSet::new();
+        // A link's turn: how many links of its rank the same named symbol
+        // already has.
+        let mut turns: HashMap<(String, bool, u8), usize> = HashMap::new();
+        for named in flow.named.values().chain(flow.dyn_named.values()) {
+            // Every edge at the node, as `has_heuristic_edge` reads them: a
+            // static edge over the same pair would hide the synthesized one
+            // from a callers list.
+            for edge in self.edges_at_in_upstream_order(&named.id)? {
+                if edge.provenance.as_deref() != Some("heuristic") {
+                    continue;
+                }
+                let outgoing = edge.source == named.id;
+                let other_id = if outgoing { &edge.target } else { &edge.source };
+                if *other_id == named.id || !seen.insert((edge.source.clone(), edge.target.clone()))
+                {
+                    continue;
+                }
+                if on_chain.contains(edge.source.as_str())
+                    && on_chain.contains(edge.target.as_str())
+                {
+                    continue;
+                }
+                let other = match flow
+                    .named
+                    .get(other_id)
+                    .or_else(|| flow.dyn_named.get(other_id))
+                {
+                    Some(node) => node.clone(),
+                    None => match self.store.node_by_id(other_id)? {
+                        Some(node) => node,
+                        None => continue,
+                    },
+                };
+                let other_weight = weight(other_id);
+                let low_value = other_weight == 0 && is_low_value_file(&other.file_path);
+                let link_weight = weight(&named.id) + other_weight;
+                let counter = turns
+                    .entry((named.id.clone(), low_value, link_weight))
+                    .or_insert(0);
+                let turn = *counter;
+                *counter += 1;
+                let line = if outgoing {
+                    synth_link_line(&edge, named, &other)
+                } else {
+                    synth_link_line(&edge, &other, named)
+                };
+                links.push(SynthLink {
+                    line,
+                    low_value,
+                    weight: link_weight,
+                    turn,
+                });
+            }
+        }
+        // Stable, so the edge order stands within a rank and a turn.
+        links.sort_by(|a, b| {
+            a.low_value
+                .cmp(&b.low_value)
+                .then(b.weight.cmp(&a.weight))
+                .then(a.turn.cmp(&b.turn))
+        });
+        let mut shown: HashSet<String> = HashSet::new();
+        for pair in chain.windows(2) {
+            let (previous, step) = (&pair[0].node, &pair[1]);
+            let Some(edge) = step
+                .edge
+                .as_ref()
+                .filter(|edge| edge.provenance.as_deref() == Some("heuristic"))
+            else {
+                continue;
+            };
+            shown.insert(if edge.source == previous.id {
+                synth_link_line(edge, previous, &step.node)
+            } else {
+                synth_link_line(edge, &step.node, previous)
+            });
+        }
+        let mut lines = Vec::new();
+        for link in links {
+            if lines.len() >= MAX_SYNTH_LINKS {
+                break;
+            }
+            if shown.insert(link.line.clone()) {
+                lines.push(link.line);
+            }
+        }
+        Ok(lines)
+    }
+
+    /// Every edge into `id`, then every edge out of it, as upstream's
+    /// `getIncomingEdges` and `getOutgoingEdges` read them (`ORDER BY kind,
+    /// source, line, col` and `ORDER BY kind, target, line, col`,
+    /// `queries.ts`): kind and the other end byte-wise, a missing line or
+    /// column first, as SQLite sorts NULL. The store's readers keep row
+    /// order, which after a sync can differ from a fresh index's; the edges
+    /// table's identity index makes this order total.
+    fn edges_at_in_upstream_order(&self, id: &str) -> anyhow::Result<Vec<Edge>> {
+        let mut edges = self.store.edges_by_target_kind(id, None)?;
+        edges.sort_by(|a, b| {
+            (a.kind.as_str(), a.source.as_str(), a.line, a.col).cmp(&(
+                b.kind.as_str(),
+                b.source.as_str(),
+                b.line,
+                b.col,
+            ))
+        });
+        let mut outgoing = self.store.edges_by_source_kind(id, None)?;
+        outgoing.sort_by(|a, b| {
+            (a.kind.as_str(), a.target.as_str(), a.line, a.col).cmp(&(
+                b.kind.as_str(),
+                b.target.as_str(),
+                b.line,
+                b.col,
+            ))
+        });
+        edges.extend(outgoing);
+        Ok(edges)
     }
 
     /// The conditions a flow hop's call site runs under (upstream
@@ -5409,11 +5598,37 @@ fn explore_file_header(
     format!("#### {file_path} — {}", cap_header_names(&ranked, cap))
 }
 
-/// Test/spec/icon/i18n detector for `excludeLowValueFiles` (`tools.ts:2200-2217`).
+/// Test/spec/icon/i18n detector for explore's `excludeLowValueFiles` and
+/// the order of its dynamic-dispatch links: upstream `isLowValue` as
+/// `b635dd46` wrote it (`tools.ts:4782-4797`), on the lowercased path.
+/// JavaScript's `\b` is an ASCII word boundary, so `lexicon.ts` is no icon
+/// file. Not [`is_test_file`], which the blast radius and the indirect-test
+/// note keep: that one also reads `e2e/` and `_unittest.` as tests. Upstream
+/// later moved explore onto its engine-wide test predicate (#2557); that is
+/// not ported yet.
 fn is_low_value_file(path: &str) -> bool {
-    let lp = path.to_lowercase();
-    is_test_file(&lp) || lp.contains("icon") || lp.contains("i18n")
+    LOW_VALUE_FILE.is_match(&path.to_lowercase())
 }
+
+/// [`is_low_value_file`]'s patterns, in upstream's order.
+static LOW_VALUE_FILE: LazyLock<regex::RegexSet> = LazyLock::new(|| {
+    regex::RegexSet::new([
+        r"(?:^|/)(tests?|__tests?__|specs?)/",
+        r"_test\.go$",
+        r"(?:^|/)test_[^/]+\.py$",
+        r"_test\.py$",
+        r"_spec\.rb$",
+        r"_test\.rb$",
+        r"\.(test|spec)\.[jt]sx?$",
+        r"(test|spec|tests)\.(java|kt|scala)$",
+        r"(tests?|spec)\.cs$",
+        r"tests?\.swift$",
+        r"_test\.dart$",
+        r"(?-u:\b)icons?(?-u:\b)",
+        r"(?-u:\b)i18n(?-u:\b)",
+    ])
+    .expect("low-value file patterns are valid")
+});
 
 /// Lowercased, ≥3-char alphanumeric query terms used by the #1064 buried check.
 /// Deterministic: a stable, deduped, order-preserving token set (short/stop-ish
@@ -5602,12 +5817,11 @@ const TRIMMED_SYMBOLS_NAMED: usize = 4;
 
 /// The name the completeness note offers for an elided symbol: `Owner.member`
 /// for a method, so an overloaded name resolves to the definition that was cut
-/// (django has 110 `as_sql`s). The bare name otherwise.
-fn follow_up_name(span: &WantedSpan) -> String {
-    let owner = span
-        .qualified_name
-        .as_deref()
-        .filter(|_| span.kind == NodeKind::Method.as_str())
+/// (django has 110 `as_sql`s). The bare name otherwise. The dynamic-dispatch
+/// links name both ends of an `X → X` link the same way.
+fn follow_up_name(name: &str, kind: &str, qualified_name: Option<&str>) -> String {
+    let owner = qualified_name
+        .filter(|_| kind == NodeKind::Method.as_str())
         .and_then(|qualified| {
             let segments: Vec<&str> = qualified.split("::").collect();
             (segments.len() >= 2).then(|| segments[segments.len() - 2])
@@ -5619,8 +5833,8 @@ fn follow_up_name(span: &WantedSpan) -> String {
                     .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
         });
     match owner {
-        Some(owner) => format!("{owner}.{}", span.name),
-        None => span.name.clone(),
+        Some(owner) => format!("{owner}.{name}"),
+        None => name.to_string(),
     }
 }
 
@@ -5709,7 +5923,7 @@ fn completeness_notes(
             if span.importance < 10 || container {
                 continue;
             }
-            let name = follow_up_name(span);
+            let name = follow_up_name(&span.name, span.kind, span.qualified_name.as_deref());
             if !names.contains(&name) {
                 names.push(name);
             }
@@ -5894,6 +6108,52 @@ fn cut_at_section_boundary(
 /// `dynamic: <summary> @<wiring site>`; `None` for an ordinary static edge.
 fn synth_edge_note(edge: &Edge) -> Option<String> {
     describe_synthesized_hop(edge).map(|hop| hop.tag())
+}
+
+/// Upstream's `MAX_SYNTH_LINKS`: the most lines the dynamic-dispatch links
+/// print.
+const MAX_SYNTH_LINKS: usize = 6;
+
+/// One link the dynamic-dispatch links may print, with what orders it.
+struct SynthLink {
+    line: String,
+    /// Into a low-value file through an end the query did not name.
+    low_value: bool,
+    /// How pointedly the query named the two ends.
+    weight: u8,
+    /// How many links of its rank its named symbol had before it.
+    turn: usize,
+}
+
+/// One line of the dynamic-dispatch links: `- A → B   [tag]`, the edge's
+/// synthesized-hop tag or, without one, its kind. `area → area` says
+/// neither which interface nor which implementation, so a link between two
+/// same-name symbols names each end as the completeness note would
+/// (`Shape.area → Square.area`).
+fn synth_link_line(edge: &Edge, source: &Node, target: &Node) -> String {
+    let same = source.name == target.name;
+    let name = |node: &Node| {
+        if same {
+            follow_up_name(&node.name, node.kind.as_str(), Some(&node.qualified_name))
+        } else {
+            node.name.clone()
+        }
+    };
+    let tag = synth_edge_note(edge).unwrap_or_else(|| edge.kind.as_str().to_string());
+    format!("- {} → {}   [{tag}]", name(source), name(target))
+}
+
+/// The dynamic-dispatch links section around its lines, as upstream prints
+/// it; the closing line is the caller's.
+fn synth_links_block(lines: Vec<String>) -> Vec<String> {
+    let mut out = vec![
+        "**Dynamic-dispatch links among your symbols**".to_string(),
+        "(synthesized — the indirect hops grep/Read would reconstruct; the `@file:line` is the wiring site)".to_string(),
+        String::new(),
+    ];
+    out.extend(lines);
+    out.push(String::new());
+    out
 }
 
 fn require_string(args: &Value, field: &str) -> Result<String, String> {
@@ -9262,6 +9522,80 @@ mod tests {
         assert!(!is_low_value_file("src/lib.rs"));
     }
 
+    /// Explore's low-value files are upstream `b635dd46`'s `isLowValue`
+    /// (OD-B23): each pattern on the lowercased path, `icon` and `i18n` as
+    /// whole ASCII words.
+    #[test]
+    fn ext_is_low_value_file_is_b635dd46s_is_low_value() {
+        for (path, low) in [
+            // A test directory, at the root or under another segment.
+            ("test/a.ts", true),
+            ("src/tests/a.ts", true),
+            ("__tests__/a.ts", true),
+            ("__test__/a.ts", true),
+            ("specs/a.ts", true),
+            ("spec/a.rb", true),
+            ("contest/a.ts", false),
+            ("src/tests.ts", false),
+            // Go, Python, Ruby and Dart file names.
+            ("pkg/a_test.go", true),
+            ("pkg/atest.go", false),
+            ("test_foo.py", true),
+            ("pkg/test_foo.py", true),
+            ("pkg/mytest_foo.py", false),
+            ("foo_test.py", true),
+            ("foo_testing.py", false),
+            ("user_spec.rb", true),
+            ("user_specs.rb", false),
+            ("user_test.rb", true),
+            ("user_tests.rb", false),
+            ("baz_test.dart", true),
+            ("baz_tests.dart", false),
+            // JavaScript and TypeScript.
+            ("src/a.test.ts", true),
+            ("src/a.spec.jsx", true),
+            ("src/a.test.mjs", false),
+            ("foo.test.go", false),
+            // JVM, .NET and Swift class names.
+            ("FooTest.java", true),
+            ("BarSpec.scala", true),
+            ("BazTests.kt", true),
+            // Upstream's own false positive, kept as it was (#2557 is next).
+            ("Latest.java", true),
+            ("FooTester.java", false),
+            ("FooTests.cs", true),
+            ("FooSpec.cs", true),
+            ("FooSpecs.cs", false),
+            ("BarTests.swift", true),
+            ("BarSpec.swift", false),
+            // Icons and translations, as whole ASCII words.
+            ("icons/x.svg", true),
+            ("assets/icon.svg", true),
+            ("src/icon-button.ts", true),
+            ("éicon.svg", true),
+            ("lexicon.ts", false),
+            ("silicon.ts", false),
+            ("iconic.ts", false),
+            ("i18n/en.json", true),
+            ("src/i18n.ts", true),
+            ("éi18n.json", true),
+            ("i18next.ts", false),
+            ("xi18n.ts", false),
+            // Lowercased first.
+            ("Specs/A.ts", true),
+            ("FOOTEST.JAVA", true),
+            ("SRC/ICONS/X.SVG", true),
+            // The engine's test predicate reads these as tests; upstream's
+            // explore here did not.
+            ("e2e/checkout.ts", false),
+            ("foo_unittest.cc", false),
+            ("a_test.c", false),
+            ("src/lib.rs", false),
+        ] {
+            assert_eq!(is_low_value_file(path), low, "{path}");
+        }
+    }
+
     /// Tier 1 item 1 (upstream #1507) — the MCP-side half of the bidirectional
     /// disagreement: the CLI's `is_test_file` had `/e2e/` and this one did not,
     /// so a Playwright/Cypress `e2e/` tree read as production code on every MCP
@@ -9278,9 +9612,11 @@ mod tests {
             is_test_file("apps/web/e2e/login.ts"),
             "a nested e2e/ tree is a test tree"
         );
-        // And it flows through to `excludeLowValueFiles`, which is what keeps an
-        // e2e tree from crowding out implementations in explore output.
-        assert!(is_low_value_file("e2e/checkout.ts"));
+        // Explore's low-value files are upstream `b635dd46`'s own patterns
+        // (OD-B23), which have no `e2e/`: an e2e tree is a test tree for the
+        // blast radius and the indirect-test note, not a file explore's hard
+        // filter drops.
+        assert!(!is_low_value_file("e2e/checkout.ts"));
         // Negative: `e2e` must be a whole path SEGMENT, never a substring.
         assert!(
             !is_test_file("src/route2e2e.ts"),
@@ -11993,6 +12329,660 @@ mod tests {
             caller_trail.contains("**Called by ←** exportReport (src/pdf-exporter.ts:5)\n")
                 || caller_trail.ends_with("**Called by ←** exportReport (src/pdf-exporter.ts:5)"),
             "a static edge carries no tag: {caller_trail}"
+        );
+    }
+
+    /* ------------------------- the dynamic-dispatch links (W7-26) -- */
+
+    /// A TypeScript method `owner::name` in `file` at `line`.
+    fn link_method(owner: &str, name: &str, file: &str, line: i64) -> Node {
+        node_lang(
+            name,
+            &format!("{owner}::{name}"),
+            file,
+            line,
+            line + 2,
+            NodeKind::Method,
+            Language::TypeScript,
+        )
+    }
+
+    /// A TypeScript function `name` in `file` at `line`.
+    fn link_function(name: &str, file: &str, line: i64) -> Node {
+        node_lang(
+            name,
+            name,
+            file,
+            line,
+            line + 2,
+            NodeKind::Function,
+            Language::TypeScript,
+        )
+    }
+
+    /// A synthesized `interface-impl` hop of `kind`, wired at `site`.
+    fn synthesized(source: &Node, target: &Node, kind: EdgeKind, site: &str) -> Edge {
+        let mut edge = mk_edge(&source.id, &target.id, kind);
+        edge.provenance = Some("heuristic".to_string());
+        edge.metadata = Some(serde_json::json!({
+            "synthesizedBy": "interface-impl",
+            "registeredAt": site,
+        }));
+        edge
+    }
+
+    /// What a query naming the callables `named` (`unique` among them picked
+    /// out by their tokens) and the non-callable endpoints `dyn_named`
+    /// resolves to, with `chain` as its best chain.
+    fn named_flow(
+        named: &[&Node],
+        unique: &[&Node],
+        dyn_named: &[&Node],
+        chain: &[FlowStep],
+    ) -> NamedSymbolFlow {
+        let mut flow = NamedSymbolFlow {
+            tokens: vec!["first".to_string(), "second".to_string()],
+            ..NamedSymbolFlow::default()
+        };
+        for node in named {
+            flow.named.set(node.id.clone(), (*node).clone());
+        }
+        for node in unique {
+            flow.unique_named_node_ids.insert(node.id.clone());
+        }
+        for node in dyn_named {
+            flow.dyn_named.set(node.id.clone(), (*node).clone());
+        }
+        if !chain.is_empty() {
+            flow.chains
+                .push(codegraph_graph::named_symbol_flow::FlowChain {
+                    steps: chain.to_vec(),
+                    call_sites: HashMap::new(),
+                });
+        }
+        flow
+    }
+
+    /// A chain step reached by `edge`; none for the first.
+    fn flow_step(node: &Node, edge: Option<&Edge>) -> FlowStep {
+        FlowStep {
+            node: node.clone(),
+            edge: edge.cloned(),
+        }
+    }
+
+    /// An interface method's implementations of one name are one link each,
+    /// and each end of a same-name link is named by its owner (#2748).
+    #[test]
+    fn a_link_is_one_line_per_pair_of_ends() {
+        let mut engine = test_engine();
+        let shape = link_method("Shape", "area", "src/shape.ts", 2);
+        let square = link_method("Square", "area", "src/square.ts", 4);
+        let triangle = link_method("Triangle", "area", "src/triangle.ts", 4);
+        put_nodes(
+            &mut engine,
+            &[shape.clone(), square.clone(), triangle.clone()],
+        );
+        put_edges(
+            &mut engine,
+            &[
+                synthesized(&shape, &square, EdgeKind::Calls, "src/square.ts:4"),
+                synthesized(&shape, &triangle, EdgeKind::Calls, "src/triangle.ts:4"),
+            ],
+        );
+        let flow = named_flow(&[&shape], &[&shape], &[], &[]);
+        assert_eq!(
+            engine.synth_links(&flow, None).unwrap(),
+            [
+                "- Shape.area → Square.area   [dynamic: interface → impl @src/square.ts:4]",
+                "- Shape.area → Triangle.area   [dynamic: interface → impl @src/triangle.ts:4]",
+            ]
+        );
+    }
+
+    /// Two synthesized edges over one pair of ends are one link whatever
+    /// their kinds, the first in the edge order: kind before row.
+    #[test]
+    fn a_pair_of_ends_is_one_link_whatever_kinds_its_edges_have() {
+        let mut engine = test_engine();
+        let dispatch = link_function("dispatchJob", "src/a.ts", 1);
+        let run = link_function("runJob", "src/b.ts", 1);
+        put_nodes(&mut engine, &[dispatch.clone(), run.clone()]);
+        put_edges(
+            &mut engine,
+            &[
+                synthesized(&dispatch, &run, EdgeKind::References, "src/b.ts:9"),
+                synthesized(&dispatch, &run, EdgeKind::Calls, "src/b.ts:1"),
+            ],
+        );
+        let flow = named_flow(&[&dispatch], &[&dispatch], &[], &[]);
+        assert_eq!(
+            engine.synth_links(&flow, None).unwrap(),
+            ["- dispatchJob → runJob   [dynamic: interface → impl @src/b.ts:1]"]
+        );
+    }
+
+    #[test]
+    fn a_synthesized_edge_from_a_symbol_to_itself_is_no_link() {
+        let mut engine = test_engine();
+        let retry = link_function("retry", "src/a.ts", 1);
+        put_nodes(&mut engine, std::slice::from_ref(&retry));
+        put_edges(
+            &mut engine,
+            &[synthesized(&retry, &retry, EdgeKind::Calls, "src/a.ts:3")],
+        );
+        let flow = named_flow(&[&retry], &[&retry], &[], &[]);
+        assert!(engine.synth_links(&flow, None).unwrap().is_empty());
+    }
+
+    /// The Flow shows a hop between two of its nodes, so a synthesized edge
+    /// with both ends on it is left out, even one that is not a hop; one end
+    /// on it is not enough.
+    #[test]
+    fn a_link_with_both_ends_on_the_flow_is_left_out() {
+        let mut engine = test_engine();
+        let start = link_function("start", "src/p.ts", 1);
+        let drain = link_method("Queue", "drain", "src/q.ts", 1);
+        let finish = link_function("finish", "src/r.ts", 1);
+        let flush = link_method("Sink", "flush", "src/x.ts", 1);
+        put_nodes(
+            &mut engine,
+            &[start.clone(), drain.clone(), finish.clone(), flush.clone()],
+        );
+        let first = mk_edge(&start.id, &drain.id, EdgeKind::Calls);
+        let second = mk_edge(&drain.id, &finish.id, EdgeKind::Calls);
+        put_edges(
+            &mut engine,
+            &[
+                first.clone(),
+                second.clone(),
+                synthesized(&finish, &start, EdgeKind::Calls, "src/p.ts:2"),
+                synthesized(&drain, &flush, EdgeKind::Calls, "src/x.ts:1"),
+            ],
+        );
+        let chain = [
+            flow_step(&start, None),
+            flow_step(&drain, Some(&first)),
+            flow_step(&finish, Some(&second)),
+        ];
+        let flow = named_flow(
+            &[&start, &drain, &finish],
+            &[&start, &drain, &finish],
+            &[],
+            &chain,
+        );
+        assert_eq!(
+            engine.synth_links(&flow, Some(&chain)).unwrap(),
+            ["- drain → flush   [dynamic: interface → impl @src/x.ts:1]"]
+        );
+    }
+
+    /// gin declares `Binding` once per build tag: the Flow runs through one
+    /// declaration's link, the other declaration's reads the same and is
+    /// not listed, and two links that read the same are listed once.
+    #[test]
+    fn a_line_already_shown_is_not_listed_again() {
+        let mut engine = test_engine();
+        let declared = link_method("Binding", "Bind", "binding.go", 6);
+        let declared_again = link_method("Binding", "Bind", "binding_nomsgpack.go", 6);
+        let form = link_method("formBinding", "Bind", "form.go", 5);
+        let query = link_method("queryBinding", "Bind", "query.go", 5);
+        let map_form = link_function("mapForm", "form.go", 9);
+        put_nodes(
+            &mut engine,
+            &[
+                declared.clone(),
+                declared_again.clone(),
+                form.clone(),
+                query.clone(),
+                map_form.clone(),
+            ],
+        );
+        let hop = synthesized(&declared, &form, EdgeKind::Calls, "form.go:5");
+        let call = mk_edge(&form.id, &map_form.id, EdgeKind::Calls);
+        put_edges(
+            &mut engine,
+            &[
+                hop.clone(),
+                call.clone(),
+                synthesized(&declared_again, &form, EdgeKind::Calls, "form.go:5"),
+                synthesized(&declared, &query, EdgeKind::Calls, "query.go:5"),
+                synthesized(&declared_again, &query, EdgeKind::Calls, "query.go:5"),
+            ],
+        );
+        let chain = [
+            flow_step(&declared, None),
+            flow_step(&form, Some(&hop)),
+            flow_step(&map_form, Some(&call)),
+        ];
+        let named = [&declared, &declared_again, &form, &map_form];
+        let flow = named_flow(&named, &named, &[], &chain);
+        assert_eq!(
+            engine.synth_links(&flow, Some(&chain)).unwrap(),
+            ["- Binding.Bind → queryBinding.Bind   [dynamic: interface → impl @query.go:5]"]
+        );
+    }
+
+    /// A chain step reached against its edge's direction reads as the edge
+    /// runs, so another link that reads the same is still not repeated.
+    #[test]
+    fn a_flow_hop_reads_in_the_direction_of_its_edge() {
+        let mut engine = test_engine();
+        let handle = link_function("handle", "src/a.ts", 1);
+        let emit = link_function("emit", "src/b1.ts", 1);
+        let emit_again = link_function("emit", "src/b2.ts", 1);
+        put_nodes(
+            &mut engine,
+            &[handle.clone(), emit.clone(), emit_again.clone()],
+        );
+        let hop = synthesized(&emit, &handle, EdgeKind::Calls, "src/a.ts:1");
+        put_edges(
+            &mut engine,
+            &[
+                hop.clone(),
+                synthesized(&emit_again, &handle, EdgeKind::Calls, "src/a.ts:1"),
+            ],
+        );
+        let chain = [flow_step(&handle, None), flow_step(&emit, Some(&hop))];
+        let flow = named_flow(&[&handle], &[&handle], &[], &chain);
+        // Without the chain the two links read the same: one line.
+        assert_eq!(
+            engine.synth_links(&flow, None).unwrap(),
+            ["- emit → handle   [dynamic: interface → impl @src/a.ts:1]"]
+        );
+        assert!(engine.synth_links(&flow, Some(&chain)).unwrap().is_empty());
+    }
+
+    /// A link weighs what its two ends do: 3 for a symbol a token picks
+    /// out or a named non-callable endpoint, 1 for an ambiguous token's
+    /// candidate, 0 for an end the query did not name.
+    #[test]
+    fn links_go_by_how_pointedly_the_query_names_their_ends() {
+        let mut engine = test_engine();
+        let alpha = link_function("alpha", "src/a.ts", 1);
+        let beta = link_function("beta", "src/b.ts", 1);
+        let gamma = node_lang(
+            "gamma",
+            "gamma",
+            "src/c.ts",
+            1,
+            1,
+            NodeKind::Constant,
+            Language::TypeScript,
+        );
+        // An ambiguous name's other candidate, after xray in the edge order.
+        let delta = link_function("delta", "src/d.ts", 1);
+        // Before beta in the edge order, so that order alone would list it
+        // first.
+        let xray = link_function("xray", "src/0x.ts", 1);
+        let yankee = link_function("yankee", "src/y.ts", 1);
+        let zulu = link_function("zulu", "src/z.ts", 1);
+        put_nodes(
+            &mut engine,
+            &[
+                alpha.clone(),
+                beta.clone(),
+                gamma.clone(),
+                delta.clone(),
+                xray.clone(),
+                yankee.clone(),
+                zulu.clone(),
+            ],
+        );
+        put_edges(
+            &mut engine,
+            &[
+                synthesized(&alpha, &xray, EdgeKind::Calls, "src/0x.ts:1"),
+                synthesized(&alpha, &beta, EdgeKind::Calls, "src/b.ts:1"),
+                synthesized(&alpha, &delta, EdgeKind::Calls, "src/d.ts:1"),
+                synthesized(&beta, &yankee, EdgeKind::Calls, "src/y.ts:1"),
+                synthesized(&gamma, &zulu, EdgeKind::Calls, "src/z.ts:1"),
+            ],
+        );
+        let flow = named_flow(&[&alpha, &beta, &delta], &[&beta], &[&gamma], &[]);
+        assert_eq!(
+            engine.synth_links(&flow, None).unwrap(),
+            [
+                "- alpha → beta   [dynamic: interface → impl @src/b.ts:1]",
+                "- beta → yankee   [dynamic: interface → impl @src/y.ts:1]",
+                "- gamma → zulu   [dynamic: interface → impl @src/z.ts:1]",
+                "- alpha → delta   [dynamic: interface → impl @src/d.ts:1]",
+                "- alpha → xray   [dynamic: interface → impl @src/0x.ts:1]",
+            ]
+        );
+    }
+
+    /// Links into low-value files go last, but only through an end the
+    /// query did not name: a named symbol in a spec file keeps its place.
+    #[test]
+    fn a_low_value_end_goes_last_only_when_the_query_did_not_name_it() {
+        let mut engine = test_engine();
+        let serve = link_function("serve", "src/a.ts", 1);
+        let named_spec = link_function("serveSpec", "specs/t.ts", 1);
+        let double = link_function("fakeServe", "fakes/d.test.ts", 1);
+        let real = link_function("realServe", "src/p.ts", 1);
+        put_nodes(
+            &mut engine,
+            &[
+                serve.clone(),
+                named_spec.clone(),
+                double.clone(),
+                real.clone(),
+            ],
+        );
+        put_edges(
+            &mut engine,
+            &[
+                synthesized(&serve, &named_spec, EdgeKind::Calls, "specs/t.ts:1"),
+                synthesized(&serve, &double, EdgeKind::Calls, "fakes/d.test.ts:1"),
+                synthesized(&serve, &real, EdgeKind::Calls, "src/p.ts:1"),
+            ],
+        );
+        let flow = named_flow(&[&serve, &named_spec], &[&serve], &[], &[]);
+        assert_eq!(
+            engine.synth_links(&flow, None).unwrap(),
+            [
+                "- serve → serveSpec   [dynamic: interface → impl @specs/t.ts:1]",
+                "- serve → realServe   [dynamic: interface → impl @src/p.ts:1]",
+                "- serve → fakeServe   [dynamic: interface → impl @fakes/d.test.ts:1]",
+            ]
+        );
+    }
+
+    /// Links of one rank take turns by the named symbol they hang from, a
+    /// rank being the low-value flag and the weight; past six lines the
+    /// rest are dropped (#2751).
+    #[test]
+    fn links_of_one_rank_take_turns_by_the_symbol_they_hang_from() {
+        let mut engine = test_engine();
+        let wide = link_method("Wide", "run", "src/wide.ts", 2);
+        let narrow = link_method("Narrow", "run", "src/narrow.ts", 2);
+        let extra = link_method("Extra", "run", "src/extra.ts", 4);
+        let wides: Vec<Node> = ["A", "B", "C", "D"]
+            .iter()
+            .map(|n| link_method(&format!("Wide{n}"), "run", &format!("src/wide-{n}.ts"), 4))
+            .collect();
+        let narrows: Vec<Node> = ["A", "B"]
+            .iter()
+            .map(|n| {
+                link_method(
+                    &format!("Narrow{n}"),
+                    "run",
+                    &format!("src/narrow-{n}.ts"),
+                    4,
+                )
+            })
+            .collect();
+        let mut nodes = vec![wide.clone(), narrow.clone(), extra.clone()];
+        nodes.extend(wides.iter().cloned());
+        nodes.extend(narrows.iter().cloned());
+        put_nodes(&mut engine, &nodes);
+        let mut edges = vec![synthesized(
+            &wide,
+            &extra,
+            EdgeKind::Calls,
+            "src/extra.ts:4",
+        )];
+        for target in &wides {
+            edges.push(synthesized(
+                &wide,
+                target,
+                EdgeKind::Calls,
+                &format!("{}:4", target.file_path),
+            ));
+        }
+        for target in &narrows {
+            edges.push(synthesized(
+                &narrow,
+                target,
+                EdgeKind::Calls,
+                &format!("{}:4", target.file_path),
+            ));
+        }
+        put_edges(&mut engine, &edges);
+        let flow = named_flow(
+            &[&wide, &narrow, &extra],
+            &[&wide, &narrow, &extra],
+            &[],
+            &[],
+        );
+        let links = engine.synth_links(&flow, None).unwrap();
+        let ends: Vec<&str> = links
+            .iter()
+            .map(|line| line.split("   [").next().unwrap())
+            .collect();
+        assert_eq!(
+            ends,
+            [
+                "- Wide.run → Extra.run",
+                "- Wide.run → WideA.run",
+                "- Narrow.run → NarrowA.run",
+                "- Wide.run → WideB.run",
+                "- Narrow.run → NarrowB.run",
+                "- Wide.run → WideC.run",
+            ]
+        );
+    }
+
+    /// Ties go by the edge order — kind, the other end, line, column, a
+    /// missing line first — never by the order the rows were written in,
+    /// which a sync can leave different from a fresh index's.
+    #[test]
+    fn links_follow_the_edge_order_whatever_order_the_rows_were_written_in() {
+        let mut engine = test_engine();
+        let route = link_function("route", "src/route.ts", 1);
+        let handlers: Vec<Node> = (1..=7)
+            .map(|i| link_function(&format!("handler{i}"), &format!("src/h{i}.ts"), 1))
+            .collect();
+        let mut nodes = vec![route.clone()];
+        nodes.extend(handlers.iter().cloned());
+        put_nodes(&mut engine, &nodes);
+        // Last to first, and handler1's edge with no line after its edge with
+        // one.
+        let mut edges = Vec::new();
+        for handler in handlers[1..].iter().rev() {
+            edges.push(synthesized(
+                &route,
+                handler,
+                EdgeKind::Calls,
+                &format!("{}:1", handler.file_path),
+            ));
+        }
+        let mut with_line = synthesized(&route, &handlers[0], EdgeKind::Calls, "src/h1.ts:9");
+        with_line.line = Some(9);
+        edges.push(with_line);
+        edges.push(synthesized(
+            &route,
+            &handlers[0],
+            EdgeKind::Calls,
+            "src/h1.ts:1",
+        ));
+        put_edges(&mut engine, &edges);
+        let flow = named_flow(&[&route], &[&route], &[], &[]);
+        assert_eq!(
+            engine.synth_links(&flow, None).unwrap(),
+            (1..=6)
+                .map(|i| format!(
+                    "- route → handler{i}   [dynamic: interface → impl @src/h{i}.ts:1]"
+                ))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// The edges into a named symbol come before the edges out of it, each
+    /// in the edge order: kind, the other end, line, then column, a missing
+    /// one first.
+    #[test]
+    fn links_into_a_symbol_come_before_links_out_of_it() {
+        let mut engine = test_engine();
+        let hub = link_function("hub", "src/hub.ts", 1);
+        let senders: Vec<Node> = (1..=3)
+            .map(|i| link_function(&format!("sender{i}"), &format!("src/s{i}.ts"), 1))
+            .collect();
+        // Before every sender in byte order, so an order that mixed the two
+        // directions would put it first.
+        let receiver = link_function("receiver", "src/0r.ts", 1);
+        let mut nodes = vec![hub.clone(), receiver.clone()];
+        nodes.extend(senders.iter().cloned());
+        put_nodes(&mut engine, &nodes);
+        // The edge out first, then the senders' last to first, sender1's
+        // with a column before its edge without one.
+        let mut edges = vec![synthesized(&hub, &receiver, EdgeKind::Calls, "src/0r.ts:1")];
+        for sender in senders[1..].iter().rev() {
+            edges.push(synthesized(
+                sender,
+                &hub,
+                EdgeKind::Calls,
+                &format!("{}:1", sender.file_path),
+            ));
+        }
+        let mut with_column = synthesized(&senders[0], &hub, EdgeKind::Calls, "src/s1.ts:7");
+        with_column.line = Some(1);
+        with_column.col = Some(7);
+        edges.push(with_column);
+        let mut without_column = synthesized(&senders[0], &hub, EdgeKind::Calls, "src/s1.ts:1");
+        without_column.line = Some(1);
+        edges.push(without_column);
+        put_edges(&mut engine, &edges);
+        let flow = named_flow(&[&hub], &[&hub], &[], &[]);
+        assert_eq!(
+            engine.synth_links(&flow, None).unwrap(),
+            [
+                "- sender1 → hub   [dynamic: interface → impl @src/s1.ts:1]",
+                "- sender2 → hub   [dynamic: interface → impl @src/s2.ts:1]",
+                "- sender3 → hub   [dynamic: interface → impl @src/s3.ts:1]",
+                "- hub → receiver   [dynamic: interface → impl @src/0r.ts:1]",
+            ]
+        );
+    }
+
+    #[test]
+    fn only_synthesized_edges_are_links() {
+        let mut engine = test_engine();
+        let load = link_function("load", "src/a.ts", 1);
+        let parse = link_function("parse", "src/b.ts", 1);
+        let render = link_function("render", "src/c.ts", 1);
+        put_nodes(&mut engine, &[load.clone(), parse.clone(), render.clone()]);
+        put_edges(
+            &mut engine,
+            &[
+                mk_edge(&load.id, &parse.id, EdgeKind::Calls),
+                synthesized(&load, &render, EdgeKind::Calls, "src/c.ts:1"),
+            ],
+        );
+        let flow = named_flow(&[&load], &[&load], &[], &[]);
+        assert_eq!(
+            engine.synth_links(&flow, None).unwrap(),
+            ["- load → render   [dynamic: interface → impl @src/c.ts:1]"]
+        );
+    }
+
+    /// The section as upstream prints it: alone after fewer than two named
+    /// callables (RTK thunks are `constant`s), alone after a two-node chain
+    /// (#687), and after the Flow, each with its closing line.
+    #[test]
+    fn the_links_section_reads_as_upstream_prints_it() {
+        const HEAD: &str = "**Dynamic-dispatch links among your symbols**\n\
+            (synthesized — the indirect hops grep/Read would reconstruct; the `@file:line` is the wiring site)\n\n";
+        const AFTER_FLOW: &str = "> Full source for these symbols is below — the call flow among them, followed by their bodies.\n";
+        let mut engine = test_engine();
+        let outer = node_lang(
+            "outerThunk",
+            "outerThunk",
+            "src/thunks.ts",
+            9,
+            11,
+            NodeKind::Constant,
+            Language::TypeScript,
+        );
+        let inner = node_lang(
+            "innerThunk",
+            "innerThunk",
+            "src/thunks.ts",
+            5,
+            7,
+            NodeKind::Constant,
+            Language::TypeScript,
+        );
+        let complete = link_function("completeCheckout", "src/checkout.ts", 2);
+        let settle = link_function("settleInvoice", "src/billing.ts", 2);
+        let start = link_function("start", "src/p.ts", 1);
+        let drain = link_function("drain", "src/q.ts", 1);
+        let finish = link_function("finish", "src/r.ts", 1);
+        let flush = link_function("flush", "src/x.ts", 1);
+        put_nodes(
+            &mut engine,
+            &[
+                outer.clone(),
+                inner.clone(),
+                complete.clone(),
+                settle.clone(),
+                start.clone(),
+                drain.clone(),
+                finish.clone(),
+                flush.clone(),
+            ],
+        );
+        let mut thunk = mk_edge(&outer.id, &inner.id, EdgeKind::Calls);
+        thunk.provenance = Some("heuristic".to_string());
+        thunk.metadata = Some(serde_json::json!({
+            "synthesizedBy": "redux-thunk",
+            "registeredAt": "src/thunks.ts:10",
+        }));
+        let mut event = mk_edge(&complete.id, &settle.id, EdgeKind::Calls);
+        event.provenance = Some("heuristic".to_string());
+        event.metadata = Some(serde_json::json!({
+            "synthesizedBy": "event-emitter",
+            "event": "invoice.settled",
+            "registeredAt": "src/billing.ts:3",
+        }));
+        let first = mk_edge(&start.id, &drain.id, EdgeKind::Calls);
+        let second = mk_edge(&drain.id, &finish.id, EdgeKind::Calls);
+        put_edges(
+            &mut engine,
+            &[
+                thunk,
+                event.clone(),
+                first.clone(),
+                second.clone(),
+                synthesized(&drain, &flush, EdgeKind::Calls, "src/x.ts:1"),
+            ],
+        );
+
+        let thunks = named_flow(&[], &[], &[&outer, &inner], &[]);
+        assert_eq!(
+            engine.flow_section_of(&thunks).unwrap(),
+            format!(
+                "{HEAD}- outerThunk → innerThunk   [dynamic: redux thunk @src/thunks.ts:10]\n\n\
+                 > Full source for these symbols is below.\n"
+            )
+        );
+
+        let pair = [flow_step(&complete, None), flow_step(&settle, Some(&event))];
+        let emitted = named_flow(&[&complete, &settle], &[&complete, &settle], &[], &pair);
+        assert_eq!(
+            engine.flow_section_of(&emitted).unwrap(),
+            format!(
+                "{HEAD}- completeCheckout → settleInvoice   [dynamic: event `invoice.settled` @src/billing.ts:3]\n\n{AFTER_FLOW}"
+            )
+        );
+
+        let chain = [
+            flow_step(&start, None),
+            flow_step(&drain, Some(&first)),
+            flow_step(&finish, Some(&second)),
+        ];
+        let named = [&start, &drain, &finish];
+        let flowing = named_flow(&named, &named, &[], &chain);
+        assert_eq!(
+            engine.flow_section_of(&flowing).unwrap(),
+            format!(
+                "**Flow (call path among the symbols you queried)**\n\n\
+                 1. start (src/p.ts:1)\n   ↓ calls\n\
+                 2. drain (src/q.ts:1)\n   ↓ calls\n\
+                 3. finish (src/r.ts:1)\n\n\
+                 {HEAD}- drain → flush   [dynamic: interface → impl @src/x.ts:1]\n\n{AFTER_FLOW}"
+            )
         );
     }
 }

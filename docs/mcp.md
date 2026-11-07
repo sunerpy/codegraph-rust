@@ -365,6 +365,22 @@ Conditions are read for JavaScript, TypeScript, Swift, Python, Java, Kotlin,
 C#, Go, C, C++ and Objective-C callers; a caller file that changed since it was
 indexed, or one above 256 KiB, gets none rather than one read at a stale line.
 
+A **Dynamic-dispatch links among your symbols** section follows the Flow, or
+stands alone when there is none: one line per synthesized edge at a symbol the
+query names, whether or not it names the other end, such as
+`- Shape.area → Square.area   [dynamic: interface → impl @square.ts:4]`. It also
+lists the links of a query that names one callable, or only non-callable
+endpoints such as RTK thunks. Two same-name ends are each named by their owner
+(`Owner.member` for a method). An edge with both ends on the Flow is left out,
+and so is a line that reads like a Flow hop or a line already listed. At most
+six lines are listed. Links into test, spec, icon and translation files
+through an end the query did not name go last; before them, links whose ends
+the query names more precisely come first: a symbol a token picks out (at most
+three definitions) before a candidate of an ambiguous name. Links of one rank
+take turns by the named symbol they hang from, so one long fan-out cannot fill
+the list, and the graph's edge order settles the rest, so a synced index and a
+fresh one list the same lines.
+
 Explicit source paths in the query are resolved before fuzzy search and pinned
 to the front of the result. Quoted/backticked paths, `./`, and Windows
 separators are normalized; exact matches precede segment-aligned suffix
