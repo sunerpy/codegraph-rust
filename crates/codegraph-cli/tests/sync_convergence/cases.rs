@@ -10554,6 +10554,441 @@ pub fn typescript_nestjs_provider_beside_its_controller_appears() -> Case {
         )
 }
 
+const EXPRESS_PACKAGE: &str =
+    "{\"name\":\"app\",\"private\":true,\"dependencies\":{\"express\":\"^4.0.0\"}}\n";
+
+const PLAIN_PACKAGE: &str = "{\"name\":\"app\",\"private\":true,\"dependencies\":{}}\n";
+
+/// An Express app that loads a router, without mounting it.
+const EXPRESS_APP: &str = "const express = require('express');\nconst users = require('./routes/users');\nconst app = express();\n";
+
+/// The same app mounting the router at `/api`.
+const EXPRESS_APP_MOUNT: &str = "const express = require('express');\nconst users = require('./routes/users');\nconst app = express();\napp.use('/api', users);\n";
+
+/// A router whose inline handler calls `loadUser`.
+const EXPRESS_USERS: &str = "const router = require('express').Router();\nrouter.get('/users/:id', (req, res) => res.json(loadUser(req.params.id)));\nfunction loadUser(id) {\n  return { id };\n}\nfunction findUser(id) {\n  return { id };\n}\nmodule.exports = router;\n";
+
+const EXPRESS_USERS_ROUTE: &str = "route routes/users.js::GET:/users/:id";
+
+/// W7-19a: a mount appears (upstream `postExtract`): the mounted router's
+/// routes are renamed under its prefix, though their file did not change.
+pub fn javascript_express_mount_appears() -> Case {
+    Case::new(Change::BodyEdit, &[Language::JavaScript])
+        .file("package.json", EXPRESS_PACKAGE)
+        .file("app.js", EXPRESS_APP)
+        .file("routes/users.js", EXPRESS_USERS)
+        .write("app.js", EXPRESS_APP_MOUNT)
+        .named_before("route", "GET /users/:id")
+        .named_after("route", "GET /api/users/:id")
+        .edge_throughout(EXPRESS_USERS_ROUTE, "calls", "function loadUser")
+        .edge_after("route app.js::USE:/api", "references", "constant router")
+}
+
+/// W7-19a: the mount goes away: a route an earlier sync renamed gets its
+/// in-file name back, as a fresh index names it.
+pub fn javascript_express_mount_is_removed() -> Case {
+    Case::new(Change::BodyEdit, &[Language::JavaScript])
+        .file("package.json", EXPRESS_PACKAGE)
+        .file("app.js", EXPRESS_APP_MOUNT)
+        .file("routes/users.js", EXPRESS_USERS)
+        .write("app.js", EXPRESS_APP)
+        .named_before("route", "GET /api/users/:id")
+        .named_after("route", "GET /users/:id")
+        .edge_throughout(EXPRESS_USERS_ROUTE, "calls", "function loadUser")
+}
+
+/// W7-19a: the mount's prefix changes.
+pub fn javascript_express_mount_prefix_changes() -> Case {
+    Case::new(Change::BodyEdit, &[Language::JavaScript])
+        .file("package.json", EXPRESS_PACKAGE)
+        .file("app.js", EXPRESS_APP_MOUNT)
+        .file("routes/users.js", EXPRESS_USERS)
+        .write(
+            "app.js",
+            "const express = require('express');\nconst users = require('./routes/users');\nconst app = express();\napp.use('/v2', users);\n",
+        )
+        .named_before("route", "GET /api/users/:id")
+        .named_after("route", "GET /v2/users/:id")
+        .edge_after("route app.js::USE:/v2", "references", "constant router")
+}
+
+/// W7-19a: a second file mounts the same router at another path: one name
+/// cannot be two paths, so the routes get their in-file names back.
+pub fn javascript_express_second_mount_of_a_router_appears() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::JavaScript])
+        .file("package.json", EXPRESS_PACKAGE)
+        .file("app.js", EXPRESS_APP_MOUNT)
+        .file("routes/users.js", EXPRESS_USERS)
+        .write(
+            "admin.js",
+            "const app = require('express')();\napp.use('/admin', require('./routes/users'));\n",
+        )
+        .named_before("route", "GET /api/users/:id")
+        .named_after("route", "GET /users/:id")
+        .named_after("route", "USE /admin")
+}
+
+/// W7-19a: the mounted router's handler is edited: its re-extracted route
+/// is renamed again under the unchanged mount.
+pub fn javascript_express_mounted_handler_body_edit() -> Case {
+    Case::new(Change::BodyEdit, &[Language::JavaScript])
+        .file("package.json", EXPRESS_PACKAGE)
+        .file("app.js", EXPRESS_APP_MOUNT)
+        .file("routes/users.js", EXPRESS_USERS)
+        .write(
+            "routes/users.js",
+            "const router = require('express').Router();\nrouter.get('/users/:id', (req, res) => res.json(findUser(req.params.id)));\nfunction loadUser(id) {\n  return { id };\n}\nfunction findUser(id) {\n  return { id };\n}\nmodule.exports = router;\n",
+        )
+        .named_before("route", "GET /api/users/:id")
+        .named_after("route", "GET /api/users/:id")
+        .edge_before(EXPRESS_USERS_ROUTE, "calls", "function loadUser")
+        .edge_after(EXPRESS_USERS_ROUTE, "calls", "function findUser")
+        .no_edge_after(EXPRESS_USERS_ROUTE, "calls", "function loadUser")
+}
+
+const EXPRESS_SERVER: &str = "const express = require('express');\nconst app = express();\napp.get('/health', health);\nfunction health(req, res) {}\n";
+
+/// W7-19a: the manifest comes to declare Express: Express is detected and
+/// every file is extracted again, so the app's route appears.
+pub fn javascript_express_dependency_appears_in_package_json() -> Case {
+    Case::new(Change::ControlFile, &[Language::JavaScript])
+        .file("package.json", PLAIN_PACKAGE)
+        .file("server/app.js", EXPRESS_SERVER)
+        .write("package.json", EXPRESS_PACKAGE)
+        .edge_after(
+            "route server/app.js::GET:/health",
+            "references",
+            "function health",
+        )
+}
+
+/// W7-19a: without a manifest that declares it, Express is detected by a
+/// file under a `routes` path that reads like a router (upstream's path
+/// scan); one arriving brings every file's routes.
+pub fn javascript_express_routes_file_appears_without_a_dependency() -> Case {
+    Case::new(Change::ControlFile, &[Language::JavaScript])
+        .file("package.json", PLAIN_PACKAGE)
+        .file("server/app.js", EXPRESS_SERVER)
+        .write(
+            "src/routes/users.js",
+            "const router = require('express').Router();\nrouter.get('/users', list);\nfunction list(req, res) {}\nmodule.exports = router;\n",
+        )
+        .edge_after(
+            "route server/app.js::GET:/health",
+            "references",
+            "function health",
+        )
+        .edge_after(
+            "route src/routes/users.js::GET:/users",
+            "references",
+            "function list",
+        )
+}
+
+const EXPRESS_ONE_AUTH: &str =
+    "function auth(req, res, next) {\n  next();\n}\nfunction setup() {\n  auth();\n}\n";
+
+const EXPRESS_TWO_AUTH: &str = "function auth(req, res, next) {\n  next();\n}\nfunction setup() {\n  auth();\n}\nfunction auth(req, res, next) {\n  next();\n}\n";
+
+/// W7-19a: a second `auth` appears in the calling file. Express proposes
+/// nothing for two candidates, so the call follows the name matcher: its
+/// sole-candidate edge becomes the ambiguous one.
+pub fn javascript_express_second_middleware_appears_in_the_file() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::JavaScript])
+        .file("package.json", EXPRESS_PACKAGE)
+        .file("server/app.js", EXPRESS_ONE_AUTH)
+        .write("server/app.js", EXPRESS_TWO_AUTH)
+        .edge_before("function setup", "calls", "function auth @server/app.js:1")
+        .edge_after("function setup", "calls", "function auth @server/app.js:7")
+        .no_edge_after("function setup", "calls", "function auth @server/app.js:1")
+}
+
+/// W7-19a: the second `auth` goes away again.
+pub fn javascript_express_second_middleware_is_removed_from_the_file() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::JavaScript])
+        .file("package.json", EXPRESS_PACKAGE)
+        .file("server/app.js", EXPRESS_TWO_AUTH)
+        .write("server/app.js", EXPRESS_ONE_AUTH)
+        .edge_before("function setup", "calls", "function auth @server/app.js:7")
+        .edge_after("function setup", "calls", "function auth @server/app.js:1")
+}
+
+const EXPRESS_HANDLERS: &str = "function list(req, res) {}\nfunction handle(req, res) {\n  userController.list(req, res);\n}\n";
+
+const EXPRESS_HANDLERS_LIST: (&str, &str, &str) = (
+    "function handle",
+    "calls",
+    "function list @src/user.handlers.js",
+);
+
+/// W7-19a: another file whose path names the controller gains a `list`:
+/// two candidates, so Express's edge to the calling file's `list` goes and
+/// the call stays unresolved.
+pub fn javascript_express_controller_method_gains_a_candidate() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::JavaScript])
+        .file("package.json", EXPRESS_PACKAGE)
+        .file("src/user.handlers.js", EXPRESS_HANDLERS)
+        .write("src/user.store.js", "function list() {}\n")
+        .edge_metadata_before(EXPRESS_HANDLERS_LIST, "framework", "express")
+        .no_edge_after(
+            EXPRESS_HANDLERS_LIST.0,
+            EXPRESS_HANDLERS_LIST.1,
+            EXPRESS_HANDLERS_LIST.2,
+        )
+}
+
+/// W7-19a: the other `list` goes away: the calling file's is the sole
+/// candidate again, Express's edge.
+pub fn javascript_express_controller_method_loses_a_candidate() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::JavaScript])
+        .file("package.json", EXPRESS_PACKAGE)
+        .file("src/user.handlers.js", EXPRESS_HANDLERS)
+        .file("src/user.store.js", "function list() {}\n")
+        .remove("src/user.store.js")
+        .edge_metadata_after(EXPRESS_HANDLERS_LIST, "framework", "express")
+}
+
+const EXPRESS_API: &str = "function lookup(id) {}\nfunction show(req, res) {\n  return userService.lookup(req.params.id);\n}\n";
+
+const EXPRESS_API_LOOKUP: (&str, &str, &str) =
+    ("function show", "calls", "function lookup @src/user.api.js");
+
+/// W7-19a: another file whose path names the service gains a `lookup`.
+pub fn javascript_express_service_method_gains_a_candidate() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::JavaScript])
+        .file("package.json", EXPRESS_PACKAGE)
+        .file("src/user.api.js", EXPRESS_API)
+        .write("src/user.store.js", "function lookup(id) {}\n")
+        .edge_metadata_before(EXPRESS_API_LOOKUP, "framework", "express")
+        .no_edge_after(
+            EXPRESS_API_LOOKUP.0,
+            EXPRESS_API_LOOKUP.1,
+            EXPRESS_API_LOOKUP.2,
+        )
+}
+
+/// W7-19a: the other `lookup` goes away.
+pub fn javascript_express_service_method_loses_a_candidate() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::JavaScript])
+        .file("package.json", EXPRESS_PACKAGE)
+        .file("src/user.api.js", EXPRESS_API)
+        .file("src/user.store.js", "function lookup(id) {}\n")
+        .remove("src/user.store.js")
+        .edge_metadata_after(EXPRESS_API_LOOKUP, "framework", "express")
+}
+
+const EXPRESS_CORS_APP: &str = "import { corsMiddleware } from 'cors-kit';\nfunction cors(req, res, next) {\n  next();\n}\nfunction setup(app) {\n  corsMiddleware();\n}\n";
+
+/// W7-19a: a declaration of `corsMiddleware` appears in another file.
+/// Upstream's second middleware tier is not ported, so Express proposes
+/// nothing either way: the call follows the name matcher alone.
+pub fn javascript_express_x_middleware_declaration_appears() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::JavaScript])
+        .file("package.json", EXPRESS_PACKAGE)
+        .file("server/app.js", EXPRESS_CORS_APP)
+        .write("lib/kit.js", "export function corsMiddleware() {}\n")
+        .edge_after(
+            "function setup",
+            "calls",
+            "function corsMiddleware @lib/kit.js",
+        )
+        .no_edge_after("function setup", "calls", "function cors")
+}
+
+/// W7-19a: the `corsMiddleware` declaration goes away again.
+pub fn javascript_express_x_middleware_declaration_is_removed() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::JavaScript])
+        .file("package.json", EXPRESS_PACKAGE)
+        .file("server/app.js", EXPRESS_CORS_APP)
+        .file("lib/kit.js", "export function corsMiddleware() {}\n")
+        .remove("lib/kit.js")
+        .edge_before(
+            "function setup",
+            "calls",
+            "function corsMiddleware @lib/kit.js",
+        )
+        .no_edge_after("function setup", "calls", "function cors")
+}
+
+const EXPRESS_OBJECT_CALLER: &str = "import { userController } from './user.objects';\nfunction handle(req, res) {\n  userController.list(req, res);\n}\n";
+
+const EXPRESS_OBJECT: &str = "export const userController = {\n  list(req, res) {},\n};\n";
+
+/// W7-19a: the imported `userController` object appears. Upstream's second
+/// controller tier is not ported and the object's `list` is not in the
+/// calling file, so Express proposes nothing: the import resolves the call.
+pub fn javascript_express_controller_object_appears() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::JavaScript])
+        .file("package.json", EXPRESS_PACKAGE)
+        .file("src/handlers.js", EXPRESS_OBJECT_CALLER)
+        .write("src/user.objects.js", EXPRESS_OBJECT)
+        .edge_after("function handle", "calls", "function userController::list")
+}
+
+/// W7-19a: the imported `userController` object goes away.
+pub fn javascript_express_controller_object_is_deleted() -> Case {
+    Case::new(Change::DeleteImportedModule, &[Language::JavaScript])
+        .file("package.json", EXPRESS_PACKAGE)
+        .file("src/handlers.js", EXPRESS_OBJECT_CALLER)
+        .file("src/user.objects.js", EXPRESS_OBJECT)
+        .remove("src/user.objects.js")
+        .edge_before("function handle", "calls", "function userController::list")
+}
+
+const ASTRO_PACKAGE: &str =
+    "{\"name\":\"site\",\"private\":true,\"dependencies\":{\"astro\":\"^5.0.0\"}}\n";
+
+/// W7-19a: a page appears under `src/pages/`: a route served by its own
+/// component (upstream #2267).
+pub fn astro_page_appears() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Astro])
+        .file("package.json", ASTRO_PACKAGE)
+        .file("src/pages/index.astro", "<h1>home</h1>\n")
+        .write("src/pages/about.astro", "<p>about</p>\n")
+        .edge_throughout(
+            "route src/pages/index.astro::route:/",
+            "calls",
+            "component src/pages/index.astro::index",
+        )
+        .edge_metadata_after(
+            (
+                "route src/pages/about.astro::route:/about",
+                "calls",
+                "component src/pages/about.astro::about",
+            ),
+            "framework",
+            "astro",
+        )
+}
+
+/// W7-19a: an endpoint comes to export another verb.
+pub fn typescript_astro_endpoint_verb_changes() -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript])
+        .file("package.json", ASTRO_PACKAGE)
+        .file(
+            "src/pages/api/hello.ts",
+            "export const GET = async () => new Response('hi');\n",
+        )
+        .write(
+            "src/pages/api/hello.ts",
+            "export const POST = async () => new Response('hi');\n",
+        )
+        .edge_before(
+            "route src/pages/api/hello.ts::route:/api/hello",
+            "references",
+            "function GET",
+        )
+        .edge_after(
+            "route src/pages/api/hello.ts::route:/api/hello",
+            "references",
+            "function POST",
+        )
+}
+
+/// W7-19a: the root manifest stops declaring Astro, and no `.astro` file
+/// remains to detect it: the endpoint is no route any more.
+pub fn typescript_astro_dependency_leaves_package_json() -> Case {
+    Case::new(Change::ControlFile, &[Language::TypeScript])
+        .file("package.json", ASTRO_PACKAGE)
+        .file(
+            "src/pages/api/hello.ts",
+            "export const GET = async () => new Response('hi');\n",
+        )
+        .write("package.json", PLAIN_PACKAGE)
+        .edge_before(
+            "route src/pages/api/hello.ts::route:/api/hello",
+            "references",
+            "function GET",
+        )
+}
+
+const ASTRO_CARD: &str = "---\nconst { t } = Astro.props;\n---\n<div>{t}</div>\n";
+
+const ASTRO_GALLERY_CARD: (&str, &str, &str) = (
+    "component src/components/Gallery.astro::Gallery",
+    "references",
+    "component src/components/cards/Card.astro::Card",
+);
+
+fn astro_gallery(case: Case) -> Case {
+    case.file("package.json", ASTRO_PACKAGE)
+        .file(
+            "src/components/Gallery.astro",
+            "<section><Card t=\"x\" /></section>\n",
+        )
+        .file("src/components/cards/Card.astro", ASTRO_CARD)
+        .file("src/layouts/Card.astro", ASTRO_CARD)
+}
+
+/// W7-19a: a second `Card` appears under the tag's directory: Astro
+/// proposes nothing for two, so its edge becomes the name matcher's.
+pub fn astro_second_component_appears_in_the_directory() -> Case {
+    astro_gallery(Case::new(Change::AddCompetitor, &[Language::Astro]))
+        .write("src/components/more/Card.astro", ASTRO_CARD)
+        .edge_metadata_before(ASTRO_GALLERY_CARD, "framework", "astro")
+        .edge_after(
+            ASTRO_GALLERY_CARD.0,
+            ASTRO_GALLERY_CARD.1,
+            ASTRO_GALLERY_CARD.2,
+        )
+        .no_edge_metadata_after(ASTRO_GALLERY_CARD, "framework", "astro")
+}
+
+/// W7-19a: the second `Card` goes away: the directory's sole one is
+/// Astro's edge again.
+pub fn astro_second_component_leaves_the_directory() -> Case {
+    astro_gallery(Case::new(Change::AddCompetitor, &[Language::Astro]))
+        .file("src/components/more/Card.astro", ASTRO_CARD)
+        .remove("src/components/more/Card.astro")
+        .edge_before(
+            ASTRO_GALLERY_CARD.0,
+            ASTRO_GALLERY_CARD.1,
+            ASTRO_GALLERY_CARD.2,
+        )
+        .edge_metadata_after(ASTRO_GALLERY_CARD, "framework", "astro")
+}
+
+const ASTRO_LOGIN: &str = "---\nimport { getCollection } from 'astro:content';\nconst posts = await getCollection('blog');\nif (!Astro.cookies.has('s')) return Astro.redirect('/login');\nconst { title } = Astro.props;\n---\n<h1>{title}</h1>\n";
+
+const ASTRO_NAV: &str = "export function redirect(to: string) { return to; }\nexport function has(x: string) { return !!x; }\n";
+
+const ASTRO_LOGIN_SELF: (&str, &str, &str) = (
+    "component src/pages/login.astro::login",
+    "calls",
+    "component src/pages/login.astro::login",
+);
+
+/// W7-19a: a module declaring `redirect` and `has` appears. `Astro.redirect`
+/// and `Astro.cookies.has` are the runtime's whatever the project declares:
+/// their edges to the page's own component stay.
+pub fn astro_global_member_namesakes_appear() -> Case {
+    Case::new(
+        Change::AddCompetitor,
+        &[Language::Astro, Language::TypeScript],
+    )
+    .file("package.json", ASTRO_PACKAGE)
+    .file("src/pages/login.astro", ASTRO_LOGIN)
+    .write("src/lib/nav.ts", ASTRO_NAV)
+    .edge_metadata_before(ASTRO_LOGIN_SELF, "framework", "astro")
+    .edge_metadata_after(ASTRO_LOGIN_SELF, "framework", "astro")
+    .no_edge_after(ASTRO_LOGIN_SELF.0, "calls", "function redirect")
+    .no_edge_after(ASTRO_LOGIN_SELF.0, "calls", "function has")
+}
+
+/// W7-19a: the module declaring `redirect` and `has` goes away.
+pub fn astro_global_member_namesakes_leave() -> Case {
+    Case::new(
+        Change::AddCompetitor,
+        &[Language::Astro, Language::TypeScript],
+    )
+    .file("package.json", ASTRO_PACKAGE)
+    .file("src/pages/login.astro", ASTRO_LOGIN)
+    .file("src/lib/nav.ts", ASTRO_NAV)
+    .remove("src/lib/nav.ts")
+    .edge_metadata_before(ASTRO_LOGIN_SELF, "framework", "astro")
+    .edge_metadata_after(ASTRO_LOGIN_SELF, "framework", "astro")
+}
+
 /// W7-03: a `nuxt.config.ts` appears in a Vue app (upstream #2130): Nuxt is
 /// detected, and its `pages/` become routes served by their components.
 pub fn vue_nuxt_config_appears() -> Case {
