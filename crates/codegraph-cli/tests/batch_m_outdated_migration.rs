@@ -14,6 +14,8 @@
 //! the index namespace, and an `uninitialized` namespace stays reserved for an
 //! explicit `init`.
 
+mod upgrade_support;
+
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -2598,7 +2600,10 @@ fn outdated_migration_synthesizes_dispatch_edges() {
         migrated.edges
     );
     let marker = rusqlite::Connection::open_with_flags(
-        format!("file:{}?immutable=1", paths.current_db().display()),
+        format!(
+            "{}?immutable=1",
+            upgrade_support::sqlite_file_uri(&paths.current_db())
+        ),
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
     )
     .expect("open the migrated db")
