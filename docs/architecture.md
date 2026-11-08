@@ -783,7 +783,16 @@ references written as a path (a Liquid `{% render 'price' %}` waits under
 `price` for `snippets/price.liquid`), send their files
 down the whole-file re-resolution lane, which rebuilds an unchanged file's
 resolved edges and keeps what its extraction produced (`contains` edges and
-same-file value references). A call through a class name (`User.create()`)
+same-file value references). Framework nodes (a React Router route) are made
+by passes that run after a file's re-extraction, so comparing a
+changed file's stored nodes with its re-extracted ones touches their names; when
+that comparison is all that touched names in a sync, and once the passes have
+run each compared file's nodes, compared again with its stored ones, touch
+none, the sync retries no reference by name. A name touched any other way (by a
+lane above, by a removed file), a framework node made or changed in a file the
+sync did not compare, a cross-file route table that changed, or compared files
+holding more stored nodes than the check keeps, leave the retry as it was. A
+call through a class name (`User.create()`)
 reads the supertypes each class head names, at most five levels up, which no
 node records: every index and sync keeps a `class_heads:` row per file declaring
 such a type, with what each declaration's own head writes, and a sync seeds the
