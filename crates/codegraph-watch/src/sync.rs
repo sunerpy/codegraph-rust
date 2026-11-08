@@ -1399,13 +1399,13 @@ fn sync_paths_with_store(
                 project_root.to_string_lossy(),
             )
             .with_max_file_size(scope.options.max_file_size);
+            let mut reexported = Vec::new();
             for (file, statement) in &changed_names.python_imports {
-                changed_names.any.extend(
-                    codegraph_resolve::import_resolver::python_reexported_names(
-                        file, statement, &context,
-                    ),
-                );
+                reexported.extend(codegraph_resolve::import_resolver::python_reexported_names(
+                    file, statement, &context,
+                ));
             }
+            changed_names.note_any(reexported);
         }
         let name_list: Vec<String> = changed_names.any.iter().cloned().collect();
         for affected in store.reference_sites_of_edges_to_named_targets(&name_list)? {
@@ -1468,18 +1468,25 @@ fn sync_paths_with_store(
         // nodes/refs were dropped on re-extraction (upstream tree-sitter.ts:4796-4819).
         if resolver.has_framework_resolvers() {
             let reindexed_files: Vec<String> = reindexed.iter().cloned().collect();
-            resolver.extract_and_persist_frameworks_with(
+            let framework_files = resolver.extract_and_persist_frameworks_with(
                 store,
                 &reindexed_files,
                 &scope.framework,
                 &scope.options.extensions,
             )?;
+            changed_names.note_framework_node_files(&framework_files);
         }
         // Cross-file framework finalization on every sync, before anything is
         // resolved, as a full index runs it (upstream's sync runs
         // runPostExtract before its resolution too): a route a constant names
-        // is renamed before a navigation call resolves against it.
-        resolver.run_post_extract(store)?;
+        // is renamed before a navigation call resolves against it. The
+        // updates are compared with the stored nodes before they are written,
+        // for the restore check.
+        let post_extract = resolver.post_extract_updates(store);
+        changed_names.note_post_extract_updates(store, &post_extract)?;
+        if !post_extract.is_empty() {
+            store.upsert_nodes(&post_extract)?;
+        }
         // Then the nodes no single file's extraction makes, the routes of
         // the tables another file hands React Router (W7-09d): what the
         // passes want now, compared with the store, the first change
@@ -1489,6 +1496,7 @@ fn sync_paths_with_store(
         let cross_file = resolver.plan_cross_file_nodes(store)?;
         if cross_file.changes_store() {
             changed_names.begin_mutation(store)?;
+            changed_names.abandon_restore_check();
         }
         let cross_file_applied = resolver.apply_cross_file_plan(store, &cross_file, false)?;
         for affected in cross_file_applied.incoming {
@@ -1531,6 +1539,17 @@ fn sync_paths_with_store(
         // name too, however many share its tail (W5-05).
         let mut retry_names = changed_names.any.clone();
         retry_names.extend(changed_names.qualified.iter().cloned());
+        // A sync whose touched names are all names of framework nodes a
+        // re-extraction left out and the passes put back as they were has
+        // nothing to wake: the store's nodes are what they were, so every
+        // reference parked under one of those names sees the candidates it
+        // saw. It skips the one pass over the parked references a retry by
+        // name reads (W7-19a0).
+        if changed_names.only_restored_nodes_touched(store)? {
+            retry_names.clear();
+        }
+        #[cfg(test)]
+        tests::note_retry_names(&retry_names);
         resolver.resolve_incremental_and_persist(
             store,
             &scope_files,
@@ -2446,7 +2465,7 @@ fn note_python_global_readers(
             }
         }
     }
-    changed_names.any.extend(names);
+    changed_names.note_any(names);
     for found in sites {
         if !reindexed.contains(&found.file_path) {
             merge_dependent_site(dependent_sites, dependent_fallbacks, found);
@@ -2519,32 +2538,13 @@ fn reextract_into_store(
     // Other languages read declaration text no node records (a C function's
     // `static`), so their moved nodes still touch.
     let old_nodes = store.nodes_by_file_path(relative)?;
-    let old_ids: HashSet<(&str, &str)> = old_nodes
-        .iter()
-        .map(|node| (node.id.as_str(), node.name.as_str()))
-        .collect();
-    let new_ids: HashSet<(&str, &str)> = result
-        .nodes
-        .iter()
-        .map(|node| (node.id.as_str(), node.name.as_str()))
-        .collect();
-    let order_before = positioned_candidate_keys(&old_nodes);
-    let order_after = positioned_candidate_keys(&result.nodes);
-    let touched_when_moved: HashSet<&str> = old_nodes
-        .iter()
-        .chain(&result.nodes)
-        .filter(|node| {
-            node.language != Language::Php
-                && !(node.language == Language::Dart && node.kind == NodeKind::Import)
-        })
-        .map(|node| node.name.as_str())
-        .collect();
-    for (_, name) in old_ids.symmetric_difference(&new_ids) {
-        if touched_when_moved.contains(*name) || order_before.get(*name) != order_after.get(*name) {
-            changed_names.any.insert((*name).to_string());
-        }
-    }
-    changed_names.note_candidates(&old_nodes, &result.nodes);
+    let mut touched = ChangedNames::default();
+    touched.note_node_diff(&old_nodes, &result.nodes);
+    // The stored nodes stay for the restore check when the comparison
+    // touched a name: a framework's nodes are among them, and no
+    // re-extraction makes those (W7-19a0).
+    changed_names.note_restorable(relative, &old_nodes, &touched);
+    changed_names.absorb_node_diff(touched);
     // What other files' Java resolution reads of this one's text and
     // packages, before and after (W4-JVM-01).
     changed_names.java.note(
@@ -2824,6 +2824,48 @@ struct ChangedNames {
     /// What the changed files held that a Dart name or import in other files
     /// reads: their directives (W4-DART-02).
     dart_libraries: crate::dart_libraries::DartLibraryChanges,
+    /// Whether every name this sync touched may be a name of stored nodes its
+    /// framework passes put back as they were (W7-19a0): a name is touched
+    /// either by a changed file's node comparison or through
+    /// [`Self::note_all`] and [`Self::note_any`], which stop the check.
+    restored: RestoreCheck,
+}
+
+/// What a sync keeps to tell, once its framework passes have run, whether the
+/// names it touched were touched only by framework nodes a re-extraction left
+/// out and the passes put back as they were
+/// ([`ChangedNames::only_restored_nodes_touched`]).
+#[derive(Debug, Default)]
+struct RestoreCheck {
+    /// The stored nodes of each changed file whose node comparison touched a
+    /// name, from before the change, by file.
+    files: BTreeMap<String, Vec<Node>>,
+    /// How many nodes `files` holds, at most [`RESTORE_CHECK_NODE_LIMIT`].
+    nodes: usize,
+    /// Set once the sync touched a name some other way, would keep more nodes
+    /// than the limit, or had a framework pass change a node outside `files`:
+    /// its retry by name then runs as it always does.
+    abandoned: bool,
+}
+
+impl RestoreCheck {
+    fn abandon(&mut self) {
+        self.abandoned = true;
+        self.files.clear();
+        self.nodes = 0;
+    }
+}
+
+/// How many stored nodes a sync keeps for its restore check. The check saves
+/// one pass over the parked references, which a sync of a few files notices; a
+/// larger sync retries by name rather than hold its files' old nodes.
+const RESTORE_CHECK_NODE_LIMIT: usize = 10_000;
+
+/// Whether `a` and `b` are the same node but for when each was written.
+fn same_but_timestamp(a: &Node, b: &Node) -> bool {
+    let mut a = a.clone();
+    a.updated_at = b.updated_at;
+    a == *b
 }
 
 /// What a changed Python file held before the change. A module global's
@@ -2918,9 +2960,153 @@ impl ChangedNames {
     /// them differently.
     fn note_all(&mut self, names: impl IntoIterator<Item = String>) {
         for name in names {
+            self.restored.abandon();
             self.candidates.insert(name.clone());
             self.any.insert(name);
         }
+    }
+
+    /// Stop the restore check: this sync retries by name as it always does.
+    fn abandon_restore_check(&mut self) {
+        self.restored.abandon();
+    }
+
+    /// Touch `names` for the name lane alone: what a name reaches moved
+    /// though no node of it changed (a Python re-export, a module global's
+    /// readers).
+    fn note_any(&mut self, names: impl IntoIterator<Item = String>) {
+        for name in names {
+            self.restored.abandon();
+            self.any.insert(name);
+        }
+    }
+
+    /// Touch the names whose nodes differ between a file's stored nodes
+    /// (`before`) and the ones its re-extraction made (`after`), the
+    /// comparison `reextract_into_store` describes: an id that came or went
+    /// touches its name, unless only a PHP node or a Dart import moved and
+    /// the order of that name's nodes held, and [`Self::note_candidates`]
+    /// adds the names whose candidates changed.
+    fn note_node_diff(&mut self, before: &[Node], after: &[Node]) {
+        let old_ids: HashSet<(&str, &str)> = before
+            .iter()
+            .map(|node| (node.id.as_str(), node.name.as_str()))
+            .collect();
+        let new_ids: HashSet<(&str, &str)> = after
+            .iter()
+            .map(|node| (node.id.as_str(), node.name.as_str()))
+            .collect();
+        let order_before = positioned_candidate_keys(before);
+        let order_after = positioned_candidate_keys(after);
+        let touched_when_moved: HashSet<&str> = before
+            .iter()
+            .chain(after)
+            .filter(|node| {
+                node.language != Language::Php
+                    && !(node.language == Language::Dart && node.kind == NodeKind::Import)
+            })
+            .map(|node| node.name.as_str())
+            .collect();
+        for (_, name) in old_ids.symmetric_difference(&new_ids) {
+            if touched_when_moved.contains(*name)
+                || order_before.get(*name) != order_after.get(*name)
+            {
+                self.any.insert((*name).to_string());
+            }
+        }
+        self.note_candidates(before, after);
+    }
+
+    /// Whether [`Self::note_node_diff`] touched nothing.
+    fn touches_nothing(&self) -> bool {
+        self.any.is_empty()
+            && self.candidates.is_empty()
+            && self.qualified.is_empty()
+            && self.rust_receiver_types.is_empty()
+    }
+
+    /// What one file's [`Self::note_node_diff`] touched, added to this sync's.
+    fn absorb_node_diff(&mut self, touched: ChangedNames) {
+        self.any.extend(touched.any);
+        self.candidates.extend(touched.candidates);
+        self.qualified.extend(touched.qualified);
+        self.rust_receiver_types.extend(touched.rust_receiver_types);
+    }
+
+    /// Keep `file`'s stored nodes (`before`) for the restore check when its
+    /// node comparison (`touched`) touched a name.
+    fn note_restorable(&mut self, file: &str, before: &[Node], touched: &ChangedNames) {
+        if self.restored.abandoned || touched.touches_nothing() {
+            return;
+        }
+        if self.restored.files.contains_key(file)
+            || self.restored.nodes + before.len() > RESTORE_CHECK_NODE_LIMIT
+        {
+            self.restored.abandon();
+            return;
+        }
+        self.restored.nodes += before.len();
+        self.restored
+            .files
+            .insert(file.to_string(), before.to_vec());
+    }
+
+    /// The framework extraction of the changed files made nodes in `files`:
+    /// one in a file the check does not keep is a node no comparison saw.
+    fn note_framework_node_files(&mut self, files: &BTreeSet<String>) {
+        if files
+            .iter()
+            .any(|file| !self.restored.files.contains_key(file))
+        {
+            self.restored.abandon();
+        }
+    }
+
+    /// `updates` are what the post-extract passes are about to write: one
+    /// that changes a stored node outside the files the check keeps changes a
+    /// node no comparison saw.
+    fn note_post_extract_updates(&mut self, store: &Store, updates: &[Node]) -> Result<()> {
+        if self.restored.abandoned {
+            return Ok(());
+        }
+        let outside: Vec<&Node> = updates
+            .iter()
+            .filter(|node| !self.restored.files.contains_key(&node.file_path))
+            .collect();
+        if outside.is_empty() {
+            return Ok(());
+        }
+        let ids: Vec<String> = outside.iter().map(|node| node.id.clone()).collect();
+        let stored = store.nodes_by_ids(&ids)?;
+        if outside.iter().any(|update| {
+            stored
+                .get(&update.id)
+                .is_none_or(|node| !same_but_timestamp(node, update))
+        }) {
+            self.restored.abandon();
+        }
+        Ok(())
+    }
+
+    /// Whether every name this sync touched is one its framework passes made
+    /// moot (W7-19a0): only node comparisons touched names, no pass changed a
+    /// node outside the files they compared, and each of those files' nodes,
+    /// read back now, touch nothing against its stored ones. The store's
+    /// nodes are then what they were before the sync, so a retry by those
+    /// names would wake references whose candidates are what they were.
+    fn only_restored_nodes_touched(&self, store: &Store) -> Result<bool> {
+        if self.restored.abandoned {
+            return Ok(false);
+        }
+        for (file, before) in &self.restored.files {
+            let after = store.nodes_by_file_path(file)?;
+            let mut touched = ChangedNames::default();
+            touched.note_node_diff(before, &after);
+            if !touched.touches_nothing() {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     /// Record each name whose nodes differ between `before` and `after` as a ref
@@ -3141,6 +3327,21 @@ pub(crate) mod tests {
         /// How the syncs on this thread refreshed each dependent file.
         static DEPENDENT_REFRESHES: std::cell::RefCell<Vec<DependentRefresh>> =
             const { std::cell::RefCell::new(Vec::new()) };
+        /// The names each sync on this thread retried parked references by,
+        /// sorted.
+        static RETRY_NAMES: std::cell::RefCell<Vec<Vec<String>>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    pub(crate) fn note_retry_names(names: &HashSet<String>) {
+        let mut names: Vec<String> = names.iter().cloned().collect();
+        names.sort();
+        RETRY_NAMES.with(|retries| retries.borrow_mut().push(names));
+    }
+
+    /// The names each sync since the last call retried by, in sync order.
+    fn take_retry_names() -> Vec<Vec<String>> {
+        RETRY_NAMES.with(|retries| std::mem::take(&mut *retries.borrow_mut()))
     }
 
     /// One dependent file a sync refreshed: whether its references came
@@ -9544,5 +9745,284 @@ pub(crate) mod tests {
             store.file_by_path("src/consumer.ts").unwrap().is_some(),
             "the consumer must survive the helper's deletion"
         );
+    }
+
+    // W7-19a0: a sync whose touched names are only framework nodes its
+    // re-extraction left out and its passes put back retries no name.
+
+    const RESTORE_PACKAGE: (&str, &str) = (
+        "package.json",
+        "{\"dependencies\":{\"react\":\"18\",\"react-router-dom\":\"6\"}}\n",
+    );
+    const RESTORE_PAGE: (&str, &str) = (
+        "src/Reports.js",
+        "export default function Reports() {\n  return null;\n}\n",
+    );
+    const RESTORE_ROUTES: (&str, &str) = (
+        "src/routes.js",
+        "import { Routes, Route } from 'react-router-dom';\nimport Reports from './Reports';\n\nexport default function Router() {\n  return <Routes><Route path=\"/reports\" element={<Reports/>}/></Routes>;\n}\n",
+    );
+
+    /// `file` with a comment appended: no node of its own moves.
+    fn with_comment(file: (&str, &str)) -> (String, String) {
+        (file.0.to_string(), format!("{}// edited\n", file.1))
+    }
+
+    fn write_owned(root: &Path, files: &[&(String, String)]) {
+        let files: Vec<(&str, &str)> = files
+            .iter()
+            .map(|(path, contents)| (path.as_str(), contents.as_str()))
+            .collect();
+        write_files(root, &files);
+    }
+
+    /// The names the one sync of `paths` retried parked references by.
+    fn retried_by(dir: &TestDir, db: &Path, paths: &[&str]) -> Vec<String> {
+        take_retry_names();
+        sync_changed_paths(dir.path(), db, paths.iter().copied()).unwrap();
+        let mut syncs = take_retry_names();
+        assert_eq!(syncs.len(), 1, "one sync: {syncs:?}");
+        syncs.pop().unwrap()
+    }
+
+    fn restore_fixture(name: &str, extra: &[(&str, &str)]) -> (TestDir, PathBuf) {
+        let dir = TestDir::new(name);
+        let db = default_db_path(dir.path()).unwrap();
+        let mut initial = vec![RESTORE_PACKAGE, RESTORE_PAGE, RESTORE_ROUTES];
+        initial.extend_from_slice(extra);
+        write_files(dir.path(), &initial);
+        sync_changed_paths(dir.path(), &db, initial.iter().map(|(path, _)| *path)).unwrap();
+        let routes = Store::open(&db).unwrap().nodes_by_name("/reports").unwrap();
+        assert!(
+            routes.iter().any(|node| node.kind == NodeKind::Route),
+            "the fixture's route is a framework node: {routes:?}"
+        );
+        (dir, db)
+    }
+
+    /// Given a route file whose re-extraction leaves its React Router route
+    /// out, when a comment is appended, the route comes back as it was: the
+    /// sync retries no name, and its graph is a fresh index's.
+    #[test]
+    fn a_sync_that_only_puts_framework_nodes_back_retries_no_name() {
+        let (dir, db) = restore_fixture("restore-only", &[]);
+        let edited = with_comment(RESTORE_ROUTES);
+        write_owned(dir.path(), &[&edited]);
+        assert_eq!(
+            retried_by(&dir, &db, &[RESTORE_ROUTES.0]),
+            Vec::<String>::new()
+        );
+        let fresh = fresh_edges(
+            "restore-only-fresh",
+            &[RESTORE_PACKAGE, RESTORE_PAGE, (&edited.0, &edited.1)],
+        );
+        assert_eq!(edge_projection(&db), fresh);
+    }
+
+    /// A route whose path changed comes back as another node: the sync
+    /// retries by the names its file's comparison touched.
+    #[test]
+    fn a_sync_that_changes_a_framework_node_retries_by_its_names() {
+        let (dir, db) = restore_fixture("restore-changed", &[]);
+        write_files(
+            dir.path(),
+            &[(
+                RESTORE_ROUTES.0,
+                &RESTORE_ROUTES.1.replace("\"/reports\"", "\"/report\""),
+            )],
+        );
+        let retried = retried_by(&dir, &db, &[RESTORE_ROUTES.0]);
+        assert!(retried.contains(&"/reports".to_string()), "{retried:?}");
+    }
+
+    /// A file the same sync removed touched its names through the removal
+    /// lane, not a node comparison: the retry runs.
+    #[test]
+    fn a_removed_file_keeps_the_retry_of_a_sync_that_put_framework_nodes_back() {
+        let spare = (
+            "src/Spare.js",
+            "export function Spare() {\n  return null;\n}\n",
+        );
+        let (dir, db) = restore_fixture("restore-removed", &[spare]);
+        write_owned(dir.path(), &[&with_comment(RESTORE_ROUTES)]);
+        fs::remove_file(dir.path().join(spare.0)).unwrap();
+        let retried = retried_by(&dir, &db, &[RESTORE_ROUTES.0, spare.0]);
+        assert!(retried.contains(&"Spare".to_string()), "{retried:?}");
+        assert!(retried.contains(&"/reports".to_string()), "{retried:?}");
+    }
+
+    /// Another changed file whose own nodes held gains a route: the
+    /// framework extraction made a node no comparison saw, so the retry
+    /// runs.
+    #[test]
+    fn a_framework_node_another_changed_file_gains_keeps_the_retry() {
+        let more = (
+            "src/More.js",
+            "import { Routes, Route } from 'react-router-dom';\n\nexport function More() {\n  return null;\n}\n",
+        );
+        let (dir, db) = restore_fixture("restore-gained", &[more]);
+        assert!(
+            Store::open(&db)
+                .unwrap()
+                .nodes_by_name("/more")
+                .unwrap()
+                .is_empty()
+        );
+        write_owned(dir.path(), &[&with_comment(RESTORE_ROUTES)]);
+        write_files(
+            dir.path(),
+            &[(
+                more.0,
+                &more.1.replace(
+                    "return null;",
+                    "return <Routes><Route path=\"/more\" element={null}/></Routes>;",
+                ),
+            )],
+        );
+        let retried = retried_by(&dir, &db, &[RESTORE_ROUTES.0, more.0]);
+        assert!(retried.contains(&"/reports".to_string()), "{retried:?}");
+        assert!(
+            Store::open(&db)
+                .unwrap()
+                .nodes_by_name("/more")
+                .unwrap()
+                .iter()
+                .any(|node| node.kind == NodeKind::Route)
+        );
+    }
+
+    /// The constant a route in an unchanged file is named from changes past
+    /// the 100 characters its node records: the post-extract pass renames a
+    /// node no comparison saw, so the retry runs.
+    #[test]
+    fn a_post_extract_rename_in_another_file_keeps_the_retry() {
+        let paths = (
+            "src/config/paths.js",
+            "export const paths = {\n  app: { reports: { path: '/reports' }, settings: { path: '/settings' }, profile: { path: '/profile' }, root: { path: '/app' } },\n};\n",
+        );
+        let router = (
+            "src/router.js",
+            "import { createBrowserRouter } from 'react-router-dom';\nimport { paths } from './config/paths';\nimport Reports from './Reports';\n\nexport const router = createBrowserRouter([\n  { path: paths.app.root.path, element: <Reports /> },\n]);\n",
+        );
+        let (dir, db) = restore_fixture("restore-renamed", &[paths, router]);
+        let route_named = |db: &Path, name: &str| {
+            Store::open(db)
+                .unwrap()
+                .nodes_by_name(name)
+                .unwrap()
+                .iter()
+                .any(|node| node.kind == NodeKind::Route && node.file_path == router.0)
+        };
+        assert!(route_named(&db, "/app"));
+        write_owned(dir.path(), &[&with_comment(RESTORE_ROUTES)]);
+        write_files(
+            dir.path(),
+            &[(paths.0, &paths.1.replace("'/app'", "'/dash'"))],
+        );
+        let retried = retried_by(&dir, &db, &[RESTORE_ROUTES.0, paths.0]);
+        assert!(route_named(&db, "/dash"), "the pass renamed the route");
+        assert!(retried.contains(&"/reports".to_string()), "{retried:?}");
+    }
+
+    /// An unchanged-looking file stops handing a table to the router: the
+    /// cross-file pass changes the table's routes, so the retry runs.
+    #[test]
+    fn a_cross_file_route_change_keeps_the_retry() {
+        let extra = (
+            "src/extra.js",
+            "import { Routes, Route } from 'react-router-dom';\nimport Reports from './Reports';\n\nexport function Extra() {\n  return <Routes><Route path=\"/extra\" element={<Reports/>}/></Routes>;\n}\n",
+        );
+        let dir = TestDir::new("restore-cross-file");
+        let db = default_db_path(dir.path()).unwrap();
+        let initial = [
+            TABLE_PACKAGE,
+            TABLE_PAGE,
+            TABLE_LAYOUT,
+            SELF_MAPPED,
+            EARLIER_HANDS,
+            extra,
+        ];
+        write_files(dir.path(), &initial);
+        sync_changed_paths(dir.path(), &db, initial.iter().map(|(path, _)| *path)).unwrap();
+        let before = table_route_edges(&db);
+        write_owned(dir.path(), &[&with_comment(extra)]);
+        write_files(
+            dir.path(),
+            &[(
+                EARLIER_HANDS.0,
+                &EARLIER_HANDS
+                    .1
+                    .replace("useRoutes(tableRoutes)", "useRoutes([])"),
+            )],
+        );
+        let retried = retried_by(&dir, &db, &[extra.0, EARLIER_HANDS.0]);
+        assert_ne!(table_route_edges(&db), before, "the table's routes moved");
+        assert!(retried.contains(&"/extra".to_string()), "{retried:?}");
+    }
+
+    #[test]
+    fn a_name_touched_outside_a_node_comparison_stops_the_restore_check() {
+        let mut names = ChangedNames::default();
+        names.note_all(Vec::<String>::new());
+        names.note_any(Vec::<String>::new());
+        assert!(!names.restored.abandoned, "no name, no touch");
+        names.note_any(["x".to_string()]);
+        assert!(names.restored.abandoned);
+        let mut names = ChangedNames::default();
+        names.note_all(["x".to_string()]);
+        assert!(names.restored.abandoned);
+    }
+
+    #[test]
+    fn the_restore_check_keeps_each_file_once_and_within_its_limit() {
+        let node = |id: &str| Node {
+            id: id.to_string(),
+            kind: NodeKind::Route,
+            name: id.to_string(),
+            qualified_name: id.to_string(),
+            file_path: "src/a.js".to_string(),
+            language: Language::JavaScript,
+            start_line: 1,
+            end_line: 1,
+            start_column: 0,
+            end_column: 0,
+            docstring: None,
+            signature: None,
+            visibility: None,
+            is_exported: false,
+            is_async: false,
+            is_static: false,
+            is_abstract: false,
+            decorators: Vec::new(),
+            type_parameters: Vec::new(),
+            return_type: None,
+            updated_at: 0,
+        };
+        let before = vec![node("route:a"), node("route:b")];
+        let mut touched = ChangedNames::default();
+        touched.note_node_diff(&before, &[]);
+        assert!(!touched.touches_nothing());
+        let mut quiet = ChangedNames::default();
+        quiet.note_node_diff(&before, &before);
+        assert!(quiet.touches_nothing());
+
+        let mut names = ChangedNames::default();
+        names.note_restorable("src/a.js", &before, &quiet);
+        assert!(
+            names.restored.files.is_empty(),
+            "nothing touched, nothing kept"
+        );
+        names.restored.nodes = RESTORE_CHECK_NODE_LIMIT - 2;
+        names.note_restorable("src/a.js", &before, &touched);
+        assert!(!names.restored.abandoned, "at the limit");
+        assert_eq!(names.restored.files.len(), 1);
+        names.note_restorable("src/b.js", &before[..1], &touched);
+        assert!(names.restored.abandoned, "past the limit");
+        assert!(names.restored.files.is_empty());
+
+        let mut names = ChangedNames::default();
+        names.note_restorable("src/a.js", &before, &touched);
+        names.note_restorable("src/a.js", &before, &touched);
+        assert!(names.restored.abandoned, "a file kept twice");
     }
 }

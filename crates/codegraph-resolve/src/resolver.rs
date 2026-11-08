@@ -1626,20 +1626,26 @@ impl ReferenceResolver {
     /// safe after every index and every incremental sync. Returns the number of
     /// nodes updated.
     pub fn run_post_extract(&self, store: &mut Store) -> anyhow::Result<usize> {
-        let mut all_updates: Vec<Node> = Vec::new();
-        {
-            let context = self.store_context(store);
-            for resolver in &self.framework_resolver_extensions {
-                if let Some(nodes) = resolver.post_extract(&context) {
-                    all_updates.extend(nodes);
-                }
-            }
-        }
+        let all_updates = self.post_extract_updates(store);
         let updated = all_updates.len();
         if !all_updates.is_empty() {
             store.upsert_nodes(&all_updates)?;
         }
         Ok(updated)
+    }
+
+    /// The node updates [`Self::run_post_extract`] persists, read without
+    /// writing them, in the order it upserts them: a sync compares them with
+    /// the stored nodes before it writes them.
+    pub fn post_extract_updates(&self, store: &Store) -> Vec<Node> {
+        let context = self.store_context(store);
+        let mut all_updates: Vec<Node> = Vec::new();
+        for resolver in &self.framework_resolver_extensions {
+            if let Some(nodes) = resolver.post_extract(&context) {
+                all_updates.extend(nodes);
+            }
+        }
+        all_updates
     }
 
     /// What the detected resolvers' cross-file passes
@@ -1798,21 +1804,23 @@ impl ReferenceResolver {
             relative_files,
             &crate::framework::FrameworkExtractionContext::without_config(&self.project_root),
             &codegraph_extract::ext_config::ExtensionOverrides::default(),
-        )
+        )?;
+        Ok(())
     }
 
     /// Like [`Self::extract_and_persist_frameworks`] but driven by the addressed
     /// project's EXPLICITLY loaded configuration: `context` carries its framework
     /// config (Godot DSL fields) and `extensions` its custom extension→language
     /// overrides, so language gating and framework extraction both reflect that
-    /// one project and never another's.
+    /// one project and never another's. Returns the files the persisted nodes
+    /// are in.
     pub fn extract_and_persist_frameworks_with(
         &self,
         store: &mut Store,
         relative_files: &[String],
         context: &crate::framework::FrameworkExtractionContext,
         extensions: &codegraph_extract::ext_config::ExtensionOverrides,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<BTreeSet<String>> {
         let collection =
             self.collect_framework_extraction_with(relative_files, context, extensions);
         if !collection.nodes.is_empty() {
@@ -1821,7 +1829,11 @@ impl ReferenceResolver {
         if !collection.unresolved_references.is_empty() {
             store.insert_unresolved_refs(&collection.unresolved_references)?;
         }
-        Ok(())
+        Ok(collection
+            .nodes
+            .iter()
+            .map(|node| node.file_path.clone())
+            .collect())
     }
 
     /// Whether a framework resolver's extraction of `file_path` reads other
