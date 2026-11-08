@@ -18533,10 +18533,11 @@ mod import_bindings {
     ];
 
     /// What this port's fresh index links from the importers to the modules
-    /// (upstream's `LINKS`, in this port's graph: it links neither Astro's
-    /// `Shell` to the `BaseLayout` component nor Express's mount of
-    /// `uploadRoutes` to its `router`, upstream's two other links).
-    const LINKS: [&str; 21] = [
+    /// (upstream's `LINKS`, in this port's graph: it does not link Astro's
+    /// `Shell` to the `BaseLayout` component, upstream's one other link).
+    /// Express's mount route references the router its default import names
+    /// (W7-19a).
+    const LINKS: [&str; 22] = [
         // The test file's top-level `const page = <Component />` renders it
         // (W7-14e's `jsx-render`), recomputed with the import's link.
         "calls constant src/pages/groups_page.test.tsx -> function src/pages/groups_page.tsx::Component",
@@ -18560,6 +18561,7 @@ mod import_bindings {
         "references component src/App.svelte -> component src/lib/Hero.svelte::Hero",
         "references component src/layouts/LayoutMain.vue -> component src/views/error/404.vue::404",
         "references constant src/pages/groups_page.test.tsx -> function src/pages/groups_page.tsx::Component",
+        "references route backend/server.js -> constant backend/routes/uploadRoutes.js::router",
     ];
 
     fn project_of(files: &[(&str, &str)]) -> Project {
@@ -20281,6 +20283,886 @@ mod nextjs {
 
     fn assert_no_edge_any(graph: &Graph, from: &str, to: &str) {
         graph.assert_no_edge(from, "navigates", to);
+    }
+}
+
+mod express {
+    use super::support::{EdgeRow, Graph, Indexed, Project};
+
+    /// A manifest that declares Express (upstream's fixtures).
+    const EXPRESS_PACKAGE: &str =
+        "{\"name\":\"app\",\"private\":true,\"dependencies\":{\"express\":\"^4.0.0\"}}";
+
+    fn project_of(files: &[(&str, &str)]) -> Project {
+        files.iter().fold(Project::new(), |project, (path, text)| {
+            project.file(path, text)
+        })
+    }
+
+    /// Every route's name, sorted.
+    fn route_names(graph: &Graph) -> Vec<String> {
+        let mut names: Vec<String> = graph
+            .nodes
+            .iter()
+            .filter(|node| node.kind == "route")
+            .map(|node| node.name.clone())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// The id of the one route named `name`.
+    #[track_caller]
+    fn route_id<'g>(graph: &'g Graph, name: &str) -> &'g str {
+        let found: Vec<&str> = graph
+            .nodes
+            .iter()
+            .filter(|node| node.kind == "route" && node.name == name)
+            .map(|node| node.id.as_str())
+            .collect();
+        assert_eq!(found.len(), 1, "routes named `{name}`\n{}", graph.report());
+        found[0]
+    }
+
+    /// The names of what the route named `name` links to by `kind` edges,
+    /// sorted (upstream's `fromRoute`).
+    #[track_caller]
+    fn from_route(graph: &Graph, name: &str, kind: &str) -> Vec<String> {
+        let id = route_id(graph, name);
+        let mut names: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.source == id && edge.kind == kind)
+            .filter_map(|edge| graph.node(&edge.target).map(|node| node.name.clone()))
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// The non-`contains` edges leaving `id`.
+    fn edges_leaving<'g>(graph: &'g Graph, id: &str) -> Vec<&'g EdgeRow> {
+        graph
+            .edges
+            .iter()
+            .filter(|edge| edge.source == id && edge.kind != "contains")
+            .collect()
+    }
+
+    /// Every non-`contains` edge leaving a node of `file`, described.
+    fn edges_from_file(graph: &Graph, file: &str) -> Vec<String> {
+        graph
+            .edges
+            .iter()
+            .filter(|edge| edge.kind != "contains")
+            .filter(|edge| {
+                graph
+                    .node(&edge.source)
+                    .is_some_and(|node| node.file_path == file)
+            })
+            .map(|edge| graph.describe_edge(edge))
+            .collect()
+    }
+
+    /// Every edge leaving the one node `source` matches, with its whole
+    /// metadata, and every reference it leaves unresolved, sorted.
+    #[track_caller]
+    fn leaving(graph: &Graph, source: &str) -> Vec<String> {
+        let sources = graph.nodes_matching(source);
+        assert_eq!(sources.len(), 1, "`{source}` matches\n{}", graph.report());
+        let id = sources[0].id.as_str();
+        let mut out: Vec<String> = edges_leaving(graph, id)
+            .into_iter()
+            .map(|edge| format!("{}  {}", graph.describe_edge(edge), edge.metadata))
+            .chain(
+                graph
+                    .unresolved
+                    .iter()
+                    .filter(|reference| reference.from_node_id == id)
+                    .map(|reference| graph.describe_ref(reference)),
+            )
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// Upstream #2200 (`route-inline-handler-calls.test.ts`): an inline
+    /// handler's calls keep their receivers. Hono's `c.text('Hello')` is no
+    /// call of the project's one other `text`, its client's
+    /// `ClientResponse::text`; `userService.lookup()` reaches the service it
+    /// names, through its import. The app is found by its `src/routes/` path.
+    #[test]
+    fn pr2200_an_inline_handlers_calls_keep_their_receivers() {
+        let project = project_of(&[
+            (
+                "package.json",
+                "{\"name\":\"api\",\"dependencies\":{\"hono\":\"^4\"}}",
+            ),
+            (
+                "src/client/types.ts",
+                "export interface ClientResponse {\n  text(): Promise<string>;\n}\n",
+            ),
+            (
+                "src/services.ts",
+                "export const userService = {\n  lookup(id: number) {\n    return { id };\n  },\n};\n",
+            ),
+            (
+                "src/routes/app.ts",
+                "import { Hono } from 'hono';\nimport { userService } from '../services';\n\nconst app = new Hono();\n\napp.get('/hello', (c) => c.text('Hello'));\n\napp.get('/users/:id', async (c) => {\n  const user = await userService.lookup(1);\n  return c.json(user);\n});\n\nexport default app;\n",
+            ),
+        ])
+        .index();
+        let graph = project.graph();
+        let hello = route_id(graph, "GET /hello");
+        assert!(edges_leaving(graph, hello).is_empty(), "{}", graph.report());
+        graph.assert_unresolved("route src/routes/app.ts::GET:/hello", "calls", "c.text");
+        graph.assert_no_edge(
+            "route src/routes/app.ts::GET:/hello",
+            "calls",
+            "method ClientResponse::text",
+        );
+        graph.assert_edge(
+            "route src/routes/app.ts::GET:/users/:id",
+            "calls",
+            "function userService::lookup @src/services.ts",
+            Some("import"),
+        );
+    }
+
+    /// Upstream #2243 (`express-heuristic-same-file.test.ts`): the name
+    /// patterns resolve only the calling file's own declaration. SvelteKit's
+    /// remote `validate(arg)` (a parameter) is never the config loader's
+    /// `validate` in another package.
+    #[test]
+    fn pr2243_a_name_pattern_never_reaches_another_files_declaration() {
+        let project = project_of(&[
+            ("package.json", EXPRESS_PACKAGE),
+            (
+                "packages/kit/src/core/config/options.js",
+                "export function validate(config) {\n  return config;\n}\n",
+            ),
+            (
+                "packages/kit/src/runtime/remote/query.js",
+                "export function query(validate, arg) {\n  return () => validate(arg);\n}\n",
+            ),
+            (
+                "server/app.js",
+                "const express = require('express');\nconst app = express();\n\nfunction validateBody(req, res, next) {\n  next();\n}\n\napp.post('/items', validateBody, (req, res) => res.send('ok'));\n",
+            ),
+        ])
+        .index();
+        let graph = project.graph();
+        assert_eq!(
+            edges_from_file(graph, "packages/kit/src/runtime/remote/query.js"),
+            Vec::<String>::new(),
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream #2261 (`express-inline-function-handler.test.ts`): a
+    /// function-expression handler is the route's body, like an arrow, also
+    /// inside a wrapper call past a trailing comma; a named last argument
+    /// stays the handler after an inline middleware.
+    #[test]
+    fn pr2261_a_function_expression_handler_lends_the_route_its_calls() {
+        let project = project_of(&[
+            ("package.json", EXPRESS_PACKAGE),
+            (
+                "app.js",
+                "const express = require('express');\nconst app = express();\nconst router = express.Router();\n\nfunction authenticate(name, pass, fn) {\n  fn(null, { name });\n}\n\nfunction restrict(req, res, next) {\n  next();\n}\n\nfunction loadUser(id) {\n  return { id };\n}\n\nfunction listPosts() {\n  return [];\n}\n\nfunction wrap(fn) {\n  return fn;\n}\n\nfunction showPost(req, res) {\n  res.send('post');\n}\n\napp.post('/login', function (req, res, next) {\n  authenticate(req.body.username, req.body.password, function (err, user) {\n    res.redirect('/');\n  });\n});\n\napp.get('/restricted', restrict, function named(req, res) {\n  res.send(loadUser(req.params.id));\n});\n\nrouter.get(\n  '/posts',\n  wrap(async function (req, res) {\n    res.json(listPosts());\n  }),\n);\n\napp.get('/post/:id', (req, res, next) => next(), showPost);\n\nrouter.route('/users/:id').get(function (req, res) {\n  res.json(loadUser(req.params.id));\n});\n",
+            ),
+        ])
+        .index();
+        let graph = project.graph();
+        assert!(from_route(graph, "POST /login", "calls").contains(&"authenticate".to_string()));
+        assert!(from_route(graph, "GET /restricted", "calls").contains(&"loadUser".to_string()));
+        assert!(from_route(graph, "GET /users/:id", "calls").contains(&"loadUser".to_string()));
+        assert!(from_route(graph, "GET /posts", "calls").contains(&"listPosts".to_string()));
+        assert!(from_route(graph, "GET /post/:id", "references").contains(&"showPost".to_string()));
+        assert_eq!(
+            from_route(graph, "GET /post/:id", "calls"),
+            Vec::<String>::new()
+        );
+    }
+
+    /// Upstream `frameworks.test.ts` ("Express mounts with a division in a
+    /// middleware argument"): `cfg.max! / 2` is no regex, so the mount still
+    /// composes its prefix, and the mount route references the router its
+    /// default import names.
+    #[test]
+    fn a_division_in_a_middleware_argument_still_mounts() {
+        let project = project_of(&[
+            ("package.json", "{\"dependencies\":{\"express\":\"4\"}}"),
+            (
+                "app.ts",
+                "import express from 'express';\nimport apiRouter from './routes/api';\nconst app = express();\napp.use('/api', rateLimit({ max: cfg.max! / 2 }), apiRouter);\n",
+            ),
+            (
+                "routes/api.ts",
+                "import { Router } from 'express';\nconst router = Router();\nfunction listUsers(req, res) {}\nrouter.get('/users', listUsers);\nexport default router;\n",
+            ),
+        ])
+        .index();
+        let graph = project.graph();
+        assert_eq!(
+            route_names(graph),
+            ["GET /api/users", "USE /api"],
+            "{}",
+            graph.report()
+        );
+        graph.assert_edge(
+            "route app.ts::USE:/api",
+            "references",
+            "constant router @routes/api.ts",
+            Some("import"),
+        );
+    }
+
+    /// Upstream #2415 (`framework-resolve-language.test.ts`, "Express beside
+    /// Go code"): Express resolves only JavaScript and TypeScript; a Go
+    /// method's `*zap.Logger` result is not the method itself.
+    #[test]
+    fn pr2415_express_resolves_no_go_reference() {
+        let project = project_of(&[
+            (
+                "package.json",
+                "{\"name\":\"dashboard\",\"dependencies\":{\"express\":\"^4.19.0\"}}",
+            ),
+            (
+                "web/server.js",
+                "const express = require('express');\nconst app = express();\n\nfunction logger(req, res, next) {\n  next();\n}\n\napp.use(logger);\napp.get('/health', (req, res) => res.json({ ok: true }));\n",
+            ),
+            ("go.mod", "module example.com/kv\n\ngo 1.22\n"),
+            (
+                "server/read/read_test.go",
+                "package read\n\nimport \"go.uber.org/zap\"\n\ntype mockServer struct {\n\tlg *zap.Logger\n}\n\nfunc (s *mockServer) Logger() *zap.Logger { return s.lg }\n",
+            ),
+        ])
+        .index();
+        let graph = project.graph();
+        assert_eq!(route_names(graph), ["GET /health"], "{}", graph.report());
+        assert_eq!(
+            edges_from_file(graph, "server/read/read_test.go"),
+            Vec::<String>::new(),
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream `nestjs-global-prefix.test.ts` test 3, its route-name half
+    /// (the http channel is W7-20): an Express route in the same repository
+    /// keeps its path under NestJS's global prefix and version.
+    #[test]
+    fn an_express_route_beside_nestjs_keeps_its_path() {
+        let project = project_of(&[
+            (
+                "package.json",
+                "{\"dependencies\":{\"@nestjs/core\":\"^11.0.0\",\"@nestjs/common\":\"^11.0.0\",\"@angular/core\":\"^19.0.0\",\"express\":\"^4.0.0\"}}",
+            ),
+            (
+                "apps/api/src/main.ts",
+                "import { NestFactory } from '@nestjs/core';\nimport { VersioningType } from '@nestjs/common';\nimport { AppModule } from './app/app.module';\nasync function bootstrap() {\n  const app = await NestFactory.create(AppModule);\n  app.enableVersioning({ defaultVersion: '1', type: VersioningType.URI });\n  app.setGlobalPrefix('api', { exclude: ['sitemap.xml', 'health{/*wildcard}'] });\n  await app.listen(3333);\n}\nbootstrap();\n",
+            ),
+            (
+                "apps/api/src/app/user.controller.ts",
+                "import { Controller, Get } from '@nestjs/common';\n@Controller('user')\nexport class UserController {\n  @Get()\n  public getUser() {}\n}\n",
+            ),
+            (
+                "apps/client/src/app/user.service.ts",
+                "import { HttpClient } from '@angular/common/http';\nexport class UserService {\n  constructor(private http: HttpClient) {}\n  public fetchUser() {\n    return this.http.get<User>('/api/v1/user');\n  }\n}\n",
+            ),
+            (
+                "tools/mock-server/src/server.ts",
+                "import express from 'express';\nconst app = express();\napp.get('/status', (req, res) => res.json({ ok: true }));\n",
+            ),
+        ])
+        .index();
+        let names = route_names(project.graph());
+        for wanted in ["GET /api/v1/user", "GET /status"] {
+            assert!(
+                names.iter().any(|name| name == wanted),
+                "{wanted}\n{}",
+                project.graph().report()
+            );
+        }
+    }
+
+    /// Upstream `postExtract`: prefixes compose down a mount tree three
+    /// levels deep, through each kind of mount target: an imported router,
+    /// an inline `require('./x')` and a name bound to a `require`. A mount is
+    /// a route of its own, renamed with the rest of its file.
+    #[test]
+    fn mounts_compose_down_a_three_level_tree() {
+        let project = project_of(&[
+            ("package.json", EXPRESS_PACKAGE),
+            (
+                "server.js",
+                "import express from 'express';\nimport api from './routes/index.js';\nconst app = express();\napp.use('/api', api);\n",
+            ),
+            (
+                "routes/index.js",
+                "const express = require('express');\nconst router = express.Router();\nrouter.use('/users', require('./users'));\nmodule.exports = router;\n",
+            ),
+            (
+                "routes/users.js",
+                "const express = require('express');\nconst router = express.Router();\nconst admin = require('./admin');\nrouter.get('/:id', getUser);\nrouter.use('/admin', admin);\nfunction getUser(req, res) {}\nmodule.exports = router;\n",
+            ),
+            (
+                "routes/admin.js",
+                "const router = require('express').Router();\nrouter.delete('/:id', removeUser);\nfunction removeUser(req, res) {}\nmodule.exports = router;\n",
+            ),
+        ])
+        .index();
+        let graph = project.graph();
+        assert_eq!(
+            route_names(graph),
+            [
+                "DELETE /api/users/admin/:id",
+                "GET /api/users/:id",
+                "USE /api",
+                "USE /api/users",
+                "USE /api/users/admin"
+            ],
+            "{}",
+            graph.report()
+        );
+        // Renamed in place: the in-file path stays in the qualified name.
+        graph.assert_edge(
+            "route routes/users.js::GET:/:id",
+            "references",
+            "function getUser",
+            None,
+        );
+    }
+
+    /// A router mounted at two different paths keeps its in-file names (one
+    /// name cannot be two paths), and a file mounting itself is no mount.
+    #[test]
+    fn a_router_mounted_twice_or_by_itself_keeps_its_names() {
+        let project = project_of(&[
+            ("package.json", EXPRESS_PACKAGE),
+            (
+                "api.js",
+                "const app = require('express')();\napp.use('/v1', require('./routes/users'));\n",
+            ),
+            (
+                "admin.js",
+                "const app = require('express')();\napp.use('/v2', require('./routes/users'));\n",
+            ),
+            (
+                "routes/users.js",
+                "const router = require('express').Router();\nrouter.get('/users', list);\nfunction list(req, res) {}\nmodule.exports = router;\n",
+            ),
+            (
+                "self.js",
+                "const express = require('express');\nconst app = express();\napp.use('/api', require('./self'));\napp.get('/health', health);\nfunction health(req, res) {}\n",
+            ),
+        ])
+        .index();
+        assert_eq!(
+            route_names(project.graph()),
+            [
+                "GET /health",
+                "GET /users",
+                "USE /api",
+                "USE /v1",
+                "USE /v2"
+            ],
+            "{}",
+            project.graph().report()
+        );
+    }
+
+    /// KEEP-RUST: a mount renames only Express's own routes. Upstream renames
+    /// every route of the mounted file whose qualified name reads
+    /// `file::X:/path`, so the Astro endpoint `/api/hello` would become
+    /// `route /x/api/hello`, a name nothing could restore when the mount
+    /// went away.
+    #[test]
+    fn keep_rust_a_mount_leaves_another_frameworks_route_alone() {
+        let project = project_of(&[
+            (
+                "package.json",
+                "{\"name\":\"site\",\"private\":true,\"dependencies\":{\"astro\":\"^5.0.0\",\"express\":\"^4.0.0\"}}",
+            ),
+            (
+                "server.ts",
+                "import express from 'express';\nconst app = express();\napp.use('/x', require('./src/pages/api/hello'));\n",
+            ),
+            (
+                "src/pages/api/hello.ts",
+                "import { Router } from 'express';\nconst router = Router();\nrouter.get('/ping', ping);\nfunction ping(req, res) {}\nexport const GET = async () => new Response('hi');\nexport default router;\n",
+            ),
+        ])
+        .index();
+        assert_eq!(
+            route_names(project.graph()),
+            ["/api/hello", "GET /x/ping", "USE /x"],
+            "{}",
+            project.graph().report()
+        );
+    }
+
+    /// The same files indexed with and without what detects Express: a
+    /// manifest that declares it, and one that declares nothing (no path
+    /// holds `routes`, `controllers` or `middleware`).
+    fn with_and_without_express(files: &[(&str, &str)]) -> (Indexed, Indexed) {
+        let tree = |manifest: &str| {
+            files
+                .iter()
+                .fold(
+                    Project::new().file("package.json", manifest),
+                    |project, (path, text)| project.file(path, text),
+                )
+                .index()
+        };
+        (
+            tree("{\"name\":\"api\",\"dependencies\":{\"express\":\"^4\"}}"),
+            tree("{\"name\":\"api\",\"dependencies\":{}}"),
+        )
+    }
+
+    /// KEEP-RUST: where a pattern finds several candidates, or a tier this
+    /// port does not have would, Express proposes nothing (upstream takes the
+    /// first the store returns), so the reference resolves as it would in a
+    /// project without Express: every edge it leaves, and whatever it leaves
+    /// unresolved, is the same with and without Express, and no edge is
+    /// Express's. Returns what it leaves.
+    #[track_caller]
+    fn assert_express_abstains(files: &[(&str, &str)], source: &str) -> Vec<String> {
+        let (express, plain) = with_and_without_express(files);
+        let with = leaving(express.graph(), source);
+        assert_eq!(
+            with,
+            leaving(plain.graph(), source),
+            "with Express:\n{}\nwithout:\n{}",
+            express.graph().report(),
+            plain.graph().report()
+        );
+        assert!(
+            !with.iter().any(|line| line.contains("\"framework\"")),
+            "{with:#?}"
+        );
+        with
+    }
+
+    /// KEEP-RUST: two `auth` declarations in the calling file are two
+    /// candidates; the call gets the name matcher's ambiguous edge.
+    #[test]
+    fn keep_rust_two_middleware_candidates_resolve_as_without_express() {
+        let left = assert_express_abstains(
+            &[(
+                "server/app.js",
+                "function auth(req, res, next) {\n  next();\n}\nfunction auth(req, res, next) {\n  next();\n}\nfunction setup() {\n  auth();\n}\n",
+            )],
+            "function setup",
+        );
+        assert_eq!(left.len(), 1, "{left:#?}");
+        assert!(
+            left[0].contains("-[calls]-> function auth @server/app.js:4"),
+            "{left:#?}"
+        );
+        assert!(left[0].contains("exact-match 0.4"), "{left:#?}");
+    }
+
+    /// KEEP-RUST: `userController.list` with a `list` in two files whose
+    /// paths name the controller, and `userService.lookup` with two
+    /// `lookup`s, stay unresolved as without Express.
+    #[test]
+    fn keep_rust_two_controller_or_service_candidates_resolve_as_without_express() {
+        let left = assert_express_abstains(
+            &[
+                (
+                    "src/user.handlers.js",
+                    "function list(req, res) {}\nfunction handle(req, res) {\n  userController.list(req, res);\n}\n",
+                ),
+                ("src/user.store.js", "function list() {}\n"),
+            ],
+            "function handle",
+        );
+        assert_eq!(left.len(), 1, "{left:#?}");
+        assert!(
+            left[0].contains("-[calls]-> ? userController.list"),
+            "{left:#?}"
+        );
+        let left = assert_express_abstains(
+            &[
+                (
+                    "src/user.api.js",
+                    "function lookup(id) {}\nfunction show(req, res) {\n  return userService.lookup(req.params.id);\n}\n",
+                ),
+                ("src/user.store.js", "function lookup(id) {}\n"),
+            ],
+            "function show",
+        );
+        assert!(
+            left.iter()
+                .any(|line| line.contains("-[calls]-> ? userService.lookup")),
+            "{left:#?}"
+        );
+        assert!(
+            !left.iter().any(|line| line.contains("-[calls]-> function")),
+            "{left:#?}"
+        );
+    }
+
+    /// KEEP-RUST: upstream's second middleware tier (without a declaration of
+    /// the whole name, the name less its `Middleware` suffix) is not ported.
+    /// The whole name passes the reference filter only through a node that is
+    /// no declaration, here the import, and then the tier could only link that
+    /// import's call to the file's `cors`, which it is not.
+    #[test]
+    fn keep_rust_an_imported_x_middleware_is_not_the_files_x() {
+        let left = assert_express_abstains(
+            &[(
+                "server/app.js",
+                "import { corsMiddleware } from 'cors-kit';\nfunction cors(req, res, next) {\n  next();\n}\nfunction setup(app) {\n  corsMiddleware();\n}\n",
+            )],
+            "function setup",
+        );
+        assert_eq!(left.len(), 1, "{left:#?}");
+        assert!(left[0].contains("-[calls]-> ? corsMiddleware"), "{left:#?}");
+    }
+
+    /// KEEP-RUST: upstream's second controller tier (a same-named method in
+    /// the file of a node named `XController`) is not ported. With the
+    /// calling file's own declarations only, it could find no more than the
+    /// file's own `userController` object's method, which the instance-method
+    /// strategy already links.
+    #[test]
+    fn keep_rust_a_controller_object_lends_no_method_by_its_name() {
+        let left = assert_express_abstains(
+            &[(
+                "src/api.js",
+                "const userController = {\n  list(req, res) {},\n};\nfunction handle(req, res) {\n  userController.list(req, res);\n}\n",
+            )],
+            "function handle",
+        );
+        assert!(
+            left.iter().any(|line| line
+                .contains("-[calls]-> function userController::list @src/api.js:2")
+                && line.contains("instance-method 0.85")),
+            "{left:#?}"
+        );
+    }
+
+    /// A pattern's one candidate, in the calling file, is Express's edge:
+    /// `userController.list` the file's `list` (0.85), `userService.lookup`
+    /// its `lookup` (0.8). Without Express both stay unresolved.
+    #[test]
+    fn a_sole_controller_or_service_candidate_is_expresss_edge() {
+        type Files = &'static [(&'static str, &'static str)];
+        let cases: [(Files, &str, &str, f64); 2] = [
+            (
+                &[(
+                    "src/user.handlers.js",
+                    "function list(req, res) {}\nfunction handle(req, res) {\n  userController.list(req, res);\n}\n",
+                )],
+                "function handle",
+                "function list",
+                0.85,
+            ),
+            (
+                &[(
+                    "src/user.api.js",
+                    "function lookup(id) {}\nfunction show(req, res) {\n  return userService.lookup(req.params.id);\n}\n",
+                )],
+                "function show",
+                "function lookup",
+                0.8,
+            ),
+        ];
+        for (files, source, target, confidence) in cases {
+            let (express, plain) = with_and_without_express(files);
+            let graph = express.graph();
+            let edges = graph.edges_matching(source, "calls", target);
+            assert_eq!(edges.len(), 1, "{source} -> {target}\n{}", graph.report());
+            assert_eq!(edges[0].resolved_by(), Some("framework"));
+            assert_eq!(edges[0].metadata["framework"], "express");
+            assert_eq!(edges[0].confidence(), Some(confidence));
+            plain.graph().assert_no_edge(source, "calls", target);
+        }
+    }
+
+    /// Strategy 1 asks Express first, as upstream registers it, so where it
+    /// and a later framework answer one reference at the same confidence,
+    /// Express's answer stands. `validateContext()` is a middleware name to
+    /// Express and a context name to React, each `0.8` to the file's own
+    /// declaration; a second declaration elsewhere keeps name matching
+    /// below them. Without Express the edge is React's.
+    #[test]
+    fn express_answers_a_confidence_tie_ahead_of_react() {
+        let app = "import express from 'express';\nconst app = express();\nfunction validateContext() {\n  return (req: any, res: any, next: any) => next();\n}\napp.use(validateContext());\nexport default app;\n";
+        for (dependencies, framework) in [
+            ("\"express\":\"^4.18.0\",\"react\":\"^18.2.0\"", "express"),
+            ("\"react\":\"^18.2.0\"", "react"),
+        ] {
+            let manifest = format!("{{\"name\":\"full\",\"dependencies\":{{{dependencies}}}}}");
+            let project = project_of(&[
+                ("package.json", manifest.as_str()),
+                ("server/app.ts", app),
+                (
+                    "client/validate.ts",
+                    "export function validateContext() {\n  return 1;\n}\n",
+                ),
+            ])
+            .index();
+            let graph = project.graph();
+            let edges = graph.edges_matching(
+                "file:server/app.ts",
+                "calls",
+                "function validateContext @server/app.ts",
+            );
+            assert_eq!(edges.len(), 1, "{framework}\n{}", graph.report());
+            assert_eq!(edges[0].resolved_by(), Some("framework"));
+            assert_eq!(edges[0].metadata["framework"], framework);
+            assert_eq!(edges[0].confidence(), Some(0.8));
+        }
+    }
+}
+
+mod astro {
+    use super::support::{EdgeRow, Graph, Project};
+
+    /// A manifest that declares Astro (upstream's fixtures).
+    const ASTRO_PACKAGE: &str =
+        "{\"name\":\"site\",\"private\":true,\"dependencies\":{\"astro\":\"^5.0.0\"}}";
+
+    fn project_of(files: &[(&str, &str)]) -> Project {
+        files.iter().fold(Project::new(), |project, (path, text)| {
+            project.file(path, text)
+        })
+    }
+
+    /// The non-`contains` edges leaving the one node `source` matches.
+    #[track_caller]
+    fn leaving<'g>(graph: &'g Graph, source: &str) -> Vec<&'g EdgeRow> {
+        let sources = graph.nodes_matching(source);
+        assert_eq!(sources.len(), 1, "`{source}` matches\n{}", graph.report());
+        let id = sources[0].id.as_str();
+        graph
+            .edges
+            .iter()
+            .filter(|edge| edge.source == id && edge.kind != "contains")
+            .collect()
+    }
+
+    /// Upstream #2245 (`astro-component-markup-only.test.ts`): a component
+    /// name in a TypeScript file (Playwright's `Page` type) is never an Astro
+    /// component; only Astro markup names one.
+    #[test]
+    fn pr2245_a_typescript_type_name_is_no_astro_component() {
+        let project = project_of(&[
+            (
+                "package.json",
+                "{\"name\":\"site\",\"private\":true,\"dependencies\":{\"astro\":\"^5.0.0\"},\"devDependencies\":{\"@playwright/test\":\"^1.0.0\"}}",
+            ),
+            ("astro.config.mjs", "export default {};\n"),
+            (
+                "src/components/Page.astro",
+                "---\nconst { title } = Astro.props;\n---\n<main>{title}</main>\n",
+            ),
+            (
+                "tests/test-utils.ts",
+                "import { type Page } from '@playwright/test';\n\nexport class StarlightPage {\n  private readonly page: Page;\n  constructor(page: Page) {\n    this.page = page;\n  }\n}\n",
+            ),
+        ])
+        .index();
+        let graph = project.graph();
+        let from_tests: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.kind != "contains")
+            .filter(|edge| {
+                graph
+                    .node(&edge.source)
+                    .is_some_and(|node| node.file_path == "tests/test-utils.ts")
+            })
+            .map(|edge| graph.describe_edge(edge))
+            .collect();
+        assert_eq!(from_tests, Vec::<String>::new(), "{}", graph.report());
+        graph.assert_unresolved("property StarlightPage::page", "references", "Page");
+    }
+
+    /// Upstream #2267 (`file-routed-page-component.test.ts`, its Astro half):
+    /// a page route is served by its own file's component, an endpoint by
+    /// the verbs it exports.
+    #[test]
+    fn pr2267_an_astro_page_is_served_by_its_own_component() {
+        let project = project_of(&[
+            (
+                "package.json",
+                "{\"name\":\"site\",\"private\":true,\"dependencies\":{\"astro\":\"^4.0.0\"}}",
+            ),
+            (
+                "src/pages/index.astro",
+                "---\nconst title = 'Home';\n---\n<h1>{title}</h1>\n",
+            ),
+            ("src/pages/about.astro", "<p>about</p>\n"),
+            ("src/pages/blog/index.astro", "<p>blog</p>\n"),
+            (
+                "src/pages/api/hello.ts",
+                "export const GET = async () => new Response('hi');\nexport async function POST() { return new Response('ok'); }\n",
+            ),
+        ])
+        .index();
+        let graph = project.graph();
+        let mut served: Vec<String> = graph
+            .nodes
+            .iter()
+            .filter(|node| node.kind == "route")
+            .flat_map(|route| {
+                graph
+                    .edges
+                    .iter()
+                    .filter(|edge| {
+                        edge.source == route.id
+                            && (edge.kind == "calls" || edge.kind == "references")
+                    })
+                    .filter_map(|edge| {
+                        let target = graph.node(&edge.target)?;
+                        Some(format!(
+                            "{} -[{}]-> {} {}",
+                            route.name, edge.kind, target.kind, target.file_path
+                        ))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        served.sort();
+        assert_eq!(
+            served,
+            [
+                "/ -[calls]-> component src/pages/index.astro",
+                "/about -[calls]-> component src/pages/about.astro",
+                "/api/hello -[references]-> function src/pages/api/hello.ts",
+                "/api/hello -[references]-> function src/pages/api/hello.ts",
+                "/blog -[calls]-> component src/pages/blog/index.astro",
+            ],
+            "{}",
+            graph.report()
+        );
+        let page = graph.edges_matching(
+            "route src/pages/about.astro::route:/about",
+            "calls",
+            "component src/pages/about.astro::about",
+        );
+        assert_eq!(page.len(), 1, "{}", graph.report());
+        assert_eq!(page[0].resolved_by(), Some("framework"));
+        assert_eq!(page[0].metadata["framework"], "astro");
+        assert_eq!(page[0].confidence(), Some(0.95));
+    }
+
+    const LOGIN: &str = "---\nimport { getCollection } from 'astro:content';\nconst posts = await getCollection('blog');\nif (!Astro.cookies.has('s')) return Astro.redirect('/login');\nconst { title } = Astro.props;\n---\n<h1>{title}</h1>\n";
+
+    /// The `Astro` global and the `astro:*` modules are the framework's:
+    /// `Astro.cookies.has(…)` and `Astro.redirect(…)` resolve to the page
+    /// component that makes them (1.0), whether or not some file declares a
+    /// `has` or a `redirect` (Astro claims the name past the reference
+    /// filter); the `astro:content` import resolves to its own file; the
+    /// member read `Astro.props` is no reference at all.
+    #[test]
+    fn the_astro_global_and_virtual_modules_are_the_frameworks() {
+        for with_nav in [false, true] {
+            let mut files = vec![
+                ("package.json", ASTRO_PACKAGE),
+                ("src/pages/login.astro", LOGIN),
+            ];
+            if with_nav {
+                files.push((
+                    "src/lib/nav.ts",
+                    "export function redirect(to: string) { return to; }\nexport function has(x: string) { return !!x; }\n",
+                ));
+            }
+            let project = project_of(&files).index();
+            let graph = project.graph();
+            let component = "component src/pages/login.astro::login";
+            let calls: Vec<String> = leaving(graph, component)
+                .into_iter()
+                .map(|edge| {
+                    format!(
+                        "{} -> {} at {:?}:{:?} {}",
+                        edge.kind,
+                        graph.describe(&edge.target),
+                        edge.line,
+                        edge.col,
+                        edge.metadata
+                    )
+                })
+                .collect();
+            let own = "component src/pages/login.astro::login @src/pages/login.astro:1";
+            let meta = "{\"confidence\":1.0,\"framework\":\"astro\",\"resolvedBy\":\"framework\"}";
+            assert_eq!(
+                calls,
+                [
+                    format!("calls -> {own} at Some(4):Some(5) {meta}"),
+                    format!("calls -> {own} at Some(4):Some(36) {meta}"),
+                ],
+                "nav.ts: {with_nav}\n{}",
+                graph.report()
+            );
+            let import = graph.edges_matching(
+                "file:src/pages/login.astro",
+                "imports",
+                "file:src/pages/login.astro",
+            );
+            assert_eq!(import.len(), 1, "{}", graph.report());
+            assert_eq!(import[0].metadata["framework"], "astro");
+            assert!(
+                !graph
+                    .unresolved
+                    .iter()
+                    .any(|reference| reference.reference_name.starts_with("Astro")),
+                "{}",
+                graph.report()
+            );
+        }
+    }
+
+    /// A PascalCase tag in Astro markup names a component: the sole one of
+    /// the name under the referencing file's directory (0.8), before one
+    /// elsewhere. KEEP-RUST: with two under the directory Astro proposes none
+    /// (upstream takes the first the store returns), and the tag resolves as
+    /// it would without Astro, by the name matcher.
+    #[test]
+    fn keep_rust_a_tag_names_the_directorys_sole_component() {
+        let card = "---\nconst { t } = Astro.props;\n---\n<div>{t}</div>\n";
+        let tree = |more: bool| {
+            let mut files = vec![
+                ("package.json", ASTRO_PACKAGE),
+                (
+                    "src/components/Gallery.astro",
+                    "<section><Card t=\"x\" /></section>\n",
+                ),
+                ("src/components/cards/Card.astro", card),
+                ("src/layouts/Card.astro", card),
+            ];
+            if more {
+                files.push(("src/components/more/Card.astro", card));
+            }
+            project_of(&files).index()
+        };
+        let gallery = "component src/components/Gallery.astro::Gallery";
+        let in_dir =
+            "component src/components/cards/Card.astro::Card @src/components/cards/Card.astro:1";
+
+        let one = tree(false);
+        let graph = one.graph();
+        let edges = leaving(graph, gallery);
+        assert_eq!(edges.len(), 1, "{}", graph.report());
+        assert_eq!(graph.describe(&edges[0].target), in_dir);
+        assert_eq!(edges[0].kind, "references");
+        assert_eq!(edges[0].resolved_by(), Some("framework"));
+        assert_eq!(edges[0].metadata["framework"], "astro");
+        assert_eq!(edges[0].confidence(), Some(0.8));
+
+        let two = tree(true);
+        let graph = two.graph();
+        let edges = leaving(graph, gallery);
+        assert_eq!(edges.len(), 1, "{}", graph.report());
+        assert_eq!(graph.describe(&edges[0].target), in_dir);
+        assert_eq!(edges[0].resolved_by(), Some("exact-match"));
+        assert_eq!(edges[0].confidence(), Some(0.7));
     }
 }
 
