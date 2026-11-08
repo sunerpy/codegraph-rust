@@ -225,6 +225,75 @@ pub(crate) fn strip_js_comments_keeping_offsets(content: &str) -> String {
     strip_c_style_blanking(content, true, Blanking::Bytes)
 }
 
+/// [`strip_comments_for_regex`] for Python with each blanked BYTE but a
+/// newline a space (W7-19b), the way [`strip_js_comments_keeping_offsets`]
+/// blanks JavaScript: a triple-quoted string and a `#` comment become
+/// spaces, a one-line string stays, and every byte offset of `content` is
+/// an offset of the result. The scan is `strip_python`'s, byte by byte:
+/// every byte it looks for is ASCII, and a backslash skips the whole
+/// character after it.
+pub(crate) fn strip_python_comments_keeping_offsets(content: &str) -> String {
+    let bytes = content.as_bytes();
+    let n = bytes.len();
+    let mut out = String::with_capacity(n);
+    let mut copied = 0;
+    // The offset just past the character that starts at `at`.
+    let next_char = |at: usize| at + content[at..].chars().next().map_or(1, char::len_utf8);
+    let mut i = 0;
+    while i < n {
+        let c = bytes[i];
+        // Triple-quoted string.
+        if (c == b'"' || c == b'\'') && bytes.get(i + 1) == Some(&c) && bytes.get(i + 2) == Some(&c)
+        {
+            let start = i;
+            i += 3;
+            while i < n {
+                if bytes[i] == b'\\' && i + 1 < n {
+                    i = next_char(i + 1);
+                    continue;
+                }
+                if bytes[i] == c && bytes.get(i + 1) == Some(&c) && bytes.get(i + 2) == Some(&c) {
+                    i += 3;
+                    break;
+                }
+                i = next_char(i);
+            }
+            blank_into(&mut out, content, &mut copied, start, i, Blanking::Bytes);
+            continue;
+        }
+        // One-line string.
+        if c == b'"' || c == b'\'' {
+            i += 1;
+            while i < n && bytes[i] != c {
+                if bytes[i] == b'\\' && i + 1 < n {
+                    i = next_char(i + 1);
+                    continue;
+                }
+                if bytes[i] == b'\n' {
+                    break;
+                }
+                i = next_char(i);
+            }
+            if i < n && bytes[i] == c {
+                i += 1;
+            }
+            continue;
+        }
+        // Line comment.
+        if c == b'#' {
+            let start = i;
+            while i < n && bytes[i] != b'\n' {
+                i = next_char(i);
+            }
+            blank_into(&mut out, content, &mut copied, start, i, Blanking::Bytes);
+            continue;
+        }
+        i = next_char(i);
+    }
+    out.push_str(&content[copied..]);
+    out
+}
+
 /// How a comment's text is blanked: one space per character, or per byte.
 #[derive(Clone, Copy)]
 enum Blanking {
@@ -1098,6 +1167,41 @@ mod tests {
         assert_eq!(out[..first_line], " ".repeat(first_line));
         assert!(out.contains("'// no'"));
         assert!(!out.contains('ü'));
+    }
+
+    /// W7-19b: the Python twin blanks what `strip_python` blanks, one space
+    /// per byte, so on ASCII text the two agree and past non-ASCII text in a
+    /// comment or a docstring every byte offset still holds.
+    #[test]
+    fn python_comments_blanked_byte_for_byte_keep_byte_offsets() {
+        for ascii in [
+            "x = 1  # note\ny = 'a # b'\n",
+            "def f():\n    \"\"\"doc\n    more\"\"\"\n    return \"x\"\n",
+            "s = 'it\\'s' # c\nt = '''a\\''' b'''\n",
+            "u = 'open\n# next\n",
+            "\"\"\"never closed\n# x\n",
+            "x = '\\\n# not a comment\n",
+        ] {
+            assert_eq!(
+                strip_python_comments_keeping_offsets(ascii),
+                strip_comments_for_regex(ascii, CommentLang::Python),
+                "{ascii:?}"
+            );
+        }
+        let input = "# café — ü 😀\npath('/x', v)  # é\n\"\"\"日本\"\"\"\nurl('/y', w)\n";
+        let out = strip_python_comments_keeping_offsets(input);
+        assert_eq!(out.len(), input.len());
+        assert_eq!(out.find("path"), input.find("path"));
+        assert_eq!(out.find("url"), input.find("url"));
+        assert!(!out.contains('é') && !out.contains('日') && !out.contains('😀'));
+        assert_eq!(out.matches('\n').count(), input.matches('\n').count());
+        // A backslash in a string skips the whole character after it.
+        let escaped = "s = 'a\\é' # c\n";
+        assert_eq!(
+            strip_python_comments_keeping_offsets(escaped).find('#'),
+            None
+        );
+        assert!(strip_python_comments_keeping_offsets(escaped).starts_with("s = 'a\\é'"));
     }
 
     #[test]

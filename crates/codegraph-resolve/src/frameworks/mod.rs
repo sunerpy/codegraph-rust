@@ -5,10 +5,10 @@
 //! ([`react_router`]), TanStack Router ([`tanstack_router`]), Next.js
 //! ([`nextjs`]), Svelte and SvelteKit ([`svelte`], [`sveltekit_router`]),
 //! Vue Router ([`vue_router`]), Angular Router ([`angular_router`]), Astro
-//! ([`astro`]), Expo Router ([`expo_router`]), Vue and Nuxt ([`vue`]),
-//! NestJS ([`nestjs`]), Godot ([`godot`]), Tauri ([`tauri`]) and GoFrame
-//! ([`goframe`]). The other upstream resolvers remain deferred (see
-//! `KNOWN_DIFFS.md`).
+//! ([`astro`]), Django, Flask and FastAPI ([`python`]), Expo Router
+//! ([`expo_router`]), Vue and Nuxt ([`vue`]), NestJS ([`nestjs`]), Godot
+//! ([`godot`]), Tauri ([`tauri`]) and GoFrame ([`goframe`]). The other
+//! upstream resolvers remain deferred (see `KNOWN_DIFFS.md`).
 //!
 //! [`detect_frameworks`] ports `frameworks/index.ts:detectFrameworks` restricted
 //! to the ported resolvers; the orchestrator hands the detected list to
@@ -30,10 +30,13 @@ pub mod godot_script;
 pub mod goframe;
 pub(crate) mod js_scan;
 pub(crate) mod lazy_loader;
+pub(crate) mod name_heuristic;
 pub mod nestjs;
 pub mod nextjs;
+pub(crate) mod offset_text;
 pub mod package_deps;
 pub(crate) mod page_component;
+pub mod python;
 pub mod react;
 pub mod react_router;
 pub(crate) mod react_tables;
@@ -58,7 +61,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// among lower answers the most confident, the earlier on a tie. Each port
 /// sits where upstream's `FRAMEWORK_RESOLVERS` puts it relative to its
 /// ported neighbours (Express before NestJS, Astro between Angular Router
-/// and Expo Router); the entries already here keep their places. A port
+/// and Expo Router, the Python frameworks after Astro); the entries already
+/// here keep their places. A port
 /// placed ahead of others must not take a reference they resolved before:
 /// it answers below `0.9`, or only for references they do not claim.
 pub fn detect_frameworks(context: &dyn ResolutionContext) -> Vec<Box<dyn FrameworkResolver>> {
@@ -121,6 +125,13 @@ pub fn detect_frameworks(context: &dyn ResolutionContext) -> Vec<Box<dyn Framewo
         // `astro:content`), and its page routes' `calls` land on their own
         // file's component.
         Box::new(astro::AstroResolver),
+        // Django, Flask and FastAPI routes, and their name heuristics
+        // (#2154, #2225), after Astro as upstream registers them. They read
+        // only Python references, which no resolver above resolves, so their
+        // place changes no other reference's resolution.
+        Box::new(python::DjangoResolver),
+        Box::new(python::FlaskResolver),
+        Box::new(python::FastapiResolver),
         // Expo Router screens and navigation (F2), after Next.js as upstream
         // registers it. It claims navigation calls only where their href
         // names one of its own screens.

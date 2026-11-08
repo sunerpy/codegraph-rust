@@ -12,13 +12,12 @@
 //! own file (#2243).
 //!
 //! Offsets are byte offsets. Comments are blanked byte for byte
-//! ([`strip_js_comments_keeping_offsets`]), so an offset into the stripped
+//! ([`crate::strip_comments::strip_js_comments_keeping_offsets`]), so an offset into the stripped
 //! text indexes the source too. Upstream counts UTF-16 code units and blanks
 //! a comment one space per unit, so whatever it measures — a column, a
 //! match's length, the text a test reads before or after a position — is
 //! measured here on the source at the same offsets ([`Text`]).
 
-use std::cell::OnceCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, OnceLock};
 
@@ -26,10 +25,10 @@ use codegraph_core::types::{EdgeKind, Language, Node, NodeKind};
 use regex::Regex;
 
 use super::js_scan::{JS_SPACE, is_js_space, js_trim};
+use super::offset_text::OffsetText as Text;
 use super::{framework_node, now_millis, sole};
 use crate::framework::{FrameworkExtractionContext, FrameworkResolver};
 use crate::import_resolver::resolve_import_path;
-use crate::strip_comments::strip_js_comments_keeping_offsets;
 use crate::types::{
     FrameworkResolverExtractionResult, RefView, ResolutionContext, ResolvedBy, ResolvedRef,
 };
@@ -250,12 +249,12 @@ impl FrameworkResolver for ExpressResolver {
         let mut mounts: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
         // Every sync searches each JavaScript and TypeScript file for a
         // mount, so the context may read them in parallel (W7-19a).
-        for file in &context.files_containing(&sources, ".use(") {
+        for file in &context.files_containing(&sources, &[".use("]) {
             let Some(content) = context.read_file_shared(file) else {
                 continue;
             };
             let language = express_language(file);
-            let text = Text::new(&content);
+            let text = Text::js(&content);
             for mount in find_mounts(&text) {
                 let Some((close, structure)) = scan_call(&text, mount.open) else {
                     continue;
@@ -414,7 +413,7 @@ fn owned_routes<'c>(
 
 /// A route's in-file `METHOD` and path, read from its qualified name the way
 /// upstream's mount pass reads it: after the first `::`, up to the next `:`.
-fn qualified_route(route: &Node) -> Option<(&str, &str)> {
+pub(super) fn qualified_route(route: &Node) -> Option<(&str, &str)> {
     let qualified = route.qualified_name.as_str();
     let sep = qualified.find("::")?;
     let rest = &qualified[sep + 2..];
@@ -447,124 +446,6 @@ fn join_paths(prefix: &str, path: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Text: the source and its stripped twin
-// ---------------------------------------------------------------------------
-
-/// A file's source and its comment-stripped text, byte for byte aligned.
-struct Text<'a> {
-    content: &'a str,
-    safe: String,
-    /// The offsets of the stripped text's `\n`s, built on first use.
-    newlines: OnceCell<Vec<usize>>,
-}
-
-impl<'a> Text<'a> {
-    fn new(content: &'a str) -> Self {
-        Self {
-            content,
-            safe: strip_js_comments_keeping_offsets(content),
-            newlines: OnceCell::new(),
-        }
-    }
-
-    /// `start..end` of the stripped text as upstream's holds it: a blanked
-    /// character is a space per UTF-16 code unit there, a byte here.
-    fn upstream(&self, start: usize, end: usize) -> String {
-        let mut out = String::with_capacity(end - start);
-        for (offset, ch) in self.content[start..end].char_indices() {
-            match self.piece(start + offset, ch) {
-                Some(blank) => out.extend(std::iter::repeat_n(blank, ch.len_utf16())),
-                None => out.push(ch),
-            }
-        }
-        out
-    }
-
-    /// Upstream's UTF-16 length of the stripped text in `start..end`, which
-    /// is the source's there.
-    fn units(&self, start: usize, end: usize) -> i64 {
-        self.content[start..end].encode_utf16().count() as i64
-    }
-
-    /// The 1-based line of `offset` (upstream `split('\n').length`).
-    fn line_at(&self, offset: usize) -> i64 {
-        let newlines = self.newlines.get_or_init(|| {
-            self.safe
-                .bytes()
-                .enumerate()
-                .filter(|&(_, byte)| byte == b'\n')
-                .map(|(at, _)| at)
-                .collect()
-        });
-        newlines.partition_point(|&at| at < offset) as i64 + 1
-    }
-
-    /// Upstream `safe.slice(Math.max(floor, end - units), end)` — `floor`
-    /// is where the text upstream slices starts — as upstream's stripped
-    /// text holds it: a blanked character is a space per code unit there.
-    /// A unit cut from its pair is U+FFFD, which every pattern here reads as
-    /// it reads the lone surrogate: no word character, no space.
-    fn units_before(&self, floor: usize, end: usize, units: usize) -> String {
-        let mut reversed: Vec<char> = Vec::new();
-        let mut taken = 0;
-        for (offset, ch) in self.content[floor..end].char_indices().rev() {
-            if taken == units {
-                break;
-            }
-            let width = ch.len_utf16();
-            let piece = self.piece(floor + offset, ch);
-            if taken + width > units {
-                reversed.push(piece.map_or('\u{FFFD}', |_| ' '));
-                break;
-            }
-            taken += width;
-            match piece {
-                Some(blank) => reversed.extend(std::iter::repeat_n(blank, width)),
-                None => reversed.push(ch),
-            }
-        }
-        reversed.into_iter().rev().collect()
-    }
-
-    /// Upstream `safe.slice(start, start + units)`, as [`Self::units_before`]
-    /// reads it.
-    fn units_after(&self, start: usize, units: usize) -> String {
-        let mut out = String::new();
-        let mut taken = 0;
-        for (offset, ch) in self.content[start..].char_indices() {
-            if taken == units {
-                break;
-            }
-            let width = ch.len_utf16();
-            let piece = self.piece(start + offset, ch);
-            if taken + width > units {
-                out.push(piece.map_or('\u{FFFD}', |_| ' '));
-                break;
-            }
-            taken += width;
-            match piece {
-                Some(blank) => out.extend(std::iter::repeat_n(blank, width)),
-                None => out.push(ch),
-            }
-        }
-        out
-    }
-
-    /// What the stripped text holds for the source character `ch` at `at`:
-    /// `Some(byte)` for an ASCII character (the comment stripper may have
-    /// blanked it) and for a blanked one (a space per code unit), `None`
-    /// for one it kept.
-    fn piece(&self, at: usize, ch: char) -> Option<char> {
-        let byte = self.safe.as_bytes()[at];
-        if ch.is_ascii() || byte == b' ' {
-            Some(byte as char)
-        } else {
-            None
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Extraction
 // ---------------------------------------------------------------------------
 
@@ -581,7 +462,7 @@ fn extract_routes(file_path: &str, content: &str) -> FrameworkResolverExtraction
         return result;
     }
     let language = express_language(file_path);
-    let text = Text::new(content);
+    let text = Text::js(content);
     let route = |line: i64, method: &str, path: &str, end_column: i64| {
         let method = method.to_ascii_uppercase();
         framework_node(
@@ -2128,18 +2009,18 @@ mod tests {
     #[test]
     fn a_window_that_cuts_a_surrogate_pair_reads_it_as_no_space() {
         let before = format!("😀{}/", " ".repeat(31));
-        let text = Text::new(&before);
+        let text = Text::js(&before);
         let window = text.units_before(0, before.len() - 1, 32);
         assert_eq!(window, format!("\u{FFFD}{}", " ".repeat(31)));
         assert!(!regex_start_before().is_match(&window));
         let after = format!("{}😀", " ".repeat(22));
-        let text = Text::new(&after);
+        let text = Text::js(&after);
         let window = text.units_after(0, 23);
         assert_eq!(window, format!("{}\u{FFFD}", " ".repeat(22)));
         assert!(!regex_end_after().is_match(&window));
         // Blanked by the comment stripper, a cut character is a space.
         let commented = format!("/*😀*/{}", " ".repeat(10));
-        let text = Text::new(&commented);
+        let text = Text::js(&commented);
         assert_eq!(text.units_before(0, commented.len(), 15), " ".repeat(15));
     }
 
@@ -2156,7 +2037,7 @@ mod tests {
     // -- mounts --------------------------------------------------------------
 
     fn prefixes(src: &str) -> Vec<String> {
-        find_mounts(&Text::new(src))
+        find_mounts(&Text::js(src))
             .into_iter()
             .map(|mount| mount.prefix)
             .collect()

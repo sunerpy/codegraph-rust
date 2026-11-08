@@ -21166,6 +21166,529 @@ mod astro {
     }
 }
 
+mod python_frameworks {
+    use super::support::{EdgeRow, Graph, Indexed, Project, project_metadata_with_prefix};
+
+    fn project_of(files: &[(&str, &str)]) -> Project {
+        files.iter().fold(Project::new(), |project, (path, text)| {
+            project.file(path, text)
+        })
+    }
+
+    /// The names of the routes in `file`, sorted.
+    fn route_names_in(graph: &Graph, file: &str) -> Vec<String> {
+        let mut names: Vec<String> = graph
+            .nodes
+            .iter()
+            .filter(|node| node.kind == "route" && node.file_path == file)
+            .map(|node| node.name.clone())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// Every route's name, sorted.
+    fn route_names(graph: &Graph) -> Vec<String> {
+        let mut names: Vec<String> = graph
+            .nodes
+            .iter()
+            .filter(|node| node.kind == "route")
+            .map(|node| node.name.clone())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// The id of the one route named `name`.
+    #[track_caller]
+    fn route_id<'g>(graph: &'g Graph, name: &str) -> &'g str {
+        let found: Vec<&str> = graph
+            .nodes
+            .iter()
+            .filter(|node| node.kind == "route" && node.name == name)
+            .map(|node| node.id.as_str())
+            .collect();
+        assert_eq!(found.len(), 1, "routes named `{name}`\n{}", graph.report());
+        found[0]
+    }
+
+    /// What the route named `name` links to by `kind` edges, described,
+    /// sorted.
+    #[track_caller]
+    fn from_route(graph: &Graph, name: &str, kind: &str) -> Vec<String> {
+        let id = route_id(graph, name);
+        let mut out: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.source == id && edge.kind == kind)
+            .map(|edge| graph.describe(&edge.target))
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// The non-`contains` edges leaving `id`.
+    fn edges_leaving<'g>(graph: &'g Graph, id: &str) -> Vec<&'g EdgeRow> {
+        graph
+            .edges
+            .iter()
+            .filter(|edge| edge.source == id && edge.kind != "contains")
+            .collect()
+    }
+
+    /// Every edge leaving the one node `source` matches, with its whole
+    /// metadata, and every reference it leaves unresolved, sorted.
+    #[track_caller]
+    fn leaving(graph: &Graph, source: &str) -> Vec<String> {
+        let sources = graph.nodes_matching(source);
+        assert_eq!(sources.len(), 1, "`{source}` matches\n{}", graph.report());
+        let id = sources[0].id.as_str();
+        let mut out: Vec<String> = edges_leaving(graph, id)
+            .into_iter()
+            .map(|edge| format!("{}  {}", graph.describe_edge(edge), edge.metadata))
+            .chain(
+                graph
+                    .unresolved
+                    .iter()
+                    .filter(|reference| reference.from_node_id == id)
+                    .map(|reference| graph.describe_ref(reference)),
+            )
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// The frameworks the index records as detected.
+    fn detected(project: &Indexed) -> String {
+        project_metadata_with_prefix(&project.db(), "frameworks_detected")
+            .into_iter()
+            .map(|(_, value)| value)
+            .collect()
+    }
+
+    /// Every non-`contains` edge leaving a node of `file`, its target
+    /// described.
+    fn targets_from_file(graph: &Graph, file: &str) -> Vec<String> {
+        let mut out: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.kind != "contains")
+            .filter(|edge| {
+                graph
+                    .node(&edge.source)
+                    .is_some_and(|node| node.file_path == file)
+            })
+            .map(|edge| graph.describe(&edge.target))
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// Upstream #2154 (`flask-url-rules.test.ts`): `add_url_rule` with a
+    /// `view_func=` or a third positional argument, and a project's wrapper
+    /// handing a list of paths and a `view_func=` over, are routes; the
+    /// wrapper's own `add_url_rule(route, …)` names no path.
+    #[test]
+    fn pr2154_flask_url_rules_and_a_wrapper_are_routes() {
+        let project = project_of(&[
+            ("requirements.txt", "flask\n"),
+            (
+                "app/helpers.py",
+                "def register_view(bp_or_app, routes, view_func, **kwargs):\n    for route in routes:\n        bp_or_app.add_url_rule(route, view_func=view_func, **kwargs)\n",
+            ),
+            (
+                "app/auth.py",
+                "from flask import Blueprint\nfrom flask.views import MethodView\nfrom app.helpers import register_view\n\nauth = Blueprint(\"auth\", __name__)\n\n\nclass Login(MethodView):\n    def get(self):\n        return \"form\"\n\n    def post(self):\n        return \"ok\"\n\n\ndef logout():\n    return \"bye\"\n\n\nregister_view(auth, routes=[\"/login\", \"/signin\"], view_func=Login.as_view(\"login\"))\nauth.add_url_rule(\"/logout\", \"logout\", logout, methods=[\"POST\"])\nauth.add_url_rule(\"/health\", view_func=logout)\n",
+            ),
+        ])
+        .index();
+        let graph = project.graph();
+        assert_eq!(
+            route_names_in(graph, "app/auth.py"),
+            ["ANY /login", "ANY /signin", "GET /health", "POST /logout"],
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            from_route(graph, "ANY /login", "references"),
+            ["class Login @app/auth.py:8"]
+        );
+        assert_eq!(
+            from_route(graph, "POST /logout", "references"),
+            ["function logout @app/auth.py:16"]
+        );
+        assert!(route_names_in(graph, "app/helpers.py").is_empty());
+    }
+
+    /// Upstream #2225 (`framework-name-heuristic-scope.test.ts`): a
+    /// heuristic never picks a class declared inside another file's function
+    /// (netbox's `TestForm`), and takes the reference's own file first (DRF's
+    /// `MockView`).
+    #[test]
+    fn pr2225_a_heuristic_picks_only_what_the_reference_can_see() {
+        let project = project_of(&[
+            ("manage.py", ""),
+            (
+                "utilities/tests/test_forms.py",
+                "class GetFieldValueTestCase:\n    def setUpTestData(self):\n        class TestForm:\n            pass\n        return TestForm()\n",
+            ),
+            (
+                "utilities/tests/test_templatetags.py",
+                "def test_any_required():\n    return TestForm()\n",
+            ),
+            ("tests/browsable_api/views.py", "class MockView:\n    pass\n"),
+            (
+                "tests/authentication/test_authentication.py",
+                "class MockView:\n    pass\n\n\ndef test_auth():\n    return MockView()\n",
+            ),
+        ])
+        .index();
+        let graph = project.graph();
+        let into_test_form: Vec<String> =
+            targets_from_file(graph, "utilities/tests/test_templatetags.py")
+                .into_iter()
+                .filter(|target| target.contains("TestForm"))
+                .collect();
+        assert!(into_test_form.is_empty(), "{}", graph.report());
+        let into_mock_view: Vec<String> =
+            targets_from_file(graph, "tests/authentication/test_authentication.py")
+                .into_iter()
+                .filter(|target| target.contains("MockView"))
+                .collect();
+        assert_eq!(
+            into_mock_view,
+            ["class MockView @tests/authentication/test_authentication.py:1"],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// `bc45e907` (`ui-steps-api-servers.test.ts`'s FastAPI service, its
+    /// route names): a router with its own prefix, included by an aggregate
+    /// router through an alias import, mounted at a literal prefix and at a
+    /// computed one.
+    #[test]
+    fn bc45e907_fastapi_routes_are_named_by_the_path_a_request_takes() {
+        let project = project_of(&[
+            ("requirements.txt", "fastapi\nsqlmodel\ncelery\n"),
+            (
+                "api/items.py",
+                "from fastapi import APIRouter, Depends, HTTPException\nfrom sqlmodel import select\nfrom .deps import get_current_user, SessionDep\nfrom .models import Item, ItemCreate\nfrom .tasks import send_welcome\n\nrouter = APIRouter()\n\n@router.post(\"/items\", dependencies=[Depends(get_current_user)])\ndef create_item(session: SessionDep, item_in: ItemCreate):\n    item = Item.model_validate(item_in)\n    session.add(item)\n    session.commit()\n    if item.price < 0:\n        raise HTTPException(status_code=422, detail=\"bad price\")\n    send_welcome.delay(item.id)\n    return item\n",
+            ),
+            (
+                "api/deps.py",
+                "def get_current_user():\n    return None\n\nSessionDep = None\n",
+            ),
+            (
+                "api/models.py",
+                "class Item:\n    pass\n\nclass ItemCreate:\n    pass\n",
+            ),
+            (
+                "api/tasks.py",
+                "from celery import shared_task\n\n@shared_task\ndef send_welcome(item_id):\n    return item_id\n",
+            ),
+            (
+                "api/orders.py",
+                "from fastapi import APIRouter\n\nrouter = APIRouter(prefix=\"/orders\", tags=[\"orders\"])\n\n@router.get(\"/\")\ndef list_orders():\n    return []\n\n@router.get(\"/{order_id}\")\ndef get_order(order_id: int):\n    return order_id\n",
+            ),
+            (
+                "api/v1.py",
+                "from fastapi import APIRouter\nfrom .orders import router as orders_router\napi_router = APIRouter()\napi_router.include_router(orders_router)\n",
+            ),
+            (
+                "api/main.py",
+                "from fastapi import FastAPI\nfrom .items import router\nfrom .v1 import api_router\nfrom .config import settings\napp = FastAPI()\napp.include_router(router)\napp.include_router(api_router, prefix=\"/api/v1\")\napp.include_router(api_router, prefix=settings.LEGACY)\n",
+            ),
+            ("api/config.py", "settings = None\n"),
+        ])
+        .index();
+        let graph = project.graph();
+        assert_eq!(
+            route_names(graph),
+            [
+                "GET /api/v1/orders",
+                "GET /api/v1/orders/{order_id}",
+                "POST /items"
+            ],
+            "{}",
+            graph.report()
+        );
+        // The renamed route keeps its id and qualified name, and its handler.
+        assert_eq!(
+            route_id(graph, "GET /api/v1/orders"),
+            "route:api/orders.py:5:GET:/"
+        );
+        assert_eq!(
+            from_route(graph, "GET /api/v1/orders", "references"),
+            ["function list_orders @api/orders.py:6"]
+        );
+    }
+
+    /// `950686de`: FastAPI is detected by an app script below the root, at
+    /// most four path segments deep.
+    #[test]
+    fn s950686de_fastapi_is_detected_below_the_root() {
+        let app = "from fastapi import FastAPI\nfrom .api.items import router\napp = FastAPI()\napp.include_router(router)\n";
+        let items = "from fastapi import APIRouter\nrouter = APIRouter()\n\n@router.get(\"/items\")\ndef list_items():\n    return []\n";
+        let project = project_of(&[
+            ("backend/app/main.py", app),
+            ("backend/app/api/items.py", items),
+        ])
+        .index();
+        assert_eq!(detected(&project), "[\"fastapi\"]");
+        assert_eq!(route_names(project.graph()), ["GET /items"]);
+        let deep = project_of(&[
+            ("svc/backend/src/app/main.py", app),
+            ("svc/backend/src/app/api/items.py", items),
+        ])
+        .index();
+        assert_eq!(detected(&deep), "[]");
+        assert!(
+            route_names(deep.graph()).is_empty(),
+            "{}",
+            deep.graph().report()
+        );
+    }
+
+    /// Django's URLconf: `include('shop.urls')` imports the URLconf's file,
+    /// `path(…)` references a function view or a class-based view's class,
+    /// and a DRF registration is a `VIEWSET` route.
+    #[test]
+    fn django_urlconf_routes_and_drf_registrations() {
+        let project = project_of(&[
+            ("manage.py", ""),
+            (
+                "config/urls.py",
+                "from django.urls import path, include\n\nurlpatterns = [\n    path(\"shop/\", include(\"shop.urls\")),\n]\n",
+            ),
+            ("shop/__init__.py", ""),
+            (
+                "shop/urls.py",
+                "from django.urls import path\nfrom rest_framework.routers import DefaultRouter\nfrom . import views\nfrom .views import UserListView, ArticleViewSet\n\nrouter = DefaultRouter()\nrouter.register(r\"articles\", ArticleViewSet)\n\nurlpatterns = [\n    path(\"products/\", views.product_list),\n    path(\"users/\", UserListView.as_view()),\n]\n",
+            ),
+            (
+                "shop/views.py",
+                "class UserListView:\n    pass\n\n\nclass ArticleViewSet:\n    pass\n\n\ndef product_list(request):\n    return None\n",
+            ),
+        ])
+        .index();
+        let graph = project.graph();
+        assert_eq!(
+            route_names(graph),
+            ["VIEWSET /articles", "products/", "shop/", "users/"],
+            "{}",
+            graph.report()
+        );
+        assert_eq!(from_route(graph, "shop/", "imports"), ["file:shop/urls.py"]);
+        assert_eq!(
+            from_route(graph, "products/", "references"),
+            ["function product_list @shop/views.py:9"]
+        );
+        assert_eq!(
+            from_route(graph, "users/", "references"),
+            ["class UserListView @shop/views.py:1"]
+        );
+        assert_eq!(
+            from_route(graph, "VIEWSET /articles", "references"),
+            ["class ArticleViewSet @shop/views.py:5"]
+        );
+    }
+
+    /// Flask-RESTful's `api.add_resource(Resource, path)` is an `ANY` route
+    /// referencing the resource class.
+    #[test]
+    fn flask_restful_resources_are_routes_of_their_class() {
+        let project = project_of(&[
+            ("requirements.txt", "Flask-RESTful\n"),
+            (
+                "app/api.py",
+                "from flask_restful import Api, Resource\n\napi = Api()\n\n\nclass TodoResource(Resource):\n    def get(self, id):\n        return {}\n\n\napi.add_resource(TodoResource, '/todos/<id>')\n",
+            ),
+        ])
+        .index();
+        let graph = project.graph();
+        assert_eq!(
+            route_names(graph),
+            ["ANY /todos/<id>"],
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            from_route(graph, "ANY /todos/<id>", "references"),
+            ["class TodoResource @app/api.py:6"]
+        );
+    }
+
+    /// The same files indexed with and without what detects Django (its
+    /// `manage.py`).
+    fn with_and_without_django(files: &[(&str, &str)]) -> (Indexed, Indexed) {
+        let tree = |django: bool| {
+            let project = if django {
+                Project::new().file("manage.py", "")
+            } else {
+                Project::new()
+            };
+            files
+                .iter()
+                .fold(project, |project, (path, text)| project.file(path, text))
+                .index()
+        };
+        (tree(true), tree(false))
+    }
+
+    /// KEEP-RUST (#2225): two candidates in one tier, here two models
+    /// folders' `Article`, propose nothing (upstream takes the first its
+    /// store returns), so the reference resolves as it would in a project
+    /// without Django, and no edge is Django's.
+    #[test]
+    fn keep_rust_two_model_candidates_resolve_as_without_django() {
+        let (django, plain) = with_and_without_django(&[
+            ("blog/models.py", "class Article:\n    pass\n"),
+            ("shop/models.py", "class Article:\n    pass\n"),
+            ("api/views.py", "def make():\n    return Article()\n"),
+        ]);
+        assert_eq!(detected(&django), "[\"django\"]");
+        let with = leaving(django.graph(), "function make");
+        assert_eq!(
+            with,
+            leaving(plain.graph(), "function make"),
+            "with Django:\n{}\nwithout:\n{}",
+            django.graph().report(),
+            plain.graph().report()
+        );
+        assert!(
+            !with.iter().any(|line| line.contains("\"framework\"")),
+            "{with:#?}"
+        );
+    }
+
+    /// One candidate of the heuristic's kinds is Django's edge, though the
+    /// name matcher sees a function of the same name as well.
+    #[test]
+    fn a_sole_model_candidate_is_djangos_edge() {
+        let files = [
+            ("blog/models.py", "class Article:\n    pass\n"),
+            ("lib/helpers.py", "def Article():\n    return None\n"),
+            ("api/views.py", "def make():\n    return Article()\n"),
+        ];
+        let (django, plain) = with_and_without_django(&files);
+        let graph = django.graph();
+        // A capitalized call instantiates.
+        let edges = graph.edges_matching("function make", "instantiates", "class Article");
+        assert_eq!(edges.len(), 1, "{}", graph.report());
+        assert_eq!(edges[0].resolved_by(), Some("framework"));
+        assert_eq!(edges[0].metadata["framework"], "django");
+        assert_eq!(edges[0].confidence(), Some(0.8));
+        assert!(
+            !leaving(plain.graph(), "function make")
+                .iter()
+                .any(|line| line.contains("\"framework\"")),
+            "{}",
+            plain.graph().report()
+        );
+    }
+
+    /// A heuristic's pick in another code family proposes nothing: a Django
+    /// project's only `Article` is a TypeScript class.
+    #[test]
+    fn keep_rust_a_typescript_class_is_no_django_model() {
+        let (django, _) = with_and_without_django(&[
+            ("web/article.ts", "export class Article {}\n"),
+            ("api/views.py", "def make():\n    return Article()\n"),
+        ]);
+        let with = leaving(django.graph(), "function make");
+        assert!(
+            !with.iter().any(|line| line.contains("\"framework\"")),
+            "{with:#?}"
+        );
+    }
+
+    /// KEEP-RUST (W7-19b): a route is named by the URL it serves, so no name
+    /// match reaches one. DRF's tests serve URLs that read like names: a
+    /// route named `path` took the imports and calls of Django's own `path`,
+    /// and `path('not_found', not_found)` referenced its own route, which
+    /// now leaves the handler to its function.
+    #[test]
+    fn keep_rust_no_name_match_reaches_a_route() {
+        let project = project_of(&[
+            ("manage.py", ""),
+            (
+                "tests/test_htmlrenderer.py",
+                "from django.urls import path\n\n\ndef not_found(request):\n    return None\n\n\nurlpatterns = [\n    path('not_found', not_found),\n]\n",
+            ),
+            (
+                "tests/test_urlpatterns.py",
+                "from django.urls import path\n\n\ndef view(request):\n    return None\n\n\nclass Tests:\n    def test_included_urls(self):\n        return [path('path', view)]\n",
+            ),
+        ])
+        .index();
+        let graph = project.graph();
+        assert_eq!(
+            route_names(graph),
+            ["not_found", "path"],
+            "{}",
+            graph.report()
+        );
+        let into_routes: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.kind != "contains")
+            .filter(|edge| {
+                graph
+                    .node(&edge.target)
+                    .is_some_and(|node| node.kind == "route")
+            })
+            .map(|edge| graph.describe_edge(edge))
+            .collect();
+        assert!(into_routes.is_empty(), "{into_routes:#?}");
+        assert_eq!(
+            from_route(graph, "not_found", "references"),
+            ["function not_found @tests/test_htmlrenderer.py:4"]
+        );
+        assert_eq!(
+            from_route(graph, "path", "references"),
+            ["function view @tests/test_urlpatterns.py:4"]
+        );
+    }
+
+    /// KEEP-RUST (W7-19b): a name the file imports is the import's. netbox
+    /// draws with `svgwrite`'s `Group`, which no Django name heuristic links
+    /// to the project's `Group` model, so the call resolves as it would
+    /// without Django; a file that does not import the name still gets
+    /// Django's model (a function of the same name keeps the name matcher
+    /// from answering first, as above).
+    #[test]
+    fn keep_rust_an_imported_name_is_no_django_guess() {
+        let (django, plain) = with_and_without_django(&[
+            ("users/models.py", "class Group:\n    pass\n"),
+            ("lib/helpers.py", "def Group():\n    return None\n"),
+            (
+                "dcim/svg.py",
+                "from svgwrite.container import Group\n\n\ndef draw():\n    return Group(class_='connector')\n",
+            ),
+            ("dcim/legend.py", "def legend():\n    return Group()\n"),
+        ]);
+        assert_eq!(detected(&django), "[\"django\"]");
+        let with = leaving(django.graph(), "function draw");
+        assert_eq!(
+            with,
+            leaving(plain.graph(), "function draw"),
+            "with Django:\n{}\nwithout:\n{}",
+            django.graph().report(),
+            plain.graph().report()
+        );
+        assert!(
+            !with.iter().any(|line| line.contains("\"framework\"")),
+            "{with:#?}"
+        );
+        let graph = django.graph();
+        let guessed = graph.edges_matching("function legend", "instantiates", "class Group");
+        assert_eq!(guessed.len(), 1, "{}", graph.report());
+        assert_eq!(guessed[0].resolved_by(), Some("framework"));
+        assert_eq!(guessed[0].metadata["framework"], "django");
+    }
+}
+
 mod expo_router {
     use super::support::{Graph, Project};
 

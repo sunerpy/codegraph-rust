@@ -1257,7 +1257,7 @@ fn rust_method_is_in_trait_impl(facts: &SourceFacts, start_line: i64) -> bool {
 /// A minified or bundled script, by name (`jquery.min.js`, `underscore-min.js`)
 /// or by its text (upstream #2204 `isMinifiedScript`, judged once per file and
 /// pass).
-fn is_minified_script(file_path: &str, context: &dyn ResolutionContext) -> bool {
+pub(crate) fn is_minified_script(file_path: &str, context: &dyn ResolutionContext) -> bool {
     if !codegraph_core::generated_header::is_minifiable_script(file_path) {
         return false;
     }
@@ -1291,7 +1291,7 @@ fn php_rooted_function_call(reference: &RefView) -> Option<RefView> {
     })
 }
 
-fn target_is_visible_across_files(
+pub(crate) fn target_is_visible_across_files(
     target: &Node,
     reference: &RefView,
     context: &dyn ResolutionContext,

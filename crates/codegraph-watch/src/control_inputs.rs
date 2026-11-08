@@ -1,7 +1,8 @@
 //! What resolution reads of a project's control files, which are no source
 //! files (W5-06): the JS/TS path aliases, workspace and package manifests,
 //! the C# project files, the Cargo manifests and the Go module files
-//! (W7-15d1), and which frameworks the project uses.
+//! (W7-15d1), the root files the Python frameworks are detected by
+//! (W7-19b), and which frameworks the project uses.
 //!
 //! Each reader reports what it read or probed in the same traversal that
 //! reads it ([`codegraph_resolve::path_aliases::alias_config_inputs`],
@@ -10,14 +11,18 @@
 //! [`codegraph_resolve::package_manifests::manifest_inputs`],
 //! [`codegraph_resolve::csharp_types::csharp_project_inputs`],
 //! [`codegraph_resolve::rust_scope::rust_manifest_inputs`],
-//! [`codegraph_resolve::context::go_module_inputs`]); every full index,
+//! [`codegraph_resolve::context::go_module_inputs`],
+//! [`codegraph_resolve::frameworks::python::ROOT_DETECTION_FILES`]); every
+//! full index,
 //! migration and sync writes one row per kind holding a digest of each input
 //! (a file's text, a directory's listing, `null` for a missing one), and one
 //! row naming the detected frameworks. A sync re-reads a kind's inputs (the
 //! CLI's full sync always, the watcher's when a changed path is one of them,
 //! names a control file, is a folder coming into a workspace glob's listing,
 //! or changes which files the kind's readers start from) and compares: a kind
-//! that moved re-resolves every file of its languages whole; a framework that
+//! that moved re-resolves every file of its languages whole (the Python
+//! kind's languages are none: it moves only which frameworks a sync
+//! detects); a framework that
 //! came or went, or a manifest edit that moves which files a framework that
 //! runs only in its own apps extracts, re-extracts every file, since
 //! framework nodes are made at extraction. The rows are written last;
@@ -58,10 +63,14 @@ pub enum ControlKind {
     Csharp,
     Rust,
     Go,
+    /// The root files Django, Flask and FastAPI are detected by, which
+    /// resolution reads whether or not they are indexed: no file re-resolves
+    /// when one moves, but the sync detects the frameworks again.
+    Python,
 }
 
 impl ControlKind {
-    pub const ALL: [Self; 4] = [Self::Js, Self::Csharp, Self::Rust, Self::Go];
+    pub const ALL: [Self; 5] = [Self::Js, Self::Csharp, Self::Rust, Self::Go, Self::Python];
 
     fn key(self) -> &'static str {
         match self {
@@ -69,6 +78,7 @@ impl ControlKind {
             Self::Csharp => "csharp",
             Self::Rust => "rust",
             Self::Go => "go",
+            Self::Python => "python",
         }
     }
 
@@ -96,6 +106,8 @@ impl ControlKind {
             }
             Self::Rust => name == "Cargo.toml",
             Self::Go => name == "go.mod",
+            // Its files are named by their root paths ([`is_control_file`]).
+            Self::Python => false,
         }
     }
 
@@ -107,6 +119,7 @@ impl ControlKind {
             Self::Csharp => language == Language::CSharp,
             Self::Rust => path.ends_with(".rs"),
             Self::Go => path.ends_with(".go"),
+            Self::Python => false,
         }
     }
 }
@@ -125,12 +138,14 @@ pub fn is_tauri_marker(relative: &str) -> bool {
     TAURI_MARKERS.contains(&relative)
 }
 
-/// Whether `relative` names a control file of any kind, a Tauri marker, or
-/// a Dart pubspec manifest (the Dart library lane's): the watcher hands its
-/// events to the sync, though it is no source file.
+/// Whether `relative` names a control file of any kind, a Tauri marker, a
+/// root file the Python frameworks are detected by, or a Dart pubspec
+/// manifest (the Dart library lane's): the watcher hands its events to the
+/// sync, though it is no source file.
 pub fn is_control_file(relative: &str) -> bool {
     let name = relative.rsplit('/').next().unwrap_or(relative);
     is_tauri_marker(relative)
+        || codegraph_resolve::frameworks::python::ROOT_DETECTION_FILES.contains(&relative)
         || ControlKind::ALL.iter().any(|kind| kind.names_file(name))
         || crate::dart_libraries::is_pubspec_path(relative)
 }
@@ -271,6 +286,14 @@ pub fn digests_of(kind: ControlKind, project_root: &Path, files: &[FileRecord]) 
             for relative in codegraph_resolve::context::go_module_inputs(&paths) {
                 let digest = file_digest(&project_root.join(&relative));
                 out.insert(relative, digest);
+            }
+        }
+        ControlKind::Python => {
+            for relative in codegraph_resolve::frameworks::python::ROOT_DETECTION_FILES {
+                out.insert(
+                    relative.to_string(),
+                    file_digest(&project_root.join(relative)),
+                );
             }
         }
     }
@@ -551,6 +574,60 @@ mod tests {
         assert!(!is_control_file("apps/tauri.conf.json"));
         assert!(!is_control_file("src/main.ts"));
         assert!(!is_control_file("cargo.toml"));
+        // The Python frameworks' root files, at the root only.
+        for file in [
+            "requirements.txt",
+            "setup.py",
+            "pyproject.toml",
+            "Pipfile",
+            "manage.py",
+            "app.py",
+            "main.py",
+            "api.py",
+        ] {
+            assert!(is_control_file(file), "{file}");
+            assert!(!is_control_file(&format!("svc/{file}")), "svc/{file}");
+        }
+        assert!(!is_control_file("requirements-dev.txt"));
+    }
+
+    /// The Python kind reads its eight root files, present or not, and names
+    /// no file to re-resolve.
+    #[test]
+    fn the_python_kind_digests_its_root_files_and_reresolves_none() {
+        let dir = std::env::temp_dir().join(format!(
+            "cg-control-inputs-python-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("requirements.txt"), "Django>=5\n").unwrap();
+        let digests = digests_of(ControlKind::Python, &dir, &[]);
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(
+            digests.keys().map(String::as_str).collect::<Vec<_>>(),
+            [
+                "Pipfile",
+                "api.py",
+                "app.py",
+                "main.py",
+                "manage.py",
+                "pyproject.toml",
+                "requirements.txt",
+                "setup.py",
+            ]
+        );
+        assert_eq!(
+            digests["requirements.txt"],
+            Some(hash_content("Django>=5\n"))
+        );
+        assert_eq!(digests["manage.py"], None);
+        assert!(!ControlKind::Python.reads_from("app/views.py", Language::Python));
+        assert!(!ControlKind::Python.names_file("requirements.txt"));
+        assert_eq!(ControlKind::Python.row_key(), "control_inputs:python");
     }
 
     /// The files the synthesis stage last read beside the index, and the

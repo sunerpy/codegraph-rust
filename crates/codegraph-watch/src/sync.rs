@@ -5915,6 +5915,60 @@ pub(crate) mod tests {
         assert_eq!(metadata(&db, &row_key), Some(row));
     }
 
+    /// W7-19b: an index from before the `python` control kind has no row for
+    /// it. The first sync counts the kind as moved, so it detects the
+    /// frameworks (here as before: nothing is extracted again), writes the
+    /// row and leaves the graph as it was; the next sync does not count it.
+    #[test]
+    fn a_missing_python_control_row_detects_the_frameworks_once() {
+        let dir = TestDir::new("control-inputs-python-row");
+        let db = default_db_path(dir.path()).unwrap();
+        let initial = [
+            ("manage.py", "import sys\n"),
+            (
+                "shop/urls.py",
+                "from django.urls import path\nfrom . import views\n\nurlpatterns = [\n    path(\"products/\", views.product_list),\n]\n",
+            ),
+            (
+                "shop/views.py",
+                "def product_list(request):\n    return None\n",
+            ),
+        ];
+        write_files(dir.path(), &initial);
+        sync_changed_paths(dir.path(), &db, initial.iter().map(|(path, _)| *path)).unwrap();
+        let expected = edge_projection(&db);
+        assert!(
+            expected
+                .iter()
+                .any(|edge| edge.starts_with("shop/urls.py:shop/urls.py::route:products/ -[references]-> shop/views.py:product_list")),
+            "{expected:#?}"
+        );
+        let row_key = crate::control_inputs::ControlKind::Python.row_key();
+        let row = metadata(&db, &row_key).expect("the Python row");
+        let moved = |db: &Path| {
+            let store = Store::open(db).unwrap();
+            crate::control_inputs::check(&store, dir.path(), false, false, &[], &[])
+                .unwrap()
+                .changed
+                .contains(&crate::control_inputs::ControlKind::Python)
+        };
+        assert!(!moved(&db));
+        Store::open(&db)
+            .unwrap()
+            .delete_project_metadata(&row_key)
+            .unwrap();
+        assert!(moved(&db));
+        let outcome = sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
+        assert_eq!(outcome.files_reindexed, 0, "Django was detected before");
+        assert_eq!(edge_projection(&db), expected);
+        assert_eq!(metadata(&db, &row_key), Some(row));
+        assert_eq!(
+            metadata(&db, crate::control_inputs::FRAMEWORKS_KEY),
+            Some("[\"django\"]".to_string())
+        );
+        assert!(!moved(&db));
+    }
+
     /// W5-06: a control file a watcher event names is read whole, so one
     /// replaced with its size and modification time kept still counts as
     /// changed.
