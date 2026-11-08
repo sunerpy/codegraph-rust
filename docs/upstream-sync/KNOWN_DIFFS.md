@@ -38,15 +38,15 @@ matching (`name-matcher.ts`) — orchestrated by `ReferenceResolver`
 (`index.ts`), plus concrete `FrameworkResolver` implementations behind the
 `FrameworkResolver` trait EXTENSION POINT (`crates/codegraph-resolve/src/framework.rs`):
 Express, NestJS, React, Vue, Godot, Tauri, Nuxt, React Router, TanStack Router,
-Next.js, Svelte, SvelteKit, Vue Router, Angular Router, Astro, Expo Router and
-GoFrame (`crates/codegraph-resolve/src/frameworks/`), detected per-project by
+Next.js, Svelte, SvelteKit, Vue Router, Angular Router, Astro, Django, Flask,
+FastAPI, Expo Router and GoFrame (`crates/codegraph-resolve/src/frameworks/`), detected per-project by
 `detect_frameworks`. The other colby resolvers stay deferred. The following
 colby behaviors are intentionally NOT ported in v1:
 
 - **The other framework-specific resolvers** — every concrete `FrameworkResolver`
   in `reference/colby/src/resolution/frameworks/**` EXCEPT those above:
   Spring/Java, Drupal `routing.yml`, React Native / Expo / Fabric bridges,
-  Swift↔ObjC bridging, and the Go-module / Python / Ruby / C# / Play route
+  Swift↔ObjC bridging, and the Go-module / Ruby / C# / Play route
   extractors. These are an additive heuristic layer; on a project where none
   of them is detected the orchestrator holds an empty resolver list, so
   behavior matches colby with zero frameworks detected. Astro's extraction
@@ -57,6 +57,23 @@ colby behaviors are intentionally NOT ported in v1:
   components named in markup) the Astro resolver's (`frameworks/astro.rs`).
   Re-enable any of the deferred resolvers by adding it to `frameworks/` and the
   `detect_frameworks` registry — no orchestrator change required.
+- **Django's ORM dispatch (W7-19b)** — colby's Django resolver links
+  `_iterable_class` to `ModelIterable.__iter__` (0.7), written for Django's own
+  source. Its answer reads the class named `ModelIterable` while its edge's
+  target is `__iter__`, so a second `ModelIterable`, or that class gaining an
+  `__iter__`, changes the answer where a sync finds the edge by neither the
+  target's name nor the reference's. It waits for a sync lane that reads it;
+  Django claims no `_iterable_class` (`frameworks/python.rs`).
+- **FastAPI mounts through an absolute import (W7-19b)** — a router mounted
+  through an absolute import (`from app.api.routes import items`, then
+  `api_router.include_router(items.router)`) keeps its routes' file names:
+  the port finds the mounted module as colby's `b635dd46` does, by an import
+  path that reads no Python package root, and `app.api.routes.items` names no
+  file that way. A relative import's module is followed. colby resolves the
+  absolute import from the project's package roots since #1921 (`6fe9dc12`),
+  which would name fastapi-realworld's routes `POST /users/login` and the
+  like; that is row 70 of the 2026-10-22 audit, a PORT row left to the next
+  round (`frameworks/python.rs`).
 - **`candidates` on framework references** — colby's Astro endpoint and
   Next.js route-handler references carry `candidates: [method]`, which no
   resolution step reads. A framework reference here carries none (`RefView`
@@ -493,6 +510,35 @@ regex engine), is not listed.
   `redirect` or `has`. colby's prefilter lets such a call through only when
   one of its names is declared somewhere, so there it resolves or stays
   unresolved by what unrelated files declare (`astro.rs`).
+- **A name heuristic's tier with two candidates (W7-19b).** The pick the
+  Django, Flask and FastAPI name heuristics share (#2225) resolves a tier only
+  through its one candidate: two declarations of the name in the reference's
+  file, its directory, a preferred folder or the project answer nothing and
+  stop the search, and the reference goes on to import and name resolution
+  as if the framework were not detected. colby takes the first in its store's
+  order (`frameworks/name_heuristic.rs`).
+- **A name heuristic's pick in another code family (W7-19b).** A pick written
+  in another code family than the reference answers nothing, for a `calls`
+  reference too: a Python `get_db()` in a FastAPI project whose one candidate
+  is a TypeScript `get_db` is left to the other strategies. colby passes a
+  framework's `calls` result across families, as a React Native or Expo
+  bridge call needs, so there the guess links it; for every other kind its
+  gate drops the pick and both answer nothing. A candidate of another family
+  still holds its tier (`frameworks/name_heuristic.rs`).
+- **A name a Python file imports (W7-19b).** The Django, Flask and FastAPI
+  name heuristics guess no name the reference's file imports: the import
+  names the module or the package that declares it, and import resolution
+  answers there, as for a React component (#2120). netbox draws with
+  `svgwrite`'s `Group`, which colby's Django resolver links to netbox's own
+  `Group` model by its capitalized name; here the call resolves as it would
+  without Django (`frameworks/python.rs`).
+- **No name match reaches a route (W7-19b).** A route is named by the URL it
+  serves, which no reference spells as a name, so the name matcher offers no
+  route. A Django URL can read like one: in DRF's tests a route served at
+  `path` took the imports and calls of Django's own `path`, and
+  `path('not_found', not_found)` resolved its handler to the route itself,
+  which now reaches the function. colby's exact-name match passes a route, an
+  importable kind there, and draws those edges (`name_matcher.rs`).
 - **Dart named constructors (#2380).** A named constructor, indexed as a
   method, is reached only by a call written through its class (`Foo.value(2)`).
   A call through a value of that type (a typed parameter or local, a chain's
@@ -824,4 +870,9 @@ mount prefixes need none either: every sync composes them again and renames
 only Express's own routes, so another framework's route in a mounted file
 keeps its name, which colby renames, and a route that no mount renames any
 more gets its file's name back (`frameworks/express.rs`), where colby's sync
-keeps the old prefix.
+keeps the old prefix. FastAPI's router prefixes (`bc45e907`) need none either:
+every sync composes them again and renames only FastAPI's own routes, so a
+Flask route on a FastAPI decorator's line keeps its name, which colby
+renames, and a route that nothing renames any more (its mount gone, its prefix
+computed, its router mounted at a second path) gets its file's name back
+(`frameworks/python.rs`), where colby's sync keeps the old prefix.

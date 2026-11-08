@@ -1870,8 +1870,9 @@ fn outdated_migration_writes_the_class_head_rows_of_index_force() {
 
 /// W5-06: a migration writes the control-input rows (what resolution read
 /// of the JS/TS configs and manifests, the C# project files, the Cargo
-/// manifests and, W7-15d1, the Go module files), the detected frameworks and
-/// both markers as `index --force` does.
+/// manifests, W7-15d1, the Go module files and, W7-19b, the root files the
+/// Python frameworks are detected by), the detected frameworks and both
+/// markers as `index --force` does.
 #[test]
 fn outdated_migration_writes_the_control_rows_of_index_force() {
     let dir = TestDir::new("outdated-control-inputs");
@@ -1905,6 +1906,8 @@ fn outdated_migration_writes_the_control_rows_of_index_force() {
         ("src/lib.rs", "pub fn one() -> u32 {\n    1\n}\n"),
         ("svc/go.mod", "module example.com/svc\n\ngo 1.22\n"),
         ("svc/main.go", "package main\n\nfunc main() {}\n"),
+        // Names no Python framework, so the detected frameworks stay React.
+        ("requirements.txt", "requests>=2\n"),
     ] {
         let full = project.join(path);
         fs::create_dir_all(full.parent().unwrap()).expect("create the source directory");
@@ -1953,6 +1956,7 @@ fn outdated_migration_writes_the_control_rows_of_index_force() {
             "control_inputs:csharp",
             "control_inputs:go",
             "control_inputs:js",
+            "control_inputs:python",
             "control_inputs:rust",
             "control_inputs_version",
             "frameworks_detected",
@@ -1965,8 +1969,10 @@ fn outdated_migration_writes_the_control_rows_of_index_force() {
         (1, "\"svc/go.mod\""),
         (2, "\"tsconfig.json\""),
         (2, "\"package.json\""),
-        (3, "\"Cargo.toml\""),
-        (5, "\"react\""),
+        // A digest, where the seven absent root files record null.
+        (3, "\"requirements.txt\":\""),
+        (4, "\"Cargo.toml\""),
+        (6, "\"react\""),
     ] {
         assert!(
             migrated[row].1.contains(input),

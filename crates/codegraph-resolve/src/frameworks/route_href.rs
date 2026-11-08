@@ -928,6 +928,9 @@ pub(crate) mod test_ctx {
     #[derive(Default)]
     pub(crate) struct RouteCtx {
         files: HashMap<String, String>,
+        /// Files read by path that the file list does not hold, as a
+        /// manifest no index holds.
+        unlisted: HashMap<String, String>,
         nodes: Vec<Node>,
         imports: HashMap<String, Vec<ImportMapping>>,
     }
@@ -936,6 +939,12 @@ pub(crate) mod test_ctx {
         /// A source file.
         pub(crate) fn file(mut self, path: &str, content: &str) -> Self {
             self.files.insert(path.to_string(), content.to_string());
+            self
+        }
+
+        /// A file read by path that is not in the file list.
+        pub(crate) fn unlisted(mut self, path: &str, content: &str) -> Self {
+            self.unlisted.insert(path.to_string(), content.to_string());
             self
         }
 
@@ -1000,16 +1009,22 @@ pub(crate) mod test_ctx {
                 .collect()
         }
         fn file_exists(&self, file_path: &str) -> bool {
-            self.files.contains_key(file_path)
+            self.files.contains_key(file_path) || self.unlisted.contains_key(file_path)
         }
         fn read_file(&self, file_path: &str) -> Option<String> {
-            self.files.get(file_path).cloned()
+            self.files
+                .get(file_path)
+                .or_else(|| self.unlisted.get(file_path))
+                .cloned()
         }
         fn get_project_root(&self) -> &str {
             "/project"
         }
+        /// Sorted by path, as the store's list is.
         fn get_all_files(&self) -> Vec<String> {
-            self.files.keys().cloned().collect()
+            let mut files: Vec<String> = self.files.keys().cloned().collect();
+            files.sort();
+            files
         }
         fn get_nodes_by_lower_name(&self, lower: &str) -> Vec<Node> {
             self.nodes

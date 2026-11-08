@@ -430,7 +430,7 @@ impl ResolutionContext for StoreResolutionContext<'_> {
     /// from the cache, as [`Self::read_file_shared`] does; a match is cached
     /// as it caches it, in `files`' order, and a file that does not match is
     /// not kept, so a batch is all the text held at once.
-    fn files_containing(&self, files: &[String], needle: &str) -> Vec<String> {
+    fn files_containing(&self, files: &[String], needles: &[&str]) -> Vec<String> {
         let root = Path::new(&self.project_root);
         let max_file_size = self.max_file_size;
         let mut matches = Vec::new();
@@ -461,7 +461,7 @@ impl ResolutionContext for StoreResolutionContext<'_> {
             for (file, (content, was_cached)) in batch.iter().zip(contents) {
                 if !content
                     .as_deref()
-                    .is_some_and(|content| content.contains(needle))
+                    .is_some_and(|content| needles.iter().any(|needle| content.contains(needle)))
                 {
                     continue;
                 }
@@ -1631,13 +1631,45 @@ mod tests {
             .filter(|(i, _)| i % 7 == 3)
             .map(|(_, file)| file.clone())
             .collect();
-        assert_eq!(ctx.files_containing(&searched, ".use("), expected);
+        assert_eq!(ctx.files_containing(&searched, &[".use("]), expected);
         // A match is cached: an edit after the search is not read.
         std::fs::write(root.join("src/f0003.js"), "const y = 2;\n").unwrap();
         assert!(
             ctx.read_file_shared("src/f0003.js")
                 .unwrap()
                 .contains(".use(")
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// W7-19b: with two needles, a file containing either is kept once, in
+    /// `files`' order, and only the matches are cached.
+    #[test]
+    fn store_context_files_containing_takes_any_needle() {
+        let root = temp_root("containing-any");
+        let store = open_store(&root);
+        std::fs::create_dir_all(root.join("api")).unwrap();
+        let bodies = [
+            ("api/a.py", "router = APIRouter()\n"),
+            ("api/b.py", "x = 1\n"),
+            ("api/c.py", "app.include_router(router)\n"),
+            ("api/d.py", "r = APIRouter()\napp.include_router(r)\n"),
+        ];
+        for (file, body) in bodies {
+            std::fs::write(root.join(file), body).unwrap();
+        }
+        let ctx = StoreResolutionContext::new(&store, root.to_str().unwrap());
+        let files: Vec<String> = bodies.iter().map(|(file, _)| file.to_string()).collect();
+        assert_eq!(
+            ctx.files_containing(&files, &["APIRouter", "include_router"]),
+            ["api/a.py", "api/c.py", "api/d.py"]
+        );
+        // The file that matched neither was not cached: its edit is read.
+        std::fs::write(root.join("api/b.py"), "router = APIRouter()\n").unwrap();
+        assert!(
+            ctx.read_file_shared("api/b.py")
+                .unwrap()
+                .contains("APIRouter")
         );
         std::fs::remove_dir_all(&root).ok();
     }

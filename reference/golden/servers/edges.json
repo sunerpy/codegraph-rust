@@ -86,6 +86,42 @@
   {
     "col": 0,
     "kind": "references",
+    "line": 19,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "route:flask/app.py:19:GET:/ping",
+    "target": "function:359d25aadac7c78f4c23663b4a877017"
+  },
+  {
+    "col": 0,
+    "kind": "references",
+    "line": 6,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "route:flask/app.py:6:GET:/hello",
+    "target": "function:c49b36ba9866aa9075c5e726b4f3fd4b"
+  },
+  {
+    "col": 0,
+    "kind": "references",
+    "line": 7,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "route:fastapi/main.py:7:GET:/{item_id}",
+    "target": "function:91f55ff4968a290758de7bbd2a2aabfd"
+  },
+  {
+    "col": 0,
+    "kind": "references",
     "line": 8,
     "metadata": {
       "confidence": 0.7,

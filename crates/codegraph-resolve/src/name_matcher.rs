@@ -2918,6 +2918,12 @@ pub fn match_by_exact_name(
         // (upstream #965, `0a91d0f5`). Linking an import to what it names is
         // the import resolver's job.
         .filter(|(n, _)| n.kind != NodeKind::Import)
+        // A route is named by the URL it serves, which no reference spells as
+        // a name: a Django URL may read like one (`path('path', …)`,
+        // `path('not_found', not_found)`), and a call, an import or the
+        // route's own handler named alike means something else (KEEP-RUST,
+        // W7-19b).
+        .filter(|(n, _)| n.kind != NodeKind::Route)
         .filter(|(n, _)| !macro_call || matches!(n.kind, NodeKind::Function | NodeKind::Method))
         // Nested locals are only reachable from inside their container (#1230).
         .filter(|(n, reach)| is_reachable_within(n, reference, context, reach))
@@ -16919,5 +16925,63 @@ mod tests {
         let ctx = Ctx::default().lower("vue", vec![statement]);
         let reference = refv("vue", EdgeKind::Calls, "src/App.vue", Language::Vue, 6);
         assert_eq!(match_fuzzy(&reference, &ctx), None);
+    }
+
+    // ================= routes are never name-match targets ===================
+
+    /// A route is named by the URL it serves (KEEP-RUST, W7-19b): a Django
+    /// `path('path', …)` route named `path` answers no call of `path()`, no
+    /// import of it and no reference to it.
+    #[test]
+    fn exact_match_never_offers_a_route() {
+        let route = mk(
+            "route:urls-path",
+            NodeKind::Route,
+            "path",
+            "path",
+            "app/urls.py",
+            Language::Python,
+        );
+        let ctx = Ctx::default().name("path", vec![route]);
+        for kind in [EdgeKind::Calls, EdgeKind::Imports, EdgeKind::References] {
+            let reference = refv("path", kind, "app/views.py", Language::Python, 3);
+            assert_eq!(match_by_exact_name(&reference, &ctx), None, "{kind:?}");
+        }
+    }
+
+    /// A route named like its handler (`path('not_found', views.not_found)`)
+    /// is not the handler its own reference names, and does not make the
+    /// handler look ambiguous: the function in another file takes the
+    /// single-match confidence, where proximity would have picked the route.
+    #[test]
+    fn a_route_never_answers_or_shadows_its_own_handler() {
+        let route = mk(
+            "route:urls-not-found",
+            NodeKind::Route,
+            "not_found",
+            "not_found",
+            "app/urls.py",
+            Language::Python,
+        );
+        let handler = mk(
+            "function:not-found",
+            NodeKind::Function,
+            "not_found",
+            "not_found",
+            "app/views.py",
+            Language::Python,
+        );
+        let ctx = Ctx::default().name("not_found", vec![route, handler]);
+        let mut reference = refv(
+            "not_found",
+            EdgeKind::References,
+            "app/urls.py",
+            Language::Python,
+            1,
+        );
+        reference.from_node_id = "route:urls-not-found".to_string();
+        let resolved = match_by_exact_name(&reference, &ctx).expect("the handler resolves");
+        assert_eq!(resolved.target_node_id, "function:not-found");
+        assert_eq!(resolved.confidence, 0.9);
     }
 }

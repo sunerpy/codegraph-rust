@@ -10989,6 +10989,557 @@ pub fn astro_global_member_namesakes_leave() -> Case {
     .edge_metadata_after(ASTRO_LOGIN_SELF, "framework", "astro")
 }
 
+// ---- W7-19b: Django, Flask and FastAPI ----
+
+const DJANGO_VIEWS: &str =
+    "def product_list(request):\n    return None\n\n\ndef order_list(request):\n    return None\n";
+
+const DJANGO_URLS: &str = "from django.urls import path\nfrom . import views\n\nurlpatterns = [\n    path(\"products/\", views.product_list),\n]\n";
+
+const DJANGO_URLS_TWO: &str = "from django.urls import path\nfrom . import views\n\nurlpatterns = [\n    path(\"products/\", views.product_list),\n    path(\"orders/\", views.order_list),\n]\n";
+
+const DJANGO_PRODUCTS_ROUTE: &str = "route shop/urls.py::route:products/";
+
+const DJANGO_ORDERS_ROUTE: &str = "route shop/urls.py::route:orders/";
+
+/// W7-19b: `django` comes into the root `requirements.txt`, which no index
+/// holds: the `python` control kind makes the sync detect the frameworks, and
+/// Django's coming extracts every file again.
+pub fn python_django_requirement_appears() -> Case {
+    Case::new(Change::ControlFile, &[Language::Python])
+        .file("requirements.txt", "requests\n")
+        .file("shop/urls.py", DJANGO_URLS)
+        .file("shop/views.py", DJANGO_VIEWS)
+        .write("requirements.txt", "requests\ndjango\n")
+        .edge_after(DJANGO_PRODUCTS_ROUTE, "references", "function product_list")
+}
+
+/// W7-19b: `django` leaves the root `requirements.txt`: its routes go.
+pub fn python_django_requirement_leaves() -> Case {
+    Case::new(Change::ControlFile, &[Language::Python])
+        .file("requirements.txt", "requests\ndjango\n")
+        .file("shop/urls.py", DJANGO_URLS)
+        .file("shop/views.py", DJANGO_VIEWS)
+        .write("requirements.txt", "requests\n")
+        .edge_before(DJANGO_PRODUCTS_ROUTE, "references", "function product_list")
+}
+
+/// W7-19b: a root `manage.py` appears: Django is detected.
+pub fn python_django_manage_py_appears() -> Case {
+    Case::new(Change::ControlFile, &[Language::Python])
+        .file("shop/urls.py", DJANGO_URLS)
+        .file("shop/views.py", DJANGO_VIEWS)
+        .write("manage.py", "import sys\n")
+        .edge_after(DJANGO_PRODUCTS_ROUTE, "references", "function product_list")
+}
+
+/// W7-19b: the root `manage.py` is deleted: Django is no longer detected.
+pub fn python_django_manage_py_is_deleted() -> Case {
+    Case::new(Change::ControlFile, &[Language::Python])
+        .file("manage.py", "import sys\n")
+        .file("shop/urls.py", DJANGO_URLS)
+        .file("shop/views.py", DJANGO_VIEWS)
+        .remove("manage.py")
+        .edge_before(DJANGO_PRODUCTS_ROUTE, "references", "function product_list")
+}
+
+/// W7-19b: a URLconf gains a `path(…)`.
+pub fn python_django_urlconf_gains_a_path() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Python])
+        .file("manage.py", "import sys\n")
+        .file("shop/urls.py", DJANGO_URLS)
+        .file("shop/views.py", DJANGO_VIEWS)
+        .write("shop/urls.py", DJANGO_URLS_TWO)
+        .edge_throughout(DJANGO_PRODUCTS_ROUTE, "references", "function product_list")
+        .edge_after(DJANGO_ORDERS_ROUTE, "references", "function order_list")
+}
+
+/// W7-19b: a URLconf loses a `path(…)`.
+pub fn python_django_urlconf_loses_a_path() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Python])
+        .file("manage.py", "import sys\n")
+        .file("shop/urls.py", DJANGO_URLS_TWO)
+        .file("shop/views.py", DJANGO_VIEWS)
+        .write("shop/urls.py", DJANGO_URLS)
+        .edge_before(DJANGO_ORDERS_ROUTE, "references", "function order_list")
+        .edge_throughout(DJANGO_PRODUCTS_ROUTE, "references", "function product_list")
+}
+
+const DJANGO_ROOT_URLS: &str = "from django.urls import path, include\n\nurlpatterns = [\n    path(\"shop/\", include(\"shop.urls\")),\n]\n";
+
+const DJANGO_INCLUDE_ROUTE: &str = "route config/urls.py::route:shop/";
+
+/// W7-19b: the URLconf an `include('shop.urls')` imports is deleted.
+pub fn python_django_included_urlconf_is_deleted() -> Case {
+    Case::new(Change::DeleteImportedModule, &[Language::Python])
+        .file("manage.py", "import sys\n")
+        .file("config/urls.py", DJANGO_ROOT_URLS)
+        .file("shop/urls.py", DJANGO_URLS)
+        .file("shop/views.py", DJANGO_VIEWS)
+        .remove("shop/urls.py")
+        .edge_before(DJANGO_INCLUDE_ROUTE, "imports", "file:shop/urls.py")
+}
+
+/// W7-19b: the URLconf an `include('shop.urls')` imports comes back: the
+/// include is resolved again (#2392's import retry, by the name's tail).
+pub fn python_django_included_urlconf_reappears() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Python])
+        .file("manage.py", "import sys\n")
+        .file("config/urls.py", DJANGO_ROOT_URLS)
+        .file("shop/views.py", DJANGO_VIEWS)
+        .write("shop/urls.py", DJANGO_URLS)
+        .edge_after(DJANGO_INCLUDE_ROUTE, "imports", "file:shop/urls.py")
+}
+
+const FLASK_HELLO: &str = "from flask import Blueprint\n\nbp = Blueprint(\"web\", __name__)\n\n\n@bp.route(\"/hello\")\ndef hello():\n    return \"hi\"\n";
+
+/// W7-19b: `flask` comes into the root `Pipfile`, which no index holds.
+pub fn python_flask_dependency_appears_in_pipfile() -> Case {
+    Case::new(Change::ControlFile, &[Language::Python])
+        .file("Pipfile", "[packages]\nrequests = \"*\"\n")
+        .file("web/views.py", FLASK_HELLO)
+        .write("Pipfile", "[packages]\nrequests = \"*\"\nflask = \"*\"\n")
+        .edge_after(
+            "route web/views.py::GET:/hello",
+            "references",
+            "function hello",
+        )
+}
+
+/// W7-19b: `flask` leaves the root `Pipfile`.
+pub fn python_flask_dependency_leaves_pipfile() -> Case {
+    Case::new(Change::ControlFile, &[Language::Python])
+        .file("Pipfile", "[packages]\nrequests = \"*\"\nflask = \"*\"\n")
+        .file("web/views.py", FLASK_HELLO)
+        .write("Pipfile", "[packages]\nrequests = \"*\"\n")
+        .edge_before(
+            "route web/views.py::GET:/hello",
+            "references",
+            "function hello",
+        )
+}
+
+const FLASK_PING: &str = "from flask import Blueprint\n\nbp = Blueprint(\"web\", __name__)\n\n\ndef ping():\n    return \"pong\"\n";
+
+const FLASK_PING_RULE: &str = "from flask import Blueprint\n\nbp = Blueprint(\"web\", __name__)\n\n\ndef ping():\n    return \"pong\"\n\n\nbp.add_url_rule(\"/ping\", view_func=ping)\n";
+
+/// W7-19b: an `add_url_rule(…, view_func=…)` appears (#2154).
+pub fn python_flask_url_rule_appears() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Python])
+        .file("requirements.txt", "flask\n")
+        .file("web/views.py", FLASK_PING)
+        .write("web/views.py", FLASK_PING_RULE)
+        .edge_after(
+            "route web/views.py::GET:/ping",
+            "references",
+            "function ping",
+        )
+}
+
+/// W7-19b: the `add_url_rule` goes away again.
+pub fn python_flask_url_rule_is_removed() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Python])
+        .file("requirements.txt", "flask\n")
+        .file("web/views.py", FLASK_PING_RULE)
+        .write("web/views.py", FLASK_PING)
+        .edge_before(
+            "route web/views.py::GET:/ping",
+            "references",
+            "function ping",
+        )
+}
+
+const FLASK_LOGIN: &str = "from flask import Blueprint\nfrom flask.views import MethodView\nfrom web.helpers import register_view\n\nbp = Blueprint(\"auth\", __name__)\n\n\nclass Login(MethodView):\n    def get(self):\n        return \"form\"\n\n\nregister_view(bp, routes=[\"/login\"], view_func=Login.as_view(\"login\"))\n";
+
+const FLASK_LOGIN_SIGNIN: &str = "from flask import Blueprint\nfrom flask.views import MethodView\nfrom web.helpers import register_view\n\nbp = Blueprint(\"auth\", __name__)\n\n\nclass Login(MethodView):\n    def get(self):\n        return \"form\"\n\n\nregister_view(bp, routes=[\"/login\", \"/signin\"], view_func=Login.as_view(\"login\"))\n";
+
+const FLASK_HELPERS: &str = "def register_view(bp_or_app, routes, view_func, **kwargs):\n    for route in routes:\n        bp_or_app.add_url_rule(route, view_func=view_func, **kwargs)\n";
+
+/// W7-19b: a wrapper's list of paths gains one (#2154, flaskbb's
+/// `register_view`).
+pub fn python_flask_register_view_gains_a_path() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Python])
+        .file("requirements.txt", "flask\n")
+        .file("web/helpers.py", FLASK_HELPERS)
+        .file("web/auth.py", FLASK_LOGIN)
+        .write("web/auth.py", FLASK_LOGIN_SIGNIN)
+        .edge_throughout("route web/auth.py::ANY:/login", "references", "class Login")
+        .edge_after(
+            "route web/auth.py::ANY:/signin",
+            "references",
+            "class Login",
+        )
+}
+
+const FASTAPI_ITEMS: &str = "from fastapi import APIRouter\n\nrouter = APIRouter()\n\n\n@router.get(\"/items\")\ndef list_items():\n    return []\n\n\ndef find_items():\n    return []\n";
+
+const FASTAPI_ITEMS_FIND: &str = "from fastapi import APIRouter\n\nrouter = APIRouter()\n\n\n@router.get(\"/items\")\ndef find_items():\n    return []\n\n\ndef list_items():\n    return []\n";
+
+const FASTAPI_MAIN: &str = "from fastapi import FastAPI\nfrom .items import router\n\napp = FastAPI()\napp.include_router(router)\n";
+
+const FASTAPI_MAIN_MOUNT: &str = "from fastapi import FastAPI\nfrom .items import router\n\napp = FastAPI()\napp.include_router(router, prefix=\"/api\")\n";
+
+const FASTAPI_ITEMS_ROUTE: &str = "route svc/items.py::GET:/items";
+
+/// W7-19b: `fastapi` comes into the root `pyproject.toml`, which no index
+/// holds (no script of the project calls `FastAPI(`).
+pub fn python_fastapi_dependency_appears_in_pyproject() -> Case {
+    Case::new(Change::ControlFile, &[Language::Python])
+        .file(
+            "pyproject.toml",
+            "[project]\nname = \"svc\"\ndependencies = []\n",
+        )
+        .file("svc/items.py", FASTAPI_ITEMS)
+        .write(
+            "pyproject.toml",
+            "[project]\nname = \"svc\"\ndependencies = [\"fastapi\"]\n",
+        )
+        .edge_after(FASTAPI_ITEMS_ROUTE, "references", "function list_items")
+}
+
+/// W7-19b: `fastapi` leaves the root `pyproject.toml`.
+pub fn python_fastapi_dependency_leaves_pyproject() -> Case {
+    Case::new(Change::ControlFile, &[Language::Python])
+        .file(
+            "pyproject.toml",
+            "[project]\nname = \"svc\"\ndependencies = [\"fastapi\"]\n",
+        )
+        .file("svc/items.py", FASTAPI_ITEMS)
+        .write(
+            "pyproject.toml",
+            "[project]\nname = \"svc\"\ndependencies = []\n",
+        )
+        .edge_before(FASTAPI_ITEMS_ROUTE, "references", "function list_items")
+}
+
+/// W7-19b: a mount gains a prefix (upstream `postExtract`, `bc45e907`): the
+/// mounted router's route is renamed, though its file did not change.
+pub fn python_fastapi_mount_gains_a_prefix() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Python])
+        .file("requirements.txt", "fastapi\n")
+        .file("svc/main.py", FASTAPI_MAIN)
+        .file("svc/items.py", FASTAPI_ITEMS)
+        .write("svc/main.py", FASTAPI_MAIN_MOUNT)
+        .named_before("route", "GET /items")
+        .named_after("route", "GET /api/items")
+        .edge_throughout(FASTAPI_ITEMS_ROUTE, "references", "function list_items")
+}
+
+/// W7-19b: the mount loses its prefix: a route an earlier sync renamed gets
+/// its in-file name back, as a fresh index names it.
+pub fn python_fastapi_mount_loses_its_prefix() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Python])
+        .file("requirements.txt", "fastapi\n")
+        .file("svc/main.py", FASTAPI_MAIN_MOUNT)
+        .file("svc/items.py", FASTAPI_ITEMS)
+        .write("svc/main.py", FASTAPI_MAIN)
+        .named_before("route", "GET /api/items")
+        .named_after("route", "GET /items")
+        .edge_throughout(FASTAPI_ITEMS_ROUTE, "references", "function list_items")
+}
+
+/// W7-19b: the mount's prefix changes.
+pub fn python_fastapi_mount_prefix_changes() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Python])
+        .file("requirements.txt", "fastapi\n")
+        .file("svc/main.py", FASTAPI_MAIN_MOUNT)
+        .file("svc/items.py", FASTAPI_ITEMS)
+        .write(
+            "svc/main.py",
+            "from fastapi import FastAPI\nfrom .items import router\n\napp = FastAPI()\napp.include_router(router, prefix=\"/v2\")\n",
+        )
+        .named_before("route", "GET /api/items")
+        .named_after("route", "GET /v2/items")
+}
+
+/// W7-19b: the prefix becomes computed: unknown, so the route gets its
+/// in-file name back.
+pub fn python_fastapi_mount_prefix_becomes_computed() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Python])
+        .file("requirements.txt", "fastapi\n")
+        .file("svc/main.py", FASTAPI_MAIN_MOUNT)
+        .file("svc/items.py", FASTAPI_ITEMS)
+        .write(
+            "svc/main.py",
+            "from fastapi import FastAPI\nfrom .items import router\n\napp = FastAPI()\napp.include_router(router, prefix=settings.API)\n",
+        )
+        .named_before("route", "GET /api/items")
+        .named_after("route", "GET /items")
+}
+
+/// W7-19b: a second file mounts the same router at another path: one name
+/// cannot be two paths, so the route gets its in-file name back.
+pub fn python_fastapi_second_mount_of_a_router_appears() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Python])
+        .file("requirements.txt", "fastapi\n")
+        .file("svc/main.py", FASTAPI_MAIN_MOUNT)
+        .file("svc/items.py", FASTAPI_ITEMS)
+        .write(
+            "svc/admin.py",
+            "from fastapi import FastAPI\nfrom .items import router\n\nadmin = FastAPI()\nadmin.include_router(router, prefix=\"/admin\")\n",
+        )
+        .named_before("route", "GET /api/items")
+        .named_after("route", "GET /items")
+}
+
+/// W7-19b: the second mount goes away again.
+pub fn python_fastapi_second_mount_of_a_router_is_deleted() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Python])
+        .file("requirements.txt", "fastapi\n")
+        .file("svc/main.py", FASTAPI_MAIN_MOUNT)
+        .file("svc/items.py", FASTAPI_ITEMS)
+        .file(
+            "svc/admin.py",
+            "from fastapi import FastAPI\nfrom .items import router\n\nadmin = FastAPI()\nadmin.include_router(router, prefix=\"/admin\")\n",
+        )
+        .remove("svc/admin.py")
+        .named_before("route", "GET /items")
+        .named_after("route", "GET /api/items")
+}
+
+const FASTAPI_OWN_PREFIX: &str = "from fastapi import APIRouter\n\nrouter = APIRouter(prefix=\"/items\")\n\n\n@router.get(\"\")\ndef list_items():\n    return []\n";
+
+/// W7-19b: a router's own `APIRouter(prefix=…)` changes, in the route's own
+/// file.
+pub fn python_fastapi_router_prefix_changes() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Python])
+        .file("requirements.txt", "fastapi\n")
+        .file("svc/items.py", FASTAPI_OWN_PREFIX)
+        .write(
+            "svc/items.py",
+            "from fastapi import APIRouter\n\nrouter = APIRouter(prefix=\"/things\")\n\n\n@router.get(\"\")\ndef list_items():\n    return []\n",
+        )
+        .named_before("route", "GET /items")
+        .named_after("route", "GET /things")
+        .edge_throughout("route svc/items.py::GET:", "references", "function list_items")
+}
+
+const FASTAPI_V1: &str = "from fastapi import APIRouter\nfrom .items import router as items_router\n\napi_router = APIRouter()\n";
+
+const FASTAPI_V1_INCLUDES: &str = "from fastapi import APIRouter\nfrom .items import router as items_router\n\napi_router = APIRouter()\napi_router.include_router(items_router)\n";
+
+const FASTAPI_MAIN_V1: &str = "from fastapi import FastAPI\nfrom .v1 import api_router\n\napp = FastAPI()\napp.include_router(api_router, prefix=\"/api/v1\")\n";
+
+/// W7-19b: an aggregate router comes to include a router through an alias
+/// import, and is mounted at a prefix: two levels compose.
+pub fn python_fastapi_alias_import_mount_appears() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Python])
+        .file("requirements.txt", "fastapi\n")
+        .file("svc/main.py", FASTAPI_MAIN_V1)
+        .file("svc/v1.py", FASTAPI_V1)
+        .file("svc/items.py", FASTAPI_ITEMS)
+        .write("svc/v1.py", FASTAPI_V1_INCLUDES)
+        .named_before("route", "GET /items")
+        .named_after("route", "GET /api/v1/items")
+}
+
+/// W7-19b: the aggregate router no longer includes it.
+pub fn python_fastapi_alias_import_mount_is_removed() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Python])
+        .file("requirements.txt", "fastapi\n")
+        .file("svc/main.py", FASTAPI_MAIN_V1)
+        .file("svc/v1.py", FASTAPI_V1_INCLUDES)
+        .file("svc/items.py", FASTAPI_ITEMS)
+        .write("svc/v1.py", FASTAPI_V1)
+        .named_before("route", "GET /api/v1/items")
+        .named_after("route", "GET /items")
+}
+
+/// W7-19b: the mounted router's handler changes: its re-extracted route is
+/// renamed again under the unchanged mount.
+pub fn python_fastapi_mounted_handler_body_edit() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Python])
+        .file("requirements.txt", "fastapi\n")
+        .file("svc/main.py", FASTAPI_MAIN_MOUNT)
+        .file("svc/items.py", FASTAPI_ITEMS)
+        .write("svc/items.py", FASTAPI_ITEMS_FIND)
+        .named_before("route", "GET /api/items")
+        .named_after("route", "GET /api/items")
+        .edge_before(FASTAPI_ITEMS_ROUTE, "references", "function list_items")
+        .edge_after(FASTAPI_ITEMS_ROUTE, "references", "function find_items")
+        .no_edge_after(FASTAPI_ITEMS_ROUTE, "references", "function list_items")
+}
+
+const MODEL_ARTICLE: &str = "class Article:\n    pass\n";
+
+/// A function named like the model: the name matcher sees two candidates,
+/// so the model's edge is the heuristic's.
+const HELPER_ARTICLE: &str = "def Article():\n    return None\n";
+
+const MAKE_ARTICLE: &str = "def make():\n    return Article()\n";
+
+const MAKE_INSTANTIATES: (&str, &str) = ("function make", "instantiates");
+
+/// W7-19b (#2225): a namesake of the model appears in the referencing file's
+/// directory, a tier before the models folder: Django's pick moves to it.
+pub fn python_django_model_gains_a_namesake_in_the_directory() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Python])
+        .file("manage.py", "import sys\n")
+        .file("blog/models.py", MODEL_ARTICLE)
+        .file("lib/helpers.py", HELPER_ARTICLE)
+        .file("api/views.py", MAKE_ARTICLE)
+        .write("api/article.py", MODEL_ARTICLE)
+        .edge_metadata_before(
+            (
+                MAKE_INSTANTIATES.0,
+                MAKE_INSTANTIATES.1,
+                "class Article @blog/models.py",
+            ),
+            "framework",
+            "django",
+        )
+        .edge_metadata_after(
+            (
+                MAKE_INSTANTIATES.0,
+                MAKE_INSTANTIATES.1,
+                "class Article @api/article.py",
+            ),
+            "framework",
+            "django",
+        )
+}
+
+/// W7-19b (#2225): the namesake leaves the directory again.
+pub fn python_django_model_loses_its_namesake_in_the_directory() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Python])
+        .file("manage.py", "import sys\n")
+        .file("blog/models.py", MODEL_ARTICLE)
+        .file("lib/helpers.py", HELPER_ARTICLE)
+        .file("api/views.py", MAKE_ARTICLE)
+        .file("api/article.py", MODEL_ARTICLE)
+        .remove("api/article.py")
+        .edge_metadata_before(
+            (
+                MAKE_INSTANTIATES.0,
+                MAKE_INSTANTIATES.1,
+                "class Article @api/article.py",
+            ),
+            "framework",
+            "django",
+        )
+        .edge_metadata_after(
+            (
+                MAKE_INSTANTIATES.0,
+                MAKE_INSTANTIATES.1,
+                "class Article @blog/models.py",
+            ),
+            "framework",
+            "django",
+        )
+}
+
+/// W7-19b (#2225, KEEP-RUST): a second model of the name appears in the
+/// pick's tier: Django proposes nothing, and the reference is left to the
+/// other strategies.
+pub fn python_django_model_gains_a_second_candidate_in_its_tier() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Python])
+        .file("manage.py", "import sys\n")
+        .file("blog/models.py", MODEL_ARTICLE)
+        .file("lib/helpers.py", HELPER_ARTICLE)
+        .file("api/views.py", MAKE_ARTICLE)
+        .write("shop/models.py", MODEL_ARTICLE)
+        .edge_metadata_before(
+            (
+                MAKE_INSTANTIATES.0,
+                MAKE_INSTANTIATES.1,
+                "class Article @blog/models.py",
+            ),
+            "framework",
+            "django",
+        )
+        .no_edge_metadata_after(
+            (
+                MAKE_INSTANTIATES.0,
+                MAKE_INSTANTIATES.1,
+                "class Article @blog/models.py",
+            ),
+            "framework",
+            "django",
+        )
+        .no_edge_metadata_after(
+            (
+                MAKE_INSTANTIATES.0,
+                MAKE_INSTANTIATES.1,
+                "class Article @shop/models.py",
+            ),
+            "framework",
+            "django",
+        )
+}
+
+/// W7-19b (#2225): the second model goes away: the pick is Django's again.
+pub fn python_django_model_loses_its_second_candidate() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Python])
+        .file("manage.py", "import sys\n")
+        .file("blog/models.py", MODEL_ARTICLE)
+        .file("shop/models.py", MODEL_ARTICLE)
+        .file("lib/helpers.py", HELPER_ARTICLE)
+        .file("api/views.py", MAKE_ARTICLE)
+        .remove("shop/models.py")
+        .edge_metadata_after(
+            (
+                MAKE_INSTANTIATES.0,
+                MAKE_INSTANTIATES.1,
+                "class Article @blog/models.py",
+            ),
+            "framework",
+            "django",
+        )
+}
+
+/// W7-19b (#2225): the model moves into a function's body, out of every
+/// other file's reach.
+pub fn python_django_model_moves_into_a_function_body() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Python])
+        .file("manage.py", "import sys\n")
+        .file("blog/models.py", MODEL_ARTICLE)
+        .file("lib/helpers.py", HELPER_ARTICLE)
+        .file("api/views.py", MAKE_ARTICLE)
+        .write(
+            "blog/models.py",
+            "def build():\n    class Article:\n        pass\n    return Article\n",
+        )
+        .edge_metadata_before(
+            (
+                MAKE_INSTANTIATES.0,
+                MAKE_INSTANTIATES.1,
+                "class Article @blog/models.py",
+            ),
+            "framework",
+            "django",
+        )
+        .no_edge_after(
+            MAKE_INSTANTIATES.0,
+            MAKE_INSTANTIATES.1,
+            "class build::Article @blog/models.py",
+        )
+}
+
+/// W7-19b (#2225): the model moves under `tests/`, out of reach of code
+/// that is no test.
+pub fn python_django_model_moves_under_tests() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Python])
+        .file("manage.py", "import sys\n")
+        .file("blog/models.py", MODEL_ARTICLE)
+        .file("lib/helpers.py", HELPER_ARTICLE)
+        .file("api/views.py", MAKE_ARTICLE)
+        .rename("blog/models.py", "tests/models.py")
+        .edge_metadata_before(
+            (
+                MAKE_INSTANTIATES.0,
+                MAKE_INSTANTIATES.1,
+                "class Article @blog/models.py",
+            ),
+            "framework",
+            "django",
+        )
+        .no_edge_after(
+            MAKE_INSTANTIATES.0,
+            MAKE_INSTANTIATES.1,
+            "class Article @tests/models.py",
+        )
+}
+
 /// W7-03: a `nuxt.config.ts` appears in a Vue app (upstream #2130): Nuxt is
 /// detected, and its `pages/` become routes served by their components.
 pub fn vue_nuxt_config_appears() -> Case {
