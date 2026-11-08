@@ -15,6 +15,7 @@ use crate::workspace_packages::{WorkspacePackages, load_workspace_packages};
 use crate::{import_resolver, pathutil};
 use codegraph_core::types::{EdgeKind, Language, Node, NodeKind};
 use codegraph_store::Store;
+use rayon::prelude::*;
 use std::borrow::Borrow;
 use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap};
@@ -24,6 +25,10 @@ use std::sync::Arc;
 /// `DEFAULT_CACHE_LIMIT` (`index.ts:54`). Override via env in the upstream; the
 /// Rust port keeps the fixed default for one resolution run.
 pub(crate) const DEFAULT_CACHE_LIMIT: usize = 5_000;
+
+/// How many files [`StoreResolutionContext`]'s `files_containing` reads at
+/// once, in parallel: its bound on the text it holds.
+const FILES_CONTAINING_BATCH: usize = 512;
 
 /// A [`ResolutionContext`] over a [`Store`] plus the project root.
 ///
@@ -416,6 +421,57 @@ impl ResolutionContext for StoreResolutionContext<'_> {
             read_source_file(&full_path, file_path, self.max_file_size).map(Arc::from);
         c.file_cache.set(file_path.to_string(), content.clone());
         content
+    }
+
+    /// The files the content cache lacks are read in parallel, a batch at a
+    /// time (W7-19a): a pass that searches every indexed file, as Express's
+    /// mount pass does on each sync, then waits for the slowest worker's
+    /// share of the reads rather than for all of them. A cached file answers
+    /// from the cache, as [`Self::read_file_shared`] does; a match is cached
+    /// as it caches it, in `files`' order, and a file that does not match is
+    /// not kept, so a batch is all the text held at once.
+    fn files_containing(&self, files: &[String], needle: &str) -> Vec<String> {
+        let root = Path::new(&self.project_root);
+        let max_file_size = self.max_file_size;
+        let mut matches = Vec::new();
+        for batch in files.chunks(FILES_CONTAINING_BATCH) {
+            let cached: Vec<Option<Option<Arc<str>>>> = {
+                let mut c = self.caches.borrow_mut();
+                batch
+                    .iter()
+                    .map(|file| {
+                        c.file_cache
+                            .has(file.as_str())
+                            .then(|| c.file_cache.get(file.as_str()).flatten())
+                    })
+                    .collect()
+            };
+            let contents: Vec<(Option<Arc<str>>, bool)> = batch
+                .par_iter()
+                .zip(cached.into_par_iter())
+                .map(|(file, cached)| match cached {
+                    Some(content) => (content, true),
+                    None => (
+                        read_source_file(&root.join(file), file, max_file_size).map(Arc::from),
+                        false,
+                    ),
+                })
+                .collect();
+            let mut c = self.caches.borrow_mut();
+            for (file, (content, was_cached)) in batch.iter().zip(contents) {
+                if !content
+                    .as_deref()
+                    .is_some_and(|content| content.contains(needle))
+                {
+                    continue;
+                }
+                if !was_cached {
+                    c.file_cache.set(file.clone(), content);
+                }
+                matches.push(file.clone());
+            }
+        }
+        matches
     }
 
     fn source_facts(&self, file_path: &str) -> Option<Arc<SourceFacts>> {
@@ -1539,6 +1595,51 @@ mod tests {
         assert!(ctx.get_all_files().contains(&"known.ts".to_string()));
         std::fs::remove_dir_all(&root).ok();
         std::fs::remove_dir_all(&outside).ok();
+    }
+
+    /// W7-19a: `files_containing` keeps `files`' order across batches,
+    /// answers a file read earlier from the cache, skips an unreadable one,
+    /// and caches each match as `read_file_shared` does.
+    #[test]
+    fn store_context_files_containing_keeps_order_and_the_cache() {
+        let root = temp_root("containing");
+        let store = open_store(&root);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let count = 2 * FILES_CONTAINING_BATCH + 76;
+        let files: Vec<String> = (0..count).map(|i| format!("src/f{i:04}.js")).collect();
+        for (i, file) in files.iter().enumerate() {
+            let body = if i % 7 == 3 {
+                "app.use('/x', r);\n"
+            } else {
+                "const x = 1;\n"
+            };
+            std::fs::write(root.join(file), body).unwrap();
+        }
+        let ctx = StoreResolutionContext::new(&store, root.to_str().unwrap());
+        // Read before the search: the search answers from the cache.
+        assert!(
+            !ctx.read_file_shared("src/f0000.js")
+                .unwrap()
+                .contains(".use(")
+        );
+        std::fs::write(root.join("src/f0000.js"), "app.use('/late', r);\n").unwrap();
+        let mut searched = files.clone();
+        searched.insert(5, "src/missing.js".to_string());
+        let expected: Vec<String> = files
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| i % 7 == 3)
+            .map(|(_, file)| file.clone())
+            .collect();
+        assert_eq!(ctx.files_containing(&searched, ".use("), expected);
+        // A match is cached: an edit after the search is not read.
+        std::fs::write(root.join("src/f0003.js"), "const y = 2;\n").unwrap();
+        assert!(
+            ctx.read_file_shared("src/f0003.js")
+                .unwrap()
+                .contains(".use(")
+        );
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]

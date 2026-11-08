@@ -13,6 +13,18 @@
   },
   {
     "col": 0,
+    "kind": "calls",
+    "line": 9,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "route:express/routes/users.js:9:GET:/users/:id",
+    "target": "function:203842290365d50993a2f45495b18a72"
+  },
+  {
+    "col": 0,
     "kind": "imports",
     "line": 2,
     "metadata": {
@@ -58,6 +70,18 @@
     "provenance": null,
     "source": "file:nest/src/main.ts",
     "target": "file:nest/src/app.module.ts"
+  },
+  {
+    "col": 0,
+    "kind": "references",
+    "line": 11,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "route:express/app.js:11:USE:/api",
+    "target": "constant:d1b69054221431f51b587e24cd94be13"
   },
   {
     "col": 0,

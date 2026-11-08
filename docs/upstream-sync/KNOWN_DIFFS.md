@@ -37,27 +37,31 @@ deterministic strategies — import resolution (`import-resolver.ts`) and name
 matching (`name-matcher.ts`) — orchestrated by `ReferenceResolver`
 (`index.ts`), plus concrete `FrameworkResolver` implementations behind the
 `FrameworkResolver` trait EXTENSION POINT (`crates/codegraph-resolve/src/framework.rs`):
-NestJS, React, Vue, Godot, Tauri, Nuxt, React Router, TanStack Router, Next.js,
-Svelte, SvelteKit, Vue Router, Angular Router, Expo Router and GoFrame
-(`crates/codegraph-resolve/src/frameworks/`), detected per-project by
+Express, NestJS, React, Vue, Godot, Tauri, Nuxt, React Router, TanStack Router,
+Next.js, Svelte, SvelteKit, Vue Router, Angular Router, Astro, Expo Router and
+GoFrame (`crates/codegraph-resolve/src/frameworks/`), detected per-project by
 `detect_frameworks`. The other colby resolvers stay deferred. The following
 colby behaviors are intentionally NOT ported in v1:
 
 - **The other framework-specific resolvers** — every concrete `FrameworkResolver`
   in `reference/colby/src/resolution/frameworks/**` EXCEPT those above:
-  Spring/Java, Drupal `routing.yml`, Express, React Native / Expo / Fabric
-  bridges, Swift↔ObjC bridging, the Go-module / Python / Ruby / C# / Play route
-  extractors, and the Astro resolver
-  (`frameworks/astro.ts`: `astro:*` module imports + the `Astro` global resolved
-  as framework-provided, and `src/pages` file-based route-node mapping). These
-  are an additive heuristic layer; on a project where none of them is
-  detected the orchestrator holds an empty resolver list, so behavior matches
-  colby with zero frameworks detected. The Astro
-  EXTRACTION half (frontmatter + `<script>` delegation, template `{call(...)}`
-  and `<Component>` refs) IS ported (`crates/codegraph-extract/src/embedded/astro.rs`,
-  #768); only its framework-resolution half is deferred. Re-enable any of the
-  deferred resolvers by adding it to `frameworks/` and the `detect_frameworks`
-  registry — no orchestrator change required.
+  Spring/Java, Drupal `routing.yml`, React Native / Expo / Fabric bridges,
+  Swift↔ObjC bridging, and the Go-module / Python / Ruby / C# / Play route
+  extractors. These are an additive heuristic layer; on a project where none
+  of them is detected the orchestrator holds an empty resolver list, so
+  behavior matches colby with zero frameworks detected. Astro's extraction
+  (frontmatter + `<script>` delegation, template `{call(...)}` and
+  `<Component>` refs) is the embedded extractor's
+  (`crates/codegraph-extract/src/embedded/astro.rs`, #768), and its framework
+  resolution (`astro:*` module imports, the `Astro` global, `src/pages` routes,
+  components named in markup) the Astro resolver's (`frameworks/astro.rs`).
+  Re-enable any of the deferred resolvers by adding it to `frameworks/` and the
+  `detect_frameworks` registry — no orchestrator change required.
+- **`candidates` on framework references** — colby's Astro endpoint and
+  Next.js route-handler references carry `candidates: [method]`, which no
+  resolution step reads. A framework reference here carries none (`RefView`
+  has no such field), so an unresolved one's `unresolved_refs.candidates` is
+  `NULL` where colby's holds the list.
 - **Dynamic-dispatch synthesis passes** — of `SYNTH_PASSES`
   (`callback-synthesizer.ts`), the field, closure-collection, emitter,
   render, JSX, Pascal form, Flutter, C++ override, interface override, Kotlin
@@ -458,6 +462,37 @@ regex engine), is not listed.
   gives it, where colby's `jsx-render` pass draws nothing for the tag. The
   resolver chain has no way for one resolver to veto the next, and the
   static `references` edge is import resolution's (`react.rs`).
+- **A framework name pattern with two candidates (W7-19a).** Express's
+  middleware, controller and service patterns and Astro's component names
+  resolve only through their one candidate: two declarations of a middleware
+  name in the reference's file, two methods whose paths name the controller or
+  the service, or two components of the name whose paths start with the
+  file's directory answer nothing, and the reference goes on to import and
+  name resolution as if the framework were not detected. colby takes the first
+  in its store's order, so its edge follows the order the files were indexed
+  in (`express.rs`, `astro.rs`).
+- **Express middleware without its suffix (W7-19a).** colby's middleware
+  resolution falls back to the name without a `Middleware` suffix when no
+  declaration carries the whole name. The port does not: a whole name passes
+  the prefilter only when a node that declares nothing carries it (an import,
+  a parameter), and with the same-file rule the fallback then links that
+  import's call, `corsMiddleware()` from `cors-kit`, to the file's own `cors`,
+  which it is not. The outcome also reads whether another file declares the
+  whole name, which a sync cannot re-read from an edge to `cors`
+  (`express.rs`).
+- **An Express controller's object (W7-19a).** colby's controller resolution
+  also takes a method of the name from the files of nodes named
+  `XController`. The port does not: with the same-file rule that finds only
+  the method of an `XController` object the reference's own file declares,
+  which the instance-method strategy links already, and its outcome reads
+  which files declare `XController`, which a sync cannot re-read from the
+  edge to the method (`express.rs`).
+- **The `Astro` global (W7-19a).** Astro claims `Astro` and every name that
+  starts with `Astro.`, so `Astro.redirect(…)` and `Astro.cookies.has(…)`
+  resolve to their own source (1.0) whether or not any file declares
+  `redirect` or `has`. colby's prefilter lets such a call through only when
+  one of its names is declared somewhere, so there it resolves or stays
+  unresolved by what unrelated files declare (`astro.rs`).
 - **Dart named constructors (#2380).** A named constructor, indexed as a
   method, is reached only by a call written through its class (`Foo.value(2)`).
   A call through a value of that type (a typed parameter or local, a chain's
@@ -784,4 +819,9 @@ removed converges there, where colby's needs a full sync. NestJS route naming
 needs no lane: every sync renames the routes again, and one that nothing
 renames any more (its app's global prefix or version, or its module's
 `RouterModule` entry, went away) gets the name its file gives it back
-(`frameworks/nestjs.rs`), where colby's sync keeps the old name.
+(`frameworks/nestjs.rs`), where colby's sync keeps the old name. Express's
+mount prefixes need none either: every sync composes them again and renames
+only Express's own routes, so another framework's route in a mounted file
+keeps its name, which colby renames, and a route that no mount renames any
+more gets its file's name back (`frameworks/express.rs`), where colby's sync
+keeps the old prefix.

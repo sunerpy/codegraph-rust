@@ -1,7 +1,7 @@
 //! A project that IS routed — the `/api/routes` half of upstream
 //! `__tests__/ui-server-api.test.ts` (`v1.6.1`). Upstream's fixture is an
-//! Express app; the Rust port has no Express resolver, so the same four routes
-//! are declared the way a resolver here mints them: a NestJS controller.
+//! Express app; this one predates the port's Express resolver and declares the
+//! same four routes the way NestJS mints them: a NestJS controller.
 
 mod support;
 
