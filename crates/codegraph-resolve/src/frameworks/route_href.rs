@@ -933,6 +933,8 @@ pub(crate) mod test_ctx {
         unlisted: HashMap<String, String>,
         nodes: Vec<Node>,
         imports: HashMap<String, Vec<ImportMapping>>,
+        /// Every path `read_file` was asked for, in order.
+        reads: std::sync::Mutex<Vec<String>>,
     }
 
     impl RouteCtx {
@@ -946,6 +948,11 @@ pub(crate) mod test_ctx {
         pub(crate) fn unlisted(mut self, path: &str, content: &str) -> Self {
             self.unlisted.insert(path.to_string(), content.to_string());
             self
+        }
+
+        /// The paths read so far, in order.
+        pub(crate) fn reads(&self) -> Vec<String> {
+            self.reads.lock().expect("reads").clone()
         }
 
         /// A route file and the nodes its router extracted from it.
@@ -1012,6 +1019,10 @@ pub(crate) mod test_ctx {
             self.files.contains_key(file_path) || self.unlisted.contains_key(file_path)
         }
         fn read_file(&self, file_path: &str) -> Option<String> {
+            self.reads
+                .lock()
+                .expect("reads")
+                .push(file_path.to_string());
             self.files
                 .get(file_path)
                 .or_else(|| self.unlisted.get(file_path))

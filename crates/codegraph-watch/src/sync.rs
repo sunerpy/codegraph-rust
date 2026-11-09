@@ -697,6 +697,14 @@ fn sync_paths_with_store(
     // failed sync may have changed: every R file is re-resolved once
     // (W4-R-01).
     let r_bootstrap = crate::r_bindings::needs_bootstrap(store)?;
+    // And for the Play routes references whose actions a failed sync's
+    // changes moved: every routes file is re-resolved once (W7-19c). The
+    // lane compares the changed files' surfaces only when the index recorded
+    // Play: otherwise a Play this sync detects is a framework change, which
+    // re-extracts every file.
+    let play_bootstrap = crate::play_routes::needs_bootstrap(store)?;
+    changed_names.play.track = crate::control_inputs::recorded_frameworks(store)?
+        .is_some_and(|names| names.iter().any(|name| name == "play"));
     // And for the Dart files whose bare calls read other files' class heads:
     // every Dart file is re-resolved once (W4-DART-01). A rebuild for an
     // unreadable row starts with the marker current: withdraw it before
@@ -844,6 +852,7 @@ fn sync_paths_with_store(
         || r_bootstrap
         || dart_bootstrap
         || dart_library_bootstrap
+        || play_bootstrap
         || shopify_bootstrap
         || !shopify.moved.is_empty();
     // A bootstrap re-resolves dependents without `begin_mutation`: the
@@ -875,6 +884,8 @@ fn sync_paths_with_store(
     if frameworks_changed {
         changed_names.begin_mutation(store)?;
         crate::control_inputs::withdraw_frameworks_marker(store)?;
+        // Every file is re-extracted and re-resolved: no lane compares.
+        changed_names.play.track = false;
         for file in store.all_files()? {
             if reindexed.contains(&file.path) || changed_names.removed_files.contains(&file.path) {
                 continue;
@@ -915,6 +926,25 @@ fn sync_paths_with_store(
             &mut dependent_sites,
             &mut dependent_fallbacks,
         )?;
+        // A Spring config key binds by its relaxed spelling, and a second
+        // profile file's key moves an existing binding's confidence or
+        // target, which no name lookup reaches (W7-19c): a changed config
+        // file retries every reference a key can bind, the unresolved ones by
+        // their whole names, the resolved ones by site.
+        if !frameworks_changed
+            && frameworks.iter().any(|name| name == "spring")
+            && reindexed
+                .iter()
+                .chain(&changed_names.removed_files)
+                .any(|file| codegraph_resolve::frameworks::spring::is_spring_config_file(file))
+        {
+            changed_names.note_any(store.unresolved_config_key_names()?);
+            for found in store.resolved_config_key_sites()? {
+                if !reindexed.contains(&found.file_path) {
+                    merge_dependent_site(&mut dependent_sites, &mut dependent_fallbacks, found);
+                }
+            }
+        }
         // What other files read from a changed JavaScript-family module's
         // text no node records (W4a-F3): the files resolving through it, up
         // the barrels that forward it, re-resolve whole.
@@ -1371,6 +1401,16 @@ fn sync_paths_with_store(
                 dependent_fallbacks.insert(file);
             }
         }
+        if play_bootstrap {
+            for file in crate::play_routes::every_routes_file(
+                store,
+                &reindexed,
+                &changed_names.removed_files,
+            )? {
+                dependent_sites.remove(&file);
+                dependent_fallbacks.insert(file);
+            }
+        }
         if case_bootstrap {
             for file in crate::case_folded::every_case_insensitive_file(
                 store,
@@ -1504,6 +1544,21 @@ fn sync_paths_with_store(
                 merge_dependent_site(&mut dependent_sites, &mut dependent_fallbacks, affected);
             }
         }
+        // The Play actions whose candidates the changes moved (W7-19c), read
+        // once the framework nodes are back: the unresolved ones retry by
+        // their whole names, which no tail ceiling bounds, and the resolved
+        // ones by site, an edge's target being only the action's method.
+        if changed_names.play.track && frameworks.iter().any(|name| name == "play") {
+            let moved: Vec<String> = changed_names.play.moved_names(store)?.into_iter().collect();
+            if !moved.is_empty() {
+                for found in store.resolved_reference_sites_named(&moved)? {
+                    if !reindexed.contains(&found.file_path) {
+                        merge_dependent_site(&mut dependent_sites, &mut dependent_fallbacks, found);
+                    }
+                }
+                changed_names.note_any(moved);
+            }
+        }
         let (mut scope_sites, fallback_files) = refresh_dependent_refs(
             project_root,
             store,
@@ -1600,6 +1655,7 @@ fn sync_paths_with_store(
         crate::case_folded::write_marker(store)?;
         crate::lua_modules::write_marker(store)?;
         crate::r_bindings::write_marker(store)?;
+        crate::play_routes::write_marker(store)?;
         crate::dart_heads::write_marker(store)?;
         crate::dart_libraries::write_marker(store)?;
         crate::resolved_refs::restore_marker(
@@ -2115,6 +2171,7 @@ fn remove_tracked_file(
     changed_names.note_removed(node_names_in_file(store, relative)?);
     let old_nodes = store.nodes_by_file_path(relative)?;
     changed_names.note_qualified(&old_nodes);
+    changed_names.play.note(relative, &old_nodes);
     changed_names.rust_receiver_types.extend(
         old_nodes
             .iter()
@@ -2545,6 +2602,8 @@ fn reextract_into_store(
     // re-extraction makes those (W7-19a0).
     changed_names.note_restorable(relative, &old_nodes, &touched);
     changed_names.absorb_node_diff(touched);
+    // What a Play action's choice read of this file (W7-19c).
+    changed_names.play.note(relative, &old_nodes);
     // What other files' Java resolution reads of this one's text and
     // packages, before and after (W4-JVM-01).
     changed_names.java.note(
@@ -2805,6 +2864,9 @@ struct ChangedNames {
     /// What the changed files held that a Go call in other files reads:
     /// type declarations' embeddings and field types (W4-GO-01).
     go: crate::go_heads::GoChanges,
+    /// What the changed files held that a Play action's choice reads: class
+    /// names and the names and languages of methods and functions (W7-19c).
+    play: crate::play_routes::PlayChanges,
     /// The Rust type, trait and alias names that came, went or changed: a
     /// CamelCase path receiver of such a name is the project's or an outside
     /// type by it (W4-RS-03).
@@ -2919,6 +2981,7 @@ impl ChangedNames {
             crate::case_folded::withdraw_marker(store)?;
             crate::lua_modules::withdraw_marker(store)?;
             crate::r_bindings::withdraw_marker(store)?;
+            crate::play_routes::withdraw_marker(store)?;
             crate::dart_heads::withdraw_marker(store)?;
             crate::dart_libraries::withdraw_marker(store)?;
             crate::resolved_refs::withdraw_marker(store)?;
@@ -5969,6 +6032,57 @@ pub(crate) mod tests {
         assert!(!moved(&db));
     }
 
+    /// W7-19c: likewise for the `jvm` kind. The first sync after the row is
+    /// gone detects the frameworks once (Spring, as before), writes the row
+    /// back and leaves the graph as it was; the next does not count it.
+    #[test]
+    fn a_missing_jvm_control_row_detects_the_frameworks_once() {
+        let dir = TestDir::new("control-inputs-jvm-row");
+        let db = default_db_path(dir.path()).unwrap();
+        let initial = [
+            (
+                "pom.xml",
+                "<project><dependency>spring-boot-starter-web</dependency></project>\n",
+            ),
+            (
+                "src/main/java/demo/HelloController.java",
+                "package demo;\n\n@RestController\npublic class HelloController {\n    @GetMapping(\"/hello\")\n    public String hello() {\n        return \"hi\";\n    }\n}\n",
+            ),
+        ];
+        write_files(dir.path(), &initial);
+        sync_changed_paths(dir.path(), &db, initial.iter().map(|(path, _)| *path)).unwrap();
+        let expected = edge_projection(&db);
+        assert!(
+            expected.iter().any(|edge| edge.starts_with("src/main/java/demo/HelloController.java:")
+                && edge.contains("-[references]-> src/main/java/demo/HelloController.java:demo::HelloController::hello")),
+            "{expected:#?}"
+        );
+        let row_key = crate::control_inputs::ControlKind::Jvm.row_key();
+        let row = metadata(&db, &row_key).expect("the JVM row");
+        let moved = |db: &Path| {
+            let store = Store::open(db).unwrap();
+            crate::control_inputs::check(&store, dir.path(), false, false, &[], &[])
+                .unwrap()
+                .changed
+                .contains(&crate::control_inputs::ControlKind::Jvm)
+        };
+        assert!(!moved(&db));
+        Store::open(&db)
+            .unwrap()
+            .delete_project_metadata(&row_key)
+            .unwrap();
+        assert!(moved(&db));
+        let outcome = sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
+        assert_eq!(outcome.files_reindexed, 0, "Spring was detected before");
+        assert_eq!(edge_projection(&db), expected);
+        assert_eq!(metadata(&db, &row_key), Some(row));
+        assert_eq!(
+            metadata(&db, crate::control_inputs::FRAMEWORKS_KEY),
+            Some("[\"spring\"]".to_string())
+        );
+        assert!(!moved(&db));
+    }
+
     /// W5-06: a control file a watcher event names is read whole, so one
     /// replaced with its size and modification time kept still counts as
     /// changed.
@@ -6631,6 +6745,134 @@ pub(crate) mod tests {
         sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
         assert_eq!(r_marker(&db), version);
         assert_eq!(edge_projection(&db), expected);
+    }
+
+    fn play_marker(db: &Path) -> Option<String> {
+        Store::open(db)
+            .unwrap()
+            .get_project_metadata(crate::play_routes::VERSION_KEY)
+            .unwrap()
+    }
+
+    const PLAY_ROUTES: (&str, &str) = ("conf/routes", "GET / controllers.HomeController.index\n");
+    const PLAY_FAR: (&str, &str) = (
+        "app/controllers/HomeController.scala",
+        "package controllers\n\nclass HomeController {\n  def index(): Int = 1\n}\n",
+    );
+    const PLAY_NEAR: (&str, &str) = (
+        "conf/HomeController.scala",
+        "package conf\n\nclass HomeController {\n  def index(): Int = 2\n}\n",
+    );
+
+    /// W7-19c: a sync failing after it indexed a nearer `HomeController`,
+    /// before resolving, leaves the next sync, with nothing changed, to move
+    /// the routes file's action to it, as a fresh index has it: the routes
+    /// file is a YAML file no other lane's bootstrap re-resolves, and the
+    /// Play marker the failure left away brings it back.
+    #[test]
+    fn a_play_sync_failing_after_its_mutations_leaves_the_next_one_to_reconcile() {
+        let to = |db: &Path, file: &str| {
+            edge_projection(db).iter().any(|edge| {
+                edge.starts_with("conf/routes:")
+                    && edge.contains(&format!("-[references]-> {file}:"))
+            })
+        };
+        let dir = TestDir::new("play-routes-fail");
+        let db = default_db_path(dir.path()).unwrap();
+        let initial = [PLAY_ROUTES, PLAY_FAR];
+        write_files(dir.path(), &initial);
+        sync_changed_paths(dir.path(), &db, initial.iter().map(|(path, _)| *path)).unwrap();
+        assert_eq!(
+            play_marker(&db),
+            Some(crate::play_routes::VERSION.to_string())
+        );
+        assert!(to(&db, PLAY_FAR.0), "{:#?}", edge_projection(&db));
+
+        write_files(dir.path(), &[PLAY_NEAR]);
+        FAIL_BEFORE_RESOLUTION.with(|fail| fail.set(true));
+        let failed = sync_changed_paths(dir.path(), &db, [PLAY_NEAR.0]);
+        FAIL_BEFORE_RESOLUTION.with(|fail| fail.set(false));
+        assert!(failed.is_err(), "the injected failure must stop the sync");
+        assert_eq!(
+            play_marker(&db),
+            None,
+            "a failed sync leaves the marker away"
+        );
+        // The lane refreshed the routes file's site before the failure: its
+        // reference waits unresolved.
+        assert!(!to(&db, PLAY_NEAR.0), "{:#?}", edge_projection(&db));
+
+        sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
+        let fresh = [PLAY_ROUTES, PLAY_FAR, PLAY_NEAR];
+        assert_eq!(
+            edge_projection(&db),
+            fresh_edges("play-routes-fresh", &fresh)
+        );
+        assert!(to(&db, PLAY_NEAR.0), "{:#?}", edge_projection(&db));
+        assert_eq!(
+            play_marker(&db),
+            Some(crate::play_routes::VERSION.to_string())
+        );
+    }
+
+    const SPRING_APP: (&str, &str) = (
+        "src/main/java/demo/App.java",
+        "package demo;\n\n@RestController\nclass App {\n  @Value(\"${app.name}\")\n  private String name;\n}\n",
+    );
+    const SPRING_CONFIG: (&str, &str) =
+        ("src/main/resources/application.yml", "app:\n  other: x\n");
+    const SPRING_CONFIG_NAMED: (&str, &str) = (
+        "src/main/resources/application.yml",
+        "app:\n  other: x\n  name: demo\n",
+    );
+
+    /// W7-19c: a sync failing after it wrote a config key, before resolving,
+    /// leaves the next sync, with nothing changed, to bind the `@Value` to
+    /// it, as a fresh index has it: the bindings are Java references, which
+    /// the Java bootstrap the failure left behind re-resolves; the Play
+    /// marker goes and comes back with the others.
+    #[test]
+    fn a_spring_config_sync_failing_after_its_mutations_leaves_the_next_one_to_reconcile() {
+        let bound = |db: &Path| {
+            edge_projection(db).iter().any(|edge| {
+                edge.starts_with("src/main/java/demo/App.java:")
+                    && edge.contains("-[references]-> src/main/resources/application.yml:app.name ")
+            })
+        };
+        let dir = TestDir::new("spring-config-fail");
+        let db = default_db_path(dir.path()).unwrap();
+        let initial = [SPRING_APP, SPRING_CONFIG];
+        write_files(dir.path(), &initial);
+        sync_changed_paths(dir.path(), &db, initial.iter().map(|(path, _)| *path)).unwrap();
+        assert_eq!(
+            play_marker(&db),
+            Some(crate::play_routes::VERSION.to_string())
+        );
+        assert!(!bound(&db), "{:#?}", edge_projection(&db));
+
+        write_files(dir.path(), &[SPRING_CONFIG_NAMED]);
+        FAIL_BEFORE_RESOLUTION.with(|fail| fail.set(true));
+        let failed = sync_changed_paths(dir.path(), &db, [SPRING_CONFIG.0]);
+        FAIL_BEFORE_RESOLUTION.with(|fail| fail.set(false));
+        assert!(failed.is_err(), "the injected failure must stop the sync");
+        assert_eq!(
+            play_marker(&db),
+            None,
+            "a failed sync leaves the marker away"
+        );
+        assert!(!bound(&db), "{:#?}", edge_projection(&db));
+
+        sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
+        let fresh = [SPRING_APP, SPRING_CONFIG_NAMED];
+        assert_eq!(
+            edge_projection(&db),
+            fresh_edges("spring-config-fresh", &fresh)
+        );
+        assert!(bound(&db), "{:#?}", edge_projection(&db));
+        assert_eq!(
+            play_marker(&db),
+            Some(crate::play_routes::VERSION.to_string())
+        );
     }
 
     fn dart_marker(db: &Path) -> Option<String> {

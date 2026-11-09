@@ -2430,6 +2430,54 @@ impl Store {
         Ok(out.into_iter().collect())
     }
 
+    /// The names of the unresolved references a Spring config key can bind
+    /// ([`CONFIG_KEY_REFERENCE`]), sorted and deduplicated: a sync that
+    /// changed a config file retries them by their whole names (W7-19c).
+    /// One scan of `unresolved_refs`; no index holds the gate.
+    pub fn unresolved_config_key_names(&self) -> rusqlite::Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT DISTINCT reference_name FROM unresolved_refs \
+             WHERE {CONFIG_KEY_REFERENCE} ORDER BY reference_name"
+        ))?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        rows.collect()
+    }
+
+    /// The sites of the resolved references a Spring config key can bind
+    /// ([`CONFIG_KEY_REFERENCE`]), sorted and deduplicated: a sync that
+    /// changed a config file refreshes them (W7-19c). One scan of
+    /// `resolved_refs`.
+    pub fn resolved_config_key_sites(&self) -> rusqlite::Result<Vec<FileReferenceSite>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT DISTINCT file_path, from_node_id, line, col FROM resolved_refs \
+             WHERE {CONFIG_KEY_REFERENCE} ORDER BY file_path, from_node_id, line, col"
+        ))?;
+        let rows = stmt.query_map([], row_to_file_reference_site)?;
+        rows.collect()
+    }
+
+    /// The sites of the resolved references named one of `names`, sorted and
+    /// deduplicated: a sync refreshes the Play actions whose candidates
+    /// moved (W7-19c). One scan of `resolved_refs`, which no index holds by
+    /// name.
+    pub fn resolved_reference_sites_named(
+        &self,
+        names: &[String],
+    ) -> rusqlite::Result<Vec<FileReferenceSite>> {
+        if names.is_empty() {
+            return Ok(Vec::new());
+        }
+        let names = serde_json::to_string(names)
+            .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?;
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT file_path, from_node_id, line, col FROM resolved_refs \
+             WHERE reference_name IN (SELECT value FROM json_each(?1)) \
+             ORDER BY file_path, from_node_id, line, col",
+        )?;
+        let rows = stmt.query_map([names], row_to_file_reference_site)?;
+        rows.collect()
+    }
+
     /// Ports `getDependencyFilePaths` from
     /// `upstream db/queries.ts:1410-1420`: the OUTGOING twin of
     /// `dependent_file_paths` — every file containing a symbol that a symbol of
@@ -2836,6 +2884,17 @@ const RESOLUTION_EDGE: &str = concat!(
 const SYNTHESIZED: &str = synthesized_edge!("");
 /// [`synthesized_edge`] for an `edges` row aliased `e`.
 const SYNTHESIZED_E: &str = synthesized_edge!("e.");
+
+/// The references a Spring config key can bind (upstream
+/// `springResolver.resolve`'s two gates, W7-19c): `references` written in
+/// Java or Kotlin whose names hold a `.` and no `::` (#1180), and the
+/// `:prefix` ones of the languages Spring reads.
+const CONFIG_KEY_REFERENCE: &str = "((reference_kind = 'references' \
+    AND language IN ('java', 'kotlin') \
+    AND instr(reference_name, '.') > 0 \
+    AND instr(reference_name, '::') = 0) \
+    OR (substr(reference_name, -7) = ':prefix' \
+    AND language IN ('java', 'kotlin', 'yaml', 'properties')))";
 
 fn row_to_file_reference_site(row: &Row<'_>) -> rusqlite::Result<FileReferenceSite> {
     let file_path = row.get(0)?;
@@ -5829,6 +5888,160 @@ mod tests {
             .map(|reference| reference.reference_name)
             .collect();
         assert_eq!(qualified, ["F\\FirstName.make"]);
+    }
+
+    /// W7-19c: the references a Spring config key can bind, unresolved by
+    /// name and resolved by site, and the resolved sites of a name set.
+    #[test]
+    fn config_key_references_and_named_resolved_sites() {
+        let mut store = store("config-key-refs");
+        store
+            .upsert_nodes(&[
+                node("constant:a", "a", "A.java"),
+                node("constant:k", "k", "B.kt"),
+                node("route:r", "r", "conf/routes"),
+            ])
+            .unwrap();
+        let mk =
+            |from: &str, name: &str, kind: EdgeKind, line: i64, file: &str, language: Language| {
+                UnresolvedRef {
+                    id: None,
+                    from_node_id: from.to_string(),
+                    reference_name: name.to_string(),
+                    reference_kind: kind,
+                    line,
+                    col: 0,
+                    candidates: None,
+                    file_path: file.to_string(),
+                    language,
+                    is_function_ref: false,
+                    reference_subkind: None,
+                }
+            };
+        let refs = vec![
+            mk(
+                "constant:a",
+                "jwt.secret",
+                EdgeKind::References,
+                1,
+                "A.java",
+                Language::Java,
+            ),
+            mk(
+                "constant:a",
+                "app.cache:prefix",
+                EdgeKind::References,
+                2,
+                "A.java",
+                Language::Java,
+            ),
+            mk(
+                "constant:a",
+                "list.add",
+                EdgeKind::Calls,
+                3,
+                "A.java",
+                Language::Java,
+            ),
+            mk(
+                "constant:a",
+                "a::b.c",
+                EdgeKind::References,
+                4,
+                "A.java",
+                Language::Java,
+            ),
+            mk(
+                "constant:a",
+                "Prefix",
+                EdgeKind::References,
+                5,
+                "A.java",
+                Language::Java,
+            ),
+            mk(
+                "constant:k",
+                "server.port",
+                EdgeKind::References,
+                1,
+                "B.kt",
+                Language::Kotlin,
+            ),
+            mk(
+                "constant:k",
+                "x:PREFIX",
+                EdgeKind::References,
+                2,
+                "B.kt",
+                Language::Kotlin,
+            ),
+            mk(
+                "route:r",
+                "Home.index",
+                EdgeKind::References,
+                1,
+                "conf/routes",
+                Language::Scala,
+            ),
+            mk(
+                "route:r",
+                "s:prefix",
+                EdgeKind::References,
+                2,
+                "conf/routes",
+                Language::Scala,
+            ),
+        ];
+        store.insert_unresolved_refs(&refs).unwrap();
+        assert_eq!(
+            store.unresolved_config_key_names().unwrap(),
+            ["app.cache:prefix", "jwt.secret", "server.port"]
+        );
+        assert!(store.resolved_config_key_sites().unwrap().is_empty());
+        // `jwt.secret`, `server.port` and `Home.index` resolve.
+        let ids: Vec<i64> = ["A.java", "B.kt", "conf/routes"]
+            .into_iter()
+            .flat_map(|file| store.unresolved_refs_by_file_path(file).unwrap())
+            .filter(|reference| {
+                matches!(
+                    reference.reference_name.as_str(),
+                    "jwt.secret" | "server.port" | "Home.index"
+                )
+            })
+            .map(|reference| reference.id.unwrap())
+            .collect();
+        store.delete_resolved_unresolved_refs(&ids).unwrap();
+        assert_eq!(
+            store.unresolved_config_key_names().unwrap(),
+            ["app.cache:prefix"]
+        );
+        let site = |file: &str, from: &str, line: i64| FileReferenceSite {
+            file_path: file.to_string(),
+            site: Some(ReferenceSite {
+                from_node_id: from.to_string(),
+                line,
+                col: 0,
+            }),
+        };
+        assert_eq!(
+            store.resolved_config_key_sites().unwrap(),
+            [
+                site("A.java", "constant:a", 1),
+                site("B.kt", "constant:k", 1)
+            ]
+        );
+        assert_eq!(
+            store
+                .resolved_reference_sites_named(&["Home.index".to_string(), "nope".to_string()])
+                .unwrap(),
+            [site("conf/routes", "route:r", 1)]
+        );
+        assert!(
+            store
+                .resolved_reference_sites_named(&[])
+                .unwrap()
+                .is_empty()
+        );
     }
 
     /// W5-09e: a reference resolution takes out of `unresolved_refs` moves

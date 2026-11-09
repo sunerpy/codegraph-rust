@@ -547,6 +547,23 @@ fn incremental_sync_on_outdated_v2_forces_all_files() {
         lua_rows(&IndexPaths::resolve(&peer, None).expect("resolve peer v2 paths")),
         "a forced migration must write the Lua module marker of `index --force`"
     );
+    // The Play routes marker (W7-19c), likewise.
+    let play_marker = |paths: &IndexPaths| {
+        Store::open_for_read(paths, deadline(), || false)
+            .expect("readable namespace")
+            .project_metadata_with_prefix("play_routes")
+            .expect("Play routes marker")
+    };
+    assert_eq!(
+        play_marker(&paths),
+        vec![("play_routes_version".to_string(), "1".to_string())],
+        "a migration writes the Play routes marker"
+    );
+    assert_eq!(
+        play_marker(&paths),
+        play_marker(&IndexPaths::resolve(&peer, None).expect("resolve peer v2 paths")),
+        "a forced migration must write the Play routes marker of `index --force`"
+    );
     // And the C/C++ namespace rows (W4-CPP-07).
     let namespace_rows = |paths: &IndexPaths| {
         Store::open_for_read(paths, deadline(), || false)
@@ -1870,9 +1887,9 @@ fn outdated_migration_writes_the_class_head_rows_of_index_force() {
 
 /// W5-06: a migration writes the control-input rows (what resolution read
 /// of the JS/TS configs and manifests, the C# project files, the Cargo
-/// manifests, W7-15d1, the Go module files and, W7-19b, the root files the
-/// Python frameworks are detected by), the detected frameworks and both
-/// markers as `index --force` does.
+/// manifests, W7-15d1, the Go module files and, W7-19b and W7-19c, the
+/// root files the Python, Spring and Play frameworks are detected by), the
+/// detected frameworks and both markers as `index --force` does.
 #[test]
 fn outdated_migration_writes_the_control_rows_of_index_force() {
     let dir = TestDir::new("outdated-control-inputs");
@@ -1908,6 +1925,11 @@ fn outdated_migration_writes_the_control_rows_of_index_force() {
         ("svc/main.go", "package main\n\nfunc main() {}\n"),
         // Names no Python framework, so the detected frameworks stay React.
         ("requirements.txt", "requests>=2\n"),
+        // Nor Spring.
+        (
+            "pom.xml",
+            "<project><artifactId>app</artifactId></project>\n",
+        ),
     ] {
         let full = project.join(path);
         fs::create_dir_all(full.parent().unwrap()).expect("create the source directory");
@@ -1956,6 +1978,7 @@ fn outdated_migration_writes_the_control_rows_of_index_force() {
             "control_inputs:csharp",
             "control_inputs:go",
             "control_inputs:js",
+            "control_inputs:jvm",
             "control_inputs:python",
             "control_inputs:rust",
             "control_inputs_version",
@@ -1969,10 +1992,13 @@ fn outdated_migration_writes_the_control_rows_of_index_force() {
         (1, "\"svc/go.mod\""),
         (2, "\"tsconfig.json\""),
         (2, "\"package.json\""),
+        // A digest, where the five absent root files record null.
+        (3, "\"pom.xml\":\""),
+        (3, "\"build.sbt\":null"),
         // A digest, where the seven absent root files record null.
-        (3, "\"requirements.txt\":\""),
-        (4, "\"Cargo.toml\""),
-        (6, "\"react\""),
+        (4, "\"requirements.txt\":\""),
+        (5, "\"Cargo.toml\""),
+        (7, "\"react\""),
     ] {
         assert!(
             migrated[row].1.contains(input),

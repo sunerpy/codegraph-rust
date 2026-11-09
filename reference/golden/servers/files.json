@@ -189,6 +189,15 @@
     "size": 355
   },
   {
+    "content_hash": "32f92326e55c5c02ba4bb7b4e14f29356cd03c1bf98beceb7d0c0d042e6d1aee",
+    "errors": null,
+    "generated": 0,
+    "language": "yaml",
+    "node_count": 0,
+    "path": "play/conf/routes",
+    "size": 149
+  },
+  {
     "content_hash": "183b5b639eaea162a49ec812cf0140d070525826d5ee1d065abbd1358d4a5973",
     "errors": null,
     "generated": 0,

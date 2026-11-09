@@ -2580,9 +2580,13 @@ impl ReferenceResolver {
             && !(crate::name_matcher::is_case_insensitive_language(reference.language)
                 && self.has_any_possible_match_ignoring_case(existence_name))
             && !self.matches_any_import(reference, context)
+            // Only a resolver that reads the reference's language may claim
+            // it (upstream `frameworksFor`, #2415): Play claims every `X.y`
+            // name, which would otherwise pass any language's past the check.
             && !self
                 .framework_resolver_extensions
                 .iter()
+                .filter(|f| resolves_language(f.as_ref(), reference.language))
                 .any(|f| f.claims_reference(&reference.reference_name))
             && !call_result_chain
         {
@@ -2677,6 +2681,18 @@ impl ReferenceResolver {
                 }
                 candidates.push(result);
             }
+        }
+
+        // A Spring binding's key is the Spring resolver's to link, at any
+        // confidence: name matching would take the binding node itself,
+        // named as its key, or a profile's key over the base file's
+        // (KEEP-RUST; upstream lets both through). A Play routes line's
+        // action is Play's alike: name matching would guess another
+        // project's controller for a line Play leaves (KEEP-RUST).
+        if crate::frameworks::spring::is_binding_reference(reference)
+            || crate::frameworks::play::is_routes_reference(reference)
+        {
+            return (candidates.into_iter().reduce(highest_confidence), None);
         }
 
         // An imported root in `make().run()` does not prove what `make`
@@ -5012,6 +5028,275 @@ mod tests {
                 "batched: {batched}"
             );
         }
+    }
+
+    /// Claims `Ghost.call` for Scala references only.
+    struct ScalaClaimer;
+    impl FrameworkResolver for ScalaClaimer {
+        fn name(&self) -> &str {
+            "scala-claimer"
+        }
+        fn languages(&self) -> Option<&[Language]> {
+            Some(&[Language::Scala])
+        }
+        fn detect(&self, _c: &dyn ResolutionContext) -> bool {
+            true
+        }
+        fn claims_reference(&self, name: &str) -> bool {
+            name == "Ghost.call"
+        }
+        fn resolve(&self, _r: &RefView, _c: &dyn ResolutionContext) -> Option<ResolvedRef> {
+            None
+        }
+    }
+
+    /// Resolves `Ghost.call` in any language, claiming nothing.
+    struct GhostTarget;
+    impl FrameworkResolver for GhostTarget {
+        fn name(&self) -> &str {
+            "ghost-target"
+        }
+        fn detect(&self, _c: &dyn ResolutionContext) -> bool {
+            true
+        }
+        fn resolve(&self, r: &RefView, _c: &dyn ResolutionContext) -> Option<ResolvedRef> {
+            (r.reference_name == "Ghost.call").then(|| {
+                ResolvedRef::new(
+                    r.clone(),
+                    "function:native".to_string(),
+                    0.95,
+                    ResolvedBy::Framework,
+                )
+            })
+        }
+    }
+
+    /// Links a binding's `key.name` to the base file's key at 0.75, as
+    /// Spring does when several files define it.
+    struct ProfilePick;
+    impl FrameworkResolver for ProfilePick {
+        fn name(&self) -> &str {
+            "profile-pick"
+        }
+        fn detect(&self, _c: &dyn ResolutionContext) -> bool {
+            true
+        }
+        fn resolve(&self, r: &RefView, _c: &dyn ResolutionContext) -> Option<ResolvedRef> {
+            (r.reference_name == "key.name").then(|| {
+                ResolvedRef::new(
+                    r.clone(),
+                    "constant:base".to_string(),
+                    0.75,
+                    ResolvedBy::Framework,
+                )
+            })
+        }
+    }
+
+    /// A Spring binding's reference takes the framework resolvers' answer
+    /// alone, below 0.9 too: name matching would link it to the binding node
+    /// itself, named as its key. Another node's reference by the same name
+    /// still goes through name matching.
+    #[test]
+    fn a_spring_binding_s_reference_takes_only_the_framework_s_answer() {
+        let mut store = Store::open(&temp_db("spring-binding")).expect("open");
+        let bound = mk_node2(
+            "spring-value:J.java:1:key.name",
+            NodeKind::Constant,
+            "key.name",
+            "J.java",
+            Language::Java,
+        );
+        let unbound = mk_node2(
+            "spring-cp:J.java:2:other.key",
+            NodeKind::Constant,
+            "other.key",
+            "J.java",
+            Language::Java,
+        );
+        let method = mk_node2(
+            "method:run",
+            NodeKind::Method,
+            "run",
+            "J.java",
+            Language::Java,
+        );
+        let base = mk_node2(
+            "constant:base",
+            NodeKind::Constant,
+            "name",
+            "application.yml",
+            Language::Yaml,
+        );
+        for file in ["J.java", "application.yml"] {
+            store.upsert_file(&file_rec(file)).expect("file");
+        }
+        store
+            .upsert_nodes(&[bound.clone(), unbound.clone(), method.clone(), base])
+            .expect("nodes");
+        let reference = |from: &Node, name: &str| UnresolvedRef {
+            id: None,
+            from_node_id: from.id.clone(),
+            reference_name: name.to_string(),
+            reference_kind: EdgeKind::References,
+            line: 1,
+            col: 0,
+            candidates: None,
+            file_path: "J.java".to_string(),
+            language: Language::Java,
+            is_function_ref: false,
+            reference_subkind: None,
+        };
+        store
+            .insert_unresolved_refs(&[
+                reference(&bound, "key.name"),
+                reference(&unbound, "other.key"),
+                reference(&method, "key.name"),
+            ])
+            .expect("refs");
+        let mut resolver = ReferenceResolver::new("/root");
+        resolver.framework_resolver_extensions = vec![Box::new(ProfilePick)];
+        resolver.resolve_and_persist(&mut store).expect("resolve");
+        let targets = |from: &Node| -> Vec<String> {
+            store
+                .edges_by_source_kind(&from.id, Some(EdgeKind::References))
+                .expect("edges")
+                .into_iter()
+                .map(|edge| edge.target)
+                .collect()
+        };
+        assert_eq!(targets(&bound), ["constant:base"]);
+        assert!(targets(&unbound).is_empty(), "{:?}", targets(&unbound));
+        assert_eq!(targets(&method), [bound.id.as_str()]);
+    }
+
+    /// A Play routes line's action is Play's alone: with no framework
+    /// answer (Play leaves two controllers at one distance), name matching
+    /// does not guess it, while the same name a Scala call writes resolves
+    /// by its qualified name (KEEP-RUST).
+    #[test]
+    fn a_play_routes_line_takes_only_the_framework_s_answer() {
+        let mut store = Store::open(&temp_db("play-routes-gate")).expect("open");
+        let class = mk_node2(
+            "class:home",
+            NodeKind::Class,
+            "HomeController",
+            "app/HomeController.scala",
+            Language::Scala,
+        );
+        let mut index = mk_node2(
+            "method:index",
+            NodeKind::Method,
+            "index",
+            "app/HomeController.scala",
+            Language::Scala,
+        );
+        index.qualified_name = "HomeController::index".to_string();
+        let route = mk_node2(
+            "route:conf/routes:1:GET:/",
+            NodeKind::Route,
+            "GET /",
+            "conf/routes",
+            Language::Scala,
+        );
+        let boot = mk_node2(
+            "method:run",
+            NodeKind::Method,
+            "run",
+            "app/Boot.scala",
+            Language::Scala,
+        );
+        for file in ["app/HomeController.scala", "conf/routes", "app/Boot.scala"] {
+            store.upsert_file(&file_rec(file)).expect("file");
+        }
+        store
+            .upsert_nodes(&[class, index.clone(), route.clone(), boot.clone()])
+            .expect("nodes");
+        let reference = |from: &Node, kind: EdgeKind| UnresolvedRef {
+            id: None,
+            from_node_id: from.id.clone(),
+            reference_name: "HomeController.index".to_string(),
+            reference_kind: kind,
+            line: 1,
+            col: 0,
+            candidates: None,
+            file_path: from.file_path.clone(),
+            language: Language::Scala,
+            is_function_ref: false,
+            reference_subkind: None,
+        };
+        store
+            .insert_unresolved_refs(&[
+                reference(&route, EdgeKind::References),
+                reference(&boot, EdgeKind::Calls),
+            ])
+            .expect("refs");
+        let mut resolver = ReferenceResolver::new("/root");
+        resolver.resolve_and_persist(&mut store).expect("resolve");
+        let targets = |from: &Node, kind: EdgeKind| -> Vec<String> {
+            store
+                .edges_by_source_kind(&from.id, Some(kind))
+                .expect("edges")
+                .into_iter()
+                .map(|edge| edge.target)
+                .collect()
+        };
+        assert!(
+            targets(&route, EdgeKind::References).is_empty(),
+            "{:?}",
+            targets(&route, EdgeKind::References)
+        );
+        assert_eq!(targets(&boot, EdgeKind::Calls), [index.id.as_str()]);
+    }
+
+    /// Upstream `frameworksFor` (#2415) in the pre-filter: a claim passes a
+    /// reference past the existence check only when the claiming resolver
+    /// reads the reference's language.
+    #[test]
+    fn only_a_resolver_reading_the_language_claims_past_the_pre_filter() {
+        let mut store = Store::open(&temp_db("claim-language")).expect("open");
+        let script = mk_node("function:ts", NodeKind::Function, "ts", "app.ts");
+        let scala = mk_node("function:sc", NodeKind::Function, "sc", "App.scala");
+        let native = mk_node("function:native", NodeKind::Function, "native", "n.ts");
+        for file in ["app.ts", "App.scala", "n.ts"] {
+            store.upsert_file(&file_rec(file)).expect("file");
+        }
+        store
+            .upsert_nodes(&[script.clone(), scala.clone(), native])
+            .expect("nodes");
+        let reference = |from: &Node, file: &str, language: Language| UnresolvedRef {
+            id: None,
+            from_node_id: from.id.clone(),
+            reference_name: "Ghost.call".to_string(),
+            reference_kind: EdgeKind::Calls,
+            line: 1,
+            col: 0,
+            candidates: None,
+            file_path: file.to_string(),
+            language,
+            is_function_ref: false,
+            reference_subkind: None,
+        };
+        store
+            .insert_unresolved_refs(&[
+                reference(&script, "app.ts", Language::TypeScript),
+                reference(&scala, "App.scala", Language::Scala),
+            ])
+            .expect("refs");
+        let mut resolver = ReferenceResolver::new("/root");
+        resolver.framework_resolver_extensions =
+            vec![Box::new(ScalaClaimer), Box::new(GhostTarget)];
+        resolver.resolve_and_persist(&mut store).expect("resolve");
+        let targets = |from: &Node| -> Vec<String> {
+            store
+                .edges_by_source_kind(&from.id, Some(EdgeKind::Calls))
+                .expect("edges")
+                .into_iter()
+                .map(|edge| edge.target)
+                .collect()
+        };
+        assert_eq!(targets(&scala), ["function:native"]);
+        assert!(targets(&script).is_empty());
     }
 
     fn run_persist(batched: bool) -> usize {

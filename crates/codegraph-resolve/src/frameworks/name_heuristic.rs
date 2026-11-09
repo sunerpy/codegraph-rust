@@ -59,6 +59,21 @@ impl Default for PickOptions<'_> {
     }
 }
 
+/// What [`pick_by_name_outcome`] found: a resolver whose rules run one
+/// after another tries the next only on [`NamePick::NoCandidate`], the case
+/// upstream's pick returns `null` for; upstream returns the first candidate
+/// whenever there is one, so a rule that declines ends the chain (W7-19c).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum NamePick {
+    /// The id of the node picked.
+    Picked(String),
+    /// A candidate exists, but the tier deciding holds two or more, or the
+    /// pick is in another code family than the reference.
+    Declined,
+    /// No node of the name and kinds that the reference can see.
+    NoCandidate,
+}
+
 /// The id of the node named like `reference`, of one of `kinds`, that the
 /// reference can see: the sole one in its file, else (with
 /// `same_directory`) the sole one in its directory, else the sole one in a
@@ -72,6 +87,20 @@ pub(crate) fn pick_by_name_and_kind(
     context: &dyn ResolutionContext,
     options: &PickOptions<'_>,
 ) -> Option<String> {
+    match pick_by_name_outcome(reference, kinds, in_preferred_dir, context, options) {
+        NamePick::Picked(id) => Some(id),
+        NamePick::Declined | NamePick::NoCandidate => None,
+    }
+}
+
+/// [`pick_by_name_and_kind`], telling a decline from no candidate at all.
+pub(crate) fn pick_by_name_outcome(
+    reference: &RefView,
+    kinds: &[NodeKind],
+    in_preferred_dir: &dyn Fn(&str) -> bool,
+    context: &dyn ResolutionContext,
+    options: &PickOptions<'_>,
+) -> NamePick {
     let inheritance = matches!(
         reference.reference_kind,
         EdgeKind::Extends | EdgeKind::Implements
@@ -90,8 +119,15 @@ pub(crate) fn pick_by_name_and_kind(
                 && options.accept.is_none_or(|accept| accept(node))
         })
         .collect();
-    let picked = pick(&candidates, reference, in_preferred_dir, options)?;
-    (!crosses_code_boundary(picked.language, reference.language)).then(|| picked.id.clone())
+    if candidates.is_empty() {
+        return NamePick::NoCandidate;
+    }
+    match pick(&candidates, reference, in_preferred_dir, options) {
+        Some(picked) if !crosses_code_boundary(picked.language, reference.language) => {
+            NamePick::Picked(picked.id.clone())
+        }
+        _ => NamePick::Declined,
+    }
 }
 
 /// What one tier of the pick holds.
