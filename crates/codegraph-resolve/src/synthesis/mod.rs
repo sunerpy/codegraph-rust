@@ -45,6 +45,8 @@ mod stage;
 mod sveltekit;
 mod vue;
 
+// `path.posix`, for the Laravel resolver's route-file mounts too (W7-19d).
+pub(crate) use c_fnptr::{posix_dirname, posix_normalize};
 pub use inputs::{INPUTS_KEY, Inputs, inputs_changed, recorded as recorded_inputs};
 pub use stage::{StageStats, run_stage, synthesize};
 

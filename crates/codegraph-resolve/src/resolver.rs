@@ -2587,7 +2587,7 @@ impl ReferenceResolver {
                 .framework_resolver_extensions
                 .iter()
                 .filter(|f| resolves_language(f.as_ref(), reference.language))
-                .any(|f| f.claims_reference(&reference.reference_name))
+                .any(|f| f.claims(reference))
             && !call_result_chain
         {
             // A store-bound bare call need not share its action's name
@@ -2688,9 +2688,13 @@ impl ReferenceResolver {
         // named as its key, or a profile's key over the base file's
         // (KEEP-RUST; upstream lets both through). A Play routes line's
         // action is Play's alike: name matching would guess another
-        // project's controller for a line Play leaves (KEEP-RUST).
+        // project's controller for a line Play leaves (KEEP-RUST). So is a
+        // Drupal routing file's handler: `_entity_form: menu.delete` names
+        // the entity type's delete form, which instance-method matching took
+        // for `Menu::delete()` (KEEP-RUST).
         if crate::frameworks::spring::is_binding_reference(reference)
             || crate::frameworks::play::is_routes_reference(reference)
+            || crate::frameworks::drupal::is_routing_reference(reference)
         {
             return (candidates.into_iter().reduce(highest_confidence), None);
         }

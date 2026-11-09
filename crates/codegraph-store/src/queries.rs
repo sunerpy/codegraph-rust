@@ -125,6 +125,63 @@ pub struct FileReferenceSite {
     pub site: Option<ReferenceSite>,
 }
 
+/// A family of references a framework lane of a sync reads in bulk
+/// ([`Store::lane_references`], W7-19d).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LaneReferences {
+    /// A PHP route's references: Laravel's, the only resolver that makes
+    /// PHP routes.
+    PhpRoutes,
+    /// A YAML route's references in a `*.routing.yml` file: Drupal's.
+    DrupalRoutingFiles,
+    /// The PHP references to a Drupal hook, named `hook_X`.
+    PhpHooks,
+    /// The PHP references named `{class}::...`, Laravel's `Model::method`.
+    PhpStaticCalls(String),
+}
+
+impl LaneReferences {
+    /// The family's `WHERE` clause and its parameters: a prefix is a range,
+    /// which an index on its column serves.
+    fn predicate(&self) -> (&'static str, Vec<String>) {
+        // `:` is followed by `;`: the ids of the routes are the ones from
+        // `route:` up to `route;`.
+        match self {
+            Self::PhpRoutes => (
+                "from_node_id >= 'route:' AND from_node_id < 'route;' AND language = 'php'",
+                Vec::new(),
+            ),
+            Self::DrupalRoutingFiles => (
+                "from_node_id >= 'route:' AND from_node_id < 'route;' \
+                 AND language = 'yaml' AND substr(file_path, -12) = '.routing.yml'",
+                Vec::new(),
+            ),
+            // `_` is followed by a backtick.
+            Self::PhpHooks => (
+                "reference_name >= 'hook_' AND reference_name < 'hook`' AND language = 'php'",
+                Vec::new(),
+            ),
+            // `:` is followed by `;`: the names starting `{class}::`.
+            Self::PhpStaticCalls(class) => (
+                "reference_name >= ?1 AND reference_name < ?2 AND language = 'php'",
+                vec![format!("{class}::"), format!("{class}:;")],
+            ),
+        }
+    }
+}
+
+/// One reference of a [`LaneReferences`] family.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaneReference {
+    /// Where it is, always with its site: neither table holds a reference
+    /// without a line and column.
+    pub site: FileReferenceSite,
+    pub reference_name: String,
+    pub reference_kind: EdgeKind,
+    /// Whether it is a row of `resolved_refs` rather than `unresolved_refs`.
+    pub resolved: bool,
+}
+
 impl Store {
     /// Ports `insertNode` / `insertNodes` / `updateNode` from `upstream db/queries.ts:243-382`.
     /// Uses one batched transaction and an upsert that fires the FTS update trigger on conflicts.
@@ -2476,6 +2533,43 @@ impl Store {
         )?;
         let rows = stmt.query_map([names], row_to_file_reference_site)?;
         rows.collect()
+    }
+
+    /// The references of one framework lane's family, the unresolved ones
+    /// then the resolved ones, each sorted by site and deduplicated: a sync
+    /// re-resolves the ones its changes moved, and an index without the
+    /// lane's marker every one (W7-19d). The route families read a range of
+    /// the tables' `from_node_id` indexes; the others scan `resolved_refs`,
+    /// which no index holds by name.
+    pub fn lane_references(&self, family: &LaneReferences) -> rusqlite::Result<Vec<LaneReference>> {
+        let (predicate, params) = family.predicate();
+        let mut out = Vec::new();
+        for (table, resolved) in [("unresolved_refs", false), ("resolved_refs", true)] {
+            let mut stmt = self.conn.prepare(&format!(
+                "SELECT DISTINCT file_path, from_node_id, line, col, reference_name, \
+                 reference_kind FROM {table} WHERE {predicate} \
+                 ORDER BY file_path, from_node_id, line, col, reference_name, reference_kind"
+            ))?;
+            let map = |row: &Row<'_>| {
+                let raw_kind = row.get::<_, String>(5)?;
+                let reference_kind = if raw_kind == "function_ref" {
+                    EdgeKind::References
+                } else {
+                    parse_edge_kind(raw_kind)?
+                };
+                Ok(LaneReference {
+                    site: row_to_file_reference_site(row)?,
+                    reference_name: row.get(4)?,
+                    reference_kind,
+                    resolved,
+                })
+            };
+            let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), map)?;
+            for row in rows {
+                out.push(row?);
+            }
+        }
+        Ok(out)
     }
 
     /// Ports `getDependencyFilePaths` from

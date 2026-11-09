@@ -703,8 +703,18 @@ fn sync_paths_with_store(
     // Play: otherwise a Play this sync detects is a framework change, which
     // re-extracts every file.
     let play_bootstrap = crate::play_routes::needs_bootstrap(store)?;
-    changed_names.play.track = crate::control_inputs::recorded_frameworks(store)?
-        .is_some_and(|names| names.iter().any(|name| name == "play"));
+    let recorded_frameworks =
+        crate::control_inputs::recorded_frameworks(store)?.unwrap_or_default();
+    let recorded = |framework: &str| recorded_frameworks.iter().any(|name| name == framework);
+    changed_names.play.track = recorded("play");
+    // And for the Laravel route references whose controllers a failed
+    // sync's changes moved, and the Drupal handlers and hooks (W7-19d):
+    // every file holding one is re-resolved once. Each lane compares only
+    // when the index recorded its framework, as Play's does.
+    let laravel_bootstrap = crate::laravel_routes::needs_bootstrap(store)?;
+    changed_names.laravel.track = recorded("laravel");
+    let drupal_bootstrap = crate::drupal_refs::needs_bootstrap(store)?;
+    changed_names.drupal.track = recorded("drupal");
     // And for the Dart files whose bare calls read other files' class heads:
     // every Dart file is re-resolved once (W4-DART-01). A rebuild for an
     // unreadable row starts with the marker current: withdraw it before
@@ -853,6 +863,8 @@ fn sync_paths_with_store(
         || dart_bootstrap
         || dart_library_bootstrap
         || play_bootstrap
+        || laravel_bootstrap
+        || drupal_bootstrap
         || shopify_bootstrap
         || !shopify.moved.is_empty();
     // A bootstrap re-resolves dependents without `begin_mutation`: the
@@ -886,6 +898,8 @@ fn sync_paths_with_store(
         crate::control_inputs::withdraw_frameworks_marker(store)?;
         // Every file is re-extracted and re-resolved: no lane compares.
         changed_names.play.track = false;
+        changed_names.laravel.track = false;
+        changed_names.drupal.track = false;
         for file in store.all_files()? {
             if reindexed.contains(&file.path) || changed_names.removed_files.contains(&file.path) {
                 continue;
@@ -1411,6 +1425,26 @@ fn sync_paths_with_store(
                 dependent_fallbacks.insert(file);
             }
         }
+        if laravel_bootstrap {
+            for file in crate::laravel_routes::every_route_file(
+                store,
+                &reindexed,
+                &changed_names.removed_files,
+            )? {
+                dependent_sites.remove(&file);
+                dependent_fallbacks.insert(file);
+            }
+        }
+        if drupal_bootstrap {
+            for file in crate::drupal_refs::every_reference_file(
+                store,
+                &reindexed,
+                &changed_names.removed_files,
+            )? {
+                dependent_sites.remove(&file);
+                dependent_fallbacks.insert(file);
+            }
+        }
         if case_bootstrap {
             for file in crate::case_folded::every_case_insensitive_file(
                 store,
@@ -1559,6 +1593,30 @@ fn sync_paths_with_store(
                 changed_names.note_any(moved);
             }
         }
+        // The Laravel controllers and the Drupal handlers and hooks whose
+        // candidates the changes moved (W7-19d), read the same way: the
+        // unresolved ones by their whole names, the resolved ones by site.
+        if changed_names.laravel.track && frameworks.iter().any(|name| name == "laravel") {
+            let moved = changed_names.laravel.moved(store)?;
+            let retries = crate::laravel_routes::retries(store, &moved)?;
+            for found in retries.sites {
+                if !reindexed.contains(&found.file_path) {
+                    merge_dependent_site(&mut dependent_sites, &mut dependent_fallbacks, found);
+                }
+            }
+            changed_names.note_any(retries.names);
+        }
+        if changed_names.drupal.track && frameworks.iter().any(|name| name == "drupal") {
+            let moved = changed_names.drupal.moved(store)?;
+            let retries =
+                crate::drupal_refs::retries(store, &moved, changed_names.candidates.iter())?;
+            for found in retries.sites {
+                if !reindexed.contains(&found.file_path) {
+                    merge_dependent_site(&mut dependent_sites, &mut dependent_fallbacks, found);
+                }
+            }
+            changed_names.note_any(retries.names);
+        }
         let (mut scope_sites, fallback_files) = refresh_dependent_refs(
             project_root,
             store,
@@ -1656,6 +1714,8 @@ fn sync_paths_with_store(
         crate::lua_modules::write_marker(store)?;
         crate::r_bindings::write_marker(store)?;
         crate::play_routes::write_marker(store)?;
+        crate::laravel_routes::write_marker(store)?;
+        crate::drupal_refs::write_marker(store)?;
         crate::dart_heads::write_marker(store)?;
         crate::dart_libraries::write_marker(store)?;
         crate::resolved_refs::restore_marker(
@@ -2172,6 +2232,8 @@ fn remove_tracked_file(
     let old_nodes = store.nodes_by_file_path(relative)?;
     changed_names.note_qualified(&old_nodes);
     changed_names.play.note(relative, &old_nodes);
+    changed_names.laravel.note(relative, &old_nodes);
+    changed_names.drupal.note(relative, &old_nodes);
     changed_names.rust_receiver_types.extend(
         old_nodes
             .iter()
@@ -2602,8 +2664,11 @@ fn reextract_into_store(
     // re-extraction makes those (W7-19a0).
     changed_names.note_restorable(relative, &old_nodes, &touched);
     changed_names.absorb_node_diff(touched);
-    // What a Play action's choice read of this file (W7-19c).
+    // What a Play action's choice read of this file (W7-19c), and a
+    // Laravel controller's and a Drupal handler's or hook's (W7-19d).
     changed_names.play.note(relative, &old_nodes);
+    changed_names.laravel.note(relative, &old_nodes);
+    changed_names.drupal.note(relative, &old_nodes);
     // What other files' Java resolution reads of this one's text and
     // packages, before and after (W4-JVM-01).
     changed_names.java.note(
@@ -2867,6 +2932,12 @@ struct ChangedNames {
     /// What the changed files held that a Play action's choice reads: class
     /// names and the names and languages of methods and functions (W7-19c).
     play: crate::play_routes::PlayChanges,
+    /// What the changed files held that a Laravel controller's choice reads:
+    /// class names and method names (W7-19d).
+    laravel: crate::laravel_routes::LaravelChanges,
+    /// What the changed files held that a Drupal handler's or hook's choice
+    /// reads: class and method names, and hook functions (W7-19d).
+    drupal: crate::drupal_refs::DrupalChanges,
     /// The Rust type, trait and alias names that came, went or changed: a
     /// CamelCase path receiver of such a name is the project's or an outside
     /// type by it (W4-RS-03).
@@ -2982,6 +3053,8 @@ impl ChangedNames {
             crate::lua_modules::withdraw_marker(store)?;
             crate::r_bindings::withdraw_marker(store)?;
             crate::play_routes::withdraw_marker(store)?;
+            crate::laravel_routes::withdraw_marker(store)?;
+            crate::drupal_refs::withdraw_marker(store)?;
             crate::dart_heads::withdraw_marker(store)?;
             crate::dart_libraries::withdraw_marker(store)?;
             crate::resolved_refs::withdraw_marker(store)?;
@@ -6083,6 +6156,102 @@ pub(crate) mod tests {
         assert!(!moved(&db));
     }
 
+    /// W7-19d: likewise for the `php` kind, in an index built before it
+    /// and the Laravel and Drupal lanes. The first sync detects the
+    /// frameworks once (Laravel and Drupal, as before), re-resolves every
+    /// route file's references once, bringing back the edges an older sync
+    /// lost, and writes the row and both markers back; the next counts
+    /// neither.
+    #[test]
+    fn a_missing_php_control_row_and_lane_markers_detect_and_re_resolve_once() {
+        let dir = TestDir::new("control-inputs-php-row");
+        let db = default_db_path(dir.path()).unwrap();
+        let initial = [
+            LARAVEL_ARTISAN,
+            LARAVEL_ROUTES,
+            LARAVEL_INDEX,
+            DRUPAL_COMPOSER,
+            DRUPAL_ROUTING,
+            DRUPAL_METHOD,
+        ];
+        write_files(dir.path(), &initial);
+        sync_changed_paths(dir.path(), &db, initial.iter().map(|(path, _)| *path)).unwrap();
+        let expected = edge_projection(&db);
+        assert!(
+            expected
+                .iter()
+                .any(|edge| edge.starts_with("routes/web.php:")
+                    && edge.contains(&format!("-[references]-> {}:", LARAVEL_INDEX.0))),
+            "{expected:#?}"
+        );
+        assert!(
+            expected
+                .iter()
+                .any(|edge| edge.starts_with(&format!("{}:", DRUPAL_ROUTING.0))
+                    && edge.contains("GreetingController::hello ")),
+            "{expected:#?}"
+        );
+        let row_key = crate::control_inputs::ControlKind::Php.row_key();
+        let row = metadata(&db, &row_key).expect("the PHP row");
+        let frameworks = metadata(&db, crate::control_inputs::FRAMEWORKS_KEY);
+        assert!(
+            frameworks
+                .as_deref()
+                .is_some_and(|found| found.contains("\"laravel\"") && found.contains("\"drupal\"")),
+            "{frameworks:?}"
+        );
+        let moved = |db: &Path| {
+            let store = Store::open(db).unwrap();
+            crate::control_inputs::check(&store, dir.path(), false, false, &[], &[])
+                .unwrap()
+                .changed
+                .contains(&crate::control_inputs::ControlKind::Php)
+        };
+        let lanes_pending = |db: &Path| {
+            let store = Store::open(db).unwrap();
+            (
+                crate::laravel_routes::needs_bootstrap(&store).unwrap(),
+                crate::drupal_refs::needs_bootstrap(&store).unwrap(),
+            )
+        };
+        assert!(!moved(&db));
+        assert_eq!(lanes_pending(&db), (false, false));
+        {
+            let store = Store::open(&db).unwrap();
+            let dropped = store
+                .connection()
+                .execute(
+                    "DELETE FROM edges WHERE kind = 'references' AND source IN (SELECT id FROM \
+                     nodes WHERE kind = 'route')",
+                    [],
+                )
+                .unwrap();
+            assert_eq!(dropped, 2, "the route edges an older sync lost");
+            store.delete_project_metadata(&row_key).unwrap();
+            store
+                .delete_project_metadata(crate::laravel_routes::VERSION_KEY)
+                .unwrap();
+            store
+                .delete_project_metadata(crate::drupal_refs::VERSION_KEY)
+                .unwrap();
+        }
+        assert!(moved(&db));
+        assert_eq!(lanes_pending(&db), (true, true));
+        let outcome = sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
+        assert_eq!(
+            outcome.files_reindexed, 0,
+            "Laravel and Drupal were detected before"
+        );
+        assert_eq!(edge_projection(&db), expected);
+        assert_eq!(metadata(&db, &row_key), Some(row));
+        assert_eq!(
+            metadata(&db, crate::control_inputs::FRAMEWORKS_KEY),
+            frameworks
+        );
+        assert!(!moved(&db));
+        assert_eq!(lanes_pending(&db), (false, false));
+    }
+
     /// W5-06: a control file a watcher event names is read whole, so one
     /// replaced with its size and modification time kept still counts as
     /// changed.
@@ -6872,6 +7041,181 @@ pub(crate) mod tests {
         assert_eq!(
             play_marker(&db),
             Some(crate::play_routes::VERSION.to_string())
+        );
+    }
+
+    fn lane_marker(db: &Path, key: &str) -> Option<String> {
+        Store::open(db).unwrap().get_project_metadata(key).unwrap()
+    }
+
+    const LARAVEL_ARTISAN: (&str, &str) = ("artisan", "#!/usr/bin/env php\n<?php\n");
+    const LARAVEL_ROUTES: (&str, &str) = (
+        "routes/web.php",
+        "<?php\n\nRoute::get('/users', 'Admin\\UserController@index');\n",
+    );
+    const LARAVEL_EMPTY: (&str, &str) = (
+        "app/Http/Controllers/Admin/UserController.php",
+        "<?php\n\nclass UserController\n{\n}\n",
+    );
+    const LARAVEL_INDEX: (&str, &str) = (
+        "app/Http/Controllers/Admin/UserController.php",
+        "<?php\n\nclass UserController\n{\n    public function index()\n    {\n    }\n}\n",
+    );
+
+    /// W7-19d: a sync failing after it gave the controller its `index`,
+    /// before resolving, leaves the next sync, with nothing changed, to link
+    /// the route's `Admin\UserController@index` to it, as a fresh index has
+    /// it: the reference waits under its whole name, which no lane but
+    /// Laravel's wakes, and the Laravel marker the failure left away brings
+    /// it back.
+    #[test]
+    fn a_laravel_sync_failing_after_its_mutations_leaves_the_next_one_to_reconcile() {
+        let routed = |db: &Path| {
+            edge_projection(db).iter().any(|edge| {
+                edge.starts_with("routes/web.php:")
+                    && edge.contains(&format!("-[references]-> {}:", LARAVEL_INDEX.0))
+            })
+        };
+        let dir = TestDir::new("laravel-routes-fail");
+        let db = default_db_path(dir.path()).unwrap();
+        let initial = [LARAVEL_ARTISAN, LARAVEL_ROUTES, LARAVEL_EMPTY];
+        write_files(dir.path(), &initial);
+        sync_changed_paths(dir.path(), &db, initial.iter().map(|(path, _)| *path)).unwrap();
+        assert_eq!(
+            lane_marker(&db, crate::laravel_routes::VERSION_KEY),
+            Some(crate::laravel_routes::VERSION.to_string())
+        );
+        assert!(!routed(&db), "{:#?}", edge_projection(&db));
+
+        write_files(dir.path(), &[LARAVEL_INDEX]);
+        FAIL_BEFORE_RESOLUTION.with(|fail| fail.set(true));
+        let failed = sync_changed_paths(dir.path(), &db, [LARAVEL_INDEX.0]);
+        FAIL_BEFORE_RESOLUTION.with(|fail| fail.set(false));
+        assert!(failed.is_err(), "the injected failure must stop the sync");
+        assert_eq!(
+            lane_marker(&db, crate::laravel_routes::VERSION_KEY),
+            None,
+            "a failed sync leaves the marker away"
+        );
+        assert!(!routed(&db), "{:#?}", edge_projection(&db));
+
+        sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
+        let fresh = [LARAVEL_ARTISAN, LARAVEL_ROUTES, LARAVEL_INDEX];
+        assert_eq!(
+            edge_projection(&db),
+            fresh_edges("laravel-routes-fresh", &fresh)
+        );
+        assert!(routed(&db), "{:#?}", edge_projection(&db));
+        assert_eq!(
+            lane_marker(&db, crate::laravel_routes::VERSION_KEY),
+            Some(crate::laravel_routes::VERSION.to_string())
+        );
+    }
+
+    /// W7-19d: an index without the Laravel marker (built before it, or a
+    /// sync that stopped) has every file holding a Laravel route's reference
+    /// re-resolved by its next sync, with nothing changed: the controller
+    /// edge an older sync lost comes back.
+    #[test]
+    fn an_index_without_the_laravel_marker_re_resolves_the_route_files() {
+        let version = Some(crate::laravel_routes::VERSION.to_string());
+        let dir = TestDir::new("laravel-routes-bootstrap");
+        let db = default_db_path(dir.path()).unwrap();
+        let initial = [LARAVEL_ARTISAN, LARAVEL_ROUTES, LARAVEL_INDEX];
+        write_files(dir.path(), &initial);
+        sync_changed_paths(dir.path(), &db, initial.iter().map(|(path, _)| *path)).unwrap();
+        assert_eq!(
+            lane_marker(&db, crate::laravel_routes::VERSION_KEY),
+            version
+        );
+        let expected = edge_projection(&db);
+        {
+            let store = Store::open(&db).unwrap();
+            let dropped = store
+                .connection()
+                .execute(
+                    "DELETE FROM edges WHERE kind = 'references' AND source IN (SELECT id FROM \
+                     nodes WHERE kind = 'route' AND file_path = 'routes/web.php')",
+                    [],
+                )
+                .unwrap();
+            assert_eq!(dropped, 1, "the controller edge an older sync lost");
+            store
+                .delete_project_metadata(crate::laravel_routes::VERSION_KEY)
+                .unwrap();
+        }
+        assert_ne!(edge_projection(&db), expected);
+        sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
+        assert_eq!(
+            lane_marker(&db, crate::laravel_routes::VERSION_KEY),
+            version
+        );
+        assert_eq!(edge_projection(&db), expected);
+    }
+
+    const DRUPAL_COMPOSER: (&str, &str) = (
+        "composer.json",
+        "{\"require\": {\"drupal/core\": \"^10\"}}\n",
+    );
+    const DRUPAL_ROUTING: (&str, &str) = (
+        "modules/greeting/greeting.routing.yml",
+        "greeting.hello:\n  path: '/hello'\n  defaults:\n    _controller: '\\Drupal\\greeting\\Controller\\GreetingController::hello'\n",
+    );
+    const DRUPAL_CLASS: (&str, &str) = (
+        "modules/greeting/src/Controller/GreetingController.php",
+        "<?php\n\nnamespace Drupal\\greeting\\Controller;\n\nclass GreetingController\n{\n}\n",
+    );
+    const DRUPAL_METHOD: (&str, &str) = (
+        "modules/greeting/src/Controller/GreetingController.php",
+        "<?php\n\nnamespace Drupal\\greeting\\Controller;\n\nclass GreetingController\n{\n    public function hello()\n    {\n    }\n}\n",
+    );
+
+    /// W7-19d: a sync failing after it gave the controller class its
+    /// `hello`, before resolving, leaves the next sync, with nothing changed,
+    /// to move the routing file's handler from the class to the method, as a
+    /// fresh index has it: the routing file is a YAML file no other lane's
+    /// bootstrap re-resolves, and the Drupal marker the failure left away
+    /// brings it back.
+    #[test]
+    fn a_drupal_sync_failing_after_its_mutations_leaves_the_next_one_to_reconcile() {
+        let to_method = |db: &Path| {
+            edge_projection(db).iter().any(|edge| {
+                edge.starts_with(&format!("{}:", DRUPAL_ROUTING.0))
+                    && edge.contains("GreetingController::hello ")
+            })
+        };
+        let dir = TestDir::new("drupal-refs-fail");
+        let db = default_db_path(dir.path()).unwrap();
+        let initial = [DRUPAL_COMPOSER, DRUPAL_ROUTING, DRUPAL_CLASS];
+        write_files(dir.path(), &initial);
+        sync_changed_paths(dir.path(), &db, initial.iter().map(|(path, _)| *path)).unwrap();
+        assert_eq!(
+            lane_marker(&db, crate::drupal_refs::VERSION_KEY),
+            Some(crate::drupal_refs::VERSION.to_string())
+        );
+        assert!(!to_method(&db), "{:#?}", edge_projection(&db));
+
+        write_files(dir.path(), &[DRUPAL_METHOD]);
+        FAIL_BEFORE_RESOLUTION.with(|fail| fail.set(true));
+        let failed = sync_changed_paths(dir.path(), &db, [DRUPAL_METHOD.0]);
+        FAIL_BEFORE_RESOLUTION.with(|fail| fail.set(false));
+        assert!(failed.is_err(), "the injected failure must stop the sync");
+        assert_eq!(
+            lane_marker(&db, crate::drupal_refs::VERSION_KEY),
+            None,
+            "a failed sync leaves the marker away"
+        );
+
+        sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
+        let fresh = [DRUPAL_COMPOSER, DRUPAL_ROUTING, DRUPAL_METHOD];
+        assert_eq!(
+            edge_projection(&db),
+            fresh_edges("drupal-refs-fresh", &fresh)
+        );
+        assert!(to_method(&db), "{:#?}", edge_projection(&db));
+        assert_eq!(
+            lane_marker(&db, crate::drupal_refs::VERSION_KEY),
+            Some(crate::drupal_refs::VERSION.to_string())
         );
     }
 

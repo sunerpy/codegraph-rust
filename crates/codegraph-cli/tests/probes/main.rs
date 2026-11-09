@@ -22103,6 +22103,413 @@ mod jvm_frameworks {
     }
 }
 
+mod php_frameworks {
+    use super::support::{Graph, Indexed, Project, project_metadata_with_prefix};
+
+    fn project_of(files: &[(&str, &str)]) -> Project {
+        files.iter().fold(Project::new(), |project, (path, text)| {
+            project.file(path, text)
+        })
+    }
+
+    /// The frameworks the index records as detected.
+    fn detected(db: &std::path::Path) -> String {
+        project_metadata_with_prefix(db, "frameworks_detected")
+            .into_iter()
+            .map(|(_, value)| value)
+            .collect()
+    }
+
+    /// Every route's name, sorted.
+    fn route_names(graph: &Graph) -> Vec<String> {
+        let mut out: Vec<String> = graph
+            .nodes
+            .iter()
+            .filter(|node| node.kind == "route")
+            .map(|node| node.name.clone())
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// What the route named `route` references: each target's name and file.
+    fn served_by(graph: &Graph, route: &str) -> Vec<String> {
+        let found: Vec<_> = graph
+            .nodes
+            .iter()
+            .filter(|node| node.kind == "route" && node.name == route)
+            .collect();
+        assert_eq!(found.len(), 1, "{route}: {}", graph.report());
+        let mut out: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.source == found[0].id)
+            .filter_map(|edge| graph.node(&edge.target))
+            .map(|target| format!("{} {}", target.name, target.file_path))
+            .collect();
+        out.sort();
+        out
+    }
+
+    const ARTISAN: (&str, &str) = ("artisan", "#!/usr/bin/env php\n<?php\n");
+    const COMPOSER: (&str, &str) = (
+        "composer.json",
+        "{\"require\":{\"laravel/framework\":\"^11.0\"}}",
+    );
+    const PAGES: (&str, &str) = (
+        "app/Http/Controllers/PageController.php",
+        "<?php\nclass PageController { public function list() {} public function login() {} }\n",
+    );
+    const API: (&str, &str) = (
+        "routes/api.php",
+        "<?php\nRoute::get('pages', [PageController::class, 'list']);\n",
+    );
+    const WEB: (&str, &str) = (
+        "routes/web.php",
+        "<?php\nRoute::get('/login', [PageController::class, 'login']);\n",
+    );
+
+    /// A Laravel project of `files`, `upstream laravel-route-paths.test.ts`'s
+    /// `project()`.
+    fn laravel(files: &[(&str, &str)]) -> Indexed {
+        let mut all = vec![ARTISAN, COMPOSER, PAGES];
+        all.extend_from_slice(files);
+        let project = project_of(&all).index();
+        assert!(
+            detected(&project.db()).contains("\"laravel\""),
+            "{}",
+            detected(&project.db())
+        );
+        project
+    }
+
+    /// Upstream #2099: `routes/api.php` is served under `/api` when nothing
+    /// says otherwise, and its controller action links.
+    #[test]
+    fn pr2099_routes_api_php_is_served_under_api() {
+        let project = laravel(&[API, WEB]);
+        let graph = project.graph();
+        assert_eq!(route_names(graph), ["GET /api/pages", "GET /login"]);
+        assert_eq!(
+            served_by(graph, "GET /api/pages"),
+            ["list app/Http/Controllers/PageController.php"]
+        );
+        assert_eq!(
+            served_by(graph, "GET /login"),
+            ["login app/Http/Controllers/PageController.php"]
+        );
+    }
+
+    /// Upstream #2099: the `RouteServiceProvider`'s prefix (Laravel <= 10).
+    #[test]
+    fn pr2099_a_route_service_provider_prefix_mounts_its_file() {
+        let project = laravel(&[
+            API,
+            WEB,
+            (
+                "app/Providers/RouteServiceProvider.php",
+                "<?php\nclass RouteServiceProvider {\n    public function boot() {\n        Route::middleware('api')->prefix('api/v1')->group(base_path('routes/api.php'));\n        Route::middleware('web')->group(base_path('routes/web.php'));\n    }\n}\n",
+            ),
+        ]);
+        assert_eq!(
+            route_names(project.graph()),
+            ["GET /api/v1/pages", "GET /login"]
+        );
+    }
+
+    /// Upstream #2099: a `Route::group(['prefix' => ...])` that requires the
+    /// file (BookStack's shape).
+    #[test]
+    fn pr2099_a_group_requiring_the_file_mounts_it() {
+        let project = laravel(&[
+            API,
+            (
+                "app/App/Providers/RouteServiceProvider.php",
+                "<?php\nclass RouteServiceProvider {\n    protected function mapApiRoutes() {\n        Route::group(['middleware' => 'api', 'prefix' => 'api'], function ($router) {\n            require base_path('routes/api.php');\n        });\n    }\n}\n",
+            ),
+        ]);
+        assert_eq!(route_names(project.graph()), ["GET /api/pages"]);
+    }
+
+    /// Upstream #2099: Laravel 11's `withRouting(api:, apiPrefix:)`.
+    #[test]
+    fn pr2099_with_routing_reads_its_api_prefix() {
+        let project = laravel(&[
+            API,
+            WEB,
+            (
+                "bootstrap/app.php",
+                "<?php\nreturn Application::configure(basePath: dirname(__DIR__))\n    ->withRouting(\n        web: __DIR__.'/../routes/web.php',\n        api: __DIR__.'/../routes/api.php',\n        apiPrefix: 'api/v2',\n        health: '/up',\n    )\n    ->create();\n",
+            ),
+        ]);
+        assert_eq!(
+            route_names(project.graph()),
+            ["GET /api/v2/pages", "GET /login"]
+        );
+    }
+
+    /// Upstream #2099: prefixes compose down an include tree, through a group
+    /// mounting a file and a plain `require`.
+    #[test]
+    fn pr2099_prefixes_compose_down_an_include_tree() {
+        let project = laravel(&[
+            (
+                "routes/api.php",
+                "<?php\nRoute::get('pages', [PageController::class, 'list']);\nRoute::prefix('v1')->group(base_path('routes/api/v1.php'));\n",
+            ),
+            (
+                "routes/api/v1.php",
+                "<?php\nRoute::get('songs', [PageController::class, 'list']);\n",
+            ),
+            (
+                "routes/web.php",
+                "<?php\nRoute::get('/', [PageController::class, 'list']);\nrequire __DIR__.'/auth.php';\n",
+            ),
+            (
+                "routes/auth.php",
+                "<?php\nRoute::get('login', [PageController::class, 'login']);\n",
+            ),
+        ]);
+        assert_eq!(
+            route_names(project.graph()),
+            ["GET /", "GET /api/pages", "GET /api/v1/songs", "GET /login"]
+        );
+    }
+
+    /// Upstream #2099: `withRouting(using:)` loads routes by code nothing
+    /// reads, so `routes/api.php` keeps its in-file paths.
+    #[test]
+    fn pr2099_with_routing_using_leaves_routes_api_php_alone() {
+        let project = laravel(&[
+            API,
+            (
+                "bootstrap/app.php",
+                "<?php\nreturn Application::configure(basePath: dirname(__DIR__))\n    ->withRouting(using: static function (): void { RouteLoader::load('api'); })\n    ->create();\n",
+            ),
+        ]);
+        assert_eq!(route_names(project.graph()), ["GET /pages"]);
+    }
+
+    /// Upstream #2099: a file mounted at two different prefixes keeps its
+    /// in-file paths.
+    #[test]
+    fn pr2099_a_file_mounted_twice_keeps_its_in_file_paths() {
+        let project = laravel(&[
+            (
+                "routes/shared.php",
+                "<?php\nRoute::get('status', [PageController::class, 'list']);\n",
+            ),
+            (
+                "app/Providers/RouteServiceProvider.php",
+                "<?php\nRoute::prefix('a')->group(base_path('routes/shared.php'));\nRoute::prefix('b')->group(base_path('routes/shared.php'));\n",
+            ),
+        ]);
+        assert_eq!(route_names(project.graph()), ["GET /status"]);
+    }
+
+    /// Upstream #2099: the names hold across a sync that changes something
+    /// else, and a mount that goes away is undone.
+    #[test]
+    fn pr2099_route_names_hold_across_syncs_and_a_removed_mount_is_undone() {
+        let provider = "app/Providers/RouteServiceProvider.php";
+        let mut project = laravel(&[
+            (
+                "routes/admin.php",
+                "<?php\nRoute::get('users', [PageController::class, 'list']);\n",
+            ),
+            (
+                provider,
+                "<?php\nRoute::prefix('admin')->group(base_path('routes/admin.php'));\n",
+            ),
+        ]);
+        assert_eq!(route_names(project.graph()), ["GET /admin/users"]);
+        project.write(PAGES.0, &format!("{}// touched\n", PAGES.1));
+        assert_eq!(route_names(project.sync()), ["GET /admin/users"]);
+        project.write(
+            provider,
+            "<?php\nRoute::group([], base_path('routes/admin.php'));\n",
+        );
+        assert_eq!(route_names(project.sync()), ["GET /users"]);
+    }
+
+    fn controller(namespace: &str, name: &str, methods: &[&str]) -> String {
+        let methods: Vec<String> = methods
+            .iter()
+            .map(|method| format!("    public function {method}() {{ return 1; }}"))
+            .collect();
+        format!(
+            "<?php\n\nnamespace App\\Http\\Controllers\\{namespace};\n\nclass {name}\n{{\n{}\n}}\n",
+            methods.join("\n")
+        )
+    }
+
+    /// Upstream #2271 (`laravel-controller-strings.test.ts`): a controller
+    /// written as a string without a `Controller` suffix resolves by its
+    /// namespace path below `App\Http\Controllers`, and a resource
+    /// controller named by string is read past its options.
+    #[test]
+    fn pr2271_string_controllers_resolve_by_their_namespace_path() {
+        let uploads = controller("Common", "Uploads", &["inline", "destroy"]);
+        let portal = controller("Portal", "Uploads", &["inline"]);
+        let companies = controller("Common", "Companies", &["index", "store"]);
+        let project = project_of(&[
+            ("artisan", "#!/usr/bin/env php\n"),
+            (
+                "composer.json",
+                "{\"require\":{\"laravel/framework\":\"^10.0\"}}",
+            ),
+            (
+                "routes/admin.php",
+                "<?php\n\nuse Illuminate\\Support\\Facades\\Route;\n\nRoute::get('uploads/{id}/inline', 'Common\\Uploads@inline')->name('inline');\nRoute::delete('uploads/{id}', 'Common\\Uploads@destroy');\nRoute::get('portal/uploads/{id}', 'Portal\\Uploads@inline');\nRoute::resource('companies', 'Common\\Companies', ['middleware' => ['dropzone']]);\n",
+            ),
+            ("app/Http/Controllers/Common/Uploads.php", &uploads),
+            ("app/Http/Controllers/Portal/Uploads.php", &portal),
+            ("app/Http/Controllers/Common/Companies.php", &companies),
+        ])
+        .index();
+        let graph = project.graph();
+        assert_eq!(
+            served_by(graph, "GET /uploads/{id}/inline"),
+            ["inline app/Http/Controllers/Common/Uploads.php"]
+        );
+        assert_eq!(
+            served_by(graph, "DELETE /uploads/{id}"),
+            ["destroy app/Http/Controllers/Common/Uploads.php"]
+        );
+        assert_eq!(
+            served_by(graph, "GET /portal/uploads/{id}"),
+            ["inline app/Http/Controllers/Portal/Uploads.php"]
+        );
+        assert_eq!(
+            served_by(graph, "resource:companies"),
+            ["Companies app/Http/Controllers/Common/Companies.php"]
+        );
+    }
+
+    /// Upstream #271 (`drupal.test.ts`'s end-to-end case): a routing file's
+    /// route links to its controller's method.
+    #[test]
+    fn pr271_a_drupal_route_links_to_its_controller_method() {
+        let module = "web/modules/custom/my_module";
+        let routing = format!("{module}/my_module.routing.yml");
+        let controller = format!("{module}/src/Controller/HelloController.php");
+        let project = project_of(&[
+            (
+                "composer.json",
+                "{\"require\":{\"drupal/core-recommended\":\"~10.5\"}}",
+            ),
+            (
+                &routing,
+                "my_module.hello:\n  path: '/hello'\n  defaults:\n    _controller: '\\Drupal\\my_module\\Controller\\HelloController::build'\n    _title: 'Hello'\n  requirements:\n    _permission: 'access content'\n",
+            ),
+            (
+                &controller,
+                "<?php\nnamespace Drupal\\my_module\\Controller;\nuse Drupal\\Core\\Controller\\ControllerBase;\nclass HelloController extends ControllerBase {\n  public function build() {\n    return ['#markup' => 'Hello'];\n  }\n}\n",
+            ),
+        ])
+        .index();
+        let graph = project.graph();
+        assert!(
+            detected(&project.db()).contains("\"drupal\""),
+            "{}",
+            detected(&project.db())
+        );
+        assert_eq!(served_by(graph, "/hello"), [format!("build {controller}")]);
+        let edge = graph
+            .edges
+            .iter()
+            .find(|edge| {
+                graph
+                    .node(&edge.source)
+                    .is_some_and(|node| node.kind == "route")
+            })
+            .expect("the route's edge");
+        assert_eq!(edge.resolved_by(), Some("framework"), "{}", graph.report());
+        assert_eq!(edge.confidence(), Some(0.9), "{}", graph.report());
+    }
+
+    /// koel's invokable controllers: `Route::post('/me',
+    /// LoginController::class)` references the class the routes file's `use`
+    /// imports, as upstream's PHP class visibility reads the name, and not a
+    /// same-named class elsewhere; a class the file neither imports nor
+    /// shares a namespace with is another namespace's and stays unlinked.
+    #[test]
+    fn an_invokable_route_links_the_controller_its_use_imports() {
+        let login = controller("Auth", "LoginController", &["__invoke"]);
+        let other = controller("Admin", "LoginController", &["__invoke"]);
+        let report = controller("Reports", "ReportController", &["__invoke"]);
+        let project = laravel(&[
+            (
+                "routes/web.php",
+                "<?php\n\nuse App\\Http\\Controllers\\Auth\\LoginController;\n\nRoute::post('/me', LoginController::class);\nRoute::get('/report', ReportController::class);\n",
+            ),
+            ("app/Http/Controllers/Auth/LoginController.php", &login),
+            ("app/Http/Controllers/Admin/LoginController.php", &other),
+            ("app/Http/Controllers/Reports/ReportController.php", &report),
+        ]);
+        let graph = project.graph();
+        assert_eq!(
+            served_by(graph, "POST /me"),
+            ["LoginController app/Http/Controllers/Auth/LoginController.php"]
+        );
+        assert!(
+            served_by(graph, "GET /report").is_empty(),
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// A routing file's handler is Drupal's alone (KEEP-RUST): `_entity_form:
+    /// 'menu.delete'` names the `menu` entity type's delete form, so name
+    /// matching does not take it for `Menu::delete()`, while a controller
+    /// route still links to its method. Of two `delete` methods, matching by
+    /// the receiver's words took `Menu`'s (drupal/drupal's
+    /// `entity.menu.delete_form`).
+    #[test]
+    fn a_drupal_entity_form_route_takes_no_other_strategy_s_answer() {
+        let module = "modules/custom/menus";
+        let routing = format!("{module}/menus.routing.yml");
+        let entity = format!("{module}/src/Entity/Menu.php");
+        let link = format!("{module}/src/Entity/Link.php");
+        let controller = format!("{module}/src/Controller/MenuController.php");
+        let project = project_of(&[
+            (
+                "composer.json",
+                "{\"require\":{\"drupal/core-recommended\":\"~10.5\"}}",
+            ),
+            (
+                &routing,
+                "entity.menu.delete_form:\n  path: '/admin/structure/menu/manage/{menu}/delete'\n  defaults:\n    _entity_form: 'menu.delete'\n  requirements:\n    _permission: 'administer menu'\nmenus.list:\n  path: '/menus'\n  defaults:\n    _controller: '\\Drupal\\menus\\Controller\\MenuController::list'\n  requirements:\n    _permission: 'access content'\n",
+            ),
+            (
+                &entity,
+                "<?php\nnamespace Drupal\\menus\\Entity;\nclass Menu {\n  public function delete() {\n    return 1;\n  }\n}\n",
+            ),
+            (
+                &link,
+                "<?php\nnamespace Drupal\\menus\\Entity;\nclass Link {\n  public function delete() {\n    return 2;\n  }\n}\n",
+            ),
+            (
+                &controller,
+                "<?php\nnamespace Drupal\\menus\\Controller;\nclass MenuController {\n  public function list() {\n    return [];\n  }\n}\n",
+            ),
+        ])
+        .index();
+        let graph = project.graph();
+        assert!(
+            detected(&project.db()).contains("\"drupal\""),
+            "{}",
+            detected(&project.db())
+        );
+        assert!(
+            served_by(graph, "/admin/structure/menu/manage/{menu}/delete").is_empty(),
+            "{}",
+            graph.report()
+        );
+        assert_eq!(served_by(graph, "/menus"), [format!("list {controller}")]);
+    }
+}
+
 mod expo_router {
     use super::support::{Graph, Project};
 

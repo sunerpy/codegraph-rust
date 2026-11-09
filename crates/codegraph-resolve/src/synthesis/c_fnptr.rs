@@ -777,7 +777,7 @@ fn parse_struct_fields_raw(inner: &str) -> Vec<RawField> {
 }
 
 /// `path.posix.normalize` for the relative paths an include resolves.
-pub(super) fn posix_normalize(path: &str) -> String {
+pub(crate) fn posix_normalize(path: &str) -> String {
     if path.is_empty() {
         return ".".to_string();
     }
@@ -815,7 +815,7 @@ pub(super) fn posix_normalize(path: &str) -> String {
 }
 
 /// `path.posix.dirname` of a project path.
-pub(super) fn posix_dirname(path: &str) -> &str {
+pub(crate) fn posix_dirname(path: &str) -> &str {
     match path.rfind('/') {
         Some(0) => "/",
         Some(at) => &path[..at],

@@ -2,8 +2,8 @@
 //! files (W5-06): the JS/TS path aliases, workspace and package manifests,
 //! the C# project files, the Cargo manifests and the Go module files
 //! (W7-15d1), the root files the Python frameworks are detected by
-//! (W7-19b) and Spring and Play are (W7-19c), and which frameworks the
-//! project uses.
+//! (W7-19b), Spring and Play are (W7-19c), and Laravel and Drupal are
+//! (W7-19d), and which frameworks the project uses.
 //!
 //! Each reader reports what it read or probed in the same traversal that
 //! reads it ([`codegraph_resolve::path_aliases::alias_config_inputs`],
@@ -15,7 +15,9 @@
 //! [`codegraph_resolve::context::go_module_inputs`],
 //! [`codegraph_resolve::frameworks::python::ROOT_DETECTION_FILES`],
 //! [`codegraph_resolve::frameworks::spring::ROOT_DETECTION_FILES`],
-//! [`codegraph_resolve::frameworks::play::ROOT_DETECTION_FILES`]); every
+//! [`codegraph_resolve::frameworks::play::ROOT_DETECTION_FILES`],
+//! [`codegraph_resolve::frameworks::laravel::ROOT_DETECTION_FILES`],
+//! [`codegraph_resolve::frameworks::drupal::ROOT_DETECTION_FILES`]); every
 //! full index,
 //! migration and sync writes one row per kind holding a digest of each input
 //! (a file's text, a directory's listing, `null` for a missing one), and one
@@ -23,8 +25,8 @@
 //! CLI's full sync always, the watcher's when a changed path is one of them,
 //! names a control file, is a folder coming into a workspace glob's listing,
 //! or changes which files the kind's readers start from) and compares: a kind
-//! that moved re-resolves every file of its languages whole (the Python
-//! and JVM kinds' languages are none: they move only which frameworks a
+//! that moved re-resolves every file of its languages whole (the Python,
+//! JVM and PHP kinds' languages are none: they move only which frameworks a
 //! sync detects); a framework that
 //! came or went, or a manifest edit that moves which files a framework that
 //! runs only in its own apps extracts, re-extracts every file, since
@@ -75,16 +77,21 @@ pub enum ControlKind {
     /// indexed, and a configuration may leave out a `pom.xml`, a
     /// `build.gradle.kts` or a `conf/routes`.
     Jvm,
+    /// The root files Laravel and Drupal are detected by, the same way: an
+    /// `artisan` and a `composer.json` are never indexed, and a
+    /// configuration may leave out an `app/Http/Kernel.php`.
+    Php,
 }
 
 impl ControlKind {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::Js,
         Self::Csharp,
         Self::Rust,
         Self::Go,
         Self::Python,
         Self::Jvm,
+        Self::Php,
     ];
 
     fn key(self) -> &'static str {
@@ -95,6 +102,7 @@ impl ControlKind {
             Self::Go => "go",
             Self::Python => "python",
             Self::Jvm => "jvm",
+            Self::Php => "php",
         }
     }
 
@@ -124,7 +132,7 @@ impl ControlKind {
             Self::Go => name == "go.mod",
             // Their files are named by their root paths
             // ([`is_control_file`]).
-            Self::Python | Self::Jvm => false,
+            Self::Python | Self::Jvm | Self::Php => false,
         }
     }
 
@@ -136,7 +144,7 @@ impl ControlKind {
             Self::Csharp => language == Language::CSharp,
             Self::Rust => path.ends_with(".rs"),
             Self::Go => path.ends_with(".go"),
-            Self::Python | Self::Jvm => false,
+            Self::Python | Self::Jvm | Self::Php => false,
         }
     }
 }
@@ -157,20 +165,29 @@ fn jvm_root_files() -> impl Iterator<Item = &'static str> {
         .chain(codegraph_resolve::frameworks::play::ROOT_DETECTION_FILES)
 }
 
+/// The root files Laravel and Drupal are detected by, by their project
+/// paths.
+fn php_root_files() -> impl Iterator<Item = &'static str> {
+    codegraph_resolve::frameworks::laravel::ROOT_DETECTION_FILES
+        .into_iter()
+        .chain(codegraph_resolve::frameworks::drupal::ROOT_DETECTION_FILES)
+}
+
 /// Whether `relative` is one of [`TAURI_MARKERS`].
 pub fn is_tauri_marker(relative: &str) -> bool {
     TAURI_MARKERS.contains(&relative)
 }
 
 /// Whether `relative` names a control file of any kind, a Tauri marker, a
-/// root file the Python, Spring or Play frameworks are detected by, or a
-/// Dart pubspec manifest (the Dart library lane's): the watcher hands its
-/// events to the sync, though it is no source file.
+/// root file the Python, Spring, Play, Laravel or Drupal frameworks are
+/// detected by, or a Dart pubspec manifest (the Dart library lane's): the
+/// watcher hands its events to the sync, though it is no source file.
 pub fn is_control_file(relative: &str) -> bool {
     let name = relative.rsplit('/').next().unwrap_or(relative);
     is_tauri_marker(relative)
         || codegraph_resolve::frameworks::python::ROOT_DETECTION_FILES.contains(&relative)
         || jvm_root_files().any(|file| file == relative)
+        || php_root_files().any(|file| file == relative)
         || ControlKind::ALL.iter().any(|kind| kind.names_file(name))
         || crate::dart_libraries::is_pubspec_path(relative)
 }
@@ -323,6 +340,14 @@ pub fn digests_of(kind: ControlKind, project_root: &Path, files: &[FileRecord]) 
         }
         ControlKind::Jvm => {
             for relative in jvm_root_files() {
+                out.insert(
+                    relative.to_string(),
+                    file_digest(&project_root.join(relative)),
+                );
+            }
+        }
+        ControlKind::Php => {
+            for relative in php_root_files() {
                 out.insert(
                     relative.to_string(),
                     file_digest(&project_root.join(relative)),
@@ -642,6 +667,13 @@ mod tests {
         }
         assert!(!is_control_file("conf/api.routes"));
         assert!(!is_control_file("settings.gradle"));
+        // Laravel's and Drupal's root files, at the root only.
+        for file in ["artisan", "app/Http/Kernel.php", "composer.json"] {
+            assert!(is_control_file(file), "{file}");
+            assert!(!is_control_file(&format!("svc/{file}")), "svc/{file}");
+        }
+        assert!(!is_control_file("composer.lock"));
+        assert!(!is_control_file("app/Http/Controllers/Kernel.php"));
     }
 
     /// The Python kind reads its eight root files, present or not, and names
@@ -721,6 +753,37 @@ mod tests {
         assert!(!ControlKind::Jvm.reads_from("conf/routes", Language::Yaml));
         assert!(!ControlKind::Jvm.names_file("pom.xml"));
         assert_eq!(ControlKind::Jvm.row_key(), "control_inputs:jvm");
+    }
+
+    /// The PHP kind reads Laravel's and Drupal's three root files, present
+    /// or not, and names no file to re-resolve (W7-19d).
+    #[test]
+    fn the_php_kind_digests_its_root_files_and_reresolves_none() {
+        let dir = std::env::temp_dir().join(format!(
+            "cg-control-inputs-php-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("composer.json"), "{\"name\": \"acme/site\"}\n").unwrap();
+        let digests = digests_of(ControlKind::Php, &dir, &[]);
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(
+            digests.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["app/Http/Kernel.php", "artisan", "composer.json"]
+        );
+        assert_eq!(
+            digests["composer.json"],
+            Some(hash_content("{\"name\": \"acme/site\"}\n"))
+        );
+        assert_eq!(digests["artisan"], None);
+        assert_eq!(digests["app/Http/Kernel.php"], None);
+        assert!(!ControlKind::Php.reads_from("app/Http/Kernel.php", Language::Php));
+        assert!(!ControlKind::Php.names_file("composer.json"));
+        assert_eq!(ControlKind::Php.row_key(), "control_inputs:php");
     }
 
     /// The files the synthesis stage last read beside the index, and the

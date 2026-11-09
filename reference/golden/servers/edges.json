@@ -77,6 +77,19 @@
     "line": 1,
     "metadata": {
       "confidence": 0.9,
+      "framework": "drupal",
+      "resolvedBy": "framework"
+    },
+    "provenance": null,
+    "source": "route:drupal/modules/custom/greeting/greeting.routing.yml:1:/hello",
+    "target": "method:dbc237abab96f8f768a79e8d91dc5d8f"
+  },
+  {
+    "col": 0,
+    "kind": "references",
+    "line": 1,
+    "metadata": {
+      "confidence": 0.9,
       "framework": "play",
       "resolvedBy": "framework"
     },
@@ -139,6 +152,19 @@
     "line": 6,
     "metadata": {
       "confidence": 0.9,
+      "framework": "laravel",
+      "resolvedBy": "framework"
+    },
+    "provenance": null,
+    "source": "route:laravel/routes/web.php:6:GET:/users",
+    "target": "method:89630d061e1ba36c3a3eee13e796d89a"
+  },
+  {
+    "col": 0,
+    "kind": "references",
+    "line": 6,
+    "metadata": {
+      "confidence": 0.9,
       "resolvedBy": "exact-match"
     },
     "provenance": null,
@@ -168,6 +194,19 @@
     "provenance": null,
     "source": "route:nest/src/users/users.controller.ts:8:GET:/users/:id",
     "target": "method:49949645145820e984b029acad16139c"
+  },
+  {
+    "col": 0,
+    "kind": "references",
+    "line": 8,
+    "metadata": {
+      "confidence": 0.9,
+      "framework": "laravel",
+      "resolvedBy": "framework"
+    },
+    "provenance": null,
+    "source": "route:laravel/routes/web.php:8:GET:/stats",
+    "target": "method:9c266f666867e6f29cf57cec22ddddc0"
   },
   {
     "col": 11,
