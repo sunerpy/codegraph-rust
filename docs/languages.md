@@ -146,16 +146,17 @@ and merged back into the parent result.
 
 YAML, Twig, and Properties complete the 38 public code/template language IDs. The three
 Godot rows are additional internal resource-format IDs. All six receive file nodes at the
-language-extraction layer; the Godot resolver adds project/resource semantics.
+language-extraction layer; the Godot resolver adds project/resource semantics, and the
+Spring and Play resolvers add config keys and routes to YAML and Properties files.
 
-| Language      | Extensions      | Extraction     | Notes                                                                                                                               |
-| ------------- | --------------- | -------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
-| YAML          | `.yml` `.yaml`  | File node only | No symbol extraction                                                                                                                |
-| Twig          | `.twig`         | File node only | No symbol extraction                                                                                                                |
-| Properties    | `.properties`   | File node only | No symbol extraction                                                                                                                |
-| GodotScene    | `.tscn`         | File node only | Semantic graph (node tree, signals, scripts, groups, sub-scenes) built by the Godot framework resolver — see [`godot.md`](godot.md) |
-| GodotResource | `.tres`         | File node only | Resource→script/resource references built by the Godot framework resolver — see [`godot.md`](godot.md)                              |
-| GodotProject  | `project.godot` | File node only | Autoload singletons, input actions, plugins parsed by the Godot framework resolver — see [`godot.md`](godot.md)                     |
+| Language      | Extensions                        | Extraction     | Notes                                                                                                                                                                                                                                                                              |
+| ------------- | --------------------------------- | -------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| YAML          | `.yml` `.yaml`, Play routes files | File node only | No symbol extraction; a Play routes file (`conf/routes`, a path ending in `/conf/routes`, `*.routes`) is YAML, its routes the Play framework resolver's, and a Spring config file's (`application*.yml`, `bootstrap*.yaml`) leaf keys are `constant`s the Spring resolver extracts |
+| Twig          | `.twig`                           | File node only | No symbol extraction                                                                                                                                                                                                                                                               |
+| Properties    | `.properties`                     | File node only | No symbol extraction; a Spring config file's (`application*.properties`, `bootstrap*.properties`) keys are `constant`s the Spring resolver extracts                                                                                                                                |
+| GodotScene    | `.tscn`                           | File node only | Semantic graph (node tree, signals, scripts, groups, sub-scenes) built by the Godot framework resolver — see [`godot.md`](godot.md)                                                                                                                                                |
+| GodotResource | `.tres`                           | File node only | Resource→script/resource references built by the Godot framework resolver — see [`godot.md`](godot.md)                                                                                                                                                                             |
+| GodotProject  | `project.godot`                   | File node only | Autoload singletons, input actions, plugins parsed by the Godot framework resolver — see [`godot.md`](godot.md)                                                                                                                                                                    |
 
 > The three Godot file types carry file nodes only at the language-extraction level.
 > All Godot-specific symbols, edges, and honesty signals are emitted by the `GodotResolver`

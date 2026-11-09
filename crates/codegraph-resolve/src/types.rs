@@ -660,6 +660,13 @@ pub trait ResolutionContext {
         Arc::new(crate::kotlin_scope::KotlinTables::new())
     }
 
+    /// The project's Spring config keys a binding reads (W7-19c). Contexts
+    /// that live for one resolution pass keep one table; the default makes a
+    /// new one, which reads the constants again, on each call.
+    fn spring_tables(&self) -> Arc<crate::frameworks::spring::SpringTables> {
+        Arc::new(crate::frameworks::spring::SpringTables::new())
+    }
+
     /// The project-wide Scala facts of one resolution pass (W4-SC-01).
     fn scala_tables(&self) -> Arc<crate::scala_scope::ScalaTables> {
         Arc::new(crate::scala_scope::ScalaTables::new())

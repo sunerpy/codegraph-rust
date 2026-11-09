@@ -181,6 +181,13 @@ pub fn detect_language_with(
 ) -> Language {
     let path = file_path.as_ref();
     let normalized = normalize_path(path);
+    // A Play routes file has no extension (`conf/routes`) or a made-up one
+    // (`conf/api.routes`): it is indexed as a YAML file, which makes no
+    // symbols, so the Play framework resolver extracts its routes (upstream
+    // `isPlayRoutesFile`, first in `detectLanguage`).
+    if is_play_routes_file(&normalized) {
+        return Language::Yaml;
+    }
     // A Shopify theme's JSON template or section group is Liquid, and only
     // inside a theme under the project root (upstream #2393).
     if crate::embedded::shopify::is_shopify_liquid_json(&normalized, overrides.project_root()) {
@@ -205,6 +212,14 @@ pub fn detect_language_with(
         return language;
     }
     Language::Unknown
+}
+
+/// Whether `path` (project-relative, `/`-separated) is a Play routes file:
+/// `conf/routes`, one under a project's `conf/` (`app/conf/routes`), or any
+/// `*.routes` include (upstream `isPlayRoutesFile` at `e8ddc4e2`, #2156; the
+/// suffix is matched case-sensitively, as upstream's `endsWith`).
+pub fn is_play_routes_file(path: &str) -> bool {
+    path == "conf/routes" || path.ends_with("/conf/routes") || path.ends_with(".routes")
 }
 
 /// The language `file_path` is indexed as, given its `source`: the language
@@ -1912,6 +1927,38 @@ mod tests {
         assert_eq!(detect_language("data.bin"), Language::Unknown);
         assert_eq!(detect_language("project.godot"), Language::GodotProject);
         assert_eq!(detect_language("src/lib.rs"), Language::Rust);
+    }
+
+    /// A Play routes file is a YAML file (upstream `isPlayRoutesFile`): the
+    /// root's `conf/routes`, a project's under it, any `*.routes` include,
+    /// the suffix case-sensitive; the scan indexes it as a file only.
+    #[test]
+    fn play_routes_files_are_yaml_files() {
+        for path in [
+            "conf/routes",
+            "play-java-hello/conf/routes",
+            "conf/api.routes",
+            "modules/admin.routes",
+        ] {
+            assert!(is_play_routes_file(path), "{path}");
+            assert_eq!(detect_language(path), Language::Yaml, "{path}");
+            assert!(
+                is_extractable_source_path(path, &ExtensionOverrides::default()),
+                "{path}"
+            );
+        }
+        for path in [
+            "routes",
+            "xconf/routes",
+            "conf/routes.txt",
+            "conf/ROUTES",
+            "conf/api.ROUTES",
+            "config/routes",
+        ] {
+            assert!(!is_play_routes_file(path), "{path}");
+        }
+        assert_eq!(detect_language("conf/routes.txt"), Language::Unknown);
+        assert_eq!(detect_language("xconf/routes"), Language::Unknown);
     }
 
     #[test]

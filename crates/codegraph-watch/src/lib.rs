@@ -20,6 +20,7 @@ mod migrate;
 pub mod module_surfaces;
 pub mod objc_heads;
 pub mod php_heads;
+pub mod play_routes;
 mod policy;
 pub mod r_bindings;
 pub mod resolved_refs;

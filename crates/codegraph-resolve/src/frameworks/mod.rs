@@ -5,8 +5,9 @@
 //! ([`react_router`]), TanStack Router ([`tanstack_router`]), Next.js
 //! ([`nextjs`]), Svelte and SvelteKit ([`svelte`], [`sveltekit_router`]),
 //! Vue Router ([`vue_router`]), Angular Router ([`angular_router`]), Astro
-//! ([`astro`]), Django, Flask and FastAPI ([`python`]), Expo Router
-//! ([`expo_router`]), Vue and Nuxt ([`vue`]), NestJS ([`nestjs`]), Godot
+//! ([`astro`]), Django, Flask and FastAPI ([`python`]), Spring ([`spring`]),
+//! Play ([`play`]), Expo Router ([`expo_router`]), Vue and Nuxt ([`vue`]),
+//! NestJS ([`nestjs`]), Godot
 //! ([`godot`]), Tauri ([`tauri`]) and GoFrame ([`goframe`]). The other
 //! upstream resolvers remain deferred (see `KNOWN_DIFFS.md`).
 //!
@@ -36,11 +37,13 @@ pub mod nextjs;
 pub(crate) mod offset_text;
 pub mod package_deps;
 pub(crate) mod page_component;
+pub mod play;
 pub mod python;
 pub mod react;
 pub mod react_router;
 pub(crate) mod react_tables;
 pub mod route_href;
+pub mod spring;
 pub mod svelte;
 pub mod sveltekit_router;
 pub mod tanstack_router;
@@ -61,7 +64,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// among lower answers the most confident, the earlier on a tie. Each port
 /// sits where upstream's `FRAMEWORK_RESOLVERS` puts it relative to its
 /// ported neighbours (Express before NestJS, Astro between Angular Router
-/// and Expo Router, the Python frameworks after Astro); the entries already
+/// and Expo Router, the Python frameworks after Astro, Spring and Play after
+/// them); the entries already
 /// here keep their places. A port
 /// placed ahead of others must not take a reference they resolved before:
 /// it answers below `0.9`, or only for references they do not claim.
@@ -132,6 +136,14 @@ pub fn detect_frameworks(context: &dyn ResolutionContext) -> Vec<Box<dyn Framewo
         Box::new(python::DjangoResolver),
         Box::new(python::FlaskResolver),
         Box::new(python::FastapiResolver),
+        // Spring's routes, config keys and conventions, then Play's routes
+        // (#2222, #2156), after the Python frameworks as upstream registers
+        // them. Of the resolvers above only the language-agnostic Godot
+        // (GDScript's references) and Astro (`Astro.*`, `astro:*`) see a
+        // Java, Kotlin or Scala reference, and neither answers one of
+        // those, so their place changes no other reference's resolution.
+        Box::new(spring::SpringResolver),
+        Box::new(play::PlayResolver),
         // Expo Router screens and navigation (F2), after Next.js as upstream
         // registers it. It claims navigation calls only where their href
         // names one of its own screens.

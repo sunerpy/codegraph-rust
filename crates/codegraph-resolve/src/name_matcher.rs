@@ -3307,6 +3307,7 @@ pub fn match_by_qualified_name(
     }
 
     let mut candidates = context.get_nodes_by_qualified_name_shared(&reference.reference_name);
+    candidates.retain(|node| !is_config_key_for_call(reference, node));
     // A C# `using X.Y;` names a namespace: one the project declares, else it
     // is the file's own (external) using, never another file's using of that
     // name (upstream #2220).
@@ -3393,7 +3394,10 @@ pub fn match_by_qualified_name(
         let partial: Vec<Arc<Node>> = context
             .get_nodes_by_name_shared(last_name)
             .into_iter()
-            .filter(|c| c.qualified_name.ends_with(&reference.reference_name))
+            .filter(|c| {
+                !is_config_key_for_call(reference, c)
+                    && c.qualified_name.ends_with(&reference.reference_name)
+            })
             .collect();
         if !partial.is_empty() {
             let ordered = prefer_call_site_file(partial, &reference.file_path);
@@ -3407,6 +3411,16 @@ pub fn match_by_qualified_name(
     }
 
     None
+}
+
+/// A config key is no callee (upstream `keepForRef`, #1180): a `calls`
+/// reference's qualified candidates leave out the YAML and Properties
+/// constants of a Spring config file, whose qualified name is the dotted key,
+/// so `service.process()` falls through to the method of that name.
+fn is_config_key_for_call(reference: &RefView, node: &Node) -> bool {
+    reference.reference_kind == EdgeKind::Calls
+        && node.kind == NodeKind::Constant
+        && matches!(node.language, Language::Yaml | Language::Properties)
 }
 
 /// Prefer the candidate(s) declared in the call site's own file, keeping the
@@ -10080,6 +10094,68 @@ mod tests {
         let r = refv("Foo::get", EdgeKind::Calls, "src/b.rs", Language::Rust, 1);
         let res = match_by_qualified_name(&r, &ctx).expect("partial qualified");
         assert!((res.confidence - 0.85).abs() < 1e-9);
+    }
+
+    /// Upstream `keepForRef` (#1180): a `calls` reference's exact and partial
+    /// qualified candidates leave out config-key constants; a `references`
+    /// one (an `@Value` binding's) keeps them.
+    #[test]
+    fn a_call_never_resolves_to_a_config_key() {
+        let key = |language: Language| {
+            mk(
+                "constant:key",
+                NodeKind::Constant,
+                "process",
+                "service.process",
+                "src/main/resources/application.yml",
+                language,
+            )
+        };
+        let method = mk(
+            "method:process",
+            NodeKind::Method,
+            "process",
+            "app.service.process",
+            "src/S.java",
+            Language::Java,
+        );
+        for language in [Language::Yaml, Language::Properties] {
+            let ctx = Ctx::default()
+                .qualified("service.process", vec![key(language)])
+                .name("process", vec![key(language), method.clone()]);
+            let call = refv(
+                "service.process",
+                EdgeKind::Calls,
+                "src/A.java",
+                Language::Java,
+                1,
+            );
+            let res = match_by_qualified_name(&call, &ctx).expect("the method by its tail");
+            assert_eq!(res.target_node_id, "method:process");
+            assert!((res.confidence - 0.85).abs() < 1e-9);
+            let binding = refv(
+                "service.process",
+                EdgeKind::References,
+                "src/A.java",
+                Language::Java,
+                1,
+            );
+            let res = match_by_qualified_name(&binding, &ctx).expect("the key");
+            assert_eq!(res.target_node_id, "constant:key");
+        }
+        // Another language's constant stays a candidate.
+        let ctx = Ctx::default().qualified("service.process", vec![key(Language::Java)]);
+        let call = refv(
+            "service.process",
+            EdgeKind::Calls,
+            "src/A.java",
+            Language::Java,
+            1,
+        );
+        assert_eq!(
+            match_by_qualified_name(&call, &ctx).map(|res| res.target_node_id),
+            Some("constant:key".to_string())
+        );
     }
 
     #[test]

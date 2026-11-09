@@ -75,14 +75,14 @@ merge invariants.
 
 ## File/framework-level IDs
 
-| Language ID      | Runtime behavior                                                     |
-| ---------------- | -------------------------------------------------------------------- |
-| `yaml`           | file-level only; no language symbols                                 |
-| `twig`           | file-level only; no language symbols                                 |
-| `properties`     | file-level only; no language symbols                                 |
-| `godot_scene`    | `.tscn`; file-level language ID plus Godot scene resolver extraction |
-| `godot_resource` | `.tres`; file-level language ID plus Godot resource relationships    |
-| `godot_project`  | `project.godot`; autoload/input/plugin/framework extraction          |
+| Language ID      | Runtime behavior                                                                                    |
+| ---------------- | --------------------------------------------------------------------------------------------------- |
+| `yaml`           | file-level only, Play routes files too; Spring config keys and Play routes are framework extraction |
+| `twig`           | file-level only; no language symbols                                                                |
+| `properties`     | file-level only; Spring config keys are framework extraction                                        |
+| `godot_scene`    | `.tscn`; file-level language ID plus Godot scene resolver extraction                                |
+| `godot_resource` | `.tres`; file-level language ID plus Godot resource relationships                                   |
+| `godot_project`  | `project.godot`; autoload/input/plugin/framework extraction                                         |
 
 The first three are part of the 38 public code/template language count. The three
 Godot resource-format IDs are reported separately so “38 languages” does not
@@ -125,6 +125,9 @@ classifications:
   and its mapping, like any of a built-in extension, leaves `.inc` PHP;
 - `.dfm` and `.fmx` use the Pascal language ID but custom extraction;
 - `project.godot` is detected by filename because it has no extension;
+- a Play routes file (`conf/routes`, a path ending in `/conf/routes`, or one
+  ending in `.routes`, case-sensitive) is YAML ahead of every other rule, an
+  extension override included (upstream `isPlayRoutesFile`);
 - project extension overrides can claim only extensions left unclaimed by built-in
   and embedded detection.
 

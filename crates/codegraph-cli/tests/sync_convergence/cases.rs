@@ -11540,6 +11540,701 @@ pub fn python_django_model_moves_under_tests() -> Case {
         )
 }
 
+// --- W7-19c: Spring and Play (upstream `java.ts`, `play.ts` at e8ddc4e2) ---
+
+/// A root `pom.xml` naming no framework.
+const PLAIN_POM: &str = "<project><artifactId>app</artifactId></project>\n";
+
+/// A root `pom.xml` naming Spring Boot.
+const SPRING_POM: &str = "<project><dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-web</artifactId></dependency></project>\n";
+
+/// A root `build.gradle` naming no framework, and one naming Spring Boot.
+const PLAIN_GRADLE: &str = "plugins {\n    id 'java'\n}\n";
+const SPRING_GRADLE: &str = "plugins {\n    id 'java'\n}\n\ndependencies {\n    implementation 'org.springframework.boot:spring-boot-starter-web'\n}\n";
+
+const SPRING_CONTROLLER_FILE: &str = "src/main/java/demo/HelloController.java";
+
+/// A controller under a class prefix, without an annotation the annotation
+/// scan reads (`@RestController`, `@Service`, …): only a build file shows
+/// Spring.
+const SPRING_CONTROLLER: &str = "package demo;\n\n@RequestMapping(\"/api\")\npublic class HelloController {\n    @GetMapping(\"/hello\")\n    public String hello() {\n        return \"hi\";\n    }\n}\n";
+
+const SPRING_HELLO_ROUTE: &str = "route src/main/java/demo/HelloController.java::route:/api/hello";
+const SPRING_HELLO: &str = "method demo::HelloController::hello";
+
+/// W7-19c: the root `build.gradle`, which is never indexed, comes to name
+/// Spring Boot: the `jvm` control kind has the sync detect the frameworks,
+/// so the controller's routes appear.
+pub fn java_spring_build_gradle_gains_spring_boot() -> Case {
+    Case::new(Change::ControlFile, &[Language::Java])
+        .file("build.gradle", PLAIN_GRADLE)
+        .file(SPRING_CONTROLLER_FILE, SPRING_CONTROLLER)
+        .write("build.gradle", SPRING_GRADLE)
+        .edge_after(SPRING_HELLO_ROUTE, "references", SPRING_HELLO)
+}
+
+/// W7-19c: Spring Boot leaves the root `build.gradle`: the routes go.
+pub fn java_spring_build_gradle_drops_spring_boot() -> Case {
+    Case::new(Change::ControlFile, &[Language::Java])
+        .file("build.gradle", SPRING_GRADLE)
+        .file(SPRING_CONTROLLER_FILE, SPRING_CONTROLLER)
+        .write("build.gradle", PLAIN_GRADLE)
+        .edge_before(SPRING_HELLO_ROUTE, "references", SPRING_HELLO)
+}
+
+/// W7-19c: the root `pom.xml` comes to name the Spring Framework.
+pub fn java_spring_pom_gains_springframework() -> Case {
+    Case::new(Change::ControlFile, &[Language::Java])
+        .file("pom.xml", PLAIN_POM)
+        .file(SPRING_CONTROLLER_FILE, SPRING_CONTROLLER)
+        .write("pom.xml", SPRING_POM)
+        .edge_after(SPRING_HELLO_ROUTE, "references", SPRING_HELLO)
+}
+
+/// W7-19c: the Spring Framework leaves the root `pom.xml`.
+pub fn java_spring_pom_drops_springframework() -> Case {
+    Case::new(Change::ControlFile, &[Language::Java])
+        .file("pom.xml", SPRING_POM)
+        .file(SPRING_CONTROLLER_FILE, SPRING_CONTROLLER)
+        .write("pom.xml", PLAIN_POM)
+        .edge_before(SPRING_HELLO_ROUTE, "references", SPRING_HELLO)
+}
+
+const USER_SERVICE_FILE: &str = "src/main/java/demo/UserService.java";
+const PLAIN_USER_SERVICE: &str = "package demo;\n\npublic class UserService {}\n";
+const ANNOTATED_USER_SERVICE: &str = "package demo;\n\n@Service\npublic class UserService {}\n";
+
+/// W7-19c: with no build file naming it, Spring is detected by an
+/// annotation of a `.java` file: one gaining `@Service` brings every
+/// controller's routes.
+pub fn java_spring_service_annotation_appears() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Java])
+        .file("pom.xml", PLAIN_POM)
+        .file(SPRING_CONTROLLER_FILE, SPRING_CONTROLLER)
+        .file(USER_SERVICE_FILE, PLAIN_USER_SERVICE)
+        .write(USER_SERVICE_FILE, ANNOTATED_USER_SERVICE)
+        .edge_after(SPRING_HELLO_ROUTE, "references", SPRING_HELLO)
+}
+
+/// W7-19c: the only `@Service` goes: Spring is no longer detected.
+pub fn java_spring_service_annotation_is_removed() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Java])
+        .file("pom.xml", PLAIN_POM)
+        .file(SPRING_CONTROLLER_FILE, SPRING_CONTROLLER)
+        .file(USER_SERVICE_FILE, ANNOTATED_USER_SERVICE)
+        .write(USER_SERVICE_FILE, PLAIN_USER_SERVICE)
+        .edge_before(SPRING_HELLO_ROUTE, "references", SPRING_HELLO)
+}
+
+/// W7-19c: [`SPRING_CONTROLLER`] with its mapping path changed.
+const SPRING_CONTROLLER_HI: &str = "package demo;\n\n@RequestMapping(\"/api\")\npublic class HelloController {\n    @GetMapping(\"/hi\")\n    public String hello() {\n        return \"hi\";\n    }\n}\n";
+
+/// W7-19c: [`SPRING_CONTROLLER`] under another class prefix.
+const SPRING_CONTROLLER_V2: &str = "package demo;\n\n@RequestMapping(\"/v2\")\npublic class HelloController {\n    @GetMapping(\"/hello\")\n    public String hello() {\n        return \"hi\";\n    }\n}\n";
+
+/// W7-19c: a route's mapping path changes: its node is renamed in place.
+pub fn java_spring_mapping_path_changes() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Java])
+        .file("pom.xml", SPRING_POM)
+        .file(SPRING_CONTROLLER_FILE, SPRING_CONTROLLER)
+        .write(SPRING_CONTROLLER_FILE, SPRING_CONTROLLER_HI)
+        .named_before("route", "GET /api/hello")
+        .named_after("route", "GET /api/hi")
+}
+
+/// W7-19c: the class prefix changes.
+pub fn java_spring_class_prefix_changes() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Java])
+        .file("pom.xml", SPRING_POM)
+        .file(SPRING_CONTROLLER_FILE, SPRING_CONTROLLER)
+        .write(SPRING_CONTROLLER_FILE, SPRING_CONTROLLER_V2)
+        .named_before("route", "GET /api/hello")
+        .named_after("route", "GET /v2/hello")
+}
+
+/// W7-19c: a controller whose class prefix is a constant of its file.
+const SPRING_CONSTANT_PREFIX: &str = "package demo;\n\n@RequestMapping(BASE)\npublic class HelloController {\n    static final String BASE = \"/api\";\n\n    @GetMapping(\"/hello\")\n    public String hello() {\n        return \"hi\";\n    }\n}\n";
+const SPRING_CONSTANT_PREFIX_V3: &str = "package demo;\n\n@RequestMapping(BASE)\npublic class HelloController {\n    static final String BASE = \"/v3\";\n\n    @GetMapping(\"/hello\")\n    public String hello() {\n        return \"hi\";\n    }\n}\n";
+
+/// W7-19c: the constant the class prefix names changes its value.
+pub fn java_spring_prefix_constant_changes() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Java])
+        .file("pom.xml", SPRING_POM)
+        .file(SPRING_CONTROLLER_FILE, SPRING_CONSTANT_PREFIX)
+        .write(SPRING_CONTROLLER_FILE, SPRING_CONSTANT_PREFIX_V3)
+        .named_before("route", "GET /api/hello")
+        .named_after("route", "GET /v3/hello")
+}
+
+const JWT_UTIL_FILE: &str = "src/main/java/demo/JwtUtil.java";
+
+/// Two `@Value` bindings.
+const JWT_UTIL: &str = "package demo;\n\npublic class JwtUtil {\n    @Value(\"${jwt.secret}\")\n    private String secret;\n    @Value(\"${jwt.tokenHead}\")\n    private String head;\n}\n";
+
+const JWT_SECRET_BINDING: &str = "constant src/main/java/demo/JwtUtil.java::@Value:jwt.secret";
+const JWT_HEAD_BINDING: &str = "constant src/main/java/demo/JwtUtil.java::@Value:jwt.tokenHead";
+const APP_YML: &str = "src/main/resources/application.yml";
+const DEV_YML: &str = "src/main/resources/application-dev.yml";
+const APP_PROPERTIES: &str = "src/main/resources/application.properties";
+const JWT_SECRET_BASE: &str = "constant jwt.secret @src/main/resources/application.yml";
+const JWT_SECRET_DEV: &str = "constant jwt.secret @src/main/resources/application-dev.yml";
+
+/// W7-19c: `application.yml` gains the key a binding names: the binding is
+/// linked to it.
+pub fn java_spring_config_key_appears() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Java, Language::Yaml])
+        .file("pom.xml", SPRING_POM)
+        .file(JWT_UTIL_FILE, JWT_UTIL)
+        .file(APP_YML, "jwt:\n  token-head: Bearer\n")
+        .write(APP_YML, "jwt:\n  token-head: Bearer\n  secret: s\n")
+        .edge_after(JWT_SECRET_BINDING, "references", JWT_SECRET_BASE)
+}
+
+/// W7-19c: the key goes: the binding is left unresolved, never linked to
+/// itself.
+pub fn java_spring_config_key_is_removed() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Java, Language::Yaml])
+        .file("pom.xml", SPRING_POM)
+        .file(JWT_UTIL_FILE, JWT_UTIL)
+        .file(APP_YML, "jwt:\n  token-head: Bearer\n  secret: s\n")
+        .write(APP_YML, "jwt:\n  token-head: Bearer\n")
+        .edge_before(JWT_SECRET_BINDING, "references", JWT_SECRET_BASE)
+        .no_edge_after(JWT_SECRET_BINDING, "references", JWT_SECRET_BINDING)
+}
+
+/// W7-19c: a key changes its relaxed spelling: the binding follows it.
+pub fn java_spring_config_key_changes_its_relaxed_spelling() -> Case {
+    Case::new(Change::RenameSymbol, &[Language::Java, Language::Yaml])
+        .file("pom.xml", SPRING_POM)
+        .file(JWT_UTIL_FILE, JWT_UTIL)
+        .file(APP_YML, "jwt:\n  token-head: Bearer\n")
+        .write(APP_YML, "jwt:\n  token_head: Bearer\n")
+        .edge_before(JWT_HEAD_BINDING, "references", "constant jwt.token-head")
+        .edge_after(JWT_HEAD_BINDING, "references", "constant jwt.token_head")
+}
+
+/// W7-19c: the base file gains a key a profile file defined alone: the
+/// binding moves to the base file's, at 0.75.
+pub fn java_spring_config_key_appears_in_the_base_file_beside_a_profile() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Java, Language::Yaml])
+        .file("pom.xml", SPRING_POM)
+        .file(JWT_UTIL_FILE, JWT_UTIL)
+        .file(DEV_YML, "jwt:\n  secret: d\n")
+        .write(APP_YML, "jwt:\n  secret: s\n")
+        .edge_before(JWT_SECRET_BINDING, "references", JWT_SECRET_DEV)
+        .edge_after(JWT_SECRET_BINDING, "references", JWT_SECRET_BASE)
+}
+
+/// W7-19c: a profile file gains the base file's key: the binding stays,
+/// at 0.75.
+pub fn java_spring_config_key_appears_in_a_profile_file() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Java, Language::Yaml])
+        .file("pom.xml", SPRING_POM)
+        .file(JWT_UTIL_FILE, JWT_UTIL)
+        .file(APP_YML, "jwt:\n  secret: s\n")
+        .write(DEV_YML, "jwt:\n  secret: d\n")
+        .edge_throughout(JWT_SECRET_BINDING, "references", JWT_SECRET_BASE)
+}
+
+/// W7-19c: the base file goes: the binding moves to the profile file's
+/// key, at 0.9.
+pub fn java_spring_config_base_file_is_deleted() -> Case {
+    Case::new(
+        Change::DeleteImportedModule,
+        &[Language::Java, Language::Yaml],
+    )
+    .file("pom.xml", SPRING_POM)
+    .file(JWT_UTIL_FILE, JWT_UTIL)
+    .file(APP_YML, "jwt:\n  secret: s\n")
+    .file(DEV_YML, "jwt:\n  secret: d\n")
+    .remove(APP_YML)
+    .edge_before(JWT_SECRET_BINDING, "references", JWT_SECRET_BASE)
+    .edge_after(JWT_SECRET_BINDING, "references", JWT_SECRET_DEV)
+}
+
+const PORTAL_JWT_UTIL_FILE: &str = "portal/src/main/java/demo/JwtUtil.java";
+const PORTAL_JWT_SECRET_BINDING: &str =
+    "constant portal/src/main/java/demo/JwtUtil.java::@Value:jwt.secret";
+const ADMIN_YML: &str = "admin/src/main/resources/application.yml";
+const PORTAL_YML: &str = "portal/src/main/resources/application.yml";
+const JWT_SECRET_ADMIN: &str = "constant jwt.secret @admin/src/main/resources/application.yml";
+const JWT_SECRET_PORTAL: &str = "constant jwt.secret @portal/src/main/resources/application.yml";
+
+/// W7-19c: a module gains its own `application.yml` defining the key that
+/// another module's defines alike: the module's binding moves to its own
+/// (KNOWN_DIFFS; upstream takes its store's first).
+pub fn java_spring_module_gains_its_own_config_key() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Java, Language::Yaml])
+        .file("pom.xml", SPRING_POM)
+        .file(PORTAL_JWT_UTIL_FILE, JWT_UTIL)
+        .file(ADMIN_YML, "jwt:\n  secret: a\n")
+        .write(PORTAL_YML, "jwt:\n  secret: p\n")
+        .edge_before(PORTAL_JWT_SECRET_BINDING, "references", JWT_SECRET_ADMIN)
+        .edge_after(PORTAL_JWT_SECRET_BINDING, "references", JWT_SECRET_PORTAL)
+}
+
+/// W7-19c: the module's own `application.yml` goes: the binding moves
+/// back to the other module's key.
+pub fn java_spring_module_loses_its_own_config_key() -> Case {
+    Case::new(
+        Change::DeleteImportedModule,
+        &[Language::Java, Language::Yaml],
+    )
+    .file("pom.xml", SPRING_POM)
+    .file(PORTAL_JWT_UTIL_FILE, JWT_UTIL)
+    .file(ADMIN_YML, "jwt:\n  secret: a\n")
+    .file(PORTAL_YML, "jwt:\n  secret: p\n")
+    .remove(PORTAL_YML)
+    .edge_before(PORTAL_JWT_SECRET_BINDING, "references", JWT_SECRET_PORTAL)
+    .edge_after(PORTAL_JWT_SECRET_BINDING, "references", JWT_SECRET_ADMIN)
+}
+
+const CACHE_PROPS_FILE: &str = "src/main/java/demo/CacheProps.java";
+const CACHE_PROPS: &str = "package demo;\n\n@ConfigurationProperties(prefix = \"app.cache\")\npublic class CacheProps {}\n";
+const CACHE_BINDING: &str =
+    "constant src/main/java/demo/CacheProps.java::@ConfigurationProperties:app.cache";
+const CACHE_LONG: &str = "app:\n  cache:\n    name:\n      user-token: u\n";
+const CACHE_SHORT: &str = "app:\n  cache:\n    ttl: 60\n    name:\n      user-token: u\n";
+
+/// W7-19c: the prefix's subtree gains a shorter key: the binding moves to
+/// it.
+pub fn java_spring_configuration_properties_gains_a_shorter_key() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Java, Language::Yaml])
+        .file("pom.xml", SPRING_POM)
+        .file(CACHE_PROPS_FILE, CACHE_PROPS)
+        .file(APP_YML, CACHE_LONG)
+        .write(APP_YML, CACHE_SHORT)
+        .edge_before(
+            CACHE_BINDING,
+            "references",
+            "constant app.cache.name.user-token",
+        )
+        .edge_after(CACHE_BINDING, "references", "constant app.cache.ttl")
+}
+
+/// W7-19c: the shorter key goes again.
+pub fn java_spring_configuration_properties_loses_its_shorter_key() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Java, Language::Yaml])
+        .file("pom.xml", SPRING_POM)
+        .file(CACHE_PROPS_FILE, CACHE_PROPS)
+        .file(APP_YML, CACHE_SHORT)
+        .write(APP_YML, CACHE_LONG)
+        .edge_before(CACHE_BINDING, "references", "constant app.cache.ttl")
+        .edge_after(
+            CACHE_BINDING,
+            "references",
+            "constant app.cache.name.user-token",
+        )
+}
+
+/// W7-19c: an `application.properties` key comes to be the one a binding
+/// names.
+pub fn java_spring_properties_key_is_renamed_to_a_binding() -> Case {
+    Case::new(
+        Change::RenameSymbol,
+        &[Language::Java, Language::Properties],
+    )
+    .file("pom.xml", SPRING_POM)
+    .file(JWT_UTIL_FILE, JWT_UTIL)
+    .file(APP_PROPERTIES, "jwt.secrets=s\n")
+    .write(APP_PROPERTIES, "jwt.secret=s\n")
+    .edge_after(
+        JWT_SECRET_BINDING,
+        "references",
+        "constant jwt.secret @src/main/resources/application.properties",
+    )
+}
+
+/// W7-19c: the key is renamed away again.
+pub fn java_spring_properties_key_is_renamed_away_from_a_binding() -> Case {
+    Case::new(
+        Change::RenameSymbol,
+        &[Language::Java, Language::Properties],
+    )
+    .file("pom.xml", SPRING_POM)
+    .file(JWT_UTIL_FILE, JWT_UTIL)
+    .file(APP_PROPERTIES, "jwt.secret=s\n")
+    .write(APP_PROPERTIES, "jwt.secrets=s\n")
+    .edge_before(
+        JWT_SECRET_BINDING,
+        "references",
+        "constant jwt.secret @src/main/resources/application.properties",
+    )
+}
+
+/// One package's controller and `UserService`s: the Service convention
+/// prefers the one under `/service/` to the one under `/legacy/`.
+const USER_CONTROLLER_FILE: &str = "src/main/java/demo/web/UserController.java";
+const USER_CONTROLLER: &str =
+    "package demo;\n\npublic class UserController {\n    private UserService users;\n}\n";
+const DEMO_USER_SERVICE: &str = "package demo;\n\npublic class UserService {}\n";
+const SERVICE_USER_SERVICE: &str = "src/main/java/demo/service/UserService.java";
+const LEGACY_USER_SERVICE: &str = "src/main/java/demo/legacy/UserService.java";
+const IMPL_USER_SERVICE: &str = "src/main/java/demo/service/impl/UserService.java";
+const USERS_PICK: (&str, &str, &str) = (
+    "field demo::UserController::users",
+    "references",
+    "class demo::UserService @src/main/java/demo/service/UserService.java",
+);
+
+/// W7-19c: a second `UserService` appears in the tier the Service
+/// convention prefers: its pick declines, and the conventions stop there
+/// rather than guess again by the entity rule (KNOWN_DIFFS).
+pub fn java_spring_service_convention_gains_a_second_candidate() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Java])
+        .file("pom.xml", SPRING_POM)
+        .file(USER_CONTROLLER_FILE, USER_CONTROLLER)
+        .file(SERVICE_USER_SERVICE, DEMO_USER_SERVICE)
+        .file(LEGACY_USER_SERVICE, DEMO_USER_SERVICE)
+        .write(IMPL_USER_SERVICE, DEMO_USER_SERVICE)
+        .edge_metadata_before(USERS_PICK, "framework", "spring")
+        .no_edge_metadata_after(USERS_PICK, "framework", "spring")
+}
+
+/// W7-19c: the second `UserService` of the tier goes again: the
+/// convention picks the one left.
+pub fn java_spring_service_convention_loses_its_second_candidate() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Java])
+        .file("pom.xml", SPRING_POM)
+        .file(USER_CONTROLLER_FILE, USER_CONTROLLER)
+        .file(SERVICE_USER_SERVICE, DEMO_USER_SERVICE)
+        .file(LEGACY_USER_SERVICE, DEMO_USER_SERVICE)
+        .file(IMPL_USER_SERVICE, DEMO_USER_SERVICE)
+        .remove(IMPL_USER_SERVICE)
+        .edge_metadata_after(USERS_PICK, "framework", "spring")
+}
+
+/// A Play controller, and a Scala call through its class name, which is
+/// no routes line: the qualified name match's, Play detected or not.
+const PLAY_HOME: &str = "package controllers\n\nclass HomeController {\n  def index(): Int = 1\n  def about(): Int = 2\n}\n";
+const PLAY_BOOT: &str =
+    "package boot\n\nobject Boot {\n  def run(): Int = HomeController.index()\n}\n";
+const PLAY_HOME_FILE: &str = "app/controllers/HomeController.scala";
+const PLAY_INDEX: &str = "method HomeController::index";
+const PLAY_BOOT_CALL: (&str, &str, &str) = ("method Boot::run", "calls", PLAY_INDEX);
+const PLAY_SBT: &str = "lazy val root = (project in file(\".\")).enablePlugins(PlayScala)\n";
+
+/// W7-19c: the root `build.sbt`, never indexed, comes to name Play: Play
+/// is detected, and leaves the Scala `Controller.action` call alone.
+pub fn scala_play_build_sbt_gains_play_scala() -> Case {
+    Case::new(Change::ControlFile, &[Language::Scala])
+        .file("build.sbt", "name := \"app\"\n")
+        .file(PLAY_HOME_FILE, PLAY_HOME)
+        .file("app/boot/Boot.scala", PLAY_BOOT)
+        .write("build.sbt", PLAY_SBT)
+        .detected_before("play", false)
+        .detected_after("play", true)
+        .edge_throughout(PLAY_BOOT_CALL.0, PLAY_BOOT_CALL.1, PLAY_BOOT_CALL.2)
+        .no_edge_metadata_after(PLAY_BOOT_CALL, "framework", "play")
+}
+
+/// W7-19c: Play leaves the root `build.sbt`.
+pub fn scala_play_build_sbt_drops_play_scala() -> Case {
+    Case::new(Change::ControlFile, &[Language::Scala])
+        .file("build.sbt", PLAY_SBT)
+        .file(PLAY_HOME_FILE, PLAY_HOME)
+        .file("app/boot/Boot.scala", PLAY_BOOT)
+        .write("build.sbt", "name := \"app\"\n")
+        .detected_before("play", true)
+        .detected_after("play", false)
+        .edge_throughout(PLAY_BOOT_CALL.0, PLAY_BOOT_CALL.1, PLAY_BOOT_CALL.2)
+}
+
+/// W7-19c: a root `conf/application.conf`, never indexed, appears.
+pub fn scala_play_application_conf_appears() -> Case {
+    Case::new(Change::ControlFile, &[Language::Scala])
+        .file(PLAY_HOME_FILE, PLAY_HOME)
+        .file("app/boot/Boot.scala", PLAY_BOOT)
+        .write(
+            "conf/application.conf",
+            "play.http.secret.key = \"changeme\"\n",
+        )
+        .detected_before("play", false)
+        .detected_after("play", true)
+        .edge_throughout(PLAY_BOOT_CALL.0, PLAY_BOOT_CALL.1, PLAY_BOOT_CALL.2)
+        .no_edge_metadata_after(PLAY_BOOT_CALL, "framework", "play")
+}
+
+/// W7-19c: the root `conf/application.conf` is deleted.
+pub fn scala_play_application_conf_is_deleted() -> Case {
+    Case::new(Change::ControlFile, &[Language::Scala])
+        .file(
+            "conf/application.conf",
+            "play.http.secret.key = \"changeme\"\n",
+        )
+        .file(PLAY_HOME_FILE, PLAY_HOME)
+        .file("app/boot/Boot.scala", PLAY_BOOT)
+        .remove("conf/application.conf")
+        .detected_before("play", true)
+        .detected_after("play", false)
+        .edge_throughout(PLAY_BOOT_CALL.0, PLAY_BOOT_CALL.1, PLAY_BOOT_CALL.2)
+}
+
+const PLAY_ROUTES: &str = "GET / controllers.HomeController.index\n";
+const PLAY_ROUTES_ABOUT: &str =
+    "GET / controllers.HomeController.index\nGET /about controllers.HomeController.about\n";
+
+/// W7-19c: a project in a subdirectory gains its `conf/routes` (#2156):
+/// Play is detected and the routes link to their actions.
+pub fn scala_play_routes_file_appears_in_a_subproject() -> Case {
+    Case::new(Change::ControlFile, &[Language::Scala])
+        .file("web/app/controllers/HomeController.scala", PLAY_HOME)
+        .write("web/conf/routes", PLAY_ROUTES)
+        .edge_after("route web/conf/routes::GET:/", "references", PLAY_INDEX)
+}
+
+/// W7-19c: the subproject's `conf/routes` is deleted.
+pub fn scala_play_routes_file_in_a_subproject_is_deleted() -> Case {
+    Case::new(Change::ControlFile, &[Language::Scala])
+        .file("web/app/controllers/HomeController.scala", PLAY_HOME)
+        .file("web/conf/routes", PLAY_ROUTES)
+        .remove("web/conf/routes")
+        .edge_before("route web/conf/routes::GET:/", "references", PLAY_INDEX)
+}
+
+/// W7-19c: the routes file gains a line.
+pub fn scala_play_routes_gains_a_line() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Scala])
+        .file("conf/routes", PLAY_ROUTES)
+        .file(PLAY_HOME_FILE, PLAY_HOME)
+        .write("conf/routes", PLAY_ROUTES_ABOUT)
+        .edge_after(
+            "route conf/routes::GET:/about",
+            "references",
+            "method HomeController::about",
+        )
+}
+
+/// W7-19c: the routes file loses the line again.
+pub fn scala_play_routes_loses_a_line() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Scala])
+        .file("conf/routes", PLAY_ROUTES_ABOUT)
+        .file(PLAY_HOME_FILE, PLAY_HOME)
+        .write("conf/routes", PLAY_ROUTES)
+        .edge_before(
+            "route conf/routes::GET:/about",
+            "references",
+            "method HomeController::about",
+        )
+}
+
+const PLAY_NEAR_JAVA_FILE: &str = "web/app/controllers/HomeController.java";
+const PLAY_NEAR_JAVA: &str = "package controllers;\n\npublic class HomeController {\n    public int index() {\n        return 1;\n    }\n}\n";
+const PLAY_INDEX_FAR: &str = "method HomeController::index @app/controllers/HomeController.scala";
+const PLAY_INDEX_NEAR: &str =
+    "method controllers::HomeController::index @web/app/controllers/HomeController.java";
+
+/// W7-19c: a controller of the name appears nearer the routes file: the
+/// route moves to it (KNOWN_DIFFS: upstream takes its store's first).
+pub fn scala_play_nearer_controller_appears() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Scala, Language::Java])
+        .file("web/conf/routes", PLAY_ROUTES)
+        .file(PLAY_HOME_FILE, PLAY_HOME)
+        .write(PLAY_NEAR_JAVA_FILE, PLAY_NEAR_JAVA)
+        .edge_before("route web/conf/routes::GET:/", "references", PLAY_INDEX_FAR)
+        .edge_after(
+            "route web/conf/routes::GET:/",
+            "references",
+            PLAY_INDEX_NEAR,
+        )
+}
+
+/// W7-19c: the nearer controller goes: the route moves back.
+pub fn scala_play_nearer_controller_is_deleted() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Scala, Language::Java])
+        .file("web/conf/routes", PLAY_ROUTES)
+        .file(PLAY_HOME_FILE, PLAY_HOME)
+        .file(PLAY_NEAR_JAVA_FILE, PLAY_NEAR_JAVA)
+        .remove(PLAY_NEAR_JAVA_FILE)
+        .edge_before(
+            "route web/conf/routes::GET:/",
+            "references",
+            PLAY_INDEX_NEAR,
+        )
+        .edge_after("route web/conf/routes::GET:/", "references", PLAY_INDEX_FAR)
+}
+
+/// W7-19c: the action is renamed: the route is left unresolved.
+pub fn scala_play_action_is_renamed() -> Case {
+    Case::new(Change::RenameSymbol, &[Language::Scala])
+        .file("conf/routes", PLAY_ROUTES)
+        .file(PLAY_HOME_FILE, PLAY_HOME)
+        .write(
+            PLAY_HOME_FILE,
+            "package controllers\n\nclass HomeController {\n  def start(): Int = 1\n  def about(): Int = 2\n}\n",
+        )
+        .edge_before("route conf/routes::GET:/", "references", PLAY_INDEX)
+}
+
+/// W7-19c: the action is deleted.
+pub fn scala_play_action_is_removed() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Scala])
+        .file("conf/routes", PLAY_ROUTES)
+        .file(PLAY_HOME_FILE, PLAY_HOME)
+        .write(
+            PLAY_HOME_FILE,
+            "package controllers\n\nclass HomeController {\n  def about(): Int = 2\n}\n",
+        )
+        .edge_before("route conf/routes::GET:/", "references", PLAY_INDEX)
+}
+
+const PLAY_MAIN: &str = "package controllers\n\nclass MainController {\n  def index(): Int = 1\n  def about(): Int = 2\n}\n";
+
+/// W7-19c: the controller class is renamed: the route is left unresolved.
+pub fn scala_play_controller_is_renamed() -> Case {
+    Case::new(Change::RenameSymbol, &[Language::Scala])
+        .file("conf/routes", PLAY_ROUTES)
+        .file(PLAY_HOME_FILE, PLAY_HOME)
+        .write(PLAY_HOME_FILE, PLAY_MAIN)
+        .edge_before("route conf/routes::GET:/", "references", PLAY_INDEX)
+}
+
+/// W7-19c: the class is renamed back: the route links again.
+pub fn scala_play_controller_is_renamed_back() -> Case {
+    Case::new(Change::RenameSymbol, &[Language::Scala])
+        .file("conf/routes", PLAY_ROUTES)
+        .file(PLAY_HOME_FILE, PLAY_MAIN)
+        .write(PLAY_HOME_FILE, PLAY_HOME)
+        .edge_after("route conf/routes::GET:/", "references", PLAY_INDEX)
+}
+
+/// W7-19c: a routes file moves into another project's directory: its
+/// route moves to that project's controller.
+pub fn scala_play_routes_file_moves_into_another_project() -> Case {
+    Case::new(Change::DeleteImportedModule, &[Language::Scala])
+        .file("a/conf/routes", PLAY_ROUTES)
+        .file("a/app/controllers/HomeController.scala", PLAY_HOME)
+        .file("b/app/controllers/HomeController.scala", PLAY_HOME)
+        .rename("a/conf/routes", "b/conf/routes")
+        .edge_before(
+            "route a/conf/routes::GET:/",
+            "references",
+            "method HomeController::index @a/app/controllers/HomeController.scala",
+        )
+        .edge_after(
+            "route b/conf/routes::GET:/",
+            "references",
+            "method HomeController::index @b/app/controllers/HomeController.scala",
+        )
+}
+
+const KOTLIN_INDEX: &str = "package controllers\n\nfun index(): Int = 1\n";
+const KOTLIN_INDEX_AND_CLASS: &str =
+    "package controllers\n\nfun index(): Int = 1\n\nclass HomeController\n";
+
+/// W7-19c: a Kotlin file whose function `index` was already there gains
+/// only a class `HomeController`: nearer the routes file, it takes the
+/// route, though no `index` changed.
+pub fn kotlin_play_class_joins_an_existing_action() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Scala, Language::Kotlin])
+        .file("web/conf/routes", PLAY_ROUTES)
+        .file(PLAY_HOME_FILE, PLAY_HOME)
+        .file("web/app/controllers/Home.kt", KOTLIN_INDEX)
+        .write("web/app/controllers/Home.kt", KOTLIN_INDEX_AND_CLASS)
+        .edge_before("route web/conf/routes::GET:/", "references", PLAY_INDEX_FAR)
+        .edge_after(
+            "route web/conf/routes::GET:/",
+            "references",
+            "function controllers::index @web/app/controllers/Home.kt",
+        )
+}
+
+/// W7-19c: the same at the depth of the controller the route links to:
+/// two candidates tie, so Play declines, and the route is left unresolved
+/// (KNOWN_DIFFS: no other strategy guesses a routes line).
+pub fn kotlin_play_class_joins_an_action_at_the_same_depth() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Scala, Language::Kotlin])
+        .file("web/conf/routes", PLAY_ROUTES)
+        .file(PLAY_HOME_FILE, PLAY_HOME)
+        .file("app/controllers/Home.kt", KOTLIN_INDEX)
+        .write("app/controllers/Home.kt", KOTLIN_INDEX_AND_CLASS)
+        .edge_metadata_before(
+            ("route web/conf/routes::GET:/", "references", PLAY_INDEX_FAR),
+            "framework",
+            "play",
+        )
+        .no_edge_after("route web/conf/routes::GET:/", "references", PLAY_INDEX_FAR)
+        .no_edge_after(
+            "route web/conf/routes::GET:/",
+            "references",
+            "function controllers::index @app/controllers/Home.kt",
+        )
+}
+
+/// More routes naming one `Controller.action` no class answers than the
+/// name lane's per-tail ceiling retries.
+static PLAY_PARKED_ROUTES: LazyLock<String> = LazyLock::new(|| {
+    (0..600)
+        .map(|index| format!("GET /p{index} controllers.Missing.go\n"))
+        .collect()
+});
+
+/// W7-19c: a class appears that 600 parked routes name: all of them link,
+/// past the name lane's per-tail ceiling.
+pub fn scala_play_parked_routes_reach_an_added_controller_past_the_tail_ceiling() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Scala])
+        .file("conf/routes", PLAY_PARKED_ROUTES.as_str())
+        .write(
+            "app/controllers/Missing.scala",
+            "package controllers\n\nclass Missing {\n  def go(): Int = 1\n}\n",
+        )
+        .edge_after(
+            "route conf/routes::GET:/p0",
+            "references",
+            "method Missing::go",
+        )
+        .edge_after(
+            "route conf/routes::GET:/p599",
+            "references",
+            "method Missing::go",
+        )
+}
+
+/// 600 routes naming `C.m`.
+static PLAY_CTL_ROUTES: LazyLock<String> = LazyLock::new(|| {
+    (0..600)
+        .map(|index| format!("GET /c{index} controllers.C.m\n"))
+        .collect()
+});
+const CTL_FILE: &str = "app/controllers/C.ctl";
+const CTL_SOURCE: &str = "class C { public void m() {} }\n";
+const CTL_SOURCE_PADDED: &str = "class C { public void m() {} }\n\n";
+const CTL_AS_CSHARP: &str = "{\"extensions\":{\".ctl\":\"csharp\"}}\n";
+const CTL_AS_JAVA: &str = "{\"extensions\":{\".ctl\":\"java\"}}\n";
+
+/// W7-19c: `codegraph.json` maps the controller's extension from C# to
+/// Java, and the file gains only trailing whitespace: no name changes, but
+/// the 600 routes a cross-family pick parked all link.
+pub fn java_play_extension_override_brings_a_controller_into_the_jvm() -> Case {
+    Case::new(
+        Change::ControlFile,
+        &[Language::Scala, Language::Java, Language::CSharp],
+    )
+    .file(".codegraph/codegraph.json", CTL_AS_CSHARP)
+    .file("conf/routes", PLAY_CTL_ROUTES.as_str())
+    .file(CTL_FILE, CTL_SOURCE)
+    .write(".codegraph/codegraph.json", CTL_AS_JAVA)
+    .write(CTL_FILE, CTL_SOURCE_PADDED)
+    .file_language_after(CTL_FILE, "java")
+    .edge_after("route conf/routes::GET:/c0", "references", "method C::m")
+    .edge_after("route conf/routes::GET:/c599", "references", "method C::m")
+}
+
+/// W7-19c: mapped back to C#: the 600 routes are all unlinked again.
+pub fn java_play_extension_override_takes_a_controller_out_of_the_jvm() -> Case {
+    Case::new(
+        Change::ControlFile,
+        &[Language::Scala, Language::Java, Language::CSharp],
+    )
+    .file(".codegraph/codegraph.json", CTL_AS_JAVA)
+    .file("conf/routes", PLAY_CTL_ROUTES.as_str())
+    .file(CTL_FILE, CTL_SOURCE)
+    .write(".codegraph/codegraph.json", CTL_AS_CSHARP)
+    .write(CTL_FILE, CTL_SOURCE_PADDED)
+    .file_language_after(CTL_FILE, "csharp")
+    .edge_before("route conf/routes::GET:/c599", "references", "method C::m")
+}
+
 /// W7-03: a `nuxt.config.ts` appears in a Vue app (upstream #2130): Nuxt is
 /// detected, and its `pages/` become routes served by their components.
 pub fn vue_nuxt_config_appears() -> Case {
