@@ -39,14 +39,14 @@ matching (`name-matcher.ts`) — orchestrated by `ReferenceResolver`
 `FrameworkResolver` trait EXTENSION POINT (`crates/codegraph-resolve/src/framework.rs`):
 Express, NestJS, React, Vue, Godot, Tauri, Nuxt, React Router, TanStack Router,
 Next.js, Svelte, SvelteKit, Vue Router, Angular Router, Astro, Django, Flask,
-FastAPI, Expo Router and GoFrame (`crates/codegraph-resolve/src/frameworks/`), detected per-project by
+FastAPI, Spring, Play, Expo Router and GoFrame (`crates/codegraph-resolve/src/frameworks/`), detected per-project by
 `detect_frameworks`. The other colby resolvers stay deferred. The following
 colby behaviors are intentionally NOT ported in v1:
 
 - **The other framework-specific resolvers** — every concrete `FrameworkResolver`
   in `reference/colby/src/resolution/frameworks/**` EXCEPT those above:
-  Spring/Java, Drupal `routing.yml`, React Native / Expo / Fabric bridges,
-  Swift↔ObjC bridging, and the Go-module / Ruby / C# / Play route
+  Drupal `routing.yml`, React Native / Expo / Fabric bridges,
+  Swift↔ObjC bridging, and the Go-module / Ruby / C# route
   extractors. These are an additive heuristic layer; on a project where none
   of them is detected the orchestrator holds an empty resolver list, so
   behavior matches colby with zero frameworks detected. Astro's extraction
@@ -539,6 +539,51 @@ regex engine), is not listed.
   `path('not_found', not_found)` resolved its handler to the route itself,
   which now reaches the function. colby's exact-name match passes a route, an
   importable kind there, and draws those edges (`name_matcher.rs`).
+- **A Spring binding's key is Spring's alone (W7-19c).** The reference an
+  `@Value` or `@ConfigurationProperties` binding makes resolves only through
+  the Spring resolver: one key spelt alike binds at `0.9` and of several the
+  base file's (else the shortest file name's) at `0.75`; a key no config file
+  holds stays unresolved, and so does one without a dot, which Spring's #1180
+  gate passes over. colby lets import and name resolution outrank Spring's
+  `0.75`, against its own comment that the base `application.yml` wins over
+  the profile variants: a key two files hold binds, when spelt exactly, to the
+  qualified-name match's first (`application-dev.yml` before
+  `application.yml`), and when spelt loosely, like a key no file holds, to the
+  binding node itself, which is named as its key (`frameworks/spring.rs`,
+  `resolver.rs`).
+- **Spring config keys of equal rank (W7-19c).** Of the keys a binding names
+  that rank alike (base files, profile files with names of one length, or
+  keys of the shortest length under an `@ConfigurationProperties` prefix),
+  the one whose file shares the most directories with the binding's wins,
+  then the first by file, line, column and id: the modules of a multi-module
+  project each hold an `application.yml` and read their own (in mall, five
+  `mall-portal` bindings link to `mall-portal`'s keys, not `mall-admin`'s).
+  colby takes the first in its store's order, which its comment calls the
+  path's (`frameworks/spring.rs`).
+- **Spring's conventions stop at a pick that answers nothing (W7-19c).**
+  Spring's convention rules (`…Service`, `…Repository`, `…Controller`, one
+  capitalized word, `…Component` or `…Config`) go on to the next rule only
+  when a rule finds no candidate. A rule whose shared pick answers nothing (a
+  tier of two, a pick in another code family) ends them, so a later rule does
+  not guess again with other kinds and folders. colby tries the next rule only
+  when there is no candidate either, and takes the first otherwise
+  (`frameworks/spring.rs`).
+- **Play's nearest controller (W7-19c).** Of the classes named as a routes
+  line's controller, Play takes the one whose file shares the most directories
+  with the routes file, and answers nothing when two share as many, or when
+  the action it picks is in another code family than the reference. colby
+  takes the first class in its store's order whose file has the action: in
+  play-samples, whose projects each hold a `HomeController`, that links most
+  projects' routes to one project's controller (`frameworks/play.rs`).
+- **Play reads only routes lines (W7-19c).** Play resolves a reference only
+  when a routes file makes it, and such a reference takes no other strategy's
+  answer: a line Play answers nothing for stays unresolved. colby also guesses
+  a `Controller.action` that Scala or Java code writes, and lets name matching
+  guess a line it leaves: in play-samples that links two Scala calls of
+  `play-scala-websocket-example` to Java methods of
+  `play-java-websocket-example`, and `play-scala-tls-example`'s `GET /`, whose
+  three nearest `HomeController`s tie, to `play-scala-anorm-example`'s
+  (`frameworks/play.rs`, `resolver.rs`).
 - **Dart named constructors (#2380).** A named constructor, indexed as a
   method, is reached only by a call written through its class (`Foo.value(2)`).
   A call through a value of that type (a typed parameter or local, a chain's
@@ -875,4 +920,9 @@ every sync composes them again and renames only FastAPI's own routes, so a
 Flask route on a FastAPI decorator's line keeps its name, which colby
 renames, and a route that nothing renames any more (its mount gone, its prefix
 computed, its router mounted at a second path) gets its file's name back
-(`frameworks/python.rs`), where colby's sync keeps the old prefix.
+(`frameworks/python.rs`), where colby's sync keeps the old prefix. Spring's
+config keys and Play's actions have lanes of their own (W7-19c): a config file
+a sync rebuilds or removes re-resolves every reference a key can bind, since a
+relaxed spelling or a second profile file moves a binding without touching
+its name, and a class or action a sync adds, removes or moves into another
+language re-resolves the routes lines naming it (`play_routes_version`).

@@ -74,6 +74,19 @@
   {
     "col": 0,
     "kind": "references",
+    "line": 1,
+    "metadata": {
+      "confidence": 0.9,
+      "framework": "play",
+      "resolvedBy": "framework"
+    },
+    "provenance": null,
+    "source": "route:play/conf/routes:1:GET:/",
+    "target": "method:0952d7c19228f96d12bb769ece592391"
+  },
+  {
+    "col": 0,
+    "kind": "references",
     "line": 11,
     "metadata": {
       "confidence": 0.9,
@@ -86,6 +99,18 @@
   {
     "col": 0,
     "kind": "references",
+    "line": 15,
+    "metadata": {
+      "confidence": 0.7,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "route:spring/src/main/java/com/example/users/UserController.java:15:GET:/users/{id}",
+    "target": "method:203dfa9524733a2e4ceac374305fad0b"
+  },
+  {
+    "col": 0,
+    "kind": "references",
     "line": 19,
     "metadata": {
       "confidence": 0.9,
@@ -94,6 +119,19 @@
     "provenance": null,
     "source": "route:flask/app.py:19:GET:/ping",
     "target": "function:359d25aadac7c78f4c23663b4a877017"
+  },
+  {
+    "col": 0,
+    "kind": "references",
+    "line": 2,
+    "metadata": {
+      "confidence": 0.9,
+      "framework": "play",
+      "resolvedBy": "framework"
+    },
+    "provenance": null,
+    "source": "route:play/conf/routes:2:GET:/items/:id",
+    "target": "method:dffa1d90061d3bb5d52e05bf5da1951d"
   },
   {
     "col": 0,

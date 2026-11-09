@@ -267,6 +267,10 @@ impl ResolutionContext for ViewContext<'_, '_> {
         self.store.kotlin_tables()
     }
 
+    fn spring_tables(&self) -> Arc<crate::frameworks::spring::SpringTables> {
+        self.store.spring_tables()
+    }
+
     fn scala_tables(&self) -> Arc<crate::scala_scope::ScalaTables> {
         self.store.scala_tables()
     }

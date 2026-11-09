@@ -129,6 +129,8 @@ pub struct Case {
     languages_after: Vec<(&'static str, &'static str)>,
     names_before: Vec<(&'static str, &'static str)>,
     names_after: Vec<(&'static str, &'static str)>,
+    detected_before: Vec<(&'static str, bool)>,
+    detected_after: Vec<(&'static str, bool)>,
 }
 
 impl Case {
@@ -149,6 +151,8 @@ impl Case {
             languages_after: Vec::new(),
             names_before: Vec::new(),
             names_after: Vec::new(),
+            detected_before: Vec::new(),
+            detected_after: Vec::new(),
         }
     }
 
@@ -275,6 +279,19 @@ impl Case {
         self
     }
 
+    /// Whether the `before` index detected `framework`: a change of the
+    /// frameworks a project shows need not show in any edge.
+    pub fn detected_before(mut self, framework: &'static str, detected: bool) -> Self {
+        self.detected_before.push((framework, detected));
+        self
+    }
+
+    /// Whether a fresh index of the final tree detects `framework`.
+    pub fn detected_after(mut self, framework: &'static str, detected: bool) -> Self {
+        self.detected_after.push((framework, detected));
+        self
+    }
+
     /// An edge both the `before` index and a fresh index of the final tree
     /// must hold.
     pub fn edge_throughout(
@@ -372,6 +389,7 @@ fn run_case(name: &str, case: &Case) {
     expect_edges(name, "before", cli.graph(), &case.edges_before);
     expect_edge_metadata(name, "before", cli.graph(), &case.metadata_before);
     expect_names(name, "before", cli.graph(), &case.names_before);
+    expect_detected(name, "before", &cli.db(), &case.detected_before);
     let mut languages = indexed_languages(cli.graph());
     case.apply(&mut cli);
     cli.sync();
@@ -392,6 +410,7 @@ fn run_case(name: &str, case: &Case) {
     expect_edge_metadata(name, "fresh", fresh.graph(), &case.metadata_after);
     expect_no_edge_metadata(name, "fresh", fresh.graph(), &case.absent_metadata_after);
     expect_names(name, "fresh", fresh.graph(), &case.names_after);
+    expect_detected(name, "fresh", &fresh.db(), &case.detected_after);
     for &(path, language) in &case.languages_after {
         let recorded = fresh
             .graph()
@@ -481,6 +500,8 @@ fn run_case(name: &str, case: &Case) {
         "frameworks_",
         "dart_pubspec",
         "synthesis_unindexed_inputs",
+        // The Play routes marker (W7-19c).
+        "play_routes",
     ] {
         let fresh_rows = comparable_rows(&fresh.db(), prefix);
         for (driver, project) in [("cli", &cli), ("watch", &watch)] {
@@ -712,6 +733,23 @@ fn expect_edges(name: &str, label: &str, graph: &Graph, edges: &[EdgeSpec]) {
 }
 
 #[track_caller]
+fn expect_detected(name: &str, label: &str, db: &Path, specs: &[(&str, bool)]) {
+    let rows = support::project_metadata_with_prefix(db, "frameworks_detected");
+    let detected: Vec<String> = rows
+        .first()
+        .and_then(|(_, value)| serde_json::from_str(value).ok())
+        .unwrap_or_default();
+    for &(framework, want) in specs {
+        assert_eq!(
+            detected.iter().any(|known| known == framework),
+            want,
+            "[{name}] the {label} index detects {detected:?}, which this case exists to \
+             exercise with {framework} {}",
+            if want { "detected" } else { "not detected" }
+        );
+    }
+}
+
 fn expect_names(name: &str, label: &str, graph: &Graph, names: &[(&str, &str)]) {
     for &(kind, node_name) in names {
         assert!(
@@ -1544,6 +1582,49 @@ matrix! {
     python_django_model_loses_its_second_candidate,
     python_django_model_moves_into_a_function_body,
     python_django_model_moves_under_tests,
+    java_spring_build_gradle_gains_spring_boot,
+    java_spring_build_gradle_drops_spring_boot,
+    java_spring_pom_gains_springframework,
+    java_spring_pom_drops_springframework,
+    java_spring_service_annotation_appears,
+    java_spring_service_annotation_is_removed,
+    java_spring_mapping_path_changes,
+    java_spring_class_prefix_changes,
+    java_spring_prefix_constant_changes,
+    java_spring_config_key_appears,
+    java_spring_config_key_is_removed,
+    java_spring_config_key_changes_its_relaxed_spelling,
+    java_spring_config_key_appears_in_the_base_file_beside_a_profile,
+    java_spring_config_key_appears_in_a_profile_file,
+    java_spring_config_base_file_is_deleted,
+    java_spring_module_gains_its_own_config_key,
+    java_spring_module_loses_its_own_config_key,
+    java_spring_configuration_properties_gains_a_shorter_key,
+    java_spring_configuration_properties_loses_its_shorter_key,
+    java_spring_properties_key_is_renamed_to_a_binding,
+    java_spring_properties_key_is_renamed_away_from_a_binding,
+    java_spring_service_convention_gains_a_second_candidate,
+    java_spring_service_convention_loses_its_second_candidate,
+    scala_play_build_sbt_gains_play_scala,
+    scala_play_build_sbt_drops_play_scala,
+    scala_play_application_conf_appears,
+    scala_play_application_conf_is_deleted,
+    scala_play_routes_file_appears_in_a_subproject,
+    scala_play_routes_file_in_a_subproject_is_deleted,
+    scala_play_routes_gains_a_line,
+    scala_play_routes_loses_a_line,
+    scala_play_nearer_controller_appears,
+    scala_play_nearer_controller_is_deleted,
+    scala_play_action_is_renamed,
+    scala_play_action_is_removed,
+    scala_play_controller_is_renamed,
+    scala_play_controller_is_renamed_back,
+    scala_play_routes_file_moves_into_another_project,
+    kotlin_play_class_joins_an_existing_action,
+    kotlin_play_class_joins_an_action_at_the_same_depth,
+    scala_play_parked_routes_reach_an_added_controller_past_the_tail_ceiling,
+    java_play_extension_override_brings_a_controller_into_the_jvm,
+    java_play_extension_override_takes_a_controller_out_of_the_jvm,
     vue_nuxt_config_appears,
     vue_nuxt_app_manifest_gains_nuxt,
     vue_nuxt_page_body_edit,

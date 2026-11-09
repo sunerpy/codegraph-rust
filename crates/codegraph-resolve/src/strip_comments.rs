@@ -225,6 +225,15 @@ pub(crate) fn strip_js_comments_keeping_offsets(content: &str) -> String {
     strip_c_style_blanking(content, true, Blanking::Bytes)
 }
 
+/// [`strip_comments_for_regex`] for Java (and the Kotlin a Spring resolver
+/// reads the same way, upstream `stripCommentsForRegex(content, 'java')`)
+/// with each comment BYTE but a newline a space (W7-19c), as
+/// [`strip_js_comments_keeping_offsets`] blanks JavaScript: a double-quoted
+/// string stays and a single quote opens none.
+pub(crate) fn strip_java_comments_keeping_offsets(content: &str) -> String {
+    strip_c_style_blanking(content, false, Blanking::Bytes)
+}
+
 /// [`strip_comments_for_regex`] for Python with each blanked BYTE but a
 /// newline a space (W7-19b), the way [`strip_js_comments_keeping_offsets`]
 /// blanks JavaScript: a triple-quoted string and a `#` comment become

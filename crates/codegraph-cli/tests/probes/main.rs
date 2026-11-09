@@ -21689,6 +21689,420 @@ mod python_frameworks {
     }
 }
 
+mod jvm_frameworks {
+    use super::support::{Graph, Project, project_metadata_with_prefix};
+
+    fn project_of(files: &[(&str, &str)]) -> Project {
+        files.iter().fold(Project::new(), |project, (path, text)| {
+            project.file(path, text)
+        })
+    }
+
+    /// Every non-`contains` edge leaving a node of `file`, described with
+    /// how it resolved, and every reference a node of `file` leaves
+    /// unresolved, sorted.
+    fn leaving_file(graph: &Graph, file: &str) -> Vec<String> {
+        let in_file = |id: &str| graph.node(id).is_some_and(|node| node.file_path == file);
+        let mut out: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.kind != "contains" && in_file(&edge.source))
+            .map(|edge| graph.describe_edge(edge))
+            .chain(
+                graph
+                    .unresolved
+                    .iter()
+                    .filter(|reference| in_file(&reference.from_node_id))
+                    .map(|reference| graph.describe_ref(reference)),
+            )
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// The routes of `file` with what each references, sorted.
+    fn routes_of(graph: &Graph, file: &str) -> Vec<String> {
+        let mut out: Vec<String> = graph
+            .nodes
+            .iter()
+            .filter(|node| node.kind == "route" && node.file_path == file)
+            .map(|route| {
+                let targets: Vec<String> = graph
+                    .edges
+                    .iter()
+                    .filter(|edge| edge.source == route.id && edge.kind == "references")
+                    .map(|edge| graph.describe(&edge.target))
+                    .collect();
+                format!("{} -> {}", route.name, targets.join(", "))
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// The frameworks the index records as detected.
+    fn detected(db: &std::path::Path) -> String {
+        project_metadata_with_prefix(db, "frameworks_detected")
+            .into_iter()
+            .map(|(_, value)| value)
+            .collect()
+    }
+
+    const MODEL_EXAMPLE: &str = "package com.macro.mall.model;\n\npublic class NAME {\n    public Criteria createCriteria() {\n        Criteria criteria = new Criteria();\n        return criteria;\n    }\n\n    public static class Criteria {\n    }\n}\n";
+
+    /// Upstream #2222 (`spring-model-name-scope.test.ts`): a Spring
+    /// heuristic starts from the reference's own file and package, and never
+    /// reaches a class nested in another file's class by its bare name.
+    #[test]
+    fn pr2222_a_spring_name_resolves_to_its_own_file_s_nested_class() {
+        let order = "mall-mbg/src/main/java/com/macro/mall/model/OmsOrderExample.java";
+        let project = project_of(&[
+            (
+                "pom.xml",
+                "<project><dependency>spring-boot-starter</dependency></project>\n",
+            ),
+            (
+                "mall-mbg/src/main/java/com/macro/mall/model/CmsHelpCategoryExample.java",
+                &MODEL_EXAMPLE.replace("NAME", "CmsHelpCategoryExample"),
+            ),
+            (order, &MODEL_EXAMPLE.replace("NAME", "OmsOrderExample")),
+            (
+                "mall-admin/src/main/java/com/macro/mall/service/OrderService.java",
+                "package com.macro.mall.service;\n\n@Service\npublic class OrderService {\n}\n",
+            ),
+        ])
+        .index();
+        let graph = project.graph();
+        assert!(
+            detected(&project.db()).contains("\"spring\""),
+            "{}",
+            detected(&project.db())
+        );
+        let criteria: Vec<&str> = graph
+            .edges
+            .iter()
+            .filter(|edge| matches!(edge.kind.as_str(), "instantiates" | "references"))
+            .filter(|edge| {
+                graph
+                    .node(&edge.source)
+                    .is_some_and(|node| node.file_path == order)
+            })
+            .filter_map(|edge| graph.node(&edge.target))
+            .filter(|target| target.name == "Criteria")
+            .map(|target| target.file_path.as_str())
+            .collect();
+        assert!(!criteria.is_empty(), "{}", graph.report());
+        assert!(
+            criteria.iter().all(|file| *file == order),
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream #2156 (`play-nested-projects.test.ts`): a repository of Play
+    /// projects with no build at its root reads as Play by a routes file in a
+    /// subdirectory, whose routes link to their actions.
+    #[test]
+    fn pr2156_play_projects_in_subdirectories_have_their_routes() {
+        let routes = "play-java-hello/conf/routes";
+        let project = project_of(&[
+            (
+                routes,
+                "GET     /                controllers.HomeController.index()\nGET     /count           controllers.CountController.count()\n",
+            ),
+            (
+                "play-java-hello/app/controllers/HomeController.java",
+                "package controllers;\npublic class HomeController {\n    public Result index() { return null; }\n}\n",
+            ),
+            (
+                "play-java-hello/app/controllers/CountController.java",
+                "package controllers;\npublic class CountController {\n    public Result count() { return null; }\n}\n",
+            ),
+        ])
+        .index();
+        let graph = project.graph();
+        assert!(
+            detected(&project.db()).contains("\"play\""),
+            "{}",
+            detected(&project.db())
+        );
+        assert!(
+            graph
+                .files
+                .iter()
+                .any(|file| file.path == routes && file.language == "yaml"),
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            routes_of(graph, routes),
+            [
+                "GET / -> method controllers::HomeController::index @play-java-hello/app/controllers/HomeController.java:3",
+                "GET /count -> method controllers::CountController::count @play-java-hello/app/controllers/CountController.java:3",
+            ],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Play projects side by side link each routes file to its own
+    /// project's controller (KEEP-RUST: the nearest of the classes so named;
+    /// upstream takes its store's first).
+    #[test]
+    fn play_projects_side_by_side_link_to_their_own_controllers() {
+        let project = project_of(&[
+            ("a/conf/routes", "GET / controllers.HomeController.index\n"),
+            (
+                "a/app/controllers/HomeController.scala",
+                "package controllers\n\nclass HomeController {\n  def index(): Int = 1\n}\n",
+            ),
+            ("b/conf/routes", "GET / controllers.HomeController.index\n"),
+            (
+                "b/app/controllers/HomeController.java",
+                "package controllers;\npublic class HomeController {\n    public int index() { return 2; }\n}\n",
+            ),
+        ])
+        .index();
+        let graph = project.graph();
+        let a = routes_of(graph, "a/conf/routes");
+        let b = routes_of(graph, "b/conf/routes");
+        assert_eq!(a.len(), 1, "{}", graph.report());
+        assert!(
+            a[0].contains("@a/app/controllers/HomeController.scala:"),
+            "{a:?}\n{}",
+            graph.report()
+        );
+        assert_eq!(b.len(), 1, "{}", graph.report());
+        assert!(
+            b[0].contains("@b/app/controllers/HomeController.java:"),
+            "{b:?}\n{}",
+            graph.report()
+        );
+    }
+
+    /// A routes line Play leaves stays unresolved (KEEP-RUST): in
+    /// play-samples, `play-scala-tls-example` holds a `HomeController` in its
+    /// `app/` and in each of its `modules/`, all one directory from its
+    /// routes, and name matching took another project's. And a
+    /// `Controller.action` that Scala code writes is no routes line: Play
+    /// leaves it to name matching, which links its own project's.
+    #[test]
+    fn play_leaves_a_tied_routes_line_unresolved_and_code_to_name_matching() {
+        let home = "package controllers\n\nclass HomeController {\n  def index(): Int = 1\n}\n";
+        let project = project_of(&[
+            ("tls/conf/routes", "GET / controllers.HomeController.index\n"),
+            ("tls/app/controllers/HomeController.scala", home),
+            ("tls/modules/one/app/controllers/HomeController.scala", home),
+            ("anorm/app/controllers/HomeController.scala", home),
+            (
+                "ws/app/actors/UserParentActor.scala",
+                "package actors\n\nclass UserParentActor {\n  def start(): Int = UserActor.watch()\n}\n",
+            ),
+            (
+                "ws/app/actors/UserActor.scala",
+                "package actors\n\nobject UserActor {\n  def watch(): Int = 1\n}\n",
+            ),
+            (
+                "java-ws/app/actors/UserActor.java",
+                "package actors;\n\npublic class UserActor {\n    public static int watch() { return 2; }\n}\n",
+            ),
+        ])
+        .index();
+        let graph = project.graph();
+        assert!(
+            detected(&project.db()).contains("\"play\""),
+            "{}",
+            detected(&project.db())
+        );
+        assert_eq!(
+            routes_of(graph, "tls/conf/routes"),
+            ["GET / -> "],
+            "{}",
+            graph.report()
+        );
+        let calls: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.kind == "calls" && graph.describe(&edge.source).contains("start"))
+            .map(|edge| {
+                format!(
+                    "{} {:?}",
+                    graph.describe(&edge.target),
+                    edge.metadata.get("framework")
+                )
+            })
+            .collect();
+        assert_eq!(calls.len(), 1, "{calls:?}\n{}", graph.report());
+        assert!(
+            calls[0].contains("@ws/app/actors/UserActor.scala") && calls[0].ends_with("None"),
+            "{calls:?}\n{}",
+            graph.report()
+        );
+    }
+
+    /// Spring's routes link to their methods, under the class prefix and
+    /// through a same-file constant path, each path of a list its own route.
+    #[test]
+    fn spring_routes_link_to_their_methods() {
+        let file = "src/main/java/demo/UserController.java";
+        let project = project_of(&[
+            ("pom.xml", "<project><dependency>spring-boot-starter-web</dependency></project>\n"),
+            (
+                file,
+                "package demo;\n\n@RestController\n@RequestMapping(\"/api\")\npublic class UserController {\n    private static final String USERS = \"/users\";\n\n    @GetMapping(USERS)\n    public String list() { return null; }\n\n    @PostMapping({\"/a\", \"/b\"})\n    public void create() {}\n\n    @RequestMapping(value = \"/old\", method = RequestMethod.PUT)\n    public void legacy() {}\n}\n",
+            ),
+        ])
+        .index();
+        let graph = project.graph();
+        let routes = routes_of(graph, file);
+        let names: Vec<&str> = routes
+            .iter()
+            .map(|route| route.split(" -> ").next().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "GET /api/users",
+                "POST /api/a",
+                "POST /api/b",
+                "PUT /api/old"
+            ],
+            "{}",
+            graph.report()
+        );
+        for (route, method) in routes.iter().zip(["list", "create", "create", "legacy"]) {
+            assert!(
+                route.contains(&format!("::{method} @{file}:")),
+                "{route}\n{}",
+                graph.report()
+            );
+        }
+    }
+
+    /// Spring config keys bind in the real pipeline: a key one file defines
+    /// at 0.9; a key two profile files define, as they spell it or in its
+    /// relaxed spelling, to the base file's at 0.75; a
+    /// `@ConfigurationProperties` prefix to its shortest key at 0.85; a key
+    /// no file defines to nothing. Upstream lets name matching outrank the
+    /// 0.75 pick, with the first file's key or the binding node itself,
+    /// which is named as its key (KNOWN_DIFFS). The keys hold no values
+    /// (#722).
+    #[test]
+    fn spring_config_keys_bind_to_their_keys() {
+        let project = project_of(&[
+            ("pom.xml", "<project><dependency>spring-boot-starter</dependency></project>\n"),
+            (
+                "src/main/resources/application.yml",
+                "jwt:\n  token-head: Bearer\n  secret: very-secret-value\n  expiration: 3600\napp:\n  cache:\n    ttl: 60\n    name:\n      user-token: u\n",
+            ),
+            (
+                "src/main/resources/application-dev.yml",
+                "jwt:\n  secret: dev-secret-value\n  token-head: Dev\n",
+            ),
+            (
+                "src/main/java/demo/JwtUtil.java",
+                "package demo;\n\n@Component\npublic class JwtUtil {\n    @Value(\"${jwt.tokenHead}\")\n    private String head;\n    @Value(\"${jwt.secret}\")\n    private String secret;\n    @Value(\"${jwt.expiration}\")\n    private long expiration;\n    @Value(\"${jwt.missing:fallback}\")\n    private String missing;\n}\n",
+            ),
+            (
+                "src/main/java/demo/CacheProps.java",
+                "package demo;\n\n@ConfigurationProperties(prefix = \"app.cache\")\npublic class CacheProps {}\n",
+            ),
+        ])
+        .index();
+        let graph = project.graph();
+        let jwt = leaving_file(graph, "src/main/java/demo/JwtUtil.java");
+        let binding = |key: &str| {
+            jwt.iter()
+                .find(|line| {
+                    line.starts_with(&format!(
+                        "constant src/main/java/demo/JwtUtil.java::@Value:{key} "
+                    ))
+                })
+                .cloned()
+                .unwrap_or_default()
+        };
+        assert!(
+            binding("jwt.expiration").contains(
+                "-[references]-> constant jwt.expiration @src/main/resources/application.yml:4"
+            ) && binding("jwt.expiration").ends_with("framework 0.9"),
+            "{jwt:#?}\n{}",
+            graph.report()
+        );
+        assert!(
+            binding("jwt.tokenHead").contains(
+                "-[references]-> constant jwt.token-head @src/main/resources/application.yml:2"
+            ) && binding("jwt.tokenHead").ends_with("framework 0.75"),
+            "{jwt:#?}\n{}",
+            graph.report()
+        );
+        assert!(
+            binding("jwt.secret").contains(
+                "-[references]-> constant jwt.secret @src/main/resources/application.yml:3"
+            ) && binding("jwt.secret").ends_with("framework 0.75"),
+            "{jwt:#?}\n{}",
+            graph.report()
+        );
+        assert!(
+            binding("jwt.missing").contains("-[references]-> ? jwt.missing "),
+            "{jwt:#?}\n{}",
+            graph.report()
+        );
+        let props = leaving_file(graph, "src/main/java/demo/CacheProps.java");
+        assert!(
+            props.iter().any(|line| line.contains(
+                "-[references]-> constant app.cache.ttl @src/main/resources/application.yml:7"
+            ) && line.ends_with("framework 0.85")),
+            "{props:#?}\n{}",
+            graph.report()
+        );
+        // No value is stored in any field of a key.
+        for node in graph
+            .nodes
+            .iter()
+            .filter(|node| node.file_path.ends_with(".yml"))
+        {
+            let text = format!("{node:?}");
+            assert!(
+                !text.contains("secret-value") && !text.contains("Bearer"),
+                "{text}"
+            );
+        }
+    }
+
+    /// Play claims every `X.y` name, but only for the languages it reads: a
+    /// TypeScript file's references resolve in a Play project as in the same
+    /// tree without Play (upstream `frameworksFor`, #2415).
+    #[test]
+    fn play_s_claims_leave_another_language_s_references_as_they_were() {
+        let files = [
+            (
+                "web/app.ts",
+                "import { client } from './client';\n\nexport function run() {\n  client.fetch();\n  Missing.call();\n  return Home.index();\n}\n",
+            ),
+            (
+                "web/client.ts",
+                "export const client = { fetch() { return 1; } };\n",
+            ),
+            (
+                "app/controllers/Home.scala",
+                "package controllers\n\nclass Home {\n  def index(): Int = 1\n}\n",
+            ),
+        ];
+        let with_play = project_of(&files)
+            .file("conf/routes", "GET / controllers.Home.index\n")
+            .index();
+        let without = project_of(&files).index();
+        assert!(detected(&with_play.db()).contains("\"play\""));
+        assert!(!detected(&without.db()).contains("\"play\""));
+        assert_eq!(
+            leaving_file(with_play.graph(), "web/app.ts"),
+            leaving_file(without.graph(), "web/app.ts"),
+            "{}",
+            with_play.graph().report()
+        );
+    }
+}
+
 mod expo_router {
     use super::support::{Graph, Project};
 

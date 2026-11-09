@@ -6510,6 +6510,7 @@ fn index_project_inner(
     codegraph_watch::case_folded::write_marker(&store)?;
     codegraph_watch::lua_modules::write_marker(&store)?;
     codegraph_watch::r_bindings::write_marker(&store)?;
+    codegraph_watch::play_routes::write_marker(&store)?;
     codegraph_watch::dart_heads::write_marker(&store)?;
     codegraph_watch::dart_libraries::write_marker(&store)?;
     finish_phase(&pb, "Persisted nodes");

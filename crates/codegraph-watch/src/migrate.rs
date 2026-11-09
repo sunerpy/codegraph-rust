@@ -284,6 +284,7 @@ pub(crate) fn migrate_project(
     crate::case_folded::write_marker(rebuild.store())?;
     crate::lua_modules::write_marker(rebuild.store())?;
     crate::r_bindings::write_marker(rebuild.store())?;
+    crate::play_routes::write_marker(rebuild.store())?;
     crate::dart_heads::write_marker(rebuild.store())?;
     crate::dart_libraries::write_marker(rebuild.store())?;
 
