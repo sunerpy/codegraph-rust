@@ -87,6 +87,8 @@ struct Caches {
     kotlin_tables: Option<Arc<crate::kotlin_scope::KotlinTables>>,
     /// The Spring config keys for the pass (W7-19c).
     spring_tables: Option<Arc<crate::frameworks::spring::SpringTables>>,
+    /// The Drupal hook implementations for the pass (W7-19d).
+    drupal_tables: Option<Arc<crate::frameworks::drupal::DrupalTables>>,
     scala_tables: Option<Arc<crate::scala_scope::ScalaTables>>,
     csharp_tables: Option<Arc<crate::csharp_types::CsharpTables>>,
     member_tables: Option<Arc<crate::member_types::MemberTables>>,
@@ -160,6 +162,7 @@ impl Caches {
             cpp_namespace_tables: None,
             kotlin_tables: None,
             spring_tables: None,
+            drupal_tables: None,
             scala_tables: None,
             csharp_tables: None,
             member_tables: None,
@@ -232,6 +235,7 @@ impl<'a> StoreResolutionContext<'a> {
         c.cpp_namespace_tables = None;
         c.kotlin_tables = None;
         c.spring_tables = None;
+        c.drupal_tables = None;
         c.scala_tables = None;
         c.csharp_tables = None;
         c.member_tables = None;
@@ -714,6 +718,15 @@ impl ResolutionContext for StoreResolutionContext<'_> {
                 .borrow_mut()
                 .spring_tables
                 .get_or_insert_with(|| Arc::new(crate::frameworks::spring::SpringTables::new())),
+        )
+    }
+
+    fn drupal_tables(&self) -> Arc<crate::frameworks::drupal::DrupalTables> {
+        Arc::clone(
+            self.caches
+                .borrow_mut()
+                .drupal_tables
+                .get_or_insert_with(|| Arc::new(crate::frameworks::drupal::DrupalTables::new())),
         )
     }
 

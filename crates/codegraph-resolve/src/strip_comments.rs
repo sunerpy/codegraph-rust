@@ -303,6 +303,67 @@ pub(crate) fn strip_python_comments_keeping_offsets(content: &str) -> String {
     out
 }
 
+/// [`strip_comments_for_regex`] for PHP with each blanked BYTE but a newline
+/// a space (W7-19d), the way [`strip_js_comments_keeping_offsets`] blanks
+/// JavaScript: a `/* */` comment and a `//` or `#` comment to the end of its
+/// line become spaces, a `'`, `"` or `` ` `` string stays and ends at a
+/// newline, and every byte offset of `content` is an offset of the result.
+/// The scan is `strip_php`'s, byte by byte: every byte it looks for is
+/// ASCII, and a backslash skips the whole character after it.
+pub(crate) fn strip_php_comments_keeping_offsets(content: &str) -> String {
+    let bytes = content.as_bytes();
+    let n = bytes.len();
+    let mut out = String::with_capacity(n);
+    let mut copied = 0;
+    // The offset just past the character that starts at `at`.
+    let next_char = |at: usize| at + content[at..].chars().next().map_or(1, char::len_utf8);
+    let mut i = 0;
+    while i < n {
+        let c = bytes[i];
+        let c2 = bytes.get(i + 1).copied().unwrap_or(0);
+        if c == b'/' && c2 == b'*' {
+            let start = i;
+            i += 2;
+            while i < n && !(bytes[i] == b'*' && bytes.get(i + 1) == Some(&b'/')) {
+                i = next_char(i);
+            }
+            if i < n {
+                i += 2;
+            }
+            blank_into(&mut out, content, &mut copied, start, i, Blanking::Bytes);
+            continue;
+        }
+        if (c == b'/' && c2 == b'/') || c == b'#' {
+            let start = i;
+            while i < n && bytes[i] != b'\n' {
+                i = next_char(i);
+            }
+            blank_into(&mut out, content, &mut copied, start, i, Blanking::Bytes);
+            continue;
+        }
+        if c == b'"' || c == b'\'' || c == b'`' {
+            i += 1;
+            while i < n && bytes[i] != c {
+                if bytes[i] == b'\\' && i + 1 < n {
+                    i = next_char(i + 1);
+                    continue;
+                }
+                if bytes[i] == b'\n' {
+                    break;
+                }
+                i = next_char(i);
+            }
+            if i < n && bytes[i] == c {
+                i += 1;
+            }
+            continue;
+        }
+        i = next_char(i);
+    }
+    out.push_str(&content[copied..]);
+    out
+}
+
 /// How a comment's text is blanked: one space per character, or per byte.
 #[derive(Clone, Copy)]
 enum Blanking {
@@ -1211,6 +1272,42 @@ mod tests {
             None
         );
         assert!(strip_python_comments_keeping_offsets(escaped).starts_with("s = 'a\\é'"));
+    }
+
+    /// W7-19d: the PHP twin blanks what `strip_php` blanks, one space per
+    /// byte: on ASCII text the two agree, and past non-ASCII text in a
+    /// comment every byte offset still holds.
+    #[test]
+    fn php_comments_blanked_byte_for_byte_keep_byte_offsets() {
+        for ascii in [
+            "<?php\n// Route::prefix('old')->group(function () {\nRoute::get('kept', [X::class, 'y']);\n",
+            "<?php\n/* a\n b */ Route::get('/a', 'C@m'); # tail\n",
+            "<?php\n$s = \"it\\\"s // not\"; $t = 'a # b'; $u = `ls # x`;\n",
+            "<?php\n$open = 'never closed\n// next\n",
+            "<?php\n/* never closed\nRoute::get('x');\n",
+            "<?php\n#[Attribute]\nfunction f() {}\n",
+            "<?php\n$e = 'a\\\n// after\n",
+        ] {
+            assert_eq!(
+                strip_php_comments_keeping_offsets(ascii),
+                strip_comments_for_regex(ascii, CommentLang::Php),
+                "{ascii:?}"
+            );
+        }
+        let input = "<?php\n// café — ü 😀\nRoute::get('/é', 'C@m'); /* 日本 */ Route::post('/x', 'D@n');\n";
+        let out = strip_php_comments_keeping_offsets(input);
+        assert_eq!(out.len(), input.len());
+        assert_eq!(out.find("Route::get"), input.find("Route::get"));
+        assert_eq!(out.find("Route::post"), input.find("Route::post"));
+        // A string keeps its text; a comment's goes.
+        assert!(out.contains("'/é'"));
+        assert!(!out.contains('ü') && !out.contains('日') && !out.contains('😀'));
+        assert_eq!(out.matches('\n').count(), input.matches('\n').count());
+        // A backslash in a string skips the whole character after it.
+        let escaped = "<?php $s = 'a\\é' # c\n";
+        let out = strip_php_comments_keeping_offsets(escaped);
+        assert_eq!(out.find('#'), None);
+        assert!(out.starts_with("<?php $s = 'a\\é'"));
     }
 
     #[test]

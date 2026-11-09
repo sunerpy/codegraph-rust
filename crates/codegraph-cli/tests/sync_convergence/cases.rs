@@ -12235,6 +12235,589 @@ pub fn java_play_extension_override_takes_a_controller_out_of_the_jvm() -> Case 
     .edge_before("route conf/routes::GET:/c599", "references", "method C::m")
 }
 
+/// The root `artisan` Laravel is detected by, never indexed.
+const LARAVEL_ARTISAN: &str = "#!/usr/bin/env php\n<?php\n";
+/// A route naming its controller by its namespace path below the
+/// controllers root, and the file that path names.
+const LARAVEL_WEB: &str = "<?php\n\nRoute::get('/users', 'Admin\\UserController@index');\n";
+const LARAVEL_USERS_FILE: &str = "app/Http/Controllers/Admin/UserController.php";
+const LARAVEL_USERS: &str = "<?php\n\nnamespace App\\Http\\Controllers\\Admin;\n\nclass UserController\n{\n    public function index() { return 1; }\n    public function show() { return 2; }\n}\n";
+const LARAVEL_USERS_SHOW: &str = "<?php\n\nnamespace App\\Http\\Controllers\\Admin;\n\nclass UserController\n{\n    public function show() { return 2; }\n}\n";
+const LARAVEL_USERS_ROUTE: &str = "route routes/web.php::route:/users";
+const LARAVEL_USERS_INDEX: &str = "method App\\Http\\Controllers\\Admin::UserController::index";
+const LARAVEL_KERNEL: &str = "<?php\n\nclass Kernel\n{\n}\n";
+
+/// W7-19d: the root `artisan` appears: Laravel is detected, and the route
+/// links to its controller's action.
+pub fn php_laravel_artisan_appears() -> Case {
+    Case::new(Change::ControlFile, &[Language::Php])
+        .file("routes/web.php", LARAVEL_WEB)
+        .file(LARAVEL_USERS_FILE, LARAVEL_USERS)
+        .write("artisan", LARAVEL_ARTISAN)
+        .detected_before("laravel", false)
+        .detected_after("laravel", true)
+        .edge_after(LARAVEL_USERS_ROUTE, "references", LARAVEL_USERS_INDEX)
+}
+
+/// W7-19d: the root `artisan` is deleted.
+pub fn php_laravel_artisan_is_deleted() -> Case {
+    Case::new(Change::ControlFile, &[Language::Php])
+        .file("artisan", LARAVEL_ARTISAN)
+        .file("routes/web.php", LARAVEL_WEB)
+        .file(LARAVEL_USERS_FILE, LARAVEL_USERS)
+        .remove("artisan")
+        .detected_before("laravel", true)
+        .detected_after("laravel", false)
+        .edge_before(LARAVEL_USERS_ROUTE, "references", LARAVEL_USERS_INDEX)
+}
+
+/// W7-19d: `app/Http/Kernel.php`, which detection reads by path whether
+/// indexed or not, appears.
+pub fn php_laravel_kernel_appears() -> Case {
+    Case::new(Change::ControlFile, &[Language::Php])
+        .file("routes/web.php", LARAVEL_WEB)
+        .file(LARAVEL_USERS_FILE, LARAVEL_USERS)
+        .write("app/Http/Kernel.php", LARAVEL_KERNEL)
+        .detected_before("laravel", false)
+        .detected_after("laravel", true)
+        .edge_after(LARAVEL_USERS_ROUTE, "references", LARAVEL_USERS_INDEX)
+}
+
+/// W7-19d: `app/Http/Kernel.php` is deleted.
+pub fn php_laravel_kernel_is_deleted() -> Case {
+    Case::new(Change::ControlFile, &[Language::Php])
+        .file("app/Http/Kernel.php", LARAVEL_KERNEL)
+        .file("routes/web.php", LARAVEL_WEB)
+        .file(LARAVEL_USERS_FILE, LARAVEL_USERS)
+        .remove("app/Http/Kernel.php")
+        .detected_before("laravel", true)
+        .detected_after("laravel", false)
+        .edge_before(LARAVEL_USERS_ROUTE, "references", LARAVEL_USERS_INDEX)
+}
+
+/// W7-19d: the controller gains the action the route names: the route's
+/// `Admin\UserController@index`, waiting under its whole name, links.
+pub fn php_laravel_controller_gains_the_action() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Php])
+        .file("artisan", LARAVEL_ARTISAN)
+        .file("routes/web.php", LARAVEL_WEB)
+        .file(LARAVEL_USERS_FILE, LARAVEL_USERS_SHOW)
+        .write(LARAVEL_USERS_FILE, LARAVEL_USERS)
+        .edge_after(LARAVEL_USERS_ROUTE, "references", LARAVEL_USERS_INDEX)
+}
+
+/// W7-19d: the controller loses the action.
+pub fn php_laravel_controller_loses_the_action() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Php])
+        .file("artisan", LARAVEL_ARTISAN)
+        .file("routes/web.php", LARAVEL_WEB)
+        .file(LARAVEL_USERS_FILE, LARAVEL_USERS)
+        .write(LARAVEL_USERS_FILE, LARAVEL_USERS_SHOW)
+        .edge_before(LARAVEL_USERS_ROUTE, "references", LARAVEL_USERS_INDEX)
+}
+
+/// W7-19d: the controller file the route's namespace path names appears:
+/// the parked route links.
+pub fn php_laravel_controller_file_appears() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Php])
+        .file("artisan", LARAVEL_ARTISAN)
+        .file("routes/web.php", LARAVEL_WEB)
+        .write(LARAVEL_USERS_FILE, LARAVEL_USERS)
+        .edge_after(LARAVEL_USERS_ROUTE, "references", LARAVEL_USERS_INDEX)
+}
+
+/// W7-19d: the controller file is deleted: the route waits again.
+pub fn php_laravel_controller_file_is_deleted() -> Case {
+    Case::new(Change::DeleteImportedModule, &[Language::Php])
+        .file("artisan", LARAVEL_ARTISAN)
+        .file("routes/web.php", LARAVEL_WEB)
+        .file(LARAVEL_USERS_FILE, LARAVEL_USERS)
+        .remove(LARAVEL_USERS_FILE)
+        .edge_before(LARAVEL_USERS_ROUTE, "references", LARAVEL_USERS_INDEX)
+}
+
+/// A route naming its controller by class, which no file under
+/// `app/Http/Controllers/` matches by path: the one controller class of
+/// the name answers.
+const LARAVEL_SHORT: &str = "<?php\n\nRoute::get('/users', [UserController::class, 'index']);\n";
+const LARAVEL_BILLING_FILE: &str = "modules/Billing/Controllers/UserController.php";
+const LARAVEL_BILLING: &str = "<?php\n\nnamespace Modules\\Billing\\Controllers;\n\nclass UserController\n{\n    public function index() { return 2; }\n}\n";
+
+/// W7-19d: a second `UserController` with the action appears in another
+/// `Controllers` directory: of two candidates Laravel takes neither
+/// (KNOWN_DIFFS: upstream takes its store's first).
+pub fn php_laravel_same_named_controller_appears_in_another_controllers_directory() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Php])
+        .file("artisan", LARAVEL_ARTISAN)
+        .file("routes/web.php", LARAVEL_SHORT)
+        .file(LARAVEL_USERS_FILE, LARAVEL_USERS)
+        .write(LARAVEL_BILLING_FILE, LARAVEL_BILLING)
+        .edge_before(LARAVEL_USERS_ROUTE, "references", LARAVEL_USERS_INDEX)
+        .no_edge_after(LARAVEL_USERS_ROUTE, "references", LARAVEL_USERS_INDEX)
+}
+
+/// W7-19d: the second `UserController` goes: the route links again.
+pub fn php_laravel_same_named_controller_leaves_the_other_controllers_directory() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Php])
+        .file("artisan", LARAVEL_ARTISAN)
+        .file("routes/web.php", LARAVEL_SHORT)
+        .file(LARAVEL_USERS_FILE, LARAVEL_USERS)
+        .file(LARAVEL_BILLING_FILE, LARAVEL_BILLING)
+        .remove(LARAVEL_BILLING_FILE)
+        .edge_after(LARAVEL_USERS_ROUTE, "references", LARAVEL_USERS_INDEX)
+}
+
+/// A resource route naming its controller by a namespace path, and the
+/// one controller whose file ends with it.
+const LARAVEL_RESOURCE: &str = "<?php\n\nRoute::resource('photos', 'Media\\PhotoController');\n";
+const LARAVEL_PHOTO_FILE: &str = "app/Http/Controllers/Media/PhotoController.php";
+const LARAVEL_PHOTO: &str =
+    "<?php\n\nnamespace App\\Http\\Controllers\\Media;\n\nclass PhotoController\n{\n}\n";
+const LARAVEL_API_PHOTO_FILE: &str = "app/Http/Controllers/Api/Media/PhotoController.php";
+const LARAVEL_API_PHOTO: &str =
+    "<?php\n\nnamespace App\\Http\\Controllers\\Api\\Media;\n\nclass PhotoController\n{\n}\n";
+const LARAVEL_PHOTOS_ROUTE: &str = "route routes/web.php::route:/photos";
+const LARAVEL_PHOTO_CLASS: &str = "class App\\Http\\Controllers\\Media::PhotoController";
+
+/// W7-19d: a second controller whose file ends with the resource's
+/// `Media\PhotoController` path appears: Laravel takes neither (akaunting's
+/// `Common\Companies`; KNOWN_DIFFS).
+pub fn php_laravel_resource_gains_a_second_path_match() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Php])
+        .file("artisan", LARAVEL_ARTISAN)
+        .file("routes/web.php", LARAVEL_RESOURCE)
+        .file(LARAVEL_PHOTO_FILE, LARAVEL_PHOTO)
+        .write(LARAVEL_API_PHOTO_FILE, LARAVEL_API_PHOTO)
+        .edge_before(LARAVEL_PHOTOS_ROUTE, "imports", LARAVEL_PHOTO_CLASS)
+        .no_edge_after(LARAVEL_PHOTOS_ROUTE, "imports", LARAVEL_PHOTO_CLASS)
+}
+
+/// W7-19d: the second path match goes: the resource imports its
+/// controller again.
+pub fn php_laravel_resource_loses_its_second_path_match() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Php])
+        .file("artisan", LARAVEL_ARTISAN)
+        .file("routes/web.php", LARAVEL_RESOURCE)
+        .file(LARAVEL_PHOTO_FILE, LARAVEL_PHOTO)
+        .file(LARAVEL_API_PHOTO_FILE, LARAVEL_API_PHOTO)
+        .remove(LARAVEL_API_PHOTO_FILE)
+        .edge_after(LARAVEL_PHOTOS_ROUTE, "imports", LARAVEL_PHOTO_CLASS)
+}
+
+/// A routes file the `RouteServiceProvider` mounts, unprefixed or under
+/// `admin`.
+const LARAVEL_ADMIN_ROUTES: &str = "<?php\n\nRoute::get('users', 'Admin\\UserController@index');\n";
+const LARAVEL_PROVIDER_FILE: &str = "app/Providers/RouteServiceProvider.php";
+const LARAVEL_PROVIDER: &str = "<?php\n\nclass RouteServiceProvider\n{\n    public function boot()\n    {\n        Route::middleware('web')->group(base_path('routes/admin.php'));\n    }\n}\n";
+const LARAVEL_PROVIDER_PREFIXED: &str = "<?php\n\nclass RouteServiceProvider\n{\n    public function boot()\n    {\n        Route::middleware('web')->prefix('admin')->group(base_path('routes/admin.php'));\n    }\n}\n";
+const LARAVEL_ADMIN_USERS_ROUTE: &str = "route routes/admin.php::route:/users";
+
+/// W7-19d: the `RouteServiceProvider` mounts its file under a prefix: the
+/// file's route takes it in its name (#2099).
+pub fn php_laravel_route_service_provider_gains_a_prefix() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Php])
+        .file("artisan", LARAVEL_ARTISAN)
+        .file("routes/admin.php", LARAVEL_ADMIN_ROUTES)
+        .file(LARAVEL_USERS_FILE, LARAVEL_USERS)
+        .file(LARAVEL_PROVIDER_FILE, LARAVEL_PROVIDER)
+        .write(LARAVEL_PROVIDER_FILE, LARAVEL_PROVIDER_PREFIXED)
+        .named_before("route", "GET /users")
+        .named_after("route", "GET /admin/users")
+        .edge_throughout(LARAVEL_ADMIN_USERS_ROUTE, "references", LARAVEL_USERS_INDEX)
+}
+
+/// W7-19d: the prefix goes again: the route's name loses it.
+pub fn php_laravel_route_service_provider_loses_its_prefix() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Php])
+        .file("artisan", LARAVEL_ARTISAN)
+        .file("routes/admin.php", LARAVEL_ADMIN_ROUTES)
+        .file(LARAVEL_USERS_FILE, LARAVEL_USERS)
+        .file(LARAVEL_PROVIDER_FILE, LARAVEL_PROVIDER_PREFIXED)
+        .write(LARAVEL_PROVIDER_FILE, LARAVEL_PROVIDER)
+        .named_before("route", "GET /admin/users")
+        .named_after("route", "GET /users")
+}
+
+/// `routes/api.php`, and a Laravel 11 `bootstrap/app.php` mounting only the
+/// web routes (`routes/api.php` is served under `/api`), loading the routes
+/// by code (it keeps its in-file paths), or mounting it under `v2`.
+const LARAVEL_API_ROUTES: &str = "<?php\n\nRoute::get('pages', 'PageController@list');\n";
+const LARAVEL_PAGES_FILE: &str = "app/Http/Controllers/PageController.php";
+const LARAVEL_PAGES: &str = "<?php\n\nnamespace App\\Http\\Controllers;\n\nclass PageController\n{\n    public function list() { return 1; }\n    public function login() { return 2; }\n}\n";
+const LARAVEL_APP_FILE: &str = "bootstrap/app.php";
+const LARAVEL_APP_WEB: &str = "<?php\n\nreturn Application::configure(basePath: dirname(__DIR__))\n    ->withRouting(\n        web: __DIR__.'/../routes/web.php',\n    )\n    ->create();\n";
+const LARAVEL_APP_USING: &str = "<?php\n\nreturn Application::configure(basePath: dirname(__DIR__))\n    ->withRouting(\n        using: function () { RouteLoader::load(); },\n    )\n    ->create();\n";
+const LARAVEL_APP_API_PREFIX: &str = "<?php\n\nreturn Application::configure(basePath: dirname(__DIR__))\n    ->withRouting(\n        api: __DIR__.'/../routes/api.php',\n        apiPrefix: 'v2',\n    )\n    ->create();\n";
+
+/// W7-19d: `withRouting` comes to load the routes by code (`using:`):
+/// `routes/api.php` loses its default `/api`.
+pub fn php_laravel_with_routing_gains_using() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Php])
+        .file("artisan", LARAVEL_ARTISAN)
+        .file("routes/api.php", LARAVEL_API_ROUTES)
+        .file(LARAVEL_PAGES_FILE, LARAVEL_PAGES)
+        .file(LARAVEL_APP_FILE, LARAVEL_APP_WEB)
+        .write(LARAVEL_APP_FILE, LARAVEL_APP_USING)
+        .named_before("route", "GET /api/pages")
+        .named_after("route", "GET /pages")
+}
+
+/// W7-19d: `using:` goes again: `routes/api.php` is served under `/api`.
+pub fn php_laravel_with_routing_loses_using() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Php])
+        .file("artisan", LARAVEL_ARTISAN)
+        .file("routes/api.php", LARAVEL_API_ROUTES)
+        .file(LARAVEL_PAGES_FILE, LARAVEL_PAGES)
+        .file(LARAVEL_APP_FILE, LARAVEL_APP_USING)
+        .write(LARAVEL_APP_FILE, LARAVEL_APP_WEB)
+        .named_before("route", "GET /pages")
+        .named_after("route", "GET /api/pages")
+}
+
+/// W7-19d: `withRouting` mounts `routes/api.php` under its `apiPrefix`.
+pub fn php_laravel_with_routing_gains_an_api_prefix() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Php])
+        .file("artisan", LARAVEL_ARTISAN)
+        .file("routes/api.php", LARAVEL_API_ROUTES)
+        .file(LARAVEL_PAGES_FILE, LARAVEL_PAGES)
+        .file(LARAVEL_APP_FILE, LARAVEL_APP_WEB)
+        .write(LARAVEL_APP_FILE, LARAVEL_APP_API_PREFIX)
+        .named_before("route", "GET /api/pages")
+        .named_after("route", "GET /v2/pages")
+}
+
+/// W7-19d: the `api:` mount and its prefix go again.
+pub fn php_laravel_with_routing_loses_its_api_prefix() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Php])
+        .file("artisan", LARAVEL_ARTISAN)
+        .file("routes/api.php", LARAVEL_API_ROUTES)
+        .file(LARAVEL_PAGES_FILE, LARAVEL_PAGES)
+        .file(LARAVEL_APP_FILE, LARAVEL_APP_API_PREFIX)
+        .write(LARAVEL_APP_FILE, LARAVEL_APP_WEB)
+        .named_before("route", "GET /v2/pages")
+        .named_after("route", "GET /api/pages")
+}
+
+/// A web routes file requiring `auth.php` inside an `auth` prefix group.
+const LARAVEL_WEB_REQUIRING: &str = "<?php\n\nRoute::get('/', 'PageController@list');\nRoute::prefix('auth')->group(function () {\n    require __DIR__.'/auth.php';\n});\n";
+const LARAVEL_AUTH_ROUTES: &str = "<?php\n\nRoute::get('login', 'PageController@login');\n";
+
+/// W7-19d: the routes file an unchanged file requires appears: its route
+/// is served under the group's prefix and links to its action.
+pub fn php_laravel_required_routes_file_appears() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Php])
+        .file("artisan", LARAVEL_ARTISAN)
+        .file("routes/web.php", LARAVEL_WEB_REQUIRING)
+        .file(LARAVEL_PAGES_FILE, LARAVEL_PAGES)
+        .write("routes/auth.php", LARAVEL_AUTH_ROUTES)
+        .named_after("route", "GET /auth/login")
+        .edge_after(
+            "route routes/auth.php::route:/login",
+            "references",
+            "method App\\Http\\Controllers::PageController::login",
+        )
+}
+
+/// W7-19d: the required routes file is deleted.
+pub fn php_laravel_required_routes_file_is_deleted() -> Case {
+    Case::new(Change::DeleteImportedModule, &[Language::Php])
+        .file("artisan", LARAVEL_ARTISAN)
+        .file("routes/web.php", LARAVEL_WEB_REQUIRING)
+        .file(LARAVEL_PAGES_FILE, LARAVEL_PAGES)
+        .file("routes/auth.php", LARAVEL_AUTH_ROUTES)
+        .remove("routes/auth.php")
+        .named_before("route", "GET /auth/login")
+}
+
+/// A Drupal project: the root `composer.json` it is detected by, never
+/// indexed, a routing file's route, and its controller.
+const DRUPAL_COMPOSER: &str = "{\"require\":{\"drupal/core\":\"^10\"}}\n";
+const DRUPAL_COMPOSER_PLAIN: &str = "{\"require\":{\"php\":\">=8.1\"}}\n";
+const DRUPAL_ROUTING_FILE: &str = "modules/greeting/greeting.routing.yml";
+const DRUPAL_ROUTING: &str = "greeting.hello:\n  path: '/hello'\n  defaults:\n    _controller: '\\Drupal\\greeting\\Controller\\GreetingController::hello'\n";
+const DRUPAL_CONTROLLER_FILE: &str = "modules/greeting/src/Controller/GreetingController.php";
+const DRUPAL_CONTROLLER: &str = "<?php\n\nnamespace Drupal\\greeting\\Controller;\n\nclass GreetingController\n{\n    public function hello() { return []; }\n    public function bye() { return []; }\n}\n";
+const DRUPAL_CONTROLLER_BYE: &str = "<?php\n\nnamespace Drupal\\greeting\\Controller;\n\nclass GreetingController\n{\n    public function bye() { return []; }\n}\n";
+const DRUPAL_HELLO_ROUTE: &str = "route modules/greeting/greeting.routing.yml::greeting.hello";
+const DRUPAL_HELLO: &str = "method Drupal\\greeting\\Controller::GreetingController::hello";
+const DRUPAL_BYE: &str = "method Drupal\\greeting\\Controller::GreetingController::bye";
+const DRUPAL_CONTROLLER_CLASS: &str = "class Drupal\\greeting\\Controller::GreetingController";
+const DRUPAL_INFO_FILE: &str = "modules/greeting/greeting.info.yml";
+const DRUPAL_INFO: &str = "name: Greeting\ntype: module\ncore_version_requirement: ^10\n";
+
+/// W7-19d: the root `composer.json` comes to require a `drupal/` package:
+/// Drupal is detected, and the route links to its controller's method.
+pub fn php_drupal_composer_json_gains_a_drupal_dependency() -> Case {
+    Case::new(Change::ControlFile, &[Language::Php, Language::Yaml])
+        .file("composer.json", DRUPAL_COMPOSER_PLAIN)
+        .file(DRUPAL_ROUTING_FILE, DRUPAL_ROUTING)
+        .file(DRUPAL_CONTROLLER_FILE, DRUPAL_CONTROLLER)
+        .write("composer.json", DRUPAL_COMPOSER)
+        .detected_before("drupal", false)
+        .detected_after("drupal", true)
+        .edge_after(DRUPAL_HELLO_ROUTE, "references", DRUPAL_HELLO)
+}
+
+/// W7-19d: the `drupal/` requirement goes.
+pub fn php_drupal_composer_json_drops_its_drupal_dependency() -> Case {
+    Case::new(Change::ControlFile, &[Language::Php, Language::Yaml])
+        .file("composer.json", DRUPAL_COMPOSER)
+        .file(DRUPAL_ROUTING_FILE, DRUPAL_ROUTING)
+        .file(DRUPAL_CONTROLLER_FILE, DRUPAL_CONTROLLER)
+        .write("composer.json", DRUPAL_COMPOSER_PLAIN)
+        .detected_before("drupal", true)
+        .detected_after("drupal", false)
+        .edge_before(DRUPAL_HELLO_ROUTE, "references", DRUPAL_HELLO)
+}
+
+/// W7-19d: a module's `.info.yml`, indexed, appears beside its routing
+/// file: Drupal is detected without a `composer.json`.
+pub fn php_drupal_info_yml_appears() -> Case {
+    Case::new(Change::ControlFile, &[Language::Php, Language::Yaml])
+        .file(DRUPAL_ROUTING_FILE, DRUPAL_ROUTING)
+        .file(DRUPAL_CONTROLLER_FILE, DRUPAL_CONTROLLER)
+        .write(DRUPAL_INFO_FILE, DRUPAL_INFO)
+        .detected_before("drupal", false)
+        .detected_after("drupal", true)
+        .edge_after(DRUPAL_HELLO_ROUTE, "references", DRUPAL_HELLO)
+}
+
+/// W7-19d: the `.info.yml` is deleted.
+pub fn php_drupal_info_yml_is_deleted() -> Case {
+    Case::new(Change::ControlFile, &[Language::Php, Language::Yaml])
+        .file(DRUPAL_INFO_FILE, DRUPAL_INFO)
+        .file(DRUPAL_ROUTING_FILE, DRUPAL_ROUTING)
+        .file(DRUPAL_CONTROLLER_FILE, DRUPAL_CONTROLLER)
+        .remove(DRUPAL_INFO_FILE)
+        .detected_before("drupal", true)
+        .detected_after("drupal", false)
+        .edge_before(DRUPAL_HELLO_ROUTE, "references", DRUPAL_HELLO)
+}
+
+/// W7-19d: the controller class gains the method the route names: the
+/// route moves from the class (0.7) to the method (0.9).
+pub fn php_drupal_controller_gains_the_method() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Php, Language::Yaml])
+        .file("composer.json", DRUPAL_COMPOSER)
+        .file(DRUPAL_ROUTING_FILE, DRUPAL_ROUTING)
+        .file(DRUPAL_CONTROLLER_FILE, DRUPAL_CONTROLLER_BYE)
+        .write(DRUPAL_CONTROLLER_FILE, DRUPAL_CONTROLLER)
+        .edge_before(DRUPAL_HELLO_ROUTE, "references", DRUPAL_CONTROLLER_CLASS)
+        .edge_after(DRUPAL_HELLO_ROUTE, "references", DRUPAL_HELLO)
+}
+
+/// W7-19d: the controller class loses the method: the route falls back
+/// to the class.
+pub fn php_drupal_controller_loses_the_method() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Php, Language::Yaml])
+        .file("composer.json", DRUPAL_COMPOSER)
+        .file(DRUPAL_ROUTING_FILE, DRUPAL_ROUTING)
+        .file(DRUPAL_CONTROLLER_FILE, DRUPAL_CONTROLLER)
+        .write(DRUPAL_CONTROLLER_FILE, DRUPAL_CONTROLLER_BYE)
+        .edge_before(DRUPAL_HELLO_ROUTE, "references", DRUPAL_HELLO)
+        .edge_after(DRUPAL_HELLO_ROUTE, "references", DRUPAL_CONTROLLER_CLASS)
+}
+
+/// Another class of the module, without and with a method named like the
+/// route's.
+const DRUPAL_HELPER_FILE: &str = "modules/greeting/src/Helper.php";
+const DRUPAL_HELPER: &str = "<?php\n\nnamespace Drupal\\greeting;\n\nclass Helper\n{\n}\n";
+const DRUPAL_HELPER_HELLO: &str = "<?php\n\nnamespace Drupal\\greeting;\n\nclass Helper\n{\n    public function hello() { return []; }\n}\n";
+
+/// W7-19d: another class gains a method of the route's method's name: the
+/// route keeps its controller class.
+pub fn php_drupal_another_class_gains_the_method() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Php, Language::Yaml])
+        .file("composer.json", DRUPAL_COMPOSER)
+        .file(DRUPAL_ROUTING_FILE, DRUPAL_ROUTING)
+        .file(DRUPAL_CONTROLLER_FILE, DRUPAL_CONTROLLER_BYE)
+        .file(DRUPAL_HELPER_FILE, DRUPAL_HELPER)
+        .write(DRUPAL_HELPER_FILE, DRUPAL_HELPER_HELLO)
+        .edge_throughout(DRUPAL_HELLO_ROUTE, "references", DRUPAL_CONTROLLER_CLASS)
+        .no_edge_after(
+            DRUPAL_HELLO_ROUTE,
+            "references",
+            "method Drupal\\greeting::Helper::hello",
+        )
+}
+
+/// W7-19d: another class loses its method of the route's method's name:
+/// the route keeps its controller's method.
+pub fn php_drupal_another_class_loses_the_method() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Php, Language::Yaml])
+        .file("composer.json", DRUPAL_COMPOSER)
+        .file(DRUPAL_ROUTING_FILE, DRUPAL_ROUTING)
+        .file(DRUPAL_CONTROLLER_FILE, DRUPAL_CONTROLLER)
+        .file(DRUPAL_HELPER_FILE, DRUPAL_HELPER_HELLO)
+        .write(DRUPAL_HELPER_FILE, DRUPAL_HELPER)
+        .edge_throughout(DRUPAL_HELLO_ROUTE, "references", DRUPAL_HELLO)
+}
+
+/// A second `GreetingController`, in another module, without and with the
+/// route's method.
+const DRUPAL_OTHER_FILE: &str = "modules/other/src/Controller/GreetingController.php";
+const DRUPAL_OTHER: &str =
+    "<?php\n\nnamespace Drupal\\other\\Controller;\n\nclass GreetingController\n{\n}\n";
+const DRUPAL_OTHER_HELLO: &str = "<?php\n\nnamespace Drupal\\other\\Controller;\n\nclass GreetingController\n{\n    public function hello() { return []; }\n}\n";
+const DRUPAL_OTHER_HELLO_METHOD: &str =
+    "method Drupal\\other\\Controller::GreetingController::hello";
+
+/// W7-19d: a second `GreetingController` without the method appears: of
+/// the classes so named only one's file holds it, so the route keeps it
+/// (KNOWN_DIFFS: upstream takes its store's first class).
+pub fn php_drupal_same_named_class_without_the_method_appears() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Php, Language::Yaml])
+        .file("composer.json", DRUPAL_COMPOSER)
+        .file(DRUPAL_ROUTING_FILE, DRUPAL_ROUTING)
+        .file(DRUPAL_CONTROLLER_FILE, DRUPAL_CONTROLLER)
+        .write(DRUPAL_OTHER_FILE, DRUPAL_OTHER)
+        .edge_throughout(DRUPAL_HELLO_ROUTE, "references", DRUPAL_HELLO)
+}
+
+/// W7-19d: a second `GreetingController` with the method appears: two
+/// files hold it, and the route is left unresolved.
+pub fn php_drupal_same_named_class_with_the_method_appears() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Php, Language::Yaml])
+        .file("composer.json", DRUPAL_COMPOSER)
+        .file(DRUPAL_ROUTING_FILE, DRUPAL_ROUTING)
+        .file(DRUPAL_CONTROLLER_FILE, DRUPAL_CONTROLLER)
+        .write(DRUPAL_OTHER_FILE, DRUPAL_OTHER_HELLO)
+        .edge_before(DRUPAL_HELLO_ROUTE, "references", DRUPAL_HELLO)
+        .no_edge_after(DRUPAL_HELLO_ROUTE, "references", DRUPAL_HELLO)
+        .no_edge_after(DRUPAL_HELLO_ROUTE, "references", DRUPAL_OTHER_HELLO_METHOD)
+}
+
+/// W7-19d: the second `GreetingController` with the method goes: the route
+/// links again.
+pub fn php_drupal_same_named_class_with_the_method_goes() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Php, Language::Yaml])
+        .file("composer.json", DRUPAL_COMPOSER)
+        .file(DRUPAL_ROUTING_FILE, DRUPAL_ROUTING)
+        .file(DRUPAL_CONTROLLER_FILE, DRUPAL_CONTROLLER)
+        .file(DRUPAL_OTHER_FILE, DRUPAL_OTHER_HELLO)
+        .remove(DRUPAL_OTHER_FILE)
+        .edge_after(DRUPAL_HELLO_ROUTE, "references", DRUPAL_HELLO)
+}
+
+/// The routing file with a second route, whose `_form` handler names a
+/// form class, and the class.
+const DRUPAL_ROUTING_WITH_FORM: &str = "greeting.hello:\n  path: '/hello'\n  defaults:\n    _controller: '\\Drupal\\greeting\\Controller\\GreetingController::hello'\ngreeting.settings:\n  path: '/admin/greeting'\n  defaults:\n    _form: '\\Drupal\\greeting\\Form\\SettingsForm'\n";
+const DRUPAL_FORM_FILE: &str = "modules/greeting/src/Form/SettingsForm.php";
+const DRUPAL_FORM: &str =
+    "<?php\n\nnamespace Drupal\\greeting\\Form;\n\nclass SettingsForm\n{\n}\n";
+const DRUPAL_SETTINGS_ROUTE: &str =
+    "route modules/greeting/greeting.routing.yml::greeting.settings";
+const DRUPAL_FORM_CLASS: &str = "class Drupal\\greeting\\Form::SettingsForm";
+const DRUPAL_ROUTING_BYE: &str = "greeting.hello:\n  path: '/hello'\n  defaults:\n    _controller: '\\Drupal\\greeting\\Controller\\GreetingController::bye'\n";
+
+/// W7-19d: the routing file gains a route whose `_form` handler names a
+/// class: the route links to it (0.85).
+pub fn php_drupal_routing_file_gains_a_form_route() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Php, Language::Yaml])
+        .file("composer.json", DRUPAL_COMPOSER)
+        .file(DRUPAL_ROUTING_FILE, DRUPAL_ROUTING)
+        .file(DRUPAL_CONTROLLER_FILE, DRUPAL_CONTROLLER)
+        .file(DRUPAL_FORM_FILE, DRUPAL_FORM)
+        .write(DRUPAL_ROUTING_FILE, DRUPAL_ROUTING_WITH_FORM)
+        .edge_after(DRUPAL_SETTINGS_ROUTE, "references", DRUPAL_FORM_CLASS)
+}
+
+/// W7-19d: the form route goes.
+pub fn php_drupal_routing_file_loses_its_form_route() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Php, Language::Yaml])
+        .file("composer.json", DRUPAL_COMPOSER)
+        .file(DRUPAL_ROUTING_FILE, DRUPAL_ROUTING_WITH_FORM)
+        .file(DRUPAL_CONTROLLER_FILE, DRUPAL_CONTROLLER)
+        .file(DRUPAL_FORM_FILE, DRUPAL_FORM)
+        .write(DRUPAL_ROUTING_FILE, DRUPAL_ROUTING)
+        .edge_before(DRUPAL_SETTINGS_ROUTE, "references", DRUPAL_FORM_CLASS)
+        .edge_after(DRUPAL_HELLO_ROUTE, "references", DRUPAL_HELLO)
+}
+
+/// W7-19d: the route's handler comes to name another method of the
+/// controller.
+pub fn php_drupal_route_handler_names_another_method() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Php, Language::Yaml])
+        .file("composer.json", DRUPAL_COMPOSER)
+        .file(DRUPAL_ROUTING_FILE, DRUPAL_ROUTING)
+        .file(DRUPAL_CONTROLLER_FILE, DRUPAL_CONTROLLER)
+        .write(DRUPAL_ROUTING_FILE, DRUPAL_ROUTING_BYE)
+        .edge_before(DRUPAL_HELLO_ROUTE, "references", DRUPAL_HELLO)
+        .edge_after(DRUPAL_HELLO_ROUTE, "references", DRUPAL_BYE)
+}
+
+/// A module's `hook_help` implementation, which references `hook_help`
+/// from its own node, a second module's, and a `hook_help` definition in
+/// an `*.api.php`.
+const DRUPAL_MODULE_FILE: &str = "modules/greeting/greeting.module";
+const DRUPAL_MODULE: &str = "<?php\n\nfunction greeting_help($route_name) {\n  return '';\n}\n";
+const DRUPAL_EXTRA_FILE: &str = "modules/extra/extra.module";
+const DRUPAL_EXTRA: &str = "<?php\n\nfunction extra_help($route_name) {\n  return '';\n}\n";
+const DRUPAL_API_FILE: &str = "modules/greeting/greeting.api.php";
+const DRUPAL_API: &str = "<?php\n\nfunction hook_help($route_name) {\n}\n";
+const DRUPAL_GREETING_HELP: &str = "function greeting_help";
+
+/// W7-19d: a second module implements `hook_help`: of two implementations
+/// Drupal takes neither (KNOWN_DIFFS: upstream takes its store's first).
+pub fn php_drupal_hook_gains_a_second_implementation() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Php])
+        .file("composer.json", DRUPAL_COMPOSER)
+        .file(DRUPAL_MODULE_FILE, DRUPAL_MODULE)
+        .write(DRUPAL_EXTRA_FILE, DRUPAL_EXTRA)
+        .edge_before(DRUPAL_GREETING_HELP, "references", DRUPAL_GREETING_HELP)
+        .no_edge_after(DRUPAL_GREETING_HELP, "references", DRUPAL_GREETING_HELP)
+}
+
+/// W7-19d: the second implementation goes: `hook_help` reaches the one
+/// left (0.75).
+pub fn php_drupal_hook_loses_its_second_implementation() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Php])
+        .file("composer.json", DRUPAL_COMPOSER)
+        .file(DRUPAL_MODULE_FILE, DRUPAL_MODULE)
+        .file(DRUPAL_EXTRA_FILE, DRUPAL_EXTRA)
+        .remove(DRUPAL_EXTRA_FILE)
+        .edge_after(DRUPAL_GREETING_HELP, "references", DRUPAL_GREETING_HELP)
+}
+
+/// W7-19d: a `hook_help` definition appears in an `*.api.php`: name
+/// matching's exact `0.9` outranks the implementation Drupal gives (0.75),
+/// though the reference it moves was resolved.
+pub fn php_drupal_hook_definition_appears() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Php])
+        .file("composer.json", DRUPAL_COMPOSER)
+        .file(DRUPAL_MODULE_FILE, DRUPAL_MODULE)
+        .write(DRUPAL_API_FILE, DRUPAL_API)
+        .edge_before(DRUPAL_GREETING_HELP, "references", DRUPAL_GREETING_HELP)
+        .edge_after(DRUPAL_GREETING_HELP, "references", "function hook_help")
+}
+
+/// W7-19d: the definition is deleted: `hook_help` reaches the
+/// implementation again.
+pub fn php_drupal_hook_definition_is_deleted() -> Case {
+    Case::new(Change::DeleteImportedModule, &[Language::Php])
+        .file("composer.json", DRUPAL_COMPOSER)
+        .file(DRUPAL_MODULE_FILE, DRUPAL_MODULE)
+        .file(DRUPAL_API_FILE, DRUPAL_API)
+        .remove(DRUPAL_API_FILE)
+        .edge_before(DRUPAL_GREETING_HELP, "references", "function hook_help")
+        .edge_after(DRUPAL_GREETING_HELP, "references", DRUPAL_GREETING_HELP)
+}
+
+/// W7-19d: in a Drupal project, a class named like a PHP `use` import's
+/// last segment appears: the import stays unresolved, as Drupal's handler
+/// rules answer a routing file's references only (KEEP-RUST).
+pub fn php_drupal_use_import_stays_unresolved_when_its_last_segment_appears() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Php])
+        .file("composer.json", DRUPAL_COMPOSER)
+        .file(
+            "src/A.php",
+            "<?php\n\nnamespace App;\n\nuse Foo\\Bar;\n\nclass A\n{\n    public function f() { return 1; }\n}\n",
+        )
+        .write("src/B.php", "<?php\n\nnamespace Baz;\n\nclass Bar\n{\n}\n")
+        .detected_after("drupal", true)
+        .no_edge_after("namespace App", "imports", "class Baz::Bar")
+}
+
 /// W7-03: a `nuxt.config.ts` appears in a Vue app (upstream #2130): Nuxt is
 /// detected, and its `pages/` become routes served by their components.
 pub fn vue_nuxt_config_appears() -> Case {

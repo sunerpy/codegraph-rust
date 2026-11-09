@@ -37,7 +37,7 @@ deterministic strategies — import resolution (`import-resolver.ts`) and name
 matching (`name-matcher.ts`) — orchestrated by `ReferenceResolver`
 (`index.ts`), plus concrete `FrameworkResolver` implementations behind the
 `FrameworkResolver` trait EXTENSION POINT (`crates/codegraph-resolve/src/framework.rs`):
-Express, NestJS, React, Vue, Godot, Tauri, Nuxt, React Router, TanStack Router,
+Laravel, Drupal, Express, NestJS, React, Vue, Godot, Tauri, Nuxt, React Router, TanStack Router,
 Next.js, Svelte, SvelteKit, Vue Router, Angular Router, Astro, Django, Flask,
 FastAPI, Spring, Play, Expo Router and GoFrame (`crates/codegraph-resolve/src/frameworks/`), detected per-project by
 `detect_frameworks`. The other colby resolvers stay deferred. The following
@@ -45,7 +45,7 @@ colby behaviors are intentionally NOT ported in v1:
 
 - **The other framework-specific resolvers** — every concrete `FrameworkResolver`
   in `reference/colby/src/resolution/frameworks/**` EXCEPT those above:
-  Drupal `routing.yml`, React Native / Expo / Fabric bridges,
+  React Native / Expo / Fabric bridges,
   Swift↔ObjC bridging, and the Go-module / Ruby / C# route
   extractors. These are an additive heuristic layer; on a project where none
   of them is detected the orchestrator holds an empty resolver list, so
@@ -584,6 +584,43 @@ regex engine), is not listed.
   `play-java-websocket-example`, and `play-scala-tls-example`'s `GET /`, whose
   three nearest `HomeController`s tie, to `play-scala-anorm-example`'s
   (`frameworks/play.rs`, `resolver.rs`).
+- **Laravel and Drupal take one candidate (W7-19d).** Where colby takes the
+  first of several candidates in its store's order, Laravel and Drupal take
+  the only one and answer nothing for several: a `Controller@action`'s
+  method among the files of the controller classes so named (those whose
+  file ends with a written namespace path first), a resource route's
+  controller among the classes whose file ends with its path (akaunting's
+  `Common\Companies` is both `Common/Companies.php` and
+  `Api/Common/Companies.php`, and its two routes files mean one each), a
+  Drupal routing file's bare namespaced class, and a `hook_X`'s
+  implementation. Of several Drupal controller classes of a handler's name,
+  Drupal takes the only one whose file holds the method, where colby takes
+  its first class and, when that file lacks the method, the class itself
+  (`frameworks/laravel.rs`, `frameworks/drupal.rs`).
+- **Laravel and Drupal candidates are PHP's (W7-19d).** Laravel's
+  controller classes, Drupal's handler classes and its hook
+  implementations are PHP classes and functions; colby takes them in any
+  language, a Pascal `.inc` file's functions among the hook
+  implementations (`frameworks/laravel.rs`, `frameworks/drupal.rs`).
+- **Laravel's and Drupal's claims read the reference (W7-19d).** colby's
+  claims take `Controller@action`, namespaced class names, `Class::method`
+  and `hook_X` past the name prefilter wherever they are written, so every
+  PHP `use Foo\Bar;` reaches its resolvers, and Drupal's namespaced-class
+  rule links it at `0.85` to any project class `Bar`, in any namespace,
+  which no sync then revisits when such a class comes or goes. Laravel
+  claims only a Laravel route's references, Drupal only a routing file's
+  and the `hook_X` names, and Drupal's handler rules answer only a routing
+  file's references; a `use` import stays import resolution's
+  (`frameworks/laravel.rs`, `frameworks/drupal.rs`, `resolver.rs`).
+- **A Drupal routing handler is Drupal's alone (W7-19d).** A routing file's
+  reference takes no other strategy's answer, so a handler Drupal answers
+  nothing for stays unresolved. colby lets the other strategies answer it:
+  without this rule instance-method matching linked four of drupal/drupal's
+  `_entity_form: <entity type>.<operation>` routes to an entity class's
+  method named for the operation (`menu.delete` to `Menu::delete()`, and
+  `filter_format.disable`, `image_style.flush`, `entity_form_mode.delete`
+  alike), where the route serves the entity type's form handler
+  (`frameworks/drupal.rs`, `resolver.rs`).
 - **Dart named constructors (#2380).** A named constructor, indexed as a
   method, is reached only by a call written through its class (`Foo.value(2)`).
   A call through a value of that type (a typed parameter or local, a chain's
@@ -885,7 +922,12 @@ depth for the same reason (`lua_scope.rs`).
   only (`import_resolver.rs`).
 - **PHP.** A class name reference is recorded by its last segment and its
   written name read back from the source; a rooted `\strlen()` keeps its `\`
-  and resolves as `strlen` (`php_scope.rs`, `import_resolver.rs`).
+  and resolves as `strlen` (`php_scope.rs`, `import_resolver.rs`). A Laravel
+  route's handler class sits at the route's column 0 under the name colby's
+  extraction gives it: a simple name is read as written, through the routes
+  file's `use` imports and namespace as colby reads it, and a namespaced one
+  (a string handler without `@`, relative to the controllers root) reaches
+  no class (`php_scope.rs`).
 - **Dart libraries.** Only an indexed file's directives are read, a URI whose
   path leaves the project names nothing, an export chain is followed at most 64
   libraries deep (colby recurses without a bound), and a field's initializer is
@@ -926,3 +968,13 @@ a sync rebuilds or removes re-resolves every reference a key can bind, since a
 relaxed spelling or a second profile file moves a binding without touching
 its name, and a class or action a sync adds, removes or moves into another
 language re-resolves the routes lines naming it (`play_routes_version`).
+So do Laravel's controllers and Drupal's handlers and hooks (W7-19d): a
+class or method name a sync adds to or removes from a controller file (a
+path holding `Controllers`) re-resolves the Laravel route references naming
+its class or file (`laravel_routes_version`), and one a sync adds to or
+removes from any PHP file re-resolves the routing files' handlers naming
+the file's classes, a hook function that comes or goes every `hook_X` it
+answers, and a node named `hook_X` that comes or goes the resolved
+references of that name (`drupal_refs_version`). Laravel's route names need
+no lane: every sync recomputes them from their qualified names, as colby's
+does, so a mount that goes away is undone in both.

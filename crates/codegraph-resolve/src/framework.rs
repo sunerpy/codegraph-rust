@@ -131,6 +131,15 @@ pub trait FrameworkResolver: Sync {
         false
     }
 
+    /// Whether `reference` passes the name-exists pre-filter by this
+    /// resolver's claim: by default whenever it claims the reference's name
+    /// ([`Self::claims_reference`]). A resolver whose names other extractors
+    /// write too narrows its claim to the references it extracts (Laravel,
+    /// Drupal: W7-19d).
+    fn claims(&self, reference: &RefView) -> bool {
+        self.claims_reference(&reference.reference_name)
+    }
+
     /// Extract this `FrameworkResolver`'s nodes + references from a file
     /// (`extract?`, `types.ts:174-182`). `None` when the resolver has no
     /// per-file extraction.

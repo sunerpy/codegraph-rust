@@ -271,6 +271,10 @@ impl ResolutionContext for ViewContext<'_, '_> {
         self.store.spring_tables()
     }
 
+    fn drupal_tables(&self) -> Arc<crate::frameworks::drupal::DrupalTables> {
+        self.store.drupal_tables()
+    }
+
     fn scala_tables(&self) -> Arc<crate::scala_scope::ScalaTables> {
         self.store.scala_tables()
     }

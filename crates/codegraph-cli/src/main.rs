@@ -6489,8 +6489,8 @@ fn index_project_inner(
     // Ruby (W4-RB-01), CFML (W4-CF-01), Swift (W4-SW-01), Objective-C
     // (W4-SW-04), Go (W4-GO-01), Rust receiver (W4-RS-03), PHP
     // (W4-PHP-01), case-folded (W4-PHP-03), Lua (W4-LUA-01), R base-binding
-    // (W4-R-01), Dart head (W4-DART-01) or Dart library (W4-DART-02)
-    // dependent unrefreshed.
+    // (W4-R-01), Dart head (W4-DART-01), Dart library (W4-DART-02), Play
+    // (W7-19c), Laravel or Drupal (W7-19d) dependent unrefreshed.
     codegraph_watch::cpp_dependents::write_marker(&store)?;
     codegraph_watch::java_heads::write_marker(&store)?;
     codegraph_watch::kotlin_surfaces::write_marker(&store)?;
@@ -6511,6 +6511,8 @@ fn index_project_inner(
     codegraph_watch::lua_modules::write_marker(&store)?;
     codegraph_watch::r_bindings::write_marker(&store)?;
     codegraph_watch::play_routes::write_marker(&store)?;
+    codegraph_watch::laravel_routes::write_marker(&store)?;
+    codegraph_watch::drupal_refs::write_marker(&store)?;
     codegraph_watch::dart_heads::write_marker(&store)?;
     codegraph_watch::dart_libraries::write_marker(&store)?;
     finish_phase(&pb, "Persisted nodes");

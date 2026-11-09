@@ -54,6 +54,15 @@
     "size": 149
   },
   {
+    "content_hash": "d6e19191fd85dff719ef801e3d768f6fda8e535bdf810f3271c76931f6ec8078",
+    "errors": null,
+    "generated": 0,
+    "language": "yaml",
+    "node_count": 0,
+    "path": "drupal/modules/custom/greeting/greeting.info.yml",
+    "size": 58
+  },
+  {
     "content_hash": "311f723ef7849faeda1acdd84a1a8e0106110bdf1404a38be385b7a7355e8c3a",
     "errors": null,
     "generated": 0,

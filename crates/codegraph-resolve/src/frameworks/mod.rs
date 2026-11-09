@@ -1,7 +1,8 @@
 //! Concrete [`FrameworkResolver`] implementations + the detection registry.
 //!
 //! Ports the subset of `upstream resolution/frameworks/` that this port
-//! ships: Express ([`express`]), React ([`react`]), React Router
+//! ships: Laravel ([`laravel`]), Drupal ([`drupal`]), Express
+//! ([`express`]), React ([`react`]), React Router
 //! ([`react_router`]), TanStack Router ([`tanstack_router`]), Next.js
 //! ([`nextjs`]), Svelte and SvelteKit ([`svelte`], [`sveltekit_router`]),
 //! Vue Router ([`vue_router`]), Angular Router ([`angular_router`]), Astro
@@ -19,6 +20,7 @@
 
 pub mod angular_router;
 pub mod astro;
+pub mod drupal;
 pub mod expo_router;
 pub mod express;
 pub mod godot;
@@ -30,6 +32,7 @@ pub(crate) mod godot_scene;
 pub mod godot_script;
 pub mod goframe;
 pub(crate) mod js_scan;
+pub mod laravel;
 pub(crate) mod lazy_loader;
 pub(crate) mod name_heuristic;
 pub mod nestjs;
@@ -63,7 +66,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// Strategy 1 asks these in order: the first to return `>= 0.9` wins, and
 /// among lower answers the most confident, the earlier on a tie. Each port
 /// sits where upstream's `FRAMEWORK_RESOLVERS` puts it relative to its
-/// ported neighbours (Express before NestJS, Astro between Angular Router
+/// ported neighbours (Laravel and Drupal first, Express before NestJS, Astro
+/// between Angular Router
 /// and Expo Router, the Python frameworks after Astro, Spring and Play after
 /// them); the entries already
 /// here keep their places. A port
@@ -71,8 +75,21 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// it answers below `0.9`, or only for references they do not claim.
 pub fn detect_frameworks(context: &dyn ResolutionContext) -> Vec<Box<dyn FrameworkResolver>> {
     let candidates: Vec<Box<dyn FrameworkResolver>> = vec![
+        // Laravel's routes, mounts and controllers (#2099, #2271), then
+        // Drupal's routing files and hooks (#271), first as upstream
+        // registers them. They read only PHP references (Drupal YAML's too).
+        // Of the resolvers after them only the language-agnostic Godot
+        // (GDScript's references), Nuxt (its own routes' `calls`) and Astro
+        // (`Astro.*`, `astro:*`), and Spring and Play (Java and Kotlin
+        // bindings, Play routes files) read such a reference, and none of
+        // them answers one of these, so their place changes no other
+        // reference's resolution. A PHP reference both answer (a namespaced
+        // resource controller, `C::m`) gets the same result in either of
+        // their orders under Strategy 1.
+        Box::new(laravel::LaravelResolver),
+        Box::new(drupal::DrupalResolver),
         // Express routes and mounts (#1957, #2200, #2243, #2244, #2261),
-        // first as upstream registers it. Its three name patterns answer
+        // next as upstream registers it. Its three name patterns answer
         // `0.8` or `0.85`, never `>= 0.9`, and only with a declaration of the
         // reference's own file: ahead of the others it decides a reference
         // only on a confidence tie, as upstream's order does.

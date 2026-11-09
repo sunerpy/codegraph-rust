@@ -522,6 +522,15 @@ persisted, and withdrawn with the others before a sync's first change. A sync
 that finds it missing or at another version re-resolves every Play routes file.
 It is not a canonical surface.
 
+The Laravel and Drupal lanes store no rows either, only their markers:
+`laravel_routes_version` (1) and `drupal_refs_version` (1) are written by a full
+index, a migration and every sync whose resolution is persisted, and withdrawn
+with the others before a sync's first change. A sync that finds
+`laravel_routes_version` missing or at another version re-resolves every file
+holding a Laravel route's reference, and one that so finds `drupal_refs_version`
+every Drupal routing file and every file holding a `hook_X` reference. They are
+not a canonical surface.
+
 `synthesis_version` (17) vouches that the synthesized edges are the synthesis
 stage's output over the current base graph and the files it read beside the
 index. A full index and a migration write it after the stage. A sync withdraws
