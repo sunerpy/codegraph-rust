@@ -22510,6 +22510,162 @@ mod php_frameworks {
     }
 }
 
+mod ruby_frameworks {
+    use super::support::{Graph, Indexed, Project, project_metadata_with_prefix};
+
+    fn project_of(files: &[(&str, &str)]) -> Project {
+        files.iter().fold(Project::new(), |project, (path, text)| {
+            project.file(path, text)
+        })
+    }
+
+    /// The frameworks the index records as detected.
+    fn detected(db: &std::path::Path) -> String {
+        project_metadata_with_prefix(db, "frameworks_detected")
+            .into_iter()
+            .map(|(_, value)| value)
+            .collect()
+    }
+
+    const GEMFILE: (&str, &str) = (
+        "Gemfile",
+        "source \"https://rubygems.org\"\ngem \"rails\", \"~> 7.1\"\n",
+    );
+
+    /// A Rails project of `files` beside upstream's `Gemfile`.
+    fn rails(files: &[(&str, &str)]) -> Indexed {
+        let mut all = vec![GEMFILE];
+        all.extend_from_slice(files);
+        let project = project_of(&all).index();
+        assert!(
+            detected(&project.db()).contains("\"rails\""),
+            "{}",
+            detected(&project.db())
+        );
+        project
+    }
+
+    /// Every route's name, sorted.
+    fn route_names(graph: &Graph) -> Vec<String> {
+        let mut out: Vec<String> = graph
+            .nodes
+            .iter()
+            .filter(|node| node.kind == "route")
+            .map(|node| node.name.clone())
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// Upstream's `handlerOf`: the file of what the route named `name`
+    /// references, `""` when it references nothing, `None` with no such
+    /// route.
+    fn handler_of(graph: &Graph, name: &str) -> Option<String> {
+        let route = graph
+            .nodes
+            .iter()
+            .find(|node| node.kind == "route" && node.name == name)?;
+        Some(
+            graph
+                .edges
+                .iter()
+                .find(|edge| edge.source == route.id && edge.kind == "references")
+                .and_then(|edge| graph.node(&edge.target))
+                .map_or(String::new(), |target| target.file_path.clone()),
+        )
+    }
+
+    /// Upstream #2155 (`rails-scoped-routes.test.ts`): a routes file is read
+    /// with its blocks, an engine's routes count, and a namespaced route
+    /// reaches its own module's controller.
+    #[test]
+    fn pr2155_routes_are_read_with_their_nesting() {
+        let project = rails(&[
+            (
+                "backend/config/routes.rb",
+                "Spree::Core::Engine.routes.draw do\n  namespace :admin do\n    get \"/search/users\", to: \"search#users\", as: :search_users\n    resources :zones, only: [\n      :index,\n      :show\n    ]\n    resources :products do\n      resources :images\n      member do\n        get :preview\n      end\n      collection do\n        post :update_positions\n      end\n    end\n  end\n  scope \"/v2\", module: \"api\" do\n    resource :account, only: [:show]\n  end\n  root to: \"home#index\"\nend\n",
+            ),
+            (
+                "backend/app/controllers/spree/admin/zones_controller.rb",
+                "module Spree\n  module Admin\n    class ZonesController < ResourceController\n      def show; end\n    end\n  end\nend\n",
+            ),
+            (
+                "api/app/controllers/spree/api/zones_controller.rb",
+                "module Spree\n  module Api\n    class ZonesController < BaseController\n      def index; end\n      def show; end\n    end\n  end\nend\n",
+            ),
+            (
+                "backend/app/controllers/spree/admin/products_controller.rb",
+                "module Spree\n  module Admin\n    class ProductsController < ResourceController\n      def preview; end\n      def update_positions; end\n    end\n  end\nend\n",
+            ),
+        ]);
+        let graph = project.graph();
+        let names = route_names(graph);
+        for name in [
+            "GET /admin/search/users",
+            "GET /admin/zones",
+            "GET /admin/zones/:id",
+            "GET /admin/products/:product_id/images",
+            "GET /admin/products/:id/preview",
+            "POST /admin/products/update_positions",
+            "GET /v2/account",
+            "GET /",
+        ] {
+            assert!(names.iter().any(|found| found == name), "{name}: {names:?}");
+        }
+        // `only:` written across lines still limits the actions.
+        assert!(!names.iter().any(|found| found == "DELETE /admin/zones/:id"));
+        assert_eq!(
+            handler_of(graph, "GET /admin/zones/:id").as_deref(),
+            Some("backend/app/controllers/spree/admin/zones_controller.rb"),
+            "{}",
+            graph.report()
+        );
+        // The admin controller inherits `index`; the API's `index` is not it.
+        assert_eq!(
+            handler_of(graph, "GET /admin/zones").as_deref(),
+            Some(""),
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            handler_of(graph, "GET /admin/products/:id/preview").as_deref(),
+            Some("backend/app/controllers/spree/admin/products_controller.rb")
+        );
+    }
+
+    /// Upstream #2269 (`rails-only-except-forms.test.ts`): a resource's
+    /// `only:` and `except:` are read however Rails lets them be written.
+    #[test]
+    fn pr2269_only_and_except_are_read_in_every_form() {
+        let project = rails(&[(
+            "config/routes.rb",
+            "Rails.application.routes.draw do\n  resources :family_exports, only: %i[new create index] do\n    member do\n      get :download\n    end\n  end\n  resources :tags, except: %w(destroy edit update)\n  resources :imports, :only => [:index, :show]\n  resource :session, only: \"show\"\nend\n",
+        )]);
+        let graph = project.graph();
+        let actions = |controller: &str| {
+            let mut found: Vec<String> = graph
+                .nodes
+                .iter()
+                .filter(|node| node.kind == "route")
+                .filter(|node| node.qualified_name.contains(&format!("{controller}#")))
+                .map(|node| {
+                    let at = node.qualified_name.rfind('#').expect("an action");
+                    node.qualified_name[at + 1..].to_string()
+                })
+                .collect();
+            found.sort();
+            found
+        };
+        assert_eq!(
+            actions("family_exports"),
+            ["create", "download", "index", "new"]
+        );
+        assert_eq!(actions("tags"), ["create", "index", "new", "show"]);
+        assert_eq!(actions("imports"), ["index", "show"]);
+        assert_eq!(actions("sessions"), ["show"]);
+    }
+}
+
 mod expo_router {
     use super::support::{Graph, Project};
 

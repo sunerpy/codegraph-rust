@@ -564,10 +564,12 @@ fn incremental_sync_on_outdated_v2_forces_all_files() {
         play_marker(&IndexPaths::resolve(&peer, None).expect("resolve peer v2 paths")),
         "a forced migration must write the Play routes marker of `index --force`"
     );
-    // The Laravel and Drupal lane markers (W7-19d), likewise.
+    // The Laravel and Drupal lane markers (W7-19d) and the Rails one
+    // (W7-19e), likewise.
     for (prefix, key) in [
         ("laravel_routes", "laravel_routes_version"),
         ("drupal_refs", "drupal_refs_version"),
+        ("rails_routes", "rails_routes_version"),
     ] {
         let marker = |paths: &IndexPaths| {
             Store::open_for_read(paths, deadline(), || false)
@@ -2006,6 +2008,7 @@ fn outdated_migration_writes_the_control_rows_of_index_force() {
             "control_inputs:jvm",
             "control_inputs:php",
             "control_inputs:python",
+            "control_inputs:ruby",
             "control_inputs:rust",
             "control_inputs_version",
             "frameworks_detected",
@@ -2027,8 +2030,11 @@ fn outdated_migration_writes_the_control_rows_of_index_force() {
         (4, "\"app/Http/Kernel.php\":null"),
         // A digest, where the seven absent root files record null.
         (5, "\"requirements.txt\":\""),
-        (6, "\"Cargo.toml\""),
-        (8, "\"react\""),
+        // Rails' four root files, all absent.
+        (6, "\"Gemfile\":null"),
+        (6, "\"config/routes.rb\":null"),
+        (7, "\"Cargo.toml\""),
+        (9, "\"react\""),
     ] {
         assert!(
             migrated[row].1.contains(input),

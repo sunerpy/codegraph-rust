@@ -1,6 +1,7 @@
 //! A file's source and its comment-stripped text, byte for byte aligned
 //! (W7-19a's Express text, shared with the Python frameworks in W7-19b,
-//! with Spring in W7-19c and with Laravel in W7-19d).
+//! with Spring in W7-19c, with Laravel in W7-19d and with Rails in
+//! W7-19e).
 //!
 //! Upstream strips comments one space per UTF-16 code unit and measures
 //! columns, match lengths and windows in code units; the strippers here
@@ -13,6 +14,7 @@ use std::cell::OnceCell;
 use crate::strip_comments::{
     strip_java_comments_keeping_offsets, strip_js_comments_keeping_offsets,
     strip_php_comments_keeping_offsets, strip_python_comments_keeping_offsets,
+    strip_ruby_comments_keeping_offsets,
 };
 
 /// A file's source and its comment-stripped text, byte for byte aligned.
@@ -53,6 +55,11 @@ impl<'a> OffsetText<'a> {
     /// PHP source ([`strip_php_comments_keeping_offsets`]).
     pub(crate) fn php(content: &'a str) -> Self {
         Self::new(content, strip_php_comments_keeping_offsets(content))
+    }
+
+    /// Ruby source ([`strip_ruby_comments_keeping_offsets`]).
+    pub(crate) fn ruby(content: &'a str) -> Self {
+        Self::new(content, strip_ruby_comments_keeping_offsets(content))
     }
 
     /// `start..end` of the stripped text as upstream's holds it: a blanked

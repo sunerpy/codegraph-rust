@@ -6,11 +6,11 @@
 //! ([`react_router`]), TanStack Router ([`tanstack_router`]), Next.js
 //! ([`nextjs`]), Svelte and SvelteKit ([`svelte`], [`sveltekit_router`]),
 //! Vue Router ([`vue_router`]), Angular Router ([`angular_router`]), Astro
-//! ([`astro`]), Django, Flask and FastAPI ([`python`]), Spring ([`spring`]),
-//! Play ([`play`]), Expo Router ([`expo_router`]), Vue and Nuxt ([`vue`]),
-//! NestJS ([`nestjs`]), Godot
-//! ([`godot`]), Tauri ([`tauri`]) and GoFrame ([`goframe`]). The other
-//! upstream resolvers remain deferred (see `KNOWN_DIFFS.md`).
+//! ([`astro`]), Django, Flask and FastAPI ([`python`]), Rails ([`rails`]),
+//! Spring ([`spring`]), Play ([`play`]), Expo Router ([`expo_router`]), Vue
+//! and Nuxt ([`vue`]), NestJS ([`nestjs`]), Godot ([`godot`]), Tauri
+//! ([`tauri`]) and GoFrame ([`goframe`]). The other upstream resolvers
+//! remain deferred (see `KNOWN_DIFFS.md`).
 //!
 //! [`detect_frameworks`] ports `frameworks/index.ts:detectFrameworks` restricted
 //! to the ported resolvers; the orchestrator hands the detected list to
@@ -42,6 +42,7 @@ pub mod package_deps;
 pub(crate) mod page_component;
 pub mod play;
 pub mod python;
+pub mod rails;
 pub mod react;
 pub mod react_router;
 pub(crate) mod react_tables;
@@ -153,6 +154,12 @@ pub fn detect_frameworks(context: &dyn ResolutionContext) -> Vec<Box<dyn Framewo
         Box::new(python::DjangoResolver),
         Box::new(python::FlaskResolver),
         Box::new(python::FastapiResolver),
+        // Rails' routes and conventions (#2155, #2269), after the Python
+        // frameworks and before Spring as upstream registers them. It reads
+        // only Ruby references, which no resolver above resolves (Godot reads
+        // GDScript's, Astro answers only its own names), so its place
+        // changes no other reference's resolution.
+        Box::new(rails::RailsResolver),
         // Spring's routes, config keys and conventions, then Play's routes
         // (#2222, #2156), after the Python frameworks as upstream registers
         // them. Of the resolvers above only the language-agnostic Godot

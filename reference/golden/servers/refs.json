@@ -402,6 +402,66 @@
   {
     "candidates": null,
     "col": 0,
+    "file_path": "rails/config/routes.rb",
+    "from_node_id": "route:rails/config/routes.rb:4:GET:/admin/reports/:id/edit:admin/reports#edit",
+    "language": "ruby",
+    "line": 4,
+    "reference_kind": "references",
+    "reference_name": "admin/reports#edit"
+  },
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "rails/config/routes.rb",
+    "from_node_id": "route:rails/config/routes.rb:4:GET:/admin/reports/:id:admin/reports#show",
+    "language": "ruby",
+    "line": 4,
+    "reference_kind": "references",
+    "reference_name": "admin/reports#show"
+  },
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "rails/config/routes.rb",
+    "from_node_id": "route:rails/config/routes.rb:4:GET:/admin/reports/new:admin/reports#new",
+    "language": "ruby",
+    "line": 4,
+    "reference_kind": "references",
+    "reference_name": "admin/reports#new"
+  },
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "rails/config/routes.rb",
+    "from_node_id": "route:rails/config/routes.rb:4:PATCH:/admin/reports/:id:admin/reports#update",
+    "language": "ruby",
+    "line": 4,
+    "reference_kind": "references",
+    "reference_name": "admin/reports#update"
+  },
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "rails/config/routes.rb",
+    "from_node_id": "route:rails/config/routes.rb:4:POST:/admin/reports:admin/reports#create",
+    "language": "ruby",
+    "line": 4,
+    "reference_kind": "references",
+    "reference_name": "admin/reports#create"
+  },
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "rails/config/routes.rb",
+    "from_node_id": "route:rails/config/routes.rb:6:GET:/health:health#show",
+    "language": "ruby",
+    "line": 6,
+    "reference_kind": "references",
+    "reference_name": "health#show"
+  },
+  {
+    "candidates": null,
+    "col": 0,
     "file_path": "spring/src/main/java/com/example/users/UserController.java",
     "from_node_id": "class:6ec3aacfa8e83a050de08024bb99c1f7",
     "language": "java",

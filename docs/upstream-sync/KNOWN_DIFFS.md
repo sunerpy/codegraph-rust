@@ -39,14 +39,14 @@ matching (`name-matcher.ts`) — orchestrated by `ReferenceResolver`
 `FrameworkResolver` trait EXTENSION POINT (`crates/codegraph-resolve/src/framework.rs`):
 Laravel, Drupal, Express, NestJS, React, Vue, Godot, Tauri, Nuxt, React Router, TanStack Router,
 Next.js, Svelte, SvelteKit, Vue Router, Angular Router, Astro, Django, Flask,
-FastAPI, Spring, Play, Expo Router and GoFrame (`crates/codegraph-resolve/src/frameworks/`), detected per-project by
+FastAPI, Rails, Spring, Play, Expo Router and GoFrame (`crates/codegraph-resolve/src/frameworks/`), detected per-project by
 `detect_frameworks`. The other colby resolvers stay deferred. The following
 colby behaviors are intentionally NOT ported in v1:
 
 - **The other framework-specific resolvers** — every concrete `FrameworkResolver`
   in `reference/colby/src/resolution/frameworks/**` EXCEPT those above:
   React Native / Expo / Fabric bridges,
-  Swift↔ObjC bridging, and the Go-module / Ruby / C# route
+  Swift↔ObjC bridging, and the Go-module / C# route
   extractors. These are an additive heuristic layer; on a project where none
   of them is detected the orchestrator holds an empty resolver list, so
   behavior matches colby with zero frameworks detected. Astro's extraction
@@ -621,6 +621,18 @@ regex engine), is not listed.
   `filter_format.disable`, `image_style.flush`, `entity_form_mode.delete`
   alike), where the route serves the entity type's form handler
   (`frameworks/drupal.rs`, `resolver.rs`).
+- **Rails takes one candidate (W7-19e).** Where colby takes the first of
+  several candidates in its store's order, Rails takes the only one and
+  answers nothing for several: a route's action among the files of the
+  controller classes so named (after the filter by the controller's module
+  path), a model among the classes of its name in a path holding
+  `app/models/`, and a controller among those in a path holding
+  `controllers/` (`frameworks/rails.rs`).
+- **Rails candidates are Ruby's (W7-19e).** A route's action and Rails'
+  controller, model, helper, service and job candidates are Ruby methods,
+  functions, classes and modules; colby takes them in any language, a
+  monorepo front end's TypeScript `UsersController` among a route's
+  controllers (`frameworks/rails.rs`).
 - **Dart named constructors (#2380).** A named constructor, indexed as a
   method, is reached only by a call written through its class (`Foo.value(2)`).
   A call through a value of that type (a typed parameter or local, a chain's
@@ -977,4 +989,8 @@ the file's classes, a hook function that comes or goes every `hook_X` it
 answers, and a node named `hook_X` that comes or goes the resolved
 references of that name (`drupal_refs_version`). Laravel's route names need
 no lane: every sync recomputes them from their qualified names, as colby's
-does, so a mount that goes away is undone in both.
+does, so a mount that goes away is undone in both. So do Rails' controllers
+(W7-19e): a Ruby class, method or function name a sync adds to or removes
+from any file re-resolves the Rails route references naming one of the
+file's classes, or naming the file as their
+`app/controllers/<controller>_controller.rb` (`rails_routes_version`).

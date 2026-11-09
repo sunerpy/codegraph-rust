@@ -2,8 +2,8 @@
 //! files (W5-06): the JS/TS path aliases, workspace and package manifests,
 //! the C# project files, the Cargo manifests and the Go module files
 //! (W7-15d1), the root files the Python frameworks are detected by
-//! (W7-19b), Spring and Play are (W7-19c), and Laravel and Drupal are
-//! (W7-19d), and which frameworks the project uses.
+//! (W7-19b), Spring and Play are (W7-19c), Laravel and Drupal are (W7-19d),
+//! and Rails is (W7-19e), and which frameworks the project uses.
 //!
 //! Each reader reports what it read or probed in the same traversal that
 //! reads it ([`codegraph_resolve::path_aliases::alias_config_inputs`],
@@ -17,7 +17,8 @@
 //! [`codegraph_resolve::frameworks::spring::ROOT_DETECTION_FILES`],
 //! [`codegraph_resolve::frameworks::play::ROOT_DETECTION_FILES`],
 //! [`codegraph_resolve::frameworks::laravel::ROOT_DETECTION_FILES`],
-//! [`codegraph_resolve::frameworks::drupal::ROOT_DETECTION_FILES`]); every
+//! [`codegraph_resolve::frameworks::drupal::ROOT_DETECTION_FILES`],
+//! [`codegraph_resolve::frameworks::rails::ROOT_DETECTION_FILES`]); every
 //! full index,
 //! migration and sync writes one row per kind holding a digest of each input
 //! (a file's text, a directory's listing, `null` for a missing one), and one
@@ -26,8 +27,8 @@
 //! names a control file, is a folder coming into a workspace glob's listing,
 //! or changes which files the kind's readers start from) and compares: a kind
 //! that moved re-resolves every file of its languages whole (the Python,
-//! JVM and PHP kinds' languages are none: they move only which frameworks a
-//! sync detects); a framework that
+//! JVM, PHP and Ruby kinds' languages are none: they move only which
+//! frameworks a sync detects); a framework that
 //! came or went, or a manifest edit that moves which files a framework that
 //! runs only in its own apps extracts, re-extracts every file, since
 //! framework nodes are made at extraction. The rows are written last;
@@ -81,10 +82,15 @@ pub enum ControlKind {
     /// `artisan` and a `composer.json` are never indexed, and a
     /// configuration may leave out an `app/Http/Kernel.php`.
     Php,
+    /// The root files Rails is detected by, the same way: a `Gemfile` is
+    /// never indexed, and a configuration may leave out a
+    /// `config/application.rb`, an
+    /// `app/controllers/application_controller.rb` or a `config/routes.rb`.
+    Ruby,
 }
 
 impl ControlKind {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Js,
         Self::Csharp,
         Self::Rust,
@@ -92,6 +98,7 @@ impl ControlKind {
         Self::Python,
         Self::Jvm,
         Self::Php,
+        Self::Ruby,
     ];
 
     fn key(self) -> &'static str {
@@ -103,6 +110,7 @@ impl ControlKind {
             Self::Python => "python",
             Self::Jvm => "jvm",
             Self::Php => "php",
+            Self::Ruby => "ruby",
         }
     }
 
@@ -132,7 +140,7 @@ impl ControlKind {
             Self::Go => name == "go.mod",
             // Their files are named by their root paths
             // ([`is_control_file`]).
-            Self::Python | Self::Jvm | Self::Php => false,
+            Self::Python | Self::Jvm | Self::Php | Self::Ruby => false,
         }
     }
 
@@ -144,7 +152,7 @@ impl ControlKind {
             Self::Csharp => language == Language::CSharp,
             Self::Rust => path.ends_with(".rs"),
             Self::Go => path.ends_with(".go"),
-            Self::Python | Self::Jvm | Self::Php => false,
+            Self::Python | Self::Jvm | Self::Php | Self::Ruby => false,
         }
     }
 }
@@ -179,15 +187,16 @@ pub fn is_tauri_marker(relative: &str) -> bool {
 }
 
 /// Whether `relative` names a control file of any kind, a Tauri marker, a
-/// root file the Python, Spring, Play, Laravel or Drupal frameworks are
-/// detected by, or a Dart pubspec manifest (the Dart library lane's): the
-/// watcher hands its events to the sync, though it is no source file.
+/// root file the Python, Spring, Play, Laravel, Drupal or Rails frameworks
+/// are detected by, or a Dart pubspec manifest (the Dart library lane's):
+/// the watcher hands its events to the sync, though it is no source file.
 pub fn is_control_file(relative: &str) -> bool {
     let name = relative.rsplit('/').next().unwrap_or(relative);
     is_tauri_marker(relative)
         || codegraph_resolve::frameworks::python::ROOT_DETECTION_FILES.contains(&relative)
         || jvm_root_files().any(|file| file == relative)
         || php_root_files().any(|file| file == relative)
+        || codegraph_resolve::frameworks::rails::ROOT_DETECTION_FILES.contains(&relative)
         || ControlKind::ALL.iter().any(|kind| kind.names_file(name))
         || crate::dart_libraries::is_pubspec_path(relative)
 }
@@ -348,6 +357,14 @@ pub fn digests_of(kind: ControlKind, project_root: &Path, files: &[FileRecord]) 
         }
         ControlKind::Php => {
             for relative in php_root_files() {
+                out.insert(
+                    relative.to_string(),
+                    file_digest(&project_root.join(relative)),
+                );
+            }
+        }
+        ControlKind::Ruby => {
+            for relative in codegraph_resolve::frameworks::rails::ROOT_DETECTION_FILES {
                 out.insert(
                     relative.to_string(),
                     file_digest(&project_root.join(relative)),
@@ -674,6 +691,19 @@ mod tests {
         }
         assert!(!is_control_file("composer.lock"));
         assert!(!is_control_file("app/Http/Controllers/Kernel.php"));
+        // Rails' root files, at the root only: an engine's
+        // `config/routes.rb` is an indexed source file.
+        for file in [
+            "Gemfile",
+            "config/application.rb",
+            "app/controllers/application_controller.rb",
+            "config/routes.rb",
+        ] {
+            assert!(is_control_file(file), "{file}");
+            assert!(!is_control_file(&format!("engine/{file}")), "engine/{file}");
+        }
+        assert!(!is_control_file("Gemfile.lock"));
+        assert!(!is_control_file("config/routes/admin.rb"));
     }
 
     /// The Python kind reads its eight root files, present or not, and names
@@ -784,6 +814,47 @@ mod tests {
         assert!(!ControlKind::Php.reads_from("app/Http/Kernel.php", Language::Php));
         assert!(!ControlKind::Php.names_file("composer.json"));
         assert_eq!(ControlKind::Php.row_key(), "control_inputs:php");
+    }
+
+    /// The Ruby kind reads Rails' four root files, present or not, and names
+    /// no file to re-resolve (W7-19e).
+    #[test]
+    fn the_ruby_kind_digests_its_root_files_and_reresolves_none() {
+        let dir = std::env::temp_dir().join(format!(
+            "cg-control-inputs-ruby-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(dir.join("config")).unwrap();
+        std::fs::write(dir.join("Gemfile"), "gem \"rails\"\n").unwrap();
+        std::fs::write(
+            dir.join("config/routes.rb"),
+            "Rails.application.routes.draw do\nend\n",
+        )
+        .unwrap();
+        let digests = digests_of(ControlKind::Ruby, &dir, &[]);
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(
+            digests.keys().map(String::as_str).collect::<Vec<_>>(),
+            [
+                "Gemfile",
+                "app/controllers/application_controller.rb",
+                "config/application.rb",
+                "config/routes.rb",
+            ]
+        );
+        assert_eq!(digests["Gemfile"], Some(hash_content("gem \"rails\"\n")));
+        assert_eq!(
+            digests["config/routes.rb"],
+            Some(hash_content("Rails.application.routes.draw do\nend\n"))
+        );
+        assert_eq!(digests["config/application.rb"], None);
+        assert!(!ControlKind::Ruby.reads_from("config/routes.rb", Language::Ruby));
+        assert!(!ControlKind::Ruby.names_file("Gemfile"));
+        assert_eq!(ControlKind::Ruby.row_key(), "control_inputs:ruby");
     }
 
     /// The files the synthesis stage last read beside the index, and the
