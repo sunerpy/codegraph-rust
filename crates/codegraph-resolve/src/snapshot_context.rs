@@ -198,6 +198,8 @@ struct SnapshotCaches {
     kotlin_tables: OnceLock<Arc<crate::kotlin_scope::KotlinTables>>,
     /// The Spring config keys for the run (W7-19c).
     spring_tables: OnceLock<Arc<crate::frameworks::spring::SpringTables>>,
+    /// The Drupal hook implementations for the run (W7-19d).
+    drupal_tables: OnceLock<Arc<crate::frameworks::drupal::DrupalTables>>,
     scala_tables: OnceLock<Arc<crate::scala_scope::ScalaTables>>,
     csharp_tables: OnceLock<Arc<crate::csharp_types::CsharpTables>>,
     member_tables: OnceLock<Arc<crate::member_types::MemberTables>>,
@@ -236,6 +238,7 @@ impl SnapshotCaches {
             cpp_namespace_tables: OnceLock::new(),
             kotlin_tables: OnceLock::new(),
             spring_tables: OnceLock::new(),
+            drupal_tables: OnceLock::new(),
             scala_tables: OnceLock::new(),
             csharp_tables: OnceLock::new(),
             member_tables: OnceLock::new(),
@@ -784,6 +787,14 @@ impl ResolutionContext for SnapshotResolutionContext {
             self.caches
                 .spring_tables
                 .get_or_init(|| Arc::new(crate::frameworks::spring::SpringTables::new())),
+        )
+    }
+
+    fn drupal_tables(&self) -> Arc<crate::frameworks::drupal::DrupalTables> {
+        Arc::clone(
+            self.caches
+                .drupal_tables
+                .get_or_init(|| Arc::new(crate::frameworks::drupal::DrupalTables::new())),
         )
     }
 

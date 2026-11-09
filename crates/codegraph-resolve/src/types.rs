@@ -667,6 +667,14 @@ pub trait ResolutionContext {
         Arc::new(crate::frameworks::spring::SpringTables::new())
     }
 
+    /// The project's Drupal hook implementations a `hook_X` reference reads
+    /// (W7-19d). Contexts that live for one resolution pass keep one table;
+    /// the default makes a new one, which reads the functions again, on each
+    /// call.
+    fn drupal_tables(&self) -> Arc<crate::frameworks::drupal::DrupalTables> {
+        Arc::new(crate::frameworks::drupal::DrupalTables::new())
+    }
+
     /// The project-wide Scala facts of one resolution pass (W4-SC-01).
     fn scala_tables(&self) -> Arc<crate::scala_scope::ScalaTables> {
         Arc::new(crate::scala_scope::ScalaTables::new())

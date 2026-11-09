@@ -564,6 +564,28 @@ fn incremental_sync_on_outdated_v2_forces_all_files() {
         play_marker(&IndexPaths::resolve(&peer, None).expect("resolve peer v2 paths")),
         "a forced migration must write the Play routes marker of `index --force`"
     );
+    // The Laravel and Drupal lane markers (W7-19d), likewise.
+    for (prefix, key) in [
+        ("laravel_routes", "laravel_routes_version"),
+        ("drupal_refs", "drupal_refs_version"),
+    ] {
+        let marker = |paths: &IndexPaths| {
+            Store::open_for_read(paths, deadline(), || false)
+                .expect("readable namespace")
+                .project_metadata_with_prefix(prefix)
+                .expect("lane marker")
+        };
+        assert_eq!(
+            marker(&paths),
+            vec![(key.to_string(), "1".to_string())],
+            "a migration writes the {key} marker"
+        );
+        assert_eq!(
+            marker(&paths),
+            marker(&IndexPaths::resolve(&peer, None).expect("resolve peer v2 paths")),
+            "a forced migration must write the {key} marker of `index --force`"
+        );
+    }
     // And the C/C++ namespace rows (W4-CPP-07).
     let namespace_rows = |paths: &IndexPaths| {
         Store::open_for_read(paths, deadline(), || false)
@@ -1887,9 +1909,10 @@ fn outdated_migration_writes_the_class_head_rows_of_index_force() {
 
 /// W5-06: a migration writes the control-input rows (what resolution read
 /// of the JS/TS configs and manifests, the C# project files, the Cargo
-/// manifests, W7-15d1, the Go module files and, W7-19b and W7-19c, the
-/// root files the Python, Spring and Play frameworks are detected by), the
-/// detected frameworks and both markers as `index --force` does.
+/// manifests, W7-15d1, the Go module files and, W7-19b to W7-19d, the
+/// root files the Python, Spring, Play, Laravel and Drupal frameworks are
+/// detected by), the detected frameworks and both markers as
+/// `index --force` does.
 #[test]
 fn outdated_migration_writes_the_control_rows_of_index_force() {
     let dir = TestDir::new("outdated-control-inputs");
@@ -1930,6 +1953,8 @@ fn outdated_migration_writes_the_control_rows_of_index_force() {
             "pom.xml",
             "<project><artifactId>app</artifactId></project>\n",
         ),
+        // Nor Drupal.
+        ("composer.json", "{\"require\":{\"php\":\">=8.1\"}}\n"),
     ] {
         let full = project.join(path);
         fs::create_dir_all(full.parent().unwrap()).expect("create the source directory");
@@ -1979,6 +2004,7 @@ fn outdated_migration_writes_the_control_rows_of_index_force() {
             "control_inputs:go",
             "control_inputs:js",
             "control_inputs:jvm",
+            "control_inputs:php",
             "control_inputs:python",
             "control_inputs:rust",
             "control_inputs_version",
@@ -1995,10 +2021,14 @@ fn outdated_migration_writes_the_control_rows_of_index_force() {
         // A digest, where the five absent root files record null.
         (3, "\"pom.xml\":\""),
         (3, "\"build.sbt\":null"),
+        // A digest, where the two absent Laravel root files record null.
+        (4, "\"composer.json\":\""),
+        (4, "\"artisan\":null"),
+        (4, "\"app/Http/Kernel.php\":null"),
         // A digest, where the seven absent root files record null.
-        (4, "\"requirements.txt\":\""),
-        (5, "\"Cargo.toml\""),
-        (7, "\"react\""),
+        (5, "\"requirements.txt\":\""),
+        (6, "\"Cargo.toml\""),
+        (8, "\"react\""),
     ] {
         assert!(
             migrated[row].1.contains(input),

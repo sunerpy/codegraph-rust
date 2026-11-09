@@ -125,6 +125,63 @@ pub struct FileReferenceSite {
     pub site: Option<ReferenceSite>,
 }
 
+/// A family of references a framework lane of a sync reads in bulk
+/// ([`Store::lane_references`], W7-19d).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LaneReferences {
+    /// A PHP route's references: Laravel's, the only resolver that makes
+    /// PHP routes.
+    PhpRoutes,
+    /// A YAML route's references in a `*.routing.yml` file: Drupal's.
+    DrupalRoutingFiles,
+    /// The PHP references to a Drupal hook, named `hook_X`.
+    PhpHooks,
+    /// The PHP references named `{class}::...`, Laravel's `Model::method`.
+    PhpStaticCalls(String),
+}
+
+impl LaneReferences {
+    /// The family's `WHERE` clause and its parameters: a prefix is a range,
+    /// which an index on its column serves.
+    fn predicate(&self) -> (&'static str, Vec<String>) {
+        // `:` is followed by `;`: the ids of the routes are the ones from
+        // `route:` up to `route;`.
+        match self {
+            Self::PhpRoutes => (
+                "from_node_id >= 'route:' AND from_node_id < 'route;' AND language = 'php'",
+                Vec::new(),
+            ),
+            Self::DrupalRoutingFiles => (
+                "from_node_id >= 'route:' AND from_node_id < 'route;' \
+                 AND language = 'yaml' AND substr(file_path, -12) = '.routing.yml'",
+                Vec::new(),
+            ),
+            // `_` is followed by a backtick.
+            Self::PhpHooks => (
+                "reference_name >= 'hook_' AND reference_name < 'hook`' AND language = 'php'",
+                Vec::new(),
+            ),
+            // `:` is followed by `;`: the names starting `{class}::`.
+            Self::PhpStaticCalls(class) => (
+                "reference_name >= ?1 AND reference_name < ?2 AND language = 'php'",
+                vec![format!("{class}::"), format!("{class}:;")],
+            ),
+        }
+    }
+}
+
+/// One reference of a [`LaneReferences`] family.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaneReference {
+    /// Where it is, always with its site: neither table holds a reference
+    /// without a line and column.
+    pub site: FileReferenceSite,
+    pub reference_name: String,
+    pub reference_kind: EdgeKind,
+    /// Whether it is a row of `resolved_refs` rather than `unresolved_refs`.
+    pub resolved: bool,
+}
+
 impl Store {
     /// Ports `insertNode` / `insertNodes` / `updateNode` from `upstream db/queries.ts:243-382`.
     /// Uses one batched transaction and an upsert that fires the FTS update trigger on conflicts.
@@ -1631,25 +1688,9 @@ impl Store {
         unique.sort_unstable();
         unique.dedup();
         let languages: Vec<&str> = languages.iter().map(|language| language.as_str()).collect();
-        let language_slots = std::iter::repeat_n("?", languages.len())
-            .collect::<Vec<_>>()
-            .join(",");
         let mut out = BTreeSet::new();
         for chunk in unique.chunks(SQLITE_PARAM_CHUNK_SIZE - languages.len()) {
-            let name_slots = std::iter::repeat_n("lower(?)", chunk.len())
-                .collect::<Vec<_>>()
-                .join(",");
-            let sql = format!(
-                r#"SELECT src.file_path, e.source, e.line, e.col
-                FROM edges e
-                JOIN nodes tgt ON tgt.id = e.target
-                JOIN nodes src ON src.id = e.source
-                WHERE lower(tgt.name) IN ({name_slots})
-                  AND src.language IN ({language_slots})
-                  AND e.kind != 'contains'
-                  AND NOT ({SYNTHESIZED_E})
-                ORDER BY src.file_path, e.source, e.line, e.col"#
-            );
+            let sql = folded_target_sites_sql(chunk.len(), languages.len());
             let mut params: Vec<&dyn ToSql> = chunk.iter().map(|name| name as &dyn ToSql).collect();
             params.extend(languages.iter().map(|language| language as &dyn ToSql));
             let mut stmt = self.conn.prepare(&sql)?;
@@ -2476,6 +2517,43 @@ impl Store {
         )?;
         let rows = stmt.query_map([names], row_to_file_reference_site)?;
         rows.collect()
+    }
+
+    /// The references of one framework lane's family, the unresolved ones
+    /// then the resolved ones, each sorted by site and deduplicated: a sync
+    /// re-resolves the ones its changes moved, and an index without the
+    /// lane's marker every one (W7-19d). The route families read a range of
+    /// the tables' `from_node_id` indexes; the others scan `resolved_refs`,
+    /// which no index holds by name.
+    pub fn lane_references(&self, family: &LaneReferences) -> rusqlite::Result<Vec<LaneReference>> {
+        let (predicate, params) = family.predicate();
+        let mut out = Vec::new();
+        for (table, resolved) in [("unresolved_refs", false), ("resolved_refs", true)] {
+            let mut stmt = self.conn.prepare(&format!(
+                "SELECT DISTINCT file_path, from_node_id, line, col, reference_name, \
+                 reference_kind FROM {table} WHERE {predicate} \
+                 ORDER BY file_path, from_node_id, line, col, reference_name, reference_kind"
+            ))?;
+            let map = |row: &Row<'_>| {
+                let raw_kind = row.get::<_, String>(5)?;
+                let reference_kind = if raw_kind == "function_ref" {
+                    EdgeKind::References
+                } else {
+                    parse_edge_kind(raw_kind)?
+                };
+                Ok(LaneReference {
+                    site: row_to_file_reference_site(row)?,
+                    reference_name: row.get(4)?,
+                    reference_kind,
+                    resolved,
+                })
+            };
+            let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), map)?;
+            for row in rows {
+                out.push(row?);
+            }
+        }
+        Ok(out)
     }
 
     /// Ports `getDependencyFilePaths` from
@@ -3611,6 +3689,34 @@ impl StoredEdge {
             && self.provenance == edge.provenance
             && self.metadata.as_deref() == metadata
     }
+}
+
+/// The query of [`Store::reference_sites_of_edges_to_folded_targets`] for
+/// `names` names and `languages` languages, its parameters in that order.
+/// `CROSS JOIN` keeps the targets the outer loop, found through the
+/// lower-name index: left to itself, with no row statistics for these
+/// tables, the planner takes the language filter for the selective one from
+/// four names on and walks every node of those languages and its edges
+/// (W7-19d cost revision). From the targets it costs what the exact-name
+/// query a sync runs for the same names costs.
+fn folded_target_sites_sql(names: usize, languages: usize) -> String {
+    let name_slots = std::iter::repeat_n("lower(?)", names)
+        .collect::<Vec<_>>()
+        .join(",");
+    let language_slots = std::iter::repeat_n("?", languages)
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        r#"SELECT src.file_path, e.source, e.line, e.col
+        FROM nodes tgt
+        CROSS JOIN edges e ON e.target = tgt.id
+        CROSS JOIN nodes src ON src.id = e.source
+        WHERE lower(tgt.name) IN ({name_slots})
+          AND src.language IN ({language_slots})
+          AND e.kind != 'contains'
+          AND NOT ({SYNTHESIZED_E})
+        ORDER BY src.file_path, e.source, e.line, e.col"#
+    )
 }
 
 fn existing_node_ids(
@@ -5833,6 +5939,41 @@ mod tests {
         assert_eq!(sites(&["formatPRICE"]), [("view.php".to_string(), 2)]);
         assert_eq!(sites(&["LOCAL"]), [("view.php".to_string(), 3)]);
         assert!(sites(&["price"]).is_empty());
+    }
+
+    /// The folded-name site query walks from the targets, through the
+    /// lower-name index, whatever the number of names (W7-19d cost
+    /// revision): left to itself the planner, which has no row statistics
+    /// for these tables, takes the language filter for the selective one
+    /// from four names on and walks every node of those languages and its
+    /// edges, 25 ms on koel for names no edge reaches.
+    #[test]
+    fn folded_target_sites_walk_from_the_targets_through_the_lower_name_index() {
+        let store = store("folded-target-plan");
+        let names = ["Alpha", "Beta", "Gamma", "Delta", "Epsilon"];
+        let languages = ["php", "pascal", "cfml"];
+        let sql = folded_target_sites_sql(names.len(), languages.len());
+        let mut params: Vec<&dyn ToSql> = names.iter().map(|name| name as &dyn ToSql).collect();
+        params.extend(languages.iter().map(|language| language as &dyn ToSql));
+        let mut stmt = store
+            .conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .unwrap();
+        let steps = stmt
+            .query_map(params.as_slice(), |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert!(
+            steps
+                .first()
+                .is_some_and(|step| step.starts_with("SEARCH tgt USING INDEX idx_nodes_lower_name")),
+            "the targets are not the outer loop: {steps:?}"
+        );
+        assert!(
+            !steps.iter().any(|step| step.contains("idx_nodes_language")),
+            "the language index drives the query: {steps:?}"
+        );
     }
 
     #[test]
