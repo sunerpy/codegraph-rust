@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# The fast builds differ as W7-19g says: on the servers fixture (this
+# checkout's crates/codegraph-bench/fixtures/servers) the candidate makes the
+# two Vapor routes under `vapor/` (a trailing closure's `GET /hello` and the
+# controller's `GET /todos`), and W7-19f makes none.
+# usage: sanity.sh <private-dir> <fixture-dir>
+set -euo pipefail
+dir=$1
+fixture=$2
+work=$(mktemp -d "$dir/sanity.XXXXXX")
+export CODEGRAPH_MCP_REGISTRY_DIR="$work/registry" CODEGRAPH_NO_DAEMON=1 CODEGRAPH_NO_WATCH=1
+for side in cand base; do
+  mkdir -p "$work/$side"
+  cp -a "$fixture/." "$work/$side/"
+  "$dir/bin-$side/codegraph" init "$work/$side" > /dev/null 2>&1
+  db="file:$work/$side/.codegraph/codegraph.db?immutable=1"
+  echo "$side routes in vapor/: $(sqlite3 "$db" "SELECT count(*) FROM nodes WHERE kind = 'route' AND file_path LIKE 'vapor/%'")"
+done
+rm -rf "$work"
