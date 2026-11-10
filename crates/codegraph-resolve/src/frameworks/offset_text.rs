@@ -1,8 +1,8 @@
 //! A file's source and its comment-stripped text, byte for byte aligned
 //! (W7-19a's Express text, shared with the Python frameworks in W7-19b,
 //! with Spring in W7-19c, with Laravel in W7-19d, with Rails in W7-19e,
-//! with ASP.NET in W7-19f, with Vapor in W7-19g and with Rust's frameworks
-//! in W7-19h).
+//! with ASP.NET in W7-19f, with Vapor in W7-19g, with Rust's frameworks in
+//! W7-19h and with Go in W7-19i).
 //!
 //! Upstream strips comments one space per UTF-16 code unit and measures
 //! columns, match lengths and windows in code units; the strippers here
@@ -13,9 +13,10 @@
 use std::cell::OnceCell;
 
 use crate::strip_comments::{
-    strip_java_comments_keeping_offsets, strip_js_comments_keeping_offsets,
-    strip_php_comments_keeping_offsets, strip_python_comments_keeping_offsets,
-    strip_ruby_comments_keeping_offsets, strip_rust_comments_keeping_offsets,
+    strip_go_comments_keeping_offsets, strip_java_comments_keeping_offsets,
+    strip_js_comments_keeping_offsets, strip_php_comments_keeping_offsets,
+    strip_python_comments_keeping_offsets, strip_ruby_comments_keeping_offsets,
+    strip_rust_comments_keeping_offsets,
 };
 
 /// A file's source and its comment-stripped text, byte for byte aligned.
@@ -78,6 +79,11 @@ impl<'a> OffsetText<'a> {
     /// Rust source ([`strip_rust_comments_keeping_offsets`]).
     pub(crate) fn rust(content: &'a str) -> Self {
         Self::new(content, strip_rust_comments_keeping_offsets(content))
+    }
+
+    /// Go source ([`strip_go_comments_keeping_offsets`]).
+    pub(crate) fn go(content: &'a str) -> Self {
+        Self::new(content, strip_go_comments_keeping_offsets(content))
     }
 
     /// `start..end` of the stripped text as upstream's holds it: a blanked

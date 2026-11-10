@@ -9,10 +9,11 @@
 //! ([`astro`]), Django, Flask and FastAPI ([`python`]), Rails ([`rails`]),
 //! Spring ([`spring`]), Play ([`play`]), Expo Router ([`expo_router`]), Vue
 //! and Nuxt ([`vue`]), NestJS ([`nestjs`]), Godot ([`godot`]), Tauri
-//! ([`tauri`]), GoFrame ([`goframe`]), Rust's axum and actix routes and
-//! Cargo workspace crates ([`rust`], [`cargo_workspace`]), ASP.NET
-//! ([`aspnet`]) and SwiftUI, UIKit and Vapor ([`swift`]). The other
-//! upstream resolvers remain deferred (see `KNOWN_DIFFS.md`).
+//! ([`tauri`]), Go's server frameworks ([`go`]), GoFrame ([`goframe`]),
+//! Rust's axum and actix routes and Cargo workspace crates ([`rust`],
+//! [`cargo_workspace`]), ASP.NET ([`aspnet`]) and SwiftUI, UIKit and Vapor
+//! ([`swift`]). The other upstream resolvers remain deferred (see
+//! `KNOWN_DIFFS.md`).
 //!
 //! [`detect_frameworks`] ports `frameworks/index.ts:detectFrameworks` restricted
 //! to the ported resolvers; the orchestrator hands the detected list to
@@ -27,6 +28,7 @@ pub mod cargo_workspace;
 pub mod drupal;
 pub mod expo_router;
 pub mod express;
+pub mod go;
 pub mod godot;
 pub(crate) mod godot_common;
 pub mod godot_dsl_config;
@@ -76,8 +78,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// ported neighbours (Laravel and Drupal first, Express before NestJS, Astro
 /// between Angular Router
 /// and Expo Router, the Python frameworks after Astro, Rails, Spring and Play
-/// after them, Rust and ASP.NET after GoFrame, SwiftUI, UIKit and Vapor
-/// after ASP.NET); the entries already
+/// after them, Go between Expo Router and GoFrame, Rust and ASP.NET after
+/// GoFrame, SwiftUI, UIKit and Vapor after ASP.NET); the entries already
 /// here keep their places. A port
 /// placed ahead of others must not take a reference they resolved before:
 /// it answers below `0.9`, or only for references they do not claim.
@@ -179,9 +181,17 @@ pub fn detect_frameworks(context: &dyn ResolutionContext) -> Vec<Box<dyn Framewo
         // registers it. It claims navigation calls only where their href
         // names one of its own screens.
         Box::new(expo_router::ExpoRouterResolver),
-        // GoFrame's `g.Meta` routes (#747), upstream's after its Go
-        // resolver. It resolves no reference, so its place here changes
-        // no resolution; the synthesis stage joins its routes.
+        // Go's server routes (Gin, Echo, Fiber, Chi, `net/http`) and its
+        // four name conventions (#2397, #2408, `e1f339f`), between Expo
+        // Router and GoFrame as upstream registers it. It reads only Go
+        // references: of the resolvers above only Godot (GDScript's
+        // references) and Astro (only its own names) see one, and neither
+        // answers it, and GoFrame after it resolves none, so its place
+        // changes no other reference's resolution.
+        Box::new(go::GoResolver),
+        // GoFrame's `g.Meta` routes (#747), after the Go resolver as
+        // upstream registers it. It resolves no reference, so its place
+        // here changes no resolution; the synthesis stage joins its routes.
         Box::new(goframe::GoFrameResolver),
         // Rust's axum and actix routes, its conventions and the Cargo
         // workspace's crates (#2359, #2224, #2214, #151), after GoFrame as
